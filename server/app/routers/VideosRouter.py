@@ -24,6 +24,8 @@ from tortoise import connections
 
 from app import logging, schemas
 from app.constants import STATIC_DIR, THUMBNAILS_DIR
+from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
+from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.RecordedPlaybackIndex import (
     RECORDED_PLAYBACK_INDEX_VERSION,
     GetRecordedPlaybackIndexState,
@@ -134,6 +136,14 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         'audio_tracks': audio_tracks,
         'audio_track_timeline': audio_track_timeline,
         'subtitle_tracks': subtitle_tracks,
+        'cm_analysis_status': row['cm_analysis_status'],
+        'cm_analysis_error_code': row['cm_analysis_error_code'],
+        'cm_analysis_finished_at': row['cm_analysis_finished_at'],
+        'cm_result_source': row['cm_result_source'],
+        'cm_result_verified': None if row['cm_result_verified'] is None else bool(row['cm_result_verified']),
+        'cm_result_chapter_path_kind': row['cm_result_chapter_path_kind'],
+        'cm_result_pipeline_version': row['cm_result_pipeline_version'],
+        'cm_result_published_at': row['cm_result_published_at'],
         'cm_sections': cm_sections,
         'thumbnail_info': thumbnail_info,
         'created_at': row['rv_created_at'],
@@ -443,6 +453,14 @@ async def VideosAPI(
             rv.audio_tracks,
             rv.audio_track_timeline,
             rv.subtitle_tracks,
+            (SELECT status FROM recorded_video_cm_analyses WHERE recorded_video_id = rv.id) AS cm_analysis_status,
+            (SELECT error_code FROM recorded_video_cm_analyses WHERE recorded_video_id = rv.id) AS cm_analysis_error_code,
+            (SELECT finished_at FROM recorded_video_cm_analyses WHERE recorded_video_id = rv.id) AS cm_analysis_finished_at,
+            (SELECT source FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_source,
+            (SELECT verified FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_verified,
+            (SELECT chapter_path_kind FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_chapter_path_kind,
+            (SELECT pipeline_version FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_pipeline_version,
+            (SELECT published_at FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_published_at,
             rv.cm_sections,
             rv.thumbnail_info,
             rv.created_at AS rv_created_at,
@@ -682,6 +700,14 @@ async def VideosSearchAPI(
             rv.audio_tracks,
             rv.audio_track_timeline,
             rv.subtitle_tracks,
+            (SELECT status FROM recorded_video_cm_analyses WHERE recorded_video_id = rv.id) AS cm_analysis_status,
+            (SELECT error_code FROM recorded_video_cm_analyses WHERE recorded_video_id = rv.id) AS cm_analysis_error_code,
+            (SELECT finished_at FROM recorded_video_cm_analyses WHERE recorded_video_id = rv.id) AS cm_analysis_finished_at,
+            (SELECT source FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_source,
+            (SELECT verified FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_verified,
+            (SELECT chapter_path_kind FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_chapter_path_kind,
+            (SELECT pipeline_version FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_pipeline_version,
+            (SELECT published_at FROM recorded_video_cm_results WHERE recorded_video_id = rv.id) AS cm_result_published_at,
             rv.cm_sections,
             rv.thumbnail_info,
             rv.created_at AS rv_created_at,
@@ -1002,8 +1028,12 @@ async def VideoReanalyzeAPI(
 )
 async def VideoDetectCMSectionsAPI(
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
+    replace_existing_chapter: Annotated[
+        bool,
+        Query(description='KonomiTVが生成したchapterの再解析と置換を許可する。外部chapterは保持する。'),
+    ] = False,
 ) -> None:
-    """指定された録画番組のCM区間を、既存結果の有無を問わず再判定する。"""
+    """通常は既存chapterを保持し、明示指定時だけKonomiTV生成chapterを再判定する。"""
 
     file_path = anyio.Path(recorded_program.recorded_video.file_path)
     if not await file_path.is_file():
@@ -1011,10 +1041,13 @@ async def VideoDetectCMSectionsAPI(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Recorded video file was not found',
         )
-    await RecordedScanTask().processRecordedFile(
-        file_path=file_path,
-        analysis_request='CMDetection',
-    )
+    if replace_existing_chapter:
+        await CMAnalysisOrchestrator().run(recorded_program.recorded_video.id, 'CMRegeneration')
+    else:
+        await RecordedScanTask().processRecordedFile(
+            file_path=file_path,
+            analysis_request='CMDetection',
+        )
 
 
 @router.get(
@@ -1083,9 +1116,16 @@ async def VideoThumbnailRegenerateAPI(
         # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
         file_path = anyio.Path(recorded_program.recorded_video.file_path)
         async with DriveIOLimiter.getSemaphore(file_path):
-            # サムネイル画像の再生成を実行
-            generator = ThumbnailGenerator.fromRecordedProgram(recorded_program_schema)
-            await generator.generateAndSave()
+            async with AnalysisTaskTracker.track(
+                'ThumbnailGeneration',
+                recorded_video_id=recorded_program.recorded_video.id,
+                title=recorded_program.title,
+                trigger='Manual',
+            ) as history:
+                await history.setStage('Generating')
+                # サムネイル画像の再生成を実行
+                generator = ThumbnailGenerator.fromRecordedProgram(recorded_program_schema)
+                await generator.generateAndSave()
 
     except Exception as ex:
         logging.error(f'[VideoThumbnailRegenerateAPI] Failed to regenerate thumbnails for video_id {recorded_program.id}:', exc_info=ex)

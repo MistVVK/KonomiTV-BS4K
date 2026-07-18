@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import os
 import pathlib
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import ClassVar, Literal, cast
@@ -14,11 +15,18 @@ from fastapi import HTTPException, status
 from tortoise import transactions
 from tortoise.exceptions import IntegrityError
 from watchfiles import Change, awatch
+from watchfiles.filters import DefaultFilter
 
 from app import logging, schemas
 from app.config import Config
 from app.constants import JST, THUMBNAILS_DIR
-from app.metadata.CMSectionsDetector import CMSectionsDetector
+from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
+from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
+from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
+from app.metadata.CMChapterFile import (
+    GetRecordedPathFromCMChapterPath,
+    SelectRecordedPathForCMChapter,
+)
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.metadata.RecordedAnalysisPlan import (
     AnalysisRequest,
@@ -179,6 +187,81 @@ class RecordedScanTask:
 
         # 初期化済みフラグをセット
         self._initialized = True
+
+
+    @staticmethod
+    def buildRecordedFolderWatchFilter() -> DefaultFilter:
+        """watchfiles既定除外にCM解析workspaceの予約rootを追加する。
+
+        Returns:
+            録画フォルダ監視に使用するwatchfiles filter。
+        """
+
+        return DefaultFilter(ignore_dirs=(
+            *DefaultFilter.ignore_dirs,
+            CMAnalysisWorkspace.ROOT_DIRECTORY_NAME,
+        ))
+
+
+    @classmethod
+    async def iterRecordedFolderPaths(cls, folder: anyio.Path) -> AsyncGenerator[anyio.Path, None]:
+        """CM解析workspaceを枝刈りしながら録画フォルダを列挙する。
+
+        Args:
+            folder: 列挙を開始する設定済み録画フォルダ。
+
+        Yields:
+            workspace予約rootとその配下を除くファイル・ディレクトリ。
+        """
+
+        directories = [pathlib.Path(str(folder))]
+        while directories:
+            directory = directories.pop()
+            try:
+                entries = await asyncio.to_thread(cls._scanDirectory, directory)
+            except OSError as ex:
+                logging.warning(f'{directory}: Failed to scan directory:', exc_info=ex)
+                continue
+            for entry_path, is_directory in entries:
+                if CMAnalysisWorkspace.isWorkspacePath(entry_path):
+                    if is_directory and entry_path.name == CMAnalysisWorkspace.ROOT_DIRECTORY_NAME:
+                        # DB行が消えて起動時DB列挙で見つからなかった残骸もmarker/lock検証付きで回収する。
+                        await CMAnalysisWorkspace.cleanupStaleInParents({entry_path.parent})
+                    continue
+                yield anyio.Path(entry_path)
+                if is_directory:
+                    directories.append(entry_path)
+
+
+    @staticmethod
+    def _scanDirectory(directory: pathlib.Path) -> list[tuple[pathlib.Path, bool]]:
+        """単一ディレクトリをsymlink非追跡で同期列挙する。"""
+
+        with os.scandir(directory) as entries:
+            return [
+                (pathlib.Path(entry.path), entry.is_dir(follow_symlinks=False))
+                for entry in entries
+            ]
+
+
+    @staticmethod
+    async def cleanupStaleWorkspaceForResolvedSymlink(
+        original_path: str,
+        canonical_path: pathlib.Path,
+        cleaned_parents: set[pathlib.Path],
+    ) -> None:
+        """録画symlinkの実体親に残ったCM解析workspaceを一括スキャン中1回だけ回収する。"""
+
+        canonical_path_str = str(canonical_path)
+        if original_path == canonical_path_str or CMAnalysisWorkspace.isWorkspacePath(canonical_path):
+            return
+
+        canonical_parent = canonical_path.parent
+        if canonical_parent in cleaned_parents:
+            return
+        # cleanup中に同じ親を指す別symlinkを処理しても再実行しないよう、awaitより先に記録する。
+        cleaned_parents.add(canonical_parent)
+        await CMAnalysisWorkspace.cleanupStaleInParents({canonical_parent})
 
 
     async def start(self) -> None:
@@ -361,10 +444,14 @@ class RecordedScanTask:
         # 各録画フォルダをスキャン
         logging.info('Scanning recorded folders...')
         processed_canonical_paths: set[str] = set()
+        cleaned_symlink_target_parents: set[pathlib.Path] = set()
         scan_tasks: set[asyncio.Task[None]] = set()
         for folder in self.recorded_folders:
-            async for file_path in folder.rglob('*'):
+            async for file_path in self.iterRecordedFolderPaths(folder):
                 try:
+                    # CM解析のcanonical MKVなどは録画と同じFSへ置くため、名前空間ごと最優先で除外する。
+                    if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(file_path))):
+                        continue
                     # Mac の metadata ファイルをスキップ
                     if file_path.name.startswith('._'):
                         continue
@@ -380,6 +467,9 @@ class RecordedScanTask:
                     # シンボリックリンクを含むパスは実体に解決して処理する
                     canonical_path = await self.resolveRecordedPath(file_path)
                     canonical_path_str = str(canonical_path)
+                    # workspaceへのsymlinkも、解決後の正規パス要素で確実に除外する。
+                    if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(canonical_path_str)):
+                        continue
                     # 除外パターンのチェック（シンボリックリンク解決後）
                     # 空文字列は全パスにマッチしてしまうため除外する
                     canonical_path_for_match = self.__normalizePathForPrefixMatch(canonical_path_str)
@@ -396,6 +486,13 @@ class RecordedScanTask:
                     ## 環境次第では、稀に glob で取得したファイルが既に存在しなくなっているケースがある
                     if not await self.isFileExists(canonical_path):
                         continue
+                    # DB行がなくても、録画ファイルsymlinkの実体と同じ場所に残ったworkspaceを回収する。
+                    # 受付可能な実在録画だけを対象とし、実体親ごとに一括スキャン中1回だけ実行する。
+                    await self.cleanupStaleWorkspaceForResolvedSymlink(
+                        original_path_str,
+                        pathlib.Path(canonical_path_str),
+                        cleaned_symlink_target_parents,
+                    )
                     if canonical_path_str in processed_canonical_paths:
                         continue
                     processed_canonical_paths.add(canonical_path_str)
@@ -556,6 +653,7 @@ class RecordedScanTask:
         # 同一ファイルパスへの DB レコード操作を排他制御する
         async with file_lock:
             metadata_analysis_recorded_video_id: int | None = None
+            metadata_history: AnalysisTaskHandle | None = None
             try:
                 # 万が一この時点でファイルが存在しない場合はスキップ
                 # ファイル変更イベント発火後に即座にファイルが削除される可能性も考慮
@@ -689,9 +787,26 @@ class RecordedScanTask:
                 ## メタデータ解析処理は実装上同期 I/O で実装されており、また CPU-bound な処理のため、別プロセスで実行している
                 ## コンテキストマネージャーはキャンセル時にも子プロセス終了を同期的に待つため、イベントループ上では使わない
                 ## 正常完了時は明示的に待ってクリーンアップし、リクエスト切断時だけ待機なしで解放処理へ進める
+                metadata_history = await AnalysisTaskTracker.start(
+                    'MetadataAnalysis',
+                    recorded_video_id=metadata_analysis_recorded_video_id,
+                    title=file_path.name,
+                    trigger='Automatic' if analysis_request == 'Automatic' else 'Manual',
+                )
                 try:
+                    await metadata_history.setStage('Probing')
                     recorded_program = await self.__analyzeMetadata(file_path)
+                    if recorded_program is None:
+                        await metadata_history.finish('Failed', error_code='MetadataUnavailable')
+                    else:
+                        await metadata_history.setTitle(recorded_program.title)
+                        await metadata_history.setStage('Saving', 0.9)
                 except Exception as ex:
+                    await metadata_history.finish(
+                        'Failed',
+                        error_code=type(ex).__name__,
+                        error_message=str(ex),
+                    )
                     logging.error(f'{file_path}: Error analyzing metadata:', exc_info=ex)
                     # メタデータ解析中に例外が発生した場合も、この時点ですでに DB にエントリが存在している場合は、UI から判別できるようステータスを更新する
                     if existing_recorded_video_summary is not None:
@@ -714,6 +829,7 @@ class RecordedScanTask:
                 # 録画中だがまだ60秒に満たない場合、今後のファイル変更イベント発火時に60秒を超えていれば録画中ファイルとして処理される
                 if recorded_program.recorded_video.duration < self.MINIMUM_RECORDING_SECONDS:
                     logging.debug(f'{file_path}: This file is too short. (duration {recorded_program.recorded_video.duration:.1f}s < {self.MINIMUM_RECORDING_SECONDS}s) Skipped.')
+                    await metadata_history.finish('Skipped', error_code='RecordingTooShort')
                     if metadata_analysis_recorded_video_id is not None:
                         await RecordedVideo.filter(id=metadata_analysis_recorded_video_id).update(status='AnalysisFailed')
                     return
@@ -753,6 +869,7 @@ class RecordedScanTask:
                     await RecordedVideo.filter(id=existing_db_recorded_video_after_analyze.id).update(status='Recorded')
                     existing_db_recorded_video_after_analyze.status = 'Recorded'
                     metadata_analysis_recorded_video_id = None
+                    await metadata_history.finish('Succeeded')
                     await self.__executePlanWithoutMetadata(
                         file_path,
                         existing_db_recorded_video_after_analyze.id,
@@ -781,13 +898,14 @@ class RecordedScanTask:
 
                 # DB に永続化
                 # メタデータ解析後の最新のデータベース情報を使う
-                await self.__saveRecordedMetadataToDB(
+                saved_recorded_video_id = await self.__saveRecordedMetadataToDB(
                     recorded_program,
                     existing_db_recorded_video_after_analyze,
                     content_state,
                 )
                 metadata_analysis_recorded_video_id = None
                 logging.info(f'{file_path}: {"Updated" if existing_db_recorded_video_after_analyze else "Saved"} metadata to DB. (status: {recorded_program.recorded_video.status})')
+                await metadata_history.finish('Succeeded')
 
                 # 録画中は確定解析を行わず、録画完了後の変更イベントで改めて計画する。
                 if recorded_program.recorded_video.status != 'Recorded':
@@ -797,7 +915,10 @@ class RecordedScanTask:
                 # CMは索引完了後に直列実行するため、このタスクへ混在させない。
                 if 'GenerateThumbnail' in analysis_plan.actions:
                     if file_path not in self._background_tasks:
-                        task = asyncio.create_task(self.__runThumbnailGeneration(recorded_program))
+                        task = asyncio.create_task(self.__runThumbnailGeneration(
+                            recorded_program,
+                            saved_recorded_video_id,
+                        ))
                         self._background_tasks[file_path] = task
 
                 # 新規・内容変更・手動再解析は、DBへ暫定保存した後で全編索引を直列実行する。
@@ -817,9 +938,17 @@ class RecordedScanTask:
 
                 # 索引が失敗してもファイルが残っていればCM判定を続行し、結果を必ず明示保存する。
                 if 'DetectCM' in analysis_plan.actions and await self.isFileExists(file_path):
-                    await CMSectionsDetector(file_path, recorded_program.recorded_video.duration).detectAndSave()
+                    db_recorded_video = await RecordedVideo.get(file_path=file_path_str)
+                    cm_intent = 'CMDetection' if analysis_request == 'CMDetection' else 'DetectCM'
+                    await CMAnalysisOrchestrator().run(db_recorded_video.id, cm_intent)
 
             except Exception as ex:
+                if metadata_history is not None:
+                    await metadata_history.finish(
+                        'Failed',
+                        error_code=type(ex).__name__,
+                        error_message=str(ex),
+                    )
                 logging.error(f'{file_path}: Error processing file inside lock:', exc_info=ex)
                 if metadata_analysis_recorded_video_id is not None:
                     await RecordedVideo.filter(id=metadata_analysis_recorded_video_id).update(status='AnalysisFailed')
@@ -902,9 +1031,10 @@ class RecordedScanTask:
                 await index_future
 
         if 'DetectCM' in analysis_plan.actions and await self.isFileExists(file_path):
-            db_recorded_video = await RecordedVideo.get_or_none(id=recorded_video_id)
-            if db_recorded_video is not None:
-                await CMSectionsDetector(file_path, db_recorded_video.duration).detectAndSave()
+            await CMAnalysisOrchestrator().run(recorded_video_id, 'CMDetection')
+        else:
+            # 録画本体がUnchangedでも、外部ツールがchapterを追加・更新・削除している可能性がある。
+            await CMAnalysisOrchestrator().syncIfChapterChanged(recorded_video_id)
 
 
     @staticmethod
@@ -989,7 +1119,7 @@ class RecordedScanTask:
         recorded_program: schemas.RecordedProgram,
         existing_db_recorded_video: RecordedVideo | None,
         content_state: ContentState,
-    ) -> None:
+    ) -> int:
         """
         録画ファイルのメタデータ解析結果を DB に保存する
         既存レコードがある場合は更新し、ない場合は新規作成する
@@ -1000,6 +1130,9 @@ class RecordedScanTask:
             recorded_program (schemas.RecordedProgram): 保存する録画番組情報
             existing_db_recorded_video (RecordedVideo | None): 既に DB に永続化されている録画ファイルの RecordedVideo レコード
             content_state: DB保存時点で確定したファイル内容状態。
+
+        Returns:
+            int: DB 保存後に確定した RecordedVideo の ID。
         """
 
         # トランザクション配下に入れることでパフォーマンスが向上する
@@ -1147,38 +1280,52 @@ class RecordedScanTask:
                 db_recorded_video.playback_indexed_at = None
                 db_recorded_video.playback_index_error_code = None
                 db_recorded_video.video_stream_timeline = None
-                # ファイル内容に依存する再生キャッシュ、CM、サムネイルだけを新しい内容用に無効化する。
+                # 再解析中も前回のCM公開結果は維持し、入力変更の判定と結果の差し替えは
+                # CMAnalysisOrchestratorへ委ねる。再生キャッシュとサムネイルだけをここで無効化する。
                 db_recorded_video.key_frames = []
                 db_recorded_video.segment_map = []
                 db_recorded_video.ts_source_base_dts = None
-                db_recorded_video.cm_sections = None
                 db_recorded_video.thumbnail_info = None
             await db_recorded_video.save()
 
+            return db_recorded_video.id
 
-    async def __runThumbnailGeneration(self, recorded_program: schemas.RecordedProgram) -> None:
+
+    async def __runThumbnailGeneration(
+        self,
+        recorded_program: schemas.RecordedProgram,
+        recorded_video_id: int,
+    ) -> None:
         """
         録画完了後のサムネイルをバックグラウンド生成する。
 
         Args:
             recorded_program (schemas.RecordedProgram): 解析対象の録画番組情報
+            recorded_video_id (int): DB 保存後に確定した RecordedVideo の ID
         """
 
         # 録画ファイルのパスを anyio.Path に変換
         file_path = anyio.Path(recorded_program.recorded_video.file_path)
 
         try:
-            logging.info(f'{file_path}: Starting background analysis task...')
-            # ProcessLimiter で稼働中のバックグラウンドタスクの同時実行数を CPU コア数の 50% に制限
-            async with ProcessLimiter.getSemaphore('RecordedScanTask'):
-                # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
-                async with DriveIOLimiter.getSemaphore(file_path):
-                    if recorded_program.recorded_video.has_video is False:
-                        logging.info(f'{file_path}: Skipping thumbnail generation for audio-only recording.')
-                        return
-                    # シークバー用サムネイルとリスト表示用の代表サムネイルの両方を生成する。
-                    await ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave()
-            logging.info(f'{file_path}: Background analysis task completed.')
+            async with AnalysisTaskTracker.track(
+                'ThumbnailGeneration',
+                recorded_video_id=recorded_video_id,
+                title=recorded_program.title,
+            ) as history:
+                logging.info(f'{file_path}: Starting background analysis task...')
+                await history.setStage('Generating')
+                # ProcessLimiter で稼働中のバックグラウンドタスクの同時実行数を CPU コア数の 50% に制限
+                async with ProcessLimiter.getSemaphore('RecordedScanTask'):
+                    # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
+                    async with DriveIOLimiter.getSemaphore(file_path):
+                        if recorded_program.recorded_video.has_video is False:
+                            logging.info(f'{file_path}: Skipping thumbnail generation for audio-only recording.')
+                            await history.finish('Skipped', error_code='AudioOnly')
+                            return
+                        # シークバー用サムネイルとリスト表示用の代表サムネイルの両方を生成する。
+                        await ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave()
+                logging.info(f'{file_path}: Background analysis task completed.')
 
         except Exception as ex:
             logging.error(f'{file_path}: Error in background analysis task:', exc_info=ex)
@@ -1302,7 +1449,11 @@ class RecordedScanTask:
 
         try:
             # watchfiles によるファイル監視
-            async for changes in awatch(*watch_paths, recursive=True):
+            async for changes in awatch(
+                *watch_paths,
+                recursive=True,
+                watch_filter=self.buildRecordedFolderWatchFilter(),
+            ):
                 if not self._is_running:
                     break
 
@@ -1312,6 +1463,9 @@ class RecordedScanTask:
                         break
 
                     file_path = anyio.Path(file_path_str)
+                    # chapter判定や録画拡張子判定より先に、CM解析workspaceの全イベントを除外する。
+                    if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(file_path_str)):
+                        continue
                     # Mac の metadata ファイルをスキップ
                     if file_path.name.startswith('._'):
                         continue
@@ -1327,6 +1481,8 @@ class RecordedScanTask:
                         continue
                     # シンボリックリンクを含むパスは実体に解決して処理する
                     canonical_path = await self.resolveRecordedPath(file_path)
+                    if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(canonical_path))):
+                        continue
                     # 除外パターンのチェック（シンボリックリンク解決後）
                     # 空文字列は全パスにマッチしてしまうため除外する
                     canonical_path_str = str(canonical_path)
@@ -1334,6 +1490,14 @@ class RecordedScanTask:
                     if any(canonical_path_for_match.startswith(pattern) for pattern in exclude_scan_paths) is True:
                         continue
                     if await canonical_path.is_dir():
+                        continue
+                    # chapterイベントは通常の録画拡張子フィルターより先に元録画へ関連付ける。
+                    # 削除イベントでは実体が存在しないため、イベント種別を問わずファイル名から逆引きする。
+                    if canonical_path.name.lower().endswith('.chapter.txt'):
+                        try:
+                            await self.__handleChapterFileChange(canonical_path)
+                        except Exception as ex:
+                            logging.error(f'{file_path}: Error handling chapter file change:', exc_info=ex)
                         continue
                     # 対象拡張子のファイル以外は無視
                     if canonical_path.suffix.lower() not in self.SCAN_TARGET_EXTENSIONS:
@@ -1360,6 +1524,63 @@ class RecordedScanTask:
             except asyncio.CancelledError:
                 pass
             logging.info('File system watch of recording folders has been stopped.')
+
+
+    async def __handleChapterFileChange(self, chapter_file_path: anyio.Path) -> None:
+        """追加・更新・削除されたchapterを対応する録画へ同期する。
+
+        Args:
+            chapter_file_path: watchfilesが通知したchapterファイルパス。
+
+        Returns:
+            None
+        """
+
+        candidate_paths = GetRecordedPathFromCMChapterPath(
+            pathlib.Path(str(chapter_file_path)),
+            set(self.SCAN_TARGET_EXTENSIONS),
+        )
+        if len(candidate_paths) == 0:
+            return
+
+        # canonical候補とlegacy候補をすべてDBと照合してから、canonical優先・legacy一意制約で決定する。
+        # QuerySet.first()へ任せると、同一stemの別拡張子録画へlegacy chapterを誤同期する可能性がある。
+        chapter_path = pathlib.Path(str(chapter_file_path))
+        base_name = chapter_path.name[:-len('.chapter.txt')]
+        recorded_videos = await RecordedVideo.filter(
+            file_path__istartswith=str(chapter_path.with_name(base_name)),
+        ).all()
+        candidate_to_recorded_video = {
+            pathlib.Path(recorded_video.file_path): recorded_video
+            for recorded_video in recorded_videos
+        }
+
+        # 元録画がシンボリックリンクの場合もあるため、保存パスで見つからない候補だけ実体へ解決する。
+        for candidate in candidate_paths:
+            if candidate in candidate_to_recorded_video:
+                continue
+            try:
+                resolved_candidate = await asyncio.to_thread(candidate.resolve)
+            except (OSError, RuntimeError):
+                continue
+            recorded_video = await RecordedVideo.get_or_none(file_path=str(resolved_candidate))
+            if recorded_video is not None:
+                candidate_to_recorded_video[candidate] = recorded_video
+
+        selection = SelectRecordedPathForCMChapter(
+            pathlib.Path(str(chapter_file_path)),
+            candidate_to_recorded_video.keys(),
+            set(self.SCAN_TARGET_EXTENSIONS),
+        )
+        if selection is None:
+            logging.debug(
+                f'{chapter_file_path}: Corresponding recorded video was not found or was ambiguous. '
+                'Skipping chapter sync.'
+            )
+            return
+        recorded_video = candidate_to_recorded_video[selection.recorded_file_path]
+        # 追加・変更・削除の区別と公開結果の更新は、chapter内容と保存済みfingerprintを知るOrchestratorへ委ねる。
+        await CMAnalysisOrchestrator().run(recorded_video.id, 'CMChapterSync')
 
 
     async def __handleFileChange(self, file_path: anyio.Path, original_file_path: anyio.Path | None = None) -> None:

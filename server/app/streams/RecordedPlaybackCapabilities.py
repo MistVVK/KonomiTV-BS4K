@@ -68,6 +68,8 @@ class RecordedPlaybackBackend:
         'QSVEncC': '0x8086',
         'VCEEncC': '0x1002',
     }
+    _AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/opt/amdgpu/lib/x86_64-linux-gnu/dri')
+    _AMD_MESA_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/usr/lib/x86_64-linux-gnu/dri')
 
     @staticmethod
     def getCodecSpec(
@@ -193,17 +195,30 @@ class RecordedPlaybackBackend:
         """
 
         environment = os.environ.copy()
-        if encoder == 'QSVEncC':
-            # iHD driverは同梱libva 2.23 ABIでビルドされているため、Ubuntu 22.04の
-            # system libva 1.22と混在させず、QSV用FFmpeg 8プロセス内だけで一式を固定する。
+        if encoder in ('QSVEncC', 'VCEEncC'):
+            # VAAPI driver と loader の ABI を Ubuntu 22.04 の system libva に依存させない。
+            # vendor-neutral な同梱 libva 2.23 を共用し、driver だけを GPU ごとに切り替える。
             library_path = Path(LIBRARY_PATH['FFmpeg8']).parent.parent / 'Library'
             current_library_path = environment.get('LD_LIBRARY_PATH')
             environment['LD_LIBRARY_PATH'] = (
                 f'{library_path}:{current_library_path}' if current_library_path else str(library_path)
             )
-            environment['LIBVA_DRIVER_NAME'] = 'iHD'
-            environment['LIBVA_DRIVERS_PATH'] = str(library_path / 'dri')
+            if encoder == 'QSVEncC':
+                environment['LIBVA_DRIVER_NAME'] = 'iHD'
+                environment['LIBVA_DRIVERS_PATH'] = str(library_path / 'dri')
+            else:
+                environment['LIBVA_DRIVER_NAME'] = 'radeonsi'
+                environment['LIBVA_DRIVERS_PATH'] = str(RecordedPlaybackBackend.getAMDVAAPIDriverDirectory())
         return environment
+
+    @classmethod
+    def getAMDVAAPIDriverDirectory(cls) -> Path:
+        """AMD proprietary 有効時はその driver、無効時は Mesa を返す。"""
+
+        proprietary_driver = cls._AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY / 'radeonsi_drv_video.so'
+        if proprietary_driver.is_file():
+            return cls._AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY
+        return cls._AMD_MESA_VAAPI_DRIVER_DIRECTORY
 
     @classmethod
     def discoverRenderDevices(cls, encoder: RecordedPlaybackEncoder) -> list[str]:

@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import os
 import tarfile
 import urllib.request
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 
@@ -38,12 +40,24 @@ def loadManifest() -> dict[str, str]:
     return manifest
 
 
+@cache
 def download(url: str) -> bytes:
     """URL からライセンスまたは固定 archive を取得する。"""
 
+    cache_root_text = os.environ.get('KONOMITV_THIRDPARTY_LICENSE_CACHE')
+    cache_path = None
+    if cache_root_text is not None:
+        cache_root = Path(cache_root_text)
+        cache_path = cache_root / hashlib.sha256(url.encode('utf-8')).hexdigest()
+        if cache_path.is_file():
+            return cache_path.read_bytes()
     request = urllib.request.Request(url, headers={'User-Agent': 'KonomiTV-thirdparty-license-generator'})
     with urllib.request.urlopen(request) as response:
-        return response.read()
+        content = response.read()
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(content)
+    return content
 
 
 def decodeLicense(content: bytes) -> str:
@@ -85,7 +99,7 @@ def extractTarLicense(url: str, sha256: str, member_name: str) -> str:
     archive = download(url)
     if hashlib.sha256(archive).hexdigest() != sha256:
         raise ValueError(f'Checksum mismatch: {url}')
-    with tarfile.open(fileobj=io.BytesIO(archive), mode='r:gz') as tar:
+    with tarfile.open(fileobj=io.BytesIO(archive), mode='r:*') as tar:
         member = tar.extractfile(member_name)
         if member is None:
             raise ValueError(f'License not found in archive: {member_name}')
@@ -111,6 +125,7 @@ def main() -> None:
         )),
         LicenseSource('FFmpeg', manifest['FFMPEG8_VERSION'], manifest['FFMPEG8_REPOSITORY'], manifest['FFMPEG8_COMMIT'], (
             ('LICENSE.md', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/LICENSE.md', manifest['FFMPEG8_LICENSE_SHA256']),
+            ('GNU LGPL version 2.1', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.LGPLv2.1', manifest['FFMPEG8_LGPLV21_SHA256']),
             ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.GPLv3', manifest['FFMPEG_GPLV3_SHA256']),
         )),
         LicenseSource('AMD Advanced Media Framework headers', manifest['AMF_VERSION'], manifest['AMF_REPOSITORY'], manifest['AMF_COMMIT'], (
@@ -136,6 +151,21 @@ def main() -> None:
         )),
         LicenseSource('Poetry', manifest['POETRY_VERSION'], 'https://github.com/python-poetry/poetry', '19a2f7bddb9bdf931a229ea0913a84021f3f9b93', (
             ('LICENSE', f'{github_raw}/python-poetry/poetry/19a2f7bddb9bdf931a229ea0913a84021f3f9b93/LICENSE', manifest['POETRY_LICENSE_SHA256']),
+        )),
+        LicenseSource('AviSynth+', manifest['AVISYNTHPLUS_TAG'], manifest['AVISYNTHPLUS_REPOSITORY'], manifest['AVISYNTHPLUS_COMMIT'], (
+            ('GNU GPL version 2', f'{github_raw}/AviSynth/AviSynthPlus/{manifest["AVISYNTHPLUS_COMMIT"]}/distrib/gpl.txt', manifest['AVISYNTHPLUS_LICENSE_SHA256']),
+        )),
+        LicenseSource('FFmpegSource2', manifest['FFMS2_VERSION'], manifest['FFMS2_REPOSITORY'], manifest['FFMS2_COMMIT'], (
+            ('COPYING', f'{github_raw}/FFMS/ffms2/{manifest["FFMS2_COMMIT"]}/COPYING', manifest['FFMS2_LICENSE_SHA256']),
+        )),
+        LicenseSource('chapter_exe', manifest['CHAPTER_EXE_COMMIT'][:12], manifest['CHAPTER_EXE_REPOSITORY'], manifest['CHAPTER_EXE_COMMIT'], (
+            ('LICENSE', f'{github_raw}/rigaya/chapter_exe/{manifest["CHAPTER_EXE_COMMIT"]}/LICENSE', manifest['CHAPTER_EXE_LICENSE_SHA256']),
+        )),
+        LicenseSource('logoframe', manifest['LOGOFRAME_VERSION'], manifest['LOGOFRAME_REPOSITORY'], manifest['LOGOFRAME_COMMIT'], (
+            ('LICENSE', f'{github_raw}/tobitti0/logoframe/{manifest["LOGOFRAME_COMMIT"]}/LICENSE', manifest['LOGOFRAME_LICENSE_SHA256']),
+        )),
+        LicenseSource('join_logo_scp', manifest['JOIN_LOGO_SCP_COMMIT'][:12], manifest['JOIN_LOGO_SCP_REPOSITORY'], manifest['JOIN_LOGO_SCP_COMMIT'], (
+            ('LICENSE', f'{github_raw}/tobitti0/join_logo_scp/{manifest["JOIN_LOGO_SCP_COMMIT"]}/LICENSE', manifest['JOIN_LOGO_SCP_LICENSE_SHA256']),
         )),
         LicenseSource('Intel gmmlib', manifest['INTEL_GMMLIB_VERSION'], 'https://github.com/intel/gmmlib', manifest['INTEL_GMMLIB_COMMIT'], (
             ('LICENSE.md', f'{github_raw}/intel/gmmlib/{manifest["INTEL_GMMLIB_COMMIT"]}/LICENSE.md', manifest['INTEL_GMMLIB_LICENSE_SHA256']),
@@ -198,6 +228,47 @@ def main() -> None:
             license_text = readVerifiedLicense(location, sha256)
             document.extend([f'### {label}', '', '```text', license_text, '```', ''])
 
+    document.extend([
+        '## CM analysis runtime corresponding source and local modifications', '',
+        '- This runtime does not include Amatsukaze itself.',
+        f'- FFmpeg source: {manifest["FFMPEG8_REPOSITORY"]} (`{manifest["FFMPEG8_COMMIT"]}`; LGPL-only build)',
+        f'- AviSynth+ source: {manifest["AVISYNTHPLUS_REPOSITORY"]} (`{manifest["AVISYNTHPLUS_COMMIT"]}`)',
+        f'- FFmpegSource2 source: {manifest["FFMS2_REPOSITORY"]} (`{manifest["FFMS2_COMMIT"]}`; AviSynth-only build)',
+        f'- chapter_exe source: {manifest["CHAPTER_EXE_REPOSITORY"]} (`{manifest["CHAPTER_EXE_COMMIT"]}`)',
+        f'- logoframe source: {manifest["LOGOFRAME_REPOSITORY"]} (`{manifest["LOGOFRAME_COMMIT"]}`)',
+        f'- join_logo_scp source: {manifest["JOIN_LOGO_SCP_REPOSITORY"]} (`{manifest["JOIN_LOGO_SCP_COMMIT"]}`)',
+        '- Reproducible build procedure: `docker/thirdparty/build-cm-analysis.sh`',
+        '- Local patches:',
+        f'  - `chapter-exe-initialize-avisynth.patch` (`{manifest["CHAPTER_EXE_AVISYNTH_INIT_PATCH_SHA256"]}`)',
+        f'  - `ffms2-hardware-decoding.patch` (`{manifest["FFMS2_HARDWARE_DECODING_PATCH_SHA256"]}`)',
+        f'  - `logoframe-error-lifetime.patch` (`{manifest["LOGOFRAME_ERROR_LIFETIME_PATCH_SHA256"]}`)',
+        f'  - `logoframe-parallel-scan.patch` (`{manifest["LOGOFRAME_PARALLEL_SCAN_PATCH_SHA256"]}`)',
+        f'  - `logoframe-native-luma.patch` (`{manifest["LOGOFRAME_NATIVE_LUMA_PATCH_SHA256"]}`)',
+        f'  - `logoframe-high-bit-rgb-fallback.patch` (`{manifest["LOGOFRAME_HIGH_BIT_RGB_FALLBACK_PATCH_SHA256"]}`)',
+        '',
+        'The fixed upstream revisions, complete local patches, dependency revisions, and build commands above are the corresponding source recipe for the redistributed native artifacts.',
+        '',
+        '## FFmpeg 8 and AMF corresponding source and local modifications', '',
+        f'- FFmpeg source: {manifest["FFMPEG8_REPOSITORY"]}',
+        f'- FFmpeg fixed commit: `{manifest["FFMPEG8_COMMIT"]}`',
+        f'- AMF source: {manifest["AMF_REPOSITORY"]}',
+        f'- AMF fixed commit: `{manifest["AMF_COMMIT"]}`',
+        '- Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`',
+        '- Local patches:',
+        f'  - `amf-1.4.36-display-capture-c.patch` (`{manifest["AMF_DISPLAY_CAPTURE_C_PATCH_SHA256"]}`)',
+        '',
+        '## Intel media stack corresponding source and local modifications', '',
+        f'- libva source: https://github.com/intel/libva (`{manifest["INTEL_LIBVA_COMMIT"]}`)',
+        f'- Intel Media Driver source: https://github.com/intel/media-driver (`{manifest["INTEL_MEDIA_DRIVER_COMMIT"]}`)',
+        f'- oneVPL GPU Runtime source: https://github.com/intel/vpl-gpu-rt (`{manifest["INTEL_ONEVPL_GPU_COMMIT"]}`)',
+        '- Reproducible build procedure: `docker/thirdparty/build-intel-media-stack.sh`',
+        '- Local patches:',
+        f'  - `intel-libva-standalone.patch` (`{manifest["INTEL_LIBVA_STANDALONE_PATCH_SHA256"]}`)',
+        f'  - `intel-media-driver-vpp-deinterlace-crash-fix.patch` (`{manifest["INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256"]}`)',
+        f'  - `intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch` (`{manifest["INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256"]}`)',
+        '',
+    ])
+
     nvcodec_license_url = (
         f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
         '/include/ffnvcodec/nvEncodeAPI.h'
@@ -205,11 +276,44 @@ def main() -> None:
     nvcodec_license = readVerifiedHeaderLicense(
         nvcodec_license_url, manifest['NVCODEC_HEADERS_LICENSE_SHA256'],
     )
+    nvcodec_cuvid_headers = (
+        ('dynlink_cuviddec.h', manifest['NVCODEC_HEADERS_CUVIDDEC_SHA256']),
+        ('dynlink_nvcuvid.h', manifest['NVCODEC_HEADERS_NVCUVID_SHA256']),
+    )
+    for header_name, header_sha256 in nvcodec_cuvid_headers:
+        header_url = (
+            f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
+            f'/include/ffnvcodec/{header_name}'
+        )
+        if readVerifiedHeaderLicense(header_url, header_sha256) != nvcodec_license:
+            raise ValueError(
+                f'{header_name} has a distinct license notice; register it in THIRD_PARTY_LICENSES.md.',
+            )
+    nvcodec_cuda_license_url = (
+        f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
+        '/include/ffnvcodec/dynlink_cuda.h'
+    )
+    nvcodec_cuda_license = readVerifiedHeaderLicense(
+        nvcodec_cuda_license_url, manifest['NVCODEC_HEADERS_CUDA_SHA256'],
+    )
+    nvcodec_loader_license_url = (
+        f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
+        '/include/ffnvcodec/dynlink_loader.h'
+    )
+    nvcodec_loader_license = readVerifiedHeaderLicense(
+        nvcodec_loader_license_url, manifest['NVCODEC_HEADERS_LOADER_SHA256'],
+    )
+    if nvcodec_loader_license != nvcodec_cuda_license:
+        raise ValueError('dynlink_loader.h has an unregistered distinct license notice.')
+    if nvcodec_cuda_license == nvcodec_license:
+        raise ValueError('Expected the audited CUDA/loader notice to be distinct from nvEncodeAPI.h.')
     document.extend([
         f'## NVIDIA codec API headers {manifest["NVCODEC_HEADERS_VERSION"]}', '',
         f'- Source: {manifest["NVCODEC_HEADERS_REPOSITORY"]}',
         f'- Fixed revision or artifact: `{manifest["NVCODEC_HEADERS_COMMIT"]}`', '',
         '### nvEncodeAPI.h license notice', '', '```text', nvcodec_license, '```', '',
+        '### dynlink_cuda.h / dynlink_loader.h license notice', '',
+        '```text', nvcodec_cuda_license, '```', '',
     ])
 
     archive_licenses = (

@@ -85,6 +85,11 @@ const router = createRouter({
             component: () => import('@/views/MyPage.vue'),
         },
         {
+            path: '/analysis-history/',
+            name: 'Analysis History',
+            component: () => import('@/views/AnalysisHistory.vue'),
+        },
+        {
             path: '/settings/',
             name: 'Settings Index',
             component: () => import('@/views/Settings/Index.vue'),
@@ -112,6 +117,16 @@ const router = createRouter({
             path: '/settings/caption',
             name: 'Settings Caption',
             component: () => import('@/views/Settings/Caption.vue'),
+        },
+        {
+            path: '/settings/cm-analysis',
+            name: 'Settings CM Analysis',
+            component: () => import('@/views/Settings/CMAnalysis.vue'),
+        },
+        {
+            path: '/settings/cm-analysis/logos',
+            name: 'Settings CM Logo Management',
+            component: () => import('@/views/Settings/CMLogoManagement.vue'),
         },
         {
             path: '/settings/data-broadcasting',

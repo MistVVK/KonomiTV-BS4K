@@ -62,6 +62,46 @@ def test_recorded_playback_qsv_uses_bundled_libva() -> None:
     assert environment['LD_LIBRARY_PATH'].split(':')[0].endswith('/Library')
 
 
+def test_recorded_playback_amd_prefers_proprietary_vaapi_driver(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AMD runtime がある構成では /opt 側の radeonsi を選ぶ。"""
+
+    proprietary = tmp_path / 'proprietary-dri'
+    mesa = tmp_path / 'mesa-dri'
+    proprietary.mkdir()
+    mesa.mkdir()
+    (proprietary / 'radeonsi_drv_video.so').write_bytes(b'driver')
+    monkeypatch.setattr(RecordedPlaybackBackend, '_AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY', proprietary)
+    monkeypatch.setattr(RecordedPlaybackBackend, '_AMD_MESA_VAAPI_DRIVER_DIRECTORY', mesa)
+
+    environment = RecordedPlaybackBackend.getEnvironment('VCEEncC')
+    assert environment['LIBVA_DRIVER_NAME'] == 'radeonsi'
+    assert environment['LIBVA_DRIVERS_PATH'] == str(proprietary)
+    assert environment['LD_LIBRARY_PATH'].split(':')[0].endswith('/Library')
+
+
+def test_recorded_playback_amd_uses_mesa_without_proprietary_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """INSTALL_AMD=false 構成では Mesa radeonsi を選ぶ。"""
+
+    proprietary = tmp_path / 'proprietary-dri'
+    mesa = tmp_path / 'mesa-dri'
+    proprietary.mkdir()
+    mesa.mkdir()
+    (mesa / 'radeonsi_drv_video.so').write_bytes(b'driver')
+    monkeypatch.setattr(RecordedPlaybackBackend, '_AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY', proprietary)
+    monkeypatch.setattr(RecordedPlaybackBackend, '_AMD_MESA_VAAPI_DRIVER_DIRECTORY', mesa)
+
+    environment = RecordedPlaybackBackend.getEnvironment('VCEEncC')
+    assert environment['LIBVA_DRIVER_NAME'] == 'radeonsi'
+    assert environment['LIBVA_DRIVERS_PATH'] == str(mesa)
+    assert environment['LD_LIBRARY_PATH'].split(':')[0].endswith('/Library')
+
+
 def test_recorded_playback_amd_probe_uses_vaapi_download() -> None:
     """AMF能力検査が実再生と同じVAAPIからsystem memoryへの境界を通ることを確認する。"""
 

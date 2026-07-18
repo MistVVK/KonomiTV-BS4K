@@ -105,6 +105,14 @@ export interface IRecordedVideo {
     audio_track_timeline: IAudioTrackTimelineEntry[];
     subtitle_tracks: ISubtitleTrack[];
     cm_sections: { start_time: number; end_time: number; }[] | null;
+    cm_analysis_status: 'Pending' | 'Analyzing' | 'Completed' | 'Failed' | 'Unsupported' | 'Excluded' | 'Interrupted' | null;
+    cm_analysis_error_code: string | null;
+    cm_analysis_finished_at: string | null;
+    cm_result_source: 'Existing' | 'Generated' | 'LegacyImported' | null;
+    cm_result_verified: boolean | null;
+    cm_result_chapter_path_kind: 'Canonical' | 'Legacy' | null;
+    cm_result_pipeline_version: string | null;
+    cm_result_published_at: string | null;
     thumbnail_info: IThumbnailInfo | null;
     created_at: string;
     updated_at: string;
@@ -179,6 +187,14 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     audio_track_timeline: [],
     subtitle_tracks: [],
     cm_sections: null,
+    cm_analysis_status: null,
+    cm_analysis_error_code: null,
+    cm_analysis_finished_at: null,
+    cm_result_source: null,
+    cm_result_verified: null,
+    cm_result_chapter_path_kind: null,
+    cm_result_pipeline_version: null,
+    cm_result_published_at: null,
     thumbnail_info: null,
     created_at: '2000-01-01T00:00:00+09:00',
     updated_at: '2000-01-01T00:00:00+09:00',
@@ -575,10 +591,14 @@ class Videos {
      */
     static async detectCMSections(video_id: number): Promise<boolean> {
 
-        const response = await APIClient.post(`/videos/${video_id}/detect-cm-sections`, undefined, {
-            // join_logo_scp による判定は長時間かかる可能性がある
-            timeout: 60 * 60 * 1000,
-        });
+        const response = await APIClient.post(
+            `/videos/${video_id}/detect-cm-sections?replace_existing_chapter=true`,
+            undefined,
+            {
+                // join_logo_scp による判定は長時間かかる可能性がある
+                timeout: 60 * 60 * 1000,
+            },
+        );
 
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'CM 区間の判定に失敗しました。');

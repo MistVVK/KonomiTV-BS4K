@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         libx264-dev libx265-dev libxcb-dri3-dev libxcb-present-dev libxcursor-dev libxext-dev libxfixes-dev \
         libxml2-dev libxvidcore-dev libzimg-dev libzmq3-dev libzvbi-dev ocl-icd-opencl-dev \
         libxi-dev libxinerama-dev libxrandr-dev libxrender-dev meson nasm ninja-build patch patchelf perl \
-        pkg-config python3 tar xz-utils yasm zlib1g-dev && \
+        libssl-dev libxxhash-dev pkg-config python3 tar xz-utils yasm zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
 COPY ./docker/thirdparty/manifest.env \
@@ -54,7 +54,11 @@ COPY ./docker/thirdparty/manifest.env \
      ./docker/thirdparty/build-intel-media-stack.sh \
      ./docker/thirdparty/collect-license-manifest.py \
      /build/docker/thirdparty/
-COPY ./docker/thirdparty/patches/ /build/docker/thirdparty/patches/
+COPY ./docker/thirdparty/patches/amf-1.4.36-display-capture-c.patch \
+     ./docker/thirdparty/patches/intel-libva-standalone.patch \
+     ./docker/thirdparty/patches/intel-media-driver-vpp-deinterlace-crash-fix.patch \
+     ./docker/thirdparty/patches/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch \
+     /build/docker/thirdparty/patches/
 COPY ./thirdparty-src/tsreadex/ /build/thirdparty-src/tsreadex/
 
 RUN --mount=type=cache,id=konomitv-thirdparty-downloads,target=/build/downloads \
@@ -65,6 +69,21 @@ RUN --mount=type=cache,id=konomitv-thirdparty-downloads,target=/build/downloads 
     ccache --max-size=20G && \
     ccache --zero-stats && \
     /build/docker/thirdparty/build.sh && \
+    ccache --show-stats
+
+# CM 解析ランタイムは再生用 FFmpeg と分離し、Amatsukaze 本体を含めず固定構築する。
+COPY ./docker/thirdparty/build-cm-analysis.sh /build/docker/thirdparty/build-cm-analysis.sh
+COPY ./docker/thirdparty/patches/ffms2-hardware-decoding.patch \
+     ./docker/thirdparty/patches/chapter-exe-initialize-avisynth.patch \
+     ./docker/thirdparty/patches/logoframe-error-lifetime.patch \
+     ./docker/thirdparty/patches/logoframe-parallel-scan.patch \
+     ./docker/thirdparty/patches/logoframe-native-luma.patch \
+     ./docker/thirdparty/patches/logoframe-high-bit-rgb-fallback.patch \
+     /build/docker/thirdparty/patches/
+RUN --mount=type=cache,id=konomitv-thirdparty-downloads,target=/build/downloads \
+    --mount=type=cache,id=konomitv-thirdparty-ccache,target=/root/.cache/ccache \
+    chmod +x /build/docker/thirdparty/build-cm-analysis.sh && \
+    /build/docker/thirdparty/build-cm-analysis.sh && \
     python3 /build/docker/thirdparty/collect-license-manifest.py \
         --stage 'third-party builder (CUDA and static artifacts)' \
         --dpkg --dpkg-prefix cuda- --dpkg-exclude cuda-keyring \
@@ -72,8 +91,7 @@ RUN --mount=type=cache,id=konomitv-thirdparty-downloads,target=/build/downloads 
         --root /opt/thirdparty \
         --root /build/sources/intel-media-stack \
         --go-module-cache /root/go/pkg/mod \
-        --output /tmp/BUILDER_THIRD_PARTY_LICENSES.md && \
-    ccache --show-stats
+        --output /tmp/BUILDER_THIRD_PARTY_LICENSES.md
 
 COPY ./docker/thirdparty/generate-license-document.py \
      ./docker/thirdparty/license-manifest.env \
@@ -82,7 +100,9 @@ COPY ./THIRD_PARTY_LICENSES.md /build/THIRD_PARTY_LICENSES.md
 RUN python3 /build/docker/thirdparty/generate-license-document.py --output /tmp/THIRD_PARTY_LICENSES.md && \
     cmp /build/THIRD_PARTY_LICENSES.md /tmp/THIRD_PARTY_LICENSES.md
 
-COPY ./docker/thirdparty/verify.sh /build/docker/thirdparty/verify.sh
+COPY ./docker/thirdparty/verify.sh \
+     ./docker/thirdparty/generate-cm-smoke-fixture.py \
+     /build/docker/thirdparty/
 RUN chmod +x /build/docker/thirdparty/verify.sh && \
     /build/docker/thirdparty/verify.sh /opt/thirdparty
 
@@ -142,9 +162,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         libaom3 libass9 libbluray2 libgnutls30 libgsm1 libmp3lame0 \
         libmysofa1 libopenjp2-7 libopenmpt0 libopus0 librabbitmq4 \
         librubberband2 libshine3 libsnappy1v5 libsoxr0 libspeex1 libsrt1.4-openssl libssh-4 libssl3 \
-        libtheora0 libtwolame0 libva-drm2 libvdpau1 libvidstab1.1 libvorbis0a libvorbisenc2 \
+        libtheora0 libtwolame0 libva-drm2 libva-x11-2 libvdpau1 libvidstab1.1 libvorbis0a libvorbisenc2 \
         libvpl2 libvpx7 libwebp7 libwebpmux3 libx11-xcb1 libx264-163 libx265-199 libxml2 libxvidcore4 \
-        libzimg2 libzmq5 libzvbi0 ocl-icd-libopencl1 && \
+        libzimg2 libzmq5 libzvbi0 libxxhash0 ocl-icd-libopencl1 && \
     if [ "${INSTALL_AMD}" = 'true' ]; then \
         nala install -y --no-install-recommends \
             amf-amdgpu-pro libamdenc-amdgpu-pro libdrm2-amdgpu mesa-amdgpu-va-drivers \
@@ -155,10 +175,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
             exit 1; \
         fi; \
     else \
-        if dpkg-query --show --showformat='${Status}' mesa-amdgpu-va-drivers 2>/dev/null | grep -F 'install ok installed'; then \
-            echo 'AMD VAAPI driver must not be installed when INSTALL_AMD=false.' >&2; \
+        nala install -y --no-install-recommends mesa-va-drivers; \
+        if dpkg-query --show --showformat='${binary:Package}\n' 2>/dev/null | \
+                grep -Eq '^(amf-amdgpu-pro|libamdenc-amdgpu-pro|libdrm2-amdgpu|mesa-amdgpu-va-drivers|rocm-opencl-runtime|vulkan-amdgpu-pro)(:amd64)?$'; then \
+            echo 'AMD proprietary runtime package must not be installed when INSTALL_AMD=false.' >&2; \
             exit 1; \
         fi; \
+        test ! -e /opt/amdgpu; \
+        test ! -e /opt/rocm; \
+        test ! -e /etc/apt/sources.list.d/amdgpu.list; \
+        test ! -e /etc/apt/sources.list.d/amdgpu-proprietary.list; \
+        test ! -e /etc/apt/sources.list.d/rocm.list; \
+        if grep -RqsF 'repo.radeon.com' /etc/apt/sources.list /etc/apt/sources.list.d; then \
+            echo 'AMD repository must not be configured when INSTALL_AMD=false.' >&2; \
+            exit 1; \
+        fi; \
+        test -e /usr/lib/x86_64-linux-gnu/dri/radeonsi_drv_video.so; \
     fi && \
     nala autoremove -y && apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/*
@@ -204,7 +236,15 @@ RUN curl -fsSL https://fastly.linuxmint.io/pool/main/l/linuxmint-keyring/linuxmi
 
 WORKDIR /code/server/
 COPY --from=thirdparty-builder /opt/thirdparty/ /code/server/thirdparty/
-RUN bash -n /code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh && \
+RUN test ! -e /code/server/thirdparty/Amatsukaze && \
+    test -x /code/server/thirdparty/CMAnalysis/chapter_exe && \
+    test -x /code/server/thirdparty/CMAnalysis/ffmsindex && \
+    test -x /code/server/thirdparty/CMAnalysis/logoframe && \
+    test -x /code/server/thirdparty/CMAnalysis/join_logo_scp && \
+    test -s /code/server/thirdparty/CMAnalysis/libffms2.so.3 && \
+    python3 -m json.tool /code/server/thirdparty/CMAnalysis/Runtime-Manifest.json > /dev/null && \
+    grep -Fx 'CONFIG_GPL=0' /code/server/thirdparty/CMAnalysis/FFmpeg-Build-Configuration.txt && \
+    bash -n /code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh && \
     ffmpeg8_version="$(/code/server/thirdparty/FFmpeg8/ffmpeg8.elf -version | sed -n '1p')" && \
     ffmpeg8_amd_version="$(/code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh -version | sed -n '1p')" && \
     test "${ffmpeg8_amd_version}" = "${ffmpeg8_version}" && \
@@ -243,6 +283,14 @@ RUN if [ "${INSTALL_AMD}" = 'true' ]; then amd_license_option='--include-amd-run
         --chromium-copyright /usr/share/doc/chromium/copyright \
         ${amd_license_option} \
         --output /code/THIRD_PARTY_LICENSES.md && \
+    if [ "${INSTALL_AMD}" = 'false' ]; then \
+        grep -Eq '^## mesa-va-drivers(:amd64)? ' /code/THIRD_PARTY_LICENSES.md; \
+        if grep -Eq 'AMD_RUNTIME_WARNING|amf-amdgpu-pro|libamdenc-amdgpu-pro|mesa-amdgpu-va-drivers|vulkan-amdgpu-pro' \
+                /code/THIRD_PARTY_LICENSES.md; then \
+            echo 'AMD-free license document contains proprietary runtime metadata.' >&2; \
+            exit 1; \
+        fi; \
+    fi && \
     rm /tmp/BASE_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md \
         /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
         /tmp/assemble-runtime-license-document.py /tmp/collect-license-manifest.py

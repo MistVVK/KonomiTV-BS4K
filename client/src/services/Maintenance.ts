@@ -149,9 +149,13 @@ class Maintenance {
      */
     static async detectCMSectionsForAllRecordedVideos(): Promise<boolean> {
 
-        const response = await APIClient.post('/maintenance/detect-cm-sections-for-all-recorded-videos', undefined, {
-            timeout: 24 * 60 * 60 * 1000,
-        });
+        const response = await APIClient.post(
+            '/maintenance/detect-cm-sections-for-all-recorded-videos?replace_existing_chapter=true',
+            undefined,
+            {
+                timeout: 24 * 60 * 60 * 1000,
+            },
+        );
 
         if (response.type === 'error') {
             switch (response.data.detail) {

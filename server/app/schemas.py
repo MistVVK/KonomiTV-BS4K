@@ -209,6 +209,16 @@ class RecordedVideo(PydanticModel):
     audio_tracks: list[AudioTrack] = Field(default_factory=list)
     audio_track_timeline: list[AudioTrackTimelineEntry] = Field(default_factory=list)
     subtitle_tracks: list[SubtitleTrack] = Field(default_factory=list)
+    cm_analysis_status: Literal[
+        'Pending', 'Analyzing', 'Completed', 'Failed', 'Unsupported', 'Excluded', 'Interrupted',
+    ] | None = None
+    cm_analysis_error_code: str | None = None
+    cm_analysis_finished_at: datetime | None = None
+    cm_result_source: Literal['Existing', 'Generated', 'LegacyImported'] | None = None
+    cm_result_verified: bool | None = None
+    cm_result_chapter_path_kind: Literal['Canonical', 'Legacy'] | None = None
+    cm_result_pipeline_version: str | None = None
+    cm_result_published_at: datetime | None = None
     cm_sections: list[CMSection] | None = None
     thumbnail_info: ThumbnailInfo | None = None
     created_at: datetime
@@ -264,6 +274,61 @@ class RecordedPlaybackCapability(PydanticModel):
         'UnsupportedCombination',
     ] | None
 
+# ***** バックグラウンド解析履歴 *****
+
+class AnalysisTaskExecution(BaseModel):
+    id: int
+    parent_id: int | None
+    recorded_video_id: int | None
+    task_type: Literal[
+        'RecordedScan', 'MetadataAnalysis', 'PlaybackIndex', 'ThumbnailGeneration', 'CMAnalysis',
+        'CMLogoGeneration', 'BatchScan', 'BatchMetadataReanalysis', 'BatchCMAnalysis', 'BackgroundAnalysis',
+    ]
+    status: Literal['Queued', 'Running', 'Succeeded', 'Failed', 'Interrupted', 'Skipped']
+    trigger: Literal['Automatic', 'Manual', 'Maintenance', 'StartupBackfill']
+    title: str
+    stage: str | None
+    progress: float | None
+    stage_history: list[dict[str, object]]
+    current_count: int
+    total_count: int
+    succeeded_count: int
+    failed_count: int
+    skipped_count: int
+    summary: dict[str, object] | None
+    error_code: str | None
+    error_message: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+class AnalysisTaskOverview(BaseModel):
+    active: list[AnalysisTaskExecution]
+    recent: list[AnalysisTaskExecution]
+
+class AnalysisTaskList(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: list[AnalysisTaskExecution]
+
+class AnalysisTaskLogoAttempt(BaseModel):
+    strategy: str
+    start_frame: int | None
+    start_seconds: float | None
+    frame_count: int
+    exit_code: int | None
+    match_ratio: float | None
+    failure_reason: str | None
+    created_at: datetime
+    completed_at: datetime | None
+
+class AnalysisTaskDetail(BaseModel):
+    execution: AnalysisTaskExecution
+    children: list[AnalysisTaskExecution]
+    logo_attempts: list[AnalysisTaskLogoAttempt]
+
 class VideoStreamTimelineEntry(TypedDict):
     start_time: float
     end_time: float
@@ -318,6 +383,64 @@ class ThumbnailTileInfo(TypedDict):
     column_count: int
     row_count: int
     interval_sec: float
+
+# ***** CM解析 *****
+
+class CMAnalysisSettings(BaseModel):
+    enabled: Annotated[bool, Field()]
+    logo_directory: Annotated[str | None, Field()]
+    excluded_directories: Annotated[list[str], Field()]
+
+class CMAnalysisSettingsUpdate(BaseModel):
+    enabled: Annotated[bool, Field()]
+    logo_directory: Annotated[str | None, Field()]
+    excluded_directories: Annotated[list[str], Field()]
+
+class CMAnalysisCapabilities(BaseModel):
+    automatic_logo_generation: Annotated[Literal['Unavailable'], Field()]
+
+class CMLogo(BaseModel):
+    id: Annotated[int, Field()]
+    path: Annotated[str, Field()]
+    filename: Annotated[str, Field()]
+    service_id: Annotated[int | None, Field()]
+    logo_name: Annotated[str, Field()]
+    file_format: Annotated[Literal['AviUtlV0.1', 'AmatsukazeExtendedV1'], Field()]
+    enabled: Annotated[bool, Field()]
+    file_hash: Annotated[str, Field()]
+    file_size: Annotated[int, Field()]
+    generated_from_recorded_video_id: Annotated[int | None, Field()]
+    last_used_at: Annotated[datetime | None, Field()]
+    missing: Annotated[bool, Field()]
+    deleted_at: Annotated[datetime | None, Field()]
+    created_at: Annotated[datetime, Field()]
+    updated_at: Annotated[datetime, Field()]
+
+class CMLogoUpdate(BaseModel):
+    enabled: Annotated[bool, Field()]
+
+class CMLogoServiceAssignment(BaseModel):
+    id: Annotated[int, Field()]
+    logo_id: Annotated[int | None, Field()]
+    network_id: Annotated[int, Field()]
+    transport_stream_id: Annotated[int, Field()]
+    service_id: Annotated[int, Field()]
+    enabled: Annotated[bool, Field()]
+    is_no_logo: Annotated[bool, Field()]
+    valid_from: Annotated[datetime | None, Field()]
+    valid_until: Annotated[datetime | None, Field()]
+    created_at: Annotated[datetime, Field()]
+    updated_at: Annotated[datetime, Field()]
+
+class CMLogoServiceAssignmentCreate(BaseModel):
+    logo_id: Annotated[int | None, Field()]
+    network_id: Annotated[int, Field(ge=0)]
+    transport_stream_id: Annotated[int, Field(ge=0)]
+    service_id: Annotated[int, Field(ge=0)]
+    enabled: Annotated[bool, Field()]
+    is_no_logo: Annotated[bool, Field()]
+    valid_from: Annotated[datetime | None, Field()]
+    valid_until: Annotated[datetime | None, Field()]
 
 # ***** 録画番組 *****
 

@@ -24,6 +24,21 @@ clone-commit() {
     test "$(git -C "${destination}" rev-parse HEAD)" = "${commit}"
 }
 
+verify-ffmpeg-component() {
+    local config_h="$1"
+    local component="$2"
+    local config_files=("${config_h}")
+    local components_h
+    components_h="$(dirname "${config_h}")/config_components.h"
+    if [ -f "${components_h}" ]; then
+        config_files+=("${components_h}")
+    fi
+    grep -Fqx "#define CONFIG_${component} 1" "${config_files[@]}" || {
+        echo "Missing playback FFmpeg component CONFIG_${component}." >&2
+        exit 1
+    }
+}
+
 ffmpeg_source="${SOURCE_ROOT}/ffmpeg8"
 nvcodec_source="${SOURCE_ROOT}/nv-codec-headers"
 amf_source="${SOURCE_ROOT}/amf"
@@ -31,7 +46,39 @@ amf_source="${SOURCE_ROOT}/amf"
 clone-commit "${FFMPEG8_REPOSITORY}" "${FFMPEG8_COMMIT}" "${ffmpeg_source}" "refs/tags/${FFMPEG8_TAG}"
 clone-commit "${NVCODEC_HEADERS_REPOSITORY}" "${NVCODEC_HEADERS_COMMIT}" "${nvcodec_source}" "refs/tags/${NVCODEC_HEADERS_TAG}"
 clone-commit "${AMF_REPOSITORY}" "${AMF_COMMIT}" "${amf_source}" "refs/tags/${AMF_TAG}"
+echo "${AMF_DISPLAY_CAPTURE_C_PATCH_SHA256}  ${SCRIPT_DIR}/patches/amf-1.4.36-display-capture-c.patch" | \
+    sha256sum --check --strict
 patch -d "${amf_source}" -p1 < "${SCRIPT_DIR}/patches/amf-1.4.36-display-capture-c.patch"
+
+# CUVID/NVDEC で実際に組み込む header も固定 commit の checksum で監査する。
+# 現在の 12.1.14.0 では 2 つの CUVID header の notice が nvEncodeAPI.h と同一であることも検証し、
+# CUDA/loader header のみが共通の別 notice を持つことを明示的に固定する。
+# notice が将来変更された場合にライセンス登録なしでビルドを進めない。
+echo "${NVCODEC_HEADERS_LICENSE_SHA256}  ${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h" | \
+    sha256sum --check --strict
+echo "${NVCODEC_HEADERS_CUDA_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h" | \
+    sha256sum --check --strict
+echo "${NVCODEC_HEADERS_CUVIDDEC_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_cuviddec.h" | \
+    sha256sum --check --strict
+echo "${NVCODEC_HEADERS_LOADER_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_loader.h" | \
+    sha256sum --check --strict
+echo "${NVCODEC_HEADERS_NVCUVID_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_nvcuvid.h" | \
+    sha256sum --check --strict
+cmp \
+    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
+    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuviddec.h")
+cmp \
+    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
+    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_nvcuvid.h")
+cmp \
+    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h") \
+    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_loader.h")
+if cmp -s \
+    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
+    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h"); then
+    echo 'Expected the audited CUDA/loader notice to be distinct from nvEncodeAPI.h.' >&2
+    exit 1
+fi
 
 make -C "${nvcodec_source}" PREFIX="${SDK_PREFIX}" install
 mkdir -p "${SDK_PREFIX}/include/AMF"
@@ -53,6 +100,10 @@ pushd "${ffmpeg_source}"
     --enable-version3 \
     --enable-shared \
     --disable-static \
+    --enable-muxer=wav \
+    --enable-encoder=pcm_s16le \
+    --enable-filter=aresample \
+    --enable-filter=asetpts \
     --enable-gnutls \
     --enable-libaom \
     --enable-libass \
@@ -104,6 +155,9 @@ pushd "${ffmpeg_source}"
     --enable-nvenc \
     --extra-cflags="-I${SDK_PREFIX}/include" \
     --extra-ldflags='-Wl,-rpath,$ORIGIN'
+for component in WAV_MUXER PCM_S16LE_ENCODER ARESAMPLE_FILTER ASETPTS_FILTER; do
+    verify-ffmpeg-component config.h "${component}"
+done
 make -j"$(nproc)"
 make install
 popd

@@ -13,6 +13,7 @@ from typing import Any, ClassVar, Literal, cast
 from app import logging, schemas
 from app.config import Config
 from app.constants import JST, LIBRARY_PATH
+from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
 from app.metadata.RecordedPlaybackIndex import (
     RECORDED_PLAYBACK_INDEX_VERSION,
     IsRecordedPlaybackIndexReady,
@@ -220,6 +221,7 @@ class RecordedPlaybackIndexer:
     _progress: ClassVar[dict[int, tuple[float, RecordedPlaybackIndexStage]]] = {}
     _metadata_seeds: ClassVar[dict[int, schemas.RecordedVideo]] = {}
     _force_rebuild_ids: ClassVar[set[int]] = set()
+    _history_handle_tasks: ClassVar[dict[int, asyncio.Task[AnalysisTaskHandle]]] = {}
 
     @classmethod
     def getProgress(
@@ -329,6 +331,14 @@ class RecordedPlaybackIndexer:
         cls._sequence += 1
         cls._queued_ids.add(recorded_video_id)
         cls._queued_priorities[recorded_video_id] = priority
+        trigger = 'StartupBackfill' if priority == 2 else ('Automatic' if priority == 1 else 'Manual')
+        cls._history_handle_tasks[recorded_video_id] = asyncio.create_task(AnalysisTaskTracker.start(
+            'PlaybackIndex',
+            recorded_video_id=recorded_video_id,
+            trigger=trigger,
+            initial_status='Queued',
+            inherit_parent=False,
+        ))
         cls._queue.put_nowait((priority, cls._sequence, recorded_video_id))
         return future
 
@@ -352,9 +362,29 @@ class RecordedPlaybackIndexer:
             cls._queued_priorities.pop(recorded_video_id, None)
             future = cls._futures.get(recorded_video_id)
             try:
-                metadata_seed = cls._metadata_seeds.get(recorded_video_id)
-                force_rebuild = recorded_video_id in cls._force_rebuild_ids
-                result = await cls.__analyze(recorded_video_id, priority, metadata_seed, force_rebuild)
+                trigger = 'StartupBackfill' if priority == 2 else ('Automatic' if priority == 1 else 'Manual')
+                history_handle_task = cls._history_handle_tasks.pop(recorded_video_id, None)
+                history_handle = await history_handle_task if history_handle_task is not None else None
+                async with AnalysisTaskTracker.track(
+                    'PlaybackIndex',
+                    recorded_video_id=recorded_video_id,
+                    trigger=trigger,
+                    existing_handle=history_handle,
+                ) as history:
+                    await history.setStage('Probing', 0.0)
+                    metadata_seed = cls._metadata_seeds.get(recorded_video_id)
+                    force_rebuild = recorded_video_id in cls._force_rebuild_ids
+                    result = await cls.__analyze(recorded_video_id, priority, metadata_seed, force_rebuild)
+                    if result is False:
+                        failed_video = await RecordedVideo.get_or_none(id=recorded_video_id)
+                        await history.finish(
+                            'Failed',
+                            error_code=(
+                                failed_video.playback_index_error_code
+                                if failed_video is not None
+                                else 'RecordedVideoUnavailable'
+                            ),
+                        )
                 if future is not None and future.done() is False:
                     future.set_result(result)
             except asyncio.CancelledError:
@@ -562,6 +592,9 @@ class RecordedPlaybackIndexer:
         if refined_timeline is not None:
             timeline = refined_timeline
         cls._progress[recorded_video_id] = (0.96, 'Finalizing')
+        history = AnalysisTaskTracker.currentHandle()
+        if history is not None:
+            await history.setStage('Finalizing', 0.96)
         # 音声PIDの存在範囲と構成は同じ全編フレーム走査を正とする。
         # 走査自体が失敗した場合だけ、軽量解析の暫定値を保持する。
         if audio_timeline is None:
@@ -1166,6 +1199,9 @@ class RecordedPlaybackIndexer:
         audio_active_states: dict[int, tuple[tuple[int, str], float, float, AudioTrackTimelineTrack]] = {}
         audio_ranges: list[tuple[float, float, AudioTrackTimelineTrack]] = []
         cls._progress[recorded_video_id] = (0.01, 'Scanning')
+        history = AnalysisTaskTracker.currentHandle()
+        if history is not None:
+            await history.setStage('Scanning', 0.01)
 
         try:
             while True:
@@ -1601,6 +1637,7 @@ class RecordedPlaybackIndexer:
         progress = 0.01 + max(0.0, min(1.0, frame_ratio)) * 0.94
         current_progress, _ = cls._progress.get(recorded_video_id, (0.01, 'Scanning'))
         cls._progress[recorded_video_id] = (max(current_progress, progress), 'Scanning')
+        AnalysisTaskTracker.updateProgressSoon(progress)
 
     @staticmethod
     def __appendVideoFrameTimelineEntry(

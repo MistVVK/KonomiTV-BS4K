@@ -11,7 +11,7 @@ from typing import Annotated, Any, Literal, cast
 
 import anyio
 import psutil
-from fastapi import APIRouter, Depends, Path, status
+from fastapi import APIRouter, Depends, Path, Query, status
 from fastapi.exceptions import HTTPException
 from fastapi.responses import Response
 from sse_starlette.sse import EventSourceResponse
@@ -23,16 +23,19 @@ from app.constants import (
     RESTART_REQUIRED_LOCK_PATH,
     THUMBNAILS_DIR,
 )
-from app.metadata.CMSectionsDetector import CMSectionsDetector
+from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
+from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
+from app.metadata.CMAnalyzer import GenericCMAnalyzer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
+from app.models.AnalysisTask import AnalysisTaskExecution
 from app.models.Channel import Channel
+from app.models.CMAnalysis import RecordedVideoCMAnalysis
 from app.models.Program import Program
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
-from app.utils.DriveIOLimiter import DriveIOLimiter
 
 
 # ルーター
@@ -171,13 +174,16 @@ async def BatchScanAPI():
     async def BatchScan():
         global batch_scan_task
         logging.info('Manual batch scan of recording folders has started.')
+        try:
+            async with AnalysisTaskTracker.track('BatchScan', trigger='Maintenance') as history:
+                await history.setStage('Scanning')
+                # 一括スキャンを実行
+                await RecordedScanTask().runBatchScan()
 
-        # 一括スキャンを実行
-        await RecordedScanTask().runBatchScan()
-
-        # 一括スキャンが完了した
-        logging.info('Manual batch scan of recording folders has finished.')
-        batch_scan_task = None  # 再度新しいタスクを作成できるように None にする
+            # 一括スキャンが完了した
+            logging.info('Manual batch scan of recording folders has finished.')
+        finally:
+            batch_scan_task = None  # 再度新しいタスクを作成できるように None にする
 
     # タスクが実行中でない場合、新しくタスクを作成して実行
     ## asyncio.create_task() で実行することで、API への HTTP コネクションが切断されてもタスクが継続される
@@ -217,26 +223,52 @@ async def ReanalyzeAllRecordedVideosAPI():
                 await RecordedVideo.all().order_by('id').values_list('file_path', flat=True),
             )
             total = len(file_paths)
+            completed_count = 0
+            missing_count = 0
+            completed_count_lock = asyncio.Lock()
 
             pipeline_semaphore = asyncio.Semaphore(RecordedScanTask.BATCH_PIPELINE_CONCURRENCY)
+            async with AnalysisTaskTracker.track(
+                'BatchMetadataReanalysis',
+                trigger='Maintenance',
+                total_count=total,
+            ) as history:
+                await history.setStage('Processing', 0.0)
 
-            async def ReanalyzeRecordedVideo(index: int, file_path_str: str) -> None:
-                file_path = anyio.Path(file_path_str)
-                if not await file_path.is_file():
-                    logging.warning(f'{file_path}: File not found. Skipping metadata reanalysis...')
-                    return
+                async def ReanalyzeRecordedVideo(index: int, file_path_str: str) -> None:
+                    nonlocal completed_count, missing_count
+                    file_path = anyio.Path(file_path_str)
+                    if not await file_path.is_file():
+                        logging.warning(f'{file_path}: File not found. Skipping metadata reanalysis...')
+                        is_missing = True
+                    else:
+                        is_missing = False
+                        logging.info(f'{file_path}: Reanalyzing metadata... ({index}/{total})')
+                        async with pipeline_semaphore:
+                            await RecordedScanTask().processRecordedFile(
+                                file_path=file_path,
+                                analysis_request='MetadataReanalysis',
+                            )
+                    async with completed_count_lock:
+                        completed_count += 1
+                        missing_count += int(is_missing)
+                        await history.setCounts(current=completed_count, total=total)
 
-                logging.info(f'{file_path}: Reanalyzing metadata... ({index}/{total})')
-                async with pipeline_semaphore:
-                    await RecordedScanTask().processRecordedFile(
-                        file_path=file_path,
-                        analysis_request='MetadataReanalysis',
-                    )
-
-            await asyncio.gather(*(
-                ReanalyzeRecordedVideo(index, file_path_str)
-                for index, file_path_str in enumerate(file_paths, start=1)
-            ))
+                await asyncio.gather(*(
+                    ReanalyzeRecordedVideo(index, file_path_str)
+                    for index, file_path_str in enumerate(file_paths, start=1)
+                ))
+                child_statuses = cast(
+                    list[str],
+                    await AnalysisTaskExecution.filter(parent_id=history.execution.id).values_list('status', flat=True),
+                )
+                await history.setCounts(
+                    current=total,
+                    total=total,
+                    succeeded=child_statuses.count('Succeeded'),
+                    failed=child_statuses.count('Failed'),
+                    skipped=missing_count + child_statuses.count('Skipped'),
+                )
 
             logging.info('Manual metadata reanalysis of all recorded videos has finished.')
         finally:
@@ -258,8 +290,13 @@ async def ReanalyzeAllRecordedVideosAPI():
     summary = '全録画ファイル CM 区間再判定 API',
     status_code = status.HTTP_204_NO_CONTENT,
 )
-async def DetectCMSectionsForAllRecordedVideosAPI():
-    """登録済みの全録画ファイルについて、既存結果の有無を問わずCM区間を再判定する。"""
+async def DetectCMSectionsForAllRecordedVideosAPI(
+    replace_existing_chapter: Annotated[
+        bool,
+        Query(description='KonomiTVが生成したchapterの再解析と置換を許可する。外部chapterは保持する。'),
+    ] = False,
+):
+    """登録済み録画を再判定し、明示指定時だけKonomiTV生成chapterを置換する。"""
 
     global cm_detection_task
 
@@ -268,26 +305,63 @@ async def DetectCMSectionsForAllRecordedVideosAPI():
         logging.info('Manual CM section detection of all recorded videos has started.')
         try:
             video_rows = await RecordedVideo.filter(status='Recorded').order_by('id').values(
+                'id',
                 'file_path',
                 'duration',
             )
             total = len(video_rows)
-            async def DetectRecordedVideoCM(index: int, video_row: dict[str, Any]) -> None:
-                file_path = anyio.Path(video_row['file_path'])
-                if not await file_path.is_file():
-                    logging.warning(f'{file_path}: File not found. Skipping CM section detection...')
-                    return
-                logging.info(f'{file_path}: Detecting CM sections... ({index}/{total})')
-                async with DriveIOLimiter.getSemaphore(file_path):
-                    await RecordedScanTask().processRecordedFile(
-                        file_path=file_path,
-                        analysis_request='CMDetection',
-                    )
+            completed_count = 0
+            failed_count = 0
+            skipped_count = 0
+            count_lock = asyncio.Lock()
+            async with AnalysisTaskTracker.track(
+                'BatchCMAnalysis',
+                trigger='Maintenance',
+                total_count=total,
+            ) as history:
+                await history.setStage('Processing', 0.0)
 
-            await asyncio.gather(*(
-                DetectRecordedVideoCM(index, video_row)
-                for index, video_row in enumerate(video_rows, start=1)
-            ))
+                async def DetectRecordedVideoCM(index: int, video_row: dict[str, Any]) -> None:
+                    nonlocal completed_count, failed_count, skipped_count
+                    file_path = anyio.Path(video_row['file_path'])
+                    item_failed = False
+                    item_skipped = False
+                    try:
+                        if not await file_path.is_file():
+                            logging.warning(f'{file_path}: File not found. Skipping CM section detection...')
+                            item_skipped = True
+                        else:
+                            logging.info(f'{file_path}: Detecting CM sections... ({index}/{total})')
+                            if replace_existing_chapter:
+                                result = await CMAnalysisOrchestrator().run(video_row['id'], 'CMRegeneration')
+                            else:
+                                await RecordedScanTask().processRecordedFile(
+                                    file_path=file_path,
+                                    analysis_request='CMDetection',
+                                )
+                                result = await RecordedVideoCMAnalysis.get_or_none(recorded_video_id=video_row['id'])
+                            item_failed = result is not None and result.status in ('Failed', 'Unsupported', 'Interrupted')
+                            item_skipped = result is not None and result.status in ('Pending', 'Excluded')
+                    except Exception:
+                        item_failed = True
+                        raise
+                    finally:
+                        async with count_lock:
+                            completed_count += 1
+                            failed_count += int(item_failed)
+                            skipped_count += int(item_skipped)
+                            await history.setCounts(
+                                current=completed_count,
+                                total=total,
+                                succeeded=completed_count - failed_count - skipped_count,
+                                failed=failed_count,
+                                skipped=skipped_count,
+                            )
+
+                await asyncio.gather(*(
+                    DetectRecordedVideoCM(index, video_row)
+                    for index, video_row in enumerate(video_rows, start=1)
+                ))
             logging.info('Manual CM section detection of all recorded videos has finished.')
         finally:
             cm_detection_task = None
@@ -321,65 +395,99 @@ async def BackgroundAnalysisAPI():
         global background_analysis_task
         logging.info('Manual background analysis has started.')
 
-        # CM 区間情報やサムネイルが未生成の録画ファイルを取得
-        ## 再生開始位置はオンデマンドで解決できるため、重い key_frames は取得しない
-        video_rows = await RecordedVideo.filter(status='Recorded').values(
-            'id',
-            'recorded_program_id',
-            'file_path',
-            'file_hash',
-            'duration',
-            'cm_sections',
-        )
+        try:
+            # CM 区間情報やサムネイルが未生成の録画ファイルを取得
+            ## 再生開始位置はオンデマンドで解決できるため、重い key_frames は取得しない
+            video_rows = await RecordedVideo.filter(status='Recorded').values(
+                'id',
+                'recorded_program_id',
+                'file_path',
+                'file_hash',
+                'duration',
+                'cm_sections',
+            )
+            cm_states = {
+                row['recorded_video_id']: row
+                for row in await RecordedVideoCMAnalysis.all().values(
+                    'recorded_video_id',
+                    'status',
+                    'analyzer_version',
+                    'chapter_source',
+                )
+            }
 
-        # 各録画ファイルに対して直列にバックグラウンド解析タスクを実行
-        ## HDD は並列アクセスが遅いため、随時直列に実行していった方が結果的に早いことが多い
-        ## すべて直列なので ProcessLimiter や DriveIOLimiter での制限は掛けていない
-        for video_row in video_rows:
-            file_path = anyio.Path(video_row['file_path'])
-            try:
-                if not await file_path.is_file():
-                    logging.warning(f'{file_path}: File not found. Skipping...')
-                    continue
+            # 各録画ファイルに対して直列にバックグラウンド解析タスクを実行
+            ## HDD は並列アクセスが遅いため、随時直列に実行していった方が結果的に早いことが多い
+            ## すべて直列なので ProcessLimiter や DriveIOLimiter での制限は掛けていない
+            async with AnalysisTaskTracker.track(
+                'BackgroundAnalysis',
+                trigger='Maintenance',
+                total_count=len(video_rows),
+            ) as history:
+                await history.setStage('Processing', 0.0)
+                for index, video_row in enumerate(video_rows, start=1):
+                    file_path = anyio.Path(video_row['file_path'])
+                    try:
+                        if not await file_path.is_file():
+                            logging.warning(f'{file_path}: File not found. Skipping...')
+                            continue
 
-                # CM 区間検出とサムネイル生成を同時に実行
-                tasks: list[Coroutine[Any, Any, None]] = []
+                        # CM 区間検出とサムネイル生成を同時に実行
+                        tasks: list[Coroutine[Any, Any, object]] = []
 
-                # CM 区間情報が未解析の場合、タスクに追加
-                ## cm_sections が [] の時は「解析はしたが CM 区間がなかった/検出に失敗した」ことを表している
-                ## CM 区間解析はかなり計算コストが高い処理のため、一度解析に失敗した録画ファイルは再解析しない
-                if video_row['cm_sections'] is None:
-                    tasks.append(CMSectionsDetector(
-                        file_path = anyio.Path(video_row['file_path']),
-                        duration_sec = video_row['duration'],
-                    ).detectAndSave())
+                        # 公開結果の有無とは独立して、未完了・失敗・旧pipelineの試行だけを候補にする。
+                        # Failed/UnsupportedもOrchestrator側のattempt keyが同じなら解析器を再起動しない。
+                        cm_state = cm_states.get(video_row['id'])
+                        should_check_cm = (
+                            video_row['cm_sections'] is None
+                            or cm_state is None
+                            or cm_state['status'] in ('Pending', 'Interrupted', 'Failed', 'Unsupported')
+                            or cm_state['chapter_source'] == 'Generated'
+                            or (
+                                cm_state['status'] == 'Completed'
+                                and cm_state['analyzer_version'] not in (None, GenericCMAnalyzer.ANALYZER_VERSION)
+                            )
+                        )
+                        if should_check_cm:
+                            tasks.append(CMAnalysisOrchestrator().run(video_row['id'], 'DetectCM'))
 
-                # サムネイルが未生成の場合、タスクに追加
-                # どちらか片方だけがないパターンも考えられるので、その場合もサムネイル生成を実行する
-                thumbnail_tile_path = anyio.Path(str(THUMBNAILS_DIR)) / f'{video_row["file_hash"]}_tile.webp'
-                thumbnail_path = anyio.Path(str(THUMBNAILS_DIR)) / f'{video_row["file_hash"]}.webp'
-                if (not await thumbnail_tile_path.is_file()) or (not await thumbnail_path.is_file()):
-                    # 録画番組情報を取得
-                    db_recorded_program = await RecordedProgram.all() \
-                        .select_related('recorded_video') \
-                        .select_related('channel') \
-                        .get_or_none(id=video_row['recorded_program_id'])
-                    if db_recorded_program is not None:
-                        # RecordedProgram モデルを schemas.RecordedProgram に変換
-                        recorded_program = schemas.RecordedProgram.model_validate(db_recorded_program, from_attributes=True)
-                        tasks.append(ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave())
+                        thumbnail_tile_path = anyio.Path(str(THUMBNAILS_DIR)) / f'{video_row["file_hash"]}_tile.webp'
+                        thumbnail_path = anyio.Path(str(THUMBNAILS_DIR)) / f'{video_row["file_hash"]}.webp'
+                        if (not await thumbnail_tile_path.is_file()) or (not await thumbnail_path.is_file()):
+                            db_recorded_program = await RecordedProgram.all() \
+                                .select_related('recorded_video') \
+                                .select_related('channel') \
+                                .get_or_none(id=video_row['recorded_program_id'])
+                            if db_recorded_program is not None:
+                                recorded_program = schemas.RecordedProgram.model_validate(
+                                    db_recorded_program,
+                                    from_attributes=True,
+                                )
 
-                # タスクが存在する場合、同時実行
-                if tasks:
-                    await asyncio.gather(*tasks)
+                                async def GenerateThumbnail() -> None:
+                                    async with AnalysisTaskTracker.track(
+                                        'ThumbnailGeneration',
+                                        recorded_video_id=recorded_program.recorded_video.id,
+                                        title=recorded_program.title,
+                                        trigger='Maintenance',
+                                    ) as thumbnail_history:
+                                        await thumbnail_history.setStage('Generating')
+                                        await ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave()
 
-            except Exception as ex:
-                logging.error(f'{file_path}: Error in background analysis:', exc_info=ex)
-                continue
+                                tasks.append(GenerateThumbnail())
 
-        # すべての録画ファイルのバックグラウンド解析が完了した
-        logging.info('Manual background analysis has finished processing all recorded files.')
-        background_analysis_task = None  # 再度新しいタスクを作成できるように None にする
+                        if tasks:
+                            await asyncio.gather(*tasks)
+
+                    except Exception as ex:
+                        logging.error(f'{file_path}: Error in background analysis:', exc_info=ex)
+                    finally:
+                        await history.setCounts(current=index, total=len(video_rows))
+
+            # すべての録画ファイルのバックグラウンド解析が完了した
+            logging.info('Manual background analysis has finished processing all recorded files.')
+        finally:
+            background_analysis_task = None  # 再度新しいタスクを作成できるように None にする
 
     # タスクが実行中でない場合、新しくタスクを作成して実行
     ## asyncio.create_task() で実行することで、API への HTTP コネクションが切断されてもタスクが継続される

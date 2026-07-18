@@ -16,6 +16,9 @@ OUTPUT_ROOT="${1:-${REPO_ROOT}/intel-media-stack}"
 : "${INTEL_MEDIA_DRIVER_COMMIT:?INTEL_MEDIA_DRIVER_COMMIT is required}"
 : "${INTEL_MEDIASDK_COMMIT:?INTEL_MEDIASDK_COMMIT is required}"
 : "${INTEL_ONEVPL_GPU_COMMIT:?INTEL_ONEVPL_GPU_COMMIT is required}"
+: "${INTEL_LIBVA_STANDALONE_PATCH_SHA256:?INTEL_LIBVA_STANDALONE_PATCH_SHA256 is required}"
+: "${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256:?INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256 is required}"
+: "${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256:?INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256 is required}"
 
 SRC_ROOT="${OUTPUT_ROOT}/src"
 BUILD_ROOT="${OUTPUT_ROOT}/build-root"
@@ -83,6 +86,12 @@ clone-commit https://github.com/intel/media-driver.git "${INTEL_MEDIA_DRIVER_COM
 clone-commit https://github.com/Intel-Media-SDK/MediaSDK.git "${INTEL_MEDIASDK_COMMIT}" "${SRC_ROOT}/MediaSDK"
 clone-commit https://github.com/intel/vpl-gpu-rt.git "${INTEL_ONEVPL_GPU_COMMIT}" "${SRC_ROOT}/vpl-gpu-rt"
 
+echo "${INTEL_LIBVA_STANDALONE_PATCH_SHA256}  ${PATCH_DIR}/intel-libva-standalone.patch" | \
+  sha256sum --check --strict
+echo "${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256}  ${PATCH_DIR}/intel-media-driver-vpp-deinterlace-crash-fix.patch" | \
+  sha256sum --check --strict
+echo "${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256}  ${PATCH_DIR}/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch" | \
+  sha256sum --check --strict
 apply-git-patch "${SRC_ROOT}/libva" "${PATCH_DIR}/intel-libva-standalone.patch"
 apply-git-patch "${SRC_ROOT}/media-driver" "${PATCH_DIR}/intel-media-driver-vpp-deinterlace-crash-fix.patch"
 apply-git-patch "${SRC_ROOT}/vpl-gpu-rt" "${PATCH_DIR}/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch"
@@ -111,25 +120,34 @@ meson setup "${BUILD_DIR}/libva" "${SRC_ROOT}/libva" \
 ninja -C "${BUILD_DIR}/libva" -j"$(nproc)"
 ninja -C "${BUILD_DIR}/libva" install
 
-# media-driver (iHD 向けの独自カーネルを含む版)
-cmake -S "${SRC_ROOT}/media-driver" -B "${BUILD_DIR}/media-driver-non-free" -G Ninja \
+# media-driver (CM の MPEG-2/H.264/HEVC デコードに必要な固定機能と
+# オープンソースカーネルだけを含む版)
+MEDIA_DRIVER_BUILD_DIR="${BUILD_DIR}/media-driver-free"
+cmake -S "${SRC_ROOT}/media-driver" -B "${MEDIA_DRIVER_BUILD_DIR}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${PREFIX_DIR}" \
   -DCMAKE_INSTALL_LIBDIR=lib \
   -DINSTALL_DRIVER_SYSCONF=OFF \
   -DENABLE_KERNELS=ON \
-  -DENABLE_NONFREE_KERNELS=ON \
+  -DENABLE_NONFREE_KERNELS=OFF \
   -DENABLE_PRODUCTION_KMD=ON \
   -DBUILD_CMRTLIB=OFF \
   -DARCH=64 \
   -DLIBVA_DRIVERS_PATH="${PREFIX_DIR}/lib/dri" \
   -DCMAKE_PREFIX_PATH="${PREFIX_DIR}" \
   -DBS_DIR_GMMLIB="${SRC_ROOT}/gmmlib"
-ninja -C "${BUILD_DIR}/media-driver-non-free" -j"$(nproc)"
-ninja -C "${BUILD_DIR}/media-driver-non-free" install
+grep -Fx 'ENABLE_KERNELS:BOOL=ON' "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
+grep -Fx 'ENABLE_NONFREE_KERNELS:BOOL=OFF' "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
+grep -Fx 'BUILD_CMRTLIB:BOOL=OFF' "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
+for definition in _FULL_OPEN_SOURCE _MPEG2_DECODE_SUPPORTED _AVC_DECODE_SUPPORTED _HEVC_DECODE_SUPPORTED; do
+  grep -Fq -- "-D${definition}" "${MEDIA_DRIVER_BUILD_DIR}/build.ninja"
+done
+ninja -C "${MEDIA_DRIVER_BUILD_DIR}" -j"$(nproc)"
+ninja -C "${MEDIA_DRIVER_BUILD_DIR}" install
 
 # media-driver (CMRT 用のフリーカーネル版)
-cmake -S "${SRC_ROOT}/media-driver" -B "${BUILD_DIR}/media-driver-free" -G Ninja \
+MEDIA_DRIVER_CMRT_BUILD_DIR="${BUILD_DIR}/media-driver-cmrt-free"
+cmake -S "${SRC_ROOT}/media-driver" -B "${MEDIA_DRIVER_CMRT_BUILD_DIR}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${FREE_PREFIX_DIR}" \
   -DCMAKE_INSTALL_LIBDIR=lib \
@@ -142,9 +160,12 @@ cmake -S "${SRC_ROOT}/media-driver" -B "${BUILD_DIR}/media-driver-free" -G Ninja
   -DLIBVA_DRIVERS_PATH="${FREE_PREFIX_DIR}/lib/dri" \
   -DCMAKE_PREFIX_PATH="${PREFIX_DIR}" \
   -DBS_DIR_GMMLIB="${SRC_ROOT}/gmmlib"
-# フリー構成から必要なのは CMRT runtime だけであり、iHD driver 本体は上の non-free 構成を採用する。
+# フリー構成から必要なのは CMRT runtime だけであり、iHD driver 本体は上のフリー構成を採用する。
 # all/install target は media-driver 全体をもう一度構築するため、CMRT target のみに限定する。
-ninja -C "${BUILD_DIR}/media-driver-free" -j"$(nproc)" igfxcmrt
+grep -Fx 'ENABLE_NONFREE_KERNELS:BOOL=OFF' "${MEDIA_DRIVER_CMRT_BUILD_DIR}/CMakeCache.txt"
+grep -Fx 'ENABLE_KERNELS:BOOL=ON' "${MEDIA_DRIVER_CMRT_BUILD_DIR}/CMakeCache.txt"
+grep -Fx 'BUILD_CMRTLIB:BOOL=ON' "${MEDIA_DRIVER_CMRT_BUILD_DIR}/CMakeCache.txt"
+ninja -C "${MEDIA_DRIVER_CMRT_BUILD_DIR}" -j"$(nproc)" igfxcmrt
 
 # 旧世代 GPU 向けの後方互換性を維持するため、MediaSDK 系の実ランタイムのみをビルドする
 # QSVEncC は libvpl のディスパッチャー相当を静的リンクしているため、libmfx.so.1 は同梱しない
@@ -187,8 +208,24 @@ cp -df "${PREFIX_DIR}/lib/libva.so"* "${ARTIFACT_DIR}/Library/"
 cp -df "${PREFIX_DIR}/lib/libva-drm.so"* "${ARTIFACT_DIR}/Library/"
 cp -df "${PREFIX_DIR}/lib/libmfx-gen.so"* "${ARTIFACT_DIR}/Library/"
 cp -df "${PREFIX_DIR}/lib/libmfxhw64.so"* "${ARTIFACT_DIR}/Library/"
-cp -df "${BUILD_DIR}/media-driver-free/cmrtlib/linux/libigfxcmrt.so"* "${ARTIFACT_DIR}/Library/"
+cp -df "${MEDIA_DRIVER_CMRT_BUILD_DIR}/cmrtlib/linux/libigfxcmrt.so"* "${ARTIFACT_DIR}/Library/"
 cp -f "${PREFIX_DIR}/lib/dri/iHD_drv_video.so" "${ARTIFACT_DIR}/Library/dri/"
+{
+  printf 'source_commit=%s\n' "${INTEL_MEDIA_DRIVER_COMMIT}"
+  grep -E '^(ENABLE_KERNELS|ENABLE_NONFREE_KERNELS|BUILD_CMRTLIB):BOOL=' \
+    "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
+  grep -E '^(ENABLE_KERNELS|ENABLE_NONFREE_KERNELS|BUILD_CMRTLIB):BOOL=' \
+    "${MEDIA_DRIVER_CMRT_BUILD_DIR}/CMakeCache.txt" | sed 's/^/cmrt_/'
+  printf 'patch_intel_libva_standalone_sha256=%s\n' "${INTEL_LIBVA_STANDALONE_PATCH_SHA256}"
+  printf 'patch_intel_media_driver_vpp_deinterlace_crash_fix_sha256=%s\n' \
+    "${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256}"
+  printf 'patch_intel_onevpl_gpu_rt_vpp_deinterlace_hang_fix_sha256=%s\n' \
+    "${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256}"
+  printf 'compile_definition=_FULL_OPEN_SOURCE\n'
+  printf 'compile_definition=_MPEG2_DECODE_SUPPORTED\n'
+  printf 'compile_definition=_AVC_DECODE_SUPPORTED\n'
+  printf 'compile_definition=_HEVC_DECODE_SUPPORTED\n'
+} > "${ARTIFACT_DIR}/Library/Intel-Media-Driver-Build-Configuration.txt"
 if [ -d "${PREFIX_DIR}/lib/libmfx-gen" ]; then
   cp -af "${PREFIX_DIR}/lib/libmfx-gen/." "${ARTIFACT_DIR}/Library/libmfx-gen/"
 fi

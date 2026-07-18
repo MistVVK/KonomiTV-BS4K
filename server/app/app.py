@@ -19,14 +19,19 @@ from app.constants import (
     QUALITY,
     VERSION,
 )
+from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
+from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
+from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.models.Channel import Channel
 from app.models.Program import Program
 from app.routers import (
+    AnalysisTasksRouter,
     BlueskyRouter,
     CapturesRouter,
     ChannelsRouter,
+    CMAnalysisRouter,
     DataBroadcastingRouter,
     LiveStreamsRouter,
     MaintenanceRouter,
@@ -71,6 +76,7 @@ app = FastAPI(
 
 # ルーターの追加
 app.include_router(ChannelsRouter.router)
+app.include_router(AnalysisTasksRouter.router)
 app.include_router(ProgramsRouter.router)
 app.include_router(VideosRouter.router)
 app.include_router(SeriesRouter.router)
@@ -80,6 +86,7 @@ app.include_router(ReservationsRouter.router)
 app.include_router(ReservationConditionsRouter.router)
 app.include_router(RecordingPresetsRouter.router)
 app.include_router(CapturesRouter.router)
+app.include_router(CMAnalysisRouter.router)
 app.include_router(DataBroadcastingRouter.router)
 app.include_router(NiconicoRouter.router)
 app.include_router(TwitterRouter.router)
@@ -234,6 +241,10 @@ recorded_scan_task: RecordedScanTask | None = None
 async def Startup():
     global recorded_scan_task
 
+    # 前回プロセスに残った構造化履歴とCM解析状態を中断へ確定する。
+    await AnalysisTaskTracker.initialize()
+    await CMAnalysisOrchestrator.markInterruptedAtStartup()
+
     # チャンネル情報を更新
     await Channel.update()
 
@@ -247,6 +258,9 @@ async def Startup():
     for channel in await Channel.filter(is_watchable=True).order_by('channel_number'):
         for quality in QUALITY:
             LiveStream(channel.display_channel_id, quality)
+
+    # 録画スキャナーを起動する前に、前プロセスが残した非稼働CM解析workspaceだけを回収する。
+    await CMAnalysisWorkspace.cleanupStale()
 
     # 録画フォルダ監視・メタデータ更新/同期タスクを開始
     ## 録画ファイルの量次第では録画ファイルの更新確認に時間がかかるため、非同期で実行する

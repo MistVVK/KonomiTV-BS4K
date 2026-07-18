@@ -69,8 +69,17 @@
                 <div class="video-info__item">
                     <div class="video-info__item-label">CM情報</div>
                     <div class="video-info__item-value">
-                        {{program.recorded_video.cm_sections === null ? '未解析' :
-                            program.recorded_video.cm_sections.length > 0 ? `あり（${program.recorded_video.cm_sections.length}区間）` : 'なし'}}
+                        {{formatCMAnalysisStatus()}}
+                    </div>
+                </div>
+                <div v-if="program.recorded_video.cm_result_source !== null" class="video-info__item">
+                    <div class="video-info__item-label">CM公開結果</div>
+                    <div class="video-info__item-value">{{formatCMResultSource()}}</div>
+                </div>
+                <div v-if="program.recorded_video.cm_result_published_at !== null" class="video-info__item">
+                    <div class="video-info__item-label">CM結果更新日時</div>
+                    <div class="video-info__item-value">
+                        {{Utils.apply28HourClock(dayjs(program.recorded_video.cm_result_published_at).format('YYYY/MM/DD (dd) HH:mm:ss'))}}
                     </div>
                 </div>
                 <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
@@ -160,7 +169,7 @@ import { IAudioTrack, IRecordedProgram } from '@/services/Videos';
 import Utils, { ProgramUtils, dayjs } from '@/utils';
 
 // Props
-defineProps<{
+const props = defineProps<{
     program: IRecordedProgram;
     show: boolean;
 }>();
@@ -203,6 +212,46 @@ const formatPlaybackIndexState = (state: IRecordedProgram['recorded_video']['pla
         Stale: '更新が必要',
         Failed: '解析失敗',
     }[state];
+};
+
+/** CM区間数とは独立した専用解析状態を利用者向けの表示へ変換する。 */
+const formatCMAnalysisStatus = (): string => {
+    const recorded_video = props.program.recorded_video;
+    const status = recorded_video.cm_analysis_status;
+    if (status === 'Completed') {
+        const section_count = recorded_video.cm_sections?.length ?? 0;
+        return section_count > 0 ? `解析完了（CM ${section_count}区間）` : '解析完了（CMなし）';
+    }
+    if (status === null) return '未解析';
+    const label = {
+        Pending: '解析待ち',
+        Analyzing: '解析中',
+        Failed: '解析失敗',
+        Unsupported: '非対応',
+        Excluded: '除外',
+        Interrupted: '中断',
+    }[status];
+    const state = recorded_video.cm_analysis_error_code !== null
+        ? `${label}（${recorded_video.cm_analysis_error_code}）`
+        : label;
+    return recorded_video.cm_result_source !== null ? `${state}・前回の公開結果を維持` : state;
+};
+
+/** 最新試行とは独立した、現在再生に使うCM結果の由来を表示する。 */
+const formatCMResultSource = (): string => {
+    const recorded_video = props.program.recorded_video;
+    if (recorded_video.cm_result_source === null) return 'なし';
+    const source = {
+        Existing: '外部 chapter',
+        Generated: 'KonomiTV 自動解析',
+        LegacyImported: '旧命名 chapter（互換読込）',
+    }[recorded_video.cm_result_source];
+    const path_kind = recorded_video.cm_result_chapter_path_kind === 'Legacy' ? ' / 旧命名' : '';
+    const pipeline = recorded_video.cm_result_pipeline_version !== null
+        ? ` / ${recorded_video.cm_result_pipeline_version}`
+        : '';
+    const verification = recorded_video.cm_result_verified === false ? ' / 未検証移行データ' : '';
+    return `${source}${path_kind}${pipeline}${verification}`;
 };
 
 </script>
