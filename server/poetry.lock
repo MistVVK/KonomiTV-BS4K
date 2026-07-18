@@ -3470,4 +3470,4 @@ websockets = ">=14.0"
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<3.12"
-content-hash = "a520bc9111791a97f4a9d45001fc2f5173ed7cb17f122fd5764454b796e0931a"
+content-hash = "794eee3522db542182bf94c8fd37c176cdd82d28b2bbf25e830e624779d3d777"

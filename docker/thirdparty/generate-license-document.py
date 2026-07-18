@@ -13,6 +13,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = Path(__file__).resolve().with_name('manifest.env')
+LICENSE_MANIFEST_PATH = Path(__file__).resolve().with_name('license-manifest.env')
 
 
 @dataclass(frozen=True)
@@ -28,11 +29,12 @@ def loadManifest() -> dict[str, str]:
     """固定 manifest を読み込む。"""
 
     manifest: dict[str, str] = {}
-    for line in MANIFEST_PATH.read_text(encoding='utf-8').splitlines():
-        if line == '' or line.startswith('#'):
-            continue
-        key, value = line.split('=', maxsplit=1)
-        manifest[key] = value
+    for path in (MANIFEST_PATH, LICENSE_MANIFEST_PATH):
+        for line in path.read_text(encoding='utf-8').splitlines():
+            if line == '' or line.startswith('#'):
+                continue
+            key, value = line.split('=', maxsplit=1)
+            manifest[key] = value
     return manifest
 
 
@@ -65,6 +67,18 @@ def readVerifiedLicense(location: str, sha256: str) -> str:
     return decodeLicense(content)
 
 
+def readVerifiedHeaderLicense(location: str, sha256: str) -> str:
+    """固定ヘッダーを checksum 検証し、ファイル先頭のライセンスコメントだけを取得する。"""
+
+    content = download(location)
+    if hashlib.sha256(content).hexdigest() != sha256:
+        raise ValueError(f'License checksum mismatch: {location}')
+    decoded = decodeLicense(content)
+    if not decoded.startswith('/*') or '*/' not in decoded:
+        raise ValueError(f'License header not found: {location}')
+    return decoded[2:decoded.index('*/')].replace(' * ', '').replace(' *', '').strip()
+
+
 def extractTarLicense(url: str, sha256: str, member_name: str) -> str:
     """checksum を検証した tar.gz からライセンス本文を抽出する。"""
 
@@ -88,9 +102,19 @@ def main() -> None:
     manifest = loadManifest()
     github_raw = 'https://raw.githubusercontent.com'
     sources = (
+        LicenseSource('KonomiTV upstream', manifest['KONOMITV_UPSTREAM_VERSION'], manifest['KONOMITV_UPSTREAM_REPOSITORY'], manifest['KONOMITV_UPSTREAM_COMMIT'], (
+            ('License.txt', f'{github_raw}/tsukumijima/KonomiTV/{manifest["KONOMITV_UPSTREAM_COMMIT"]}/License.txt', manifest['KONOMITV_UPSTREAM_LICENSE_SHA256']),
+        )),
         LicenseSource('FFmpeg', manifest['FFMPEG_VERSION'], manifest['FFMPEG_REPOSITORY'], manifest['FFMPEG_COMMIT'], (
             ('LICENSE.md', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG_COMMIT"]}/LICENSE.md', manifest['FFMPEG_LICENSE_SHA256']),
             ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG_COMMIT"]}/COPYING.GPLv3', manifest['FFMPEG_GPLV3_SHA256']),
+        )),
+        LicenseSource('FFmpeg', manifest['FFMPEG8_VERSION'], manifest['FFMPEG8_REPOSITORY'], manifest['FFMPEG8_COMMIT'], (
+            ('LICENSE.md', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/LICENSE.md', manifest['FFMPEG8_LICENSE_SHA256']),
+            ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.GPLv3', manifest['FFMPEG_GPLV3_SHA256']),
+        )),
+        LicenseSource('AMD Advanced Media Framework headers', manifest['AMF_VERSION'], manifest['AMF_REPOSITORY'], manifest['AMF_COMMIT'], (
+            ('LICENSE.txt', f'{github_raw}/GPUOpen-LibrariesAndSDKs/AMF/{manifest["AMF_COMMIT"]}/LICENSE.txt', manifest['AMF_LICENSE_SHA256']),
         )),
         LicenseSource('QSVEncC', manifest['QSVENCC_VERSION'], manifest['QSVENCC_REPOSITORY'], manifest['QSVENCC_COMMIT'], (
             ('license.txt', f'{github_raw}/rigaya/QSVEnc/{manifest["QSVENCC_COMMIT"]}/license.txt', manifest['QSVENCC_LICENSE_SHA256']),
@@ -136,25 +160,38 @@ def main() -> None:
     document = [
         '# Third-Party Software Licenses',
         '',
+        '<!-- AMD_RUNTIME_WARNING_START -->',
+        '> **重要: このDockerイメージを再配布しないでください。**',
+        '>',
+        '> このイメージには、GPL version 3 or later で提供されるFFmpegなどと、AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro`）が同時に含まれます。AMD側は再配布とFree Software Licenseの適用を制限しており、その制限とGPL側の再配布条件は、この完成イメージについて同時に満たすことができません。したがって、完成イメージ全体をGPLv3以降としてライセンスまたは再配布することはできません。現在のDockerfileは、各ユーザーが自身の環境でローカルビルドして利用することだけを前提としています。',
+        '<!-- AMD_RUNTIME_WARNING_END -->',
+        '',
+        '<!--',
         'KonomiTV の Docker image に直接組み込む third-party ソフトウェアの著作権表示とライセンス全文です。',
         'ライセンスの種類にかかわらず、取得元に含まれるライセンス本文を省略せず掲載しています。',
         '',
-        '> このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。',
-        '> Ubuntu・CUDA・GPU runtime・Python／JavaScript パッケージの推移的依存関係については、各配布物と Docker image 内の `/usr/share/doc` および package metadata に含まれるライセンスも適用されます。',
+        'このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。',
+        'Ubuntu・CUDA・GPU runtime・Python／JavaScript パッケージの推移的依存関係を含め、各配布物の著作権表示とライセンス全文を掲載します。',
+        '-->',
         '',
-        '## Chromium（Docker image ビルド時の Linux Mint Virginia 最新版）',
+        '## Chromium @CHROMIUM_VERSION@',
         '',
         '- Source package and binaries: https://packages.linuxmint.com/',
         '- Upstream source: https://chromium.googlesource.com/chromium/src/',
         '- Package: `chromium` from the signed Linux Mint Virginia `upstream` repository',
         '- Licenses include: BSD 3-Clause, GPL-2.0+, and bundled third-party licenses',
-        '- Complete copyright and license notices: `/usr/share/doc/chromium/copyright` in the Docker image',
+        '',
+        '### Copyright and license notices',
+        '',
+        '````text',
+        '@CHROMIUM_COPYRIGHT@',
+        '````',
         '',
     ]
 
     for source in sources:
         document.extend([
-            f'## {source.name} {source.version}',
+            f'## {source.name} {source.version}'.rstrip(),
             '',
             f'- Source: {source.source_url}',
             f'- Fixed revision or artifact: `{source.fixed_value}`',
@@ -163,6 +200,20 @@ def main() -> None:
         for label, location, sha256 in source.files:
             license_text = readVerifiedLicense(location, sha256)
             document.extend([f'### {label}', '', '```text', license_text, '```', ''])
+
+    nvcodec_license_url = (
+        f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
+        '/include/ffnvcodec/nvEncodeAPI.h'
+    )
+    nvcodec_license = readVerifiedHeaderLicense(
+        nvcodec_license_url, manifest['NVCODEC_HEADERS_LICENSE_SHA256'],
+    )
+    document.extend([
+        f'## NVIDIA codec API headers {manifest["NVCODEC_HEADERS_VERSION"]}', '',
+        f'- Source: {manifest["NVCODEC_HEADERS_REPOSITORY"]}',
+        f'- Fixed revision or artifact: `{manifest["NVCODEC_HEADERS_COMMIT"]}`', '',
+        '### nvEncodeAPI.h license notice', '', '```text', nvcodec_license, '```', '',
+    ])
 
     archive_licenses = (
         ('x264', manifest['X264_VERSION'], manifest['X264_SOURCE_URL'], manifest['X264_SOURCE_SHA256'], (

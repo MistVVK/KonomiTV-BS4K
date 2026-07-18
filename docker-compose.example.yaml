@@ -6,6 +6,9 @@ services:
     container_name: KonomiTV
     build:
       context: .
+      args:
+        CUDA_VERSION: '${KONOMITV_CUDA_VERSION:-12-4}'
+        INSTALL_AMD: '${KONOMITV_INSTALL_AMD:-true}'
     # OS 起動時にコンテナを自動起動
     restart: always
     # ネットワークをホスト側と共有する

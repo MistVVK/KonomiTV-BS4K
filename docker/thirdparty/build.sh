@@ -89,6 +89,9 @@ find "${OUTPUT_ROOT}/FFmpeg" -type f -name '*.so*' -exec patchelf --set-rpath '$
 patchelf --set-rpath '$ORIGIN' "${OUTPUT_ROOT}/FFmpeg/ffmpeg.elf"
 patchelf --set-rpath '$ORIGIN' "${OUTPUT_ROOT}/FFmpeg/ffprobe.elf"
 
+# 既存 FFmpeg 7 とは共有ライブラリも含めて分離し、将来の HW 処理向け FFmpeg 8 を構築する。
+SOURCE_ROOT="${SOURCE_ROOT}" OUTPUT_ROOT="${OUTPUT_ROOT}" "${SCRIPT_DIR}/build-ffmpeg8.sh"
+
 # encoder の deb とライセンスは同一 release tag に対応する完全 commit へ固定する。
 for encoder in QSVENCC NVENCC VCEENCC; do
     version_variable="${encoder}_VERSION"
