@@ -113,22 +113,67 @@
                 </v-text-field>
             </div>
             <div class="settings__item">
-                <div class="settings__item-heading">HTTPS リバースプロキシのカスタム HTTPS 証明書/秘密鍵ファイルへの絶対パス</div>
+                <div class="settings__item-heading">HTTPS / リバースプロキシの動作モード</div>
                 <div class="settings__item-label">
-                    設定すると、カスタム HTTPS 証明書を使って HTTPS リバースプロキシを開始します。<br>
-                    カスタム HTTPS 証明書を有効化すると、https://192-168-x-xx.local.konomi.tv:7000/ の URL では KonomiTV にアクセスできなくなります。<br>
-                    基本空欄のままで問題ありません。HTTPS 証明書について詳細に理解している方のみ設定してください。<br>
+                    akebi は従来どおり Akebi Keyless Server で HTTPS を提供します。<br>
+                    certificate は指定した証明書で直接 HTTPS を提供します。reverse_proxy は信頼済みプロキシの背後で HTTP を提供します。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :items="['akebi', 'certificate', 'reverse_proxy']"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    v-model="server_settings.server.https_mode">
+                </v-select>
+            </div>
+            <div class="settings__item" v-if="server_settings.server.https_mode === 'certificate'">
+                <div class="settings__item-heading">HTTPS 証明書・秘密鍵ファイルへの絶対パス</div>
+                <div class="settings__item-label">
+                    certificate モードでは証明書と秘密鍵の両方が必須です。Docker ではホスト上の絶対パスを指定してください。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
-                    label="例: C:\path\to\cert.pem"
+                    label="例: /etc/letsencrypt/live/tv.example.com/fullchain.pem"
                     :density="is_form_dense ? 'compact' : 'default'"
                     v-model="server_settings.server.custom_https_certificate">
                 </v-text-field>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
-                    label="例: C:\path\to\key.pem"
+                    label="例: /etc/letsencrypt/live/tv.example.com/privkey.pem"
                     :density="is_form_dense ? 'compact' : 'default'"
                     v-model="server_settings.server.custom_https_private_key">
                 </v-text-field>
+            </div>
+            <div class="settings__item" v-if="server_settings.server.https_mode === 'reverse_proxy'">
+                <div class="settings__item-heading">リバースプロキシ用 HTTP リッスンアドレス</div>
+                <div class="settings__item-label">
+                    通常は 0.0.0.0 のまま変更する必要はありません。KonomiTV のポートを外部へ直接公開しないでください。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
+                    label="例: 0.0.0.0"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    v-model="server_settings.server.reverse_proxy_listen_address">
+                </v-text-field>
+                <div class="settings__item-heading mt-5">信頼済みリバースプロキシの CIDR 許可リスト</div>
+                <div class="settings__item-label">
+                    実際に KonomiTV へ接続する nginx / Apache などの送信元 CIDR を1件以上指定してください。IPv4・IPv6に対応しています。<br>
+                </div>
+                <div v-for="(cidr, index) in server_settings.server.trusted_proxy_cidrs" :key="'trusted-proxy-cidr-' + index">
+                    <div class="d-flex align-center mt-3">
+                        <v-text-field class="settings__item-form mt-0" color="primary" variant="outlined" hide-details
+                            placeholder="例: 172.18.0.0/16"
+                            :density="is_form_dense ? 'compact' : 'default'"
+                            v-model="server_settings.server.trusted_proxy_cidrs[index]">
+                        </v-text-field>
+                        <button v-ripple class="settings__item-delete-button"
+                            @click="server_settings.server.trusted_proxy_cidrs.splice(index, 1)">
+                            <svg class="iconify iconify--fluent" width="20px" height="20px" viewBox="0 0 16 16">
+                                <path fill="currentColor" d="M7 3h2a1 1 0 0 0-2 0ZM6 3a2 2 0 1 1 4 0h4a.5.5 0 0 1 0 1h-.564l-1.205 8.838A2.5 2.5 0 0 1 9.754 15H6.246a2.5 2.5 0 0 1-2.477-2.162L2.564 4H2a.5.5 0 0 1 0-1h4Zm1 3.5a.5.5 0 0 0-1 0v5a.5.5 0 0 0 1 0v-5ZM9.5 6a.5.5 0 0 0-.5.5v5a.5.5 0 0 0 1 0v-5a.5.5 0 0 0-.5-.5Z"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <v-btn class="mt-3" color="background-lighten-2" variant="flat" height="40px"
+                    @click="server_settings.server.trusted_proxy_cidrs.push('')">
+                    <Icon icon="fluent:add-12-filled" height="17px" />
+                    <span class="ml-1">信頼済み CIDR を追加</span>
+                </v-btn>
             </div>
             <div class="settings__content-heading mt-6">
                 <Icon icon="fluent:tv-20-filled" width="22px" />
@@ -515,7 +560,21 @@ Settings.fetchServerSettings().then((settings) => {
 // サーバー設定を更新する関数
 async function updateServerSettings() {
 
-    // custom_https_certificate と custom_https_private_key が空文字列の場合は null に変換
+    // モードと無関係な設定は送信前に明示的に初期化する
+    if (server_settings.value.server.https_mode !== 'certificate') {
+        server_settings.value.server.custom_https_certificate = null;
+        server_settings.value.server.custom_https_private_key = null;
+    }
+    if (server_settings.value.server.https_mode !== 'reverse_proxy') {
+        server_settings.value.server.reverse_proxy_listen_address = '0.0.0.0';
+        server_settings.value.server.trusted_proxy_cidrs = [];
+    } else {
+        server_settings.value.server.trusted_proxy_cidrs = server_settings.value.server.trusted_proxy_cidrs
+            .map(cidr => cidr.trim())
+            .filter(cidr => cidr !== '');
+    }
+
+    // certificate モードの空文字列は null に変換し、サーバー側で必須対として検証する
     if (server_settings.value.server.custom_https_certificate === '') {
         server_settings.value.server.custom_https_certificate = null;
     }

@@ -1,6 +1,7 @@
 
 import asyncio
 import concurrent.futures
+import ipaddress
 import re
 import subprocess
 import sys
@@ -15,6 +16,8 @@ from pydantic import (
     BaseModel,
     DirectoryPath,
     FilePath,
+    IPvAnyAddress,
+    IPvAnyNetwork,
     PositiveFloat,
     PositiveInt,
     UrlConstraints,
@@ -22,6 +25,7 @@ from pydantic import (
     ValidationInfo,
     confloat,
     field_validator,
+    model_validator,
 )
 from pydantic_core import Url
 
@@ -294,9 +298,54 @@ class _ServerSettingsGeneral(BaseModel):
         return cls._validate_encoder_value(encoder)
 
 class _ServerSettingsServer(BaseModel):
+    https_mode: Literal['akebi', 'certificate', 'reverse_proxy'] = 'akebi'
     port: PositiveInt = 7000
     custom_https_certificate: FilePath | None = None
     custom_https_private_key: FilePath | None = None
+    reverse_proxy_listen_address: IPvAnyAddress = ipaddress.IPv4Address('0.0.0.0')
+    trusted_proxy_cidrs: list[IPvAnyNetwork] = []
+
+    @model_validator(mode='after')
+    def validate_https_mode(self, info: ValidationInfo) -> '_ServerSettingsServer':
+        # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する
+        if type(info.context) is dict and info.context.get('bypass_validation') is True:
+            return self
+
+        certificate_is_set = self.custom_https_certificate is not None
+        private_key_is_set = self.custom_https_private_key is not None
+
+        if self.https_mode == 'akebi':
+            if certificate_is_set or private_key_is_set:
+                raise ValueError(
+                    'https_mode が akebi ではカスタム HTTPS 証明書を利用できません。\n'
+                    'カスタム HTTPS 証明書を利用する場合は https_mode を certificate に変更してください。'
+                )
+            if self.trusted_proxy_cidrs:
+                raise ValueError('trusted_proxy_cidrs は https_mode が reverse_proxy の場合のみ指定できます。')
+            if str(self.reverse_proxy_listen_address) != '0.0.0.0':
+                raise ValueError('reverse_proxy_listen_address は https_mode が reverse_proxy の場合のみ変更できます。')
+
+        elif self.https_mode == 'certificate':
+            if certificate_is_set is False or private_key_is_set is False:
+                raise ValueError(
+                    'https_mode が certificate の場合、custom_https_certificate と '
+                    'custom_https_private_key の両方を指定してください。'
+                )
+            if self.trusted_proxy_cidrs:
+                raise ValueError('trusted_proxy_cidrs は https_mode が reverse_proxy の場合のみ指定できます。')
+            if str(self.reverse_proxy_listen_address) != '0.0.0.0':
+                raise ValueError('reverse_proxy_listen_address は https_mode が reverse_proxy の場合のみ変更できます。')
+
+        elif self.https_mode == 'reverse_proxy':
+            if certificate_is_set or private_key_is_set:
+                raise ValueError(
+                    'https_mode が reverse_proxy の場合、custom_https_certificate と '
+                    'custom_https_private_key は指定できません。'
+                )
+            if not self.trusted_proxy_cidrs:
+                raise ValueError('https_mode が reverse_proxy の場合、trusted_proxy_cidrs を1件以上指定してください。')
+
+        return self
 
     @field_validator('port')
     def validate_port(cls, port: int, info: ValidationInfo) -> int:
@@ -340,7 +389,7 @@ class _ServerSettingsServer(BaseModel):
                 f'ポート {port} は他のプロセスで使われているため、KonomiTV を起動できません。\n'
                 f'重複して KonomiTV を起動していないか、他のソフトでポート {port} を使っていないかを確認してください。'
             )
-        if (port + 10) in used_ports:
+        if info.data.get('https_mode') == 'akebi' and (port + 10) in used_ports:
             raise ValueError(
                 f'ポート {port + 10} ({port} + 10) は他のプロセスで使われているため、KonomiTV を起動できません。\n'
                 f'重複して KonomiTV を起動していないか、他のソフトでポート {port + 10} を使っていないかを確認してください。'
@@ -469,6 +518,10 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
             config_dict['capture']['upload_folders'] = [_DOCKER_PATH_PREFIX + folder for folder in config_dict['capture']['upload_folders']]
             if type(config_dict['tv']['debug_mode_ts_path']) is str:
                 config_dict['tv']['debug_mode_ts_path'] = _DOCKER_PATH_PREFIX + config_dict['tv']['debug_mode_ts_path']
+            if type(config_dict['server']['custom_https_certificate']) is str:
+                config_dict['server']['custom_https_certificate'] = _DOCKER_PATH_PREFIX + config_dict['server']['custom_https_certificate']
+            if type(config_dict['server']['custom_https_private_key']) is str:
+                config_dict['server']['custom_https_private_key'] = _DOCKER_PATH_PREFIX + config_dict['server']['custom_https_private_key']
     except Exception:
         pass  # config.yaml の記述が不正な場合は何もしない（どっちみち後のバリデーション処理で弾かれる）
 
@@ -483,9 +536,12 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
             ## カスタムバリデーターからのエラーメッセージかどうかは ctx に error が含まれているかどうかで判定する
             custom_error = False
             for error_message in error.errors():
-                if 'ctx' in error_message and 'error' in error_message['ctx'] and type(error_message['ctx']['error']) is str:
+                if 'ctx' in error_message and 'error' in error_message['ctx']:
+                    validation_error = error_message['ctx']['error']
+                    if not isinstance(validation_error, (str, ValueError)):
+                        continue
                     custom_error = True
-                    for message in error_message['ctx']['error'].split('\n'):
+                    for message in str(validation_error).split('\n'):
                         logging.error(message)
             if custom_error is True:
                 sys.exit(1)
@@ -528,6 +584,10 @@ def SaveConfig(config: ServerSettings) -> None:
         config_dict['capture']['upload_folders'] = [str(folder).replace(_DOCKER_PATH_PREFIX, '') for folder in config_dict['capture']['upload_folders']]
         if type(config_dict['tv']['debug_mode_ts_path']) is str or config_dict['tv']['debug_mode_ts_path'] is Path:
             config_dict['tv']['debug_mode_ts_path'] = str(config_dict['tv']['debug_mode_ts_path']).replace(_DOCKER_PATH_PREFIX, '')
+        if type(config_dict['server']['custom_https_certificate']) is str:
+            config_dict['server']['custom_https_certificate'] = config_dict['server']['custom_https_certificate'].replace(_DOCKER_PATH_PREFIX, '')
+        if type(config_dict['server']['custom_https_private_key']) is str:
+            config_dict['server']['custom_https_private_key'] = config_dict['server']['custom_https_private_key'].replace(_DOCKER_PATH_PREFIX, '')
 
     # config.yaml の内容をロード
     yaml = ruamel.yaml.YAML()

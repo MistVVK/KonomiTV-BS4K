@@ -45,6 +45,7 @@ from app.routers import (
 from app.streams.LiveStream import LiveStream
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
+from app.utils.HTTPS import ReverseProxyMiddleware
 
 
 # もし Config() の実行時に AssertionError が発生した場合は、LoadConfig() を実行してサーバー設定データをロードする
@@ -98,6 +99,14 @@ app.add_middleware(
     allow_headers = ['*'],
     allow_credentials = True,
 )
+
+# reverse_proxy モードでは、実際の TCP 接続元を検証してから転送ヘッダーを反映する
+## Uvicorn 標準の proxy headers は KonomiTV.py 側で無効化している
+if CONFIG.server.https_mode == 'reverse_proxy':
+    app.add_middleware(
+        ReverseProxyMiddleware,
+        trusted_proxy_cidrs = [str(cidr) for cidr in CONFIG.server.trusted_proxy_cidrs],
+    )
 
 # 拡張子と MIME タイプの対照表を上書きする
 ## StaticFiles の内部動作は mimetypes.guess_type() の挙動に応じて変化する

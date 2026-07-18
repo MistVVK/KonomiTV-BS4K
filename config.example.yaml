@@ -84,13 +84,27 @@ server:
     # デフォルトのリッスンポートは 7000 です。
     port: 7000
 
-    # HTTPS リバースプロキシのカスタム HTTPS 証明書/秘密鍵ファイルへの絶対パス
-    # 設定すると、Akebi Keyless Server の代わりに、カスタム HTTPS 証明書を使って HTTPS リバースプロキシを開始します。
-    # カスタム HTTPS 証明書を有効化すると、https://192-168-x-xx.local.konomi.tv:7000/ の URL では KonomiTV にアクセスできなくなります。
-    # カスタム HTTPS 証明書を有効化するには、custom_https_certificate と custom_https_private_key の両方に設定が必要です。
-    # 基本的に変更する必要はありません。HTTPS 証明書について詳細に理解している方のみ設定してください。
+    # HTTPS / リバースプロキシの動作モード
+    # akebi (既定): Akebi Keyless Server が port で HTTPS を提供します。証明書設定と trusted_proxy_cidrs は指定できません。
+    # certificate: Uvicorn が port で直接 HTTPS を提供します。証明書と秘密鍵の両方が必須です。
+    # reverse_proxy: Uvicorn が port で HTTP を提供します。必ず信頼できるリバースプロキシの背後で利用してください。
+    https_mode: 'akebi'
+
+    # certificate モードで使用する HTTPS 証明書・秘密鍵のホスト上の絶対パス
+    # Docker コンテナ内では既存の /host-rootfs マウントを通して自動的に参照されます。
+    # akebi / reverse_proxy モードでは指定できません。
     custom_https_certificate: null
     custom_https_private_key: null
+
+    # reverse_proxy モードで Uvicorn が HTTP を待ち受けるアドレス
+    # 通常は 0.0.0.0 のまま変更する必要はありません。akebi / certificate モードでは使用されません。
+    reverse_proxy_listen_address: '0.0.0.0'
+
+    # KonomiTV へ直接 TCP 接続できる、信頼済みリバースプロキシの CIDR 許可リスト
+    # reverse_proxy モードでは1件以上必須です。実際の接続元がこの範囲外の場合は HTTP 403 で拒否します。
+    # nginx / Apache などのプロキシ側では X-Forwarded-For / Proto / Host を必ず上書きしてください。
+    # IPv4・IPv6 の両方を指定できます。akebi / certificate モードでは空のままにしてください。
+    trusted_proxy_cidrs: []
 
 # ======================= テレビのライブストリーミングの設定 =======================
 tv:

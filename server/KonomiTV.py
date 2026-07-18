@@ -25,6 +25,7 @@ from app.constants import (
     RESTART_REQUIRED_LOCK_PATH,
     VERSION,
 )
+from app.utils.HTTPS import BuildServerStartupSettings, GetRequiredThirdpartyLibraries
 from app.utils.LogRotation import SplitServerLogByDate
 
 
@@ -51,13 +52,11 @@ def main(
     os.environ['TZ'] = 'Asia/Tokyo'
     time.tzset()
 
-    # 前回のログのうち、アクセスログと Akebi のログのみ削除する
+    # 前回のアクセスログを削除する
     ## サーバーログは起動時に日付別分割されるため、ここでは削除しない
     try:
         if KONOMITV_ACCESS_LOG_PATH.exists():
             KONOMITV_ACCESS_LOG_PATH.unlink()
-        if AKEBI_LOG_PATH.exists():
-            AKEBI_LOG_PATH.unlink()
     except PermissionError:
         pass
 
@@ -103,8 +102,10 @@ def main(
 
     # ***** サードパーティーライブラリが配置されているかのバリデーション *****
 
-    # すべてのサードパーティーライブラリの配置をチェック
-    for library_name, library_path in LIBRARY_PATH.items():
+    # HTTPS モードに依存しないサードパーティーライブラリの配置をチェック
+    ## Akebi は設定ロード後に akebi モードの場合だけ確認する
+    for library_name in GetRequiredThirdpartyLibraries('certificate'):
+        library_path = LIBRARY_PATH[library_name]
         if Path(library_path).is_file() is False:
             logging.error(f'{library_name} がサードパーティーライブラリとして配置されていないため、KonomiTV を起動できません。')
             logging.error(f'{library_name} が {library_path} に配置されているかを確認してください。')
@@ -118,47 +119,52 @@ def main(
     ## LoadConfig() 内でエラーログを出力した後、sys.exit(1) でサーバーが終了される
     CONFIG = LoadConfig()
 
+    # akebi モードの場合だけ Akebi バイナリを確認し、前回の Akebi ログを削除する
+    if CONFIG.server.https_mode == 'akebi':
+        akebi_path = LIBRARY_PATH['Akebi']
+        if Path(akebi_path).is_file() is False:
+            logging.error('Akebi がサードパーティーライブラリとして配置されていないため、KonomiTV を起動できません。')
+            logging.error(f'Akebi が {akebi_path} に配置されているかを確認してください。')
+            sys.exit(1)
+        try:
+            if AKEBI_LOG_PATH.exists():
+                AKEBI_LOG_PATH.unlink()
+        except PermissionError:
+            pass
+
     # ***** KonomiTV サーバーを起動 *****
 
-    # カスタム HTTPS 証明書/秘密鍵が指定されているとき
-    custom_https_certificate: list[str] = []
-    if CONFIG.server.custom_https_certificate is not None and CONFIG.server.custom_https_private_key is not None:
-        custom_https_certificate = [
-            '--custom-certificate', str(CONFIG.server.custom_https_certificate),
-            '--custom-private-key', str(CONFIG.server.custom_https_private_key),
-        ]
+    startup_settings = BuildServerStartupSettings(CONFIG.server)
 
-    # Akebi HTTPS Server (HTTPS リバースプロキシ) を起動
-    ## HTTP/2 対応と HTTPS 化を一手に行う Golang 製の特殊なリバースプロキシサーバー
-    ## ログは server/logs/Akebi-HTTPS-Server.log に出力する
-    ## ref: https://github.com/tsukumijima/Akebi
-    with open(AKEBI_LOG_PATH, mode='w', encoding='utf-8') as file:
-        reverse_proxy_process = subprocess.Popen(
-            [
-                LIBRARY_PATH['Akebi'],
-                '--listen-address', f'0.0.0.0:{CONFIG.server.port}',
-                '--proxy-pass-url', f'http://127.0.0.77:{CONFIG.server.port + 10}/',
-                '--keyless-server-url', 'https://akebi.konomi.tv/',
-                *custom_https_certificate,  # カスタム HTTPS 証明書/秘密鍵を指定する引数を追加（指定されているときのみ）
-            ],
-            stdout = file,
-            stderr = file,
-        )
+    # akebi モードの場合だけ Akebi Keyless Server を起動する
+    reverse_proxy_process: subprocess.Popen[bytes] | None = None
+    if startup_settings.use_akebi:
+        with open(AKEBI_LOG_PATH, mode='w', encoding='utf-8') as file:
+            reverse_proxy_process = subprocess.Popen(
+                [
+                    LIBRARY_PATH['Akebi'],
+                    '--listen-address', f'0.0.0.0:{CONFIG.server.port}',
+                    '--proxy-pass-url', f'http://{startup_settings.host}:{startup_settings.port}/',
+                    '--keyless-server-url', 'https://akebi.konomi.tv/',
+                ],
+                stdout = file,
+                stderr = file,
+            )
 
-    # このプロセスが終了されたときに、HTTPS リバースプロキシも一緒に終了する
-    atexit.register(lambda: reverse_proxy_process.terminate())
+        # このプロセスが終了されたときに、Akebi も一緒に終了する
+        atexit.register(reverse_proxy_process.terminate)
 
     # Uvicorn の設定
     server_config = uvicorn.Config(
         # 起動するアプリケーション
         app = 'app.app:app',
         # リッスンするアドレス
-        ## サーバーへのすべてのアクセスには一度 Akebi のリバースプロキシを通す
-        ## 混乱を避けるため、容易にアクセスされないだろう 127.0.0.77 のみでリッスンしている
-        host = '127.0.0.77',
-        # リッスンするポート番号
-        ## 指定されたポートに 10 を足したもの
-        port = CONFIG.server.port + 10,
+        host = startup_settings.host,
+        port = startup_settings.port,
+        ssl_certfile = startup_settings.ssl_certfile,
+        ssl_keyfile = startup_settings.ssl_keyfile,
+        # TCP 接続元の CIDR 検証前に転送ヘッダーを反映させない
+        proxy_headers = startup_settings.proxy_headers,
         # 自動リロードモードモードで起動するか
         reload = reload,
         # リロードするフォルダ
@@ -195,12 +201,13 @@ def main(
             # 通常時
             server.run()
     except KeyboardInterrupt:
-        # Uvicorn のサーバーインスタンスから KeyboardInterrupt が送出された場合は一旦無視して、HTTPS リバースプロキシを確実に終了する
+        # Uvicorn のサーバーインスタンスから KeyboardInterrupt が送出された場合は一旦無視する
         # 少し前の Uvicorn は KeyboardInterrupt を内部で握り潰していたが、最近のバージョンから送出するようになった
         pass
 
-    # HTTPS リバースプロキシを終了
-    reverse_proxy_process.terminate()
+    # akebi モードの場合だけ Akebi を終了する
+    if reverse_proxy_process is not None:
+        reverse_proxy_process.terminate()
 
     # この時点ではタイミングの関係でまだロックファイルが作成されていないことがあるので、1秒待機する
     time.sleep(1)

@@ -137,9 +137,12 @@ export interface IServerSettings {
         debug_encoder: boolean;
     };
     server: {
+        https_mode: 'akebi' | 'certificate' | 'reverse_proxy';
         port: number;
         custom_https_certificate: string | null;
         custom_https_private_key: string | null;
+        reverse_proxy_listen_address: string;
+        trusted_proxy_cidrs: string[];
     };
     tv: {
         preferred_terrestrial_region: string | null;
@@ -177,9 +180,12 @@ export const IServerSettingsDefault: IServerSettings = {
         debug_encoder: false,
     },
     server: {
+        https_mode: 'akebi',
         port: 7000,
         custom_https_certificate: null,
         custom_https_private_key: null,
+        reverse_proxy_listen_address: '0.0.0.0',
+        trusted_proxy_cidrs: [],
     },
     tv: {
         preferred_terrestrial_region: null,
