@@ -32,6 +32,7 @@ from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.utils.DriveIOLimiter import DriveIOLimiter
 
 
 # ルーター
@@ -40,9 +41,10 @@ router = APIRouter(
     prefix = '/api/maintenance',
 )
 
-# 録画フォルダの一括スキャン・メタデータ再解析・バックグラウンド解析タスクの asyncio.Task インスタンス
+# 録画フォルダの一括スキャン・メタデータ再解析・CM判定・バックグラウンド解析タスクの asyncio.Task インスタンス
 batch_scan_task: asyncio.Task[None] | None = None
 metadata_reanalysis_task: asyncio.Task[None] | None = None
+cm_detection_task: asyncio.Task[None] | None = None
 background_analysis_task: asyncio.Task[None] | None = None
 
 
@@ -199,7 +201,7 @@ async def BatchScanAPI():
 async def ReanalyzeAllRecordedVideosAPI():
     """
     データベースに登録されているすべての録画ファイルのメタデータを強制的に再解析する。<br>
-    録画ファイルごとに直列で処理し、個別録画の「メタデータを再解析」と同じ解析を行う。<br>
+    録画ごとの処理順序を保ちつつ、別録画の解析パイプラインは上限付きで並行実行する。<br>
     このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
     """
 
@@ -216,18 +218,25 @@ async def ReanalyzeAllRecordedVideosAPI():
             )
             total = len(file_paths)
 
-            for index, file_path_str in enumerate(file_paths, start=1):
+            pipeline_semaphore = asyncio.Semaphore(RecordedScanTask.BATCH_PIPELINE_CONCURRENCY)
+
+            async def ReanalyzeRecordedVideo(index: int, file_path_str: str) -> None:
                 file_path = anyio.Path(file_path_str)
                 if not await file_path.is_file():
                     logging.warning(f'{file_path}: File not found. Skipping metadata reanalysis...')
-                    continue
+                    return
 
                 logging.info(f'{file_path}: Reanalyzing metadata... ({index}/{total})')
-                await RecordedScanTask().processRecordedFile(
-                    file_path = file_path,
-                    force_update = True,
-                    wait_background_analysis = True,
-                )
+                async with pipeline_semaphore:
+                    await RecordedScanTask().processRecordedFile(
+                        file_path=file_path,
+                        analysis_request='MetadataReanalysis',
+                    )
+
+            await asyncio.gather(*(
+                ReanalyzeRecordedVideo(index, file_path_str)
+                for index, file_path_str in enumerate(file_paths, start=1)
+            ))
 
             logging.info('Manual metadata reanalysis of all recorded videos has finished.')
         finally:
@@ -242,6 +251,56 @@ async def ReanalyzeAllRecordedVideosAPI():
             status_code = status.HTTP_429_TOO_MANY_REQUESTS,
             detail = 'Metadata reanalysis of all recorded videos is already running',
         )
+
+
+@router.post(
+    '/detect-cm-sections-for-all-recorded-videos',
+    summary = '全録画ファイル CM 区間再判定 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def DetectCMSectionsForAllRecordedVideosAPI():
+    """登録済みの全録画ファイルについて、既存結果の有無を問わずCM区間を再判定する。"""
+
+    global cm_detection_task
+
+    async def DetectCMSectionsForAllRecordedVideos() -> None:
+        global cm_detection_task
+        logging.info('Manual CM section detection of all recorded videos has started.')
+        try:
+            video_rows = await RecordedVideo.filter(status='Recorded').order_by('id').values(
+                'file_path',
+                'duration',
+            )
+            total = len(video_rows)
+            async def DetectRecordedVideoCM(index: int, video_row: dict[str, Any]) -> None:
+                file_path = anyio.Path(video_row['file_path'])
+                if not await file_path.is_file():
+                    logging.warning(f'{file_path}: File not found. Skipping CM section detection...')
+                    return
+                logging.info(f'{file_path}: Detecting CM sections... ({index}/{total})')
+                async with DriveIOLimiter.getSemaphore(file_path):
+                    await RecordedScanTask().processRecordedFile(
+                        file_path=file_path,
+                        analysis_request='CMDetection',
+                    )
+
+            await asyncio.gather(*(
+                DetectRecordedVideoCM(index, video_row)
+                for index, video_row in enumerate(video_rows, start=1)
+            ))
+            logging.info('Manual CM section detection of all recorded videos has finished.')
+        finally:
+            cm_detection_task = None
+
+    if cm_detection_task is not None:
+        logging.warning('[MaintenanceRouter][DetectCMSectionsForAllRecordedVideosAPI] CM section detection is already running.')
+        raise HTTPException(
+            status_code = status.HTTP_429_TOO_MANY_REQUESTS,
+            detail = 'CM section detection of all recorded videos is already running',
+        )
+
+    cm_detection_task = asyncio.create_task(DetectCMSectionsForAllRecordedVideos())
+    await cm_detection_task
 
 
 @router.post(

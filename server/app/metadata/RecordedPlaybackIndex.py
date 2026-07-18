@@ -1,7 +1,7 @@
 from typing import Literal
 
 
-RECORDED_PLAYBACK_INDEX_VERSION = 6
+RECORDED_PLAYBACK_INDEX_VERSION = 10
 
 RecordedPlaybackIndexStatus = Literal['Pending', 'Analyzing', 'Ready', 'Failed']
 RecordedPlaybackIndexState = Literal['Pending', 'Analyzing', 'Ready', 'Stale', 'Failed']

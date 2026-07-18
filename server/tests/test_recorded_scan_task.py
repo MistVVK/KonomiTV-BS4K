@@ -37,3 +37,6 @@ def test_recorded_scan_detects_content_changes_and_recording() -> None:
 
     summary.status = 'Recording'
     assert summary.isFileContentUnchanged(summary.file_modified_at, summary.file_size) is False
+
+    summary.status = 'Analyzing'
+    assert summary.isFileContentUnchanged(summary.file_modified_at, summary.file_size) is False

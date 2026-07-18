@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from io import BufferedReader, BytesIO
@@ -167,8 +168,21 @@ class TSInfoAnalyzer:
 
         # 録画番組情報のモデルを作成
         ## EIT[p/f] のうち、現在と次の番組情報を両方取得した上で、録画マージンを考慮してどちらの番組を録画したかを判定する
+        # __analyzeEITInformation() は取得した EIT 音声記述を recorded_video に反映する。
+        # present と following を続けて解析すると following の記述が present の録画全体へ漏れるため、
+        # それぞれを同じ FFprobe 初期値から独立して解析して結果を退避する。
+        base_audio_tracks = copy.deepcopy(self.recorded_video.audio_tracks)
+        base_audio_track_timeline = copy.deepcopy(self.recorded_video.audio_track_timeline)
+
         recorded_program_present = self.__analyzeEITInformation(channel, is_following=False)
+        present_audio_tracks = copy.deepcopy(self.recorded_video.audio_tracks)
+        present_audio_track_timeline = copy.deepcopy(self.recorded_video.audio_track_timeline)
+
+        self.recorded_video.audio_tracks = copy.deepcopy(base_audio_tracks)
+        self.recorded_video.audio_track_timeline = copy.deepcopy(base_audio_track_timeline)
         recorded_program_following = self.__analyzeEITInformation(channel, is_following=True)
+        following_audio_tracks = copy.deepcopy(self.recorded_video.audio_tracks)
+        following_audio_track_timeline = copy.deepcopy(self.recorded_video.audio_track_timeline)
         ## 通常まず発生し得ないが、どちらかの番組情報が取得できなかった場合は正常に判定できないため None を返す
         if recorded_program_present is None or recorded_program_following is None:
             return None
@@ -180,8 +194,29 @@ class TSInfoAnalyzer:
         if (self.recorded_video.recording_start_time is not None and
             timedelta(minutes=0) <= (recorded_program_following.start_time - self.recorded_video.recording_start_time) <= timedelta(minutes=1)):
             recorded_program = recorded_program_following
+            selected_audio_tracks = following_audio_tracks
+            selected_audio_track_timeline = following_audio_track_timeline
         else:
             recorded_program = recorded_program_present
+            selected_audio_tracks = present_audio_tracks
+            selected_audio_track_timeline = present_audio_track_timeline
+
+        # 番組境界をまたぐ録画では、後半だけ Dual Mono へ変わる可能性がある。
+        # present / following のどちらかに Dual Mono 記述があれば論理 Track の候補として保持し、
+        # 実際に2chだった区間だけを RecordedPlaybackIndexer の全編フレーム走査で Dual Mono と確定する。
+        dual_mono_hints: dict[int, schemas.AudioTrack] = {}
+        for audio_track in [*present_audio_tracks, *following_audio_tracks]:
+            if audio_track.get('is_dual_mono') is True:
+                dual_mono_hints[int(audio_track['index'])] = audio_track
+        for audio_track in selected_audio_tracks:
+            dual_mono_hint = dual_mono_hints.get(int(audio_track['index']))
+            if dual_mono_hint is not None:
+                audio_track['channel'] = 'Dual Mono'
+                audio_track['language'] = dual_mono_hint.get('language')
+                audio_track['is_dual_mono'] = True
+
+        self.recorded_video.audio_tracks = selected_audio_tracks
+        self.recorded_video.audio_track_timeline = selected_audio_track_timeline
 
         # 選択された番組情報の duration が 0 の場合は現在/次の両方とも正しい番組情報を取得できなかったことを意味するので、None を返す
         # このとき番組開始時刻・番組終了時刻は 1970-01-01 09:00:00 になっているはず
@@ -523,21 +558,6 @@ class TSInfoAnalyzer:
         secondary_audio_language: str | None = None
         audio_component_tracks: list[tuple[str | None, str | None]] = []
 
-        def GetAudioChannelLabel(audio_type: str | None) -> str | None:
-            if audio_type is None:
-                return None
-            if 'デュアルモノ' in audio_type or '1/0+1/0' in audio_type:
-                return 'Dual Mono'
-            if '22.2' in audio_type or '3/3/3-5/2/3-3/0/0.2' in audio_type:
-                return '22.2ch'
-            if '5.1' in audio_type or '3/2+LFE' in audio_type:
-                return '5.1ch'
-            if 'ステレオ' in audio_type or '2/0' in audio_type:
-                return 'Stereo'
-            if 'モノ' in audio_type or '1/0' in audio_type:
-                return 'Monaural'
-            return audio_type
-
         # TS から EIT (Event Information Table) を抽出
         count: int = 0
         corrupted_events: int = 0  # 破損したイベント数をカウント
@@ -785,11 +805,14 @@ class TSInfoAnalyzer:
             for index, (audio_type, audio_language) in enumerate(audio_component_tracks):
                 if index >= len(audio_tracks):
                     break
-                channel_label = GetAudioChannelLabel(audio_type)
-                if channel_label is not None:
-                    audio_tracks[index]['channel'] = channel_label
+                is_dual_mono = audio_type is not None and 'デュアルモノ' in audio_type
+                # 実際のチャンネル数は FFprobe の解析結果を優先する。
+                # EIT の AudioComponentDescriptor は番組全体の予定情報であり、録画内容と一致しない場合がある。
+                # 一方、デュアルモノは FFprobe では通常の Stereo と区別できないため、この場合だけ EIT で補完する。
+                if is_dual_mono:
+                    audio_tracks[index]['channel'] = 'Dual Mono'
                 audio_tracks[index]['language'] = audio_language
-                audio_tracks[index]['is_dual_mono'] = audio_type is not None and 'デュアルモノ' in audio_type
+                audio_tracks[index]['is_dual_mono'] = is_dual_mono
             self.recorded_video.audio_tracks = audio_tracks
             # EIT の言語・デュアルモノ情報を、FFprobe 由来の有効期間にも反映する。
             # PID の増減区間は維持しつつ、同じ論理 Track は同じ表示名で扱う。

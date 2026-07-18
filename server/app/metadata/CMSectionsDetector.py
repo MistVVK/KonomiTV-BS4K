@@ -78,6 +78,12 @@ class CMSectionsDetector:
 
         except Exception as ex:
             logging.error(f'{self.file_path}: Error saving CM sections to DB:', exc_info=ex)
+            # ファイル存在確認後に開始した判定が例外終了した場合も、未解析のNoneを残さない。
+            # []を「判定したが区間なし、または判定不能」の明示結果として保存する。
+            try:
+                await RecordedVideo.filter(file_path=str(self.file_path)).update(cm_sections=[])
+            except Exception as save_ex:
+                logging.error(f'{self.file_path}: Failed to save empty CM sections after detection failure:', exc_info=save_ex)
 
 
     async def __detectWithJLS(self) -> list[schemas.CMSection] | None:

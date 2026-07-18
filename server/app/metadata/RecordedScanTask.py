@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import os
 import pathlib
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,12 @@ from app.config import Config
 from app.constants import JST, THUMBNAILS_DIR
 from app.metadata.CMSectionsDetector import CMSectionsDetector
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
+from app.metadata.RecordedAnalysisPlan import (
+    AnalysisRequest,
+    BuildRecordedAnalysisPlan,
+    ContentState,
+    RecordedAnalysisPlan,
+)
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.models.Channel import Channel
 from app.models.RecordedProgram import RecordedProgram
@@ -56,11 +63,13 @@ class RecordedVideoSummary:
     file_path: str
     created_at: datetime
     recorded_program_id: int
-    status: Literal['Recording', 'Recorded', 'AnalysisFailed']
+    status: Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed']
     file_created_at: datetime
     file_modified_at: datetime
     file_size: int
     file_hash: str
+    playback_index_status: Literal['Pending', 'Analyzing', 'Ready', 'Failed'] = 'Pending'
+    playback_index_version: int | None = None
 
     def isFileContentUnchanged(self, file_modified_at: datetime, file_size: int) -> bool:
         """ファイル内容に関係しない ctime の変化を無視して、再解析が不要かを判定する。"""
@@ -111,6 +120,10 @@ class RecordedScanTask:
     KNOWN_COLLISION_FILE_HASHES: ClassVar[set[str]] = {
         'd1dd210d6b1312cb342b56d02bd5e651',
     }
+
+    # 一括スキャンは録画単位のパイプラインを複数流し、別録画の各解析段階を重ねる。
+    # 各MetadataAnalyzerが子プロセスを1つ使うため、CPUコア数の50%を上限とする。
+    BATCH_PIPELINE_CONCURRENCY: ClassVar[int] = max(1, (os.cpu_count() or 2) // 2)
 
 
     def __new__(cls) -> RecordedScanTask:
@@ -260,6 +273,8 @@ class RecordedScanTask:
             'file_modified_at',
             'file_size',
             'file_hash',
+            'playback_index_status',
+            'playback_index_version',
         )
         videos_by_path: dict[str, list[RecordedVideoSummary]] = {}
         videos_to_keep: list[RecordedVideoSummary] = []  # 保持するレコードのリスト
@@ -274,6 +289,8 @@ class RecordedScanTask:
                 file_modified_at = row['file_modified_at'],
                 file_size = row['file_size'],
                 file_hash = row['file_hash'],
+                playback_index_status = row['playback_index_status'],
+                playback_index_version = row['playback_index_version'],
             )
             if recorded_video_summary.file_path not in videos_by_path:
                 videos_by_path[recorded_video_summary.file_path] = []
@@ -344,6 +361,7 @@ class RecordedScanTask:
         # 各録画フォルダをスキャン
         logging.info('Scanning recorded folders...')
         processed_canonical_paths: set[str] = set()
+        scan_tasks: set[asyncio.Task[None]] = set()
         for folder in self.recorded_folders:
             async for file_path in folder.rglob('*'):
                 try:
@@ -382,14 +400,26 @@ class RecordedScanTask:
                         continue
                     processed_canonical_paths.add(canonical_path_str)
 
-                    # 見つかったファイルを処理
-                    await self.processRecordedFile(
+                    # 録画ごとに独立したパイプラインとして処理する。
+                    # 上限へ達した時だけ完了済みタスクを回収し、別録画のMetadata/Index/CM/Thumbnailを重ねる。
+                    scan_tasks.add(asyncio.create_task(self.processRecordedFile(
                         file_path = canonical_path,
                         original_path = file_path,
                         existing_db_recorded_videos = existing_db_recorded_videos,
-                    )
+                    )))
+                    if len(scan_tasks) >= self.BATCH_PIPELINE_CONCURRENCY:
+                        done_tasks, scan_tasks = await asyncio.wait(
+                            scan_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for done_task in done_tasks:
+                            done_task.result()
                 except Exception as ex:
                     logging.error(f'{file_path}: Failed to process recorded file:', exc_info=ex)
+
+        # ファイル消失判定や不要サムネイル削除は、全パイプラインがDB保存まで完了してから行う。
+        if len(scan_tasks) > 0:
+            await asyncio.gather(*scan_tasks)
 
         # 存在しない録画ファイルに対応するレコードを一括削除
         ## トランザクション配下に入れることでパフォーマンスが向上する
@@ -475,7 +505,7 @@ class RecordedScanTask:
                         logging.info(f'{file_path}: Reanalyzing due to known hash collision ({collision_video_row["file_hash"]}).')
                         await self.processRecordedFile(
                             file_path = file_path,
-                            force_update = True,
+                            analysis_request = 'MetadataReanalysis',
                         )
                         # 処理済みファイルに追加
                         processed_collision_paths.add(file_path_str)
@@ -500,8 +530,7 @@ class RecordedScanTask:
         file_path: anyio.Path,
         original_path: anyio.Path | None = None,
         existing_db_recorded_videos: dict[anyio.Path, RecordedVideoSummary] | None = None,
-        force_update: bool = False,
-        wait_background_analysis: bool = False,
+        analysis_request: AnalysisRequest = 'Automatic',
     ) -> None:
         """
         指定された録画ファイルのメタデータを解析し、DB に永続化する
@@ -512,8 +541,7 @@ class RecordedScanTask:
             original_path (anyio.Path | None): シンボリックリンクなどで取得した元のファイルパス
             existing_db_recorded_videos (dict[anyio.Path, RecordedVideoSummary] | None): 既に DB に永続化されている録画ファイルパスと RecordedVideo のサマリーデータのマッピング
                 (ファイル変更イベントから呼ばれた場合、watchfiles 初期化時に取得した全レコードと今で状態が一致しているとは限らないため、None が入る)
-            force_update (bool): 既に DB に登録されている録画ファイルのメタデータを強制的に再解析するかどうか (デフォルト: False)
-            wait_background_analysis (bool): バックグラウンド解析が完了するまで待つかどうか (デフォルト: False)
+            analysis_request: 自動判定、手動メタデータ再解析、索引再実行、CM再判定のいずれか。
         """
 
         # ファイルパスに対応するロックを取得または作成
@@ -527,6 +555,7 @@ class RecordedScanTask:
 
         # 同一ファイルパスへの DB レコード操作を排他制御する
         async with file_lock:
+            metadata_analysis_recorded_video_id: int | None = None
             try:
                 # 万が一この時点でファイルが存在しない場合はスキップ
                 # ファイル変更イベント発火後に即座にファイルが削除される可能性も考慮
@@ -580,6 +609,8 @@ class RecordedScanTask:
                         'file_modified_at',
                         'file_size',
                         'file_hash',
+                        'playback_index_status',
+                        'playback_index_version',
                     )
                     if len(summary_rows) > 0:
                         row = summary_rows[0]
@@ -593,19 +624,27 @@ class RecordedScanTask:
                             file_modified_at = row['file_modified_at'],
                             file_size = row['file_size'],
                             file_hash = row['file_hash'],
+                            playback_index_status = row['playback_index_status'],
+                            playback_index_version = row['playback_index_version'],
                         )
                         existing_recorded_video_summary.file_path = file_path_str
 
-                # 同じファイルパスの既存レコードがあり、ファイル内容を示す更新日時とサイズが前回と一致した場合、
-                # ファイル内容は変更されておらず、レコード内容は更新不要と判断してスキップ
-                ## こうすることで、録画済みファイルに対しては HDD への I/O 負荷が高いハッシュ算出やメタデータ解析処理を省略できる
+                # 更新日時とサイズが一致する既存録画は、内容をUnchangedと確定できる。
+                # マトリックスから処理集合を決め、索引単独更新などMetadataAnalyzer不要の経路をここで完結させる。
+                ## こうすることで、録画済みファイルに対するハッシュ算出やメタデータ解析を省略する。
                 ## Linux の ctime は権限・所有者などのメタデータ変更でも更新されるため、内容変更の判定には使わない
                 ## 万が一前回実行時からファイルサイズや最終更新日時の変更を伴わずに録画が完了した場合に状態を適切に反映できるよう、録画中はスキップしない
-                if (force_update is False and
-                    existing_recorded_video_summary is not None and
+                if (existing_recorded_video_summary is not None and
                     existing_recorded_video_summary.isFileContentUnchanged(file_modified_at, file_size)):
-                    # logging.debug(f'{file_path}: File content unchanged, skipping...')
-                    return
+                    unchanged_plan = BuildRecordedAnalysisPlan(
+                        'Unchanged',
+                        analysis_request,
+                        existing_recorded_video_summary.playback_index_status,
+                        existing_recorded_video_summary.playback_index_version,
+                    )
+                    if 'AnalyzeMetadata' not in unchanged_plan.actions:
+                        await self.__executePlanWithoutMetadata(file_path, existing_recorded_video_summary.id, unchanged_plan)
+                        return
 
                 # 現在録画中とマークされているファイルの処理
                 is_recording = file_path in self._recording_files
@@ -636,20 +675,22 @@ class RecordedScanTask:
                         # 録画開始前にファイルアロケーションを行う録画予約ソフトでは、録画中も表面上ファイルサイズが変化しない問題への対処
                         pass
 
+                # 既存録画はMetadataAnalyzerを開始する時点で再生をブロックする。
+                # status='Analyzing' は索引キューとは独立した軽量メタデータ解析中を表し、
+                # 内容変更後のファイルを旧索引で再生する競合を防ぐ。
+                status_before_metadata_analysis = existing_recorded_video_summary.status \
+                    if existing_recorded_video_summary is not None else None
+                if existing_recorded_video_summary is not None:
+                    metadata_analysis_recorded_video_id = existing_recorded_video_summary.id
+                    await RecordedVideo.filter(id=existing_recorded_video_summary.id).update(status='Analyzing')
+                    existing_recorded_video_summary.status = 'Analyzing'
+
                 # ProcessPoolExecutor を使い、別プロセス上でメタデータを解析
                 ## メタデータ解析処理は実装上同期 I/O で実装されており、また CPU-bound な処理のため、別プロセスで実行している
                 ## コンテキストマネージャーはキャンセル時にも子プロセス終了を同期的に待つため、イベントループ上では使わない
                 ## 正常完了時は明示的に待ってクリーンアップし、リクエスト切断時だけ待機なしで解放処理へ進める
-                loop = asyncio.get_running_loop()
-                analyzer = MetadataAnalyzer(pathlib.Path(str(file_path)))  # anyio.Path -> pathlib.Path に変換
-                executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
-                should_wait_executor = True
                 try:
-                    recorded_program = await loop.run_in_executor(executor, analyzer.analyze)
-                except asyncio.CancelledError:
-                    should_wait_executor = False
-                    await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
-                    raise
+                    recorded_program = await self.__analyzeMetadata(file_path)
                 except Exception as ex:
                     logging.error(f'{file_path}: Error analyzing metadata:', exc_info=ex)
                     # メタデータ解析中に例外が発生した場合も、この時点ですでに DB にエントリが存在している場合は、UI から判別できるようステータスを更新する
@@ -658,9 +699,6 @@ class RecordedScanTask:
                         existing_recorded_video_summary.status = 'AnalysisFailed'
                     self._recording_files.pop(file_path, None)  # もし録画中扱いであればここで削除
                     return
-                finally:
-                    if should_wait_executor is True:
-                        await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
                 if recorded_program is None:
                     logging.error(f'{file_path}: Failed to analyze metadata.')
                     # メタデータ解析に失敗したがこの時点ですでに DB にエントリが存在している場合は、UI から判別できるようステータスを更新する
@@ -676,6 +714,8 @@ class RecordedScanTask:
                 # 録画中だがまだ60秒に満たない場合、今後のファイル変更イベント発火時に60秒を超えていれば録画中ファイルとして処理される
                 if recorded_program.recorded_video.duration < self.MINIMUM_RECORDING_SECONDS:
                     logging.debug(f'{file_path}: This file is too short. (duration {recorded_program.recorded_video.duration:.1f}s < {self.MINIMUM_RECORDING_SECONDS}s) Skipped.')
+                    if metadata_analysis_recorded_video_id is not None:
+                        await RecordedVideo.filter(id=metadata_analysis_recorded_video_id).update(status='AnalysisFailed')
                     return
 
                 # 前回の DB 取得からメタデータ解析までの間に他のタスクがレコードを作成/更新している可能性があるため、
@@ -688,12 +728,36 @@ class RecordedScanTask:
                         file_path=original_path_str
                     ).select_related('recorded_program', 'recorded_program__channel')
 
-                # 同じファイルパスの既存レコードがあり、先ほど計算した最新のハッシュと変わっていない場合は、レコード内容は更新不要と判断してスキップ
-                ## 万が一前回実行時からファイルサイズや最終更新日時の変更を伴わずに録画が完了した場合に状態を適切に反映できるよう、録画中はスキップしない
-                if (force_update is False and
-                    existing_db_recorded_video_after_analyze is not None and
-                    existing_db_recorded_video_after_analyze.status == 'Recorded' and
-                    existing_db_recorded_video_after_analyze.file_hash == recorded_program.recorded_video.file_hash):
+                # 部分ハッシュまで比較して最終的なContentStateを確定する。
+                # 更新日時だけが変わった同一内容の録画は、Automaticならメタデータを保存せず索引状態だけを処理する。
+                if existing_db_recorded_video_after_analyze is None:
+                    content_state: ContentState = 'New'
+                elif existing_db_recorded_video_after_analyze.file_hash == recorded_program.recorded_video.file_hash:
+                    content_state = 'Unchanged'
+                else:
+                    content_state = 'Changed'
+                analysis_plan = BuildRecordedAnalysisPlan(
+                    content_state,
+                    analysis_request,
+                    existing_db_recorded_video_after_analyze.playback_index_status
+                        if existing_db_recorded_video_after_analyze is not None else None,
+                    existing_db_recorded_video_after_analyze.playback_index_version
+                        if existing_db_recorded_video_after_analyze is not None else None,
+                )
+                if (
+                    content_state == 'Unchanged' and
+                    analysis_request == 'Automatic' and
+                    status_before_metadata_analysis == 'Recorded'
+                ):
+                    assert existing_db_recorded_video_after_analyze is not None
+                    await RecordedVideo.filter(id=existing_db_recorded_video_after_analyze.id).update(status='Recorded')
+                    existing_db_recorded_video_after_analyze.status = 'Recorded'
+                    metadata_analysis_recorded_video_id = None
+                    await self.__executePlanWithoutMetadata(
+                        file_path,
+                        existing_db_recorded_video_after_analyze.id,
+                        analysis_plan,
+                    )
                     return
 
                 # 録画中のファイルとして処理
@@ -717,29 +781,72 @@ class RecordedScanTask:
 
                 # DB に永続化
                 # メタデータ解析後の最新のデータベース情報を使う
-                await self.__saveRecordedMetadataToDB(recorded_program, existing_db_recorded_video_after_analyze)
+                await self.__saveRecordedMetadataToDB(
+                    recorded_program,
+                    existing_db_recorded_video_after_analyze,
+                    content_state,
+                )
+                metadata_analysis_recorded_video_id = None
                 logging.info(f'{file_path}: {"Updated" if existing_db_recorded_video_after_analyze else "Saved"} metadata to DB. (status: {recorded_program.recorded_video.status})')
 
-                # DB への永続化が完了したら、録画完了後のバックグラウンド解析タスクを開始
-                ## "Recording" 状態の録画ファイルはまだ録画が完了していないので、サムネイル生成などの解析タスクは実行しない
-                ## DB 保存に失敗した状態で開始すると、RecordedVideo が存在しないままサムネイル生成だけが進んでしまうため、この処理は永続化後に実行する必要がある
-                if recorded_program.recorded_video.status == 'Recorded':
+                # 録画中は確定解析を行わず、録画完了後の変更イベントで改めて計画する。
+                if recorded_program.recorded_video.status != 'Recorded':
+                    return
+
+                # サムネイルだけは直列処理に含めず、従来どおりバックグラウンドで生成する。
+                # CMは索引完了後に直列実行するため、このタスクへ混在させない。
+                if 'GenerateThumbnail' in analysis_plan.actions:
                     if file_path not in self._background_tasks:
-                        task = asyncio.create_task(self.__runBackgroundAnalysis(recorded_program))
+                        task = asyncio.create_task(self.__runThumbnailGeneration(recorded_program))
                         self._background_tasks[file_path] = task
 
-                # wait_background_analysis が True の場合のみ、バックグラウンド解析タスクが完了するまで待つ
-                # 録画番組メタデータ再解析 API では、API レスポンスの返却をもってメタデータ再解析が完全に完了したことをユーザーに伝える必要があるため
-                if wait_background_analysis is True and file_path in self._background_tasks:
-                    await self._background_tasks[file_path]
+                # 新規・内容変更・手動再解析は、DBへ暫定保存した後で全編索引を直列実行する。
+                # MetadataAnalyzerが得たEIT候補はDBの旧確定索引を上書きせず、今回の索引入力としてだけ渡す。
+                if 'BuildPlaybackIndex' in analysis_plan.actions:
+                    assert analysis_plan.index_priority is not None
+                    db_recorded_video = await RecordedVideo.get(file_path=file_path_str)
+                    from app.metadata.RecordedPlaybackIndexer import (
+                        RecordedPlaybackIndexer,
+                    )
+                    await RecordedPlaybackIndexer.enqueue(
+                        db_recorded_video.id,
+                        priority=analysis_plan.index_priority,
+                        metadata_seed=recorded_program.recorded_video,
+                        force_rebuild=analysis_request == 'MetadataReanalysis',
+                    )
+
+                # 索引が失敗してもファイルが残っていればCM判定を続行し、結果を必ず明示保存する。
+                if 'DetectCM' in analysis_plan.actions and await self.isFileExists(file_path):
+                    await CMSectionsDetector(file_path, recorded_program.recorded_video.duration).detectAndSave()
 
             except Exception as ex:
                 logging.error(f'{file_path}: Error processing file inside lock:', exc_info=ex)
+                if metadata_analysis_recorded_video_id is not None:
+                    await RecordedVideo.filter(id=metadata_analysis_recorded_video_id).update(status='AnalysisFailed')
             finally:
                 # 不要になったロックを管理辞書から削除 (ロックが解放された後に行う)
                 async with self._file_locks_dict_lock:
                      if file_path in self._file_locks and not file_lock.locked():
                         self._file_locks.pop(file_path, None)
+
+
+    @staticmethod
+    async def __analyzeMetadata(file_path: anyio.Path) -> schemas.RecordedProgram | None:
+        """同期MetadataAnalyzerを専用プロセスで実行し、キャンセル時も確実に回収する。"""
+
+        loop = asyncio.get_running_loop()
+        analyzer = MetadataAnalyzer(pathlib.Path(str(file_path)))
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+        should_wait_executor = True
+        try:
+            return await loop.run_in_executor(executor, analyzer.analyze)
+        except asyncio.CancelledError:
+            should_wait_executor = False
+            await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
+            raise
+        finally:
+            if should_wait_executor is True:
+                await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
 
 
     @staticmethod
@@ -764,6 +871,40 @@ class RecordedScanTask:
         except OSError as e:
             logging.warning(f'{file_path}: OSError during is_file() check:', exc_info=e)
             return False
+
+
+    async def __executePlanWithoutMetadata(
+        self,
+        file_path: anyio.Path,
+        recorded_video_id: int,
+        analysis_plan: RecordedAnalysisPlan,
+    ) -> None:
+        """MetadataAnalyzer不要の索引単独更新またはCM再判定を実行する。
+
+        Args:
+            file_path: 解析対象の録画ファイル。
+            recorded_video_id: 対応するRecordedVideoのID。
+            analysis_plan: マトリックスから構築済みの処理計画。
+
+        Returns:
+            None
+        """
+
+        if 'BuildPlaybackIndex' in analysis_plan.actions:
+            assert analysis_plan.index_priority is not None
+            from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
+            index_future = RecordedPlaybackIndexer.enqueue(
+                recorded_video_id,
+                priority=analysis_plan.index_priority,
+            )
+            # 自動バックフィルはファイルスキャンを待たせない。明示的な再実行だけ完了まで待つ。
+            if analysis_plan.index_priority != 2:
+                await index_future
+
+        if 'DetectCM' in analysis_plan.actions and await self.isFileExists(file_path):
+            db_recorded_video = await RecordedVideo.get_or_none(id=recorded_video_id)
+            if db_recorded_video is not None:
+                await CMSectionsDetector(file_path, db_recorded_video.duration).detectAndSave()
 
 
     @staticmethod
@@ -847,6 +988,7 @@ class RecordedScanTask:
         self,
         recorded_program: schemas.RecordedProgram,
         existing_db_recorded_video: RecordedVideo | None,
+        content_state: ContentState,
     ) -> None:
         """
         録画ファイルのメタデータ解析結果を DB に保存する
@@ -857,6 +999,7 @@ class RecordedScanTask:
         Args:
             recorded_program (schemas.RecordedProgram): 保存する録画番組情報
             existing_db_recorded_video (RecordedVideo | None): 既に DB に永続化されている録画ファイルの RecordedVideo レコード
+            content_state: DB保存時点で確定したファイル内容状態。
         """
 
         # トランザクション配下に入れることでパフォーマンスが向上する
@@ -961,11 +1104,8 @@ class RecordedScanTask:
             else:
                 db_recorded_video = RecordedVideo()
 
-            # ファイル内容が更新された場合だけ再生用インデックスを無効化する。
-            ## メタデータの手動再解析だけでReady済みインデックスを捨てないため、保存前のhashと比較する。
-            previous_file_hash = existing_db_recorded_video.file_hash if existing_db_recorded_video is not None else None
-
             # RecordedVideo の属性を設定 (id, created_at, updated_at は自動生成のため指定しない)
+            # ここでは軽量メタデータ解析が所有するファイル情報・時刻・暫定メディア情報だけを更新する。
             db_recorded_video.recorded_program = db_recorded_program
             db_recorded_video.status = recorded_program.recorded_video.status
             db_recorded_video.file_path = str(recorded_program.recorded_video.file_path)
@@ -982,51 +1122,43 @@ class RecordedScanTask:
             db_recorded_video.container_format = recorded_program.recorded_video.container_format
             db_recorded_video.has_video = recorded_program.recorded_video.has_video
             db_recorded_video.has_audio = recorded_program.recorded_video.has_audio
-            db_recorded_video.video_codec = recorded_program.recorded_video.video_codec
-            db_recorded_video.video_codec_profile = recorded_program.recorded_video.video_codec_profile
-            db_recorded_video.video_scan_type = recorded_program.recorded_video.video_scan_type
-            db_recorded_video.video_frame_rate = recorded_program.recorded_video.video_frame_rate
-            db_recorded_video.video_resolution_width = recorded_program.recorded_video.video_resolution_width
-            db_recorded_video.video_resolution_height = recorded_program.recorded_video.video_resolution_height
-            db_recorded_video.has_video_stream_changes = recorded_program.recorded_video.has_video_stream_changes
-            db_recorded_video.primary_audio_codec = recorded_program.recorded_video.primary_audio_codec
-            db_recorded_video.primary_audio_channel = recorded_program.recorded_video.primary_audio_channel
-            db_recorded_video.primary_audio_sampling_rate = recorded_program.recorded_video.primary_audio_sampling_rate
-            db_recorded_video.secondary_audio_codec = recorded_program.recorded_video.secondary_audio_codec
-            db_recorded_video.secondary_audio_channel = recorded_program.recorded_video.secondary_audio_channel
-            db_recorded_video.secondary_audio_sampling_rate = recorded_program.recorded_video.secondary_audio_sampling_rate
-            db_recorded_video.audio_tracks = recorded_program.recorded_video.audio_tracks
-            db_recorded_video.audio_track_timeline = recorded_program.recorded_video.audio_track_timeline
-            db_recorded_video.subtitle_tracks = recorded_program.recorded_video.subtitle_tracks
-            if previous_file_hash != recorded_program.recorded_video.file_hash:
+
+            # New/Changedでは全編索引がまだ存在しないため、画面表示に必要な暫定値を保存する。
+            # Unchangedの手動再解析では、Indexerが所有する既存の確定値を成功時まで変更しない。
+            if content_state in ('New', 'Changed'):
+                db_recorded_video.video_codec = recorded_program.recorded_video.video_codec
+                db_recorded_video.video_codec_profile = recorded_program.recorded_video.video_codec_profile
+                db_recorded_video.video_scan_type = recorded_program.recorded_video.video_scan_type
+                db_recorded_video.video_frame_rate = recorded_program.recorded_video.video_frame_rate
+                db_recorded_video.video_resolution_width = recorded_program.recorded_video.video_resolution_width
+                db_recorded_video.video_resolution_height = recorded_program.recorded_video.video_resolution_height
+                db_recorded_video.has_video_stream_changes = recorded_program.recorded_video.has_video_stream_changes
+                db_recorded_video.primary_audio_codec = recorded_program.recorded_video.primary_audio_codec
+                db_recorded_video.primary_audio_channel = recorded_program.recorded_video.primary_audio_channel
+                db_recorded_video.primary_audio_sampling_rate = recorded_program.recorded_video.primary_audio_sampling_rate
+                db_recorded_video.secondary_audio_codec = recorded_program.recorded_video.secondary_audio_codec
+                db_recorded_video.secondary_audio_channel = recorded_program.recorded_video.secondary_audio_channel
+                db_recorded_video.secondary_audio_sampling_rate = recorded_program.recorded_video.secondary_audio_sampling_rate
+                db_recorded_video.audio_tracks = recorded_program.recorded_video.audio_tracks
+                db_recorded_video.audio_track_timeline = recorded_program.recorded_video.audio_track_timeline
+                db_recorded_video.subtitle_tracks = recorded_program.recorded_video.subtitle_tracks
                 db_recorded_video.playback_index_status = 'Pending'
                 db_recorded_video.playback_index_version = None
                 db_recorded_video.playback_indexed_at = None
                 db_recorded_video.playback_index_error_code = None
                 db_recorded_video.video_stream_timeline = None
-            # ファイル本体を再解析した場合、以前の再生開始位置キャッシュは別ファイル由来の可能性がある
-            ## 新規録画と同じ空状態へ戻し、次回再生時に現在のファイルからオンデマンドで解決する
-            db_recorded_video.key_frames = []
-            db_recorded_video.segment_map = []
-            db_recorded_video.ts_source_base_dts = None
-            # この時点では CM 区間情報は未解析なので、明示的に未解析を表す None を設定する (デフォルトで None だが念のため)
-            # 「解析したが CM 区間がなかった/検出に失敗した」場合、CMSectionsDetector 側で [] が設定される
-            db_recorded_video.cm_sections = None
+                # ファイル内容に依存する再生キャッシュ、CM、サムネイルだけを新しい内容用に無効化する。
+                db_recorded_video.key_frames = []
+                db_recorded_video.segment_map = []
+                db_recorded_video.ts_source_base_dts = None
+                db_recorded_video.cm_sections = None
+                db_recorded_video.thumbnail_info = None
             await db_recorded_video.save()
 
-            # 録画完了直後のインデックス生成は既存録画バックフィルより優先する。
-            ## 循環参照を避けるため、保存が完了した時点で遅延インポートする。
-            if db_recorded_video.playback_index_status == 'Pending':
-                from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
-                RecordedPlaybackIndexer.enqueue(db_recorded_video.id, priority=1)
 
-
-    async def __runBackgroundAnalysis(self, recorded_program: schemas.RecordedProgram) -> None:
+    async def __runThumbnailGeneration(self, recorded_program: schemas.RecordedProgram) -> None:
         """
-        録画完了後のバックグラウンド解析タスク
-        - サムネイル生成
-        - CM区間検出
-        など、時間のかかる処理を非同期に同時実行する
+        録画完了後のサムネイルをバックグラウンド生成する。
 
         Args:
             recorded_program (schemas.RecordedProgram): 解析対象の録画番組情報
@@ -1042,14 +1174,10 @@ class RecordedScanTask:
                 # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
                 async with DriveIOLimiter.getSemaphore(file_path):
                     if recorded_program.recorded_video.has_video is False:
-                        logging.info(f'{file_path}: Skipping video-dependent background analysis for audio-only recording.')
+                        logging.info(f'{file_path}: Skipping thumbnail generation for audio-only recording.')
                         return
-                    await asyncio.gather(
-                        # 録画ファイルの CM 区間を検出し DB に保存
-                        CMSectionsDetector(file_path, recorded_program.recorded_video.duration).detectAndSave(),
-                        # シークバー用サムネイルとリスト表示用の代表サムネイルの両方を生成
-                        ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave(),
-                    )
+                    # シークバー用サムネイルとリスト表示用の代表サムネイルの両方を生成する。
+                    await ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave()
             logging.info(f'{file_path}: Background analysis task completed.')
 
         except Exception as ex:

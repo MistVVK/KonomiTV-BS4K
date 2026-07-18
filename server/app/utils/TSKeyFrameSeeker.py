@@ -172,6 +172,65 @@ class TSKeyFrameSeeker:
     KEYFRAME_BACKTRACK_BYTES = 8 * 1024 * 1024
     MAX_KEYFRAME_SCAN_BYTES = 96 * 1024 * 1024
 
+    @staticmethod
+    def findAudioPIDGroups(
+        path: Path,
+        sample_count: int = 5,
+        max_scan_bytes_per_sample: int = 4 * 1024 * 1024,
+    ) -> list[dict[int, int]]:
+        """録画内の複数位置にあるPAT/PMTから、program単位の音声PID集合を列挙する。"""
+
+        packet_size = TSKeyFrameSeeker.__detectPacketSize(path)
+        file_size = path.stat().st_size
+        audio_stream_types = {0x03, 0x04, 0x0F, 0x11, 0x81, 0x87}
+        audio_pids_by_program: dict[int, dict[int, int]] = {}
+        if sample_count <= 1:
+            sample_offsets = [0]
+        else:
+            max_start = max(0, file_size - max_scan_bytes_per_sample)
+            sample_offsets = [
+                int(max_start * index / (sample_count - 1))
+                for index in range(sample_count)
+            ]
+
+        with path.open('rb') as file:
+            for sample_offset in sample_offsets:
+                aligned_offset = max(0, (sample_offset // packet_size) * packet_size)
+                file.seek(aligned_offset)
+                pat_parser = SectionParser(PATSection)
+                pmt_parsers: dict[int, SectionParser[PMTSection]] = {}
+                program_numbers_by_pmt_pid: dict[int, int] = {}
+                max_packet_count = max(1, max_scan_bytes_per_sample // packet_size)
+                for _ in range(max_packet_count):
+                    packet = TSKeyFrameSeeker.normalizePacket(file.read(packet_size), packet_size)
+                    if packet is None:
+                        break
+                    packet_pid = ts.pid(packet)
+                    if packet_pid == 0x00:
+                        pat_parser.push(packet)
+                        for pat in pat_parser:
+                            if pat.CRC32() != 0:
+                                continue
+                            for program_number, pmt_pid in pat:
+                                if program_number == 0:
+                                    continue
+                                program_numbers_by_pmt_pid[pmt_pid] = program_number
+                                pmt_parsers.setdefault(pmt_pid, SectionParser(PMTSection))
+                        continue
+                    pmt_parser = pmt_parsers.get(packet_pid)
+                    if pmt_parser is None:
+                        continue
+                    pmt_parser.push(packet)
+                    for pmt in pmt_parser:
+                        if pmt.CRC32() != 0:
+                            continue
+                        program_number = program_numbers_by_pmt_pid[packet_pid]
+                        audio_pids = audio_pids_by_program.setdefault(program_number, {})
+                        for stream_type, elementary_pid, _descriptors in pmt:
+                            if stream_type in audio_stream_types:
+                                audio_pids[elementary_pid] = stream_type
+        return [pids for pids in audio_pids_by_program.values() if pids]
+
 
     @staticmethod
     def findARIBCaptionPIDs(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) -> set[int]:

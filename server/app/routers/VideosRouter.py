@@ -819,10 +819,14 @@ async def VideoPlaybackIndexCreateAPI(
 
     await recorded_program.recorded_video.refresh_from_db()
     index = BuildRecordedPlaybackIndex(recorded_program)
+    # 軽量メタデータ解析中・録画中・解析失敗中は、現ファイルに対応する索引入力が未確定。
+    # 先に索引だけを起動すると旧メタデータと変更後ファイルが混在するため、Metadata完了を待つ。
+    if recorded_program.recorded_video.status != 'Recorded':
+        return index
     if index.state != 'Ready':
-        # StaleやFailedのままでは、POST直後のポーリングが解析失敗と誤認する。
-        # 実行中のジョブは維持し、それ以外はPendingへ移してから共有キューへ投入する。
-        if index.state != 'Analyzing':
+        # 索引を持たないFailedだけPendingへ戻す。Staleは旧Versionと全索引データを
+        # 成功時まで公開したまま、メモリ上の進捗だけを更新する。
+        if index.state == 'Failed':
             await RecordedVideo.filter(id=recorded_program.recorded_video.id) \
                 .exclude(playback_index_status='Analyzing').update(
                     playback_index_status = 'Pending',
@@ -972,20 +976,15 @@ async def VideoReanalyzeAPI(
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
 ):
     """
-    指定された録画番組のメタデータ（動画情報・番組情報・サムネイル画像・CM 区間情報など）をすべて再解析・再生成する。
+    指定された録画番組のメタデータと再生索引を再解析する。CM区間とサムネイルは保持する。
     """
 
     try:
         file_path = anyio.Path(recorded_program.recorded_video.file_path)
-        # メタデータ再解析を実行
-        ## wait_background_analysis = True 指定時は DriveIOLimiter を掛けるとデッドロックが発生するので、敢えて掛けない
-        ## どのみち内部で実行される RecordedScanTask で DriveIOLimiter を掛けているため、ここで掛ける必要はない
+        # メタデータ再解析を実行し、索引の再構築まで待つ。
         await RecordedScanTask().processRecordedFile(
             file_path = file_path,
-            # 既に DB に登録されている録画ファイルのメタデータを強制的に再解析する
-            force_update = True,
-            # API レスポンスの返却をもってメタデータ再解析が完全に完了したことをユーザーに伝えるため、バックグラウンド解析タスクが完了するまで待つ
-            wait_background_analysis = True,
+            analysis_request = 'MetadataReanalysis',
         )
 
     except Exception as ex:
@@ -994,6 +993,28 @@ async def VideoReanalyzeAPI(
             status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail = f'Failed to reanalyze the video: {ex!s}',
         )
+
+
+@router.post(
+    '/{video_id}/detect-cm-sections',
+    summary = '録画番組 CM 区間再判定 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def VideoDetectCMSectionsAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
+) -> None:
+    """指定された録画番組のCM区間を、既存結果の有無を問わず再判定する。"""
+
+    file_path = anyio.Path(recorded_program.recorded_video.file_path)
+    if not await file_path.is_file():
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Recorded video file was not found',
+        )
+    await RecordedScanTask().processRecordedFile(
+        file_path=file_path,
+        analysis_request='CMDetection',
+    )
 
 
 @router.get(

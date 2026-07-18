@@ -15,9 +15,8 @@ from app import logging, schemas
 from app.config import Config, LoadConfig
 from app.constants import JST, LIBRARY_PATH
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
-from app.utils import ClosestMultiple
 from app.utils.TSInformation import TSInformation
-from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker, TSStreamInfo
+from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker
 
 
 class FFprobeFormat(BaseModel):
@@ -227,7 +226,6 @@ class MetadataAnalyzer:
     FFPROBE_PROBESIZE: ClassVar[str] = '80M'
     # TS の映像ストリーム変化検出で、各サンプル位置から読み込む最大バイト数
     ## 末尾サンプルでも同じ値を使い、割合指定だけでは短くなりやすい小さめの録画でも PMT を拾える範囲を確保する
-    MAX_STREAM_SCAN_BYTES: ClassVar[int] = 8 * 1024 * 1024
 
     def __init__(self, recorded_file_path: Path) -> None:
         """
@@ -607,7 +605,8 @@ class MetadataAnalyzer:
                     logging.warning(f'{self.recorded_file_path}: sync_byte is missing. ignored.')
                     return None
 
-            has_video_stream_changes = self.__detectTSVideoStreamChanges(end_ts_offset) if has_video else False
+            # 映像PID・構成変更の確定は全編索引解析が所有する。
+            has_video_stream_changes = False
 
         # ファイルハッシュを計算
         try:
@@ -813,61 +812,17 @@ class MetadataAnalyzer:
         tracks: list[schemas.AudioTrack],
         duration: float,
     ) -> list[schemas.AudioTrackTimelineEntry]:
-        """FFprobe が列挙したストリームの有効期間から音声構成タイムラインを組み立てる。"""
+        """軽量probeが列挙した音声から暫定タイムラインを組み立てる。"""
 
         if not tracks:
             return [{'start_time': 0.0, 'end_time': duration, 'tracks': []}]
         if self.recorded_file_path.suffix.lower() in ['.ts', '.mts', '.m2ts']:
-            pid_tracks = {
-                pid: cast(schemas.AudioTrackTimelineTrack, track)
-                for track in tracks if (pid := track.get('pid')) is not None
-            }
-            if pid_tracks:
-                first_packet: dict[int, int | None] = {pid: None for pid in pid_tracks}
-                last_packet: dict[int, int | None] = {pid: None for pid in pid_tracks}
-                packet_index = 0
-                with self.recorded_file_path.open('rb') as file:
-                    while packet := file.read(ts.PACKET_SIZE):
-                        if len(packet) < ts.PACKET_SIZE:
-                            break
-                        if packet[0] != 0x47:
-                            packet_index += 1
-                            continue
-                        packet_pid = ((packet[1] & 0x1F) << 8) | packet[2]
-                        if packet_pid in pid_tracks:
-                            if first_packet[packet_pid] is None:
-                                first_packet[packet_pid] = packet_index
-                            last_packet[packet_pid] = packet_index
-                        packet_index += 1
-                if packet_index > 0:
-                    active_ranges: list[tuple[float, float, schemas.AudioTrackTimelineTrack]] = []
-                    boundaries = {0.0, duration}
-                    for pid, track in pid_tracks.items():
-                        first_packet_index = first_packet[pid]
-                        last_packet_index = last_packet[pid]
-                        if first_packet_index is None or last_packet_index is None:
-                            continue
-                        start = duration * first_packet_index / packet_index
-                        end = min(duration, duration * (last_packet_index + 1) / packet_index)
-                        # TSパケット位置換算の微小誤差で先頭/末尾に隙間を作らない。
-                        if start < 0.5:
-                            start = 0.0
-                        if duration - end < 0.5:
-                            end = duration
-                        active_ranges.append((start, end, track))
-                        boundaries.update((start, end))
-                    if active_ranges:
-                        timeline: list[schemas.AudioTrackTimelineEntry] = []
-                        ordered_boundaries = sorted(boundaries)
-                        for index, start in enumerate(ordered_boundaries[:-1]):
-                            end = ordered_boundaries[index + 1]
-                            active_tracks = [track for track_start, track_end, track in active_ranges
-                                             if track_start <= start < track_end]
-                            if timeline and timeline[-1]['tracks'] == active_tracks:
-                                timeline[-1]['end_time'] = end
-                            else:
-                                timeline.append({'start_time': start, 'end_time': end, 'tracks': active_tracks})
-                        return timeline
+            # TSのPID存在範囲は全編フレーム走査で確定するため、独立したTS全体走査は行わない。
+            return [{
+                'start_time': 0.0,
+                'end_time': duration,
+                'tracks': cast(list[schemas.AudioTrackTimelineTrack], tracks),
+            }]
 
         # MP4/MKV 等のトラックは全時間有効。PIDを取得できないTSはstart_time/durationへフォールバックする。
         if len(streams) != len(tracks) or all(stream.start_time is None for stream in streams):
@@ -1089,93 +1044,10 @@ class MetadataAnalyzer:
             return None
 
 
-    def __detectTSVideoStreamChanges(self, end_ts_offset: int | None) -> bool:
-        """
-        録画 TS 内で映像ストリーム構成が変化しているかを軽量に検出する
-
-        Args:
-            end_ts_offset (int | None): 有効な TS データの終了位置 (ゼロ埋め領域を除外する場合に指定)
-
-        Returns:
-            bool: 映像 PID または映像コーデックが途中で変化している場合は True
-        """
-
-        file_size = self.recorded_file_path.stat().st_size
-        effective_size = min(end_ts_offset, file_size) if end_ts_offset is not None else file_size
-        if effective_size < ts.PACKET_SIZE * 100:
-            return False
-
-        stream_infos: list[tuple[float, TSStreamInfo]] = []
-        selected_sample_offsets: set[int] = set()
-        for sample_ratio in (0.0, 0.25, 0.98):
-            # 先頭・本編付近・末尾付近だけを見ることで、録画マージン由来の PID 切替を低コストで拾う
-            ## 正常録画では PMT が同一のため、追加 I/O は数 MB の局所読み取りだけで終わる
-            ## 末尾側は割合指定だと小さめの録画で探索範囲が短くなるため、最後の数 MB を固定で読む
-            if sample_ratio == 0.98:
-                sample_offset = ClosestMultiple(
-                    max(effective_size - self.MAX_STREAM_SCAN_BYTES, 0),
-                    ts.PACKET_SIZE,
-                )
-            else:
-                sample_offset = ClosestMultiple(int(effective_size * sample_ratio), ts.PACKET_SIZE)
-            if sample_offset > effective_size - ts.PACKET_SIZE:
-                sample_offset = ClosestMultiple(max(effective_size - ts.PACKET_SIZE, 0), ts.PACKET_SIZE)
-            if sample_offset > effective_size - ts.PACKET_SIZE:
-                sample_offset = max(sample_offset - ts.PACKET_SIZE, 0)
-
-            # 小さな録画では先頭サンプルだけでファイル全体を読めるため、末尾サンプルが同じ offset になることがある
-            ## 同じ位置を重複して読むと検出力は増えず、判定材料の件数だけが水増しされるのでスキップする
-            if sample_offset in selected_sample_offsets:
-                continue
-            selected_sample_offsets.add(sample_offset)
-
-            try:
-                stream_info = TSKeyFrameSeeker.findStreamInfo(
-                    self.recorded_file_path,
-                    start_offset = sample_offset,
-                    max_scan_bytes = self.MAX_STREAM_SCAN_BYTES,
-                )
-            except Exception as ex:
-                # PMT がサンプル範囲で拾えない TS でもメタデータ解析自体は継続する
-                ## 検出不能な位置は判定材料から外し、取れた位置だけで保守的に判断する
-                logging.warning(
-                    f'{self.recorded_file_path}: Failed to inspect TS video stream info. '
-                    f'[sample_ratio: {sample_ratio}, sample_offset: {sample_offset}]',
-                    exc_info=ex,
-                )
-                continue
-
-            stream_infos.append((sample_ratio, stream_info))
-
-        if len(stream_infos) < 2:
-            return False
-
-        base_stream_info = stream_infos[0][1]
-        for sample_ratio, stream_info in stream_infos[1:]:
-            # 映像 PID や映像ストリーム構成が途中で変わる録画（マルチ編成開始/終了での解像度変更時など）に関して、
-            # HWEncC 系エンコーダーは --avhw だと録画マージン区間 -> 本編での解像度切り替えに対応できずクラッシュし、
-            # --avsw の場合はエラーこそ出ないがデコードがめちゃくちゃになる問題がある
-            ## 録画ファイル自体の代表解像度は 25% 位置の FFprobe サンプルから取得済みなので、ここではエンコーダー選択用のフラグのみ決める
-            ## この関数の戻り値が RecordedVideo.has_video_stream_changes に反映され、True の場合は再生時エンコーダーが FFmpeg に固定される
-            if (
-                stream_info.video_pid != base_stream_info.video_pid or
-                stream_info.codec != base_stream_info.codec
-            ):
-                logging.info(
-                    f'{self.recorded_file_path}: Video stream changes were detected. '
-                    f'[base_video_pid: {base_stream_info.video_pid:#x}, base_codec: {base_stream_info.codec}, '
-                    f'sample_ratio: {sample_ratio}, video_pid: {stream_info.video_pid:#x}, codec: {stream_info.codec}]'
-                )
-                return True
-
-        return False
-
-
     def __analyzeFFprobe(self) -> tuple[FFprobeResult, FFprobeSampleResult, int | None] | None:
         """
         録画ファイルのメディア情報を FFprobe を使って解析する
-        全体解析と部分解析の2段階で解析を行う
-        全体解析では全般情報（コンテナ情報、録画時間など）を、部分解析では映像・音声情報を取得する
+        軽量probeでコンテナ情報と暫定表示に必要な映像・音声情報を取得する
 
         Returns:
             tuple[FFprobeResult, FFprobeSampleResult, int | None] | None: 全体解析と部分解析の結果、有効な TS データの終了位置のタプル
@@ -1219,100 +1091,12 @@ class MetadataAnalyzer:
                 logging.warning(f'{self.recorded_file_path}: Duration is missing and fallback failed.')
                 return None
 
-        # 部分解析: 録画ファイルの25%位置から30秒程度のデータを取得し、メディア情報を解析する
-        sample_json: dict[str, Any] | None = None
-        sample_data = b''
-        sample_size = ClosestMultiple(18 * 1024 * 1024 * 30 // 8, ts.PACKET_SIZE)
-        if full_probe.format.bit_rate is not None:
-            try:
-                # Use roughly 30 seconds of the actual TS bitrate. BS8K is around 80Mbps,
-                # so the old fixed 18Mbps sample often covered only a few seconds.
-                actual_sample_size = int(int(full_probe.format.bit_rate) * 30 // 8)
-                sample_size = ClosestMultiple(max(sample_size, actual_sample_size), ts.PACKET_SIZE)
-                sample_size = min(sample_size, ClosestMultiple(512 * 1024 * 1024, ts.PACKET_SIZE))
-            except ValueError:
-                pass
+        # 軽量解析では先頭probeから暫定表示に必要な情報だけを作る。
+        # 25%位置の30秒サンプルと追加フレーム検査は廃止し、代表情報・構成変化は全編索引へ委譲する。
         try:
-            # MPEG-TS 形式の場合のみ実行
-            if 'mpegts' in (full_probe.format.format_name or '').lower():
-                # ファイルを開く
-                with open(self.recorded_file_path, 'rb') as f:
-                    # 25%位置にシーク (TS パケットサイズに合わせて切り出す)
-                    file_size = self.recorded_file_path.stat().st_size
-                    offset = ClosestMultiple(int(file_size * 0.25), ts.PACKET_SIZE)
-                    f.seek(offset)
-                    # 30秒程度のデータを読み込む
-                    ## サンプルとして FFprobe に渡すデータが30秒より短いと正確に解析できないことがある
-                    sample_data = f.read(sample_size)
-                    # サンプルデータが全てゼロ埋めされているかチェック
-                    if sample_data and all(byte == 0 for byte in sample_data):
-                        # ゼロ埋め領域の境界を取得するため calculateTSFileDuration を実行
-                        duration_result = self.__calculateTSFileDuration()
-                        if duration_result is None:
-                            logging.warning(f'{self.recorded_file_path}: Failed to calculate duration.')
-                            return None
-                        # ゼロ埋め領域を除いた有効データ範囲から再度サンプルを取得
-                        # 有効データ範囲の25%位置にシーク
-                        _, end_ts_offset = duration_result
-                        offset = ClosestMultiple(int(end_ts_offset * 0.25), ts.PACKET_SIZE)
-                        f.seek(offset)
-                        # 30秒程度のデータを読み込む (ビットレートを 18Mbps と仮定)
-                        sample_size = min(sample_size, end_ts_offset - offset)  # 有効データ範囲を超えないようにする
-                        sample_data = f.read(sample_size)
-
-                    # 録画ファイルから切り出したサンプルを標準入力から FFprobe に渡して解析
-                    args_sample = [
-                        '-hide_banner',
-                        '-loglevel', 'error',
-                        '-analyzeduration', self.FFPROBE_ANALYZE_DURATION_US,
-                        '-probesize', self.FFPROBE_PROBESIZE,
-                        '-f', 'mpegts',
-                        '-i', 'pipe:0',
-                        '-show_streams',
-                        '-of', 'json',
-                    ]
-                    sample_json = self.__runFFprobe(args_sample, input_bytes=sample_data)
-            else:
-                # MPEG-TS 形式でない場合は部分解析はせず、全体解析の結果をそのまま設定
-                sample_json = full_json
+            sample_probe = FFprobeSampleResult(**full_json)
         except Exception as ex:
-            logging.warning(f'{self.recorded_file_path}: Failed to analyze sample via ffprobe:', exc_info=ex)
-            return None
-
-        if sample_json is None:
-            return None
-
-        # 部分解析の映像ストリームに field_order が含まれない場合のみ、同じサンプルの先頭2秒程度から
-        # 実フレームの interlaced_frame を取得する。通常ケースでは追加解析を行わず、録画スキャンの負荷を抑える。
-        ## HEVC では Progressive 映像でも field_order 自体が省略されることがあり、欠落を Interlaced とみなすと
-        ## インターレース解除済み録画が一律で誤判定されるため、フレーム単位の情報をフォールバックに用いる。
-        sample_video_stream = next(
-            (stream for stream in sample_json.get('streams', []) if stream.get('codec_type') == 'video'),
-            None,
-        )
-        if (sample_video_stream is not None and sample_video_stream.get('field_order') is None and
-            full_probe.format.format_name == 'mpegts'):
-            args_frames = [
-                '-hide_banner',
-                '-loglevel', 'error',
-                '-analyzeduration', self.FFPROBE_ANALYZE_DURATION_US,
-                '-probesize', self.FFPROBE_PROBESIZE,
-                '-f', 'mpegts',
-                '-i', 'pipe:0',
-                '-select_streams', 'v:0',
-                '-read_intervals', '%+2',
-                '-show_frames',
-                '-show_entries', 'frame=interlaced_frame',
-                '-of', 'json',
-            ]
-            frames_json = self.__runFFprobe(args_frames, input_bytes=sample_data)
-            if frames_json is not None:
-                sample_json['frames'] = frames_json.get('frames', [])
-
-        try:
-            sample_probe = FFprobeSampleResult(**sample_json)
-        except Exception as ex:
-            logging.warning(f'{self.recorded_file_path}: Failed to parse sample ffprobe result:', exc_info=ex)
+            logging.warning(f'{self.recorded_file_path}: Failed to build provisional ffprobe result:', exc_info=ex)
             return None
 
         # 解析処理中に calculateTSFileDuration() を実行した場合は、有効な TS データの終了位置も一緒に返す

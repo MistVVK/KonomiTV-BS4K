@@ -4,7 +4,10 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
-from app.routers.VideosRouter import BuildRecordedPlaybackIndex
+from app.routers.VideosRouter import (
+    BuildRecordedPlaybackIndex,
+    VideoPlaybackIndexCreateAPI,
+)
 from app.routers.VideoStreamsRouter import EnsurePlaybackIndexReady, GetRecordedStream
 
 
@@ -40,7 +43,7 @@ def test_master_playlist_waits_for_on_demand_playback_index(monkeypatch) -> None
 
     async def RefreshFromDB() -> None:
         recorded_video.playback_index_status = 'Ready'
-        recorded_video.playback_index_version = 6
+        recorded_video.playback_index_version = 10
 
     recorded_video.refresh_from_db = RefreshFromDB
     recorded_program = SimpleNamespace(recorded_video=recorded_video)
@@ -59,7 +62,7 @@ def test_master_playlist_waits_for_on_demand_playback_index(monkeypatch) -> None
 
     assert enqueued_priorities == [(61, 0)]
     assert recorded_video.playback_index_status == 'Ready'
-    assert recorded_video.playback_index_version == 6
+    assert recorded_video.playback_index_version == 10
 
 
 def test_stale_ready_recording_is_rejected() -> None:
@@ -98,6 +101,35 @@ def test_recorded_playback_index_response_contains_stale_and_current_version() -
     assert index.status == 'Ready'
     assert index.state == 'Stale'
     assert index.version == 5
-    assert index.current_version == 6
+    assert index.current_version == 10
     assert index.progress == 0.0
     assert index.stage == 'Queued'
+
+
+def test_metadata_analysis_blocks_index_enqueue(monkeypatch) -> None:
+    """軽量Metadata解析がRecordedへ戻るまで、旧情報による索引生成を開始しない。"""
+
+    recorded_video = SimpleNamespace(
+        id=61,
+        status='Analyzing',
+        playback_index_status='Ready',
+        playback_index_version=7,
+        playback_indexed_at=None,
+        playback_index_error_code=None,
+    )
+
+    async def RefreshFromDB() -> None:
+        return None
+
+    recorded_video.refresh_from_db = RefreshFromDB
+    recorded_program = SimpleNamespace(recorded_video=recorded_video)
+    enqueue_calls: list[int] = []
+    monkeypatch.setattr(
+        'app.routers.VideosRouter.RecordedPlaybackIndexer.enqueue',
+        lambda recorded_video_id, **_kwargs: enqueue_calls.append(recorded_video_id),
+    )
+
+    index = asyncio.run(VideoPlaybackIndexCreateAPI(recorded_program))
+
+    assert index.state == 'Stale'
+    assert enqueue_calls == []

@@ -201,6 +201,7 @@ export default defineComponent({
                 right: 0px !important;
                 bottom: env(safe-area-inset-bottom) !important;  // iPhone X 以降の Home Indicator の高さ分
                 width: 100% !important;
+                max-width: none !important;
                 height: 100% !important;
                 background: rgb(var(--v-theme-background));
                 transform: translateY(40%) !important;

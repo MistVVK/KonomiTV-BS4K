@@ -3,11 +3,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 from fastapi import FastAPI, Query
 from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 
-from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
+from app.metadata.RecordedPlaybackIndexer import (
+    RecordedPlaybackIndexAnalysisError,
+    RecordedPlaybackIndexer,
+)
 from app.models.RecordedVideo import RecordedVideo
 from app.routers.VideoStreamsRouter import VideoBitDepthQuery
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
@@ -245,8 +249,14 @@ def test_recorded_video_timeline_detects_same_stream_configuration_change(monkey
             except StopIteration as ex:
                 raise StopAsyncIteration from ex
 
-        async def read(self) -> bytes:
+        async def read(self, _size: int = -1) -> bytes:
             return b''
+
+        async def readline(self) -> bytes:
+            try:
+                return next(self.lines)
+            except StopIteration:
+                return b''
 
     class FakeProcess:
         """成功するFFprobe子プロセスを再現する。"""
@@ -308,7 +318,7 @@ def test_recorded_video_timeline_detects_same_stream_configuration_change(monkey
         'channel_layout': 'stereo',
         'is_dual_mono': True,
     }]
-    timeline, audio_timeline = asyncio.run(
+    timeline, audio_timeline, discovered_audio_tracks = asyncio.run(
         RecordedPlaybackIndexer._RecordedPlaybackIndexer__buildFrameTimelines(  # pyright: ignore[reportPrivateUsage]
             999,
             Path('/recording.ts'),
@@ -316,6 +326,7 @@ def test_recorded_video_timeline_detects_same_stream_configuration_change(monkey
             100.0,
             base_timeline,
             audio_tracks,
+            {},
             0,
         )
     )
@@ -335,6 +346,55 @@ def test_recorded_video_timeline_detects_same_stream_configuration_change(monkey
     assert audio_timeline[0]['tracks'][0]['channel'] == 'Monaural'
     assert audio_timeline[1]['tracks'] == []
     assert audio_timeline[2]['tracks'][0]['channel'] == 'Dual Mono'
+    assert discovered_audio_tracks == audio_tracks
+
+
+def test_recorded_video_frame_probe_failure_does_not_publish_ready(monkeypatch) -> None:
+    """全編フレーム走査失敗を暫定値へフォールバックせず、機械判定可能な失敗として返す。"""
+
+    class FakeStream:
+        def __init__(self) -> None:
+            self.has_read = False
+
+        async def readline(self) -> bytes:
+            return b''
+
+        async def read(self, _size: int = -1) -> bytes:
+            if self.has_read:
+                return b''
+            self.has_read = True
+            return b'broken transport stream'
+
+    class FakeProcess:
+        stdout = FakeStream()
+        stderr = FakeStream()
+
+        async def wait(self) -> int:
+            return 1
+
+    async def CreateFakeProcess(*_args, **_kwargs):
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        'app.metadata.RecordedPlaybackIndexer.asyncio.create_subprocess_exec',
+        CreateFakeProcess,
+    )
+
+    with pytest.raises(RecordedPlaybackIndexAnalysisError) as ex_info:
+        asyncio.run(
+            RecordedPlaybackIndexer._RecordedPlaybackIndexer__buildFrameTimelines(  # pyright: ignore[reportPrivateUsage]
+                999,
+                Path('/recording.ts'),
+                4.0,
+                100.0,
+                [],
+                [],
+                {},
+                0,
+            )
+        )
+
+    assert ex_info.value.error_code == 'FrameProbeFailed'
 
 
 def test_recorded_audio_timeline_detects_dual_mono_transition() -> None:
