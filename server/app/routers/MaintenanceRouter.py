@@ -42,8 +42,9 @@ router = APIRouter(
     prefix = '/api/maintenance',
 )
 
-# 録画フォルダの一括スキャン・バックグラウンド解析タスクの asyncio.Task インスタンス
+# 録画フォルダの一括スキャン・メタデータ再解析・バックグラウンド解析タスクの asyncio.Task インスタンス
 batch_scan_task: asyncio.Task[None] | None = None
+metadata_reanalysis_task: asyncio.Task[None] | None = None
 background_analysis_task: asyncio.Task[None] | None = None
 
 
@@ -215,6 +216,56 @@ async def BatchScanAPI():
         raise HTTPException(
             status_code = status.HTTP_429_TOO_MANY_REQUESTS,
             detail = 'Batch scan of recording folders is already running',
+        )
+
+
+@router.post(
+    '/reanalyze-all-recorded-videos',
+    summary = '全録画ファイルメタデータ再解析 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def ReanalyzeAllRecordedVideosAPI():
+    """
+    データベースに登録されているすべての録画ファイルのメタデータを強制的に再解析する。<br>
+    録画ファイルごとに直列で処理し、個別録画の「メタデータを再解析」と同じ解析を行う。<br>
+    このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
+    """
+
+    global metadata_reanalysis_task
+
+    async def ReanalyzeAllRecordedVideos():
+        global metadata_reanalysis_task
+        logging.info('Manual metadata reanalysis of all recorded videos has started.')
+
+        try:
+            file_paths = await RecordedVideo.all().order_by('id').values_list('file_path', flat=True)
+            total = len(file_paths)
+
+            for index, file_path_str in enumerate(file_paths, start=1):
+                file_path = anyio.Path(file_path_str)
+                if not await file_path.is_file():
+                    logging.warning(f'{file_path}: File not found. Skipping metadata reanalysis...')
+                    continue
+
+                logging.info(f'{file_path}: Reanalyzing metadata... ({index}/{total})')
+                await RecordedScanTask().processRecordedFile(
+                    file_path = file_path,
+                    force_update = True,
+                    wait_background_analysis = True,
+                )
+
+            logging.info('Manual metadata reanalysis of all recorded videos has finished.')
+        finally:
+            metadata_reanalysis_task = None
+
+    if metadata_reanalysis_task is None:
+        metadata_reanalysis_task = asyncio.create_task(ReanalyzeAllRecordedVideos())
+        await metadata_reanalysis_task
+    else:
+        logging.warning('[MaintenanceRouter][ReanalyzeAllRecordedVideosAPI] Metadata reanalysis is already running.')
+        raise HTTPException(
+            status_code = status.HTTP_429_TOO_MANY_REQUESTS,
+            detail = 'Metadata reanalysis of all recorded videos is already running',
         )
 
 

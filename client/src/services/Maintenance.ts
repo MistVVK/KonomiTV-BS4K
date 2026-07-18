@@ -117,6 +117,33 @@ class Maintenance {
 
 
     /**
+     * すべての録画ファイルのメタデータを再解析する
+     * @returns タスクの実行に成功した場合は true、失敗した場合は false
+     */
+    static async reanalyzeAllRecordedVideos(): Promise<boolean> {
+
+        const response = await APIClient.post('/maintenance/reanalyze-all-recorded-videos', undefined, {
+            // 最大1日以上かかるのでタイムアウトを1日に設定
+            timeout: 24 * 60 * 60 * 1000,
+        });
+
+        if (response.type === 'error') {
+            switch (response.data.detail) {
+                case 'Metadata reanalysis of all recorded videos is already running':
+                    APIClient.showGenericError(response, 'すべての録画ファイルのメタデータ再解析は既に実行中です。');
+                    break;
+                default:
+                    APIClient.showGenericError(response, 'すべての録画ファイルのメタデータ再解析を開始できませんでした。');
+                    break;
+            }
+            return false;
+        }
+
+        return true;
+    }
+
+
+    /**
      * バックグラウンド解析タスクを開始する
      * @returns タスクの実行に成功した場合は true、失敗した場合は false
      */

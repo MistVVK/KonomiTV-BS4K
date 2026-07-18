@@ -124,6 +124,10 @@ class FFprobeOtherStream(BaseModel):
     codec_name: str = 'unknown'  # オプショナル - "arib_caption", "bin_data", そのほか未知のもの
     ts_packetsize: str | None = None  # オプショナル - TS パケットサイズ ("188" / "192" / "204")
 
+class FFprobeFrame(BaseModel):
+    """FFprobe から返される映像フレームの走査方式情報"""
+    interlaced_frame: int | None = None  # 0: プログレッシブ、1: インターレース
+
 class FFprobeProgram(BaseModel):
     """FFprobe から返される program セクションの情報"""
     program_id: int | None = None
@@ -165,6 +169,7 @@ class FFprobeResult(BaseModel):
 class FFprobeSampleResult(BaseModel):
     """FFprobe のサンプル解析から返される情報（映像・音声のみ）"""
     streams: list[FFprobeVideoStream | FFprobeAudioStream | FFprobeOtherStream] = []
+    frames: list[FFprobeFrame] = []
 
     def getVideoStreams(self) -> list[FFprobeVideoStream]:
         """映像ストリームのみを抽出してバリデーション"""
@@ -400,14 +405,25 @@ class MetadataAnalyzer:
                     profile.split('@')[0] if profile else 'Main'
                 )
                 ## スキャン形式
-                field_order = video_stream.field_order or 'tt'  # 通常取得できるはずだが、デフォルトはインターレースとする
-                if field_order.lower() == 'progressive':
+                ## HEVC エンコーダーでインターレース解除した映像などでは、ストリーム単位の field_order が
+                ## FFprobe の結果に含まれないことがある。その場合は部分解析で取得した実フレームの
+                ## interlaced_frame を参照し、少なくとも1枚でもインターレースなら Interlaced とする。
+                if video_stream.field_order is not None:
+                    video_scan_type = 'Progressive' if video_stream.field_order.lower() == 'progressive' else 'Interlaced'
+                elif any(frame.interlaced_frame == 1 for frame in sample_probe.frames):
+                    video_scan_type = 'Interlaced'
+                elif any(frame.interlaced_frame == 0 for frame in sample_probe.frames):
                     video_scan_type = 'Progressive'
                 else:
+                    # ストリーム・フレームのどちらからも判定できない場合は、誤ってインターレース映像を
+                    # Progressive と扱わないよう、従来どおり保守的に Interlaced とする。
                     video_scan_type = 'Interlaced'
-                ## ここで Progressive になっているが、全体解析側の field_order が progressive でない場合はインターレースとする
+                ## ここで Progressive になっているが、全体解析側で field_order が明示的にインターレースを
+                ## 示している場合は Interlaced とする。field_order の欠落は反証には使わない。
                 ## (部分解析のみ、稀に本来インターレースにもかかわらずプログレッシブ映像と判定される場合があるため)
-                if video_scan_type == 'Progressive' and (full_probe_video_streams[0].field_order or '').lower() != 'progressive':
+                full_probe_field_order = full_probe_video_streams[0].field_order
+                if (video_scan_type == 'Progressive' and full_probe_field_order is not None and
+                    full_probe_field_order.lower() != 'progressive'):
                     video_scan_type = 'Interlaced'
                 ## フレームレート
                 video_frame_rate = ParseFPS(video_stream.avg_frame_rate) or ParseFPS(video_stream.r_frame_rate)
@@ -941,6 +957,7 @@ class MetadataAnalyzer:
 
         # 部分解析: 録画ファイルの25%位置から30秒程度のデータを取得し、メディア情報を解析する
         sample_json: dict[str, Any] | None = None
+        sample_data = b''
         sample_size = ClosestMultiple(18 * 1024 * 1024 * 30 // 8, ts.PACKET_SIZE)
         if full_probe.format.bit_rate is not None:
             try:
@@ -1000,6 +1017,33 @@ class MetadataAnalyzer:
 
         if sample_json is None:
             return None
+
+        # 部分解析の映像ストリームに field_order が含まれない場合のみ、同じサンプルの先頭2秒程度から
+        # 実フレームの interlaced_frame を取得する。通常ケースでは追加解析を行わず、録画スキャンの負荷を抑える。
+        ## HEVC では Progressive 映像でも field_order 自体が省略されることがあり、欠落を Interlaced とみなすと
+        ## インターレース解除済み録画が一律で誤判定されるため、フレーム単位の情報をフォールバックに用いる。
+        sample_video_stream = next(
+            (stream for stream in sample_json.get('streams', []) if stream.get('codec_type') == 'video'),
+            None,
+        )
+        if (sample_video_stream is not None and sample_video_stream.get('field_order') is None and
+            full_probe.format.format_name == 'mpegts'):
+            args_frames = [
+                '-hide_banner',
+                '-loglevel', 'error',
+                '-analyzeduration', self.FFPROBE_ANALYZE_DURATION_US,
+                '-probesize', self.FFPROBE_PROBESIZE,
+                '-f', 'mpegts',
+                '-i', 'pipe:0',
+                '-select_streams', 'v:0',
+                '-read_intervals', '%+2',
+                '-show_frames',
+                '-show_entries', 'frame=interlaced_frame',
+                '-of', 'json',
+            ]
+            frames_json = self.__runFFprobe(args_frames, input_bytes=sample_data)
+            if frames_json is not None:
+                sample_json['frames'] = frames_json.get('frames', [])
 
         try:
             sample_probe = FFprobeSampleResult(**sample_json)

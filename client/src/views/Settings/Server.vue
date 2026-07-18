@@ -357,6 +357,21 @@
                 <span class="ml-2">録画フォルダの一括スキャンを手動実行</span>
             </v-btn>
             <div class="settings__item">
+                <div class="settings__item-heading">すべての録画ファイルのメタデータを再解析</div>
+                <div class="settings__item-label">
+                    KonomiTV に登録されているすべての録画ファイルのメタデータを強制的に再解析します。<br>
+                    メタデータの解析方法が変更された後に、既存の録画ファイルにも新しい解析結果を反映したい場合に利用してください。<br>
+                </div>
+                <div class="settings__item-label mt-1">
+                    <strong>すべての録画ファイルを読み込むため、処理完了まで数時間〜数日以上かかることがあります。</strong><br>
+                </div>
+            </div>
+            <v-btn class="settings__save-button mt-5" color="background-lighten-2" variant="flat"
+                @click="reanalyzeAllRecordedVideos()">
+                <Icon icon="fluent:video-clip-20-filled" height="20px" />
+                <span class="ml-2">すべての録画ファイルを再解析</span>
+            </v-btn>
+            <div class="settings__item">
                 <div class="settings__item-heading">録画ファイルのバックグラウンド解析タスクを再実行</div>
                 <div class="settings__item-label">
                     録画ファイルのメタデータ解析やサムネイル作成が完了していない場合に、これらの処理を再度実行します。<br>
@@ -552,6 +567,18 @@ async function runBatchScan() {
             '録画フォルダの一括スキャンが完了しました。\n' +
             'すべての録画ファイルがデータベースに同期されているはずです。'
         );
+    }
+}
+
+// すべての録画ファイルのメタデータを再解析する関数
+async function reanalyzeAllRecordedVideos() {
+    Message.info(
+        'すべての録画ファイルのメタデータ再解析を開始しています...\n' +
+        '大量の録画ファイルが保存されている環境では、処理完了まで数時間〜数日以上かかることがあります。'
+    );
+    const result = await Maintenance.reanalyzeAllRecordedVideos();
+    if (result === true) {
+        Message.success('すべての録画ファイルのメタデータ再解析が完了しました。');
     }
 }
 
