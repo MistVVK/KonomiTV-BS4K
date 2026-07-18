@@ -1,10 +1,12 @@
 # Third-Party Software Licenses
 
-<!-- AMD_RUNTIME_WARNING_START -->
+<!-- NONFREE_RUNTIME_WARNING_START -->
 > **重要: このDockerイメージを再配布しないでください。**
 >
-> このイメージには、GPL version 3 or later で提供されるFFmpegなどと、AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro`）が同時に含まれます。AMD側は再配布とFree Software Licenseの適用を制限しており、その制限とGPL側の再配布条件は、この完成イメージについて同時に満たすことができません。したがって、完成イメージ全体をGPLv3以降としてライセンスまたは再配布することはできません。現在のDockerfileは、各ユーザーが自身の環境でローカルビルドして利用することだけを前提としています。
-<!-- AMD_RUNTIME_WARNING_END -->
+> この `NONFREE=true` ビルドには、Intel Media DriverのFull Feature版（`ENABLE_NONFREE_KERNELS=ON`）と、AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro`）が含まれます。
+>
+> 再配布禁止の直接の理由は、GPL version 3 or laterで提供されるFFmpegなどとAMD proprietary runtimeが同じ完成イメージに含まれることです。AMD側は再配布とFree Software Licenseの適用を制限しており、その制限とGPL側の再配布条件は、この完成イメージについて同時に満たすことができません。したがって、完成イメージ全体をGPLv3以降としてライセンスまたは再配布することはできません。現在のDockerfileは、各ユーザーが自身の環境でローカルビルドして利用することだけを前提としています。
+<!-- NONFREE_RUNTIME_WARNING_END -->
 
 <!--
 KonomiTV の Docker image に直接組み込む third-party ソフトウェアの著作権表示とライセンス全文です。

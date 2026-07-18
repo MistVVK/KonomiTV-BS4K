@@ -8,6 +8,19 @@ set -a
 source "${SCRIPT_DIR}/manifest.env"
 set +a
 
+case "${NONFREE:-}" in
+    true)
+        expected_media_driver_nonfree_kernels='ON'
+        ;;
+    false)
+        expected_media_driver_nonfree_kernels='OFF'
+        ;;
+    *)
+        echo "NONFREE must be exactly 'true' or 'false'. actual: ${NONFREE:-<unset>}" >&2
+        exit 2
+        ;;
+esac
+
 required_files=(
     Akebi/akebi-https-server.elf
     CMAnalysis/chapter_exe
@@ -119,11 +132,12 @@ if grep -Eq '(/build/|/opt/|/home/)' "${cm_runtime_manifest}"; then
     exit 1
 fi
 
-echo 'Verifying the Intel Media Driver free-kernel build configuration.'
+echo "Verifying the Intel Media Driver build configuration for NONFREE=${NONFREE}."
 intel_media_driver_configuration="${THIRDPARTY_ROOT}/Library/Intel-Media-Driver-Build-Configuration.txt"
 grep -Fx "source_commit=${INTEL_MEDIA_DRIVER_COMMIT}" "${intel_media_driver_configuration}"
+grep -Fx "nonfree=${NONFREE}" "${intel_media_driver_configuration}"
 grep -Fx 'ENABLE_KERNELS:BOOL=ON' "${intel_media_driver_configuration}"
-grep -Fx 'ENABLE_NONFREE_KERNELS:BOOL=OFF' "${intel_media_driver_configuration}"
+grep -Fx "ENABLE_NONFREE_KERNELS:BOOL=${expected_media_driver_nonfree_kernels}" "${intel_media_driver_configuration}"
 grep -Fx 'BUILD_CMRTLIB:BOOL=OFF' "${intel_media_driver_configuration}"
 grep -Fx 'cmrt_ENABLE_KERNELS:BOOL=ON' "${intel_media_driver_configuration}"
 grep -Fx 'cmrt_ENABLE_NONFREE_KERNELS:BOOL=OFF' "${intel_media_driver_configuration}"
@@ -134,7 +148,12 @@ grep -Fx "patch_intel_media_driver_vpp_deinterlace_crash_fix_sha256=${INTEL_MEDI
     "${intel_media_driver_configuration}"
 grep -Fx "patch_intel_onevpl_gpu_rt_vpp_deinterlace_hang_fix_sha256=${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256}" \
     "${intel_media_driver_configuration}"
-grep -Fx 'compile_definition=_FULL_OPEN_SOURCE' "${intel_media_driver_configuration}"
+if [ "${NONFREE}" = 'false' ]; then
+    grep -Fx 'compile_definition=_FULL_OPEN_SOURCE' "${intel_media_driver_configuration}"
+elif grep -Fx 'compile_definition=_FULL_OPEN_SOURCE' "${intel_media_driver_configuration}"; then
+    echo 'Full Feature media-driver configuration unexpectedly records _FULL_OPEN_SOURCE.' >&2
+    exit 1
+fi
 grep -Fx 'compile_definition=_MPEG2_DECODE_SUPPORTED' "${intel_media_driver_configuration}"
 grep -Fx 'compile_definition=_AVC_DECODE_SUPPORTED' "${intel_media_driver_configuration}"
 grep -Fx 'compile_definition=_HEVC_DECODE_SUPPORTED' "${intel_media_driver_configuration}"

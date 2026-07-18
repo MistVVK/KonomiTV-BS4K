@@ -14,7 +14,7 @@ export LIBVA_DRIVER_NAME=radeonsi
 if [ -e /opt/amdgpu/lib/x86_64-linux-gnu/dri/radeonsi_drv_video.so ]; then
     export LIBVA_DRIVERS_PATH=/opt/amdgpu/lib/x86_64-linux-gnu/dri
 else
-    # INSTALL_AMD=false の再配布可能構成では Ubuntu の Mesa VAAPI driver を使う。
+    # NONFREE=false の再配布可能構成では Ubuntu の Mesa VAAPI driver を使う。
     export LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri
 fi
 

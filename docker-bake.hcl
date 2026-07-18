@@ -1,9 +1,9 @@
 group "default" {
   targets = [
-    "cuda12-4-amd",
-    "cuda12-4-no-amd",
-    "cuda12-8-amd",
-    "cuda12-8-no-amd",
+    "cuda12-4-nonfree",
+    "cuda12-4-free",
+    "cuda12-8-nonfree",
+    "cuda12-8-free",
   ]
 }
 
@@ -12,38 +12,38 @@ target "common" {
   dockerfile = "Dockerfile"
 }
 
-target "cuda12-4-amd" {
+target "cuda12-4-nonfree" {
   inherits = ["common"]
   args = {
-    CUDA_VERSION = "12-4"
-    INSTALL_AMD   = "true"
+    CUDA_VERSION = "12.4"
+    NONFREE      = "true"
   }
-  tags = ["konomitv:cuda12.4-amd"]
+  tags = ["konomitv:cuda12.4-nonfree"]
 }
 
-target "cuda12-4-no-amd" {
+target "cuda12-4-free" {
   inherits = ["common"]
   args = {
-    CUDA_VERSION = "12-4"
-    INSTALL_AMD   = "false"
+    CUDA_VERSION = "12.4"
+    NONFREE      = "false"
   }
-  tags = ["konomitv:cuda12.4-no-amd"]
+  tags = ["konomitv:cuda12.4-free"]
 }
 
-target "cuda12-8-amd" {
+target "cuda12-8-nonfree" {
   inherits = ["common"]
   args = {
-    CUDA_VERSION = "12-8"
-    INSTALL_AMD   = "true"
+    CUDA_VERSION = "12.8"
+    NONFREE      = "true"
   }
-  tags = ["konomitv:cuda12.8-amd"]
+  tags = ["konomitv:cuda12.8-nonfree"]
 }
 
-target "cuda12-8-no-amd" {
+target "cuda12-8-free" {
   inherits = ["common"]
   args = {
-    CUDA_VERSION = "12-8"
-    INSTALL_AMD   = "false"
+    CUDA_VERSION = "12.8"
+    NONFREE      = "false"
   }
-  tags = ["konomitv:cuda12.8-no-amd"]
+  tags = ["konomitv:cuda12.8-free"]
 }

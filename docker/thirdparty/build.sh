@@ -11,6 +11,14 @@ set -a
 source "${SCRIPT_DIR}/manifest.env"
 set +a
 
+case "${NONFREE:-}" in
+    true|false) ;;
+    *)
+        echo "NONFREE must be exactly 'true' or 'false'. actual: ${NONFREE:-<unset>}" >&2
+        exit 2
+        ;;
+esac
+
 mkdir -p "${SOURCE_ROOT}" "${DOWNLOAD_ROOT}" "${OUTPUT_ROOT}"
 
 download-verified() {
@@ -131,7 +139,8 @@ patchelf --set-rpath '$ORIGIN:$ORIGIN/../FFmpeg:$ORIGIN/../Library' "${OUTPUT_RO
 patchelf --set-rpath '$ORIGIN:$ORIGIN/../FFmpeg:$ORIGIN/../Library' "${OUTPUT_ROOT}/VCEEncC/VCEEncC.elf"
 
 # Intel Media Stack を固定 commit と既存の修正 patch から構築する。
-OUTPUT_ROOT="${SOURCE_ROOT}/intel-media-stack" "${SCRIPT_DIR}/build-intel-media-stack.sh" "${SOURCE_ROOT}/intel-media-stack"
+NONFREE="${NONFREE}" OUTPUT_ROOT="${SOURCE_ROOT}/intel-media-stack" \
+    "${SCRIPT_DIR}/build-intel-media-stack.sh" "${SOURCE_ROOT}/intel-media-stack"
 cp -a "${SOURCE_ROOT}/intel-media-stack/artifact/Library" "${OUTPUT_ROOT}/Library"
 
 # Docker build context では submodule の Git metadata が除外されるため、固定 commit の tracked source tree と同じ内容か検証する。

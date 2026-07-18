@@ -20,6 +20,21 @@ OUTPUT_ROOT="${1:-${REPO_ROOT}/intel-media-stack}"
 : "${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256:?INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256 is required}"
 : "${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256:?INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256 is required}"
 
+case "${NONFREE:-}" in
+  true)
+    MEDIA_DRIVER_PROFILE='full-feature'
+    MEDIA_DRIVER_NONFREE_KERNELS='ON'
+    ;;
+  false)
+    MEDIA_DRIVER_PROFILE='free-kernel'
+    MEDIA_DRIVER_NONFREE_KERNELS='OFF'
+    ;;
+  *)
+    echo "NONFREE must be exactly 'true' or 'false'. actual: ${NONFREE:-<unset>}" >&2
+    exit 2
+    ;;
+esac
+
 SRC_ROOT="${OUTPUT_ROOT}/src"
 BUILD_ROOT="${OUTPUT_ROOT}/build-root"
 BUILD_DIR="${BUILD_ROOT}/work"
@@ -120,16 +135,16 @@ meson setup "${BUILD_DIR}/libva" "${SRC_ROOT}/libva" \
 ninja -C "${BUILD_DIR}/libva" -j"$(nproc)"
 ninja -C "${BUILD_DIR}/libva" install
 
-# media-driver (CM の MPEG-2/H.264/HEVC デコードに必要な固定機能と
-# オープンソースカーネルだけを含む版)
-MEDIA_DRIVER_BUILD_DIR="${BUILD_DIR}/media-driver-free"
+# media-driver (実配布する iHD driver)
+# NONFREE=true では Full Feature Build、false では Free Kernel Build を構築する。
+MEDIA_DRIVER_BUILD_DIR="${BUILD_DIR}/media-driver-${MEDIA_DRIVER_PROFILE}"
 cmake -S "${SRC_ROOT}/media-driver" -B "${MEDIA_DRIVER_BUILD_DIR}" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${PREFIX_DIR}" \
   -DCMAKE_INSTALL_LIBDIR=lib \
   -DINSTALL_DRIVER_SYSCONF=OFF \
   -DENABLE_KERNELS=ON \
-  -DENABLE_NONFREE_KERNELS=OFF \
+  -DENABLE_NONFREE_KERNELS="${MEDIA_DRIVER_NONFREE_KERNELS}" \
   -DENABLE_PRODUCTION_KMD=ON \
   -DBUILD_CMRTLIB=OFF \
   -DARCH=64 \
@@ -137,11 +152,17 @@ cmake -S "${SRC_ROOT}/media-driver" -B "${MEDIA_DRIVER_BUILD_DIR}" -G Ninja \
   -DCMAKE_PREFIX_PATH="${PREFIX_DIR}" \
   -DBS_DIR_GMMLIB="${SRC_ROOT}/gmmlib"
 grep -Fx 'ENABLE_KERNELS:BOOL=ON' "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
-grep -Fx 'ENABLE_NONFREE_KERNELS:BOOL=OFF' "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
+grep -Fx "ENABLE_NONFREE_KERNELS:BOOL=${MEDIA_DRIVER_NONFREE_KERNELS}" "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
 grep -Fx 'BUILD_CMRTLIB:BOOL=OFF' "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
-for definition in _FULL_OPEN_SOURCE _MPEG2_DECODE_SUPPORTED _AVC_DECODE_SUPPORTED _HEVC_DECODE_SUPPORTED; do
+for definition in _MPEG2_DECODE_SUPPORTED _AVC_DECODE_SUPPORTED _HEVC_DECODE_SUPPORTED; do
   grep -Fq -- "-D${definition}" "${MEDIA_DRIVER_BUILD_DIR}/build.ninja"
 done
+if [ "${NONFREE}" = 'false' ]; then
+  grep -Fq -- '-D_FULL_OPEN_SOURCE' "${MEDIA_DRIVER_BUILD_DIR}/build.ninja"
+elif grep -Fq -- '-D_FULL_OPEN_SOURCE' "${MEDIA_DRIVER_BUILD_DIR}/build.ninja"; then
+  echo 'Full Feature media-driver unexpectedly defines _FULL_OPEN_SOURCE.' >&2
+  exit 1
+fi
 ninja -C "${MEDIA_DRIVER_BUILD_DIR}" -j"$(nproc)"
 ninja -C "${MEDIA_DRIVER_BUILD_DIR}" install
 
@@ -160,7 +181,7 @@ cmake -S "${SRC_ROOT}/media-driver" -B "${MEDIA_DRIVER_CMRT_BUILD_DIR}" -G Ninja
   -DLIBVA_DRIVERS_PATH="${FREE_PREFIX_DIR}/lib/dri" \
   -DCMAKE_PREFIX_PATH="${PREFIX_DIR}" \
   -DBS_DIR_GMMLIB="${SRC_ROOT}/gmmlib"
-# フリー構成から必要なのは CMRT runtime だけであり、iHD driver 本体は上のフリー構成を採用する。
+# フリー構成から必要なのは CMRT runtime だけであり、iHD driver 本体は上の実配布構成を採用する。
 # all/install target は media-driver 全体をもう一度構築するため、CMRT target のみに限定する。
 grep -Fx 'ENABLE_NONFREE_KERNELS:BOOL=OFF' "${MEDIA_DRIVER_CMRT_BUILD_DIR}/CMakeCache.txt"
 grep -Fx 'ENABLE_KERNELS:BOOL=ON' "${MEDIA_DRIVER_CMRT_BUILD_DIR}/CMakeCache.txt"
@@ -212,6 +233,7 @@ cp -df "${MEDIA_DRIVER_CMRT_BUILD_DIR}/cmrtlib/linux/libigfxcmrt.so"* "${ARTIFAC
 cp -f "${PREFIX_DIR}/lib/dri/iHD_drv_video.so" "${ARTIFACT_DIR}/Library/dri/"
 {
   printf 'source_commit=%s\n' "${INTEL_MEDIA_DRIVER_COMMIT}"
+  printf 'nonfree=%s\n' "${NONFREE}"
   grep -E '^(ENABLE_KERNELS|ENABLE_NONFREE_KERNELS|BUILD_CMRTLIB):BOOL=' \
     "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
   grep -E '^(ENABLE_KERNELS|ENABLE_NONFREE_KERNELS|BUILD_CMRTLIB):BOOL=' \
@@ -221,7 +243,9 @@ cp -f "${PREFIX_DIR}/lib/dri/iHD_drv_video.so" "${ARTIFACT_DIR}/Library/dri/"
     "${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256}"
   printf 'patch_intel_onevpl_gpu_rt_vpp_deinterlace_hang_fix_sha256=%s\n' \
     "${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256}"
-  printf 'compile_definition=_FULL_OPEN_SOURCE\n'
+  if [ "${NONFREE}" = 'false' ]; then
+    printf 'compile_definition=_FULL_OPEN_SOURCE\n'
+  fi
   printf 'compile_definition=_MPEG2_DECODE_SUPPORTED\n'
   printf 'compile_definition=_AVC_DECODE_SUPPORTED\n'
   printf 'compile_definition=_HEVC_DECODE_SUPPORTED\n'

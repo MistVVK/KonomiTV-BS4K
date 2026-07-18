@@ -6,10 +6,20 @@
 
 FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982 AS thirdparty-builder
 
-ARG CUDA_VERSION=12-4
+ARG CUDA_VERSION=12.4
+ARG NONFREE=true
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates nala && \
+RUN case "${CUDA_VERSION}" in \
+        '12.4') CUDA_PACKAGE_SUFFIX='12-4' ;; \
+        '12.8') CUDA_PACKAGE_SUFFIX='12-8' ;; \
+        *) echo 'CUDA_VERSION must be either 12.4 or 12.8.' >&2; exit 1 ;; \
+    esac && \
+    case "${NONFREE}" in \
+        'true'|'false') ;; \
+        *) echo 'NONFREE must be either true or false.' >&2; exit 1 ;; \
+    esac && \
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates nala && \
     printf '%s\n' \
         'deb https://ftp.udx.icscoe.jp/Linux/ubuntu/ jammy main restricted universe multiverse' \
         'deb https://ftp.udx.icscoe.jp/Linux/ubuntu/ jammy-updates main restricted universe multiverse' \
@@ -33,7 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics-keyring.gpg && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics-keyring.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2523 unified' > /etc/apt/sources.list.d/intel-gpu-jammy.list && \
     nala update && nala upgrade -y && nala install -y --no-install-recommends \
-        autoconf automake build-essential ca-certificates ccache clang cmake cuda-cudart-dev-${CUDA_VERSION} cuda-nvvm-${CUDA_VERSION} curl file git libdrm-dev libffi-dev libglib2.0-dev \
+        autoconf automake build-essential ca-certificates ccache clang cmake cuda-cudart-dev-${CUDA_PACKAGE_SUFFIX} cuda-nvvm-${CUDA_PACKAGE_SUFFIX} curl file git libdrm-dev libffi-dev libglib2.0-dev \
         libaom-dev libass-dev libbluray-dev libbz2-dev libfontconfig1-dev libfreetype6-dev libfribidi-dev \
         libgnutls28-dev libgsm1-dev liblzma-dev libmp3lame-dev libmysofa-dev \
         libnuma-dev libopenjp2-7-dev libopenmpt-dev libopus-dev libpciaccess-dev librabbitmq-dev \
@@ -68,7 +78,7 @@ RUN --mount=type=cache,id=konomitv-thirdparty-downloads,target=/build/downloads 
     chmod +x /build/docker/thirdparty/*.sh && \
     ccache --max-size=20G && \
     ccache --zero-stats && \
-    /build/docker/thirdparty/build.sh && \
+    NONFREE="${NONFREE}" /build/docker/thirdparty/build.sh && \
     ccache --show-stats
 
 # CM 解析ランタイムは再生用 FFmpeg と分離し、Amatsukaze 本体を含めず固定構築する。
@@ -104,7 +114,7 @@ COPY ./docker/thirdparty/verify.sh \
      ./docker/thirdparty/generate-cm-smoke-fixture.py \
      /build/docker/thirdparty/
 RUN chmod +x /build/docker/thirdparty/verify.sh && \
-    /build/docker/thirdparty/verify.sh /opt/thirdparty
+    NONFREE="${NONFREE}" /build/docker/thirdparty/verify.sh /opt/thirdparty
 
 # --------------------------------------------------------------------------------------------------------------
 # クライアントをビルドするステージ
@@ -125,14 +135,22 @@ RUN yarn build && \
 
 FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
-ARG CUDA_VERSION=12-4
-ARG INSTALL_AMD=true
+ARG CUDA_VERSION=12.4
+ARG NONFREE=true
 LABEL cc.konomi.konomitv.cuda-version="${CUDA_VERSION}" \
-      cc.konomi.konomitv.amd-runtime="${INSTALL_AMD}"
+      cc.konomi.konomitv.nonfree="${NONFREE}"
 ENV TZ=Asia/Tokyo
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates nala && \
+RUN case "${CUDA_VERSION}" in \
+        '12.4'|'12.8') ;; \
+        *) echo 'CUDA_VERSION must be either 12.4 or 12.8.' >&2; exit 1 ;; \
+    esac && \
+    case "${NONFREE}" in \
+        'true'|'false') ;; \
+        *) echo 'NONFREE must be either true or false.' >&2; exit 1 ;; \
+    esac && \
+    apt-get update && apt-get install -y --no-install-recommends ca-certificates nala && \
     printf '%s\n' \
         'deb https://ftp.udx.icscoe.jp/Linux/ubuntu/ jammy main restricted universe multiverse' \
         'deb https://ftp.udx.icscoe.jp/Linux/ubuntu/ jammy-updates main restricted universe multiverse' \
@@ -150,7 +168,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     nala update && nala upgrade -y && nala install -y --no-install-recommends curl git gpg tzdata && \
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics-keyring.gpg && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics-keyring.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2523 unified' > /etc/apt/sources.list.d/intel-gpu-jammy.list && \
-    if [ "${INSTALL_AMD}" = 'true' ]; then \
+    if [ "${NONFREE}" = 'true' ]; then \
         curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --yes --dearmor --output /usr/share/keyrings/rocm-keyring.gpg; \
         echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/amdgpu/6.4.4/ubuntu jammy main' > /etc/apt/sources.list.d/amdgpu.list; \
         echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/amdgpu/6.4.4/ubuntu jammy proprietary' > /etc/apt/sources.list.d/amdgpu-proprietary.list; \
@@ -165,7 +183,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         libtheora0 libtwolame0 libva-drm2 libva-x11-2 libvdpau1 libvidstab1.1 libvorbis0a libvorbisenc2 \
         libvpl2 libvpx7 libwebp7 libwebpmux3 libx11-xcb1 libx264-163 libx265-199 libxml2 libxvidcore4 \
         libzimg2 libzmq5 libzvbi0 libxxhash0 ocl-icd-libopencl1 && \
-    if [ "${INSTALL_AMD}" = 'true' ]; then \
+    if [ "${NONFREE}" = 'true' ]; then \
         nala install -y --no-install-recommends \
             amf-amdgpu-pro libamdenc-amdgpu-pro libdrm2-amdgpu mesa-amdgpu-va-drivers \
             rocm-opencl-runtime vulkan-amdgpu-pro; \
@@ -178,7 +196,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         nala install -y --no-install-recommends mesa-va-drivers; \
         if dpkg-query --show --showformat='${binary:Package}\n' 2>/dev/null | \
                 grep -Eq '^(amf-amdgpu-pro|libamdenc-amdgpu-pro|libdrm2-amdgpu|mesa-amdgpu-va-drivers|rocm-opencl-runtime|vulkan-amdgpu-pro)(:amd64)?$'; then \
-            echo 'AMD proprietary runtime package must not be installed when INSTALL_AMD=false.' >&2; \
+            echo 'AMD proprietary runtime package must not be installed when NONFREE=false.' >&2; \
             exit 1; \
         fi; \
         test ! -e /opt/amdgpu; \
@@ -187,7 +205,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
         test ! -e /etc/apt/sources.list.d/amdgpu-proprietary.list; \
         test ! -e /etc/apt/sources.list.d/rocm.list; \
         if grep -RqsF 'repo.radeon.com' /etc/apt/sources.list /etc/apt/sources.list.d; then \
-            echo 'AMD repository must not be configured when INSTALL_AMD=false.' >&2; \
+            echo 'AMD repository must not be configured when NONFREE=false.' >&2; \
             exit 1; \
         fi; \
         test -e /usr/lib/x86_64-linux-gnu/dri/radeonsi_drv_video.so; \
@@ -248,7 +266,7 @@ RUN test ! -e /code/server/thirdparty/Amatsukaze && \
     ffmpeg8_version="$(/code/server/thirdparty/FFmpeg8/ffmpeg8.elf -version | sed -n '1p')" && \
     ffmpeg8_amd_version="$(/code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh -version | sed -n '1p')" && \
     test "${ffmpeg8_amd_version}" = "${ffmpeg8_version}" && \
-    if [ "${INSTALL_AMD}" = 'true' ]; then \
+    if [ "${NONFREE}" = 'true' ]; then \
         /code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh -hide_banner -filters 2>&1 | grep -Eq '[[:space:]]deinterlace_vaapi[[:space:]]'; \
     fi
 COPY ./server/pyproject.toml ./server/poetry.lock ./server/poetry.toml /code/server/
@@ -263,7 +281,7 @@ COPY ./docker/thirdparty/assemble-runtime-license-document.py /tmp/assemble-runt
 COPY ./docker/thirdparty/collect-license-manifest.py /tmp/collect-license-manifest.py
 COPY --from=client-builder /tmp/CLIENT_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md
 COPY --from=thirdparty-builder /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/BUILDER_THIRD_PARTY_LICENSES.md
-RUN if [ "${INSTALL_AMD}" = 'true' ]; then amd_license_option='--include-amd-runtime'; else amd_license_option=''; fi && \
+RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree-runtime'; else nonfree_license_option=''; fi && \
     chromium_version="$(dpkg-query --showformat='${Version}' --show chromium)" && \
     python3 /tmp/collect-license-manifest.py \
         --stage 'final runtime OS and GPU packages' --dpkg --dpkg-exclude chromium \
@@ -281,13 +299,13 @@ RUN if [ "${INSTALL_AMD}" = 'true' ]; then amd_license_option='--include-amd-run
         --cuda-version "${CUDA_VERSION}" \
         --chromium-version "${chromium_version}" \
         --chromium-copyright /usr/share/doc/chromium/copyright \
-        ${amd_license_option} \
+        ${nonfree_license_option} \
         --output /code/THIRD_PARTY_LICENSES.md && \
-    if [ "${INSTALL_AMD}" = 'false' ]; then \
+    if [ "${NONFREE}" = 'false' ]; then \
         grep -Eq '^## mesa-va-drivers(:amd64)? ' /code/THIRD_PARTY_LICENSES.md; \
-        if grep -Eq 'AMD_RUNTIME_WARNING|amf-amdgpu-pro|libamdenc-amdgpu-pro|mesa-amdgpu-va-drivers|vulkan-amdgpu-pro' \
+        if grep -Eq 'NONFREE_RUNTIME_WARNING|amf-amdgpu-pro|libamdenc-amdgpu-pro|mesa-amdgpu-va-drivers|vulkan-amdgpu-pro' \
                 /code/THIRD_PARTY_LICENSES.md; then \
-            echo 'AMD-free license document contains proprietary runtime metadata.' >&2; \
+            echo 'NONFREE=false license document contains non-free runtime metadata.' >&2; \
             exit 1; \
         fi; \
     fi && \
