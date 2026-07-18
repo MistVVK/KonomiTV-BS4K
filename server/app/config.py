@@ -404,6 +404,32 @@ class _ServerSettingsTV(BaseModel):
 class _ServerSettingsVideo(BaseModel):
     recorded_folders: list[DirectoryPath] = []
     exclude_scan_paths: list[str] = []
+    recorded_fmp4_cache_folder: Path | None = None
+    recorded_playback_index_backfill_enabled: bool = True
+
+    @field_validator('recorded_fmp4_cache_folder')
+    def validate_recorded_fmp4_cache_folder(cls, folder: Path | None) -> Path | None:
+        """録画fMP4キャッシュ保存先を作成し、書き込み可能であることを検証する。"""
+
+        if folder is None:
+            return None
+        if folder.is_absolute() is False:
+            raise ValueError('録画 fMP4 キャッシュの保存先には絶対パスを指定してください。')
+
+        # 設定画面とconfig.yamlではホスト側パスを扱う。Dockerの設定更新APIから直接
+        # model_validate()された場合だけ、実アクセス前に/host-rootfsを一度だけ付与する。
+        from app.utils import GetPlatformEnvironment
+        docker_root = Path(_DOCKER_PATH_PREFIX)
+        if GetPlatformEnvironment() == 'Linux-Docker' and folder.is_relative_to(docker_root) is False:
+            folder = Path(f'{_DOCKER_PATH_PREFIX}{folder}')
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            write_test_path = folder / '.konomitv-fmp4-write-test'
+            write_test_path.write_bytes(b'')
+            write_test_path.unlink()
+        except OSError as ex:
+            raise ValueError(f'録画 fMP4 キャッシュの保存先へ書き込めません: {folder}') from ex
+        return folder
 
 class _ServerSettingsCapture(BaseModel):
     upload_folders: list[DirectoryPath] = []
@@ -503,6 +529,9 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
         ## /host-rootfs (docker-compose.yaml で定義) を通してホストマシンのファイルシステムにアクセスできる
         if GetPlatformEnvironment() == 'Linux-Docker':
             config_dict['video']['recorded_folders'] = [_DOCKER_PATH_PREFIX + folder for folder in config_dict['video']['recorded_folders']]
+            if type(config_dict['video']['recorded_fmp4_cache_folder']) is str:
+                config_dict['video']['recorded_fmp4_cache_folder'] = \
+                    _DOCKER_PATH_PREFIX + config_dict['video']['recorded_fmp4_cache_folder']
             if 'exclude_scan_paths' in config_dict['video']:
                 # 空文字や空白だけのパスは無視する
                 ## 空文字が Docker 用 Prefix に変換されると、全パスが除外対象になってしまうため
@@ -581,6 +610,9 @@ def SaveConfig(config: ServerSettings) -> None:
     if GetPlatformEnvironment() == 'Linux-Docker':
         config_dict['video']['recorded_folders'] = [str(folder).replace(_DOCKER_PATH_PREFIX, '') for folder in config_dict['video']['recorded_folders']]
         config_dict['video']['exclude_scan_paths'] = [str(pattern).replace(_DOCKER_PATH_PREFIX, '') for pattern in config_dict['video']['exclude_scan_paths']]
+        if type(config_dict['video']['recorded_fmp4_cache_folder']) is str:
+            config_dict['video']['recorded_fmp4_cache_folder'] = \
+                config_dict['video']['recorded_fmp4_cache_folder'].replace(_DOCKER_PATH_PREFIX, '')
         config_dict['capture']['upload_folders'] = [str(folder).replace(_DOCKER_PATH_PREFIX, '') for folder in config_dict['capture']['upload_folders']]
         if type(config_dict['tv']['debug_mode_ts_path']) is str or config_dict['tv']['debug_mode_ts_path'] is Path:
             config_dict['tv']['debug_mode_ts_path'] = str(config_dict['tv']['debug_mode_ts_path']).replace(_DOCKER_PATH_PREFIX, '')

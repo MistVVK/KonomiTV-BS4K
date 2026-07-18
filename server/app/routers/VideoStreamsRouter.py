@@ -1,22 +1,32 @@
 
 import asyncio
 import json
-from typing import Annotated
+import math
+from enum import IntEnum
+from typing import Annotated, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from fastapi.responses import Response
 from sse_starlette.sse import EventSourceResponse
 
-from app import logging
+from app import logging, schemas
 from app.config import Config
+from app.metadata.RecordedPlaybackIndex import IsRecordedPlaybackIndexReady
+from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.models.RecordedProgram import RecordedProgram
+from app.streams.RecordedEncodingCodecs import (
+    AudioCodec,
+    VideoCodec,
+)
+from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
+from app.streams.RecordedPlaybackCapabilities import (
+    RecordedPlaybackCapabilityProbe,
+)
+from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.StreamEncodingOptions import (
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
 )
-from app.streams.RecordedEncodingCodecs import AudioCodec, VideoCodec
-from app.streams.VideoStream import VideoStream
-from app.streams.RecordedEncodingCodecs import getAudioCodecDefinition
 
 
 # ルーター
@@ -24,6 +34,109 @@ router = APIRouter(
     tags = ['Streams'],
     prefix = '/api/streams/video',
 )
+
+class VideoBitDepthQuery(IntEnum):
+    """クエリ文字列から整数へ変換可能な録画映像bit depth。"""
+
+    BIT_8 = 8
+    BIT_10 = 10
+
+
+def GetRecordedStream(
+    session_id: str,
+    recorded_program: RecordedProgram,
+    stream_quality: StreamQualityWithOptions,
+    is_new_session_allowed: bool = False,
+) -> RecordedFMP4Stream:
+    """FFmpeg 8・fMP4録画視聴セッションを返す。"""
+
+    if RecordedFMP4Stream.hasSession(session_id):
+        return RecordedFMP4Stream(
+            session_id,
+            recorded_program,
+            stream_quality.quality,
+            encoding_options=None,
+            is_new_session_allowed=False,
+        )
+    if IsRecordedPlaybackIndexReady(
+        recorded_program.recorded_video.playback_index_status,
+        recorded_program.recorded_video.playback_index_version,
+    ) is False:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                'code': 'PlaybackIndexUnavailable',
+                'message': 'The recorded playback index is unavailable.',
+            },
+        )
+    return RecordedFMP4Stream(
+        session_id,
+        recorded_program,
+        stream_quality.quality,
+        stream_quality.encoding_options,
+        is_new_session_allowed=is_new_session_allowed,
+    )
+
+
+async def EnsurePlaybackIndexReady(recorded_program: RecordedProgram, session_id: str) -> None:
+    """新規録画視聴セッションに必要な再生索引を最優先で生成する。
+
+    Args:
+        recorded_program: 再生対象の録画番組。
+        session_id: マスタープレイリスト要求が作成する視聴セッションID。
+
+    Returns:
+        None
+    """
+
+    # 既存セッションの後続要求と、索引生成済みの録画は待機不要。
+    if (
+        RecordedFMP4Stream.hasSession(session_id) or
+        IsRecordedPlaybackIndexReady(
+            recorded_program.recorded_video.playback_index_status,
+            recorded_program.recorded_video.playback_index_version,
+        )
+    ):
+        return
+
+    # 旧MPEG-TS経路の削除後もPending録画を再生できるよう、再生要求を最優先で解析する。
+    # 同じ録画への複数要求はIndexer側の共有Futureへ合流する。クライアント切断で
+    # 共有Futureまでキャンセルされないようshieldし、完了後は依存解決時の古いDB値を更新する。
+    indexed = await asyncio.shield(RecordedPlaybackIndexer.enqueue(recorded_program.recorded_video.id, priority=0))
+    await recorded_program.recorded_video.refresh_from_db()
+    if indexed is False or IsRecordedPlaybackIndexReady(
+        recorded_program.recorded_video.playback_index_status,
+        recorded_program.recorded_video.playback_index_version,
+    ) is False:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                'code': recorded_program.recorded_video.playback_index_error_code or 'PlaybackIndexUnavailable',
+                'message': 'The recorded playback index is unavailable.',
+            },
+        )
+
+
+@router.get(
+    '/capabilities',
+    summary = '録画再生エンコード能力 API',
+    response_model = list[schemas.RecordedPlaybackCapability],
+)
+async def RecordedPlaybackCapabilitiesAPI() -> list[schemas.RecordedPlaybackCapability]:
+    """録画用FFmpeg 8で利用できるエンコーダー・コーデック・bit depthの組み合わせを返す。"""
+
+    capabilities = await RecordedPlaybackCapabilityProbe.getCapabilities()
+    return [
+        schemas.RecordedPlaybackCapability(
+            encoder = capability.encoder,
+            codec = capability.codec,
+            bit_depth = capability.bit_depth,
+            available = capability.available,
+            profile = capability.profile,
+            reason_code = capability.reason_code,
+        )
+        for capability in capabilities
+    ]
 
 
 async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番組の ID 。')]) -> RecordedProgram:
@@ -47,6 +160,7 @@ async def ValidateQuality(
     quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     video_codec: Annotated[VideoCodec | None, Query(description='出力映像コーデック。省略時は旧画質URLから判定。')] = None,
+    video_bit_depth: Annotated[VideoBitDepthQuery | None, Query(description='出力映像bit depth。')] = None,
     audio_codec: Annotated[AudioCodec, Query(description='出力音声コーデック。')] = 'aac',
     audio_track: Annotated[str | None, Query(description='映像と多重化する音声レンディション ID。')] = None,
 ) -> StreamQualityWithOptions:
@@ -60,6 +174,7 @@ async def ValidateQuality(
         Config().general.encoder_bs4k if is_bs4k_recorded_video is True else None,
         is_24fps_mode_allowed = is_bs4k_recorded_video is False,
         video_codec = video_codec,
+        video_bit_depth = cast(Literal[8, 10] | None, int(video_bit_depth) if video_bit_depth is not None else None),
         audio_codec = audio_codec,
         audio_rendition_id = audio_track,
     )
@@ -69,6 +184,35 @@ async def ValidateQuality(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Specified quality was not found',
         )
+
+    # 新経路を明示した要求は、能力APIと同じ実検査結果で事前に拒否する。
+    if (
+        IsRecordedPlaybackIndexReady(
+            recorded_program.recorded_video.playback_index_status,
+            recorded_program.recorded_video.playback_index_version,
+        ) and
+        (video_codec is not None or video_bit_depth is not None)
+    ):
+        selected_encoder = Config().general.encoder_bs4k \
+            if is_bs4k_recorded_video else Config().general.encoder
+        capability = next(
+            (
+                item for item in await RecordedPlaybackCapabilityProbe.getCapabilities()
+                if item.encoder == selected_encoder and
+                item.codec == stream_quality.encoding_options.video_codec and
+                item.bit_depth == stream_quality.encoding_options.video_bit_depth
+            ),
+            None,
+        )
+        if capability is None or capability.available is False:
+            reason_code = capability.reason_code if capability is not None else 'ProbeFailed'
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    'code': reason_code,
+                    'message': 'The requested recorded encoding is unavailable.',
+                },
+            )
 
     return stream_quality
 
@@ -95,17 +239,12 @@ async def VideoHLSPlaylistAPI(
     この M3U8 プレイリストは仮想的なもので、すべてのセグメントデータがエンコード済みとは限らない。セグメントはリクエストされ次第随時生成される。
     """
 
-    # 品質とオプション指定に対応する録画視聴セッションを作成または取得
-    video_stream = VideoStream(
-        session_id,
-        recorded_program,
-        stream_quality.quality,
-        stream_quality.encoding_options,
-        is_new_session_allowed = True,
-    )
+    # 旧録画経路の削除後は、未解析の録画もオンデマンド索引が完了し次第そのまま再生を開始する。
+    await EnsurePlaybackIndexReady(recorded_program, session_id)
 
-    # 映像と選択音声を同じ MPEG-TS に多重化した HLS プレイリストを取得
-    virtual_playlist = video_stream.getMasterPlaylist(cache_key)
+    # 品質とオプション指定に対応する録画視聴セッションを作成または取得
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality, is_new_session_allowed = True)
+    virtual_playlist = await video_stream.getMasterPlaylist(cache_key)
     return Response(
         content = virtual_playlist,
         media_type = 'application/vnd.apple.mpegurl',
@@ -122,9 +261,9 @@ async def VideoHLSVideoPlaylistAPI(
     session_id: Annotated[str, Query()],
     cache_key: Annotated[str | None, Query()] = None,
 ):
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     return Response(
-        content=video_stream.getVirtualPlaylist(cache_key),
+        content=video_stream.getVideoPlaylist(cache_key),
         media_type='application/vnd.apple.mpegurl',
         headers={'Cache-Control': 'max-age=0'},
     )
@@ -137,13 +276,30 @@ async def VideoHLSVideoSegmentAPI(
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
     cache_key: Annotated[str | None, Query()] = None,
-    request_generation: Annotated[int | None, Query()] = None,
 ):
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
-    segment_data = await video_stream.getMuxedSegment(sequence, request_generation)
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
+    segment_data = await video_stream.getVideoSegment(sequence)
     if segment_data is None:
         raise HTTPException(status_code=422, detail='Video segment was not found')
-    return Response(content=segment_data, media_type='video/mp2t', headers={'Cache-Control': 'max-age=10800'})
+    return Response(content=segment_data, media_type='video/mp4', headers={'Cache-Control': 'max-age=10800'})
+
+
+@router.get('/{video_id}/{quality}/video/init', response_class=Response)
+async def VideoHLSVideoInitSegmentAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    generation: Annotated[int, Query()],
+    sequence: Annotated[int, Query()] = 0,
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    """録画映像の初期化セグメントを返す。"""
+
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
+    init_segment = await video_stream.getVideoInitSegment(generation, sequence)
+    if init_segment is None:
+        raise HTTPException(status_code=422, detail='Video initialization segment was not found')
+    return Response(content=init_segment, media_type='video/mp4', headers={'Cache-Control': 'max-age=10800'})
 
 
 @router.get('/{video_id}/{quality}/audio/{rendition_id}/playlist', response_class=Response)
@@ -154,7 +310,7 @@ async def VideoHLSAudioPlaylistAPI(
     session_id: Annotated[str, Query()],
     cache_key: Annotated[str | None, Query()] = None,
 ):
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     return Response(
         content=video_stream.getAudioPlaylist(rendition_id, cache_key),
         media_type='application/vnd.apple.mpegurl',
@@ -170,15 +326,14 @@ async def VideoHLSAudioSegmentAPI(
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
     cache_key: Annotated[str | None, Query()] = None,
-    request_generation: Annotated[int | None, Query()] = None,
 ):
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
-    segment_data = await video_stream.getAudioSegment(rendition_id, sequence, request_generation)
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
+    segment_data = await video_stream.getAudioSegment(rendition_id, sequence)
     if segment_data is None:
         raise HTTPException(status_code=422, detail='Audio segment was not found')
     return Response(
         content=segment_data,
-        media_type=getAudioCodecDefinition(video_stream.encoding_options.audio_codec).mime_type,
+        media_type='audio/mp4',
         headers={'Cache-Control': 'max-age=10800'},
     )
 
@@ -192,7 +347,7 @@ async def VideoHLSAudioInitSegmentAPI(
     sequence: Annotated[int, Query()] = 0,
     cache_key: Annotated[str | None, Query()] = None,
 ):
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     init_segment = await video_stream.getAudioInitSegment(rendition_id, sequence)
     if init_segment is None:
         raise HTTPException(status_code=422, detail='Audio initialization segment was not found')
@@ -207,9 +362,18 @@ async def VideoHLSSubtitlePlaylistAPI(
     session_id: Annotated[str, Query()],
     cache_key: Annotated[str | None, Query()] = None,
 ):
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
+    subtitle_stream = RecordedSubtitleStream(recorded_program.recorded_video)
+    if subtitle_stream.getTrackKind(subtitle_index) != 'Text':
+        raise HTTPException(status_code=422, detail='This subtitle track cannot be converted to WebVTT')
     return Response(
-        content=video_stream.getSubtitlePlaylist(subtitle_index, cache_key),
+        content=(
+            '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-PLAYLIST-TYPE:VOD\n'
+            f'#EXT-X-TARGETDURATION:{math.ceil(recorded_program.recorded_video.duration)}\n'
+            f'#EXTINF:{recorded_program.recorded_video.duration:.6f},\n'
+            f'webvtt?session_id={session_id}&cache_key={cache_key or ""}&{video_stream.getCodecQuery()}\n'
+            '#EXT-X-ENDLIST\n'
+        ),
         media_type='application/vnd.apple.mpegurl',
         headers={'Cache-Control': 'max-age=0'},
     )
@@ -223,61 +387,81 @@ async def VideoHLSSubtitleSegmentAPI(
     session_id: Annotated[str, Query()],
     cache_key: Annotated[str | None, Query()] = None,
 ):
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
-    segment_data = await video_stream.getSubtitleSegment(subtitle_index)
+    GetRecordedStream(session_id, recorded_program, stream_quality).keepAlive()
+    segment_data = await RecordedSubtitleStream(recorded_program.recorded_video).getWebVTT(subtitle_index)
     if segment_data is None:
-        raise HTTPException(status_code=422, detail='Subtitle segment was not found')
+        raise HTTPException(status_code=422, detail='Subtitle conversion failed')
     return Response(content=segment_data, media_type='text/vtt', headers={'Cache-Control': 'max-age=10800'})
 
 
-@router.get(
-    '/{video_id}/{quality}/segment',
-    summary = '録画番組 HLS セグメント API',
-    response_class = Response,
-    responses = {
-        status.HTTP_200_OK: {
-            'description': 'HLS セグメントとして分割された MPEG-TS データ。',
-            'content': {'video/mp2t': {}},
-        }
-    }
-)
-async def VideoHLSSegmentAPI(
+@router.get('/{video_id}/{quality}/subtitle/{subtitle_index}/webvtt', response_class=Response)
+async def VideoSubtitleWebVTTAPI(
+    subtitle_index: int,
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
-    session_id: Annotated[str, Query(description='セッション ID（クライアント側で適宜生成したランダム値を指定する）。')],
-    sequence: Annotated[int, Query(description='HLS セグメントの 0 スタートのシーケンス番号。')],
-    cache_key: Annotated[str | None, Query(description='キャッシュ制御用のキー。')],
+    session_id: Annotated[str, Query()],
 ):
-    """
-    指定された画質に対応する、録画番組のストリーミング用 HLS セグメントを返す。<br>
-    呼び出された時点でエンコードされていない場合は既存のエンコードタスクが終了され、<br>
-    sequence の HLS セグメントが含まれる範囲から新たにエンコードタスクが開始される。
-    """
+    """映像セッションと独立したWebVTT字幕を返す。"""
 
-    # 品質とオプション指定に対応する録画視聴セッションを取得
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    GetRecordedStream(session_id, recorded_program, stream_quality).keepAlive()
+    data = await RecordedSubtitleStream(recorded_program.recorded_video).getWebVTT(subtitle_index)
+    if data is None:
+        raise HTTPException(status_code=422, detail='Subtitle conversion failed or the track is disabled')
+    return Response(content=data, media_type='text/vtt', headers={'Cache-Control': 'max-age=10800'})
 
-    # セグメントを取得（キャッシュキーはブラウザキャッシュ避けのための ID なので特に使わない）
-    segment_data = await video_stream.getMuxedSegment(sequence)
-    if segment_data is None:
-        logging.error(
-            f'{video_stream.log_prefix} Specified sequence segment was not found. '
-            f'[sequence: {sequence}]'
-        )
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Specified sequence segment was not found',
-        )
 
-    # 取得した MPEG-TS データを返す
-    return Response(
-        content = segment_data,
-        media_type = 'video/mp2t',
-        headers = {
-            # キャッシュ有効期間を3時間に設定
-            'Cache-Control': 'max-age=10800',
-        },
+@router.get('/{video_id}/{quality}/subtitle/{subtitle_index}/arib')
+async def VideoSubtitleARIBAPI(
+    subtitle_index: int,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    start_time: Annotated[float, Query(ge=0)],
+    end_time: Annotated[float, Query(gt=0)],
+):
+    """指定時間範囲のPTS付きARIB生字幕とシーク復元情報を返す。"""
+
+    GetRecordedStream(session_id, recorded_program, stream_quality).keepAlive()
+    result = await RecordedSubtitleStream(recorded_program.recorded_video).getARIBRange(
+        subtitle_index,
+        start_time,
+        end_time,
     )
+    if result is None:
+        raise HTTPException(status_code=422, detail='ARIB subtitle track was not found')
+    return result
+
+
+@router.get('/{video_id}/subtitle/{subtitle_index}/webvtt', response_class=Response)
+async def RecordedSubtitleWebVTTAPI(
+    subtitle_index: int,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+):
+    """録画視聴セッションに依存しないWebVTT字幕を返す。"""
+
+    data = await RecordedSubtitleStream(recorded_program.recorded_video).getWebVTT(subtitle_index)
+    if data is None:
+        raise HTTPException(status_code=422, detail='Subtitle conversion failed or the track is disabled')
+    return Response(content=data, media_type='text/vtt', headers={'Cache-Control': 'max-age=10800'})
+
+
+@router.get('/{video_id}/subtitle/{subtitle_index}/arib')
+async def RecordedSubtitleARIBAPI(
+    subtitle_index: int,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    start_time: Annotated[float, Query(ge=0)],
+    end_time: Annotated[float, Query(gt=0)],
+):
+    """録画視聴セッションに依存しないARIB字幕範囲を返す。"""
+
+    result = await RecordedSubtitleStream(recorded_program.recorded_video).getARIBRange(
+        subtitle_index,
+        start_time,
+        end_time,
+    )
+    if result is None:
+        raise HTTPException(status_code=422, detail='ARIB subtitle track was not found')
+    return result
 
 
 @router.get(
@@ -308,7 +492,7 @@ async def VideoHLSBufferAPI(
     """
 
     # 品質とオプション指定に対応する録画視聴セッションを取得
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
 
     # バッファ範囲の変更を監視し、変更があればバッファ範囲をイベントストリームとして出力する
     async def generator():
@@ -369,7 +553,7 @@ async def VideoHLSKeepAliveAPI(
     """
 
     # 品質とオプション指定に対応する録画視聴セッションを取得
-    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
 
     # セッションのアクティブ状態を維持する
     video_stream.keepAlive()

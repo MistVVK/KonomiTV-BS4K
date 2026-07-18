@@ -100,7 +100,7 @@ def _render_collapsible_licenses(markdown: MarkdownIt, source: str) -> str:
     summary = 'サードパーティーライセンス取得 API',
     response_class = HTMLResponse,
 )
-def ThirdPartyLicensesAPI() -> HTMLResponse:
+async def ThirdPartyLicensesAPI() -> HTMLResponse:
     """
     KonomiTV に同梱している third-party ソフトウェアのライセンス全文を返す。
 

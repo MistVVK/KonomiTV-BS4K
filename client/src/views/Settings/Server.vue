@@ -289,6 +289,30 @@
                     <span class="ml-1">除外フォルダを追加</span>
                 </v-btn>
             </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">録画再生 fMP4 キャッシュの保存先フォルダの絶対パス</div>
+                <div class="settings__item-label" style="padding-bottom: 2px;">
+                    未指定の場合は、各録画ファイルと同じフォルダへキャッシュファイルを保存します。<br>
+                    Docker 版でもホストマシン側の絶対パスを指定してください。設定はサーバー再起動後に反映されます。<br>
+                </div>
+                <v-text-field class="settings__item-form mt-3" color="primary" variant="outlined" hide-details
+                    placeholder="未指定（録画ファイルと同じフォルダ）"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :model-value="server_settings.video.recorded_fmp4_cache_folder ?? ''"
+                    @update:model-value="server_settings.video.recorded_fmp4_cache_folder = $event === '' ? null : String($event)">
+                </v-text-field>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">既存録画の再生用インデックスを自動生成する</div>
+                <div class="settings__item-label">
+                    無効にすると、サーバー起動後に既存録画を順番に解析するバックフィルだけを停止します。<br>
+                    再生を要求した録画と新しく完了した録画のインデックス生成は、無効時も継続します。設定はサーバー再起動後に反映されます。<br>
+                </div>
+                <v-switch class="settings__item-switch" color="primary"
+                    id="recorded_playback_index_backfill_enabled" hide-details
+                    v-model="server_settings.video.recorded_playback_index_backfill_enabled">
+                </v-switch>
+            </div>
             <div class="settings__content-heading mt-6">
                 <Icon icon="fluent:image-multiple-16-filled" width="22px" />
                 <span class="ml-2">キャプチャ</span>

@@ -17,6 +17,7 @@ export const BS4K_LIVE_STREAMING_QUALITIES: BS4KLiveStreamingQuality[] = ['4320p
 export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
 export type StreamingVideoCodec = 'avc' | 'hevc';
+export type RecordedStreamingVideoCodec = StreamingVideoCodec | 'vp9' | 'av1';
 
 // 番組表関連の型定義
 export type TimeTableSizeOption = 'Wide' | 'Normal' | 'Narrow';
@@ -103,10 +104,10 @@ export interface ILocalClientSettings extends IClientSettings {
     tv_24fps_mode_cellular: boolean;
     video_streaming_quality: VideoStreamingQuality;
     video_streaming_quality_cellular: VideoStreamingQuality;
-    video_encoding_codec: StreamingVideoCodec;
-    video_encoding_codec_cellular: StreamingVideoCodec;
-    bs4k_video_encoding_codec: StreamingVideoCodec;
-    bs4k_video_encoding_codec_cellular: StreamingVideoCodec;
+    video_encoding_codec: RecordedStreamingVideoCodec;
+    video_encoding_codec_cellular: RecordedStreamingVideoCodec;
+    bs4k_video_encoding_codec: RecordedStreamingVideoCodec;
+    bs4k_video_encoding_codec_cellular: RecordedStreamingVideoCodec;
     video_24fps_mode: boolean;
     video_24fps_mode_cellular: boolean;
     caption_font: string;

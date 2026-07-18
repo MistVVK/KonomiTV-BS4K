@@ -3,11 +3,17 @@
         <router-link class="watch-header__back-icon" v-ripple :to="playback_mode === 'Live' ? '/tv/' : '/videos/'">
             <Icon icon="fluent:chevron-left-12-filled" width="21px" />
         </router-link>
-        <img class="watch-header__broadcaster" v-if="playback_mode === 'Live'"
-            :src="`${Utils.api_base_url}/channels/${channelsStore.channel.current.id}/logo`">
+        <img class="watch-header__broadcaster"
+            v-if="playback_mode === 'Live' || playerStore.recorded_program.channel !== null"
+            :src="`${Utils.api_base_url}/channels/${playback_mode === 'Live' ?
+                channelsStore.channel.current.id : playerStore.recorded_program.channel?.id}/logo`">
         <span class="watch-header__program-title" v-html="ProgramUtils.decorateProgramInfo(
             playback_mode === 'Live' ? channelsStore.channel.current.program_present : playerStore.recorded_program, 'title'
         )"></span>
+        <span v-if="playback_mode === 'Video' && playerStore.recorded_program.channel !== null"
+            class="watch-header__broadcaster-name">
+            {{playerStore.recorded_program.channel.name}}
+        </span>
         <span class="watch-header__program-time">
             {{ProgramUtils.getProgramTime(playback_mode === 'Live' ? channelsStore.channel.current.program_present : playerStore.recorded_program, true)}}
         </span>
@@ -280,6 +286,23 @@ export default defineComponent({
         @include smartphone-vertical {
             margin-left: 8px;
             font-size: 13px;
+        }
+    }
+
+    .watch-header__broadcaster-name {
+        flex-shrink: 0;
+        margin-left: 16px;
+        color: rgb(var(--v-theme-text-darken-1));
+        font-size: 13px;
+        font-weight: 500;
+
+        @include smartphone-horizontal {
+            margin-left: 8px;
+            font-size: 12px;
+        }
+        @include smartphone-vertical {
+            margin-left: 8px;
+            font-size: 12px;
         }
     }
 

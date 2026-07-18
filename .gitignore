@@ -152,11 +152,13 @@ config.yaml
 docker-compose.yaml
 
 # user files
-server/data/*.*
-server/data/account-icons/*.*
-server/data/thumbnails/*.*
-server/data/thumbnails/old/*.*
-server/data/twitter*
+server/data/*
+!server/data/account-icons/
+server/data/account-icons/*
+!server/data/account-icons/.gitkeep
+!server/data/thumbnails/
+server/data/thumbnails/*
+!server/data/thumbnails/.gitkeep
 server/static/interlaced_*
 
 # thirdparty

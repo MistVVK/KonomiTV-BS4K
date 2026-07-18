@@ -1,16 +1,21 @@
+import asyncio
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from httpx import ASGITransport, Response
+from httpx import AsyncClient as HTTPXAsyncClient
 
 from app.routers import VersionRouter
 
 
-def create_test_client(licenses_path: Path) -> TestClient:
+async def get_third_party_licenses(licenses_path: Path) -> Response:
+    """別スレッドを起動せずASGIアプリへライセンスAPI要求を送る。"""
+
     VersionRouter.THIRD_PARTY_LICENSES_PATH = licenses_path
     app = FastAPI()
     app.include_router(VersionRouter.router)
-    return TestClient(app)
+    async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+        return await client.get('/api/version/third-party-licenses')
 
 
 def test_third_party_licenses_api_renders_markdown_as_html(tmp_path: Path) -> None:
@@ -24,9 +29,7 @@ def test_third_party_licenses_api_renders_markdown_as_html(tmp_path: Path) -> No
         '## KonomiTV upstream\n\n<script>alert(1)</script>\n',
         encoding = 'utf-8',
     )
-    client = create_test_client(licenses_path)
-
-    response = client.get('/api/version/third-party-licenses')
+    response = asyncio.run(get_third_party_licenses(licenses_path))
 
     assert response.status_code == 200
     assert response.headers['content-type'].startswith('text/html;')
@@ -48,9 +51,7 @@ def test_third_party_licenses_api_renders_markdown_as_html(tmp_path: Path) -> No
 
 
 def test_third_party_licenses_api_returns_404_when_document_is_missing(tmp_path: Path) -> None:
-    client = create_test_client(tmp_path / 'missing.md')
-
-    response = client.get('/api/version/third-party-licenses')
+    response = asyncio.run(get_third_party_licenses(tmp_path / 'missing.md'))
 
     assert response.status_code == 404
     assert response.json() == {'detail': 'サードパーティーライセンス文書が見つかりません。'}
@@ -66,9 +67,7 @@ def test_third_party_licenses_api_renders_bundled_web_fonts_as_table(tmp_path: P
         '| Kosugi | 5.2.5 | OFL-1.1 |\n',
         encoding = 'utf-8',
     )
-    client = create_test_client(licenses_path)
-
-    response = client.get('/api/version/third-party-licenses')
+    response = asyncio.run(get_third_party_licenses(licenses_path))
 
     assert response.status_code == 200
     assert '<span class="license-section__title">Bundled web fonts</span>' in response.text

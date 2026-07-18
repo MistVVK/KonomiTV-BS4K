@@ -11,6 +11,11 @@ from tortoise import fields
 from tortoise.fields import Field as TortoiseField
 from tortoise.models import Model as TortoiseModel
 
+from app.metadata.RecordedPlaybackIndex import (
+    RECORDED_PLAYBACK_INDEX_VERSION,
+    GetRecordedPlaybackIndexState,
+    RecordedPlaybackIndexState,
+)
 from app.models.RecordedProgram import RecordedProgram
 from app.schemas import (
     AudioTrack,
@@ -20,6 +25,7 @@ from app.schemas import (
     SegmentMapEntry,
     SubtitleTrack,
     ThumbnailInfo,
+    VideoStreamTimelineEntry,
 )
 
 
@@ -41,6 +47,13 @@ class RecordedVideo(TortoiseModel):
     file_modified_at = fields.DatetimeField()
     analyzed_at = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     analysis_git_commit = cast(TortoiseField[str | None], fields.CharField(255, null=True))
+    playback_index_status = cast(TortoiseField[Literal['Pending', 'Analyzing', 'Ready', 'Failed']],
+        fields.CharField(255, default='Pending', db_index=True))
+    playback_index_version = cast(TortoiseField[int | None], fields.IntField(null=True))
+    playback_indexed_at = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
+    playback_index_error_code = cast(TortoiseField[str | None], fields.CharField(255, null=True))
+    video_stream_timeline = cast(TortoiseField[list[VideoStreamTimelineEntry] | None],
+        fields.JSONField(default=None, encoder=lambda x: json.dumps(x, ensure_ascii=False), null=True))  # type: ignore
     recording_start_time = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     recording_end_time = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     duration = fields.FloatField()
@@ -82,3 +95,15 @@ class RecordedVideo(TortoiseModel):
         fields.JSONField(default=None, encoder=lambda x: json.dumps(x, ensure_ascii=False), null=True))  # type: ignore
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
+
+    @property
+    def playback_index_state(self) -> RecordedPlaybackIndexState:
+        """現行Versionとの差異を含むクライアント向け索引状態を返す。"""
+
+        return GetRecordedPlaybackIndexState(self.playback_index_status, self.playback_index_version)
+
+    @property
+    def playback_index_current_version(self) -> int:
+        """サーバーが要求する現行の録画再生索引Versionを返す。"""
+
+        return RECORDED_PLAYBACK_INDEX_VERSION

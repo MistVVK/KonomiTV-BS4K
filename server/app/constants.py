@@ -77,12 +77,14 @@ LIBRARY_PATH = {
     'Akebi': str(LIBRARY_DIR / 'Akebi/akebi-https-server.elf'),
     'FFmpeg': str(LIBRARY_DIR / 'FFmpeg/ffmpeg.elf'),
     'FFprobe': str(LIBRARY_DIR / 'FFmpeg/ffprobe.elf'),
+    'FFmpeg8': str(LIBRARY_DIR / 'FFmpeg8/ffmpeg8.elf'),
+    'FFmpeg8AMD': str(LIBRARY_DIR / 'FFmpeg8/ffmpeg8-amd.sh'),
+    'FFprobe8': str(LIBRARY_DIR / 'FFmpeg8/ffprobe8.elf'),
     'QSVEncC': str(LIBRARY_DIR / 'QSVEncC/QSVEncC.elf'),
     'NVEncC': str(LIBRARY_DIR / 'NVEncC/NVEncC.elf'),
     'VCEEncC': str(LIBRARY_DIR / 'VCEEncC/VCEEncC.elf'),
     'tsreadex': str(LIBRARY_DIR / 'tsreadex/tsreadex.elf'),
     'psisiarc': str(LIBRARY_DIR / 'psisiarc/psisiarc.elf'),
-    'psisimux': str(LIBRARY_DIR / 'psisimux/psisimux.elf'),
 }
 
 # データベース (Tortoise ORM) の設定

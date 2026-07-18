@@ -148,12 +148,6 @@ mkdir -p "${OUTPUT_ROOT}/psisiarc"
 install -m 0755 "${SOURCE_ROOT}/psisiarc/psisiarc" "${OUTPUT_ROOT}/psisiarc/psisiarc.elf"
 copy-license "${SOURCE_ROOT}/psisiarc/License.txt" "${OUTPUT_ROOT}/psisiarc/License.txt"
 
-clone-commit "${PSISIMUX_REPOSITORY}" "${PSISIMUX_COMMIT}" "${SOURCE_ROOT}/psisimux"
-make -C "${SOURCE_ROOT}/psisimux" -j"$(nproc)"
-mkdir -p "${OUTPUT_ROOT}/psisimux"
-install -m 0755 "${SOURCE_ROOT}/psisimux/psisimux" "${OUTPUT_ROOT}/psisimux/psisimux.elf"
-copy-license "${SOURCE_ROOT}/psisimux/License.txt" "${OUTPUT_ROOT}/psisimux/License.txt"
-
 # Akebi は検証済みの Go archive を展開し、固定 commit から静的リンクで構築する。
 download-verified "${GO_URL}" "${GO_SHA256}" "${DOWNLOAD_ROOT}/go.tar.gz"
 tar -xzf "${DOWNLOAD_ROOT}/go.tar.gz" -C /opt

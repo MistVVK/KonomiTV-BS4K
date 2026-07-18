@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from app.config import Config
 from app.constants import QUALITY, QUALITY_TYPES
@@ -45,6 +46,7 @@ class StreamEncodingOptions:
 
     # 録画HLSの出力コーデック。ライブでは既存画質から導出した既定値を使用する。
     video_codec: VideoCodec = 'avc'
+    video_bit_depth: Literal[8, 10] = 8
     audio_codec: AudioCodec = 'aac'
 
     # 録画再生で映像と一緒に多重化する音声レンディション ID
@@ -60,6 +62,7 @@ class StreamEncodingOptions:
         encoder: str | None = None,
         is_24fps_mode_allowed: bool = True,
         video_codec: VideoCodec | None = None,
+        video_bit_depth: Literal[8, 10] | None = None,
         audio_codec: AudioCodec = 'aac',
         audio_rendition_id: str | None = None,
     ) -> StreamEncodingOptions:
@@ -101,6 +104,7 @@ class StreamEncodingOptions:
             is_hevc_10bit_enabled = is_hevc_10bit_enabled,
             is_24fps_mode_enabled = is_24fps_mode_enabled,
             video_codec = resolved_video_codec,
+            video_bit_depth = video_bit_depth or (10 if is_hevc_10bit_enabled else 8),
             audio_codec = audio_codec,
             audio_rendition_id = audio_rendition_id,
         )
@@ -150,6 +154,7 @@ def SplitQualityAndEncodingOptions(
     encoder: str | None = None,
     is_24fps_mode_allowed: bool = True,
     video_codec: VideoCodec | None = None,
+    video_bit_depth: Literal[8, 10] | None = None,
     audio_codec: AudioCodec = 'aac',
     audio_rendition_id: str | None = None,
 ) -> StreamQualityWithOptions | None:
@@ -199,6 +204,7 @@ def SplitQualityAndEncodingOptions(
         encoder,
         is_24fps_mode_allowed,
         resolved_video_codec,
+        video_bit_depth,
         audio_codec,
         audio_rendition_id,
     )

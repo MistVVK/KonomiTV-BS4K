@@ -20,7 +20,6 @@ required_files=(
     QSVEncC/QSVEncC.elf
     VCEEncC/VCEEncC.elf
     psisiarc/psisiarc.elf
-    psisimux/psisimux.elf
     tsreadex/tsreadex.elf
     Library/dri/iHD_drv_video.so
     Library/libmfx-gen.so.1.2

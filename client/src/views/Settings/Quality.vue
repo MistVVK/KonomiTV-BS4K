@@ -132,11 +132,11 @@
                     AVC は互換性を、HEVC は通信量の削減を優先します。非対応環境では再生時だけ AVC に戻します。
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
-                    :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                    :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_video_codecs"
                     v-if="network_circuit !== 'モバイル回線時'" v-model="settingsStore.settings.video_encoding_codec">
                 </v-select>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
-                    :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                    :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_video_codecs"
                     v-if="network_circuit === 'モバイル回線時'" v-model="settingsStore.settings.video_encoding_codec_cellular">
                 </v-select>
             </div>
@@ -166,6 +166,8 @@
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
+import Videos, { IRecordedPlaybackCodecOption } from '@/services/Videos';
+import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import Utils, { PlayerUtils } from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
@@ -225,10 +227,16 @@ export default defineComponent({
                 {title: 'H.264 / AVC（互換性優先）', value: 'avc'},
                 {title: 'H.265 / HEVC（通信量優先）', value: 'hevc'},
             ],
+            recorded_streaming_video_codecs: [] as IRecordedPlaybackCodecOption[],
         };
     },
     computed: {
-        ...mapStores(useSettingsStore),
+        ...mapStores(useSettingsStore, useServerSettingsStore),
+    },
+    async mounted() {
+        this.recorded_streaming_video_codecs = await Videos.buildRecordedPlaybackCodecOptions(
+            this.serverSettingsStore.server_settings.general.encoder,
+        );
     },
     watch: {
         'settingsStore.settings.tv_encoding_codec': {

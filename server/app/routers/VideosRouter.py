@@ -24,10 +24,16 @@ from tortoise import connections
 
 from app import logging, schemas
 from app.constants import STATIC_DIR, THUMBNAILS_DIR
+from app.metadata.RecordedPlaybackIndex import (
+    RECORDED_PLAYBACK_INDEX_VERSION,
+    GetRecordedPlaybackIndexState,
+)
+from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.models.RecordedProgram import RecordedProgram
+from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
 from app.utils.DriveIOLimiter import DriveIOLimiter
@@ -80,6 +86,11 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         else:
             subtitle_tracks = row['subtitle_tracks']
 
+    video_stream_timeline: list[schemas.VideoStreamTimelineEntry] | None = None
+    if row['video_stream_timeline'] is not None:
+        video_stream_timeline = json.loads(row['video_stream_timeline']) \
+            if isinstance(row['video_stream_timeline'], str) else row['video_stream_timeline']
+
     # recorded_video のデータを構築
     recorded_video_dict = {
         'id': row['rv_id'],
@@ -91,6 +102,16 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         'file_modified_at': row['file_modified_at'],
         'analyzed_at': row['analyzed_at'],
         'analysis_git_commit': row['analysis_git_commit'],
+        'playback_index_status': row['playback_index_status'],
+        'playback_index_state': GetRecordedPlaybackIndexState(
+            row['playback_index_status'],
+            row['playback_index_version'],
+        ),
+        'playback_index_version': row['playback_index_version'],
+        'playback_index_current_version': RECORDED_PLAYBACK_INDEX_VERSION,
+        'playback_indexed_at': row['playback_indexed_at'],
+        'playback_index_error_code': row['playback_index_error_code'],
+        'video_stream_timeline': video_stream_timeline,
         'recording_start_time': row['recording_start_time'],
         'recording_end_time': row['recording_end_time'],
         'duration': row['video_duration'],
@@ -395,6 +416,11 @@ async def VideosAPI(
             rv.file_modified_at,
             rv.analyzed_at,
             rv.analysis_git_commit,
+            rv.playback_index_status,
+            rv.playback_index_version,
+            rv.playback_indexed_at,
+            rv.playback_index_error_code,
+            rv.video_stream_timeline,
             rv.recording_start_time,
             rv.recording_end_time,
             rv.duration AS video_duration,
@@ -629,6 +655,11 @@ async def VideosSearchAPI(
             rv.file_modified_at,
             rv.analyzed_at,
             rv.analysis_git_commit,
+            rv.playback_index_status,
+            rv.playback_index_version,
+            rv.playback_indexed_at,
+            rv.playback_index_error_code,
+            rv.video_stream_timeline,
             rv.recording_start_time,
             rv.recording_end_time,
             rv.duration AS video_duration,
@@ -731,6 +762,76 @@ async def VideoAPI(
     """
 
     return recorded_program
+
+
+def BuildRecordedPlaybackIndex(recorded_program: RecordedProgram) -> schemas.RecordedPlaybackIndex:
+    """録画番組モデルから公開用の録画再生索引状態を構築する。
+
+    Args:
+        recorded_program: 状態を取得する録画番組。
+
+    Returns:
+        現行Versionとの差異を含む録画再生索引状態。
+    """
+
+    recorded_video = recorded_program.recorded_video
+    index_state = GetRecordedPlaybackIndexState(
+        recorded_video.playback_index_status,
+        recorded_video.playback_index_version,
+    )
+    progress, stage = RecordedPlaybackIndexer.getProgress(recorded_video.id, index_state)
+    return schemas.RecordedPlaybackIndex(
+        status = recorded_video.playback_index_status,
+        state = index_state,
+        version = recorded_video.playback_index_version,
+        current_version = RECORDED_PLAYBACK_INDEX_VERSION,
+        indexed_at = recorded_video.playback_indexed_at,
+        error_code = recorded_video.playback_index_error_code,
+        progress = progress,
+        stage = stage,
+    )
+
+
+@router.get(
+    '/{video_id}/playback-index',
+    summary = '録画再生索引状態 API',
+    response_model = schemas.RecordedPlaybackIndex,
+)
+async def VideoPlaybackIndexAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
+) -> schemas.RecordedPlaybackIndex:
+    """録画再生索引の公開状態と現行Versionを取得する。"""
+
+    await recorded_program.recorded_video.refresh_from_db()
+    return BuildRecordedPlaybackIndex(recorded_program)
+
+
+@router.post(
+    '/{video_id}/playback-index',
+    summary = '録画再生索引生成要求 API',
+    response_model = schemas.RecordedPlaybackIndex,
+    status_code = status.HTTP_202_ACCEPTED,
+)
+async def VideoPlaybackIndexCreateAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
+) -> schemas.RecordedPlaybackIndex:
+    """未解析・旧Version・失敗済みの録画再生索引を最優先キューへ投入する。"""
+
+    await recorded_program.recorded_video.refresh_from_db()
+    index = BuildRecordedPlaybackIndex(recorded_program)
+    if index.state != 'Ready':
+        # StaleやFailedのままでは、POST直後のポーリングが解析失敗と誤認する。
+        # 実行中のジョブは維持し、それ以外はPendingへ移してから共有キューへ投入する。
+        if index.state != 'Analyzing':
+            await RecordedVideo.filter(id=recorded_program.recorded_video.id) \
+                .exclude(playback_index_status='Analyzing').update(
+                    playback_index_status = 'Pending',
+                    playback_index_error_code = None,
+                )
+        RecordedPlaybackIndexer.enqueue(recorded_program.recorded_video.id, priority=0)
+        await recorded_program.recorded_video.refresh_from_db()
+        index = BuildRecordedPlaybackIndex(recorded_program)
+    return index
 
 
 @router.get(

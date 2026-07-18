@@ -177,11 +177,11 @@
                         </p>
                     </div>
                     <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
-                        :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                        :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_video_codecs"
                         v-if="network_circuit !== 'モバイル回線時'" v-model="settings_store.settings.bs4k_video_encoding_codec">
                     </v-select>
                     <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
-                        :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                        :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_video_codecs"
                         v-if="network_circuit === 'モバイル回線時'" v-model="settings_store.settings.bs4k_video_encoding_codec_cellular">
                     </v-select>
                 </div>
@@ -240,6 +240,7 @@ import Message from '@/message';
 import Maintenance from '@/services/Maintenance';
 import Settings, { IServerSettings, IServerSettingsDefault } from '@/services/Settings';
 import Version from '@/services/Version';
+import Videos, { IRecordedPlaybackCodecOption } from '@/services/Videos';
 import useSettingsStore, { type BS4KLiveStreamingQuality } from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { PlayerUtils } from '@/utils';
@@ -303,6 +304,7 @@ const streaming_video_codecs = [
     {title: 'H.264 / AVC（互換性優先）', value: 'avc'},
     {title: 'H.265 / HEVC（通信量優先）', value: 'hevc'},
 ];
+const recorded_streaming_video_codecs = ref<IRecordedPlaybackCodecOption[]>([]);
 const bs4k_streaming_quality = computed(() => {
     return settings_store.settings.bs4k_tv_encoding_codec === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
 });
@@ -338,6 +340,9 @@ const server_settings = ref<IServerSettings>(structuredClone(IServerSettingsDefa
 Settings.fetchServerSettings().then((settings) => {
     if (settings) {
         server_settings.value = settings;
+        Videos.buildRecordedPlaybackCodecOptions(settings.general.encoder_bs4k).then((options) => {
+            recorded_streaming_video_codecs.value = options;
+        });
     }
 });
 

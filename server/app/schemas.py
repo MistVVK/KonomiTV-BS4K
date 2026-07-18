@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, RootModel, computed_field
 from tortoise.contrib.pydantic import PydanticModel
 from typing_extensions import TypedDict
 
+from app.metadata.RecordedPlaybackIndex import RECORDED_PLAYBACK_INDEX_VERSION
 from app.utils.TSInformation import TerrestrialRegion
 
 
@@ -147,12 +148,13 @@ class AudioTrack(TypedDict):
     sampling_rate: int | None
     language: str | None
     stream_index: NotRequired[int]
+    pid: NotRequired[int]
     title: NotRequired[str | None]
     channel_layout: NotRequired[str | None]
     is_dual_mono: NotRequired[bool]
 
 class AudioTrackTimelineTrack(AudioTrack):
-    pid: NotRequired[int]
+    pass
 
 class AudioTrackTimelineEntry(TypedDict):
     start_time: float
@@ -165,6 +167,7 @@ class SubtitleTrack(TypedDict):
     codec: str
     language: str | None
     title: str | None
+    pid: NotRequired[int]
 
 class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け
@@ -177,6 +180,13 @@ class RecordedVideo(PydanticModel):
     file_modified_at: datetime
     analyzed_at: datetime | None = None
     analysis_git_commit: str | None = None
+    playback_index_status: Literal['Pending', 'Analyzing', 'Ready', 'Failed'] = 'Pending'
+    playback_index_state: Literal['Pending', 'Analyzing', 'Ready', 'Stale', 'Failed'] = 'Pending'
+    playback_index_version: int | None = None
+    playback_index_current_version: int = RECORDED_PLAYBACK_INDEX_VERSION
+    playback_indexed_at: datetime | None = None
+    playback_index_error_code: str | None = None
+    video_stream_timeline: list[VideoStreamTimelineEntry] | None = None
     recording_start_time: datetime | None
     recording_end_time: datetime | None
     duration: float
@@ -203,6 +213,55 @@ class RecordedVideo(PydanticModel):
     thumbnail_info: ThumbnailInfo | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class RecordedPlaybackIndex(PydanticModel):
+    status: Literal['Pending', 'Analyzing', 'Ready', 'Failed']
+    state: Literal['Pending', 'Analyzing', 'Ready', 'Stale', 'Failed']
+    version: int | None
+    current_version: int
+    indexed_at: datetime | None
+    error_code: str | None
+    progress: float | None
+    stage: Literal['Queued', 'Probing', 'Scanning', 'Finalizing', 'Complete', 'Failed']
+
+class RecordedPlaybackCapability(PydanticModel):
+    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC']
+    codec: Literal['avc', 'hevc', 'vp9', 'av1']
+    bit_depth: Literal[8, 10]
+    available: bool
+    profile: str
+    reason_code: Literal[
+        'BinaryUnavailable',
+        'DeviceUnavailable',
+        'DeviceInitializationFailed',
+        'FilterUnavailable',
+        'EncodeFailed',
+        'ProbeFailed',
+        'CodecMismatch',
+        'BitDepthMismatch',
+        'ProfileMismatch',
+        'UnsupportedCombination',
+    ] | None
+
+class VideoStreamTimelineEntry(TypedDict):
+    start_time: float
+    end_time: float
+    pid: int | None
+    stream_index: int
+    codec: str
+    profile: str
+    width: int
+    height: int
+    frame_rate: float
+    scan_type: Literal['Interlaced', 'Progressive', 'Unknown']
+    bit_depth: int
+    color_range: str | None
+    color_space: str | None
+    color_primaries: str | None
+    color_transfer: str | None
+    mastering_display_metadata: dict[str, object] | None
+    content_light_level: dict[str, object] | None
 
 class KeyFrame(TypedDict):
     offset: int

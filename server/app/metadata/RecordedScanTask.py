@@ -23,7 +23,7 @@ from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.models.Channel import Channel
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
-from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
+from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.Git import GetGitCommit
@@ -61,6 +61,15 @@ class RecordedVideoSummary:
     file_modified_at: datetime
     file_size: int
     file_hash: str
+
+    def isFileContentUnchanged(self, file_modified_at: datetime, file_size: int) -> bool:
+        """ファイル内容に関係しない ctime の変化を無視して、再解析が不要かを判定する。"""
+
+        return (
+            self.status == 'Recorded' and
+            self.file_modified_at == file_modified_at and
+            self.file_size == file_size
+        )
 
 
 class RecordedScanTask:
@@ -315,9 +324,6 @@ class RecordedScanTask:
         else:
             logging.info('No duplicate records found.')
 
-        # 旧 key_frames が残っている録画は、再生開始位置キャッシュへ変換して DB サイズを抑える
-        await self.__migrateKeyFramesToSegmentMap()
-
         # 現在登録されている全ての RecordedVideo レコードをキャッシュ
         ## 重複削除処理で保持すると判断されたレコードのみを使う
         existing_db_recorded_videos: dict[anyio.Path, RecordedVideoSummary] = {}
@@ -343,6 +349,10 @@ class RecordedScanTask:
                 try:
                     # Mac の metadata ファイルをスキップ
                     if file_path.name.startswith('._'):
+                        continue
+                    # 録画と同じ階層へ置かれるfMP4予約キャッシュは録画ファイルとして登録しない。
+                    if RecordedFMP4CacheManager.isCacheFileName(file_path.name):
+                        await RecordedFMP4CacheManager.cleanupDiscovered(pathlib.Path(str(file_path)))
                         continue
                     # 除外パターンのチェック（シンボリックリンク解決前）
                     original_path_str = str(file_path)
@@ -532,7 +542,6 @@ class RecordedScanTask:
                 stat = await file_path.stat()
                 now = datetime.now(tz=JST)
                 file_size = stat.st_size
-                file_created_at = datetime.fromtimestamp(stat.st_ctime, tz=JST)
                 file_modified_at = datetime.fromtimestamp(stat.st_mtime, tz=JST)
 
                 # 全く録画できていない0バイトのファイルをスキップ
@@ -587,18 +596,16 @@ class RecordedScanTask:
                         )
                         existing_recorded_video_summary.file_path = file_path_str
 
-                # 同じファイルパスの既存レコードがあり、ファイルの基本情報（作成日時、更新日時、サイズ）が前回と一致した場合、
+                # 同じファイルパスの既存レコードがあり、ファイル内容を示す更新日時とサイズが前回と一致した場合、
                 # ファイル内容は変更されておらず、レコード内容は更新不要と判断してスキップ
                 ## こうすることで、録画済みファイルに対しては HDD への I/O 負荷が高いハッシュ算出やメタデータ解析処理を省略できる
+                ## Linux の ctime は権限・所有者などのメタデータ変更でも更新されるため、内容変更の判定には使わない
                 ## 万が一前回実行時からファイルサイズや最終更新日時の変更を伴わずに録画が完了した場合に状態を適切に反映できるよう、録画中はスキップしない
                 if (force_update is False and
                     existing_recorded_video_summary is not None and
-                    existing_recorded_video_summary.status == 'Recorded'):
-                    if (existing_recorded_video_summary.file_created_at == file_created_at and
-                        existing_recorded_video_summary.file_modified_at == file_modified_at and
-                        existing_recorded_video_summary.file_size == file_size):
-                        # logging.debug(f'{file_path}: File metadata unchanged, skipping...')
-                        return
+                    existing_recorded_video_summary.isFileContentUnchanged(file_modified_at, file_size)):
+                    # logging.debug(f'{file_path}: File content unchanged, skipping...')
+                    return
 
                 # 現在録画中とマークされているファイルの処理
                 is_recording = file_path in self._recording_files
@@ -911,7 +918,7 @@ class RecordedScanTask:
                 ):
                     # 既存チャンネルに TSID がない場合だけ、録画メタデータから得た値で補完する
                     ## Mirakurun のチャンネル情報には TSID が含まれないが、NID/SID/TSID の組は放送運用上ほぼ不変なので、
-                    ## 既知の TSID を失わず保持しておくことで MP4 再生時の psisimux 引数にも利用できる
+                    ## 録画メタデータから判明した TSID は失わず保持する
                     db_channel.transport_stream_id = recorded_program.channel.transport_stream_id
                     await db_channel.save(update_fields=['transport_stream_id'])
 
@@ -954,6 +961,10 @@ class RecordedScanTask:
             else:
                 db_recorded_video = RecordedVideo()
 
+            # ファイル内容が更新された場合だけ再生用インデックスを無効化する。
+            ## メタデータの手動再解析だけでReady済みインデックスを捨てないため、保存前のhashと比較する。
+            previous_file_hash = existing_db_recorded_video.file_hash if existing_db_recorded_video is not None else None
+
             # RecordedVideo の属性を設定 (id, created_at, updated_at は自動生成のため指定しない)
             db_recorded_video.recorded_program = db_recorded_program
             db_recorded_video.status = recorded_program.recorded_video.status
@@ -987,6 +998,12 @@ class RecordedScanTask:
             db_recorded_video.audio_tracks = recorded_program.recorded_video.audio_tracks
             db_recorded_video.audio_track_timeline = recorded_program.recorded_video.audio_track_timeline
             db_recorded_video.subtitle_tracks = recorded_program.recorded_video.subtitle_tracks
+            if previous_file_hash != recorded_program.recorded_video.file_hash:
+                db_recorded_video.playback_index_status = 'Pending'
+                db_recorded_video.playback_index_version = None
+                db_recorded_video.playback_indexed_at = None
+                db_recorded_video.playback_index_error_code = None
+                db_recorded_video.video_stream_timeline = None
             # ファイル本体を再解析した場合、以前の再生開始位置キャッシュは別ファイル由来の可能性がある
             ## 新規録画と同じ空状態へ戻し、次回再生時に現在のファイルからオンデマンドで解決する
             db_recorded_video.key_frames = []
@@ -996,6 +1013,12 @@ class RecordedScanTask:
             # 「解析したが CM 区間がなかった/検出に失敗した」場合、CMSectionsDetector 側で [] が設定される
             db_recorded_video.cm_sections = None
             await db_recorded_video.save()
+
+            # 録画完了直後のインデックス生成は既存録画バックフィルより優先する。
+            ## 循環参照を避けるため、保存が完了した時点で遅延インポートする。
+            if db_recorded_video.playback_index_status == 'Pending':
+                from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
+                RecordedPlaybackIndexer.enqueue(db_recorded_video.id, priority=1)
 
 
     async def __runBackgroundAnalysis(self, recorded_program: schemas.RecordedProgram) -> None:
@@ -1034,134 +1057,6 @@ class RecordedScanTask:
         finally:
             # 完了したタスクを管理対象から削除
             self._background_tasks.pop(file_path, None)
-
-
-    async def __migrateKeyFramesToSegmentMap(self) -> None:
-        """
-        旧 key_frames を再生開始位置キャッシュへ移行する
-
-        このメソッドは runBatchScan() から呼び出され、以下の処理を行う:
-        - TS コンテナは key_frames から segment_map を生成して保存
-        - MPEG-4 コンテナは moov の同期サンプル表を再生時に読むため key_frames だけ破棄
-        - 変換後の key_frames は空配列へ戻し、巨大な JSON が残り続けないようにする
-        """
-
-        logging.info('Starting keyframe to segment map migration...')
-
-        migrated_count = 0
-        repaired_count = 0
-        skipped_count = 0
-        last_seen_id = 0
-        next_progress_log_count = 500
-
-        while True:
-            # key_frames は ORM 取得時に list へ復元されるため、Python 側で空配列かどうかを判定する
-            ## DB 側で巨大 JSON の文字列比較を走らせず、ID 順に少量ずつ読み出して移行する
-            video_rows = await RecordedVideo.filter(
-                status = 'Recorded',
-                id__gt = last_seen_id,
-            ).order_by('id').limit(50).values(
-                'id',
-                'file_path',
-                'duration',
-                'container_format',
-                'video_frame_rate',
-                'key_frames',
-                'segment_map',
-            )
-            if len(video_rows) == 0:
-                break
-
-            for video_row in video_rows:
-                last_seen_id = video_row['id']
-
-                try:
-                    segment_map = video_row['segment_map']
-                    if not isinstance(segment_map, list):
-                        segment_map = []
-
-                    is_broken_segment_map = False
-                    # 旧変換ロジックで同じ入力位置が連続保存された MPEG-TS は、再生時に同じ映像を繰り返す
-                    ## key_frames が既に空でも検出できるよう、移行対象判定より先に segment_map を確認する
-                    if (
-                        video_row['container_format'] == 'MPEG-TS' and
-                        len(segment_map) > 0 and
-                        VideoSegmentPlanner.isSegmentMapProbablyBroken(cast(list[schemas.SegmentMapEntry], segment_map)) is True
-                    ):
-                        is_broken_segment_map = True
-
-                    key_frames = video_row['key_frames']
-                    if not isinstance(key_frames, list) or len(key_frames) == 0:
-                        # 壊れた既存キャッシュだけを空に戻し、通常の未キャッシュ状態としてオンデマンド探索へ戻す
-                        ## key_frames が空の録画は旧データから再変換できないため、誤った値を温存しない
-                        if is_broken_segment_map is True:
-                            await RecordedVideo.filter(id=video_row['id']).update(segment_map = [])
-                            repaired_count += 1
-                            logging.warning(
-                                f'{video_row["file_path"]}: Broken segment map was cleared. '
-                                f'[video_id: {video_row["id"]}]'
-                            )
-                        continue
-
-                    # TS コンテナは既存 key_frames をオンデマンド探索と同じ規則のキャッシュへ変換できる
-                    if video_row['container_format'] == 'MPEG-TS':
-                        if len(segment_map) == 0 or is_broken_segment_map is True:
-                            video_frame_rate = video_row['video_frame_rate']
-                            # 旧 DB に壊れたフレームレートが混じっている場合、セグメント長を復元できないため移行対象から外す
-                            if (
-                                isinstance(video_frame_rate, bool) is True or
-                                isinstance(video_frame_rate, int | float) is False
-                            ):
-                                skipped_count += 1
-                                logging.warning(
-                                    f'{video_row["file_path"]}: Invalid video frame rate. '
-                                    f'[video_id: {video_row["id"]}, video_frame_rate: {video_frame_rate}]'
-                                )
-                                continue
-                            # 0 以下のフレームレートは segment_map の時刻計算で除算できないため移行対象から外す
-                            if video_frame_rate <= 0:
-                                skipped_count += 1
-                                logging.warning(
-                                    f'{video_row["file_path"]}: Invalid video frame rate. '
-                                    f'[video_id: {video_row["id"]}, video_frame_rate: {video_frame_rate}]'
-                                )
-                                continue
-                            segment_map = VideoSegmentPlanner.convertKeyFramesToSegmentMap(
-                                key_frames = key_frames,
-                                video_frame_rate = float(video_frame_rate),
-                                duration_seconds = video_row['duration'],
-                            )
-
-                        await RecordedVideo.filter(id=video_row['id']).update(
-                            segment_map = segment_map,
-                            key_frames = [],
-                        )
-                        migrated_count += 1
-                    # MP4 は moov から同期サンプル DTS を短時間で復元できるため、巨大な旧キャッシュだけ破棄する
-                    else:
-                        await RecordedVideo.filter(id=video_row['id']).update(key_frames = [])
-                        migrated_count += 1
-                except Exception as ex:
-                    skipped_count += 1
-                    logging.error(f'{video_row["file_path"]}: Failed to migrate keyframes to segment map:', exc_info=ex)
-
-            # 大量の録画を持つ環境では起動直後に沈黙すると不安になるため、500件ごとに進捗をログへ出す
-            processed_count = migrated_count + repaired_count + skipped_count
-            if processed_count >= next_progress_log_count:
-                logging.info(
-                    f'Keyframe to segment map migration progress. '
-                    f'[processed: {processed_count}, migrated: {migrated_count}, repaired: {repaired_count}, '
-                    f'skipped: {skipped_count}]'
-                )
-                next_progress_log_count += 500
-
-            # 移行処理がイベントループを占有し続けないよう適宜制御を返す
-            await asyncio.sleep(0)
-
-        logging.info(
-            f'Keyframe to segment map migration completed. '
-            f'[migrated: {migrated_count}, repaired: {repaired_count}, skipped: {skipped_count}]'
-        )
 
 
     async def __migrateThumbnailInfo(self) -> None:
@@ -1291,6 +1186,10 @@ class RecordedScanTask:
                     file_path = anyio.Path(file_path_str)
                     # Mac の metadata ファイルをスキップ
                     if file_path.name.startswith('._'):
+                        continue
+                    # 再生中にも生成・削除イベントが発生するため、キャッシュ管理側だけに処理を任せる。
+                    if RecordedFMP4CacheManager.isCacheFileName(file_path.name):
+                        await RecordedFMP4CacheManager.cleanupDiscovered(pathlib.Path(str(file_path)))
                         continue
                     # 除外パターンのチェック（シンボリックリンク解決前）
                     # 空文字列は全パスにマッチしてしまうため除外する

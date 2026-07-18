@@ -1,4 +1,5 @@
 
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, HTTPException, status
@@ -7,6 +8,7 @@ from app import logging
 from app.config import ClientSettings, Config, SaveConfig, ServerSettings
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
+from app.utils import GetPlatformEnvironment
 
 
 # ルーター
@@ -72,10 +74,18 @@ async def ClientSettingsUpdateAPI(
 async def ServerSettingsAPI():
     """
     現在稼働中の KonomiTV サーバーのサーバー設定を取得する。<br>
-    Docker 環境では、パス指定の項目は Docker 環境向けの Prefix (/host-rootfs) が付与された状態で返される。<br>
+    Docker 環境では、録画fMP4キャッシュ保存先を除くパス項目はDocker用Prefix (/host-rootfs) 付きで返される。<br>
+    録画fMP4キャッシュ保存先は設定画面で編集できるよう、ホスト側の絶対パスで返される。<br>
     """
 
-    return Config()
+    settings = Config().model_copy(deep=True)
+    if (
+        GetPlatformEnvironment() == 'Linux-Docker' and
+        settings.video.recorded_fmp4_cache_folder is not None
+    ):
+        internal_path = str(settings.video.recorded_fmp4_cache_folder)
+        settings.video.recorded_fmp4_cache_folder = Path(internal_path.removeprefix('/host-rootfs'))
+    return settings
 
 
 @router.put(
@@ -89,7 +99,8 @@ async def ServerSettingsUpdateAPI(
 ):
     """
     現在稼働中の KonomiTV サーバーのサーバー設定を更新する。<br>
-    Docker 環境では、パス指定の項目には Docker 環境向けの Prefix (/host-rootfs) を付与した状態でリクエストする必要がある。<br>
+    Docker 環境では、録画fMP4キャッシュ保存先だけはホスト側の絶対パスを指定する。<br>
+    その他のパス項目にはDocker用Prefix (/host-rootfs) を付与した状態でリクエストする。<br>
     Pydantic のカスタムバリデーターの実装の都合上、バリデーション処理中はメインスレッドが数秒間ブロッキングされることがあるので注意。<br>
 
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。

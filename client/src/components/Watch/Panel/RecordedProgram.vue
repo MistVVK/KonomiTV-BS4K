@@ -51,8 +51,14 @@
                         <span style="margin-left: 6px;">マイリストに追加</span>
                     </template>
                 </div>
+                <div v-ripple class="program-info__button program-info__button--file-info"
+                    @click="show_video_info = true">
+                    <Icon icon="fluent:document-20-filled" width="18px" height="18px" />
+                    <span style="margin-left: 6px;">録画ファイル情報</span>
+                </div>
             </div>
         </section>
+        <RecordedFileInfoDialog :program="playerStore.recorded_program" v-model:show="show_video_info" />
         <section class="program-detail-container">
             <div class="program-detail" :key="detail_heading"
                 v-for="(detail_text, detail_heading) in playerStore.recorded_program.detail ?? {}">
@@ -67,6 +73,7 @@
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
+import RecordedFileInfoDialog from '@/components/Videos/Dialogs/RecordedFileInfoDialog.vue';
 import Message from '@/message';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
@@ -74,6 +81,9 @@ import Utils, { ProgramUtils } from '@/utils';
 
 export default defineComponent({
     name: 'Panel-RecordedProgramTab',
+    components: {
+        RecordedFileInfoDialog,
+    },
     data() {
         return {
             // ユーティリティをテンプレートで使えるように
@@ -82,6 +92,8 @@ export default defineComponent({
 
             // コメント数カウント
             comment_count: null as number | null,
+            // 録画ファイル情報ダイアログの表示状態
+            show_video_info: false,
         };
     },
     computed: {
@@ -274,6 +286,10 @@ export default defineComponent({
 
             &:hover {
                 color: rgb(var(--v-theme-text));
+            }
+
+            &--file-info {
+                margin-left: 8px;
             }
         }
     }

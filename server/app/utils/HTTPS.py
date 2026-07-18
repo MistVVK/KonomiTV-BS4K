@@ -64,7 +64,7 @@ def BuildServerStartupSettings(server_settings: Any) -> ServerStartupSettings:
 def GetRequiredThirdpartyLibraries(https_mode: str) -> set[str]:
     """HTTPS モードに応じて起動前に存在確認する thirdparty を返す。"""
 
-    libraries = {'FFmpeg', 'FFprobe', 'QSVEncC', 'NVEncC', 'VCEEncC', 'tsreadex', 'psisiarc', 'psisimux'}
+    libraries = {'FFmpeg', 'FFprobe', 'QSVEncC', 'NVEncC', 'VCEEncC', 'tsreadex', 'psisiarc'}
     if https_mode == 'akebi':
         libraries.add('Akebi')
     return libraries

@@ -56,6 +56,8 @@ export type PlayerEvents = {
     SeekRequest: {
         playback_position: number;  // シーク先の再生位置 (秒)
     }
+    // 録画再生時: 失敗した録画再生索引の再解析をUIから要求する
+    RetryRecordedPlaybackIndex: void;
 };
 
 
@@ -79,6 +81,13 @@ const usePlayerStore = defineStore('player', {
         // 現在視聴中の録画番組の情報
         // 視聴中の録画番組がない場合は IRecordedProgramDefault を設定すべき (初期値も IRecordedProgramDefault にしている)
         recorded_program: structuredClone(IRecordedProgramDefault) as IRecordedProgram,
+
+        // 録画再生索引の待機画面へ表示する実進捗。録画を視聴していない場合はnull
+        recorded_playback_index_progress: null as number | null,
+
+        // 録画再生索引の現在処理段階。録画を視聴していない場合はnull
+        recorded_playback_index_stage: null as
+            'Queued' | 'Probing' | 'Scanning' | 'Finalizing' | 'Complete' | 'Failed' | null,
 
         // 仮想キーボードが表示されているか
         // 既定で表示されていない想定
@@ -212,6 +221,8 @@ const usePlayerStore = defineStore('player', {
             this.is_watching = false;
             this.is_player_initialized = false;
             this.recorded_program = structuredClone(IRecordedProgramDefault);
+            this.recorded_playback_index_progress = null;
+            this.recorded_playback_index_stage = null;
             this.is_virtual_keyboard_display = false;
             this.is_fullscreen = false;
             this.is_document_pip = false;

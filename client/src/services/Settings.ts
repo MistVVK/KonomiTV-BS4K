@@ -152,6 +152,8 @@ export interface IServerSettings {
     video: {
         recorded_folders: string[];
         exclude_scan_paths: string[];
+        recorded_fmp4_cache_folder: string | null;
+        recorded_playback_index_backfill_enabled: boolean;
     };
     capture: {
         upload_folders: string[];
@@ -195,6 +197,8 @@ export const IServerSettingsDefault: IServerSettings = {
     video: {
         recorded_folders: [],
         exclude_scan_paths: [],
+        recorded_fmp4_cache_folder: null,
+        recorded_playback_index_backfill_enabled: true,
     },
     capture: {
         upload_folders: [],

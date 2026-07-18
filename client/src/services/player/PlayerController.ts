@@ -21,7 +21,7 @@ import Videos from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
-import useSettingsStore, { BS4KLiveStreamingQuality, BS4K_LIVE_STREAMING_QUALITIES, LiveStreamingQuality, LIVE_STREAMING_QUALITIES, VideoStreamingQuality, VIDEO_STREAMING_QUALITIES } from '@/stores/SettingsStore';
+import useSettingsStore, { BS4KLiveStreamingQuality, BS4K_LIVE_STREAMING_QUALITIES, LiveStreamingQuality, LIVE_STREAMING_QUALITIES, RecordedStreamingVideoCodec, VideoStreamingQuality, VIDEO_STREAMING_QUALITIES } from '@/stores/SettingsStore';
 import Utils, { dayjs, PlayerUtils } from '@/utils';
 
 
@@ -78,6 +78,9 @@ class PlayerController {
 
     // シークやHLS再読み込みでhls.jsがTrack 1へ初期化しても、選択中の録画音声を復元するための安定キー
     private recorded_selected_audio_track_name: string | null = null;
+
+    // fMP4 録画のARIB字幕先読みハンドラーを解除する関数
+    private recorded_arib_subtitle_cancel: (() => void) | null = null;
 
     // setupPlayerContainerResizeHandler() で利用する ResizeObserver
     // 保持しておかないと disconnect() で ResizeObserver を止められない
@@ -172,8 +175,8 @@ class PlayerController {
         tv_low_latency_mode: boolean;
         tv_24fps_mode: boolean;
         video_streaming_quality: VideoStreamingQuality;
-        video_encoding_codec: 'avc' | 'hevc';
-        bs4k_video_encoding_codec: 'avc' | 'hevc';
+        video_encoding_codec: RecordedStreamingVideoCodec;
+        bs4k_video_encoding_codec: RecordedStreamingVideoCodec;
         video_24fps_mode: boolean;
     } {
         const settings_store = useSettingsStore();
@@ -261,6 +264,7 @@ class PlayerController {
     }): Promise<void> {
         const channels_store = useChannelsStore();
         const player_store = usePlayerStore();
+        const server_settings_store = useServerSettingsStore();
         const settings_store = useSettingsStore();
         console.log('\u001b[31m[PlayerController] Initializing...');
 
@@ -282,8 +286,58 @@ class PlayerController {
         const selected_video_codec = this.playback_mode === 'Live' ?
             (is_bs4k_stream ? this.quality_profile.bs4k_tv_encoding_codec : this.quality_profile.tv_encoding_codec) :
             (is_bs4k_stream ? this.quality_profile.bs4k_video_encoding_codec : this.quality_profile.video_encoding_codec);
-        const is_hevc_playback = PlayerUtils.isHEVCVideoSupported() && selected_video_codec === 'hevc';
-        const recorded_video_codec = is_hevc_playback === true ? 'hevc' : 'avc';
+        let recorded_video_codec: RecordedStreamingVideoCodec = 'avc';
+        let recorded_video_bit_depth: 8 | 10 = 8;
+        if (this.playback_mode === 'Video') {
+            const encoder = is_bs4k_stream === true ?
+                server_settings_store.server_settings.general.encoder_bs4k :
+                server_settings_store.server_settings.general.encoder;
+            const capabilities = await Videos.fetchRecordedPlaybackCapabilities();
+            const media_source = (
+                window as Window & {ManagedMediaSource?: {isTypeSupported: (mime_type: string) => boolean}}
+            ).ManagedMediaSource ?? window.MediaSource;
+            const codec_mime_types: Record<RecordedStreamingVideoCodec, Record<8 | 10, string | null>> = {
+                avc: {8: 'video/mp4; codecs="avc1.640028"', 10: null},
+                hevc: {8: 'video/mp4; codecs="hvc1.1.6.L153.B0"', 10: 'video/mp4; codecs="hvc1.2.4.L153.B0"'},
+                vp9: {8: 'video/mp4; codecs="vp09.00.40.08"', 10: 'video/mp4; codecs="vp09.02.40.10"'},
+                av1: {8: 'video/mp4; codecs="av01.0.08M.08"', 10: 'video/mp4; codecs="av01.0.10M.10"'},
+            };
+            const codec_order = Array.from(new Set<RecordedStreamingVideoCodec>([
+                selected_video_codec as RecordedStreamingVideoCodec,
+                'avc',
+                'hevc',
+                'vp9',
+                'av1',
+            ]));
+            let selected_capability: {codec: RecordedStreamingVideoCodec; bit_depth: 8 | 10} | null = null;
+            for (const codec of codec_order) {
+                const bit_depths: (8 | 10)[] = codec === 'avc' ? [8] : [10, 8];
+                for (const bit_depth of bit_depths) {
+                    const mime_type = codec_mime_types[codec][bit_depth];
+                    if (
+                        mime_type !== null && media_source?.isTypeSupported(mime_type) === true &&
+                        capabilities.some((capability) =>
+                            capability.encoder === encoder && capability.codec === codec &&
+                            capability.bit_depth === bit_depth && capability.available === true,
+                        )
+                    ) {
+                        selected_capability = {codec, bit_depth};
+                        break;
+                    }
+                }
+                if (selected_capability !== null) {
+                    break;
+                }
+            }
+            if (selected_capability === null) {
+                throw new Error('No recorded playback codec is supported by both the server and this browser.');
+            }
+            recorded_video_codec = selected_capability.codec;
+            recorded_video_bit_depth = selected_capability.bit_depth;
+        }
+        const is_hevc_playback = this.playback_mode === 'Live' ?
+            PlayerUtils.isHEVCVideoSupported() && selected_video_codec === 'hevc' :
+            recorded_video_codec === 'hevc';
         // 録画HLSの音声は互換性を優先してAACへ固定する。
         const recorded_audio_codec = 'aac';
 
@@ -547,7 +601,8 @@ class PlayerController {
                             name: get_quality_display_name(quality_name),
                             type: 'hls',
                             url: `${streaming_api_base_url}/${build_api_quality(quality_name)}/playlist?session_id=${session_id}` +
-                                `&video_codec=${recorded_video_codec}&audio_codec=${recorded_audio_codec}` +
+                                `&video_codec=${recorded_video_codec}&video_bit_depth=${recorded_video_bit_depth}` +
+                                `&audio_codec=${recorded_audio_codec}` +
                                 (initial_audio_rendition !== null ? `&audio_track=${initial_audio_rendition}` : ''),
                         });
                     }
@@ -913,6 +968,56 @@ class PlayerController {
         aribb24_caption.attachMedia(this.player.video);
         aribb24_caption.show();
         this.player.plugins.aribb24Caption = aribb24_caption;
+
+        // fMP4 経路ではARIB生字幕を映像から分離し、シーク復元点と後続12秒を先読みする。
+        if (
+            this.playback_mode === 'Video' &&
+            player_store.recorded_program.recorded_video.playback_index_status === 'Ready'
+        ) {
+            const arib_track = player_store.recorded_program.recorded_video.subtitle_tracks.find((track) =>
+                track.codec.toLowerCase().includes('arib'),
+            );
+            if (arib_track !== undefined) {
+                const requested_ranges = new Set<number>();
+                let is_fetching = false;
+                const fetch_arib_subtitle = async (restore: boolean = false): Promise<void> => {
+                    if (this.player === null || is_fetching === true) return;
+                    const range_start = Math.max(0, Math.floor(this.player.video.currentTime / 6) * 6);
+                    if (restore === true) requested_ranges.clear();
+                    if (requested_ranges.has(range_start)) return;
+                    is_fetching = true;
+                    const response = await APIClient.get<{
+                        restore_packets: {pts: number; data: string}[];
+                        packets: {pts: number; data: string}[];
+                    }>(`/streams/video/${player_store.recorded_program.id}/subtitle/${arib_track.index}/arib`, {
+                        params: {start_time: range_start, end_time: range_start + 12},
+                    });
+                    if (response.type === 'success') {
+                        const decode = (data: string): Uint8Array => Uint8Array.from(atob(data), (character) =>
+                            character.charCodeAt(0),
+                        );
+                        // 復元packetは録画先頭からの管理データ・DRCS・表示状態を含むため、
+                        // 初回とseek時だけ投入する。通常先読みで再投入すると字幕状態が巻き戻る。
+                        const packets = restore === true ?
+                            [...response.data.restore_packets, ...response.data.packets] : response.data.packets;
+                        for (const packet of packets) {
+                            aribb24_caption.pushRawData(packet.pts, decode(packet.data));
+                        }
+                        requested_ranges.add(range_start);
+                    }
+                    is_fetching = false;
+                };
+                const timeupdate_handler = () => void fetch_arib_subtitle(false);
+                const seeking_handler = () => void fetch_arib_subtitle(true);
+                this.player.video.addEventListener('timeupdate', timeupdate_handler);
+                this.player.video.addEventListener('seeking', seeking_handler);
+                this.recorded_arib_subtitle_cancel = () => {
+                    this.player?.video.removeEventListener('timeupdate', timeupdate_handler);
+                    this.player?.video.removeEventListener('seeking', seeking_handler);
+                };
+                void fetch_arib_subtitle(true);
+            }
+        }
 
         // 文字スーパーが有効な場合も同じパッチ済みレンダラーへ差し替える。
         this.player.plugins.aribb24Superimpose?.dispose();
@@ -2096,7 +2201,7 @@ class PlayerController {
     }
 
 
-    /** 映像と選択音声をmuxした録画HLSを、音声変更時に現在位置から作り直す。 */
+    /** 録画HLSの代替音声レンディションを、映像を維持したまま切り替える。 */
     private setupRecordedHLSAudioTrackSelector(): void {
 
         if (this.playback_mode !== 'Video' || this.player === null) return;
@@ -2113,14 +2218,17 @@ class PlayerController {
                     (count, item) => count + (item.is_dual_mono === true ? 2 : 1), 0) + 1;
                 return [
                     {id: `${track.index}-main`, logicalIndex: track.index,
+                        isDualMonoSub: false,
                         label: `Track${main_display_index}${language_parts[0] ? ` ${language_parts[0]}` : ''} (Monaural) 主音声`},
                     {id: `${track.index}-sub`, logicalIndex: track.index,
+                        isDualMonoSub: true,
                         label: `Track${main_display_index + 1} ${language_parts[1] || '副音声'} (Monaural) 副音声`},
                 ];
             }
             return [{
                 id: String(track.index),
                 logicalIndex: track.index,
+                isDualMonoSub: false,
                 label: track.title || `Track${track.index}${track.language ? ` ${track.language}` : ''}` +
                     `${track.channel ? ` (${track.channel})` : ''}`,
             }];
@@ -2129,39 +2237,15 @@ class PlayerController {
             this.recorded_selected_audio_track_name = renditions[0].id;
         }
         let last_timeline_key = '';
-        let was_preferred_available: boolean | null = null;
-        let is_audio_reload_pending = false;
 
-        const reloadForAudio = (rendition_id: string): void => {
-            if (this.player === null || this.player.quality === null || is_audio_reload_pending) return;
-            is_audio_reload_pending = true;
-            const resume_time = this.player.video.currentTime;
-            const should_resume = this.player.video.paused === false;
-            const source_url = new URL(this.player.quality.url);
-            source_url.searchParams.set('session_id', crypto.randomUUID().split('-')[0]);
-            source_url.searchParams.set('audio_track', rendition_id);
-            this.player.quality.url = source_url.toString();
-            const onManifestParsed = () => {
-                hls.off(Hls.Events.MANIFEST_PARSED, onManifestParsed);
-                if (this.player === null) return;
-                // loadSource()直後のhls.jsは既定で先頭Fragmentを要求するため、明示的に停止して
-                // 保存位置からロードし直す。currentTimeの代入だけでは先頭エンコードが継続してしまう。
-                hls.stopLoad();
-                this.player.video.currentTime = resume_time;
-                hls.startLoad(resume_time);
-                is_audio_reload_pending = false;
-                if (should_resume) void this.player.video.play();
-            };
-            hls.on(Hls.Events.MANIFEST_PARSED, onManifestParsed);
-            hls.stopLoad();
-            hls.loadSource(source_url.toString());
+        const switchAudioTrack = (index: number): void => {
+            if (index < 0 || index >= hls.audioTracks.length || hls.audioTrack === index) return;
+            // hls.jsの代替音声切替だけを使い、マスター・映像SourceBuffer・映像fragmentを維持する。
+            hls.audioTrack = index;
         };
 
         const syncAudioTracks = () => {
             if (this.player === null) return;
-            // loadSource()中はHTMLMediaElementの時刻が一時的に0へ戻るため、
-            // その値でTrack消失・復帰を判定すると二重再読み込みになる。
-            if (is_audio_reload_pending) return;
             const panel = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-panel');
             const header = panel?.querySelector<HTMLElement>('.dplayer-setting-audio-header');
             const settingItem = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio');
@@ -2171,28 +2255,31 @@ class PlayerController {
             const current_time = this.player.video.currentTime;
             const timeline_interval = recorded_video.audio_track_timeline.find((interval) =>
                 interval.start_time <= current_time && current_time < interval.end_time);
-            const available_track_indexes = timeline_interval === undefined ? null :
-                new Set(timeline_interval.tracks.map((track) => track.index));
-            const isTrackAvailable = (index: number): boolean => available_track_indexes === null ||
-                available_track_indexes.has(renditions[index]?.logicalIndex ?? index + 1);
+            const available_tracks = timeline_interval?.tracks ?? null;
+            const isTrackAvailable = (index: number): boolean => {
+                // タイムラインが不明な区間は全Trackを選択可能にし、サーバー側の無音補完で再生を継続する。
+                if (available_tracks === null) return true;
+                const rendition = renditions[index];
+                const timeline_track = available_tracks.find((track) => track.index === rendition.logicalIndex);
+                if (timeline_track === undefined) return false;
+                // 同じ論理Trackでも、モノラル区間にDual Monoの副音声channelは存在しない。
+                return rendition.isDualMonoSub === false || timeline_track.is_dual_mono === true;
+            };
             const preferred_index = renditions.findIndex((track) => track.id === this.recorded_selected_audio_track_name);
             const is_preferred_available = preferred_index >= 0 && isTrackAvailable(preferred_index);
-            const active_index = preferred_index >= 0 && isTrackAvailable(preferred_index) ? preferred_index :
+            const active_index = is_preferred_available ? preferred_index :
                 renditions.findIndex((_, index) => isTrackAvailable(index));
             const active_rendition_id = active_index >= 0 ? renditions[active_index].id : null;
-            // Trackが存在しない位置から再出現区間へ移った場合、旧エンコーダーは後発Trackを認識できない。
-            // 希望Trackは維持したまま、移動先を入力開始点とする新セッションへ切り替える。
-            if (was_preferred_available === false && is_preferred_available &&
-                this.recorded_selected_audio_track_name !== null) {
-                reloadForAudio(this.recorded_selected_audio_track_name);
-            } else if (was_preferred_available === true && is_preferred_available === false &&
-                active_rendition_id !== null) {
-                // 希望Trackが消えた区間では、希望値自体は保持したままTrack 1相当で
-                // セッションを作り直す。HWEncC/FFmpegは起動後に入力Trackを差し替えられない。
-                reloadForAudio(active_rendition_id);
+            // 初期表示・シーク・HLS再読み込みのいずれでも、実際のHLS Trackを現在区間の選択結果と同期する。
+            // 希望Trackが消えた区間では希望値を保持したままTrack 1相当へ退避し、
+            // 再出現時は同じ処理で希望Trackへ自動復帰する。タイムライン不明時は全Trackを利用可能とする。
+            if (active_rendition_id !== null) {
+                switchAudioTrack(active_index);
             }
-            was_preferred_available = is_preferred_available;
-            const timeline_key = available_track_indexes === null ? 'static' : [...available_track_indexes].join(',');
+            // 論理Track番号が同じままモノラルとDual Monoが切り替わる場合もUIを更新する。
+            const timeline_key = available_tracks === null ? 'unknown' : available_tracks
+                .map((track) => `${track.index}:${track.is_dual_mono === true ? 'dual' : 'single'}`)
+                .join(',');
             const sync_key = `${timeline_key}/${this.recorded_selected_audio_track_name}/${active_rendition_id}`;
             if (sync_key === last_timeline_key) return;
             last_timeline_key = sync_key;
@@ -2224,13 +2311,13 @@ class PlayerController {
                 const is_available = isTrackAvailable(index);
                 item.classList.toggle('dplayer-setting-audio-item--disabled', is_available === false);
                 item.classList.toggle('dplayer-setting-audio-current', active_rendition_id === track.id);
-                item.addEventListener('click', async (event) => {
+                item.setAttribute('aria-disabled', String(is_available === false));
+                item.addEventListener('click', (event) => {
                     event.stopImmediatePropagation();
                     if (is_available === false || this.player === null || this.player.quality === null) return;
                     if (this.recorded_selected_audio_track_name === track.id) return;
                     this.recorded_selected_audio_track_name = track.id;
-                    was_preferred_available = true;
-                    reloadForAudio(track.id);
+                    switchAudioTrack(index);
                     if (settingValue !== null && settingValue !== undefined) settingValue.textContent = label;
                     this.player?.container.querySelector('.dplayer-setting-box')?.classList.remove('dplayer-setting-box-audio');
                     last_timeline_key = '';
@@ -2245,11 +2332,13 @@ class PlayerController {
                     currentTrack?.label || 'Track1 音声不明';
             }
             settingItem?.classList.toggle('dplayer-setting-audio--disabled', visible_track_count === 0);
+            settingItem?.setAttribute('aria-disabled', String(visible_track_count === 0));
             const audio_panel_row_count = renditions.length + (visible_track_count === 0 ? 1 : 0);
             settingBox?.style.setProperty('--audio-panel-height', `${Math.max(audio_panel_row_count, 1) * 30 + 54}px`);
         };
 
         hls.on(Hls.Events.MANIFEST_PARSED, syncAudioTracks);
+        hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, syncAudioTracks);
         this.player.video.addEventListener('timeupdate', syncAudioTracks);
         this.player.video.addEventListener('seeking', syncAudioTracks);
         syncAudioTracks();
@@ -2545,6 +2634,17 @@ class PlayerController {
         };
 
         // 映像コーデック選択とモバイル回線プロファイルに切り替えるボタンを動的に追加する
+        // ライブは従来の AVC / HEVC、録画は FFmpeg 8 経路の4種類を表示する。
+        const selectable_video_codecs: RecordedStreamingVideoCodec[] = this.playback_mode === 'Video' ?
+            ['avc', 'hevc', 'vp9', 'av1'] : ['avc', 'hevc'];
+        const video_codec_item_html = selectable_video_codecs.map((codec) => `
+            <div class="dplayer-setting-video-codec-item" data-codec="${codec}"
+                style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer;">
+                <div class="dplayer-toggle dplayer-setting-video-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                <span class="dplayer-label">${codec.toUpperCase()}</span>
+            </div>
+        `).join('');
+        const video_codec_panel_height = 54 + selectable_video_codecs.length * 30;
         this.player.template.audio.insertAdjacentHTML('afterend', `
             <div class="dplayer-setting-item dplayer-setting-video-codec">
                 <span class="dplayer-label">映像コーデック</span>
@@ -2570,16 +2670,7 @@ class PlayerController {
                         style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
                     <span class="dplayer-label">映像コーデック</span>
                 </div>
-                <div class="dplayer-setting-video-codec-item" data-codec="avc"
-                    style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer;">
-                    <div class="dplayer-toggle dplayer-setting-video-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
-                    <span class="dplayer-label">AVC</span>
-                </div>
-                <div class="dplayer-setting-video-codec-item" data-codec="hevc"
-                    style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer;">
-                    <div class="dplayer-toggle dplayer-setting-video-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
-                    <span class="dplayer-label">HEVC</span>
-                </div>
+                ${video_codec_item_html}
             </div>
         `);
 
@@ -2634,13 +2725,21 @@ class PlayerController {
             update_video_codec_display();
             setting_origin_panel.style.transform = 'translateX(-100%)';
             video_codec_panel.style.transform = 'translateX(0%)';
-            setting_box.style.clipPath = 'inset(calc(100% - 114px) 0 0 round 7px)';
+            setting_box.style.clipPath = `inset(calc(100% - ${video_codec_panel_height}px) 0 0 round 7px)`;
         });
         this.player.container.querySelector('.dplayer-setting-video-codec-header')!.addEventListener('click', close_video_codec_panel);
         video_codec_items.forEach((item) => {
             item.addEventListener('click', () => {
-                const codec = item.dataset.codec as 'avc' | 'hevc';
-                settings_store.settings[get_video_codec_setting_key()] = codec;
+                const codec = item.dataset.codec as RecordedStreamingVideoCodec;
+                const setting_key = get_video_codec_setting_key();
+                if (codec === 'vp9' || codec === 'av1') {
+                    const recorded_setting_key = setting_key as
+                        'video_encoding_codec' | 'video_encoding_codec_cellular' |
+                        'bs4k_video_encoding_codec' | 'bs4k_video_encoding_codec_cellular';
+                    settings_store.settings[recorded_setting_key] = codec;
+                } else {
+                    settings_store.settings[setting_key] = codec;
+                }
                 update_video_codec_display();
                 close_video_codec_panel();
                 // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
@@ -3125,6 +3224,10 @@ class PlayerController {
         if (this.video_keep_alive_interval_timer_cancel !== null) {
             this.video_keep_alive_interval_timer_cancel();
             this.video_keep_alive_interval_timer_cancel = null;
+        }
+        if (this.recorded_arib_subtitle_cancel !== null) {
+            this.recorded_arib_subtitle_cancel();
+            this.recorded_arib_subtitle_cancel = null;
         }
         this.live_media_info = null;
         window.clearTimeout(this.watched_history_threshold_timer_id);

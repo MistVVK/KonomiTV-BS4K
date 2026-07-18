@@ -131,9 +131,6 @@ def main() -> None:
         LicenseSource('psisiarc', manifest['PSISIARC_COMMIT'][:12], manifest['PSISIARC_REPOSITORY'], manifest['PSISIARC_COMMIT'], (
             ('License.txt', f'{github_raw}/xtne6f/psisiarc/{manifest["PSISIARC_COMMIT"]}/License.txt', manifest['PSISIARC_LICENSE_SHA256']),
         )),
-        LicenseSource('psisimux', manifest['PSISIMUX_COMMIT'][:12], manifest['PSISIMUX_REPOSITORY'], manifest['PSISIMUX_COMMIT'], (
-            ('License.txt', f'{github_raw}/xtne6f/psisimux/{manifest["PSISIMUX_COMMIT"]}/License.txt', manifest['PSISIMUX_LICENSE_SHA256']),
-        )),
         LicenseSource('Akebi HTTPS Server', manifest['AKEBI_COMMIT'][:12], manifest['AKEBI_REPOSITORY'], manifest['AKEBI_COMMIT'], (
             ('License.txt', f'{github_raw}/tsukumijima/Akebi/{manifest["AKEBI_COMMIT"]}/License.txt', manifest['AKEBI_LICENSE_SHA256']),
         )),

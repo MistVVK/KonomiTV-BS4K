@@ -19,6 +19,7 @@ from app.constants import (
     QUALITY,
     VERSION,
 )
+from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.models.Channel import Channel
 from app.models.Program import Program
@@ -43,6 +44,7 @@ from app.routers import (
     VideoStreamsRouter,
 )
 from app.streams.LiveStream import LiveStream
+from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
 from app.utils.HTTPS import ReverseProxyMiddleware
@@ -252,6 +254,12 @@ async def Startup():
     recorded_scan_task = RecordedScanTask()
     await recorded_scan_task.start()
 
+    # 録画再生用インデックスの中断状態を復旧し、低優先度バックフィルを開始する。
+    await RecordedPlaybackIndexer.start()
+
+    # 異常終了した前プロセスが残したfMP4予約キャッシュだけを削除する。
+    await RecordedFMP4CacheManager.cleanupStale()
+
 # サーバー設定で指定された時間 (デフォルト: 15分) ごとに1回、チャンネル情報と番組情報を更新する
 # チャンネル情報は頻繁に変わるわけではないけど、手動で再起動しなくても自動で変更が適用されてほしい
 # 番組情報の更新処理はかなり重くストリーム配信などの他の処理に影響してしまうため、マルチプロセスで実行する
@@ -296,6 +304,9 @@ async def Shutdown():
     if recorded_scan_task is not None:
         await recorded_scan_task.stop()
         recorded_scan_task = None
+
+    # DB接続が閉じられる前に録画再生用インデックスワーカーを停止する。
+    await RecordedPlaybackIndexer.stop()
 
     # 非同期タスクの終了処理が完全に終わるよう、もう少しだけ待つ
     # この待機を省略すると LiveEncodingTask などの終了前に Tortoise ORM の DB 接続が閉じられ、エラートレースバックが出力される

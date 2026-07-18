@@ -125,13 +125,16 @@ class FFprobeOtherStream(BaseModel):
     index: int
     codec_type: str = 'unknown'  # オプショナル - "subtitle", "data", そのほか未知のもの
     codec_name: str = 'unknown'  # オプショナル - "arib_caption", "bin_data", そのほか未知のもの
+    id: str | int | None = None
     ts_packetsize: str | None = None  # オプショナル - TS パケットサイズ ("188" / "192" / "204")
+    tags: dict[str, str] = {}
 
 class FFprobeSubtitleStream(BaseModel):
     """FFprobe から返される字幕ストリームの情報"""
     index: int
     codec_type: Literal['subtitle']
     codec_name: str
+    id: str | int | None = None
     tags: dict[str, str] = {}
 
 class FFprobeFrame(BaseModel):
@@ -493,16 +496,9 @@ class MetadataAnalyzer:
         # TS は途中で PMT / PID が変化し得るため全体 probe の和集合を使う。
         # 非 TS はコンテナに宣言されたトラックが全時間有効なので部分 probe で十分。
         if container_format == 'MPEG-TS':
-            sample_audio_by_index = {stream.index: stream for stream in sample_probe_audio_streams}
-            audio_source_streams = [
-                sample_audio_by_index.get(stream.index, stream)
-                if stream.channels <= 0 else stream
-                for stream in full_probe_audio_streams
-            ]
-            # ファイル全体解析に現れず、25%サンプルで初めて実体を確認できた音声も候補へ加える。
-            known_stream_indexes = {stream.index for stream in audio_source_streams}
-            audio_source_streams.extend(
-                stream for stream in sample_probe_audio_streams if stream.index not in known_stream_indexes
+            audio_source_streams = self.__mergeTSAudioStreams(
+                full_probe_audio_streams,
+                sample_probe_audio_streams,
             )
         else:
             audio_source_streams = sample_probe_audio_streams
@@ -546,13 +542,50 @@ class MetadataAnalyzer:
         for subtitle_stream in full_probe.getSubtitleStreams():
             if selected_program_stream_indices is not None and subtitle_stream.index not in selected_program_stream_indices:
                 continue
-            subtitle_tracks.append({
+            subtitle_track: schemas.SubtitleTrack = {
                 'index': len(subtitle_tracks) + 1,
                 'stream_index': subtitle_stream.index,
                 'codec': subtitle_stream.codec_name,
                 'language': subtitle_stream.tags.get('language'),
                 'title': subtitle_stream.tags.get('title'),
-            })
+            }
+            try:
+                subtitle_pid = int(str(subtitle_stream.id), 0) if subtitle_stream.id is not None else None
+            except ValueError:
+                subtitle_pid = None
+            if subtitle_pid is not None:
+                subtitle_track['pid'] = subtitle_pid
+            subtitle_tracks.append(subtitle_track)
+
+        # FFmpeg 8でも放送TSのARIB字幕がbin_dataとしてprobeされる場合がある。
+        # PMT descriptorで字幕と確認できたPIDだけを採用し、データ放送は登録しない。
+        if container_format == 'MPEG-TS':
+            try:
+                arib_caption_pids = TSKeyFrameSeeker.findARIBCaptionPIDs(self.recorded_file_path)
+            except (OSError, ValueError):
+                arib_caption_pids = set()
+            known_subtitle_stream_indexes = {track['stream_index'] for track in subtitle_tracks}
+            for data_stream in full_probe.streams:
+                if not isinstance(data_stream, FFprobeOtherStream) or data_stream.codec_type != 'data':
+                    continue
+                if data_stream.index in known_subtitle_stream_indexes:
+                    continue
+                if selected_program_stream_indices is not None and data_stream.index not in selected_program_stream_indices:
+                    continue
+                try:
+                    data_pid = int(str(data_stream.id), 0) if data_stream.id is not None else None
+                except ValueError:
+                    data_pid = None
+                if data_pid is None or data_pid not in arib_caption_pids:
+                    continue
+                subtitle_tracks.append({
+                    'index': len(subtitle_tracks) + 1,
+                    'stream_index': data_stream.index,
+                    'codec': 'arib_caption',
+                    'language': data_stream.tags.get('language'),
+                    'title': data_stream.tags.get('title'),
+                    'pid': data_pid,
+                })
 
         has_video = video_codec is not None
         has_audio = primary_audio_codec is not None
@@ -736,6 +769,44 @@ class MetadataAnalyzer:
         return recorded_program
 
 
+    @staticmethod
+    def __mergeTSAudioStreams(
+        full_probe_streams: list[FFprobeAudioStream],
+        sample_probe_streams: list[FFprobeAudioStream],
+    ) -> list[FFprobeAudioStream]:
+        """全体probeと部分probeのTS音声をPID単位で統合する。
+
+        Args:
+            full_probe_streams: 録画先頭から得た音声ストリーム。
+            sample_probe_streams: 録画25%位置の切り出しから得た音声ストリーム。
+
+        Returns:
+            同一PIDを重複させず、実音声情報が豊富な方を採用したストリーム一覧。
+        """
+
+        merged_streams: dict[tuple[str, int], FFprobeAudioStream] = {}
+        stream_scores: dict[tuple[str, int], tuple[bool, bool, bool, bool]] = {}
+        for is_sample, streams in ((False, full_probe_streams), (True, sample_probe_streams)):
+            for stream in streams:
+                try:
+                    pid = int(str(stream.id), 0) if stream.id is not None else None
+                except ValueError:
+                    pid = None
+                # TSのstream indexは切り出したサンプル内で振り直される。同一PIDが取得できる場合は
+                # indexが異なっても同じelementary streamとして扱い、Trackの二重登録を防ぐ。
+                stream_key = ('pid', pid) if pid is not None else ('index', stream.index)
+                score = (
+                    stream.channels > 0,
+                    stream.channel_layout is not None,
+                    bool(stream.tags.get('language')),
+                    is_sample,
+                )
+                if stream_key not in merged_streams or score > stream_scores[stream_key]:
+                    merged_streams[stream_key] = stream
+                    stream_scores[stream_key] = score
+        return list(merged_streams.values())
+
+
     def __buildAudioTrackTimeline(
         self,
         streams: list[FFprobeAudioStream],
@@ -748,8 +819,8 @@ class MetadataAnalyzer:
             return [{'start_time': 0.0, 'end_time': duration, 'tracks': []}]
         if self.recorded_file_path.suffix.lower() in ['.ts', '.mts', '.m2ts']:
             pid_tracks = {
-                int(track['pid']): cast(schemas.AudioTrackTimelineTrack, track)
-                for track in tracks if track.get('pid') is not None
+                pid: cast(schemas.AudioTrackTimelineTrack, track)
+                for track in tracks if (pid := track.get('pid')) is not None
             }
             if pid_tracks:
                 first_packet: dict[int, int | None] = {pid: None for pid in pid_tracks}
@@ -772,10 +843,12 @@ class MetadataAnalyzer:
                     active_ranges: list[tuple[float, float, schemas.AudioTrackTimelineTrack]] = []
                     boundaries = {0.0, duration}
                     for pid, track in pid_tracks.items():
-                        if first_packet[pid] is None or last_packet[pid] is None:
+                        first_packet_index = first_packet[pid]
+                        last_packet_index = last_packet[pid]
+                        if first_packet_index is None or last_packet_index is None:
                             continue
-                        start = duration * int(first_packet[pid]) / packet_index
-                        end = min(duration, duration * (int(last_packet[pid]) + 1) / packet_index)
+                        start = duration * first_packet_index / packet_index
+                        end = min(duration, duration * (last_packet_index + 1) / packet_index)
                         # TSパケット位置換算の微小誤差で先頭/末尾に隙間を作らない。
                         if start < 0.5:
                             start = 0.0

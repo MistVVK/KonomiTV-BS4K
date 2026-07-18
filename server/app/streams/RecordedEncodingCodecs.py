@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-VideoCodec = Literal['avc', 'hevc']
+VideoCodec = Literal['avc', 'hevc', 'vp9', 'av1']
 AudioCodec = Literal['aac']
 
 
@@ -44,6 +44,16 @@ VIDEO_CODECS: dict[VideoCodec, VideoCodecDefinition] = {
         id='hevc', display_name='H.265 / HEVC', hls_codec='hvc1.2.4.L153.B0',
         mime_type='video/mp2t', container='mpegts', ffmpeg_encoder='libx265',
         hwenc_codec='hevc', supports_10bit=True,
+    ),
+    'vp9': VideoCodecDefinition(
+        id='vp9', display_name='Google VP9', hls_codec='vp09.02.10.10',
+        mime_type='video/mp4', container='fmp4', ffmpeg_encoder='libvpx-vp9',
+        hwenc_codec='vp9', supports_10bit=True,
+    ),
+    'av1': VideoCodecDefinition(
+        id='av1', display_name='Alliance for Open Media AV1', hls_codec='av01.0.10M.10',
+        mime_type='video/mp4', container='fmp4', ffmpeg_encoder='libaom-av1',
+        hwenc_codec='av1', supports_10bit=True,
     ),
 }
 

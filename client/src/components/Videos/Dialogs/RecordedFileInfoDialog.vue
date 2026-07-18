@@ -45,6 +45,28 @@
                     <div class="video-info__item-value">{{program.recorded_video.analysis_git_commit ?? '不明'}}</div>
                 </div>
                 <div class="video-info__item">
+                    <div class="video-info__item-label">再生索引状態</div>
+                    <div class="video-info__item-value">{{formatPlaybackIndexState(program.recorded_video.playback_index_state)}}</div>
+                </div>
+                <div class="video-info__item">
+                    <div class="video-info__item-label">索引バージョン</div>
+                    <div class="video-info__item-value">
+                        {{program.recorded_video.playback_index_version ?? '未生成'}}
+                        （現行: {{program.recorded_video.playback_index_current_version}}）
+                    </div>
+                </div>
+                <div class="video-info__item">
+                    <div class="video-info__item-label">索引解析日時</div>
+                    <div class="video-info__item-value">
+                        {{program.recorded_video.playback_indexed_at !== null ?
+                            Utils.apply28HourClock(dayjs(program.recorded_video.playback_indexed_at).format('YYYY/MM/DD (dd) HH:mm:ss')) : '未解析'}}
+                    </div>
+                </div>
+                <div v-if="program.recorded_video.playback_index_error_code !== null" class="video-info__item">
+                    <div class="video-info__item-label">索引解析エラー</div>
+                    <div class="video-info__item-value">{{program.recorded_video.playback_index_error_code}}</div>
+                </div>
+                <div class="video-info__item">
                     <div class="video-info__item-label">CM情報</div>
                     <div class="video-info__item-value">
                         {{program.recorded_video.cm_sections === null ? '未解析' :
@@ -106,13 +128,27 @@
                         <div class="video-info__item-value">{{program.recorded_video.secondary_audio_sampling_rate ? `${program.recorded_video.secondary_audio_sampling_rate / 1000}kHz` : '不明'}}</div>
                     </div>
                 </template>
+                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
+                    <Icon icon="fluent:timeline-20-filled" width="24px" height="20px" />
+                    <span class="ml-2">音声構成タイムライン</span>
+                </div>
+                <div v-if="program.recorded_video.audio_track_timeline.length === 0" class="video-info__item">
+                    <div class="video-info__item-label">時間配分</div>
+                    <div class="video-info__item-value">不明</div>
+                </div>
+                <div v-for="(interval, index) in program.recorded_video.audio_track_timeline"
+                    v-else :key="`${interval.start_time}-${interval.end_time}-${index}`"
+                    class="video-info__item video-info__item--timeline">
+                    <div class="video-info__item-label">{{formatTimelineRange(interval.start_time, interval.end_time)}}</div>
+                    <div class="video-info__item-value">{{formatTimelineTracks(interval.tracks)}}</div>
+                </div>
             </div>
         </v-card>
     </v-dialog>
 </template>
 <script lang="ts" setup>
 
-import { IRecordedProgram } from '@/services/Videos';
+import { IAudioTrack, IRecordedProgram } from '@/services/Videos';
 import Utils, { ProgramUtils, dayjs } from '@/utils';
 
 // Props
@@ -125,6 +161,41 @@ defineProps<{
 defineEmits<{
     (e: 'update:show', value: boolean): void;
 }>();
+
+/** 録画先頭基準の秒数を HH:MM:SS 形式へ変換する。 */
+const formatTimelineTime = (seconds: number): string => {
+    const total_seconds = Math.max(0, Math.floor(seconds));
+    const hours = Math.floor(total_seconds / 3600);
+    const minutes = Math.floor((total_seconds % 3600) / 60);
+    const remaining_seconds = total_seconds % 60;
+    return [hours, minutes, remaining_seconds].map((value) => String(value).padStart(2, '0')).join(':');
+};
+
+/** 音声構成区間の開始・終了と長さを表示する。 */
+const formatTimelineRange = (start_time: number, end_time: number): string => {
+    return `${formatTimelineTime(start_time)} ～ ${formatTimelineTime(end_time)}` +
+        `（${formatTimelineTime(Math.max(0, end_time - start_time))}）`;
+};
+
+/** 音声構成区間に実在する論理Trackを表示する。 */
+const formatTimelineTracks = (tracks: IAudioTrack[]): string => {
+    if (tracks.length === 0) return '音声なし';
+    return tracks.map((track) => {
+        const language = track.language !== null && track.language.length > 0 ? ` / ${track.language}` : '';
+        return `Track ${track.index}: ${track.channel}${language}`;
+    }).join('、');
+};
+
+/** APIが計算した録画再生索引状態を利用者向けの表示へ変換する。 */
+const formatPlaybackIndexState = (state: IRecordedProgram['recorded_video']['playback_index_state']): string => {
+    return {
+        Pending: '解析待ち',
+        Analyzing: '解析中',
+        Ready: '再生準備完了',
+        Stale: '更新が必要',
+        Failed: '解析失敗',
+    }[state];
+};
 
 </script>
 <style lang="scss" scoped>
@@ -145,6 +216,14 @@ defineEmits<{
             flex-grow: 1;
             font-size: 14px;
             word-break: break-word;
+        }
+    }
+
+    &__item--timeline {
+        .video-info__item-label {
+            // HH:MM:SSの開始・終了・区間長を折り返さず表示できる幅を確保する
+            width: 245px;
+            font-variant-numeric: tabular-nums;
         }
     }
 }

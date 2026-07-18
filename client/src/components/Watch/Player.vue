@@ -17,6 +17,28 @@
         <v-progress-circular indeterminate size="60" width="6" class="watch-player__buffering"
             :class="{'watch-player__buffering--display': playerStore.is_video_buffering}">
         </v-progress-circular>
+        <div v-if="playback_mode === 'Video' && playerStore.recorded_program.recorded_video.playback_index_state !== 'Ready'"
+            class="watch-player__playback-index-status">
+            <v-progress-circular v-if="playerStore.recorded_program.recorded_video.playback_index_state !== 'Failed'"
+                indeterminate size="52" width="5" />
+            <Icon v-else icon="fluent:error-circle-24-filled" width="52px" />
+            <div class="watch-player__playback-index-status-title">{{playbackIndexStatusTitle}}</div>
+            <div v-if="playerStore.recorded_program.recorded_video.playback_index_state !== 'Failed'"
+                class="watch-player__playback-index-status-detail">
+                {{playbackIndexStageTitle}}
+                <template v-if="playerStore.recorded_playback_index_progress !== null">
+                    {{Math.round(playerStore.recorded_playback_index_progress * 100)}}%
+                </template>
+            </div>
+            <div v-if="playerStore.recorded_program.recorded_video.playback_index_state === 'Failed'"
+                class="watch-player__playback-index-status-detail">
+                {{playerStore.recorded_program.recorded_video.playback_index_error_code ?? 'UnknownError'}}
+            </div>
+            <v-btn v-if="playerStore.recorded_program.recorded_video.playback_index_state === 'Failed'"
+                color="primary" variant="flat" class="mt-4" @click="retryRecordedPlaybackIndex">
+                再解析する
+            </v-btn>
+        </div>
         <div class="watch-player__dplayer"></div>
         <div class="watch-player__dplayer-setting-cover"
             :class="{'watch-player__dplayer-setting-cover--display': playerStore.is_player_setting_panel_open}"
@@ -45,7 +67,7 @@
 </template>
 <script setup lang="ts">
 
-import { PropType } from 'vue';
+import { computed, PropType } from 'vue';
 
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
@@ -65,6 +87,31 @@ const channelsStore = useChannelsStore();
 const playerStore = usePlayerStore();
 const settingsStore = useSettingsStore();
 
+// 視聴画面を開いた時点でPending・Staleも優先度0の解析へ投入されるため、プレイヤー領域では解析中と表示する
+const playbackIndexStatusTitle = computed(() => {
+    return playerStore.recorded_program.recorded_video.playback_index_state === 'Failed' ?
+        '録画再生用索引の解析に失敗しました' : '録画再生用索引を解析中…';
+});
+
+// サーバーが返す処理段階を、進捗率だけでは分からない作業内容とともに表示する
+const playbackIndexStageTitle = computed(() => {
+    const stage_titles = {
+        Queued: '解析待ち',
+        Probing: 'ストリームを確認中',
+        Scanning: '映像・音声フレームを走査中',
+        Finalizing: '索引を確定中',
+        Complete: '解析完了',
+        Failed: '解析失敗',
+    } as const;
+    const stage = playerStore.recorded_playback_index_stage;
+    return stage !== null ? stage_titles[stage] : '解析を開始しています';
+});
+
+// PlayerControllerはまだ存在しないため、Storeのイベントを通じて視聴画面の初期化処理へ再試行を依頼する
+const retryRecordedPlaybackIndex = () => {
+    playerStore.event_emitter.emit('RetryRecordedPlaybackIndex');
+};
+
 // watch-player__dplayer-setting-cover がクリックされたとき、設定パネルを閉じる
 const handleSettingCoverClick = () => {
     const dplayer_mask = document.querySelector<HTMLDivElement>('.dplayer-mask');
@@ -76,6 +123,30 @@ const handleSettingCoverClick = () => {
 
 </script>
 <style lang="scss">
+
+.watch-player__playback-index-status {
+    position: absolute;
+    z-index: 5;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: rgb(var(--v-theme-text));
+    background: rgb(var(--v-theme-background));
+
+    &-title {
+        margin-top: 18px;
+        font-size: 18px;
+        font-weight: 600;
+    }
+
+    &-detail {
+        margin-top: 8px;
+        color: rgb(var(--v-theme-text-darken-1));
+        font-size: 14px;
+    }
+}
 
 // DPlayer のデフォルトスタイルを上書き
 .watch-player__dplayer {

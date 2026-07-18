@@ -174,6 +174,68 @@ class TSKeyFrameSeeker:
 
 
     @staticmethod
+    def findARIBCaptionPIDs(path: Path, max_scan_bytes: int = 8 * 1024 * 1024) -> set[int]:
+        """PMTのdata component descriptorからARIB字幕PIDを列挙する。
+
+        FFprobeはARIB字幕をbin_dataとして返す構成があるため、codec_typeだけでは
+        データ放送と区別できない。ARIB STD-B10で字幕を示すdata_component_id 0x0008を使う。
+        """
+
+        packet_size = TSKeyFrameSeeker.__detectPacketSize(path)
+        pat_parser = SectionParser(PATSection)
+        pmt_parsers: dict[int, SectionParser[PMTSection]] = {}
+        caption_candidates: set[int] = set()
+        caption_pids: set[int] = set()
+        max_packet_count = max(1, max_scan_bytes // packet_size)
+        with path.open('rb') as file:
+            for _ in range(max_packet_count):
+                packet = TSKeyFrameSeeker.normalizePacket(file.read(packet_size), packet_size)
+                if packet is None:
+                    break
+                packet_pid = ts.pid(packet)
+                if packet_pid == 0x00:
+                    pat_parser.push(packet)
+                    for pat in pat_parser:
+                        if pat.CRC32() != 0:
+                            continue
+                        for program_number, pmt_pid in pat:
+                            if program_number != 0:
+                                pmt_parsers.setdefault(pmt_pid, SectionParser(PMTSection))
+                    continue
+                if packet_pid in caption_candidates and ts.payload_unit_start_indicator(packet):
+                    payload = bytes(ts.payload(packet))
+                    if payload[:3] != b'\x00\x00\x01' or len(payload) < 7:
+                        continue
+                    stream_id = payload[3]
+                    if stream_id == 0xBD and len(payload) >= 9:
+                        data_offset = 9 + payload[8]
+                    elif stream_id == 0xBF:
+                        data_offset = 6
+                    else:
+                        continue
+                    # data_component_id 0x0008 は字幕と文字スーパーの両方に使われる。
+                    # PES の data_identifier 0x80 だけが字幕で、0x81 は文字スーパー。
+                    if data_offset < len(payload) and payload[data_offset] == 0x80:
+                        caption_pids.add(packet_pid)
+                    continue
+                pmt_parser = pmt_parsers.get(packet_pid)
+                if pmt_parser is None:
+                    continue
+                pmt_parser.push(packet)
+                for pmt in pmt_parser:
+                    if pmt.CRC32() != 0:
+                        continue
+                    for _stream_type, elementary_pid, descriptors in pmt:
+                        if any(
+                            descriptor_tag == 0xFD and len(payload) >= 2 and
+                            int.from_bytes(payload[:2], 'big') == 0x0008
+                            for descriptor_tag, payload in descriptors
+                        ):
+                            caption_candidates.add(elementary_pid)
+        return caption_pids
+
+
+    @staticmethod
     def findStreamInfo(
         path: Path,
         *,

@@ -6,6 +6,8 @@
                 'watch-container--fullscreen': playerStore.is_fullscreen,
                 'watch-container--document-pip': playerStore.is_document_pip,
                 'watch-container--video': playback_mode === 'Video',
+                'watch-container--playback-index-waiting': playback_mode === 'Video' &&
+                    playerStore.recorded_program.recorded_video.playback_index_state !== 'Ready',
             }">
             <WatchNavigation />
             <div class="watch-content"
@@ -395,6 +397,16 @@ export default defineComponent({
                 opacity: 1 !important;
                 visibility: visible !important;
             }
+        }
+    }
+
+    // 録画再生索引の待機中はDPlayerがまだ存在しないため、直前のコントロール表示状態に依存させない。
+    // 解析中オーバーレイより前面に置き、番組タイトル・放送局・番組時刻・現在時刻を常に表示する。
+    &.watch-container--playback-index-waiting {
+        .watch-header {
+            z-index: 6 !important;
+            opacity: 1 !important;
+            visibility: visible !important;
         }
     }
 
