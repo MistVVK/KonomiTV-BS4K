@@ -43,6 +43,11 @@ echo "${ffmpeg_version}" | grep -F "ffmpeg version n${FFMPEG_VERSION}"
 ffprobe_version="$(${THIRDPARTY_ROOT}/FFmpeg/ffprobe.elf -version 2>&1)" || { echo "${ffprobe_version}" >&2; exit 1; }
 echo "${ffprobe_version}"
 echo "${ffprobe_version}" | grep -F "ffprobe version n${FFMPEG_VERSION}"
+ffmpeg_encoders="$(${THIRDPARTY_ROOT}/FFmpeg/ffmpeg.elf -hide_banner -encoders 2>&1)"
+echo "${ffmpeg_encoders}" | grep -Eq '[[:space:]]libwebp[[:space:]]' || {
+    echo 'Missing FFmpeg WebP encoder.' >&2
+    exit 1
+}
 echo "Expected FFmpeg 8: ${FFMPEG8_VERSION}"
 ffmpeg8="${THIRDPARTY_ROOT}/FFmpeg8/ffmpeg8.elf"
 ffprobe8="${THIRDPARTY_ROOT}/FFmpeg8/ffprobe8.elf"

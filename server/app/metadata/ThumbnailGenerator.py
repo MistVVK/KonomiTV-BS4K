@@ -1240,7 +1240,7 @@ class ThumbnailGenerator:
                 '-f', 'image2pipe',
                 '-codec:v', 'png',
                 '-i', 'pipe:0',
-                '-codec:v', 'webp',
+                '-codec:v', 'libwebp',
                 '-quality', str(ThumbnailGenerator.WEBP_QUALITY_TILE),
                 '-compression_level', str(ThumbnailGenerator.WEBP_COMPRESSION),
                 '-preset', preset,

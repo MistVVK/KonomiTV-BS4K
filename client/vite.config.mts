@@ -83,7 +83,12 @@ export default defineConfig({
             injectRegister: 'auto',
             // PWA のキャッシュに含めるファイル
             includeAssets: [
-                'assets/**',
+                'assets/fonts/**',
+                'assets/images/account-icon-default.png',
+                'assets/images/icon.svg',
+                'assets/images/logo.svg',
+                'assets/images/icons/**',
+                'assets/romsounds/**',
             ],
             // manifest.json の内容
             manifest: {
@@ -127,6 +132,23 @@ export default defineConfig({
                 navigateFallbackDenylist: [/^\/api/, /^\/cdn-cgi/],
                 // キャッシュするファイルの最大サイズ
                 maximumFileSizeToCacheInBytes: 1024 * 1024 * 15,  // 15MB
+                // プレイヤー背景画像は実際に表示されたものだけを長期間キャッシュする
+                runtimeCaching: [
+                    {
+                        urlPattern: /\/assets\/images\/player-backgrounds\/\d{2}\.jpg$/,
+                        handler: 'CacheFirst',
+                        options: {
+                            cacheName: 'player-backgrounds',
+                            expiration: {
+                                maxAgeSeconds: 60 * 60 * 24 * 365,  // 1年間
+                                purgeOnQuotaError: true,
+                            },
+                            cacheableResponse: {
+                                statuses: [0, 200],
+                            },
+                        },
+                    },
+                ],
             }
         }),
     ],

@@ -71,6 +71,7 @@ pushd "${SOURCE_ROOT}/ffmpeg"
     --enable-shared \
     --disable-static \
     --enable-libopus \
+    --enable-libwebp \
     --enable-libx264 \
     --enable-libx265 \
     --enable-zlib \
