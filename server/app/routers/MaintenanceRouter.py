@@ -11,14 +11,12 @@ from typing import Annotated, Any, Literal, cast
 
 import anyio
 import psutil
-from fastapi import APIRouter, Depends, Path, Request, status
+from fastapi import APIRouter, Depends, Path, status
 from fastapi.exceptions import HTTPException
 from fastapi.responses import Response
-from fastapi.security import OAuth2PasswordBearer
 from sse_starlette.sse import EventSourceResponse
 
 from app import logging, schemas
-from app.config import Config
 from app.constants import (
     KONOMITV_ACCESS_LOG_PATH,
     KONOMITV_SERVER_LOG_PATH,
@@ -33,7 +31,7 @@ from app.models.Program import Program
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
-from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
+from app.routers.UsersRouter import GetCurrentAdminUser
 
 
 # ルーター
@@ -46,32 +44,6 @@ router = APIRouter(
 batch_scan_task: asyncio.Task[None] | None = None
 metadata_reanalysis_task: asyncio.Task[None] | None = None
 background_analysis_task: asyncio.Task[None] | None = None
-
-
-async def GetCurrentAdminUserOrLocal(
-    request: Request,
-    token: Annotated[str | None, Depends(OAuth2PasswordBearer(tokenUrl='users/token', auto_error=False))],
-) -> User | None:
-    """
-    現在管理者ユーザーでログインしているか、http://127.0.0.77:7010 からのアクセスであるかを確認する
-    KonomiTV の Windows サービスからサーバーをシャットダウンするために必要
-    """
-
-    # HTTP リクエストの Host ヘッダーが 127.0.0.77:7010 である場合、Windows サービスプロセスからのアクセスと見なす
-    ## 通常アクセス時の Host ヘッダーは 192-168-1-11.local.konomi.tv:7000 のような形式になる
-    valid_host = f'127.0.0.77:{Config().server.port + 10}'
-    if request.headers.get('host', '').strip() == valid_host:
-        return None
-
-    # それ以外である場合、管理者ユーザーでログインしているかを確認する
-    if token is None:
-        logging.error('[MaintenanceRouter][GetCurrentAdminUserOrLocal] Not authenticated.')
-        raise HTTPException(
-            status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = 'Not authenticated',
-            headers = {'WWW-Authenticate': 'Bearer'},
-        )
-    return await GetCurrentAdminUser(await GetCurrentUser(token))
 
 
 @router.get(
@@ -370,7 +342,7 @@ async def BackgroundAnalysisAPI():
     status_code = status.HTTP_204_NO_CONTENT,
 )
 def ServerRestartAPI(
-    current_user: Annotated[User | None, Depends(GetCurrentAdminUserOrLocal)],
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ):
     """
     KonomiTV サーバーを再起動する。<br>
@@ -388,10 +360,7 @@ def ServerRestartAPI(
                 target_process = parent_process
 
         # 現在の Uvicorn サーバーを終了する
-        if sys.platform == 'win32':
-            target_process.send_signal(signal.CTRL_C_EVENT)
-        else:
-            target_process.send_signal(signal.SIGINT)
+        target_process.send_signal(signal.SIGINT)
 
         # Uvicorn 終了後に再起動が必要であることを示すロックファイルを作成する
         # Uvicorn 終了後、KonomiTV.py でロックファイルの存在が確認され、もし存在していればサーバー再起動が行われる
@@ -407,7 +376,7 @@ def ServerRestartAPI(
     status_code = status.HTTP_204_NO_CONTENT,
 )
 def ServerShutdownAPI(
-    current_user: Annotated[User | None, Depends(GetCurrentAdminUserOrLocal)],
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ):
     """
     KonomiTV サーバーを終了する。<br>
@@ -426,10 +395,7 @@ def ServerShutdownAPI(
                 target_process = parent_process
 
         # 現在の Uvicorn サーバーを終了する
-        if sys.platform == 'win32':
-            target_process.send_signal(signal.CTRL_C_EVENT)
-        else:
-            target_process.send_signal(signal.SIGINT)
+        target_process.send_signal(signal.SIGINT)
 
     # バックグラウンドでサーバー終了を開始
     threading.Thread(target=Shutdown).start()

@@ -7,9 +7,9 @@ export interface IVersionInformation {
     version: string;
     git_commit: string;
     latest_version: string;
-    environment: 'Windows' | 'Linux' | 'Linux-Docker' | 'Linux-ARM';
+    environment: 'Linux' | 'Linux-Docker';
     backend: 'EDCB' | 'Mirakurun';
-    encoder: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC' | 'rkmppenc';
+    encoder: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC';
 }
 
 

@@ -122,8 +122,8 @@ export interface IServerSettings {
         always_receive_tv_from_mirakurun: boolean;
         edcb_url: string;
         mirakurun_url: string;
-        encoder: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC' | 'rkmppenc';
-        encoder_bs4k: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC' | 'rkmppenc';
+        encoder: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC';
+        encoder_bs4k: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC';
         encoder_bs4k_input_probesize: number;
         encoder_bs4k_input_analyze: number;
         encoder_bs4k_input_analysis_enabled: boolean;

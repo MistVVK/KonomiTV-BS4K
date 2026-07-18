@@ -4,10 +4,11 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter
+from fastapi.responses import FileResponse
 
 from app import schemas
 from app.config import Config
-from app.constants import HTTPX_CLIENT, VERSION
+from app.constants import HTTPX_CLIENT, THIRD_PARTY_LICENSES_PATH, VERSION
 from app.utils import GetPlatformEnvironment
 from app.utils.Git import GetGitCommit
 
@@ -22,6 +23,27 @@ router = APIRouter(
 # GitHub API から取得した KonomiTV の最新バージョン (と最終更新日時)
 latest_version: str | None = None
 latest_version_updated_at: float = 0
+
+
+@router.get(
+    '/third-party-licenses',
+    summary = 'サードパーティーライセンス取得 API',
+    response_class = FileResponse,
+)
+def ThirdPartyLicensesAPI() -> FileResponse:
+    """
+    KonomiTV に同梱している third-party ソフトウェアのライセンス全文を返す。
+
+    Returns:
+        FileResponse: Markdown 形式のライセンス文書
+    """
+
+    return FileResponse(
+        THIRD_PARTY_LICENSES_PATH,
+        media_type = 'text/markdown; charset=utf-8',
+        filename = 'THIRD_PARTY_LICENSES.md',
+        content_disposition_type = 'inline',
+    )
 
 @router.get(
     '',

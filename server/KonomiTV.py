@@ -1,24 +1,11 @@
 
-# タイムゾーンを常に Asia/Tokyo に設定する (Linux のみ)
-## タイムゾーンが UTC の環境ではログの日時が日本時間より9時間遅れてしまうため
-## デフォルトを Asia/Tokyo に変更することで、万が一のタイムゾーン関連のバグを防ぐ防波堤としての意味合いもある
-## Windows ではタイムゾーンを変更することができないため、何もしない
-import os  # noqa: I001
-import sys
-import time
-if sys.platform != 'win32':
-    os.environ['TZ'] = 'Asia/Tokyo'
-    # Linux でもなぜか time.tzset() が使えないことがあるので、try-except で囲む
-    try:
-        time.tzset()
-    except AttributeError:
-        pass
-
 import asyncio
 import atexit
 import logging
-import platform
+import os
 import subprocess
+import sys
+import time
 from pathlib import Path
 
 import typer
@@ -58,6 +45,12 @@ def main(
     version: bool = typer.Option(None, '--version', callback=version, is_eager=True, help='Show version information.'),
 ):
 
+    # タイムゾーンを常に Asia/Tokyo に設定する
+    ## タイムゾーンが UTC の環境ではログの日時が日本時間より9時間遅れてしまうため
+    ## デフォルトを Asia/Tokyo に変更することで、万が一のタイムゾーン関連のバグを防ぐ防波堤としての意味合いもある
+    os.environ['TZ'] = 'Asia/Tokyo'
+    time.tzset()
+
     # 前回のログのうち、アクセスログと Akebi のログのみ削除する
     ## サーバーログは起動時に日付別分割されるため、ここでは削除しない
     try:
@@ -82,7 +75,6 @@ def main(
     ## 前回のログをすべて削除する処理を logging.py 自体に記述してしまうとマルチプロセス実行時や自動リロードモード時に意図せずファイルが削除されてしまう
     ## constants.py は内部モジュールへの依存がなく、config.py も constants.py 以外への依存はないので、この2つのみトップレベルでインポートしている
     from app import logging
-    from app.utils import IsRunningAsWindowsService
 
     # バージョン情報をログに出力
     logging.info(f'KonomiTV version {VERSION}')
@@ -104,25 +96,15 @@ def main(
     # ***** サポートされているアーキテクチャかのバリデーション *****
 
     # CPU のアーキテクチャから実行可否を判定
-    ## サポートされているアーキテクチャ
-    ## AMD64 : Windows (x64)
-    ## x86_64: Linux (x64)
-    ## aarch64: Linux (arm64)
-    current_arch = platform.machine()
-    if current_arch not in ['AMD64', 'x86_64', 'aarch64']:
-        logging.error(f'KonomiTV は {current_arch} アーキテクチャに対応していません。')
+    # Docker image は Linux amd64 専用なので、実行環境も同じ条件に限定する
+    if sys.platform != 'linux' or os.uname().machine != 'x86_64':
+        logging.error('KonomiTV は Linux amd64 Docker 環境でのみ実行できます。')
         sys.exit(1)
 
     # ***** サードパーティーライブラリが配置されているかのバリデーション *****
 
     # すべてのサードパーティーライブラリの配置をチェック
     for library_name, library_path in LIBRARY_PATH.items():
-        # x64 の場合、ARM のみの rkmppenc はチェックしない
-        if current_arch in ['AMD64', 'x86_64'] and library_name == 'rkmppenc':
-            continue
-        # arm64 の場合、x64 のみの QSVEncC・NVEncC・VCEEncC はチェックしない
-        if current_arch == 'aarch64' and library_name in ['QSVEncC', 'NVEncC', 'VCEEncC']:
-            continue
         if Path(library_path).is_file() is False:
             logging.error(f'{library_name} がサードパーティーライブラリとして配置されていないため、KonomiTV を起動できません。')
             logging.error(f'{library_name} が {library_path} に配置されているかを確認してください。')
@@ -161,7 +143,6 @@ def main(
             ],
             stdout = file,
             stderr = file,
-            creationflags = (subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0),  # コンソールなしで実行 (Windows)
         )
 
     # このプロセスが終了されたときに、HTTPS リバースプロキシも一緒に終了する
@@ -198,21 +179,8 @@ def main(
     server = uvicorn.Server(server_config)
 
     # Linux では Uvloop をイベントループとして利用する
-    # Windows では Winloop をイベントループとして利用する予定だったが、2025年3月時点では
-    # キャプチャ保存時 (?) に稀にプロセスごと無言で落ちる問題があるため、当面は通常の asyncio (ProactorEventLoop) を利用する
-    # ref: https://github.com/Vizonex/Winloop
-    if sys.platform == 'win32':
-        if reload is True:
-            logging.warning('Python の asyncio の技術的な制約により、Windows では自動リロードモードは正常に動作しません。')
-            logging.warning('なお、外部プロセス実行を伴うストリーミング視聴を行わなければ一応 Windows でも機能します。')
-        # Aerich 0.8.2 以降では Windows のみインポート時にイベントループポリシーが SelectorEventLoop に変更されてしまうが、
-        # asyncio.subprocess.create_subprocess_exec() は ProactorEventLoop でないと動作しないため、明示的に ProactorEventLoop に戻す
-        # psycopg3 バックエンドが SelectorEventLoop しか対応していない件の対策らしいが、KonomiTV では SQLite を利用しているため問題ない
-        # ref: https://github.com/tortoise/aerich/pull/251
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    else:
-        import uvloop
-        uvloop.install()
+    import uvloop
+    uvloop.install()
 
     # Uvicorn を起動
     ## 自動リロードモードと通常時で呼び方が異なる
@@ -220,10 +188,7 @@ def main(
     ## ref: https://github.com/encode/uvicorn/blob/0.18.2/uvicorn/main.py#L568-L575
     try:
         if server_config.should_reload:
-            # 自動リロードモード (Linux 専用)
-            ## Windows で自動リロードモードを機能させるには SelectorEventLoop が必要だが、外部プロセス実行に利用している
-            ## asyncio.subprocess.create_subprocess_exec() は ProactorEventLoop でないと動作しないため、Windows では事実上利用できない
-            ## 外部プロセス実行を伴うストリーミング視聴を行わなければ一応 Windows でも機能する
+            # 自動リロードモード
             sock = server_config.bind_socket()
             WatchFilesReload(server_config, target=server.run, sockets=[sock]).run()
         else:
@@ -244,10 +209,6 @@ def main(
     ## このロックファイルは ServerRestartAPI によって作成される
     if RESTART_REQUIRED_LOCK_PATH.exists():
         logging.warning('Server restart requested. Restarting...')
-
-        # Windows サービスとして実行されている場合は、Windows サービス側で再起動処理が行われるので、確実にプロセスを終了する
-        if IsRunningAsWindowsService():
-            os._exit(0)  # type: ignore
 
         # os.execv() で現在のプロセスを新規に起動したプロセスに置き換える
         ## os.execv() は戻らないので、事前にロックファイルを削除しておく

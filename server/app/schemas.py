@@ -797,6 +797,6 @@ class VersionInformation(BaseModel):
     version: str
     git_commit: str
     latest_version: str | None
-    environment: Literal['Windows', 'Linux', 'Linux-Docker', 'Linux-ARM']
+    environment: Literal['Linux', 'Linux-Docker']
     backend: Literal['EDCB', 'Mirakurun']
-    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc']
+    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC']

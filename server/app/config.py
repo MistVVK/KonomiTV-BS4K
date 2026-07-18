@@ -1,7 +1,6 @@
 
 import asyncio
 import concurrent.futures
-import platform
 import re
 import subprocess
 import sys
@@ -149,8 +148,8 @@ class _ServerSettingsGeneral(BaseModel):
     always_receive_tv_from_mirakurun: bool = False
     edcb_url: Annotated[Url, UrlConstraints(allowed_schemes=['tcp'])] = Url('tcp://127.0.0.1:4510/')
     mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] = Url('http://127.0.0.1:40772/')
-    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'] = 'FFmpeg'
-    encoder_bs4k: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'] = 'FFmpeg'
+    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC'] = 'FFmpeg'
+    encoder_bs4k: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC'] = 'FFmpeg'
     encoder_bs4k_input_probesize: Annotated[int, PositiveInt] = 3000
     encoder_bs4k_input_analyze: Annotated[float, PositiveFloat] = 1.5
     encoder_bs4k_input_analysis_enabled: bool = True
@@ -254,19 +253,6 @@ class _ServerSettingsGeneral(BaseModel):
     @classmethod
     def _validate_encoder_value(cls, encoder: str) -> str:
         from app import logging
-        current_arch = platform.machine()
-        # x64 なのにエンコーダーとして rkmppenc が指定されている場合
-        if current_arch in ['AMD64', 'x86_64'] and encoder == 'rkmppenc':
-            raise ValueError(
-                'x64 アーキテクチャでは rkmppenc は使用できません。\n'
-                '利用するエンコーダーを FFmpeg・QSVEncC・NVEncC・VCEEncC のいずれかに変更してください。'
-            )
-        # arm64 なのにエンコーダーとして QSVEncC・NVEncC・VCEEncC が指定されている場合
-        if current_arch == 'aarch64' and encoder in ['QSVEncC', 'NVEncC', 'VCEEncC']:
-            raise ValueError(
-                'arm64 アーキテクチャでは QSVEncC・NVEncC・VCEEncC は使用できません。\n'
-                '利用するエンコーダーを FFmpeg・rkmppenc のいずれかに変更してください。'
-            )
         # HWEncC が指定されているときのみ、--check-hw でハードウェアエンコーダーが利用できるかをチェック
         ## もし利用可能なら標準出力に "H.264/AVC" という文字列が出力されるので、それで判定する
         if encoder != 'FFmpeg':
@@ -607,24 +593,3 @@ def Config() -> ServerSettings:
     global _CONFIG
     assert _CONFIG is not None, 'Server settings have not been initialized.'
     return _CONFIG
-
-
-def GetServerPort() -> int:
-    """
-    サーバーのポート番号を返す (KonomiTV-Service.py でポート番号を取得するために使用)
-    KonomiTV-Service.py ではバリデーションは行いたくないので、Pydantic には通さずに config.yaml から直接ロードする
-
-    Returns:
-        int: サーバーのポート番号
-    """
-
-    try:
-
-        # 設定ファイルからサーバー設定をロードし、ポート番号だけを返す
-        with open(_CONFIG_YAML_PATH, encoding='utf-8') as file:
-            config_dict: dict[str, dict[str, Any]] = dict(ruamel.yaml.YAML().load(file))
-        return config_dict['server']['port']
-
-    # 処理中にエラーが発生した (config.yaml が存在しない・フォーマットが不正など) 場合は、デフォルトのポート番号を返す
-    except Exception:
-        return 7000

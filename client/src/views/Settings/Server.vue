@@ -37,10 +37,6 @@
                     バックエンドに EDCB が選択されているときに利用されます。<br>
                     tcp://edcb-namedpipe/ と指定すると、TCP API の代わりに名前付きパイプを使って通信します (ローカルのみ)。<br>
                 </div>
-                <div class="settings__item-label mt-1">
-                    一部 Windows 環境では localhost の名前解決が遅いため、ストリーミング開始までの待機時間が長くなる場合があります。
-                    EDCB と同じ PC に KonomiTV をインストールしている場合、localhost ではなく 127.0.0.1 の利用を推奨します。<br>
-                </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
                     v-model="server_settings.general.edcb_url">
@@ -50,10 +46,6 @@
                 <div class="settings__item-heading">Mirakurun / mirakc の HTTP API の URL</div>
                 <div class="settings__item-label">
                     バックエンドに Mirakurun が選択されているときに利用されます。<br>
-                </div>
-                <div class="settings__item-label mt-1">
-                    一部 Windows 環境では localhost の名前解決が遅いため、ストリーミング開始までの待機時間が長くなる場合があります。
-                    Mirakurun / mirakc と同じ PC に KonomiTV をインストールしている場合、localhost ではなく 127.0.0.1 の利用を推奨します。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -67,7 +59,7 @@
                     すべての PC で利用できますが、CPU に多大な負荷がかかり、パフォーマンスが悪いです。<br>
                 </div>
                 <div class="settings__item-label mt-1">
-                    QSVEncC・NVEncC・VCEEncC・rkmppenc はハードウェアエンコーダーです。<br>
+                    QSVEncC・NVEncC・VCEEncC はハードウェアエンコーダーです。<br>
                     CPU 負荷が低く、パフォーマンスがとても高いです（おすすめ）。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
@@ -443,7 +435,6 @@ const encoder_options = [
     {title: 'QSVEncC : Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能', value: 'QSVEncC'},
     {title: 'NVEncC : NVIDIA GPU で利用可能', value: 'NVEncC'},
     {title: 'VCEEncC : AMD GPU で利用可能', value: 'VCEEncC'},
-    {title: 'rkmppenc : Rockchip RK3588 系 SoC 搭載 SBC で利用可能', value: 'rkmppenc'},
 ];
 
 // 優先する地デジのエリアの選択肢

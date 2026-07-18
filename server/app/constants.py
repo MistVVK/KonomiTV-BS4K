@@ -3,7 +3,6 @@ import base64
 import hashlib
 import pkgutil
 import secrets
-import sys
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -23,6 +22,9 @@ JST = ZoneInfo('Asia/Tokyo')
 
 # ベースディレクトリ
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# third-party ソフトウェアのライセンス文書
+THIRD_PARTY_LICENSES_PATH = BASE_DIR.parent / 'THIRD_PARTY_LICENSES.md'
 
 # クライアントの静的ファイルがあるディレクトリ
 CLIENT_DIR = BASE_DIR.parent / 'client/dist'
@@ -71,18 +73,16 @@ AKEBI_LOG_PATH = LOGS_DIR / 'Akebi-HTTPS-Server.log'
 LIBRARY_DIR = BASE_DIR / 'thirdparty'
 
 # サードパーティーライブラリのあるパス
-LIBRARY_EXTENSION = ('.exe' if sys.platform == 'win32' else '.elf')
 LIBRARY_PATH = {
-    'Akebi': str(LIBRARY_DIR / 'Akebi/akebi-https-server') + LIBRARY_EXTENSION,
-    'FFmpeg': str(LIBRARY_DIR / 'FFmpeg/ffmpeg') + LIBRARY_EXTENSION,
-    'FFprobe': str(LIBRARY_DIR / 'FFmpeg/ffprobe') + LIBRARY_EXTENSION,
-    'QSVEncC': str(LIBRARY_DIR / 'QSVEncC/QSVEncC') + LIBRARY_EXTENSION,
-    'NVEncC': str(LIBRARY_DIR / 'NVEncC/NVEncC') + LIBRARY_EXTENSION,
-    'VCEEncC': str(LIBRARY_DIR / 'VCEEncC/VCEEncC') + LIBRARY_EXTENSION,
-    'rkmppenc': str(LIBRARY_DIR / 'rkmppenc/rkmppenc') + LIBRARY_EXTENSION,
-    'tsreadex': str(LIBRARY_DIR / 'tsreadex/tsreadex') + LIBRARY_EXTENSION,
-    'psisiarc': str(LIBRARY_DIR / 'psisiarc/psisiarc') + LIBRARY_EXTENSION,
-    'psisimux': str(LIBRARY_DIR / 'psisimux/psisimux') + LIBRARY_EXTENSION,
+    'Akebi': str(LIBRARY_DIR / 'Akebi/akebi-https-server.elf'),
+    'FFmpeg': str(LIBRARY_DIR / 'FFmpeg/ffmpeg.elf'),
+    'FFprobe': str(LIBRARY_DIR / 'FFmpeg/ffprobe.elf'),
+    'QSVEncC': str(LIBRARY_DIR / 'QSVEncC/QSVEncC.elf'),
+    'NVEncC': str(LIBRARY_DIR / 'NVEncC/NVEncC.elf'),
+    'VCEEncC': str(LIBRARY_DIR / 'VCEEncC/VCEEncC.elf'),
+    'tsreadex': str(LIBRARY_DIR / 'tsreadex/tsreadex.elf'),
+    'psisiarc': str(LIBRARY_DIR / 'psisiarc/psisiarc.elf'),
+    'psisimux': str(LIBRARY_DIR / 'psisimux/psisimux.elf'),
 }
 
 # データベース (Tortoise ORM) の設定

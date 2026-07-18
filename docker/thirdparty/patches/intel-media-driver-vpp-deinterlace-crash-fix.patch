@@ -440,9 +440,10 @@ index 52f482e64..479a5e53a 100644
      return MOS_STATUS_SUCCESS;
  }
  
-@@ -923,11 +1007,13 @@ MHW_SETPAR_DECL_SRC(VDENC_DS_REF_SURFACE_STATE, HevcBasicFeature)
+@@ -923,12 +1007,14 @@ MHW_SETPAR_DECL_SRC(VDENC_DS_REF_SURFACE_STATE, HevcBasicFeature)
  MHW_SETPAR_DECL_SRC(VDENC_PIPE_BUF_ADDR_STATE, HevcBasicFeature)
  {
+     ENCODE_FUNC_CALL();
      ENCODE_CHK_NULL_RETURN(m_mmcState);   
 +    // Keep the raw-surface address and its MMC state from the same surface.
 +    PMOS_SURFACE rawSurface = m_rawSurfaceToPak != nullptr ? m_rawSurfaceToPak : const_cast<PMOS_SURFACE>(&m_rawSurface);
@@ -1192,7 +1193,7 @@ index 9e3ddd983..2c7cdd259 100644
 +#include "media_copy_wrapper.h"
  #include "renderhal_platform_interface_next.h"
  
- #define SURFACE_DW_UY_OFFSET(pSurface) \
+ namespace vp {
 @@ -2759,9 +2760,6 @@ MOS_STATUS VpVeboxCmdPacket::SetUpdatedExecuteResource(
      m_allocator->UpdateResourceUsageType(&inputSurface->osSurface->OsResource, MOS_HW_RESOURCE_USAGE_VP_INPUT_PICTURE_FF);
      m_allocator->UpdateResourceUsageType(&outputSurface->osSurface->OsResource, MOS_HW_RESOURCE_USAGE_VP_OUTPUT_PICTURE_FF);
@@ -1288,11 +1289,6 @@ index 9e3ddd983..2c7cdd259 100644
  void VpVeboxCmdPacket::CopySurfaceValue(
      VP_SURFACE                  *pTargetSurface,
      VP_SURFACE                  *pSourceSurface)
-@@ -4521,4 +4564,3 @@ MHW_CSPACE VpVeboxCmdPacket::VpHalCspace2MhwCspace(VPHAL_CSPACE cspace)
- }
- 
- }
--
 diff --git a/media_softlet/agnostic/common/vp/hal/packet/vp_vebox_cmd_packet.h b/media_softlet/agnostic/common/vp/hal/packet/vp_vebox_cmd_packet.h
 index 42c50f3e2..5f206a699 100644
 --- a/media_softlet/agnostic/common/vp/hal/packet/vp_vebox_cmd_packet.h

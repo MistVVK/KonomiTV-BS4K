@@ -2,21 +2,20 @@
 set -euo pipefail
 
 # QSVEncC が依存する Intel Media Stack の構成ライブラリ (gmmlib / libva / media-driver / MediaSDK runtime / oneVPL GPU runtime) を
-# Ubuntu 20.04 上でビルドし、thirdparty/Library/ 以下へそのままコピーできる形へ整える CI 環境向けスクリプト
+# Ubuntu 22.04 の Docker builder 上でビルドし、thirdparty/Library/ 以下へそのままコピーできる形へ整えるスクリプト
 ## Intel Media Stack の構成ライブラリ (OpenCL ランタイムを除く) をすべて自己完結型でビルドすることで、
 ## サードパーティーライブラリ上の QSVEncC がシステム側の iHD_drv_video.so や libmfx に依存しないようにし、
 ## どのような OS 環境・CPU 世代でも QSVEncC を安定的に動作させ続けることが狙い
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-PATCH_DIR="${REPO_ROOT}/.github/workflows/patches"
+PATCH_DIR="${SCRIPT_DIR}/patches"
 OUTPUT_ROOT="${1:-${REPO_ROOT}/intel-media-stack}"
 
-: "${INTEL_GMMLIB_TAG:?INTEL_GMMLIB_TAG is required}"
-: "${INTEL_LIBVA_TAG:?INTEL_LIBVA_TAG is required}"
-: "${INTEL_MEDIA_DRIVER_TAG:?INTEL_MEDIA_DRIVER_TAG is required}"
-: "${INTEL_MEDIASDK_TAG:?INTEL_MEDIASDK_TAG is required}"
-: "${INTEL_ONEVPL_GPU_TAG:?INTEL_ONEVPL_GPU_TAG is required}"
+: "${INTEL_GMMLIB_COMMIT:?INTEL_GMMLIB_COMMIT is required}"
+: "${INTEL_LIBVA_COMMIT:?INTEL_LIBVA_COMMIT is required}"
+: "${INTEL_MEDIA_DRIVER_COMMIT:?INTEL_MEDIA_DRIVER_COMMIT is required}"
+: "${INTEL_MEDIASDK_COMMIT:?INTEL_MEDIASDK_COMMIT is required}"
+: "${INTEL_ONEVPL_GPU_COMMIT:?INTEL_ONEVPL_GPU_COMMIT is required}"
 
 SRC_ROOT="${OUTPUT_ROOT}/src"
 BUILD_ROOT="${OUTPUT_ROOT}/build-root"
@@ -42,6 +41,8 @@ mkdir -p "${SRC_ROOT}" "${BUILD_DIR}" "${PREFIX_DIR}" "${FREE_PREFIX_DIR}" \
 
 export PKG_CONFIG_PATH="${PREFIX_DIR}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 export CMAKE_PREFIX_PATH="${PREFIX_DIR}"
+export CMAKE_C_COMPILER_LAUNCHER=ccache
+export CMAKE_CXX_COMPILER_LAUNCHER=ccache
 
 apply-git-patch() {
   local source_dir="$1"
@@ -61,21 +62,26 @@ apply-git-patch() {
   return 1
 }
 
-if [ ! -d "${SRC_ROOT}/gmmlib" ]; then
-  git clone --depth=1 --branch "${INTEL_GMMLIB_TAG}" https://github.com/intel/gmmlib.git "${SRC_ROOT}/gmmlib"
-fi
-if [ ! -d "${SRC_ROOT}/libva" ]; then
-  git clone --depth=1 --branch "${INTEL_LIBVA_TAG}" https://github.com/intel/libva.git "${SRC_ROOT}/libva"
-fi
-if [ ! -d "${SRC_ROOT}/media-driver" ]; then
-  git clone --depth=1 --branch "${INTEL_MEDIA_DRIVER_TAG}" https://github.com/intel/media-driver.git "${SRC_ROOT}/media-driver"
-fi
-if [ ! -d "${SRC_ROOT}/MediaSDK" ]; then
-  git clone --depth=1 --branch "${INTEL_MEDIASDK_TAG}" https://github.com/Intel-Media-SDK/MediaSDK.git "${SRC_ROOT}/MediaSDK"
-fi
-if [ ! -d "${SRC_ROOT}/vpl-gpu-rt" ]; then
-  git clone --depth=1 --branch "${INTEL_ONEVPL_GPU_TAG}" https://github.com/intel/vpl-gpu-rt.git "${SRC_ROOT}/vpl-gpu-rt"
-fi
+clone-commit() {
+  local url="$1"
+  local commit="$2"
+  local destination="$3"
+
+  if [ ! -d "${destination}/.git" ]; then
+    git init "${destination}"
+    git -C "${destination}" remote add origin "${url}"
+    git -C "${destination}" fetch --depth=1 origin "${commit}"
+    git -C "${destination}" checkout --detach FETCH_HEAD
+  fi
+
+  test "$(git -C "${destination}" rev-parse HEAD)" = "${commit}"
+}
+
+clone-commit https://github.com/intel/gmmlib.git "${INTEL_GMMLIB_COMMIT}" "${SRC_ROOT}/gmmlib"
+clone-commit https://github.com/intel/libva.git "${INTEL_LIBVA_COMMIT}" "${SRC_ROOT}/libva"
+clone-commit https://github.com/intel/media-driver.git "${INTEL_MEDIA_DRIVER_COMMIT}" "${SRC_ROOT}/media-driver"
+clone-commit https://github.com/Intel-Media-SDK/MediaSDK.git "${INTEL_MEDIASDK_COMMIT}" "${SRC_ROOT}/MediaSDK"
+clone-commit https://github.com/intel/vpl-gpu-rt.git "${INTEL_ONEVPL_GPU_COMMIT}" "${SRC_ROOT}/vpl-gpu-rt"
 
 apply-git-patch "${SRC_ROOT}/libva" "${PATCH_DIR}/intel-libva-standalone.patch"
 apply-git-patch "${SRC_ROOT}/media-driver" "${PATCH_DIR}/intel-media-driver-vpp-deinterlace-crash-fix.patch"
@@ -97,7 +103,7 @@ meson setup "${BUILD_DIR}/libva" "${SRC_ROOT}/libva" \
   --sysconfdir='.' \
   --libdir=lib \
   -Ddriverdir=dri \
-  -Dwith_x11=no \
+  -Dwith_x11=yes \
   -Dwith_wayland=no \
   -Dwith_glx=no \
   -Ddisable_drm=false \
@@ -136,8 +142,9 @@ cmake -S "${SRC_ROOT}/media-driver" -B "${BUILD_DIR}/media-driver-free" -G Ninja
   -DLIBVA_DRIVERS_PATH="${FREE_PREFIX_DIR}/lib/dri" \
   -DCMAKE_PREFIX_PATH="${PREFIX_DIR}" \
   -DBS_DIR_GMMLIB="${SRC_ROOT}/gmmlib"
-ninja -C "${BUILD_DIR}/media-driver-free" -j"$(nproc)"
-ninja -C "${BUILD_DIR}/media-driver-free" install
+# フリー構成から必要なのは CMRT runtime だけであり、iHD driver 本体は上の non-free 構成を採用する。
+# all/install target は media-driver 全体をもう一度構築するため、CMRT target のみに限定する。
+ninja -C "${BUILD_DIR}/media-driver-free" -j"$(nproc)" igfxcmrt
 
 # 旧世代 GPU 向けの後方互換性を維持するため、MediaSDK 系の実ランタイムのみをビルドする
 # QSVEncC は libvpl のディスパッチャー相当を静的リンクしているため、libmfx.so.1 は同梱しない
@@ -180,7 +187,7 @@ cp -df "${PREFIX_DIR}/lib/libva.so"* "${ARTIFACT_DIR}/Library/"
 cp -df "${PREFIX_DIR}/lib/libva-drm.so"* "${ARTIFACT_DIR}/Library/"
 cp -df "${PREFIX_DIR}/lib/libmfx-gen.so"* "${ARTIFACT_DIR}/Library/"
 cp -df "${PREFIX_DIR}/lib/libmfxhw64.so"* "${ARTIFACT_DIR}/Library/"
-cp -df "${FREE_PREFIX_DIR}/lib/libigfxcmrt.so"* "${ARTIFACT_DIR}/Library/"
+cp -df "${BUILD_DIR}/media-driver-free/cmrtlib/linux/libigfxcmrt.so"* "${ARTIFACT_DIR}/Library/"
 cp -f "${PREFIX_DIR}/lib/dri/iHD_drv_video.so" "${ARTIFACT_DIR}/Library/dri/"
 if [ -d "${PREFIX_DIR}/lib/libmfx-gen" ]; then
   cp -af "${PREFIX_DIR}/lib/libmfx-gen/." "${ARTIFACT_DIR}/Library/libmfx-gen/"

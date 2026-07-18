@@ -281,15 +281,15 @@ class VideoEncodingTask:
 
     def buildHWEncCOptions(self,
         quality: QUALITY_TYPES,
-        encoder_type: Literal['QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'],
+        encoder_type: Literal['QSVEncC', 'NVEncC', 'VCEEncC'],
         output_ts_offset: float,
     ) -> list[str]:
         """
-        QSVEncC・NVEncC・VCEEncC・rkmppenc (便宜上 HWEncC と総称) に渡すオプションを組み立てる
+        QSVEncC・NVEncC・VCEEncC (便宜上 HWEncC と総称) に渡すオプションを組み立てる
 
         Args:
             quality (QUALITY_TYPES): 映像の品質
-            encoder_type (Literal['QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc']): エンコーダー (QSVEncC or NVEncC or VCEEncC or rkmppenc)
+            encoder_type (Literal['QSVEncC', 'NVEncC', 'VCEEncC']): エンコーダー (QSVEncC or NVEncC or VCEEncC)
             output_ts_offset (float): 出力 TS のタイムスタンプオフセット (秒)
 
         Returns:
@@ -325,7 +325,7 @@ class VideoEncodingTask:
         ## VCEEncC の HW デコーダーはエラー耐性が低く TS を扱う用途では不安定なので、SW デコーダーを利用する
         if encoder_type == 'VCEEncC':
             options.append('--avsw')
-        ## QSVEncC・NVEncC・rkmppenc は HW デコーダーを利用する
+        ## QSVEncC・NVEncC は HW デコーダーを利用する
         else:
             options.append('--avhw')
 
@@ -349,8 +349,8 @@ class VideoEncodingTask:
             max_interleave_delta = round(5000 + (self._retry_count * 1000))
             options.append('-m avioflags:direct -m fflags:nobuffer+flush_packets -m flush_packets:1 -m max_delay:0')
             options.append(f'-m max_interleave_delta:{max_interleave_delta}K')
-        ## QSVEncC と rkmppenc では OpenCL を使用しないので、無効化することで初期化フェーズを高速化する
-        if (encoder_type == 'QSVEncC' or encoder_type == 'rkmppenc') and (
+        ## QSVEncC では OpenCL を使用しない場合、無効化することで初期化フェーズを高速化する
+        if encoder_type == 'QSVEncC' and (
             encoding_profile.is_bs4k is True or
             self.video_stream.encoding_options.is_24fps_mode_enabled is False
         ):
@@ -401,7 +401,7 @@ class VideoEncodingTask:
             options.append('--repeat-headers')
 
         ## GOP 長を固定
-        ## VCEEncC / rkmppenc では下記オプションは存在しない
+        ## VCEEncC では下記オプションは存在しない
         if encoder_type == 'QSVEncC':
             options.append('--strict-gop')
         elif encoder_type == 'NVEncC':
@@ -414,8 +414,6 @@ class VideoEncodingTask:
             options.append('--preset default')
         elif encoder_type == 'VCEEncC':
             options.append('--preset balanced')
-        elif encoder_type == 'rkmppenc':
-            options.append('--preset best')
         if self.video_stream.encoding_options.video_codec == 'hevc':
             options.append('--profile main')
         else:
@@ -426,7 +424,7 @@ class VideoEncodingTask:
         if encoder_type == 'NVEncC':
             options.append('--vpp-deband')
         # HEVC 選択時は、HEVC 10bit のデコードに対応したクライアント向けに HEVC 10bit でエンコードし、さらにバンディング耐性を高める
-        ## (VCEEncC は HEVC 10bit 対応の機種かを判定できず、rkmppenc は HEVC 10bit エンコード自体に非対応のため設定しない)
+        ## VCEEncC は HEVC 10bit 対応の機種かを判定できないため設定しない
         ## --fallback-bitdepth により、GPU 側が HEVC 10bit 非対応の場合でも 8bit へフォールバックされる
         ## 末尾の -10bit は、HEVC 10bit でのエンコードを試すストリームであることだけを表す
         if self.video_stream.encoding_options.video_codec == 'hevc' and self.video_stream.encoding_options.is_hevc_10bit_enabled is True:
@@ -445,8 +443,6 @@ class VideoEncodingTask:
                     options.append('--vpp-deinterlace bob')
                 elif encoder_type == 'NVEncC' or encoder_type == 'VCEEncC':
                     options.append('--vpp-yadif mode=bob')
-                elif encoder_type == 'rkmppenc':
-                    options.append('--vpp-deinterlace bob_i5')
                 options.append(f'--avsync vfr --gop-len {int(self.GOP_LENGTH_SECOND * 60)}')
             ## インターレース解除 (60i → 30p (フレームレート: 30fps))
             ## NVEncC の --vpp-deinterlace normal は GPU 機種次第では稀に解除漏れのジャギーが入るらしいので、代わりに --vpp-afs を使う
@@ -462,8 +458,6 @@ class VideoEncodingTask:
                         options.append('--vpp-deinterlace normal')
                     elif encoder_type == 'NVEncC' or encoder_type == 'VCEEncC':
                         options.append('--vpp-afs preset=default,coeff_shift=0')
-                    elif encoder_type == 'rkmppenc':
-                        options.append('--vpp-deinterlace normal_i5')
                 options.append(f'--avsync vfr --gop-len {int(self.GOP_LENGTH_SECOND * 30)}')
         ## プログレッシブ映像
         ## プログレッシブ映像の場合は 60fps 化する方法はないため、無視して入力ファイルと同じ fps でエンコードする

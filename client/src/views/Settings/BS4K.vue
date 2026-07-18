@@ -322,7 +322,6 @@ const encoder_options = [
     {title: 'QSVEncC : Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能', value: 'QSVEncC'},
     {title: 'NVEncC : NVIDIA GPU で利用可能', value: 'NVEncC'},
     {title: 'VCEEncC : AMD GPU で利用可能', value: 'VCEEncC'},
-    {title: 'rkmppenc : Rockchip RK3588 系 SoC 搭載 SBC で利用可能', value: 'rkmppenc'},
 ];
 
 // ユーザー情報を取得し、もし管理者権限であれば無効化を解除

@@ -51,12 +51,12 @@ const useVersionStore = defineStore('version', {
             if (this.server_version === null) return false;
             return this.client_version !== this.server_version;
         },
-        server_environment(): 'Windows' | 'Linux' | 'Linux-Docker' | 'Linux-ARM' | null {
+        server_environment(): 'Linux' | 'Linux-Docker' | null {
             return this.server_version_info?.environment ?? null;
         },
         is_linux_environment(): boolean {
             const env = this.server_environment;
-            return env === 'Linux' || env === 'Linux-Docker' || env === 'Linux-ARM';
+            return env === 'Linux' || env === 'Linux-Docker';
         }
     },
     actions: {

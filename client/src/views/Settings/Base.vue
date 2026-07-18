@@ -50,11 +50,20 @@
                         <Icon icon="fluent:server-surface-16-filled" width="26px" />
                         <span class="ml-4">サーバー設定</span>
                     </v-btn>
+                    <a class="settings-navigation__license-link link mt-3"
+                        href="/api/version/third-party-licenses" target="_blank" rel="noopener noreferrer">
+                        サードパーティーソフトウェアのライセンス
+                    </a>
                 </nav>
                 <div class="settings ml-5 px-7 py-7" width="100%">
                     <!-- この slot にそれぞれの設定画面の内容が入る -->
                     <slot></slot>
                 </div>
+            </div>
+            <div class="settings-license-link settings-license-link--mobile mx-auto px-5 pb-8">
+                <a class="link" href="/api/version/third-party-licenses" target="_blank" rel="noopener noreferrer">
+                    サードパーティーソフトウェアのライセンス
+                </a>
             </div>
         </main>
     </div>
@@ -107,6 +116,12 @@ export default defineComponent({
         // タブレット縦画面・スマホ横画面・スマホ縦画面では表示しない
         @include tablet-vertical {
             display: none;
+        }
+
+        .settings-navigation__license-link {
+            padding: 8px 16px;
+            font-size: 12.5px;
+            line-height: 1.6;
         }
         @include smartphone-horizontal {
             display: none;
@@ -427,6 +442,26 @@ export default defineComponent({
             font-size: 13.5px;
             line-height: 1.6;
         }
+    }
+}
+
+.settings-license-link {
+    width: 100%;
+    max-width: 1000px;
+    text-align: right;
+    font-size: 13px;
+    opacity: 0.8;
+    @include smartphone-vertical {
+        padding-right: 16px !important;
+        padding-left: 16px !important;
+        text-align: center;
+    }
+}
+
+.settings-license-link--mobile {
+    display: none;
+    @include tablet-vertical {
+        display: block;
     }
 }
 

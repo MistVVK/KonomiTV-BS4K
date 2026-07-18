@@ -281,16 +281,16 @@ class LiveEncodingTask:
 
     def buildHWEncCOptions(self,
         quality: QUALITY_TYPES,
-        encoder_type: Literal['QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'],
+        encoder_type: Literal['QSVEncC', 'NVEncC', 'VCEEncC'],
         channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'],
         is_fullhd_channel: bool,
     ) -> list[str]:
         """
-        QSVEncC・NVEncC・VCEEncC・rkmppenc (便宜上 HWEncC と総称) に渡すオプションを組み立てる
+        QSVEncC・NVEncC・VCEEncC (便宜上 HWEncC と総称) に渡すオプションを組み立てる
 
         Args:
             quality (QUALITY_TYPES): 映像の品質
-            encoder_type (Literal['QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc']): エンコーダー (QSVEncC or NVEncC or VCEEncC or rkmppenc)
+            encoder_type (Literal['QSVEncC', 'NVEncC', 'VCEEncC']): エンコーダー (QSVEncC or NVEncC or VCEEncC)
             channel_type (Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']): チャンネルの種類
             is_fullhd_channel (bool): フル HD 放送が実施されているチャンネルかどうか
 
@@ -336,7 +336,7 @@ class LiveEncodingTask:
         ## VCEEncC の HW デコーダーはエラー耐性が低く TS を扱う用途では不安定なので、SW デコーダーを利用する
         if encoder_type == 'VCEEncC':
             options.append('--avsw')
-        ## QSVEncC・NVEncC・rkmppenc は HW デコーダーを利用する
+        ## QSVEncC・NVEncC は HW デコーダーを利用する
         else:
             options.append('--avhw')
 
@@ -357,8 +357,8 @@ class LiveEncodingTask:
         options.append(f'-m max_interleave_delta:{max_interleave_delta}K --output-thread 0')
         if channel_type != 'BS4K' or CONFIG.general.encoder_bs4k_low_latency is True:
             options.append('--lowlatency')
-        ## QSVEncC と rkmppenc では OpenCL を使用しないので、無効化することで初期化フェーズを高速化する
-        if (encoder_type == 'QSVEncC' or encoder_type == 'rkmppenc') and not self.live_stream.encoding_options.is_24fps_mode_enabled:
+        ## QSVEncC では OpenCL を使用しない場合、無効化することで初期化フェーズを高速化する
+        if encoder_type == 'QSVEncC' and not self.live_stream.encoding_options.is_24fps_mode_enabled:
             options.append('--disable-opencl')
         ## NVEncC では NVML によるモニタリングと DX11, Vulkan を無効化することで初期化フェーズを高速化する
         if encoder_type == 'NVEncC':
@@ -403,8 +403,6 @@ class LiveEncodingTask:
             options.append('--preset default')
         elif encoder_type == 'VCEEncC':
             options.append('--preset balanced')
-        elif encoder_type == 'rkmppenc':
-            options.append('--preset best')
         if QUALITY[quality].is_hevc is True:
             options.append('--profile main')
         else:
@@ -415,7 +413,7 @@ class LiveEncodingTask:
         if encoder_type == 'NVEncC':
             options.append('--vpp-deband')
         # HEVC 選択時は、HEVC 10bit のデコードに対応したクライアント向けに HEVC 10bit でエンコードし、さらにバンディング耐性を高める
-        ## (VCEEncC は HEVC 10bit 対応の機種かを判定できず、rkmppenc は HEVC 10bit エンコード自体に非対応のため設定しない)
+        ## VCEEncC は HEVC 10bit 対応の機種かを判定できないため設定しない
         ## --fallback-bitdepth により、GPU 側が HEVC 10bit 非対応の場合でも 8bit へフォールバックされる
         ## 末尾の -10bit は、HEVC 10bit でのエンコードを試すストリームであることだけを表す
         if QUALITY[quality].is_hevc is True and self.live_stream.encoding_options.is_hevc_10bit_enabled is True:
@@ -449,8 +447,6 @@ class LiveEncodingTask:
                     options.append('--vpp-deinterlace bob')
                 elif encoder_type == 'NVEncC' or encoder_type == 'VCEEncC':
                     options.append('--vpp-yadif mode=bob')
-                elif encoder_type == 'rkmppenc':
-                    options.append('--vpp-deinterlace bob_i5')
                 options.append(f'--avsync vfr --gop-len {int(gop_length_second * 60)}')
             ## インターレース解除 (60i → 30p (フレームレート: 30fps))
             ## NVEncC の --vpp-deinterlace normal は GPU 機種次第では稀に解除漏れのジャギーが入るらしいので、代わりに --vpp-afs を使う
@@ -466,8 +462,6 @@ class LiveEncodingTask:
                         options.append('--vpp-deinterlace normal')
                     elif encoder_type == 'NVEncC' or encoder_type == 'VCEEncC':
                         options.append('--vpp-afs preset=default')
-                    elif encoder_type == 'rkmppenc':
-                        options.append('--vpp-deinterlace normal_i5')
                 options.append(f'--avsync vfr --gop-len {int(gop_length_second * 30)}')
 
         ## フル HD 放送が行われているチャンネルかつ、指定された品質の解像度が 1440×1080 (1080p) の場合のみ、
@@ -736,7 +730,7 @@ class LiveEncodingTask:
         else:
 
             # オプションを取得
-            hw_encoder_type = cast(Literal['QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'], ENCODER_TYPE)
+            hw_encoder_type = cast(Literal['QSVEncC', 'NVEncC', 'VCEEncC'], ENCODER_TYPE)
             encoder_options = self.buildHWEncCOptions(
                 self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
             )

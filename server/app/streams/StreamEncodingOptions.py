@@ -81,7 +81,7 @@ class StreamEncodingOptions:
             encoder = Config().general.encoder
 
         # HEVC 10bit は HEVC 画質かつ QSVEncC / NVEncC の場合だけ有効化する
-        ## VCEEncC は HEVC 10bit 対応の機種かを判定できず、rkmppenc は HEVC 10bit エンコード自体に非対応のため設定しない
+        ## VCEEncC は HEVC 10bit 対応の機種かを判定できないため設定しない
         resolved_video_codec: VideoCodec = video_codec or ('hevc' if QUALITY[quality].is_hevc else 'avc')
         is_hevc_10bit_enabled = (
             is_hevc_10bit_requested is True and
