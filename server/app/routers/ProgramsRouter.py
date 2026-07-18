@@ -232,7 +232,10 @@ def DecodeEDCBEventInfo(event_info: EventInfo) -> schemas.Program:
         if component_types is not None:
             program.video_type = component_types.get(component_info['component_type'])
         ## 映像のコーデック
-        program.video_codec = TSInformation.STREAM_CONTENT.get(component_info['stream_content'])
+        program.video_codec = TSInformation.getVideoCodec(
+            component_info['stream_content'],
+            component_info['component_type'],
+        )
         ## 映像の解像度
         program.video_resolution = TSInformation.COMPONENT_TYPE.get(component_info['component_type'])
 

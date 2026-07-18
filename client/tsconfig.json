@@ -1,6 +1,5 @@
 {
     "compilerOptions": {
-        "baseUrl": ".",
         "target": "ES2022",
         "module": "ESNext",
         "moduleResolution": "Bundler",  // Bundler にしないと package.json の exports フィールドが考慮されない (web-bml で必要)
@@ -39,7 +38,7 @@
         ],
         "paths": {
             "@/*": [
-                "src/*",
+                "./src/*",
             ]
         },
     },

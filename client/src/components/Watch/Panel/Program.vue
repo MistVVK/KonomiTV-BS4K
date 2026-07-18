@@ -21,6 +21,42 @@
                     {{genre.major}} / {{genre.middle}}
                 </div>
             </div>
+            <div class="program-info__media" v-if="channelsStore.channel.current.program_present">
+                <div class="program-info__media-item"
+                    v-if="channelsStore.channel.current.program_present.video_codec && channelsStore.channel.current.program_present.video_resolution">
+                    <Icon icon="fluent:video-16-filled" height="17px" />
+                    <span class="ml-2">
+                        映像: {{channelsStore.channel.current.program_present.video_codec}} / {{channelsStore.channel.current.program_present.video_resolution}}
+                    </span>
+                </div>
+                <div class="program-info__media-item" v-if="channelsStore.channel.current.program_present.video_type">
+                    <Icon icon="fluent:video-16-filled" height="17px" />
+                    <span class="ml-2">映像詳細: {{channelsStore.channel.current.program_present.video_type}}</span>
+                </div>
+                <div class="program-info__media-item">
+                    <Icon icon="fluent:headphones-sound-wave-20-filled" height="17px" />
+                    <span class="ml-2">
+                        主音声: {{channelsStore.channel.current.program_present.primary_audio_type || '不明'}}
+                        {{channelsStore.channel.current.program_present.primary_audio_sampling_rate || '不明'}} /
+                        {{channelsStore.channel.current.program_present.primary_audio_language || '不明'}}
+                    </span>
+                </div>
+                <div class="program-info__media-item" v-if="channelsStore.channel.current.program_present.secondary_audio_type">
+                    <Icon icon="fluent:headphones-sound-wave-20-filled" height="17px" />
+                    <span class="ml-2">
+                        副音声: {{channelsStore.channel.current.program_present.secondary_audio_type}}
+                        {{channelsStore.channel.current.program_present.secondary_audio_sampling_rate || '不明'}} /
+                        {{channelsStore.channel.current.program_present.secondary_audio_language || '不明'}}
+                    </span>
+                </div>
+                <div class="program-info__media-item">
+                    <Icon icon="fluent:info-16-regular" height="17px" />
+                    <span class="ml-2">
+                        識別子 (NID-TSID-SID-EID):
+                        {{channelsStore.channel.current.program_present.network_id}}-{{channelsStore.channel.current.transport_stream_id ?? '不明'}}-{{channelsStore.channel.current.program_present.service_id}}-{{channelsStore.channel.current.program_present.event_id}}
+                    </span>
+                </div>
+            </div>
             <div class="program-info__next">
                 <span class="program-info__next-decorate">NEXT</span>
                 <Icon class="program-info__next-icon" icon="fluent:fast-forward-20-filled" width="16px" />
@@ -588,6 +624,21 @@ export default defineComponent({
                 background: rgb(var(--v-theme-background-lighten-2));
                 @include smartphone-horizontal {
                     font-size: 9px;
+                }
+            }
+        }
+        .program-info__media {
+            margin-top: 12px;
+
+            &-item {
+                display: flex;
+                align-items: center;
+                margin-top: 6px;
+                color: rgb(var(--v-theme-text-darken-1));
+                font-size: 12.5px;
+                line-height: 170%;
+                @include smartphone-horizontal {
+                    font-size: 11.5px;
                 }
             }
         }

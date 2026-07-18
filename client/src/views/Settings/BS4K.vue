@@ -102,8 +102,8 @@
         </div>
         <div class="settings__content">
             <div class="settings__content-heading">
-                <Icon icon="fluent:play-circle-20-filled" width="22px" />
-                <span class="ml-2">プレイヤー</span>
+                <Icon icon="fluent:video-clip-multiple-16-filled" width="22px" />
+                <span class="ml-2">画質</span>
             </div>
             <v-tabs class="settings__tab" color="primary" bg-color="transparent" align-tabs="center" v-model="player_tab">
                 <v-tab style="text-transform: none !important;" v-for="network_circuit in network_circuits" :key="network_circuit">
@@ -187,6 +187,12 @@
                         v-model="settings_store.settings.video_data_saver_mode_cellular" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
                     </v-switch>
                 </div>
+            </div>
+        </div>
+        <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
+            <div class="settings__content-heading">
+                <Icon icon="fluent:play-circle-20-filled" width="22px" />
+                <span class="ml-2">プレイヤー</span>
             </div>
             <div class="settings__item settings__item--switch" :class="{'settings__item--disabled': is_disabled}">
                 <label class="settings__item-heading" for="bs4k_ignore_viewer_low_latency">BS4K プレイヤーを通常バッファで再生する</label>

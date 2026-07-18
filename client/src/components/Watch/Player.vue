@@ -336,6 +336,10 @@ const handleSettingCoverClick = () => {
         @include tablet-vertical {
             height: calc(100% - 60px) !important;
         }
+        &.dplayer-setting-box-audio {
+            // DPlayer の固定値 (2トラック分) ではなく、実際に表示する音声トラック数に合わせる
+            clip-path: inset(calc(100% - var(--audio-panel-height, 114px)) 0 0 round 7px) !important;
+        }
         .dplayer-setting-origin-panel {
             .dplayer-setting-item.dplayer-setting-lshaped-screen-crop,
             .dplayer-setting-item.dplayer-setting-keyboard-shortcut {
@@ -346,11 +350,17 @@ const handleSettingCoverClick = () => {
             }
         }
         .dplayer-setting-audio-panel {
-            // 副音声がない番組で副音声を選択できないように
-            .dplayer-setting-audio-item.dplayer-setting-audio-item--disabled {
-                pointer-events: none;  // クリックイベントを無効化
-                .dplayer-label {
-                    color: #AAAAAA;  // グレーアウト
+            // 配信 TS に実在しない音声トラックは、状態表示用の先頭行を除いて表示しない
+            .dplayer-setting-audio-item.dplayer-setting-audio-item--disabled:not(.dplayer-setting-audio-item--status) {
+                display: none;
+            }
+            // 「音声不明」「音声なし」は選択できない状態表示として扱う
+            .dplayer-setting-audio-item.dplayer-setting-audio-item--status {
+                cursor: default;
+                pointer-events: none;
+
+                .dplayer-toggle {
+                    visibility: hidden !important;
                 }
             }
         }

@@ -1,6 +1,7 @@
 
 import assert from 'assert';
 
+import { CanvasRenderer } from 'aribb24.js';
 import DPlayer, { DPlayerType } from 'dplayer';
 import Hls from 'hls.js';
 import mpegts from 'mpegts.js';
@@ -841,6 +842,33 @@ class PlayerController {
                 }
             }
         });
+
+        // DPlayer の配布バンドルにはビルド時点の aribb24.js が内包されており、KonomiTV 側で適用した
+        // aribb24.js のパッチはそのままでは字幕レンダラーへ反映されない。
+        // DPlayer 内蔵レンダラーを破棄し、JIS X 0213:2004 に対応した外部のレンダラーへ差し替える。
+        const aribb24_options = this.player.options.pluginOptions.aribb24!;
+        this.player.plugins.aribb24Caption?.dispose();
+        const aribb24_caption = new CanvasRenderer({
+            ...aribb24_options,
+            data_identifier: 0x80,
+        });
+        aribb24_caption.attachMedia(this.player.video);
+        aribb24_caption.show();
+        this.player.plugins.aribb24Caption = aribb24_caption;
+
+        // 文字スーパーが有効な場合も同じパッチ済みレンダラーへ差し替える。
+        this.player.plugins.aribb24Superimpose?.dispose();
+        if (aribb24_options.disableSuperimposeRenderer !== true) {
+            const aribb24_superimpose = new CanvasRenderer({
+                ...aribb24_options,
+                data_identifier: 0x81,
+            });
+            aribb24_superimpose.attachMedia(this.player.video);
+            aribb24_superimpose.show();
+            this.player.plugins.aribb24Superimpose = aribb24_superimpose;
+        } else {
+            delete this.player.plugins.aribb24Superimpose;
+        }
 
         // デバッグ用にプレイヤーインスタンスも window 直下に入れる
         (window as any).player = this.player;
@@ -1754,6 +1782,7 @@ class PlayerController {
         const labels = this.buildAudioTrackLabels(media_info);
         const audio_track_count = this.getSelectableAudioTrackCount(media_info, labels);
         const audio_items = Array.from(this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-item'));
+        const setting_box = this.player.container.querySelector<HTMLElement>('.dplayer-setting-box');
         const audio_setting_item = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio');
         const audio_setting_value = audio_setting_item?.querySelector<HTMLElement>('.dplayer-label-value') ?? null;
         const current_audio_item = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-current');
@@ -1769,15 +1798,22 @@ class PlayerController {
         }
 
         if (audio_setting_item !== null) {
-            const has_audio_track = audio_track_count > 0;
-            audio_setting_item.classList.toggle('dplayer-setting-audio--disabled', has_audio_track === false);
-            audio_setting_item.setAttribute('aria-disabled', String(has_audio_track === false));
+            // 音声が不明・存在しない場合も、状態表示用のサブメニューを開けるようにする
+            const has_audio_menu = audio_items.length > 0;
+            audio_setting_item.classList.toggle('dplayer-setting-audio--disabled', has_audio_menu === false);
+            audio_setting_item.setAttribute('aria-disabled', String(has_audio_menu === false));
         }
+
+        // 非表示にした音声項目の分だけサブメニュー上部に空白が残らないよう、表示高さを実トラック数に同期する
+        // 音声が不明・存在しない場合は、状態表示用に1行分を確保する
+        const visible_audio_item_count = Math.max(audio_track_count, 1);
+        setting_box?.style.setProperty('--audio-panel-height', `${visible_audio_item_count * 30 + 54}px`);
 
         if (audio_items.length === 0) return;
 
         audio_items.forEach((audio_item, index) => {
-            const label = labels[index] ?? `Track${index + 1} 音声不明`;
+            const is_audio_status_item = audio_track_count === 0 && index === 0;
+            const label = is_audio_status_item ? current_audio_label : labels[index] ?? `Track${index + 1} 音声不明`;
             const label_element = audio_item.querySelector<HTMLElement>('.dplayer-label') ?? audio_item;
             label_element.textContent = label;
             if (audio_item.dataset.konomitvAudioLabelHandlerBound !== 'true') {
@@ -1786,10 +1822,10 @@ class PlayerController {
                     window.setTimeout(() => this.applyAudioTrackLabels(media_info), 0);
                 });
             }
-            audio_item.classList.toggle(
-                'dplayer-setting-audio-item--disabled',
-                audio_track_count === 0 || index >= audio_track_count
-            );
+            const is_audio_item_unavailable = audio_track_count === 0 || index >= audio_track_count;
+            audio_item.classList.toggle('dplayer-setting-audio-item--disabled', is_audio_item_unavailable);
+            audio_item.classList.toggle('dplayer-setting-audio-item--status', is_audio_status_item);
+            audio_item.setAttribute('aria-disabled', String(is_audio_item_unavailable));
         });
 
         this.ensureLiveAudioTrackSelection(media_info);
@@ -1840,7 +1876,7 @@ class PlayerController {
 
         if (this.playback_mode !== 'Live' || this.player === null) return;
 
-        const audio_track_count = this.getLiveTSAudioTrackCount(media_info);
+        const audio_track_count = this.getLiveSelectableAudioTrackCount(media_info);
         if (audio_track_count <= 0) return;
 
         const current_audio_index = this.getCurrentAudioTrackIndex();
@@ -1864,6 +1900,13 @@ class PlayerController {
 
         if (this.playback_mode !== 'Live' || this.player === null) return 0;
 
+        // mpegts.js の Worker から MediaInfo 経由で通知された音声 PID 数を最優先で使う。
+        const media_info_audio_track_count = media_info?.audioTrackCount;
+        if (typeof media_info_audio_track_count === 'number' &&
+            Number.isInteger(media_info_audio_track_count) && media_info_audio_track_count >= 0) {
+            return media_info_audio_track_count;
+        }
+
         // KonomiTV の mpegts.js は DPlayer の主音声・副音声切替用に全音声 PID を PMT 内へ保持している。
         // mediaInfo.audioTracks や HTMLMediaElement.audioTracks は音声 PID 数ではないため使用しない。
         const mpegts_player = this.player.plugins.mpegts as any;
@@ -1882,9 +1925,36 @@ class PlayerController {
             }
         }
 
-        // Worker 利用時など PMT を直接参照できない場合は、mediaInfo の音声有無だけを使う。
+        // 旧版の mpegts.js や PMT をまだ参照できない場合は、mediaInfo の音声有無だけを使う。
         // audioChannelCount は1音声ストリーム内のチャンネル数であり、音声トラック数ではない。
         return media_info?.hasAudio === true || Number(media_info?.audioChannelCount) > 0 ? 1 : 0;
+    }
+
+
+    /**
+     * 配信 TS と現在番組の音声構成から、ライブ視聴で実際に選択可能な音声トラック数を取得する
+     */
+    private getLiveSelectableAudioTrackCount(media_info: {[key: string]: any} | null): number {
+
+        const ts_audio_track_count = this.getLiveTSAudioTrackCount(media_info);
+        if (ts_audio_track_count <= 1) return ts_audio_track_count;
+
+        const channels_store = useChannelsStore();
+        const program = channels_store.current_program_present ?? channels_store.channel.current.program_present;
+        if (program === null) return ts_audio_track_count;
+
+        // 番組境界では、PMT に旧番組の副音声 PID が宣言されたままでも PES が送られなくなることがある。
+        // TS 側の実トラック数を上限としつつ、現在番組の EPG で有効な音声構成が確定している場合は
+        // その本数までに絞り、消滅した Track2 以降を選択状態に残さない。
+        const program_audio_track_count = this.buildProgramAudioTrackLabels(
+            program.primary_audio_language,
+            program.primary_audio_type,
+            program.secondary_audio_language,
+            program.secondary_audio_type,
+            true,
+        ).length;
+        if (program_audio_track_count === 0) return ts_audio_track_count;
+        return Math.min(ts_audio_track_count, program_audio_track_count);
     }
 
 
@@ -2055,8 +2125,8 @@ class PlayerController {
         const media_audio_tracks = Array.isArray(media_info?.audioTracks) ? media_info.audioTracks : [];
 
         if (this.playback_mode === 'Live') {
-            // EIT や DPlayer の項目数ではなく、変換後の配信 TS に実在する音声トラック数だけを使う。
-            return this.getLiveTSAudioTrackCount(media_info);
+            // 配信 TS の実トラック数を上限とし、現在番組の音声構成から消滅したトラックを除外する。
+            return this.getLiveSelectableAudioTrackCount(media_info);
         }
 
         if (this.playback_mode === 'Video') {

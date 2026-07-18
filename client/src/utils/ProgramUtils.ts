@@ -55,6 +55,19 @@ export class ProgramUtils {
         0xF4: '180p',
     };
 
+    /**
+     * EIT の映像コンポーネント記述子から映像コーデックを取得する
+     */
+    static getVideoCodec(stream_content: number, component_type: number): string | null {
+        // BS4K/BS8K の EIT では stream_content が 0x01 で送出されるため、
+        // これをそのまま MPEG-2 と解釈すると実際の HEVC 映像と矛盾する。
+        // component_type で 4K/8K 映像と判別できる場合は HEVC として扱う。
+        if ([0x83, 0x91, 0x92, 0x93, 0x94].includes(component_type)) {
+            return 'H.265';
+        }
+        return ProgramUtils.STREAM_CONTENT[stream_content] ?? null;
+    }
+
     // 以下は ariblib から LivePSIArchivedDataDecoder で必要なもののみ移植
     // node-aribts にも同等の定義があるが微妙に文字列の表記揺れがあるため、互換性を鑑みて敢えて移植している
     // ref: https://github.com/tsukumijima/ariblib/blob/master/ariblib/constants.py

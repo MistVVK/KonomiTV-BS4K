@@ -73,6 +73,20 @@ class TSInformation:
         0xF4: '180p',
     }
 
+    @classmethod
+    def getVideoCodec(cls, stream_content: int | None, component_type: int | None) -> str | None:
+        """ EIT の映像コンポーネント記述子から映像コーデックを取得する """
+
+        # BS4K/BS8K の EIT では stream_content が 0x01 で送出されるため、
+        # これをそのまま MPEG-2 と解釈すると実際の HEVC 映像と矛盾する。
+        # component_type で 4K/8K 映像と判別できる場合は HEVC として扱う。
+        if component_type in (0x83, 0x91, 0x92, 0x93, 0x94):
+            return 'H.265'
+
+        if stream_content is None:
+            return None
+        return cls.STREAM_CONTENT.get(stream_content)
+
     # 地域名 → 対応する地域識別のリスト（県域 + 広域）
     # 北海道は放送エリアごとに地域識別が異なるため、個別に分割
     # ARIB TR-B14 第五分冊 第七編 9.1「各種数値割り当て一覧」に基づく

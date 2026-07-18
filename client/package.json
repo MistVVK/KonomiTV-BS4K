@@ -8,6 +8,8 @@
         "akebi:nix": "../server/thirdparty/Akebi/akebi-https-server.elf --listen-address 0.0.0.0:7001 --proxy-pass-url http://127.0.0.77:7011/ --keyless-server-url https://akebi.konomi.tv/ > /dev/null",
         "dev": "concurrently --raw \"npm:akebi\" \"vite\"",
         "build": "vue-tsc --noEmit && vite build",
+        "postinstall": "patch-package",
+        "prebuild": "patch-package",
         "preview": "concurrently --raw \"npm:akebi\" \"vite preview\"",
         "lint": "eslint . --fix --ignore-path .gitignore",
         "typecheck": "vue-tsc --noEmit"
@@ -66,6 +68,7 @@
         "eslint-plugin-vue": "^9.27.0",
         "eslint-plugin-vuetify": "^2.4.0",
         "network-information-types": "^0.1.1",
+        "patch-package": "8.0.1",
         "run-script-os": "^1.1.6",
         "sass": "1.77.6",
         "typescript": "~5.5.4",

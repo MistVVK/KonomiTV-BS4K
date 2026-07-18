@@ -343,7 +343,10 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
                 program.video_type = component_types[video_component_descriptor.component_type] ?? null;
             }
             // 映像のコーデック
-            program.video_codec = ProgramUtils.STREAM_CONTENT[video_component_descriptor.stream_content] ?? null;
+            program.video_codec = ProgramUtils.getVideoCodec(
+                video_component_descriptor.stream_content,
+                video_component_descriptor.component_type,
+            );
             // 映像の解像度
             program.video_resolution = ProgramUtils.VIDEO_COMPONENT_TYPE[video_component_descriptor.component_type] ?? null;
         } else {

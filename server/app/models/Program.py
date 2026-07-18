@@ -298,13 +298,25 @@ class Program(TortoiseModel):
                     # 重複する番組 ID の番組情報があれば取得する
                     duplicate_program = duplicate_programs.get(program_id)
 
-                    # 重複する番組情報があり、かつタイトル・番組概要・番組詳細・番組開始時刻・番組終了時刻が全て同じ
+                    video_codec = None
+                    video_resolution = None
+                    if 'video' in program_info:
+                        video_codec = TSInformation.getVideoCodec(
+                            program_info['video']['streamContent'],
+                            program_info['video']['componentType'],
+                        )
+                        video_resolution = program_info['video']['resolution']
+
+                    # 重複する番組情報があり、かつタイトル・番組概要・番組詳細・番組開始時刻・番組終了時刻・映像情報が全て同じ
                     if (duplicate_program is not None and
                         duplicate_program.title == title and
                         duplicate_program.description == description and
                         len(duplicate_program.detail) == len(detail) and
                         duplicate_program.start_time == start_time and
-                        duplicate_program.end_time == end_time):
+                        duplicate_program.end_time == end_time and
+                        ('video' not in program_info or
+                         (duplicate_program.video_codec == video_codec and
+                          duplicate_program.video_resolution == video_resolution))):
 
                         # 更新不要なのでスキップ
                         del duplicate_programs[program_id]
@@ -387,8 +399,8 @@ class Program(TortoiseModel):
                                 [program_info['video']['streamContent']].get(program_info['video']['componentType'], 'Unknown')
                         else:
                             program.video_type = 'Unknown'
-                        program.video_codec = program_info['video']['type']
-                        program.video_resolution = program_info['video']['resolution']
+                        program.video_codec = video_codec
+                        program.video_resolution = video_resolution
 
                     # 音声情報
                     program.primary_audio_type = ''
@@ -602,13 +614,26 @@ class Program(TortoiseModel):
                         # 重複する番組 ID の番組情報があれば取得する
                         duplicate_program = duplicate_programs.get(program_id)
 
-                        # 重複する番組情報があり、かつタイトル・番組概要・番組詳細・番組開始時刻・番組終了時刻が全て同じ
+                        component_info = event_info.get('component_info')
+                        video_codec = None
+                        video_resolution = None
+                        if component_info is not None:
+                            video_codec = TSInformation.getVideoCodec(
+                                component_info['stream_content'],
+                                component_info['component_type'],
+                            )
+                            video_resolution = TSInformation.COMPONENT_TYPE.get(component_info['component_type'])
+
+                        # 重複する番組情報があり、かつタイトル・番組概要・番組詳細・番組開始時刻・番組終了時刻・映像情報が全て同じ
                         if (duplicate_program is not None and
                             duplicate_program.title == title and
                             duplicate_program.description == description and
                             len(duplicate_program.detail) == len(detail) and
                             duplicate_program.start_time == start_time and
-                            duplicate_program.end_time == end_time):
+                            duplicate_program.end_time == end_time and
+                            (component_info is None or
+                             (duplicate_program.video_codec == video_codec and
+                              duplicate_program.video_resolution == video_resolution))):
 
                             # 更新不要なのでスキップ
                             del duplicate_programs[program_id]
@@ -673,16 +698,15 @@ class Program(TortoiseModel):
                         program.video_type = None
                         program.video_codec = None
                         program.video_resolution = None
-                        component_info = event_info.get('component_info')
                         if component_info is not None:
                             ## 映像の種類
                             component_types = ariblib.constants.COMPONENT_TYPE.get(component_info['stream_content'])
                             if component_types is not None:
                                 program.video_type = component_types.get(component_info['component_type'])
                             ## 映像のコーデック
-                            program.video_codec = TSInformation.STREAM_CONTENT.get(component_info['stream_content'])
+                            program.video_codec = video_codec
                             ## 映像の解像度
-                            program.video_resolution = TSInformation.COMPONENT_TYPE.get(component_info['component_type'])
+                            program.video_resolution = video_resolution
 
                         # 音声情報
                         program.primary_audio_type = ''

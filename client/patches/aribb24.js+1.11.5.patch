@@ -1,0 +1,259 @@
+diff --git a/node_modules/aribb24.js/src/canvas-provider.ts b/node_modules/aribb24.js/src/canvas-provider.ts
+index 24142ff..46af1d5 100644
+--- a/node_modules/aribb24.js/src/canvas-provider.ts
++++ b/node_modules/aribb24.js/src/canvas-provider.ts
+@@ -19,6 +19,7 @@ import { PathElement } from './constants/mapping/additional-symbols-glyph'
+ 
+ import CRC16 from './utils/crc16-ccitt'
+ import MD5 from './utils/md5'
++import decodeJISX0213Character from './utils/jis-x0213'
+ 
+ const SIZE_MAGNIFICATION = 2; // 奇数の height 時に SSZ で改行を行う場合があるため、全体をN倍して半分サイズに備える
+ let EMBEDDED_GLYPH: Map<string, PathElement> | null = null;
+@@ -411,6 +412,18 @@ export default class CanvasProvider {
+   }
+ 
+   private parseText(begin: number, end: number): void {
++    let trailingSpaces: Array<{ x: number; y: number; width: number; height: number }> = []
++    const commitTrailingSpaces = () => { trailingSpaces = [] }
++    const clearTrailingSpaces = () => {
++      const ctx = this.render_canvas?.getContext('2d')
++      if (ctx) {
++        for (const rect of trailingSpaces) {
++          ctx.clearRect(rect.x, rect.y, rect.width, rect.height)
++        }
++      }
++      trailingSpaces = []
++    }
++
+     while (begin < end) {
+       if (0x20 < this.pes[begin] && this.pes[begin] < 0x7F) {
+         let key = 0
+@@ -421,6 +434,7 @@ export default class CanvasProvider {
+           key <<= 8
+           key |= this.pes[begin + i] & 0x7F
+         }
++        commitTrailingSpaces()
+         this.renderCharacter(key, entry)
+         begin += entry.bytes
+       } else if (0xA0 < this.pes[begin] && this.pes[begin] < 0xFF) {
+@@ -432,6 +446,7 @@ export default class CanvasProvider {
+           key <<= 8
+           key |= this.pes[begin + i] & 0x7F
+         }
++        commitTrailingSpaces()
+         this.renderCharacter(key, entry)
+         begin += entry.bytes
+       } else if (this.pes[begin] === JIS8.NUL) {
+@@ -456,6 +471,7 @@ export default class CanvasProvider {
+         }
+         begin += 1
+       } else if (this.pes[begin] === JIS8.APR) {
++        clearTrailingSpaces()
+         this.move_newline()
+         begin += 1
+       } else if (this.pes[begin] === JIS8.LS1) {
+@@ -479,6 +495,7 @@ export default class CanvasProvider {
+           key <<= 8
+           key |= this.pes[(begin + 1) + i] & 0x7F
+         }
++        commitTrailingSpaces()
+         this.renderCharacter(key, entry)
+         begin += 1 + entry.bytes
+       } else if (this.pes[begin] === JIS8.ESC) {
+@@ -524,6 +541,7 @@ export default class CanvasProvider {
+           return
+         }
+       } else if (this.pes[begin] === JIS8.APS) {
++        clearTrailingSpaces()
+         const P1 = this.pes[begin + 1] & 0x3F
+         const P2 = this.pes[begin + 2] & 0x3F
+         this.move_absolute_pos(P2, P1)
+@@ -537,6 +555,7 @@ export default class CanvasProvider {
+           key <<= 8
+           key |= this.pes[(begin + 1) + i] & 0x7F
+         }
++        commitTrailingSpaces()
+         this.renderCharacter(key, entry)
+         begin += 1 + entry.bytes
+       } else if (this.pes[begin] === JIS8.RS) {
+@@ -547,7 +566,14 @@ export default class CanvasProvider {
+         const entry = G_SET_BY_ALPHABET.get(ALPHABETS.KANJI)
+         if(!entry){ return }
+ 
++        const rect = {
++          x: this.position_x * this.width_magnification(),
++          y: (this.position_y - this.height()) * this.height_magnification(),
++          width: this.width() * this.width_magnification(),
++          height: this.height() * this.height_magnification(),
++        }
+         this.renderCharacter(0x2121, entry)
++        trailingSpaces.push(rect)
+         begin += 1
+       } else if (this.pes[begin] === JIS8.DEL) {
+         begin += 1
+@@ -749,6 +775,10 @@ export default class CanvasProvider {
+             }
+             this.sdp_x = P1 * SIZE_MAGNIFICATION
+             this.sdp_y = P2 * SIZE_MAGNIFICATION
++            // SDP は後続文字列の表示領域原点も兼ねるため、カーソルを新しい領域の先頭へ移動する。
++            // BSP4K 字幕では一つの字幕データ内で SDP を切り替えて複数行を配置することがあり、
++            // 以前のカーソルを維持すると文字セルが折り返され、半透明の背景が重なって描画される。
++            this.move_absolute_dot(this.sdp_x, this.sdp_y + this.height())
+             break
+           }else if(this.pes[last] === CSI.ACPS){
+             let index = begin + 1
+@@ -821,6 +851,7 @@ export default class CanvasProvider {
+         return
+       }
+     }
++    clearTrailingSpaces()
+   }
+ 
+   private parseDRCS(bytes: number, begin: number, end: number){
+@@ -991,6 +1022,16 @@ export default class CanvasProvider {
+ 
+       this.renderFont(character)
+ 
++      this.move_relative_pos(1, 0)
++    }else if(
++      entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_1 ||
++      entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_2
++    ) {
++      const plane = entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_1 ? 1 : 2
++      const character = decodeJISX0213Character(key, plane)
++      if (character !== null) {
++        this.renderFont(character)
++      }
+       this.move_relative_pos(1, 0)
+     }else if(entry.alphabet === ALPHABETS.MACRO) {
+       if (key === 0x60){
+diff --git a/node_modules/aribb24.js/src/html-provider-experimental.ts b/node_modules/aribb24.js/src/html-provider-experimental.ts
+index fce514f..24bec4b 100644
+--- a/node_modules/aribb24.js/src/html-provider-experimental.ts
++++ b/node_modules/aribb24.js/src/html-provider-experimental.ts
+@@ -19,6 +19,7 @@ import { PathElement } from './constants/mapping/additional-symbols-glyph'
+ 
+ import CRC16 from './utils/crc16-ccitt'
+ import MD5 from './utils/md5'
++import decodeJISX0213Character from './utils/jis-x0213'
+ 
+ const SIZE_MAGNIFICATION = 2; // 奇数の height 時に SSZ で改行を行う場合があるため、全体をN倍して半分サイズに備える
+ let EMBEDDED_GLYPH: Map<string, PathElement> | null = null;
+@@ -410,6 +411,13 @@ export default class HTMLProvider {
+       } else if (this.pes[begin] === JIS8.US) {
+         begin += 1
+       } else if (this.pes[begin] === JIS8.SP) {
++        // A trailing half-width space is padding, not visible caption content.
++        // Advancing without painting avoids an extra background cell at line end.
++        if (begin + 1 === end) {
++          this.move_relative_pos(1, 0)
++          begin += 1
++          continue
++        }
+         const entry = G_SET_BY_ALPHABET.get(ALPHABETS.KANJI)
+         if(!entry){ return }
+ 
+@@ -608,6 +616,8 @@ export default class HTMLProvider {
+             }
+             this.sdp_x = P1 * SIZE_MAGNIFICATION
+             this.sdp_y = P2 * SIZE_MAGNIFICATION
++            // SDP は後続文字列の表示領域原点も兼ねるため、カーソルを新しい領域の先頭へ移動する。
++            this.move_absolute_dot(this.sdp_x, this.sdp_y + this.height())
+             break
+           }else if(this.pes[last] === CSI.ACPS){
+             let index = begin + 1
+@@ -829,6 +839,16 @@ export default class HTMLProvider {
+ 
+       this.renderFont(character)
+ 
++      this.move_relative_pos(1, 0)
++    }else if(
++      entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_1 ||
++      entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_2
++    ) {
++      const plane = entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_1 ? 1 : 2
++      const character = decodeJISX0213Character(key, plane)
++      if (character !== null) {
++        this.renderFont(character)
++      }
+       this.move_relative_pos(1, 0)
+     }else if(entry.alphabet === ALPHABETS.MACRO) {
+       if (key === 0x60){
+diff --git a/node_modules/aribb24.js/src/svg-provider.ts b/node_modules/aribb24.js/src/svg-provider.ts
+index 94d0f64..abfc566 100644
+--- a/node_modules/aribb24.js/src/svg-provider.ts
++++ b/node_modules/aribb24.js/src/svg-provider.ts
+@@ -19,6 +19,7 @@ import { PathElement } from './constants/mapping/additional-symbols-glyph'
+ 
+ import CRC16 from './utils/crc16-ccitt'
+ import MD5 from './utils/md5'
++import decodeJISX0213Character from './utils/jis-x0213'
+ import CRC32 from './utils/crc32'
+ 
+ const SIZE_MAGNIFICATION = 2; // 奇数の height 時に SSZ で改行を行う場合があるため、全体をN倍して半分サイズに備える
+@@ -413,6 +414,13 @@ export default class SVGProvider {
+       } else if (this.pes[begin] === JIS8.US) {
+         begin += 1
+       } else if (this.pes[begin] === JIS8.SP) {
++        // A trailing half-width space is padding, not visible caption content.
++        // Advancing without painting avoids an extra background cell at line end.
++        if (begin + 1 === end) {
++          this.move_relative_pos(1, 0)
++          begin += 1
++          continue
++        }
+         const entry = G_SET_BY_ALPHABET.get(ALPHABETS.KANJI)
+         if(!entry){ return }
+ 
+@@ -624,6 +632,8 @@ export default class SVGProvider {
+             }
+             this.sdp_x = P1 * SIZE_MAGNIFICATION
+             this.sdp_y = P2 * SIZE_MAGNIFICATION
++            // SDP は後続文字列の表示領域原点も兼ねるため、カーソルを新しい領域の先頭へ移動する。
++            this.move_absolute_dot(this.sdp_x, this.sdp_y + this.height())
+             break
+           }else if(this.pes[last] === CSI.ACPS){
+             let index = begin + 1
+@@ -880,6 +890,16 @@ export default class SVGProvider {
+ 
+       this.renderFont(character)
+ 
++      this.move_relative_pos(1, 0)
++    }else if(
++      entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_1 ||
++      entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_2
++    ) {
++      const plane = entry.alphabet === ALPHABETS.JIS_X0213_2004_KANJI_1 ? 1 : 2
++      const character = decodeJISX0213Character(key, plane)
++      if (character !== null) {
++        this.renderFont(character)
++      }
+       this.move_relative_pos(1, 0)
+     }else if(entry.alphabet === ALPHABETS.MACRO) {
+       if (key === 0x60){
+diff --git a/node_modules/aribb24.js/src/utils/jis-x0213.ts b/node_modules/aribb24.js/src/utils/jis-x0213.ts
+new file mode 100644
+index 0000000..2d34606
+--- /dev/null
++++ b/node_modules/aribb24.js/src/utils/jis-x0213.ts
+@@ -0,0 +1,19 @@
++const EUC_JP_DECODER = new TextDecoder('euc-jp', { fatal: true })
++
++/**
++ * 7ビットの区点コードで表現された JIS X 0213:2004 の漢字を Unicode へ変換する。
++ * 第1面は EUC-JP の2バイト、第2面は SS3 に続く3バイトとして復号する。
++ */
++export default function decodeJISX0213Character(key: number, plane: 1 | 2): string | null {
++  const row = ((key >> 8) & 0x7F) | 0x80
++  const cell = (key & 0x7F) | 0x80
++  const bytes = plane === 1
++    ? Uint8Array.from([row, cell])
++    : Uint8Array.from([0x8F, row, cell])
++
++  try {
++    return EUC_JP_DECODER.decode(bytes)
++  } catch {
++    return null
++  }
++}
