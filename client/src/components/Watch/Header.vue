@@ -144,7 +144,8 @@ export default defineComponent({
     height: 82px;
     padding-left: calc(68px + 30px);
     padding-right: 30px;
-    background: linear-gradient(to bottom, #000000cf, transparent);
+    color: rgb(var(--v-theme-player-on-overlay));
+    background: linear-gradient(to bottom, rgba(var(--v-theme-player-overlay), 0.92), transparent);
     transition: opacity 0.3s, visibility 0.3s;
     opacity: 0;
     visibility: hidden;
@@ -192,7 +193,7 @@ export default defineComponent({
             padding: 6px;
             margin-right: -3px;
             border-radius: 50%;
-            color: rgb(var(--v-theme-text));
+            color: rgb(var(--v-theme-player-on-overlay));
         }
         @include smartphone-horizontal {
             display: flex;
@@ -206,7 +207,7 @@ export default defineComponent({
             padding: 6px;
             margin-right: -3px;
             border-radius: 50%;
-            color: rgb(var(--v-theme-text));
+            color: rgb(var(--v-theme-player-on-overlay));
         }
         @include smartphone-vertical {
             display: flex;
@@ -220,7 +221,7 @@ export default defineComponent({
             padding: 6px;
             margin-right: -6px;
             border-radius: 50%;
-            color: rgb(var(--v-theme-text));
+            color: rgb(var(--v-theme-player-on-overlay));
         }
     }
 

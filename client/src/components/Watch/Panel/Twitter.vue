@@ -1261,7 +1261,7 @@ export default defineComponent({
             // エラー時だけ赤系の色を指定し、成功時は既存 notice の既定色を使う
             this.playerStore.event_emitter.emit('SendNotification', {
                 message: result.message,
-                color: result.is_error ? '#FF6F6A' : undefined,
+                color: result.is_error ? 'rgb(var(--v-theme-error-readable))' : undefined,
             });
         },
     }
@@ -1367,6 +1367,7 @@ export default defineComponent({
                 border-radius: 6px;
             }
             &--active {
+                color: rgb(var(--v-theme-on-twitter));
                 background: rgb(var(--v-theme-twitter));
             }
 
@@ -1451,7 +1452,7 @@ export default defineComponent({
                 height: 100%;
                 flex-grow: 1;
                 font-size: 12.5px;
-                color: rgb(var(--v-theme-twitter-lighten-2));
+                color: rgb(var(--v-theme-twitter-readable));
                 outline: none;
                 @include smartphone-horizontal {
                     width: calc(100% - 22px);
@@ -1479,7 +1480,7 @@ export default defineComponent({
                     }
                 }
                 &::placeholder {
-                    color: rgba(65, 165, 241, 60%);
+                    color: rgb(var(--v-theme-twitter-readable));
                 }
             }
             &-list-button {
@@ -1493,7 +1494,7 @@ export default defineComponent({
                 height: 34px;
                 padding: 6px;
                 border-radius: 50%;
-                color: rgb(var(--v-theme-twitter-lighten-2));
+                color: rgb(var(--v-theme-twitter-readable));
                 cursor: pointer;
                 @include smartphone-horizontal {
                     right: -11px;
@@ -1716,10 +1717,10 @@ export default defineComponent({
                         }
                     }
                     &--yellow {
-                        color: rgb(var(--v-theme-warning));
+                        color: rgb(var(--v-theme-warning-readable));
                     }
                     &--red {
-                        color: rgb(var(--v-theme-error));
+                        color: rgb(var(--v-theme-error-readable));
                     }
                 }
             }
@@ -1801,7 +1802,7 @@ export default defineComponent({
                 border-radius: 7px;
                 font-size: 12.5px;
                 line-height: 2;
-                color: rgb(var(--v-theme-text));
+                color: rgb(var(--v-theme-on-twitter));
                 background: rgb(var(--v-theme-twitter));
                 user-select: none;
                 outline: none;
@@ -2112,7 +2113,7 @@ export default defineComponent({
                     display: block;
                     flex-grow: 1;
                     border-radius: 2px;
-                    color: rgb(var(--v-theme-twitter-lighten-2));
+                    color: rgb(var(--v-theme-twitter-readable));
                     opacity: 1;
                     outline: none;
                     cursor: pointer;
@@ -2268,7 +2269,7 @@ export default defineComponent({
                 position: absolute;
                 left: 0px;
                 bottom: 0px;
-                color: #fff;
+                color: rgb(var(--v-theme-on-twitter));
                 line-height: 0;
 
                 &--twitter,
@@ -2491,7 +2492,7 @@ export default defineComponent({
             }
             &__check {
                 flex-shrink: 0;
-                color: rgb(var(--v-theme-twitter-lighten-1));
+                color: rgb(var(--v-theme-twitter-readable-hover));
             }
         }
     }

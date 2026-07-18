@@ -82,7 +82,7 @@
                                     class="navigation-analysis__status-dot"
                                     :class="`navigation-analysis__status-dot--${analysisTasksStore.activeTaskStatus}`"></span>
                             </span>
-                            <span v-if="!iconOnly" class="navigation__link-text">バックグラウンド処理</span>
+                            <span v-if="!iconOnly" class="navigation__link-text navigation__link-text--utility">バックグラウンド処理</span>
                             <small v-if="!iconOnly && analysisTasksStore.activeTaskStatus !== null"
                                 class="navigation-analysis__status-label">
                                 {{analysisTasksStore.activeTaskStatus === 'Running' ? '実行中' : '待機中'}}
@@ -110,7 +110,7 @@
                         }"
                         v-ftooltip.right="iconOnly ? '設定' : ''">
                         <Icon class="navigation__link-icon" icon="fluent:settings-20-regular" width="26px" />
-                        <span v-if="!iconOnly" class="navigation__link-text">設定</span>
+                        <span v-if="!iconOnly" class="navigation__link-text navigation__link-text--utility">設定</span>
                     </router-link>
                     <a v-ripple class="navigation__link" active-class="navigation__link--active"
                         href="https://github.com/tsukumijima/KonomiTV" target="_blank"
@@ -293,13 +293,24 @@ export default defineComponent({
                 }
                 &--active {
                     color: rgb(var(--v-theme-primary));
-                    background: #5b2d3c;
+                    background: rgb(var(--v-theme-navigation-active));
+
+                    // アイコンのアクセント色は維持し、ラベルだけ背景に対して十分読める色へ分ける
+                    .navigation__link-text--utility {
+                        color: rgb(var(--v-theme-navigation-active-text));
+                    }
                     &:hover {
-                        background: #5b2d3c;
+                        background: rgb(var(--v-theme-navigation-active));
                     }
                 }
                 &--highlight {
-                    color: rgb(var(--v-theme-secondary-lighten-1));
+                    color: rgb(var(--v-theme-secondary-readable));
+
+                    // 更新通知時は version とコミット表示も、親リンクの強調色に合わせる
+                    .navigation__link-version,
+                    .navigation__link-commit {
+                        color: inherit;
+                    }
                 }
                 &--develop-version {
                     font-size: 15px;
@@ -426,14 +437,15 @@ export default defineComponent({
                 .navigation__link-version {
                     display: flex;
                     flex-direction: column;
+                    color: rgb(var(--v-theme-text-darken-1));
                     line-height: 1.15;
                 }
 
                 .navigation__link-commit {
                     margin-top: 3px;
+                    color: rgb(var(--v-theme-text-darken-2));
                     font-family: monospace;
                     font-size: 11px;
-                    opacity: 0.65;
                 }
 
                 // アイコンのみモード: 正方形のアイコンボタンに変更

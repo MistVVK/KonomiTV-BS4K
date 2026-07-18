@@ -17,7 +17,7 @@
                 <button v-ripple class="timeline-header__settings" @click="toggleSettings">
                     <Icon icon="fluent:settings-16-filled" width="20" />
                 </button>
-                <button v-ripple class="timeline-header__refresh" style="color: rgb(var(--v-theme-twitter-lighten-1))" @click="fetchTimelineTweets"
+                <button v-ripple class="timeline-header__refresh" @click="fetchTimelineTweets"
                     v-ftooltip.bottom="'タイムラインを更新'">
                     <Icon icon="ic:round-refresh" width="20" :class="isFetching ? 'animate-spin' : ''" />
                 </button>
@@ -910,6 +910,7 @@ onUnmounted(() => {
 
     &__refresh {
         margin-left: 6px;
+        color: rgb(var(--v-theme-on-twitter)) !important;
         background-color: rgb(var(--v-theme-twitter));
     }
 }
@@ -993,7 +994,7 @@ onUnmounted(() => {
     padding: 8px;
     background-color: rgba(var(--v-theme-background-lighten-2), 0.5);
     border-bottom: 1px solid rgba(var(--v-theme-on-surface), 0.12);
-    color: rgb(var(--v-theme-twitter));
+    color: rgb(var(--v-theme-twitter-readable));
     font-size: 13px;
     transition: background-color 0.15s ease;
     cursor: pointer;

@@ -62,11 +62,11 @@
                 </v-select>
             </div>
             <div class="settings__item">
-                <div class="settings__item-heading text-error-lighten-1">データ放送の保存データをリセット</div>
+                <div class="settings__item-heading text-error-readable">データ放送の保存データをリセット</div>
                 <div class="settings__item-label">
                     このデバイス（ブラウザ）に保存されているデータ放送の保存データを、初期状態にリセット (消去) できます。<br>
                     保存データには、データ放送内のミニゲームの得点、プレゼント企画のスタンプ個数、設定などが含まれます。<br>
-                    <strong class="text-error-lighten-1">保存データをリセットすると、元に戻すことはできません。十分ご注意ください。</strong><br>
+                    <strong class="text-error-readable">保存データをリセットすると、元に戻すことはできません。十分ご注意ください。</strong><br>
                 </div>
             </div>
             <v-btn class="settings__save-button bg-error mt-5" variant="flat" @click="resetNVRAMSettings()">

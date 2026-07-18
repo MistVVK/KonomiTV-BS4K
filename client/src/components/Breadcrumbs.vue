@@ -45,13 +45,13 @@ defineProps<{
         }
 
         &--disabled {
-            color: #b8aead;
+            color: rgb(var(--v-theme-text-darken-1));
             cursor: default;
             pointer-events: none;
         }
 
         &-separator {
-            color: #b8aead;
+            color: rgb(var(--v-theme-text-darken-1));
             margin-left: 2px;
             margin-right: 4px;
         }

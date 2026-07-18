@@ -139,7 +139,7 @@ onUnmounted(() => {
                     display: flex;
                 }
                 &-highlight {
-                    color: rgb(var(--v-theme-secondary-lighten-1)) !important;
+                    color: rgb(var(--v-theme-secondary-readable)) !important;
                 }
             }
         }
@@ -216,6 +216,7 @@ onUnmounted(() => {
                 height: 24px;
             margin-left: 10px;
             border-radius: 4px;
+            color: rgb(var(--v-theme-on-secondary));
             background: rgb(var(--v-theme-secondary));
             font-size: 11.5px;
             font-weight: 500;

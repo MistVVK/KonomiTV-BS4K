@@ -14,7 +14,7 @@
                     管理者ユーザーには、サーバー設定やアカウントの管理権限が与えられます。<br>
                     変更内容はすぐに反映されます。<br>
                 </div>
-                <div class="user-manage-settings__label text-error-lighten-1">
+                <div class="user-manage-settings__label text-error-readable">
                     <strong>アカウントを削除すると、そのアカウントに紐づくすべてのユーザーデータが削除されます。元に戻すことはできません。</strong>
                 </div>
                 <div class="user-manage-settings__label"
@@ -286,6 +286,7 @@ function deleteAccount() {
             flex-shrink: 0;
             width: 40px;
             height: 40px;
+            color: rgb(var(--v-theme-on-error));
             background-color: rgb(var(--v-theme-error));
             margin-left: 16px;
             border-radius: 5px;

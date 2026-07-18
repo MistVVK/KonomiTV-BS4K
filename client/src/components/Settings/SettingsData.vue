@@ -11,12 +11,12 @@
             <Icon icon="fa6-solid:download" class="mr-3" height="19px" />設定をエクスポート
         </v-btn>
         <div class="settings__item">
-            <div class="settings__item-heading text-error-lighten-1">設定をインポート</div>
+            <div class="settings__item-heading text-error-readable">設定をインポート</div>
             <div class="settings__item-label">
                 [設定をエクスポート] でダウンロードした設定データを、このデバイス (ブラウザ) にインポートできます。<br>
                 マイリスト・視聴履歴を含めてインポートするかは、ボタンを押した後の確認ダイヤログで選択できます。<br>
-                <strong class="text-error-lighten-1">設定をインポートすると、現在のデバイス設定はすべて上書きされます。元に戻すことはできません。</strong><br>
-                <strong class="text-error-lighten-1">設定のデバイス間同期がオンのときは、同期が有効なすべてのデバイスに反映されます。</strong>十分ご注意ください。<br>
+                <strong class="text-error-readable">設定をインポートすると、現在のデバイス設定はすべて上書きされます。元に戻すことはできません。</strong><br>
+                <strong class="text-error-readable">設定のデバイス間同期がオンのときは、同期が有効なすべてのデバイスに反映されます。</strong>十分ご注意ください。<br>
             </div>
             <v-file-input class="settings__item-form" color="primary" variant="outlined" hide-details
                 label="設定データ (KonomiTV-Settings.json) を選択"
@@ -51,12 +51,12 @@
                     </div>
                 </v-card-text>
                 <div class="d-flex flex-column px-4 pb-6 import-settings-dialog">
-                    <v-btn class="settings__save-button text-error-lighten-1" color="background-lighten-1" variant="flat"
+                    <v-btn class="settings__save-button text-error-readable" color="background-lighten-1" variant="flat"
                         @click="executeImport(true)">
                         <Icon icon="fluent:document-arrow-down-16-filled" class="mr-2" height="22px" />
                         マイリスト・視聴履歴を<br class="smartphone-vertical-only">上書きしてインポート
                     </v-btn>
-                    <v-btn class="settings__save-button text-error-lighten-1 mt-3" color="background-lighten-1" variant="flat"
+                    <v-btn class="settings__save-button text-error-readable mt-3" color="background-lighten-1" variant="flat"
                         @click="executeImport(false)">
                         <Icon icon="fluent:document-checkmark-16-filled" class="mr-2" height="22px" />
                         マイリスト・視聴履歴は<br class="smartphone-vertical-only">維持してインポート
@@ -70,11 +70,11 @@
             </v-card>
         </v-dialog>
         <div class="settings__item">
-            <div class="settings__item-heading text-error-lighten-1">設定を初期状態にリセット</div>
+            <div class="settings__item-heading text-error-readable">設定を初期状態にリセット</div>
             <div class="settings__item-label">
                 このデバイス (ブラウザ) に保存されている設定データを、初期状態のデフォルト値にリセットできます。<br>
-                <strong class="text-error-lighten-1">設定をリセットすると、元に戻すことはできません。</strong><br>
-                <strong class="text-error-lighten-1">設定のデバイス間同期がオンのときは、同期が有効なすべてのデバイスに反映されます。</strong>十分ご注意ください。<br>
+                <strong class="text-error-readable">設定をリセットすると、元に戻すことはできません。</strong><br>
+                <strong class="text-error-readable">設定のデバイス間同期がオンのときは、同期が有効なすべてのデバイスに反映されます。</strong>十分ご注意ください。<br>
             </div>
         </div>
         <v-btn class="settings__save-button bg-error mt-5" variant="flat" @click="resetSettings()">

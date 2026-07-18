@@ -855,7 +855,11 @@ export default defineComponent({
                     color: rgb(var(--v-theme-primary));
                 }
                 &--my-post {
-                    color: rgb(var(--v-theme-secondary-lighten-2));
+                    padding-left: 7px;
+                    color: rgb(var(--v-theme-text));
+                    box-shadow:
+                        inset 3px 0 0 rgb(var(--v-theme-comment-own)),
+                        inset 4px 0 0 rgb(var(--v-theme-comment-own-outline));
                 }
 
                 &__text {
@@ -925,6 +929,7 @@ export default defineComponent({
         height: 42px;
         margin: 0 auto;
         border-radius: 50%;
+        color: rgb(var(--v-theme-on-primary));
         background: rgb(var(--v-theme-primary));
         transition: background-color 0.15s, opacity 0.3s, visibility 0.3s;
         visibility: hidden;

@@ -53,10 +53,10 @@
                     AVC は互換性を、HEVC は通信量の削減を優先します。HEVC 非対応環境では再生時だけ AVC に戻します。<br>
                 </div>
                 <div class="settings__item-label mt-1">
-                    <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === false">
+                    <p class="mt-1 mb-0 text-error-readable" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === false">
                         このデバイスでは HEVC がサポートされていません。
                     </p>
-                    <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === true">
+                    <p class="mt-1 mb-0 text-error-readable" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === true">
                         お使いの Firefox ブラウザでは HEVC がサポートされていません。
                     </p>
                 </div>

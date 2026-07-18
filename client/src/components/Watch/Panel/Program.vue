@@ -745,13 +745,13 @@ export default defineComponent({
             }
 
             &-force--festival {
-                color: #E7556E;
+                color: rgb(var(--v-theme-jikkyo-festival-readable));
             }
             &-force--so-many {
-                color: #E76B55;
+                color: rgb(var(--v-theme-jikkyo-so-many-readable));
             }
             &-force--many {
-                color: #E7A355;
+                color: rgb(var(--v-theme-jikkyo-many-readable));
             }
         }
     }
@@ -792,7 +792,7 @@ export default defineComponent({
 
                 // リンクの色
                 :deep(a:link), :deep(a:visited) {
-                    color: rgb(var(--v-theme-primary-lighten-1));
+                    color: rgb(var(--v-theme-primary-readable-hover));
                     text-decoration: underline;
                     text-underline-offset: 3px;  // 下線と字の間隔を空ける
                 }
@@ -824,12 +824,12 @@ export default defineComponent({
 
     // 録画中の警告 (エラー色)
     &--recording {
-        background-color: rgba(var(--v-theme-error-darken-3), 0.5);
+        background-color: rgba(var(--v-theme-error), 0.16);
         .warning-banner__icon {
-            color: rgb(var(--v-theme-error));
+            color: rgb(var(--v-theme-error-readable));
         }
         .warning-banner__text {
-            color: rgb(var(--v-theme-error-lighten-1));
+            color: rgb(var(--v-theme-error-readable));
         }
     }
 }

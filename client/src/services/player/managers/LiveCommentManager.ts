@@ -103,7 +103,7 @@ class LiveCommentManager implements PlayerManager {
             // 通常発生しないエラーメッセージ (サーバーエラーなど) はプレイヤー側にも通知する
             if (watch_session_info.detail !== 'このチャンネルはニコニコ実況に対応していません。') {
                 if (this.player.template.notice.textContent!.includes('再起動しています…') === false) {
-                    this.player.notice(watch_session_info.detail, undefined, undefined, '#FF6F6A');
+                    this.player.notice(watch_session_info.detail, undefined, undefined, 'rgb(var(--v-theme-error-readable))');
                 }
             }
             return;
@@ -179,7 +179,7 @@ class LiveCommentManager implements PlayerManager {
             // ニコニコ生放送からエラーが返された: 普通発生しないため警告メッセージとして表示
             } else if (websocket_info.nicolive_watch_session_error !== null) {
                 console.warn(`[LiveCommentManager][WatchSession] Failed to get Nicolive watch session URL. (${websocket_info.nicolive_watch_session_error})`);
-                this.player.notice(`${websocket_info.nicolive_watch_session_error}代わりに NX-Jikkyo にコメントします。`, undefined, undefined, '#FFA86A');
+                this.player.notice(`${websocket_info.nicolive_watch_session_error}代わりに NX-Jikkyo にコメントします。`, undefined, undefined, 'rgb(var(--v-theme-warning-readable))');
             }
         }
 
@@ -213,7 +213,7 @@ class LiveCommentManager implements PlayerManager {
             // 接続切断の理由を表示
             const code = (event instanceof CloseEvent) ? event.code : 'Error';
             if (this.player.template.notice.textContent!.includes('再起動しています…') === false) {
-                this.player.notice(`${this.watch_session_type}との接続が切断されました。(Code: ${code})`, undefined, undefined, '#FF6F6A');
+                this.player.notice(`${this.watch_session_type}との接続が切断されました。(Code: ${code})`, undefined, undefined, 'rgb(var(--v-theme-error-readable))');
             }
             console.error(`[LiveCommentManager][WatchSession] Connection closed. (Code: ${code})`);
 
@@ -300,7 +300,7 @@ class LiveCommentManager implements PlayerManager {
 
                     // エラー情報を表示
                     if (this.player.template.notice.textContent!.includes('再起動しています…') === false) {
-                        this.player.notice(error, undefined, undefined, '#FF6F6A');
+                        this.player.notice(error, undefined, undefined, 'rgb(var(--v-theme-error-readable))');
                     }
                     console.error(`[LiveCommentManager][WatchSession] Error occurred. (Code: ${message.data.code})`);
 
@@ -359,7 +359,7 @@ class LiveCommentManager implements PlayerManager {
 
                     // 接続切断の理由を表示
                     if (this.player.template.notice.textContent!.includes('再起動しています…') === false) {
-                        this.player.notice(disconnect_reason, undefined, undefined, '#FF6F6A');
+                        this.player.notice(disconnect_reason, undefined, undefined, 'rgb(var(--v-theme-error-readable))');
                     }
                     console.error(`[LiveCommentManager][WatchSession] Disconnected. (Reason: ${message.data.reason})`);
 
@@ -484,7 +484,7 @@ class LiveCommentManager implements PlayerManager {
             // 接続切断の理由を表示
             const code = (event instanceof CloseEvent) ? event.code : 'Error';
             if (this.player.template.notice.textContent!.includes('再起動しています…') === false) {
-                this.player.notice(`NX-Jikkyo との接続が切断されました。(Code: ${code})`, undefined, undefined, '#FF6F6A');
+                this.player.notice(`NX-Jikkyo との接続が切断されました。(Code: ${code})`, undefined, undefined, 'rgb(var(--v-theme-error-readable))');
             }
             console.error(`[LiveCommentManager][CommentSession] Connection closed. (Code: ${code})`);
 
@@ -632,10 +632,10 @@ class LiveCommentManager implements PlayerManager {
         if (settings_store.settings.prefer_posting_to_nicolive === true) {
             if (user_store.user === null) {
                 this.player.notice('ニコニコ実況にコメントするには、KonomiTV アカウントにログインしてください。代わりに NX-Jikkyo にコメントします。',
-                    undefined, undefined, '#FFA86A');
+                    undefined, undefined, 'rgb(var(--v-theme-warning-readable))');
             } else if (user_store.user.niconico_user_id === null) {
                 this.player.notice('ニコニコ実況にコメントするには、ニコニコアカウントと連携してください。代わりに NX-Jikkyo にコメントします。',
-                    undefined, undefined, '#FFA86A');
+                    undefined, undefined, 'rgb(var(--v-theme-warning-readable))');
             }
         }
 
@@ -795,7 +795,7 @@ class LiveCommentManager implements PlayerManager {
 
             // 無条件にエラーメッセージをプレイヤーに通知
             if (this.player.template.notice.textContent!.includes('再起動しています…') === false) {
-                this.player.notice(watch_session_info.detail, undefined, undefined, '#FF6F6A');
+                this.player.notice(watch_session_info.detail, undefined, undefined, 'rgb(var(--v-theme-error-readable))');
             }
 
             // 視聴セッションへの接続情報自体を取得できなかったので再接続を諦める

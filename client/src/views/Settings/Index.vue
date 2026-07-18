@@ -109,7 +109,7 @@ const settingsNavigationCategories = SETTINGS_NAVIGATION_CATEGORIES;
                     display: flex;
                 }
                 &-highlight {
-                    color: rgb(var(--v-theme-secondary-lighten-1)) !important;
+                    color: rgb(var(--v-theme-secondary-readable)) !important;
                 }
             }
         }

@@ -7,6 +7,7 @@ import KeyboardShortcutManager from '@/services/player/managers/KeyboardShortcut
 import LiveDataBroadcastingManager from '@/services/player/managers/LiveDataBroadcastingManager';
 import PlayerManager from '@/services/player/PlayerManager';
 import usePlayerStore from '@/stores/PlayerStore';
+import useSettingsStore from '@/stores/SettingsStore';
 
 
 /**
@@ -60,6 +61,7 @@ class DocumentPiPManager implements PlayerManager {
      */
     public async init(): Promise<void> {
         const player_store = usePlayerStore();
+        const settings_store = useSettingsStore();
 
         // Document Picture-in-Picture API がサポートされていない場合は何もしない
         if (('documentPictureInPicture' in window) === false) {
@@ -142,6 +144,18 @@ class DocumentPiPManager implements PlayerManager {
             pip_window.document.body.classList.add('watch-container');
             pip_window.document.body.classList.add('watch-container--fullscreen');
 
+            // コピー済みの Vuetify テーマ定義から現在のテーマを選び、PiP を開いたままの設定変更にも追従する
+            const apply_theme = (theme_name: string): void => {
+                for (const class_name of [...pip_window.document.body.classList]) {
+                    if (class_name.startsWith('v-theme--')) {
+                        pip_window.document.body.classList.remove(class_name);
+                    }
+                }
+                pip_window.document.body.classList.add(`v-theme--${theme_name}`);
+            };
+            apply_theme(settings_store.settings.ui_theme);
+            const stop_theme_watcher = watch(() => settings_store.settings.ui_theme, apply_theme);
+
             // player_store.is_control_display が変更された時に .watch-container--control-display クラスを追加・削除する
             const stop_control_display_watcher = watch(() => player_store.is_control_display, (value) => {
                 if (value) {
@@ -201,6 +215,8 @@ class DocumentPiPManager implements PlayerManager {
                 player_store.is_document_pip = false;
                 // is_control_display の watcher を停止
                 stop_control_display_watcher();
+                // カラーテーマの watcher を停止
+                stop_theme_watcher();
                 // キーボードショートカットを削除
                 keyboard_shortcut_manager.destroy();  // 完了を待たない
                 // メインウインドウ側の「ピクチャー イン ピクチャーを再生しています」テキストを削除

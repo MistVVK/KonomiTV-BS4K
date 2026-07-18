@@ -44,7 +44,7 @@ import Snackbars from '@/components/Snackbars.vue';
 
 // 選択時の色
 *::selection {
-	background-color: #E64F9780;
+	background-color: rgba(var(--v-theme-accent), 0.35);
 }
 
 // リンクの既定の CSS をリセット
@@ -114,6 +114,11 @@ html {
     --timetable-genre-background-ochre: #fdf5e2;
     --timetable-genre-highlight-brown: #a3421f;
     --timetable-genre-background-brown: #fff2eb;
+    // 予約状態と現在時刻線は番組表固有の意味色として、画面テーマのアクセント色から分離する
+    --timetable-reservation-active: #e33157;
+    --timetable-reservation-disabled: #8e7f7e;
+    --timetable-current-time: #e33157;
+    --timetable-current-time-shadow: rgba(227, 49, 87, 0.5);
 }
 
 // アプリケーションのルート
@@ -263,7 +268,7 @@ body .route-container {
 // スライダーのつまみのラベルの色を Vuetify 2 に合わせる
 .v-slider-thumb__label {
     background: rgb(var(--v-theme-primary)) !important;
-    color: rgb(var(--v-theme-text)) !important;
+    color: rgb(var(--v-theme-on-primary)) !important;
     &:before {
         color: rgb(var(--v-theme-primary)) !important;
     }
@@ -285,13 +290,18 @@ body .route-container {
 
 // リンク用のスタイル
 .link {
-    color: rgb(var(--v-theme-primary)) !important;
+    color: rgb(var(--v-theme-primary-readable)) !important;
     text-decoration: underline !important;
     cursor: pointer;
 
     &:visited {
-        color: rgb(var(--v-theme-primary-darken-1)) !important;
+        color: rgb(var(--v-theme-primary-readable-hover)) !important;
     }
+}
+
+// 背景としても使う機能色の段階色とは分け、ダーク／ライト双方で読める警告文字色を使う
+.text-error-readable {
+    color: rgb(var(--v-theme-error-readable)) !important;
 }
 
 // 番組情報内の囲み文字の装飾
@@ -304,7 +314,7 @@ body .route-container {
     margin-left: 2.5px;
     margin-right: 2.5px;
     border-radius: 4px;
-    color: rgb(var(--v-theme-text));
+    color: rgb(var(--v-theme-on-primary));
     background: rgb(var(--v-theme-primary));
     font-size: 0.94em;
 

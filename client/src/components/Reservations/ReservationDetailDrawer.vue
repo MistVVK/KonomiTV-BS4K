@@ -635,40 +635,40 @@ const handleAddReservation = async () => {
 
     // キーワード自動予約の警告（警告色）
     &--keyword {
-        background-color: rgb(var(--v-theme-warning-darken-3), 0.5);
+        background-color: rgb(var(--v-theme-warning), 0.16);
 
         .warning-banner__icon {
-            color: rgb(var(--v-theme-warning));
+            color: rgb(var(--v-theme-warning-readable));
         }
 
         .warning-banner__text {
-            color: rgb(var(--v-theme-warning-lighten-1));
+            color: rgb(var(--v-theme-warning-readable));
         }
     }
 
     // 録画中の警告（エラー色）
     &--recording {
-        background-color: rgb(var(--v-theme-error-darken-3), 0.5);
+        background-color: rgb(var(--v-theme-error), 0.16);
 
         .warning-banner__icon {
-            color: rgb(var(--v-theme-error));
+            color: rgb(var(--v-theme-error-readable));
         }
 
         .warning-banner__text {
-            color: rgb(var(--v-theme-error-lighten-1));
+            color: rgb(var(--v-theme-error-readable));
         }
     }
 
     // 通常の警告（情報色）
     &--normal {
-        background-color: rgb(var(--v-theme-info-darken-3), 0.5);
+        background-color: rgb(var(--v-theme-info), 0.16);
 
         .warning-banner__icon {
-            color: rgb(var(--v-theme-info));
+            color: rgb(var(--v-theme-info-readable));
         }
 
         .warning-banner__text {
-            color: rgb(var(--v-theme-info-lighten-1));
+            color: rgb(var(--v-theme-info-readable));
         }
     }
 }
@@ -696,40 +696,40 @@ const handleAddReservation = async () => {
 
     // 警告（一部のみ録画）
     &--warning {
-        background-color: rgb(var(--v-theme-warning-darken-3), 0.4);
+        background-color: rgb(var(--v-theme-warning), 0.14);
 
         .status-banner__icon {
-            color: rgb(var(--v-theme-warning));
+            color: rgb(var(--v-theme-warning-readable));
         }
 
         .status-banner__text {
-            color: rgb(var(--v-theme-warning-lighten-1));
+            color: rgb(var(--v-theme-warning-readable));
         }
     }
 
     // エラー（録画不可）
     &--error {
-        background-color: rgb(var(--v-theme-error-darken-3), 0.4);
+        background-color: rgb(var(--v-theme-error), 0.14);
 
         .status-banner__icon {
-            color: rgb(var(--v-theme-error));
+            color: rgb(var(--v-theme-error-readable));
         }
 
         .status-banner__text {
-            color: rgb(var(--v-theme-error-lighten-1));
+            color: rgb(var(--v-theme-error-readable));
         }
     }
 
     // 情報（Mirakurun バックエンド通知など）
     &--info {
-        background-color: rgb(var(--v-theme-info-darken-3), 0.4);
+        background-color: rgb(var(--v-theme-info), 0.14);
 
         .status-banner__icon {
-            color: rgb(var(--v-theme-info));
+            color: rgb(var(--v-theme-info-readable));
         }
 
         .status-banner__text {
-            color: rgb(var(--v-theme-info-lighten-1));
+            color: rgb(var(--v-theme-info-readable));
         }
     }
 }

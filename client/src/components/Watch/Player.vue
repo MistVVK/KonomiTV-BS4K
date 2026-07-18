@@ -178,7 +178,13 @@ const handleSettingCoverClick = () => {
         overflow: visible !important;
     }
     svg circle, svg path {
-        fill: rgb(var(--v-theme-text)) !important;
+        fill: rgb(var(--v-theme-player-on-overlay)) !important;
+    }
+    .dplayer-bezel {
+        color: rgb(var(--v-theme-player-on-overlay));
+        .dplayer-bezel-icon {
+            background: rgba(var(--v-theme-player-overlay), 0.82) !important;
+        }
     }
     .dplayer-video-wrap {
         background: transparent !important;
@@ -217,7 +223,7 @@ const handleSettingCoverClick = () => {
     }
     .dplayer-controller-mask {
         height: 82px !important;
-        background: linear-gradient(to bottom, transparent, #000000cf) !important;
+        background: linear-gradient(to bottom, transparent, rgba(var(--v-theme-player-overlay), 0.92)) !important;
         opacity: 0 !important;
         visibility: hidden;
         transition: opacity 0.3s ease, visibility 0.3s ease !important;
@@ -229,6 +235,12 @@ const handleSettingCoverClick = () => {
         }
         @include smartphone-vertical {
             height: 66px !important;
+        }
+    }
+    .dplayer-bar-wrap .dplayer-bar {
+        background: rgba(var(--v-theme-player-on-overlay), 0.2) !important;
+        .dplayer-loaded {
+            background: rgb(var(--v-theme-player-on-overlay)) !important;
         }
     }
 
@@ -270,11 +282,11 @@ const handleSettingCoverClick = () => {
             bottom: auto !important;
             &.dplayer-icons-left {
                 .dplayer-time, .dplayer-live-badge {
-                    color: rgb(var(--v-theme-text)) !important;
+                    color: rgb(var(--v-theme-player-on-overlay)) !important;
                 }
                 .dplayer-volume {
                     .dplayer-volume-bar {
-                        background: rgb(var(--v-theme-text)) !important;
+                        background: rgb(var(--v-theme-player-on-overlay)) !important;
                     }
                     // Document Picture-in-Picture ウインドウでは非表示
                     @media all and (display-mode: picture-in-picture) {
@@ -371,11 +383,16 @@ const handleSettingCoverClick = () => {
                 z-index: 5;
             }
             .dplayer-comment-input {
+                color: rgb(var(--v-theme-player-on-overlay)) !important;
+                background: rgba(var(--v-theme-player-overlay), 0.88) !important;
+                &::placeholder {
+                    color: rgb(var(--v-theme-player-on-overlay)) !important;
+                }
                 transition: box-shadow 0.09s ease;
                 appearance: none;
                 -webkit-appearance: none;
                 &:focus {
-                    box-shadow: rgba(79, 130, 230, 60%) 0 0 0 3.5px;
+                    box-shadow: rgb(var(--v-theme-accent)) 0 0 0 3.5px;
                 }
                 // iOS Safari でフォーカス時にズームされる問題への対処
                 @supports (-webkit-touch-callout: none) {
@@ -403,6 +420,8 @@ const handleSettingCoverClick = () => {
         border-radius: 4px !important;
         font-size: 15px !important;
         line-height: 1.6;
+        color: rgb(var(--v-theme-player-on-overlay));
+        background: rgba(var(--v-theme-player-overlay), 0.92) !important;
         @include tablet-vertical {
             top: auto;
             left: 16px !important;
@@ -425,12 +444,43 @@ const handleSettingCoverClick = () => {
     }
     .dplayer-info-panel {
         transition: top 0.3s, left 0.3s;
+        color: rgb(var(--v-theme-player-on-overlay)) !important;
+        background: rgba(var(--v-theme-player-overlay), 0.92) !important;
     }
     .dplayer-setting-box {
         z-index: 10 !important;
+        color: rgb(var(--v-theme-player-on-overlay)) !important;
+        background: rgba(var(--v-theme-player-overlay), 0.96) !important;
         // 長い音声トラック名（言語・Dual Mono・主副音声）が途中で切れないようにする
         width: 280px;
         max-width: calc(100% - 40px);
+        .dplayer-label,
+        .dplayer-label-value {
+            color: rgb(var(--v-theme-player-on-overlay)) !important;
+        }
+        .dplayer-setting-item:hover,
+        .dplayer-setting-quality-item:hover,
+        .dplayer-setting-speed-item:hover,
+        .dplayer-setting-audio-item:hover,
+        .dplayer-setting-video-codec-item:hover,
+        .dplayer-setting-header:hover {
+            background: rgba(var(--v-theme-primary), 0.12) !important;
+        }
+        .dplayer-setting-origin-panel,
+        .dplayer-setting-quality-panel,
+        .dplayer-setting-speed-panel,
+        .dplayer-setting-audio-panel {
+            scrollbar-color: rgba(var(--v-theme-player-on-overlay), 0.24) transparent;
+            &::-webkit-scrollbar-thumb {
+                background: rgba(var(--v-theme-player-on-overlay), 0.24) !important;
+            }
+        }
+        .dplayer-setting-header {
+            border-bottom-color: rgba(var(--v-theme-player-on-overlay), 0.15) !important;
+        }
+        .dplayer-danmaku-bar {
+            background: rgb(var(--v-theme-player-on-overlay)) !important;
+        }
         @include tablet-vertical {
             height: calc(100% - 60px) !important;
         }
@@ -490,15 +540,26 @@ const handleSettingCoverClick = () => {
     }
     .dplayer-comment-setting-box {
         z-index: 10 !important;
+        color: rgb(var(--v-theme-player-on-overlay)) !important;
+        background: rgba(var(--v-theme-player-overlay), 0.96) !important;
+        scrollbar-color: rgba(var(--v-theme-player-on-overlay), 0.24) transparent;
+        &::-webkit-scrollbar-thumb {
+            background: rgba(var(--v-theme-player-on-overlay), 0.24) !important;
+        }
+        input {
+            color: rgb(var(--v-theme-player-on-overlay)) !important;
+        }
         .dplayer-comment-setting-title {
-            color: rgb(var(--v-theme-text));
+            color: rgb(var(--v-theme-player-on-overlay));
         }
         .dplayer-comment-setting-type, .dplayer-comment-setting-size {
             span {
-                border: 1px solid rgb(var(--v-theme-text));
+                color: rgb(var(--v-theme-player-on-overlay));
+                border: 1px solid rgb(var(--v-theme-player-on-overlay));
             }
             input:checked + span {
-                background: rgb(var(--v-theme-text));
+                background: rgb(var(--v-theme-player-on-overlay));
+                color: rgb(var(--v-theme-player-overlay));
             }
         }
     }
@@ -706,6 +767,8 @@ _::-webkit-full-page-media, _:future, :root .dplayer-subtitle-icon[aria-label='�
                 height: 34px;
                 right: 56px;
                 bottom: 44px;
+                // プレイヤー背景は選択テーマにかかわらず暗いため、SVG の白文字を常に使用する
+                color-scheme: dark;
                 filter: drop-shadow(0px 0px 5px rgb(var(--v-theme-black)));
 
                 @include tablet-vertical {
@@ -787,8 +850,8 @@ _::-webkit-full-page-media, _:future, :root .dplayer-subtitle-icon[aria-label='�
             align-items: center;
             width: 48px;
             height: 48px;
-            color: rgb(var(--v-theme-text));
-            background: #2F221FC0;
+            color: rgb(var(--v-theme-player-on-overlay));
+            background: rgba(var(--v-theme-player-overlay), 0.82);
             border-radius: 7px;
             transition: background-color 0.15s;
             user-select: none;
@@ -805,12 +868,12 @@ _::-webkit-full-page-media, _:future, :root .dplayer-subtitle-icon[aria-label='�
             }
 
             &:hover {
-                background: #2F221FF0;
+                background: rgba(var(--v-theme-player-overlay), 0.95);
             }
             // タッチデバイスで hover を無効にする
             @media (hover: none) {
                 &:hover {
-                    background: #2F221FC0;
+                    background: rgba(var(--v-theme-player-overlay), 0.82);
                 }
             }
 

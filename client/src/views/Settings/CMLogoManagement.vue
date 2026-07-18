@@ -44,7 +44,7 @@
                         <strong>{{logo.logo_name || logo.filename}}</strong>
                         <span>{{logo.filename}}</span>
                         <small>{{logo.service_id === null ? 'SID 未割り当て' : `SID ${logo.service_id}`}} · {{formatSize(logo.file_size)}}</small>
-                        <small v-if="logo.missing" class="text-error-lighten-1">missing / 外部削除済み</small>
+                        <small v-if="logo.missing" class="text-error-readable">missing / 外部削除済み</small>
                         <small v-else-if="!logo.enabled">無効</small>
                     </div>
                 </button>
@@ -86,7 +86,7 @@
                     <v-btn v-if="!selected_logo.missing" class="mt-6" color="error" variant="flat" @click="deleteSelectedLogo()">
                         共有 .lgd を削除
                     </v-btn>
-                    <div class="settings__item-label mt-2 text-error-lighten-1">
+                    <div class="settings__item-label mt-2 text-error-readable">
                         共有ファイルを削除すると、同じフォルダを参照する外部ツールからも利用できなくなります。履歴は missing として残ります。
                     </div>
                 </template>

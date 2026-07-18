@@ -77,7 +77,7 @@ export default defineComponent({
     // その間下に何も背景がない部分ができてしまうのを防ぐ
     bottom: -100px;
     padding: 18px 8px 122px;
-    background: #2F221F80;
+    background: rgba(var(--v-theme-player-overlay), 0.5);
     transition: opacity 0.3s, visibility 0.3s;
     opacity: 0;
     visibility: hidden;
@@ -100,7 +100,7 @@ export default defineComponent({
         margin-bottom: 17px;
         border-radius: 11px;
         font-size: 16px;
-        color: rgb(var(--v-theme-text));
+        color: rgb(var(--v-theme-player-on-overlay));
         transition: background-color 0.15s;
         text-decoration: none;
         user-select: none;
@@ -124,7 +124,7 @@ export default defineComponent({
         height: 52px;
         border-radius: 11px;
         font-size: 16px;
-        color: rgb(var(--v-theme-text));
+        color: rgb(var(--v-theme-player-on-overlay));
         transition: background-color 0.15s;
         text-decoration: none;
         user-select: none;
@@ -138,7 +138,7 @@ export default defineComponent({
         }
 
         &:hover {
-            background: #433532A0;
+            background: rgba(var(--v-theme-player-overlay), 0.75);
         }
 
         @include smartphone-horizontal {
@@ -150,7 +150,7 @@ export default defineComponent({
 
         &--active {
             color: rgb(var(--v-theme-primary));
-            background: #433532A0;
+            background: rgba(var(--v-theme-player-overlay), 0.75);
         }
         + .watch-navigation__link {
             margin-top: 4px;

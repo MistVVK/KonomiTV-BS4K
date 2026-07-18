@@ -395,13 +395,13 @@ export default defineComponent({
                             color: rgb(var(--v-theme-text-darken-1));
 
                             &--festival {
-                                color: #E7556E;
+                                color: rgb(var(--v-theme-jikkyo-festival-readable));
                             }
                             &--so-many {
-                                color: #E76B55;
+                                color: rgb(var(--v-theme-jikkyo-so-many-readable));
                             }
                             &--many {
-                                color: #E7A355;
+                                color: rgb(var(--v-theme-jikkyo-many-readable));
                             }
                         }
                     }

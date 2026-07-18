@@ -323,19 +323,19 @@ class CaptureManager implements PlayerManager {
         // ラジオチャンネルを視聴している場合 (映像がないのでキャプチャできない)
         // この場合映像の幅/高さも 0 になるので、このチェックは必ず先に行う
         if (this.playback_mode === 'Live' && channels_store.channel.current.is_radiochannel === true) {
-            this.player.notice('ラジオチャンネルはキャプチャできません。', undefined, undefined, '#FF6F6A');
+            this.player.notice('ラジオチャンネルはキャプチャできません。', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
             return;
         }
 
         // まだ映像の表示準備が終わっていない (映像の幅/高さが 0 のまま)
         if (this.player.video.videoWidth === 0 && this.player.video.videoHeight === 0) {
-            this.player.notice('読み込み中はキャプチャできません。', undefined, undefined, '#FF6F6A');
+            this.player.notice('読み込み中はキャプチャできません。', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
             return;
         }
 
         // コメントが表示されていないのにコメント付きでキャプチャしようとした
         if (is_comment_composite === true && this.player.danmaku!.showing === false) {
-            this.player.notice('コメントを付けてキャプチャするには、コメント表示をオンにしてください。', undefined, undefined, '#FF6F6A');
+            this.player.notice('コメントを付けてキャプチャするには、コメント表示をオンにしてください。', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
             return;
         }
 
@@ -480,7 +480,7 @@ class CaptureManager implements PlayerManager {
                     try {
                         await copyBlobToClipboard(await convertBlobToPng(capture));
                     } catch (error) {
-                        this.player.notice('クリップボードへのキャプチャのコピーに失敗しました。', undefined, undefined, '#FF6F6A');
+                        this.player.notice('クリップボードへのキャプチャのコピーに失敗しました。', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
                         console.error(error);
                     }
                 }

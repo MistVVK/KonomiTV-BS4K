@@ -196,8 +196,9 @@ onUnmounted(() => {
 .history-row__heading { display: flex; justify-content: space-between; gap: 8px; }
 .history-row__heading small { flex-shrink: 0; }
 .history-empty { padding: 40px; text-align: center; opacity: 0.65; }
-.status--Succeeded { color: #66bb6a; } .status--Failed { color: rgb(var(--v-theme-error)); }
-.status--Interrupted, .status--Skipped { color: #ffa726; }
+.status--Succeeded { color: rgb(var(--v-theme-success-readable)); }
+.status--Failed { color: rgb(var(--v-theme-error-readable)); }
+.status--Interrupted, .status--Skipped { color: rgb(var(--v-theme-warning-readable)); }
 .detail-card { background: rgb(var(--v-theme-background-lighten-1)); }
 .detail-card h3 { margin-bottom: 12px; overflow-wrap: anywhere; }
 .detail-card h4 { margin: 18px 0 8px; }

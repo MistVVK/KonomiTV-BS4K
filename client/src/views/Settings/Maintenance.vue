@@ -137,7 +137,7 @@
                 <span class="ml-2">サーバー操作</span>
             </div>
             <div class="settings__item">
-                <div class="settings__item-heading text-error-lighten-1">KonomiTV サーバーを再起動</div>
+                <div class="settings__item-heading text-error-readable">KonomiTV サーバーを再起動</div>
                 <div class="settings__item-label">
                     KonomiTV サーバーを再起動します。サーバー設定の変更を反映するには再起動が必要です。<br>
                     <strong>再起動を実行すると、すべての視聴中セッションが切断されます。</strong>十分注意してください。<br>
@@ -148,7 +148,7 @@
                 <span class="ml-2">KonomiTV サーバーを再起動</span>
             </v-btn>
             <div class="settings__item">
-                <div class="settings__item-heading text-error-lighten-1">KonomiTV サーバーをシャットダウン</div>
+                <div class="settings__item-heading text-error-readable">KonomiTV サーバーをシャットダウン</div>
                 <div class="settings__item-label">
                     KonomiTV サーバーをシャットダウンします。<br>
                     <strong>シャットダウンを実行すると、再度手動で KonomiTV サーバーを起動するまで KonomiTV にアクセスできなくなります。</strong>十分注意してください。<br>

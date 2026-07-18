@@ -543,11 +543,11 @@ onMounted(async () => {
     align-items: center;
     padding: 12px 16px;
     margin-bottom: 4px;
-    background-color: rgb(var(--v-theme-warning-darken-3), 0.5);
+    background-color: rgb(var(--v-theme-warning), 0.16);
     border-radius: 6px;
 
     &__icon {
-        color: rgb(var(--v-theme-warning));
+        color: rgb(var(--v-theme-warning-readable));
         width: 22px;
         height: 22px;
         margin-right: 8px;
@@ -558,7 +558,7 @@ onMounted(async () => {
         font-size: 13px;
         font-weight: 500;
         line-height: 1.5;
-        color: rgb(var(--v-theme-warning-lighten-1));
+        color: rgb(var(--v-theme-warning-readable));
     }
 }
 

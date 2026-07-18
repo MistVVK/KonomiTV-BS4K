@@ -1086,7 +1086,7 @@ const handleSearchKeyDown = (event: KeyboardEvent) => {
 
         &--active {
             border-color: rgba(var(--v-theme-primary), 0.85);
-            color: rgb(var(--v-theme-primary));
+            color: rgb(var(--v-theme-primary-readable-hover));
             background: rgba(var(--v-theme-primary), 0.16);
         }
     }
@@ -1127,11 +1127,11 @@ const handleSearchKeyDown = (event: KeyboardEvent) => {
         }
         :deep(.v-expansion-panel-title--active) {
             border-bottom-color: rgba(var(--v-theme-text), 0.14);
-            color: rgb(var(--v-theme-primary));
+            color: rgb(var(--v-theme-primary-readable-hover));
             background: rgba(var(--v-theme-primary), 0.08);
 
             svg {
-                color: rgb(var(--v-theme-primary));
+                color: rgb(var(--v-theme-primary-readable-hover));
             }
         }
         :deep(.v-expansion-panel-title__icon) {
@@ -1187,13 +1187,13 @@ const handleSearchKeyDown = (event: KeyboardEvent) => {
 
         &--modified {
             border-color: rgba(var(--v-theme-primary), 0.55);
-            color: rgb(var(--v-theme-primary));
+            color: rgb(var(--v-theme-primary-readable-hover));
             background: rgba(var(--v-theme-primary), 0.12);
         }
 
         &--warning {
             border-color: rgba(var(--v-theme-warning), 0.7);
-            color: rgb(var(--v-theme-warning));
+            color: rgb(var(--v-theme-warning-readable));
             background: rgba(var(--v-theme-warning), 0.16);
         }
     }
@@ -1237,7 +1237,7 @@ const handleSearchKeyDown = (event: KeyboardEvent) => {
         transition: transform 0.15s, background-color 0.15s, color 0.15s;
 
         &:hover {
-            color: rgb(var(--v-theme-primary));
+            color: rgb(var(--v-theme-primary-readable-hover));
             background: rgba(var(--v-theme-primary), 0.12);
         }
 
@@ -1269,7 +1269,7 @@ const handleSearchKeyDown = (event: KeyboardEvent) => {
         }
 
         &--active {
-            color: rgb(var(--v-theme-primary));
+            color: rgb(var(--v-theme-primary-readable-hover));
             background: rgba(var(--v-theme-primary), 0.12);
         }
 
@@ -1405,7 +1405,7 @@ const handleSearchKeyDown = (event: KeyboardEvent) => {
 
         &--active {
             border-color: rgba(var(--v-theme-primary), 0.85);
-            color: rgb(var(--v-theme-primary));
+            color: rgb(var(--v-theme-primary-readable-hover));
             background: rgba(var(--v-theme-primary), 0.16);
         }
     }
@@ -1456,7 +1456,7 @@ const handleSearchKeyDown = (event: KeyboardEvent) => {
         cursor: pointer;
 
         &:hover {
-            color: rgb(var(--v-theme-primary));
+            color: rgb(var(--v-theme-primary-readable-hover));
             background: rgba(var(--v-theme-primary), 0.12);
         }
     }
@@ -1527,7 +1527,7 @@ const handleSearchKeyDown = (event: KeyboardEvent) => {
 
         &--active {
             border-color: rgba(var(--v-theme-primary), 0.85);
-            color: rgb(var(--v-theme-primary));
+            color: rgb(var(--v-theme-primary-readable-hover));
             background: rgba(var(--v-theme-primary), 0.16);
         }
     }

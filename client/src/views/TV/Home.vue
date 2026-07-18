@@ -746,13 +746,13 @@ export default defineComponent({
                         }
 
                         &-force--festival {
-                            color: #E7556E;
+                            color: rgb(var(--v-theme-jikkyo-festival-readable));
                         }
                         &-force--so-many {
-                            color: #E76B55;
+                            color: rgb(var(--v-theme-jikkyo-so-many-readable));
                         }
                         &-force--many {
-                            color: #E7A355;
+                            color: rgb(var(--v-theme-jikkyo-many-readable));
                         }
                     }
 
@@ -796,20 +796,20 @@ export default defineComponent({
                             }
                         }
                         &--pinned {
-                            color: rgb(var(--v-theme-primary));
+                            color: rgb(var(--v-theme-primary-readable));
                             &:hover{
-                                color: rgb(var(--v-theme-primary-lighten-1));
+                                color: rgb(var(--v-theme-primary-readable-hover));
                             }
                             @include smartphone-horizontal {
-                                color: rgb(var(--v-theme-secondary-lighten-2));
+                                color: rgb(var(--v-theme-secondary-readable));
                                 &:hover{
-                                    color: rgb(var(--v-theme-secondary-lighten-3));
+                                    color: rgb(var(--v-theme-secondary-readable-hover));
                                 }
                             }
                             @include smartphone-vertical {
-                                color: rgb(var(--v-theme-secondary-lighten-2));
+                                color: rgb(var(--v-theme-secondary-readable));
                                 &:hover{
-                                    color: rgb(var(--v-theme-secondary-lighten-3));
+                                    color: rgb(var(--v-theme-secondary-readable-hover));
                                 }
                             }
                         }
@@ -1091,7 +1091,7 @@ export default defineComponent({
     &__text {
         margin-left: 8px;
         margin-right: 2px;
-        color: #FFEAEA;
+        color: rgb(var(--v-theme-text));
         font-size: 16px;
         font-weight: 500;
     }

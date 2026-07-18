@@ -505,7 +505,7 @@ const handleSwitchClick = (event: Event) => {
             height: 22px;
             border-radius: 50%;
             background: rgb(var(--v-theme-primary));
-            color: white;
+            color: rgb(var(--v-theme-on-primary));
             font-size: 13px;
             font-weight: 600;
             margin-bottom: 3px;

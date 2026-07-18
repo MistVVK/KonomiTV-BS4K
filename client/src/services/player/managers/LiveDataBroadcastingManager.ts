@@ -197,7 +197,7 @@ class LiveDataBroadcastingManager implements PlayerManager {
                         // network_id と service_id が一致するチャンネルが見つからなかった
                         // 3秒間エラーメッセージを表示する
                         console.error(`[LiveDataBroadcastingManager] Channel not found (network_id: ${network_id} / service_id: ${service_id})`);
-                        this_.player.notice(`切り替え先のチャンネルが見つかりませんでした。(network_id: ${network_id} / service_id: ${service_id})`, 3000, undefined, '#FF6F6A');
+                        this_.player.notice(`切り替え先のチャンネルが見つかりませんでした。(network_id: ${network_id} / service_id: ${service_id})`, 3000, undefined, 'rgb(var(--v-theme-error-readable))');
                         // エラーメッセージを表示し終わったタイミングで、非同期で LiveDataBroadcastingManager を再起動
                         // チャンネル切り替えに失敗すると BML ブラウザがフリーズするため
                         Utils.sleep(3).then(async () => {
@@ -333,7 +333,7 @@ class LiveDataBroadcastingManager implements PlayerManager {
                 // エラー発生時のメッセージ表示
                 // 3秒間プレイヤーにエラーメッセージを表示する
                 showErrorMessage(title: string, message: string, code?: string): void {
-                    this_.player.notice(`${title}<br>${message} (${code})`, 3000, undefined, '#FF6F6A');
+                    this_.player.notice(`${title}<br>${message} (${code})`, 3000, undefined, 'rgb(var(--v-theme-error-readable))');
                 }
             });
             this.bml_browser_width = 960;

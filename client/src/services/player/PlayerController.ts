@@ -444,7 +444,7 @@ class PlayerController {
             // DPlayer を配置する要素
             container: document.querySelector<HTMLDivElement>('.watch-player__dplayer')!,
             // テーマカラー
-            theme: '#E64F97',
+            theme: 'rgb(var(--v-theme-primary))',
             // 言語 (日本語固定)
             lang: 'ja-jp',
             // ライブモード (ビデオ視聴では無効)
@@ -1155,7 +1155,7 @@ class PlayerController {
             if (this.playback_mode === 'Live' && mpegts.isSupported() !== true) {  // mpegts.js 非対応環境では undefined が返る
                 console.warn('\u001b[31m[PlayerController] PlayerRestartRequired event received, but mpegts.js is not supported. Ignored.');
                 // iOS 17.0 以下は mpegts.js がサポートされていないため、再生できない
-                this.player?.notice('iOS (Safari) 17.0 以下での視聴には対応していません。速やかに iOS を 17.1 以降に更新してください。', -1, undefined, '#FF6F6A');
+                this.player?.notice('iOS (Safari) 17.0 以下での視聴には対応していません。速やかに iOS を 17.1 以降に更新してください。', -1, undefined, 'rgb(var(--v-theme-error-readable))');
                 return;
             }
 
@@ -1204,7 +1204,7 @@ class PlayerController {
                 await Utils.sleep(event.message_delay_seconds ?? 0);
                 // 明示的にエラーメッセージではないことが指定されていればデフォルトの色で通知を表示する
                 // デフォルトではメッセージは赤色で表示される
-                const color = event.is_error_message === false ? undefined : '#FF6F6A';
+                const color = event.is_error_message === false ? undefined : 'rgb(var(--v-theme-error-readable))';
                 this.player.notice(event.message, undefined, undefined, color);
             }
         });
@@ -1487,7 +1487,7 @@ class PlayerController {
 
                     // もしこの時点でオフラインの場合、ネットワーク接続の変更による接続切断の可能性が高いので、オンラインになるまで待機する
                     if (navigator.onLine === false) {
-                        this.player.notice('現在ネットワーク接続がありません。オンラインになるまで待機しています…', undefined, undefined, '#FF6F6A');
+                        this.player.notice('現在ネットワーク接続がありません。オンラインになるまで待機しています…', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
                         console.warn('\u001b[31m[PlayerController] mpegts.js error event: Network error. Waiting for online...');
                         await Utils.waitUntilOnline();
                     }
@@ -1719,7 +1719,7 @@ class PlayerController {
                     this.player.video.pause();
                     this.player.notice(
                         'このブラウザは録画再生に必要な Media Source Extensions に対応していません。',
-                        -1, undefined, '#FFA86A',
+                        -1, undefined, 'rgb(var(--v-theme-warning-readable))',
                     );
                 }
 
@@ -1909,7 +1909,7 @@ class PlayerController {
                 fullscreen_container.requestFullscreen();
             } else {
                 // フルスクリーンがサポートされていない場合はエラーを表示
-                this.player.notice('iPhone Safari は動画のフルスクリーン表示に対応していません。', undefined, undefined, '#FF6F6A');
+                this.player.notice('iPhone Safari は動画のフルスクリーン表示に対応していません。', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
                 return;
             }
             // 画面の向きを横に固定 (Screen Orientation API がサポートされている場合)
@@ -2655,7 +2655,7 @@ class PlayerController {
                 <span class="dplayer-label">モバイル回線向け画質</span>
                 <div class="dplayer-toggle">
                     <input class="dplayer-mobile-profile-setting-input" type="checkbox" name="dplayer-toggle-mobile-profile">
-                    <label for="dplayer-toggle-mobile-profile" style="--theme-color:#E64F97"></label>
+                    <label for="dplayer-toggle-mobile-profile" style="--theme-color:rgb(var(--v-theme-primary))"></label>
                 </div>
             </div>
         `);

@@ -897,7 +897,7 @@ export default defineComponent({
             width: 24px;
             height: 24px;
             border-radius: 6px;
-            color: #fff;
+            color: rgb(var(--v-theme-on-twitter));
             line-height: 0;
 
             :deep(svg) {

@@ -104,12 +104,12 @@
                             一度上書きすると、元に戻すことはできません。慎重に選択してください。<br>
                         </v-card-text>
                         <div class="d-flex flex-column px-4 pb-6 settings__conflict-dialog">
-                            <v-btn class="settings__save-button text-error-lighten-1" color="background-lighten-1" variant="flat"
+                            <v-btn class="settings__save-button text-error-readable" color="background-lighten-1" variant="flat"
                                 @click="overrideServerSettingsFromClient()">
                                 <Icon icon="fluent:document-arrow-up-16-filled" class="mr-2" height="22px" />
                                 サーバーに保存されている設定を、<br class="smartphone-vertical-only">このデバイスの設定で上書きする
                             </v-btn>
-                            <v-btn class="settings__save-button text-error-lighten-1 mt-3" color="background-lighten-1" variant="flat"
+                            <v-btn class="settings__save-button text-error-readable mt-3" color="background-lighten-1" variant="flat"
                                 @click="overrideClientSettingsFromServer()">
                                 <Icon icon="fluent:document-arrow-down-16-filled" class="mr-2" height="22px" />
                                 このデバイスの設定を、<br class="smartphone-vertical-only">サーバーに保存されている設定で上書きする
@@ -176,10 +176,10 @@
                 </v-btn>
                 <v-divider class="mt-6"></v-divider>
                 <div class="settings__item mt-6">
-                    <div class="settings__item-heading text-error-lighten-1">アカウントを削除</div>
+                    <div class="settings__item-heading text-error-readable">アカウントを削除</div>
                     <div class="settings__item-label">
                         現在ログインしている KonomiTV アカウントを削除します。<br>
-                        <strong class="text-error-lighten-1">アカウントに紐づくすべてのデータが削除されます。元に戻すことはできません。</strong><br>
+                        <strong class="text-error-readable">アカウントに紐づくすべてのデータが削除されます。元に戻すことはできません。</strong><br>
                     </div>
                 </div>
                 <v-btn class="settings__save-button bg-error mt-5" variant="flat" @click="account_delete_confirm_dialog = true">
@@ -546,6 +546,7 @@ export default defineComponent({
             height: 28px;
             margin-left: 10px;
             border-radius: 5px;
+            color: rgb(var(--v-theme-on-secondary));
             background: rgb(var(--v-theme-secondary));
             font-size: 14px;
             font-weight: 500;
@@ -656,7 +657,7 @@ export default defineComponent({
                 height: 46px;
                 flex-shrink: 0;
                 margin-right: 16px;
-                color: rgb(var(--v-theme-secondary-lighten-1));
+                color: rgb(var(--v-theme-secondary-readable));
             }
 
             &__info {

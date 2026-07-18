@@ -228,9 +228,9 @@ const reservationIconColor = computed(() => {
         return 'rgb(var(--v-theme-warning))';
     }
     if (isReservationDisabled.value) {
-        return 'rgb(var(--v-theme-text-darken-2))';
+        return 'var(--timetable-reservation-disabled)';
     }
-    return 'rgb(var(--v-theme-secondary))';
+    return 'var(--timetable-reservation-active)';
 });
 
 /**
@@ -562,12 +562,12 @@ watch(isExpanded, async (value) => {
 
     // 予約あり
     &--reserved {
-        border: 3.8px dashed rgb(var(--v-theme-secondary));
+        border: 3.8px dashed var(--timetable-reservation-active);
     }
 
     // 録画中
     &--recording {
-        border: 3.8px dashed rgb(var(--v-theme-secondary));
+        border: 3.8px dashed var(--timetable-reservation-active);
     }
 
     // 一部のみ録画
@@ -582,7 +582,7 @@ watch(isExpanded, async (value) => {
 
     // 予約無効
     &--disabled {
-        border: 3.8px dashed rgb(var(--v-theme-text-darken-2));
+        border: 3.8px dashed var(--timetable-reservation-disabled);
     }
 
     // 次の番組も予約されている場合は border-bottom を非表示にして重複を避ける

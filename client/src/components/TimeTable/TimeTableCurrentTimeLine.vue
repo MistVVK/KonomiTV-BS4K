@@ -108,17 +108,17 @@ onUnmounted(() => {
         width: 12px;
         height: 12px;
         margin-left: -6px;
-        background: rgb(var(--v-theme-secondary));
+        background: var(--timetable-current-time);
         border-radius: 50%;
-        box-shadow: 0 0 4px rgba(var(--v-theme-secondary), 0.5);
+        box-shadow: 0 0 4px var(--timetable-current-time-shadow);
     }
 
     // ライン
     &__line {
         flex-grow: 1;
         height: 2px;
-        background: rgb(var(--v-theme-secondary));
-        box-shadow: 0 0 4px rgba(var(--v-theme-secondary), 0.5);
+        background: var(--timetable-current-time);
+        box-shadow: 0 0 4px var(--timetable-current-time-shadow);
     }
 }
 

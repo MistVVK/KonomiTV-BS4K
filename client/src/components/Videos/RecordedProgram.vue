@@ -144,7 +144,7 @@
             <v-card-title class="d-flex justify-center pt-6 font-weight-bold">本当に録画ファイルを削除しますか？</v-card-title>
             <v-card-text class="pt-2 pb-0">
                 <div class="delete-confirmation__file-path mb-4">{{ program.recorded_video.file_path }}</div>
-                <div class="text-error-lighten-1 font-weight-bold">
+                <div class="text-error-readable font-weight-bold">
                     この録画ファイルに関連するすべてのデータ (サムネイル / .ts.program.txt / .ts.err を含む) が削除されます。<br>
                     元に戻すことはできません。本当に録画ファイルを削除しますか？
                 </div>
@@ -408,7 +408,7 @@ const deleteVideo = async () => {
             font-weight: 700;
             line-height: 1;
             background: rgba(var(--v-theme-background-lighten-1), 0.9);
-            color: rgba(255, 255, 255, 0.85);
+            color: rgba(var(--v-theme-text), 0.85);
 
             &--failed {
                 gap: 3px;
@@ -418,7 +418,7 @@ const deleteVideo = async () => {
             }
 
             &--analyzing svg {
-                color: rgb(var(--v-theme-secondary-lighten-1));
+                color: rgb(var(--v-theme-secondary-readable));
                 animation: playback-index-spin 1.5s linear infinite;
             }
 
@@ -859,7 +859,7 @@ const deleteVideo = async () => {
 }
 
 .recorded-program__menu-list-item--danger {
-    color: rgb(var(--v-theme-error)) !important;
+    color: rgb(var(--v-theme-error-readable)) !important;
 }
 
 </style>

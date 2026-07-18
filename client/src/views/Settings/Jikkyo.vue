@@ -42,7 +42,7 @@
                             <span class="mr-2" style="white-space: nowrap;">Niconico User ID:</span>
                             <a class="link mr-2" :href="`https://www.nicovideo.jp/user/${userStore.user.niconico_user_id}`"
                                 target="_blank">{{userStore.user.niconico_user_id}}</a>
-                            <span class="text-secondary" v-if="userStore.user.niconico_user_premium === true">(Premium)</span>
+                            <span class="text-secondary-readable" v-if="userStore.user.niconico_user_premium === true">(Premium)</span>
                         </span>
                     </div>
                 </div>
