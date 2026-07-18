@@ -198,7 +198,7 @@ index 5777cb3..73bca5d 100644
      common_pids: {
          h264: number | undefined,
 diff --git a/node_modules/mpegts.js/src/demux/ts-demuxer.ts b/node_modules/mpegts.js/src/demux/ts-demuxer.ts
-index 1adb2cc..0ec681d 100644
+index 1adb2cc..c496d49 100644
 --- a/node_modules/mpegts.js/src/demux/ts-demuxer.ts
 +++ b/node_modules/mpegts.js/src/demux/ts-demuxer.ts
 @@ -158,7 +158,7 @@ class TSDemuxer extends BaseDemuxer {
@@ -214,11 +214,11 @@ index 1adb2cc..0ec681d 100644
          let info_start_index = 12 + program_info_length;
          let info_bytes = section_length - 9 - program_info_length - 4;
 
-+        let audio_stream_index = 0;
++        const audio_streams: Array<{pid: number, stream_type: StreamType}> = [];
          for (let i = info_start_index; i < info_start_index + info_bytes; ) {
              let stream_type = data[i] as StreamType;
              let elementary_PID = ((data[i + 1] & 0x1F) << 8) | data[i + 2];
-@@ -782,24 +783,31 @@ class TSDemuxer extends BaseDemuxer {
+@@ -782,24 +783,36 @@ class TSDemuxer extends BaseDemuxer {
 
              pmt.pid_stream_type[elementary_PID] = stream_type;
 
@@ -251,21 +251,45 @@ index 1adb2cc..0ec681d 100644
 -                       (!already_has_audio || this.preferred_secondary_audio)) {
 -                pmt.common_pids.mp3 = elementary_PID;
 +            } else if (stream_type === StreamType.kADTSAAC) {
-+                if (audio_stream_index++ === this.preferred_audio_track_index) pmt.common_pids.adts_aac = elementary_PID;
++                audio_streams.push({pid: elementary_PID, stream_type});
++                if (audio_streams.length - 1 === this.preferred_audio_track_index) pmt.common_pids.adts_aac = elementary_PID;
 +            } else if (stream_type === StreamType.kLOASAAC) {
-+                if (audio_stream_index++ === this.preferred_audio_track_index) pmt.common_pids.loas_aac = elementary_PID;
++                audio_streams.push({pid: elementary_PID, stream_type});
++                if (audio_streams.length - 1 === this.preferred_audio_track_index) pmt.common_pids.loas_aac = elementary_PID;
 +            } else if (stream_type === StreamType.kAC3) {
-+                if (audio_stream_index++ === this.preferred_audio_track_index) pmt.common_pids.ac3 = elementary_PID; // ATSC AC-3
++                audio_streams.push({pid: elementary_PID, stream_type});
++                if (audio_streams.length - 1 === this.preferred_audio_track_index) pmt.common_pids.ac3 = elementary_PID; // ATSC AC-3
 +            } else if (stream_type === StreamType.kEAC3) {
-+                if (audio_stream_index++ === this.preferred_audio_track_index) pmt.common_pids.eac3 = elementary_PID; // ATSC E-AC-3
++                audio_streams.push({pid: elementary_PID, stream_type});
++                if (audio_streams.length - 1 === this.preferred_audio_track_index) pmt.common_pids.eac3 = elementary_PID; // ATSC E-AC-3
 +            } else if (stream_type === StreamType.kMPEG1Audio || stream_type === StreamType.kMPEG2Audio) {
-+                if (audio_stream_index++ === this.preferred_audio_track_index) pmt.common_pids.mp3 = elementary_PID;
++                audio_streams.push({pid: elementary_PID, stream_type});
++                if (audio_streams.length - 1 === this.preferred_audio_track_index) pmt.common_pids.mp3 = elementary_PID;
              } else if (stream_type === StreamType.kPESPrivateData) {
                  pmt.pes_private_data_pids[elementary_PID] = true;
                  if (ES_info_length > 0) {
-@@ -921,6 +929,22 @@ class TSDemuxer extends BaseDemuxer {
+@@ -920,7 +933,41 @@ class TSDemuxer extends BaseDemuxer {
+             i += 5 + ES_info_length;
          }
 
++        // 選択中の音声トラックが PMT 更新で消えた場合は、同じ PMT の Track1 へ即時復帰する。
++        // UI 側から後で preferred_audio_track_index を戻すだけでは、次の PMT まで音声 PID が未選択になる。
++        if (audio_streams.length > 0 && this.preferred_audio_track_index >= audio_streams.length) {
++            Log.w(this.TAG,
++                `Selected audio track is no longer available, fallback to Track1: ` +
++                `selected=${this.preferred_audio_track_index + 1}, tracks=${audio_streams.length}`);
++            this.preferred_audio_track_index = 0;
++            const first_audio_stream = audio_streams[0];
++            if (first_audio_stream !== undefined) {
++                const {pid: elementary_PID, stream_type} = first_audio_stream;
++                if (stream_type === StreamType.kADTSAAC) pmt.common_pids.adts_aac = elementary_PID;
++                else if (stream_type === StreamType.kLOASAAC) pmt.common_pids.loas_aac = elementary_PID;
++                else if (stream_type === StreamType.kAC3) pmt.common_pids.ac3 = elementary_PID;
++                else if (stream_type === StreamType.kEAC3) pmt.common_pids.eac3 = elementary_PID;
++                else pmt.common_pids.mp3 = elementary_PID;
++            }
++        }
++
          if (program_number === this.current_program_) {
 +            const previous_audio_track_count = this.media_info_.audioTrackCount;
 +            const audio_stream_types = new Set([
@@ -286,7 +310,7 @@ index 1adb2cc..0ec681d 100644
              if (this.pmt_ == undefined) {
                  Log.v(this.TAG, `Parsed first PMT: ${JSON.stringify(pmt)}`);
              }
-@@ -931,6 +955,13 @@ class TSDemuxer extends BaseDemuxer {
+@@ -931,6 +978,13 @@ class TSDemuxer extends BaseDemuxer {
              if (pmt.common_pids.adts_aac || pmt.common_pids.loas_aac || pmt.common_pids.ac3 || pmt.common_pids.opus || pmt.common_pids.mp3) {
                  this.has_audio_ = true;
              }
