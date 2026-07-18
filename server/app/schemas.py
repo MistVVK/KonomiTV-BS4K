@@ -140,6 +140,13 @@ class TimeTableProgramReservation(BaseModel):
 
 # ***** 録画ファイル *****
 
+class AudioTrack(TypedDict):
+    index: int
+    codec: str
+    channel: str
+    sampling_rate: int | None
+    language: str | None
+
 class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け
     id: int = -1  # メタデータ取得時は ID が定まらないため -1 を設定
@@ -160,12 +167,13 @@ class RecordedVideo(PydanticModel):
     video_resolution_width: int
     video_resolution_height: int
     has_video_stream_changes: bool = False
-    primary_audio_codec: Literal['AAC-LC']
-    primary_audio_channel: Literal['Monaural', 'Stereo', '5.1ch']
+    primary_audio_codec: str
+    primary_audio_channel: str
     primary_audio_sampling_rate: int
-    secondary_audio_codec: Literal['AAC-LC'] | None = None
-    secondary_audio_channel: Literal['Monaural', 'Stereo', '5.1ch'] | None = None
+    secondary_audio_codec: str | None = None
+    secondary_audio_channel: str | None = None
     secondary_audio_sampling_rate: int | None = None
+    audio_tracks: list[AudioTrack] = Field(default_factory=list)
     cm_sections: list[CMSection] | None = None
     thumbnail_info: ThumbnailInfo | None = None
     created_at: datetime

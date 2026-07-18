@@ -60,6 +60,14 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         else:
             thumbnail_info = row['thumbnail_info']
 
+    # audio_tracks は可変長音声トラック情報を表す
+    audio_tracks: list[schemas.AudioTrack] = []
+    if row['audio_tracks'] is not None:
+        if isinstance(row['audio_tracks'], str):
+            audio_tracks = json.loads(row['audio_tracks'])
+        else:
+            audio_tracks = row['audio_tracks']
+
     # recorded_video のデータを構築
     recorded_video_dict = {
         'id': row['rv_id'],
@@ -86,6 +94,7 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         'secondary_audio_codec': row['secondary_audio_codec'],
         'secondary_audio_channel': row['secondary_audio_channel'],
         'secondary_audio_sampling_rate': row['secondary_audio_sampling_rate'],
+        'audio_tracks': audio_tracks,
         'cm_sections': cm_sections,
         'thumbnail_info': thumbnail_info,
         'created_at': row['rv_created_at'],
@@ -383,6 +392,7 @@ async def VideosAPI(
             rv.secondary_audio_codec,
             rv.secondary_audio_channel,
             rv.secondary_audio_sampling_rate,
+            rv.audio_tracks,
             rv.cm_sections,
             rv.thumbnail_info,
             rv.created_at AS rv_created_at,
@@ -610,6 +620,7 @@ async def VideosSearchAPI(
             rv.secondary_audio_codec,
             rv.secondary_audio_channel,
             rv.secondary_audio_sampling_rate,
+            rv.audio_tracks,
             rv.cm_sections,
             rv.thumbnail_info,
             rv.created_at AS rv_created_at,

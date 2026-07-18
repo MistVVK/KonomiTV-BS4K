@@ -976,6 +976,7 @@ class RecordedScanTask:
             db_recorded_video.secondary_audio_codec = recorded_program.recorded_video.secondary_audio_codec
             db_recorded_video.secondary_audio_channel = recorded_program.recorded_video.secondary_audio_channel
             db_recorded_video.secondary_audio_sampling_rate = recorded_program.recorded_video.secondary_audio_sampling_rate
+            db_recorded_video.audio_tracks = recorded_program.recorded_video.audio_tracks
             # ファイル本体を再解析した場合、以前の再生開始位置キャッシュは別ファイル由来の可能性がある
             ## 新規録画と同じ空状態へ戻し、次回再生時に現在のファイルからオンデマンドで解決する
             db_recorded_video.key_frames = []

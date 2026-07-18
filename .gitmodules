@@ -1,0 +1,4 @@
+[submodule "thirdparty-src/tsreadex"]
+	path = thirdparty-src/tsreadex
+	url = https://github.com/MistVVK/tsreadex.git
+	branch = main

@@ -13,3 +13,6 @@ server/data/*
 
 # サードパーティーライブラリ: Docker 側でファイルを準備するため不要
 server/thirdparty/
+
+# tsreadex: Docker の builder stage でコンテナ環境向けにビルドする
+thirdparty-src/tsreadex/tsreadex.elf

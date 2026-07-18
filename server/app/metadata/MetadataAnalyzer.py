@@ -91,7 +91,7 @@ class FFprobeAudioStream(BaseModel):
     @classmethod
     def validate_audio_codec(cls, codec_name: str) -> str:
         """サポートされている音声コーデックかを検証"""
-        supported_codecs = ['aac']
+        supported_codecs = ['aac', 'mp2']
         if codec_name not in supported_codecs:
             raise ValueError(f'Unsupported audio codec: {codec_name}')
         return codec_name
@@ -100,7 +100,7 @@ class FFprobeAudioStream(BaseModel):
     @classmethod
     def validate_channels(cls, channels: int) -> int:
         """サポートされているチャンネル数かを検証"""
-        supported_channels = [1, 2, 6]
+        supported_channels = [1, 2, 6, 8, 24]
         if channels not in supported_channels:
             raise ValueError(f'Unsupported channel count: {channels}')
         return channels
@@ -250,6 +250,26 @@ class MetadataAnalyzer:
             except Exception:
                 return None
 
+        def GetAudioCodec(codec_name: str, profile: str | None) -> str | None:
+            if codec_name == 'aac':
+                if profile is None or 'LC' in profile:
+                    return 'AAC-LC'
+                return 'AAC'
+            if codec_name == 'mp2':
+                return 'MP2'
+            return None
+
+        def GetAudioChannelLabel(channels: int) -> str:
+            if channels == 1:
+                return 'Monaural'
+            if channels == 2:
+                return 'Stereo'
+            if channels == 6:
+                return '5.1ch'
+            if channels == 24:
+                return '22.2ch'
+            return f'{channels}ch'
+
         # もし Config() の実行時に AssertionError が発生した場合は、LoadConfig() を実行してサーバー設定データをロードする
         ## 通常ならこの関数を ProcessPoolExecutor で実行した場合もサーバー設定データはロード状態になっているはずだが、
         ## 自動リロードモード時のみなぜかグローバル変数がマルチプロセスに引き継がれないため、明示的にロードさせる必要がある
@@ -269,12 +289,13 @@ class MetadataAnalyzer:
         video_resolution_width: int | None = None
         video_resolution_height: int | None = None
         has_video_stream_changes: bool = False
-        primary_audio_codec: Literal['AAC-LC'] | None = None
-        primary_audio_channel: Literal['Monaural', 'Stereo', '5.1ch'] | None = None
+        primary_audio_codec: str | None = None
+        primary_audio_channel: str | None = None
         primary_audio_sampling_rate: int | None = None
-        secondary_audio_codec: Literal['AAC-LC'] | None = None
-        secondary_audio_channel: Literal['Monaural', 'Stereo', '5.1ch'] | None = None
+        secondary_audio_codec: str | None = None
+        secondary_audio_channel: str | None = None
         secondary_audio_sampling_rate: int | None = None
+        audio_tracks: list[schemas.AudioTrack] = []
 
         # FFprobe から録画ファイルのメディア情報を取得
         ## 取得に失敗した場合は KonomiTV で再生可能なファイルではないと判断し、None を返す
@@ -397,60 +418,32 @@ class MetadataAnalyzer:
                 is_video_track_analyzed = True
 
         for audio_stream in sample_probe_audio_streams:
+            audio_codec = GetAudioCodec(audio_stream.codec_name, audio_stream.profile)
+            if audio_codec is None:
+                logging.warning(f'{self.recorded_file_path}: Unsupported audio codec: {audio_stream.codec_name}. ignored.')
+                continue
+            audio_channel = GetAudioChannelLabel(audio_stream.channels)
+            audio_sampling_rate = int(audio_stream.sample_rate)
+            audio_tracks.append({
+                'index': len(audio_tracks) + 1,
+                'codec': audio_codec,
+                'channel': audio_channel,
+                'sampling_rate': audio_sampling_rate,
+                'language': None,
+            })
+
             ## 主音声情報
             if is_primary_audio_track_analyzed is False:
-                ## コーデック
-                if audio_stream.codec_name == 'aac':
-                    prof = audio_stream.profile
-                    if prof is None or 'LC' in prof:
-                        primary_audio_codec = 'AAC-LC'
-                if primary_audio_codec is None:
-                    # AAC-LC 以外のフォーマットは当面 KonomiTV で再生できない
-                    logging.warning(f'{self.recorded_file_path}: Unsupported audio codec: {audio_stream.codec_name}. ignored.')
-                    continue
-                ## チャンネル数
-                if audio_stream.channels == 1:
-                    primary_audio_channel = 'Monaural'
-                elif audio_stream.channels == 2:
-                    # デュアルモノも Stereo として判定される可能性がある (別途 RecordedProgram の secondary_audio_type で判定すべき)
-                    primary_audio_channel = 'Stereo'
-                elif audio_stream.channels == 6:
-                    primary_audio_channel = '5.1ch'
-                else:
-                    # 1ch, 2ch, 5.1ch 以外の音声チャンネル数は KonomiTV で再生できない
-                    logging.warning(f'{self.recorded_file_path}: Unsupported audio channel count: {audio_stream.channels}. ignored.')
-                    continue
-                ## サンプルレート
-                primary_audio_sampling_rate = int(audio_stream.sample_rate)
-                ## 音声トラックの解析が完了したことをマーク
+                primary_audio_codec = audio_codec
+                primary_audio_channel = audio_channel
+                primary_audio_sampling_rate = audio_sampling_rate
                 is_primary_audio_track_analyzed = True
 
             ## 副音声情報（存在する場合）
             elif is_secondary_audio_track_analyzed is False:
-                ## コーデック
-                if audio_stream.codec_name == 'aac':
-                    prof = audio_stream.profile
-                    if prof is None or 'LC' in prof:
-                        secondary_audio_codec = 'AAC-LC'
-                if secondary_audio_codec is None:
-                    # AAC-LC 以外のフォーマットは当面 KonomiTV で再生できない
-                    logging.warning(f'{self.recorded_file_path}: Unsupported audio codec: {audio_stream.codec_name}. ignored.')
-                    continue
-                ## チャンネル数
-                if audio_stream.channels == 1:
-                    secondary_audio_channel = 'Monaural'
-                elif audio_stream.channels == 2:
-                    # デュアルモノも Stereo として判定される可能性がある (別途 RecordedProgram の secondary_audio_type で判定すべき)
-                    secondary_audio_channel = 'Stereo'
-                elif audio_stream.channels == 6:
-                    secondary_audio_channel = '5.1ch'
-                else:
-                    # 1ch, 2ch, 5.1ch 以外の音声チャンネル数は KonomiTV で再生できない
-                    logging.warning(f'{self.recorded_file_path}: Unsupported audio channel count: {audio_stream.channels}. ignored.')
-                    continue
-                ## サンプルレート
-                secondary_audio_sampling_rate = int(audio_stream.sample_rate)
-                ## 音声トラックの解析が完了したことをマーク
+                secondary_audio_codec = audio_codec
+                secondary_audio_channel = audio_channel
+                secondary_audio_sampling_rate = audio_sampling_rate
                 is_secondary_audio_track_analyzed = True
 
         # 最低でも映像トラックと主音声トラックが含まれている必要がある
@@ -518,6 +511,7 @@ class MetadataAnalyzer:
             secondary_audio_codec = secondary_audio_codec,
             secondary_audio_channel = secondary_audio_channel,
             secondary_audio_sampling_rate = secondary_audio_sampling_rate,
+            audio_tracks = audio_tracks,
             # 必須フィールドのため作成日時・更新日時は適当に現在時刻を入れている
             # この値は参照されず、DB の値は別途自動生成される
             created_at = now,

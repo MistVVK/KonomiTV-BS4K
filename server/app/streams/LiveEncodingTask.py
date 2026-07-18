@@ -219,8 +219,8 @@ class LiveEncodingTask:
                     options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
 
         # 音声
-        ## 音声が 5.1ch かどうかに関わらず、ステレオにダウンミックスする
-        options.append(f'-acodec aac -aac_coder twoloop -ac 2 -ab {QUALITY[quality].audio_bitrate} -ar 48000 -af volume=2.0')
+        ## 実在する音声トラックをすべて保持するため、FFmpeg 側では音声をコピーする
+        options.append('-map 0:v:0 -map 0:a? -map 0:d? -acodec copy')
 
         # 出力
         options.append('-y -f mpegts')  # MPEG-TS 出力ということを明示
@@ -340,10 +340,8 @@ class LiveEncodingTask:
         else:
             options.append('--avhw')
 
-        # ストリームのマッピング
-        ## 音声切り替えのため、主音声・副音声両方をエンコード後の TS に含む
-        ## 音声が 5.1ch かどうかに関わらず、ステレオにダウンミックスする
-        options.append('--audio-stream 1?:stereo --audio-stream 2?:stereo --data-copy timed_id3')
+        # tsreadex -A 1 が分離したデュアルモノを含む、すべての実音声をそのまま出力する
+        options.append('--audio-copy --data-copy timed_id3')
 
         # フラグ
         ## 主に HWEncC の起動を高速化するための設定
@@ -480,10 +478,6 @@ class LiveEncodingTask:
             video_width = 1920
         options.append(f'--output-res {video_width}x{video_height}')
 
-        # 音声
-        options.append(f'--audio-codec aac:aac_coder=twoloop --audio-bitrate {QUALITY[quality].audio_bitrate}')
-        options.append('--audio-samplerate 48000 --audio-filter volume=2.0 --audio-ignore-decode-error 30')
-
         # 出力
         options.append('--output-format mpegts')  # MPEG-TS 出力ということを明示
         options.append('--output -')  # 標準出力へ出力
@@ -515,6 +509,8 @@ class LiveEncodingTask:
 
         # Mirakurun / mirakc は通常チャンネルタイプが GR, BS, CS, SKY しかないので、
         # フォールバックとして BS4K を BS に、CATV を CS に変換する
+        ## ただし、BS4K などのチャンネルタイプに対応したチューナーが登録されている場合は、
+        ## フォールバック先のチューナーを先に拾わないよう、必ず本来のチャンネルタイプを優先する
         fallback_channel_type = channel_type
         if channel_type == 'BS4K':
             fallback_channel_type = 'BS'
@@ -547,16 +543,37 @@ class LiveEncodingTask:
                     return False
 
                 # 指定されたチャンネルタイプが受信可能なチューナーが1つでも利用可能であれば True を返す
-                for tuner in tuners:
-                    if tuner['isAvailable'] is True and tuner['isFree'] is True and channel_type in tuner['types']:
-                        logging.info(f'{self.live_stream.log_prefix} Acquired a tuner from {mirakurun_or_mirakc}.')
+                available_tuners = [tuner for tuner in tuners if tuner['isAvailable'] is True]
+                exact_type_tuners = [tuner for tuner in available_tuners if channel_type in tuner['types']]
+                exact_free_tuners = [tuner for tuner in exact_type_tuners if tuner['isFree'] is True]
+                if len(exact_free_tuners) > 0:
+                    tuner = exact_free_tuners[0]
+                    logging.info(f'{self.live_stream.log_prefix} Acquired a tuner from {mirakurun_or_mirakc}.')
+                    logging.info(
+                        f'{self.live_stream.log_prefix} Tuner: {tuner["name"]} / '
+                        f'Type: {channel_type} / Acquired in {round(time.time() - start_time, 2)} seconds'
+                    )
+                    return True
+
+                # 本来のチャンネルタイプのチューナーが登録されている場合、空きがなくてもフォールバック先は使わない
+                ## Service Stream API は最終的に Mirakurun / mirakc 側でチューナーを選ぶため、
+                ## ここでフォールバック先の空きチューナーを「確保できた」と扱うとログと実際の挙動がずれてしまう
+                if len(exact_type_tuners) > 0:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # 本来のチャンネルタイプのチューナーが登録されていない環境のみ、互換用のフォールバックタイプを確認する
+                if fallback_channel_type != channel_type:
+                    fallback_free_tuners = [
+                        tuner for tuner in available_tuners
+                        if tuner['isFree'] is True and fallback_channel_type in tuner['types']
+                    ]
+                    if len(fallback_free_tuners) > 0:
+                        tuner = fallback_free_tuners[0]
                         logging.info(
-                            f'{self.live_stream.log_prefix} Tuner: {tuner["name"]} / '
-                            f'Type: {channel_type} / Acquired in {round(time.time() - start_time, 2)} seconds'
+                            f'{self.live_stream.log_prefix} Acquired a tuner from {mirakurun_or_mirakc}. '
+                            f'({channel_type} tuner is not registered, using {fallback_channel_type})'
                         )
-                        return True
-                    if tuner['isAvailable'] is True and tuner['isFree'] is True and fallback_channel_type in tuner['types']:
-                        logging.info(f'{self.live_stream.log_prefix} Acquired a tuner from {mirakurun_or_mirakc}. ({channel_type} -> {fallback_channel_type})')
                         logging.info(
                             f'{self.live_stream.log_prefix} Tuner: {tuner["name"]} / '
                             f'Type: {fallback_channel_type} / Acquired in {round(time.time() - start_time, 2)} seconds'
@@ -617,15 +634,9 @@ class LiveEncodingTask:
             ## 有効にすると、特定のストリームのみ PID を固定して出力される
             ## 視聴対象のチャンネルのサービス ID を指定する
             '-n', f'{channel.service_id}' if CONFIG.tv.debug_mode_ts_path is None else '-1',
-            # 主音声ストリームが常に存在する状態にする
-            ## ストリームが存在しない場合、無音の AAC ストリームが出力される
-            ## 音声がモノラルであればステレオにする
-            ## デュアルモノを2つのモノラル音声に分離し、右チャンネルを副音声として扱う
-            '-a', '13',
-            # 副音声ストリームが常に存在する状態にする
-            ## ストリームが存在しない場合、無音の AAC ストリームが出力される
-            ## 音声がモノラルであればステレオにする
-            '-b', '5',
+            # PMT 上に実在する音声ストリームをすべて保持する
+            ## 無音補完・mono stereo 化・dual mono 分離・downmix は行わない
+            '-A', '1',
             # 字幕ストリームが常に存在する状態にする
             ## ストリームが存在しない場合、PMT の項目が補われて出力される
             ## 実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する

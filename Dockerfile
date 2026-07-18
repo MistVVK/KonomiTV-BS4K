@@ -25,6 +25,21 @@ RUN tar xvf thirdparty-linux.tar.xz
 # RUN unzip thirdparty-linux.tar.xz.zip && tar xvf thirdparty-linux.tar.xz
 
 # --------------------------------------------------------------------------------------------------------------
+# tsreadex をビルドするステージ
+# ローカル submodule の tsreadex-BS4K をビルドし、release thirdparty 内の tsreadex.elf を差し替える
+# --------------------------------------------------------------------------------------------------------------
+
+FROM ubuntu:22.04 AS tsreadex-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates
+
+WORKDIR /build/tsreadex/
+COPY ./thirdparty-src/tsreadex/ /build/tsreadex/
+RUN make TARGET=tsreadex.elf
+
+# --------------------------------------------------------------------------------------------------------------
 # クライアントをビルドするステージ
 # クライアントのビルド成果物 (dist) は Git に含まれているが、万が一ビルドし忘れたりや開発ブランチでの利便性を考慮してビルドしておく
 # --------------------------------------------------------------------------------------------------------------
@@ -107,6 +122,7 @@ RUN apt-get update && \
 # ダウンロードしておいたサードパーティーライブラリをコピー
 WORKDIR /code/server/
 COPY --from=thirdparty-downloader /thirdparty/ /code/server/thirdparty/
+COPY --from=tsreadex-builder /build/tsreadex/tsreadex.elf /code/server/thirdparty/tsreadex/tsreadex.elf
 
 # Poetry の依存パッケージリストだけをコピー
 COPY ./server/pyproject.toml ./server/poetry.lock ./server/poetry.toml /code/server/

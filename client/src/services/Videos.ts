@@ -10,6 +10,15 @@ export type SortOrder = 'desc' | 'asc';
 export type MylistSortOrder = 'mylist_added_desc' | 'mylist_added_asc' | 'recorded_desc' | 'recorded_asc';
 
 /** 録画ファイル情報を表すインターフェース */
+export interface IAudioTrack {
+    index: number;
+    codec: string;
+    channel: string;
+    sampling_rate: number | null;
+    language: string | null;
+}
+
+/** 録画ファイル情報を表すインターフェース */
 export interface IRecordedVideo {
     id: number;
     status: 'Recording' | 'Recorded' | 'AnalysisFailed';
@@ -29,12 +38,13 @@ export interface IRecordedVideo {
     video_resolution_width: number;
     video_resolution_height: number;
     has_video_stream_changes: boolean;
-    primary_audio_codec: 'AAC-LC';
-    primary_audio_channel: 'Monaural' | 'Stereo' | '5.1ch';
+    primary_audio_codec: string;
+    primary_audio_channel: string;
     primary_audio_sampling_rate: number;
-    secondary_audio_codec: 'AAC-LC' | null;
-    secondary_audio_channel: 'Monaural' | 'Stereo' | '5.1ch' | null;
+    secondary_audio_codec: string | null;
+    secondary_audio_channel: string | null;
     secondary_audio_sampling_rate: number | null;
+    audio_tracks: IAudioTrack[];
     cm_sections: { start_time: number; end_time: number; }[] | null;
     thumbnail_info: IThumbnailInfo | null;
     created_at: string;
@@ -94,6 +104,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     secondary_audio_codec: null,
     secondary_audio_channel: null,
     secondary_audio_sampling_rate: null,
+    audio_tracks: [],
     cm_sections: null,
     thumbnail_info: null,
     created_at: '2000-01-01T00:00:00+09:00',

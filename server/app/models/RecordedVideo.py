@@ -12,7 +12,7 @@ from tortoise.fields import Field as TortoiseField
 from tortoise.models import Model as TortoiseModel
 
 from app.models.RecordedProgram import RecordedProgram
-from app.schemas import CMSection, KeyFrame, SegmentMapEntry, ThumbnailInfo
+from app.schemas import AudioTrack, CMSection, KeyFrame, SegmentMapEntry, ThumbnailInfo
 
 
 class RecordedVideo(TortoiseModel):
@@ -43,12 +43,14 @@ class RecordedVideo(TortoiseModel):
     video_resolution_width = fields.IntField()
     video_resolution_height = fields.IntField()
     has_video_stream_changes = fields.BooleanField(default=False)
-    primary_audio_codec = cast(TortoiseField[Literal['AAC-LC']], fields.CharField(255))
-    primary_audio_channel = cast(TortoiseField[Literal['Monaural', 'Stereo', '5.1ch']], fields.CharField(255))
+    primary_audio_codec = fields.CharField(255)
+    primary_audio_channel = fields.CharField(255)
     primary_audio_sampling_rate = fields.IntField()
-    secondary_audio_codec = cast(TortoiseField[Literal['AAC-LC'] | None], fields.CharField(255, null=True))
-    secondary_audio_channel = cast(TortoiseField[Literal['Monaural', 'Stereo', '5.1ch'] | None], fields.CharField(255, null=True))
+    secondary_audio_codec = cast(TortoiseField[str | None], fields.CharField(255, null=True))
+    secondary_audio_channel = cast(TortoiseField[str | None], fields.CharField(255, null=True))
     secondary_audio_sampling_rate = cast(TortoiseField[int | None], fields.IntField(null=True))
+    audio_tracks = cast(TortoiseField[list[AudioTrack]],
+        fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
     key_frames = cast(TortoiseField[list[KeyFrame]],
         fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
     segment_map = cast(TortoiseField[list[SegmentMapEntry]],

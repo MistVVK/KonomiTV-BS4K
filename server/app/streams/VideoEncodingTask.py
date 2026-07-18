@@ -227,8 +227,8 @@ class VideoEncodingTask:
             options.append(f'-g {int(self.GOP_LENGTH_SECOND * int_fps)}')
 
         # 音声
-        ## 音声が 5.1ch かどうかに関わらず、ステレオにダウンミックスする
-        options.append(f'-acodec aac -aac_coder twoloop -ac 2 -ab {QUALITY[quality].audio_bitrate} -ar 48000 -af volume=2.0')
+        ## 実在する音声トラックをすべて保持するため、FFmpeg 側では音声をコピーする
+        options.append('-map 0:v:0 -map 0:a? -map 0:d? -acodec copy')
 
         # 出力 TS のタイムスタンプオフセット
         options.append(f'-output_ts_offset {output_ts_offset}')
@@ -296,9 +296,8 @@ class VideoEncodingTask:
             options.append('--avhw')
 
         # ストリームのマッピング
-        ## 音声切り替えのため、主音声・副音声両方をエンコード後の TS に含む
-        ## 音声が 5.1ch かどうかに関わらず、ステレオにダウンミックスする
-        options.append('--audio-stream 1?:stereo --audio-stream 2?:stereo --data-copy timed_id3')
+        ## 実在する音声トラックをすべて保持するため、HWEncC 側では音声をコピーする
+        options.append('--audio-copy --data-copy timed_id3')
 
         # フラグ
         ## 主に HWEncC の起動を高速化するための設定
@@ -448,8 +447,8 @@ class VideoEncodingTask:
         options.append(f'--output-res {video_width}x{video_height}')
 
         # 音声
-        options.append(f'--audio-codec aac:aac_coder=twoloop --audio-bitrate {QUALITY[quality].audio_bitrate}')
-        options.append('--audio-samplerate 48000 --audio-filter volume=2.0 --audio-ignore-decode-error 30')
+        ## --audio-copy により元 TS の実在音声を保持する。ここでは downmix / resample / 音量補正を行わない。
+        options.append('--audio-ignore-decode-error 30')
 
         # 出力 TS のタイムスタンプオフセット
         options.append(f'-m output_ts_offset:{output_ts_offset}')
@@ -898,15 +897,9 @@ class VideoEncodingTask:
                     ## 有効にすると、特定のストリームのみ PID を固定して出力される
                     ## 視聴対象の録画番組が放送されたチャンネルのサービス ID があれば指定する
                     '-n', tsreadex_service_id,
-                    # 主音声ストリームが常に存在する状態にする
-                    ## ストリームが存在しない場合、無音の AAC ストリームが出力される
-                    ## 音声がモノラルであればステレオにする
-                    ## デュアルモノを2つのモノラル音声に分離し、右チャンネルを副音声として扱う
-                    '-a', '13',
-                    # 副音声ストリームが常に存在する状態にする
-                    ## ストリームが存在しない場合、無音の AAC ストリームが出力される
-                    ## 音声がモノラルであればステレオにする
-                    '-b', '7',
+                    # PMT 上に実在する音声ストリームをすべて保持する
+                    ## 無音補完・mono stereo 化・dual mono 分離・downmix は行わない
+                    '-A', '1',
                     # 字幕ストリームが常に存在する状態にする
                     ## ストリームが存在しない場合、PMT の項目が補われて出力される
                     ## 実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する

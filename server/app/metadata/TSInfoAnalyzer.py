@@ -521,6 +521,20 @@ class TSInfoAnalyzer:
         primary_audio_language: str | None = None
         secondary_audio_type: str | None = None
         secondary_audio_language: str | None = None
+        audio_component_tracks: list[tuple[str | None, str | None]] = []
+
+        def GetAudioChannelLabel(audio_type: str | None) -> str | None:
+            if audio_type is None:
+                return None
+            if '22.2' in audio_type or '3/3/3-5/2/3-3/0/0.2' in audio_type:
+                return '22.2ch'
+            if '5.1' in audio_type or '3/2+LFE' in audio_type:
+                return '5.1ch'
+            if 'ステレオ' in audio_type or '2/0' in audio_type:
+                return 'Stereo'
+            if 'モノ' in audio_type or '1/0' in audio_type:
+                return 'Monaural'
+            return audio_type
 
         # TS から EIT (Event Information Table) を抽出
         count: int = 0
@@ -634,27 +648,28 @@ class TSInfoAnalyzer:
                         secondary_audio_type = str(event.second_audio)
                     ## 主音声・副音声の言語
                     ## event クラスには用意されていないので自前で取得する
+                    audio_component_tracks = []
                     for acd in event_data.descriptors.get(AudioComponentDescriptor, []):
+                        audio_type = ariblib.constants.COMPONENT_TYPE[0x02].get(acd.component_type, 'Unknown')
+                        audio_language = TSInformation.getISO639LanguageCodeName(acd.ISO_639_language_code)
+                        if audio_type == '1/0+1/0モード(デュアルモノ)':
+                            if bool(acd.ES_multi_lingual_flag) is True:
+                                audio_language += '+' + TSInformation.getISO639LanguageCodeName(acd.ISO_639_language_code_2)
+                            else:
+                                audio_language += '+副音声'
+                        audio_component_tracks.append((audio_type, audio_language))
                         if bool(acd.main_component_flag) is True:
                             ## 主音声の言語
-                            primary_audio_language = TSInformation.getISO639LanguageCodeName(acd.ISO_639_language_code)
+                            primary_audio_language = audio_language
                             ## デュアルモノのみ
                             if primary_audio_type == '1/0+1/0モード(デュアルモノ)':
-                                if bool(acd.ES_multi_lingual_flag) is True:
-                                    primary_audio_language += '+' + \
-                                        TSInformation.getISO639LanguageCodeName(acd.ISO_639_language_code_2)
-                                else:
-                                    primary_audio_language += '+副音声'  # 副音声で固定
+                                primary_audio_language = audio_language
                         else:
                             ## 副音声の言語
-                            secondary_audio_language = TSInformation.getISO639LanguageCodeName(acd.ISO_639_language_code)
+                            secondary_audio_language = audio_language
                             ## デュアルモノのみ
                             if secondary_audio_type == '1/0+1/0モード(デュアルモノ)':
-                                if bool(acd.ES_multi_lingual_flag) is True:
-                                    secondary_audio_language += '+' + \
-                                        TSInformation.getISO639LanguageCodeName(acd.ISO_639_language_code_2)
-                                else:
-                                    secondary_audio_language += '+副音声'  # 副音声で固定
+                                secondary_audio_language = audio_language
 
                     # EIT から取得できるすべての情報を取得できたら抜ける
                     ## 一回の EIT ですべての情報 (Descriptor) が降ってくるとは限らない
@@ -763,6 +778,16 @@ class TSInfoAnalyzer:
             recorded_program.secondary_audio_type = secondary_audio_type
         if secondary_audio_language is not None:  # 音声多重放送のみ存在
             recorded_program.secondary_audio_language = secondary_audio_language
+        if len(audio_component_tracks) > 0:
+            audio_tracks = list(self.recorded_video.audio_tracks)
+            for index, (audio_type, audio_language) in enumerate(audio_component_tracks):
+                if index >= len(audio_tracks):
+                    break
+                channel = GetAudioChannelLabel(audio_type)
+                if channel is not None:
+                    audio_tracks[index]['channel'] = channel
+                audio_tracks[index]['language'] = audio_language
+            self.recorded_video.audio_tracks = audio_tracks
 
         return recorded_program
 
