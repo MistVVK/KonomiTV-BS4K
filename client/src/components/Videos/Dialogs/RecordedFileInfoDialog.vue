@@ -34,6 +34,23 @@
                         {{Utils.apply28HourClock(dayjs(program.recorded_video.file_modified_at).format('YYYY/MM/DD (dd) HH:mm:ss'))}}
                     </div>
                 </div>
+                <div class="video-info__item">
+                    <div class="video-info__item-label">解析日時</div>
+                    <div class="video-info__item-value">
+                        {{program.recorded_video.analyzed_at !== null ? Utils.apply28HourClock(dayjs(program.recorded_video.analyzed_at).format('YYYY/MM/DD (dd) HH:mm:ss')) : '不明'}}
+                    </div>
+                </div>
+                <div class="video-info__item">
+                    <div class="video-info__item-label">解析時ビルド番号</div>
+                    <div class="video-info__item-value">{{program.recorded_video.analysis_git_commit ?? '不明'}}</div>
+                </div>
+                <div class="video-info__item">
+                    <div class="video-info__item-label">CM情報</div>
+                    <div class="video-info__item-value">
+                        {{program.recorded_video.cm_sections === null ? '未解析' :
+                            program.recorded_video.cm_sections.length > 0 ? `あり（${program.recorded_video.cm_sections.length}区間）` : 'なし'}}
+                    </div>
+                </div>
                 <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
                     <Icon icon="fluent:video-20-filled" width="24px" height="20px" />
                     <span class="ml-2">映像情報</span>

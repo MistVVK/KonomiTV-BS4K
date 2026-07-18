@@ -89,16 +89,20 @@ class ClientSettings(BaseModel):
     # tv_streaming_quality_cellular: 同期無効
     # bs4k_streaming_quality: 同期無効
     # bs4k_streaming_quality_cellular: 同期無効
-    # tv_data_saver_mode: 同期無効
-    # tv_data_saver_mode_cellular: 同期無効
+    # tv_encoding_codec: 同期無効
+    # tv_encoding_codec_cellular: 同期無効
+    # bs4k_tv_encoding_codec: 同期無効
+    # bs4k_tv_encoding_codec_cellular: 同期無効
     # tv_low_latency_mode: 同期無効
     # tv_low_latency_mode_cellular: 同期無効
     # tv_24fps_mode: 同期無効
     # tv_24fps_mode_cellular: 同期無効
     # video_streaming_quality: 同期無効
     # video_streaming_quality_cellular: 同期無効
-    # video_data_saver_mode: 同期無効
-    # video_data_saver_mode_cellular: 同期無効
+    # video_encoding_codec: 同期無効
+    # video_encoding_codec_cellular: 同期無効
+    # bs4k_video_encoding_codec: 同期無効
+    # bs4k_video_encoding_codec_cellular: 同期無効
     # video_24fps_mode: 同期無効
     # video_24fps_mode_cellular: 同期無効
     caption_font: str = 'Rounded M+ 1m for ARIB'
@@ -278,9 +282,9 @@ class _ServerSettingsGeneral(BaseModel):
                     f'お使いの環境では {encoder} がサポートされていないため、KonomiTV を起動できません。\n'
                     f'別のエンコーダーを選択するか、{encoder} の動作環境を整備してください。'
                 )
-            # H.265/HEVC に対応していない環境では、通信節約モードが利用できない旨を出力する
+            # H.265/HEVC に対応していない環境では、HEVC を選択できない旨を出力する
             if 'H.265/HEVC' not in result_stdout:
-                logging.warning(f'お使いの環境では {encoder} での H.265/HEVC エンコードがサポートされていないため、通信節約モードは利用できません。')
+                logging.warning(f'お使いの環境では {encoder} での H.265/HEVC エンコードがサポートされていないため、映像コーデックに HEVC は利用できません。')
         # エンコーダーのバージョン情報を取得する
         ## バージョン情報は出力の1行目にある
         result = subprocess.run(

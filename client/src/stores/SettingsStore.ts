@@ -16,7 +16,7 @@ export type BS4KLiveStreamingQuality = '4320p' | '2160p' | '1440p' | '1080p-60fp
 export const BS4K_LIVE_STREAMING_QUALITIES: BS4KLiveStreamingQuality[] = ['4320p', '2160p', '1440p', '1080p-60fps', '1080p-30fps', '810p-60fps', '810p-30fps', '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps'];
 export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
-export type RecordedVideoCodec = 'avc' | 'hevc';
+export type StreamingVideoCodec = 'avc' | 'hevc';
 
 // 番組表関連の型定義
 export type TimeTableSizeOption = 'Wide' | 'Normal' | 'Narrow';
@@ -93,17 +93,20 @@ export interface ILocalClientSettings extends IClientSettings {
     bs4k_streaming_quality_cellular: BS4KLiveStreamingQuality;
     bs4k_video_streaming_quality: BS4KLiveStreamingQuality;
     bs4k_video_streaming_quality_cellular: BS4KLiveStreamingQuality;
-    tv_data_saver_mode: boolean;
-    tv_data_saver_mode_cellular: boolean;
+    tv_encoding_codec: StreamingVideoCodec;
+    tv_encoding_codec_cellular: StreamingVideoCodec;
+    bs4k_tv_encoding_codec: StreamingVideoCodec;
+    bs4k_tv_encoding_codec_cellular: StreamingVideoCodec;
     tv_low_latency_mode: boolean;
     tv_low_latency_mode_cellular: boolean;
     tv_24fps_mode: boolean;
     tv_24fps_mode_cellular: boolean;
     video_streaming_quality: VideoStreamingQuality;
     video_streaming_quality_cellular: VideoStreamingQuality;
-    video_data_saver_mode: boolean;
-    video_data_saver_mode_cellular: boolean;
-    video_encoding_codec: RecordedVideoCodec;
+    video_encoding_codec: StreamingVideoCodec;
+    video_encoding_codec_cellular: StreamingVideoCodec;
+    bs4k_video_encoding_codec: StreamingVideoCodec;
+    bs4k_video_encoding_codec_cellular: StreamingVideoCodec;
     video_24fps_mode: boolean;
     video_24fps_mode_cellular: boolean;
     caption_font: string;
@@ -260,10 +263,14 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     bs4k_video_streaming_quality: '1080p-60fps',
     // BS4K 録画再生のデフォルトのストリーミング画質 (モバイル回線時) (Default: 540p-30fps) (同期無効)
     bs4k_video_streaming_quality_cellular: '540p-30fps',
-    // テレビを通信節約モードで視聴する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
-    tv_data_saver_mode: false,
-    // テレビを通信節約モードで視聴する (モバイル回線時)  (Default: オン) (同期無効)
-    tv_data_saver_mode_cellular: true,
+    // テレビの映像コーデック (Wi-Fi 回線時) (Default: AVC) (同期無効)
+    tv_encoding_codec: 'avc',
+    // テレビの映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
+    tv_encoding_codec_cellular: 'hevc',
+    // BS4K テレビの映像コーデック (Wi-Fi 回線時) (Default: HEVC) (同期無効)
+    bs4k_tv_encoding_codec: 'hevc',
+    // BS4K テレビの映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
+    bs4k_tv_encoding_codec_cellular: 'hevc',
     // テレビを低遅延で視聴する (Wi-Fi 回線時)  (Default: 低遅延で視聴する) (同期無効)
     tv_low_latency_mode: true,
     // テレビを低遅延で視聴する (モバイル回線時)  (Default: 低遅延で視聴しない) (同期無効)
@@ -277,12 +284,14 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     video_streaming_quality: '1080p',
     // ビデオのデフォルトのストリーミング画質 (モバイル回線時) (Default: 480p) (同期無効)
     video_streaming_quality_cellular: '480p',
-    // ビデオを通信節約モードで視聴する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
-    video_data_saver_mode: false,
-    // ビデオを通信節約モードで視聴する (モバイル回線時)  (Default: オン) (同期無効)
-    video_data_saver_mode_cellular: true,
-    // 録画再生の映像コーデック (ブラウザ単位、同期無効)
+    // 録画再生の映像コーデック (Wi-Fi 回線時) (Default: AVC) (同期無効)
     video_encoding_codec: 'avc',
+    // 録画再生の映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
+    video_encoding_codec_cellular: 'hevc',
+    // BS4K 録画再生の映像コーデック (Wi-Fi 回線時) (Default: HEVC) (同期無効)
+    bs4k_video_encoding_codec: 'hevc',
+    // BS4K 録画再生の映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
+    bs4k_video_encoding_codec_cellular: 'hevc',
     // ビデオを 24fps モードで再生する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
     video_24fps_mode: false,
     // ビデオを 24fps モードで再生する (モバイル回線時)  (Default: オフ) (同期無効)
@@ -419,17 +428,20 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     // bs4k_streaming_quality_cellular: 同期無効
     // bs4k_video_streaming_quality: 同期無効
     // bs4k_video_streaming_quality_cellular: 同期無効
-    // tv_data_saver_mode: 同期無効
-    // tv_data_saver_mode_cellular: 同期無効
+    // tv_encoding_codec: 同期無効
+    // tv_encoding_codec_cellular: 同期無効
+    // bs4k_tv_encoding_codec: 同期無効
+    // bs4k_tv_encoding_codec_cellular: 同期無効
     // tv_low_latency_mode: 同期無効
     // tv_low_latency_mode_cellular: 同期無効
     // tv_24fps_mode: 同期無効
     // tv_24fps_mode_cellular: 同期無効
     // video_streaming_quality: 同期無効
     // video_streaming_quality_cellular: 同期無効
-    // video_data_saver_mode: 同期無効
-    // video_data_saver_mode_cellular: 同期無効
     // video_encoding_codec: 同期無効
+    // video_encoding_codec_cellular: 同期無効
+    // bs4k_video_encoding_codec: 同期無効
+    // bs4k_video_encoding_codec_cellular: 同期無効
     // video_24fps_mode: 同期無効
     // video_24fps_mode_cellular: 同期無効
     'caption_font',
@@ -523,6 +535,32 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
             // (配列などの参照型を直接代入すると ILocalClientSettingsDefault が汚染される恐れがあるため)
             normalized_settings[default_settings_key] = structuredClone(ILocalClientSettingsDefault[default_settings_key]);
         }
+    }
+
+    // 通信節約モードを廃止し、用途・回線別の映像コーデック設定へ移行する。
+    // 新キーが生データにない場合だけ旧値を引き継ぎ、移行後のユーザー設定を上書きしない。
+    const codecFromDataSaver = (value: unknown): StreamingVideoCodec => value === true ? 'hevc' : 'avc';
+    if (!('tv_encoding_codec' in settings) && 'tv_data_saver_mode' in settings) {
+        normalized_settings.tv_encoding_codec = codecFromDataSaver(settings.tv_data_saver_mode);
+    }
+    if (!('tv_encoding_codec_cellular' in settings) && 'tv_data_saver_mode_cellular' in settings) {
+        normalized_settings.tv_encoding_codec_cellular = codecFromDataSaver(settings.tv_data_saver_mode_cellular);
+    }
+    if (!('bs4k_tv_encoding_codec' in settings) && 'tv_data_saver_mode' in settings) {
+        normalized_settings.bs4k_tv_encoding_codec = codecFromDataSaver(settings.tv_data_saver_mode);
+    }
+    if (!('bs4k_tv_encoding_codec_cellular' in settings) && 'tv_data_saver_mode_cellular' in settings) {
+        normalized_settings.bs4k_tv_encoding_codec_cellular = codecFromDataSaver(settings.tv_data_saver_mode_cellular);
+    }
+    if (!('video_encoding_codec_cellular' in settings) &&
+        (settings.video_encoding_codec === 'avc' || settings.video_encoding_codec === 'hevc')) {
+        normalized_settings.video_encoding_codec_cellular = settings.video_encoding_codec;
+    }
+    if (!('bs4k_video_encoding_codec' in settings) && 'video_data_saver_mode' in settings) {
+        normalized_settings.bs4k_video_encoding_codec = codecFromDataSaver(settings.video_data_saver_mode);
+    }
+    if (!('bs4k_video_encoding_codec_cellular' in settings) && 'video_data_saver_mode_cellular' in settings) {
+        normalized_settings.bs4k_video_encoding_codec_cellular = codecFromDataSaver(settings.video_data_saver_mode_cellular);
     }
 
     // 旧 selected_twitter_account_id (Twitter アカウント単独参照) を

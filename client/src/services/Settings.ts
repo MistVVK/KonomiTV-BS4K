@@ -60,16 +60,20 @@ export interface IClientSettings {
     // bs4k_streaming_quality_cellular: 同期無効
     // bs4k_video_streaming_quality: 同期無効
     // bs4k_video_streaming_quality_cellular: 同期無効
-    // tv_data_saver_mode: 同期無効
-    // tv_data_saver_mode_cellular: 同期無効
+    // tv_encoding_codec: 同期無効
+    // tv_encoding_codec_cellular: 同期無効
+    // bs4k_tv_encoding_codec: 同期無効
+    // bs4k_tv_encoding_codec_cellular: 同期無効
     // tv_low_latency_mode: 同期無効
     // tv_low_latency_mode_cellular: 同期無効
     // tv_24fps_mode: 同期無効
     // tv_24fps_mode_cellular: 同期無効
     // video_streaming_quality: 同期無効
     // video_streaming_quality_cellular: 同期無効
-    // video_data_saver_mode: 同期無効
-    // video_data_saver_mode_cellular: 同期無効
+    // video_encoding_codec: 同期無効
+    // video_encoding_codec_cellular: 同期無効
+    // bs4k_video_encoding_codec: 同期無効
+    // bs4k_video_encoding_codec_cellular: 同期無効
     // video_24fps_mode: 同期無効
     // video_24fps_mode_cellular: 同期無効
     caption_font: string;

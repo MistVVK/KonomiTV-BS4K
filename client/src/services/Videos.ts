@@ -46,6 +46,8 @@ export interface IRecordedVideo {
     file_size: number;
     file_created_at: string;
     file_modified_at: string;
+    analyzed_at: string | null;
+    analysis_git_commit: string | null;
     recording_start_time: string | null;
     recording_end_time: string | null;
     duration: number;
@@ -110,6 +112,8 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     file_size: 0,
     file_created_at: '2000-01-01T00:00:00+09:00',
     file_modified_at: '2000-01-01T00:00:00+09:00',
+    analyzed_at: null,
+    analysis_git_commit: null,
     recording_start_time: null,
     recording_end_time: null,
     duration: 0,

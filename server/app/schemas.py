@@ -175,6 +175,8 @@ class RecordedVideo(PydanticModel):
     file_size: int
     file_created_at: datetime
     file_modified_at: datetime
+    analyzed_at: datetime | None = None
+    analysis_git_commit: str | None = None
     recording_start_time: datetime | None
     recording_end_time: datetime | None
     duration: float

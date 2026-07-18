@@ -39,6 +39,8 @@ class RecordedVideo(TortoiseModel):
     file_size = fields.IntField()
     file_created_at = fields.DatetimeField()
     file_modified_at = fields.DatetimeField()
+    analyzed_at = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
+    analysis_git_commit = cast(TortoiseField[str | None], fields.CharField(255, null=True))
     recording_start_time = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     recording_end_time = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     duration = fields.FloatField()

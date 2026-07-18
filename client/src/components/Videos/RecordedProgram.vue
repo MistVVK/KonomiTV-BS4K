@@ -190,6 +190,11 @@ const reanalyzeVideo = async () => {
     Message.success('メタデータの再解析を開始します。完了までしばらくお待ちください。');
     const result = await Videos.reanalyzeVideo(props.program.id);
     if (result === true) {
+        // 再解析で更新された解析日時・CM情報などを、ページ再読み込みなしで表示へ反映する
+        const updated_program = await Videos.fetchVideo(props.program.id);
+        if (updated_program !== null) {
+            Object.assign(props.program, updated_program);
+        }
         Message.success('メタデータの再解析が完了しました。');
     }
 };

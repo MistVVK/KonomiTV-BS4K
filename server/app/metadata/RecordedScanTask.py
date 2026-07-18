@@ -26,6 +26,7 @@ from app.models.RecordedVideo import RecordedVideo
 from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.DriveIOLimiter import DriveIOLimiter
+from app.utils.Git import GetGitCommit
 from app.utils.ProcessLimiter import ProcessLimiter
 from app.utils.TSInformation import TSInformation
 
@@ -961,6 +962,9 @@ class RecordedScanTask:
             db_recorded_video.file_size = recorded_program.recorded_video.file_size
             db_recorded_video.file_created_at = recorded_program.recorded_video.file_created_at
             db_recorded_video.file_modified_at = recorded_program.recorded_video.file_modified_at
+            # 解析結果を保存する直前の日時と実行中ビルドを記録し、後から解析結果の由来を追跡できるようにする
+            db_recorded_video.analyzed_at = datetime.now(tz=JST)
+            db_recorded_video.analysis_git_commit = await GetGitCommit()
             db_recorded_video.recording_start_time = recorded_program.recorded_video.recording_start_time
             db_recorded_video.recording_end_time = recorded_program.recorded_video.recording_end_time
             db_recorded_video.duration = recorded_program.recorded_video.duration

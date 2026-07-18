@@ -126,28 +126,27 @@
                         :items="bs4k_streaming_quality_cellular" v-model="settings_store.settings.bs4k_streaming_quality_cellular">
                     </v-select>
                 </div>
-                <div class="settings__item settings__item--switch settings__item--sync-disabled"
-                    :class="{'settings__item--disabled': PlayerUtils.isHEVCVideoSupported() === false}">
-                    <label class="settings__item-heading" :for="`bs4k_tv_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
-                        BS4K ライブ視聴を通信節約モードにする
-                    </label>
-                    <label class="settings__item-label" :for="`bs4k_tv_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
-                        画質設定のテレビ通信節約モードと同じ設定です。H.265 / HEVC で通信量を抑えて視聴します。<br>
-                    </label>
+                <div class="settings__item settings__item--sync-disabled">
+                    <div class="settings__item-heading">BS4K ライブ視聴の映像コーデック</div>
+                    <div class="settings__item-label">
+                        AVC は互換性を、HEVC は通信量の削減を優先します。HEVC 非対応環境では再生時だけ AVC に戻します。<br>
+                    </div>
                     <div class="settings__item-label mt-1">
                         <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === false">
-                            このデバイスでは通信節約モードがサポートされていません。
+                            このデバイスでは HEVC がサポートされていません。
                         </p>
                         <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === true">
-                            お使いの Firefox ブラウザでは通信節約モードがサポートされていません。
+                            お使いの Firefox ブラウザでは HEVC がサポートされていません。
                         </p>
                     </div>
-                    <v-switch class="settings__item-switch" color="primary" id="bs4k_tv_data_saver_mode" hide-details v-if="network_circuit !== 'モバイル回線時'"
-                        v-model="settings_store.settings.tv_data_saver_mode" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
-                    </v-switch>
-                    <v-switch class="settings__item-switch" color="primary" id="bs4k_tv_data_saver_mode_cellular" hide-details v-if="network_circuit === 'モバイル回線時'"
-                        v-model="settings_store.settings.tv_data_saver_mode_cellular" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
-                    </v-switch>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                        v-if="network_circuit !== 'モバイル回線時'" v-model="settings_store.settings.bs4k_tv_encoding_codec">
+                    </v-select>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                        v-if="network_circuit === 'モバイル回線時'" v-model="settings_store.settings.bs4k_tv_encoding_codec_cellular">
+                    </v-select>
                 </div>
                 <div class="settings__item settings__item--sync-disabled">
                     <div class="settings__item-heading">BS4K 録画再生のデフォルトのストリーミング画質</div>
@@ -164,28 +163,27 @@
                         :items="bs4k_video_streaming_quality_cellular" v-model="settings_store.settings.bs4k_video_streaming_quality_cellular">
                     </v-select>
                 </div>
-                <div class="settings__item settings__item--switch settings__item--sync-disabled"
-                    :class="{'settings__item--disabled': PlayerUtils.isHEVCVideoSupported() === false}">
-                    <label class="settings__item-heading" :for="`bs4k_video_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
-                        BS4K 録画再生を通信節約モードにする
-                    </label>
-                    <label class="settings__item-label" :for="`bs4k_video_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
-                        画質設定のビデオ通信節約モードと同じ設定です。ONID=11 の録画再生時に H.265 / HEVC で通信量を抑えます。<br>
-                    </label>
+                <div class="settings__item settings__item--sync-disabled">
+                    <div class="settings__item-heading">BS4K 録画再生の映像コーデック</div>
+                    <div class="settings__item-label">
+                        AVC は互換性を、HEVC は通信量の削減を優先します。HEVC 非対応環境では再生時だけ AVC に戻します。<br>
+                    </div>
                     <div class="settings__item-label mt-1">
                         <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === false">
-                            このデバイスでは通信節約モードがサポートされていません。
+                            このデバイスでは HEVC がサポートされていません。
                         </p>
                         <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === true">
-                            お使いの Firefox ブラウザでは通信節約モードがサポートされていません。
+                            お使いの Firefox ブラウザでは HEVC がサポートされていません。
                         </p>
                     </div>
-                    <v-switch class="settings__item-switch" color="primary" id="bs4k_video_data_saver_mode" hide-details v-if="network_circuit !== 'モバイル回線時'"
-                        v-model="settings_store.settings.video_data_saver_mode" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
-                    </v-switch>
-                    <v-switch class="settings__item-switch" color="primary" id="bs4k_video_data_saver_mode_cellular" hide-details v-if="network_circuit === 'モバイル回線時'"
-                        v-model="settings_store.settings.video_data_saver_mode_cellular" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
-                    </v-switch>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                        v-if="network_circuit !== 'モバイル回線時'" v-model="settings_store.settings.bs4k_video_encoding_codec">
+                    </v-select>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                        v-if="network_circuit === 'モバイル回線時'" v-model="settings_store.settings.bs4k_video_encoding_codec_cellular">
+                    </v-select>
                 </div>
             </div>
         </div>
@@ -301,17 +299,21 @@ settings_store.settings.bs4k_video_streaming_quality_cellular =
     legacy_bs4k_quality_map[settings_store.settings.bs4k_video_streaming_quality_cellular] ?? settings_store.settings.bs4k_video_streaming_quality_cellular;
 const player_tab = ref<number | null>(0);
 const network_circuits = ['Wi-Fi 回線時', 'モバイル回線時'];
+const streaming_video_codecs = [
+    {title: 'H.264 / AVC（互換性優先）', value: 'avc'},
+    {title: 'H.265 / HEVC（通信量優先）', value: 'hevc'},
+];
 const bs4k_streaming_quality = computed(() => {
-    return settings_store.settings.tv_data_saver_mode === true ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+    return settings_store.settings.bs4k_tv_encoding_codec === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
 });
 const bs4k_streaming_quality_cellular = computed(() => {
-    return settings_store.settings.tv_data_saver_mode_cellular === true ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+    return settings_store.settings.bs4k_tv_encoding_codec_cellular === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
 });
 const bs4k_video_streaming_quality = computed(() => {
-    return settings_store.settings.video_data_saver_mode === true ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+    return settings_store.settings.bs4k_video_encoding_codec === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
 });
 const bs4k_video_streaming_quality_cellular = computed(() => {
-    return settings_store.settings.video_data_saver_mode_cellular === true ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+    return settings_store.settings.bs4k_video_encoding_codec_cellular === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
 });
 
 // エンコーダーの選択肢

@@ -167,11 +167,13 @@ class PlayerController {
         tv_streaming_quality: LiveStreamingQuality;
         bs4k_streaming_quality: BS4KLiveStreamingQuality;
         bs4k_video_streaming_quality: BS4KLiveStreamingQuality;
-        tv_data_saver_mode: boolean;
+        tv_encoding_codec: 'avc' | 'hevc';
+        bs4k_tv_encoding_codec: 'avc' | 'hevc';
         tv_low_latency_mode: boolean;
         tv_24fps_mode: boolean;
         video_streaming_quality: VideoStreamingQuality;
-        video_data_saver_mode: boolean;
+        video_encoding_codec: 'avc' | 'hevc';
+        bs4k_video_encoding_codec: 'avc' | 'hevc';
         video_24fps_mode: boolean;
     } {
         const settings_store = useSettingsStore();
@@ -181,11 +183,13 @@ class PlayerController {
                 tv_streaming_quality: settings_store.settings.tv_streaming_quality_cellular,
                 bs4k_streaming_quality: settings_store.settings.bs4k_streaming_quality_cellular,
                 bs4k_video_streaming_quality: settings_store.settings.bs4k_video_streaming_quality_cellular,
-                tv_data_saver_mode: settings_store.settings.tv_data_saver_mode_cellular,
+                tv_encoding_codec: settings_store.settings.tv_encoding_codec_cellular,
+                bs4k_tv_encoding_codec: settings_store.settings.bs4k_tv_encoding_codec_cellular,
                 tv_low_latency_mode: settings_store.settings.tv_low_latency_mode_cellular,
                 tv_24fps_mode: settings_store.settings.tv_24fps_mode_cellular,
                 video_streaming_quality: settings_store.settings.video_streaming_quality_cellular,
-                video_data_saver_mode: settings_store.settings.video_data_saver_mode_cellular,
+                video_encoding_codec: settings_store.settings.video_encoding_codec_cellular,
+                bs4k_video_encoding_codec: settings_store.settings.bs4k_video_encoding_codec_cellular,
                 video_24fps_mode: settings_store.settings.video_24fps_mode_cellular,
             };
         // Wi-Fi 回線向けの画質プロファイルを返す
@@ -194,11 +198,13 @@ class PlayerController {
                 tv_streaming_quality: settings_store.settings.tv_streaming_quality,
                 bs4k_streaming_quality: settings_store.settings.bs4k_streaming_quality,
                 bs4k_video_streaming_quality: settings_store.settings.bs4k_video_streaming_quality,
-                tv_data_saver_mode: settings_store.settings.tv_data_saver_mode,
+                tv_encoding_codec: settings_store.settings.tv_encoding_codec,
+                bs4k_tv_encoding_codec: settings_store.settings.bs4k_tv_encoding_codec,
                 tv_low_latency_mode: settings_store.settings.tv_low_latency_mode,
                 tv_24fps_mode: settings_store.settings.tv_24fps_mode,
                 video_streaming_quality: settings_store.settings.video_streaming_quality,
-                video_data_saver_mode: settings_store.settings.video_data_saver_mode,
+                video_encoding_codec: settings_store.settings.video_encoding_codec,
+                bs4k_video_encoding_codec: settings_store.settings.bs4k_video_encoding_codec,
                 video_24fps_mode: settings_store.settings.video_24fps_mode,
             };
         }
@@ -268,15 +274,15 @@ class PlayerController {
         // KeyboardShortcutManager がこのタイミングで破棄される
         player_store.is_player_initialized = true;
 
-        // ライブは従来の通信節約設定、録画はブラウザ単位の明示設定から映像コーデックを決める。
+        // 通常 / BS4K、ライブ / 録画、回線プロファイルごとの設定から映像コーデックを決める。
         // 非対応時は保存設定を書き換えず、この再生だけ互換コーデックへ戻す。
-        let is_hevc_playback = false;
-        if (PlayerUtils.isHEVCVideoSupported() && (
-            (this.playback_mode === 'Live' && this.quality_profile.tv_data_saver_mode === true) ||
-            (this.playback_mode === 'Video' && settings_store.settings.video_encoding_codec === 'hevc')
-        )) {
-            is_hevc_playback = true;
-        }
+        const is_bs4k_stream = this.playback_mode === 'Live' ?
+            channels_store.channel.current.display_channel_id.startsWith('bs4k') :
+            player_store.recorded_program.network_id === 0x000B;
+        const selected_video_codec = this.playback_mode === 'Live' ?
+            (is_bs4k_stream ? this.quality_profile.bs4k_tv_encoding_codec : this.quality_profile.tv_encoding_codec) :
+            (is_bs4k_stream ? this.quality_profile.bs4k_video_encoding_codec : this.quality_profile.video_encoding_codec);
+        const is_hevc_playback = PlayerUtils.isHEVCVideoSupported() && selected_video_codec === 'hevc';
         const recorded_video_codec = is_hevc_playback === true ? 'hevc' : 'avc';
         // 録画HLSの音声は互換性を優先してAACへ固定する。
         const recorded_audio_codec = 'aac';
@@ -294,7 +300,7 @@ class PlayerController {
             )
         );
 
-        // HEVC 10bit は通信節約モード中の対応環境にだけ透過的に要求する
+        // HEVC 10bit は HEVC 選択中の対応環境にだけ透過的に要求する
         // MediaCapabilities で滑らかに再生できると判断できない場合は、通常の HEVC 8bit に留めて互換性を優先する
         const is_hevc_10bit_playback = (
             is_hevc_playback === true &&
@@ -925,11 +931,7 @@ class PlayerController {
         // デバッグ用にプレイヤーインスタンスも window 直下に入れる
         (window as any).player = this.player;
 
-        if (
-            this.playback_mode === 'Video' &&
-            settings_store.settings.video_encoding_codec === 'hevc' &&
-            recorded_video_codec === 'avc'
-        ) {
+        if (selected_video_codec === 'hevc' && is_hevc_playback === false) {
             this.player.notice('このブラウザは HEVC に対応していないため、今回の再生では AVC を使用します。');
         }
         // この時点で DPlayer のコンテナ要素に dplayer-mobile クラスが付与されている場合、
@@ -2525,6 +2527,8 @@ class PlayerController {
     private setupSettingPanelHandler(): void {
         assert(this.player !== null);
         const player_store = usePlayerStore();
+        const channels_store = useChannelsStore();
+        const settings_store = useSettingsStore();
 
         // 設定パネルの開閉を把握するためモンキーパッチを追加し、PlayerStore に通知する
         const original_hide = this.player.setting.hide;
@@ -2540,8 +2544,13 @@ class PlayerController {
             player_store.is_player_setting_panel_open = true;
         };
 
-        // モバイル回線プロファイルに切り替えるボタンを動的に追加する
+        // 映像コーデック選択とモバイル回線プロファイルに切り替えるボタンを動的に追加する
         this.player.template.audio.insertAdjacentHTML('afterend', `
+            <div class="dplayer-setting-item dplayer-setting-video-codec">
+                <span class="dplayer-label">映像コーデック</span>
+                <span class="dplayer-label-value dplayer-setting-video-codec-value"></span>
+                <div class="dplayer-toggle dplayer-setting-video-codec-arrow"></div>
+            </div>
             <div class="dplayer-setting-item dplayer-setting-mobile-profile">
                 <span class="dplayer-label">モバイル回線向け画質</span>
                 <div class="dplayer-toggle">
@@ -2550,6 +2559,100 @@ class PlayerController {
                 </div>
             </div>
         `);
+
+        // 音声トラックと同じ構成のサブパネルを追加する
+        this.player.template.settingBox.insertAdjacentHTML('beforeend', `
+            <div class="dplayer-setting-video-codec-panel"
+                style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
+                <div class="dplayer-setting-header dplayer-setting-video-codec-header"
+                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer;">
+                    <div class="dplayer-toggle dplayer-setting-video-codec-back"
+                        style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                    <span class="dplayer-label">映像コーデック</span>
+                </div>
+                <div class="dplayer-setting-video-codec-item" data-codec="avc"
+                    style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer;">
+                    <div class="dplayer-toggle dplayer-setting-video-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                    <span class="dplayer-label">AVC</span>
+                </div>
+                <div class="dplayer-setting-video-codec-item" data-codec="hevc"
+                    style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer;">
+                    <div class="dplayer-toggle dplayer-setting-video-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                    <span class="dplayer-label">HEVC</span>
+                </div>
+            </div>
+        `);
+
+        // DPlayer が持つ音声トラック用の矢印・戻る・チェックアイコンを流用して見た目を揃える
+        const audio_arrow_html = this.player.template.audio.querySelector<HTMLElement>('.dplayer-toggle')?.innerHTML ?? '';
+        const audio_back_html = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-header .dplayer-toggle')?.innerHTML ?? '';
+        const audio_check_html = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-item .dplayer-toggle')?.innerHTML ?? '';
+        this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-arrow')!.innerHTML = audio_arrow_html;
+        this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-back')!.innerHTML = audio_back_html;
+        this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-video-codec-check')
+            .forEach((element) => element.innerHTML = audio_check_html);
+
+        // 現在の再生種別・放送種別・回線プロファイルに対応する設定キーを取得する
+        const is_bs4k = this.playback_mode === 'Live' ?
+            channels_store.channel.current.display_channel_id.startsWith('bs4k') :
+            player_store.recorded_program.network_id === 0x000B;
+        type VideoCodecSettingKey =
+            'tv_encoding_codec' | 'tv_encoding_codec_cellular' |
+            'bs4k_tv_encoding_codec' | 'bs4k_tv_encoding_codec_cellular' |
+            'video_encoding_codec' | 'video_encoding_codec_cellular' |
+            'bs4k_video_encoding_codec' | 'bs4k_video_encoding_codec_cellular';
+        const get_video_codec_setting_key = (): VideoCodecSettingKey => {
+            const cellular_suffix = this.quality_profile_type === 'Cellular' ? '_cellular' : '';
+            if (this.playback_mode === 'Live') {
+                return `${is_bs4k ? 'bs4k_' : ''}tv_encoding_codec${cellular_suffix}` as VideoCodecSettingKey;
+            }
+            return `${is_bs4k ? 'bs4k_' : ''}video_encoding_codec${cellular_suffix}` as VideoCodecSettingKey;
+        };
+
+        // サブパネルは設定画面と同じ SettingsStore の値を直接読み書きする
+        const setting_box = this.player.template.settingBox;
+        const setting_origin_panel = this.player.template.settingOriginPanel;
+        const video_codec_button = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec')!;
+        const video_codec_value = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-value')!;
+        const video_codec_panel = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-panel')!;
+        const video_codec_items = Array.from(this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-video-codec-item'));
+        const update_video_codec_display = () => {
+            const selected_codec = settings_store.settings[get_video_codec_setting_key()];
+            video_codec_value.textContent = selected_codec.toUpperCase();
+            video_codec_items.forEach((item) => {
+                const check = item.querySelector<HTMLElement>('.dplayer-setting-video-codec-check');
+                if (check !== null) check.style.visibility = item.dataset.codec === selected_codec ? 'visible' : 'hidden';
+            });
+        };
+        const close_video_codec_panel = () => {
+            setting_origin_panel.style.transform = '';
+            video_codec_panel.style.transform = 'translateX(100%)';
+            setting_box.style.clipPath = '';
+        };
+        update_video_codec_display();
+        video_codec_button.addEventListener('click', () => {
+            update_video_codec_display();
+            setting_origin_panel.style.transform = 'translateX(-100%)';
+            video_codec_panel.style.transform = 'translateX(0%)';
+            setting_box.style.clipPath = 'inset(calc(100% - 114px) 0 0 round 7px)';
+        });
+        this.player.container.querySelector('.dplayer-setting-video-codec-header')!.addEventListener('click', close_video_codec_panel);
+        video_codec_items.forEach((item) => {
+            item.addEventListener('click', () => {
+                const codec = item.dataset.codec as 'avc' | 'hevc';
+                settings_store.settings[get_video_codec_setting_key()] = codec;
+                update_video_codec_display();
+                close_video_codec_panel();
+                // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
+                this.player?.setting.hide();
+                player_store.event_emitter.emit('PlayerRestartRequired', {
+                    message: `映像コーデックを ${codec.toUpperCase()} に変更しました。`,
+                    message_delay_seconds: this.tv_low_latency_mode || this.playback_mode === 'Video' ? 2 : 4.5,
+                    is_error_message: false,
+                    should_resume_quality: true,
+                });
+            });
+        });
 
         // デフォルトのチェック状態を画質プロファイルタイプに合わせる
         const toggle_mobile_profile_input = this.player.container.querySelector<HTMLInputElement>('.dplayer-mobile-profile-setting-input')!;
@@ -2564,6 +2667,7 @@ class PlayerController {
             if (toggle_mobile_profile_input.checked) {
                 this.quality_profile_type = 'Cellular';
                 player_store.selected_quality_profile_type = this.quality_profile_type;
+                update_video_codec_display();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: 'モバイル回線向けの画質プロファイルに切り替えました。',
                     // 他の通知と被らないように、メッセージを遅らせて表示する
@@ -2576,6 +2680,7 @@ class PlayerController {
             } else {
                 this.quality_profile_type = 'Wi-Fi';
                 player_store.selected_quality_profile_type = this.quality_profile_type;
+                update_video_codec_display();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: 'Wi-Fi 回線向けの画質プロファイルに切り替えました。',
                     // 他の通知と被らないように、メッセージを遅らせて表示する

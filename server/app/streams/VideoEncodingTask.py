@@ -425,7 +425,7 @@ class VideoEncodingTask:
         ## バンディング軽減のためのオプション (速度低下を鑑みて当面 NVEncC でのみ有効にする)
         if encoder_type == 'NVEncC':
             options.append('--vpp-deband')
-        # 通信節約モードでは、HEVC 10bit のデコードに対応したクライアント向けに HEVC 10bit でエンコードし、さらにバンディング耐性を高める
+        # HEVC 選択時は、HEVC 10bit のデコードに対応したクライアント向けに HEVC 10bit でエンコードし、さらにバンディング耐性を高める
         ## (VCEEncC は HEVC 10bit 対応の機種かを判定できず、rkmppenc は HEVC 10bit エンコード自体に非対応のため設定しない)
         ## --fallback-bitdepth により、GPU 側が HEVC 10bit 非対応の場合でも 8bit へフォールバックされる
         ## 末尾の -10bit は、HEVC 10bit でのエンコードを試すストリームであることだけを表す

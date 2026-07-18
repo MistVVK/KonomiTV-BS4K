@@ -43,29 +43,27 @@
                     :items="tv_streaming_quality_cellular" v-model="settingsStore.settings.tv_streaming_quality_cellular">
                 </v-select>
             </div>
-            <div class="settings__item settings__item--switch settings__item--sync-disabled"
-                :class="{'settings__item--disabled': PlayerUtils.isHEVCVideoSupported() === false}">
-                <label class="settings__item-heading" :for="`tv_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
-                    テレビを通信節約モードで視聴する
-                </label>
-                <label class="settings__item-label" :for="`tv_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
-                    通信節約モードでは、圧縮率の高い H.265 / HEVC を使い、<b>画質はほぼそのまま、通信量を通常より 50% 〜 70% 削減して視聴できます！</b> サーバー PC によっては高負荷になることがあります。<br>
-                </label>
+            <div class="settings__item settings__item--sync-disabled">
+                <div class="settings__item-heading">ライブ視聴の映像コーデック</div>
+                <div class="settings__item-label">
+                    AVC は互換性を、HEVC は通信量の削減を優先します。HEVC 非対応環境では再生時だけ AVC に戻します。<br>
+                </div>
                 <div class="settings__item-label mt-1">
-                    通信が不安定になりがちなモバイル回線 (4G/5G)・通信速度の遅いフリー Wi-Fi から視聴するときに特におすすめです。<br>
                     <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === false">
-                        このデバイスでは通信節約モードがサポートされていません。
+                        このデバイスでは HEVC がサポートされていません。
                     </p>
                     <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === true">
-                        お使いの Firefox ブラウザでは通信節約モードがサポートされていません。
+                        お使いの Firefox ブラウザでは HEVC がサポートされていません。
                     </p>
                 </div>
-                <v-switch class="settings__item-switch" color="primary" id="tv_data_saver_mode" hide-details v-if="network_circuit !== 'モバイル回線時'"
-                    v-model="settingsStore.settings.tv_data_saver_mode" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
-                </v-switch>
-                <v-switch class="settings__item-switch" color="primary" id="tv_data_saver_mode_cellular" hide-details v-if="network_circuit === 'モバイル回線時'"
-                    v-model="settingsStore.settings.tv_data_saver_mode_cellular" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
-                </v-switch>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                    v-if="network_circuit !== 'モバイル回線時'" v-model="settingsStore.settings.tv_encoding_codec">
+                </v-select>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                    v-if="network_circuit === 'モバイル回線時'" v-model="settingsStore.settings.tv_encoding_codec_cellular">
+                </v-select>
             </div>
             <div class="settings__item settings__item--switch settings__item--sync-disabled">
                 <label class="settings__item-heading" :for="`tv_low_latency_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
@@ -134,8 +132,12 @@
                     AVC は互換性を、HEVC は通信量の削減を優先します。非対応環境では再生時だけ AVC に戻します。
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
-                    :density="is_form_dense ? 'compact' : 'default'"
-                    :items="recorded_video_codecs" v-model="settingsStore.settings.video_encoding_codec">
+                    :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                    v-if="network_circuit !== 'モバイル回線時'" v-model="settingsStore.settings.video_encoding_codec">
+                </v-select>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'" :items="streaming_video_codecs"
+                    v-if="network_circuit === 'モバイル回線時'" v-model="settingsStore.settings.video_encoding_codec_cellular">
                 </v-select>
             </div>
             <div class="settings__item settings__item--switch settings__item--sync-disabled">
@@ -219,7 +221,7 @@ export default defineComponent({
             video_streaming_quality: QUALITY_H264,
             video_streaming_quality_cellular: QUALITY_H264,
 
-            recorded_video_codecs: [
+            streaming_video_codecs: [
                 {title: 'H.264 / AVC（互換性優先）', value: 'avc'},
                 {title: 'H.265 / HEVC（通信量優先）', value: 'hevc'},
             ],
@@ -229,20 +231,20 @@ export default defineComponent({
         ...mapStores(useSettingsStore),
     },
     watch: {
-        'settingsStore.settings.tv_data_saver_mode': {
+        'settingsStore.settings.tv_encoding_codec': {
             immediate: true,
-            handler(value: boolean) {
-                if (value === true) {
+            handler(value: 'avc' | 'hevc') {
+                if (value === 'hevc') {
                     this.tv_streaming_quality = QUALITY_H265;
                 } else {
                     this.tv_streaming_quality = QUALITY_H264;
                 }
             },
         },
-        'settingsStore.settings.tv_data_saver_mode_cellular': {
+        'settingsStore.settings.tv_encoding_codec_cellular': {
             immediate: true,
-            handler(value: boolean) {
-                if (value === true) {
+            handler(value: 'avc' | 'hevc') {
+                if (value === 'hevc') {
                     this.tv_streaming_quality_cellular = QUALITY_H265;
                 } else {
                     this.tv_streaming_quality_cellular = QUALITY_H264;
@@ -254,27 +256,22 @@ export default defineComponent({
             handler(value: 'avc' | 'hevc') {
                 if (value === 'hevc') {
                     this.video_streaming_quality = QUALITY_H265;
-                    this.video_streaming_quality_cellular = QUALITY_H265;
                 } else {
                     this.video_streaming_quality = QUALITY_H264;
+                }
+            },
+        },
+        'settingsStore.settings.video_encoding_codec_cellular': {
+            immediate: true,
+            handler(value: 'avc' | 'hevc') {
+                if (value === 'hevc') {
+                    this.video_streaming_quality_cellular = QUALITY_H265;
+                } else {
                     this.video_streaming_quality_cellular = QUALITY_H264;
                 }
             },
         },
     },
-    created() {
-        // 通信節約モードならストリーミング画質の選択肢を H.265 にする
-        if (this.settingsStore.settings.tv_data_saver_mode === true) {
-            this.tv_streaming_quality = QUALITY_H265;
-        }
-        if (this.settingsStore.settings.tv_data_saver_mode_cellular === true) {
-            this.tv_streaming_quality_cellular = QUALITY_H265;
-        }
-        if (this.settingsStore.settings.video_encoding_codec === 'hevc') {
-            this.video_streaming_quality = QUALITY_H265;
-            this.video_streaming_quality_cellular = QUALITY_H265;
-        }
-    }
 });
 
 </script>
