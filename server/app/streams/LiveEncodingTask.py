@@ -30,6 +30,7 @@ from app.constants import (
 )
 from app.models.Channel import Channel
 from app.streams.LivePSIDataArchiver import LivePSIDataArchiver
+from app.streams.StreamEncodingOptions import GetEncoderForLiveChannel
 from app.utils import GetMirakurunAPIEndpointURL
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.edcb.PipeStreamReader import PipeStreamReader
@@ -134,7 +135,11 @@ class LiveEncodingTask:
         options: list[str] = []
 
         # 入力ストリームの解析時間
-        analyzeduration = round(500000 + (self._retry_count * 200000))  # リトライ回数に応じて少し増やす
+        CONFIG = Config()
+        if channel_type == 'BS4K' and CONFIG.general.encoder_bs4k_input_analysis_enabled is True:
+            analyzeduration = round((CONFIG.general.encoder_bs4k_input_analyze * 1000000) + (self._retry_count * 200000))
+        else:
+            analyzeduration = round(500000 + (self._retry_count * 200000))  # リトライ回数に応じて少し増やす
         if channel_type == 'SKY':
             # スカパー！プレミアムサービスのチャンネルは入力ストリームの解析時間を長めにする (その方がうまくいく)
             ## ほかと違い H.264 コーデックが採用されていることが影響しているのかも
@@ -152,8 +157,14 @@ class LiveEncodingTask:
         ## 主に FFmpeg の起動を高速化するための設定
         ## max_interleave_delta: mux 時に影響するオプションで、増やしすぎると CM で詰まりがちになる
         ## リトライなしの場合は 500K (0.5秒) に設定し、リトライ回数に応じて 100K (0.1秒) ずつ増やす
-        max_interleave_delta = round(500 + (self._retry_count * 100))
-        options.append(f'-fflags nobuffer -flags low_delay -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
+        if channel_type == 'BS4K':
+            max_interleave_delta = round(CONFIG.general.encoder_bs4k_max_interleave_delta + (self._retry_count * 100))
+        else:
+            max_interleave_delta = round(500 + (self._retry_count * 100))
+        if channel_type == 'BS4K' and CONFIG.general.encoder_bs4k_low_latency is False:
+            options.append(f'-max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
+        else:
+            options.append(f'-fflags nobuffer -flags low_delay -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
 
         # 映像
         ## コーデック
@@ -184,10 +195,13 @@ class LiveEncodingTask:
             ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
             gop_length_second = self.GOP_LENGTH_SECONDS_H265
 
-        ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わず 60fps でエンコードする
+        ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わない
         if channel_type == "BS4K":
             options.append(f'-vf scale={video_width}:{video_height}')
-            options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
+            if '-30fps' in quality:
+                options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
+            else:
+                options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
         else:
             ## インターレース解除 (60i → 60p (フレームレート: 60fps))
             if QUALITY[quality].is_60fps is True:
@@ -288,19 +302,33 @@ class LiveEncodingTask:
         options: list[str] = []
 
         # 入力ストリームの解析時間
-        input_probesize = round(1000 + (self._retry_count * 500))  # リトライ回数に応じて少し増やす
-        input_analyze = round(0.7 + (self._retry_count * 0.2), 1)  # リトライ回数に応じて少し増やす
+        CONFIG = Config()
+        if (
+            channel_type == 'BS4K' and
+            CONFIG.general.encoder_bs4k_input_analysis_enabled is True and
+            CONFIG.general.encoder_bs4k_low_latency is False
+        ):
+            input_probesize = '8M'
+            input_analyze = 3
+        elif channel_type == 'BS4K' and CONFIG.general.encoder_bs4k_input_analysis_enabled is True:
+            input_probesize = f'{round(CONFIG.general.encoder_bs4k_input_probesize + (self._retry_count * 500))}K'
+            input_analyze = round(CONFIG.general.encoder_bs4k_input_analyze + (self._retry_count * 0.2), 1)
+        else:
+            input_probesize = f'{round(1000 + (self._retry_count * 500))}K'  # リトライ回数に応じて少し増やす
+            input_analyze = round(0.7 + (self._retry_count * 0.2), 1)  # リトライ回数に応じて少し増やす
         if channel_type == 'SKY':
             # スカパー！プレミアムサービスのチャンネルは入力ストリームの解析時間を長めにする (その方がうまくいく)
             ## ほかと違い H.264 コーデックが採用されていることが影響しているのかも
-            input_probesize += 500
+            input_probesize = f'{round(1500 + (self._retry_count * 500))}K'
             input_analyze += 0.2
 
         # 入力
         ## --input-probesize, --input-analyze をつけることで、ストリームの分析時間を短縮できる
         ## 両方つけるのが重要で、--input-analyze だけだとエンコーダーがフリーズすることがある
-        options.append(f'--input-format mpegts --input-probesize {input_probesize}K --input-analyze {input_analyze}')
+        options.append(f'--input-format mpegts --input-probesize {input_probesize} --input-analyze {input_analyze}')
         ## BS4K 以外では 29.97fps (59.94i) を指定する
+        ## BS4K は MPEG-TS/avhw 入力の 59.94p をそのまま読ませ、30fps 品質は VPP で間引く
+        is_bs4k_30fps_quality = channel_type == 'BS4K' and '-30fps' in quality
         if channel_type != 'BS4K':
             options.append('--fps 30000/1001')
         ## 入力を指定する
@@ -321,9 +349,16 @@ class LiveEncodingTask:
         ## 主に HWEncC の起動を高速化するための設定
         ## max_interleave_delta: mux 時に影響するオプションで、増やしすぎると CM で詰まりがちになる
         ## リトライなしの場合は 500K (0.5秒) に設定し、リトライ回数に応じて 100K (0.1秒) ずつ増やす
-        max_interleave_delta = round(500 + (self._retry_count * 100))
-        options.append('-m avioflags:direct -m fflags:nobuffer+flush_packets -m flush_packets:1 -m max_delay:250000')
-        options.append(f'-m max_interleave_delta:{max_interleave_delta}K --output-thread 0 --lowlatency')
+        if channel_type == 'BS4K':
+            max_interleave_delta = round(CONFIG.general.encoder_bs4k_max_interleave_delta + (self._retry_count * 100))
+        else:
+            max_interleave_delta = round(500 + (self._retry_count * 100))
+        if channel_type != 'BS4K' or CONFIG.general.encoder_bs4k_low_latency is True:
+            options.append('-m avioflags:direct -m flush_packets:1 -m max_delay:250000')
+            options.append('-m fflags:nobuffer+flush_packets')
+        options.append(f'-m max_interleave_delta:{max_interleave_delta}K --output-thread 0')
+        if channel_type != 'BS4K' or CONFIG.general.encoder_bs4k_low_latency is True:
+            options.append('--lowlatency')
         ## QSVEncC と rkmppenc では OpenCL を使用しないので、無効化することで初期化フェーズを高速化する
         if (encoder_type == 'QSVEncC' or encoder_type == 'rkmppenc') and not self.live_stream.encoding_options.is_24fps_mode_enabled:
             options.append('--disable-opencl')
@@ -395,9 +430,15 @@ class LiveEncodingTask:
             ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
             gop_length_second = self.GOP_LENGTH_SECONDS_H265
 
-        ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わず 60fps でエンコードする
+        ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わない
         if channel_type == "BS4K":
-            options.append(f'--avsync vfr --gop-len {int(gop_length_second * 60)}')
+            if is_bs4k_30fps_quality is True:
+                options.append('--vpp-decimate cycle=2,drop=1')
+                avsync_mode = 'vfr' if CONFIG.general.encoder_bs4k_low_latency is True else 'forcecfr'
+                options.append(f'--avsync {avsync_mode} --gop-len {int(gop_length_second * 30)}')
+            else:
+                avsync_mode = 'vfr' if CONFIG.general.encoder_bs4k_low_latency is True else 'forcecfr'
+                options.append(f'--avsync {avsync_mode} --gop-len {int(gop_length_second * 60)}')
         else:
             ## インターレース映像として読み込む
             options.append('--interlace tff')
@@ -541,9 +582,6 @@ class LiveEncodingTask:
         ## always_receive_tv_from_mirakurun が True なら、バックエンドに関わらず常に Mirakurun / mirakc から受信する
         BACKEND_TYPE: Literal['EDCB', 'Mirakurun'] = 'Mirakurun' if CONFIG.general.always_receive_tv_from_mirakurun is True else CONFIG.general.backend
 
-        # エンコーダーの種類を取得
-        ENCODER_TYPE = CONFIG.general.encoder
-
         # まだ Standby になっていなければ、ステータスを Standby に設定
         # 基本はエンコードタスクの呼び出し元である self.live_stream.connect() の方で Standby に設定されるが、再起動の場合はそこを経由しないため必要
         if not (self.live_stream.getStatus().status == 'Standby' and self.live_stream.getStatus().detail == 'エンコードタスクを起動しています…'):
@@ -551,6 +589,9 @@ class LiveEncodingTask:
 
         # チャンネル情報からサービス ID とネットワーク ID を取得する
         channel = cast(Channel, await Channel.filter(display_channel_id=self.live_stream.display_channel_id).first())
+
+        # エンコーダーの種類を取得
+        ENCODER_TYPE = GetEncoderForLiveChannel(self.live_stream.display_channel_id)
 
         # 現在の番組情報を取得する
         program_present = (await channel.getCurrentAndNextProgram())[0]
@@ -744,11 +785,16 @@ class LiveEncodingTask:
                 # Mirakurun の Service Stream API へ HTTP リクエストを開始
                 self.live_stream.setStatus('Standby', 'チューナーを起動しています…')
                 session = aiohttp.ClientSession()
+                mirakurun_stream_timeout = 40 if channel.type == 'BS4K' else 15
                 try:
                     response = await session.get(
                         url = GetMirakurunAPIEndpointURL(f'/api/services/{mirakurun_service_id}/stream'),
                         headers = {**API_REQUEST_HEADERS, 'X-Mirakurun-Priority': '0'},
-                        timeout = aiohttp.ClientTimeout(connect=15, sock_connect=15, sock_read=15)
+                        timeout = aiohttp.ClientTimeout(
+                            connect=mirakurun_stream_timeout,
+                            sock_connect=mirakurun_stream_timeout,
+                            sock_read=mirakurun_stream_timeout,
+                        )
                     )
                 except (TimeoutError, aiohttp.ClientConnectorError):
 
@@ -872,6 +918,11 @@ class LiveEncodingTask:
             ## Unix Time とかではないので注意
             tuner_ts_read_at: float = time.monotonic()
             tuner_ts_read_at_lock = asyncio.Lock()
+            bs4k_startup_discard_seconds = (
+                CONFIG.general.bs4k_live_startup_discard_seconds
+                if channel.type == 'BS4K' and CONFIG.general.bs4k_live_startup_discard_enabled is True
+                else 0.0
+            )
 
             async def Reader() -> None:
                 nonlocal tuner_ts_read_at
@@ -893,6 +944,17 @@ class LiveEncodingTask:
 
                 assert stream_reader is not None
                 stream_iterator = GetIterator(stream_reader)
+                startup_discard_until = (
+                    time.monotonic() + bs4k_startup_discard_seconds
+                    if bs4k_startup_discard_seconds > 0
+                    else 0.0
+                )
+                startup_discard_finished_logged = startup_discard_until == 0.0
+                if startup_discard_until > 0:
+                    logging.info(
+                        f'{self.live_stream.log_prefix} BS4K startup TS discard started. '
+                        f'Discarding tuner TS for {bs4k_startup_discard_seconds:.1f} seconds.'
+                    )
 
                 # EDCB / Mirakurun から受信した放送波を随時 tsreadex の入力に書き込む
                 try:
@@ -907,15 +969,24 @@ class LiveEncodingTask:
                             break
 
                         try:
-                            # ストリームデータを tsreadex の標準入力に書き込む
-                            cast(asyncio.StreamWriter, tsreadex.stdin).write(chunk)
-                            await cast(asyncio.StreamWriter, tsreadex.stdin).drain()
-
                             # 生の放送波の TS パケットを PSI/SI データアーカイバーに送信する
                             ## 放送波の tsreadex への書き込みを最優先で行うため、非同期タスクとして実行する
                             ## ここで tsreadex への書き込みがブロックされると放送波の受信ループが止まり、ライブストリームの異常終了に繋がりかねない
                             if self.live_stream.psi_data_archiver is not None:
                                 background_tasks.add(asyncio.create_task(self.live_stream.psi_data_archiver.pushTSPacketData(chunk)))
+
+                            # BS4K ライブ開始直後の不安定な TS はエンコーダーへ渡さず破棄する
+                            if startup_discard_until > 0 and time.monotonic() < startup_discard_until:
+                                if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                                    break
+                                continue
+                            if startup_discard_finished_logged is False:
+                                logging.info(f'{self.live_stream.log_prefix} BS4K startup TS discard finished.')
+                                startup_discard_finished_logged = True
+
+                            # ストリームデータを tsreadex の標準入力に書き込む
+                            cast(asyncio.StreamWriter, tsreadex.stdin).write(chunk)
+                            await cast(asyncio.StreamWriter, tsreadex.stdin).drain()
 
                         # 並列タスク処理中に何らかの例外が発生した
                         # BrokenPipeError・asyncio.TimeoutError などが想定されるが、何が発生するかわからないためすべての例外をキャッチする

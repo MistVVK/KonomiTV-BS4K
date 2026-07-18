@@ -8,6 +8,7 @@ from fastapi.responses import Response
 from sse_starlette.sse import EventSourceResponse
 
 from app import logging
+from app.config import Config
 from app.models.RecordedProgram import RecordedProgram
 from app.streams.StreamEncodingOptions import (
     SplitQualityAndEncodingOptions,
@@ -40,12 +41,20 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
     return recorded_program
 
 
-async def ValidateQuality(quality: Annotated[str, Path(description='映像の品質。ex: 1080p')]) -> StreamQualityWithOptions:
+async def ValidateQuality(
+    quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
 
     # 指定された品質が存在するか確認
     ## 品質の指定に -10bit や -24fps が付いていれば分解する
-    stream_quality = SplitQualityAndEncodingOptions(quality)
+    is_bs4k_recorded_video = recorded_program.network_id == 0x000B
+    stream_quality = SplitQualityAndEncodingOptions(
+        quality,
+        Config().general.encoder_bs4k if is_bs4k_recorded_video is True else None,
+        is_24fps_mode_allowed = is_bs4k_recorded_video is False,
+    )
     if stream_quality is None:
         logging.error(f'[VideoStreamsRouter][ValidateQuality] Specified quality was not found. [quality: {quality}]')
         raise HTTPException(

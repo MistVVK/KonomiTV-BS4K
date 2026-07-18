@@ -56,6 +56,10 @@ export interface IClientSettings {
     video_watched_history_max_count: number;
     // tv_streaming_quality: 同期無効
     // tv_streaming_quality_cellular: 同期無効
+    // bs4k_streaming_quality: 同期無効
+    // bs4k_streaming_quality_cellular: 同期無効
+    // bs4k_video_streaming_quality: 同期無効
+    // bs4k_video_streaming_quality_cellular: 同期無効
     // tv_data_saver_mode: 同期無効
     // tv_data_saver_mode_cellular: 同期無効
     // tv_low_latency_mode: 同期無効
@@ -115,6 +119,15 @@ export interface IServerSettings {
         edcb_url: string;
         mirakurun_url: string;
         encoder: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC' | 'rkmppenc';
+        encoder_bs4k: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC' | 'rkmppenc';
+        encoder_bs4k_input_probesize: number;
+        encoder_bs4k_input_analyze: number;
+        encoder_bs4k_input_analysis_enabled: boolean;
+        encoder_bs4k_max_interleave_delta: number;
+        encoder_bs4k_low_latency: boolean;
+        bs4k_ignore_viewer_low_latency: boolean;
+        bs4k_live_startup_discard_enabled: boolean;
+        bs4k_live_startup_discard_seconds: number;
         program_update_interval: number;
         debug: boolean;
         debug_encoder: boolean;
@@ -146,6 +159,15 @@ export const IServerSettingsDefault: IServerSettings = {
         edcb_url: 'tcp://127.0.0.1:4510/',
         mirakurun_url: 'http://127.0.0.1:40772/',
         encoder: 'FFmpeg',
+        encoder_bs4k: 'FFmpeg',
+        encoder_bs4k_input_probesize: 3000,
+        encoder_bs4k_input_analyze: 1.5,
+        encoder_bs4k_input_analysis_enabled: true,
+        encoder_bs4k_max_interleave_delta: 800,
+        encoder_bs4k_low_latency: true,
+        bs4k_ignore_viewer_low_latency: false,
+        bs4k_live_startup_discard_enabled: true,
+        bs4k_live_startup_discard_seconds: 2.0,
         program_update_interval: 5.0,
         debug: false,
         debug_encoder: false,

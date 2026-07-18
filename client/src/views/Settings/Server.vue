@@ -61,7 +61,7 @@
                 </v-text-field>
             </div>
             <div class="settings__item">
-                <div class="settings__item-heading">利用するエンコーダー</div>
+                <div class="settings__item-heading">録画と BS4K 以外で利用するエンコーダー</div>
                 <div class="settings__item-label">
                     FFmpeg はソフトウェアエンコーダーです。<br>
                     すべての PC で利用できますが、CPU に多大な負荷がかかり、パフォーマンスが悪いです。<br>
@@ -72,13 +72,7 @@
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
-                    :items="[
-                        {title: 'FFmpeg : ソフトウェアエンコーダー', value: 'FFmpeg'},
-                        {title: 'QSVEncC : Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能', value: 'QSVEncC'},
-                        {title: 'NVEncC : NVIDIA GPU で利用可能', value: 'NVEncC'},
-                        {title: 'VCEEncC : AMD GPU で利用可能', value: 'VCEEncC'},
-                        {title: 'rkmppenc : Rockchip RK3588 系 SoC 搭載 SBC で利用可能', value: 'rkmppenc'}
-                    ]"
+                    :items="encoder_options"
                     v-model="server_settings.general.encoder">
                 </v-select>
             </div>
@@ -428,6 +422,15 @@ import SettingsBase from '@/views/Settings/Base.vue';
 // フォームを小さくするかどうか
 const is_form_dense = Utils.isSmartphoneHorizontal();
 
+// エンコーダーの選択肢
+const encoder_options = [
+    {title: 'FFmpeg : ソフトウェアエンコーダー', value: 'FFmpeg'},
+    {title: 'QSVEncC : Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能', value: 'QSVEncC'},
+    {title: 'NVEncC : NVIDIA GPU で利用可能', value: 'NVEncC'},
+    {title: 'VCEEncC : AMD GPU で利用可能', value: 'VCEEncC'},
+    {title: 'rkmppenc : Rockchip RK3588 系 SoC 搭載 SBC で利用可能', value: 'rkmppenc'},
+];
+
 // 優先する地デジのエリアの選択肢
 const preferred_terrestrial_region_options = [
     { title: '未設定', value: null },
@@ -590,4 +593,3 @@ async function shutdownServer() {
 }
 
 </script>
-

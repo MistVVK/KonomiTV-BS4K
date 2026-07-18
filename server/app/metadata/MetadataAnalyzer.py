@@ -325,8 +325,8 @@ class MetadataAnalyzer:
             logging.warning(f'{self.recorded_file_path}: No valid video streams found. (from sample probe)')
             return None
         if len(sample_probe_audio_streams) == 0:
-            logging.warning(f'{self.recorded_file_path}: No valid audio streams found. (from sample probe)')
-            return None
+            logging.warning(f'{self.recorded_file_path}: No valid audio streams found. (from sample probe), falling back to full probe audio streams.')
+            sample_probe_audio_streams = full_probe_audio_streams
 
         ## FFprobe の結果として "video" / "audio" の codec_type そのものは存在するが、
         ## 詳細が取得できず FFprobeOtherStream にフォールバックしているケース（スクランブルや不正 TS）を検出する
@@ -947,6 +947,16 @@ class MetadataAnalyzer:
 
         # 部分解析: 録画ファイルの25%位置から30秒程度のデータを取得し、メディア情報を解析する
         sample_json: dict[str, Any] | None = None
+        sample_size = ClosestMultiple(18 * 1024 * 1024 * 30 // 8, ts.PACKET_SIZE)
+        if full_probe.format.bit_rate is not None:
+            try:
+                # Use roughly 30 seconds of the actual TS bitrate. BS8K is around 80Mbps,
+                # so the old fixed 18Mbps sample often covered only a few seconds.
+                actual_sample_size = int(int(full_probe.format.bit_rate) * 30 // 8)
+                sample_size = ClosestMultiple(max(sample_size, actual_sample_size), ts.PACKET_SIZE)
+                sample_size = min(sample_size, ClosestMultiple(512 * 1024 * 1024, ts.PACKET_SIZE))
+            except ValueError:
+                pass
         try:
             # MPEG-TS 形式の場合のみ実行
             if 'mpegts' in (full_probe.format.format_name or '').lower():
@@ -956,9 +966,8 @@ class MetadataAnalyzer:
                     file_size = self.recorded_file_path.stat().st_size
                     offset = ClosestMultiple(int(file_size * 0.25), ts.PACKET_SIZE)
                     f.seek(offset)
-                    # 30秒程度のデータを読み込む (ビットレートを 18Mbps と仮定)
+                    # 30秒程度のデータを読み込む
                     ## サンプルとして FFprobe に渡すデータが30秒より短いと正確に解析できないことがある
-                    sample_size = ClosestMultiple(18 * 1024 * 1024 * 30 // 8, ts.PACKET_SIZE)  # TS パケットサイズに合わせて切り出す
                     sample_data = f.read(sample_size)
                     # サンプルデータが全てゼロ埋めされているかチェック
                     if sample_data and all(byte == 0 for byte in sample_data):

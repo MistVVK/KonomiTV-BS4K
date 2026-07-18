@@ -12,6 +12,8 @@ import Utils from '@/utils';
 // 選択可能な画質の種類
 export type LiveStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const LIVE_STREAMING_QUALITIES: LiveStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
+export type BS4KLiveStreamingQuality = '4320p' | '2160p' | '1440p' | '1080p-60fps' | '1080p-30fps' | '810p-60fps' | '810p-30fps' | '720p-60fps' | '720p-30fps' | '540p-30fps' | '480p-30fps' | '360p-30fps' | '240p-30fps';
+export const BS4K_LIVE_STREAMING_QUALITIES: BS4KLiveStreamingQuality[] = ['4320p', '2160p', '1440p', '1080p-60fps', '1080p-30fps', '810p-60fps', '810p-30fps', '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps'];
 export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
 
@@ -86,6 +88,10 @@ export interface ILocalClientSettings extends IClientSettings {
     video_watched_history_max_count: number;
     tv_streaming_quality: LiveStreamingQuality;
     tv_streaming_quality_cellular: LiveStreamingQuality;
+    bs4k_streaming_quality: BS4KLiveStreamingQuality;
+    bs4k_streaming_quality_cellular: BS4KLiveStreamingQuality;
+    bs4k_video_streaming_quality: BS4KLiveStreamingQuality;
+    bs4k_video_streaming_quality_cellular: BS4KLiveStreamingQuality;
     tv_data_saver_mode: boolean;
     tv_data_saver_mode_cellular: boolean;
     tv_low_latency_mode: boolean;
@@ -244,6 +250,14 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     tv_streaming_quality: '1080p',
     // テレビのデフォルトのストリーミング画質 (モバイル回線時) (Default: 480p) (同期無効)
     tv_streaming_quality_cellular: '480p',
+    // BS4K テレビのデフォルトのストリーミング画質 (Wi-Fi 回線時) (Default: 1080p-60fps) (同期無効)
+    bs4k_streaming_quality: '1080p-60fps',
+    // BS4K テレビのデフォルトのストリーミング画質 (モバイル回線時) (Default: 540p-30fps) (同期無効)
+    bs4k_streaming_quality_cellular: '540p-30fps',
+    // BS4K 録画再生のデフォルトのストリーミング画質 (Wi-Fi 回線時) (Default: 1080p-60fps) (同期無効)
+    bs4k_video_streaming_quality: '1080p-60fps',
+    // BS4K 録画再生のデフォルトのストリーミング画質 (モバイル回線時) (Default: 540p-30fps) (同期無効)
+    bs4k_video_streaming_quality_cellular: '540p-30fps',
     // テレビを通信節約モードで視聴する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
     tv_data_saver_mode: false,
     // テレビを通信節約モードで視聴する (モバイル回線時)  (Default: オン) (同期無効)
@@ -397,6 +411,10 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'video_watched_history_max_count',
     // tv_streaming_quality: 同期無効
     // tv_streaming_quality_cellular: 同期無効
+    // bs4k_streaming_quality: 同期無効
+    // bs4k_streaming_quality_cellular: 同期無効
+    // bs4k_video_streaming_quality: 同期無効
+    // bs4k_video_streaming_quality_cellular: 同期無効
     // tv_data_saver_mode: 同期無効
     // tv_data_saver_mode_cellular: 同期無効
     // tv_low_latency_mode: 同期無効

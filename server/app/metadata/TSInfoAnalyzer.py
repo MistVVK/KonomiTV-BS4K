@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import ariblib
+import ariblib.constants
 import ariblib.event
 from ariblib.descriptors import (
     AudioComponentDescriptor,
@@ -28,6 +29,9 @@ from app import logging, schemas
 from app.constants import JST
 from app.utils import ClosestMultiple, NormalizeToJSTDatetime
 from app.utils.TSInformation import TSInformation
+
+# ariblib 0.1.1 lacks the BS8K/4320p video component type used in ARIB EIT.
+ariblib.constants.COMPONENT_TYPE.setdefault(0x01, {})[0x83] = '映像4320p、アスペクト比16:9'
 
 
 class TSInfoAnalyzer:
@@ -539,7 +543,7 @@ class TSInfoAnalyzer:
                     try:
                         # EIT 内のイベントを取得
                         event: Any = ariblib.event.Event(eit, event_data)
-                    except (IndexError, ValueError, TypeError, AttributeError) as ex:
+                    except (IndexError, ValueError, TypeError, AttributeError, KeyError) as ex:
                         # 破損したイベントをスキップ
                         corrupted_events += 1
                         if corrupted_events <= 20:  # 20個までは許容

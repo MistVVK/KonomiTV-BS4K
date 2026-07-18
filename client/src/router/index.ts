@@ -139,6 +139,11 @@ const router = createRouter({
             component: () => import('@/views/Settings/Twitter.vue'),
         },
         {
+            path: '/settings/bs4k',
+            name: 'Settings BS4K',
+            component: () => import('@/views/Settings/BS4K.vue'),
+        },
+        {
             path: '/settings/server',
             name: 'Settings Server',
             component: () => import('@/views/Settings/Server.vue'),

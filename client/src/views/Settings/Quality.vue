@@ -183,7 +183,7 @@ import Utils, { PlayerUtils } from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 const QUALITY_H264 = [
-    {title: '1080p (60fps) (約4.50GB/h / 平均10.0Mbps)', value: '1080p-60fps'},
+    {title: '1080p (60fps) (約4.95GB/h / 平均11.0Mbps)', value: '1080p-60fps'},
     {title: '1080p (約4.50GB/h / 平均10.0Mbps)', value: '1080p'},
     {title: '810p (約2.62GB/h / 平均5.8Mbps)', value: '810p'},
     {title: '720p (約2.18GB/h / 平均4.9Mbps)', value: '720p'},
@@ -194,7 +194,7 @@ const QUALITY_H264 = [
 ];
 
 const QUALITY_H265 = [
-    {title: '1080p (60fps) (約1.80GB/h / 平均4.0Mbps)', value: '1080p-60fps'},
+    {title: '1080p (60fps) (約1.58GB/h / 平均3.5Mbps)', value: '1080p-60fps'},
     {title: '1080p (約1.37GB/h / 平均3.0Mbps)', value: '1080p'},
     {title: '810p (約1.05GB/h / 平均2.3Mbps)', value: '810p'},
     {title: '720p (約0.82GB/h / 平均1.8Mbps)', value: '720p'},

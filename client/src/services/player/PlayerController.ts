@@ -19,7 +19,8 @@ import PlayerManager from '@/services/player/PlayerManager';
 import Videos from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
-import useSettingsStore, { LiveStreamingQuality, LIVE_STREAMING_QUALITIES, VideoStreamingQuality, VIDEO_STREAMING_QUALITIES } from '@/stores/SettingsStore';
+import useServerSettingsStore from '@/stores/ServerSettingsStore';
+import useSettingsStore, { BS4KLiveStreamingQuality, BS4K_LIVE_STREAMING_QUALITIES, LiveStreamingQuality, LIVE_STREAMING_QUALITIES, VideoStreamingQuality, VIDEO_STREAMING_QUALITIES } from '@/stores/SettingsStore';
 import Utils, { dayjs, PlayerUtils } from '@/utils';
 
 
@@ -150,6 +151,8 @@ class PlayerController {
      */
     private get quality_profile(): {
         tv_streaming_quality: LiveStreamingQuality;
+        bs4k_streaming_quality: BS4KLiveStreamingQuality;
+        bs4k_video_streaming_quality: BS4KLiveStreamingQuality;
         tv_data_saver_mode: boolean;
         tv_low_latency_mode: boolean;
         tv_24fps_mode: boolean;
@@ -162,6 +165,8 @@ class PlayerController {
         if (this.quality_profile_type === 'Cellular') {
             return {
                 tv_streaming_quality: settings_store.settings.tv_streaming_quality_cellular,
+                bs4k_streaming_quality: settings_store.settings.bs4k_streaming_quality_cellular,
+                bs4k_video_streaming_quality: settings_store.settings.bs4k_video_streaming_quality_cellular,
                 tv_data_saver_mode: settings_store.settings.tv_data_saver_mode_cellular,
                 tv_low_latency_mode: settings_store.settings.tv_low_latency_mode_cellular,
                 tv_24fps_mode: settings_store.settings.tv_24fps_mode_cellular,
@@ -173,6 +178,8 @@ class PlayerController {
         } else {
             return {
                 tv_streaming_quality: settings_store.settings.tv_streaming_quality,
+                bs4k_streaming_quality: settings_store.settings.bs4k_streaming_quality,
+                bs4k_video_streaming_quality: settings_store.settings.bs4k_video_streaming_quality,
                 tv_data_saver_mode: settings_store.settings.tv_data_saver_mode,
                 tv_low_latency_mode: settings_store.settings.tv_low_latency_mode,
                 tv_24fps_mode: settings_store.settings.tv_24fps_mode,
@@ -189,7 +196,7 @@ class PlayerController {
      */
     private get live_playback_buffer_seconds(): number {
         // 低遅延モードであれば低遅延向けの再生バッファを、そうでなければ通常の再生バッファ (秒単位)
-        let live_playback_buffer_seconds = this.quality_profile.tv_low_latency_mode ?
+        let live_playback_buffer_seconds = this.tv_low_latency_mode ?
             PlayerController.LIVE_PLAYBACK_BUFFER_SECONDS_LOW_LATENCY : PlayerController.LIVE_PLAYBACK_BUFFER_SECONDS;
         // Safari の Media Source Extensions API の実装はどうもバッファの揺らぎが大きい (?) ようなので、バッファ詰まり対策で
         // さらに 0.3 秒程度余裕を持たせる
@@ -199,6 +206,26 @@ class PlayerController {
         return live_playback_buffer_seconds;
     }
 
+
+    /**
+     * ライブ視聴で低遅延モードを有効扱いにするか
+     */
+    private get tv_low_latency_mode(): boolean {
+        if (this.playback_mode !== 'Live') {
+            return false;
+        }
+
+        const channels_store = useChannelsStore();
+        const server_settings_store = useServerSettingsStore();
+        if (
+            channels_store.channel.current.display_channel_id.startsWith('bs4k') &&
+            server_settings_store.server_settings.general.bs4k_ignore_viewer_low_latency === true
+        ) {
+            return false;
+        }
+
+        return this.quality_profile.tv_low_latency_mode;
+    }
 
     /**
      * DPlayer と PlayerManager を初期化し、再生準備を行う
@@ -235,12 +262,34 @@ class PlayerController {
             is_hevc_playback = true;
         }
 
+        // BS4K は入力 TS が HEVC Main10 で、QSVEncC ではさらに HEVC 10bit 出力を要求すると
+        // MFXDEC が device operation failure で落ちることがあるため、HEVC 10bit 要求は通常チャンネルだけに限定する
+        const is_bs4k_playback_for_hevc_10bit = (
+            (
+                this.playback_mode === 'Live' &&
+                channels_store.channel.current.display_channel_id.startsWith('bs4k')
+            ) ||
+            (
+                this.playback_mode === 'Video' &&
+                player_store.recorded_program.network_id === 0x000B
+            )
+        );
+
         // HEVC 10bit は通信節約モード中の対応環境にだけ透過的に要求する
         // MediaCapabilities で滑らかに再生できると判断できない場合は、通常の HEVC 8bit に留めて互換性を優先する
-        const is_hevc_10bit_playback = is_hevc_playback === true && await PlayerUtils.isHEVC10bitVideoSupported();
+        const is_hevc_10bit_playback = (
+            is_hevc_playback === true &&
+            is_bs4k_playback_for_hevc_10bit === false &&
+            await PlayerUtils.isHEVC10bitVideoSupported()
+        );
 
         // ブラウザが MSE in Worker での H.265 / HEVC 再生に対応しているかどうか
         const is_hevc_video_supported_in_worker = await mpegts.supportWorkerForMSEH265Playback();
+
+        const is_bs4k_live_playback = (
+            this.playback_mode === 'Live' &&
+            channels_store.channel.current.display_channel_id.startsWith('bs4k')
+        );
 
         // 文字スーパーの表示設定
         // ライブ視聴とビデオ視聴で設定キーが異なる
@@ -350,12 +399,19 @@ class PlayerController {
                 const hevc_suffix = is_hevc_playback === true ? '-hevc' : '';
                 // -10bit や -24fps は品質名の末尾に付けて API パスに含める
                 // 録画再生では session_id が同じでも画質が違うリクエストはサーバー側でエラーになる
-                const build_api_quality = (quality_name: LiveStreamingQuality | VideoStreamingQuality): string => {
+                const is_bs4k_live = is_bs4k_live_playback;
+                const is_bs4k_recorded_video = (
+                    this.playback_mode === 'Video' &&
+                    player_store.recorded_program.network_id === 0x000B
+                );
+                const build_api_quality = (quality_name: LiveStreamingQuality | BS4KLiveStreamingQuality | VideoStreamingQuality): string => {
                     let api_quality = `${quality_name}${hevc_suffix}`;
                     if (is_hevc_10bit_playback === true) {
                         api_quality += '-10bit';
                     }
                     if (
+                        is_bs4k_live === false &&
+                        is_bs4k_recorded_video === false &&
                         quality_name !== '1080p-60fps' &&
                         (
                             this.playback_mode === 'Live' ?
@@ -366,6 +422,44 @@ class PlayerController {
                         api_quality += '-24fps';
                     }
                     return api_quality;
+                };
+                const get_quality_display_name = (quality_name: LiveStreamingQuality | BS4KLiveStreamingQuality | VideoStreamingQuality): string => {
+                    if (quality_name === '4320p') {
+                        return '8K';
+                    }
+                    if (quality_name === '2160p') {
+                        return '4K';
+                    }
+                    if (quality_name.endsWith('-60fps')) {
+                        return `${quality_name.replace('-60fps', '')} (60fps)`;
+                    }
+                    if (quality_name.endsWith('-30fps')) {
+                        return `${quality_name.replace('-30fps', '')} (30fps)`;
+                    }
+                    return quality_name;
+                };
+                const normalize_default_quality = (
+                    default_quality: string,
+                    quality_names: (LiveStreamingQuality | BS4KLiveStreamingQuality | VideoStreamingQuality)[],
+                ): string => {
+                    const legacy_bs4k_quality_map: Record<string, BS4KLiveStreamingQuality> = {
+                        '1080p': '1080p-30fps',
+                        '810p': '810p-30fps',
+                        '720p': '720p-30fps',
+                        '540p': '540p-30fps',
+                        '480p': '480p-30fps',
+                        '360p': '360p-30fps',
+                        '240p': '240p-30fps',
+                    };
+                    const normalized_default_quality = (
+                        is_bs4k_live === true || is_bs4k_recorded_video === true ?
+                            legacy_bs4k_quality_map[default_quality] ?? default_quality :
+                            default_quality
+                    );
+                    if (quality_names.includes(normalized_default_quality as LiveStreamingQuality | BS4KLiveStreamingQuality | VideoStreamingQuality)) {
+                        return get_quality_display_name(normalized_default_quality as LiveStreamingQuality | BS4KLiveStreamingQuality | VideoStreamingQuality);
+                    }
+                    return normalized_default_quality;
                 };
 
                 // ライブ視聴: チャンネル情報がセットされているはず
@@ -384,22 +478,24 @@ class PlayerController {
                     // 通常のチャンネルの場合
                     } else {
                         // 画質リストを作成
-                        for (const quality_name of LIVE_STREAMING_QUALITIES) {
+                        const live_streaming_qualities = is_bs4k_live === true ? BS4K_LIVE_STREAMING_QUALITIES : LIVE_STREAMING_QUALITIES;
+                        for (const quality_name of live_streaming_qualities) {
                             qualities.push({
-                                // 1080p-60fps のみ、見栄えの観点から表示上 "1080p (60fps)" と表示する
-                                name: quality_name === '1080p-60fps' ? '1080p (60fps)' : quality_name,
+                                name: get_quality_display_name(quality_name),
                                 type: 'mpegts',
                                 url: `${streaming_api_base_url}/${build_api_quality(quality_name)}/mpegts`,
                             });
                         }
                     }
                     // デフォルトの画質
-                    let default_quality: string = this.quality_profile.tv_streaming_quality;
+                    const live_streaming_qualities = is_bs4k_live === true ? BS4K_LIVE_STREAMING_QUALITIES : LIVE_STREAMING_QUALITIES;
+                    let default_quality: string = is_bs4k_live === true ? this.quality_profile.bs4k_streaming_quality : this.quality_profile.tv_streaming_quality;
                     if (options.default_quality !== null) {
                         // PlayerController.init() のオプションでデフォルト画質が指定されている場合は
                         // 画質プロファイルに記載の画質ではなく、指定された（前回再生時の）画質を使ってレジュームする
                         default_quality = options.default_quality;
                     }
+                    default_quality = normalize_default_quality(default_quality, live_streaming_qualities);
                     // ラジオチャンネルのみ常に 48KHz/192kbps に固定する
                     if (channels_store.channel.current.is_radiochannel) {
                         default_quality = '48kHz/192kbps';
@@ -414,25 +510,27 @@ class PlayerController {
                     // ビデオストリーミング API のベース URL
                     const streaming_api_base_url = `${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}`;
                     // 画質リストを作成
-                    for (const quality_name of VIDEO_STREAMING_QUALITIES) {
+                    const video_streaming_qualities = is_bs4k_recorded_video === true ? BS4K_LIVE_STREAMING_QUALITIES : VIDEO_STREAMING_QUALITIES;
+                    for (const quality_name of video_streaming_qualities) {
                         // 画質ごとに異なるセッション ID を生成 (セッション ID は UUID の - で区切って一番左側のみを使う)
                         const session_id = crypto.randomUUID().split('-')[0];
                         // 画質設定を追加
                         qualities.push({
-                            // 1080p-60fps のみ、見栄えの観点から表示上 "1080p (60fps)" と表示する
-                            name: quality_name === '1080p-60fps' ? '1080p (60fps)' : quality_name,
+                            name: get_quality_display_name(quality_name),
                             type: 'hls',
                             url: `${streaming_api_base_url}/${build_api_quality(quality_name)}/playlist?session_id=${session_id}`,
                         });
                     }
                     // デフォルトの画質
                     // ビデオ視聴時はラジオは考慮しない
-                    let default_quality: string = this.quality_profile.video_streaming_quality;
+                    let default_quality: string = is_bs4k_recorded_video === true ?
+                        this.quality_profile.bs4k_video_streaming_quality : this.quality_profile.video_streaming_quality;
                     if (options.default_quality !== null) {
                         // PlayerController.init() のオプションでデフォルト画質が指定されている場合は
                         // 画質プロファイルに記載の画質ではなく、指定された（前回再生時の）画質を使ってレジュームする
                         default_quality = options.default_quality;
                     }
+                    default_quality = normalize_default_quality(default_quality, video_streaming_qualities);
                     const tile_info = player_store.recorded_program.recorded_video.thumbnail_info?.tile ?? null;
                     return {
                         quality: qualities,
@@ -586,7 +684,7 @@ class PlayerController {
                         // HTMLMediaElement の内部バッファによるライブストリームの遅延を追跡する
                         // liveBufferLatencyChasing と異なり、いきなり再生時間をスキップするのではなく、
                         // 再生速度を少しだけ上げることで再生を途切れさせることなく遅延を追跡する
-                        liveSync: this.quality_profile.tv_low_latency_mode,
+                        liveSync: this.tv_low_latency_mode,
                         // 許容する HTMLMediaElement の内部バッファの最大値 (秒単位, 3秒)
                         liveSyncMaxLatency: 3,
                         // HTMLMediaElement の内部バッファ (遅延) が liveSyncMaxLatency を超えたとき、ターゲットとする遅延時間 (秒単位)
@@ -1685,7 +1783,7 @@ class PlayerController {
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: 'モバイル回線向けの画質プロファイルに切り替えました。',
                     // 他の通知と被らないように、メッセージを遅らせて表示する
-                    message_delay_seconds: this.quality_profile.tv_low_latency_mode || this.playback_mode === 'Video' ? 2 : 4.5,
+                    message_delay_seconds: this.tv_low_latency_mode || this.playback_mode === 'Video' ? 2 : 4.5,
                     is_error_message: false,
                     // モバイル回線プロファイル切り替え時、切り替え後の画質プロファイルのデフォルト画質を優先する
                     should_resume_quality: false,
@@ -1697,7 +1795,7 @@ class PlayerController {
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: 'Wi-Fi 回線向けの画質プロファイルに切り替えました。',
                     // 他の通知と被らないように、メッセージを遅らせて表示する
-                    message_delay_seconds: this.quality_profile.tv_low_latency_mode || this.playback_mode === 'Video' ? 2 : 4.5,
+                    message_delay_seconds: this.tv_low_latency_mode || this.playback_mode === 'Video' ? 2 : 4.5,
                     is_error_message: false,
                     // Wi-Fi プロファイル切り替え時、切り替え後の画質プロファイルのデフォルト画質を優先する
                     should_resume_quality: false,

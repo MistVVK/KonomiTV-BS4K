@@ -484,7 +484,8 @@ class LiveStream:
                         break
 
                     # 現在 ONAir 状態のライブストリームがなく、リトライしたところで Idling なライブストリームが取得できる見込みがない
-                    if len(self.getONAirLiveStreams()) == 0:
+                    onair_live_streams = self.getONAirLiveStreams()
+                    if len(onair_live_streams) == 0:
                         break
 
                     await asyncio.sleep(0.1)
@@ -657,8 +658,9 @@ class LiveStream:
         # 接続している全てのクライアントの Queue にストリームデータを書き込む
         for client in self._clients:
 
-            # タイムアウト秒数は 10 秒
-            timeout = 10
+            # タイムアウト秒数は通常 10 秒
+            # SMB400 + DMirakurun 経路の BS4K は初回起動に 10 秒以上かかることがあるため長めに待つ
+            timeout = 30 if self.live_stream_id.startswith('bs4k') else 10
 
             # 最終読み取り時刻を指定秒数過ぎたクライアントはタイムアウトと判断し、クライアントを削除する
             ## 主にネットワークが切断されたなどの理由で発生する

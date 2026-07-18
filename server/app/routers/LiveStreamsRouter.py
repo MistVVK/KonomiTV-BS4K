@@ -13,6 +13,7 @@ from app import logging, schemas
 from app.models.Channel import Channel
 from app.streams.LiveStream import LiveStream, LiveStreamStatus
 from app.streams.StreamEncodingOptions import (
+    GetEncoderForLiveChannel,
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
 )
@@ -39,12 +40,15 @@ async def ValidateChannelID(display_channel_id: Annotated[str, Path(description=
     return display_channel_id
 
 
-async def ValidateQuality(quality: Annotated[str, Path(description='映像の品質。ex: 1080p')]) -> StreamQualityWithOptions:
+async def ValidateQuality(
+    quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
+    display_channel_id: Annotated[str, Depends(ValidateChannelID)],
+) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
 
     # 指定された品質が存在するか確認
     ## 品質の指定に -10bit や -24fps が付いていれば分解する
-    stream_quality = SplitQualityAndEncodingOptions(quality)
+    stream_quality = SplitQualityAndEncodingOptions(quality, GetEncoderForLiveChannel(display_channel_id))
     if stream_quality is None:
         logging.error(f'[LiveStreamsRouter][ValidateQuality] Specified quality was not found. [quality: {quality}]')
         raise HTTPException(

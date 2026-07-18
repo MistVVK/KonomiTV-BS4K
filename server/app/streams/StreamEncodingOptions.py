@@ -6,6 +6,23 @@ from app.config import Config
 from app.constants import QUALITY, QUALITY_TYPES
 
 
+def GetEncoderForLiveChannel(display_channel_id: str) -> str:
+    """
+    ライブチャンネルで利用するエンコーダーを返す
+
+    Args:
+        display_channel_id (str): チャンネル ID
+
+    Returns:
+        str: 利用するエンコーダー
+    """
+
+    CONFIG = Config()
+    if display_channel_id.startswith('bs4k'):
+        return CONFIG.general.encoder_bs4k
+    return CONFIG.general.encoder
+
+
 @dataclass(frozen=True)
 class StreamEncodingOptions:
     """
@@ -31,6 +48,8 @@ class StreamEncodingOptions:
         quality: QUALITY_TYPES,
         is_hevc_10bit_requested: bool,
         is_24fps_mode_requested: bool,
+        encoder: str | None = None,
+        is_24fps_mode_allowed: bool = True,
     ) -> StreamEncodingOptions:
         """
         API で指定されたオプションから、実際に使うストリームオプションを作る
@@ -39,22 +58,28 @@ class StreamEncodingOptions:
             quality (QUALITY_TYPES): ベース画質
             is_hevc_10bit_requested (bool): クライアントが HEVC 10bit を要求しているかどうか
             is_24fps_mode_requested (bool): クライアントが 24fps モードを要求しているかどうか
+            encoder (str | None): このストリームで利用するエンコーダー
+            is_24fps_mode_allowed (bool): 24fps モードの適用を許可するかどうか
 
         Returns:
             StreamEncodingOptions: 実際のストリーム生成に使うエンコードオプション
         """
+
+        if encoder is None:
+            encoder = Config().general.encoder
 
         # HEVC 10bit は通信節約モードで使う HEVC 画質かつ QSVEncC / NVEncC の場合だけ有効化する
         ## VCEEncC は HEVC 10bit 対応の機種かを判定できず、rkmppenc は HEVC 10bit エンコード自体に非対応のため設定しない
         is_hevc_10bit_enabled = (
             is_hevc_10bit_requested is True and
             QUALITY[quality].is_hevc is True and
-            Config().general.encoder in ['QSVEncC', 'NVEncC']
+            encoder in ['QSVEncC', 'NVEncC']
         )
 
         # 24fps モードは 60fps 画質以外で有効化する
         ## 1080p-60fps では 60i を 60p 化するユーザー意図が明確なので、24fps モードより 60fps 化を優先する
         is_24fps_mode_enabled = (
+            is_24fps_mode_allowed is True and
             is_24fps_mode_requested is True and
             QUALITY[quality].is_60fps is False
         )
@@ -104,12 +129,18 @@ class StreamQualityWithOptions:
     encoding_options: StreamEncodingOptions
 
 
-def SplitQualityAndEncodingOptions(quality: str) -> StreamQualityWithOptions | None:
+def SplitQualityAndEncodingOptions(
+    quality: str,
+    encoder: str | None = None,
+    is_24fps_mode_allowed: bool = True,
+) -> StreamQualityWithOptions | None:
     """
     API パスの品質指定 (例: 720p-hevc-10bit-24fps) を、ベース画質 (720p-hevc) と追加オプション (-10bit / -24fps) に分解する
 
     Args:
         quality (str): API パスで指定された品質
+        encoder (str | None): このストリームで利用するエンコーダー
+        is_24fps_mode_allowed (bool): 24fps モードの適用を許可するかどうか
 
     Returns:
         StreamQualityWithOptions | None: 分解結果 (不正な品質指定の場合は None)
@@ -138,6 +169,8 @@ def SplitQualityAndEncodingOptions(quality: str) -> StreamQualityWithOptions | N
         base_quality,
         is_hevc_10bit_requested,
         is_24fps_mode_requested,
+        encoder,
+        is_24fps_mode_allowed,
     )
     return StreamQualityWithOptions(
         quality = base_quality,

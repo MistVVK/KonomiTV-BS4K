@@ -36,6 +36,39 @@ general:
     # RK3588 などの Rockchip SoC 搭載の ARM SBC をお使いなら、rkmppenc が使えます (いくつか事前設定が必要です) 。
     encoder: 'FFmpeg'
 
+    # BS4K のライブ視聴で利用するエンコーダー
+    # 録画再生と BS4K 以外のライブ視聴には encoder が使われます。
+    encoder_bs4k: 'FFmpeg'
+
+    # BS4K のライブ視聴で利用する入力解析サイズ (KB)
+    # エンコーダーが映像ヘッダーを探すために読むデータ量です。
+    # BS4K HEVC 60p は途中から掴むと解析に時間がかかるため、通常チャンネルより大きめにしています。
+    encoder_bs4k_input_probesize: 3000
+
+    # BS4K のライブ視聴で利用する入力解析時間 (秒)
+    encoder_bs4k_input_analyze: 1.5
+
+    # BS4K のライブ視聴で入力解析を強化するか
+    # 無効にすると、通常チャンネルと同じ入力解析サイズ・時間を使います。
+    encoder_bs4k_input_analysis_enabled: true
+
+    # BS4K のライブ視聴で利用する mux 待ち幅 (KB)
+    encoder_bs4k_max_interleave_delta: 800
+
+    # BS4K のライブ視聴でエンコーダーを即時出力優先にするか
+    encoder_bs4k_low_latency: true
+
+    # BS4K のライブ視聴ではプレイヤーを通常バッファで再生するか
+    # 有効にすると、BS4K のライブ視聴時だけユーザーの低遅延視聴設定を使わず、通常の再生バッファを使います。
+    bs4k_ignore_viewer_low_latency: false
+
+    # BS4K のライブ視聴開始時に先頭 TS を捨てるか
+    # 有効にすると、チューナー切替直後の不安定な TS をエンコーダーに渡さず破棄します。
+    bs4k_live_startup_discard_enabled: true
+
+    # BS4K のライブ視聴開始時に捨てる TS の秒数
+    bs4k_live_startup_discard_seconds: 2.0
+
     # 番組情報の更新間隔 (分)
     # 番組情報を EDCB または Mirakurun / mirakc から取得する間隔を設定します。デフォルトは 5 (分) です。
     program_update_interval: 5.0

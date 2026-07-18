@@ -87,6 +87,8 @@ class ClientSettings(BaseModel):
     video_watched_history_max_count: Annotated[int, PositiveInt] = 50
     # tv_streaming_quality: 同期無効
     # tv_streaming_quality_cellular: 同期無効
+    # bs4k_streaming_quality: 同期無効
+    # bs4k_streaming_quality_cellular: 同期無効
     # tv_data_saver_mode: 同期無効
     # tv_data_saver_mode_cellular: 同期無効
     # tv_low_latency_mode: 同期無効
@@ -144,6 +146,15 @@ class _ServerSettingsGeneral(BaseModel):
     edcb_url: Annotated[Url, UrlConstraints(allowed_schemes=['tcp'])] = Url('tcp://127.0.0.1:4510/')
     mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] = Url('http://127.0.0.1:40772/')
     encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'] = 'FFmpeg'
+    encoder_bs4k: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'] = 'FFmpeg'
+    encoder_bs4k_input_probesize: Annotated[int, PositiveInt] = 3000
+    encoder_bs4k_input_analyze: Annotated[float, PositiveFloat] = 1.5
+    encoder_bs4k_input_analysis_enabled: bool = True
+    encoder_bs4k_max_interleave_delta: Annotated[int, PositiveInt] = 800
+    encoder_bs4k_low_latency: bool = True
+    bs4k_ignore_viewer_low_latency: bool = False
+    bs4k_live_startup_discard_enabled: bool = True
+    bs4k_live_startup_discard_seconds: Annotated[float, confloat(ge=0.0)] = 2.0
     program_update_interval: Annotated[float, confloat(ge=0.1)] = 5.0
     debug: bool = False
     debug_encoder: bool = False
@@ -236,11 +247,8 @@ class _ServerSettingsGeneral(BaseModel):
                 logging.info(f'Always receive TV from {mirakurun_or_mirakc}.')
         return mirakurun_url
 
-    @field_validator('encoder')
-    def validate_encoder(cls, encoder: str, info: ValidationInfo) -> str:
-        # バリデーションをスキップする場合はここで終了
-        if type(info.context) is dict and info.context.get('bypass_validation') is True:
-            return encoder
+    @classmethod
+    def _validate_encoder_value(cls, encoder: str) -> str:
         from app import logging
         current_arch = platform.machine()
         # x64 なのにエンコーダーとして rkmppenc が指定されている場合
@@ -287,6 +295,13 @@ class _ServerSettingsGeneral(BaseModel):
         encoder_version = encoder_version.replace('ffmpeg', 'FFmpeg').strip()
         logging.info(f'Encoder: {encoder_version}')
         return encoder
+
+    @field_validator('encoder', 'encoder_bs4k')
+    def validate_encoder(cls, encoder: str, info: ValidationInfo) -> str:
+        # バリデーションをスキップする場合はここで終了
+        if type(info.context) is dict and info.context.get('bypass_validation') is True:
+            return encoder
+        return cls._validate_encoder_value(encoder)
 
 class _ServerSettingsServer(BaseModel):
     port: PositiveInt = 7000

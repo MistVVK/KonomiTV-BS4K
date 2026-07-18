@@ -42,6 +42,10 @@
                         <!-- 表記スペースがないのであえて「Twitter 連携」のまま -->
                         <span class="ml-4">Twitter 連携</span>
                     </v-btn>
+                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/bs4k">
+                        <Icon icon="fluent:tv-20-filled" width="26px" />
+                        <span class="ml-4">BS4K設定</span>
+                    </v-btn>
                     <v-btn variant="flat" class="settings-navigation__button" to="/settings/server">
                         <Icon icon="fluent:server-surface-16-filled" width="26px" />
                         <span class="ml-4">サーバー設定</span>

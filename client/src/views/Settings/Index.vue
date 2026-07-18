@@ -46,6 +46,10 @@
                         <Icon icon="fa-brands:twitter" width="26px" style="padding: 0 1px;" />
                         <span class="ml-4">Twitter / Bluesky 連携</span>
                     </v-btn>
+                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/bs4k">
+                        <Icon icon="fluent:tv-20-filled" width="26px" />
+                        <span class="ml-4">BS4K設定</span>
+                    </v-btn>
                     <v-btn variant="flat" class="settings-navigation__button" to="/settings/server">
                         <Icon icon="fluent:server-surface-16-filled" width="26px" />
                         <span class="ml-4">サーバー設定</span>

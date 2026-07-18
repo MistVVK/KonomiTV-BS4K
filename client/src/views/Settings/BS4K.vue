@@ -1,0 +1,365 @@
+<template>
+    <SettingsBase>
+        <h2 class="settings__heading">
+            <a v-ripple class="settings__back-button" @click="$router.back()">
+                <Icon icon="fluent:chevron-left-12-filled" width="27px" />
+            </a>
+            <Icon icon="fluent:tv-20-filled" width="22px" />
+            <span class="ml-2">BS4K設定</span>
+        </h2>
+        <div class="settings__description">
+            BS4K のライブ視聴と、ONID=11 の録画再生に関するサーバー設定です。<br>
+        </div>
+        <div class="settings__description mt-1">
+            [BS4K設定を更新] ボタンを押さずにこのページから離れると、変更内容は破棄されます。<br>
+            変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
+        </div>
+        <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
+            <div class="settings__content-heading">
+                <Icon icon="fluent:video-settings-20-filled" width="22px" />
+                <span class="ml-2">エンコーダ</span>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">BS4K で利用するエンコーダー</div>
+                <div class="settings__item-label">
+                    BS4K のライブ視聴と、ONID=11 の録画再生時だけ、こちらのエンコーダーを利用します。<br>
+                    BS4K 以外のライブ視聴と通常録画の再生にはサーバー設定の通常エンコーダーが使われます。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :items="encoder_options"
+                    v-model="server_settings.general.encoder_bs4k">
+                </v-select>
+            </div>
+            <div class="settings__item settings__item--switch">
+                <label class="settings__item-heading" for="encoder_bs4k_input_analysis_enabled">BS4K ライブ入力解析を強化する</label>
+                <label class="settings__item-label" for="encoder_bs4k_input_analysis_enabled">
+                    有効にすると、BS4K のライブ視聴時だけ下の入力解析サイズ・時間を使います。<br>
+                    無効にすると、通常チャンネルと同じ入力解析設定を使います。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" id="encoder_bs4k_input_analysis_enabled" hide-details
+                    v-model="server_settings.general.encoder_bs4k_input_analysis_enabled">
+                </v-switch>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">BS4K 入力解析サイズ (KB)</div>
+                <div class="settings__item-label">
+                    BS4K ライブ入力解析を強化する場合に、エンコーダーが映像ヘッダーを探すために読むデータ量を設定します。デフォルトは 3000 です。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    v-model.number="server_settings.general.encoder_bs4k_input_probesize">
+                </v-text-field>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">BS4K 入力解析時間 (秒)</div>
+                <div class="settings__item-label">
+                    BS4K ライブ入力解析を強化する場合に、エンコーダーが入力ストリームを解析する時間を設定します。デフォルトは 1.5 です。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number" step="0.1" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    v-model.number="server_settings.general.encoder_bs4k_input_analyze">
+                </v-text-field>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">BS4K mux 待ち幅 (KB)</div>
+                <div class="settings__item-label">
+                    BS4K のライブ視聴と ONID=11 の録画再生時だけ、映像と音声の多重化で許容する待ち幅を設定します。デフォルトは 800 です。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    v-model.number="server_settings.general.encoder_bs4k_max_interleave_delta">
+                </v-text-field>
+            </div>
+            <div class="settings__item settings__item--switch">
+                <label class="settings__item-heading" for="encoder_bs4k_low_latency">BS4K エンコーダーを即時出力優先にする</label>
+                <label class="settings__item-label" for="encoder_bs4k_low_latency">
+                    有効にすると、BS4K のライブ視聴と ONID=11 の録画再生時だけエンコーダーに即時出力系のオプションを付けます。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" id="encoder_bs4k_low_latency" hide-details
+                    v-model="server_settings.general.encoder_bs4k_low_latency">
+                </v-switch>
+            </div>
+            <div class="settings__item settings__item--switch">
+                <label class="settings__item-heading" for="bs4k_live_startup_discard_enabled">BS4K ライブ開始時に先頭 TS を捨てる</label>
+                <label class="settings__item-label" for="bs4k_live_startup_discard_enabled">
+                    有効にすると、BS4K のライブ視聴開始時だけチューナー切替直後の TS をエンコーダーに渡さず破棄します。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" id="bs4k_live_startup_discard_enabled" hide-details
+                    v-model="server_settings.general.bs4k_live_startup_discard_enabled">
+                </v-switch>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">BS4K ライブ先頭 TS 破棄秒数</div>
+                <div class="settings__item-label">
+                    BS4K ライブ開始時に捨てる TS の秒数を設定します。デフォルトは 2.0 です。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number" step="0.1" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    v-model.number="server_settings.general.bs4k_live_startup_discard_seconds">
+                </v-text-field>
+            </div>
+        </div>
+        <div class="settings__content">
+            <div class="settings__content-heading">
+                <Icon icon="fluent:play-circle-20-filled" width="22px" />
+                <span class="ml-2">プレイヤー</span>
+            </div>
+            <v-tabs class="settings__tab" color="primary" bg-color="transparent" align-tabs="center" v-model="player_tab">
+                <v-tab style="text-transform: none !important;" v-for="network_circuit in network_circuits" :key="network_circuit">
+                    {{network_circuit}}
+                </v-tab>
+            </v-tabs>
+            <div v-show="player_tab === index" v-for="(network_circuit, index) in network_circuits" :key="network_circuit">
+                <div class="settings__item settings__item--sync-disabled">
+                    <div class="settings__item-heading">BS4K のデフォルトのストリーミング画質</div>
+                    <div class="settings__item-label">
+                        BS4K ライブ視聴時に最初に適用される、デフォルトの画質を設定します。<br>
+                        通常のテレビ画質設定とは別に、BS4K 専用の画質リストから選択します。<br>
+                    </div>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" v-if="network_circuit !== 'モバイル回線時'"
+                        :items="bs4k_streaming_quality" v-model="settings_store.settings.bs4k_streaming_quality">
+                    </v-select>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" v-if="network_circuit === 'モバイル回線時'"
+                        :items="bs4k_streaming_quality_cellular" v-model="settings_store.settings.bs4k_streaming_quality_cellular">
+                    </v-select>
+                </div>
+                <div class="settings__item settings__item--switch settings__item--sync-disabled"
+                    :class="{'settings__item--disabled': PlayerUtils.isHEVCVideoSupported() === false}">
+                    <label class="settings__item-heading" :for="`bs4k_tv_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
+                        BS4K ライブ視聴を通信節約モードにする
+                    </label>
+                    <label class="settings__item-label" :for="`bs4k_tv_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
+                        画質設定のテレビ通信節約モードと同じ設定です。H.265 / HEVC で通信量を抑えて視聴します。<br>
+                    </label>
+                    <div class="settings__item-label mt-1">
+                        <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === false">
+                            このデバイスでは通信節約モードがサポートされていません。
+                        </p>
+                        <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === true">
+                            お使いの Firefox ブラウザでは通信節約モードがサポートされていません。
+                        </p>
+                    </div>
+                    <v-switch class="settings__item-switch" color="primary" id="bs4k_tv_data_saver_mode" hide-details v-if="network_circuit !== 'モバイル回線時'"
+                        v-model="settings_store.settings.tv_data_saver_mode" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
+                    </v-switch>
+                    <v-switch class="settings__item-switch" color="primary" id="bs4k_tv_data_saver_mode_cellular" hide-details v-if="network_circuit === 'モバイル回線時'"
+                        v-model="settings_store.settings.tv_data_saver_mode_cellular" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
+                    </v-switch>
+                </div>
+                <div class="settings__item settings__item--sync-disabled">
+                    <div class="settings__item-heading">BS4K 録画再生のデフォルトのストリーミング画質</div>
+                    <div class="settings__item-label">
+                        ONID=11 の録画再生時に最初に適用される、デフォルトの画質を設定します。<br>
+                        通常のビデオ画質設定とは別に、BS4K 専用の画質リストから選択します。<br>
+                    </div>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" v-if="network_circuit !== 'モバイル回線時'"
+                        :items="bs4k_video_streaming_quality" v-model="settings_store.settings.bs4k_video_streaming_quality">
+                    </v-select>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" v-if="network_circuit === 'モバイル回線時'"
+                        :items="bs4k_video_streaming_quality_cellular" v-model="settings_store.settings.bs4k_video_streaming_quality_cellular">
+                    </v-select>
+                </div>
+                <div class="settings__item settings__item--switch settings__item--sync-disabled"
+                    :class="{'settings__item--disabled': PlayerUtils.isHEVCVideoSupported() === false}">
+                    <label class="settings__item-heading" :for="`bs4k_video_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
+                        BS4K 録画再生を通信節約モードにする
+                    </label>
+                    <label class="settings__item-label" :for="`bs4k_video_data_saver_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
+                        画質設定のビデオ通信節約モードと同じ設定です。ONID=11 の録画再生時に H.265 / HEVC で通信量を抑えます。<br>
+                    </label>
+                    <div class="settings__item-label mt-1">
+                        <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === false">
+                            このデバイスでは通信節約モードがサポートされていません。
+                        </p>
+                        <p class="mt-1 mb-0 text-error-lighten-1" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === true">
+                            お使いの Firefox ブラウザでは通信節約モードがサポートされていません。
+                        </p>
+                    </div>
+                    <v-switch class="settings__item-switch" color="primary" id="bs4k_video_data_saver_mode" hide-details v-if="network_circuit !== 'モバイル回線時'"
+                        v-model="settings_store.settings.video_data_saver_mode" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
+                    </v-switch>
+                    <v-switch class="settings__item-switch" color="primary" id="bs4k_video_data_saver_mode_cellular" hide-details v-if="network_circuit === 'モバイル回線時'"
+                        v-model="settings_store.settings.video_data_saver_mode_cellular" :disabled="PlayerUtils.isHEVCVideoSupported() === false">
+                    </v-switch>
+                </div>
+            </div>
+            <div class="settings__item settings__item--switch" :class="{'settings__item--disabled': is_disabled}">
+                <label class="settings__item-heading" for="bs4k_ignore_viewer_low_latency">BS4K プレイヤーを通常バッファで再生する</label>
+                <label class="settings__item-label" for="bs4k_ignore_viewer_low_latency">
+                    有効にすると、BS4K のライブ視聴時だけユーザーの低遅延視聴設定を使わず、通常の再生バッファを使います。<br>
+                    変更を反映するには BS4K設定を更新し、KonomiTV サーバーを再起動してください。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" id="bs4k_ignore_viewer_low_latency" hide-details
+                    v-model="server_settings.general.bs4k_ignore_viewer_low_latency" :disabled="is_disabled">
+                </v-switch>
+            </div>
+        </div>
+        <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
+            <div class="settings__content-heading">
+                <Icon icon="fluent:arrow-counterclockwise-20-filled" width="22px" />
+                <span class="ml-2">反映</span>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">BS4K設定を更新</div>
+                <div class="settings__item-label">
+                    エンコーダ設定と一部のプレイヤー設定を config.yaml に保存します。<br>
+                    保存した変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
+                </div>
+            </div>
+            <v-btn class="settings__save-button bg-secondary mt-5" variant="flat" @click="updateServerSettings()">
+                <Icon icon="fluent:save-16-filled" class="mr-2" height="23px" />BS4K設定を更新
+            </v-btn>
+            <div class="settings__item mt-8">
+                <div class="settings__item-heading text-error-lighten-1">KonomiTV サーバーを再起動</div>
+                <div class="settings__item-label">
+                    BS4K設定の変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
+                    <strong>再起動を実行すると、すべての視聴中セッションが切断されます。</strong>十分注意してください。<br>
+                </div>
+            </div>
+            <v-btn class="settings__save-button bg-error mt-5" variant="flat" @click="restartServer()">
+                <Icon icon="fluent:arrow-counterclockwise-20-filled" height="20px" />
+                <span class="ml-2">KonomiTV サーバーを再起動</span>
+            </v-btn>
+        </div>
+    </SettingsBase>
+</template>
+<script lang="ts" setup>
+
+import { computed, ref } from 'vue';
+
+import Message from '@/message';
+import Maintenance from '@/services/Maintenance';
+import Settings, { IServerSettings, IServerSettingsDefault } from '@/services/Settings';
+import Version from '@/services/Version';
+import useSettingsStore, { type BS4KLiveStreamingQuality } from '@/stores/SettingsStore';
+import useUserStore from '@/stores/UserStore';
+import Utils, { PlayerUtils } from '@/utils';
+import SettingsBase from '@/views/Settings/Base.vue';
+
+const QUALITY_BS4K_H264 = [
+    {title: '8K (約18.00GB/h / 平均40.0Mbps)', value: '4320p'},
+    {title: '4K (約8.10GB/h / 平均18.0Mbps)', value: '2160p'},
+    {title: '1440p (約5.85GB/h / 平均13.0Mbps)', value: '1440p'},
+    {title: '1080p (60fps) (約4.95GB/h / 平均11.0Mbps)', value: '1080p-60fps'},
+    {title: '1080p (30fps) (約4.28GB/h / 平均9.5Mbps)', value: '1080p-30fps'},
+    {title: '810p (60fps) (約2.93GB/h / 平均6.5Mbps)', value: '810p-60fps'},
+    {title: '810p (30fps) (約2.48GB/h / 平均5.5Mbps)', value: '810p-30fps'},
+    {title: '720p (60fps) (約2.43GB/h / 平均5.4Mbps)', value: '720p-60fps'},
+    {title: '720p (30fps) (約2.03GB/h / 平均4.5Mbps)', value: '720p-30fps'},
+    {title: '540p (30fps) (約1.35GB/h / 平均3.0Mbps)', value: '540p-30fps'},
+    {title: '480p (30fps) (約0.90GB/h / 平均2.0Mbps)', value: '480p-30fps'},
+    {title: '360p (30fps) (約0.50GB/h / 平均1.1Mbps)', value: '360p-30fps'},
+    {title: '240p (30fps) (約0.25GB/h / 平均0.6Mbps)', value: '240p-30fps'},
+];
+
+const QUALITY_BS4K_H265 = [
+    {title: '8K (約9.00GB/h / 平均20.0Mbps)', value: '4320p'},
+    {title: '4K (約4.05GB/h / 平均9.0Mbps)', value: '2160p'},
+    {title: '1440p (約2.48GB/h / 平均5.5Mbps)', value: '1440p'},
+    {title: '1080p (60fps) (約1.58GB/h / 平均3.5Mbps)', value: '1080p-60fps'},
+    {title: '1080p (30fps) (約1.35GB/h / 平均3.0Mbps)', value: '1080p-30fps'},
+    {title: '810p (60fps) (約1.35GB/h / 平均3.0Mbps)', value: '810p-60fps'},
+    {title: '810p (30fps) (約1.13GB/h / 平均2.5Mbps)', value: '810p-30fps'},
+    {title: '720p (60fps) (約1.08GB/h / 平均2.4Mbps)', value: '720p-60fps'},
+    {title: '720p (30fps) (約0.90GB/h / 平均2.0Mbps)', value: '720p-30fps'},
+    {title: '540p (30fps) (約0.63GB/h / 平均1.4Mbps)', value: '540p-30fps'},
+    {title: '480p (30fps) (約0.47GB/h / 平均1.1Mbps)', value: '480p-30fps'},
+    {title: '360p (30fps) (約0.34GB/h / 平均0.8Mbps)', value: '360p-30fps'},
+    {title: '240p (30fps) (約0.20GB/h / 平均0.5Mbps)', value: '240p-30fps'},
+];
+
+// フォームを小さくするかどうか
+const is_form_dense = Utils.isSmartphoneHorizontal();
+const settings_store = useSettingsStore();
+const legacy_bs4k_quality_map: Record<string, BS4KLiveStreamingQuality> = {
+    '1080p': '1080p-30fps',
+    '810p': '810p-30fps',
+    '720p': '720p-30fps',
+    '540p': '540p-30fps',
+    '480p': '480p-30fps',
+    '360p': '360p-30fps',
+    '240p': '240p-30fps',
+};
+settings_store.settings.bs4k_streaming_quality =
+    legacy_bs4k_quality_map[settings_store.settings.bs4k_streaming_quality] ?? settings_store.settings.bs4k_streaming_quality;
+settings_store.settings.bs4k_streaming_quality_cellular =
+    legacy_bs4k_quality_map[settings_store.settings.bs4k_streaming_quality_cellular] ?? settings_store.settings.bs4k_streaming_quality_cellular;
+settings_store.settings.bs4k_video_streaming_quality =
+    legacy_bs4k_quality_map[settings_store.settings.bs4k_video_streaming_quality] ?? settings_store.settings.bs4k_video_streaming_quality;
+settings_store.settings.bs4k_video_streaming_quality_cellular =
+    legacy_bs4k_quality_map[settings_store.settings.bs4k_video_streaming_quality_cellular] ?? settings_store.settings.bs4k_video_streaming_quality_cellular;
+const player_tab = ref<number | null>(0);
+const network_circuits = ['Wi-Fi 回線時', 'モバイル回線時'];
+const bs4k_streaming_quality = computed(() => {
+    return settings_store.settings.tv_data_saver_mode === true ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+});
+const bs4k_streaming_quality_cellular = computed(() => {
+    return settings_store.settings.tv_data_saver_mode_cellular === true ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+});
+const bs4k_video_streaming_quality = computed(() => {
+    return settings_store.settings.video_data_saver_mode === true ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+});
+const bs4k_video_streaming_quality_cellular = computed(() => {
+    return settings_store.settings.video_data_saver_mode_cellular === true ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+});
+
+// エンコーダーの選択肢
+const encoder_options = [
+    {title: 'FFmpeg : ソフトウェアエンコーダー', value: 'FFmpeg'},
+    {title: 'QSVEncC : Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能', value: 'QSVEncC'},
+    {title: 'NVEncC : NVIDIA GPU で利用可能', value: 'NVEncC'},
+    {title: 'VCEEncC : AMD GPU で利用可能', value: 'VCEEncC'},
+    {title: 'rkmppenc : Rockchip RK3588 系 SoC 搭載 SBC で利用可能', value: 'rkmppenc'},
+];
+
+// ユーザー情報を取得し、もし管理者権限であれば無効化を解除
+const is_disabled = ref(true);
+const user_store = useUserStore();
+user_store.fetchUser().then((user) => {
+    if (user && user.is_admin) {
+        is_disabled.value = false;
+    }
+});
+
+// サーバー設定を取得
+const server_settings = ref<IServerSettings>(structuredClone(IServerSettingsDefault));
+Settings.fetchServerSettings().then((settings) => {
+    if (settings) {
+        server_settings.value = settings;
+    }
+});
+
+// サーバー設定を更新する関数
+async function updateServerSettings() {
+
+    // サーバー設定を更新
+    const result = await Settings.updateServerSettings(server_settings.value);
+
+    // 成功した場合のみメッセージを表示
+    // エラー処理は Services 層で行われるため、ここではエラー処理は不要
+    // 再起動するまでは設定データは反映されないため、再起動せずにページをリロードすると反映されてないように見える点に注意
+    if (result === true) {
+        Message.success('BS4K設定を更新しました。\n変更を反映するためには、KonomiTV サーバーを再起動してください。');
+    }
+}
+
+// KonomiTV サーバーの再起動を行う関数
+async function restartServer() {
+    const result = await Maintenance.restartServer();
+    if (result === true) {
+        Message.show('KonomiTV サーバーを再起動しています...');
+        // バージョン情報が取得できるようになるまで待つ
+        await Utils.sleep(1.0);
+        while (await Version.fetchServerVersion(true) === null) {
+            await Utils.sleep(1.0);
+        }
+        Message.success('KonomiTV サーバーを再起動しました。');
+    }
+}
+
+</script>

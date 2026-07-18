@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
 
 from biim.mpeg2ts import ts
@@ -31,6 +32,19 @@ from app.utils.TSKeyFrameSeeker import TSKeyFrameCollector
 
 if TYPE_CHECKING:
     from app.streams.VideoStream import VideoStream, VideoStreamSegment
+
+
+@dataclass(frozen=True)
+class VideoEncodingProfile:
+    """録画再生時のエンコードプロファイル。"""
+
+    name: str
+    is_bs4k: bool = False
+    input_probesize: int | None = None
+    input_analyze: float | None = None
+    max_interleave_delta: int | None = None
+    low_latency: bool = True
+    encoder_read_timeout: float = 10.0
 
 
 class VideoEncodingTask:
@@ -86,6 +100,24 @@ class VideoEncodingTask:
         self._retry_count: int = 0
 
 
+    def getEncodingProfile(self) -> VideoEncodingProfile:
+        """録画ファイルの特性に応じたエンコードプロファイルを取得する。"""
+
+        if self.video_stream.recorded_program.network_id == 0x000B:
+            CONFIG = Config()
+            return VideoEncodingProfile(
+                name = 'BS4K',
+                is_bs4k = True,
+                input_probesize = CONFIG.general.encoder_bs4k_input_probesize,
+                input_analyze = CONFIG.general.encoder_bs4k_input_analyze,
+                max_interleave_delta = CONFIG.general.encoder_bs4k_max_interleave_delta,
+                low_latency = CONFIG.general.encoder_bs4k_low_latency,
+                encoder_read_timeout = 60.0,
+            )
+
+        return VideoEncodingProfile(name = 'Default')
+
+
     def buildFFmpegOptions(self,
         quality: QUALITY_TYPES,
         output_ts_offset: float,
@@ -104,11 +136,16 @@ class VideoEncodingTask:
         # オプションの入る配列
         options: list[str] = []
 
+        encoding_profile = self.getEncodingProfile()
+
         # 入力ストリームの解析時間
-        analyzeduration = round(500000 + (self._retry_count * 500000))  # リトライ回数に応じて少し増やす
-        if self.video_stream.recorded_program.recorded_video.video_codec != 'MPEG-2':
-            # MPEG-2 以外のコーデックでは入力ストリームの解析時間を長めにする (その方がうまくいく)
-            analyzeduration += 1000000
+        if encoding_profile.is_bs4k is True and encoding_profile.input_analyze is not None:
+            analyzeduration = round((encoding_profile.input_analyze * 1000000) + (self._retry_count * 200000))
+        else:
+            analyzeduration = round(500000 + (self._retry_count * 500000))  # リトライ回数に応じて少し増やす
+            if self.video_stream.recorded_program.recorded_video.video_codec != 'MPEG-2':
+                # MPEG-2 以外のコーデックでは入力ストリームの解析時間を長めにする (その方がうまくいく)
+                analyzeduration += 1000000
 
         # 入力
         ## -analyzeduration をつけることで、ストリームの分析時間を短縮できる
@@ -123,8 +160,15 @@ class VideoEncodingTask:
         ## max_interleave_delta: mux 時に影響するオプションで、ライブ再生では増やしすぎると CM で詰まりがちになる
         ## 録画再生では逆に大きめでないと映像/音声のずれが大きくなりセグメント分割時に問題が生じるため、
         ## 5000K (5秒) に設定し、リトライ回数に応じて 1000K (1秒) ずつ増やす
-        max_interleave_delta = round(5000 + (self._retry_count * 1000))
-        options.append(f'-fflags nobuffer -flags low_delay -max_delay 0 -tune zerolatency -max_interleave_delta {max_interleave_delta}K -threads auto')
+        if encoding_profile.is_bs4k is True and encoding_profile.max_interleave_delta is not None:
+            max_interleave_delta = round(encoding_profile.max_interleave_delta + (self._retry_count * 100))
+            if encoding_profile.low_latency is False:
+                options.append(f'-max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
+            else:
+                options.append(f'-fflags nobuffer -flags low_delay -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
+        else:
+            max_interleave_delta = round(5000 + (self._retry_count * 1000))
+            options.append(f'-fflags nobuffer -flags low_delay -max_delay 0 -tune zerolatency -max_interleave_delta {max_interleave_delta}K -threads auto')
 
         # 映像
         ## コーデック
@@ -145,13 +189,22 @@ class VideoEncodingTask:
         ## 特別に縦解像度を 1920 に変更してフル HD (1920×1080) でエンコードする
         video_width = QUALITY[quality].width
         video_height = QUALITY[quality].height
-        if (video_width == 1440 and video_height == 1080) and \
-            (self.video_stream.recorded_program.recorded_video.video_resolution_width == 1920 and \
-             self.video_stream.recorded_program.recorded_video.video_resolution_height == 1080):
+        if (video_width == 1440 and video_height == 1080) and (
+            encoding_profile.is_bs4k is True or
+            (self.video_stream.recorded_program.recorded_video.video_resolution_width == 1920 and
+             self.video_stream.recorded_program.recorded_video.video_resolution_height == 1080)
+        ):
             video_width = 1920
 
+        ## BS4K/BS8K 録画は 60p (プログレッシブ) 前提で扱い、24fps/インターレース解除フィルタを使わない
+        if encoding_profile.is_bs4k is True:
+            options.append(f'-vf scale={video_width}:{video_height}')
+            if '-30fps' in quality:
+                options.append(f'-r 30000/1001 -g {int(self.GOP_LENGTH_SECOND * 30)}')
+            else:
+                options.append(f'-r 60000/1001 -g {int(self.GOP_LENGTH_SECOND * 60)}')
         ## インターレース映像のみ
-        if self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
+        elif self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
             ## インターレース解除 (60i → 60p (フレームレート: 60fps))
             if QUALITY[quality].is_60fps is True:
                 options.append(f'-vf yadif=mode=1:parity=-1:deint=1,scale={video_width}:{video_height}')
@@ -212,18 +265,29 @@ class VideoEncodingTask:
         # オプションの入る配列
         options: list[str] = []
 
+        encoding_profile = self.getEncodingProfile()
+
         # 入力ストリームの解析時間
-        input_probesize = round(1000 + (self._retry_count * 1000))  # リトライ回数に応じて少し増やす
-        input_analyze = round(0.7 + (self._retry_count * 1), 1)  # リトライ回数に応じて少し増やす
-        if self.video_stream.recorded_program.recorded_video.video_codec != 'MPEG-2':
-            # MPEG-2 以外のコーデックでは入力ストリームの解析時間を長めにする (その方がうまくいく)
-            input_probesize += 2000
-            input_analyze += 6.3
+        if (
+            encoding_profile.is_bs4k is True and
+            encoding_profile.input_probesize is not None and
+            encoding_profile.input_analyze is not None
+        ):
+            input_probesize = round(encoding_profile.input_probesize + (self._retry_count * 500))
+            input_analyze = round(encoding_profile.input_analyze + (self._retry_count * 0.2), 1)
+        else:
+            input_probesize = round(1000 + (self._retry_count * 1000))  # リトライ回数に応じて少し増やす
+            input_analyze = round(0.7 + (self._retry_count * 1), 1)  # リトライ回数に応じて少し増やす
+            if self.video_stream.recorded_program.recorded_video.video_codec != 'MPEG-2':
+                # MPEG-2 以外のコーデックでは入力ストリームの解析時間を長めにする (その方がうまくいく)
+                input_probesize += 2000
+                input_analyze += 6.3
 
         # 入力
         ## --input-probesize, --input-analyze をつけることで、ストリームの分析時間を短縮できる
         ## 両方つけるのが重要で、--input-analyze だけだとエンコーダーがフリーズすることがある
-        options.append(f'--input-format mpegts --input-probesize {input_probesize}K --input-analyze {input_analyze} --input -')
+        options.append(f'--input-format mpegts --input-probesize {input_probesize}K --input-analyze {input_analyze}')
+        options.append('--input -')
         ## VCEEncC の HW デコーダーはエラー耐性が低く TS を扱う用途では不安定なので、SW デコーダーを利用する
         if encoder_type == 'VCEEncC':
             options.append('--avsw')
@@ -241,11 +305,23 @@ class VideoEncodingTask:
         ## max_interleave_delta: mux 時に影響するオプションで、ライブ再生では増やしすぎると CM で詰まりがちになる
         ## 録画再生では逆に大きめでないと映像/音声のずれが大きくなりセグメント分割時に問題が生じるため、
         ## 5000K (5秒) に設定し、リトライ回数に応じて 1000K (1秒) ずつ増やす
-        max_interleave_delta = round(5000 + (self._retry_count * 1000))
-        options.append('-m avioflags:direct -m fflags:nobuffer+flush_packets -m flush_packets:1 -m max_delay:0')
-        options.append(f'-m max_interleave_delta:{max_interleave_delta}K')
+        if encoding_profile.is_bs4k is True and encoding_profile.max_interleave_delta is not None:
+            max_interleave_delta = round(encoding_profile.max_interleave_delta + (self._retry_count * 100))
+            options.append('-m avioflags:direct -m flush_packets:1 -m max_delay:250000')
+            if encoding_profile.low_latency is True:
+                options.append('-m fflags:nobuffer+flush_packets')
+            options.append(f'-m max_interleave_delta:{max_interleave_delta}K --output-thread 0')
+            if encoding_profile.low_latency is True:
+                options.append('--lowlatency')
+        else:
+            max_interleave_delta = round(5000 + (self._retry_count * 1000))
+            options.append('-m avioflags:direct -m fflags:nobuffer+flush_packets -m flush_packets:1 -m max_delay:0')
+            options.append(f'-m max_interleave_delta:{max_interleave_delta}K')
         ## QSVEncC と rkmppenc では OpenCL を使用しないので、無効化することで初期化フェーズを高速化する
-        if (encoder_type == 'QSVEncC' or encoder_type == 'rkmppenc') and not self.video_stream.encoding_options.is_24fps_mode_enabled:
+        if (encoder_type == 'QSVEncC' or encoder_type == 'rkmppenc') and (
+            encoding_profile.is_bs4k is True or
+            self.video_stream.encoding_options.is_24fps_mode_enabled is False
+        ):
             options.append('--disable-opencl')
         ## NVEncC では NVML によるモニタリングと DX11, Vulkan を無効化することで初期化フェーズを高速化する
         if encoder_type == 'NVEncC':
@@ -313,8 +389,15 @@ class VideoEncodingTask:
         if QUALITY[quality].is_hevc is True and self.video_stream.encoding_options.is_hevc_10bit_enabled is True:
             options.append('--output-depth 10 --fallback-bitdepth')
 
+        ## BS4K/BS8K 録画は 60p (プログレッシブ) 前提で扱い、24fps/インターレース解除フィルタを使わない
+        if encoding_profile.is_bs4k is True:
+            if '-30fps' in quality:
+                options.append('--vpp-decimate cycle=2,drop=1')
+                options.append(f'--avsync vfr --gop-len {int(self.GOP_LENGTH_SECOND * 30)}')
+            else:
+                options.append(f'--avsync vfr --gop-len {int(self.GOP_LENGTH_SECOND * 60)}')
         ## インターレース映像のみ
-        if self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
+        elif self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
             # インターレース映像として読み込む
             options.append('--interlace tff')
             ## インターレース解除 (60i → 60p (フレームレート: 60fps))
@@ -356,9 +439,11 @@ class VideoEncodingTask:
         ## 特別に縦解像度を 1920 に変更してフル HD (1920×1080) でエンコードする
         video_width = QUALITY[quality].width
         video_height = QUALITY[quality].height
-        if (video_width == 1440 and video_height == 1080) and \
-            (self.video_stream.recorded_program.recorded_video.video_resolution_width == 1920 and \
-             self.video_stream.recorded_program.recorded_video.video_resolution_height == 1080):
+        if (video_width == 1440 and video_height == 1080) and (
+            encoding_profile.is_bs4k is True or
+            (self.video_stream.recorded_program.recorded_video.video_resolution_width == 1920 and
+             self.video_stream.recorded_program.recorded_video.video_resolution_height == 1080)
+        ):
             video_width = 1920
         options.append(f'--output-res {video_width}x{video_height}')
 
@@ -396,7 +481,10 @@ class VideoEncodingTask:
 
         # エンコーダーの種類を取得
         CONFIG = Config()
-        ENCODER_TYPE = CONFIG.general.encoder
+        encoding_profile = self.getEncodingProfile()
+        ENCODER_TYPE = CONFIG.general.encoder_bs4k if encoding_profile.is_bs4k is True else CONFIG.general.encoder
+        if encoding_profile.name != 'Default':
+            logging.info(f'{self.video_stream.log_prefix} Using recorded playback encoding profile: {encoding_profile.name}')
 
         # 映像 PID や映像ストリーム構成が途中で変わる録画（マルチ編成開始/終了での解像度変更時など）に関して、HWEncC 系エンコーダーは
         # --avhw だと録画マージン区間 -> 本編での解像度切り替えに対応できずクラッシュし、--avsw の場合はエラーこそ出ないがデコードがめちゃくちゃになる問題がある
@@ -1047,7 +1135,7 @@ class VideoEncodingTask:
                 latest_pmt: PMTSection | None = None
 
                 # エンコーダーの出力読み取りタイムアウトを設定
-                read_timeout = 10.0  # 10秒
+                read_timeout = encoding_profile.encoder_read_timeout
                 last_read_time = asyncio.get_running_loop().time()
 
                 # 新しいセグメントのエンコードを開始するため、バッファをリセット
