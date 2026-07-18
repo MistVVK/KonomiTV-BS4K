@@ -83,6 +83,18 @@ class ClientSettings(BaseModel):
     show_catv_channels: bool = True
     show_sky_channels: bool = True
     show_bs4k_channels: bool = True
+    ui_theme: Literal[
+        'KonomiClassic',
+        'KonomiNavy',
+        'KonomiCharcoal',
+        'DeepPlum',
+        'NightBlue',
+        'DayBlue',
+        'KonomiIvory',
+        'PearlBlue',
+        'WarmCream',
+        'CoolGray',
+    ] = 'KonomiClassic'
     show_player_background_image: bool = True
     use_pure_black_player_background: bool = False
     tv_channel_sort_by_jikkyo_force: bool = False

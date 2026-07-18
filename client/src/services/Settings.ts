@@ -1,4 +1,6 @@
 
+import type { KonomiTVTheme } from '@/themes';
+
 import APIClient from '@/services/APIClient';
 import { getSyncableClientSettings, ITimeTableGenreColors, TimeTableSizeOption } from '@/stores/SettingsStore';
 
@@ -49,6 +51,7 @@ export interface IClientSettings {
     show_catv_channels: boolean;
     show_sky_channels: boolean;
     show_bs4k_channels: boolean;
+    ui_theme: KonomiTVTheme;
     show_player_background_image: boolean;
     use_pure_black_player_background: boolean;
     tv_channel_sort_by_jikkyo_force: boolean;

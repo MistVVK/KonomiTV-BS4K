@@ -20,6 +20,7 @@ import useSettingsStore, {
     hashClientSettings,
     setLocalStorageSettings,
 } from '@/stores/SettingsStore';
+import { KONOMITV_THEME_OPTIONS } from '@/themes';
 import Utils from '@/utils';
 
 
@@ -44,6 +45,20 @@ app.use(router);
 
 // Vuetify を使う
 app.use(vuetify);
+
+// 初回描画より前に、このブラウザへ保存されているテーマを適用する
+// マウント後に切り替えると、起動時に Konomi Classic が一瞬表示されてしまう
+const settings_store = useSettingsStore();
+const applySelectedTheme = (): void => {
+    const selected_theme = KONOMITV_THEME_OPTIONS.find(option => option.value === settings_store.settings.ui_theme) ??
+        KONOMITV_THEME_OPTIONS[0];
+    vuetify.theme.global.name.value = selected_theme.value;
+    document.documentElement.style.colorScheme = selected_theme.dark ? 'dark' : 'light';
+    document.body.style.backgroundColor = selected_theme.preview.background;
+    document.body.style.color = selected_theme.preview.text;
+    document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute('content', selected_theme.preview.background);
+};
+applySelectedTheme();
 
 // vue-virtual-scroller を使う
 app.use(VueVirtualScroller);
@@ -89,9 +104,11 @@ const { updateServiceWorker } = useRegisterSW({
 
 // 設定データの変更を監視する
 // Pinia の $subscribe() は app.mount() の後に呼び出す必要がある
-const settings_store = useSettingsStore();
 let is_updating_watched_history = false;
 settings_store.$subscribe(async () => {
+
+    // テーマ変更・設定インポート・設定同期のいずれでも即時に表示へ反映する
+    applySelectedTheme();
 
     // 視聴履歴の保持件数を変更した際に、既存の視聴履歴件数が上限を超えている場合は即時に古い履歴から削除する
     // これにより、履歴追加時だけでなく設定値の縮小時にも常に上限件数を維持できる

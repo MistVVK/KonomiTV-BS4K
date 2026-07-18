@@ -6,6 +6,7 @@ import { toRaw } from 'vue';
 import type { IBlueskyReplyThreadState, ITwitterReplyThreadState } from '@/utils/TweetUtils';
 
 import Settings, { IClientSettings, IMutedCommentKeywords } from '@/services/Settings';
+import { isKonomiTVTheme, type KonomiTVTheme } from '@/themes';
 import Utils from '@/utils';
 
 
@@ -83,6 +84,7 @@ export interface ILocalClientSettings extends IClientSettings {
     show_catv_channels: boolean;
     show_sky_channels: boolean;
     show_bs4k_channels: boolean;
+    ui_theme: KonomiTVTheme;
     show_player_background_image: boolean;
     use_pure_black_player_background: boolean;
     tv_channel_sort_by_jikkyo_force: boolean;
@@ -244,6 +246,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     show_sky_channels: true,
     // TVタブと番組表にBS4Kを表示する (Default: オン)
     show_bs4k_channels: true,
+    // 画面全体のカラーテーマ (Default: Konomi Classic)
+    ui_theme: 'KonomiClassic',
     // プレイヤーの読み込み中に背景写真を表示する (Default: オン)
     show_player_background_image: true,
     // プレイヤー表示領域の背景色を完全な黒にする (Default: オフ)
@@ -436,6 +440,7 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'show_catv_channels',
     'show_sky_channels',
     'show_bs4k_channels',
+    'ui_theme',
     'show_player_background_image',
     'use_pure_black_player_background',
     'tv_channel_sort_by_jikkyo_force',
@@ -562,6 +567,12 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         }
     }
 
+    // 不明なテーマ名が保存されていた場合は、現行の Konomi Classic に戻す
+    // テーマ名の変更や不正な設定インポートで Vuetify が描画不能になることを防ぐ
+    if (isKonomiTVTheme(normalized_settings.ui_theme) === false) {
+        normalized_settings.ui_theme = ILocalClientSettingsDefault.ui_theme;
+    }
+
     // 通信節約モードを廃止し、用途・回線別の映像コーデック設定へ移行する。
     // 新キーが生データにない場合だけ旧値を引き継ぎ、移行後のユーザー設定を上書きしない。
     const codecFromDataSaver = (value: unknown): StreamingVideoCodec => value === true ? 'hevc' : 'avc';
@@ -625,6 +636,12 @@ export function getSyncableClientSettings(settings: {[key: string]: any}): IClie
             // (配列などの参照型を直接代入すると ILocalClientSettingsDefault が汚染される恐れがあるため)
             syncable_settings[sync_settings_key as string] = structuredClone(ILocalClientSettingsDefault[sync_settings_key]);
         }
+    }
+
+    // サーバー側が新しいテーマ名を返すなど、クライアントが認識できない値は既定テーマへ戻す
+    // バージョン差のある設定同期でも、テーマ適用時に描画が停止しないようにする
+    if (isKonomiTVTheme(syncable_settings.ui_theme) === false) {
+        syncable_settings.ui_theme = ILocalClientSettingsDefault.ui_theme;
     }
 
     return syncable_settings as IClientSettings;

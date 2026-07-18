@@ -43,6 +43,7 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
         label: '個人設定',
         items: [
             {type: 'Route', label: '表示・操作', icon: 'fa-solid:sliders-h', iconStyle: 'padding: 0 3px;', to: '/settings/personal/display'},
+            {type: 'Route', label: 'カラーテーマ', icon: 'fluent:paint-brush-24-filled', to: '/settings/personal/color-theme'},
             {type: 'Route', label: '再生・画質', icon: 'fluent:video-clip-multiple-16-filled', to: '/settings/personal/quality'},
             {type: 'Route', label: '字幕・コメント', icon: 'fluent:subtitles-16-filled', to: '/settings/personal/caption-comments'},
             {type: 'Route', label: 'データ放送', icon: SETTINGS_DATA_BROADCASTING_ICON, to: '/settings/personal/data-broadcasting'},
@@ -101,6 +102,11 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         name: 'Settings Personal Display',
         component: () => import('@/views/Settings/General.vue'),
         props: {section: 'display'},
+    },
+    {
+        path: '/settings/personal/color-theme',
+        name: 'Settings Personal Color Theme',
+        component: () => import('@/views/Settings/ColorTheme.vue'),
     },
     {
         path: '/settings/personal/quality',
