@@ -159,6 +159,24 @@
                     <div class="video-info__item-label">{{formatTimelineRange(interval.start_time, interval.end_time)}}</div>
                     <div class="video-info__item-value">{{formatTimelineTracks(interval.tracks)}}</div>
                 </div>
+                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
+                    <Icon icon="fluent:timeline-20-filled" width="24px" height="20px" />
+                    <span class="ml-2">CMタイムライン</span>
+                </div>
+                <div v-if="program.recorded_video.cm_sections === null" class="video-info__item">
+                    <div class="video-info__item-label">CM区間</div>
+                    <div class="video-info__item-value">未解析</div>
+                </div>
+                <div v-else-if="program.recorded_video.cm_sections.length === 0" class="video-info__item">
+                    <div class="video-info__item-label">CM区間</div>
+                    <div class="video-info__item-value">CMなし</div>
+                </div>
+                <div v-for="(section, index) in program.recorded_video.cm_sections"
+                    v-else :key="`${section.start_time}-${section.end_time}-${index}`"
+                    class="video-info__item video-info__item--timeline">
+                    <div class="video-info__item-label">{{formatTimelineRange(section.start_time, section.end_time)}}</div>
+                    <div class="video-info__item-value">CM {{index + 1}}</div>
+                </div>
             </div>
         </v-card>
     </v-dialog>
@@ -188,7 +206,7 @@ const formatTimelineTime = (seconds: number): string => {
     return [hours, minutes, remaining_seconds].map((value) => String(value).padStart(2, '0')).join(':');
 };
 
-/** 音声構成区間の開始・終了と長さを表示する。 */
+/** 音声構成やCMの区間の開始・終了と長さを表示する。 */
 const formatTimelineRange = (start_time: number, end_time: number): string => {
     return `${formatTimelineTime(start_time)} ～ ${formatTimelineTime(end_time)}` +
         `（${formatTimelineTime(Math.max(0, end_time - start_time))}）`;
@@ -244,14 +262,18 @@ const formatCMResultSource = (): string => {
     const source = {
         Existing: '外部 chapter',
         Generated: 'KonomiTV 自動解析',
-        LegacyImported: '旧命名 chapter（互換読込）',
+        LegacyImported: '外部 chapter',
     }[recorded_video.cm_result_source];
-    const path_kind = recorded_video.cm_result_chapter_path_kind === 'Legacy' ? ' / 旧命名' : '';
+    const naming_method = {
+        Canonical: '完全ファイル名方式',
+        Legacy: '基本名方式',
+    }[recorded_video.cm_result_chapter_path_kind ?? ''] ?? null;
+    const naming_method_label = naming_method !== null ? `（${naming_method}）` : '';
     const pipeline = recorded_video.cm_result_pipeline_version !== null
         ? ` / ${recorded_video.cm_result_pipeline_version}`
         : '';
     const verification = recorded_video.cm_result_verified === false ? ' / 未検証移行データ' : '';
-    return `${source}${path_kind}${pipeline}${verification}`;
+    return `${source}${naming_method_label}${pipeline}${verification}`;
 };
 
 </script>

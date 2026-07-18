@@ -67,6 +67,42 @@
                         <span v-if="!iconOnly" class="navigation__link-text">視聴履歴</span>
                     </router-link>
                     <v-spacer></v-spacer>
+                    <router-link v-ripple class="navigation__link navigation__link--analysis" active-class="navigation__link--active"
+                        to="/analysis-history/"
+                        :class="{
+                            'navigation__link--active': $route.path.startsWith('/analysis-history'),
+                            'navigation__link--analysis-active': analysisTasksStore.activeTaskStatus !== null,
+                            'navigation__link--icon-only': iconOnly,
+                        }"
+                        v-ftooltip.right="iconOnly ? analysisTaskTooltip : ''">
+                        <div class="navigation-analysis__heading">
+                            <span class="navigation__link-icon navigation__link-icon--status">
+                                <Icon icon="fluent:database-search-20-regular" width="26px" />
+                                <span v-if="analysisTasksStore.activeTaskStatus !== null"
+                                    class="navigation-analysis__status-dot"
+                                    :class="`navigation-analysis__status-dot--${analysisTasksStore.activeTaskStatus}`"></span>
+                            </span>
+                            <span v-if="!iconOnly" class="navigation__link-text">バックグラウンド処理</span>
+                            <small v-if="!iconOnly && analysisTasksStore.activeTaskStatus !== null"
+                                class="navigation-analysis__status-label">
+                                {{analysisTasksStore.activeTaskStatus === 'Running' ? '実行中' : '待機中'}}
+                            </small>
+                        </div>
+                        <div v-if="!iconOnly && analysisTasksStore.activeTaskGroups.length > 0"
+                            class="navigation-analysis__tasks">
+                            <div v-for="group in analysisTasksStore.activeTaskGroups" :key="group.task_type"
+                                class="navigation-analysis__task">
+                                <div class="navigation-analysis__task-line">
+                                    <strong>{{taskTypeLabel(group.task_type)}}</strong>
+                                    <small>{{group.running_count}}件実行中<span v-if="group.queued_count">・{{group.queued_count}}件待機</span></small>
+                                </div>
+                                <small class="navigation-analysis__stage">{{stageLabel(group.first.stage)}}</small>
+                                <v-progress-linear v-if="group.progress !== null" class="mt-1" color="primary" height="4"
+                                    rounded :model-value="group.progress * 100" />
+                                <v-progress-linear v-else class="mt-1" color="primary" height="4" rounded indeterminate />
+                            </div>
+                        </div>
+                    </router-link>
                     <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/settings/"
                         :class="{
                             'navigation__link--active': $route.path.startsWith('/settings'),
@@ -104,6 +140,7 @@ import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
 import BottomNavigation from '@/components/BottomNavigation.vue';
+import useAnalysisTasksStore, { stageLabel, taskTypeLabel } from '@/stores/AnalysisTasksStore';
 import useVersionStore from '@/stores/VersionStore';
 
 export default defineComponent({
@@ -120,10 +157,24 @@ export default defineComponent({
         },
     },
     computed: {
+        ...mapStores(useAnalysisTasksStore),
         ...mapStores(useVersionStore),
+        analysisTaskTooltip(): string {
+            if (this.analysisTasksStore.activeTaskStatus === 'Running') return 'バックグラウンド処理 (実行中)';
+            if (this.analysisTasksStore.activeTaskStatus === 'Queued') return 'バックグラウンド処理 (待機中)';
+            return 'バックグラウンド処理';
+        },
+    },
+    methods: {
+        stageLabel,
+        taskTypeLabel,
     },
     async created() {
+        this.analysisTasksStore.startOverviewPolling();
         await this.versionStore.fetchServerVersion();
+    },
+    beforeUnmount() {
+        this.analysisTasksStore.stopOverviewPolling();
     }
 });
 
@@ -264,6 +315,114 @@ export default defineComponent({
                     }
                 }
 
+                &--analysis {
+                    flex-direction: column;
+                    align-items: stretch;
+                    justify-content: center;
+                    height: 52px;
+                    padding: 0 12px 0 16px;
+                    overflow: hidden;
+                    @include smartphone-horizontal {
+                        height: 40px;
+                        padding-left: 12px;
+                    }
+
+                    &-active {
+                        justify-content: flex-start;
+                        height: auto;
+                        min-height: 52px;
+                        padding-top: 13px;
+                        padding-bottom: 10px;
+                        @include smartphone-horizontal {
+                            min-height: 40px;
+                            padding-top: 7px;
+                            padding-bottom: 8px;
+                        }
+                    }
+
+                    .navigation-analysis__heading {
+                        display: flex;
+                        align-items: center;
+                        flex-shrink: 0;
+                        width: 100%;
+                        min-height: 26px;
+                    }
+
+                    .navigation-analysis__status-label {
+                        flex-shrink: 0;
+                        margin-left: auto;
+                        color: rgb(var(--v-theme-primary));
+                        font-size: 11px;
+                    }
+
+                    .navigation-analysis__tasks {
+                        display: flex;
+                        flex-direction: column;
+                        gap: 8px;
+                        width: 100%;
+                        padding-top: 8px;
+                    }
+
+                    .navigation-analysis__task {
+                        min-width: 0;
+                        padding-top: 7px;
+                        border-top: 1px solid rgb(var(--v-theme-background-lighten-2));
+                    }
+
+                    .navigation-analysis__task-line {
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 6px;
+
+                        strong {
+                            min-width: 0;
+                            overflow: hidden;
+                            white-space: nowrap;
+                            text-overflow: ellipsis;
+                            font-size: 11px;
+                        }
+
+                        small {
+                            flex-shrink: 0;
+                            font-size: 9px;
+                        }
+                    }
+
+                    .navigation-analysis__stage {
+                        display: block;
+                        margin-top: 2px;
+                        overflow: hidden;
+                        color: rgb(var(--v-theme-text-darken-1));
+                        white-space: nowrap;
+                        text-overflow: ellipsis;
+                        font-size: 10px;
+                    }
+                }
+
+                .navigation__link-icon--status {
+                    display: flex;
+                    position: relative;
+                }
+
+                .navigation-analysis__status-dot {
+                    position: absolute;
+                    width: 8px;
+                    height: 8px;
+                    right: -2px;
+                    bottom: -1px;
+                    border: 2px solid rgb(var(--v-theme-background-lighten-1));
+                    border-radius: 50%;
+
+                    &--Running {
+                        background: rgb(var(--v-theme-primary));
+                    }
+
+                    &--Queued {
+                        background: rgb(var(--v-theme-secondary-lighten-1));
+                    }
+                }
+
                 .navigation__link-version {
                     display: flex;
                     flex-direction: column;
@@ -294,6 +453,28 @@ export default defineComponent({
 
                     .navigation__link-icon {
                         margin-right: 0;
+                    }
+
+                    &.navigation__link--analysis {
+                        align-items: center;
+                        width: 52px;
+                        height: 52px;
+                        min-height: 0;
+                        padding: 0;
+                        @include smartphone-horizontal {
+                            width: 44px;
+                            height: 44px;
+                        }
+                        @include smartphone-horizontal-short {
+                            width: 40px;
+                            height: 40px;
+                        }
+
+                        .navigation-analysis__heading {
+                            justify-content: center;
+                            width: auto;
+                            min-height: 0;
+                        }
                     }
                 }
             }
