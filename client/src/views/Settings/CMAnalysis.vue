@@ -5,7 +5,7 @@
                 <Icon icon="fluent:chevron-left-12-filled" width="27px" />
             </a>
             <Icon icon="fluent:timeline-20-filled" width="25px" />
-            <span class="ml-3">CM解析</span>
+            <span class="ml-3">CM管理</span>
         </h2>
         <div class="settings__description">
             録画横の .chapter.txt を優先して同期し、ファイルがない録画だけを汎用メディア入力対応パイプラインで解析します。<br>
@@ -47,8 +47,8 @@
                 <div class="settings__item-label">
                     単一ロゴの追加・無効化・SID/NID/TSID サービス割り当て・「ロゴなし」指定・missing 履歴を管理します。
                 </div>
-                <v-btn class="settings__save-button mt-4" variant="flat" to="/settings/cm-analysis/logos">
-                    <Icon icon="fluent:image-stack-20-filled" class="mr-2" width="22px" />ロゴ管理を開く
+                <v-btn class="settings__save-button mt-4" variant="flat" to="/settings/server/cm-analysis/logos">
+                    <Icon icon="fluent:image-stack-20-filled" class="mr-2" width="22px" />CMロゴ管理を開く
                 </v-btn>
             </div>
         </div>

@@ -1,7 +1,7 @@
 <template>
     <!-- ベース画面の中にそれぞれの設定画面で異なる部分を記述する -->
-    <SettingsBase>
-        <h2 class="settings__heading">
+    <SettingsViewContainer :embedded="embedded">
+        <h2 v-if="embedded === false" class="settings__heading">
             <a v-ripple class="settings__back-button" @click="$router.back()">
                 <Icon icon="fluent:chevron-left-12-filled" width="27px" />
             </a>
@@ -9,6 +9,10 @@
             <span class="ml-3">字幕</span>
         </h2>
         <div class="settings__content">
+            <div v-if="embedded" class="settings__content-heading">
+                <Icon icon="fluent:subtitles-16-filled" width="22px" />
+                <span class="ml-2">字幕・文字スーパー</span>
+            </div>
             <div class="settings__item">
                 <label class="settings__item-heading">字幕のフォント</label>
                 <label class="settings__item-label">
@@ -71,21 +75,27 @@
                 </v-switch>
             </div>
         </div>
-    </SettingsBase>
+    </SettingsViewContainer>
 </template>
 <script lang="ts">
 
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
+import SettingsViewContainer from '@/components/Settings/SettingsViewContainer.vue';
 import useSettingsStore from '@/stores/SettingsStore';
 import Utils from '@/utils';
-import SettingsBase from '@/views/Settings/Base.vue';
 
 export default defineComponent({
     name: 'Settings-Caption',
+    props: {
+        embedded: {
+            type: Boolean,
+            default: false,
+        },
+    },
     components: {
-        SettingsBase,
+        SettingsViewContainer,
     },
     data() {
         return {

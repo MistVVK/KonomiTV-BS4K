@@ -6,7 +6,7 @@
                 <Icon icon="fluent:chevron-left-12-filled" width="27px" />
             </a>
             <Icon icon="fluent:person-20-filled" width="25px" />
-            <span class="ml-2">アカウント</span>
+            <span class="ml-2">{{section === 'profile' ? 'プロフィール・セキュリティ' : section === 'sync' ? '同期・データ' : 'アカウント・データ'}}</span>
         </h2>
         <div class="settings__content" :class="{'settings__content--loading': is_loading}">
             <div class="account" v-if="userStore.user === null">
@@ -38,7 +38,7 @@
                     <Icon icon="fa:sign-out" class="mr-2" />ログアウト
                 </v-btn>
             </div>
-            <div class="account-register" v-if="userStore.is_logged_in === false">
+            <div class="account-register" v-if="userStore.is_logged_in === false && section !== 'sync'">
                 <div class="account-register__heading">
                     KonomiTV アカウントにログインすると、<br>より便利な機能が使えます！
                 </div>
@@ -81,7 +81,7 @@
                     <Icon icon="fluent:person-add-20-filled" class="mr-2" height="24" />アカウントを作成
                 </v-btn>
             </div>
-            <div v-if="userStore.is_logged_in === true">
+            <div v-if="userStore.is_logged_in === true && section !== 'profile'">
                 <div class="settings__item settings__item--switch">
                     <label class="settings__item-heading" for="sync_settings">設定をデバイス間で同期する</label>
                     <label class="settings__item-label" for="sync_settings">
@@ -122,6 +122,8 @@
                         </div>
                     </v-card>
                 </v-dialog>
+            </div>
+            <div v-if="userStore.is_logged_in === true && section !== 'sync'">
                 <v-form class="settings__item" ref="settings_username" @submit.prevent>
                     <div class="settings__item-heading">ユーザー名</div>
                     <div class="settings__item-label">
@@ -201,14 +203,23 @@
                 </v-dialog>
             </div>
         </div>
+        <div class="settings__content" v-if="section === 'all'">
+            <v-divider></v-divider>
+            <div class="settings__content-heading mt-8">
+                <Icon icon="fluent:arrow-import-20-filled" width="22px" />
+                <span class="ml-2">設定の入出力</span>
+            </div>
+            <SettingsData />
+        </div>
     </SettingsBase>
 </template>
 <script lang="ts">
 
 import { mapStores } from 'pinia';
-import { defineComponent } from 'vue';
+import { defineComponent, type PropType } from 'vue';
 import { VForm } from 'vuetify/components';
 
+import SettingsData from '@/components/Settings/SettingsData.vue';
 import Message from '@/message';
 import Settings from '@/services/Settings';
 import useSettingsStore, { getSyncableClientSettings, hashClientSettings } from '@/stores/SettingsStore';
@@ -218,7 +229,14 @@ import SettingsBase from '@/views/Settings/Base.vue';
 
 export default defineComponent({
     name: 'Settings-Account',
+    props: {
+        section: {
+            type: String as PropType<'profile' | 'sync' | 'all'>,
+            default: 'all',
+        },
+    },
     components: {
+        SettingsData,
         SettingsBase,
     },
     data() {

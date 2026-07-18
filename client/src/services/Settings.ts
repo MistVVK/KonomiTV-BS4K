@@ -43,6 +43,12 @@ export interface IClientSettings {
     timetable_hover_expand: boolean;
     timetable_dim_shopping_programs: boolean;
     timetable_genre_colors: ITimeTableGenreColors;
+    show_gr_channels: boolean;
+    show_bs_channels: boolean;
+    show_cs_channels: boolean;
+    show_catv_channels: boolean;
+    show_sky_channels: boolean;
+    show_bs4k_channels: boolean;
     show_player_background_image: boolean;
     use_pure_black_player_background: boolean;
     tv_channel_sort_by_jikkyo_force: boolean;

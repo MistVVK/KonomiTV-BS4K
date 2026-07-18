@@ -2,7 +2,7 @@
 
 import { createRouter, createWebHistory } from 'vue-router';
 
-import Utils from '@/utils';
+import { SETTINGS_ROUTES } from '@/router/settings';
 
 
 // Vue Router v4
@@ -89,80 +89,7 @@ const router = createRouter({
             name: 'Analysis History',
             component: () => import('@/views/AnalysisHistory.vue'),
         },
-        {
-            path: '/settings/',
-            name: 'Settings Index',
-            component: () => import('@/views/Settings/Index.vue'),
-            beforeEnter: (to, from, next) => {
-                // スマホ縦画面・スマホ横画面・タブレット縦画面では設定一覧画面を表示する（画面サイズの関係）
-                if (Utils.isSmartphoneVertical() || Utils.isSmartphoneHorizontal() || Utils.isTabletVertical()) {
-                    next();  // 通常通り遷移
-                    return;
-                }
-                // それ以外の画面サイズでは全般設定にリダイレクト
-                next({path: '/settings/general/'});
-            }
-        },
-        {
-            path: '/settings/general',
-            name: 'Settings General',
-            component: () => import('@/views/Settings/General.vue'),
-        },
-        {
-            path: '/settings/quality',
-            name: 'Settings Quality',
-            component: () => import('@/views/Settings/Quality.vue'),
-        },
-        {
-            path: '/settings/caption',
-            name: 'Settings Caption',
-            component: () => import('@/views/Settings/Caption.vue'),
-        },
-        {
-            path: '/settings/cm-analysis',
-            name: 'Settings CM Analysis',
-            component: () => import('@/views/Settings/CMAnalysis.vue'),
-        },
-        {
-            path: '/settings/cm-analysis/logos',
-            name: 'Settings CM Logo Management',
-            component: () => import('@/views/Settings/CMLogoManagement.vue'),
-        },
-        {
-            path: '/settings/data-broadcasting',
-            name: 'Settings Data Broadcasting',
-            component: () => import('@/views/Settings/DataBroadcasting.vue'),
-        },
-        {
-            path: '/settings/capture',
-            name: 'Settings Capture',
-            component: () => import('@/views/Settings/Capture.vue'),
-        },
-        {
-            path: '/settings/account',
-            name: 'Settings Account',
-            component: () => import('@/views/Settings/Account.vue'),
-        },
-        {
-            path: '/settings/jikkyo',
-            name: 'Settings Jikkyo',
-            component: () => import('@/views/Settings/Jikkyo.vue'),
-        },
-        {
-            path: '/settings/twitter',
-            name: 'Settings Twitter',
-            component: () => import('@/views/Settings/Twitter.vue'),
-        },
-        {
-            path: '/settings/bs4k',
-            name: 'Settings BS4K',
-            component: () => import('@/views/Settings/BS4K.vue'),
-        },
-        {
-            path: '/settings/server',
-            name: 'Settings Server',
-            component: () => import('@/views/Settings/Server.vue'),
-        },
+        ...SETTINGS_ROUTES,
         {
             path: '/login/',
             name: 'Login',

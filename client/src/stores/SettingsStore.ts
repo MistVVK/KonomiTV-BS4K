@@ -77,6 +77,12 @@ export interface ILocalClientSettings extends IClientSettings {
     timetable_hover_expand: boolean;
     timetable_dim_shopping_programs: boolean;
     timetable_genre_colors: ITimeTableGenreColors;
+    show_gr_channels: boolean;
+    show_bs_channels: boolean;
+    show_cs_channels: boolean;
+    show_catv_channels: boolean;
+    show_sky_channels: boolean;
+    show_bs4k_channels: boolean;
     show_player_background_image: boolean;
     use_pure_black_player_background: boolean;
     tv_channel_sort_by_jikkyo_force: boolean;
@@ -226,6 +232,18 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
 
     // ***** 設定 → 全般 *****
 
+    // TVタブと番組表に地デジを表示する (Default: オン)
+    show_gr_channels: true,
+    // TVタブと番組表にBSを表示する (Default: オン)
+    show_bs_channels: true,
+    // TVタブと番組表にCSを表示する (Default: オン)
+    show_cs_channels: true,
+    // TVタブと番組表にCATVを表示する (Default: オン)
+    show_catv_channels: true,
+    // TVタブと番組表にSKYを表示する (Default: オン)
+    show_sky_channels: true,
+    // TVタブと番組表にBS4Kを表示する (Default: オン)
+    show_bs4k_channels: true,
     // プレイヤーの読み込み中に背景写真を表示する (Default: オン)
     show_player_background_image: true,
     // プレイヤー表示領域の背景色を完全な黒にする (Default: オフ)
@@ -412,6 +430,12 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'timetable_hover_expand',
     'timetable_dim_shopping_programs',
     'timetable_genre_colors',
+    'show_gr_channels',
+    'show_bs_channels',
+    'show_cs_channels',
+    'show_catv_channels',
+    'show_sky_channels',
+    'show_bs4k_channels',
     'show_player_background_image',
     'use_pure_black_player_background',
     'tv_channel_sort_by_jikkyo_force',

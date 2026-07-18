@@ -1,20 +1,21 @@
 <template>
-    <SettingsBase>
-        <h2 class="settings__heading">
+    <SettingsViewContainer :embedded="embedded">
+        <h2 class="settings__heading" v-if="embedded === false">
             <a v-ripple class="settings__back-button" @click="$router.back()">
                 <Icon icon="fluent:chevron-left-12-filled" width="27px" />
             </a>
             <Icon icon="fluent:tv-20-filled" width="22px" />
-            <span class="ml-2">BS4K設定</span>
+            <span class="ml-2">{{section_title}}</span>
         </h2>
-        <div class="settings__description">
-            BS4K のライブ視聴と、ONID=11 の録画再生に関するサーバー設定です。<br>
+        <div class="settings__description" v-if="embedded === false">
+            {{section_description}}<br>
         </div>
-        <div class="settings__description mt-1">
+        <div class="settings__description mt-1" v-if="embedded === false && section !== 'quality'">
             [BS4K設定を更新] ボタンを押さずにこのページから離れると、変更内容は破棄されます。<br>
             変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
         </div>
-        <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
+        <div class="settings__content" v-if="isSectionVisible('server')"
+            :class="{'settings__content--disabled': is_disabled}">
             <div class="settings__content-heading">
                 <Icon icon="fluent:video-settings-20-filled" width="22px" />
                 <span class="ml-2">エンコーダ</span>
@@ -100,10 +101,10 @@
                 </v-text-field>
             </div>
         </div>
-        <div class="settings__content">
+        <div class="settings__content" v-if="isSectionVisible('quality')">
             <div class="settings__content-heading">
                 <Icon icon="fluent:video-clip-multiple-16-filled" width="22px" />
-                <span class="ml-2">画質</span>
+                <span class="ml-2">{{embedded ? 'BS4K画質' : '画質'}}</span>
             </div>
             <v-tabs class="settings__tab" color="primary" bg-color="transparent" align-tabs="center" v-model="player_tab">
                 <v-tab style="text-transform: none !important;" v-for="network_circuit in network_circuits" :key="network_circuit">
@@ -187,7 +188,8 @@
                 </div>
             </div>
         </div>
-        <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
+        <div class="settings__content" v-if="isSectionVisible('server')"
+            :class="{'settings__content--disabled': is_disabled}">
             <div class="settings__content-heading">
                 <Icon icon="fluent:play-circle-20-filled" width="22px" />
                 <span class="ml-2">プレイヤー</span>
@@ -203,7 +205,8 @@
                 </v-switch>
             </div>
         </div>
-        <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
+        <div class="settings__content" v-if="isSectionVisible('server')"
+            :class="{'settings__content--disabled': is_disabled}">
             <div class="settings__content-heading">
                 <Icon icon="fluent:arrow-counterclockwise-20-filled" width="22px" />
                 <span class="ml-2">反映</span>
@@ -218,33 +221,52 @@
             <v-btn class="settings__save-button bg-secondary mt-5" variant="flat" @click="updateServerSettings()">
                 <Icon icon="fluent:save-16-filled" class="mr-2" height="23px" />BS4K設定を更新
             </v-btn>
-            <div class="settings__item mt-8">
-                <div class="settings__item-heading text-error-lighten-1">KonomiTV サーバーを再起動</div>
-                <div class="settings__item-label">
-                    BS4K設定の変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
-                    <strong>再起動を実行すると、すべての視聴中セッションが切断されます。</strong>十分注意してください。<br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button bg-error mt-5" variant="flat" @click="restartServer()">
-                <Icon icon="fluent:arrow-counterclockwise-20-filled" height="20px" />
-                <span class="ml-2">KonomiTV サーバーを再起動</span>
-            </v-btn>
         </div>
-    </SettingsBase>
+    </SettingsViewContainer>
 </template>
 <script lang="ts" setup>
 
-import { computed, ref } from 'vue';
+import { storeToRefs } from 'pinia';
+import { computed, ref, toRaw, watch } from 'vue';
 
+import type { IServerSettings } from '@/services/Settings';
+
+import SettingsViewContainer from '@/components/Settings/SettingsViewContainer.vue';
 import Message from '@/message';
-import Maintenance from '@/services/Maintenance';
-import Settings, { IServerSettings, IServerSettingsDefault } from '@/services/Settings';
-import Version from '@/services/Version';
 import Videos, { IRecordedPlaybackCodecOption } from '@/services/Videos';
+import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore, { type BS4KLiveStreamingQuality } from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { PlayerUtils } from '@/utils';
-import SettingsBase from '@/views/Settings/Base.vue';
+
+type BS4KSettingsSection = 'quality' | 'server' | 'all';
+
+const props = withDefaults(defineProps<{
+    section?: BS4KSettingsSection;
+    embedded?: boolean;
+}>(), {
+    section: 'all',
+    embedded: false,
+});
+
+// BS4K の端末別再生設定とサーバー共有設定を別ルートから表示できるようにする
+const section = computed(() => props.section);
+const embedded = computed(() => props.embedded);
+const section_title = computed(() => ({
+    quality: 'BS4K再生画質',
+    server: 'BS4K配信・エンコーダー',
+    all: 'BS4K設定',
+})[props.section]);
+const section_description = computed(() => {
+    if (props.section === 'quality') {
+        return 'この端末での BS4K ライブ視聴と、ONID=11 の録画再生に使う画質・映像コーデックを設定します。';
+    }
+    return 'BS4K のライブ視聴と、ONID=11 の録画再生に関するサーバー設定です。';
+});
+
+function isSectionVisible(target_section: Exclude<BS4KSettingsSection, 'all'>): boolean {
+    return props.section === 'all' || props.section === target_section;
+}
 
 const QUALITY_BS4K_H264 = [
     {title: '8K (約18.00GB/h / 平均40.0Mbps)', value: '4320p'},
@@ -335,42 +357,57 @@ user_store.fetchUser().then((user) => {
     }
 });
 
-// サーバー設定を取得
-const server_settings = ref<IServerSettings>(structuredClone(IServerSettingsDefault));
-Settings.fetchServerSettings().then((settings) => {
-    if (settings) {
-        server_settings.value = settings;
-        Videos.buildRecordedPlaybackCodecOptions(settings.general.encoder_bs4k).then((options) => {
-            recorded_streaming_video_codecs.value = options;
-        });
+// ストアには最後に取得・保存した基準値だけを保持し、この画面では section ごとのローカルドラフトを編集する
+// 録画再生のコーデック候補は、ローカルドラフトにある BS4K エンコーダーから生成する
+const server_settings_store = useServerSettingsStore();
+const { server_settings: base_server_settings } = storeToRefs(server_settings_store);
+const server_settings = ref<IServerSettings>(structuredClone(toRaw(base_server_settings.value)));
+
+function resetServerSettingsDraft(): void {
+    server_settings.value = structuredClone(toRaw(base_server_settings.value));
+}
+
+server_settings_store.fetchServerSettingsOnce().then((settings) => {
+    if (settings !== null) {
+        resetServerSettingsDraft();
     }
+});
+
+// 同じコンポーネントを使う端末設定・サーバー設定間の移動時に、未保存のサーバー設定を破棄する
+watch(() => props.section, () => {
+    resetServerSettingsDraft();
+});
+
+// エンコーダーが連続して切り替わったとき、遅く返った古い応答で候補を上書きしない
+let recorded_codec_options_request_id = 0;
+watch([
+    () => server_settings.value.general.encoder_bs4k,
+    () => props.section,
+], async ([encoder, current_section]) => {
+    const request_id = ++recorded_codec_options_request_id;
+    if (current_section === 'server') {
+        recorded_streaming_video_codecs.value = [];
+        return;
+    }
+    const options = await Videos.buildRecordedPlaybackCodecOptions(encoder);
+    if (request_id === recorded_codec_options_request_id) {
+        recorded_streaming_video_codecs.value = options;
+    }
+}, {
+    immediate: true,
 });
 
 // サーバー設定を更新する関数
 async function updateServerSettings() {
-
-    // サーバー設定を更新
-    const result = await Settings.updateServerSettings(server_settings.value);
+    // サーバー管理の各 section と同じ正規化・更新経路を利用する
+    const result = await server_settings_store.updateServerSettings(server_settings.value);
 
     // 成功した場合のみメッセージを表示
     // エラー処理は Services 層で行われるため、ここではエラー処理は不要
     // 再起動するまでは設定データは反映されないため、再起動せずにページをリロードすると反映されてないように見える点に注意
     if (result === true) {
+        resetServerSettingsDraft();
         Message.success('BS4K設定を更新しました。\n変更を反映するためには、KonomiTV サーバーを再起動してください。');
-    }
-}
-
-// KonomiTV サーバーの再起動を行う関数
-async function restartServer() {
-    const result = await Maintenance.restartServer();
-    if (result === true) {
-        Message.show('KonomiTV サーバーを再起動しています...');
-        // バージョン情報が取得できるようになるまで待つ
-        await Utils.sleep(1.0);
-        while (await Version.fetchServerVersion(true) === null) {
-            await Utils.sleep(1.0);
-        }
-        Message.success('KonomiTV サーバーを再起動しました。');
     }
 }
 

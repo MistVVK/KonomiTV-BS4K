@@ -321,7 +321,7 @@ const useTimeTableStore = defineStore('timetable', () => {
 
         // ピン留めの場合はチャンネル ID リストを使用
         const actual_pinned_channel_ids = actual_channel_type === 'ピン留め'
-            ? (pinned_channel_ids ?? settings_store.settings.pinned_channel_ids)
+            ? (pinned_channel_ids ?? channels_store.channels_list_with_pinned.get('ピン留め')?.map(channel => channel.id) ?? [])
             : undefined;
 
         // ChannelTypePretty から API 用の ChannelType に変換

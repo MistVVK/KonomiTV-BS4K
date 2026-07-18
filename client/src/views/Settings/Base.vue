@@ -4,62 +4,30 @@
         <main>
             <Navigation />
             <SPHeaderBar :hide-on-smartphone-vertical="true" />
-            <div class="settings-container d-flex px-5 py-5 mx-auto" width="100%" max-width="1000">
+            <div class="settings-container d-flex px-5 py-5 mx-auto" width="100%">
                 <nav class="settings-navigation">
                     <h1 class="mt-2 ml-4" style="font-size: 24px;">設定</h1>
-                    <v-btn variant="flat" class="settings-navigation__button mt-6" to="/settings/general">
-                        <Icon icon="fa-solid:sliders-h" width="26px" style="padding: 0 3px;" />
-                        <span class="ml-4">全般</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/quality">
-                        <Icon icon="fluent:video-clip-multiple-16-filled" width="26px" />
-                        <span class="ml-4">画質</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/caption">
-                        <Icon icon="fluent:subtitles-16-filled" width="26px" />
-                        <span class="ml-4">字幕</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/cm-analysis">
-                        <Icon icon="fluent:timeline-20-filled" width="26px" />
-                        <span class="ml-4">CM解析</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/data-broadcasting">
-                        <svg width="26px" height="26px" viewBox="0 0 512 512">
-                            <path fill="currentColor" d="M248.039 381.326L355.039 67.8258C367.539 28.3257 395.039 34.3258 406.539 34.3258C431.039 34.3258 453.376 61.3258 441.039 96.8258C362.639 322.426 343.539 375.326 340.539 384.826C338.486 391.326 342.039 391.326 345.539 391.326C377.039 391.326 386.539 418.326 386.539 435.326C386.539 458.826 371.539 477.326 350.039 477.326H214.539C179.039 477.326 85.8269 431.3 88.0387 335.826C91.0387 206.326 192.039 183.326 243.539 183.326H296.539L265.539 272.326H243.539C185.539 272.326 174.113 314.826 176.039 334.326C180.039 374.826 215.039 389.814 237.039 390.326C244.539 390.5 246.039 386.826 248.039 381.326Z" />
-                        </svg>
-                        <span class="ml-4">データ放送</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/capture">
-                        <Icon icon="fluent:image-multiple-16-filled" width="26px" />
-                        <span class="ml-4">キャプチャ</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/account">
-                        <Icon icon="fluent:person-20-filled" width="26px" />
-                        <span class="ml-4">アカウント</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/jikkyo">
-                        <Icon icon="bi:chat-left-text-fill" width="26px" style="padding: 0 2px;" />
-                        <span class="ml-4">ニコニコ実況</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/twitter">
-                        <Icon icon="fa-brands:twitter" width="26px" style="padding: 0 1px;" />
-                        <!-- 表記スペースがないのであえて「Twitter 連携」のまま -->
-                        <span class="ml-4">Twitter 連携</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/bs4k">
-                        <Icon icon="fluent:tv-20-filled" width="26px" />
-                        <span class="ml-4">BS4K設定</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button" to="/settings/server">
-                        <Icon icon="fluent:server-surface-16-filled" width="26px" />
-                        <span class="ml-4">サーバー設定</span>
-                    </v-btn>
-                    <v-btn variant="flat" class="settings-navigation__button"
-                        href="/api/version/third-party-licenses" target="_blank" rel="noopener noreferrer"
-                        aria-label="サードパーティーソフトウェアのライセンス">
-                        <Icon icon="fluent:document-text-20-filled" width="26px" />
-                        <span class="ml-4">ライセンス</span>
-                    </v-btn>
+                    <section v-for="category in settingsNavigationCategories" :key="category.label"
+                        class="settings-navigation__category">
+                        <h2 class="settings-navigation__category-heading">{{category.label}}</h2>
+                        <v-btn v-for="item in category.items"
+                            :key="item.type === 'Route' ? item.to : item.href"
+                            variant="flat" class="settings-navigation__button"
+                            :to="item.type === 'Route' ? item.to : undefined"
+                            :exact="item.type === 'Route'"
+                            :active="isNavigationItemActive(item)"
+                            :href="item.type === 'ExternalLink' ? item.href : undefined"
+                            :target="item.type === 'ExternalLink' ? '_blank' : undefined"
+                            :rel="item.type === 'ExternalLink' ? 'noopener noreferrer' : undefined"
+                            :aria-label="item.type === 'ExternalLink' ? item.ariaLabel : undefined">
+                            <svg v-if="item.icon === settingsDataBroadcastingIcon"
+                                width="26px" height="26px" viewBox="0 0 512 512">
+                                <path fill="currentColor" d="M248.039 381.326L355.039 67.8258C367.539 28.3257 395.039 34.3258 406.539 34.3258C431.039 34.3258 453.376 61.3258 441.039 96.8258C362.639 322.426 343.539 375.326 340.539 384.826C338.486 391.326 342.039 391.326 345.539 391.326C377.039 391.326 386.539 418.326 386.539 435.326C386.539 458.826 371.539 477.326 350.039 477.326H214.539C179.039 477.326 85.8269 431.3 88.0387 335.826C91.0387 206.326 192.039 183.326 243.539 183.326H296.539L265.539 272.326H243.539C185.539 272.326 174.113 314.826 176.039 334.326C180.039 374.826 215.039 389.814 237.039 390.326C244.539 390.5 246.039 386.826 248.039 381.326Z" />
+                            </svg>
+                            <Icon v-else :icon="item.icon" :width="item.iconWidth ?? '26px'" :style="item.iconStyle" />
+                            <span class="ml-4">{{item.label}}</span>
+                        </v-btn>
+                    </section>
                 </nav>
                 <div class="settings ml-5 px-7 py-7" width="100%">
                     <!-- この slot にそれぞれの設定画面の内容が入る -->
@@ -76,6 +44,11 @@ import { defineComponent } from 'vue';
 import HeaderBar from '@/components/HeaderBar.vue';
 import Navigation from '@/components/Navigation.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
+import {
+    SETTINGS_DATA_BROADCASTING_ICON,
+    SETTINGS_NAVIGATION_CATEGORIES,
+    type SettingsNavigationItem,
+} from '@/router/settings';
 
 // 設定のベース画面なので、ロジックは基本置かない
 export default defineComponent({
@@ -84,7 +57,23 @@ export default defineComponent({
         HeaderBar,
         Navigation,
         SPHeaderBar,
-    }
+    },
+    computed: {
+        settingsDataBroadcastingIcon() {
+            return SETTINGS_DATA_BROADCASTING_ICON;
+        },
+        settingsNavigationCategories() {
+            return SETTINGS_NAVIGATION_CATEGORIES;
+        },
+    },
+    methods: {
+        isNavigationItemActive(item: SettingsNavigationItem): boolean {
+            if (item.type === 'ExternalLink') {
+                return false;
+            }
+            return item.to === this.$route.path || item.activePaths?.includes(this.$route.path) === true;
+        },
+    },
 });
 
 </script>
@@ -94,7 +83,7 @@ export default defineComponent({
     background: rgb(var(--v-theme-background)) !important;
     width: 100%;
     min-width: 0;
-    max-width: 1000px;
+    max-width: 1240px;
     @include smartphone-horizontal {
         padding: 16px 20px !important;
     }
@@ -110,7 +99,11 @@ export default defineComponent({
         align-self: flex-start;
         flex-direction: column;
         flex-shrink: 0;
-        width: 195px;
+        width: 235px;
+        max-height: calc(100dvh - 105px);
+        padding-right: 8px;
+        overflow-y: auto;
+        overscroll-behavior: contain;
         position: sticky;
         top: calc(65px + 20px) !important;  // ヘッダー+余白の高さ
 
@@ -126,13 +119,34 @@ export default defineComponent({
             display: none;
         }
 
+        .settings-navigation__category {
+            display: flex;
+            flex-direction: column;
+
+            &:first-of-type {
+                margin-top: 20px;
+            }
+
+            & + .settings-navigation__category {
+                margin-top: 16px;
+            }
+        }
+
+        .settings-navigation__category-heading {
+            padding: 0 12px 6px;
+            color: rgb(var(--v-theme-text-darken-1));
+            font-size: 12px;
+            font-weight: bold;
+            letter-spacing: 0.04em;
+        }
+
         .settings-navigation__button {
             justify-content: left !important;
             width: 100%;
-            height: 58px;
-            margin-bottom: 4px;
+            height: 48px;
+            margin-bottom: 2px;
             border-radius: 11px;
-            font-size: 16px;
+            font-size: 14px;
             color: rgb(var(--v-theme-text)) !important;
             background: rgb(var(--v-theme-background)) !important;
 

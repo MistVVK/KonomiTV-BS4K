@@ -1,14 +1,19 @@
 <template>
     <!-- ベース画面の中にそれぞれの設定画面で異なる部分を記述する -->
-    <SettingsBase>
-        <h2 class="settings__heading">
+    <SettingsViewContainer :embedded="embedded">
+        <h2 v-if="embedded === false" class="settings__heading">
             <a v-ripple class="settings__back-button" @click="$router.back()">
                 <Icon icon="fluent:chevron-left-12-filled" width="27px" />
             </a>
             <Icon icon="bi:chat-left-text-fill" width="19px" />
-            <span class="ml-3">ニコニコ実況</span>
+            <span class="ml-3">{{section === 'comments' ? 'コメント' : 'ニコニコ実況'}}</span>
         </h2>
         <div class="settings__content" :class="{'settings__content--loading': is_loading}">
+            <div v-if="embedded" class="settings__content-heading">
+                <Icon icon="bi:chat-left-text-fill" width="19px" />
+                <span class="ml-2">コメント表示</span>
+            </div>
+            <template v-if="section !== 'comments'">
             <div class="niconico-account niconico-account--anonymous" v-if="userStore.user === null || userStore.user.niconico_user_id === null">
                 <div class="niconico-account-wrapper">
                     <Icon class="flex-shrink-0" icon="bi:chat-left-text-fill" width="45px" />
@@ -66,6 +71,8 @@
                     v-model="settingsStore.settings.prefer_posting_to_nicolive">
                 </v-switch>
             </div>
+            </template>
+            <template v-if="section !== 'account'">
             <div class="settings__item">
                 <div class="settings__item-heading">コメントのミュート設定</div>
                 <div class="settings__item-label">
@@ -153,27 +160,39 @@
                     v-model="settingsStore.settings.close_comment_form_after_sending">
                 </v-switch>
             </div>
+            </template>
         </div>
-        <CommentMuteSettings :modelValue="comment_mute_settings_modal" @update:modelValue="comment_mute_settings_modal = $event" />
-    </SettingsBase>
+        <CommentMuteSettings v-if="section !== 'account'"
+            :modelValue="comment_mute_settings_modal" @update:modelValue="comment_mute_settings_modal = $event" />
+    </SettingsViewContainer>
 </template>
 <script lang="ts">
 
 import { mapStores } from 'pinia';
-import { defineComponent } from 'vue';
+import { defineComponent, type PropType } from 'vue';
 
 import CommentMuteSettings from '@/components/Settings/CommentMuteSettings.vue';
+import SettingsViewContainer from '@/components/Settings/SettingsViewContainer.vue';
 import Message from '@/message';
 import Niconico from '@/services/Niconico';
 import useSettingsStore from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils from '@/utils';
-import SettingsBase from '@/views/Settings/Base.vue';
 
 export default defineComponent({
     name: 'Settings-Jikkyo',
+    props: {
+        section: {
+            type: String as PropType<'comments' | 'account' | 'all'>,
+            default: 'all',
+        },
+        embedded: {
+            type: Boolean,
+            default: false,
+        },
+    },
     components: {
-        SettingsBase,
+        SettingsViewContainer,
         CommentMuteSettings,
     },
     data() {
@@ -232,27 +251,31 @@ export default defineComponent({
             this.comment_opacity = parseFloat(comment_opacity_raw);
         }
 
-        // アカウント情報を更新
-        await this.userStore.fetchUser();
+        // コメント表示設定だけを表示するときは、ニコニコ連携情報を取得する必要はない
+        if (this.section !== 'comments') {
+
+            // アカウント情報を更新
+            await this.userStore.fetchUser();
+
+            // もしハッシュ (# から始まるフラグメント) に何か指定されていたら、
+            // OAuth 連携のコールバックの結果が入っている可能性が高いので、パースを試みる
+            // アカウント情報更新より後にしないと Snackbar がうまく表示されない
+            if (location.hash !== '') {
+                const params = new URLSearchParams(location.hash.replace('#', ''));
+                if (params.get('status') !== null && params.get('detail') !== null) {
+                    // コールバックの結果を取得できたので、OAuth 連携の結果を画面に通知する
+                    const authorization_status = parseInt(params.get('status')!);
+                    const authorization_detail = params.get('detail')!;
+                    this.onOAuthCallbackReceived(authorization_status, authorization_detail);
+                    // URL からフラグメントを削除
+                    // ref: https://stackoverflow.com/a/49373716/17124142
+                    history.replaceState(null, '', ' ');
+                }
+            }
+        }
 
         // ローディング状態を解除
         this.is_loading = false;
-
-        // もしハッシュ (# から始まるフラグメント) に何か指定されていたら、
-        // OAuth 連携のコールバックの結果が入っている可能性が高いので、パースを試みる
-        // アカウント情報更新より後にしないと Snackbar がうまく表示されない
-        if (location.hash !== '') {
-            const params = new URLSearchParams(location.hash.replace('#', ''));
-            if (params.get('status') !== null && params.get('detail') !== null) {
-                // コールバックの結果を取得できたので、OAuth 連携の結果を画面に通知する
-                const authorization_status = parseInt(params.get('status')!);
-                const authorization_detail = params.get('detail')!;
-                this.onOAuthCallbackReceived(authorization_status, authorization_detail);
-                // URL からフラグメントを削除
-                // ref: https://stackoverflow.com/a/49373716/17124142
-                history.replaceState(null, '', ' ');
-            }
-        }
     },
     methods: {
         setDefaultIcon(event: Event) {

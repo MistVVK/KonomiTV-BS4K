@@ -590,7 +590,7 @@ export default defineComponent({
                     document.exitFullscreen();
                 }
 
-                this.$router.push({path: '/settings/twitter'});
+                this.$router.push({path: '/settings/account/social'});
                 return;
             }
 

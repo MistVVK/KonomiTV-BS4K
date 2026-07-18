@@ -177,6 +177,18 @@ const useChannelsStore = defineStore('channels', {
         channels_list_with_pinned(): Map<ChannelTypePretty, ILiveChannel[]> {
             const settings_store = useSettingsStore();
 
+            // 全般設定で非表示にした放送種別は、通常タブだけでなくピン留めタブからも除外する。
+            const isChannelTypeVisible = (channel_type: ChannelType): boolean => {
+                return {
+                    GR: settings_store.settings.show_gr_channels,
+                    BS: settings_store.settings.show_bs_channels,
+                    CS: settings_store.settings.show_cs_channels,
+                    CATV: settings_store.settings.show_catv_channels,
+                    SKY: settings_store.settings.show_sky_channels,
+                    BS4K: settings_store.settings.show_bs4k_channels,
+                }[channel_type];
+            };
+
             // チャンネル番号をメイン番号とサブ番号に分割する
             const parseChannelNumber = (channel_number: string): {main: number; sub: number} => {
                 const matched_channel_number = channel_number.match(/^(\d+)(?:-(\d+))?$/);
@@ -228,6 +240,11 @@ const useChannelsStore = defineStore('channels', {
             const pinned_channels: ILiveChannel[] = [];
             for (const [channel_type, channels] of Object.entries(this.channels_list)) {
                 for (const channel of channels) {
+
+                    // 非表示の放送種別は、この先のピン留め判定やタブ分類に渡さない。
+                    if (isChannelTypeVisible(channel.type) === false) {
+                        continue;
+                    }
 
                     // ピン留め中チャンネルの ID (ex: NID32736-SID1024) が入るリストに含まれているチャンネルなら、ピン留めタブに追加
                     // 一旦 pinned_channels に追加した後、pinned_channel_ids の順に並び替える

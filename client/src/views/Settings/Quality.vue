@@ -1,13 +1,17 @@
 <template>
     <!-- ベース画面の中にそれぞれの設定画面で異なる部分を記述する -->
-    <SettingsBase>
-        <h2 class="settings__heading">
+    <SettingsViewContainer :embedded="embedded">
+        <h2 class="settings__heading" v-if="embedded === false">
             <a v-ripple class="settings__back-button" @click="$router.back()">
                 <Icon icon="fluent:chevron-left-12-filled" width="27px" />
             </a>
             <Icon icon="fluent:video-clip-multiple-16-filled" width="26px" />
             <span class="ml-3">画質</span>
         </h2>
+        <div class="settings__content-heading" v-if="embedded">
+            <Icon icon="fluent:video-clip-multiple-16-filled" width="22px" />
+            <span class="ml-2">通常画質</span>
+        </div>
         <div class="settings__quote mt-5 pb-2">
             視聴開始時の画質プロファイルは、デバイスの回線状況に応じて自動的に選択されます (Android のみ) 。<br>
             画質プロファイルは、プレイヤー下にある設定アイコン ⚙️ から変更できます。<br>
@@ -159,18 +163,18 @@
                 </v-switch>
             </div>
         </div>
-    </SettingsBase>
+    </SettingsViewContainer>
 </template>
 <script lang="ts">
 
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
+import SettingsViewContainer from '@/components/Settings/SettingsViewContainer.vue';
 import Videos, { IRecordedPlaybackCodecOption } from '@/services/Videos';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import Utils, { PlayerUtils } from '@/utils';
-import SettingsBase from '@/views/Settings/Base.vue';
 
 const QUALITY_H264 = [
     {title: '1080p (60fps) (約4.95GB/h / 平均11.0Mbps)', value: '1080p-60fps'},
@@ -197,7 +201,13 @@ const QUALITY_H265 = [
 export default defineComponent({
     name: 'Settings-Quality',
     components: {
-        SettingsBase,
+        SettingsViewContainer,
+    },
+    props: {
+        embedded: {
+            type: Boolean,
+            default: false,
+        },
     },
     data() {
         return {
@@ -234,8 +244,10 @@ export default defineComponent({
         ...mapStores(useSettingsStore, useServerSettingsStore),
     },
     async mounted() {
+        // サーバー設定の取得前の初期値で録画コーデック候補を固定しない
+        const server_settings = await this.serverSettingsStore.fetchServerSettingsOnce();
         this.recorded_streaming_video_codecs = await Videos.buildRecordedPlaybackCodecOptions(
-            this.serverSettingsStore.server_settings.general.encoder,
+            server_settings?.general.encoder ?? this.serverSettingsStore.server_settings.general.encoder,
         );
     },
     watch: {

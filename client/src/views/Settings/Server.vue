@@ -1,26 +1,26 @@
 <template>
     <!-- ベース画面の中にそれぞれの設定画面で異なる部分を記述する -->
-    <SettingsBase>
-        <h2 class="settings__heading">
+    <component :is="embedded ? 'div' : SettingsBase">
+        <h2 class="settings__heading" v-if="embedded === false">
             <a v-ripple class="settings__back-button" @click="$router.back()">
                 <Icon icon="fluent:chevron-left-12-filled" width="27px" />
             </a>
             <Icon icon="fluent:server-surface-16-filled" width="22px" />
-            <span class="ml-2">サーバー設定</span>
+            <span class="ml-2">{{section_title}}</span>
         </h2>
-        <div class="settings__description">
-            サーバー設定を変更するには、管理者アカウントでログインしている必要があります。<br>
+        <div class="settings__description" v-if="embedded === false">
+            {{section_description}}<br>
         </div>
-        <div class="settings__description mt-1">
+        <div class="settings__description mt-1" v-if="embedded === false && section !== 'users'">
             [サーバー設定を更新] ボタンを押さずにこのページから離れると、変更内容は破棄されます。<br>
             変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
         </div>
         <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
-            <div class="settings__content-heading">
+            <div class="settings__content-heading" v-if="isSectionVisible('backend') || isSectionVisible('streaming') || isSectionVisible('diagnostics')">
                 <Icon icon="fa-solid:sliders-h" width="22px" style="padding: 0 3px;" />
-                <span class="ml-2">全般</span>
+                <span class="ml-2">{{general_section_title}}</span>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('backend')">
                 <div class="settings__item-heading">利用するバックエンド</div>
                 <div class="settings__item-label">
                     EDCB・Mirakurun のいずれかを選択してください。<br>
@@ -31,7 +31,7 @@
                     :items="['EDCB', 'Mirakurun']" v-model="server_settings.general.backend">
                 </v-select>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('backend')">
                 <div class="settings__item-heading">EDCB (EpgTimerNW) の TCP API の URL</div>
                 <div class="settings__item-label">
                     バックエンドに EDCB が選択されているときに利用されます。<br>
@@ -42,7 +42,7 @@
                     v-model="server_settings.general.edcb_url">
                 </v-text-field>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('backend')">
                 <div class="settings__item-heading">Mirakurun / mirakc の HTTP API の URL</div>
                 <div class="settings__item-label">
                     バックエンドに Mirakurun が選択されているときに利用されます。<br>
@@ -52,7 +52,7 @@
                     v-model="server_settings.general.mirakurun_url">
                 </v-text-field>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('streaming')">
                 <div class="settings__item-heading">録画と BS4K 以外で利用するエンコーダー</div>
                 <div class="settings__item-label">
                     FFmpeg はソフトウェアエンコーダーです。<br>
@@ -68,7 +68,7 @@
                     v-model="server_settings.general.encoder">
                 </v-select>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('backend')">
                 <div class="settings__item-heading">番組情報の更新間隔 (分)</div>
                 <div class="settings__item-label">
                     番組情報を EDCB または Mirakurun / mirakc から取得する間隔を設定します。デフォルトは 5 (分) です。<br>
@@ -79,7 +79,7 @@
                     v-model="server_settings.general.program_update_interval">
                 </v-slider>
             </div>
-            <div class="settings__item settings__item--switch">
+            <div class="settings__item settings__item--switch" v-if="isSectionVisible('diagnostics')">
                 <label class="settings__item-heading" for="debug">デバッグモードを有効にする</label>
                 <label class="settings__item-label" for="debug">
                     有効にすると、デバッグログも出力されるようになります。<br>
@@ -88,7 +88,7 @@
                     v-model="server_settings.general.debug">
                 </v-switch>
             </div>
-            <div class="settings__item settings__item--switch">
+            <div class="settings__item settings__item--switch" v-if="isSectionVisible('diagnostics')">
                 <label class="settings__item-heading" for="debug_encoder">エンコーダーのログを有効にする</label>
                 <label class="settings__item-label" for="debug_encoder">
                     有効にすると、ライブ視聴時のエンコーダーのログが KonomiTV/server/logs/ 以下に保存されます。<br>
@@ -98,11 +98,11 @@
                     v-model="server_settings.general.debug_encoder">
                 </v-switch>
             </div>
-            <div class="settings__content-heading mt-6">
+            <div class="settings__content-heading mt-6" v-if="isSectionVisible('network')">
                 <Icon icon="fluent:server-surface-16-filled" width="22px" />
-                <span class="ml-2">サーバー</span>
+                <span class="ml-2">ネットワーク・HTTPS</span>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('network')">
                 <div class="settings__item-heading">KonomiTV サーバーのリッスンポート</div>
                 <div class="settings__item-label">
                     デフォルトのリッスンポートは 7000 です。<br>
@@ -112,7 +112,7 @@
                     v-model="server_settings.server.port">
                 </v-text-field>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('network')">
                 <div class="settings__item-heading">HTTPS / リバースプロキシの動作モード</div>
                 <div class="settings__item-label">
                     akebi は従来どおり Akebi Keyless Server で HTTPS を提供します。<br>
@@ -124,7 +124,7 @@
                     v-model="server_settings.server.https_mode">
                 </v-select>
             </div>
-            <div class="settings__item" v-if="server_settings.server.https_mode === 'certificate'">
+            <div class="settings__item" v-if="isSectionVisible('network') && server_settings.server.https_mode === 'certificate'">
                 <div class="settings__item-heading">HTTPS 証明書・秘密鍵ファイルへの絶対パス</div>
                 <div class="settings__item-label">
                     certificate モードでは証明書と秘密鍵の両方が必須です。Docker ではホスト上の絶対パスを指定してください。<br>
@@ -140,7 +140,7 @@
                     v-model="server_settings.server.custom_https_private_key">
                 </v-text-field>
             </div>
-            <div class="settings__item" v-if="server_settings.server.https_mode === 'reverse_proxy'">
+            <div class="settings__item" v-if="isSectionVisible('network') && server_settings.server.https_mode === 'reverse_proxy'">
                 <div class="settings__item-heading">リバースプロキシ用 HTTP リッスンアドレス</div>
                 <div class="settings__item-label">
                     通常は 0.0.0.0 のまま変更する必要はありません。KonomiTV のポートを外部へ直接公開しないでください。<br>
@@ -175,11 +175,11 @@
                     <span class="ml-1">信頼済み CIDR を追加</span>
                 </v-btn>
             </div>
-            <div class="settings__content-heading mt-6">
+            <div class="settings__content-heading mt-6" v-if="isSectionVisible('backend') || isSectionVisible('streaming')">
                 <Icon icon="fluent:tv-20-filled" width="22px" />
-                <span class="ml-2">テレビのライブストリーミング</span>
+                <span class="ml-2">{{tv_section_title}}</span>
             </div>
-            <div class="settings__item settings__item--switch">
+            <div class="settings__item settings__item--switch" v-if="isSectionVisible('backend')">
                 <label class="settings__item-heading" for="always_receive_tv_from_mirakurun">常に Mirakurun / mirakc から放送波を受信する</label>
                 <label class="settings__item-label" for="always_receive_tv_from_mirakurun">
                     利用するバックエンドが EDCB のとき、常に Mirakurun / mirakc から放送波を受信するかを設定します。
@@ -193,7 +193,7 @@
                     v-model="server_settings.general.always_receive_tv_from_mirakurun">
                 </v-switch>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('backend')">
                 <div class="settings__item-heading">チャンネル表示・選局で優先するエリア (地デジ)</div>
                 <div class="settings__item-label">
                     複数の地域の放送波が受信できる環境で、リモコン番号が同じチャンネルが複数ある場合に、どのエリアのチャンネルを優先して表示・選局するかを設定します。デフォルトは未設定です。<br>
@@ -210,7 +210,7 @@
                     v-model="server_settings.tv.preferred_terrestrial_region">
                 </v-select>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('streaming')">
                 <div class="settings__item-heading">誰も見ていないチャンネルのエンコードタスクを維持する秒数</div>
                 <div class="settings__item-label">
                     10 秒に設定したなら、10 秒間誰も見ていない状態が継続したらエンコードタスク（エンコーダー）を終了します。<br>
@@ -224,11 +224,11 @@
                     v-model="server_settings.tv.max_alive_time">
                 </v-slider>
             </div>
-            <div class="settings__content-heading mt-6">
+            <div class="settings__content-heading mt-6" v-if="isSectionVisible('storage')">
                 <Icon icon="fluent:movies-and-tv-20-filled" width="22px" />
                 <span class="ml-2">ビデオのオンデマンドストリーミング</span>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('storage')">
                 <div class="settings__item-heading">録画済み番組の保存先フォルダの絶対パス</div>
                 <div class="settings__item-label" style="padding-bottom: 2px;">
                     指定フォルダ以下に保存されている MPEG-TS 形式の録画ファイルを KonomiTV サーバーが自動的に見つけ出し、メタデータの解析とサムネイルの作成を行います。<br>
@@ -259,7 +259,7 @@
                     <span class="ml-1">保存先フォルダを追加</span>
                 </v-btn>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('storage')">
                 <div class="settings__item-heading">録画フォルダのスキャン対象から除外するフォルダの絶対パス</div>
                 <div class="settings__item-label" style="padding-bottom: 2px;">
                     録画フォルダ以下にある一時フォルダなど、スキャン対象から除外したいサブフォルダを指定できます。<br>
@@ -289,7 +289,7 @@
                     <span class="ml-1">除外フォルダを追加</span>
                 </v-btn>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('storage')">
                 <div class="settings__item-heading">録画再生 fMP4 キャッシュの保存先フォルダの絶対パス</div>
                 <div class="settings__item-label" style="padding-bottom: 2px;">
                     未指定の場合は、各録画ファイルと同じフォルダへキャッシュファイルを保存します。<br>
@@ -302,7 +302,7 @@
                     @update:model-value="server_settings.video.recorded_fmp4_cache_folder = $event === '' ? null : String($event)">
                 </v-text-field>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('storage')">
                 <div class="settings__item-heading">既存録画の再生用インデックスを自動生成する</div>
                 <div class="settings__item-label">
                     無効にすると、サーバー起動後に既存録画を順番に解析するバックフィルだけを停止します。<br>
@@ -313,14 +313,14 @@
                     v-model="server_settings.video.recorded_playback_index_backfill_enabled">
                 </v-switch>
             </div>
-            <div class="settings__content-heading mt-6">
+            <div class="settings__content-heading mt-6" v-if="isSectionVisible('storage')">
                 <Icon icon="fluent:image-multiple-16-filled" width="22px" />
                 <span class="ml-2">キャプチャ</span>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('storage')">
                 <div class="settings__item-heading">アップロードしたキャプチャ画像の保存先フォルダの絶対パス</div>
                 <div class="settings__item-label">
-                    <router-link class="link" to="/settings/capture">[キャプチャ]</router-link> → [キャプチャの保存先] で [KonomiTV サーバーにアップロード] または
+                    <router-link class="link" to="/settings/personal/capture">[キャプチャ]</router-link> → [キャプチャの保存先] で [KonomiTV サーバーにアップロード] または
                     [ブラウザでのダウンロードと、KonomiTV サーバーへのアップロードを両方行う] が選択されているときに利用されます。<br>
                 </div>
                 <div class="settings__item-label mt-1" style="padding-bottom: 2px;">
@@ -348,14 +348,15 @@
                     <span class="ml-1">保存先フォルダを追加</span>
                 </v-btn>
             </div>
-            <v-btn class="settings__save-button bg-secondary mt-6" variant="flat" @click="updateServerSettings()">
+            <v-btn class="settings__save-button bg-secondary mt-6" variant="flat"
+                v-if="section !== 'users'" @click="updateServerSettings()">
                 <Icon icon="fluent:save-16-filled" class="mr-2" height="23px" />サーバー設定を更新
             </v-btn>
-            <div class="settings__content-heading mt-8">
+            <div class="settings__content-heading mt-8" v-if="isSectionVisible('users')">
                 <Icon icon="fluent:person-board-20-filled" width="22px" />
                 <span class="ml-2">アカウント</span>
             </div>
-            <div class="settings__item">
+            <div class="settings__item" v-if="isSectionVisible('users')">
                 <div class="settings__item-heading">アカウントの管理</div>
                 <div class="settings__item-label">
                     現在 KonomiTV に登録されているすべてのアカウントの一覧の確認、管理者権限の付与/剥奪、アカウントの削除ができます。<br>
@@ -364,151 +365,81 @@
                     ログイン中ユーザーの設定変更は、別途 <router-link class="link" to="/settings/account">アカウント設定画面</router-link> から行ってください。<br>
                 </div>
             </div>
-            <v-btn class="settings__save-button mt-4" variant="flat" @click="account_manage_settings_modal = !account_manage_settings_modal">
+            <v-btn class="settings__save-button mt-4" variant="flat" v-if="isSectionVisible('users')"
+                @click="account_manage_settings_modal = !account_manage_settings_modal">
                 <Icon icon="fluent:person-board-20-filled" height="20px" />
                 <span class="ml-1">アカウントの管理設定を開く</span>
             </v-btn>
         </div>
-        <div class="settings__content">
-            <div class="settings__content-heading mt-8">
-                <Icon icon="fluent:wrench-settings-20-filled" width="22px" />
-                <span class="ml-2">メンテナンス</span>
-            </div>
-        </div>
-        <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
-            <div class="settings__item">
-                <div class="settings__item-heading">サーバーログの表示</div>
-                <div class="settings__item-label">
-                    KonomiTV サーバーの動作ログとアクセスログをリアルタイムで表示します。<br>
-                    サーバーの動作状況の確認やトラブルシューティングに役立ちます。<br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button mt-5" color="background-lighten-2" variant="flat"
-                @click="server_log_dialog = !server_log_dialog">
-                <Icon icon="fluent:document-text-16-regular" height="20px" />
-                <span class="ml-2">サーバーログを表示</span>
-            </v-btn>
-        </div>
-        <div class="settings__content">
-            <div class="settings__item">
-                <div class="settings__item-heading">KonomiTV のデータベースを更新</div>
-                <div class="settings__item-label">
-                    KonomiTV のデータベースに保存されている、チャンネル情報・番組情報・Twitter アカウント情報などの外部 API に依存するデータをすべて更新します。<br>
-                    即座に外部 API からのデータ更新を反映させたいときに利用してください。<br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button mt-5" color="background-lighten-2" variant="flat"
-                @click="updateDatabase()">
-                <Icon icon="iconoir:database-backup" height="20px" />
-                <span class="ml-2">データベースを更新</span>
-            </v-btn>
-            <div class="settings__item">
-                <div class="settings__item-heading">録画フォルダの一括スキャンを手動実行</div>
-                <div class="settings__item-label">
-                    録画フォルダ内のファイルは、通常 KonomiTV サーバーの起動時に自動的にスキャンされます。<br>
-                    録画ファイルが KonomiTV に正しく反映されていない場合にのみ実行してみてください。<br>
-                </div>
-                <div class="settings__item-label mt-1">
-                    <strong>大量の録画ファイルが保存されている環境では、処理完了まで数時間〜数日以上かかることがあります。</strong><br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button mt-5" color="background-lighten-2" variant="flat"
-                @click="runBatchScan()">
-                <Icon icon="fluent:folder-sync-20-regular" height="20px" />
-                <span class="ml-2">録画フォルダの一括スキャンを手動実行</span>
-            </v-btn>
-            <div class="settings__item">
-                <div class="settings__item-heading">すべての録画ファイルのメタデータを再解析</div>
-                <div class="settings__item-label">
-                    KonomiTV に登録されているすべての録画ファイルのメタデータを強制的に再解析します。<br>
-                    メタデータの解析方法が変更された後に、既存の録画ファイルにも新しい解析結果を反映したい場合に利用してください。<br>
-                </div>
-                <div class="settings__item-label mt-1">
-                    <strong>すべての録画ファイルを読み込むため、処理完了まで数時間〜数日以上かかることがあります。</strong><br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button mt-5" color="background-lighten-2" variant="flat"
-                @click="reanalyzeAllRecordedVideos()">
-                <Icon icon="fluent:video-clip-20-filled" height="20px" />
-                <span class="ml-2">すべての録画ファイルを再解析</span>
-            </v-btn>
-            <div class="settings__item">
-                <div class="settings__item-heading">すべての録画ファイルの CM 区間を再判定</div>
-                <div class="settings__item-label">
-                    KonomiTV に登録されているすべての録画ファイルについて、既存結果を上書きして CM 区間を再判定します。<br>
-                    CM 判定方法が変更された後に、既存の録画ファイルにも新しい判定結果を反映したい場合に利用してください。<br>
-                </div>
-                <div class="settings__item-label mt-1">
-                    <strong>すべての録画ファイルを読み込むため、処理完了まで数時間〜数日以上かかることがあります。</strong><br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button mt-5" color="background-lighten-2" variant="flat"
-                @click="detectCMSectionsForAllRecordedVideos()">
-                <Icon icon="fluent:scan-dash-20-regular" height="20px" />
-                <span class="ml-2">すべての CM 区間を再判定</span>
-            </v-btn>
-            <div class="settings__item">
-                <div class="settings__item-heading">録画ファイルのバックグラウンド解析タスクを再実行</div>
-                <div class="settings__item-label">
-                    録画ファイルのメタデータ解析やサムネイル作成が完了していない場合に、これらの処理を再度実行します。<br>
-                    PC のシャットダウンなどで途中で中断してしまった場合は、このボタンから処理を再開できます。<br>
-                </div>
-                <div class="settings__item-label mt-1">
-                    <strong>大量の録画ファイルが保存されている環境では、処理完了まで数時間〜数日以上かかることがあります。</strong><br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button mt-5" color="background-lighten-2" variant="flat"
-                @click="startBackgroundAnalysis()">
-                <Icon icon="fluent:book-arrow-clockwise-20-regular" height="20px" />
-                <span class="ml-2">バックグラウンド解析タスクを再実行</span>
-            </v-btn>
-        </div>
-        <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
-            <div class="settings__item">
-                <div class="settings__item-heading text-error-lighten-1">KonomiTV サーバーを再起動</div>
-                <div class="settings__item-label">
-                    KonomiTV サーバーを再起動します。サーバー設定の変更を反映するには再起動が必要です。<br>
-                    <strong>再起動を実行すると、すべての視聴中セッションが切断されます。</strong>十分注意してください。<br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button bg-error mt-5" variant="flat"
-                @click="restartServer()">
-                <Icon icon="fluent:arrow-counterclockwise-20-filled" height="20px" />
-                <span class="ml-2">KonomiTV サーバーを再起動</span>
-            </v-btn>
-            <div class="settings__item">
-                <div class="settings__item-heading text-error-lighten-1">KonomiTV サーバーをシャットダウン</div>
-                <div class="settings__item-label">
-                    KonomiTV サーバーをシャットダウンします。<br>
-                    <strong>シャットダウンを実行すると、再度手動で KonomiTV サーバーを起動するまで KonomiTV にアクセスできなくなります。</strong>十分注意してください。<br>
-                </div>
-                <div class="settings__item-label mt-1">
-                    なお、Linux 版 KonomiTV サーバーはプロセス管理を PM2 / Docker に委譲しているため、シャットダウン後は自動で再起動されます。完全にシャットダウンするには、PM2 / Docker 側でサービスを停止してください。<br>
-                </div>
-            </div>
-            <v-btn class="settings__save-button bg-error mt-5" variant="flat"
-                @click="shutdownServer()">
-                <Icon icon="fluent:power-20-filled" height="20px" />
-                <span class="ml-2">KonomiTV サーバーをシャットダウン</span>
-            </v-btn>
-        </div>
         <AccountManageSettings :modelValue="account_manage_settings_modal" @update:modelValue="account_manage_settings_modal = $event" />
-        <ServerLogDialog :modelValue="server_log_dialog" @update:modelValue="server_log_dialog = $event" />
-    </SettingsBase>
+    </component>
 </template>
 <script lang="ts" setup>
 
-import { ref } from 'vue';
+import { storeToRefs } from 'pinia';
+import { computed, ref, toRaw, watch } from 'vue';
+
+import type { IServerSettings } from '@/services/Settings';
 
 import AccountManageSettings from '@/components/Settings/AccountManageSettings.vue';
-import ServerLogDialog from '@/components/Settings/ServerLogDialog.vue';
 import Message from '@/message';
-import Maintenance from '@/services/Maintenance';
-import Settings, { IServerSettings, IServerSettingsDefault } from '@/services/Settings';
-import Version from '@/services/Version';
+import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
+
+type ServerSettingsSection = 'basic' | 'backend' | 'network' | 'streaming' | 'storage' | 'users' | 'diagnostics' | 'all';
+
+const props = withDefaults(defineProps<{
+    section?: ServerSettingsSection;
+    embedded?: boolean;
+}>(), {
+    section: 'all',
+    embedded: false,
+});
+
+// 同じコンポーネントを複数の設定ルートから利用し、指定された責務の設定だけを表示する
+const section = computed(() => props.section);
+const embedded = computed(() => props.embedded);
+const section_title = computed(() => ({
+    basic: '基本・接続',
+    backend: 'バックエンド・番組情報',
+    network: 'ネットワーク・HTTPS',
+    streaming: '配信・エンコーダー',
+    storage: '録画・ストレージ',
+    users: 'ユーザー管理',
+    diagnostics: '診断設定',
+    all: 'サーバー設定',
+})[props.section]);
+const section_description = computed(() => {
+    if (props.section === 'users') {
+        return 'KonomiTV に登録されているアカウントを管理します。管理者アカウントでログインしている必要があります。';
+    }
+    return `${section_title.value}を変更するには、管理者アカウントでログインしている必要があります。`;
+});
+const general_section_title = computed(() => ({
+    basic: 'バックエンド・番組情報',
+    backend: 'バックエンド・番組情報',
+    streaming: '配信・エンコーダー',
+    diagnostics: '診断設定',
+    all: '全般',
+})[props.section as 'basic' | 'backend' | 'streaming' | 'diagnostics' | 'all'] ?? '全般');
+const tv_section_title = computed(() => {
+    if (props.section === 'basic' || props.section === 'backend') {
+        return '受信・チャンネル';
+    }
+    if (props.section === 'streaming') {
+        return '通常放送';
+    }
+    return 'テレビのライブストリーミング';
+});
+
+function isSectionVisible(target_section: Exclude<ServerSettingsSection, 'all'>): boolean {
+    if (props.section === 'all' || props.section === target_section) {
+        return true;
+    }
+    return props.section === 'basic' && (target_section === 'backend' || target_section === 'network');
+}
 
 // フォームを小さくするかどうか
 const is_form_dense = Utils.isSmartphoneHorizontal();
@@ -588,136 +519,42 @@ user_store.fetchUser().then((user) => {
     }
 });
 
-// サーバー設定を取得
-const server_settings = ref<IServerSettings>(structuredClone(IServerSettingsDefault));
-Settings.fetchServerSettings().then((settings) => {
-    if (settings) {
-        server_settings.value = settings;
+// ストアには最後に取得・保存した基準値だけを保持し、この画面では section ごとのローカルドラフトを編集する
+// /api/settings/server は再起動前の稼働中設定を返すため、基準値の取得は一度だけにして直前の保存内容を維持する
+const server_settings_store = useServerSettingsStore();
+const { server_settings: base_server_settings } = storeToRefs(server_settings_store);
+const server_settings = ref<IServerSettings>(structuredClone(toRaw(base_server_settings.value)));
+
+function resetServerSettingsDraft(): void {
+    server_settings.value = structuredClone(toRaw(base_server_settings.value));
+}
+
+server_settings_store.fetchServerSettingsOnce().then((settings) => {
+    if (settings !== null) {
+        resetServerSettingsDraft();
     }
+});
+
+// 同じコンポーネントを使う別 section へ移動した場合、保存していない変更は基準値へ戻す
+watch(() => props.section, () => {
+    resetServerSettingsDraft();
 });
 
 // サーバー設定を更新する関数
 async function updateServerSettings() {
-
-    // モードと無関係な設定は送信前に明示的に初期化する
-    if (server_settings.value.server.https_mode !== 'certificate') {
-        server_settings.value.server.custom_https_certificate = null;
-        server_settings.value.server.custom_https_private_key = null;
-    }
-    if (server_settings.value.server.https_mode !== 'reverse_proxy') {
-        server_settings.value.server.reverse_proxy_listen_address = '0.0.0.0';
-        server_settings.value.server.trusted_proxy_cidrs = [];
-    } else {
-        server_settings.value.server.trusted_proxy_cidrs = server_settings.value.server.trusted_proxy_cidrs
-            .map(cidr => cidr.trim())
-            .filter(cidr => cidr !== '');
-    }
-
-    // certificate モードの空文字列は null に変換し、サーバー側で必須対として検証する
-    if (server_settings.value.server.custom_https_certificate === '') {
-        server_settings.value.server.custom_https_certificate = null;
-    }
-    if (server_settings.value.server.custom_https_private_key === '') {
-        server_settings.value.server.custom_https_private_key = null;
-    }
-
-    // サーバー設定を更新
-    const result = await Settings.updateServerSettings(server_settings.value);
+    // すべての section と BS4K 設定で同じ正規化・更新経路を利用する
+    const result = await server_settings_store.updateServerSettings(server_settings.value);
 
     // 成功した場合のみメッセージを表示
     // エラー処理は Services 層で行われるため、ここではエラー処理は不要
     // 再起動するまでは設定データは反映されないため、再起動せずにページをリロードすると反映されてないように見える点に注意
     if (result === true) {
+        resetServerSettingsDraft();
         Message.success('サーバー設定を更新しました。\n変更を反映するためには、KonomiTV サーバーを再起動してください。');
     }
 }
 
 // ユーザー管理モーダルの表示状態
 const account_manage_settings_modal = ref(false);
-// サーバーログダイアログの表示状態
-const server_log_dialog = ref(false);
-
-// データベースを更新する関数
-async function updateDatabase() {
-    Message.show('データベースを更新しています...');
-    await Maintenance.updateDatabase();
-    Message.success('データベースを更新しました。');
-}
-
-// 録画フォルダの一括スキャンを実行する関数
-async function runBatchScan() {
-    Message.info(
-        '録画フォルダの一括スキャンを開始しています...\n' +
-        '大量の録画ファイルが保存されている環境では、処理完了まで数時間〜数日以上かかることがあります。'
-    );
-    const result = await Maintenance.runBatchScan();
-    if (result === true) {
-        Message.success(
-            '録画フォルダの一括スキャンが完了しました。\n' +
-            'すべての録画ファイルがデータベースに同期されているはずです。'
-        );
-    }
-}
-
-// すべての録画ファイルのメタデータを再解析する関数
-async function reanalyzeAllRecordedVideos() {
-    Message.info(
-        'すべての録画ファイルのメタデータ再解析を開始しています...\n' +
-        '大量の録画ファイルが保存されている環境では、処理完了まで数時間〜数日以上かかることがあります。'
-    );
-    const result = await Maintenance.reanalyzeAllRecordedVideos();
-    if (result === true) {
-        Message.success('すべての録画ファイルのメタデータ再解析が完了しました。');
-    }
-}
-
-// すべての録画ファイルの CM 区間を再判定する関数
-async function detectCMSectionsForAllRecordedVideos() {
-    Message.info(
-        'すべての録画ファイルの CM 区間判定を開始しています...\n' +
-        '大量の録画ファイルが保存されている環境では、処理完了まで数時間〜数日以上かかることがあります。'
-    );
-    const result = await Maintenance.detectCMSectionsForAllRecordedVideos();
-    if (result === true) {
-        Message.success('すべての録画ファイルの CM 区間判定が完了しました。');
-    }
-}
-
-// バックグラウンド解析タスクを開始する関数
-async function startBackgroundAnalysis() {
-    Message.info(
-        'バックグラウンド解析タスクを開始しています...\n' +
-        '大量の録画ファイルが保存されている環境では、処理完了まで数時間〜数日以上かかることがあります。'
-    );
-    const result = await Maintenance.startBackgroundAnalysis();
-    if (result === true) {
-        Message.success(
-            'バックグラウンド解析タスクの実行が完了しました。\n' +
-            'すべての録画番組のメタデータ解析/サムネイル生成が完了しているはずです。'
-        );
-    }
-}
-
-// KonomiTV サーバーの再起動を行う関数
-async function restartServer() {
-    const result = await Maintenance.restartServer();
-    if (result === true) {
-        Message.show('KonomiTV サーバーを再起動しています...');
-        // バージョン情報が取得できるようになるまで待つ
-        await Utils.sleep(1.0);
-        while (await Version.fetchServerVersion(true) === null) {
-            await Utils.sleep(1.0);
-        }
-        Message.success('KonomiTV サーバーを再起動しました。');
-    }
-}
-
-// KonomiTV サーバーのシャットダウンを行う関数
-async function shutdownServer() {
-    const result = await Maintenance.shutdownServer();
-    if (result === true) {
-        Message.success('KonomiTV サーバーをシャットダウンしました。');
-    }
-}
 
 </script>
