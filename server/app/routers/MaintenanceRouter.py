@@ -7,7 +7,7 @@ import sys
 import threading
 import time
 from collections.abc import Coroutine
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 import anyio
 import psutil
@@ -238,7 +238,10 @@ async def ReanalyzeAllRecordedVideosAPI():
         logging.info('Manual metadata reanalysis of all recorded videos has started.')
 
         try:
-            file_paths = await RecordedVideo.all().order_by('id').values_list('file_path', flat=True)
+            file_paths = cast(
+                list[str],
+                await RecordedVideo.all().order_by('id').values_list('file_path', flat=True),
+            )
             total = len(file_paths)
 
             for index, file_path_str in enumerate(file_paths, start=1):

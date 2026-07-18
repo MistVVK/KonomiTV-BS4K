@@ -68,6 +68,18 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         else:
             audio_tracks = row['audio_tracks']
 
+    audio_track_timeline: list[schemas.AudioTrackTimelineEntry] = []
+    if row['audio_track_timeline'] is not None:
+        audio_track_timeline = json.loads(row['audio_track_timeline']) \
+            if isinstance(row['audio_track_timeline'], str) else row['audio_track_timeline']
+
+    subtitle_tracks: list[schemas.SubtitleTrack] = []
+    if row['subtitle_tracks'] is not None:
+        if isinstance(row['subtitle_tracks'], str):
+            subtitle_tracks = json.loads(row['subtitle_tracks'])
+        else:
+            subtitle_tracks = row['subtitle_tracks']
+
     # recorded_video のデータを構築
     recorded_video_dict = {
         'id': row['rv_id'],
@@ -81,6 +93,8 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         'recording_end_time': row['recording_end_time'],
         'duration': row['video_duration'],
         'container_format': row['container_format'],
+        'has_video': bool(row['has_video']),
+        'has_audio': bool(row['has_audio']),
         'video_codec': row['video_codec'],
         'video_codec_profile': row['video_codec_profile'],
         'video_scan_type': row['video_scan_type'],
@@ -95,6 +109,8 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         'secondary_audio_channel': row['secondary_audio_channel'],
         'secondary_audio_sampling_rate': row['secondary_audio_sampling_rate'],
         'audio_tracks': audio_tracks,
+        'audio_track_timeline': audio_track_timeline,
+        'subtitle_tracks': subtitle_tracks,
         'cm_sections': cm_sections,
         'thumbnail_info': thumbnail_info,
         'created_at': row['rv_created_at'],
@@ -379,6 +395,8 @@ async def VideosAPI(
             rv.recording_end_time,
             rv.duration AS video_duration,
             rv.container_format,
+            rv.has_video,
+            rv.has_audio,
             rv.video_codec,
             rv.video_codec_profile,
             rv.video_scan_type,
@@ -393,6 +411,8 @@ async def VideosAPI(
             rv.secondary_audio_channel,
             rv.secondary_audio_sampling_rate,
             rv.audio_tracks,
+            rv.audio_track_timeline,
+            rv.subtitle_tracks,
             rv.cm_sections,
             rv.thumbnail_info,
             rv.created_at AS rv_created_at,
@@ -607,6 +627,8 @@ async def VideosSearchAPI(
             rv.recording_end_time,
             rv.duration AS video_duration,
             rv.container_format,
+            rv.has_video,
+            rv.has_audio,
             rv.video_codec,
             rv.video_codec_profile,
             rv.video_scan_type,
@@ -621,6 +643,8 @@ async def VideosSearchAPI(
             rv.secondary_audio_channel,
             rv.secondary_audio_sampling_rate,
             rv.audio_tracks,
+            rv.audio_track_timeline,
+            rv.subtitle_tracks,
             rv.cm_sections,
             rv.thumbnail_info,
             rv.created_at AS rv_created_at,

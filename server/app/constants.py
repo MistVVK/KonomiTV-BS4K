@@ -33,6 +33,8 @@ DATA_DIR = BASE_DIR / 'data'
 ACCOUNT_ICON_DIR = DATA_DIR / 'account-icons'
 ## サムネイル画像があるディレクトリ
 THUMBNAILS_DIR = DATA_DIR / 'thumbnails'
+## 変換済み録画字幕 (WebVTT) のキャッシュディレクトリ
+RECORDED_SUBTITLES_DIR = DATA_DIR / 'recorded-subtitles'
 ## Twitter 関連のデバッグ用スクリーンショットの保存先ディレクトリ
 TWITTER_DEBUG_SCREENSHOTS_DIR = DATA_DIR / 'twitter-debug-screenshots'
 ## デバッグ用スクリーンショットの保持期限 (日数)

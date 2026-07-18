@@ -75,7 +75,9 @@ class RecordedScanTask:
     __instance: ClassVar[RecordedScanTask | None] = None
 
     # スキャン対象の拡張子
-    SCAN_TARGET_EXTENSIONS: ClassVar[list[str]] = ['.ts', '.m2t', '.m2ts', '.mts', '.mp4']
+    SCAN_TARGET_EXTENSIONS: ClassVar[list[str]] = [
+        '.ts', '.m2t', '.m2ts', '.mts', '.mp4', '.m4v', '.mov', '.mkv', '.webm', '.ogv', '.ogg',
+    ]
 
     # 録画中ファイルの更新イベントを間引く間隔 (ログ出力用) (秒)
     UPDATE_THROTTLE_SECONDS: ClassVar[int] = 30
@@ -963,6 +965,8 @@ class RecordedScanTask:
             db_recorded_video.recording_end_time = recorded_program.recorded_video.recording_end_time
             db_recorded_video.duration = recorded_program.recorded_video.duration
             db_recorded_video.container_format = recorded_program.recorded_video.container_format
+            db_recorded_video.has_video = recorded_program.recorded_video.has_video
+            db_recorded_video.has_audio = recorded_program.recorded_video.has_audio
             db_recorded_video.video_codec = recorded_program.recorded_video.video_codec
             db_recorded_video.video_codec_profile = recorded_program.recorded_video.video_codec_profile
             db_recorded_video.video_scan_type = recorded_program.recorded_video.video_scan_type
@@ -977,10 +981,13 @@ class RecordedScanTask:
             db_recorded_video.secondary_audio_channel = recorded_program.recorded_video.secondary_audio_channel
             db_recorded_video.secondary_audio_sampling_rate = recorded_program.recorded_video.secondary_audio_sampling_rate
             db_recorded_video.audio_tracks = recorded_program.recorded_video.audio_tracks
+            db_recorded_video.audio_track_timeline = recorded_program.recorded_video.audio_track_timeline
+            db_recorded_video.subtitle_tracks = recorded_program.recorded_video.subtitle_tracks
             # ファイル本体を再解析した場合、以前の再生開始位置キャッシュは別ファイル由来の可能性がある
             ## 新規録画と同じ空状態へ戻し、次回再生時に現在のファイルからオンデマンドで解決する
             db_recorded_video.key_frames = []
             db_recorded_video.segment_map = []
+            db_recorded_video.ts_source_base_dts = None
             # この時点では CM 区間情報は未解析なので、明示的に未解析を表す None を設定する (デフォルトで None だが念のため)
             # 「解析したが CM 区間がなかった/検出に失敗した」場合、CMSectionsDetector 側で [] が設定される
             db_recorded_video.cm_sections = None
@@ -1007,6 +1014,9 @@ class RecordedScanTask:
             async with ProcessLimiter.getSemaphore('RecordedScanTask'):
                 # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
                 async with DriveIOLimiter.getSemaphore(file_path):
+                    if recorded_program.recorded_video.has_video is False:
+                        logging.info(f'{file_path}: Skipping video-dependent background analysis for audio-only recording.')
+                        return
                     await asyncio.gather(
                         # 録画ファイルの CM 区間を検出し DB に保存
                         CMSectionsDetector(file_path, recorded_program.recorded_video.duration).detectAndSave(),

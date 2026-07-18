@@ -16,6 +16,25 @@ export interface IAudioTrack {
     channel: string;
     sampling_rate: number | null;
     language: string | null;
+    stream_index?: number;
+    title?: string | null;
+    channel_layout?: string | null;
+    is_dual_mono?: boolean;
+    pid?: number;
+}
+
+export interface IAudioTrackTimelineEntry {
+    start_time: number;
+    end_time: number;
+    tracks: IAudioTrack[];
+}
+
+export interface ISubtitleTrack {
+    index: number;
+    stream_index: number;
+    codec: string;
+    language: string | null;
+    title: string | null;
 }
 
 /** 録画ファイル情報を表すインターフェース */
@@ -30,21 +49,25 @@ export interface IRecordedVideo {
     recording_start_time: string | null;
     recording_end_time: string | null;
     duration: number;
-    container_format: 'MPEG-TS' | 'MPEG-4';
-    video_codec: 'MPEG-2' | 'H.264' | 'H.265';
-    video_codec_profile: 'High' | 'High 10' | 'Main' | 'Main 10' | 'Baseline' | 'Constrained Baseline';
-    video_scan_type: 'Interlaced' | 'Progressive';
-    video_frame_rate: number;
-    video_resolution_width: number;
-    video_resolution_height: number;
+    container_format: string;
+    has_video: boolean;
+    has_audio: boolean;
+    video_codec: string | null;
+    video_codec_profile: string | null;
+    video_scan_type: 'Interlaced' | 'Progressive' | null;
+    video_frame_rate: number | null;
+    video_resolution_width: number | null;
+    video_resolution_height: number | null;
     has_video_stream_changes: boolean;
-    primary_audio_codec: string;
-    primary_audio_channel: string;
-    primary_audio_sampling_rate: number;
+    primary_audio_codec: string | null;
+    primary_audio_channel: string | null;
+    primary_audio_sampling_rate: number | null;
     secondary_audio_codec: string | null;
     secondary_audio_channel: string | null;
     secondary_audio_sampling_rate: number | null;
     audio_tracks: IAudioTrack[];
+    audio_track_timeline: IAudioTrackTimelineEntry[];
+    subtitle_tracks: ISubtitleTrack[];
     cm_sections: { start_time: number; end_time: number; }[] | null;
     thumbnail_info: IThumbnailInfo | null;
     created_at: string;
@@ -91,6 +114,8 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     recording_end_time: null,
     duration: 0,
     container_format: 'MPEG-TS',
+    has_video: true,
+    has_audio: true,
     video_codec: 'MPEG-2',
     video_codec_profile: 'High',
     video_scan_type: 'Interlaced',
@@ -105,6 +130,8 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     secondary_audio_channel: null,
     secondary_audio_sampling_rate: null,
     audio_tracks: [],
+    audio_track_timeline: [],
+    subtitle_tracks: [],
     cm_sections: null,
     thumbnail_info: null,
     created_at: '2000-01-01T00:00:00+09:00',

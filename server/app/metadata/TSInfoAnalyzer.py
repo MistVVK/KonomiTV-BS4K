@@ -1,4 +1,3 @@
-
 import asyncio
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -29,6 +28,7 @@ from app import logging, schemas
 from app.constants import JST
 from app.utils import ClosestMultiple, NormalizeToJSTDatetime
 from app.utils.TSInformation import TSInformation
+
 
 # ariblib 0.1.1 lacks the BS8K/4320p video component type used in ARIB EIT.
 ariblib.constants.COMPONENT_TYPE.setdefault(0x01, {})[0x83] = '映像4320p、アスペクト比16:9'
@@ -526,6 +526,8 @@ class TSInfoAnalyzer:
         def GetAudioChannelLabel(audio_type: str | None) -> str | None:
             if audio_type is None:
                 return None
+            if 'デュアルモノ' in audio_type or '1/0+1/0' in audio_type:
+                return 'Dual Mono'
             if '22.2' in audio_type or '3/3/3-5/2/3-3/0/0.2' in audio_type:
                 return '22.2ch'
             if '5.1' in audio_type or '3/2+LFE' in audio_type:
@@ -783,11 +785,36 @@ class TSInfoAnalyzer:
             for index, (audio_type, audio_language) in enumerate(audio_component_tracks):
                 if index >= len(audio_tracks):
                     break
-                channel = GetAudioChannelLabel(audio_type)
-                if channel is not None:
-                    audio_tracks[index]['channel'] = channel
+                channel_label = GetAudioChannelLabel(audio_type)
+                if channel_label is not None:
+                    audio_tracks[index]['channel'] = channel_label
                 audio_tracks[index]['language'] = audio_language
+                audio_tracks[index]['is_dual_mono'] = audio_type is not None and 'デュアルモノ' in audio_type
             self.recorded_video.audio_tracks = audio_tracks
+            # EIT の言語・デュアルモノ情報を、FFprobe 由来の有効期間にも反映する。
+            # PID の増減区間は維持しつつ、同じ論理 Track は同じ表示名で扱う。
+            track_metadata = {int(track['index']): track for track in audio_tracks}
+            for interval in self.recorded_video.audio_track_timeline:
+                for timeline_track in interval['tracks']:
+                    metadata = track_metadata.get(int(timeline_track['index']))
+                    if metadata is None:
+                        continue
+                    timeline_track['channel'] = metadata['channel']
+                    timeline_track['language'] = metadata['language']
+                    timeline_track['is_dual_mono'] = metadata.get('is_dual_mono', False)
+
+        # ariblib の event.audio から主音声種別は取得できても、AudioComponentDescriptor 一覧が
+        # 取得できないTSがある。主音声種別をフォールバックにしてデュアルモノ属性を失わないようにする。
+        if primary_audio_type is not None and 'デュアルモノ' in primary_audio_type and self.recorded_video.audio_tracks:
+            self.recorded_video.audio_tracks[0]['is_dual_mono'] = True
+            self.recorded_video.audio_tracks[0]['channel'] = 'Dual Mono'
+            self.recorded_video.audio_tracks[0]['language'] = primary_audio_language
+            for interval in self.recorded_video.audio_track_timeline:
+                for timeline_track in interval['tracks']:
+                    if int(timeline_track['index']) == int(self.recorded_video.audio_tracks[0]['index']):
+                        timeline_track['is_dual_mono'] = True
+                        timeline_track['channel'] = 'Dual Mono'
+                        timeline_track['language'] = primary_audio_language
 
         return recorded_program
 

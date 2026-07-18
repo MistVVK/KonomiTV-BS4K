@@ -23,6 +23,7 @@ from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker, TSStreamInfo
 class FFprobeFormat(BaseModel):
     """FFprobe から返される format セクションの情報"""
     format_name: str  # 必須 - "mpegts", "mp4" など
+    format_long_name: str | None = None
     duration: str | None = None  # オプショナル - 秒数の文字列、TS ファイルでは稀に取得できない場合がある
     size: str | None = None
     bit_rate: str | None = None
@@ -31,11 +32,9 @@ class FFprobeFormat(BaseModel):
     @classmethod
     def validate_container_format(cls, format_name: str) -> str:
         """サポートされているコンテナ形式かを検証"""
-        # H.264/H.265 + AAC が入った映像のみサポート
-        if format_name == 'mpegts' or 'mp4' in format_name:
-            return format_name
-        else:
-            raise ValueError(f'Unsupported container format: {format_name}')
+        if format_name.strip() == '':
+            raise ValueError('Container format is empty.')
+        return format_name
 
 class FFprobeVideoStream(BaseModel):
     """FFprobe から返される映像ストリームの情報"""
@@ -50,14 +49,14 @@ class FFprobeVideoStream(BaseModel):
     r_frame_rate: str  # 必須 - "30000/1001", "30/1" など分数形式
     field_order: str | None = None  # オプショナル - "progressive", "tt", "bb" など
     ts_packetsize: str | None = None  # オプショナル - TS パケットサイズ ("188" / "192" / "204")
+    tags: dict[str, str] = {}
 
     @field_validator('codec_name')
     @classmethod
     def validate_video_codec(cls, codec_name: str) -> str:
         """サポートされている映像コーデックかを検証"""
-        supported_codecs = ['mpeg2video', 'h264', 'hevc']
-        if codec_name not in supported_codecs:
-            raise ValueError(f'Unsupported video codec: {codec_name}')
+        if codec_name.strip() == '':
+            raise ValueError('Video codec is empty.')
         return codec_name
 
     @field_validator('width', 'height')
@@ -82,26 +81,30 @@ class FFprobeAudioStream(BaseModel):
     codec_type: Literal['audio']  # 必須 - "audio" 固定
     codec_name: str  # 必須 - "aac" など
     duration: float | None = None  # オプショナル - 音声の長さ（秒）（部分解析時はパイプ渡しのため取得できない）
+    start_time: float | None = None
+    id: str | int | None = None
     profile: str | None = None  # オプショナル - "LC", "HE-AAC" など
-    channels: int  # 必須 - 1, 2, 6 など
-    sample_rate: str  # 必須 - "48000" など文字列形式
+    # TS の PMT には存在するがまだ PES が出現していない音声は FFprobe が channels=0 / sample_rate欠落で返す。
+    # 動的音声タイムラインの候補として保持し、実データがあるサンプル解析の値で後から補完する。
+    channels: int = 0
+    sample_rate: str = '48000'
     ts_packetsize: str | None = None  # オプショナル - TS パケットサイズ ("188" / "192" / "204")
+    channel_layout: str | None = None
+    tags: dict[str, str] = {}
 
     @field_validator('codec_name')
     @classmethod
     def validate_audio_codec(cls, codec_name: str) -> str:
         """サポートされている音声コーデックかを検証"""
-        supported_codecs = ['aac', 'mp2']
-        if codec_name not in supported_codecs:
-            raise ValueError(f'Unsupported audio codec: {codec_name}')
+        if codec_name.strip() == '':
+            raise ValueError('Audio codec is empty.')
         return codec_name
 
     @field_validator('channels')
     @classmethod
     def validate_channels(cls, channels: int) -> int:
         """サポートされているチャンネル数かを検証"""
-        supported_channels = [1, 2, 6, 8, 24]
-        if channels not in supported_channels:
+        if channels < 0:
             raise ValueError(f'Unsupported channel count: {channels}')
         return channels
 
@@ -124,6 +127,13 @@ class FFprobeOtherStream(BaseModel):
     codec_name: str = 'unknown'  # オプショナル - "arib_caption", "bin_data", そのほか未知のもの
     ts_packetsize: str | None = None  # オプショナル - TS パケットサイズ ("188" / "192" / "204")
 
+class FFprobeSubtitleStream(BaseModel):
+    """FFprobe から返される字幕ストリームの情報"""
+    index: int
+    codec_type: Literal['subtitle']
+    codec_name: str
+    tags: dict[str, str] = {}
+
 class FFprobeFrame(BaseModel):
     """FFprobe から返される映像フレームの走査方式情報"""
     interlaced_frame: int | None = None  # 0: プログレッシブ、1: インターレース
@@ -135,11 +145,12 @@ class FFprobeProgram(BaseModel):
     nb_streams: int | None = None
     pmt_pid: int | None = None
     pcr_pid: int | None = None
+    streams: list[dict[str, Any]] = []
 
 class FFprobeResult(BaseModel):
     """FFprobe から返される JSON 全体の情報"""
     format: FFprobeFormat
-    streams: list[FFprobeVideoStream | FFprobeAudioStream | FFprobeOtherStream] = []
+    streams: list[FFprobeVideoStream | FFprobeAudioStream | FFprobeSubtitleStream | FFprobeOtherStream] = []
     programs: list[FFprobeProgram] = []
 
     def getVideoStreams(self) -> list[FFprobeVideoStream]:
@@ -166,9 +177,12 @@ class FFprobeResult(BaseModel):
                     logging.warning('Invalid audio stream data:', exc_info=ex)
         return audio_streams
 
+    def getSubtitleStreams(self) -> list[FFprobeSubtitleStream]:
+        return [stream for stream in self.streams if isinstance(stream, FFprobeSubtitleStream)]
+
 class FFprobeSampleResult(BaseModel):
     """FFprobe のサンプル解析から返される情報（映像・音声のみ）"""
-    streams: list[FFprobeVideoStream | FFprobeAudioStream | FFprobeOtherStream] = []
+    streams: list[FFprobeVideoStream | FFprobeAudioStream | FFprobeSubtitleStream | FFprobeOtherStream] = []
     frames: list[FFprobeFrame] = []
 
     def getVideoStreams(self) -> list[FFprobeVideoStream]:
@@ -194,6 +208,9 @@ class FFprobeSampleResult(BaseModel):
                 except Exception as ex:
                     logging.warning('Invalid audio stream data:', exc_info=ex)
         return audio_streams
+
+    def getSubtitleStreams(self) -> list[FFprobeSubtitleStream]:
+        return [stream for stream in self.streams if isinstance(stream, FFprobeSubtitleStream)]
 
 
 class MetadataAnalyzer:
@@ -255,14 +272,14 @@ class MetadataAnalyzer:
             except Exception:
                 return None
 
-        def GetAudioCodec(codec_name: str, profile: str | None) -> str | None:
+        def GetAudioCodec(codec_name: str, profile: str | None) -> str:
             if codec_name == 'aac':
                 if profile is None or 'LC' in profile:
                     return 'AAC-LC'
                 return 'AAC'
             if codec_name == 'mp2':
                 return 'MP2'
-            return None
+            return codec_name.replace('_', ' ').upper()
 
         def GetAudioChannelLabel(channels: int) -> str:
             if channels == 1:
@@ -286,9 +303,9 @@ class MetadataAnalyzer:
 
         # 必要な情報を一旦変数として保持
         duration: float | None = None
-        container_format: Literal['MPEG-TS', 'MPEG-4'] | None = None
-        video_codec: Literal['MPEG-2', 'H.264', 'H.265'] | None = None
-        video_codec_profile: Literal['High', 'High 10', 'Main', 'Main 10', 'Baseline', 'Constrained Baseline'] | None = None
+        container_format: str | None = None
+        video_codec: str | None = None
+        video_codec_profile: str | None = None
         video_scan_type: Literal['Interlaced', 'Progressive'] | None = None
         video_frame_rate: float | None = None
         video_resolution_width: int | None = None
@@ -301,6 +318,7 @@ class MetadataAnalyzer:
         secondary_audio_channel: str | None = None
         secondary_audio_sampling_rate: int | None = None
         audio_tracks: list[schemas.AudioTrack] = []
+        subtitle_tracks: list[schemas.SubtitleTrack] = []
 
         # FFprobe から録画ファイルのメディア情報を取得
         ## 取得に失敗した場合は KonomiTV で再生可能なファイルではないと判断し、None を返す
@@ -315,9 +333,10 @@ class MetadataAnalyzer:
             try:
                 sizes: list[int] = []
                 for stream in full_probe.streams:
-                    if stream.ts_packetsize is None:
+                    packet_size = getattr(stream, 'ts_packetsize', None)
+                    if packet_size is None:
                         continue
-                    sizes.append(int(stream.ts_packetsize))
+                    sizes.append(int(packet_size))
                 if len(sizes) > 0 and any(size != 188 for size in sizes):
                     first_bad = next(size for size in sizes if size != 188)
                     logging.warning(f'{self.recorded_file_path}: Unsupported TS packet size detected: {first_bad} bytes.')
@@ -328,10 +347,17 @@ class MetadataAnalyzer:
         # メディア情報から録画ファイルのメタデータを取得
         # 全般（コンテナ情報）
         ## コンテナ形式
-        if full_probe.format.format_name == 'mpegts':
+        format_names = set(full_probe.format.format_name.lower().split(','))
+        if 'mpegts' in format_names:
             container_format = 'MPEG-TS'
-        elif 'mp4' in full_probe.format.format_name:
+        elif 'mp4' in format_names or 'mov' in format_names:
             container_format = 'MPEG-4'
+        elif 'matroska' in format_names:
+            container_format = 'WebM' if 'webm' in format_names or self.recorded_file_path.suffix.lower() == '.webm' else 'Matroska'
+        elif 'ogg' in format_names:
+            container_format = 'Ogg'
+        else:
+            container_format = full_probe.format.format_long_name or full_probe.format.format_name
 
         ## 部分解析: 映像・音声情報を取得
         is_video_track_analyzed = False
@@ -341,14 +367,33 @@ class MetadataAnalyzer:
         full_probe_audio_streams = full_probe.getAudioStreams()
         sample_probe_video_streams = sample_probe.getVideoStreams()
         sample_probe_audio_streams = sample_probe.getAudioStreams()
-        if len(full_probe_video_streams) == 0:
-            logging.warning(f'{self.recorded_file_path}: No valid video streams found. (from full probe)')
-            return None
-        if len(full_probe_audio_streams) == 0:
-            logging.warning(f'{self.recorded_file_path}: No valid audio streams found. (from full probe)')
-            return None
-        if len(sample_probe_video_streams) == 0:
-            logging.warning(f'{self.recorded_file_path}: No valid video streams found. (from sample probe)')
+        selected_program_stream_indices: set[int] | None = None
+        # MPEG-TS に複数サービスが含まれる場合、代表映像（映像がなければ代表音声）と同じ program だけを採用する
+        ## 他サービスの音声を HLS 代替音声として誤登録しないため、FFprobe の program.streams を利用する
+        if full_probe.format.format_name == 'mpegts' and (sample_probe_video_streams or sample_probe_audio_streams):
+            representative_stream_index = (sample_probe_video_streams or sample_probe_audio_streams)[0].index
+            for program in full_probe.programs:
+                program_stream_indices = {
+                    int(stream['index']) for stream in program.streams if stream.get('index') is not None
+                }
+                if representative_stream_index in program_stream_indices:
+                    selected_program_stream_indices = program_stream_indices
+                    break
+            if selected_program_stream_indices is not None:
+                full_probe_video_streams = [
+                    stream for stream in full_probe_video_streams if stream.index in selected_program_stream_indices
+                ]
+                full_probe_audio_streams = [
+                    stream for stream in full_probe_audio_streams if stream.index in selected_program_stream_indices
+                ]
+                sample_probe_video_streams = [
+                    stream for stream in sample_probe_video_streams if stream.index in selected_program_stream_indices
+                ]
+                sample_probe_audio_streams = [
+                    stream for stream in sample_probe_audio_streams if stream.index in selected_program_stream_indices
+                ]
+        if len(full_probe_video_streams) == 0 and len(full_probe_audio_streams) == 0:
+            logging.warning(f'{self.recorded_file_path}: No valid video or audio streams found. (from full probe)')
             return None
         if len(sample_probe_audio_streams) == 0:
             logging.warning(f'{self.recorded_file_path}: No valid audio streams found. (from sample probe), falling back to full probe audio streams.')
@@ -369,19 +414,21 @@ class MetadataAnalyzer:
             return None
 
         ## 再生時間
+        duration_streams = full_probe_video_streams or full_probe_audio_streams
+        representative_duration = duration_streams[0].duration
         if full_probe.format.duration is not None:
             ## コンテナ自体の再生時間が取得できている場合（通常のケース）
-            if (full_probe_video_streams[0].duration is not None and
-                full_probe_video_streams[0].duration < float(full_probe.format.duration)):
+            if (representative_duration is not None and
+                representative_duration < float(full_probe.format.duration)):
                 ## コンテナ自体の再生時間は特に tsreplace した TS データなどでは映像や音声よりも長くなる場合があるため、
                 ## 映像ストリームの再生時間が取得できていて、かつコンテナ自体の再生時間より短い場合はそれを優先的に使う
-                duration = full_probe_video_streams[0].duration
+                duration = representative_duration
             else:
                 ## 万が一映像ストリームの再生時間が取得できていない場合、コンテナ自体の再生時間を使う
                 duration = float(full_probe.format.duration)
-        elif full_probe_video_streams[0].duration is not None:
+        elif representative_duration is not None:
             ## 万が一コンテナ自体の再生時間が取得できていない場合、映像ストリームの再生時間が取得できていればそれを使う
-            duration = full_probe_video_streams[0].duration
+            duration = representative_duration
         else:
             ## どちらの再生時間も取得できていない場合は録画ファイルが破損していると判断し、None を返す
             logging.warning(f'{self.recorded_file_path}: Duration is missing or invalid. ignored.')
@@ -397,19 +444,29 @@ class MetadataAnalyzer:
                     video_codec = 'H.264'
                 elif video_stream.codec_name == 'hevc':
                     video_codec = 'H.265'
+                elif video_stream.codec_name == 'av1':
+                    video_codec = 'AV1'
+                elif video_stream.codec_name == 'vp9':
+                    video_codec = 'VP9'
+                elif video_stream.codec_name == 'vp8':
+                    video_codec = 'VP8'
+                elif video_stream.codec_name == 'theora':
+                    video_codec = 'Theora'
+                else:
+                    video_codec = video_stream.codec_name.replace('_', ' ').upper()
                 ## プロファイル
                 ## Main@High や High@L5 など @ 区切りで Level や Tier などが付与されている場合があるので、それらを除去する
                 profile = video_stream.profile or ''
-                video_codec_profile = cast(
-                    Literal['High', 'High 10', 'Main', 'Main 10', 'Baseline', 'Constrained Baseline'],
-                    profile.split('@')[0] if profile else 'Main'
-                )
+                video_codec_profile = profile.split('@')[0] if profile else 'Unknown'
                 ## スキャン形式
                 ## HEVC エンコーダーでインターレース解除した映像などでは、ストリーム単位の field_order が
                 ## FFprobe の結果に含まれないことがある。その場合は部分解析で取得した実フレームの
                 ## interlaced_frame を参照し、少なくとも1枚でもインターレースなら Interlaced とする。
-                if video_stream.field_order is not None:
-                    video_scan_type = 'Progressive' if video_stream.field_order.lower() == 'progressive' else 'Interlaced'
+                field_order = (video_stream.field_order or '').lower()
+                if field_order == 'progressive':
+                    video_scan_type = 'Progressive'
+                elif field_order in ['tt', 'bb', 'tb', 'bt']:
+                    video_scan_type = 'Interlaced'
                 elif any(frame.interlaced_frame == 1 for frame in sample_probe.frames):
                     video_scan_type = 'Interlaced'
                 elif any(frame.interlaced_frame == 0 for frame in sample_probe.frames):
@@ -421,9 +478,9 @@ class MetadataAnalyzer:
                 ## ここで Progressive になっているが、全体解析側で field_order が明示的にインターレースを
                 ## 示している場合は Interlaced とする。field_order の欠落は反証には使わない。
                 ## (部分解析のみ、稀に本来インターレースにもかかわらずプログレッシブ映像と判定される場合があるため)
-                full_probe_field_order = full_probe_video_streams[0].field_order
+                full_probe_field_order = full_probe_video_streams[0].field_order if full_probe_video_streams else None
                 if (video_scan_type == 'Progressive' and full_probe_field_order is not None and
-                    full_probe_field_order.lower() != 'progressive'):
+                    full_probe_field_order.lower() in ['tt', 'bb', 'tb', 'bt']):
                     video_scan_type = 'Interlaced'
                 ## フレームレート
                 video_frame_rate = ParseFPS(video_stream.avg_frame_rate) or ParseFPS(video_stream.r_frame_rate)
@@ -433,20 +490,44 @@ class MetadataAnalyzer:
                 ## 映像トラックの解析が完了したことをマーク
                 is_video_track_analyzed = True
 
-        for audio_stream in sample_probe_audio_streams:
+        # TS は途中で PMT / PID が変化し得るため全体 probe の和集合を使う。
+        # 非 TS はコンテナに宣言されたトラックが全時間有効なので部分 probe で十分。
+        if container_format == 'MPEG-TS':
+            sample_audio_by_index = {stream.index: stream for stream in sample_probe_audio_streams}
+            audio_source_streams = [
+                sample_audio_by_index.get(stream.index, stream)
+                if stream.channels <= 0 else stream
+                for stream in full_probe_audio_streams
+            ]
+            # ファイル全体解析に現れず、25%サンプルで初めて実体を確認できた音声も候補へ加える。
+            known_stream_indexes = {stream.index for stream in audio_source_streams}
+            audio_source_streams.extend(
+                stream for stream in sample_probe_audio_streams if stream.index not in known_stream_indexes
+            )
+        else:
+            audio_source_streams = sample_probe_audio_streams
+        for audio_stream in audio_source_streams:
             audio_codec = GetAudioCodec(audio_stream.codec_name, audio_stream.profile)
-            if audio_codec is None:
-                logging.warning(f'{self.recorded_file_path}: Unsupported audio codec: {audio_stream.codec_name}. ignored.')
-                continue
             audio_channel = GetAudioChannelLabel(audio_stream.channels)
             audio_sampling_rate = int(audio_stream.sample_rate)
-            audio_tracks.append({
+            try:
+                audio_pid = int(str(audio_stream.id), 0) if audio_stream.id is not None else None
+            except ValueError:
+                audio_pid = None
+            audio_track: schemas.AudioTrackTimelineTrack = {
                 'index': len(audio_tracks) + 1,
+                'stream_index': audio_stream.index,
                 'codec': audio_codec,
                 'channel': audio_channel,
+                'channel_layout': audio_stream.channel_layout,
                 'sampling_rate': audio_sampling_rate,
-                'language': None,
-            })
+                'language': audio_stream.tags.get('language'),
+                'title': audio_stream.tags.get('title'),
+                'is_dual_mono': False,
+            }
+            if audio_pid is not None:
+                audio_track['pid'] = audio_pid
+            audio_tracks.append(audio_track)
 
             ## 主音声情報
             if is_primary_audio_track_analyzed is False:
@@ -462,24 +543,26 @@ class MetadataAnalyzer:
                 secondary_audio_sampling_rate = audio_sampling_rate
                 is_secondary_audio_track_analyzed = True
 
-        # 最低でも映像トラックと主音声トラックが含まれている必要がある
-        # 映像 or 主音声のどちらかが含まれていない場合は None を返す
-        if video_codec is None or primary_audio_codec is None:
-            logging.warning(f'{self.recorded_file_path}: Video or primary audio track is missing or invalid. ignored.')
+        for subtitle_stream in full_probe.getSubtitleStreams():
+            if selected_program_stream_indices is not None and subtitle_stream.index not in selected_program_stream_indices:
+                continue
+            subtitle_tracks.append({
+                'index': len(subtitle_tracks) + 1,
+                'stream_index': subtitle_stream.index,
+                'codec': subtitle_stream.codec_name,
+                'language': subtitle_stream.tags.get('language'),
+                'title': subtitle_stream.tags.get('title'),
+            })
+
+        has_video = video_codec is not None
+        has_audio = primary_audio_codec is not None
+        if has_video is False and has_audio is False:
+            logging.warning(f'{self.recorded_file_path}: Video and audio tracks are missing or invalid. ignored.')
             return None
 
         # 必要な情報が全て揃っていることを保証
         assert duration is not None, 'duration not found.'
         assert container_format is not None, 'container_format not found.'
-        assert video_codec is not None, 'video_codec not found.'
-        assert video_codec_profile is not None, 'video_codec_profile not found.'
-        assert video_scan_type is not None, 'video_scan_type not found.'
-        assert video_frame_rate is not None, 'video_frame_rate not found.'
-        assert video_resolution_width is not None, 'video_resolution_width not found.'
-        assert video_resolution_height is not None, 'video_resolution_height not found.'
-        assert primary_audio_codec is not None, 'primary_audio_codec not found.'
-        assert primary_audio_channel is not None, 'primary_audio_channel not found.'
-        assert primary_audio_sampling_rate is not None, 'primary_audio_sampling_rate not found.'
 
         ## 現状 ariblib は先頭が sync_byte でない or 途中で同期が壊れる (破損した TS パケットが存在する) TS ファイルを想定していないため、
         ## ariblib に入力する録画ファイルは必ず正常な TS ファイルである必要がある
@@ -491,7 +574,7 @@ class MetadataAnalyzer:
                     logging.warning(f'{self.recorded_file_path}: sync_byte is missing. ignored.')
                     return None
 
-            has_video_stream_changes = self.__detectTSVideoStreamChanges(end_ts_offset)
+            has_video_stream_changes = self.__detectTSVideoStreamChanges(end_ts_offset) if has_video else False
 
         # ファイルハッシュを計算
         try:
@@ -514,6 +597,8 @@ class MetadataAnalyzer:
             recording_end_time = None,
             duration = duration,
             container_format = container_format,
+            has_video = has_video,
+            has_audio = has_audio,
             video_codec = video_codec,
             video_codec_profile = video_codec_profile,
             video_scan_type = video_scan_type,
@@ -528,6 +613,8 @@ class MetadataAnalyzer:
             secondary_audio_channel = secondary_audio_channel,
             secondary_audio_sampling_rate = secondary_audio_sampling_rate,
             audio_tracks = audio_tracks,
+            audio_track_timeline = self.__buildAudioTrackTimeline(audio_source_streams, audio_tracks, duration),
+            subtitle_tracks = subtitle_tracks,
             # 必須フィールドのため作成日時・更新日時は適当に現在時刻を入れている
             # この値は参照されず、DB の値は別途自動生成される
             created_at = now,
@@ -581,6 +668,22 @@ class MetadataAnalyzer:
                     recorded_video.recording_start_time = recording_time[0]
                     recorded_video.recording_end_time = recording_time[1]
 
+        if recorded_program is not None:
+            # TSInfoAnalyzer は RecordedProgram 構築後に EIT 音声記述子で self.recorded_video を補正するため、
+            # Pydantic が構築時に複製した RecordedProgram 側へ最終結果を明示的に戻す。
+            if ('デュアルモノ' in recorded_program.primary_audio_type and recorded_video.audio_tracks):
+                recorded_video.audio_tracks[0]['is_dual_mono'] = True
+                recorded_video.audio_tracks[0]['channel'] = 'Dual Mono'
+                recorded_video.audio_tracks[0]['language'] = recorded_program.primary_audio_language
+                recorded_video.primary_audio_channel = 'Dual Mono'
+                for interval in recorded_video.audio_track_timeline:
+                    for timeline_track in interval['tracks']:
+                        if int(timeline_track['index']) == int(recorded_video.audio_tracks[0]['index']):
+                            timeline_track['is_dual_mono'] = True
+                            timeline_track['channel'] = 'Dual Mono'
+                            timeline_track['language'] = recorded_program.primary_audio_language
+            recorded_program.recorded_video = recorded_video
+
         # MPEG-TS 形式ではなくメタ情報も存在しなければ番組情報は取得できないので、ファイル名などから最低限の情報を設定する
         # MPEG-TS 形式だが TS ファイルからチャンネル情報・番組情報を取得できなかった場合も同様
         ## 他の値は RecordedProgram モデルで設定されたデフォルト値が自動的に入るので、タイトルと日時だけここで設定する
@@ -631,6 +734,94 @@ class MetadataAnalyzer:
                 recorded_program.is_partially_recorded = False
 
         return recorded_program
+
+
+    def __buildAudioTrackTimeline(
+        self,
+        streams: list[FFprobeAudioStream],
+        tracks: list[schemas.AudioTrack],
+        duration: float,
+    ) -> list[schemas.AudioTrackTimelineEntry]:
+        """FFprobe が列挙したストリームの有効期間から音声構成タイムラインを組み立てる。"""
+
+        if not tracks:
+            return [{'start_time': 0.0, 'end_time': duration, 'tracks': []}]
+        if self.recorded_file_path.suffix.lower() in ['.ts', '.mts', '.m2ts']:
+            pid_tracks = {
+                int(track['pid']): cast(schemas.AudioTrackTimelineTrack, track)
+                for track in tracks if track.get('pid') is not None
+            }
+            if pid_tracks:
+                first_packet: dict[int, int | None] = {pid: None for pid in pid_tracks}
+                last_packet: dict[int, int | None] = {pid: None for pid in pid_tracks}
+                packet_index = 0
+                with self.recorded_file_path.open('rb') as file:
+                    while packet := file.read(ts.PACKET_SIZE):
+                        if len(packet) < ts.PACKET_SIZE:
+                            break
+                        if packet[0] != 0x47:
+                            packet_index += 1
+                            continue
+                        packet_pid = ((packet[1] & 0x1F) << 8) | packet[2]
+                        if packet_pid in pid_tracks:
+                            if first_packet[packet_pid] is None:
+                                first_packet[packet_pid] = packet_index
+                            last_packet[packet_pid] = packet_index
+                        packet_index += 1
+                if packet_index > 0:
+                    active_ranges: list[tuple[float, float, schemas.AudioTrackTimelineTrack]] = []
+                    boundaries = {0.0, duration}
+                    for pid, track in pid_tracks.items():
+                        if first_packet[pid] is None or last_packet[pid] is None:
+                            continue
+                        start = duration * int(first_packet[pid]) / packet_index
+                        end = min(duration, duration * (int(last_packet[pid]) + 1) / packet_index)
+                        # TSパケット位置換算の微小誤差で先頭/末尾に隙間を作らない。
+                        if start < 0.5:
+                            start = 0.0
+                        if duration - end < 0.5:
+                            end = duration
+                        active_ranges.append((start, end, track))
+                        boundaries.update((start, end))
+                    if active_ranges:
+                        timeline: list[schemas.AudioTrackTimelineEntry] = []
+                        ordered_boundaries = sorted(boundaries)
+                        for index, start in enumerate(ordered_boundaries[:-1]):
+                            end = ordered_boundaries[index + 1]
+                            active_tracks = [track for track_start, track_end, track in active_ranges
+                                             if track_start <= start < track_end]
+                            if timeline and timeline[-1]['tracks'] == active_tracks:
+                                timeline[-1]['end_time'] = end
+                            else:
+                                timeline.append({'start_time': start, 'end_time': end, 'tracks': active_tracks})
+                        return timeline
+
+        # MP4/MKV 等のトラックは全時間有効。PIDを取得できないTSはstart_time/durationへフォールバックする。
+        if len(streams) != len(tracks) or all(stream.start_time is None for stream in streams):
+            return [{'start_time': 0.0, 'end_time': duration, 'tracks': cast(list[schemas.AudioTrackTimelineTrack], tracks)}]
+
+        source_base = min(stream.start_time or 0.0 for stream in streams)
+        active_ranges: list[tuple[float, float, schemas.AudioTrackTimelineTrack]] = []
+        boundaries = {0.0, duration}
+        for stream, track in zip(streams, tracks, strict=True):
+            start = max(0.0, min(duration, (stream.start_time or source_base) - source_base))
+            end = min(duration, start + stream.duration) if stream.duration is not None else duration
+            end = max(start, end)
+            typed_track = cast(schemas.AudioTrackTimelineTrack, track)
+            active_ranges.append((start, end, typed_track))
+            boundaries.update((start, end))
+
+        timeline: list[schemas.AudioTrackTimelineEntry] = []
+        ordered_boundaries = sorted(boundaries)
+        for index, start in enumerate(ordered_boundaries[:-1]):
+            end = ordered_boundaries[index + 1]
+            active_tracks = [track for track_start, track_end, track in active_ranges
+                             if track_start <= start < track_end]
+            if timeline and timeline[-1]['tracks'] == active_tracks:
+                timeline[-1]['end_time'] = end
+            else:
+                timeline.append({'start_time': start, 'end_time': end, 'tracks': active_tracks})
+        return timeline
 
 
     def __calculateFileHash(self, end_ts_offset: int | None, chunk_size: int = 1024 * 1024, num_chunks: int = 3) -> str:

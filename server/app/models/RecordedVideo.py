@@ -12,7 +12,15 @@ from tortoise.fields import Field as TortoiseField
 from tortoise.models import Model as TortoiseModel
 
 from app.models.RecordedProgram import RecordedProgram
-from app.schemas import AudioTrack, CMSection, KeyFrame, SegmentMapEntry, ThumbnailInfo
+from app.schemas import (
+    AudioTrack,
+    AudioTrackTimelineEntry,
+    CMSection,
+    KeyFrame,
+    SegmentMapEntry,
+    SubtitleTrack,
+    ThumbnailInfo,
+)
 
 
 class RecordedVideo(TortoiseModel):
@@ -34,22 +42,27 @@ class RecordedVideo(TortoiseModel):
     recording_start_time = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     recording_end_time = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     duration = fields.FloatField()
-    container_format = cast(TortoiseField[Literal['MPEG-TS', 'MPEG-4']], fields.CharField(255))
-    video_codec = cast(TortoiseField[Literal['MPEG-2', 'H.264', 'H.265']], fields.CharField(255))
-    # プロファイルは他にも多くあるが、現実的に使われそうなものだけを列挙
-    video_codec_profile = cast(TortoiseField[Literal['High', 'High 10', 'Main', 'Main 10', 'Baseline', 'Constrained Baseline']], fields.CharField(255))
-    video_scan_type = cast(TortoiseField[Literal['Interlaced', 'Progressive']], fields.CharField(255))
-    video_frame_rate = fields.FloatField()
-    video_resolution_width = fields.IntField()
-    video_resolution_height = fields.IntField()
+    container_format = fields.CharField(255)
+    has_video = fields.BooleanField(default=True)
+    has_audio = fields.BooleanField(default=True)
+    video_codec = cast(TortoiseField[str | None], fields.CharField(255, null=True))
+    video_codec_profile = cast(TortoiseField[str | None], fields.CharField(255, null=True))
+    video_scan_type = cast(TortoiseField[Literal['Interlaced', 'Progressive'] | None], fields.CharField(255, null=True))
+    video_frame_rate = cast(TortoiseField[float | None], fields.FloatField(null=True))
+    video_resolution_width = cast(TortoiseField[int | None], fields.IntField(null=True))
+    video_resolution_height = cast(TortoiseField[int | None], fields.IntField(null=True))
     has_video_stream_changes = fields.BooleanField(default=False)
-    primary_audio_codec = fields.CharField(255)
-    primary_audio_channel = fields.CharField(255)
-    primary_audio_sampling_rate = fields.IntField()
+    primary_audio_codec = cast(TortoiseField[str | None], fields.CharField(255, null=True))
+    primary_audio_channel = cast(TortoiseField[str | None], fields.CharField(255, null=True))
+    primary_audio_sampling_rate = cast(TortoiseField[int | None], fields.IntField(null=True))
     secondary_audio_codec = cast(TortoiseField[str | None], fields.CharField(255, null=True))
     secondary_audio_channel = cast(TortoiseField[str | None], fields.CharField(255, null=True))
     secondary_audio_sampling_rate = cast(TortoiseField[int | None], fields.IntField(null=True))
     audio_tracks = cast(TortoiseField[list[AudioTrack]],
+        fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
+    audio_track_timeline = cast(TortoiseField[list[AudioTrackTimelineEntry]],
+        fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
+    subtitle_tracks = cast(TortoiseField[list[SubtitleTrack]],
         fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
     key_frames = cast(TortoiseField[list[KeyFrame]],
         fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
@@ -57,6 +70,8 @@ class RecordedVideo(TortoiseModel):
         # segment_map は再生開始時刻から入力ファイル位置を引くためのキャッシュ
         ## 空配列は未キャッシュ状態を表し、再生可否の判定には使わない
         fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
+    # MPEG-TS の録画先頭にある映像基準 DTS。シークや音声レンディション生成のたびに再走査しないため保持する。
+    ts_source_base_dts = cast(TortoiseField[int | None], fields.BigIntField(null=True))
     cm_sections = cast(TortoiseField[list[CMSection] | None],
         # None は未解析状態を表す ([] は解析したが CM 区間がなかった/検出に失敗したことを表す)
         fields.JSONField(default=None, encoder=lambda x: json.dumps(x, ensure_ascii=False), null=True))  # type: ignore

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NotRequired
 
 from pydantic import BaseModel, Field, RootModel, computed_field
 from tortoise.contrib.pydantic import PydanticModel
@@ -146,6 +146,25 @@ class AudioTrack(TypedDict):
     channel: str
     sampling_rate: int | None
     language: str | None
+    stream_index: NotRequired[int]
+    title: NotRequired[str | None]
+    channel_layout: NotRequired[str | None]
+    is_dual_mono: NotRequired[bool]
+
+class AudioTrackTimelineTrack(AudioTrack):
+    pid: NotRequired[int]
+
+class AudioTrackTimelineEntry(TypedDict):
+    start_time: float
+    end_time: float
+    tracks: list[AudioTrackTimelineTrack]
+
+class SubtitleTrack(TypedDict):
+    index: int
+    stream_index: int
+    codec: str
+    language: str | None
+    title: str | None
 
 class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け
@@ -159,21 +178,25 @@ class RecordedVideo(PydanticModel):
     recording_start_time: datetime | None
     recording_end_time: datetime | None
     duration: float
-    container_format: Literal['MPEG-TS', 'MPEG-4']
-    video_codec: Literal['MPEG-2', 'H.264', 'H.265']
-    video_codec_profile: Literal['High', 'High 10', 'Main', 'Main 10', 'Baseline', 'Constrained Baseline']
-    video_scan_type: Literal['Interlaced', 'Progressive']
-    video_frame_rate: float
-    video_resolution_width: int
-    video_resolution_height: int
+    container_format: str
+    has_video: bool = True
+    has_audio: bool = True
+    video_codec: str | None
+    video_codec_profile: str | None
+    video_scan_type: Literal['Interlaced', 'Progressive'] | None
+    video_frame_rate: float | None
+    video_resolution_width: int | None
+    video_resolution_height: int | None
     has_video_stream_changes: bool = False
-    primary_audio_codec: str
-    primary_audio_channel: str
-    primary_audio_sampling_rate: int
+    primary_audio_codec: str | None
+    primary_audio_channel: str | None
+    primary_audio_sampling_rate: int | None
     secondary_audio_codec: str | None = None
     secondary_audio_channel: str | None = None
     secondary_audio_sampling_rate: int | None = None
     audio_tracks: list[AudioTrack] = Field(default_factory=list)
+    audio_track_timeline: list[AudioTrackTimelineEntry] = Field(default_factory=list)
+    subtitle_tracks: list[SubtitleTrack] = Field(default_factory=list)
     cm_sections: list[CMSection] | None = None
     thumbnail_info: ThumbnailInfo | None = None
     created_at: datetime

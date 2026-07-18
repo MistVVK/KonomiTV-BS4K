@@ -146,7 +146,7 @@ class ThumbnailGenerator:
     def __init__(
         self,
         file_path: anyio.Path,
-        container_format: Literal['MPEG-TS', 'MPEG-4'],
+        container_format: str,
         file_hash: str,
         duration_sec: float,
         candidate_time_ranges: list[tuple[float, float]],
@@ -159,7 +159,7 @@ class ThumbnailGenerator:
 
         Args:
             file_path (anyio.Path): 動画ファイルのパス
-            container_format (Literal['MPEG-TS', 'MPEG-4']): 動画ファイルのコンテナ形式
+            container_format (str): 動画ファイルのコンテナ形式
             file_hash (str): 動画ファイルのハッシュ値（ファイル名の一意性を保証するため）
             duration_sec (float): 動画の再生時間(秒)
             candidate_time_ranges (list[tuple[float, float]]): 代表サムネ候補とする区間 [(start, end), ...]
