@@ -68,6 +68,7 @@ class PlayerController {
 
     // ライブ視聴: 動的 PMT で音声トラック数が変化した場合に設定パネルを追従するためのインターバルをキャンセルする関数
     private live_audio_track_interval_timer_cancel: (() => void) | null = null;
+    private live_selected_audio_track_index = 0;
 
     // ビデオ視聴: ビデオストリームのアクティブ状態を維持するために Keep-Alive API にリクエストを送るインターバルのキャンセルする関数
     private video_keep_alive_interval_timer_cancel: (() => void) | null = null;
@@ -1847,6 +1848,27 @@ class PlayerController {
         const labels = this.buildAudioTrackLabels(media_info);
         const audio_track_count = this.getSelectableAudioTrackCount(media_info, labels);
         const audio_items = Array.from(this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-item'));
+
+        // DPlayer は音声項目を主・副の2件に固定しているため、ライブTSのPMTに3本以上の音声PIDがある場合は
+        // 実トラック数に合わせて項目を増減する。録画側はHLSレンディション同期処理で同様に管理する。
+        if (this.playback_mode === 'Live' && audio_items.length > 0) {
+            const audio_panel = audio_items[0].parentElement;
+            while (audio_panel !== null && audio_items.length < Math.max(audio_track_count, 1)) {
+                const index = audio_items.length;
+                const audio_item = audio_items[0].cloneNode(true) as HTMLElement;
+                audio_item.classList.remove('dplayer-setting-audio-current');
+                audio_item.dataset.audio = `track-${index}`;
+                delete audio_item.dataset.konomitvAudioLabelHandlerBound;
+                audio_panel.appendChild(audio_item);
+                audio_items.push(audio_item);
+            }
+            while (audio_items.length > Math.max(audio_track_count, 1) && audio_items.length > 2) {
+                audio_items.pop()?.remove();
+            }
+            audio_items.forEach((audio_item, index) => {
+                audio_item.dataset.audio = `track-${index}`;
+            });
+        }
         const setting_box = this.player.container.querySelector<HTMLElement>('.dplayer-setting-box');
         const audio_setting_item = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio');
         const audio_setting_value = audio_setting_item?.querySelector<HTMLElement>('.dplayer-label-value') ?? null;
@@ -1887,6 +1909,23 @@ class PlayerController {
                     window.setTimeout(() => this.applyAudioTrackLabels(media_info), 0);
                 });
             }
+            if (this.playback_mode === 'Live' && audio_item.dataset.konomitvAudioSwitchHandlerBound !== 'true') {
+                audio_item.dataset.konomitvAudioSwitchHandlerBound = 'true';
+                audio_item.addEventListener('click', () => {
+                    if (audio_item.classList.contains('dplayer-setting-audio-item--disabled')) return;
+                    const mpegts_player = this.player?.plugins.mpegts as any;
+                    if (typeof mpegts_player?.switchAudioTrack !== 'function') return;
+                    mpegts_player.switchAudioTrack(index);
+                    this.live_selected_audio_track_index = index;
+                    audio_items.forEach((item, item_index) => {
+                        item.classList.toggle('dplayer-setting-audio-current', item_index === index);
+                    });
+                    if (audio_setting_value !== null) {
+                        audio_setting_value.textContent = labels[index] ?? `Track${index + 1} 音声不明`;
+                    }
+                    setting_box?.classList.remove('dplayer-setting-box-audio');
+                });
+            }
             const is_audio_item_unavailable = audio_track_count === 0 || index >= audio_track_count;
             audio_item.classList.toggle('dplayer-setting-audio-item--disabled', is_audio_item_unavailable);
             audio_item.classList.toggle('dplayer-setting-audio-item--status', is_audio_status_item);
@@ -1897,7 +1936,7 @@ class PlayerController {
 
         if (audio_track_count > 0 && audio_items.length !== audio_track_count) {
             console.warn(
-                `\u001b[31m[PlayerController] Audio track count mismatch. ` +
+                '\u001b[31m[PlayerController] Audio track count mismatch. ' +
                 `(player=${audio_items.length}, metadata=${audio_track_count})`
             );
         }
@@ -1910,6 +1949,7 @@ class PlayerController {
     private getCurrentAudioTrackIndex(): number {
 
         if (this.player === null) return 0;
+        if (this.playback_mode === 'Live') return this.live_selected_audio_track_index;
 
         const audio_items = Array.from(this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-item'));
         const current_audio_item = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-current');
@@ -1946,11 +1986,10 @@ class PlayerController {
 
         const current_audio_index = this.getCurrentAudioTrackIndex();
         if (current_audio_index >= 0 && current_audio_index < audio_track_count) return;
-        if (current_audio_index === 0) return;
-
         if (this.switchAudioTrackTo(0) === true) {
+            this.live_selected_audio_track_index = 0;
             console.warn(
-                `\u001b[31m[PlayerController] Selected live audio track is no longer available. ` +
+                '\u001b[31m[PlayerController] Selected live audio track is no longer available. ' +
                 `Fallback to Track1. (selected=${current_audio_index + 1}, tracks=${audio_track_count})`
             );
             window.setTimeout(() => this.applyAudioTrackLabels(media_info), 0);
@@ -2000,26 +2039,9 @@ class PlayerController {
      * 配信 TS と現在番組の音声構成から、ライブ視聴で実際に選択可能な音声トラック数を取得する
      */
     private getLiveSelectableAudioTrackCount(media_info: {[key: string]: any} | null): number {
-
-        const ts_audio_track_count = this.getLiveTSAudioTrackCount(media_info);
-        if (ts_audio_track_count <= 1) return ts_audio_track_count;
-
-        const channels_store = useChannelsStore();
-        const program = channels_store.current_program_present ?? channels_store.channel.current.program_present;
-        if (program === null) return ts_audio_track_count;
-
-        // 番組境界では、PMT に旧番組の副音声 PID が宣言されたままでも PES が送られなくなることがある。
-        // TS 側の実トラック数を上限としつつ、現在番組の EPG で有効な音声構成が確定している場合は
-        // その本数までに絞り、消滅した Track2 以降を選択状態に残さない。
-        const program_audio_track_count = this.buildProgramAudioTrackLabels(
-            program.primary_audio_language,
-            program.primary_audio_type,
-            program.secondary_audio_language,
-            program.secondary_audio_type,
-            true,
-        ).length;
-        if (program_audio_track_count === 0) return ts_audio_track_count;
-        return Math.min(ts_audio_track_count, program_audio_track_count);
+        // EPG は放送中の実ストリームと一致しない場合があるため、選択可否には一切使わない。
+        // mpegts.js がPMTから数えた音声PID数だけを正とする。
+        return this.getLiveTSAudioTrackCount(media_info);
     }
 
 
@@ -2244,46 +2266,34 @@ class PlayerController {
         });
 
         if (this.playback_mode === 'Live') {
-            const program = channels_store.current_program_present ?? channels_store.channel.current.program_present;
-            // 選択可能な音声数は、変換後の配信 TS を解析した mpegts.js の PMT だけを正とする。
-            // DPlayer の音声項目は主音声・副音声の2項目が固定で存在するため、実トラック数の判定には使わない。
             const actual_audio_track_count = this.getLiveTSAudioTrackCount(media_info);
-            let metadata_labels = program !== null ? this.buildProgramAudioTrackLabels(
-                program.primary_audio_language,
-                program.primary_audio_type,
-                program.secondary_audio_language,
-                program.secondary_audio_type,
-                actual_audio_track_count >= 2,
-            ) : [];
+            const program = channels_store.current_program_present ?? channels_store.channel.current.program_present;
+            const audio_components = program?.audio_components ?? [];
+            const ordered_audio_components = [...audio_components].sort((a, b) => a.component_tag - b.component_tag);
+            const expanded_audio_components = ordered_audio_components.flatMap((component) => {
+                if (this.isDualMonoAudioType(component.audio_type) === false) return [component];
+                const languages = component.language.split('+').map((language) => language.trim()).filter(Boolean);
+                return [
+                    {...component, language: languages[0] || '言語不明', audio_type: '1/0モード(シングルモノ)'},
+                    {...component, language: languages[1] || '副音声', audio_type: '1/0モード(シングルモノ)'},
+                ];
+            });
+            const component_tags = Array.isArray(media_info?.audioTrackComponentTags) ?
+                media_info.audioTrackComponentTags as number[] : [];
 
-            // dantto4k --audio-stereo-only は元放送の 5.1ch を破棄し、実在するステレオ音声を1本だけ PID 0x0110 へ配置する。
-            // EIT の主音声メタデータは変換前の 5.1ch のままなので、実トラックが1本の BSP4K では
-            // Stereo ラベルを優先し、存在しない 5.1ch を Track1 として表示しない。
-            const is_bs4k_live = channels_store.channel.current.display_channel_id.startsWith('bs4k');
-            if (is_bs4k_live && actual_audio_track_count === 1) {
-                const stereo_label = metadata_labels.find((label) => label.includes('(Stereo)'));
-                if (stereo_label !== undefined) {
-                    metadata_labels = [stereo_label.replace(/^Track\d+/, 'Track1')];
-                } else if (metadata_labels.some((label) => label.includes('(5.1ch)') || label.includes('(22.2ch)'))) {
-                    metadata_labels = [];
-                }
-            }
-
-            // EIT は変換前の放送音声構成を表すため、実在するプレイヤー音声数よりラベルを増やさない。
-            metadata_labels = metadata_labels.slice(0, actual_audio_track_count);
-            if (media_audio_track_labels.length > 0) {
-                if (metadata_labels.length > media_audio_track_labels.length) {
-                    return metadata_labels;
-                }
-                return media_audio_track_labels.map((label, index) => metadata_labels[index] ?? label);
-            }
-            if (metadata_labels.length > 0) {
-                return metadata_labels;
-            }
-            if (actual_audio_track_count > 0) {
-                return Array.from({length: actual_audio_track_count}, (_, index) => `Track${index + 1} 音声不明`);
-            }
-            return [];
+            // トラック数と順序はPMTだけを正とし、EITは同じcomponent tagの表示名補完に限って使う。
+            return Array.from({length: actual_audio_track_count}, (_, index) => {
+                const component_tag = component_tags[index];
+                // HWEncC の再muxでStream Identifier Descriptorが失われる場合は、PMT音声順と同じ
+                // component tag昇順でEIT記述子を対応させる。件数はPMT側から増やさない。
+                const component = (expanded_audio_components.length === actual_audio_track_count ?
+                    expanded_audio_components[index] :
+                    (typeof component_tag === 'number' ?
+                        audio_components.find((item) => item.component_tag === component_tag) :
+                        ordered_audio_components[index])) ?? null;
+                if (component === null) return `Track${index + 1} 言語不明`;
+                return this.formatAudioTrackLabel(index + 1, component.language, component.audio_type);
+            });
         }
 
         if (this.playback_mode === 'Video') {

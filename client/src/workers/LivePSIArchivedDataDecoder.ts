@@ -252,6 +252,7 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
             descriptors.find(d => d.descriptor_tag === 0xC4 && d.main_component_flag === 1) ?? null;  // 音声コンポーネント記述子 (主音声)
         const audio_component_descriptor_secondary =
             descriptors.find(d => d.descriptor_tag === 0xC4 && d.main_component_flag !== 1) ?? null;  // 音声コンポーネント記述子 (副音声)
+        const audio_component_descriptors = descriptors.filter(d => d.descriptor_tag === 0xC4);
 
         // タイトル・番組概要
         if (short_event_descriptor !== null) {
@@ -404,6 +405,26 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
             program.secondary_audio_language = null;
             program.secondary_audio_sampling_rate = null;
         }
+
+        // PMT に実在する音声PIDとの component tag 照合用に、主・副の区別なく全記述子を保持する。
+        // この情報は表示名の補完だけに使い、トラックの存在・順序・選択可否には使わない。
+        program.audio_components = audio_component_descriptors.map((descriptor) => {
+            let language = ProgramUtils.getISO639LanguageCodeName(
+                String.fromCharCode(...descriptor.ISO_639_language_code),
+            );
+            const audio_type = ProgramUtils.COMPONENT_TYPE[0x02][descriptor.component_type] ?? '';
+            if (audio_type === '1/0+1/0モード(デュアルモノ)') {
+                language += '+' + (descriptor.ES_multi_lingual_flag === 1 ?
+                    ProgramUtils.getISO639LanguageCodeName(String.fromCharCode(...descriptor.ISO_639_language_code_2)) :
+                    '副音声');
+            }
+            return {
+                component_tag: descriptor.component_tag,
+                language,
+                audio_type,
+                sampling_rate: ProgramUtils.SAMPLING_RATE[descriptor.sampling_rate] ?? '',
+            };
+        });
 
         // Safari では console.debug() がデフォルトで出力されてしまい煩いので出力しない
         if (Utils.isSafari() === false) {

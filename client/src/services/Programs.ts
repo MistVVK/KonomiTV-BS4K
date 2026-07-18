@@ -28,6 +28,13 @@ export interface IProgram {
     secondary_audio_type: string | null;
     secondary_audio_language: string | null;
     secondary_audio_sampling_rate: string | null;
+    /** EIT の全 Audio Component Descriptor。PMT の component tag と照合して表示名だけを補完する。 */
+    audio_components?: {
+        component_tag: number;
+        language: string;
+        audio_type: string;
+        sampling_rate: string;
+    }[];
 }
 
 /** 番組情報を表すインターフェイスのデフォルト値 */
@@ -54,6 +61,7 @@ export const IProgramDefault: IProgram = {
     secondary_audio_type: null,
     secondary_audio_language: null,
     secondary_audio_sampling_rate: null,
+    audio_components: [],
 };
 
 /** 番組情報を表すインターフェイス (present_or_following: Present なら現在放送中、Following なら次の番組であることを示す) */
