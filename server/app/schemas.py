@@ -214,6 +214,26 @@ class RecordedVideo(PydanticModel):
     created_at: datetime
     updated_at: datetime
 
+    @property
+    def _representative_video_stream(self) -> VideoStreamTimelineEntry | None:
+        return max(
+            self.video_stream_timeline or [],
+            key=lambda entry: entry['end_time'] - entry['start_time'],
+            default=None,
+        )
+
+    @computed_field
+    @property
+    def video_sample_aspect_ratio(self) -> str | None:
+        representative_stream = self._representative_video_stream
+        return representative_stream.get('sample_aspect_ratio') if representative_stream is not None else None
+
+    @computed_field
+    @property
+    def video_display_aspect_ratio(self) -> str | None:
+        representative_stream = self._representative_video_stream
+        return representative_stream.get('display_aspect_ratio') if representative_stream is not None else None
+
 
 class RecordedPlaybackIndex(PydanticModel):
     status: Literal['Pending', 'Analyzing', 'Ready', 'Failed']
@@ -253,6 +273,8 @@ class VideoStreamTimelineEntry(TypedDict):
     profile: str
     width: int
     height: int
+    sample_aspect_ratio: NotRequired[str | None]
+    display_aspect_ratio: NotRequired[str | None]
     frame_rate: float
     scan_type: Literal['Interlaced', 'Progressive', 'Unknown']
     bit_depth: int

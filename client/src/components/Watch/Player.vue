@@ -17,24 +17,24 @@
         <v-progress-circular indeterminate size="60" width="6" class="watch-player__buffering"
             :class="{'watch-player__buffering--display': playerStore.is_video_buffering}">
         </v-progress-circular>
-        <div v-if="playback_mode === 'Video' && playerStore.recorded_program.recorded_video.playback_index_state !== 'Ready'"
+        <div v-if="playback_mode === 'Video' && isRecordedAnalysisBlocking"
             class="watch-player__playback-index-status">
-            <v-progress-circular v-if="playerStore.recorded_program.recorded_video.playback_index_state !== 'Failed'"
+            <v-progress-circular v-if="!isRecordedAnalysisFailed"
                 indeterminate size="52" width="5" />
             <Icon v-else icon="fluent:error-circle-24-filled" width="52px" />
             <div class="watch-player__playback-index-status-title">{{playbackIndexStatusTitle}}</div>
-            <div v-if="playerStore.recorded_program.recorded_video.playback_index_state !== 'Failed'"
+            <div v-if="!isRecordedAnalysisFailed"
                 class="watch-player__playback-index-status-detail">
                 {{playbackIndexStageTitle}}
-                <template v-if="playerStore.recorded_playback_index_progress !== null">
+                <template v-if="playerStore.recorded_program.recorded_video.status === 'Recorded' && playerStore.recorded_playback_index_progress !== null">
                     {{Math.round(playerStore.recorded_playback_index_progress * 100)}}%
                 </template>
             </div>
-            <div v-if="playerStore.recorded_program.recorded_video.playback_index_state === 'Failed'"
+            <div v-if="isRecordedAnalysisFailed"
                 class="watch-player__playback-index-status-detail">
-                {{playerStore.recorded_program.recorded_video.playback_index_error_code ?? 'UnknownError'}}
+                {{recordedAnalysisErrorCode}}
             </div>
-            <v-btn v-if="playerStore.recorded_program.recorded_video.playback_index_state === 'Failed'"
+            <v-btn v-if="isRecordedAnalysisFailed"
                 color="primary" variant="flat" class="mt-4" @click="retryRecordedPlaybackIndex">
                 再解析する
             </v-btn>
@@ -87,14 +87,32 @@ const channelsStore = useChannelsStore();
 const playerStore = usePlayerStore();
 const settingsStore = useSettingsStore();
 
+// 軽量Metadataと現行Versionの再生索引だけを再生開始条件にする。
+// CM判定とサムネイル生成の状態はここへ含めない。
+const isRecordedAnalysisBlocking = computed(() => {
+    const recorded_video = playerStore.recorded_program.recorded_video;
+    return recorded_video.status !== 'Recorded' || recorded_video.playback_index_state !== 'Ready';
+});
+
+const isRecordedAnalysisFailed = computed(() => {
+    const recorded_video = playerStore.recorded_program.recorded_video;
+    return recorded_video.status === 'AnalysisFailed' || recorded_video.playback_index_state === 'Failed';
+});
+
 // 視聴画面を開いた時点でPending・Staleも優先度0の解析へ投入されるため、プレイヤー領域では解析中と表示する
 const playbackIndexStatusTitle = computed(() => {
-    return playerStore.recorded_program.recorded_video.playback_index_state === 'Failed' ?
+    const recorded_video = playerStore.recorded_program.recorded_video;
+    if (recorded_video.status === 'AnalysisFailed') return '録画メタデータの解析に失敗しました';
+    if (recorded_video.status !== 'Recorded') return '録画メタデータを解析中…';
+    return recorded_video.playback_index_state === 'Failed' ?
         '録画再生用索引の解析に失敗しました' : '録画再生用索引を解析中…';
 });
 
 // サーバーが返す処理段階を、進捗率だけでは分からない作業内容とともに表示する
 const playbackIndexStageTitle = computed(() => {
+    const recorded_video = playerStore.recorded_program.recorded_video;
+    if (recorded_video.status === 'Recording') return '録画完了を待っています';
+    if (recorded_video.status === 'Analyzing') return 'ファイル情報・番組情報を解析中';
     const stage_titles = {
         Queued: '解析待ち',
         Probing: 'ストリームを確認中',
@@ -105,6 +123,12 @@ const playbackIndexStageTitle = computed(() => {
     } as const;
     const stage = playerStore.recorded_playback_index_stage;
     return stage !== null ? stage_titles[stage] : '解析を開始しています';
+});
+
+const recordedAnalysisErrorCode = computed(() => {
+    return playerStore.recorded_program.recorded_video.status === 'AnalysisFailed' ?
+        'MetadataAnalysisFailed' :
+        (playerStore.recorded_program.recorded_video.playback_index_error_code ?? 'UnknownError');
 });
 
 // PlayerControllerはまだ存在しないため、Storeのイベントを通じて視聴画面の初期化処理へ再試行を依頼する

@@ -144,6 +144,31 @@ class Maintenance {
 
 
     /**
+     * すべての録画ファイルの CM 区間を再判定する
+     * @returns タスクの実行に成功した場合は true、失敗した場合は false
+     */
+    static async detectCMSectionsForAllRecordedVideos(): Promise<boolean> {
+
+        const response = await APIClient.post('/maintenance/detect-cm-sections-for-all-recorded-videos', undefined, {
+            timeout: 24 * 60 * 60 * 1000,
+        });
+
+        if (response.type === 'error') {
+            switch (response.data.detail) {
+                case 'CM section detection of all recorded videos is already running':
+                    APIClient.showGenericError(response, 'すべての録画ファイルの CM 区間判定は既に実行中です。');
+                    break;
+                default:
+                    APIClient.showGenericError(response, 'すべての録画ファイルの CM 区間判定を開始できませんでした。');
+                    break;
+            }
+            return false;
+        }
+        return true;
+    }
+
+
+    /**
      * バックグラウンド解析タスクを開始する
      * @returns タスクの実行に成功した場合は true、失敗した場合は false
      */

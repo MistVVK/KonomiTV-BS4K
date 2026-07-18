@@ -102,6 +102,62 @@ def test_video_input_seek_decodes_preroll_before_exact_trim_position() -> None:
     assert RecordedFMP4Stream.computeInputSeekWindow(4.0, 6.006) == (0.0, 4.0, 10.006)
 
 
+def test_video_segment_explicitly_keeps_16_by_9_display_aspect_ratio(monkeypatch, tmp_path) -> None:
+    """1440x1080出力がsquare pixelの4:3映像として保存されないことを確認する。"""
+
+    stream = object.__new__(RecordedFMP4Stream)
+    stream.quality = '1080p-60fps'
+    stream.encoding_options = SimpleNamespace(
+        video_codec='avc',
+        video_bit_depth=8,
+        is_24fps_mode_enabled=False,
+    )
+    stream.recorded_program = SimpleNamespace(recorded_video=SimpleNamespace(
+        id=1,
+        file_path='/recording.mp4',
+        container_format='MP4',
+        video_scan_type='Progressive',
+        video_stream_timeline=[],
+    ))
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b'fragment', b''
+
+    async def CreateSubprocessExec(*command, **_kwargs):
+        commands.append([str(argument) for argument in command])
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__getBackend',
+        lambda _self: 'FFmpeg',
+    )
+    monkeypatch.setattr('app.streams.RecordedFMP4Stream.asyncio.create_subprocess_exec', CreateSubprocessExec)
+    monkeypatch.setattr(
+        'app.streams.RecordedFMP4Stream.RecordedFMP4CacheManager.writeAtomic',
+        AsyncMock(),
+    )
+    monkeypatch.setattr(RecordedFMP4Stream, 'splitFragmentedMP4', staticmethod(lambda _data: (b'init', b'media')))
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        'normalizeFragmentTimeline',
+        staticmethod(lambda _init, media, _start_time, _sequence: media),
+    )
+
+    asyncio.run(stream._RecordedFMP4Stream__encodeSegment(  # pyright: ignore[reportPrivateUsage]
+        RecordedFMP4Segment(0, 0.0, 6.0, 0, 0),
+        tmp_path / 'init.mp4',
+        tmp_path / 'segment.m4s',
+    ))
+
+    aspect_index = commands[0].index('-aspect')
+    assert commands[0][aspect_index + 1] == '16:9'
+
+
 def test_extract_avc_codec_string_from_actual_configuration_box() -> None:
     """avcCのprofile/compatibility/levelをcodec stringへ反映する。"""
 

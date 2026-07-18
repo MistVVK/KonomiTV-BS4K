@@ -18,6 +18,14 @@
                     <Icon icon="fluent:error-circle-12-regular" width="15px" height="15px" />
                     メタデータ解析失敗
                 </div>
+                <div v-else-if="program.recorded_video.status === 'Analyzing'" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--analyzing">
+                    <Icon icon="fluent:arrow-sync-circle-20-regular" width="15px" height="15px" />
+                    メタデータ解析中
+                </div>
+                <div v-else-if="isPlaybackIndexAnalyzing" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--analyzing">
+                    <Icon icon="fluent:arrow-sync-circle-20-regular" width="15px" height="15px" />
+                    メタデータ解析中
+                </div>
                 <div v-else-if="program.is_partially_recorded" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--partial">
                     ⚠️ 一部のみ録画
                 </div>
@@ -103,6 +111,12 @@
                                 <Icon icon="fluent:book-arrow-clockwise-20-regular" width="20px" height="20px" />
                             </template>
                             <v-list-item-title class="ml-3">メタデータを再解析</v-list-item-title>
+                        </v-list-item>
+                        <v-list-item @click="detectCMSections" v-ftooltip="'この録画ファイル全体を検査し、CM 区間を再判定します（時間がかかる場合があります）'">
+                            <template v-slot:prepend>
+                                <Icon icon="fluent:scan-dash-20-regular" width="20px" height="20px" />
+                            </template>
+                            <v-list-item-title class="ml-3">CM 区間を再判定</v-list-item-title>
                         </v-list-item>
                         <v-list-item @click="regenerateThumbnail()" v-ftooltip="'サムネイルのみを再生成します（数分かかります） 変更を反映するにはブラウザキャッシュの削除が必要です'">
                             <template v-slot:prepend>
@@ -199,6 +213,19 @@ const reanalyzeVideo = async () => {
     }
 };
 
+// CM 区間再判定
+const detectCMSections = async () => {
+    Message.info('CM 区間の再判定を開始します。完了までしばらくお待ちください。');
+    const result = await Videos.detectCMSections(props.program.id);
+    if (result === true) {
+        const updated_program = await Videos.fetchVideo(props.program.id);
+        if (updated_program !== null) {
+            Object.assign(props.program, updated_program);
+        }
+        Message.success('CM 区間の再判定が完了しました。');
+    }
+};
+
 // サムネイル再生成
 const regenerateThumbnail = async () => {
     Message.success('サムネイルの再生成を開始しました。完了までしばらくお待ちください。');
@@ -241,6 +268,12 @@ const isInMylist = computed(() => {
 // 視聴履歴を取得
 const watchHistory = computed(() => {
     return settingsStore.settings.watched_history.find(history => history.video_id === props.program.id);
+});
+
+// 未生成・生成中・旧Versionの索引は、いずれも再生に必要なメタデータの解析中として表示する
+const isPlaybackIndexAnalyzing = computed(() => {
+    const state = props.program.recorded_video.playback_index_state;
+    return state === 'Pending' || state === 'Analyzing' || state === 'Stale';
 });
 
 // 視聴履歴から削除
@@ -382,6 +415,11 @@ const deleteVideo = async () => {
                 svg {
                     color: rgb(var(--v-theme-error));
                 }
+            }
+
+            &--analyzing svg {
+                color: rgb(var(--v-theme-secondary-lighten-1));
+                animation: playback-index-spin 1.5s linear infinite;
             }
 
             &-dot {
@@ -802,6 +840,11 @@ const deleteVideo = async () => {
     0% { opacity: 0; }
     50% { opacity: 1; }
     100% { opacity: 0; }
+}
+
+@keyframes playback-index-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
 }
 
 .delete-confirmation {

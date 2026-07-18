@@ -66,7 +66,7 @@ export interface ISubtitleTrack {
 /** 録画ファイル情報を表すインターフェース */
 export interface IRecordedVideo {
     id: number;
-    status: 'Recording' | 'Recorded' | 'AnalysisFailed';
+    status: 'Recording' | 'Analyzing' | 'Recorded' | 'AnalysisFailed';
     file_path: string;
     file_hash: string;
     file_size: number;
@@ -92,6 +92,8 @@ export interface IRecordedVideo {
     video_frame_rate: number | null;
     video_resolution_width: number | null;
     video_resolution_height: number | null;
+    video_sample_aspect_ratio: string | null;
+    video_display_aspect_ratio: string | null;
     has_video_stream_changes: boolean;
     primary_audio_codec: string | null;
     primary_audio_channel: string | null;
@@ -149,7 +151,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     playback_index_status: 'Pending',
     playback_index_state: 'Pending',
     playback_index_version: null,
-    playback_index_current_version: 6,
+    playback_index_current_version: 11,
     playback_indexed_at: null,
     playback_index_error_code: null,
     recording_start_time: null,
@@ -164,6 +166,8 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     video_frame_rate: 29.97,
     video_resolution_width: 1440,
     video_resolution_height: 1080,
+    video_sample_aspect_ratio: '4:3',
+    video_display_aspect_ratio: '16:9',
     has_video_stream_changes: false,
     primary_audio_codec: 'AAC-LC',
     primary_audio_channel: 'Stereo',
@@ -270,6 +274,41 @@ export interface IJikkyoComments {
 
 class Videos {
 
+    /** 画面遷移時に即座に解除できるポーリング間隔。 */
+    private static async waitForPollingInterval(signal: AbortSignal): Promise<boolean> {
+        return await new Promise<boolean>((resolve) => {
+            const on_abort = () => {
+                window.clearTimeout(timeout_id);
+                resolve(false);
+            };
+            const timeout_id = window.setTimeout(() => {
+                signal.removeEventListener('abort', on_abort);
+                resolve(true);
+            }, 1000);
+            signal.addEventListener('abort', on_abort, {once: true});
+        });
+    }
+
+    /** 軽量メタデータ解析が完了または失敗するまで録画情報を監視する。 */
+    static async waitForRecordedMetadata(
+        recorded_program: IRecordedProgram,
+        on_update: (program: IRecordedProgram) => void,
+        signal: AbortSignal,
+    ): Promise<IRecordedProgram | null> {
+        let current_program = recorded_program;
+        while (
+            current_program.recorded_video.status !== 'Recorded' &&
+            current_program.recorded_video.status !== 'AnalysisFailed'
+        ) {
+            if (await this.waitForPollingInterval(signal) === false) return null;
+            const fetched_program = await this.fetchVideo(current_program.id, signal, false);
+            if (fetched_program === null) continue;
+            current_program = fetched_program;
+            on_update(current_program);
+        }
+        return current_program;
+    }
+
     /** 録画再生索引の生成を最優先で要求する。 */
     static async requestRecordedPlaybackIndex(
         video_id: number,
@@ -306,17 +345,7 @@ class Videos {
 
         while (index.state !== 'Ready' && index.state !== 'Failed') {
             // 画面遷移時はタイマーも直ちに解除し、別録画の状態をStoreへ書き戻さない。
-            const should_continue = await new Promise<boolean>((resolve) => {
-                const on_abort = () => {
-                    window.clearTimeout(timeout_id);
-                    resolve(false);
-                };
-                const timeout_id = window.setTimeout(() => {
-                    signal.removeEventListener('abort', on_abort);
-                    resolve(true);
-                }, 1000);
-                signal.addEventListener('abort', on_abort, {once: true});
-            });
+            const should_continue = await this.waitForPollingInterval(signal);
             if (should_continue === false) return null;
 
             const fetched_index = await this.fetchRecordedPlaybackIndex(video_id, signal);
@@ -465,14 +494,18 @@ class Videos {
      * @param video_id 録画番組の ID
      * @returns 録画番組情報 or 録画番組情報の取得に失敗した場合は null
      */
-    static async fetchVideo(video_id: number): Promise<IRecordedProgram | null> {
+    static async fetchVideo(
+        video_id: number,
+        signal?: AbortSignal,
+        show_error: boolean = true,
+    ): Promise<IRecordedProgram | null> {
 
         // API リクエストを実行
-        const response = await APIClient.get<IRecordedProgram>(`/videos/${video_id}`);
+        const response = await APIClient.get<IRecordedProgram>(`/videos/${video_id}`, {signal});
 
         // エラー処理
         if (response.type === 'error') {
-            APIClient.showGenericError(response, '録画番組情報を取得できませんでした。');
+            if (show_error) APIClient.showGenericError(response, '録画番組情報を取得できませんでした。');
             return null;
         }
 
@@ -531,6 +564,26 @@ class Videos {
             return false;
         }
 
+        return true;
+    }
+
+
+    /**
+     * 録画番組の CM 区間を再判定する
+     * @param video_id 録画番組の ID
+     * @returns CM 区間判定に成功した場合は true
+     */
+    static async detectCMSections(video_id: number): Promise<boolean> {
+
+        const response = await APIClient.post(`/videos/${video_id}/detect-cm-sections`, undefined, {
+            // join_logo_scp による判定は長時間かかる可能性がある
+            timeout: 60 * 60 * 1000,
+        });
+
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'CM 区間の判定に失敗しました。');
+            return false;
+        }
         return true;
     }
 

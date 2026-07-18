@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import shutil
 from collections.abc import Sequence
@@ -38,6 +39,46 @@ class RecordedPlaybackIndexAnalysisError(Exception):
         self.error_code = error_code
 
 
+def _getAudioChannelLabel(channels: int, channel_layout: str | None) -> str:
+    """実チャンネル数とFFprobeのlayoutから画面表示用ラベルを返す。"""
+
+    normalized_layout = (channel_layout or '').lower()
+    if normalized_layout == 'mono' or channels == 1:
+        return 'Monaural'
+    if normalized_layout == 'stereo' or channels == 2:
+        return 'Stereo'
+    if normalized_layout.startswith('5.1'):
+        return '5.1ch'
+    return f'{channels} Channels'
+
+
+def _normalizeAspectRatio(value: object) -> str | None:
+    """FFprobeの比率表記を既約な ``横:縦`` へ正規化する。"""
+
+    normalized = str(value or '').replace('/', ':')
+    try:
+        numerator_text, denominator_text = normalized.split(':', maxsplit=1)
+        numerator = int(numerator_text)
+        denominator = int(denominator_text)
+    except (ValueError, TypeError):
+        return None
+    if numerator <= 0 or denominator <= 0:
+        return None
+    divisor = math.gcd(numerator, denominator)
+    return f'{numerator // divisor}:{denominator // divisor}'
+
+
+def _calculateDisplayAspectRatio(width: int, height: int, sample_aspect_ratio: str | None) -> str | None:
+    """解像度とSARからDARを算出する。"""
+
+    normalized_sar = _normalizeAspectRatio(sample_aspect_ratio)
+    if width <= 0 or height <= 0 or normalized_sar is None:
+        return None
+    sar_width, sar_height = (int(value) for value in normalized_sar.split(':'))
+    divisor = math.gcd(width * sar_width, height * sar_height)
+    return f'{width * sar_width // divisor}:{height * sar_height // divisor}'
+
+
 class _TSAudioPIDCollector:
     """FFprobeへTSを供給する同じ走査で、遅延追加音声PIDの範囲とADTS構成を収集する。"""
 
@@ -49,7 +90,7 @@ class _TSAudioPIDCollector:
         3: ('3 Channels', '3.0'),
         4: ('4 Channels', '4.0'),
         5: ('5 Channels', '5.0'),
-        6: ('6 Channels', '5.1'),
+        6: ('5.1ch', '5.1'),
         7: ('8 Channels', '7.1'),
     }
 
@@ -663,15 +704,16 @@ class RecordedPlaybackIndexer:
                 sampling_rate = int(stream.get('sample_rate') or 48_000)
             except (TypeError, ValueError):
                 sampling_rate = 48_000
+            channel_layout = stream.get('channel_layout')
             track = AudioTrack(
                 index=max((int(item['index']) for item in normalized), default=0) + 1,
                 stream_index=stream_index,
                 codec=codec,
-                channel='Monaural' if channels == 1 else ('Stereo' if channels == 2 else f'{channels} Channels'),
+                channel=_getAudioChannelLabel(channels, channel_layout),
                 sampling_rate=sampling_rate,
                 language=cast(dict[str, str], stream.get('tags') or {}).get('language'),
                 title=cast(dict[str, str], stream.get('tags') or {}).get('title'),
-                channel_layout=stream.get('channel_layout'),
+                channel_layout=channel_layout,
                 is_dual_mono=False,
             )
             try:
@@ -964,6 +1006,11 @@ class RecordedPlaybackIndexer:
                 pid = int(str(stream['id']), 0) if stream.get('id') is not None else None
             except ValueError:
                 pid = None
+            width = int(stream.get('width') or 0)
+            height = int(stream.get('height') or 0)
+            sample_aspect_ratio = _normalizeAspectRatio(stream.get('sample_aspect_ratio'))
+            display_aspect_ratio = _normalizeAspectRatio(stream.get('display_aspect_ratio')) or \
+                _calculateDisplayAspectRatio(width, height, sample_aspect_ratio)
             mastering_display_metadata: dict[str, object] | None = None
             content_light_level: dict[str, object] | None = None
             for side_data in stream.get('side_data_list', []):
@@ -979,8 +1026,10 @@ class RecordedPlaybackIndexer:
                 stream_index = int(stream['index']),
                 codec = str(stream.get('codec_name') or 'unknown'),
                 profile = str(stream.get('profile') or 'Unknown'),
-                width = int(stream.get('width') or 0),
-                height = int(stream.get('height') or 0),
+                width = width,
+                height = height,
+                sample_aspect_ratio = sample_aspect_ratio,
+                display_aspect_ratio = display_aspect_ratio,
                 frame_rate = frame_rate,
                 scan_type = scan_type,
                 bit_depth = bit_depth,
@@ -1052,11 +1101,12 @@ class RecordedPlaybackIndexer:
             '-show_frames',
             '-show_streams',
             '-show_entries',
-            'frame=media_type,stream_index,pts_time,width,height,pix_fmt,interlaced_frame,'
+            'frame=media_type,stream_index,pts_time,width,height,sample_aspect_ratio,pix_fmt,interlaced_frame,'
             'color_range,color_space,color_primaries,color_transfer,channels,channel_layout:'
             'frame_side_data=side_data_type,red_x,red_y,green_x,green_y,blue_x,blue_y,'
             'white_point_x,white_point_y,min_luminance,max_luminance,max_content,max_average:'
-            'stream=index,id,codec_type,codec_name,profile,width,height,pix_fmt,field_order,'
+            'stream=index,id,codec_type,codec_name,profile,width,height,sample_aspect_ratio,display_aspect_ratio,'
+            'pix_fmt,field_order,'
             'avg_frame_rate,r_frame_rate,bits_per_raw_sample,sample_rate,channels,channel_layout,'
             'start_time,duration,color_range,color_space,color_primaries,color_transfer:'
             'stream_tags=language,title',
@@ -1596,6 +1646,12 @@ class RecordedPlaybackIndexer:
                 profile='Unknown',
                 width=width,
                 height=height,
+                sample_aspect_ratio=_normalizeAspectRatio(values.get('sample_aspect_ratio')),
+                display_aspect_ratio=_calculateDisplayAspectRatio(
+                    width,
+                    height,
+                    _normalizeAspectRatio(values.get('sample_aspect_ratio')),
+                ),
                 frame_rate=0.0,
                 scan_type='Unknown',
                 bit_depth=8,
@@ -1618,6 +1674,10 @@ class RecordedPlaybackIndexer:
         else:
             scan_type = base_entry['scan_type']
         pixel_format = values.get('pix_fmt') or ''
+        sample_aspect_ratio = _normalizeAspectRatio(values.get('sample_aspect_ratio')) or \
+            base_entry.get('sample_aspect_ratio')
+        display_aspect_ratio = _calculateDisplayAspectRatio(width, height, sample_aspect_ratio) or \
+            base_entry.get('display_aspect_ratio')
         bit_depth = 10 if '10' in pixel_format or pixel_format.startswith('p010') else 8
         color_range = values.get('color_range') or base_entry['color_range']
         color_space = values.get('color_space') or base_entry['color_space']
@@ -1626,7 +1686,7 @@ class RecordedPlaybackIndexer:
         mastering_display_metadata = mastering_display_metadata or base_entry['mastering_display_metadata']
         content_light_level = content_light_level or base_entry['content_light_level']
         signature = (
-            width, height, pixel_format, scan_type,
+            width, height, sample_aspect_ratio, display_aspect_ratio, pixel_format, scan_type,
             color_range, color_space, color_primaries, color_transfer,
             json.dumps(mastering_display_metadata, sort_keys=True),
             json.dumps(content_light_level, sort_keys=True),
@@ -1645,6 +1705,8 @@ class RecordedPlaybackIndexer:
             end_time=base_entry['end_time'],
             width=width,
             height=height,
+            sample_aspect_ratio=sample_aspect_ratio,
+            display_aspect_ratio=display_aspect_ratio,
             scan_type=scan_type,
             bit_depth=bit_depth,
             color_range=color_range,
@@ -1678,14 +1740,15 @@ class RecordedPlaybackIndexer:
         base_track = tracks_by_stream_index.get(stream_index)
         if base_track is None:
             # 先頭PMTにない途中追加音声PIDもフレーム自体から存在範囲を確定する。
+            channel_layout = values.get('channel_layout')
             base_track = AudioTrack(
                 index=max((int(track['index']) for track in audio_tracks), default=0) + 1,
                 stream_index=stream_index,
                 codec='Unknown',
-                channel='Monaural' if channels == 1 else ('Stereo' if channels == 2 else f'{channels} Channels'),
+                channel=_getAudioChannelLabel(channels, channel_layout),
                 sampling_rate=48_000,
                 language=None,
-                channel_layout=values.get('channel_layout'),
+                channel_layout=channel_layout,
                 is_dual_mono=False,
             )
             audio_tracks.append(base_track)
@@ -1827,7 +1890,7 @@ class RecordedPlaybackIndexer:
             timeline_track['channel'] = 'Stereo'
             timeline_track['is_dual_mono'] = False
         else:
-            timeline_track['channel'] = f'{channels} Channels'
+            timeline_track['channel'] = _getAudioChannelLabel(channels, channel_layout)
             timeline_track['is_dual_mono'] = False
         return timeline_track
 

@@ -756,6 +756,10 @@ class RecordedFMP4Stream:
         command += [
             '-b:v', quality.video_bitrate, '-maxrate', quality.video_bitrate_max,
             '-bufsize', str(int(float(quality.video_bitrate_max.rstrip('K')) * 2)) + 'K',
+            # 1080p 品質は帯域削減のため 1440x1080 の anamorphic 映像として出力する。
+            # 入力が square pixel の 1920x1080 / 3840x2160 でも 4:3 と解釈されないよう、
+            # encoder / MP4 muxer へ表示アスペクト比を明示する。
+            '-aspect', '16:9',
             # libaom-av1は最初のpacketでsequence headerを返すため、empty_moovでは空のav1Cが
             # 出力される。delay_moovで全codecの実configurationを含むinitを確定してから書く。
             '-movflags', '+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',

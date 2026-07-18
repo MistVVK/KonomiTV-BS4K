@@ -8,6 +8,7 @@ from fastapi import FastAPI, Query
 from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 
+from app import schemas
 from app.metadata.RecordedPlaybackIndexer import (
     RecordedPlaybackIndexAnalysisError,
     RecordedPlaybackIndexer,
@@ -189,6 +190,8 @@ def test_recorded_playback_timeline_normalizes_mpeg_ts_pts() -> None:
                 'duration': '609.241967',
                 'width': 1440,
                 'height': 1080,
+                'sample_aspect_ratio': '4:3',
+                'display_aspect_ratio': '16:9',
                 'pix_fmt': 'yuv420p10le',
                 'avg_frame_rate': '60000/1001',
             }],
@@ -197,6 +200,22 @@ def test_recorded_playback_timeline_normalizes_mpeg_ts_pts() -> None:
     )
     assert timeline[0]['start_time'] == 0.0
     assert timeline[0]['end_time'] == 609.241967
+    assert timeline[0]['sample_aspect_ratio'] == '4:3'
+    assert timeline[0]['display_aspect_ratio'] == '16:9'
+
+
+def test_recorded_video_exposes_representative_aspect_ratios() -> None:
+    """一覧・単体APIのどちらでも代表映像区間のSAR/DARを公開する。"""
+
+    recorded_video = schemas.RecordedVideo.model_construct(video_stream_timeline=[{
+        'start_time': 0.0,
+        'end_time': 65.0,
+        'sample_aspect_ratio': '1:1',
+        'display_aspect_ratio': '16:9',
+    }])
+
+    assert recorded_video.video_sample_aspect_ratio == '1:1'
+    assert recorded_video.video_display_aspect_ratio == '16:9'
 
 
 def test_recorded_index_backfills_existing_arib_caption_track(monkeypatch) -> None:
@@ -426,6 +445,29 @@ def test_recorded_audio_timeline_detects_dual_mono_transition() -> None:
     assert dual_mono['channel'] == 'Dual Mono'
     assert dual_mono['language'] == '日本語+英語'
     assert dual_mono['is_dual_mono'] is True
+
+
+def test_recorded_audio_timeline_labels_51_layout() -> None:
+    """6チャンネルの5.1 layoutを汎用的なチャンネル数ではなく5.1chと表示する。"""
+
+    base_track = {
+        'index': 1,
+        'codec': 'AAC-LC',
+        'channel': '6 Channels',
+        'sampling_rate': 48_000,
+        'language': '日本語',
+        'stream_index': 2,
+        'channel_layout': '5.1',
+        'is_dual_mono': False,
+    }
+    surround = RecordedPlaybackIndexer._RecordedPlaybackIndexer__buildTimelineAudioTrack(  # pyright: ignore[reportPrivateUsage]
+        base_track,
+        6,
+        '5.1',
+    )
+
+    assert surround['channel'] == '5.1ch'
+    assert surround['channel_layout'] == '5.1'
 
 
 def test_video_bit_depth_query_accepts_browser_query_string() -> None:

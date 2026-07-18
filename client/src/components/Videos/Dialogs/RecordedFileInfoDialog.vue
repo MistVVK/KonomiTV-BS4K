@@ -86,6 +86,14 @@
                     <div class="video-info__item-value">{{program.recorded_video.video_resolution_width}}×{{program.recorded_video.video_resolution_height}}</div>
                 </div>
                 <div class="video-info__item">
+                    <div class="video-info__item-label">SAR</div>
+                    <div class="video-info__item-value">{{program.recorded_video.video_sample_aspect_ratio ?? '不明'}}</div>
+                </div>
+                <div class="video-info__item">
+                    <div class="video-info__item-label">DAR</div>
+                    <div class="video-info__item-value">{{program.recorded_video.video_display_aspect_ratio ?? '不明'}}</div>
+                </div>
+                <div class="video-info__item">
                     <div class="video-info__item-label">フレームレート</div>
                     <div class="video-info__item-value">{{program.recorded_video.video_frame_rate}} fps</div>
                 </div>

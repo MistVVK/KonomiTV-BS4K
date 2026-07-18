@@ -79,12 +79,33 @@ export default defineComponent({
             }
 
             // 録画番組情報を更新する
-            const recorded_program = await Videos.fetchVideo(parseFloat(this.$route.params.video_id as string));
+            let recorded_program = await Videos.fetchVideo(parseFloat(this.$route.params.video_id as string));
             if (recorded_program === null) {
                 this.$router.push({path: '/not-found/'});
                 return;
             }
             this.playerStore.recorded_program = recorded_program;
+
+            // 内容変更・手動再解析中は旧索引を起動せず、軽量Metadataが確定するまで待つ。
+            // CM判定とサムネイル生成はこの待機条件へ含めない。
+            if (recorded_program.recorded_video.status !== 'Recorded') {
+                const metadata_program = await Videos.waitForRecordedMetadata(
+                    recorded_program,
+                    (program) => {
+                        this.playerStore.recorded_program = program;
+                    },
+                    abort_controller.signal,
+                );
+                if (
+                    metadata_program === null ||
+                    metadata_program.recorded_video.status !== 'Recorded' ||
+                    abort_controller.signal.aborted
+                ) {
+                    return;
+                }
+                recorded_program = metadata_program;
+                this.playerStore.recorded_program = recorded_program;
+            }
 
             // 現行Versionの索引がない間はメディアプレイヤーを生成せず、専用APIで解析を開始して待つ。
             // これにより長時間のマスタープレイリスト要求とhls.js側のタイムアウトを避ける。
@@ -136,7 +157,15 @@ export default defineComponent({
         },
 
         // 解析失敗後に同じ録画の索引生成を再要求する
-        retryRecordedPlaybackIndex() {
+        async retryRecordedPlaybackIndex() {
+            if (this.playerStore.recorded_program.recorded_video.status === 'AnalysisFailed') {
+                this.playerStore.recorded_program.recorded_video.status = 'Analyzing';
+                const succeeded = await Videos.reanalyzeVideo(this.playerStore.recorded_program.id);
+                if (succeeded === false) {
+                    this.playerStore.recorded_program.recorded_video.status = 'AnalysisFailed';
+                    return;
+                }
+            }
             void this.init();
         }
     }
