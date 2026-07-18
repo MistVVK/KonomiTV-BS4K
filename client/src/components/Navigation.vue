@@ -87,7 +87,10 @@
                             (versionStore.is_update_available ? `アップデートがあります (version ${versionStore.latest_version})` : `version ${versionStore.client_version}`) :
                             (versionStore.is_update_available ? `アップデートがあります (version ${versionStore.latest_version})` : '')">
                         <Icon class="navigation__link-icon" icon="fluent:info-16-regular" width="26px" />
-                        <span v-if="!iconOnly" class="navigation__link-text">version {{versionStore.client_version}}</span>
+                        <span v-if="!iconOnly" class="navigation__link-text navigation__link-version">
+                            <span>version {{versionStore.client_version}}</span>
+                            <span class="navigation__link-commit">{{versionStore.client_git_commit}}</span>
+                        </span>
                     </a>
                 </div>
             </nav>
@@ -259,6 +262,19 @@ export default defineComponent({
                     @include smartphone-horizontal {
                         margin-right: 10px;
                     }
+                }
+
+                .navigation__link-version {
+                    display: flex;
+                    flex-direction: column;
+                    line-height: 1.15;
+                }
+
+                .navigation__link-commit {
+                    margin-top: 3px;
+                    font-family: monospace;
+                    font-size: 11px;
+                    opacity: 0.65;
                 }
 
                 // アイコンのみモード: 正方形のアイコンボタンに変更

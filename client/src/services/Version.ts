@@ -5,6 +5,7 @@ import APIClient from '@/services/APIClient';
 /** バージョン情報を表すインターフェイス */
 export interface IVersionInformation {
     version: string;
+    git_commit: string;
     latest_version: string;
     environment: 'Windows' | 'Linux' | 'Linux-Docker' | 'Linux-ARM';
     backend: 'EDCB' | 'Mirakurun';

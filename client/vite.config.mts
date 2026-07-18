@@ -16,6 +16,7 @@ export default defineConfig({
     define: {
         'process.env': {},  // これがないと assert がエラーになる
         'import.meta.env.KONOMITV_VERSION': JSON.stringify(process.env.npm_package_version),
+        'import.meta.env.KONOMITV_GIT_COMMIT': JSON.stringify(process.env.KONOMITV_GIT_COMMIT ?? 'unknown'),
     },
     // ビルドの設定
     build: {

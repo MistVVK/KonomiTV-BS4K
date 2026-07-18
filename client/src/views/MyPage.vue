@@ -36,7 +36,8 @@
                         href="https://github.com/tsukumijima/KonomiTV" target="_blank">
                         <Icon icon="fluent:info-20-regular" width="26px" />
                         <span class="ml-4">
-                            version {{versionStore.client_version}}{{versionStore.is_update_available ? ' (Update Available)' : ''}}
+                            version {{versionStore.client_version}}{{versionStore.is_update_available ? ' (Update Available)' : ''}}<br>
+                            <small>{{versionStore.client_git_commit}}</small>
                         </span>
                     </v-btn>
                 </nav>

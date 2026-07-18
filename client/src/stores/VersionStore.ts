@@ -21,6 +21,9 @@ const useVersionStore = defineStore('version', {
         client_version(): string {
             return Utils.version;
         },
+        client_git_commit(): string {
+            return this.server_version_info?.git_commit ?? Utils.git_commit;
+        },
         server_version(): string | null {
             return this.server_version_info?.version ?? null;
         },

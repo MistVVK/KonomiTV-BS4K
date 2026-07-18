@@ -12,9 +12,16 @@ services:
     # 標準の bridge モード (仮想ネットワーク) だと、ローカルホストとの通信が面倒
     # ref: https://inocop.hatenablog.com/entry/2018/12/18/131526
     network_mode: host
+    environment:
+      KONOMITV_SOURCE_TREE: '/code/source-tree'
     # ボリュームのマウント設定
     # /host-rootfs/ はコンテナ内の KonomiTV からホストマシンのファイルを読み書きするために必要
     volumes:
+      # Git コミットハッシュと未コミット差分を実行時に自動判定するため、ソースツリーを読み取り専用で参照する
+      - type: bind
+        source: './'
+        target: '/code/source-tree/'
+        read_only: true
       - type: bind
         source: './config.yaml'
         target: '/code/config.yaml'
