@@ -102,6 +102,7 @@ export default defineComponent({
         width: 235px;
         max-height: calc(100dvh - 105px);
         padding-right: 8px;
+        overflow-x: hidden;
         overflow-y: auto;
         overscroll-behavior: contain;
         position: sticky;
