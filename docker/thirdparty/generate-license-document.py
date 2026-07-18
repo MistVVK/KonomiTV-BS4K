@@ -142,6 +142,14 @@ def main() -> None:
         '> このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。',
         '> Ubuntu・CUDA・GPU runtime・Python／JavaScript パッケージの推移的依存関係については、各配布物と Docker image 内の `/usr/share/doc` および package metadata に含まれるライセンスも適用されます。',
         '',
+        '## Chromium（Docker image ビルド時の Linux Mint Virginia 最新版）',
+        '',
+        '- Source package and binaries: https://packages.linuxmint.com/',
+        '- Upstream source: https://chromium.googlesource.com/chromium/src/',
+        '- Package: `chromium` from the signed Linux Mint Virginia `upstream` repository',
+        '- Licenses include: BSD 3-Clause, GPL-2.0+, and bundled third-party licenses',
+        '- Complete copyright and license notices: `/usr/share/doc/chromium/copyright` in the Docker image',
+        '',
     ]
 
     for source in sources:

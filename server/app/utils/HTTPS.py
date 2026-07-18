@@ -1,10 +1,12 @@
 import ipaddress
+import socket
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import psutil
 from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -66,6 +68,39 @@ def GetRequiredThirdpartyLibraries(https_mode: str) -> set[str]:
     if https_mode == 'akebi':
         libraries.add('Akebi')
     return libraries
+
+
+def GetAkebiAccessURLs(port: int) -> list[tuple[str, str]]:
+    """Akebi の証明書でアクセスできる HTTPS URL とインターフェイス名を返す。"""
+
+    access_urls = [(f'https://my.local.konomi.tv:{port}/', 'ローカルホスト')]
+    interface_addresses: list[tuple[ipaddress.IPv4Address, str]] = []
+    try:
+        network_interfaces = psutil.net_if_addrs()
+    except OSError:
+        # 制限されたコンテナ環境などで列挙できなくても、ループバック用 URL は案内できる
+        return access_urls
+    for interface_name, addresses in network_interfaces.items():
+        for address in addresses:
+            if address.family != socket.AF_INET:
+                continue
+            ip_address = ipaddress.ip_address(address.address)
+            if not isinstance(ip_address, ipaddress.IPv4Address):
+                continue
+            # upstream インストーラーと同様に、ループバックとリンクローカルは表示しない
+            if ip_address.is_loopback or ip_address.is_link_local:
+                continue
+            interface_addresses.append((ip_address, interface_name))
+
+    # IP アドレス順で安定して表示し、同一 IP が複数回列挙された場合は最初の1件だけを使う
+    seen_ip_addresses: set[ipaddress.IPv4Address] = set()
+    for ip_address, interface_name in sorted(interface_addresses, key=lambda item: int(item[0])):
+        if ip_address in seen_ip_addresses:
+            continue
+        seen_ip_addresses.add(ip_address)
+        hostname = str(ip_address).replace('.', '-')
+        access_urls.append((f'https://{hostname}.local.konomi.tv:{port}/', interface_name))
+    return access_urls
 
 
 class ReverseProxyMiddleware:

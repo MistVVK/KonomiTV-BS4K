@@ -526,8 +526,8 @@ class TwitterScrapeBrowser:
                     user_data_dir=None,
                     # 今の所ウインドウを表示せずとも問題なく動作しているので、ヘッドレスモードで起動する
                     headless=True,
-                    # ブラウザは現在の環境にインストールされているものを自動選択させる
-                    browser='auto',
+                    # Docker image に同梱している Linux Mint 版 Chromium を明示的に使用する
+                    browser_executable_path='/usr/bin/chromium',
                     # Chrome 系ブラウザの起動最適化フラグをチューニングし、なるべくメモリ使用量を下げる
                     # Zendriver デフォルトで指定されているフラグに加え、さらに以下のフラグを追加する
                     browser_args=[
@@ -556,12 +556,12 @@ class TwitterScrapeBrowser:
                     ]
                 )
             except FileNotFoundError as ex:
-                logging.error(f'{self.log_prefix} Chrome or Brave is not installed on this machine:', exc_info=ex)
-                raise BrowserBinaryNotFoundError('ヘッドレスブラウザの起動に必要な Chrome または Brave が KonomiTV サーバーにインストールされていません。') from ex
+                logging.error(f'{self.log_prefix} Chromium is not installed on this machine:', exc_info=ex)
+                raise BrowserBinaryNotFoundError('ヘッドレスブラウザの起動に必要な Chromium が KonomiTV サーバーにインストールされていません。') from ex
             except Exception as ex:
                 if 'Failed to connect to browser' in str(ex):
-                    logging.error(f'{self.log_prefix} Browser connection failed. Please check if Chrome or Brave is installed:', exc_info=ex)
-                    raise BrowserConnectionFailedError('ヘッドレスブラウザとの接続に失敗しました。Chrome または Brave が KonomiTV サーバーにインストールされているかどうかを確認してください。') from ex
+                    logging.error(f'{self.log_prefix} Browser connection failed. Please check if Chromium is installed:', exc_info=ex)
+                    raise BrowserConnectionFailedError('ヘッドレスブラウザとの接続に失敗しました。Chromium が KonomiTV サーバーにインストールされているかどうかを確認してください。') from ex
                 else:
                     logging.error(f'{self.log_prefix} Error starting browser:', exc_info=ex)
                     raise ex

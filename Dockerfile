@@ -74,14 +74,44 @@ RUN apt-mark hold \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/amdgpu/6.4.4/ubuntu jammy main' > /etc/apt/sources.list.d/amdgpu.list && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/amdgpu/6.4.4/ubuntu jammy proprietary' > /etc/apt/sources.list.d/amdgpu-proprietary.list && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/rocm/apt/6.4.4 jammy main' > /etc/apt/sources.list.d/rocm.list && \
-    curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --yes --dearmor --output /usr/share/keyrings/google-chrome-keyring.gpg && \
-    echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome-keyring.gpg] https://dl.google.com/linux/chrome/deb/ stable main' > /etc/apt/sources.list.d/google-chrome.list && \
     apt-get update && apt-get install -y --no-install-recommends \
-        amf-amdgpu-pro cuda-nvrtc-12-4 fonts-vlgothic google-chrome-stable intel-opencl-icd \
+        amf-amdgpu-pro cuda-nvrtc-12-4 fonts-vlgothic intel-opencl-icd \
         libamdenc-amdgpu-pro libdrm2 libdrm2-amdgpu libfontconfig1 libfreetype6 libfribidi0 \
         libnpp-12-4 libopus0 libssl3 libva-drm2 \
         libx11-xcb1 libx264-163 libx265-199 ocl-icd-libopencl1 rocm-opencl-runtime vulkan-amdgpu-pro && \
     apt-get -y autoremove && apt-get -y clean && \
+    rm -rf /var/lib/apt/lists/* /tmp/*
+
+# Linux Mint は InRelease を提供していないため、署名対象の Release をリモート入力にして
+# Chromium の更新時に、ブラウザ導入レイヤーが古いキャッシュを再利用しないようにする
+ADD https://fastly.linuxmint.io/dists/virginia/Release /tmp/linuxmint-virginia-Release
+
+RUN curl -fsSL https://fastly.linuxmint.io/pool/main/l/linuxmint-keyring/linuxmint-keyring_2022.06.21_all.deb \
+        --output /tmp/linuxmint-keyring.deb && \
+    echo 'b71be690c543112ea7b65f43e9bbce9a3f17dd5cc784074858f0824154942a99  /tmp/linuxmint-keyring.deb' | sha256sum --check - && \
+    dpkg-deb --extract /tmp/linuxmint-keyring.deb /tmp/linuxmint-keyring && \
+    install -m 0644 /tmp/linuxmint-keyring/etc/apt/trusted.gpg.d/linuxmint-keyring.gpg \
+        /usr/share/keyrings/linuxmint-archive-keyring.gpg && \
+    echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/linuxmint-archive-keyring.gpg] https://fastly.linuxmint.io virginia upstream' \
+        > /etc/apt/sources.list.d/linuxmint-virginia.list && \
+    printf '%s\n' \
+        'Package: *' \
+        'Pin: release o=linuxmint' \
+        'Pin-Priority: -1' \
+        '' \
+        'Package: chromium' \
+        'Pin: release o=linuxmint,n=virginia,c=upstream' \
+        'Pin-Priority: 1001' \
+        > /etc/apt/preferences.d/linuxmint-chromium && \
+    apt-get update && apt-get install -y --no-install-recommends chromium libasound2 && \
+    chromium_candidate="$(apt-cache policy chromium | awk '/Candidate:/ { print $2; exit }')" && \
+    chromium_installed="$(dpkg-query --showformat='${Version}' --show chromium)" && \
+    test "${chromium_candidate}" = "${chromium_installed}" && \
+    printf '%s' "${chromium_installed}" | grep -Eq '~linuxmint[0-9]+\+virginia$' && \
+    apt-cache policy chromium | grep -F 'https://fastly.linuxmint.io virginia/upstream amd64 Packages' && \
+    test "$(command -v chromium)" = '/usr/bin/chromium' && \
+    chromium --version && \
+    apt-get -y clean && \
     rm -rf /var/lib/apt/lists/* /tmp/*
 
 WORKDIR /code/server/

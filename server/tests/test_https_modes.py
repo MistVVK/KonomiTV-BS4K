@@ -1,5 +1,7 @@
+import socket
 import tempfile
 import unittest
+from collections import namedtuple
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -13,6 +15,7 @@ import app.config as config_module
 from app.config import ServerSettings
 from app.utils.HTTPS import (
     BuildServerStartupSettings,
+    GetAkebiAccessURLs,
     GetRequiredThirdpartyLibraries,
     ReverseProxyMiddleware,
 )
@@ -112,6 +115,26 @@ class HTTPSModeConfigTest(unittest.TestCase):
         self.assertIn('Akebi', GetRequiredThirdpartyLibraries('akebi'))
         self.assertNotIn('Akebi', GetRequiredThirdpartyLibraries('certificate'))
         self.assertNotIn('Akebi', GetRequiredThirdpartyLibraries('reverse_proxy'))
+
+    def test_akebi_access_urls_follow_upstream_installer_format(self) -> None:
+        address = namedtuple('Address', ('family', 'address'))
+        with patch('app.utils.HTTPS.psutil.net_if_addrs', return_value={
+            'lo': [address(socket.AF_INET, '127.0.0.1')],
+            'enp2s0': [address(socket.AF_INET, '192.168.0.4')],
+            'tailscale0': [address(socket.AF_INET, '100.64.0.10')],
+            'link-local': [address(socket.AF_INET, '169.254.1.1')],
+        }):
+            self.assertEqual(GetAkebiAccessURLs(7001), [
+                ('https://my.local.konomi.tv:7001/', 'ローカルホスト'),
+                ('https://100-64-0-10.local.konomi.tv:7001/', 'tailscale0'),
+                ('https://192-168-0-4.local.konomi.tv:7001/', 'enp2s0'),
+            ])
+
+    def test_akebi_access_urls_fall_back_to_localhost(self) -> None:
+        with patch('app.utils.HTTPS.psutil.net_if_addrs', side_effect=PermissionError):
+            self.assertEqual(GetAkebiAccessURLs(7001), [
+                ('https://my.local.konomi.tv:7001/', 'ローカルホスト'),
+            ])
 
     def test_certificate_paths_are_mapped_through_host_rootfs_in_docker(self) -> None:
         temporary_path = Path(self.temporary_directory.name)

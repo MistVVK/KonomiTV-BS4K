@@ -25,7 +25,11 @@ from app.constants import (
     RESTART_REQUIRED_LOCK_PATH,
     VERSION,
 )
-from app.utils.HTTPS import BuildServerStartupSettings, GetRequiredThirdpartyLibraries
+from app.utils.HTTPS import (
+    BuildServerStartupSettings,
+    GetAkebiAccessURLs,
+    GetRequiredThirdpartyLibraries,
+)
 from app.utils.LogRotation import SplitServerLogByDate
 
 
@@ -153,6 +157,11 @@ def main(
 
         # このプロセスが終了されたときに、Akebi も一緒に終了する
         atexit.register(reverse_proxy_process.terminate)
+
+        # upstream インストーラーと同じ規則で、Akebi の証明書を利用してアクセスできる URL を表示する
+        logging.info('KonomiTV にアクセスできる URL:')
+        for access_url, interface_name in GetAkebiAccessURLs(CONFIG.server.port):
+            logging.info(f'  {access_url} ({interface_name})')
 
     # Uvicorn の設定
     server_config = uvicorn.Config(
