@@ -10,6 +10,11 @@
       .c {
         fill: url(#b);
       }
+      @media (prefers-color-scheme: light) {
+        .b {
+          fill: #292126;
+        }
+      }
     </style>
     <linearGradient id="a" x1="255.036" y1="154.595" x2="333.205" y2="369.361" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#e64f97"/>
