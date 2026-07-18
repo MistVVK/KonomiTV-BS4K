@@ -101,7 +101,7 @@ class ClientSettings(BaseModel):
     # video_data_saver_mode_cellular: 同期無効
     # video_24fps_mode: 同期無効
     # video_24fps_mode_cellular: 同期無効
-    caption_font: str = 'Windows TV MaruGothic'
+    caption_font: str = 'Rounded M+ 1m for ARIB'
     always_border_caption_text: bool = True
     specify_caption_opacity: bool = False
     caption_opacity: Annotated[float, confloat(ge=0.0, le=1.0)] = 1.0

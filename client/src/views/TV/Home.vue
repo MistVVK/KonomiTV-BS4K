@@ -6,12 +6,12 @@
             <div class="channels-container channels-container--home" :class="{'channels-container--loading': is_loading}">
                 <SPHeaderBar />
                 <div class="channels-tab">
-                    <div class="channels-tab__buttons" :style="{
-                        '--tab-length': Array.from(channelsStore.channels_list_with_pinned).length,
-                        '--active-tab-index': active_tab_index,
+                    <div ref="channels_tab_buttons" class="channels-tab__buttons" :style="{
+                        '--active-tab-offset': `${active_tab_offset}px`,
+                        '--active-tab-width': `${active_tab_width}px`,
                     }">
                         <v-btn variant="flat" class="channels-tab__button"
-                            v-for="([channels_type,], index) in Array.from(channelsStore.channels_list_with_pinned)" :key="channels_type"
+                            v-for="([channels_type,], index) in channel_tabs" :key="channels_type"
                             @click="active_tab_index = index">
                             {{channels_type}}
                         </v-btn>
@@ -22,8 +22,8 @@
                     :observer="true" :observe-parents="true"
                     @swiper="swiper_instance = $event"
                     @slide-change="active_tab_index = $event.activeIndex"
-                    v-show="Array.from(channelsStore.channels_list_with_pinned).length > 0">
-                    <SwiperSlide v-for="[channels_type, channels] in Array.from(channelsStore.channels_list_with_pinned)" :key="channels_type">
+                    v-show="channel_tabs.length > 0">
+                    <SwiperSlide v-for="[channels_type, channels] in channel_tabs" :key="channels_type">
                         <div class="channels" :class="`channels--tab-${channels_type} channels--length-${channels.length}`">
                             <router-link v-ripple class="channel" draggable="false"
                                 v-for="channel in channels" :key="channel.id" :to="`/tv/watch/${channel.display_channel_id}`">
@@ -100,7 +100,7 @@
                     </SwiperSlide>
                 </Swiper>
                 <div class="channels-list pinned-container d-flex justify-center align-center w-100" style="flex-grow: 1;"
-                    v-if="Array.from(channelsStore.channels_list_with_pinned).length === 0">
+                    v-if="channel_tabs.length === 0">
                     <div class="d-flex justify-center align-center flex-column">
                         <h2>視聴可能なチャンネルが<br class="d-sm-none">ありません。</h2>
                         <div class="mt-4 text-text-darken-1">前回チャンネルスキャンしたときに<br class="d-sm-none">受信可能なチャンネルを見つけられませんでした。</div>
@@ -155,6 +155,10 @@ export default defineComponent({
             // 現在アクティブなタブ
             active_tab_index: 0 as number,
 
+            // 実際のタブ要素から測定したアクセントの位置と幅
+            active_tab_offset: 0 as number,
+            active_tab_width: 0 as number,
+
             // Swiper のインスタンス
             swiper_instance: null as SwiperClass | null,
 
@@ -172,6 +176,10 @@ export default defineComponent({
     },
     computed: {
         ...mapStores(useChannelsStore, useSettingsStore),
+        // 表示順を含めたタブ一覧を1か所で保持し、タブとスライドの対応を常に一致させる
+        channel_tabs() {
+            return Array.from(this.channelsStore.channels_list_with_pinned);
+        },
     },
     watch: {
         active_tab_index() {
@@ -180,16 +188,23 @@ export default defineComponent({
             // 現在なアクティブなタブを Swiper 側に随時反映する
             // ローディング中のみスライドアニメーションを実行せずに即座に切り替える
             this.swiper_instance?.slideTo(this.active_tab_index, this.is_loading === true ? 0 : undefined);
+            this.updateActiveTabHighlight();
+        },
+        channel_tabs(channel_tabs) {
+            // 受信できる波の変化でタブが減った場合、存在しないindexを選択しないようにする
+            if (channel_tabs.length === 0) {
+                this.active_tab_index = 0;
+            } else if (this.active_tab_index >= channel_tabs.length) {
+                this.active_tab_index = channel_tabs.length - 1;
+            }
+            this.updateActiveTabHighlight();
         }
     },
     // 開始時に実行
     async mounted() {
 
-        // ピン留めされているチャンネルがないなら、タブを地デジタブに切り替える
-        // ピン留めができる事を示唆するためにピン留めタブ自体は残す
-        if (this.settingsStore.settings.pinned_channel_ids.length === 0) {
-            this.active_tab_index = 1;
-        }
+        // ピン留めがなければ地デジ、地デジもなければ最初に受信できる波を選ぶ
+        this.active_tab_index = this.getDefaultActiveTabIndex();
 
         // 00秒までの残り秒数を取得
         // 現在 16:01:34 なら 26 (秒) になる
@@ -210,11 +225,8 @@ export default defineComponent({
         // チャンネル情報を更新 (初回)
         await this.channelsStore.update();
 
-        // この時点でピン留めされているチャンネルがないなら、タブを地デジタブに切り替える
-        // ピン留めされているチャンネル自体はあるが、現在放送されていないため表示できない場合に備える
-        if (this.channelsStore.channels_list_with_pinned.get('ピン留め')?.length === 0) {
-            this.active_tab_index = 1;
-        }
+        // チャンネル更新後の実際のタブ構成から初期選択を決める
+        this.active_tab_index = this.getDefaultActiveTabIndex();
 
         // content-visibility: auto の指定の関係でうまく計算されないことがある Swiper の autoHeight を強制的に再計算する
         this.swiper_instance?.updateAutoHeight();
@@ -223,6 +235,13 @@ export default defineComponent({
         window.addEventListener('scroll', () => {
             this.swiper_instance?.updateAutoHeight();
         }, { passive: true, signal: this.scroll_abort_controller.signal });
+
+        // 画面幅の変更でタブ幅が変わっても、アクセントを実タブに合わせ直す
+        window.addEventListener('resize', () => {
+            this.updateActiveTabHighlight();
+        }, { passive: true, signal: this.scroll_abort_controller.signal });
+
+        this.updateActiveTabHighlight();
 
         // チャンネル情報の更新が終わったタイミングでローディング状態を解除する
         await Utils.sleep(0.01);  // 少し待たないとタブのハイライトがアニメーションされてしまう
@@ -261,10 +280,7 @@ export default defineComponent({
             // UI に変更を反映するため、意図的に指定チャンネルの ID が削除された配列を新しく作り再代入している
             this.settingsStore.settings.pinned_channel_ids = this.settingsStore.settings.pinned_channel_ids.filter((id) => id !== channel.id);
 
-            // この時点でピン留めされているチャンネルがないなら、タブを地デジタブに切り替える
-            if (this.channelsStore.channels_list_with_pinned.get('ピン留め')?.length === 0) {
-                this.active_tab_index = 1;
-            }
+            this.active_tab_index = this.getDefaultActiveTabIndex();
 
             // ピン留めを外したチャンネルを通知
             Message.show(`${channel.name}のピン留めを外しました。`);
@@ -273,6 +289,39 @@ export default defineComponent({
         // チャンネルがピン留めされているか
         isPinnedChannel(channel: ILiveChannel): boolean {
             return this.settingsStore.settings.pinned_channel_ids.includes(channel.id);
+        },
+
+        // タブ一覧の内容に応じた初期選択indexを返す
+        getDefaultActiveTabIndex(): number {
+            const pinned_tab_index = this.channel_tabs.findIndex(([channel_type, channels]) => {
+                return channel_type === 'ピン留め' && channels.length > 0;
+            });
+            if (pinned_tab_index >= 0) {
+                return pinned_tab_index;
+            }
+
+            const terrestrial_tab_index = this.channel_tabs.findIndex(([channel_type]) => channel_type === '地デジ');
+            if (terrestrial_tab_index >= 0) {
+                return terrestrial_tab_index;
+            }
+
+            const first_non_pinned_tab_index = this.channel_tabs.findIndex(([channel_type]) => channel_type !== 'ピン留め');
+            return first_non_pinned_tab_index >= 0 ? first_non_pinned_tab_index : 0;
+        },
+
+        // スクロールコンテナ内の実タブ要素を測定し、従来と同じアクセントを正しい位置へ移動する
+        updateActiveTabHighlight(): void {
+            this.$nextTick(() => {
+                const tab_buttons = this.$refs.channels_tab_buttons as HTMLElement | undefined;
+                const tab_button = tab_buttons?.querySelectorAll<HTMLElement>('.channels-tab__button')[this.active_tab_index];
+                if (tab_button === undefined) {
+                    this.active_tab_offset = 0;
+                    this.active_tab_width = 0;
+                    return;
+                }
+                this.active_tab_offset = tab_button.offsetLeft;
+                this.active_tab_width = tab_button.offsetWidth;
+            });
         }
     }
 });
@@ -297,7 +346,7 @@ export default defineComponent({
     &--loading {
         opacity: 0;
 
-        // ローディング中はタブのハイライトのアニメーションを無効にする
+        // ローディング中はタブのアクセントのアニメーションを無効にする
         .channels-tab__highlight {
             transition: none !important;
         }
@@ -358,6 +407,7 @@ export default defineComponent({
         }
 
         .channels-tab__buttons {
+            --tab-button-width: 98px;
             display: flex;
             position: relative;
             align-items: center;
@@ -368,11 +418,16 @@ export default defineComponent({
             overflow-x: auto;
             overflow-y: clip;
 
+            @include smartphone-vertical {
+                --tab-button-width: 90px;
+            }
+
             .channels-tab__button {
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                width: 98px;
+                flex: 0 0 var(--tab-button-width);
+                width: var(--tab-button-width);
                 height: 100%;
                 padding: 0;
                 border-radius: 2.5px;
@@ -386,7 +441,6 @@ export default defineComponent({
                     font-size: 15px;
                 }
                 @include smartphone-vertical {
-                    width: 90px;
                     font-size: 15px;
                 }
             }
@@ -395,13 +449,14 @@ export default defineComponent({
                 position: absolute;
                 left: 0;
                 bottom: 0;
-                width: calc(100% / var(--tab-length, 0));
+                width: var(--active-tab-width);
                 height: 3px;
                 background: rgb(var(--v-theme-primary));
-                transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.5, 1);
-                transform: translateX(calc(100% * var(--active-tab-index, 0)));
-                will-change: transform;
+                transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.5, 1), width 0.3s cubic-bezier(0.25, 0.8, 0.5, 1);
+                transform: translateX(var(--active-tab-offset));
+                will-change: transform, width;
             }
+
         }
     }
 

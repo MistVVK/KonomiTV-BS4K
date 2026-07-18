@@ -286,8 +286,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
 
     // ***** 設定 → 字幕 *****
 
-    // 字幕のフォント (Default: Windows TV 丸ゴシック)
-    caption_font: 'Windows TV MaruGothic',
+    // 字幕のフォント (Default: Rounded M+ 1m for ARIB)
+    caption_font: 'Rounded M+ 1m for ARIB',
     // 字幕の文字を常に縁取って描画する (Default: 常に縁取る)
     always_border_caption_text: true,
     // 字幕の不透明度を指定する (Default: 指定しない)
