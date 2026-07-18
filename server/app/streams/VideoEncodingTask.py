@@ -27,6 +27,7 @@ from app import logging
 from app.config import Config
 from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
 from app.schemas import KeyFrame
+from app.streams.RecordedEncodingCodecs import getVideoCodecDefinition
 from app.utils.TSKeyFrameSeeker import TSKeyFrameCollector
 
 
@@ -98,6 +99,7 @@ class VideoEncodingTask:
 
         # エンコードタスクのリトライ回数のカウント
         self._retry_count: int = 0
+        self._selected_audio_rendition: dict[str, str | int] | None = None
 
 
     def getEncodingProfile(self) -> VideoEncodingProfile:
@@ -116,6 +118,26 @@ class VideoEncodingTask:
             )
 
         return VideoEncodingProfile(name = 'Default')
+
+
+    def selectAudioRenditionForSequence(self, sequence: int) -> None:
+        """エンコーダー起動時点でmuxする音声1本を確定する。"""
+
+        self._selected_audio_rendition = self.video_stream.getEffectiveAudioRendition(sequence)
+
+
+    def getSelectedAudioInputTrackNumber(self) -> int | None:
+        """エンコーダー入力上の1始まり音声Track番号を返す。"""
+
+        if self._selected_audio_rendition is None:
+            return None
+        if self.video_stream.recorded_program.recorded_video.container_format == 'MPEG-TS':
+            # tsreadex -A 1 はDual Mono主副を別PIDへ分離するため、論理Track番号ではなく
+            # 出力レンディション順で選択する。
+            return next((index for index, rendition in enumerate(
+                self.video_stream.getAudioRenditions(), start=1,
+            ) if rendition['id'] == self._selected_audio_rendition['id']), 1)
+        return int(self._selected_audio_rendition['track_index'])
 
 
     def buildFFmpegOptions(self,
@@ -149,11 +171,31 @@ class VideoEncodingTask:
 
         # 入力
         ## -analyzeduration をつけることで、ストリームの分析時間を短縮できる
-        options.append(f'-f mpegts -analyzeduration {analyzeduration} -i pipe:0')
+        dual_mono_option = ''
+        probe_option = ''
+        if self._selected_audio_rendition is not None and self._selected_audio_rendition['channel'] in ['main', 'sub']:
+            # tsreadexは最初のAACフレーム解析後にDual Mono副音声PIDをPMTへ追加する。
+            # 短い解析ではFFmpegが主音声1本だけで入力を確定するため、Dual Mono時だけ十分に読む。
+            analyzeduration = max(analyzeduration, 10_000_000)
+            probe_option = '-probesize 20M '
+        if (
+            self.video_stream.recorded_program.recorded_video.container_format != 'MPEG-TS' and
+            self._selected_audio_rendition is not None and
+            self._selected_audio_rendition['channel'] in ['main', 'sub']
+        ):
+            dual_mono_option = f'-dual_mono_mode {self._selected_audio_rendition["channel"]} '
+        options.append(
+            f'-f mpegts -analyzeduration {analyzeduration} {probe_option}{dual_mono_option}-i pipe:0'
+        )
 
-        # ストリームのマッピング
-        ## 音声切り替えのため、主音声・副音声両方をエンコード後の TS に含む
-        options.append('-map 0:v:0 -map 0:a:0 -map 0:a:1 -map 0:d? -ignore_unknown')
+        # 映像と選択音声1本を同じプロセス・タイムラインでエンコードする。
+        options.append('-map 0:v:0 -map 0:d? -ignore_unknown')
+        if self._selected_audio_rendition is not None:
+            input_track_number = self.getSelectedAudioInputTrackNumber()
+            assert input_track_number is not None
+            track_index = input_track_number - 1
+            options.append(f'-map 0:a:{track_index}?')
+            options.append('-c:a aac -b:a 192k -ar 48000')
 
         # フラグ
         ## 主に FFmpeg の起動を高速化するための設定
@@ -172,15 +214,13 @@ class VideoEncodingTask:
 
         # 映像
         ## コーデック
-        if QUALITY[quality].is_hevc is True:
-            options.append('-vcodec libx265')  # H.265/HEVC (通信節約モード)
-        else:
-            options.append('-vcodec libx264')  # H.264
+        video_codec = getVideoCodecDefinition(self.video_stream.encoding_options.video_codec)
+        options.append(f'-vcodec {video_codec.ffmpeg_encoder}')
 
         ## ビットレートと品質
         options.append(f'-flags +cgop+global_header -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
         options.append('-preset veryfast -aspect 16:9 -pix_fmt:v yuv420p')
-        if QUALITY[quality].is_hevc is True:
+        if self.video_stream.encoding_options.video_codec == 'hevc':
             options.append('-profile:v main')
         else:
             options.append('-profile:v high')
@@ -196,15 +236,8 @@ class VideoEncodingTask:
         ):
             video_width = 1920
 
-        ## BS4K/BS8K 録画は 60p (プログレッシブ) 前提で扱い、24fps/インターレース解除フィルタを使わない
-        if encoding_profile.is_bs4k is True:
-            options.append(f'-vf scale={video_width}:{video_height}')
-            if '-30fps' in quality:
-                options.append(f'-r 30000/1001 -g {int(self.GOP_LENGTH_SECOND * 30)}')
-            else:
-                options.append(f'-r 60000/1001 -g {int(self.GOP_LENGTH_SECOND * 60)}')
-        ## インターレース映像のみ
-        elif self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
+        # DBの解析結果だけをインターレース解除の判断元にする。BS4K/BS8Kも例外扱いしない。
+        if self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
             ## インターレース解除 (60i → 60p (フレームレート: 60fps))
             if QUALITY[quality].is_60fps is True:
                 options.append(f'-vf yadif=mode=1:parity=-1:deint=1,scale={video_width}:{video_height}')
@@ -222,13 +255,14 @@ class VideoEncodingTask:
         ## プログレッシブ映像
         ## プログレッシブ映像の場合は 60fps 化する方法はないため、無視して入力ファイルと同じ fps でエンコードする
         elif self.video_stream.recorded_program.recorded_video.video_scan_type == 'Progressive':
-            int_fps = math.ceil(self.video_stream.recorded_program.recorded_video.video_frame_rate)  # 29.97 -> 30
+            int_fps = math.ceil(self.video_stream.recorded_program.recorded_video.video_frame_rate or 30)  # 29.97 -> 30
             options.append(f'-vf scale={video_width}:{video_height}')
             options.append(f'-g {int(self.GOP_LENGTH_SECOND * int_fps)}')
-
-        # 音声
-        ## 実在する音声トラックをすべて保持するため、FFmpeg 側では音声をコピーする
-        options.append('-map 0:v:0 -map 0:a? -map 0:d? -acodec copy')
+        else:
+            int_fps = math.ceil(self.video_stream.recorded_program.recorded_video.video_frame_rate or 30)
+            logging.warning(f'{self.video_stream.log_prefix} video_scan_type is unknown; deinterlace is disabled.')
+            options.append(f'-vf scale={video_width}:{video_height}')
+            options.append(f'-g {int(self.GOP_LENGTH_SECOND * int_fps)}')
 
         # 出力 TS のタイムスタンプオフセット
         options.append(f'-output_ts_offset {output_ts_offset}')
@@ -295,9 +329,8 @@ class VideoEncodingTask:
         else:
             options.append('--avhw')
 
-        # ストリームのマッピング
-        ## 実在する音声トラックをすべて保持するため、HWEncC 側では音声をコピーする
-        options.append('--audio-copy --data-copy timed_id3')
+        # 映像レンディションには音声を含めず、TS字幕由来の timed ID3 だけを保持する
+        options.append('--data-copy timed_id3')
 
         # フラグ
         ## 主に HWEncC の起動を高速化するための設定
@@ -328,22 +361,33 @@ class VideoEncodingTask:
 
         # 映像
         ## コーデック
-        if QUALITY[quality].is_hevc is True:
-            options.append('--codec hevc')  # H.265/HEVC (通信節約モード)
-        else:
-            options.append('--codec h264')  # H.264
+        video_codec = getVideoCodecDefinition(self.video_stream.encoding_options.video_codec)
+        options.append(f'--codec {video_codec.hwenc_codec}')
+
+        # HWEncCでも選択音声1本だけを映像と同じ出力へAAC化する。
+        if self._selected_audio_rendition is not None:
+            track_index = self.getSelectedAudioInputTrackNumber()
+            assert track_index is not None
+            options.append(
+                f'--audio-codec {track_index}?aac --audio-bitrate {track_index}?192 '
+                f'--audio-samplerate {track_index}?48000'
+            )
+            if self._selected_audio_rendition['channel'] == 'main':
+                options.append(f'--audio-stream {track_index}?FL:stereo')
+            elif self._selected_audio_rendition['channel'] == 'sub':
+                options.append(f'--audio-stream {track_index}?FR:stereo')
 
         ## ビットレート
         ## H.265/HEVC かつ QSVEncC の場合のみ、--qvbr (品質ベース可変ビットレート) モードでエンコードする
         ## それ以外は --vbr (可変ビットレート) モードでエンコードする
-        if QUALITY[quality].is_hevc is True and encoder_type == 'QSVEncC':
+        if self.video_stream.encoding_options.video_codec == 'hevc' and encoder_type == 'QSVEncC':
             options.append(f'--qvbr {QUALITY[quality].video_bitrate} --fallback-rc')
         else:
             options.append(f'--vbr {QUALITY[quality].video_bitrate}')
         options.append(f'--max-bitrate {QUALITY[quality].video_bitrate_max}')
 
         ## H.265/HEVC の高圧縮化調整
-        if QUALITY[quality].is_hevc is True:
+        if self.video_stream.encoding_options.video_codec == 'hevc':
             if encoder_type == 'QSVEncC':
                 options.append('--qvbr-quality 20 --extbrc --mbbrc --scenario-info game_streaming --tune perceptual')
                 options.append('--i-adapt --b-adapt --b-pyramid --weightp --weightb --adapt-ref --adapt-ltr --adapt-cqm')
@@ -372,7 +416,7 @@ class VideoEncodingTask:
             options.append('--preset balanced')
         elif encoder_type == 'rkmppenc':
             options.append('--preset best')
-        if QUALITY[quality].is_hevc is True:
+        if self.video_stream.encoding_options.video_codec == 'hevc':
             options.append('--profile main')
         else:
             options.append('--profile high')
@@ -385,18 +429,11 @@ class VideoEncodingTask:
         ## (VCEEncC は HEVC 10bit 対応の機種かを判定できず、rkmppenc は HEVC 10bit エンコード自体に非対応のため設定しない)
         ## --fallback-bitdepth により、GPU 側が HEVC 10bit 非対応の場合でも 8bit へフォールバックされる
         ## 末尾の -10bit は、HEVC 10bit でのエンコードを試すストリームであることだけを表す
-        if QUALITY[quality].is_hevc is True and self.video_stream.encoding_options.is_hevc_10bit_enabled is True:
+        if self.video_stream.encoding_options.video_codec == 'hevc' and self.video_stream.encoding_options.is_hevc_10bit_enabled is True:
             options.append('--output-depth 10 --fallback-bitdepth')
 
-        ## BS4K/BS8K 録画は 60p (プログレッシブ) 前提で扱い、24fps/インターレース解除フィルタを使わない
-        if encoding_profile.is_bs4k is True:
-            if '-30fps' in quality:
-                options.append('--vpp-decimate cycle=2,drop=1')
-                options.append(f'--avsync vfr --gop-len {int(self.GOP_LENGTH_SECOND * 30)}')
-            else:
-                options.append(f'--avsync vfr --gop-len {int(self.GOP_LENGTH_SECOND * 60)}')
-        ## インターレース映像のみ
-        elif self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
+        # DBの解析結果だけをインターレース解除の判断元にする。BS4K/BS8Kも例外扱いしない。
+        if self.video_stream.recorded_program.recorded_video.video_scan_type == 'Interlaced':
             # インターレース映像として読み込む
             options.append('--interlace tff')
             ## インターレース解除 (60i → 60p (フレームレート: 60fps))
@@ -431,7 +468,11 @@ class VideoEncodingTask:
         ## プログレッシブ映像
         ## プログレッシブ映像の場合は 60fps 化する方法はないため、無視して入力ファイルと同じ fps でエンコードする
         elif self.video_stream.recorded_program.recorded_video.video_scan_type == 'Progressive':
-            int_fps = math.ceil(self.video_stream.recorded_program.recorded_video.video_frame_rate)  # 29.97 -> 30
+            int_fps = math.ceil(self.video_stream.recorded_program.recorded_video.video_frame_rate or 30)  # 29.97 -> 30
+            options.append(f'--avsync vfr --gop-len {int(self.GOP_LENGTH_SECOND * int_fps)}')
+        else:
+            int_fps = math.ceil(self.video_stream.recorded_program.recorded_video.video_frame_rate or 30)
+            logging.warning(f'{self.video_stream.log_prefix} video_scan_type is unknown; deinterlace is disabled.')
             options.append(f'--avsync vfr --gop-len {int(self.GOP_LENGTH_SECOND * int_fps)}')
 
         ## 指定された品質の解像度が 1440×1080 (1080p) かつ入力ストリームがフル HD (1920×1080) の場合のみ、
@@ -445,10 +486,6 @@ class VideoEncodingTask:
         ):
             video_width = 1920
         options.append(f'--output-res {video_width}x{video_height}')
-
-        # 音声
-        ## --audio-copy により元 TS の実在音声を保持する。ここでは downmix / resample / 音量補正を行わない。
-        options.append('--audio-ignore-decode-error 30')
 
         # 出力 TS のタイムスタンプオフセット
         options.append(f'-m output_ts_offset:{output_ts_offset}')
@@ -501,14 +538,21 @@ class VideoEncodingTask:
             )
             ENCODER_TYPE = 'FFmpeg'
 
-        # 新しいエンコードタスクを起動させた時点で既にエンコード済みのセグメントは使えなくなるので、すべてリセットする
-        for segment in self.video_stream.segments:
-            if segment.encode_status != 'Pending':
-                await segment.resetState()
-
         # 処理対象の VideoStreamSegment を取得し、エンコード中状態に設定
         current_sequence = start_sequence
         current_segment: VideoStreamSegment = self.video_stream.segments[current_sequence]
+        self.selectAudioRenditionForSequence(current_sequence)
+        # HWEncCは第2音声以降を個別指定した際、映像との先頭PTSが数秒ずれる入力がある。
+        # 通常のTrack 1以外とDual Mono主副はFFmpegで映像・音声を同時処理し、同期を優先する。
+        if self._selected_audio_rendition is not None and ENCODER_TYPE != 'FFmpeg' and (
+            int(self._selected_audio_rendition['track_index']) > 1 or
+            self._selected_audio_rendition['channel'] in ['main', 'sub']
+        ):
+            logging.info(
+                f'{self.video_stream.log_prefix} FFmpeg will be used for selected audio synchronization. '
+                f'[rendition: {self._selected_audio_rendition["id"]}]'
+            )
+            ENCODER_TYPE = 'FFmpeg'
         current_segment.encode_status = 'Encoding'
         logging.info(f'{self.video_stream.log_prefix}[Segment {current_sequence}] Starting the Encoder...')
 
@@ -1343,6 +1387,14 @@ class VideoEncodingTask:
                                     current_segment.encode_status = 'Encoding'
                                     encoded_segment = bytearray()
                                     is_split_pending = False
+                                    # hls.jsの要求より大幅に先行すると、シーク先とは無関係な範囲を
+                                    # 録画末尾までエンコードし続ける。3セグメント分だけ先行生成し、
+                                    # 新しい要求またはキャンセルを待つ。
+                                    while (
+                                        current_sequence > self.video_stream.latest_requested_sequence + 3 and
+                                        self._is_cancelled is False
+                                    ):
+                                        await asyncio.sleep(0.05)
                                     # セグメント切り替えのタイミングで、蓄積されたキーフレーム情報の保存を試みる
                                     ## バッチ閾値に達していなければ何もせずに返る
                                     await FlushCollectedSegmentMap()
@@ -1465,10 +1517,10 @@ class VideoEncodingTask:
 
                 # この時点で video_pid と audio_pid が取得できていない場合、正常にエンコード済み TS が出力されていないと考えられるため、
                 # エンコーダー起動をリトライする
-                if video_pid is None or audio_pid is None:
+                if video_pid is None:
                     self._retry_count += 1
                     if self._retry_count < self.MAX_RETRY_COUNT:
-                        logging.warning(f'{self.video_stream.log_prefix} Failed to get video/audio PID. Retrying... ({self._retry_count}/{self.MAX_RETRY_COUNT})')
+                        logging.warning(f'{self.video_stream.log_prefix} Failed to get video PID. Retrying... ({self._retry_count}/{self.MAX_RETRY_COUNT})')
                         # リトライする理由をログから追えるよう、失敗した試行の stderr を必ず警告ログとして出力する
                         if current_encoder_stderr_lines is not None:
                             DumpEncoderStderr(current_encoder_stderr_lines, is_warning = True)

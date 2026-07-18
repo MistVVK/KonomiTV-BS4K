@@ -736,7 +736,10 @@ class LiveEncodingTask:
         else:
 
             # オプションを取得
-            encoder_options = self.buildHWEncCOptions(self.live_stream.quality, ENCODER_TYPE, channel.type, is_fullhd_channel)
+            hw_encoder_type = cast(Literal['QSVEncC', 'NVEncC', 'VCEEncC', 'rkmppenc'], ENCODER_TYPE)
+            encoder_options = self.buildHWEncCOptions(
+                self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
+            )
             logging.info(f'{self.live_stream.log_prefix} {ENCODER_TYPE} Commands:\n{ENCODER_TYPE} {" ".join(encoder_options)}')
 
             # エンコーダープロセスを非同期で作成・実行

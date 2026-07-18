@@ -14,7 +14,9 @@ from app.streams.StreamEncodingOptions import (
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
 )
+from app.streams.RecordedEncodingCodecs import AudioCodec, VideoCodec
 from app.streams.VideoStream import VideoStream
+from app.streams.RecordedEncodingCodecs import getAudioCodecDefinition
 
 
 # ルーター
@@ -44,6 +46,9 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
 async def ValidateQuality(
     quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    video_codec: Annotated[VideoCodec | None, Query(description='出力映像コーデック。省略時は旧画質URLから判定。')] = None,
+    audio_codec: Annotated[AudioCodec, Query(description='出力音声コーデック。')] = 'aac',
+    audio_track: Annotated[str | None, Query(description='映像と多重化する音声レンディション ID。')] = None,
 ) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
 
@@ -54,6 +59,9 @@ async def ValidateQuality(
         quality,
         Config().general.encoder_bs4k if is_bs4k_recorded_video is True else None,
         is_24fps_mode_allowed = is_bs4k_recorded_video is False,
+        video_codec = video_codec,
+        audio_codec = audio_codec,
+        audio_rendition_id = audio_track,
     )
     if stream_quality is None:
         logging.error(f'[VideoStreamsRouter][ValidateQuality] Specified quality was not found. [quality: {quality}]')
@@ -96,8 +104,8 @@ async def VideoHLSPlaylistAPI(
         is_new_session_allowed = True,
     )
 
-    # 仮想 HLS M3U8 プレイリストを取得
-    virtual_playlist = video_stream.getVirtualPlaylist(cache_key)
+    # 映像と選択音声を同じ MPEG-TS に多重化した HLS プレイリストを取得
+    virtual_playlist = video_stream.getMasterPlaylist(cache_key)
     return Response(
         content = virtual_playlist,
         media_type = 'application/vnd.apple.mpegurl',
@@ -105,6 +113,121 @@ async def VideoHLSPlaylistAPI(
             'Cache-Control': 'max-age=0',
         },
     )
+
+
+@router.get('/{video_id}/{quality}/video/playlist', response_class=Response)
+async def VideoHLSVideoPlaylistAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    return Response(
+        content=video_stream.getVirtualPlaylist(cache_key),
+        media_type='application/vnd.apple.mpegurl',
+        headers={'Cache-Control': 'max-age=0'},
+    )
+
+
+@router.get('/{video_id}/{quality}/video/segment', response_class=Response)
+async def VideoHLSVideoSegmentAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    sequence: Annotated[int, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+    request_generation: Annotated[int | None, Query()] = None,
+):
+    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    segment_data = await video_stream.getMuxedSegment(sequence, request_generation)
+    if segment_data is None:
+        raise HTTPException(status_code=422, detail='Video segment was not found')
+    return Response(content=segment_data, media_type='video/mp2t', headers={'Cache-Control': 'max-age=10800'})
+
+
+@router.get('/{video_id}/{quality}/audio/{rendition_id}/playlist', response_class=Response)
+async def VideoHLSAudioPlaylistAPI(
+    rendition_id: str,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    return Response(
+        content=video_stream.getAudioPlaylist(rendition_id, cache_key),
+        media_type='application/vnd.apple.mpegurl',
+        headers={'Cache-Control': 'max-age=0'},
+    )
+
+
+@router.get('/{video_id}/{quality}/audio/{rendition_id}/segment', response_class=Response)
+async def VideoHLSAudioSegmentAPI(
+    rendition_id: str,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    sequence: Annotated[int, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+    request_generation: Annotated[int | None, Query()] = None,
+):
+    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    segment_data = await video_stream.getAudioSegment(rendition_id, sequence, request_generation)
+    if segment_data is None:
+        raise HTTPException(status_code=422, detail='Audio segment was not found')
+    return Response(
+        content=segment_data,
+        media_type=getAudioCodecDefinition(video_stream.encoding_options.audio_codec).mime_type,
+        headers={'Cache-Control': 'max-age=10800'},
+    )
+
+
+@router.get('/{video_id}/{quality}/audio/{rendition_id}/init', response_class=Response)
+async def VideoHLSAudioInitSegmentAPI(
+    rendition_id: str,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    sequence: Annotated[int, Query()] = 0,
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    init_segment = await video_stream.getAudioInitSegment(rendition_id, sequence)
+    if init_segment is None:
+        raise HTTPException(status_code=422, detail='Audio initialization segment was not found')
+    return Response(content=init_segment, media_type='audio/mp4', headers={'Cache-Control': 'max-age=10800'})
+
+
+@router.get('/{video_id}/{quality}/subtitle/{subtitle_index}/playlist', response_class=Response)
+async def VideoHLSSubtitlePlaylistAPI(
+    subtitle_index: int,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    return Response(
+        content=video_stream.getSubtitlePlaylist(subtitle_index, cache_key),
+        media_type='application/vnd.apple.mpegurl',
+        headers={'Cache-Control': 'max-age=0'},
+    )
+
+
+@router.get('/{video_id}/{quality}/subtitle/{subtitle_index}/segment', response_class=Response)
+async def VideoHLSSubtitleSegmentAPI(
+    subtitle_index: int,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
+    segment_data = await video_stream.getSubtitleSegment(subtitle_index)
+    if segment_data is None:
+        raise HTTPException(status_code=422, detail='Subtitle segment was not found')
+    return Response(content=segment_data, media_type='text/vtt', headers={'Cache-Control': 'max-age=10800'})
 
 
 @router.get(
@@ -135,7 +258,7 @@ async def VideoHLSSegmentAPI(
     video_stream = VideoStream(session_id, recorded_program, stream_quality.quality, stream_quality.encoding_options)
 
     # セグメントを取得（キャッシュキーはブラウザキャッシュ避けのための ID なので特に使わない）
-    segment_data = await video_stream.getSegment(sequence)
+    segment_data = await video_stream.getMuxedSegment(sequence)
     if segment_data is None:
         logging.error(
             f'{video_stream.log_prefix} Specified sequence segment was not found. '

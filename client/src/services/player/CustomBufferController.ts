@@ -11,11 +11,20 @@ import Hls, { BufferController, FragmentTracker } from 'hls.js';
 // @ts-ignore
 class CustomBufferController extends BufferController {
 
+    // セグメント要求へ付与するシーク世代番号
+    // stopLoad() より前に開始済みだった古い要求をサーバー側で識別するために使う
+    private static requestGeneration: number = 0;
+
+    public static getRequestGeneration(): number {
+        return CustomBufferController.requestGeneration;
+    }
+
+    private static advanceRequestGeneration(): void {
+        CustomBufferController.requestGeneration += 1;
+    }
+
     // バッファフラッシュ時のイベントハンドラー（独自）
     private onCustomBufferFlushingHandler: () => void;
-
-    // バッファフラッシュを抑制するフラグ
-    private dontFlush: boolean = false;
 
     // SSE の EventSource インスタンス
     private sse: EventSource | null = null;
@@ -23,27 +32,24 @@ class CustomBufferController extends BufferController {
     // サーバーからのバッファ範囲情報
     private serverBufferingRange: { begin: number, end: number } | null = null;
 
+    // 初回fragment取得前のレジュームシークを独自処理で中断しないための状態
+    private isInitialFragmentBuffered: boolean = false;
+
+    // バッファ削除完了待ちの間に連続シークされた場合、最後の位置だけを採用する
+    private isSeekRestartInProgress: boolean = false;
+    private pendingSeekPosition: number | null = null;
+    private seekDebounceTimerId: ReturnType<typeof setTimeout> | null = null;
+    private seekRestartTimeoutId: ReturnType<typeof setTimeout> | null = null;
 
     constructor(hls: Hls, fragmentTracker: FragmentTracker) {
         super(hls, fragmentTracker);
         this.onCustomBufferFlushingHandler = this.onCustomBufferFlushing.bind(this);
-        this.dontFlush = false;
+        this.isInitialFragmentBuffered = false;
+        this.isSeekRestartInProgress = false;
+        this.pendingSeekPosition = null;
+        this.seekDebounceTimerId = null;
+        this.seekRestartTimeoutId = null;
     }
-
-
-    /**
-     * バッファリセット時のイベントハンドラー（上書き）
-     */
-    protected onBufferReset(): void {
-        if (this.dontFlush) {
-            this.dontFlush = false;
-            return;
-        }
-        // 親クラスの onBufferReset を呼び出す
-        // @ts-ignore
-        super.onBufferReset();
-    }
-
 
     /**
      * メディアアタッチ時のイベントハンドラー（上書き）
@@ -57,13 +63,23 @@ class CustomBufferController extends BufferController {
         const hls: Hls = this.hls;
         // @ts-ignore
         const media: HTMLMediaElement = this.media;
-        // seeking イベントのリスナーを登録
+        // PlayerController の再初期化前に残っていた要求と、新しい再生セッションの要求を分離する
+        CustomBufferController.advanceRequestGeneration();
+        // 録画VODのシークはhls.js標準処理に任せる。
+        // 独自の全バッファ破棄やマニフェスト再読み込みは、代替音声のロード状態を壊す。
         media.addEventListener('seeking', this.onCustomBufferFlushingHandler);
-        // SSE の接続を開始
-        this.sse = new EventSource(hls.url!.replace('playlist', 'buffer'));
-        this.sse.addEventListener('buffer_range_update', (event) => {
-            this.serverBufferingRange = JSON.parse(event.data);
-            console.log('[CustomBufferController] Updated Server Buffering Range:', this.serverBufferingRange);
+        hls.once(Hls.Events.FRAG_BUFFERED, () => {
+            this.isInitialFragmentBuffered = true;
+        });
+        // マスタープレイリストAPIが録画セッションを作成した後にSSEへ接続する。
+        // media attach直後では/bufferが先着して422となり、不要な再接続が発生する。
+        hls.once(Hls.Events.MANIFEST_PARSED, () => {
+            if (this.sse !== null || hls.url == null) return;
+            this.sse = new EventSource(hls.url.replace('playlist', 'buffer'));
+            this.sse.addEventListener('buffer_range_update', (event) => {
+                this.serverBufferingRange = JSON.parse(event.data);
+                console.log('[CustomBufferController] Updated Server Buffering Range:', this.serverBufferingRange);
+            });
         });
     }
 
@@ -72,11 +88,16 @@ class CustomBufferController extends BufferController {
      * メディアデタッチ時のイベントハンドラー（上書き）
      */
     protected onMediaDetaching(): void {
-        // HTMLMediaElement を取得
         // @ts-ignore
         const media: HTMLMediaElement = this.media;
-        // seeking イベントのリスナーを削除
         media.removeEventListener('seeking', this.onCustomBufferFlushingHandler);
+        this.isInitialFragmentBuffered = false;
+        this.isSeekRestartInProgress = false;
+        this.pendingSeekPosition = null;
+        if (this.seekDebounceTimerId !== null) clearTimeout(this.seekDebounceTimerId);
+        if (this.seekRestartTimeoutId !== null) clearTimeout(this.seekRestartTimeoutId);
+        this.seekDebounceTimerId = null;
+        this.seekRestartTimeoutId = null;
         // SSE の接続を終了
         if (this.sse) {
             this.sse.close();
@@ -98,6 +119,7 @@ class CustomBufferController extends BufferController {
         // @ts-ignore
         const media: HTMLMediaElement = this.media;
         if (!media) return;
+        if (this.isInitialFragmentBuffered === false) return;
 
         // シーク位置がバッファの範囲内かチェック
         let isInBufferedRange = false;
@@ -112,35 +134,69 @@ class CustomBufferController extends BufferController {
                 break;
             }
         }
-        // サーバー側のバッファ範囲をチェック
-        if (this.serverBufferingRange &&
-            media.currentTime >= this.serverBufferingRange.begin &&
-            media.currentTime <= this.serverBufferingRange.end) {
-            isInBufferedRange = true;
-        }
+        // サーバー側に生成済みでもMSEへappendされているとは限らないため、
+        // シーク再配置の判定にはHTMLMediaElementのbufferedだけを使う。
         // 再生が終了しているかチェック
         if (media.currentTime >= duration - 0.5) {  // 0.5秒の余裕を持たせる
             isAtEnd = true;
         }
 
-        // バッファ範囲外かつ再生終了でない場合のみフラッシュとマニフェストの再読み込みを実行
+        // バッファ範囲外では同じHLSセッションのローダーだけをシーク位置へ再配置する。
+        // マスターや代替音声プレイリストを再読み込みせず、選択Trackも維持する。
         console.log('[CustomBufferController] Server Buffering Range:', this.serverBufferingRange, 'Current Time:', media.currentTime);
-        if (!isInBufferedRange && !isAtEnd) {
-            console.log('[CustomBufferController] Flushing Buffer...');
-            hls.trigger(Hls.Events.BUFFER_FLUSHING, {
-                startOffset: 0,
-                endOffset: Number.POSITIVE_INFINITY,
-                type: null,
-            });
-            this.dontFlush = true;
-            // マニフェストの再読み込み
-            // URL のクエリパラメータを解析し、cache_key を更新または追加
-            // セッション ID を生成 (セッション ID は UUID の - で区切って一番左側のみを使う)
-            const url = new URL(hls.url!);
-            url.searchParams.set('cache_key', crypto.randomUUID().split('-')[0]);
-            hls.trigger(Hls.Events.MANIFEST_LOADING, {
-                url: url.toString()
-            });
+        if ((!isInBufferedRange && !isAtEnd) || this.isSeekRestartInProgress) {
+            this.pendingSeekPosition = media.currentTime;
+            CustomBufferController.advanceRequestGeneration();
+
+            // hls.js の標準シーク処理がデバウンス中の位置を取得し始めないよう、最初のイベントで即座に止める。
+            // 以降の seeking イベントでは pendingSeekPosition だけを更新し、最後の位置から再開する。
+            if (this.isSeekRestartInProgress === false) {
+                this.isSeekRestartInProgress = true;
+                hls.stopLoad();
+            }
+
+            // 既に SourceBuffer の削除を開始している場合は、完了時に最新の pendingSeekPosition が使われる。
+            if (this.seekRestartTimeoutId !== null) return;
+            if (this.seekDebounceTimerId !== null) clearTimeout(this.seekDebounceTimerId);
+            this.seekDebounceTimerId = setTimeout(() => {
+                this.seekDebounceTimerId = null;
+                console.log('[CustomBufferController] Restarting HLS loaders at seek position...');
+                hls.stopLoad();
+
+                // BUFFER_FLUSHED は SourceBuffer ごとに発火するため、映像・音声の両方を待つ。
+                // 片方だけ削除された時点で startLoad() すると、旧音声と新映像が混在して再生が停止する。
+                // @ts-ignore hls.js の tracks は private だが、カスタム BufferController 内では実体を参照できる
+                const expectedBufferTypes = new Set<string>(Object.entries(this.tracks ?? {})
+                    .filter(([, track]: [string, any]) => track?.buffer != null)
+                    .map(([type]) => type));
+                const flushedBufferTypes = new Set<string>();
+
+                const finishRestart = () => {
+                    if (this.isSeekRestartInProgress === false) return;
+                    if (this.seekRestartTimeoutId !== null) clearTimeout(this.seekRestartTimeoutId);
+                    this.seekRestartTimeoutId = null;
+                    hls.off(Hls.Events.BUFFER_FLUSHED, onBufferFlushed);
+                    const seekPosition = this.pendingSeekPosition ?? media.currentTime;
+                    this.pendingSeekPosition = null;
+                    this.isSeekRestartInProgress = false;
+                    hls.startLoad(seekPosition);
+                };
+
+                const onBufferFlushed = (_event: string, data: { type?: string }) => {
+                    if (data.type != null) flushedBufferTypes.add(data.type);
+                    if ([...expectedBufferTypes].every(type => flushedBufferTypes.has(type))) {
+                        finishRestart();
+                    }
+                };
+                hls.on(Hls.Events.BUFFER_FLUSHED, onBufferFlushed);
+                // 空バッファなどでBUFFER_FLUSHEDが発火しない場合も停止状態を残さない。
+                this.seekRestartTimeoutId = setTimeout(finishRestart, 3000);
+                hls.trigger(Hls.Events.BUFFER_FLUSHING, {
+                    startOffset: 0,
+                    endOffset: Number.POSITIVE_INFINITY,
+                    type: null,
+                });
+            }, 300);
         }
     }
 }

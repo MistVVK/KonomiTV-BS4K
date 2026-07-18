@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from app.config import Config
 from app.constants import QUALITY, QUALITY_TYPES
+from app.streams.RecordedEncodingCodecs import AudioCodec, VideoCodec
 
 
 def GetEncoderForLiveChannel(display_channel_id: str) -> str:
@@ -42,6 +43,14 @@ class StreamEncodingOptions:
     ## 1080p-60fps では 60fps 化を優先し、24fps モードの要求があってもここでは無効にする
     is_24fps_mode_enabled: bool = False
 
+    # 録画HLSの出力コーデック。ライブでは既存画質から導出した既定値を使用する。
+    video_codec: VideoCodec = 'avc'
+    audio_codec: AudioCodec = 'aac'
+
+    # 録画再生で映像と一緒に多重化する音声レンディション ID
+    # 例: 1, 2, 1-main, 1-sub。None は先頭の利用可能な音声を表す。
+    audio_rendition_id: str | None = None
+
     @classmethod
     def fromRequest(
         cls,
@@ -50,6 +59,9 @@ class StreamEncodingOptions:
         is_24fps_mode_requested: bool,
         encoder: str | None = None,
         is_24fps_mode_allowed: bool = True,
+        video_codec: VideoCodec | None = None,
+        audio_codec: AudioCodec = 'aac',
+        audio_rendition_id: str | None = None,
     ) -> StreamEncodingOptions:
         """
         API で指定されたオプションから、実際に使うストリームオプションを作る
@@ -70,9 +82,10 @@ class StreamEncodingOptions:
 
         # HEVC 10bit は通信節約モードで使う HEVC 画質かつ QSVEncC / NVEncC の場合だけ有効化する
         ## VCEEncC は HEVC 10bit 対応の機種かを判定できず、rkmppenc は HEVC 10bit エンコード自体に非対応のため設定しない
+        resolved_video_codec: VideoCodec = video_codec or ('hevc' if QUALITY[quality].is_hevc else 'avc')
         is_hevc_10bit_enabled = (
             is_hevc_10bit_requested is True and
-            QUALITY[quality].is_hevc is True and
+            resolved_video_codec == 'hevc' and
             encoder in ['QSVEncC', 'NVEncC']
         )
 
@@ -87,6 +100,9 @@ class StreamEncodingOptions:
         return cls(
             is_hevc_10bit_enabled = is_hevc_10bit_enabled,
             is_24fps_mode_enabled = is_24fps_mode_enabled,
+            video_codec = resolved_video_codec,
+            audio_codec = audio_codec,
+            audio_rendition_id = audio_rendition_id,
         )
 
     def buildSuffix(self) -> str:
@@ -133,6 +149,9 @@ def SplitQualityAndEncodingOptions(
     quality: str,
     encoder: str | None = None,
     is_24fps_mode_allowed: bool = True,
+    video_codec: VideoCodec | None = None,
+    audio_codec: AudioCodec = 'aac',
+    audio_rendition_id: str | None = None,
 ) -> StreamQualityWithOptions | None:
     """
     API パスの品質指定 (例: 720p-hevc-10bit-24fps) を、ベース画質 (720p-hevc) と追加オプション (-10bit / -24fps) に分解する
@@ -159,6 +178,14 @@ def SplitQualityAndEncodingOptions(
         base_quality = base_quality[:-len('-10bit')]
         is_hevc_10bit_requested = True
 
+    # 旧URLでは映像コーデックが画質名の -hevc 接尾辞に埋め込まれている。
+    # 明示クエリがある場合はそちらを優先し、内部の既存QUALITYキーへ正規化する。
+    legacy_video_codec: VideoCodec = 'hevc' if base_quality.endswith('-hevc') else 'avc'
+    resolved_video_codec = video_codec or legacy_video_codec
+    quality_without_codec = base_quality[:-len('-hevc')] if base_quality.endswith('-hevc') else base_quality
+    normalized_quality = f'{quality_without_codec}-hevc' if resolved_video_codec == 'hevc' else quality_without_codec
+    base_quality = normalized_quality
+
     # ベース画質が QUALITY に存在しない場合は、ルーター側で従来通り 422 を返す
     if base_quality not in QUALITY:
         return None
@@ -171,6 +198,9 @@ def SplitQualityAndEncodingOptions(
         is_24fps_mode_requested,
         encoder,
         is_24fps_mode_allowed,
+        resolved_video_codec,
+        audio_codec,
+        audio_rendition_id,
     )
     return StreamQualityWithOptions(
         quality = base_quality,

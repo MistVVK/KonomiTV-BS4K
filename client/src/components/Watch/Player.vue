@@ -333,6 +333,9 @@ const handleSettingCoverClick = () => {
     }
     .dplayer-setting-box {
         z-index: 10 !important;
+        // 長い音声トラック名（言語・Dual Mono・主副音声）が途中で切れないようにする
+        width: 280px;
+        max-width: calc(100% - 40px);
         @include tablet-vertical {
             height: calc(100% - 60px) !important;
         }
@@ -350,9 +353,11 @@ const handleSettingCoverClick = () => {
             }
         }
         .dplayer-setting-audio-panel {
-            // 配信 TS に実在しない音声トラックは、状態表示用の先頭行を除いて表示しない
+            // 現在位置に存在しない音声も録画全体の候補として残し、選択不能であることを示す
             .dplayer-setting-audio-item.dplayer-setting-audio-item--disabled:not(.dplayer-setting-audio-item--status) {
-                display: none;
+                cursor: default;
+                opacity: 0.45;
+                pointer-events: none;
             }
             // 「音声不明」「音声なし」は選択できない状態表示として扱う
             .dplayer-setting-audio-item.dplayer-setting-audio-item--status {
@@ -363,6 +368,29 @@ const handleSettingCoverClick = () => {
                     visibility: hidden !important;
                 }
             }
+        }
+    }
+    // 録画の音声設定は 0/1 トラックでも状態確認できるよう常時表示する
+    &.dplayer-no-audio-switching .dplayer-setting-box .dplayer-setting-audio {
+        display: flex !important;
+    }
+    &.dplayer-audio-only {
+        .dplayer-video-wrap-aspect::after {
+            content: '音声のみ';
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: rgba(255, 255, 255, 0.72);
+            font-size: 18px;
+            pointer-events: none;
+        }
+        .dplayer-setting-quality,
+        .dplayer-setting-lshaped-screen-crop,
+        .dplayer-camera-icon,
+        .dplayer-subtitle-btn {
+            display: none !important;
         }
     }
     .dplayer-comment-setting-box {

@@ -16,6 +16,7 @@ export type BS4KLiveStreamingQuality = '4320p' | '2160p' | '1440p' | '1080p-60fp
 export const BS4K_LIVE_STREAMING_QUALITIES: BS4KLiveStreamingQuality[] = ['4320p', '2160p', '1440p', '1080p-60fps', '1080p-30fps', '810p-60fps', '810p-30fps', '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps'];
 export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
+export type RecordedVideoCodec = 'avc' | 'hevc';
 
 // 番組表関連の型定義
 export type TimeTableSizeOption = 'Wide' | 'Normal' | 'Narrow';
@@ -102,6 +103,7 @@ export interface ILocalClientSettings extends IClientSettings {
     video_streaming_quality_cellular: VideoStreamingQuality;
     video_data_saver_mode: boolean;
     video_data_saver_mode_cellular: boolean;
+    video_encoding_codec: RecordedVideoCodec;
     video_24fps_mode: boolean;
     video_24fps_mode_cellular: boolean;
     caption_font: string;
@@ -279,6 +281,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     video_data_saver_mode: false,
     // ビデオを通信節約モードで視聴する (モバイル回線時)  (Default: オン) (同期無効)
     video_data_saver_mode_cellular: true,
+    // 録画再生の映像コーデック (ブラウザ単位、同期無効)
+    video_encoding_codec: 'avc',
     // ビデオを 24fps モードで再生する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
     video_24fps_mode: false,
     // ビデオを 24fps モードで再生する (モバイル回線時)  (Default: オフ) (同期無効)
@@ -425,6 +429,7 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     // video_streaming_quality_cellular: 同期無効
     // video_data_saver_mode: 同期無効
     // video_data_saver_mode_cellular: 同期無効
+    // video_encoding_codec: 同期無効
     // video_24fps_mode: 同期無効
     // video_24fps_mode_cellular: 同期無効
     'caption_font',
