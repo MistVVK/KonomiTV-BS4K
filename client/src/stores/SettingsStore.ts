@@ -68,6 +68,7 @@ export interface ILocalClientSettings extends IClientSettings {
         created_at: number;
         updated_at: number;
     }[];
+    video_auto_skip_cm: boolean;
     lshaped_screen_crop_enabled: boolean;
     lshaped_screen_crop_zoom_level: number;
     lshaped_screen_crop_x_position: number;
@@ -191,6 +192,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     mylist: [],
     // 「ビデオをみる」の視聴履歴
     watched_history: [],
+    // 録画再生時に CM 区間を自動でスキップする (Default: オフ) (同期無効)
+    video_auto_skip_cm: false,
 
     // ***** L字画面のクロップ設定 *****
 
@@ -436,6 +439,7 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'saved_twitter_hashtags',
     'mylist',
     'watched_history',
+    // video_auto_skip_cm: 同期無効
     // lshaped_screen_crop_enabled: 同期無効
     // lshaped_screen_crop_zoom_level: 同期無効
     // lshaped_screen_crop_x_position: 同期無効
