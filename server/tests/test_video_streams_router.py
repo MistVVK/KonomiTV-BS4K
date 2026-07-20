@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from app.metadata.RecordedPlaybackIndex import RECORDED_PLAYBACK_INDEX_VERSION
 from app.routers.VideosRouter import (
     BuildRecordedPlaybackIndex,
     VideoPlaybackIndexCreateAPI,
@@ -43,7 +44,7 @@ def test_master_playlist_waits_for_on_demand_playback_index(monkeypatch) -> None
 
     async def RefreshFromDB() -> None:
         recorded_video.playback_index_status = 'Ready'
-        recorded_video.playback_index_version = 10
+        recorded_video.playback_index_version = RECORDED_PLAYBACK_INDEX_VERSION
 
     recorded_video.refresh_from_db = RefreshFromDB
     recorded_program = SimpleNamespace(recorded_video=recorded_video)
@@ -62,7 +63,7 @@ def test_master_playlist_waits_for_on_demand_playback_index(monkeypatch) -> None
 
     assert enqueued_priorities == [(61, 0)]
     assert recorded_video.playback_index_status == 'Ready'
-    assert recorded_video.playback_index_version == 10
+    assert recorded_video.playback_index_version == RECORDED_PLAYBACK_INDEX_VERSION
 
 
 def test_stale_ready_recording_is_rejected() -> None:
@@ -101,7 +102,7 @@ def test_recorded_playback_index_response_contains_stale_and_current_version() -
     assert index.status == 'Ready'
     assert index.state == 'Stale'
     assert index.version == 5
-    assert index.current_version == 10
+    assert index.current_version == RECORDED_PLAYBACK_INDEX_VERSION
     assert index.progress == 0.0
     assert index.stage == 'Queued'
 

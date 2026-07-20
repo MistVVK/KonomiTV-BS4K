@@ -1,6 +1,7 @@
 import pytest
 
 from app.metadata.RecordedAnalysisPlan import BuildRecordedAnalysisPlan
+from app.metadata.RecordedPlaybackIndex import RECORDED_PLAYBACK_INDEX_VERSION
 
 
 @pytest.mark.parametrize(
@@ -22,12 +23,19 @@ from app.metadata.RecordedAnalysisPlan import BuildRecordedAnalysisPlan
             {'AnalyzeMetadata', 'BuildPlaybackIndex', 'DetectCM', 'GenerateThumbnail'},
             1,
         ),
-        ('Unchanged', 'MetadataReanalysis', 'Ready', 10, {'AnalyzeMetadata', 'BuildPlaybackIndex'}, 1),
+        (
+            'Unchanged',
+            'MetadataReanalysis',
+            'Ready',
+            RECORDED_PLAYBACK_INDEX_VERSION,
+            {'AnalyzeMetadata', 'BuildPlaybackIndex'},
+            1,
+        ),
         ('Unchanged', 'Automatic', 'Pending', None, {'BuildPlaybackIndex'}, 2),
         ('Unchanged', 'Automatic', 'Ready', 7, {'BuildPlaybackIndex'}, 2),
         ('Unchanged', 'PlaybackIndexRetry', 'Failed', None, {'BuildPlaybackIndex'}, 0),
-        ('Unchanged', 'CMDetection', 'Ready', 10, {'DetectCM'}, None),
-        ('Unchanged', 'Automatic', 'Ready', 10, set(), None),
+        ('Unchanged', 'CMDetection', 'Ready', RECORDED_PLAYBACK_INDEX_VERSION, {'DetectCM'}, None),
+        ('Unchanged', 'Automatic', 'Ready', RECORDED_PLAYBACK_INDEX_VERSION, set(), None),
         ('Unchanged', 'Automatic', 'Failed', None, set(), None),
     ],
 )

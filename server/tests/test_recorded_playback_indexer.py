@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.metadata.RecordedPlaybackIndex import (
+    RECORDED_PLAYBACK_INDEX_VERSION,
     GetRecordedPlaybackIndexState,
     IsRecordedPlaybackIndexReady,
 )
@@ -17,11 +18,11 @@ from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 def test_public_playback_index_state_exposes_stale_version() -> None:
     """DB上のReadyを維持したまま、旧VersionだけをStaleとして公開する。"""
 
-    assert GetRecordedPlaybackIndexState('Ready', 9) == 'Stale'
-    assert GetRecordedPlaybackIndexState('Ready', 10) == 'Ready'
+    assert GetRecordedPlaybackIndexState('Ready', RECORDED_PLAYBACK_INDEX_VERSION - 1) == 'Stale'
+    assert GetRecordedPlaybackIndexState('Ready', RECORDED_PLAYBACK_INDEX_VERSION) == 'Ready'
     assert GetRecordedPlaybackIndexState('Pending', 5) == 'Pending'
     assert IsRecordedPlaybackIndexReady('Ready', 5) is False
-    assert IsRecordedPlaybackIndexReady('Ready', 10) is True
+    assert IsRecordedPlaybackIndexReady('Ready', RECORDED_PLAYBACK_INDEX_VERSION) is True
 
 
 def test_frame_pts_updates_monotonic_playback_index_progress() -> None:
@@ -53,9 +54,9 @@ def test_backfill_includes_pending_and_stale_but_not_current_failed(monkeypatch)
         async def values_list(self, *_fields):
             return [
                 (1, 'Pending', None),
-                (2, 'Ready', 9),
-                (3, 'Ready', 10),
-                (4, 'Failed', 10),
+                (2, 'Ready', RECORDED_PLAYBACK_INDEX_VERSION - 1),
+                (3, 'Ready', RECORDED_PLAYBACK_INDEX_VERSION),
+                (4, 'Failed', RECORDED_PLAYBACK_INDEX_VERSION),
             ]
 
     monkeypatch.setattr(
@@ -191,7 +192,10 @@ def test_queued_analysis_skips_recording_that_became_current_ready(monkeypatch) 
     """キュー待機中に現行索引が完成した録画は重複して全編走査しない。"""
 
     async def GetRecordedVideo(**_kwargs):
-        return SimpleNamespace(playback_index_status='Ready', playback_index_version=10)
+        return SimpleNamespace(
+            playback_index_status='Ready',
+            playback_index_version=RECORDED_PLAYBACK_INDEX_VERSION,
+        )
 
     monkeypatch.setattr(
         'app.metadata.RecordedPlaybackIndexer.RecordedVideo.get_or_none',
