@@ -488,6 +488,17 @@ const handleSettingCoverClick = () => {
             // DPlayer の固定値 (2トラック分) ではなく、実際に表示する音声トラック数に合わせる
             clip-path: inset(calc(100% - var(--audio-panel-height, 114px)) 0 0 round 7px) !important;
         }
+        &.dplayer-setting-box-video-codec {
+            // DPlayer が保持する元パネルの clip-path を壊さず、コーデック選択中だけ高さを切り替える
+            clip-path: inset(calc(100% - var(--video-codec-panel-height, 114px)) 0 0 round 7px) !important;
+
+            .dplayer-setting-origin-panel {
+                transform: translateX(-100%);
+            }
+            .dplayer-setting-video-codec-panel {
+                transform: translateX(0%) !important;
+            }
+        }
         .dplayer-setting-origin-panel {
             .dplayer-setting-item.dplayer-setting-lshaped-screen-crop,
             .dplayer-setting-item.dplayer-setting-keyboard-shortcut {

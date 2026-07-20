@@ -2625,6 +2625,9 @@ class PlayerController {
         this.player.setting.hide = () => {
             if (this.player === null) return;
             original_hide.call(this.player.setting);
+            // 映像コーデックのサブパネルを開いたまま外側を押して閉じた場合も、
+            // 次回は必ず元の設定パネルから表示する。
+            this.player.template.settingBox.classList.remove('dplayer-setting-box-video-codec');
             player_store.is_player_setting_panel_open = false;
         };
         this.player.setting.show = () => {
@@ -2702,11 +2705,10 @@ class PlayerController {
 
         // サブパネルは設定画面と同じ SettingsStore の値を直接読み書きする
         const setting_box = this.player.template.settingBox;
-        const setting_origin_panel = this.player.template.settingOriginPanel;
         const video_codec_button = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec')!;
         const video_codec_value = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-value')!;
-        const video_codec_panel = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-panel')!;
         const video_codec_items = Array.from(this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-video-codec-item'));
+        setting_box.style.setProperty('--video-codec-panel-height', `${video_codec_panel_height}px`);
         const update_video_codec_display = () => {
             const selected_codec = settings_store.settings[get_video_codec_setting_key()];
             video_codec_value.textContent = selected_codec.toUpperCase();
@@ -2716,16 +2718,14 @@ class PlayerController {
             });
         };
         const close_video_codec_panel = () => {
-            setting_origin_panel.style.transform = '';
-            video_codec_panel.style.transform = 'translateX(100%)';
-            setting_box.style.clipPath = '';
+            setting_box.classList.remove('dplayer-setting-box-video-codec');
         };
         update_video_codec_display();
         video_codec_button.addEventListener('click', () => {
             update_video_codec_display();
-            setting_origin_panel.style.transform = 'translateX(-100%)';
-            video_codec_panel.style.transform = 'translateX(0%)';
-            setting_box.style.clipPath = `inset(calc(100% - ${video_codec_panel_height}px) 0 0 round 7px)`;
+            // DPlayer が計測した元パネル用の inline clip-path は上書きせず、
+            // サブパネル表示中だけ専用クラスで切り替える。
+            setting_box.classList.add('dplayer-setting-box-video-codec');
         });
         this.player.container.querySelector('.dplayer-setting-video-codec-header')!.addEventListener('click', close_video_codec_panel);
         video_codec_items.forEach((item) => {
