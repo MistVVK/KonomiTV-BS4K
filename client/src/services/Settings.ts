@@ -153,6 +153,16 @@ export interface IServerSettings {
         reverse_proxy_listen_address: string;
         trusted_proxy_cidrs: string[];
     };
+    compatibility_api: {
+        enabled: boolean;
+        port: number;
+        profile: 'KomorebiV1';
+        https_mode: 'inherit' | 'akebi' | 'certificate' | 'reverse_proxy';
+        custom_https_certificate: string | null;
+        custom_https_private_key: string | null;
+        reverse_proxy_listen_address: string;
+        trusted_proxy_cidrs: string[];
+    };
     tv: {
         preferred_terrestrial_region: string | null;
         max_alive_time: number;
@@ -193,6 +203,16 @@ export const IServerSettingsDefault: IServerSettings = {
     server: {
         https_mode: 'akebi',
         port: 7000,
+        custom_https_certificate: null,
+        custom_https_private_key: null,
+        reverse_proxy_listen_address: '0.0.0.0',
+        trusted_proxy_cidrs: [],
+    },
+    compatibility_api: {
+        enabled: false,
+        port: 7200,
+        profile: 'KomorebiV1',
+        https_mode: 'inherit',
         custom_https_certificate: null,
         custom_https_private_key: null,
         reverse_proxy_listen_address: '0.0.0.0',

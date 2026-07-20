@@ -89,6 +89,28 @@ const useServerSettingsStore = defineStore('serverSettings', () => {
             normalized_settings.server.custom_https_private_key = null;
         }
 
+        // 互換 API は inherit の場合だけ通常 API の接続設定を継承し、それ以外は専用の接続設定を利用する
+        if (normalized_settings.compatibility_api.https_mode !== 'certificate') {
+            normalized_settings.compatibility_api.custom_https_certificate = null;
+            normalized_settings.compatibility_api.custom_https_private_key = null;
+        }
+        if (normalized_settings.compatibility_api.https_mode !== 'reverse_proxy') {
+            normalized_settings.compatibility_api.reverse_proxy_listen_address = '0.0.0.0';
+            normalized_settings.compatibility_api.trusted_proxy_cidrs = [];
+        } else {
+            normalized_settings.compatibility_api.trusted_proxy_cidrs = normalized_settings.compatibility_api.trusted_proxy_cidrs
+                .map(cidr => cidr.trim())
+                .filter(cidr => cidr !== '');
+        }
+
+        // 互換 API の certificate モードも空文字列を null に変換し、サーバー側で必須対として検証する
+        if (normalized_settings.compatibility_api.custom_https_certificate === '') {
+            normalized_settings.compatibility_api.custom_https_certificate = null;
+        }
+        if (normalized_settings.compatibility_api.custom_https_private_key === '') {
+            normalized_settings.compatibility_api.custom_https_private_key = null;
+        }
+
         // 保存に成功した場合だけ、次の section が複製する基準値を更新する
         const result = await Settings.updateServerSettings(normalized_settings);
         if (result === true) {

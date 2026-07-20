@@ -12,7 +12,7 @@ from starlette.types import Message, Receive, Scope, Send
 
 import app as app_package
 import app.config as config_module
-from app.config import ServerSettings
+from app.config import ResolveCompatibilityHTTPSSettings, ServerSettings
 from app.utils.HTTPS import (
     BuildServerStartupSettings,
     GetAkebiAccessURLs,
@@ -27,8 +27,12 @@ class HTTPSModeConfigTest(unittest.TestCase):
         temporary_path = Path(self.temporary_directory.name)
         self.certificate_path = temporary_path / 'certificate.pem'
         self.private_key_path = temporary_path / 'private-key.pem'
+        self.compatibility_certificate_path = temporary_path / 'compatibility-certificate.pem'
+        self.compatibility_private_key_path = temporary_path / 'compatibility-private-key.pem'
         self.certificate_path.write_text('certificate', encoding='utf-8')
         self.private_key_path.write_text('private-key', encoding='utf-8')
+        self.compatibility_certificate_path.write_text('compatibility-certificate', encoding='utf-8')
+        self.compatibility_private_key_path.write_text('compatibility-private-key', encoding='utf-8')
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -39,6 +43,62 @@ class HTTPSModeConfigTest(unittest.TestCase):
             {'server': {'port': 65420, **overrides}},
             context={'bypass_validation': False},
         ).server
+
+    def compatibility_settings(
+        self,
+        *,
+        server_port: int = 65400,
+        compatibility_port: int = 65420,
+        https_mode: str = 'akebi',
+        compatibility_https_mode: str = 'inherit',
+        compatibility_overrides: dict[str, object] | None = None,
+        used_ports: set[int] | None = None,
+        **server_overrides: object,
+    ) -> ServerSettings:
+        with patch('app.config._GetUsedListenPorts', return_value=used_ports or set()):
+            return ServerSettings.model_validate(
+                {
+                    'server': {
+                        'port': server_port,
+                        'https_mode': https_mode,
+                        **server_overrides,
+                    },
+                    'compatibility_api': {
+                        'enabled': True,
+                        'port': compatibility_port,
+                        'profile': 'KomorebiV1',
+                        'https_mode': compatibility_https_mode,
+                        **(compatibility_overrides or {}),
+                    },
+                },
+                context={'bypass_validation': False},
+            )
+
+    def server_mode_overrides(self, https_mode: str) -> dict[str, object]:
+        if https_mode == 'certificate':
+            return {
+                'custom_https_certificate': self.certificate_path,
+                'custom_https_private_key': self.private_key_path,
+            }
+        if https_mode == 'reverse_proxy':
+            return {
+                'reverse_proxy_listen_address': '127.0.0.2',
+                'trusted_proxy_cidrs': ['10.0.0.0/8'],
+            }
+        return {}
+
+    def compatibility_mode_overrides(self, https_mode: str) -> dict[str, object]:
+        if https_mode == 'certificate':
+            return {
+                'custom_https_certificate': self.compatibility_certificate_path,
+                'custom_https_private_key': self.compatibility_private_key_path,
+            }
+        if https_mode == 'reverse_proxy':
+            return {
+                'reverse_proxy_listen_address': '127.0.0.3',
+                'trusted_proxy_cidrs': ['192.0.2.0/24'],
+            }
+        return {}
 
     def test_default_mode_is_akebi(self) -> None:
         settings = self.server_settings()
@@ -111,6 +171,215 @@ class HTTPSModeConfigTest(unittest.TestCase):
         self.assertIsNone(reverse_proxy.ssl_certfile)
         self.assertFalse(reverse_proxy.proxy_headers)
 
+    def test_resolved_compatibility_https_settings_cover_every_mode_pair(self) -> None:
+        for main_mode in ('akebi', 'certificate', 'reverse_proxy'):
+            for compatibility_mode in ('inherit', 'akebi', 'certificate', 'reverse_proxy'):
+                with self.subTest(main_mode=main_mode, compatibility_mode=compatibility_mode):
+                    settings = self.compatibility_settings(
+                        https_mode=main_mode,
+                        compatibility_https_mode=compatibility_mode,
+                        compatibility_overrides=self.compatibility_mode_overrides(compatibility_mode),
+                        **self.server_mode_overrides(main_mode),
+                    )
+                    resolved = ResolveCompatibilityHTTPSSettings(settings)
+                    effective_mode = main_mode if compatibility_mode == 'inherit' else compatibility_mode
+
+                    if compatibility_mode == 'inherit':
+                        self.assertIs(resolved, settings.server)
+                    else:
+                        self.assertIs(resolved, settings.compatibility_api)
+                    self.assertEqual(resolved.https_mode, effective_mode)
+
+                    startup = BuildServerStartupSettings(resolved, port=settings.compatibility_api.port)
+                    if effective_mode == 'akebi':
+                        self.assertEqual((startup.host, startup.port), ('127.0.0.77', 65430))
+                        self.assertTrue(startup.use_akebi)
+                        self.assertIsNone(startup.ssl_certfile)
+                    elif effective_mode == 'certificate':
+                        expected_certificate = (
+                            self.certificate_path
+                            if compatibility_mode == 'inherit'
+                            else self.compatibility_certificate_path
+                        )
+                        expected_private_key = (
+                            self.private_key_path
+                            if compatibility_mode == 'inherit'
+                            else self.compatibility_private_key_path
+                        )
+                        self.assertEqual((startup.host, startup.port), ('0.0.0.0', 65420))
+                        self.assertFalse(startup.use_akebi)
+                        self.assertEqual(startup.ssl_certfile, str(expected_certificate))
+                        self.assertEqual(startup.ssl_keyfile, str(expected_private_key))
+                    else:
+                        expected_host = '127.0.0.2' if compatibility_mode == 'inherit' else '127.0.0.3'
+                        self.assertEqual((startup.host, startup.port), (expected_host, 65420))
+                        self.assertFalse(startup.use_akebi)
+                        self.assertIsNone(startup.ssl_certfile)
+
+    def test_compatibility_api_defaults_to_disabled_komorebi_listener(self) -> None:
+        with patch('app.config._GetUsedListenPorts', return_value=set()):
+            settings = ServerSettings.model_validate({}, context={'bypass_validation': False})
+
+        self.assertFalse(settings.compatibility_api.enabled)
+        self.assertEqual(settings.compatibility_api.https_mode, 'inherit')
+        self.assertEqual(settings.compatibility_api.port, 7200)
+        self.assertEqual(settings.compatibility_api.profile, 'KomorebiV1')
+        self.assertIsNone(settings.compatibility_api.custom_https_certificate)
+        self.assertIsNone(settings.compatibility_api.custom_https_private_key)
+        self.assertEqual(str(settings.compatibility_api.reverse_proxy_listen_address), '0.0.0.0')
+        self.assertEqual(settings.compatibility_api.trusted_proxy_cidrs, [])
+
+    def test_compatibility_inherit_and_akebi_reject_dedicated_https_settings(self) -> None:
+        for compatibility_mode in ('inherit', 'akebi'):
+            with self.subTest(compatibility_mode=compatibility_mode, setting='certificate'):
+                with self.assertRaisesRegex(ValidationError, '専用の HTTPS 証明書は指定できません'):
+                    self.compatibility_settings(
+                        compatibility_https_mode=compatibility_mode,
+                        compatibility_overrides={'custom_https_certificate': self.compatibility_certificate_path},
+                    )
+            with self.subTest(compatibility_mode=compatibility_mode, setting='trusted_proxy_cidrs'):
+                with self.assertRaisesRegex(ValidationError, 'reverse_proxy の場合のみ'):
+                    self.compatibility_settings(
+                        compatibility_https_mode=compatibility_mode,
+                        compatibility_overrides={'trusted_proxy_cidrs': ['192.0.2.0/24']},
+                    )
+            with self.subTest(compatibility_mode=compatibility_mode, setting='listen_address'):
+                with self.assertRaisesRegex(ValidationError, 'reverse_proxy の場合のみ'):
+                    self.compatibility_settings(
+                        compatibility_https_mode=compatibility_mode,
+                        compatibility_overrides={'reverse_proxy_listen_address': '127.0.0.3'},
+                    )
+
+    def test_compatibility_certificate_requires_its_own_certificate_pair(self) -> None:
+        with self.assertRaisesRegex(ValidationError, '両方を指定'):
+            self.compatibility_settings(
+                compatibility_https_mode='certificate',
+                compatibility_overrides={'custom_https_certificate': self.compatibility_certificate_path},
+            )
+
+        settings = self.compatibility_settings(
+            compatibility_https_mode='certificate',
+            compatibility_overrides=self.compatibility_mode_overrides('certificate'),
+        )
+        self.assertEqual(
+            settings.compatibility_api.custom_https_certificate,
+            self.compatibility_certificate_path,
+        )
+        self.assertEqual(
+            settings.compatibility_api.custom_https_private_key,
+            self.compatibility_private_key_path,
+        )
+
+        with self.assertRaisesRegex(ValidationError, 'reverse_proxy の場合のみ'):
+            self.compatibility_settings(
+                compatibility_https_mode='certificate',
+                compatibility_overrides={
+                    **self.compatibility_mode_overrides('certificate'),
+                    'trusted_proxy_cidrs': ['192.0.2.0/24'],
+                },
+            )
+
+    def test_compatibility_reverse_proxy_requires_cidrs_and_rejects_certificates(self) -> None:
+        with self.assertRaisesRegex(ValidationError, '1件以上'):
+            self.compatibility_settings(compatibility_https_mode='reverse_proxy')
+
+        with self.assertRaisesRegex(ValidationError, '指定できません'):
+            self.compatibility_settings(
+                compatibility_https_mode='reverse_proxy',
+                compatibility_overrides={
+                    'custom_https_certificate': self.compatibility_certificate_path,
+                    'custom_https_private_key': self.compatibility_private_key_path,
+                    'trusted_proxy_cidrs': ['192.0.2.0/24'],
+                },
+            )
+
+        settings = self.compatibility_settings(
+            compatibility_https_mode='reverse_proxy',
+            compatibility_overrides=self.compatibility_mode_overrides('reverse_proxy'),
+        )
+        self.assertEqual(str(settings.compatibility_api.reverse_proxy_listen_address), '127.0.0.3')
+        self.assertEqual([str(cidr) for cidr in settings.compatibility_api.trusted_proxy_cidrs], ['192.0.2.0/24'])
+
+    def test_main_and_compatibility_reserved_port_matrix(self) -> None:
+        main_port = 65400
+        for main_mode in ('akebi', 'certificate', 'reverse_proxy'):
+            for compatibility_mode in ('inherit', 'akebi', 'certificate', 'reverse_proxy'):
+                effective_compatibility_mode = main_mode if compatibility_mode == 'inherit' else compatibility_mode
+                forbidden_ports = {main_port}
+                if main_mode == 'akebi':
+                    forbidden_ports.add(main_port + 10)
+                if effective_compatibility_mode == 'akebi':
+                    forbidden_ports.add(main_port - 10)
+
+                for compatibility_port in (main_port - 10, main_port, main_port + 10):
+                    with self.subTest(
+                        main_mode=main_mode,
+                        compatibility_mode=compatibility_mode,
+                        compatibility_port=compatibility_port,
+                    ):
+                        validate = lambda: self.compatibility_settings(
+                            server_port=main_port,
+                            compatibility_port=compatibility_port,
+                            https_mode=main_mode,
+                            compatibility_https_mode=compatibility_mode,
+                            compatibility_overrides=self.compatibility_mode_overrides(compatibility_mode),
+                            **self.server_mode_overrides(main_mode),
+                        )
+                        if compatibility_port in forbidden_ports:
+                            with self.assertRaisesRegex(ValidationError, '重複しています'):
+                                validate()
+                        else:
+                            settings = validate()
+                            self.assertEqual(settings.compatibility_api.port, compatibility_port)
+
+    def test_enabled_compatibility_api_used_port_matrix(self) -> None:
+        compatibility_port = 65420
+        for main_mode in ('akebi', 'certificate', 'reverse_proxy'):
+            for compatibility_mode in ('inherit', 'akebi', 'certificate', 'reverse_proxy'):
+                effective_compatibility_mode = main_mode if compatibility_mode == 'inherit' else compatibility_mode
+                for used_port in (compatibility_port, compatibility_port + 10):
+                    with self.subTest(
+                        main_mode=main_mode,
+                        compatibility_mode=compatibility_mode,
+                        used_port=used_port,
+                    ):
+                        validate = lambda: self.compatibility_settings(
+                            compatibility_port=compatibility_port,
+                            https_mode=main_mode,
+                            compatibility_https_mode=compatibility_mode,
+                            compatibility_overrides=self.compatibility_mode_overrides(compatibility_mode),
+                            used_ports={used_port},
+                            **self.server_mode_overrides(main_mode),
+                        )
+                        if used_port == compatibility_port or effective_compatibility_mode == 'akebi':
+                            with self.assertRaisesRegex(ValidationError, '他のプロセスで使われている'):
+                                validate()
+                        else:
+                            settings = validate()
+                            self.assertEqual(settings.compatibility_api.port, compatibility_port)
+
+    def test_disabled_compatibility_api_does_not_reserve_its_port(self) -> None:
+        with patch('app.config._GetUsedListenPorts', return_value={7200, 7210}):
+            settings = ServerSettings.model_validate(
+                {
+                    'server': {'port': 65400},
+                    'compatibility_api': {'enabled': False, 'port': 7200},
+                },
+                context={'bypass_validation': False},
+            )
+
+        self.assertFalse(settings.compatibility_api.enabled)
+
+    def test_bypass_validation_accepts_prevalidated_compatibility_collision(self) -> None:
+        settings = ServerSettings.model_validate(
+            {
+                'server': {'port': 65400},
+                'compatibility_api': {'enabled': True, 'port': 65410},
+            },
+            context={'bypass_validation': True},
+        )
+        self.assertTrue(settings.compatibility_api.enabled)
+
     def test_akebi_is_required_only_in_akebi_mode(self) -> None:
         self.assertIn('Akebi', GetRequiredThirdpartyLibraries('akebi'))
         self.assertNotIn('Akebi', GetRequiredThirdpartyLibraries('certificate'))
@@ -142,13 +411,21 @@ class HTTPSModeConfigTest(unittest.TestCase):
         host_rootfs.mkdir()
         (host_rootfs / 'certificate.pem').write_text('certificate', encoding='utf-8')
         (host_rootfs / 'private-key.pem').write_text('private-key', encoding='utf-8')
+        (host_rootfs / 'compatibility-certificate.pem').write_text('compatibility-certificate', encoding='utf-8')
+        (host_rootfs / 'compatibility-private-key.pem').write_text('compatibility-private-key', encoding='utf-8')
         config_path = temporary_path / 'config.yaml'
         config_path.write_text(
             'server:\n'
             "    https_mode: 'certificate'\n"
             '    port: 65420\n'
             "    custom_https_certificate: '/certificate.pem'\n"
-            "    custom_https_private_key: '/private-key.pem'\n",
+            "    custom_https_private_key: '/private-key.pem'\n"
+            'compatibility_api:\n'
+            '    enabled: true\n'
+            "    https_mode: 'certificate'\n"
+            '    port: 65440\n'
+            "    custom_https_certificate: '/compatibility-certificate.pem'\n"
+            "    custom_https_private_key: '/compatibility-private-key.pem'\n",
             encoding='utf-8',
         )
 
@@ -168,15 +445,76 @@ class HTTPSModeConfigTest(unittest.TestCase):
                 settings = config_module.LoadConfig(bypass_validation=True)
                 self.assertEqual(settings.server.custom_https_certificate, host_rootfs / 'certificate.pem')
                 self.assertEqual(settings.server.custom_https_private_key, host_rootfs / 'private-key.pem')
+                self.assertEqual(
+                    settings.compatibility_api.custom_https_certificate,
+                    host_rootfs / 'compatibility-certificate.pem',
+                )
+                self.assertEqual(
+                    settings.compatibility_api.custom_https_private_key,
+                    host_rootfs / 'compatibility-private-key.pem',
+                )
                 config_module.SaveConfig(settings)
 
             saved_config = YAML().load(config_path.read_text(encoding='utf-8'))
             self.assertEqual(saved_config['server']['custom_https_certificate'], '/certificate.pem')
             self.assertEqual(saved_config['server']['custom_https_private_key'], '/private-key.pem')
+            self.assertEqual(
+                saved_config['compatibility_api']['custom_https_certificate'],
+                '/compatibility-certificate.pem',
+            )
+            self.assertEqual(
+                saved_config['compatibility_api']['custom_https_private_key'],
+                '/compatibility-private-key.pem',
+            )
         finally:
             config_module._CONFIG = original_config  # pyright: ignore[reportPrivateUsage]
             config_module._CONFIG_YAML_PATH = original_config_path  # pyright: ignore[reportPrivateUsage]
             config_module._DOCKER_PATH_PREFIX = original_docker_path_prefix  # pyright: ignore[reportPrivateUsage]
+
+    def test_compatibility_api_settings_are_added_to_old_config_and_saved(self) -> None:
+        temporary_path = Path(self.temporary_directory.name)
+        config_path = temporary_path / 'config.yaml'
+        config_path.write_text(
+            'server:\n'
+            '    port: 65420\n',
+            encoding='utf-8',
+        )
+
+        original_config = config_module._CONFIG  # pyright: ignore[reportPrivateUsage]
+        original_config_path = config_module._CONFIG_YAML_PATH  # pyright: ignore[reportPrivateUsage]
+        try:
+            config_module._CONFIG = None  # pyright: ignore[reportPrivateUsage]
+            config_module._CONFIG_YAML_PATH = config_path  # pyright: ignore[reportPrivateUsage]
+            test_logging = SimpleNamespace(debug=Mock(), error=Mock())
+            with (
+                patch.object(app_package, 'logging', test_logging, create=True),
+                patch.dict('sys.modules', {'app.logging': test_logging}),
+                patch('app.utils.GetPlatformEnvironment', return_value='Linux'),
+            ):
+                settings = config_module.LoadConfig(bypass_validation=True)
+                self.assertFalse(settings.compatibility_api.enabled)
+                self.assertEqual(settings.compatibility_api.https_mode, 'inherit')
+                self.assertEqual(settings.compatibility_api.port, 7200)
+                self.assertIs(ResolveCompatibilityHTTPSSettings(settings), settings.server)
+
+                settings.compatibility_api.enabled = True
+                settings.compatibility_api.port = 65440
+                config_module.SaveConfig(settings)
+
+            saved_config = YAML().load(config_path.read_text(encoding='utf-8'))
+            self.assertEqual(saved_config['compatibility_api'], {
+                'enabled': True,
+                'https_mode': 'inherit',
+                'port': 65440,
+                'profile': 'KomorebiV1',
+                'custom_https_certificate': None,
+                'custom_https_private_key': None,
+                'reverse_proxy_listen_address': '0.0.0.0',
+                'trusted_proxy_cidrs': [],
+            })
+        finally:
+            config_module._CONFIG = original_config  # pyright: ignore[reportPrivateUsage]
+            config_module._CONFIG_YAML_PATH = original_config_path  # pyright: ignore[reportPrivateUsage]
 
 
 class ReverseProxyMiddlewareTest(unittest.IsolatedAsyncioTestCase):

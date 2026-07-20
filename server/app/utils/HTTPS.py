@@ -27,13 +27,15 @@ class ServerStartupSettings:
     proxy_headers: bool = False
 
 
-def BuildServerStartupSettings(server_settings: Any) -> ServerStartupSettings:
+def BuildServerStartupSettings(server_settings: Any, port: int | None = None) -> ServerStartupSettings:
     """サーバー設定から Akebi / Uvicorn の排他的な起動構成を組み立てる。"""
+
+    listen_port = server_settings.port if port is None else port
 
     if server_settings.https_mode == 'akebi':
         return ServerStartupSettings(
             host = '127.0.0.77',
-            port = server_settings.port + 10,
+            port = listen_port + 10,
             ssl_certfile = None,
             ssl_keyfile = None,
             use_akebi = True,
@@ -46,7 +48,7 @@ def BuildServerStartupSettings(server_settings: Any) -> ServerStartupSettings:
         assert isinstance(private_key, Path)
         return ServerStartupSettings(
             host = '0.0.0.0',
-            port = server_settings.port,
+            port = listen_port,
             ssl_certfile = str(certificate),
             ssl_keyfile = str(private_key),
             use_akebi = False,
@@ -54,7 +56,7 @@ def BuildServerStartupSettings(server_settings: Any) -> ServerStartupSettings:
 
     return ServerStartupSettings(
         host = str(server_settings.reverse_proxy_listen_address),
-        port = server_settings.port,
+        port = listen_port,
         ssl_certfile = None,
         ssl_keyfile = None,
         use_akebi = False,

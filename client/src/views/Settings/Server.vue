@@ -175,6 +175,117 @@
                     <span class="ml-1">信頼済み CIDR を追加</span>
                 </v-btn>
             </div>
+            <div class="settings__content-heading mt-6" v-if="section === 'basic'">
+                <Icon icon="fluent:plug-connected-20-filled" width="22px" />
+                <span class="ml-2">互換 API</span>
+            </div>
+            <div class="settings__item settings__item--switch" v-if="section === 'basic'">
+                <label class="settings__item-heading" for="compatibility_api_enabled">互換 API を有効にする</label>
+                <label class="settings__item-label" for="compatibility_api_enabled">
+                    Komorebi など、KonomiTV 互換 API を利用するクライアント向けの API を専用ポートで公開します。<br>
+                    通常の KonomiTV Web UI・API のリッスンポートや動作は変更されません。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" id="compatibility_api_enabled" hide-details
+                    v-model="server_settings.compatibility_api.enabled">
+                </v-switch>
+            </div>
+            <div class="settings__item" v-if="section === 'basic'">
+                <div class="settings__item-heading">互換 API 専用の HTTPS / リバースプロキシ動作モード</div>
+                <div class="settings__item-label">
+                    以下の接続設定は互換 API 専用です。通常の KonomiTV Web UI・API の接続設定には影響しません。<br>
+                    「通常 API と同じ設定を使用」を選んだ場合だけ、上の KonomiTV サーバー設定を引き継ぎます。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :items="compatibility_https_mode_options"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    v-model="server_settings.compatibility_api.https_mode">
+                </v-select>
+            </div>
+            <div class="settings__item"
+                v-if="section === 'basic' && server_settings.compatibility_api.https_mode === 'certificate'">
+                <div class="settings__item-heading">互換 API 専用 HTTPS 証明書・秘密鍵ファイルへの絶対パス</div>
+                <div class="settings__item-label">
+                    通常 API に設定した証明書は使用しません。Docker ではホスト上の絶対パスを両方指定してください。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details="auto"
+                    label="例: /etc/letsencrypt/live/compat.example.com/fullchain.pem"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :error-messages="compatibility_api_certificate_error"
+                    v-model="server_settings.compatibility_api.custom_https_certificate">
+                </v-text-field>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details="auto"
+                    label="例: /etc/letsencrypt/live/compat.example.com/privkey.pem"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :error-messages="compatibility_api_private_key_error"
+                    v-model="server_settings.compatibility_api.custom_https_private_key">
+                </v-text-field>
+            </div>
+            <div class="settings__item"
+                v-if="section === 'basic' && server_settings.compatibility_api.https_mode === 'reverse_proxy'">
+                <div class="settings__item-heading">互換 API 専用 HTTP リッスンアドレス</div>
+                <div class="settings__item-label">
+                    このアドレスと互換 API ポートはリバースプロキシからだけ到達可能にし、外部へ直接公開しないでください。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details="auto"
+                    label="例: 0.0.0.0"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :error-messages="compatibility_api_reverse_proxy_listen_address_error"
+                    v-model="server_settings.compatibility_api.reverse_proxy_listen_address">
+                </v-text-field>
+                <div class="settings__item-heading mt-5">互換 API で信頼するリバースプロキシの CIDR</div>
+                <div class="settings__item-label">
+                    上の通常 API の許可リストとは別です。実際に互換 API へ接続する nginx / Apache などの送信元 CIDR を1件以上指定してください。<br>
+                </div>
+                <div v-for="(cidr, index) in server_settings.compatibility_api.trusted_proxy_cidrs"
+                    :key="'compatibility-trusted-proxy-cidr-' + index">
+                    <div class="d-flex align-center mt-3">
+                        <v-text-field class="settings__item-form mt-0" color="primary" variant="outlined" hide-details
+                            placeholder="例: 172.18.0.0/16"
+                            :density="is_form_dense ? 'compact' : 'default'"
+                            v-model="server_settings.compatibility_api.trusted_proxy_cidrs[index]">
+                        </v-text-field>
+                        <button v-ripple class="settings__item-delete-button"
+                            @click="server_settings.compatibility_api.trusted_proxy_cidrs.splice(index, 1)">
+                            <svg class="iconify iconify--fluent" width="20px" height="20px" viewBox="0 0 16 16">
+                                <path fill="currentColor" d="M7 3h2a1 1 0 0 0-2 0ZM6 3a2 2 0 1 1 4 0h4a.5.5 0 0 1 0 1h-.564l-1.205 8.838A2.5 2.5 0 0 1 9.754 15H6.246a2.5 2.5 0 0 1-2.477-2.162L2.564 4H2a.5.5 0 0 1 0-1h4Zm1 3.5a.5.5 0 0 0-1 0v5a.5.5 0 0 0 1 0v-5ZM9.5 6a.5.5 0 0 0-.5.5v5a.5.5 0 0 0 1 0v-5a.5.5 0 0 0-.5-.5Z"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="settings__item-label text-error mt-2"
+                    v-if="compatibility_api_trusted_proxy_cidrs_error !== ''">
+                    {{compatibility_api_trusted_proxy_cidrs_error}}
+                </div>
+                <v-btn class="mt-3" color="background-lighten-2" variant="flat" height="40px"
+                    @click="server_settings.compatibility_api.trusted_proxy_cidrs.push('')">
+                    <Icon icon="fluent:add-12-filled" height="17px" />
+                    <span class="ml-1">互換 API の信頼済み CIDR を追加</span>
+                </v-btn>
+            </div>
+            <div class="settings__item" v-if="section === 'basic'">
+                <div class="settings__item-heading">互換 API のリッスンポート</div>
+                <div class="settings__item-label">
+                    通常の KonomiTV サーバーとは異なる未使用のポートを指定してください。デフォルトは 7200 です。<br>
+                    Akebi では指定ポートに加えて、10 番大きいポートを内部 HTTP 通信に使用します。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number"
+                    min="1024" max="65525" step="1" hide-details="auto"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :error-messages="compatibility_api_port_error"
+                    v-model.number="server_settings.compatibility_api.port">
+                </v-text-field>
+            </div>
+            <div class="settings__item" v-if="section === 'basic'">
+                <div class="settings__item-heading">互換プロファイル</div>
+                <div class="settings__item-label">
+                    接続するクライアントが期待する API 仕様を選択します。現在は Komorebi V1 のみ利用できます。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :items="compatibility_profile_options"
+                    v-model="server_settings.compatibility_api.profile">
+                </v-select>
+            </div>
             <div class="settings__content-heading mt-6" v-if="isSectionVisible('backend') || isSectionVisible('streaming')">
                 <Icon icon="fluent:tv-20-filled" width="22px" />
                 <span class="ml-2">{{tv_section_title}}</span>
@@ -349,7 +460,9 @@
                 </v-btn>
             </div>
             <v-btn class="settings__save-button bg-secondary mt-6" variant="flat"
-                v-if="section !== 'users'" @click="updateServerSettings()">
+                v-if="section !== 'users'"
+                :disabled="section === 'basic' && has_compatibility_api_validation_error"
+                @click="updateServerSettings()">
                 <Icon icon="fluent:save-16-filled" class="mr-2" height="23px" />サーバー設定を更新
             </v-btn>
             <div class="settings__content-heading mt-8" v-if="isSectionVisible('users')">
@@ -452,6 +565,19 @@ const encoder_options = [
     {title: 'VCEEncC : AMD GPU で利用可能', value: 'VCEEncC'},
 ];
 
+// KonomiTV 互換 API のプロファイル選択肢
+const compatibility_profile_options = [
+    {title: 'Komorebi V1', value: 'KomorebiV1'},
+];
+
+// KonomiTV 互換 API の HTTPS / リバースプロキシ動作モード
+const compatibility_https_mode_options = [
+    {title: '通常 API と同じ設定を使用', value: 'inherit'},
+    {title: 'Akebi で HTTPS', value: 'akebi'},
+    {title: '指定した証明書で直接 HTTPS', value: 'certificate'},
+    {title: '信頼済みリバースプロキシの背後で HTTP', value: 'reverse_proxy'},
+];
+
 // 優先する地デジのエリアの選択肢
 const preferred_terrestrial_region_options = [
     { title: '未設定', value: null },
@@ -525,6 +651,89 @@ const server_settings_store = useServerSettingsStore();
 const { server_settings: base_server_settings } = storeToRefs(server_settings_store);
 const server_settings = ref<IServerSettings>(structuredClone(toRaw(base_server_settings.value)));
 
+// inherit の場合は通常 API の動作モードを利用して、実際に使用する物理リッスンポートを判定する
+const compatibility_api_effective_https_mode = computed<IServerSettings['server']['https_mode']>(() => {
+    const https_mode = server_settings.value.compatibility_api.https_mode;
+    return https_mode === 'inherit' ? server_settings.value.server.https_mode : https_mode;
+});
+
+const compatibility_api_port_error = computed(() => {
+    const compatibility_api_port = Number(server_settings.value.compatibility_api.port);
+    const server_port = Number(server_settings.value.server.port);
+    if (Number.isInteger(compatibility_api_port) === false || compatibility_api_port < 1024 || compatibility_api_port > 65525) {
+        return '1024 ～ 65525 の整数を指定してください。';
+    }
+    if (server_settings.value.compatibility_api.enabled === false) {
+        return '';
+    }
+    if (Number.isInteger(server_port) === false) {
+        return '';
+    }
+
+    const server_listener_ports = [server_port];
+    if (server_settings.value.server.https_mode === 'akebi') {
+        server_listener_ports.push(server_port + 10);
+    }
+    const compatibility_api_listener_ports = [compatibility_api_port];
+    if (compatibility_api_effective_https_mode.value === 'akebi') {
+        compatibility_api_listener_ports.push(compatibility_api_port + 10);
+    }
+    const conflicted_port = compatibility_api_listener_ports.find(port => server_listener_ports.includes(port));
+    if (conflicted_port !== undefined) {
+        return `通常 API または Akebi の内部通信が使用するポート ${conflicted_port} と重複しています。`;
+    }
+    return '';
+});
+
+const compatibility_api_certificate_error = computed(() => {
+    if (server_settings.value.compatibility_api.https_mode !== 'certificate') {
+        return '';
+    }
+    const certificate = server_settings.value.compatibility_api.custom_https_certificate;
+    if (typeof certificate !== 'string' || certificate.trim().startsWith('/') === false) {
+        return '証明書ファイルの絶対パスを指定してください。';
+    }
+    return '';
+});
+
+const compatibility_api_private_key_error = computed(() => {
+    if (server_settings.value.compatibility_api.https_mode !== 'certificate') {
+        return '';
+    }
+    const private_key = server_settings.value.compatibility_api.custom_https_private_key;
+    if (typeof private_key !== 'string' || private_key.trim().startsWith('/') === false) {
+        return '秘密鍵ファイルの絶対パスを指定してください。';
+    }
+    return '';
+});
+
+const compatibility_api_reverse_proxy_listen_address_error = computed(() => {
+    if (server_settings.value.compatibility_api.https_mode !== 'reverse_proxy') {
+        return '';
+    }
+    if (server_settings.value.compatibility_api.reverse_proxy_listen_address.trim() === '') {
+        return '互換 API の HTTP リッスンアドレスを指定してください。';
+    }
+    return '';
+});
+
+const compatibility_api_trusted_proxy_cidrs_error = computed(() => {
+    if (server_settings.value.compatibility_api.https_mode !== 'reverse_proxy') {
+        return '';
+    }
+    const has_trusted_proxy_cidr = server_settings.value.compatibility_api.trusted_proxy_cidrs
+        .some(cidr => cidr.trim() !== '');
+    return has_trusted_proxy_cidr ? '' : '信頼するリバースプロキシの CIDR を1件以上指定してください。';
+});
+
+const has_compatibility_api_validation_error = computed(() => [
+    compatibility_api_port_error.value,
+    compatibility_api_certificate_error.value,
+    compatibility_api_private_key_error.value,
+    compatibility_api_reverse_proxy_listen_address_error.value,
+    compatibility_api_trusted_proxy_cidrs_error.value,
+].some(error => error !== ''));
+
 function resetServerSettingsDraft(): void {
     server_settings.value = structuredClone(toRaw(base_server_settings.value));
 }
@@ -542,6 +751,10 @@ watch(() => props.section, () => {
 
 // サーバー設定を更新する関数
 async function updateServerSettings() {
+    if (props.section === 'basic' && has_compatibility_api_validation_error.value) {
+        return;
+    }
+
     // すべての section と BS4K 設定で同じ正規化・更新経路を利用する
     const result = await server_settings_store.updateServerSettings(server_settings.value);
 

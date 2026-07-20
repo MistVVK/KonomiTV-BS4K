@@ -37,6 +37,34 @@ from app.constants import (
 from app.utils.TSInformation import TerrestrialRegion
 
 
+def _GetUsedListenPorts() -> set[int]:
+    """現在の KonomiTV プロセス群を除き、他プロセスが待ち受けている TCP ポートを取得する。"""
+
+    current_process = psutil.Process()
+    used_ports: set[int] = set()
+    for connection in psutil.net_connections():
+        if connection.status != 'LISTEN' or connection.pid is None:
+            continue
+
+        # サーバー設定更新時は、稼働中の Uvicorn・リローダー・Akebi がすでに対象ポートを使用している。
+        # 現在プロセスと同じプロセスツリーに属する待ち受けは除外し、外部プロセスとの衝突だけを検出する。
+        try:
+            process = psutil.Process(connection.pid)
+            if (
+                process.pid == current_process.pid or
+                process.pid == current_process.ppid() or
+                process.ppid() == current_process.pid or
+                process.ppid() == current_process.ppid()
+            ):
+                continue
+        except Exception:
+            pass
+
+        if connection.laddr is not None:
+            used_ports.add(cast(Any, connection.laddr).port)
+    return used_ports
+
+
 # クライアント設定を表す Pydantic モデル (クライアント設定同期用 API で利用)
 # デバイス間で同期するとかえって面倒なことになりそうな設定は除外されている
 # 詳細は client/src/services/Settings.ts と client/src/stores/SettingsStore.ts を参照
@@ -377,29 +405,7 @@ class _ServerSettingsServer(BaseModel):
                 '設定したポート番号が 1024 ~ 65525 (65535 ではない) の間に収まっているかを確認してください。'
             )
         # 使用中のポートを取得
-        # ref: https://qiita.com/skokado/items/6e76762c68866d73570b
-        current_process = psutil.Process()
-        used_ports: list[int] = []
-        for conn in psutil.net_connections():
-            if conn.status == 'LISTEN':
-                if conn.pid is None:
-                    continue
-                # 自分自身のプロセスは除外
-                ## サーバーの起動中に再度バリデーションが実行された際に、ポートが使用中と判定されてしまうのを防ぐためのもの
-                ## 自動リロードモードでの reloader process や Akebi は KonomiTV サーバーの子プロセスになるので、
-                ## プロセスの親プロセスの PID が一致するかもチェックする
-                try:
-                    process = psutil.Process(conn.pid)
-                    if ((process.pid == current_process.pid) or
-                        (process.pid == current_process.ppid()) or
-                        (process.ppid() == current_process.pid) or
-                        (process.ppid() == current_process.ppid())):
-                        continue
-                except Exception:
-                    pass
-                # 使用中のポートに追加
-                if conn.laddr is not None:
-                    used_ports.append(cast(Any, conn.laddr).port)
+        used_ports = _GetUsedListenPorts()
         # リッスンポートと同じポートが使われていたら、エラーを表示する
         # Akebi HTTPS Server のリッスンポートと Uvicorn のリッスンポートの両方をチェック
         if port in used_ports:
@@ -411,6 +417,83 @@ class _ServerSettingsServer(BaseModel):
             raise ValueError(
                 f'ポート {port + 10} ({port} + 10) は他のプロセスで使われているため、KonomiTV を起動できません。\n'
                 f'重複して KonomiTV を起動していないか、他のソフトでポート {port + 10} を使っていないかを確認してください。'
+            )
+        return port
+
+class _ServerSettingsCompatibilityAPI(BaseModel):
+    enabled: bool = False
+    https_mode: Literal['inherit', 'akebi', 'certificate', 'reverse_proxy'] = 'inherit'
+    port: PositiveInt = 7200
+    profile: Literal['KomorebiV1'] = 'KomorebiV1'
+    custom_https_certificate: FilePath | None = None
+    custom_https_private_key: FilePath | None = None
+    reverse_proxy_listen_address: IPvAnyAddress = ipaddress.IPv4Address('0.0.0.0')
+    trusted_proxy_cidrs: list[IPvAnyNetwork] = []
+
+    @model_validator(mode='after')
+    def validate_https_mode(self, info: ValidationInfo) -> '_ServerSettingsCompatibilityAPI':
+        """互換 API 専用の HTTPS モードと関連設定が矛盾しないことを検証する。"""
+
+        # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する
+        if type(info.context) is dict and info.context.get('bypass_validation') is True:
+            return self
+
+        certificate_is_set = self.custom_https_certificate is not None
+        private_key_is_set = self.custom_https_private_key is not None
+
+        if self.https_mode in ('inherit', 'akebi'):
+            if certificate_is_set or private_key_is_set:
+                raise ValueError(
+                    '互換 API の https_mode が inherit または akebi の場合、専用の HTTPS 証明書は指定できません。'
+                )
+            if self.trusted_proxy_cidrs:
+                raise ValueError(
+                    '互換 API の trusted_proxy_cidrs は https_mode が reverse_proxy の場合のみ指定できます。'
+                )
+            if str(self.reverse_proxy_listen_address) != '0.0.0.0':
+                raise ValueError(
+                    '互換 API の reverse_proxy_listen_address は '
+                    'https_mode が reverse_proxy の場合のみ変更できます。'
+                )
+
+        elif self.https_mode == 'certificate':
+            if certificate_is_set is False or private_key_is_set is False:
+                raise ValueError(
+                    '互換 API の https_mode が certificate の場合、custom_https_certificate と '
+                    'custom_https_private_key の両方を指定してください。'
+                )
+            if self.trusted_proxy_cidrs:
+                raise ValueError(
+                    '互換 API の trusted_proxy_cidrs は https_mode が reverse_proxy の場合のみ指定できます。'
+                )
+            if str(self.reverse_proxy_listen_address) != '0.0.0.0':
+                raise ValueError(
+                    '互換 API の reverse_proxy_listen_address は '
+                    'https_mode が reverse_proxy の場合のみ変更できます。'
+                )
+
+        elif self.https_mode == 'reverse_proxy':
+            if certificate_is_set or private_key_is_set:
+                raise ValueError(
+                    '互換 API の https_mode が reverse_proxy の場合、custom_https_certificate と '
+                    'custom_https_private_key は指定できません。'
+                )
+            if not self.trusted_proxy_cidrs:
+                raise ValueError(
+                    '互換 API の https_mode が reverse_proxy の場合、trusted_proxy_cidrs を1件以上指定してください。'
+                )
+
+        return self
+
+    @field_validator('port')
+    def validate_port(cls, port: int, info: ValidationInfo) -> int:
+        # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する
+        if type(info.context) is dict and info.context.get('bypass_validation') is True:
+            return port
+        if port < 1024 or port > 65525:
+            raise ValueError(
+                '互換 API のポート番号が不正なため、KonomiTV を起動できません。\n'
+                '設定したポート番号が 1024 ~ 65525 の間に収まっているかを確認してください。'
             )
         return port
 
@@ -455,9 +538,65 @@ class _ServerSettingsCapture(BaseModel):
 class ServerSettings(BaseModel):
     general: _ServerSettingsGeneral = _ServerSettingsGeneral()
     server: _ServerSettingsServer = _ServerSettingsServer()
+    compatibility_api: _ServerSettingsCompatibilityAPI = _ServerSettingsCompatibilityAPI()
     tv: _ServerSettingsTV = _ServerSettingsTV()
     video: _ServerSettingsVideo = _ServerSettingsVideo()
     capture: _ServerSettingsCapture = _ServerSettingsCapture()
+
+    @model_validator(mode='after')
+    def validate_compatibility_api(self, info: ValidationInfo) -> 'ServerSettings':
+        """互換 API と通常 API のリスナが互いに衝突しないことを検証する。"""
+
+        if type(info.context) is dict and info.context.get('bypass_validation') is True:
+            return self
+        if self.compatibility_api.enabled is False:
+            return self
+
+        compatibility_https_mode = (
+            self.server.https_mode
+            if self.compatibility_api.https_mode == 'inherit'
+            else self.compatibility_api.https_mode
+        )
+        listen_ports = {
+            '通常 API': self.server.port,
+            '互換 API': self.compatibility_api.port,
+        }
+        if self.server.https_mode == 'akebi':
+            listen_ports['通常 API の内部 Uvicorn'] = self.server.port + 10
+        if compatibility_https_mode == 'akebi':
+            listen_ports['互換 API の内部 Uvicorn'] = self.compatibility_api.port + 10
+
+        port_owners: dict[int, str] = {}
+        for owner, port in listen_ports.items():
+            if port in port_owners:
+                raise ValueError(
+                    f'{owner} のポート {port} が {port_owners[port]} と重複しています。\n'
+                    '通常 API と互換 API が使用するポートを重複しない値に変更してください。'
+                )
+            port_owners[port] = owner
+
+        used_ports = _GetUsedListenPorts()
+        compatibility_ports = {'互換 API': self.compatibility_api.port}
+        if compatibility_https_mode == 'akebi':
+            compatibility_ports['互換 API の内部 Uvicorn'] = self.compatibility_api.port + 10
+        for owner, port in compatibility_ports.items():
+            if port in used_ports:
+                raise ValueError(
+                    f'{owner} のポート {port} は他のプロセスで使われているため、KonomiTV を起動できません。\n'
+                    f'他のソフトでポート {port} を使っていないかを確認してください。'
+                )
+
+        return self
+
+
+def ResolveCompatibilityHTTPSSettings(
+    settings: ServerSettings,
+) -> _ServerSettingsServer | _ServerSettingsCompatibilityAPI:
+    """互換 API が実際に使用する HTTPS 設定を返す。"""
+
+    if settings.compatibility_api.https_mode == 'inherit':
+        return settings.server
+    return settings.compatibility_api
 
 
 # サーバー設定データと読み込み・保存用の関数
@@ -565,10 +704,15 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
             config_dict['capture']['upload_folders'] = [_DOCKER_PATH_PREFIX + folder for folder in config_dict['capture']['upload_folders']]
             if type(config_dict['tv']['debug_mode_ts_path']) is str:
                 config_dict['tv']['debug_mode_ts_path'] = _DOCKER_PATH_PREFIX + config_dict['tv']['debug_mode_ts_path']
-            if type(config_dict['server']['custom_https_certificate']) is str:
-                config_dict['server']['custom_https_certificate'] = _DOCKER_PATH_PREFIX + config_dict['server']['custom_https_certificate']
-            if type(config_dict['server']['custom_https_private_key']) is str:
-                config_dict['server']['custom_https_private_key'] = _DOCKER_PATH_PREFIX + config_dict['server']['custom_https_private_key']
+            for https_section in ('server', 'compatibility_api'):
+                if type(config_dict[https_section]['custom_https_certificate']) is str:
+                    config_dict[https_section]['custom_https_certificate'] = (
+                        _DOCKER_PATH_PREFIX + config_dict[https_section]['custom_https_certificate']
+                    )
+                if type(config_dict[https_section]['custom_https_private_key']) is str:
+                    config_dict[https_section]['custom_https_private_key'] = (
+                        _DOCKER_PATH_PREFIX + config_dict[https_section]['custom_https_private_key']
+                    )
     except Exception:
         pass  # config.yaml の記述が不正な場合は何もしない（どっちみち後のバリデーション処理で弾かれる）
 
@@ -634,10 +778,15 @@ def SaveConfig(config: ServerSettings) -> None:
         config_dict['capture']['upload_folders'] = [str(folder).replace(_DOCKER_PATH_PREFIX, '') for folder in config_dict['capture']['upload_folders']]
         if type(config_dict['tv']['debug_mode_ts_path']) is str or config_dict['tv']['debug_mode_ts_path'] is Path:
             config_dict['tv']['debug_mode_ts_path'] = str(config_dict['tv']['debug_mode_ts_path']).replace(_DOCKER_PATH_PREFIX, '')
-        if type(config_dict['server']['custom_https_certificate']) is str:
-            config_dict['server']['custom_https_certificate'] = config_dict['server']['custom_https_certificate'].replace(_DOCKER_PATH_PREFIX, '')
-        if type(config_dict['server']['custom_https_private_key']) is str:
-            config_dict['server']['custom_https_private_key'] = config_dict['server']['custom_https_private_key'].replace(_DOCKER_PATH_PREFIX, '')
+        for https_section in ('server', 'compatibility_api'):
+            if type(config_dict[https_section]['custom_https_certificate']) is str:
+                config_dict[https_section]['custom_https_certificate'] = (
+                    config_dict[https_section]['custom_https_certificate'].replace(_DOCKER_PATH_PREFIX, '')
+                )
+            if type(config_dict[https_section]['custom_https_private_key']) is str:
+                config_dict[https_section]['custom_https_private_key'] = (
+                    config_dict[https_section]['custom_https_private_key'].replace(_DOCKER_PATH_PREFIX, '')
+                )
 
     # config.yaml の内容をロード
     yaml = ruamel.yaml.YAML()

@@ -3,10 +3,13 @@ import asyncio
 import atexit
 import logging
 import os
+import socket
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import typer
 import uvicorn
@@ -14,7 +17,7 @@ from aerich import Command
 from tortoise import Tortoise
 from uvicorn.supervisors.watchfilesreload import WatchFilesReload
 
-from app.config import LoadConfig
+from app.config import LoadConfig, ResolveCompatibilityHTTPSSettings
 from app.constants import (
     AKEBI_LOG_PATH,
     BASE_DIR,
@@ -29,6 +32,7 @@ from app.utils.HTTPS import (
     BuildServerStartupSettings,
     GetAkebiAccessURLs,
     GetRequiredThirdpartyLibraries,
+    ServerStartupSettings,
 )
 from app.utils.LogRotation import SplitServerLogByDate
 
@@ -38,6 +42,100 @@ from app.utils.LogRotation import SplitServerLogByDate
 logging.getLogger('passlib').setLevel(logging.ERROR)
 
 cli = typer.Typer()
+
+
+def BindUvicornSocket(server_config: uvicorn.Config, startup_settings: ServerStartupSettings) -> socket.socket:
+    """指定された Uvicorn 設定でリスナ用のソケットを事前に確保する。"""
+
+    original_host = server_config.host
+    original_port = server_config.port
+    try:
+        server_config.host = startup_settings.host
+        server_config.port = startup_settings.port
+        return server_config.bind_socket()
+    finally:
+        server_config.host = original_host
+        server_config.port = original_port
+
+
+class MultiListenerUvicornServer(uvicorn.Server):
+    """リスナごとに異なる HTTP/TLS 設定を適用し、lifespan と状態は共有する Uvicorn Server。"""
+
+    def __init__(self, listener_configs: list[uvicorn.Config]) -> None:
+        if not listener_configs:
+            raise ValueError('At least one Uvicorn listener config is required.')
+        super().__init__(listener_configs[0])
+        self.listener_configs = listener_configs
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        """通常 API の lifespan を一度だけ起動し、各ソケットへ固有の TLS 設定を割り当てる。"""
+
+        if sockets is None or len(sockets) != len(self.listener_configs):
+            raise ValueError('One pre-bound socket is required for each Uvicorn listener config.')
+
+        # 証明書の読み込みなどで失敗する設定は、通常 API の lifespan 起動前に検出する。
+        for listener_config in self.listener_configs[1:]:
+            if listener_config.loaded is False:
+                listener_config.load()
+
+        # 通常 API は Uvicorn 標準の起動経路を使い、lifespan と共有 ServerState を初期化する。
+        await super().startup(sockets=[sockets[0]])
+        if self.should_exit:
+            return
+
+        loop = asyncio.get_running_loop()
+        try:
+            for listener_config, listener_socket in zip(self.listener_configs[1:], sockets[1:]):
+                def CreateProtocol(
+                    _loop: asyncio.AbstractEventLoop | None = None,
+                    config: uvicorn.Config = listener_config,
+                ) -> asyncio.Protocol:
+                    protocol_class = cast(Callable[..., asyncio.Protocol], config.http_protocol_class)
+                    return protocol_class(
+                        config = config,
+                        server_state = self.server_state,
+                        app_state = self.lifespan.state,
+                        _loop = _loop,
+                    )
+
+                listener_server = await loop.create_server(
+                    CreateProtocol,
+                    sock = listener_socket,
+                    ssl = listener_config.ssl,
+                    backlog = listener_config.backlog,
+                )
+                self.servers.append(listener_server)
+        except BaseException:
+            # 途中のリスナ起動に失敗した場合、通常 API だけが残らないように一括停止する。
+            await super().shutdown(sockets=sockets)
+            self.started = False
+            raise
+
+
+def CreateUvicornConfig(
+    startup_settings: ServerStartupSettings,
+    *,
+    reload: bool,
+) -> uvicorn.Config:
+    """1つの公開 API リスナに対応する Uvicorn 設定を作成する。"""
+
+    return uvicorn.Config(
+        app = 'app.app:application',
+        host = startup_settings.host,
+        port = startup_settings.port,
+        ssl_certfile = startup_settings.ssl_certfile,
+        ssl_keyfile = startup_settings.ssl_keyfile,
+        # TCP 接続元の CIDR 検証前に転送ヘッダーを反映させない
+        proxy_headers = startup_settings.proxy_headers,
+        reload = reload,
+        reload_dirs = str(BASE_DIR / 'app') if reload else None,
+        log_config = LOGGING_CONFIG,
+        interface = 'asgi3',
+        http = 'httptools',
+        # イベントループのセットアップは KonomiTV.py 側で行う
+        loop = 'none',
+        timeout_graceful_shutdown = 1,
+    )
 
 def version(value: bool):
     if value is True:
@@ -123,8 +221,18 @@ def main(
     ## LoadConfig() 内でエラーログを出力した後、sys.exit(1) でサーバーが終了される
     CONFIG = LoadConfig()
 
-    # akebi モードの場合だけ Akebi バイナリを確認し、前回の Akebi ログを削除する
-    if CONFIG.server.https_mode == 'akebi':
+    compatibility_https_settings = (
+        ResolveCompatibilityHTTPSSettings(CONFIG)
+        if CONFIG.compatibility_api.enabled
+        else None
+    )
+    akebi_is_required = (
+        CONFIG.server.https_mode == 'akebi' or
+        (compatibility_https_settings is not None and compatibility_https_settings.https_mode == 'akebi')
+    )
+
+    # 通常 API または互換 API が akebi モードの場合だけ、Akebi バイナリを確認して前回ログを削除する
+    if akebi_is_required:
         akebi_path = LIBRARY_PATH['Akebi']
         if Path(akebi_path).is_file() is False:
             logging.error('Akebi がサードパーティーライブラリとして配置されていないため、KonomiTV を起動できません。')
@@ -139,59 +247,64 @@ def main(
     # ***** KonomiTV サーバーを起動 *****
 
     startup_settings = BuildServerStartupSettings(CONFIG.server)
+    compatibility_startup_settings: ServerStartupSettings | None = None
+    if compatibility_https_settings is not None:
+        compatibility_startup_settings = BuildServerStartupSettings(
+            compatibility_https_settings,
+            port = CONFIG.compatibility_api.port,
+        )
 
-    # akebi モードの場合だけ Akebi Keyless Server を起動する
-    reverse_proxy_process: subprocess.Popen[bytes] | None = None
+    # akebi モードのリスナごとに Akebi Keyless Server を起動する
+    reverse_proxy_processes: list[subprocess.Popen[bytes]] = []
+    akebi_listeners: list[tuple[int, ServerStartupSettings]] = []
     if startup_settings.use_akebi:
-        with open(AKEBI_LOG_PATH, mode='w', encoding='utf-8') as file:
-            reverse_proxy_process = subprocess.Popen(
-                [
-                    LIBRARY_PATH['Akebi'],
-                    '--listen-address', f'0.0.0.0:{CONFIG.server.port}',
-                    '--proxy-pass-url', f'http://{startup_settings.host}:{startup_settings.port}/',
-                    '--keyless-server-url', 'https://akebi.konomi.tv/',
-                ],
-                stdout = file,
-                stderr = file,
-            )
+        akebi_listeners.append((CONFIG.server.port, startup_settings))
+    if compatibility_startup_settings is not None and compatibility_startup_settings.use_akebi:
+        akebi_listeners.append((CONFIG.compatibility_api.port, compatibility_startup_settings))
+    if akebi_listeners:
+        # 従来どおりサーバー起動ごとにログを初期化し、各 Akebi は同じファイルへ追記する。
+        with open(AKEBI_LOG_PATH, mode='w', encoding='utf-8'):
+            pass
+        for public_port, internal_settings in akebi_listeners:
+            # 複数の Akebi が同時に書き込んでもログを上書きしないよう、追記モードで共通ログを開く。
+            with open(AKEBI_LOG_PATH, mode='a', encoding='utf-8') as file:
+                reverse_proxy_process = subprocess.Popen(
+                    [
+                        LIBRARY_PATH['Akebi'],
+                        '--listen-address', f'0.0.0.0:{public_port}',
+                        '--proxy-pass-url', f'http://{internal_settings.host}:{internal_settings.port}/',
+                        '--keyless-server-url', 'https://akebi.konomi.tv/',
+                    ],
+                    stdout = file,
+                    stderr = file,
+                )
+            reverse_proxy_processes.append(reverse_proxy_process)
 
-        # このプロセスが終了されたときに、Akebi も一緒に終了する
-        atexit.register(reverse_proxy_process.terminate)
+            # このプロセスが終了されたときに、Akebi も一緒に終了する
+            atexit.register(reverse_proxy_process.terminate)
 
         # upstream インストーラーと同じ規則で、Akebi の証明書を利用してアクセスできる URL を表示する
-        logging.info('KonomiTV にアクセスできる URL:')
-        for access_url, interface_name in GetAkebiAccessURLs(CONFIG.server.port):
-            logging.info(f'  {access_url} ({interface_name})')
+        if startup_settings.use_akebi:
+            logging.info('KonomiTV にアクセスできる URL:')
+            for access_url, interface_name in GetAkebiAccessURLs(CONFIG.server.port):
+                logging.info(f'  {access_url} ({interface_name})')
+        if compatibility_startup_settings is not None and compatibility_startup_settings.use_akebi:
+            logging.info(f'{CONFIG.compatibility_api.profile} 互換 API にアクセスできる URL:')
+            for access_url, interface_name in GetAkebiAccessURLs(CONFIG.compatibility_api.port):
+                logging.info(f'  {access_url} ({interface_name})')
 
-    # Uvicorn の設定
-    server_config = uvicorn.Config(
-        # 起動するアプリケーション
-        app = 'app.app:app',
-        # リッスンするアドレス
-        host = startup_settings.host,
-        port = startup_settings.port,
-        ssl_certfile = startup_settings.ssl_certfile,
-        ssl_keyfile = startup_settings.ssl_keyfile,
-        # TCP 接続元の CIDR 検証前に転送ヘッダーを反映させない
-        proxy_headers = startup_settings.proxy_headers,
-        # 自動リロードモードモードで起動するか
-        reload = reload,
-        # リロードするフォルダ
-        reload_dirs = str(BASE_DIR / 'app') if reload else None,
-        # ロギングの設定
-        log_config = LOGGING_CONFIG,
-        # インターフェイスとして ASGI3 を選択
-        interface = 'asgi3',
-        # HTTP プロトコルの実装として httptools を選択
-        http = 'httptools',
-        # イベントループのセットアップは自前で行うため、ここでは none を指定
-        loop = 'none',
-        # ストリーミング配信中にサーバーシャットダウンを要求された際、強制的に接続を切断するまでの秒数
-        timeout_graceful_shutdown = 1,
-    )
+    # リスナごとに HTTP/TLS 設定を分離しつつ、単一 Uvicorn Server の lifespan と状態を共有する。
+    # これにより通常 API と互換 API で、HTTP・Akebi・直接 TLS・証明書を独立して選択できる。
+    server_configs = [CreateUvicornConfig(startup_settings, reload=reload)]
+    server_sockets = [BindUvicornSocket(server_configs[0], startup_settings)]
+    if compatibility_startup_settings is not None:
+        compatibility_server_config = CreateUvicornConfig(compatibility_startup_settings, reload=False)
+        server_configs.append(compatibility_server_config)
+        server_sockets.append(BindUvicornSocket(compatibility_server_config, compatibility_startup_settings))
 
     # Uvicorn のサーバーインスタンスを初期化
-    server = uvicorn.Server(server_config)
+    server = MultiListenerUvicornServer(server_configs)
+    server_config = server_configs[0]
 
     # Linux では Uvloop をイベントループとして利用する
     import uvloop
@@ -204,18 +317,17 @@ def main(
     try:
         if server_config.should_reload:
             # 自動リロードモード
-            sock = server_config.bind_socket()
-            WatchFilesReload(server_config, target=server.run, sockets=[sock]).run()
+            WatchFilesReload(server_config, target=server.run, sockets=server_sockets).run()
         else:
             # 通常時
-            server.run()
+            server.run(sockets=server_sockets)
     except KeyboardInterrupt:
         # Uvicorn のサーバーインスタンスから KeyboardInterrupt が送出された場合は一旦無視する
         # 少し前の Uvicorn は KeyboardInterrupt を内部で握り潰していたが、最近のバージョンから送出するようになった
         pass
 
     # akebi モードの場合だけ Akebi を終了する
-    if reverse_proxy_process is not None:
+    for reverse_proxy_process in reverse_proxy_processes:
         reverse_proxy_process.terminate()
 
     # この時点ではタイミングの関係でまだロックファイルが作成されていないことがあるので、1秒待機する

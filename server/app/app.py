@@ -10,9 +10,11 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.types import ASGIApp
 
 from app import logging
-from app.config import Config, LoadConfig
+from app.CompatibilityAPI import CreateCompatibilityAPI, PortDispatchApplication
+from app.config import Config, LoadConfig, ResolveCompatibilityHTTPSSettings
 from app.constants import (
     CLIENT_DIR,
     DATABASE_CONFIG,
@@ -52,7 +54,7 @@ from app.streams.LiveStream import LiveStream
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
-from app.utils.HTTPS import ReverseProxyMiddleware
+from app.utils.HTTPS import BuildServerStartupSettings, ReverseProxyMiddleware
 
 
 # もし Config() の実行時に AssertionError が発生した場合は、LoadConfig() を実行してサーバー設定データをロードする
@@ -329,3 +331,25 @@ async def Shutdown():
 # shutdown イベントが発火しない場合も想定し、アプリケーションの終了時に Shutdown() が確実に呼ばれるように
 # atexit は同期関数しか実行できないので、asyncio.run() でくるむ
 atexit.register(asyncio.run, Shutdown())
+
+# 互換 API は通常 API と同じプロセス・DB・ストリーム状態を共有する一方、別の FastAPI ルーター集合を使う。
+# lifespan は PortDispatchApplication が通常アプリだけへ転送するため、起動・終了処理が二重に走ることはない。
+application: ASGIApp = app
+if CONFIG.compatibility_api.enabled:
+    compatibility_https_settings = ResolveCompatibilityHTTPSSettings(CONFIG)
+    trusted_proxy_cidrs = None
+    if compatibility_https_settings.https_mode == 'reverse_proxy':
+        trusted_proxy_cidrs = [str(cidr) for cidr in compatibility_https_settings.trusted_proxy_cidrs]
+    compatibility_app = CreateCompatibilityAPI(
+        profile = CONFIG.compatibility_api.profile,
+        trusted_proxy_cidrs = trusted_proxy_cidrs,
+    )
+    compatibility_startup_settings = BuildServerStartupSettings(
+        compatibility_https_settings,
+        port = CONFIG.compatibility_api.port,
+    )
+    application = PortDispatchApplication(
+        main_app = app,
+        compatibility_app = compatibility_app,
+        compatibility_port = compatibility_startup_settings.port,
+    )

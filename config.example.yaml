@@ -106,6 +106,36 @@ server:
     # IPv4・IPv6 の両方を指定できます。akebi / certificate モードでは空のままにしてください。
     trusted_proxy_cidrs: []
 
+# =============================== 互換 API の設定 ===============================
+compatibility_api:
+
+    # Komorebi など、upstream KonomiTV API との互換性を必要とするクライアント向け API を別ポートで公開するか
+    enabled: false
+
+    # 互換 API のリッスンポート
+    # akebi モードでは、このポート + 10 も内部通信用に使用します。
+    port: 7200
+
+    # 互換 API の HTTPS / リバースプロキシ動作モード
+    # inherit: 通常 API と同じ設定を使用します。旧バージョンと同じ動作です。
+    # akebi / certificate / reverse_proxy: 互換 API 専用の設定を使用します。
+    https_mode: 'inherit'
+
+    # https_mode: 'certificate' の場合に使用する、互換 API 専用の HTTPS 証明書と秘密鍵
+    custom_https_certificate: null
+    custom_https_private_key: null
+
+    # https_mode: 'reverse_proxy' の場合に使用する、互換 API 専用のリッスンアドレス
+    reverse_proxy_listen_address: '0.0.0.0'
+
+    # 転送ヘッダーを信頼するリバースプロキシの CIDR
+    # https_mode: 'reverse_proxy' の場合は1件以上必須です。
+    trusted_proxy_cidrs: []
+
+    # 提供する互換プロファイル
+    # 現在は KomorebiV1 のみ利用できます。
+    profile: 'KomorebiV1'
+
 # ======================= テレビのライブストリーミングの設定 =======================
 tv:
 
