@@ -498,11 +498,17 @@ const handleSettingCoverClick = () => {
             }
         }
         .dplayer-setting-audio-panel {
-            // 現在位置に存在しない音声も録画全体の候補として残し、選択不能であることを示す
+            // ライブで配信 TS に存在しない DPlayer の固定音声項目は表示しない。
+            // 録画だけは現在位置に存在しない音声も全体の候補として残し、選択不能であることを示す。
             .dplayer-setting-audio-item.dplayer-setting-audio-item--disabled:not(.dplayer-setting-audio-item--status) {
-                cursor: default;
-                opacity: 0.45;
-                pointer-events: none;
+                display: none;
+
+                .watch-player--video & {
+                    display: flex;
+                    cursor: default;
+                    opacity: 0.45;
+                    pointer-events: none;
+                }
             }
             // 「音声不明」「音声なし」は選択できない状態表示として扱う
             .dplayer-setting-audio-item.dplayer-setting-audio-item--status {
