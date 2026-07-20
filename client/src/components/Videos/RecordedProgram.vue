@@ -112,11 +112,13 @@
                             </template>
                             <v-list-item-title class="ml-3">メタデータを再解析</v-list-item-title>
                         </v-list-item>
-                        <v-list-item @click="detectCMSections" v-ftooltip="'この録画ファイル全体を検査し、CM 区間を再判定します（時間がかかる場合があります）'">
+                        <v-list-item @click="detectCMSections" :disabled="isCMAnalysisRequesting" v-ftooltip="'この録画ファイル全体を検査し、CM 区間を再判定します（時間がかかる場合があります）'">
                             <template v-slot:prepend>
                                 <Icon icon="fluent:scan-dash-20-regular" width="20px" height="20px" />
                             </template>
-                            <v-list-item-title class="ml-3">CM 区間を再判定</v-list-item-title>
+                            <v-list-item-title class="ml-3">
+                                {{ isCMAnalysisRequesting ? 'CM 区間を再判定中' : 'CM 区間を再判定' }}
+                            </v-list-item-title>
                         </v-list-item>
                         <v-list-item @click="regenerateThumbnail()" v-ftooltip="'サムネイルのみを再生成します（数分かかります） 変更を反映するにはブラウザキャッシュの削除が必要です'">
                             <template v-slot:prepend>
@@ -165,10 +167,11 @@
 </template>
 <script lang="ts" setup>
 
-import { ref, computed } from 'vue';
+import { ref, computed, onBeforeUnmount } from 'vue';
 
 import RecordedFileInfoDialog from '@/components/Videos/Dialogs/RecordedFileInfoDialog.vue';
 import Message from '@/message';
+import AnalysisTasks from '@/services/AnalysisTasks';
 import Videos, { IRecordedProgram } from '@/services/Videos';
 import useSettingsStore from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
@@ -193,6 +196,15 @@ const emit = defineEmits<{
 const show_video_info = ref(false);
 // 削除確認ダイアログの表示状態
 const show_delete_confirmation = ref(false);
+// CM 再判定の受付・履歴ポーリングを同じ録画カード内で重複させない
+const isCMAnalysisRequesting = ref(false);
+let cmAnalysisAbortController: AbortController | null = null;
+
+// 画面を離れたらブラウザ側のポーリングだけを止める。受理済みのサーバー解析は継続する。
+onBeforeUnmount(() => {
+    cmAnalysisAbortController?.abort();
+    cmAnalysisAbortController = null;
+});
 
 // 録画ファイルのダウンロード (location.href を変更し、ダウンロード自体はブラウザに任せる)
 const downloadVideo = () => {
@@ -215,14 +227,64 @@ const reanalyzeVideo = async () => {
 
 // CM 区間再判定
 const detectCMSections = async () => {
-    Message.info('CM 区間の再判定を開始します。完了までしばらくお待ちください。');
-    const result = await Videos.detectCMSections(props.program.id);
-    if (result === true) {
-        const updated_program = await Videos.fetchVideo(props.program.id);
-        if (updated_program !== null) {
-            Object.assign(props.program, updated_program);
+    if (isCMAnalysisRequesting.value) return;
+    isCMAnalysisRequesting.value = true;
+    const abortController = new AbortController();
+    cmAnalysisAbortController = abortController;
+
+    try {
+        const accepted = await Videos.detectCMSections(props.program.id, abortController.signal);
+        if (accepted === null) return;
+        Message.info(accepted.reused
+            ? 'この録画の CM 区間はすでに再判定中です。完了までしばらくお待ちください。'
+            : 'CM 区間の再判定を開始しました。完了までしばらくお待ちください。');
+
+        // HTTP受付ではなく、永続化された解析履歴の終端状態をもって完了を判定する。
+        const execution = await AnalysisTasks.waitForCompletion(accepted.execution_id, abortController.signal);
+        if (execution === null) return;
+        const updatedProgram = await Videos.fetchVideo(props.program.id, abortController.signal, false);
+        if (updatedProgram !== null) {
+            Object.assign(props.program, updatedProgram);
         }
-        Message.success('CM 区間の再判定が完了しました。');
+
+        const cmStatus = updatedProgram?.recorded_video.cm_analysis_status ?? null;
+        const errorCode = updatedProgram?.recorded_video.cm_analysis_error_code ?? execution.error_code;
+        const errorSuffix = errorCode !== null ? `（${errorCode}）` : '';
+        if (execution.status === 'Succeeded' && cmStatus === 'Completed') {
+            Message.success('CM 区間の再判定が完了しました。');
+        } else if (execution.status === 'Skipped') {
+            switch (execution.error_code) {
+                case 'ExternalCanonicalChapterProtected':
+                    Message.warning('外部ツールが作成した chapter を保護するため、CM 区間は再判定されませんでした。');
+                    break;
+                case 'CMAnalysisDisabled':
+                    Message.warning('CM 解析が無効なため、CM 区間は再判定されませんでした。');
+                    break;
+                case 'ExcludedDirectory':
+                    Message.warning('CM 解析の除外ディレクトリにあるため、CM 区間は再判定されませんでした。');
+                    break;
+                case 'ExistingChapterKept':
+                    Message.info('既存の chapter を保持したため、CM 区間は再判定されませんでした。');
+                    break;
+                default:
+                    Message.warning(`CM 区間の再判定は実行されませんでした。${errorSuffix}`);
+                    break;
+            }
+        } else if (execution.status === 'Interrupted') {
+            Message.warning(`CM 区間の再判定が中断されました。${errorSuffix}`);
+        } else if (cmStatus === 'Unsupported') {
+            Message.warning(`この録画形式は CM 区間の再判定に対応していません。${errorSuffix}`);
+        } else if (execution.status === 'Failed') {
+            Message.error(`CM 区間の再判定に失敗しました。${errorSuffix}`);
+        } else {
+            // 履歴成功後に録画状態を取得できない場合も、完了したと誤表示せず再読込を促す。
+            Message.warning(`CM 区間の再判定結果を確認できませんでした。ページを再読み込みしてください。${errorSuffix}`);
+        }
+    } finally {
+        if (cmAnalysisAbortController === abortController) {
+            cmAnalysisAbortController = null;
+            isCMAnalysisRequesting.value = false;
+        }
     }
 };
 

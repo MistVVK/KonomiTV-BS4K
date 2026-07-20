@@ -329,6 +329,10 @@ class AnalysisTaskDetail(BaseModel):
     children: list[AnalysisTaskExecution]
     logo_attempts: list[AnalysisTaskLogoAttempt]
 
+class AnalysisTaskAccepted(BaseModel):
+    execution_id: int
+    reused: bool
+
 class VideoStreamTimelineEntry(TypedDict):
     start_time: float
     end_time: float

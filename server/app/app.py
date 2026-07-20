@@ -23,6 +23,7 @@ from app.constants import (
 )
 from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
+from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
@@ -320,6 +321,9 @@ async def Shutdown():
     if recorded_scan_task is not None:
         await recorded_scan_task.stop()
         recorded_scan_task = None
+
+    # DB接続が閉じられる前に、HTTP接続から分離した手動CM再判定を中断・回収する。
+    await CMAnalysisTaskManager.stop()
 
     # DB接続が閉じられる前に録画再生用インデックスワーカーを停止する。
     await RecordedPlaybackIndexer.stop()

@@ -25,7 +25,7 @@ from tortoise import connections
 from app import logging, schemas
 from app.constants import STATIC_DIR, THUMBNAILS_DIR
 from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
-from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
+from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.RecordedPlaybackIndex import (
     RECORDED_PLAYBACK_INDEX_VERSION,
     GetRecordedPlaybackIndexState,
@@ -34,6 +34,7 @@ from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
+from app.models.CMAnalysis import RecordedVideoCMAnalysis, RecordedVideoCMResult
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
@@ -782,12 +783,30 @@ async def VideosSearchAPI(
 )
 async def VideoAPI(
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
-):
+) -> schemas.RecordedProgram:
     """
     指定された録画番組を取得する。
     """
 
-    return recorded_program
+    # ORM本体にはCM解析・公開結果の派生フィールドがないため、一覧APIと同じ状態を明示的に補う。
+    # 補完しない場合、再判定後の再取得で正しい一覧状態がスキーマ既定値のnullへ戻ってしまう。
+    recorded_program_schema = schemas.RecordedProgram.model_validate(recorded_program, from_attributes=True)
+    cm_analysis, cm_result = await asyncio.gather(
+        RecordedVideoCMAnalysis.get_or_none(recorded_video_id=recorded_program.recorded_video.id),
+        RecordedVideoCMResult.get_or_none(recorded_video_id=recorded_program.recorded_video.id),
+    )
+    recorded_video_schema = recorded_program_schema.recorded_video
+    if cm_analysis is not None:
+        recorded_video_schema.cm_analysis_status = cm_analysis.status
+        recorded_video_schema.cm_analysis_error_code = cm_analysis.error_code
+        recorded_video_schema.cm_analysis_finished_at = cm_analysis.finished_at
+    if cm_result is not None:
+        recorded_video_schema.cm_result_source = cm_result.source
+        recorded_video_schema.cm_result_verified = cm_result.verified
+        recorded_video_schema.cm_result_chapter_path_kind = cm_result.chapter_path_kind
+        recorded_video_schema.cm_result_pipeline_version = cm_result.pipeline_version
+        recorded_video_schema.cm_result_published_at = cm_result.published_at
+    return recorded_program_schema
 
 
 def BuildRecordedPlaybackIndex(recorded_program: RecordedProgram) -> schemas.RecordedPlaybackIndex:
@@ -1024,16 +1043,23 @@ async def VideoReanalyzeAPI(
 @router.post(
     '/{video_id}/detect-cm-sections',
     summary = '録画番組 CM 区間再判定 API',
-    status_code = status.HTTP_204_NO_CONTENT,
+    response_model = schemas.AnalysisTaskAccepted,
+    status_code = status.HTTP_202_ACCEPTED,
 )
 async def VideoDetectCMSectionsAPI(
+    response: Response,
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
     replace_existing_chapter: Annotated[
         bool,
-        Query(description='KonomiTVが生成したchapterの再解析と置換を許可する。外部chapterは保持する。'),
+        Query(
+            description=(
+                'KonomiTV生成chapterの再解析と置換、またはlegacy chapterを保持したまま'
+                'canonical chapterを新規生成する。外部canonical chapterは保持する。'
+            ),
+        ),
     ] = False,
-) -> None:
-    """通常は既存chapterを保持し、明示指定時だけKonomiTV生成chapterを再判定する。"""
+) -> schemas.AnalysisTaskAccepted:
+    """個別CM再判定をバックグラウンドで受け付け、ポーリング可能な実行IDを返す。"""
 
     file_path = anyio.Path(recorded_program.recorded_video.file_path)
     if not await file_path.is_file():
@@ -1041,13 +1067,10 @@ async def VideoDetectCMSectionsAPI(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Recorded video file was not found',
         )
-    if replace_existing_chapter:
-        await CMAnalysisOrchestrator().run(recorded_program.recorded_video.id, 'CMRegeneration')
-    else:
-        await RecordedScanTask().processRecordedFile(
-            file_path=file_path,
-            analysis_request='CMDetection',
-        )
+    intent = 'CMRegeneration' if replace_existing_chapter else 'CMDetection'
+    execution_id, reused = await CMAnalysisTaskManager.enqueue(recorded_program.recorded_video.id, intent)
+    response.headers['Location'] = f'/api/analysis-tasks/{execution_id}'
+    return schemas.AnalysisTaskAccepted(execution_id=execution_id, reused=reused)
 
 
 @router.get(

@@ -139,8 +139,19 @@ class CMAnalysisOrchestrator:
         self,
         recorded_video_id: int,
         intent: CMAnalysisIntent = 'DetectCM',
+        *,
+        existing_handle: AnalysisTaskHandle | None = None,
     ) -> RecordedVideoCMAnalysis | None:
-        """chapter を優先して同期し、必要な場合だけ新しい解析試行を開始する。"""
+        """chapter を優先して同期し、必要な場合だけ新しい解析試行を開始する。
+
+        Args:
+            recorded_video_id: 解析対象のRecordedVideo ID。
+            intent: 自動同期または明示的な再判定を表す実行意図。
+            existing_handle: APIが先にQueuedで永続化した解析履歴。指定時は同じ履歴へ進捗を記録する。
+
+        Returns:
+            最新のCM解析状態。対象録画が消えている場合はNone。
+        """
 
         async with self._recordingLock(recorded_video_id):
             recorded_video = await RecordedVideo.get_or_none(id=recorded_video_id).prefetch_related(
@@ -297,6 +308,7 @@ class CMAnalysisOrchestrator:
                         chapter_selection.kind,
                         input_fingerprint,
                         intent,
+                        existing_handle=existing_handle,
                     )
 
     async def syncIfChapterChanged(self, recorded_video_id: int) -> RecordedVideoCMAnalysis | None:
@@ -338,13 +350,32 @@ class CMAnalysisOrchestrator:
         chapter_path_kind: CMChapterPathKind,
         input_fingerprint: dict[str, int | str],
         intent: CMAnalysisIntent,
+        *,
+        existing_handle: AnalysisTaskHandle | None = None,
     ) -> RecordedVideoCMAnalysis:
+        """実CM解析を構造化履歴へ記録しながら実行する。
+
+        Args:
+            recorded_video: 解析対象の録画モデル。
+            state: 更新対象のCM解析状態。
+            settings: 現在のCM解析設定。
+            chapter_result: 解析開始前に読み取ったchapter状態。
+            chapter_path_kind: 採用対象chapterのパス種別。
+            input_fingerprint: 録画入力の内容fingerprint。
+            intent: 自動同期または明示的な再判定を表す実行意図。
+            existing_handle: APIが先にQueuedで永続化した解析履歴。
+
+        Returns:
+            実解析後のCM解析状態。
+        """
+
         trigger = 'Manual' if intent in ('CMDetection', 'CMRegeneration') else 'Automatic'
         async with AnalysisTaskTracker.track(
             'CMAnalysis',
             recorded_video_id=recorded_video.id,
             title=recorded_video.recorded_program.title,
             trigger=trigger,
+            existing_handle=existing_handle,
         ) as history:
             workspace: CMAnalysisWorkspace | None = None
             attempt_key: str | None = None

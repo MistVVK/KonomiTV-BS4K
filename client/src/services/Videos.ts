@@ -1,4 +1,5 @@
 
+import type { IAnalysisTaskAccepted } from '@/services/AnalysisTasks';
 import type { RecordedStreamingAudioCodec } from '@/stores/SettingsStore';
 
 import APIClient from  '@/services/APIClient';
@@ -616,24 +617,27 @@ class Videos {
     /**
      * 録画番組の CM 区間を再判定する
      * @param video_id 録画番組の ID
-     * @returns CM 区間判定に成功した場合は true
+     * @param signal 画面遷移時に受付リクエストだけを中断する AbortSignal
+     * @returns 受け付けた解析履歴、または受付に失敗した場合は null
      */
-    static async detectCMSections(video_id: number): Promise<boolean> {
+    static async detectCMSections(
+        video_id: number,
+        signal?: AbortSignal,
+    ): Promise<IAnalysisTaskAccepted | null> {
 
-        const response = await APIClient.post(
+        const response = await APIClient.post<IAnalysisTaskAccepted>(
             `/videos/${video_id}/detect-cm-sections?replace_existing_chapter=true`,
             undefined,
-            {
-                // join_logo_scp による判定は長時間かかる可能性がある
-                timeout: 60 * 60 * 1000,
-            },
+            {signal},
         );
 
         if (response.type === 'error') {
-            APIClient.showGenericError(response, 'CM 区間の判定に失敗しました。');
-            return false;
+            if (signal?.aborted !== true) {
+                APIClient.showGenericError(response, 'CM 区間の再判定を開始できませんでした。');
+            }
+            return null;
         }
-        return true;
+        return response.data;
     }
 
 
