@@ -728,6 +728,12 @@ class PlayerController {
             apiBackend: {
                 // コメント取得時
                 read: async (options) => {
+                    // 実況機能が無効な場合も DPlayer のコメント機能自体は空の状態で初期化する
+                    // DPlayer 内部の多くが danmaku の存在を前提にしているため、機能ごと削除せず通信だけを止める
+                    if (settings_store.is_jikkyo_enabled === false) {
+                        options.success([]);
+                        return;
+                    }
                     if (this.playback_mode === 'Live') {
                         // ライブ視聴: 空の配列を返す
                         // ライブ視聴では LiveCommentManager 側でリアルタイムにコメントを受信して直接描画するため、ここでは一旦コメント0件として認識させる
@@ -782,6 +788,11 @@ class PlayerController {
                 },
                 // コメント送信時
                 send: async (options) => {
+                    // 非表示のコメントフォームが何らかの理由で呼び出された場合も、実況機能が無効なら送信しない
+                    if (settings_store.is_jikkyo_enabled === false) {
+                        options.error('実況機能は無効です。');
+                        return;
+                    }
                     if (this.playback_mode === 'Live') {
                         // ライブ視聴: コメントを送信する
                         // PlayerManager に登録されているはずの LiveCommentManager を探し、コメントを送信する
@@ -791,6 +802,8 @@ class PlayerController {
                                 return;
                             }
                         }
+                        // 実況機能が有効でも LiveCommentManager が未初期化なら、送信処理を完了待ちのままにしない
+                        options.error('コメント送信機能を初期化できませんでした。');
                     } else {
                         // ビデオ視聴: 過去ログにはコメントできないのでエラーを返す
                         options.error('録画番組にはコメントできません。');
@@ -1335,7 +1348,8 @@ class PlayerController {
             // ライブ視聴時に設定する PlayerManager
             this.player_managers = [
                 new LiveEventManager(this.player),
-                new LiveCommentManager(this.player),
+                // 実況機能が無効な場合は接続情報 API へのアクセスも WebSocket 接続も開始しない
+                ...(settings_store.is_jikkyo_enabled === true ? [new LiveCommentManager(this.player)] : []),
                 new LiveDataBroadcastingManager(this.player),
                 new CaptureManager(this.player, this.playback_mode),
                 new DocumentPiPManager(this.player, this.playback_mode),

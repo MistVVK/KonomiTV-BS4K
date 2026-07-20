@@ -43,7 +43,7 @@
                     KonomiTV アカウントにログインすると、<br>より便利な機能が使えます！
                 </div>
                 <div class="account-register__feature">
-                    <div class="account-feature">
+                    <div class="account-feature" v-if="versionStore.is_jikkyo_enabled_on_server">
                         <Icon class="account-feature__icon" icon="bi:chat-left-text-fill" />
                         <div class="account-feature__info">
                             <span class="account-feature__info-heading">ニコニコ実況にコメントする</span>
@@ -224,6 +224,7 @@ import Message from '@/message';
 import Settings from '@/services/Settings';
 import useSettingsStore, { getSyncableClientSettings, hashClientSettings } from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
+import useVersionStore from '@/stores/VersionStore';
 import Utils from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
 
@@ -280,7 +281,7 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(useSettingsStore, useUserStore),
+        ...mapStores(useSettingsStore, useUserStore, useVersionStore),
     },
     watch: {
         // sync_settings の値の変更を監視する

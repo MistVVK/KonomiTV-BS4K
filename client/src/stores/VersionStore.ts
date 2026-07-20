@@ -16,6 +16,10 @@ const useVersionStore = defineStore('version', {
 
         // 最終更新日時 (UNIX タイムスタンプ、秒単位)
         last_updated_at: 0,
+
+        // バージョン情報 API の直近の取得に失敗したかどうか
+        // 以前の取得結果が残っていても、通信状態を確認できない間は実況機能を Fail Closed にするために使う
+        is_server_version_fetch_failed: false,
     }),
     getters: {
         client_version(): string {
@@ -57,6 +61,10 @@ const useVersionStore = defineStore('version', {
         is_linux_environment(): boolean {
             const env = this.server_environment;
             return env === 'Linux' || env === 'Linux-Docker';
+        },
+        is_jikkyo_enabled_on_server(): boolean {
+            // 未取得時・取得失敗時・旧サーバーからフィールドが返らない場合は、外部サービスへ接続しないよう必ず無効として扱う
+            return this.is_server_version_fetch_failed === false && this.server_version_info?.jikkyo_enabled === true;
         }
     },
     actions: {
@@ -82,10 +90,12 @@ const useVersionStore = defineStore('version', {
             // サーバーのバージョン情報を取得する
             const version_info = await Version.fetchServerVersion();
             if (version_info === null) {
+                this.is_server_version_fetch_failed = true;
                 return null;
             }
             this.server_version_info = version_info;
             this.last_updated_at = Utils.time();
+            this.is_server_version_fetch_failed = false;
 
             return this.server_version_info;
         },

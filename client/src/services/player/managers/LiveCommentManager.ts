@@ -83,7 +83,14 @@ class LiveCommentManager implements PlayerManager {
      */
     public async init(): Promise<void> {
         const player_store = usePlayerStore();
+        const settings_store = useSettingsStore();
         const user_store = useUserStore();
+
+        // PlayerController 側の生成条件をすり抜けても、無効時はユーザー情報取得や接続情報 API へ一切アクセスしない
+        if (settings_store.is_jikkyo_enabled === false) {
+            this.destroyed = true;
+            return;
+        }
 
         // 破棄済みかどうかのフラグを下ろす
         this.destroyed = false;
@@ -125,6 +132,14 @@ class LiveCommentManager implements PlayerManager {
         const channels_store = useChannelsStore();
         const settings_store = useSettingsStore();
         const user_store = useUserStore();
+
+        // 防御的に再判定し、無効時は WebSocket 接続情報 API へアクセスしない
+        if (settings_store.is_jikkyo_enabled === false) {
+            return {
+                is_success: false,
+                detail: '実況機能は無効です。',
+            };
+        }
 
         // サーバーから disconnect メッセージが送られてきた際のフラグ
         let is_disconnect_message_received = false;
@@ -440,7 +455,13 @@ class LiveCommentManager implements PlayerManager {
      */
     private initCommentSession(comment_session_info: IWatchSessionInfo): void {
         const player_store = usePlayerStore();
+        const settings_store = useSettingsStore();
         const user_store = useUserStore();
+
+        // 視聴セッション取得後に無効化されていた場合も、コメント WebSocket は開かない
+        if (settings_store.is_jikkyo_enabled === false) {
+            return;
+        }
 
         // 初回接続時に一括で送信されてくる過去コメントを受信し終えるまで格納するバッファ
         const initial_comments_buffer: ICommentData[] = [];
@@ -621,6 +642,12 @@ class LiveCommentManager implements PlayerManager {
         const settings_store = useSettingsStore();
         const user_store = useUserStore();
 
+        // 非表示のフォームなどから直接呼び出されても、無効時はコメントを送信しない
+        if (settings_store.is_jikkyo_enabled === false) {
+            options.error('実況機能は無効です。');
+            return;
+        }
+
         // 初期化に失敗しているときは実行せず、保存しておいたエラーメッセージを表示する
         if (player_store.live_comment_init_failed_message !== null) {
             options.error(player_store.live_comment_init_failed_message);
@@ -760,6 +787,14 @@ class LiveCommentManager implements PlayerManager {
      */
     private async reconnect(): Promise<void> {
         const player_store = usePlayerStore();
+        const settings_store = useSettingsStore();
+
+        // 無効化後に遅延した close/error イベントが発火しても、再接続は行わない
+        if (settings_store.is_jikkyo_enabled === false) {
+            await this.destroy();
+            this.reconnecting = false;
+            return;
+        }
 
         // 現在再接続中ではない && 視聴セッションとコメントセッションのどちらも開かれている場合のみ終了
         // 現在再接続中であっても視聴セッションとコメントセッションのどちらかが閉じられている場合は、

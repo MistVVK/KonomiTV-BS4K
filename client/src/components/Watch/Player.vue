@@ -4,6 +4,7 @@
         'watch-player--virtual-keyboard-display': playerStore.is_virtual_keyboard_display && Utils.hasActiveElementClass('dplayer-comment-input'),
         'watch-player--video': playback_mode === 'Video',
         'watch-player--pure-black': settingsStore.settings.use_pure_black_player_background,
+        'watch-player--jikkyo-disabled': settingsStore.is_jikkyo_enabled === false,
     }">
         <div class="watch-player__background-wrapper">
             <div class="watch-player__background" :class="{
@@ -650,6 +651,19 @@ const handleSettingCoverClick = () => {
         .dplayer-icons.dplayer-icons-right {
             right: 14px !important;
         }
+    }
+}
+
+// 実況機能が無効な場合も DPlayer の danmaku インスタンスは内部互換性のため維持し、操作 UI だけを完全に隠す
+.watch-player--jikkyo-disabled .watch-player__dplayer {
+    .dplayer-icons.dplayer-comment-box,
+    .dplayer-controller .dplayer-icons .dplayer-comment,
+    .dplayer-comment-setting-box,
+    .dplayer-setting-item.dplayer-setting-showdan,
+    .dplayer-setting-item.dplayer-setting-danunlimit,
+    .dplayer-setting-item.dplayer-setting-danmaku,
+    .dplayer-comment-capture-icon {
+        display: none !important;
     }
 }
 

@@ -298,7 +298,7 @@ const useChannelsStore = defineStore('channels', {
             // 「チャンネル一覧を実況勢いが強い順に並べる」がオンかつ、実況勢いが1つでも取得できている場合のみ、
             // ピン留めタブを含む全チャンネルリストを実況勢い順で並び替える
             // すべての実況勢いが 0 または取得できない（null）場合は、従来の並び順をそのまま維持する
-            if (settings_store.settings.tv_channel_sort_by_jikkyo_force === true) {
+            if (settings_store.is_jikkyo_enabled === true && settings_store.settings.tv_channel_sort_by_jikkyo_force === true) {
                 const has_non_zero_jikkyo_force = Array.from(channels_list_with_pinned.values())
                     .flat()
                     .some((channel) => (channel.jikkyo_force ?? 0) > 0);

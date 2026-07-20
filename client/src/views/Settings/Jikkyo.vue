@@ -1,6 +1,6 @@
 <template>
     <!-- ベース画面の中にそれぞれの設定画面で異なる部分を記述する -->
-    <SettingsViewContainer :embedded="embedded">
+    <SettingsViewContainer v-if="versionStore.is_jikkyo_enabled_on_server" :embedded="embedded">
         <h2 v-if="embedded === false" class="settings__heading">
             <a v-ripple class="settings__back-button" @click="$router.back()">
                 <Icon icon="fluent:chevron-left-12-filled" width="27px" />
@@ -13,6 +13,17 @@
                 <Icon icon="bi:chat-left-text-fill" width="19px" />
                 <span class="ml-2">コメント表示</span>
             </div>
+            <div class="settings__item settings__item--switch">
+                <label class="settings__item-heading" for="jikkyo_enabled">ニコニコ実況 / NX-Jikkyo を利用する</label>
+                <label class="settings__item-label" for="jikkyo_enabled">
+                    オンにした場合だけ、このクライアントからニコニコ実況 / NX-Jikkyo のコメントを取得・送信します。デフォルトはオフです。<br>
+                    オフの間もニコニコアカウントの連携情報と、その他のコメント設定は保持されます。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" id="jikkyo_enabled" hide-details
+                    v-model="settingsStore.settings.jikkyo_enabled">
+                </v-switch>
+            </div>
+            <template v-if="settingsStore.is_jikkyo_enabled">
             <template v-if="section !== 'comments'">
             <div class="niconico-account niconico-account--anonymous" v-if="userStore.user === null || userStore.user.niconico_user_id === null">
                 <div class="niconico-account-wrapper">
@@ -161,8 +172,9 @@
                 </v-switch>
             </div>
             </template>
+            </template>
         </div>
-        <CommentMuteSettings v-if="section !== 'account'"
+        <CommentMuteSettings v-if="settingsStore.is_jikkyo_enabled && section !== 'account'"
             :modelValue="comment_mute_settings_modal" @update:modelValue="comment_mute_settings_modal = $event" />
     </SettingsViewContainer>
 </template>
@@ -177,6 +189,7 @@ import Message from '@/message';
 import Niconico from '@/services/Niconico';
 import useSettingsStore from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
+import useVersionStore from '@/stores/VersionStore';
 import Utils from '@/utils';
 
 export default defineComponent({
@@ -227,9 +240,15 @@ export default defineComponent({
             // コメント不透明度設定を LocalStorage に保存する
             localStorage.setItem('dplayer-danmaku-opacity', new_value.toString());
         },
+        async 'settingsStore.is_jikkyo_enabled'(is_jikkyo_enabled: boolean) {
+            // ニコニコ実況設定ページ上で個人スイッチをオンにした時点で、休止していた連携情報の表示を復元する
+            if (is_jikkyo_enabled === true && this.section !== 'comments') {
+                await this.userStore.fetchUser();
+            }
+        },
     },
     computed: {
-        ...mapStores(useSettingsStore, useUserStore),
+        ...mapStores(useSettingsStore, useUserStore, useVersionStore),
     },
     async created() {
 
@@ -252,7 +271,7 @@ export default defineComponent({
         }
 
         // コメント表示設定だけを表示するときは、ニコニコ連携情報を取得する必要はない
-        if (this.section !== 'comments') {
+        if (this.section !== 'comments' && this.settingsStore.is_jikkyo_enabled === true) {
 
             // アカウント情報を更新
             await this.userStore.fetchUser();
@@ -283,6 +302,11 @@ export default defineComponent({
         },
 
         async loginNiconicoAccount() {
+
+            // 設定変更直後などに非表示になる前の UI から呼ばれても、外部認証 API へは接続しない
+            if (this.settingsStore.is_jikkyo_enabled === false) {
+                return;
+            }
 
             // ログインしていない場合はエラーにする
             if (this.userStore.is_logged_in === false) {

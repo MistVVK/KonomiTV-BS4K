@@ -20,6 +20,17 @@
                 <Icon icon="fa-solid:sliders-h" width="22px" style="padding: 0 3px;" />
                 <span class="ml-2">{{general_section_title}}</span>
             </div>
+            <div class="settings__item settings__item--switch" v-if="isSectionVisible('backend')">
+                <label class="settings__item-heading" for="jikkyo_enabled_on_server">ニコニコ実況 / NX-Jikkyo 連携を有効にする</label>
+                <label class="settings__item-label" for="jikkyo_enabled_on_server">
+                    無効にすると、KonomiTV サーバーとクライアントの両方からニコニコ実況 / NX-Jikkyo へのアクセスを停止し、関連 UI も非表示にします。デフォルトは無効です。<br>
+                    保存済みのニコニコアカウント連携情報とクライアント設定は削除されません。変更の反映には KonomiTV サーバーの再起動と、開いているすべてのクライアントの再読み込みが必要です。<br>
+                    ブラウザから外部サービスへ直接接続済みの WebSocket は、KonomiTV サーバー側から切断できません。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" id="jikkyo_enabled_on_server" hide-details
+                    v-model="server_settings.general.jikkyo_enabled">
+                </v-switch>
+            </div>
             <div class="settings__item" v-if="isSectionVisible('backend')">
                 <div class="settings__item-heading">利用するバックエンド</div>
                 <div class="settings__item-label">

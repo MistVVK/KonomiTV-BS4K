@@ -39,13 +39,19 @@
 </template>
 <script lang="ts" setup>
 
+import { computed } from 'vue';
+
 import HeaderBar from '@/components/HeaderBar.vue';
 import Navigation from '@/components/Navigation.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
-import { SETTINGS_DATA_BROADCASTING_ICON, SETTINGS_NAVIGATION_CATEGORIES } from '@/router/settings';
+import { getSettingsNavigationCategories, SETTINGS_DATA_BROADCASTING_ICON } from '@/router/settings';
+import useVersionStore from '@/stores/VersionStore';
 
 const settingsDataBroadcastingIcon = SETTINGS_DATA_BROADCASTING_ICON;
-const settingsNavigationCategories = SETTINGS_NAVIGATION_CATEGORIES;
+const versionStore = useVersionStore();
+const settingsNavigationCategories = computed(() =>
+    getSettingsNavigationCategories(versionStore.is_jikkyo_enabled_on_server),
+);
 
 </script>
 <style lang="scss" scoped>

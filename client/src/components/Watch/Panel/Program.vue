@@ -68,7 +68,7 @@
                 {{ProgramUtils.getProgramTime(channelsStore.channel.current.program_following)}}
             </div>
             <div class="program-info__status">
-                <div class="program-info__status-force"
+                <div v-if="settingsStore.is_jikkyo_enabled" class="program-info__status-force"
                     :class="`program-info__status-force--${ChannelUtils.getChannelForceType(channelsStore.channel.current.jikkyo_force)}`">
                     <Icon icon="fa-solid:fire-alt" height="14px" />
                     <span class="ml-2">勢い:</span>
@@ -167,6 +167,7 @@ import Message from '@/message';
 import Reservations, { IReservation } from '@/services/Reservations';
 import useChannelsStore from '@/stores/ChannelsStore';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
+import useSettingsStore from '@/stores/SettingsStore';
 import Utils, { ChannelUtils, ProgramUtils } from '@/utils';
 
 export default defineComponent({
@@ -197,7 +198,7 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(useChannelsStore, useServerSettingsStore),
+        ...mapStores(useChannelsStore, useServerSettingsStore, useSettingsStore),
 
         // EDCB バックエンドかどうか
         // サーバー設定がまだ取得されていない場合は EDCB と判定しない

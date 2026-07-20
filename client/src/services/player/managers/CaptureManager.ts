@@ -320,6 +320,11 @@ class CaptureManager implements PlayerManager {
 
         // ***** バリデーション *****
 
+        // 実況機能が無効な場合、非表示のボタンなどから到達してもコメント付きキャプチャは実行しない
+        if (is_comment_composite === true && settings_store.is_jikkyo_enabled === false) {
+            return;
+        }
+
         // ラジオチャンネルを視聴している場合 (映像がないのでキャプチャできない)
         // この場合映像の幅/高さも 0 になるので、このチェックは必ず先に行う
         if (this.playback_mode === 'Live' && channels_store.channel.current.is_radiochannel === true) {

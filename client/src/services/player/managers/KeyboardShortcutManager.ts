@@ -16,6 +16,8 @@ import Utils from '@/utils';
  * 一部の特殊なキーコンビネーションは表現しきれないため、キーボードイベント発生時の条件分岐で直接実装している
  */
 interface ShortcutDefinition {
+    // 実況機能が有効な場合にのみ利用できるショートカットかどうか
+    requires_jikkyo?: boolean;
     // 適用対象の再生モード (Live: ライブ視聴のみ, Video: ビデオ視聴のみ, Both: 両方に適用)
     mode: 'Live' | 'Video' | 'Both';
     // トリガー対象のキー (KeyboardEvent.code)
@@ -276,7 +278,7 @@ class KeyboardShortcutManager implements PlayerManager {
             }},
 
             // D: コメントの表示切り替え
-            {mode: 'Both', key: 'KeyD', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
+            {requires_jikkyo: true, mode: 'Both', key: 'KeyD', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
                 this.player.template.showDanmaku.click();
                 if (this.player.template.showDanmakuToggle.checked) {
                     this.player.notice(`${this.player.tran('Show comment')}`);
@@ -291,13 +293,13 @@ class KeyboardShortcutManager implements PlayerManager {
             }},
 
             // V: 映像をコメントを付けてキャプチャする
-            {mode: 'Both', key: 'KeyV', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
+            {requires_jikkyo: true, mode: 'Both', key: 'KeyV', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
                 comment_capture_button_element.click();
             }},
 
             // M: ライブ視聴: コメント入力フォームにフォーカスする
             // ビデオ視聴ではコメント送信自体ができないため有効化しない
-            {mode: 'Live', key: 'KeyM', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
+            {requires_jikkyo: true, mode: 'Live', key: 'KeyM', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
                 this.player.controller.show();
                 this.player.comment!.show();
                 player_store.event_emitter.emit('SetControlDisplayTimer', {});
@@ -332,7 +334,7 @@ class KeyboardShortcutManager implements PlayerManager {
             }},
 
             // ;(＋): コメントタブを表示する
-            {mode: 'Both', key: 'Semicolon', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
+            {requires_jikkyo: true, mode: 'Both', key: 'Semicolon', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
                 if (this.playback_mode === 'Live') {
                     player_store.tv_panel_active_tab = 'Comment';
                 } else {
@@ -525,6 +527,7 @@ class KeyboardShortcutManager implements PlayerManager {
             // コメント入力フォームが表示されているときのみ有効
             // コメント入力フォームにフォーカスが当たっている場合も実行する
             if ((this.playback_mode === 'Live') &&
+                (settings_store.is_jikkyo_enabled === true) &&
                 (event.code === 'KeyM') &&
                 (is_repeat === false) &&
                 (is_ctrl_or_cmd_pressed === true) &&
@@ -845,6 +848,10 @@ class KeyboardShortcutManager implements PlayerManager {
             // キーボードショートカットの定義を走査して、該当するものがあれば実行
             for (const shortcut of shortcuts) {
 
+                // 実況機能が無効な場合、コメント関連のショートカットは実行しない
+                if (shortcut.requires_jikkyo === true && settings_store.is_jikkyo_enabled === false) {
+                    continue;
+                }
                 // 適用対象の再生モード が Both ではなく、初期化時の再生モードと一致しない
                 if (shortcut.mode !== 'Both' && shortcut.mode !== this.playback_mode) {
                     continue;

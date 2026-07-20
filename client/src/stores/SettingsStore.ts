@@ -6,6 +6,7 @@ import { toRaw } from 'vue';
 import type { IBlueskyReplyThreadState, ITwitterReplyThreadState } from '@/utils/TweetUtils';
 
 import Settings, { IClientSettings, IMutedCommentKeywords } from '@/services/Settings';
+import useVersionStore from '@/stores/VersionStore';
 import { isKonomiTVTheme, type KonomiTVTheme } from '@/themes';
 import Utils from '@/utils';
 
@@ -137,6 +138,7 @@ export interface ILocalClientSettings extends IClientSettings {
     capture_filename_pattern: string;
     capture_copy_to_clipboard: boolean;
     sync_settings: boolean;
+    jikkyo_enabled: boolean;
     prefer_posting_to_nicolive: boolean;
     comment_speed_rate: number;
     comment_font_size: number;
@@ -377,6 +379,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
 
     // ***** 設定 → ニコニコ実況 *****
 
+    // ニコニコ実況 / NX-Jikkyo を利用する (Default: オフ)
+    jikkyo_enabled: false,
     // 可能であればニコニコ実況にコメントする (Default: オン)
     prefer_posting_to_nicolive: true,
     // コメントの速さ (Default: 1倍)
@@ -508,6 +512,7 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'capture_filename_pattern',
     // capture_copy_to_clipboard: 同期無効
     // sync_settings: 同期無効
+    'jikkyo_enabled',
     'prefer_posting_to_nicolive',
     'comment_speed_rate',
     'comment_font_size',
@@ -731,6 +736,17 @@ const useSettingsStore = defineStore('settings', {
         return {
             settings: normalized_settings,
         };
+    },
+    getters: {
+
+        /**
+         * ニコニコ実況 / NX-Jikkyo を現在のクライアントで利用できるかどうか
+         * サーバー全体とユーザー個別の両方が明示的に有効な場合だけ true を返す
+         */
+        is_jikkyo_enabled(): boolean {
+            const version_store = useVersionStore();
+            return version_store.is_jikkyo_enabled_on_server === true && this.settings.jikkyo_enabled === true;
+        },
     },
     actions: {
 

@@ -35,7 +35,7 @@
                     <span class="ml-2">録画期間: {{playerStore.recorded_program.is_partially_recorded ? '(一部のみ録画)' : ''}}</span><br>
                     <span>{{ProgramUtils.getRecordingTime(playerStore.recorded_program)}}</span>
                 </div>
-                <div class="program-info__status">
+                <div v-if="settingsStore.is_jikkyo_enabled" class="program-info__status">
                     <Icon icon="bi:chat-left-text-fill" height="12.5px" style="margin-bottom: -3px" />
                     <span class="ml-2">コメント数:</span>
                     <span class="ml-2">{{comment_count ?? '--'}}</span>

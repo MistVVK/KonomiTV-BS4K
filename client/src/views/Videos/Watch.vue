@@ -11,6 +11,7 @@ import PlayerController from '@/services/player/PlayerController';
 import Videos from '@/services/Videos';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 
 // PlayerController のインスタンス
 // data() 内に記述すると再帰的にリアクティブ化され重くなる上リアクティブにする必要自体がないので、グローバル変数にしている
@@ -25,7 +26,7 @@ export default defineComponent({
         Watch,
     },
     computed: {
-        ...mapStores(usePlayerStore, useSettingsStore),
+        ...mapStores(usePlayerStore, useSettingsStore, useVersionStore),
     },
     // 開始時に実行
     created() {
@@ -70,6 +71,10 @@ export default defineComponent({
             playback_index_abort_controller?.abort();
             playback_index_abort_controller = new AbortController();
             const abort_controller = playback_index_abort_controller;
+
+            // 実況機能のサーバー側有効状態をプレイヤー生成前に確定する
+            // 取得に失敗した場合は VersionStore がフェイルクローズで無効として扱う
+            await this.versionStore.fetchServerVersion(true);
 
             // URL 上の録画番組 ID が未定義なら実行しない (フェイルセーフ)
             // 基本あり得ないはずだが、念のため

@@ -1,6 +1,7 @@
 
 import type { RouteRecordRaw } from 'vue-router';
 
+import useVersionStore from '@/stores/VersionStore';
 import Utils from '@/utils';
 
 
@@ -95,6 +96,29 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
     },
 ];
 
+/**
+ * 現在のサーバーで利用できる機能に合わせた設定ナビゲーションを返す。
+ * ニコニコ実況 / NX-Jikkyo がサーバー全体で無効な場合は、設定ページへの導線自体を表示しない。
+ */
+export function getSettingsNavigationCategories(jikkyo_enabled_on_server: boolean): readonly SettingsNavigationCategory[] {
+    return SETTINGS_NAVIGATION_CATEGORIES.map(category => ({
+        ...category,
+        items: category.items.filter(item =>
+            jikkyo_enabled_on_server === true || item.type !== 'Route' || item.to !== '/settings/account/niconico',
+        ),
+    }));
+}
+
+/** ニコニコ実況設定への直接アクセスを、サーバーの実稼働設定に基づいて制御する。 */
+async function redirectDisabledJikkyoSettings(): Promise<true | {path: string}> {
+    const version_store = useVersionStore();
+    await version_store.fetchServerVersion();
+    if (version_store.is_jikkyo_enabled_on_server === false) {
+        return {path: '/settings/account'};
+    }
+    return true;
+}
+
 // 設定画面の正規 URL。同じ目的の設定は同一ページに集約し、保存方式や API は変更しない。
 const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
     {
@@ -139,6 +163,7 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         name: 'Settings Account Niconico',
         component: () => import('@/views/Settings/Jikkyo.vue'),
         props: {section: 'account'},
+        beforeEnter: redirectDisabledJikkyoSettings,
     },
     {
         path: '/settings/account/social',

@@ -28,6 +28,10 @@ const useUserStore = defineStore('user', {
          * ログイン済みのユーザーのニコニコアカウントのユーザーアイコンの URL (ニコニコアカウントと連携されている場合のみ)
          */
         user_niconico_icon_url(): string | null {
+            // 実況機能の停止中は、ブラウザがニコニコの画像 CDN へアクセスする URL 自体を公開しない
+            if (useSettingsStore().is_jikkyo_enabled === false) {
+                return null;
+            }
             if (this.user === null || this.user.niconico_user_id === null) {
                 return null;
             }

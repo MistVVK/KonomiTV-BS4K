@@ -97,7 +97,7 @@
                 </v-switch>
             </div>
             <v-divider class="mt-6"></v-divider>
-            <div class="settings__item settings__item--switch">
+            <div class="settings__item settings__item--switch" v-if="settingsStore.is_jikkyo_enabled">
                 <label class="settings__item-heading" for="tv_channel_sort_by_jikkyo_force">チャンネル一覧を実況勢いが強い順に並び替える</label>
                 <label class="settings__item-label" for="tv_channel_sort_by_jikkyo_force">
                     オンにすると、チャンネル一覧を実況勢い (ニコニコ実況に1分間に投稿されたコメント数) が強い順に並べ替えます。デフォルトはオフです。<br>
@@ -169,7 +169,7 @@
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
-                    :items="tv_panel_active_tab" v-model="settingsStore.settings.tv_panel_active_tab">
+                    :items="tv_panel_active_tab_options" v-model="effective_tv_panel_active_tab">
                 </v-select>
             </div>
             <div class="settings__item">
@@ -179,7 +179,7 @@
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
-                    :items="video_panel_active_tab" v-model="settingsStore.settings.video_panel_active_tab">
+                    :items="video_panel_active_tab_options" v-model="effective_video_panel_active_tab">
                 </v-select>
             </div>
             <div class="settings__item">
@@ -212,7 +212,7 @@ import { defineComponent, type PropType } from 'vue';
 import PinnedChannelSettings from '@/components/Settings/PinnedChannelSettings.vue';
 import SettingsData from '@/components/Settings/SettingsData.vue';
 import TimeTableSettingsDialog from '@/components/Settings/TimeTableSettings.vue';
-import useSettingsStore from '@/stores/SettingsStore';
+import useSettingsStore, { type ILocalClientSettings } from '@/stores/SettingsStore';
 import Utils from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
 
@@ -253,7 +253,7 @@ export default defineComponent({
             ],
 
             // テレビをみるときにデフォルトで表示されるパネルのタブの選択肢
-            tv_panel_active_tab: [
+            tv_panel_active_tab_options_all: [
                 {title: '番組情報タブ', value: 'Program'},
                 {title: 'チャンネルタブ', value: 'Channel'},
                 {title: 'コメントタブ', value: 'Comment'},
@@ -261,7 +261,7 @@ export default defineComponent({
             ],
 
             // ビデオをみるときにデフォルトで表示されるパネルのタブの選択肢
-            video_panel_active_tab: [
+            video_panel_active_tab_options_all: [
                 {title: '番組情報タブ', value: 'RecordedProgram'},
                 {title: 'シリーズタブ', value: 'Series'},
                 {title: 'コメントタブ', value: 'Comment'},
@@ -271,6 +271,36 @@ export default defineComponent({
     },
     computed: {
         ...mapStores(useSettingsStore),
+        tv_panel_active_tab_options() {
+            if (this.settingsStore.is_jikkyo_enabled === true) {
+                return this.tv_panel_active_tab_options_all;
+            }
+            return this.tv_panel_active_tab_options_all.filter(option => option.value !== 'Comment');
+        },
+        video_panel_active_tab_options() {
+            if (this.settingsStore.is_jikkyo_enabled === true) {
+                return this.video_panel_active_tab_options_all;
+            }
+            return this.video_panel_active_tab_options_all.filter(option => option.value !== 'Comment');
+        },
+        effective_tv_panel_active_tab: {
+            get(): ILocalClientSettings['tv_panel_active_tab'] {
+                const saved_tab = this.settingsStore.settings.tv_panel_active_tab;
+                return this.settingsStore.is_jikkyo_enabled === false && saved_tab === 'Comment' ? 'Program' : saved_tab;
+            },
+            set(tab: ILocalClientSettings['tv_panel_active_tab']): void {
+                this.settingsStore.settings.tv_panel_active_tab = tab;
+            },
+        },
+        effective_video_panel_active_tab: {
+            get(): ILocalClientSettings['video_panel_active_tab'] {
+                const saved_tab = this.settingsStore.settings.video_panel_active_tab;
+                return this.settingsStore.is_jikkyo_enabled === false && saved_tab === 'Comment' ? 'RecordedProgram' : saved_tab;
+            },
+            set(tab: ILocalClientSettings['video_panel_active_tab']): void {
+                this.settingsStore.settings.video_panel_active_tab = tab;
+            },
+        },
     },
 });
 

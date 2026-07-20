@@ -39,16 +39,18 @@
 </template>
 <script lang="ts">
 
+import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
 import HeaderBar from '@/components/HeaderBar.vue';
 import Navigation from '@/components/Navigation.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
 import {
+    getSettingsNavigationCategories,
     SETTINGS_DATA_BROADCASTING_ICON,
-    SETTINGS_NAVIGATION_CATEGORIES,
     type SettingsNavigationItem,
 } from '@/router/settings';
+import useVersionStore from '@/stores/VersionStore';
 
 // 設定のベース画面なので、ロジックは基本置かない
 export default defineComponent({
@@ -59,11 +61,12 @@ export default defineComponent({
         SPHeaderBar,
     },
     computed: {
+        ...mapStores(useVersionStore),
         settingsDataBroadcastingIcon() {
             return SETTINGS_DATA_BROADCASTING_ICON;
         },
         settingsNavigationCategories() {
-            return SETTINGS_NAVIGATION_CATEGORIES;
+            return getSettingsNavigationCategories(this.versionStore.is_jikkyo_enabled_on_server);
         },
     },
     methods: {

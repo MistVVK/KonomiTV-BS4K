@@ -64,6 +64,7 @@ interface IShortcutGroup {
 }
 
 interface IShortcut {
+    requires_jikkyo?: boolean;
     name: string;
     keys: {
         name: string;
@@ -103,12 +104,12 @@ const LIVE_SHORTCUT_LIST: IShortcutList = {
                 { name: 'フルスクリーンの切り替え', keys: [{name: 'F', icon: false}] },
                 { name: 'Picture-in-Picture の表示切り替え', keys: [{name: 'E', icon: false}] },
                 { name: '字幕の表示切り替え', keys: [{name: 'S', icon: false}] },
-                { name: 'コメントの表示切り替え', keys: [{name: 'D', icon: false}] },
+                { requires_jikkyo: true, name: 'コメントの表示切り替え', keys: [{name: 'D', icon: false}] },
                 { name: '映像をキャプチャする', keys: [{name: 'C', icon: false}] },
-                { name: '映像をコメントを付けてキャプチャする', keys: [{name: 'V', icon: false}] },
-                { name: 'コメント入力フォームにフォーカスする', keys: [{name: 'M', icon: false}] },
-                { name: 'コメント入力フォームを閉じる', keys: [{name: Utils.CtrlOrCmd(), icon: false}, {name: 'M', icon: false}] },
-                { name: 'コメントを送信する', keys: [{name: 'コメント入力フォームを表示', icon: false}, {name: 'Enter', icon: false}] },
+                { requires_jikkyo: true, name: '映像をコメントを付けてキャプチャする', keys: [{name: 'V', icon: false}] },
+                { requires_jikkyo: true, name: 'コメント入力フォームにフォーカスする', keys: [{name: 'M', icon: false}] },
+                { requires_jikkyo: true, name: 'コメント入力フォームを閉じる', keys: [{name: Utils.CtrlOrCmd(), icon: false}, {name: 'M', icon: false}] },
+                { requires_jikkyo: true, name: 'コメントを送信する', keys: [{name: 'コメント入力フォームを表示', icon: false}, {name: 'Enter', icon: false}] },
             ]
         },
     ],
@@ -121,7 +122,7 @@ const LIVE_SHORTCUT_LIST: IShortcutList = {
                 { name: 'パネルの表示切り替え', keys: [{name: 'P', icon: false}] },
                 { name: '番組情報タブを表示する', keys: [{name: 'K', icon: false}] },
                 { name: 'チャンネルタブを表示する', keys: [{name: 'L', icon: false}] },
-                { name: 'コメントタブを表示する', keys: [{name: '；(＋)', icon: false}] },
+                { requires_jikkyo: true, name: 'コメントタブを表示する', keys: [{name: '；(＋)', icon: false}] },
                 { name: 'Twitter タブを表示する', keys: [{name: '：(＊)', icon: false}] },
             ]
         },
@@ -198,9 +199,9 @@ const VIDEO_SHORTCUT_LIST: IShortcutList = {
                 { name: 'フルスクリーンの切り替え', keys: [{name: 'F', icon: false}] },
                 { name: 'Picture-in-Picture の表示切り替え', keys: [{name: 'E', icon: false}] },
                 { name: '字幕の表示切り替え', keys: [{name: 'S', icon: false}] },
-                { name: 'コメントの表示切り替え', keys: [{name: 'D', icon: false}] },
+                { requires_jikkyo: true, name: 'コメントの表示切り替え', keys: [{name: 'D', icon: false}] },
                 { name: '映像をキャプチャする', keys: [{name: 'C', icon: false}] },
-                { name: '映像をコメントを付けてキャプチャする', keys: [{name: 'V', icon: false}] },
+                { requires_jikkyo: true, name: '映像をコメントを付けてキャプチャする', keys: [{name: 'V', icon: false}] },
             ]
         },
     ],
@@ -213,7 +214,7 @@ const VIDEO_SHORTCUT_LIST: IShortcutList = {
                 { name: 'パネルの表示切り替え', keys: [{name: 'P', icon: false}] },
                 { name: '番組情報タブを表示する', keys: [{name: 'K', icon: false}] },
                 { name: 'シリーズタブを表示する', keys: [{name: 'L', icon: false}] },
-                { name: 'コメントタブを表示する', keys: [{name: '；(＋)', icon: false}] },
+                { requires_jikkyo: true, name: 'コメントタブを表示する', keys: [{name: '；(＋)', icon: false}] },
                 { name: 'Twitter タブを表示する', keys: [{name: '：(＊)', icon: false}] },
             ]
         },
@@ -268,11 +269,20 @@ export default defineComponent({
         // キーボードショートカットの一覧に表示するショートカットキーのリスト
         // ライブ視聴の場合は live_shortcut_key_list を、ビデオ視聴の場合は video_shortcut_key_list を返す
         shortcut_list() {
-            if (this.playback_mode === 'Live') {
-                return this.live_shortcut_list;
-            } else {
-                return this.video_shortcut_list;
-            }
+            const shortcut_list = this.playback_mode === 'Live' ? this.live_shortcut_list : this.video_shortcut_list;
+            if (this.settingsStore.is_jikkyo_enabled === true) return shortcut_list;
+
+            // 実況機能が無効な場合は、実行できないコメント関連ショートカットも一覧から取り除く
+            return {
+                left_column: shortcut_list.left_column.map((group) => ({
+                    ...group,
+                    shortcuts: group.shortcuts.filter((shortcut) => shortcut.requires_jikkyo !== true),
+                })),
+                right_column: shortcut_list.right_column.map((group) => ({
+                    ...group,
+                    shortcuts: group.shortcuts.filter((shortcut) => shortcut.requires_jikkyo !== true),
+                })),
+            };
         },
     },
     created() {

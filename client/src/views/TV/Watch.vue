@@ -11,6 +11,7 @@ import PlayerController from '@/services/player/PlayerController';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 import Utils from '@/utils';
 
 // PlayerController のインスタンス
@@ -31,7 +32,7 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(useChannelsStore, usePlayerStore, useSettingsStore),
+        ...mapStores(useChannelsStore, usePlayerStore, useSettingsStore, useVersionStore),
     },
     // 開始時に実行
     created() {
@@ -94,6 +95,10 @@ export default defineComponent({
 
         // 再生セッションを初期化する
         async init() {
+
+            // 実況機能のサーバー側有効状態をプレイヤー生成前に確定する
+            // 取得に失敗した場合は VersionStore がフェイルクローズで無効として扱う
+            await this.versionStore.fetchServerVersion(true);
 
             // 00秒までの残り秒数を取得
             // 現在 16:01:34 なら 26 (秒) になる

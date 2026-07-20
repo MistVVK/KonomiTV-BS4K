@@ -98,6 +98,7 @@ export interface IClientSettings {
     capture_filename_pattern: string;
     // capture_copy_to_clipboard: 同期無効
     // sync_settings: 同期無効
+    jikkyo_enabled: boolean;
     prefer_posting_to_nicolive: boolean;
     comment_speed_rate: number;
     comment_font_size: number;
@@ -128,6 +129,7 @@ export interface IClientSettings {
 export interface IServerSettings {
     general: {
         backend: 'EDCB' | 'Mirakurun';
+        jikkyo_enabled: boolean;
         always_receive_tv_from_mirakurun: boolean;
         edcb_url: string;
         mirakurun_url: string;
@@ -183,6 +185,7 @@ export interface IServerSettings {
 export const IServerSettingsDefault: IServerSettings = {
     general: {
         backend: 'EDCB',
+        jikkyo_enabled: false,
         always_receive_tv_from_mirakurun: false,
         edcb_url: 'tcp://127.0.0.1:4510/',
         mirakurun_url: 'http://127.0.0.1:40772/',

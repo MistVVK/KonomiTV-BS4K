@@ -22,7 +22,7 @@
                 :class="{'watch-panel__content--active': panel_active_tab === 'Channel'}" />
             <Series class="watch-panel__content" v-if="playback_mode === 'Video'"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Series'}" />
-            <Comment class="watch-panel__content" :playback_mode="playback_mode"
+            <Comment class="watch-panel__content" v-if="settingsStore.is_jikkyo_enabled" :playback_mode="playback_mode"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Comment'}" />
             <Twitter class="watch-panel__content" :playback_mode="playback_mode"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Twitter'}" />
@@ -61,7 +61,7 @@
                     style="width: 39px; height: 39px; margin-top: -4px; margin-bottom: -4px;" />
                 <span class="panel-navigation-button__text">シリーズ</span>
             </div>
-            <div v-ripple class="panel-navigation-button"
+            <div v-ripple class="panel-navigation-button" v-if="settingsStore.is_jikkyo_enabled"
                  :class="{'panel-navigation-button--active': panel_active_tab === 'Comment'}"
                  @click="playback_mode === 'Live' ? playerStore.tv_panel_active_tab = 'Comment' : playerStore.video_panel_active_tab = 'Comment'">
                 <Icon class="panel-navigation-button__icon" icon="bi:chat-left-text-fill" width="29px" />
@@ -90,6 +90,7 @@ import Series from '@/components/Watch/Panel/Series.vue';
 import Twitter from '@/components/Watch/Panel/Twitter.vue';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
+import useSettingsStore from '@/stores/SettingsStore';
 import Utils from '@/utils';
 
 export default defineComponent({
@@ -116,13 +117,21 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(useChannelsStore, usePlayerStore),
+        ...mapStores(useChannelsStore, usePlayerStore, useSettingsStore),
 
         // ライブ視聴なら tv_panel_active_tab を、ビデオ視聴なら video_panel_active_tab を返す
         panel_active_tab() {
             if (this.playback_mode === 'Live') {
+                // 実況停止中は保存値を壊さず、表示上だけ番組情報タブへ退避する
+                if (this.settingsStore.is_jikkyo_enabled === false && this.playerStore.tv_panel_active_tab === 'Comment') {
+                    return 'Program';
+                }
                 return this.playerStore.tv_panel_active_tab;
             } else {
+                // 録画再生でも同様に、コメントタブの保存値は次回有効化時のために保持する
+                if (this.settingsStore.is_jikkyo_enabled === false && this.playerStore.video_panel_active_tab === 'Comment') {
+                    return 'RecordedProgram';
+                }
                 return this.playerStore.video_panel_active_tab;
             }
         }
