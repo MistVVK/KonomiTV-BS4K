@@ -113,7 +113,7 @@
                         <span v-if="!iconOnly" class="navigation__link-text navigation__link-text--utility">設定</span>
                     </router-link>
                     <a v-ripple class="navigation__link" active-class="navigation__link--active"
-                        href="https://github.com/tsukumijima/KonomiTV" target="_blank"
+                        href="https://github.com/MistVVK/KonomiTV-BS4K" target="_blank"
                         :class="{
                             'navigation__link--develop-version': versionStore.is_client_develop_version,
                             'navigation__link--highlight': versionStore.is_update_available,
