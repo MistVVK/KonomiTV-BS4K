@@ -259,9 +259,14 @@ const formatCMAnalysisStatus = (): string => {
 const formatCMResultSource = (): string => {
     const recorded_video = props.program.recorded_video;
     if (recorded_video.cm_result_source === null) return 'なし';
+    const verification = recorded_video.cm_result_verified === false ? ' / 未検証移行データ' : '';
+    if (recorded_video.cm_result_source === 'Generated') {
+        const engine_version = recorded_video.cm_result_pipeline_version?.match(/^KonomiTV-CM-(\d+)$/)?.[1] ?? null;
+        const engine_label = engine_version !== null ? `（解析エンジン v${engine_version}）` : '';
+        return `KonomiTV自動解析${engine_label}${verification}`;
+    }
     const source = {
         Existing: '外部 chapter',
-        Generated: 'KonomiTV 自動解析',
         LegacyImported: '外部 chapter',
     }[recorded_video.cm_result_source];
     const naming_method = {
@@ -272,7 +277,6 @@ const formatCMResultSource = (): string => {
     const pipeline = recorded_video.cm_result_pipeline_version !== null
         ? ` / ${recorded_video.cm_result_pipeline_version}`
         : '';
-    const verification = recorded_video.cm_result_verified === false ? ' / 未検証移行データ' : '';
     return `${source}${naming_method_label}${pipeline}${verification}`;
 };
 
