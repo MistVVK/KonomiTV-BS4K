@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_root="$(git rev-parse --show-toplevel)"
+
+if ! command -v poetry > /dev/null 2>&1; then
+    echo '[pre-push] Poetry is required to run the server test suite.' >&2
+    exit 1
+fi
+if ! command -v node > /dev/null 2>&1; then
+    echo '[pre-push] Node.js is required to run the client test suite.' >&2
+    exit 1
+fi
+
+echo '[pre-push] Running server tests...'
+(
+    cd "${repository_root}/server"
+    poetry run task test
+)
+
+echo '[pre-push] Running client tests...'
+(
+    cd "${repository_root}/client"
+    node --test scripts/generate-license-document.test.mjs
+)
+
+echo '[pre-push] All local tests passed.'
