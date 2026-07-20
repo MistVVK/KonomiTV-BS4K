@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import tempfile
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import ClassVar, Literal
 
@@ -16,6 +17,8 @@ from app import logging
 from app.config import Config
 from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
 from app.models.RecordedProgram import RecordedProgram
+from app.schemas import AudioTrack
+from app.streams.RecordedEncodingCodecs import AudioCodec
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager, RecordedFMP4Variant
 from app.streams.RecordedPlaybackCapabilities import (
     RecordedPlaybackBackend,
@@ -35,7 +38,39 @@ class RecordedFMP4Segment:
     start_time: float
     duration: float
     generation: int
+    # 元音声構成と映像DISCONTINUITYに対応する世代。
     audio_generation: int
+    # AAC/Opusの待ち時間を制限する最大6segmentのdelivery世代。
+    transcoded_audio_generation: int | None = None
+    transcoded_audio_start_sample: int | None = None
+    transcoded_audio_sample_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedAudioSegmentTiming:
+    """音声fragmentの48kHz sample基準の生成範囲を表す。"""
+
+    start_sample: int
+    sample_count: int
+
+    @property
+    def start_time(self) -> float:
+        return self.start_sample / 48_000
+
+    @property
+    def duration(self) -> float:
+        return self.sample_count / 48_000
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedAudioFragmentInfo:
+    """fMP4音声fragmentから検証したdecode timeline情報。"""
+
+    timescale: int
+    first_decode_time: int
+    total_duration: int
+    sample_count: int
+    sample_durations: tuple[int, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +94,20 @@ class RecordedFMP4Stream:
     _instances: ClassVar[dict[str, RecordedFMP4Stream]] = {}
     SESSION_TIMEOUT: ClassVar[float] = 30.0
     SEEK_PREROLL_SECONDS: ClassVar[float] = 10.0
+    AAC_ENCODER_DELAY_SAMPLES: ClassVar[int] = 1024
+    AAC_PACKET_SAMPLES: ClassVar[int] = 1024
+    AUDIO_SAMPLE_RATE: ClassVar[int] = 48_000
+    OPUS_ENCODER_DELAY_SAMPLES: ClassVar[int] = 312
+    AUDIO_BOUNDARY_COALESCE_SECONDS: ClassVar[float] = 1024 / 48_000
+    AUDIO_DELIVERY_GENERATION_SEGMENTS: ClassVar[int] = 6
+    AUDIO_INPUT_TAIL_MARGIN_SECONDS: ClassVar[float] = 0.1
+    OPUS_BITRATES: ClassVar[tuple[tuple[range, int], ...]] = (
+        (range(1, 2), 64_000),
+        (range(2, 3), 128_000),
+        (range(3, 5), 192_000),
+        (range(5, 7), 256_000),
+        (range(7, 9), 320_000),
+    )
 
     # セッションを識別し、ルーターの後続API要求とキャッシュ参照に利用する。
     session_id: str
@@ -68,6 +117,8 @@ class RecordedFMP4Stream:
     quality: QUALITY_TYPES
     # codec・24fpsなど、初回プレイリスト要求で固定される生成条件。
     encoding_options: StreamEncodingOptions
+    # 録画メタデータと実生成結果を踏まえ、このセッションで実際に配信する音声方式。
+    _effective_audio_codec: AudioCodec
     # 全APIが同じ時間境界を参照するため、初期化時に確定したセグメント計画。
     _segments: list[RecordedFMP4Segment]
     # destroy()で一括releaseする、このセッションが参照済みのキャッシュパス。
@@ -97,6 +148,7 @@ class RecordedFMP4Stream:
             instance.recorded_program = recorded_program
             instance.quality = quality
             instance.encoding_options = encoding_options
+            instance._effective_audio_codec = instance.__resolveEffectiveAudioCodec(encoding_options.audio_codec)
             instance._segments = instance.__buildSegments()
             instance._referenced_paths = set()
             instance._completed_sequences = set()
@@ -108,6 +160,16 @@ class RecordedFMP4Stream:
             cls._instances[session_id] = instance
         instance = cls._instances[session_id]
         if instance.recorded_program.id != recorded_program.id or instance.quality != quality:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session conditions mismatch')
+        # HLS子APIにも初回と同じqueryを必須とし、同一session IDを異なる生成条件で再利用させない。
+        # audio_rendition_idは旧MPEG-TS経路向けで現在の代替音声HLSでは未使用のため照合対象外とする。
+        if encoding_options is not None and (
+            instance.encoding_options.is_hevc_10bit_enabled != encoding_options.is_hevc_10bit_enabled or
+            instance.encoding_options.is_24fps_mode_enabled != encoding_options.is_24fps_mode_enabled or
+            instance.encoding_options.video_codec != encoding_options.video_codec or
+            instance.encoding_options.video_bit_depth != encoding_options.video_bit_depth or
+            instance.encoding_options.audio_codec != encoding_options.audio_codec
+        ):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session conditions mismatch')
         return instance
 
@@ -129,7 +191,7 @@ class RecordedFMP4Stream:
         await self.destroy()
 
     @asynccontextmanager
-    async def __activeOperation(self) -> AsyncIterator[None]:
+    async def __activeOperation(self) -> AsyncGenerator[None]:
         """長時間のエンコードやfsync中にセッションタイムアウトを防ぐ。"""
 
         self._active_operations += 1
@@ -191,6 +253,22 @@ class RecordedFMP4Stream:
         async with self.__activeOperation():
             return await self.__getMasterPlaylist(cache_key)
 
+    def __getAudioBandwidth(self, renditions: list[RecordedAudioRendition]) -> int:
+        """実効音声方式を含むmasterの音声帯域加算値を返す。"""
+
+        if len(renditions) == 0:
+            return 0
+        if self._effective_audio_codec == 'opus':
+            bitrates = [
+                self.getOpusBitrate(channels)
+                for rendition in renditions
+                if (channels := self.__getMaximumAudioRenditionChannelCount(rendition)) is not None
+            ]
+            valid_bitrates = [bitrate for bitrate in bitrates if bitrate is not None]
+            if len(valid_bitrates) > 0:
+                return math.ceil(max(valid_bitrates) * 1.25)
+        return 256_000
+
     async def __getMasterPlaylist(self, cache_key: str | None = None) -> str:
         """実initを生成してHLSマスターを組み立てる。"""
 
@@ -204,9 +282,11 @@ class RecordedFMP4Stream:
             default = 'YES' if index == 0 else 'NO'
             language = rendition.language.replace('"', '')
             name = rendition.name.replace('"', '')
+            channels = self.__getMaximumDeclaredAudioRenditionChannelCount(rendition)
+            channels_attribute = f',CHANNELS="{channels}"' if channels is not None else ''
             lines.append(
                 '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",'
-                f'NAME="{name}",DEFAULT={default},AUTOSELECT=YES,LANGUAGE="{language}",'
+                f'NAME="{name}",DEFAULT={default},AUTOSELECT=YES,LANGUAGE="{language}"{channels_attribute},'
                 f'URI="audio/{rendition.id}/playlist?session_id={self.session_id}&cache_key={cache_key}'
                 f'&{self.getCodecQuery()}"'
             )
@@ -249,7 +329,12 @@ class RecordedFMP4Stream:
                     'message': 'The generated initialization segment has no supported codec configuration.',
                 },
             )
-        stream_attributes = [f'BANDWIDTH={bandwidth + 256_000}', f'CODECS="{codec_string},mp4a.40.2"']
+        audio_codec_string = 'opus' if self._effective_audio_codec == 'opus' else 'mp4a.40.2'
+        codec_attribute = f'{codec_string},{audio_codec_string}' if len(renditions) > 0 else codec_string
+        stream_attributes = [
+            f'BANDWIDTH={bandwidth + self.__getAudioBandwidth(renditions)}',
+            f'CODECS="{codec_attribute}"',
+        ]
         if len(renditions) > 0:
             stream_attributes.append('AUDIO="audio"')
         if subtitle_group_enabled:
@@ -345,6 +430,174 @@ class RecordedFMP4Stream:
 
         return None
 
+    @staticmethod
+    def extractAACInitializationConfiguration(init_segment: bytes) -> tuple[int, int, int] | None:
+        """AAC initのAudioSpecificConfigからobject type/sample rate/channel構成を取得する。
+
+        Args:
+            init_segment: FFmpegが生成した音声fMP4初期化セグメント。
+
+        Returns:
+            Audio Object Type、sampling rate、channel configuration。判定不能時はNone。
+        """
+
+        # AACはmp4a sample entryだけではLC/HE-AACを区別できないため、esds内の
+        # DecoderSpecificInfo(tag 0x05)からAudio Object Typeを読み取る。
+        if b'mp4a' not in init_segment:
+            return None
+        esds_type_offset = init_segment.find(b'esds')
+        if esds_type_offset < 4:
+            return None
+        esds_size = int.from_bytes(init_segment[esds_type_offset - 4:esds_type_offset], 'big')
+        esds_start = esds_type_offset + 4
+        esds_end = esds_type_offset - 4 + esds_size
+        if esds_size < 12 or esds_end > len(init_segment):
+            return None
+
+        # FullBoxヘッダー4byteの後ろに可変長descriptor列がある。入れ子descriptorの
+        # 境界を完全展開する必要はなく、長さがbox内に収まるtag 0x05だけを採用する。
+        offset = esds_start + 4
+        while offset < esds_end:
+            if init_segment[offset] != 0x05:
+                offset += 1
+                continue
+            length_offset = offset + 1
+            descriptor_length = 0
+            for _ in range(4):
+                if length_offset >= esds_end:
+                    return None
+                value = init_segment[length_offset]
+                length_offset += 1
+                descriptor_length = (descriptor_length << 7) | (value & 0x7F)
+                if value & 0x80 == 0:
+                    break
+            else:
+                offset += 1
+                continue
+            if descriptor_length < 2 or length_offset + descriptor_length > esds_end:
+                offset += 1
+                continue
+            audio_specific_config = init_segment[length_offset:length_offset + descriptor_length]
+            bit_string = ''.join(f'{value:08b}' for value in audio_specific_config)
+            bit_offset = 0
+
+            def ReadBits(length: int) -> int | None:
+                """AudioSpecificConfigから指定bit数を安全に読む。"""
+
+                nonlocal bit_offset
+                if bit_offset + length > len(bit_string):
+                    return None
+                value = int(bit_string[bit_offset:bit_offset + length], 2)
+                bit_offset += length
+                return value
+
+            audio_object_type = ReadBits(5)
+            if audio_object_type is None or audio_object_type == 0:
+                return None
+            if audio_object_type == 31:
+                extended_type = ReadBits(6)
+                if extended_type is None:
+                    return None
+                audio_object_type = 32 + extended_type
+            sampling_frequency_index = ReadBits(4)
+            if sampling_frequency_index is None:
+                return None
+            sampling_frequencies = (
+                96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000,
+                22_050, 16_000, 12_000, 11_025, 8_000, 7_350,
+            )
+            if sampling_frequency_index == 0x0F:
+                sampling_rate = ReadBits(24)
+            elif sampling_frequency_index < len(sampling_frequencies):
+                sampling_rate = sampling_frequencies[sampling_frequency_index]
+            else:
+                sampling_rate = None
+            channel_configuration = ReadBits(4)
+            if sampling_rate is None or channel_configuration is None:
+                return None
+            return audio_object_type, sampling_rate, channel_configuration
+        return None
+
+    @staticmethod
+    def getAACChannelCountFromConfiguration(channel_configuration: int) -> int | None:
+        """AudioSpecificConfigのchannelConfigurationを実チャンネル数へ変換する。"""
+
+        # ISO/IEC 14496-3の標準speaker mapping。0はPCE依存のため安全側で判定不能とする。
+        return {
+            1: 1,
+            2: 2,
+            3: 3,
+            4: 4,
+            5: 5,
+            6: 6,
+            7: 8,
+        }.get(channel_configuration)
+
+    @classmethod
+    def extractAudioInitializationChannelCount(
+        cls,
+        init_segment: bytes,
+        audio_codec: Literal['aac', 'opus'],
+    ) -> int | None:
+        """AAC/Opus initから実際に宣言された出力チャンネル数を取得する。"""
+
+        if audio_codec == 'aac':
+            configuration = cls.extractAACInitializationConfiguration(init_segment)
+            if configuration is None:
+                return None
+            channel_count = cls.getAACChannelCountFromConfiguration(configuration[2])
+            if channel_count is not None:
+                return channel_count
+            # channelConfiguration=0 の AAC は Program Config Element (PCE) で構成を表す。
+            # PCE のビット列を独自解釈せず、同じ AudioSampleEntry に muxer が書いた
+            # channelcount を size 検証した上で参照する。
+            if configuration[2] == 0:
+                mp4a_box = cls.__findMP4Box(init_segment, b'mp4a')
+                if mp4a_box is None:
+                    return None
+                mp4a_offset, mp4a_size, mp4a_header_size = mp4a_box
+                channel_count_offset = mp4a_offset + mp4a_header_size + 16
+                if channel_count_offset + 2 > mp4a_offset + mp4a_size:
+                    return None
+                channel_count = int.from_bytes(
+                    init_segment[channel_count_offset:channel_count_offset + 2],
+                    'big',
+                )
+                return channel_count if 1 <= channel_count <= 8 else None
+            return None
+        dops_box = cls.__findMP4Box(init_segment, b'dOps')
+        if dops_box is None:
+            return None
+        dops_offset, dops_size, dops_header_size = dops_box
+        payload_offset = dops_offset + dops_header_size
+        if payload_offset + 2 > dops_offset + dops_size:
+            return None
+        return init_segment[payload_offset + 1]
+
+    @classmethod
+    def extractAudioCodecString(cls, init_segment: bytes) -> str | None:
+        """音声initからHLS CODECSへ記載するRFC 6381 codec stringを取得する。
+
+        Args:
+            init_segment: FFmpegが生成した音声fMP4初期化セグメント。
+
+        Returns:
+            AAC Audio Object TypeまたはOpusのcodec string。判定できない場合はNone。
+        """
+
+        # OpusSampleEntryは大文字のOpus、構成boxはdOpsで識別される。
+        if b'Opus' in init_segment and b'dOps' in init_segment:
+            return 'opus'
+        configuration = cls.extractAACInitializationConfiguration(init_segment)
+        return f'mp4a.40.{configuration[0]}' if configuration is not None else None
+
+    @staticmethod
+    def __getTranscodedAudioGeneration(segment: RecordedFMP4Segment) -> int:
+        """AAC/Opus delivery generationを返す。"""
+
+        return segment.transcoded_audio_generation \
+            if segment.transcoded_audio_generation is not None else segment.audio_generation
+
     def getVideoPlaylist(self, cache_key: str | None = None) -> str:
         """世代別initと映像fragmentを並べたVODメディアプレイリストを返す。"""
 
@@ -358,19 +611,26 @@ class RecordedFMP4Stream:
             f'#EXT-X-TARGETDURATION:{math.ceil(max(segment.duration for segment in self._segments))}',
         ]
         previous_generation_key: tuple[int, int] | None = None
+        previous_video_generation: int | None = None
         for segment in self._segments:
             # 代替音声と映像でcontinuity counterがずれると、hls.jsのAudioStreamControllerが
             # 対応する映像init PTSを見つけられずWAITING_INIT_PTSのまま停止する。
             # どちらかの構成世代が変わる境界を両メディアプレイリストへ同じ順序で出す。
-            generation_key = (segment.generation, segment.audio_generation)
+            generation_key = (segment.generation, self.__getTranscodedAudioGeneration(segment))
             if previous_generation_key != generation_key:
                 if previous_generation_key is not None:
                     lines.append('#EXT-X-DISCONTINUITY')
+                previous_generation_key = generation_key
+            # 音声delivery generationだけが変わる境界では、映像の初期化情報は変わらない。
+            # ここで同じ映像initを再指定すると、hls.jsはMAP取得中に先行した代替音声を
+            # WAITING_INIT_PTSから再要求し続ける場合がある。MAPは実映像世代だけで更新し、
+            # DISCONTINUITYは上で音声playlistと同じ位置に維持する。
+            if previous_video_generation != segment.generation:
                 lines.append(
                     f'#EXT-X-MAP:URI="init?session_id={self.session_id}&generation={segment.generation}'
                     f'&sequence={segment.sequence}&cache_key={cache_key}&{self.getCodecQuery()}"'
                 )
-                previous_generation_key = generation_key
+                previous_video_generation = segment.generation
             lines.append(f'#EXTINF:{segment.duration:.6f},')
             lines.append(
                 f'segment?session_id={self.session_id}&sequence={segment.sequence}&cache_key={cache_key}'
@@ -412,21 +672,256 @@ class RecordedFMP4Stream:
                 ))
         return renditions
 
+    @staticmethod
+    def getAudioChannelCount(track: AudioTrack) -> int | None:
+        """索引済み音声Trackのchannel layoutから1～8chのチャンネル数を返す。
+
+        Args:
+            track: 録画再生索引に保存された音声Track。
+
+        Returns:
+            対応するチャンネル数。layoutを安全に判定できない場合はNone。
+        """
+
+        normalized_layout = str(track.get('channel_layout') or '').strip().lower()
+        layout_channels = {
+            'mono': 1,
+            'stereo': 2,
+            'stereo downmix': 2,
+            '2.1': 3,
+            '3.0': 3,
+            '3.0(back)': 3,
+            '3.1': 4,
+            '4.0': 4,
+            'quad': 4,
+            'quad(side)': 4,
+            '4.1': 5,
+            '5.0': 5,
+            '5.0(side)': 5,
+            '5.1': 6,
+            '5.1(side)': 6,
+            '5.1(back)': 6,
+            '6.0': 6,
+            '6.0(front)': 6,
+            'hexagonal': 6,
+            '6.1': 7,
+            '6.1(back)': 7,
+            '6.1(front)': 7,
+            '7.0': 7,
+            '7.0(front)': 7,
+            '7.1': 8,
+            '7.1(wide)': 8,
+            '7.1(wide-side)': 8,
+            'octagonal': 8,
+        }
+        if normalized_layout in layout_channels:
+            return layout_channels[normalized_layout]
+
+        # FFmpeg が明示した未知 layout は、表示ラベルが 5.1ch などでも推測しない。
+        # 実 layout が欠けた古い索引だけ、下の表示ラベルから安全な構成を補完する。
+        if normalized_layout != '':
+            return None
+
+        # 古い索引にはchannel_layoutがないため、既存の表示ラベルで確実に判定できる
+        # 構成だけを補完する。曖昧なラベルをstereoと推測してOpus化しない。
+        channel_label = str(track.get('channel') or '').strip().lower()
+        if channel_label in ('monaural', 'mono'):
+            return 1
+        if channel_label == 'stereo':
+            return 2
+        if channel_label == 'dual mono':
+            return 2
+        if '5.1' in channel_label:
+            return 6
+        if '7.1' in channel_label:
+            return 8
+        return None
+
+    @classmethod
+    def getOpusBitrate(cls, channels: int) -> int | None:
+        """Opusのチャンネル数別固定ビットレートを返す。
+
+        Args:
+            channels: 出力音声のチャンネル数。
+
+        Returns:
+            1～8chに対応するビットレート。範囲外はNone。
+        """
+
+        for channel_range, bitrate in cls.OPUS_BITRATES:
+            if channels in channel_range:
+                return bitrate
+        return None
+
+    def __getAudioSourceTrack(
+        self,
+        rendition: RecordedAudioRendition,
+        start_time: float | None = None,
+    ) -> AudioTrack | None:
+        """レンディションの指定時刻または代表構成に対応する索引Trackを返す。"""
+
+        timeline_track = next(
+            (
+                track
+                for interval in self.recorded_program.recorded_video.audio_track_timeline
+                if start_time is None or
+                float(interval['start_time']) <= start_time < float(interval['end_time'])
+                for track in interval['tracks']
+                if int(track.get('index', 0)) == rendition.track_index
+            ),
+            None,
+        )
+        if timeline_track is not None:
+            return timeline_track
+        return next(
+            (
+                track for track in self.recorded_program.recorded_video.audio_tracks
+                if int(track.get('index', 0)) == rendition.track_index
+            ),
+            None,
+        )
+
+    def __getAudioRenditionChannelCount(
+        self,
+        rendition: RecordedAudioRendition,
+        start_time: float | None = None,
+    ) -> int | None:
+        """指定時刻にエンコードするレンディションのチャンネル数を返す。"""
+
+        # Dual Monoを主/副へ展開したレンディションは、入力が2chでも出力は常にmono。
+        if rendition.channel in ('main', 'sub'):
+            return 1
+        source_track = self.__getAudioSourceTrack(rendition, start_time)
+        return self.getAudioChannelCount(source_track) if source_track is not None else None
+
+    def __getAudioRenditionChannelCounts(self, rendition: RecordedAudioRendition) -> list[int] | None:
+        """録画全区間で出現するレンディションのチャンネル数を返す。"""
+
+        if rendition.channel in ('main', 'sub'):
+            return [1]
+        source_tracks = [
+            track
+            for interval in self.recorded_program.recorded_video.audio_track_timeline
+            for track in interval['tracks']
+            if int(track.get('index', 0)) == rendition.track_index
+        ]
+        if len(source_tracks) == 0:
+            source_track = self.__getAudioSourceTrack(rendition)
+            source_tracks = [source_track] if source_track is not None else []
+        channel_counts = [self.getAudioChannelCount(track) for track in source_tracks]
+        if len(channel_counts) == 0 or any(channels is None for channels in channel_counts):
+            return None
+        return sorted({channels for channels in channel_counts if channels is not None})
+
+    def __getMaximumAudioRenditionChannelCount(self, rendition: RecordedAudioRendition) -> int | None:
+        """masterのCHANNELS/BANDWIDTHへ使う録画全区間の最大チャンネル数を返す。"""
+
+        channel_counts = self.__getAudioRenditionChannelCounts(rendition)
+        return max(channel_counts) if channel_counts is not None else None
+
+    @classmethod
+    def getDeclaredAudioChannelCount(cls, track: AudioTrack) -> int | None:
+        """AAC fallbackでもHLSへ宣言できる索引上の実チャンネル数を返す。"""
+
+        # Opus可否は未知layoutを拒否する必要があるが、AACへfallbackした後のCHANNELSまで
+        # stereoと推測してはならない。Indexerが実channelsから保存した表示ラベルを別途使う。
+        if (channels := cls.getAudioChannelCount(track)) is not None:
+            return channels
+        channel_label = str(track.get('channel') or '').strip().lower()
+        label_parts = channel_label.split()
+        if (
+            len(label_parts) == 2 and
+            label_parts[0].isdigit() and
+            label_parts[1] in ('channel', 'channels')
+        ):
+            declared_channels = int(label_parts[0])
+            return declared_channels if 1 <= declared_channels <= 8 else None
+        if '5.1' in channel_label:
+            return 6
+        if '7.1' in channel_label:
+            return 8
+        return None
+
+    def __getMaximumDeclaredAudioRenditionChannelCount(
+        self,
+        rendition: RecordedAudioRendition,
+    ) -> int | None:
+        """masterのCHANNELSへ使う録画全区間の最大実チャンネル数を返す。"""
+
+        if rendition.channel in ('main', 'sub'):
+            return 1
+        source_tracks = [
+            track
+            for interval in self.recorded_program.recorded_video.audio_track_timeline
+            for track in interval['tracks']
+            if int(track.get('index', 0)) == rendition.track_index
+        ]
+        if len(source_tracks) == 0:
+            source_track = self.__getAudioSourceTrack(rendition)
+            source_tracks = [source_track] if source_track is not None else []
+        channel_counts = [self.getDeclaredAudioChannelCount(track) for track in source_tracks]
+        if len(channel_counts) == 0 or any(channels is None for channels in channel_counts):
+            return None
+        return max(channels for channels in channel_counts if channels is not None)
+
+    def __resolveEffectiveAudioCodec(self, requested_codec: AudioCodec) -> AudioCodec:
+        """録画の実音声構成からセッション全体の実効音声方式を決定する。"""
+
+        if requested_codec == 'opus':
+            # Opusは既知の1～8ch構成だけを保持してエンコードする。未知layoutを暗黙に
+            # stereoへdownmixせず、セッション全体を互換性の高いAACへ切り替える。
+            renditions = self.getAudioRenditions()
+            if len(renditions) == 0 or any(
+                channel_counts is None or
+                any(self.getOpusBitrate(channels) is None for channels in channel_counts)
+                for rendition in renditions
+                for channel_counts in [self.__getAudioRenditionChannelCounts(rendition)]
+            ):
+                logging.warning(
+                    '[RecordedFMP4Stream] Opus channel layout is unsupported; falling back to AAC. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}]'
+                )
+                return 'aac'
+        return requested_codec
+
+    def __getAudioSegmentTiming(self, segment: RecordedFMP4Segment) -> RecordedAudioSegmentTiming:
+        """AAC/Opus音声fragmentの整数presentation sample境界を返す。"""
+
+        if (
+            segment.transcoded_audio_start_sample is not None and
+            segment.transcoded_audio_sample_count is not None
+        ):
+            start_sample = segment.transcoded_audio_start_sample
+            sample_count = segment.transcoded_audio_sample_count
+        else:
+            start_sample = round(segment.start_time * self.AUDIO_SAMPLE_RATE)
+            end_sample = round((segment.start_time + segment.duration) * self.AUDIO_SAMPLE_RATE)
+            sample_count = max(1, end_sample - start_sample)
+        return RecordedAudioSegmentTiming(start_sample, sample_count)
+
+    def __getAudioPlaylistDuration(self, segment: RecordedFMP4Segment) -> float:
+        """codec delayを反映した音声fragmentのpresentation durationを返す。"""
+
+        # segment muxerへ負のinitial_offsetと(B + encoder delay)のsplit時刻を渡すため、
+        # edit list適用後の各fragmentはここで計画したpresentation sample数と一致する。
+        return self.__getAudioSegmentTiming(segment).duration
+
     def getAudioPlaylist(self, rendition_id: str, cache_key: str | None = None) -> str:
-        """映像と同じ境界を使うAAC fMP4レンディションプレイリストを返す。"""
+        """映像と同じsequenceで、方式に適した音声時間境界のプレイリストを返す。"""
 
         rendition = self.__getAudioRendition(rendition_id)
         if rendition is None:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Audio rendition was not found')
         self.keepAlive()
         cache_key = cache_key or uuid.uuid4().hex[:8]
+        audio_durations = [self.__getAudioPlaylistDuration(segment) for segment in self._segments]
         lines = [
             '#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-PLAYLIST-TYPE:VOD',
-            f'#EXT-X-TARGETDURATION:{math.ceil(max(segment.duration for segment in self._segments))}',
+            f'#EXT-X-TARGETDURATION:{math.ceil(max(audio_durations))}',
         ]
         previous_generation_key: tuple[int, int] | None = None
         for segment in self._segments:
-            generation_key = (segment.generation, segment.audio_generation)
+            generation_key = (segment.generation, self.__getTranscodedAudioGeneration(segment))
             if generation_key != previous_generation_key:
                 if previous_generation_key is not None:
                     lines.append('#EXT-X-DISCONTINUITY')
@@ -435,7 +930,8 @@ class RecordedFMP4Stream:
                     f'&cache_key={cache_key}&{self.getCodecQuery()}"'
                 )
                 previous_generation_key = generation_key
-            lines.append(f'#EXTINF:{segment.duration:.6f},')
+            audio_duration = self.__getAudioPlaylistDuration(segment)
+            lines.append(f'#EXTINF:{audio_duration:.6f},')
             lines.append(
                 f'segment?session_id={self.session_id}&sequence={segment.sequence}&cache_key={cache_key}'
                 f'&{self.getCodecQuery()}'
@@ -444,7 +940,7 @@ class RecordedFMP4Stream:
         return '\n'.join(lines) + '\n'
 
     async def getAudioInitSegment(self, rendition_id: str, sequence: int) -> bytes | None:
-        """指定レンディションのAAC初期化セグメントを返す。"""
+        """指定レンディションの音声初期化セグメントを返す。"""
 
         segment = self.__getSegment(sequence)
         rendition = self.__getAudioRendition(rendition_id)
@@ -455,28 +951,20 @@ class RecordedFMP4Stream:
         return await asyncio.to_thread(init_path.read_bytes) if init_path.is_file() else None
 
     async def getAudioSegment(self, rendition_id: str, sequence: int) -> bytes | None:
-        """映像とは独立して指定音声のAAC fragmentを生成または再利用する。"""
+        """映像とは独立して指定方式の音声fragmentを生成または再利用する。"""
 
         async with self.__activeOperation():
             return await self.__getAudioSegment(rendition_id, sequence)
 
     async def __getAudioSegment(self, rendition_id: str, sequence: int) -> bytes | None:
-        """AAC fragment生成の本体処理を行う。"""
+        """音声fragment生成の本体処理を行う。"""
 
         self.keepAlive()
         segment = self.__getSegment(sequence)
         rendition = self.__getAudioRendition(rendition_id)
         if segment is None or rendition is None:
             return None
-        segment_path = self.__buildAudioCachePath(segment, rendition, is_init=False)
-        init_path = self.__buildAudioCachePath(segment, rendition, is_init=True)
-        segment_lock = await self.__acquire(segment_path)
-        await self.__acquire(init_path)
-        async with segment_lock:
-            if segment_path.is_file():
-                return await asyncio.to_thread(segment_path.read_bytes)
-            await self.__encodeAudioSegment(segment, rendition, init_path, segment_path)
-            return await asyncio.to_thread(segment_path.read_bytes) if segment_path.is_file() else None
+        return await self.__getTranscodedAudioSegment(segment, rendition, self._effective_audio_codec)
 
     async def getVideoInitSegment(self, generation: int, sequence: int) -> bytes | None:
         """指定世代の実エンコード結果から得た初期化セグメントを返す。"""
@@ -484,8 +972,14 @@ class RecordedFMP4Stream:
         segment = self.__getSegment(sequence)
         if segment is None or segment.generation != generation:
             return None
-        await self.getVideoSegment(sequence)
         init_path = self.__buildCachePath(segment, is_init=True)
+        # master生成や同じ映像世代の先行segmentですでにinitを確定済みなら、音声だけの
+        # DISCONTINUITY境界に対応するsegment encodeを待たず即座に返す。
+        if init_path.is_file():
+            # initは数KB以下の小さな固定データなので、executorへ渡すより同期読込の方が
+            # 境界MAPへの応答を確実に即時化できる。
+            return init_path.read_bytes()
+        await self.getVideoSegment(sequence)
         if init_path.is_file() is False:
             return None
         return await asyncio.to_thread(init_path.read_bytes)
@@ -527,25 +1021,141 @@ class RecordedFMP4Stream:
             self._completed_sequences.add(sequence)
             return await asyncio.to_thread(segment_path.read_bytes)
 
+    @staticmethod
+    def __alignTranscodedAudioGenerationBoundaries(
+        desired_boundaries: list[int],
+        frame_samples: int,
+        boundary_phase: int,
+    ) -> list[int] | None:
+        """generation内部境界をcodec packet位相を保ったまま近傍へ揃える。"""
+
+        if len(desired_boundaries) <= 2:
+            return desired_boundaries.copy()
+        generation_start = desired_boundaries[0]
+        generation_end = desired_boundaries[-1]
+        internal_count = len(desired_boundaries) - 2
+        minimum_k = 1 if boundary_phase == 0 else 0
+        maximum_k = math.floor(
+            (generation_end - generation_start - 1 - boundary_phase) / frame_samples
+        )
+        if maximum_k - minimum_k + 1 < internal_count:
+            return None
+
+        aligned_k: list[int] = []
+        for index, boundary in enumerate(desired_boundaries[1:-1]):
+            relative_sample = boundary - generation_start
+            desired_k = math.floor((relative_sample - boundary_phase) / frame_samples + 0.5)
+            minimum_for_index = minimum_k + index
+            maximum_for_index = maximum_k - (internal_count - index - 1)
+            aligned_value = max(minimum_for_index, min(maximum_for_index, desired_k))
+            if len(aligned_k) > 0:
+                aligned_value = max(aligned_value, aligned_k[-1] + 1)
+            aligned_k.append(aligned_value)
+        return [
+            generation_start,
+            *[
+                generation_start + boundary_phase + k * frame_samples
+                for k in aligned_k
+            ],
+            generation_end,
+        ]
+
+    @classmethod
+    def __coalesceAudioVideoStructuralBoundaries(
+        cls,
+        video_boundaries: set[float],
+        audio_boundaries: set[float],
+        duration: float,
+    ) -> set[float]:
+        """近接する映像・音声構成境界だけを一対一で後側時刻へまとめる。
+
+        Args:
+            video_boundaries: 映像構成区間の開始・終了時刻。
+            audio_boundaries: 音声構成区間の開始・終了時刻。
+            duration: 録画全体の長さ。
+
+        Returns:
+            同一メディア内の短区間を維持したまま統合した構成境界。
+        """
+
+        # 映像と音声の解析では同じ放送上の切替でも数msずれる場合がある。全境界を単純に
+        # cluster化すると同一メディア内の本物の短区間まで消えるため、cross-mediaの候補だけを
+        # sample精度で列挙し、最も近い組から一対一で採用する。
+        candidates: list[tuple[int, float, float, float, float]] = []
+        for video_boundary in video_boundaries:
+            if video_boundary <= 0.0 or video_boundary >= duration:
+                continue
+            video_sample = round(video_boundary * cls.AUDIO_SAMPLE_RATE)
+            for audio_boundary in audio_boundaries:
+                if audio_boundary <= 0.0 or audio_boundary >= duration:
+                    continue
+                audio_sample = round(audio_boundary * cls.AUDIO_SAMPLE_RATE)
+                sample_difference = abs(video_sample - audio_sample)
+                if sample_difference <= cls.AAC_PACKET_SAMPLES:
+                    candidates.append((
+                        sample_difference,
+                        max(video_boundary, audio_boundary),
+                        min(video_boundary, audio_boundary),
+                        video_boundary,
+                        audio_boundary,
+                    ))
+
+        consumed_video_boundaries: set[float] = set()
+        consumed_audio_boundaries: set[float] = set()
+        canonical_boundaries: set[float] = set()
+        for _, later_boundary, _, video_boundary, audio_boundary in sorted(candidates):
+            if (
+                video_boundary in consumed_video_boundaries or
+                audio_boundary in consumed_audio_boundaries
+            ):
+                continue
+            consumed_video_boundaries.add(video_boundary)
+            consumed_audio_boundaries.add(audio_boundary)
+            # 半開区間の後側を採用すれば、その時刻で映像・音声とも切替後の構成が選ばれる。
+            canonical_boundaries.add(later_boundary)
+
+        return (
+            (video_boundaries - consumed_video_boundaries) |
+            (audio_boundaries - consumed_audio_boundaries) |
+            canonical_boundaries |
+            {0.0, duration}
+        )
+
     def __buildSegments(self) -> list[RecordedFMP4Segment]:
         """通常約6秒境界と映像構成変化点の和集合からセグメント計画を作る。"""
 
         recorded_video = self.recorded_program.recorded_video
         duration = recorded_video.duration
         segment_duration = VideoSegmentPlanner.computeSegmentDurationSeconds(recorded_video.video_frame_rate or 0)
-        boundaries = {0.0, duration}
-        boundaries.update(
+        regular_boundaries = {
             min(duration, index * segment_duration)
             for index in range(1, max(1, math.ceil(duration / segment_duration)))
-        )
+        }
+        # 構成変化点の直前直後へ通常境界が重なると、AAC encoder delayより短い
+        # 数msのsegmentが生まれる。構成境界を優先し、その1 AAC frame以内の通常境界だけを除く。
+        video_structural_boundaries = {0.0, duration}
         timeline = recorded_video.video_stream_timeline or []
         for entry in timeline:
-            boundaries.add(max(0.0, min(duration, float(entry['start_time']))))
-            boundaries.add(max(0.0, min(duration, float(entry['end_time']))))
+            video_structural_boundaries.add(max(0.0, min(duration, float(entry['start_time']))))
+            video_structural_boundaries.add(max(0.0, min(duration, float(entry['end_time']))))
+        audio_structural_boundaries = {0.0, duration}
         audio_timeline = recorded_video.audio_track_timeline
         for entry in audio_timeline:
-            boundaries.add(max(0.0, min(duration, float(entry['start_time']))))
-            boundaries.add(max(0.0, min(duration, float(entry['end_time']))))
+            audio_structural_boundaries.add(max(0.0, min(duration, float(entry['start_time']))))
+            audio_structural_boundaries.add(max(0.0, min(duration, float(entry['end_time']))))
+        structural_boundaries = self.__coalesceAudioVideoStructuralBoundaries(
+            video_structural_boundaries,
+            audio_structural_boundaries,
+            duration,
+        )
+        boundaries = structural_boundaries | {
+            boundary
+            for boundary in regular_boundaries
+            if all(
+                abs(boundary - structural_boundary) > self.AUDIO_BOUNDARY_COALESCE_SECONDS
+                for structural_boundary in structural_boundaries
+            )
+        }
         ordered_boundaries = sorted(boundaries)
         segments: list[RecordedFMP4Segment] = []
         previous_signature: tuple[object, ...] | None = None
@@ -573,7 +1183,8 @@ class RecordedFMP4Stream:
                 json.dumps(entry.get('mastering_display_metadata'), sort_keys=True) if entry else None,
                 json.dumps(entry.get('content_light_level'), sort_keys=True) if entry else None,
             )
-            if signature != previous_signature:
+            is_video_generation_changed = signature != previous_signature
+            if is_video_generation_changed:
                 generation += 1
                 previous_signature = signature
             audio_entry = next(
@@ -583,14 +1194,23 @@ class RecordedFMP4Stream:
                 ),
                 None,
             )
+            # タイムライン自体が存在するのに該当区間がない場合は、索引が明示した音声欠落区間。
+            # legacy録画のようにタイムラインが空の場合だけ、全体メタデータへfallbackする。
+            audio_tracks = audio_entry['tracks'] if audio_entry is not None else (
+                recorded_video.audio_tracks if len(audio_timeline) == 0 else []
+            )
             audio_signature = tuple(
                 (
                     track.get('index'), track.get('pid'), track.get('stream_index'), track.get('codec'),
-                    track.get('channel'), track.get('sampling_rate'),
+                    track.get('channel'), track.get('sampling_rate'), track.get('channel_layout'),
+                    track.get('is_dual_mono'),
                 )
-                for track in (audio_entry['tracks'] if audio_entry is not None else recorded_video.audio_tracks)
+                for track in audio_tracks
             )
-            if audio_signature != previous_audio_signature:
+            # 映像playlistも(video generation, audio generation)変化でDISCONTINUITYを出すため、
+            # 映像だけの構成変化でも音声encoder/initを新世代にする。連続encoder途中のmediaへ
+            # 同じedit listを再適用してcodec delayを二重にskipする状態を防ぐ。
+            if audio_signature != previous_audio_signature or is_video_generation_changed:
                 audio_generation += 1
                 previous_audio_signature = audio_signature
             segments.append(RecordedFMP4Segment(
@@ -600,6 +1220,72 @@ class RecordedFMP4Stream:
                 generation = generation,
                 audio_generation = audio_generation,
             ))
+
+        # AAC/Opusはaudio_generationごとに1つのencoderを連続稼働させる。各generationの
+        # 正確な開始sampleを原点にし、内部境界だけをcodec frame gridへ丸めることで、
+        # segmentごとのencoder primingと長時間の丸め誤差を同時に排除する。構成変化点である
+        # generation終端だけは任意sampleを許し、muxerが最終packet durationでpaddingをclipする。
+        frame_samples = 960 if self._effective_audio_codec == 'opus' else self.AAC_PACKET_SAMPLES
+        # Opusは312-sample pre-skip後の最初のpacketが648 samplesだけpresentationへ現れる。
+        # したがってgeneration内の安全なpacket境界は648 + 960*k、AACは1024*kになる。
+        boundary_phase = frame_samples - self.OPUS_ENCODER_DELAY_SAMPLES \
+            if self._effective_audio_codec == 'opus' else 0
+        next_audio_generation = 0
+        for audio_generation in sorted({segment.audio_generation for segment in segments}):
+            configuration_segments = [
+                segment for segment in segments
+                if segment.audio_generation == audio_generation
+            ]
+            # 長時間番組の全編encode完了を先頭segment要求が待たないよう、同じ構成でも最大6
+            # segmentのdelivery generationへ分割する。各境界は両playlistのDISCONTINUITYと
+            # 専用initに反映され、3segment以上の連続decode検証と一定の初回待ちを両立する。
+            for group_start in range(0, len(configuration_segments), self.AUDIO_DELIVERY_GENERATION_SEGMENTS):
+                generation_segments = configuration_segments[
+                    group_start:group_start + self.AUDIO_DELIVERY_GENERATION_SEGMENTS
+                ]
+                if len(generation_segments) == 0:
+                    continue
+                generation_start_time = generation_segments[0].start_time
+                generation_end_time = generation_segments[-1].start_time + generation_segments[-1].duration
+                generation_start_sample = round(generation_start_time * self.AUDIO_SAMPLE_RATE)
+                generation_end_sample = round(generation_end_time * self.AUDIO_SAMPLE_RATE)
+                desired_boundaries = [
+                    generation_start_sample,
+                    *[
+                        round(generation_segment.start_time * self.AUDIO_SAMPLE_RATE)
+                        for generation_segment in generation_segments[1:]
+                    ],
+                    generation_end_sample,
+                ]
+                local_boundaries = self.__alignTranscodedAudioGenerationBoundaries(
+                    desired_boundaries,
+                    frame_samples,
+                    boundary_phase,
+                )
+                if local_boundaries is None:
+                    # 同一delivery generation内にpacket grid点より多い映像境界がある場合は、
+                    # 各segmentを独立generationへ分け、短いterminal packetを次へ接続しない。
+                    for generation_segment in generation_segments:
+                        segment_start_sample = round(generation_segment.start_time * self.AUDIO_SAMPLE_RATE)
+                        segment_end_sample = round(
+                            (generation_segment.start_time + generation_segment.duration) * self.AUDIO_SAMPLE_RATE
+                        )
+                        segments[generation_segment.sequence] = replace(
+                            generation_segment,
+                            transcoded_audio_generation=next_audio_generation,
+                            transcoded_audio_start_sample=segment_start_sample,
+                            transcoded_audio_sample_count=max(1, segment_end_sample - segment_start_sample),
+                        )
+                        next_audio_generation += 1
+                    continue
+                for index, generation_segment in enumerate(generation_segments):
+                    segments[generation_segment.sequence] = replace(
+                        generation_segment,
+                        transcoded_audio_generation=next_audio_generation,
+                        transcoded_audio_start_sample=local_boundaries[index],
+                        transcoded_audio_sample_count=local_boundaries[index + 1] - local_boundaries[index],
+                    )
+                next_audio_generation += 1
         return segments
 
     async def __encodeSegment(
@@ -906,101 +1592,359 @@ class RecordedFMP4Stream:
             return ['-profile:v', 'main' if backend != 'FFmpeg' else '0']
         return []
 
-    async def __encodeAudioSegment(
+    def __getAudioGenerationSegments(self, audio_generation: int) -> list[RecordedFMP4Segment]:
+        """同じ音声構成を共有する連続segment群を返す。"""
+
+        return [
+            segment for segment in self._segments
+            if self.__getTranscodedAudioGeneration(segment) == audio_generation
+        ]
+
+    async def __getTranscodedAudioSegment(
         self,
         segment: RecordedFMP4Segment,
         rendition: RecordedAudioRendition,
-        init_path: Path,
-        segment_path: Path,
-    ) -> None:
-        """指定Trackを48kHz AACへ変換し、消失区間は同じ長さの無音で補う。"""
+        audio_codec: Literal['aac', 'opus'],
+    ) -> bytes | None:
+        """generation全体を単一encoderで生成し、要求fragmentを返す。"""
 
-        availability = self.__getAudioRenditionAvailability(segment.start_time, rendition)
-        # タイムライン不明時は実入力を優先するが、TrackやDual Monoの副channelが
-        # 実際には存在しない場合も映像再生を止めないよう、無音AACへ再試行する。
+        generation_segments = self.__getAudioGenerationSegments(
+            self.__getTranscodedAudioGeneration(segment)
+        )
+        if len(generation_segments) == 0:
+            return None
+        init_path = self.__buildAudioCachePath(segment, rendition, is_init=True)
+        segment_paths = {
+            generation_segment.sequence: self.__buildAudioCachePath(
+                generation_segment,
+                rendition,
+                is_init=False,
+            )
+            for generation_segment in generation_segments
+        }
+        # init pathはaudio_generationとcodec/renditionで一意なのでgeneration lockとしても使う。
+        # ランダムな後方segmentが先に要求されても、同じgenerationを重複encodeせず全cacheを確定する。
+        generation_lock = await self.__acquire(init_path)
+        for segment_path in segment_paths.values():
+            await self.__acquire(segment_path)
+        async with generation_lock:
+            if init_path.is_file() and all(path.is_file() for path in segment_paths.values()):
+                return await asyncio.to_thread(segment_paths[segment.sequence].read_bytes)
+            is_succeeded = await self.__encodeTranscodedAudioGeneration(
+                generation_segments,
+                rendition,
+                init_path,
+                segment_paths,
+                audio_codec,
+            )
+            if is_succeeded is False:
+                return None
+            requested_path = segment_paths[segment.sequence]
+            return await asyncio.to_thread(requested_path.read_bytes) if requested_path.is_file() else None
+
+    async def __encodeTranscodedAudioGeneration(
+        self,
+        generation_segments: list[RecordedFMP4Segment],
+        rendition: RecordedAudioRendition,
+        init_path: Path,
+        segment_paths: dict[int, Path],
+        audio_codec: Literal['aac', 'opus'],
+    ) -> bool:
+        """AAC/Opusを音声構成generation単位で連続encodeし、全fragmentをcacheする。"""
+
+        first_segment = generation_segments[0]
+        first_timing = self.__getAudioSegmentTiming(first_segment)
+        configuration_time = first_segment.start_time
+        expected_channel_count = self.__getAudioRenditionChannelCount(rendition, configuration_time)
+        expected_channel_layout = self.__getAudioRenditionChannelLayout(rendition, configuration_time)
+        availability = self.__getAudioRenditionAvailability(configuration_time, rendition)
         source_attempts = [False] if availability is False else [True, False]
-        stdout = b''
+        timings = [self.__getAudioSegmentTiming(item) for item in generation_segments]
+        total_input_samples = sum(timing.sample_count for timing in timings)
+        if total_input_samples <= 0:
+            return False
+
         stderr = b''
-        is_succeeded = False
         for use_recorded_audio in source_attempts:
             command = [LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error']
+            normalization_command: list[str] | None = None
+            trim_start_samples = 0
             if use_recorded_audio:
-                # TS の stream index は入力開始位置の PMT により変わるため、PIDが保存されていれば
-                # FFmpegのstream ID指定を使い、途中追加された音声を確実に選択する。
-                stream_specifier = f'0:i:0x{rendition.pid:x}' \
+                source_track = self.__getAudioSourceTrack(rendition, configuration_time)
+                source_pid = rendition.pid
+                source_stream_index = rendition.stream_index
+                if source_track is not None:
+                    timeline_pid = source_track.get('pid')
+                    timeline_stream_index = source_track.get('stream_index')
+                    if timeline_pid is not None:
+                        source_pid = int(timeline_pid)
+                    if timeline_stream_index is not None:
+                        source_stream_index = int(timeline_stream_index)
+                stream_specifier = f'0:i:0x{int(source_pid):x}' \
                     if (self.recorded_program.recorded_video.container_format == 'MPEG-TS' and
-                        rendition.pid is not None) else f'0:{rendition.stream_index}'
-                command += [
-                    '-ss', f'{segment.start_time:.6f}',
+                        source_pid is not None) else f'0:{source_stream_index}'
+                # 同じ音声構成のdelivery境界だけは手前からdecoderをwarm upする。構成世代の
+                # 先頭でprerollすると、target時刻から出現する新PIDをinput probeできず、
+                # generation全体を無音へ誤fallbackするため、そこでのseekはtargetへ直行する。
+                use_decoder_preroll = (
+                    first_segment.sequence > 0 and
+                    self._segments[first_segment.sequence - 1].audio_generation == first_segment.audio_generation
+                )
+                input_seek = max(0.0, first_timing.start_time - self.SEEK_PREROLL_SECONDS) \
+                    if use_decoder_preroll else first_timing.start_time
+                trim_start_samples = round(
+                    (first_timing.start_time - input_seek) * self.AUDIO_SAMPLE_RATE
+                )
+                input_duration = (
+                    (trim_start_samples + total_input_samples) / self.AUDIO_SAMPLE_RATE +
+                    self.AUDIO_INPUT_TAIL_MARGIN_SECONDS
+                )
+                source_input_arguments: list[str] = []
+                if input_seek > 0:
+                    source_input_arguments += ['-ss', f'{input_seek:.6f}']
+                source_input_arguments += [
                     '-i', self.recorded_program.recorded_video.file_path,
-                    '-t', f'{segment.duration + self.SEEK_PREROLL_SECONDS:.6f}',
+                    '-t', f'{input_duration:.6f}',
                     '-map', stream_specifier,
                 ]
-                filters: list[str] = []
+                source_filters: list[str] = []
                 if rendition.channel == 'main':
-                    filters.append('pan=mono|c0=c0')
+                    source_filters.append('pan=mono|c0=c0')
                 elif rendition.channel == 'sub':
-                    filters.append('pan=mono|c0=c1')
-                filters.append('asetpts=PTS-STARTPTS')
-                command += ['-af', ','.join(filters)]
+                    source_filters.append('pan=mono|c0=c1')
+
+                if expected_channel_layout is not None and expected_channel_count is not None:
+                    # 可変AACを同じstateful filter graphへ直接入れると、Stereo/Monaural切替で
+                    # graphが再初期化され、trim・resampler・padの状態が失われる。第1段は
+                    # layout変換だけを行い、元PTSを保持した固定layout PCM/NUTへ正規化する。
+                    source_filters.append(
+                        'aformat=sample_fmts=flt:sample_rates=48000:'
+                        f'channel_layouts={expected_channel_layout}'
+                    )
+                    normalization_command = [
+                        LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error',
+                        *source_input_arguments,
+                        '-af', ','.join(source_filters),
+                        '-vn', '-c:a', 'pcm_f32le', '-ac', str(expected_channel_count), '-ar', '48000',
+                        '-f', 'nut',
+                    ]
+                else:
+                    # 未知の明示layoutを標準layoutへ推測するとチャンネル配置を壊すため、
+                    # 安全に固定できないAACだけは従来の単段経路を維持する。
+                    source_filters.extend([
+                        'aresample=48000',
+                        f'atrim=start_sample={trim_start_samples}:'
+                        f'end_sample={trim_start_samples + total_input_samples}',
+                        'asetpts=N/SR/TB',
+                    ])
+                    command += [*source_input_arguments, '-af', ','.join(source_filters)]
             else:
-                # Track消失区間も同じAAC構成を維持する。Dual Monoから展開した
-                # 主音声・副音声レンディションは常にmono、それ以外は元Trackの構成を使う。
-                channel_layout = self.__getSilentAudioChannelLayout(rendition)
+                # 入力読込・Track欠落のどちらでもgeneration全体を同じcodec/layoutの無音で作り直す。
+                # 一部segmentだけを差し替えるとencoder stateが切れて継ぎ目が生じるため禁止する。
+                channel_layout = self.__getSilentAudioChannelLayout(rendition, configuration_time)
                 command += [
                     '-f', 'lavfi', '-i', f'anullsrc=r=48000:cl={channel_layout}',
-                    '-t', f'{segment.duration:.6f}',
-                    '-af', 'asetpts=PTS-STARTPTS',
+                    '-af', f'atrim=end_sample={total_input_samples},asetpts=N/SR/TB',
                 ]
-            command += [
-                '-vn', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000',
-                # 入力の音声構成変更でfilter graphが再初期化されても、AAC packet数を
-                # 48kHz / 1024 samples基準で制限し、fragmentが要求境界を越えないようにする。
-                # AAC encoderがflush時にpriming packetを1つ追加するため、その分を差し引く。
-                '-frames:a', str(self.computeAACFrameLimit(segment.duration)),
-                '-movflags', '+frag_keyframe+empty_moov+default_base_moof+negative_cts_offsets',
-                '-f', 'mp4', 'pipe:1',
-            ]
-            async with self._cpu_semaphore:
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout = asyncio.subprocess.PIPE,
-                    stderr = asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await process.communicate()
-            if process.returncode == 0:
-                is_succeeded = True
-                break
+
+            encoder_arguments: list[str] = []
+            if audio_codec == 'aac':
+                frame_samples = self.AAC_PACKET_SAMPLES
+                encoder_delay = self.AAC_ENCODER_DELAY_SAMPLES
+                encoder_arguments += ['-vn', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000']
+            else:
+                frame_samples = 960
+                encoder_delay = self.OPUS_ENCODER_DELAY_SAMPLES
+                bitrate = self.getOpusBitrate(expected_channel_count) \
+                    if expected_channel_count is not None else None
+                if expected_channel_count is None or bitrate is None:
+                    logging.error(
+                        '[RecordedFMP4Stream] Opus channel layout became unavailable during generation encoding. '
+                        f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                        f'rendition: {rendition.id}, audio_generation: '
+                        f'{self.__getTranscodedAudioGeneration(first_segment)}]'
+                    )
+                    return False
+                encoder_arguments += [
+                    '-vn', '-c:a', 'libopus', '-b:a', str(bitrate), '-ar', '48000',
+                    '-vbr', 'on', '-application', 'audio', '-frame_duration', '20',
+                    '-compression_level', '10',
+                ]
+                if expected_channel_count >= 3:
+                    encoder_arguments += ['-mapping_family', '1']
+            if expected_channel_count is not None:
+                # encoder側にもチャンネル数を明示し、initのAudioSpecificConfig/dOpsを
+                # generationの期待値から変化させない。
+                encoder_arguments += ['-ac', str(expected_channel_count)]
+
+            # encoder delayを含む最後のpacketまで出力させる。内部境界はframe gridに揃っており、
+            # generation終端のpaddingだけをMP4 muxerの最終sample durationでclipする。
+            frame_limit = math.ceil((total_input_samples + encoder_delay) / frame_samples)
+            encoder_arguments += ['-frames:a', str(frame_limit)]
+            cumulative_samples = 0
+            split_samples: list[int] = []
+            for timing in timings[:-1]:
+                cumulative_samples += timing.sample_count
+                split_samples.append(cumulative_samples + encoder_delay)
+
+            with tempfile.TemporaryDirectory(prefix='konomitv-audio-generation-') as temporary_directory:
+                temporary_directory_path = Path(temporary_directory)
+                normalized_audio_path = temporary_directory_path / 'normalized-audio.nut'
+                output_pattern = str(Path(temporary_directory) / 'segment-%06d.mp4')
+                if normalization_command is not None:
+                    assert expected_channel_layout is not None
+                    normalization_command.append(str(normalized_audio_path))
+                    # 第2段は固定layout NUTだけを入力するため、PTS補完・trim・padの状態が
+                    # Stereo/Monaural切替で再初期化されない。NUTのPCM layoutは明示指定し、
+                    # 元PTSの64ms欠落を同じ位置へ無音として補完してから予定sample数へ揃える。
+                    command = [
+                        LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error',
+                        '-ch_layout:a:0', expected_channel_layout,
+                        '-i', str(normalized_audio_path),
+                        '-map', '0:a:0',
+                        '-af', ','.join([
+                            f'aresample=48000:out_chlayout={expected_channel_layout}:'
+                            'async=1:min_hard_comp=0.001:first_pts=0',
+                            f'atrim=start_sample={trim_start_samples}',
+                            f'apad=whole_len={total_input_samples}',
+                            f'atrim=end_sample={total_input_samples}',
+                            'asetpts=N/SR/TB',
+                        ]),
+                    ]
+
+                # 入力経路に関係なく、codecとsample上限は最終段だけへ適用する。
+                command += encoder_arguments
+                if len(split_samples) > 0:
+                    command += [
+                        '-segment_times',
+                        ','.join(f'{sample / self.AUDIO_SAMPLE_RATE:.9f}' for sample in split_samples),
+                    ]
+                command += [
+                    '-initial_offset', f'{-encoder_delay / self.AUDIO_SAMPLE_RATE:.9f}',
+                    '-f', 'segment', '-segment_format', 'mp4',
+                    '-segment_format_options',
+                    'movflags=+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
+                    '-reset_timestamps', '0',
+                    output_pattern,
+                ]
+                async with self._cpu_semaphore:
+                    if normalization_command is not None:
+                        normalization_process = await asyncio.create_subprocess_exec(
+                            *normalization_command,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        _, stderr = await normalization_process.communicate()
+                        if normalization_process.returncode != 0 or normalized_audio_path.is_file() is False:
+                            logging.warning(
+                                '[RecordedFMP4Stream] FFmpeg 8 audio normalization source failed; '
+                                'retrying the entire generation with silence. '
+                                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                                f'rendition: {rendition.id}, audio_generation: '
+                                f'{self.__getTranscodedAudioGeneration(first_segment)}, '
+                                f'stderr: {stderr.decode(errors="ignore").strip()}]'
+                            )
+                            continue
+                    process = await asyncio.create_subprocess_exec(
+                        *command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await process.communicate()
+                output_paths = sorted(Path(temporary_directory).glob('segment-*.mp4'))
+                if process.returncode != 0 or len(output_paths) != len(generation_segments):
+                    if use_recorded_audio:
+                        logging.warning(
+                            '[RecordedFMP4Stream] FFmpeg 8 audio generation source failed; '
+                            'retrying the entire generation with silence. '
+                            f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                            f'rendition: {rendition.id}, audio_generation: '
+                            f'{self.__getTranscodedAudioGeneration(first_segment)}, '
+                            f'stderr: {stderr.decode(errors="ignore").strip()}]'
+                        )
+                    continue
+                outputs = [await asyncio.to_thread(path.read_bytes) for path in output_paths]
+
+            media_fragments: list[bytes] = []
+            common_init_data = b''
+            next_decode_sample = first_timing.start_sample
+            is_valid = True
+            for index, (generation_segment, timing, output) in enumerate(zip(
+                generation_segments,
+                timings,
+                outputs,
+                strict=True,
+            )):
+                init_data, media_data = self.splitFragmentedMP4(output)
+                expected_duration = timing.sample_count
+                if index == 0:
+                    expected_duration += encoder_delay
+                if self.validateTranscodedAudioFragmentTimeline(
+                    init_data,
+                    media_data,
+                    audio_codec,
+                    expected_start_sample=0,
+                    expected_sample_count=expected_duration,
+                    expected_channel_count=expected_channel_count,
+                ) is False:
+                    is_valid = False
+                    break
+                try:
+                    normalized_media = self.normalizeFragmentTimeline(
+                        init_data,
+                        media_data,
+                        next_decode_sample / self.AUDIO_SAMPLE_RATE,
+                        generation_segment.sequence,
+                    )
+                except ValueError:
+                    is_valid = False
+                    break
+                if self.validateTranscodedAudioFragmentTimeline(
+                    init_data,
+                    normalized_media,
+                    audio_codec,
+                    expected_start_sample=next_decode_sample,
+                    expected_sample_count=expected_duration,
+                    expected_channel_count=expected_channel_count,
+                ) is False:
+                    is_valid = False
+                    break
+                if index == 0:
+                    patched_init = self.patchAudioInitializationEditList(init_data, encoder_delay)
+                    if (
+                        patched_init is None or
+                        self.validateAudioInitializationDelay(patched_init, audio_codec, encoder_delay) is False
+                    ):
+                        is_valid = False
+                        break
+                    common_init_data = patched_init
+                media_fragments.append(normalized_media)
+                next_decode_sample += expected_duration
+
+            if is_valid and len(common_init_data) > 0 and len(media_fragments) == len(generation_segments):
+                await RecordedFMP4CacheManager.writeAtomic(init_path, common_init_data)
+                for generation_segment, media_data in zip(generation_segments, media_fragments, strict=True):
+                    await RecordedFMP4CacheManager.writeAtomic(segment_paths[generation_segment.sequence], media_data)
+                return True
             if use_recorded_audio:
-                logging.warning(
-                    '[RecordedFMP4Stream] FFmpeg 8 audio source failed; retrying with silence. '
-                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, rendition: {rendition.id}, '
-                    f'sequence: {segment.sequence}, stderr: {stderr.decode(errors="ignore").strip()}]'
+                # 実音声を正常に生成できた後の検証失敗は、入力Track欠落とは異なる実装上の異常。
+                # ここで無音へ置換するとHTTP上は成功したまま音声だけが消えるため、失敗を呼び出し元へ返す。
+                logging.error(
+                    '[RecordedFMP4Stream] FFmpeg 8 recorded audio generation failed validation; '
+                    'refusing to replace recorded audio with silence. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'rendition: {rendition.id}, audio_generation: '
+                    f'{self.__getTranscodedAudioGeneration(first_segment)}]'
                 )
-        if is_succeeded is False:
-            logging.error(
-                '[RecordedFMP4Stream] FFmpeg 8 audio segment failed. '
-                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, rendition: {rendition.id}, '
-                f'sequence: {segment.sequence}, stderr: {stderr.decode(errors="ignore").strip()}]'
-            )
-            return
-        init_data, media_data = self.splitFragmentedMP4(stdout)
-        if len(init_data) == 0 or len(media_data) == 0:
-            logging.error(
-                '[RecordedFMP4Stream] FFmpeg 8 audio output did not contain init and media fragments. '
-                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, rendition: {rendition.id}, '
-                f'sequence: {segment.sequence}]'
-            )
-            return
-        media_data = self.normalizeFragmentTimeline(
-            init_data,
-            media_data,
-            segment.start_time,
-            segment.sequence,
+                return False
+
+        logging.error(
+            '[RecordedFMP4Stream] FFmpeg 8 audio generation failed. '
+            f'[recorded_video_id: {self.recorded_program.recorded_video.id}, rendition: {rendition.id}, '
+            f'audio_generation: {self.__getTranscodedAudioGeneration(first_segment)}, '
+            f'stderr: {stderr.decode(errors="ignore").strip()}]'
         )
-        if init_path.is_file() is False:
-            await RecordedFMP4CacheManager.writeAtomic(init_path, init_data)
-        await RecordedFMP4CacheManager.writeAtomic(segment_path, media_data)
+        return False
 
     def __buildCachePath(self, segment: RecordedFMP4Segment, is_init: bool) -> Path:
         """現在の映像条件に対応するinitまたはfragmentのキャッシュパスを返す。"""
@@ -1031,11 +1975,11 @@ class RecordedFMP4Stream:
 
         variant = RecordedFMP4Variant(
             quality = self.quality,
-            codec = 'aac',
+            codec = self.__getAudioCacheCodec(segment, rendition),
             bit_depth = 0,
             is_24fps = False,
             backend = 'FFmpeg',
-            configuration_generation = segment.audio_generation,
+            configuration_generation = self.__getTranscodedAudioGeneration(segment),
             seek_generation = 0,
             rendition = rendition.id,
         )
@@ -1043,8 +1987,26 @@ class RecordedFMP4Stream:
             self.recorded_program.recorded_video,
             variant,
             'audio-init' if is_init else 'audio',
-            segment.audio_generation if is_init else segment.sequence,
+            self.__getTranscodedAudioGeneration(segment) if is_init else segment.sequence,
         )
+
+    def __getAudioCacheCodec(
+        self,
+        segment: RecordedFMP4Segment,
+        rendition: RecordedAudioRendition,
+    ) -> str:
+        """要求方式・実効方式・ビットレートを含む音声cache codecキーを返す。"""
+
+        channel_layout = self.__getAudioRenditionChannelLayout(rendition, segment.start_time) or 'unfixed'
+        if self._effective_audio_codec == 'opus':
+            channels = self.__getAudioRenditionChannelCount(rendition, segment.start_time)
+            bitrate = self.getOpusBitrate(channels) if channels is not None else None
+            if bitrate is None:
+                return 'opus-invalid'
+            return f'opus-continuous-{bitrate}-{channel_layout}'
+        if self.encoding_options.audio_codec == 'opus':
+            return f'opus-fallback-aac-continuous-192000-{channel_layout}'
+        return f'aac-continuous-192000-{channel_layout}'
 
     def __getAudioRendition(self, rendition_id: str) -> RecordedAudioRendition | None:
         """公開済みIDに一致する音声レンディションを返す。"""
@@ -1074,7 +2036,7 @@ class RecordedFMP4Stream:
             None,
         )
         if interval is None:
-            return None
+            return None if len(self.recorded_program.recorded_video.audio_track_timeline) == 0 else False
         timeline_track = next(
             (track for track in interval['tracks'] if int(track.get('index', 0)) == rendition.track_index),
             None,
@@ -1086,31 +2048,40 @@ class RecordedFMP4Stream:
             return False
         return True
 
-    def __getSilentAudioChannelLayout(self, rendition: RecordedAudioRendition) -> str:
-        """Track消失区間へ挿入する無音AACのchannel layoutを返す。"""
+    def __getAudioRenditionChannelLayout(
+        self,
+        rendition: RecordedAudioRendition,
+        start_time: float | None = None,
+    ) -> str | None:
+        """指定時刻のレンディションを安全に固定できるchannel layoutへ解決する。
+
+        Args:
+            rendition: 固定対象の論理音声レンディション。
+            start_time: 録画先頭0秒基準の構成確認時刻。
+
+        Returns:
+            FFmpegへ明示できる既知layout。未知の明示layoutは推測せずNone。
+        """
 
         if rendition.channel in ('main', 'sub'):
             return 'mono'
-        source_track = next(
-            (
-                track
-                for interval in self.recorded_program.recorded_video.audio_track_timeline
-                for track in interval['tracks']
-                if int(track.get('index', 0)) == rendition.track_index
-            ),
-            next(
-                (
-                    track for track in self.recorded_program.recorded_video.audio_tracks
-                    if int(track.get('index', 0)) == rendition.track_index
-                ),
-                None,
-            ),
-        )
+        source_track = self.__getAudioSourceTrack(rendition, start_time)
         if source_track is None:
-            return 'stereo'
-        channel_layout = str(source_track.get('channel_layout') or '').lower()
-        if channel_layout in ('mono', 'stereo', '2.1', '3.0', '4.0', '5.1', '7.1'):
-            return channel_layout
+            return None
+        channel_layout = str(source_track.get('channel_layout') or '').strip().lower()
+        # FFmpegが明示した既知1～8ch layoutは名前ごと保持し、5.0/6.1/quadなどを
+        # stereoへ暗黙変換しない。未知の明示layoutも表示ラベルから推測しない。
+        if channel_layout != '' and self.getAudioChannelCount(source_track) is not None:
+            return {
+                # FFmpeg 8 の anullsrc が受理しない索引上の別名を同等の canonical 名へ直す。
+                'stereo downmix': 'stereo',
+                '5.1(back)': '5.1',
+            }.get(channel_layout, channel_layout)
+        if channel_layout != '':
+            return None
+
+        # channel_layoutを持たない古い索引だけ、明確な表示ラベルまたは宣言チャンネル数を
+        # FFmpeg標準layoutへ補完する。
         channel_label = str(source_track.get('channel') or '').lower()
         if 'monaural' in channel_label or 'mono' in channel_label:
             return 'mono'
@@ -1118,6 +2089,53 @@ class RecordedFMP4Stream:
             return '5.1'
         if '7.1' in channel_label:
             return '7.1'
+        declared_channels = self.getDeclaredAudioChannelCount(source_track)
+        if declared_channels is not None:
+            return {
+                1: 'mono',
+                2: 'stereo',
+                3: '3.0',
+                4: '4.0',
+                5: '5.0',
+                6: '5.1',
+                7: '6.1',
+                8: '7.1',
+            }[declared_channels]
+        return None
+
+    def __getSilentAudioChannelLayout(
+        self,
+        rendition: RecordedAudioRendition,
+        start_time: float | None = None,
+    ) -> str:
+        """Track消失区間へ挿入する無音音声のchannel layoutを返す。
+
+        Args:
+            rendition: 無音を生成する論理音声レンディション。
+            start_time: 録画先頭0秒基準の構成確認時刻。
+
+        Returns:
+            anullsrcへ渡す既知layout。判断材料がなければ従来どおりstereo。
+        """
+
+        channel_layout = self.__getAudioRenditionChannelLayout(rendition, start_time)
+        if channel_layout is not None:
+            return channel_layout
+        source_track = self.__getAudioSourceTrack(rendition, start_time)
+        declared_channels = self.getDeclaredAudioChannelCount(source_track) if source_track is not None else None
+        if declared_channels is not None:
+            # 実音声では未知layoutを推測しないが、入力自体がない無音fallbackでは
+            # master playlistへ宣言済みのチャンネル数を保つ必要がある。
+            return {
+                1: 'mono',
+                2: 'stereo',
+                3: '3.0',
+                4: '4.0',
+                5: '5.0',
+                6: '5.1',
+                7: '6.1',
+                8: '7.1',
+            }[declared_channels]
         return 'stereo'
 
     async def __acquire(self, cache_path: Path) -> asyncio.Lock:
@@ -1168,6 +2186,376 @@ class RecordedFMP4Stream:
                 media.extend(box)
             offset += size
         return bytes(init), bytes(media)
+
+    @staticmethod
+    def __iterateMP4Boxes(
+        data: bytes | bytearray,
+        start: int,
+        end: int,
+    ) -> Iterator[tuple[int, int, int, bytes]]:
+        """指定範囲の直下にある検証済みISO BMFF boxを順に返す。"""
+
+        offset = start
+        while offset + 8 <= end:
+            box_size = int.from_bytes(data[offset:offset + 4], 'big')
+            box_type = bytes(data[offset + 4:offset + 8])
+            header_size = 8
+            if box_size == 1:
+                if offset + 16 > end:
+                    raise ValueError('The fMP4 data contains a truncated extended box header.')
+                box_size = int.from_bytes(data[offset + 8:offset + 16], 'big')
+                header_size = 16
+            elif box_size == 0:
+                box_size = end - offset
+            if box_size < header_size or offset + box_size > end:
+                raise ValueError('The fMP4 data contains an invalid box size.')
+            yield offset, box_size, header_size, box_type
+            offset += box_size
+        if offset != end:
+            raise ValueError('The fMP4 data ends with a truncated box header.')
+
+    @staticmethod
+    def __findMP4Box(data: bytes, box_type: bytes) -> tuple[int, int, int] | None:
+        """任意階層にあるsize検証済みboxの位置を返す。"""
+
+        search_offset = 0
+        while True:
+            type_offset = data.find(box_type, search_offset)
+            if type_offset < 0:
+                return None
+            if type_offset >= 4:
+                box_start = type_offset - 4
+                box_size = int.from_bytes(data[box_start:type_offset], 'big')
+                header_size = 8
+                if box_size == 1 and box_start + 16 <= len(data):
+                    box_size = int.from_bytes(data[box_start + 8:box_start + 16], 'big')
+                    header_size = 16
+                if box_size >= header_size and box_start + box_size <= len(data):
+                    return box_start, box_size, header_size
+            search_offset = type_offset + 1
+
+    @classmethod
+    def patchAudioInitializationEditList(cls, init_data: bytes, encoder_delay: int) -> bytes | None:
+        """generation共通initの先頭codec delayだけをedit listで除外する。
+
+        Args:
+            init_data: segment muxer先頭出力から分離した初期化セグメント。
+            encoder_delay: AAC primingまたはOpus pre-skipの48kHz sample数。
+
+        Returns:
+            先頭media_timeをcodec delayへ補正したinit。安全に補正できない場合はNone。
+        """
+
+        elst_box = cls.__findMP4Box(init_data, b'elst')
+        if elst_box is None or encoder_delay < 0:
+            return None
+        elst_offset, elst_size, elst_header_size = elst_box
+        payload_offset = elst_offset + elst_header_size
+        box_end = elst_offset + elst_size
+        if payload_offset + 8 > box_end:
+            return None
+        version = init_data[payload_offset]
+        entry_count = int.from_bytes(init_data[payload_offset + 4:payload_offset + 8], 'big')
+        if entry_count < 1:
+            return None
+        # version 0は32bit、version 1は64bitのsegment_duration/media_timeを持つ。
+        if version == 0:
+            media_time_offset = payload_offset + 12
+            media_time_size = 4
+        elif version == 1:
+            media_time_offset = payload_offset + 16
+            media_time_size = 8
+        else:
+            return None
+        if media_time_offset + media_time_size + 4 > box_end:
+            return None
+        if encoder_delay >= 1 << (media_time_size * 8 - 1):
+            return None
+        patched_init = bytearray(init_data)
+        patched_init[media_time_offset:media_time_offset + media_time_size] = encoder_delay.to_bytes(
+            media_time_size,
+            'big',
+            signed=True,
+        )
+        return bytes(patched_init)
+
+    @classmethod
+    def validateAudioInitializationDelay(
+        cls,
+        init_data: bytes,
+        audio_codec: Literal['aac', 'opus'],
+        encoder_delay: int,
+    ) -> bool:
+        """共通initがcodec delayをgeneration先頭で一度だけ除外するか検証する。"""
+
+        elst_box = cls.__findMP4Box(init_data, b'elst')
+        if elst_box is None:
+            return False
+        elst_offset, elst_size, elst_header_size = elst_box
+        payload_offset = elst_offset + elst_header_size
+        box_end = elst_offset + elst_size
+        if payload_offset + 8 > box_end:
+            return False
+        version = init_data[payload_offset]
+        entry_count = int.from_bytes(init_data[payload_offset + 4:payload_offset + 8], 'big')
+        if entry_count != 1:
+            return False
+        if version == 0:
+            duration_offset = payload_offset + 8
+            duration_size = 4
+            media_time_offset = payload_offset + 12
+            media_time_size = 4
+        elif version == 1:
+            duration_offset = payload_offset + 8
+            duration_size = 8
+            media_time_offset = payload_offset + 16
+            media_time_size = 8
+        else:
+            return False
+        rate_offset = media_time_offset + media_time_size
+        if rate_offset + 4 > box_end:
+            return False
+        segment_duration = int.from_bytes(
+            init_data[duration_offset:duration_offset + duration_size],
+            'big',
+        )
+        media_time = int.from_bytes(
+            init_data[media_time_offset:media_time_offset + media_time_size],
+            'big',
+            signed=True,
+        )
+        if segment_duration != 0 or media_time != encoder_delay or init_data[rate_offset:rate_offset + 4] != b'\x00\x01\x00\x00':
+            return False
+        if audio_codec == 'aac':
+            return True
+
+        dops_box = cls.__findMP4Box(init_data, b'dOps')
+        if dops_box is None:
+            return False
+        dops_offset, dops_size, dops_header_size = dops_box
+        dops_payload = dops_offset + dops_header_size
+        if dops_payload + 8 > dops_offset + dops_size:
+            return False
+        pre_skip = int.from_bytes(init_data[dops_payload + 2:dops_payload + 4], 'big')
+        input_sample_rate = int.from_bytes(init_data[dops_payload + 4:dops_payload + 8], 'big')
+        return pre_skip == encoder_delay and input_sample_rate == cls.AUDIO_SAMPLE_RATE
+
+    @classmethod
+    def inspectAudioFragment(
+        cls,
+        init_data: bytes,
+        media_data: bytes,
+    ) -> RecordedAudioFragmentInfo | None:
+        """fMP4音声fragmentの全moofからsample数・duration・decode連続性を検証する。"""
+
+        mdhd_box = cls.__findMP4Box(init_data, b'mdhd')
+        if mdhd_box is None:
+            return None
+        mdhd_offset, mdhd_size, mdhd_header_size = mdhd_box
+        mdhd_payload = mdhd_offset + mdhd_header_size
+        if mdhd_payload + 4 > mdhd_offset + mdhd_size:
+            return None
+        mdhd_version = init_data[mdhd_payload]
+        timescale_offset = mdhd_payload + (20 if mdhd_version == 1 else 12)
+        if timescale_offset + 4 > mdhd_offset + mdhd_size:
+            return None
+        timescale = int.from_bytes(init_data[timescale_offset:timescale_offset + 4], 'big')
+        if timescale <= 0:
+            return None
+
+        # trunでsample durationが省略された場合に使うtrex既定値をtrack ID別に保持する。
+        trex_defaults: dict[int, int] = {}
+        search_offset = 0
+        while True:
+            type_offset = init_data.find(b'trex', search_offset)
+            if type_offset < 0:
+                break
+            box = cls.__findMP4Box(init_data[search_offset:], b'trex')
+            if box is None:
+                break
+            relative_offset, box_size, header_size = box
+            box_offset = search_offset + relative_offset
+            payload_offset = box_offset + header_size
+            if payload_offset + 16 <= box_offset + box_size:
+                track_id = int.from_bytes(init_data[payload_offset + 4:payload_offset + 8], 'big')
+                default_duration = int.from_bytes(init_data[payload_offset + 12:payload_offset + 16], 'big')
+                trex_defaults[track_id] = default_duration
+            search_offset = box_offset + box_size
+
+        sample_durations: list[int] = []
+        first_decode_time: int | None = None
+        previous_decode_end: int | None = None
+        try:
+            top_level_boxes = cls.__iterateMP4Boxes(media_data, 0, len(media_data))
+            for moof_offset, moof_size, moof_header_size, moof_type in top_level_boxes:
+                if moof_type != b'moof':
+                    continue
+                for traf_offset, traf_size, traf_header_size, traf_type in cls.__iterateMP4Boxes(
+                    media_data,
+                    moof_offset + moof_header_size,
+                    moof_offset + moof_size,
+                ):
+                    if traf_type != b'traf':
+                        continue
+                    track_id: int | None = None
+                    default_duration: int | None = None
+                    decode_time: int | None = None
+                    trun_boxes: list[tuple[int, int, int]] = []
+                    for child_offset, child_size, child_header_size, child_type in cls.__iterateMP4Boxes(
+                        media_data,
+                        traf_offset + traf_header_size,
+                        traf_offset + traf_size,
+                    ):
+                        payload_offset = child_offset + child_header_size
+                        child_end = child_offset + child_size
+                        if child_type == b'tfhd':
+                            if payload_offset + 8 > child_end:
+                                return None
+                            flags = int.from_bytes(media_data[payload_offset + 1:payload_offset + 4], 'big')
+                            track_id = int.from_bytes(media_data[payload_offset + 4:payload_offset + 8], 'big')
+                            cursor = payload_offset + 8
+                            if flags & 0x000001:
+                                cursor += 8
+                            if flags & 0x000002:
+                                cursor += 4
+                            if flags & 0x000008:
+                                if cursor + 4 > child_end:
+                                    return None
+                                default_duration = int.from_bytes(media_data[cursor:cursor + 4], 'big')
+                                cursor += 4
+                            if flags & 0x000010:
+                                cursor += 4
+                            if flags & 0x000020:
+                                cursor += 4
+                            if cursor > child_end:
+                                return None
+                        elif child_type == b'tfdt':
+                            if payload_offset + 8 > child_end:
+                                return None
+                            version = media_data[payload_offset]
+                            decode_time_size = 8 if version == 1 else 4
+                            if payload_offset + 4 + decode_time_size > child_end:
+                                return None
+                            decode_time = int.from_bytes(
+                                media_data[payload_offset + 4:payload_offset + 4 + decode_time_size],
+                                'big',
+                            )
+                        elif child_type == b'trun':
+                            trun_boxes.append((child_offset, child_size, child_header_size))
+                    if track_id is None or decode_time is None or len(trun_boxes) == 0:
+                        return None
+                    if default_duration is None:
+                        default_duration = trex_defaults.get(track_id)
+
+                    traf_durations: list[int] = []
+                    for trun_offset, trun_size, trun_header_size in trun_boxes:
+                        payload_offset = trun_offset + trun_header_size
+                        trun_end = trun_offset + trun_size
+                        if payload_offset + 8 > trun_end:
+                            return None
+                        flags = int.from_bytes(media_data[payload_offset + 1:payload_offset + 4], 'big')
+                        sample_count = int.from_bytes(media_data[payload_offset + 4:payload_offset + 8], 'big')
+                        cursor = payload_offset + 8
+                        if flags & 0x000001:
+                            cursor += 4
+                        if flags & 0x000004:
+                            cursor += 4
+                        for _ in range(sample_count):
+                            if flags & 0x000100:
+                                if cursor + 4 > trun_end:
+                                    return None
+                                duration = int.from_bytes(media_data[cursor:cursor + 4], 'big')
+                                cursor += 4
+                            elif default_duration is not None:
+                                duration = default_duration
+                            else:
+                                return None
+                            if flags & 0x000200:
+                                cursor += 4
+                            if flags & 0x000400:
+                                cursor += 4
+                            if flags & 0x000800:
+                                cursor += 4
+                            if cursor > trun_end or duration <= 0:
+                                return None
+                            traf_durations.append(duration)
+
+                    traf_duration = sum(traf_durations)
+                    if first_decode_time is None:
+                        first_decode_time = decode_time
+                    if previous_decode_end is not None and decode_time != previous_decode_end:
+                        return None
+                    previous_decode_end = decode_time + traf_duration
+                    sample_durations.extend(traf_durations)
+        except ValueError:
+            return None
+
+        if first_decode_time is None or previous_decode_end is None or len(sample_durations) == 0:
+            return None
+        return RecordedAudioFragmentInfo(
+            timescale=timescale,
+            first_decode_time=first_decode_time,
+            total_duration=previous_decode_end - first_decode_time,
+            sample_count=len(sample_durations),
+            sample_durations=tuple(sample_durations),
+        )
+
+    @classmethod
+    def validateTranscodedAudioFragmentTimeline(
+        cls,
+        init_data: bytes,
+        media_data: bytes,
+        audio_codec: Literal['aac', 'opus'],
+        expected_start_sample: int,
+        expected_sample_count: int,
+        expected_channel_count: int | None = None,
+    ) -> bool:
+        """AAC/Opus変換fragmentが48kHzの予定timelineを連続して覆うか判定する。"""
+
+        info = cls.inspectAudioFragment(init_data, media_data)
+        expected_codec = 'mp4a.40.2' if audio_codec == 'aac' else 'opus'
+        frame_samples = cls.AAC_PACKET_SAMPLES if audio_codec == 'aac' else 960
+        expected_packet_count = math.ceil(expected_sample_count / frame_samples)
+        expected_last_duration = expected_sample_count % frame_samples or frame_samples
+        if info is None or not (
+            cls.extractAudioCodecString(init_data) == expected_codec and
+            (
+                expected_channel_count is None or
+                cls.extractAudioInitializationChannelCount(init_data, audio_codec) == expected_channel_count
+            ) and
+            info.timescale == cls.AUDIO_SAMPLE_RATE and
+            info.first_decode_time == expected_start_sample and
+            info.total_duration == expected_sample_count and
+            info.sample_count == expected_packet_count
+        ):
+            return False
+
+        # FFmpegのsegment muxerは境界時刻をTrack timebaseへ丸める際、連続する2 packetを
+        # 1023/1025 samples（Opusでは959/961）のような相殺済み±1 sampleへすることがある。
+        # 合計時間とdecode連続性はinspectAudioFragment()で厳密に確認済みなので、この隣接する
+        # 補償ペアだけを許容し、それ以外の短縮・伸長や末尾partial packetのずれは拒否する。
+        # 末尾がpartial packetのときだけ、その長さを補償対象から外して完全一致を要求する。
+        # 末尾も完全frameなら、直前packetとの補償ペアが境界に現れても同じ規則で許容する。
+        if expected_last_duration != frame_samples and info.sample_durations[-1] != expected_last_duration:
+            return False
+        full_frame_durations = info.sample_durations[:-1] \
+            if expected_last_duration != frame_samples else info.sample_durations
+        duration_index = 0
+        while duration_index < len(full_frame_durations):
+            duration = full_frame_durations[duration_index]
+            if duration == frame_samples:
+                duration_index += 1
+                continue
+            if (
+                duration in (frame_samples - 1, frame_samples + 1) and
+                duration_index + 1 < len(full_frame_durations) and
+                full_frame_durations[duration_index + 1] == frame_samples * 2 - duration
+            ):
+                duration_index += 2
+                continue
+            return False
+
+        return True
 
     @staticmethod
     def normalizeFragmentTimeline(
@@ -1274,18 +2662,3 @@ class RecordedFMP4Stream:
         if fragment_count == 0:
             raise ValueError('The fMP4 fragment does not contain a moof box.')
         return bytes(normalized_media)
-
-    @staticmethod
-    def computeAACFrameLimit(duration: float) -> int:
-        """要求時間を越えないAAC encoder入力フレーム上限を返す。
-
-        Args:
-            duration: HLSセグメントの要求時間。
-
-        Returns:
-            FFmpegの-frames:aへ渡すフレーム数。
-        """
-
-        # AAC-LCは48kHzで1packetあたり1024 samples。encoderのflush時にpriming packetが
-        # 1つ加わるため、切り上げたpacket数から入力フレームを1つ差し引く。
-        return max(1, math.ceil(duration * 48_000 / 1024) - 1)

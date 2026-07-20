@@ -22,6 +22,10 @@ RecordedFMP4CacheKind = Literal['video-init', 'video', 'audio-init', 'audio']
 class RecordedFMP4Variant:
     """映像・音声fMP4キャッシュを一意に識別する生成条件を表す。"""
 
+    # 生成パイプラインの変更時にこの値を上げ、互換性のない旧キャッシュとの衝突を防ぐ。
+    # キャッシュの配置形式は変わらないため、LAYOUT_VERSION とは独立した内部改訂値とする。
+    PIPELINE_REVISION: ClassVar[int] = 2
+
     quality: str
     codec: str
     bit_depth: int
@@ -34,7 +38,17 @@ class RecordedFMP4Variant:
     def digest(self) -> str:
         """フィールド順に依存しない安定した短縮SHA-256を返す。"""
 
-        serialized = json.dumps(asdict(self), ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        # dataclass の生成条件と内部パイプライン改訂値の両方をdigestへ含める。
+        # ClassVar は asdict() に含まれないため、専用のメタデータとして明示的に直列化する。
+        serialized = json.dumps(
+            {
+                'pipeline_revision': self.PIPELINE_REVISION,
+                'variant': asdict(self),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
         return hashlib.sha256(serialized.encode()).hexdigest()[:24]
 
 

@@ -55,7 +55,7 @@ def GetRecordedStream(
             session_id,
             recorded_program,
             stream_quality.quality,
-            encoding_options=None,
+            encoding_options=stream_quality.encoding_options,
             is_new_session_allowed=False,
         )
     if IsRecordedPlaybackIndexReady(

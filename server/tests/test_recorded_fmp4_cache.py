@@ -17,6 +17,20 @@ def test_recorded_fmp4_variant_digest_is_stable() -> None:
     assert len(variant.digest()) == 24
 
 
+def test_recorded_fmp4_pipeline_revision_changes_digest_without_changing_layout() -> None:
+    """内部パイプライン改訂時だけdigestが変わり、旧v1キャッシュも管理対象に残ることを確認する。"""
+
+    variant = RecordedFMP4Variant('1080p', 'hevc', 10, False, 'QSVEncC', 1, 2)
+    current_digest = variant.digest()
+
+    with patch.object(RecordedFMP4Variant, 'PIPELINE_REVISION', RecordedFMP4Variant.PIPELINE_REVISION + 1):
+        assert variant.digest() != current_digest
+
+    assert RecordedFMP4CacheManager.LAYOUT_VERSION == 1
+    old_cache_name = '.konomitv-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-3.m4s'
+    assert RecordedFMP4CacheManager.isCacheFileName(old_cache_name) is True
+
+
 def test_recorded_fmp4_reserved_file_name_is_strict() -> None:
     """予約形式だけを除外し、一般MP4や部分一致を誤除外しないことを確認する。"""
 

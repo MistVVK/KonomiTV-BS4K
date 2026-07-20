@@ -5,7 +5,7 @@ from typing import Literal
 
 
 VideoCodec = Literal['avc', 'hevc', 'vp9', 'av1']
-AudioCodec = Literal['aac']
+AudioCodec = Literal['aac', 'opus']
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,11 @@ VIDEO_CODECS: dict[VideoCodec, VideoCodecDefinition] = {
 AUDIO_CODECS: dict[AudioCodec, AudioCodecDefinition] = {
     'aac': AudioCodecDefinition(
         id='aac', display_name='AAC', hls_codec='mp4a.40.2',
-        mime_type='video/mp2t', container='mpegts', ffmpeg_encoder='aac',
+        mime_type='audio/mp4', container='fmp4', ffmpeg_encoder='aac',
+    ),
+    'opus': AudioCodecDefinition(
+        id='opus', display_name='Opus', hls_codec='opus',
+        mime_type='audio/mp4', container='fmp4', ffmpeg_encoder='libopus',
     ),
 }
 
