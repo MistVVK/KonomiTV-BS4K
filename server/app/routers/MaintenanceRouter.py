@@ -293,10 +293,15 @@ async def ReanalyzeAllRecordedVideosAPI():
 async def DetectCMSectionsForAllRecordedVideosAPI(
     replace_existing_chapter: Annotated[
         bool,
-        Query(description='KonomiTVが生成したchapterの再解析と置換を許可する。外部chapterは保持する。'),
+        Query(
+            description=(
+                'KonomiTV生成chapterの再解析と置換、またはlegacy chapterを保持したまま'
+                'canonical chapterを新規生成する。外部canonical chapterは保持する。'
+            ),
+        ),
     ] = False,
 ):
-    """登録済み録画を再判定し、明示指定時だけKonomiTV生成chapterを置換する。"""
+    """登録済み録画を再判定し、明示指定時だけ安全に置換可能なchapterを再生成する。"""
 
     global cm_detection_task
 

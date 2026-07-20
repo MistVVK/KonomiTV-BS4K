@@ -10,9 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
+from app.metadata.CMAnalysisOrchestrator import CMAnalysisIntent, CMAnalysisOrchestrator
 from app.metadata.CMAnalyzer import CMInputDescriptor
-from app.metadata.CMChapterFile import CMChapterReadResult
+from app.metadata.CMChapterFile import CMChapterPathKind, CMChapterReadResult
 from app.metadata.CMLogoSelector import CMLogoSelection
 from app.models.CMAnalysis import CMLogo, RecordedVideoCMAnalysis
 from app.schemas import AudioTrackTimelineEntry
@@ -220,6 +220,32 @@ def test_generated_result_requires_matching_chapter_hash() -> None:
         {**saved, 'inode': 11},
     ) is False
     assert CMAnalysisOrchestrator._sameChapterFingerprint(None, {'sha256': 'new'}) is False
+
+
+@pytest.mark.parametrize(
+    ('intent', 'path_kind', 'generated_identity', 'expected'),
+    [
+        ('CMRegeneration', 'Legacy', False, False),
+        ('CMRegeneration', 'Canonical', False, True),
+        ('CMDetection', 'Legacy', False, True),
+        ('DetectCM', 'Legacy', False, True),
+        ('CMChapterSync', 'Legacy', False, True),
+        ('CMRegeneration', 'Legacy', True, False),
+    ],
+)
+def test_explicit_regeneration_can_analyze_alongside_unowned_legacy_chapter(
+    intent: CMAnalysisIntent,
+    path_kind: CMChapterPathKind,
+    generated_identity: bool,
+    expected: bool,
+) -> None:
+    """明示再判定だけlegacyを迂回し、外部canonicalと自動同期は保護する。"""
+
+    assert CMAnalysisOrchestrator._shouldPublishExistingChapterWithoutAnalysis(
+        intent,
+        path_kind,
+        generated_identity,
+    ) is expected
 
 
 def test_pending_generated_content_can_recover_after_file_db_commit_gap() -> None:

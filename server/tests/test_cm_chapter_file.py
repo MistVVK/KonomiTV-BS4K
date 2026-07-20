@@ -239,6 +239,26 @@ def test_commit_chapter_atomically(tmp_path: Path) -> None:
     assert list(destination_path.parent.glob('.*.tmp')) == []
 
 
+def test_commit_canonical_chapter_keeps_legacy_chapter_unchanged(tmp_path: Path) -> None:
+    """legacyを入力に再判定しても旧sidecarを残し、canonicalを優先採用する。"""
+
+    recorded_path = tmp_path / 'program.hevc.ts'
+    recorded_path.touch()
+    legacy_path = GetLegacyCMChapterPath(recorded_path)
+    WriteChapter(legacy_path, [(1, '00:00:00.000', 'Legacy')])
+    legacy_content = legacy_path.read_bytes()
+    generated_path = tmp_path / 'generated.chapter.txt'
+    WriteChapter(generated_path, [(1, '00:00:00.000', 'CM'), (2, '00:00:30.000', 'Program')])
+
+    canonical_path = GetCMChapterPath(recorded_path)
+    CommitCMChapterFile(generated_path, canonical_path, 60.0, {'exists': False})
+    selection = SelectCMChapterPath(recorded_path, [recorded_path])
+
+    assert legacy_path.read_bytes() == legacy_content
+    assert selection.path == canonical_path
+    assert selection.kind == 'Canonical'
+
+
 def test_invalid_generated_chapter_does_not_replace_existing(tmp_path: Path) -> None:
     """作業chapterが壊れていれば既存chapterを変更しない。"""
 

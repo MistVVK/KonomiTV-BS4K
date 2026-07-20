@@ -198,9 +198,14 @@ class CMAnalysisOrchestrator:
                         used_logo_id=state.used_logo_id,
                     )
                 generated_chapter_identity = published_generated_identity or pending_generated_identity
-                # 外部chapterは常に保護する。KonomiTV生成chapterは公開結果として保持したまま
-                # runtime/logo/streamを含むattempt keyを計算し、同一keyなら状態を変更せず返す。
-                if generated_chapter_identity is False:
+                # 外部canonical chapterは常に保護する。一方、legacy chapterは実体を残したまま
+                # canonical chapterを別名で生成できるため、明示的な再判定時だけ解析へ進める。
+                # 通常の自動解析では従来どおりchapterを最優先し、既存結果を再公開して終了する。
+                if self._shouldPublishExistingChapterWithoutAnalysis(
+                    intent,
+                    chapter_selection.kind,
+                    generated_chapter_identity,
+                ):
                     source: CMResultSource
                     if chapter_selection.kind == 'Legacy':
                         source = 'LegacyImported'
@@ -941,6 +946,18 @@ class CMAnalysisOrchestrator:
         """pending結果は解析時と現在の録画内容が完全一致する場合だけ回復する。"""
 
         return left is not None and right is not None and dict(left) == dict(right)
+
+    @staticmethod
+    def _shouldPublishExistingChapterWithoutAnalysis(
+        intent: CMAnalysisIntent,
+        chapter_path_kind: CMChapterPathKind,
+        generated_chapter_identity: bool,
+    ) -> bool:
+        """所有していないchapterを解析せず採用するかを返す。"""
+
+        if generated_chapter_identity:
+            return False
+        return intent != 'CMRegeneration' or chapter_path_kind == 'Canonical'
 
     @staticmethod
     def _isRecoverablePendingState(state: RecordedVideoCMAnalysis) -> bool:
