@@ -251,8 +251,11 @@ async def Startup():
     # チャンネル情報を更新
     await Channel.update()
 
-    # ニコニコ実況関連のステータスを更新
-    await Channel.updateJikkyoStatus()
+    # ニコニコ実況が有効ならステータスを更新し、無効なら以前のキャッシュと DB 値を消去する
+    if CONFIG.general.jikkyo_enabled is True:
+        await Channel.updateJikkyoStatus()
+    else:
+        await Channel.clearJikkyoStatus()
 
     # 番組情報を更新
     await Program.update()
@@ -288,14 +291,18 @@ async def Startup():
 )
 async def UpdateChannelAndProgram():
     await Channel.update()
-    await Channel.updateJikkyoStatus()
+    # 無効時には定期処理から実況の外部 API を呼び出さない
+    if CONFIG.general.jikkyo_enabled is True:
+        await Channel.updateJikkyoStatus()
     await Program.update(multiprocess=True)
 
 # 30秒に1回、ニコニコ実況関連のステータスを更新する
 @app.on_event('startup')
 @repeat_every(seconds=0.5 * 60, wait_first=0.5 * 60, logger=logging.logger)
 async def UpdateChannelJikkyoStatus():
-    await Channel.updateJikkyoStatus()
+    # 無効時には30秒周期の実況更新処理自体を実行しない
+    if CONFIG.general.jikkyo_enabled is True:
+        await Channel.updateJikkyoStatus()
 
 # サーバーの終了時に実行する
 cleanup = False

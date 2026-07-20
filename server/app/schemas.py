@@ -1008,3 +1008,4 @@ class VersionInformation(BaseModel):
     environment: Literal['Linux', 'Linux-Docker']
     backend: Literal['EDCB', 'Mirakurun']
     encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC']
+    jikkyo_enabled: bool

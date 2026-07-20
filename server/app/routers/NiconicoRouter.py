@@ -9,8 +9,10 @@ from fastapi.security.utils import get_authorization_scheme_param
 from jose import jwt
 
 from app import logging, schemas
+from app.config import Config
 from app.constants import API_REQUEST_HEADERS, HTTPX_CLIENT, NICONICO_OAUTH_CLIENT_ID
 from app.models.User import User
+from app.routers.JikkyoDependency import EnsureJikkyoEnabled
 from app.routers.UsersRouter import GetCurrentUser
 from app.utils import Interlaced
 from app.utils.OAuthCallbackResponse import OAuthCallbackResponse
@@ -28,6 +30,7 @@ router = APIRouter(
     summary = 'ニコニコ OAuth 認証 URL 発行 API',
     response_model = schemas.ThirdpartyAuthURL,
     response_description = 'ユーザーにアプリ連携してもらうための認証 URL。',
+    dependencies = [Depends(EnsureJikkyoEnabled)],
 )
 async def NiconicoAuthURLAPI(
     request: Request,
@@ -109,6 +112,14 @@ async def NiconicoAuthCallbackAPI(
 
     # スマホ・タブレット向けのリダイレクト先 URL を生成
     redirect_url = f'{client.rstrip("/")}/settings/jikkyo'
+
+    # ブラウザ向けコールバックの応答形式を維持しつつ、認証コードの交換前に拒否する
+    if Config().general.jikkyo_enabled is False:
+        return OAuthCallbackResponse(
+            status_code = status.HTTP_403_FORBIDDEN,
+            detail = 'Jikkyo is disabled by server settings',
+            redirect_to = redirect_url,
+        )
 
     # "error" パラメーターがセットされている
     # OAuth 認証がユーザーによって拒否されたことを示しているので、401 エラーにする

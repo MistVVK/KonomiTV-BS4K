@@ -11,6 +11,7 @@ from tortoise import fields
 from tortoise.fields import Field as TortoiseField
 from tortoise.models import Model as TortoiseModel
 
+from app.config import Config
 from app.constants import API_REQUEST_HEADERS, HTTPX_CLIENT, NICONICO_OAUTH_CLIENT_ID
 from app.utils import Interlaced
 
@@ -52,6 +53,10 @@ class User(TortoiseModel):
         Raises:
             Exception: アクセストークンの更新に失敗した場合 (例外に含まれるエラーメッセージを API レスポンスで返す想定)
         """
+
+        # 実況機能が無効な間は、保持中の認証情報を変更せずニコニコへも接続しない
+        if Config().general.jikkyo_enabled is False:
+            raise RuntimeError('実況機能はサーバー設定で無効になっています。')
 
         try:
 

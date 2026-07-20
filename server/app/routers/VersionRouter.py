@@ -516,5 +516,7 @@ async def VersionInformationAPI():
         'environment': environment,
         'backend': Config().general.backend,
         'encoder': Config().general.encoder,
+        # 保存直後の設定値ではなく、このプロセスで実際に有効な実況機能の状態を返す
+        'jikkyo_enabled': Config().general.jikkyo_enabled,
     }
     return result

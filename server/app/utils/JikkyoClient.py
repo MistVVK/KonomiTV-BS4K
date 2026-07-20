@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from typing_extensions import TypedDict
 
 from app import logging, schemas
+from app.config import Config
 from app.constants import API_REQUEST_HEADERS, HTTPX_CLIENT, JIKKYO_CHANNELS_PATH, JST
 from app.models.User import User
 from app.utils import ParseDatetimeStringToJST
@@ -216,11 +217,28 @@ class JikkyoClient:
 
 
     @classmethod
+    def clearStatuses(cls) -> None:
+        """
+        プロセス内に保持している実況チャンネルのステータスをすべて破棄する。
+
+        Returns:
+            None
+        """
+
+        cls.__jikkyo_channels_statuses.clear()
+
+
+    @classmethod
     async def updateStatuses(cls) -> None:
         """
         全ての実況チャンネルのステータスを更新する
         更新したステータスは getStatus() で取得できる
         """
+
+        # サーバー全体で実況機能が無効なら、以前取得したステータスも破棄して外部 API へは接続しない
+        if Config().general.jikkyo_enabled is False:
+            cls.clearStatuses()
+            return
 
         # NX-Jikkyo のチャンネル情報 API から実況チャンネルのステータスを取得する
         ## サーバー混雑時は若干時間がかかることがあるのでタイムアウトを 5 秒に伸ばしている
@@ -268,6 +286,16 @@ class JikkyoClient:
         Returns:
             schemas.JikkyoWebSocketInfo: ニコニコ実況・NX-Jikkyo とコメントを送受信するための WebSocket API の情報
         """
+
+        # ルーター以外から直接呼び出された場合も、外部接続先 URL を一切公開しない
+        if Config().general.jikkyo_enabled is False:
+            return schemas.JikkyoWebSocketInfo(
+                watch_session_url = None,
+                nicolive_watch_session_url = None,
+                nicolive_watch_session_error = '実況機能はサーバー設定で無効になっています。',
+                comment_session_url = None,
+                is_nxjikkyo_exclusive = False,
+            )
 
         # 現在は NX-Jikkyo のみ存在するニコニコ実況チャンネルかどうかを表すフラグ
         ## 実況チャンネル ID に対応するニコニコチャンネル ID が存在しない場合、NX-Jikkyo 固有のニコニコ実況チャンネルと判定する (jk141 など)
@@ -422,6 +450,14 @@ class JikkyoClient:
         Returns:
             schemas.JikkyoComments: 過去ログコメントのリスト
         """
+
+        # ルーター以外から直接呼び出された場合も、過去ログ API へは接続しない
+        if Config().general.jikkyo_enabled is False:
+            return schemas.JikkyoComments(
+                is_success = False,
+                comments = [],
+                detail = '実況機能はサーバー設定で無効になっています。',
+            )
 
         # ニコニコ実況 過去ログ API から過去ログコメントを取得する
         ## 30秒応答がなかったらタイムアウト (レスポンスが結構重めなので場合によっては時間がかかることがある)

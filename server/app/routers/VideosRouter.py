@@ -38,6 +38,7 @@ from app.models.CMAnalysis import RecordedVideoCMAnalysis, RecordedVideoCMResult
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
+from app.routers.JikkyoDependency import EnsureJikkyoEnabled
 from app.routers.UsersRouter import GetCurrentAdminUser
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.JikkyoClient import JikkyoClient
@@ -917,6 +918,7 @@ async def VideoDownloadAPI(
     summary = '録画番組過去ログコメント API',
     response_description = '録画番組の放送中に投稿されたニコニコ実況の過去ログコメント。',
     response_model = schemas.JikkyoComments,
+    dependencies = [Depends(EnsureJikkyoEnabled)],
 )
 async def VideoJikkyoCommentsAPI(
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],

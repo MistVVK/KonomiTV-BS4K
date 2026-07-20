@@ -22,6 +22,11 @@ def test_client_settings_theme_defaults_to_konomi_classic() -> None:
     assert ClientSettings().ui_theme == 'KonomiClassic'
 
 
+def test_client_settings_jikkyo_defaults_to_disabled() -> None:
+    assert ClientSettings().jikkyo_enabled is False
+    assert ClientSettings.model_validate({}).jikkyo_enabled is False
+
+
 @pytest.mark.parametrize('theme', THEMES)
 def test_client_settings_accepts_all_supported_themes(theme: str) -> None:
     assert ClientSettings.model_validate({'ui_theme': theme}).ui_theme == theme

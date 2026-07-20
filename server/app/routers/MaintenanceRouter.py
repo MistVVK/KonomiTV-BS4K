@@ -17,6 +17,7 @@ from fastapi.responses import Response
 from sse_starlette.sse import EventSourceResponse
 
 from app import logging, schemas
+from app.config import Config
 from app.constants import (
     KONOMITV_ACCESS_LOG_PATH,
     KONOMITV_SERVER_LOG_PATH,
@@ -152,7 +153,9 @@ async def UpdateDatabaseAPI():
     """
 
     await Channel.update()
-    await Channel.updateJikkyoStatus()
+    # 実況機能が無効な間は、手動 DB 更新からも実況サービスへ接続しない
+    if Config().general.jikkyo_enabled is True:
+        await Channel.updateJikkyoStatus()
     await Program.update(multiprocess=True)
 
 

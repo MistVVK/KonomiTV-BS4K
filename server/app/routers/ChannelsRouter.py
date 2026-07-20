@@ -16,6 +16,7 @@ from app import logging, schemas
 from app.config import Config
 from app.constants import HTTPX_CLIENT, JST, LOGO_DIR, VERSION
 from app.models.Channel import Channel
+from app.routers.JikkyoDependency import EnsureJikkyoEnabled
 from app.routers.UsersRouter import GetCurrentUser
 from app.streams.LiveStream import LiveStream
 from app.utils import GetMirakurunAPIEndpointURL, ParseDatetimeStringToJST
@@ -533,6 +534,7 @@ async def ChannelLogoAPI(
     summary = 'ニコニコ実況 WebSocket URL API',
     response_description = 'ニコニコ実況コメント送受信用 WebSocket API の情報。',
     response_model = schemas.JikkyoWebSocketInfo,
+    dependencies = [Depends(EnsureJikkyoEnabled)],
 )
 async def ChannelJikkyoWebSocketInfoAPI(
     request: Request,

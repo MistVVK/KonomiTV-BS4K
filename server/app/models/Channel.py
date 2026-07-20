@@ -627,8 +627,27 @@ class Channel(TortoiseModel):
 
 
     @classmethod
+    async def clearJikkyoStatus(cls) -> None:
+        """
+        プロセス内キャッシュと DB に残っているニコニコ実況の勢い情報をすべて消去する。
+
+        Returns:
+            None
+        """
+
+        # 無効化前に取得した値が UI や並び順へ残らないよう、メモリと全チャンネル行の両方を初期化する
+        JikkyoClient.clearStatuses()
+        await cls.all().update(jikkyo_force=None)
+
+
+    @classmethod
     async def updateJikkyoStatus(cls) -> None:
         """ チャンネル情報のうち、ニコニコ実況関連のステータスを更新する """
+
+        # 呼び出し元の判定漏れがあっても、無効時には外部 API へ接続せず残存データを消去する
+        if Config().general.jikkyo_enabled is False:
+            await cls.clearJikkyoStatus()
+            return
 
         # 全ての実況チャンネルのステータスを更新
         await JikkyoClient.updateStatuses()

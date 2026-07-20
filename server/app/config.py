@@ -167,6 +167,7 @@ class ClientSettings(BaseModel):
     capture_filename_pattern: str = 'Capture_%date%-%time%'
     # capture_copy_to_clipboard: 同期無効
     # sync_settings: 同期無効
+    jikkyo_enabled: bool = False
     prefer_posting_to_nicolive: bool = True
     comment_speed_rate: Annotated[float, PositiveFloat] = 1.0
     comment_font_size: Annotated[int, PositiveInt] = 34
@@ -195,6 +196,7 @@ class ClientSettings(BaseModel):
 
 class _ServerSettingsGeneral(BaseModel):
     backend: Literal['EDCB', 'Mirakurun'] = 'EDCB'
+    jikkyo_enabled: bool = False
     always_receive_tv_from_mirakurun: bool = False
     edcb_url: Annotated[Url, UrlConstraints(allowed_schemes=['tcp'])] = Url('tcp://127.0.0.1:4510/')
     mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] = Url('http://127.0.0.1:40772/')

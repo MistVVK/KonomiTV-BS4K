@@ -7,6 +7,11 @@ general:
     # バックエンドに Mirakurun が選択されているときは、録画予約機能は利用できません。
     backend: 'EDCB'
 
+    # ニコニコ実況 / NX-Jikkyo 連携を有効にするか
+    # 有効にすると KonomiTV サーバーと各クライアントから外部の実況サービスへ接続できるようになります。
+    # 設定変更を反映するには KonomiTV サーバーの再起動が必要です。
+    jikkyo_enabled: false
+
     # 利用するバックエンドが EDCB のとき、常に Mirakurun / mirakc から放送波を受信するか
     # バックエンドに Mirakurun が選択されているときは効果がありません。
     # EDCB に加えて mirakurun_url で指定した Mirakurun / mirakc にアクセスできる必要があります。
