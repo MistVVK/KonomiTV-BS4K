@@ -1,0 +1,138 @@
+import hashlib
+import importlib.util
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+from markdown_it import MarkdownIt
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+GENERATOR_PATH = REPOSITORY_ROOT / 'docker/thirdparty/generate-chromium-license-document.py'
+
+
+def LoadGenerator() -> ModuleType:
+    spec = importlib.util.spec_from_file_location('generate_chromium_license_document', GENERATOR_PATH)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+GENERATOR = LoadGenerator()
+
+
+def test_chromium_package_version_is_pinned_to_four_part_upstream_version() -> None:
+    assert GENERATOR.extractPackageChromiumVersion('150.0.7871.124~linuxmint1+virginia') == '150.0.7871.124'
+
+    with pytest.raises(ValueError, match='Unsupported Chromium package version'):
+        GENERATOR.extractPackageChromiumVersion('latest')
+
+
+def test_chromium_credits_require_complete_text_and_supported_homepages() -> None:
+    credits = GENERATOR.validateCredits([
+        {
+            'name': 'External project',
+            'homepage': 'https://example.com/project',
+            'license': 'First page\fSecond page',
+        },
+        {
+            'name': 'Chromium internal project',
+            'homepage': 'chrome://credits/Internal',
+            'license': 'Internal license.',
+        },
+    ])
+    assert credits[0]['license'] == 'First page\nSecond page'
+
+    with pytest.raises(ValueError, match='unsupported homepage URL'):
+        GENERATOR.validateCredits([
+            {'name': 'Unsafe', 'homepage': 'javascript:alert(1)', 'license': 'License.'},
+        ])
+
+    with pytest.raises(ValueError, match='empty license text'):
+        GENERATOR.validateCredits([
+            {'name': 'Missing', 'homepage': 'https://example.com/', 'license': ''},
+        ])
+
+    with pytest.raises(ValueError, match='at least 100 are required'):
+        GENERATOR.validateCredits([
+            {'name': 'Only project', 'homepage': 'https://example.com/', 'license': 'License.'},
+        ], minimum_count=100)
+
+    with pytest.raises(ValueError, match='Unicode replacement character'):
+        GENERATOR.validateCredits([
+            {'name': 'Damaged', 'homepage': 'https://example.com/', 'license': 'Copyright \ufffd'},
+        ])
+
+
+def test_known_chromium_credits_encoding_damage_is_repaired_only_for_fixed_version() -> None:
+    android_license = (
+        GENERATOR.ANDROID_BROKEN_LICENSE_LINE + '\n' +
+        GENERATOR.ANDROID_BROKEN_MULTIPLE_LICENSED_LINE + '\n' +
+        GENERATOR.ANDROID_BROKEN_LICENSE_LINE
+    )
+    credits = [
+        {'name': name, 'homepage': 'https://example.com/', 'license': android_license}
+        for name in GENERATOR.ANDROID_NOTICE_REPAIR_PROJECTS
+    ]
+    credits.append({
+        'name': 'FreeType',
+        'homepage': 'https://freetype.org/',
+        'license': GENERATOR.FREETYPE_BROKEN_COPYRIGHT_LINE,
+    })
+
+    repaired, repairs = GENERATOR.repairKnownCreditsEncoding('150.0.7871.124', credits)
+    assert len(repairs) == 16
+    assert sum(character_count for _, character_count in repairs) == 121
+    assert all('\ufffd' not in credit['license'] for credit in repaired)
+    assert GENERATOR.ANDROID_REPAIRED_LICENSE_LINE in repaired[0]['license']
+    assert GENERATOR.FREETYPE_REPAIRED_COPYRIGHT_LINE in repaired[-1]['license']
+
+    with pytest.raises(ValueError, match='known repairs apply only'):
+        GENERATOR.repairKnownCreditsEncoding('151.0.0.0', credits)
+
+
+def test_linux_mint_package_copyright_is_strict_utf8_and_hashed(tmp_path: Path) -> None:
+    copyright_path = tmp_path / 'copyright'
+    copyright_path.write_bytes(b'Package notice.\n')
+
+    copyright_text, copyright_sha256 = GENERATOR.readPackageCopyright(copyright_path)
+    assert copyright_text == 'Package notice.'
+    assert copyright_sha256 == hashlib.sha256(b'Package notice.\n').hexdigest()
+
+    copyright_path.write_bytes(b'Invalid UTF-8: \xff')
+    with pytest.raises(RuntimeError, match='not valid UTF-8'):
+        GENERATOR.readPackageCopyright(copyright_path)
+
+    copyright_path.write_text('Damaged: \ufffd', encoding='utf-8')
+    with pytest.raises(ValueError, match='Unicode replacement character'):
+        GENERATOR.readPackageCopyright(copyright_path)
+
+
+def test_chromium_license_document_uses_safe_dynamic_markdown_fences() -> None:
+    chromium_license = '// Copyright Chromium\n````\nLicense text.'
+    document = GENERATOR.buildLicenseDocument(
+        '1.2.3.4~linuxmint1+virginia',
+        '1.2.3.4',
+        'https://chromium.googlesource.com/chromium/src/+/refs/tags/1.2.3.4/LICENSE?format=TEXT',
+        chromium_license,
+        'Linux Mint package copyright.',
+        '0' * 64,
+        [{
+            'name': 'Markup project',
+            'homepage': 'https://example.com/',
+            'license': '<script>alert(1)</script>\n`````\nLicense text.',
+        }],
+        [('Markup project', 1)],
+    )
+
+    assert 'Fixed upstream Chromium version: `1.2.3.4`' in document
+    assert 'Bundled project count: 1' in document
+    assert 'Linux Mint package copyright file' in document
+    assert '`Markup project`: 1 character' in document
+    assert '`````text\n// Copyright Chromium' in document
+    assert '``````text\n' in document
+    rendered = MarkdownIt().render(document)
+    assert '<script>alert(1)</script>' not in rendered
+    assert '&lt;script&gt;alert(1)&lt;/script&gt;' in rendered

@@ -1,11 +1,13 @@
 # Third-Party Software Licenses
 
 <!-- NONFREE_RUNTIME_WARNING_START -->
-> **重要: このDockerイメージを再配布しないでください。**
+> **重要: `NONFREE=true` でビルドした Docker イメージは再配布しないでください。**
 >
-> この `NONFREE=true` ビルドには、Intel Media DriverのFull Feature版（`ENABLE_NONFREE_KERNELS=ON`）と、AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro`）が含まれます。
+> このビルドプロファイルには、Intel Media Driver の Full Feature 版（`ENABLE_NONFREE_KERNELS=ON`）と AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro` など）が含まれます。
 >
-> 再配布禁止の直接の理由は、GPL version 3 or laterで提供されるFFmpegなどとAMD proprietary runtimeが同じ完成イメージに含まれることです。AMD側は再配布とFree Software Licenseの適用を制限しており、その制限とGPL側の再配布条件は、この完成イメージについて同時に満たすことができません。したがって、完成イメージ全体をGPLv3以降としてライセンスまたは再配布することはできません。現在のDockerfileは、各ユーザーが自身の環境でローカルビルドして利用することだけを前提としています。
+> AMD proprietary runtime に同梱される AMD Software End User License Agreement は、Software の配布・公開・表示・サブライセンス・譲渡・移転を禁止し、AMD プロセッサーを組み込んだシステムまたはコンポーネントでのインストールと使用に限定しています。したがって、これらのパッケージを含む完成イメージを再配布または移転せず、EULA が許諾する AMD 環境でのローカル利用に限定してください。AMD の現行 EULA: <https://www.amd.com/en/legal/eula/amd-software-eula.html>
+>
+> また、完成イメージには GPL version 3 or later で提供される FFmpeg など、別の条件が適用されるソフトウェアも含まれます。この注意書きは各ライセンスの条件を変更したり、追加の権利を許諾したりするものではありません。利用者自身で、完成イメージに含まれるすべてのライセンス条件を確認してください。
 <!-- NONFREE_RUNTIME_WARNING_END -->
 
 <!--
@@ -14,27 +16,30 @@ KonomiTV の Docker image に直接組み込む third-party ソフトウェア�
 
 このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。
 Ubuntu・CUDA・GPU runtime・Python／JavaScript パッケージの推移的依存関係を含め、各配布物の著作権表示とライセンス全文を掲載します。
+Chromium の大容量なライセンス全文は、同じイメージ内の専用文書へ分離してこの文書からリンクします。
 -->
 
-## Chromium @CHROMIUM_VERSION@
+## Directly Managed Third-Party Components
 
-- Source package and binaries: https://packages.linuxmint.com/
-- Upstream source: https://chromium.googlesource.com/chromium/src/
+### Bundled Components
+
+#### Chromium
+
+- Source package and binaries: <https://packages.linuxmint.com/>
+- Upstream source: <https://chromium.googlesource.com/chromium/src/>
 - Package: `chromium` from the signed Linux Mint Virginia `upstream` repository
-- Licenses include: BSD 3-Clause, GPL-2.0+, and bundled third-party licenses
+- Licenses include: BSD 3-Clause and the licenses listed by the installed Chromium binary
 
-### Copyright and license notices
+The exact Chromium license and every third-party notice reported by the installed binary are generated during the Docker build.
 
-````text
-@CHROMIUM_COPYRIGHT@
-````
+[Open the complete Chromium license document](/api/version/chromium-third-party-licenses)
 
-## KonomiTV upstream
+#### KonomiTV upstream
 
-- Source: https://github.com/tsukumijima/KonomiTV.git
+- Source: <https://github.com/tsukumijima/KonomiTV.git>
 - Fixed revision or artifact: `89190d2e009513e0caef71f5416ea56868ae00f9`
 
-### License.txt
+##### License.txt
 
 ```text
 The MIT License (MIT)
@@ -48,12 +53,12 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## FFmpeg 7.1.5
+#### FFmpeg 7.1.5
 
-- Source: https://github.com/FFmpeg/FFmpeg.git
+- Source: <https://github.com/FFmpeg/FFmpeg.git>
 - Fixed revision or artifact: `3a0867c2bfda4a4d4309ca1a8cbdc6175e67f587`
 
-### LICENSE.md
+##### LICENSE.md
 
 ```text
 # License
@@ -187,7 +192,7 @@ incompatible with the GPLv2 and v3. To the best of our knowledge, they are
 compatible with the LGPL.
 ```
 
-### GNU GPL version 3
+##### GNU GPL version 3
 
 ```text
                     GNU GENERAL PUBLIC LICENSE
@@ -866,12 +871,12 @@ Public License instead of this License.  But first, please read
 <http://www.gnu.org/philosophy/why-not-lgpl.html>.
 ```
 
-## FFmpeg 8.1.2
+#### FFmpeg 8.1.2
 
-- Source: https://github.com/FFmpeg/FFmpeg.git
+- Source: <https://github.com/FFmpeg/FFmpeg.git>
 - Fixed revision or artifact: `38b88335f99e76ed89ff3c93f877fdefce736c13`
 
-### LICENSE.md
+##### LICENSE.md
 
 ```text
 # License
@@ -1003,7 +1008,7 @@ incompatible with the GPLv2 and v3. To the best of our knowledge, they are
 compatible with the LGPL.
 ```
 
-### GNU LGPL version 2.1
+##### GNU LGPL version 2.1
 
 ```text
                   GNU LESSER GENERAL PUBLIC LICENSE
@@ -1510,7 +1515,7 @@ necessary.  Here is a sample; alter the names:
 That's all there is to it!
 ```
 
-### GNU GPL version 3
+##### GNU GPL version 3
 
 ```text
                     GNU GENERAL PUBLIC LICENSE
@@ -2189,12 +2194,12 @@ Public License instead of this License.  But first, please read
 <http://www.gnu.org/philosophy/why-not-lgpl.html>.
 ```
 
-## AMD Advanced Media Framework headers 1.4.36
+#### AMD Advanced Media Framework headers 1.4.36
 
-- Source: https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
+- Source: <https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git>
 - Fixed revision or artifact: `16f7d73e0b45c473e903e46981ed0b91efc4c091`
 
-### LICENSE.txt
+##### LICENSE.txt
 
 ```text
 Notice Regarding Standards.  AMD does not provide a license or sublicense to
@@ -2230,12 +2235,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-## QSVEncC 8.21
+#### QSVEncC 8.21
 
-- Source: https://github.com/rigaya/QSVEnc.git
+- Source: <https://github.com/rigaya/QSVEnc.git>
 - Fixed revision or artifact: `e5f7eaf26e3ab713f65898e92ba985663e9da161`
 
-### license.txt
+##### license.txt
 
 ```text
 ------------------------------------------------------------------------------------------
@@ -2976,12 +2981,12 @@ That's all there is to it!
 ------------------------------------------------------------------------------------------
 ```
 
-## NVEncC 9.24
+#### NVEncC 9.24
 
-- Source: https://github.com/rigaya/NVEnc.git
+- Source: <https://github.com/rigaya/NVEnc.git>
 - Fixed revision or artifact: `cf30caa8d5ef7b1f953f16294749bfc093c3af0c`
 
-### NVEnc_license.txt
+##### NVEnc_license.txt
 
 ```text
 -----------------------------------------------------------------------------------------
@@ -3123,12 +3128,12 @@ QSVEncCでは、"vapoursynth.h""VSScript.h"をインクルードし使用して�
 ------------------------------------------------------------------------------------------
 ```
 
-## VCEEncC 9.08
+#### VCEEncC 9.08
 
-- Source: https://github.com/rigaya/VCEEnc.git
+- Source: <https://github.com/rigaya/VCEEnc.git>
 - Fixed revision or artifact: `648cb34f5338b388d19f6fb83575080a91db5499`
 
-### VCEEnc_license.txt
+##### VCEEnc_license.txt
 
 ```text
 -----------------------------------------------------------------------------------------
@@ -3350,12 +3355,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ****************************************************************************
 ```
 
-## tsreadex 7f2d2aec01c1
+#### tsreadex 7f2d2aec01c1
 
-- Source: https://github.com/MistVVK/tsreadex
+- Source: <https://github.com/MistVVK/tsreadex>
 - Fixed revision or artifact: `7f2d2aec01c1f7ebb7290c5180f34fe49211d9ee`
 
-### License.txt
+##### License.txt
 
 ```text
 The MIT License
@@ -3381,12 +3386,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## psisiarc 6593a0f63aed
+#### psisiarc 6593a0f63aed
 
-- Source: https://github.com/xtne6f/psisiarc.git
+- Source: <https://github.com/xtne6f/psisiarc.git>
 - Fixed revision or artifact: `6593a0f63aedaaecfac7682b51e267874a8ec549`
 
-### License.txt
+##### License.txt
 
 ```text
 The MIT License
@@ -3412,12 +3417,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## Akebi HTTPS Server be986980f7a5
+#### Akebi HTTPS Server be986980f7a5
 
-- Source: https://github.com/tsukumijima/Akebi.git
+- Source: <https://github.com/tsukumijima/Akebi.git>
 - Fixed revision or artifact: `be986980f7a560b4f74eefcfa2cd474f892f3bc7`
 
-### License.txt
+##### License.txt
 
 ```text
 MIT License
@@ -3444,12 +3449,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## Poetry 1.8.5
+#### Poetry 1.8.5
 
-- Source: https://github.com/python-poetry/poetry
+- Source: <https://github.com/python-poetry/poetry>
 - Fixed revision or artifact: `19a2f7bddb9bdf931a229ea0913a84021f3f9b93`
 
-### LICENSE
+##### LICENSE
 
 ```text
 Copyright (c) 2018-present Sébastien Eustace
@@ -3474,12 +3479,12 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## AviSynth+ v3.7.3
+#### AviSynth+ v3.7.3
 
-- Source: https://github.com/AviSynth/AviSynthPlus.git
+- Source: <https://github.com/AviSynth/AviSynthPlus.git>
 - Fixed revision or artifact: `fc5b9bc41fd47001b7da39ea777d29c0ede2a2a7`
 
-### GNU GPL version 2
+##### GNU GPL version 2
 
 ```text
 		    GNU GENERAL PUBLIC LICENSE
@@ -3826,12 +3831,12 @@ library.  If this is what you want to do, use the GNU Library General
 Public License instead of this License.
 ```
 
-## FFmpegSource2 5.1.2
+#### FFmpegSource2 5.1.2
 
-- Source: https://github.com/FFMS/ffms2.git
+- Source: <https://github.com/FFMS/ffms2.git>
 - Fixed revision or artifact: `3af2ef2ae47bc30b64597c9e419e5b19c4bda7d8`
 
-### COPYING
+##### COPYING
 
 ```text
 The FFMS2 source is licensed under the MIT license, but its binaries
@@ -3866,12 +3871,12 @@ OTHER DEALINGS IN THE SOFTWARE.
 -----------------------------------------------------------
 ```
 
-## chapter_exe 32880d45f088
+#### chapter_exe 32880d45f088
 
-- Source: https://github.com/rigaya/chapter_exe.git
+- Source: <https://github.com/rigaya/chapter_exe.git>
 - Fixed revision or artifact: `32880d45f088e574285a101e6a49b032bb04f6ea`
 
-### LICENSE
+##### LICENSE
 
 ```text
                     GNU GENERAL PUBLIC LICENSE
@@ -4215,12 +4220,12 @@ library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
 ```
 
-## logoframe 1.20
+#### logoframe 1.20
 
-- Source: https://github.com/tobitti0/logoframe.git
+- Source: <https://github.com/tobitti0/logoframe.git>
 - Fixed revision or artifact: `c93aec0c89838e9b4dd3a9a3d5496dfaaa41311d`
 
-### LICENSE
+##### LICENSE
 
 ```text
                     GNU GENERAL PUBLIC LICENSE
@@ -4564,12 +4569,12 @@ library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
 ```
 
-## join_logo_scp d1a24d758f8b
+#### join_logo_scp d1a24d758f8b
 
-- Source: https://github.com/tobitti0/join_logo_scp.git
+- Source: <https://github.com/tobitti0/join_logo_scp.git>
 - Fixed revision or artifact: `d1a24d758f8b3c04352b82ff6756fdf3d56729b3`
 
-### LICENSE
+##### LICENSE
 
 ```text
                     GNU GENERAL PUBLIC LICENSE
@@ -4913,12 +4918,12 @@ library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
 ```
 
-## Intel gmmlib 22.10.0
+#### Intel gmmlib 22.10.0
 
-- Source: https://github.com/intel/gmmlib
+- Source: <https://github.com/intel/gmmlib>
 - Fixed revision or artifact: `0246660b2ade17afc1c9c4c510368fa649ca809f`
 
-### LICENSE.md
+##### LICENSE.md
 
 ```text
 MIT License
@@ -4998,12 +5003,12 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## Intel libva 2.23.0
+#### Intel libva 2.23.0
 
-- Source: https://github.com/intel/libva
+- Source: <https://github.com/intel/libva>
 - Fixed revision or artifact: `dbf83dc3b1ce6bad46e1628aaf2da5ef731157b8`
 
-### COPYING
+##### COPYING
 
 ```text
     Permission is hereby granted, free of charge, to any person obtaining a
@@ -5027,12 +5032,12 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
     SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## Intel Media Driver 26.1.5
+#### Intel Media Driver 26.1.5
 
-- Source: https://github.com/intel/media-driver
+- Source: <https://github.com/intel/media-driver>
 - Fixed revision or artifact: `1d2d8e96aeaba0471dc7fd0a7e85190519758fc5`
 
-### LICENSE.md
+##### LICENSE.md
 
 ```text
 Copyright (c) 2007-2017 Intel Corporation
@@ -5160,12 +5165,12 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## Intel Media SDK 23.2.2
+#### Intel Media SDK 23.2.2
 
-- Source: https://github.com/Intel-Media-SDK/MediaSDK
+- Source: <https://github.com/Intel-Media-SDK/MediaSDK>
 - Fixed revision or artifact: `869b60a6c3d7b5e9f7c3b3b914986322dca4bbae`
 
-### LICENSE
+##### LICENSE
 
 ```text
 Copyright (c) 2017 Intel Corporation
@@ -5189,12 +5194,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## Intel oneVPL GPU Runtime 26.1.5
+#### Intel oneVPL GPU Runtime 26.1.5
 
-- Source: https://github.com/intel/vpl-gpu-rt
+- Source: <https://github.com/intel/vpl-gpu-rt>
 - Fixed revision or artifact: `c74d193957c059c4850726dbfc5772b8d9d18c4b`
 
-### LICENSE
+##### LICENSE
 
 ```text
 Copyright (c) 2021 Intel Corporation
@@ -5218,53 +5223,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## CM analysis runtime corresponding source and local modifications
+#### NVIDIA codec API headers 12.1.14.0
 
-- This runtime does not include Amatsukaze itself.
-- FFmpeg source: https://github.com/FFmpeg/FFmpeg.git (`38b88335f99e76ed89ff3c93f877fdefce736c13`; LGPL-only build)
-- AviSynth+ source: https://github.com/AviSynth/AviSynthPlus.git (`fc5b9bc41fd47001b7da39ea777d29c0ede2a2a7`)
-- FFmpegSource2 source: https://github.com/FFMS/ffms2.git (`3af2ef2ae47bc30b64597c9e419e5b19c4bda7d8`; AviSynth-only build)
-- chapter_exe source: https://github.com/rigaya/chapter_exe.git (`32880d45f088e574285a101e6a49b032bb04f6ea`)
-- logoframe source: https://github.com/tobitti0/logoframe.git (`c93aec0c89838e9b4dd3a9a3d5496dfaaa41311d`)
-- join_logo_scp source: https://github.com/tobitti0/join_logo_scp.git (`d1a24d758f8b3c04352b82ff6756fdf3d56729b3`)
-- Reproducible build procedure: `docker/thirdparty/build-cm-analysis.sh`
-- Local patches:
-  - `chapter-exe-initialize-avisynth.patch` (`a600b31b149a9cd3d1c62608a2d3452d4db927b236f3ed59c102b69239fb3b63`)
-  - `ffms2-hardware-decoding.patch` (`f6c2ba0bacd4b5996596262f7b81917dca6ec94fe880224230e59d67a6a2bfd6`)
-  - `logoframe-error-lifetime.patch` (`3b3c8351a027586f58ca415a9d7a6750f8cb90e2c069bc099da18db222a0906c`)
-  - `logoframe-parallel-scan.patch` (`fb2841957546a1cfc72df32ea22ea19b06e39e25c44773b8d9d9c988eed74939`)
-  - `logoframe-native-luma.patch` (`0e9d388204debe4e58c9954232db263f908a22574c319a646caaf641684a2a46`)
-  - `logoframe-high-bit-rgb-fallback.patch` (`344d300bdbe5199301c9518634f9927be9710eef9f06e42a5da330ed6c04f235`)
-
-The fixed upstream revisions, complete local patches, dependency revisions, and build commands above are the corresponding source recipe for the redistributed native artifacts.
-
-## FFmpeg 8 and AMF corresponding source and local modifications
-
-- FFmpeg source: https://github.com/FFmpeg/FFmpeg.git
-- FFmpeg fixed commit: `38b88335f99e76ed89ff3c93f877fdefce736c13`
-- AMF source: https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
-- AMF fixed commit: `16f7d73e0b45c473e903e46981ed0b91efc4c091`
-- Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`
-- Local patches:
-  - `amf-1.4.36-display-capture-c.patch` (`3527641c277d534d223dcfb669fdff465be9ceca1fe60713c6dcc2880d939f25`)
-
-## Intel media stack corresponding source and local modifications
-
-- libva source: https://github.com/intel/libva (`dbf83dc3b1ce6bad46e1628aaf2da5ef731157b8`)
-- Intel Media Driver source: https://github.com/intel/media-driver (`1d2d8e96aeaba0471dc7fd0a7e85190519758fc5`)
-- oneVPL GPU Runtime source: https://github.com/intel/vpl-gpu-rt (`c74d193957c059c4850726dbfc5772b8d9d18c4b`)
-- Reproducible build procedure: `docker/thirdparty/build-intel-media-stack.sh`
-- Local patches:
-  - `intel-libva-standalone.patch` (`ab00d3b1b0729f01040eaef8d9cc682600bfd1f1bee440eff5fbd69c32478d3b`)
-  - `intel-media-driver-vpp-deinterlace-crash-fix.patch` (`9f57523e52edf0e6674ade252a839fbaac6f0f38678349b8034e7ee834cfd46c`)
-  - `intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch` (`dec3f6100b020d22fbd2c6c7488f117001c0f039b4d59607af1c581835219a76`)
-
-## NVIDIA codec API headers 12.1.14.0
-
-- Source: https://github.com/FFmpeg/nv-codec-headers.git
+- Source: <https://github.com/FFmpeg/nv-codec-headers.git>
 - Fixed revision or artifact: `1889e62e2d35ff7aa9baca2bceb14f053785e6f1`
 
-### nvEncodeAPI.h license notice
+##### nvEncodeAPI.h license notice
 
 ```text
 This copyright notice applies to this header file only:
@@ -5293,7 +5257,7 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### dynlink_cuda.h / dynlink_loader.h license notice
+##### dynlink_cuda.h / dynlink_loader.h license notice
 
 ```text
 This copyright notice applies to this header file only:
@@ -5322,12 +5286,12 @@ FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
 OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## x264 0.163.3060+git5db6aa6
+#### x264 0.163.3060+git5db6aa6
 
-- Source: https://archive.ubuntu.com/ubuntu/pool/universe/x/x264/x264_0.163.3060+git5db6aa6.orig.tar.gz
+- Source: <https://archive.ubuntu.com/ubuntu/pool/universe/x/x264/x264_0.163.3060+git5db6aa6.orig.tar.gz>
 - SHA-256: `0c7a5585f1b160c91eab8114d8493e65d08d2dfdc5b5d6ae46bbe5523469df9d`
 
-### COPYING
+##### COPYING
 
 ```text
 		    GNU GENERAL PUBLIC LICENSE
@@ -5677,12 +5641,12 @@ library.  If this is what you want to do, use the GNU Library General
 Public License instead of this License.
 ```
 
-## x265 3.5
+#### x265 3.5
 
-- Source: https://archive.ubuntu.com/ubuntu/pool/universe/x/x265/x265_3.5.orig.tar.gz
+- Source: <https://archive.ubuntu.com/ubuntu/pool/universe/x/x265/x265_3.5.orig.tar.gz>
 - SHA-256: `e70a3335cacacbba0b3a20ec6fecd6783932288ebc8163ad74bcc9606477cae8`
 
-### COPYING
+##### COPYING
 
 ```text
 		    GNU GENERAL PUBLIC LICENSE
@@ -6035,7 +5999,7 @@ This program is also available under a commercial proprietary license.
 For more information, contact us at license @ x265.com.
 ```
 
-### dynamicHDR10/LICENSE.txt
+##### dynamicHDR10/LICENSE.txt
 
 ```text
 Copyright (C) 2013-2020 MulticoreWare, Inc
@@ -6058,7 +6022,7 @@ This program is also available under a commercial proprietary license.
 For more information, contact us at license @ x265.com.
 ```
 
-### dynamicHDR10/json11/LICENSE.txt
+##### dynamicHDR10/json11/LICENSE.txt
 
 ```text
 Copyright (c) 2013 Dropbox, Inc.
@@ -6082,12 +6046,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-## Opus 1.3.1
+#### Opus 1.3.1
 
-- Source: https://archive.ubuntu.com/ubuntu/pool/main/o/opus/opus_1.3.1.orig.tar.gz
+- Source: <https://archive.ubuntu.com/ubuntu/pool/main/o/opus/opus_1.3.1.orig.tar.gz>
 - SHA-256: `65b58e1e25b2a114157014736a3d9dfeaad8d41be1c8179866f144a2fb44ff9d`
 
-### COPYING
+##### COPYING
 
 ```text
 Copyright 2001-2011 Xiph.Org, Skype Limited, Octasic,
@@ -6136,12 +6100,12 @@ Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
 ```
 
-## Python Standalone 3.11.15
+#### Python Standalone 3.11.15
 
-- Source: https://github.com/indygreg/python-build-standalone/releases/download/20260623/cpython-3.11.15+20260623-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz
+- Source: <https://github.com/indygreg/python-build-standalone/releases/download/20260623/cpython-3.11.15+20260623-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz>
 - SHA-256: `0604cd029b142dc223e131f17f5941c0c8d2d5074997c8178b515b19eea2a6c2`
 
-### LICENSE.txt
+##### LICENSE.txt
 
 ```text
 A. HISTORY OF THE SOFTWARE
@@ -6425,12 +6389,12 @@ OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 PERFORMANCE OF THIS SOFTWARE.
 ```
 
-## Go 1.26.5
+#### Go 1.26.5
 
-- Source: https://go.dev/dl/go1.26.5.linux-amd64.tar.gz
+- Source: <https://go.dev/dl/go1.26.5.linux-amd64.tar.gz>
 - SHA-256: `5c2c3b16caefa1d968a94c1daca04a7ca301a496d9b086e17ad77bb81393f053`
 
-### LICENSE
+##### LICENSE
 
 ```text
 Copyright 2009 The Go Authors.
@@ -6461,3 +6425,46 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
+
+### Corresponding Source and Local Modifications
+
+#### CM analysis runtime
+
+- This runtime does not include Amatsukaze itself.
+- FFmpeg source: <https://github.com/FFmpeg/FFmpeg.git> (`38b88335f99e76ed89ff3c93f877fdefce736c13`; LGPL-only build)
+- AviSynth+ source: <https://github.com/AviSynth/AviSynthPlus.git> (`fc5b9bc41fd47001b7da39ea777d29c0ede2a2a7`)
+- FFmpegSource2 source: <https://github.com/FFMS/ffms2.git> (`3af2ef2ae47bc30b64597c9e419e5b19c4bda7d8`; AviSynth-only build)
+- chapter_exe source: <https://github.com/rigaya/chapter_exe.git> (`32880d45f088e574285a101e6a49b032bb04f6ea`)
+- logoframe source: <https://github.com/tobitti0/logoframe.git> (`c93aec0c89838e9b4dd3a9a3d5496dfaaa41311d`)
+- join_logo_scp source: <https://github.com/tobitti0/join_logo_scp.git> (`d1a24d758f8b3c04352b82ff6756fdf3d56729b3`)
+- Reproducible build procedure: `docker/thirdparty/build-cm-analysis.sh`
+- Local patches:
+  - `chapter-exe-initialize-avisynth.patch` (`a600b31b149a9cd3d1c62608a2d3452d4db927b236f3ed59c102b69239fb3b63`)
+  - `ffms2-hardware-decoding.patch` (`f6c2ba0bacd4b5996596262f7b81917dca6ec94fe880224230e59d67a6a2bfd6`)
+  - `logoframe-error-lifetime.patch` (`3b3c8351a027586f58ca415a9d7a6750f8cb90e2c069bc099da18db222a0906c`)
+  - `logoframe-parallel-scan.patch` (`fb2841957546a1cfc72df32ea22ea19b06e39e25c44773b8d9d9c988eed74939`)
+  - `logoframe-native-luma.patch` (`0e9d388204debe4e58c9954232db263f908a22574c319a646caaf641684a2a46`)
+  - `logoframe-high-bit-rgb-fallback.patch` (`344d300bdbe5199301c9518634f9927be9710eef9f06e42a5da330ed6c04f235`)
+
+The fixed upstream revisions, complete local patches, dependency revisions, and build commands above are the corresponding source recipe for the redistributed native artifacts.
+
+#### FFmpeg 8 and AMF
+
+- FFmpeg source: <https://github.com/FFmpeg/FFmpeg.git>
+- FFmpeg fixed commit: `38b88335f99e76ed89ff3c93f877fdefce736c13`
+- AMF source: <https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git>
+- AMF fixed commit: `16f7d73e0b45c473e903e46981ed0b91efc4c091`
+- Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`
+- Local patches:
+  - `amf-1.4.36-display-capture-c.patch` (`3527641c277d534d223dcfb669fdff465be9ceca1fe60713c6dcc2880d939f25`)
+
+#### Intel media stack
+
+- libva source: <https://github.com/intel/libva> (`dbf83dc3b1ce6bad46e1628aaf2da5ef731157b8`)
+- Intel Media Driver source: <https://github.com/intel/media-driver> (`1d2d8e96aeaba0471dc7fd0a7e85190519758fc5`)
+- oneVPL GPU Runtime source: <https://github.com/intel/vpl-gpu-rt> (`c74d193957c059c4850726dbfc5772b8d9d18c4b`)
+- Reproducible build procedure: `docker/thirdparty/build-intel-media-stack.sh`
+- Local patches:
+  - `intel-libva-standalone.patch` (`ab00d3b1b0729f01040eaef8d9cc682600bfd1f1bee440eff5fbd69c32478d3b`)
+  - `intel-media-driver-vpp-deinterlace-crash-fix.patch` (`9f57523e52edf0e6674ade252a839fbaac6f0f38678349b8034e7ee834cfd46c`)
+  - `intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch` (`dec3f6100b020d22fbd2c6c7488f117001c0f039b4d59607af1c581835219a76`)

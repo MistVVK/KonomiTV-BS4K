@@ -95,7 +95,7 @@ RUN --mount=type=cache,id=konomitv-thirdparty-downloads,target=/build/downloads 
     chmod +x /build/docker/thirdparty/build-cm-analysis.sh && \
     /build/docker/thirdparty/build-cm-analysis.sh && \
     python3 /build/docker/thirdparty/collect-license-manifest.py \
-        --stage 'third-party builder (CUDA and static artifacts)' \
+        --stage 'Third-Party Builder Dependencies' \
         --dpkg --dpkg-prefix cuda- --dpkg-exclude cuda-keyring \
         --root /usr/share/vpl/licensing \
         --root /opt/thirdparty \
@@ -279,16 +279,30 @@ COPY ./config.example.yaml /code/config.example.yaml
 COPY ./THIRD_PARTY_LICENSES.md /tmp/BASE_THIRD_PARTY_LICENSES.md
 COPY ./docker/thirdparty/assemble-runtime-license-document.py /tmp/assemble-runtime-license-document.py
 COPY ./docker/thirdparty/collect-license-manifest.py /tmp/collect-license-manifest.py
+COPY ./docker/thirdparty/generate-chromium-license-document.py /tmp/generate-chromium-license-document.py
+# grapheme 0.6.0 の wheel/sdist は LICENSE を欠くため、公開時コミット
+# 7350dfcc1a75a8e347f38ed9e38cb9f9fa928ce0 の上流 LICENSE
+# (https://github.com/alvinlindstam/grapheme/blob/7350dfcc1a75a8e347f38ed9e38cb9f9fa928ce0/LICENSE) を固定して補う。
+COPY ./docker/thirdparty/licenses/grapheme-0.6.0-LICENSE /tmp/grapheme-0.6.0-LICENSE
 COPY --from=client-builder /tmp/CLIENT_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md
 COPY --from=thirdparty-builder /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/BUILDER_THIRD_PARTY_LICENSES.md
 RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree-runtime'; else nonfree_license_option=''; fi && \
+    printf '%s  %s\n' \
+        '8c09b6ef3ef6bf62858af66af73138b5a234231266c4736009d27233681a5dcf' \
+        '/tmp/grapheme-0.6.0-LICENSE' | sha256sum --check --strict - && \
     chromium_version="$(dpkg-query --showformat='${Version}' --show chromium)" && \
+    python3 /tmp/generate-chromium-license-document.py \
+        --chromium /usr/bin/chromium \
+        --package-version "${chromium_version}" \
+        --package-copyright /usr/share/doc/chromium/copyright \
+        --output /code/CHROMIUM_THIRD_PARTY_LICENSES.md && \
     python3 /tmp/collect-license-manifest.py \
-        --stage 'final runtime OS and GPU packages' --dpkg --dpkg-exclude chromium \
+        --stage 'Final Runtime Dependencies' --dpkg --dpkg-exclude chromium \
         --root /usr/share/vpl/licensing \
         --root /opt/rocm \
         --python-root /code/server/.venv \
         --python-root /code/server/thirdparty/Python \
+        --python-license-override 'grapheme==0.6.0=/tmp/grapheme-0.6.0-LICENSE' \
         --root /code/server/thirdparty/Python \
         --output /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
     python3 /tmp/assemble-runtime-license-document.py \
@@ -297,12 +311,10 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
         --manifest /tmp/BUILDER_THIRD_PARTY_LICENSES.md \
         --manifest /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
         --cuda-version "${CUDA_VERSION}" \
-        --chromium-version "${chromium_version}" \
-        --chromium-copyright /usr/share/doc/chromium/copyright \
         ${nonfree_license_option} \
         --output /code/THIRD_PARTY_LICENSES.md && \
     if [ "${NONFREE}" = 'false' ]; then \
-        grep -Eq '^## mesa-va-drivers(:amd64)? ' /code/THIRD_PARTY_LICENSES.md; \
+        grep -Eq '^#### mesa-va-drivers(:amd64)? ' /code/THIRD_PARTY_LICENSES.md; \
         if grep -Eq 'NONFREE_RUNTIME_WARNING|amf-amdgpu-pro|libamdenc-amdgpu-pro|mesa-amdgpu-va-drivers|vulkan-amdgpu-pro' \
                 /code/THIRD_PARTY_LICENSES.md; then \
             echo 'NONFREE=false license document contains non-free runtime metadata.' >&2; \
@@ -311,6 +323,7 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     fi && \
     rm /tmp/BASE_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md \
         /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
-        /tmp/assemble-runtime-license-document.py /tmp/collect-license-manifest.py
+        /tmp/assemble-runtime-license-document.py /tmp/collect-license-manifest.py \
+        /tmp/generate-chromium-license-document.py /tmp/grapheme-0.6.0-LICENSE
 
 ENTRYPOINT ["/code/server/.venv/bin/python", "KonomiTV.py"]

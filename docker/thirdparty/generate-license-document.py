@@ -188,11 +188,13 @@ def main() -> None:
         '# Third-Party Software Licenses',
         '',
         '<!-- NONFREE_RUNTIME_WARNING_START -->',
-        '> **重要: このDockerイメージを再配布しないでください。**',
+        '> **重要: `NONFREE=true` でビルドした Docker イメージは再配布しないでください。**',
         '>',
-        '> この `NONFREE=true` ビルドには、Intel Media DriverのFull Feature版（`ENABLE_NONFREE_KERNELS=ON`）と、AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro`）が含まれます。',
+        '> このビルドプロファイルには、Intel Media Driver の Full Feature 版（`ENABLE_NONFREE_KERNELS=ON`）と AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro` など）が含まれます。',
         '>',
-        '> 再配布禁止の直接の理由は、GPL version 3 or laterで提供されるFFmpegなどとAMD proprietary runtimeが同じ完成イメージに含まれることです。AMD側は再配布とFree Software Licenseの適用を制限しており、その制限とGPL側の再配布条件は、この完成イメージについて同時に満たすことができません。したがって、完成イメージ全体をGPLv3以降としてライセンスまたは再配布することはできません。現在のDockerfileは、各ユーザーが自身の環境でローカルビルドして利用することだけを前提としています。',
+        '> AMD proprietary runtime に同梱される AMD Software End User License Agreement は、Software の配布・公開・表示・サブライセンス・譲渡・移転を禁止し、AMD プロセッサーを組み込んだシステムまたはコンポーネントでのインストールと使用に限定しています。したがって、これらのパッケージを含む完成イメージを再配布または移転せず、EULA が許諾する AMD 環境でのローカル利用に限定してください。AMD の現行 EULA: <https://www.amd.com/en/legal/eula/amd-software-eula.html>',
+        '>',
+        '> また、完成イメージには GPL version 3 or later で提供される FFmpeg など、別の条件が適用されるソフトウェアも含まれます。この注意書きは各ライセンスの条件を変更したり、追加の権利を許諾したりするものではありません。利用者自身で、完成イメージに含まれるすべてのライセンス条件を確認してください。',
         '<!-- NONFREE_RUNTIME_WARNING_END -->',
         '',
         '<!--',
@@ -201,75 +203,37 @@ def main() -> None:
         '',
         'このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。',
         'Ubuntu・CUDA・GPU runtime・Python／JavaScript パッケージの推移的依存関係を含め、各配布物の著作権表示とライセンス全文を掲載します。',
+        'Chromium の大容量なライセンス全文は、同じイメージ内の専用文書へ分離してこの文書からリンクします。',
         '-->',
         '',
-        '## Chromium @CHROMIUM_VERSION@',
+        '## Directly Managed Third-Party Components',
         '',
-        '- Source package and binaries: https://packages.linuxmint.com/',
-        '- Upstream source: https://chromium.googlesource.com/chromium/src/',
+        '### Bundled Components',
+        '',
+        '#### Chromium',
+        '',
+        '- Source package and binaries: <https://packages.linuxmint.com/>',
+        '- Upstream source: <https://chromium.googlesource.com/chromium/src/>',
         '- Package: `chromium` from the signed Linux Mint Virginia `upstream` repository',
-        '- Licenses include: BSD 3-Clause, GPL-2.0+, and bundled third-party licenses',
+        '- Licenses include: BSD 3-Clause and the licenses listed by the installed Chromium binary',
         '',
-        '### Copyright and license notices',
+        'The exact Chromium license and every third-party notice reported by the installed binary are generated during the Docker build.',
         '',
-        '````text',
-        '@CHROMIUM_COPYRIGHT@',
-        '````',
+        '[Open the complete Chromium license document](/api/version/chromium-third-party-licenses)',
         '',
     ]
 
     for source in sources:
         document.extend([
-            f'## {source.name} {source.version}'.rstrip(),
+            f'#### {source.name} {source.version}'.rstrip(),
             '',
-            f'- Source: {source.source_url}',
+            f'- Source: <{source.source_url}>',
             f'- Fixed revision or artifact: `{source.fixed_value}`',
             '',
         ])
         for label, location, sha256 in source.files:
             license_text = readVerifiedLicense(location, sha256)
-            document.extend([f'### {label}', '', '```text', license_text, '```', ''])
-
-    document.extend([
-        '## CM analysis runtime corresponding source and local modifications', '',
-        '- This runtime does not include Amatsukaze itself.',
-        f'- FFmpeg source: {manifest["FFMPEG8_REPOSITORY"]} (`{manifest["FFMPEG8_COMMIT"]}`; LGPL-only build)',
-        f'- AviSynth+ source: {manifest["AVISYNTHPLUS_REPOSITORY"]} (`{manifest["AVISYNTHPLUS_COMMIT"]}`)',
-        f'- FFmpegSource2 source: {manifest["FFMS2_REPOSITORY"]} (`{manifest["FFMS2_COMMIT"]}`; AviSynth-only build)',
-        f'- chapter_exe source: {manifest["CHAPTER_EXE_REPOSITORY"]} (`{manifest["CHAPTER_EXE_COMMIT"]}`)',
-        f'- logoframe source: {manifest["LOGOFRAME_REPOSITORY"]} (`{manifest["LOGOFRAME_COMMIT"]}`)',
-        f'- join_logo_scp source: {manifest["JOIN_LOGO_SCP_REPOSITORY"]} (`{manifest["JOIN_LOGO_SCP_COMMIT"]}`)',
-        '- Reproducible build procedure: `docker/thirdparty/build-cm-analysis.sh`',
-        '- Local patches:',
-        f'  - `chapter-exe-initialize-avisynth.patch` (`{manifest["CHAPTER_EXE_AVISYNTH_INIT_PATCH_SHA256"]}`)',
-        f'  - `ffms2-hardware-decoding.patch` (`{manifest["FFMS2_HARDWARE_DECODING_PATCH_SHA256"]}`)',
-        f'  - `logoframe-error-lifetime.patch` (`{manifest["LOGOFRAME_ERROR_LIFETIME_PATCH_SHA256"]}`)',
-        f'  - `logoframe-parallel-scan.patch` (`{manifest["LOGOFRAME_PARALLEL_SCAN_PATCH_SHA256"]}`)',
-        f'  - `logoframe-native-luma.patch` (`{manifest["LOGOFRAME_NATIVE_LUMA_PATCH_SHA256"]}`)',
-        f'  - `logoframe-high-bit-rgb-fallback.patch` (`{manifest["LOGOFRAME_HIGH_BIT_RGB_FALLBACK_PATCH_SHA256"]}`)',
-        '',
-        'The fixed upstream revisions, complete local patches, dependency revisions, and build commands above are the corresponding source recipe for the redistributed native artifacts.',
-        '',
-        '## FFmpeg 8 and AMF corresponding source and local modifications', '',
-        f'- FFmpeg source: {manifest["FFMPEG8_REPOSITORY"]}',
-        f'- FFmpeg fixed commit: `{manifest["FFMPEG8_COMMIT"]}`',
-        f'- AMF source: {manifest["AMF_REPOSITORY"]}',
-        f'- AMF fixed commit: `{manifest["AMF_COMMIT"]}`',
-        '- Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`',
-        '- Local patches:',
-        f'  - `amf-1.4.36-display-capture-c.patch` (`{manifest["AMF_DISPLAY_CAPTURE_C_PATCH_SHA256"]}`)',
-        '',
-        '## Intel media stack corresponding source and local modifications', '',
-        f'- libva source: https://github.com/intel/libva (`{manifest["INTEL_LIBVA_COMMIT"]}`)',
-        f'- Intel Media Driver source: https://github.com/intel/media-driver (`{manifest["INTEL_MEDIA_DRIVER_COMMIT"]}`)',
-        f'- oneVPL GPU Runtime source: https://github.com/intel/vpl-gpu-rt (`{manifest["INTEL_ONEVPL_GPU_COMMIT"]}`)',
-        '- Reproducible build procedure: `docker/thirdparty/build-intel-media-stack.sh`',
-        '- Local patches:',
-        f'  - `intel-libva-standalone.patch` (`{manifest["INTEL_LIBVA_STANDALONE_PATCH_SHA256"]}`)',
-        f'  - `intel-media-driver-vpp-deinterlace-crash-fix.patch` (`{manifest["INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256"]}`)',
-        f'  - `intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch` (`{manifest["INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256"]}`)',
-        '',
-    ])
+            document.extend([f'##### {label}', '', '```text', license_text, '```', ''])
 
     nvcodec_license_url = (
         f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
@@ -310,11 +274,11 @@ def main() -> None:
     if nvcodec_cuda_license == nvcodec_license:
         raise ValueError('Expected the audited CUDA/loader notice to be distinct from nvEncodeAPI.h.')
     document.extend([
-        f'## NVIDIA codec API headers {manifest["NVCODEC_HEADERS_VERSION"]}', '',
-        f'- Source: {manifest["NVCODEC_HEADERS_REPOSITORY"]}',
+        f'#### NVIDIA codec API headers {manifest["NVCODEC_HEADERS_VERSION"]}', '',
+        f'- Source: <{manifest["NVCODEC_HEADERS_REPOSITORY"]}>',
         f'- Fixed revision or artifact: `{manifest["NVCODEC_HEADERS_COMMIT"]}`', '',
-        '### nvEncodeAPI.h license notice', '', '```text', nvcodec_license, '```', '',
-        '### dynlink_cuda.h / dynlink_loader.h license notice', '',
+        '##### nvEncodeAPI.h license notice', '', '```text', nvcodec_license, '```', '',
+        '##### dynlink_cuda.h / dynlink_loader.h license notice', '',
         '```text', nvcodec_cuda_license, '```', '',
     ])
 
@@ -333,30 +297,70 @@ def main() -> None:
     )
     for name, version, source_url, sha256, license_files in archive_licenses:
         document.extend([
-            f'## {name} {version}', '',
-            f'- Source: {source_url}',
+            f'#### {name} {version}', '',
+            f'- Source: <{source_url}>',
             f'- SHA-256: `{sha256}`', '',
         ])
         for label, member_name in license_files:
             license_text = extractTarLicense(source_url, sha256, member_name)
-            document.extend([f'### {label}', '', '```text', license_text, '```', ''])
+            document.extend([f'##### {label}', '', '```text', license_text, '```', ''])
 
     python_license = extractTarLicense(
         manifest['PYTHON_URL'], manifest['PYTHON_SHA256'], 'python/lib/python3.11/LICENSE.txt',
     )
     document.extend([
-        f'## Python Standalone {manifest["PYTHON_VERSION"]}', '',
-        f'- Source: {manifest["PYTHON_URL"]}',
+        f'#### Python Standalone {manifest["PYTHON_VERSION"]}', '',
+        f'- Source: <{manifest["PYTHON_URL"]}>',
         f'- SHA-256: `{manifest["PYTHON_SHA256"]}`', '',
-        '### LICENSE.txt', '', '```text', python_license, '```', '',
+        '##### LICENSE.txt', '', '```text', python_license, '```', '',
     ])
 
     go_license = extractTarLicense(manifest['GO_URL'], manifest['GO_SHA256'], 'go/LICENSE')
     document.extend([
-        f'## Go {manifest["GO_VERSION"]}', '',
-        f'- Source: {manifest["GO_URL"]}',
+        f'#### Go {manifest["GO_VERSION"]}', '',
+        f'- Source: <{manifest["GO_URL"]}>',
         f'- SHA-256: `{manifest["GO_SHA256"]}`', '',
-        '### LICENSE', '', '```text', go_license, '```', '',
+        '##### LICENSE', '', '```text', go_license, '```', '',
+        '### Corresponding Source and Local Modifications',
+        '',
+        '#### CM analysis runtime', '',
+        '- This runtime does not include Amatsukaze itself.',
+        f'- FFmpeg source: <{manifest["FFMPEG8_REPOSITORY"]}> (`{manifest["FFMPEG8_COMMIT"]}`; LGPL-only build)',
+        f'- AviSynth+ source: <{manifest["AVISYNTHPLUS_REPOSITORY"]}> (`{manifest["AVISYNTHPLUS_COMMIT"]}`)',
+        f'- FFmpegSource2 source: <{manifest["FFMS2_REPOSITORY"]}> (`{manifest["FFMS2_COMMIT"]}`; AviSynth-only build)',
+        f'- chapter_exe source: <{manifest["CHAPTER_EXE_REPOSITORY"]}> (`{manifest["CHAPTER_EXE_COMMIT"]}`)',
+        f'- logoframe source: <{manifest["LOGOFRAME_REPOSITORY"]}> (`{manifest["LOGOFRAME_COMMIT"]}`)',
+        f'- join_logo_scp source: <{manifest["JOIN_LOGO_SCP_REPOSITORY"]}> (`{manifest["JOIN_LOGO_SCP_COMMIT"]}`)',
+        '- Reproducible build procedure: `docker/thirdparty/build-cm-analysis.sh`',
+        '- Local patches:',
+        f'  - `chapter-exe-initialize-avisynth.patch` (`{manifest["CHAPTER_EXE_AVISYNTH_INIT_PATCH_SHA256"]}`)',
+        f'  - `ffms2-hardware-decoding.patch` (`{manifest["FFMS2_HARDWARE_DECODING_PATCH_SHA256"]}`)',
+        f'  - `logoframe-error-lifetime.patch` (`{manifest["LOGOFRAME_ERROR_LIFETIME_PATCH_SHA256"]}`)',
+        f'  - `logoframe-parallel-scan.patch` (`{manifest["LOGOFRAME_PARALLEL_SCAN_PATCH_SHA256"]}`)',
+        f'  - `logoframe-native-luma.patch` (`{manifest["LOGOFRAME_NATIVE_LUMA_PATCH_SHA256"]}`)',
+        f'  - `logoframe-high-bit-rgb-fallback.patch` (`{manifest["LOGOFRAME_HIGH_BIT_RGB_FALLBACK_PATCH_SHA256"]}`)',
+        '',
+        'The fixed upstream revisions, complete local patches, dependency revisions, and build commands above are the corresponding source recipe for the redistributed native artifacts.',
+        '',
+        '#### FFmpeg 8 and AMF', '',
+        f'- FFmpeg source: <{manifest["FFMPEG8_REPOSITORY"]}>',
+        f'- FFmpeg fixed commit: `{manifest["FFMPEG8_COMMIT"]}`',
+        f'- AMF source: <{manifest["AMF_REPOSITORY"]}>',
+        f'- AMF fixed commit: `{manifest["AMF_COMMIT"]}`',
+        '- Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`',
+        '- Local patches:',
+        f'  - `amf-1.4.36-display-capture-c.patch` (`{manifest["AMF_DISPLAY_CAPTURE_C_PATCH_SHA256"]}`)',
+        '',
+        '#### Intel media stack', '',
+        f'- libva source: <https://github.com/intel/libva> (`{manifest["INTEL_LIBVA_COMMIT"]}`)',
+        f'- Intel Media Driver source: <https://github.com/intel/media-driver> (`{manifest["INTEL_MEDIA_DRIVER_COMMIT"]}`)',
+        f'- oneVPL GPU Runtime source: <https://github.com/intel/vpl-gpu-rt> (`{manifest["INTEL_ONEVPL_GPU_COMMIT"]}`)',
+        '- Reproducible build procedure: `docker/thirdparty/build-intel-media-stack.sh`',
+        '- Local patches:',
+        f'  - `intel-libva-standalone.patch` (`{manifest["INTEL_LIBVA_STANDALONE_PATCH_SHA256"]}`)',
+        f'  - `intel-media-driver-vpp-deinterlace-crash-fix.patch` (`{manifest["INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256"]}`)',
+        f'  - `intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch` (`{manifest["INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256"]}`)',
+        '',
     ])
 
     args.output.write_text('\n'.join(document), encoding='utf-8', newline='\n')
