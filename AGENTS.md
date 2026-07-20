@@ -176,6 +176,28 @@ Windows では Windows サービス、Linux では pm2 サービスとして動�
 - `KonomiTV.py`: KonomiTV サーバーのエントリーポイント
 - `KonomiTV-Service.py`: Windows サービス管理スクリプト & Windows サービスのエントリーポイント
 
+## アーキテクチャ上の設計判断と既知の制約
+
+### ライブストリーミング (LiveStream / LiveEncodingTask) の協調動作
+
+- `LiveStream.connect()` と `LiveEncodingTask.run()` は相互依存の関係にある。チャンネル切り替え時は `connect()` が旧タスクを `cancel()` し、`run()` がチューナー起動フェーズから `Controller()` までの `CancelledError` を捕捉してクリーンアップに到達する
+- `EDCBTuner._isOwner()` チェックは二重操作を防ぐガードレールで、`handoff()` で所有権を移譲した後は旧ストリームからの `close()` / `disconnect()` はこのチェックで弾かれる
+- Python 3.11 では `CancelledError` を捕捉するとキャンセルカウンターがデクリメントされ、以降の `await` は正常に動作する。`asyncio.wait()` はタスク状態を変更しないが、`asyncio.wait_for()` はタイムアウト時にタスクを再度 cancel するので挙動が異なる点に注意する
+- より詳細な処理の流れは `server/app/streams/LiveEncodingTask.py` 内のコメントを参照すること
+
+### 録画再生 (RecordedFMP4Stream / RecordedFMP4Cache)
+
+- このフォークの録画再生は `server/app/streams/RecordedFMP4Stream.py` が FFmpeg 8 で fMP4 をオンデマンド生成し、`RecordedFMP4CacheManager` が生成物の参照・排他・遅延削除を管理する。upstream の `VideoStream` / `VideoEncodingTask` を前提にした変更をそのまま持ち込まないこと
+- 同一セッションでは録画・画質・映像コーデック・bit depth・24fps モード・音声コーデックを固定する。HLS の子 API も初回と同じ生成条件を渡し、同じ session ID を異なる条件で再利用しない
+- fMP4 キャッシュの識別子には録画 ID・ファイルハッシュ・生成条件・パイプライン改訂値を含める。書き込みは同一ディレクトリへの一時ファイル作成、`fsync()`、atomic rename の順を維持し、最後のセッション参照が外れた後に遅延削除する
+- エンコーダー能力検査と実再生は `RecordedPlaybackBackend` の定義を共有する。設定上選べる組み合わせと、実機で利用可能と判定された組み合わせを混同しない
+
+### 録画フォルダスキャン (RecordedScanTask) の設計判断
+
+- `RecordedScanTask.run()` は起動時の全件スキャン (`runBatchScan()`) と新規ファイルの監視 (`watchRecordedFolders()`) を `asyncio.gather()` で同時に実行しており、起動時スキャンが完了する前から新規録画の監視は動いている
+- `runBatchScan()` は `iterRecordedFolderPaths()` から見つかった順に録画を処理し、CM 解析 workspace を列挙段階で枝刈りする。録画ごとの処理は `BATCH_PIPELINE_CONCURRENCY` を上限に重ね、`processRecordedFile()` はファイル情報が DB と一致する録画の重い解析をスキップする
+- 起動時に全パスを先に収集・ソートする構造へ変更しない。HDD・NAS・SMB では最初の録画を処理するまでの固定 IO コストが大きくなるため、列挙済みの録画から処理しつつ新規録画の監視も並行する設計を維持する
+
 ## コーディング規約
 
 ### 全般
@@ -222,6 +244,10 @@ Windows では Windows サービス、Linux では pm2 サービスとして動�
 - TypeScript による型安全性を確保する
 - コンポーネント属性は可能な限り1行に記述 (約100文字まで)
 - 必ず day.js を utils/index.ts からインポートして使うこと！！！new Date() を絶対に使うな！！！
+- クライアント側で新たに永続化したい値が出てきた場合、`localStorage.setItem` / `getItem` を直接呼ばず、必ず `client/src/stores/SettingsStore.ts` の `ILocalClientSettings` / `ILocalClientSettingsDefault` に集約する。SettingsStore は LocalStorage への永続化と、KonomiTV アカウントによるサーバー側設定との双方向同期を一手に引き受けており、独自キーを直書きするとこの同期の枠組みから外れてしまう
+  - DB の連番 ID に依存する値 (`selected_twitter_panel_account` など) は環境が変わると意味を失うため、`ENVIRONMENT_SPECIFIC_SETTINGS_KEYS` に加えて同期無効にする
+  - 他者の実装をレビューする際は `localStorage` / `sessionStorage` を grep し、この集約を迂回した直接アクセスが紛れ込んでいないか必ず確認する
+  - なお、アクセストークン (`Utils.ts`)・データ放送 NVRAM エミュレーション (`DataBroadcasting.vue`)・DPlayer 側のキー (`Jikkyo.vue` の `dplayer-danmaku-*`) は、ユーザー設定ではなく認証状態・ハードウェアエミュレーション・サードパーティ側の永続化キーであるため、この集約ルールの対象外として既存のまま残っている
 
 ### CSS / SCSS スタイリング
 - このプロジェクトで使用している色 (CSS 変数) などは `client/src/App.vue` や `client/src/plugins/vuetify.ts` に定義しているので、それを参照すること

@@ -824,6 +824,9 @@ class LiveEncodingTask:
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
                     try:
                         tsreadex.kill()
+                    except Exception:
+                        pass
+                    try:
                         encoder.kill()
                     except Exception:
                         pass
@@ -874,6 +877,9 @@ class LiveEncodingTask:
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
                     try:
                         tsreadex.kill()
+                    except Exception:
+                        pass
+                    try:
                         encoder.kill()
                     except Exception:
                         pass
@@ -909,6 +915,9 @@ class LiveEncodingTask:
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
                     try:
                         tsreadex.kill()
+                    except Exception:
+                        pass
+                    try:
                         encoder.kill()
                     except Exception:
                         pass
@@ -1502,6 +1511,9 @@ class LiveEncodingTask:
         ## 何らかの理由で既に終了している場合は何もしない
         try:
             tsreadex.kill()
+        except Exception:
+            pass
+        try:
             encoder.kill()
         except Exception:
             pass
