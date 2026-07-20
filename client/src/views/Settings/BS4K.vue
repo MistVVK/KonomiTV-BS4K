@@ -186,6 +186,20 @@
                         v-if="network_circuit === 'モバイル回線時'" v-model="settings_store.settings.bs4k_video_encoding_codec_cellular">
                     </v-select>
                 </div>
+                <div class="settings__item settings__item--sync-disabled">
+                    <div class="settings__item-heading">BS4K 録画再生の音声コーデック</div>
+                    <div class="settings__item-label">
+                        AAC は互換性を、Opus は音質と圧縮効率を優先します。<br>
+                    </div>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_audio_codecs"
+                        v-if="network_circuit !== 'モバイル回線時'" v-model="settings_store.settings.bs4k_video_audio_encoding_codec">
+                    </v-select>
+                    <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                        :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_audio_codecs"
+                        v-if="network_circuit === 'モバイル回線時'" v-model="settings_store.settings.bs4k_video_audio_encoding_codec_cellular">
+                    </v-select>
+                </div>
             </div>
         </div>
         <div class="settings__content" v-if="isSectionVisible('server')"
@@ -327,6 +341,7 @@ const streaming_video_codecs = [
     {title: 'H.265 / HEVC（通信量優先）', value: 'hevc'},
 ];
 const recorded_streaming_video_codecs = ref<IRecordedPlaybackCodecOption[]>([]);
+const recorded_streaming_audio_codecs = Videos.buildRecordedPlaybackAudioCodecOptions();
 const bs4k_streaming_quality = computed(() => {
     return settings_store.settings.bs4k_tv_encoding_codec === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
 });

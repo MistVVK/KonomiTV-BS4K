@@ -144,6 +144,20 @@
                     v-if="network_circuit === 'モバイル回線時'" v-model="settingsStore.settings.video_encoding_codec_cellular">
                 </v-select>
             </div>
+            <div class="settings__item settings__item--sync-disabled">
+                <div class="settings__item-heading">録画再生の音声コーデック</div>
+                <div class="settings__item-label">
+                    AAC は互換性を、Opus は音質と圧縮効率を優先します。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_audio_codecs"
+                    v-if="network_circuit !== 'モバイル回線時'" v-model="settingsStore.settings.video_audio_encoding_codec">
+                </v-select>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_audio_codecs"
+                    v-if="network_circuit === 'モバイル回線時'" v-model="settingsStore.settings.video_audio_encoding_codec_cellular">
+                </v-select>
+            </div>
             <div class="settings__item settings__item--switch settings__item--sync-disabled">
                 <label class="settings__item-heading" :for="`video_24fps_mode${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
                     ビデオを 24fps モードで再生する
@@ -238,6 +252,7 @@ export default defineComponent({
                 {title: 'H.265 / HEVC（通信量優先）', value: 'hevc'},
             ],
             recorded_streaming_video_codecs: [] as IRecordedPlaybackCodecOption[],
+            recorded_streaming_audio_codecs: Videos.buildRecordedPlaybackAudioCodecOptions(),
         };
     },
     computed: {

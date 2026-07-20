@@ -3,7 +3,7 @@ import assert from 'assert';
 
 import { CanvasRenderer } from 'aribb24.js';
 import DPlayer, { DPlayerType } from 'dplayer';
-import Hls from 'hls.js';
+import Hls, { ErrorDetails } from 'hls.js';
 import mpegts from 'mpegts.js';
 import { watch } from 'vue';
 
@@ -21,7 +21,7 @@ import Videos from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
-import useSettingsStore, { BS4KLiveStreamingQuality, BS4K_LIVE_STREAMING_QUALITIES, LiveStreamingQuality, LIVE_STREAMING_QUALITIES, RecordedStreamingVideoCodec, VideoStreamingQuality, VIDEO_STREAMING_QUALITIES } from '@/stores/SettingsStore';
+import useSettingsStore, { BS4KLiveStreamingQuality, BS4K_LIVE_STREAMING_QUALITIES, LiveStreamingQuality, LIVE_STREAMING_QUALITIES, RecordedStreamingAudioCodec, RecordedStreamingVideoCodec, VideoStreamingQuality, VIDEO_STREAMING_QUALITIES } from '@/stores/SettingsStore';
 import Utils, { dayjs, PlayerUtils } from '@/utils';
 
 
@@ -78,6 +78,14 @@ class PlayerController {
 
     // シークやHLS再読み込みでhls.jsがTrack 1へ初期化しても、選択中の録画音声を復元するための安定キー
     private recorded_selected_audio_track_name: string | null = null;
+
+    // この PlayerController 内で Opus の実再生に失敗した場合、この再生だけ AAC へフォールバックする
+    // 保存設定は書き換えず、ユーザーがプレイヤーから明示的に選び直した場合だけ再試行する
+    private force_recorded_aac_audio_codec = false;
+
+    // 現在の録画HLSセッションに要求した実効音声コーデック
+    // HTMLMediaElement の実再生エラー時に Opus 固有の一度限りのフォールバックを判断するために保持する
+    private recorded_audio_codec_for_current_playback: RecordedStreamingAudioCodec = 'aac';
 
     // fMP4 録画のARIB字幕先読みハンドラーを解除する関数
     private recorded_arib_subtitle_cancel: (() => void) | null = null;
@@ -177,6 +185,8 @@ class PlayerController {
         video_streaming_quality: VideoStreamingQuality;
         video_encoding_codec: RecordedStreamingVideoCodec;
         bs4k_video_encoding_codec: RecordedStreamingVideoCodec;
+        video_audio_encoding_codec: RecordedStreamingAudioCodec;
+        bs4k_video_audio_encoding_codec: RecordedStreamingAudioCodec;
         video_24fps_mode: boolean;
     } {
         const settings_store = useSettingsStore();
@@ -193,6 +203,8 @@ class PlayerController {
                 video_streaming_quality: settings_store.settings.video_streaming_quality_cellular,
                 video_encoding_codec: settings_store.settings.video_encoding_codec_cellular,
                 bs4k_video_encoding_codec: settings_store.settings.bs4k_video_encoding_codec_cellular,
+                video_audio_encoding_codec: settings_store.settings.video_audio_encoding_codec_cellular,
+                bs4k_video_audio_encoding_codec: settings_store.settings.bs4k_video_audio_encoding_codec_cellular,
                 video_24fps_mode: settings_store.settings.video_24fps_mode_cellular,
             };
         // Wi-Fi 回線向けの画質プロファイルを返す
@@ -208,6 +220,8 @@ class PlayerController {
                 video_streaming_quality: settings_store.settings.video_streaming_quality,
                 video_encoding_codec: settings_store.settings.video_encoding_codec,
                 bs4k_video_encoding_codec: settings_store.settings.bs4k_video_encoding_codec,
+                video_audio_encoding_codec: settings_store.settings.video_audio_encoding_codec,
+                bs4k_video_audio_encoding_codec: settings_store.settings.bs4k_video_audio_encoding_codec,
                 video_24fps_mode: settings_store.settings.video_24fps_mode,
             };
         }
@@ -338,8 +352,19 @@ class PlayerController {
         const is_hevc_playback = this.playback_mode === 'Live' ?
             PlayerUtils.isHEVCVideoSupported() && selected_video_codec === 'hevc' :
             recorded_video_codec === 'hevc';
-        // 録画HLSの音声は互換性を優先してAACへ固定する。
-        const recorded_audio_codec = 'aac';
+
+        // 録画HLSの音声コーデックも、通常 / BS4K と現在の回線プロファイルに対応する設定から決める。
+        // Opus が MSE / ManagedMediaSource で利用できない場合や、直前の実再生で失敗した場合は、
+        // 保存設定を書き換えずにこの PlayerController の再生だけ AAC へフォールバックする。
+        const selected_recorded_audio_codec: RecordedStreamingAudioCodec = this.playback_mode === 'Video' ?
+            (is_bs4k_stream ? this.quality_profile.bs4k_video_audio_encoding_codec : this.quality_profile.video_audio_encoding_codec) :
+            'aac';
+        const is_recorded_opus_audio_supported = Videos.isOpusAudioSupported();
+        const recorded_audio_codec: RecordedStreamingAudioCodec = (
+            selected_recorded_audio_codec === 'opus' &&
+            (is_recorded_opus_audio_supported === false || this.force_recorded_aac_audio_codec === true)
+        ) ? 'aac' : selected_recorded_audio_codec;
+        this.recorded_audio_codec_for_current_playback = recorded_audio_codec;
 
         // BS4K は入力 TS が HEVC Main10 で、QSVEncC ではさらに HEVC 10bit 出力を要求すると
         // MFXDEC が device operation failure で落ちることがあるため、HEVC 10bit 要求は通常チャンネルだけに限定する
@@ -1038,6 +1063,13 @@ class PlayerController {
 
         if (selected_video_codec === 'hevc' && is_hevc_playback === false) {
             this.player.notice('このブラウザは HEVC に対応していないため、今回の再生では AVC を使用します。');
+        }
+        if (
+            this.playback_mode === 'Video' &&
+            selected_recorded_audio_codec === 'opus' &&
+            is_recorded_opus_audio_supported === false
+        ) {
+            this.player.notice('このブラウザは fMP4 の Opus 音声に対応していないため、今回の再生では AAC を使用します。');
         }
         // この時点で DPlayer のコンテナ要素に dplayer-mobile クラスが付与されている場合、
         // DPlayer は音量コントロールがないスマホ向けの UI になっている
@@ -1758,6 +1790,14 @@ class PlayerController {
                         return;
                     }
 
+                    // ネットワークエラーや映像側の失敗では音声設定を変えない。
+                    // HTMLMediaElement がデコード失敗を報告した場合だけ、Opus 固有の一度限りのフォールバックを試す。
+                    const media_error = this.player.video.error;
+                    if (
+                        media_error?.code === media_error?.MEDIA_ERR_DECODE &&
+                        this.requestRecordedOpusFallback() === true
+                    ) return;
+
                     // ライブ視聴時とは異なり、録画なので待たなくても再起動できる
                     if (this.player.video.error) {
                         console.error('\u001b[31m[PlayerController] HTMLVideoElement error event:', this.player.video.error);
@@ -2201,6 +2241,30 @@ class PlayerController {
     }
 
 
+    /** Opus の実再生失敗時、この PlayerController の再生だけ一度限りで AAC へ切り替える。 */
+    private requestRecordedOpusFallback(): boolean {
+
+        if (
+            this.playback_mode !== 'Video' ||
+            this.recorded_audio_codec_for_current_playback !== 'opus' ||
+            this.force_recorded_aac_audio_codec === true
+        ) {
+            return false;
+        }
+
+        // 保存設定は変更せず、一時フラグだけを立てて同じ再生位置から新しい AAC セッションへ移行する。
+        this.force_recorded_aac_audio_codec = true;
+        console.warn('\u001b[31m[PlayerController] Opus playback failed. Falling back to AAC for this playback.');
+        usePlayerStore().event_emitter.emit('PlayerRestartRequired', {
+            message: 'Opus 音声の再生に失敗したため、今回の再生では AAC を使用します。',
+            message_delay_seconds: 2,
+            is_error_message: false,
+            should_resume_quality: true,
+        });
+        return true;
+    }
+
+
     /** 録画HLSの代替音声レンディションを、映像を維持したまま切り替える。 */
     private setupRecordedHLSAudioTrackSelector(): void {
 
@@ -2209,6 +2273,19 @@ class PlayerController {
         if (hls === undefined) return;  // 録画再生はhls.js必須。非対応表示は初期化処理側で行う。
         if (this.recorded_hls_audio_selector_instances.has(hls)) return;
         this.recorded_hls_audio_selector_instances.add(hls);
+
+        // MSE 型判定を通過していても、実際の SourceBuffer 追加・append 時に Opus が拒否されることがある。
+        // 音声 SourceBuffer に限定し、ネットワークや映像側の失敗を誤って AAC フォールバック扱いにしない。
+        hls.on(Hls.Events.ERROR, (_event, data) => {
+            const is_audio_source_buffer_error = data.sourceBufferName === 'audio' && [
+                ErrorDetails.BUFFER_ADD_CODEC_ERROR,
+                ErrorDetails.BUFFER_APPEND_ERROR,
+                ErrorDetails.BUFFER_APPENDING_ERROR,
+            ].includes(data.details);
+            if (is_audio_source_buffer_error === true) {
+                this.requestRecordedOpusFallback();
+            }
+        });
         const recorded_video = usePlayerStore().recorded_program.recorded_video;
         const renditions = recorded_video.audio_tracks.flatMap((track) => {
             const language_parts = (track.language ?? '').split('+').map((value) => value.trim()).filter(Boolean);
@@ -2619,15 +2696,30 @@ class PlayerController {
         const channels_store = useChannelsStore();
         const settings_store = useSettingsStore();
 
+        // 独自サブパネルの表示は modifier class だけで制御し、DPlayer が元パネル用に設定した
+        // inline clip-path / height は変更しない。閉じる際に全 modifier を外すことで、
+        // 戻る操作・外側クリック・別サブパネルへの移動のいずれでも元の寸法へ確実に戻す。
+        const setting_box = this.player.template.settingBox;
+        const codec_panel_class_names = [
+            'dplayer-setting-box-video-codec',
+            'dplayer-setting-box-audio-codec',
+        ];
+        const close_codec_panel = () => {
+            setting_box.classList.remove(...codec_panel_class_names);
+        };
+        const open_codec_panel = (panel_name: 'video-codec' | 'audio-codec') => {
+            close_codec_panel();
+            setting_box.classList.add(`dplayer-setting-box-${panel_name}`);
+        };
+
         // 設定パネルの開閉を把握するためモンキーパッチを追加し、PlayerStore に通知する
         const original_hide = this.player.setting.hide;
         const original_show = this.player.setting.show;
         this.player.setting.hide = () => {
             if (this.player === null) return;
             original_hide.call(this.player.setting);
-            // 映像コーデックのサブパネルを開いたまま外側を押して閉じた場合も、
-            // 次回は必ず元の設定パネルから表示する。
-            this.player.template.settingBox.classList.remove('dplayer-setting-box-video-codec');
+            // 独自サブパネルを開いたまま外側を押して閉じた場合も、次回は必ず元パネルから表示する。
+            close_codec_panel();
             player_store.is_player_setting_panel_open = false;
         };
         this.player.setting.show = () => {
@@ -2636,8 +2728,8 @@ class PlayerController {
             player_store.is_player_setting_panel_open = true;
         };
 
-        // 映像コーデック選択とモバイル回線プロファイルに切り替えるボタンを動的に追加する
-        // ライブは従来の AVC / HEVC、録画は FFmpeg 8 経路の4種類を表示する。
+        // 映像・録画音声コーデック選択と、モバイル回線プロファイルに切り替えるボタンを動的に追加する。
+        // ライブの映像は従来の AVC / HEVC、録画の映像は FFmpeg 8 経路の4種類、録画の音声は2種類を表示する。
         const selectable_video_codecs: RecordedStreamingVideoCodec[] = this.playback_mode === 'Video' ?
             ['avc', 'hevc', 'vp9', 'av1'] : ['avc', 'hevc'];
         const video_codec_item_html = selectable_video_codecs.map((codec) => `
@@ -2648,12 +2740,34 @@ class PlayerController {
             </div>
         `).join('');
         const video_codec_panel_height = 54 + selectable_video_codecs.length * 30;
+        const audio_codec_labels: Record<RecordedStreamingAudioCodec, string> = {
+            aac: 'AAC',
+            opus: 'Opus',
+        };
+        const audio_codec_options = this.playback_mode === 'Video' ? Videos.buildRecordedPlaybackAudioCodecOptions() : [];
+        const audio_codec_item_html = audio_codec_options.map((option) => `
+            <div class="dplayer-setting-audio-codec-item${option.props.disabled ? ' dplayer-setting-audio-codec-item--disabled' : ''}"
+                data-codec="${option.value}" aria-disabled="${option.props.disabled}"
+                style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer;">
+                <div class="dplayer-toggle dplayer-setting-audio-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                <span class="dplayer-label">${audio_codec_labels[option.value]}${option.props.disabled ? '（非対応）' : ''}</span>
+            </div>
+        `).join('');
+        const audio_codec_panel_height = 54 + audio_codec_options.length * 30;
+        const audio_codec_setting_item_html = this.playback_mode === 'Video' ? `
+            <div class="dplayer-setting-item dplayer-setting-audio-codec">
+                <span class="dplayer-label">音声コーデック</span>
+                <span class="dplayer-label-value dplayer-setting-audio-codec-value"></span>
+                <div class="dplayer-toggle dplayer-setting-audio-codec-arrow"></div>
+            </div>
+        ` : '';
         this.player.template.audio.insertAdjacentHTML('afterend', `
             <div class="dplayer-setting-item dplayer-setting-video-codec">
                 <span class="dplayer-label">映像コーデック</span>
                 <span class="dplayer-label-value dplayer-setting-video-codec-value"></span>
                 <div class="dplayer-toggle dplayer-setting-video-codec-arrow"></div>
             </div>
+            ${audio_codec_setting_item_html}
             <div class="dplayer-setting-item dplayer-setting-mobile-profile">
                 <span class="dplayer-label">モバイル回線向け画質</span>
                 <div class="dplayer-toggle">
@@ -2663,8 +2777,20 @@ class PlayerController {
             </div>
         `);
 
-        // 音声トラックと同じ構成のサブパネルを追加する
-        this.player.template.settingBox.insertAdjacentHTML('beforeend', `
+        // DPlayer の音声トラックと同じ構成の独自サブパネルを追加する。
+        const audio_codec_panel_html = this.playback_mode === 'Video' ? `
+            <div class="dplayer-setting-audio-codec-panel"
+                style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
+                <div class="dplayer-setting-header dplayer-setting-audio-codec-header"
+                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer;">
+                    <div class="dplayer-toggle dplayer-setting-audio-codec-back"
+                        style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                    <span class="dplayer-label">音声コーデック</span>
+                </div>
+                ${audio_codec_item_html}
+            </div>
+        ` : '';
+        setting_box.insertAdjacentHTML('beforeend', `
             <div class="dplayer-setting-video-codec-panel"
                 style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
                 <div class="dplayer-setting-header dplayer-setting-video-codec-header"
@@ -2675,6 +2801,7 @@ class PlayerController {
                 </div>
                 ${video_codec_item_html}
             </div>
+            ${audio_codec_panel_html}
         `);
 
         // DPlayer が持つ音声トラック用の矢印・戻る・チェックアイコンを流用して見た目を揃える
@@ -2685,6 +2812,12 @@ class PlayerController {
         this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-back')!.innerHTML = audio_back_html;
         this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-video-codec-check')
             .forEach((element) => element.innerHTML = audio_check_html);
+        if (this.playback_mode === 'Video') {
+            this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-codec-arrow')!.innerHTML = audio_arrow_html;
+            this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-codec-back')!.innerHTML = audio_back_html;
+            this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-codec-check')
+                .forEach((element) => element.innerHTML = audio_check_html);
+        }
 
         // 現在の再生種別・放送種別・回線プロファイルに対応する設定キーを取得する
         const is_bs4k = this.playback_mode === 'Live' ?
@@ -2702,9 +2835,15 @@ class PlayerController {
             }
             return `${is_bs4k ? 'bs4k_' : ''}video_encoding_codec${cellular_suffix}` as VideoCodecSettingKey;
         };
+        type AudioCodecSettingKey =
+            'video_audio_encoding_codec' | 'video_audio_encoding_codec_cellular' |
+            'bs4k_video_audio_encoding_codec' | 'bs4k_video_audio_encoding_codec_cellular';
+        const get_audio_codec_setting_key = (): AudioCodecSettingKey => {
+            const cellular_suffix = this.quality_profile_type === 'Cellular' ? '_cellular' : '';
+            return `${is_bs4k ? 'bs4k_' : ''}video_audio_encoding_codec${cellular_suffix}` as AudioCodecSettingKey;
+        };
 
         // サブパネルは設定画面と同じ SettingsStore の値を直接読み書きする
-        const setting_box = this.player.template.settingBox;
         const video_codec_button = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec')!;
         const video_codec_value = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-value')!;
         const video_codec_items = Array.from(this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-video-codec-item'));
@@ -2717,17 +2856,14 @@ class PlayerController {
                 if (check !== null) check.style.visibility = item.dataset.codec === selected_codec ? 'visible' : 'hidden';
             });
         };
-        const close_video_codec_panel = () => {
-            setting_box.classList.remove('dplayer-setting-box-video-codec');
-        };
         update_video_codec_display();
         video_codec_button.addEventListener('click', () => {
             update_video_codec_display();
             // DPlayer が計測した元パネル用の inline clip-path は上書きせず、
             // サブパネル表示中だけ専用クラスで切り替える。
-            setting_box.classList.add('dplayer-setting-box-video-codec');
+            open_codec_panel('video-codec');
         });
-        this.player.container.querySelector('.dplayer-setting-video-codec-header')!.addEventListener('click', close_video_codec_panel);
+        this.player.container.querySelector('.dplayer-setting-video-codec-header')!.addEventListener('click', close_codec_panel);
         video_codec_items.forEach((item) => {
             item.addEventListener('click', () => {
                 const codec = item.dataset.codec as RecordedStreamingVideoCodec;
@@ -2741,7 +2877,7 @@ class PlayerController {
                     settings_store.settings[setting_key] = codec;
                 }
                 update_video_codec_display();
-                close_video_codec_panel();
+                close_codec_panel();
                 // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
                 this.player?.setting.hide();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
@@ -2753,6 +2889,53 @@ class PlayerController {
             });
         });
 
+        // 録画再生時のみ、音声コーデックも映像コーデックと同じ回線プロファイル単位で選択できるようにする。
+        // Opus 非対応ブラウザでは項目を残して理由を示すが、クリックは受け付けない。
+        let update_audio_codec_display: () => void = () => {};
+        if (this.playback_mode === 'Video') {
+            const audio_codec_button = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-codec')!;
+            const audio_codec_value = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-codec-value')!;
+            const audio_codec_items = Array.from(
+                this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-codec-item'),
+            );
+            setting_box.style.setProperty('--audio-codec-panel-height', `${audio_codec_panel_height}px`);
+            update_audio_codec_display = () => {
+                const selected_codec = settings_store.settings[get_audio_codec_setting_key()];
+                audio_codec_value.textContent = audio_codec_labels[selected_codec];
+                audio_codec_items.forEach((item) => {
+                    const check = item.querySelector<HTMLElement>('.dplayer-setting-audio-codec-check');
+                    if (check !== null) check.style.visibility = item.dataset.codec === selected_codec ? 'visible' : 'hidden';
+                });
+            };
+            update_audio_codec_display();
+            audio_codec_button.addEventListener('click', () => {
+                update_audio_codec_display();
+                open_codec_panel('audio-codec');
+            });
+            this.player.container.querySelector('.dplayer-setting-audio-codec-header')!
+                .addEventListener('click', close_codec_panel);
+            audio_codec_items.forEach((item) => {
+                item.addEventListener('click', () => {
+                    if (item.classList.contains('dplayer-setting-audio-codec-item--disabled')) return;
+                    const codec = item.dataset.codec as RecordedStreamingAudioCodec;
+                    settings_store.settings[get_audio_codec_setting_key()] = codec;
+
+                    // ユーザーが明示的に選び直したときは、過去の実再生エラーによる一時フォールバックを解除する。
+                    // Opus を再選択した場合も、この操作をもって再試行を許可する。
+                    this.force_recorded_aac_audio_codec = false;
+                    update_audio_codec_display();
+                    close_codec_panel();
+                    this.player?.setting.hide();
+                    player_store.event_emitter.emit('PlayerRestartRequired', {
+                        message: `音声コーデックを ${audio_codec_labels[codec]} に変更しました。`,
+                        message_delay_seconds: 2,
+                        is_error_message: false,
+                        should_resume_quality: true,
+                    });
+                });
+            });
+        }
+
         // デフォルトのチェック状態を画質プロファイルタイプに合わせる
         const toggle_mobile_profile_input = this.player.container.querySelector<HTMLInputElement>('.dplayer-mobile-profile-setting-input')!;
         toggle_mobile_profile_input.checked = this.quality_profile_type === 'Cellular';
@@ -2762,11 +2945,14 @@ class PlayerController {
         toggle_mobile_profile_button.addEventListener('click', () => {
             // チェックボックスの状態を切り替える
             toggle_mobile_profile_input.checked = !toggle_mobile_profile_input.checked;
+            // 回線プロファイルが変わった場合は、切り替え先の保存設定を改めて評価する。
+            this.force_recorded_aac_audio_codec = false;
             // 画質プロファイルをモバイル回線向けに切り替えてから、プレイヤーを再起動
             if (toggle_mobile_profile_input.checked) {
                 this.quality_profile_type = 'Cellular';
                 player_store.selected_quality_profile_type = this.quality_profile_type;
                 update_video_codec_display();
+                update_audio_codec_display();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: 'モバイル回線向けの画質プロファイルに切り替えました。',
                     // 他の通知と被らないように、メッセージを遅らせて表示する
@@ -2780,6 +2966,7 @@ class PlayerController {
                 this.quality_profile_type = 'Wi-Fi';
                 player_store.selected_quality_profile_type = this.quality_profile_type;
                 update_video_codec_display();
+                update_audio_codec_display();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: 'Wi-Fi 回線向けの画質プロファイルに切り替えました。',
                     // 他の通知と被らないように、メッセージを遅らせて表示する

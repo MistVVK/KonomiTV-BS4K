@@ -1,4 +1,6 @@
 
+import type { RecordedStreamingAudioCodec } from '@/stores/SettingsStore';
+
 import APIClient from  '@/services/APIClient';
 import { IChannel } from '@/services/Channels';
 import { CommentUtils } from '@/utils';
@@ -21,6 +23,12 @@ export interface IRecordedPlaybackCapability {
 export interface IRecordedPlaybackCodecOption {
     title: string;
     value: 'avc' | 'hevc' | 'vp9' | 'av1';
+    props: {disabled: boolean};
+}
+
+export interface IRecordedPlaybackAudioCodecOption {
+    title: string;
+    value: RecordedStreamingAudioCodec;
     props: {disabled: boolean};
 }
 
@@ -442,6 +450,27 @@ class Videos {
                 props: {disabled: reason !== null},
             };
         });
+    }
+
+    /** このブラウザが fMP4 コンテナ内の Opus 音声を再生できるかどうかを返す。 */
+    static isOpusAudioSupported(): boolean {
+        const media_source = (
+            window as Window & {ManagedMediaSource?: {isTypeSupported: (mime_type: string) => boolean}}
+        ).ManagedMediaSource ?? window.MediaSource;
+        return media_source?.isTypeSupported('audio/mp4; codecs="opus"') === true;
+    }
+
+    /** ブラウザの対応状況を反映した録画音声コーデックの選択肢を作る。 */
+    static buildRecordedPlaybackAudioCodecOptions(): IRecordedPlaybackAudioCodecOption[] {
+        const is_opus_supported = this.isOpusAudioSupported();
+        return [
+            {title: 'AAC（互換性優先）', value: 'aac', props: {disabled: false}},
+            {
+                title: `Opus（音質・圧縮効率優先）${is_opus_supported ? '' : '（ブラウザ非対応）'}`,
+                value: 'opus',
+                props: {disabled: is_opus_supported === false},
+            },
+        ];
     }
 
     /**

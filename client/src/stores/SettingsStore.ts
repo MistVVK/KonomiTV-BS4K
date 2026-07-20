@@ -19,6 +19,7 @@ export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | 
 export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
 export type StreamingVideoCodec = 'avc' | 'hevc';
 export type RecordedStreamingVideoCodec = StreamingVideoCodec | 'vp9' | 'av1';
+export type RecordedStreamingAudioCodec = 'aac' | 'opus';
 
 // 番組表関連の型定義
 export type TimeTableSizeOption = 'Wide' | 'Normal' | 'Narrow';
@@ -116,6 +117,10 @@ export interface ILocalClientSettings extends IClientSettings {
     video_encoding_codec_cellular: RecordedStreamingVideoCodec;
     bs4k_video_encoding_codec: RecordedStreamingVideoCodec;
     bs4k_video_encoding_codec_cellular: RecordedStreamingVideoCodec;
+    video_audio_encoding_codec: RecordedStreamingAudioCodec;
+    video_audio_encoding_codec_cellular: RecordedStreamingAudioCodec;
+    bs4k_video_audio_encoding_codec: RecordedStreamingAudioCodec;
+    bs4k_video_audio_encoding_codec_cellular: RecordedStreamingAudioCodec;
     video_24fps_mode: boolean;
     video_24fps_mode_cellular: boolean;
     caption_font: string;
@@ -315,6 +320,14 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     bs4k_video_encoding_codec: 'hevc',
     // BS4K 録画再生の映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
     bs4k_video_encoding_codec_cellular: 'hevc',
+    // 録画再生の音声コーデック (Wi-Fi 回線時) (Default: AAC) (同期無効)
+    video_audio_encoding_codec: 'aac',
+    // 録画再生の音声コーデック (モバイル回線時) (Default: AAC) (同期無効)
+    video_audio_encoding_codec_cellular: 'aac',
+    // BS4K 録画再生の音声コーデック (Wi-Fi 回線時) (Default: AAC) (同期無効)
+    bs4k_video_audio_encoding_codec: 'aac',
+    // BS4K 録画再生の音声コーデック (モバイル回線時) (Default: AAC) (同期無効)
+    bs4k_video_audio_encoding_codec_cellular: 'aac',
     // ビデオを 24fps モードで再生する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
     video_24fps_mode: false,
     // ビデオを 24fps モードで再生する (モバイル回線時)  (Default: オフ) (同期無効)
@@ -472,6 +485,10 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     // video_encoding_codec_cellular: 同期無効
     // bs4k_video_encoding_codec: 同期無効
     // bs4k_video_encoding_codec_cellular: 同期無効
+    // video_audio_encoding_codec: 同期無効
+    // video_audio_encoding_codec_cellular: 同期無効
+    // bs4k_video_audio_encoding_codec: 同期無効
+    // bs4k_video_audio_encoding_codec_cellular: 同期無効
     // video_24fps_mode: 同期無効
     // video_24fps_mode_cellular: 同期無効
     'caption_font',
@@ -571,6 +588,20 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
     // テーマ名の変更や不正な設定インポートで Vuetify が描画不能になることを防ぐ
     if (isKonomiTVTheme(normalized_settings.ui_theme) === false) {
         normalized_settings.ui_theme = ILocalClientSettingsDefault.ui_theme;
+    }
+
+    // 録画音声コーデックは AAC / Opus の2択だけを許可する。
+    // 未設定の旧データだけでなく、開発途中版で保存された廃止値も互換既定の AAC へ戻す。
+    const recorded_audio_codec_keys = [
+        'video_audio_encoding_codec',
+        'video_audio_encoding_codec_cellular',
+        'bs4k_video_audio_encoding_codec',
+        'bs4k_video_audio_encoding_codec_cellular',
+    ] as const;
+    for (const key of recorded_audio_codec_keys) {
+        if (normalized_settings[key] !== 'aac' && normalized_settings[key] !== 'opus') {
+            normalized_settings[key] = ILocalClientSettingsDefault[key];
+        }
     }
 
     // 通信節約モードを廃止し、用途・回線別の映像コーデック設定へ移行する。
