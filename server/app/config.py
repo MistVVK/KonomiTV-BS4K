@@ -214,6 +214,24 @@ class _ServerSettingsGeneral(BaseModel):
     debug: bool = False
     debug_encoder: bool = False
 
+    @property
+    def live_stream_backend(self) -> Literal['EDCB', 'Mirakurun']:
+        """
+        ライブ放送波を実際に受信するバックエンドを返す。
+
+        Args:
+            なし。
+
+        Returns:
+            Literal['EDCB', 'Mirakurun']: ライブ放送波を受信するバックエンド。
+        """
+
+        # メタデータバックエンドが Mirakurun の場合は、always_receive_tv_from_mirakurun の値にかかわらず
+        # ライブ放送波も Mirakurun から受信する。EDCB の場合だけ設定値に応じて受信元を切り替える。
+        if self.backend == 'EDCB' and self.always_receive_tv_from_mirakurun is False:
+            return 'EDCB'
+        return 'Mirakurun'
+
     @field_validator('edcb_url')
     def validate_edcb_url(cls, edcb_url: Url, info: ValidationInfo) -> Url:
         # URL を末尾のスラッシュありに統一

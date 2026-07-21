@@ -118,6 +118,7 @@ class LiveEncodingTask:
         quality: QUALITY_TYPES,
         channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'],
         is_fullhd_channel: bool,
+        is_oneseg: bool = False,
     ) -> list[str]:
         """
         FFmpeg に渡すオプションを組み立てる
@@ -126,6 +127,7 @@ class LiveEncodingTask:
             quality (QUALITY_TYPES): 映像の品質
             channel_type (Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']): チャンネルの種類
             is_fullhd_channel (bool): フル HD 放送が実施されているチャンネルかどうか
+            is_oneseg (bool): ワンセグサービスかどうか
 
         Returns:
             list[str]: FFmpeg に渡すオプションが連なる配列
@@ -136,14 +138,17 @@ class LiveEncodingTask:
 
         # 入力ストリームの解析時間
         CONFIG = Config()
-        if channel_type == 'BS4K' and CONFIG.general.encoder_bs4k_input_analysis_enabled is True:
+        if is_oneseg is True:
+            # ワンセグは低フレームレートの H.264 で、GOP の途中から受信を開始すると
+            # SPS/PPS・IDR の検出まで時間がかかるため、初回から十分な解析時間を確保する
+            analyzeduration = round(2_500_000 + (self._retry_count * 200_000))
+        elif channel_type == 'BS4K' and CONFIG.general.encoder_bs4k_input_analysis_enabled is True:
             analyzeduration = round((CONFIG.general.encoder_bs4k_input_analyze * 1000000) + (self._retry_count * 200000))
+        elif channel_type == 'SKY':
+            # H.264 入力のスカパー！プレミアムサービスは入力ストリームの解析時間を長めにする
+            analyzeduration = round(700_000 + (self._retry_count * 200_000))
         else:
             analyzeduration = round(500000 + (self._retry_count * 200000))  # リトライ回数に応じて少し増やす
-        if channel_type == 'SKY':
-            # スカパー！プレミアムサービスのチャンネルは入力ストリームの解析時間を長めにする (その方がうまくいく)
-            ## ほかと違い H.264 コーデックが採用されていることが影響しているのかも
-            analyzeduration += 200000
 
         # 入力
         ## -analyzeduration をつけることで、ストリームの分析時間を短縮できる
@@ -151,7 +156,11 @@ class LiveEncodingTask:
 
         # ストリームのマッピング
         ## 音声切り替えのため、主音声・副音声両方をエンコード後の TS に含む
-        options.append('-map 0:v:0 -map 0:a:0 -map 0:a:1 -map 0:d? -ignore_unknown')
+        ## ワンセグは音声が1ストリームだけの場合があるため、後段の optional な全音声マッピングだけを利用する
+        if is_oneseg is True:
+            options.append('-ignore_unknown')
+        else:
+            options.append('-map 0:v:0 -map 0:a:0 -map 0:a:1 -map 0:d? -ignore_unknown')
 
         # フラグ
         ## 主に FFmpeg の起動を高速化するための設定
@@ -195,8 +204,13 @@ class LiveEncodingTask:
             ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
             gop_length_second = self.GOP_LENGTH_SECONDS_H265
 
+        # ワンセグはプログレッシブかつ約 10～15fps の VFR で放送されているため、
+        ## フレームレートの固定やインターレース解除を行わず、入力 PTS をそのまま維持する。
+        if is_oneseg is True:
+            options.append(f'-vf scale={video_width}:{video_height}')
+            options.append(f'-fps_mode vfr -g {30 if QUALITY[quality].is_hevc is True else 8}')
         ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わない
-        if channel_type == "BS4K":
+        elif channel_type == "BS4K":
             options.append(f'-vf scale={video_width}:{video_height}')
             if '-30fps' in quality:
                 options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
@@ -219,8 +233,16 @@ class LiveEncodingTask:
                     options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
 
         # 音声
-        ## 実在する音声トラックをすべて保持するため、FFmpeg 側では音声をコピーする
-        options.append('-map 0:v:0 -map 0:a? -map 0:d? -acodec copy')
+        if is_oneseg is True:
+            # ワンセグでは、放送局や番組によって ADTS の channel_configuration=0 と
+            # PCE (Program Config Element) に依存する AAC が送出されることがある。
+            # そのままコピーするとブラウザ側の AAC デコーダーで再生できないため、
+            # 標準的なステレオ AAC (channel_configuration=2) へ正規化する。
+            options.append('-map 0:v:0 -map 0:a? -map 0:d?')
+            options.append('-acodec aac -aac_coder twoloop -ac 2 -ab 96K -ar 48000')
+        else:
+            # 通常放送は実在する音声トラックをすべてそのまま保持する
+            options.append('-map 0:v:0 -map 0:a? -map 0:d? -acodec copy')
 
         # 出力
         options.append('-y -f mpegts')  # MPEG-TS 出力ということを明示
@@ -284,6 +306,7 @@ class LiveEncodingTask:
         encoder_type: Literal['QSVEncC', 'NVEncC', 'VCEEncC'],
         channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'],
         is_fullhd_channel: bool,
+        is_oneseg: bool = False,
     ) -> list[str]:
         """
         QSVEncC・NVEncC・VCEEncC (便宜上 HWEncC と総称) に渡すオプションを組み立てる
@@ -293,6 +316,7 @@ class LiveEncodingTask:
             encoder_type (Literal['QSVEncC', 'NVEncC', 'VCEEncC']): エンコーダー (QSVEncC or NVEncC or VCEEncC)
             channel_type (Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']): チャンネルの種類
             is_fullhd_channel (bool): フル HD 放送が実施されているチャンネルかどうか
+            is_oneseg (bool): ワンセグサービスかどうか
 
         Returns:
             list[str]: HWEncC に渡すオプションが連なる配列
@@ -303,7 +327,12 @@ class LiveEncodingTask:
 
         # 入力ストリームの解析時間
         CONFIG = Config()
-        if (
+        if is_oneseg is True:
+            # ワンセグは低フレームレートの H.264 で、GOP の途中から受信を開始すると
+            # SPS/PPS・IDR の検出まで時間がかかるため、初回から十分な解析量と時間を確保する
+            input_probesize = f'{round(3000 + (self._retry_count * 500))}K'
+            input_analyze = round(2.5 + (self._retry_count * 0.2), 1)
+        elif (
             channel_type == 'BS4K' and
             CONFIG.general.encoder_bs4k_input_analysis_enabled is True and
             CONFIG.general.encoder_bs4k_low_latency is False
@@ -313,23 +342,23 @@ class LiveEncodingTask:
         elif channel_type == 'BS4K' and CONFIG.general.encoder_bs4k_input_analysis_enabled is True:
             input_probesize = f'{round(CONFIG.general.encoder_bs4k_input_probesize + (self._retry_count * 500))}K'
             input_analyze = round(CONFIG.general.encoder_bs4k_input_analyze + (self._retry_count * 0.2), 1)
+        elif channel_type == 'SKY':
+            # H.264 入力のスカパー！プレミアムサービスは入力ストリームの解析時間を長めにする
+            input_probesize = f'{round(1500 + (self._retry_count * 500))}K'
+            input_analyze = round(0.9 + (self._retry_count * 0.2), 1)
         else:
             input_probesize = f'{round(1000 + (self._retry_count * 500))}K'  # リトライ回数に応じて少し増やす
             input_analyze = round(0.7 + (self._retry_count * 0.2), 1)  # リトライ回数に応じて少し増やす
-        if channel_type == 'SKY':
-            # スカパー！プレミアムサービスのチャンネルは入力ストリームの解析時間を長めにする (その方がうまくいく)
-            ## ほかと違い H.264 コーデックが採用されていることが影響しているのかも
-            input_probesize = f'{round(1500 + (self._retry_count * 500))}K'
-            input_analyze += 0.2
 
         # 入力
         ## --input-probesize, --input-analyze をつけることで、ストリームの分析時間を短縮できる
         ## 両方つけるのが重要で、--input-analyze だけだとエンコーダーがフリーズすることがある
         options.append(f'--input-format mpegts --input-probesize {input_probesize} --input-analyze {input_analyze}')
-        ## BS4K 以外では 29.97fps (59.94i) を指定する
+        ## BS4K とワンセグ以外では 29.97fps (59.94i) を指定する
         ## BS4K は MPEG-TS/avhw 入力の 59.94p をそのまま読ませ、30fps 品質は VPP で間引く
+        ## ワンセグは約 10～15fps の入力 PTS をそのまま読ませる
         is_bs4k_30fps_quality = channel_type == 'BS4K' and '-30fps' in quality
-        if channel_type != 'BS4K':
+        if channel_type != 'BS4K' and is_oneseg is False:
             options.append('--fps 30000/1001')
         ## 入力を指定する
         options.append('--input -')
@@ -340,8 +369,14 @@ class LiveEncodingTask:
         else:
             options.append('--avhw')
 
-        # tsreadex -A 1 が分離したデュアルモノを含む、すべての実音声をそのまま出力する
-        options.append('--audio-copy --data-copy timed_id3')
+        if is_oneseg is True:
+            # ワンセグの PCE 依存 AAC を、ブラウザ互換の標準的なステレオ AAC へ正規化する。
+            # 受信開始直後に PCE がまだ届いていない AAC フレームは無音に置換して継続する。
+            options.append('--audio-codec aac --audio-bitrate 96 --audio-samplerate 48000')
+            options.append('--audio-stream :stereo --audio-ignore-decode-error 100 --data-copy timed_id3')
+        else:
+            # tsreadex -A 1 が分離したデュアルモノを含む、すべての実音声をそのまま出力する
+            options.append('--audio-copy --data-copy timed_id3')
 
         # フラグ
         ## 主に HWEncC の起動を高速化するための設定
@@ -358,7 +393,10 @@ class LiveEncodingTask:
         if channel_type != 'BS4K' or CONFIG.general.encoder_bs4k_low_latency is True:
             options.append('--lowlatency')
         ## QSVEncC では OpenCL を使用しない場合、無効化することで初期化フェーズを高速化する
-        if encoder_type == 'QSVEncC' and not self.live_stream.encoding_options.is_24fps_mode_enabled:
+        if (
+            encoder_type == 'QSVEncC' and
+            (is_oneseg is True or self.live_stream.encoding_options.is_24fps_mode_enabled is False)
+        ):
             options.append('--disable-opencl')
         ## NVEncC では NVML によるモニタリングと DX11, Vulkan を無効化することで初期化フェーズを高速化する
         if encoder_type == 'NVEncC':
@@ -426,8 +464,12 @@ class LiveEncodingTask:
             ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
             gop_length_second = self.GOP_LENGTH_SECONDS_H265
 
+        # ワンセグはプログレッシブかつ約 10～15fps の VFR で放送されているため、
+        ## フレームレートの固定やインターレース解除を行わず、入力 PTS をそのまま維持する。
+        if is_oneseg is True:
+            options.append(f'--avsync vfr --gop-len {30 if QUALITY[quality].is_hevc is True else 8}')
         ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わない
-        if channel_type == "BS4K":
+        elif channel_type == "BS4K":
             if is_bs4k_30fps_quality is True:
                 options.append('--vpp-decimate cycle=2,drop=1')
                 avsync_mode = 'vfr' if CONFIG.general.encoder_bs4k_low_latency is True else 'forcecfr'
@@ -498,8 +540,7 @@ class LiveEncodingTask:
         """
 
         CONFIG = Config()
-        BACKEND_TYPE: Literal['EDCB', 'Mirakurun'] = 'Mirakurun' if CONFIG.general.always_receive_tv_from_mirakurun is True else CONFIG.general.backend
-        assert BACKEND_TYPE == 'Mirakurun', 'This method is only for Mirakurun backend.'
+        assert CONFIG.general.live_stream_backend == 'Mirakurun', 'This method is only for Mirakurun backend.'
 
         # Mirakurun / mirakc は通常チャンネルタイプが GR, BS, CS, SKY しかないので、
         # フォールバックとして BS4K を BS に、CATV を CS に変換する
@@ -589,9 +630,8 @@ class LiveEncodingTask:
 
         CONFIG = Config()
 
-        # バックエンドの種類を取得
-        ## always_receive_tv_from_mirakurun が True なら、バックエンドに関わらず常に Mirakurun / mirakc から受信する
-        BACKEND_TYPE: Literal['EDCB', 'Mirakurun'] = 'Mirakurun' if CONFIG.general.always_receive_tv_from_mirakurun is True else CONFIG.general.backend
+        # メタデータの取得元とは独立した、ライブ放送波の実際の受信元を取得する
+        LIVE_STREAM_BACKEND = CONFIG.general.live_stream_backend
 
         # まだ Standby になっていなければ、ステータスを Standby に設定
         # 基本はエンコードタスクの呼び出し元である self.live_stream.connect() の方で Standby に設定されるが、再起動の場合はそこを経由しないため必要
@@ -600,6 +640,16 @@ class LiveEncodingTask:
 
         # チャンネル情報からサービス ID とネットワーク ID を取得する
         channel = cast(Channel, await Channel.filter(display_channel_id=self.live_stream.display_channel_id).first())
+
+        # 3つのバックエンド構成のどれで動作しているかと、実際に選局するサービスを明示する
+        ## 接続 URL は認証情報やローカル環境情報を含む可能性があるためログへ出力しない。
+        logging.info(
+            f'{self.live_stream.log_prefix} Backend: Metadata={CONFIG.general.backend} / Live={LIVE_STREAM_BACKEND}'
+        )
+        logging.info(
+            f'{self.live_stream.log_prefix} Source: {LIVE_STREAM_BACKEND} / NID: {channel.network_id} / '
+            f'TSID: {channel.transport_stream_id} / SID: {channel.service_id}'
+        )
 
         # エンコーダーの種類を取得
         ENCODER_TYPE = GetEncoderForLiveChannel(self.live_stream.display_channel_id)
@@ -689,7 +739,10 @@ class LiveEncodingTask:
         # チューナーの起動にも時間がかかるが、エンコーダーの起動は非同期なのに対し、チューナーの起動は EDCB の場合は同期的
 
         # フル HD 放送が行われているチャンネルかを取得
-        is_fullhd_channel = self.isFullHDChannel(channel.network_id, channel.service_id)
+        is_fullhd_channel = (
+            channel.is_oneseg is False and
+            self.isFullHDChannel(channel.network_id, channel.service_id)
+        )
 
         ## ラジオチャンネルでは HW エンコードの意味がないため、FFmpeg に固定する
         if channel.is_radiochannel is True:
@@ -703,7 +756,9 @@ class LiveEncodingTask:
             if channel.is_radiochannel is True:
                 encoder_options = self.buildFFmpegOptionsForRadio()
             else:
-                encoder_options = self.buildFFmpegOptions(self.live_stream.quality, channel.type, is_fullhd_channel)
+                encoder_options = self.buildFFmpegOptions(
+                    self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg,
+                )
             logging.info(f'{self.live_stream.log_prefix} FFmpeg Commands:\nffmpeg {" ".join(encoder_options)}')
 
             # エンコーダープロセスを非同期で作成・実行
@@ -732,7 +787,7 @@ class LiveEncodingTask:
             # オプションを取得
             hw_encoder_type = cast(Literal['QSVEncC', 'NVEncC', 'VCEEncC'], ENCODER_TYPE)
             encoder_options = self.buildHWEncCOptions(
-                self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
+                self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel, channel.is_oneseg,
             )
             logging.info(f'{self.live_stream.log_prefix} {ENCODER_TYPE} Commands:\n{ENCODER_TYPE} {" ".join(encoder_options)}')
 
@@ -779,7 +834,7 @@ class LiveEncodingTask:
         # CancelledError をキャッチしないとエンコーダープロセスの終了処理に到達せず、プロセスがリークしてしまう
         try:
             # Mirakurun バックエンド
-            if BACKEND_TYPE == 'Mirakurun':
+            if LIVE_STREAM_BACKEND == 'Mirakurun':
 
                 # チューナーを確保できるまで待機する
                 ## 確保できなかった場合でも共聴で受信できる可能性があるので、戻り値は無視する
@@ -839,7 +894,7 @@ class LiveEncodingTask:
                 stream_reader = response.content
 
             # EDCB バックエンド
-            elif BACKEND_TYPE == 'EDCB':
+            elif LIVE_STREAM_BACKEND == 'EDCB':
 
                 # チューナーインスタンスを取得する
                 ## Idling への切り替え、ONAir への復帰時に LiveStream 側でチューナーのアンロック/ロックが行われる
@@ -1028,11 +1083,11 @@ class LiveEncodingTask:
 
                 # EDCB バックエンド: チューナーとのストリーミング接続を閉じる
                 ## チャンネル切り替え時に再利用するため、ここではチューナー自体は閉じない
-                if BACKEND_TYPE == 'EDCB' and self.live_stream.tuner is not None:
+                if LIVE_STREAM_BACKEND == 'EDCB' and self.live_stream.tuner is not None:
                     await self.live_stream.tuner.disconnect(self.live_stream.live_stream_id)
 
                 # Mirakurun バックエンド: Service Stream API とのストリーミング接続を閉じる
-                if BACKEND_TYPE == 'Mirakurun' and response is not None and session is not None:
+                if LIVE_STREAM_BACKEND == 'Mirakurun' and response is not None and session is not None:
                     await session.close()
                     response.close()
 
@@ -1374,7 +1429,7 @@ class LiveEncodingTask:
                                 self.live_stream.setStatus('Offline', 'チューナーからの放送波の受信がタイムアウトしました。チューナー側に何らかの問題があるかもしれません。(E-11)')
 
                     # Mirakurun の Service Stream API からエラーが返された場合
-                    if BACKEND_TYPE == 'Mirakurun' and response is not None and response.status != 200:
+                    if LIVE_STREAM_BACKEND == 'Mirakurun' and response is not None and response.status != 200:
                         # レスポンスヘッダーの server が mirakc であれば mirakc と判定できる
                         if ('server' in response.headers) and ('mirakc' in response.headers['server']):
                             mirakurun_or_mirakc = 'mirakc'
@@ -1429,8 +1484,8 @@ class LiveEncodingTask:
 
                     # チューナーとの接続が切断された場合
                     ## ref: https://stackoverflow.com/a/45251241/17124142
-                    if ((BACKEND_TYPE == 'Mirakurun' and response is not None and response.closed is True) or
-                        (BACKEND_TYPE == 'EDCB' and self.live_stream.tuner is not None and self.live_stream.tuner.isDisconnected() is True)):
+                    if ((LIVE_STREAM_BACKEND == 'Mirakurun' and response is not None and response.closed is True) or
+                        (LIVE_STREAM_BACKEND == 'EDCB' and self.live_stream.tuner is not None and self.live_stream.tuner.isDisconnected() is True)):
 
                         # エンコードタスクを再起動
                         self.live_stream.setStatus('Restart', 'チューナーとの接続が切断されました。エンコードタスクを再起動しています… (ER-05)')
@@ -1532,7 +1587,7 @@ class LiveEncodingTask:
             # チューナーをアンロックする (EDCB バックエンドのみ)
             ## 新しいエンコードタスクが今回立ち上げたチューナーを再利用できるようにする
             ## エンコーダーの再起動が必要なだけでチューナー自体はそのまま使えるし、わざわざ閉じてからもう一度開くのは無駄
-            if BACKEND_TYPE == 'EDCB' and self.live_stream.tuner is not None:
+            if LIVE_STREAM_BACKEND == 'EDCB' and self.live_stream.tuner is not None:
                 self.live_stream.tuner.unlock(self.live_stream.live_stream_id)
 
             # 再起動回数が最大再起動回数に達していなければ、再起動する
@@ -1554,7 +1609,7 @@ class LiveEncodingTask:
 
                 # チューナーを終了する (EDCB バックエンドのみ)
                 ## tuner.close() した時点でそのチューナーインスタンスは意味をなさなくなるので、LiveStream インスタンスのプロパティからも削除する
-                if BACKEND_TYPE == 'EDCB' and self.live_stream.tuner is not None:
+                if LIVE_STREAM_BACKEND == 'EDCB' and self.live_stream.tuner is not None:
                     if await self.live_stream.tuner.close(self.live_stream.live_stream_id) is True:
                         self.live_stream.tuner = None
 
@@ -1562,7 +1617,7 @@ class LiveEncodingTask:
         else:
 
             # EDCB バックエンドのみ
-            if BACKEND_TYPE == 'EDCB' and self.live_stream.tuner is not None:
+            if LIVE_STREAM_BACKEND == 'EDCB' and self.live_stream.tuner is not None:
 
                 # 再利用中ならチューナーを閉じない
                 ## LiveStream 側の handoff と競合しないようにする

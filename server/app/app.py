@@ -325,8 +325,8 @@ async def Shutdown():
     for live_stream in LiveStream.getAllLiveStreams():
         live_stream.setStatus('Offline', 'ライブストリームは Offline です。', True)
 
-    # 全てのチューナーインスタンスを終了する (EDCB バックエンドのみ)
-    if CONFIG.general.backend == 'EDCB':
+    # 全てのチューナーインスタンスを終了する (ライブ放送波を EDCB から受信している場合のみ)
+    if CONFIG.general.live_stream_backend == 'EDCB':
         await EDCBTuner.closeAll()
 
     # 録画フォルダ監視タスクを停止

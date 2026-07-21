@@ -366,10 +366,7 @@ class LiveStream:
             ## EDCB バックエンドの場合はチューナーインスタンスを直接移譲して再利用できるため、より高度なチューナー再利用ロジックを実行する
             ## Mirakurun バックエンドの場合はチューナー管理が Mirakurun/mirakc 側で行われるため、
             ## Idling ストリームを Offline にしてチューナーを解放するだけでよい (チューナーインスタンスの移譲は不要)
-            is_edcb_backend = (
-                Config().general.backend == 'EDCB' and
-                Config().general.always_receive_tv_from_mirakurun is False
-            )
+            is_edcb_backend = Config().general.live_stream_backend == 'EDCB'
 
             # EDCB バックエンドの場合は、再利用できるチューナーがあれば取得しておく
             if should_start_task is True and is_edcb_backend is True:

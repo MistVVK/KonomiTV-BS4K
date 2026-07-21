@@ -29,12 +29,21 @@ router = APIRouter(
 async def ValidateChannelID(display_channel_id: Annotated[str, Path(description='チャンネル ID 。ex: gr011')]) -> str:
     """ チャンネル ID のバリデーション """
 
-    # チャンネル ID が存在するか確認
-    if await Channel.filter(display_channel_id=display_channel_id).get_or_none() is None:
+    # チャンネル ID が存在し、ライブ視聴可能か確認
+    ## 録画ファイルから登録された録画専用チャンネルなどを URL の直接指定で視聴しようとすると、
+    ## バックエンド側に存在しないサービスの選局へ進んでしまうため、ここで確実に拒否する。
+    channel = await Channel.filter(display_channel_id=display_channel_id).get_or_none()
+    if channel is None:
         logging.error(f'[LiveStreamsRouter][ValidateChannelID] Specified display_channel_id was not found. [display_channel_id: {display_channel_id}]')
         raise HTTPException(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Specified display_channel_id was not found',
+        )
+    if channel.is_watchable is False:
+        logging.error(f'[LiveStreamsRouter][ValidateChannelID] Specified display_channel_id is not watchable. [display_channel_id: {display_channel_id}]')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified display_channel_id is not watchable',
         )
 
     return display_channel_id
