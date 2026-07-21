@@ -1,5 +1,45 @@
+diff --git a/node_modules/aribb24.js/d.ts/canvas-provider.d.ts b/node_modules/aribb24.js/d.ts/canvas-provider.d.ts
+index ef277a3..1b64b2e 100644
+--- a/node_modules/aribb24.js/d.ts/canvas-provider.d.ts
++++ b/node_modules/aribb24.js/d.ts/canvas-provider.d.ts
+@@ -3,6 +3,7 @@ export interface ProviderOption {
+     canvas?: HTMLCanvasElement;
+     width?: number;
+     height?: number;
++    profile?: 'A' | 'C';
+     data_identifier?: number;
+     data_group_id?: number;
+     forceStrokeColor?: boolean | string;
+@@ -27,6 +28,7 @@ export default class CanvasProvider {
+     private option_canvas;
+     private render_canvas;
+     private render_text;
++    private profile;
+     private GL;
+     private GR;
+     private G_BACK;
+@@ -86,6 +88,7 @@ export default class CanvasProvider {
+     private parseDRCS;
+     private renderCharacter;
+     private renderFont;
++    private isRubyMode;
+     private renderPath;
+     private getOrnColorCode;
+     private static getRGBAColorCode;
+diff --git a/node_modules/aribb24.js/d.ts/canvas-renderer.d.ts b/node_modules/aribb24.js/d.ts/canvas-renderer.d.ts
+index 0bcf52d..dea8bdc 100644
+--- a/node_modules/aribb24.js/d.ts/canvas-renderer.d.ts
++++ b/node_modules/aribb24.js/d.ts/canvas-renderer.d.ts
+@@ -1,6 +1,7 @@
+ export interface RendererOption {
+     width?: number;
+     height?: number;
++    profile?: 'A' | 'C';
+     data_identifier?: number;
+     data_group_id?: number;
+     forceStrokeColor?: boolean | string;
 diff --git a/node_modules/aribb24.js/src/canvas-provider.ts b/node_modules/aribb24.js/src/canvas-provider.ts
-index 24142ff..46af1d5 100644
+index 24142ff..e9ff8df 100644
 --- a/node_modules/aribb24.js/src/canvas-provider.ts
 +++ b/node_modules/aribb24.js/src/canvas-provider.ts
 @@ -19,6 +19,7 @@ import { PathElement } from './constants/mapping/additional-symbols-glyph'
@@ -10,7 +50,100 @@ index 24142ff..46af1d5 100644
  
  const SIZE_MAGNIFICATION = 2; // 奇数の height 時に SSZ で改行を行う場合があるため、全体をN倍して半分サイズに備える
  let EMBEDDED_GLYPH: Map<string, PathElement> | null = null;
-@@ -411,6 +412,18 @@ export default class CanvasProvider {
+@@ -27,6 +28,7 @@ export interface ProviderOption {
+   canvas?: HTMLCanvasElement,
+   width?: number,
+   height?: number,
++  profile?: 'A' | 'C',
+   data_identifier?: number,
+   data_group_id?: number,
+   forceStrokeColor?: boolean | string,
+@@ -56,6 +58,8 @@ export default class CanvasProvider {
+   private render_canvas: HTMLCanvasElement | null = null
+   private render_text: string = '';
+ 
++  private profile: 'A' | 'C' = 'A'
++
+   private GL: number = 0
+   private GR: number = 2
+   private G_BACK: (ALPHABET_ENTRY | undefined)[] = [
+@@ -137,20 +141,29 @@ export default class CanvasProvider {
+     EMBEDDED_GLYPH = embeded;
+   }
+ 
+-  private initialize(): void {
++  private initialize(profile: 'A' | 'C'): void {
+     // デフォルト値の対応を上記ととること
+     this.render_canvas = null
+     this.option_canvas = null
+     this.render_text = ''
+ 
++    this.profile = profile
++
+     this.GL = 0
+     this.GR = 2
+-    this.G_BACK = [
+-      G_SET_BY_ALPHABET.get(ALPHABETS.KANJI),
+-      G_SET_BY_ALPHABET.get(ALPHABETS.ASCII),
+-      G_SET_BY_ALPHABET.get(ALPHABETS.HIRAGANA),
+-      G_DRCS_BY_ALPHABET.get(ALPHABETS.MACRO)
+-    ]
++    this.G_BACK = profile === 'C'
++      ? [
++        G_DRCS_BY_ALPHABET.get(ALPHABETS.DRCS_1),
++        G_SET_BY_ALPHABET.get(ALPHABETS.ASCII),
++        G_SET_BY_ALPHABET.get(ALPHABETS.KANJI),
++        G_DRCS_BY_ALPHABET.get(ALPHABETS.MACRO)
++      ]
++      : [
++        G_SET_BY_ALPHABET.get(ALPHABETS.KANJI),
++        G_SET_BY_ALPHABET.get(ALPHABETS.ASCII),
++        G_SET_BY_ALPHABET.get(ALPHABETS.HIRAGANA),
++        G_DRCS_BY_ALPHABET.get(ALPHABETS.MACRO)
++      ]
+     this.DRCS_mapping = new Map([
+       [ALPHABETS.DRCS_0, new Map<number, Uint8Array>()],
+       [ALPHABETS.DRCS_1, new Map<number, Uint8Array>()],
+@@ -170,19 +183,19 @@ export default class CanvasProvider {
+       [ALPHABETS.DRCS_15, new Map<number, Uint8Array>()],
+     ])
+ 
+-    this.purpose_width = 960  * SIZE_MAGNIFICATION
+-    this.purpose_height = 540 * SIZE_MAGNIFICATION
++    this.purpose_width = (profile === 'C' ? 320 : 960) * SIZE_MAGNIFICATION
++    this.purpose_height = (profile === 'C' ? 180 : 540) * SIZE_MAGNIFICATION
+ 
+-    this.swf_x = 960 * SIZE_MAGNIFICATION
+-    this.swf_y = 540 * SIZE_MAGNIFICATION
+-    this.sdf_x = 960 * SIZE_MAGNIFICATION
+-    this.sdf_y = 540 * SIZE_MAGNIFICATION
++    this.swf_x = (profile === 'C' ? 320 : 960) * SIZE_MAGNIFICATION
++    this.swf_y = (profile === 'C' ? 180 : 540) * SIZE_MAGNIFICATION
++    this.sdf_x = (profile === 'C' ? 320 : 960) * SIZE_MAGNIFICATION
++    this.sdf_y = (profile === 'C' ? 180 : 540) * SIZE_MAGNIFICATION
+     this.sdp_x = 0   * SIZE_MAGNIFICATION
+     this.sdp_y = 0   * SIZE_MAGNIFICATION
+-    this.ssm_x = 36  * SIZE_MAGNIFICATION
+-    this.ssm_y = 36  * SIZE_MAGNIFICATION
+-    this.shs = 4  * SIZE_MAGNIFICATION
+-    this.svs = 24 * SIZE_MAGNIFICATION
++    this.ssm_x = (profile === 'C' ? 18 : 36) * SIZE_MAGNIFICATION
++    this.ssm_y = (profile === 'C' ? 18 : 36) * SIZE_MAGNIFICATION
++    this.shs = (profile === 'C' ? 2 : 4) * SIZE_MAGNIFICATION
++    this.svs = (profile === 'C' ? 6 : 24) * SIZE_MAGNIFICATION
+     this.text_size_x = 1
+     this.text_size_y = 1
+     this.position_x = -1
+@@ -309,7 +322,7 @@ export default class CanvasProvider {
+   }
+ 
+   public render(option?: ProviderOption): ProviderResult | null {
+-    this.initialize()
++    this.initialize(option?.profile ?? 'A')
+ 
+     this.option_canvas = option?.canvas ?? null
+ 
+@@ -411,6 +424,18 @@ export default class CanvasProvider {
    }
  
    private parseText(begin: number, end: number): void {
@@ -29,7 +162,7 @@ index 24142ff..46af1d5 100644
      while (begin < end) {
        if (0x20 < this.pes[begin] && this.pes[begin] < 0x7F) {
          let key = 0
-@@ -421,6 +434,7 @@ export default class CanvasProvider {
+@@ -421,6 +446,7 @@ export default class CanvasProvider {
            key <<= 8
            key |= this.pes[begin + i] & 0x7F
          }
@@ -37,7 +170,7 @@ index 24142ff..46af1d5 100644
          this.renderCharacter(key, entry)
          begin += entry.bytes
        } else if (0xA0 < this.pes[begin] && this.pes[begin] < 0xFF) {
-@@ -432,6 +446,7 @@ export default class CanvasProvider {
+@@ -432,6 +458,7 @@ export default class CanvasProvider {
            key <<= 8
            key |= this.pes[begin + i] & 0x7F
          }
@@ -45,7 +178,7 @@ index 24142ff..46af1d5 100644
          this.renderCharacter(key, entry)
          begin += entry.bytes
        } else if (this.pes[begin] === JIS8.NUL) {
-@@ -456,6 +471,7 @@ export default class CanvasProvider {
+@@ -456,6 +483,7 @@ export default class CanvasProvider {
          }
          begin += 1
        } else if (this.pes[begin] === JIS8.APR) {
@@ -53,7 +186,7 @@ index 24142ff..46af1d5 100644
          this.move_newline()
          begin += 1
        } else if (this.pes[begin] === JIS8.LS1) {
-@@ -479,6 +495,7 @@ export default class CanvasProvider {
+@@ -479,6 +507,7 @@ export default class CanvasProvider {
            key <<= 8
            key |= this.pes[(begin + 1) + i] & 0x7F
          }
@@ -61,7 +194,7 @@ index 24142ff..46af1d5 100644
          this.renderCharacter(key, entry)
          begin += 1 + entry.bytes
        } else if (this.pes[begin] === JIS8.ESC) {
-@@ -524,6 +541,7 @@ export default class CanvasProvider {
+@@ -524,6 +553,7 @@ export default class CanvasProvider {
            return
          }
        } else if (this.pes[begin] === JIS8.APS) {
@@ -69,7 +202,7 @@ index 24142ff..46af1d5 100644
          const P1 = this.pes[begin + 1] & 0x3F
          const P2 = this.pes[begin + 2] & 0x3F
          this.move_absolute_pos(P2, P1)
-@@ -537,6 +555,7 @@ export default class CanvasProvider {
+@@ -537,6 +567,7 @@ export default class CanvasProvider {
            key <<= 8
            key |= this.pes[(begin + 1) + i] & 0x7F
          }
@@ -77,7 +210,7 @@ index 24142ff..46af1d5 100644
          this.renderCharacter(key, entry)
          begin += 1 + entry.bytes
        } else if (this.pes[begin] === JIS8.RS) {
-@@ -547,7 +566,14 @@ export default class CanvasProvider {
+@@ -547,7 +578,14 @@ export default class CanvasProvider {
          const entry = G_SET_BY_ALPHABET.get(ALPHABETS.KANJI)
          if(!entry){ return }
  
@@ -92,7 +225,26 @@ index 24142ff..46af1d5 100644
          begin += 1
        } else if (this.pes[begin] === JIS8.DEL) {
          begin += 1
-@@ -749,6 +775,10 @@ export default class CanvasProvider {
+@@ -656,7 +694,17 @@ export default class CanvasProvider {
+               P1 += this.pes[index] & 0x0F
+               index++
+             }
+-            if(P1 === 5){
++            if(this.profile === 'C'){
++              // Profile C の書式は SWF の指定値にかかわらず規定値へ戻る
++              this.swf_x = 320 * SIZE_MAGNIFICATION
++              this.swf_y = 180 * SIZE_MAGNIFICATION
++              this.sdf_x = 320 * SIZE_MAGNIFICATION
++              this.sdf_y = 180 * SIZE_MAGNIFICATION
++              this.ssm_x = 18 * SIZE_MAGNIFICATION
++              this.ssm_y = 18 * SIZE_MAGNIFICATION
++              this.shs = 2 * SIZE_MAGNIFICATION
++              this.svs = 6 * SIZE_MAGNIFICATION
++            }else if(P1 === 5){
+               this.swf_x = 1920 * SIZE_MAGNIFICATION
+               this.swf_y = 1080 * SIZE_MAGNIFICATION
+             }else if(P1 === 7){
+@@ -749,6 +797,10 @@ export default class CanvasProvider {
              }
              this.sdp_x = P1 * SIZE_MAGNIFICATION
              this.sdp_y = P2 * SIZE_MAGNIFICATION
@@ -103,7 +255,7 @@ index 24142ff..46af1d5 100644
              break
            }else if(this.pes[last] === CSI.ACPS){
              let index = begin + 1
-@@ -821,6 +851,7 @@ export default class CanvasProvider {
+@@ -821,6 +873,7 @@ export default class CanvasProvider {
          return
        }
      }
@@ -111,7 +263,7 @@ index 24142ff..46af1d5 100644
    }
  
    private parseDRCS(bytes: number, begin: number, end: number){
-@@ -991,6 +1022,16 @@ export default class CanvasProvider {
+@@ -991,6 +1044,16 @@ export default class CanvasProvider {
  
        this.renderFont(character)
  
@@ -128,6 +280,41 @@ index 24142ff..46af1d5 100644
        this.move_relative_pos(1, 0)
      }else if(entry.alphabet === ALPHABETS.MACRO) {
        if (key === 0x60){
+@@ -1215,7 +1278,7 @@ export default class CanvasProvider {
+     character += this.non_spacing;
+     this.non_spacing = '';
+ 
+-    if (!(this.text_size_x === 0.5 && this.text_size_y === 0.5 && (HIRAGANA_MAPPING.includes(character) || KATAKANA_MAPPING.includes(character)))) {
++    if (!(this.isRubyMode() && (HIRAGANA_MAPPING.includes(character) || KATAKANA_MAPPING.includes(character)))) {
+       this.render_text += character
+     }
+ 
+@@ -1282,6 +1345,13 @@ export default class CanvasProvider {
+     ctx.setTransform(1, 0, 0, 1, 0, 0);
+   }
+ 
++  private isRubyMode(): boolean {
++    return (
++      (this.text_size_x === 0.5 && this.text_size_y === 0.5) ||
++      (this.profile === 'A' && this.ssm_x === 18 * SIZE_MAGNIFICATION && this.ssm_y === 18 * SIZE_MAGNIFICATION)
++    )
++  }
++
+   private renderPath(viewBox: [number, number, number, number], path: string): void {
+     if (!this.render_canvas) { return; }
+ 
+diff --git a/node_modules/aribb24.js/src/canvas-renderer.ts b/node_modules/aribb24.js/src/canvas-renderer.ts
+index 9124671..2f55010 100644
+--- a/node_modules/aribb24.js/src/canvas-renderer.ts
++++ b/node_modules/aribb24.js/src/canvas-renderer.ts
+@@ -8,6 +8,7 @@ const DETECT_TIMEUPDATE_SEEKING_RANGE = 1;
+ export interface RendererOption {
+   width?: number,
+   height?: number,
++  profile?: 'A' | 'C',
+   data_identifier?: number,
+   data_group_id?: number,
+   forceStrokeColor?: boolean | string,
 diff --git a/node_modules/aribb24.js/src/html-provider-experimental.ts b/node_modules/aribb24.js/src/html-provider-experimental.ts
 index fce514f..24bec4b 100644
 --- a/node_modules/aribb24.js/src/html-provider-experimental.ts

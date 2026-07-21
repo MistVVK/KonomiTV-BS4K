@@ -1,7 +1,7 @@
 
 import assert from 'assert';
 
-import { CanvasRenderer } from 'aribb24.js';
+import CanvasRenderer from 'aribb24.js/src/canvas-renderer';
 import DPlayer, { DPlayerType } from 'dplayer';
 import Hls, { ErrorDetails } from 'hls.js';
 import mpegts from 'mpegts.js';
@@ -66,6 +66,9 @@ class PlayerController {
     // 再生モード (Live: ライブ視聴, Video: ビデオ視聴)
     private readonly playback_mode: 'Live' | 'Video';
 
+    // ARIB STD-B24 字幕の符号化プロファイル (A: フルセグ / C: ワンセグ)
+    private aribb24_profile: 'A' | 'C' = 'A';
+
     // 画質プロファイル (Wi-Fi 回線時 / モバイル回線時)
     // デフォルトは自動判定だが、ユーザーによって手動変更されうる
     private quality_profile_type: 'Wi-Fi' | 'Cellular';
@@ -96,6 +99,9 @@ class PlayerController {
 
     // fMP4 録画のARIB字幕先読みハンドラーを解除する関数
     private recorded_arib_subtitle_cancel: (() => void) | null = null;
+
+    // 画質切り替え後の video 要素へ fMP4 録画のARIB字幕先読みハンドラーを付け直す関数
+    private recorded_arib_subtitle_restart: (() => void) | null = null;
 
     // 録画を末尾まで自然に再生し終えたかどうか
     // ended の多重通知防止と、完走後の視聴履歴を先頭付近へ戻す判断に共用する
@@ -416,6 +422,10 @@ class PlayerController {
             this.playback_mode === 'Live' &&
             channels_store.channel.current.display_channel_id.startsWith('bs4k')
         );
+        const is_oneseg_playback = this.playback_mode === 'Live' ?
+            channels_store.channel.current.is_oneseg === true :
+            player_store.recorded_program.channel?.is_oneseg === true;
+        this.aribb24_profile = is_oneseg_playback ? 'C' : 'A';
 
         // 文字スーパーの表示設定
         // ライブ視聴とビデオ視聴で設定キーが異なる
@@ -1039,16 +1049,8 @@ class PlayerController {
 
         // DPlayer の配布バンドルにはビルド時点の aribb24.js が内包されており、KonomiTV 側で適用した
         // aribb24.js のパッチはそのままでは字幕レンダラーへ反映されない。
-        // DPlayer 内蔵レンダラーを破棄し、JIS X 0213:2004 に対応した外部のレンダラーへ差し替える。
-        const aribb24_options = this.player.options.pluginOptions.aribb24!;
-        this.player.plugins.aribb24Caption?.dispose();
-        const aribb24_caption = new CanvasRenderer({
-            ...aribb24_options,
-            data_identifier: 0x80,
-        });
-        aribb24_caption.attachMedia(this.player.video);
-        aribb24_caption.show();
-        this.player.plugins.aribb24Caption = aribb24_caption;
+        // DPlayer 内蔵レンダラーを破棄し、Profile C と JIS X 0213:2004 に対応した外部レンダラーへ差し替える。
+        this.replaceARIBB24Renderers();
 
         // fMP4 経路ではARIB生字幕を映像から分離し、シーク復元点と後続12秒を先読みする。
         if (
@@ -1061,57 +1063,75 @@ class PlayerController {
             if (arib_track !== undefined) {
                 const requested_ranges = new Set<number>();
                 let is_fetching = false;
+                let restore_after_fetch = false;
+                let subtitle_generation = 0;
                 const fetch_arib_subtitle = async (restore: boolean = false): Promise<void> => {
-                    if (this.player === null || is_fetching === true) return;
+                    if (this.player === null) return;
+                    if (is_fetching === true) {
+                        // 画質切り替えやシーク中なら、進行中の取得完了後に新しい再生位置から状態を復元する。
+                        restore_after_fetch ||= restore;
+                        return;
+                    }
                     const range_start = Math.max(0, Math.floor(this.player.video.currentTime / 6) * 6);
                     if (restore === true) requested_ranges.clear();
                     if (requested_ranges.has(range_start)) return;
                     is_fetching = true;
-                    const response = await APIClient.get<{
-                        restore_packets: {pts: number; data: string}[];
-                        packets: {pts: number; data: string}[];
-                    }>(`/streams/video/${player_store.recorded_program.id}/subtitle/${arib_track.index}/arib`, {
-                        params: {start_time: range_start, end_time: range_start + 12},
-                    });
-                    if (response.type === 'success') {
-                        const decode = (data: string): Uint8Array => Uint8Array.from(atob(data), (character) =>
-                            character.charCodeAt(0),
-                        );
-                        // 復元packetは録画先頭からの管理データ・DRCS・表示状態を含むため、
-                        // 初回とseek時だけ投入する。通常先読みで再投入すると字幕状態が巻き戻る。
-                        const packets = restore === true ?
-                            [...response.data.restore_packets, ...response.data.packets] : response.data.packets;
-                        for (const packet of packets) {
-                            aribb24_caption.pushRawData(packet.pts, decode(packet.data));
+                    const fetch_generation = subtitle_generation;
+                    try {
+                        const response = await APIClient.get<{
+                            restore_packets: {pts: number; data: string}[];
+                            packets: {pts: number; data: string}[];
+                        }>(`/streams/video/${player_store.recorded_program.id}/subtitle/${arib_track.index}/arib`, {
+                            params: {start_time: range_start, end_time: range_start + 12},
+                        });
+                        if (
+                            response.type === 'success' &&
+                            this.player !== null &&
+                            fetch_generation === subtitle_generation
+                        ) {
+                            const decode = (data: string): Uint8Array => Uint8Array.from(atob(data), (character) =>
+                                character.charCodeAt(0),
+                            );
+                            // 復元packetは録画先頭からの管理データ・DRCS・表示状態を含むため、
+                            // 初回とseek時だけ投入する。通常先読みで再投入すると字幕状態が巻き戻る。
+                            const packets = restore === true ?
+                                [...response.data.restore_packets, ...response.data.packets] : response.data.packets;
+                            const aribb24_plugins = this.player.plugins as unknown as {aribb24Caption?: CanvasRenderer};
+                            for (const packet of packets) {
+                                aribb24_plugins.aribb24Caption?.pushRawData(packet.pts, decode(packet.data));
+                            }
+                            requested_ranges.add(range_start);
                         }
-                        requested_ranges.add(range_start);
+                    } finally {
+                        is_fetching = false;
+                        if (restore_after_fetch === true) {
+                            restore_after_fetch = false;
+                            void fetch_arib_subtitle(true);
+                        }
                     }
-                    is_fetching = false;
                 };
-                const timeupdate_handler = () => void fetch_arib_subtitle(false);
-                const seeking_handler = () => void fetch_arib_subtitle(true);
-                this.player.video.addEventListener('timeupdate', timeupdate_handler);
-                this.player.video.addEventListener('seeking', seeking_handler);
-                this.recorded_arib_subtitle_cancel = () => {
-                    this.player?.video.removeEventListener('timeupdate', timeupdate_handler);
-                    this.player?.video.removeEventListener('seeking', seeking_handler);
+                const restore_arib_subtitle = () => {
+                    // 進行中の旧再生位置向け取得が完了しても、新しいレンダラーへ投入しない。
+                    subtitle_generation += 1;
+                    void fetch_arib_subtitle(true);
                 };
-                void fetch_arib_subtitle(true);
+                const restart_arib_subtitle = () => {
+                    if (this.player === null) return;
+                    this.recorded_arib_subtitle_cancel?.();
+                    const video = this.player.video;
+                    const timeupdate_handler = () => void fetch_arib_subtitle(false);
+                    const seeking_handler = restore_arib_subtitle;
+                    video.addEventListener('timeupdate', timeupdate_handler);
+                    video.addEventListener('seeking', seeking_handler);
+                    this.recorded_arib_subtitle_cancel = () => {
+                        video.removeEventListener('timeupdate', timeupdate_handler);
+                        video.removeEventListener('seeking', seeking_handler);
+                    };
+                    restore_arib_subtitle();
+                };
+                this.recorded_arib_subtitle_restart = restart_arib_subtitle;
+                restart_arib_subtitle();
             }
-        }
-
-        // 文字スーパーが有効な場合も同じパッチ済みレンダラーへ差し替える。
-        this.player.plugins.aribb24Superimpose?.dispose();
-        if (aribb24_options.disableSuperimposeRenderer !== true) {
-            const aribb24_superimpose = new CanvasRenderer({
-                ...aribb24_options,
-                data_identifier: 0x81,
-            });
-            aribb24_superimpose.attachMedia(this.player.video);
-            aribb24_superimpose.show();
-            this.player.plugins.aribb24Superimpose = aribb24_superimpose;
-        } else {
-            delete this.player.plugins.aribb24Superimpose;
         }
 
         // デバッグ用にプレイヤーインスタンスも window 直下に入れる
@@ -1477,6 +1497,51 @@ class PlayerController {
 
 
     /**
+     * DPlayer 内蔵の aribb24.js レンダラーを、KonomiTV 側でパッチしたソース版へ差し替える。
+     * ワンセグでは ARIB STD-B24 Profile C、それ以外では Profile A を指定する。
+     */
+    private replaceARIBB24Renderers(): void {
+        assert(this.player !== null);
+
+        const aribb24_options = this.player.options.pluginOptions.aribb24!;
+        const aribb24_plugins = this.player.plugins as unknown as {
+            aribb24Caption?: CanvasRenderer;
+            aribb24Superimpose?: CanvasRenderer;
+        };
+        const is_caption_hidden = this.player.subtitle?.container.classList.contains('dplayer-subtitle-hide') ?? false;
+
+        aribb24_plugins.aribb24Caption?.dispose();
+        const aribb24_caption = new CanvasRenderer({
+            ...aribb24_options,
+            profile: this.aribb24_profile,
+            data_identifier: 0x80,
+        });
+        aribb24_caption.attachMedia(this.player.video);
+        if (is_caption_hidden) {
+            aribb24_caption.hide();
+        } else {
+            aribb24_caption.show();
+        }
+        aribb24_plugins.aribb24Caption = aribb24_caption;
+
+        aribb24_plugins.aribb24Superimpose?.dispose();
+        if (aribb24_options.disableSuperimposeRenderer !== true) {
+            const aribb24_superimpose = new CanvasRenderer({
+                ...aribb24_options,
+                profile: this.aribb24_profile,
+                data_identifier: 0x81,
+            });
+            aribb24_superimpose.attachMedia(this.player.video);
+            aribb24_superimpose.show();
+            aribb24_plugins.aribb24Superimpose = aribb24_superimpose;
+        } else {
+            delete aribb24_plugins.aribb24Superimpose;
+        }
+
+    }
+
+
+    /**
      * DPlayer に動画再生系のイベントハンドラーを登録する
      * 特にライブ視聴ではここで適切に再生状態の管理 (再生可能かどうか、エラーが発生していないかなど) を行う必要がある
      */
@@ -1563,8 +1628,14 @@ class PlayerController {
 
         // 今回 (DPlayer 初期化直後) と画質切り替え開始時の両方のタイミングで実行する必要がある処理
         // mpegts.js などの DPlayer のプラグインは画質切り替え時に一旦破棄されるため、再度イベントハンドラーを登録する必要がある
-        const on_init_or_quality_change = async () => {
+        const on_init_or_quality_change = async (is_quality_change: boolean = false) => {
             assert(this.player !== null);
+
+            // 画質切り替え時は DPlayer が内蔵字幕レンダラーを再生成するため、再度パッチ済み版へ差し替える。
+            if (is_quality_change) {
+                this.replaceARIBB24Renderers();
+                this.recorded_arib_subtitle_restart?.();
+            }
 
             // ローディング中の背景写真をランダムに変更
             player_store.background_url = PlayerUtils.generatePlayerBackgroundURL();
@@ -1897,7 +1968,7 @@ class PlayerController {
         on_init_or_quality_change();
 
         // 画質切り替え開始時のイベント
-        this.player.on('quality_start', on_init_or_quality_change);
+        this.player.on('quality_start', () => on_init_or_quality_change(true));
 
         // 動画の統計情報の表示/非表示を切り替える隠しコマンドのイベントハンドラーを登録
         // iOS / iPadOS Safari では DPlayer 側の contextmenu が長押ししても発火しないため、代替の表示手段として用意
@@ -3577,6 +3648,7 @@ class PlayerController {
             this.recorded_arib_subtitle_cancel();
             this.recorded_arib_subtitle_cancel = null;
         }
+        this.recorded_arib_subtitle_restart = null;
         this.live_media_info = null;
         window.clearTimeout(this.watched_history_threshold_timer_id);
         window.clearTimeout(this.player_control_ui_hide_timer_id);
