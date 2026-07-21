@@ -34,6 +34,7 @@ from app.metadata.RecordedAnalysisPlan import (
     ContentState,
     RecordedAnalysisPlan,
 )
+from app.metadata.RecordedSeriesResolver import RecordedSeriesResolver
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.models.Channel import Channel
 from app.models.RecordedProgram import RecordedProgram
@@ -898,7 +899,7 @@ class RecordedScanTask:
 
                 # DB に永続化
                 # メタデータ解析後の最新のデータベース情報を使う
-                saved_recorded_video_id = await self.__saveRecordedMetadataToDB(
+                saved_recorded_video_id, saved_recorded_program_id = await self.__saveRecordedMetadataToDB(
                     recorded_program,
                     existing_db_recorded_video_after_analyze,
                     content_state,
@@ -910,6 +911,17 @@ class RecordedScanTask:
                 # 録画中は確定解析を行わず、録画完了後の変更イベントで改めて計画する。
                 if recorded_program.recorded_video.status != 'Recorded':
                     return
+
+                # 録画スキャンを外部API待ちで止めないよう、DB保存済みIDだけを専用ワーカーへ渡す。
+                # 任意機能の設定ファイル破損やキュー障害で、後続の索引・CM解析まで中断しない。
+                try:
+                    await RecordedSeriesResolver.enqueue(saved_recorded_program_id, input_changed=True)
+                except Exception as ex:
+                    logging.error(
+                        f'{file_path}: Failed to enqueue recorded series resolution. '
+                        f'recorded_program_id: {saved_recorded_program_id}',
+                        exc_info=ex,
+                    )
 
                 # サムネイルだけは直列処理に含めず、従来どおりバックグラウンドで生成する。
                 # CMは索引完了後に直列実行するため、このタスクへ混在させない。
@@ -1119,7 +1131,7 @@ class RecordedScanTask:
         recorded_program: schemas.RecordedProgram,
         existing_db_recorded_video: RecordedVideo | None,
         content_state: ContentState,
-    ) -> int:
+    ) -> tuple[int, int]:
         """
         録画ファイルのメタデータ解析結果を DB に保存する
         既存レコードがある場合は更新し、ない場合は新規作成する
@@ -1132,7 +1144,7 @@ class RecordedScanTask:
             content_state: DB保存時点で確定したファイル内容状態。
 
         Returns:
-            int: DB 保存後に確定した RecordedVideo の ID。
+            DB 保存後に確定した RecordedVideo ID と RecordedProgram ID。
         """
 
         # トランザクション配下に入れることでパフォーマンスが向上する
@@ -1212,12 +1224,30 @@ class RecordedScanTask:
             db_recorded_program.network_id = recorded_program.network_id
             db_recorded_program.service_id = recorded_program.service_id
             db_recorded_program.event_id = recorded_program.event_id
-            db_recorded_program.series_id = recorded_program.series_id
-            db_recorded_program.series_broadcast_period_id = recorded_program.series_broadcast_period_id
             db_recorded_program.title = recorded_program.title
-            db_recorded_program.series_title = recorded_program.series_title
-            db_recorded_program.episode_number = recorded_program.episode_number
-            db_recorded_program.subtitle = recorded_program.subtitle
+            # SeriesResolverが所有する確定済み関連付けは、ファイル内容が変わった場合も保持する。
+            # Resolverはメタデータ保存後に非同期で再判定するため、ここで先に消すと同一fingerprintの
+            # cache hitや判定失敗時に関連付けだけが失われる。Analyzerの初期値を使うのは新規作成時だけ。
+            if existing_db_recorded_video is None:
+                db_recorded_program.series_id = recorded_program.series_id
+                db_recorded_program.series_broadcast_period_id = recorded_program.series_broadcast_period_id
+                db_recorded_program.series_title = recorded_program.series_title
+                db_recorded_program.episode_number = recorded_program.episode_number
+                db_recorded_program.subtitle = recorded_program.subtitle
+            else:
+                if db_recorded_program.series_id is None and recorded_program.series_id is not None:
+                    db_recorded_program.series_id = recorded_program.series_id
+                if (
+                    db_recorded_program.series_broadcast_period_id is None and
+                    recorded_program.series_broadcast_period_id is not None
+                ):
+                    db_recorded_program.series_broadcast_period_id = recorded_program.series_broadcast_period_id
+                if db_recorded_program.series_title is None and recorded_program.series_title is not None:
+                    db_recorded_program.series_title = recorded_program.series_title
+                if db_recorded_program.episode_number is None and recorded_program.episode_number is not None:
+                    db_recorded_program.episode_number = recorded_program.episode_number
+                if db_recorded_program.subtitle is None and recorded_program.subtitle is not None:
+                    db_recorded_program.subtitle = recorded_program.subtitle
             db_recorded_program.description = recorded_program.description
             db_recorded_program.detail = recorded_program.detail
             db_recorded_program.start_time = recorded_program.start_time
@@ -1288,7 +1318,7 @@ class RecordedScanTask:
                 db_recorded_video.thumbnail_info = None
             await db_recorded_video.save()
 
-            return db_recorded_video.id
+            return db_recorded_video.id, db_recorded_program.id
 
 
     async def __runThumbnailGeneration(

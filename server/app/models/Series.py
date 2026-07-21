@@ -24,6 +24,8 @@ class Series(TortoiseModel):
         table: str = 'series'
 
     id = fields.IntField(pk=True)
+    canonical_key = cast(TortoiseField[str | None], fields.CharField(64, null=True, unique=True))
+    wikipedia_page_id = cast(TortoiseField[int | None], fields.IntField(null=True, unique=True))
     title = fields.TextField()
     description = fields.TextField()
     genres = cast(TortoiseField[list[Genre]], fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore

@@ -27,6 +27,7 @@ from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
+from app.metadata.RecordedSeriesResolver import RecordedSeriesResolver
 from app.models.Channel import Channel
 from app.models.Program import Program
 from app.routers import (
@@ -40,6 +41,7 @@ from app.routers import (
     MaintenanceRouter,
     NiconicoRouter,
     ProgramsRouter,
+    RecordedSeriesRouter,
     RecordingPresetsRouter,
     ReservationConditionsRouter,
     ReservationsRouter,
@@ -88,6 +90,7 @@ app.include_router(VideoStreamsRouter.router)
 app.include_router(ReservationsRouter.router)
 app.include_router(ReservationConditionsRouter.router)
 app.include_router(RecordingPresetsRouter.router)
+app.include_router(RecordedSeriesRouter.router)
 app.include_router(CapturesRouter.router)
 app.include_router(CMAnalysisRouter.router)
 app.include_router(DataBroadcastingRouter.router)
@@ -260,6 +263,9 @@ async def Startup():
     # 番組情報を更新
     await Program.update()
 
+    # 録画スキャンとは分離したシリーズ判定ワーカーを開始する。
+    await RecordedSeriesResolver.start()
+
     # 全てのチャンネル&品質のライブストリームを初期化する
     for channel in await Channel.filter(is_watchable=True).order_by('channel_number'):
         for quality in QUALITY:
@@ -328,6 +334,9 @@ async def Shutdown():
     if recorded_scan_task is not None:
         await recorded_scan_task.stop()
         recorded_scan_task = None
+
+    # DB接続が閉じられる前にシリーズ判定ワーカーと一括判定を停止する。
+    await RecordedSeriesResolver.stop()
 
     # DB接続が閉じられる前に、HTTP接続から分離した手動CM再判定を中断・回収する。
     await CMAnalysisTaskManager.stop()

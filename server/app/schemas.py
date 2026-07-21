@@ -282,7 +282,8 @@ class AnalysisTaskExecution(BaseModel):
     recorded_video_id: int | None
     task_type: Literal[
         'RecordedScan', 'MetadataAnalysis', 'PlaybackIndex', 'ThumbnailGeneration', 'CMAnalysis',
-        'CMLogoGeneration', 'BatchScan', 'BatchMetadataReanalysis', 'BatchCMAnalysis', 'BackgroundAnalysis',
+        'CMLogoGeneration', 'BatchScan', 'BatchMetadataReanalysis', 'BatchCMAnalysis',
+        'BatchSeriesResolution', 'BackgroundAnalysis',
     ]
     status: Literal['Queued', 'Running', 'Succeeded', 'Failed', 'Interrupted', 'Skipped']
     trigger: Literal['Automatic', 'Manual', 'Maintenance', 'StartupBackfill']

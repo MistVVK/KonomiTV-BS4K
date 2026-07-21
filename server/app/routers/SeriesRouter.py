@@ -34,18 +34,23 @@ async def SeriesListAPI(
     page (ページ番号) には 1 以上の整数を指定する。
     """
 
-    series_list = await Series.all() \
-        .select_related('broadcast_periods') \
-        .select_related('broadcast_periods__channel') \
-        .select_related('broadcast_periods__recorded_programs') \
-        .select_related('broadcast_periods__recorded_programs__recorded_video') \
-        .select_related('broadcast_periods__recorded_programs__channel') \
+    visible_series_query = Series.filter(
+        broadcast_periods__recorded_programs__recorded_video__status='Recorded',
+    ).distinct()
+    series_list = await visible_series_query \
+        .prefetch_related(
+            'broadcast_periods__channel',
+            'broadcast_periods__recorded_programs__recorded_video',
+            'broadcast_periods__recorded_programs__channel',
+        ) \
         .order_by('-updated_at' if order == 'desc' else 'updated_at') \
         .offset((page - 1) * PAGE_SIZE) \
         .limit(PAGE_SIZE) \
 
     return {
-        'total': await Series.all().count(),
+        # QuerySet.count() は利用中の Tortoise ORM 版で distinct を引き継がないため、
+        # reverse joinの録画数ではなくdistinctなSeries ID数を数える。
+        'total': len(await visible_series_query.values_list('id', flat=True)),
         'series_list': series_list,
     }
 
@@ -74,27 +79,24 @@ async def SeriesSearchAPI(
 
     # 検索条件を構築
     # title または description のいずれかに部分一致するレコードを検索
-    series_list = await Series.all() \
-        .select_related('broadcast_periods') \
-        .select_related('broadcast_periods__channel') \
-        .select_related('broadcast_periods__recorded_programs') \
-        .select_related('broadcast_periods__recorded_programs__recorded_video') \
-        .select_related('broadcast_periods__recorded_programs__channel') \
-        .filter(
-            Q(title__icontains=query) |
-            Q(description__icontains=query)
+    visible_series_query = Series.filter(
+        broadcast_periods__recorded_programs__recorded_video__status='Recorded',
+    ).filter(
+        Q(title__icontains=query) |
+        Q(description__icontains=query)
+    ).distinct()
+    series_list = await visible_series_query \
+        .prefetch_related(
+            'broadcast_periods__channel',
+            'broadcast_periods__recorded_programs__recorded_video',
+            'broadcast_periods__recorded_programs__channel',
         ) \
         .order_by('-updated_at' if order == 'desc' else 'updated_at') \
         .offset((page - 1) * PAGE_SIZE) \
         .limit(PAGE_SIZE)
 
     # 検索条件に一致する総件数を取得
-    total = await Series.all() \
-        .filter(
-            Q(title__icontains=query) |
-            Q(description__icontains=query)
-        ) \
-        .count()
+    total = len(await visible_series_query.values_list('id', flat=True))
 
     return {
         'total': total,
@@ -115,12 +117,14 @@ async def SeriesAPI(
     指定されたシリーズ番組を取得する。
     """
 
-    series = await Series.all() \
-        .select_related('broadcast_periods') \
-        .select_related('broadcast_periods__channel') \
-        .select_related('broadcast_periods__recorded_programs') \
-        .select_related('broadcast_periods__recorded_programs__recorded_video') \
-        .select_related('broadcast_periods__recorded_programs__channel') \
+    series = await Series.filter(
+        broadcast_periods__recorded_programs__recorded_video__status='Recorded',
+    ).distinct() \
+        .prefetch_related(
+            'broadcast_periods__channel',
+            'broadcast_periods__recorded_programs__recorded_video',
+            'broadcast_periods__recorded_programs__channel',
+        ) \
         .get_or_none(id=series_id)
     if series is None:
         logging.warning(f'[SeriesRouter][SeriesAPI] Specified series_id was not found. [series_id: {series_id}]')

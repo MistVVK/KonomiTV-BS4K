@@ -270,6 +270,7 @@ class AnalysisTaskTracker:
             'BatchScan': '録画フォルダ一括スキャン',
             'BatchMetadataReanalysis': '全件メタデータ再解析',
             'BatchCMAnalysis': '全件CM再判定',
+            'BatchSeriesResolution': '既存録画シリーズ一括判定',
             'BackgroundAnalysis': 'バックグラウンド一括解析',
         }[task_type]
 
