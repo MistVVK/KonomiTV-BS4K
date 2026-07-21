@@ -424,12 +424,14 @@
                     @update:model-value="server_settings.video.recorded_fmp4_cache_folder = $event === '' ? null : String($event)">
                 </v-text-field>
             </div>
-            <div class="settings__item" v-if="isSectionVisible('storage')">
-                <div class="settings__item-heading">既存録画の再生用インデックスを自動生成する</div>
-                <div class="settings__item-label">
+            <div class="settings__item settings__item--switch" v-if="isSectionVisible('storage')">
+                <label class="settings__item-heading" for="recorded_playback_index_backfill_enabled">
+                    既存録画の再生用インデックスを自動生成する
+                </label>
+                <label class="settings__item-label" for="recorded_playback_index_backfill_enabled">
                     無効にすると、サーバー起動後に既存録画を順番に解析するバックフィルだけを停止します。<br>
                     再生を要求した録画と新しく完了した録画のインデックス生成は、無効時も継続します。設定はサーバー再起動後に反映されます。<br>
-                </div>
+                </label>
                 <v-switch class="settings__item-switch" color="primary"
                     id="recorded_playback_index_backfill_enabled" hide-details
                     v-model="server_settings.video.recorded_playback_index_backfill_enabled">
