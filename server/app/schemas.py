@@ -53,6 +53,16 @@ class LiveChannel(Channel):
     viewer_count: int
     program_present: Program | None
     program_following: Program | None
+    program_present_fallback: LiveProgramPresentFallback | None = None
+
+class LiveProgramPresentFallback(BaseModel):
+    # ワンセグ自身の現在番組が取得できない場合に限り、親フルセグ局の現在番組から生成する表示専用データ
+    ## 番組 ID や放送仕様を含めず、録画予約・番組表などに流用できない最小構造にする
+    title: str
+    description: str
+    start_time: datetime
+    end_time: datetime
+    duration: float
 
 class LiveChannels(BaseModel):
     GR: list[LiveChannel]

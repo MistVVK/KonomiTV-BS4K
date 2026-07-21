@@ -1,6 +1,6 @@
 
 import APIClient from '@/services/APIClient';
-import { IProgram, IProgramDefault } from '@/services/Programs';
+import { IProgram, IProgramDefault, IProgramDisplay } from '@/services/Programs';
 
 
 /** チャンネルタイプの型 */
@@ -54,6 +54,8 @@ export interface ILiveChannel extends IChannel {
     viewer_count: number;
     program_present: IProgram | null;
     program_following: IProgram | null;
+    // ワンセグ自身の現在番組がない場合に、親フルセグ局から借りる表示専用の最小番組情報
+    program_present_fallback: IProgramDisplay | null;
 }
 
 /** 現在放送中のチャンネル情報を表すインターフェイスのデフォルト値 */
@@ -77,6 +79,7 @@ export const ILiveChannelDefault: ILiveChannel = {
     viewer_count: 0,
     program_present: IProgramDefault,
     program_following: IProgramDefault,
+    program_present_fallback: null,
 };
 
 /** すべてのチャンネルタイプの現在放送中のチャンネルの情報を表すインターフェイス */

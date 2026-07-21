@@ -39,9 +39,9 @@
                             </div>
                             <div class="channel__program-present">
                                 <span class="channel__program-present-title"
-                                    v-html="ProgramUtils.decorateProgramInfo(channel.program_present, 'title')">
+                                    v-html="ProgramUtils.decorateProgramInfo(ChannelUtils.getProgramPresentForDisplay(channel), 'title')">
                                 </span>
-                                <span class="channel__program-present-time">{{ProgramUtils.getProgramTime(channel.program_present)}}</span>
+                                <span class="channel__program-present-time">{{ProgramUtils.getProgramTime(ChannelUtils.getProgramPresentForDisplay(channel))}}</span>
                             </div>
                             <div class="channel__program-following">
                                 <div class="channel__program-following-title">
@@ -57,7 +57,7 @@
                             </div>
                             <div class="channel__progressbar">
                                 <div class="channel__progressbar-progress"
-                                    :style="`width:${ProgramUtils.getProgramProgress(channel.program_present)}%;`"></div>
+                                    :style="`width:${ProgramUtils.getProgramProgress(ChannelUtils.getProgramPresentForDisplay(channel))}%;`"></div>
                             </div>
                         </router-link>
                     </div>

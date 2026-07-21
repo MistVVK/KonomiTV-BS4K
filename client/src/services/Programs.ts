@@ -4,19 +4,23 @@ import APIClient from '@/services/APIClient';
 import { ChannelType, IChannel } from '@/services/Channels';
 
 
+/** 番組表示に必要な最小情報を表すインターフェイス */
+export interface IProgramDisplay {
+    title: string;
+    description: string;
+    start_time: string;
+    end_time: string;
+    duration: number;
+}
+
 /** 番組情報を表すインターフェイス */
-export interface IProgram {
+export interface IProgram extends IProgramDisplay {
     id: string;
     channel_id: string;
     network_id: number;
     service_id: number;
     event_id: number;
-    title: string;
-    description: string;
     detail: { [key: string]: string };
-    start_time: string;
-    end_time: string;
-    duration: number;
     is_free: boolean;
     genres: { major: string; middle: string; }[];
     video_type: string | null;

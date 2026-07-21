@@ -1,11 +1,24 @@
 
-import { ChannelType } from '@/services/Channels';
+import type { ChannelType, ILiveChannel } from '@/services/Channels';
+import type { IProgramDisplay } from '@/services/Programs';
 
 
 /**
  * チャンネル周りのユーティリティ
  */
 export class ChannelUtils {
+
+    /**
+     * ライブ画面に表示する現在番組を取得する
+     * @param channel ライブチャンネル情報
+     * @returns ワンセグ自身の現在番組を優先し、なければ親フルセグ局由来の表示専用情報
+     */
+    static getProgramPresentForDisplay(channel: ILiveChannel): IProgramDisplay | null {
+        if (channel.program_present !== null) {
+            return channel.program_present;
+        }
+        return channel.is_oneseg === true ? channel.program_present_fallback ?? null : null;
+    }
 
     /**
      * display_channel_id からチャンネルタイプを取得する

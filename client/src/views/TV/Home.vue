@@ -65,11 +65,11 @@
                                 <div class="channel__program-present">
                                     <div class="channel__program-present-title-wrapper">
                                         <span class="channel__program-present-title"
-                                            v-html="ProgramUtils.decorateProgramInfo(channel.program_present, 'title')"></span>
-                                        <span class="channel__program-present-time">{{ProgramUtils.getProgramTime(channel.program_present)}}</span>
+                                            v-html="ProgramUtils.decorateProgramInfo(ChannelUtils.getProgramPresentForDisplay(channel), 'title')"></span>
+                                        <span class="channel__program-present-time">{{ProgramUtils.getProgramTime(ChannelUtils.getProgramPresentForDisplay(channel))}}</span>
                                     </div>
                                     <span class="channel__program-present-description"
-                                          v-html="ProgramUtils.decorateProgramInfo(channel.program_present, 'description')"></span>
+                                          v-html="ProgramUtils.decorateProgramInfo(ChannelUtils.getProgramPresentForDisplay(channel), 'description')"></span>
                                 </div>
                                 <v-spacer></v-spacer>
                                 <div class="channel__program-following">
@@ -85,7 +85,7 @@
                                 </div>
                                 <div class="channel__progressbar">
                                     <div class="channel__progressbar-progress"
-                                         :style="`width:${ProgramUtils.getProgramProgress(channel.program_present)}%;`"></div>
+                                         :style="`width:${ProgramUtils.getProgramProgress(ChannelUtils.getProgramPresentForDisplay(channel))}%;`"></div>
                                 </div>
                             </router-link>
                             <div class="pinned-container d-flex justify-center align-center w-100"

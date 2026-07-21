@@ -33,6 +33,75 @@ router = APIRouter(
 )
 
 
+def BuildCurrentProgramDisplayMap(pf_programs: list[dict[str, Any]]) -> dict[tuple[int, int], dict[str, Any]]:
+    """
+    現在放送中の番組だけを、表示に必要な最小フィールドへ投影してサービスごとに整理する。
+
+    Args:
+        pf_programs (list[dict[str, Any]]): ChannelsAPI が一括取得した現在・次番組の行。
+
+    Returns:
+        dict[tuple[int, int], dict[str, Any]]: (NID, SID) ごとの現在番組表示データ。
+    """
+
+    current_program_display_map: dict[tuple[int, int], dict[str, Any]] = {}
+
+    for program in pf_programs:
+        # 次番組はフォールバック対象にしない
+        if bool(program['is_present']) is False:
+            continue
+
+        service_key = (int(program['network_id']), int(program['service_id']))
+        # 現在番組が重複している場合も、既存の ChannelsAPI と同じく先に取得された番組を使う
+        ## 親フルセグ局の表示とワンセグ側のフォールバックで異なる番組が表示されるのを防ぐ
+        if service_key in current_program_display_map:
+            continue
+
+        start_time = ParseDatetimeStringToJST(program['start_time'])
+        current_program_display_map[service_key] = {
+            'title': str(program['title']),
+            'description': str(program['description']),
+            'start_time': start_time.isoformat(),
+            'end_time': ParseDatetimeStringToJST(program['end_time']).isoformat(),
+            'duration': float(program['duration']),
+        }
+
+    return current_program_display_map
+
+
+def GetOneSegProgramPresentFallback(
+    channel: Channel,
+    program_present: dict[str, Any] | None,
+    current_program_display_map: dict[tuple[int, int], dict[str, Any]],
+    watchable_service_keys: set[tuple[int, int]],
+) -> dict[str, Any] | None:
+    """
+    ワンセグ自身の現在番組がない場合だけ、親フルセグ局の表示用現在番組を取得する。
+
+    Args:
+        channel (Channel): 対象のワンセグチャンネル。
+        program_present (dict[str, Any] | None): ワンセグ自身の現在番組。
+        current_program_display_map (dict[tuple[int, int], dict[str, Any]]): 現在番組の表示データ。
+        watchable_service_keys (set[tuple[int, int]]): 視聴可能なサービスの (NID, SID)。
+
+    Returns:
+        dict[str, Any] | None: 親フルセグ局由来の表示専用現在番組。補完不要なら None。
+    """
+
+    if channel.is_oneseg is False or program_present is not None:
+        return None
+
+    parent_service_key = (
+        channel.network_id,
+        TSInformation.calculateOneSegParentServiceID(channel.service_id),
+    )
+    if parent_service_key not in watchable_service_keys:
+        return None
+
+    parent_program = current_program_display_map.get(parent_service_key)
+    return dict(parent_program) if parent_program is not None else None
+
+
 async def GetChannel(channel_id: Annotated[str, Path(description='チャンネル ID (id or display_channel_id) 。ex: NID32736-SID1024, gr011')]) -> Channel:
     """ チャンネル ID (id or display_channel_id) からチャンネル情報を取得する """
 
@@ -118,6 +187,11 @@ async def ChannelsAPI():
     # 並行して実行
     channels, pf_programs = await asyncio.gather(*tasks)
 
+    # ワンセグの表示用フォールバックに利用する、現在番組の最小投影と視聴可能サービス一覧を構築する
+    ## どちらもこの API レスポンスの生成中だけ利用し、Program DB や選局処理には反映しない
+    current_program_display_map = BuildCurrentProgramDisplayMap(pf_programs)
+    watchable_service_keys = {(channel.network_id, channel.service_id) for channel in channels}
+
     # レスポンスの雛形
     result = {
         'GR': [],
@@ -158,6 +232,7 @@ async def ChannelsAPI():
             'viewer_count': 0,
             'program_present': None,
             'program_following': None,
+            'program_present_fallback': None,
         }
 
         # チャンネルに紐づく現在と次の番組情報を取得
@@ -237,9 +312,19 @@ async def ChannelsAPI():
                 channel_dict['program_following'].pop('is_present')
                 channel_dict['program_following'].pop('program_order')
 
+        # ワンセグ自身の現在番組がない場合だけ、対応する親フルセグ局の現在番組を表示用に補完する
+        ## program_present 自体は変更せず、録画予約・番組表・選局判定から構造的に分離する
+        channel_dict['program_present_fallback'] = GetOneSegProgramPresentFallback(
+            channel,
+            channel_dict['program_present'],
+            current_program_display_map,
+            watchable_service_keys,
+        )
+
         # サブチャンネル & 現在の番組情報が存在しないなら、表示フラグを False に設定
         ## 現在放送中のサブチャンネルのみをチャンネルリストに表示するような挙動とする
         ## 一般的にサブチャンネルは常に放送されているわけではないため、放送されていない時にチャンネルリストに表示する必要はない
+        ## 表示用フォールバックは、この従来の表示・選局対象判定には利用しない
         if channel_dict['is_subchannel'] is True and channel_dict['program_present'] is None:
             channel_dict['is_display'] = False
 

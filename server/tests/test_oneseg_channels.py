@@ -10,7 +10,7 @@ from app import schemas
 from app.constants import JST
 from app.models.Channel import Channel
 from app.models.Program import Program
-from app.routers import ProgramsRouter
+from app.routers import ChannelsRouter, ProgramsRouter
 from app.utils.TSInformation import TSInformation
 
 
@@ -63,6 +63,135 @@ def test_channel_schema_exposes_derived_is_oneseg_without_database_column() -> N
     assert schemas.Channel.model_validate(channel).is_oneseg is True
 
 
+def test_oneseg_current_program_fallback_contains_display_fields_only() -> None:
+    parent_present_start = datetime(2026, 7, 21, 23, 50, tzinfo=JST)
+    parent_following_start = parent_present_start + timedelta(minutes=45)
+    program_rows = [
+        {
+            'network_id': MX_NETWORK_ID,
+            'service_id': MX_FULLSEG_SERVICE_ID,
+            'title': '親フルセグの現在番組',
+            'description': '表示用に利用する番組概要',
+            'start_time': parent_present_start.isoformat(),
+            'end_time': parent_following_start.isoformat(),
+            'duration': 45 * 60,
+            'is_present': 1,
+        },
+        {
+            'network_id': MX_NETWORK_ID,
+            'service_id': MX_FULLSEG_SERVICE_ID,
+            'title': '重複した親フルセグの現在番組',
+            'description': '既存の親局表示と同じく採用しない',
+            'start_time': (parent_present_start + timedelta(minutes=5)).isoformat(),
+            'end_time': parent_following_start.isoformat(),
+            'duration': 40 * 60,
+            'is_present': 1,
+        },
+        {
+            'network_id': MX_NETWORK_ID,
+            'service_id': MX_FULLSEG_SERVICE_ID,
+            'title': '親フルセグの次番組',
+            'description': '次番組は利用しない',
+            'start_time': parent_following_start.isoformat(),
+            'end_time': (parent_following_start + timedelta(minutes=30)).isoformat(),
+            'duration': 30 * 60,
+            'is_present': 0,
+        },
+    ]
+    current_program_display_map = ChannelsRouter.BuildCurrentProgramDisplayMap(program_rows)
+    oneseg_channel = Channel(
+        id=f'NID{MX_NETWORK_ID}-SID{MX_ONESEG_SERVICE_ID:03d}',
+        display_channel_id='gr094',
+        network_id=MX_NETWORK_ID,
+        service_id=MX_ONESEG_SERVICE_ID,
+        transport_stream_id=MX_NETWORK_ID,
+        remocon_id=9,
+        channel_number='094',
+        type='GR',
+        name='MXワンセグ1',
+        jikkyo_force=None,
+        is_subchannel=False,
+        is_radiochannel=False,
+        is_watchable=True,
+    )
+
+    fallback = ChannelsRouter.GetOneSegProgramPresentFallback(
+        oneseg_channel,
+        None,
+        current_program_display_map,
+        {(MX_NETWORK_ID, MX_FULLSEG_SERVICE_ID), (MX_NETWORK_ID, MX_ONESEG_SERVICE_ID)},
+    )
+
+    assert fallback == {
+        'title': '親フルセグの現在番組',
+        'description': '表示用に利用する番組概要',
+        'start_time': parent_present_start.isoformat(),
+        'end_time': parent_following_start.isoformat(),
+        'duration': 45 * 60,
+    }
+    validated_fallback = schemas.LiveProgramPresentFallback.model_validate(fallback)
+    assert set(validated_fallback.model_dump()) == {
+        'title',
+        'description',
+        'start_time',
+        'end_time',
+        'duration',
+    }
+    # 番組表や通常番組のスキーマには表示専用フィールドを追加しない
+    assert 'program_present_fallback' not in schemas.Program.model_fields
+    assert 'program_present_fallback' not in schemas.TimeTableProgram.model_fields
+
+
+def test_oneseg_current_program_fallback_never_overrides_native_or_uses_unwatchable_parent() -> None:
+    oneseg_channel = Channel(
+        id=f'NID{MX_NETWORK_ID}-SID{MX_ONESEG_SERVICE_ID:03d}',
+        display_channel_id='gr094',
+        network_id=MX_NETWORK_ID,
+        service_id=MX_ONESEG_SERVICE_ID,
+        transport_stream_id=MX_NETWORK_ID,
+        remocon_id=9,
+        channel_number='094',
+        type='GR',
+        name='MXワンセグ1',
+        jikkyo_force=None,
+        is_subchannel=False,
+        is_radiochannel=False,
+        is_watchable=True,
+    )
+    parent_program = {
+        'title': '親フルセグ番組',
+        'description': '親番組概要',
+        'start_time': '2026-07-21T23:50:00+09:00',
+        'end_time': '2026-07-22T00:35:00+09:00',
+        'duration': 2700.0,
+    }
+    current_program_display_map = {(MX_NETWORK_ID, MX_FULLSEG_SERVICE_ID): parent_program}
+
+    # ワンセグ自身の現在番組がある場合は親番組で上書きしない
+    assert ChannelsRouter.GetOneSegProgramPresentFallback(
+        oneseg_channel,
+        {'title': 'ワンセグ自身の現在番組'},
+        current_program_display_map,
+        {(MX_NETWORK_ID, MX_FULLSEG_SERVICE_ID)},
+    ) is None
+
+    # 親フルセグ局が視聴可能チャンネルでなければ、残存DBの番組を表示に流用しない
+    assert ChannelsRouter.GetOneSegProgramPresentFallback(
+        oneseg_channel,
+        None,
+        current_program_display_map,
+        {(MX_NETWORK_ID, MX_ONESEG_SERVICE_ID)},
+    ) is None
+
+    # 同じ親SIDでも別ネットワークの番組は利用しない
+    assert ChannelsRouter.GetOneSegProgramPresentFallback(
+        oneseg_channel,
+        None,
+        {(MX_NETWORK_ID + 1, MX_FULLSEG_SERVICE_ID): parent_program},
+        {(MX_NETWORK_ID, MX_FULLSEG_SERVICE_ID)},
+    ) is None
+
+
 class _FakeChannelQuery:
 
     def __init__(self, channels: list[Channel] | None = None, first_channel: Channel | None = None) -> None:
@@ -74,8 +203,236 @@ class _FakeChannelQuery:
             return self.channels
         return Resolve().__await__()
 
+    def order_by(self, *_fields: str) -> '_FakeChannelQuery':
+        return self
+
     async def first(self) -> Channel | None:
         return self.first_channel
+
+
+class _FakeChannelsAPIConnection:
+
+    def __init__(self, program_rows: list[dict[str, Any]]) -> None:
+        self.program_rows = program_rows
+
+    async def execute_query_dict(
+        self,
+        query: str,
+        values: list[Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        assert 'DENSE_RANK()' in query
+        assert values is not None
+        return [dict(program_row) for program_row in self.program_rows]
+
+
+def _build_channels_api_program_row(
+    channel: Channel,
+    event_id: int,
+    title: str,
+    description: str,
+    start_time: datetime,
+    end_time: datetime,
+    is_present: bool,
+    program_order: int,
+) -> dict[str, Any]:
+    return {
+        'program_order': program_order,
+        'is_present': int(is_present),
+        'id': f'NID{channel.network_id}-SID{channel.service_id:03d}-EID{event_id}',
+        'channel_id': channel.id,
+        'network_id': channel.network_id,
+        'service_id': channel.service_id,
+        'event_id': event_id,
+        'title': title,
+        'description': description,
+        'detail': '{}',
+        'start_time': start_time.isoformat(),
+        'end_time': end_time.isoformat(),
+        'duration': (end_time - start_time).total_seconds(),
+        'is_free': 1,
+        'genres': '[]',
+        'video_type': '1080i',
+        'video_codec': 'MPEG-2',
+        'video_resolution': '1080i',
+        'primary_audio_type': '2/0モード（ステレオ）',
+        'primary_audio_language': '日本語',
+        'primary_audio_sampling_rate': '48kHz',
+        'secondary_audio_type': None,
+        'secondary_audio_language': None,
+        'secondary_audio_sampling_rate': None,
+    }
+
+
+@pytest.mark.parametrize(
+    ('parent_service_id', 'oneseg_service_id', 'is_subchannel', 'expected_is_display'),
+    [
+        (MX_FULLSEG_SERVICE_ID, MX_ONESEG_SERVICE_ID, False, True),
+        (MX_FULLSEG_SERVICE_ID + 1, MX_ADDITIONAL_ONESEG_SERVICE_ID, True, False),
+    ],
+)
+def test_channels_api_adds_oneseg_current_program_as_display_only_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    parent_service_id: int,
+    oneseg_service_id: int,
+    is_subchannel: bool,
+    expected_is_display: bool,
+) -> None:
+    parent_channel = Channel(
+        id=f'NID{MX_NETWORK_ID}-SID{parent_service_id:03d}',
+        display_channel_id='gr091' if is_subchannel is False else 'gr092',
+        network_id=MX_NETWORK_ID,
+        service_id=parent_service_id,
+        transport_stream_id=MX_NETWORK_ID,
+        remocon_id=9,
+        channel_number='091' if is_subchannel is False else '092',
+        type='GR',
+        name='TOKYO MX1' if is_subchannel is False else 'TOKYO MX2',
+        jikkyo_force=None,
+        is_subchannel=False,
+        is_radiochannel=False,
+        is_watchable=True,
+    )
+    oneseg_channel = Channel(
+        id=f'NID{MX_NETWORK_ID}-SID{oneseg_service_id:03d}',
+        display_channel_id='gr094' if is_subchannel is False else 'gr095',
+        network_id=MX_NETWORK_ID,
+        service_id=oneseg_service_id,
+        transport_stream_id=MX_NETWORK_ID,
+        remocon_id=9,
+        channel_number='094' if is_subchannel is False else '095',
+        type='GR',
+        name='MXワンセグ1' if is_subchannel is False else 'MXワンセグ2',
+        jikkyo_force=None,
+        is_subchannel=is_subchannel,
+        is_radiochannel=False,
+        is_watchable=True,
+    )
+    parent_present_start = datetime.now(JST) - timedelta(minutes=10)
+    parent_present_end = parent_present_start + timedelta(minutes=45)
+    parent_program_row = _build_channels_api_program_row(
+        parent_channel,
+        100,
+        '親フルセグの現在番組',
+        'ライブ画面用の番組概要',
+        parent_present_start,
+        parent_present_end,
+        True,
+        1,
+    )
+    connection = _FakeChannelsAPIConnection([parent_program_row])
+
+    monkeypatch.setattr(ChannelsRouter.connections, 'get', lambda _: connection)
+    monkeypatch.setattr(
+        Channel,
+        'filter',
+        classmethod(lambda cls, *args, **kwargs: _FakeChannelQuery(channels=[parent_channel, oneseg_channel])),
+    )
+    monkeypatch.setattr(ChannelsRouter.LiveStream, 'getViewerCount', lambda _: 0)
+
+    result = asyncio.run(ChannelsRouter.ChannelsAPI())
+    oneseg_result = next(channel for channel in result.GR if channel.is_oneseg is True)
+
+    # 実番組と次番組は欠けたままで、ライブ表示専用フィールドだけに親番組を載せる
+    assert oneseg_result.program_present is None
+    assert oneseg_result.program_following is None
+    assert oneseg_result.program_present_fallback is not None
+    assert oneseg_result.program_present_fallback.model_dump() == {
+        'title': '親フルセグの現在番組',
+        'description': 'ライブ画面用の番組概要',
+        'start_time': parent_present_start,
+        'end_time': parent_present_end,
+        'duration': 45 * 60,
+    }
+    # フォールバックによって従来の表示・選局対象判定を変更しない
+    assert oneseg_result.is_display is expected_is_display
+
+
+def test_channels_api_keeps_native_oneseg_present_and_following_programs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent_channel = Channel(
+        id=f'NID{MX_NETWORK_ID}-SID{MX_FULLSEG_SERVICE_ID:03d}',
+        display_channel_id='gr091',
+        network_id=MX_NETWORK_ID,
+        service_id=MX_FULLSEG_SERVICE_ID,
+        transport_stream_id=MX_NETWORK_ID,
+        remocon_id=9,
+        channel_number='091',
+        type='GR',
+        name='TOKYO MX1',
+        jikkyo_force=None,
+        is_subchannel=False,
+        is_radiochannel=False,
+        is_watchable=True,
+    )
+    oneseg_channel = Channel(
+        id=f'NID{MX_NETWORK_ID}-SID{MX_ONESEG_SERVICE_ID:03d}',
+        display_channel_id='gr094',
+        network_id=MX_NETWORK_ID,
+        service_id=MX_ONESEG_SERVICE_ID,
+        transport_stream_id=MX_NETWORK_ID,
+        remocon_id=9,
+        channel_number='094',
+        type='GR',
+        name='MXワンセグ1',
+        jikkyo_force=None,
+        is_subchannel=False,
+        is_radiochannel=False,
+        is_watchable=True,
+    )
+    present_start = datetime.now(JST) - timedelta(minutes=10)
+    present_end = present_start + timedelta(minutes=45)
+    following_end = present_end + timedelta(minutes=30)
+    program_rows = [
+        _build_channels_api_program_row(
+            parent_channel,
+            100,
+            '親フルセグの現在番組',
+            '利用してはいけない親番組',
+            present_start,
+            present_end,
+            True,
+            1,
+        ),
+        _build_channels_api_program_row(
+            oneseg_channel,
+            200,
+            'ワンセグ自身の現在番組',
+            '優先するワンセグ番組',
+            present_start,
+            present_end,
+            True,
+            1,
+        ),
+        _build_channels_api_program_row(
+            oneseg_channel,
+            201,
+            'ワンセグ自身の次番組',
+            '変更しないワンセグ次番組',
+            present_end,
+            following_end,
+            False,
+            2,
+        ),
+    ]
+    connection = _FakeChannelsAPIConnection(program_rows)
+
+    monkeypatch.setattr(ChannelsRouter.connections, 'get', lambda _: connection)
+    monkeypatch.setattr(
+        Channel,
+        'filter',
+        classmethod(lambda cls, *args, **kwargs: _FakeChannelQuery(channels=[parent_channel, oneseg_channel])),
+    )
+    monkeypatch.setattr(ChannelsRouter.LiveStream, 'getViewerCount', lambda _: 0)
+
+    result = asyncio.run(ChannelsRouter.ChannelsAPI())
+    oneseg_result = next(channel for channel in result.GR if channel.is_oneseg is True)
+
+    assert oneseg_result.program_present is not None
+    assert oneseg_result.program_present.title == 'ワンセグ自身の現在番組'
+    assert oneseg_result.program_following is not None
+    assert oneseg_result.program_following.title == 'ワンセグ自身の次番組'
+    assert oneseg_result.program_present_fallback is None
 
 
 class _FakeTransactionContext:
@@ -349,6 +706,7 @@ def test_mirakurun_program_update_saves_oneseg_epg_fixture(monkeypatch: pytest.M
 class _FakeTimeTableConnection:
 
     def __init__(self) -> None:
+        self.program_rows: list[dict[str, Any]] = []
         self.channel_rows = [
             {
                 'id': f'NID{MX_NETWORK_ID}-SID{MX_FULLSEG_SERVICE_ID:03d}',
@@ -394,6 +752,15 @@ class _FakeTimeTableConnection:
             }]
         if 'FROM channels' in query:
             return [dict(channel_row) for channel_row in self.channel_rows]
+        if 'SELECT *' in query and 'FROM programs' in query:
+            selected_channel_ids = {
+                value for value in values or []
+                if isinstance(value, str) and value.startswith('NID')
+            }
+            return [
+                dict(program_row) for program_row in self.program_rows
+                if program_row['channel_id'] in selected_channel_ids
+            ]
         return []
 
 
@@ -427,6 +794,52 @@ def test_timetable_api_filters_gr_and_oneseg_independently(
 
     assert [channel.channel.display_channel_id for channel in result.channels] == [expected_display_channel_id]
     assert result.channels[0].channel.is_oneseg is is_oneseg
+
+
+def test_timetable_api_never_copies_parent_program_to_oneseg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeTimeTableConnection()
+    parent_channel = Channel(**connection.channel_rows[0])
+    program_start = datetime.fromisoformat('2026-07-21T12:00:00+09:00')
+    parent_program_row = _build_channels_api_program_row(
+        parent_channel,
+        300,
+        '番組表にある親フルセグ番組',
+        'ワンセグ番組表にはコピーしない',
+        program_start,
+        program_start + timedelta(minutes=30),
+        True,
+        1,
+    )
+    parent_program_row.pop('is_present')
+    parent_program_row.pop('program_order')
+    connection.program_rows = [parent_program_row]
+
+    monkeypatch.setattr(ProgramsRouter.connections, 'get', lambda _: connection)
+    monkeypatch.setattr(
+        ProgramsRouter,
+        'Config',
+        lambda: SimpleNamespace(general=SimpleNamespace(backend='Mirakurun')),
+    )
+
+    fullseg_result = asyncio.run(ProgramsRouter.TimeTableAPI(
+        start_time=datetime.fromisoformat('2026-07-21T00:00:00+09:00'),
+        end_time=datetime.fromisoformat('2026-07-22T00:00:00+09:00'),
+        channel_type='GR',
+        pinned_channel_ids=None,
+        is_oneseg=False,
+    ))
+    oneseg_result = asyncio.run(ProgramsRouter.TimeTableAPI(
+        start_time=datetime.fromisoformat('2026-07-21T00:00:00+09:00'),
+        end_time=datetime.fromisoformat('2026-07-22T00:00:00+09:00'),
+        channel_type='GR',
+        pinned_channel_ids=None,
+        is_oneseg=True,
+    ))
+
+    assert [program.title for program in fullseg_result.channels[0].programs] == ['番組表にある親フルセグ番組']
+    assert oneseg_result.channels[0].programs == []
 
 
 def test_timetable_api_pinned_channels_override_oneseg_filter(monkeypatch: pytest.MonkeyPatch) -> None:

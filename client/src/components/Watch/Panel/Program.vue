@@ -7,13 +7,13 @@
         </section>
         <section class="program-info">
             <h1 class="program-info__title"
-                v-html="ProgramUtils.decorateProgramInfo(channelsStore.channel.current.program_present, 'title')">
+                v-html="ProgramUtils.decorateProgramInfo(programPresentForDisplay, 'title')">
             </h1>
             <div class="program-info__time">
-                {{ProgramUtils.getProgramTime(channelsStore.channel.current.program_present)}}
+                {{ProgramUtils.getProgramTime(programPresentForDisplay)}}
             </div>
             <div class="program-info__description"
-                v-html="ProgramUtils.decorateProgramInfo(channelsStore.channel.current.program_present, 'description')">
+                v-html="ProgramUtils.decorateProgramInfo(programPresentForDisplay, 'description')">
             </div>
             <div class="program-info__genre-container" v-if="channelsStore.channel.current.program_present?.genres && channelsStore.channel.current.program_present.genres.length > 0">
                 <div class="program-info__genre" :key="genre_index"
@@ -81,7 +81,7 @@
                 </div>
             </div>
             <!-- 録画開始ボタン / 録画状態表示 -->
-            <div v-ripple="isRecordButtonClickable"
+            <div v-if="isOneSegProgramPresentFallbackVisible === false" v-ripple="isRecordButtonClickable"
                 class="program-info__record-button"
                 :class="{
                     'program-info__record-button--disabled': !isEDCBBackend,
@@ -163,6 +163,8 @@
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
+import type { IProgramDisplay } from '@/services/Programs';
+
 import Message from '@/message';
 import Reservations, { IReservation } from '@/services/Reservations';
 import useChannelsStore from '@/stores/ChannelsStore';
@@ -199,6 +201,19 @@ export default defineComponent({
     },
     computed: {
         ...mapStores(useChannelsStore, useServerSettingsStore, useSettingsStore),
+
+        // 実際のワンセグ現在番組がなければ、親フルセグ局由来の最小表示情報を利用する
+        programPresentForDisplay(): IProgramDisplay | null {
+            return ChannelUtils.getProgramPresentForDisplay(this.channelsStore.channel.current);
+        },
+
+        // フォールバックは表示専用のため、録画操作など実番組を必要とする機能を出さない
+        isOneSegProgramPresentFallbackVisible(): boolean {
+            const channel = this.channelsStore.channel.current;
+            return channel.is_oneseg === true &&
+                channel.program_present === null &&
+                (channel.program_present_fallback ?? null) !== null;
+        },
 
         // EDCB バックエンドかどうか
         // サーバー設定がまだ取得されていない場合は EDCB と判定しない

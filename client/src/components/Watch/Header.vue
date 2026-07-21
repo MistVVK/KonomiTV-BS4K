@@ -8,14 +8,14 @@
             :src="`${Utils.api_base_url}/channels/${playback_mode === 'Live' ?
                 channelsStore.channel.current.id : playerStore.recorded_program.channel?.id}/logo`">
         <span class="watch-header__program-title" v-html="ProgramUtils.decorateProgramInfo(
-            playback_mode === 'Live' ? channelsStore.channel.current.program_present : playerStore.recorded_program, 'title'
+            playback_mode === 'Live' ? ChannelUtils.getProgramPresentForDisplay(channelsStore.channel.current) : playerStore.recorded_program, 'title'
         )"></span>
         <span v-if="playback_mode === 'Video' && playerStore.recorded_program.channel !== null"
             class="watch-header__broadcaster-name">
             {{playerStore.recorded_program.channel.name}}
         </span>
         <span class="watch-header__program-time">
-            {{ProgramUtils.getProgramTime(playback_mode === 'Live' ? channelsStore.channel.current.program_present : playerStore.recorded_program, true)}}
+            {{ProgramUtils.getProgramTime(playback_mode === 'Live' ? ChannelUtils.getProgramPresentForDisplay(channelsStore.channel.current) : playerStore.recorded_program, true)}}
         </span>
         <v-spacer></v-spacer>
         <span class="watch-header__now">
@@ -34,7 +34,7 @@ import type { Dayjs } from 'dayjs';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
-import Utils, { dayjs, ProgramUtils } from '@/utils';
+import Utils, { ChannelUtils, dayjs, ProgramUtils } from '@/utils';
 
 export default defineComponent({
     name: 'Watch-Header',
@@ -49,6 +49,7 @@ export default defineComponent({
 
             // ユーティリティをテンプレートで使えるように
             Utils: Object.freeze(Utils),
+            ChannelUtils: Object.freeze(ChannelUtils),
             ProgramUtils: Object.freeze(ProgramUtils),
 
             // 現在時刻 (ライブ再生時は現在時刻、録画再生時は設定に応じて録画当時の時刻または現在時刻)
