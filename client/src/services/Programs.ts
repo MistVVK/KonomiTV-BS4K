@@ -1,7 +1,7 @@
 import type { Dayjs } from 'dayjs';
 
 import APIClient from '@/services/APIClient';
-import { IChannel } from '@/services/Channels';
+import { ChannelType, IChannel } from '@/services/Channels';
 
 
 /** 番組情報を表すインターフェイス */
@@ -211,13 +211,15 @@ class Programs {
      * @param end_time 終了日時
      * @param channel_type チャンネルタイプ (省略時は全種別)
      * @param pinned_channel_ids チャンネル ID リスト (ピン留め用、指定時は channel_type より優先)
+     * @param is_oneseg 地デジのうちワンセグかどうか (省略時は両方)
      * @returns 番組表データ、取得失敗時は null
      */
     static async fetchTimeTable(
         start_time: Dayjs,
         end_time: Dayjs,
-        channel_type?: 'GR' | 'BS' | 'CS' | 'CATV' | 'SKY' | 'BS4K',
+        channel_type?: ChannelType,
         pinned_channel_ids?: string[],
+        is_oneseg?: boolean,
     ): Promise<ITimeTable | null> {
 
         // API リクエストのパラメータを構築
@@ -234,6 +236,11 @@ class Programs {
         // pinned_channel_ids を指定 (channel_type より優先される)
         if (pinned_channel_ids !== undefined && pinned_channel_ids.length > 0) {
             params.set('pinned_channel_ids', pinned_channel_ids.join(','));
+        }
+
+        // 地デジとワンセグを区別する場合のみ指定
+        if (is_oneseg !== undefined) {
+            params.set('is_oneseg', String(is_oneseg));
         }
 
         // API リクエストを実行

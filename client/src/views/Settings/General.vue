@@ -46,6 +46,12 @@
                 </v-switch>
             </div>
             <div class="settings__item settings__item--switch">
+                <label class="settings__item-heading" for="show_oneseg_channels">ワンセグ</label>
+                <v-switch class="settings__item-switch" color="primary" id="show_oneseg_channels" hide-details
+                    v-model="settingsStore.settings.show_oneseg_channels">
+                </v-switch>
+            </div>
+            <div class="settings__item settings__item--switch">
                 <label class="settings__item-heading" for="show_bs_channels">BS</label>
                 <v-switch class="settings__item-switch" color="primary" id="show_bs_channels" hide-details
                     v-model="settingsStore.settings.show_bs_channels">

@@ -5,29 +5,28 @@ import { computed, ref, shallowRef, watch } from 'vue';
 
 import type { Dayjs } from 'dayjs';
 
-import { ChannelType, ChannelTypePretty } from '@/services/Channels';
+import { CHANNEL_TYPE_DISPLAY_ORDER, ChannelType, ChannelTypePretty } from '@/services/Channels';
 import Programs, { ITimeTableChannel } from '@/services/Programs';
 import useChannelsStore from '@/stores/ChannelsStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import { dayjs } from '@/utils';
 
 
-/**
- * チャンネルタイプの表示順序
- */
-export const CHANNEL_TYPE_DISPLAY_ORDER: ChannelTypePretty[] = ['ピン留め', '地デジ', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'];
+// 既存のインポート元との互換性を維持するため、共有した表示順序をこのモジュールからも公開する
+export { CHANNEL_TYPE_DISPLAY_ORDER };
 
 /**
- * 表示名から API 用チャンネルタイプへのマッピング (ChannelTypePretty -> ChannelType)
+ * 表示名から API 用チャンネル絞り込み条件へのマッピング
  * 'ピン留め' は API では channel_ids パラメータで指定するため、このマッピングには含まれない
  */
-const CHANNEL_TYPE_PRETTY_TO_API: Map<ChannelTypePretty, ChannelType> = new Map([
-    ['地デジ', 'GR'],
-    ['BS', 'BS'],
-    ['CS', 'CS'],
-    ['CATV', 'CATV'],
-    ['SKY', 'SKY'],
-    ['BS4K', 'BS4K'],
+const CHANNEL_TYPE_PRETTY_TO_API: Map<ChannelTypePretty, {channel_type: ChannelType; is_oneseg?: boolean}> = new Map([
+    ['地デジ', {channel_type: 'GR', is_oneseg: false}],
+    ['ワンセグ', {channel_type: 'GR', is_oneseg: true}],
+    ['BS', {channel_type: 'BS'}],
+    ['CS', {channel_type: 'CS'}],
+    ['CATV', {channel_type: 'CATV'}],
+    ['SKY', {channel_type: 'SKY'}],
+    ['BS4K', {channel_type: 'BS4K'}],
 ]);
 
 
@@ -324,17 +323,19 @@ const useTimeTableStore = defineStore('timetable', () => {
             ? (pinned_channel_ids ?? channels_store.channels_list_with_pinned.get('ピン留め')?.map(channel => channel.id) ?? [])
             : undefined;
 
-        // ChannelTypePretty から API 用の ChannelType に変換
-        const api_channel_type = CHANNEL_TYPE_PRETTY_TO_API.get(actual_channel_type);
+        // ChannelTypePretty から API 用のチャンネル絞り込み条件に変換
+        const api_channel_filter = CHANNEL_TYPE_PRETTY_TO_API.get(actual_channel_type);
 
         // API リクエストを実行 (Programs サービスを使用)
         const response = await Programs.fetchTimeTable(
             actual_start_time,
             actual_end_time,
             // ピン留め以外の場合のみ channel_type を指定
-            api_channel_type,
+            api_channel_filter?.channel_type,
             // ピン留めの場合は pinned_channel_ids を指定
             actual_pinned_channel_ids,
+            // 地デジとワンセグを区別する場合のみ is_oneseg を指定
+            api_channel_filter?.is_oneseg,
         );
 
         if (response === null) {

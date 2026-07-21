@@ -27,6 +27,11 @@ def test_client_settings_jikkyo_defaults_to_disabled() -> None:
     assert ClientSettings.model_validate({}).jikkyo_enabled is False
 
 
+def test_client_settings_oneseg_channels_default_to_visible() -> None:
+    assert ClientSettings().show_oneseg_channels is True
+    assert ClientSettings.model_validate({}).show_oneseg_channels is True
+
+
 @pytest.mark.parametrize('theme', THEMES)
 def test_client_settings_accepts_all_supported_themes(theme: str) -> None:
     assert ClientSettings.model_validate({'ui_theme': theme}).ui_theme == theme

@@ -284,6 +284,7 @@ const createFallbackChannel = (program: IProgram): IChannel => {
         name: program.channel_id,
         terrestrial_regions: null,
         jikkyo_force: null,
+        is_oneseg: false,
         is_subchannel: false,
         is_radiochannel: false,
         is_watchable: true,

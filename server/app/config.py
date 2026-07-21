@@ -106,6 +106,7 @@ class ClientSettings(BaseModel):
         'その他': 'White',
     }
     show_gr_channels: bool = True
+    show_oneseg_channels: bool = True
     show_bs_channels: bool = True
     show_cs_channels: bool = True
     show_catv_channels: bool = True

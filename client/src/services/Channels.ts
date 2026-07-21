@@ -7,7 +7,10 @@ import { IProgram, IProgramDefault } from '@/services/Programs';
 export type ChannelType = 'GR' | 'BS' | 'CS' | 'CATV' | 'SKY' | 'BS4K';
 
 // チャンネルタイプの型 (実際のチャンネルリストに表示される表現)
-export type ChannelTypePretty = 'ピン留め' | '地デジ' | 'BS' | 'CS' | 'CATV' | 'SKY' | 'BS4K';
+export type ChannelTypePretty = 'ピン留め' | '地デジ' | 'ワンセグ' | 'BS' | 'CS' | 'CATV' | 'SKY' | 'BS4K';
+
+/** TV タブと番組表でのチャンネルタイプの表示順序 */
+export const CHANNEL_TYPE_DISPLAY_ORDER: ChannelTypePretty[] = ['ピン留め', '地デジ', 'ワンセグ', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'];
 
 /** 地デジ放送エリアの型 (北海道は7分割、計53選択肢) */
 export type TerrestrialRegion =
@@ -38,6 +41,7 @@ export interface IChannel {
     // 地デジ以外のチャンネルまたは地域が特定できない場合は null
     terrestrial_regions: TerrestrialRegion[] | null;
     jikkyo_force: number | null;
+    is_oneseg: boolean;
     is_subchannel: boolean;
     is_radiochannel: boolean;
     is_watchable: boolean;
@@ -64,6 +68,7 @@ export const ILiveChannelDefault: ILiveChannel = {
     type: 'GR',
     name: '取得中…',
     jikkyo_force: null,
+    is_oneseg: false,
     is_subchannel: false,
     is_radiochannel: false,
     is_watchable: true,

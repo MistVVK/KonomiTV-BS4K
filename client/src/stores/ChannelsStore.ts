@@ -1,7 +1,7 @@
 
 import { defineStore } from 'pinia';
 
-import Channels, { ChannelType, ChannelTypePretty, ILiveChannelsList, ILiveChannel, ILiveChannelDefault } from '@/services/Channels';
+import Channels, { CHANNEL_TYPE_DISPLAY_ORDER, ChannelType, ChannelTypePretty, ILiveChannelsList, ILiveChannel, ILiveChannelDefault } from '@/services/Channels';
 import { IProgram, IProgramDefault } from '@/services/Programs';
 import useSettingsStore from '@/stores/SettingsStore';
 import Utils, { ChannelUtils } from '@/utils';
@@ -109,21 +109,26 @@ const useChannelsStore = defineStore('channels', {
                 };
             }
 
+            // 地デジとワンセグは同じ GR 配列に格納されるため、前後選局では現在と同じ放送種別だけを対象にする
+            const current_channel_is_oneseg = channels[current_channel_index].is_oneseg === true;
+
             // 前のインデックスを取得する
             // インデックスがマイナスになった時は、最後のインデックスに巻き戻す
             // channel.is_display が true のチャンネルに到達するまで続ける
             const previous_channel_index = ((): number => {
                 let index = current_channel_index - 1;
-                while (channels.length) {
+                let checked_channel_count = 0;
+                while (checked_channel_count < channels.length) {
                     if (index <= -1) {
                         index = channels.length - 1;  // 最後のインデックス
                     }
-                    if (channels[index].is_display) {
+                    if (channels[index].is_display && (channels[index].is_oneseg === true) === current_channel_is_oneseg) {
                         return index;
                     }
                     index--;
+                    checked_channel_count++;
                 }
-                return 0;
+                return current_channel_index;
             })();
 
             // 次のインデックスを取得する
@@ -131,16 +136,18 @@ const useChannelsStore = defineStore('channels', {
             // channel.is_display が true のチャンネルに到達するまで続ける
             const next_channel_index = ((): number => {
                 let index = current_channel_index + 1;
-                while (channels.length) {
+                let checked_channel_count = 0;
+                while (checked_channel_count < channels.length) {
                     if (index >= channels.length) {
                         index = 0;  // 最初のインデックス
                     }
-                    if (channels[index].is_display) {
+                    if (channels[index].is_display && (channels[index].is_oneseg === true) === current_channel_is_oneseg) {
                         return index;
                     }
                     index++;
+                    checked_channel_count++;
                 }
-                return 0;
+                return current_channel_index;
             })();
 
             // structuredClone() でディープコピーを行い、プロパティの変更が channels_list 内のオブジェクトに反映されないようにする
@@ -178,15 +185,17 @@ const useChannelsStore = defineStore('channels', {
             const settings_store = useSettingsStore();
 
             // 全般設定で非表示にした放送種別は、通常タブだけでなくピン留めタブからも除外する。
-            const isChannelTypeVisible = (channel_type: ChannelType): boolean => {
+            const isChannelVisible = (channel: ILiveChannel): boolean => {
                 return {
-                    GR: settings_store.settings.show_gr_channels,
+                    GR: channel.is_oneseg === true
+                        ? settings_store.settings.show_oneseg_channels
+                        : settings_store.settings.show_gr_channels,
                     BS: settings_store.settings.show_bs_channels,
                     CS: settings_store.settings.show_cs_channels,
                     CATV: settings_store.settings.show_catv_channels,
                     SKY: settings_store.settings.show_sky_channels,
                     BS4K: settings_store.settings.show_bs4k_channels,
-                }[channel_type];
+                }[channel.type];
             };
 
             // チャンネル番号をメイン番号とサブ番号に分割する
@@ -228,11 +237,10 @@ const useChannelsStore = defineStore('channels', {
                 return channels_list_with_pinned;
             }
 
-            channels_list_with_pinned.set('BS', []);
-            channels_list_with_pinned.set('CS', []);
-            channels_list_with_pinned.set('CATV', []);
-            channels_list_with_pinned.set('SKY', []);
-            channels_list_with_pinned.set('BS4K', []);
+            // 初期表示用に追加済みの2項目に続けて、共通の表示順序で残りのタブを初期化する
+            for (const channel_type_pretty of CHANNEL_TYPE_DISPLAY_ORDER.slice(2)) {
+                channels_list_with_pinned.set(channel_type_pretty, []);
+            }
 
             // channels_list に格納されているすべてのチャンネルに対しループを回し、
             // 順次 channels_list_with_pinned に追加していく
@@ -242,7 +250,7 @@ const useChannelsStore = defineStore('channels', {
                 for (const channel of channels) {
 
                     // 非表示の放送種別は、この先のピン留め判定やタブ分類に渡さない。
-                    if (isChannelTypeVisible(channel.type) === false) {
+                    if (isChannelVisible(channel) === false) {
                         continue;
                     }
 
@@ -261,7 +269,8 @@ const useChannelsStore = defineStore('channels', {
                     // チャンネルタイプごとに分類
                     switch (channel.type) {
                         case 'GR': {
-                            channels_list_with_pinned.get('地デジ')?.push(channel);
+                            const channel_type_pretty = channel.is_oneseg === true ? 'ワンセグ' : '地デジ';
+                            channels_list_with_pinned.get(channel_type_pretty)?.push(channel);
                             break;
                         }
                         case 'BS': {
@@ -367,15 +376,18 @@ const useChannelsStore = defineStore('channels', {
          * チャンネルタイプとリモコン番号からチャンネル情報を取得する
          * @param channel_type チャンネルタイプ
          * @param remocon_id リモコン番号
+         * @param is_oneseg ワンセグチャンネルを対象にするかどうか
          * @returns チャンネル情報 (見つからなかった場合は null)
          */
-        getChannelByRemoconID(channel_type: ChannelType, remocon_id: number): ILiveChannel | null {
+        getChannelByRemoconID(channel_type: ChannelType, remocon_id: number, is_oneseg: boolean = false): ILiveChannel | null {
 
             // 指定されたチャンネルタイプのチャンネルを取得
             const channels = this.channels_list[channel_type];
 
             // リモコン番号が一致するチャンネルを取得
-            const channel = channels.find((channel) => channel.remocon_id === remocon_id);
+            const channel = channels.find((channel) => {
+                return channel.remocon_id === remocon_id && (channel.is_oneseg === true) === is_oneseg;
+            });
 
             // リモコン番号が一致するチャンネルを見つけられなかった場合は null を返す
             return channel ?? null;
@@ -435,11 +447,13 @@ const useChannelsStore = defineStore('channels', {
                 return;
             }
 
-            // この時点で pinned_channels に存在していないピン留め中チャンネルの ID を pinned_channel_ids から削除する
+            // この時点で全チャンネルに存在していないピン留め中チャンネルの ID を pinned_channel_ids から削除する
             // 受信環境の変化などでピン留め中チャンネルのチャンネル情報が取得できなくなった場合に備える
+            // 表示設定で一時的に非表示になっているチャンネルのピン留めは維持する
             const settings_store = useSettingsStore();
+            const available_channel_ids = new Set(Object.values(this.channels_list).flat().map(channel => channel.id));
             settings_store.settings.pinned_channel_ids = settings_store.settings.pinned_channel_ids.filter((channel_id) => {
-                const result = this.channels_list_with_pinned.get('ピン留め')?.some((channel) => channel.id === channel_id);
+                const result = available_channel_ids.has(channel_id);
                 if (result === false) {
                     console.warn('[ChannelsStore] Deleted pinned channel ID:', channel_id);
                 }

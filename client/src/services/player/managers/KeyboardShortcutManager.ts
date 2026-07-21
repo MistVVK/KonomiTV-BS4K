@@ -482,6 +482,8 @@ class KeyboardShortcutManager implements PlayerManager {
 
                 // Shift キーが同時押しされていたら BS チャンネルの方を選局する
                 const switch_channel_type = is_shift_pressed ? 'BS' : 'GR';
+                // Shift キーなしでは、現在ワンセグを視聴中ならワンセグ内で数字選局する
+                const switch_is_oneseg = is_shift_pressed === false && channels_store.channel.current.is_oneseg === true;
 
                 // 切り替えるチャンネルのリモコン ID
                 // リモコン ID に当てはまるキーが押下していなければ null のままになる
@@ -508,7 +510,7 @@ class KeyboardShortcutManager implements PlayerManager {
                 if (switch_remocon_id !== null) {
 
                     // 切り替え先のチャンネルを取得する
-                    const switch_channel = channels_store.getChannelByRemoconID(switch_channel_type, switch_remocon_id);
+                    const switch_channel = channels_store.getChannelByRemoconID(switch_channel_type, switch_remocon_id, switch_is_oneseg);
 
                     // チャンネルが取得できていれば、ルーティングをそのチャンネルに置き換える
                     // 押されたキーに対応するリモコン ID のチャンネルがない場合や、現在と同じチャンネル ID の場合は何も起こらない

@@ -82,6 +82,7 @@ export interface ILocalClientSettings extends IClientSettings {
     timetable_dim_shopping_programs: boolean;
     timetable_genre_colors: ITimeTableGenreColors;
     show_gr_channels: boolean;
+    show_oneseg_channels: boolean;
     show_bs_channels: boolean;
     show_cs_channels: boolean;
     show_catv_channels: boolean;
@@ -246,6 +247,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
 
     // TVタブと番組表に地デジを表示する (Default: オン)
     show_gr_channels: true,
+    // TVタブと番組表にワンセグを表示する (Default: オン)
+    show_oneseg_channels: true,
     // TVタブと番組表にBSを表示する (Default: オン)
     show_bs_channels: true,
     // TVタブと番組表にCSを表示する (Default: オン)
@@ -456,6 +459,7 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'timetable_dim_shopping_programs',
     'timetable_genre_colors',
     'show_gr_channels',
+    'show_oneseg_channels',
     'show_bs_channels',
     'show_cs_channels',
     'show_catv_channels',

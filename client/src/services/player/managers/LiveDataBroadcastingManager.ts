@@ -496,7 +496,8 @@ class LiveDataBroadcastingManager implements PlayerManager {
                     // 切り替え先のチャンネルを取得する
                     // チャンネルタイプは現在視聴中のチャンネルと同じ
                     const switch_channel_type = channels_store.channel.current.type;
-                    const switch_channel = channels_store.getChannelByRemoconID(switch_channel_type, remocon_id);
+                    const switch_is_oneseg = channels_store.channel.current.is_oneseg === true;
+                    const switch_channel = channels_store.getChannelByRemoconID(switch_channel_type, remocon_id, switch_is_oneseg);
 
                     // チャンネルが取得できていれば、ルーティングをそのチャンネルに置き換える
                     // 押されたキーに対応するリモコン ID のチャンネルがない場合や、現在と同じチャンネル ID の場合は何も起こらない

@@ -46,6 +46,7 @@ export interface IClientSettings {
     timetable_dim_shopping_programs: boolean;
     timetable_genre_colors: ITimeTableGenreColors;
     show_gr_channels: boolean;
+    show_oneseg_channels: boolean;
     show_bs_channels: boolean;
     show_cs_channels: boolean;
     show_catv_channels: boolean;
