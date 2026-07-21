@@ -105,6 +105,7 @@ const typeOptions = [
     {title: '再生索引作成', value: 'PlaybackIndex'}, {title: 'サムネイル生成', value: 'ThumbnailGeneration'},
     {title: 'CM区間解析', value: 'CMAnalysis'}, {title: 'CMロゴ生成', value: 'CMLogoGeneration'},
     {title: '全件メタデータ再解析', value: 'BatchMetadataReanalysis'}, {title: '全件CM再判定', value: 'BatchCMAnalysis'},
+    {title: '既存録画シリーズ一括判定', value: 'BatchSeriesResolution'},
     {title: 'バックグラウンド一括解析', value: 'BackgroundAnalysis'},
 ];
 const statusOptions = [

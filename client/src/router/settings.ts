@@ -67,6 +67,13 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
             {type: 'Route', label: '録画・ストレージ', icon: 'fluent:hard-drive-20-filled', to: '/settings/server/storage'},
             {
                 type: 'Route',
+                label: '録画シリーズ',
+                icon: 'fluent:collections-20-filled',
+                to: '/settings/server/recorded-series',
+                activePaths: ['/settings/server/recorded-series/series'],
+            },
+            {
+                type: 'Route',
                 label: 'CM管理',
                 icon: 'fluent:timeline-20-filled',
                 to: '/settings/server/cm-analysis',
@@ -186,6 +193,16 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         name: 'Settings Server Storage',
         component: () => import('@/views/Settings/Server.vue'),
         props: {section: 'storage'},
+    },
+    {
+        path: '/settings/server/recorded-series',
+        name: 'Settings Server Recorded Series',
+        component: () => import('@/views/Settings/RecordedSeries.vue'),
+    },
+    {
+        path: '/settings/server/recorded-series/series',
+        name: 'Settings Server Recorded Series Management',
+        component: () => import('@/views/Settings/RecordedSeriesManagement.vue'),
     },
     {
         path: '/settings/server/cm-analysis',

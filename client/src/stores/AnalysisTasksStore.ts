@@ -26,7 +26,8 @@ export function taskTypeLabel(type: AnalysisTaskType): string {
         RecordedScan: '録画フォルダスキャン', MetadataAnalysis: 'メタデータ解析', PlaybackIndex: '再生索引作成',
         ThumbnailGeneration: 'サムネイル生成', CMAnalysis: 'CM区間解析', CMLogoGeneration: 'CMロゴ生成',
         BatchScan: '録画フォルダ一括スキャン', BatchMetadataReanalysis: '全件メタデータ再解析',
-        BatchCMAnalysis: '全件CM再判定', BackgroundAnalysis: 'バックグラウンド一括解析',
+        BatchCMAnalysis: '全件CM再判定', BatchSeriesResolution: '既存録画シリーズ一括判定',
+        BackgroundAnalysis: 'バックグラウンド一括解析',
     }[type];
 }
 

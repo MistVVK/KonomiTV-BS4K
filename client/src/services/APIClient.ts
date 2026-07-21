@@ -99,7 +99,12 @@ class APIClient {
 
         // エラーが発生した場合は IErrorResponse を返す
         if (result instanceof AxiosError) {
-            console.error(result);
+            // AxiosError 全体には Authorization ヘッダーやリクエストボディが含まれる。
+            // API キーなどの秘密情報を DevTools コンソールへ残さないよう、安全なメタデータだけを文字列で出力する。
+            const request_method = result.config?.method?.toUpperCase() ?? 'UNKNOWN';
+            const request_path = result.config?.url?.split('?')[0] ?? '(unknown URL)';
+            const response_status = result.response?.status ?? 'network error';
+            console.error(`[APIClient] ${request_method} ${request_path} failed: ${result.message} (${response_status})`);
 
             // エラーレスポンスがあれば、エラー内容と AxiosError を IErrorResponse に入れて返す
             if (result.response) {

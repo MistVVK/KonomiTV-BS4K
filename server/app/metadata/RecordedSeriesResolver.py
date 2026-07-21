@@ -126,6 +126,18 @@ class RecordedSeriesInvalidTitleError(Exception):
     """手動割当用タイトルから有効な正規化キーを作れないことを表す。"""
 
 
+class RecordedSeriesTitleConflictError(Exception):
+    """Series名の変更が既存Seriesまたは判定Ruleと衝突することを表す。"""
+
+
+class RecordedSeriesMetadataStaleError(Exception):
+    """編集開始後にSeriesが更新され、古い画面からの上書きを拒否したことを表す。"""
+
+
+class RecordedSeriesResolverBusyError(Exception):
+    """自動判定または別の更新が実行中で、編集を即時受理できないことを表す。"""
+
+
 def _sha256JSON(payload: object) -> str:
     """順序を固定したJSON表現からSHA-256を生成する。"""
 
@@ -1098,6 +1110,138 @@ class RecordedSeriesResolver:
             if normalized_key != '' and _buildRuleKeyHash(normalized_key) == canonical_key:
                 return legacy_series
         return None
+
+    @classmethod
+    async def updateSeriesMetadata(
+        cls,
+        series_id: int,
+        *,
+        title: str,
+        description: str,
+        expected_title: str,
+        expected_description: str,
+    ) -> None:
+        """管理者が編集したSeries名・説明を関連録画と原子的に同期する。
+
+        Args:
+            series_id: 更新するSeries ID。
+            title: 前後空白を除去して保存する新しい表示名。
+            description: 保存する新しい説明。
+            expected_title: 編集開始時に取得したSeries名。
+            expected_description: 編集開始時に取得したSeries説明。
+
+        Returns:
+            None
+
+        Raises:
+            RecordedSeriesTargetNotFoundError: 対象Seriesが存在しない場合。
+            RecordedSeriesInvalidTitleError: タイトルから有効な正規化キーを作れない場合。
+            RecordedSeriesTitleConflictError: 別Seriesまたは既存Ruleが新タイトルのキーを所有する場合。
+            RecordedSeriesMetadataStaleError: 編集開始後に対象Seriesが更新された場合。
+            RecordedSeriesResolverBusyError: 別のSeries判定・更新が実行中の場合。
+        """
+
+        cleaned_title = title.strip()
+        normalized_title = BuildSeriesGroupingKey(cleaned_title)
+        if normalized_title == '':
+            raise RecordedSeriesInvalidTitleError
+        normalized_title_hash = _buildRuleKeyHash(normalized_title)
+
+        # 長時間のMediaWiki/AI判定の後ろでHTTPリクエストを待たせると、
+        # 画面がタイムアウトした後に遅れてcommitされる。使用中なら即時再試行を促す。
+        if cls._resolve_lock.locked():
+            raise RecordedSeriesResolverBusyError
+
+        # 自動Resolverが旧Series名を読み取った後に判定結果をcommitする競合を防ぐため、
+        # 録画の手動割当と同じlockを使い、Seriesと全RecordedProgramを一括更新する。
+        async with cls._resolve_lock:
+            async with transactions.in_transaction() as connection:
+                series = await Series.filter(id=series_id).using_db(connection).first()
+                if series is None:
+                    raise RecordedSeriesTargetNotFoundError
+
+                # updated_atは録画追加・再判定でも更新されるため、編集対象の2項目だけでlost updateを
+                # 検出する。比較と更新を同一transaction内に置き、全録画名の巻き戻しも防ぐ。
+                if series.title != expected_title or series.description != expected_description:
+                    raise RecordedSeriesMetadataStaleError
+
+                current_normalized_title = BuildSeriesGroupingKey(series.title)
+                title_changed = cleaned_title != series.title
+                normalized_title_changed = normalized_title != current_normalized_title
+                target_rule: RecordedSeriesRule | None = None
+
+                # 正規化キーが同じ表記修正でも、完全に同じ表示名の別Seriesを新たに作る変更だけは拒否する。
+                if title_changed:
+                    exact_title_owner = await Series.filter(title=cleaned_title) \
+                        .exclude(id=series.id).using_db(connection).first()
+                    if exact_title_owner is not None:
+                        raise RecordedSeriesTitleConflictError
+
+                if normalized_title_changed:
+                    # canonical_keyは元のEPG名を将来も同じSeriesへ寄せるstable aliasなので、
+                    # renameでは書き換えない。一方、新しい正規化キーを別Seriesが所有する場合は、
+                    # 将来の自動判定先が曖昧になるため暗黙mergeせず拒否する。
+                    other_series_list = await Series.exclude(id=series.id).using_db(connection).values(
+                        'canonical_key',
+                        'title',
+                    )
+                    for other_series in other_series_list:
+                        if (
+                            other_series['canonical_key'] == normalized_title_hash or
+                            BuildSeriesGroupingKey(str(other_series['title'])) == normalized_title
+                        ):
+                            raise RecordedSeriesTitleConflictError
+
+                    # 新表示名と同じ入力キーのRuleが別Series・単発を指す状態でrenameを許すと、
+                    # 一覧上の名前と次回自動判定の所属先が食い違うため409で止める。
+                    target_rule = await RecordedSeriesRule.filter(
+                        key_hash=normalized_title_hash,
+                    ).using_db(connection).first()
+                    if target_rule is not None and (
+                        target_rule.decision != 'Series' or
+                        target_rule.series_id != series.id
+                    ):
+                        raise RecordedSeriesTitleConflictError
+
+                updated_at = datetime.now(tz=JST)
+                series.title = cleaned_title
+                series.description = description
+                series.updated_at = updated_at
+                await series.save(
+                    update_fields=['title', 'description', 'updated_at'],
+                    using_db=connection,
+                )
+
+                # RecordedProgram.series_titleはAPI・検索・Media Sessionが直接参照する非正規化列なので、
+                # Series.titleだけを変えて表示が混在しないよう、録画状態を問わず全所属行へ反映する。
+                await RecordedProgram.filter(series_id=series.id).using_db(connection).update(
+                    series_title=cleaned_title,
+                    updated_at=updated_at,
+                )
+
+                # 旧canonical keyと過去Ruleは入力履歴として保持したまま、新しい正規化名も
+                # 同じSeriesへ戻せるManual aliasを追加する。これにより空白・記号の表記揺れでも
+                # rename直後に別Seriesを作らず、管理者の明示変更を将来の判定へ再利用できる。
+                if normalized_title_changed:
+                    await RecordedSeriesRule.update_or_create(
+                        key_hash=normalized_title_hash,
+                        defaults={
+                            'normalized_key': normalized_title,
+                            'display_title': cleaned_title,
+                            'decision': 'Series',
+                            'series_id': series.id,
+                            'wikipedia_page_id': series.wikipedia_page_id,
+                            'source': 'Manual',
+                            'confidence': 1.0,
+                            'evidence_hash': _sha256JSON({
+                                'source': 'ManualSeriesRename',
+                                'series_id': series.id,
+                                'normalized_key': normalized_title,
+                            }),
+                            'resolver_version': RECORDED_SERIES_RESOLVER_VERSION,
+                        },
+                        using_db=connection,
+                    )
 
     @classmethod
     async def assignProgram(

@@ -1226,28 +1226,14 @@ class RecordedScanTask:
             db_recorded_program.event_id = recorded_program.event_id
             db_recorded_program.title = recorded_program.title
             # SeriesResolverが所有する確定済み関連付けは、ファイル内容が変わった場合も保持する。
-            # Resolverはメタデータ保存後に非同期で再判定するため、ここで先に消すと同一fingerprintの
-            # cache hitや判定失敗時に関連付けだけが失われる。Analyzerの初期値を使うのは新規作成時だけ。
+            # Resolverはメタデータ保存後に非同期で再判定するため、Analyzerの初期値を使うのは
+            # 新規作成時だけとし、既存行ではseries関連列をUPDATE対象にも含めない。
             if existing_db_recorded_video is None:
                 db_recorded_program.series_id = recorded_program.series_id
                 db_recorded_program.series_broadcast_period_id = recorded_program.series_broadcast_period_id
                 db_recorded_program.series_title = recorded_program.series_title
                 db_recorded_program.episode_number = recorded_program.episode_number
                 db_recorded_program.subtitle = recorded_program.subtitle
-            else:
-                if db_recorded_program.series_id is None and recorded_program.series_id is not None:
-                    db_recorded_program.series_id = recorded_program.series_id
-                if (
-                    db_recorded_program.series_broadcast_period_id is None and
-                    recorded_program.series_broadcast_period_id is not None
-                ):
-                    db_recorded_program.series_broadcast_period_id = recorded_program.series_broadcast_period_id
-                if db_recorded_program.series_title is None and recorded_program.series_title is not None:
-                    db_recorded_program.series_title = recorded_program.series_title
-                if db_recorded_program.episode_number is None and recorded_program.episode_number is not None:
-                    db_recorded_program.episode_number = recorded_program.episode_number
-                if db_recorded_program.subtitle is None and recorded_program.subtitle is not None:
-                    db_recorded_program.subtitle = recorded_program.subtitle
             db_recorded_program.description = recorded_program.description
             db_recorded_program.detail = recorded_program.detail
             db_recorded_program.start_time = recorded_program.start_time
@@ -1259,7 +1245,33 @@ class RecordedScanTask:
             db_recorded_program.primary_audio_language = recorded_program.primary_audio_language
             db_recorded_program.secondary_audio_type = recorded_program.secondary_audio_type
             db_recorded_program.secondary_audio_language = recorded_program.secondary_audio_language
-            await db_recorded_program.save()
+            if existing_db_recorded_video is None:
+                await db_recorded_program.save()
+            else:
+                # 解析開始後にSeriesResolverや管理画面が更新した関連付けを、取得済みの古い
+                # モデルインスタンスから後勝ちで巻き戻さないよう、Scanner所有列だけを保存する。
+                await db_recorded_program.save(update_fields=[
+                    'recording_start_margin',
+                    'recording_end_margin',
+                    'is_partially_recorded',
+                    'channel_id',
+                    'network_id',
+                    'service_id',
+                    'event_id',
+                    'title',
+                    'description',
+                    'detail',
+                    'start_time',
+                    'end_time',
+                    'duration',
+                    'is_free',
+                    'genres',
+                    'primary_audio_type',
+                    'primary_audio_language',
+                    'secondary_audio_type',
+                    'secondary_audio_language',
+                    'updated_at',
+                ])
 
             # RecordedVideo の保存または更新
             if existing_db_recorded_video is not None:
