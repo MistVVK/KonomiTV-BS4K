@@ -8,8 +8,9 @@ import { defineComponent } from 'vue';
 
 import Watch from '@/components/Watch/Watch.vue';
 import PlayerController from '@/services/player/PlayerController';
+import RecordedSeries from '@/services/RecordedSeries';
 import Videos from '@/services/Videos';
-import usePlayerStore from '@/stores/PlayerStore';
+import usePlayerStore, { type PlayerEvents } from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import useVersionStore from '@/stores/VersionStore';
 
@@ -25,6 +26,13 @@ export default defineComponent({
     components: {
         Watch,
     },
+    data() {
+        return {
+            // ended が多重発火しても、次話 API とルート遷移を1回だけ実行する。
+            is_next_recorded_program_transitioning: false,
+            next_recorded_program_request_sequence: 0,
+        };
+    },
     computed: {
         ...mapStores(usePlayerStore, useSettingsStore, useVersionStore),
     },
@@ -36,6 +44,9 @@ export default defineComponent({
         // 解析失敗表示の再試行ボタンから、同じ初期化処理をやり直せるようにする
         this.playerStore.event_emitter.on('RetryRecordedPlaybackIndex', this.retryRecordedPlaybackIndex);
 
+        // 録画を自然に完走した場合だけ、シリーズ内の次話へ進む。
+        this.playerStore.event_emitter.on('RecordedPlaybackEnded', this.handleRecordedPlaybackEnded);
+
         // 再生セッションを初期化
         this.init();
     },
@@ -43,6 +54,9 @@ export default defineComponent({
     // コンポーネント（インスタンス）は再利用される
     // ref: https://v3.router.vuejs.org/ja/guide/advanced/navigation-guards.html#%E3%83%AB%E3%83%BC%E3%83%88%E5%8D%98%E4%BD%8D%E3%82%AB%E3%82%99%E3%83%BC%E3%83%88%E3%82%99
     beforeRouteUpdate(to, from, next) {
+
+        // 次話照会中に別ルートへ移動した場合は、戻ってきた古いレスポンスから遷移させない。
+        this.invalidateNextRecordedProgramTransition();
 
         // 前の再生セッションを破棄して終了し、完了を待ってから再度初期化する
         const destroy_promise = this.destroy();
@@ -59,10 +73,67 @@ export default defineComponent({
         // さもなければ、ブラウザがリロードされるまでバックグラウンドで永遠に再生され続けてしまう
         this.destroy();
         this.playerStore.event_emitter.off('RetryRecordedPlaybackIndex', this.retryRecordedPlaybackIndex);
+        this.playerStore.event_emitter.off('RecordedPlaybackEnded', this.handleRecordedPlaybackEnded);
+        this.invalidateNextRecordedProgramTransition();
 
         // 上記以外の視聴画面の終了処理は Watch コンポーネントの方で自動的に行われる
     },
     methods: {
+
+        /** 次話 API の未完了レスポンスと重複遷移を無効化する。 */
+        invalidateNextRecordedProgramTransition(): void {
+            this.next_recorded_program_request_sequence += 1;
+            this.is_next_recorded_program_transitioning = false;
+        },
+
+        /** 録画の自然完走時に、同じシリーズの次話があれば現在の再生画面から遷移する。 */
+        async handleRecordedPlaybackEnded(event: PlayerEvents['RecordedPlaybackEnded']): Promise<void> {
+            if (this.is_next_recorded_program_transitioning) return;
+
+            const ended_program_id = event.recorded_program_id;
+            const route_program_id = Number(this.$route.params.video_id);
+            if (
+                Number.isInteger(route_program_id) === false ||
+                route_program_id !== ended_program_id ||
+                this.playerStore.recorded_program.id !== ended_program_id
+            ) {
+                return;
+            }
+
+            this.is_next_recorded_program_transitioning = true;
+            const request_sequence = ++this.next_recorded_program_request_sequence;
+            const next_program = await RecordedSeries.fetchNextProgram(ended_program_id);
+
+            // API 待機中に手動遷移・コンポーネント破棄・別録画への切り替えが起きていれば何もしない。
+            if (
+                request_sequence !== this.next_recorded_program_request_sequence ||
+                Number(this.$route.params.video_id) !== ended_program_id ||
+                this.playerStore.recorded_program.id !== ended_program_id
+            ) {
+                return;
+            }
+
+            const next_program_id = next_program?.recorded_program_id ?? null;
+            if (next_program_id === null || next_program_id === ended_program_id) {
+                this.is_next_recorded_program_transitioning = false;
+                return;
+            }
+
+            // beforeRouteUpdate() がこのリクエスト世代を無効化してから既存 PlayerController を破棄する。
+            // push が同一URLなどで不成立だった場合だけ、現在の画面で再度 ended を受け取れる状態へ戻す。
+            try {
+                await this.$router.push(`/videos/watch/${next_program_id}`);
+            } catch (error) {
+                // 予期しないルーター例外をイベントハンドラー外へ未処理 Promise として漏らさない。
+                console.error('[Video-Watch] Failed to transition to the next recorded program:', error);
+            }
+            if (
+                request_sequence === this.next_recorded_program_request_sequence &&
+                Number(this.$route.params.video_id) === ended_program_id
+            ) {
+                this.is_next_recorded_program_transitioning = false;
+            }
+        },
 
         // 再生セッションを初期化する
         async init() {

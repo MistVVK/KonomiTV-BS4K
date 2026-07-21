@@ -58,6 +58,10 @@ export type PlayerEvents = {
     }
     // 録画再生時: 失敗した録画再生索引の再解析をUIから要求する
     RetryRecordedPlaybackIndex: void;
+    // 録画再生時: ループ再生ではなく、録画の末尾まで自然に再生し終えたことを通知する
+    RecordedPlaybackEnded: {
+        recorded_program_id: number;
+    };
 };
 
 

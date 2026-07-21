@@ -51,6 +51,12 @@ class PlayerController {
     // 視聴履歴の更新間隔 (秒)
     private static readonly WATCHED_HISTORY_UPDATE_INTERVAL = 10;
 
+    // 録画末尾への直接シークと自然完走を区別するための許容誤差 (秒)
+    private static readonly RECORDED_PLAYBACK_END_TOLERANCE_SECONDS = 0.25;
+
+    // CM 自動スキップ先は HLS のタイムライン補正で指定位置からわずかにずれるため、その許容誤差 (秒)
+    private static readonly RECORDED_CM_SKIP_TARGET_TOLERANCE_SECONDS = 1.0;
+
     // DPlayer のインスタンス
     private player: DPlayer | null = null;
 
@@ -90,6 +96,18 @@ class PlayerController {
 
     // fMP4 録画のARIB字幕先読みハンドラーを解除する関数
     private recorded_arib_subtitle_cancel: (() => void) | null = null;
+
+    // 録画を末尾まで自然に再生し終えたかどうか
+    // ended の多重通知防止と、完走後の視聴履歴を先頭付近へ戻す判断に共用する
+    private recorded_playback_ended = false;
+
+    // シーク操作で直接末尾へ移動したときに、自然な完走として扱わないためのフラグ
+    // シーク後に末尾より前へ戻った時点、または CM 自動スキップと確認できた時点で解除する
+    private recorded_playback_end_blocked_by_seek = false;
+
+    // RecordedCMSkipManager が開始したシーク先
+    // 通常のユーザーシークと、自然再生中に跨いだ CM の自動スキップを区別するために保持する
+    private recorded_auto_skip_cm_target: number | null = null;
 
     // setupPlayerContainerResizeHandler() で利用する ResizeObserver
     // 保持しておかないと disconnect() で ResizeObserver を止められない
@@ -286,6 +304,9 @@ class PlayerController {
         // 破棄済みかどうかのフラグを下ろす
         this.destroyed = false;
         this.is_live_startup_temporary_muted = false;
+        this.recorded_playback_ended = false;
+        this.recorded_playback_end_blocked_by_seek = false;
+        this.recorded_auto_skip_cm_target = null;
 
         // PlayerStore にプレイヤーを初期化したことを通知する
         // 実際にはこの時点ではプレイヤーの初期化は完了していないが、PlayerController.init() を実行したことが通知されることが重要
@@ -498,8 +519,8 @@ class PlayerController {
             live: this.playback_mode === 'Live' ? true : false,
             // ライブモードで同期する際の最小バッファサイズ
             liveSyncMinBufferSize: this.live_playback_buffer_seconds - 0.1,
-            // ループ再生 (ライブ視聴では無効)
-            loop: this.playback_mode === 'Live' ? false : true,
+            // ループ再生 (既定では無効。DPlayer でユーザーが明示的に有効化した保存値は尊重する)
+            loop: false,
             // 自動再生
             autoplay: true,
             // AirPlay 機能 (うまく動かないため無効化)
@@ -1359,7 +1380,12 @@ class PlayerController {
         } else {
             // ビデオ視聴時に設定する PlayerManager
             this.player_managers = [
-                new RecordedCMSkipManager(this.player),
+                new RecordedCMSkipManager(this.player, (target_time) => {
+                    // CM 自動スキップは自然再生を継続する操作なので、末尾への直接シーク扱いにはしない。
+                    // seeking / seeked でブラウザ側の実際のシーク先を照合できるよう、先に目標位置を記録する。
+                    this.recorded_auto_skip_cm_target = target_time;
+                    this.recorded_playback_end_blocked_by_seek = false;
+                }),
                 new CaptureManager(this.player, this.playback_mode),
                 new DocumentPiPManager(this.player, this.playback_mode),
                 new KeyboardShortcutManager(this.player, this.playback_mode),
@@ -1517,6 +1543,17 @@ class PlayerController {
             // ロード中 (映像が表示されていない) でなければ Progress Circular を非表示にする
             if (player_store.is_loading === false) {
                 player_store.is_video_buffering = false;
+            }
+            // 完走後に末尾より前へ戻して実際の再生を再開した場合は、再び通常の視聴中として扱う。
+            // シーク操作だけでは解除せず、playing まで到達したことをもって「再生を続けた」と判断する。
+            if (this.playback_mode === 'Video' && this.player !== null) {
+                const video = this.player.video;
+                const is_before_end = Number.isFinite(video.duration) &&
+                    video.currentTime < video.duration - PlayerController.RECORDED_PLAYBACK_END_TOLERANCE_SECONDS;
+                if (is_before_end) {
+                    this.recorded_playback_end_blocked_by_seek = false;
+                    this.recorded_playback_ended = false;
+                }
             }
             // ライブ視聴: 再生が開始できていない場合に再生状態の復旧を試みる
             if (this.playback_mode === 'Live') {
@@ -1887,6 +1924,58 @@ class PlayerController {
 
         // ビデオ視聴時のみ実行する処理
         if (this.playback_mode === 'Video') {
+
+            // シークで直接末尾へ移動した場合は、HTMLMediaElement が ended を発火しても次話へ進めない。
+            // CM 自動スキップのシークは自然再生の続きなので除外する。
+            this.player.on('seeking', () => {
+                if (this.player === null) return;
+                const cm_skip_target = this.recorded_auto_skip_cm_target;
+                const is_auto_skip_cm_seek = cm_skip_target !== null &&
+                    Number.isFinite(this.player.video.currentTime) &&
+                    Math.abs(this.player.video.currentTime - cm_skip_target) <=
+                        PlayerController.RECORDED_CM_SKIP_TARGET_TOLERANCE_SECONDS;
+                if (is_auto_skip_cm_seek === false) {
+                    this.recorded_auto_skip_cm_target = null;
+                    this.recorded_playback_end_blocked_by_seek = true;
+                }
+            });
+
+            // バッファ済み範囲へのシークでは playing が再発火しないことがあるため、seeked でも解除を判断する。
+            // 末尾へ直接移動した通常シークだけはブロックを維持し、CM 自動スキップは末尾でも完走を許可する。
+            this.player.on('seeked', () => {
+                if (this.player === null) return;
+                const video = this.player.video;
+                const cm_skip_target = this.recorded_auto_skip_cm_target;
+                const completed_auto_skip_cm_seek = cm_skip_target !== null &&
+                    Number.isFinite(video.currentTime) &&
+                    Math.abs(video.currentTime - cm_skip_target) <=
+                        PlayerController.RECORDED_CM_SKIP_TARGET_TOLERANCE_SECONDS;
+                const is_before_end = Number.isFinite(video.duration) &&
+                    video.currentTime < video.duration - PlayerController.RECORDED_PLAYBACK_END_TOLERANCE_SECONDS;
+                if (completed_auto_skip_cm_seek || is_before_end) {
+                    this.recorded_playback_end_blocked_by_seek = false;
+                    this.recorded_playback_ended = false;
+                }
+                this.recorded_auto_skip_cm_target = null;
+            });
+
+            // DPlayer 自身のループを無効にした通常再生だけ、録画の自然な完走を View へ通知する。
+            // DPlayer の保存済みループ設定が有効なら同一録画の再生を優先し、次話へは進めない。
+            const recorded_program_id = player_store.recorded_program.id;
+            this.player.on('ended', () => {
+                if (this.destroyed || this.destroying || this.player === null) return;
+                if (this.player.setting.loop === true) return;
+                if (
+                    this.player.video.ended === false ||
+                    this.player.video.seeking === true ||
+                    this.recorded_playback_end_blocked_by_seek === true ||
+                    this.recorded_playback_ended === true
+                ) {
+                    return;
+                }
+                this.recorded_playback_ended = true;
+                player_store.event_emitter.emit('RecordedPlaybackEnded', {recorded_program_id});
+            });
 
             // 再生位置の変更（再生の進行状況）を Comment.vue にイベントとして通知する
             this.player.on('timeupdate', () => {
@@ -3409,8 +3498,16 @@ class PlayerController {
                 history => history.video_id === player_store.recorded_program.id
             );
             if (history_index !== -1) {
-                // 次再生するときにスムーズに再開できるよう、現在の再生位置の10秒前の位置を記録する
-                const current_time = this.player.video.currentTime - 10;
+                // 完走済みなら次回は本編開始付近から再生する。末尾を保存すると、再訪時に即座に
+                // ended が再発火して次話へ飛ぶため、録画マージン直後かつ動画長の内側へ収める。
+                // 通常の離脱では従来どおり、再開しやすいよう現在位置の10秒前を保存する。
+                const video_duration = player_store.recorded_program.recorded_video.duration;
+                const completed_resume_position = Math.min(
+                    Math.max(player_store.recorded_program.recording_start_margin + 2, 0),
+                    Math.max(video_duration - 0.1, 0),
+                );
+                const current_time = this.recorded_playback_ended ?
+                    completed_resume_position : this.player.video.currentTime - 10;
                 settings_store.settings.watched_history[history_index].last_playback_position = current_time;
                 settings_store.settings.watched_history[history_index].updated_at = Utils.time();
                 console.log(`\u001b[31m[PlayerController] Last playback position updated. (Video ID: ${player_store.recorded_program.id}, last_playback_position: ${current_time})`);

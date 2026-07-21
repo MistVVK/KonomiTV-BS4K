@@ -23,6 +23,10 @@ class RecordedCMSkipManager implements PlayerManager {
     // DPlayer のインスタンス
     private readonly player: DPlayer;
 
+    // CM 自動スキップによるシーク先を PlayerController へ通知するコールバック
+    // ユーザーが末尾へ直接シークした場合と、末尾 CM を自然に跨いだ場合を区別するために利用する
+    private readonly on_auto_skip_seek: (target_time: number) => void;
+
     // 録画時間内に正規化し、開始時刻順に並べた CM 区間
     private cm_sections: CMSection[] = [];
 
@@ -45,9 +49,11 @@ class RecordedCMSkipManager implements PlayerManager {
     /**
      * コンストラクタ
      * @param player DPlayer のインスタンス
+     * @param on_auto_skip_seek CM 自動スキップでシークする直前に呼び出すコールバック
      */
-    constructor(player: DPlayer) {
+    constructor(player: DPlayer, on_auto_skip_seek: (target_time: number) => void = () => undefined) {
         this.player = player;
+        this.on_auto_skip_seek = on_auto_skip_seek;
     }
 
 
@@ -309,6 +315,7 @@ class RecordedCMSkipManager implements PlayerManager {
 
         this.last_skipped_cm_section = section;
         this.previous_playback_position = section.end_time;
+        this.on_auto_skip_seek(section.end_time);
         this.player.seek(section.end_time, true);
     };
 }
