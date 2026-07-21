@@ -144,6 +144,7 @@ async def ChannelsAPI():
             'type': channel.type,
             'name': channel.name,
             'jikkyo_force': channel.jikkyo_force,
+            'is_oneseg': channel.is_oneseg,
             'is_subchannel': channel.is_subchannel,
             'is_radiochannel': channel.is_radiochannel,
             'is_watchable': True,
@@ -309,6 +310,13 @@ async def ChannelLogoAPI(
         if await (logo_dir /f'{channel.id}.png').exists():
             return logo_dir / f'{channel.id}.png'
 
+        # ワンセグ専用ロゴがない場合は、SID のサービス種別ビットを落とした親フルセグ局のロゴを利用する
+        if channel.is_oneseg is True:
+            parent_service_id = TSInformation.calculateOneSegParentServiceID(channel.service_id)
+            parent_logo_path = logo_dir / f'NID{channel.network_id}-SID{parent_service_id:03d}.png'
+            if await parent_logo_path.exists():
+                return parent_logo_path
+
         # ***** ロゴが全国共通なので、チャンネル名の前方一致で決め打ち *****
 
         # NHK総合
@@ -419,8 +427,16 @@ async def ChannelLogoAPI(
             if len(files) == 2:
                 logo_data_ini = EDCBUtil.convertBytesToString(files[0]['data'])
                 logo_dir_index = EDCBUtil.convertBytesToString(files[1]['data'])
-                logo_id = EDCBUtil.getLogoIDFromLogoDataIni(logo_data_ini, channel.network_id, channel.service_id)
-                if logo_id >= 0:
+
+                # まずワンセグ自身のロゴを探し、存在しない場合だけ親フルセグ SID へフォールバックする
+                logo_service_ids = [channel.service_id]
+                if channel.is_oneseg is True:
+                    logo_service_ids.append(TSInformation.calculateOneSegParentServiceID(channel.service_id))
+                for logo_service_id in logo_service_ids:
+                    logo_id = EDCBUtil.getLogoIDFromLogoDataIni(logo_data_ini, channel.network_id, logo_service_id)
+                    if logo_id < 0:
+                        continue
+
                     # なるべく画質が良いロゴタイプのものを取得
                     for logo_type in [5, 2, 4, 1, 3, 0]:
                         logo_name = EDCBUtil.getLogoFileNameFromDirectoryIndex(logo_dir_index, channel.network_id, logo_id, logo_type)
@@ -430,6 +446,8 @@ async def ChannelLogoAPI(
                                 logo = files[0]['data']
                                 logo_media_type = 'image/bmp' if logo_name.upper().endswith('.BMP') else 'image/png'
                             break
+                    if logo is not None:
+                        break
 
             # 取得したロゴデータを返す
             if logo is not None and len(logo) > 0:
@@ -438,24 +456,24 @@ async def ChannelLogoAPI(
         # Mirakurun バックエンドの場合
         elif Config().general.backend == 'Mirakurun':
 
-            # Mirakurun 形式のサービス ID
-            # NID と SID を 5 桁でゼロ埋めした上で int に変換する
-            mirakurun_service_id = int(str(channel.network_id).zfill(5) + str(channel.service_id).zfill(5))
-
             # 同梱のロゴが存在しない場合のみ、Mirakurun の API からロゴを取得する
             ## mirakc においては、ユーザーが mirakc にロゴを手動設定している場合のみ局ロゴを取得できる
             try:
-                mirakurun_logo_api_url = GetMirakurunAPIEndpointURL(f'/api/services/{mirakurun_service_id}/logo')
+                # まずワンセグ自身のロゴを探し、存在しない場合だけ親フルセグ SID へフォールバックする
+                logo_service_ids = [channel.service_id]
+                if channel.is_oneseg is True:
+                    logo_service_ids.append(TSInformation.calculateOneSegParentServiceID(channel.service_id))
                 async with HTTPX_CLIENT() as client:
-                    mirakurun_logo_api_response = await client.get(mirakurun_logo_api_url, timeout=5)
+                    for logo_service_id in logo_service_ids:
+                        # Mirakurun 形式のサービス ID は NID と SID を 5 桁でゼロ埋めして連結する
+                        mirakurun_service_id = int(str(channel.network_id).zfill(5) + str(logo_service_id).zfill(5))
+                        mirakurun_logo_api_url = GetMirakurunAPIEndpointURL(f'/api/services/{mirakurun_service_id}/logo')
+                        mirakurun_logo_api_response = await client.get(mirakurun_logo_api_url, timeout=5)
 
-                # ステータスコードが 200 であれば
-                # ステータスコードが 503 の場合はロゴデータが存在しない
-                if mirakurun_logo_api_response.status_code == 200:
-
-                    # 取得したロゴデータを返す
-                    mirakurun_logo = mirakurun_logo_api_response.content
-                    return (mirakurun_logo, 'image/png')
+                        # ステータスコードが 200 であれば取得したロゴデータを返す
+                        ## ステータスコードが 503 の場合はロゴデータが存在しない
+                        if mirakurun_logo_api_response.status_code == 200:
+                            return (mirakurun_logo_api_response.content, 'image/png')
 
             # API に接続できなかった際は特にエラーは吐かず、デフォルトのロゴ画像を利用する
             except (httpx.NetworkError, httpx.TimeoutException):

@@ -42,6 +42,7 @@ class Channel(PydanticModel):
     # 地デジ以外のチャンネルまたは地域が特定できない場合は None
     terrestrial_regions: list[TerrestrialRegion] | None = None
     jikkyo_force: int | None = None
+    is_oneseg: bool = False
     is_subchannel: bool = False
     is_radiochannel: bool = False
     is_watchable: bool = False

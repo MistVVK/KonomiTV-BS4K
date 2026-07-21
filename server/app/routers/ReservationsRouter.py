@@ -243,7 +243,7 @@ async def DecodeEDCBReserveData(
         # そうでない場合はデータベースから取得する
         channel = await Channel.filter(network_id=network_id, service_id=service_id, transport_stream_id=transport_stream_id).get_or_none()
     ## 取得できなかった場合のみ、上記の限定的な情報を使って間に合わせのチャンネル情報を作成する
-    ## 通常ここでチャンネル情報が取得できないのはワンセグやデータ放送など KonomiTV ではサポートしていないサービスを予約している場合だけのはず
+    ## 通常ここでチャンネル情報が取得できないのはデータ放送など KonomiTV ではサポートしていないサービスを予約している場合だけのはず
     if channel is None:
         channel = Channel(
             id = f'NID{network_id}-SID{service_id}',

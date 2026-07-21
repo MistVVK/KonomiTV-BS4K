@@ -28,7 +28,7 @@ router = APIRouter(
     prefix = '/api/programs',
 )
 
-TimeTableSubchannelGroupKey = tuple[Literal['TS', 'BSService'], int, int]
+TimeTableSubchannelGroupKey = tuple[Literal['TS', 'OneSegTS', 'BSService'], int, int]
 
 
 def GetTimeTableChannelSortKey(channel_row: dict[str, Any]) -> tuple[int, int, int, int, str]:
@@ -96,6 +96,9 @@ def GetTimeTableSubchannelGroupKey(channel_row: dict[str, Any]) -> TimeTableSubc
     ## サブチャンネルは同一 TS 内の別サービスなので、EDCB や録画メタデータで TSID が取れている環境では
     ## NID+TSID がもっとも情報量の多い結合条件になる
     if channel_row['transport_stream_id'] is not None:
+        # フルセグとワンセグは同じ TSID を持つが、番組表では別の放送種別として表示するため結合しない
+        if TSInformation.isOneSegChannel(channel_row['type'], int(channel_row['service_id'])):
+            return ('OneSegTS', int(channel_row['network_id']), int(channel_row['transport_stream_id']))
         return ('TS', int(channel_row['network_id']), int(channel_row['transport_stream_id']))
 
     # TSID がない BS は、既知のマルチ編成だけサービス ID から親サービスへ寄せる
@@ -306,7 +309,7 @@ async def ProgramSearchAPI(
         return schemas.Programs(total=0, programs=[])
 
     # KonomiTV で管理対象の視聴可能チャンネルだけを検索結果として返す
-    ## EDCB の検索結果はワンセグや KonomiTV では除外しているチャンネル
+    ## EDCB の検索結果はデータ放送など KonomiTV では除外しているチャンネル
     ## (Ch: 042 などの基本イベント共有しかしてないサブチャンネルを含む) も返しうるが、
     ## クライアント側で整合性を合わせるのが困難になるため、API 側で事前に除外してから返す
     channel_rows = await Channel.filter(is_watchable=True).values(
@@ -371,6 +374,7 @@ async def TimeTableAPI(
     end_time: Annotated[datetime | None, Query(description='取得終了日時 (ISO8601 形式)。省略時は DB に存在する最終日時。')] = None,
     channel_type: Annotated[Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'] | None, Query(description='チャンネル種別。省略時は全種別。')] = None,
     pinned_channel_ids: Annotated[str | None, Query(description='チャンネル ID のカンマ区切りリスト (ピン留めチャンネル用)。指定時は channel_type より優先される。')] = None,
+    is_oneseg: Annotated[bool | None, Query(description='channel_type=GR のとき、ワンセグかどうかで絞り込む。省略時は両方。')] = None,
 ):
     """
     番組表データを取得する。<br>
@@ -461,6 +465,18 @@ async def TimeTableAPI(
             ORDER BY channel_number, remocon_id
         """
         channels_result = await connection.execute_query_dict(channels_query)
+
+    # is_oneseg は DB カラムではなく GR と SID からの派生値なので、取得後に各行へ追加する
+    for channel_row in channels_result:
+        channel_row['is_oneseg'] = TSInformation.isOneSegChannel(
+            channel_row['type'],
+            int(channel_row['service_id']),
+        )
+
+    # ピン留め指定がない GR 番組表だけ、要求された地デジ／ワンセグへ絞り込む
+    ## pinned_channel_ids 指定時は channel_type と同様に is_oneseg よりもユーザー指定を優先する
+    if target_channel_ids is None and channel_type == 'GR' and is_oneseg is not None:
+        channels_result = [channel_row for channel_row in channels_result if channel_row['is_oneseg'] is is_oneseg]
 
     # チャンネルがない場合は空のレスポンスを返す
     if not channels_result:

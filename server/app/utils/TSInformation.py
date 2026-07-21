@@ -391,6 +391,69 @@ class TSInformation:
 
 
     @staticmethod
+    def isOneSegService(
+        network_id: int,
+        service_type: int,
+        service_id: int,
+        partial_reception: bool | None = None,
+    ) -> bool:
+        """
+        Mirakurun / EDCB のサービス情報がワンセグかどうかを判定する
+
+        Args:
+            network_id (int): ネットワーク ID
+            service_type (int): サービス種別
+            service_id (int): サービス ID
+            partial_reception (bool | None): EDCB の部分受信フラグ。Mirakurun のように取得できない場合は None
+
+        Returns:
+            bool: ワンセグサービスなら True、それ以外なら False
+        """
+
+        # service_type=0xC0 はデータ放送や G ガイドでも利用されるため、サービス種別だけでは判定できない。
+        # 地上波ネットワークであり、ARIB TR-B14 で定義されたサービス種別ビットがワンセグ型であることも必須とする。
+        return (
+            TSInformation.getNetworkType(network_id) == 'GR' and
+            service_type == 0xC0 and
+            (service_id & 0x0180) == 0x0180 and
+            (partial_reception is None or partial_reception is True)
+        )
+
+
+    @staticmethod
+    def isOneSegChannel(type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'], service_id: int) -> bool:
+        """
+        登録済みチャンネルの種別と SID からワンセグかどうかを判定する
+
+        Args:
+            type (Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']): チャンネル種別
+            service_id (int): サービス ID
+
+        Returns:
+            bool: ワンセグチャンネルなら True、それ以外なら False
+        """
+
+        # channels テーブルはサービス種別を保持していないため、取り込み時に厳密な判定を済ませた上で、
+        # API レスポンスでは GR と SID 内のサービス種別ビットから派生値を返す。
+        return type == 'GR' and (service_id & 0x0180) == 0x0180
+
+
+    @staticmethod
+    def calculateOneSegParentServiceID(service_id: int) -> int:
+        """
+        ワンセグ SID に対応するフルセグ側のサービス ID を算出する
+
+        Args:
+            service_id (int): ワンセグのサービス ID
+
+        Returns:
+            int: 対応するフルセグ側のサービス ID
+        """
+
+        return service_id & ~0x0180
+
+
+    @staticmethod
     def getRegionIDFromNetworkID(network_id: int) -> int | None:
         """
         地デジのネットワーク ID から地域識別を取得する
@@ -727,7 +790,13 @@ class TSInformation:
         ## サービス種別とサービス番号のみを取得できる  ビットマスクした値のサービス種別が 0（テレビ型）でサービス番号が 0（プライマリサービス）であれば
         ## メインチャンネルと判定できるし、そうでなければサブチャンネルだと言える
         if type == 'GR':
-            is_subchannel = (service_id & 0x0187) != 0
+            # ワンセグはサービス種別ビット自体が 0x0180 のため、従来のマスクではすべてが
+            # サブチャンネル扱いになってしまう。ワンセグ内ではサービス番号 (下位 3bit) が
+            # 0 のサービスをメイン、それ以外を追加サービスとして扱う。
+            if TSInformation.isOneSegChannel(type, service_id):
+                is_subchannel = (service_id & 0x0007) != 0
+            else:
+                is_subchannel = (service_id & 0x0187) != 0
 
         # BS: EDCB / Mirakurun から得られる情報からはサブチャンネルかを判定できないため、決め打ちで設定
         elif type == 'BS':

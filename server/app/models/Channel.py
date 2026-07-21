@@ -59,6 +59,20 @@ class Channel(TortoiseModel):
     program_following: Any
 
     @property
+    def is_oneseg(self) -> bool:
+        """
+        チャンネルがワンセグサービスかどうかを取得する
+
+        Args:
+            self (Channel): チャンネルモデル
+
+        Returns:
+            bool: ワンセグサービスなら True、それ以外なら False
+        """
+
+        return TSInformation.isOneSegChannel(self.type, self.service_id)
+
+    @property
     def is_display(self) -> bool:
         # is_watchable が False のチャンネルは録画番組に紐付けられているだけで視聴不可なので常に False を返す
         if self.is_watchable is False:
@@ -120,6 +134,38 @@ class Channel(TortoiseModel):
 
 
     @classmethod
+    async def fetchMirakurunServices(cls) -> list[dict[str, Any]]:
+        """
+        Mirakurun / mirakc からサービス一覧を取得する
+
+        Args:
+            cls (type[Channel]): Channel クラス
+
+        Returns:
+            list[dict[str, Any]]: Mirakurun / mirakc のサービス一覧
+        """
+
+        try:
+            mirakurun_services_api_url = GetMirakurunAPIEndpointURL('/api/services')
+            async with HTTPX_CLIENT() as client:
+                response = await client.get(mirakurun_services_api_url, timeout=5)
+            if response.status_code != 200:
+                logging.error(f'Failed to get channels from Mirakurun / mirakc. (HTTP Error {response.status_code})')
+                raise Exception(f'Failed to get channels from Mirakurun / mirakc. (HTTP Error {response.status_code})')
+            services = response.json()
+            if not isinstance(services, list):
+                logging.error('Failed to get channels from Mirakurun / mirakc. (Invalid Response)')
+                raise Exception('Failed to get channels from Mirakurun / mirakc. (Invalid Response)')
+            return cast(list[dict[str, Any]], services)
+        except httpx.NetworkError as ex:
+            logging.error('Failed to get channels from Mirakurun / mirakc. (Network Error)')
+            raise ex
+        except httpx.TimeoutException as ex:
+            logging.error('Failed to get channels from Mirakurun / mirakc. (Connection Timeout)')
+            raise ex
+
+
+    @classmethod
     async def updateFromMirakurun(cls) -> None:
         """ Mirakurun バックエンドからチャンネル情報を取得し、更新する """
 
@@ -131,20 +177,16 @@ class Channel(TortoiseModel):
             duplicate_channels = {temp.id:temp for temp in await Channel.filter(is_watchable=True)}
 
             # Mirakurun / mirakc の API からチャンネル情報を取得する
-            try:
-                mirakurun_services_api_url = GetMirakurunAPIEndpointURL('/api/services')
-                async with HTTPX_CLIENT() as client:
-                    mirakurun_services_api_response = await client.get(mirakurun_services_api_url, timeout=5)
-                if mirakurun_services_api_response.status_code != 200:  # Mirakurun / mirakc からエラーが返ってきた
-                    logging.error(f'Failed to get channels from Mirakurun / mirakc. (HTTP Error {mirakurun_services_api_response.status_code})')
-                    raise Exception(f'Failed to get channels from Mirakurun / mirakc. (HTTP Error {mirakurun_services_api_response.status_code})')
-                services = mirakurun_services_api_response.json()
-            except httpx.NetworkError as ex:
-                logging.error('Failed to get channels from Mirakurun / mirakc. (Network Error)')
-                raise ex
-            except httpx.TimeoutException as ex:
-                logging.error('Failed to get channels from Mirakurun / mirakc. (Connection Timeout)')
-                raise ex
+            services = await cls.fetchMirakurunServices()
+
+            # リモコン番号が取得できないワンセグで、既存値を最後のフォールバックに利用する
+            backup_remocon_ids: dict[str, int] = {channel.id: channel.remocon_id for channel in await Channel.all()}
+
+            # ワンセグのリモコン番号を親フルセグサービスから補完するための逆引き
+            services_by_key = {
+                (int(service['networkId']), int(service['serviceId'])): service
+                for service in services
+            }
 
             # 優先地域から対応する地域識別リストを取得
             preferred_region = Config().tv.preferred_terrestrial_region
@@ -184,12 +226,15 @@ class Channel(TortoiseModel):
 
             for service in services:
 
-                # type が 0x01 (デジタルTVサービス) / 0x02 (デジタル音声サービス) / 0xa1 (161: 臨時映像サービス) /
-                # 0xa2 (162: 臨時音声サービス) / 0xad (173: 超高精細度4K専用TVサービス) 以外のサービスを弾く
-                ## ワンセグ・データ放送 (type:0xC0) やエンジニアリングサービス (type:0xA4) など
+                # type が通常の映像・音声サービス、または厳密にワンセグと判定できるサービス以外を弾く
+                is_oneseg = TSInformation.isOneSegService(
+                    int(service['networkId']),
+                    int(service['type']),
+                    int(service['serviceId']),
+                )
                 ## 詳細は ARIB STD-B10 第2部 6.2.13 に記載されている
                 ## https://web.archive.org/web/20140427183421if_/http://www.arib.or.jp/english/html/overview/doc/2-STD-B10v5_3.pdf#page=153
-                if service['type'] not in [0x01, 0x02, 0xa1, 0xa2, 0xad]:
+                if service['type'] not in [0x01, 0x02, 0xa1, 0xa2, 0xad] and is_oneseg is False:
                     continue
 
                 # 不明なネットワーク ID のチャンネルを弾く
@@ -197,8 +242,28 @@ class Channel(TortoiseModel):
                 if channel_type == 'OTHER':
                     continue
 
+                # SID のサービス種別ビットがワンセグ型なのに、service type を含む厳密判定が
+                # ワンセグでない不整合サービスは登録しない。保存後は channels テーブルに
+                # service type が残らないため、ここで除外しないと API 上だけワンセグ扱いになる。
+                if TSInformation.isOneSegChannel(channel_type, int(service['serviceId'])) is True and is_oneseg is False:
+                    continue
+
                 # チャンネル ID
                 channel_id = f'NID{service["networkId"]}-SID{service["serviceId"]:03d}'
+
+                # Mirakurun のワンセグサービスには remoteControlKeyId がない実装もあるため、
+                # 対応するフルセグ親サービス、既存 DB 値の順に補完する
+                remocon_id = int(service.get('remoteControlKeyId', 0) or 0)
+                if is_oneseg is True and remocon_id <= 0:
+                    parent_service_id = TSInformation.calculateOneSegParentServiceID(int(service['serviceId']))
+                    parent_service = services_by_key.get((int(service['networkId']), parent_service_id))
+                    if parent_service is not None:
+                        remocon_id = int(parent_service.get('remoteControlKeyId', 0) or 0)
+                    if remocon_id <= 0:
+                        remocon_id = backup_remocon_ids.get(channel_id, 0)
+                    if remocon_id <= 0:
+                        logging.warning(f'OneSeg channel: {channel_id} has no remote control key ID, skipped.')
+                        continue
 
                 # 既にレコードがある場合は更新、ない場合は新規作成
                 duplicate_channel = duplicate_channels.pop(channel_id, None)
@@ -229,7 +294,7 @@ class Channel(TortoiseModel):
                 ## BS/CS など NID から TSID を推測できないチャンネルでは、既存レコードの transport_stream_id を触らない
                 if channel_type == 'GR':
                     channel.transport_stream_id = channel.network_id
-                channel.remocon_id = int(service['remoteControlKeyId']) if ('remoteControlKeyId' in service) else 0
+                channel.remocon_id = remocon_id
                 channel.type = channel_type
                 channel.name = TSInformation.formatString(service['name'])
                 channel.jikkyo_force = None
@@ -322,11 +387,28 @@ class Channel(TortoiseModel):
         # "Specified display_channel_id was not found" エラーでフロントエンドを誤動作させるのを防ぐためのもの
         async with transactions.in_transaction():
 
+            # EDCB をメタデータ元、Mirakurun をライブ受信元にする構成では、Mirakurun 側でも
+            # 実際に選局できるワンセグだけを視聴可能として登録する。取得失敗時は例外を送出し、
+            # このトランザクション内のチャンネル更新をすべてロールバックする。
+            mirakurun_oneseg_service_keys: set[tuple[int, int]] | None = None
+            if Config().general.always_receive_tv_from_mirakurun is True:
+                mirakurun_services = await cls.fetchMirakurunServices()
+                mirakurun_oneseg_service_keys = {
+                    (int(service['networkId']), int(service['serviceId']))
+                    for service in mirakurun_services
+                    if TSInformation.isOneSegService(
+                        int(service['networkId']),
+                        int(service['type']),
+                        int(service['serviceId']),
+                    )
+                }
+
             # この変数から更新対象のチャンネル情報を削除していき、残った古いチャンネル情報を最後にまとめて削除する
             duplicate_channels = {temp.id:temp for temp in await Channel.filter(is_watchable=True)}
 
             # リモコン番号が取得できない場合に備えてバックアップ
-            backup_remocon_ids: dict[str, int] = {channel.id: channel.remocon_id for channel in await Channel.filter(is_watchable=True)}
+            ## 録画メタデータから先に登録されたワンセグは is_watchable=False なので、全チャンネルを対象にする
+            backup_remocon_ids: dict[str, int] = {channel.id: channel.remocon_id for channel in await Channel.all()}
 
             # CtrlCmdUtil を初期化
             edcb = CtrlCmdUtil()
@@ -375,6 +457,16 @@ class Channel(TortoiseModel):
             ## あればラッキー程度の情報と考えてほしい
             epg_services = await edcb.sendEnumService() or []
 
+            # ワンセグのリモコン番号を親フルセグサービスから補完するための逆引き
+            services_by_key = {
+                (int(service['onid']), int(service['sid'])): service
+                for service in services
+            }
+            epg_services_by_key = {
+                (int(service['onid']), int(service['sid'])): service
+                for service in epg_services
+            }
+
             # 同じネットワーク ID のサービスのカウント
             same_network_id_counts: dict[int, int] = {}
 
@@ -383,12 +475,25 @@ class Channel(TortoiseModel):
 
             for service in services:
 
-                # type が 0x01 (デジタルTVサービス) / 0x02 (デジタル音声サービス) / 0xa1 (161: 臨時映像サービス) /
-                # 0xa2 (162: 臨時音声サービス) / 0xad (173: 超高精細度4K専用TVサービス) 以外のサービスを弾く
-                ## ワンセグ・データ放送 (type:0xC0) やエンジニアリングサービス (type:0xA4) など
+                # EDCB では共通のワンセグ判定に加え、ChSet5.txt の部分受信フラグを必須とする
+                ## これにより同じ type=0xC0 の G ガイドやデータ放送を取り込まない
+                is_oneseg = TSInformation.isOneSegService(
+                    int(service['onid']),
+                    int(service['service_type']),
+                    int(service['sid']),
+                    partial_reception=service['partial_flag'],
+                )
                 ## 詳細は ARIB STD-B10 第2部 6.2.13 に記載されている
                 ## https://web.archive.org/web/20140427183421if_/http://www.arib.or.jp/english/html/overview/doc/2-STD-B10v5_3.pdf#page=153
-                if service['service_type'] not in [0x01, 0x02, 0xa1, 0xa2, 0xad]:
+                if service['service_type'] not in [0x01, 0x02, 0xa1, 0xa2, 0xad] and is_oneseg is False:
+                    continue
+
+                # ハイブリッド構成のワンセグは、Mirakurun に同じ NID-SID がある場合だけ視聴可能にする
+                if (
+                    is_oneseg is True and
+                    mirakurun_oneseg_service_keys is not None and
+                    (int(service['onid']), int(service['sid'])) not in mirakurun_oneseg_service_keys
+                ):
                     continue
 
                 # 不明なネットワーク ID のチャンネルを弾く
@@ -396,8 +501,36 @@ class Channel(TortoiseModel):
                 if channel_type == 'OTHER':
                     continue
 
+                # SID のサービス種別ビットがワンセグ型なのに、service type と部分受信フラグを
+                # 含む厳密判定がワンセグでない不整合サービスは登録しない。
+                if TSInformation.isOneSegChannel(channel_type, int(service['sid'])) is True and is_oneseg is False:
+                    continue
+
                 # チャンネル ID
                 channel_id = f'NID{service["onid"]}-SID{service["sid"]:03d}'
+
+                # EDCB のワンセグサービスにはリモコン番号がない場合があるため、現在サービスの EPG、
+                # 対応するフルセグ親サービス、既存 DB 値の順に補完する
+                oneseg_remocon_id: int | None = None
+                if is_oneseg is True:
+                    oneseg_remocon_id = int(service['remocon_id'])
+                    current_epg_service = epg_services_by_key.get((int(service['onid']), int(service['sid'])))
+                    if oneseg_remocon_id <= 0 and current_epg_service is not None:
+                        oneseg_remocon_id = int(current_epg_service['remote_control_key_id'])
+
+                    parent_service_id = TSInformation.calculateOneSegParentServiceID(int(service['sid']))
+                    parent_service = services_by_key.get((int(service['onid']), parent_service_id))
+                    if oneseg_remocon_id <= 0 and parent_service is not None:
+                        oneseg_remocon_id = int(parent_service['remocon_id'])
+                    parent_epg_service = epg_services_by_key.get((int(service['onid']), parent_service_id))
+                    if oneseg_remocon_id <= 0 and parent_epg_service is not None:
+                        oneseg_remocon_id = int(parent_epg_service['remote_control_key_id'])
+
+                    if oneseg_remocon_id <= 0:
+                        oneseg_remocon_id = backup_remocon_ids.get(channel_id, 0)
+                    if oneseg_remocon_id <= 0:
+                        logging.warning(f'OneSeg channel: {channel_id} has no remote control key ID, skipped.')
+                        continue
 
                 # 既にレコードがある場合は更新、ない場合は新規作成
                 duplicate_channel = duplicate_channels.pop(channel_id, None)
@@ -424,7 +557,8 @@ class Channel(TortoiseModel):
                 channel.service_id = int(service['sid'])
                 channel.network_id = int(service['onid'])
                 channel.transport_stream_id = int(service['tsid'])
-                channel.remocon_id = int(service['remocon_id'])  # EDCB-240213 未満の EDCB では ChSet5.txt からリモコン番号を取得できず、常に 0 になる
+                # EDCB-240213 未満の EDCB では ChSet5.txt からリモコン番号を取得できず、常に 0 になる
+                channel.remocon_id = oneseg_remocon_id if oneseg_remocon_id is not None else int(service['remocon_id'])
                 channel.type = channel_type
                 channel.name = TSInformation.formatString(service['service_name'])
                 channel.jikkyo_force = None
@@ -459,26 +593,31 @@ class Channel(TortoiseModel):
                 ## 地デジ: EDCB からリモコン番号を取得
                 if channel.type == 'GR':
 
+                    # ワンセグはチャンネル生成前に親サービスまで含めて解決済みなので、ここでは上書きしない
+                    if is_oneseg is True:
+                        pass
+
                     # EPG 由来のチャンネル情報から現在のチャンネルのリモコン番号を取得
                     ## EDCB-240213 以降であれば ChSet5.txt にリモコン番号が含まれているが、それ以前のバージョンでは
                     ## EPG 由来のチャンネル情報以外からはリモコン番号を取得できないことによる対応
-                    epg_service = next(filter(lambda temp: temp['onid'] == channel.network_id and temp['sid'] == channel.service_id, epg_services), None)
-
-                    if epg_service is not None:
-                        # EPG 由来のチャンネル情報が取得できていればリモコン番号を取得
-                        channel.remocon_id = int(epg_service['remote_control_key_id'])
                     else:
-                        # 取得できなかったので、あれば以前のバックアップからリモコン番号を取得
-                        if channel.remocon_id <= 0 and channel.id in backup_remocon_ids:
-                            channel.remocon_id = backup_remocon_ids.get(channel.id, 0)
+                        epg_service = next(filter(lambda temp: temp['onid'] == channel.network_id and temp['sid'] == channel.service_id, epg_services), None)
 
-                        # それでもリモコン番号が不明の時は、同じネットワーク ID を持つ別サービスのリモコン番号を取得する
-                        ## 地上波の臨時サービスはリモコン番号が取得できないことが多い問題への対応
-                        if channel.remocon_id <= 0:
-                            for temp in epg_services:
-                                if temp['onid'] == channel.network_id and temp['sid'] != channel.service_id:
-                                    channel.remocon_id = int(temp['remote_control_key_id'])
-                                    break
+                        if epg_service is not None:
+                            # EPG 由来のチャンネル情報が取得できていればリモコン番号を取得
+                            channel.remocon_id = int(epg_service['remote_control_key_id'])
+                        else:
+                            # 取得できなかったので、あれば以前のバックアップからリモコン番号を取得
+                            if channel.remocon_id <= 0 and channel.id in backup_remocon_ids:
+                                channel.remocon_id = backup_remocon_ids.get(channel.id, 0)
+
+                            # それでもリモコン番号が不明の時は、同じネットワーク ID を持つ別サービスのリモコン番号を取得する
+                            ## 地上波の臨時サービスはリモコン番号が取得できないことが多い問題への対応
+                            if channel.remocon_id <= 0:
+                                for temp in epg_services:
+                                    if temp['onid'] == channel.network_id and temp['sid'] != channel.service_id:
+                                        channel.remocon_id = int(temp['remote_control_key_id'])
+                                        break
 
                 ## それ以外: サービス ID からリモコン番号を算出
                 else:

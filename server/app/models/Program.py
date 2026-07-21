@@ -239,7 +239,7 @@ class Program(TortoiseModel):
                     # この番組が放送されるチャンネルの情報を取得
                     channel = channels.get(f'NID{program_info["networkId"]}-SID{program_info["serviceId"]:03d}', None)
 
-                    # 登録されていないチャンネルの番組を弾く（ワンセグやデータ放送など）
+                    # 登録されていないチャンネルの番組を弾く（データ放送など）
                     if channel is None:
                         continue
 
@@ -543,7 +543,7 @@ class Program(TortoiseModel):
                     ## (BS トランスポンダ再編時など) に同一チャンネルの重複追加を回避できる
                     ## EDCB バックエンド利用時、Channel レコードには必ず TSID が設定されている (Mirakurun バックエンド利用時は常に null)
                     channel = await Channel.filter(network_id=nid, service_id=sid, transport_stream_id=tsid).first()
-                    if channel is None:  # 登録されていないチャンネルの番組を弾く（ワンセグやデータ放送など）
+                    if channel is None:  # 登録されていないチャンネルの番組を弾く（データ放送など）
                         continue
 
                     # 番組情報ごとに
