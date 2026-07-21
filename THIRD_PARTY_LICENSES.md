@@ -3355,10 +3355,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ****************************************************************************
 ```
 
-#### tsreadex 7f2d2aec01c1
+#### tsreadex 33ea51d46b5b
 
 - Source: <https://github.com/MistVVK/tsreadex>
-- Fixed revision or artifact: `7f2d2aec01c1f7ebb7290c5180f34fe49211d9ee`
+- Fixed revision or artifact: `33ea51d46b5bb6a66a35b15793394c0765c0167a`
 
 ##### License.txt
 
