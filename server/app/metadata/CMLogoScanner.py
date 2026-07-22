@@ -31,7 +31,7 @@ _MAX_LOGO_PIXELS = 4_194_304
 
 
 class CMLogoUnsupportedError(ValueError):
-    """構造は判別できるがKonomiTVでは扱わないロゴ形式を表す。"""
+    """構造は判別できるがKonomiTV-BS4Kでは扱わないロゴ形式を表す。"""
 
 
 @dataclass(frozen=True, slots=True)

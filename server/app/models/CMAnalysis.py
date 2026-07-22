@@ -81,7 +81,7 @@ class CMLogo(TortoiseModel):
 
 
 class CMLogoServiceAssignment(TortoiseModel):
-    """SIDロゴをKonomiTV固有のNID・TSIDサービスへ割り当てる。"""
+    """SIDロゴをKonomiTV-BS4K固有のNID・TSIDサービスへ割り当てる。"""
 
     class Meta(TortoiseModel.Meta):
         table: str = 'cm_logo_service_assignments'

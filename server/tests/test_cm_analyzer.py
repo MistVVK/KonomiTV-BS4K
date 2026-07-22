@@ -890,7 +890,7 @@ def test_completed_analysis_uses_recording_duration_for_trailing_cm(tmp_path: Pa
 
     assert result.status == 'completed'
     assert result.sections == ({'start_time': 59.9599, 'end_time': 60.0},)
-    assert result.analyzer_version == 'KonomiTV-CM-8'
+    assert result.analyzer_version == 'cm-8'
 
 
 def test_analyzer_requires_precreated_private_workspace(tmp_path: Path) -> None:

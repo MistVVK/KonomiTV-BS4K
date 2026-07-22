@@ -16,7 +16,7 @@ from tortoise import transactions
 
 from app import logging
 from app.config import Config
-from app.constants import JST, VERSION
+from app.constants import BS4K_VERSION, JST
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
 from app.metadata.CMAnalysisPaths import ResolveCMHostPath
 from app.metadata.CMAnalysisWorkspace import (
@@ -42,13 +42,13 @@ from app.metadata.CMChapterFile import (
 )
 from app.metadata.CMLogoScanner import CMLogoScanner
 from app.metadata.CMLogoSelector import CMLogoSelection, CMLogoSelector
-from app.metadata.KonomiTVChapterFile import (
-    BuildKonomiTVChapterFile,
-    CommitKonomiTVChapterFile,
-    GetKonomiTVChapterPath,
-    KonomiTVChapterConflictError,
-    KonomiTVChapterReadResult,
-    ReadKonomiTVChapterFileAsync,
+from app.metadata.KonomiTVBS4KChapterFile import (
+    BuildKonomiTVBS4KChapterFile,
+    CommitKonomiTVBS4KChapterFile,
+    GetKonomiTVBS4KChapterPath,
+    KonomiTVBS4KChapterConflictError,
+    KonomiTVBS4KChapterReadResult,
+    ReadKonomiTVBS4KChapterFileAsync,
 )
 from app.models.CMAnalysis import (
     CMAnalysisExcludedDirectory,
@@ -69,7 +69,7 @@ from app.utils.DriveIOLimiter import DriveIOLimiter
 
 
 CMAnalysisIntent = Literal['DetectCM', 'CMChapterSync', 'CMDetection', 'CMRegeneration']
-CMChapterReadResultType = CMChapterReadResult | KonomiTVChapterReadResult
+CMChapterReadResultType = CMChapterReadResult | KonomiTVBS4KChapterReadResult
 
 
 class CMAnalysisOrchestrator:
@@ -186,10 +186,10 @@ class CMAnalysisOrchestrator:
             chapter_result = await self._readChapterFile(chapter_selection, recorded_video.duration)
             if chapter_result.status in ('Valid', 'ValidNoCM'):
                 if chapter_selection.kind == 'Canonical':
-                    assert isinstance(chapter_result, KonomiTVChapterReadResult)
+                    assert isinstance(chapter_result, KonomiTVBS4KChapterReadResult)
                     provenance = chapter_result.provenance
                     if provenance is not None and provenance.source == 'Manual':
-                        # 手書きYAML、またはKonomiTV生成YAMLのchaptersを人が編集した結果は
+                        # 手書きYAML、またはKonomiTV-BS4K生成YAMLのchaptersを人が編集した結果は
                         # 利用者入力として常に保護する。
                         return await self._publishChapterResult(
                             recorded_video,
@@ -620,7 +620,7 @@ class CMAnalysisOrchestrator:
                         if current_chapter_selection.kind == 'Legacy':
                             changed_source = 'Existing'
                         else:
-                            assert isinstance(current_chapter_result, KonomiTVChapterReadResult)
+                            assert isinstance(current_chapter_result, KonomiTVBS4KChapterReadResult)
                             provenance = current_chapter_result.provenance
                             if provenance is not None and provenance.source == 'Manual':
                                 changed_source = 'Manual'
@@ -689,10 +689,10 @@ class CMAnalysisOrchestrator:
                 )
                 generated_at = datetime.now(tz=JST)
                 try:
-                    generated_yaml = BuildKonomiTVChapterFile(
+                    generated_yaml = BuildKonomiTVBS4KChapterFile(
                         result.sections,
                         recorded_video.duration,
-                        application_version=VERSION,
+                        application_version=BS4K_VERSION,
                         pipeline_version=result.analyzer_version,
                         generated_at=generated_at,
                         input_fingerprint=input_fingerprint,
@@ -727,11 +727,11 @@ class CMAnalysisOrchestrator:
                 commit_future = asyncio.get_running_loop().run_in_executor(
                     None,
                     partial(
-                        CommitKonomiTVChapterFile,
-                        GetKonomiTVChapterPath(Path(recorded_video.file_path)),
+                        CommitKonomiTVBS4KChapterFile,
+                        GetKonomiTVBS4KChapterPath(Path(recorded_video.file_path)),
                         result.sections,
                         recorded_video.duration,
-                        application_version=VERSION,
+                        application_version=BS4K_VERSION,
                         pipeline_version=result.analyzer_version,
                         generated_at=generated_at,
                         input_fingerprint=input_fingerprint,
@@ -740,7 +740,7 @@ class CMAnalysisOrchestrator:
                 )
                 try:
                     committed, cancellation_during_commit = await self._awaitCommitFuture(commit_future)
-                except KonomiTVChapterConflictError as ex:
+                except KonomiTVBS4KChapterConflictError as ex:
                     state.chapter_source = None
                     state = await self._saveAttemptFailure(
                         state,
@@ -863,8 +863,8 @@ class CMAnalysisOrchestrator:
 
     @staticmethod
     async def _awaitCommitFuture(
-        commit_future: asyncio.Future[KonomiTVChapterReadResult],
-    ) -> tuple[KonomiTVChapterReadResult, bool]:
+        commit_future: asyncio.Future[KonomiTVBS4KChapterReadResult],
+    ) -> tuple[KonomiTVBS4KChapterReadResult, bool]:
         """executor commitをキャンセルから保護し、完了をjoinしてから要求有無と結果を返す。"""
 
         cancellation_requested = False
@@ -989,7 +989,7 @@ class CMAnalysisOrchestrator:
         return f'vaapi:{devices[0]}' if devices else None
 
     async def _selectChapterPath(self, recorded_path: Path) -> CMChapterPathSelection:
-        yaml_path = GetKonomiTVChapterPath(recorded_path)
+        yaml_path = GetKonomiTVBS4KChapterPath(recorded_path)
         if yaml_path.is_file():
             return CMChapterPathSelection(yaml_path, 'Canonical')
 
@@ -1003,7 +1003,7 @@ class CMAnalysisOrchestrator:
         basic_selection = SelectCMChapterPath(recorded_path, registered_paths)
         if basic_selection is not None:
             return basic_selection
-        # YAMLはKonomiTVの唯一の出力先であり、欠落fingerprint/CASの基準にもする。
+        # YAMLはKonomiTV-BS4Kの唯一の出力先であり、欠落fingerprint/CASの基準にもする。
         return CMChapterPathSelection(yaml_path, 'Canonical')
 
     @staticmethod
@@ -1014,12 +1014,12 @@ class CMAnalysisOrchestrator:
         """選択したsidecar形式だけを読み込み、旧完全名.chapter.txtは参照しない。"""
 
         if selection.kind == 'Canonical':
-            return await ReadKonomiTVChapterFileAsync(selection.path, duration_sec)
+            return await ReadKonomiTVBS4KChapterFileAsync(selection.path, duration_sec)
         return await ReadCMChapterFileAsync(selection.path, duration_sec)
 
     @staticmethod
     def _isGeneratedChapterForInput(
-        chapter_result: KonomiTVChapterReadResult,
+        chapter_result: KonomiTVBS4KChapterReadResult,
         input_fingerprint: Mapping[str, int | str],
     ) -> bool:
         """YAMLの生成由来と録画fingerprintが現在の入力に一致するか検証する。"""

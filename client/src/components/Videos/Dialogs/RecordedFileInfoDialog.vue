@@ -280,9 +280,9 @@ const formatCMResultSource = (): string => {
     if (recorded_video.cm_result_source === null) return 'なし';
     const verification = recorded_video.cm_result_verified === false ? ' / 未検証移行データ' : '';
     if (recorded_video.cm_result_source === 'Generated') {
-        const engine_version = recorded_video.cm_result_pipeline_version?.match(/^KonomiTV-CM-(\d+)$/)?.[1] ?? null;
+        const engine_version = recorded_video.cm_result_pipeline_version?.match(/^cm-([1-9][0-9]*)$/)?.[1] ?? null;
         const engine_label = engine_version !== null ? `（解析エンジン v${engine_version}）` : '';
-        return `KonomiTV自動解析${engine_label}${verification}`;
+        return `KonomiTV-BS4K自動解析${engine_label}${verification}`;
     }
     if (recorded_video.cm_result_source === 'Manual') {
         return `手動編集 YAML${verification}`;

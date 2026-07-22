@@ -263,7 +263,7 @@ async def CMLogoUpdateAPI(
     update: Annotated[schemas.CMLogoUpdate, Body(description='更新するロゴ設定。')],
     current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> None:
-    """共有ファイルを変更せずKonomiTV側の有効状態だけを更新する。"""
+    """共有ファイルを変更せずKonomiTV-BS4K側の有効状態だけを更新する。"""
 
     del current_user
     logo = await CMLogo.get_or_none(id=logo_id)
@@ -279,7 +279,7 @@ async def CMLogoUpdateAPI(
     response_model=list[schemas.CMLogoServiceAssignment],
 )
 async def CMLogoAssignmentsAPI() -> list[schemas.CMLogoServiceAssignment]:
-    """KonomiTV固有のNID・TSID割り当てと「ロゴなし」指定を返す。"""
+    """KonomiTV-BS4K固有のNID・TSID割り当てと「ロゴなし」指定を返す。"""
 
     assignments = await CMLogoServiceAssignment.all().order_by('network_id', 'transport_stream_id', 'service_id', 'id')
     return [schemas.CMLogoServiceAssignment.model_validate(assignment, from_attributes=True) for assignment in assignments]
@@ -329,7 +329,7 @@ async def CMLogoAssignmentDeleteAPI(
     assignment_id: int,
     current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> None:
-    """KonomiTV固有の割り当てだけを削除し、共有ロゴは変更しない。"""
+    """KonomiTV-BS4K固有の割り当てだけを削除し、共有ロゴは変更しない。"""
 
     del current_user
     assignment = await CMLogoServiceAssignment.get_or_none(id=assignment_id)

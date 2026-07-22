@@ -13,10 +13,10 @@ import pytest
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalyzer import CMInputDescriptor
 from app.metadata.CMLogoSelector import CMLogoSelection
-from app.metadata.KonomiTVChapterFile import (
-    KonomiTVChapterProvenance,
-    KonomiTVChapterReadResult,
-    KonomiTVChapterRecording,
+from app.metadata.KonomiTVBS4KChapterFile import (
+    KonomiTVBS4KChapterProvenance,
+    KonomiTVBS4KChapterReadResult,
+    KonomiTVBS4KChapterRecording,
 )
 from app.models.CMAnalysis import CMLogo, RecordedVideoCMAnalysis
 from app.schemas import AudioTrackTimelineEntry
@@ -227,19 +227,19 @@ def test_generated_result_requires_matching_chapter_hash() -> None:
 
 
 def test_generated_yaml_requires_verified_provenance_and_current_recording_input() -> None:
-    """Generated YAMLは検証済み出自と現在の録画fingerprintが揃った場合だけ自前生成とみなす。"""
+    """KonomiTV-BS4K生成YAMLは検証済み出自と現在の録画fingerprintが揃った場合だけ自前生成とみなす。"""
 
-    recording = KonomiTVChapterRecording(
+    recording = KonomiTVBS4KChapterRecording(
         duration_ms=60_000,
         size=100,
         mtime_ns=200,
         sample_sha256='a' * 64,
     )
-    generated = KonomiTVChapterReadResult(
+    generated = KonomiTVBS4KChapterReadResult(
         'ValidNoCM',
         (),
         {'exists': True, 'sha256': 'b' * 64},
-        KonomiTVChapterProvenance(
+        KonomiTVBS4KChapterProvenance(
             source='Generated',
             generator_present=True,
             generator_consistent=True,
@@ -263,11 +263,11 @@ def test_generated_yaml_requires_verified_provenance_and_current_recording_input
 def test_manual_yaml_is_never_treated_as_generated_for_current_input() -> None:
     """生成情報を持たない手書きYAMLは上書き対象にしない。"""
 
-    manual = KonomiTVChapterReadResult(
+    manual = KonomiTVBS4KChapterReadResult(
         'ValidNoCM',
         (),
         {'exists': True, 'sha256': 'b' * 64},
-        KonomiTVChapterProvenance(
+        KonomiTVBS4KChapterProvenance(
             source='Manual',
             generator_present=False,
             generator_consistent=None,
@@ -322,7 +322,7 @@ def test_commit_executor_future_is_joined_before_cancellation_is_propagated() ->
         # run_in_executor() と同じ concurrent Future -> asyncio Future の橋渡しだけを再現する。
         # このホストの Python は default ThreadPoolExecutor の終了が不能なため、実スレッドを
         # 起動すると helper の成否に関係なく asyncio.run() の shutdown でテストが停止する。
-        worker_future: Future[KonomiTVChapterReadResult] = Future()
+        worker_future: Future[KonomiTVBS4KChapterReadResult] = Future()
         commit_future = asyncio.wrap_future(worker_future)
         waiter = asyncio.create_task(CMAnalysisOrchestrator._awaitCommitFuture(commit_future))
         # helper が最初の wait へ入ってからキャンセルし、本番の commit 中断を再現する。
@@ -332,7 +332,7 @@ def test_commit_executor_future_is_joined_before_cancellation_is_propagated() ->
         assert waiter.done() is False
         assert commit_future.cancelled() is False
         assert worker_future.cancelled() is False
-        worker_future.set_result(KonomiTVChapterReadResult('Missing', (), {'exists': False}, None))
+        worker_future.set_result(KonomiTVBS4KChapterReadResult('Missing', (), {'exists': False}, None))
         result, cancellation_requested = await waiter
         assert result.status == 'Missing'
         assert cancellation_requested is True

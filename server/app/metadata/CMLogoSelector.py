@@ -25,7 +25,7 @@ class CMLogoSelection:
 
 
 class CMLogoSelector:
-    """SID共有ロゴとKonomiTV固有のNID・TSID割り当てを分離して選択する。"""
+    """SID共有ロゴとKonomiTV-BS4K固有のNID・TSID割り当てを分離して選択する。"""
 
     @staticmethod
     async def select(

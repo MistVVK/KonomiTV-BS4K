@@ -29,19 +29,19 @@ from ruamel.yaml.error import YAMLError  # type: ignore[reportMissingTypeStubs]
 from app.schemas import CMSection
 
 
-KonomiTVChapterReadStatus = Literal['Valid', 'ValidNoCM', 'Missing', 'Invalid', 'IOError']
-KonomiTVChapterSource = Literal['Generated', 'Manual']
-KonomiTVChapterFingerprint = dict[str, int | str | bool]
+KonomiTVBS4KChapterReadStatus = Literal['Valid', 'ValidNoCM', 'Missing', 'Invalid', 'IOError']
+KonomiTVBS4KChapterSource = Literal['Generated', 'Manual']
+KonomiTVBS4KChapterFingerprint = dict[str, int | str | bool]
 
-_SCHEMA_VERSION = 'konomitv/chapters/v1'
-_SIDECAR_SUFFIX = '.konomitv-chapters.yaml'
+_SCHEMA_VERSION = 'konomitv-bs4k/chapters/v1'
+_SIDECAR_SUFFIX = '.konomitv-bs4k-chapters.yaml'
 _MAX_FILE_SIZE = 4 * 1024 * 1024
 _TIMESTAMP_PATTERN = re.compile(
     r'^(?P<hours>\d{2,}):(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)\.(?P<milliseconds>\d{3})$',
 )
 
 
-class KonomiTVChapterEntry(BaseModel):
+class KonomiTVBS4KChapterEntry(BaseModel):
     """一つのチャプター境界と、次の境界までの区間種別を表す。"""
 
     model_config = ConfigDict(extra='forbid', strict=True)
@@ -69,14 +69,14 @@ class KonomiTVChapterEntry(BaseModel):
         return value
 
 
-class KonomiTVChapterGenerator(BaseModel):
-    """KonomiTVがsidecarを生成したときの由来情報を表す。"""
+class KonomiTVBS4KChapterGenerator(BaseModel):
+    """KonomiTV-BS4Kがsidecarを生成したときの由来情報を表す。"""
 
     model_config = ConfigDict(extra='forbid', strict=True)
 
-    name: Literal['KonomiTV']
+    name: Literal['KonomiTV-BS4K']
     application_version: Annotated[str, Field(min_length=1, max_length=128)]
-    pipeline_version: Annotated[str, Field(min_length=1, max_length=128)]
+    pipeline_version: Annotated[str, Field(pattern=r'^cm-[1-9][0-9]*$', max_length=128)]
     generated_at: Annotated[str, Field(min_length=1, max_length=64)]
     chapters_sha256: Annotated[str, Field(pattern=r'^[0-9a-f]{64}$')]
 
@@ -94,7 +94,7 @@ class KonomiTVChapterGenerator(BaseModel):
         return value
 
 
-class KonomiTVChapterRecording(BaseModel):
+class KonomiTVBS4KChapterRecording(BaseModel):
     """生成元録画を識別し、古いsidecarの誤採用を防ぐ情報を表す。"""
 
     model_config = ConfigDict(extra='forbid', strict=True)
@@ -105,18 +105,21 @@ class KonomiTVChapterRecording(BaseModel):
     sample_sha256: Annotated[str, Field(pattern=r'^[0-9a-f]{64}$')]
 
 
-class KonomiTVChapterDocument(BaseModel):
-    """KonomiTV chapter sidecar v1の文書全体を表す。"""
+class KonomiTVBS4KChapterDocument(BaseModel):
+    """KonomiTV-BS4K chapter sidecar v1の文書全体を表す。"""
 
     model_config = ConfigDict(extra='forbid', populate_by_name=True, strict=True)
 
-    schema_version: Literal['konomitv/chapters/v1'] = Field(alias='schema', serialization_alias='schema')
-    chapters: Annotated[list[KonomiTVChapterEntry], Field(min_length=1, max_length=100_000)]
-    generator: KonomiTVChapterGenerator | None = None
-    recording: KonomiTVChapterRecording | None = None
+    schema_version: Annotated[
+        Literal['konomitv-bs4k/chapters/v1'],
+        Field(alias='schema', serialization_alias='schema'),
+    ]
+    chapters: Annotated[list[KonomiTVBS4KChapterEntry], Field(min_length=1, max_length=100_000)]
+    generator: KonomiTVBS4KChapterGenerator | None = None
+    recording: KonomiTVBS4KChapterRecording | None = None
 
     @model_validator(mode='after')
-    def ValidateDocument(self) -> KonomiTVChapterDocument:
+    def ValidateDocument(self) -> KonomiTVBS4KChapterDocument:
         """境界順序と生成メタデータの内部整合性を検証する。"""
 
         timestamps_ms = [_ParseTimestampMilliseconds(chapter.at) for chapter in self.chapters]
@@ -125,46 +128,46 @@ class KonomiTVChapterDocument(BaseModel):
         if any(current <= previous for previous, current in pairwise(timestamps_ms)):
             raise ValueError('Chapter timestamps must be strictly increasing.')
 
-        # generatorとrecordingは一組で初めてKonomiTV生成物の出自検証に使える。
+        # generatorとrecordingは一組で初めてKonomiTV-BS4K生成物の出自検証に使える。
         if (self.generator is None) != (self.recording is None):
             raise ValueError('generator and recording must either both be present or both be omitted.')
         return self
 
 
 @dataclass(frozen=True, slots=True)
-class KonomiTVChapterProvenance:
-    """手書きとKonomiTV生成物を区別するための検証済み由来情報をまとめる。"""
+class KonomiTVBS4KChapterProvenance:
+    """手書きとKonomiTV-BS4K生成物を区別するための検証済み由来情報をまとめる。"""
 
-    source: KonomiTVChapterSource
+    source: KonomiTVBS4KChapterSource
     generator_present: bool
     generator_consistent: bool | None
-    generator: KonomiTVChapterGenerator | None
-    recording: KonomiTVChapterRecording | None
+    generator: KonomiTVBS4KChapterGenerator | None
+    recording: KonomiTVBS4KChapterRecording | None
 
 
 @dataclass(frozen=True, slots=True)
-class KonomiTVChapterReadResult:
+class KonomiTVBS4KChapterReadResult:
     """YAML sidecarの読込状態、CM区間、fingerprint、由来をまとめる。"""
 
-    status: KonomiTVChapterReadStatus
+    status: KonomiTVBS4KChapterReadStatus
     sections: tuple[CMSection, ...]
-    fingerprint: KonomiTVChapterFingerprint
-    provenance: KonomiTVChapterProvenance | None
+    fingerprint: KonomiTVBS4KChapterFingerprint
+    provenance: KonomiTVBS4KChapterProvenance | None
     error_code: str | None = None
     error_message: str | None = None
 
 
-class KonomiTVChapterConflictError(ValueError):
+class KonomiTVBS4KChapterConflictError(ValueError):
     """解析中に確定先sidecarが変更され、原子的な公開を中止したことを表す。"""
 
 
-def GetKonomiTVChapterPath(recorded_file_path: Path) -> Path:
-    """録画ファイルに対応するKonomiTV YAML sidecarのパスを返す。"""
+def GetKonomiTVBS4KChapterPath(recorded_file_path: Path) -> Path:
+    """録画ファイルに対応するKonomiTV-BS4K YAML sidecarのパスを返す。"""
 
     return recorded_file_path.with_name(f'{recorded_file_path.name}{_SIDECAR_SUFFIX}')
 
 
-def GetRecordedPathFromKonomiTVChapterPath(
+def GetRecordedPathFromKonomiTVBS4KChapterPath(
     chapter_file_path: Path,
     candidate_extensions: set[str],
 ) -> Path | None:
@@ -180,7 +183,7 @@ def GetRecordedPathFromKonomiTVChapterPath(
     return recorded_path
 
 
-def BuildKonomiTVChapterFile(
+def BuildKonomiTVBS4KChapterFile(
     sections: Iterable[CMSection],
     duration_sec: float,
     *,
@@ -189,12 +192,12 @@ def BuildKonomiTVChapterFile(
     generated_at: datetime | str,
     input_fingerprint: Mapping[str, int | str],
 ) -> bytes:
-    """CM区間と生成情報から、可読なKonomiTV YAML sidecarを構築する。
+    """CM区間と生成情報から、可読なKonomiTV-BS4K YAML sidecarを構築する。
 
     Args:
-        sections: KonomiTVの解析器が検出したCM区間。
+        sections: KonomiTV-BS4Kの解析器が検出したCM区間。
         duration_sec: 対応する録画の秒数。
-        application_version: KonomiTV本体のバージョン。
+        application_version: KonomiTV-BS4K本体のバージョン。
         pipeline_version: CM解析パイプラインのバージョン。
         generated_at: タイムゾーン付きの生成日時。
         input_fingerprint: size・mtime_ns・sample_sha256を持つ録画fingerprint。
@@ -210,7 +213,7 @@ def BuildKonomiTVChapterFile(
         raise ValueError('generated_at must include a timezone offset.')
 
     try:
-        recording = KonomiTVChapterRecording.model_validate({
+        recording = KonomiTVBS4KChapterRecording.model_validate({
             'duration_ms': duration_ms,
             'size': input_fingerprint['size'],
             'mtime_ns': input_fingerprint['mtime_ns'],
@@ -219,14 +222,14 @@ def BuildKonomiTVChapterFile(
     except KeyError as ex:
         raise ValueError(f'input_fingerprint is missing {ex.args[0]}.') from ex
 
-    generator = KonomiTVChapterGenerator(
-        name='KonomiTV',
+    generator = KonomiTVBS4KChapterGenerator(
+        name='KonomiTV-BS4K',
         application_version=application_version,
         pipeline_version=pipeline_version,
         generated_at=generated_at_text,
         chapters_sha256=_CalculateChaptersSHA256(chapters),
     )
-    document = KonomiTVChapterDocument.model_validate({
+    document = KonomiTVBS4KChapterDocument.model_validate({
         'schema': _SCHEMA_VERSION,
         'chapters': chapters,
         'generator': generator,
@@ -235,33 +238,33 @@ def BuildKonomiTVChapterFile(
     return _SerializeDocument(document)
 
 
-def ReadKonomiTVChapterFile(chapter_file_path: Path, duration_sec: float) -> KonomiTVChapterReadResult:
-    """KonomiTV YAML sidecarを厳格に検証してCM区間へ変換する。"""
+def ReadKonomiTVBS4KChapterFile(chapter_file_path: Path, duration_sec: float) -> KonomiTVBS4KChapterReadResult:
+    """KonomiTV-BS4K YAML sidecarを厳格に検証してCM区間へ変換する。"""
 
-    missing_fingerprint: KonomiTVChapterFingerprint = {'exists': False}
+    missing_fingerprint: KonomiTVBS4KChapterFingerprint = {'exists': False}
     try:
         stat_before = chapter_file_path.stat()
     except FileNotFoundError:
-        return KonomiTVChapterReadResult('Missing', (), missing_fingerprint, None)
+        return KonomiTVBS4KChapterReadResult('Missing', (), missing_fingerprint, None)
     except OSError as ex:
-        return KonomiTVChapterReadResult('IOError', (), missing_fingerprint, None, type(ex).__name__, str(ex))
+        return KonomiTVBS4KChapterReadResult('IOError', (), missing_fingerprint, None, type(ex).__name__, str(ex))
 
     try:
         raw = chapter_file_path.read_bytes()
         stat_after = chapter_file_path.stat()
     except FileNotFoundError:
-        return KonomiTVChapterReadResult('Missing', (), missing_fingerprint, None)
+        return KonomiTVBS4KChapterReadResult('Missing', (), missing_fingerprint, None)
     except OSError as ex:
-        fingerprint: KonomiTVChapterFingerprint = {
+        fingerprint: KonomiTVBS4KChapterFingerprint = {
             'exists': True,
             'size': stat_before.st_size,
             'mtime_ns': stat_before.st_mtime_ns,
             'device': stat_before.st_dev,
             'inode': stat_before.st_ino,
         }
-        return KonomiTVChapterReadResult('IOError', (), fingerprint, None, type(ex).__name__, str(ex))
+        return KonomiTVBS4KChapterReadResult('IOError', (), fingerprint, None, type(ex).__name__, str(ex))
 
-    fingerprint: KonomiTVChapterFingerprint = {
+    fingerprint: KonomiTVBS4KChapterFingerprint = {
         'exists': True,
         'size': stat_after.st_size,
         'mtime_ns': stat_after.st_mtime_ns,
@@ -275,50 +278,50 @@ def ReadKonomiTVChapterFile(chapter_file_path: Path, duration_sec: float) -> Kon
         or stat_before.st_dev != stat_after.st_dev
         or stat_before.st_ino != stat_after.st_ino
     ):
-        return KonomiTVChapterReadResult(
+        return KonomiTVBS4KChapterReadResult(
             'IOError',
             (),
             fingerprint,
             None,
             'ChapterChangedDuringRead',
-            'The KonomiTV chapter file changed while it was being read.',
+            'The KonomiTV-BS4K chapter file changed while it was being read.',
         )
 
     try:
         duration_ms = _DurationToMilliseconds(duration_sec)
     except ValueError as ex:
-        return KonomiTVChapterReadResult('Invalid', (), fingerprint, None, 'InvalidDuration', str(ex))
+        return KonomiTVBS4KChapterReadResult('Invalid', (), fingerprint, None, 'InvalidDuration', str(ex))
 
     # safe loaderへ巨大入力を渡さず、手書きsidecarとして十分な余裕を残しながら資源消費を制限する。
     if len(raw) > _MAX_FILE_SIZE:
-        return KonomiTVChapterReadResult(
+        return KonomiTVBS4KChapterReadResult(
             'Invalid',
             (),
             fingerprint,
             None,
             'FileTooLarge',
-            'The KonomiTV chapter file is too large.',
+            'The KonomiTV-BS4K chapter file is too large.',
         )
 
     try:
         text = raw.decode('utf-8')
     except UnicodeDecodeError as ex:
-        return KonomiTVChapterReadResult('Invalid', (), fingerprint, None, 'InvalidEncoding', str(ex))
+        return KonomiTVBS4KChapterReadResult('Invalid', (), fingerprint, None, 'InvalidEncoding', str(ex))
 
     try:
         yaml = _CreateSafeYAML()
         loaded = yaml.load(text)
     except YAMLError as ex:
-        return KonomiTVChapterReadResult('Invalid', (), fingerprint, None, 'InvalidYAML', str(ex))
+        return KonomiTVBS4KChapterReadResult('Invalid', (), fingerprint, None, 'InvalidYAML', str(ex))
 
     try:
-        document = KonomiTVChapterDocument.model_validate(loaded)
+        document = KonomiTVBS4KChapterDocument.model_validate(loaded)
     except ValidationError as ex:
-        return KonomiTVChapterReadResult('Invalid', (), fingerprint, None, 'InvalidDocument', str(ex))
+        return KonomiTVBS4KChapterReadResult('Invalid', (), fingerprint, None, 'InvalidDocument', str(ex))
 
     timestamps_ms = [_ParseTimestampMilliseconds(chapter.at) for chapter in document.chapters]
     if any(timestamp_ms / 1000 > duration_sec for timestamp_ms in timestamps_ms):
-        return KonomiTVChapterReadResult(
+        return KonomiTVBS4KChapterReadResult(
             'Invalid',
             (),
             fingerprint,
@@ -336,27 +339,27 @@ def ReadKonomiTVChapterFile(chapter_file_path: Path, duration_sec: float) -> Kon
             document.generator.chapters_sha256 == _CalculateChaptersSHA256(document.chapters)
             and document.recording.duration_ms == duration_ms
         )
-    provenance = KonomiTVChapterProvenance(
+    provenance = KonomiTVBS4KChapterProvenance(
         source='Generated' if generator_consistent is True else 'Manual',
         generator_present=document.generator is not None,
         generator_consistent=generator_consistent,
         generator=document.generator,
         recording=document.recording,
     )
-    status: KonomiTVChapterReadStatus = 'Valid' if sections else 'ValidNoCM'
-    return KonomiTVChapterReadResult(status, sections, fingerprint, provenance)
+    status: KonomiTVBS4KChapterReadStatus = 'Valid' if sections else 'ValidNoCM'
+    return KonomiTVBS4KChapterReadResult(status, sections, fingerprint, provenance)
 
 
-async def ReadKonomiTVChapterFileAsync(
+async def ReadKonomiTVBS4KChapterFileAsync(
     chapter_file_path: Path,
     duration_sec: float,
-) -> KonomiTVChapterReadResult:
+) -> KonomiTVBS4KChapterReadResult:
     """YAMLの同期I/O・構文検証・ハッシュ計算をワーカースレッドで実行する。"""
 
-    return await asyncio.to_thread(ReadKonomiTVChapterFile, chapter_file_path, duration_sec)
+    return await asyncio.to_thread(ReadKonomiTVBS4KChapterFile, chapter_file_path, duration_sec)
 
 
-def CommitKonomiTVChapterFile(
+def CommitKonomiTVBS4KChapterFile(
     destination_path: Path,
     sections: Iterable[CMSection],
     duration_sec: float,
@@ -365,11 +368,11 @@ def CommitKonomiTVChapterFile(
     pipeline_version: str,
     generated_at: datetime | str,
     input_fingerprint: Mapping[str, int | str],
-    expected_destination_fingerprint: KonomiTVChapterFingerprint | None = None,
-) -> KonomiTVChapterReadResult:
-    """KonomiTV生成YAMLをCAS検証して録画横へ原子的に配置する。"""
+    expected_destination_fingerprint: KonomiTVBS4KChapterFingerprint | None = None,
+) -> KonomiTVBS4KChapterReadResult:
+    """KonomiTV-BS4K生成YAMLをCAS検証して録画横へ原子的に配置する。"""
 
-    content = BuildKonomiTVChapterFile(
+    content = BuildKonomiTVBS4KChapterFile(
         sections,
         duration_sec,
         application_version=application_version,
@@ -381,9 +384,9 @@ def CommitKonomiTVChapterFile(
     def CheckDestinationFingerprint() -> None:
         if expected_destination_fingerprint is None:
             return
-        current = ReadKonomiTVChapterFile(destination_path, duration_sec)
+        current = ReadKonomiTVBS4KChapterFile(destination_path, duration_sec)
         if current.fingerprint != expected_destination_fingerprint:
-            raise KonomiTVChapterConflictError('The destination KonomiTV chapter file changed during CM analysis.')
+            raise KonomiTVBS4KChapterConflictError('The destination KonomiTV-BS4K chapter file changed during CM analysis.')
 
     CheckDestinationFingerprint()
     destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -393,7 +396,7 @@ def CommitKonomiTVChapterFile(
         dir=destination_path.parent,
     )
     temporary_path = Path(temporary_name)
-    source_result: KonomiTVChapterReadResult | None = None
+    source_result: KonomiTVBS4KChapterReadResult | None = None
     try:
         with os.fdopen(temporary_fd, 'wb') as temporary_file:
             os.fchmod(temporary_file.fileno(), 0o644)
@@ -401,19 +404,19 @@ def CommitKonomiTVChapterFile(
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
 
-        source_result = ReadKonomiTVChapterFile(temporary_path, duration_sec)
+        source_result = ReadKonomiTVBS4KChapterFile(temporary_path, duration_sec)
         if source_result.status not in ('Valid', 'ValidNoCM'):
-            raise ValueError(f'Generated KonomiTV chapter is not valid: {source_result.error_code}')
+            raise ValueError(f'Generated KonomiTV-BS4K chapter is not valid: {source_result.error_code}')
 
         # 欠落状態からの公開にはhard linkを使い、解析中に手書きYAMLが作られても上書きしない。
-        # 既存のKonomiTV生成物を置換するときもrename直前にfingerprintを再確認する。
+        # 既存のKonomiTV-BS4K生成物を置換するときもrename直前にfingerprintを再確認する。
         CheckDestinationFingerprint()
         if expected_destination_fingerprint is not None and expected_destination_fingerprint.get('exists') is False:
             try:
                 os.link(temporary_path, destination_path)
             except FileExistsError as ex:
-                raise KonomiTVChapterConflictError(
-                    'The destination KonomiTV chapter file was created during CM analysis.',
+                raise KonomiTVBS4KChapterConflictError(
+                    'The destination KonomiTV-BS4K chapter file was created during CM analysis.',
                 ) from ex
         else:
             os.replace(temporary_path, destination_path)
@@ -427,17 +430,17 @@ def CommitKonomiTVChapterFile(
     finally:
         temporary_path.unlink(missing_ok=True)
 
-    committed_result = ReadKonomiTVChapterFile(destination_path, duration_sec)
+    committed_result = ReadKonomiTVBS4KChapterFile(destination_path, duration_sec)
     if committed_result.status not in ('Valid', 'ValidNoCM'):
-        raise OSError(f'Committed KonomiTV chapter validation failed: {committed_result.error_code}')
+        raise OSError(f'Committed KonomiTV-BS4K chapter validation failed: {committed_result.error_code}')
     if source_result is None or committed_result.fingerprint.get('sha256') != source_result.fingerprint.get('sha256'):
-        raise KonomiTVChapterConflictError(
-            'The destination KonomiTV chapter file changed immediately after CM analysis commit.',
+        raise KonomiTVBS4KChapterConflictError(
+            'The destination KonomiTV-BS4K chapter file changed immediately after CM analysis commit.',
         )
     return committed_result
 
 
-async def CommitKonomiTVChapterFileAsync(
+async def CommitKonomiTVBS4KChapterFileAsync(
     destination_path: Path,
     sections: Iterable[CMSection],
     duration_sec: float,
@@ -446,12 +449,12 @@ async def CommitKonomiTVChapterFileAsync(
     pipeline_version: str,
     generated_at: datetime | str,
     input_fingerprint: Mapping[str, int | str],
-    expected_destination_fingerprint: KonomiTVChapterFingerprint | None = None,
-) -> KonomiTVChapterReadResult:
-    """KonomiTV生成YAMLの構築・確定処理をワーカースレッドで実行する。"""
+    expected_destination_fingerprint: KonomiTVBS4KChapterFingerprint | None = None,
+) -> KonomiTVBS4KChapterReadResult:
+    """KonomiTV-BS4K生成YAMLの構築・確定処理をワーカースレッドで実行する。"""
 
     return await asyncio.to_thread(
-        CommitKonomiTVChapterFile,
+        CommitKonomiTVBS4KChapterFile,
         destination_path,
         sections,
         duration_sec,
@@ -476,7 +479,7 @@ def _CreateSafeYAML() -> YAML:
     return yaml
 
 
-def _SerializeDocument(document: KonomiTVChapterDocument) -> bytes:
+def _SerializeDocument(document: KonomiTVBS4KChapterDocument) -> bytes:
     """検証済み文書を人間が編集しやすいblock-style YAMLへ直列化する。"""
 
     data = document.model_dump(mode='json', by_alias=True, exclude_none=True)
@@ -485,7 +488,7 @@ def _SerializeDocument(document: KonomiTVChapterDocument) -> bytes:
     return stream.getvalue().encode('utf-8')
 
 
-def _CalculateChaptersSHA256(chapters: Iterable[KonomiTVChapterEntry]) -> str:
+def _CalculateChaptersSHA256(chapters: Iterable[KonomiTVBS4KChapterEntry]) -> str:
     """YAMLの表記差に影響されない正規化chapterハッシュを計算する。"""
 
     normalized = [chapter.model_dump(mode='json', exclude_none=True) for chapter in chapters]
@@ -543,7 +546,7 @@ def _RequireFiniteNumber(value: object, error_message: str) -> float:
 def _BuildChaptersFromSections(
     sections: Iterable[CMSection],
     duration_sec: float,
-) -> list[KonomiTVChapterEntry]:
+) -> list[KonomiTVBS4KChapterEntry]:
     """CM区間列を全タイムラインを表すprogram/cm境界列へ変換する。"""
 
     duration_ms = _DurationToMilliseconds(duration_sec)
@@ -576,22 +579,22 @@ def _BuildChaptersFromSections(
             normalized_sections.append((start_ms, end_ms))
         previous_end_sec = end_sec
 
-    chapters: list[KonomiTVChapterEntry] = []
+    chapters: list[KonomiTVBS4KChapterEntry] = []
     if normalized_sections and normalized_sections[0][0] == 0:
-        chapters.append(KonomiTVChapterEntry(at='00:00:00.000', type='cm'))
+        chapters.append(KonomiTVBS4KChapterEntry(at='00:00:00.000', type='cm'))
     else:
-        chapters.append(KonomiTVChapterEntry(at='00:00:00.000', type='program'))
+        chapters.append(KonomiTVBS4KChapterEntry(at='00:00:00.000', type='program'))
 
     for start_ms, end_ms in normalized_sections:
         if start_ms > 0:
-            chapters.append(KonomiTVChapterEntry(at=_FormatTimestampMilliseconds(start_ms), type='cm'))
+            chapters.append(KonomiTVBS4KChapterEntry(at=_FormatTimestampMilliseconds(start_ms), type='cm'))
         if end_ms < duration_ms:
-            chapters.append(KonomiTVChapterEntry(at=_FormatTimestampMilliseconds(end_ms), type='program'))
+            chapters.append(KonomiTVBS4KChapterEntry(at=_FormatTimestampMilliseconds(end_ms), type='program'))
     return chapters
 
 
 def _BuildSectionsFromDocument(
-    document: KonomiTVChapterDocument,
+    document: KonomiTVBS4KChapterDocument,
     duration_sec: float,
 ) -> tuple[CMSection, ...]:
     """各境界から次境界・録画末尾までを区間とみなし、連続CMをまとめる。"""

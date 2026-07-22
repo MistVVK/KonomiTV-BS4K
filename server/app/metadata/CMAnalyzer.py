@@ -216,7 +216,7 @@ class GenericCMAnalyzer:
     """全登録メディアを FFMS2 の共有媒体・索引で解析する CM 解析器。"""
 
     ANALYSIS_FPS = Fraction(30_000, 1001)
-    ANALYZER_VERSION = 'KonomiTV-CM-8'
+    ANALYZER_VERSION = 'cm-8'
     NORMALIZATION_POLICY_VERSION = 4
     _LOGO_FRAME_MAX_WORKERS = 15
     _LOGO_FRAME_MIN_FRAMES_PER_WORKER = 600
@@ -734,7 +734,7 @@ class GenericCMAnalyzer:
         try:
             trim_text = trim_output.read_text(encoding='utf-8-sig')
             # chapter_exe/JLS は正規化後の総フレーム数を基準にするため、コンテナ末尾の
-            # パディングまで含む時刻が KonomiTV の録画時間をわずかに超えることがある。
+            # パディングまで含む時刻が KonomiTV-BS4K の録画時間をわずかに超えることがある。
             # 公開するCM区間はプレイヤーとYAMLが共有する録画時間軸へ収める一方、
             # JLS自身のTrim範囲検証は総フレーム数に対して厳格なまま維持する。
             timeline_duration_seconds = (
@@ -1438,7 +1438,7 @@ class UnavailableCMAnalyzer:
         del request
         raise CMInputUnsupportedError(
             'AnalyzerUnavailable',
-            'The KonomiTV CM analyzer runtime is not installed.',
+            'The KonomiTV-BS4K CM analyzer runtime is not installed.',
         )
 
     async def analyze(self, request: CMAnalyzerRequest) -> CMAnalyzerResult:
@@ -1448,5 +1448,5 @@ class UnavailableCMAnalyzer:
             chapter_file=None,
             analyzer_version=GenericCMAnalyzer.ANALYZER_VERSION,
             error_code='AnalyzerUnavailable',
-            error_message='The KonomiTV CM analyzer runtime is not installed.',
+            error_message='The KonomiTV-BS4K CM analyzer runtime is not installed.',
         )

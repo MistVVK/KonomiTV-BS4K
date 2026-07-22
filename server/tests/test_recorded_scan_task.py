@@ -340,6 +340,8 @@ def test_chapter_watcher_selects_unique_basic_name(
         ('program.chapter.txt', ('program.ts', 'program.mkv')),
         # 旧完全ファイル名方式は program.ts 自体へ対応付けない。
         ('program.ts.chapter.txt', ('program.ts',)),
+        # 旧KonomiTV suffixは新形式へ暗黙変換せず同期しない。
+        ('program.ts.konomitv-chapters.yaml', ('program.ts',)),
     ],
 )
 def test_chapter_watcher_ignores_ambiguous_or_full_filename_chapter(
@@ -394,11 +396,11 @@ def test_chapter_watcher_ignores_ambiguous_or_full_filename_chapter(
     assert called == []
 
 
-def test_chapter_watcher_maps_konomitv_yaml_by_complete_filename(
+def test_chapter_watcher_maps_konomitv_bs4k_yaml_by_complete_filename(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """KonomiTV YAMLは同じ基本名の別録画があっても完全ファイル名一致で同期する。"""
+    """KonomiTV-BS4K YAMLは同じ基本名の別録画があっても完全ファイル名一致で同期する。"""
 
     recorded_videos = {
         str(tmp_path / 'program.ts'): SimpleNamespace(id=1, file_path=str(tmp_path / 'program.ts')),
@@ -422,7 +424,7 @@ def test_chapter_watcher_maps_konomitv_yaml_by_complete_filename(
 
     handle_chapter_file_change = getattr(scan_task, '_RecordedScanTask__handleChapterFileChange')
     asyncio.run(asyncio.wait_for(
-        handle_chapter_file_change(tmp_path / 'program.ts.konomitv-chapters.yaml'),
+        handle_chapter_file_change(tmp_path / 'program.ts.konomitv-bs4k-chapters.yaml'),
         timeout=1.0,
     ))
 
@@ -431,14 +433,14 @@ def test_chapter_watcher_maps_konomitv_yaml_by_complete_filename(
 
 
 @pytest.mark.parametrize('change_type', [Change.added, Change.modified, Change.deleted])
-def test_recorded_folder_watcher_routes_all_konomitv_yaml_events(
+def test_recorded_folder_watcher_routes_all_konomitv_bs4k_yaml_events(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     change_type: Change,
 ) -> None:
-    """KonomiTV YAMLの追加・変更・削除を録画拡張子フィルターより先にchapter処理へ渡す。"""
+    """KonomiTV-BS4K YAMLの追加・変更・削除を録画拡張子フィルターより先にchapter処理へ渡す。"""
 
-    chapter_path = tmp_path / 'program.ts.konomitv-chapters.yaml'
+    chapter_path = tmp_path / 'program.ts.konomitv-bs4k-chapters.yaml'
     handled_paths: list[pathlib.Path] = []
 
     async def Watch(*args: Any, **kwargs: Any) -> AsyncGenerator[set[tuple[Change, str]], None]:

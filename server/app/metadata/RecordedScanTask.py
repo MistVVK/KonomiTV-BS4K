@@ -27,7 +27,9 @@ from app.metadata.CMChapterFile import (
     GetRecordedPathFromCMChapterPath,
     SelectRecordedPathForCMChapter,
 )
-from app.metadata.KonomiTVChapterFile import GetRecordedPathFromKonomiTVChapterPath
+from app.metadata.KonomiTVBS4KChapterFile import (
+    GetRecordedPathFromKonomiTVBS4KChapterPath,
+)
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.metadata.RecordedAnalysisPlan import (
     AnalysisRequest,
@@ -1536,7 +1538,7 @@ class RecordedScanTask:
                         continue
                     # chapterイベントは通常の録画拡張子フィルターより先に元録画へ関連付ける。
                     # 削除イベントでは実体が存在しないため、イベント種別を問わずファイル名から逆引きする。
-                    if canonical_path.name.lower().endswith(('.chapter.txt', '.konomitv-chapters.yaml')):
+                    if canonical_path.name.lower().endswith(('.chapter.txt', '.konomitv-bs4k-chapters.yaml')):
                         try:
                             await self.__handleChapterFileChange(canonical_path)
                         except Exception as ex:
@@ -1579,8 +1581,8 @@ class RecordedScanTask:
             None
         """
 
-        # KonomiTV YAMLは録画ファイル名を拡張子ごと保持するため、基本名を推測せず完全一致で対応付ける。
-        recorded_path = GetRecordedPathFromKonomiTVChapterPath(
+        # KonomiTV-BS4K YAMLは録画ファイル名を拡張子ごと保持するため、基本名を推測せず完全一致で対応付ける。
+        recorded_path = GetRecordedPathFromKonomiTVBS4KChapterPath(
             pathlib.Path(str(chapter_file_path)),
             set(self.SCAN_TARGET_EXTENSIONS),
         )
