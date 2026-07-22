@@ -22,7 +22,7 @@ def main() -> None:
     height = 16
     content = bytearray(_FILE_HEADER.pack(b'<logo data file ver0.1>', 1))
     content.extend(_LOGO_HEADER.pack(
-        b'KonomiTV CM smoke'.ljust(32, b'\0'),
+        b'KonomiTV-BS4K CM smoke'.ljust(32, b'\0'),
         16,
         16,
         height,

@@ -57,9 +57,9 @@ class RecordedFMP4CacheManager:
 
     LAYOUT_VERSION: ClassVar[int] = 1
     RELEASE_DELAY_SECONDS: ClassVar[float] = 60.0
-    FILE_PREFIX: ClassVar[str] = f'.konomitv-fmp4-v{LAYOUT_VERSION}-'
+    FILE_PREFIX: ClassVar[str] = f'.konomitv-bs4k-fmp4-v{LAYOUT_VERSION}-'
     _FILE_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
-        rf'^\.konomitv-fmp4-v{LAYOUT_VERSION}-\d+-[0-9a-f]+-[0-9a-f]{{24}}-'
+        rf'^\.konomitv-bs4k-fmp4-v{LAYOUT_VERSION}-\d+-[0-9a-f]+-[0-9a-f]{{24}}-'
         r'(?:video-init-\d+\.mp4|video-\d+\.m4s|audio-[A-Za-z0-9_-]+-\d+-init\.mp4|'
         r'audio-[A-Za-z0-9_-]+-\d+\.m4s)(?:\.tmp-[0-9a-f-]+)?$',
     )
@@ -69,7 +69,7 @@ class RecordedFMP4CacheManager:
 
     @classmethod
     def isCacheFileName(cls, file_name: str) -> bool:
-        """ファイル名がKonomiTV管理下のfMP4予約形式と完全一致するかを返す。"""
+        """ファイル名がKonomiTV-BS4K管理下のfMP4予約形式と完全一致するかを返す。"""
 
         return cls._FILE_PATTERN.fullmatch(file_name) is not None
 

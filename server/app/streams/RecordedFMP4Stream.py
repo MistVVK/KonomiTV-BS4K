@@ -1787,7 +1787,7 @@ class RecordedFMP4Stream:
                 cumulative_samples += timing.sample_count
                 split_samples.append(cumulative_samples + encoder_delay)
 
-            with tempfile.TemporaryDirectory(prefix='konomitv-audio-generation-') as temporary_directory:
+            with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-audio-generation-') as temporary_directory:
                 temporary_directory_path = Path(temporary_directory)
                 normalized_audio_path = temporary_directory_path / 'normalized-audio.nut'
                 output_pattern = str(Path(temporary_directory) / 'segment-%06d.mp4')

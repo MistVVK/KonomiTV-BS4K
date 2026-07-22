@@ -20,7 +20,7 @@ import useSettingsStore, {
     hashClientSettings,
     setLocalStorageSettings,
 } from '@/stores/SettingsStore';
-import { KONOMITV_THEME_OPTIONS } from '@/themes';
+import { KONOMITV_BS4K_THEME_OPTIONS } from '@/themes';
 import Utils from '@/utils';
 
 
@@ -50,8 +50,8 @@ app.use(vuetify);
 // マウント後に切り替えると、起動時に Konomi Classic が一瞬表示されてしまう
 const settings_store = useSettingsStore();
 const applySelectedTheme = (): void => {
-    const selected_theme = KONOMITV_THEME_OPTIONS.find(option => option.value === settings_store.settings.ui_theme) ??
-        KONOMITV_THEME_OPTIONS[0];
+    const selected_theme = KONOMITV_BS4K_THEME_OPTIONS.find(option => option.value === settings_store.settings.ui_theme) ??
+        KONOMITV_BS4K_THEME_OPTIONS[0];
     vuetify.theme.global.name.value = selected_theme.value;
     document.documentElement.style.colorScheme = selected_theme.dark ? 'dark' : 'light';
     document.body.style.backgroundColor = selected_theme.preview.background;

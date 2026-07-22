@@ -3,7 +3,7 @@ import '@/styles/materialdesignicons.min.css';
 import { createVuetify } from 'vuetify';
 import { ja } from 'vuetify/locale';
 
-import { KONOMITV_THEMES } from '@/themes';
+import { KONOMITV_BS4K_THEMES } from '@/themes';
 
 
 const vuetify = createVuetify({
@@ -14,7 +14,7 @@ const vuetify = createVuetify({
     },
     theme: {
         defaultTheme: 'KonomiClassic',
-        themes: KONOMITV_THEMES,
+        themes: KONOMITV_BS4K_THEMES,
     },
 });
 

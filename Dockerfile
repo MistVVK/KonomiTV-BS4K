@@ -71,10 +71,10 @@ COPY ./docker/thirdparty/patches/amf-1.4.36-display-capture-c.patch \
      /build/docker/thirdparty/patches/
 COPY ./thirdparty-src/tsreadex/ /build/thirdparty-src/tsreadex/
 
-RUN --mount=type=cache,id=konomitv-thirdparty-downloads,target=/build/downloads \
-    --mount=type=cache,id=konomitv-thirdparty-ccache,target=/root/.cache/ccache \
-    --mount=type=cache,id=konomitv-thirdparty-go-build,target=/root/.cache/go-build \
-    --mount=type=cache,id=konomitv-thirdparty-go-mod,target=/root/go/pkg/mod \
+RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downloads \
+    --mount=type=cache,id=konomitv-bs4k-thirdparty-ccache,target=/root/.cache/ccache \
+    --mount=type=cache,id=konomitv-bs4k-thirdparty-go-build,target=/root/.cache/go-build \
+    --mount=type=cache,id=konomitv-bs4k-thirdparty-go-mod,target=/root/go/pkg/mod \
     chmod +x /build/docker/thirdparty/*.sh && \
     ccache --max-size=20G && \
     ccache --zero-stats && \
@@ -90,8 +90,8 @@ COPY ./docker/thirdparty/patches/ffms2-hardware-decoding.patch \
      ./docker/thirdparty/patches/logoframe-native-luma.patch \
      ./docker/thirdparty/patches/logoframe-high-bit-rgb-fallback.patch \
      /build/docker/thirdparty/patches/
-RUN --mount=type=cache,id=konomitv-thirdparty-downloads,target=/build/downloads \
-    --mount=type=cache,id=konomitv-thirdparty-ccache,target=/root/.cache/ccache \
+RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downloads \
+    --mount=type=cache,id=konomitv-bs4k-thirdparty-ccache,target=/root/.cache/ccache \
     chmod +x /build/docker/thirdparty/build-cm-analysis.sh && \
     /build/docker/thirdparty/build-cm-analysis.sh && \
     python3 /build/docker/thirdparty/collect-license-manifest.py \
@@ -130,15 +130,15 @@ RUN yarn build && \
     node scripts/generate-license-document.mjs /tmp/CLIENT_THIRD_PARTY_LICENSES.md
 
 # --------------------------------------------------------------------------------------------------------------
-# KonomiTV の実行ステージ (Linux amd64 専用)
+# KonomiTV-BS4K の実行ステージ (Linux amd64 専用)
 # --------------------------------------------------------------------------------------------------------------
 
 FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
 ARG CUDA_VERSION=12.4
 ARG NONFREE=true
-LABEL cc.konomi.konomitv.cuda-version="${CUDA_VERSION}" \
-      cc.konomi.konomitv.nonfree="${NONFREE}"
+LABEL cc.konomi.konomitv-bs4k.cuda-version="${CUDA_VERSION}" \
+      cc.konomi.konomitv-bs4k.nonfree="${NONFREE}"
 ENV TZ=Asia/Tokyo
 ENV DEBIAN_FRONTEND=noninteractive
 

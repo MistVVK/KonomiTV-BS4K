@@ -35,8 +35,8 @@ export interface SettingsNavigationCategory {
     items: readonly SettingsNavigationItem[];
 }
 
-// データ放送だけは KonomiTV 独自のインライン SVG を使うため、Iconify のアイコン名と衝突しない識別子を保持する。
-export const SETTINGS_DATA_BROADCASTING_ICON = 'KonomiTVDataBroadcasting';
+// データ放送だけは KonomiTV-BS4K 独自のインライン SVG を使うため、Iconify のアイコン名と衝突しない識別子を保持する。
+export const SETTINGS_DATA_BROADCASTING_ICON = 'KonomiTVBS4KDataBroadcasting';
 
 // PC のサイドメニューと SP / タブレットの設定一覧は、必ずこの定義から同じ順序で生成する。
 export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory[] = [

@@ -361,7 +361,10 @@ def extractChromiumCredits(
     """
 
     # root で動く Docker build 中でも専用 profile だけを使い、通常の Chromium 設定には触れない。
-    with tempfile.TemporaryDirectory(prefix='konomitv-chromium-credits-', ignore_cleanup_errors=True) as temporary_directory:
+    with tempfile.TemporaryDirectory(
+        prefix='konomitv-bs4k-chromium-credits-',
+        ignore_cleanup_errors=True,
+    ) as temporary_directory:
         temporary_path = Path(temporary_directory)
         stderr_path = temporary_path / 'chromium-stderr.log'
         with stderr_path.open('wb') as stderr_file:

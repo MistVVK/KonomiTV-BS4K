@@ -44,7 +44,7 @@ function GetPackageSection(document, name, version) {
 }
 
 test('generated document includes browser and service worker runtime packages', async () => {
-    const temporaryDirectory = await mkdtemp(join(tmpdir(), 'konomitv-client-licenses-'));
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), 'konomitv-bs4k-client-licenses-'));
     const outputPath = join(temporaryDirectory, 'CLIENT_THIRD_PARTY_LICENSES.md');
     await GenerateLicenseDocument(clientRoot, outputPath);
     const document = await readFile(outputPath, 'utf8');
@@ -103,7 +103,7 @@ test('generated document includes browser and service worker runtime packages', 
 });
 
 test('all packages without bundled license files use exact-version verified fallbacks', async () => {
-    const temporaryDirectory = await mkdtemp(join(tmpdir(), 'konomitv-client-licenses-'));
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), 'konomitv-bs4k-client-licenses-'));
     const outputPath = join(temporaryDirectory, 'CLIENT_THIRD_PARTY_LICENSES.md');
     await GenerateLicenseDocument(clientRoot, outputPath);
     const document = await readFile(outputPath, 'utf8');
@@ -140,7 +140,7 @@ test('all packages without bundled license files use exact-version verified fall
 });
 
 test('README license text preserves only attribution and verifies humanize-number fallback', async () => {
-    const temporaryDirectory = await mkdtemp(join(tmpdir(), 'konomitv-client-licenses-'));
+    const temporaryDirectory = await mkdtemp(join(tmpdir(), 'konomitv-bs4k-client-licenses-'));
     const outputPath = join(temporaryDirectory, 'CLIENT_THIRD_PARTY_LICENSES.md');
     await GenerateLicenseDocument(clientRoot, outputPath);
     const document = await readFile(outputPath, 'utf8');
@@ -193,7 +193,7 @@ test('verified README fallback rejects modified package contents', () => {
 });
 
 test('declared dependency resolution fails closed with package and dependency names', async () => {
-    const rootDirectory = await mkdtemp(join(tmpdir(), 'konomitv-client-license-dependency-'));
+    const rootDirectory = await mkdtemp(join(tmpdir(), 'konomitv-bs4k-client-license-dependency-'));
     const packageDirectory = join(rootDirectory, 'node_modules', 'parent-package');
     await mkdir(packageDirectory, { recursive: true });
     await writeFile(join(packageDirectory, 'package.json'), JSON.stringify({

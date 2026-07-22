@@ -43,15 +43,15 @@ def ValidateCMLogoDirectory(host_path: Path) -> Path:
     runtime_path = ResolveCMHostPath(host_path)
     try:
         runtime_path.mkdir(parents=True, exist_ok=True)
-        temporary_fd, temporary_name = tempfile.mkstemp(prefix='.konomitv-cm-logo-', dir=runtime_path)
+        temporary_fd, temporary_name = tempfile.mkstemp(prefix='.konomitv-bs4k-cm-logo-', dir=runtime_path)
         temporary_path = Path(temporary_name)
         destination_path = temporary_path.with_suffix('.rename-test')
         try:
             with os.fdopen(temporary_fd, 'wb') as temporary_file:
-                temporary_file.write(b'KonomiTV CM logo directory test')
+                temporary_file.write(b'KonomiTV-BS4K CM logo directory test')
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())
-            if temporary_path.read_bytes() == b'KonomiTV CM logo directory test':
+            if temporary_path.read_bytes() == b'KonomiTV-BS4K CM logo directory test':
                 os.replace(temporary_path, destination_path)
             else:
                 raise OSError('Written data could not be read back.')

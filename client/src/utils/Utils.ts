@@ -12,7 +12,7 @@ export default class Utils {
     // バージョン情報
     // ビルド時の環境変数 (vue.config.js に記載) から取得
     static readonly version: string = import.meta.env.KONOMITV_VERSION;
-    static readonly git_commit: string = import.meta.env.KONOMITV_GIT_COMMIT;
+    static readonly git_commit: string = import.meta.env.KONOMITV_BS4K_GIT_COMMIT;
 
     // バックエンドの API のベース URL
     // Worker からも参照できるように self.location を使う

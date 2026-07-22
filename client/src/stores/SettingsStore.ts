@@ -7,7 +7,7 @@ import type { IBlueskyReplyThreadState, ITwitterReplyThreadState } from '@/utils
 
 import Settings, { IClientSettings, IMutedCommentKeywords } from '@/services/Settings';
 import useVersionStore from '@/stores/VersionStore';
-import { isKonomiTVTheme, type KonomiTVTheme } from '@/themes';
+import { isKonomiTVBS4KTheme, type KonomiTVBS4KTheme } from '@/themes';
 import Utils from '@/utils';
 
 
@@ -90,7 +90,7 @@ export interface ILocalClientSettings extends IClientSettings {
     show_catv_channels: boolean;
     show_sky_channels: boolean;
     show_bs4k_channels: boolean;
-    ui_theme: KonomiTVTheme;
+    ui_theme: KonomiTVBS4KTheme;
     show_player_background_image: boolean;
     use_pure_black_player_background: boolean;
     tv_channel_sort_by_jikkyo_force: boolean;
@@ -609,7 +609,7 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
 
     // 不明なテーマ名が保存されていた場合は、現行の Konomi Classic に戻す
     // テーマ名の変更や不正な設定インポートで Vuetify が描画不能になることを防ぐ
-    if (isKonomiTVTheme(normalized_settings.ui_theme) === false) {
+    if (isKonomiTVBS4KTheme(normalized_settings.ui_theme) === false) {
         normalized_settings.ui_theme = ILocalClientSettingsDefault.ui_theme;
     }
 
@@ -709,7 +709,7 @@ export function getSyncableClientSettings(settings: {[key: string]: any}): IClie
 
     // サーバー側が新しいテーマ名を返すなど、クライアントが認識できない値は既定テーマへ戻す
     // バージョン差のある設定同期でも、テーマ適用時に描画が停止しないようにする
-    if (isKonomiTVTheme(syncable_settings.ui_theme) === false) {
+    if (isKonomiTVBS4KTheme(syncable_settings.ui_theme) === false) {
         syncable_settings.ui_theme = ILocalClientSettingsDefault.ui_theme;
     }
 

@@ -52,12 +52,12 @@
 <script lang="ts" setup>
 
 import useSettingsStore from '@/stores/SettingsStore';
-import { KONOMITV_THEME_OPTIONS } from '@/themes';
+import { KONOMITV_BS4K_THEME_OPTIONS } from '@/themes';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
 const settingsStore = useSettingsStore();
-const themeOptions = Object.freeze(KONOMITV_THEME_OPTIONS);
+const themeOptions = Object.freeze(KONOMITV_BS4K_THEME_OPTIONS);
 
 </script>
 <style lang="scss" scoped>

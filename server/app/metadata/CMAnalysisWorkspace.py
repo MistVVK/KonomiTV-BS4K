@@ -92,7 +92,7 @@ class TemporaryStorageInsufficientError(CMAnalysisWorkspaceError):
 class CMAnalysisWorkspace:
     """録画と同じファイルシステム上の排他的なCM解析作業領域を管理する。"""
 
-    ROOT_DIRECTORY_NAME: ClassVar[str] = '.konomitv-cm-analysis'
+    ROOT_DIRECTORY_NAME: ClassVar[str] = '.konomitv-bs4k-cm-analysis'
     LAYOUT_VERSION: ClassVar[int] = 1
     ROOT_MARKER_NAME: ClassVar[str] = '.workspace-root.json'
     JOB_MARKER_NAME: ClassVar[str] = '.workspace-owner.json'
@@ -101,7 +101,7 @@ class CMAnalysisWorkspace:
     MINIMUM_HEADROOM_BYTES: ClassVar[int] = 128 * 1024 * 1024
     FIXED_RESERVE_BYTES: ClassVar[int] = 2 * 1024 * 1024 * 1024
     _JOB_NAME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r'^(?P<recorded_video_id>\d+)-(?P<token>[0-9a-f]{32})$')
-    _MARKER_APPLICATION: ClassVar[str] = 'KonomiTV-CMAnalysisWorkspace'
+    _MARKER_APPLICATION: ClassVar[str] = 'KonomiTV-BS4K-CMAnalysisWorkspace'
 
     path: Path
     required_bytes: int
@@ -286,7 +286,7 @@ class CMAnalysisWorkspace:
         except asyncio.CancelledError:
             raise
         except Exception as ex:
-            # 一時領域の掃除失敗だけでKonomiTV全体の起動を妨げない。
+            # 一時領域の掃除失敗だけでKonomiTV-BS4K全体の起動を妨げない。
             logging.warning('[CMAnalysisWorkspace] Failed to enumerate stale workspaces:', exc_info=ex)
 
     @staticmethod

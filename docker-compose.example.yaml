@@ -2,7 +2,7 @@
 version: '3.9'
 services:
   konomitv:
-    image: konomitv
+    image: konomitv-bs4k
     container_name: KonomiTV
     build:
       context: .
@@ -16,9 +16,9 @@ services:
     # ref: https://inocop.hatenablog.com/entry/2018/12/18/131526
     network_mode: host
     environment:
-      KONOMITV_SOURCE_TREE: '/code/source-tree'
+      KONOMITV_BS4K_SOURCE_TREE: '/code/source-tree'
     # ボリュームのマウント設定
-    # /host-rootfs/ はコンテナ内の KonomiTV からホストマシンのファイルを読み書きするために必要
+    # /host-rootfs/ はコンテナ内の KonomiTV-BS4K からホストマシンのファイルを読み書きするために必要
     volumes:
       # Git コミットハッシュと未コミット差分を実行時に自動判定するため、ソースツリーを読み取り専用で参照する
       - type: bind
@@ -43,14 +43,14 @@ services:
     # QSVEncC / VCEEncC を利用する (Intel Graphics / AMD GPU にアクセスする) ために必要な設定
     # VCEEncC (AMD GPU) を利用するには、別途 AMDGPU-PRO Driver のインストールが必要です。
     # GPU が1個も搭載されていない (/dev/dri/ 以下のデバイスファイルが存在しない) 特殊な環境では、
-    # コメントアウトしてこの設定を無効にしないと、KonomiTV サーバーを起動できなくなります。
+    # コメントアウトしてこの設定を無効にしないと、KonomiTV-BS4K サーバーを起動できなくなります。
     devices:
       - '/dev/dri/:/dev/dri/'
 
     # NVEncC を利用する (NVIDIA GPU にアクセスする) ために必要な設定
     # NVEncC (NVIDIA GPU) を利用するには、別途 NVIDIA Graphics Driver と
     # NVIDIA Container Toolkit のインストールが必要です。
-    # コメントアウトを解除してこの設定を有効にすると、NVIDIA GPU が搭載されていない環境では KonomiTV サーバーを起動できなくなります。
+    # コメントアウトを解除してこの設定を有効にすると、NVIDIA GPU が搭載されていない環境では KonomiTV-BS4K サーバーを起動できなくなります。
     # deploy:
     #   resources:
     #     reservations:

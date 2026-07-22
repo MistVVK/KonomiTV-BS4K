@@ -2395,7 +2395,7 @@ class PlayerController {
                 const audio_item = audio_items[0].cloneNode(true) as HTMLElement;
                 audio_item.classList.remove('dplayer-setting-audio-current');
                 audio_item.dataset.audio = `track-${index}`;
-                delete audio_item.dataset.konomitvAudioLabelHandlerBound;
+                delete audio_item.dataset.konomitvBs4kAudioLabelHandlerBound;
                 audio_panel.appendChild(audio_item);
                 audio_items.push(audio_item);
             }
@@ -2440,14 +2440,14 @@ class PlayerController {
             const label = is_audio_status_item ? current_audio_label : labels[index] ?? `Track${index + 1} 音声不明`;
             const label_element = audio_item.querySelector<HTMLElement>('.dplayer-label') ?? audio_item;
             label_element.textContent = label;
-            if (audio_item.dataset.konomitvAudioLabelHandlerBound !== 'true') {
-                audio_item.dataset.konomitvAudioLabelHandlerBound = 'true';
+            if (audio_item.dataset.konomitvBs4kAudioLabelHandlerBound !== 'true') {
+                audio_item.dataset.konomitvBs4kAudioLabelHandlerBound = 'true';
                 audio_item.addEventListener('click', () => {
                     window.setTimeout(() => this.applyAudioTrackLabels(media_info), 0);
                 });
             }
-            if (this.playback_mode === 'Live' && audio_item.dataset.konomitvAudioSwitchHandlerBound !== 'true') {
-                audio_item.dataset.konomitvAudioSwitchHandlerBound = 'true';
+            if (this.playback_mode === 'Live' && audio_item.dataset.konomitvBs4kAudioSwitchHandlerBound !== 'true') {
+                audio_item.dataset.konomitvBs4kAudioSwitchHandlerBound = 'true';
                 audio_item.addEventListener('click', () => {
                     if (audio_item.classList.contains('dplayer-setting-audio-item--disabled')) return;
                     const mpegts_player = this.player?.plugins.mpegts as any;

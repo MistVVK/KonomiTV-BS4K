@@ -78,6 +78,7 @@ def test_workspace_uses_resolved_source_parent_and_cleans_empty_root(
     assert stat.S_IMODE(workspace.path.stat().st_mode) == 0o700
     assert stat.S_IMODE(workspace.path.parent.stat().st_mode) == 0o700
     marker = json.loads((workspace.path / CMAnalysisWorkspace.JOB_MARKER_NAME).read_text())
+    assert marker['application'] == 'KonomiTV-BS4K-CMAnalysisWorkspace'
     assert marker['recorded_video_id'] == 157
     assert marker['name'] == workspace.path.name
 
@@ -424,9 +425,10 @@ def test_startup_cleanup_does_not_follow_workspace_symlink(
 @pytest.mark.parametrize(
     ('path', 'expected'),
     [
-        ('/recordings/.konomitv-cm-analysis', True),
-        ('/recordings/.konomitv-cm-analysis/1-token/media.cmwork', True),
-        ('/recordings/.konomitv-cm-analysis-copy/media.mkv', False),
+        ('/recordings/.konomitv-bs4k-cm-analysis', True),
+        ('/recordings/.konomitv-bs4k-cm-analysis/1-token/media.cmwork', True),
+        ('/recordings/.konomitv-bs4k-cm-analysis-copy/media.mkv', False),
+        ('/recordings/.konomitv-cm-analysis/1-token/media.cmwork', False),
         ('/recordings/program.mkv', False),
     ],
 )

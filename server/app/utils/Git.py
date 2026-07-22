@@ -27,7 +27,7 @@ async def GetGitCommit() -> str:
             return git_commit
 
         source_tree_candidates = [
-            Path(os.environ.get('KONOMITV_SOURCE_TREE', '/code/source-tree')),
+            Path(os.environ.get('KONOMITV_BS4K_SOURCE_TREE', '/code/source-tree')),
             Path(__file__).resolve().parents[3],
         ]
         source_tree = next(
@@ -49,5 +49,5 @@ async def GetGitCommit() -> str:
             except (FileNotFoundError, OSError):
                 pass
 
-        git_commit = os.environ.get('KONOMITV_GIT_COMMIT', 'unknown')
+        git_commit = os.environ.get('KONOMITV_BS4K_GIT_COMMIT', 'unknown')
         return git_commit

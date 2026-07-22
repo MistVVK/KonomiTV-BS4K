@@ -429,7 +429,7 @@ class RecordedPlaybackCapabilityProbe:
 
         last_reason: RecordedPlaybackCapabilityReason = 'DeviceInitializationFailed'
         for device in devices:
-            with tempfile.TemporaryDirectory(prefix='konomitv-recorded-capability-') as temporary_directory:
+            with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-recorded-capability-') as temporary_directory:
                 output_path = Path(temporary_directory) / 'probe.mp4'
                 command = RecordedPlaybackBackend.buildProbeCommand(encoder, codec, bit_depth, output_path, device)
                 try:

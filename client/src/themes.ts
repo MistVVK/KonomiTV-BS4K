@@ -1,7 +1,7 @@
 import type { ThemeDefinition } from 'vuetify';
 
 
-export type KonomiTVTheme =
+export type KonomiTVBS4KTheme =
     'KonomiClassic' |
     'KonomiNavy' |
     'KonomiCharcoal' |
@@ -13,9 +13,9 @@ export type KonomiTVTheme =
     'WarmCream' |
     'CoolGray';
 
-export interface IKonomiTVThemeOption {
+export interface IKonomiTVBS4KThemeOption {
     title: string;
-    value: KonomiTVTheme;
+    value: KonomiTVBS4KTheme;
     dark: boolean;
     preview: {
         background: string;
@@ -28,7 +28,7 @@ export interface IKonomiTVThemeOption {
     };
 }
 
-interface IKonomiTVThemePalette {
+interface IKonomiTVBS4KThemePalette {
     dark: boolean;
     background: string;
     surface: string;
@@ -103,7 +103,7 @@ const functionalColors = {
     'jikkyo-many': '#e7a355',
 };
 
-const createTheme = (palette: IKonomiTVThemePalette): ThemeDefinition => {
+const createTheme = (palette: IKonomiTVBS4KThemePalette): ThemeDefinition => {
     const primaryVariants = createColorVariants(palette.primary);
     const secondaryVariants = createColorVariants(palette.secondary);
     const accentVariants = createColorVariants(palette.accent);
@@ -205,7 +205,7 @@ const createTheme = (palette: IKonomiTVThemePalette): ThemeDefinition => {
     };
 };
 
-const palettes: Record<KonomiTVTheme, IKonomiTVThemePalette> = {
+const palettes: Record<KonomiTVBS4KTheme, IKonomiTVBS4KThemePalette> = {
     KonomiClassic: {
         dark: true,
         background: '#1e1310', surface: '#2f221f', elevated: '#433532', elevatedHigh: '#4c3c38',
@@ -290,11 +290,11 @@ const palettes: Record<KonomiTVTheme, IKonomiTVThemePalette> = {
     },
 };
 
-export const KONOMITV_THEMES: Record<KonomiTVTheme, ThemeDefinition> = Object.fromEntries(
+export const KONOMITV_BS4K_THEMES: Record<KonomiTVBS4KTheme, ThemeDefinition> = Object.fromEntries(
     Object.entries(palettes).map(([name, palette]) => [name, createTheme(palette)]),
-) as Record<KonomiTVTheme, ThemeDefinition>;
+) as Record<KonomiTVBS4KTheme, ThemeDefinition>;
 
-const themeOptionNames: {title: string; value: KonomiTVTheme}[] = [
+const themeOptionNames: {title: string; value: KonomiTVBS4KTheme}[] = [
     {title: 'Konomi Classic', value: 'KonomiClassic'},
     {title: 'Konomi Navy', value: 'KonomiNavy'},
     {title: 'Konomi Charcoal', value: 'KonomiCharcoal'},
@@ -307,7 +307,7 @@ const themeOptionNames: {title: string; value: KonomiTVTheme}[] = [
     {title: 'Cool Gray', value: 'CoolGray'},
 ];
 
-export const KONOMITV_THEME_OPTIONS: IKonomiTVThemeOption[] = themeOptionNames.map(option => ({
+export const KONOMITV_BS4K_THEME_OPTIONS: IKonomiTVBS4KThemeOption[] = themeOptionNames.map(option => ({
     ...option,
     dark: palettes[option.value].dark,
     preview: {
@@ -321,6 +321,6 @@ export const KONOMITV_THEME_OPTIONS: IKonomiTVThemeOption[] = themeOptionNames.m
     },
 }));
 
-export const isKonomiTVTheme = (value: unknown): value is KonomiTVTheme => {
-    return typeof value === 'string' && Object.prototype.hasOwnProperty.call(KONOMITV_THEMES, value);
+export const isKonomiTVBS4KTheme = (value: unknown): value is KonomiTVBS4KTheme => {
+    return typeof value === 'string' && Object.prototype.hasOwnProperty.call(KONOMITV_BS4K_THEMES, value);
 };

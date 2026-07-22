@@ -548,7 +548,7 @@ class _ServerSettingsVideo(BaseModel):
             folder = Path(f'{_DOCKER_PATH_PREFIX}{folder}')
         try:
             folder.mkdir(parents=True, exist_ok=True)
-            write_test_path = folder / '.konomitv-fmp4-write-test'
+            write_test_path = folder / '.konomitv-bs4k-fmp4-write-test'
             write_test_path.write_bytes(b'')
             write_test_path.unlink()
         except OSError as ex:

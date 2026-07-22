@@ -18,7 +18,7 @@ target "cuda12-4-nonfree" {
     CUDA_VERSION = "12.4"
     NONFREE      = "true"
   }
-  tags = ["konomitv:cuda12.4-nonfree"]
+  tags = ["konomitv-bs4k:cuda12.4-nonfree"]
 }
 
 target "cuda12-4-free" {
@@ -27,7 +27,7 @@ target "cuda12-4-free" {
     CUDA_VERSION = "12.4"
     NONFREE      = "false"
   }
-  tags = ["konomitv:cuda12.4-free"]
+  tags = ["konomitv-bs4k:cuda12.4-free"]
 }
 
 target "cuda12-8-nonfree" {
@@ -36,7 +36,7 @@ target "cuda12-8-nonfree" {
     CUDA_VERSION = "12.8"
     NONFREE      = "true"
   }
-  tags = ["konomitv:cuda12.8-nonfree"]
+  tags = ["konomitv-bs4k:cuda12.8-nonfree"]
 }
 
 target "cuda12-8-free" {
@@ -45,5 +45,5 @@ target "cuda12-8-free" {
     CUDA_VERSION = "12.8"
     NONFREE      = "false"
   }
-  tags = ["konomitv:cuda12.8-free"]
+  tags = ["konomitv-bs4k:cuda12.8-free"]
 }

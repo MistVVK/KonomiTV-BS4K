@@ -18,7 +18,7 @@ def test_recorded_fmp4_variant_digest_is_stable() -> None:
 
 
 def test_recorded_fmp4_pipeline_revision_changes_digest_without_changing_layout() -> None:
-    """内部パイプライン改訂時だけdigestが変わり、旧v1キャッシュも管理対象に残ることを確認する。"""
+    """内部パイプライン改訂時だけdigestが変わり、BS4K版v1キャッシュも管理対象に残ることを確認する。"""
 
     variant = RecordedFMP4Variant('1080p', 'hevc', 10, False, 'QSVEncC', 1, 2)
     current_digest = variant.digest()
@@ -27,16 +27,17 @@ def test_recorded_fmp4_pipeline_revision_changes_digest_without_changing_layout(
         assert variant.digest() != current_digest
 
     assert RecordedFMP4CacheManager.LAYOUT_VERSION == 1
-    old_cache_name = '.konomitv-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-3.m4s'
-    assert RecordedFMP4CacheManager.isCacheFileName(old_cache_name) is True
+    layout_v1_cache_name = '.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-3.m4s'
+    assert RecordedFMP4CacheManager.isCacheFileName(layout_v1_cache_name) is True
 
 
 def test_recorded_fmp4_reserved_file_name_is_strict() -> None:
     """予約形式だけを除外し、一般MP4や部分一致を誤除外しないことを確認する。"""
 
-    valid = '.konomitv-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-3.m4s'
+    valid = '.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-3.m4s'
     assert RecordedFMP4CacheManager.isCacheFileName(valid) is True
     assert RecordedFMP4CacheManager.isCacheFileName(valid + '.tmp-123e4567-e89b-12d3-a456-426614174000') is True
+    assert RecordedFMP4CacheManager.isCacheFileName(valid.replace('.konomitv-bs4k-', '.konomitv-')) is False
     assert RecordedFMP4CacheManager.isCacheFileName('program.mp4') is False
     assert RecordedFMP4CacheManager.isCacheFileName(f'copy-{valid}') is False
 
@@ -45,7 +46,7 @@ def test_recorded_fmp4_reference_delays_deletion_and_reuse_cancels_it(tmp_path: 
     """最後の参照後に遅延削除し、猶予中の再参照で削除を中止することを確認する。"""
 
     async def Run() -> None:
-        path = tmp_path / ('.konomitv-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-3.m4s')
+        path = tmp_path / ('.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-3.m4s')
         path.write_bytes(b'fragment')
         original_delay = RecordedFMP4CacheManager.RELEASE_DELAY_SECONDS
         RecordedFMP4CacheManager.RELEASE_DELAY_SECONDS = 0.02
@@ -75,7 +76,7 @@ def test_recorded_scan_cleanup_preserves_referenced_cache(tmp_path: Path) -> Non
     """録画スキャンが未参照残骸だけを削除し、再生中キャッシュを保護することを確認する。"""
 
     async def Run() -> None:
-        path = tmp_path / ('.konomitv-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-4.m4s')
+        path = tmp_path / ('.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-4.m4s')
         path.write_bytes(b'fragment')
         await RecordedFMP4CacheManager.acquire(path, 'session')
         await RecordedFMP4CacheManager.cleanupDiscovered(path)
