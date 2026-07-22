@@ -1,4 +1,5 @@
 
+import type { VideoSeriesSortDirection, VideoSeriesSortKey } from '@/stores/SettingsStore';
 import type { KonomiTVTheme } from '@/themes';
 
 import APIClient from '@/services/APIClient';
@@ -63,6 +64,8 @@ export interface IClientSettings {
     panel_display_state: 'RestorePreviousState' | 'AlwaysDisplay' | 'AlwaysFold';
     tv_panel_active_tab: 'Program' | 'Channel' | 'Comment' | 'Twitter';
     video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment' | 'Twitter';
+    video_series_sort_key: VideoSeriesSortKey;
+    video_series_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
     // tv_streaming_quality: 同期無効
     // tv_streaming_quality_cellular: 同期無効

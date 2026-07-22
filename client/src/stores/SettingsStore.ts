@@ -21,6 +21,8 @@ export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps'
 export type StreamingVideoCodec = 'avc' | 'hevc';
 export type RecordedStreamingVideoCodec = StreamingVideoCodec | 'vp9' | 'av1';
 export type RecordedStreamingAudioCodec = 'aac' | 'opus';
+export type VideoSeriesSortKey = 'SeasonEpisode' | 'BroadcastDate' | 'Title';
+export type VideoSeriesSortDirection = 'Asc' | 'Desc';
 
 // 番組表関連の型定義
 export type TimeTableSizeOption = 'Wide' | 'Normal' | 'Narrow';
@@ -99,6 +101,8 @@ export interface ILocalClientSettings extends IClientSettings {
     panel_display_state: 'RestorePreviousState' | 'AlwaysDisplay' | 'AlwaysFold';
     tv_panel_active_tab: 'Program' | 'Channel' | 'Comment' | 'Twitter';
     video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment' | 'Twitter';
+    video_series_sort_key: VideoSeriesSortKey;
+    video_series_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
     tv_streaming_quality: LiveStreamingQuality;
     tv_streaming_quality_cellular: LiveStreamingQuality;
@@ -281,6 +285,10 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     tv_panel_active_tab: 'Program',
     // ビデオをみるときにデフォルトで表示されるパネルのタブ (Default: 番組情報タブ)
     video_panel_active_tab: 'RecordedProgram',
+    // ビデオ視聴画面のシリーズを並べる基準 (Default: シーズン・話数)
+    video_series_sort_key: 'SeasonEpisode',
+    // ビデオ視聴画面のシリーズを並べる方向 (Default: 昇順)
+    video_series_sort_direction: 'Asc',
     // 視聴履歴の保持件数 (Default: 50件)
     // この値を超えると、最も古い視聴履歴から自動的に削除される
     video_watched_history_max_count: 50,
@@ -476,6 +484,8 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'panel_display_state',
     'tv_panel_active_tab',
     'video_panel_active_tab',
+    'video_series_sort_key',
+    'video_series_sort_direction',
     'video_watched_history_max_count',
     // tv_streaming_quality: 同期無効
     // tv_streaming_quality_cellular: 同期無効
@@ -601,6 +611,21 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
     // テーマ名の変更や不正な設定インポートで Vuetify が描画不能になることを防ぐ
     if (isKonomiTVTheme(normalized_settings.ui_theme) === false) {
         normalized_settings.ui_theme = ILocalClientSettingsDefault.ui_theme;
+    }
+
+    // 不正なインポート値や開発途中版の値では、シリーズ一覧と連続再生の順序を既定値へ戻す。
+    if (
+        normalized_settings.video_series_sort_key !== 'SeasonEpisode' &&
+        normalized_settings.video_series_sort_key !== 'BroadcastDate' &&
+        normalized_settings.video_series_sort_key !== 'Title'
+    ) {
+        normalized_settings.video_series_sort_key = ILocalClientSettingsDefault.video_series_sort_key;
+    }
+    if (
+        normalized_settings.video_series_sort_direction !== 'Asc' &&
+        normalized_settings.video_series_sort_direction !== 'Desc'
+    ) {
+        normalized_settings.video_series_sort_direction = ILocalClientSettingsDefault.video_series_sort_direction;
     }
 
     // 録画音声コーデックは AAC / Opus の2択だけを許可する。

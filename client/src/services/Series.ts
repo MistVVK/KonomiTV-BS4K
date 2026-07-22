@@ -4,6 +4,20 @@ import { IChannel } from '@/services/Channels';
 import { IRecordedProgram } from '@/services/Videos';
 
 
+/** シリーズ内で構造化されたシーズン・話数。 */
+export interface ISeriesEpisode {
+    id: number;
+    season_number: number;
+    episode_number: string;
+}
+
+/** Series API に限って、構造化話数を含む録画番組情報。 */
+export interface ISeriesRecordedProgram extends IRecordedProgram {
+    /** ローリング更新中の旧サーバー応答ではフィールド自体がない場合がある。 */
+    series_episode?: ISeriesEpisode | null;
+}
+
+
 /** シリーズ情報を表すインターフェース */
 export interface ISeries {
     id: number;
@@ -26,7 +40,7 @@ export interface ISeriesBroadcastPeriod {
     channel: IChannel;
     start_date: string;
     end_date: string;
-    recorded_programs: IRecordedProgram[];
+    recorded_programs: ISeriesRecordedProgram[];
 }
 
 

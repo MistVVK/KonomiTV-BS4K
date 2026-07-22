@@ -36,10 +36,29 @@
                     <h1 class="series-header__title">{{series_info.title}}</h1>
                     <div class="series-header__count">録画 {{recorded_programs.length.toLocaleString()}} 件</div>
                 </div>
-                <v-btn v-if="is_admin" class="series-header__edit" icon size="small" variant="text"
-                    v-ftooltip.bottom="'シリーズを訂正'" @click="openAssignmentDialog()">
-                    <Icon icon="fluent:edit-20-filled" width="20px" />
-                </v-btn>
+                <div v-if="is_admin" class="series-header__actions">
+                    <v-btn class="series-header__episode-edit" size="x-small" variant="tonal"
+                        @click="show_episode_assignment_dialog = true">
+                        話数を訂正
+                    </v-btn>
+                    <v-btn class="series-header__edit" icon size="small" variant="text"
+                        v-ftooltip.bottom="'シリーズを訂正'" @click="openAssignmentDialog()">
+                        <Icon icon="fluent:edit-20-filled" width="20px" />
+                    </v-btn>
+                </div>
+                <div class="series-header__sort">
+                    <v-select v-model="settingsStore.settings.video_series_sort_key"
+                        class="series-header__sort-select" :items="series_sort_items"
+                        item-title="title" item-value="value" label="並び順" density="compact"
+                        variant="outlined" hide-details />
+                    <v-btn class="series-header__sort-direction" size="small" variant="tonal"
+                        :aria-label="series_sort_direction_label" v-ftooltip.bottom="series_sort_direction_label"
+                        @click="toggleSeriesSortDirection()">
+                        <Icon :icon="settingsStore.settings.video_series_sort_direction === 'Asc' ?
+                            'akar-icons:arrow-up' : 'akar-icons:arrow-down'" width="17px" />
+                        <span>{{settingsStore.settings.video_series_sort_direction === 'Asc' ? '昇順' : '降順'}}</span>
+                    </v-btn>
+                </div>
             </header>
 
             <div v-if="recorded_programs.length === 0" class="series-state series-state--compact">
@@ -51,8 +70,7 @@
                     :to="`/videos/watch/${program.id}`" :aria-current="isCurrentProgram(program) ? 'page' : undefined"
                     role="listitem">
                     <div class="series-program__episode">
-                        <span v-if="program.episode_number !== null">{{program.episode_number}}</span>
-                        <span v-else>—</span>
+                        <span>{{formatProgramEpisode(program)}}</span>
                     </div>
                     <div class="series-program__content">
                         <div class="series-program__heading">
@@ -122,6 +140,12 @@
                 </v-card-actions>
             </v-card>
         </v-dialog>
+
+        <RecordedEpisodeAssignmentDialog v-if="series_info !== null"
+            v-model="show_episode_assignment_dialog"
+            :series-id="series_info.id"
+            :recorded-program-id="playerStore.recorded_program.id"
+            @saved="episodeAssignmentSaved()" />
     </div>
 </template>
 <script lang="ts">
@@ -129,13 +153,17 @@
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
+import RecordedEpisodeAssignmentDialog from '@/components/Videos/Dialogs/RecordedEpisodeAssignmentDialog.vue';
 import Message from '@/message';
 import RecordedSeries, { type IRecordedSeriesAssignment } from '@/services/RecordedSeries';
-import Series, { type ISeries } from '@/services/Series';
+import Series, { type ISeries, type ISeriesRecordedProgram } from '@/services/Series';
 import Videos, { type IRecordedProgram } from '@/services/Videos';
 import usePlayerStore from '@/stores/PlayerStore';
+import useRecordedSeriesStore, { getRecordedSeriesProgramDisplayTitle } from '@/stores/RecordedSeriesStore';
+import useSettingsStore, { type VideoSeriesSortDirection, type VideoSeriesSortKey } from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { dayjs } from '@/utils';
+import { formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
 
 
 type AssignmentMode = 'Existing' | 'New' | 'NotSeries';
@@ -143,19 +171,26 @@ type AssignmentMode = 'Existing' | 'New' | 'NotSeries';
 
 export default defineComponent({
     name: 'Panel-SeriesTab',
+    components: {RecordedEpisodeAssignmentDialog},
     data() {
         return {
             // ユーティリティをテンプレートで使えるようにする。
             Utils: Object.freeze(Utils),
 
+            series_sort_items: [
+                {title: 'シーズン・話数', value: 'SeasonEpisode'},
+                {title: '放送日', value: 'BroadcastDate'},
+                {title: '五十音順', value: 'Title'},
+            ] as {title: string; value: VideoSeriesSortKey;}[],
+
             // 表示中の録画が属するシリーズと、その取得状態。
-            series_info: null as ISeries | null,
             is_loading: false,
             series_load_failed: false,
             series_fetch_sequence: 0,
 
             // 管理者向け手動訂正ダイアログの状態。
             show_assignment_dialog: false,
+            show_episode_assignment_dialog: false,
             assignment_mode: 'Existing' as AssignmentMode,
             assignment_series_id: null as number | null,
             assignment_search_query: '',
@@ -169,7 +204,14 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(usePlayerStore, useUserStore),
+        ...mapStores(usePlayerStore, useRecordedSeriesStore, useSettingsStore, useUserStore),
+
+        /** 現在の録画が属する Series API の取得結果。 */
+        series_info(): ISeries | null {
+            const series_id = this.playerStore.recorded_program.series_id;
+            if (series_id === null) return null;
+            return this.recordedSeriesStore.getSeries(series_id);
+        },
 
         /** ルート間でコンポーネントが再利用されても、録画または割り当ての変更を検出できるキー。 */
         recorded_program_identity(): string {
@@ -187,22 +229,18 @@ export default defineComponent({
             );
         },
 
-        /** Series API の放送期間を平坦化し、再生可能な録画だけを古い順に並べる。 */
-        recorded_programs(): IRecordedProgram[] {
+        /** Series パネルと連続再生で共有する規則に沿って並べた録画。 */
+        recorded_programs(): ISeriesRecordedProgram[] {
             if (this.series_info === null) return [];
-
-            // reverse relation の prefetch には解析中・失敗した録画も含まれ得るため、Recorded だけを表示する。
-            const unique_programs = new Map<number, IRecordedProgram>();
-            for (const period of this.series_info.broadcast_periods) {
-                for (const program of period.recorded_programs) {
-                    if (program.recorded_video.status === 'Recorded') {
-                        unique_programs.set(program.id, program);
-                    }
-                }
-            }
-            return Array.from(unique_programs.values()).sort((first, second) =>
-                dayjs(first.start_time).valueOf() - dayjs(second.start_time).valueOf() || first.id - second.id
+            return this.recordedSeriesStore.getOrderedPrograms(
+                this.series_info.id,
+                this.settingsStore.settings.video_series_sort_key,
+                this.settingsStore.settings.video_series_sort_direction,
             );
+        },
+
+        series_sort_direction_label(): string {
+            return this.settingsStore.settings.video_series_sort_direction === 'Asc' ? '昇順' : '降順';
         },
 
         is_admin(): boolean {
@@ -239,6 +277,7 @@ export default defineComponent({
                 if (this.show_assignment_dialog && this.is_applying_assignment === false) {
                     this.show_assignment_dialog = false;
                 }
+                this.show_episode_assignment_dialog = false;
                 // 手動訂正の成功直後は submitAssignment() 側で再取得するため、同じ API を二重に呼ばない。
                 if (this.is_applying_assignment === false) {
                     void this.fetchCurrentSeries();
@@ -247,6 +286,12 @@ export default defineComponent({
         },
         is_series_tab_active(is_active: boolean) {
             if (is_active) void this.scrollCurrentProgramIntoView();
+        },
+        'settingsStore.settings.video_series_sort_key'() {
+            if (this.is_series_tab_active) void this.scrollCurrentProgramIntoView();
+        },
+        'settingsStore.settings.video_series_sort_direction'() {
+            if (this.is_series_tab_active) void this.scrollCurrentProgramIntoView();
         },
     },
     created() {
@@ -267,8 +312,6 @@ export default defineComponent({
             const route_program_id = Number(this.$route.params.video_id);
             const request_sequence = ++this.series_fetch_sequence;
 
-            // 録画切り替え直後に前のシリーズを見せないよう、リクエスト開始時点で表示を消す。
-            this.series_info = null;
             this.series_load_failed = false;
             this.is_loading = program_id >= 0 && program_id === route_program_id && series_id !== null;
             if (program_id < 0 || program_id !== route_program_id || series_id === null) return;
@@ -288,8 +331,15 @@ export default defineComponent({
                 this.series_load_failed = true;
                 return;
             }
-            this.series_info = fetched_series;
+            this.recordedSeriesStore.setSeries(fetched_series);
             if (this.is_series_tab_active) await this.scrollCurrentProgramIntoView();
+        },
+
+        toggleSeriesSortDirection(): void {
+            const current_direction = this.settingsStore.settings.video_series_sort_direction;
+            this.settingsStore.settings.video_series_sort_direction = (
+                current_direction === 'Asc' ? 'Desc' : 'Asc'
+            ) as VideoSeriesSortDirection;
         },
 
         /** 長いシリーズでは、タブを開いたときに現在再生中の話が見える位置まで移動する。 */
@@ -304,9 +354,15 @@ export default defineComponent({
         },
 
         getProgramDisplayTitle(program: IRecordedProgram): string {
-            const subtitle = program.subtitle?.trim();
-            if (subtitle) return subtitle;
-            return program.title;
+            return getRecordedSeriesProgramDisplayTitle(program as ISeriesRecordedProgram);
+        },
+
+        /** 構造化話数を優先し、同一話の局違いでも同じ短縮表記にそろえる。 */
+        formatProgramEpisode(program: ISeriesRecordedProgram): string {
+            const structured_episode = program.series_episode ?? null;
+            if (structured_episode === null) return program.episode_number ?? '—';
+            const episode_number = formatRecordedEpisodeNumber(structured_episode.episode_number);
+            return `S${structured_episode.season_number} #${episode_number}`;
         },
 
         formatStartTime(start_time: string): string {
@@ -405,6 +461,21 @@ export default defineComponent({
                 '単発番組へ変更しました。' :
                 '録画番組のシリーズを変更しました。');
         },
+
+        /** 話数訂正後にプレイヤー本体と Series パネルの両方を最新状態へそろえる。 */
+        async episodeAssignmentSaved(): Promise<void> {
+            const program_id = this.playerStore.recorded_program.id;
+            const series_id = this.playerStore.recorded_program.series_id;
+            if (series_id === null) return;
+
+            const [refreshed_program, refreshed_series] = await Promise.all([
+                Videos.fetchVideo(program_id),
+                Series.fetchSeries(series_id),
+            ]);
+            if (this.playerStore.recorded_program.id !== program_id) return;
+            if (refreshed_program !== null) this.playerStore.recorded_program = refreshed_program;
+            if (refreshed_series !== null) this.recordedSeriesStore.setSeries(refreshed_series);
+        },
     },
 });
 
@@ -451,6 +522,7 @@ export default defineComponent({
 .series-header {
     display: flex;
     align-items: flex-start;
+    flex-wrap: wrap;
     position: sticky;
     top: 0;
     padding: 15px 0 12px;
@@ -488,9 +560,46 @@ export default defineComponent({
         font-size: 11.5px;
     }
 
-    &__edit {
+    &__actions {
+        display: flex;
+        align-items: center;
         flex-shrink: 0;
         margin: -3px -7px 0 5px;
+        gap: 2px;
+    }
+
+    &__episode-edit {
+        padding: 0 8px;
+        font-size: 10.5px;
+    }
+
+    &__edit {
+        flex-shrink: 0;
+    }
+
+    &__sort {
+        display: flex;
+        align-items: center;
+        width: 100%;
+        margin-top: 10px;
+        gap: 7px;
+    }
+
+    &__sort-select {
+        min-width: 0;
+        flex-grow: 1;
+
+        :deep(.v-field) {
+            font-size: 12px;
+        }
+    }
+
+    &__sort-direction {
+        flex-shrink: 0;
+        height: 40px;
+        padding: 0 10px;
+        gap: 5px;
+        font-size: 11px;
     }
 }
 

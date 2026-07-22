@@ -8,9 +8,10 @@ import { defineComponent } from 'vue';
 
 import Watch from '@/components/Watch/Watch.vue';
 import PlayerController from '@/services/player/PlayerController';
-import RecordedSeries from '@/services/RecordedSeries';
+import Series from '@/services/Series';
 import Videos from '@/services/Videos';
 import usePlayerStore, { type PlayerEvents } from '@/stores/PlayerStore';
+import useRecordedSeriesStore from '@/stores/RecordedSeriesStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import useVersionStore from '@/stores/VersionStore';
 
@@ -28,13 +29,13 @@ export default defineComponent({
     },
     data() {
         return {
-            // ended が多重発火しても、次話 API とルート遷移を1回だけ実行する。
+            // ended が多重発火しても、Series API とルート遷移を1回だけ実行する。
             is_next_recorded_program_transitioning: false,
             next_recorded_program_request_sequence: 0,
         };
     },
     computed: {
-        ...mapStores(usePlayerStore, useSettingsStore, useVersionStore),
+        ...mapStores(usePlayerStore, useRecordedSeriesStore, useSettingsStore, useVersionStore),
     },
     // 開始時に実行
     created() {
@@ -80,7 +81,7 @@ export default defineComponent({
     },
     methods: {
 
-        /** 次話 API の未完了レスポンスと重複遷移を無効化する。 */
+        /** Series API の未完了レスポンスと重複遷移を無効化する。 */
         invalidateNextRecordedProgramTransition(): void {
             this.next_recorded_program_request_sequence += 1;
             this.is_next_recorded_program_transitioning = false;
@@ -100,20 +101,43 @@ export default defineComponent({
                 return;
             }
 
+            const series_id = this.playerStore.recorded_program.series_id;
+            if (series_id === null) return;
+
             this.is_next_recorded_program_transitioning = true;
             const request_sequence = ++this.next_recorded_program_request_sequence;
-            const next_program = await RecordedSeries.fetchNextProgram(ended_program_id);
+            // 長時間再生中に録画が増えた場合も反映するため、自然完走時点の Series を取得し直す。
+            const fetched_series = await Series.fetchSeries(series_id);
 
             // API 待機中に手動遷移・コンポーネント破棄・別録画への切り替えが起きていれば何もしない。
             if (
                 request_sequence !== this.next_recorded_program_request_sequence ||
                 Number(this.$route.params.video_id) !== ended_program_id ||
-                this.playerStore.recorded_program.id !== ended_program_id
+                this.playerStore.recorded_program.id !== ended_program_id ||
+                this.playerStore.recorded_program.series_id !== series_id
             ) {
+                // より新しい遷移が始まっている場合は、その遷移のフラグを古い応答から消さない。
+                if (request_sequence === this.next_recorded_program_request_sequence) {
+                    this.is_next_recorded_program_transitioning = false;
+                }
                 return;
             }
 
-            const next_program_id = next_program?.recorded_program_id ?? null;
+            // 取得失敗時は別の並び順へフォールバックせず、現在の録画で停止する。
+            if (fetched_series === null) {
+                this.is_next_recorded_program_transitioning = false;
+                return;
+            }
+            this.recordedSeriesStore.setSeries(fetched_series);
+            const ordered_programs = this.recordedSeriesStore.getOrderedPrograms(
+                series_id,
+                this.settingsStore.settings.video_series_sort_key,
+                this.settingsStore.settings.video_series_sort_direction,
+            );
+            const current_program_index = ordered_programs.findIndex(program => program.id === ended_program_id);
+            const next_program_id = current_program_index >= 0 ?
+                ordered_programs[current_program_index + 1]?.id ?? null :
+                null;
             if (next_program_id === null || next_program_id === ended_program_id) {
                 this.is_next_recorded_program_transitioning = false;
                 return;
