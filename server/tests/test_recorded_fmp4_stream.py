@@ -1,16 +1,18 @@
 import asyncio
+from itertools import pairwise
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
-from app.constants import QUALITY
+from app.constants import QUALITY_TYPES
 from app.streams.RecordedEncodingCodecs import AUDIO_CODECS, AudioCodec
 from app.streams.RecordedFMP4Stream import (
     RecordedAudioRendition,
     RecordedFMP4Segment,
     RecordedFMP4Stream,
+    RecordedVideoBitrate,
 )
 
 
@@ -478,14 +480,67 @@ def test_video_input_seek_decodes_preroll_before_exact_trim_position() -> None:
     assert RecordedFMP4Stream.computeInputSeekWindow(4.0, 6.006) == (0.0, 4.0, 10.006)
 
 
-def test_video_segment_explicitly_keeps_16_by_9_display_aspect_ratio(monkeypatch, tmp_path) -> None:
-    """1440x1080出力がsquare pixelの4:3映像として保存されないことを確認する。"""
+@pytest.mark.parametrize('quality', [
+    # 通常録画の選択肢
+    '1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p',
+    # BS4K 録画だけにある選択肢
+    '4320p', '2160p', '1440p', '1080p-30fps', '810p-60fps', '810p-30fps',
+    '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps',
+])
+def test_recorded_video_bitrates_strictly_increase_from_av1_to_avc(quality: QUALITY_TYPES) -> None:
+    """通常・BS4Kの全録画画質でAV1 < VP9 < HEVC < AVCを保証する。"""
+
+    bitrates = [
+        RecordedFMP4Stream.getVideoBitrate(quality, codec)
+        for codec in ('av1', 'vp9', 'hevc', 'avc')
+    ]
+    specified_values = [int(bitrate.video_bitrate.removesuffix('K')) for bitrate in bitrates]
+    maximum_values = [int(bitrate.video_bitrate_max.removesuffix('K')) for bitrate in bitrates]
+
+    assert all(left < right for left, right in pairwise(specified_values))
+    assert all(left < right for left, right in pairwise(maximum_values))
+
+
+def test_recorded_video_bitrate_representative_values() -> None:
+    """通常・BS4K・最低画質のコーデック別指定値と最大値を固定する。"""
+
+    assert [
+        RecordedFMP4Stream.getVideoBitrate('1080p', codec)
+        for codec in ('av1', 'vp9', 'hevc', 'avc')
+    ] == [
+        RecordedVideoBitrate('2100K', '3150K'),
+        RecordedVideoBitrate('2700K', '4050K'),
+        RecordedVideoBitrate('3000K', '4500K'),
+        RecordedVideoBitrate('9500K', '13000K'),
+    ]
+    assert [
+        RecordedFMP4Stream.getVideoBitrate('2160p', codec)
+        for codec in ('av1', 'vp9', 'hevc', 'avc')
+    ] == [
+        RecordedVideoBitrate('6300K', '9450K'),
+        RecordedVideoBitrate('8100K', '12150K'),
+        RecordedVideoBitrate('9000K', '13500K'),
+        RecordedVideoBitrate('18000K', '25000K'),
+    ]
+    assert [
+        RecordedFMP4Stream.getVideoBitrate('240p', codec)
+        for codec in ('av1', 'vp9', 'hevc', 'avc')
+    ] == [
+        RecordedVideoBitrate('315K', '420K'),
+        RecordedVideoBitrate('405K', '540K'),
+        RecordedVideoBitrate('450K', '600K'),
+        RecordedVideoBitrate('550K', '650K'),
+    ]
+
+
+def test_video_segment_uses_codec_bitrate_and_keeps_16_by_9_display_aspect_ratio(monkeypatch, tmp_path) -> None:
+    """AV1用帯域を指定し、1440x1080出力の表示アスペクト比も16:9に保つ。"""
 
     stream = object.__new__(RecordedFMP4Stream)
     stream.quality = '1080p-60fps'
     stream.encoding_options = SimpleNamespace(
-        video_codec='avc',
-        video_bit_depth=8,
+        video_codec='av1',
+        video_bit_depth=10,
         is_24fps_mode_enabled=False,
     )
     stream.recorded_program = SimpleNamespace(recorded_video=SimpleNamespace(
@@ -532,6 +587,12 @@ def test_video_segment_explicitly_keeps_16_by_9_display_aspect_ratio(monkeypatch
 
     aspect_index = commands[0].index('-aspect')
     assert commands[0][aspect_index + 1] == '16:9'
+    bitrate_index = commands[0].index('-b:v')
+    maxrate_index = commands[0].index('-maxrate')
+    bufsize_index = commands[0].index('-bufsize')
+    assert commands[0][bitrate_index + 1] == '2450K'
+    assert commands[0][maxrate_index + 1] == '3640K'
+    assert commands[0][bufsize_index + 1] == '7280K'
 
 
 def test_extract_avc_codec_string_from_actual_configuration_box() -> None:
@@ -583,7 +644,7 @@ def test_opus_master_uses_maximum_timeline_channels_codec_and_bandwidth(monkeypa
     stream = object.__new__(RecordedFMP4Stream)
     stream.session_id = 'opus-session'
     stream.quality = '1080p'
-    stream.encoding_options = SimpleNamespace(video_codec='avc', video_bit_depth=8, audio_codec='opus')
+    stream.encoding_options = SimpleNamespace(video_codec='av1', video_bit_depth=10, audio_codec='opus')
     stream._effective_audio_codec = 'opus'
     stream._segments = [
         RecordedFMP4Segment(0, 0.0, 6.0, 0, 0),
@@ -598,8 +659,8 @@ def test_opus_master_uses_maximum_timeline_channels_codec_and_bandwidth(monkeypa
         ],
         subtitle_tracks=[],
     ))
-    avcc = bytes([1, 100, 0, 40])
-    video_init = (len(avcc) + 8).to_bytes(4, 'big') + b'avcC' + avcc
+    av1c = bytes([0x81, 0x0A, 0x40])
+    video_init = (len(av1c) + 8).to_bytes(4, 'big') + b'av1C' + av1c
 
     async def GetVideoInitSegment(_self, _generation: int, _sequence: int) -> bytes:
         return video_init
@@ -608,11 +669,12 @@ def test_opus_master_uses_maximum_timeline_channels_codec_and_bandwidth(monkeypa
     monkeypatch.setattr(RecordedFMP4Stream, 'getVideoInitSegment', GetVideoInitSegment)
 
     master = asyncio.run(stream._RecordedFMP4Stream__getMasterPlaylist('cache'))  # pyright: ignore[reportPrivateUsage]
-    expected_bandwidth = int(float(QUALITY['1080p'].video_bitrate_max.rstrip('K')) * 1000) + 256_000 * 5 // 4
+    expected_bandwidth = 3_150_000 + 256_000 * 5 // 4
 
     assert 'CHANNELS="6"' in master
-    assert 'CODECS="avc1.640028,opus"' in master
+    assert 'CODECS="av01.0.10M.10,opus"' in master
     assert f'BANDWIDTH={expected_bandwidth}' in master
+    assert 'video_codec=av1' in master
     assert 'audio_codec=opus' in master
 
 

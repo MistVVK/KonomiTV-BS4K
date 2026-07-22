@@ -9,7 +9,7 @@ from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, cast
 
 from fastapi import HTTPException, status
 
@@ -18,7 +18,7 @@ from app.config import Config
 from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
 from app.models.RecordedProgram import RecordedProgram
 from app.schemas import AudioTrack
-from app.streams.RecordedEncodingCodecs import AudioCodec
+from app.streams.RecordedEncodingCodecs import AudioCodec, VideoCodec
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager, RecordedFMP4Variant
 from app.streams.RecordedPlaybackCapabilities import (
     RecordedPlaybackBackend,
@@ -44,6 +44,14 @@ class RecordedFMP4Segment:
     transcoded_audio_generation: int | None = None
     transcoded_audio_start_sample: int | None = None
     transcoded_audio_sample_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedVideoBitrate:
+    """録画映像エンコードに適用する指定ビットレートと最大ビットレートを表す。"""
+
+    video_bitrate: str
+    video_bitrate_max: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +116,15 @@ class RecordedFMP4Stream:
         (range(5, 7), 256_000),
         (range(7, 9), 320_000),
     )
+    # AVC / HEVC の既存調整値を保ちながら、VP9 と AV1 は HEVC より段階的に帯域を抑える。
+    # ユーザーが選んだコーデックごとの通信量の差を明確にしつつ、全画質で同じ比率を適用する。
+    VIDEO_BITRATE_RATIOS_FROM_HEVC: ClassVar[dict[VideoCodec, tuple[int, int]]] = {
+        'hevc': (100, 100),
+        'vp9': (90, 100),
+        'av1': (70, 100),
+    }
+    # 240p の既存最大値は AVC / HEVC とも 650K のため、録画再生だけ最低 50K の差を確保する。
+    VIDEO_BITRATE_MINIMUM_GAP_KBPS: ClassVar[int] = 50
 
     # セッションを識別し、ルーターの後続API要求とキャッシュ参照に利用する。
     session_id: str
@@ -236,6 +253,59 @@ class RecordedFMP4Stream:
         completed = [self._segments[sequence] for sequence in sorted(self._completed_sequences)]
         return (completed[0].start_time, completed[-1].start_time + completed[-1].duration)
 
+    @classmethod
+    def getVideoBitrate(cls, quality: QUALITY_TYPES, codec: VideoCodec) -> RecordedVideoBitrate:
+        """録画画質と映像コーデックから指定値・最大値を解決する。
+
+        Args:
+            quality: 解像度・フレームレートを表す既存画質キー。
+            codec: 録画再生で出力する映像コーデック。
+
+        Returns:
+            FFmpeg と HLS マスターで共有するコーデック別ビットレート。
+        """
+
+        # QUALITY はライブと録画で共用されているため定義自体は変更せず、同じ解像度の
+        # AVC / HEVC ペアを録画専用ポリシーの基準値として利用する。
+        quality_without_codec = quality.removesuffix('-hevc')
+        avc_quality_key = cast(QUALITY_TYPES, quality_without_codec)
+        hevc_quality_key = cast(QUALITY_TYPES, f'{quality_without_codec}-hevc')
+        if avc_quality_key not in QUALITY or hevc_quality_key not in QUALITY:
+            raise ValueError(f'Video bitrate is not defined for quality: {quality}')
+        avc_quality = QUALITY[avc_quality_key]
+        hevc_quality = QUALITY[hevc_quality_key]
+
+        def ParseKbps(value: str) -> int:
+            """QUALITY の Kbps 文字列を整数へ変換する。"""
+
+            if value.endswith('K') is False:
+                raise ValueError(f'Invalid video bitrate: {value}')
+            return int(value[:-1])
+
+        avc_bitrate_kbps = ParseKbps(avc_quality.video_bitrate)
+        avc_bitrate_max_kbps = ParseKbps(avc_quality.video_bitrate_max)
+        if codec == 'avc':
+            return RecordedVideoBitrate(
+                video_bitrate = f'{avc_bitrate_kbps}K',
+                video_bitrate_max = f'{avc_bitrate_max_kbps}K',
+            )
+
+        # HEVC は既存値を維持する。ただし AVC と同値になる端点だけは 50K 下へ制限し、
+        # 指定値・最大値の双方で AV1 < VP9 < HEVC < AVC を厳密に成立させる。
+        hevc_bitrate_kbps = min(
+            ParseKbps(hevc_quality.video_bitrate),
+            avc_bitrate_kbps - cls.VIDEO_BITRATE_MINIMUM_GAP_KBPS,
+        )
+        hevc_bitrate_max_kbps = min(
+            ParseKbps(hevc_quality.video_bitrate_max),
+            avc_bitrate_max_kbps - cls.VIDEO_BITRATE_MINIMUM_GAP_KBPS,
+        )
+        ratio_numerator, ratio_denominator = cls.VIDEO_BITRATE_RATIOS_FROM_HEVC[codec]
+        return RecordedVideoBitrate(
+            video_bitrate = f'{hevc_bitrate_kbps * ratio_numerator // ratio_denominator}K',
+            video_bitrate_max = f'{hevc_bitrate_max_kbps * ratio_numerator // ratio_denominator}K',
+        )
+
     async def destroy(self) -> None:
         """セッション参照を解放し、キャッシュの60秒削除猶予を開始する。"""
 
@@ -274,8 +344,8 @@ class RecordedFMP4Stream:
 
         self.keepAlive()
         cache_key = cache_key or uuid.uuid4().hex[:8]
-        quality = QUALITY[self.quality]
-        bandwidth = int(float(quality.video_bitrate_max.rstrip('K')) * 1000)
+        video_bitrate = self.getVideoBitrate(self.quality, self.encoding_options.video_codec)
+        bandwidth = int(video_bitrate.video_bitrate_max.removesuffix('K')) * 1000
         lines = ['#EXTM3U', '#EXT-X-VERSION:7']
         renditions = self.getAudioRenditions()
         for index, rendition in enumerate(renditions):
@@ -1297,6 +1367,8 @@ class RecordedFMP4Stream:
         """FFmpeg 8で自己完結fMP4を生成し、initとfragmentへ分離する。"""
 
         quality = QUALITY[self.quality]
+        video_bitrate = self.getVideoBitrate(self.quality, self.encoding_options.video_codec)
+        video_bitrate_max_kbps = int(video_bitrate.video_bitrate_max.removesuffix('K'))
         backend = self.__getBackend()
         codec = self.encoding_options.video_codec
         bit_depth = self.encoding_options.video_bit_depth
@@ -1440,8 +1512,8 @@ class RecordedFMP4Stream:
         if codec == 'hevc':
             command += ['-tag:v', 'hvc1']
         command += [
-            '-b:v', quality.video_bitrate, '-maxrate', quality.video_bitrate_max,
-            '-bufsize', str(int(float(quality.video_bitrate_max.rstrip('K')) * 2)) + 'K',
+            '-b:v', video_bitrate.video_bitrate, '-maxrate', video_bitrate.video_bitrate_max,
+            '-bufsize', f'{video_bitrate_max_kbps * 2}K',
             # 1080p 品質は帯域削減のため 1440x1080 の anamorphic 映像として出力する。
             # 入力が square pixel の 1920x1080 / 3840x2160 でも 4:3 と解釈されないよう、
             # encoder / MP4 muxer へ表示アスペクト比を明示する。
