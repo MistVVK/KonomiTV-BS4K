@@ -64,13 +64,14 @@
                 </v-text-field>
             </div>
             <div class="settings__item" v-if="isSectionVisible('streaming')">
-                <div class="settings__item-heading">録画と BS4K 以外で利用するエンコーダー</div>
+                <div class="settings__item-heading">通常</div>
                 <div class="settings__item-label">
-                    FFmpeg はソフトウェアエンコーダーです。<br>
+                    通常チャンネルのライブ再生と、BS4K 以外の録画再生で利用します。<br>
+                    CPU はソフトウェアエンコーダーです。<br>
                     すべての PC で利用できますが、CPU に多大な負荷がかかり、パフォーマンスが悪いです。<br>
                 </div>
                 <div class="settings__item-label mt-1">
-                    QSVEncC・NVEncC・VCEEncC はハードウェアエンコーダーです。<br>
+                    QSV・NVENC・VCE はハードウェアエンコーダーです。<br>
                     CPU 負荷が低く、パフォーマンスがとても高いです（おすすめ）。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
@@ -297,7 +298,8 @@
                     v-model="server_settings.compatibility_api.profile">
                 </v-select>
             </div>
-            <div class="settings__content-heading mt-6" v-if="isSectionVisible('backend') || isSectionVisible('streaming')">
+            <div class="settings__content-heading mt-6"
+                v-if="isSectionVisible('backend') || isSectionVisible('streaming') || isSectionVisible('streaming-common')">
                 <Icon icon="fluent:tv-20-filled" width="22px" />
                 <span class="ml-2">{{tv_section_title}}</span>
             </div>
@@ -332,7 +334,7 @@
                     v-model="server_settings.tv.preferred_terrestrial_region">
                 </v-select>
             </div>
-            <div class="settings__item" v-if="isSectionVisible('streaming')">
+            <div class="settings__item" v-if="isSectionVisible('streaming-common')">
                 <div class="settings__item-heading">誰も見ていないチャンネルのエンコードタスクを維持する秒数</div>
                 <div class="settings__item-label">
                     10 秒に設定したなら、10 秒間誰も見ていない状態が継続したらエンコードタスク（エンコーダー）を終了します。<br>
@@ -473,7 +475,7 @@
                 </v-btn>
             </div>
             <v-btn class="settings__save-button bg-secondary mt-6" variant="flat"
-                v-if="section !== 'users'"
+                v-if="section !== 'users' && show_save_button"
                 :disabled="section === 'basic' && has_compatibility_api_validation_error"
                 @click="updateServerSettings()">
                 <Icon icon="fluent:save-16-filled" class="mr-2" height="23px" />サーバー設定を更新
@@ -514,24 +516,29 @@ import useUserStore from '@/stores/UserStore';
 import Utils from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
 
-type ServerSettingsSection = 'basic' | 'backend' | 'network' | 'streaming' | 'storage' | 'users' | 'diagnostics' | 'all';
+type ServerSettingsSection = 'basic' | 'backend' | 'network' | 'streaming' | 'streaming-common' | 'storage' | 'users' | 'diagnostics' | 'all';
 
 const props = withDefaults(defineProps<{
     section?: ServerSettingsSection;
     embedded?: boolean;
+    showSaveButton?: boolean;
 }>(), {
     section: 'all',
     embedded: false,
+    showSaveButton: true,
 });
+const shared_server_settings = defineModel<IServerSettings>('serverSettings');
 
 // 同じコンポーネントを複数の設定ルートから利用し、指定された責務の設定だけを表示する
 const section = computed(() => props.section);
 const embedded = computed(() => props.embedded);
+const show_save_button = computed(() => props.showSaveButton);
 const section_title = computed(() => ({
     basic: '基本・接続',
     backend: 'バックエンド・番組情報',
     network: 'ネットワーク・HTTPS',
     streaming: '配信・エンコーダー',
+    'streaming-common': '配信・エンコーダー共通設定',
     storage: '録画・ストレージ',
     users: 'ユーザー管理',
     diagnostics: '診断設定',
@@ -557,6 +564,9 @@ const tv_section_title = computed(() => {
     if (props.section === 'streaming') {
         return '通常放送';
     }
+    if (props.section === 'streaming-common') {
+        return '共通';
+    }
     return 'テレビのライブストリーミング';
 });
 
@@ -570,12 +580,12 @@ function isSectionVisible(target_section: Exclude<ServerSettingsSection, 'all'>)
 // フォームを小さくするかどうか
 const is_form_dense = Utils.isSmartphoneHorizontal();
 
-// エンコーダーの選択肢
+// 表示名だけを利用者向けに短縮し、value はサーバー API との既存契約を維持する
 const encoder_options = [
-    {title: 'FFmpeg : ソフトウェアエンコーダー', value: 'FFmpeg'},
-    {title: 'QSVEncC : Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能', value: 'QSVEncC'},
-    {title: 'NVEncC : NVIDIA GPU で利用可能', value: 'NVEncC'},
-    {title: 'VCEEncC : AMD GPU で利用可能', value: 'VCEEncC'},
+    {title: 'CPU', value: 'FFmpeg'},
+    {title: 'QSV (Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能)', value: 'QSVEncC'},
+    {title: 'NVENC (NVIDIA GPU で利用可能)', value: 'NVEncC'},
+    {title: 'VCE (AMD GPU で利用可能)', value: 'VCEEncC'},
 ];
 
 // KonomiTV 互換 API のプロファイル選択肢
@@ -662,7 +672,17 @@ user_store.fetchUser().then((user) => {
 // /api/settings/server は再起動前の稼働中設定を返すため、基準値の取得は一度だけにして直前の保存内容を維持する
 const server_settings_store = useServerSettingsStore();
 const { server_settings: base_server_settings } = storeToRefs(server_settings_store);
-const server_settings = ref<IServerSettings>(structuredClone(toRaw(base_server_settings.value)));
+const local_server_settings = ref<IServerSettings>(structuredClone(toRaw(base_server_settings.value)));
+const server_settings = computed<IServerSettings>({
+    get: () => shared_server_settings.value ?? local_server_settings.value,
+    set: (settings) => {
+        if (shared_server_settings.value !== undefined) {
+            shared_server_settings.value = settings;
+        } else {
+            local_server_settings.value = settings;
+        }
+    },
+});
 
 // inherit の場合は通常 API の動作モードを利用して、実際に使用する物理リッスンポートを判定する
 const compatibility_api_effective_https_mode = computed<IServerSettings['server']['https_mode']>(() => {
@@ -748,18 +768,23 @@ const has_compatibility_api_validation_error = computed(() => [
 ].some(error => error !== ''));
 
 function resetServerSettingsDraft(): void {
-    server_settings.value = structuredClone(toRaw(base_server_settings.value));
+    local_server_settings.value = structuredClone(toRaw(base_server_settings.value));
 }
 
-server_settings_store.fetchServerSettingsOnce().then((settings) => {
-    if (settings !== null) {
-        resetServerSettingsDraft();
-    }
-});
+// 配信・エンコーダーページから共有ドラフトを受け取った場合、取得と保存は親画面へ集約する
+if (shared_server_settings.value === undefined) {
+    server_settings_store.fetchServerSettingsOnce().then((settings) => {
+        if (settings !== null) {
+            resetServerSettingsDraft();
+        }
+    });
+}
 
 // 同じコンポーネントを使う別 section へ移動した場合、保存していない変更は基準値へ戻す
 watch(() => props.section, () => {
-    resetServerSettingsDraft();
+    if (shared_server_settings.value === undefined) {
+        resetServerSettingsDraft();
+    }
 });
 
 // サーバー設定を更新する関数

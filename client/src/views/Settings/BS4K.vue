@@ -21,10 +21,10 @@
                 <span class="ml-2">エンコーダ</span>
             </div>
             <div class="settings__item">
-                <div class="settings__item-heading">BS4K で利用するエンコーダー</div>
+                <div class="settings__item-heading">BS4K</div>
                 <div class="settings__item-label">
-                    BS4K のライブ視聴と、ONID=11 の録画再生時だけ、こちらのエンコーダーを利用します。<br>
-                    BS4K 以外のライブ視聴と通常録画の再生にはサーバー設定の通常エンコーダーが使われます。<br>
+                    BS4K のライブ再生と、BS4K（ONID=11）の録画再生で利用します。<br>
+                    通常のライブ再生と録画再生には、通常側のタブで選んだエンコーダーを利用します。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -219,7 +219,7 @@
                 </v-switch>
             </div>
         </div>
-        <div class="settings__content" v-if="isSectionVisible('server')"
+        <div class="settings__content" v-if="isSectionVisible('server') && show_save_button"
             :class="{'settings__content--disabled': is_disabled}">
             <div class="settings__content-heading">
                 <Icon icon="fluent:arrow-counterclockwise-20-filled" width="22px" />
@@ -258,14 +258,18 @@ type BS4KSettingsSection = 'quality' | 'server' | 'all';
 const props = withDefaults(defineProps<{
     section?: BS4KSettingsSection;
     embedded?: boolean;
+    showSaveButton?: boolean;
 }>(), {
     section: 'all',
     embedded: false,
+    showSaveButton: true,
 });
+const shared_server_settings = defineModel<IServerSettings>('serverSettings');
 
 // BS4K の端末別再生設定とサーバー共有設定を別ルートから表示できるようにする
 const section = computed(() => props.section);
 const embedded = computed(() => props.embedded);
+const show_save_button = computed(() => props.showSaveButton);
 const section_title = computed(() => ({
     quality: 'BS4K再生画質',
     server: 'BS4K配信・エンコーダー',
@@ -355,12 +359,12 @@ const bs4k_video_streaming_quality_cellular = computed(() => {
     return settings_store.settings.bs4k_video_encoding_codec_cellular === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
 });
 
-// エンコーダーの選択肢
+// 表示名だけを利用者向けに短縮し、value はサーバー API との既存契約を維持する
 const encoder_options = [
-    {title: 'FFmpeg : ソフトウェアエンコーダー', value: 'FFmpeg'},
-    {title: 'QSVEncC : Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能', value: 'QSVEncC'},
-    {title: 'NVEncC : NVIDIA GPU で利用可能', value: 'NVEncC'},
-    {title: 'VCEEncC : AMD GPU で利用可能', value: 'VCEEncC'},
+    {title: 'CPU', value: 'FFmpeg'},
+    {title: 'QSV (Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能)', value: 'QSVEncC'},
+    {title: 'NVENC (NVIDIA GPU で利用可能)', value: 'NVEncC'},
+    {title: 'VCE (AMD GPU で利用可能)', value: 'VCEEncC'},
 ];
 
 // ユーザー情報を取得し、もし管理者権限であれば無効化を解除
@@ -376,21 +380,36 @@ user_store.fetchUser().then((user) => {
 // 録画再生のコーデック候補は、ローカルドラフトにある BS4K エンコーダーから生成する
 const server_settings_store = useServerSettingsStore();
 const { server_settings: base_server_settings } = storeToRefs(server_settings_store);
-const server_settings = ref<IServerSettings>(structuredClone(toRaw(base_server_settings.value)));
+const local_server_settings = ref<IServerSettings>(structuredClone(toRaw(base_server_settings.value)));
+const server_settings = computed<IServerSettings>({
+    get: () => shared_server_settings.value ?? local_server_settings.value,
+    set: (settings) => {
+        if (shared_server_settings.value !== undefined) {
+            shared_server_settings.value = settings;
+        } else {
+            local_server_settings.value = settings;
+        }
+    },
+});
 
 function resetServerSettingsDraft(): void {
-    server_settings.value = structuredClone(toRaw(base_server_settings.value));
+    local_server_settings.value = structuredClone(toRaw(base_server_settings.value));
 }
 
-server_settings_store.fetchServerSettingsOnce().then((settings) => {
-    if (settings !== null) {
-        resetServerSettingsDraft();
-    }
-});
+// 配信・エンコーダーページから共有ドラフトを受け取った場合、取得と保存は親画面へ集約する
+if (shared_server_settings.value === undefined) {
+    server_settings_store.fetchServerSettingsOnce().then((settings) => {
+        if (settings !== null) {
+            resetServerSettingsDraft();
+        }
+    });
+}
 
 // 同じコンポーネントを使う端末設定・サーバー設定間の移動時に、未保存のサーバー設定を破棄する
 watch(() => props.section, () => {
-    resetServerSettingsDraft();
+    if (shared_server_settings.value === undefined) {
+        resetServerSettingsDraft();
+    }
 });
 
 // エンコーダーが連続して切り替わったとき、遅く返った古い応答で候補を上書きしない
