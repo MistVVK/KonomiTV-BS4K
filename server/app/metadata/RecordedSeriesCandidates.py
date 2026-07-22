@@ -116,6 +116,32 @@ class RecordedSeriesAIError(Exception):
         self.latency_ms = latency_ms
 
 
+def BuildOpenAICompatibleEndpointURL(
+    api_base_url: str,
+    endpoint: Literal['chat/completions', 'responses'],
+) -> str:
+    """OpenAI互換APIのベースURLから指定エンドポイントURLを生成する。
+
+    Args:
+        api_base_url: Web設定で指定されたHTTP/HTTPSベースURL。
+        endpoint: 生成するOpenAI互換APIエンドポイント。
+
+    Returns:
+        既知のエンドポイントサフィックスを置換したURL。
+    """
+
+    parsed = urlsplit(api_base_url)
+    path = parsed.path.rstrip('/')
+    # UIにprovider rootだけでなく既存のChat Completions / Responses URLが入力されても、
+    # 両機能が同じprovider rootを利用できるよう既知の末尾だけを取り除く。
+    for known_suffix in ('/chat/completions', '/responses'):
+        if path.endswith(known_suffix):
+            path = path[:-len(known_suffix)]
+            break
+    path = f'{path}/{endpoint}'
+    return urlunsplit((parsed.scheme, parsed.netloc, path, '', ''))
+
+
 def BuildChatCompletionsURL(api_base_url: str) -> str:
     """OpenAI互換APIのベースURLからChat Completions URLを生成する。
 
@@ -126,11 +152,7 @@ def BuildChatCompletionsURL(api_base_url: str) -> str:
         `/chat/completions` を一度だけ付与したURL。
     """
 
-    parsed = urlsplit(api_base_url)
-    path = parsed.path.rstrip('/')
-    if path.endswith('/chat/completions') is False:
-        path += '/chat/completions'
-    return urlunsplit((parsed.scheme, parsed.netloc, path, '', ''))
+    return BuildOpenAICompatibleEndpointURL(api_base_url, 'chat/completions')
 
 
 async def SearchWikipediaCandidates(query: str, limit: int = 5) -> list[WikipediaCandidate]:

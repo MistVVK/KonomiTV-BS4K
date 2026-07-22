@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from httpx import AsyncClient as HTTPXAsyncClient
 from tortoise import Tortoise
 
 from app.constants import JST
+from app.metadata.RecordedEpisodeResolver import RecordedEpisodeResolver
 from app.metadata.RecordedSeriesResolver import (
     RecordedSeriesProgramNotFoundError,
     RecordedSeriesResolver,
@@ -22,6 +24,7 @@ from app.metadata.RecordedSeriesResolver import (
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
 from app.metadata.SeriesTitleParser import ParseSeriesTitle, SeriesTitleParseResult
 from app.models.Channel import Channel
+from app.models.RecordedEpisode import RecordedEpisodeResolution
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedSeries import RecordedSeriesResolution, RecordedSeriesRule
 from app.models.RecordedVideo import RecordedVideo
@@ -55,6 +58,7 @@ async def InitializeDatabase() -> None:
         db_url='sqlite://:memory:',
         modules={'models': [
             'app.models.Channel',
+            'app.models.RecordedEpisode',
             'app.models.RecordedProgram',
             'app.models.RecordedVideo',
             'app.models.RecordedSeries',
@@ -199,6 +203,16 @@ def test_assignment_api_accepts_only_the_three_documented_shapes(
         'assignProgram',
         staticmethod(AssignProgram),
     )
+    episode_queue: list[int] = []
+
+    async def EnqueueEpisode(recorded_program_id: int) -> None:
+        episode_queue.append(recorded_program_id)
+
+    monkeypatch.setattr(
+        RecordedSeriesRouter.RecordedEpisodeAutomation,
+        'enqueue',
+        staticmethod(EnqueueEpisode),
+    )
 
     async def Run() -> None:
         async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
@@ -238,6 +252,7 @@ def test_assignment_api_accepts_only_the_three_documented_shapes(
         (11, 'Series', None, '新しいシリーズ'),
         (12, 'NotSeries', None, None),
     ]
+    assert episode_queue == [10, 11]
 
 
 def test_assignment_api_returns_404_for_a_missing_target_series(
@@ -642,6 +657,20 @@ def test_manual_series_assignment_preserves_episode_and_reconciles_periods(
             assert resolution.source == 'Manual'
             assert resolution.input_fingerprint != ''
 
+            # 話数を明示確定した状態でSeriesが一時解除されても、孤立Episodeリンクを残さない。
+            await RecordedEpisodeResolver.assignProgramEpisode(
+                first.id,
+                expected_series_id=target_series.id,
+                expected_series_episode_id=None,
+                decision='StructuredEpisode',
+                season_number=1,
+                episode_number=Decimal('1'),
+            )
+            await first.refresh_from_db()
+            episode_resolution = await RecordedEpisodeResolution.get(recorded_program_id=first.id)
+            assert first.series_episode_id is not None
+            assert episode_resolution.status == 'Resolved'
+
             # title変更とchannel欠落が同時に起きても、desired series_idをNeedsReviewへ保持する。
             first.title = '以前と一致しない完全変更タイトル'
             first.channel_id = None
@@ -664,8 +693,13 @@ def test_manual_series_assignment_preserves_episode_and_reconciles_periods(
             assert unavailable_result.source == 'Manual'
             assert first.series_id is None
             assert first.series_broadcast_period_id is None
-            assert first.episode_number == '保存済み #1'
+            assert first.series_episode_id is None
+            assert first.episode_number == '#1'
             assert first.subtitle == '保存済み話名'
+            await episode_resolution.refresh_from_db()
+            assert episode_resolution.episode_id is None
+            assert episode_resolution.status == 'Unknown'
+            assert episode_resolution.error_code == 'ProgramNotInSeries'
             assert resolution.status == 'NeedsReview'
             assert resolution.source == 'Manual'
             assert resolution.series_id == target_series.id
@@ -704,8 +738,13 @@ def test_manual_series_assignment_preserves_episode_and_reconciles_periods(
             assert restored_result.source == 'Manual'
             assert first.series_id == target_series.id
             assert first.series_broadcast_period_id is not None
-            assert first.episode_number == '保存済み #1'
+            assert first.series_episode_id is not None
+            assert first.episode_number == '#1'
             assert first.subtitle == '保存済み話名'
+            await episode_resolution.refresh_from_db()
+            assert episode_resolution.episode_id == first.series_episode_id
+            assert episode_resolution.status == 'Resolved'
+            assert episode_resolution.source == 'Manual'
             assert resolution.status == 'Resolved'
             assert resolution.source == 'Manual'
             assert resolution.series_id == target_series.id

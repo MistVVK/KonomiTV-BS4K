@@ -51,6 +51,7 @@ async def InitializeDatabase() -> None:
         db_url='sqlite://:memory:',
         modules={'models': [
             'app.models.Channel',
+            'app.models.RecordedEpisode',
             'app.models.RecordedProgram',
             'app.models.RecordedVideo',
             'app.models.RecordedSeries',

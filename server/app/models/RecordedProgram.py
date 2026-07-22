@@ -15,6 +15,7 @@ from app.schemas import Genre
 
 if TYPE_CHECKING:
     from app.models.Channel import Channel
+    from app.models.RecordedEpisode import SeriesEpisode
     from app.models.RecordedVideo import RecordedVideo
     from app.models.Series import Series
     from app.models.SeriesBroadcastPeriod import SeriesBroadcastPeriod
@@ -43,6 +44,9 @@ class RecordedProgram(TortoiseModel):
     series_broadcast_period: fields.ForeignKeyNullableRelation[SeriesBroadcastPeriod] = \
         fields.ForeignKeyField('models.SeriesBroadcastPeriod', related_name='recorded_programs', null=True, on_delete=fields.CASCADE)
     series_broadcast_period_id: int | None
+    series_episode: fields.ForeignKeyNullableRelation[SeriesEpisode] = \
+        fields.ForeignKeyField('models.SeriesEpisode', related_name='recorded_programs', null=True, on_delete=fields.SET_NULL)
+    series_episode_id: int | None
     title = fields.TextField()
     series_title = cast(TortoiseField[str | None], fields.TextField(null=True))
     episode_number = cast(TortoiseField[str | None], fields.CharField(255, null=True))

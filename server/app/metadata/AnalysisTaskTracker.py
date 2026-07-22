@@ -271,6 +271,7 @@ class AnalysisTaskTracker:
             'BatchMetadataReanalysis': '全件メタデータ再解析',
             'BatchCMAnalysis': '全件CM再判定',
             'BatchSeriesResolution': '既存録画シリーズ一括判定',
+            'BatchEpisodeResolution': '既存録画話数一括判定',
             'BackgroundAnalysis': 'バックグラウンド一括解析',
         }[task_type]
 

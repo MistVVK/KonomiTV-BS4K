@@ -1,5 +1,7 @@
 import asyncio
+import json
 import stat
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
@@ -9,6 +11,12 @@ from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 from pydantic import ValidationError
 
+from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeBackfillAccepted
+from app.metadata.RecordedEpisodeSearch import (
+    AIEpisodeCitation,
+    AIEpisodeLookupResult,
+    RecordedEpisodeProgramPrompt,
+)
 from app.metadata.RecordedSeriesCandidates import (
     AIChoiceResult,
     RecordedSeriesProgramPrompt,
@@ -56,10 +64,37 @@ def test_recorded_series_settings_defaults_are_safe(monkeypatch: pytest.MonkeyPa
 
     assert settings.enabled is True
     assert settings.ai_enabled is False
+    assert settings.ai_candidate_selection_enabled is True
+    assert settings.ai_episode_number_search_enabled is True
+    assert settings.ai_episode_number_acceptance_mode == 'HighConfidenceOnly'
     assert settings.api_base_url == 'https://api.openai.com/v1'
     assert settings.model == 'gpt-5.6-luna'
     assert settings.daily_ai_request_limit == 20
     assert RecordedSeriesSettingsStore.getAPIKey() is None
+
+
+def test_legacy_settings_enable_new_child_switch_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    ConfigureTemporaryStore(monkeypatch, tmp_path)
+    RecordedSeriesSettingsStore.SETTINGS_PATH.write_text(
+        json.dumps({
+            'enabled': True,
+            'ai_enabled': False,
+            'api_base_url': 'https://api.openai.com/v1',
+            'model': 'legacy-model',
+            'daily_ai_request_limit': 20,
+        }),
+        encoding='utf-8',
+    )
+
+    settings = RecordedSeriesSettingsStore.getSettings()
+
+    assert settings.ai_enabled is False
+    assert settings.ai_candidate_selection_enabled is True
+    assert settings.ai_episode_number_search_enabled is True
+    assert settings.ai_episode_number_acceptance_mode == 'HighConfidenceOnly'
 
 
 @pytest.mark.parametrize('limit', [0, 1, 1000])
@@ -71,6 +106,11 @@ def test_daily_ai_request_limit_accepts_supported_boundaries(limit: int) -> None
 def test_daily_ai_request_limit_rejects_out_of_range_values(limit: int) -> None:
     with pytest.raises(ValidationError):
         RecordedSeriesSettings(daily_ai_request_limit=limit)
+
+
+def test_episode_number_acceptance_mode_rejects_unknown_values() -> None:
+    with pytest.raises(ValidationError):
+        RecordedSeriesSettings(ai_episode_number_acceptance_mode='Unknown')  # type: ignore[arg-type]
 
 
 def test_recorded_series_settings_store_separates_and_protects_api_key(
@@ -198,6 +238,9 @@ def test_recorded_series_settings_api_never_returns_api_key(
             assert get_response.json() == {
                 'enabled': True,
                 'ai_enabled': True,
+                'ai_candidate_selection_enabled': True,
+                'ai_episode_number_search_enabled': True,
+                'ai_episode_number_acceptance_mode': 'HighConfidenceOnly',
                 'api_base_url': 'https://compatible.example/v1',
                 'model': 'gpt-5-nano',
                 'daily_ai_request_limit': 0,
@@ -399,6 +442,77 @@ def test_connection_test_does_not_send_saved_key_to_a_different_base_url(
     assert captured_api_key is None
 
 
+def test_connection_test_can_validate_episode_web_search_capability(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """話数側の接続試験はResponses Web Searchを呼び、候補選択とは別に監査する。"""
+
+    ConfigureTemporaryStore(monkeypatch, tmp_path)
+    app = CreateAdminApp()
+    captured_program: RecordedEpisodeProgramPrompt | None = None
+    audit_records: list[dict[str, object]] = []
+
+    async def SearchEpisode(
+        *,
+        api_base_url: str,
+        api_key: str | None,
+        model: str,
+        program: RecordedEpisodeProgramPrompt,
+    ) -> AIEpisodeLookupResult:
+        assert api_base_url == 'https://api.openai.com/v1'
+        assert api_key == 'episode-test-key'
+        assert model == 'episode-model'
+        nonlocal captured_program
+        captured_program = program
+        citation = AIEpisodeCitation(url='https://example.com/episode-3', title='Episode 3')
+        return AIEpisodeLookupResult(
+            numbered=True,
+            season_number=1,
+            episode_number=Decimal('3'),
+            confidence=0.95,
+            citations=(citation,),
+            sources=(citation,),
+            model='episode-model-response',
+            prompt_tokens=20,
+            completion_tokens=5,
+            http_status=200,
+            latency_ms=48,
+        )
+
+    async def CreateAudit(**kwargs: object) -> object:
+        audit_records.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(RecordedSeriesRouter, 'SearchRecordedEpisodeNumber', SearchEpisode)
+    monkeypatch.setattr(RecordedSeriesRouter.RecordedSeriesAIRequest, 'create', CreateAudit)
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post(
+                '/api/recorded-series/settings/test',
+                json={
+                    'capability': 'EpisodeLookup',
+                    'api_base_url': 'https://api.openai.com/v1',
+                    'model': 'episode-model',
+                    'api_key': 'episode-test-key',
+                },
+            )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            'success': True,
+            'latency_ms': 48,
+            'model': 'episode-model-response',
+            'message': 'Responses API のWeb検索と構造化出力の検証に成功しました。',
+        }
+
+    asyncio.run(Run())
+    assert captured_program is not None
+    assert audit_records[0]['candidate_ids'] == ['episode-lookup']
+    assert audit_records[0]['selected_choice_id'] == 'S1E3'
+
+
 def test_settings_update_rejects_sending_saved_key_to_a_different_base_url(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -455,6 +569,7 @@ def test_status_and_backfill_endpoints_return_task_contract(
     tmp_path: Path,
 ) -> None:
     ConfigureTemporaryStore(monkeypatch, tmp_path)
+    RecordedSeriesSettingsStore.saveSettings(RecordedSeriesSettings(ai_enabled=True))
     app = CreateAdminApp()
 
     async def GetStatus() -> dict[str, int | str | bool | None]:
@@ -466,11 +581,25 @@ def test_status_and_backfill_endpoints_return_task_contract(
             'needs_review': 29,
             'failed': 1,
             'ai_requests_today': 3,
+            'series_ai_requests_today': 2,
+            'episode_ai_requests_today': 1,
             'last_run_at': '2026-07-21T12:34:56+09:00',
             'is_running': False,
         }
 
+    async def GetEpisodeStatus() -> dict[str, int | str | bool | None]:
+        return {
+            'episode_resolved': 90,
+            'episode_unknown': 8,
+            'episode_not_numbered': 1,
+            'episode_needs_review': 1,
+            'episode_failed': 0,
+            'episode_last_run_at': '2026-07-21T12:35:00+09:00',
+            'is_episode_running': False,
+        }
+
     received_force_values: list[bool] = []
+    received_episode_force_values: list[bool] = []
 
     async def StartBackfill(
         *,
@@ -481,18 +610,34 @@ def test_status_and_backfill_endpoints_return_task_contract(
         received_force_values.append(force)
         return RecordedSeriesBackfillAccepted(execution_id=42, reused=False)
 
+    async def StartEpisodeBackfill(*, force: bool = False) -> RecordedEpisodeBackfillAccepted:
+        received_episode_force_values.append(force)
+        return RecordedEpisodeBackfillAccepted(execution_id=43, reused=True)
+
     monkeypatch.setattr(RecordedSeriesRouter.RecordedSeriesResolver, 'getStatus', GetStatus)
     monkeypatch.setattr(RecordedSeriesRouter.RecordedSeriesResolver, 'startBackfill', StartBackfill)
+    monkeypatch.setattr(RecordedSeriesRouter.RecordedEpisodeAutomation, 'getStatus', GetEpisodeStatus)
+    monkeypatch.setattr(RecordedSeriesRouter.RecordedEpisodeAutomation, 'startBackfill', StartEpisodeBackfill)
 
     async def Run() -> None:
         async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
             status_response = await client.get('/api/recorded-series/status')
             backfill_response = await client.post('/api/recorded-series/backfill', json={'force': True})
+            episode_backfill_response = await client.post(
+                '/api/recorded-series/episodes/backfill',
+                json={'force': False},
+            )
 
         assert status_response.status_code == 200
         assert status_response.json()['total'] == 160
+        assert status_response.json()['episode_resolved'] == 90
+        assert status_response.json()['series_ai_requests_today'] == 2
+        assert status_response.json()['episode_ai_requests_today'] == 1
         assert backfill_response.status_code == 202
         assert backfill_response.json() == {'execution_id': 42, 'reused': False}
+        assert episode_backfill_response.status_code == 202
+        assert episode_backfill_response.json() == {'execution_id': 43, 'reused': True}
 
     asyncio.run(Run())
     assert received_force_values == [True]
+    assert received_episode_force_values == [False]

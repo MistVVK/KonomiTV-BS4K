@@ -5,12 +5,15 @@ import os
 import secrets
 import threading
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.constants import DATA_DIR
+
+
+RecordedEpisodeNumberAcceptanceMode = Literal['HighConfidenceOnly', 'Always']
 
 
 class RecordedSeriesSettings(BaseModel):
@@ -20,6 +23,12 @@ class RecordedSeriesSettings(BaseModel):
 
     enabled: Annotated[bool, Field()] = True
     ai_enabled: Annotated[bool, Field()] = False
+    ai_candidate_selection_enabled: Annotated[bool, Field()] = True
+    ai_episode_number_search_enabled: Annotated[bool, Field()] = True
+    ai_episode_number_acceptance_mode: Annotated[
+        RecordedEpisodeNumberAcceptanceMode,
+        Field(),
+    ] = 'HighConfidenceOnly'
     api_base_url: Annotated[str, Field(min_length=1, max_length=2048)] = 'https://api.openai.com/v1'
     model: Annotated[str, Field(min_length=1, max_length=255)] = 'gpt-5.6-luna'
     daily_ai_request_limit: Annotated[int, Field(ge=0, le=1000)] = 20

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Annotated, Literal, Self
+from decimal import Decimal
+from typing import Annotated, Literal, Self, cast
 
 from fastapi import (
     APIRouter,
@@ -18,12 +19,27 @@ from tortoise.expressions import Q
 from typing_extensions import TypedDict
 
 from app import logging, schemas
+from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
+from app.metadata.RecordedEpisodeResolver import (
+    RecordedEpisodeAssignmentStaleError,
+    RecordedEpisodeCrossSeriesError,
+    RecordedEpisodeInvalidNumberError,
+    RecordedEpisodeProgramNotFoundError,
+    RecordedEpisodeResolver,
+    RecordedEpisodeSeriesNotAssignedError,
+    RecordedEpisodeTargetNotFoundError,
+)
+from app.metadata.RecordedEpisodeSearch import (
+    RecordedEpisodeProgramPrompt,
+    SearchRecordedEpisodeNumber,
+)
 from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesAIError,
     RecordedSeriesProgramPrompt,
     SelectRecordedSeriesCandidate,
     SeriesChoiceCandidate,
 )
+from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesResolver import (
     RecordedSeriesChannelUnavailableError,
     RecordedSeriesInvalidTitleError,
@@ -40,6 +56,7 @@ from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettingsResponse,
     RecordedSeriesSettingsStore,
 )
+from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedSeries import RecordedSeriesAIRequest
 from app.models.Series import Series
@@ -80,9 +97,18 @@ class RecordedSeriesStatusResponse(BaseModel):
     not_series: int
     needs_review: int
     failed: int
+    episode_resolved: int
+    episode_unknown: int
+    episode_not_numbered: int
+    episode_needs_review: int
+    episode_failed: int
     ai_requests_today: int
+    series_ai_requests_today: int
+    episode_ai_requests_today: int
     last_run_at: str | None
+    episode_last_run_at: str | None
     is_running: bool
+    is_episode_running: bool
 
 
 class RecordedSeriesNextProgramResponse(BaseModel):
@@ -187,6 +213,104 @@ class RecordedSeriesManagementUpdateRequest(BaseModel):
         return self
 
 
+class RecordedEpisodeAssignmentListResponse(BaseModel):
+    """Series内のEpisode候補と録画ごとの現在割当。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    series_id: int
+    episodes: list[RecordedEpisodeAssignmentEpisode]
+    programs: list[RecordedEpisodeAssignmentProgram]
+
+
+class RecordedEpisodeAssignmentEpisode(BaseModel):
+    """手動割当先として選択可能な構造化Episode。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    id: int
+    season_number: int
+    episode_number: schemas.RecordedEpisodeNumber
+
+
+class RecordedEpisodeAssignmentProgram(BaseModel):
+    """Series管理画面で話数を訂正できる再生可能録画。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    recorded_program_id: int
+    title: str
+    subtitle: str | None
+    legacy_episode_number: str | None
+    start_time: datetime
+    channel_id: str | None
+    channel_name: str | None
+    series_episode_id: int | None
+    resolution: RecordedEpisodeAssignmentResolution | None
+
+
+class RecordedEpisodeAssignmentCitation(BaseModel):
+    """Web検索結果から保存したHTTP(S)出典。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    url: str
+    title: str
+
+
+class RecordedEpisodeAssignmentResolution(BaseModel):
+    """手動判断時に表示する話数判定状態と根拠。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    status: Literal['Pending', 'Resolved', 'Unknown', 'NotNumbered', 'NeedsReview', 'Failed']
+    source: Literal['Local', 'EPG', 'WebSearch', 'Manual', 'Migration'] | None
+    proposed_season_number: int | None
+    proposed_episode_number: schemas.RecordedEpisodeNumber | None
+    confidence: float | None
+    web_search_performed: bool
+    citations: list[RecordedEpisodeAssignmentCitation]
+    error_code: str | None
+
+
+class _RecordedEpisodeAssignmentRequestBase(BaseModel):
+    """全話数割当判断に共通する楽観ロック値。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    expected_series_id: Annotated[int, Field(gt=0)]
+    expected_series_episode_id: Annotated[int | None, Field(gt=0)]
+
+
+class RecordedEpisodeExistingAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
+    """Series内の既存Episodeを選ぶ手動判断。"""
+
+    decision: Literal['ExistingEpisode']
+    episode_id: Annotated[int, Field(gt=0)]
+
+
+class RecordedEpisodeStructuredAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
+    """新しいシーズン・話数を入力する手動判断。"""
+
+    decision: Literal['StructuredEpisode']
+    season_number: Annotated[int, Field(ge=0, le=2_147_483_647)]
+    episode_number: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=3)]
+
+
+class RecordedEpisodeUnknownAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
+    """この録画の話数を不明として確定する手動判断。"""
+
+    decision: Literal['Unknown']
+
+
+RecordedEpisodeAssignmentRequest = Annotated[
+    RecordedEpisodeExistingAssignmentRequest |
+    RecordedEpisodeStructuredAssignmentRequest |
+    RecordedEpisodeUnknownAssignmentRequest,
+    Field(discriminator='decision'),
+]
+
+
 class _RecordedSeriesProgramSummary(TypedDict):
     """管理一覧1件に集約する再生可能な録画の件数と期間。"""
 
@@ -266,19 +390,25 @@ def _parseOptionalAPIKey(request_body: dict[str, object]) -> str | None:
     return api_key_value.strip()
 
 
-def _connectionErrorMessage(error_code: str) -> str:
+def _connectionErrorMessage(
+    error_code: str,
+    capability: Literal['CandidateSelection', 'EpisodeLookup'],
+) -> str:
     """内部エラーコードをキーや外部レスポンスを含まない表示文へ変換する。"""
 
     if error_code == 'HTTP401':
         return '認証に失敗しました。API キーを確認してください。'
     if error_code == 'HTTP404':
-        return 'Chat Completions の URL またはモデル ID を確認してください。'
+        endpoint_name = 'Responses / Web Search' if capability == 'EpisodeLookup' else 'Chat Completions'
+        return f'{endpoint_name} の URL またはモデル ID を確認してください。'
     if error_code.startswith('HTTP'):
         return f'OpenAI 互換 API がエラーを返しました。（{error_code}）'
     if error_code in {'Timeout', 'NetworkError'}:
         return 'OpenAI 互換 API へ接続できませんでした。URL と稼働状態を確認してください。'
     if error_code == 'RedirectRejected':
         return '接続先からのリダイレクトは安全のため拒否しました。最終 URL を指定してください。'
+    if capability == 'EpisodeLookup':
+        return 'Responses API のWeb検索・構造化出力に対応していないか、結果を検証できませんでした。'
     return '応答が Chat Completions 互換形式ではないか、候補選択結果を検証できませんでした。'
 
 
@@ -415,6 +545,8 @@ async def RecordedSeriesSettingsUpdateAPI(
         ) from ex
     # 起動時に設定破損などでPending回収できなかった場合も、設定修復直後に再試行する。
     await RecordedSeriesResolver.retryPendingRecovery()
+    # 話数側はAlwaysへの変更で既存提案を無課金昇格し、新規録画の保留だけを再評価する。
+    await RecordedEpisodeAutomation.settingsUpdated()
 
 
 @router.delete(
@@ -458,7 +590,7 @@ async def RecordedSeriesConnectionTestAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> RecordedSeriesConnectionTestResponse:
-    """入力中のURL・モデル・任意キーを保存せず、最小候補選択を1回だけ試す。"""
+    """入力中のURL・モデル・任意キーを保存せず、選択したAI機能を1回だけ試す。"""
 
     response.headers.update(NO_STORE_HEADERS)
     try:
@@ -478,10 +610,21 @@ async def RecordedSeriesConnectionTestAPI(
 
     draft = dict(request_body)
     api_key = _parseOptionalAPIKey(draft)
+    capability_value = draft.pop('capability', 'CandidateSelection')
+    if (
+        not isinstance(capability_value, str) or
+        capability_value not in {'CandidateSelection', 'EpisodeLookup'}
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='Connection test capability is invalid.',
+            headers=NO_STORE_HEADERS,
+        )
+    capability = cast(Literal['CandidateSelection', 'EpisodeLookup'], capability_value)
     if set(draft) != {'api_base_url', 'model'}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail='Connection test accepts only api_base_url, model, and api_key.',
+            detail='Connection test accepts only capability, api_base_url, model, and api_key.',
             headers=NO_STORE_HEADERS,
         )
     try:
@@ -510,48 +653,84 @@ async def RecordedSeriesConnectionTestAPI(
     effective_api_key = api_key
     if effective_api_key is None and validated_settings.api_base_url == saved_settings.api_base_url:
         effective_api_key = saved_api_key
-    candidates = [
-        SeriesChoiceCandidate(
-            choice_id='unresolved',
-            kind='Unresolved',
-            title='Connection test',
-            description='Select this only candidate to prove Chat Completions compatibility.',
-        ),
-    ]
-    program = RecordedSeriesProgramPrompt(
-        title='KonomiTV OpenAI-compatible API connection test',
-        description='This is a connection test, not recorded content.',
-        genres=['ConnectionTest'],
-        channel=None,
-        start_date=date.today().isoformat(),
-    )
     try:
-        result = await SelectRecordedSeriesCandidate(
-            api_base_url=validated_settings.api_base_url,
-            api_key=effective_api_key,
-            model=validated_settings.model,
-            program=program,
-            candidates=candidates,
-            minimum_confidence=0.0,
-        )
+        if capability == 'CandidateSelection':
+            candidates = [
+                SeriesChoiceCandidate(
+                    choice_id='unresolved',
+                    kind='Unresolved',
+                    title='Connection test',
+                    description='Select this only candidate to prove Chat Completions compatibility.',
+                ),
+            ]
+            program = RecordedSeriesProgramPrompt(
+                title='KonomiTV OpenAI-compatible API connection test',
+                description='This is a connection test, not recorded content.',
+                genres=['ConnectionTest'],
+                channel=None,
+                start_date=date.today().isoformat(),
+            )
+            candidate_result = await SelectRecordedSeriesCandidate(
+                api_base_url=validated_settings.api_base_url,
+                api_key=effective_api_key,
+                model=validated_settings.model,
+                program=program,
+                candidates=candidates,
+                minimum_confidence=0.0,
+            )
+            result_model = candidate_result.model
+            selected_choice_id = candidate_result.choice_id
+            prompt_tokens = candidate_result.prompt_tokens
+            completion_tokens = candidate_result.completion_tokens
+            http_status = candidate_result.http_status
+            latency_ms = candidate_result.latency_ms
+            candidate_ids = ['unresolved']
+            success_message = '接続と候補制約付き応答の検証に成功しました。'
+        else:
+            episode_result = await SearchRecordedEpisodeNumber(
+                api_base_url=validated_settings.api_base_url,
+                api_key=effective_api_key,
+                model=validated_settings.model,
+                program=RecordedEpisodeProgramPrompt(
+                    series_title='KonomiTV connection test',
+                    program_title='Episode lookup connection test',
+                    subtitle=None,
+                    description='This request only verifies Responses API Web Search support.',
+                    detail='ConnectionTest: true',
+                    channel=None,
+                    broadcast_datetime=datetime.now().astimezone().isoformat(),
+                ),
+            )
+            result_model = episode_result.model
+            selected_choice_id = (
+                f'S{episode_result.season_number}E{episode_result.episode_number}'
+                if episode_result.numbered
+                else 'not-numbered'
+            )
+            prompt_tokens = episode_result.prompt_tokens
+            completion_tokens = episode_result.completion_tokens
+            http_status = episode_result.http_status
+            latency_ms = episode_result.latency_ms
+            candidate_ids = ['episode-lookup']
+            success_message = 'Responses API のWeb検索と構造化出力の検証に成功しました。'
         await RecordedSeriesAIRequest.create(
             resolution_id=None,
             purpose='ConnectionTest',
             status='Succeeded',
-            model=result.model,
-            candidate_ids=['unresolved'],
-            selected_choice_id=result.choice_id,
-            prompt_tokens=result.prompt_tokens,
-            completion_tokens=result.completion_tokens,
-            http_status=result.http_status,
-            latency_ms=result.latency_ms,
+            model=result_model,
+            candidate_ids=candidate_ids,
+            selected_choice_id=selected_choice_id,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            http_status=http_status,
+            latency_ms=latency_ms,
             error_code=None,
         )
         return RecordedSeriesConnectionTestResponse(
             success=True,
-            latency_ms=result.latency_ms,
-            model=result.model,
-            message='接続と候補制約付き応答の検証に成功しました。',
+            latency_ms=latency_ms,
+            model=result_model,
+            message=success_message,
         )
     except RecordedSeriesAIError as ex:
         await RecordedSeriesAIRequest.create(
@@ -563,9 +742,10 @@ async def RecordedSeriesConnectionTestAPI(
                 'InvalidJSON',
                 'InvalidJSONType',
                 'LowConfidence',
+                'MissingWebSearchCall',
             } else 'Failed',
             model=validated_settings.model,
-            candidate_ids=['unresolved'],
+            candidate_ids=['episode-lookup'] if capability == 'EpisodeLookup' else ['unresolved'],
             selected_choice_id=None,
             prompt_tokens=None,
             completion_tokens=None,
@@ -577,7 +757,7 @@ async def RecordedSeriesConnectionTestAPI(
             success=False,
             latency_ms=ex.latency_ms or 0,
             model=validated_settings.model,
-            message=_connectionErrorMessage(ex.code),
+            message=_connectionErrorMessage(ex.code, capability),
         )
 
 
@@ -728,6 +908,182 @@ async def RecordedSeriesManagementUpdateAPI(
 
 
 @router.get(
+    '/series/{series_id}/episode-assignments',
+    summary='録画シリーズ話数割当一覧取得 API',
+    response_model=RecordedEpisodeAssignmentListResponse,
+)
+async def RecordedEpisodeAssignmentListAPI(
+    series_id: Annotated[int, Path(gt=0, description='取得するSeries ID。')],
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> RecordedEpisodeAssignmentListResponse:
+    """Series内の構造化Episodeと再生可能録画の現在割当を遅延取得する。
+
+    Args:
+        series_id: 取得対象のSeries ID。
+        response: Cache-Controlヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        Episode候補、録画、AIまたは手動の判定概要。
+
+    Raises:
+        HTTPException: 指定Seriesが存在しない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    if await Series.filter(id=series_id).exists() is False:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Specified series_id was not found.',
+            headers=NO_STORE_HEADERS,
+        )
+
+    episodes = await SeriesEpisode.filter(series_id=series_id).all()
+    # SQLiteではDecimalFieldが文字列保存されるため、PythonのDecimalで確実に数値順へそろえる。
+    episodes.sort(key=lambda episode: (episode.season_number, episode.episode_number, episode.id))
+    programs = await RecordedProgram.filter(
+        series_id=series_id,
+        recorded_video__status='Recorded',
+    ).prefetch_related('channel').order_by('start_time', 'id')
+    program_ids = [program.id for program in programs]
+    resolutions = (
+        await RecordedEpisodeResolution.filter(recorded_program_id__in=program_ids).all()
+        if len(program_ids) > 0
+        else []
+    )
+    resolutions_by_program_id = {
+        resolution.recorded_program_id: resolution
+        for resolution in resolutions
+    }
+
+    response_programs: list[RecordedEpisodeAssignmentProgram] = []
+    for program in programs:
+        resolution = resolutions_by_program_id.get(program.id)
+        resolution_response = None
+        if resolution is not None:
+            resolution_response = RecordedEpisodeAssignmentResolution(
+                status=resolution.status,
+                source=resolution.source,
+                proposed_season_number=resolution.proposed_season_number,
+                proposed_episode_number=resolution.proposed_episode_number,
+                confidence=resolution.confidence,
+                web_search_performed=resolution.web_search_performed,
+                citations=[
+                    RecordedEpisodeAssignmentCitation(
+                        url=citation['url'],
+                        title=citation['title'],
+                    )
+                    for citation in resolution.citations
+                ],
+                error_code=resolution.error_code,
+            )
+        response_programs.append(RecordedEpisodeAssignmentProgram(
+            recorded_program_id=program.id,
+            title=program.title,
+            subtitle=program.subtitle,
+            legacy_episode_number=program.episode_number,
+            start_time=program.start_time,
+            channel_id=program.channel_id,
+            channel_name=program.channel.name if program.channel is not None else None,
+            series_episode_id=program.series_episode_id,
+            resolution=resolution_response,
+        ))
+
+    return RecordedEpisodeAssignmentListResponse(
+        series_id=series_id,
+        episodes=[
+            RecordedEpisodeAssignmentEpisode(
+                id=episode.id,
+                season_number=episode.season_number,
+                episode_number=episode.episode_number,
+            )
+            for episode in episodes
+        ],
+        programs=response_programs,
+    )
+
+
+@router.put(
+    '/programs/{recorded_program_id}/episode-assignment',
+    summary='録画シリーズ話数手動割当更新 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def RecordedEpisodeAssignmentUpdateAPI(
+    recorded_program_id: Annotated[int, Path(gt=0, description='録画番組の ID。')],
+    request: RecordedEpisodeAssignmentRequest,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+):
+    """管理者の話数判断をSeries・Episodeの楽観ロック付きで保存する。
+
+    Args:
+        recorded_program_id: 更新対象のRecordedProgram ID。
+        request: 既存Episode、新規構造化話数、またはUnknownの判断。
+        response: Cache-Controlヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 録画・Episode不在、競合、別Series指定、または不正値の場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    episode_id = request.episode_id if request.decision == 'ExistingEpisode' else None
+    season_number = request.season_number if request.decision == 'StructuredEpisode' else None
+    episode_number = request.episode_number if request.decision == 'StructuredEpisode' else None
+    try:
+        async with RECORDED_SERIES_RESOLUTION_LOCK:
+            await RecordedEpisodeResolver.assignProgramEpisode(
+                recorded_program_id,
+                expected_series_id=request.expected_series_id,
+                expected_series_episode_id=request.expected_series_episode_id,
+                decision=request.decision,
+                episode_id=episode_id,
+                season_number=season_number,
+                episode_number=episode_number,
+            )
+    except RecordedEpisodeProgramNotFoundError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Specified recorded_program_id was not found.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    except RecordedEpisodeTargetNotFoundError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='Specified episode_id was not found.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    except RecordedEpisodeSeriesNotAssignedError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='The recorded program is not assigned to a series.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    except RecordedEpisodeAssignmentStaleError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='The series or episode assignment was updated by another request.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    except RecordedEpisodeCrossSeriesError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='The specified episode belongs to another series.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    except RecordedEpisodeInvalidNumberError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='The episode assignment is invalid.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+
+
+@router.get(
     '/status',
     summary='録画シリーズ判定状況取得 API',
     response_model=RecordedSeriesStatusResponse,
@@ -739,7 +1095,9 @@ async def RecordedSeriesStatusAPI(
     """録画シリーズ判定の件数、当日AI利用数、一括処理状態を返す。"""
 
     response.headers.update(NO_STORE_HEADERS)
-    return RecordedSeriesStatusResponse.model_validate(await RecordedSeriesResolver.getStatus())
+    series_status = await RecordedSeriesResolver.getStatus()
+    episode_status = await RecordedEpisodeAutomation.getStatus()
+    return RecordedSeriesStatusResponse.model_validate({**series_status, **episode_status})
 
 
 @router.post(
@@ -757,6 +1115,42 @@ async def RecordedSeriesBackfillAPI(
 
     response.headers.update(NO_STORE_HEADERS)
     accepted = await RecordedSeriesResolver.startBackfill(trigger='Manual', force=request.force)
+    return schemas.AnalysisTaskAccepted(
+        execution_id=accepted.execution_id,
+        reused=accepted.reused,
+    )
+
+
+@router.post(
+    '/episodes/backfill',
+    summary='既存録画話数一括判定 API',
+    response_model=schemas.AnalysisTaskAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def RecordedEpisodeBackfillAPI(
+    request: RecordedSeriesBackfillRequest,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> schemas.AnalysisTaskAccepted:
+    """既存録画の話数を、明示操作1回につき当日のAI上限まで判定・再検索する。"""
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        settings = RecordedSeriesSettingsStore.getSettings()
+    except (OSError, ValueError) as ex:
+        logging.error('[RecordedEpisodeBackfillAPI] Failed to load recorded series settings:', exc_info=ex)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load recorded series settings.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    if settings.ai_enabled is False or settings.ai_episode_number_search_enabled is False:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='AI episode number search must be enabled before starting episode backfill.',
+            headers=NO_STORE_HEADERS,
+        )
+    accepted = await RecordedEpisodeAutomation.startBackfill(force=request.force)
     return schemas.AnalysisTaskAccepted(
         execution_id=accepted.execution_id,
         reused=accepted.reused,
@@ -831,6 +1225,8 @@ async def RecordedSeriesAssignmentUpdateAPI(
             series_id=request.series_id,
             series_title=request.series_title,
         )
+        if request.decision == 'Series':
+            await RecordedEpisodeAutomation.enqueue(recorded_program_id)
     except RecordedSeriesProgramNotFoundError as ex:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

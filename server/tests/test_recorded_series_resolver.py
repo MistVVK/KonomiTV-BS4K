@@ -422,6 +422,7 @@ def test_pending_ai_recovery_only_closes_the_matching_resolution_generation(
             db_url='sqlite://:memory:',
             modules={'models': [
                 'app.models.Channel',
+                'app.models.RecordedEpisode',
                 'app.models.RecordedProgram',
                 'app.models.RecordedVideo',
                 'app.models.RecordedSeries',
@@ -606,6 +607,7 @@ def test_reconcile_broadcast_period_shrinks_and_moves_preserved_series() -> None
             db_url='sqlite://:memory:',
             modules={'models': [
                 'app.models.Channel',
+                'app.models.RecordedEpisode',
                 'app.models.RecordedProgram',
                 'app.models.RecordedVideo',
                 'app.models.RecordedSeries',
@@ -808,6 +810,7 @@ def test_zero_ai_request_limit_skips_daily_count_and_checks_recent_attempt_cache
                 SimpleNamespace(
                     enabled=True,
                     ai_enabled=True,
+                    ai_candidate_selection_enabled=True,
                     api_base_url='https://example.invalid/v1',
                     model='test-model',
                     daily_ai_request_limit=0,
@@ -891,7 +894,7 @@ def test_ai_can_resolve_without_existing_or_wikipedia_candidates(
             return None
 
     class CountQuery:
-        def filter(self, **_kwargs: object) -> 'CountQuery':
+        def filter(self, *_args: object, **_kwargs: object) -> 'CountQuery':
             return self
 
         async def count(self) -> int:
@@ -974,6 +977,7 @@ def test_ai_can_resolve_without_existing_or_wikipedia_candidates(
                 SimpleNamespace(
                     enabled=True,
                     ai_enabled=True,
+                    ai_candidate_selection_enabled=True,
                     api_base_url='https://example.invalid/v1',
                     model='test-model',
                     daily_ai_request_limit=20,
@@ -1043,7 +1047,7 @@ def test_generation_change_while_building_wikipedia_candidates_stops_before_ai_r
             return None
 
     class CountQuery:
-        def filter(self, **_kwargs: object) -> 'CountQuery':
+        def filter(self, *_args: object, **_kwargs: object) -> 'CountQuery':
             return self
 
         async def count(self) -> int:
@@ -1101,6 +1105,7 @@ def test_generation_change_while_building_wikipedia_candidates_stops_before_ai_r
                 SimpleNamespace(
                     enabled=True,
                     ai_enabled=True,
+                    ai_candidate_selection_enabled=True,
                     api_base_url='https://example.invalid/v1',
                     model='test-model',
                     daily_ai_request_limit=20,
@@ -1188,7 +1193,7 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
             events.append('audit-failed')
 
     class CountQuery:
-        def filter(self, **_kwargs: object) -> 'CountQuery':
+        def filter(self, *_args: object, **_kwargs: object) -> 'CountQuery':
             return self
 
         async def count(self) -> int:
@@ -1247,6 +1252,7 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
                 SimpleNamespace(
                     enabled=True,
                     ai_enabled=True,
+                    ai_candidate_selection_enabled=True,
                     api_base_url='https://example.invalid/v1',
                     model='test-model',
                     daily_ai_request_limit=20,

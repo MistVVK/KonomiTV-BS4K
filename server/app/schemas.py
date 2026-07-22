@@ -4,14 +4,38 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Annotated, Literal, NotRequired
 
-from pydantic import BaseModel, Field, RootModel, computed_field
+from pydantic import BaseModel, Field, PlainSerializer, RootModel, computed_field
 from tortoise.contrib.pydantic import PydanticModel
 from typing_extensions import TypedDict
 
 from app.metadata.RecordedPlaybackIndex import RECORDED_PLAYBACK_INDEX_VERSION
 from app.utils.TSInformation import TerrestrialRegion
+
+
+def SerializeRecordedEpisodeNumber(episode_number: Decimal) -> str:
+    """Tortoiseが指数表記へnormalizeした話数を、API向けの通常の小数表記へ戻す。
+
+    Args:
+        episode_number: DecimalFieldから取得した非負の話数。
+
+    Returns:
+        整数末尾の0を維持し、小数部の不要な0だけを除いた文字列。
+    """
+
+    episode_text = format(episode_number, 'f')
+    if '.' in episode_text:
+        episode_text = episode_text.rstrip('0').rstrip('.')
+    return episode_text
+
+
+# Decimalのまま内部検証しつつ、JSON境界では `1E+1` ではなく `10` として返す。
+RecordedEpisodeNumber = Annotated[
+    Decimal,
+    PlainSerializer(SerializeRecordedEpisodeNumber, return_type=str, when_used='json'),
+]
 
 
 # 以下に定義する型定義は、必ず以下の例のように、「親モデル」->「子モデル」の順に記述すること！
@@ -296,7 +320,7 @@ class AnalysisTaskExecution(BaseModel):
     task_type: Literal[
         'RecordedScan', 'MetadataAnalysis', 'PlaybackIndex', 'ThumbnailGeneration', 'CMAnalysis',
         'CMLogoGeneration', 'BatchScan', 'BatchMetadataReanalysis', 'BatchCMAnalysis',
-        'BatchSeriesResolution', 'BackgroundAnalysis',
+        'BatchSeriesResolution', 'BatchEpisodeResolution', 'BackgroundAnalysis',
     ]
     status: Literal['Queued', 'Running', 'Succeeded', 'Failed', 'Interrupted', 'Skipped']
     trigger: Literal['Automatic', 'Manual', 'Maintenance', 'StartupBackfill']
@@ -516,7 +540,15 @@ class SeriesBroadcastPeriod(PydanticModel):
     channel: Channel
     start_date: date
     end_date: date
-    recorded_programs: list[RecordedProgram]
+    recorded_programs: list[SeriesRecordedProgram]
+
+class SeriesRecordedProgram(RecordedProgram):
+    series_episode: SeriesEpisode | None = None
+
+class SeriesEpisode(PydanticModel):
+    id: int
+    season_number: int
+    episode_number: RecordedEpisodeNumber
 
 # ***** ユーザー *****
 

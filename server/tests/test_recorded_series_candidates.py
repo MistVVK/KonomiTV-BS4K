@@ -18,6 +18,8 @@ def test_build_chat_completions_url_accepts_service_root_or_full_endpoint() -> N
     assert BuildChatCompletionsURL('http://127.0.0.1:1234/v1/') == 'http://127.0.0.1:1234/v1/chat/completions'
     assert BuildChatCompletionsURL('https://api.example/v1/chat/completions') == \
         'https://api.example/v1/chat/completions'
+    assert BuildChatCompletionsURL('https://api.example/v1/responses') == \
+        'https://api.example/v1/chat/completions'
 
 
 def _program() -> RecordedSeriesProgramPrompt:

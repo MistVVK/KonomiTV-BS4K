@@ -25,6 +25,8 @@ from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
+from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
+from app.metadata.RecordedEpisodeResolver import RecordedEpisodeResolver
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.metadata.RecordedSeriesResolver import RecordedSeriesResolver
@@ -263,8 +265,23 @@ async def Startup():
     # 番組情報を更新
     await Program.update()
 
+    # migration前から存在し、現在Series所属済みの録画だけを、外部通信なしで構造化Episodeへ移行する。
+    # 失敗してもPending行を残せるため、次回起動で同じ処理を安全に再試行できる。
+    try:
+        resolved_episode_count, review_episode_count = await RecordedEpisodeResolver.backfillLegacyEpisodes()
+        if resolved_episode_count > 0 or review_episode_count > 0:
+            logging.info(
+                f'Legacy episode backfill completed. '
+                f'[resolved: {resolved_episode_count}, needs_review: {review_episode_count}]',
+            )
+    except Exception as ex:
+        logging.error('[RecordedEpisodeResolver] Failed to backfill legacy episodes:', exc_info=ex)
+
     # 録画スキャンとは分離したシリーズ判定ワーカーを開始する。
     await RecordedSeriesResolver.start()
+
+    # Series確定後の話数解析・Web検索も別ワーカーで開始し、録画スキャンを待たせない。
+    await RecordedEpisodeAutomation.start()
 
     # 全てのチャンネル&品質のライブストリームを初期化する
     for channel in await Channel.filter(is_watchable=True).order_by('channel_number'):
@@ -335,8 +352,10 @@ async def Shutdown():
         await recorded_scan_task.stop()
         recorded_scan_task = None
 
-    # DB接続が閉じられる前にシリーズ判定ワーカーと一括判定を停止する。
+    # DB接続が閉じられる前にproducerのシリーズ判定を先に止め、その後に話数判定を停止する。
+    # 逆順では、停止済みの話数ワーカーへSeries側がenqueueして再起動する競合が起こり得る。
     await RecordedSeriesResolver.stop()
+    await RecordedEpisodeAutomation.stop()
 
     # DB接続が閉じられる前に、HTTP接続から分離した手動CM再判定を中断・回収する。
     await CMAnalysisTaskManager.stop()

@@ -9,6 +9,7 @@ from tortoise.models import Model as TortoiseModel
 
 
 if TYPE_CHECKING:
+    from app.models.RecordedEpisode import RecordedEpisodeResolution
     from app.models.RecordedProgram import RecordedProgram
     from app.models.Series import Series
 
@@ -16,7 +17,7 @@ if TYPE_CHECKING:
 RecordedSeriesDecision = Literal['Series', 'NotSeries']
 RecordedSeriesResolutionStatus = Literal['Pending', 'Resolved', 'NotSeries', 'NeedsReview', 'Failed']
 RecordedSeriesSource = Literal['Rule', 'Local', 'EPG', 'MediaWiki', 'AI', 'Manual']
-RecordedSeriesAIRequestPurpose = Literal['Resolution', 'ConnectionTest']
+RecordedSeriesAIRequestPurpose = Literal['Resolution', 'EpisodeLookup', 'ConnectionTest']
 RecordedSeriesAIRequestStatus = Literal['Pending', 'Succeeded', 'Failed', 'Rejected']
 
 
@@ -101,6 +102,13 @@ class RecordedSeriesAIRequest(TortoiseModel):
         on_delete=fields.SET_NULL,
     )
     resolution_id: int | None
+    episode_resolution: fields.ForeignKeyNullableRelation[RecordedEpisodeResolution] = fields.ForeignKeyField(
+        'models.RecordedEpisodeResolution',
+        related_name='ai_requests',
+        null=True,
+        on_delete=fields.SET_NULL,
+    )
+    episode_resolution_id: int | None
     purpose = cast(TortoiseField[RecordedSeriesAIRequestPurpose], fields.CharField(32))
     status = cast(TortoiseField[RecordedSeriesAIRequestStatus], fields.CharField(32))
     model = fields.TextField()

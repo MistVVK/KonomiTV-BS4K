@@ -19,6 +19,8 @@ from tortoise.expressions import Q
 from app import logging
 from app.constants import JST
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
+from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
+from app.metadata.RecordedEpisodeResolver import RecordedEpisodeResolver
 from app.metadata.RecordedSeriesCandidates import (
     AIChoiceResult,
     RecordedSeriesAIError,
@@ -28,6 +30,7 @@ from app.metadata.RecordedSeriesCandidates import (
     SeriesChoiceCandidate,
     WikipediaCandidate,
 )
+from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
 from app.metadata.SeriesTitleParser import (
     SERIES_TITLE_PARSER_VERSION,
@@ -338,7 +341,7 @@ class RecordedSeriesResolver:
     _rerun_ids: set[int] = set()
     _ai_attempt_keys: dict[str, float] = {}
     _snapshot_generation = 0
-    _resolve_lock = asyncio.Lock()
+    _resolve_lock = RECORDED_SERIES_RESOLUTION_LOCK
     _backfill_start_lock = asyncio.Lock()
     _recovery_lock = asyncio.Lock()
     _canonical_key_backfill_lock = asyncio.Lock()
@@ -633,6 +636,7 @@ class RecordedSeriesResolver:
             retry_after_current = False
             try:
                 await cls.resolveProgram(recorded_program_id)
+                await RecordedEpisodeAutomation.enqueue(recorded_program_id)
             except asyncio.CancelledError:
                 raise
             except _RecordedProgramSnapshotChanged:
@@ -784,6 +788,7 @@ class RecordedSeriesResolver:
                     else:
                         failed_count += 1
                     ai_request_count += int(result.ai_requested)
+                    await RecordedEpisodeAutomation.enqueue(recorded_program_id)
                     await history.setCounts(
                         current=index,
                         total=len(ordered_ids),
@@ -1382,6 +1387,11 @@ class RecordedSeriesResolver:
                             using_db=connection,
                         )
 
+                    await RecordedEpisodeResolver.synchronizeSeriesAssignment(
+                        recorded_program,
+                        target_series_id=target_series.id,
+                        connection=connection,
+                    )
                     recorded_program.series_id = target_series.id
                     recorded_program.series_broadcast_period_id = target_period.id
                     recorded_program.series_title = target_series.title
@@ -1406,6 +1416,11 @@ class RecordedSeriesResolver:
                     )
                     await target_series.save(update_fields=['updated_at'], using_db=connection)
                 else:
+                    await RecordedEpisodeResolver.synchronizeSeriesAssignment(
+                        recorded_program,
+                        target_series_id=None,
+                        connection=connection,
+                    )
                     recorded_program.series_id = None
                     recorded_program.series_broadcast_period_id = None
                     recorded_program.series_title = None
@@ -1586,6 +1601,11 @@ class RecordedSeriesResolver:
                     if len(changed_period_fields) > 0:
                         await period.save(update_fields=changed_period_fields, using_db=connection)
 
+            await RecordedEpisodeResolver.synchronizeSeriesAssignment(
+                recorded_program,
+                target_series_id=series.id,
+                connection=connection,
+            )
             recorded_program.series_id = series.id
             recorded_program.series_broadcast_period_id = period.id if period is not None else None
             recorded_program.series_title = series.title
@@ -1672,6 +1692,11 @@ class RecordedSeriesResolver:
                 raise _RecordedProgramSnapshotChanged
             _assertRecordedProgramSnapshotCurrent(recorded_program, snapshot)
             previous_period_id = recorded_program.series_broadcast_period_id
+            await RecordedEpisodeResolver.synchronizeSeriesAssignment(
+                recorded_program,
+                target_series_id=None,
+                connection=connection,
+            )
             recorded_program.series_id = None
             recorded_program.series_broadcast_period_id = None
             recorded_program.series_title = None
@@ -1739,6 +1764,11 @@ class RecordedSeriesResolver:
             _assertRecordedProgramSnapshotCurrent(recorded_program, snapshot)
             if clear_series:
                 previous_period_id = recorded_program.series_broadcast_period_id
+                await RecordedEpisodeResolver.synchronizeSeriesAssignment(
+                    recorded_program,
+                    target_series_id=None,
+                    connection=connection,
+                )
                 recorded_program.series_id = None
                 recorded_program.series_broadcast_period_id = None
                 recorded_program.series_title = None
@@ -2207,13 +2237,17 @@ class RecordedSeriesResolver:
                 return RecordedSeriesResolveResult(recorded_program_id, 'NotSeries', 'Local', False)
 
             existing_series = await cls._findExistingSeriesCandidates(cluster.display_title)
-            if settings.ai_enabled is False:
+            if settings.ai_enabled is False or settings.ai_candidate_selection_enabled is False:
                 await cls._applyNeedsReview(
                     snapshot=snapshot,
                     resolution=resolution,
                     expected_generation=decision_generation,
                     source='Local',
-                    error_code='AIIsDisabled',
+                    error_code=(
+                        'AIIsDisabled'
+                        if settings.ai_enabled is False
+                        else 'AICandidateSelectionIsDisabled'
+                    ),
                     clear_series=force is False,
                 )
                 return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'Local', False)
@@ -2221,9 +2255,11 @@ class RecordedSeriesResolver:
             if settings.daily_ai_request_limit > 0:
                 today_start = datetime.combine(datetime.now(tz=JST).date(), datetime_time.min, tzinfo=JST)
                 requests_today = await RecordedSeriesAIRequest.filter(
-                    purpose='Resolution',
+                    purpose__in=['Resolution', 'EpisodeLookup'],
                     created_at__gte=today_start,
-                ).filter(error_code__not='InputChangedBeforeRequest').count()
+                ).filter(
+                    Q(error_code=None) | Q(error_code__not='InputChangedBeforeRequest'),
+                ).count()
                 if requests_today >= settings.daily_ai_request_limit:
                     await cls._applyNeedsReview(
                         snapshot=snapshot,
@@ -2593,10 +2629,18 @@ class RecordedSeriesResolver:
             for status in ('Pending', 'Resolved', 'NotSeries', 'NeedsReview', 'Failed')
         }
         today_start = datetime.combine(datetime.now(tz=JST).date(), datetime_time.min, tzinfo=JST)
-        ai_requests_today = await RecordedSeriesAIRequest.filter(
+        series_ai_requests_today = await RecordedSeriesAIRequest.filter(
             purpose='Resolution',
             created_at__gte=today_start,
-        ).filter(error_code__not='InputChangedBeforeRequest').count()
+        ).filter(
+            Q(error_code=None) | Q(error_code__not='InputChangedBeforeRequest'),
+        ).count()
+        episode_ai_requests_today = await RecordedSeriesAIRequest.filter(
+            purpose='EpisodeLookup',
+            created_at__gte=today_start,
+        ).filter(
+            Q(error_code=None) | Q(error_code__not='InputChangedBeforeRequest'),
+        ).count()
         last_resolution = await RecordedSeriesResolution.all().order_by('-updated_at').first()
         resolved_count = status_counts['Resolved']
         not_series_count = status_counts['NotSeries']
@@ -2613,7 +2657,9 @@ class RecordedSeriesResolver:
             'not_series': not_series_count,
             'needs_review': needs_review_count,
             'failed': failed_count,
-            'ai_requests_today': ai_requests_today,
+            'ai_requests_today': series_ai_requests_today + episode_ai_requests_today,
+            'series_ai_requests_today': series_ai_requests_today,
+            'episode_ai_requests_today': episode_ai_requests_today,
             'last_run_at': last_resolution.updated_at.isoformat() if last_resolution is not None else None,
             'is_running': cls._backfill_task is not None and cls._backfill_task.done() is False,
         }
