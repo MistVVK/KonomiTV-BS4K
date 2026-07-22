@@ -167,7 +167,8 @@
                 <div class="settings__item settings__item--sync-disabled">
                     <div class="settings__item-heading">BS4K 録画再生の映像コーデック</div>
                     <div class="settings__item-label">
-                        AVC は互換性を、HEVC は通信量の削減を優先します。HEVC 非対応環境では再生時だけ AVC に戻します。<br>
+                        AVC は互換性を優先し、HEVC、VP9、AV1 の順に映像ビットレートを抑えます。<br>
+                        非対応環境では、保存設定を変えずに再生時だけ利用可能な別コーデックへ切り替えます。<br>
                     </div>
                     <div class="settings__item-label mt-1">
                         <p class="mt-1 mb-0 text-error-readable" v-if="PlayerUtils.isHEVCVideoSupported() === false && Utils.isFirefox() === false">
@@ -249,7 +250,10 @@ import SettingsViewContainer from '@/components/Settings/SettingsViewContainer.v
 import Message from '@/message';
 import Videos, { IRecordedPlaybackCodecOption } from '@/services/Videos';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
-import useSettingsStore, { type BS4KLiveStreamingQuality } from '@/stores/SettingsStore';
+import useSettingsStore, {
+    type BS4KLiveStreamingQuality,
+    type RecordedStreamingVideoCodec,
+} from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { PlayerUtils } from '@/utils';
 
@@ -318,6 +322,47 @@ const QUALITY_BS4K_H265 = [
     {title: '240p (30fps) (約0.20GB/h / 平均0.5Mbps)', value: '240p-30fps'},
 ];
 
+// 録画再生では既存の HEVC 指定値を基準に、VP9 は 90%、AV1 は 70% へ下げる。
+// 表示は小数第1位へ丸めるが、実際の FFmpeg 指定値はサーバー側で Kbps 単位に計算される。
+const QUALITY_BS4K_VP9 = [
+    {title: '8K (約8.10GB/h / 平均18.0Mbps)', value: '4320p'},
+    {title: '4K (約3.65GB/h / 平均8.1Mbps)', value: '2160p'},
+    {title: '1440p (約2.23GB/h / 平均5.0Mbps)', value: '1440p'},
+    {title: '1080p (60fps) (約1.42GB/h / 平均3.2Mbps)', value: '1080p-60fps'},
+    {title: '1080p (30fps) (約1.22GB/h / 平均2.7Mbps)', value: '1080p-30fps'},
+    {title: '810p (60fps) (約1.22GB/h / 平均2.7Mbps)', value: '810p-60fps'},
+    {title: '810p (30fps) (約1.01GB/h / 平均2.3Mbps)', value: '810p-30fps'},
+    {title: '720p (60fps) (約0.97GB/h / 平均2.2Mbps)', value: '720p-60fps'},
+    {title: '720p (30fps) (約0.81GB/h / 平均1.8Mbps)', value: '720p-30fps'},
+    {title: '540p (30fps) (約0.57GB/h / 平均1.3Mbps)', value: '540p-30fps'},
+    {title: '480p (30fps) (約0.43GB/h / 平均0.9Mbps)', value: '480p-30fps'},
+    {title: '360p (30fps) (約0.30GB/h / 平均0.7Mbps)', value: '360p-30fps'},
+    {title: '240p (30fps) (約0.18GB/h / 平均0.4Mbps)', value: '240p-30fps'},
+];
+
+const QUALITY_BS4K_AV1 = [
+    {title: '8K (約6.30GB/h / 平均14.0Mbps)', value: '4320p'},
+    {title: '4K (約2.84GB/h / 平均6.3Mbps)', value: '2160p'},
+    {title: '1440p (約1.73GB/h / 平均3.9Mbps)', value: '1440p'},
+    {title: '1080p (60fps) (約1.10GB/h / 平均2.5Mbps)', value: '1080p-60fps'},
+    {title: '1080p (30fps) (約0.95GB/h / 平均2.1Mbps)', value: '1080p-30fps'},
+    {title: '810p (60fps) (約0.95GB/h / 平均2.1Mbps)', value: '810p-60fps'},
+    {title: '810p (30fps) (約0.79GB/h / 平均1.8Mbps)', value: '810p-30fps'},
+    {title: '720p (60fps) (約0.76GB/h / 平均1.7Mbps)', value: '720p-60fps'},
+    {title: '720p (30fps) (約0.63GB/h / 平均1.4Mbps)', value: '720p-30fps'},
+    {title: '540p (30fps) (約0.44GB/h / 平均1.0Mbps)', value: '540p-30fps'},
+    {title: '480p (30fps) (約0.33GB/h / 平均0.7Mbps)', value: '480p-30fps'},
+    {title: '360p (30fps) (約0.24GB/h / 平均0.5Mbps)', value: '360p-30fps'},
+    {title: '240p (30fps) (約0.14GB/h / 平均0.3Mbps)', value: '240p-30fps'},
+];
+
+const RECORDED_BS4K_QUALITY_BY_CODEC: Record<RecordedStreamingVideoCodec, typeof QUALITY_BS4K_H264> = {
+    avc: QUALITY_BS4K_H264,
+    hevc: QUALITY_BS4K_H265,
+    vp9: QUALITY_BS4K_VP9,
+    av1: QUALITY_BS4K_AV1,
+};
+
 // フォームを小さくするかどうか
 const is_form_dense = Utils.isSmartphoneHorizontal();
 const settings_store = useSettingsStore();
@@ -353,10 +398,10 @@ const bs4k_streaming_quality_cellular = computed(() => {
     return settings_store.settings.bs4k_tv_encoding_codec_cellular === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
 });
 const bs4k_video_streaming_quality = computed(() => {
-    return settings_store.settings.bs4k_video_encoding_codec === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+    return RECORDED_BS4K_QUALITY_BY_CODEC[settings_store.settings.bs4k_video_encoding_codec];
 });
 const bs4k_video_streaming_quality_cellular = computed(() => {
-    return settings_store.settings.bs4k_video_encoding_codec_cellular === 'hevc' ? QUALITY_BS4K_H265 : QUALITY_BS4K_H264;
+    return RECORDED_BS4K_QUALITY_BY_CODEC[settings_store.settings.bs4k_video_encoding_codec_cellular];
 });
 
 // 表示名だけを利用者向けに短縮し、value はサーバー API との既存契約を維持する

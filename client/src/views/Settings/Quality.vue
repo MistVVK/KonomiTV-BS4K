@@ -133,7 +133,8 @@
             <div class="settings__item settings__item--sync-disabled">
                 <div class="settings__item-heading">録画再生の映像コーデック</div>
                 <div class="settings__item-label">
-                    AVC は互換性を、HEVC は通信量の削減を優先します。非対応環境では再生時だけ AVC に戻します。
+                    AVC は互換性を優先し、HEVC、VP9、AV1 の順に映像ビットレートを抑えます。<br>
+                    非対応環境では、保存設定を変えずに再生時だけ利用可能な別コーデックへ切り替えます。
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'" :items="recorded_streaming_video_codecs"
@@ -187,7 +188,7 @@ import { defineComponent } from 'vue';
 import SettingsViewContainer from '@/components/Settings/SettingsViewContainer.vue';
 import Videos, { IRecordedPlaybackCodecOption } from '@/services/Videos';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
-import useSettingsStore from '@/stores/SettingsStore';
+import useSettingsStore, { type RecordedStreamingVideoCodec } from '@/stores/SettingsStore';
 import Utils, { PlayerUtils } from '@/utils';
 
 const QUALITY_H264 = [
@@ -211,6 +212,37 @@ const QUALITY_H265 = [
     {title: '360p (約0.30GB/h / 平均0.7Mbps)', value: '360p'},
     {title: '240p (約0.20GB/h / 平均0.4Mbps)', value: '240p'},
 ];
+
+// 録画再生では既存の HEVC 指定値を基準に、VP9 は 90%、AV1 は 70% へ下げる。
+// 表示は小数第1位へ丸めるが、実際の FFmpeg 指定値はサーバー側で Kbps 単位に計算される。
+const QUALITY_VP9 = [
+    {title: '1080p (60fps) (約1.42GB/h / 平均3.2Mbps)', value: '1080p-60fps'},
+    {title: '1080p (約1.22GB/h / 平均2.7Mbps)', value: '1080p'},
+    {title: '810p (約1.01GB/h / 平均2.3Mbps)', value: '810p'},
+    {title: '720p (約0.81GB/h / 平均1.8Mbps)', value: '720p'},
+    {title: '540p (約0.57GB/h / 平均1.3Mbps)', value: '540p'},
+    {title: '480p (約0.43GB/h / 平均0.9Mbps)', value: '480p'},
+    {title: '360p (約0.30GB/h / 平均0.7Mbps)', value: '360p'},
+    {title: '240p (約0.18GB/h / 平均0.4Mbps)', value: '240p'},
+];
+
+const QUALITY_AV1 = [
+    {title: '1080p (60fps) (約1.10GB/h / 平均2.5Mbps)', value: '1080p-60fps'},
+    {title: '1080p (約0.95GB/h / 平均2.1Mbps)', value: '1080p'},
+    {title: '810p (約0.79GB/h / 平均1.8Mbps)', value: '810p'},
+    {title: '720p (約0.63GB/h / 平均1.4Mbps)', value: '720p'},
+    {title: '540p (約0.44GB/h / 平均1.0Mbps)', value: '540p'},
+    {title: '480p (約0.33GB/h / 平均0.7Mbps)', value: '480p'},
+    {title: '360p (約0.24GB/h / 平均0.5Mbps)', value: '360p'},
+    {title: '240p (約0.14GB/h / 平均0.3Mbps)', value: '240p'},
+];
+
+const RECORDED_QUALITY_BY_CODEC: Record<RecordedStreamingVideoCodec, typeof QUALITY_H264> = {
+    avc: QUALITY_H264,
+    hevc: QUALITY_H265,
+    vp9: QUALITY_VP9,
+    av1: QUALITY_AV1,
+};
 
 export default defineComponent({
     name: 'Settings-Quality',
@@ -288,22 +320,14 @@ export default defineComponent({
         },
         'settingsStore.settings.video_encoding_codec': {
             immediate: true,
-            handler(value: 'avc' | 'hevc') {
-                if (value === 'hevc') {
-                    this.video_streaming_quality = QUALITY_H265;
-                } else {
-                    this.video_streaming_quality = QUALITY_H264;
-                }
+            handler(value: RecordedStreamingVideoCodec) {
+                this.video_streaming_quality = RECORDED_QUALITY_BY_CODEC[value];
             },
         },
         'settingsStore.settings.video_encoding_codec_cellular': {
             immediate: true,
-            handler(value: 'avc' | 'hevc') {
-                if (value === 'hevc') {
-                    this.video_streaming_quality_cellular = QUALITY_H265;
-                } else {
-                    this.video_streaming_quality_cellular = QUALITY_H264;
-                }
+            handler(value: RecordedStreamingVideoCodec) {
+                this.video_streaming_quality_cellular = RECORDED_QUALITY_BY_CODEC[value];
             },
         },
     },
