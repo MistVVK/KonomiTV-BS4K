@@ -9,6 +9,7 @@ from markdown_it import MarkdownIt
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 GENERATOR_PATH = REPOSITORY_ROOT / 'docker/thirdparty/generate-chromium-license-document.py'
+CHROMIUM_LICENSE_PATH = REPOSITORY_ROOT / 'docker/thirdparty/licenses/chromium-LICENSE'
 
 
 def LoadGenerator() -> ModuleType:
@@ -23,7 +24,7 @@ def LoadGenerator() -> ModuleType:
 GENERATOR = LoadGenerator()
 
 
-def test_chromium_package_version_is_pinned_to_four_part_upstream_version() -> None:
+def test_chromium_package_version_extracts_four_part_upstream_version() -> None:
     assert GENERATOR.extractPackageChromiumVersion('150.0.7871.124~linuxmint1+virginia') == '150.0.7871.124'
 
     with pytest.raises(ValueError, match='Unsupported Chromium package version'):
@@ -110,12 +111,27 @@ def test_linux_mint_package_copyright_is_strict_utf8_and_hashed(tmp_path: Path) 
         GENERATOR.readPackageCopyright(copyright_path)
 
 
+def test_vendored_chromium_license_is_read_without_network_or_version_pinning(tmp_path: Path) -> None:
+    chromium_license = GENERATOR.readChromiumLicense(CHROMIUM_LICENSE_PATH)
+    assert chromium_license.startswith('// Copyright 2015 The Chromium Authors')
+    assert 'Redistribution and use in source and binary forms' in chromium_license
+
+    invalid_license_path = tmp_path / 'chromium-LICENSE'
+    invalid_license_path.write_text('Not the Chromium license.\n', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='expected license text structure'):
+        GENERATOR.readChromiumLicense(invalid_license_path)
+
+    invalid_license_path.write_bytes(b'Invalid UTF-8: \xff')
+    with pytest.raises(RuntimeError, match='not valid UTF-8'):
+        GENERATOR.readChromiumLicense(invalid_license_path)
+
+
 def test_chromium_license_document_uses_safe_dynamic_markdown_fences() -> None:
     chromium_license = '// Copyright Chromium\n````\nLicense text.'
     document = GENERATOR.buildLicenseDocument(
         '1.2.3.4~linuxmint1+virginia',
         '1.2.3.4',
-        'https://chromium.googlesource.com/chromium/src/+/refs/tags/1.2.3.4/LICENSE?format=TEXT',
+        GENERATOR.CHROMIUM_LICENSE_SOURCE_URL,
         chromium_license,
         'Linux Mint package copyright.',
         '0' * 64,
@@ -127,7 +143,7 @@ def test_chromium_license_document_uses_safe_dynamic_markdown_fences() -> None:
         [('Markup project', 1)],
     )
 
-    assert 'Fixed upstream Chromium version: `1.2.3.4`' in document
+    assert 'Installed upstream Chromium version: `1.2.3.4`' in document
     assert 'Bundled project count: 1' in document
     assert 'Linux Mint package copyright file' in document
     assert '`Markup project`: 1 character' in document

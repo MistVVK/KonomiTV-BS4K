@@ -20,9 +20,7 @@ from typing import Any
 
 
 CHROMIUM_CREDITS_URL = 'chrome://credits/'
-CHROMIUM_LICENSE_URL_TEMPLATE = (
-    'https://chromium.googlesource.com/chromium/src/+/refs/tags/{version}/LICENSE?format=TEXT'
-)
+CHROMIUM_LICENSE_SOURCE_URL = 'https://chromium.googlesource.com/chromium/src/+/main/LICENSE'
 CHROMIUM_VERSION_PATTERN = re.compile(r'^Chromium ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)(?: .*)?$')
 PACKAGE_VERSION_PATTERN = re.compile(r'^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)(?:[~+].*)?$')
 UNSAFE_CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
@@ -301,37 +299,27 @@ def readChromiumBinaryVersion(chromium_path: Path) -> str:
     return match.group(1)
 
 
-def fetchChromiumLicense(version: str) -> tuple[str, str]:
-    """インストール済み Chromium と同じ公式 tag の LICENSE を取得する。
+def readChromiumLicense(path: Path) -> str:
+    """リポジトリへ同梱した Chromium 本体の LICENSE を厳密に読む。
 
     Args:
-        version: 4要素の upstream Chromium バージョン。
+        path: Chromium 本体の LICENSE を同梱したパス。
 
     Returns:
-        公式 LICENSE URL と UTF-8 本文。
+        正規化済みの UTF-8 本文。
     """
 
-    license_url = CHROMIUM_LICENSE_URL_TEMPLATE.format(version=version)
-    request = urllib.request.Request(
-        license_url,
-        headers={'User-Agent': 'KonomiTV-Chromium-license-generator'},
-    )
-    with urllib.request.urlopen(request, timeout=30.0) as response:
-        final_url = urllib.parse.urlsplit(response.geturl())
-        if final_url.scheme != 'https' or final_url.hostname != 'chromium.googlesource.com':
-            raise RuntimeError(f'Chromium LICENSE was redirected to an unexpected URL: {response.geturl()!r}')
-        encoded_license = response.read(MAX_CHROMIUM_LICENSE_SIZE + 1)
-        if len(encoded_license) > MAX_CHROMIUM_LICENSE_SIZE:
-            raise RuntimeError('Official Chromium LICENSE is unexpectedly large.')
+    license_bytes = path.read_bytes()
+    if len(license_bytes) > MAX_CHROMIUM_LICENSE_SIZE:
+        raise RuntimeError(f'Vendored Chromium LICENSE is unexpectedly large: {path}')
     try:
-        compact_license = b''.join(encoded_license.split())
-        license_text = base64.b64decode(compact_license, validate=True).decode('utf-8')
-    except (ValueError, UnicodeDecodeError) as ex:
-        raise RuntimeError('Official Chromium LICENSE is not valid base64-encoded UTF-8 text.') from ex
-    license_text = normalizeAndValidateText(license_text, 'Official Chromium LICENSE')
+        license_text = license_bytes.decode('utf-8')
+    except UnicodeDecodeError as ex:
+        raise RuntimeError(f'Vendored Chromium LICENSE is not valid UTF-8: {path}') from ex
+    license_text = normalizeAndValidateText(license_text, 'Vendored Chromium LICENSE')
     if not license_text.startswith('// Copyright ') or 'Redistribution and use in source and binary forms' not in license_text:
-        raise RuntimeError('Official Chromium LICENSE does not have the expected license text structure.')
-    return license_url, license_text
+        raise RuntimeError('Vendored Chromium LICENSE does not have the expected license text structure.')
+    return license_text
 
 
 def readPackageCopyright(path: Path) -> tuple[str, str]:
@@ -694,7 +682,7 @@ def buildLicenseDocument(
     Args:
         package_version: Linux Mint Chromium パッケージ版。
         upstream_version: 対応する upstream Chromium 版。
-        license_url: 取得した公式 LICENSE の固定 tag URL。
+        license_url: 同梱した公式 LICENSE の出典 URL。
         chromium_license: Chromium 本体の LICENSE 本文。
         package_copyright: Linux Mint package 同梱 copyright file の本文。
         package_copyright_sha256: 同梱 copyright file bytes の SHA-256。
@@ -745,7 +733,7 @@ def buildLicenseDocument(
         'This document is generated from the Chromium binary installed in this Docker image.',
         '',
         f'- Installed Linux Mint package version: `{package_version}`',
-        f'- Fixed upstream Chromium version: `{upstream_version}`',
+        f'- Installed upstream Chromium version: `{upstream_version}`',
         f'- Chromium main license source: <{license_url}>',
         f'- Chromium main license SHA-256: `{hashlib.sha256(chromium_license.encode("utf-8")).hexdigest()}`',
         '- Linux Mint package copyright path: `/usr/share/doc/chromium/copyright`',
@@ -794,6 +782,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--chromium', type=Path, required=True)
     parser.add_argument('--package-version', required=True)
+    parser.add_argument('--chromium-license', type=Path, required=True)
     parser.add_argument('--package-copyright', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
@@ -808,13 +797,13 @@ def main() -> None:
             f'{args.package_version!r}.',
         )
 
-    license_url, chromium_license = fetchChromiumLicense(binary_version)
+    chromium_license = readChromiumLicense(args.chromium_license)
     package_copyright, package_copyright_sha256 = readPackageCopyright(args.package_copyright)
     credits, encoding_repairs = extractChromiumCredits(args.chromium, binary_version)
     document = buildLicenseDocument(
         args.package_version,
         binary_version,
-        license_url,
+        CHROMIUM_LICENSE_SOURCE_URL,
         chromium_license,
         package_copyright,
         package_copyright_sha256,

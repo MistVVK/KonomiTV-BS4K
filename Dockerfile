@@ -280,6 +280,7 @@ COPY ./THIRD_PARTY_LICENSES.md /tmp/BASE_THIRD_PARTY_LICENSES.md
 COPY ./docker/thirdparty/assemble-runtime-license-document.py /tmp/assemble-runtime-license-document.py
 COPY ./docker/thirdparty/collect-license-manifest.py /tmp/collect-license-manifest.py
 COPY ./docker/thirdparty/generate-chromium-license-document.py /tmp/generate-chromium-license-document.py
+COPY ./docker/thirdparty/licenses/chromium-LICENSE /tmp/chromium-LICENSE
 # grapheme 0.6.0 の wheel/sdist は LICENSE を欠くため、公開時コミット
 # 7350dfcc1a75a8e347f38ed9e38cb9f9fa928ce0 の上流 LICENSE
 # (https://github.com/alvinlindstam/grapheme/blob/7350dfcc1a75a8e347f38ed9e38cb9f9fa928ce0/LICENSE) を固定して補う。
@@ -294,6 +295,7 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     python3 /tmp/generate-chromium-license-document.py \
         --chromium /usr/bin/chromium \
         --package-version "${chromium_version}" \
+        --chromium-license /tmp/chromium-LICENSE \
         --package-copyright /usr/share/doc/chromium/copyright \
         --output /code/CHROMIUM_THIRD_PARTY_LICENSES.md && \
     python3 /tmp/collect-license-manifest.py \
@@ -324,6 +326,7 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     rm /tmp/BASE_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md \
         /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
         /tmp/assemble-runtime-license-document.py /tmp/collect-license-manifest.py \
-        /tmp/generate-chromium-license-document.py /tmp/grapheme-0.6.0-LICENSE
+        /tmp/generate-chromium-license-document.py /tmp/chromium-LICENSE \
+        /tmp/grapheme-0.6.0-LICENSE
 
 ENTRYPOINT ["/code/server/.venv/bin/python", "KonomiTV.py"]
