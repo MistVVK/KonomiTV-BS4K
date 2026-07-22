@@ -170,7 +170,7 @@ async def BMLBrowserInternetStatusAPI(
 ):
     """
     データ放送ブラウザ (web-bml) のネット接続機能から利用される、ネット接続状態確認 API。<br>
-    Web ブラウザからの HTTP リクエストには CORS の制限があるため、この API により KonomiTV サーバー側がネットに接続できるかが確認される。<br>
+    Web ブラウザからの HTTP リクエストには CORS の制限があるため、この API により KonomiTV-BS4K サーバー側がネットに接続できるかが確認される。<br>
     web-bml のネット接続機能専用の API で、web-bml 以外からは利用されない。
     """
 

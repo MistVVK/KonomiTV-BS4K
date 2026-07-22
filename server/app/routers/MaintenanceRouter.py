@@ -298,13 +298,13 @@ async def DetectCMSectionsForAllRecordedVideosAPI(
         bool,
         Query(
             description=(
-                'KonomiTV自動解析YAMLを再解析して置換する。また、基本名方式の外部.chapter.txtは保持したまま'
-                'KonomiTV YAMLを新規生成する。手動編集YAMLは保護する。'
+                'KonomiTV-BS4K自動解析YAMLを再解析して置換する。また、基本名方式の外部.chapter.txtは保持したまま'
+                'KonomiTV-BS4K YAMLを新規生成する。手動編集YAMLは保護する。'
             ),
         ),
     ] = False,
 ):
-    """登録済み録画を再判定し、明示指定時だけKonomiTV自動解析YAMLを再生成する。"""
+    """登録済み録画を再判定し、明示指定時だけKonomiTV-BS4K自動解析YAMLを再生成する。"""
 
     global cm_detection_task
 
@@ -520,7 +520,7 @@ def ServerRestartAPI(
     current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ):
     """
-    KonomiTV サーバーを再起動する。<br>
+    KonomiTV-BS4K サーバーを再起動する。<br>
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
@@ -554,7 +554,7 @@ def ServerShutdownAPI(
     current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ):
     """
-    KonomiTV サーバーを終了する。<br>
+    KonomiTV-BS4K サーバーを終了する。<br>
     なお、PM2 環境 / Docker 環境ではサーバー終了後に自動的にプロセスが再起動されるため、事実上 /api/maintenance/restart と等価。<br>
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """

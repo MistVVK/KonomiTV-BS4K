@@ -30,7 +30,7 @@
                 <div class="settings__item-heading">配信・エンコーダー設定を更新</div>
                 <div class="settings__item-label">
                     通常・BS4K・共通の設定をまとめて config.yaml に保存します。<br>
-                    保存した変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
+                    保存した変更を反映するには KonomiTV-BS4K サーバーの再起動が必要です。<br>
                 </div>
             </div>
             <v-btn class="settings__save-button bg-secondary mt-5" variant="flat"
@@ -89,7 +89,7 @@ async function updateServerSettings(): Promise<void> {
     const result = await server_settings_store.updateServerSettings(server_settings.value);
     if (result === true) {
         resetServerSettingsDraft();
-        Message.success('配信・エンコーダー設定を更新しました。\n変更を反映するためには、KonomiTV サーバーを再起動してください。');
+        Message.success('配信・エンコーダー設定を更新しました。\n変更を反映するためには、KonomiTV-BS4K サーバーを再起動してください。');
     }
 }
 

@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
 
-      # KonomiTV のソースコードをチェックアウト
+      # KonomiTV-BS4K のソースコードをチェックアウト
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
@@ -44,7 +44,7 @@ jobs:
           # ソースコードやドキュメント内のバージョンを更新
           sed -i -e 's|"version": ".*",|"version": "${{ github.event.inputs.version }}",|' client/package.json
           sed -i -e 's|^version = ".*"|version = "${{ github.event.inputs.version }}"|' server/pyproject.toml
-          sed -i -e "s|VERSION = '.*'|VERSION = '${{ github.event.inputs.version }}'|" server/app/constants.py
+          sed -i -e "s|BS4K_VERSION = '.*'|BS4K_VERSION = '${{ github.event.inputs.version }}'|" server/app/constants.py
 
           # クライアントをビルド
           cd client/

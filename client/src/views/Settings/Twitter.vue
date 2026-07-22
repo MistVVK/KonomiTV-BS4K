@@ -79,13 +79,13 @@
                         <v-card-title class="d-flex justify-center pt-6 font-weight-bold">連携する Twitter アカウントを追加</v-card-title>
                         <v-card-text class="pt-2 pb-0">
                             <p>
-                                2023年7月以降、<a class="link" href="https://www.watch.impress.co.jp/docs/news/1475575.html" target="_blank">Twitter のサードパーティー API の有料化（個人向け API の事実上廃止）</a> により、従来の連携方法では KonomiTV から Twitter にアクセスできなくなりました。
+                                2023年7月以降、<a class="link" href="https://www.watch.impress.co.jp/docs/news/1475575.html" target="_blank">Twitter のサードパーティー API の有料化（個人向け API の事実上廃止）</a> により、従来の連携方法では KonomiTV-BS4K から Twitter にアクセスできなくなりました。
                             </p>
                             <p class="mt-1">
-                                そこで KonomiTV では、<strong><a class="link" href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" target="_blank">Chrome 拡張機能「GET cookies.txt LOCALLY」</a> を使い、ブラウザから Netscape 形式でエクスポートした、<a class="link" href="https://x.com/" target="_blank">Web 版 Twitter</a> の Cookie データによる Twitter 連携に対応しています。</strong>
+                                そこで KonomiTV-BS4K では、<strong><a class="link" href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" target="_blank">Chrome 拡張機能「GET cookies.txt LOCALLY」</a> を使い、ブラウザから Netscape 形式でエクスポートした、<a class="link" href="https://x.com/" target="_blank">Web 版 Twitter</a> の Cookie データによる Twitter 連携に対応しています。</strong>
                             </p>
                             <p class="mt-2">
-                                <strong>ここで入力した Cookie データは、ローカルの KonomiTV サーバーにのみ、暗号化の上で保存されます。</strong><br>
+                                <strong>ここで入力した Cookie データは、ローカルの KonomiTV-BS4K サーバーにのみ、暗号化の上で保存されます。</strong><br>
                                 Cookie データが Twitter API 以外の外部サービスに送信されることは一切ありません。<br>
                                 Cookie を取得した際に使ったブラウザと同じブラウザで操作することを強く推奨します。
                             </p>
@@ -105,7 +105,7 @@
                                     これまで不審判定されないよう <a class="link" href="https://github.com/tsukumijima/tweepy-authlib" target="_blank">様々な技術的対策</a> を施してきましたが、2025年11月に KonomiTV と同様の方法で Twitter API にアクセスしていた <a class="link" href="https://arkxv.com/blog/x-suspended/" target="_blank">OldTweetDeck のユーザーが一時的に大量凍結される騒動</a> (<a class="link" href="https://github.com/dimdenGD/OldTweetDeck/issues/459#issuecomment-3499066798" target="_blank">詳細</a>) が起きたことを踏まえ、より堅牢で安全なアプローチに切り替えました。<br>
                                 </p>
                                 <p class="mt-2">
-                                    <strong>この関係で、Twitter 実況機能を使うには、KonomiTV サーバー側に <a class="link" href="https://www.google.com/chrome/" target="_blank">Google Chrome</a> または <a class="link" href="https://brave.com/ja/" target="_blank">Brave</a> がインストールされている必要があります。</strong>なお、Linux (Docker) 環境では既に Docker イメージに含まれているため不要です。また、Twitter 実況機能を使わないならインストールする必要はありません。
+                                    <strong>この関係で、Twitter 実況機能を使うには、KonomiTV-BS4K サーバー側に <a class="link" href="https://www.google.com/chrome/" target="_blank">Google Chrome</a> または <a class="link" href="https://brave.com/ja/" target="_blank">Brave</a> がインストールされている必要があります。</strong>なお、Linux (Docker) 環境では既に Docker イメージに含まれているため不要です。また、Twitter 実況機能を使わないならインストールする必要はありません。
                                 </p>
                                 <p class="mt-2">
                                     ヘッドレスブラウザは、視聴画面で Twitter パネル内の各機能を使うときにバックグラウンドで自動的に起動し、使わなくなったら自動終了します。Twitter 実況機能が使われない場合には起動しません。
@@ -141,7 +141,7 @@
                                 Bluesky で <a class="link" href="https://bsky.app/settings/app-passwords" target="_blank">App Password</a> を発行し、Bluesky ハンドルと一緒に入力してください。
                             </p>
                             <p class="mt-1">
-                                ここで入力された App Password は保存されません。ログイン後に、atproto SDK のセッション文字列だけを、ローカルの KonomiTV サーバーに暗号化して保存します。
+                                ここで入力された App Password は保存されません。ログイン後に、atproto SDK のセッション文字列だけを、ローカルの KonomiTV-BS4K サーバーに暗号化して保存します。
                             </p>
                             <v-form class="settings__item" ref="bluesky_form" @submit.prevent>
                                 <v-text-field class="settings__item-form mt-6" color="primary" variant="outlined"
@@ -543,7 +543,7 @@ export default defineComponent({
         async loginTwitterAccountWithCookieForm() {
             // ログインしていない場合はエラーにする
             if (this.userStore.is_logged_in === false) {
-                Message.warning('連携をはじめるには、KonomiTV アカウントにログインしてください。');
+                Message.warning('連携をはじめるには、KonomiTV-BS4K アカウントにログインしてください。');
                 await Utils.sleep(0.01);
                 this.twitter_cookie_auth_dialog = false;
                 return;
@@ -664,7 +664,7 @@ export default defineComponent({
 
         async loginBlueskyAccountWithAppPasswordForm() {
             if (this.userStore.is_logged_in === false) {
-                Message.warning('連携をはじめるには、KonomiTV アカウントにログインしてください。');
+                Message.warning('連携をはじめるには、KonomiTV-BS4K アカウントにログインしてください。');
                 await Utils.sleep(0.01);
                 this.bluesky_auth_dialog = false;
                 return;

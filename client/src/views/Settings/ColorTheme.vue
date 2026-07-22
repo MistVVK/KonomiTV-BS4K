@@ -11,7 +11,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">カラーテーマ</div>
                 <div class="settings__item-label">
-                    KonomiTV の画面全体に適用するカラーテーマを選択できます。選択したテーマはすぐに反映されます。<br>
+                    KonomiTV-BS4K の画面全体に適用するカラーテーマを選択できます。選択したテーマはすぐに反映されます。<br>
                     番組表の番組セル・ジャンル色・時刻帯色や、コメントなどの機能色は変更されません。<br>
                 </div>
                 <div class="theme-selector" role="group" aria-label="カラーテーマ">

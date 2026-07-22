@@ -4,7 +4,7 @@
             <div class="settings__item-heading">設定をエクスポート</div>
             <div class="settings__item-label">
                 このデバイス (ブラウザ) に保存されている設定データを、エクスポート (ダウンロード) できます。<br>
-                ダウンロードした設定データ (KonomiTV-Settings.json) は、[設定をインポート] からインポートできます。異なるサーバーの KonomiTV を同じ設定で使いたいときなどに使ってください。<br>
+                ダウンロードした設定データ (KonomiTV-BS4K-Settings.json) は、[設定をインポート] からインポートできます。異なる KonomiTV-BS4K サーバーを同じ設定で使いたいときなどに使ってください。<br>
             </div>
         </div>
         <v-btn class="settings__save-button mt-4" variant="flat" @click="exportSettings()">
@@ -19,7 +19,7 @@
                 <strong class="text-error-readable">設定のデバイス間同期がオンのときは、同期が有効なすべてのデバイスに反映されます。</strong>十分ご注意ください。<br>
             </div>
             <v-file-input class="settings__item-form" color="primary" variant="outlined" hide-details
-                label="設定データ (KonomiTV-Settings.json) を選択"
+                label="設定データ (KonomiTV-BS4K-Settings.json) を選択"
                 :density="is_form_dense ? 'compact' : 'default'"
                 accept="application/json"
                 prepend-icon=""
@@ -35,7 +35,7 @@
                 <v-card-title class="import-settings-dialog__title d-flex justify-center font-weight-bold pt-6">マイリスト・視聴履歴もインポートしますか？</v-card-title>
                 <v-card-text class="pt-2 pb-5">
                     マイリストと視聴履歴は、このサーバーの録画番組と紐づいています。<br>
-                    別の KonomiTV サーバーの設定をインポートすると、保存されている録画番組が異なるため、身に覚えのない番組が表示されてしまいます。<br>
+                    別の KonomiTV-BS4K サーバーの設定をインポートすると、保存されている録画番組が異なるため、身に覚えのない番組が表示されてしまいます。<br>
                     <p class="mt-2">
                         <strong>同じサーバーのバックアップから復元する際は「上書き」、別のサーバーへ設定を移行する際は「維持」を選択してください。</strong><br>
                     </p>
@@ -99,7 +99,7 @@ export default defineComponent({
             // フォームを小さくするかどうか
             is_form_dense: Utils.isSmartphoneHorizontal(),
 
-            // 選択された設定データ (KonomiTV-Settings.json) が入る
+            // 選択された設定データ (KonomiTV-BS4K-Settings.json) が入る
             import_settings_file: null as File | null,
 
             // 設定インポートの確認ダイヤログを表示するか
@@ -121,9 +121,9 @@ export default defineComponent({
             // 設定データを JSON 化して取得
             const settings_json = JSON.stringify(this.settingsStore.settings, null, 4);
 
-            // ダウンロードさせるために一旦 Blob にしてから、KonomiTV-Settings.json としてダウンロード
+            // ダウンロードさせるために一旦 Blob にしてから、KonomiTV-BS4K-Settings.json としてダウンロード
             const settings_json_blob = new Blob([settings_json], {type: 'application/json'});
-            Utils.downloadBlobData(settings_json_blob, 'KonomiTV-Settings.json');
+            Utils.downloadBlobData(settings_json_blob, 'KonomiTV-BS4K-Settings.json');
             Message.success('設定をエクスポートしました。');
         },
 

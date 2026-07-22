@@ -310,7 +310,7 @@ export default defineComponent({
 
             // ログインしていない場合はエラーにする
             if (this.userStore.is_logged_in === false) {
-                Message.warning('連携をはじめるには、KonomiTV アカウントにログインしてください。');
+                Message.warning('連携をはじめるには、KonomiTV-BS4K アカウントにログインしてください。');
                 return;
             }
 

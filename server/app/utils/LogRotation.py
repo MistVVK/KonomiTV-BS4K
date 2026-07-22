@@ -186,11 +186,11 @@ def GetArchiveFilePath(date_key: str) -> Path:
         date_key (str): 日付キー（例: '20260212'）
 
     Returns:
-        Path: アーカイブファイルのパス（例: logs/archives/KonomiTV-Server.20260212.log）
+        Path: アーカイブファイルのパス（例: logs/archives/KonomiTV-BS4K-Server.20260212.log）
     """
 
     # アーカイブ命名規則を 1 箇所に集約して、生成と解析の不一致を防ぐ
-    ## 例: KonomiTV-Server.log -> KonomiTV-Server.20260212.log
+    ## 例: KonomiTV-BS4K-Server.log -> KonomiTV-BS4K-Server.20260212.log
     return LOGS_ARCHIVES_DIR / f'{KONOMITV_SERVER_LOG_PATH.stem}.{date_key}{KONOMITV_SERVER_LOG_PATH.suffix}'
 
 
@@ -334,7 +334,7 @@ def SplitServerLogByDate() -> None:
                         mode='w',
                         encoding='utf-8',
                         dir=KONOMITV_SERVER_LOG_PATH.parent,
-                        prefix='.KonomiTV-Server.today.',
+                        prefix='.KonomiTV-BS4K-Server.today.',
                         suffix='.log.tmp',
                         delete=False,
                     ),

@@ -63,7 +63,7 @@
                         <dt>最終利用</dt><dd>{{selected_logo.last_used_at ?? '未使用'}}</dd>
                         <dt>生成元録画</dt><dd>{{selected_logo.generated_from_recorded_video_id ?? '外部/手動追加'}}</dd>
                     </dl>
-                    <v-switch color="primary" hide-details label="KonomiTV で有効"
+                    <v-switch color="primary" hide-details label="KonomiTV-BS4K で有効"
                         :model-value="selected_logo.enabled" :disabled="selected_logo.missing"
                         @update:modelValue="updateSelectedLogo(Boolean($event))" />
                     <v-divider class="my-5"></v-divider>

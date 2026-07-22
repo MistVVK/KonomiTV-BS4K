@@ -13,8 +13,10 @@ from passlib.context import CryptContext
 from pydantic import BaseModel, PositiveInt
 
 
-# バージョン
+# upstream KonomiTV のバージョン
 VERSION = '0.14.1'
+# KonomiTV-BS4K 固有のバージョン
+BS4K_VERSION = '1.0.0'
 
 # 日本標準時 (JST, UTC+9) の ZoneInfo
 ## KonomiTV は日本向けのアプリケーションのため、日時は JST で統一して扱う
@@ -62,10 +64,10 @@ LOGS_ARCHIVES_DIR = LOGS_DIR / 'archives'
 ## サーバーログのアーカイブの保持期限 (日数)
 ## 30 日を超えたアーカイブログを自動削除する
 SERVER_LOG_ARCHIVE_RETENTION_DAYS: int | None = 30
-## KonomiTV のサーバーログのパス
-KONOMITV_SERVER_LOG_PATH = LOGS_DIR / 'KonomiTV-Server.log'
-## KonomiTV のアクセスログのパス
-KONOMITV_ACCESS_LOG_PATH = LOGS_DIR / 'KonomiTV-Access.log'
+## KonomiTV-BS4K のサーバーログのパス
+KONOMITV_SERVER_LOG_PATH = LOGS_DIR / 'KonomiTV-BS4K-Server.log'
+## KonomiTV-BS4K のアクセスログのパス
+KONOMITV_ACCESS_LOG_PATH = LOGS_DIR / 'KonomiTV-BS4K-Access.log'
 ## Akebi (HTTPS リバースプロキシ) のログファイルのパス
 AKEBI_LOG_PATH = LOGS_DIR / 'Akebi-HTTPS-Server.log'
 
@@ -150,7 +152,7 @@ LOGGING_CONFIG: dict[str, Any] = {
         },
     },
     'handlers': {
-        # サーバーログは標準エラー出力と server/logs/KonomiTV-Server.log の両方に出力する
+        # サーバーログは標準エラー出力と server/logs/KonomiTV-BS4K-Server.log の両方に出力する
         'default': {
             'formatter': 'default',
             'class': 'logging.StreamHandler',
@@ -163,7 +165,7 @@ LOGGING_CONFIG: dict[str, Any] = {
             'encoding': 'utf-8',
             'retention_days': SERVER_LOG_ARCHIVE_RETENTION_DAYS,
         },
-        # サーバーログ (デバッグ) は標準エラー出力と server/logs/KonomiTV-Server.log の両方に出力する
+        # サーバーログ (デバッグ) は標準エラー出力と server/logs/KonomiTV-BS4K-Server.log の両方に出力する
         'debug': {
             'formatter': 'debug',
             'class': 'logging.StreamHandler',
@@ -176,7 +178,7 @@ LOGGING_CONFIG: dict[str, Any] = {
             'encoding': 'utf-8',
             'retention_days': SERVER_LOG_ARCHIVE_RETENTION_DAYS,
         },
-        # アクセスログは標準出力と server/logs/KonomiTV-Access.log の両方に出力する
+        # アクセスログは標準出力と server/logs/KonomiTV-BS4K-Access.log の両方に出力する
         'access': {
             'formatter': 'access',
             'class': 'logging.StreamHandler',
@@ -654,15 +656,15 @@ PASSWORD_CONTEXT = CryptContext(
 )
 
 # 外部 API に送信するリクエストヘッダー
-## KonomiTV の User-Agent を指定
+## KonomiTV-BS4K の User-Agent を指定
 API_REQUEST_HEADERS: dict[str, str] = {
-    'User-Agent': f'KonomiTV/{VERSION}',
+    'User-Agent': f'KonomiTV-BS4K/{BS4K_VERSION}',
 }
 
 # KonomiTV で利用する httpx.AsyncClient の設定
 ## httpx.AsyncClient 自体は一度使ったら再利用できないので、httpx.AsyncClient を返す関数にしている
 HTTPX_CLIENT = lambda: httpx.AsyncClient(
-    # KonomiTV の User-Agent を指定
+    # KonomiTV-BS4K の User-Agent を指定
     headers = API_REQUEST_HEADERS,
     # リダイレクトを追跡する
     follow_redirects = True,

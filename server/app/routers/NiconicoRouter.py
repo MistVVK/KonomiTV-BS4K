@@ -101,7 +101,7 @@ async def NiconicoAuthURLAPI(
     response_description = 'ユーザーアカウントにニコニコアカウントのアクセストークン・リフレッシュトークンが登録できたことを示す。',
 )
 async def NiconicoAuthCallbackAPI(
-    client: Annotated[str, Query(description='OAuth 連携元の KonomiTV クライアントの URL 。')],
+    client: Annotated[str, Query(description='OAuth 連携元の KonomiTV-BS4K クライアントの URL 。')],
     user_access_token: Annotated[str, Query(description='コールバック元から渡された、ユーザーの JWT アクセストークン。')],
     code: Annotated[str | None, Query(description='コールバック元から渡された認証コード。OAuth 認証が成功したときのみセットされる。')] = None,
     error: Annotated[str | None, Query(description='このパラメーターがセットされているとき、OAuth 認証がユーザーによって拒否されたことを示す。')] = None,

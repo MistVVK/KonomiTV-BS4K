@@ -1210,5 +1210,5 @@ if __name__ == '__main__':
         if result is not None:
             print(result)
         else:
-            logging.error('Not a KonomiTV playable TS file.')
+            logging.error('Not a KonomiTV-BS4K playable TS file.')
     typer.run(main)

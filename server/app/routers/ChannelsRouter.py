@@ -14,7 +14,7 @@ from tortoise import connections
 
 from app import logging, schemas
 from app.config import Config
-from app.constants import HTTPX_CLIENT, JST, LOGO_DIR, VERSION
+from app.constants import BS4K_VERSION, HTTPX_CLIENT, JST, LOGO_DIR
 from app.models.Channel import Channel
 from app.routers.JikkyoDependency import EnsureJikkyoEnabled
 from app.routers.UsersRouter import GetCurrentUser
@@ -594,7 +594,7 @@ async def ChannelLogoAPI(
 
         # リクエストに If-None-Match ヘッダが存在し、ETag が一致する場合は 304 を返す
         ## ETag はロゴファイルのパスとバージョン情報のハッシュから生成する
-        etag = GetETag(f'{logo_path}{VERSION}'.encode())
+        etag = GetETag(f'{logo_path}{BS4K_VERSION}'.encode())
         if request.headers.get('If-None-Match') == etag:
             return Response(status_code=304)
 

@@ -5,8 +5,9 @@ import APIClient from '@/services/APIClient';
 /** バージョン情報を表すインターフェイス */
 export interface IVersionInformation {
     version: string;
+    upstream_version: string;
     git_commit: string;
-    latest_version: string;
+    latest_version: string | null;
     environment: 'Linux' | 'Linux-Docker';
     backend: 'EDCB' | 'Mirakurun';
     encoder: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC';

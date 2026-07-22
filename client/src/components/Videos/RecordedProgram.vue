@@ -255,10 +255,10 @@ const detectCMSections = async () => {
         } else if (execution.status === 'Skipped') {
             switch (execution.error_code) {
                 case 'ExternalCanonicalChapterProtected':
-                    Message.warning('手動編集された KonomiTV chapter YAML を保護するため、CM 区間は再判定されませんでした。');
+                    Message.warning('手動編集された KonomiTV-BS4K chapter YAML を保護するため、CM 区間は再判定されませんでした。');
                     break;
                 case 'GeneratedChapterKept':
-                    Message.info('既存の KonomiTV 自動解析 YAML を保持したため、CM 区間は再判定されませんでした。');
+                    Message.info('既存の KonomiTV-BS4K 自動解析 YAML を保持したため、CM 区間は再判定されませんでした。');
                     break;
                 case 'CMAnalysisDisabled':
                     Message.warning('CM 解析が無効なため、CM 区間は再判定されませんでした。');

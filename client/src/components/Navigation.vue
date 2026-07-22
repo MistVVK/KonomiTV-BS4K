@@ -112,7 +112,7 @@
                         <Icon class="navigation__link-icon" icon="fluent:settings-20-regular" width="26px" />
                         <span v-if="!iconOnly" class="navigation__link-text navigation__link-text--utility">設定</span>
                     </router-link>
-                    <a v-ripple class="navigation__link" active-class="navigation__link--active"
+                    <a v-ripple class="navigation__link navigation__link--version" active-class="navigation__link--active"
                         href="https://github.com/MistVVK/KonomiTV-BS4K" target="_blank"
                         :class="{
                             'navigation__link--develop-version': versionStore.is_client_develop_version,
@@ -120,11 +120,12 @@
                             'navigation__link--icon-only': iconOnly,
                         }"
                         v-ftooltip.right="iconOnly ?
-                            (versionStore.is_update_available ? `アップデートがあります (version ${versionStore.latest_version})` : `version ${versionStore.client_version}`) :
-                            (versionStore.is_update_available ? `アップデートがあります (version ${versionStore.latest_version})` : '')">
+                            (versionStore.is_update_available ? `アップデートがあります (KonomiTV-BS4K ${versionStore.latest_version})` : `KonomiTV-BS4K ${versionStore.client_version}`) :
+                            (versionStore.is_update_available ? `アップデートがあります (KonomiTV-BS4K ${versionStore.latest_version})` : '')">
                         <Icon class="navigation__link-icon" icon="fluent:info-16-regular" width="26px" />
                         <span v-if="!iconOnly" class="navigation__link-text navigation__link-version">
-                            <span>version {{versionStore.client_version}}</span>
+                            <span>KonomiTV-BS4K {{versionStore.client_version}}</span>
+                            <span>upstream: KonomiTV {{versionStore.upstream_version ?? '-'}}</span>
                             <span class="navigation__link-commit">{{versionStore.client_git_commit}}</span>
                         </span>
                     </a>
@@ -316,6 +317,12 @@ export default defineComponent({
                     font-size: 15px;
                     @include smartphone-horizontal {
                         font-size: 14.5px;
+                    }
+                }
+                &--version {
+                    height: 64px;
+                    @include smartphone-horizontal {
+                        height: 58px;
                     }
                 }
 

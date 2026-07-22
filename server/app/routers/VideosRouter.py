@@ -1055,8 +1055,8 @@ async def VideoDetectCMSectionsAPI(
         bool,
         Query(
             description=(
-                'KonomiTV自動解析YAMLを再解析して置換する。また、基本名方式の外部.chapter.txtは保持したまま'
-                'KonomiTV YAMLを新規生成する。手動編集YAMLは保護する。'
+                'KonomiTV-BS4K自動解析YAMLを再解析して置換する。また、基本名方式の外部.chapter.txtは保持したまま'
+                'KonomiTV-BS4K YAMLを新規生成する。手動編集YAMLは保護する。'
             ),
         ),
     ] = False,

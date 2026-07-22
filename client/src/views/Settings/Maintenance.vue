@@ -8,7 +8,7 @@
             <span class="ml-2">{{section_title}}</span>
         </h2>
         <div class="settings__description" v-if="embedded === false">
-            KonomiTV サーバーの保守操作を実行します。管理者アカウントでログインしている必要があります。<br>
+            KonomiTV-BS4K サーバーの保守操作を実行します。管理者アカウントでログインしている必要があります。<br>
         </div>
 
         <div class="settings__content" v-if="isSectionVisible('logs')"
@@ -20,7 +20,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">サーバーログの表示</div>
                 <div class="settings__item-label">
-                    KonomiTV サーバーの動作ログとアクセスログをリアルタイムで表示します。<br>
+                    KonomiTV-BS4K サーバーの動作ログとアクセスログをリアルタイムで表示します。<br>
                     サーバーの動作状況の確認やトラブルシューティングに役立ちます。<br>
                 </div>
             </div>
@@ -38,9 +38,9 @@
                 <span class="ml-2">DB・録画</span>
             </div>
             <div class="settings__item">
-                <div class="settings__item-heading">KonomiTV のデータベースを更新</div>
+                <div class="settings__item-heading">KonomiTV-BS4K のデータベースを更新</div>
                 <div class="settings__item-label">
-                    KonomiTV のデータベースに保存されている、チャンネル情報・番組情報・Twitter アカウント情報などの外部 API に依存するデータをすべて更新します。<br>
+                    KonomiTV-BS4K のデータベースに保存されている、チャンネル情報・番組情報・Twitter アカウント情報などの外部 API に依存するデータをすべて更新します。<br>
                     即座に外部 API からのデータ更新を反映させたいときに利用してください。<br>
                 </div>
             </div>
@@ -52,8 +52,8 @@
             <div class="settings__item">
                 <div class="settings__item-heading">録画フォルダの一括スキャンを手動実行</div>
                 <div class="settings__item-label">
-                    録画フォルダ内のファイルは、通常 KonomiTV サーバーの起動時に自動的にスキャンされます。<br>
-                    録画ファイルが KonomiTV に正しく反映されていない場合にのみ実行してみてください。<br>
+                    録画フォルダ内のファイルは、通常 KonomiTV-BS4K サーバーの起動時に自動的にスキャンされます。<br>
+                    録画ファイルが KonomiTV-BS4K に正しく反映されていない場合にのみ実行してみてください。<br>
                 </div>
                 <div class="settings__item-label mt-1">
                     <strong>大量の録画ファイルが保存されている環境では、処理完了まで数時間〜数日以上かかることがあります。</strong><br>
@@ -75,7 +75,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">すべての録画ファイルのメタデータを再解析</div>
                 <div class="settings__item-label">
-                    KonomiTV に登録されているすべての録画ファイルのメタデータを強制的に再解析します。<br>
+                    KonomiTV-BS4K に登録されているすべての録画ファイルのメタデータを強制的に再解析します。<br>
                     メタデータの解析方法が変更された後に、既存の録画ファイルにも新しい解析結果を反映したい場合に利用してください。<br>
                 </div>
                 <div class="settings__item-label mt-1">
@@ -90,7 +90,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">すべての録画ファイルの CM 区間を再判定</div>
                 <div class="settings__item-label">
-                    KonomiTV に登録されているすべての録画ファイルについて、既存結果を上書きして CM 区間を再判定します。<br>
+                    KonomiTV-BS4K に登録されているすべての録画ファイルについて、既存結果を上書きして CM 区間を再判定します。<br>
                     CM 判定方法が変更された後に、既存の録画ファイルにも新しい判定結果を反映したい場合に利用してください。<br>
                 </div>
                 <div class="settings__item-label mt-1">
@@ -120,7 +120,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">共有 CM ロゴを再スキャン</div>
                 <div class="settings__item-label">
-                    共有ロゴフォルダを再スキャンし、追加・変更・削除された .lgd ファイルを KonomiTV に反映します。<br>
+                    共有ロゴフォルダを再スキャンし、追加・変更・削除された .lgd ファイルを KonomiTV-BS4K に反映します。<br>
                 </div>
             </div>
             <v-btn class="settings__save-button mt-5" color="background-lighten-2" variant="flat"
@@ -137,29 +137,29 @@
                 <span class="ml-2">サーバー操作</span>
             </div>
             <div class="settings__item">
-                <div class="settings__item-heading text-error-readable">KonomiTV サーバーを再起動</div>
+                <div class="settings__item-heading text-error-readable">KonomiTV-BS4K サーバーを再起動</div>
                 <div class="settings__item-label">
-                    KonomiTV サーバーを再起動します。サーバー設定の変更を反映するには再起動が必要です。<br>
+                    KonomiTV-BS4K サーバーを再起動します。サーバー設定の変更を反映するには再起動が必要です。<br>
                     <strong>再起動を実行すると、すべての視聴中セッションが切断されます。</strong>十分注意してください。<br>
                 </div>
             </div>
             <v-btn class="settings__save-button bg-error mt-5" variant="flat" @click="restartServer()">
                 <Icon icon="fluent:arrow-counterclockwise-20-filled" height="20px" />
-                <span class="ml-2">KonomiTV サーバーを再起動</span>
+                <span class="ml-2">KonomiTV-BS4K サーバーを再起動</span>
             </v-btn>
             <div class="settings__item">
-                <div class="settings__item-heading text-error-readable">KonomiTV サーバーをシャットダウン</div>
+                <div class="settings__item-heading text-error-readable">KonomiTV-BS4K サーバーをシャットダウン</div>
                 <div class="settings__item-label">
-                    KonomiTV サーバーをシャットダウンします。<br>
-                    <strong>シャットダウンを実行すると、再度手動で KonomiTV サーバーを起動するまで KonomiTV にアクセスできなくなります。</strong>十分注意してください。<br>
+                    KonomiTV-BS4K サーバーをシャットダウンします。<br>
+                    <strong>シャットダウンを実行すると、再度手動で KonomiTV-BS4K サーバーを起動するまで KonomiTV-BS4K にアクセスできなくなります。</strong>十分注意してください。<br>
                 </div>
                 <div class="settings__item-label mt-1">
-                    なお、Linux 版 KonomiTV サーバーはプロセス管理を PM2 / Docker に委譲しているため、シャットダウン後は自動で再起動されます。完全にシャットダウンするには、PM2 / Docker 側でサービスを停止してください。<br>
+                    なお、Linux 版 KonomiTV-BS4K サーバーはプロセス管理を PM2 / Docker に委譲しているため、シャットダウン後は自動で再起動されます。完全にシャットダウンするには、PM2 / Docker 側でサービスを停止してください。<br>
                 </div>
             </div>
             <v-btn class="settings__save-button bg-error mt-5" variant="flat" @click="shutdownServer()">
                 <Icon icon="fluent:power-20-filled" height="20px" />
-                <span class="ml-2">KonomiTV サーバーをシャットダウン</span>
+                <span class="ml-2">KonomiTV-BS4K サーバーをシャットダウン</span>
             </v-btn>
         </div>
 
@@ -289,25 +289,25 @@ async function rescanCMLogos() {
     }
 }
 
-// KonomiTV サーバーの再起動を行う関数
+// KonomiTV-BS4K サーバーの再起動を行う関数
 async function restartServer() {
     const result = await Maintenance.restartServer();
     if (result === true) {
-        Message.show('KonomiTV サーバーを再起動しています...');
+        Message.show('KonomiTV-BS4K サーバーを再起動しています...');
         // バージョン情報が取得できるようになるまで待つ
         await Utils.sleep(1.0);
         while (await Version.fetchServerVersion(true) === null) {
             await Utils.sleep(1.0);
         }
-        Message.success('KonomiTV サーバーを再起動しました。');
+        Message.success('KonomiTV-BS4K サーバーを再起動しました。');
     }
 }
 
-// KonomiTV サーバーのシャットダウンを行う関数
+// KonomiTV-BS4K サーバーのシャットダウンを行う関数
 async function shutdownServer() {
     const result = await Maintenance.shutdownServer();
     if (result === true) {
-        Message.success('KonomiTV サーバーをシャットダウンしました。');
+        Message.success('KonomiTV-BS4K サーバーをシャットダウンしました。');
     }
 }
 

@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "KonomiTV"
-version = "0.14.1"
-description = "KonomiTV: Kept Organized, Notably Optimized, Modern Interface TV media server"
+version = "1.0.0"
+description = "KonomiTV-BS4K: Kept Organized, Notably Optimized, Modern Interface TV media server"
 package-mode = false
 
 [tool.taskipy.tasks]

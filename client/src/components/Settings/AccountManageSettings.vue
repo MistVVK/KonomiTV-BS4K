@@ -19,8 +19,8 @@
                 </div>
                 <div class="user-manage-settings__label"
                     v-if="user_accounts.length === 0">
-                    <div><b>まだ KonomiTV アカウントが一つも作成されていません。</b></div>
-                    <div class="mt-1">KonomiTV アカウントを作成すると、より便利な機能が使えます！ぜひログインしての利用をおすすめします。</div>
+                    <div><b>まだ KonomiTV-BS4K アカウントが一つも作成されていません。</b></div>
+                    <div class="mt-1">KonomiTV-BS4K アカウントを作成すると、より便利な機能が使えます！ぜひログインしての利用をおすすめします。</div>
                 </div>
                 <div class="user-accounts" v-if="user_accounts.length > 0">
                     <div v-for="user_account in user_accounts" :key="user_account.id" class="user-account">

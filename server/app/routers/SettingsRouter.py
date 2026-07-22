@@ -68,12 +68,12 @@ async def ClientSettingsUpdateAPI(
 @router.get(
     '/server',
     summary = 'サーバー設定取得 API',
-    response_description = '現在稼働中の KonomiTV サーバーのサーバー設定。',
+    response_description = '現在稼働中の KonomiTV-BS4K サーバーのサーバー設定。',
     response_model = ServerSettings,
 )
 async def ServerSettingsAPI():
     """
-    現在稼働中の KonomiTV サーバーのサーバー設定を取得する。<br>
+    現在稼働中の KonomiTV-BS4K サーバーのサーバー設定を取得する。<br>
     Docker 環境では、録画fMP4キャッシュ保存先を除くパス項目はDocker用Prefix (/host-rootfs) 付きで返される。<br>
     録画fMP4キャッシュ保存先は設定画面で編集できるよう、ホスト側の絶対パスで返される。<br>
     """
@@ -98,7 +98,7 @@ async def ServerSettingsUpdateAPI(
     current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ):
     """
-    現在稼働中の KonomiTV サーバーのサーバー設定を更新する。<br>
+    現在稼働中の KonomiTV-BS4K サーバーのサーバー設定を更新する。<br>
     Docker 環境では、録画fMP4キャッシュ保存先だけはホスト側の絶対パスを指定する。<br>
     その他のパス項目にはDocker用Prefix (/host-rootfs) を付与した状態でリクエストする。<br>
     Pydantic のカスタムバリデーターの実装の都合上、バリデーション処理中はメインスレッドが数秒間ブロッキングされることがあるので注意。<br>

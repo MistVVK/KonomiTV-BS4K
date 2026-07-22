@@ -11,7 +11,7 @@
 <!-- NONFREE_RUNTIME_WARNING_END -->
 
 <!--
-KonomiTV の Docker image に直接組み込む third-party ソフトウェアの著作権表示とライセンス全文です。
+KonomiTV-BS4K の Docker image に直接組み込む third-party ソフトウェアの著作権表示とライセンス全文です。
 ライセンスの種類にかかわらず、取得元に含まれるライセンス本文を省略せず掲載しています。
 
 このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。

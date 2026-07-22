@@ -13,7 +13,7 @@
         </div>
         <div class="settings__description mt-1" v-if="embedded === false && section !== 'users'">
             [サーバー設定を更新] ボタンを押さずにこのページから離れると、変更内容は破棄されます。<br>
-            変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
+            変更を反映するには KonomiTV-BS4K サーバーの再起動が必要です。<br>
         </div>
         <div class="settings__content" :class="{'settings__content--disabled': is_disabled}">
             <div class="settings__content-heading" v-if="isSectionVisible('backend') || isSectionVisible('streaming') || isSectionVisible('diagnostics')">
@@ -23,9 +23,9 @@
             <div class="settings__item settings__item--switch" v-if="isSectionVisible('backend')">
                 <label class="settings__item-heading" for="jikkyo_enabled_on_server">ニコニコ実況 / NX-Jikkyo 連携を有効にする</label>
                 <label class="settings__item-label" for="jikkyo_enabled_on_server">
-                    無効にすると、KonomiTV サーバーとクライアントの両方からニコニコ実況 / NX-Jikkyo へのアクセスを停止し、関連 UI も非表示にします。デフォルトは無効です。<br>
-                    保存済みのニコニコアカウント連携情報とクライアント設定は削除されません。変更の反映には KonomiTV サーバーの再起動と、開いているすべてのクライアントの再読み込みが必要です。<br>
-                    ブラウザから外部サービスへ直接接続済みの WebSocket は、KonomiTV サーバー側から切断できません。<br>
+                    無効にすると、KonomiTV-BS4K サーバーとクライアントの両方からニコニコ実況 / NX-Jikkyo へのアクセスを停止し、関連 UI も非表示にします。デフォルトは無効です。<br>
+                    保存済みのニコニコアカウント連携情報とクライアント設定は削除されません。変更の反映には KonomiTV-BS4K サーバーの再起動と、開いているすべてのクライアントの再読み込みが必要です。<br>
+                    ブラウザから外部サービスへ直接接続済みの WebSocket は、KonomiTV-BS4K サーバー側から切断できません。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="jikkyo_enabled_on_server" hide-details
                     v-model="server_settings.general.jikkyo_enabled">
@@ -103,7 +103,7 @@
             <div class="settings__item settings__item--switch" v-if="isSectionVisible('diagnostics')">
                 <label class="settings__item-heading" for="debug_encoder">エンコーダーのログを有効にする</label>
                 <label class="settings__item-label" for="debug_encoder">
-                    有効にすると、ライブ視聴時のエンコーダーのログが KonomiTV/server/logs/ 以下に保存されます。<br>
+                    有効にすると、ライブ視聴時のエンコーダーのログが server/logs/ 以下に保存されます。<br>
                     さらにデバッグモード有効時は、サーバーログにエンコーダーのログがリアルタイム出力されます。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="debug_encoder" hide-details
@@ -115,7 +115,7 @@
                 <span class="ml-2">ネットワーク・HTTPS</span>
             </div>
             <div class="settings__item" v-if="isSectionVisible('network')">
-                <div class="settings__item-heading">KonomiTV サーバーのリッスンポート</div>
+                <div class="settings__item-heading">KonomiTV-BS4K サーバーのリッスンポート</div>
                 <div class="settings__item-label">
                     デフォルトのリッスンポートは 7000 です。<br>
                 </div>
@@ -155,7 +155,7 @@
             <div class="settings__item" v-if="isSectionVisible('network') && server_settings.server.https_mode === 'reverse_proxy'">
                 <div class="settings__item-heading">リバースプロキシ用 HTTP リッスンアドレス</div>
                 <div class="settings__item-label">
-                    通常は 0.0.0.0 のまま変更する必要はありません。KonomiTV のポートを外部へ直接公開しないでください。<br>
+                    通常は 0.0.0.0 のまま変更する必要はありません。KonomiTV-BS4K のポートを外部へ直接公開しないでください。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
                     label="例: 0.0.0.0"
@@ -164,7 +164,7 @@
                 </v-text-field>
                 <div class="settings__item-heading mt-5">信頼済みリバースプロキシの CIDR 許可リスト</div>
                 <div class="settings__item-label">
-                    実際に KonomiTV へ接続する nginx / Apache などの送信元 CIDR を1件以上指定してください。IPv4・IPv6に対応しています。<br>
+                    実際に KonomiTV-BS4K へ接続する nginx / Apache などの送信元 CIDR を1件以上指定してください。IPv4・IPv6に対応しています。<br>
                 </div>
                 <div v-for="(cidr, index) in server_settings.server.trusted_proxy_cidrs" :key="'trusted-proxy-cidr-' + index">
                     <div class="d-flex align-center mt-3">
@@ -195,7 +195,7 @@
                 <label class="settings__item-heading" for="compatibility_api_enabled">互換 API を有効にする</label>
                 <label class="settings__item-label" for="compatibility_api_enabled">
                     Komorebi など、KonomiTV 互換 API を利用するクライアント向けの API を専用ポートで公開します。<br>
-                    通常の KonomiTV Web UI・API のリッスンポートや動作は変更されません。<br>
+                    通常の KonomiTV-BS4K Web UI・API のリッスンポートや動作は変更されません。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="compatibility_api_enabled" hide-details
                     v-model="server_settings.compatibility_api.enabled">
@@ -204,8 +204,8 @@
             <div class="settings__item" v-if="section === 'basic'">
                 <div class="settings__item-heading">互換 API 専用の HTTPS / リバースプロキシ動作モード</div>
                 <div class="settings__item-label">
-                    以下の接続設定は互換 API 専用です。通常の KonomiTV Web UI・API の接続設定には影響しません。<br>
-                    「通常 API と同じ設定を使用」を選んだ場合だけ、上の KonomiTV サーバー設定を引き継ぎます。<br>
+                    以下の接続設定は互換 API 専用です。通常の KonomiTV-BS4K Web UI・API の接続設定には影響しません。<br>
+                    「通常 API と同じ設定を使用」を選んだ場合だけ、上の KonomiTV-BS4K サーバー設定を引き継ぎます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :items="compatibility_https_mode_options"
@@ -277,7 +277,7 @@
             <div class="settings__item" v-if="section === 'basic'">
                 <div class="settings__item-heading">互換 API のリッスンポート</div>
                 <div class="settings__item-label">
-                    通常の KonomiTV サーバーとは異なる未使用のポートを指定してください。デフォルトは 7200 です。<br>
+                    通常の KonomiTV-BS4K サーバーとは異なる未使用のポートを指定してください。デフォルトは 7200 です。<br>
                     Akebi では指定ポートに加えて、10 番大きいポートを内部 HTTP 通信に使用します。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number"
@@ -310,7 +310,7 @@
                     バックエンドに Mirakurun が選択されているときは効果がありません。<br>
                 </label>
                 <label class="settings__item-label mt-1" for="always_receive_tv_from_mirakurun">
-                    KonomiTV から EDCB と Mirakurun / mirakc 両方にアクセスできる必要があります。<br>
+                    KonomiTV-BS4K から EDCB と Mirakurun / mirakc 両方にアクセスできる必要があります。<br>
                     EDCB はチューナー起動やチャンネル切り替えに時間がかかるため、Mirakurun / mirakc が利用できる環境であれば、この設定を有効にするとより快適に使えます。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="always_receive_tv_from_mirakurun" hide-details
@@ -355,7 +355,7 @@
             <div class="settings__item" v-if="isSectionVisible('storage')">
                 <div class="settings__item-heading">録画済み番組の保存先フォルダの絶対パス</div>
                 <div class="settings__item-label" style="padding-bottom: 2px;">
-                    指定フォルダ以下に保存されている MPEG-TS 形式の録画ファイルを KonomiTV サーバーが自動的に見つけ出し、メタデータの解析とサムネイルの作成を行います。<br>
+                    指定フォルダ以下に保存されている MPEG-TS 形式の録画ファイルを KonomiTV-BS4K サーバーが自動的に見つけ出し、メタデータの解析とサムネイルの作成を行います。<br>
                     解析が完了すると、録画番組一覧から再生できるようになります。<br>
                 </div>
                 <div class="settings__item-label mt-1" style="padding-bottom: 2px;">
@@ -446,8 +446,8 @@
             <div class="settings__item" v-if="isSectionVisible('storage')">
                 <div class="settings__item-heading">アップロードしたキャプチャ画像の保存先フォルダの絶対パス</div>
                 <div class="settings__item-label">
-                    <router-link class="link" to="/settings/personal/capture">[キャプチャ]</router-link> → [キャプチャの保存先] で [KonomiTV サーバーにアップロード] または
-                    [ブラウザでのダウンロードと、KonomiTV サーバーへのアップロードを両方行う] が選択されているときに利用されます。<br>
+                    <router-link class="link" to="/settings/personal/capture">[キャプチャ]</router-link> → [キャプチャの保存先] で [KonomiTV-BS4K サーバーにアップロード] または
+                    [ブラウザでのダウンロードと、KonomiTV-BS4K サーバーへのアップロードを両方行う] が選択されているときに利用されます。<br>
                 </div>
                 <div class="settings__item-label mt-1" style="padding-bottom: 2px;">
                     複数の保存先フォルダを指定できます。<br>
@@ -487,7 +487,7 @@
             <div class="settings__item" v-if="isSectionVisible('users')">
                 <div class="settings__item-heading">アカウントの管理</div>
                 <div class="settings__item-label">
-                    現在 KonomiTV に登録されているすべてのアカウントの一覧の確認、管理者権限の付与/剥奪、アカウントの削除ができます。<br>
+                    現在 KonomiTV-BS4K に登録されているすべてのアカウントの一覧の確認、管理者権限の付与/剥奪、アカウントの削除ができます。<br>
                 </div>
                 <div class="settings__item-label mt-1">
                     ログイン中ユーザーの設定変更は、別途 <router-link class="link" to="/settings/account">アカウント設定画面</router-link> から行ってください。<br>
@@ -546,7 +546,7 @@ const section_title = computed(() => ({
 })[props.section]);
 const section_description = computed(() => {
     if (props.section === 'users') {
-        return 'KonomiTV に登録されているアカウントを管理します。管理者アカウントでログインしている必要があります。';
+        return 'KonomiTV-BS4K に登録されているアカウントを管理します。管理者アカウントでログインしている必要があります。';
     }
     return `${section_title.value}を変更するには、管理者アカウントでログインしている必要があります。`;
 });
@@ -801,7 +801,7 @@ async function updateServerSettings() {
     // 再起動するまでは設定データは反映されないため、再起動せずにページをリロードすると反映されてないように見える点に注意
     if (result === true) {
         resetServerSettingsDraft();
-        Message.success('サーバー設定を更新しました。\n変更を反映するためには、KonomiTV サーバーを再起動してください。');
+        Message.success('サーバー設定を更新しました。\n変更を反映するためには、KonomiTV-BS4K サーバーを再起動してください。');
     }
 }
 

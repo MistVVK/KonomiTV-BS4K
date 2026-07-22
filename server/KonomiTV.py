@@ -21,6 +21,7 @@ from app.config import LoadConfig, ResolveCompatibilityHTTPSSettings
 from app.constants import (
     AKEBI_LOG_PATH,
     BASE_DIR,
+    BS4K_VERSION,
     DATABASE_CONFIG,
     KONOMITV_ACCESS_LOG_PATH,
     LIBRARY_PATH,
@@ -139,10 +140,11 @@ def CreateUvicornConfig(
 
 def version(value: bool):
     if value is True:
-        typer.echo(f'KonomiTV version {VERSION}')
+        typer.echo(f'KonomiTV-BS4K version {BS4K_VERSION}')
+        typer.echo(f'upstream: KonomiTV {VERSION}')
         raise typer.Exit()
 
-@cli.command(help='KonomiTV: Kept Organized, Notably Optimized, Modern Interface TV media server')
+@cli.command(help='KonomiTV-BS4K: Kept Organized, Notably Optimized, Modern Interface TV media server')
 def main(
     reload: bool = typer.Option(False, '--reload', help='Start Uvicorn in auto-reload mode. (Linux only)'),
     version: bool = typer.Option(None, '--version', callback=version, is_eager=True, help='Show version information.'),
@@ -178,7 +180,8 @@ def main(
     from app import logging
 
     # バージョン情報をログに出力
-    logging.info(f'KonomiTV version {VERSION}')
+    logging.info(f'KonomiTV-BS4K version {BS4K_VERSION}')
+    logging.info(f'upstream: KonomiTV {VERSION}')
 
     # Aerich でデータベースをアップグレードする
     ## 特にデータベースのアップグレードが必要ない場合は何も起こらない
@@ -199,7 +202,7 @@ def main(
     # CPU のアーキテクチャから実行可否を判定
     # Docker image は Linux amd64 専用なので、実行環境も同じ条件に限定する
     if sys.platform != 'linux' or os.uname().machine != 'x86_64':
-        logging.error('KonomiTV は Linux amd64 Docker 環境でのみ実行できます。')
+        logging.error('KonomiTV-BS4K は Linux amd64 Docker 環境でのみ実行できます。')
         sys.exit(1)
 
     # ***** サードパーティーライブラリが配置されているかのバリデーション *****
@@ -209,7 +212,7 @@ def main(
     for library_name in GetRequiredThirdpartyLibraries('certificate'):
         library_path = LIBRARY_PATH[library_name]
         if Path(library_path).is_file() is False:
-            logging.error(f'{library_name} がサードパーティーライブラリとして配置されていないため、KonomiTV を起動できません。')
+            logging.error(f'{library_name} がサードパーティーライブラリとして配置されていないため、KonomiTV-BS4K を起動できません。')
             logging.error(f'{library_name} が {library_path} に配置されているかを確認してください。')
             sys.exit(1)
 
@@ -235,7 +238,7 @@ def main(
     if akebi_is_required:
         akebi_path = LIBRARY_PATH['Akebi']
         if Path(akebi_path).is_file() is False:
-            logging.error('Akebi がサードパーティーライブラリとして配置されていないため、KonomiTV を起動できません。')
+            logging.error('Akebi がサードパーティーライブラリとして配置されていないため、KonomiTV-BS4K を起動できません。')
             logging.error(f'Akebi が {akebi_path} に配置されているかを確認してください。')
             sys.exit(1)
         try:
@@ -244,7 +247,7 @@ def main(
         except PermissionError:
             pass
 
-    # ***** KonomiTV サーバーを起動 *****
+    # ***** KonomiTV-BS4K サーバーを起動 *****
 
     startup_settings = BuildServerStartupSettings(CONFIG.server)
     compatibility_startup_settings: ServerStartupSettings | None = None
@@ -285,7 +288,7 @@ def main(
 
         # upstream インストーラーと同じ規則で、Akebi の証明書を利用してアクセスできる URL を表示する
         if startup_settings.use_akebi:
-            logging.info('KonomiTV にアクセスできる URL:')
+            logging.info('KonomiTV-BS4K にアクセスできる URL:')
             for access_url, interface_name in GetAkebiAccessURLs(CONFIG.server.port):
                 logging.info(f'  {access_url} ({interface_name})')
         if compatibility_startup_settings is not None and compatibility_startup_settings.use_akebi:
@@ -333,7 +336,7 @@ def main(
     # この時点ではタイミングの関係でまだロックファイルが作成されていないことがあるので、1秒待機する
     time.sleep(1)
 
-    # もしこの時点で再起動が必要であることを示すロックファイルが存在する場合、KonomiTV サーバーを再起動する
+    # もしこの時点で再起動が必要であることを示すロックファイルが存在する場合、KonomiTV-BS4K サーバーを再起動する
     ## このロックファイルは ServerRestartAPI によって作成される
     if RESTART_REQUIRED_LOCK_PATH.exists():
         logging.warning('Server restart requested. Restarting...')

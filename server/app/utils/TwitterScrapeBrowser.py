@@ -557,11 +557,11 @@ class TwitterScrapeBrowser:
                 )
             except FileNotFoundError as ex:
                 logging.error(f'{self.log_prefix} Chromium is not installed on this machine:', exc_info=ex)
-                raise BrowserBinaryNotFoundError('ヘッドレスブラウザの起動に必要な Chromium が KonomiTV サーバーにインストールされていません。') from ex
+                raise BrowserBinaryNotFoundError('ヘッドレスブラウザの起動に必要な Chromium が KonomiTV-BS4K サーバーにインストールされていません。') from ex
             except Exception as ex:
                 if 'Failed to connect to browser' in str(ex):
                     logging.error(f'{self.log_prefix} Browser connection failed. Please check if Chromium is installed:', exc_info=ex)
-                    raise BrowserConnectionFailedError('ヘッドレスブラウザとの接続に失敗しました。Chromium が KonomiTV サーバーにインストールされているかどうかを確認してください。') from ex
+                    raise BrowserConnectionFailedError('ヘッドレスブラウザとの接続に失敗しました。Chromium が KonomiTV-BS4K サーバーにインストールされているかどうかを確認してください。') from ex
                 else:
                     logging.error(f'{self.log_prefix} Error starting browser:', exc_info=ex)
                     raise ex

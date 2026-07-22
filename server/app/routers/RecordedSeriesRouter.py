@@ -664,7 +664,7 @@ async def RecordedSeriesConnectionTestAPI(
                 ),
             ]
             program = RecordedSeriesProgramPrompt(
-                title='KonomiTV OpenAI-compatible API connection test',
+                title='KonomiTV-BS4K OpenAI-compatible API connection test',
                 description='This is a connection test, not recorded content.',
                 genres=['ConnectionTest'],
                 channel=None,
@@ -692,7 +692,7 @@ async def RecordedSeriesConnectionTestAPI(
                 api_key=effective_api_key,
                 model=validated_settings.model,
                 program=RecordedEpisodeProgramPrompt(
-                    series_title='KonomiTV connection test',
+                    series_title='KonomiTV-BS4K connection test',
                     program_title='Episode lookup connection test',
                     subtitle=None,
                     description='This request only verifies Responses API Web Search support.',

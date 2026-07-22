@@ -536,7 +536,7 @@ async def TwitterVideoProxyAPI(
     url: Annotated[str, Query(description='プロキシ対象の Twitter 動画 URL 。')],
 ):
     """
-    Twitter の動画を KonomiTV サーバー経由でプロキシ配信する。<br>
+    Twitter の動画を KonomiTV-BS4K サーバー経由でプロキシ配信する。<br>
     Twitter 側の仕様変更により、許可されたオリジン以外からの動画 URL への直接アクセスが<br>
     403 Forbidden で拒否されるようになったため、サーバー側でリクエストを中継することでこの制限を回避する。<br>
     Range リクエストに対応しており、動画のシーク操作が可能。<br>

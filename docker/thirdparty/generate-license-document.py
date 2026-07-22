@@ -51,7 +51,7 @@ def download(url: str) -> bytes:
         cache_path = cache_root / hashlib.sha256(url.encode('utf-8')).hexdigest()
         if cache_path.is_file():
             return cache_path.read_bytes()
-    request = urllib.request.Request(url, headers={'User-Agent': 'KonomiTV-thirdparty-license-generator'})
+    request = urllib.request.Request(url, headers={'User-Agent': 'KonomiTV-BS4K-thirdparty-license-generator'})
     with urllib.request.urlopen(request) as response:
         content = response.read()
     if cache_path is not None:
@@ -198,7 +198,7 @@ def main() -> None:
         '<!-- NONFREE_RUNTIME_WARNING_END -->',
         '',
         '<!--',
-        'KonomiTV の Docker image に直接組み込む third-party ソフトウェアの著作権表示とライセンス全文です。',
+        'KonomiTV-BS4K の Docker image に直接組み込む third-party ソフトウェアの著作権表示とライセンス全文です。',
         'ライセンスの種類にかかわらず、取得元に含まれるライセンス本文を省略せず掲載しています。',
         '',
         'このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。',

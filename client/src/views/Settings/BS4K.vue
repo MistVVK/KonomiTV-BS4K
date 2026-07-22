@@ -12,7 +12,7 @@
         </div>
         <div class="settings__description mt-1" v-if="embedded === false && section !== 'quality'">
             [BS4K設定を更新] ボタンを押さずにこのページから離れると、変更内容は破棄されます。<br>
-            変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
+            変更を反映するには KonomiTV-BS4K サーバーの再起動が必要です。<br>
         </div>
         <div class="settings__content" v-if="isSectionVisible('server')"
             :class="{'settings__content--disabled': is_disabled}">
@@ -212,7 +212,7 @@
                 <label class="settings__item-heading" for="bs4k_ignore_viewer_low_latency">BS4K プレイヤーを通常バッファで再生する</label>
                 <label class="settings__item-label" for="bs4k_ignore_viewer_low_latency">
                     有効にすると、BS4K のライブ視聴時だけユーザーの低遅延視聴設定を使わず、通常の再生バッファを使います。<br>
-                    変更を反映するには BS4K設定を更新し、KonomiTV サーバーを再起動してください。<br>
+                    変更を反映するには BS4K設定を更新し、KonomiTV-BS4K サーバーを再起動してください。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="bs4k_ignore_viewer_low_latency" hide-details
                     v-model="server_settings.general.bs4k_ignore_viewer_low_latency" :disabled="is_disabled">
@@ -229,7 +229,7 @@
                 <div class="settings__item-heading">BS4K設定を更新</div>
                 <div class="settings__item-label">
                     エンコーダ設定と一部のプレイヤー設定を config.yaml に保存します。<br>
-                    保存した変更を反映するには KonomiTV サーバーの再起動が必要です。<br>
+                    保存した変更を反映するには KonomiTV-BS4K サーバーの再起動が必要です。<br>
                 </div>
             </div>
             <v-btn class="settings__save-button bg-secondary mt-5" variant="flat" @click="updateServerSettings()">
@@ -441,7 +441,7 @@ async function updateServerSettings() {
     // 再起動するまでは設定データは反映されないため、再起動せずにページをリロードすると反映されてないように見える点に注意
     if (result === true) {
         resetServerSettingsDraft();
-        Message.success('BS4K設定を更新しました。\n変更を反映するためには、KonomiTV サーバーを再起動してください。');
+        Message.success('BS4K設定を更新しました。\n変更を反映するためには、KonomiTV-BS4K サーバーを再起動してください。');
     }
 }
 

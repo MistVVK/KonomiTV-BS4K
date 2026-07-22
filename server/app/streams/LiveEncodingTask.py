@@ -107,7 +107,7 @@ class LiveEncodingTask:
             return True
 
         # BS4K・CS4K (放送終了) は 4K 放送なのでフル HD 扱いとする
-        # 現在の KonomiTV は 1920×1080 以上の解像度へのエンコードをサポートしていない
+        # 現在の KonomiTV-BS4K は 1920×1080 以上の解像度へのエンコードをサポートしていない
         if network_id == 0x000B or network_id == 0x000C:
             return True
 
@@ -1199,9 +1199,9 @@ class LiveEncodingTask:
                 # 既にエンコーダーのログファイルが存在していた場合は上書きしないようにリネーム
                 ## ref: https://note.nkmk.me/python-pathlib-name-suffix-parent/
                 count = 1
-                encoder_log_path = LOGS_DIR / f'KonomiTV-Encoder-{self.live_stream.live_stream_id}.log'
+                encoder_log_path = LOGS_DIR / f'KonomiTV-BS4K-Encoder-{self.live_stream.live_stream_id}.log'
                 while await anyio.Path(str(encoder_log_path)).exists():
-                    encoder_log_path = LOGS_DIR / f'KonomiTV-Encoder-{self.live_stream.live_stream_id}-{count}.log'
+                    encoder_log_path = LOGS_DIR / f'KonomiTV-BS4K-Encoder-{self.live_stream.live_stream_id}-{count}.log'
                     count += 1
 
                 # エンコーダーのログファイルを開く (エンコーダーログ有効時のみ)

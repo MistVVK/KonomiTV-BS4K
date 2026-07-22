@@ -1049,6 +1049,7 @@ class UserAccessToken(BaseModel):
 
 class VersionInformation(BaseModel):
     version: str
+    upstream_version: str
     git_commit: str
     latest_version: str | None
     environment: Literal['Linux', 'Linux-Docker']

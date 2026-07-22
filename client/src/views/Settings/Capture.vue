@@ -22,7 +22,7 @@
                             どのデバイスから撮っても1つのフォルダにまとめて保存できます。他のデバイスからキャプチャを見るには、保存先フォルダをネットワーク共有するか、サーバー PC に直接アクセスする必要があります。
                         </li>
                     </ul>
-                    <p class="settings__item-note">※ 将来的には、サーバー PC に保存されたキャプチャを KonomiTV 上で閲覧できる機能を追加予定です。</p>
+                    <p class="settings__item-note">※ 将来的には、サーバー PC に保存されたキャプチャを KonomiTV-BS4K 上で閲覧できる機能を追加予定です。</p>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -173,8 +173,8 @@ export default defineComponent({
             // キャプチャの保存先の選択肢
             capture_save_mode: [
                 {title: 'ブラウザでダウンロード', value: 'Browser'},
-                {title: 'KonomiTV サーバーにアップロード', value: 'UploadServer'},
-                {title: 'ブラウザでのダウンロードと、KonomiTV サーバーへのアップロードを両方行う', value: 'Both'},
+                {title: 'KonomiTV-BS4K サーバーにアップロード', value: 'UploadServer'},
+                {title: 'ブラウザでのダウンロードと、KonomiTV-BS4K サーバーへのアップロードを両方行う', value: 'Both'},
             ],
 
             // 字幕が表示されているときのキャプチャの保存モードの選択肢

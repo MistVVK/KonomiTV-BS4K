@@ -384,7 +384,7 @@ class CaptureCompositor implements ICaptureCompositor {
                 // 撮影時刻
                 [piexif.TagValues.ImageIFD.DateTime]: datetime,
                 // ソフトウェア名
-                [piexif.TagValues.ImageIFD.Software]: `KonomiTV version ${Utils.version}`,
+                [piexif.TagValues.ImageIFD.Software]: `KonomiTV-BS4K version ${Utils.version}`,
                 // Microsoft 拡張のコメント領域（エクスプローラーで出てくるコメント欄と同じもの）
                 // ref: https://stackoverflow.com/a/66186660/17124142
                 [piexif.TagValues.ImageIFD.XPComment]: [...Buffer.from(JSON.stringify(capture_exif_data), 'ucs2')],

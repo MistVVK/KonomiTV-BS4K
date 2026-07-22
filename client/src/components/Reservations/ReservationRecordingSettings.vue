@@ -184,7 +184,7 @@
         <div class="reservation-recording-settings__section">
             <div class="reservation-recording-settings__label">データ放送録画設定</div>
             <div class="reservation-recording-settings__description">
-                データ放送は30分で 500MB 以上録画容量を消費する上、KonomiTV は録画再生時のデータ放送表示に非対応です。<br>
+                データ放送は30分で 500MB 以上録画容量を消費する上、KonomiTV-BS4K は録画再生時のデータ放送表示に非対応です。<br>
                 [録画しない] に設定しておくことを強くおすすめします。
             </div>
             <v-select

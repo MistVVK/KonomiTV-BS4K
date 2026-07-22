@@ -16,10 +16,10 @@ from app import logging
 from app.CompatibilityAPI import CreateCompatibilityAPI, PortDispatchApplication
 from app.config import Config, LoadConfig, ResolveCompatibilityHTTPSSettings
 from app.constants import (
+    BS4K_VERSION,
     CLIENT_DIR,
     DATABASE_CONFIG,
     QUALITY,
-    VERSION,
 )
 from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
@@ -73,9 +73,9 @@ except AssertionError:
 
 # FastAPI を初期化
 app = FastAPI(
-    title = 'KonomiTV',
-    description = 'KonomiTV: Kept Organized, Notably Optimized, Modern Interface TV media server',
-    version = VERSION,
+    title = 'KonomiTV-BS4K',
+    description = 'KonomiTV-BS4K: Kept Organized, Notably Optimized, Modern Interface TV media server',
+    version = BS4K_VERSION,
     openapi_url = '/api/openapi.json',
     docs_url = '/api/docs',
     redoc_url = '/api/redoc',

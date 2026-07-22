@@ -15,6 +15,7 @@ from app.CompatibilityAPI import (
     TransformRecordedProgramForKomorebi,
     histories_router,
 )
+from app.constants import VERSION
 
 
 def BuildRecordedProgramResponse() -> dict[str, Any]:
@@ -324,6 +325,7 @@ def test_compatibility_app_does_not_publish_web_ui_or_server_settings() -> None:
         for method in getattr(route, 'methods', set()) or set()
     }
 
+    assert app.version == VERSION
     assert '/api/channels' in paths
     assert '/api/videos' in paths
     assert '/api/histories' in paths
@@ -339,6 +341,7 @@ def test_compatibility_app_does_not_publish_web_ui_or_server_settings() -> None:
     assert ('DELETE', '/api/videos/{video_id}') not in method_paths
     assert not any(path.startswith('/api/settings') for path in paths)
     assert not any(path.startswith('/api/maintenance') for path in paths)
+    assert '/api/version' not in paths
     assert '/{file:path}' not in paths
 
 

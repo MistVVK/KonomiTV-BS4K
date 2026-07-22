@@ -181,10 +181,10 @@ class LiveCommentManager implements PlayerManager {
             } else if (websocket_info.is_nxjikkyo_exclusive === true) {
                 console.warn('[LiveCommentManager][WatchSession] Failed to get Nicolive watch session URL. (This channel is exclusive to NX-Jikkyo.)');
 
-            // KonomiTV アカウントにログインしていないために視聴セッション WebSocket URL を取得できなかった: コンソールにのみ警告を表示
+            // KonomiTV-BS4K アカウントにログインしていないために視聴セッション WebSocket URL を取得できなかった: コンソールにのみ警告を表示
             // ニコニコ実況を使わない人にとって、わざわざ設定をオフにしないとこのメッセージが消せないのはストレスなので、警告メッセージとしては表示しない
             } else if (user_store.user === null) {
-                console.warn('[LiveCommentManager][WatchSession] Failed to get Nicolive watch session URL. (Not logged in to KonomiTV)');
+                console.warn('[LiveCommentManager][WatchSession] Failed to get Nicolive watch session URL. (Not logged in to KonomiTV-BS4K)');
 
             // ニコニコアカウントと連携していないために視聴セッション WebSocket URL を取得できなかった: コンソールにのみ警告を表示
             // ニコニコ実況を使わない人にとって、わざわざ設定をオフにしないとこのメッセージが消せないのはストレスなので、警告メッセージとしては表示しない
@@ -658,7 +658,7 @@ class LiveCommentManager implements PlayerManager {
         // フォールバックで代わりに NX-Jikkyo にコメントが投稿される旨を通知する
         if (settings_store.settings.prefer_posting_to_nicolive === true) {
             if (user_store.user === null) {
-                this.player.notice('ニコニコ実況にコメントするには、KonomiTV アカウントにログインしてください。代わりに NX-Jikkyo にコメントします。',
+                this.player.notice('ニコニコ実況にコメントするには、KonomiTV-BS4K アカウントにログインしてください。代わりに NX-Jikkyo にコメントします。',
                     undefined, undefined, 'rgb(var(--v-theme-warning-readable))');
             } else if (user_store.user.niconico_user_id === null) {
                 this.player.notice('ニコニコ実況にコメントするには、ニコニコアカウントと連携してください。代わりに NX-Jikkyo にコメントします。',

@@ -8,8 +8,8 @@
             <span class="ml-3">CM管理</span>
         </h2>
         <div class="settings__description">
-            手動編集した KonomiTV chapter YAML、または基本名方式の .chapter.txt を優先して同期します。<br>
-            KonomiTV の自動解析結果は録画横の YAML に保存します。<br>
+            手動編集した KonomiTV-BS4K chapter YAML、または基本名方式の .chapter.txt を優先して同期します。<br>
+            KonomiTV-BS4K の自動解析結果は録画横の YAML に保存します。<br>
             この設定はすべてのユーザーと端末で共有されます。
         </div>
         <div class="settings__content" :class="{'settings__content--loading': is_loading}">
@@ -25,7 +25,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">共有ロゴフォルダ</div>
                 <div class="settings__item-label">
-                    空欄時は KonomiTV 内部フォルダを使用します。指定する場合はホスト側の絶対パスを入力してください。<br>
+                    空欄時は KonomiTV-BS4K 内部フォルダを使用します。指定する場合はホスト側の絶対パスを入力してください。<br>
                     利用不能な場合に内部フォルダへ自動切り替えは行いません。
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details

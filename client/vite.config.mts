@@ -92,8 +92,8 @@ export default defineConfig({
             ],
             // manifest.json の内容
             manifest: {
-                name: 'KonomiTV',
-                short_name: 'KonomiTV',
+                name: 'KonomiTV-BS4K',
+                short_name: 'KonomiTV-BS4K',
                 start_url: '.',
                 display: 'standalone',
                 theme_color: '#0D0807',

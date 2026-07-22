@@ -31,6 +31,9 @@ const useVersionStore = defineStore('version', {
         server_version(): string | null {
             return this.server_version_info?.version ?? null;
         },
+        upstream_version(): string | null {
+            return this.server_version_info?.upstream_version ?? null;
+        },
         latest_version(): string | null {
             return this.server_version_info?.latest_version ?? null;
         },

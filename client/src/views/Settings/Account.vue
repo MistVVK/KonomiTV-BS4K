@@ -40,7 +40,7 @@
             </div>
             <div class="account-register" v-if="userStore.is_logged_in === false && section !== 'sync'">
                 <div class="account-register__heading">
-                    KonomiTV アカウントにログインすると、<br>より便利な機能が使えます！
+                    KonomiTV-BS4K アカウントにログインすると、<br>より便利な機能が使えます！
                 </div>
                 <div class="account-register__feature">
                     <div class="account-feature" v-if="versionStore.is_jikkyo_enabled_on_server">
@@ -73,8 +73,8 @@
                     </div>
                 </div>
                 <div class="account-register__description">
-                    KonomiTV アカウントの作成に必要なものは<br class="smartphone-vertical-only">ユーザー名とパスワードだけです。<br>
-                    アカウントはローカルに導入した<br class="smartphone-vertical-only"> KonomiTV サーバーにのみ保存されます。<br>
+                    KonomiTV-BS4K アカウントの作成に必要なものは<br class="smartphone-vertical-only">ユーザー名とパスワードだけです。<br>
+                    アカウントはローカルに導入した<br class="smartphone-vertical-only"> KonomiTV-BS4K サーバーにのみ保存されます。<br>
                     外部のサービスには保存されませんので、ご安心ください。<br>
                 </div>
                 <v-btn class="account-register__button" color="secondary" width="100%" max-width="250" height="50" variant="flat" to="/register/">
@@ -85,7 +85,7 @@
                 <div class="settings__item settings__item--switch">
                     <label class="settings__item-heading" for="sync_settings">設定をデバイス間で同期する</label>
                     <label class="settings__item-label" for="sync_settings">
-                        KonomiTV では、設定を同じアカウントでログインしているデバイス間で同期できます！<br>
+                        KonomiTV-BS4K では、設定を同じアカウントでログインしているデバイス間で同期できます！<br>
                         同期をオンにすると、<strong>同期をオンにしているすべてのデバイスで共通の設定が使えます。</strong><br>
                     </label>
                     <label class="settings__item-label" for="sync_settings">
@@ -127,8 +127,8 @@
                 <v-form class="settings__item" ref="settings_username" @submit.prevent>
                     <div class="settings__item-heading">ユーザー名</div>
                     <div class="settings__item-label">
-                        KonomiTV アカウントのユーザー名を設定します。アルファベットだけでなく日本語や記号も使えます。<br>
-                        同じ KonomiTV サーバー上の他のアカウントと同じユーザー名には変更できません。<br>
+                        KonomiTV-BS4K アカウントのユーザー名を設定します。アルファベットだけでなく日本語や記号も使えます。<br>
+                        同じ KonomiTV-BS4K サーバー上の他のアカウントと同じユーザー名には変更できません。<br>
                     </div>
                     <v-text-field class="settings__item-form" color="primary" variant="outlined" placeholder="ユーザー名"
                         :density="is_form_dense ? 'compact' : 'default'"
@@ -142,7 +142,7 @@
                 <v-form class="settings__item" @submit.prevent>
                     <div class="settings__item-heading">アイコン画像</div>
                     <div class="settings__item-label">
-                        KonomiTV アカウントのアイコン画像を設定します。<br>
+                        KonomiTV-BS4K アカウントのアイコン画像を設定します。<br>
                         アップロードされた画像は自動で 400×400 の正方形にリサイズされます。<br>
                     </div>
                     <v-file-input class="settings__item-form" color="primary" variant="outlined" hide-details
@@ -160,7 +160,7 @@
                 <v-form class="settings__item" ref="settings_password" @submit.prevent>
                     <div class="settings__item-heading">新しいパスワード</div>
                     <div class="settings__item-label">
-                        KonomiTV アカウントの新しいパスワードを設定します。<br>
+                        KonomiTV-BS4K アカウントの新しいパスワードを設定します。<br>
                     </div>
                     <v-text-field class="settings__item-form" color="primary" variant="outlined" placeholder="新しいパスワード"
                         :density="is_form_dense ? 'compact' : 'default'"
@@ -178,7 +178,7 @@
                 <div class="settings__item mt-6">
                     <div class="settings__item-heading text-error-readable">アカウントを削除</div>
                     <div class="settings__item-label">
-                        現在ログインしている KonomiTV アカウントを削除します。<br>
+                        現在ログインしている KonomiTV-BS4K アカウントを削除します。<br>
                         <strong class="text-error-readable">アカウントに紐づくすべてのデータが削除されます。元に戻すことはできません。</strong><br>
                     </div>
                 </div>

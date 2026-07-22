@@ -38,7 +38,7 @@ from app.utils.TSInformation import TerrestrialRegion
 
 
 def _GetUsedListenPorts() -> set[int]:
-    """現在の KonomiTV プロセス群を除き、他プロセスが待ち受けている TCP ポートを取得する。"""
+    """現在の KonomiTV-BS4K プロセス群を除き、他プロセスが待ち受けている TCP ポートを取得する。"""
 
     current_process = psutil.Process()
     used_ports: set[int] = set()
@@ -338,7 +338,7 @@ class _ServerSettingsGeneral(BaseModel):
             result_stdout = '\n'.join([line for line in result_stdout.split('\n') if 'reader:' not in line])
             if 'unavailable.' in result_stdout:
                 raise ValueError(
-                    f'お使いの環境では {encoder} がサポートされていないため、KonomiTV を起動できません。\n'
+                    f'お使いの環境では {encoder} がサポートされていないため、KonomiTV-BS4K を起動できません。\n'
                     f'別のエンコーダーを選択するか、{encoder} の動作環境を整備してください。'
                 )
             # H.265/HEVC に対応していない環境では、HEVC を選択できない旨を出力する
@@ -424,7 +424,7 @@ class _ServerSettingsServer(BaseModel):
         # リッスンするポート番号が 1024 ~ 65525 の間に収まっているかをチェック
         if port < 1024 or port > 65525:
             raise ValueError(
-                'ポート番号の設定が不正なため、KonomiTV を起動できません。\n'
+                'ポート番号の設定が不正なため、KonomiTV-BS4K を起動できません。\n'
                 '設定したポート番号が 1024 ~ 65525 (65535 ではない) の間に収まっているかを確認してください。'
             )
         # 使用中のポートを取得
@@ -433,13 +433,13 @@ class _ServerSettingsServer(BaseModel):
         # Akebi HTTPS Server のリッスンポートと Uvicorn のリッスンポートの両方をチェック
         if port in used_ports:
             raise ValueError(
-                f'ポート {port} は他のプロセスで使われているため、KonomiTV を起動できません。\n'
-                f'重複して KonomiTV を起動していないか、他のソフトでポート {port} を使っていないかを確認してください。'
+                f'ポート {port} は他のプロセスで使われているため、KonomiTV-BS4K を起動できません。\n'
+                f'重複して KonomiTV-BS4K を起動していないか、他のソフトでポート {port} を使っていないかを確認してください。'
             )
         if info.data.get('https_mode') == 'akebi' and (port + 10) in used_ports:
             raise ValueError(
-                f'ポート {port + 10} ({port} + 10) は他のプロセスで使われているため、KonomiTV を起動できません。\n'
-                f'重複して KonomiTV を起動していないか、他のソフトでポート {port + 10} を使っていないかを確認してください。'
+                f'ポート {port + 10} ({port} + 10) は他のプロセスで使われているため、KonomiTV-BS4K を起動できません。\n'
+                f'重複して KonomiTV-BS4K を起動していないか、他のソフトでポート {port + 10} を使っていないかを確認してください。'
             )
         return port
 
@@ -515,7 +515,7 @@ class _ServerSettingsCompatibilityAPI(BaseModel):
             return port
         if port < 1024 or port > 65525:
             raise ValueError(
-                '互換 API のポート番号が不正なため、KonomiTV を起動できません。\n'
+                '互換 API のポート番号が不正なため、KonomiTV-BS4K を起動できません。\n'
                 '設定したポート番号が 1024 ~ 65525 の間に収まっているかを確認してください。'
             )
         return port
@@ -605,7 +605,7 @@ class ServerSettings(BaseModel):
         for owner, port in compatibility_ports.items():
             if port in used_ports:
                 raise ValueError(
-                    f'{owner} のポート {port} は他のプロセスで使われているため、KonomiTV を起動できません。\n'
+                    f'{owner} のポート {port} は他のプロセスで使われているため、KonomiTV-BS4K を起動できません。\n'
                     f'他のソフトでポート {port} を使っていないかを確認してください。'
                 )
 
@@ -683,7 +683,7 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
 
     # 設定ファイルが配置されていない場合、エラーを表示して終了する
     if Path.exists(_CONFIG_YAML_PATH) is False:
-        logging.error('設定ファイルが配置されていないため、KonomiTV を起動できません。')
+        logging.error('設定ファイルが配置されていないため、KonomiTV-BS4K を起動できません。')
         logging.error('config.example.yaml を config.yaml にコピーし、お使いの環境に合わせて編集してください。')
         sys.exit(1)
 
@@ -692,12 +692,12 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
         with open(_CONFIG_YAML_PATH, encoding='utf-8') as file:
             config_raw = ruamel.yaml.YAML().load(file)
             if config_raw is None:
-                logging.error('設定ファイルが空のため、KonomiTV を起動できません。')
+                logging.error('設定ファイルが空のため、KonomiTV-BS4K を起動できません。')
                 logging.error('config.example.yaml を config.yaml にコピーし、お使いの環境に合わせて編集してください。')
                 sys.exit(1)
         config_dict: dict[str, dict[str, Any]] = dict(config_raw)
     except Exception as error:
-        logging.error('設定ファイルのロード中にエラーが発生したため、KonomiTV を起動できません。')
+        logging.error('設定ファイルのロード中にエラーが発生したため、KonomiTV-BS4K を起動できません。')
         logging.error(f'{type(error).__name__}: {error}')
         sys.exit(1)
 
@@ -761,7 +761,7 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
                 sys.exit(1)
 
             # それ以外のバリデーションエラー
-            logging.error('設定内容が不正なため、KonomiTV を起動できません。')
+            logging.error('設定内容が不正なため、KonomiTV-BS4K を起動できません。')
             logging.error('以下のエラーメッセージを参考に、config.yaml の記述が正しいかを確認してください。')
             logging.error(error)
             sys.exit(1)

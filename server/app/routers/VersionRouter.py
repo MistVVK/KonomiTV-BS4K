@@ -13,7 +13,7 @@ from markdown_it.token import Token
 
 from app import schemas
 from app.config import Config
-from app.constants import HTTPX_CLIENT, THIRD_PARTY_LICENSES_PATH, VERSION
+from app.constants import BS4K_VERSION, HTTPX_CLIENT, THIRD_PARTY_LICENSES_PATH, VERSION
 from app.utils import GetPlatformEnvironment
 from app.utils.Git import GetGitCommit
 
@@ -25,7 +25,7 @@ router = APIRouter(
 )
 
 
-# GitHub API から取得した KonomiTV の最新バージョン (と最終更新日時)
+# GitHub API から取得した KonomiTV-BS4K の最新バージョン (と最終更新日時)
 latest_version: str | None = None
 latest_version_updated_at: float = 0
 
@@ -274,7 +274,7 @@ def _render_collapsible_licenses(markdown: MarkdownIt, source: str) -> str:
 )
 async def ThirdPartyLicensesAPI(request: Request) -> Response:
     """
-    KonomiTV に同梱している third-party ソフトウェアのライセンス全文を返す。
+    KonomiTV-BS4K に同梱している third-party ソフトウェアのライセンス全文を返す。
 
     Returns:
         Response: HTML 形式のライセンス文書
@@ -484,24 +484,26 @@ async def ChromiumThirdPartyLicensesAPI(request: Request) -> Response:
 @router.get(
     '',
     summary = 'バージョン情報取得 API',
-    response_description = 'KonomiTV サーバーのバージョンなどの情報。',
+    response_description = 'KonomiTV-BS4K サーバーのバージョンなどの情報。',
     response_model = schemas.VersionInformation,
 )
 async def VersionInformationAPI():
     """
-    KonomiTV サーバーのバージョン情報と、バックエンドの種類、稼働環境などを取得する。
+    KonomiTV-BS4K サーバーのバージョン情報と、バックエンドの種類、稼働環境などを取得する。
     """
 
     global latest_version, latest_version_updated_at
 
-    # GitHub API で KonomiTV の最新のタグ (=最新バージョン) を取得
+    # GitHub API で KonomiTV-BS4K の最新のタグ (=最新バージョン) を取得
     ## GitHub API は無認証だと60回/1時間までしかリクエストできないので、リクエスト結果を10分ほどキャッシュする
-    if latest_version is None or (time.time() - latest_version_updated_at) > 60 * 10:
+    ## タグが0件の場合も latest_version=None を正常な取得結果としてキャッシュする
+    if latest_version_updated_at == 0 or (time.time() - latest_version_updated_at) > 60 * 10:
         try:
             async with HTTPX_CLIENT() as client:
-                response = await client.get('https://api.github.com/repos/tsukumijima/KonomiTV/tags')
+                response = await client.get('https://api.github.com/repos/MistVVK/KonomiTV-BS4K/tags')
             if response.status_code == 200:
-                latest_version = response.json()[0]['name'].replace('v', '')  # 先頭の v を取り除く
+                tags = response.json()
+                latest_version = tags[0]['name'].removeprefix('v') if len(tags) > 0 else None
                 latest_version_updated_at = time.time()
         except (httpx.NetworkError, httpx.TimeoutException):
             pass
@@ -510,7 +512,8 @@ async def VersionInformationAPI():
     environment = GetPlatformEnvironment()
 
     result: dict[str, Any] = {
-        'version': VERSION,
+        'version': BS4K_VERSION,
+        'upstream_version': VERSION,
         'git_commit': await GetGitCommit(),
         'latest_version': latest_version,
         'environment': environment,
