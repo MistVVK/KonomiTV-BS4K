@@ -8,7 +8,7 @@
             <span class="ml-3">録画シリーズ管理</span>
         </h2>
         <div class="settings__description">
-            判定済みの録画シリーズを検索し、表示するタイトルと説明を編集します。<br>
+            判定済みの録画シリーズを検索し、シリーズ情報と録画ごとのシーズン・話数を編集します。<br>
             録画ごとの所属先は、各録画の再生画面にある「シリーズを訂正」から変更できます。
         </div>
 
@@ -68,10 +68,15 @@
                 v-model="series_page" :length="series_page_count" />
         </template>
 
-        <v-dialog v-model="series_edit_dialog" :persistent="is_updating_series" max-width="560" scrollable>
+        <v-dialog v-model="series_edit_dialog" :persistent="is_updating_series" max-width="760" scrollable>
             <v-card v-if="editing_series !== null" class="recorded-series-dialog recorded-series-edit-dialog">
-                <v-card-title>シリーズ情報を編集</v-card-title>
-                <v-card-text>
+                <v-card-title>{{editing_series.title}}</v-card-title>
+                <v-tabs v-model="series_edit_tab" class="recorded-series-edit-dialog__tabs" color="primary" grow>
+                    <v-tab value="SeriesInfo">シリーズ情報</v-tab>
+                    <v-tab value="Episodes">録画・話数</v-tab>
+                </v-tabs>
+                <!-- `scrollable` は v-card 直下の v-card-text だけをスクロール領域にする。 -->
+                <v-card-text v-if="series_edit_tab === 'SeriesInfo'">
                     <div class="recorded-series-edit-dialog__summary">
                         <span>シリーズ ID {{editing_series.id}}</span>
                         <span>録画 {{editing_series.recorded_program_count.toLocaleString()}} 件</span>
@@ -89,7 +94,52 @@
                         シリーズ名を変更すると、このシリーズに所属する録画のシリーズ表示名もまとめて更新されます。<br>
                     </div>
                 </v-card-text>
-                <v-card-actions>
+                <v-card-text v-else class="recorded-series-episodes">
+                    <v-progress-linear v-if="is_loading_episode_assignments" color="primary"
+                        indeterminate rounded />
+                    <div v-else-if="episode_assignments_load_failed"
+                        class="recorded-series-episodes__state">
+                        <Icon icon="fluent:error-circle-20-regular" width="27px" />
+                        <span>録画と話数を取得できませんでした。</span>
+                        <v-btn color="primary" size="small" variant="tonal"
+                            @click="fetchEpisodeAssignments()">再試行</v-btn>
+                    </div>
+                    <div v-else-if="episode_assignments?.programs.length === 0"
+                        class="recorded-series-episodes__state">
+                        <Icon icon="fluent:video-clip-off-20-regular" width="27px" />
+                        <span>再生可能な録画はありません。</span>
+                    </div>
+                    <template v-else-if="episode_assignments !== null">
+                        <div class="recorded-series-episodes__description">
+                            同じ話を別の放送局で録画した場合も、同じシーズン・話数へ割り当てたまま個別の録画として残ります。
+                        </div>
+                        <div class="recorded-series-episodes__list" role="list">
+                            <button v-for="program in episode_assignments.programs"
+                                :key="program.recorded_program_id" v-ripple type="button"
+                                class="recorded-series-episode-item" role="listitem"
+                                @click="openEpisodeAssignmentDialog(program)">
+                                <div class="recorded-series-episode-item__episode">
+                                    {{formatProgramEpisode(program)}}
+                                </div>
+                                <div class="recorded-series-episode-item__body">
+                                    <strong>{{program.subtitle || program.title}}</strong>
+                                    <span>
+                                        {{dayjs(program.start_time).format('YYYY/M/D (ddd) HH:mm')}}
+                                        ・{{program.channel_name ?? 'チャンネル情報なし'}}
+                                    </span>
+                                    <small v-if="program.resolution !== null">
+                                        {{episodeResolutionStatusLabel(program.resolution.status)}}
+                                        <template v-if="program.resolution.source !== null">
+                                            ・{{episodeResolutionSourceLabel(program.resolution.source)}}
+                                        </template>
+                                    </small>
+                                </div>
+                                <Icon icon="fluent:edit-20-filled" width="19px" />
+                            </button>
+                        </div>
+                    </template>
+                </v-card-text>
+                <v-card-actions v-if="series_edit_tab === 'SeriesInfo'">
                     <v-spacer />
                     <v-btn variant="text" :disabled="is_updating_series" @click="series_edit_dialog = false">
                         キャンセル
@@ -99,8 +149,19 @@
                         更新
                     </v-btn>
                 </v-card-actions>
+                <v-card-actions v-else>
+                    <v-spacer />
+                    <v-btn variant="text" @click="series_edit_dialog = false">閉じる</v-btn>
+                </v-card-actions>
             </v-card>
         </v-dialog>
+
+        <RecordedEpisodeAssignmentDialog v-if="editing_series !== null"
+            v-model="episode_assignment_dialog"
+            :series-id="editing_series.id"
+            :recorded-program-id="editing_episode_program_id"
+            :assignment-list="episode_assignments"
+            @saved="episodeAssignmentSaved" />
     </SettingsBase>
 </template>
 
@@ -108,13 +169,18 @@
 
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 
+import RecordedEpisodeAssignmentDialog from '@/components/Videos/Dialogs/RecordedEpisodeAssignmentDialog.vue';
 import Message from '@/message';
 import RecordedSeries, {
+    type IRecordedEpisodeAssignmentList,
+    type IRecordedEpisodeAssignmentProgram,
+    type IRecordedEpisodeAssignmentResolution,
     type IRecordedSeriesManagementItem,
     type IRecordedSeriesManagementUpdate,
 } from '@/services/RecordedSeries';
 import useUserStore from '@/stores/UserStore';
 import { dayjs } from '@/utils';
+import { formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
@@ -135,11 +201,20 @@ const editing_series = ref<IRecordedSeriesManagementItem | null>(null);
 const editing_series_title = ref('');
 const editing_series_description = ref('');
 const is_updating_series = ref(false);
+const series_edit_tab = ref<'SeriesInfo' | 'Episodes'>('SeriesInfo');
+
+// 録画件数が多い Series もあるため、「録画・話数」タブを初めて開くまで詳細一覧は取得しない。
+const episode_assignments = ref<IRecordedEpisodeAssignmentList | null>(null);
+const is_loading_episode_assignments = ref(false);
+const episode_assignments_load_failed = ref(false);
+const episode_assignment_dialog = ref(false);
+const editing_episode_program_id = ref<number | null>(null);
 
 const user_store = useUserStore();
 let series_search_timer: number | null = null;
 let status_polling_timer: number | null = null;
 let series_request_sequence = 0;
+let episode_assignments_request_sequence = 0;
 let is_backfill_running = false;
 
 const series_page_count = computed(() => Math.max(1, Math.ceil(series_total.value / SERIES_PAGE_SIZE)));
@@ -193,7 +268,75 @@ function openSeriesEditDialog(series: IRecordedSeriesManagementItem): void {
     editing_series.value = series;
     editing_series_title.value = series.title;
     editing_series_description.value = series.description;
+    series_edit_tab.value = 'SeriesInfo';
+    episode_assignments.value = null;
+    episode_assignments_load_failed.value = false;
+    editing_episode_program_id.value = null;
     series_edit_dialog.value = true;
+}
+
+/** 選択中の Series に属する録画と構造化話数だけを、タブ表示時に遅延取得する。 */
+async function fetchEpisodeAssignments(show_error = true): Promise<void> {
+    const series_id = editing_series.value?.id;
+    if (series_id === undefined) return;
+
+    const request_sequence = ++episode_assignments_request_sequence;
+    is_loading_episode_assignments.value = true;
+    episode_assignments_load_failed.value = false;
+    const result = await RecordedSeries.fetchEpisodeAssignments(series_id, show_error);
+    if (
+        request_sequence !== episode_assignments_request_sequence ||
+        editing_series.value?.id !== series_id
+    ) {
+        return;
+    }
+
+    is_loading_episode_assignments.value = false;
+    episode_assignments.value = result;
+    episode_assignments_load_failed.value = result === null;
+}
+
+function openEpisodeAssignmentDialog(program: IRecordedEpisodeAssignmentProgram): void {
+    editing_episode_program_id.value = program.recorded_program_id;
+    episode_assignment_dialog.value = true;
+}
+
+/** 共通ダイアログが再取得した一覧をそのまま反映し、失敗時だけ管理画面側で再取得する。 */
+function episodeAssignmentSaved(refreshed_assignments: IRecordedEpisodeAssignmentList | null): void {
+    if (refreshed_assignments?.series_id === editing_series.value?.id) {
+        episode_assignments.value = refreshed_assignments;
+    } else {
+        void fetchEpisodeAssignments(false);
+    }
+}
+
+function formatProgramEpisode(program: IRecordedEpisodeAssignmentProgram): string {
+    const episode = episode_assignments.value?.episodes.find(candidate => candidate.id === program.series_episode_id);
+    if (episode === undefined) return '話数未設定';
+    return `S${episode.season_number}・第 ${formatRecordedEpisodeNumber(episode.episode_number)} 話`;
+}
+
+function episodeResolutionStatusLabel(status: IRecordedEpisodeAssignmentResolution['status']): string {
+    return {
+        Pending: '判定待ち',
+        Resolved: '確定',
+        Unknown: '話数不明',
+        NotNumbered: '公式話数なし',
+        NeedsReview: '要確認',
+        Failed: '判定失敗',
+    }[status];
+}
+
+function episodeResolutionSourceLabel(
+    source: NonNullable<IRecordedEpisodeAssignmentResolution['source']>,
+): string {
+    return {
+        Local: 'ローカル情報',
+        EPG: 'EPG',
+        WebSearch: 'AI Web 検索',
+        Manual: '手動訂正',
+        Migration: '既存データ移行',
+    }[source];
 }
 
 /** シリーズの表示情報を更新し、検索結果と件数をサーバーから同期し直す。 */
@@ -277,6 +420,18 @@ watch(series_search_query, () => {
     }, 300);
 });
 watch(series_page, () => void fetchManagementSeriesList());
+watch(series_edit_tab, (tab) => {
+    if (tab === 'Episodes' && episode_assignments.value === null && is_loading_episode_assignments.value === false) {
+        void fetchEpisodeAssignments();
+    }
+});
+watch(series_edit_dialog, (is_open) => {
+    if (is_open) return;
+    episode_assignment_dialog.value = false;
+    editing_episode_program_id.value = null;
+    episode_assignments_request_sequence += 1;
+    is_loading_episode_assignments.value = false;
+});
 
 function formatSeriesPeriod(first_recorded_at: string | null, last_recorded_at: string | null): string {
     if (first_recorded_at === null || last_recorded_at === null) return '録画期間なし';
@@ -314,6 +469,7 @@ onUnmounted(() => {
     if (series_search_timer !== null) window.clearTimeout(series_search_timer);
     stopStatusPolling();
     series_request_sequence += 1;
+    episode_assignments_request_sequence += 1;
 });
 
 </script>
@@ -435,12 +591,114 @@ onUnmounted(() => {
 }
 
 .recorded-series-edit-dialog {
+    &__tabs {
+        flex: none;
+    }
+
     &__summary {
         display: flex;
         flex-wrap: wrap;
         gap: 6px 14px;
         color: rgb(var(--v-theme-text-darken-1));
         font-size: 12.5px;
+    }
+}
+
+.recorded-series-episodes {
+    min-height: 0;
+
+    &__state {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-direction: column;
+        min-height: 220px;
+        gap: 10px;
+        color: rgb(var(--v-theme-text-darken-1));
+        font-size: 13px;
+        text-align: center;
+    }
+
+    &__description {
+        margin-bottom: 12px;
+        padding: 9px 11px;
+        border-radius: 6px;
+        color: rgb(var(--v-theme-text-darken-1));
+        background: rgba(var(--v-theme-primary), 0.09);
+        font-size: 11.5px;
+        line-height: 1.55;
+    }
+
+    &__list {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+    }
+}
+
+.recorded-series-episode-item {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    min-width: 0;
+    padding: 10px 11px;
+    gap: 11px;
+    border-radius: 7px;
+    color: rgb(var(--v-theme-text));
+    text-align: left;
+    background: rgb(var(--v-theme-background));
+    transition: background-color 0.15s ease;
+    cursor: pointer;
+
+    &:hover {
+        background: rgba(var(--v-theme-primary), 0.13);
+    }
+
+    > svg {
+        flex-shrink: 0;
+        color: rgb(var(--v-theme-text-darken-1));
+    }
+
+    &__episode {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        width: 105px;
+        min-height: 38px;
+        padding: 5px 7px;
+        border-radius: 5px;
+        color: rgb(var(--v-theme-primary-readable));
+        background: rgba(var(--v-theme-primary), 0.1);
+        font-size: 11.5px;
+        font-weight: bold;
+        text-align: center;
+    }
+
+    &__body {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        flex-grow: 1;
+
+        strong,
+        span,
+        small {
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+
+        strong {
+            font-size: 13px;
+        }
+
+        span,
+        small {
+            margin-top: 2px;
+            color: rgb(var(--v-theme-text-darken-1));
+            font-size: 11px;
+        }
     }
 }
 
@@ -460,6 +718,20 @@ onUnmounted(() => {
             align-items: flex-start;
             flex-direction: column;
             gap: 6px;
+        }
+    }
+
+    .recorded-series-episode-item {
+        align-items: flex-start;
+        flex-wrap: wrap;
+
+        &__episode {
+            width: auto;
+            min-height: 0;
+        }
+
+        &__body {
+            width: calc(100% - 90px);
         }
     }
 }

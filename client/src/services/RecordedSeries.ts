@@ -118,6 +118,73 @@ export interface IRecordedSeriesNextProgram {
     recorded_program_id: number | null;
 }
 
+/** Series 内で手動割当先として選べる構造化済みの話数。 */
+export interface IRecordedEpisodeAssignmentEpisode {
+    id: number;
+    season_number: number;
+    episode_number: string;
+}
+
+/** 録画ごとの話数判定状態と、AI Web 検索を含む判断根拠。 */
+export interface IRecordedEpisodeAssignmentResolution {
+    status: 'Pending' | 'Resolved' | 'Unknown' | 'NotNumbered' | 'NeedsReview' | 'Failed';
+    source: 'Local' | 'EPG' | 'WebSearch' | 'Manual' | 'Migration' | null;
+    proposed_season_number: number | null;
+    proposed_episode_number: string | null;
+    confidence: number | null;
+    web_search_performed: boolean;
+    citations: {url: string; title: string;}[];
+    error_code: string | null;
+}
+
+/** Series 管理画面で話数を訂正できる録画。 */
+export interface IRecordedEpisodeAssignmentProgram {
+    recorded_program_id: number;
+    title: string;
+    subtitle: string | null;
+    legacy_episode_number: string | null;
+    start_time: string;
+    channel_id: string | null;
+    channel_name: string | null;
+    series_episode_id: number | null;
+    resolution: IRecordedEpisodeAssignmentResolution | null;
+}
+
+/** Series 内の構造化話数候補と、録画ごとの現在割当。 */
+export interface IRecordedEpisodeAssignmentList {
+    series_id: number;
+    episodes: IRecordedEpisodeAssignmentEpisode[];
+    programs: IRecordedEpisodeAssignmentProgram[];
+}
+
+/** 管理者が録画の話数を手動訂正するときの、楽観ロック付きリクエスト。 */
+export type IRecordedEpisodeAssignmentUpdate =
+    | {
+        decision: 'ExistingEpisode';
+        expected_series_id: number;
+        expected_series_episode_id: number | null;
+        episode_id: number;
+    }
+    | {
+        decision: 'StructuredEpisode';
+        expected_series_id: number;
+        expected_series_episode_id: number | null;
+        season_number: number;
+        episode_number: string;
+    }
+    | {
+        decision: 'Unknown';
+        expected_series_id: number;
+        expected_series_episode_id: number | null;
+    };
+
+/** 手動話数訂正の更新結果。 */
+export type IRecordedEpisodeAssignmentUpdateResult =
+    | {type: 'Success'}
+    | {type: 'Stale'}
+    | {type: 'NotFound'}
+    | {type: 'Error'};
+
 
 /** 録画シリーズ判定の設定・接続確認・一括判定 API。 */
 export default class RecordedSeries {
@@ -236,6 +303,42 @@ export default class RecordedSeries {
             if (response.status === 503) return {type: 'Busy'};
 
             APIClient.showGenericError(response, '録画シリーズを更新できませんでした。');
+            return {type: 'Error'};
+        }
+        return {type: 'Success'};
+    }
+
+    /** 管理者向けに、Series 内の構造化話数候補と録画ごとの割当を取得する。 */
+    static async fetchEpisodeAssignments(
+        series_id: number,
+        show_error = true,
+    ): Promise<IRecordedEpisodeAssignmentList | null> {
+        const response = await APIClient.get<IRecordedEpisodeAssignmentList>(
+            `/recorded-series/series/${series_id}/episode-assignments`,
+        );
+        if (response.type === 'error') {
+            if (show_error) {
+                APIClient.showGenericError(response, '録画の話数割当を取得できませんでした。');
+            }
+            return null;
+        }
+        return response.data;
+    }
+
+    /** 録画の構造化話数を、読み込み時点の割当を確認して手動更新する。 */
+    static async updateEpisodeAssignment(
+        recorded_program_id: number,
+        update: IRecordedEpisodeAssignmentUpdate,
+    ): Promise<IRecordedEpisodeAssignmentUpdateResult> {
+        const response = await APIClient.put(
+            `/recorded-series/programs/${recorded_program_id}/episode-assignment`,
+            update,
+        );
+        if (response.type === 'error') {
+            if (response.status === 404) return {type: 'NotFound'};
+            if (response.status === 409) return {type: 'Stale'};
+
+            APIClient.showGenericError(response, '録画の話数を訂正できませんでした。');
             return {type: 'Error'};
         }
         return {type: 'Success'};
