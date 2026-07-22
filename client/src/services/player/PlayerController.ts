@@ -8,6 +8,7 @@ import mpegts from 'mpegts.js';
 import { watch } from 'vue';
 
 import APIClient from '@/services/APIClient';
+import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
 import CaptureManager from '@/services/player/managers/CaptureManager';
 import DocumentPiPManager from '@/services/player/managers/DocumentPiPManager';
@@ -69,6 +70,22 @@ class PlayerController {
     // ARIB STD-B24 字幕の符号化プロファイル (A: フルセグ / C: ワンセグ)
     private aribb24_profile: 'A' | 'C' = 'A';
 
+    // ISDB-S3 の字幕・文字スーパーを共通処理する ARIB-TTML レンダラー
+    private arib_ttml_renderer: ARIBTTMLRenderer | null = null;
+
+    // ライブの timed-ID3 listener を現在の mpegts.js インスタンスへ一度だけ登録するための記録
+    private live_arib_ttml_source: {
+        on: (event: string, listener: (data: {pts: number; original_pts?: number; data: Uint8Array}) => void) => void;
+        off: (event: string, listener: (data: {pts: number; original_pts?: number; data: Uint8Array}) => void) => void;
+    } | null = null;
+    private readonly live_arib_ttml_handler = (data: {pts: number; original_pts?: number; data: Uint8Array}): void => {
+        this.arib_ttml_renderer?.pushID3v2Data(
+            data.pts / 1000,
+            data.data,
+            data.original_pts === undefined ? null : data.original_pts / 1000,
+        );
+    };
+
     // 画質プロファイル (Wi-Fi 回線時 / モバイル回線時)
     // デフォルトは自動判定だが、ユーザーによって手動変更されうる
     private quality_profile_type: 'Wi-Fi' | 'Cellular';
@@ -103,6 +120,10 @@ class PlayerController {
     // 画質切り替え後の video 要素へ fMP4 録画のARIB字幕先読みハンドラーを付け直す関数
     private recorded_arib_subtitle_restart: (() => void) | null = null;
 
+    // fMP4 録画のARIB-TTML timed-ID3先読みハンドラーと再接続関数
+    private recorded_arib_ttml_cancel: (() => void) | null = null;
+    private recorded_arib_ttml_restart: (() => void) | null = null;
+
     // 録画を末尾まで自然に再生し終えたかどうか
     // ended の多重通知防止と、完走後の視聴履歴を先頭付近へ戻す判断に共用する
     private recorded_playback_ended = false;
@@ -133,7 +154,8 @@ class PlayerController {
 
     // RomSound の AudioContext と AudioBuffer のリスト
     private readonly romsounds_context: AudioContext = new AudioContext();
-    private readonly romsounds_buffers: AudioBuffer[] = [];
+    private readonly romsounds_buffers = new Map<number, AudioBuffer>();
+    private readonly romsounds_ready: Promise<void>;
 
     // L字画面のクロップ設定で使うウォッチャーを保持する配列
     private lshaped_screen_crop_watchers: (() => void)[] = [];
@@ -178,9 +200,9 @@ class PlayerController {
             }
         }
 
-        // 01 ~ 14 まですべての RomSound を読み込む
-        (async () => {
-            for (let index = 1; index <= 14; index++) {
+        // 01 ~ 14 を番号を崩さず並列取得し、初回再生は準備完了を待つ。
+        this.romsounds_ready = Promise.all(Array.from({length: 14}, (_, index) => index + 1).map(async (index) => {
+            try {
                 // ArrayBuffer をデコードして AudioBuffer にし、すぐ呼び出せるように貯めておく
                 // ref: https://ics.media/entry/200427/
                 const romsound_url = `/assets/romsounds/${index.toString().padStart(2, '0')}.wav`;
@@ -189,10 +211,15 @@ class PlayerController {
                     responseType: 'arraybuffer',
                 });
                 if (romsound_response.type === 'success') {
-                    this.romsounds_buffers.push(await this.romsounds_context.decodeAudioData(romsound_response.data));
+                    this.romsounds_buffers.set(
+                        index,
+                        await this.romsounds_context.decodeAudioData(romsound_response.data),
+                    );
                 }
+            } catch (error) {
+                console.warn(`[PlayerController] Failed to preload RomSound ${index}.`, error);
             }
-        })();
+        })).then(() => undefined);
     }
 
 
@@ -1014,30 +1041,52 @@ class PlayerController {
                         }
                     })(),
                     // 文字スーパーの PRA (内蔵音再生コマンド) のコールバックを指定
-                    PRACallback: async (index: number) => {
-                        // 設定で文字スーパーが無効なら実行しない
-                        if (is_show_superimpose === false) return;
+                    PRACallback: async (index: number, loop: boolean = false, offset: number = 0) => {
                         // index に応じた内蔵音を鳴らす
                         // ref: https://ics.media/entry/200427/
                         // ref: https://www.ipentec.com/document/javascript-web-audio-api-change-volume
                         // 自動再生ポリシーに引っかかったなどで AudioContext が一時停止されている場合、一度 resume() する必要がある
                         // resume() するまでに何らかのユーザーのジェスチャーが行われているはず…
                         // なくても動くこともあるみたいだけど、念のため
+                        await this.romsounds_ready;
                         if (this.romsounds_context.state === 'suspended') {
                             await this.romsounds_context.resume();
                         }
                         // index で指定された音声データを読み込み
+                        const buffer = this.romsounds_buffers.get(index);
+                        if (buffer === undefined || this.romsounds_context.state === 'closed') return;
                         const buffer_source_node = this.romsounds_context.createBufferSource();
-                        buffer_source_node.buffer = this.romsounds_buffers[index];
+                        buffer_source_node.buffer = buffer;
+                        buffer_source_node.loop = loop;
                         // GainNode につなげる
                         const gain_node = this.romsounds_context.createGain();
                         buffer_source_node.connect(gain_node);
                         // 出力につなげる
                         gain_node.connect(this.romsounds_context.destination);
                         // 音量を元の wav の3倍にする (1倍だと結構小さめ)
-                        gain_node.gain.value = 3;
+                        gain_node.gain.value = 3 * (
+                            this.player?.video.muted === true ? 0 : this.player?.video.volume ?? 1
+                        );
                         // 再生開始
-                        buffer_source_node.start(0);
+                        const start_offset = loop && buffer.duration > 0 ? offset % buffer.duration : 0;
+                        buffer_source_node.start(0, start_offset);
+                        let is_stopped = false;
+                        const cleanup = () => {
+                            if (is_stopped) return;
+                            is_stopped = true;
+                            buffer_source_node.disconnect();
+                            gain_node.disconnect();
+                        };
+                        buffer_source_node.addEventListener('ended', cleanup, {once: true});
+                        return () => {
+                            if (is_stopped) return;
+                            try {
+                                buffer_source_node.stop();
+                            } catch (error) {
+                                // 既に終了済みならcleanupだけ行う。
+                            }
+                            cleanup();
+                        };
                     }
                 }
             }
@@ -1052,13 +1101,19 @@ class PlayerController {
         // DPlayer 内蔵レンダラーを破棄し、Profile C と JIS X 0213:2004 に対応した外部レンダラーへ差し替える。
         this.replaceARIBB24Renderers();
 
+        // ARIB-TTML はライブと録画のどちらも同じレンダラーへ timed-ID3 を投入する。
+        // 字幕ボタンは字幕層だけを切り替え、緊急情報にも使われる文字スーパー層は既存設定に従って独立表示する。
+        this.attachARIBTTMLRenderer();
+        this.player.on('subtitle_show', () => this.arib_ttml_renderer?.showCaption());
+        this.player.on('subtitle_hide', () => this.arib_ttml_renderer?.hideCaption());
+
         // fMP4 経路ではARIB生字幕を映像から分離し、シーク復元点と後続12秒を先読みする。
         if (
             this.playback_mode === 'Video' &&
             player_store.recorded_program.recorded_video.playback_index_status === 'Ready'
         ) {
             const arib_track = player_store.recorded_program.recorded_video.subtitle_tracks.find((track) =>
-                track.codec.toLowerCase().includes('arib'),
+                track.codec.toLowerCase().includes('arib') && track.codec.toLowerCase() !== 'arib_ttml',
             );
             if (arib_track !== undefined) {
                 const requested_ranges = new Set<number>();
@@ -1131,6 +1186,97 @@ class PlayerController {
                 };
                 this.recorded_arib_subtitle_restart = restart_arib_subtitle;
                 restart_arib_subtitle();
+            }
+
+            const has_arib_ttml_track = player_store.recorded_program.recorded_video.subtitle_tracks.some((track) =>
+                track.codec.toLowerCase() === 'arib_ttml',
+            );
+            if (has_arib_ttml_track === true) {
+                const requested_ranges = new Set<number>();
+                let is_fetching = false;
+                let restore_after_fetch = false;
+                let subtitle_generation = 0;
+                const fetch_arib_ttml = async (restore: boolean = false): Promise<void> => {
+                    if (this.player === null || this.arib_ttml_renderer === null) return;
+                    if (is_fetching === true) {
+                        restore_after_fetch ||= restore;
+                        return;
+                    }
+                    const range_start = Math.max(0, Math.floor(this.player.video.currentTime / 6) * 6);
+                    if (restore === true) requested_ranges.clear();
+                    if (requested_ranges.has(range_start)) return;
+                    is_fetching = true;
+                    const fetch_generation = subtitle_generation;
+                    try {
+                        const response = await APIClient.get<{
+                            restore_packets: {
+                                pts: number;
+                                transport_timestamp: number;
+                                component_tag: number;
+                                data: string;
+                                is_restore_point: boolean;
+                            }[];
+                            packets: {
+                                pts: number;
+                                transport_timestamp: number;
+                                component_tag: number;
+                                data: string;
+                                is_restore_point: boolean;
+                            }[];
+                        }>(`/streams/video/${player_store.recorded_program.id}/subtitle/arib-ttml`, {
+                            params: {start_time: range_start, end_time: range_start + 12},
+                        });
+                        if (
+                            response.type === 'success' &&
+                            this.player !== null &&
+                            this.arib_ttml_renderer !== null &&
+                            fetch_generation === subtitle_generation
+                        ) {
+                            const decode = (data: string): Uint8Array => Uint8Array.from(atob(data), (character) =>
+                                character.charCodeAt(0),
+                            );
+                            if (restore === true) this.arib_ttml_renderer.reset();
+                            const packets = restore === true ?
+                                [...response.data.restore_packets, ...response.data.packets] : response.data.packets;
+                            // restore履歴も通常rangeも同じ raw ID3 + 録画相対PTS を共通デコーダーへ順番どおり投入する。
+                            // component_tagの字幕/文字スーパー振り分けはJS内部だけで行い、録画アダプターには持ち込まない。
+                            for (const packet of packets) {
+                                this.arib_ttml_renderer.pushID3v2Data(
+                                    packet.pts,
+                                    decode(packet.data),
+                                    packet.transport_timestamp,
+                                );
+                            }
+                            requested_ranges.add(range_start);
+                        }
+                    } finally {
+                        is_fetching = false;
+                        if (restore_after_fetch === true) {
+                            restore_after_fetch = false;
+                            void fetch_arib_ttml(true);
+                        }
+                    }
+                };
+                const restore_arib_ttml = () => {
+                    subtitle_generation += 1;
+                    void fetch_arib_ttml(true);
+                };
+                const restart_arib_ttml = () => {
+                    if (this.player === null) return;
+                    this.recorded_arib_ttml_cancel?.();
+                    const video = this.player.video;
+                    const timeupdate_handler = () => void fetch_arib_ttml(false);
+                    const seeking_handler = restore_arib_ttml;
+                    video.addEventListener('timeupdate', timeupdate_handler);
+                    video.addEventListener('seeking', seeking_handler);
+                    this.recorded_arib_ttml_cancel = () => {
+                        video.removeEventListener('timeupdate', timeupdate_handler);
+                        video.removeEventListener('seeking', seeking_handler);
+                    };
+                    restore_arib_ttml();
+                };
+                this.recorded_arib_ttml_restart = restart_arib_ttml;
+                restart_arib_ttml();
             }
         }
 
@@ -1542,6 +1688,44 @@ class PlayerController {
 
 
     /**
+     * ARIB-TTML レンダラーを現在の video 要素へ接続する。
+     * 画質切り替えでは video 要素自体が作り直されるため、同じデコーダーを新しい要素へ付け直す。
+     */
+    private attachARIBTTMLRenderer(): void {
+        assert(this.player !== null);
+        const aribb24_options = this.player.options.pluginOptions.aribb24!;
+        if (this.arib_ttml_renderer === null) {
+            this.arib_ttml_renderer = new ARIBTTMLRenderer({
+                normal_font: aribb24_options.normalFont,
+                force_stroke_color: aribb24_options.forceStrokeColor,
+                force_background_color: aribb24_options.forceBackgroundColor,
+                show_superimpose: aribb24_options.disableSuperimposeRenderer !== true,
+                playback_mode: this.playback_mode === 'Live' ? 'Live' : 'Playback',
+                rom_sound_callback: aribb24_options.PRACallback,
+            });
+        }
+        (this.player.plugins as unknown as {aribTTML?: ARIBTTMLRenderer}).aribTTML = this.arib_ttml_renderer;
+        this.arib_ttml_renderer.attachMedia(this.player.video);
+        const is_caption_hidden = this.player.subtitle?.container.classList.contains('dplayer-subtitle-hide') ?? false;
+        if (is_caption_hidden) this.arib_ttml_renderer.hideCaption();
+        else this.arib_ttml_renderer.showCaption();
+        this.arib_ttml_renderer.setSuperimposeVisibility(aribb24_options.disableSuperimposeRenderer !== true);
+    }
+
+
+    /** 現在のライブ mpegts.js から共通 ARIB-TTML レンダラーへ timed-ID3 を渡す。 */
+    private attachLiveARIBTTMLStream(): void {
+        assert(this.player !== null);
+        const source = this.player.plugins.mpegts as unknown as typeof this.live_arib_ttml_source | undefined;
+        if (source === null || source === undefined || source === this.live_arib_ttml_source) return;
+        // 画質切り替え前の mpegts.js は DPlayer が既に破棄しているため off() は呼ばず、参照だけを更新する。
+        // 現在のインスタンスは PlayerController.destroy() で明示的に解除する。
+        this.live_arib_ttml_source = source;
+        source.on(mpegts.Events.TIMED_ID3_METADATA_ARRIVED, this.live_arib_ttml_handler);
+    }
+
+
+    /**
      * DPlayer に動画再生系のイベントハンドラーを登録する
      * 特にライブ視聴ではここで適切に再生状態の管理 (再生可能かどうか、エラーが発生していないかなど) を行う必要がある
      */
@@ -1634,7 +1818,9 @@ class PlayerController {
             // 画質切り替え時は DPlayer が内蔵字幕レンダラーを再生成するため、再度パッチ済み版へ差し替える。
             if (is_quality_change) {
                 this.replaceARIBB24Renderers();
+                this.attachARIBTTMLRenderer();
                 this.recorded_arib_subtitle_restart?.();
+                this.recorded_arib_ttml_restart?.();
             }
 
             // ローディング中の背景写真をランダムに変更
@@ -1650,6 +1836,10 @@ class PlayerController {
 
             // ライブ視聴時のみ
             if (this.playback_mode === 'Live') {
+
+                // DPlayer と aribb24.js が購読するものと同じ timed-ID3 event を、KonomiTV の
+                // ARIB-TTML 共通デコーダーにも並列で接続する。
+                this.attachLiveARIBTTMLStream();
 
                 // mpegts.js のエラーログハンドラーを登録
                 // 再生中に mpegts.js 内部でエラーが発生した際 (例: デバイスの通信が一時的に切断され、API からのストリーミングが途切れた際) に呼び出される
@@ -3648,7 +3838,27 @@ class PlayerController {
             this.recorded_arib_subtitle_cancel();
             this.recorded_arib_subtitle_cancel = null;
         }
+        if (this.recorded_arib_ttml_cancel !== null) {
+            this.recorded_arib_ttml_cancel();
+            this.recorded_arib_ttml_cancel = null;
+        }
         this.recorded_arib_subtitle_restart = null;
+        this.recorded_arib_ttml_restart = null;
+        if (
+            this.live_arib_ttml_source !== null &&
+            this.player?.plugins.mpegts === this.live_arib_ttml_source
+        ) {
+            this.live_arib_ttml_source.off(
+                mpegts.Events.TIMED_ID3_METADATA_ARRIVED,
+                this.live_arib_ttml_handler,
+            );
+        }
+        this.live_arib_ttml_source = null;
+        this.arib_ttml_renderer?.dispose();
+        this.arib_ttml_renderer = null;
+        if (this.player !== null) {
+            delete (this.player.plugins as unknown as {aribTTML?: ARIBTTMLRenderer}).aribTTML;
+        }
         this.live_media_info = null;
         window.clearTimeout(this.watched_history_threshold_timer_id);
         window.clearTimeout(this.player_control_ui_hide_timer_id);

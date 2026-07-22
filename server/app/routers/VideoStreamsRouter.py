@@ -464,6 +464,23 @@ async def RecordedSubtitleARIBAPI(
     return result
 
 
+@router.get('/{video_id}/subtitle/arib-ttml')
+async def RecordedSubtitleARIBTTMLAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    start_time: Annotated[float, Query(ge=0)],
+    end_time: Annotated[float, Query(gt=0)],
+):
+    """ライブと同じdecoderへ渡す録画ARIB-TTML timed ID3範囲を返す。"""
+
+    result = await RecordedSubtitleStream(recorded_program.recorded_video).getARIBTTMLRange(
+        start_time,
+        end_time,
+    )
+    if result is None:
+        raise HTTPException(status_code=422, detail='ARIB-TTML subtitle track was not found')
+    return result
+
+
 @router.get(
     '/{video_id}/{quality}/buffer',
     summary = '録画番組 HLS バッファ範囲 API',

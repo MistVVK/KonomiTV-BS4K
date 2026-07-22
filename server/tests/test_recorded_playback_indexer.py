@@ -13,6 +13,7 @@ from app.metadata.RecordedPlaybackIndex import (
     IsRecordedPlaybackIndexReady,
 )
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
+from app.utils.TSKeyFrameSeeker import ARIBTTMLStreamInfo
 
 
 def test_public_playback_index_state_exposes_stale_version() -> None:
@@ -264,6 +265,59 @@ def test_initial_probe_timeout_marks_index_failed(monkeypatch) -> None:
 
     assert result is False
     mark_failed.assert_awaited_once_with(16, 'ProbeTimeout')
+
+
+def test_initial_probe_requests_program_membership(monkeypatch) -> None:
+    """複数service TSの字幕を絞り込めるよう、実probeでprogram構成も取得する。"""
+
+    recorded_video = SimpleNamespace(
+        playback_index_status='Pending',
+        playback_index_version=None,
+        file_path='/recording.ts',
+        duration=120.0,
+        has_video=True,
+    )
+
+    async def GetRecordedVideo(**_kwargs):
+        return recorded_video
+
+    class FakeQuery:
+        async def update(self, **_kwargs) -> None:
+            return None
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            # probe引数の検証後は、不正JSONで後続の全編走査へ進ませない。
+            return b'invalid json', b''
+
+    command: tuple[str, ...] | None = None
+
+    async def CreateFakeProcess(*args, **_kwargs):
+        nonlocal command
+        command = args
+        return FakeProcess()
+
+    mark_failed = AsyncMock()
+    monkeypatch.setattr('app.metadata.RecordedPlaybackIndexer.RecordedVideo.get_or_none', GetRecordedVideo)
+    monkeypatch.setattr('app.metadata.RecordedPlaybackIndexer.RecordedVideo.filter', lambda **_kwargs: FakeQuery())
+    monkeypatch.setattr('app.metadata.RecordedPlaybackIndexer.Path.is_file', lambda _path: True)
+    monkeypatch.setattr('app.metadata.RecordedPlaybackIndexer.asyncio.create_subprocess_exec', CreateFakeProcess)
+    monkeypatch.setattr(
+        RecordedPlaybackIndexer,
+        '_RecordedPlaybackIndexer__markFailed',
+        mark_failed,
+    )
+
+    result = asyncio.run(
+        RecordedPlaybackIndexer._RecordedPlaybackIndexer__analyze(16, 0)  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert result is False
+    assert command is not None
+    assert command[command.index('-show_streams') + 1] == '-show_programs'
+    mark_failed.assert_awaited_once_with(16, 'ProbeFailed')
 
 
 def test_audio_timeline_keeps_pid_presence_and_applies_frame_configuration() -> None:
@@ -792,3 +846,42 @@ def test_subtitle_backfill_includes_probed_and_bin_data_arib_tracks(monkeypatch)
             'pid': 0x0138,
         },
     ]
+
+
+def test_subtitle_backfill_selects_dynamic_arib_ttml_track_from_recorded_program(monkeypatch) -> None:
+    """FFprobeにない途中追加PIDも対象programだけcomponent tag付きtrackとして補完する。"""
+
+    monkeypatch.setattr(
+        'app.metadata.RecordedPlaybackIndexer.TSKeyFrameSeeker.findARIBCaptionPIDs',
+        lambda _path: set(),
+    )
+    monkeypatch.setattr(
+        'app.metadata.RecordedPlaybackIndexer.TSKeyFrameSeeker.findARIBTTMLStreams',
+        lambda _path: [
+            ARIBTTMLStreamInfo(program_number=1, pid=0x0130, component_tag=0x30),
+            ARIBTTMLStreamInfo(program_number=2, pid=0x0230, component_tag=0x30),
+        ],
+    )
+    recorded_video = SimpleNamespace(subtitle_tracks=[], container_format='MPEG-TS')
+
+    tracks = RecordedPlaybackIndexer._RecordedPlaybackIndexer__backfillARIBSubtitleTracks(  # pyright: ignore[reportPrivateUsage]
+        recorded_video,
+        {
+            'streams': [{'index': 0, 'codec_type': 'video'}],
+            'programs': [{
+                'program_num': 2,
+                'streams': [{'index': 0}],
+            }],
+        },
+        Path('/recording.ts'),
+    )
+
+    assert tracks == [{
+        'index': 1,
+        'codec': 'arib_ttml',
+        'language': 'jpn',
+        'title': None,
+        'pid': 0x0230,
+        'component_tag': 0x30,
+        'program_number': 2,
+    }]

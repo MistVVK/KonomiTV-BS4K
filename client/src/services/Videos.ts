@@ -66,10 +66,13 @@ export interface IAudioTrackTimelineEntry {
 
 export interface ISubtitleTrack {
     index: number;
-    stream_index: number;
     codec: string;
     language: string | null;
     title: string | null;
+    stream_index?: number;
+    pid?: number;
+    component_tag?: number;
+    program_number?: number;
 }
 
 /** 録画ファイル情報を表すインターフェース */

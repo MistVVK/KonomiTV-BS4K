@@ -504,6 +504,7 @@ class RecordedPlaybackIndexer:
             '-v',
             'error',
             '-show_streams',
+            '-show_programs',
             '-show_format',
             '-of',
             'json',
@@ -951,11 +952,45 @@ class RecordedPlaybackIndexer:
         subtitle_tracks = [SubtitleTrack(**track) for track in recorded_video.subtitle_tracks]
         if recorded_video.container_format != 'MPEG-TS':
             return subtitle_tracks
+        selected_program_number: int | None = None
+        representative_stream = next((
+            stream for stream in probe.get('streams', [])
+            if stream.get('codec_type') == 'video' and stream.get('index') is not None
+        ), None) or next((
+            stream for stream in probe.get('streams', [])
+            if stream.get('codec_type') == 'audio' and stream.get('index') is not None
+        ), None)
+        if representative_stream is not None:
+            representative_stream_index = int(representative_stream['index'])
+            for program in probe.get('programs', []):
+                program_stream_indices = {
+                    int(stream['index'])
+                    for stream in program.get('streams', [])
+                    if stream.get('index') is not None
+                }
+                if representative_stream_index not in program_stream_indices:
+                    continue
+                raw_program_number = program.get('program_num')
+                if raw_program_number is None:
+                    raw_program_number = program.get('program_id')
+                if raw_program_number is not None:
+                    selected_program_number = int(raw_program_number)
+                break
+        if selected_program_number is not None:
+            # 旧索引がprogram識別を持たないTTML trackや別serviceのtrackを引き継がない。
+            subtitle_tracks = [
+                track for track in subtitle_tracks
+                if track['codec'].lower() != 'arib_ttml' or track.get('program_number') == selected_program_number
+            ]
         try:
             caption_pids = TSKeyFrameSeeker.findARIBCaptionPIDs(file_path)
         except (OSError, ValueError):
-            return subtitle_tracks
-        known_stream_indexes = {track['stream_index'] for track in subtitle_tracks}
+            caption_pids = set()
+        known_stream_indexes = {
+            stream_index
+            for track in subtitle_tracks
+            if (stream_index := track.get('stream_index')) is not None
+        }
         next_track_index = max((track['index'] for track in subtitle_tracks), default=0) + 1
         for stream in probe.get('streams', []):
             if stream.get('codec_type') != 'subtitle' or int(stream.get('index', -1)) in known_stream_indexes:
@@ -985,7 +1020,7 @@ class RecordedPlaybackIndexer:
                 pid = int(str(stream['id']), 0) if stream.get('id') is not None else None
             except ValueError:
                 pid = None
-            if pid not in caption_pids:
+            if pid is None or pid not in caption_pids:
                 continue
             tags = stream.get('tags') if isinstance(stream.get('tags'), dict) else {}
             stream_index = int(stream['index'])
@@ -998,6 +1033,58 @@ class RecordedPlaybackIndexer:
                 pid=pid,
             ))
             known_stream_indexes.add(stream_index)
+            next_track_index += 1
+
+        # ARIB-TTMLはmetadata streamとして記録されるため、通常のsubtitle/bin_data経路には
+        # 現れない。PMTのID3 metadata_descriptorと実PRIV ownerを確認し、既存Ready録画にも
+        # 論理字幕トラックとしてバックフィルする。途中追加PIDではstream_indexを省略できる。
+        try:
+            arib_ttml_streams = TSKeyFrameSeeker.findARIBTTMLStreams(file_path)
+        except (OSError, ValueError):
+            arib_ttml_streams = []
+        probe_data_streams_by_pid: dict[int, dict[str, Any]] = {}
+        for stream in probe.get('streams', []):
+            if stream.get('codec_type') != 'data':
+                continue
+            try:
+                pid = int(str(stream['id']), 0) if stream.get('id') is not None else None
+            except ValueError:
+                pid = None
+            if pid is not None:
+                probe_data_streams_by_pid[pid] = stream
+        known_arib_ttml_streams = {
+            (track.get('program_number'), track.get('pid'), track.get('component_tag'))
+            for track in subtitle_tracks
+            if track['codec'].lower() == 'arib_ttml'
+        }
+        for stream_info in arib_ttml_streams:
+            if (
+                selected_program_number is not None and
+                stream_info.program_number != selected_program_number
+            ):
+                continue
+            stream_key = (stream_info.program_number, stream_info.pid, stream_info.component_tag)
+            if stream_key in known_arib_ttml_streams or (None, stream_info.pid, stream_info.component_tag) in known_arib_ttml_streams:
+                continue
+            probe_stream = probe_data_streams_by_pid.get(stream_info.pid)
+            tags: dict[str, Any] = {}
+            if probe_stream is not None and isinstance(probe_stream.get('tags'), dict):
+                tags = probe_stream['tags']
+            subtitle_track = SubtitleTrack(
+                index=next_track_index,
+                codec='arib_ttml',
+                language=tags.get('language') or 'jpn',
+                title=tags.get('title'),
+                pid=stream_info.pid,
+                component_tag=stream_info.component_tag,
+                program_number=stream_info.program_number,
+            )
+            if probe_stream is not None:
+                stream_index = int(probe_stream['index'])
+                subtitle_track['stream_index'] = stream_index
+                known_stream_indexes.add(stream_index)
+            subtitle_tracks.append(subtitle_track)
+            known_arib_ttml_streams.add(stream_key)
             next_track_index += 1
         return subtitle_tracks
 

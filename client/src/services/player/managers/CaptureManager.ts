@@ -5,6 +5,8 @@ import * as Comlink from 'comlink';
 import { convertBlobToPng, copyBlobToClipboard } from 'copy-image-clipboard';
 import DPlayer from 'dplayer';
 
+import type ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
+
 import Captures from '@/services/Captures';
 import { ILiveChannelDefault } from '@/services/Channels';
 import PlayerManager from '@/services/player/PlayerManager';
@@ -192,12 +194,16 @@ class CaptureManager implements PlayerManager {
         // 字幕がプレイヤー上で表示されているかどうか
         // 字幕自体は存在するが表示されていない場合は false になる
         const aribb24_caption = this.player.plugins.aribb24Caption!;
-        const is_caption_showing = ((aribb24_caption as any).isShowing === true && aribb24_caption.isPresent());
+        const arib_ttml = (this.player.plugins as unknown as {aribTTML?: ARIBTTMLRenderer}).aribTTML;
+        const is_arib_ttml_caption_showing = arib_ttml?.isCaptionPresent() === true;
+        const is_caption_showing = is_arib_ttml_caption_showing ||
+            ((aribb24_caption as any).isShowing === true && aribb24_caption.isPresent());
 
         // 字幕がプレイヤー上で表示されている場合、表示中の字幕のテキストを取得
         // 取得した字幕のテキストは、キャプチャに字幕が合成されているかに関わらず、常に EXIF メタデータに書き込まれる
         // 字幕が表示されていない場合は null を入れ、キャプチャしたシーンで字幕が表示されていなかったことを明示する
-        const caption_text = is_caption_showing ? aribb24_caption.getTextContent() : null;
+        const caption_text = is_arib_ttml_caption_showing ? arib_ttml.getCaptionTextContent() :
+            is_caption_showing ? aribb24_caption.getTextContent() : null;
 
         // ライブ視聴: 現在視聴中のチャンネル情報・番組情報を EXIF メタデータに設定
         let capture_exif_data: ICaptureExifData;
@@ -355,14 +361,25 @@ class CaptureManager implements PlayerManager {
         // aribb24.js (文字スーパー) はビデオ視聴では常に無効なほか、ライブ視聴でも設定によっては無効になる
         const aribb24_superimpose = this.player.plugins.aribb24Superimpose ?? null;
 
+        // ARIB-TTML はライブと録画で共用するSVG描画層を、キャプチャ時だけ映像解像度のCanvasへ変換する。
+        const arib_ttml = (this.player.plugins as unknown as {aribTTML?: ARIBTTMLRenderer}).aribTTML;
+        const is_arib_ttml_caption_showing = arib_ttml?.isCaptionPresent() === true;
+        const is_arib_ttml_superimpose_showing = arib_ttml?.isSuperimposePresent() === true;
+
         // 字幕・文字スーパーの Canvas を取得
         // getRawCanvas() で映像と同じ解像度の Canvas が取得できる
-        const caption_canvas = aribb24_caption.getRawCanvas()!;
-        const superimpose_canvas = aribb24_superimpose?.getRawCanvas() ?? null;
+        const [arib_ttml_caption_canvas, arib_ttml_superimpose_canvas] = await Promise.all([
+            is_arib_ttml_caption_showing ? arib_ttml.createRawCanvas('Caption') : null,
+            is_arib_ttml_superimpose_showing ? arib_ttml.createRawCanvas('Superimpose') : null,
+        ]);
+        const caption_canvas = arib_ttml_caption_canvas ?? aribb24_caption.getRawCanvas();
+        const superimpose_canvas = arib_ttml_superimpose_canvas ?? aribb24_superimpose?.getRawCanvas() ?? null;
 
         // 字幕/文字スーパーが表示されているか
-        const is_caption_showing = ((aribb24_caption as any).isShowing === true && aribb24_caption.isPresent());
-        const is_superimpose_showing = (aribb24_superimpose && (aribb24_superimpose as any).isShowing === true && aribb24_superimpose.isPresent());
+        const is_caption_showing = caption_canvas !== null && (is_arib_ttml_caption_showing ||
+            ((aribb24_caption as any).isShowing === true && aribb24_caption.isPresent()));
+        const is_superimpose_showing = superimpose_canvas !== null && (is_arib_ttml_superimpose_showing ||
+            (aribb24_superimpose && (aribb24_superimpose as any).isShowing === true && aribb24_superimpose.isPresent()));
 
         // ***** キャプチャの実行・字幕/文字スーパー/コメントを合成 *****
 
@@ -371,7 +388,7 @@ class CaptureManager implements PlayerManager {
             // 現在再生中の動画のキャプチャを ImageBitmap として取得
             createImageBitmap(this.player.video),
             // 字幕が表示されていれば、字幕の Canvas を ImageBitmap として取得
-            is_caption_showing ? createImageBitmap(caption_canvas) : null,
+            is_caption_showing ? createImageBitmap(caption_canvas!) : null,
             // 文字スーパーが表示されていれば、文字スーパーの Canvas を ImageBitmap として取得
             is_superimpose_showing ? createImageBitmap(superimpose_canvas!) : null,
         ]);

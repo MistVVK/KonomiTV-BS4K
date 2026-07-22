@@ -369,6 +369,7 @@ class MetadataAnalyzer:
         sample_probe_video_streams = sample_probe.getVideoStreams()
         sample_probe_audio_streams = sample_probe.getAudioStreams()
         selected_program_stream_indices: set[int] | None = None
+        selected_program_number: int | None = None
         # MPEG-TS に複数サービスが含まれる場合、代表映像（映像がなければ代表音声）と同じ program だけを採用する
         ## 他サービスの音声を HLS 代替音声として誤登録しないため、FFprobe の program.streams を利用する
         if full_probe.format.format_name == 'mpegts' and (sample_probe_video_streams or sample_probe_audio_streams):
@@ -379,6 +380,9 @@ class MetadataAnalyzer:
                 }
                 if representative_stream_index in program_stream_indices:
                     selected_program_stream_indices = program_stream_indices
+                    selected_program_number = (
+                        program.program_num if program.program_num is not None else program.program_id
+                    )
                     break
             if selected_program_stream_indices is not None:
                 full_probe_video_streams = [
@@ -562,7 +566,11 @@ class MetadataAnalyzer:
                 arib_caption_pids = TSKeyFrameSeeker.findARIBCaptionPIDs(self.recorded_file_path)
             except (OSError, ValueError):
                 arib_caption_pids = set()
-            known_subtitle_stream_indexes = {track['stream_index'] for track in subtitle_tracks}
+            known_subtitle_stream_indexes = {
+                stream_index
+                for track in subtitle_tracks
+                if (stream_index := track.get('stream_index')) is not None
+            }
             for data_stream in full_probe.streams:
                 if not isinstance(data_stream, FFprobeOtherStream) or data_stream.codec_type != 'data':
                     continue
@@ -584,6 +592,62 @@ class MetadataAnalyzer:
                     'title': data_stream.tags.get('title'),
                     'pid': data_pid,
                 })
+
+            # ISDB-S3由来のARIB-TTMLは、dantto4kが元MFUをtimed ID3としてTSへ保持する。
+            # FFprobeのcodec_nameだけでは別用途のID3と区別できないため、複数位置のPMT記述子と
+            # 実PES内の ``arib-ttml.js`` PRIV ownerを両方確認したstreamだけを登録する。
+            try:
+                arib_ttml_streams = TSKeyFrameSeeker.findARIBTTMLStreams(self.recorded_file_path)
+            except (OSError, ValueError):
+                arib_ttml_streams = []
+            timed_id3_streams_by_pid: dict[int, FFprobeOtherStream] = {}
+            for data_stream in full_probe.streams:
+                if not isinstance(data_stream, FFprobeOtherStream) or data_stream.codec_type != 'data':
+                    continue
+                try:
+                    data_pid = int(str(data_stream.id), 0) if data_stream.id is not None else None
+                except ValueError:
+                    data_pid = None
+                if data_pid is not None:
+                    timed_id3_streams_by_pid[data_pid] = data_stream
+            known_arib_ttml_streams = {
+                (track.get('program_number'), track.get('pid'), track.get('component_tag'))
+                for track in subtitle_tracks
+                if track['codec'].lower() == 'arib_ttml'
+            }
+            for stream_info in arib_ttml_streams:
+                if (
+                    selected_program_number is not None and
+                    stream_info.program_number != selected_program_number
+                ):
+                    continue
+                stream_key = (stream_info.program_number, stream_info.pid, stream_info.component_tag)
+                if (
+                    stream_key in known_arib_ttml_streams or
+                    (None, stream_info.pid, stream_info.component_tag) in known_arib_ttml_streams
+                ):
+                    continue
+                data_stream = timed_id3_streams_by_pid.get(stream_info.pid)
+                if (
+                    selected_program_stream_indices is not None and data_stream is not None and
+                    data_stream.index not in selected_program_stream_indices
+                ):
+                    continue
+                subtitle_track: schemas.SubtitleTrack = {
+                    'index': len(subtitle_tracks) + 1,
+                    'codec': 'arib_ttml',
+                    'language': data_stream.tags.get('language') if data_stream is not None else 'jpn',
+                    'title': data_stream.tags.get('title') if data_stream is not None else None,
+                    'pid': stream_info.pid,
+                    'component_tag': stream_info.component_tag,
+                    'program_number': stream_info.program_number,
+                }
+                # 動的PMTで録画途中に追加されたPIDは先頭FFprobeのstream一覧に現れない。
+                # 録画side-channelはPIDで直接索引化するため、その場合は架空のstream indexを作らない。
+                if data_stream is not None:
+                    subtitle_track['stream_index'] = data_stream.index
+                subtitle_tracks.append(subtitle_track)
+                known_arib_ttml_streams.add(stream_key)
 
         has_video = video_codec is not None
         has_audio = primary_audio_codec is not None

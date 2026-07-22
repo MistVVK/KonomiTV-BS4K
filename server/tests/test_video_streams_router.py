@@ -13,7 +13,11 @@ from app.routers.VideosRouter import (
     BuildRecordedPlaybackIndex,
     VideoPlaybackIndexCreateAPI,
 )
-from app.routers.VideoStreamsRouter import EnsurePlaybackIndexReady, GetRecordedStream
+from app.routers.VideoStreamsRouter import (
+    EnsurePlaybackIndexReady,
+    GetRecordedStream,
+    RecordedSubtitleARIBTTMLAPI,
+)
 from app.streams.RecordedEncodingCodecs import AudioCodec
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
 from app.streams.StreamEncodingOptions import StreamEncodingOptions
@@ -178,6 +182,40 @@ def test_recorded_playback_index_response_contains_stale_and_current_version() -
     assert index.current_version == RECORDED_PLAYBACK_INDEX_VERSION
     assert index.progress == 0.0
     assert index.stage == 'Queued'
+
+
+def test_recorded_arib_ttml_api_returns_session_independent_timed_id3_range(monkeypatch) -> None:
+    """録画字幕APIが再生sessionに依存せず、共通decoder向けraw ID3範囲を返す。"""
+
+    expected = {
+        'start_time': 4.0,
+        'end_time': 10.0,
+        'restore_packets': [],
+        'packets': [{
+            'pts': 5.0,
+            'transport_timestamp': 95.0,
+            'component_tag': 0x30,
+            'data': 'SUQz',
+            'is_restore_point': False,
+        }],
+    }
+    calls: list[tuple[object, float, float]] = []
+
+    async def GetARIBTTMLRange(stream, start_time: float, end_time: float):
+        calls.append((stream.recorded_video, start_time, end_time))
+        return expected
+
+    monkeypatch.setattr(
+        'app.routers.VideoStreamsRouter.RecordedSubtitleStream.getARIBTTMLRange',
+        GetARIBTTMLRange,
+    )
+    recorded_video = SimpleNamespace(id=61)
+    recorded_program = SimpleNamespace(recorded_video=recorded_video)
+
+    result = asyncio.run(RecordedSubtitleARIBTTMLAPI(recorded_program, 4.0, 10.0))
+
+    assert result == expected
+    assert calls == [(recorded_video, 4.0, 10.0)]
 
 
 def test_metadata_analysis_blocks_index_enqueue(monkeypatch) -> None:

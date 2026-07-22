@@ -174,11 +174,13 @@ class AudioTrackTimelineEntry(TypedDict):
 
 class SubtitleTrack(TypedDict):
     index: int
-    stream_index: int
     codec: str
     language: str | None
     title: str | None
+    stream_index: NotRequired[int]
     pid: NotRequired[int]
+    component_tag: NotRequired[int]
+    program_number: NotRequired[int]
 
 class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -43,6 +44,15 @@ class TSStreamInfo:
     pcr_pid: int
     codec: Literal['MPEG-2', 'H.264', 'H.265']
     packet_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class ARIBTTMLStreamInfo:
+    """ARIB-TTML timed ID3を運ぶMPEG-TS elementary stream。"""
+
+    program_number: int
+    pid: int
+    component_tag: int
 
 
 class TSKeyFrameCollector:
@@ -292,6 +302,239 @@ class TSKeyFrameSeeker:
                         ):
                             caption_candidates.add(elementary_pid)
         return caption_pids
+
+
+    @staticmethod
+    def getARIBTTMLComponentTag(
+        stream_type: int,
+        descriptors: Sequence[tuple[int, bytes | bytearray | memoryview]],
+    ) -> int | None:
+        """PMTの記述子からARIB-TTML timed ID3のcomponent tagを返す。
+
+        Args:
+            stream_type: PMTに記録されたstream_type。
+            descriptors: biimが展開したES descriptorの一覧。
+
+        Returns:
+            字幕0x30..0x37または文字スーパー0x38..0x3F。対象外ならNone。
+        """
+
+        # dantto4k / tsreadex が出力するARIB-TTMLは、ISO/IEC 13818-1のmetadata streamと、
+        # application/metadata formatの双方が ``ID3 `` のmetadata_descriptorで識別する。
+        # stream_identifier_descriptorだけを見ると別用途のtimed ID3まで字幕として登録してしまう。
+        if stream_type != 0x15:
+            return None
+        component_tag: int | None = None
+        has_id3_metadata_descriptor = False
+        for descriptor_tag, payload in descriptors:
+            if descriptor_tag == 0x52 and len(payload) >= 1 and 0x30 <= payload[0] <= 0x3F:
+                component_tag = payload[0]
+            elif (
+                descriptor_tag == 0x26 and len(payload) >= 13 and
+                payload[0:2] == b'\xFF\xFF' and payload[2:6] == b'ID3 ' and
+                payload[6] == 0xFF and payload[7:11] == b'ID3 '
+            ):
+                has_id3_metadata_descriptor = True
+        return component_tag if has_id3_metadata_descriptor is True else None
+
+
+    @staticmethod
+    def getARIBTTMLTimedID3ComponentTag(data: bytes) -> int | None:
+        """ID3v2.4 PRIVからKonomiTV用ARIB-TTML envelopeのcomponent tagを返す。
+
+        Args:
+            data: PES payloadとして運ばれたID3 tag列。
+
+        Returns:
+            ownerとenvelopeが正しい字幕0x30..0x37または文字スーパー0x38..0x3F。対象外ならNone。
+        """
+
+        def DecodeSynchsafe(value: bytes) -> int | None:
+            """4 byte synchsafe integerを検証して展開する。"""
+
+            if len(value) != 4 or any(byte & 0x80 for byte in value):
+                return None
+            return (value[0] << 21) | (value[1] << 14) | (value[2] << 7) | value[3]
+
+        tag_offset = 0
+        while tag_offset + 10 <= len(data):
+            if data[tag_offset:tag_offset + 3] != b'ID3' or data[tag_offset + 3] != 4:
+                return None
+            tag_size = DecodeSynchsafe(data[tag_offset + 6:tag_offset + 10])
+            if tag_size is None:
+                return None
+            frame_offset = tag_offset + 10
+            tag_end = frame_offset + tag_size
+            if tag_end > len(data):
+                return None
+            while frame_offset + 10 <= tag_end:
+                frame_id = data[frame_offset:frame_offset + 4]
+                if frame_id == b'\x00\x00\x00\x00':
+                    break
+                frame_size = DecodeSynchsafe(data[frame_offset + 4:frame_offset + 8])
+                if frame_size is None:
+                    return None
+                payload_offset = frame_offset + 10
+                frame_end = payload_offset + frame_size
+                if frame_end > tag_end:
+                    return None
+                if frame_id == b'PRIV':
+                    owner_end = data.find(b'\x00', payload_offset, frame_end)
+                    if owner_end >= 0 and data[payload_offset:owner_end] == b'arib-ttml.js':
+                        envelope_offset = owner_end + 1
+                        # 独自外装v1は変換前source PTSを持たない20 byte header、v2は
+                        # 末尾にsource PTSを追加した28 byte header。録画資産の互換性のため両方を受理する。
+                        envelope_header_length: int | None = None
+                        if envelope_offset < frame_end:
+                            envelope_header_length = {1: 20, 2: 28}.get(data[envelope_offset])
+                        if (
+                            envelope_header_length is not None and
+                            envelope_offset + envelope_header_length <= frame_end and
+                            0x30 <= data[envelope_offset + 1] <= 0x3F
+                        ):
+                            return data[envelope_offset + 1]
+                frame_offset = frame_end
+            # dantto4kは1 PESへ1 ID3 tagを格納するが、連結tagも同じ規則で検査する。
+            tag_offset = tag_end + (10 if data[tag_offset + 5] & 0x10 else 0)
+        return None
+
+
+    @staticmethod
+    def findARIBTTMLStreams(
+        path: Path,
+        sample_count: int = 5,
+        max_scan_bytes_per_sample: int = 8 * 1024 * 1024,
+    ) -> list[ARIBTTMLStreamInfo]:
+        """録画内の複数位置からARIB-TTML timed ID3 PIDとcomponent tagを列挙する。
+
+        Args:
+            path: TSコンテナの録画ファイルパス。
+            sample_count: 先頭から末尾までに設ける探索窓の数。
+            max_scan_bytes_per_sample: 各探索窓で読み込む最大バイト数。
+
+        Returns:
+            PMT記述子と実ID3 PRIV ownerの双方を確認できたstream一覧。
+        """
+
+        packet_size = TSKeyFrameSeeker.__detectPacketSize(path)
+        file_size = path.stat().st_size
+        if sample_count <= 1:
+            sample_offsets = [0]
+        else:
+            max_start = max(0, file_size - max_scan_bytes_per_sample)
+            sample_offsets = [
+                int(max_start * index / (sample_count - 1))
+                for index in range(sample_count)
+            ]
+        # 短い録画では複数の割合位置が同じpacketへ丸められるため、同じ窓を再走査しない。
+        aligned_offsets = sorted({max(0, (offset // packet_size) * packet_size) for offset in sample_offsets})
+        candidates: dict[int, set[tuple[int, int]]] = {}
+        verified: set[tuple[int, int, int]] = set()
+        with path.open('rb') as file:
+            for aligned_offset in aligned_offsets:
+                file.seek(aligned_offset)
+                pat_parser = SectionParser(PATSection)
+                pmt_parsers: dict[int, SectionParser[PMTSection]] = {}
+                pmt_program_numbers: dict[int, int] = {}
+                pes_parsers: dict[int, PESParser[PES]] = {}
+                max_packet_count = max(1, max_scan_bytes_per_sample // packet_size)
+                for _ in range(max_packet_count):
+                    packet = TSKeyFrameSeeker.normalizePacket(file.read(packet_size), packet_size)
+                    if packet is None:
+                        break
+                    packet_pid = ts.pid(packet)
+                    if packet_pid == 0x00:
+                        pat_parser.push(packet)
+                        for pat in pat_parser:
+                            if pat.CRC32() != 0:
+                                continue
+                            for program_number, pmt_pid in pat:
+                                if program_number != 0:
+                                    pmt_parsers.setdefault(pmt_pid, SectionParser(PMTSection))
+                                    pmt_program_numbers[pmt_pid] = program_number
+                        continue
+                    pmt_parser = pmt_parsers.get(packet_pid)
+                    if pmt_parser is not None:
+                        pmt_parser.push(packet)
+                        for pmt in pmt_parser:
+                            if pmt.CRC32() != 0:
+                                continue
+                            for stream_type, elementary_pid, descriptors in pmt:
+                                component_tag = TSKeyFrameSeeker.getARIBTTMLComponentTag(stream_type, descriptors)
+                                if component_tag is None:
+                                    continue
+                                program_number = pmt_program_numbers.get(packet_pid)
+                                if program_number is None:
+                                    continue
+                                candidates.setdefault(elementary_pid, set()).add((program_number, component_tag))
+                                pes_parsers.setdefault(elementary_pid, PESParser(PES))
+                        continue
+                    if packet_pid not in candidates:
+                        continue
+                    parser = pes_parsers.setdefault(packet_pid, PESParser(PES))
+                    try:
+                        parser.push(packet)
+                    except (IndexError, ValueError):
+                        pes_parsers[packet_pid] = PESParser(PES)
+                        continue
+                    for pes in parser:
+                        component_tag = TSKeyFrameSeeker.getARIBTTMLTimedID3ComponentTag(
+                            bytes(pes.PES_packet_data()),
+                        )
+                        if component_tag is None:
+                            continue
+                        for program_number, candidate_tag in candidates[packet_pid]:
+                            if component_tag == candidate_tag:
+                                verified.add((program_number, packet_pid, component_tag))
+
+        # PMTは短いsample窓でもほぼ確実に得られる一方、実際の字幕ID3は台詞のない区間では
+        # 長時間現れない。descriptor候補があるのにownerを一つも確認できない場合だけ、録画先頭から
+        # 構造化されたPRIV markerを探して取りこぼしを防ぐ。通常のISDB-T/S録画は全走査しない。
+        remaining = {
+            (program_number, elementary_pid, component_tag)
+            for elementary_pid, program_components in candidates.items()
+            for program_number, component_tag in program_components
+            if (program_number, elementary_pid, component_tag) not in verified
+        }
+        if len(verified) == 0 and len(remaining) > 0:
+            # version byteは、source PTSなしのv1とsource PTSありのv2を恒久的に受理する。
+            marker = b'arib-ttml.js\x00'
+            chunk_size = packet_size * 32_768
+            with path.open('rb') as file:
+                while len(verified) == 0 and (chunk := file.read(chunk_size)):
+                    marker_offset = chunk.find(marker)
+                    while marker_offset >= 0:
+                        version_offset = marker_offset + len(marker)
+                        component_offset = version_offset + 1
+                        envelope_header_length: int | None = None
+                        if version_offset < len(chunk):
+                            envelope_header_length = {1: 20, 2: 28}.get(chunk[version_offset])
+                        id3_offset = marker_offset - 20
+                        packet_start = (marker_offset // packet_size) * packet_size
+                        packet_offset = packet_start + (4 if packet_size == 192 else 0)
+                        if (
+                            component_offset < len(chunk) and id3_offset >= packet_offset + 4 and
+                            envelope_header_length is not None and
+                            version_offset + envelope_header_length <= len(chunk) and
+                            chunk[packet_offset] == 0x47 and
+                            chunk[id3_offset:id3_offset + 6] == b'ID3\x04\x00\x00' and
+                            chunk[marker_offset - 10:marker_offset - 6] == b'PRIV' and
+                            chunk[marker_offset - 2:marker_offset] == b'\x00\x00'
+                        ):
+                            packet_pid = ((chunk[packet_offset + 1] & 0x1F) << 8) | chunk[packet_offset + 2]
+                            component_tag = chunk[component_offset]
+                            matching_streams = {
+                                stream for stream in remaining
+                                if stream[1] == packet_pid and stream[2] == component_tag
+                            }
+                            if len(matching_streams) > 0:
+                                verified.update(matching_streams)
+                                break
+                        marker_offset = chunk.find(marker, marker_offset + 1)
+        return [
+            ARIBTTMLStreamInfo(program_number=program_number, pid=pid, component_tag=component_tag)
+            for program_number, pid, component_tag in sorted(verified, key=lambda item: (item[2], item[0], item[1]))
+        ]
 
 
     @staticmethod

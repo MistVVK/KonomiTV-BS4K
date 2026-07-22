@@ -23,6 +23,10 @@
                     <div class="video-info__item-value">{{Utils.formatBytes(program.recorded_video.file_size)}}</div>
                 </div>
                 <div class="video-info__item">
+                    <div class="video-info__item-label">字幕</div>
+                    <div class="video-info__item-value">{{formatSubtitleInfo()}}</div>
+                </div>
+                <div class="video-info__item">
                     <div class="video-info__item-label">録画期間</div>
                     <div class="video-info__item-value">
                         {{ProgramUtils.getRecordingTime(program)}}
@@ -230,6 +234,21 @@ const formatPlaybackIndexState = (state: IRecordedProgram['recorded_video']['pla
         Stale: '更新が必要',
         Failed: '解析失敗',
     }[state];
+};
+
+/** ARIB字幕トラックの有無と形式を表示する。 */
+const formatSubtitleInfo = (): string => {
+    const tracks = props.program.recorded_video.subtitle_tracks;
+    const has_b24 = tracks.some((track) => track.codec.toLowerCase() === 'arib_caption');
+    const has_ttml = tracks.some((track) =>
+        track.codec.toLowerCase() === 'arib_ttml' &&
+        track.component_tag !== undefined &&
+        track.component_tag >= 0x30 && track.component_tag <= 0x37,
+    );
+    const formats: string[] = [];
+    if (has_b24) formats.push('B24');
+    if (has_ttml) formats.push('TTML');
+    return formats.length > 0 ? `あり（${formats.join('/')}）` : 'なし';
 };
 
 /** CM区間数とは独立した専用解析状態を利用者向けの表示へ変換する。 */
