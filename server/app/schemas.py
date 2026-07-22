@@ -227,7 +227,7 @@ class RecordedVideo(PydanticModel):
     ] | None = None
     cm_analysis_error_code: str | None = None
     cm_analysis_finished_at: datetime | None = None
-    cm_result_source: Literal['Existing', 'Generated', 'LegacyImported'] | None = None
+    cm_result_source: Literal['Existing', 'Generated', 'LegacyImported', 'Manual'] | None = None
     cm_result_verified: bool | None = None
     cm_result_chapter_path_kind: Literal['Canonical', 'Legacy'] | None = None
     cm_result_pipeline_version: str | None = None

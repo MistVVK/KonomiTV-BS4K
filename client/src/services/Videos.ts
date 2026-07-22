@@ -120,7 +120,7 @@ export interface IRecordedVideo {
     cm_analysis_status: 'Pending' | 'Analyzing' | 'Completed' | 'Failed' | 'Unsupported' | 'Excluded' | 'Interrupted' | null;
     cm_analysis_error_code: string | null;
     cm_analysis_finished_at: string | null;
-    cm_result_source: 'Existing' | 'Generated' | 'LegacyImported' | null;
+    cm_result_source: 'Existing' | 'Generated' | 'LegacyImported' | 'Manual' | null;
     cm_result_verified: boolean | null;
     cm_result_chapter_path_kind: 'Canonical' | 'Legacy' | null;
     cm_result_pipeline_version: string | null;

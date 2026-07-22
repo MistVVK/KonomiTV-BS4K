@@ -181,6 +181,10 @@ class CMAnalysisTaskManager:
             # CMDetectionのCompletedがここへ来るのは、既存chapterを保持して実解析前に返った場合だけ。
             # 実解析まで進んだ場合は同じhandleがOrchestrator内ですでに終端化される。
             if intent == 'CMDetection':
+                if state.chapter_source == 'Generated':
+                    return 'Skipped', 'GeneratedChapterKept'
+                if state.chapter_path_kind == 'Canonical':
+                    return 'Skipped', 'ExternalCanonicalChapterProtected'
                 return 'Skipped', 'ExistingChapterKept'
             if state.chapter_source == 'Generated':
                 return 'Succeeded', None

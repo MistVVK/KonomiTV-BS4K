@@ -10,10 +10,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.metadata.CMAnalysisOrchestrator import CMAnalysisIntent, CMAnalysisOrchestrator
+from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalyzer import CMInputDescriptor
-from app.metadata.CMChapterFile import CMChapterPathKind, CMChapterReadResult
 from app.metadata.CMLogoSelector import CMLogoSelection
+from app.metadata.KonomiTVChapterFile import (
+    KonomiTVChapterProvenance,
+    KonomiTVChapterReadResult,
+    KonomiTVChapterRecording,
+)
 from app.models.CMAnalysis import CMLogo, RecordedVideoCMAnalysis
 from app.schemas import AudioTrackTimelineEntry
 from app.streams.RecordedPlaybackCapabilities import RecordedPlaybackBackend
@@ -222,52 +226,66 @@ def test_generated_result_requires_matching_chapter_hash() -> None:
     assert CMAnalysisOrchestrator._sameChapterFingerprint(None, {'sha256': 'new'}) is False
 
 
-@pytest.mark.parametrize(
-    ('intent', 'path_kind', 'generated_identity', 'expected'),
-    [
-        ('CMRegeneration', 'Legacy', False, False),
-        ('CMRegeneration', 'Canonical', False, True),
-        ('CMDetection', 'Legacy', False, True),
-        ('DetectCM', 'Legacy', False, True),
-        ('CMChapterSync', 'Legacy', False, True),
-        ('CMRegeneration', 'Legacy', True, False),
-    ],
-)
-def test_explicit_regeneration_can_analyze_alongside_unowned_legacy_chapter(
-    intent: CMAnalysisIntent,
-    path_kind: CMChapterPathKind,
-    generated_identity: bool,
-    expected: bool,
-) -> None:
-    """明示再判定だけlegacyを迂回し、外部canonicalと自動同期は保護する。"""
+def test_generated_yaml_requires_verified_provenance_and_current_recording_input() -> None:
+    """Generated YAMLは検証済み出自と現在の録画fingerprintが揃った場合だけ自前生成とみなす。"""
 
-    assert CMAnalysisOrchestrator._shouldPublishExistingChapterWithoutAnalysis(
-        intent,
-        path_kind,
-        generated_identity,
-    ) is expected
+    recording = KonomiTVChapterRecording(
+        duration_ms=60_000,
+        size=100,
+        mtime_ns=200,
+        sample_sha256='a' * 64,
+    )
+    generated = KonomiTVChapterReadResult(
+        'ValidNoCM',
+        (),
+        {'exists': True, 'sha256': 'b' * 64},
+        KonomiTVChapterProvenance(
+            source='Generated',
+            generator_present=True,
+            generator_consistent=True,
+            generator=None,
+            recording=recording,
+        ),
+    )
+    current_input = {'size': 100, 'mtime_ns': 200, 'sample_sha256': 'a' * 64}
+
+    assert CMAnalysisOrchestrator._isGeneratedChapterForInput(generated, current_input) is True
+    for key, changed_value in (
+        ('size', 101),
+        ('mtime_ns', 201),
+        ('sample_sha256', 'c' * 64),
+    ):
+        changed_input = {**current_input, key: changed_value}
+        assert CMAnalysisOrchestrator._isGeneratedChapterForInput(generated, changed_input) is False
+    assert CMAnalysisOrchestrator._isGeneratedChapterForInput(generated, {'size': 100}) is False
 
 
-def test_pending_generated_content_can_recover_after_file_db_commit_gap() -> None:
+def test_manual_yaml_is_never_treated_as_generated_for_current_input() -> None:
+    """生成情報を持たない手書きYAMLは上書き対象にしない。"""
+
+    manual = KonomiTVChapterReadResult(
+        'ValidNoCM',
+        (),
+        {'exists': True, 'sha256': 'b' * 64},
+        KonomiTVChapterProvenance(
+            source='Manual',
+            generator_present=False,
+            generator_consistent=None,
+            generator=None,
+            recording=None,
+        ),
+    )
+
+    assert CMAnalysisOrchestrator._isGeneratedChapterForInput(
+        manual,
+        {'size': 100, 'mtime_ns': 200, 'sample_sha256': 'a' * 64},
+    ) is False
+
+
+def test_pending_generated_marker_and_commit_failure_recovery_contract() -> None:
     pending = {'exists': True, 'size': 100, 'sha256': 'generated'}
-    committed = {
-        'exists': True,
-        'size': 100,
-        'mtime_ns': 200,
-        'device': 1,
-        'inode': 10,
-        'sha256': 'generated',
-    }
-
-    assert CMAnalysisOrchestrator._samePendingChapterContent(pending, committed) is True
-    assert CMAnalysisOrchestrator._samePendingChapterContent(pending, {**committed, 'sha256': 'external'}) is False
-    assert CMAnalysisOrchestrator._samePendingChapterContent(committed, committed) is False
     assert CMAnalysisOrchestrator._isPendingMarkerFingerprint(pending) is True
-    assert CMAnalysisOrchestrator._isPendingMarkerFingerprint(committed) is False
-    saved_input = {'size': 1, 'mtime_ns': 2, 'sample_sha256': 'input-a'}
-    current_input = {'size': 1, 'mtime_ns': 3, 'sample_sha256': 'input-b'}
-    assert CMAnalysisOrchestrator._sameInputFingerprint(saved_input, dict(saved_input)) is True
-    assert CMAnalysisOrchestrator._sameInputFingerprint(saved_input, current_input) is False
+    assert CMAnalysisOrchestrator._isPendingMarkerFingerprint({**pending, 'mtime_ns': 200}) is False
 
     assert CMAnalysisOrchestrator._isRecoverablePendingState(
         RecordedVideoCMAnalysis(status='Failed', error_code='ChapterCommitFailed')
@@ -304,7 +322,7 @@ def test_commit_executor_future_is_joined_before_cancellation_is_propagated() ->
         # run_in_executor() と同じ concurrent Future -> asyncio Future の橋渡しだけを再現する。
         # このホストの Python は default ThreadPoolExecutor の終了が不能なため、実スレッドを
         # 起動すると helper の成否に関係なく asyncio.run() の shutdown でテストが停止する。
-        worker_future: Future[CMChapterReadResult] = Future()
+        worker_future: Future[KonomiTVChapterReadResult] = Future()
         commit_future = asyncio.wrap_future(worker_future)
         waiter = asyncio.create_task(CMAnalysisOrchestrator._awaitCommitFuture(commit_future))
         # helper が最初の wait へ入ってからキャンセルし、本番の commit 中断を再現する。
@@ -314,7 +332,7 @@ def test_commit_executor_future_is_joined_before_cancellation_is_propagated() ->
         assert waiter.done() is False
         assert commit_future.cancelled() is False
         assert worker_future.cancelled() is False
-        worker_future.set_result(CMChapterReadResult('Missing', (), {'exists': False}))
+        worker_future.set_result(KonomiTVChapterReadResult('Missing', (), {'exists': False}, None))
         result, cancellation_requested = await waiter
         assert result.status == 'Missing'
         assert cancellation_requested is True

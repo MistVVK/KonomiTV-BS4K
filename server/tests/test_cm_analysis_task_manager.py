@@ -82,13 +82,27 @@ class FakeAnalysisTaskHandle:
 @pytest.mark.parametrize(
     ('state', 'intent', 'expected'),
     [
-        (RecordedVideoCMAnalysis(status='Completed', chapter_source='Generated'), 'CMRegeneration', ('Succeeded', None)),
-        (
-            RecordedVideoCMAnalysis(status='Completed', chapter_source='Generated'),
-            'CMDetection',
-            ('Skipped', 'ExistingChapterKept'),
+        pytest.param(
+            RecordedVideoCMAnalysis(
+                status='Completed',
+                chapter_source='Generated',
+                chapter_path_kind='Canonical',
+            ),
+            'CMRegeneration',
+            ('Succeeded', None),
+            id='generated-yaml-regeneration',
         ),
-        (
+        pytest.param(
+            RecordedVideoCMAnalysis(
+                status='Completed',
+                chapter_source='Generated',
+                chapter_path_kind='Canonical',
+            ),
+            'CMDetection',
+            ('Skipped', 'GeneratedChapterKept'),
+            id='generated-yaml-detection-keeps-generated',
+        ),
+        pytest.param(
             RecordedVideoCMAnalysis(
                 status='Completed',
                 chapter_source='Existing',
@@ -96,11 +110,23 @@ class FakeAnalysisTaskHandle:
             ),
             'CMRegeneration',
             ('Skipped', 'ExternalCanonicalChapterProtected'),
+            id='manual-yaml-regeneration-is-protected',
         ),
-        (
+        pytest.param(
+            RecordedVideoCMAnalysis(
+                status='Completed',
+                chapter_source='Existing',
+                chapter_path_kind='Canonical',
+            ),
+            'CMDetection',
+            ('Skipped', 'ExternalCanonicalChapterProtected'),
+            id='manual-yaml-detection-is-protected',
+        ),
+        pytest.param(
             RecordedVideoCMAnalysis(status='Completed', chapter_source='Existing', chapter_path_kind='Legacy'),
             'CMDetection',
             ('Skipped', 'ExistingChapterKept'),
+            id='basic-name-text-detection-keeps-existing',
         ),
         (
             RecordedVideoCMAnalysis(status='Pending', error_code='CMAnalysisDisabled'),

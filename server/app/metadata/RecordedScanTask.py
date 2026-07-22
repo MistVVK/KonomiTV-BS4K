@@ -27,6 +27,7 @@ from app.metadata.CMChapterFile import (
     GetRecordedPathFromCMChapterPath,
     SelectRecordedPathForCMChapter,
 )
+from app.metadata.KonomiTVChapterFile import GetRecordedPathFromKonomiTVChapterPath
 from app.metadata.MetadataAnalyzer import MetadataAnalyzer
 from app.metadata.RecordedAnalysisPlan import (
     AnalysisRequest,
@@ -1535,7 +1536,7 @@ class RecordedScanTask:
                         continue
                     # chapterイベントは通常の録画拡張子フィルターより先に元録画へ関連付ける。
                     # 削除イベントでは実体が存在しないため、イベント種別を問わずファイル名から逆引きする。
-                    if canonical_path.name.lower().endswith('.chapter.txt'):
+                    if canonical_path.name.lower().endswith(('.chapter.txt', '.konomitv-chapters.yaml')):
                         try:
                             await self.__handleChapterFileChange(canonical_path)
                         except Exception as ex:
@@ -1578,6 +1579,29 @@ class RecordedScanTask:
             None
         """
 
+        # KonomiTV YAMLは録画ファイル名を拡張子ごと保持するため、基本名を推測せず完全一致で対応付ける。
+        recorded_path = GetRecordedPathFromKonomiTVChapterPath(
+            pathlib.Path(str(chapter_file_path)),
+            set(self.SCAN_TARGET_EXTENSIONS),
+        )
+        if recorded_path is not None:
+            recorded_video = await RecordedVideo.get_or_none(file_path=str(recorded_path))
+            if recorded_video is None:
+                # 元録画がシンボリックリンクの場合も、解決後の完全パスだけを照合する。
+                try:
+                    resolved_recorded_path = await asyncio.to_thread(recorded_path.resolve)
+                except (OSError, RuntimeError):
+                    resolved_recorded_path = recorded_path
+                if resolved_recorded_path != recorded_path:
+                    recorded_video = await RecordedVideo.get_or_none(file_path=str(resolved_recorded_path))
+            if recorded_video is None:
+                logging.debug(
+                    f'{chapter_file_path}: Corresponding recorded video was not found. Skipping chapter sync.'
+                )
+                return
+            await CMAnalysisOrchestrator().run(recorded_video.id, 'CMChapterSync')
+            return
+
         candidate_paths = GetRecordedPathFromCMChapterPath(
             pathlib.Path(str(chapter_file_path)),
             set(self.SCAN_TARGET_EXTENSIONS),
@@ -1585,8 +1609,8 @@ class RecordedScanTask:
         if len(candidate_paths) == 0:
             return
 
-        # canonical候補とlegacy候補をすべてDBと照合してから、canonical優先・legacy一意制約で決定する。
-        # QuerySet.first()へ任せると、同一stemの別拡張子録画へlegacy chapterを誤同期する可能性がある。
+        # 基本名候補をすべてDBと照合してから、所有者が一意な場合だけ同期する。
+        # QuerySet.first()へ任せると、同一stemの別拡張子録画へchapterを誤同期する可能性がある。
         chapter_path = pathlib.Path(str(chapter_file_path))
         base_name = chapter_path.name[:-len('.chapter.txt')]
         recorded_videos = await RecordedVideo.filter(

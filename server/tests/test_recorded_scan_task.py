@@ -270,24 +270,24 @@ def test_thumbnail_history_uses_persisted_recorded_video_id(monkeypatch: pytest.
 @pytest.mark.parametrize(
     ('chapter_name', 'recorded_paths', 'expected_recorded_video_id'),
     [
-        # canonical録画と、同じ名前をlegacyとして解釈できる録画が共存してもcanonicalを優先する。
-        ('program.ts.chapter.txt', ('program.ts', 'program.ts.mkv'), 1),
-        # canonical候補がDBになく、legacy候補が1件だけなら互換読込する。
+        # 完全ファイル名方式とは解釈せず、基本名が program.ts の録画だけへ対応付ける。
+        ('program.ts.chapter.txt', ('program.ts', 'program.ts.mkv'), 2),
+        # 基本名が一致する録画が1件だけなら外部入力として同期する。
         ('program.chapter.txt', ('program.mkv',), 1),
-        # DB保存パスの拡張子が大文字でも、legacy名をcase-insensitiveに対応付ける。
+        # DB保存パスの拡張子が大文字でも、基本名をcase-insensitiveに対応付ける。
         ('program.chapter.txt', ('program.TS',), 1),
         # chapter削除イベントでも同じ対応付けを行い、存在確認はOrchestratorへ委ねる。
-        ('deleted.ts.chapter.txt', ('deleted.ts',), 1),
+        ('deleted.chapter.txt', ('deleted.ts',), 1),
     ],
 )
-def test_chapter_watcher_selects_canonical_or_unique_legacy(
+def test_chapter_watcher_selects_unique_basic_name(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
     chapter_name: str,
     recorded_paths: tuple[str, ...],
     expected_recorded_video_id: int,
 ) -> None:
-    """chapter watcherはcanonicalを優先し、一意なlegacyと削除イベントだけを同期する。"""
+    """chapter watcherは基本名が一意な.chapter.txtと、その削除イベントだけを同期する。"""
 
     recorded_videos = [
         SimpleNamespace(id=index, file_path=str(tmp_path / recorded_path))
@@ -333,15 +333,26 @@ def test_chapter_watcher_selects_canonical_or_unique_legacy(
     assert called == [(expected_recorded_video_id, 'CMChapterSync')]
 
 
-def test_chapter_watcher_ignores_ambiguous_legacy(
+@pytest.mark.parametrize(
+    ('chapter_name', 'recorded_paths'),
+    [
+        # 同じ基本名の録画が複数ある場合は曖昧なので同期しない。
+        ('program.chapter.txt', ('program.ts', 'program.mkv')),
+        # 旧完全ファイル名方式は program.ts 自体へ対応付けない。
+        ('program.ts.chapter.txt', ('program.ts',)),
+    ],
+)
+def test_chapter_watcher_ignores_ambiguous_or_full_filename_chapter(
     tmp_path: pathlib.Path,
     monkeypatch: pytest.MonkeyPatch,
+    chapter_name: str,
+    recorded_paths: tuple[str, ...],
 ) -> None:
-    """同じlegacy chapterに対応する登録録画が複数あれば、どちらにも同期しない。"""
+    """曖昧な基本名と旧完全ファイル名方式の.chapter.txtは同期しない。"""
 
     recorded_videos = [
-        SimpleNamespace(id=1, file_path=str(tmp_path / 'program.ts')),
-        SimpleNamespace(id=2, file_path=str(tmp_path / 'program.mkv')),
+        SimpleNamespace(id=index, file_path=str(tmp_path / recorded_path))
+        for index, recorded_path in enumerate(recorded_paths, start=1)
     ]
     called: list[tuple[int, str]] = []
 
@@ -376,8 +387,94 @@ def test_chapter_watcher_ignores_ambiguous_legacy(
 
     handle_chapter_file_change = getattr(scan_task, '_RecordedScanTask__handleChapterFileChange')
     asyncio.run(asyncio.wait_for(
-        handle_chapter_file_change(tmp_path / 'program.chapter.txt'),
+        handle_chapter_file_change(tmp_path / chapter_name),
         timeout=1.0,
     ))
 
     assert called == []
+
+
+def test_chapter_watcher_maps_konomitv_yaml_by_complete_filename(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KonomiTV YAMLは同じ基本名の別録画があっても完全ファイル名一致で同期する。"""
+
+    recorded_videos = {
+        str(tmp_path / 'program.ts'): SimpleNamespace(id=1, file_path=str(tmp_path / 'program.ts')),
+        str(tmp_path / 'program.ts.mkv'): SimpleNamespace(id=2, file_path=str(tmp_path / 'program.ts.mkv')),
+    }
+    queried_paths: list[str] = []
+    called: list[tuple[int, str]] = []
+
+    async def GetOrNone(cls: type[RecordedVideo], **kwargs: Any) -> SimpleNamespace | None:
+        del cls
+        queried_paths.append(kwargs['file_path'])
+        return recorded_videos.get(kwargs['file_path'])
+
+    async def Run(self: CMAnalysisOrchestrator, recorded_video_id: int, intent: str) -> None:
+        del self
+        called.append((recorded_video_id, intent))
+
+    monkeypatch.setattr(RecordedVideo, 'get_or_none', classmethod(GetOrNone))
+    monkeypatch.setattr(CMAnalysisOrchestrator, 'run', Run)
+    scan_task = object.__new__(RecordedScanTask)
+
+    handle_chapter_file_change = getattr(scan_task, '_RecordedScanTask__handleChapterFileChange')
+    asyncio.run(asyncio.wait_for(
+        handle_chapter_file_change(tmp_path / 'program.ts.konomitv-chapters.yaml'),
+        timeout=1.0,
+    ))
+
+    assert queried_paths == [str(tmp_path / 'program.ts')]
+    assert called == [(1, 'CMChapterSync')]
+
+
+@pytest.mark.parametrize('change_type', [Change.added, Change.modified, Change.deleted])
+def test_recorded_folder_watcher_routes_all_konomitv_yaml_events(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change_type: Change,
+) -> None:
+    """KonomiTV YAMLの追加・変更・削除を録画拡張子フィルターより先にchapter処理へ渡す。"""
+
+    chapter_path = tmp_path / 'program.ts.konomitv-chapters.yaml'
+    handled_paths: list[pathlib.Path] = []
+
+    async def Watch(*args: Any, **kwargs: Any) -> AsyncGenerator[set[tuple[Change, str]], None]:
+        del args, kwargs
+        yield {(change_type, str(chapter_path))}
+        scan_task._is_running = False  # type: ignore[attr-defined]
+
+    async def CheckRecordingCompletion(self: RecordedScanTask) -> None:
+        del self
+        await asyncio.Event().wait()
+
+    async def HandleChapterFileChange(self: RecordedScanTask, file_path: anyio.Path) -> None:
+        del self
+        handled_paths.append(pathlib.Path(str(file_path)))
+
+    async def IsDirectory(path: anyio.Path) -> bool:
+        del path
+        return False
+
+    monkeypatch.setattr('app.metadata.RecordedScanTask.awatch', Watch)
+    monkeypatch.setattr(anyio.Path, 'is_dir', IsDirectory)
+    monkeypatch.setattr(
+        RecordedScanTask,
+        '_RecordedScanTask__checkRecordingCompletion',
+        CheckRecordingCompletion,
+    )
+    monkeypatch.setattr(
+        RecordedScanTask,
+        '_RecordedScanTask__handleChapterFileChange',
+        HandleChapterFileChange,
+    )
+    scan_task = object.__new__(RecordedScanTask)
+    scan_task.recorded_folders = [anyio.Path(tmp_path)]  # type: ignore[attr-defined]
+    scan_task.config = SimpleNamespace(video=SimpleNamespace(exclude_scan_paths=[]))  # type: ignore[attr-defined]
+    scan_task._is_running = True  # type: ignore[attr-defined]
+
+    asyncio.run(asyncio.wait_for(scan_task.watchRecordedFolders(), timeout=1.0))
+
+    assert handled_paths == [chapter_path]

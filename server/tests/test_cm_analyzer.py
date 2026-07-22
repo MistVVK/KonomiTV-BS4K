@@ -113,6 +113,8 @@ def InstallSuccessfulProcesses(
     analyzer: GenericCMAnalyzer,
     payload: dict[str, object],
     commands: list[tuple[str, ...]],
+    *,
+    trim_text: str = 'Trim(0,899) ++ Trim(1200,1799)\n',
 ) -> None:
     async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
         del environment
@@ -148,7 +150,7 @@ def InstallSuccessfulProcesses(
             )
             return _ProcessResult(0, '')
         trim_path = Path(command[command.index('-o') + 1])
-        trim_path.write_text('Trim(0,899) ++ Trim(1200,1799)\n', encoding='utf-8')
+        trim_path.write_text(trim_text, encoding='utf-8')
         return _ProcessResult(0, '')
 
     analyzer._runProcess = RunProcess  # type: ignore[method-assign]
@@ -859,32 +861,36 @@ def test_python_output_enospc_is_normalized_to_temporary_storage_error(
     assert result.error_code == 'TemporaryStorageInsufficient'
 
 
-def test_generated_chapter_enospc_is_normalized_to_temporary_storage_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_completed_analysis_returns_sections_without_writing_public_chapter(tmp_path: Path) -> None:
     analyzer = CreateRuntime(tmp_path)
     commands: list[tuple[str, ...]] = []
     InstallSuccessfulProcesses(analyzer, ProbePayload(), commands)
-    original_write_text = Path.write_text
-
-    def WriteText(
-        path: Path,
-        data: str,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        if path.name == 'generated.cmchapter':
-            raise OSError(errno.ENOSPC, 'No space left on device')
-        return original_write_text(path, data, encoding=encoding, errors=errors, newline=newline)
-
-    monkeypatch.setattr(Path, 'write_text', WriteText)
 
     result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path)))
 
-    assert result.status == 'analysis_failed'
-    assert result.error_code == 'TemporaryStorageInsufficient'
+    assert result.status == 'completed'
+    assert result.chapter_file is None
+    assert result.sections == ({'start_time': 30.03, 'end_time': 40.04},)
+    assert list((tmp_path / 'work').rglob('generated.cmchapter')) == []
+
+
+def test_completed_analysis_uses_recording_duration_for_trailing_cm(tmp_path: Path) -> None:
+    """解析clipの末尾が長くても、公開CM区間はDBと同じ60秒で終端する。"""
+
+    analyzer = CreateRuntime(tmp_path)
+    commands: list[tuple[str, ...]] = []
+    InstallSuccessfulProcesses(
+        analyzer,
+        ProbePayload(),
+        commands,
+        trim_text='Trim(0,1796)\n',
+    )
+
+    result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path)))
+
+    assert result.status == 'completed'
+    assert result.sections == ({'start_time': 59.9599, 'end_time': 60.0},)
+    assert result.analyzer_version == 'KonomiTV-CM-8'
 
 
 def test_analyzer_requires_precreated_private_workspace(tmp_path: Path) -> None:
@@ -917,6 +923,53 @@ def test_jls_output_requires_ordered_determinate_trim_ranges() -> None:
             'Trim(100,500) ++ Trim(400,900)',
             1800,
             Fraction(30_000, 1001),
+        )
+
+
+def test_jls_trailing_cm_is_clamped_to_canonical_timeline_duration() -> None:
+    assert GenericCMAnalyzer._parseCMSections(
+        'Trim(0,1796)',
+        1810,
+        Fraction(30, 1),
+        timeline_duration_seconds=60.0,
+    ) == [{'start_time': 59.9, 'end_time': 60.0}]
+
+
+def test_jls_trailing_cm_outside_canonical_timeline_is_dropped() -> None:
+    assert GenericCMAnalyzer._parseCMSections(
+        'Trim(0,1802)',
+        1810,
+        Fraction(30, 1),
+        timeline_duration_seconds=60.0,
+    ) == []
+
+
+def test_jls_cm_within_canonical_timeline_is_unchanged() -> None:
+    assert GenericCMAnalyzer._parseCMSections(
+        'Trim(0,899) ++ Trim(1200,1799)',
+        1800,
+        Fraction(30_000, 1001),
+        timeline_duration_seconds=60.0,
+    ) == [{'start_time': 30.03, 'end_time': 40.04}]
+
+
+def test_jls_timeline_longer_than_analyzed_clip_does_not_extend_cm() -> None:
+    assert GenericCMAnalyzer._parseCMSections(
+        'Trim(0,1796)',
+        1810,
+        Fraction(30, 1),
+        timeline_duration_seconds=120.0,
+    ) == [{'start_time': 59.9, 'end_time': 60.333333}]
+
+
+@pytest.mark.parametrize('timeline_duration_seconds', [0.0, -1.0, float('nan'), float('inf')])
+def test_jls_rejects_invalid_canonical_timeline_duration(timeline_duration_seconds: float) -> None:
+    with pytest.raises(ValueError, match='finite positive'):
+        GenericCMAnalyzer._parseCMSections(
+            'Trim(0,1796)',
+            1810,
+            Fraction(30, 1),
+            timeline_duration_seconds=timeline_duration_seconds,
         )
 
 

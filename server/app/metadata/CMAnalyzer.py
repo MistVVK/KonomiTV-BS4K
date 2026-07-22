@@ -168,7 +168,7 @@ class CMAnalyzer(Protocol):
         ...
 
     async def analyze(self, request: CMAnalyzerRequest) -> CMAnalyzerResult:
-        """録画を解析して検証前の chapter を返す。"""
+        """録画を解析し、検出したCM区間を構造化結果として返す。"""
         ...
 
 
@@ -216,7 +216,7 @@ class GenericCMAnalyzer:
     """全登録メディアを FFMS2 の共有媒体・索引で解析する CM 解析器。"""
 
     ANALYSIS_FPS = Fraction(30_000, 1001)
-    ANALYZER_VERSION = 'KonomiTV-CM-7'
+    ANALYZER_VERSION = 'KonomiTV-CM-8'
     NORMALIZATION_POLICY_VERSION = 4
     _LOGO_FRAME_MAX_WORKERS = 15
     _LOGO_FRAME_MIN_FRAMES_PER_WORKER = 600
@@ -733,12 +733,20 @@ class GenericCMAnalyzer:
             )
         try:
             trim_text = trim_output.read_text(encoding='utf-8-sig')
-            sections = self._parseCMSections(trim_text, total_frames, self.ANALYSIS_FPS)
-            normalized_duration = total_frames / float(self.ANALYSIS_FPS)
-            chapter_path = work_directory / 'generated.cmchapter'
-            chapter_path.write_text(
-                self._buildChapterText(sections, normalized_duration),
-                encoding='utf-8',
+            # chapter_exe/JLS は正規化後の総フレーム数を基準にするため、コンテナ末尾の
+            # パディングまで含む時刻が KonomiTV の録画時間をわずかに超えることがある。
+            # 公開するCM区間はプレイヤーとYAMLが共有する録画時間軸へ収める一方、
+            # JLS自身のTrim範囲検証は総フレーム数に対して厳格なまま維持する。
+            timeline_duration_seconds = (
+                request.duration_seconds
+                if math.isfinite(request.duration_seconds) and request.duration_seconds > 0
+                else descriptor.duration_seconds
+            )
+            sections = self._parseCMSections(
+                trim_text,
+                total_frames,
+                self.ANALYSIS_FPS,
+                timeline_duration_seconds=timeline_duration_seconds,
             )
         except OSError as ex:
             return CMAnalyzerResult(
@@ -759,7 +767,7 @@ class GenericCMAnalyzer:
             )
         return CMAnalyzerResult(
             status='completed',
-            chapter_file=chapter_path,
+            chapter_file=None,
             sections=tuple(sections),
             matched_logo=logo_output.matched_logo,
             analysis_fps=str(self.ANALYSIS_FPS),
@@ -1075,6 +1083,8 @@ class GenericCMAnalyzer:
         trim_text: str,
         total_frames: int,
         fps: Fraction,
+        *,
+        timeline_duration_seconds: float | None = None,
     ) -> list[CMSectionJSON]:
         keep_ranges = [
             (int(match.group(1)), int(match.group(2)) + 1)
@@ -1084,6 +1094,18 @@ class GenericCMAnalyzer:
             raise ValueError('JLS did not emit a determinate Trim range.')
         if total_frames <= 0:
             raise ValueError('Analysis frame count must be positive.')
+        if fps <= 0:
+            raise ValueError('Analysis frame rate must be positive.')
+        analysis_duration_seconds = total_frames / float(fps)
+        timeline_end_seconds = analysis_duration_seconds
+        timeline_is_clipped = False
+        if timeline_duration_seconds is not None:
+            if math.isfinite(timeline_duration_seconds) is False or timeline_duration_seconds <= 0:
+                raise ValueError('Timeline duration must be a finite positive number.')
+            # DB/プレイヤーの録画時間が解析clipより短い場合だけ末尾を切り詰める。
+            # 逆に長い場合は、解析できていない範囲をCMとして捏造しない。
+            timeline_end_seconds = min(timeline_duration_seconds, analysis_duration_seconds)
+            timeline_is_clipped = timeline_duration_seconds < analysis_duration_seconds
         previous_end = 0
         for start, end in keep_ranges:
             if start < 0 or end <= start or end > total_frames:
@@ -1093,42 +1115,39 @@ class GenericCMAnalyzer:
             previous_end = end
         cursor = 0
         sections: list[CMSectionJSON] = []
+
+        def AppendCMSection(start_frame: int, end_frame: int) -> None:
+            """フレーム区間を公開時間軸内のCM区間として追加する。
+
+            Args:
+                start_frame: CM区間の開始フレーム。inclusive。
+                end_frame: CM区間の終了フレーム。exclusive。
+
+            Returns:
+                None
+            """
+
+            start_seconds = round(start_frame / float(fps), 6)
+            raw_end_seconds = end_frame / float(fps)
+            if start_seconds >= timeline_end_seconds:
+                return
+            # 上限へ到達した区間では丸めによる再超過を避け、録画時間そのものを使う。
+            end_seconds = (
+                timeline_end_seconds
+                if timeline_is_clipped and raw_end_seconds >= timeline_end_seconds
+                else round(raw_end_seconds, 6)
+            )
+            if end_seconds <= start_seconds:
+                return
+            sections.append(CMSectionJSON(start_time=start_seconds, end_time=end_seconds))
+
         for start, end in keep_ranges:
             if cursor < start:
-                sections.append(CMSectionJSON(
-                    start_time=round(cursor / float(fps), 6),
-                    end_time=round(start / float(fps), 6),
-                ))
+                AppendCMSection(cursor, start)
             cursor = end
         if cursor < total_frames:
-            sections.append(CMSectionJSON(
-                start_time=round(cursor / float(fps), 6),
-                end_time=round(total_frames / float(fps), 6),
-            ))
+            AppendCMSection(cursor, total_frames)
         return sections
-
-    @staticmethod
-    def _buildChapterText(sections: list[CMSectionJSON], duration_seconds: float) -> str:
-        boundaries: dict[int, str] = {0: 'Program'}
-        duration_ms = max(0, round(duration_seconds * 1000))
-        for section in sections:
-            start_ms = max(0, min(duration_ms, round(section['start_time'] * 1000)))
-            end_ms = max(0, min(duration_ms, round(section['end_time'] * 1000)))
-            if end_ms <= start_ms:
-                raise ValueError('CM section end must be greater than start.')
-            boundaries[start_ms] = 'CM'
-            if end_ms < duration_ms:
-                boundaries[end_ms] = 'Program'
-        if len(boundaries) > 99:
-            raise ValueError('Generated chapter contains more than 99 entries.')
-        lines: list[str] = []
-        for index, (milliseconds, name) in enumerate(sorted(boundaries.items()), start=1):
-            hours, remainder = divmod(milliseconds, 3_600_000)
-            minutes, remainder = divmod(remainder, 60_000)
-            seconds, millis = divmod(remainder, 1000)
-            lines.append(f'CHAPTER{index:02d}={hours:02d}:{minutes:02d}:{seconds:02d}.{millis:03d}')
-            lines.append(f'CHAPTER{index:02d}NAME={name}')
-        return '\n'.join(lines) + '\n'
 
     async def _runProcess(
         self,

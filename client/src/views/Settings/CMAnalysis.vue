@@ -8,7 +8,8 @@
             <span class="ml-3">CM管理</span>
         </h2>
         <div class="settings__description">
-            録画横の .chapter.txt を優先して同期し、ファイルがない録画だけを汎用メディア入力対応パイプラインで解析します。<br>
+            手動編集した KonomiTV chapter YAML、または基本名方式の .chapter.txt を優先して同期します。<br>
+            KonomiTV の自動解析結果は録画横の YAML に保存します。<br>
             この設定はすべてのユーザーと端末で共有されます。
         </div>
         <div class="settings__content" :class="{'settings__content--loading': is_loading}">

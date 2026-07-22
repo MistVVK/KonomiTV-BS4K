@@ -7,6 +7,7 @@ from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import ClassVar, Literal, cast
 
@@ -15,7 +16,7 @@ from tortoise import transactions
 
 from app import logging
 from app.config import Config
-from app.constants import JST
+from app.constants import JST, VERSION
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
 from app.metadata.CMAnalysisPaths import ResolveCMHostPath
 from app.metadata.CMAnalysisWorkspace import (
@@ -33,17 +34,22 @@ from app.metadata.CMAnalyzer import (
 )
 from app.metadata.CMChapterFile import (
     ChapterFingerprint,
-    CMChapterConflictError,
     CMChapterPathKind,
     CMChapterPathSelection,
     CMChapterReadResult,
-    CommitCMChapterFile,
-    GetCMChapterPath,
     ReadCMChapterFileAsync,
     SelectCMChapterPath,
 )
 from app.metadata.CMLogoScanner import CMLogoScanner
 from app.metadata.CMLogoSelector import CMLogoSelection, CMLogoSelector
+from app.metadata.KonomiTVChapterFile import (
+    BuildKonomiTVChapterFile,
+    CommitKonomiTVChapterFile,
+    GetKonomiTVChapterPath,
+    KonomiTVChapterConflictError,
+    KonomiTVChapterReadResult,
+    ReadKonomiTVChapterFileAsync,
+)
 from app.models.CMAnalysis import (
     CMAnalysisExcludedDirectory,
     CMAnalysisSettings,
@@ -63,6 +69,7 @@ from app.utils.DriveIOLimiter import DriveIOLimiter
 
 
 CMAnalysisIntent = Literal['DetectCM', 'CMChapterSync', 'CMDetection', 'CMRegeneration']
+CMChapterReadResultType = CMChapterReadResult | KonomiTVChapterReadResult
 
 
 class CMAnalysisOrchestrator:
@@ -173,69 +180,88 @@ class CMAnalysisOrchestrator:
                     input_fingerprint=None,
                     attempt_key=None,
                 )
-            saved_input_fingerprint = state.input_fingerprint
             state.input_fingerprint = input_fingerprint
 
             chapter_selection = await self._selectChapterPath(recorded_path)
-            chapter_result = await ReadCMChapterFileAsync(chapter_selection.path, recorded_video.duration)
+            chapter_result = await self._readChapterFile(chapter_selection, recorded_video.duration)
             if chapter_result.status in ('Valid', 'ValidNoCM'):
-                published_generated_identity = (
-                    published_result is not None
-                    and published_result.source == 'Generated'
-                    and self._sameChapterFingerprint(published_result.chapter_fingerprint, chapter_result.fingerprint)
-                )
-                pending_generated_identity = (
-                    state.chapter_source == 'Generated'
-                    and state.chapter_path_kind == 'Canonical'
-                    and chapter_selection.kind == 'Canonical'
-                    and self._isRecoverablePendingState(state)
-                    and self._samePendingChapterContent(state.chapter_fingerprint, chapter_result.fingerprint)
-                )
-                if (
-                    pending_generated_identity
-                    and published_generated_identity is False
-                    and self._sameInputFingerprint(saved_input_fingerprint, input_fingerprint)
-                ):
-                    # sidecar配置後・結果transaction前の停止を、durableな生成予定hashから回復する。
-                    return await self._publishChapterResult(
-                        recorded_video,
-                        state,
-                        chapter_result,
-                        source='Generated',
-                        path_kind='Canonical',
-                        input_fingerprint=input_fingerprint,
-                        pipeline_version=state.analyzer_version,
-                        runtime_fingerprint=state.runtime_fingerprint,
-                        used_logo_id=state.used_logo_id,
-                    )
-                generated_chapter_identity = published_generated_identity or pending_generated_identity
-                # 外部canonical chapterは常に保護する。一方、legacy chapterは実体を残したまま
-                # canonical chapterを別名で生成できるため、明示的な再判定時だけ解析へ進める。
-                # 通常の自動解析では従来どおりchapterを最優先し、既存結果を再公開して終了する。
-                if self._shouldPublishExistingChapterWithoutAnalysis(
-                    intent,
-                    chapter_selection.kind,
-                    generated_chapter_identity,
-                ):
-                    source: CMResultSource
-                    if chapter_selection.kind == 'Legacy':
-                        source = 'LegacyImported'
+                if chapter_selection.kind == 'Canonical':
+                    assert isinstance(chapter_result, KonomiTVChapterReadResult)
+                    provenance = chapter_result.provenance
+                    if provenance is not None and provenance.source == 'Manual':
+                        # 手書きYAML、またはKonomiTV生成YAMLのchaptersを人が編集した結果は
+                        # 利用者入力として常に保護する。
+                        return await self._publishChapterResult(
+                            recorded_video,
+                            state,
+                            chapter_result,
+                            source='Manual',
+                            path_kind='Canonical',
+                            input_fingerprint=input_fingerprint,
+                            pipeline_version=None,
+                            runtime_fingerprint=None,
+                            used_logo_id=None,
+                        )
+
+                    if self._isGeneratedChapterForInput(chapter_result, input_fingerprint):
+                        # YAML自身の検証済みgenerator/recording情報を所有権の根拠にする。
+                        # これによりSQLiteを失っても生成済み結果をsidecarから復元できる。
+                        if intent != 'CMRegeneration':
+                            same_published_result = (
+                                published_result is not None
+                                and published_result.source == 'Generated'
+                                and self._sameChapterFingerprint(
+                                    published_result.chapter_fingerprint,
+                                    chapter_result.fingerprint,
+                                )
+                            )
+                            previous_generated_result = published_result if same_published_result else None
+                            generator = provenance.generator if provenance is not None else None
+                            return await self._publishChapterResult(
+                                recorded_video,
+                                state,
+                                chapter_result,
+                                source='Generated',
+                                path_kind='Canonical',
+                                input_fingerprint=input_fingerprint,
+                                pipeline_version=generator.pipeline_version if generator is not None else None,
+                                runtime_fingerprint=(
+                                    previous_generated_result.runtime_fingerprint
+                                    if previous_generated_result is not None
+                                    else None
+                                ),
+                                used_logo_id=(
+                                    previous_generated_result.used_logo_id
+                                    if previous_generated_result is not None
+                                    else None
+                                ),
+                            )
+                        # 明示的な再生成だけは、自前のYAMLを解析結果で置換する。
                     else:
-                        source = 'Existing'
+                        # 録画内容が生成時から変わったYAMLを現在のCM結果として公開しない。
+                        state = await self._saveMissingChapter(
+                            recorded_video,
+                            state,
+                            chapter_result,
+                            chapter_selection.kind,
+                            error_code='GeneratedChapterInputChanged',
+                        )
+                        published_result = None
+                        if intent in ('CMChapterSync', 'CMDetection'):
+                            return state
+                elif intent != 'CMRegeneration':
+                    # 外部.chapter.txtは基本名方式かつ録画との対応が一意な場合だけ採用する。
                     return await self._publishChapterResult(
                         recorded_video,
                         state,
                         chapter_result,
-                        source=source,
-                        path_kind=chapter_selection.kind,
+                        source='Existing',
+                        path_kind='Legacy',
                         input_fingerprint=input_fingerprint,
                         pipeline_version=None,
                         runtime_fingerprint=None,
                         used_logo_id=None,
                     )
-                # 明示的な置換許可がない個別・一括再判定では、自前chapterもそのまま保持する。
-                if intent == 'CMDetection':
-                    return state
             elif chapter_result.status in ('Invalid', 'IOError'):
                 # 壊れた sidecar も暗黙に置き換えない。公開済み結果は保持して試行状態だけ失敗にする。
                 return await self._saveChapterError(state, chapter_result, chapter_selection.kind)
@@ -346,7 +372,7 @@ class CMAnalysisOrchestrator:
         recorded_video: RecordedVideo,
         state: RecordedVideoCMAnalysis,
         settings: CMAnalysisSettings,
-        chapter_result: CMChapterReadResult,
+        chapter_result: CMChapterReadResultType,
         chapter_path_kind: CMChapterPathKind,
         input_fingerprint: dict[str, int | str],
         intent: CMAnalysisIntent,
@@ -546,7 +572,7 @@ class CMAnalysisOrchestrator:
                     attempt_key,
                     runtime_fingerprint,
                 )
-                if result.status != 'completed' or result.chapter_file is None:
+                if result.status != 'completed' or result.analyzer_version is None:
                     state = await self._saveStructuredAnalyzerFailure(
                         state,
                         result,
@@ -578,8 +604,8 @@ class CMAnalysisOrchestrator:
                     return state
 
                 current_chapter_selection = await self._selectChapterPath(Path(recorded_video.file_path))
-                current_chapter_result = await ReadCMChapterFileAsync(
-                    current_chapter_selection.path,
+                current_chapter_result = await self._readChapterFile(
+                    current_chapter_selection,
                     recorded_video.duration,
                 )
                 chapter_unchanged = (
@@ -588,20 +614,48 @@ class CMAnalysisOrchestrator:
                 )
                 if chapter_unchanged is False:
                     if current_chapter_result.status in ('Valid', 'ValidNoCM'):
-                        # 解析中に現れた正常chapterは利用者入力として優先し、解析結果を破棄する。
+                        # 解析中に現れた正常sidecarは優先し、解析結果を破棄する。
+                        changed_source: CMResultSource
+                        changed_pipeline_version: str | None = None
+                        if current_chapter_selection.kind == 'Legacy':
+                            changed_source = 'Existing'
+                        else:
+                            assert isinstance(current_chapter_result, KonomiTVChapterReadResult)
+                            provenance = current_chapter_result.provenance
+                            if provenance is not None and provenance.source == 'Manual':
+                                changed_source = 'Manual'
+                            elif self._isGeneratedChapterForInput(
+                                current_chapter_result,
+                                current_input_fingerprint,
+                            ):
+                                changed_source = 'Generated'
+                                changed_pipeline_version = (
+                                    provenance.generator.pipeline_version
+                                    if provenance is not None and provenance.generator is not None
+                                    else None
+                                )
+                            else:
+                                state = await self._saveAttemptFailure(
+                                    state,
+                                    'Interrupted',
+                                    'ChapterChangedDuringAnalysis',
+                                    'A generated YAML sidecar for a different recording input appeared during analysis.',
+                                    input_fingerprint=current_input_fingerprint,
+                                    attempt_key=None,
+                                    runtime_fingerprint=runtime_fingerprint,
+                                    analyzer_version=result.analyzer_version,
+                                )
+                                await history.finish('Interrupted', error_code=state.error_code)
+                                return state
                         state.attempt_key_sha256 = None
                         state = await self._publishChapterResult(
                             recorded_video,
                             state,
                             current_chapter_result,
-                            source=(
-                                'LegacyImported'
-                                if current_chapter_selection.kind == 'Legacy'
-                                else 'Existing'
-                            ),
+                            source=changed_source,
                             path_kind=current_chapter_selection.kind,
                             input_fingerprint=current_input_fingerprint,
-                            pipeline_version=None,
+                            pipeline_version=changed_pipeline_version,
                             runtime_fingerprint=None,
                             used_logo_id=None,
                         )
@@ -628,18 +682,27 @@ class CMAnalysisOrchestrator:
                     await history.finish('Interrupted', error_code=state.error_code)
                     return state
 
-                expected_canonical_fingerprint: ChapterFingerprint = (
+                expected_yaml_fingerprint: ChapterFingerprint = (
                     chapter_result.fingerprint
                     if chapter_path_kind == 'Canonical'
                     else {'exists': False}
                 )
-                generated_chapter = await ReadCMChapterFileAsync(result.chapter_file, recorded_video.duration)
-                if generated_chapter.status not in ('Valid', 'ValidNoCM'):
+                generated_at = datetime.now(tz=JST)
+                try:
+                    generated_yaml = BuildKonomiTVChapterFile(
+                        result.sections,
+                        recorded_video.duration,
+                        application_version=VERSION,
+                        pipeline_version=result.analyzer_version,
+                        generated_at=generated_at,
+                        input_fingerprint=input_fingerprint,
+                    )
+                except ValueError as ex:
                     state = await self._saveAttemptFailure(
                         state,
                         'Failed',
                         'GeneratedChapterInvalid',
-                        generated_chapter.error_message,
+                        str(ex),
                         input_fingerprint=input_fingerprint,
                         attempt_key=attempt_key,
                         runtime_fingerprint=runtime_fingerprint,
@@ -653,9 +716,9 @@ class CMAnalysisOrchestrator:
                 state.chapter_source = 'Generated'
                 state.chapter_path_kind = 'Canonical'
                 state.chapter_fingerprint = {
-                    key: value
-                    for key, value in generated_chapter.fingerprint.items()
-                    if key in ('exists', 'size', 'sha256')
+                    'exists': True,
+                    'size': len(generated_yaml),
+                    'sha256': hashlib.sha256(generated_yaml).hexdigest(),
                 }
                 state.used_logo_id = selected_logo.id if selected_logo is not None else None
                 state.analyzer_version = result.analyzer_version
@@ -663,15 +726,21 @@ class CMAnalysisOrchestrator:
                 await state.save()
                 commit_future = asyncio.get_running_loop().run_in_executor(
                     None,
-                    CommitCMChapterFile,
-                    result.chapter_file,
-                    GetCMChapterPath(Path(recorded_video.file_path)),
-                    recorded_video.duration,
-                    expected_canonical_fingerprint,
+                    partial(
+                        CommitKonomiTVChapterFile,
+                        GetKonomiTVChapterPath(Path(recorded_video.file_path)),
+                        result.sections,
+                        recorded_video.duration,
+                        application_version=VERSION,
+                        pipeline_version=result.analyzer_version,
+                        generated_at=generated_at,
+                        input_fingerprint=input_fingerprint,
+                        expected_destination_fingerprint=expected_yaml_fingerprint,
+                    ),
                 )
                 try:
                     committed, cancellation_during_commit = await self._awaitCommitFuture(commit_future)
-                except CMChapterConflictError as ex:
+                except KonomiTVChapterConflictError as ex:
                     state.chapter_source = None
                     state = await self._saveAttemptFailure(
                         state,
@@ -794,8 +863,8 @@ class CMAnalysisOrchestrator:
 
     @staticmethod
     async def _awaitCommitFuture(
-        commit_future: asyncio.Future[CMChapterReadResult],
-    ) -> tuple[CMChapterReadResult, bool]:
+        commit_future: asyncio.Future[KonomiTVChapterReadResult],
+    ) -> tuple[KonomiTVChapterReadResult, bool]:
         """executor commitをキャンセルから保護し、完了をjoinしてから要求有無と結果を返す。"""
 
         cancellation_requested = False
@@ -920,6 +989,10 @@ class CMAnalysisOrchestrator:
         return f'vaapi:{devices[0]}' if devices else None
 
     async def _selectChapterPath(self, recorded_path: Path) -> CMChapterPathSelection:
+        yaml_path = GetKonomiTVChapterPath(recorded_path)
+        if yaml_path.is_file():
+            return CMChapterPathSelection(yaml_path, 'Canonical')
+
         prefix = str(recorded_path.parent / recorded_path.stem)
         rows = cast(
             list[str],
@@ -927,7 +1000,39 @@ class CMAnalysisOrchestrator:
         )
         registered_paths = {Path(path) for path in rows}
         registered_paths.add(recorded_path)
-        return SelectCMChapterPath(recorded_path, registered_paths)
+        basic_selection = SelectCMChapterPath(recorded_path, registered_paths)
+        if basic_selection is not None:
+            return basic_selection
+        # YAMLはKonomiTVの唯一の出力先であり、欠落fingerprint/CASの基準にもする。
+        return CMChapterPathSelection(yaml_path, 'Canonical')
+
+    @staticmethod
+    async def _readChapterFile(
+        selection: CMChapterPathSelection,
+        duration_sec: float,
+    ) -> CMChapterReadResultType:
+        """選択したsidecar形式だけを読み込み、旧完全名.chapter.txtは参照しない。"""
+
+        if selection.kind == 'Canonical':
+            return await ReadKonomiTVChapterFileAsync(selection.path, duration_sec)
+        return await ReadCMChapterFileAsync(selection.path, duration_sec)
+
+    @staticmethod
+    def _isGeneratedChapterForInput(
+        chapter_result: KonomiTVChapterReadResult,
+        input_fingerprint: Mapping[str, int | str],
+    ) -> bool:
+        """YAMLの生成由来と録画fingerprintが現在の入力に一致するか検証する。"""
+
+        provenance = chapter_result.provenance
+        if provenance is None or provenance.source != 'Generated' or provenance.recording is None:
+            return False
+        recording = provenance.recording
+        return (
+            recording.size == input_fingerprint.get('size')
+            and recording.mtime_ns == input_fingerprint.get('mtime_ns')
+            and recording.sample_sha256 == input_fingerprint.get('sample_sha256')
+        )
 
     @staticmethod
     def _sameChapterFingerprint(
@@ -949,18 +1054,6 @@ class CMAnalysisOrchestrator:
         return True
 
     @staticmethod
-    def _samePendingChapterContent(
-        left: Mapping[str, object] | None,
-        right: Mapping[str, object] | None,
-    ) -> bool:
-        """commit直前に保存した生成予定hashと、配置済みsidecarの内容を照合する。"""
-
-        if not CMAnalysisOrchestrator._isPendingMarkerFingerprint(left) or right is None:
-            return False
-        assert left is not None
-        return left.get('sha256') == right.get('sha256') and left.get('size') == right.get('size')
-
-    @staticmethod
     def _isPendingMarkerFingerprint(value: Mapping[str, object] | None) -> bool:
         return (
             value is not None
@@ -968,27 +1061,6 @@ class CMAnalysisOrchestrator:
             and value.get('exists') is True
             and isinstance(value.get('sha256'), str)
         )
-
-    @staticmethod
-    def _sameInputFingerprint(
-        left: Mapping[str, object] | None,
-        right: Mapping[str, object] | None,
-    ) -> bool:
-        """pending結果は解析時と現在の録画内容が完全一致する場合だけ回復する。"""
-
-        return left is not None and right is not None and dict(left) == dict(right)
-
-    @staticmethod
-    def _shouldPublishExistingChapterWithoutAnalysis(
-        intent: CMAnalysisIntent,
-        chapter_path_kind: CMChapterPathKind,
-        generated_chapter_identity: bool,
-    ) -> bool:
-        """所有していないchapterを解析せず採用するかを返す。"""
-
-        if generated_chapter_identity:
-            return False
-        return intent != 'CMRegeneration' or chapter_path_kind == 'Canonical'
 
     @staticmethod
     def _isRecoverablePendingState(state: RecordedVideoCMAnalysis) -> bool:
@@ -1001,7 +1073,7 @@ class CMAnalysisOrchestrator:
     async def _publishChapterResult(
         recorded_video: RecordedVideo,
         state: RecordedVideoCMAnalysis,
-        chapter_result: CMChapterReadResult,
+        chapter_result: CMChapterReadResultType,
         *,
         source: CMResultSource,
         path_kind: CMChapterPathKind,
@@ -1068,7 +1140,7 @@ class CMAnalysisOrchestrator:
     @staticmethod
     async def _saveChapterError(
         state: RecordedVideoCMAnalysis,
-        result: CMChapterReadResult,
+        result: CMChapterReadResultType,
         path_kind: CMChapterPathKind,
     ) -> RecordedVideoCMAnalysis:
         state.status = 'Failed'
@@ -1087,8 +1159,10 @@ class CMAnalysisOrchestrator:
     async def _saveMissingChapter(
         recorded_video: RecordedVideo,
         state: RecordedVideoCMAnalysis,
-        result: CMChapterReadResult,
+        result: CMChapterReadResultType,
         path_kind: CMChapterPathKind,
+        *,
+        error_code: str = 'ChapterMissing',
     ) -> RecordedVideoCMAnalysis:
         """chapter削除を公開結果へ反映し、次の解析が可能なPendingへ戻す。"""
 
@@ -1106,7 +1180,7 @@ class CMAnalysisOrchestrator:
             state.attempt_key_sha256 = None
             state.completed_at = None
             state.finished_at = now
-            state.error_code = 'ChapterMissing'
+            state.error_code = error_code
             state.error_message = None
             await state.save(using_db=connection)
         return state
@@ -1114,7 +1188,7 @@ class CMAnalysisOrchestrator:
     @staticmethod
     async def _saveSkippedState(
         state: RecordedVideoCMAnalysis,
-        chapter_result: CMChapterReadResult,
+        chapter_result: CMChapterReadResultType,
         path_kind: CMChapterPathKind,
         status: Literal['Pending', 'Excluded'],
         error_code: str,

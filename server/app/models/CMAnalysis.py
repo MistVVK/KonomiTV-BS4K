@@ -21,7 +21,7 @@ CMAnalysisStatus = Literal[
 ]
 CMChapterSource = Literal['Existing', 'Generated']
 CMChapterPathKind = Literal['Canonical', 'Legacy']
-CMResultSource = Literal['Existing', 'Generated', 'LegacyImported']
+CMResultSource = Literal['Existing', 'Generated', 'LegacyImported', 'Manual']
 CMLogoFileFormat = Literal['AviUtlV0.1', 'AmatsukazeExtendedV1']
 CMLogoGenerationBatchState = Literal['NotAttempted', 'Running', 'Succeeded', 'Exhausted', 'Interrupted']
 

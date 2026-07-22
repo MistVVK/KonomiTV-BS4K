@@ -284,19 +284,10 @@ const formatCMResultSource = (): string => {
         const engine_label = engine_version !== null ? `（解析エンジン v${engine_version}）` : '';
         return `KonomiTV自動解析${engine_label}${verification}`;
     }
-    const source = {
-        Existing: '外部 chapter',
-        LegacyImported: '外部 chapter',
-    }[recorded_video.cm_result_source];
-    const naming_method = {
-        Canonical: '完全ファイル名方式',
-        Legacy: '基本名方式',
-    }[recorded_video.cm_result_chapter_path_kind ?? ''] ?? null;
-    const naming_method_label = naming_method !== null ? `（${naming_method}）` : '';
-    const pipeline = recorded_video.cm_result_pipeline_version !== null
-        ? ` / ${recorded_video.cm_result_pipeline_version}`
-        : '';
-    return `${source}${naming_method_label}${pipeline}${verification}`;
+    if (recorded_video.cm_result_source === 'Manual') {
+        return `手動編集 YAML${verification}`;
+    }
+    return `外部 chapter（基本名方式）${verification}`;
 };
 
 </script>
