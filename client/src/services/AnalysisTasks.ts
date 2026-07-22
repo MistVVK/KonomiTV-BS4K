@@ -4,7 +4,7 @@ import APIClient from '@/services/APIClient';
 export type AnalysisTaskType =
     'RecordedScan' | 'MetadataAnalysis' | 'PlaybackIndex' | 'ThumbnailGeneration' | 'CMAnalysis' |
     'CMLogoGeneration' | 'BatchScan' | 'BatchMetadataReanalysis' | 'BatchCMAnalysis' |
-    'BatchSeriesResolution' | 'BackgroundAnalysis';
+    'BatchSeriesResolution' | 'BatchEpisodeResolution' | 'BackgroundAnalysis';
 export type AnalysisTaskStatus = 'Queued' | 'Running' | 'Succeeded' | 'Failed' | 'Interrupted' | 'Skipped';
 
 export interface IAnalysisTaskExecution {

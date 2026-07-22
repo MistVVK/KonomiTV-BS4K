@@ -38,13 +38,54 @@
                     v-model="settings.enabled" />
             </div>
             <div class="settings__item settings__item--switch">
-                <label class="settings__item-heading" for="recorded_series_ai_enabled">曖昧な候補の選択に AI API を使用する</label>
+                <label class="settings__item-heading" for="recorded_series_ai_enabled">AI API を使用する</label>
                 <label class="settings__item-label" for="recorded_series_ai_enabled">
-                    無効にすると、OpenAI 互換 API と Wikipedia へ一切接続せず、ローカル情報・EPG だけで判定します。<br>
+                    無効にすると、候補選択と話数検索のどちらでも AI API を使用しません。<br>
+                    シリーズ判定では Wikipedia へも接続せず、ローカル情報・EPG だけで判定します。<br>
                     API キーと保存済みの判定結果は削除されません。<br>
                 </label>
                 <v-switch id="recorded_series_ai_enabled" class="settings__item-switch" color="primary" hide-details
                     v-model="settings.ai_enabled" />
+            </div>
+            <div class="recorded-series-ai-options"
+                :class="{'recorded-series-ai-options--disabled': settings.ai_enabled === false}"
+                :inert="settings.ai_enabled === false">
+                <div class="settings__item settings__item--switch">
+                    <label class="settings__item-heading" for="recorded_series_ai_candidate_selection_enabled">
+                        曖昧なシリーズ候補の選択に使う
+                    </label>
+                    <label class="settings__item-label" for="recorded_series_ai_candidate_selection_enabled">
+                        ローカル情報・EPG だけで確定できない場合に、Wikipedia 候補と既存シリーズから選択します。<br>
+                    </label>
+                    <v-switch id="recorded_series_ai_candidate_selection_enabled" class="settings__item-switch"
+                        color="primary" hide-details v-model="settings.ai_candidate_selection_enabled" />
+                </div>
+                <div class="settings__item settings__item--switch">
+                    <label class="settings__item-heading" for="recorded_series_ai_episode_number_search_enabled">
+                        <span>話数不明時の Web 検索に使う</span>
+                        <span class="recorded-series-beta-badge">BETA</span>
+                    </label>
+                    <label class="settings__item-label" for="recorded_series_ai_episode_number_search_enabled">
+                        Series が確定していて話数だけ不明な録画を、AI の Web 検索で判定します。<br>
+                        既存録画は自動検索せず、下の専用ボタンから明示的に開始します。<br>
+                    </label>
+                    <v-switch id="recorded_series_ai_episode_number_search_enabled" class="settings__item-switch"
+                        color="primary" hide-details :model-value="settings.ai_episode_number_search_enabled"
+                        @update:model-value="updateEpisodeNumberSearchEnabled" />
+                </div>
+                <div class="settings__item"
+                    :class="{'recorded-series-ai-options--disabled': settings.ai_episode_number_search_enabled === false}"
+                    :inert="settings.ai_episode_number_search_enabled === false">
+                    <div class="settings__item-heading">Web 検索結果の受理条件</div>
+                    <div class="settings__item-label">
+                        「高信頼度のみ」は引用または Web 検索元があり、信頼度 80% 以上の結果だけを確定します。<br>
+                        「常に受理」は Web 検索を実行して得た有効な数値を、信頼度にかかわらず確定します。<br>
+                    </div>
+                    <v-select class="settings__item-form" color="primary" variant="outlined"
+                        :density="is_form_dense ? 'compact' : 'default'"
+                        :items="episode_acceptance_modes" item-title="title" item-value="value"
+                        v-model="settings.ai_episode_number_acceptance_mode" />
+                </div>
             </div>
 
             <div class="settings__content-heading mt-7">
@@ -108,10 +149,16 @@
                     @click:appendInner="api_key_showing = !api_key_showing" />
                 <div class="recorded-series-actions mt-3">
                     <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :loading="is_testing_connection"
-                        :disabled="has_connection_validation_error"
-                        @click="testConnection()">
-                        <Icon icon="fluent:plug-connected-checkmark-20-filled" class="mr-2" width="21px" />接続テスト
+                        :loading="testing_connection_capability === 'CandidateSelection'"
+                        :disabled="has_connection_validation_error || testing_connection_capability !== null"
+                        @click="testConnection('CandidateSelection')">
+                        <Icon icon="fluent:plug-connected-checkmark-20-filled" class="mr-2" width="21px" />候補選択をテスト
+                    </v-btn>
+                    <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
+                        :loading="testing_connection_capability === 'EpisodeLookup'"
+                        :disabled="has_connection_validation_error || testing_connection_capability !== null"
+                        @click="testConnection('EpisodeLookup')">
+                        <Icon icon="fluent:globe-search-20-filled" class="mr-2" width="21px" />話数 Web 検索をテスト
                     </v-btn>
                     <v-btn v-if="settings.api_key_configured" class="settings__save-button" color="error" variant="flat"
                         :loading="is_deleting_api_key" @click="api_key_delete_dialog = true">
@@ -119,7 +166,27 @@
                     </v-btn>
                 </div>
                 <div class="settings__item-label mt-2">
-                    接続テストでは本番判定と同じ API へ最小リクエストを送るため、少量の API 利用が発生します。入力内容は保存されません。<br>
+                    候補選択は Chat Completions、話数検索は Responses API と Web Search の能力を個別に確認します。<br>
+                    本番と同じ API へ最小リクエストを送るため、少量の API 利用が発生します。入力内容は保存されません。<br>
+                </div>
+                <div v-if="has_connection_test_result" class="recorded-series-connection-results mt-3">
+                    <template v-for="capability in connection_test_capabilities" :key="capability.value">
+                        <div v-if="connection_test_results[capability.value] !== null"
+                            class="recorded-series-connection-result"
+                            :class="{'recorded-series-connection-result--error':
+                                connection_test_results[capability.value]?.success === false}">
+                            <Icon :icon="connection_test_results[capability.value]?.success ?
+                                'fluent:checkmark-circle-20-filled' : 'fluent:error-circle-20-filled'" width="21px" />
+                            <div>
+                                <strong>{{capability.title}}</strong>
+                                <span>{{connection_test_results[capability.value]?.message}}</span>
+                                <small>
+                                    {{connection_test_results[capability.value]?.model}} /
+                                    {{connection_test_results[capability.value]?.latency_ms.toLocaleString()}} ms
+                                </small>
+                            </div>
+                        </div>
+                    </template>
                 </div>
             </div>
             <v-btn class="settings__save-button bg-secondary mt-6" variant="flat"
@@ -134,24 +201,49 @@
                 <span class="ml-2">判定状況</span>
             </div>
             <template v-if="status !== null">
-                <div class="recorded-series-status-grid mt-5">
-                    <div class="recorded-series-status-card">
-                        <span>録画総数</span><strong>{{status.total.toLocaleString()}}</strong>
+                <div class="settings__item">
+                    <div class="settings__item-heading">シリーズ判定</div>
+                    <div class="recorded-series-status-grid mt-3">
+                        <div class="recorded-series-status-card">
+                            <span>録画総数</span><strong>{{status.total.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card">
+                            <span>シリーズ確定</span><strong>{{status.resolved.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card">
+                            <span>単発番組</span><strong>{{status.not_series.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card">
+                            <span>未判定</span><strong>{{status.pending.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card">
+                            <span>要確認</span><strong>{{status.needs_review.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card"
+                            :class="{'recorded-series-status-card--error': status.failed > 0}">
+                            <span>失敗</span><strong>{{status.failed.toLocaleString()}}</strong>
+                        </div>
                     </div>
-                    <div class="recorded-series-status-card">
-                        <span>シリーズ確定</span><strong>{{status.resolved.toLocaleString()}}</strong>
-                    </div>
-                    <div class="recorded-series-status-card">
-                        <span>単発番組</span><strong>{{status.not_series.toLocaleString()}}</strong>
-                    </div>
-                    <div class="recorded-series-status-card">
-                        <span>未判定</span><strong>{{status.pending.toLocaleString()}}</strong>
-                    </div>
-                    <div class="recorded-series-status-card">
-                        <span>要確認</span><strong>{{status.needs_review.toLocaleString()}}</strong>
-                    </div>
-                    <div class="recorded-series-status-card" :class="{'recorded-series-status-card--error': status.failed > 0}">
-                        <span>失敗</span><strong>{{status.failed.toLocaleString()}}</strong>
+                </div>
+                <div class="settings__item">
+                    <div class="settings__item-heading">話数判定</div>
+                    <div class="recorded-series-status-grid mt-3">
+                        <div class="recorded-series-status-card">
+                            <span>話数確定</span><strong>{{status.episode_resolved.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card">
+                            <span>話数不明</span><strong>{{status.episode_unknown.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card">
+                            <span>公式話数なし</span><strong>{{status.episode_not_numbered.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card">
+                            <span>要確認</span><strong>{{status.episode_needs_review.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card"
+                            :class="{'recorded-series-status-card--error': status.episode_failed > 0}">
+                            <span>失敗</span><strong>{{status.episode_failed.toLocaleString()}}</strong>
+                        </div>
                     </div>
                 </div>
                 <div class="settings__item">
@@ -159,7 +251,10 @@
                     <div class="settings__item-label">
                         {{status.ai_requests_today.toLocaleString()}} /
                         {{settings.daily_ai_request_limit === 0 ? '無制限' : settings.daily_ai_request_limit.toLocaleString()}} リクエスト<br>
-                        最終実行: {{formatLastRunAt(status.last_run_at)}}<br>
+                        内訳: シリーズ候補 {{status.series_ai_requests_today.toLocaleString()}}・
+                        話数検索 {{status.episode_ai_requests_today.toLocaleString()}}<br>
+                        シリーズ判定の最終実行: {{formatLastRunAt(status.last_run_at)}}<br>
+                        話数判定の最終実行: {{formatLastRunAt(status.episode_last_run_at)}}<br>
                     </div>
                 </div>
             </template>
@@ -202,6 +297,49 @@
                 </v-btn>
             </div>
 
+            <v-divider class="mt-7" />
+            <div class="settings__item">
+                <div class="settings__item-heading">既存録画の話数を判定</div>
+                <div class="settings__item-label">
+                    シリーズ確定済みで話数が不明な既存録画を対象に、AI の Web 検索でシーズン・話数を判定します。<br>
+                    通常実行では、自動で確定済み、公式話数なし、手動訂正済みの結果は再検索しません。<br>
+                    現在サーバーに保存されている設定と、本日の共有 AI API 上限の残りを使用します。<br>
+                    <template v-if="episode_backfill_available === false">
+                        実行するには「AI API を使用する」と「話数不明時の Web 検索に使う」を有効にして、先に設定を保存してください。<br>
+                    </template>
+                </div>
+            </div>
+            <div class="settings__item settings__item--switch">
+                <label class="settings__item-heading" for="recorded_episode_force_backfill">確定済みを含む前回結果も再検索する</label>
+                <label class="settings__item-label" for="recorded_episode_force_backfill">
+                    有効にすると、手動訂正以外の確定済み・失敗・要確認・公式話数なしをすべて再検索します。<br>
+                    新しい結果を確定できない場合は、最後に確定した話数を保持します。追加の API 利用が発生します。
+                </label>
+                <v-switch id="recorded_episode_force_backfill" class="settings__item-switch" color="primary" hide-details
+                    :disabled="is_episode_backfill_running"
+                    v-model="force_episode_backfill" />
+            </div>
+            <div class="settings__item">
+                <v-progress-linear v-if="is_episode_backfill_running" class="mt-4" color="primary" height="7" rounded
+                    :indeterminate="episode_backfill_progress === null"
+                    :model-value="episode_backfill_progress ?? undefined" />
+                <div v-if="episode_backfill_task !== null" class="settings__item-label mt-2">
+                    {{stageLabel(episode_backfill_task.stage)}}
+                    <template v-if="episode_backfill_progress !== null">・{{episode_backfill_progress.toFixed(0)}}%</template>
+                    <template v-if="episode_backfill_task.total_count > 0">
+                        ・{{episode_backfill_task.current_count.toLocaleString()}} /
+                        {{episode_backfill_task.total_count.toLocaleString()}} 件
+                    </template>
+                </div>
+                <v-btn class="settings__save-button mt-4" color="background-lighten-2" variant="flat"
+                    :loading="is_starting_episode_backfill"
+                    :disabled="is_episode_backfill_running || episode_backfill_available === false"
+                    @click="startEpisodeBackfill()">
+                    <Icon icon="fluent:globe-search-20-filled" class="mr-2" width="22px" />
+                    {{force_episode_backfill ? '確定済みを含めて話数を再判定' : '既存録画の話数判定を開始'}}
+                </v-btn>
+            </div>
+
             </div>
 
             <div class="settings__content">
@@ -209,7 +347,7 @@
                 <div class="settings__item">
                     <div class="settings__item-heading">録画シリーズ管理</div>
                     <div class="settings__item-label">
-                        判定済みのシリーズを検索し、表示するタイトルと説明を編集できます。<br>
+                        判定済みのシリーズを検索し、表示するタイトル・説明と、録画ごとのシーズン・話数を編集できます。<br>
                         録画ごとの所属先は、各録画の再生画面にある「シリーズを訂正」から変更できます。<br>
                     </div>
                     <v-btn class="settings__save-button mt-4" variant="flat"
@@ -233,6 +371,25 @@
                 </v-card-actions>
             </v-card>
         </v-dialog>
+        <v-dialog v-model="episode_number_search_warning_dialog" max-width="560">
+            <v-card class="recorded-series-dialog">
+                <v-card-title>話数 Web 検索（BETA）を有効化</v-card-title>
+                <v-card-text>
+                    <v-alert class="mb-4" color="warning" variant="tonal">
+                        この機能は未成熟な BETA オプションのため、使用を推奨しません。
+                    </v-alert>
+                    Web 検索結果や AI の判定が誤っていても、受理条件によっては誤った話数を確定する可能性があります。<br>
+                    内容を理解した上で、それでも利用する場合だけ有効にしてください。
+                </v-card-text>
+                <v-card-actions>
+                    <v-spacer />
+                    <v-btn variant="text" @click="episode_number_search_warning_dialog = false">キャンセル</v-btn>
+                    <v-btn color="warning" variant="flat" @click="confirmEpisodeNumberSearchEnabled()">
+                        それでも有効にする
+                    </v-btn>
+                </v-card-actions>
+            </v-card>
+        </v-dialog>
     </SettingsBase>
 </template>
 
@@ -244,9 +401,12 @@ import Message from '@/message';
 import AnalysisTasks, { type IAnalysisTaskExecution } from '@/services/AnalysisTasks';
 import RecordedSeries, {
     type IRecordedSeriesConnectionTestRequest,
+    type IRecordedSeriesConnectionTestResult,
     type IRecordedSeriesSettings,
     type IRecordedSeriesSettingsUpdate,
     type IRecordedSeriesStatus,
+    type RecordedEpisodeNumberAcceptanceMode,
+    type RecordedSeriesConnectionTestCapability,
 } from '@/services/RecordedSeries';
 import { stageLabel } from '@/stores/AnalysisTasksStore';
 import useUserStore from '@/stores/UserStore';
@@ -259,41 +419,84 @@ const model_presets = [
     'gpt-5.4-nano',
     'gpt-5-nano',
 ];
+const episode_acceptance_modes: {title: string; value: RecordedEpisodeNumberAcceptanceMode;}[] = [
+    {title: '高信頼度の結果のみ受理', value: 'HighConfidenceOnly'},
+    {title: '有効な数値なら常に受理', value: 'Always'},
+];
+const connection_test_capabilities: {title: string; value: RecordedSeriesConnectionTestCapability;}[] = [
+    {title: 'シリーズ候補選択', value: 'CandidateSelection'},
+    {title: '話数 Web 検索', value: 'EpisodeLookup'},
+];
+type ConnectionTestResults = Record<RecordedSeriesConnectionTestCapability, IRecordedSeriesConnectionTestResult | null>;
 
 // API 取得前は入力欄を操作できないため、安全側の無効値を初期値にする。
 const settings = ref<IRecordedSeriesSettings>({
     enabled: true,
     ai_enabled: false,
+    ai_candidate_selection_enabled: true,
+    ai_episode_number_search_enabled: false,
+    ai_episode_number_acceptance_mode: 'Always',
     api_base_url: 'https://api.openai.com/v1',
     model: 'gpt-5.6-luna',
     daily_ai_request_limit: 20,
     api_key_configured: false,
 });
 const saved_api_base_url = ref(settings.value.api_base_url);
+const saved_ai_enabled = ref(settings.value.ai_enabled);
+const saved_ai_episode_number_search_enabled = ref(settings.value.ai_episode_number_search_enabled);
 const status = ref<IRecordedSeriesStatus | null>(null);
 
 // API キーは共有ストアへ入れず、この画面が開いている間だけローカルメモリに保持する。
 const api_key_input = ref('');
 const api_key_showing = ref(false);
 const api_key_delete_dialog = ref(false);
+const episode_number_search_warning_dialog = ref(false);
 
 const is_loading = ref(true);
 const is_disabled = ref(true);
 const is_saving = ref(false);
-const is_testing_connection = ref(false);
+const testing_connection_capability = ref<RecordedSeriesConnectionTestCapability | null>(null);
+const connection_test_results = ref<ConnectionTestResults>({
+    CandidateSelection: null,
+    EpisodeLookup: null,
+});
 const is_deleting_api_key = ref(false);
 const is_starting_backfill = ref(false);
 const is_monitoring_backfill = ref(false);
+const is_starting_episode_backfill = ref(false);
+const is_monitoring_episode_backfill = ref(false);
 const is_refreshing_status = ref(false);
 const authorization_error = ref<'AdminRequired' | 'UserUnavailable' | null>(null);
 const backfill_task = ref<IAnalysisTaskExecution | null>(null);
+const episode_backfill_task = ref<IAnalysisTaskExecution | null>(null);
 const force_backfill = ref(false);
+const force_episode_backfill = ref(false);
 
 const is_form_dense = Utils.isSmartphoneHorizontal();
 const user_store = useUserStore();
 
 let backfill_abort_controller: AbortController | null = null;
+let episode_backfill_abort_controller: AbortController | null = null;
 let status_polling_timer: number | null = null;
+
+
+/** BETA 機能は警告への明示的な同意が得られるまで有効化しない。 */
+function updateEpisodeNumberSearchEnabled(enabled: boolean | null): void {
+    if (enabled !== true) {
+        settings.value.ai_episode_number_search_enabled = false;
+        episode_number_search_warning_dialog.value = false;
+        return;
+    }
+    if (settings.value.ai_episode_number_search_enabled === false) {
+        episode_number_search_warning_dialog.value = true;
+    }
+}
+
+/** BETA 警告で利用継続を選んだ場合だけ、話数 Web 検索を有効化する。 */
+function confirmEpisodeNumberSearchEnabled(): void {
+    settings.value.ai_episode_number_search_enabled = true;
+    episode_number_search_warning_dialog.value = false;
+}
 
 
 /** API の URL が OpenAI 互換 API の接続先として扱える HTTP(S) URL かを確認する。 */
@@ -357,15 +560,34 @@ const has_settings_validation_error = computed(() =>
     daily_ai_request_limit_error.value !== '' ||
     api_key_error.value !== '',
 );
+const has_connection_test_result = computed(() =>
+    connection_test_results.value.CandidateSelection !== null ||
+    connection_test_results.value.EpisodeLookup !== null,
+);
 const is_settings_action_running = computed(() =>
-    is_saving.value || is_testing_connection.value || is_deleting_api_key.value,
+    is_saving.value || testing_connection_capability.value !== null || is_deleting_api_key.value,
 );
 const is_backfill_running = computed(() =>
     is_starting_backfill.value || is_monitoring_backfill.value || status.value?.is_running === true,
 );
+const is_episode_backfill_running = computed(() =>
+    is_starting_episode_backfill.value ||
+    is_monitoring_episode_backfill.value ||
+    status.value?.is_episode_running === true,
+);
+const episode_backfill_available = computed(() =>
+    settings.value.ai_enabled &&
+    settings.value.ai_episode_number_search_enabled &&
+    saved_ai_enabled.value &&
+    saved_ai_episode_number_search_enabled.value,
+);
 const backfill_progress = computed(() => {
     if (backfill_task.value?.progress === null || backfill_task.value?.progress === undefined) return null;
     return Math.max(0, Math.min(100, backfill_task.value.progress * 100));
+});
+const episode_backfill_progress = computed(() => {
+    if (episode_backfill_task.value?.progress === null || episode_backfill_task.value?.progress === undefined) return null;
+    return Math.max(0, Math.min(100, episode_backfill_task.value.progress * 100));
 });
 
 
@@ -385,7 +607,12 @@ async function refreshStatus(show_error = false): Promise<void> {
     if (fetched_status === null) return;
 
     status.value = fetched_status;
-    if (fetched_status.is_running === false && is_monitoring_backfill.value === false) {
+    if (
+        fetched_status.is_running === false &&
+        fetched_status.is_episode_running === false &&
+        is_monitoring_backfill.value === false &&
+        is_monitoring_episode_backfill.value === false
+    ) {
         stopStatusPolling();
     }
 }
@@ -410,6 +637,9 @@ async function saveSettings(): Promise<void> {
     const request = appendDraftAPIKey<IRecordedSeriesSettingsUpdate>({
         enabled: settings.value.enabled,
         ai_enabled: settings.value.ai_enabled,
+        ai_candidate_selection_enabled: settings.value.ai_candidate_selection_enabled,
+        ai_episode_number_search_enabled: settings.value.ai_episode_number_search_enabled,
+        ai_episode_number_acceptance_mode: settings.value.ai_episode_number_acceptance_mode,
         api_base_url: settings.value.api_base_url.trim().replace(/\/+$/, ''),
         model: settings.value.model.trim(),
         daily_ai_request_limit: Number(settings.value.daily_ai_request_limit),
@@ -419,12 +649,17 @@ async function saveSettings(): Promise<void> {
         settings.value = {
             enabled: request.enabled,
             ai_enabled: request.ai_enabled,
+            ai_candidate_selection_enabled: request.ai_candidate_selection_enabled,
+            ai_episode_number_search_enabled: request.ai_episode_number_search_enabled,
+            ai_episode_number_acceptance_mode: request.ai_episode_number_acceptance_mode,
             api_base_url: request.api_base_url,
             model: request.model,
             daily_ai_request_limit: request.daily_ai_request_limit,
             api_key_configured: settings.value.api_key_configured || request.api_key !== undefined,
         };
         saved_api_base_url.value = request.api_base_url;
+        saved_ai_enabled.value = request.ai_enabled;
+        saved_ai_episode_number_search_enabled.value = request.ai_episode_number_search_enabled;
         api_key_input.value = '';
         api_key_showing.value = false;
         Message.success('録画シリーズ判定設定を更新しました。');
@@ -432,22 +667,26 @@ async function saveSettings(): Promise<void> {
     is_saving.value = false;
 }
 
-/** 現在のドラフトを保存せず、本番と同じ OpenAI 互換 API への最小リクエストを試す。 */
-async function testConnection(): Promise<void> {
+/** 現在のドラフトを保存せず、指定した本番能力と同じ OpenAI 互換 API の最小リクエストを試す。 */
+async function testConnection(capability: RecordedSeriesConnectionTestCapability): Promise<void> {
     if (has_connection_validation_error.value || is_settings_action_running.value) return;
 
-    is_testing_connection.value = true;
+    testing_connection_capability.value = capability;
+    connection_test_results.value[capability] = null;
     const request = appendDraftAPIKey<IRecordedSeriesConnectionTestRequest>({
+        capability,
         api_base_url: settings.value.api_base_url.trim().replace(/\/+$/, ''),
         model: settings.value.model.trim(),
     });
     const result = await RecordedSeries.testConnection(request);
+    const capability_title = connection_test_capabilities.find(item => item.value === capability)?.title ?? capability;
+    connection_test_results.value[capability] = result;
     if (result?.success) {
-        Message.success(`OpenAI 互換 API へ接続できました。（${result.model} / ${result.latency_ms.toLocaleString()} ms）`);
+        Message.success(`${capability_title}の接続テストに成功しました。（${result.model} / ${result.latency_ms.toLocaleString()} ms）`);
     } else if (result !== null) {
-        Message.error(`OpenAI 互換 API へ接続できませんでした。\n${result.message}`);
+        Message.error(`${capability_title}の接続テストに失敗しました。\n${result.message}`);
     }
-    is_testing_connection.value = false;
+    testing_connection_capability.value = null;
 }
 
 /** 保存済み API キーを、確認ダイアログから明示的に削除する。 */
@@ -503,6 +742,87 @@ async function startBackfill(): Promise<void> {
     }
 }
 
+/** Series 確定済みで話数が不明な既存録画を、バックグラウンドで話数判定する。 */
+async function startEpisodeBackfill(): Promise<void> {
+    const confirmation_message = force_episode_backfill.value ?
+        '手動訂正以外の確定済み・失敗・要確認・公式話数なしをすべて再検索します。新しい結果を確定できない場合は最後の確定値を保持します。録画件数分の追加 AI API 利用が発生することがあります。続行しますか？' :
+        'シリーズ確定済みで話数が不明な既存録画を判定します。保存済み設定で AI の Web 検索を実行するため、API 利用が発生することがあります。続行しますか？';
+    const confirmed = window.confirm(confirmation_message);
+    if (confirmed === false) return;
+
+    is_starting_episode_backfill.value = true;
+    const accepted = await RecordedSeries.startEpisodeBackfill(force_episode_backfill.value);
+    is_starting_episode_backfill.value = false;
+    if (accepted === null) return;
+
+    status.value = status.value === null ? null : {...status.value, is_episode_running: true};
+    is_monitoring_episode_backfill.value = true;
+    startStatusPolling();
+    Message.info(accepted.reused ? '実行中の話数判定を引き続き監視します。' : '既存録画の話数判定を開始しました。');
+
+    // Series 一括判定とは独立した AnalysisTask を追跡し、それぞれの進捗を混同しない。
+    episode_backfill_abort_controller?.abort();
+    episode_backfill_abort_controller = new AbortController();
+    const execution = await AnalysisTasks.waitForCompletion(
+        accepted.execution_id,
+        episode_backfill_abort_controller.signal,
+        task => episode_backfill_task.value = task,
+    );
+    if (episode_backfill_abort_controller.signal.aborted) return;
+
+    is_monitoring_episode_backfill.value = false;
+    await refreshStatus();
+    if (
+        execution !== null &&
+        ['Succeeded', 'Failed'].includes(execution.status) &&
+        hasAnalysisSummaryCount(execution, 'resolved') &&
+        hasAnalysisSummaryCount(execution, 'not_numbered') &&
+        hasAnalysisSummaryCount(execution, 'needs_review')
+    ) {
+        const resolved_count = analysisSummaryCount(execution, 'resolved');
+        const not_numbered_count = analysisSummaryCount(execution, 'not_numbered');
+        const needs_review_count = analysisSummaryCount(execution, 'needs_review');
+        const failed_count = analysisSummaryCount(execution, 'failed');
+        const skipped_count = analysisSummaryCount(execution, 'skipped');
+        const preserved_count = analysisSummaryCount(execution, 'preserved');
+        const result_parts = [
+            `話数確定 ${resolved_count.toLocaleString()} 件`,
+            `公式話数なし ${not_numbered_count.toLocaleString()} 件`,
+            `要確認 ${needs_review_count.toLocaleString()} 件`,
+        ];
+        if (failed_count > 0) result_parts.push(`失敗 ${failed_count.toLocaleString()} 件`);
+        if (skipped_count > 0) result_parts.push(`スキップ ${skipped_count.toLocaleString()} 件`);
+        if (preserved_count > 0) result_parts.push(`旧値維持 ${preserved_count.toLocaleString()} 件`);
+        const result_summary = result_parts.join('・');
+        if (execution.summary?.stopped_by_daily_limit === true) {
+            Message.warning(
+                `本日の AI API 上限に達したため途中で終了しました（${result_summary}）。` +
+                '残りは次回の実行で判定します。',
+            );
+        } else if (needs_review_count > 0 || failed_count > 0 || execution.status === 'Failed') {
+            Message.warning(`既存録画の話数判定が完了しました（${result_summary}）。`);
+        } else {
+            Message.success(`既存録画の話数判定が完了しました（${result_summary}）。`);
+        }
+    } else if (execution?.status === 'Interrupted') {
+        Message.warning('既存録画の話数判定が中断されました。');
+    } else if (execution !== null) {
+        Message.error(`既存録画の話数判定に失敗しました。${execution.error_message ? `\n${execution.error_message}` : ''}`);
+    }
+}
+
+/** AnalysisTaskの自由形式summaryから、非負の件数だけを安全に取り出す。 */
+function analysisSummaryCount(execution: IAnalysisTaskExecution, key: string): number {
+    const value = execution.summary?.[key];
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+/** 指定したsummary件数が、新形式の完了結果に存在するかを判定する。 */
+function hasAnalysisSummaryCount(execution: IAnalysisTaskExecution, key: string): boolean {
+    const value = execution.summary?.[key];
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
 function formatLastRunAt(value: string | null): string {
     return value === null ? '未実行' : dayjs(value).format('YYYY/M/D HH:mm:ss');
 }
@@ -530,11 +850,13 @@ onMounted(async () => {
     if (fetched_settings !== null) {
         settings.value = fetched_settings;
         saved_api_base_url.value = fetched_settings.api_base_url;
+        saved_ai_enabled.value = fetched_settings.ai_enabled;
+        saved_ai_episode_number_search_enabled.value = fetched_settings.ai_episode_number_search_enabled;
         is_disabled.value = false;
     }
     if (fetched_status !== null) {
         status.value = fetched_status;
-        if (fetched_status.is_running) startStatusPolling();
+        if (fetched_status.is_running || fetched_status.is_episode_running) startStatusPolling();
     }
     is_loading.value = false;
 });
@@ -543,6 +865,7 @@ onUnmounted(() => {
     // 画面を離れたら API キー入力とポーリングを即座に破棄する。
     api_key_input.value = '';
     backfill_abort_controller?.abort();
+    episode_backfill_abort_controller?.abort();
     stopStatusPolling();
 });
 
@@ -554,6 +877,80 @@ onUnmounted(() => {
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
+}
+
+.recorded-series-beta-badge {
+    flex-shrink: 0;
+    margin-left: 8px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgb(var(--v-theme-warning));
+    color: rgb(var(--v-theme-on-warning));
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 18px;
+    letter-spacing: 0.08em;
+}
+
+.recorded-series-ai-options {
+    margin-left: 18px;
+    padding-left: 17px;
+    border-left: 3px solid rgba(var(--v-theme-primary), 0.35);
+    transition: opacity 0.2s;
+
+    &--disabled {
+        opacity: 0.5;
+    }
+}
+
+.recorded-series-connection-results {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.recorded-series-connection-result {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    color: rgb(var(--v-theme-success-readable));
+    background: rgba(var(--v-theme-success), 0.1);
+
+    > div {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+    }
+
+    strong,
+    span,
+    small {
+        overflow-wrap: anywhere;
+    }
+
+    strong {
+        color: rgb(var(--v-theme-text));
+        font-size: 12.5px;
+    }
+
+    span {
+        margin-top: 2px;
+        color: rgb(var(--v-theme-text-darken-1));
+        font-size: 11.5px;
+    }
+
+    small {
+        margin-top: 3px;
+        color: rgb(var(--v-theme-text-darken-1));
+        font-size: 10.5px;
+    }
+
+    &--error {
+        color: rgb(var(--v-theme-error-readable));
+        background: rgba(var(--v-theme-error), 0.1);
+    }
 }
 
 .recorded-series-access-state {
@@ -600,6 +997,11 @@ onUnmounted(() => {
 }
 
 @include smartphone-vertical {
+    .recorded-series-ai-options {
+        margin-left: 8px;
+        padding-left: 11px;
+    }
+
     .recorded-series-status-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }

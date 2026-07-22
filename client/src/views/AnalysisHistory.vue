@@ -106,6 +106,7 @@ const typeOptions = [
     {title: 'CM区間解析', value: 'CMAnalysis'}, {title: 'CMロゴ生成', value: 'CMLogoGeneration'},
     {title: '全件メタデータ再解析', value: 'BatchMetadataReanalysis'}, {title: '全件CM再判定', value: 'BatchCMAnalysis'},
     {title: '既存録画シリーズ一括判定', value: 'BatchSeriesResolution'},
+    {title: '既存録画話数一括判定', value: 'BatchEpisodeResolution'},
     {title: 'バックグラウンド一括解析', value: 'BackgroundAnalysis'},
 ];
 const statusOptions = [
@@ -144,7 +145,39 @@ function durationLabel(task: IAnalysisTaskExecution): string {
     const seconds = Math.max(0, end.diff(dayjs(task.started_at), 'second'));
     return seconds >= 3600 ? `${Math.floor(seconds / 3600)}時間${Math.floor(seconds % 3600 / 60)}分` : `${Math.floor(seconds / 60)}分${seconds % 60}秒`;
 }
+function summaryCount(task: IAnalysisTaskExecution, key: string): number | null {
+    const value = task.summary?.[key];
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+function episodeResolutionResultLabel(task: IAnalysisTaskExecution): string {
+    const resolved_count = summaryCount(task, 'resolved');
+    const not_numbered_count = summaryCount(task, 'not_numbered');
+    const needs_review_count = summaryCount(task, 'needs_review');
+    if (resolved_count !== null && not_numbered_count !== null && needs_review_count !== null) {
+        const labels = [
+            `${task.current_count}/${task.total_count}件`,
+            `話数確定${resolved_count}`,
+            `公式話数なし${not_numbered_count}`,
+            `要確認${needs_review_count}`,
+        ];
+        const failed_count = summaryCount(task, 'failed') ?? task.failed_count;
+        const skipped_count = summaryCount(task, 'skipped') ?? task.skipped_count;
+        const preserved_count = summaryCount(task, 'preserved') ?? 0;
+        if (failed_count > 0) labels.push(`失敗${failed_count}`);
+        if (skipped_count > 0) labels.push(`スキップ${skipped_count}`);
+        if (preserved_count > 0) labels.push(`旧値維持${preserved_count}`);
+        return labels.join('・');
+    }
+
+    // 旧履歴と実行中の履歴は内訳を持たないため、要確認を成功と誤表示しない表現で件数を表示する。
+    if (task.total_count > 0) {
+        return `${task.current_count}/${task.total_count}件・処理済み${task.succeeded_count}・失敗${task.failed_count}` +
+            (task.skipped_count > 0 ? `・スキップ${task.skipped_count}` : '');
+    }
+    return statusLabel(task.status);
+}
 function resultLabel(task: IAnalysisTaskExecution): string {
+    if (task.task_type === 'BatchEpisodeResolution') return episodeResolutionResultLabel(task);
     if (task.status === 'Failed') return `失敗${task.error_code ? `・${task.error_code}` : ''}`;
     if (task.total_count > 0) return `${task.current_count}/${task.total_count}件・成功${task.succeeded_count}・失敗${task.failed_count}`;
     return statusLabel(task.status);

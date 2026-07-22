@@ -3,10 +3,17 @@ import type { IAnalysisTaskAccepted } from '@/services/AnalysisTasks';
 import APIClient from '@/services/APIClient';
 
 
+export type RecordedEpisodeNumberAcceptanceMode = 'HighConfidenceOnly' | 'Always';
+export type RecordedSeriesConnectionTestCapability = 'CandidateSelection' | 'EpisodeLookup';
+
+
 /** 録画シリーズ判定のサーバー共有設定。API キーそのものは取得レスポンスに含めない。 */
 export interface IRecordedSeriesSettings {
     enabled: boolean;
     ai_enabled: boolean;
+    ai_candidate_selection_enabled: boolean;
+    ai_episode_number_search_enabled: boolean;
+    ai_episode_number_acceptance_mode: RecordedEpisodeNumberAcceptanceMode;
     api_base_url: string;
     model: string;
     daily_ai_request_limit: number;
@@ -17,6 +24,9 @@ export interface IRecordedSeriesSettings {
 export interface IRecordedSeriesSettingsUpdate {
     enabled: boolean;
     ai_enabled: boolean;
+    ai_candidate_selection_enabled: boolean;
+    ai_episode_number_search_enabled: boolean;
+    ai_episode_number_acceptance_mode: RecordedEpisodeNumberAcceptanceMode;
     api_base_url: string;
     model: string;
     daily_ai_request_limit: number;
@@ -25,6 +35,7 @@ export interface IRecordedSeriesSettingsUpdate {
 
 /** OpenAI 互換 API の接続テストリクエスト。 */
 export interface IRecordedSeriesConnectionTestRequest {
+    capability: RecordedSeriesConnectionTestCapability;
     api_base_url: string;
     model: string;
     api_key?: string;
@@ -46,9 +57,18 @@ export interface IRecordedSeriesStatus {
     not_series: number;
     needs_review: number;
     failed: number;
+    episode_resolved: number;
+    episode_unknown: number;
+    episode_not_numbered: number;
+    episode_needs_review: number;
+    episode_failed: number;
     ai_requests_today: number;
+    series_ai_requests_today: number;
+    episode_ai_requests_today: number;
     last_run_at: string | null;
+    episode_last_run_at: string | null;
     is_running: boolean;
+    is_episode_running: boolean;
 }
 
 /** 管理画面の一覧に表示する、録画シリーズの軽量な集計情報。 */
@@ -226,6 +246,16 @@ export default class RecordedSeries {
         const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/backfill', {force});
         if (response.type === 'error') {
             APIClient.showGenericError(response, '既存録画のシリーズ判定を開始できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    /** 既存録画の話数判定を開始する。force 時は自動判定済みの結果も再判定する。 */
+    static async startEpisodeBackfill(force = false): Promise<IAnalysisTaskAccepted | null> {
+        const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/episodes/backfill', {force});
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, '既存録画の話数判定を開始できませんでした。');
             return null;
         }
         return response.data;

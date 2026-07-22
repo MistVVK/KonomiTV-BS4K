@@ -65,15 +65,15 @@ def test_recorded_series_settings_defaults_are_safe(monkeypatch: pytest.MonkeyPa
     assert settings.enabled is True
     assert settings.ai_enabled is False
     assert settings.ai_candidate_selection_enabled is True
-    assert settings.ai_episode_number_search_enabled is True
-    assert settings.ai_episode_number_acceptance_mode == 'HighConfidenceOnly'
+    assert settings.ai_episode_number_search_enabled is False
+    assert settings.ai_episode_number_acceptance_mode == 'Always'
     assert settings.api_base_url == 'https://api.openai.com/v1'
     assert settings.model == 'gpt-5.6-luna'
     assert settings.daily_ai_request_limit == 20
     assert RecordedSeriesSettingsStore.getAPIKey() is None
 
 
-def test_legacy_settings_enable_new_child_switch_defaults(
+def test_legacy_settings_use_new_child_defaults(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -93,8 +93,8 @@ def test_legacy_settings_enable_new_child_switch_defaults(
 
     assert settings.ai_enabled is False
     assert settings.ai_candidate_selection_enabled is True
-    assert settings.ai_episode_number_search_enabled is True
-    assert settings.ai_episode_number_acceptance_mode == 'HighConfidenceOnly'
+    assert settings.ai_episode_number_search_enabled is False
+    assert settings.ai_episode_number_acceptance_mode == 'Always'
 
 
 @pytest.mark.parametrize('limit', [0, 1, 1000])
@@ -239,8 +239,8 @@ def test_recorded_series_settings_api_never_returns_api_key(
                 'enabled': True,
                 'ai_enabled': True,
                 'ai_candidate_selection_enabled': True,
-                'ai_episode_number_search_enabled': True,
-                'ai_episode_number_acceptance_mode': 'HighConfidenceOnly',
+                'ai_episode_number_search_enabled': False,
+                'ai_episode_number_acceptance_mode': 'Always',
                 'api_base_url': 'https://compatible.example/v1',
                 'model': 'gpt-5-nano',
                 'daily_ai_request_limit': 0,
@@ -569,7 +569,10 @@ def test_status_and_backfill_endpoints_return_task_contract(
     tmp_path: Path,
 ) -> None:
     ConfigureTemporaryStore(monkeypatch, tmp_path)
-    RecordedSeriesSettingsStore.saveSettings(RecordedSeriesSettings(ai_enabled=True))
+    RecordedSeriesSettingsStore.saveSettings(RecordedSeriesSettings(
+        ai_enabled=True,
+        ai_episode_number_search_enabled=True,
+    ))
     app = CreateAdminApp()
 
     async def GetStatus() -> dict[str, int | str | bool | None]:
