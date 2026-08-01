@@ -13,9 +13,11 @@ from app.CompatibilityAPI import (
     PortDispatchApplication,
     PreserveReservationSettingsForKomorebi,
     TransformRecordedProgramForKomorebi,
+    ValidateCompatibilityLiveStreamQuality,
     histories_router,
 )
 from app.constants import VERSION
+from app.routers import LiveStreamsRouter
 
 
 def BuildRecordedProgramResponse() -> dict[str, Any]:
@@ -354,3 +356,54 @@ def test_compatibility_app_rejects_unlisted_video_operations() -> None:
 
     response = asyncio.run(GetResponse())
     assert response.status_code == 404
+
+
+def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> None:
+    """互換 API の stream dependency は高度 codec query を通常 validator へ渡さない。"""
+
+    class _TerrestrialChannel:
+
+        is_radiochannel = False
+
+    class _TerrestrialChannelQuery:
+
+        async def get_or_none(self):
+            return _TerrestrialChannel()
+
+    monkeypatch.setattr(
+        LiveStreamsRouter,
+        'GetEncoderForLiveChannel',
+        lambda _display_channel_id: 'FFmpeg',
+    )
+    monkeypatch.setattr(
+        LiveStreamsRouter.Channel,
+        'filter',
+        lambda **_kwargs: _TerrestrialChannelQuery(),
+    )
+    stream_quality = asyncio.run(
+        ValidateCompatibilityLiveStreamQuality('1080p', 'gr011')
+    )
+    assert stream_quality.encoding_options.video_codec == 'avc'
+    assert stream_quality.encoding_options.video_bit_depth == 8
+    assert stream_quality.encoding_options.audio_codec == 'aac'
+
+    hevc_stream_quality = asyncio.run(
+        ValidateCompatibilityLiveStreamQuality('1080p-hevc', 'gr011')
+    )
+    assert hevc_stream_quality.encoding_options.video_codec == 'hevc'
+    assert hevc_stream_quality.encoding_options.audio_codec == 'aac'
+
+    compatibility_app = CreateCompatibilityAPI()
+    openapi_paths = compatibility_app.openapi()['paths']
+    live_parameters = openapi_paths[
+        '/api/streams/live/{display_channel_id}/{quality}/mpegts'
+    ]['get']['parameters']
+    recorded_parameters = openapi_paths[
+        '/api/streams/video/{video_id}/{quality}/playlist'
+    ]['get']['parameters']
+    assert {'video_codec', 'video_bit_depth', 'audio_codec'}.isdisjoint(
+        parameter['name'] for parameter in live_parameters
+    )
+    assert {'video_codec', 'video_bit_depth', 'audio_codec', 'audio_track'}.isdisjoint(
+        parameter['name'] for parameter in recorded_parameters
+    )

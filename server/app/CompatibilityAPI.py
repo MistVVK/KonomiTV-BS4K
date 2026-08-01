@@ -3,13 +3,24 @@ import re
 from collections.abc import Sequence
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Body, Depends, FastAPI, Response, status
+from fastapi import (
+    APIRouter,
+    Body,
+    Depends,
+    FastAPI,
+    Path,
+    Query,
+    Request,
+    Response,
+    status,
+)
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app import schemas
 from app.constants import VERSION
+from app.models.RecordedProgram import RecordedProgram
 from app.routers import (
     ChannelsRouter,
     LiveStreamsRouter,
@@ -19,6 +30,7 @@ from app.routers import (
     VideosRouter,
     VideoStreamsRouter,
 )
+from app.streams.StreamEncodingOptions import StreamQualityWithOptions
 from app.utils.edcb import ReserveDataRequired
 from app.utils.edcb.CtrlCmdUtil import CtrlCmdUtil
 from app.utils.HTTPS import ReverseProxyMiddleware
@@ -50,18 +62,6 @@ _KOMOREBI_V1_UPSTREAM_ROUTE_ALLOWLIST = frozenset({
     ('GET', '/api/videos/{video_id}/thumbnail'),
     ('GET', '/api/videos/{video_id}/thumbnail/tiled'),
     ('GET', '/api/videos/{video_id}/jikkyo'),
-    ('GET', '/api/streams/live/{display_channel_id}/{quality}/mpegts'),
-    ('GET', '/api/streams/live/{display_channel_id}/{quality}/events'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/playlist'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/video/playlist'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/video/init'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/video/segment'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/audio/{rendition_id}/playlist'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/audio/{rendition_id}/init'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/audio/{rendition_id}/segment'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/subtitle/{subtitle_index}/playlist'),
-    ('GET', '/api/streams/video/{video_id}/{quality}/subtitle/{subtitle_index}/webvtt'),
-    ('PUT', '/api/streams/video/{video_id}/{quality}/keep-alive'),
     ('GET', '/api/recording/reservations'),
     ('POST', '/api/recording/reservations'),
     ('DELETE', '/api/recording/reservations/{reservation_id}'),
@@ -172,6 +172,294 @@ def IncludeKomorebiV1UpstreamRoutes(
         raise RuntimeError(f'Komorebi V1 互換 API の実装ルートが見つかりません: {missing_routes_text}')
 
     compatibility_app.include_router(filtered_router)
+
+
+async def ValidateCompatibilityLiveStreamQuality(
+    quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
+    display_channel_id: Annotated[str, Depends(LiveStreamsRouter.ValidateChannelID)],
+) -> StreamQualityWithOptions:
+    """互換 API のライブ出力を旧 AVC / HEVC + AAC 契約へ固定する。"""
+
+    # 互換ルートの依存関係には高度 codec query を宣言しない。
+    # FastAPI が未知 query を無視しても、通常 API の validator へは固定値だけを渡すため、
+    # VP9 / AV1 / Opus や Bridge 起動条件へ到達できない。
+    return await LiveStreamsRouter.ValidateQuality(
+        quality,
+        display_channel_id,
+        None,
+        None,
+        'aac',
+    )
+
+
+async def ValidateCompatibilityRecordedStreamQuality(
+    quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+) -> StreamQualityWithOptions:
+    """互換 API の録画出力を旧 AVC / HEVC + AAC 契約へ固定する。"""
+
+    return await VideoStreamsRouter.ValidateQuality(
+        quality,
+        recorded_program,
+        None,
+        None,
+        'aac',
+        None,
+    )
+
+
+compatibility_live_streams_router = APIRouter(
+    tags = ['Compatibility - Live Streams'],
+    prefix = '/api/streams/live',
+)
+
+
+@compatibility_live_streams_router.get(
+    '/{display_channel_id}/{quality}/events',
+    response_class = Response,
+)
+async def CompatibilityLiveStreamEventAPI(
+    request: Request,
+    display_channel_id: Annotated[str, Depends(LiveStreamsRouter.ValidateChannelID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityLiveStreamQuality)],
+):
+    """
+    従来 codec に固定したライブ状態イベントを返す。
+
+    Args:
+        request (Request): 処理対象の HTTP request。
+        display_channel_id (Annotated[str, Depends(LiveStreamsRouter.ValidateChannelID)]): 対象チャンネルの表示用 ID。
+        stream_quality (Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityLiveStreamQuality)]): codec option を解決済みのライブ画質。
+
+    Returns:
+        None
+    """
+
+    request.state.stream_anchor_enabled = False
+    return await LiveStreamsRouter.LiveStreamEventAPI(request, display_channel_id, stream_quality)
+
+
+@compatibility_live_streams_router.get(
+    '/{display_channel_id}/{quality}/mpegts',
+    response_class = Response,
+)
+async def CompatibilityLiveMPEGTSStreamAPI(
+    request: Request,
+    display_channel_id: Annotated[str, Depends(LiveStreamsRouter.ValidateChannelID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityLiveStreamQuality)],
+):
+    """
+    Bridge を通らない従来 codec のライブ MPEG-TS を返す。
+
+    Args:
+        request (Request): 処理対象の HTTP request。
+        display_channel_id (Annotated[str, Depends(LiveStreamsRouter.ValidateChannelID)]): 対象チャンネルの表示用 ID。
+        stream_quality (Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityLiveStreamQuality)]): codec option を解決済みのライブ画質。
+
+    Returns:
+        None
+    """
+
+    request.state.stream_anchor_enabled = False
+    return await LiveStreamsRouter.LiveMPEGTSStreamAPI(
+        request,
+        display_channel_id,
+        stream_quality,
+    )
+
+
+compatibility_video_streams_router = APIRouter(
+    tags = ['Compatibility - Video Streams'],
+    prefix = '/api/streams/video',
+)
+
+
+@compatibility_video_streams_router.get('/{video_id}/{quality}/playlist', response_class = Response)
+async def CompatibilityVideoHLSPlaylistAPI(
+    request: Request,
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    """従来 codec に固定した録画 HLS master playlist を返す。"""
+
+    return await VideoStreamsRouter.VideoHLSPlaylistAPI(
+        request,
+        recorded_program,
+        stream_quality,
+        session_id,
+        cache_key,
+    )
+
+
+@compatibility_video_streams_router.get('/{video_id}/{quality}/video/playlist', response_class = Response)
+async def CompatibilityVideoHLSVideoPlaylistAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    return await VideoStreamsRouter.VideoHLSVideoPlaylistAPI(
+        recorded_program,
+        stream_quality,
+        session_id,
+        cache_key,
+    )
+
+
+@compatibility_video_streams_router.get('/{video_id}/{quality}/video/init', response_class = Response)
+async def CompatibilityVideoHLSVideoInitSegmentAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+    generation: Annotated[int, Query()],
+    sequence: Annotated[int, Query()] = 0,
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    return await VideoStreamsRouter.VideoHLSVideoInitSegmentAPI(
+        recorded_program,
+        stream_quality,
+        session_id,
+        generation,
+        sequence,
+        cache_key,
+    )
+
+
+@compatibility_video_streams_router.get('/{video_id}/{quality}/video/segment', response_class = Response)
+async def CompatibilityVideoHLSVideoSegmentAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+    sequence: Annotated[int, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    return await VideoStreamsRouter.VideoHLSVideoSegmentAPI(
+        recorded_program,
+        stream_quality,
+        session_id,
+        sequence,
+        cache_key,
+    )
+
+
+@compatibility_video_streams_router.get(
+    '/{video_id}/{quality}/audio/{rendition_id}/playlist',
+    response_class = Response,
+)
+async def CompatibilityVideoHLSAudioPlaylistAPI(
+    rendition_id: str,
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    return await VideoStreamsRouter.VideoHLSAudioPlaylistAPI(
+        rendition_id,
+        recorded_program,
+        stream_quality,
+        session_id,
+        cache_key,
+    )
+
+
+@compatibility_video_streams_router.get(
+    '/{video_id}/{quality}/audio/{rendition_id}/init',
+    response_class = Response,
+)
+async def CompatibilityVideoHLSAudioInitSegmentAPI(
+    rendition_id: str,
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+    sequence: Annotated[int, Query()] = 0,
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    return await VideoStreamsRouter.VideoHLSAudioInitSegmentAPI(
+        rendition_id,
+        recorded_program,
+        stream_quality,
+        session_id,
+        sequence,
+        cache_key,
+    )
+
+
+@compatibility_video_streams_router.get(
+    '/{video_id}/{quality}/audio/{rendition_id}/segment',
+    response_class = Response,
+)
+async def CompatibilityVideoHLSAudioSegmentAPI(
+    rendition_id: str,
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+    sequence: Annotated[int, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    return await VideoStreamsRouter.VideoHLSAudioSegmentAPI(
+        rendition_id,
+        recorded_program,
+        stream_quality,
+        session_id,
+        sequence,
+        cache_key,
+    )
+
+
+@compatibility_video_streams_router.get(
+    '/{video_id}/{quality}/subtitle/{subtitle_index}/playlist',
+    response_class = Response,
+)
+async def CompatibilityVideoHLSSubtitlePlaylistAPI(
+    subtitle_index: int,
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+    cache_key: Annotated[str | None, Query()] = None,
+):
+    return await VideoStreamsRouter.VideoHLSSubtitlePlaylistAPI(
+        subtitle_index,
+        recorded_program,
+        stream_quality,
+        session_id,
+        cache_key,
+    )
+
+
+@compatibility_video_streams_router.get(
+    '/{video_id}/{quality}/subtitle/{subtitle_index}/webvtt',
+    response_class = Response,
+)
+async def CompatibilityVideoSubtitleWebVTTAPI(
+    subtitle_index: int,
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+):
+    return await VideoStreamsRouter.VideoSubtitleWebVTTAPI(
+        subtitle_index,
+        recorded_program,
+        stream_quality,
+        session_id,
+    )
+
+
+@compatibility_video_streams_router.put(
+    '/{video_id}/{quality}/keep-alive',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def CompatibilityVideoHLSKeepAliveAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
+    session_id: Annotated[str, Query()],
+):
+    return await VideoStreamsRouter.VideoHLSKeepAliveAPI(
+        recorded_program,
+        stream_quality,
+        session_id,
+    )
 
 
 def PreserveReservationSettingsForKomorebi(
@@ -570,6 +858,8 @@ def CreateCompatibilityAPI(
             ReservationConditionsRouter.router,
         ),
     )
+    compatibility_app.include_router(compatibility_live_streams_router)
+    compatibility_app.include_router(compatibility_video_streams_router)
     compatibility_app.include_router(compatibility_reservations_router)
     compatibility_app.include_router(users_router)
     compatibility_app.include_router(histories_router)

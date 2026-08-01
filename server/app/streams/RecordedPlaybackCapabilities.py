@@ -5,29 +5,26 @@ import hashlib
 import json
 import os
 import tempfile
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
-from typing import ClassVar, Literal, cast
+from typing import ClassVar
 
 from app import logging
 from app.constants import LIBRARY_PATH
+from app.streams.KonomiTVBS4KPlaybackEncoding import (
+    KonomiTVBS4KPlaybackCapabilityReason,
+    KonomiTVBS4KPlaybackEncoder,
+    KonomiTVBS4KVideoBitDepth,
+    KonomiTVBS4KVideoCodec,
+)
 
 
-RecordedPlaybackEncoder = Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC']
-RecordedPlaybackVideoCodec = Literal['avc', 'hevc', 'vp9', 'av1']
-RecordedPlaybackBitDepth = Literal[8, 10]
-RecordedPlaybackCapabilityReason = Literal[
-    'BinaryUnavailable',
-    'DeviceUnavailable',
-    'DeviceInitializationFailed',
-    'FilterUnavailable',
-    'EncodeFailed',
-    'ProbeFailed',
-    'CodecMismatch',
-    'BitDepthMismatch',
-    'ProfileMismatch',
-    'UnsupportedCombination',
-]
+# 既存importを壊さず、型の権威データだけをライブ・録画共通moduleへ移す。
+RecordedPlaybackEncoder = KonomiTVBS4KPlaybackEncoder
+RecordedPlaybackVideoCodec = KonomiTVBS4KVideoCodec
+RecordedPlaybackBitDepth = KonomiTVBS4KVideoBitDepth
+RecordedPlaybackCapabilityReason = KonomiTVBS4KPlaybackCapabilityReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,19 +51,33 @@ class RecordedPlaybackCapability:
     reason_code: RecordedPlaybackCapabilityReason | None
 
 
+RecordedPlaybackCapabilityKey = tuple[
+    RecordedPlaybackEncoder,
+    RecordedPlaybackVideoCodec,
+    RecordedPlaybackBitDepth,
+]
+
+
+@dataclass(slots=True)
+class _RecordedPlaybackProbeContext:
+    """実probe Task内だけで成功したrender nodeを保持する。"""
+
+    selected_device: str | None = None
+
+
 class RecordedPlaybackBackend:
-    """能力検査と実再生で共有するFFmpeg 8バックエンド定義を提供する。"""
+    """録画能力検査・録画再生・ライブで共有するFFmpeg 8バックエンド定義を提供する。"""
 
     _ENCODERS: ClassVar[dict[RecordedPlaybackEncoder, dict[RecordedPlaybackVideoCodec, str | None]]] = {
         'FFmpeg': {'avc': 'libx264', 'hevc': 'libx265', 'vp9': 'libvpx-vp9', 'av1': 'libaom-av1'},
-        'QSVEncC': {'avc': 'h264_qsv', 'hevc': 'hevc_qsv', 'vp9': 'vp9_qsv', 'av1': 'av1_qsv'},
-        'NVEncC': {'avc': 'h264_nvenc', 'hevc': 'hevc_nvenc', 'vp9': None, 'av1': 'av1_nvenc'},
-        'VCEEncC': {'avc': 'h264_amf', 'hevc': 'hevc_amf', 'vp9': None, 'av1': 'av1_amf'},
+        'QSV': {'avc': 'h264_qsv', 'hevc': 'hevc_qsv', 'vp9': 'vp9_qsv', 'av1': 'av1_qsv'},
+        'NVENC': {'avc': 'h264_nvenc', 'hevc': 'hevc_nvenc', 'vp9': None, 'av1': 'av1_nvenc'},
+        'AMF': {'avc': 'h264_amf', 'hevc': 'hevc_amf', 'vp9': None, 'av1': 'av1_amf'},
     }
 
     _VENDOR_IDS: ClassVar[dict[RecordedPlaybackEncoder, str]] = {
-        'QSVEncC': '0x8086',
-        'VCEEncC': '0x1002',
+        'QSV': '0x8086',
+        'AMF': '0x1002',
     }
     _AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/opt/amdgpu/lib/x86_64-linux-gnu/dri')
     _AMD_MESA_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/usr/lib/x86_64-linux-gnu/dri')
@@ -181,11 +192,11 @@ class RecordedPlaybackBackend:
             実行ファイルの絶対パス。
         """
 
-        return LIBRARY_PATH['FFmpeg8AMD'] if encoder == 'VCEEncC' else LIBRARY_PATH['FFmpeg8']
+        return LIBRARY_PATH['FFmpeg8AMD'] if encoder == 'AMF' else LIBRARY_PATH['FFmpeg8']
 
     @staticmethod
     def getEnvironment(encoder: RecordedPlaybackEncoder) -> dict[str, str]:
-        """録画用FFmpeg 8に限定したGPU runtime環境を返す。
+        """KonomiTV-BS4KのFFmpeg 8に限定したGPU runtime環境を返す。
 
         Args:
             encoder: 公開設定上のエンコーダー名。
@@ -195,7 +206,7 @@ class RecordedPlaybackBackend:
         """
 
         environment = os.environ.copy()
-        if encoder in ('QSVEncC', 'VCEEncC'):
+        if encoder in ('QSV', 'AMF'):
             # VAAPI driver と loader の ABI を Ubuntu 22.04 の system libva に依存させない。
             # vendor-neutral な同梱 libva 2.23 を共用し、driver だけを GPU ごとに切り替える。
             library_path = Path(LIBRARY_PATH['FFmpeg8']).parent.parent / 'Library'
@@ -203,7 +214,7 @@ class RecordedPlaybackBackend:
             environment['LD_LIBRARY_PATH'] = (
                 f'{library_path}:{current_library_path}' if current_library_path else str(library_path)
             )
-            if encoder == 'QSVEncC':
+            if encoder == 'QSV':
                 environment['LIBVA_DRIVER_NAME'] = 'iHD'
                 environment['LIBVA_DRIVERS_PATH'] = str(library_path / 'dri')
             else:
@@ -276,13 +287,13 @@ class RecordedPlaybackBackend:
             '-loglevel',
             'error',
         ]
-        if encoder == 'QSVEncC':
+        if encoder == 'QSV':
             if device is None:
                 raise ValueError('QSV render device is required.')
             command += ['-init_hw_device', f'qsv=recorded_qsv:{device}', '-filter_hw_device', 'recorded_qsv']
-        elif encoder == 'NVEncC':
+        elif encoder == 'NVENC':
             command += ['-init_hw_device', 'cuda=recorded_cuda:0', '-filter_hw_device', 'recorded_cuda']
-        elif encoder == 'VCEEncC':
+        elif encoder == 'AMF':
             if device is None:
                 raise ValueError('AMD render device is required.')
             command += ['-init_hw_device', f'vaapi=recorded_vaapi:{device}', '-filter_hw_device', 'recorded_vaapi']
@@ -292,9 +303,9 @@ class RecordedPlaybackBackend:
         command += ['-f', 'lavfi', '-i', 'testsrc2=size=320x192:rate=10:duration=0.6']
         if encoder == 'FFmpeg':
             command += ['-vf', f'format={spec.pixel_format}']
-        elif encoder == 'QSVEncC':
+        elif encoder == 'QSV':
             command += ['-vf', f'format={spec.encoder_pixel_format},hwupload=extra_hw_frames=32']
-        elif encoder == 'NVEncC':
+        elif encoder == 'NVENC':
             command += ['-vf', f'format={spec.encoder_pixel_format},hwupload_cuda']
         else:
             # AMF自体はsystem-memoryのNV12/P010を受けるため、能力検査でも実再生と同じ
@@ -310,11 +321,11 @@ class RecordedPlaybackBackend:
         # software pixel formatを出力側で強制すると、不要なauto_scaleが挿入され接続できない。
         if encoder == 'FFmpeg':
             command += ['-pix_fmt', spec.pixel_format]
-        elif encoder == 'NVEncC':
+        elif encoder == 'NVENC':
             # NVENCへCUDA frameを渡すことを明示し、software nv12/p010leへ戻す
             # auto_scaleがhwupload_cuda後へ挿入されるのを防ぐ。
             command += ['-pix_fmt', 'cuda']
-        elif encoder == 'VCEEncC':
+        elif encoder == 'AMF':
             command += ['-pix_fmt', spec.encoder_pixel_format]
         if codec == 'avc':
             command += ['-profile:v', 'high']
@@ -323,7 +334,7 @@ class RecordedPlaybackBackend:
         elif codec == 'vp9':
             command += [
                 '-profile:v',
-                ('profile2' if bit_depth == 10 else 'profile0') if encoder == 'QSVEncC' else
+                ('profile2' if bit_depth == 10 else 'profile0') if encoder == 'QSV' else
                 ('2' if bit_depth == 10 else '0'),
             ]
         elif codec == 'av1':
@@ -331,7 +342,7 @@ class RecordedPlaybackBackend:
             # libaom-av1は数値、QSV/AMFはmainを受け付けるためバックエンド別に指定する。
             if encoder == 'FFmpeg':
                 command += ['-profile:v', '0']
-            elif encoder != 'NVEncC':
+            elif encoder != 'NVENC':
                 command += ['-profile:v', 'main']
         command += cls.getTuningArguments(encoder, codec)
         command += [
@@ -351,10 +362,27 @@ class RecordedPlaybackCapabilityProbe:
     """録画用FFmpeg 8の能力行列を遅延検査し、プロセス内で共有する。"""
 
     _result: ClassVar[list[RecordedPlaybackCapability] | None] = None
+    _individual_results: ClassVar[dict[RecordedPlaybackCapabilityKey, RecordedPlaybackCapability]] = {}
     _signature: ClassVar[str | None] = None
+    _signature_generation: ClassVar[int] = 0
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
-    _selected_devices: ClassVar[dict[RecordedPlaybackEncoder, str]] = {}
-    _probe_version: ClassVar[int] = 2
+    _inflight_tasks: ClassVar[
+        dict[
+            tuple[int, RecordedPlaybackCapabilityKey],
+            asyncio.Task[tuple[RecordedPlaybackCapability, str | None] | None],
+        ]
+    ] = {}
+    _matrix_inflight_tasks: ClassVar[
+        dict[int, asyncio.Task[list[RecordedPlaybackCapability] | None]]
+    ] = {}
+    _selected_devices: ClassVar[dict[RecordedPlaybackCapabilityKey, str]] = {}
+    _probe_context: ClassVar[ContextVar[_RecordedPlaybackProbeContext | None]] = ContextVar(
+        'recorded_playback_probe_context',
+        default = None,
+    )
+    _probe_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
+    _probe_version: ClassVar[int] = 4
+    _probe_timeout_seconds: ClassVar[float] = 20.0
 
     @classmethod
     async def getCapabilities(cls) -> list[RecordedPlaybackCapability]:
@@ -364,42 +392,262 @@ class RecordedPlaybackCapabilityProbe:
             全エンコーダー・コーデック・bit depthの能力検査結果。
         """
 
-        async with cls._lock:
+        while True:
             signature = await cls.__getSignature()
-            if cls._result is not None and cls._signature == signature:
-                return cls._result
-            cls._selected_devices.clear()
-            cls._result = await cls.__probeAll()
-            cls._signature = signature
-            return cls._result
+            async with cls._lock:
+                generation = cls.__resetCacheForSignature(signature)
+                if cls._result is not None:
+                    return cls._result
+                task = cls._matrix_inflight_tasks.get(generation)
+                if task is None:
+                    task = asyncio.create_task(
+                        cls.__runMatrixProbeForGeneration(generation, signature),
+                        name = f'RecordedPlaybackCapabilityProbe-matrix-{generation}',
+                    )
+                    cls._matrix_inflight_tasks[generation] = task
+
+            result = await asyncio.shield(task)
+            latest_signature = await cls.__getSignature()
+            async with cls._lock:
+                latest_generation = cls.__resetCacheForSignature(latest_signature)
+                if (
+                    result is not None
+                    and latest_generation == generation
+                    and latest_signature == signature
+                ):
+                    if cls._result is None:
+                        cls._result = result
+                    return cls._result
 
     @classmethod
-    def getSelectedDevice(cls, encoder: RecordedPlaybackEncoder) -> str | None:
-        """能力検査で最初に初期化できたrender nodeを返す。"""
+    async def getCapability(
+        cls,
+        encoder: RecordedPlaybackEncoder,
+        codec: RecordedPlaybackVideoCodec,
+        bit_depth: RecordedPlaybackBitDepth,
+    ) -> RecordedPlaybackCapability:
+        """指定した1組だけを実probeし、全32行の初回検査を強制せず返す。"""
 
-        return cls._selected_devices.get(encoder)
+        key = (encoder, codec, bit_depth)
+        while True:
+            signature = await cls.__getSignature()
+            async with cls._lock:
+                generation = cls.__resetCacheForSignature(signature)
+                cached = cls._individual_results.get(key)
+                if cached is not None:
+                    return cached
+                task_key = (generation, key)
+                task = cls._inflight_tasks.get(task_key)
+                if task is None:
+                    task = asyncio.create_task(
+                        cls.__runProbeForGeneration(
+                            generation,
+                            signature,
+                            key,
+                        ),
+                        name = (
+                            f'RecordedPlaybackCapabilityProbe-{generation}-'
+                            f'{encoder}-{codec}-{bit_depth}'
+                        ),
+                    )
+                    cls._inflight_tasks[task_key] = task
+
+            outcome = await asyncio.shield(task)
+            latest_signature = await cls.__getSignature()
+            async with cls._lock:
+                latest_generation = cls.__resetCacheForSignature(latest_signature)
+                if (
+                    outcome is not None
+                    and latest_generation == generation
+                    and latest_signature == signature
+                ):
+                    capability, selected_device = outcome
+                    cached = cls._individual_results.setdefault(key, capability)
+                    if selected_device is not None:
+                        cls._selected_devices.setdefault(key, selected_device)
+                    return cached
+
+    @classmethod
+    def __resetCacheForSignature(cls, signature: str) -> int:
+        """固定バイナリ署名が変わった場合だけ全能力cacheと選択deviceを破棄する。"""
+
+        if cls._signature == signature:
+            return cls._signature_generation
+        cls._signature_generation += 1
+        cls._result = None
+        cls._individual_results.clear()
+        cls._selected_devices.clear()
+        cls._signature = signature
+        return cls._signature_generation
+
+    @classmethod
+    def getSelectedDevice(
+        cls,
+        encoder: RecordedPlaybackEncoder,
+        codec: RecordedPlaybackVideoCodec | None = None,
+        bit_depth: RecordedPlaybackBitDepth | None = None,
+    ) -> str | None:
+        """能力組み合わせで実際に成功したrender nodeを返す。"""
+
+        if codec is not None and bit_depth is not None:
+            return cls._selected_devices.get((encoder, codec, bit_depth))
+        # CM解析のdecode専用候補ではcodecを固定できないため、同encoderで成功済みの任意deviceを返す。
+        return next(
+            (
+                device
+                for (selected_encoder, _, _), device in cls._selected_devices.items()
+                if selected_encoder == encoder
+            ),
+            None,
+        )
 
     @classmethod
     async def __getSignature(cls) -> str:
         """バイナリ更新時に能力キャッシュを破棄するための署名を返す。"""
 
-        executable = Path(LIBRARY_PATH['FFmpeg8'])
-        if executable.is_file() is False:
-            return f'probe-{cls._probe_version}-missing'
-        stat = await asyncio.to_thread(executable.stat)
-        value = f'{cls._probe_version}:{stat.st_size}:{stat.st_mtime_ns}'
-        return hashlib.sha256(value.encode()).hexdigest()
+        values = [str(cls._probe_version)]
+        for key in ('FFmpeg8', 'FFmpeg8AMD', 'FFprobe8'):
+            executable = Path(LIBRARY_PATH[key])
+            try:
+                stat = await asyncio.to_thread(executable.stat)
+                values.append(f'{key}:{stat.st_size}:{stat.st_mtime_ns}')
+            except OSError:
+                values.append(f'{key}:missing')
+        return hashlib.sha256(':'.join(values).encode()).hexdigest()
 
     @classmethod
-    async def __probeAll(cls) -> list[RecordedPlaybackCapability]:
-        """能力行列の全組み合わせを順番に検査する。"""
+    async def __runMatrixProbeForGeneration(
+        cls,
+        generation: int,
+        signature: str,
+    ) -> list[RecordedPlaybackCapability] | None:
+        """1署名世代の全行列を共有Taskで構築し、安定した世代だけcacheする。"""
 
-        results: list[RecordedPlaybackCapability] = []
-        for encoder in cast(tuple[RecordedPlaybackEncoder, ...], ('FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC')):
-            for codec in cast(tuple[RecordedPlaybackVideoCodec, ...], ('avc', 'hevc', 'vp9', 'av1')):
-                for bit_depth in cast(tuple[RecordedPlaybackBitDepth, ...], (8, 10)):
-                    results.append(await cls.__probeOne(encoder, codec, bit_depth))
-        return results
+        try:
+            result = await cls.__probeAllUsingIndividualCache(generation)
+            if result is None:
+                return None
+            latest_signature = await cls.__getSignature()
+            async with cls._lock:
+                latest_generation = cls.__resetCacheForSignature(latest_signature)
+                if latest_generation == generation and latest_signature == signature:
+                    cls._result = result
+            return result
+        finally:
+            async with cls._lock:
+                current_task = asyncio.current_task()
+                if cls._matrix_inflight_tasks.get(generation) is current_task:
+                    cls._matrix_inflight_tasks.pop(generation, None)
+
+    @classmethod
+    async def __probeAllUsingIndividualCache(
+        cls,
+        generation: int,
+    ) -> list[RecordedPlaybackCapability] | None:
+        """全32組を2組ずつgetCapabilityへ渡し、exact probeの割り込み余地を保つ。"""
+
+        encoders: tuple[RecordedPlaybackEncoder, ...] = ('FFmpeg', 'QSV', 'NVENC', 'AMF')
+        codecs: tuple[RecordedPlaybackVideoCodec, ...] = ('avc', 'hevc', 'vp9', 'av1')
+        bit_depths: tuple[RecordedPlaybackBitDepth, ...] = (8, 10)
+        keys: list[RecordedPlaybackCapabilityKey] = [
+            (encoder, codec, bit_depth)
+            for encoder in encoders
+            for codec in codecs
+            for bit_depth in bit_depths
+        ]
+        key_indexes = {key: index for index, key in enumerate(keys)}
+        probe_order: list[tuple[int, RecordedPlaybackCapabilityKey]] = [
+            (key_indexes[(encoder, codec, bit_depth)], (encoder, codec, bit_depth))
+            for codec in codecs
+            for bit_depth in bit_depths
+            for encoder in encoders
+        ]
+        results: dict[int, RecordedPlaybackCapability] = {}
+        for index in range(0, len(probe_order), 2):
+            async with cls._lock:
+                if cls._signature_generation != generation:
+                    return None
+            chunk = probe_order[index:index + 2]
+            capabilities = await asyncio.gather(*(
+                cls.getCapability(encoder, codec, bit_depth)
+                for _, (encoder, codec, bit_depth) in chunk
+            ))
+            for (result_index, _), capability in zip(chunk, capabilities, strict=True):
+                results[result_index] = capability
+        return [results[index] for index in range(len(keys))]
+
+    @classmethod
+    async def __runProbeForGeneration(
+        cls,
+        generation: int,
+        signature: str,
+        key: RecordedPlaybackCapabilityKey,
+    ) -> tuple[RecordedPlaybackCapability, str | None] | None:
+        """署名世代と能力キーに対応する唯一の実probeを実行する。"""
+
+        task_key = (generation, key)
+        encoder, codec, bit_depth = key
+        try:
+            # exact要求を全行列の後ろへ滞留させず、実probe総数は全backend合計2件に制限する。
+            async with cls._probe_semaphore:
+                async with cls._lock:
+                    if cls._signature_generation != generation or cls._signature != signature:
+                        return None
+                context = _RecordedPlaybackProbeContext()
+                token = cls._probe_context.set(context)
+                try:
+                    capability = await cls.__probeOne(encoder, codec, bit_depth)
+                finally:
+                    cls._probe_context.reset(token)
+
+            outcome = (capability, context.selected_device)
+            latest_signature = await cls.__getSignature()
+            async with cls._lock:
+                latest_generation = cls.__resetCacheForSignature(latest_signature)
+                if latest_generation == generation and latest_signature == signature:
+                    cls._individual_results.setdefault(key, capability)
+                    if context.selected_device is not None:
+                        cls._selected_devices.setdefault(key, context.selected_device)
+            return outcome
+        finally:
+            async with cls._lock:
+                current_task = asyncio.current_task()
+                if cls._inflight_tasks.get(task_key) is current_task:
+                    cls._inflight_tasks.pop(task_key, None)
+
+    @classmethod
+    async def __communicateWithTimeout(
+        cls,
+        process: asyncio.subprocess.Process,
+    ) -> tuple[bytes, bytes]:
+        """
+        probe subprocess を上限時間内に drain し、異常終了時も必ず回収する。
+
+        Args:
+            process (asyncio.subprocess.Process): encoder または FFprobe の subprocess。
+
+        Returns:
+            tuple[bytes, bytes]: subprocess の標準出力と標準エラー出力。
+        """
+
+        try:
+            async with asyncio.timeout(cls._probe_timeout_seconds):
+                stdout, stderr = await process.communicate()
+                return stdout or b'', stderr or b''
+
+        # TimeoutError だけでなく、呼び出し元 Task の CancelledError や communicate() 自体の例外でも
+        ## 子プロセスを残留させない。BaseException は回収後にそのまま再送出する。
+        except BaseException:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    await process.wait()
+                except (ProcessLookupError, OSError):
+                    pass
+            raise
 
     @classmethod
     async def __probeOne(
@@ -419,11 +667,9 @@ class RecordedPlaybackCapabilityProbe:
             return RecordedPlaybackCapability(encoder, codec, bit_depth, False, spec.profile, 'BinaryUnavailable')
 
         devices: list[str | None] = [None]
-        if encoder in ('QSVEncC', 'VCEEncC'):
-            selected_device = cls._selected_devices.get(encoder)
-            devices = [selected_device] if selected_device is not None else [
-                *RecordedPlaybackBackend.discoverRenderDevices(encoder),
-            ]
+        if encoder in ('QSV', 'AMF'):
+            # 同vendorでも世代ごとにcodec能力が異なるため、各能力キーで全deviceを試す。
+            devices = [*RecordedPlaybackBackend.discoverRenderDevices(encoder)]
             if len(devices) == 0:
                 return RecordedPlaybackCapability(encoder, codec, bit_depth, False, spec.profile, 'DeviceUnavailable')
 
@@ -439,7 +685,10 @@ class RecordedPlaybackCapabilityProbe:
                         stderr = asyncio.subprocess.PIPE,
                         env = RecordedPlaybackBackend.getEnvironment(encoder),
                     )
-                    _, stderr = await process.communicate()
+                    _, stderr = await cls.__communicateWithTimeout(process)
+                except TimeoutError:
+                    last_reason = 'EncodeFailed'
+                    continue
                 except OSError:
                     last_reason = 'BinaryUnavailable'
                     continue
@@ -453,19 +702,23 @@ class RecordedPlaybackCapabilityProbe:
                     last_reason = cls.classifyFailure(decoded_stderr)
                     continue
 
-                probe_process = await asyncio.create_subprocess_exec(
-                    str(ffprobe),
-                    '-v',
-                    'error',
-                    '-count_frames',
-                    '-show_streams',
-                    '-of',
-                    'json',
-                    str(output_path),
-                    stdout = asyncio.subprocess.PIPE,
-                    stderr = asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await probe_process.communicate()
+                try:
+                    probe_process = await asyncio.create_subprocess_exec(
+                        str(ffprobe),
+                        '-v',
+                        'error',
+                        '-count_frames',
+                        '-show_streams',
+                        '-of',
+                        'json',
+                        str(output_path),
+                        stdout = asyncio.subprocess.PIPE,
+                        stderr = asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await cls.__communicateWithTimeout(probe_process)
+                except (OSError, TimeoutError):
+                    last_reason = 'ProbeFailed'
+                    continue
                 if probe_process.returncode != 0:
                     last_reason = 'ProbeFailed'
                     continue
@@ -489,7 +742,13 @@ class RecordedPlaybackCapabilityProbe:
                     last_reason = 'ProfileMismatch'
                     continue
                 if device is not None:
-                    cls._selected_devices.setdefault(encoder, device)
+                    context = cls._probe_context.get()
+                    if context is None:
+                        # private probeを単体利用する既存経路では従来どおり即時公開する。
+                        cls._selected_devices[(encoder, codec, bit_depth)] = device
+                    else:
+                        # 通常経路では署名再確認後にだけ現在世代へ反映する。
+                        context.selected_device = device
                 return RecordedPlaybackCapability(encoder, codec, bit_depth, True, spec.profile, None)
 
         return RecordedPlaybackCapability(encoder, codec, bit_depth, False, spec.profile, last_reason)
