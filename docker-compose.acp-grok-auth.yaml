@@ -1,0 +1,10 @@
+services:
+  konomitv:
+    volumes:
+      - type: bind
+        source: '${KONOMITV_BS4K_GROK_AUTH_FILE:?KONOMITV_BS4K_GROK_AUTH_FILE must be an absolute auth.json path}'
+        target: '/run/konomitv-bs4k-host-auth/grok/auth.json'
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z

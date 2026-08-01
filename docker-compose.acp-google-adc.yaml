@@ -1,0 +1,10 @@
+services:
+  konomitv:
+    volumes:
+      - type: bind
+        source: '${KONOMITV_BS4K_GOOGLE_ADC_FILE:?KONOMITV_BS4K_GOOGLE_ADC_FILE must be an absolute ADC JSON path}'
+        target: '/run/konomitv-bs4k-host-auth/google/application_default_credentials.json'
+        read_only: true
+        bind:
+          create_host_path: false
+          selinux: z
