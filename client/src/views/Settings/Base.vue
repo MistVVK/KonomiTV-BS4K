@@ -97,6 +97,7 @@ export default defineComponent({
         flex-direction: column;
         flex-shrink: 0;
         width: 195px;
+        overflow-x: hidden;
         position: sticky;
         top: calc(65px + 20px) !important;  // ヘッダー+余白の高さ
 
