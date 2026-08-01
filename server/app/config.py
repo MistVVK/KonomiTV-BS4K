@@ -2,9 +2,12 @@
 import asyncio
 import concurrent.futures
 import ipaddress
+import math
 import re
 import subprocess
 import sys
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
@@ -15,15 +18,14 @@ import ruamel.yaml.scalarstring
 from pydantic import (
     BaseModel,
     DirectoryPath,
+    Field,
     FilePath,
     IPvAnyAddress,
     IPvAnyNetwork,
-    PositiveFloat,
     PositiveInt,
     UrlConstraints,
     ValidationError,
     ValidationInfo,
-    confloat,
     field_validator,
     model_validator,
 )
@@ -32,7 +34,12 @@ from pydantic_core import Url
 from app.constants import (
     API_REQUEST_HEADERS,
     BASE_DIR,
-    LIBRARY_PATH,
+)
+from app.utils.HostPath import (
+    HostPathError,
+    NormalizeHostPath,
+    ToHostPath,
+    ToRuntimePath,
 )
 from app.utils.TSInformation import TerrestrialRegion
 
@@ -70,7 +77,8 @@ def _GetUsedListenPorts() -> set[int]:
 # 詳細は client/src/services/Settings.ts と client/src/stores/SettingsStore.ts を参照
 
 class ClientSettings(BaseModel):
-    last_synced_at: Annotated[float, PositiveFloat] = 0.0
+    # 0 は未同期の初期値として正当なので、正の値に限定しない
+    last_synced_at: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 0.0
     # showed_panel_last_time: 同期無効
     # selected_twitter_panel_account: 同期無効
     # twitter_panel_post_targets: 同期無効
@@ -136,7 +144,7 @@ class ClientSettings(BaseModel):
     video_panel_active_tab: Literal['RecordedProgram', 'Series', 'Comment', 'Twitter'] = 'RecordedProgram'
     video_series_sort_key: Literal['SeasonEpisode', 'BroadcastDate', 'Title'] = 'SeasonEpisode'
     video_series_sort_direction: Literal['Asc', 'Desc'] = 'Asc'
-    video_watched_history_max_count: Annotated[int, PositiveInt] = 50
+    video_watched_history_max_count: PositiveInt = 50
     # tv_streaming_quality: 同期無効
     # tv_streaming_quality_cellular: 同期無効
     # bs4k_streaming_quality: 同期無効
@@ -147,6 +155,8 @@ class ClientSettings(BaseModel):
     # bs4k_tv_encoding_codec_cellular: 同期無効
     # tv_low_latency_mode: 同期無効
     # tv_low_latency_mode_cellular: 同期無効
+    # tv_low_latency_mode_for_bs4k: 同期無効
+    # tv_low_latency_mode_for_bs4k_cellular: 同期無効
     # tv_24fps_mode: 同期無効
     # tv_24fps_mode_cellular: 同期無効
     # video_streaming_quality: 同期無効
@@ -160,7 +170,7 @@ class ClientSettings(BaseModel):
     caption_font: str = 'Rounded M+ 1m for ARIB'
     always_border_caption_text: bool = True
     specify_caption_opacity: bool = False
-    caption_opacity: Annotated[float, confloat(ge=0.0, le=1.0)] = 1.0
+    caption_opacity: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)] = 1.0
     tv_show_superimpose: bool = True
     video_show_superimpose: bool = False
     # tv_show_data_broadcasting: 同期無効
@@ -172,8 +182,8 @@ class ClientSettings(BaseModel):
     # sync_settings: 同期無効
     jikkyo_enabled: bool = False
     prefer_posting_to_nicolive: bool = True
-    comment_speed_rate: Annotated[float, PositiveFloat] = 1.0
-    comment_font_size: Annotated[int, PositiveInt] = 34
+    comment_speed_rate: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.0
+    comment_font_size: PositiveInt = 34
     close_comment_form_after_sending: bool = True
     mute_vulgar_comments: bool = True
     mute_abusive_discriminatory_prejudiced_comments: bool = True
@@ -193,6 +203,35 @@ class ClientSettings(BaseModel):
     tweet_hashtag_position: Literal['Prepend', 'Append', 'PrependWithLineBreak', 'AppendWithLineBreak'] = 'Append'
     tweet_capture_watermark_position: Literal['None', 'TopLeft', 'TopRight', 'BottomLeft', 'BottomRight'] = 'None'
 
+    @staticmethod
+    def _rejectNonFiniteNumbers(value: Any, path: str = 'root') -> None:
+        """list/dict を再帰走査し、非有限 float (NaN/Inf) を拒否する。"""
+
+        if isinstance(value, float):
+            if math.isfinite(value) is False:
+                raise ValueError(f'Non-finite number is not allowed at {path}')
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                ClientSettings._rejectNonFiniteNumbers(child, f'{path}.{key}')
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                ClientSettings._rejectNonFiniteNumbers(child, f'{path}[{index}]')
+
+    @model_validator(mode='before')
+    @classmethod
+    def rejectNestedNonFiniteNumbers(cls, data: Any) -> Any:
+        """
+        mylist / watched_history など dict[str, Any] 配下の NaN/Inf も 422 にする。
+
+        Field(allow_inf_nan=False) は最上位 float のみ対象のため、任意 dict 内は別途検査する。
+        """
+
+        if isinstance(data, dict):
+            cls._rejectNonFiniteNumbers(data)
+        return data
+
 
 # サーバー設定を表す Pydantic モデル
 # config.yaml のバリデーションは設定データをこの Pydantic モデルに通すことで行う
@@ -203,17 +242,18 @@ class _ServerSettingsGeneral(BaseModel):
     always_receive_tv_from_mirakurun: bool = False
     edcb_url: Annotated[Url, UrlConstraints(allowed_schemes=['tcp'])] = Url('tcp://127.0.0.1:4510/')
     mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] = Url('http://127.0.0.1:40772/')
-    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC'] = 'FFmpeg'
-    encoder_bs4k: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC'] = 'FFmpeg'
-    encoder_bs4k_input_probesize: Annotated[int, PositiveInt] = 3000
-    encoder_bs4k_input_analyze: Annotated[float, PositiveFloat] = 1.5
+    encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
+    encoder_bs4k: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
+    encoder_bs4k_input_probesize: PositiveInt = 3000
+    encoder_bs4k_input_analyze: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.5
     encoder_bs4k_input_analysis_enabled: bool = True
-    encoder_bs4k_max_interleave_delta: Annotated[int, PositiveInt] = 800
+    encoder_bs4k_max_interleave_delta: PositiveInt = 800
     encoder_bs4k_low_latency: bool = True
+    konomitv_bs4k_acceptance_diagnostics_enabled: bool = False
     bs4k_ignore_viewer_low_latency: bool = False
     bs4k_live_startup_discard_enabled: bool = True
-    bs4k_live_startup_discard_seconds: Annotated[float, confloat(ge=0.0)] = 2.0
-    program_update_interval: Annotated[float, confloat(ge=0.1)] = 5.0
+    bs4k_live_startup_discard_seconds: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 2.0
+    program_update_interval: Annotated[float, Field(ge=0.1, allow_inf_nan=False)] = 5.0
     debug: bool = False
     debug_encoder: bool = False
 
@@ -326,41 +366,91 @@ class _ServerSettingsGeneral(BaseModel):
     @classmethod
     def _validate_encoder_value(cls, encoder: str) -> str:
         from app import logging
-        # HWEncC が指定されているときのみ、--check-hw でハードウェアエンコーダーが利用できるかをチェック
-        ## もし利用可能なら標準出力に "H.264/AVC" という文字列が出力されるので、それで判定する
+        from app.streams.RecordedPlaybackCapabilities import (
+            RecordedPlaybackBackend,
+            RecordedPlaybackEncoder,
+        )
+
+        # 正規化済みの公開設定名から、ライブ再生と同じ FFmpeg 8 定義を使う
+        encoder_type = cast(RecordedPlaybackEncoder, encoder)
+        encoder_executable = RecordedPlaybackBackend.getExecutable(encoder_type)
+
+        # HW エンコーダーは FFmpeg 8 で短い実エンコードを行い、H.264 と H.265 の利用可否を検査する
+        ## EncC の --check-hw は実際のライブ経路と異なるため、移行後の起動可否を正しく表せない
         if encoder != 'FFmpeg':
-            result = subprocess.run(
-                [LIBRARY_PATH[encoder], '--check-hw'],
-                stdout = subprocess.PIPE,
-                stderr = subprocess.DEVNULL,
-            )
-            result_stdout = result.stdout.decode('utf-8')
-            result_stdout = '\n'.join([line for line in result_stdout.split('\n') if 'reader:' not in line])
-            if 'unavailable.' in result_stdout:
+            device: str | None = None
+            if encoder_type in ('QSV', 'AMF'):
+                devices = RecordedPlaybackBackend.discoverRenderDevices(encoder_type)
+                if len(devices) > 0:
+                    device = devices[0]
+            probe_results: dict[Literal['avc', 'hevc'], bool] = {}
+            with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-live-encoder-probe-') as temporary_directory:
+                for codec in cast(tuple[Literal['avc', 'hevc'], ...], ('avc', 'hevc')):
+                    output_path = Path(temporary_directory) / f'{codec}.mp4'
+                    command = RecordedPlaybackBackend.buildProbeCommand(
+                        encoder_type,
+                        codec,
+                        8,
+                        output_path,
+                        device,
+                    )
+                    try:
+                        result = subprocess.run(
+                            command,
+                            capture_output = True,
+                            timeout = 20,
+                            check = False,
+                            env = RecordedPlaybackBackend.getEnvironment(encoder_type),
+                        )
+                    except (OSError, subprocess.SubprocessError) as ex:
+                        raise ValueError(f'{encoder} の FFmpeg 8 ハードウェア能力検査を実行できませんでした。') from ex
+                    probe_results[codec] = result.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0
+
+            # H.264 は全ライブ品質の最低要件なので、利用できない環境では起動を拒否する
+            if probe_results['avc'] is False:
                 raise ValueError(
                     f'お使いの環境では {encoder} がサポートされていないため、KonomiTV-BS4K を起動できません。\n'
-                    f'別のエンコーダーを選択するか、{encoder} の動作環境を整備してください。'
+                    f'別のエンコーダーを選択するか、FFmpeg 8 の {encoder} 向け動作環境を整備してください。'
                 )
+
             # H.265/HEVC に対応していない環境では、HEVC を選択できない旨を出力する
-            if 'H.265/HEVC' not in result_stdout:
+            if probe_results['hevc'] is False:
                 logging.warning(f'お使いの環境では {encoder} での H.265/HEVC エンコードがサポートされていないため、映像コーデックに HEVC は利用できません。')
+
         # エンコーダーのバージョン情報を取得する
         ## バージョン情報は出力の1行目にある
-        result = subprocess.run(
-            [LIBRARY_PATH[encoder], '--version'],
-            stdout = subprocess.PIPE,
-            stderr = subprocess.STDOUT,
-        )
-        encoder_version = result.stdout.decode('utf-8').split('\n')[0]
-        ## Copyright (FFmpeg) と by rigaya (HWEncC) 以降の文字列を削除
+        try:
+            result = subprocess.run(
+                [encoder_executable, '-version'],
+                capture_output = True,
+                timeout = 10,
+                check = False,
+                env = RecordedPlaybackBackend.getEnvironment(encoder_type),
+            )
+        except (OSError, subprocess.SubprocessError) as ex:
+            raise ValueError(f'{encoder} のバージョン情報を取得できませんでした。') from ex
+        if result.returncode != 0 or result.stdout.strip() == b'':
+            raise ValueError(f'{encoder} のバージョン情報を取得できませんでした。')
+        encoder_version = result.stdout.decode('utf-8', errors='replace').split('\n')[0]
+        ## Copyright 以降の文字列を削除し、公開設定名と実際の FFmpeg 8 バックエンドを併記する
         encoder_version = re.sub(r' Copyright.*$', '', encoder_version)
-        encoder_version = re.sub(r' by rigaya.*$', '', encoder_version)
         encoder_version = encoder_version.replace('ffmpeg', 'FFmpeg').strip()
-        logging.info(f'Encoder: {encoder_version}')
+        logging.info(f'Encoder: {encoder} via {encoder_version}')
         return encoder
 
-    @field_validator('encoder', 'encoder_bs4k')
-    def validate_encoder(cls, encoder: str, info: ValidationInfo) -> str:
+    @field_validator('encoder', 'encoder_bs4k', mode='before')
+    def validate_encoder(cls, encoder: Any, info: ValidationInfo) -> str:
+        # FFmpeg 8 バックエンドへ移行する前の設定値を、現在の正規識別子へ一方向に変換する。
+        ## この互換処理は config.yaml の読み込み境界だけに限定し、API と実行時の型には旧名を残さない。
+        if isinstance(encoder, str):
+            encoder = {
+                'QSVEncC': 'QSV',
+                'NVEncC': 'NVENC',
+                'VCEEncC': 'AMF',
+            }.get(encoder, encoder)
+        else:
+            raise ValueError('エンコーダー名は文字列で指定してください。')
+
         # バリデーションをスキップする場合はここで終了
         if type(info.context) is dict and info.context.get('bypass_validation') is True:
             return encoder
@@ -539,24 +629,27 @@ class _ServerSettingsVideo(BaseModel):
             return None
         if folder.is_absolute() is False:
             raise ValueError('録画 fMP4 キャッシュの保存先には絶対パスを指定してください。')
-
-        # 設定画面とconfig.yamlではホスト側パスを扱う。Dockerの設定更新APIから直接
-        # model_validate()された場合だけ、実アクセス前に/host-rootfsを一度だけ付与する。
-        from app.utils import GetPlatformEnvironment
-        docker_root = Path(_DOCKER_PATH_PREFIX)
-        if GetPlatformEnvironment() == 'Linux-Docker' and folder.is_relative_to(docker_root) is False:
-            folder = Path(f'{_DOCKER_PATH_PREFIX}{folder}')
         try:
             folder.mkdir(parents=True, exist_ok=True)
             write_test_path = folder / '.konomitv-bs4k-fmp4-write-test'
             write_test_path.write_bytes(b'')
             write_test_path.unlink()
         except OSError as ex:
-            raise ValueError(f'録画 fMP4 キャッシュの保存先へ書き込めません: {folder}') from ex
+            raise ValueError('録画 fMP4 キャッシュの保存先へ書き込めません。') from ex
         return folder
 
 class _ServerSettingsCapture(BaseModel):
     upload_folders: list[DirectoryPath] = []
+
+
+class _ServerSettingsCMAnalysis(BaseModel):
+    """サーバー全体で共有するCM解析の運用設定（config.yaml）。"""
+
+    enabled: bool = False
+    # 起動時に DirectoryPath で存在検証しない。未設定時は data/cm-analysis/logos を使う。
+    logo_directory: Path | None = None
+    excluded_directories: list[str] = []
+
 
 class ServerSettings(BaseModel):
     general: _ServerSettingsGeneral = _ServerSettingsGeneral()
@@ -565,6 +658,7 @@ class ServerSettings(BaseModel):
     tv: _ServerSettingsTV = _ServerSettingsTV()
     video: _ServerSettingsVideo = _ServerSettingsVideo()
     capture: _ServerSettingsCapture = _ServerSettingsCapture()
+    cm_analysis: _ServerSettingsCMAnalysis = _ServerSettingsCMAnalysis()
 
     @model_validator(mode='after')
     def validate_compatibility_api(self, info: ValidationInfo) -> 'ServerSettings':
@@ -612,6 +706,240 @@ class ServerSettings(BaseModel):
         return self
 
 
+class _HostServerSettingsServer(_ServerSettingsServer):
+    """API・設定ファイルでホストパスを保持する通常サーバー設定。"""
+
+    custom_https_certificate: Path | None = None
+    custom_https_private_key: Path | None = None
+
+
+class _HostServerSettingsCompatibilityAPI(_ServerSettingsCompatibilityAPI):
+    """API・設定ファイルでホストパスを保持する互換API設定。"""
+
+    custom_https_certificate: Path | None = None
+    custom_https_private_key: Path | None = None
+
+
+class _HostServerSettingsTV(_ServerSettingsTV):
+    """API・設定ファイルでホストパスを保持するライブ視聴設定。"""
+
+    debug_mode_ts_path: Path | None = None
+
+
+class _HostServerSettingsVideo(_ServerSettingsVideo):
+    """API・設定ファイルでホストパスを保持する録画設定。"""
+
+    recorded_folders: list[Path] = []
+    exclude_scan_paths: list[str] = []
+    recorded_fmp4_cache_folder: Path | None = None
+
+    @field_validator('exclude_scan_paths')
+    def normalize_exclude_scan_paths(cls, paths: list[str]) -> list[str]:
+        """
+        UIの未入力行を除き、従来のLoadConfigと同じく前後の空白を正規化する。
+
+        Args:
+            paths (list[str]): WebUI・API・config.yamlの録画スキャン除外パス。
+
+        Returns:
+            list[str]: 空行を除去した録画スキャン除外パス。
+        """
+
+        return [path.strip() for path in paths if path.strip() != '']
+
+    @field_validator('recorded_fmp4_cache_folder')
+    def validate_recorded_fmp4_cache_folder(cls, folder: Path | None) -> Path | None:
+        """
+        外部モデルでは実アクセス検証を内部モデルへの変換後まで延期する。
+
+        Args:
+            folder (Path | None): WebUI・API・config.yamlのホストパス。
+
+        Returns:
+            Path | None: 未変更の外部ホストパス。
+        """
+
+        return folder
+
+
+class _HostServerSettingsCapture(_ServerSettingsCapture):
+    """API・設定ファイルでホストパスを保持するキャプチャ設定。"""
+
+    upload_folders: list[Path] = []
+
+
+class _HostServerSettingsCMAnalysis(_ServerSettingsCMAnalysis):
+    """API・設定ファイルでホストパスを保持するCM解析設定。"""
+
+    logo_directory: Path | None = None
+    excluded_directories: list[str] = []
+
+    @field_validator('excluded_directories')
+    def normalize_excluded_directories(cls, paths: list[str]) -> list[str]:
+        """
+        UIの未入力行を除き、前後の空白を正規化する。
+
+        Args:
+            paths (list[str]): WebUI・API・config.yamlのCM解析除外パス。
+
+        Returns:
+            list[str]: 空行を除去した除外パス。
+        """
+
+        return [path.strip() for path in paths if path.strip() != '']
+
+
+_SERVER_SETTINGS_PATH_FIELDS: tuple[tuple[str, str, bool], ...] = (
+    ('server', 'custom_https_certificate', False),
+    ('server', 'custom_https_private_key', False),
+    ('compatibility_api', 'custom_https_certificate', False),
+    ('compatibility_api', 'custom_https_private_key', False),
+    ('tv', 'debug_mode_ts_path', False),
+    ('video', 'recorded_folders', True),
+    ('video', 'exclude_scan_paths', True),
+    ('video', 'recorded_fmp4_cache_folder', False),
+    ('capture', 'upload_folders', True),
+    ('cm_analysis', 'logo_directory', False),
+    ('cm_analysis', 'excluded_directories', True),
+)
+
+
+def _ConvertServerSettingsPaths(
+    config_dict: dict[str, Any],
+    converter: Callable[[str | Path], Path],
+) -> dict[str, Any]:
+    """
+    対象パス項目を定義表に従って同じ変換境界へ通す。
+
+    Args:
+        config_dict (dict[str, Any]): 変換対象のサーバー設定辞書。
+        converter (Callable[[str | Path], Path]): 各パスへ適用する変換関数。
+
+    Returns:
+        dict[str, Any]: 入力辞書の対象パスを変換した辞書。
+    """
+
+    for section, field_name, is_list in _SERVER_SETTINGS_PATH_FIELDS:
+        field_value = config_dict[section][field_name]
+        if field_value is None:
+            continue
+        if is_list:
+            config_dict[section][field_name] = [
+                str(converter(path_value))
+                for path_value in field_value
+            ]
+        else:
+            config_dict[section][field_name] = str(converter(field_value))
+    return config_dict
+
+
+class HostServerSettings(BaseModel):
+    """WebUI・API・config.yamlでホスト絶対パスを保持するサーバー設定。"""
+
+    general: _ServerSettingsGeneral = _ServerSettingsGeneral()
+    server: _HostServerSettingsServer = _HostServerSettingsServer()
+    compatibility_api: _HostServerSettingsCompatibilityAPI = _HostServerSettingsCompatibilityAPI()
+    tv: _HostServerSettingsTV = _HostServerSettingsTV()
+    video: _HostServerSettingsVideo = _HostServerSettingsVideo()
+    capture: _HostServerSettingsCapture = _HostServerSettingsCapture()
+    cm_analysis: _HostServerSettingsCMAnalysis = _HostServerSettingsCMAnalysis()
+
+    @model_validator(mode='after')
+    def normalize_host_paths(self) -> 'HostServerSettings':
+        """
+        外部モデルを構築した時点で対象パス項目をホスト表現へ正規化する。
+
+        旧クライアントから受け取ったDocker内部接頭辞を、保存や内部変換まで
+        モデル内に保持しない。各セクションは再検証してPathなどの宣言型を維持する。
+
+        Returns:
+            HostServerSettings: 対象パスを正規化した外部設定。
+        """
+
+        normalized_config = _ConvertServerSettingsPaths(
+            self.model_dump(mode='json'),
+            NormalizeHostPath,
+        )
+        bypass_context = {'bypass_validation': True}
+        self.server = _HostServerSettingsServer.model_validate(
+            normalized_config['server'],
+            context=bypass_context,
+        )
+        self.compatibility_api = _HostServerSettingsCompatibilityAPI.model_validate(
+            normalized_config['compatibility_api'],
+            context=bypass_context,
+        )
+        self.tv = _HostServerSettingsTV.model_validate(
+            normalized_config['tv'],
+            context=bypass_context,
+        )
+        self.video = _HostServerSettingsVideo.model_validate(
+            normalized_config['video'],
+            context=bypass_context,
+        )
+        self.capture = _HostServerSettingsCapture.model_validate(
+            normalized_config['capture'],
+            context=bypass_context,
+        )
+        self.cm_analysis = _HostServerSettingsCMAnalysis.model_validate(
+            normalized_config['cm_analysis'],
+            context=bypass_context,
+        )
+        return self
+
+    @classmethod
+    def fromServerSettings(cls, settings: ServerSettings) -> 'HostServerSettings':
+        """
+        内部実行用設定から外部向けホストパス設定を生成する。
+
+        Args:
+            settings (ServerSettings): 実アクセス用パスを保持する内部設定。
+
+        Returns:
+            HostServerSettings: 全対象パスをホスト表現へ変換した設定。
+        """
+
+        config_dict = settings.model_dump(mode='json')
+        return cls.model_validate(
+            _ConvertServerSettingsPaths(config_dict, ToHostPath),
+            context={'bypass_validation': True},
+        )
+
+    def toServerSettings(self, bypass_validation: bool = False) -> ServerSettings:
+        """
+        ホストパス設定を内部実行用設定へ変換して検証する。
+
+        Args:
+            bypass_validation (bool): カスタム実行環境検証を省略するかどうか。
+
+        Returns:
+            ServerSettings: Dockerでは対象パスへ接頭辞を1回だけ付けた内部設定。
+
+        Raises:
+            HostPathError: 外部パスが安全なホスト絶対パスでない場合。
+            ValidationError: 実アクセス先が存在しないなど内部設定の検証に失敗した場合。
+        """
+
+        config_dict = self.model_dump(mode='json')
+        return ServerSettings.model_validate(
+            _ConvertServerSettingsPaths(config_dict, ToRuntimePath),
+            context={'bypass_validation': bypass_validation},
+        )
+
+    def toSaveConfigDict(self) -> dict[str, Any]:
+        """
+        設定ファイルへ保存できる正規化済み辞書を返す。
+
+        Returns:
+            dict[str, Any]: 旧接頭辞を除き、ホストパスだけを保持する設定辞書。
+
+        Raises:
+            HostPathError: 外部パスが安全なホスト絶対パスでない場合。
+        """
+
+        return _ConvertServerSettingsPaths(self.model_dump(mode='json'), ToHostPath)
+
+
 def ResolveCompatibilityHTTPSSettings(
     settings: ServerSettings,
 ) -> _ServerSettingsServer | _ServerSettingsCompatibilityAPI:
@@ -628,7 +956,6 @@ def ResolveCompatibilityHTTPSSettings(
 
 _CONFIG: ServerSettings | None = None
 _CONFIG_YAML_PATH = BASE_DIR.parent / 'config.yaml'
-_DOCKER_PATH_PREFIX = '/host-rootfs'
 
 
 def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
@@ -671,15 +998,14 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
                     merged_dict[key] = value
             return merged_dict
 
-        default_config_dict = ServerSettings().model_dump(mode='json')
+        default_config_dict = HostServerSettings().model_dump(mode='json')
         return merge_dicts(default_config_dict, config_dict)
 
-    global _CONFIG, _CONFIG_YAML_PATH, _DOCKER_PATH_PREFIX
+    global _CONFIG, _CONFIG_YAML_PATH
     assert _CONFIG is None, 'LoadConfig() has already been called.'
 
     # 循環参照を避けるために遅延インポート
     from app import logging
-    from app.utils import GetPlatformEnvironment
 
     # 設定ファイルが配置されていない場合、エラーを表示して終了する
     if Path.exists(_CONFIG_YAML_PATH) is False:
@@ -701,51 +1027,24 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
         logging.error(f'{type(error).__name__}: {error}')
         sys.exit(1)
 
+    # config.yamlに存在しない設定値は、ホスト表現のデフォルト値で補完する。
+    config_dict = MergeConfigWithDefaults(config_dict)
+
+    # 外部表現を先に構築し、対象パス項目を共通変換してからDirectoryPath / FilePathを検証する。
     try:
-        # config.yaml に存在しない設定値はデフォルト値で補完する
-        config_dict = MergeConfigWithDefaults(config_dict)
-
-        # Docker 上で実行されているとき、サーバー設定のうちパス指定の項目に Docker 環境向けの Prefix (/host-rootfs) を付ける
-        ## /host-rootfs (docker-compose.yaml で定義) を通してホストマシンのファイルシステムにアクセスできる
-        if GetPlatformEnvironment() == 'Linux-Docker':
-            config_dict['video']['recorded_folders'] = [_DOCKER_PATH_PREFIX + folder for folder in config_dict['video']['recorded_folders']]
-            if type(config_dict['video']['recorded_fmp4_cache_folder']) is str:
-                config_dict['video']['recorded_fmp4_cache_folder'] = \
-                    _DOCKER_PATH_PREFIX + config_dict['video']['recorded_fmp4_cache_folder']
-            if 'exclude_scan_paths' in config_dict['video']:
-                # 空文字や空白だけのパスは無視する
-                ## 空文字が Docker 用 Prefix に変換されると、全パスが除外対象になってしまうため
-                exclude_scan_paths = [
-                    pattern.strip()
-                    for pattern in config_dict['video']['exclude_scan_paths']
-                    if type(pattern) is str and pattern.strip() != ''
-                ]
-                config_dict['video']['exclude_scan_paths'] = [
-                    _DOCKER_PATH_PREFIX + pattern
-                    for pattern in exclude_scan_paths
-                ]
-            config_dict['capture']['upload_folders'] = [_DOCKER_PATH_PREFIX + folder for folder in config_dict['capture']['upload_folders']]
-            if type(config_dict['tv']['debug_mode_ts_path']) is str:
-                config_dict['tv']['debug_mode_ts_path'] = _DOCKER_PATH_PREFIX + config_dict['tv']['debug_mode_ts_path']
-            for https_section in ('server', 'compatibility_api'):
-                if type(config_dict[https_section]['custom_https_certificate']) is str:
-                    config_dict[https_section]['custom_https_certificate'] = (
-                        _DOCKER_PATH_PREFIX + config_dict[https_section]['custom_https_certificate']
-                    )
-                if type(config_dict[https_section]['custom_https_private_key']) is str:
-                    config_dict[https_section]['custom_https_private_key'] = (
-                        _DOCKER_PATH_PREFIX + config_dict[https_section]['custom_https_private_key']
-                    )
-    except Exception:
-        pass  # config.yaml の記述が不正な場合は何もしない（どっちみち後のバリデーション処理で弾かれる）
-
-    # サーバー設定のバリデーションを実行
-    if bypass_validation is False:
-        try:
-            _CONFIG = ServerSettings.model_validate(config_dict, context={'bypass_validation': False})
+        host_config = HostServerSettings.model_validate(
+            config_dict,
+            context={'bypass_validation': True},
+        )
+        _CONFIG = host_config.toServerSettings(bypass_validation=bypass_validation)
+        if bypass_validation is False:
             logging.debug('Server settings loaded.')
-        except ValidationError as error:
-
+    except HostPathError as error:
+        logging.error('設定内容が不正なため、KonomiTV-BS4K を起動できません。')
+        logging.error(str(error))
+        sys.exit(1)
+    except ValidationError as error:
+        if bypass_validation is False:
             # エラーのうちどれか一つでもカスタムバリデーターからのエラーだった場合、エラーメッセージを表示して終了する
             ## カスタムバリデーターからのエラーメッセージかどうかは ctx に error が含まれているかどうかで判定する
             custom_error = False
@@ -763,53 +1062,31 @@ def LoadConfig(bypass_validation: bool = False) -> ServerSettings:
             # それ以外のバリデーションエラー
             logging.error('設定内容が不正なため、KonomiTV-BS4K を起動できません。')
             logging.error('以下のエラーメッセージを参考に、config.yaml の記述が正しいかを確認してください。')
-            logging.error(error)
-            sys.exit(1)
-    else:
-        _CONFIG = ServerSettings.model_validate(config_dict, context={'bypass_validation': True})
-        # logging.debug('Server settings loaded (bypassed validation).')
+            # Pydanticの文字列表現には内部パスと入力値が含まれるため、項目名と安全な説明だけを表示する。
+            for error_message in error.errors(include_input=False):
+                location = '.'.join(str(part) for part in error_message['loc'])
+                logging.error(f'{location}: {error_message["msg"]}')
+        else:
+            logging.error('サーバー設定を復元できませんでした。')
+        sys.exit(1)
 
     return _CONFIG
 
 
-def SaveConfig(config: ServerSettings) -> None:
+def SaveConfig(config: HostServerSettings) -> None:
     """
     変更されたサーバー設定データを、コメントやフォーマットを保持した形で config.yaml に書き込む
     この関数は _CONFIG を更新しないため、設定変更を反映するにはサーバーを再起動する必要がある
     (仮に _CONFIG を更新するよう実装しても、すでに Config() から取得した値を使って実行されている処理は更新できない)
 
     Args:
-        config (ServerSettings): 変更されたサーバー設定データ
+        config (HostServerSettings): ホストパスで受け取ったサーバー設定データ
     """
 
-    global _CONFIG_YAML_PATH, _DOCKER_PATH_PREFIX
+    global _CONFIG_YAML_PATH
 
-    # 循環参照を避けるために遅延インポート
-    from app.utils import GetPlatformEnvironment
-
-    # ServerSettings の Pydantic モデルを辞書に変換
-    config_dict = config.model_dump(mode='json')
-
-    # Docker 上で実行されているとき、サーバー設定のうちパス指定の項目に付与されている Docker 環境向けの Prefix (/host-rootfs) を外す
-    ## LoadConfig() で実行されている処理と逆の処理を行う
-    if GetPlatformEnvironment() == 'Linux-Docker':
-        config_dict['video']['recorded_folders'] = [str(folder).replace(_DOCKER_PATH_PREFIX, '') for folder in config_dict['video']['recorded_folders']]
-        config_dict['video']['exclude_scan_paths'] = [str(pattern).replace(_DOCKER_PATH_PREFIX, '') for pattern in config_dict['video']['exclude_scan_paths']]
-        if type(config_dict['video']['recorded_fmp4_cache_folder']) is str:
-            config_dict['video']['recorded_fmp4_cache_folder'] = \
-                config_dict['video']['recorded_fmp4_cache_folder'].replace(_DOCKER_PATH_PREFIX, '')
-        config_dict['capture']['upload_folders'] = [str(folder).replace(_DOCKER_PATH_PREFIX, '') for folder in config_dict['capture']['upload_folders']]
-        if type(config_dict['tv']['debug_mode_ts_path']) is str or config_dict['tv']['debug_mode_ts_path'] is Path:
-            config_dict['tv']['debug_mode_ts_path'] = str(config_dict['tv']['debug_mode_ts_path']).replace(_DOCKER_PATH_PREFIX, '')
-        for https_section in ('server', 'compatibility_api'):
-            if type(config_dict[https_section]['custom_https_certificate']) is str:
-                config_dict[https_section]['custom_https_certificate'] = (
-                    config_dict[https_section]['custom_https_certificate'].replace(_DOCKER_PATH_PREFIX, '')
-                )
-            if type(config_dict[https_section]['custom_https_private_key']) is str:
-                config_dict[https_section]['custom_https_private_key'] = (
-                    config_dict[https_section]['custom_https_private_key'].replace(_DOCKER_PATH_PREFIX, '')
-                )
+    # 保存直前にも全対象を同じ変換表へ通し、旧形式入力をconfig.yamlへ残さない。
+    config_dict = config.toSaveConfigDict()
 
     # config.yaml の内容をロード
     yaml = ruamel.yaml.YAML()
@@ -861,6 +1138,29 @@ def SaveConfig(config: ServerSettings) -> None:
 
     with open(_CONFIG_YAML_PATH, mode='w', encoding='utf-8') as file:
         yaml.dump(config_raw, file, transform=transform)
+
+
+def SaveConfigAndApply(config: HostServerSettings, *, bypass_validation: bool = True) -> ServerSettings:
+    """
+    config.yaml へ保存し、稼働中の _CONFIG も差し替える。
+
+    通常のサーバー設定更新 (SettingsRouter) は再起動前提のため SaveConfig のみを使う。
+    CM 解析設定のように WebUI から即時反映が必要な項目はこちらを使う。
+
+    Args:
+        config (HostServerSettings): ホストパスで受け取ったサーバー設定データ。
+        bypass_validation (bool): エンコーダー接続などの重い検証を省略するか。
+            稼働中プロセスからの部分更新では True を推奨する。
+
+    Returns:
+        ServerSettings: 差し替え後の内部実行用設定。
+    """
+
+    global _CONFIG
+    SaveConfig(config)
+    # エンコーダー再検査を避けるため、既に検証済みの稼働中更新では bypass する。
+    _CONFIG = config.toServerSettings(bypass_validation=bypass_validation)
+    return _CONFIG
 
 
 def Config() -> ServerSettings:

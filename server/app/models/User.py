@@ -22,6 +22,12 @@ if TYPE_CHECKING:
     from app.models.TwitterAccount import TwitterAccount
 
 
+def encodeClientSettingsJSON(value: object) -> str:
+    """ClientSettings JSON を allow_nan=False でシリアライズする。"""
+
+    return json.dumps(value, ensure_ascii=False, allow_nan=False)
+
+
 class User(TortoiseModel):
 
     # データベース上のテーブル名
@@ -32,7 +38,11 @@ class User(TortoiseModel):
     name = fields.TextField()
     password = fields.TextField()
     is_admin = fields.BooleanField()
-    client_settings = cast(TortoiseField[dict[str, Any]], fields.JSONField(default={}, encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
+    # allow_nan=False で NaN/Inf の DB 汚染を拒否する (Starlette JSONResponse も非有限値を拒否するため)
+    client_settings = cast(
+        TortoiseField[dict[str, Any]],
+        fields.JSONField(default={}, encoder=encodeClientSettingsJSON),
+    )  # type: ignore
     niconico_user_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     niconico_user_name = cast(TortoiseField[str | None], fields.TextField(null=True))
     niconico_user_premium = cast(TortoiseField[bool | None], fields.BooleanField(null=True))

@@ -24,32 +24,44 @@ const useServerSettingsStore = defineStore('serverSettings', () => {
 
     /**
      * サーバー設定を一度だけ取得する
+     * @param signal 呼び出し元のライフサイクル終了時にストア更新を中断する AbortSignal
      * @returns 取得結果のサーバー設定、取得失敗時は null
      */
-    async function fetchServerSettingsOnce(): Promise<IServerSettings | null> {
+    async function fetchServerSettingsOnce(signal?: AbortSignal): Promise<IServerSettings | null> {
+        const isCallerActive = () => signal?.aborted !== true;
+        if (isCallerActive() === false) {
+            return null;
+        }
         if (is_loaded.value) {
             return server_settings.value;
         }
 
         if (fetch_promise !== null) {
-            return await fetch_promise;
+            const settings = await fetch_promise;
+            if (settings !== null && isCallerActive()) {
+                server_settings.value = settings;
+                is_loaded.value = true;
+                return settings;
+            }
+            return null;
         }
 
         is_loading.value = true;
         fetch_promise = Settings.fetchServerSettings()
-            .then((settings) => {
-                if (settings !== null) {
-                    server_settings.value = settings;
-                    is_loaded.value = true;
-                }
-                return settings;
-            })
             .finally(() => {
                 is_loading.value = false;
                 fetch_promise = null;
             });
 
-        return await fetch_promise;
+        const settings = await fetch_promise;
+        // 共有中のリクエストが完了しても、破棄済み caller の代わりにストアを書き換えない。
+        // 同じ Promise を待つ別 caller が生きていれば、その caller が同じ値を反映する。
+        if (settings !== null && isCallerActive()) {
+            server_settings.value = settings;
+            is_loaded.value = true;
+            return settings;
+        }
+        return null;
     }
 
 

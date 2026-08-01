@@ -6,6 +6,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal, NotRequired
+from uuid import UUID
 
 from pydantic import BaseModel, Field, PlainSerializer, RootModel, computed_field
 from tortoise.contrib.pydantic import PydanticModel
@@ -293,7 +294,7 @@ class RecordedPlaybackIndex(PydanticModel):
     stage: Literal['Queued', 'Probing', 'Scanning', 'Finalizing', 'Complete', 'Failed']
 
 class RecordedPlaybackCapability(PydanticModel):
-    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC']
+    encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
     codec: Literal['avc', 'hevc', 'vp9', 'av1']
     bit_depth: Literal[8, 10]
     available: bool
@@ -311,6 +312,64 @@ class RecordedPlaybackCapability(PydanticModel):
         'UnsupportedCombination',
     ] | None
 
+
+KonomiTVBS4KPlaybackCapabilityReason = Literal[
+    'BinaryUnavailable',
+    'BridgeUnavailable',
+    'FeatureDisabled',
+    'DeviceUnavailable',
+    'DeviceInitializationFailed',
+    'FilterUnavailable',
+    'EncodeFailed',
+    'ProbeFailed',
+    'CodecMismatch',
+    'BitDepthMismatch',
+    'ProfileMismatch',
+    'UnsupportedCombination',
+]
+
+
+class KonomiTVBS4KPlaybackVideoCapability(PydanticModel):
+    """通常APIで公開するライブ・録画共通の映像codec能力。"""
+
+    encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
+    codec: Literal['avc', 'hevc', 'vp9', 'av1']
+    bit_depth: Literal[8, 10]
+    profile: str
+    live_available: bool
+    recorded_available: bool
+    live_reason_code: KonomiTVBS4KPlaybackCapabilityReason | None
+    recorded_reason_code: KonomiTVBS4KPlaybackCapabilityReason | None
+
+
+class KonomiTVBS4KPlaybackAudioCapability(PydanticModel):
+    """通常APIで公開するライブ・録画共通の音声codec能力。"""
+
+    codec: Literal['aac', 'opus']
+    live_available: bool
+    recorded_available: bool
+    live_reason_code: KonomiTVBS4KPlaybackCapabilityReason | None
+    recorded_reason_code: KonomiTVBS4KPlaybackCapabilityReason | None
+
+
+class KonomiTVBS4KPlaybackLiveCombinationCapability(PydanticModel):
+    """通常APIで公開するライブのbackend・映像・音声組み合わせ能力。"""
+
+    encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
+    video_codec: Literal['avc', 'hevc', 'vp9', 'av1']
+    video_bit_depth: Literal[8, 10]
+    audio_codec: Literal['aac', 'opus']
+    available: bool
+    reason_code: KonomiTVBS4KPlaybackCapabilityReason | None
+
+
+class KonomiTVBS4KPlaybackCapabilities(PydanticModel):
+    """映像・音声codec能力とライブ組み合わせ行列をまとめた通常APIの応答。"""
+
+    video: list[KonomiTVBS4KPlaybackVideoCapability]
+    audio: list[KonomiTVBS4KPlaybackAudioCapability]
+    live_combinations: list[KonomiTVBS4KPlaybackLiveCombinationCapability]
+
 # ***** バックグラウンド解析履歴 *****
 
 class AnalysisTaskExecution(BaseModel):
@@ -325,6 +384,7 @@ class AnalysisTaskExecution(BaseModel):
     status: Literal['Queued', 'Running', 'Succeeded', 'Failed', 'Interrupted', 'Skipped']
     trigger: Literal['Automatic', 'Manual', 'Maintenance', 'StartupBackfill']
     title: str
+    file_path: str | None
     stage: str | None
     progress: float | None
     stage_history: list[dict[str, object]]
@@ -343,6 +403,7 @@ class AnalysisTaskExecution(BaseModel):
 
 class AnalysisTaskOverview(BaseModel):
     active: list[AnalysisTaskExecution]
+    active_children: list[AnalysisTaskExecution]
     recent: list[AnalysisTaskExecution]
 
 class AnalysisTaskList(BaseModel):
@@ -717,6 +778,61 @@ class LiveStreamStatus(BaseModel):
     started_at: float
     updated_at: float
     client_count: int
+    prepare_state: Literal['Idle', 'Prepared', 'Consumed', 'Released', 'Expired', 'Rejected'] = 'Idle'
+    encoder_startup_elapsed_ms: int | None = None
+    last_output_age_ms: int | None = None
+    # JavaScript の Number では uint64 を正確に保持できないため10進文字列で返す
+    anchor_generation_id: str | None = None
+    anchor_sequence: int | None = None
+
+
+class LivePrepareLeaseRequest(BaseModel):
+    """Prepare lease の解放要求。"""
+
+    token: str
+    disposition: Literal['abort', 'commit']
+
+
+class LivePrepareLeaseAcquireRequest(BaseModel):
+    """Prepare lease の取得要求。"""
+
+    source_playback_session_id: UUID
+    prepared_playback_session_id: UUID
+
+
+class LivePrepareLeaseResponse(BaseModel):
+    """Prepare lease の取得・解放結果。"""
+
+    accepted: bool
+    token: str | None
+    expires_at: str | None
+    reason: str | None
+    cleanup_confirmed: bool = False
+    rollback_allowed: bool = True
+    terminal_restart_required: bool = False
+
+
+class LivePlaybackSessionRetireResponse(BaseModel):
+    """Playback session の明示終了結果。"""
+
+    accepted: bool
+    result: Literal[
+        'cleanup_completed',
+        'shared_encoder_retained',
+        'session_ambiguous',
+        'cleanup_timeout',
+        'cleanup_failed',
+    ]
+    reason: str | None
+    cleanup_confirmed: bool
+    terminal_restart_required: bool
+
+
+class LivePlaybackSessionRetireRequest(BaseModel):
+    """Playback session の明示終了要求。"""
+
+    playback_session_id: UUID
+
 
 class LiveStreamStatuses(BaseModel):
     Restart: dict[str, LiveStreamStatus]
@@ -1054,5 +1170,5 @@ class VersionInformation(BaseModel):
     latest_version: str | None
     environment: Literal['Linux', 'Linux-Docker']
     backend: Literal['EDCB', 'Mirakurun']
-    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC']
+    encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
     jikkyo_enabled: bool

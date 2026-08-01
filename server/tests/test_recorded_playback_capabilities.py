@@ -18,8 +18,26 @@ from app.routers.VideoStreamsRouter import VideoBitDepthQuery
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
 from app.streams.RecordedPlaybackCapabilities import (
     RecordedPlaybackBackend,
+    RecordedPlaybackBitDepth,
+    RecordedPlaybackCapability,
     RecordedPlaybackCapabilityProbe,
+    RecordedPlaybackEncoder,
+    RecordedPlaybackVideoCodec,
 )
+
+
+def _reset_recorded_playback_probe_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """能力probeのプロセス内状態を独立したasyncio loop向けに初期化する。"""
+
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_result', None)
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_individual_results', {})
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_signature', None)
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_signature_generation', 0)
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_inflight_tasks', {})
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_matrix_inflight_tasks', {})
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_selected_devices', {})
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_lock', asyncio.Lock())
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_probe_semaphore', asyncio.Semaphore(2))
 
 
 def test_recorded_playback_capability_matrix() -> None:
@@ -27,9 +45,9 @@ def test_recorded_playback_capability_matrix() -> None:
 
     assert RecordedPlaybackBackend.isCombinationSupported('FFmpeg', 'avc', 8) is True
     assert RecordedPlaybackBackend.isCombinationSupported('FFmpeg', 'avc', 10) is False
-    assert RecordedPlaybackBackend.isCombinationSupported('QSVEncC', 'vp9', 10) is True
-    assert RecordedPlaybackBackend.isCombinationSupported('NVEncC', 'vp9', 8) is False
-    assert RecordedPlaybackBackend.isCombinationSupported('VCEEncC', 'vp9', 10) is False
+    assert RecordedPlaybackBackend.isCombinationSupported('QSV', 'vp9', 10) is True
+    assert RecordedPlaybackBackend.isCombinationSupported('NVENC', 'vp9', 8) is False
+    assert RecordedPlaybackBackend.isCombinationSupported('AMF', 'vp9', 10) is False
 
 
 def test_recorded_playback_fixed_profiles() -> None:
@@ -50,13 +68,13 @@ def test_recorded_playback_cpu_encoders_use_realtime_tuning() -> None:
     assert RecordedPlaybackBackend.getTuningArguments('FFmpeg', 'av1') == [
         '-usage', 'realtime', '-cpu-used', '8', '-row-mt', '1',
     ]
-    assert RecordedPlaybackBackend.getTuningArguments('NVEncC', 'hevc') == []
+    assert RecordedPlaybackBackend.getTuningArguments('NVENC', 'hevc') == []
 
 
 def test_recorded_playback_qsv_uses_bundled_libva() -> None:
     """QSV用FFmpeg 8が同梱libvaとiHD driverを同じABIで使うことを確認する。"""
 
-    environment = RecordedPlaybackBackend.getEnvironment('QSVEncC')
+    environment = RecordedPlaybackBackend.getEnvironment('QSV')
     assert environment['LIBVA_DRIVER_NAME'] == 'iHD'
     assert environment['LIBVA_DRIVERS_PATH'].endswith('/Library/dri')
     assert environment['LD_LIBRARY_PATH'].split(':')[0].endswith('/Library')
@@ -76,7 +94,7 @@ def test_recorded_playback_amd_prefers_proprietary_vaapi_driver(
     monkeypatch.setattr(RecordedPlaybackBackend, '_AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY', proprietary)
     monkeypatch.setattr(RecordedPlaybackBackend, '_AMD_MESA_VAAPI_DRIVER_DIRECTORY', mesa)
 
-    environment = RecordedPlaybackBackend.getEnvironment('VCEEncC')
+    environment = RecordedPlaybackBackend.getEnvironment('AMF')
     assert environment['LIBVA_DRIVER_NAME'] == 'radeonsi'
     assert environment['LIBVA_DRIVERS_PATH'] == str(proprietary)
     assert environment['LD_LIBRARY_PATH'].split(':')[0].endswith('/Library')
@@ -96,7 +114,7 @@ def test_recorded_playback_amd_uses_mesa_without_proprietary_runtime(
     monkeypatch.setattr(RecordedPlaybackBackend, '_AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY', proprietary)
     monkeypatch.setattr(RecordedPlaybackBackend, '_AMD_MESA_VAAPI_DRIVER_DIRECTORY', mesa)
 
-    environment = RecordedPlaybackBackend.getEnvironment('VCEEncC')
+    environment = RecordedPlaybackBackend.getEnvironment('AMF')
     assert environment['LIBVA_DRIVER_NAME'] == 'radeonsi'
     assert environment['LIBVA_DRIVERS_PATH'] == str(mesa)
     assert environment['LD_LIBRARY_PATH'].split(':')[0].endswith('/Library')
@@ -106,7 +124,7 @@ def test_recorded_playback_amd_probe_uses_vaapi_download() -> None:
     """AMF能力検査が実再生と同じVAAPIからsystem memoryへの境界を通ることを確認する。"""
 
     command = RecordedPlaybackBackend.buildProbeCommand(
-        'VCEEncC',
+        'AMF',
         'hevc',
         10,
         Path('/tmp/probe.mp4'),
@@ -125,7 +143,7 @@ def test_recorded_playback_qsv_probe_keeps_hardware_pixel_format() -> None:
     """QSV frameをsoftware pixel formatへ戻す出力指定がないことを確認する。"""
 
     command = RecordedPlaybackBackend.buildProbeCommand(
-        'QSVEncC',
+        'QSV',
         'hevc',
         10,
         Path('/tmp/probe.mp4'),
@@ -134,7 +152,7 @@ def test_recorded_playback_qsv_probe_keeps_hardware_pixel_format() -> None:
     assert '-pix_fmt' not in command
 
     vp9_command = RecordedPlaybackBackend.buildProbeCommand(
-        'QSVEncC',
+        'QSV',
         'vp9',
         10,
         Path('/tmp/probe.mp4'),
@@ -147,7 +165,7 @@ def test_recorded_playback_nvenc_probe_keeps_cuda_frames() -> None:
     """NVENCがhwupload後のCUDA frameをsoftware形式へ戻さないことを確認する。"""
 
     command = RecordedPlaybackBackend.buildProbeCommand(
-        'NVEncC',
+        'NVENC',
         'hevc',
         10,
         Path('/tmp/probe.mp4'),
@@ -156,7 +174,7 @@ def test_recorded_playback_nvenc_probe_keeps_cuda_frames() -> None:
     assert command[command.index('-pix_fmt') + 1] == 'cuda'
 
     av1_command = RecordedPlaybackBackend.buildProbeCommand(
-        'NVEncC',
+        'NVENC',
         'av1',
         10,
         Path('/tmp/probe.mp4'),
@@ -174,7 +192,7 @@ def test_recorded_playback_non_ts_fallback_keeps_gpu_encoder() -> None:
     ]
     fallback = RecordedFMP4Stream.buildSoftwareDecodeFallback(
         command,
-        'NVEncC',
+        'NVENC',
         'p010le',
     )
     assert '-hwaccel' not in fallback
@@ -212,6 +230,485 @@ def test_recorded_playback_capability_failure_reason() -> None:
     assert RecordedPlaybackCapabilityProbe.classifyFailure(
         "No such filter: 'bwdif_cuda'",
     ) == 'FilterUnavailable'
+
+
+def test_recorded_playback_capability_selects_device_per_codec_and_bit_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧GPUのAVC成功後も全deviceを試し、AV1は新GPUへ割り当てる。"""
+
+    selected_codec = 'avc'
+
+    class FakeProcess:
+        def __init__(self, returncode: int, stdout: bytes = b'', stderr: bytes = b'') -> None:
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return self.stdout, self.stderr
+
+    async def CreateProcess(*args, **_kwargs):
+        nonlocal selected_codec
+        if args[0] == 'encode':
+            device = str(args[1])
+            selected_codec = str(args[2])
+            if device == '/dev/dri/renderD128' and selected_codec == 'av1':
+                return FakeProcess(1, stderr=b'unsupported codec')
+            return FakeProcess(0)
+        codec_name = {'avc': 'h264', 'av1': 'av1'}[selected_codec]
+        profile = 'High' if selected_codec == 'avc' else 'Main'
+        return FakeProcess(0, stdout=(
+            f'{{"streams":[{{"codec_name":"{codec_name}","nb_read_frames":"6",'
+            f'"pix_fmt":"yuv420p","profile":"{profile}"}}]}}'
+        ).encode())
+
+    monkeypatch.setattr(Path, 'is_file', lambda _path: True)
+    monkeypatch.setattr(
+        RecordedPlaybackBackend,
+        'discoverRenderDevices',
+        lambda _encoder: ['/dev/dri/renderD128', '/dev/dri/renderD129'],
+    )
+    monkeypatch.setattr(
+        RecordedPlaybackBackend,
+        'buildProbeCommand',
+        lambda _encoder, codec, _bit_depth, _output_path, device: ['encode', str(device), codec],
+    )
+    monkeypatch.setattr(
+        'app.streams.RecordedPlaybackCapabilities.asyncio.create_subprocess_exec',
+        CreateProcess,
+    )
+    RecordedPlaybackCapabilityProbe._selected_devices.clear()  # pyright: ignore[reportPrivateUsage]
+
+    async def Verify() -> None:
+        avc = await RecordedPlaybackCapabilityProbe._RecordedPlaybackCapabilityProbe__probeOne(  # pyright: ignore[reportPrivateUsage]
+            'QSV',
+            'avc',
+            8,
+        )
+        av1 = await RecordedPlaybackCapabilityProbe._RecordedPlaybackCapabilityProbe__probeOne(  # pyright: ignore[reportPrivateUsage]
+            'QSV',
+            'av1',
+            8,
+        )
+        assert avc.available is True
+        assert av1.available is True
+        assert RecordedPlaybackCapabilityProbe.getSelectedDevice('QSV', 'avc', 8) == \
+            '/dev/dri/renderD128'
+        assert RecordedPlaybackCapabilityProbe.getSelectedDevice('QSV', 'av1', 8) == \
+            '/dev/dri/renderD129'
+
+    asyncio.run(Verify())
+
+
+def test_recorded_playback_exact_probe_is_reused_by_full_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """要求した1組だけを先行probeし、後続の全行列でも同じ結果を再実行しない。"""
+
+    calls: list[tuple[str, str, int]] = []
+
+    async def GetSignature(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+    ) -> str:
+        """固定したテスト署名を返す。"""
+
+        return 'exact-probe-signature'
+
+    async def ProbeOne(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+        encoder: str,
+        codec: str,
+        bit_depth: int,
+    ) -> RecordedPlaybackCapability:
+        """呼び出しキーを記録して利用可能な能力を返す。"""
+
+        calls.append((encoder, codec, bit_depth))
+        return RecordedPlaybackCapability(
+            cast(RecordedPlaybackEncoder, encoder),
+            cast(RecordedPlaybackVideoCodec, codec),
+            cast(RecordedPlaybackBitDepth, bit_depth),
+            True,
+            'test',
+            None,
+        )
+
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_RecordedPlaybackCapabilityProbe__getSignature',
+        classmethod(GetSignature),
+    )
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_RecordedPlaybackCapabilityProbe__probeOne',
+        classmethod(ProbeOne),
+    )
+    _reset_recorded_playback_probe_state(monkeypatch)
+
+    async def Verify() -> None:
+        exact = await RecordedPlaybackCapabilityProbe.getCapability(
+            'QSV',
+            'av1',
+            10,
+        )
+        matrix = await RecordedPlaybackCapabilityProbe.getCapabilities()
+        assert exact is next(
+            capability
+            for capability in matrix
+            if (
+                capability.encoder,
+                capability.codec,
+                capability.bit_depth,
+            ) == ('QSV', 'av1', 10)
+        )
+
+    asyncio.run(Verify())
+
+    assert calls.count(('QSV', 'av1', 10)) == 1
+    assert len(calls) == 32
+
+
+def test_recorded_playback_same_key_shares_inflight_probe_without_holding_state_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一署名・同一キーの同時要求はlock外の1実probeだけを共有する。"""
+
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def GetSignature(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+    ) -> str:
+        return 'shared-inflight-signature'
+
+    async def ProbeOne(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+        encoder: RecordedPlaybackEncoder,
+        codec: RecordedPlaybackVideoCodec,
+        bit_depth: RecordedPlaybackBitDepth,
+    ) -> RecordedPlaybackCapability:
+        nonlocal calls
+        calls += 1
+        assert RecordedPlaybackCapabilityProbe._lock.locked() is False  # pyright: ignore[reportPrivateUsage]
+        started.set()
+        await release.wait()
+        return RecordedPlaybackCapability(encoder, codec, bit_depth, True, 'Main', None)
+
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_RecordedPlaybackCapabilityProbe__getSignature',
+        classmethod(GetSignature),
+    )
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_RecordedPlaybackCapabilityProbe__probeOne',
+        classmethod(ProbeOne),
+    )
+    _reset_recorded_playback_probe_state(monkeypatch)
+
+    async def Verify() -> None:
+        first = asyncio.create_task(RecordedPlaybackCapabilityProbe.getCapability('QSV', 'av1', 10))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        second = asyncio.create_task(RecordedPlaybackCapabilityProbe.getCapability('QSV', 'av1', 10))
+        await asyncio.sleep(0)
+        assert calls == 1
+        release.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert first_result is second_result
+
+    asyncio.run(Verify())
+    assert calls == 1
+
+
+def test_recorded_playback_full_matrix_allows_exact_probe_and_limits_parallelism(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全行列中も同backend末尾キーのexact要求を先行させ、実probeを2件に制限する。"""
+
+    first_key = ('FFmpeg', 'avc', 8)
+    exact_key = ('FFmpeg', 'av1', 10)
+    calls: list[tuple[str, str, int]] = []
+    active = 0
+    maximum_active = 0
+    first_started = asyncio.Event()
+    exact_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def GetSignature(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+    ) -> str:
+        return 'bounded-matrix-signature'
+
+    async def ProbeOne(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+        encoder: RecordedPlaybackEncoder,
+        codec: RecordedPlaybackVideoCodec,
+        bit_depth: RecordedPlaybackBitDepth,
+    ) -> RecordedPlaybackCapability:
+        nonlocal active, maximum_active
+        key = (encoder, codec, bit_depth)
+        calls.append(key)
+        active += 1
+        maximum_active = max(maximum_active, active)
+        try:
+            if key == first_key:
+                first_started.set()
+                await release_first.wait()
+            if key == exact_key:
+                exact_started.set()
+            await asyncio.sleep(0)
+            return RecordedPlaybackCapability(encoder, codec, bit_depth, True, 'test', None)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_RecordedPlaybackCapabilityProbe__getSignature',
+        classmethod(GetSignature),
+    )
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_RecordedPlaybackCapabilityProbe__probeOne',
+        classmethod(ProbeOne),
+    )
+    _reset_recorded_playback_probe_state(monkeypatch)
+
+    async def Verify() -> None:
+        first_matrix = asyncio.create_task(RecordedPlaybackCapabilityProbe.getCapabilities())
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        second_matrix = asyncio.create_task(RecordedPlaybackCapabilityProbe.getCapabilities())
+        exact = asyncio.create_task(RecordedPlaybackCapabilityProbe.getCapability(*exact_key))
+        await asyncio.wait_for(exact_started.wait(), timeout=1)
+        exact_result = await asyncio.wait_for(exact, timeout=1)
+        assert (exact_result.encoder, exact_result.codec, exact_result.bit_depth) == exact_key
+        assert first_matrix.done() is False
+        release_first.set()
+        first_result, second_result = await asyncio.gather(first_matrix, second_matrix)
+        assert first_result is second_result
+        assert len(first_result) == 32
+
+    asyncio.run(Verify())
+
+    assert calls.count(exact_key) == 1
+    assert len(calls) == 32
+    assert maximum_active <= 2
+
+
+def test_recorded_playback_signature_change_discards_stale_inflight_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧署名probe完了と新署名要求が競合しても旧結果を現世代cacheへ混入させない。"""
+
+    signature = 'signature-1'
+    calls: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def GetSignature(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+    ) -> str:
+        return signature
+
+    async def ProbeOne(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+        encoder: RecordedPlaybackEncoder,
+        codec: RecordedPlaybackVideoCodec,
+        bit_depth: RecordedPlaybackBitDepth,
+    ) -> RecordedPlaybackCapability:
+        probe_signature = signature
+        calls.append(probe_signature)
+        context = RecordedPlaybackCapabilityProbe._probe_context.get()  # pyright: ignore[reportPrivateUsage]
+        assert context is not None
+        context.selected_device = f'/dev/dri/{probe_signature}'
+        if probe_signature == 'signature-1':
+            first_started.set()
+            await release_first.wait()
+        return RecordedPlaybackCapability(
+            encoder,
+            codec,
+            bit_depth,
+            True,
+            probe_signature,
+            None,
+        )
+
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_RecordedPlaybackCapabilityProbe__getSignature',
+        classmethod(GetSignature),
+    )
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_RecordedPlaybackCapabilityProbe__probeOne',
+        classmethod(ProbeOne),
+    )
+    _reset_recorded_playback_probe_state(monkeypatch)
+
+    async def Verify() -> None:
+        nonlocal signature
+        first = asyncio.create_task(RecordedPlaybackCapabilityProbe.getCapability('QSV', 'av1', 10))
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        signature = 'signature-2'
+        second = asyncio.create_task(RecordedPlaybackCapabilityProbe.getCapability('QSV', 'av1', 10))
+        await asyncio.sleep(0)
+        release_first.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        assert first_result is second_result
+        assert first_result.profile == 'signature-2'
+        assert RecordedPlaybackCapabilityProbe._signature == 'signature-2'  # pyright: ignore[reportPrivateUsage]
+        cached = RecordedPlaybackCapabilityProbe._individual_results[('QSV', 'av1', 10)]  # pyright: ignore[reportPrivateUsage]
+        assert cached is first_result
+        assert RecordedPlaybackCapabilityProbe.getSelectedDevice('QSV', 'av1', 10) == \
+            '/dev/dri/signature-2'
+
+    asyncio.run(Verify())
+    assert calls == ['signature-1', 'signature-2']
+
+
+def test_recorded_playback_probe_timeout_kills_and_reaps_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """停止したencoder/ffprobeを能力APIへ無期限に残さず強制回収する。"""
+
+    class HangingProcess:
+        """終了しないprobe subprocessを再現する。"""
+
+        returncode: int | None = None
+        killed = False
+        waited = False
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            """呼び出し元のtimeoutまで終了しない。"""
+
+            await asyncio.Event().wait()
+            return b'', b''
+
+        def kill(self) -> None:
+            """強制終了を記録する。"""
+
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            """回収待ちを記録する。"""
+
+            self.waited = True
+            return -9
+
+    process = HangingProcess()
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        '_probe_timeout_seconds',
+        0.001,
+    )
+
+    async def Verify() -> None:
+        with pytest.raises(TimeoutError):
+            await RecordedPlaybackCapabilityProbe.\
+                _RecordedPlaybackCapabilityProbe__communicateWithTimeout(  # pyright: ignore[reportPrivateUsage]
+                    cast(asyncio.subprocess.Process, process),
+                )
+
+    asyncio.run(Verify())
+
+    assert process.killed is True
+    assert process.waited is True
+
+
+def test_recorded_playback_probe_cancellation_kills_and_reaps_process() -> None:
+    """呼び出し元 Task のキャンセルでも能力 probe subprocess を強制回収する。"""
+
+    class HangingProcess:
+        """キャンセルされるまで communicate() が終了しない probe subprocess を再現する。"""
+
+        def __init__(self) -> None:
+            """
+            subprocess の状態と communicate() 開始通知を初期化する。
+
+            Args:
+                None
+
+            Returns:
+                None
+            """
+
+            self.returncode: int | None = None
+            self.killed = False
+            self.waited = False
+            self.communicate_started = asyncio.Event()
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            """
+            communicate() の開始を通知し、呼び出し元からのキャンセルを待つ。
+
+            Args:
+                None
+
+            Returns:
+                tuple[bytes, bytes]: 通常はキャンセルされるため返らない空出力。
+            """
+
+            self.communicate_started.set()
+            await asyncio.Event().wait()
+            return b'', b''
+
+        def kill(self) -> None:
+            """
+            subprocess の強制終了を記録する。
+
+            Args:
+                None
+
+            Returns:
+                None
+            """
+
+            self.killed = True
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            """
+            subprocess の回収待ちを記録する。
+
+            Args:
+                None
+
+            Returns:
+                int: SIGKILL 相当の終了コード。
+            """
+
+            self.waited = True
+            return -9
+
+    process = HangingProcess()
+
+    async def Verify() -> None:
+        """
+        communicate() 待機中の Task をキャンセルし、例外伝播と回収を検証する。
+
+        Args:
+            None
+
+        Returns:
+            None
+        """
+
+        probe_task = asyncio.create_task(
+            RecordedPlaybackCapabilityProbe.
+                _RecordedPlaybackCapabilityProbe__communicateWithTimeout(  # pyright: ignore[reportPrivateUsage]
+                    cast(asyncio.subprocess.Process, process),
+                ),
+        )
+        await asyncio.wait_for(process.communicate_started.wait(), timeout=1)
+        probe_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe_task
+
+    asyncio.run(Verify())
+
+    assert process.killed is True
+    assert process.waited is True
 
 
 def test_recorded_playback_timeline_normalizes_mpeg_ts_pts() -> None:

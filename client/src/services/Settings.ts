@@ -79,6 +79,8 @@ export interface IClientSettings {
     // bs4k_tv_encoding_codec_cellular: 同期無効
     // tv_low_latency_mode: 同期無効
     // tv_low_latency_mode_cellular: 同期無効
+    // tv_low_latency_mode_for_bs4k: 同期無効
+    // tv_low_latency_mode_for_bs4k_cellular: 同期無効
     // tv_24fps_mode: 同期無効
     // tv_24fps_mode_cellular: 同期無効
     // video_streaming_quality: 同期無効
@@ -127,8 +129,15 @@ export interface IClientSettings {
 }
 
 /**
+ * WebUI・設定 API・config.yaml で保持するホスト側の絶対パス
+ */
+export type HostAbsolutePath = string;
+
+export type ServerEncoder = 'FFmpeg' | 'QSV' | 'NVENC' | 'AMF';
+
+/**
  * サーバー設定を表すインターフェース
- * サーバー側の app.config.ServerSettings で定義されているものと同じ
+ * サーバー側の app.config.HostServerSettings で定義されているものと同じ
  */
 export interface IServerSettings {
     general: {
@@ -137,8 +146,8 @@ export interface IServerSettings {
         always_receive_tv_from_mirakurun: boolean;
         edcb_url: string;
         mirakurun_url: string;
-        encoder: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC';
-        encoder_bs4k: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC';
+        encoder: ServerEncoder;
+        encoder_bs4k: ServerEncoder;
         encoder_bs4k_input_probesize: number;
         encoder_bs4k_input_analyze: number;
         encoder_bs4k_input_analysis_enabled: boolean;
@@ -154,8 +163,8 @@ export interface IServerSettings {
     server: {
         https_mode: 'akebi' | 'certificate' | 'reverse_proxy';
         port: number;
-        custom_https_certificate: string | null;
-        custom_https_private_key: string | null;
+        custom_https_certificate: HostAbsolutePath | null;
+        custom_https_private_key: HostAbsolutePath | null;
         reverse_proxy_listen_address: string;
         trusted_proxy_cidrs: string[];
     };
@@ -164,25 +173,57 @@ export interface IServerSettings {
         port: number;
         profile: 'KomorebiV1';
         https_mode: 'inherit' | 'akebi' | 'certificate' | 'reverse_proxy';
-        custom_https_certificate: string | null;
-        custom_https_private_key: string | null;
+        custom_https_certificate: HostAbsolutePath | null;
+        custom_https_private_key: HostAbsolutePath | null;
         reverse_proxy_listen_address: string;
         trusted_proxy_cidrs: string[];
     };
     tv: {
         preferred_terrestrial_region: string | null;
         max_alive_time: number;
-        debug_mode_ts_path: string | null;
+        debug_mode_ts_path: HostAbsolutePath | null;
     };
     video: {
-        recorded_folders: string[];
-        exclude_scan_paths: string[];
-        recorded_fmp4_cache_folder: string | null;
+        recorded_folders: HostAbsolutePath[];
+        exclude_scan_paths: HostAbsolutePath[];
+        recorded_fmp4_cache_folder: HostAbsolutePath | null;
         recorded_playback_index_backfill_enabled: boolean;
     };
     capture: {
-        upload_folders: string[];
+        upload_folders: HostAbsolutePath[];
     };
+    /** CM 解析のサーバー全体設定（config.yaml の cm_analysis）。専用 API でも更新する。 */
+    cm_analysis: {
+        enabled: boolean;
+        logo_directory: HostAbsolutePath | null;
+        excluded_directories: HostAbsolutePath[];
+    };
+}
+
+type LegacyServerEncoder = 'QSVEncC' | 'NVEncC' | 'VCEEncC';
+type ServerSettingsResponse = Omit<IServerSettings, 'general'> & {
+    general: Omit<IServerSettings['general'], 'encoder' | 'encoder_bs4k'> & {
+        encoder: ServerEncoder | LegacyServerEncoder;
+        encoder_bs4k: ServerEncoder | LegacyServerEncoder;
+    };
+};
+
+/**
+ * FFmpeg 8 移行前のエンコーダー名を現在の正規識別子へ変換する
+ * @param encoder API から取得したエンコーダー名
+ * @return 現在の正規識別子
+ */
+function normalizeServerEncoder(encoder: ServerEncoder | LegacyServerEncoder): ServerEncoder {
+    switch (encoder) {
+        case 'QSVEncC':
+            return 'QSV';
+        case 'NVEncC':
+            return 'NVENC';
+        case 'VCEEncC':
+            return 'AMF';
+        default:
+            return encoder;
+    }
 }
 
 /* サーバー設定を表すインターフェースのデフォルト値 */
@@ -238,6 +279,11 @@ export const IServerSettingsDefault: IServerSettings = {
     },
     capture: {
         upload_folders: [],
+    },
+    cm_analysis: {
+        enabled: false,
+        logo_directory: null,
+        excluded_directories: [],
     },
 };
 
@@ -295,7 +341,7 @@ class Settings {
     static async fetchServerSettings(): Promise<IServerSettings | null> {
 
         // API リクエストを実行
-        const response = await APIClient.get<IServerSettings>('/settings/server');
+        const response = await APIClient.get<ServerSettingsResponse>('/settings/server');
 
         // エラー処理
         if (response.type === 'error') {
@@ -307,7 +353,15 @@ class Settings {
             return null;
         }
 
-        return response.data;
+        // 再起動前の旧サーバープロセスから旧名が返っても、画面状態と次回保存値には正規識別子だけを使う
+        return {
+            ...response.data,
+            general: {
+                ...response.data.general,
+                encoder: normalizeServerEncoder(response.data.general.encoder),
+                encoder_bs4k: normalizeServerEncoder(response.data.general.encoder_bs4k),
+            },
+        };
     }
 
     /**

@@ -18,11 +18,59 @@ export type BS4KLiveStreamingQuality = '4320p' | '2160p' | '1440p' | '1080p-60fp
 export const BS4K_LIVE_STREAMING_QUALITIES: BS4KLiveStreamingQuality[] = ['4320p', '2160p', '1440p', '1080p-60fps', '1080p-30fps', '810p-60fps', '810p-30fps', '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps'];
 export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
+export type KonomiTVBS4KPlaybackStreamingQuality = LiveStreamingQuality;
+export type KonomiTVBS4KPlaybackVideoCodec = 'avc' | 'hevc' | 'vp9' | 'av1';
+export type KonomiTVBS4KPlaybackAudioCodec = 'aac' | 'opus';
+export interface IKonomiTVBS4KPlaybackVideoProfile {
+    is_bs4k: boolean;
+    streaming_quality: KonomiTVBS4KPlaybackStreamingQuality | BS4KLiveStreamingQuality;
+}
+export type KonomiTVBS4KPlaybackVideoCodecSettingKey =
+    'konomitv_bs4k_playback_video_codec' |
+    'konomitv_bs4k_playback_video_codec_cellular' |
+    'konomitv_bs4k_playback_video_codec_for_bs4k' |
+    'konomitv_bs4k_playback_video_codec_for_bs4k_cellular';
+export type KonomiTVBS4KPlaybackAudioCodecSettingKey =
+    'konomitv_bs4k_playback_audio_codec' |
+    'konomitv_bs4k_playback_audio_codec_cellular' |
+    'konomitv_bs4k_playback_audio_codec_for_bs4k' |
+    'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular';
+// 以下3型は旧キー・既存importを最低1リリース維持するための互換型。
 export type StreamingVideoCodec = 'avc' | 'hevc';
-export type RecordedStreamingVideoCodec = StreamingVideoCodec | 'vp9' | 'av1';
-export type RecordedStreamingAudioCodec = 'aac' | 'opus';
+export type RecordedStreamingVideoCodec = KonomiTVBS4KPlaybackVideoCodec;
+export type RecordedStreamingAudioCodec = KonomiTVBS4KPlaybackAudioCodec;
 export type VideoSeriesSortKey = 'SeasonEpisode' | 'BroadcastDate' | 'Title';
 export type VideoSeriesSortDirection = 'Asc' | 'Desc';
+
+/** 通常 / BS4K と回線種別に対応する共通映像コーデック設定キーを返す。 */
+export function getKonomiTVBS4KPlaybackVideoCodecSettingKey(
+    is_konomitv_bs4k: boolean,
+    is_konomitv_bs4k_cellular: boolean,
+): KonomiTVBS4KPlaybackVideoCodecSettingKey {
+    if (is_konomitv_bs4k === true) {
+        return is_konomitv_bs4k_cellular === true ?
+            'konomitv_bs4k_playback_video_codec_for_bs4k_cellular' :
+            'konomitv_bs4k_playback_video_codec_for_bs4k';
+    }
+    return is_konomitv_bs4k_cellular === true ?
+        'konomitv_bs4k_playback_video_codec_cellular' :
+        'konomitv_bs4k_playback_video_codec';
+}
+
+/** 通常 / BS4K と回線種別に対応する共通音声コーデック設定キーを返す。 */
+export function getKonomiTVBS4KPlaybackAudioCodecSettingKey(
+    is_konomitv_bs4k: boolean,
+    is_konomitv_bs4k_cellular: boolean,
+): KonomiTVBS4KPlaybackAudioCodecSettingKey {
+    if (is_konomitv_bs4k === true) {
+        return is_konomitv_bs4k_cellular === true ?
+            'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular' :
+            'konomitv_bs4k_playback_audio_codec_for_bs4k';
+    }
+    return is_konomitv_bs4k_cellular === true ?
+        'konomitv_bs4k_playback_audio_codec_cellular' :
+        'konomitv_bs4k_playback_audio_codec';
+}
 
 // 番組表関連の型定義
 export type TimeTableSizeOption = 'Wide' | 'Normal' | 'Narrow';
@@ -110,12 +158,40 @@ export interface ILocalClientSettings extends IClientSettings {
     bs4k_streaming_quality_cellular: BS4KLiveStreamingQuality;
     bs4k_video_streaming_quality: BS4KLiveStreamingQuality;
     bs4k_video_streaming_quality_cellular: BS4KLiveStreamingQuality;
+    konomitv_bs4k_playback_streaming_quality: KonomiTVBS4KPlaybackStreamingQuality;
+    konomitv_bs4k_playback_streaming_quality_cellular: KonomiTVBS4KPlaybackStreamingQuality;
+    konomitv_bs4k_playback_streaming_quality_for_bs4k: BS4KLiveStreamingQuality;
+    konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular: BS4KLiveStreamingQuality;
+    konomitv_bs4k_playback_video_codec: KonomiTVBS4KPlaybackVideoCodec;
+    konomitv_bs4k_playback_video_codec_cellular: KonomiTVBS4KPlaybackVideoCodec;
+    konomitv_bs4k_playback_video_codec_for_bs4k: KonomiTVBS4KPlaybackVideoCodec;
+    konomitv_bs4k_playback_video_codec_for_bs4k_cellular: KonomiTVBS4KPlaybackVideoCodec;
+    konomitv_bs4k_playback_audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+    konomitv_bs4k_playback_audio_codec_cellular: KonomiTVBS4KPlaybackAudioCodec;
+    konomitv_bs4k_playback_audio_codec_for_bs4k: KonomiTVBS4KPlaybackAudioCodec;
+    konomitv_bs4k_playback_audio_codec_for_bs4k_cellular: KonomiTVBS4KPlaybackAudioCodec;
+    // 自動画質選択モード (回線ごと / 通常・BS4K 共通フラグ)
+    konomitv_bs4k_playback_auto_quality_mode: boolean;
+    konomitv_bs4k_playback_auto_quality_mode_cellular: boolean;
+    // 自動モード時の上限画質 (通常 / BS4K / 回線別)
+    konomitv_bs4k_playback_auto_quality_max: KonomiTVBS4KPlaybackStreamingQuality;
+    konomitv_bs4k_playback_auto_quality_max_cellular: KonomiTVBS4KPlaybackStreamingQuality;
+    konomitv_bs4k_playback_auto_quality_max_for_bs4k: BS4KLiveStreamingQuality;
+    konomitv_bs4k_playback_auto_quality_max_for_bs4k_cellular: BS4KLiveStreamingQuality;
+    konomitv_bs4k_playback_24fps_mode: boolean;
+    konomitv_bs4k_playback_24fps_mode_cellular: boolean;
+    konomitv_bs4k_playback_24fps_mode_for_bs4k: boolean;
+    konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular: boolean;
+    konomitv_bs4k_playback_profile_migration_conflict_notice_pending: boolean;
+    // ここから下は旧ライブ・録画別キー。ロールバック用に最低1リリース保持する。
     tv_encoding_codec: StreamingVideoCodec;
     tv_encoding_codec_cellular: StreamingVideoCodec;
     bs4k_tv_encoding_codec: StreamingVideoCodec;
     bs4k_tv_encoding_codec_cellular: StreamingVideoCodec;
     tv_low_latency_mode: boolean;
     tv_low_latency_mode_cellular: boolean;
+    tv_low_latency_mode_for_bs4k: boolean;
+    tv_low_latency_mode_for_bs4k_cellular: boolean;
     tv_24fps_mode: boolean;
     tv_24fps_mode_cellular: boolean;
     video_streaming_quality: VideoStreamingQuality;
@@ -307,6 +383,56 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     bs4k_video_streaming_quality: '1080p-60fps',
     // BS4K 録画再生のデフォルトのストリーミング画質 (モバイル回線時) (Default: 540p-30fps) (同期無効)
     bs4k_video_streaming_quality_cellular: '540p-30fps',
+
+    // 通常放送の共通再生画質 (Wi-Fi 回線時) (Default: 1080p) (同期無効)
+    konomitv_bs4k_playback_streaming_quality: '1080p',
+    // 通常放送の共通再生画質 (モバイル回線時) (Default: 480p) (同期無効)
+    konomitv_bs4k_playback_streaming_quality_cellular: '480p',
+    // BS4K の共通再生画質 (Wi-Fi 回線時) (Default: 1080p-60fps) (同期無効)
+    konomitv_bs4k_playback_streaming_quality_for_bs4k: '1080p-60fps',
+    // BS4K の共通再生画質 (モバイル回線時) (Default: 540p-30fps) (同期無効)
+    konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular: '540p-30fps',
+    // 通常放送の共通映像コーデック (Wi-Fi 回線時) (Default: AVC) (同期無効)
+    konomitv_bs4k_playback_video_codec: 'avc',
+    // 通常放送の共通映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
+    konomitv_bs4k_playback_video_codec_cellular: 'hevc',
+    // BS4K の共通映像コーデック (Wi-Fi 回線時) (Default: HEVC) (同期無効)
+    konomitv_bs4k_playback_video_codec_for_bs4k: 'hevc',
+    // BS4K の共通映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
+    konomitv_bs4k_playback_video_codec_for_bs4k_cellular: 'hevc',
+    // 通常放送の共通音声コーデック (Wi-Fi 回線時) (Default: AAC) (同期無効)
+    konomitv_bs4k_playback_audio_codec: 'aac',
+    // 通常放送の共通音声コーデック (モバイル回線時) (Default: AAC) (同期無効)
+    konomitv_bs4k_playback_audio_codec_cellular: 'aac',
+    // BS4K の共通音声コーデック (Wi-Fi 回線時) (Default: AAC) (同期無効)
+    konomitv_bs4k_playback_audio_codec_for_bs4k: 'aac',
+    // BS4K の共通音声コーデック (モバイル回線時) (Default: AAC) (同期無効)
+    konomitv_bs4k_playback_audio_codec_for_bs4k_cellular: 'aac',
+    // 自動画質選択モード (Wi-Fi 回線時) (Default: オン) (同期無効)
+    konomitv_bs4k_playback_auto_quality_mode: true,
+    // 自動画質選択モード (モバイル回線時) (Default: オン) (同期無効)
+    konomitv_bs4k_playback_auto_quality_mode_cellular: true,
+    // 自動モード時の通常放送上限画質 (Wi-Fi) (Default: 1080p-60fps) (同期無効)
+    konomitv_bs4k_playback_auto_quality_max: '1080p-60fps',
+    // 自動モード時の通常放送上限画質 (モバイル) (Default: 720p) (同期無効)
+    konomitv_bs4k_playback_auto_quality_max_cellular: '720p',
+    // 自動モード時の BS4K 上限画質 (Wi-Fi) (Default: 2160p) (同期無効)
+    konomitv_bs4k_playback_auto_quality_max_for_bs4k: '2160p',
+    // 自動モード時の BS4K 上限画質 (モバイル) (Default: 1080p-60fps) (同期無効)
+    konomitv_bs4k_playback_auto_quality_max_for_bs4k_cellular: '1080p-60fps',
+    // 通常放送の共通 24fps モード (Wi-Fi 回線時) (Default: オフ) (同期無効)
+    konomitv_bs4k_playback_24fps_mode: false,
+    // 通常放送の共通 24fps モード (モバイル回線時) (Default: オフ) (同期無効)
+    konomitv_bs4k_playback_24fps_mode_cellular: false,
+    // BS4K の共通 24fps モード (Wi-Fi 回線時) (Default: オフ・現在は適用外) (同期無効)
+    konomitv_bs4k_playback_24fps_mode_for_bs4k: false,
+    // BS4K の共通 24fps モード (モバイル回線時) (Default: オフ・現在は適用外) (同期無効)
+    konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular: false,
+    // 旧ライブ・録画設定の競合説明を一度だけ表示するための保留フラグ (Default: オフ) (同期無効)
+    konomitv_bs4k_playback_profile_migration_conflict_notice_pending: false,
+
+    // ***** 旧ライブ・録画別再生設定 (ロールバック用に最低1リリース保持) *****
+
     // テレビの映像コーデック (Wi-Fi 回線時) (Default: AVC) (同期無効)
     tv_encoding_codec: 'avc',
     // テレビの映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
@@ -319,6 +445,10 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     tv_low_latency_mode: true,
     // テレビを低遅延で視聴する (モバイル回線時)  (Default: 低遅延で視聴しない) (同期無効)
     tv_low_latency_mode_cellular: false,
+    // BS4K テレビを低遅延で視聴する (Wi-Fi 回線時)  (Default: 低遅延で視聴する) (同期無効)
+    tv_low_latency_mode_for_bs4k: true,
+    // BS4K テレビを低遅延で視聴する (モバイル回線時)  (Default: 低遅延で視聴しない) (同期無効)
+    tv_low_latency_mode_for_bs4k_cellular: false,
     // テレビを 24fps モードで視聴する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
     tv_24fps_mode: false,
     // テレビを 24fps モードで視聴する (モバイル回線時)  (Default: オフ) (同期無効)
@@ -493,12 +623,37 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     // bs4k_streaming_quality_cellular: 同期無効
     // bs4k_video_streaming_quality: 同期無効
     // bs4k_video_streaming_quality_cellular: 同期無効
+    // konomitv_bs4k_playback_streaming_quality: 同期無効
+    // konomitv_bs4k_playback_streaming_quality_cellular: 同期無効
+    // konomitv_bs4k_playback_streaming_quality_for_bs4k: 同期無効
+    // konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular: 同期無効
+    // konomitv_bs4k_playback_video_codec: 同期無効
+    // konomitv_bs4k_playback_video_codec_cellular: 同期無効
+    // konomitv_bs4k_playback_video_codec_for_bs4k: 同期無効
+    // konomitv_bs4k_playback_video_codec_for_bs4k_cellular: 同期無効
+    // konomitv_bs4k_playback_audio_codec: 同期無効
+    // konomitv_bs4k_playback_audio_codec_cellular: 同期無効
+    // konomitv_bs4k_playback_audio_codec_for_bs4k: 同期無効
+    // konomitv_bs4k_playback_audio_codec_for_bs4k_cellular: 同期無効
+    // konomitv_bs4k_playback_auto_quality_mode: 同期無効
+    // konomitv_bs4k_playback_auto_quality_mode_cellular: 同期無効
+    // konomitv_bs4k_playback_auto_quality_max: 同期無効
+    // konomitv_bs4k_playback_auto_quality_max_cellular: 同期無効
+    // konomitv_bs4k_playback_auto_quality_max_for_bs4k: 同期無効
+    // konomitv_bs4k_playback_auto_quality_max_for_bs4k_cellular: 同期無効
+    // konomitv_bs4k_playback_24fps_mode: 同期無効
+    // konomitv_bs4k_playback_24fps_mode_cellular: 同期無効
+    // konomitv_bs4k_playback_24fps_mode_for_bs4k: 同期無効
+    // konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular: 同期無効
+    // konomitv_bs4k_playback_profile_migration_conflict_notice_pending: 同期無効
     // tv_encoding_codec: 同期無効
     // tv_encoding_codec_cellular: 同期無効
     // bs4k_tv_encoding_codec: 同期無効
     // bs4k_tv_encoding_codec_cellular: 同期無効
     // tv_low_latency_mode: 同期無効
     // tv_low_latency_mode_cellular: 同期無効
+    // tv_low_latency_mode_for_bs4k: 同期無効
+    // tv_low_latency_mode_for_bs4k_cellular: 同期無効
     // tv_24fps_mode: 同期無効
     // tv_24fps_mode_cellular: 同期無効
     // video_streaming_quality: 同期無効
@@ -586,6 +741,329 @@ export function setLocalStorageSettings(settings: ILocalClientSettings): void {
     localStorage.setItem('KonomiTV-Settings', JSON.stringify(settings));
 }
 
+const LEGACY_BS4K_QUALITY_MAP: Record<string, BS4KLiveStreamingQuality> = {
+    '1080p': '1080p-30fps',
+    '810p': '810p-30fps',
+    '720p': '720p-30fps',
+    '540p': '540p-30fps',
+    '480p': '480p-30fps',
+    '360p': '360p-30fps',
+    '240p': '240p-30fps',
+};
+
+// 開発途中版で一時的に作成された汎用名キーから、
+// KonomiTV-BS4K 専用名へ値を失わず移行する。
+// 正規キーがすでにある場合は必ずそちらを優先し、再起動のたびに値が巻き戻ることを防ぐ。
+const KONOMITV_BS4K_PLAYBACK_PROFILE_CANDIDATE_KEY_MIGRATIONS = {
+    playback_streaming_quality: 'konomitv_bs4k_playback_streaming_quality',
+    playback_streaming_quality_cellular: 'konomitv_bs4k_playback_streaming_quality_cellular',
+    bs4k_playback_streaming_quality: 'konomitv_bs4k_playback_streaming_quality_for_bs4k',
+    bs4k_playback_streaming_quality_cellular: 'konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular',
+    playback_video_codec: 'konomitv_bs4k_playback_video_codec',
+    playback_video_codec_cellular: 'konomitv_bs4k_playback_video_codec_cellular',
+    bs4k_playback_video_codec: 'konomitv_bs4k_playback_video_codec_for_bs4k',
+    bs4k_playback_video_codec_cellular: 'konomitv_bs4k_playback_video_codec_for_bs4k_cellular',
+    playback_audio_codec: 'konomitv_bs4k_playback_audio_codec',
+    playback_audio_codec_cellular: 'konomitv_bs4k_playback_audio_codec_cellular',
+    bs4k_playback_audio_codec: 'konomitv_bs4k_playback_audio_codec_for_bs4k',
+    bs4k_playback_audio_codec_cellular: 'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular',
+    playback_24fps_mode: 'konomitv_bs4k_playback_24fps_mode',
+    playback_24fps_mode_cellular: 'konomitv_bs4k_playback_24fps_mode_cellular',
+    bs4k_playback_24fps_mode: 'konomitv_bs4k_playback_24fps_mode_for_bs4k',
+    bs4k_playback_24fps_mode_cellular: 'konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular',
+    playback_profile_migration_conflict_notice_pending:
+        'konomitv_bs4k_playback_profile_migration_conflict_notice_pending',
+} as const satisfies Record<string, keyof ILocalClientSettings>;
+
+/**
+ * 旧ライブ・録画別設定から共通再生プロファイルを生成する。
+ * 新キーが生データに存在する場合は一切上書きしないため、何度呼び出しても同じ結果になる。
+ */
+export function migrateKonomiTVBS4KPlaybackProfileSettings(
+    konomitv_bs4k_settings: {[key: string]: any},
+): {[key: string]: any} {
+
+    const konomitv_bs4k_migrated_settings = {...konomitv_bs4k_settings};
+    const codecFromKonomiTVBS4KDataSaver = (
+        konomitv_bs4k_value: unknown,
+    ): StreamingVideoCodec => konomitv_bs4k_value === true ? 'hevc' : 'avc';
+
+    // 開発途中版の共通キーが残る環境では、旧ライブ・録画別キーより先にその保存値を引き継ぐ。
+    for (const [konomitv_bs4k_candidate_key, konomitv_bs4k_canonical_key] of Object.entries(
+        KONOMITV_BS4K_PLAYBACK_PROFILE_CANDIDATE_KEY_MIGRATIONS,
+    )) {
+        if (
+            !(konomitv_bs4k_canonical_key in konomitv_bs4k_migrated_settings) &&
+            konomitv_bs4k_candidate_key in konomitv_bs4k_migrated_settings
+        ) {
+            konomitv_bs4k_migrated_settings[konomitv_bs4k_canonical_key] =
+                konomitv_bs4k_migrated_settings[konomitv_bs4k_candidate_key];
+        }
+    }
+
+    // 共通化より前の「通信節約モード」世代も、まず旧ライブ・録画別キーへ復元する。
+    if (
+        !('tv_encoding_codec' in konomitv_bs4k_migrated_settings) &&
+        'tv_data_saver_mode' in konomitv_bs4k_migrated_settings
+    ) {
+        konomitv_bs4k_migrated_settings.tv_encoding_codec =
+            codecFromKonomiTVBS4KDataSaver(konomitv_bs4k_migrated_settings.tv_data_saver_mode);
+    }
+    if (
+        !('tv_encoding_codec_cellular' in konomitv_bs4k_migrated_settings) &&
+        'tv_data_saver_mode_cellular' in konomitv_bs4k_migrated_settings
+    ) {
+        konomitv_bs4k_migrated_settings.tv_encoding_codec_cellular =
+            codecFromKonomiTVBS4KDataSaver(konomitv_bs4k_migrated_settings.tv_data_saver_mode_cellular);
+    }
+    if (
+        !('bs4k_tv_encoding_codec' in konomitv_bs4k_migrated_settings) &&
+        'tv_data_saver_mode' in konomitv_bs4k_migrated_settings
+    ) {
+        konomitv_bs4k_migrated_settings.bs4k_tv_encoding_codec =
+            codecFromKonomiTVBS4KDataSaver(konomitv_bs4k_migrated_settings.tv_data_saver_mode);
+    }
+    if (
+        !('bs4k_tv_encoding_codec_cellular' in konomitv_bs4k_migrated_settings) &&
+        'tv_data_saver_mode_cellular' in konomitv_bs4k_migrated_settings
+    ) {
+        konomitv_bs4k_migrated_settings.bs4k_tv_encoding_codec_cellular =
+            codecFromKonomiTVBS4KDataSaver(konomitv_bs4k_migrated_settings.tv_data_saver_mode_cellular);
+    }
+    if (
+        !('video_encoding_codec_cellular' in konomitv_bs4k_migrated_settings) &&
+        (
+            konomitv_bs4k_migrated_settings.video_encoding_codec === 'avc' ||
+            konomitv_bs4k_migrated_settings.video_encoding_codec === 'hevc'
+        )
+    ) {
+        konomitv_bs4k_migrated_settings.video_encoding_codec_cellular =
+            konomitv_bs4k_migrated_settings.video_encoding_codec;
+    }
+    if (
+        !('bs4k_video_encoding_codec' in konomitv_bs4k_migrated_settings) &&
+        'video_data_saver_mode' in konomitv_bs4k_migrated_settings
+    ) {
+        konomitv_bs4k_migrated_settings.bs4k_video_encoding_codec =
+            codecFromKonomiTVBS4KDataSaver(konomitv_bs4k_migrated_settings.video_data_saver_mode);
+    }
+    if (
+        !('bs4k_video_encoding_codec_cellular' in konomitv_bs4k_migrated_settings) &&
+        'video_data_saver_mode_cellular' in konomitv_bs4k_migrated_settings
+    ) {
+        konomitv_bs4k_migrated_settings.bs4k_video_encoding_codec_cellular =
+            codecFromKonomiTVBS4KDataSaver(konomitv_bs4k_migrated_settings.video_data_saver_mode_cellular);
+    }
+
+    let has_konomitv_bs4k_conflict = false;
+    const migrateKonomiTVBS4KPair = <T>(
+        konomitv_bs4k_new_key: string,
+        konomitv_bs4k_live_key: string,
+        konomitv_bs4k_recorded_key: string,
+        konomitv_bs4k_live_default: T,
+        konomitv_bs4k_recorded_default: T,
+        normalize_konomitv_bs4k_value: (
+            konomitv_bs4k_value: unknown,
+            konomitv_bs4k_fallback: T,
+        ) => T,
+    ): void => {
+        if (konomitv_bs4k_new_key in konomitv_bs4k_migrated_settings) return;
+
+        const konomitv_bs4k_live_value = normalize_konomitv_bs4k_value(
+            konomitv_bs4k_migrated_settings[konomitv_bs4k_live_key],
+            konomitv_bs4k_live_default,
+        );
+        const konomitv_bs4k_recorded_value = normalize_konomitv_bs4k_value(
+            konomitv_bs4k_migrated_settings[konomitv_bs4k_recorded_key],
+            konomitv_bs4k_recorded_default,
+        );
+        const is_konomitv_bs4k_live_changed =
+            isEqual(konomitv_bs4k_live_value, konomitv_bs4k_live_default) === false;
+        const is_konomitv_bs4k_recorded_changed =
+            isEqual(konomitv_bs4k_recorded_value, konomitv_bs4k_recorded_default) === false;
+
+        // 片方だけ変更されていれば変更側、両方変更済みならリアルタイム視聴を優先して旧ライブ側を採用する。
+        konomitv_bs4k_migrated_settings[konomitv_bs4k_new_key] =
+            is_konomitv_bs4k_recorded_changed && is_konomitv_bs4k_live_changed === false ?
+                konomitv_bs4k_recorded_value : konomitv_bs4k_live_value;
+        if (
+            is_konomitv_bs4k_live_changed &&
+            is_konomitv_bs4k_recorded_changed &&
+            isEqual(konomitv_bs4k_live_value, konomitv_bs4k_recorded_value) === false
+        ) {
+            has_konomitv_bs4k_conflict = true;
+        }
+    };
+    const normalizeKonomiTVBS4KPlaybackQuality = (
+        konomitv_bs4k_value: unknown,
+        konomitv_bs4k_fallback: KonomiTVBS4KPlaybackStreamingQuality,
+    ): KonomiTVBS4KPlaybackStreamingQuality =>
+        LIVE_STREAMING_QUALITIES.includes(konomitv_bs4k_value as KonomiTVBS4KPlaybackStreamingQuality) ?
+            konomitv_bs4k_value as KonomiTVBS4KPlaybackStreamingQuality :
+            konomitv_bs4k_fallback;
+    const normalizeKonomiTVBS4KPlaybackQualityForBS4K = (
+        konomitv_bs4k_value: unknown,
+        konomitv_bs4k_fallback: BS4KLiveStreamingQuality,
+    ): BS4KLiveStreamingQuality => {
+        const konomitv_bs4k_normalized_value =
+            typeof konomitv_bs4k_value === 'string' ?
+                LEGACY_BS4K_QUALITY_MAP[konomitv_bs4k_value] ?? konomitv_bs4k_value :
+                konomitv_bs4k_value;
+        return BS4K_LIVE_STREAMING_QUALITIES.includes(
+            konomitv_bs4k_normalized_value as BS4KLiveStreamingQuality,
+        ) ?
+            konomitv_bs4k_normalized_value as BS4KLiveStreamingQuality :
+            konomitv_bs4k_fallback;
+    };
+    const normalizeKonomiTVBS4KPlaybackVideoCodec = (
+        konomitv_bs4k_value: unknown,
+        konomitv_bs4k_fallback: KonomiTVBS4KPlaybackVideoCodec,
+    ): KonomiTVBS4KPlaybackVideoCodec =>
+        ['avc', 'hevc', 'vp9', 'av1'].includes(konomitv_bs4k_value as string) ?
+            konomitv_bs4k_value as KonomiTVBS4KPlaybackVideoCodec :
+            konomitv_bs4k_fallback;
+    const normalizeKonomiTVBS4KBoolean = (
+        konomitv_bs4k_value: unknown,
+        konomitv_bs4k_fallback: boolean,
+    ): boolean => typeof konomitv_bs4k_value === 'boolean' ?
+        konomitv_bs4k_value :
+        konomitv_bs4k_fallback;
+
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_streaming_quality',
+        'tv_streaming_quality',
+        'video_streaming_quality',
+        ILocalClientSettingsDefault.tv_streaming_quality,
+        ILocalClientSettingsDefault.video_streaming_quality,
+        normalizeKonomiTVBS4KPlaybackQuality,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_streaming_quality_cellular',
+        'tv_streaming_quality_cellular',
+        'video_streaming_quality_cellular',
+        ILocalClientSettingsDefault.tv_streaming_quality_cellular,
+        ILocalClientSettingsDefault.video_streaming_quality_cellular,
+        normalizeKonomiTVBS4KPlaybackQuality,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_streaming_quality_for_bs4k',
+        'bs4k_streaming_quality',
+        'bs4k_video_streaming_quality',
+        ILocalClientSettingsDefault.bs4k_streaming_quality,
+        ILocalClientSettingsDefault.bs4k_video_streaming_quality,
+        normalizeKonomiTVBS4KPlaybackQualityForBS4K,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular',
+        'bs4k_streaming_quality_cellular',
+        'bs4k_video_streaming_quality_cellular',
+        ILocalClientSettingsDefault.bs4k_streaming_quality_cellular,
+        ILocalClientSettingsDefault.bs4k_video_streaming_quality_cellular,
+        normalizeKonomiTVBS4KPlaybackQualityForBS4K,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_video_codec',
+        'tv_encoding_codec',
+        'video_encoding_codec',
+        ILocalClientSettingsDefault.tv_encoding_codec,
+        ILocalClientSettingsDefault.video_encoding_codec,
+        normalizeKonomiTVBS4KPlaybackVideoCodec,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_video_codec_cellular',
+        'tv_encoding_codec_cellular',
+        'video_encoding_codec_cellular',
+        ILocalClientSettingsDefault.tv_encoding_codec_cellular,
+        ILocalClientSettingsDefault.video_encoding_codec_cellular,
+        normalizeKonomiTVBS4KPlaybackVideoCodec,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_video_codec_for_bs4k',
+        'bs4k_tv_encoding_codec',
+        'bs4k_video_encoding_codec',
+        ILocalClientSettingsDefault.bs4k_tv_encoding_codec,
+        ILocalClientSettingsDefault.bs4k_video_encoding_codec,
+        normalizeKonomiTVBS4KPlaybackVideoCodec,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_video_codec_for_bs4k_cellular',
+        'bs4k_tv_encoding_codec_cellular',
+        'bs4k_video_encoding_codec_cellular',
+        ILocalClientSettingsDefault.bs4k_tv_encoding_codec_cellular,
+        ILocalClientSettingsDefault.bs4k_video_encoding_codec_cellular,
+        normalizeKonomiTVBS4KPlaybackVideoCodec,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_24fps_mode',
+        'tv_24fps_mode',
+        'video_24fps_mode',
+        ILocalClientSettingsDefault.tv_24fps_mode,
+        ILocalClientSettingsDefault.video_24fps_mode,
+        normalizeKonomiTVBS4KBoolean,
+    );
+    migrateKonomiTVBS4KPair(
+        'konomitv_bs4k_playback_24fps_mode_cellular',
+        'tv_24fps_mode_cellular',
+        'video_24fps_mode_cellular',
+        ILocalClientSettingsDefault.tv_24fps_mode_cellular,
+        ILocalClientSettingsDefault.video_24fps_mode_cellular,
+        normalizeKonomiTVBS4KBoolean,
+    );
+    // BS4Kでは現在24fpsを適用しない。正規キーや開発途中キーがない既存環境では、
+    // 通常放送の旧24fps設定を複製せず、将来の契約だけを false で確保する。
+    if (!('konomitv_bs4k_playback_24fps_mode_for_bs4k' in konomitv_bs4k_migrated_settings)) {
+        konomitv_bs4k_migrated_settings.konomitv_bs4k_playback_24fps_mode_for_bs4k = false;
+    }
+    if (!('konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular' in konomitv_bs4k_migrated_settings)) {
+        konomitv_bs4k_migrated_settings.konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular = false;
+    }
+
+    const migrateKonomiTVBS4KAudio = (
+        konomitv_bs4k_new_key: string,
+        konomitv_bs4k_recorded_key: string,
+        konomitv_bs4k_default_value: KonomiTVBS4KPlaybackAudioCodec,
+    ): void => {
+        if (konomitv_bs4k_new_key in konomitv_bs4k_migrated_settings) return;
+        const konomitv_bs4k_recorded_value =
+            konomitv_bs4k_migrated_settings[konomitv_bs4k_recorded_key];
+        konomitv_bs4k_migrated_settings[konomitv_bs4k_new_key] =
+            konomitv_bs4k_recorded_value === 'aac' || konomitv_bs4k_recorded_value === 'opus' ?
+                konomitv_bs4k_recorded_value : konomitv_bs4k_default_value;
+    };
+    migrateKonomiTVBS4KAudio(
+        'konomitv_bs4k_playback_audio_codec',
+        'video_audio_encoding_codec',
+        ILocalClientSettingsDefault.konomitv_bs4k_playback_audio_codec,
+    );
+    migrateKonomiTVBS4KAudio(
+        'konomitv_bs4k_playback_audio_codec_cellular',
+        'video_audio_encoding_codec_cellular',
+        ILocalClientSettingsDefault.konomitv_bs4k_playback_audio_codec_cellular,
+    );
+    migrateKonomiTVBS4KAudio(
+        'konomitv_bs4k_playback_audio_codec_for_bs4k',
+        'bs4k_video_audio_encoding_codec',
+        ILocalClientSettingsDefault.konomitv_bs4k_playback_audio_codec_for_bs4k,
+    );
+    migrateKonomiTVBS4KAudio(
+        'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular',
+        'bs4k_video_audio_encoding_codec_cellular',
+        ILocalClientSettingsDefault.konomitv_bs4k_playback_audio_codec_for_bs4k_cellular,
+    );
+
+    // 既存の通知フラグは上書きせず、新しく旧キーから移行した際の衝突だけ通知対象にする。
+    if (
+        has_konomitv_bs4k_conflict &&
+        !(
+            'konomitv_bs4k_playback_profile_migration_conflict_notice_pending' in
+            konomitv_bs4k_migrated_settings
+        )
+    ) {
+        konomitv_bs4k_migrated_settings.konomitv_bs4k_playback_profile_migration_conflict_notice_pending = true;
+    }
+    return konomitv_bs4k_migrated_settings;
+}
+
 /**
  * 与えられた生の設定データにソート・足りない設定キーの補完・不要な設定キーの削除を行って返す
  * @param settings 生の設定データ
@@ -593,12 +1071,15 @@ export function setLocalStorageSettings(settings: ILocalClientSettings): void {
  */
 export function getNormalizedLocalClientSettings(settings: {[key: string]: any}): ILocalClientSettings {
 
+    // 型補完や不要キー排除より前の生データ段階で、旧ライブ・録画別設定を共通profileへ冪等移行する。
+    const konomitv_bs4k_migrated_settings = migrateKonomiTVBS4KPlaybackProfileSettings(settings);
+
     // (名前が変わった、廃止されたなどの理由で) 現在の ILocalClientSettingsDefault に存在しない設定キーを排除した上でソート
     // ソートされていないと設定データの比較がうまくいかない
     const normalized_settings: Partial<ILocalClientSettings> = {};
     for (const default_settings_key of Object.keys(ILocalClientSettingsDefault)) {
-        if (default_settings_key in settings) {
-            normalized_settings[default_settings_key] = settings[default_settings_key];
+        if (default_settings_key in konomitv_bs4k_migrated_settings) {
+            normalized_settings[default_settings_key] = konomitv_bs4k_migrated_settings[default_settings_key];
         } else {
             // 後のバージョンで追加されたなどの理由で現状の KonomiTV-Settings に存在しない設定キーの場合
             // その設定キーのデフォルト値をディープコピーして取得する
@@ -642,30 +1123,101 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         }
     }
 
-    // 通信節約モードを廃止し、用途・回線別の映像コーデック設定へ移行する。
-    // 新キーが生データにない場合だけ旧値を引き継ぎ、移行後のユーザー設定を上書きしない。
-    const codecFromDataSaver = (value: unknown): StreamingVideoCodec => value === true ? 'hevc' : 'avc';
-    if (!('tv_encoding_codec' in settings) && 'tv_data_saver_mode' in settings) {
-        normalized_settings.tv_encoding_codec = codecFromDataSaver(settings.tv_data_saver_mode);
+    // 共通profileの不正なimport値は、再生前に必ず安全な既定値へ戻す。
+    const konomitv_bs4k_common_video_codec_keys = [
+        'konomitv_bs4k_playback_video_codec',
+        'konomitv_bs4k_playback_video_codec_cellular',
+        'konomitv_bs4k_playback_video_codec_for_bs4k',
+        'konomitv_bs4k_playback_video_codec_for_bs4k_cellular',
+    ] as const;
+    for (const konomitv_bs4k_key of konomitv_bs4k_common_video_codec_keys) {
+        if (
+            ['avc', 'hevc', 'vp9', 'av1'].includes(
+                normalized_settings[konomitv_bs4k_key] as string,
+            ) === false
+        ) {
+            normalized_settings[konomitv_bs4k_key] =
+                ILocalClientSettingsDefault[konomitv_bs4k_key];
+        }
     }
-    if (!('tv_encoding_codec_cellular' in settings) && 'tv_data_saver_mode_cellular' in settings) {
-        normalized_settings.tv_encoding_codec_cellular = codecFromDataSaver(settings.tv_data_saver_mode_cellular);
+    const konomitv_bs4k_common_audio_codec_keys = [
+        'konomitv_bs4k_playback_audio_codec',
+        'konomitv_bs4k_playback_audio_codec_cellular',
+        'konomitv_bs4k_playback_audio_codec_for_bs4k',
+        'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular',
+    ] as const;
+    for (const konomitv_bs4k_key of konomitv_bs4k_common_audio_codec_keys) {
+        if (
+            normalized_settings[konomitv_bs4k_key] !== 'aac' &&
+            normalized_settings[konomitv_bs4k_key] !== 'opus'
+        ) {
+            normalized_settings[konomitv_bs4k_key] =
+                ILocalClientSettingsDefault[konomitv_bs4k_key];
+        }
     }
-    if (!('bs4k_tv_encoding_codec' in settings) && 'tv_data_saver_mode' in settings) {
-        normalized_settings.bs4k_tv_encoding_codec = codecFromDataSaver(settings.tv_data_saver_mode);
+    const konomitv_bs4k_common_quality_keys = [
+        'konomitv_bs4k_playback_streaming_quality',
+        'konomitv_bs4k_playback_streaming_quality_cellular',
+    ] as const;
+    for (const konomitv_bs4k_key of konomitv_bs4k_common_quality_keys) {
+        if (
+            LIVE_STREAMING_QUALITIES.includes(
+                normalized_settings[konomitv_bs4k_key] as KonomiTVBS4KPlaybackStreamingQuality,
+            ) === false
+        ) {
+            normalized_settings[konomitv_bs4k_key] =
+                ILocalClientSettingsDefault[konomitv_bs4k_key];
+        }
     }
-    if (!('bs4k_tv_encoding_codec_cellular' in settings) && 'tv_data_saver_mode_cellular' in settings) {
-        normalized_settings.bs4k_tv_encoding_codec_cellular = codecFromDataSaver(settings.tv_data_saver_mode_cellular);
+    const konomitv_bs4k_common_bs4k_quality_keys = [
+        'konomitv_bs4k_playback_streaming_quality_for_bs4k',
+        'konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular',
+        'konomitv_bs4k_playback_auto_quality_max_for_bs4k',
+        'konomitv_bs4k_playback_auto_quality_max_for_bs4k_cellular',
+    ] as const;
+    for (const konomitv_bs4k_key of konomitv_bs4k_common_bs4k_quality_keys) {
+        const konomitv_bs4k_value = normalized_settings[konomitv_bs4k_key];
+        const konomitv_bs4k_normalized_value = typeof konomitv_bs4k_value === 'string' ?
+            LEGACY_BS4K_QUALITY_MAP[konomitv_bs4k_value] ?? konomitv_bs4k_value :
+            konomitv_bs4k_value;
+        normalized_settings[konomitv_bs4k_key] = BS4K_LIVE_STREAMING_QUALITIES.includes(
+            konomitv_bs4k_normalized_value as BS4KLiveStreamingQuality,
+        ) ?
+            konomitv_bs4k_normalized_value as BS4KLiveStreamingQuality :
+            ILocalClientSettingsDefault[konomitv_bs4k_key];
     }
-    if (!('video_encoding_codec_cellular' in settings) &&
-        (settings.video_encoding_codec === 'avc' || settings.video_encoding_codec === 'hevc')) {
-        normalized_settings.video_encoding_codec_cellular = settings.video_encoding_codec;
+    const konomitv_bs4k_auto_normal_quality_keys = [
+        'konomitv_bs4k_playback_auto_quality_max',
+        'konomitv_bs4k_playback_auto_quality_max_cellular',
+    ] as const;
+    for (const konomitv_bs4k_key of konomitv_bs4k_auto_normal_quality_keys) {
+        if (
+            LIVE_STREAMING_QUALITIES.includes(
+                normalized_settings[konomitv_bs4k_key] as KonomiTVBS4KPlaybackStreamingQuality,
+            ) === false
+        ) {
+            normalized_settings[konomitv_bs4k_key] =
+                ILocalClientSettingsDefault[konomitv_bs4k_key];
+        }
     }
-    if (!('bs4k_video_encoding_codec' in settings) && 'video_data_saver_mode' in settings) {
-        normalized_settings.bs4k_video_encoding_codec = codecFromDataSaver(settings.video_data_saver_mode);
-    }
-    if (!('bs4k_video_encoding_codec_cellular' in settings) && 'video_data_saver_mode_cellular' in settings) {
-        normalized_settings.bs4k_video_encoding_codec_cellular = codecFromDataSaver(settings.video_data_saver_mode_cellular);
+    const konomitv_bs4k_common_boolean_keys = [
+        'konomitv_bs4k_playback_auto_quality_mode',
+        'konomitv_bs4k_playback_auto_quality_mode_cellular',
+        'konomitv_bs4k_playback_24fps_mode',
+        'konomitv_bs4k_playback_24fps_mode_cellular',
+        'konomitv_bs4k_playback_24fps_mode_for_bs4k',
+        'konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular',
+        'konomitv_bs4k_playback_profile_migration_conflict_notice_pending',
+        'tv_low_latency_mode',
+        'tv_low_latency_mode_cellular',
+        'tv_low_latency_mode_for_bs4k',
+        'tv_low_latency_mode_for_bs4k_cellular',
+    ] as const;
+    for (const konomitv_bs4k_key of konomitv_bs4k_common_boolean_keys) {
+        if (typeof normalized_settings[konomitv_bs4k_key] !== 'boolean') {
+            normalized_settings[konomitv_bs4k_key] =
+                ILocalClientSettingsDefault[konomitv_bs4k_key];
+        }
     }
 
     // 旧 selected_twitter_account_id (Twitter アカウント単独参照) を
@@ -778,6 +1330,52 @@ const useSettingsStore = defineStore('settings', {
         },
     },
     actions: {
+
+        /**
+         * 共通再生profileの映像・音声codecを、1回のPinia mutationとして同時に更新する。
+         *
+         * 片方ずつ代入すると、SettingsStoreの永続化購読が非対応な中間tupleをLocalStorageへ
+         * 保存し得るため、設定画面で能力行列から解決済みの2値だけをこのactionへ渡す。
+         */
+        updateKonomiTVBS4KPlaybackCodecPair(
+            is_konomitv_bs4k: boolean,
+            is_konomitv_bs4k_cellular: boolean,
+            konomitv_bs4k_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+            konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        ): void {
+            const konomitv_bs4k_video_codec_key =
+                getKonomiTVBS4KPlaybackVideoCodecSettingKey(
+                    is_konomitv_bs4k,
+                    is_konomitv_bs4k_cellular,
+                );
+            const konomitv_bs4k_audio_codec_key =
+                getKonomiTVBS4KPlaybackAudioCodecSettingKey(
+                    is_konomitv_bs4k,
+                    is_konomitv_bs4k_cellular,
+                );
+
+            // settings全体を1つのpatch objectで置換し、購読側からも完成済みtupleだけが観測されるようにする。
+            this.$patch({
+                settings: {
+                    ...this.settings,
+                    [konomitv_bs4k_video_codec_key]: konomitv_bs4k_video_codec,
+                    [konomitv_bs4k_audio_codec_key]: konomitv_bs4k_audio_codec,
+                },
+            });
+        },
+
+        /**
+         * 旧ライブ・録画設定の競合説明を未表示の場合だけ消費する。
+         * @returns 今回説明を表示すべき場合は true
+         */
+        consumeKonomiTVBS4KPlaybackProfileMigrationConflictNotice(): boolean {
+            if (this.settings.konomitv_bs4k_playback_profile_migration_conflict_notice_pending === false) {
+                return false;
+            }
+            this.settings.konomitv_bs4k_playback_profile_migration_conflict_notice_pending = false;
+            setLocalStorageSettings(this.settings);
+            return true;
+        },
 
         /**
          * エクスポートした JSON ファイルから設定データをインポートする (既存の設定はすべて上書きされる)

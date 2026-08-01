@@ -77,14 +77,12 @@ LIBRARY_DIR = BASE_DIR / 'thirdparty'
 # サードパーティーライブラリのあるパス
 LIBRARY_PATH = {
     'Akebi': str(LIBRARY_DIR / 'Akebi/akebi-https-server.elf'),
-    'FFmpeg': str(LIBRARY_DIR / 'FFmpeg/ffmpeg.elf'),
-    'FFprobe': str(LIBRARY_DIR / 'FFmpeg/ffprobe.elf'),
     'FFmpeg8': str(LIBRARY_DIR / 'FFmpeg8/ffmpeg8.elf'),
     'FFmpeg8AMD': str(LIBRARY_DIR / 'FFmpeg8/ffmpeg8-amd.sh'),
     'FFprobe8': str(LIBRARY_DIR / 'FFmpeg8/ffprobe8.elf'),
-    'QSVEncC': str(LIBRARY_DIR / 'QSVEncC/QSVEncC.elf'),
-    'NVEncC': str(LIBRARY_DIR / 'NVEncC/NVEncC.elf'),
-    'VCEEncC': str(LIBRARY_DIR / 'VCEEncC/VCEEncC.elf'),
+    'KonomiTVBS4KTSCodecBridge': str(
+        LIBRARY_DIR / 'KonomiTVBS4KTSCodecBridge/ts-codec-bridge.elf'
+    ),
     'tsreadex': str(LIBRARY_DIR / 'tsreadex/tsreadex.elf'),
     'psisiarc': str(LIBRARY_DIR / 'psisiarc/psisiarc.elf'),
 }
@@ -186,7 +184,7 @@ LOGGING_CONFIG: dict[str, Any] = {
         },
         'access_file': {
             'formatter': 'access_file',
-            'class': 'logging.FileHandler',
+            'class': 'app.utils.LogRotation.SecureFileHandler',
             'filename': KONOMITV_ACCESS_LOG_PATH,
             'mode': 'a',
             'encoding': 'utf-8',

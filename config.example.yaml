@@ -28,16 +28,16 @@ general:
     mirakurun_url: 'http://127.0.0.1:40772/'
 
     # 利用するエンコーダー
-    # FFmpeg・QSVEncC・NVEncC・VCEEncC から選択してください。
+    # BS4K のライブ視聴や録画視聴以外で使用されます。
+    # FFmpeg・QSV・NVENC・AMF から選択してください。
     # FFmpeg はソフトウェアエンコーダーです。すべての PC で利用できますが、CPU に多大な負荷がかかり、パフォーマンスが悪いです。
-    # QSVEncC・NVEncC・VCEEncC はハードウェアエンコーダーです。CPU 負荷が低く、パフォーマンスがとても高いです（おすすめ）。
-    # Intel Graphics 搭載の Intel CPU をお使いなら、QSVEncC が使えます。
-    # Geforce などの NVIDIA GPU をお使いなら、NVEncC が使えます。
-    # Radeon などの AMD GPU をお使いなら、VCEEncC が使えます。
+    # QSV・NVENC・AMF はハードウェアエンコーダーです。CPU 負荷が低く、パフォーマンスがとても高いです（おすすめ）。
+    # Intel Graphics 搭載の Intel CPU をお使いなら、QSV が使えます。
+    # Geforce などの NVIDIA GPU をお使いなら、NVENC が使えます。
+    # Radeon などの AMD GPU をお使いなら、AMF が使えます。
     encoder: 'FFmpeg'
 
-    # BS4K のライブ視聴で利用するエンコーダー
-    # 録画再生と BS4K 以外のライブ視聴には encoder が使われます。
+    # BS4K のライブ視聴や録画視聴で利用するエンコーダー
     encoder_bs4k: 'FFmpeg'
 
     # BS4K のライブ視聴で利用する入力解析サイズ (KB)
@@ -57,6 +57,10 @@ general:
 
     # BS4K のライブ視聴でエンコーダーを即時出力優先にするか
     encoder_bs4k_low_latency: true
+
+    # 受入試験中だけBridge起動counterを能力APIの応答headerへ公開するか
+    # 通常運用では視聴活動の推測を防ぐため、必ず無効のままにしてください。
+    konomitv_bs4k_acceptance_diagnostics_enabled: false
 
     # BS4K のライブ視聴ではプレイヤーを通常バッファで再生するか
     # 有効にすると、BS4K のライブ視聴時だけユーザーの低遅延視聴設定を使わず、通常の再生バッファを使います。
@@ -96,7 +100,7 @@ server:
     https_mode: 'akebi'
 
     # certificate モードで使用する HTTPS 証明書・秘密鍵のホスト上の絶対パス
-    # Docker コンテナ内では既存の /host-rootfs マウントを通して自動的に参照されます。
+    # Docker コンテナ内では実アクセス用の内部パスへ自動的に変換されます。
     # akebi / reverse_proxy モードでは指定できません。
     custom_https_certificate: null
     custom_https_private_key: null
@@ -127,6 +131,7 @@ compatibility_api:
     https_mode: 'inherit'
 
     # https_mode: 'certificate' の場合に使用する、互換 API 専用の HTTPS 証明書と秘密鍵
+    # Docker でインストールした場合も、ホストマシン側のファイルの絶対パスを指定してください。
     custom_https_certificate: null
     custom_https_private_key: null
 
@@ -162,6 +167,7 @@ tv:
     # この値に TS ファイルのパスを指定すると、すべてのチャンネルにおいて、ストリーミングされる映像（字幕・文字スーパーを含む）が
     # リアルタイムで放送されているものから、指定した TS ファイルのものに強制的に置き換えられます。
     # 開発者がライブストリーミング関連の機能をテストするために使う特殊なデバッグ用設定です。
+    # Docker でインストールした場合も、ホストマシン側のファイルの絶対パスを指定してください。
     debug_mode_ts_path: null
 
 # ==================== ビデオのオンデマンドストリーミングの設定 ====================
@@ -171,13 +177,14 @@ video:
     # 複数の保存先フォルダを指定できます。
     # Docker でインストールした場合も、ホストマシン側のフォルダの絶対パスを指定してください。
     recorded_folders: [
-        'E:\TV-Record',
+        '/mnt/TV-Record',
     ]
 
     # 録画フォルダのスキャン対象から除外するサブフォルダの絶対パス
     # 録画フォルダ以下にある一時フォルダなど、スキャン対象から除外したいサブフォルダを指定できます。
     # シンボリックリンク解決前のパスと、解決後の実体パスの両方で前方一致判定を行います。
-    # 例えば、'E:\TV-Record\Temp' を指定すると、そのサブフォルダ以下の録画ファイルはスキャン対象から除外されます。
+    # 例えば、'/mnt/TV-Record/Temp' を指定すると、そのサブフォルダ以下の録画ファイルはスキャン対象から除外されます。
+    # Docker でインストールした場合も、ホストマシン側のフォルダの絶対パスを指定してください。
     exclude_scan_paths: []
 
     # 録画再生で生成する fMP4 キャッシュの保存先フォルダの絶対パス
@@ -199,5 +206,22 @@ capture:
     # 複数の保存先フォルダを指定できます。先頭から順に利用され、保存先フォルダがいっぱいになったら次の保存先フォルダに保存されます。
     # Docker でインストールした場合も、ホストマシン側のフォルダの絶対パスを指定してください。
     upload_folders: [
-        'E:\TV-Capture',
+        '/mnt/TV-Capture',
     ]
+
+# =============================== CM 解析の設定 ===============================
+cm_analysis:
+
+    # 新規録画に対する自動 CM 解析を有効にするかどうか
+    # false の場合、解析状態は Pending のままになり、共有ロゴフォルダの手動操作は可能です。
+    enabled: false
+
+    # CM ロゴ (.lgd) を置く共有フォルダの絶対パス
+    # null の場合はサーバー data 配下の既定フォルダ (cm-analysis/logos) を使います。
+    # Docker でインストールした場合も、ホストマシン側のフォルダの絶対パスを指定してください。
+    logo_directory: null
+
+    # 新規 CM 解析だけを除外するディレクトリの絶対パス
+    # 録画フォルダ全体のスキャン除外 (video.exclude_scan_paths) とは独立です。
+    # Docker でインストールした場合も、ホストマシン側のフォルダの絶対パスを指定してください。
+    excluded_directories: []

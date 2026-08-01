@@ -71,7 +71,7 @@
                     すべての PC で利用できますが、CPU に多大な負荷がかかり、パフォーマンスが悪いです。<br>
                 </div>
                 <div class="settings__item-label mt-1">
-                    QSV・NVENC・VCE はハードウェアエンコーダーです。<br>
+                    QSV・NVENC・AMF はハードウェアエンコーダーです。<br>
                     CPU 負荷が低く、パフォーマンスがとても高いです（おすすめ）。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
@@ -299,7 +299,7 @@
                 </v-select>
             </div>
             <div class="settings__content-heading mt-6"
-                v-if="isSectionVisible('backend') || isSectionVisible('streaming') || isSectionVisible('streaming-common')">
+                v-if="isSectionVisible('backend') || isSectionVisible('streaming-common')">
                 <Icon icon="fluent:tv-20-filled" width="22px" />
                 <span class="ml-2">{{tv_section_title}}</span>
             </div>
@@ -365,7 +365,7 @@
                 <div v-for="(folder, index) in server_settings.video.recorded_folders" :key="'recorded-folder-' + index">
                     <div class="d-flex align-center mt-3">
                         <v-text-field class="settings__item-form mt-0" color="primary" variant="outlined" hide-details
-                            placeholder="例: E:\TV-Record"
+                            placeholder="例: /mnt/TV-Record"
                             :density="is_form_dense ? 'compact' : 'default'"
                             v-model="server_settings.video.recorded_folders[index]">
                         </v-text-field>
@@ -390,12 +390,12 @@
                 </div>
                 <div class="settings__item-label mt-1" style="padding-bottom: 2px;">
                     シンボリックリンク解決前のパスと、解決後の実体パスの両方で前方一致判定を行います。<br>
-                    例えば、<code>E:\TV-Record\Temp</code> を指定すると、そのサブフォルダ以下の録画ファイルはスキャン対象から除外されます。<br>
+                    例えば、<code>/mnt/TV-Record/Temp</code> を指定すると、そのサブフォルダ以下の録画ファイルはスキャン対象から除外されます。<br>
                 </div>
                 <div v-for="(pattern, index) in server_settings.video.exclude_scan_paths" :key="'exclude-pattern-' + index">
                     <div class="d-flex align-center mt-3">
                         <v-text-field class="settings__item-form mt-0" color="primary" variant="outlined" hide-details
-                            placeholder="例: E:\TV-Record\Trash"
+                            placeholder="例: /mnt/TV-Record/Trash"
                             :density="is_form_dense ? 'compact' : 'default'"
                             v-model="server_settings.video.exclude_scan_paths[index]">
                         </v-text-field>
@@ -456,7 +456,7 @@
                 <div v-for="(folder, index) in server_settings.capture.upload_folders" :key="'upload-folder-' + index">
                     <div class="d-flex align-center mt-3">
                         <v-text-field class="settings__item-form mt-0" color="primary" variant="outlined" hide-details
-                            placeholder="例: E:\TV-Capture"
+                            placeholder="例: /mnt/TV-Capture"
                             :density="is_form_dense ? 'compact' : 'default'"
                             v-model="server_settings.capture.upload_folders[index]">
                         </v-text-field>
@@ -561,9 +561,6 @@ const tv_section_title = computed(() => {
     if (props.section === 'basic' || props.section === 'backend') {
         return '受信・チャンネル';
     }
-    if (props.section === 'streaming') {
-        return '通常放送';
-    }
     if (props.section === 'streaming-common') {
         return '共通';
     }
@@ -580,12 +577,12 @@ function isSectionVisible(target_section: Exclude<ServerSettingsSection, 'all'>)
 // フォームを小さくするかどうか
 const is_form_dense = Utils.isSmartphoneHorizontal();
 
-// 表示名だけを利用者向けに短縮し、value はサーバー API との既存契約を維持する
+// FFmpeg 8 の実装名に対応する短い正規識別子を API との共通値として使う
 const encoder_options = [
     {title: 'CPU', value: 'FFmpeg'},
-    {title: 'QSV (Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能)', value: 'QSVEncC'},
-    {title: 'NVENC (NVIDIA GPU で利用可能)', value: 'NVEncC'},
-    {title: 'VCE (AMD GPU で利用可能)', value: 'VCEEncC'},
+    {title: 'QSV (Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能)', value: 'QSV'},
+    {title: 'NVENC (NVIDIA GPU で利用可能)', value: 'NVENC'},
+    {title: 'AMF (AMD GPU で利用可能)', value: 'AMF'},
 ];
 
 // KonomiTV 互換 API のプロファイル選択肢
