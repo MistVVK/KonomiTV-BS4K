@@ -64,6 +64,11 @@ class LiveDataBroadcastingManager implements PlayerManager {
     // PSI/SI アーカイブデータデコーダーのインスタンス
     private live_psi_archived_data_decoder: Comlink.Remote<ILivePSIArchivedDataDecoder> | null = null;
 
+    // init() ごとの世代番号
+    // 画質切り替えでは同じ Manager インスタンスを再利用するため、旧 BMLBrowser・Worker・
+    // 遅延処理が新しい再生世代の DOM / Store へ書き込まないように利用する
+    private lifecycle_generation = 0;
+
     /**
      * コンストラクタ
      * @param player DPlayer のインスタンス
@@ -89,11 +94,15 @@ class LiveDataBroadcastingManager implements PlayerManager {
     public async init(): Promise<void> {
         const channels_store = useChannelsStore();
 
+        // 旧 init() の callback と、Proxy コンストラクターを待機中の処理を無効化する
+        const lifecycle_generation = ++this.lifecycle_generation;
+        const is_current = (): boolean => this.lifecycle_generation === lifecycle_generation;
+
         const is_data_broadcasting_enabled = useSettingsStore().settings.tv_show_data_broadcasting;
         console.log(`[LiveDataBroadcastingManager] BMLBrowser: ${is_data_broadcasting_enabled ? 'enabled' : 'disabled'}`);
 
         // リモコンのボタンを初期化
-        this.initRemoconButtons();
+        this.initRemoconButtons(lifecycle_generation);
 
         // データ放送機能有効時のみ
         if (is_data_broadcasting_enabled === true) {
@@ -114,7 +123,14 @@ class LiveDataBroadcastingManager implements PlayerManager {
 
             // BML ブラウザの初期化
             const this_ = this;
-            this.#bml_browser = new BMLBrowser({
+            let bml_browser: BMLBrowser | null = null;
+            const is_bml_current = (): boolean => (
+                is_current() &&
+                // BMLBrowser のコンストラクターから同期的に呼ばれる設定 callback は、
+                // local への代入前なので世代だけで判定する。構築後は resource identity も必須にする。
+                (bml_browser === null || this.#bml_browser === bml_browser)
+            );
+            bml_browser = new BMLBrowser({
                 mediaElement: document.createElement('p'),  // ここではダミーの p 要素を渡す
                 containerElement: this.container_element,
                 storagePrefix: 'KonomiTV-BMLBrowser_',
@@ -128,12 +144,15 @@ class LiveDataBroadcastingManager implements PlayerManager {
                 // ステータス更新時のイベント
                 indicator: {
                     setUrl(name: string, loading: boolean) {
+                        if (is_bml_current() === false) return;
                         this_.toggleRemoconButtonsLoading(loading);
                     },
                     setNetworkingGetStatus(connecting: boolean) {
+                        if (is_bml_current() === false) return;
                         this_.toggleRemoconButtonsLoading(connecting);
                     },
                     setNetworkingPostStatus(connecting: boolean) {
+                        if (is_bml_current() === false) return;
                         this_.toggleRemoconButtonsLoading(connecting);
                     },
                     setReceivingStatus(receiving: boolean) {
@@ -146,6 +165,7 @@ class LiveDataBroadcastingManager implements PlayerManager {
                 // Greg: 受信機の電源を切るまでグローバルに持続するメモリ
                 greg: {
                     getReg(index: number) {
+                        if (is_bml_current() === false) return '';
                         let Greg: string[];
                         if (window.sessionStorage.getItem('KonomiTV-BMLBrowser-Greg') === null) {
                             // 初回は Greg を初期化する
@@ -157,6 +177,7 @@ class LiveDataBroadcastingManager implements PlayerManager {
                         return Greg[index] ?? '';
                     },
                     setReg(index: number, value: string) {
+                        if (is_bml_current() === false) return;
                         let Greg: string[];
                         if (window.sessionStorage.getItem('KonomiTV-BMLBrowser-Greg') === null) {
                             // 初回は Greg を初期化する
@@ -172,12 +193,17 @@ class LiveDataBroadcastingManager implements PlayerManager {
                 // データ放送からのチャンネル切り替え機能
                 epg: {
                     tune(network_id: number, transport_stream_id: number, service_id: number) {
+                        if (is_bml_current() === false) return false;
                         // 選局対象のチャンネルが現在視聴中のチャンネルと同じ場合
                         if (channels_store.channel.current.network_id === network_id && channels_store.channel.current.service_id === service_id) {
                             // 非同期で LiveDataBroadcastingManager を再起動
                             // チャンネル切り替え後は BML ブラウザがフリーズするため
                             (async () => {
+                                if (is_bml_current() === false) return;
                                 await this_.destroy();
+                                // destroy() を待っている間に外部の画質切り替えなどが次世代を開始した場合、
+                                // この BML callback からさらに init() して上書きしない
+                                if (this_.lifecycle_generation !== lifecycle_generation + 1) return;
                                 await this_.init();
                             })();
                             return true;
@@ -189,7 +215,10 @@ class LiveDataBroadcastingManager implements PlayerManager {
                             for (const channel of channels) {
                                 if (channel.network_id === network_id && channel.service_id === service_id) {
                                     // 少し待ってからチャンネルを切り替える（チャンネル切り替え時にデータ放送側から音が鳴る可能性があるため）
-                                    Utils.sleep(0.3).then(() => router.push({path: `/tv/watch/${channel.display_channel_id}`}));
+                                    Utils.sleep(0.3).then(() => {
+                                        if (is_bml_current() === false) return;
+                                        router.push({path: `/tv/watch/${channel.display_channel_id}`});
+                                    });
                                     return true;
                                 }
                             }
@@ -201,7 +230,9 @@ class LiveDataBroadcastingManager implements PlayerManager {
                         // エラーメッセージを表示し終わったタイミングで、非同期で LiveDataBroadcastingManager を再起動
                         // チャンネル切り替えに失敗すると BML ブラウザがフリーズするため
                         Utils.sleep(3).then(async () => {
+                            if (is_bml_current() === false) return;
                             await this_.destroy();
+                            if (this_.lifecycle_generation !== lifecycle_generation + 1) return;
                             await this_.init();
                         });
                         return false;
@@ -210,6 +241,7 @@ class LiveDataBroadcastingManager implements PlayerManager {
                 // 双方向 (ネット接続) 機能
                 ip: {
                     getConnectionType(): number {
+                        if (is_bml_current() === false) return NaN;
                         // ARIB STD-B24 第二分冊 (2/2) 第二編 付属3 5.6.5.2 表5-12
                         // 1: PSTN
                         // 100: ISDN
@@ -229,6 +261,7 @@ class LiveDataBroadcastingManager implements PlayerManager {
                         return 403;
                     },
                     isIPConnected(): number {
+                        if (is_bml_current() === false) return 0;
                         // ARIB STD-B24 第二分冊 (2/2) 第二編 付属3 5.6.5.2 表5-14
                         // 0: IP 接続は確立していない
                         // 1: IP 接続は自動接続によって確立している
@@ -242,17 +275,21 @@ class LiveDataBroadcastingManager implements PlayerManager {
                     },
                     // サーバー側のプロキシ API 経由で HTTP GET リクエストを送信し、レスポンスを受け取る
                     async get(uri: string) {
+                        if (is_bml_current() === false) return {};
                         // データ放送からのインターネットアクセスが無効なときは何もしない
                         if (useSettingsStore().settings.enable_internet_access_from_data_broadcasting === false) {
                             return {};
                         }
+                        // target URL 全体 (query 含む) を path パラメータとして encode し、上流 query が KonomiTV の query に誤分離されないようにする
+                        const encoded_uri = encodeURIComponent(uri);
                         // サーバー側のプロキシ API 経由で HTTP GET リクエストを送信する
-                        const response = await APIClient.get<ArrayBuffer>(`/data-broadcasting/request/${uri}`, {
+                        const response = await APIClient.get<ArrayBuffer>(`/data-broadcasting/request/${encoded_uri}`, {
                             // レスポンスを ArrayBuffer として受け取る
                             responseType: 'arraybuffer',
                             // すべてのステータスコードで AxiosError にならないようにする
                             validateStatus: () => true,
                         });
+                        if (is_bml_current() === false) return {};
                         // HTTP リクエスト自体に失敗した (何も返さない)
                         if (response.type === 'error') {
                             return {};
@@ -266,16 +303,21 @@ class LiveDataBroadcastingManager implements PlayerManager {
                     },
                     // サーバー側のプロキシ API 経由で HTTP POST リクエストを送信し、レスポンスを受け取る
                     async transmitTextDataOverIP(uri: string, body: Uint8Array) {
+                        const failed_result = () => ({
+                            resultCode: NaN,
+                            statusCode: '',
+                            response: new Uint8Array(),
+                        });
+                        if (is_bml_current() === false) return failed_result();
                         // データ放送からのインターネットアクセスが無効なときは何もしない
                         if (useSettingsStore().settings.enable_internet_access_from_data_broadcasting === false) {
-                            return {
-                                resultCode: NaN,
-                                statusCode: '',
-                                response: new Uint8Array(),
-                            };
+                            return failed_result();
                         }
+                        // target URL 全体 (query 含む) を path パラメータとして encode する
+                        const encoded_uri = encodeURIComponent(uri);
                         // サーバー側のプロキシ API 経由で HTTP POST リクエストを送信する
-                        const response = await APIClient.post<ArrayBuffer>(`/data-broadcasting/request/${uri}`, body, {
+                        // body は Shift_JIS / EUC-JP の raw 電文を byte 透過で送る（Form 再構築しない）
+                        const response = await APIClient.post<ArrayBuffer>(`/data-broadcasting/request/${encoded_uri}`, body, {
                             // 受け取ったフォームデータをそのまま送信する
                             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                             // レスポンスを ArrayBuffer として受け取る
@@ -283,14 +325,11 @@ class LiveDataBroadcastingManager implements PlayerManager {
                             // すべてのステータスコードで AxiosError にならないようにする
                             validateStatus: () => true,
                         });
+                        if (is_bml_current() === false) return failed_result();
                         // HTTP リクエストに失敗した
                         if (response.type === 'error') {
                             // HTTP リクエスト自体に失敗した
-                            return {
-                                resultCode: NaN,
-                                statusCode: '',
-                                response: new Uint8Array(),
-                            };
+                            return failed_result();
                         }
                         // HTTP リクエストに成功した
                         return {
@@ -301,6 +340,7 @@ class LiveDataBroadcastingManager implements PlayerManager {
                     },
                     // サーバー側のプロキシ API 経由でインターネット接続状態を確認する
                     async confirmIPNetwork(destination: string, isICMP: boolean, timeoutMillis: number) {
+                        if (is_bml_current() === false) return null;
                         // データ放送からのインターネットアクセスが無効なときは何もしない
                         if (useSettingsStore().settings.enable_internet_access_from_data_broadcasting === false) {
                             return null;
@@ -318,6 +358,7 @@ class LiveDataBroadcastingManager implements PlayerManager {
                             // すべてのステータスコードで AxiosError にならないようにする
                             validateStatus: () => true,
                         });
+                        if (is_bml_current() === false) return null;
                         // HTTP リクエスト自体に失敗した
                         if (response.type === 'error') {
                             return null;
@@ -333,19 +374,22 @@ class LiveDataBroadcastingManager implements PlayerManager {
                 // エラー発生時のメッセージ表示
                 // 3秒間プレイヤーにエラーメッセージを表示する
                 showErrorMessage(title: string, message: string, code?: string): void {
+                    if (is_bml_current() === false) return;
                     this_.player.notice(`${title}<br>${message} (${code})`, 3000, undefined, 'rgb(var(--v-theme-error-readable))');
                 }
             });
+            this.#bml_browser = bml_browser;
             this.bml_browser_width = 960;
             this.bml_browser_height = 540;
 
             // BML ブラウザが保持する FontFace をこの時点で全て明示的にロードしておき、画面のチラつきを防ぐ
-            for (const font of (this.#bml_browser as any).fonts) {
+            for (const font of (bml_browser as any).fonts) {
                 font.load();  // ロード完了を待たない
             }
 
             // BML ブラウザがロードされたときのイベント
-            this.#bml_browser.addEventListener('load', (event) => {
+            bml_browser.addEventListener('load', (event) => {
+                if (is_bml_current() === false) return;
                 console.log('[LiveDataBroadcastingManager] BMLBrowser: load', event.detail);
 
                 // BML ブラウザの要素に幅と高さを設定
@@ -362,7 +406,8 @@ class LiveDataBroadcastingManager implements PlayerManager {
             });
 
             // BML ブラウザの表示状態が変化したときのイベント
-            this.#bml_browser.addEventListener('invisible', (event) => {
+            bml_browser.addEventListener('invisible', (event) => {
+                if (is_bml_current() === false) return;
                 if (event.detail === true) {
                     // 非表示状態
                     // データ放送内に移動していた映像の要素を DPlayer に戻す
@@ -385,18 +430,26 @@ class LiveDataBroadcastingManager implements PlayerManager {
             });
 
             // 現在 BML ブラウザ上で利用しているボタンの一覧が変化したときのイベント
-            this.#bml_browser.addEventListener('usedkeylistchanged', (event) => {
+            bml_browser.addEventListener('usedkeylistchanged', (event) => {
+                if (is_bml_current() === false) return;
                 // usedKeyList の中に numeric-tuning が含まれている場合は、データ放送が数字キーを利用中
                 this.is_bml_browser_using_numeric_key = [...event.detail.usedKeyList].includes('numeric-tuning');
             });
 
             // DPlayer のリサイズを監視する ResizeObserver を開始
-            this.resize_observer = new ResizeObserver((entries: ResizeObserverEntry[]) => {
+            const resize_observer = new ResizeObserver((entries: ResizeObserverEntry[]) => {
+                if (
+                    is_bml_current() === false ||
+                    this.resize_observer !== resize_observer
+                ) {
+                    return;
+                }
                 // データ放送画面の拡大/縮小率を再計算
                 const entry = entries[0];
                 this.calculateBMLBrowserScaleFactor(entry.contentRect.width, entry.contentRect.height);
             });
-            this.resize_observer.observe(this.player.template.videoWrap);
+            this.resize_observer = resize_observer;
+            resize_observer.observe(this.player.template.videoWrap);
         }
 
         // ここからはデータ放送機能無効時も実行される
@@ -405,11 +458,31 @@ class LiveDataBroadcastingManager implements PlayerManager {
         // ライブ PSI/SI アーカイブデータデコーダーを初期化
         // Comlink を挟んでいる関係上、コンストラクタにも関わらず Promise を返すため await する必要がある
         const api_quality = PlayerUtils.extractLiveAPIQualityFromDPlayer(this.player);
-        this.live_psi_archived_data_decoder = await new LivePSIArchivedDataDecoderProxy(channels_store.channel.current, api_quality);
+        const konomitv_bs4k_codec_query =
+            PlayerUtils.extractKonomiTVBS4KLivePlaybackCodecQueryFromDPlayer(this.player);
+        const live_psi_archived_data_decoder = await new LivePSIArchivedDataDecoderProxy(
+            channels_store.channel.current,
+            api_quality,
+            konomitv_bs4k_codec_query,
+        );
+        // Proxy の非同期生成中に destroy() または次世代 init() が走った場合、この Proxy は
+        // インスタンス変数へ公開せず、その場で Worker を終了する
+        if (is_current() === false) {
+            live_psi_archived_data_decoder.destroy();
+            return;
+        }
+        this.live_psi_archived_data_decoder = live_psi_archived_data_decoder;
 
         // デコードを開始
         // デコーダーは Web Worker 上で実行される (コールバックを Comlink.proxy() で包むのがポイント)
-        this.live_psi_archived_data_decoder.run(Comlink.proxy(async (message) => {
+        live_psi_archived_data_decoder.run(Comlink.proxy(async (message) => {
+            // 旧 Worker から遅れて届いた message を、新世代の BMLBrowser や Store へ流さない
+            if (
+                is_current() === false ||
+                this.live_psi_archived_data_decoder !== live_psi_archived_data_decoder
+            ) {
+                return;
+            }
 
             // データ放送有効時のみ
             if (this.#bml_browser !== null) {
@@ -466,23 +539,32 @@ class LiveDataBroadcastingManager implements PlayerManager {
             }
         }));
 
+        if (is_current() === false) return;
         console.log('[LiveDataBroadcastingManager] Initialized.');
     }
 
 
     /**
      * リモコンのボタンを初期化する
+     * @param lifecycle_generation ボタンが所属する init() の世代番号
      */
-    private initRemoconButtons(): void {
+    private initRemoconButtons(lifecycle_generation: number): void {
         const channels_store = useChannelsStore();
 
         // リモコンのボタンのクリックイベントを一括で削除するための AbortController
-        this.remocon_button_event_abort_controller = new AbortController();
+        const event_abort_controller = new AbortController();
+        this.remocon_button_event_abort_controller = event_abort_controller;
+        const is_current = (): boolean => (
+            this.lifecycle_generation === lifecycle_generation &&
+            this.remocon_button_event_abort_controller === event_abort_controller &&
+            event_abort_controller.signal.aborted === false
+        );
 
         // リモコンのボタンをクリックしたときのイベントを登録
         const buttons = this.remocon_element.querySelectorAll('button');
         for (const button of buttons) {
             button.addEventListener('click', async () => {
+                if (is_current() === false) return;
 
                 // ARIB 仕様上のキーコード
                 const arib_key_code = (parseInt(button.dataset.aribKeyCode!) as AribKeyCode);
@@ -510,19 +592,23 @@ class LiveDataBroadcastingManager implements PlayerManager {
                 // データ放送機能無効時は何もしない
                 // TODO: BML ブラウザがクラッシュした場合 processKeyDown() あたりから例外が送出されるが、途中で握り潰されている？のかキャッチできない
                 } else {
-                    if (this.#bml_browser !== null) {
+                    const bml_browser = this.#bml_browser;
+                    if (bml_browser !== null) {
                         if (remocon_id === 10) {
                             // リモコン番号が 10 の場合のみ、"0" のキーイベントも送信する
-                            this.#bml_browser.content.processKeyDown(AribKeyCode.Digit0);
-                            this.#bml_browser.content.processKeyUp(AribKeyCode.Digit0);
+                            bml_browser.content.processKeyDown(AribKeyCode.Digit0);
+                            bml_browser.content.processKeyUp(AribKeyCode.Digit0);
                             await Utils.sleep(0.1);  // 若干待つのがポイント
                         }
-                        this.#bml_browser.content.processKeyDown(arib_key_code);
-                        this.#bml_browser.content.processKeyUp(arib_key_code);
+                        // 待機中に画質切り替えで BMLBrowser が入れ替わった場合、旧ボタン操作の
+                        // 後半だけを新しいブラウザーへ送信しない
+                        if (is_current() === false || this.#bml_browser !== bml_browser) return;
+                        bml_browser.content.processKeyDown(arib_key_code);
+                        bml_browser.content.processKeyUp(arib_key_code);
                     }
                 }
 
-            }, {signal: this.remocon_button_event_abort_controller.signal});
+            }, {signal: event_abort_controller.signal});
         }
     }
 
@@ -691,11 +777,16 @@ class LiveDataBroadcastingManager implements PlayerManager {
     public async destroy(): Promise<void> {
         const channels_store = useChannelsStore();
 
+        // Worker / BMLBrowser の実破棄を待つ前に世代を無効化し、queued callback と
+        // init() 内で Proxy 生成を待っている処理を同期的に遮断する
+        this.lifecycle_generation += 1;
+
         // ライブ PSI/SI アーカイブデータデコーダーを終了
-        if (this.live_psi_archived_data_decoder !== null) {
+        const live_psi_archived_data_decoder = this.live_psi_archived_data_decoder;
+        this.live_psi_archived_data_decoder = null;
+        if (live_psi_archived_data_decoder !== null) {
             // タイミングの関係なのかチャンネル切り替え時の映像のフェードアウトが効かなくなるため、await してはいけない
-            this.live_psi_archived_data_decoder.destroy();
-            this.live_psi_archived_data_decoder = null;
+            live_psi_archived_data_decoder.destroy();
         }
 
         // ChannelsStore に設定したリアルタイム番組情報を削除
@@ -711,7 +802,9 @@ class LiveDataBroadcastingManager implements PlayerManager {
         }
 
         // ここからはデータ放送機能有効時のみ実行
-        if (this.#bml_browser !== null) {
+        const bml_browser = this.#bml_browser;
+        const container_element = this.container_element;
+        if (bml_browser !== null) {
 
             // リモコンのボタンを再び無効化
             this.toggleRemoconButtonsEnabled(false);
@@ -730,12 +823,15 @@ class LiveDataBroadcastingManager implements PlayerManager {
 
             // BML ブラウザを破棄
             this.is_bml_browser_destroying = true;
-            await this.#bml_browser.destroy();
+            // await 中に次世代 init() が開始されても、そのインスタンス変数を旧 destroy() の
+            // 完了処理で null に戻さないよう、破棄対象を local に固定する
+            if (this.#bml_browser === bml_browser) this.#bml_browser = null;
+            if (this.container_element === container_element) this.container_element = null;
+            await bml_browser.destroy();
             this.is_bml_browser_destroying = false;
-            this.#bml_browser = null;
 
             // BML ブラウザの要素を削除
-            this.container_element?.remove();
+            container_element?.remove();
 
             console.log('[LiveDataBroadcastingManager] Destroyed.');
         }
