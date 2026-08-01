@@ -18,7 +18,6 @@ from app import logging
 from app.config import Config
 from app.constants import BS4K_VERSION, JST
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
-from app.metadata.CMAnalysisPaths import ResolveCMHostPath
 from app.metadata.CMAnalysisWorkspace import (
     CMAnalysisWorkspace,
     CMAnalysisWorkspaceError,
@@ -31,6 +30,8 @@ from app.metadata.CMAnalyzer import (
     CMInputDescriptor,
     CMInputUnsupportedError,
     GenericCMAnalyzer,
+    KonomiTVBS4KLogicalAudioRebuildPreference,
+    KonomiTVBS4KLogicalAudioRebuildStrategy,
 )
 from app.metadata.CMChapterFile import (
     ChapterFingerprint,
@@ -51,8 +52,6 @@ from app.metadata.KonomiTVBS4KChapterFile import (
     ReadKonomiTVBS4KChapterFileAsync,
 )
 from app.models.CMAnalysis import (
-    CMAnalysisExcludedDirectory,
-    CMAnalysisSettings,
     CMLogo,
     CMResultSource,
     RecordedVideoCMAnalysis,
@@ -66,6 +65,7 @@ from app.streams.RecordedPlaybackCapabilities import (
     RecordedPlaybackEncoder,
 )
 from app.utils.DriveIOLimiter import DriveIOLimiter
+from app.utils.HostPath import ToHostPath, ToUserHostPathText
 
 
 CMAnalysisIntent = Literal['DetectCM', 'CMChapterSync', 'CMDetection', 'CMRegeneration']
@@ -75,6 +75,12 @@ CMChapterReadResultType = CMChapterReadResult | KonomiTVBS4KChapterReadResult
 class CMAnalysisOrchestrator:
     """録画の既存 chapter 同期と汎用 CM 解析を一貫した状態契約で実行する。"""
 
+    _KONOMITV_BS4K_LOGICAL_AUDIO_REBUILD_STRATEGY_KEY = (
+        'konomitv_bs4k_logical_audio_rebuild_strategy'
+    )
+    _KONOMITV_BS4K_LOGICAL_AUDIO_REBUILD_PREFERENCE_KEY = (
+        'konomitv_bs4k_logical_audio_rebuild_preference'
+    )
     _analysis_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(1)
     _recording_locks: ClassVar[dict[int, asyncio.Lock]] = {}
     _recording_lock_users: ClassVar[dict[int, int]] = {}
@@ -180,6 +186,20 @@ class CMAnalysisOrchestrator:
                     input_fingerprint=None,
                     attempt_key=None,
                 )
+            # chapter同期で旧pipelineの生成YAMLをPendingへ戻すと、直前の
+            # MediaPreparationFailedはerror_codeから消える。更新前の状態と現在入力を
+            # ここで照合し、解析semaphore待機をまたいでも再構築方針を失わないようにする。
+            logical_audio_rebuild_preference = self._konomiTVBS4KLogicalAudioRebuildPreference(
+                state,
+                input_fingerprint,
+            )
+            if logical_audio_rebuild_preference == 'FFmpegAfterPreviousFailure':
+                state.runtime_fingerprint = {
+                    **(state.runtime_fingerprint or {}),
+                    self._KONOMITV_BS4K_LOGICAL_AUDIO_REBUILD_PREFERENCE_KEY: (
+                        logical_audio_rebuild_preference
+                    ),
+                }
             state.input_fingerprint = input_fingerprint
 
             chapter_selection = await self._selectChapterPath(recorded_path)
@@ -203,7 +223,16 @@ class CMAnalysisOrchestrator:
                             used_logo_id=None,
                         )
 
-                    if self._isGeneratedChapterForInput(chapter_result, input_fingerprint):
+                    generated_input_matches = self._isGeneratedChapterForInput(
+                        chapter_result,
+                        input_fingerprint,
+                    )
+                    generated_pipeline_matches = self._isGeneratedChapterForInput(
+                        chapter_result,
+                        input_fingerprint,
+                        pipeline_version=GenericCMAnalyzer.ANALYZER_VERSION,
+                    )
+                    if generated_pipeline_matches:
                         # YAML自身の検証済みgenerator/recording情報を所有権の根拠にする。
                         # これによりSQLiteを失っても生成済み結果をsidecarから復元できる。
                         if intent != 'CMRegeneration':
@@ -237,6 +266,18 @@ class CMAnalysisOrchestrator:
                                 ),
                             )
                         # 明示的な再生成だけは、自前のYAMLを解析結果で置換する。
+                    elif generated_input_matches:
+                        # 自前の旧pipeline結果は利用者編集ではないため、新pipelineで置換できる。
+                        state = await self._saveMissingChapter(
+                            recorded_video,
+                            state,
+                            chapter_result,
+                            chapter_selection.kind,
+                            error_code='GeneratedChapterPipelineOutdated',
+                        )
+                        published_result = None
+                        if intent == 'CMChapterSync':
+                            return state
                     else:
                         # 録画内容が生成時から変わったYAMLを現在のCM結果として公開しない。
                         state = await self._saveMissingChapter(
@@ -303,8 +344,8 @@ class CMAnalysisOrchestrator:
                 if intent == 'CMChapterSync' and unverified_migrated_result is False:
                     return state
 
-            settings, _ = await CMAnalysisSettings.get_or_create(id=1, defaults={'enabled': False})
-            if settings.enabled is False:
+            cm_settings = Config().cm_analysis
+            if cm_settings.enabled is False:
                 return await self._saveSkippedState(
                     state,
                     chapter_result,
@@ -329,10 +370,11 @@ class CMAnalysisOrchestrator:
                     return await self._runTrackedAnalysis(
                         recorded_video,
                         state,
-                        settings,
+                        cm_settings.logo_directory,
                         chapter_result,
                         chapter_selection.kind,
                         input_fingerprint,
+                        logical_audio_rebuild_preference,
                         intent,
                         existing_handle=existing_handle,
                     )
@@ -371,10 +413,11 @@ class CMAnalysisOrchestrator:
         self,
         recorded_video: RecordedVideo,
         state: RecordedVideoCMAnalysis,
-        settings: CMAnalysisSettings,
+        logo_directory: Path | None,
         chapter_result: CMChapterReadResultType,
         chapter_path_kind: CMChapterPathKind,
         input_fingerprint: dict[str, int | str],
+        logical_audio_rebuild_preference: KonomiTVBS4KLogicalAudioRebuildPreference,
         intent: CMAnalysisIntent,
         *,
         existing_handle: AnalysisTaskHandle | None = None,
@@ -384,10 +427,11 @@ class CMAnalysisOrchestrator:
         Args:
             recorded_video: 解析対象の録画モデル。
             state: 更新対象のCM解析状態。
-            settings: 現在のCM解析設定。
+            logo_directory: 共有ロゴフォルダの実行時パス。未設定時は None。
             chapter_result: 解析開始前に読み取ったchapter状態。
             chapter_path_kind: 採用対象chapterのパス種別。
             input_fingerprint: 録画入力の内容fingerprint。
+            logical_audio_rebuild_preference: 状態更新前の失敗履歴から確定した音声再構築方針。
             intent: 自動同期または明示的な再判定を表す実行意図。
             existing_handle: APIが先にQueuedで永続化した解析履歴。
 
@@ -413,6 +457,15 @@ class CMAnalysisOrchestrator:
                 await CMLogoScanner.scan()
                 logo_selection = CMLogoSelection(status='Missing')
                 runtime_fingerprint = self._runtimeFingerprint()
+                if logical_audio_rebuild_preference == 'FFmpegAfterPreviousFailure':
+                    # 解析開始後にサービス停止・cancelが発生しても次回再解析で方針を
+                    # 失わないよう、試行中の状態にも確定済みpreferenceを含める。
+                    runtime_fingerprint = {
+                        **runtime_fingerprint,
+                        self._KONOMITV_BS4K_LOGICAL_AUDIO_REBUILD_PREFERENCE_KEY: (
+                            logical_audio_rebuild_preference
+                        ),
+                    }
                 hardware_device, hardware_environment = self._resolveHardwareDecodeContext()
                 await history.setStage('ProbingMedia', 0.05)
                 analyzer_request = CMAnalyzerRequest(
@@ -425,6 +478,7 @@ class CMAnalysisOrchestrator:
                     hardware_environment=hardware_environment,
                     duration_seconds=recorded_video.duration,
                     has_variable_video_format=recorded_video.has_video_stream_changes,
+                    konomitv_bs4k_logical_audio_rebuild_preference=logical_audio_rebuild_preference,
                 )
                 descriptor: CMInputDescriptor | None = None
                 try:
@@ -491,7 +545,7 @@ class CMAnalysisOrchestrator:
 
                 logo_selection = await CMLogoSelector.select(
                     recorded_video,
-                    settings,
+                    logo_directory,
                     resolved_video_size=(descriptor.width, descriptor.height) if descriptor is not None else None,
                 )
 
@@ -572,6 +626,16 @@ class CMAnalysisOrchestrator:
                     attempt_key,
                     runtime_fingerprint,
                 )
+                if result.konomitv_bs4k_logical_audio_rebuild_strategy is not None:
+                    # 固定runtime fingerprintとは別に、この録画入力で実際に採用した
+                    # 論理音声再構築方式を保存する。次回の同一入力再解析では、native
+                    # crashを起こしたPyAV経路を再試行せずFFmpegを主経路にできる。
+                    runtime_fingerprint = {
+                        **runtime_fingerprint,
+                        self._KONOMITV_BS4K_LOGICAL_AUDIO_REBUILD_STRATEGY_KEY: (
+                            result.konomitv_bs4k_logical_audio_rebuild_strategy
+                        ),
+                    }
                 if result.status != 'completed' or result.analyzer_version is None:
                     state = await self._saveStructuredAnalyzerFailure(
                         state,
@@ -614,7 +678,8 @@ class CMAnalysisOrchestrator:
                 )
                 if chapter_unchanged is False:
                     if current_chapter_result.status in ('Valid', 'ValidNoCM'):
-                        # 解析中に現れた正常sidecarは優先し、解析結果を破棄する。
+                        # 解析中に現れた手書き・外部・現行pipelineのsidecarは優先する。
+                        # 異なる録画入力や旧pipelineの生成物なら解析結果と混在させず中断する。
                         changed_source: CMResultSource
                         changed_pipeline_version: str | None = None
                         if current_chapter_selection.kind == 'Legacy':
@@ -627,6 +692,7 @@ class CMAnalysisOrchestrator:
                             elif self._isGeneratedChapterForInput(
                                 current_chapter_result,
                                 current_input_fingerprint,
+                                pipeline_version=GenericCMAnalyzer.ANALYZER_VERSION,
                             ):
                                 changed_source = 'Generated'
                                 changed_pipeline_version = (
@@ -639,7 +705,8 @@ class CMAnalysisOrchestrator:
                                     state,
                                     'Interrupted',
                                     'ChapterChangedDuringAnalysis',
-                                    'A generated YAML sidecar for a different recording input appeared during analysis.',
+                                    'A generated YAML sidecar for a different recording input or pipeline '
+                                    'appeared during analysis.',
                                     input_fingerprint=current_input_fingerprint,
                                     attempt_key=None,
                                     runtime_fingerprint=runtime_fingerprint,
@@ -898,6 +965,49 @@ class CMAnalysisOrchestrator:
     def _runtimeFingerprint(self) -> dict[str, object]:
         return self.analyzer.runtimeFingerprint
 
+    @classmethod
+    def _konomiTVBS4KLogicalAudioRebuildPreference(
+        cls,
+        state: RecordedVideoCMAnalysis,
+        input_fingerprint: Mapping[str, int | str],
+    ) -> KonomiTVBS4KLogicalAudioRebuildPreference:
+        """同じ録画入力で確認済みのnative crashを再発させない再構築方針を返す。
+
+        Args:
+            state: 録画に保存されている直前のCM解析状態。
+            input_fingerprint: 今回解析する録画入力のfingerprint。
+
+        Returns:
+            初回入力ではPyAV、過去の媒体準備失敗またはfallback成功後はFFmpegを選ぶ方針。
+        """
+
+        # ファイルが更新されていれば以前の失敗理由を引き継がず、現在の入力に対して
+        # StreamReform準拠assemblerを改めて試す。fingerprintが欠落した旧状態も同様に扱う。
+        if state.input_fingerprint != dict(input_fingerprint):
+            return 'PyAV'
+        previous_strategy = (
+            state.runtime_fingerprint.get(cls._KONOMITV_BS4K_LOGICAL_AUDIO_REBUILD_STRATEGY_KEY)
+            if state.runtime_fingerprint is not None
+            else None
+        )
+        previous_preference = (
+            state.runtime_fingerprint.get(cls._KONOMITV_BS4K_LOGICAL_AUDIO_REBUILD_PREFERENCE_KEY)
+            if state.runtime_fingerprint is not None
+            else None
+        )
+        fallback_strategies: tuple[KonomiTVBS4KLogicalAudioRebuildStrategy, ...] = (
+            'FFmpegPrimaryAfterPreviousFailure',
+            'FFmpegFallbackAfterSignal',
+            'FFmpegFallbackAfterReportedFailure',
+        )
+        if (
+            (state.status == 'Failed' and state.error_code == 'MediaPreparationFailed')
+            or previous_preference == 'FFmpegAfterPreviousFailure'
+            or previous_strategy in fallback_strategies
+        ):
+            return 'FFmpegAfterPreviousFailure'
+        return 'PyAV'
+
     @staticmethod
     def buildAttemptKey(
         input_fingerprint: Mapping[str, int | str],
@@ -980,7 +1090,7 @@ class CMAnalysisOrchestrator:
     def _resolveHardwareDecodeDevice(encoder: RecordedPlaybackEncoder) -> str | None:
         if encoder == 'FFmpeg':
             return None
-        if encoder == 'NVEncC':
+        if encoder == 'NVENC':
             return 'cuda:0'
         selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(encoder)
         if selected_device is not None:
@@ -1021,11 +1131,21 @@ class CMAnalysisOrchestrator:
     def _isGeneratedChapterForInput(
         chapter_result: KonomiTVBS4KChapterReadResult,
         input_fingerprint: Mapping[str, int | str],
+        *,
+        pipeline_version: str | None = None,
     ) -> bool:
-        """YAMLの生成由来と録画fingerprintが現在の入力に一致するか検証する。"""
+        """YAMLの生成由来・録画fingerprint・任意のpipeline版を検証する。"""
 
         provenance = chapter_result.provenance
         if provenance is None or provenance.source != 'Generated' or provenance.recording is None:
+            return False
+        if (
+            pipeline_version is not None
+            and (
+                provenance.generator is None
+                or provenance.generator.pipeline_version != pipeline_version
+            )
+        ):
             return False
         recording = provenance.recording
         return (
@@ -1151,7 +1271,11 @@ class CMAnalysisOrchestrator:
         state.finished_at = datetime.now(tz=JST)
         state.completed_at = None
         state.error_code = result.error_code or result.status
-        state.error_message = result.error_message
+        state.error_message = (
+            ToUserHostPathText(result.error_message)
+            if result.error_message is not None
+            else None
+        )
         await state.save()
         return state
 
@@ -1254,26 +1378,40 @@ class CMAnalysisOrchestrator:
         state.completed_at = None
         state.finished_at = datetime.now(tz=JST)
         state.error_code = error_code
-        state.error_message = error_message
+        state.error_message = (
+            ToUserHostPathText(error_message)
+            if error_message is not None
+            else None
+        )
         await state.save()
         return state
 
     @staticmethod
     async def _findMatchedExclusion(recorded_path: Path) -> str | None:
+        """除外ディレクトリ設定（実行時パス）に録画が含まれるか照合する。
+
+        Args:
+            recorded_path: 照合する録画の実行時パス。
+
+        Returns:
+            一致した除外パスのホスト表現。一致しなければ None。
+        """
+
         try:
             resolved_recorded_path = await asyncio.to_thread(recorded_path.resolve)
         except OSError:
             resolved_recorded_path = recorded_path
-        for excluded in await CMAnalysisExcludedDirectory.filter(enabled=True):
-            configured_path = Path(excluded.path)
+        # Config 上は実行時パス文字列。照合結果は UI 向けにホスト表現で返す。
+        for excluded_text in Config().cm_analysis.excluded_directories:
+            configured_path = Path(excluded_text)
+            try:
+                resolved_excluded_path = await asyncio.to_thread(configured_path.resolve)
+            except OSError:
+                resolved_excluded_path = configured_path
             for path_candidate in (recorded_path, resolved_recorded_path):
-                for excluded_candidate in (
-                    configured_path,
-                    ResolveCMHostPath(configured_path),
-                    Path(excluded.resolved_path),
-                ):
+                for excluded_candidate in (configured_path, resolved_excluded_path):
                     if CMAnalysisOrchestrator.isPathWithinDirectory(path_candidate, excluded_candidate):
-                        return excluded.path
+                        return str(ToHostPath(configured_path))
         return None
 
     @staticmethod

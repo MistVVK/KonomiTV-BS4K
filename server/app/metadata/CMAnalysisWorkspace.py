@@ -97,11 +97,16 @@ class CMAnalysisWorkspace:
     ROOT_MARKER_NAME: ClassVar[str] = '.workspace-root.json'
     JOB_MARKER_NAME: ClassVar[str] = '.workspace-owner.json'
     LOCK_FILE_NAME: ClassVar[str] = '.workspace.lock'
-    AUDIO_BYTES_PER_SECOND: ClassVar[int] = 96_000
+    # Amatsukazeと同じ48kHz/16bit/stereo PCM。
+    AUDIO_BYTES_PER_SECOND: ClassVar[int] = 192_000
     MINIMUM_HEADROOM_BYTES: ClassVar[int] = 128 * 1024 * 1024
     FIXED_RESERVE_BYTES: ClassVar[int] = 2 * 1024 * 1024 * 1024
     _JOB_NAME_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r'^(?P<recorded_video_id>\d+)-(?P<token>[0-9a-f]{32})$')
     _MARKER_APPLICATION: ClassVar[str] = 'KonomiTV-BS4K-CMAnalysisWorkspace'
+    # bd4e0b2c のnamespace移行前に使われたrootとapplication marker。
+    # 未知の旧名・markerまで対象を広げず、この完全一致だけをmigration cleanupする。
+    _LEGACY_ROOT_DIRECTORY_NAME: ClassVar[str] = '.konomitv-cm-analysis'
+    _LEGACY_MARKER_APPLICATION: ClassVar[str] = 'KonomiTV-CMAnalysisWorkspace'
 
     path: Path
     required_bytes: int
@@ -221,7 +226,7 @@ class CMAnalysisWorkspace:
 
     @classmethod
     def isWorkspacePath(cls, path: Path) -> bool:
-        """パスが予約workspace root自身またはその配下かを返す。
+        """パスが現行・既知legacy workspace root自身またはその配下かを返す。
 
         Args:
             path: 録画スキャナーが検査するパス。
@@ -230,7 +235,19 @@ class CMAnalysisWorkspace:
             予約ディレクトリ名が完全なパス要素として含まれる場合は ``True``。
         """
 
-        return cls.ROOT_DIRECTORY_NAME in path.parts
+        return any(root_name in path.parts for root_name in cls.getRootDirectoryNames())
+
+    @classmethod
+    def getRootDirectoryNames(cls) -> tuple[str, ...]:
+        """scannerが枝刈り・migration cleanupする既知root名を返す。"""
+
+        return (cls.ROOT_DIRECTORY_NAME, cls._LEGACY_ROOT_DIRECTORY_NAME)
+
+    @classmethod
+    def isWorkspaceRootName(cls, name: str) -> bool:
+        """単一path要素が現行または既知legacyのroot名と完全一致するかを返す。"""
+
+        return name in cls.getRootDirectoryNames()
 
     async def cleanup(self) -> None:
         """lockを保持したまま自身のjob directoryだけを削除する。
@@ -444,7 +461,7 @@ class CMAnalysisWorkspace:
 
     @classmethod
     def _cleanupStaleInParentSynchronous(cls, parent: Path) -> None:
-        """単一親ディレクトリのmarker検証済み非稼働jobだけを削除する。
+        """単一親ディレクトリの現行・legacy marker検証済み非稼働jobだけを削除する。
 
         Args:
             parent: DB登録録画から得た親ディレクトリ。
@@ -456,46 +473,93 @@ class CMAnalysisWorkspace:
         resolved_parent = parent.resolve(strict=True)
         parent_lock_fd = cls._lockDirectory(resolved_parent)
         try:
-            root = resolved_parent / cls.ROOT_DIRECTORY_NAME
-            try:
-                root_stat = root.lstat()
-            except FileNotFoundError:
-                return
-            if (
-                stat.S_ISDIR(root_stat.st_mode) is False
-                or root.is_symlink()
-                or root_stat.st_uid != os.geteuid()
-                or cls._readMarker(root / cls.ROOT_MARKER_NAME) != cls._rootMarker()
-            ):
-                logging.warning('[CMAnalysisWorkspace] Ignored an unowned or invalid workspace root.')
-                return
-
-            with os.scandir(root) as entries:
-                for entry in entries:
-                    if entry.name == cls.ROOT_MARKER_NAME:
-                        continue
-                    match = cls._JOB_NAME_PATTERN.fullmatch(entry.name)
-                    if match is None or entry.is_dir(follow_symlinks=False) is False or entry.is_symlink():
-                        continue
-                    path = root / entry.name
-                    path_stat = path.lstat()
-                    recorded_video_id = int(match.group('recorded_video_id'))
-                    marker = cls._readMarker(path / cls.JOB_MARKER_NAME)
-                    if (
-                        path_stat.st_uid != os.geteuid()
-                        or marker is None
-                        or marker.get('application') != cls._MARKER_APPLICATION
-                        or marker.get('kind') != 'job'
-                        or marker.get('layout_version') != cls.LAYOUT_VERSION
-                        or marker.get('name') != entry.name
-                        or marker.get('recorded_video_id') != recorded_video_id
-                        or marker.get('owner_uid') != path_stat.st_uid
-                    ):
-                        continue
-                    cls._removeIfUnlocked(path)
-            cls._removeEmptyRootUnderParentLock(root)
+            for root_name, marker_application in cls.__workspaceNamespaces():
+                cls.__cleanupStaleRootUnderParentLock(
+                    resolved_parent / root_name,
+                    marker_application,
+                )
         finally:
             cls._unlockDirectory(parent_lock_fd)
+
+    @classmethod
+    def __cleanupStaleRootUnderParentLock(cls, root: Path, marker_application: str) -> None:
+        """親lock保持中に、指定namespaceと完全一致する非稼働jobだけを削除する。"""
+
+        try:
+            root_stat = root.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISDIR(root_stat.st_mode) is False
+            or root.is_symlink()
+            or root_stat.st_uid != os.geteuid()
+            or cls._readMarker(root / cls.ROOT_MARKER_NAME) != cls._rootMarker(marker_application)
+        ):
+            logging.warning(f'[CMAnalysisWorkspace] Ignored an unowned or invalid workspace root: {root}')
+            return
+
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if entry.name == cls.ROOT_MARKER_NAME:
+                    continue
+                match = cls._JOB_NAME_PATTERN.fullmatch(entry.name)
+                if match is None or entry.is_dir(follow_symlinks=False) is False or entry.is_symlink():
+                    continue
+                path = root / entry.name
+                path_stat = path.lstat()
+                recorded_video_id = int(match.group('recorded_video_id'))
+                marker = cls._readMarker(path / cls.JOB_MARKER_NAME)
+                if path_stat.st_uid != os.geteuid() or cls.__isOwnedJobMarker(
+                    marker,
+                    marker_application,
+                    entry.name,
+                    recorded_video_id,
+                    path_stat.st_uid,
+                ) is False:
+                    continue
+                cls._removeIfUnlocked(path)
+        cls._removeEmptyRootUnderParentLock(root, marker_application)
+
+    @classmethod
+    def __isOwnedJobMarker(
+        cls,
+        marker: dict[str, object] | None,
+        marker_application: str,
+        job_name: str,
+        recorded_video_id: int,
+        owner_uid: int,
+    ) -> bool:
+        """現行・legacy実装が生成する全fieldと完全一致するjob markerだけを認める。"""
+
+        if marker is None or set(marker) != {
+            'application',
+            'kind',
+            'layout_version',
+            'name',
+            'recorded_video_id',
+            'owner_uid',
+            'owner_pid',
+        }:
+            return False
+        return (
+            marker['application'] == marker_application
+            and marker['kind'] == 'job'
+            and marker['layout_version'] == cls.LAYOUT_VERSION
+            and marker['name'] == job_name
+            and marker['recorded_video_id'] == recorded_video_id
+            and marker['owner_uid'] == owner_uid
+            and type(marker['owner_pid']) is int
+            and marker['owner_pid'] > 0
+        )
+
+    @classmethod
+    def __workspaceNamespaces(cls) -> tuple[tuple[str, str], ...]:
+        """cleanup対象として厳密に認めるroot名とapplication markerの組を返す。"""
+
+        return (
+            (cls.ROOT_DIRECTORY_NAME, cls._MARKER_APPLICATION),
+            (cls._LEGACY_ROOT_DIRECTORY_NAME, cls._LEGACY_MARKER_APPLICATION),
+        )
 
     @classmethod
     def _removeIfUnlocked(cls, path: Path) -> None:
@@ -553,15 +617,19 @@ class CMAnalysisWorkspace:
             cls._unlockDirectory(parent_lock_fd)
 
     @classmethod
-    def _removeEmptyRootUnderParentLock(cls, root: Path) -> None:
-        """録画親の排他取得中に、空の所有rootだけを削除する。"""
+    def _removeEmptyRootUnderParentLock(
+        cls,
+        root: Path,
+        marker_application: str | None = None,
+    ) -> None:
+        """録画親の排他取得中に、指定namespaceと一致する空の所有rootだけを削除する。"""
 
         root_stat = root.lstat()
         if (
             stat.S_ISDIR(root_stat.st_mode) is False
             or root.is_symlink()
             or root_stat.st_uid != os.geteuid()
-            or cls._readMarker(root / cls.ROOT_MARKER_NAME) != cls._rootMarker()
+            or cls._readMarker(root / cls.ROOT_MARKER_NAME) != cls._rootMarker(marker_application)
         ):
             return
         entries = list(os.scandir(root))
@@ -603,7 +671,7 @@ class CMAnalysisWorkspace:
             os.close(fd)
 
     @classmethod
-    def _rootMarker(cls) -> dict[str, object]:
+    def _rootMarker(cls, marker_application: str | None = None) -> dict[str, object]:
         """予約rootの所有権を検証する決定的markerを返す。
 
         Returns:
@@ -611,7 +679,7 @@ class CMAnalysisWorkspace:
         """
 
         return {
-            'application': cls._MARKER_APPLICATION,
+            'application': marker_application or cls._MARKER_APPLICATION,
             'kind': 'root',
             'layout_version': cls.LAYOUT_VERSION,
             'owner_uid': os.geteuid(),

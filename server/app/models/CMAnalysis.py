@@ -27,7 +27,11 @@ CMLogoGenerationBatchState = Literal['NotAttempted', 'Running', 'Succeeded', 'Ex
 
 
 class CMAnalysisSettings(TortoiseModel):
-    """サーバー全体で共有するCM解析設定を保持する。"""
+    """旧SQLite版のCM解析設定（読み書き停止）。
+
+    現行の運用設定は config.yaml の cm_analysis セクション。
+    テーブルは過去マイグレーション互換のため残している。
+    """
 
     class Meta(TortoiseModel.Meta):
         table: str = 'cm_analysis_settings'
@@ -39,7 +43,10 @@ class CMAnalysisSettings(TortoiseModel):
 
 
 class CMAnalysisExcludedDirectory(TortoiseModel):
-    """新規CM解析だけを除外するディレクトリを保持する。"""
+    """旧SQLite版のCM解析除外ディレクトリ（読み書き停止）。
+
+    現行は config.yaml の cm_analysis.excluded_directories。
+    """
 
     class Meta(TortoiseModel.Meta):
         table: str = 'cm_analysis_excluded_directories'

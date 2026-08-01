@@ -18,21 +18,26 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
-from tortoise import transactions
 
 from app import schemas
+from app.config import Config, HostServerSettings, SaveConfigAndApply
 from app.constants import DATA_DIR, JST
-from app.metadata.CMAnalysisPaths import ResolveCMHostPath, ValidateCMLogoDirectory
+from app.metadata.CMAnalysisPaths import ValidateCMLogoDirectory
 from app.metadata.CMLogoGenerator import UnavailableCMLogoGenerator
 from app.metadata.CMLogoScanner import CMLogoScanner
 from app.models.CMAnalysis import (
-    CMAnalysisExcludedDirectory,
-    CMAnalysisSettings,
     CMLogo,
     CMLogoServiceAssignment,
 )
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.utils.HostPath import (
+    HostPathError,
+    NormalizeHostPath,
+    ToHostPath,
+    ToRuntimePath,
+    ToUserHostPathText,
+)
 
 
 router = APIRouter(
@@ -51,12 +56,13 @@ _MAX_LOGO_UPLOAD_BYTES = 64 * 1024 * 1024
 async def CMAnalysisSettingsAPI() -> schemas.CMAnalysisSettings:
     """サーバー全体で共有するCM解析設定を返す。"""
 
-    settings, _ = await CMAnalysisSettings.get_or_create(id=1, defaults={'enabled': False})
-    excluded_directories = await CMAnalysisExcludedDirectory.filter(enabled=True).order_by('id')
+    # config.yaml 由来。Docker 内部表現はホストパスへ戻して返す。
+    host_settings = HostServerSettings.fromServerSettings(Config())
+    cm = host_settings.cm_analysis
     return schemas.CMAnalysisSettings(
-        enabled=settings.enabled,
-        logo_directory=settings.logo_directory,
-        excluded_directories=[excluded.path for excluded in excluded_directories],
+        enabled=cm.enabled,
+        logo_directory=str(cm.logo_directory) if cm.logo_directory is not None else None,
+        excluded_directories=list(cm.excluded_directories),
     )
 
 
@@ -82,46 +88,53 @@ async def CMAnalysisSettingsUpdateAPI(
     new_settings: Annotated[schemas.CMAnalysisSettingsUpdate, Body(description='更新するCM解析設定。')],
     current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> None:
-    """ロゴフォルダと除外パスを検証してCM解析設定を原子的に更新する。"""
+    """ロゴフォルダと除外パスを検証し、config.yaml と稼働中設定を更新する。"""
 
     del current_user
-    logo_directory: str | None = None
+    logo_directory: Path | None = None
     if new_settings.logo_directory is not None and new_settings.logo_directory.strip() != '':
-        host_logo_path = Path(new_settings.logo_directory.strip())
-        await asyncio.to_thread(ValidateCMLogoDirectory, host_logo_path)
-        logo_directory = str(host_logo_path)
+        try:
+            host_logo_path = NormalizeHostPath(new_settings.logo_directory.strip())
+            await asyncio.to_thread(ValidateCMLogoDirectory, host_logo_path)
+        except (HostPathError, ValueError) as ex:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=str(ex),
+            ) from ex
+        logo_directory = host_logo_path
 
-    validated_exclusions: list[tuple[str, str]] = []
+    validated_exclusions: list[str] = []
     seen_exclusions: set[str] = set()
     for raw_path in new_settings.excluded_directories:
         normalized_path = raw_path.strip()
-        if normalized_path == '' or normalized_path in seen_exclusions:
+        if normalized_path == '':
             continue
-        host_path = Path(normalized_path)
-        if host_path.is_absolute() is False:
+        try:
+            host_path = NormalizeHostPath(normalized_path)
+        except HostPathError as ex:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f'CM analysis exclusion must be an absolute path: {normalized_path}',
-            )
-        runtime_path = ResolveCMHostPath(host_path)
-        resolved_path = await asyncio.to_thread(runtime_path.resolve)
-        validated_exclusions.append((str(host_path), str(resolved_path)))
-        seen_exclusions.add(normalized_path)
+                detail=str(ex),
+            ) from ex
+        host_path_text = str(host_path)
+        if host_path_text in seen_exclusions:
+            continue
+        # 保存はホスト表現のみ。解決後パスは照合時に都度 resolve する。
+        validated_exclusions.append(host_path_text)
+        seen_exclusions.add(host_path_text)
 
-    async with transactions.in_transaction() as connection:
-        settings, _ = await CMAnalysisSettings.get_or_create(
-            id=1,
-            defaults={'enabled': False},
-            using_db=connection,
-        )
-        settings.enabled = new_settings.enabled
-        settings.logo_directory = logo_directory
-        await settings.save(using_db=connection)
-        await CMAnalysisExcludedDirectory.all().using_db(connection).delete()
-        await CMAnalysisExcludedDirectory.bulk_create([
-            CMAnalysisExcludedDirectory(path=path, resolved_path=resolved_path, enabled=True)
-            for path, resolved_path in validated_exclusions
-        ], using_db=connection)
+    # 他セクションは現状のまま保持し、cm_analysis だけ差し替える。
+    host_settings = HostServerSettings.fromServerSettings(Config())
+    host_settings.cm_analysis.enabled = new_settings.enabled
+    host_settings.cm_analysis.logo_directory = logo_directory
+    host_settings.cm_analysis.excluded_directories = validated_exclusions
+    try:
+        SaveConfigAndApply(host_settings, bypass_validation=True)
+    except (HostPathError, OSError, RuntimeError, ValueError) as ex:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(ex),
+        ) from ex
 
 
 @router.get(
@@ -163,15 +176,14 @@ async def CMLogoPreviewAPI(logo_id: int) -> FileResponse:
     logo = await CMLogo.get_or_none(id=logo_id)
     if logo is None or logo.missing or logo.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='CM logo was not found')
-    logo_path = Path(logo.path)
-    if await asyncio.to_thread(logo_path.exists) is False:
-        logo_path = ResolveCMHostPath(logo_path)
+    logo_directory = Config().cm_analysis.logo_directory
+    logo_path = ToRuntimePath(Path(logo.path)) if logo_directory is not None else Path(logo.path)
     if await asyncio.to_thread(logo_path.exists) is False:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='CM logo file was not found')
 
     preview_directory = DATA_DIR / 'cm-analysis/logo-previews'
     await asyncio.to_thread(preview_directory.mkdir, parents=True, exist_ok=True)
-    preview_path = preview_directory / f'{logo.file_hash}.png'
+    preview_path = preview_directory / f'{logo.file_hash}.v2.png'
     if await asyncio.to_thread(preview_path.exists) is False:
         temporary_fd, temporary_name = tempfile.mkstemp(prefix=f'.{logo.file_hash}.', suffix='.png', dir=preview_directory)
         os.close(temporary_fd)
@@ -183,7 +195,7 @@ async def CMLogoPreviewAPI(logo_id: int) -> FileResponse:
             await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f'CM logo preview conversion failed: {ex!s}',
+                detail=ToUserHostPathText(f'CM logo preview conversion failed: {ex!s}'),
             ) from ex
         finally:
             await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
@@ -212,9 +224,11 @@ async def CMLogoUploadAPI(
     if filename == '' or filename.lower().endswith('.lgd') is False:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='A .lgd file is required')
 
-    settings, _ = await CMAnalysisSettings.get_or_create(id=1, defaults={'enabled': False})
-    configured_path = Path(settings.logo_directory) if settings.logo_directory else None
-    runtime_directory = ResolveCMHostPath(configured_path) if configured_path else DATA_DIR / 'cm-analysis/logos'
+    # Config 内部は実行時パス。DB へ書くロゴ path はホスト表現に揃える。
+    configured_runtime = Config().cm_analysis.logo_directory
+    configured_host = ToHostPath(configured_runtime) if configured_runtime is not None else None
+    runtime_directory = Path(configured_runtime) if configured_runtime is not None else DATA_DIR / 'cm-analysis/logos'
+    configured_path = configured_host
     await asyncio.to_thread(runtime_directory.mkdir, parents=True, exist_ok=True)
     destination_path = runtime_directory / filename
     if await asyncio.to_thread(destination_path.exists):
@@ -242,7 +256,10 @@ async def CMLogoUploadAPI(
     except FileExistsError as ex:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='A logo with the same filename already exists') from ex
     except (OSError, ValueError) as ex:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ex)) from ex
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=ToUserHostPathText(str(ex)),
+        ) from ex
     finally:
         await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
 
@@ -357,12 +374,15 @@ async def CMLogoDeleteAPI(
     logo = await CMLogo.get_or_none(id=logo_id)
     if logo is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='CM logo was not found')
-    settings, _ = await CMAnalysisSettings.get_or_create(id=1, defaults={'enabled': False})
-    runtime_path = ResolveCMHostPath(Path(logo.path)) if settings.logo_directory else Path(logo.path)
+    logo_directory = Config().cm_analysis.logo_directory
+    runtime_path = ToRuntimePath(Path(logo.path)) if logo_directory is not None else Path(logo.path)
     try:
         await asyncio.to_thread(runtime_path.unlink, missing_ok=True)
     except OSError as ex:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(ex)) from ex
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=ToUserHostPathText(str(ex)),
+        ) from ex
     logo.missing = True
     logo.deleted_at = datetime.now(tz=JST)
     await logo.save(update_fields=['missing', 'deleted_at', 'updated_at'])

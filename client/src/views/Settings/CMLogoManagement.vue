@@ -10,17 +10,20 @@
         <div class="settings__description">
             AviUtl v0.1 の単一ロゴ .lgd と拡張 v1 を読み込み、SID・NID・TSID の割り当てと適用期間を管理します。
         </div>
+        <div v-if="is_edit_disabled" class="settings__item-label mt-4">
+            CM ロゴの変更操作は管理者のみ実行できます。一覧の閲覧は可能です。
+        </div>
         <div class="logo-toolbar mt-5">
             <v-text-field color="primary" variant="outlined" density="compact" hide-details
                 prepend-inner-icon="mdi-magnify" placeholder="SID・名前・ファイル名を検索" v-model="search_query" />
-            <v-btn variant="flat" :disabled="capabilities.automatic_logo_generation === 'Unavailable'">
+            <v-btn variant="flat" :disabled="is_edit_disabled || capabilities.automatic_logo_generation === 'Unavailable'">
                 <Icon icon="fluent:image-add-20-filled" class="mr-2" />録画から自動作成（準備中）
             </v-btn>
-            <v-btn variant="flat" :loading="is_loading" @click="loadData(true)">
+            <v-btn variant="flat" :loading="is_loading" :disabled="is_edit_disabled" @click="loadData(true)">
                 <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" />再スキャン
             </v-btn>
         </div>
-        <div class="logo-manager mt-4" :class="{'logo-manager--loading': is_loading}">
+        <div class="logo-manager mt-4" :class="{'logo-manager--loading': is_loading, 'logo-manager--readonly': is_edit_disabled}">
             <section class="logo-pane logo-services">
                 <h3>サービス</h3>
                 <button v-for="service_id in service_ids" :key="String(service_id)" type="button"
@@ -64,7 +67,7 @@
                         <dt>生成元録画</dt><dd>{{selected_logo.generated_from_recorded_video_id ?? '外部/手動追加'}}</dd>
                     </dl>
                     <v-switch color="primary" hide-details label="KonomiTV-BS4K で有効"
-                        :model-value="selected_logo.enabled" :disabled="selected_logo.missing"
+                        :model-value="selected_logo.enabled" :disabled="is_edit_disabled || selected_logo.missing"
                         @update:modelValue="updateSelectedLogo(Boolean($event))" />
                     <v-divider class="my-5"></v-divider>
                     <h4>NID・TSID サービス割り当て</h4>
@@ -72,18 +75,18 @@
                         <span>SID {{assignment.service_id}} / NID {{assignment.network_id}} / TSID {{assignment.transport_stream_id}}
                             <template v-if="assignment.valid_from || assignment.valid_until"><br>{{assignment.valid_from ?? '開始なし'}} ～ {{assignment.valid_until ?? '終了なし'}}</template>
                         </span>
-                        <v-btn icon="mdi-delete" size="small" variant="text" @click="deleteAssignment(assignment.id)" />
+                        <v-btn icon="mdi-delete" size="small" variant="text" :disabled="is_edit_disabled" @click="deleteAssignment(assignment.id)" />
                     </div>
                     <div class="assignment-form mt-3">
-                        <v-text-field label="SID" type="number" density="compact" variant="outlined" hide-details v-model.number="assignment_service_id" />
-                        <v-text-field label="NID" type="number" density="compact" variant="outlined" hide-details v-model.number="assignment_network_id" />
-                        <v-text-field label="TSID" type="number" density="compact" variant="outlined" hide-details v-model.number="assignment_transport_stream_id" />
-                        <v-text-field label="適用開始" type="datetime-local" density="compact" variant="outlined" hide-details v-model="assignment_valid_from" />
-                        <v-text-field label="適用終了" type="datetime-local" density="compact" variant="outlined" hide-details v-model="assignment_valid_until" />
-                        <v-btn variant="flat" @click="createLogoAssignment(false)">このロゴを割り当て</v-btn>
-                        <v-btn variant="flat" color="background-lighten-2" @click="createLogoAssignment(true)">「ロゴなし」を割り当て</v-btn>
+                        <v-text-field label="SID" type="number" density="compact" variant="outlined" hide-details v-model.number="assignment_service_id" :disabled="is_edit_disabled" />
+                        <v-text-field label="NID" type="number" density="compact" variant="outlined" hide-details v-model.number="assignment_network_id" :disabled="is_edit_disabled" />
+                        <v-text-field label="TSID" type="number" density="compact" variant="outlined" hide-details v-model.number="assignment_transport_stream_id" :disabled="is_edit_disabled" />
+                        <v-text-field label="適用開始" type="datetime-local" density="compact" variant="outlined" hide-details v-model="assignment_valid_from" :disabled="is_edit_disabled" />
+                        <v-text-field label="適用終了" type="datetime-local" density="compact" variant="outlined" hide-details v-model="assignment_valid_until" :disabled="is_edit_disabled" />
+                        <v-btn variant="flat" :disabled="is_edit_disabled" @click="createLogoAssignment(false)">このロゴを割り当て</v-btn>
+                        <v-btn variant="flat" color="background-lighten-2" :disabled="is_edit_disabled" @click="createLogoAssignment(true)">「ロゴなし」を割り当て</v-btn>
                     </div>
-                    <v-btn v-if="!selected_logo.missing" class="mt-6" color="error" variant="flat" @click="deleteSelectedLogo()">
+                    <v-btn v-if="!selected_logo.missing" class="mt-6" color="error" variant="flat" :disabled="is_edit_disabled" @click="deleteSelectedLogo()">
                         共有 .lgd を削除
                     </v-btn>
                     <div class="settings__item-label mt-2 text-error-readable">
@@ -93,7 +96,7 @@
                 <template v-else>
                     <h3>ロゴ追加</h3>
                     <v-file-input accept=".lgd" label="単一ロゴ .lgd（AviUtl v0.1 / 拡張 v1）" variant="outlined" hide-details
-                        @update:modelValue="uploadLogo($event)" />
+                        :disabled="is_edit_disabled" @update:modelValue="uploadLogo($event)" />
                     <div class="settings__item-label mt-3">標準形式は追加後にSIDを明示割り当てします。.lgd2 と複数ロゴは非対応です。</div>
                 </template>
             </section>
@@ -107,6 +110,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 
 import Message from '@/message';
 import CMAnalysis, { ICMAnalysisCapabilities, ICMLogo, ICMLogoServiceAssignment } from '@/services/CMAnalysis';
+import useUserStore from '@/stores/UserStore';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
@@ -118,6 +122,14 @@ type ServiceKey = number | 'unassigned';
 const selected_service_id = ref<ServiceKey | null>(null);
 const selected_logo_id = ref<number | null>(null);
 const is_loading = ref(false);
+// 管理者権限が確認できるまでは変更系操作を無効化する（閲覧は維持）
+const is_edit_disabled = ref(true);
+const user_store = useUserStore();
+user_store.fetchUser().then((user) => {
+    if (user && user.is_admin) {
+        is_edit_disabled.value = false;
+    }
+});
 const assignment_service_id = ref<number | null>(null);
 const assignment_network_id = ref<number | null>(null);
 const assignment_transport_stream_id = ref<number | null>(null);
@@ -147,7 +159,8 @@ watch(selected_logo, (logo) => {
 });
 
 function logoPreviewURL(logo: ICMLogo): string {
-    return `/api/cm-analysis/logos/${logo.id}/preview?v=${logo.file_hash}`;
+    // サーバー側プレビューキャッシュの v2（マゼンタ）と揃えて、旧白PNGのブラウザキャッシュを無効化する
+    return `/api/cm-analysis/logos/${logo.id}/preview?v=${logo.file_hash}.v2`;
 }
 
 onMounted(() => loadData(false));
@@ -192,13 +205,14 @@ function formatLogoFileFormat(file_format: ICMLogo['file_format']): string {
 }
 
 async function updateSelectedLogo(enabled: boolean): Promise<void> {
-    if (selected_logo.value === null) return;
+    if (is_edit_disabled.value || selected_logo.value === null) return;
     if (await CMAnalysis.updateLogo(selected_logo.value.id, enabled)) {
         selected_logo.value.enabled = enabled;
     }
 }
 
 async function uploadLogo(value: File | File[] | null): Promise<void> {
+    if (is_edit_disabled.value) return;
     const file = Array.isArray(value) ? value[0] : value;
     if (file === null || file === undefined) return;
     const logo = await CMAnalysis.uploadLogo(file);
@@ -211,6 +225,7 @@ async function uploadLogo(value: File | File[] | null): Promise<void> {
 }
 
 async function createLogoAssignment(no_logo: boolean): Promise<void> {
+    if (is_edit_disabled.value) return;
     if (
         selected_logo.value === null || assignment_service_id.value === null ||
         assignment_network_id.value === null || assignment_transport_stream_id.value === null
@@ -235,13 +250,14 @@ async function createLogoAssignment(no_logo: boolean): Promise<void> {
 }
 
 async function deleteAssignment(assignment_id: number): Promise<void> {
+    if (is_edit_disabled.value) return;
     if (await CMAnalysis.deleteAssignment(assignment_id)) {
         assignments.value = assignments.value.filter((assignment) => assignment.id !== assignment_id);
     }
 }
 
 async function deleteSelectedLogo(): Promise<void> {
-    if (selected_logo.value === null) return;
+    if (is_edit_disabled.value || selected_logo.value === null) return;
     if (!window.confirm('共有 .lgd を削除します。同じフォルダを参照する外部ツールにも影響します。続行しますか？')) return;
     if (await CMAnalysis.deleteLogo(selected_logo.value.id)) {
         Message.success('共有ロゴを削除し、missing 履歴として保存しました。');
@@ -257,6 +273,8 @@ async function deleteSelectedLogo(): Promise<void> {
 .logo-toolbar { display: grid; grid-template-columns: 1fr auto auto; gap: 12px; }
 .logo-manager { display: grid; grid-template-columns: 150px minmax(220px, 1fr) minmax(300px, 1.2fr); gap: 12px; min-height: 520px; }
 .logo-manager--loading { opacity: 0.65; pointer-events: none; }
+.logo-manager--readonly .assignment-form,
+.logo-manager--readonly .assignment-row v-btn { opacity: 0.85; }
 .logo-pane { padding: 14px; border-radius: 10px; background: rgb(var(--v-theme-background-lighten-2)); overflow: auto; }
 .logo-pane h3 { margin-bottom: 12px; font-size: 17px; }
 .logo-services button { display: flex; flex-direction: column; width: 100%; padding: 10px; margin-bottom: 6px; border-radius: 8px; text-align: left; }
@@ -266,7 +284,16 @@ async function deleteSelectedLogo(): Promise<void> {
 .logo-card { display: grid; grid-template-columns: 64px 1fr; width: 100%; padding: 9px; margin-bottom: 8px; border: 2px solid transparent; border-radius: 9px; text-align: left; background: rgb(var(--v-theme-background-lighten-1)); }
 .logo-card--active { border-color: rgb(var(--v-theme-primary)); }
 .logo-card--missing { opacity: 0.6; }
-.logo-card__preview { display: flex; align-items: center; justify-content: center; }
+.logo-card__preview {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgb(var(--v-theme-background-lighten-2));
+    border-radius: 6px;
+    padding: 4px;
+}
+/* マゼンタ半透明ロゴが溶けるのを防ぐため、実ロゴだけ Amatsukaze と同様の黒背景で表示する */
+.logo-card:not(.logo-card--missing) .logo-card__preview { background: #000; }
 .logo-card__preview img { max-width: 58px; max-height: 42px; object-fit: contain; }
 .logo-card__body { display: flex; min-width: 0; flex-direction: column; }
 .logo-card__body strong { overflow-wrap: anywhere; }

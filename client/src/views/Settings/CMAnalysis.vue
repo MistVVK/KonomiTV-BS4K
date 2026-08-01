@@ -12,15 +12,18 @@
             KonomiTV-BS4K の自動解析結果は録画横の YAML に保存します。<br>
             この設定はすべてのユーザーと端末で共有されます。
         </div>
-        <div class="settings__content" :class="{'settings__content--loading': is_loading}">
+        <div class="settings__content" :class="{'settings__content--loading': is_loading, 'settings__content--disabled': is_edit_disabled}">
+            <div v-if="is_edit_disabled" class="settings__item-label mb-4">
+                CM 解析設定の変更は管理者のみ実行できます。閲覧は可能です。
+            </div>
             <div class="settings__item settings__item--switch">
-                <label class="settings__item-heading" for="cm_analysis_enabled">新しい CM 解析を有効にする</label>
+                <label class="settings__item-heading" for="cm_analysis_enabled">KonomiTV-BS4K で CM 解析する</label>
                 <label class="settings__item-label" for="cm_analysis_enabled">
                     無効にしても、既存の chapter 読み込みや保存済みの CM 区間・ロゴ・履歴は維持されます。<br>
                     実行中の解析は停止しません。
                 </label>
                 <v-switch id="cm_analysis_enabled" class="settings__item-switch" color="primary" hide-details
-                    v-model="settings.enabled" />
+                    v-model="settings.enabled" :disabled="is_edit_disabled" />
             </div>
             <div class="settings__item">
                 <div class="settings__item-heading">共有ロゴフォルダ</div>
@@ -29,7 +32,7 @@
                     利用不能な場合に内部フォルダへ自動切り替えは行いません。
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
-                    placeholder="/absolute/host/path" v-model="logo_directory" />
+                    placeholder="/absolute/host/path" v-model="logo_directory" :disabled="is_edit_disabled" />
             </div>
             <div class="settings__item">
                 <div class="settings__item-heading">CM 解析の除外ディレクトリ</div>
@@ -37,9 +40,9 @@
                     1 行に 1 つ、ホスト側の絶対パスを入力します。通常の録画登録・再生・索引・サムネイルと既存 chapter の読込は除外されません。
                 </div>
                 <v-textarea class="settings__item-form" color="primary" variant="outlined" rows="5" hide-details
-                    placeholder="/recordings/without-cm-analysis" v-model="excluded_directories_text" />
+                    placeholder="/recordings/without-cm-analysis" v-model="excluded_directories_text" :disabled="is_edit_disabled" />
             </div>
-            <v-btn class="settings__save-button mt-5" variant="flat" :loading="is_saving" @click="saveSettings()">
+            <v-btn class="settings__save-button mt-5" variant="flat" :loading="is_saving" :disabled="is_edit_disabled" @click="saveSettings()">
                 <Icon icon="fluent:save-20-filled" class="mr-2" width="22px" />CM 解析設定を更新
             </v-btn>
             <v-divider class="mt-7"></v-divider>
@@ -62,6 +65,7 @@ import { onMounted, ref } from 'vue';
 
 import Message from '@/message';
 import CMAnalysis, { ICMAnalysisSettings } from '@/services/CMAnalysis';
+import useUserStore from '@/stores/UserStore';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
@@ -70,6 +74,14 @@ const logo_directory = ref('');
 const excluded_directories_text = ref('');
 const is_loading = ref(true);
 const is_saving = ref(false);
+// 管理者権限が確認できるまでは編集操作を無効化する（閲覧 route / navigation は維持）
+const is_edit_disabled = ref(true);
+const user_store = useUserStore();
+user_store.fetchUser().then((user) => {
+    if (user && user.is_admin) {
+        is_edit_disabled.value = false;
+    }
+});
 
 onMounted(async () => {
     const fetched_settings = await CMAnalysis.fetchSettings();
@@ -82,6 +94,9 @@ onMounted(async () => {
 });
 
 async function saveSettings(): Promise<void> {
+    if (is_edit_disabled.value) {
+        return;
+    }
     is_saving.value = true;
     const updated_settings: ICMAnalysisSettings = {
         enabled: settings.value.enabled,

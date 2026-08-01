@@ -11,13 +11,13 @@ from typing import ClassVar
 from PIL import Image
 
 from app import logging
+from app.config import Config
 from app.constants import DATA_DIR, JST
-from app.metadata.CMAnalysisPaths import ResolveCMHostPath
 from app.models.CMAnalysis import (
-    CMAnalysisSettings,
     CMLogo,
     CMLogoFileFormat,
 )
+from app.utils.HostPath import ToHostPath
 
 
 _AVIUTL_LOGO_FILE_HEADER = struct.Struct('>28sI')
@@ -78,21 +78,10 @@ class CMLogoScanner:
         metadata = logo.metadata
         rgba_pixels: list[tuple[int, int, int, int]] = []
         for offset in range(0, len(logo.pixels), _AVIUTL_LOGO_PIXEL.size):
-            dp_y, y, dp_cb, cb, dp_cr, cr = _AVIUTL_LOGO_PIXEL.unpack_from(logo.pixels, offset)
+            dp_y, _y, dp_cb, _cb, dp_cr, _cr = _AVIUTL_LOGO_PIXEL.unpack_from(logo.pixels, offset)
             alpha = round(max(0, min(1000, max(dp_y, dp_cb, dp_cr))) * 255 / 1000)
-            # AviUtlのYC48値域をBT.601相当のプレビュー色へ変換する。
-            y8 = y * 255 / 4096
-            cb8 = cb * 255 / 4096
-            cr8 = cr * 255 / 4096
-            red = round(y8 + 1.402 * cr8)
-            green = round(y8 - 0.344136 * cb8 - 0.714136 * cr8)
-            blue = round(y8 + 1.772 * cb8)
-            rgba_pixels.append((
-                max(0, min(255, red)),
-                max(0, min(255, green)),
-                max(0, min(255, blue)),
-                alpha,
-            ))
+            # Amatsukaze 互換の表示にするため、不透明度(alpha)を保持したままマゼンタ色 (255, 0, 255) で描画
+            rgba_pixels.append((255, 0, 255, alpha))
 
         image = Image.new('RGBA', (metadata.logo_width, metadata.logo_height))
         image.putdata(rgba_pixels)
@@ -204,9 +193,14 @@ class CMLogoScanner:
         """現在の共有フォルダをDBへ同期し、外部削除はmissingとして保持する。"""
 
         async with cls._scan_lock:
-            settings, _ = await CMAnalysisSettings.get_or_create(id=1, defaults={'enabled': False})
-            configured_path = Path(settings.logo_directory) if settings.logo_directory else None
-            runtime_directory = ResolveCMHostPath(configured_path) if configured_path else DATA_DIR / 'cm-analysis/logos'
+            # Config 内部の logo_directory は実行時パス。DB の path 列はホスト表現で保持する。
+            configured_runtime = Config().cm_analysis.logo_directory
+            configured_host = ToHostPath(configured_runtime) if configured_runtime is not None else None
+            runtime_directory = (
+                Path(configured_runtime)
+                if configured_runtime is not None
+                else DATA_DIR / 'cm-analysis/logos'
+            )
             await asyncio.to_thread(runtime_directory.mkdir, parents=True, exist_ok=True)
 
             entries = await asyncio.to_thread(
@@ -214,7 +208,11 @@ class CMLogoScanner:
             )
             seen_paths: set[str] = set()
             for runtime_path in entries:
-                stored_path = str(configured_path / runtime_path.name) if configured_path else str(runtime_path)
+                stored_path = (
+                    str(configured_host / runtime_path.name)
+                    if configured_host is not None
+                    else str(runtime_path)
+                )
                 seen_paths.add(stored_path)
                 try:
                     stat = await asyncio.to_thread(runtime_path.stat)
@@ -256,7 +254,8 @@ class CMLogoScanner:
                     logging.warning(f'{runtime_path}: Unsupported or invalid CM logo file. Skipping...', exc_info=ex)
 
             # 自動削除は行わず、この共有フォルダに属していたファイルの外部削除だけを履歴へ反映する。
-            stored_directory = configured_path if configured_path else runtime_directory
+            # DB path はホスト表現なので、比較もホスト側ディレクトリで行う。
+            stored_directory = configured_host if configured_host is not None else runtime_directory
             existing_logos = await CMLogo.all()
             now = datetime.now(tz=JST)
             for logo in existing_logos:

@@ -78,7 +78,7 @@ def test_selection_drops_an_incompatible_logo_before_analysis(monkeypatch: pytes
 
     selection = asyncio.run(CMLogoSelector._selected(
         (logo_1440, logo_4k),  # type: ignore[arg-type]
-        SimpleNamespace(logo_directory=''),  # type: ignore[arg-type]
+        None,
         1440,
         1080,
     ))

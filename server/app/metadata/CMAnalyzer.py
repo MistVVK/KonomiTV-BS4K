@@ -9,13 +9,18 @@ import math
 import os
 import re
 import signal
+import struct
+import sys
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Literal, Protocol, cast
 
+import av
 from typing_extensions import TypedDict
+
+from app import logging
 
 
 CMAnalyzerStatus = Literal[
@@ -25,6 +30,13 @@ CMAnalyzerStatus = Literal[
     'interrupted',
 ]
 CMDecodeMode = Literal['Hardware', 'CPU']
+KonomiTVBS4KLogicalAudioRebuildPreference = Literal['PyAV', 'FFmpegAfterPreviousFailure']
+KonomiTVBS4KLogicalAudioRebuildStrategy = Literal[
+    'PyAV',
+    'FFmpegPrimaryAfterPreviousFailure',
+    'FFmpegFallbackAfterSignal',
+    'FFmpegFallbackAfterReportedFailure',
+]
 CMAnalysisStage = Literal[
     'PreparingMedia',
     'IndexingMedia',
@@ -64,7 +76,9 @@ class CMInputDescriptor:
     has_variable_video_format: bool = False
     has_variable_audio_stream: bool = False
     video_start_time_seconds: float | None = None
+    video_duration_seconds: float | None = None
     audio_start_time_seconds: float | None = None
+    audio_stream_id: int | None = None
 
     def toJSON(self) -> dict[str, object]:
         """解析 key に利用できる決定的な JSON 値へ変換する。"""
@@ -87,7 +101,9 @@ class CMInputDescriptor:
             'has_variable_video_format': self.has_variable_video_format,
             'has_variable_audio_stream': self.has_variable_audio_stream,
             'video_start_time_seconds': self.video_start_time_seconds,
+            'video_duration_seconds': self.video_duration_seconds,
             'audio_start_time_seconds': self.audio_start_time_seconds,
+            'audio_stream_id': self.audio_stream_id,
         }
 
 
@@ -105,6 +121,7 @@ class CMAnalyzerRequest:
     has_variable_video_format: bool = False
     input_descriptor: CMInputDescriptor | None = None
     stage_callback: CMAnalysisStageCallback | None = None
+    konomitv_bs4k_logical_audio_rebuild_preference: KonomiTVBS4KLogicalAudioRebuildPreference = 'PyAV'
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +141,7 @@ class CMAnalyzerResult:
     descriptor: CMInputDescriptor | None = None
     decode_mode: CMDecodeMode | None = None
     total_frames: int | None = None
+    konomitv_bs4k_logical_audio_rebuild_strategy: KonomiTVBS4KLogicalAudioRebuildStrategy | None = None
 
     def toJSON(self) -> dict[str, object]:
         """ログ・テスト用の JSON 互換値を返す。"""
@@ -142,6 +160,9 @@ class CMAnalyzerResult:
             'descriptor': self.descriptor.toJSON() if self.descriptor is not None else None,
             'decode_mode': self.decode_mode,
             'total_frames': self.total_frames,
+            'konomitv_bs4k_logical_audio_rebuild_strategy': (
+                self.konomitv_bs4k_logical_audio_rebuild_strategy
+            ),
         }
 
 
@@ -177,10 +198,20 @@ class _ProcessResult:
     return_code: int
     output: str
     error_output: str = ''
+    konomitv_bs4k_logical_audio_rebuild_strategy: KonomiTVBS4KLogicalAudioRebuildStrategy | None = None
 
     @property
     def diagnostic(self) -> str:
         return '\n'.join(part for part in (self.output, self.error_output) if part)[-4000:]
+
+
+@dataclass(frozen=True, slots=True)
+class _LogicalAudioRebuildReport:
+    """隔離rebuilderがstdoutへ返した段階付き統計。"""
+
+    stage: str
+    statistics: dict[str, int]
+    error: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,8 +247,8 @@ class GenericCMAnalyzer:
     """全登録メディアを FFMS2 の共有媒体・索引で解析する CM 解析器。"""
 
     ANALYSIS_FPS = Fraction(30_000, 1001)
-    ANALYZER_VERSION = 'cm-8'
-    NORMALIZATION_POLICY_VERSION = 4
+    ANALYZER_VERSION = 'cm-9'
+    NORMALIZATION_POLICY_VERSION = 6
     _LOGO_FRAME_MAX_WORKERS = 15
     _LOGO_FRAME_MIN_FRAMES_PER_WORKER = 600
     _TRIM_PATTERN = re.compile(r'\btrim\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)', re.IGNORECASE)
@@ -256,6 +287,7 @@ class GenericCMAnalyzer:
         self.runtime_manifest_path = runtime_manifest_path or runtime_directory / 'Runtime-Manifest.json'
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
+        self.logical_audio_rebuilder_path = Path(__file__).with_name('CMLogicalAudioRebuilder.py')
 
     @property
     def runtimeFingerprint(self) -> dict[str, object]:
@@ -263,14 +295,24 @@ class GenericCMAnalyzer:
 
         manifest_sha256, manifest_error = self._runtimeManifestFingerprint()
         media_preparer_sha256, media_preparer_error = self._fileFingerprint(self.ffmpeg_path)
+        audio_rebuilder_sha256, audio_rebuilder_error = self._fileFingerprint(
+            self.logical_audio_rebuilder_path,
+        )
         return {
             'analyzer_version': self.ANALYZER_VERSION,
             'normalization_policy_version': self.NORMALIZATION_POLICY_VERSION,
-            'analysis_fps': str(self.ANALYSIS_FPS),
+            'analysis_fps_policy': f'source-with-{self.ANALYSIS_FPS}-fallback',
             'native_runtime_manifest_sha256': manifest_sha256,
             'native_runtime_manifest_error': manifest_error,
             'media_preparer_sha256': media_preparer_sha256,
             'media_preparer_error': media_preparer_error,
+            'logical_audio_rebuilder_sha256': audio_rebuilder_sha256,
+            'logical_audio_rebuilder_error': audio_rebuilder_error,
+            'pyav_version': av.__version__,
+            'ffmpeg_library_versions': {
+                name: '.'.join(str(part) for part in version)
+                for name, version in sorted(av.library_versions.items())
+            },
         }
 
     async def analyze(self, request: CMAnalyzerRequest) -> CMAnalyzerResult:
@@ -287,6 +329,7 @@ class GenericCMAnalyzer:
                 self.runtime_manifest_path,
                 self.ffmpeg_path,
                 self.ffprobe_path,
+                self.logical_audio_rebuilder_path,
             )
             if path.is_file() is False
         ]
@@ -336,17 +379,6 @@ class GenericCMAnalyzer:
                 error_code='VariableVideoFormat',
                 descriptor=descriptor,
             )
-        # 単一 stream を -map する音声正規化では、主音声 PID/stream が途中で交代した
-        # 録画の一部を無音のまま成功扱いにしてしまう。連結実装までは安定した非対応にする。
-        if descriptor.has_variable_audio_stream:
-            return CMAnalyzerResult(
-                status='unsupported',
-                chapter_file=None,
-                analyzer_version=self.ANALYZER_VERSION,
-                error_code='VariableAudioStream',
-                descriptor=descriptor,
-            )
-
         if request.work_directory.is_dir() is False:
             return CMAnalyzerResult(
                 status='analysis_failed',
@@ -387,6 +419,9 @@ class GenericCMAnalyzer:
                 ),
                 error_message=prepare_process.diagnostic or 'FFmpeg did not produce prepared media.',
                 descriptor=descriptor,
+                konomitv_bs4k_logical_audio_rebuild_strategy=(
+                    prepare_process.konomitv_bs4k_logical_audio_rebuild_strategy
+                ),
             )
 
         await self._emitStage(request, 'IndexingMedia', 0.25)
@@ -426,6 +461,9 @@ class GenericCMAnalyzer:
                 error_code=storage_error or ('DecoderUnavailable' if decoder_unavailable else 'MediaIndexFailed'),
                 error_message=failed_index.diagnostic or 'FFMS2 did not produce an index.',
                 descriptor=descriptor,
+                konomitv_bs4k_logical_audio_rebuild_strategy=(
+                    prepare_process.konomitv_bs4k_logical_audio_rebuild_strategy
+                ),
             )
         try:
             prepared_video_index, prepared_audio_index = await asyncio.gather(
@@ -441,6 +479,9 @@ class GenericCMAnalyzer:
                 error_code=storage_error or 'PreparedMediaInvalid',
                 error_message=str(ex),
                 descriptor=descriptor,
+                konomitv_bs4k_logical_audio_rebuild_strategy=(
+                    prepare_process.konomitv_bs4k_logical_audio_rebuild_strategy
+                ),
             )
         prepared = _PreparedMedia(
             media_path=prepared_media_path,
@@ -477,6 +518,15 @@ class GenericCMAnalyzer:
                     descriptor=descriptor,
                     decode_mode=decode_mode,
                 )
+            # media準備で実際に採用した論理音声再構築方式は、chapter/logo解析の
+            # 成否にかかわらず呼び出し元へ返す。同一入力の再解析時にnative crash
+            # 済みのPyAV経路を避けるため、最終結果へこの実行時情報を引き継ぐ。
+            result = replace(
+                result,
+                konomitv_bs4k_logical_audio_rebuild_strategy=(
+                    prepare_process.konomitv_bs4k_logical_audio_rebuild_strategy
+                ),
+            )
             if decode_mode == 'Hardware' and self._isHardwareDecodeFailure(result):
                 hardware_failure = result
                 await self._emitStage(request, 'HardwareFallback', None)
@@ -513,6 +563,12 @@ class GenericCMAnalyzer:
         if not isinstance(raw_streams, list):
             raise ValueError('FFprobe did not return a stream list.')
         streams = [stream for stream in raw_streams if isinstance(stream, dict)]
+        format_payload = payload.get('format') if isinstance(payload.get('format'), dict) else {}
+        format_name = (
+            str(format_payload['format_name'])
+            if format_payload.get('format_name') is not None
+            else None
+        )
         videos = [
             stream for stream in streams
             if stream.get('codec_type') == 'video' and self._isAttachedPicture(stream) is False
@@ -529,13 +585,20 @@ class GenericCMAnalyzer:
             ),
             None,
         )
+        if (
+            self._isMPEGTS(format_name)
+            and request.service_id is not None
+            and matching_program is None
+        ):
+            raise CMInputUnsupportedError('ProgramUnavailable')
         selected_program: dict[str, object] | None = None
         if matching_program is not None:
             indexes = self._programStreamIndexes(matching_program)
             program_videos = [stream for stream in videos if self._streamIndex(stream) in indexes]
-            if program_videos:
-                videos = program_videos
-                selected_program = matching_program
+            if not program_videos:
+                raise CMInputUnsupportedError('ProgramVideoStreamUnavailable')
+            videos = program_videos
+            selected_program = matching_program
         video = max(videos, key=self._videoSelectionKey)
         video_index = self._streamIndex(video)
 
@@ -548,11 +611,12 @@ class GenericCMAnalyzer:
         if selected_program is not None:
             indexes = self._programStreamIndexes(selected_program)
             audios = [stream for stream in audios if self._streamIndex(stream) in indexes]
-        audio = max(audios, key=self._audioSelectionKey) if audios else None
+        # 論理音声0はdefault属性や全編durationではなく、選択program/container内の
+        # 最初の音声track。TSの後続PMT/PID交代はprepare時のmerge_pmt_versionsで追う。
+        audio = min(audios, key=self._streamIndex) if audios else None
         if audio is None:
             raise CMInputUnsupportedError('AudioStreamUnavailable')
 
-        format_payload = payload.get('format') if isinstance(payload.get('format'), dict) else {}
         duration = self._parsePositiveFloat(format_payload.get('duration'))
         if duration is None:
             duration = self._parsePositiveFloat(video.get('duration'))
@@ -566,6 +630,7 @@ class GenericCMAnalyzer:
         if width <= 0 or height <= 0:
             raise CMInputUnsupportedError('VideoGeometryUnavailable')
         pixel_format = str(video['pix_fmt']) if video.get('pix_fmt') is not None else None
+        video_duration = self._parsePositiveFloat(video.get('duration'))
         bit_depth = self._parseInteger(video.get('bits_per_raw_sample'))
         if bit_depth is None:
             bit_depth = self._inferBitDepth(pixel_format)
@@ -574,9 +639,7 @@ class GenericCMAnalyzer:
             if selected_program is not None else None
         )
         return CMInputDescriptor(
-            format_name=(
-                str(format_payload['format_name']) if format_payload.get('format_name') is not None else None
-            ),
+            format_name=format_name,
             video_stream_index=video_index,
             audio_stream_index=self._streamIndex(audio) if audio is not None else None,
             video_codec_name=str(video['codec_name']) if video.get('codec_name') is not None else None,
@@ -595,7 +658,9 @@ class GenericCMAnalyzer:
             service_id=request.service_id,
             has_variable_video_format=request.has_variable_video_format,
             video_start_time_seconds=self._streamStartSeconds(video),
+            video_duration_seconds=video_duration,
             audio_start_time_seconds=self._streamStartSeconds(audio),
+            audio_stream_id=self._streamID(audio),
         )
 
     async def _analyzeOnce(
@@ -624,11 +689,16 @@ class GenericCMAnalyzer:
             ),
             encoding='utf-8',
         )
+        analysis_frame_rate = self._analysisFrameRate(descriptor)
         chapter_process = await self._runProcess((
             str(self.chapter_executable_path),
             '-v', str(chapter_script),
             '-o', str(chapter_output),
-            '-s', '10',
+            '-s', (
+                '20'
+                if math.floor(float(analysis_frame_rate) + 0.5) >= 60
+                else '10'
+            ),
         ), environment)
         # chapter_exe は AviSynth の読み込み失敗時にも 0 を返し、不正な出力を
         # 作ることがある。出力中の明示的な AviSynth エラーも工程失敗として扱う。
@@ -686,6 +756,7 @@ class GenericCMAnalyzer:
                 work_directory,
                 environment,
                 logo_worker_count,
+                analysis_frame_rate,
             )
             if logo_process.return_code != 0:
                 return self._failure(
@@ -745,7 +816,7 @@ class GenericCMAnalyzer:
             sections = self._parseCMSections(
                 trim_text,
                 total_frames,
-                self.ANALYSIS_FPS,
+                analysis_frame_rate,
                 timeline_duration_seconds=timeline_duration_seconds,
             )
         except OSError as ex:
@@ -770,7 +841,7 @@ class GenericCMAnalyzer:
             chapter_file=None,
             sections=tuple(sections),
             matched_logo=logo_output.matched_logo,
-            analysis_fps=str(self.ANALYSIS_FPS),
+            analysis_fps=str(analysis_frame_rate),
             library='FFMS2-FFmpeg8-LGPL',
             analyzer_version=self.ANALYZER_VERSION,
             warnings=tuple(warnings),
@@ -786,6 +857,7 @@ class GenericCMAnalyzer:
         work_directory: Path,
         environment: dict[str, str],
         worker_count: int,
+        analysis_frame_rate: Fraction,
     ) -> tuple[_ProcessResult, _LogoFrameOutput]:
         analysis_output = work_directory / 'logoframe-analysis.txt'
         command = [
@@ -811,6 +883,11 @@ class GenericCMAnalyzer:
             section = parser['logodata']
             frame_count = int(section['FrameTotal'])
             if int(section.get('LogoTotalN', '0')) <= 0:
+                return process, _LogoFrameOutput(None, None, frame_count, ('LogoNotMatched',))
+            logo_frame_count = int(section.get('FrameSum_N1', '0'))
+            duration_seconds = frame_count / float(analysis_frame_rate)
+            minimum_ratio = 0.03 if duration_seconds <= 7 * 60 else 0.10
+            if frame_count <= 0 or logo_frame_count / frame_count < minimum_ratio:
                 return process, _LogoFrameOutput(None, None, frame_count, ('LogoNotMatched',))
             matched_logo = Path(section['LogoName_N1']).name
             output_name = section.get('oaFileName_N1')
@@ -893,8 +970,9 @@ class GenericCMAnalyzer:
         # logoframe には FFMS2 の native planar luma をそのまま渡す。
         # colorspace=Y* を強制すると swscale が limited/full range を誤変換し得るほか、
         # Y14 は AviSynth+ の明示的な出力色空間として扱えない。
+        analysis_frame_rate = self._analysisFrameRate(descriptor)
         video_common = (
-            f'fpsnum={self.ANALYSIS_FPS.numerator}, fpsden={self.ANALYSIS_FPS.denominator}, '
+            f'fpsnum={analysis_frame_rate.numerator}, fpsden={analysis_frame_rate.denominator}, '
             f'cache=true, cachefile="{cache}", threads={decoder_threads}'
             f'{hardware}'
         )
@@ -914,13 +992,6 @@ class GenericCMAnalyzer:
                 f'cache=true, cachefile="{audio_cache}", adjustdelay=-3, fill_gaps=1)'
             )
             lines.append('clip = AudioDubEx(video, audio)')
-            if (
-                descriptor.video_start_time_seconds is not None
-                and descriptor.audio_start_time_seconds is not None
-            ):
-                audio_delay = descriptor.audio_start_time_seconds - descriptor.video_start_time_seconds
-                if abs(audio_delay) >= (0.5 / 48_000):
-                    lines.append(f'clip = DelayAudio(clip, {audio_delay:.9f})')
         else:
             lines.append('clip = video')
         if descriptor.field_order in ('tt', 'tb', 'tff'):
@@ -948,7 +1019,7 @@ class GenericCMAnalyzer:
         audio_output_path: Path,
         environment: Mapping[str, str],
     ) -> _ProcessResult:
-        """選択映像と固定PCM音声を、一回の入力走査で別々の媒体へ正規化する。"""
+        """論理音声0をPTS再構築し、選択映像と別々の共有媒体へ正規化する。"""
 
         if descriptor.audio_stream_index is None:
             return _ProcessResult(-1, '', 'The selected audio stream is missing.')
@@ -956,17 +1027,128 @@ class GenericCMAnalyzer:
         raw_audio_partial_path = audio_output_path.with_name(
             f'{audio_output_path.stem}.normalized.partial.wav',
         )
-        filters = ['asetpts=PTS-STARTPTS', 'aresample=48000:async=1000:first_pts=0']
         temporary_paths = (
             video_partial_path,
             raw_audio_partial_path,
         )
         published_paths: list[Path] = []
+        logical_audio_strategy: KonomiTVBS4KLogicalAudioRebuildStrategy = 'PyAV'
         try:
+            if request.konomitv_bs4k_logical_audio_rebuild_preference == 'FFmpegAfterPreviousFailure':
+                # 同一入力で過去にMediaPreparationFailedまたはsignal fallbackを確認済みなら、
+                # 捕捉不能なPyAV native crashを再現させず、既に成功実績のある同一stream固定
+                # FFmpeg経路を主経路として使う。初回入力では従来どおりStreamReform準拠
+                # assemblerを優先するため、すべてのMPEG-TSを一律に切り替えることはない。
+                logical_audio_strategy = 'FFmpegPrimaryAfterPreviousFailure'
+                logging.warning(
+                    '[CMAnalyzer] AudioRebuildPrimary=FFmpeg; '
+                    'Reason=PreviousMediaPreparationFailure; '
+                    f'StreamMap=0:{descriptor.audio_stream_index}; '
+                    f'StreamID={descriptor.audio_stream_id}'
+                )
+                audio_process = await self._rebuildLogicalAudioWithFFmpeg(
+                    request,
+                    descriptor,
+                    raw_audio_partial_path,
+                    environment,
+                )
+                audio_validation_error = self._validatePreparedWAV(raw_audio_partial_path)
+                if audio_process.return_code != 0 or audio_validation_error is not None:
+                    audio_diagnostic = (
+                        audio_process.diagnostic
+                        if audio_process.return_code != 0
+                        else f'InvalidWAV: {audio_validation_error}'
+                    )
+                    self._removeFiles(temporary_paths)
+                    return _ProcessResult(
+                        audio_process.return_code or -1,
+                        '',
+                        (
+                            'AudioRebuildPrimary=FFmpeg failed after a previous media preparation '
+                            f'failure: {audio_diagnostic or "FFmpeg did not produce logical audio."}'
+                        ),
+                        logical_audio_strategy,
+                    )
+                logging.warning('[CMAnalyzer] AudioRebuildPrimary=FFmpeg completed.')
+            else:
+                audio_process = await self._rebuildLogicalAudio(
+                    request,
+                    descriptor,
+                    raw_audio_partial_path,
+                    environment,
+                )
+                audio_report = self._parseLogicalAudioRebuildReport(audio_process.output)
+                audio_validation_error = self._validatePreparedWAV(raw_audio_partial_path)
+                if audio_process.return_code != 0 or audio_validation_error is not None:
+                    primary_diagnostic = self._logicalAudioFailureDiagnostic(
+                        audio_process,
+                        audio_report,
+                        audio_validation_error,
+                    )
+                    if self._shouldFallbackLogicalAudio(
+                        audio_process,
+                        audio_report,
+                        audio_validation_error,
+                    ):
+                        # PyAV固有のSIGSEGV・decoder拒否・WAV書き込み失敗時だけ、
+                        # Amatsukazeと異なるFFmpegのasync resample/無音補完経路を使う。
+                        # mapはprobeで確定した同じstream indexに固定し、別audioIdxや
+                        # 最長trackへ切り替えて成功扱いすることはない。
+                        logical_audio_strategy = (
+                            'FFmpegFallbackAfterSignal'
+                            if audio_process.return_code < 0
+                            else 'FFmpegFallbackAfterReportedFailure'
+                        )
+                        self._removeFiles((raw_audio_partial_path,))
+                        logging.warning(
+                            '[CMAnalyzer] AudioRebuildFallback=FFmpeg; '
+                            f'StreamMap=0:{descriptor.audio_stream_index}; '
+                            f'StreamID={descriptor.audio_stream_id}; '
+                            f'PrimaryFailure={primary_diagnostic}'
+                        )
+                        fallback_process = await self._rebuildLogicalAudioWithFFmpeg(
+                            request,
+                            descriptor,
+                            raw_audio_partial_path,
+                            environment,
+                        )
+                        fallback_validation_error = self._validatePreparedWAV(raw_audio_partial_path)
+                        if fallback_process.return_code != 0 or fallback_validation_error is not None:
+                            fallback_diagnostic = (
+                                fallback_process.diagnostic
+                                if fallback_process.return_code != 0
+                                else f'InvalidWAV: {fallback_validation_error}'
+                            )
+                            self._removeFiles(temporary_paths)
+                            return _ProcessResult(
+                                fallback_process.return_code or audio_process.return_code or -1,
+                                '',
+                                (
+                                    f'{primary_diagnostic}; AudioRebuildFallback=FFmpeg failed: '
+                                    f'{fallback_diagnostic or "FFmpeg did not produce logical audio."}'
+                                ),
+                                logical_audio_strategy,
+                            )
+                        logging.warning('[CMAnalyzer] AudioRebuildFallback=FFmpeg completed.')
+                    else:
+                        self._removeFiles(temporary_paths)
+                        return _ProcessResult(
+                            audio_process.return_code or -1,
+                            '',
+                            primary_diagnostic,
+                            logical_audio_strategy,
+                        )
+
+            input_options = (
+                ('-merge_pmt_versions', '1')
+                if self._isMPEGTS(descriptor.format_name)
+                else ()
+            )
             process = await self._runProcess((
                 str(self.ffmpeg_path),
                 '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
                 '-fflags', '+genpts+discardcorrupt',
+                *input_options,
                 '-i', str(request.recorded_file_path),
                 # video-only Matroska: chapterとlogoがこの同じ媒体・indexを読む。
                 '-map', f'0:{descriptor.video_stream_index}',
@@ -975,27 +1157,20 @@ class GenericCMAnalyzer:
                 '-map_metadata', '-1', '-map_chapters', '-1',
                 '-f', 'matroska',
                 str(video_partial_path),
-                # 独立WAV muxerは、同一stream内の2ch/5.1ch切替でfilter graphが
-                # 再初期化されても、正規化済みsampleを順番通り保持する。
-                '-map', f'0:{descriptor.audio_stream_index}',
-                '-vn', '-sn', '-dn',
-                '-filter:a', ','.join(filters),
-                '-ac', '1', '-ar', '48000', '-sample_fmt', 's16',
-                '-c:a', 'pcm_s16le',
-                '-map_metadata', '-1', '-map_chapters', '-1',
-                '-rf64', 'auto',
-                '-f', 'wav',
-                str(raw_audio_partial_path),
             ), environment)
             if process.return_code != 0:
                 self._removeFiles(temporary_paths)
-                return process
+                return replace(
+                    process,
+                    konomitv_bs4k_logical_audio_rebuild_strategy=logical_audio_strategy,
+                )
             if video_partial_path.is_file() is False or raw_audio_partial_path.is_file() is False:
                 self._removeFiles(temporary_paths)
                 return _ProcessResult(
                     -1,
                     process.output,
                     'FFmpeg did not produce both prepared video and audio.',
+                    logical_audio_strategy,
                 )
 
             # work directoryはjob専用でconsumerはこの関数の完了後にだけ起動する。
@@ -1005,13 +1180,297 @@ class GenericCMAnalyzer:
             os.replace(raw_audio_partial_path, audio_output_path)
             published_paths.append(audio_output_path)
             self._removeFiles(temporary_paths)
-            return process
+            return replace(
+                process,
+                konomitv_bs4k_logical_audio_rebuild_strategy=logical_audio_strategy,
+            )
         except asyncio.CancelledError:
             self._removeFiles((*temporary_paths, *published_paths))
             raise
         except OSError as ex:
             self._removeFiles((*temporary_paths, *published_paths))
-            return _ProcessResult(-1, '', str(ex))
+            return _ProcessResult(-1, '', str(ex), logical_audio_strategy)
+
+    async def _rebuildLogicalAudio(
+        self,
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        """隔離subprocessで論理音声0のPTS付きPCMを構築する。"""
+
+        if descriptor.audio_stream_index is None:
+            return _ProcessResult(-1, '', 'The selected audio stream is missing.')
+        command = [
+            sys.executable,
+            '-m', 'app.metadata.CMLogicalAudioRebuilder',
+            '--input', str(request.recorded_file_path),
+            '--output', str(output_path),
+            '--stream-index', str(descriptor.audio_stream_index),
+            '--video-start-time', str(descriptor.video_start_time_seconds or 0.0),
+            '--video-duration', str(
+                descriptor.video_duration_seconds or descriptor.duration_seconds
+            ),
+        ]
+        if descriptor.format_name is not None:
+            command.extend(('--format-name', descriptor.format_name))
+        if descriptor.audio_stream_id is not None:
+            command.extend(('--stream-id', str(descriptor.audio_stream_id)))
+        process = await self._runProcess(tuple(command), environment)
+        report = self._parseLogicalAudioRebuildReport(process.output)
+        if report is not None:
+            residual_statistics = {
+                name: value
+                for name, value in report.statistics.items()
+                if name in ('decode_errors', 'demux_errors', 'skipped_frames')
+                and value > 0
+            }
+            if residual_statistics:
+                logging.warning(
+                    '[CMAnalyzer] Logical audio rebuild residual statistics: '
+                    f'{json.dumps(residual_statistics, separators=(",", ":"), sort_keys=True)}'
+                )
+        if process.return_code < 0:
+            signal_number = -process.return_code
+            signal_diagnostic = f'Logical audio rebuild killed by signal {signal_number}.'
+            if process.error_output:
+                signal_diagnostic = f'{signal_diagnostic} {process.error_output}'
+            return _ProcessResult(process.return_code, process.output, signal_diagnostic)
+        if process.return_code != 0 and report is not None:
+            report_error = report.error or 'No detailed error was reported.'
+            return _ProcessResult(
+                process.return_code,
+                process.output,
+                (
+                    f'Logical audio rebuild failed at {report.stage} '
+                    f'(exit code {process.return_code}): {report_error}'
+                ),
+            )
+        return process
+
+    async def _rebuildLogicalAudioWithFFmpeg(
+        self,
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        """同じ論理streamだけをFFmpeg CLIで固定長PCM WAVへ変換する。
+
+        Args:
+            request: 録画入力とjob作業領域。
+            descriptor: probeで確定済みの論理音声0と映像時間軸。
+            output_path: 未公開のWAV出力先。
+            environment: media処理subprocess用環境変数。
+
+        Returns:
+            FFmpeg CLIの終了状態と診断。
+        """
+
+        if descriptor.audio_stream_index is None:
+            return _ProcessResult(-1, '', 'The selected audio stream is missing.')
+        video_start_time = descriptor.video_start_time_seconds or 0.0
+        video_duration = descriptor.video_duration_seconds or descriptor.duration_seconds
+        start_sample = round(video_start_time * 48_000)
+        duration_samples = max(1, math.ceil(video_duration * 48_000))
+        end_sample = start_sample + duration_samples
+        input_options = (
+            ('-merge_pmt_versions', '1')
+            if self._isMPEGTS(descriptor.format_name)
+            else ()
+        )
+        # 前半のaresample asyncは破損packetによるtimestamp gapをPCM時間軸へ反映する。
+        # 後半のapad/atrimはStreamReformにはない、fallback限定の固定長WAV契約。
+        audio_filter = (
+            f'aresample=48000:async=1:first_pts={start_sample},'
+            f'atrim=start_pts={start_sample}:end_pts={end_sample},'
+            'asetpts=PTS-STARTPTS,'
+            'aformat=sample_fmts=s16:sample_rates=48000:channel_layouts=stereo,'
+            f'apad=whole_len={duration_samples},'
+            f'atrim=end_sample={duration_samples}'
+        )
+        return await self._runProcess((
+            str(self.ffmpeg_path),
+            '-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
+            '-fflags', '+genpts+discardcorrupt',
+            '-err_detect', 'ignore_err',
+            *input_options,
+            '-i', str(request.recorded_file_path),
+            '-map', f'0:{descriptor.audio_stream_index}',
+            '-vn', '-sn', '-dn',
+            '-af', audio_filter,
+            '-ar', '48000', '-ac', '2',
+            '-c:a', 'pcm_s16le',
+            '-map_metadata', '-1', '-map_chapters', '-1',
+            '-rf64', 'auto',
+            '-f', 'wav',
+            str(output_path),
+        ), environment)
+
+    @staticmethod
+    def _parseLogicalAudioRebuildReport(output: str) -> _LogicalAudioRebuildReport | None:
+        """rebuilder stdoutの1行JSONを検証して内部表現へ変換する。
+
+        Args:
+            output: rebuilderのstdout。
+
+        Returns:
+            stage・統計・errorが揃ったreport。非JSONや旧形式ならNone。
+        """
+
+        try:
+            payload = json.loads(output)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        stage = payload.get('stage')
+        raw_statistics = payload.get('statistics')
+        error = payload.get('error')
+        if not isinstance(stage, str) or not isinstance(raw_statistics, dict):
+            return None
+        if error is not None and not isinstance(error, str):
+            return None
+        statistics = {
+            str(name): value
+            for name, value in raw_statistics.items()
+            if isinstance(name, str) and isinstance(value, int) and isinstance(value, bool) is False
+        }
+        return _LogicalAudioRebuildReport(
+            stage=stage,
+            statistics=statistics,
+            error=error,
+        )
+
+    @staticmethod
+    def _logicalAudioFailureDiagnostic(
+        process: _ProcessResult,
+        report: _LogicalAudioRebuildReport | None,
+        validation_error: str | None,
+    ) -> str:
+        """親だけが分かるsignal・終了段階・WAV不正を一つの英語診断にする。
+
+        Args:
+            process: rebuilder subprocessの終了状態。
+            report: parseできた子の段階付きreport。
+            validation_error: WAV検証エラー。正常時はNone。
+
+        Returns:
+            MediaPreparationFailedへ載せる英語診断。
+        """
+
+        if process.return_code < 0:
+            return process.error_output or f'Logical audio rebuild killed by signal {-process.return_code}.'
+        if process.return_code != 0 and report is not None:
+            return (
+                f'Logical audio rebuild failed at {report.stage} '
+                f'(exit code {process.return_code}): '
+                f'{report.error or "No detailed error was reported."}'
+            )
+        if process.return_code != 0:
+            return process.error_output or f'Logical audio rebuild exited with code {process.return_code}.'
+        return f'Logical audio rebuild produced an invalid WAV: {validation_error or "unknown error"}'
+
+    @staticmethod
+    def _shouldFallbackLogicalAudio(
+        process: _ProcessResult,
+        report: _LogicalAudioRebuildReport | None,
+        validation_error: str | None,
+    ) -> bool:
+        """設計で許可したdecode系失敗だけをFFmpeg fallback対象にする。
+
+        Args:
+            process: rebuilder subprocessの終了状態。
+            report: parseできた子の段階付きreport。
+            validation_error: WAV検証エラー。正常時はNone。
+
+        Returns:
+            同じstream indexをFFmpeg CLIで再構築してよい場合はTrue。
+        """
+
+        if process.return_code < 0 or process.return_code == 2:
+            return True
+        if report is not None and report.stage in ('Demux', 'Decode', 'Assemble', 'Write'):
+            return True
+        # 正常終了したのに空・破損WAVだった場合は子のWrite失敗相当として扱う。
+        return process.return_code == 0 and validation_error is not None
+
+    @staticmethod
+    def _validatePreparedWAV(path: Path) -> str | None:
+        """WAV containerとchapter_exe向けPCM形式・非空dataを検証する。
+
+        Args:
+            path: rebuilderまたはfallbackが生成した未公開WAV。
+
+        Returns:
+            正常時はNone。不正時は原因層を示す英語診断。
+        """
+
+        if path.is_file() is False:
+            return 'WAV file was not produced.'
+        try:
+            file_size = path.stat().st_size
+            if file_size < 44:
+                return 'WAV file is missing or shorter than its header.'
+            with path.open('rb') as wav_file:
+                header = wav_file.read(12)
+                if len(header) != 12 or header[:4] not in (b'RIFF', b'RF64') or header[8:] != b'WAVE':
+                    return 'WAV container header is invalid.'
+                is_rf64 = header[:4] == b'RF64'
+                rf64_data_size: int | None = None
+                format_fields: tuple[int, int, int, int] | None = None
+                data_size: int | None = None
+                data_offset: int | None = None
+                while wav_file.tell() + 8 <= file_size:
+                    chunk_header = wav_file.read(8)
+                    if len(chunk_header) != 8:
+                        break
+                    chunk_id = chunk_header[:4]
+                    chunk_size = struct.unpack('<I', chunk_header[4:])[0]
+                    chunk_data_offset = wav_file.tell()
+                    if chunk_id == b'ds64' and chunk_size >= 28:
+                        ds64 = wav_file.read(28)
+                        rf64_data_size = struct.unpack('<QQQI', ds64)[1]
+                    elif chunk_id == b'fmt ' and chunk_size >= 16:
+                        raw_format = wav_file.read(16)
+                        format_tag, channels, sample_rate, _, block_align, bits_per_sample = struct.unpack(
+                            '<HHIIHH',
+                            raw_format,
+                        )
+                        format_fields = (format_tag, channels, sample_rate, bits_per_sample)
+                        if block_align != 4:
+                            return f'WAV block alignment is {block_align}, expected 4.'
+                    elif chunk_id == b'data':
+                        data_offset = chunk_data_offset
+                        data_size = (
+                            rf64_data_size
+                            if is_rf64 and chunk_size == 0xFFFFFFFF
+                            else chunk_size
+                        )
+                        break
+                    next_chunk_offset = chunk_data_offset + chunk_size + (chunk_size % 2)
+                    if next_chunk_offset > file_size:
+                        return f'WAV chunk {chunk_id!r} exceeds the file size.'
+                    wav_file.seek(next_chunk_offset)
+        except OSError as ex:
+            return f'{type(ex).__name__}: {ex}'
+
+        if format_fields is None:
+            return 'WAV fmt chunk is missing.'
+        if format_fields != (1, 2, 48_000, 16):
+            return (
+                'WAV format is invalid: '
+                f'format={format_fields[0]}, channels={format_fields[1]}, '
+                f'sample_rate={format_fields[2]}, bits={format_fields[3]}.'
+            )
+        if data_size is None or data_offset is None or data_size <= 0:
+            return 'WAV data chunk is empty or missing.'
+        if data_size % 4 != 0:
+            return f'WAV data size {data_size} is not aligned to stereo s16le samples.'
+        if data_offset + data_size > file_size:
+            return 'WAV data chunk exceeds the file size.'
+        return None
 
     @staticmethod
     def _removeFiles(paths: tuple[Path, ...]) -> None:
@@ -1285,14 +1744,6 @@ class GenericCMAnalyzer:
             -cls._streamIndex(stream),
         )
 
-    @classmethod
-    def _audioSelectionKey(cls, stream: dict[str, object]) -> tuple[int, float, int]:
-        return (
-            cls._dispositionValue(stream, 'default'),
-            cls._parsePositiveFloat(stream.get('duration')) or 0.0,
-            -cls._streamIndex(stream),
-        )
-
     @staticmethod
     def _dispositionValue(stream: dict[str, object], key: str) -> int:
         disposition = stream.get('disposition')
@@ -1342,6 +1793,29 @@ class GenericCMAnalyzer:
             return None
         return float(start_pts * time_base)
 
+    @classmethod
+    def _streamID(cls, stream: dict[str, object]) -> int | None:
+        """FFprobeのdecimal/hex stream idを整数へ正規化する。"""
+
+        value = stream.get('id')
+        try:
+            if isinstance(value, str):
+                return int(value, 0)
+            if isinstance(value, int):
+                return value
+        except ValueError:
+            return None
+        return None
+
+    @staticmethod
+    def _isMPEGTS(format_name: str | None) -> bool:
+        """拡張子ではなくdemuxerのformat名でMPEG-TSを判定する。"""
+
+        return format_name is not None and 'mpegts' in {
+            item.strip().lower()
+            for item in format_name.split(',')
+        }
+
     @staticmethod
     def _parseFiniteFloat(value: object) -> float | None:
         try:
@@ -1365,6 +1839,15 @@ class GenericCMAnalyzer:
         target_width = max(16, math.floor(width * scale / 16) * 16)
         target_height = max(2, math.floor(height * scale / 2) * 2)
         return target_width, target_height
+
+    @classmethod
+    def _analysisFrameRate(cls, descriptor: CMInputDescriptor) -> Fraction:
+        """Amatsukaze同様にsourceのCFRを保ち、不明時だけ従来値へ戻す。"""
+
+        source_frame_rate = descriptor.source_frame_rate
+        if source_frame_rate is None or source_frame_rate <= 0 or source_frame_rate > 120:
+            return cls.ANALYSIS_FPS
+        return source_frame_rate
 
     @classmethod
     def _isHardwareDecodeFailure(cls, result: CMAnalyzerResult) -> bool:

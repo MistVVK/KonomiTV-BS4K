@@ -48,7 +48,7 @@ def test_required_bytes_include_pcm_variable_headroom_and_fixed_reserve() -> Non
 
     assert CMAnalysisWorkspace.calculateRequiredBytes(source_size, duration_seconds) == (
         source_size
-        + 345_624_000
+        + 691_248_000
         + 512 * 1024 * 1024
         + 2 * 1024 * 1024 * 1024
     )
@@ -422,13 +422,68 @@ def test_startup_cleanup_does_not_follow_workspace_symlink(
     assert sentinel.read_text() == 'keep'
 
 
+def test_legacy_workspace_cleanup_requires_exact_markers_and_unlocked_real_job(tmp_path: Path) -> None:
+    """旧marker完全一致だけを削除し、unknown marker・symlink・active lockを保持する。"""
+
+    legacy_root = tmp_path / '.konomitv-cm-analysis'
+    legacy_root.mkdir()
+    owner_uid = os.geteuid()
+    (legacy_root / CMAnalysisWorkspace.ROOT_MARKER_NAME).write_text(json.dumps({
+        'application': 'KonomiTV-CMAnalysisWorkspace',
+        'kind': 'root',
+        'layout_version': 1,
+        'owner_uid': owner_uid,
+    }))
+
+    def CreateLegacyJob(recorded_video_id: int, token_character: str, application: str) -> Path:
+        """旧layoutと指定application markerを持つjob fixtureを作る。"""
+
+        job = legacy_root / f'{recorded_video_id}-{token_character * 32}'
+        job.mkdir()
+        (job / CMAnalysisWorkspace.JOB_MARKER_NAME).write_text(json.dumps({
+            'application': application,
+            'kind': 'job',
+            'layout_version': 1,
+            'name': job.name,
+            'recorded_video_id': recorded_video_id,
+            'owner_uid': owner_uid,
+            'owner_pid': os.getpid(),
+        }))
+        (job / CMAnalysisWorkspace.LOCK_FILE_NAME).write_bytes(b'')
+        return job
+
+    removable = CreateLegacyJob(1, 'a', 'KonomiTV-CMAnalysisWorkspace')
+    unknown_marker = CreateLegacyJob(2, 'b', 'Unknown-CMAnalysisWorkspace')
+    active = CreateLegacyJob(3, 'c', 'KonomiTV-CMAnalysisWorkspace')
+    active_lock_fd = os.open(active / CMAnalysisWorkspace.LOCK_FILE_NAME, os.O_RDWR)
+    fcntl.flock(active_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    external = tmp_path / 'external'
+    external.mkdir()
+    sentinel = external / 'sentinel'
+    sentinel.write_text('keep')
+    workspace_symlink = legacy_root / f'4-{"d" * 32}'
+    workspace_symlink.symlink_to(external, target_is_directory=True)
+
+    try:
+        asyncio.run(CMAnalysisWorkspace.cleanupStaleInParents({tmp_path}))
+        assert removable.exists() is False
+        assert unknown_marker.is_dir() is True
+        assert active.is_dir() is True
+        assert workspace_symlink.is_symlink() is True
+        assert sentinel.read_text() == 'keep'
+    finally:
+        fcntl.flock(active_lock_fd, fcntl.LOCK_UN)
+        os.close(active_lock_fd)
+
+
 @pytest.mark.parametrize(
     ('path', 'expected'),
     [
         ('/recordings/.konomitv-bs4k-cm-analysis', True),
         ('/recordings/.konomitv-bs4k-cm-analysis/1-token/media.cmwork', True),
         ('/recordings/.konomitv-bs4k-cm-analysis-copy/media.mkv', False),
-        ('/recordings/.konomitv-cm-analysis/1-token/media.cmwork', False),
+        ('/recordings/.konomitv-cm-analysis/1-token/media.cmwork', True),
         ('/recordings/program.mkv', False),
     ],
 )

@@ -6,10 +6,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-from app.metadata.CMAnalysisPaths import ResolveCMHostPath
 from app.metadata.CMLogoScanner import CMLogoFileMetadata, CMLogoScanner
-from app.models.CMAnalysis import CMAnalysisSettings, CMLogo, CMLogoServiceAssignment
+from app.models.CMAnalysis import CMLogo, CMLogoServiceAssignment
 from app.models.RecordedVideo import RecordedVideo
+from app.utils.HostPath import ToRuntimePath
 
 
 CMLogoSelectionStatus = Literal['Selected', 'NoLogo', 'Missing', 'Ambiguous']
@@ -30,11 +30,20 @@ class CMLogoSelector:
     @staticmethod
     async def select(
         recorded_video: RecordedVideo,
-        settings: CMAnalysisSettings,
+        logo_directory: Path | None,
         *,
         resolved_video_size: tuple[int, int] | None = None,
     ) -> CMLogoSelection:
-        """明示割り当てを優先し、SID共有ロゴは全候補を内容照合に渡す。"""
+        """明示割り当てを優先し、SID共有ロゴは全候補を内容照合に渡す。
+
+        Args:
+            recorded_video: 解析対象の録画。
+            logo_directory: 共有ロゴフォルダの実行時パス。未設定時はロゴ path をそのまま使う。
+            resolved_video_size: 実測解像度。未指定時は録画メタの解像度を使う。
+
+        Returns:
+            選択結果。
+        """
 
         recorded_program = recorded_video.recorded_program
         channel = recorded_program.channel
@@ -72,7 +81,7 @@ class CMLogoSelector:
                     return CMLogoSelection(status='Missing')
                 return await CMLogoSelector._selected(
                     (assignment.logo,),
-                    settings,
+                    logo_directory,
                     video_width,
                     video_height,
                 )
@@ -82,7 +91,7 @@ class CMLogoSelector:
             return CMLogoSelection(status='Missing')
         return await CMLogoSelector._selected(
             tuple(logos),
-            settings,
+            logo_directory,
             video_width,
             video_height,
         )
@@ -90,14 +99,14 @@ class CMLogoSelector:
     @staticmethod
     async def _selected(
         logos: tuple[CMLogo, ...],
-        settings: CMAnalysisSettings,
+        logo_directory: Path | None,
         video_width: int | None,
         video_height: int | None,
     ) -> CMLogoSelection:
         """DB保存パスを実行時パスへ変換し、入力キャンバスと互換なロゴだけを返す。"""
 
         runtime_paths = tuple(
-            ResolveCMHostPath(Path(logo.path)) if settings.logo_directory else Path(logo.path)
+            ToRuntimePath(Path(logo.path)) if logo_directory is not None else Path(logo.path)
             for logo in logos
         )
         compatible: list[tuple[CMLogo, Path]] = []

@@ -3,6 +3,7 @@
 import asyncio
 import errno
 import json
+import struct
 from collections.abc import Mapping
 from dataclasses import replace
 from fractions import Fraction
@@ -13,10 +14,26 @@ import pytest
 
 from app.metadata.CMAnalyzer import (
     CMAnalyzerRequest,
+    CMInputDescriptor,
+    CMInputUnsupportedError,
     GenericCMAnalyzer,
-    _PreparedMedia,
     _ProcessResult,
 )
+
+
+def WriteValidWAV(path: Path, *, samples: int = 1) -> None:
+    """48kHz stereo s16leの最小テストWAVを生成する。"""
+
+    data_size = samples * 4
+    path.write_bytes(
+        b'RIFF'
+        + struct.pack('<I', 36 + data_size)
+        + b'WAVEfmt '
+        + struct.pack('<IHHIIHH', 16, 1, 2, 48_000, 48_000 * 4, 4, 16)
+        + b'data'
+        + struct.pack('<I', data_size)
+        + bytes(data_size)
+    )
 
 
 def CreateRuntime(tmp_path: Path) -> GenericCMAnalyzer:
@@ -39,7 +56,26 @@ def CreateRuntime(tmp_path: Path) -> GenericCMAnalyzer:
     ffprobe = tmp_path / 'ffprobe8.elf'
     ffmpeg.write_bytes(b'test')
     ffprobe.write_bytes(b'test')
-    return GenericCMAnalyzer(runtime_directory=runtime, ffmpeg_path=ffmpeg, ffprobe_path=ffprobe)
+    analyzer = GenericCMAnalyzer(runtime_directory=runtime, ffmpeg_path=ffmpeg, ffprobe_path=ffprobe)
+
+    async def RebuildLogicalAudio(
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        del request, descriptor, environment
+        WriteValidWAV(output_path)
+        return _ProcessResult(
+            0,
+            (
+                '{"error":null,"stage":"Completed","statistics":'
+                '{"decode_errors":0,"decoded_frames":1,"demux_errors":0,"skipped_frames":0}}'
+            ),
+        )
+
+    analyzer._rebuildLogicalAudio = RebuildLogicalAudio  # type: ignore[method-assign]
+    return analyzer
 
 
 def CreateRequest(
@@ -76,7 +112,7 @@ def ProbePayload(*, format_name: str = 'matroska,webm', codec: str = 'av1') -> d
                 'field_order': 'progressive',
                 'time_base': '1/1000',
                 'start_time': '1.500',
-                'avg_frame_rate': '24000/1001',
+                'avg_frame_rate': '30000/1001',
                 'disposition': {'default': 1},
             },
             {
@@ -92,12 +128,40 @@ def ProbePayload(*, format_name: str = 'matroska,webm', codec: str = 'av1') -> d
     }
 
 
+def LogicalAudioDescriptor(*, format_name: str = 'mpegts') -> CMInputDescriptor:
+    """論理音声前処理単体テスト用のprobe確定値を返す。"""
+
+    return CMInputDescriptor(
+        format_name=format_name,
+        video_stream_index=1,
+        audio_stream_index=2,
+        audio_stream_id=0x112,
+        video_codec_name='hevc',
+        pixel_format='yuv420p10le',
+        bit_depth=10,
+        width=1920,
+        height=1080,
+        field_order='progressive',
+        time_base=Fraction(1, 90_000),
+        source_frame_rate=Fraction(60_000, 1001),
+        duration_seconds=60.0,
+        video_start_time_seconds=9434.464589,
+        video_duration_seconds=59.95,
+        program_id=101,
+        service_id=101,
+    )
+
+
 def WriteFFmpegOutputs(command: tuple[str, ...]) -> None:
     """テスト用FFmpeg commandの明示された各outputを生成する。"""
 
     for index, argument in enumerate(command[:-2]):
         if argument == '-f' and command[index + 1] in ('matroska', 'wav'):
-            Path(command[index + 2]).write_bytes(b'prepared-output')
+            output_path = Path(command[index + 2])
+            if command[index + 1] == 'wav':
+                WriteValidWAV(output_path)
+            else:
+                output_path.write_bytes(b'prepared-output')
 
 
 def PreparedVideoPayload(payload: dict[str, object]) -> dict[str, object]:
@@ -143,6 +207,7 @@ def InstallSuccessfulProcesses(
                     '[logodata]',
                     'LogoTotalN=1',
                     'FrameTotal=1800',
+                    'FrameSum_N1=900',
                     'LogoName_N1=logo.lgd',
                     f'oaFileName_N1={result_path}',
                 )),
@@ -195,8 +260,38 @@ def test_descriptor_selects_sid_program_and_ignores_attached_picture(tmp_path: P
     assert descriptor.service_id == 101
 
 
-def test_descriptor_never_mixes_video_and_audio_from_different_programs(tmp_path: Path) -> None:
-    """SID番組に映像がなければ、実際に選んだ映像番組の音声を組み合わせる。"""
+def test_descriptor_selects_container_audio_zero_before_default_or_longest_track(tmp_path: Path) -> None:
+    analyzer = CreateRuntime(tmp_path)
+    payload = ProbePayload(format_name='matroska,webm')
+    streams = cast(list[dict[str, object]], payload['streams'])
+    streams[1].update({
+        'index': 1,
+        'id': '0x101',
+        'duration': '20',
+        'disposition': {'default': 0},
+    })
+    streams.append({
+        'index': 2,
+        'id': '0x102',
+        'codec_type': 'audio',
+        'codec_name': 'opus',
+        'duration': '60',
+        'disposition': {'default': 1},
+    })
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        del command, environment
+        return _ProcessResult(0, json.dumps(payload))
+
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    descriptor = asyncio.run(analyzer.resolveInputDescriptor(CreateRequest(tmp_path)))
+
+    assert descriptor.audio_stream_index == 1
+    assert descriptor.audio_stream_id == 0x101
+
+
+def test_descriptor_rejects_requested_program_without_video(tmp_path: Path) -> None:
+    """指定SIDに映像がなければ別番組を誤解析しない。"""
 
     analyzer = CreateRuntime(tmp_path)
     payload = {
@@ -217,27 +312,9 @@ def test_descriptor_never_mixes_video_and_audio_from_different_programs(tmp_path
         return _ProcessResult(0, json.dumps(payload))
 
     analyzer._runProcess = RunProcess  # type: ignore[method-assign]
-    descriptor = asyncio.run(analyzer.resolveInputDescriptor(CreateRequest(tmp_path, service_id=101)))
-
-    assert descriptor.video_stream_index == 3
-    assert descriptor.audio_stream_index == 4
-    assert descriptor.program_id == 202
-    script = analyzer._buildAviSynthScript(
-        descriptor,
-        _PreparedMedia(
-            media_path=tmp_path / 'prepared-media.cmwork',
-            index_path=tmp_path / 'prepared.ffindex',
-            video_stream_index=0,
-            audio_path=tmp_path / 'prepared-audio.wav',
-            audio_index_path=tmp_path / 'prepared-audio.ffindex',
-            audio_stream_index=0,
-        ),
-        None,
-        for_chapter=True,
-    )
-    assert 'FFVideoSource' in script
-    assert 'track=0' in script
-    assert 'FFAudioSource' in script
+    with pytest.raises(CMInputUnsupportedError) as error:
+        asyncio.run(analyzer.resolveInputDescriptor(CreateRequest(tmp_path, service_id=101)))
+    assert error.value.code == 'ProgramVideoStreamUnavailable'
 
 
 @pytest.mark.parametrize(
@@ -317,7 +394,7 @@ def test_variable_video_format_is_rejected_before_frames_can_be_silently_dropped
     assert all(command[0] != str(analyzer.chapter_executable_path) for command in commands)
 
 
-def test_variable_audio_stream_is_rejected_before_audio_can_be_silently_dropped(tmp_path: Path) -> None:
+def test_variable_audio_stream_uses_pts_logical_audio_rebuild(tmp_path: Path) -> None:
     analyzer = CreateRuntime(tmp_path)
     commands: list[tuple[str, ...]] = []
     InstallSuccessfulProcesses(analyzer, ProbePayload(), commands)
@@ -329,9 +406,9 @@ def test_variable_audio_stream_is_rejected_before_audio_can_be_silently_dropped(
 
     result = asyncio.run(analyzer.analyze(request))
 
-    assert result.status == 'unsupported'
-    assert result.error_code == 'VariableAudioStream'
-    assert all(command[0] != str(analyzer.ffmpeg_path) for command in commands)
+    assert result.status == 'completed'
+    assert result.error_code is None
+    assert any(command[0] == str(analyzer.ffmpeg_path) for command in commands)
 
 
 def test_preparation_separates_shared_cfr_video_and_chapter_pcm_without_codec_or_bs4k_branch(
@@ -339,6 +416,13 @@ def test_preparation_separates_shared_cfr_video_and_chapter_pcm_without_codec_or
 ) -> None:
     analyzer = CreateRuntime(tmp_path)
     descriptor_payload = ProbePayload(format_name='mpegts', codec='hevc')
+    descriptor_payload['programs'] = [{
+        'program_id': 101,
+        'streams': [
+            cast(list[dict[str, object]], descriptor_payload['streams'])[0],
+            cast(list[dict[str, object]], descriptor_payload['streams'])[1],
+        ],
+    }]
     commands: list[tuple[str, ...]] = []
     InstallSuccessfulProcesses(analyzer, descriptor_payload, commands)
     result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path, service_id=101)))
@@ -354,7 +438,7 @@ def test_preparation_separates_shared_cfr_video_and_chapter_pcm_without_codec_or
     assert 'prepared-audio.wav' in chapter_script
     assert 'prepared-audio.ffindex' in chapter_script
     assert 'clip = AudioDubEx(video, audio)' in chapter_script
-    assert 'clip = DelayAudio(clip, 0.100000000)' in chapter_script
+    assert 'DelayAudio(' not in chapter_script
     assert 'fpsnum=30000, fpsden=1001' in chapter_script
     assert 'ConvertBits(clip, 8)' in chapter_script
     assert 'ConvertToYV12(clip)' in chapter_script
@@ -368,19 +452,18 @@ def test_preparation_separates_shared_cfr_video_and_chapter_pcm_without_codec_or
         for index, argument in enumerate(prepare_command[:-1])
         if argument == '-map'
     ]
-    assert mapped_streams == ['0:0', '0:1']
+    assert mapped_streams == ['0:0']
     assert prepare_command[prepare_command.index('-c:v') + 1] == 'copy'
     assert [
         prepare_command[index + 1]
         for index, argument in enumerate(prepare_command[:-1])
         if argument == '-f'
-    ] == ['matroska', 'wav']
+    ] == ['matroska']
     video_output_index = prepare_command.index(str(tmp_path / 'work/prepared-media.cmwork.partial'))
     assert '-an' in prepare_command[:video_output_index]
-    assert prepare_command[prepare_command.index('-ac') + 1] == '1'
-    assert prepare_command[prepare_command.index('-ar') + 1] == '48000'
-    assert prepare_command[prepare_command.index('-c:a') + 1] == 'pcm_s16le'
-    assert prepare_command[prepare_command.index('-rf64') + 1] == 'auto'
+    assert prepare_command[prepare_command.index('-merge_pmt_versions') + 1] == '1'
+    assert '-ac' not in prepare_command
+    assert '-c:a' not in prepare_command
     index_commands = [command for command in commands if command[0] == str(analyzer.ffmsindex_path)]
     assert len(index_commands) == 2
     assert {command[-2] for command in index_commands} == {
@@ -396,6 +479,318 @@ def test_preparation_separates_shared_cfr_video_and_chapter_pcm_without_codec_or
     assert 'Amatsukaze' not in logo_free_script
 
 
+def test_logical_audio_rebuilder_command_carries_container_track_and_video_pts(
+    tmp_path: Path,
+) -> None:
+    analyzer = CreateRuntime(tmp_path)
+    descriptor = LogicalAudioDescriptor()
+    commands: list[tuple[str, ...]] = []
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        del environment
+        commands.append(command)
+        return _ProcessResult(0, '')
+
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    result = asyncio.run(GenericCMAnalyzer._rebuildLogicalAudio(
+        analyzer,
+        CreateRequest(tmp_path, service_id=101),
+        descriptor,
+        tmp_path / 'logical.wav',
+        {},
+    ))
+
+    assert result.return_code == 0
+    command = commands[0]
+    assert command[1:3] == ('-m', 'app.metadata.CMLogicalAudioRebuilder')
+    assert command[command.index('--format-name') + 1] == 'mpegts'
+    assert command[command.index('--stream-index') + 1] == '2'
+    assert command[command.index('--stream-id') + 1] == str(0x112)
+    assert command[command.index('--video-start-time') + 1] == '9434.464589'
+    assert command[command.index('--video-duration') + 1] == '59.95'
+
+
+def test_logical_audio_rebuilder_signal_is_normalized_by_the_parent(tmp_path: Path) -> None:
+    analyzer = CreateRuntime(tmp_path)
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        del command, environment
+        return _ProcessResult(-11, '', 'native decoder crashed')
+
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    result = asyncio.run(GenericCMAnalyzer._rebuildLogicalAudio(
+        analyzer,
+        CreateRequest(tmp_path),
+        LogicalAudioDescriptor(),
+        tmp_path / 'logical.wav',
+        {},
+    ))
+
+    assert result.return_code == -11
+    assert result.error_output == (
+        'Logical audio rebuild killed by signal 11. native decoder crashed'
+    )
+
+
+@pytest.mark.parametrize(
+    'primary_process',
+    [
+        _ProcessResult(-11, '', 'Logical audio rebuild killed by signal 11.'),
+        _ProcessResult(
+            2,
+            (
+                '{"error":"No decodable frame was found in logical audio stream 0.",'
+                '"stage":"Decode","statistics":{"decode_errors":4,"decoded_frames":0}}'
+            ),
+            'Logical audio rebuild failed at Decode (exit code 2).',
+        ),
+        _ProcessResult(
+            0,
+            (
+                '{"error":null,"stage":"Completed","statistics":'
+                '{"decode_errors":0,"decoded_frames":1}}'
+            ),
+        ),
+    ],
+)
+def test_signal_exit_2_and_empty_wav_use_strict_ffmpeg_fallback(
+    tmp_path: Path,
+    primary_process: _ProcessResult,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    analyzer = CreateRuntime(tmp_path)
+    request = CreateRequest(tmp_path)
+    descriptor = LogicalAudioDescriptor()
+    commands: list[tuple[str, ...]] = []
+    warning_messages: list[str] = []
+    monkeypatch.setattr('app.metadata.CMAnalyzer.logging.warning', warning_messages.append)
+
+    async def RebuildLogicalAudio(
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        del request, descriptor, output_path, environment
+        return primary_process
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        del environment
+        commands.append(command)
+        WriteFFmpegOutputs(command)
+        return _ProcessResult(0, '')
+
+    analyzer._rebuildLogicalAudio = RebuildLogicalAudio  # type: ignore[method-assign]
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    result = asyncio.run(GenericCMAnalyzer._prepareMedia(
+        analyzer,
+        request,
+        descriptor,
+        tmp_path / 'work/prepared-media.cmwork',
+        tmp_path / 'work/prepared-audio.wav',
+        {},
+    ))
+
+    assert result.return_code == 0
+    fallback_command = next(command for command in commands if '-f' in command and 'wav' in command)
+    assert [
+        fallback_command[index + 1]
+        for index, argument in enumerate(fallback_command[:-1])
+        if argument == '-map'
+    ] == ['0:2']
+    assert fallback_command[fallback_command.index('-merge_pmt_versions') + 1] == '1'
+    assert '-af' in fallback_command
+    assert any(
+        'AudioRebuildFallback=FFmpeg; StreamMap=0:2; StreamID=274;'
+        in message
+        for message in warning_messages
+    )
+    assert (tmp_path / 'work/prepared-media.cmwork').is_file()
+    assert GenericCMAnalyzer._validatePreparedWAV(
+        tmp_path / 'work/prepared-audio.wav',
+    ) is None
+    assert result.konomitv_bs4k_logical_audio_rebuild_strategy == (
+        'FFmpegFallbackAfterSignal'
+        if primary_process.return_code < 0
+        else 'FFmpegFallbackAfterReportedFailure'
+    )
+    assert list((tmp_path / 'work').glob('*.partial*')) == []
+
+
+def test_previous_failure_uses_ffmpeg_as_primary_without_retrying_pyav(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同一入力の失敗実績があれば、捕捉不能なPyAV native crashを再試行しない。"""
+
+    analyzer = CreateRuntime(tmp_path)
+    request = replace(
+        CreateRequest(tmp_path),
+        konomitv_bs4k_logical_audio_rebuild_preference='FFmpegAfterPreviousFailure',
+    )
+    commands: list[tuple[str, ...]] = []
+    warning_messages: list[str] = []
+    monkeypatch.setattr('app.metadata.CMAnalyzer.logging.warning', warning_messages.append)
+
+    async def RebuildLogicalAudio(
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        del request, descriptor, output_path, environment
+        raise AssertionError('PyAV logical audio rebuild must not run after the same input failed.')
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        del environment
+        commands.append(command)
+        WriteFFmpegOutputs(command)
+        return _ProcessResult(0, '')
+
+    analyzer._rebuildLogicalAudio = RebuildLogicalAudio  # type: ignore[method-assign]
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    result = asyncio.run(GenericCMAnalyzer._prepareMedia(
+        analyzer,
+        request,
+        LogicalAudioDescriptor(),
+        tmp_path / 'work/prepared-media.cmwork',
+        tmp_path / 'work/prepared-audio.wav',
+        {},
+    ))
+
+    assert result.return_code == 0
+    assert result.konomitv_bs4k_logical_audio_rebuild_strategy == 'FFmpegPrimaryAfterPreviousFailure'
+    audio_command = next(command for command in commands if '-f' in command and 'wav' in command)
+    assert audio_command[audio_command.index('-map') + 1] == '0:2'
+    assert any('AudioRebuildPrimary=FFmpeg; Reason=PreviousMediaPreparationFailure;' in message
+               for message in warning_messages)
+    assert all('app.metadata.CMLogicalAudioRebuilder' not in command for command in commands)
+
+
+def test_ffmpeg_fallback_failure_preserves_both_layers_and_cleans_partials(
+    tmp_path: Path,
+) -> None:
+    analyzer = CreateRuntime(tmp_path)
+    request = CreateRequest(tmp_path)
+    descriptor = LogicalAudioDescriptor()
+
+    async def RebuildLogicalAudio(
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        del request, descriptor, environment
+        output_path.write_bytes(b'partial primary output')
+        return _ProcessResult(
+            2,
+            (
+                '{"error":"No decodable frame was found in logical audio stream 0.",'
+                '"stage":"Decode","statistics":{"decode_errors":7,"decoded_frames":0}}'
+            ),
+        )
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        del environment
+        assert command[command.index('-map') + 1] == '0:2'
+        Path(command[-1]).write_bytes(b'partial fallback output')
+        return _ProcessResult(1, '', 'AAC decoder rejected the selected stream.')
+
+    analyzer._rebuildLogicalAudio = RebuildLogicalAudio  # type: ignore[method-assign]
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    result = asyncio.run(GenericCMAnalyzer._prepareMedia(
+        analyzer,
+        request,
+        descriptor,
+        tmp_path / 'work/prepared-media.cmwork',
+        tmp_path / 'work/prepared-audio.wav',
+        {},
+    ))
+
+    assert result.return_code == 1
+    assert (
+        'Logical audio rebuild failed at Decode (exit code 2): '
+        'No decodable frame was found in logical audio stream 0.'
+    ) in result.error_output
+    assert (
+        'AudioRebuildFallback=FFmpeg failed: AAC decoder rejected the selected stream.'
+    ) in result.error_output
+    assert (tmp_path / 'work/prepared-media.cmwork').exists() is False
+    assert (tmp_path / 'work/prepared-audio.wav').exists() is False
+    assert list((tmp_path / 'work').glob('*.partial*')) == []
+
+
+def test_stream_selection_failure_does_not_use_ffmpeg_fallback(tmp_path: Path) -> None:
+    analyzer = CreateRuntime(tmp_path)
+
+    async def RebuildLogicalAudio(
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        del request, descriptor, output_path, environment
+        return _ProcessResult(
+            1,
+            (
+                '{"error":"The selected logical audio stream is unavailable.",'
+                '"stage":"StreamSelection","statistics":{"decoded_frames":0}}'
+            ),
+        )
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        del command, environment
+        raise AssertionError('FFmpeg fallback must not run for stream selection failures.')
+
+    analyzer._rebuildLogicalAudio = RebuildLogicalAudio  # type: ignore[method-assign]
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    result = asyncio.run(GenericCMAnalyzer._prepareMedia(
+        analyzer,
+        CreateRequest(tmp_path),
+        LogicalAudioDescriptor(),
+        tmp_path / 'work/prepared-media.cmwork',
+        tmp_path / 'work/prepared-audio.wav',
+        {},
+    ))
+
+    assert result.return_code == 1
+    assert result.error_output == (
+        'Logical audio rebuild failed at StreamSelection (exit code 1): '
+        'The selected logical audio stream is unavailable.'
+    )
+
+
+def test_exit_1_without_report_is_diagnosed_without_ffmpeg_fallback(tmp_path: Path) -> None:
+    analyzer = CreateRuntime(tmp_path)
+
+    async def RebuildLogicalAudio(
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        del request, descriptor, output_path, environment
+        return _ProcessResult(1, '', '')
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        del command, environment
+        raise AssertionError('FFmpeg fallback must not hide an unclassified exit 1.')
+
+    analyzer._rebuildLogicalAudio = RebuildLogicalAudio  # type: ignore[method-assign]
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    result = asyncio.run(GenericCMAnalyzer._prepareMedia(
+        analyzer,
+        CreateRequest(tmp_path),
+        LogicalAudioDescriptor(),
+        tmp_path / 'work/prepared-media.cmwork',
+        tmp_path / 'work/prepared-audio.wav',
+        {},
+    ))
+
+    assert result.return_code == 1
+    assert result.error_output == 'Logical audio rebuild exited with code 1.'
+
+
 def test_negative_audio_start_offset_is_restored_after_timestamp_reset(tmp_path: Path) -> None:
     analyzer = CreateRuntime(tmp_path)
     payload = ProbePayload()
@@ -408,7 +803,7 @@ def test_negative_audio_start_offset_is_restored_after_timestamp_reset(tmp_path:
 
     assert result.status == 'completed'
     chapter_script = (tmp_path / 'work/cpu/chapter.avs').read_text(encoding='utf-8')
-    assert 'clip = DelayAudio(clip, -0.100000000)' in chapter_script
+    assert 'DelayAudio(' not in chapter_script
     assert len([command for command in commands if command[0] == str(analyzer.ffmpeg_path)]) == 1
 
 
@@ -447,11 +842,24 @@ def test_missing_audio_output_publishes_neither_prepared_output(tmp_path: Path) 
 
     analyzer._runProcess = RunProcess  # type: ignore[method-assign]
 
+    async def RebuildLogicalAudio(
+        request: CMAnalyzerRequest,
+        descriptor: CMInputDescriptor,
+        output_path: Path,
+        environment: Mapping[str, str],
+    ) -> _ProcessResult:
+        del request, descriptor, output_path, environment
+        return _ProcessResult(0, '')
+
+    analyzer._rebuildLogicalAudio = RebuildLogicalAudio  # type: ignore[method-assign]
+
     result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path)))
 
     assert result.status == 'analysis_failed'
     assert result.error_code == 'MediaPreparationFailed'
-    assert result.error_message == 'FFmpeg did not produce both prepared video and audio.'
+    assert result.error_message is not None
+    assert result.error_message.startswith('Logical audio rebuild produced an invalid WAV:')
+    assert 'AudioRebuildFallback=FFmpeg failed: InvalidWAV:' in result.error_message
     assert (tmp_path / 'work/prepared-media.cmwork').exists() is False
     assert (tmp_path / 'work/prepared-audio.wav').exists() is False
     assert list((tmp_path / 'work').glob('*.partial*')) == []
@@ -621,6 +1029,66 @@ def test_logo_and_chapter_frame_count_must_match(tmp_path: Path) -> None:
 
     assert result.status == 'analysis_failed'
     assert result.error_code == 'AnalyzerFrameCountMismatch'
+
+
+def test_low_logo_ratio_is_not_passed_to_join_logo_scp(tmp_path: Path) -> None:
+    analyzer = CreateRuntime(tmp_path)
+    logo = tmp_path / 'logo.lgd'
+    logo.write_bytes(b'logo')
+    commands: list[tuple[str, ...]] = []
+    InstallSuccessfulProcesses(analyzer, ProbePayload(), commands)
+    original_run = analyzer._runProcess
+
+    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
+        result = await original_run(command, environment)
+        if command[0] == str(analyzer.logoframe_path):
+            analysis_path = Path(command[command.index('-oa') + 1])
+            list_path = analysis_path.with_name(f'{analysis_path.stem}_list.ini')
+            list_path.write_text(
+                list_path.read_text(encoding='utf-8').replace('FrameSum_N1=900', 'FrameSum_N1=10'),
+                encoding='utf-8',
+            )
+        return result
+
+    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
+    result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path, logo_paths=(logo,))))
+
+    assert result.status == 'completed'
+    assert 'LogoNotMatched' in result.warnings
+    join_command = next(command for command in commands if command[0] == str(analyzer.join_logo_scp_path))
+    assert '-inlogo' not in join_command
+
+
+@pytest.mark.parametrize(
+    ('frame_rate', 'expected_analysis_fps', 'expected_sampling'),
+    [
+        ('60000/1001', '60000/1001', '20'),
+        ('50/1', '50', '10'),
+    ],
+)
+def test_source_frame_rate_uses_amatsukaze_chapter_sampling_boundary(
+    tmp_path: Path,
+    frame_rate: str,
+    expected_analysis_fps: str,
+    expected_sampling: str,
+) -> None:
+    analyzer = CreateRuntime(tmp_path)
+    payload = ProbePayload()
+    cast(list[dict[str, object]], payload['streams'])[0]['avg_frame_rate'] = frame_rate
+    commands: list[tuple[str, ...]] = []
+    InstallSuccessfulProcesses(analyzer, payload, commands)
+
+    result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path)))
+
+    assert result.status == 'completed'
+    assert result.analysis_fps == expected_analysis_fps
+    chapter_script = (tmp_path / 'work/cpu/chapter.avs').read_text(encoding='utf-8')
+    source_rate = Fraction(frame_rate)
+    assert f'fpsnum={source_rate.numerator}, fpsden={source_rate.denominator}' in chapter_script
+    chapter_command = next(
+        command for command in commands if command[0] == str(analyzer.chapter_executable_path)
+    )
+    assert chapter_command[chapter_command.index('-s') + 1] == expected_sampling
 
 
 def test_hardware_initialization_failure_falls_back_to_cpu_once(tmp_path: Path) -> None:
@@ -890,7 +1358,7 @@ def test_completed_analysis_uses_recording_duration_for_trailing_cm(tmp_path: Pa
 
     assert result.status == 'completed'
     assert result.sections == ({'start_time': 59.9599, 'end_time': 60.0},)
-    assert result.analyzer_version == 'cm-8'
+    assert result.analyzer_version == 'cm-9'
 
 
 def test_analyzer_requires_precreated_private_workspace(tmp_path: Path) -> None:
