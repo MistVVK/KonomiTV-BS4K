@@ -93,47 +93,97 @@ class LivePSIDataArchiver:
         self._psisiarc_processes.append(psisiarc_process)
         logging.debug(f'[LivePSIDataArchiver] psisiarc started. (PID: {psisiarc_process.pid})')
 
-        # 受信した PSI/SI アーカイブデータを yield で返す
-        trailer_size: int = 0
-        while True:
+        # readexactly() 待機中の generator cancel は通常分岐を通らないため、
+        # generator 全体を finally で覆って process / pipe / 登録リストを必ず回収する。
+        try:
+            trailer_size: int = 0
+            while True:
 
-            # HTTP リクエストが途中で切断された
-            if await request.is_disconnected():
-                if psisiarc_process.returncode is None:
-                    psisiarc_process.kill()
-                if psisiarc_process in self._psisiarc_processes:
-                    self._psisiarc_processes.remove(psisiarc_process)
-                logging.debug(f'[LivePSIDataArchiver] psisiarc terminated. (Disconnected / PID: {psisiarc_process.pid})')
-                break
+                # HTTP リクエストが途中で切断された
+                if await request.is_disconnected():
+                    break
 
-            # PSI/SI アーカイブデータを psisiarc から読み取る
-            result = await self.__readPSIArchivedDataChunk(psisiarc_process, trailer_size)
+                # PSI/SI アーカイブデータを psisiarc から読み取る
+                result = await self.__readPSIArchivedDataChunk(psisiarc_process, trailer_size)
 
-            # LivePSIDataArchiver が破棄されたなどの理由で読み取り処理中に psisiarc が終了したか、データ構造が壊れている
-            if result is None:
-                if psisiarc_process.returncode is None:
-                    psisiarc_process.kill()
-                if psisiarc_process in self._psisiarc_processes:
-                    self._psisiarc_processes.remove(psisiarc_process)
-                logging.debug(f'[LivePSIDataArchiver] psisiarc terminated. (Destroyed / PID: {psisiarc_process.pid})')
-                break
+                # Archiver が破棄されたか、データ構造が壊れている場合は終了する
+                if result is None:
+                    break
 
-            # PSI/SI アーカイブデータを yield で返す
-            psi_archive, trailer_size = result
-            yield psi_archive
+                # PSI/SI アーカイブデータを yield で返す
+                psi_archive, trailer_size = result
+                yield psi_archive
+        finally:
+            await self.__cleanupProcess(psisiarc_process)
+            logging.debug(f'[LivePSIDataArchiver] psisiarc terminated. (PID: {psisiarc_process.pid})')
 
 
-    def destroy(self) -> None:
+    async def destroy(self) -> None:
         """
         PSI/SI データアーカイバーを破棄する
         """
 
-        # 登録されているすべての psisiarc プロセスを終了する
+        # 登録済みリストを先に切り離してから、すべての psisiarc プロセスを終了する
         ## 基本ここに到達する前に HTTP リクエストが切断され psisiarc も終了されているはずだが、念のため
         ## タイミング次第では LivePSIDataArchiver.getPSIArchivedData() で psisiarc を終了する前に到達する可能性もある
-        for psisiarc_process in self._psisiarc_processes:
-            psisiarc_process.kill()
-        self._psisiarc_processes.clear()
+        ## 先に空にすることで、二重 destroy() を安全な no-op にし、1 プロセスの失敗で後続の回収が止まらないようにする
+        psisiarc_processes, self._psisiarc_processes = self._psisiarc_processes, []
+        if len(psisiarc_processes) > 0:
+            cleanup_results = await asyncio.gather(
+                *(self.__cleanupProcess(psisiarc_process) for psisiarc_process in psisiarc_processes),
+                return_exceptions=True,
+            )
+            cleanup_failures = [
+                result
+                for result in cleanup_results
+                if isinstance(result, BaseException)
+            ]
+            if cleanup_failures:
+                raise RuntimeError('psi_data_archiver_cleanup_failed') from BaseExceptionGroup(
+                    'PSI/SI archiver cleanup failures',
+                    cleanup_failures,
+                )
+
+
+    async def __cleanupProcess(self, psisiarc_process: asyncio.subprocess.Process) -> None:
+        """psisiarc の stdin を閉じ、kill / wait 後に登録リストから除く。"""
+
+        cleanup_failures: list[BaseException] = []
+        try:
+            if psisiarc_process.stdin is not None:
+                try:
+                    psisiarc_process.stdin.close()
+                except BaseException as ex:
+                    cleanup_failures.append(ex)
+                else:
+                    try:
+                        await psisiarc_process.stdin.wait_closed()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    except BaseException as ex:
+                        cleanup_failures.append(ex)
+            if psisiarc_process.returncode is None:
+                try:
+                    psisiarc_process.kill()
+                except ProcessLookupError:
+                    pass
+                except BaseException as ex:
+                    cleanup_failures.append(ex)
+        except BaseException as ex:
+            cleanup_failures.append(ex)
+        try:
+            await psisiarc_process.wait()
+        except BaseException as ex:
+            cleanup_failures.append(ex)
+        finally:
+            if psisiarc_process in self._psisiarc_processes:
+                self._psisiarc_processes.remove(psisiarc_process)
+        if cleanup_failures:
+            logging.warning(f'[LivePSIDataArchiver] Failed to clean up psisiarc. (PID: {psisiarc_process.pid})')
+            raise RuntimeError('psisiarc_cleanup_failed') from BaseExceptionGroup(
+                'psisiarc process cleanup failures',
+                cleanup_failures,
+            )
 
 
     @staticmethod
