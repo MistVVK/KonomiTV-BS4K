@@ -159,8 +159,8 @@ def main(
     # 前回のアクセスログを削除する
     ## サーバーログは起動時に日付別分割されるため、ここでは削除しない
     try:
-        if KONOMITV_ACCESS_LOG_PATH.exists():
-            KONOMITV_ACCESS_LOG_PATH.unlink()
+        # unlink() は symlink を追跡しないため、dangling symlink を含めて固定名だけを安全に削除できる
+        KONOMITV_ACCESS_LOG_PATH.unlink(missing_ok=True)
     except PermissionError:
         pass
 

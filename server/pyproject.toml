@@ -125,3 +125,7 @@ reportUnknownArgumentType = "none"
 reportUnknownMemberType = "none"
 reportUnknownVariableType = "none"
 reportUnusedFunction = "none"
+
+[tool.pytest.ini_options]
+# ACP profile や録画データ配下へ第三者 package の tests が展開されても収集しない。
+testpaths = ["tests"]

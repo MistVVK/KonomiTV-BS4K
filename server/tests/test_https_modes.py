@@ -12,7 +12,12 @@ from starlette.types import Message, Receive, Scope, Send
 
 import app as app_package
 import app.config as config_module
-from app.config import ResolveCompatibilityHTTPSSettings, ServerSettings
+import app.utils.HostPath as host_path_module
+from app.config import (
+    HostServerSettings,
+    ResolveCompatibilityHTTPSSettings,
+    ServerSettings,
+)
 from app.utils.HTTPS import (
     BuildServerStartupSettings,
     GetAkebiAccessURLs,
@@ -431,11 +436,11 @@ class HTTPSModeConfigTest(unittest.TestCase):
 
         original_config = config_module._CONFIG  # pyright: ignore[reportPrivateUsage]
         original_config_path = config_module._CONFIG_YAML_PATH  # pyright: ignore[reportPrivateUsage]
-        original_docker_path_prefix = config_module._DOCKER_PATH_PREFIX  # pyright: ignore[reportPrivateUsage]
+        original_docker_host_root = host_path_module.DOCKER_HOST_ROOT
         try:
             config_module._CONFIG = None  # pyright: ignore[reportPrivateUsage]
             config_module._CONFIG_YAML_PATH = config_path  # pyright: ignore[reportPrivateUsage]
-            config_module._DOCKER_PATH_PREFIX = str(host_rootfs)  # pyright: ignore[reportPrivateUsage]
+            host_path_module.DOCKER_HOST_ROOT = host_rootfs
             test_logging = SimpleNamespace(debug=Mock(), error=Mock())
             with (
                 patch.object(app_package, 'logging', test_logging, create=True),
@@ -453,7 +458,7 @@ class HTTPSModeConfigTest(unittest.TestCase):
                     settings.compatibility_api.custom_https_private_key,
                     host_rootfs / 'compatibility-private-key.pem',
                 )
-                config_module.SaveConfig(settings)
+                config_module.SaveConfig(HostServerSettings.fromServerSettings(settings))
 
             saved_config = YAML().load(config_path.read_text(encoding='utf-8'))
             self.assertEqual(saved_config['server']['custom_https_certificate'], '/certificate.pem')
@@ -469,7 +474,7 @@ class HTTPSModeConfigTest(unittest.TestCase):
         finally:
             config_module._CONFIG = original_config  # pyright: ignore[reportPrivateUsage]
             config_module._CONFIG_YAML_PATH = original_config_path  # pyright: ignore[reportPrivateUsage]
-            config_module._DOCKER_PATH_PREFIX = original_docker_path_prefix  # pyright: ignore[reportPrivateUsage]
+            host_path_module.DOCKER_HOST_ROOT = original_docker_host_root
 
     def test_compatibility_api_settings_are_added_to_old_config_and_saved(self) -> None:
         temporary_path = Path(self.temporary_directory.name)
@@ -499,7 +504,7 @@ class HTTPSModeConfigTest(unittest.TestCase):
 
                 settings.compatibility_api.enabled = True
                 settings.compatibility_api.port = 65440
-                config_module.SaveConfig(settings)
+                config_module.SaveConfig(HostServerSettings.fromServerSettings(settings))
 
             saved_config = YAML().load(config_path.read_text(encoding='utf-8'))
             self.assertEqual(saved_config['compatibility_api'], {

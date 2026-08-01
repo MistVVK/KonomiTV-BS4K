@@ -22,8 +22,18 @@ client/scripts/*.test.mjs
 # データベース: マイグレーションに失敗するのを防ぐ
 server/data/*
 
+# ACP / Google のホスト資格情報は配置場所にかかわらず build context へ含めない
+**/.codex/
+**/.grok/
+**/.config/gcloud/
+**/auth.json
+**/application_default_credentials.json
+
 # サードパーティーライブラリ: Docker 側でファイルを準備するため不要
 server/thirdparty/
 
 # tsreadex: Docker の builder stage でコンテナ環境向けにビルドする
+thirdparty-src/tsreadex/build/
+thirdparty-src/tsreadex/tsreadex
+thirdparty-src/tsreadex/tsreadex-anchor-test
 thirdparty-src/tsreadex/tsreadex.elf

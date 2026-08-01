@@ -145,6 +145,13 @@ cython_debug/
 # Codex
 .codex/hooks.json
 
+# ACP / Google のホスト資格情報
+**/.codex/
+**/.grok/
+**/.config/gcloud/
+**/auth.json
+**/application_default_credentials.json
+
 # config.yaml
 config.yaml
 

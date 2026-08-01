@@ -1,10 +1,12 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+ARG UBUNTU_2204_IMAGE_SHA256=0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
 # --------------------------------------------------------------------------------------------------------------
 # サードパーティー実行環境を固定構築するステージ
 # --------------------------------------------------------------------------------------------------------------
 
-FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982 AS thirdparty-builder
+FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS thirdparty-builder
 
 ARG CUDA_VERSION=12.4
 ARG NONFREE=true
@@ -116,6 +118,69 @@ COPY ./docker/thirdparty/verify.sh \
 RUN chmod +x /build/docker/thirdparty/verify.sh && \
     NONFREE="${NONFREE}" /build/docker/thirdparty/verify.sh /opt/thirdparty
 
+# 同一 UID で動く ACP provider 間の資格情報を OS 強制で分離する Landlock launcher。
+# 既存の重い third-party build layer を C source 変更で無効化しないよう、独立した末尾 layer で構築する。
+COPY ./docker/acp/KonomiTVBS4KACPSandbox.c /build/docker/acp/KonomiTVBS4KACPSandbox.c
+RUN cc -std=c17 -Wall -Wextra -Werror -Wconversion -Wformat=2 -Wshadow -Wstrict-prototypes \
+        -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -O2 \
+        -Wl,-z,relro,-z,now -pie \
+        /build/docker/acp/KonomiTVBS4KACPSandbox.c \
+        -o /opt/konomitv-bs4k-acp-sandbox && \
+    chmod 0755 /opt/konomitv-bs4k-acp-sandbox && \
+    test "$(stat -c '%a' /opt/konomitv-bs4k-acp-sandbox)" = '755' && \
+    file /opt/konomitv-bs4k-acp-sandbox | grep -F 'pie executable'
+
+# --------------------------------------------------------------------------------------------------------------
+# KonomiTV-BS4K TS Codec Bridge を完全 commit と source archive SHA-256 から固定構築するステージ
+# --------------------------------------------------------------------------------------------------------------
+
+FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS tscodecbridge-toolchain
+
+ARG UBUNTU_2204_IMAGE_SHA256
+ENV DEBIAN_FRONTEND=noninteractive
+ENV KONOMITV_BS4K_TSCODECBRIDGE_EXPECTED_UBUNTU_IMAGE_SHA256=${UBUNTU_2204_IMAGE_SHA256}
+
+# 公開済み commit の完全 SHA と codeload archive SHA-256 が未確定なら、apt や source 取得より前に失敗する。
+COPY ./docker/ts-codec-bridge/manifest.env \
+     ./docker/ts-codec-bridge/build.sh \
+     /build/docker/ts-codec-bridge/
+RUN chmod 0755 /build/docker/ts-codec-bridge/build.sh && \
+    /build/docker/ts-codec-bridge/build.sh validate-manifest
+
+# SBCL / cl-swank は Jammy 公式 archive の固定 package、SBLint / Mallet は固定 archive だけを使う。
+RUN /build/docker/ts-codec-bridge/build.sh prepare
+
+FROM tscodecbridge-toolchain AS tscodecbridge-builder
+
+# Jammy公式toolchainだけで全compile・lint・単体試験を行い、保存実行形式と表示物を固定する。
+RUN /build/docker/ts-codec-bridge/build.sh build && \
+    test -x /opt/konomitv-bs4k-tscodecbridge-runtime/ts-codec-bridge.elf && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/LICENSE && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/COPYRIGHT-SBCL && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/COPYRIGHT-GLIBC && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/COPYRIGHT-ZLIB && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/Apache-2.0-LICENSE && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/GPL-2-LICENSE && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/LGPL-2.1-LICENSE && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/GFDL-1.3-LICENSE && \
+    test -s /opt/konomitv-bs4k-tscodecbridge-runtime/Runtime-Manifest.tsv && \
+    test "$(find /opt/konomitv-bs4k-tscodecbridge-runtime -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 10
+
+# FFmpeg統合試験だけは、全依存を検証済みのthirdparty-builder環境でその成果物を直接用いて実行する。
+# Bridge source・toolchain・thirdparty build treeは中間stageに留め、最終imageへは実行形式と表示物だけを移す。
+FROM thirdparty-builder AS tscodecbridge-integration
+
+ARG UBUNTU_2204_IMAGE_SHA256
+ENV KONOMITV_BS4K_TSCODECBRIDGE_EXPECTED_UBUNTU_IMAGE_SHA256=${UBUNTU_2204_IMAGE_SHA256}
+
+COPY --from=tscodecbridge-builder /build/docker/ts-codec-bridge/ /build/docker/ts-codec-bridge/
+COPY --from=tscodecbridge-builder /build/konomitv-bs4k-tscodecbridge/source/ \
+    /build/konomitv-bs4k-tscodecbridge/source/
+COPY --from=tscodecbridge-builder /opt/konomitv-bs4k-tscodecbridge-runtime/ \
+    /opt/konomitv-bs4k-tscodecbridge-runtime/
+RUN KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_ROOT=/opt/thirdparty/FFmpeg8 \
+        /build/docker/ts-codec-bridge/build.sh test-ffmpeg-integration
+
 # --------------------------------------------------------------------------------------------------------------
 # クライアントをビルドするステージ
 # --------------------------------------------------------------------------------------------------------------
@@ -130,13 +195,80 @@ RUN yarn build && \
     node scripts/generate-license-document.mjs /tmp/CLIENT_THIRD_PARTY_LICENSES.md
 
 # --------------------------------------------------------------------------------------------------------------
+# 録画シリーズ ACP CLI を資格情報なしで固定導入するステージ
+# --------------------------------------------------------------------------------------------------------------
+
+FROM node:20.16.0 AS acp-builder
+
+# package.json / package-lock.json だけを先に COPY し、dependency layer のキャッシュ境界を明確にする。
+# npm の version / integrity の正本は lockfile。manifest.env は展開後 binary と直接依存 version 表示用。
+WORKDIR /opt/konomitv-bs4k-acp
+COPY ./docker/acp/package.json ./docker/acp/package-lock.json /opt/konomitv-bs4k-acp/
+COPY ./docker/acp/manifest.env /build/docker/acp/manifest.env
+COPY ./docker/acp/generate-license-document.mjs ./docker/acp/normalize-acp-web-telemetry.mjs \
+    ./docker/acp/assemble-acp-license-section.py /build/docker/acp/
+RUN set -eu && \
+    . /build/docker/acp/manifest.env && \
+    # Grok の公式 postinstall は platform package の payload を固定配置へ展開する。
+    # builder の root home へ状態を残さず、完成イメージへコピーする配布ディレクトリだけを使う。
+    GROK_HOME=/opt/konomitv-bs4k-acp/grok-distribution \
+        npm ci --omit=dev --no-audit --no-fund && \
+    node /build/docker/acp/normalize-acp-web-telemetry.mjs /opt/konomitv-bs4k-acp && \
+    npm ls --depth=0 && \
+    test "$(node -p "require('./node_modules/@agentclientprotocol/codex-acp/package.json').version")" = "${CODEX_ACP_VERSION}" && \
+    test "$(node -p "require('./node_modules/@openai/codex/package.json').version")" = "${CODEX_CLI_VERSION}" && \
+    test "$(node -p "require('./node_modules/@google/gemini-cli/package.json').version")" = "${GEMINI_CLI_VERSION}" && \
+    test "$(node -p "require('./node_modules/${GROK_NPM_PACKAGE}/package.json').version")" = "${GROK_BUILD_VERSION}" && \
+    test "$(node -p "require('./node_modules/${GROK_PLATFORM_NPM_PACKAGE}/package.json').version")" = "${GROK_BUILD_VERSION}" && \
+    node -e 'const fs=require("fs");const path=require("path");const lock=JSON.parse(fs.readFileSync("package-lock.json","utf8"));const packages=lock.packages||{};function walk(dir,rel,found){if(!fs.existsSync(dir))return;for(const entry of fs.readdirSync(dir,{withFileTypes:true})){if(!entry.isDirectory()||entry.name.startsWith("."))continue;const full=path.join(dir,entry.name);const nextRel=rel?rel+"/"+entry.name:entry.name;if(entry.name.startsWith("@")&&!fs.existsSync(path.join(full,"package.json"))){walk(full,nextRel,found);continue;}const pkgJson=path.join(full,"package.json");if(fs.existsSync(pkgJson)){const pkg=JSON.parse(fs.readFileSync(pkgJson,"utf8"));const lockPath="node_modules/"+nextRel;found.set(lockPath,{name:pkg.name||entry.name,version:pkg.version||""});const nested=path.join(full,"node_modules");if(fs.existsSync(nested))walk(nested,nextRel+"/node_modules",found);}}}const installed=new Map();walk("node_modules","",installed);for(const [lockPath,info] of installed.entries()){const locked=packages[lockPath];if(!locked){console.error("installed path missing from lockfile:",lockPath);process.exit(1);}if(locked.version&&info.version&&locked.version!==info.version){console.error("version mismatch",lockPath,locked.version,info.version);process.exit(1);}if(locked.name&&info.name&&locked.name!==info.name){console.error("name mismatch",lockPath,locked.name,info.name);process.exit(1);}}for(const [lockPath,locked] of Object.entries(packages)){if(!lockPath.startsWith("node_modules/"))continue;if(locked.optional)continue;if(!installed.has(lockPath)){console.error("required lock path not installed:",lockPath);process.exit(1);}}console.log("installed package path/name/version match lockfile");' && \
+    # CLI --version は終了成功と既知の完全1行出力の双方を要求する（部分一致 grep は禁止）。
+    codex_acp_version="$(/opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp --version)" && \
+    codex_cli_version="$(/opt/konomitv-bs4k-acp/node_modules/.bin/codex --version)" && \
+    gemini_cli_version="$(/opt/konomitv-bs4k-acp/node_modules/.bin/gemini --version)" && \
+    grok_version_line="$(/opt/konomitv-bs4k-acp/grok-distribution/bin/grok --version)" && \
+    test "${codex_acp_version}" = "@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}" && \
+    test "${codex_cli_version}" = "codex-cli ${CODEX_CLI_VERSION}" && \
+    test "${gemini_cli_version}" = "${GEMINI_CLI_VERSION}" && \
+    test "${grok_version_line}" = "${GROK_BUILD_VERSION_LINE}" && \
+    printf '%s  %s\n' \
+        "${GROK_BUILD_LINUX_X86_64_SHA256}" \
+        "/opt/konomitv-bs4k-acp/grok-distribution/bin/grok-${GROK_BUILD_VERSION}" \
+        | sha256sum --check --strict - && \
+    # Node.js binary と LICENSE のバージョン対応を固定する（LICENSE 欠落は build 失敗）。
+    test -s /usr/local/LICENSE && \
+    node_version="$(node --version)" && \
+    test "${node_version}" = "v20.16.0" && \
+    cp /usr/local/LICENSE /opt/konomitv-bs4k-acp/NODE-LICENSE && \
+    # lockfile と実 tree を照合した ACP npm ライセンス文書へ、Node.js LICENSE を結合する。
+    # Grok binary と THIRD_PARTY_NOTICES は同じ integrity 固定 platform package から収集する。
+    node /build/docker/acp/generate-license-document.mjs \
+        /opt/konomitv-bs4k-acp/NPM_THIRD_PARTY_LICENSES.md \
+        /opt/konomitv-bs4k-acp && \
+    python3 /build/docker/acp/assemble-acp-license-section.py \
+        --npm-document /opt/konomitv-bs4k-acp/NPM_THIRD_PARTY_LICENSES.md \
+        --node-license /opt/konomitv-bs4k-acp/NODE-LICENSE \
+        --node-version "${node_version}" \
+        --output /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '## ACP Runtime Dependencies' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### Node.js 20.16.0' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### @agentclientprotocol/codex-acp 1.1.7' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### @openai/codex 0.145.0' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### @google/gemini-cli 0.52.0' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F "### @xai-official/grok ${GROK_BUILD_VERSION}" /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F "### @xai-official/grok-linux-x64 ${GROK_BUILD_VERSION}" \
+        /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
+    npm cache clean --force
+
+# --------------------------------------------------------------------------------------------------------------
 # KonomiTV-BS4K の実行ステージ (Linux amd64 専用)
 # --------------------------------------------------------------------------------------------------------------
 
-FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
+FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256}
 
 ARG CUDA_VERSION=12.4
 ARG NONFREE=true
+ARG KONOMITV_UID=1000
+ARG KONOMITV_GID=1000
 LABEL cc.konomi.konomitv-bs4k.cuda-version="${CUDA_VERSION}" \
       cc.konomi.konomitv-bs4k.nonfree="${NONFREE}"
 ENV TZ=Asia/Tokyo
@@ -252,9 +384,66 @@ RUN curl -fsSL https://fastly.linuxmint.io/pool/main/l/linuxmint-keyring/linuxmi
     chromium --version && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/*
 
+# ACP adapter / Codex / Gemini / Grok は公式 npm package と lockfile integrity で固定する。
+# Google Cloud CLI は完成イメージへコピーせず、Gemini は host ADC の read-only mount だけを参照する。
+#
+# ----- ACP ホスト認証（イメージには含めない。実行時 bind mount 必須）-----
+# Dockerfile / イメージ内に auth.json や ADC を焼き込まない。
+# 録画シリーズ設定 UI の「検出済み / 未検出」は、コンテナ内の次の固定 path の読取り可否だけを見る。
+#
+#   Codex:  /run/konomitv-bs4k-host-auth/codex/auth.json
+#   Grok:   /run/konomitv-bs4k-host-auth/grok/auth.json
+#   Google: /run/konomitv-bs4k-host-auth/google/application_default_credentials.json
+#
+# 起動時にホストの認証ファイルを上記 target へ read-only bind する。
+# リポジトリ同梱の差分 Compose（任意）:
+#   docker-compose.acp-codex-auth.yaml   … KONOMITV_BS4K_CODEX_AUTH_FILE
+#   docker-compose.acp-grok-auth.yaml    … KONOMITV_BS4K_GROK_AUTH_FILE
+#   docker-compose.acp-google-adc.yaml   … KONOMITV_BS4K_GOOGLE_ADC_FILE
+#
+# 例（ホストの file 認証を使う場合）:
+#   export KONOMITV_BS4K_CODEX_AUTH_FILE="$HOME/.codex/auth.json"
+#   export KONOMITV_BS4K_GROK_AUTH_FILE="$HOME/.grok/auth.json"
+#   export KONOMITV_BS4K_GOOGLE_ADC_FILE="$HOME/.config/gcloud/application_default_credentials.json"
+#   docker compose -f docker-compose.yaml \
+#     -f docker-compose.acp-codex-auth.yaml \
+#     -f docker-compose.acp-grok-auth.yaml \
+#     -f docker-compose.acp-google-adc.yaml \
+#     up -d
+#
+# 開発機など常に ACP を使う場合は、gitignore された docker-compose.yaml の volumes に
+# 上記 3 本を直接書いてよい（create_host_path: false / read_only / selinux: z）。
+# Codex / Grok は UI から専用プロファイルへ「取り込み」、Google ADC は mount 読取りのみ。
+# OS keyring だけだと host に auth.json が無いことがある → cli_auth_credentials_store = "file"。
+COPY --from=acp-builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=acp-builder /opt/konomitv-bs4k-acp/ /opt/konomitv-bs4k-acp/
+COPY --from=thirdparty-builder /opt/konomitv-bs4k-acp-sandbox \
+    /usr/local/libexec/konomitv-bs4k-acp-sandbox
+RUN ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp /usr/local/bin/codex-acp && \
+    ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex /usr/local/bin/codex && \
+    ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/gemini /usr/local/bin/gemini && \
+    ln -s /opt/konomitv-bs4k-acp/grok-distribution/bin/grok /usr/local/bin/grok && \
+    codex_acp_version="$(codex-acp --version)" && \
+    codex_cli_version="$(codex --version)" && \
+    gemini_cli_version="$(gemini --version)" && \
+    grok_version_line="$(grok --version)" && \
+    test "${codex_acp_version}" = '@agentclientprotocol/codex-acp 1.1.7' && \
+    test "${codex_cli_version}" = 'codex-cli 0.145.0' && \
+    test "${gemini_cli_version}" = '0.52.0' && \
+    test "${grok_version_line}" = 'grok 0.2.112 (9bbd559437)' && \
+    test "$(stat -c '%U:%G:%a' /usr/local/libexec/konomitv-bs4k-acp-sandbox)" = 'root:root:755' && \
+    if command -v gcloud >/dev/null 2>&1; then \
+        echo 'Google Cloud CLI must not be included in the final image.' >&2; \
+        exit 1; \
+    fi
+
 WORKDIR /code/server/
 COPY --from=thirdparty-builder /opt/thirdparty/ /code/server/thirdparty/
 RUN test ! -e /code/server/thirdparty/Amatsukaze && \
+    test ! -e /code/server/thirdparty/FFmpeg && \
+    test ! -e /code/server/thirdparty/QSVEncC && \
+    test ! -e /code/server/thirdparty/NVEncC && \
+    test ! -e /code/server/thirdparty/VCEEncC && \
     test -x /code/server/thirdparty/CMAnalysis/chapter_exe && \
     test -x /code/server/thirdparty/CMAnalysis/ffmsindex && \
     test -x /code/server/thirdparty/CMAnalysis/logoframe && \
@@ -269,6 +458,131 @@ RUN test ! -e /code/server/thirdparty/Amatsukaze && \
     if [ "${NONFREE}" = 'true' ]; then \
         /code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh -hide_banner -filters 2>&1 | grep -Eq '[[:space:]]deinterlace_vaapi[[:space:]]'; \
     fi
+
+# Bridge final surface は保存実行形式、ライセンス・著作権表示、固定 runtime manifest だけにする。
+COPY --from=tscodecbridge-integration /opt/konomitv-bs4k-tscodecbridge-runtime/ \
+    /code/server/thirdparty/KonomiTVBS4KTSCodecBridge/
+RUN --mount=type=bind,from=tscodecbridge-builder,source=/opt/konomitv-bs4k-tscodecbridge-runtime-packages,target=/mnt/konomitv-bs4k-tscodecbridge-runtime-packages \
+    set -eu && \
+    bridge_root='/code/server/thirdparty/KonomiTVBS4KTSCodecBridge' && \
+    runtime_packages_root='/mnt/konomitv-bs4k-tscodecbridge-runtime-packages' && \
+    expected_files="$(printf '%s\n' \
+        Apache-2.0-LICENSE \
+        COPYRIGHT-GLIBC \
+        COPYRIGHT-SBCL \
+        COPYRIGHT-ZLIB \
+        GFDL-1.3-LICENSE \
+        GPL-2-LICENSE \
+        LGPL-2.1-LICENSE \
+        LICENSE \
+        Runtime-Manifest.tsv \
+        ts-codec-bridge.elf | sort)" && \
+    actual_files="$(find "${bridge_root}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)" && \
+    test "${actual_files}" = "${expected_files}" && \
+    test -z "$(find "${bridge_root}" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" && \
+    test -z "$(find "${bridge_root}" -type f \( \
+        -name '*.asd' -o -name '*.fasl' -o -name '*.lisp' -o -name 'Makefile' \
+        \) -print -quit)" && \
+    test "$(stat -c '%U:%G:%a' "${bridge_root}/ts-codec-bridge.elf")" = 'root:root:755' && \
+    test "$(stat -c '%U:%G:%a' "${bridge_root}/Runtime-Manifest.tsv")" = 'root:root:644' && \
+    test -s "${bridge_root}/LICENSE" && \
+    test -s "${bridge_root}/COPYRIGHT-SBCL" && \
+    test -s "${bridge_root}/COPYRIGHT-GLIBC" && \
+    test -s "${bridge_root}/COPYRIGHT-ZLIB" && \
+    test -s "${bridge_root}/Apache-2.0-LICENSE" && \
+    test -s "${bridge_root}/GPL-2-LICENSE" && \
+    test -s "${bridge_root}/LGPL-2.1-LICENSE" && \
+    test -s "${bridge_root}/GFDL-1.3-LICENSE" && \
+    runtime_manifest="${bridge_root}/Runtime-Manifest.tsv" && \
+    ! grep -Fq 'PENDING_' "${runtime_manifest}" && \
+    build_glibc_version="$(awk -F '\t' '$1 == "BUILD_GLIBC_PACKAGE_VERSION" { print $2 }' "${runtime_manifest}")" && \
+    build_glibc_package_sha256="$(awk -F '\t' '$1 == "LIBC6_PACKAGE_ARCHIVE_SHA256" { print $2 }' "${runtime_manifest}")" && \
+    build_glibc_package_url="$(awk -F '\t' '$1 == "LIBC6_PACKAGE_ARCHIVE_URL" { print $2 }' "${runtime_manifest}")" && \
+    build_glibc_sha256="$(awk -F '\t' '$1 == "BUILD_GLIBC_LIBRARY_SHA256" { print $2 }' "${runtime_manifest}")" && \
+    build_zlib_version="$(awk -F '\t' '$1 == "BUILD_ZLIB_PACKAGE_VERSION" { print $2 }' "${runtime_manifest}")" && \
+    build_zlib_package_sha256="$(awk -F '\t' '$1 == "ZLIB1G_PACKAGE_ARCHIVE_SHA256" { print $2 }' "${runtime_manifest}")" && \
+    build_zlib_package_url="$(awk -F '\t' '$1 == "ZLIB1G_PACKAGE_ARCHIVE_URL" { print $2 }' "${runtime_manifest}")" && \
+    build_zlib_sha256="$(awk -F '\t' '$1 == "BUILD_ZLIB_LIBRARY_SHA256" { print $2 }' "${runtime_manifest}")" && \
+    test -n "${build_glibc_version}" && \
+    printf '%s' "${build_glibc_package_sha256}" | grep -Eq '^[0-9a-f]{64}$' && \
+    test "${build_glibc_package_url}" = "https://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_${build_glibc_version}_amd64.deb" && \
+    printf '%s' "${build_glibc_sha256}" | grep -Eq '^[0-9a-f]{64}$' && \
+    test -n "${build_zlib_version}" && \
+    printf '%s' "${build_zlib_package_sha256}" | grep -Eq '^[0-9a-f]{64}$' && \
+    test "${build_zlib_package_url}" = "https://archive.ubuntu.com/ubuntu/pool/main/z/zlib/zlib1g_${build_zlib_version#*:}_amd64.deb" && \
+    printf '%s' "${build_zlib_sha256}" | grep -Eq '^[0-9a-f]{64}$' && \
+    expected_runtime_packages="$(printf '%s\n' libc6-amd64.deb zlib1g-amd64.deb | sort)" && \
+    actual_runtime_packages="$(find "${runtime_packages_root}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)" && \
+    test "${actual_runtime_packages}" = "${expected_runtime_packages}" && \
+    test -z "$(find "${runtime_packages_root}" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" && \
+    printf '%s  %s\n' "${build_glibc_package_sha256}" "${runtime_packages_root}/libc6-amd64.deb" | \
+        sha256sum --check --strict - && \
+    printf '%s  %s\n' "${build_zlib_package_sha256}" "${runtime_packages_root}/zlib1g-amd64.deb" | \
+        sha256sum --check --strict - && \
+    test "$(dpkg-deb --field "${runtime_packages_root}/libc6-amd64.deb" Package)" = 'libc6' && \
+    test "$(dpkg-deb --field "${runtime_packages_root}/libc6-amd64.deb" Version)" = "${build_glibc_version}" && \
+    test "$(dpkg-deb --field "${runtime_packages_root}/libc6-amd64.deb" Architecture)" = 'amd64' && \
+    test "$(dpkg-deb --field "${runtime_packages_root}/zlib1g-amd64.deb" Package)" = 'zlib1g' && \
+    test "$(dpkg-deb --field "${runtime_packages_root}/zlib1g-amd64.deb" Version)" = "${build_zlib_version}" && \
+    test "$(dpkg-deb --field "${runtime_packages_root}/zlib1g-amd64.deb" Architecture)" = 'amd64' && \
+    dpkg --install \
+        "${runtime_packages_root}/libc6-amd64.deb" \
+        "${runtime_packages_root}/zlib1g-amd64.deb" && \
+    test -z "$(dpkg --audit)" && \
+    awk -F '\t' ' \
+        NF < 2 { invalid = 1 } \
+        $1 == "BUILDER_PACKAGE" { \
+            package_count += 1; \
+            if (NF != 4 || $4 !~ /^https?:\/\/(archive|security)\.ubuntu\.com\/ubuntu /) invalid = 1; \
+        } \
+        $1 == "COMMON_LICENSE" { \
+            common_license_count += 1; \
+            if (NF != 4 || $2 !~ /^(Apache-2\.0|GPL-2|LGPL-2\.1|GFDL-1\.3)-LICENSE$/ || \
+                length($3) != 64 || $3 !~ /^[0-9a-f]+$/ || \
+                $4 !~ /^\/usr\/share\/common-licenses\//) invalid = 1; \
+        } \
+        END { exit invalid || package_count == 0 || common_license_count != 4 } \
+    ' "${runtime_manifest}" && \
+    awk -F '\t' '$1 == "COMMON_LICENSE" { print $3 "  " root "/" $2 }' \
+        root="${bridge_root}" "${runtime_manifest}" | \
+        sha256sum --check --strict - && \
+    cli_version="$(awk -F '\t' '$1 == "CLI_VERSION" { print $2 }' "${runtime_manifest}")" && \
+    mapping_version="$(awk -F '\t' '$1 == "TS_MAPPING_VERSION" { print $2 }' "${runtime_manifest}")" && \
+    executable_sha256="$(awk -F '\t' '$1 == "EXECUTABLE_SHA256" { print $2 }' "${runtime_manifest}")" && \
+    test -n "${cli_version}" && \
+    test -n "${mapping_version}" && \
+    test -n "${executable_sha256}" && \
+    test "$("${bridge_root}/ts-codec-bridge.elf" --version)" = "${cli_version}" && \
+    test "$("${bridge_root}/ts-codec-bridge.elf" --mapping-version)" = "${mapping_version}" && \
+    printf '%s  %s\n' "${executable_sha256}" "${bridge_root}/ts-codec-bridge.elf" | \
+        sha256sum --check --strict - && \
+    ldd_output="$(ldd "${bridge_root}/ts-codec-bridge.elf")" && \
+    printf '%s\n' "${ldd_output}" && \
+    ! printf '%s\n' "${ldd_output}" | grep -Fq 'not found' && \
+    printf '%s\n' "${ldd_output}" | grep -Fq 'libc.so.6' && \
+    printf '%s\n' "${ldd_output}" | grep -Fq 'libz.so.1' && \
+    runtime_glibc_path="$(printf '%s\n' "${ldd_output}" | awk '$1 == "libc.so.6" { print $3; exit }')" && \
+    runtime_zlib_path="$(printf '%s\n' "${ldd_output}" | awk '$1 == "libz.so.1" { print $3; exit }')" && \
+    test -n "${runtime_glibc_path}" && \
+    test -n "${runtime_zlib_path}" && \
+    test "$(dpkg-query --showformat='${Version}' --show libc6)" = "${build_glibc_version}" && \
+    test "$(dpkg-query --showformat='${Version}' --show zlib1g)" = "${build_zlib_version}" && \
+    printf '%s  %s\n' "${build_glibc_sha256}" "${runtime_glibc_path}" | \
+        sha256sum --check --strict - && \
+    printf '%s  %s\n' "${build_zlib_sha256}" "${runtime_zlib_path}" | \
+        sha256sum --check --strict - && \
+    ! command -v sbcl >/dev/null 2>&1 && \
+    ! command -v mallet >/dev/null 2>&1 && \
+    ! command -v sblint >/dev/null 2>&1 && \
+    test ! -e /usr/lib/sbcl && \
+    test ! -e /usr/share/sbcl-source && \
+    test ! -e /opt/mallet && \
+    test ! -e /opt/sblint && \
+    test ! -e /root/.cache/common-lisp && \
+    test ! -e /build/konomitv-bs4k-tscodecbridge && \
+    test ! -e /opt/konomitv-bs4k-tscodecbridge-toolchain && \
+    test ! -e /opt/konomitv-bs4k-tscodecbridge-ffmpeg8
+
 COPY ./server/pyproject.toml ./server/poetry.lock ./server/poetry.toml /code/server/
 RUN /code/server/thirdparty/Python/bin/python -m poetry env use /code/server/thirdparty/Python/bin/python && \
     /code/server/thirdparty/Python/bin/python -m poetry install --only main --no-root
@@ -287,6 +601,7 @@ COPY ./docker/thirdparty/licenses/chromium-LICENSE /tmp/chromium-LICENSE
 COPY ./docker/thirdparty/licenses/grapheme-0.6.0-LICENSE /tmp/grapheme-0.6.0-LICENSE
 COPY --from=client-builder /tmp/CLIENT_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md
 COPY --from=thirdparty-builder /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/BUILDER_THIRD_PARTY_LICENSES.md
+COPY --from=acp-builder /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md /tmp/ACP_THIRD_PARTY_LICENSES.md
 RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree-runtime'; else nonfree_license_option=''; fi && \
     printf '%s  %s\n' \
         '8c09b6ef3ef6bf62858af66af73138b5a234231266c4736009d27233681a5dcf' \
@@ -306,15 +621,42 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
         --python-root /code/server/thirdparty/Python \
         --python-license-override 'grapheme==0.6.0=/tmp/grapheme-0.6.0-LICENSE' \
         --root /code/server/thirdparty/Python \
+        --root /code/server/thirdparty/KonomiTVBS4KTSCodecBridge \
         --output /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    grep -F 'KonomiTVBS4KTSCodecBridge: LICENSE' /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    grep -F 'KonomiTVBS4KTSCodecBridge: COPYRIGHT-SBCL' /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    grep -F 'KonomiTVBS4KTSCodecBridge: COPYRIGHT-GLIBC' /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    grep -F 'KonomiTVBS4KTSCodecBridge: COPYRIGHT-ZLIB' /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    grep -F 'KonomiTVBS4KTSCodecBridge: Apache-2.0-LICENSE' /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    grep -F 'KonomiTVBS4KTSCodecBridge: GPL-2-LICENSE' /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    grep -F 'KonomiTVBS4KTSCodecBridge: LGPL-2.1-LICENSE' /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    grep -F 'KonomiTVBS4KTSCodecBridge: GFDL-1.3-LICENSE' /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
+    # ACP 配布物（npm tree + Node.js）は独立 H2 として最終文書へ統合する。
+    # ACP セクションは npm 全件（公式 Grok platform package を含む）+ Node.js を必須とする。
+    test -s /tmp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '## ACP Runtime Dependencies' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### Node.js 20.16.0' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### @agentclientprotocol/codex-acp 1.1.7' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### @openai/codex 0.145.0' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### @google/gemini-cli 0.52.0' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### @xai-official/grok 0.2.112' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
+    grep -F '### @xai-official/grok-linux-x64 0.2.112' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
     python3 /tmp/assemble-runtime-license-document.py \
         --base /tmp/BASE_THIRD_PARTY_LICENSES.md \
         --client /tmp/CLIENT_THIRD_PARTY_LICENSES.md \
         --manifest /tmp/BUILDER_THIRD_PARTY_LICENSES.md \
         --manifest /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
+        --manifest /tmp/ACP_THIRD_PARTY_LICENSES.md \
         --cuda-version "${CUDA_VERSION}" \
         ${nonfree_license_option} \
         --output /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '## ACP Runtime Dependencies' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### Node.js 20.16.0' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### @agentclientprotocol/codex-acp 1.1.7' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### @openai/codex 0.145.0' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### @google/gemini-cli 0.52.0' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### @xai-official/grok 0.2.112' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### @xai-official/grok-linux-x64 0.2.112' /code/THIRD_PARTY_LICENSES.md && \
     if [ "${NONFREE}" = 'false' ]; then \
         grep -Eq '^#### mesa-va-drivers(:amd64)? ' /code/THIRD_PARTY_LICENSES.md; \
         if grep -Eq 'NONFREE_RUNTIME_WARNING|amf-amdgpu-pro|libamdenc-amdgpu-pro|mesa-amdgpu-va-drivers|vulkan-amdgpu-pro' \
@@ -325,8 +667,21 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     fi && \
     rm /tmp/BASE_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md \
         /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
+        /tmp/ACP_THIRD_PARTY_LICENSES.md \
         /tmp/assemble-runtime-license-document.py /tmp/collect-license-manifest.py \
         /tmp/generate-chromium-license-document.py /tmp/chromium-LICENSE \
         /tmp/grapheme-0.6.0-LICENSE
+
+# KonomiTV-BS4K 本体は専用の非 root ユーザーで実行する。
+# bind mount する config.yaml・data・logs も、ホスト側で同じ UID/GID が所有している必要がある。
+RUN groupadd --gid "${KONOMITV_GID}" konomitv && \
+    useradd --uid "${KONOMITV_UID}" --gid "${KONOMITV_GID}" \
+        --home-dir /home/konomitv --create-home --shell /usr/sbin/nologin konomitv && \
+    install -d -o "${KONOMITV_UID}" -g "${KONOMITV_GID}" -m 0750 \
+        /code/server/data /code/server/logs /home/konomitv/.cache && \
+    chown -R "${KONOMITV_UID}:${KONOMITV_GID}" /code/server/data /code/server/logs
+
+ENV HOME=/home/konomitv
+USER konomitv:konomitv
 
 ENTRYPOINT ["/code/server/.venv/bin/python", "KonomiTV.py"]

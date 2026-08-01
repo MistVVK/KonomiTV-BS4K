@@ -2,11 +2,13 @@
 import asyncio
 import atexit
 import mimetypes
+from collections.abc import Awaitable
 from pathlib import Path
 
 import tortoise.contrib.fastapi
 import tortoise.log
 from fastapi import FastAPI, Request, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -55,8 +57,11 @@ from app.routers import (
     VideosRouter,
     VideoStreamsRouter,
 )
+from app.streams.LivePrepareCoordinator import LIVE_PREPARE_COORDINATOR
+from app.streams.LiveSourceCoordinator import LIVE_SOURCE_COORDINATOR
 from app.streams.LiveStream import LiveStream
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
+from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
 from app.utils.HTTPS import BuildServerStartupSettings, ReverseProxyMiddleware
@@ -80,6 +85,23 @@ app = FastAPI(
     docs_url = '/api/docs',
     redoc_url = '/api/redoc',
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def RequestValidationExceptionHandler(request: Request, exception: Exception):
+    """
+    パス設定APIだけ入力値を除いた422へ変換し、それ以外は標準形式を維持する。
+
+    Args:
+        request (Request): バリデーションに失敗したHTTPリクエスト。
+        exception (Exception): FastAPIが渡すRequestValidationError。
+
+    Returns:
+        JSONResponse: SettingsRouterの安全な422レスポンス。
+    """
+
+    assert isinstance(exception, RequestValidationError)
+    return await SettingsRouter.HostPathRequestValidationErrorHandler(request, exception)
 
 # ルーターの追加
 app.include_router(ChannelsRouter.router)
@@ -291,6 +313,9 @@ async def Startup():
     # 録画スキャナーを起動する前に、前プロセスが残した非稼働CM解析workspaceだけを回収する。
     await CMAnalysisWorkspace.cleanupStale()
 
+    # DBから到達不能になった字幕cacheを、録画スキャナー開始前にも安全に回収する。
+    await RecordedSubtitleStream.cleanupOrphanedCaches()
+
     # 録画フォルダ監視・メタデータ更新/同期タスクを開始
     ## 録画ファイルの量次第では録画ファイルの更新確認に時間がかかるため、非同期で実行する
     # ref: https://docs.astral.sh/ruff/rules/asyncio-dangling-task/
@@ -327,49 +352,195 @@ async def UpdateChannelJikkyoStatus():
     if CONFIG.general.jikkyo_enabled is True:
         await Channel.updateJikkyoStatus()
 
-# サーバーの終了時に実行する
-cleanup = False
-@app.on_event('shutdown')
-async def Shutdown():
+# サーバーの終了処理は FastAPI と atexit のどちらから呼ばれても同じ Task を共有する
+_shutdown_completed = False
+_shutdown_task: asyncio.Task[None] | None = None
 
-    # 2度呼ばれないように
-    global cleanup
-    if cleanup is True:
-        return
-    cleanup = True
 
-    # 全てのライブストリームを終了する
-    for live_stream in LiveStream.getAllLiveStreams():
-        live_stream.setStatus('Offline', 'ライブストリームは Offline です。', True)
+async def _RunShutdownCleanup() -> None:
+    """
+    アプリ終了時に共有 source と Prepare lease をすべて解放する。
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
+
+    cleanup_failures: list[BaseException] = []
+
+    def RecordUnconfirmedCleanup(label: str, result: object) -> None:
+        """bool 契約が True でない cleanup 結果を失敗として記録する。"""
+
+        failure = (
+            result
+            if isinstance(result, BaseException)
+            else RuntimeError(f'{label}:{result!r}')
+        )
+        cleanup_failures.append(failure)
+        logging.error(f'{label} Shutdown cleanup was not confirmed: {result!r}')
+
+    async def RunCleanupStep(
+        label: str,
+        operation: Awaitable[object],
+    ) -> tuple[bool, object | None]:
+        """一工程の失敗後も残りの終了処理を続け、成否と結果を返す。"""
+
+        try:
+            return True, await operation
+        except BaseException as ex:
+            cleanup_failures.append(ex)
+            logging.error(f'{label} Shutdown cleanup failed.', exc_info=ex)
+            return False, None
+
+    # LiveStream の接続・エンコーダーと共有 source producer を同時に停止する
+    ## LiveStream.shutdown() は HTTP 要求から分離した session Retire / Prepare cleanup も回収する
+    live_streams = LiveStream.getAllLiveStreams()
+    shutdown_results = await asyncio.gather(
+        *(live_stream.shutdown() for live_stream in live_streams),
+        LIVE_SOURCE_COORDINATOR.shutdown(),
+        return_exceptions = True,
+    )
+    for live_stream, result in zip(live_streams, shutdown_results[:len(live_streams)]):
+        if result is not True:
+            RecordUnconfirmedCleanup(live_stream.log_prefix, result)
+    source_shutdown_result = shutdown_results[-1]
+    if source_shutdown_result is not True:
+        RecordUnconfirmedCleanup('[LiveSourceCoordinator]', source_shutdown_result)
+
+    # 切断により生成された Prepare finalize を待ち、そこから増えた LiveStream cleanup も再度回収する
+    prepare_drain_succeeded, prepare_drain_result = await RunCleanupStep(
+        '[LivePrepareCoordinator] finalize drain',
+        LIVE_PREPARE_COORDINATOR.drainFinalizeTasks(),
+    )
+    if prepare_drain_succeeded and prepare_drain_result is not True:
+        RecordUnconfirmedCleanup(
+            '[LivePrepareCoordinator] finalize drain',
+            prepare_drain_result,
+        )
+    redrain_results = await asyncio.gather(
+        *(live_stream.drainCleanupTasks() for live_stream in live_streams),
+        return_exceptions = True,
+    )
+    for live_stream, result in zip(live_streams, redrain_results):
+        if result is not True:
+            RecordUnconfirmedCleanup(f'{live_stream.log_prefix} redrain', result)
+
+    # cleanup 完了後も残っている lease だけを shutdown fallback として解放する
+    await RunCleanupStep(
+        '[LivePrepareCoordinator] release all',
+        LIVE_PREPARE_COORDINATOR.releaseAll(reason='shutdown'),
+    )
 
     # 全てのチューナーインスタンスを終了する (ライブ放送波を EDCB から受信している場合のみ)
     if CONFIG.general.live_stream_backend == 'EDCB':
-        await EDCBTuner.closeAll()
+        await RunCleanupStep('[EDCBTuner]', EDCBTuner.closeAll())
 
     # 録画フォルダ監視タスクを停止
     global recorded_scan_task
     if recorded_scan_task is not None:
-        await recorded_scan_task.stop()
-        recorded_scan_task = None
+        scan_stop_succeeded, _scan_stop_result = await RunCleanupStep(
+            '[RecordedScanTask]',
+            recorded_scan_task.stop(),
+        )
+        if scan_stop_succeeded:
+            recorded_scan_task = None
 
     # DB接続が閉じられる前にproducerのシリーズ判定を先に止め、その後に話数判定を停止する。
     # 逆順では、停止済みの話数ワーカーへSeries側がenqueueして再起動する競合が起こり得る。
-    await RecordedSeriesResolver.stop()
-    await RecordedEpisodeAutomation.stop()
+    await RunCleanupStep('[RecordedSeriesResolver]', RecordedSeriesResolver.stop())
+    await RunCleanupStep('[RecordedEpisodeAutomation]', RecordedEpisodeAutomation.stop())
 
     # DB接続が閉じられる前に、HTTP接続から分離した手動CM再判定を中断・回収する。
-    await CMAnalysisTaskManager.stop()
+    await RunCleanupStep('[CMAnalysisTaskManager]', CMAnalysisTaskManager.stop())
 
     # DB接続が閉じられる前に録画再生用インデックスワーカーを停止する。
-    await RecordedPlaybackIndexer.stop()
+    await RunCleanupStep('[RecordedPlaybackIndexer]', RecordedPlaybackIndexer.stop())
 
-    # 非同期タスクの終了処理が完全に終わるよう、もう少しだけ待つ
-    # この待機を省略すると LiveEncodingTask などの終了前に Tortoise ORM の DB 接続が閉じられ、エラートレースバックが出力される
-    await asyncio.sleep(0.5)
+    if cleanup_failures:
+        raise RuntimeError('shutdown_cleanup_failed') from BaseExceptionGroup(
+            'application shutdown cleanup failures',
+            cleanup_failures,
+        )
+
+
+async def _RunShutdownCleanupOnce() -> None:
+    """
+    終了処理本体を実行し、例外なく完了した場合だけ完了状態を確定する。
+
+    Returns:
+        None
+    """
+
+    global _shutdown_completed
+    await _RunShutdownCleanup()
+    _shutdown_completed = True
+
+
+@app.on_event('shutdown')
+async def Shutdown() -> None:
+    """
+    同時・再呼び出し間で終了処理 Task を共有し、呼び出し側のキャンセルから保護して待機する。
+
+    Returns:
+        None
+    """
+
+    global _shutdown_task
+    if _shutdown_completed is True:
+        return
+
+    running_loop = asyncio.get_running_loop()
+    shutdown_task = _shutdown_task
+    if shutdown_task is not None:
+        if shutdown_task.done() is True:
+            # 失敗またはキャンセルで完了状態が確定しなかった Task は再試行対象とする。
+            _shutdown_task = None
+            shutdown_task = None
+        elif shutdown_task.get_loop() is not running_loop:
+            # atexit は FastAPI の event loop 終了後に別 loop で呼ばれる。
+            # 閉じた loop に残った未完 Task は進行不能なので、新しい loop で cleanup を再試行する。
+            if shutdown_task.get_loop().is_closed() is False:
+                raise RuntimeError('Shutdown cleanup is already running on another event loop.')
+            _shutdown_task = None
+            shutdown_task = None
+
+    if shutdown_task is None:
+        shutdown_task = running_loop.create_task(
+            _RunShutdownCleanupOnce(),
+            name = 'app-shutdown-cleanup',
+        )
+        _shutdown_task = shutdown_task
+
+    try:
+        # shutdown event の呼び出し側だけがキャンセルされても、共有 cleanup Task は継続させる。
+        await asyncio.shield(shutdown_task)
+    except BaseException:
+        # cleanup Task 自体が失敗またはキャンセルされた場合だけ参照を外し、次回呼び出しを再試行可能にする。
+        if shutdown_task.done() is True and _shutdown_task is shutdown_task:
+            _shutdown_task = None
+        raise
+
 
 # shutdown イベントが発火しない場合も想定し、アプリケーションの終了時に Shutdown() が確実に呼ばれるように
-# atexit は同期関数しか実行できないので、asyncio.run() でくるむ
-atexit.register(asyncio.run, Shutdown())
+def _ShutdownAtExit() -> None:
+    """
+    FastAPI 側で完了していない終了処理を、interpreter 終了時の新しい event loop で再試行する。
+
+    Returns:
+        None
+    """
+
+    if _shutdown_completed is True:
+        return
+    try:
+        asyncio.run(Shutdown())
+    except BaseException as ex:
+        logging.error('Shutdown cleanup failed during interpreter exit.', exc_info=ex)
+
+
+atexit.register(_ShutdownAtExit)
 
 # 互換 API は通常 API と同じプロセス・DB・ストリーム状態を共有する一方、別の FastAPI ルーター集合を使う。
 # lifespan は PortDispatchApplication が通常アプリだけへ転送するため、起動・終了処理が二重に走ることはない。

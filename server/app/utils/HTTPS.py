@@ -66,7 +66,9 @@ def BuildServerStartupSettings(server_settings: Any, port: int | None = None) ->
 def GetRequiredThirdpartyLibraries(https_mode: str) -> set[str]:
     """HTTPS モードに応じて起動前に存在確認する thirdparty を返す。"""
 
-    libraries = {'FFmpeg', 'FFprobe', 'QSVEncC', 'NVEncC', 'VCEEncC', 'tsreadex', 'psisiarc'}
+    # ライブ・録画・メタデータ解析はすべて FFmpeg 8 系へ統一されている
+    ## 公開設定の GPU バックエンド識別子は互換性のため維持するが、独立した実行ファイルは必要ない
+    libraries = {'FFmpeg8', 'FFmpeg8AMD', 'FFprobe8', 'tsreadex', 'psisiarc'}
     if https_mode == 'akebi':
         libraries.add('Akebi')
     return libraries
