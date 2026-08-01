@@ -1,5 +1,23 @@
 # AGENTS.md
 
+## KonomiTV-BS4K の必須指示読込
+
+`KonomiTV-BS4K/` に関係する依頼（質問への回答、調査、計画、
+レビュー、編集、コマンド実行を含む）では、対象作業を始める前に、
+次の2ファイルをこの順で必ず EOF まで全文読むこと。
+
+1. `KonomiTV-BS4K/AGENTS.md`
+2. `KonomiTV-BS4K/AGENTS-BS4K.md`
+
+両ファイルを読み終えるまでは、ファイルの所在確認と読取り以外の
+作業を行ってはならない。抜粋、検索結果、過去の記憶、要約で
+全文読了を代替してはならない。
+
+両ファイルの指示が矛盾する場合は `AGENTS-BS4K.md` を優先する。
+
+ユーザーから「AGENTS.md を読んで」と指示された場合は、
+上記2ファイルも対象に含め、読了後に各ファイルのパスと行数を報告すること。
+
 ## プロジェクト固有の注意事項
 
 - yarn や poetry はそれぞれ `client/` と `server/` のディレクトリに移動した状態で実行してください。ルートディレクトリにはパッケージ管理系のファイルは一切配置していません。
@@ -26,7 +44,7 @@
   - 起動すると port 7001 で Akebi HTTPS Server 経由でリッスンされます (内部の Vite は `127.0.0.77:7011` でリッスンします)
 - **重複起動は禁止**です。起動前に必ず `ps -ef | grep vite` などで既存プロセスの有無を確認してください
 - `yarn dev` で起動するクライアントは、開発モード時のみ同じドメインの `:7000` のサーバー API を直接叩くようハードコードされています ([client/src/utils/Utils.ts](client/src/utils/Utils.ts) の `Utils.api_base_url` を参照)。Vite の proxy 設定は不要です
-- Chrome DevTools MCP からの検証時は `https://my.local.konomi.tv:7001` にアクセスしてください
+- Chrome DevTools MCP や Playwright からの検証時は `https://my.local.konomi.tv:7001` にアクセスしてください
 - クライアント開発サーバー経由で API リクエストが想定通りに動かない場合でも、**サーバーを立て直そうとしないでください**。まず `Utils.api_base_url` の DEV 分岐の挙動を読み直し、port 7000 で動いているサーバー側の状態を `ps -ef | grep KonomiTV` などで確認してください
 
 ### Docker 版ステージング (port 7100、別物)
