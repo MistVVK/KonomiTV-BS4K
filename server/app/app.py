@@ -23,6 +23,7 @@ from app.metadata.RecordedScanTask import RecordedScanTask
 from app.models.Channel import Channel
 from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.Program import Program
+from app.models.RefreshToken import RefreshToken
 from app.routers import (
     BlueskyRouter,
     CapturesRouter,
@@ -223,6 +224,9 @@ recorded_scan_task: RecordedScanTask | None = None
 @app.on_event('startup')
 async def Startup():
     global recorded_scan_task
+
+    # 期限切れの更新トークンを起動時に削除し、認証テーブルの無制限増加を防ぐ
+    await RefreshToken.cleanupExpired()
 
     # サーバー停止中を含めて期限切れになった OAuth state の PKCE verifier を起動直後に消去
     await NiconicoOAuthState.cleanupExpired()

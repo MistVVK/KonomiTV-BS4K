@@ -3,16 +3,18 @@ import asyncio
 import pathlib
 import uuid
 from datetime import datetime, timedelta
-from typing import Annotated, BinaryIO
+from typing import Annotated, BinaryIO, cast
 
 import anyio
 from fastapi import (
     APIRouter,
     Body,
+    Cookie,
     Depends,
     File,
     HTTPException,
     Path,
+    Request,
     Response,
     UploadFile,
     status,
@@ -21,7 +23,9 @@ from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from PIL import Image
+from tortoise import timezone
 from tortoise.exceptions import IntegrityError
+from tortoise.transactions import in_transaction
 
 from app import logging, schemas
 from app.constants import (
@@ -33,8 +37,19 @@ from app.constants import (
 )
 from app.models.AccountLink import AccountLink
 from app.models.BlueskyAccount import BlueskyAccount
+from app.models.RefreshToken import RefreshToken
 from app.models.TwitterAccount import TwitterAccount
 from app.models.User import User
+from app.utils.AuthSecurity import (
+    DUMMY_PASSWORD_HASH,
+    LOGIN_ATTEMPT_LIMITER,
+    GenerateRefreshToken,
+    GenerateRefreshTokenFamilyID,
+    GetClientIP,
+    GetUsernameFingerprint,
+    GetUsernameRateLimitKey,
+    HashRefreshToken,
+)
 
 
 # ルーター
@@ -43,17 +58,72 @@ router = APIRouter(
     prefix = '/api/users',
 )
 
+# JWT アクセストークンの有効期間
+ACCESS_TOKEN_LIFETIME = timedelta(minutes=15)
+# 更新トークンの有効期間（ローテーション時に更新される）
+REFRESH_TOKEN_LIFETIME = timedelta(days=30)
+# 更新トークンを保存する HttpOnly Cookie
+REFRESH_TOKEN_COOKIE_NAME = 'KonomiTV-Refresh-Token'
+REFRESH_TOKEN_COOKIE_PATH = '/api/users'
+REFRESH_TOKEN_COOKIE_MAX_AGE = int(REFRESH_TOKEN_LIFETIME.total_seconds())
 
-def GenerateAccessToken(user_id: int) -> str:
+
+def SetRefreshTokenCookie(request: Request, response: Response, refresh_token: str) -> None:
+    """更新トークンをHttpOnly Cookieへ設定する。"""
+
+    response.set_cookie(
+        key = REFRESH_TOKEN_COOKIE_NAME,
+        value = refresh_token,
+        max_age = REFRESH_TOKEN_COOKIE_MAX_AGE,
+        httponly = True,
+        secure = request.url.scheme == 'https',
+        samesite = 'lax',
+        path = REFRESH_TOKEN_COOKIE_PATH,
+    )
+
+
+def DeleteRefreshTokenCookie(request: Request, response: Response) -> None:
+    """更新トークンCookieを削除する。"""
+
+    response.delete_cookie(
+        key = REFRESH_TOKEN_COOKIE_NAME,
+        httponly = True,
+        secure = request.url.scheme == 'https',
+        samesite = 'lax',
+        path = REFRESH_TOKEN_COOKIE_PATH,
+    )
+
+
+def InvalidRefreshTokenException(request: Request) -> HTTPException:
+    """更新トークンの詳細を漏らさない共通エラーを生成する。"""
+
+    # HTTPException を投げると FastAPI は依存注入された Response のCookieをコピーしないため、
+    # 削除Cookieを例外応答のヘッダーへ明示的に引き継ぐ。
+    delete_response = Response()
+    DeleteRefreshTokenCookie(request, delete_response)
+    return HTTPException(
+        status_code = status.HTTP_401_UNAUTHORIZED,
+        detail = 'Refresh token is invalid',
+        headers = {
+            'Cache-Control': 'no-store',
+            'Set-Cookie': delete_response.headers['set-cookie'],
+        },
+    )
+
+
+def GenerateAccessToken(user_id: int, token_version: int) -> str:
     """
     ユーザー ID を受け取り、そのユーザー ID を含む JWT アクセストークンを生成する
 
     Args:
         user_id (int): ユーザー ID
+        token_version (int): ユーザーのJWT失効バージョン
 
     Returns:
-        str: JWT アクセストークン (有効期限は 180 日間)
+        str: JWT アクセストークン (有効期限は 15 分間)
     """
+
+    issued_at = datetime.now(JST)
 
     # JWT エンコードするペイロード
     jwt_payload = {
@@ -63,10 +133,12 @@ def GenerateAccessToken(user_id: int) -> str:
         'typ': 'AccessToken',
         # ユーザーの識別子 (ユーザー ID を文字列化したもの)
         'sub': f'{user_id}',
+        # パスワード変更時に既存トークンを失効させるためのバージョン
+        'token_version': token_version,
         # JWT の発行時間
-        'iat': datetime.now(JST),
-        # JWT の有効期限 (JWT の発行から 180 日間)
-        'exp': datetime.now(JST) + timedelta(days=180),
+        'iat': issued_at,
+        # JWT の有効期限 (JWT の発行から 15 分間)
+        'exp': issued_at + ACCESS_TOKEN_LIFETIME,
         # JWT ごとの一意な ID (UUID v4)
         'jti': str(uuid.uuid4()),
     }
@@ -109,17 +181,27 @@ async def GetCurrentUser(token: Annotated[str, Depends(OAuth2PasswordBearer(toke
                 headers = {'WWW-Authenticate': 'Bearer'},
             )
 
+        # token_version がない旧JWTや不正な型のJWTは受け入れない
+        ## パスワード変更時に既存JWTを確実に失効させるため、再ログインを要求する
+        token_version = jwt_payload.get('token_version')
+        if type(token_version) is not int or token_version < 0:
+            logging.warning('[GetCurrentUser] Access token version is invalid.')
+            raise HTTPException(
+                status_code = status.HTTP_401_UNAUTHORIZED,
+                detail = 'Access token is invalid',
+                headers = {'WWW-Authenticate': 'Bearer'},
+            )
+
+        user_id = int(jwt_payload['sub'])
+
     # JWT トークンが不正
-    except JWTError as ex:
+    except (JWTError, TypeError, ValueError) as ex:
         logging.warning('[GetCurrentUser] Access token is invalid:', exc_info=ex)
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
             detail = 'Access token is invalid',
             headers = {'WWW-Authenticate': 'Bearer'},
         )
-
-    # JWT ペイロードの Subject をユーザー ID として取得
-    user_id: int = int(jwt_payload['sub'])
 
     # JWT トークンに刻まれたユーザー ID に紐づくユーザー情報を取得
     ## 認証時の Depends として認証が必要な全 API から呼ばれるメソッドなので、ここでは関連アカウントの取得を行わない
@@ -132,6 +214,15 @@ async def GetCurrentUser(token: Annotated[str, Depends(OAuth2PasswordBearer(toke
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
             detail = 'User associated with access token does not exist',
+            headers = {'WWW-Authenticate': 'Bearer'},
+        )
+
+    # パスワード変更などでユーザーのトークンバージョンが進んでいる
+    if current_user.token_version != token_version:
+        logging.warning(f'[GetCurrentUser] Access token version is obsolete. [user_id: {user_id}]')
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = 'Access token is invalid',
             headers = {'WWW-Authenticate': 'Bearer'},
         )
 
@@ -272,6 +363,8 @@ async def UserCreateAPI(
     response_model = schemas.UserAccessToken,
 )
 async def UserAccessTokenAPI(
+    request: Request,
+    response: Response,
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
 ):
     """
@@ -282,32 +375,155 @@ async def UserAccessTokenAPI(
     この API はアクセストークンを発行するだけで、ログインそのものは行わない。
     """
 
+    client_ip = GetClientIP(request)
+    username_key = GetUsernameRateLimitKey(form_data.username)
+
+    # IP とユーザー名のどちらかが制限中なら認証処理を行わない
+    retry_after = await LOGIN_ATTEMPT_LIMITER.Check(client_ip, username_key)
+    if retry_after is not None:
+        logging.warning(
+            '[UsersRouter][UserAccessTokenAPI] Login attempt was rate limited. '
+            f'[client_ip: {client_ip}, username_fingerprint: {GetUsernameFingerprint(form_data.username)}]'
+        )
+        raise HTTPException(
+            status_code = status.HTTP_429_TOO_MANY_REQUESTS,
+            detail = 'Too many login attempts',
+            headers = {
+                'Retry-After': str(retry_after),
+                'Cache-Control': 'no-store',
+            },
+        )
+
     # ユーザーを取得
     current_user = await User.filter(name=form_data.username).get_or_none()
 
-    # 指定されたユーザーが存在しない
-    if not current_user:
-        logging.warning(f'[UsersRouter][UserAccessTokenAPI] Incorrect username. [username: {form_data.username}]')
+    # ユーザーが存在しない場合も固定bcryptハッシュを検証し、応答時間の差を抑える
+    password_hash = current_user.password if current_user is not None else DUMMY_PASSWORD_HASH
+    password_is_valid = PASSWORD_CONTEXT.verify(form_data.password, password_hash)
+
+    # ユーザーが存在しない場合とパスワードが違う場合は同じ応答にする
+    if current_user is None or password_is_valid is False:
+        await LOGIN_ATTEMPT_LIMITER.RecordFailure(client_ip, username_key)
+        logging.warning(
+            '[UsersRouter][UserAccessTokenAPI] Login credentials were rejected. '
+            f'[client_ip: {client_ip}, username_fingerprint: {GetUsernameFingerprint(form_data.username)}]'
+        )
         raise HTTPException(
             status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = 'Incorrect username',
-            headers = {'WWW-Authenticate': 'Bearer'},
+            detail = 'Invalid credentials',
+            headers = {
+                'WWW-Authenticate': 'Bearer',
+                'Cache-Control': 'no-store',
+            },
         )
 
-    # 指定されたパスワードのハッシュが DB にあるものと一致しない
-    if not PASSWORD_CONTEXT.verify(form_data.password, current_user.password):
-        logging.warning(f'[UsersRouter][UserAccessTokenAPI] Incorrect password. [username: {form_data.username}]')
-        raise HTTPException(
-            status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = 'Incorrect password',
-            headers = {'WWW-Authenticate': 'Bearer'},
-        )
+    await LOGIN_ATTEMPT_LIMITER.RecordSuccess(username_key)
+
+    # ログイン成功時に更新トークンを発行し、DBにはハッシュだけを保存する
+    refresh_token = GenerateRefreshToken()
+    await RefreshToken.create(
+        token_hash = HashRefreshToken(refresh_token),
+        family_id = GenerateRefreshTokenFamilyID(),
+        user_id = current_user.id,
+        expires_at = timezone.now() + REFRESH_TOKEN_LIFETIME,
+    )
+    SetRefreshTokenCookie(request, response, refresh_token)
+    response.headers['Cache-Control'] = 'no-store'
 
     # JWT アクセストークンを生成して返す
     return schemas.UserAccessToken(
-        access_token = GenerateAccessToken(current_user.id),
+        access_token = GenerateAccessToken(current_user.id, current_user.token_version),
         token_type = 'bearer',
     )
+
+
+@router.post(
+    '/refresh',
+    summary = 'アクセストークン更新 API',
+    response_description = '更新されたJWTアクセストークン。',
+    response_model = schemas.UserAccessToken,
+)
+async def RefreshAccessTokenAPI(
+    request: Request,
+    response: Response,
+    refresh_token_cookie: Annotated[str | None, Cookie(alias=REFRESH_TOKEN_COOKIE_NAME)] = None,
+):
+    """HttpOnly Cookie の更新トークンをローテーションしてアクセストークンを更新する。"""
+
+    if refresh_token_cookie is None:
+        raise InvalidRefreshTokenException(request)
+
+    now = timezone.now()
+    refresh_token_hash = HashRefreshToken(refresh_token_cookie)
+    new_refresh_token = GenerateRefreshToken()
+    new_refresh_token_hash = HashRefreshToken(new_refresh_token)
+    user: User | None = None
+    refresh_token_error = False
+
+    # 同じ更新トークンの同時利用を直列化し、利用済みトークンの再利用時は
+    # ファミリー全体を失効させる。
+    async with in_transaction() as connection:
+        refresh_token = await RefreshToken.filter(
+            token_hash = refresh_token_hash,
+        ).select_for_update().using_db(connection).get_or_none()
+
+        if refresh_token is None:
+            refresh_token_error = True
+        elif refresh_token.revoked_at is not None or refresh_token.expires_at <= now:
+            await RefreshToken.filter(
+                family_id = refresh_token.family_id,
+            ).using_db(connection).update(revoked_at = now)
+            refresh_token_error = True
+        else:
+            refresh_token_user_id = cast(int, getattr(refresh_token, 'user_id'))
+            user = await User.filter(id=refresh_token_user_id).select_for_update().using_db(connection).get_or_none()
+            if user is None:
+                refresh_token_error = True
+            else:
+                refresh_token.revoked_at = now
+                refresh_token.replaced_by_hash = new_refresh_token_hash
+                await refresh_token.save(
+                    using_db = connection,
+                    update_fields = ['revoked_at', 'replaced_by_hash'],
+                )
+                await RefreshToken.create(
+                    token_hash = new_refresh_token_hash,
+                    family_id = refresh_token.family_id,
+                    user_id = user.id,
+                    expires_at = now + REFRESH_TOKEN_LIFETIME,
+                    using_db = connection,
+                )
+
+    if refresh_token_error or user is None:
+        raise InvalidRefreshTokenException(request)
+
+    SetRefreshTokenCookie(request, response, new_refresh_token)
+    response.headers['Cache-Control'] = 'no-store'
+    return schemas.UserAccessToken(
+        access_token = GenerateAccessToken(user.id, user.token_version),
+        token_type = 'bearer',
+    )
+
+
+@router.post(
+    '/logout',
+    summary = 'ログアウト API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def UserLogoutAPI(
+    request: Request,
+    response: Response,
+    refresh_token_cookie: Annotated[str | None, Cookie(alias=REFRESH_TOKEN_COOKIE_NAME)] = None,
+):
+    """現在の更新トークンを失効させ、Cookieを削除する。"""
+
+    if refresh_token_cookie is not None:
+        await RefreshToken.filter(
+            token_hash = HashRefreshToken(refresh_token_cookie),
+            revoked_at__isnull = True,
+        ).update(revoked_at = timezone.now())
+
+    DeleteRefreshTokenCookie(request, response)
 
 
 @router.get(
@@ -499,12 +715,32 @@ async def UserUpdateAPI(
         # 新しいユーザー名を設定
         current_user.name = user_update_request.username
 
-    # パスワードを更新（存在する場合）
+    # パスワードを更新する場合は、行ロック下でハッシュとトークンバージョンを更新する
+    ## 並行するパスワード変更で token_version の増分が失われないようにする
     if user_update_request.password is not None:
-        current_user.password = PASSWORD_CONTEXT.hash(user_update_request.password)  # ハッシュ化されたパスワード
+        password_hash = PASSWORD_CONTEXT.hash(user_update_request.password)
+        async with in_transaction() as connection:
+            locked_user = await User.filter(id=current_user.id).select_for_update().using_db(connection).get()
+            if user_update_request.username is not None:
+                locked_user.name = current_user.name
+            locked_user.password = password_hash
+            locked_user.token_version += 1
+            update_fields = ['password', 'token_version']
+            if user_update_request.username is not None:
+                update_fields.append('name')
+            await locked_user.save(
+                using_db = connection,
+                update_fields = update_fields,
+            )
 
-    # レコードを保存する
-    await current_user.save()
+            # パスワード変更時は、全端末の更新トークンも失効させる
+            await RefreshToken.filter(
+                user_id = locked_user.id,
+                revoked_at__isnull = True,
+            ).using_db(connection).update(revoked_at = timezone.now())
+    else:
+        # パスワードを変更しない場合は従来どおりユーザー名などだけを保存する
+        await current_user.save()
 
 
 @router.get(

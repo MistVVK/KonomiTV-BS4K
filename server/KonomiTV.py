@@ -188,6 +188,9 @@ def main(
         interface = 'asgi3',
         # HTTP プロトコルの実装として httptools を選択
         http = 'httptools',
+        # Akebi (127.0.0.77) が付与する転送ヘッダーだけを信頼し、実クライアントIPとHTTPS schemeを復元する
+        proxy_headers = True,
+        forwarded_allow_ips = '127.0.0.77',
         # イベントループのセットアップは自前で行うため、ここでは none を指定
         loop = 'none',
         # ストリーミング配信中にサーバーシャットダウンを要求された際、強制的に接続を切断するまでの秒数
