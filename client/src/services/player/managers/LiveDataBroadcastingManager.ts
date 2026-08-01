@@ -246,8 +246,10 @@ class LiveDataBroadcastingManager implements PlayerManager {
                         if (useSettingsStore().settings.enable_internet_access_from_data_broadcasting === false) {
                             return {};
                         }
+                        // target URL 全体 (query 含む) を path パラメータとして encode し、上流 query が KonomiTV の query に誤分離されないようにする
+                        const encoded_uri = encodeURIComponent(uri);
                         // サーバー側のプロキシ API 経由で HTTP GET リクエストを送信する
-                        const response = await APIClient.get<ArrayBuffer>(`/data-broadcasting/request/${uri}`, {
+                        const response = await APIClient.get<ArrayBuffer>(`/data-broadcasting/request/${encoded_uri}`, {
                             // レスポンスを ArrayBuffer として受け取る
                             responseType: 'arraybuffer',
                             // すべてのステータスコードで AxiosError にならないようにする
@@ -274,8 +276,11 @@ class LiveDataBroadcastingManager implements PlayerManager {
                                 response: new Uint8Array(),
                             };
                         }
+                        // target URL 全体 (query 含む) を path パラメータとして encode する
+                        const encoded_uri = encodeURIComponent(uri);
                         // サーバー側のプロキシ API 経由で HTTP POST リクエストを送信する
-                        const response = await APIClient.post<ArrayBuffer>(`/data-broadcasting/request/${uri}`, body, {
+                        // body は Shift_JIS / EUC-JP の raw 電文を byte 透過で送る（Form 再構築しない）
+                        const response = await APIClient.post<ArrayBuffer>(`/data-broadcasting/request/${encoded_uri}`, body, {
                             // 受け取ったフォームデータをそのまま送信する
                             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                             // レスポンスを ArrayBuffer として受け取る

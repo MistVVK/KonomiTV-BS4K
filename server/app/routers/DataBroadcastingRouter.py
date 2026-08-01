@@ -5,7 +5,7 @@ import time
 from typing import Annotated
 
 import httpx
-from fastapi import APIRouter, Form, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, HTTPException, Path, Query, Request, status
 from fastapi.responses import StreamingResponse
 from ping3 import ping
 
@@ -22,6 +22,43 @@ router = APIRouter(
 # 以下の API 実装は web-bml での実装を Python に移植したもの (with GPT-4)
 # ref: https://github.com/tsukumijima/web-bml/blob/master/server/index.ts#L195-L296
 
+# データ放送 POST の本文は Denbun 電文として最大 4096 バイトまでを byte 透過で転送する
+_MAX_POST_BODY_BYTES = 4096
+
+
+def _validateUpstreamURL(request_url: str) -> None:
+    """上流プロキシ対象 URL が HTTP/HTTPS であることを検証する。"""
+
+    if not (request_url.startswith('http://') or request_url.startswith('https://')):
+        logging.error(f'[DataBroadcastingRouter] Request URL must be http or https URL: {request_url}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Request URL must be http or https URL',
+        )
+
+
+def _filterResponseHeaders(response: httpx.Response) -> dict[str, str]:
+    """データ放送クライアントへ返す許可済み応答ヘッダだけを取り出す。"""
+
+    allowed_response_headers = {
+        'accept-ranges',
+        'authentication-info',
+        'last-modified',
+        'pragma',
+        'date',
+        'cache-control',
+        'age',
+        'expire',
+        'content-language',
+        'content-location',
+        'content-type',
+    }
+    return {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() in allowed_response_headers
+    }
+
 
 @router.get(
     '/request/{request_url:path}',
@@ -35,17 +72,12 @@ async def BMLBrowserRequestGETProxyAPI(
     """
     データ放送ブラウザ (web-bml) のネット接続機能から利用される、HTTP (GET) プロキシ。<br>
     Web ブラウザからの HTTP リクエストには CORS の制限があるため、この API を経由してリクエストを送信する。<br>
-    web-bml のネット接続機能専用の API で、web-bml 以外からは利用されない。
+    web-bml のネット接続機能専用の API で、web-bml 以外からは利用されない。<br>
+    request_url は client 側で encodeURIComponent 済みの target URL を path に載せたものであり、
+    サーバーは追加の unquote を行わず FastAPI が path として復元した URL をそのまま上流へ送る。
     """
 
-    # URLが HTTP または HTTPS URL かのバリデーション
-    if not (request_url.startswith("http://") or request_url.startswith("https://")):
-        logging.error(f'[DataBroadcastingRouter][BMLBrowserRequestGETProxyAPI] Request URL must be http or https URL: {request_url}')
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Request URL must be http or https URL',
-        )
-
+    _validateUpstreamURL(request_url)
     logging.debug(f'Request URL: {request_url}')
 
     headers = {
@@ -73,22 +105,11 @@ async def BMLBrowserRequestGETProxyAPI(
                 detail = f'Failed to request: {ex}',
             )
 
-    allowed_response_headers = [
-        'accept-ranges',
-        'authentication-info',
-        'last-modified',
-        'pragma',
-        'date',
-        'cache-control',
-        'age',
-        'expire',
-        'content-language',
-        'content-location',
-        'content-type',
-    ]
-    response_headers = {key: value for key, value in response.headers.items() if key.lower() in allowed_response_headers}
-
-    return StreamingResponse(response.iter_bytes(), headers=response_headers)
+    return StreamingResponse(
+        response.iter_bytes(),
+        status_code = response.status_code,
+        headers = _filterResponseHeaders(response),
+    )
 
 
 @router.post(
@@ -98,30 +119,32 @@ async def BMLBrowserRequestGETProxyAPI(
 )
 async def BMLBrowserRequestPOSTProxyAPI(
     request_url: Annotated[str, Path(description='リクエスト URL 。')],
-    Denbun: Annotated[str, Form(max_length=4096, description='データ放送ブラウザからのリクエストボディ (Denbun) 。')] = '',
+    request: Request,
 ):
     """
     データ放送ブラウザ (web-bml) のネット接続機能から利用される、HTTP (POST) プロキシ。<br>
     Web ブラウザからの HTTP リクエストには CORS の制限があるため、この API を経由してリクエストを送信する。<br>
     web-bml のネット接続機能専用の API で、web-bml 以外からは利用されない。<br>
-    Denbun は仕様書いわく「電文」のことらしく、データ放送ブラウザからの x-www-form-urlencoded 形式の値のキー名は Denbun で固定されている。
+    本文は Form 解釈せず raw body を最大 4096 バイトまで byte-for-byte で上流へ転送する
+    （Shift_JIS / EUC-JP の Denbun 電文を UTF-8 として壊さないため）。
     """
 
-    # URLが HTTP または HTTPS URL かのバリデーション
-    if not (request_url.startswith("http://") or request_url.startswith("https://")):
-        logging.error(f'[DataBroadcastingRouter][BMLBrowserRequestPOSTProxyAPI] Request URL must be http or https URL: {request_url}')
+    _validateUpstreamURL(request_url)
+    logging.debug(f'Request URL: {request_url}')
+
+    # Starlette FormParser を経由せず raw body を透過する
+    raw_body = await request.body()
+    if len(raw_body) > _MAX_POST_BODY_BYTES:
         raise HTTPException(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Request URL must be http or https URL',
+            detail = f'POST body must be at most {_MAX_POST_BODY_BYTES} bytes',
         )
 
-    logging.debug(f'Request URL: {request_url}')
-    logging.debug(f'Denbun: {Denbun}')
-
+    content_type = request.headers.get('content-type') or 'application/x-www-form-urlencoded'
     headers = {
         'Accept': '*/*',
         'Pragma': 'no-cache',
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': content_type,
     }
 
     # タイムアウトはデータ放送の動作を壊さないようにあえて設定しない
@@ -129,7 +152,7 @@ async def BMLBrowserRequestPOSTProxyAPI(
     ## 正確には放送波経由で古い規格の HTTPS 証明書が降ってきているらしいが、どのみち実装困難なので証明書の状態は無視する
     async with httpx.AsyncClient(headers={**API_REQUEST_HEADERS, **headers}, follow_redirects=True, verify=False) as client:
         try:
-            response = await client.post(request_url, content=f'Denbun={Denbun}')
+            response = await client.post(request_url, content=raw_body)
         except Exception as ex:
             # リクエスト中に例外が発生した場合は、エラーメッセージをログに出力して 500 エラーを返す
             ## HTTP リクエスト自体が DNS 名前解決エラーや接続エラーで失敗した場合に発生する
@@ -139,22 +162,11 @@ async def BMLBrowserRequestPOSTProxyAPI(
                 detail = f'Failed to request: {ex}',
             )
 
-    allowed_response_headers = [
-        'accept-ranges',
-        'authentication-info',
-        'last-modified',
-        'pragma',
-        'date',
-        'cache-control',
-        'age',
-        'expire',
-        'content-language',
-        'content-location',
-        'content-type',
-    ]
-    response_headers = {key: value for key, value in response.headers.items() if key.lower() in allowed_response_headers}
-
-    return StreamingResponse(response.iter_bytes(), headers=response_headers)
+    return StreamingResponse(
+        response.iter_bytes(),
+        status_code = response.status_code,
+        headers = _filterResponseHeaders(response),
+    )
 
 
 @router.get(
