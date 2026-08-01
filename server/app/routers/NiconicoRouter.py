@@ -1,10 +1,14 @@
 
 import base64
 import json
+import re
+from enum import StrEnum
 from typing import Annotated
+from urllib.parse import urlencode, urlsplit
 
 import httpx
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from jose import jwt
 
 from app import logging, schemas
@@ -13,7 +17,6 @@ from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentUser
 from app.utils import Interlaced
-from app.utils.OAuthCallbackResponse import OAuthCallbackResponse
 
 
 # ルーター
@@ -23,16 +26,134 @@ router = APIRouter(
 )
 
 
-def _BuildSettingsJikkyoRedirectUrl(client_url: str) -> str:
-    """クライアント URL から実況設定画面へのリダイレクト先を組み立てる。"""
+OAUTH_CALLBACK_RESPONSE_HEADERS = {
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+}
 
-    return f'{client_url.rstrip("/")}/settings/jikkyo'
+
+class NiconicoOAuthResult(StrEnum):
+    """クライアントへ通知するニコニコ OAuth 連携結果。"""
+
+    Success = 'Success'
+    AccessDenied = 'AccessDenied'
+    AuthorizationError = 'AuthorizationError'
+    AuthorizationCodeMissing = 'AuthorizationCodeMissing'
+    UserNotFound = 'UserNotFound'
+    TokenAPIError = 'TokenAPIError'
+    TokenAPITimeout = 'TokenAPITimeout'
+    UserAPIError = 'UserAPIError'
+    UserAPITimeout = 'UserAPITimeout'
 
 
-def _NormalizeClientUrl(client_url: str) -> str:
-    """クライアント URL を末尾スラッシュ付きで正規化する。"""
+def _NormalizeClientOrigin(client_origin: str) -> str:
+    """
+    クライアント Origin を、パスなどを含まない HTTPS Origin へ正規化する。
 
-    return client_url.rstrip('/') + '/'
+    Args:
+        client_origin: Origin ヘッダーまたはサーバー側 state に保存されたクライアント Origin。
+
+    Returns:
+        正規化済みの HTTPS Origin。
+
+    Raises:
+        ValueError: Origin として不正、または HTTPS 以外の URL が渡された場合。
+    """
+
+    try:
+        parsed_origin = urlsplit(client_origin)
+        port = parsed_origin.port
+    except ValueError as ex:
+        raise ValueError('Client Origin is invalid') from ex
+
+    # OAuth 結果の転送先は Secure Context である KonomiTV クライアントの Origin だけに限定する。
+    # ユーザー情報・パス・クエリ・フラグメントを許すと、資格情報の誤送信や任意パスへの転送につながる。
+    hostname = parsed_origin.hostname
+    if (
+        parsed_origin.scheme != 'https'
+        or hostname is None
+        or parsed_origin.username is not None
+        or parsed_origin.password is not None
+        or parsed_origin.path not in ['', '/']
+        or parsed_origin.query != ''
+        or parsed_origin.fragment != ''
+    ):
+        raise ValueError('Client Origin must be an HTTPS Origin without credentials, path, query, or fragment')
+
+    # Origin ヘッダーは ASCII で送信される。許可文字を限定し、空白や JavaScript 構文文字を排除する。
+    normalized_hostname = hostname.lower()
+    if ':' in normalized_hostname:
+        if re.fullmatch(r'[0-9a-f:.]+', normalized_hostname) is None:
+            raise ValueError('Client Origin contains an invalid IPv6 hostname')
+        normalized_host = f'[{normalized_hostname}]'
+    else:
+        if re.fullmatch(r'[a-z0-9.-]+', normalized_hostname) is None:
+            raise ValueError('Client Origin contains an invalid hostname')
+        normalized_host = normalized_hostname
+
+    # HTTPS の既定ポートは location.origin と同じ表現へそろえ、それ以外の明示ポートだけを保持する。
+    if port is not None and port != 443:
+        normalized_host += f':{port}'
+
+    return f'https://{normalized_host}'
+
+
+def _BuildSettingsJikkyoRedirectUrl(client_origin: str, result: NiconicoOAuthResult) -> str:
+    """
+    クライアント Origin から、固定形式の OAuth 結果を持つ実況設定画面 URL を組み立てる。
+
+    Args:
+        client_origin: 正規化済みのクライアント Origin。
+        result: クライアントへ通知する固定の OAuth 連携結果。
+
+    Returns:
+        実況設定画面へのリダイレクト URL。
+    """
+
+    return f'{client_origin}/settings/jikkyo#{urlencode({"result": result.value})}'
+
+
+def _CreateOAuthCallbackErrorResponse(detail: str, status_code: int) -> PlainTextResponse:
+    """
+    信頼できるクライアント Origin がない場合の、スクリプトを含まない固定エラー応答を作成する。
+
+    Args:
+        detail: サーバー側で定義した固定エラーメッセージ。
+        status_code: 応答する HTTP ステータスコード。
+
+    Returns:
+        キャッシュと外部リソース読み込みを禁止したプレーンテキスト応答。
+    """
+
+    return PlainTextResponse(
+        content = detail,
+        status_code = status_code,
+        headers = OAUTH_CALLBACK_RESPONSE_HEADERS,
+    )
+
+
+def _CreateOAuthCallbackRedirectResponse(
+    client_origin: str,
+    result: NiconicoOAuthResult,
+) -> RedirectResponse:
+    """
+    state に保存されたクライアント Origin へ OAuth 結果を返すリダイレクト応答を作成する。
+
+    Args:
+        client_origin: 正規化済みのクライアント Origin。
+        result: クライアントへ通知する固定の OAuth 連携結果。
+
+    Returns:
+        クライアントの実況設定画面へ遷移する 303 応答。
+    """
+
+    return RedirectResponse(
+        url = _BuildSettingsJikkyoRedirectUrl(client_origin, result),
+        status_code = status.HTTP_303_SEE_OTHER,
+        headers = OAUTH_CALLBACK_RESPONSE_HEADERS,
+    )
 
 
 @router.get(
@@ -54,9 +175,15 @@ async def NiconicoAuthURLAPI(
 
     # クライアント (フロントエンド) の URL を Origin ヘッダーから取得
     ## Origin ヘッダーがリクエストに含まれていない場合はこの API サーバーの URL を使う
-    client_url = _NormalizeClientUrl(
-        request.headers.get('Origin', f'https://{request.url.netloc}')
-    )
+    try:
+        client_origin = _NormalizeClientOrigin(
+            request.headers.get('Origin', f'https://{request.url.netloc}')
+        )
+    except ValueError as ex:
+        raise HTTPException(
+            status_code = status.HTTP_400_BAD_REQUEST,
+            detail = 'Client Origin is invalid',
+        ) from ex
 
     # コールバック URL を設定
     ## ニコニコ API の OAuth 連携では、事前にコールバック先の URL を運営側に設定しておく必要がある
@@ -71,16 +198,16 @@ async def NiconicoAuthURLAPI(
     # 代わりにサーバ側の短命・使い捨て state を発行し、その ID だけを OAuth state に載せる。
     oauth_state_id, code_challenge = await NiconicoOAuthState.issue(
         user_id = current_user.id,
-        client_url = client_url,
+        client_url = client_origin,
     )
 
     # コールバック後の NiconicoAuthCallbackAPI に渡す state の値
-    ## client も state 経由で転送されるが、サーバは DB 上の client_url を正本として使う
+    ## client は app.konomi.tv の従来リレー契約を維持するためだけに残し、サーバーは DB 上の client_url だけを正本として使う
     state = {
         # リダイレクト先の KonomiTV サーバー
         'server': f'https://{request.url.netloc}/',
-        # スマホ・タブレットでのフォールバック用クライアント URL（表示・旧経路向け）
-        'client': client_url,
+        # 従来リレーとの互換用クライアント Origin（callback 側では使用しない）
+        'client': client_origin,
         # サーバ側セッション ID（ログイン JWT ではない）
         'oauth_state': oauth_state_id,
     }
@@ -114,12 +241,12 @@ async def NiconicoAuthURLAPI(
 @router.get(
     '/callback',
     summary = 'ニコニコ OAuth コールバック API',
-    response_class = OAuthCallbackResponse,
-    response_description = 'ユーザーアカウントにニコニコアカウントのアクセストークン・リフレッシュトークンが登録できたことを示す。',
+    response_class = RedirectResponse,
+    response_description = 'OAuth 連携結果を KonomiTV クライアントへ通知するリダイレクト。',
 )
 async def NiconicoAuthCallbackAPI(
     oauth_state: Annotated[str | None, Query(description='サーバ発行の OAuth state ID。ログイン JWT ではない。')] = None,
-    client: Annotated[str | None, Query(description='OAuth 連携元クライアント URL（リダイレクト用フォールバック）。')] = None,
+    client: Annotated[str | None, Query(description='互換のため残す。リダイレクト先には使用しない。', include_in_schema=False)] = None,
     code: Annotated[str | None, Query(description='コールバック元から渡された認証コード。OAuth 認証が成功したときのみセットされる。')] = None,
     error: Annotated[str | None, Query(description='このパラメーターがセットされているとき、OAuth 認証がユーザーによって拒否されたことを示す。')] = None,
     # 旧実装が state に載せていたログイン JWT。受理してユーザー認証に使わない（SEC-001）。
@@ -129,14 +256,8 @@ async def NiconicoAuthCallbackAPI(
     ニコニコの OAuth 認証のコールバックを受け取り、ログイン中のユーザーアカウントとニコニコアカウントを紐づける。
     """
 
-    del user_access_token  # 意図的に未使用。クエリに残っていてもセッション認証には使わない。
-
-    # エラー応答用のリダイレクト先（state 消費前はクエリ client をフォールバックに使う）
-    if client:
-        redirect_url = _BuildSettingsJikkyoRedirectUrl(client)
-    else:
-        # client も無い場合は最低限の相対パス相当を避け、自サーバ設定画面を示すプレースホルダ
-        redirect_url = '/settings/jikkyo'
+    # 旧リレーが転送する client と user_access_token は受理だけして、認証・リダイレクトには一切使わない。
+    del client, user_access_token
 
     # state は OAuth の成功・拒否にかかわらず、callback へ到達した時点で一度だけ消費する。
     pending_state: NiconicoOAuthState | None = None
@@ -148,43 +269,49 @@ async def NiconicoAuthCallbackAPI(
 
     if oauth_state is None:
         logging.warning('[NiconicoRouter][NiconicoAuthCallbackAPI] OAuth state is missing.')
-        return OAuthCallbackResponse(
-            status_code = status.HTTP_401_UNAUTHORIZED,
+        return _CreateOAuthCallbackErrorResponse(
             detail = 'OAuth state is missing',
-            redirect_to = redirect_url,
+            status_code = status.HTTP_401_UNAUTHORIZED,
         )
 
     if pending_state is None:
         logging.warning('[NiconicoRouter][NiconicoAuthCallbackAPI] OAuth state is invalid or expired.')
-        return OAuthCallbackResponse(
-            status_code = status.HTTP_401_UNAUTHORIZED,
+        return _CreateOAuthCallbackErrorResponse(
             detail = 'OAuth state is invalid or expired',
-            redirect_to = redirect_url,
+            status_code = status.HTTP_401_UNAUTHORIZED,
         )
 
-    # リダイレクト先は発行時に保存した client_url を正本にする（クエリ改ざんを無視）
-    redirect_url = _BuildSettingsJikkyoRedirectUrl(pending_state.client_url)
+    # DB が手動変更されていても不正 URL へ転送しないよう、保存済み Origin を callback 側でも再検証する。
+    try:
+        client_origin = _NormalizeClientOrigin(pending_state.client_url)
+    except ValueError:
+        logging.error('[NiconicoRouter][NiconicoAuthCallbackAPI] Stored client Origin is invalid.')
+        return _CreateOAuthCallbackErrorResponse(
+            detail = 'Stored client Origin is invalid',
+            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
     # "error" パラメーターがセットされている
     # OAuth 認証がユーザーによって拒否されたことを示しているので、401 エラーにする
     if error is not None:
 
-        # 401 エラーを送出
-        ## コールバック元から渡されたエラーメッセージをそのまま表示する
-        logging.warning(f'[NiconicoRouter][NiconicoAuthCallbackAPI] Authorization was denied. ({error})')
-        return OAuthCallbackResponse(
-            status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = f'Authorization was denied ({error})',
-            redirect_to = redirect_url,
+        # 外部から渡された error は本文やログへ反映せず、既知値だけを固定結果へ変換する。
+        oauth_result = (
+            NiconicoOAuthResult.AccessDenied
+            if error == 'access_denied'
+            else NiconicoOAuthResult.AuthorizationError
         )
+        logging.warning(
+            f'[NiconicoRouter][NiconicoAuthCallbackAPI] Authorization failed. [result: {oauth_result.value}]'
+        )
+        return _CreateOAuthCallbackRedirectResponse(client_origin, oauth_result)
 
     # なぜか code がない
     if code is None:
         logging.error('[NiconicoRouter][NiconicoAuthCallbackAPI] Authorization code does not exist.')
-        return OAuthCallbackResponse(
-            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail = 'Authorization code does not exist',
-            redirect_to = redirect_url,
+        return _CreateOAuthCallbackRedirectResponse(
+            client_origin,
+            NiconicoOAuthResult.AuthorizationCodeMissing,
         )
 
     current_user = await User.filter(id=pending_state.user_id).get_or_none()
@@ -193,10 +320,9 @@ async def NiconicoAuthCallbackAPI(
             f'[NiconicoRouter][NiconicoAuthCallbackAPI] User for OAuth state does not exist. '
             f'[user_id: {pending_state.user_id}]'
         )
-        return OAuthCallbackResponse(
-            status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = 'User associated with OAuth state does not exist',
-            redirect_to = redirect_url,
+        return _CreateOAuthCallbackRedirectResponse(
+            client_origin,
+            NiconicoOAuthResult.UserNotFound,
         )
 
     try:
@@ -220,10 +346,9 @@ async def NiconicoAuthCallbackAPI(
         # ステータスコードが 200 以外
         if token_api_response.status_code != 200:
             logging.error(f'[NiconicoRouter][NiconicoAuthCallbackAPI] Failed to get access token. (HTTP Error {token_api_response.status_code})')
-            return OAuthCallbackResponse(
-                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail = f'Failed to get access token. (HTTP Error {token_api_response.status_code})',
-                redirect_to = redirect_url,
+            return _CreateOAuthCallbackRedirectResponse(
+                client_origin,
+                NiconicoOAuthResult.TokenAPIError,
             )
 
         token_api_response_json = token_api_response.json()
@@ -231,10 +356,9 @@ async def NiconicoAuthCallbackAPI(
     # 接続エラー（サーバーメンテナンスやタイムアウトなど）
     except (httpx.NetworkError, httpx.TimeoutException):
         logging.error('[NiconicoRouter][NiconicoAuthCallbackAPI] Failed to get access token. (Connection Timeout)')
-        return OAuthCallbackResponse(
-            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail = 'Failed to get access token. (Connection Timeout)',
-            redirect_to = redirect_url,
+        return _CreateOAuthCallbackRedirectResponse(
+            client_origin,
+            NiconicoOAuthResult.TokenAPITimeout,
         )
 
     # 取得したアクセストークンとリフレッシュトークンをユーザーアカウントに設定
@@ -259,10 +383,9 @@ async def NiconicoAuthCallbackAPI(
         # ステータスコードが 200 以外
         if user_api_response.status_code != 200:
             logging.error(f'[NiconicoRouter][NiconicoAuthCallbackAPI] Failed to get user information. (HTTP Error {user_api_response.status_code})')
-            return OAuthCallbackResponse(
-                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail = f'Failed to get user information (HTTP Error {user_api_response.status_code})',
-                redirect_to = redirect_url,
+            return _CreateOAuthCallbackRedirectResponse(
+                client_origin,
+                NiconicoOAuthResult.UserAPIError,
             )
 
         # ユーザー名
@@ -273,20 +396,18 @@ async def NiconicoAuthCallbackAPI(
     # 接続エラー（サーバー再起動やタイムアウトなど）
     except (httpx.NetworkError, httpx.TimeoutException):
         logging.error('[NiconicoRouter][NiconicoAuthCallbackAPI] Failed to get user information. (Connection Timeout)')
-        return OAuthCallbackResponse(
-            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail = 'Failed to get user information (Connection Timeout)',
-            redirect_to = redirect_url,
+        return _CreateOAuthCallbackRedirectResponse(
+            client_origin,
+            NiconicoOAuthResult.UserAPITimeout,
         )
 
     # 変更をデータベースに保存
     await current_user.save()
 
     # OAuth 連携が正常に完了したことを伝える
-    return OAuthCallbackResponse(
-        status_code = status.HTTP_200_OK,
-        detail = 'Success',
-        redirect_to = redirect_url,
+    return _CreateOAuthCallbackRedirectResponse(
+        client_origin,
+        NiconicoOAuthResult.Success,
     )
 
 

@@ -1,4 +1,4 @@
-"""ニコニコ OAuth state からログイン JWT を排除した SEC-001 修正の回帰テスト。"""
+"""ニコニコ OAuth state と callback の信頼境界を保護する SEC-001 / SEC-002 回帰テスト。"""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def test_niconico_oauth_state_issue_and_consume_are_one_time() -> None:
             user = await _CreateUser()
             state_id, code_challenge = await NiconicoOAuthState.issue(
                 user_id=user.id,
-                client_url='https://client.example/',
+                client_url='https://client.example',
             )
             assert state_id
             assert code_challenge
@@ -64,7 +64,7 @@ def test_niconico_oauth_state_issue_and_consume_are_one_time() -> None:
 
             record = await NiconicoOAuthState.consume(state_id)
             assert record.user_id == user.id
-            assert record.client_url == 'https://client.example/'
+            assert record.client_url == 'https://client.example'
             assert record.consumed_at is not None
             assert record.code_verifier is not None
 
@@ -88,7 +88,7 @@ def test_niconico_oauth_state_rejects_expired() -> None:
             user = await _CreateUser()
             state_id, _ = await NiconicoOAuthState.issue(
                 user_id=user.id,
-                client_url='https://client.example/',
+                client_url='https://client.example',
                 ttl=timedelta(seconds=1),
             )
             # 期限を過去へずらす
@@ -161,7 +161,7 @@ def test_niconico_oauth_state_reissue_keeps_one_row_per_user() -> None:
             for _ in range(50):
                 state_id, _ = await NiconicoOAuthState.issue(
                     user_id=user.id,
-                    client_url='https://client.example/',
+                    client_url='https://client.example',
                 )
                 serial_states.append(state_id)
             assert await NiconicoOAuthState.filter(user_id=user.id).count() == 1
@@ -172,7 +172,7 @@ def test_niconico_oauth_state_reissue_keeps_one_row_per_user() -> None:
             concurrent_states = await asyncio.gather(*(
                 NiconicoOAuthState.issue(
                     user_id=user.id,
-                    client_url='https://client.example/',
+                    client_url='https://client.example',
                 )
                 for _ in range(10)
             ))
@@ -235,7 +235,7 @@ def test_niconico_auth_url_does_not_embed_login_jwt(monkeypatch: pytest.MonkeyPa
             assert access_token not in state['oauth_state']
             # JWT の典型的な3セグメント形が state に混入していない
             assert state['oauth_state'].count('.') != 2
-            assert state['client'] == 'https://client.example/'
+            assert state['client'] == 'https://client.example'
             assert state['server'].startswith('https://')
             assert query['code_challenge_method'] == ['S256']
             assert len(query['code_challenge'][0]) == 43
@@ -264,7 +264,7 @@ def test_niconico_callback_uses_oauth_state_not_query_jwt(monkeypatch: pytest.Mo
             user = await _CreateUser()
             state_id, _ = await NiconicoOAuthState.issue(
                 user_id=user.id,
-                client_url='https://client.example/',
+                client_url='https://client.example',
             )
             issued_state = await NiconicoOAuthState.get(user_id=user.id)
             expected_code_verifier = issued_state.code_verifier
@@ -331,10 +331,12 @@ def test_niconico_callback_uses_oauth_state_not_query_jwt(monkeypatch: pytest.Mo
                     },
                 )
 
-            assert response.status_code == 200, response.text
-            # クエリ client の改ざんは使わず、発行時 client_url が redirect に入る
-            assert 'https://client.example/settings/jikkyo' in response.text
-            assert 'evil.example' not in response.text
+            assert response.status_code == 303, response.text
+            # クエリ client の改ざんは使わず、発行時 client_url だけへ固定結果を返す。
+            assert response.headers['Location'] == 'https://client.example/settings/jikkyo#result=Success'
+            assert 'evil.example' not in response.headers['Location']
+            assert response.headers['Cache-Control'] == 'no-store'
+            assert response.headers['Referrer-Policy'] == 'no-referrer'
 
             await user.refresh_from_db()
             assert user.niconico_access_token == 'nico-access'
@@ -377,7 +379,7 @@ def test_niconico_callback_consumes_state_when_authorization_is_denied(
             user = await _CreateUser()
             state_id, _ = await NiconicoOAuthState.issue(
                 user_id=user.id,
-                client_url='https://client.example/',
+                client_url='https://client.example',
             )
             network_client = Mock(side_effect=AssertionError('HTTP client must not be created'))
             monkeypatch.setattr(niconico_router_module, 'HTTPX_CLIENT', network_client)
@@ -398,9 +400,9 @@ def test_niconico_callback_consumes_state_when_authorization_is_denied(
                     },
                 )
 
-            assert response.status_code == 401
-            assert 'https://client.example/settings/jikkyo' in response.text
-            assert 'evil.example' not in response.text
+            assert response.status_code == 303
+            assert response.headers['Location'] == 'https://client.example/settings/jikkyo#result=AccessDenied'
+            assert 'evil.example' not in response.headers['Location']
             network_client.assert_not_called()
 
             consumed_state = await NiconicoOAuthState.get(user_id=user.id)
@@ -442,9 +444,138 @@ def test_niconico_callback_rejects_missing_oauth_state(monkeypatch: pytest.Monke
                 )
 
             assert response.status_code == 401
+            assert response.text == 'OAuth state is missing'
+            assert 'Location' not in response.headers
+            assert 'client.example' not in response.text
+            assert response.headers['Content-Type'].startswith('text/plain')
+            assert response.headers['Content-Security-Policy'] == (
+                "default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+            )
             network_client.assert_not_called()
             await user.refresh_from_db()
             assert user.niconico_access_token is None
+        finally:
+            await _CloseDatabase()
+
+    asyncio.run(Run())
+
+
+@pytest.mark.parametrize((
+    'client_origin',
+    'expected_origin',
+), [
+    ('https://client.example', 'https://client.example'),
+    ('https://CLIENT.EXAMPLE/', 'https://client.example'),
+    ('https://client.example:443', 'https://client.example'),
+    ('https://client.example:7001/', 'https://client.example:7001'),
+    ('https://127.0.0.1:7001', 'https://127.0.0.1:7001'),
+    ('https://[2001:db8::1]:7001', 'https://[2001:db8::1]:7001'),
+])
+def test_niconico_client_origin_is_normalized(client_origin: str, expected_origin: str) -> None:
+    """認証開始時のクライアント Origin を location.origin と同じ形式へ正規化する。"""
+
+    assert niconico_router_module._NormalizeClientOrigin(client_origin) == expected_origin
+
+
+@pytest.mark.parametrize('client_origin', [
+    'http://client.example',
+    'https://user:password@client.example',
+    'https://client.example/settings/jikkyo',
+    'https://client.example/?query=1',
+    'https://client.example/#fragment',
+    'https://client.example`;.invalid',
+    'javascript:alert(1)',
+    '//client.example',
+    'https://client.example:invalid',
+    'https://client.example:70000',
+    'null',
+    '',
+])
+def test_niconico_client_origin_rejects_unsafe_values(client_origin: str) -> None:
+    """Origin 以外の URL や JavaScript 構文文字を含む値を拒否する。"""
+
+    with pytest.raises(ValueError):
+        niconico_router_module._NormalizeClientOrigin(client_origin)
+
+
+def test_niconico_callback_does_not_reflect_external_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """外部 error を HTML・Location・ログへ反映せず、固定結果だけをクライアントへ返す。"""
+
+    async def Run() -> None:
+        await _InitializeDatabase()
+        try:
+            user = await _CreateUser()
+            state_id, _ = await NiconicoOAuthState.issue(
+                user_id=user.id,
+                client_url='https://client.example',
+            )
+            network_client = Mock(side_effect=AssertionError('HTTP client must not be created'))
+            warning_log = Mock()
+            monkeypatch.setattr(niconico_router_module, 'HTTPX_CLIENT', network_client)
+            monkeypatch.setattr(niconico_router_module.logging, 'warning', warning_log)
+
+            app = FastAPI()
+            app.include_router(niconico_router_module.router)
+            attack = "</script><script>document.body.dataset.pwn='1'</script>\r\nFAKE LOG"
+
+            async with HTTPXAsyncClient(
+                transport=ASGITransport(app=app),
+                base_url='https://tv.example',
+            ) as client:
+                response = await client.get(
+                    '/api/niconico/callback',
+                    params={
+                        'oauth_state': state_id,
+                        'client': 'https://evil.example/`;document.body.dataset.pwn=1;//',
+                        'error': attack,
+                    },
+                )
+
+            assert response.status_code == 303
+            assert response.headers['Location'] == (
+                'https://client.example/settings/jikkyo#result=AuthorizationError'
+            )
+            assert attack not in response.text
+            assert attack not in response.headers['Location']
+            assert all(attack not in str(call) for call in warning_log.call_args_list)
+            network_client.assert_not_called()
+        finally:
+            await _CloseDatabase()
+
+    asyncio.run(Run())
+
+
+def test_niconico_callback_rejects_corrupted_stored_origin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DB の保存値が壊れていても、不正 Origin へリダイレクトしない。"""
+
+    async def Run() -> None:
+        await _InitializeDatabase()
+        try:
+            user = await _CreateUser()
+            state_id, _ = await NiconicoOAuthState.issue(
+                user_id=user.id,
+                client_url='https://client.example/`;document.body.dataset.pwn=1;//',
+            )
+            network_client = Mock(side_effect=AssertionError('HTTP client must not be created'))
+            monkeypatch.setattr(niconico_router_module, 'HTTPX_CLIENT', network_client)
+
+            app = FastAPI()
+            app.include_router(niconico_router_module.router)
+
+            async with HTTPXAsyncClient(
+                transport=ASGITransport(app=app),
+                base_url='https://tv.example',
+            ) as client:
+                response = await client.get(
+                    '/api/niconico/callback',
+                    params={'oauth_state': state_id, 'code': 'authorization-code'},
+                )
+
+            assert response.status_code == 500
+            assert response.text == 'Stored client Origin is invalid'
+            assert 'Location' not in response.headers
+            assert 'document.body' not in response.text
+            network_client.assert_not_called()
         finally:
             await _CloseDatabase()
 

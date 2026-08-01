@@ -47,7 +47,7 @@ class NiconicoOAuthState(TortoiseModel):
     user_id: int
     # PKCE verifier は callback 消費時に DB から消去する。戻り値のモデルだけが token 交換まで保持する
     code_verifier = fields.TextField(null=True)
-    # 連携完了後のフロントリダイレクト先（発行時の Origin を正とする）
+    # 連携完了後のフロントリダイレクト先（発行時に正規化した Origin を正とする）
     client_url = fields.TextField()
     expires_at = fields.DatetimeField()
     consumed_at = fields.DatetimeField(null=True)
@@ -104,7 +104,7 @@ class NiconicoOAuthState(TortoiseModel):
 
         Args:
             user_id: 連携対象の KonomiTV ユーザー ID。
-            client_url: 連携完了後に戻すクライアント URL（末尾 / 付き推奨）。
+            client_url: 連携完了後に戻す、パスと末尾 / を含まないクライアント Origin。
             ttl: 有効期限。省略時は DEFAULT_TTL。
 
         Returns:
