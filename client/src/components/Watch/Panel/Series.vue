@@ -88,58 +88,14 @@
             </div>
         </template>
 
-        <v-dialog v-model="show_assignment_dialog" :fullscreen="Utils.isSmartphoneVertical()" max-width="560">
-            <v-card class="series-assignment-dialog">
-                <v-card-title class="series-assignment-dialog__title">シリーズを訂正</v-card-title>
-                <v-card-text>
-                    <div class="series-assignment-dialog__current">
-                        <span>現在の分類</span>
-                        <strong>{{current_assignment_label}}</strong>
-                    </div>
-                    <div class="series-assignment-dialog__rule-note">
-                        <Icon icon="fluent:info-20-regular" width="18px" />
-                        <span>この訂正は、同じ番組名として判定される今後の録画にも適用されます。</span>
-                    </div>
-
-                    <v-radio-group v-model="assignment_mode" color="primary" hide-details>
-                        <v-radio label="既存シリーズに割り当て" value="Existing" />
-                        <v-radio label="新しいシリーズ名で割り当て" value="New" />
-                        <v-radio label="単発番組に変更" value="NotSeries" />
-                    </v-radio-group>
-
-                    <v-autocomplete v-if="assignment_mode === 'Existing'" class="mt-3"
-                        v-model="assignment_series_id" v-model:search="assignment_search_query"
-                        :items="assignment_search_results" :loading="is_searching_series"
-                        item-title="title" item-value="id" label="シリーズを検索" placeholder="シリーズ名を入力"
-                        color="primary" variant="outlined" density="comfortable" clearable no-filter
-                        hide-details="auto" no-data-text="一致するシリーズがありません"
-                        @update:search="queueSeriesSearch" />
-
-                    <template v-else-if="assignment_mode === 'New'">
-                        <v-text-field class="mt-3" v-model="new_series_title" label="新しいシリーズ名"
-                            placeholder="シリーズ名を入力" color="primary" variant="outlined" density="comfortable"
-                            maxlength="255" counter hide-details="auto" />
-                        <div class="series-assignment-dialog__hint">
-                            同じシリーズ名がすでに存在する場合は、新規作成せず既存シリーズへ割り当てます。
-                        </div>
-                    </template>
-
-                    <div v-else class="series-assignment-dialog__notice">
-                        この録画のシリーズ割り当てを外し、単発番組として扱います。
-                    </div>
-                </v-card-text>
-                <v-card-actions>
-                    <v-spacer />
-                    <v-btn variant="text" :disabled="is_assigning" @click="show_assignment_dialog = false">
-                        キャンセル
-                    </v-btn>
-                    <v-btn color="primary" variant="flat" :loading="is_assigning"
-                        :disabled="assignment_submit_disabled" @click="submitAssignment()">
-                        変更
-                    </v-btn>
-                </v-card-actions>
-            </v-card>
-        </v-dialog>
+        <RecordedSeriesAssignmentDialog
+            v-model="show_assignment_dialog"
+            :recorded-program-id="playerStore.recorded_program.id"
+            :current-series-id="playerStore.recorded_program.series_id"
+            :current-series-title="playerStore.recorded_program.series_title"
+            :current-label="current_assignment_label"
+            :program-title="playerStore.recorded_program.title"
+            @saved="seriesAssignmentSaved" />
 
         <RecordedEpisodeAssignmentDialog v-if="series_info !== null"
             v-model="show_episode_assignment_dialog"
@@ -153,9 +109,9 @@
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
+import RecordedSeriesAssignmentDialog from '@/components/Settings/RecordedSeriesAssignmentDialog.vue';
 import RecordedEpisodeAssignmentDialog from '@/components/Videos/Dialogs/RecordedEpisodeAssignmentDialog.vue';
 import Message from '@/message';
-import RecordedSeries, { type IRecordedSeriesAssignment } from '@/services/RecordedSeries';
 import Series, { type ISeries, type ISeriesRecordedProgram } from '@/services/Series';
 import Videos, { type IRecordedProgram } from '@/services/Videos';
 import usePlayerStore from '@/stores/PlayerStore';
@@ -166,12 +122,9 @@ import Utils, { dayjs } from '@/utils';
 import { formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
 
 
-type AssignmentMode = 'Existing' | 'New' | 'NotSeries';
-
-
 export default defineComponent({
     name: 'Panel-SeriesTab',
-    components: {RecordedEpisodeAssignmentDialog},
+    components: {RecordedEpisodeAssignmentDialog, RecordedSeriesAssignmentDialog},
     data() {
         return {
             // ユーティリティをテンプレートで使えるようにする。
@@ -191,16 +144,7 @@ export default defineComponent({
             // 管理者向け手動訂正ダイアログの状態。
             show_assignment_dialog: false,
             show_episode_assignment_dialog: false,
-            assignment_mode: 'Existing' as AssignmentMode,
-            assignment_series_id: null as number | null,
-            assignment_search_query: '',
-            assignment_search_results: [] as ISeries[],
-            new_series_title: '',
-            is_searching_series: false,
-            is_assigning: false,
             is_applying_assignment: false,
-            series_search_sequence: 0,
-            series_search_timer: null as number | null,
         };
     },
     computed: {
@@ -258,16 +202,6 @@ export default defineComponent({
             }
             return 'シリーズなし';
         },
-
-        assignment_submit_disabled(): boolean {
-            if (this.is_assigning) return true;
-            if (this.assignment_mode === 'Existing') return this.assignment_series_id === null;
-            if (this.assignment_mode === 'New') {
-                const title = this.new_series_title.trim();
-                return title.length === 0 || title.length > 255;
-            }
-            return false;
-        },
     },
     watch: {
         recorded_program_identity: {
@@ -278,7 +212,7 @@ export default defineComponent({
                     this.show_assignment_dialog = false;
                 }
                 this.show_episode_assignment_dialog = false;
-                // 手動訂正の成功直後は submitAssignment() 側で再取得するため、同じ API を二重に呼ばない。
+                // 手動訂正の成功直後は seriesAssignmentSaved() 側で再取得するため、同じ API を二重に呼ばない。
                 if (this.is_applying_assignment === false) {
                     void this.fetchCurrentSeries();
                 }
@@ -299,10 +233,8 @@ export default defineComponent({
         void this.userStore.fetchUser();
     },
     beforeUnmount() {
-        // 遅延検索と未完了レスポンスを、このコンポーネントへ反映させない。
-        if (this.series_search_timer !== null) window.clearTimeout(this.series_search_timer);
+        // 未完了レスポンスを、このコンポーネントへ反映させない。
         this.series_fetch_sequence += 1;
-        this.series_search_sequence += 1;
     },
     methods: {
         /** 現在の録画に対応する Series API を取得し、古い録画向けレスポンスは破棄する。 */
@@ -373,93 +305,28 @@ export default defineComponent({
             return `${Math.max(1, Math.round(duration_seconds / 60)).toLocaleString()}分`;
         },
 
-        /** 訂正ダイアログを、現在の割り当てを初期選択した状態で開く。 */
+        /** 共通ダイアログを、管理者のみ開ける。 */
         openAssignmentDialog(): void {
             if (this.is_admin === false) return;
-
-            this.assignment_mode = 'Existing';
-            this.assignment_series_id = this.playerStore.recorded_program.series_id;
-            this.assignment_search_query = '';
-            this.assignment_search_results = this.series_info === null ? [] : [this.series_info];
-            this.new_series_title = this.playerStore.recorded_program.series_title ?? '';
             this.show_assignment_dialog = true;
-            void this.searchSeries('');
         },
 
-        /** 入力中の検索を短時間まとめ、古い検索結果が新しい検索語を上書きしないようにする。 */
-        queueSeriesSearch(query: string | null): void {
-            if (this.series_search_timer !== null) window.clearTimeout(this.series_search_timer);
-            this.series_search_timer = window.setTimeout(() => {
-                this.series_search_timer = null;
-                void this.searchSeries(query?.trim() ?? '');
-            }, 300);
-        },
-
-        /** 空文字では最近更新されたシリーズ、入力時は一致する既存シリーズを取得する。 */
-        async searchSeries(query: string): Promise<void> {
-            const request_sequence = ++this.series_search_sequence;
-            this.is_searching_series = true;
-            const result = query === '' ?
-                await Series.fetchSeriesList('desc', 1) :
-                await Series.searchSeries(query, 'desc', 1);
-            if (request_sequence !== this.series_search_sequence) return;
-
-            this.is_searching_series = false;
-            if (result === null) return;
-
-            // 現在のシリーズが検索上位30件から外れていても、初期選択だけは失わないようにする。
-            const series_list = [...result.series_list];
-            if (this.series_info !== null && series_list.some(series => series.id === this.series_info?.id) === false) {
-                series_list.unshift(this.series_info);
-            }
-            this.assignment_search_results = series_list;
-        },
-
-        /** 選択した訂正を保存し、現在の録画とシリーズ一覧をサーバーから取り直す。 */
-        async submitAssignment(): Promise<void> {
-            if (this.assignment_submit_disabled || this.is_admin === false) return;
-
-            let assignment: IRecordedSeriesAssignment;
-            if (this.assignment_mode === 'Existing') {
-                if (this.assignment_series_id === null) return;
-                assignment = {decision: 'Series', series_id: this.assignment_series_id};
-            } else if (this.assignment_mode === 'New') {
-                assignment = {decision: 'Series', series_title: this.new_series_title.trim()};
-            } else {
-                assignment = {decision: 'NotSeries'};
-            }
-
+        /** 所属変更後にプレイヤー本体と Series パネルを最新状態へそろえる。 */
+        async seriesAssignmentSaved(): Promise<void> {
             const program_id = this.playerStore.recorded_program.id;
-            this.is_assigning = true;
-            const succeeded = await RecordedSeries.updateProgramAssignment(program_id, assignment);
-            if (succeeded === false) {
-                this.is_assigning = false;
-                return;
-            }
-
-            // API は 204 を返すため、更新後の ID・表示名・話数情報は録画 API を正として取り直す。
             const refreshed_program = await Videos.fetchVideo(program_id);
             if (refreshed_program === null) {
-                this.is_assigning = false;
-                this.show_assignment_dialog = false;
                 Message.warning('変更は保存されましたが、表示を更新できませんでした。ページを再読み込みしてください。');
                 return;
             }
-            if (this.playerStore.recorded_program.id === program_id) {
-                this.is_applying_assignment = true;
-                try {
-                    this.playerStore.recorded_program = refreshed_program;
-                    await this.fetchCurrentSeries();
-                } finally {
-                    this.is_applying_assignment = false;
-                }
+            if (this.playerStore.recorded_program.id !== program_id) return;
+            this.is_applying_assignment = true;
+            try {
+                this.playerStore.recorded_program = refreshed_program;
+                await this.fetchCurrentSeries();
+            } finally {
+                this.is_applying_assignment = false;
             }
-
-            this.is_assigning = false;
-            this.show_assignment_dialog = false;
-            Message.success(assignment.decision === 'NotSeries' ?
-                '単発番組へ変更しました。' :
-                '録画番組のシリーズを変更しました。');
         },
 
         /** 話数訂正後にプレイヤー本体と Series パネルの両方を最新状態へそろえる。 */
@@ -735,68 +602,6 @@ export default defineComponent({
         flex-shrink: 0;
         margin-left: 4px;
         color: rgb(var(--v-theme-text-darken-1));
-    }
-}
-
-.series-assignment-dialog {
-    color: rgb(var(--v-theme-text));
-    background: rgb(var(--v-theme-background-lighten-1));
-
-    &__title {
-        font-weight: bold;
-    }
-
-    &__current {
-        display: flex;
-        flex-direction: column;
-        margin-bottom: 12px;
-        padding: 11px 13px;
-        border-radius: 6px;
-        background: rgb(var(--v-theme-background));
-
-        span {
-            color: rgb(var(--v-theme-text-darken-1));
-            font-size: 11.5px;
-        }
-
-        strong {
-            margin-top: 2px;
-            font-size: 14px;
-            overflow-wrap: anywhere;
-        }
-    }
-
-    &__hint,
-    &__notice {
-        margin-top: 8px;
-        color: rgb(var(--v-theme-text-darken-1));
-        font-size: 11.5px;
-        line-height: 1.6;
-    }
-
-    &__notice {
-        padding: 11px 13px;
-        border-radius: 6px;
-        background: rgb(var(--v-theme-background));
-    }
-
-    &__rule-note {
-        display: flex;
-        align-items: flex-start;
-        gap: 7px;
-        margin-bottom: 8px;
-        padding: 9px 11px;
-        border-radius: 6px;
-        color: rgb(var(--v-theme-text-darken-1));
-        background: rgba(var(--v-theme-primary), 0.1);
-        font-size: 11.5px;
-        line-height: 1.55;
-
-        svg {
-            flex-shrink: 0;
-            margin-top: 1px;
-            color: rgb(var(--v-theme-primary-readable));
-        }
     }
 }
 

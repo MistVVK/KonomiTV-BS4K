@@ -21,7 +21,10 @@ from app.metadata.RecordedSeriesResolver import (
     _ClusterEvidence,
     _ProgramSnapshot,
 )
-from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
+from app.metadata.RecordedSeriesSettings import (
+    RecordedSeriesSettings,
+    RecordedSeriesSettingsStore,
+)
 from app.metadata.SeriesTitleParser import ParseSeriesTitle, SeriesTitleParseResult
 from app.models.Channel import Channel
 from app.models.RecordedEpisode import RecordedEpisodeResolution
@@ -580,7 +583,7 @@ def test_manual_series_assignment_preserves_episode_and_reconciles_periods(
             monkeypatch.setattr(
                 RecordedSeriesSettingsStore,
                 'getSettingsAndAPIKey',
-                staticmethod(lambda: (SimpleNamespace(enabled=True), None)),
+                staticmethod(lambda: (RecordedSeriesSettings(enabled=True), None)),
             )
 
             await RecordedSeriesResolver.assignProgram(
@@ -791,7 +794,7 @@ def test_manual_rule_beats_force_and_hard_standalone_but_never_creates_a_half_as
             monkeypatch.setattr(
                 RecordedSeriesSettingsStore,
                 'getSettingsAndAPIKey',
-                staticmethod(lambda: (SimpleNamespace(enabled=True), None)),
+                staticmethod(lambda: (RecordedSeriesSettings(enabled=True), None)),
             )
             await RecordedSeriesResolver.assignProgram(
                 assigned.id,

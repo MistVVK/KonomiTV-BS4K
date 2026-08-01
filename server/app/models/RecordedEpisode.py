@@ -8,6 +8,8 @@ from tortoise import fields
 from tortoise.fields import Field as TortoiseField
 from tortoise.models import Model as TortoiseModel
 
+from app.metadata.ai.episode_lookup import EpisodeLookupOutcome
+
 
 if TYPE_CHECKING:
     from app.models.RecordedProgram import RecordedProgram
@@ -22,7 +24,7 @@ RecordedEpisodeResolutionStatus = Literal[
     'NeedsReview',
     'Failed',
 ]
-RecordedEpisodeSource = Literal['Local', 'EPG', 'WebSearch', 'Manual', 'Migration']
+RecordedEpisodeSource = Literal['Local', 'EPG', 'WebSearch', 'Manual', 'Migration', 'AI']
 
 
 class SeriesEpisode(TortoiseModel):
@@ -66,17 +68,50 @@ class RecordedEpisodeResolution(TortoiseModel):
         on_delete=fields.SET_NULL,
     )
     episode_id: int | None
-    status = cast(TortoiseField[RecordedEpisodeResolutionStatus], fields.CharField(32, index=True))
-    source = cast(TortoiseField[RecordedEpisodeSource | None], fields.CharField(32, null=True))
-    input_fingerprint = cast(TortoiseField[str | None], fields.CharField(64, null=True, index=True))
-    provider_fingerprint = cast(TortoiseField[str | None], fields.CharField(64, null=True))
+    status = cast(
+        TortoiseField[RecordedEpisodeResolutionStatus], fields.CharField(32, index=True)
+    )
+    # 現在の正本（再生・一覧で使う採用元）。Manual / WebSearch など。
+    source = cast(
+        TortoiseField[RecordedEpisodeSource | None], fields.CharField(32, null=True)
+    )
+    lookup_outcome = cast(
+        TortoiseField[EpisodeLookupOutcome | None], fields.CharField(32, null=True)
+    )
+    input_fingerprint = cast(
+        TortoiseField[str | None], fields.CharField(64, null=True, index=True)
+    )
+    provider_fingerprint = cast(
+        TortoiseField[str | None], fields.CharField(64, null=True)
+    )
+    # AI レーン。手動確定しても残し、単票再検索や「AI を採用」で参照する。
     proposed_season_number = cast(TortoiseField[int | None], fields.IntField(null=True))
     proposed_episode_number = cast(
         TortoiseField[Decimal | None],
         fields.DecimalField(max_digits=10, decimal_places=3, null=True),
     )
+    # 手動レーン。AI 採用後も残し、再び手動へ戻せる。
+    manual_episode: fields.ForeignKeyNullableRelation[SeriesEpisode] = (
+        fields.ForeignKeyField(
+            'models.SeriesEpisode',
+            related_name='manual_recorded_episode_resolutions',
+            null=True,
+            on_delete=fields.SET_NULL,
+        )
+    )
+    manual_episode_id: int | None
+    manual_season_number = cast(TortoiseField[int | None], fields.IntField(null=True))
+    manual_episode_number = cast(
+        TortoiseField[Decimal | None],
+        fields.DecimalField(max_digits=10, decimal_places=3, null=True),
+    )
+    manual_status = cast(
+        TortoiseField[Literal['Resolved', 'Unknown', 'NotNumbered'] | None],
+        fields.CharField(32, null=True),
+    )
     confidence = cast(TortoiseField[float | None], fields.FloatField(null=True))
     web_search_performed = fields.BooleanField(default=False)
+    rationale_short = cast(TortoiseField[str | None], fields.TextField(null=True))
     is_legacy_recording = fields.BooleanField(default=False)
     citations = cast(TortoiseField[list[dict[str, str]]], fields.JSONField(default=[]))
     ai_model = cast(TortoiseField[str | None], fields.TextField(null=True))

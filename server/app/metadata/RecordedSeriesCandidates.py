@@ -352,6 +352,10 @@ async def SelectRecordedSeriesCandidate(
     except httpx.TimeoutException as ex:
         latency_ms = round((time.monotonic() - started_at) * 1000)
         raise RecordedSeriesAIError('Timeout', latency_ms=latency_ms) from ex
+    except (httpx.InvalidURL, ValueError) as ex:
+        # 不正 port 等は HTTPError 外で発生し得るため終端失敗へ正規化する
+        latency_ms = round((time.monotonic() - started_at) * 1000)
+        raise RecordedSeriesAIError('InvalidURL', latency_ms=latency_ms) from ex
     except httpx.HTTPError as ex:
         latency_ms = round((time.monotonic() - started_at) * 1000)
         raise RecordedSeriesAIError('NetworkError', latency_ms=latency_ms) from ex

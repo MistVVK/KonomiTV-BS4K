@@ -8,8 +8,8 @@
             <span class="ml-3">録画シリーズ管理</span>
         </h2>
         <div class="settings__description">
-            判定済みの録画シリーズを検索し、シリーズ情報と録画ごとのシーズン・話数を編集します。<br>
-            録画ごとの所属先は、各録画の再生画面にある「シリーズを訂正」から変更できます。
+            判定済みの録画シリーズとシリーズ未所属の録画を、この画面だけで単発化・シリーズ化・話数訂正できます。<br>
+            再生画面から開く必要はありません。
         </div>
 
         <v-progress-linear v-if="is_loading" class="mt-5" color="primary" indeterminate rounded />
@@ -21,51 +21,110 @@
         </div>
 
         <template v-else>
-            <div class="recorded-series-list-toolbar mt-5">
-                <v-text-field color="primary" variant="outlined" density="compact" hide-details clearable
-                    prepend-inner-icon="mdi-magnify" placeholder="シリーズ名・説明を検索" maxlength="255"
-                    v-model="series_search_query" />
-                <span>{{series_total.toLocaleString()}} シリーズ</span>
-                <v-btn color="background-lighten-2" variant="flat" :loading="is_loading_series"
-                    @click="fetchManagementSeriesList()">
-                    <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="20px" />再読み込み
-                </v-btn>
-            </div>
+            <v-tabs v-model="management_tab" class="mt-5" color="primary" grow>
+                <v-tab value="Series">シリーズ一覧</v-tab>
+                <v-tab value="Standalone">単発・未所属</v-tab>
+            </v-tabs>
 
-            <v-progress-linear v-if="is_loading_series" class="mt-4" color="primary" indeterminate rounded />
-            <div v-else-if="series_load_failed" class="recorded-series-list-state">
-                <Icon icon="fluent:error-circle-20-regular" width="27px" />
-                <span>シリーズ一覧を取得できませんでした。</span>
-                <v-btn color="primary" size="small" variant="tonal" @click="fetchManagementSeriesList()">
-                    再試行
-                </v-btn>
-            </div>
-            <div v-else-if="management_series.length === 0" class="recorded-series-list-state">
-                <Icon icon="fluent:search-info-20-regular" width="27px" />
-                <span>{{normalized_series_search_query === '' ? 'シリーズはまだありません。' : '一致するシリーズはありません。'}}</span>
-            </div>
-            <div v-else class="recorded-series-list mt-4" role="list">
-                <button v-for="series in management_series" :key="series.id" v-ripple type="button"
-                    class="recorded-series-list-item" role="listitem" @click="openSeriesEditDialog(series)">
-                    <div class="recorded-series-list-item__body">
-                        <div class="recorded-series-list-item__heading">
-                            <strong>{{series.title}}</strong>
-                            <span>録画 {{series.recorded_program_count.toLocaleString()}} 件</span>
+            <template v-if="management_tab === 'Series'">
+                <div class="recorded-series-list-toolbar mt-4">
+                    <v-text-field color="primary" variant="outlined" density="compact" hide-details clearable
+                        prepend-inner-icon="mdi-magnify" placeholder="シリーズ名・説明を検索" maxlength="255"
+                        v-model="series_search_query" />
+                    <span>{{series_total.toLocaleString()}} シリーズ</span>
+                    <v-btn color="background-lighten-2" variant="flat" :loading="is_loading_series"
+                        @click="fetchManagementSeriesList()">
+                        <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="20px" />再読み込み
+                    </v-btn>
+                </div>
+
+                <v-progress-linear v-if="is_loading_series" class="mt-4" color="primary" indeterminate rounded />
+                <div v-else-if="series_load_failed" class="recorded-series-list-state">
+                    <Icon icon="fluent:error-circle-20-regular" width="27px" />
+                    <span>シリーズ一覧を取得できませんでした。</span>
+                    <v-btn color="primary" size="small" variant="tonal" @click="fetchManagementSeriesList()">
+                        再試行
+                    </v-btn>
+                </div>
+                <div v-else-if="management_series.length === 0" class="recorded-series-list-state">
+                    <Icon icon="fluent:search-info-20-regular" width="27px" />
+                    <span>{{normalized_series_search_query === '' ? 'シリーズはまだありません。' : '一致するシリーズはありません。'}}</span>
+                </div>
+                <div v-else class="recorded-series-list mt-4" role="list">
+                    <button v-for="series in management_series" :key="series.id" v-ripple type="button"
+                        class="recorded-series-list-item" role="listitem" @click="openSeriesEditDialog(series)">
+                        <div class="recorded-series-list-item__body">
+                            <div class="recorded-series-list-item__heading">
+                                <strong>{{series.title}}</strong>
+                                <span>録画 {{series.recorded_program_count.toLocaleString()}} 件</span>
+                            </div>
+                            <p>{{series.description || '説明は設定されていません。'}}</p>
+                            <div class="recorded-series-list-item__meta">
+                                <span>{{formatSeriesPeriod(series.first_recorded_at, series.last_recorded_at)}}</span>
+                                <span>更新 {{dayjs(series.updated_at).format('YYYY/M/D HH:mm')}}</span>
+                                <span v-if="series.wikipedia_page_id !== null">
+                                    Wikipedia page ID: {{series.wikipedia_page_id}}
+                                </span>
+                            </div>
                         </div>
-                        <p>{{series.description || '説明は設定されていません。'}}</p>
-                        <div class="recorded-series-list-item__meta">
-                            <span>{{formatSeriesPeriod(series.first_recorded_at, series.last_recorded_at)}}</span>
-                            <span>更新 {{dayjs(series.updated_at).format('YYYY/M/D HH:mm')}}</span>
-                            <span v-if="series.wikipedia_page_id !== null">
-                                Wikipedia page ID: {{series.wikipedia_page_id}}
-                            </span>
+                        <Icon icon="fluent:edit-20-filled" width="20px" />
+                    </button>
+                </div>
+                <v-pagination v-if="series_page_count > 1" class="mt-4" color="primary"
+                    v-model="series_page" :length="series_page_count" />
+            </template>
+
+            <template v-else>
+                <div class="recorded-series-list-toolbar mt-4">
+                    <v-text-field color="primary" variant="outlined" density="compact" hide-details clearable
+                        prepend-inner-icon="mdi-magnify" placeholder="録画タイトルを検索" maxlength="255"
+                        v-model="standalone_search_query" />
+                    <span>{{standalone_total.toLocaleString()}} 件</span>
+                    <v-btn color="background-lighten-2" variant="flat" :loading="is_loading_standalone"
+                        @click="fetchStandalonePrograms()">
+                        <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="20px" />再読み込み
+                    </v-btn>
+                </div>
+                <div class="settings__item-label mt-3">
+                    シリーズ未所属の録画です。ここから既存・新規シリーズへ割り当てたり、単発のまま確定できます。
+                </div>
+
+                <v-progress-linear v-if="is_loading_standalone" class="mt-4" color="primary" indeterminate rounded />
+                <div v-else-if="standalone_load_failed" class="recorded-series-list-state">
+                    <Icon icon="fluent:error-circle-20-regular" width="27px" />
+                    <span>シリーズ未所属の録画一覧を取得できませんでした。</span>
+                    <v-btn color="primary" size="small" variant="tonal" @click="fetchStandalonePrograms()">
+                        再試行
+                    </v-btn>
+                </div>
+                <div v-else-if="standalone_programs.length === 0" class="recorded-series-list-state">
+                    <Icon icon="fluent:checkmark-circle-20-regular" width="27px" />
+                    <span>{{normalized_standalone_search_query === '' ?
+                        'シリーズ未所属の録画はありません。' : '一致する録画はありません。'}}</span>
+                </div>
+                <div v-else class="recorded-series-list mt-4" role="list">
+                    <div v-for="program in standalone_programs" :key="program.recorded_program_id"
+                        class="recorded-series-list-item recorded-series-list-item--static" role="listitem">
+                        <div class="recorded-series-list-item__body">
+                            <div class="recorded-series-list-item__heading">
+                                <strong>{{program.subtitle || program.title}}</strong>
+                                <span>{{standaloneStatusLabel(program)}}</span>
+                            </div>
+                            <p>{{program.title}}</p>
+                            <div class="recorded-series-list-item__meta">
+                                <span>{{dayjs(program.start_time).format('YYYY/M/D (ddd) HH:mm')}}</span>
+                                <span>{{program.channel_name ?? 'チャンネル情報なし'}}</span>
+                            </div>
                         </div>
+                        <v-btn color="primary" size="small" variant="tonal"
+                            @click="openStandaloneAssignmentDialog(program)">
+                            シリーズを訂正
+                        </v-btn>
                     </div>
-                    <Icon icon="fluent:edit-20-filled" width="20px" />
-                </button>
-            </div>
-            <v-pagination v-if="series_page_count > 1" class="mt-4" color="primary"
-                v-model="series_page" :length="series_page_count" />
+                </div>
+                <v-pagination v-if="standalone_page_count > 1" class="mt-4" color="primary"
+                    v-model="standalone_page" :length="standalone_page_count" />
+            </template>
         </template>
 
         <v-dialog v-model="series_edit_dialog" :persistent="is_updating_series" max-width="760" scrollable>
@@ -111,13 +170,13 @@
                     </div>
                     <template v-else-if="episode_assignments !== null">
                         <div class="recorded-series-episodes__description">
-                            同じ話を別の放送局で録画した場合も、同じシーズン・話数へ割り当てたまま個別の録画として残ります。
+                            同じ話を別の放送局で録画した場合も、同じシーズン・話数へ割り当てたまま個別の録画として残ります。<br>
+                            所属シリーズの変更（単発化・他シリーズへ移動）もこの一覧から行えます。
                         </div>
                         <div class="recorded-series-episodes__list" role="list">
-                            <button v-for="program in episode_assignments.programs"
-                                :key="program.recorded_program_id" v-ripple type="button"
-                                class="recorded-series-episode-item" role="listitem"
-                                @click="openEpisodeAssignmentDialog(program)">
+                            <div v-for="program in episode_assignments.programs"
+                                :key="program.recorded_program_id"
+                                class="recorded-series-episode-item" role="listitem">
                                 <div class="recorded-series-episode-item__episode">
                                     {{formatProgramEpisode(program)}}
                                 </div>
@@ -127,15 +186,36 @@
                                         {{dayjs(program.start_time).format('YYYY/M/D (ddd) HH:mm')}}
                                         ・{{program.channel_name ?? 'チャンネル情報なし'}}
                                     </span>
-                                    <small v-if="program.resolution !== null">
+                                    <small v-if="program.resolution !== null"
+                                        class="recorded-series-episode-item__resolution">
                                         {{episodeResolutionStatusLabel(program.resolution.status)}}
+                                        <template v-if="program.resolution.lookup_outcome !== null">
+                                            ・{{episodeLookupOutcomeLabel(program.resolution.lookup_outcome)}}
+                                        </template>
                                         <template v-if="program.resolution.source !== null">
                                             ・{{episodeResolutionSourceLabel(program.resolution.source)}}
                                         </template>
+                                        <template v-if="program.resolution.confidence !== null">
+                                            ・信頼度 {{Math.round(program.resolution.confidence * 100)}}%
+                                        </template>
+                                    </small>
+                                    <small v-if="program.resolution !== null"
+                                        class="recorded-series-episode-item__reason"
+                                        :title="recordedEpisodeResolutionReason(program.resolution)">
+                                        {{recordedEpisodeResolutionReason(program.resolution)}}
                                     </small>
                                 </div>
-                                <Icon icon="fluent:edit-20-filled" width="19px" />
-                            </button>
+                                <div class="recorded-series-episode-item__actions">
+                                    <v-btn size="small" variant="tonal"
+                                        @click="openEpisodeAssignmentDialog(program)">
+                                        話数を訂正
+                                    </v-btn>
+                                    <v-btn size="small" color="primary" variant="tonal"
+                                        @click="openSeriesAssignmentFromEpisode(program)">
+                                        シリーズを訂正
+                                    </v-btn>
+                                </div>
+                            </div>
                         </div>
                     </template>
                 </v-card-text>
@@ -162,6 +242,15 @@
             :recorded-program-id="editing_episode_program_id"
             :assignment-list="episode_assignments"
             @saved="episodeAssignmentSaved" />
+
+        <RecordedSeriesAssignmentDialog
+            v-model="series_assignment_dialog"
+            :recorded-program-id="series_assignment_program_id"
+            :current-series-id="series_assignment_current_series_id"
+            :current-series-title="series_assignment_current_series_title"
+            :current-label="series_assignment_current_label"
+            :program-title="series_assignment_program_title"
+            @saved="seriesAssignmentSaved" />
     </SettingsBase>
 </template>
 
@@ -169,23 +258,31 @@
 
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 
+import RecordedSeriesAssignmentDialog from '@/components/Settings/RecordedSeriesAssignmentDialog.vue';
 import RecordedEpisodeAssignmentDialog from '@/components/Videos/Dialogs/RecordedEpisodeAssignmentDialog.vue';
 import Message from '@/message';
 import RecordedSeries, {
     type IRecordedEpisodeAssignmentList,
     type IRecordedEpisodeAssignmentProgram,
-    type IRecordedEpisodeAssignmentResolution,
     type IRecordedSeriesManagementItem,
     type IRecordedSeriesManagementUpdate,
+    type IRecordedSeriesStandaloneProgram,
 } from '@/services/RecordedSeries';
 import useUserStore from '@/stores/UserStore';
 import { dayjs } from '@/utils';
 import { formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
+import {
+    episodeLookupOutcomeLabel,
+    episodeResolutionSourceLabel,
+    episodeResolutionStatusLabel,
+    recordedEpisodeResolutionReason,
+} from '@/utils/RecordedEpisodeResolution';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
 const SERIES_PAGE_SIZE = 30;
 
+const management_tab = ref<'Series' | 'Standalone'>('Series');
 const management_series = ref<IRecordedSeriesManagementItem[]>([]);
 const series_total = ref(0);
 const series_page = ref(1);
@@ -210,15 +307,33 @@ const episode_assignments_load_failed = ref(false);
 const episode_assignment_dialog = ref(false);
 const editing_episode_program_id = ref<number | null>(null);
 
+// 単発・未所属一覧と、共通のシリーズ所属訂正ダイアログ。
+const standalone_programs = ref<IRecordedSeriesStandaloneProgram[]>([]);
+const standalone_total = ref(0);
+const standalone_page = ref(1);
+const standalone_search_query = ref<string | null>('');
+const is_loading_standalone = ref(false);
+const standalone_load_failed = ref(false);
+const series_assignment_dialog = ref(false);
+const series_assignment_program_id = ref<number | null>(null);
+const series_assignment_current_series_id = ref<number | null>(null);
+const series_assignment_current_series_title = ref<string | null>(null);
+const series_assignment_current_label = ref('シリーズなし');
+const series_assignment_program_title = ref<string | null>(null);
+
 const user_store = useUserStore();
 let series_search_timer: number | null = null;
+let standalone_search_timer: number | null = null;
 let status_polling_timer: number | null = null;
 let series_request_sequence = 0;
+let standalone_request_sequence = 0;
 let episode_assignments_request_sequence = 0;
 let is_backfill_running = false;
 
 const series_page_count = computed(() => Math.max(1, Math.ceil(series_total.value / SERIES_PAGE_SIZE)));
+const standalone_page_count = computed(() => Math.max(1, Math.ceil(standalone_total.value / SERIES_PAGE_SIZE)));
 const normalized_series_search_query = computed(() => series_search_query.value?.trim() ?? '');
+const normalized_standalone_search_query = computed(() => standalone_search_query.value?.trim() ?? '');
 const series_title_error = computed(() => {
     const title = editing_series_title.value.trim();
     if (title === '') return 'シリーズ名を入力してください。';
@@ -301,6 +416,26 @@ function openEpisodeAssignmentDialog(program: IRecordedEpisodeAssignmentProgram)
     episode_assignment_dialog.value = true;
 }
 
+/** シリーズ所属録画から、単発化や他シリーズへの移動を行う。 */
+function openSeriesAssignmentFromEpisode(program: IRecordedEpisodeAssignmentProgram): void {
+    series_assignment_program_id.value = program.recorded_program_id;
+    series_assignment_current_series_id.value = editing_series.value?.id ?? null;
+    series_assignment_current_series_title.value = editing_series.value?.title ?? null;
+    series_assignment_current_label.value = editing_series.value?.title ?? 'シリーズなし';
+    series_assignment_program_title.value = program.subtitle || program.title;
+    series_assignment_dialog.value = true;
+}
+
+/** 単発・未所属一覧からシリーズへ割り当てる。 */
+function openStandaloneAssignmentDialog(program: IRecordedSeriesStandaloneProgram): void {
+    series_assignment_program_id.value = program.recorded_program_id;
+    series_assignment_current_series_id.value = null;
+    series_assignment_current_series_title.value = null;
+    series_assignment_current_label.value = 'シリーズなし（単発・未所属）';
+    series_assignment_program_title.value = program.subtitle || program.title;
+    series_assignment_dialog.value = true;
+}
+
 /** 共通ダイアログが再取得した一覧をそのまま反映し、失敗時だけ管理画面側で再取得する。 */
 function episodeAssignmentSaved(refreshed_assignments: IRecordedEpisodeAssignmentList | null): void {
     if (refreshed_assignments?.series_id === editing_series.value?.id) {
@@ -310,33 +445,61 @@ function episodeAssignmentSaved(refreshed_assignments: IRecordedEpisodeAssignmen
     }
 }
 
+/** 所属変更後はシリーズ一覧・未所属一覧・編集中の録画一覧を同期し直す。 */
+async function seriesAssignmentSaved(payload: {
+    recorded_program_id: number;
+    decision: 'Series' | 'NotSeries';
+    series_id: number | null;
+}): Promise<void> {
+    await Promise.all([
+        fetchManagementSeriesList(false),
+        fetchStandalonePrograms(false),
+    ]);
+    // 編集中シリーズから単発化・他シリーズ移動した場合、録画一覧を取り直す。
+    if (editing_series.value !== null) {
+        if (payload.decision === 'NotSeries' || payload.series_id !== editing_series.value.id) {
+            await fetchEpisodeAssignments(false);
+        }
+    }
+}
+
+/** 管理画面向けに、シリーズ未所属の再生可能録画を取得する。 */
+async function fetchStandalonePrograms(show_error = true): Promise<void> {
+    const request_sequence = ++standalone_request_sequence;
+    is_loading_standalone.value = true;
+    standalone_load_failed.value = false;
+    const result = await RecordedSeries.fetchStandalonePrograms(
+        normalized_standalone_search_query.value,
+        standalone_page.value,
+        SERIES_PAGE_SIZE,
+        show_error,
+    );
+    if (request_sequence !== standalone_request_sequence) return;
+
+    is_loading_standalone.value = false;
+    if (result === null) {
+        standalone_load_failed.value = true;
+        return;
+    }
+    standalone_programs.value = result.items;
+    standalone_total.value = result.total;
+    const last_page = Math.max(1, Math.ceil(result.total / SERIES_PAGE_SIZE));
+    if (standalone_page.value > last_page) standalone_page.value = last_page;
+}
+
+function standaloneStatusLabel(program: IRecordedSeriesStandaloneProgram): string {
+    if (program.resolution_status === null) return '判定なし';
+    if (program.resolution_status === 'NotSeries') return '単発番組';
+    if (program.resolution_status === 'NeedsReview') return '要確認';
+    if (program.resolution_status === 'Failed') return '判定失敗';
+    if (program.resolution_status === 'Pending') return '判定待ち';
+    return program.resolution_status;
+}
+
 function formatProgramEpisode(program: IRecordedEpisodeAssignmentProgram): string {
     const episode = episode_assignments.value?.episodes.find(candidate => candidate.id === program.series_episode_id);
     if (episode === undefined) return '話数未設定';
     return `S${episode.season_number}・第 ${formatRecordedEpisodeNumber(episode.episode_number)} 話`;
-}
-
-function episodeResolutionStatusLabel(status: IRecordedEpisodeAssignmentResolution['status']): string {
-    return {
-        Pending: '判定待ち',
-        Resolved: '確定',
-        Unknown: '話数不明',
-        NotNumbered: '公式話数なし',
-        NeedsReview: '要確認',
-        Failed: '判定失敗',
-    }[status];
-}
-
-function episodeResolutionSourceLabel(
-    source: NonNullable<IRecordedEpisodeAssignmentResolution['source']>,
-): string {
-    return {
-        Local: 'ローカル情報',
-        EPG: 'EPG',
-        WebSearch: 'AI Web 検索',
-        Manual: '手動訂正',
-        Migration: '既存データ移行',
-    }[source];
 }
 
 /** シリーズの表示情報を更新し、検索結果と件数をサーバーから同期し直す。 */
@@ -419,7 +582,24 @@ watch(series_search_query, () => {
         }
     }, 300);
 });
+watch(standalone_search_query, () => {
+    if (standalone_search_timer !== null) window.clearTimeout(standalone_search_timer);
+    standalone_search_timer = window.setTimeout(() => {
+        standalone_search_timer = null;
+        if (standalone_page.value !== 1) {
+            standalone_page.value = 1;
+        } else {
+            void fetchStandalonePrograms();
+        }
+    }, 300);
+});
 watch(series_page, () => void fetchManagementSeriesList());
+watch(standalone_page, () => void fetchStandalonePrograms());
+watch(management_tab, (tab) => {
+    if (tab === 'Standalone' && standalone_programs.value.length === 0 && is_loading_standalone.value === false) {
+        void fetchStandalonePrograms();
+    }
+});
 watch(series_edit_tab, (tab) => {
     if (tab === 'Episodes' && episode_assignments.value === null && is_loading_episode_assignments.value === false) {
         void fetchEpisodeAssignments();
@@ -428,6 +608,7 @@ watch(series_edit_tab, (tab) => {
 watch(series_edit_dialog, (is_open) => {
     if (is_open) return;
     episode_assignment_dialog.value = false;
+    series_assignment_dialog.value = false;
     editing_episode_program_id.value = null;
     episode_assignments_request_sequence += 1;
     is_loading_episode_assignments.value = false;
@@ -467,8 +648,10 @@ onMounted(async () => {
 
 onUnmounted(() => {
     if (series_search_timer !== null) window.clearTimeout(series_search_timer);
+    if (standalone_search_timer !== null) window.clearTimeout(standalone_search_timer);
     stopStatusPolling();
     series_request_sequence += 1;
+    standalone_request_sequence += 1;
     episode_assignments_request_sequence += 1;
 });
 
@@ -532,6 +715,14 @@ onUnmounted(() => {
 
     &:hover {
         background: rgb(var(--v-theme-primary) / 13%);
+    }
+
+    &--static {
+        cursor: default;
+
+        &:hover {
+            background: rgb(var(--v-theme-background-lighten-2));
+        }
     }
 
     > svg {
@@ -647,16 +838,12 @@ onUnmounted(() => {
     color: rgb(var(--v-theme-text));
     text-align: left;
     background: rgb(var(--v-theme-background));
-    transition: background-color 0.15s ease;
-    cursor: pointer;
 
-    &:hover {
-        background: rgba(var(--v-theme-primary), 0.13);
-    }
-
-    > svg {
+    &__actions {
+        display: flex;
         flex-shrink: 0;
-        color: rgb(var(--v-theme-text-darken-1));
+        flex-direction: column;
+        gap: 6px;
     }
 
     &__episode {
@@ -699,6 +886,10 @@ onUnmounted(() => {
             color: rgb(var(--v-theme-text-darken-1));
             font-size: 11px;
         }
+
+        .recorded-series-episode-item__reason {
+            color: rgb(var(--v-theme-text));
+        }
     }
 }
 
@@ -732,6 +923,12 @@ onUnmounted(() => {
 
         &__body {
             width: calc(100% - 90px);
+        }
+
+        &__actions {
+            width: 100%;
+            flex-direction: row;
+            justify-content: flex-end;
         }
     }
 }

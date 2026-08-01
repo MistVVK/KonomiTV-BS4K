@@ -313,6 +313,10 @@ def test_manual_assignment_validates_stale_and_cross_series_updates() -> None:
             resolution = await RecordedEpisodeResolution.get(recorded_program_id=program.id)
             assert resolution.status == 'Resolved'
             assert resolution.source == 'Manual'
+            assert resolution.manual_status == 'Resolved'
+            assert resolution.manual_season_number == 2
+            assert resolution.manual_episode_number == Decimal('10')
+            assert resolution.manual_episode_id == program.series_episode_id
 
             with pytest.raises(RecordedEpisodeAssignmentStaleError):
                 await RecordedEpisodeResolver.assignProgramEpisode(
@@ -342,6 +346,104 @@ def test_manual_assignment_validates_stale_and_cross_series_updates() -> None:
             assert program.episode_number is None
             assert resolution.status == 'Unknown'
             assert resolution.source == 'Manual'
+            assert resolution.manual_status == 'Unknown'
+            assert resolution.manual_episode_id is None
+        finally:
+            await Tortoise.close_connections()
+
+    asyncio.run(Run())
+
+
+def test_manual_assignment_preserves_ai_lane_and_adopt_ai_keeps_manual_lane() -> None:
+    """手動保存は AI レーンを消しず、AdoptAI は手動レーンを残して正本だけ切り替える。"""
+
+    async def Run() -> None:
+        await InitializeDatabase()
+        try:
+            series = await Series.create(
+                title='デュアルレーンシリーズ', description='', genres=ANIME_GENRES
+            )
+            channel = await CreateChannel('NID4-SID201', 201)
+            program = await CreateRecordedProgram(
+                1,
+                series=series,
+                channel=channel,
+                episode_number='#3',
+                day=1,
+            )
+            ai_episode = await SeriesEpisode.create(
+                series=series,
+                season_number=1,
+                episode_number=Decimal('3'),
+            )
+            program.series_episode_id = ai_episode.id
+            await program.save(update_fields=['series_episode_id', 'updated_at'])
+            await RecordedEpisodeResolution.create(
+                recorded_program=program,
+                episode=ai_episode,
+                status='Resolved',
+                source='WebSearch',
+                lookup_outcome='Resolved',
+                proposed_season_number=1,
+                proposed_episode_number=Decimal('3'),
+                confidence=0.91,
+                web_search_performed=True,
+                rationale_short='AI 提案の根拠',
+                citations=[{'url': 'https://example.com/ai', 'title': 'AI 出典'}],
+                ai_model='test-model',
+            )
+
+            await RecordedEpisodeResolver.assignProgramEpisode(
+                program.id,
+                expected_series_id=series.id,
+                expected_series_episode_id=ai_episode.id,
+                decision='StructuredEpisode',
+                season_number=2,
+                episode_number=Decimal('10'),
+            )
+            program = await RecordedProgram.get(id=program.id)
+            resolution = await RecordedEpisodeResolution.get(
+                recorded_program_id=program.id
+            )
+            assert resolution.source == 'Manual'
+            assert resolution.status == 'Resolved'
+            assert resolution.manual_status == 'Resolved'
+            assert resolution.manual_season_number == 2
+            assert resolution.manual_episode_number == Decimal('10')
+            # AI レーンは手動保存後も残る。
+            assert resolution.proposed_season_number == 1
+            assert resolution.proposed_episode_number == Decimal('3')
+            assert resolution.web_search_performed is True
+            assert resolution.citations == [
+                {'url': 'https://example.com/ai', 'title': 'AI 出典'}
+            ]
+            assert resolution.rationale_short == 'AI 提案の根拠'
+            assert resolution.lookup_outcome == 'Resolved'
+            assert program.episode_number == 'Season 2 #10'
+
+            await RecordedEpisodeResolver.assignProgramEpisode(
+                program.id,
+                expected_series_id=series.id,
+                expected_series_episode_id=program.series_episode_id,
+                decision='AdoptAI',
+            )
+            program = await RecordedProgram.get(id=program.id)
+            resolution = await RecordedEpisodeResolution.get(
+                recorded_program_id=program.id
+            )
+            assert resolution.source == 'WebSearch'
+            assert resolution.status == 'Resolved'
+            assert resolution.proposed_season_number == 1
+            assert resolution.proposed_episode_number == Decimal('3')
+            # 手動レーンは AI 採用後も残る。
+            assert resolution.manual_status == 'Resolved'
+            assert resolution.manual_season_number == 2
+            assert resolution.manual_episode_number == Decimal('10')
+            episode = await SeriesEpisode.get(id=program.series_episode_id)
+            assert episode.season_number == 1
+            assert episode.episode_number == Decimal('3')
+            # Season 1 は #N 形式へ省略される。
+            assert program.episode_number == '#3'
         finally:
             await Tortoise.close_connections()
 

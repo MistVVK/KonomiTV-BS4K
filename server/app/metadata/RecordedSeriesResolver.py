@@ -18,20 +18,38 @@ from tortoise.expressions import Q
 
 from app import logging
 from app.constants import JST
+from app.metadata.ai.recorded_series_ai import (
+    get_audit_model,
+)
+from app.metadata.ai.recorded_series_ai import (
+    resolve_series_metadata as ai_resolve_series_metadata,
+)
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
 from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
-from app.metadata.RecordedEpisodeResolver import RecordedEpisodeResolver
+from app.metadata.RecordedEpisodeResolver import (
+    FormatEpisodeNumber,
+    ParsedEpisodeNumber,
+    ParseLegacyEpisodeNumber,
+    RecordedEpisodeResolver,
+)
 from app.metadata.RecordedSeriesCandidates import (
-    AIChoiceResult,
     RecordedSeriesAIError,
     RecordedSeriesProgramPrompt,
     SearchWikipediaCandidates,
-    SelectRecordedSeriesCandidate,
-    SeriesChoiceCandidate,
-    WikipediaCandidate,
+)
+from app.metadata.RecordedSeriesGeneration import (
+    AISeriesMetadataResult,
+    SeriesMetadataClusterHint,
+    SeriesMetadataExistingSeriesHint,
+    SeriesMetadataHints,
+    SeriesMetadataLocalParseHint,
+    SeriesMetadataWikipediaHint,
 )
 from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
-from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
+from app.metadata.RecordedSeriesSettings import (
+    RecordedSeriesSettings,
+    RecordedSeriesSettingsStore,
+)
 from app.metadata.SeriesTitleParser import (
     SERIES_TITLE_PARSER_VERSION,
     BuildSeriesGroupingKey,
@@ -52,8 +70,12 @@ from app.models.SeriesBroadcastPeriod import SeriesBroadcastPeriod
 from app.schemas import Genre
 
 
-RECORDED_SERIES_RESOLVER_VERSION = f'1-parser{SERIES_TITLE_PARSER_VERSION}'
+RECORDED_SERIES_RESOLVER_VERSION = f'2-parser{SERIES_TITLE_PARSER_VERSION}'
 AI_ATTEMPT_CACHE_TTL_SECONDS = 300.0
+NON_BILLABLE_AI_REQUEST_ERROR_CODES = (
+    'InputChangedBeforeRequest',
+    'InputChangedBeforeApply',
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +111,17 @@ class _EPGEnrichment:
 
     parse_result: SeriesTitleParseResult
     program_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _GeneratedSeriesTarget:
+    """AI 生成名を既存 Series とすり合わせたサーバー最終決定。"""
+
+    title: str
+    description: str
+    existing_series_id: int | None
+    wikipedia_page_id: int | None
+    selected_choice_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1010,12 +1043,16 @@ class RecordedSeriesResolver:
         return matches
 
     @classmethod
-    async def _findExistingSeriesCandidates(cls, title: str) -> list[Series]:
-        """文字列包含・共通部分が十分な既存SeriesだけをAI候補へ渡す。"""
+    async def _findExistingSeriesCandidates(
+        cls,
+        title: str,
+    ) -> tuple[list[Series], list[Series]]:
+        """AI候補と生成後のすり合わせで共有する既存Series一覧を一度だけ取得する。"""
 
         scored: list[tuple[float, int, Series]] = []
         title_key = BuildSeriesGroupingKey(title)
-        for series in await Series.all():
+        available_series = await Series.all().order_by('id')
+        for series in available_series:
             series_key = BuildSeriesGroupingKey(series.title)
             ratio, common_length = _seriesSimilarity(title, series.title)
             contains = min(len(title_key), len(series_key)) >= 4 and (
@@ -1024,7 +1061,148 @@ class RecordedSeriesResolver:
             if contains or common_length >= 5 or ratio >= 0.50:
                 scored.append((ratio, common_length, series))
         scored.sort(key=lambda item: (item[1], item[0]), reverse=True)
-        return [item[2] for item in scored[:5]]
+        return [item[2] for item in scored[:5]], available_series
+
+    @classmethod
+    async def _reconcileGeneratedSeries(
+        cls,
+        *,
+        generated: AISeriesMetadataResult,
+        hints: SeriesMetadataHints,
+        snapshot: _ProgramSnapshot,
+        available_series: list[Series],
+    ) -> _GeneratedSeriesTarget:
+        """生成 title を hints 内 ID、正規化一致、高精度 fuzzy の順ですり合わせる。"""
+
+        if generated.decision != 'Series' or generated.series_title is None:
+            raise RecordedSeriesAIError('InvalidSeriesMetadataSchema')
+
+        # ① hints 内 existing_series_id。出力検証で hints 外 ID は既に null 化済み。
+        if generated.existing_series_id is not None:
+            existing_hint = next(
+                (
+                    hint
+                    for hint in hints['existing_series']
+                    if hint['id'] == generated.existing_series_id
+                ),
+                None,
+            )
+            if existing_hint is None:
+                raise RecordedSeriesAIError('ExistingSeriesHintNoLongerAvailable')
+            series = await Series.get_or_none(id=generated.existing_series_id)
+            if series is None:
+                # hint 取得後の削除 race は別作品の新規作成へ逃がさず、管理者確認へ倒す。
+                raise RecordedSeriesAIError('HintSeriesNoLongerExists')
+            generated_key = BuildSeriesGroupingKey(generated.series_title)
+            existing_key = BuildSeriesGroupingKey(series.title)
+            ratio, common_length = _seriesSimilarity(generated.series_title, series.title)
+            contains = min(len(generated_key), len(existing_key)) >= 4 and (
+                generated_key in existing_key or existing_key in generated_key
+            )
+            title_matches_hint = (
+                generated_key == existing_key or
+                contains or
+                common_length >= 4 or
+                ratio >= 0.55
+            )
+            if title_matches_hint is False:
+                # hints 内 ID は候補集合を制限するだけで、生成 title との整合性までは保証しない。
+                # 極端な不一致だけでなく中程度の誤選択も NeedsReview へ倒し、別作品への静かな合流を防ぐ。
+                raise RecordedSeriesAIError('GeneratedSeriesHintTitleMismatch')
+            return _GeneratedSeriesTarget(
+                title=series.title,
+                description=series.description,
+                existing_series_id=series.id,
+                wikipedia_page_id=series.wikipedia_page_id,
+                selected_choice_id=f'series:{series.id}',
+            )
+
+        # ② hints 内 wikipedia_page_id。同一 page がなければ記事名を正本として作成する。
+        if generated.wikipedia_page_id is not None:
+            wikipedia_hint = next(
+                (
+                    hint
+                    for hint in hints['wikipedia']
+                    if hint['page_id'] == generated.wikipedia_page_id
+                ),
+                None,
+            )
+            if wikipedia_hint is None:
+                raise RecordedSeriesAIError('WikipediaHintNoLongerAvailable')
+            series = await Series.get_or_none(wikipedia_page_id=generated.wikipedia_page_id)
+            if series is not None:
+                return _GeneratedSeriesTarget(
+                    title=series.title,
+                    description=series.description,
+                    existing_series_id=series.id,
+                    wikipedia_page_id=series.wikipedia_page_id,
+                    selected_choice_id=f'series:{series.id}',
+                )
+            return _GeneratedSeriesTarget(
+                title=wikipedia_hint['title'],
+                description=wikipedia_hint['extract'] or snapshot.description,
+                existing_series_id=None,
+                wikipedia_page_id=wikipedia_hint['page_id'],
+                selected_choice_id=f'wiki:{wikipedia_hint["page_id"]}',
+            )
+
+        generated_key = BuildSeriesGroupingKey(generated.series_title)
+        generated_canonical_key = _buildRuleKeyHash(generated_key)
+
+        # ③ canonical / title 完全一致 / legacy 正規化一致。
+        series = await Series.get_or_none(canonical_key=generated_canonical_key)
+        if series is None:
+            series = await Series.filter(title=generated.series_title).order_by('id').first()
+        if series is None:
+            for legacy_series in available_series:
+                if legacy_series.canonical_key is not None:
+                    continue
+                if BuildSeriesGroupingKey(legacy_series.title) == generated_key:
+                    series = legacy_series
+                    break
+        if series is not None:
+            return _GeneratedSeriesTarget(
+                title=series.title,
+                description=series.description,
+                existing_series_id=series.id,
+                wikipedia_page_id=series.wikipedia_page_id,
+                selected_choice_id=f'series:{series.id}',
+            )
+
+        # ④ 5文字以上・ratio 0.90以上・共通長5以上を満たす一意な高類似候補だけへ合流する。
+        fuzzy_matches: list[tuple[float, int, Series]] = []
+        if len(generated_key) >= 5:
+            for candidate in available_series:
+                candidate_key = BuildSeriesGroupingKey(candidate.title)
+                if len(candidate_key) < 5:
+                    continue
+                ratio, common_length = _seriesSimilarity(generated.series_title, candidate.title)
+                if ratio >= 0.90 and common_length >= 5:
+                    fuzzy_matches.append((ratio, common_length, candidate))
+        fuzzy_matches.sort(key=lambda item: (item[0], item[1], -item[2].id), reverse=True)
+        if len(fuzzy_matches) >= 2 and fuzzy_matches[0][0] - fuzzy_matches[1][0] < 0.05:
+            raise RecordedSeriesAIError('AmbiguousFuzzySeriesMatch')
+        if len(fuzzy_matches) == 1 or (
+            len(fuzzy_matches) >= 2 and
+            fuzzy_matches[0][0] - fuzzy_matches[1][0] >= 0.05
+        ):
+            series = fuzzy_matches[0][2]
+            return _GeneratedSeriesTarget(
+                title=series.title,
+                description=series.description,
+                existing_series_id=series.id,
+                wikipedia_page_id=series.wikipedia_page_id,
+                selected_choice_id=f'series:{series.id}',
+            )
+
+        # ⑤ 既存へ合流できない場合だけ AI 生成名で新規作成する。
+        return _GeneratedSeriesTarget(
+            title=generated.series_title,
+            description=snapshot.description,
+            existing_series_id=None,
+            wikipedia_page_id=None,
+            selected_choice_id='series:generated',
+        )
 
     @classmethod
     async def _getOrCreateResolution(
@@ -1056,7 +1234,7 @@ class RecordedSeriesResolver:
         series_id: int | None = None,
         wikipedia_page_id: int | None = None,
         candidate_set_hash: str | None = None,
-        candidate_snapshot: list[SeriesChoiceCandidate] | None = None,
+        candidate_snapshot: list[object] | None = None,
         ai_model: str | None = None,
         error_code: str | None = None,
         error_message: str | None = None,
@@ -1069,7 +1247,7 @@ class RecordedSeriesResolver:
         resolution.series_id = series_id
         resolution.wikipedia_page_id = wikipedia_page_id
         resolution.candidate_set_hash = candidate_set_hash
-        resolution.candidate_snapshot = cast(list[object] | None, candidate_snapshot)
+        resolution.candidate_snapshot = candidate_snapshot
         resolution.ai_model = ai_model
         resolution.error_code = error_code
         resolution.error_message = error_message
@@ -1512,8 +1690,10 @@ class RecordedSeriesResolver:
         wikipedia_page_id: int | None = None,
         existing_series_id: int | None = None,
         candidate_set_hash: str | None = None,
-        candidate_snapshot: list[SeriesChoiceCandidate] | None = None,
+        candidate_snapshot: list[object] | None = None,
         ai_model: str | None = None,
+        generated_metadata: AISeriesMetadataResult | None = None,
+        local_episode_fallback: ParsedEpisodeNumber | None = None,
     ) -> Series:
         """Series・放送期間・録画・positive ruleを同一トランザクションで冪等更新する。"""
 
@@ -1611,7 +1791,22 @@ class RecordedSeriesResolver:
             recorded_program.series_title = series.title
             # Manual割当・再適用では、既存のTS/EPG由来話数と話名を優先し、欠けている値だけを
             # 現在タイトルのローカル解析で補完する。自動判定時は従来どおり解析結果へ更新する。
-            if source == 'Manual':
+            if generated_metadata is not None:
+                generated_allowed = await RecordedEpisodeResolver.applyGeneratedMetadata(
+                    recorded_program,
+                    target_series_id=series.id,
+                    generated=generated_metadata,
+                    input_fingerprint=_buildInputFingerprint(snapshot),
+                    connection=connection,
+                    local_episode_fallback=local_episode_fallback,
+                )
+                if generated_allowed:
+                    # null は既存話名を消す指示ではない。生成できた場合だけ上書きする。
+                    if generated_metadata.subtitle is not None:
+                        recorded_program.subtitle = generated_metadata.subtitle
+                    elif recorded_program.subtitle is None:
+                        recorded_program.subtitle = parse_result.subtitle
+            elif source == 'Manual':
                 if recorded_program.episode_number is None:
                     recorded_program.episode_number = parse_result.episode_number
                 if recorded_program.subtitle is None:
@@ -1623,6 +1818,7 @@ class RecordedSeriesResolver:
                 'series_id',
                 'series_broadcast_period_id',
                 'series_title',
+                'series_episode_id',
                 'episode_number',
                 'subtitle',
                 'updated_at',
@@ -1678,7 +1874,7 @@ class RecordedSeriesResolver:
         source: RecordedSeriesSource,
         confidence: float,
         candidate_set_hash: str | None = None,
-        candidate_snapshot: list[SeriesChoiceCandidate] | None = None,
+        candidate_snapshot: list[object] | None = None,
         ai_model: str | None = None,
         persist_rule: bool = True,
     ) -> None:
@@ -1748,7 +1944,7 @@ class RecordedSeriesResolver:
         source: RecordedSeriesSource,
         error_code: str,
         candidate_set_hash: str | None = None,
-        candidate_snapshot: list[SeriesChoiceCandidate] | None = None,
+        candidate_snapshot: list[object] | None = None,
         ai_model: str | None = None,
         clear_series: bool,
         series_id: int | None = None,
@@ -1840,7 +2036,7 @@ class RecordedSeriesResolver:
         request: RecordedSeriesAIRequest,
         status: Literal['Succeeded', 'Failed', 'Rejected'],
         selected_choice_id: str | None = None,
-        result: AIChoiceResult | None = None,
+        result: AISeriesMetadataResult | None = None,
         error: RecordedSeriesAIError | None = None,
     ) -> None:
         """事前予約済み監査行を、プロンプト・応答・キーなしで終端状態へ更新する。"""
@@ -1865,6 +2061,385 @@ class RecordedSeriesResolver:
         ])
 
     @classmethod
+    async def _resolveWithGeneratedMetadata(
+        cls,
+        *,
+        snapshot: _ProgramSnapshot,
+        local_parse: SeriesTitleParseResult,
+        cluster: _ClusterEvidence,
+        resolution: RecordedSeriesResolution,
+        expected_generation: int,
+        settings: RecordedSeriesSettings,
+        runtime_api_key: str | None,
+        audit_model: str,
+        force: bool,
+    ) -> RecordedSeriesResolveResult:
+        """AI ON の常時生成、監査、既存 Series すり合わせを完結させる。"""
+
+        # 日次上限を超えた場合は dirty な Local title へ暗黙フォールバックしない。
+        daily_ai_request_limit = settings.daily_ai_request_limit
+        if daily_ai_request_limit > 0:
+            today_start = datetime.combine(datetime.now(tz=JST).date(), datetime_time.min, tzinfo=JST)
+            requests_today = await RecordedSeriesAIRequest.filter(
+                purpose__in=['Resolution', 'EpisodeLookup'],
+                created_at__gte=today_start,
+            ).filter(
+                Q(error_code=None) | Q(error_code__not_in=NON_BILLABLE_AI_REQUEST_ERROR_CODES),
+            ).count()
+            if requests_today >= daily_ai_request_limit:
+                await cls._applyNeedsReview(
+                    snapshot=snapshot,
+                    resolution=resolution,
+                    expected_generation=expected_generation,
+                    source='AI',
+                    error_code='DailyAIRequestLimitReached',
+                    clear_series=force is False,
+                )
+                return RecordedSeriesResolveResult(snapshot.id, 'NeedsReview', 'AI', False)
+
+        # 高コスト・外部の hints は Manual / Rule / 上限ゲート通過後にだけ遅延構築する。
+        # hints と生成後の既存 Series すり合わせで同じスナップショットを共有し、
+        # Series 全件走査を外部 AI 呼び出しの前後で重複させない。
+        existing_series, available_series = await cls._findExistingSeriesCandidates(cluster.display_title)
+        try:
+            wikipedia_candidates = await SearchWikipediaCandidates(cluster.display_title, limit=5)
+        except (httpx.HTTPError, ValueError):
+            # Wikipedia は参考情報であり、停止条件ではない。空 hints で生成を継続する。
+            wikipedia_candidates = []
+        hints = SeriesMetadataHints(
+            local_parse=SeriesMetadataLocalParseHint(
+                series_title=local_parse.series_title,
+                season_number=local_parse.season_number,
+                episode_number=local_parse.episode_number,
+                subtitle=local_parse.subtitle,
+            ),
+            cluster=SeriesMetadataClusterHint(
+                display_title=cluster.display_title,
+                normalized_key=cluster.normalized_key,
+                member_count=len(cluster.member_ids),
+            ),
+            existing_series=[
+                SeriesMetadataExistingSeriesHint(
+                    id=series.id,
+                    title=series.title,
+                    description=series.description[:600],
+                    wikipedia_page_id=series.wikipedia_page_id,
+                )
+                for series in existing_series
+            ],
+            wikipedia=[
+                SeriesMetadataWikipediaHint(
+                    page_id=candidate['page_id'],
+                    title=candidate['title'],
+                    extract=candidate['extract'],
+                )
+                for candidate in wikipedia_candidates
+            ],
+        )
+        candidate_set_hash = _sha256JSON(hints)
+        candidate_ids = [
+            *[f'series:{candidate["id"]}' for candidate in hints['existing_series']],
+            *[f'wiki:{candidate["page_id"]}' for candidate in hints['wikipedia']],
+        ]
+        candidate_snapshot = cast(list[object], [hints])
+        program_prompt = RecordedSeriesProgramPrompt(
+            title=snapshot.title,
+            description=snapshot.description[:800],
+            genres=[genre['major'] for genre in snapshot.genres],
+            channel=snapshot.channel_id,
+            start_date=snapshot.start_time.date().isoformat(),
+        )
+
+        # hints 構築中に録画入力が変わった場合は、日次枠を予約する前に中止する。
+        latest_snapshot = await cls._loadProgramSnapshot(snapshot.id)
+        if (
+            expected_generation != cls._snapshot_generation or
+            latest_snapshot is None or
+            _buildInputFingerprint(latest_snapshot) != _buildInputFingerprint(snapshot)
+        ):
+            raise _RecordedProgramSnapshotChanged
+
+        ai_attempt_key = _buildAIAttemptKey(
+            resolution_id=resolution.id,
+            input_fingerprint=_buildInputFingerprint(snapshot),
+            evidence_hash=cluster.evidence_hash,
+            candidate_set_hash=candidate_set_hash,
+            api_base_url=settings.api_base_url,
+            model=audit_model,
+            api_key=runtime_api_key,
+        )
+        attempt_started_at = time.monotonic()
+        for expired_attempt_key in [
+            key
+            for key, started_at in cls._ai_attempt_keys.items()
+            if attempt_started_at - started_at >= AI_ATTEMPT_CACHE_TTL_SECONDS
+        ]:
+            cls._ai_attempt_keys.pop(expired_attempt_key, None)
+        if force is False and ai_attempt_key in cls._ai_attempt_keys:
+            await cls._applyNeedsReview(
+                snapshot=snapshot,
+                resolution=resolution,
+                expected_generation=expected_generation,
+                source='AI',
+                candidate_set_hash=candidate_set_hash,
+                candidate_snapshot=candidate_snapshot,
+                ai_model=audit_model,
+                error_code='RecentAIAttempt',
+                clear_series=True,
+            )
+            return RecordedSeriesResolveResult(snapshot.id, 'Skipped', 'AIAttemptCache', False)
+
+        resolution.candidate_set_hash = candidate_set_hash
+        resolution.candidate_snapshot = candidate_snapshot
+        resolution.ai_model = audit_model
+        await resolution.save(update_fields=[
+            'candidate_set_hash',
+            'candidate_snapshot',
+            'ai_model',
+            'updated_at',
+        ])
+        ai_request = await RecordedSeriesAIRequest.create(
+            resolution_id=resolution.id,
+            purpose='Resolution',
+            status='Pending',
+            model=audit_model,
+            input_fingerprint=_buildInputFingerprint(snapshot),
+            candidate_set_hash=candidate_set_hash,
+            candidate_ids=candidate_ids,
+            selected_choice_id=None,
+            prompt_tokens=None,
+            completion_tokens=None,
+            http_status=None,
+            latency_ms=None,
+            error_code=None,
+        )
+
+        # 監査予約の DB await 中に入力が変わった場合も、外部 POST を開始しない。
+        latest_snapshot = await cls._loadProgramSnapshot(snapshot.id)
+        if (
+            expected_generation != cls._snapshot_generation or
+            latest_snapshot is None or
+            _buildInputFingerprint(latest_snapshot) != _buildInputFingerprint(snapshot)
+        ):
+            await cls._finishAIRequest(
+                request=ai_request,
+                status='Failed',
+                error=RecordedSeriesAIError('InputChangedBeforeRequest'),
+            )
+            raise _RecordedProgramSnapshotChanged
+        cls._ai_attempt_keys[ai_attempt_key] = attempt_started_at
+
+        try:
+            generated = await ai_resolve_series_metadata(
+                program=program_prompt,
+                hints=hints,
+                settings=settings,
+                api_key=runtime_api_key,
+            )
+        except RecordedSeriesAIError as ex:
+            rejected_codes = {
+                'InvalidJSON',
+                'InvalidJSONType',
+                'InvalidSeriesMetadataSchema',
+            }
+            await cls._finishAIRequest(
+                request=ai_request,
+                status='Rejected' if ex.code in rejected_codes else 'Failed',
+                error=ex,
+            )
+            await cls._applyNeedsReview(
+                snapshot=snapshot,
+                resolution=resolution,
+                expected_generation=expected_generation,
+                source='AI',
+                candidate_set_hash=candidate_set_hash,
+                candidate_snapshot=candidate_snapshot,
+                ai_model=audit_model,
+                error_code=ex.code,
+                clear_series=force is False,
+            )
+            return RecordedSeriesResolveResult(snapshot.id, 'NeedsReview', 'AI', True)
+
+        if generated.decision == 'Unresolved':
+            try:
+                await cls._applyNeedsReview(
+                    snapshot=snapshot,
+                    resolution=resolution,
+                    expected_generation=expected_generation,
+                    source='AI',
+                    candidate_set_hash=candidate_set_hash,
+                    candidate_snapshot=candidate_snapshot,
+                    ai_model=generated.model,
+                    error_code='AISelectedUnresolved',
+                    clear_series=force is False,
+                )
+            except _RecordedProgramSnapshotChanged:
+                await cls._finishAIRequest(
+                    request=ai_request,
+                    status='Failed',
+                    result=generated,
+                    error=RecordedSeriesAIError('InputChangedBeforeApply'),
+                )
+                raise
+            except RecordedSeriesAIError as ex:
+                await cls._finishAIRequest(
+                    request=ai_request,
+                    status='Failed',
+                    result=generated,
+                    error=ex,
+                )
+                raise
+            await cls._finishAIRequest(
+                request=ai_request,
+                status='Succeeded',
+                selected_choice_id='unresolved',
+                result=generated,
+            )
+            return RecordedSeriesResolveResult(snapshot.id, 'NeedsReview', 'AI', True)
+        if generated.decision == 'NotSeries':
+            try:
+                await cls._applyNotSeries(
+                    snapshot=snapshot,
+                    cluster=cluster,
+                    resolution=resolution,
+                    expected_generation=expected_generation,
+                    source='AI',
+                    confidence=generated.confidence,
+                    candidate_set_hash=candidate_set_hash,
+                    candidate_snapshot=candidate_snapshot,
+                    ai_model=generated.model,
+                )
+            except _RecordedProgramSnapshotChanged:
+                await cls._finishAIRequest(
+                    request=ai_request,
+                    status='Failed',
+                    result=generated,
+                    error=RecordedSeriesAIError('InputChangedBeforeApply'),
+                )
+                raise
+            except RecordedSeriesAIError as ex:
+                await cls._finishAIRequest(
+                    request=ai_request,
+                    status='Failed',
+                    result=generated,
+                    error=ex,
+                )
+                raise
+            await cls._finishAIRequest(
+                request=ai_request,
+                status='Succeeded',
+                selected_choice_id='not-series',
+                result=generated,
+            )
+            return RecordedSeriesResolveResult(snapshot.id, 'NotSeries', 'AI', True)
+
+        try:
+            target = await cls._reconcileGeneratedSeries(
+                generated=generated,
+                hints=hints,
+                snapshot=snapshot,
+                available_series=available_series,
+            )
+        except RecordedSeriesAIError as ex:
+            await cls._finishAIRequest(
+                request=ai_request,
+                status='Rejected',
+                result=generated,
+                error=ex,
+            )
+            await cls._applyNeedsReview(
+                snapshot=snapshot,
+                resolution=resolution,
+                expected_generation=expected_generation,
+                source='AI',
+                candidate_set_hash=candidate_set_hash,
+                candidate_snapshot=candidate_snapshot,
+                ai_model=generated.model,
+                error_code=ex.code,
+                clear_series=force is False,
+            )
+            return RecordedSeriesResolveResult(snapshot.id, 'NeedsReview', 'AI', True)
+
+        generated_episode_text = (
+            FormatEpisodeNumber(generated.season_number, generated.episode_number)
+            if generated.season_number is not None and generated.episode_number is not None
+            else None
+        )
+        local_episode_fallback = (
+            ParseLegacyEpisodeNumber(local_parse.episode_number)
+            if generated.episode_number is None and generated.episode_not_numbered is False
+            else None
+        )
+        generated_parse = SeriesTitleParseResult(
+            series_title=cast(str, generated.series_title),
+            normalized_key=BuildSeriesGroupingKey(cast(str, generated.series_title)),
+            episode_number=generated_episode_text,
+            subtitle=generated.subtitle if generated.subtitle is not None else local_parse.subtitle,
+            season_number=(
+                str(generated.season_number)
+                if generated.season_number is not None
+                else None
+            ),
+            episode_source=None,
+            has_explicit_episode=generated_episode_text is not None,
+            is_hard_standalone=False,
+            is_soft_standalone=False,
+        )
+        try:
+            await cls._applySeries(
+                snapshot=snapshot,
+                parse_result=generated_parse,
+                cluster=cluster,
+                resolution=resolution,
+                expected_generation=expected_generation,
+                source='AI',
+                title=target.title,
+                description=target.description,
+                confidence=generated.confidence,
+                wikipedia_page_id=target.wikipedia_page_id,
+                existing_series_id=target.existing_series_id,
+                candidate_set_hash=candidate_set_hash,
+                candidate_snapshot=candidate_snapshot,
+                ai_model=generated.model,
+                generated_metadata=generated,
+                local_episode_fallback=local_episode_fallback,
+            )
+        except _RecordedProgramSnapshotChanged:
+            await cls._finishAIRequest(
+                request=ai_request,
+                status='Failed',
+                result=generated,
+                error=RecordedSeriesAIError('InputChangedBeforeApply'),
+            )
+            raise
+        except RecordedSeriesAIError as ex:
+            await cls._finishAIRequest(
+                request=ai_request,
+                status='Rejected',
+                result=generated,
+                error=ex,
+            )
+            await cls._applyNeedsReview(
+                snapshot=snapshot,
+                resolution=resolution,
+                expected_generation=expected_generation,
+                source='AI',
+                candidate_set_hash=candidate_set_hash,
+                candidate_snapshot=candidate_snapshot,
+                ai_model=generated.model,
+                error_code=ex.code,
+                clear_series=force is False,
+            )
+            return RecordedSeriesResolveResult(snapshot.id, 'NeedsReview', 'AI', True)
+        await cls._finishAIRequest(
+            request=ai_request,
+            status='Succeeded',
+            selected_choice_id=target.selected_choice_id,
+            result=generated,
+        )
+        return RecordedSeriesResolveResult(snapshot.id, 'Resolved', 'AI', True)
+
+    @classmethod
     async def resolveProgram(
         cls,
         recorded_program_id: int,
@@ -1876,7 +2451,7 @@ class RecordedSeriesResolver:
         cluster_evidence: dict[int, _ClusterEvidence] | None = None,
         snapshot_generation: int | None = None,
     ) -> RecordedSeriesResolveResult:
-        """1録画をcache→local→EPG→MediaWiki→候補制約AIの順で判定する。
+        """1録画を保護ゲート後の AI 一括生成または従来 Local / EPG 経路で判定する。
 
         Args:
             recorded_program_id: 判定対象RecordedProgram ID。
@@ -1893,6 +2468,7 @@ class RecordedSeriesResolver:
 
         async with cls._resolve_lock:
             settings, runtime_api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+            audit_model = get_audit_model(settings)
             if settings.enabled is False and allow_disabled is False:
                 return RecordedSeriesResolveResult(recorded_program_id, 'Skipped', 'Disabled', False)
 
@@ -2173,6 +2749,21 @@ class RecordedSeriesResolver:
                     )
                     return RecordedSeriesResolveResult(recorded_program_id, 'NotSeries', 'Rule', False)
 
+            # AI ON は Local / EPG / soft standalone で早期確定せず、常に一括生成へ進む。
+            # Manual、hard standalone、channel 不在、有効 Rule はここより前で既に終端している。
+            if settings.ai_enabled:
+                return await cls._resolveWithGeneratedMetadata(
+                    snapshot=snapshot,
+                    local_parse=local_parse,
+                    cluster=cluster,
+                    resolution=resolution,
+                    expected_generation=decision_generation,
+                    settings=settings,
+                    runtime_api_key=runtime_api_key,
+                    audit_model=audit_model,
+                    force=force,
+                )
+
             # 明示話数は最も強いローカル証拠。同じrootで異なる内容が2件以上ある場合も
             # 外部アクセスなしでシリーズ化し、重複再放送だけの同名録画は除外する。
             if local_parse.has_explicit_episode or cluster.is_strong_repeat:
@@ -2236,349 +2827,16 @@ class RecordedSeriesResolver:
                 )
                 return RecordedSeriesResolveResult(recorded_program_id, 'NotSeries', 'Local', False)
 
-            existing_series = await cls._findExistingSeriesCandidates(cluster.display_title)
-            if settings.ai_enabled is False or settings.ai_candidate_selection_enabled is False:
-                await cls._applyNeedsReview(
-                    snapshot=snapshot,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='Local',
-                    error_code=(
-                        'AIIsDisabled'
-                        if settings.ai_enabled is False
-                        else 'AICandidateSelectionIsDisabled'
-                    ),
-                    clear_series=force is False,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'Local', False)
-
-            if settings.daily_ai_request_limit > 0:
-                today_start = datetime.combine(datetime.now(tz=JST).date(), datetime_time.min, tzinfo=JST)
-                requests_today = await RecordedSeriesAIRequest.filter(
-                    purpose__in=['Resolution', 'EpisodeLookup'],
-                    created_at__gte=today_start,
-                ).filter(
-                    Q(error_code=None) | Q(error_code__not='InputChangedBeforeRequest'),
-                ).count()
-                if requests_today >= settings.daily_ai_request_limit:
-                    await cls._applyNeedsReview(
-                        snapshot=snapshot,
-                        resolution=resolution,
-                        expected_generation=decision_generation,
-                        source='Local',
-                        error_code='DailyAIRequestLimitReached',
-                        clear_series=force is False,
-                    )
-                    return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'Local', False)
-
-            try:
-                wikipedia_candidates = await SearchWikipediaCandidates(cluster.display_title, limit=5)
-            except (httpx.HTTPError, ValueError):
-                await cls._applyNeedsReview(
-                    snapshot=snapshot,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='MediaWiki',
-                    error_code='MediaWikiUnavailable',
-                    clear_series=force is False,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'MediaWiki', False)
-
-            # Wikipedia・既存Series候補が見つからない場合も、KonomiTVが固定した
-            # ローカルSeries・単発・未解決の3候補からだけAIに選ばせる。外部候補がないことを
-            # 理由にここで要確認へ戻すと、同じ入力を何度再判定しても解消できなくなる。
-            local_choice_id = f'local:{_buildRuleKeyHash(cluster.normalized_key)}'
-            candidates: list[SeriesChoiceCandidate] = [
-                SeriesChoiceCandidate(
-                    choice_id=local_choice_id,
-                    kind='Local',
-                    title=cluster.display_title,
-                    description='Create a new local series using this exact server-provided title.',
-                ),
-            ]
-            candidates.extend(
-                SeriesChoiceCandidate(
-                    choice_id=f'series:{series.id}',
-                    kind='ExistingSeries',
-                    title=series.title,
-                    description=series.description[:600],
-                )
-                for series in existing_series
-            )
-            candidates.extend(
-                SeriesChoiceCandidate(
-                    choice_id=f'wiki:{candidate["page_id"]}',
-                    kind='Wikipedia',
-                    title=candidate['title'],
-                    description=candidate['extract'],
-                )
-                for candidate in wikipedia_candidates
-            )
-            candidates.extend([
-                SeriesChoiceCandidate(
-                    choice_id='standalone',
-                    kind='Standalone',
-                    title='Standalone',
-                    description='The recording is a one-off program and must not be grouped as a series.',
-                ),
-                SeriesChoiceCandidate(
-                    choice_id='unresolved',
-                    kind='Unresolved',
-                    title='Unresolved',
-                    description='Evidence is insufficient; leave the recording for review.',
-                ),
-            ])
-            candidate_set_hash = _sha256JSON(candidates)
-            candidate_ids = [candidate['choice_id'] for candidate in candidates]
-            program_prompt = RecordedSeriesProgramPrompt(
-                title=snapshot.title,
-                description=snapshot.description[:800],
-                genres=[genre['major'] for genre in snapshot.genres],
-                channel=snapshot.channel_id,
-                start_date=snapshot.start_time.date().isoformat(),
-            )
-
-            # MediaWiki待機中に録画入力やクラスタ構成が変わった場合は、
-            # 古い候補をAIへ送って日次枠を消費する前に中止する。
-            if decision_generation != cls._snapshot_generation:
-                raise _RecordedProgramSnapshotChanged
-            latest_snapshot = await cls._loadProgramSnapshot(recorded_program_id)
-            if (
-                decision_generation != cls._snapshot_generation or
-                latest_snapshot is None or
-                _buildInputFingerprint(latest_snapshot) != input_fingerprint
-            ):
-                raise _RecordedProgramSnapshotChanged
-
-            # 外部POSTより先に1リクエスト分を予約し、応答後〜監査保存前のクラッシュでも
-            # 未監査リクエストとして日次上限を超えないようにする。
-            ai_attempt_key = _buildAIAttemptKey(
-                resolution_id=resolution.id,
-                input_fingerprint=input_fingerprint,
-                evidence_hash=cluster.evidence_hash,
-                candidate_set_hash=candidate_set_hash,
-                api_base_url=settings.api_base_url,
-                model=settings.model,
-                api_key=runtime_api_key,
-            )
-            attempt_started_at = time.monotonic()
-            expired_attempt_keys = [
-                key
-                for key, started_at in cls._ai_attempt_keys.items()
-                if attempt_started_at - started_at >= AI_ATTEMPT_CACHE_TTL_SECONDS
-            ]
-            for expired_attempt_key in expired_attempt_keys:
-                cls._ai_attempt_keys.pop(expired_attempt_key, None)
-            if force is False and ai_attempt_key in cls._ai_attempt_keys:
-                await cls._applyNeedsReview(
-                    snapshot=snapshot,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='AI',
-                    candidate_set_hash=candidate_set_hash,
-                    candidate_snapshot=candidates,
-                    ai_model=settings.model,
-                    error_code='RecentAIAttempt',
-                    clear_series=force is False,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'Skipped', 'AIAttemptCache', False)
-            resolution.candidate_set_hash = candidate_set_hash
-            resolution.candidate_snapshot = cast(list[object], candidates)
-            resolution.ai_model = settings.model
-            await resolution.save(update_fields=[
-                'candidate_set_hash',
-                'candidate_snapshot',
-                'ai_model',
-                'updated_at',
-            ])
-            ai_request = await RecordedSeriesAIRequest.create(
-                resolution_id=resolution.id,
-                purpose='Resolution',
-                status='Pending',
-                model=settings.model,
-                input_fingerprint=input_fingerprint,
-                candidate_set_hash=candidate_set_hash,
-                candidate_ids=candidate_ids,
-                selected_choice_id=None,
-                prompt_tokens=None,
-                completion_tokens=None,
-                http_status=None,
-                latency_ms=None,
-                error_code=None,
-            )
-            # candidate snapshotと監査予約のDB await中に入力が変わる窓も閉じる。
-            # この失敗監査は実際のAPIリクエストではないため、日次利用数から除外する。
-            latest_snapshot = await cls._loadProgramSnapshot(recorded_program_id)
-            if (
-                decision_generation != cls._snapshot_generation or
-                latest_snapshot is None or
-                _buildInputFingerprint(latest_snapshot) != input_fingerprint
-            ):
-                await cls._finishAIRequest(
-                    request=ai_request,
-                    status='Failed',
-                    error=RecordedSeriesAIError('InputChangedBeforeRequest'),
-                )
-                raise _RecordedProgramSnapshotChanged
-            cls._ai_attempt_keys[ai_attempt_key] = attempt_started_at
-            try:
-                ai_result = await SelectRecordedSeriesCandidate(
-                    api_base_url=settings.api_base_url,
-                    api_key=runtime_api_key,
-                    model=settings.model,
-                    program=program_prompt,
-                    candidates=candidates,
-                )
-                await cls._finishAIRequest(
-                    request=ai_request,
-                    status='Succeeded',
-                    selected_choice_id=ai_result.choice_id,
-                    result=ai_result,
-                )
-            except RecordedSeriesAIError as ex:
-                rejected_codes = {
-                    'ChoiceOutsideCandidateSet',
-                    'InvalidOutputSchema',
-                    'InvalidJSON',
-                    'InvalidJSONType',
-                    'LowConfidence',
-                }
-                await cls._finishAIRequest(
-                    request=ai_request,
-                    status='Rejected' if ex.code in rejected_codes else 'Failed',
-                    error=ex,
-                )
-                await cls._applyNeedsReview(
-                    snapshot=snapshot,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='AI',
-                    candidate_set_hash=candidate_set_hash,
-                    candidate_snapshot=candidates,
-                    ai_model=settings.model,
-                    error_code=ex.code,
-                    clear_series=force is False,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'AI', True)
-
-            if ai_result.choice_id == 'unresolved':
-                await cls._applyNeedsReview(
-                    snapshot=snapshot,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='AI',
-                    candidate_set_hash=candidate_set_hash,
-                    candidate_snapshot=candidates,
-                    ai_model=ai_result.model,
-                    error_code='AISelectedUnresolved',
-                    clear_series=force is False,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'AI', True)
-            if ai_result.choice_id == 'standalone':
-                await cls._applyNotSeries(
-                    snapshot=snapshot,
-                    cluster=cluster,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='AI',
-                    confidence=ai_result.confidence,
-                    candidate_set_hash=candidate_set_hash,
-                    candidate_snapshot=candidates,
-                    ai_model=ai_result.model,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'NotSeries', 'AI', True)
-            if ai_result.choice_id == local_choice_id:
-                await cls._applySeries(
-                    snapshot=snapshot,
-                    parse_result=local_parse,
-                    cluster=cluster,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='AI',
-                    title=cluster.display_title,
-                    description=snapshot.description,
-                    confidence=ai_result.confidence,
-                    candidate_set_hash=candidate_set_hash,
-                    candidate_snapshot=candidates,
-                    ai_model=ai_result.model,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'Resolved', 'AI', True)
-            if ai_result.choice_id.startswith('series:'):
-                selected_series_id = int(ai_result.choice_id.removeprefix('series:'))
-                if selected_series_id not in {series.id for series in existing_series}:
-                    # 直前の候補集合検証に加え、commit時にもDB候補集合を再確認する。
-                    await cls._applyNeedsReview(
-                        snapshot=snapshot,
-                        resolution=resolution,
-                        expected_generation=decision_generation,
-                        source='AI',
-                        error_code='SeriesOutsideCandidateSetAtCommit',
-                        clear_series=force is False,
-                    )
-                    return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'AI', True)
-                selected_series = next(series for series in existing_series if series.id == selected_series_id)
-                await cls._applySeries(
-                    snapshot=snapshot,
-                    parse_result=local_parse,
-                    cluster=cluster,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='AI',
-                    title=selected_series.title,
-                    description=selected_series.description,
-                    confidence=ai_result.confidence,
-                    existing_series_id=selected_series.id,
-                    wikipedia_page_id=selected_series.wikipedia_page_id,
-                    candidate_set_hash=candidate_set_hash,
-                    candidate_snapshot=candidates,
-                    ai_model=ai_result.model,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'Resolved', 'AI', True)
-            if ai_result.choice_id.startswith('wiki:'):
-                selected_page_id = int(ai_result.choice_id.removeprefix('wiki:'))
-                wikipedia_by_id: dict[int, WikipediaCandidate] = {
-                    candidate['page_id']: candidate
-                    for candidate in wikipedia_candidates
-                }
-                selected_wikipedia = wikipedia_by_id.get(selected_page_id)
-                if selected_wikipedia is None:
-                    await cls._applyNeedsReview(
-                        snapshot=snapshot,
-                        resolution=resolution,
-                        expected_generation=decision_generation,
-                        source='AI',
-                        error_code='WikipediaOutsideCandidateSetAtCommit',
-                        clear_series=force is False,
-                    )
-                    return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'AI', True)
-                await cls._applySeries(
-                    snapshot=snapshot,
-                    parse_result=local_parse,
-                    cluster=cluster,
-                    resolution=resolution,
-                    expected_generation=decision_generation,
-                    source='AI',
-                    title=selected_wikipedia['title'],
-                    description=selected_wikipedia['extract'] or snapshot.description,
-                    confidence=ai_result.confidence,
-                    wikipedia_page_id=selected_wikipedia['page_id'],
-                    candidate_set_hash=candidate_set_hash,
-                    candidate_snapshot=candidates,
-                    ai_model=ai_result.model,
-                )
-                return RecordedSeriesResolveResult(recorded_program_id, 'Resolved', 'AI', True)
-
-            # SelectRecordedSeriesCandidate()が候補集合を検証済みなので通常到達しないが、
-            # 将来候補種別が増えた場合も暗黙採用せずNeedsReviewへ倒す。
+            # AI OFF の曖昧ケースは Wikipedia / AI へ接続せず、従来どおり要確認にする。
             await cls._applyNeedsReview(
                 snapshot=snapshot,
                 resolution=resolution,
                 expected_generation=decision_generation,
-                source='AI',
-                error_code='UnsupportedChoiceKind',
+                source='Local',
+                error_code='AIIsDisabled',
                 clear_series=force is False,
             )
-            return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'AI', True)
+            return RecordedSeriesResolveResult(recorded_program_id, 'NeedsReview', 'Local', False)
 
     @classmethod
     async def getNextProgramID(cls, recorded_program_id: int) -> int | None:
@@ -2633,13 +2891,13 @@ class RecordedSeriesResolver:
             purpose='Resolution',
             created_at__gte=today_start,
         ).filter(
-            Q(error_code=None) | Q(error_code__not='InputChangedBeforeRequest'),
+            Q(error_code=None) | Q(error_code__not_in=NON_BILLABLE_AI_REQUEST_ERROR_CODES),
         ).count()
         episode_ai_requests_today = await RecordedSeriesAIRequest.filter(
             purpose='EpisodeLookup',
             created_at__gte=today_start,
         ).filter(
-            Q(error_code=None) | Q(error_code__not='InputChangedBeforeRequest'),
+            Q(error_code=None) | Q(error_code__not_in=NON_BILLABLE_AI_REQUEST_ERROR_CODES),
         ).count()
         last_resolution = await RecordedSeriesResolution.all().order_by('-updated_at').first()
         resolved_count = status_counts['Resolved']

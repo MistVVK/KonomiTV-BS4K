@@ -5,13 +5,14 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import cast
+from typing import Literal, cast
 
 from tortoise import transactions
 from tortoise.backends.base.client import BaseDBAsyncClient
 
 from app import logging
 from app.constants import JST
+from app.metadata.RecordedSeriesGeneration import AISeriesMetadataResult
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 
@@ -396,7 +397,7 @@ class RecordedEpisodeResolver:
             recorded_program_id: 更新対象のRecordedProgram ID。
             expected_series_id: 編集画面を開いた時点のSeries ID。
             expected_series_episode_id: 編集画面を開いた時点のEpisode ID。
-            decision: ExistingEpisode、StructuredEpisode、Unknownのいずれか。
+            decision: ExistingEpisode、StructuredEpisode、Unknown、AdoptAIのいずれか。
             episode_id: ExistingEpisode時のSeriesEpisode ID。
             season_number: StructuredEpisode時のシーズン番号。
             episode_number: StructuredEpisode時の話数。
@@ -428,7 +429,18 @@ class RecordedEpisodeResolver:
             ):
                 raise RecordedEpisodeAssignmentStaleError
 
+            resolution = (
+                await RecordedEpisodeResolution.filter(
+                    recorded_program_id=recorded_program.id,
+                )
+                .select_for_update()
+                .using_db(connection)
+                .first()
+            )
+
             selected_episode: SeriesEpisode | None
+            resolution_status: Literal['Resolved', 'Unknown', 'NotNumbered']
+            adopted_source: Literal['Manual', 'WebSearch']
             if decision == 'ExistingEpisode':
                 if episode_id is None or season_number is not None or episode_number is not None:
                     raise RecordedEpisodeInvalidNumberError
@@ -437,6 +449,8 @@ class RecordedEpisodeResolver:
                     raise RecordedEpisodeTargetNotFoundError
                 if selected_episode.series_id != recorded_program.series_id:
                     raise RecordedEpisodeCrossSeriesError
+                resolution_status = 'Resolved'
+                adopted_source = 'Manual'
             elif decision == 'StructuredEpisode':
                 if episode_id is not None or season_number is None or episode_number is None:
                     raise RecordedEpisodeInvalidNumberError
@@ -446,35 +460,87 @@ class RecordedEpisodeResolver:
                     episode_number=episode_number,
                     connection=connection,
                 )
+                resolution_status = 'Resolved'
+                adopted_source = 'Manual'
             elif decision == 'Unknown':
                 if episode_id is not None or season_number is not None or episode_number is not None:
                     raise RecordedEpisodeInvalidNumberError
                 selected_episode = None
+                resolution_status = 'Unknown'
+                adopted_source = 'Manual'
+            elif decision == 'AdoptAI':
+                # AI レーンに保存済みの提案だけを正本へ採用する（再検索はしない）。
+                if (
+                    episode_id is not None
+                    or season_number is not None
+                    or episode_number is not None
+                ):
+                    raise RecordedEpisodeInvalidNumberError
+                if resolution is None:
+                    raise RecordedEpisodeInvalidNumberError
+                if resolution.lookup_outcome == 'NotNumbered':
+                    selected_episode = None
+                    resolution_status = 'NotNumbered'
+                elif (
+                    resolution.proposed_season_number is not None
+                    and resolution.proposed_episode_number is not None
+                ):
+                    selected_episode = await cls._getOrCreateEpisode(
+                        series_id=recorded_program.series_id,
+                        season_number=resolution.proposed_season_number,
+                        episode_number=resolution.proposed_episode_number,
+                        connection=connection,
+                    )
+                    resolution_status = 'Resolved'
+                else:
+                    raise RecordedEpisodeInvalidNumberError
+                adopted_source = 'WebSearch'
             else:
                 raise RecordedEpisodeInvalidNumberError
 
-            recorded_program.series_episode_id = selected_episode.id if selected_episode is not None else None
-            recorded_program.episode_number = (
-                FormatEpisodeNumber(selected_episode.season_number, selected_episode.episode_number)
-                if selected_episode is not None
-                else None
+            recorded_program.series_episode_id = (
+                selected_episode.id if selected_episode is not None else None
             )
+            if resolution_status == 'NotNumbered':
+                recorded_program.episode_number = None
+            else:
+                recorded_program.episode_number = (
+                    FormatEpisodeNumber(
+                        selected_episode.season_number, selected_episode.episode_number
+                    )
+                    if selected_episode is not None
+                    else None
+                )
             await recorded_program.save(
                 update_fields=['series_episode_id', 'episode_number', 'updated_at'],
                 using_db=connection,
             )
-            resolution = await RecordedEpisodeResolution.filter(
-                recorded_program_id=recorded_program.id,
-            ).using_db(connection).first()
-            selected_episode_id = selected_episode.id if selected_episode is not None else None
-            resolution_status = 'Resolved' if selected_episode is not None else 'Unknown'
+            selected_episode_id = (
+                selected_episode.id if selected_episode is not None else None
+            )
             resolved_at = datetime.now(tz=JST)
             if resolution is None:
                 await RecordedEpisodeResolution.create(
                     recorded_program_id=recorded_program.id,
                     episode_id=selected_episode_id,
                     status=resolution_status,
-                    source='Manual',
+                    source=adopted_source,
+                    manual_episode_id=selected_episode_id
+                    if adopted_source == 'Manual'
+                    else None,
+                    manual_season_number=(
+                        selected_episode.season_number
+                        if adopted_source == 'Manual' and selected_episode is not None
+                        else None
+                    ),
+                    manual_episode_number=(
+                        selected_episode.episode_number
+                        if adopted_source == 'Manual' and selected_episode is not None
+                        else None
+                    ),
+                    manual_status=resolution_status
+                    if adopted_source == 'Manual'
+                    else None,
                     error_code=None,
                     error_message=None,
                     resolved_at=resolved_at,
@@ -483,14 +549,26 @@ class RecordedEpisodeResolver:
             else:
                 resolution.episode_id = selected_episode_id
                 resolution.status = resolution_status
-                resolution.source = 'Manual'
-                resolution.provider_fingerprint = None
-                resolution.proposed_season_number = None
-                resolution.proposed_episode_number = None
-                resolution.confidence = None
-                resolution.web_search_performed = False
-                resolution.citations = []
-                resolution.ai_model = None
+                resolution.source = adopted_source
+                # 手動確定では AI レーン（proposed / citations 等）を消さない。
+                # AI 採用では lookup 監査を残し、手動レーンも消さない。
+                if adopted_source == 'Manual':
+                    # 外部検索中に Manual が勝った場合、正本側に in-flight 表示だけを
+                    # 残さない。課金監査は Automation が応答後に Rejected へ閉じる。
+                    if resolution.lookup_outcome == 'Pending':
+                        resolution.lookup_outcome = None
+                    resolution.manual_episode_id = selected_episode_id
+                    resolution.manual_season_number = (
+                        selected_episode.season_number
+                        if selected_episode is not None
+                        else None
+                    )
+                    resolution.manual_episode_number = (
+                        selected_episode.episode_number
+                        if selected_episode is not None
+                        else None
+                    )
+                    resolution.manual_status = resolution_status
                 resolution.error_code = None
                 resolution.error_message = None
                 resolution.resolved_at = resolved_at
@@ -499,13 +577,11 @@ class RecordedEpisodeResolver:
                         'episode_id',
                         'status',
                         'source',
-                        'provider_fingerprint',
-                        'proposed_season_number',
-                        'proposed_episode_number',
-                        'confidence',
-                        'web_search_performed',
-                        'citations',
-                        'ai_model',
+                        'lookup_outcome',
+                        'manual_episode_id',
+                        'manual_season_number',
+                        'manual_episode_number',
+                        'manual_status',
                         'error_code',
                         'error_message',
                         'resolved_at',
@@ -513,6 +589,137 @@ class RecordedEpisodeResolver:
                     ],
                     using_db=connection,
                 )
+
+    @classmethod
+    async def applyGeneratedMetadata(
+        cls,
+        recorded_program: RecordedProgram,
+        *,
+        target_series_id: int,
+        generated: AISeriesMetadataResult,
+        input_fingerprint: str,
+        connection: BaseDBAsyncClient,
+        local_episode_fallback: ParsedEpisodeNumber | None = None,
+    ) -> bool:
+        """シリーズ生成と同じ transaction で AI 話数を正本へ反映する。
+
+        Args:
+            recorded_program: Series 割当を更新中の録画。
+            target_series_id: サーバーすり合わせ後に確定した Series ID。
+            generated: strict schema 検証済みの一括生成結果。
+            input_fingerprint: 生成へ送った録画入力の fingerprint。
+            connection: Series 更新と共有する transaction。
+            local_episode_fallback: AI が話数を返さない場合に限り採用できる厳格なローカル解析結果。
+
+        Returns:
+            AI の話名反映を許可する場合は True。Manual Episode を保護した場合は False。
+        """
+
+        resolution = await RecordedEpisodeResolution.filter(
+            recorded_program_id=recorded_program.id,
+        ).using_db(connection).first()
+        # Series の再判定を強制しても、管理者が確定した Episode レーンは上書きしない。
+        if resolution is not None and resolution.source == 'Manual':
+            return False
+
+        # null は「話数なし」の明示ではなく、モデルが話数を生成できなかった欠損値として扱う。
+        # 既に同じ Series で確定した話数がある場合は、出典を問わず欠損値で正本を消さない。
+        # Series 変更時に無効となる WebSearch / EPG / AI は synchronizeSeriesAssignment() が先に除去する。
+        # 明示的な NotNumbered はこの保護に入れず、後続処理で話数なしへ更新する。
+        has_deterministic_episode = (
+            recorded_program.series_episode_id is not None or
+            ParseLegacyEpisodeNumber(recorded_program.episode_number) is not None
+        )
+        preserve_deterministic_episode = (
+            generated.episode_number is None and
+            generated.episode_not_numbered is False and
+            has_deterministic_episode
+        )
+        if preserve_deterministic_episode:
+            return True
+
+        # AI が話数を明示しなかった初回判定では、タイトルから厳格に解析できた話数を採用する。
+        # episode_not_numbered=True はモデルの明示判断なので、ローカル値で覆さない。
+        use_local_episode_fallback = (
+            generated.episode_number is None and
+            generated.episode_not_numbered is False and
+            local_episode_fallback is not None
+        )
+        resolved_season_number = (
+            local_episode_fallback.season_number
+            if use_local_episode_fallback and local_episode_fallback is not None
+            else generated.season_number
+        )
+        resolved_episode_number = (
+            local_episode_fallback.episode_number
+            if use_local_episode_fallback and local_episode_fallback is not None
+            else generated.episode_number
+        )
+        episode: SeriesEpisode | None = None
+        if resolved_season_number is not None and resolved_episode_number is not None:
+            episode = await cls._getOrCreateEpisode(
+                series_id=target_series_id,
+                season_number=resolved_season_number,
+                episode_number=resolved_episode_number,
+                connection=connection,
+            )
+        recorded_program.series_episode_id = episode.id if episode is not None else None
+        recorded_program.episode_number = (
+            FormatEpisodeNumber(episode.season_number, episode.episode_number)
+            if episode is not None
+            else None
+        )
+
+        resolution_status: Literal['Resolved', 'Unknown', 'NotNumbered']
+        if episode is not None:
+            resolution_status = 'Resolved'
+        else:
+            # 一括生成で数値話数が得られなかった録画は、仕様上 NotNumbered として保存する。
+            # provider_fingerprint は空のため、話数 Web 検索を有効にしていれば後段で再検索できる。
+            resolution_status = 'NotNumbered'
+        resolved_at = datetime.now(tz=JST)
+        if resolution is None:
+            await RecordedEpisodeResolution.create(
+                recorded_program_id=recorded_program.id,
+                episode_id=episode.id if episode is not None else None,
+                status=resolution_status,
+                source='Local' if use_local_episode_fallback else 'AI',
+                lookup_outcome=None,
+                input_fingerprint=input_fingerprint,
+                provider_fingerprint=None,
+                proposed_season_number=generated.season_number,
+                proposed_episode_number=generated.episode_number,
+                confidence=None if use_local_episode_fallback else generated.confidence,
+                web_search_performed=False,
+                rationale_short=None if use_local_episode_fallback else generated.rationale_short,
+                citations=[],
+                ai_model=None if use_local_episode_fallback else generated.model,
+                error_code=None,
+                error_message=None,
+                resolved_at=resolved_at,
+                using_db=connection,
+            )
+            return True
+
+        resolution.episode_id = episode.id if episode is not None else None
+        resolution.status = resolution_status
+        resolution.source = 'Local' if use_local_episode_fallback else 'AI'
+        resolution.lookup_outcome = None
+        resolution.input_fingerprint = input_fingerprint
+        resolution.provider_fingerprint = None
+        resolution.proposed_season_number = generated.season_number
+        resolution.proposed_episode_number = generated.episode_number
+        resolution.confidence = None if use_local_episode_fallback else generated.confidence
+        resolution.web_search_performed = False
+        resolution.rationale_short = None if use_local_episode_fallback else generated.rationale_short
+        resolution.citations = []
+        resolution.ai_model = None if use_local_episode_fallback else generated.model
+        resolution.error_code = None
+        resolution.error_message = None
+        resolution.resolved_at = resolved_at
+        # manual_* は別レーンとして保持し、AI 再生成では触らない。
+        await resolution.save(using_db=connection)
+        return True
 
     @classmethod
     async def synchronizeSeriesAssignment(
@@ -544,7 +751,7 @@ class RecordedEpisodeResolver:
             target_series_id is not None and
             series_changed and
             resolution is not None and
-            resolution.source in {'WebSearch', 'EPG'}
+            resolution.source in {'WebSearch', 'EPG', 'AI'}
         )
         current_episode: SeriesEpisode | None = None
         if invalidate_contextual_result is False and recorded_program.series_episode_id is not None:
@@ -584,11 +791,13 @@ class RecordedEpisodeResolver:
             elif invalidate_contextual_result:
                 resolution.status = 'Pending'
                 resolution.source = 'Migration' if resolution.is_legacy_recording else 'Local'
+                resolution.lookup_outcome = None
                 resolution.provider_fingerprint = None
                 resolution.proposed_season_number = None
                 resolution.proposed_episode_number = None
                 resolution.confidence = None
                 resolution.web_search_performed = False
+                resolution.rationale_short = None
                 resolution.citations = []
                 resolution.ai_model = None
                 resolution.error_code = None
@@ -604,11 +813,13 @@ class RecordedEpisodeResolver:
                 # Web提案は元Seriesの文脈に依存するため、移動先へ持ち越さず再判定可能に戻す。
                 resolution.status = 'Pending'
                 resolution.source = 'Migration' if resolution.is_legacy_recording else 'Local'
+                resolution.lookup_outcome = None
                 resolution.provider_fingerprint = None
                 resolution.proposed_season_number = None
                 resolution.proposed_episode_number = None
                 resolution.confidence = None
                 resolution.web_search_performed = False
+                resolution.rationale_short = None
                 resolution.citations = []
                 resolution.ai_model = None
                 resolution.error_code = None
@@ -618,11 +829,13 @@ class RecordedEpisodeResolver:
                     'episode_id',
                     'status',
                     'source',
+                    'lookup_outcome',
                     'provider_fingerprint',
                     'proposed_season_number',
                     'proposed_episode_number',
                     'confidence',
                     'web_search_performed',
+                    'rationale_short',
                     'citations',
                     'ai_model',
                     'error_code',
