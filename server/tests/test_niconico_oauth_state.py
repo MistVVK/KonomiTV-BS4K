@@ -199,7 +199,7 @@ def test_niconico_auth_url_does_not_embed_login_jwt(monkeypatch: pytest.MonkeyPa
         await _InitializeDatabase()
         try:
             user = await _CreateUser()
-            access_token = GenerateAccessToken(user.id)
+            access_token = GenerateAccessToken(user.id, user.token_version)
 
             app = FastAPI()
             app.include_router(niconico_router_module.router)
@@ -269,7 +269,7 @@ def test_niconico_callback_uses_oauth_state_not_query_jwt(monkeypatch: pytest.Mo
             issued_state = await NiconicoOAuthState.get(user_id=user.id)
             expected_code_verifier = issued_state.code_verifier
             assert expected_code_verifier is not None
-            login_jwt = GenerateAccessToken(user.id)
+            login_jwt = GenerateAccessToken(user.id, user.token_version)
 
             # ニコニコ token / user API をスタブ
             token_response = Mock()
@@ -423,7 +423,7 @@ def test_niconico_callback_rejects_missing_oauth_state(monkeypatch: pytest.Monke
         await _InitializeDatabase()
         try:
             user = await _CreateUser()
-            login_jwt = GenerateAccessToken(user.id)
+            login_jwt = GenerateAccessToken(user.id, user.token_version)
             network_client = Mock(side_effect=AssertionError('HTTP client must not be created'))
             monkeypatch.setattr(niconico_router_module, 'HTTPX_CLIENT', network_client)
 
