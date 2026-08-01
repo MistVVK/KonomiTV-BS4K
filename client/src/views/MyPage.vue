@@ -31,7 +31,10 @@
                             <div class="analysis-tasks__section-title">
                                 {{analysisTasksStore.activeTaskStatus === 'Running' ? '実行中' : '待機中'}}
                             </div>
-                            <div v-for="group in activeTaskGroups" :key="group.task_type" class="analysis-task analysis-task--active">
+                            <button v-for="group in activeTaskGroups" :key="group.task_type" v-ripple type="button"
+                                class="analysis-task analysis-task--active"
+                                :aria-label="`${taskTypeLabel(group.task_type)}の現在の処理を表示`"
+                                @click="openActiveAnalysisTaskDialog(group.task_type)">
                                 <div class="analysis-task__line">
                                     <strong class="analysis-task__type">{{taskTypeLabel(group.task_type)}}</strong>
                                     <small class="analysis-task__stage">{{stageLabel(group.first.stage)}}</small>
@@ -40,7 +43,7 @@
                                 <v-progress-linear v-if="group.progress !== null" class="mt-2" color="primary" height="5"
                                     rounded :model-value="group.progress * 100" />
                                 <v-progress-linear v-else class="mt-2" color="primary" height="5" rounded indeterminate />
-                            </div>
+                            </button>
                         </template>
                         <div v-else class="analysis-tasks__empty">実行中の処理はありません。</div>
                     </section>
@@ -69,16 +72,20 @@
                 </nav>
             </v-card>
         </main>
+        <KonomiTVBS4KActiveAnalysisTaskDialog v-model="activeAnalysisTaskDialog"
+            :task-type="selectedActiveTaskType" />
     </div>
 </template>
 <script lang="ts" setup>
 
 import { storeToRefs } from 'pinia';
-import { onMounted, onUnmounted } from 'vue';
+import { onMounted, onUnmounted, ref } from 'vue';
 
 import HeaderBar from '@/components/HeaderBar.vue';
+import KonomiTVBS4KActiveAnalysisTaskDialog from '@/components/KonomiTVBS4KActiveAnalysisTaskDialog.vue';
 import Navigation from '@/components/Navigation.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
+import { AnalysisTaskType } from '@/services/AnalysisTasks';
 import useAnalysisTasksStore, { stageLabel, taskTypeLabel } from '@/stores/AnalysisTasksStore';
 import useUserStore from '@/stores/UserStore';
 import useVersionStore from '@/stores/VersionStore';
@@ -87,6 +94,13 @@ const userStore = useUserStore();
 const versionStore = useVersionStore();
 const analysisTasksStore = useAnalysisTasksStore();
 const { activeTaskGroups } = storeToRefs(analysisTasksStore);
+const activeAnalysisTaskDialog = ref(false);
+const selectedActiveTaskType = ref<AnalysisTaskType | null>(null);
+
+function openActiveAnalysisTaskDialog(taskType: AnalysisTaskType): void {
+    selectedActiveTaskType.value = taskType;
+    activeAnalysisTaskDialog.value = true;
+}
 
 onMounted(async () => {
     // 非同期のユーザー情報取得中に画面遷移しても開始・停止の対応が崩れないよう、先に購読を開始する。
@@ -248,8 +262,11 @@ onUnmounted(() => {
     &__empty { padding: 16px 4px 4px; text-align: center; opacity: 0.65; font-size: 12px; }
 }
 .analysis-task {
-    display: block; min-width: 0; padding: 10px; margin-top: 6px; border-radius: 6px;
+    display: block; width: 100%; min-width: 0; padding: 10px; margin-top: 6px; border: none; border-radius: 6px;
+    cursor: pointer; text-align: left;
     color: rgb(var(--v-theme-text)); background: rgb(var(--v-theme-background-lighten-2));
+    transition: background-color 0.15s ease;
+    &:hover, &:focus-visible { background: rgb(var(--v-theme-background-lighten-3)); }
     &__line { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; }
     &__type, &__stage { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
     &__count { flex-shrink: 0; white-space: nowrap; }

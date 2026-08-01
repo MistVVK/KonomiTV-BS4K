@@ -1,5 +1,14 @@
 
-import DPlayer from 'dplayer';
+import type {
+    BS4KLiveStreamingQuality,
+    IKonomiTVBS4KPlaybackVideoProfile,
+    KonomiTVBS4KPlaybackAudioCodec,
+    KonomiTVBS4KPlaybackVideoCodec,
+    LiveStreamingQuality,
+    VideoStreamingQuality,
+} from '@/stores/SettingsStore';
+import type DPlayer from 'dplayer';
+
 
 import Utils from '@/utils/Utils';
 
@@ -8,6 +17,12 @@ import Utils from '@/utils/Utils';
  * ライブ/録画番組ストリーミング API でベース画質として設定できる動画の画質
  */
 type APIBaseVideoQuality = (
+    '4320p' |
+    '4320p-hevc' |
+    '2160p' |
+    '2160p-hevc' |
+    '1440p' |
+    '1440p-hevc' |
     '1080p-60fps' |
     '1080p-60fps-hevc' |
     '1080p-30fps' |
@@ -66,9 +81,226 @@ type VideoAPIVideoQuality = (
 
 
 /**
+ * KonomiTV-BS4K の DPlayer で選択できる、suffix 付与前の API 画質。
+ */
+export type KonomiTVBS4KPlaybackSelectableQuality =
+    LiveStreamingQuality | BS4KLiveStreamingQuality | VideoStreamingQuality;
+
+
+/**
+ * server/app/constants.py の各 QUALITY が生成する最大解像度・fps を満たす最小 codec level。
+ *
+ * DPlayer の表示名ではなく suffix 付与前の API 画質をキーにすることで、初期化時と画質切り替え時が
+ * 必ず同じ MSE SourceBuffer 条件を参照する。
+ */
+const KONOMITV_BS4K_PLAYBACK_VIDEO_LEVELS: Record<KonomiTVBS4KPlaybackSelectableQuality, {
+    avc: string;
+    hevc: string;
+    vp9: string;
+    av1: string;
+}> = {
+    // 7680x4320 / 60fps
+    '4320p': {avc: '3D', hevc: '183', vp9: '61', av1: '17'},
+    // 3840x2160 / 60fps
+    '2160p': {avc: '34', hevc: '153', vp9: '51', av1: '13'},
+    // 2560x1440 / 60fps
+    '1440p': {avc: '33', hevc: '150', vp9: '50', av1: '12'},
+    // 1440x1080 / 60fps
+    '1080p-60fps': {avc: '2A', hevc: '126', vp9: '41', av1: '09'},
+    // 1440x1080 / 30fps
+    // mpegts.js の VP9 sequence header は fps を取得できず、全画質で解像度を常に 60fps として level 化する。
+    '1080p-30fps': {avc: '28', hevc: '120', vp9: '41', av1: '08'},
+    '1080p': {avc: '28', hevc: '120', vp9: '41', av1: '08'},
+    // 1440x810 / 60fps
+    '810p-60fps': {avc: '2A', hevc: '126', vp9: '40', av1: '08'},
+    // 1440x810 / 30fps
+    '810p-30fps': {avc: '20', hevc: '120', vp9: '40', av1: '08'},
+    '810p': {avc: '20', hevc: '120', vp9: '40', av1: '08'},
+    // 1280x720 / 60fps
+    '720p-60fps': {avc: '20', hevc: '120', vp9: '40', av1: '08'},
+    // 1280x720 / 30fps
+    '720p-30fps': {avc: '1F', hevc: '93', vp9: '40', av1: '05'},
+    '720p': {avc: '1F', hevc: '93', vp9: '40', av1: '05'},
+    // 960x540 / 30fps
+    '540p-30fps': {avc: '1F', hevc: '90', vp9: '31', av1: '04'},
+    '540p': {avc: '1F', hevc: '90', vp9: '31', av1: '04'},
+    // 854x480 / 30fps
+    '480p-30fps': {avc: '1F', hevc: '90', vp9: '31', av1: '04'},
+    '480p': {avc: '1F', hevc: '90', vp9: '31', av1: '04'},
+    // 640x360 / 30fps
+    '360p-30fps': {avc: '1E', hevc: '63', vp9: '30', av1: '01'},
+    '360p': {avc: '1E', hevc: '63', vp9: '30', av1: '01'},
+    // 426x240 / 30fps
+    '240p-30fps': {avc: '15', hevc: '60', vp9: '21', av1: '00'},
+    '240p': {avc: '15', hevc: '60', vp9: '21', av1: '00'},
+};
+
+
+/**
  * プレイヤー周りのユーティリティ
  */
 export class PlayerUtils {
+
+    /**
+     * codec / bit depth / 実際の選択画質ごとに、mpegts.js・hls.js が生成し得る
+     * SourceBuffer の MIME を返す。
+     */
+    static getKonomiTVBS4KPlaybackVideoMIMEType(
+        konomitv_bs4k_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_bit_depth: 8 | 10,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): string | null {
+        const konomitv_bs4k_levels =
+            KONOMITV_BS4K_PLAYBACK_VIDEO_LEVELS[konomitv_bs4k_profile.streaming_quality];
+        const konomitv_bs4k_mime_types:
+        Record<KonomiTVBS4KPlaybackVideoCodec, Record<8 | 10, string | null>> = {
+            avc: {8: `video/mp4; codecs="avc1.6400${konomitv_bs4k_levels.avc}"`, 10: null},
+            hevc: {
+                8: `video/mp4; codecs="hvc1.1.6.L${konomitv_bs4k_levels.hevc}.B0"`,
+                10: `video/mp4; codecs="hvc1.2.4.L${konomitv_bs4k_levels.hevc}.B0"`,
+            },
+            vp9: {
+                8: `video/mp4; codecs="vp09.00.${konomitv_bs4k_levels.vp9}.08"`,
+                10: `video/mp4; codecs="vp09.02.${konomitv_bs4k_levels.vp9}.10"`,
+            },
+            av1: {
+                8: `video/mp4; codecs="av01.0.${konomitv_bs4k_levels.av1}M.08"`,
+                10: `video/mp4; codecs="av01.0.${konomitv_bs4k_levels.av1}M.10"`,
+            },
+        };
+        return konomitv_bs4k_mime_types[konomitv_bs4k_codec][konomitv_bs4k_bit_depth];
+    }
+
+
+    /** suffix 付与前の API 画質を、DPlayer に表示する画質名へ変換する。 */
+    static getKonomiTVBS4KPlaybackQualityDisplayName(
+        konomitv_bs4k_api_quality: KonomiTVBS4KPlaybackSelectableQuality,
+    ): string {
+        if (konomitv_bs4k_api_quality === '4320p') return '8K';
+        if (konomitv_bs4k_api_quality === '2160p') return '4K';
+        if (konomitv_bs4k_api_quality.endsWith('-60fps')) {
+            return `${konomitv_bs4k_api_quality.replace('-60fps', '')} (60fps)`;
+        }
+        if (konomitv_bs4k_api_quality.endsWith('-30fps')) {
+            return `${konomitv_bs4k_api_quality.replace('-30fps', '')} (30fps)`;
+        }
+        return konomitv_bs4k_api_quality;
+    }
+
+
+    /**
+     * 保存値・レジューム値・DPlayer の表示名を、suffix 付与前の API 画質へ正規化する。
+     *
+     * 未知の表示名を既定画質へ黙って読み替えると、画質切り替え時の MSE 判定を別画質で通してしまうため null を返す。
+     */
+    static normalizeKonomiTVBS4KPlaybackAPIQuality(
+        konomitv_bs4k_quality_name: string,
+        is_konomitv_bs4k: boolean,
+        konomitv_bs4k_available_qualities: readonly KonomiTVBS4KPlaybackSelectableQuality[],
+    ): KonomiTVBS4KPlaybackSelectableQuality | null {
+        const konomitv_bs4k_legacy_quality_map: Record<string, BS4KLiveStreamingQuality> = {
+            '1080p': '1080p-30fps',
+            '810p': '810p-30fps',
+            '720p': '720p-30fps',
+            '540p': '540p-30fps',
+            '480p': '480p-30fps',
+            '360p': '360p-30fps',
+            '240p': '240p-30fps',
+        };
+        let konomitv_bs4k_normalized_quality = konomitv_bs4k_quality_name.trim();
+        if (konomitv_bs4k_normalized_quality === '8K') {
+            konomitv_bs4k_normalized_quality = '4320p';
+        } else if (konomitv_bs4k_normalized_quality === '4K') {
+            konomitv_bs4k_normalized_quality = '2160p';
+        } else {
+            const konomitv_bs4k_display_name_match =
+                konomitv_bs4k_normalized_quality.match(/^(.+) \((60|30)fps\)$/);
+            if (konomitv_bs4k_display_name_match !== null) {
+                konomitv_bs4k_normalized_quality =
+                    `${konomitv_bs4k_display_name_match[1]}-${konomitv_bs4k_display_name_match[2]}fps`;
+            }
+        }
+        if (is_konomitv_bs4k === true) {
+            konomitv_bs4k_normalized_quality =
+                konomitv_bs4k_legacy_quality_map[konomitv_bs4k_normalized_quality] ??
+                konomitv_bs4k_normalized_quality;
+        }
+        return konomitv_bs4k_available_qualities.includes(
+            konomitv_bs4k_normalized_quality as KonomiTVBS4KPlaybackSelectableQuality,
+        ) ?
+            konomitv_bs4k_normalized_quality as KonomiTVBS4KPlaybackSelectableQuality :
+            null;
+    }
+
+
+    /** 現在のブラウザが指定映像codecのMSE SourceBufferを作成できるか返す。 */
+    static isKonomiTVBS4KPlaybackVideoCodecSupported(
+        konomitv_bs4k_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_bit_depth: 8 | 10,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): boolean {
+        const konomitv_bs4k_mime_type = this.getKonomiTVBS4KPlaybackVideoMIMEType(
+            konomitv_bs4k_codec,
+            konomitv_bs4k_bit_depth,
+            konomitv_bs4k_profile,
+        );
+        if (konomitv_bs4k_mime_type === null) return false;
+        return this.isKonomiTVBS4KPlaybackMIMETypeSupported(konomitv_bs4k_mime_type);
+    }
+
+
+    /** 現在のブラウザが指定音声codecのMSE SourceBufferを作成できるか返す。 */
+    static isKonomiTVBS4KPlaybackAudioCodecSupported(
+        konomitv_bs4k_codec: KonomiTVBS4KPlaybackAudioCodec,
+    ): boolean {
+        const konomitv_bs4k_mime_type = konomitv_bs4k_codec === 'opus' ?
+            `audio/mp4; codecs="${Utils.isSafari() ? 'Opus' : 'opus'}"` :
+            'audio/mp4; codecs="mp4a.40.2"';
+        return this.isKonomiTVBS4KPlaybackMIMETypeSupported(konomitv_bs4k_mime_type);
+    }
+
+
+    /**
+     * ライブと録画が実際に選ぶ全MediaSource実装でMIMEを利用できるか返す。
+     *
+     * 両APIが共存するSafariでは、mpegts.jsはMediaSourceを、hls.jsは
+     * preferManagedMediaSourceによりManagedMediaSourceを使うため、共通profileには両方の対応が必要。
+     */
+    private static isKonomiTVBS4KPlaybackMIMETypeSupported(konomitv_bs4k_mime_type: string): boolean {
+        const konomitv_bs4k_media_source_api = window.MediaSource;
+        const konomitv_bs4k_managed_media_source_api = (
+            window as Window & {
+                ManagedMediaSource?: {isTypeSupported: (konomitv_bs4k_mime_type: string) => boolean};
+            }
+        ).ManagedMediaSource;
+        if (
+            konomitv_bs4k_media_source_api === undefined &&
+            konomitv_bs4k_managed_media_source_api === undefined
+        ) {
+            return false;
+        }
+        return (
+            konomitv_bs4k_media_source_api === undefined ||
+            konomitv_bs4k_media_source_api.isTypeSupported(konomitv_bs4k_mime_type) === true
+        ) && (
+            konomitv_bs4k_managed_media_source_api === undefined ||
+            konomitv_bs4k_managed_media_source_api.isTypeSupported(konomitv_bs4k_mime_type) === true
+        );
+    }
+
+
+    /** ライブ通常APIへ渡すcodec queryを安定した順序で生成する。 */
+    static buildKonomiTVBS4KLivePlaybackCodecQuery(konomitv_bs4k_profile: {
+        video_codec: KonomiTVBS4KPlaybackVideoCodec;
+        video_bit_depth: 8 | 10;
+        audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+    }): string {
+        return new URLSearchParams({
+            video_codec: konomitv_bs4k_profile.video_codec,
+            video_bit_depth: konomitv_bs4k_profile.video_bit_depth.toString(),
+            audio_codec: konomitv_bs4k_profile.audio_codec,
+        }).toString();
+    }
 
     /**
      * DPlayer のインスタンスからライブストリーミング API で設定できる画質を取得する
@@ -82,6 +314,66 @@ export class PlayerUtils {
         const regex = /streams\/live\/[a-z0-9-]*\/(.*)\/mpegts/;
         const match = player.quality.url.match(regex);
         return match ? (match[1] as LiveAPIVideoQuality) : '1080p';
+    }
+
+
+    /**
+     * 再生中の MPEG-TS URL から codec query だけを正規順序で取り出す。
+     * events / psi-archived-data を必ず同一 LiveStream 共有キーへ接続するために使う。
+     */
+    static extractKonomiTVBS4KLivePlaybackCodecQueryFromDPlayer(
+        konomitv_bs4k_player: DPlayer,
+    ): string {
+        if (konomitv_bs4k_player.quality === null) return '';
+        const konomitv_bs4k_source_url =
+            new URL(konomitv_bs4k_player.quality.url, window.location.origin);
+        const konomitv_bs4k_query = new URLSearchParams();
+        for (
+            const konomitv_bs4k_key of
+            ['video_codec', 'video_bit_depth', 'audio_codec'] as const
+        ) {
+            const konomitv_bs4k_value =
+                konomitv_bs4k_source_url.searchParams.get(konomitv_bs4k_key);
+            if (konomitv_bs4k_value !== null) {
+                konomitv_bs4k_query.set(konomitv_bs4k_key, konomitv_bs4k_value);
+            }
+        }
+        return konomitv_bs4k_query.toString();
+    }
+
+
+    /** 指定画質・codec queryを持つライブ通常API URLを、全endpoint共通の規則で生成する。 */
+    static buildKonomiTVBS4KLiveAPIEndpointURL(
+        konomitv_bs4k_display_channel_id: string,
+        konomitv_bs4k_api_quality: string,
+        konomitv_bs4k_endpoint: 'mpegts' | 'events' | 'psi-archived-data',
+        konomitv_bs4k_codec_query: string,
+    ): string {
+        const konomitv_bs4k_url =
+            `${Utils.api_base_url}/streams/live/${konomitv_bs4k_display_channel_id}/` +
+            `${konomitv_bs4k_api_quality}/${konomitv_bs4k_endpoint}`;
+        return konomitv_bs4k_codec_query === '' ?
+            konomitv_bs4k_url :
+            `${konomitv_bs4k_url}?${konomitv_bs4k_codec_query}`;
+    }
+
+
+    /** 再生中のMPEG-TSと同じ画質・codec queryを持つライブ通常API URLを生成する。 */
+    static buildKonomiTVBS4KLiveAPIEndpointURLFromDPlayer(
+        konomitv_bs4k_player: DPlayer,
+        konomitv_bs4k_display_channel_id: string,
+        konomitv_bs4k_endpoint: 'mpegts' | 'events' | 'psi-archived-data',
+    ): string {
+        const konomitv_bs4k_api_quality =
+            this.extractLiveAPIQualityFromDPlayer(konomitv_bs4k_player);
+        const konomitv_bs4k_codec_query =
+            this.extractKonomiTVBS4KLivePlaybackCodecQueryFromDPlayer(konomitv_bs4k_player);
+        return this.buildKonomiTVBS4KLiveAPIEndpointURL(
+            konomitv_bs4k_display_channel_id,
+            konomitv_bs4k_api_quality,
+            konomitv_bs4k_endpoint,
+            konomitv_bs4k_codec_query,
+        );
     }
 
 

@@ -262,7 +262,9 @@ class KeyboardShortcutManager implements PlayerManager {
 
             // E: Picture-in-Picture の表示切り替え
             {mode: 'Both', key: 'KeyE', repeat: false, ctrl: false, shift: false, alt: false, handler: () => {
-                if (document.pictureInPictureEnabled) {
+                // Firefox のように映像単体のネイティブ Picture-in-Picture は非対応でも
+                // Document Picture-in-Picture API に対応しているブラウザでは、DocumentPiPManager が補った入口を利用する
+                if (document.pictureInPictureEnabled || 'documentPictureInPicture' in window) {
                     this.player.template.pipButton.click();
                 }
             }},

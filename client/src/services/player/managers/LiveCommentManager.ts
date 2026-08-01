@@ -3,6 +3,7 @@ import { throttle } from '@github/mini-throttle';
 import DPlayer, { DPlayerType } from 'dplayer';
 
 import Channels from '@/services/Channels';
+import { ILivePlaybackPolicy, resolveLiveCommentDelaySeconds } from '@/services/player/LivePlaybackPolicy';
 import PlayerManager from '@/services/player/PlayerManager';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
@@ -42,6 +43,10 @@ class LiveCommentManager implements PlayerManager {
     // 設計上コンストラクタ以降で変更すべきでないため readonly にしている
     private readonly player: DPlayer;
 
+    // PlayerController の初期化世代で解決済みの低遅延ポリシー
+    // 映像バッファをまだ取得できない時の実況遅延に使い、設定ストアの再参照による ON / OFF 混在を防ぐ
+    private readonly live_playback_policy: Readonly<ILivePlaybackPolicy>;
+
     // 視聴セッションの WebSocket のインスタンス
     private watch_session: WebSocket | null = null;
 
@@ -66,9 +71,11 @@ class LiveCommentManager implements PlayerManager {
     /**
      * コンストラクタ
      * @param player DPlayer のインスタンス
+     * @param live_playback_policy PlayerController の初期化時に解決済みの低遅延ポリシー
      */
-    constructor(player: DPlayer) {
+    constructor(player: DPlayer, live_playback_policy: Readonly<ILivePlaybackPolicy>) {
         this.player = player;
+        this.live_playback_policy = live_playback_policy;
     }
 
 
@@ -601,17 +608,26 @@ class LiveCommentManager implements PlayerManager {
                 return;
             }
 
-            // 配信で発生する遅延分待ってから
-            // おおよその遅延時間は video.buffered.end(0) - video.currentTime で取得できる
-            let buffered_end = 0;
+            // 配信で発生する遅延分待ってから描画する。
+            // 実バッファを取得できる場合は映像との同期精度を優先し、まだ取得できない場合は
+            // PlayerController が DPlayer・mpegts.js・開始バッファへ渡した同じセッション固定値を使う。
+            let buffered_end: number | null = null;
             if (this.player.video.buffered.length >= 1) {
                 buffered_end = this.player.video.buffered.end(0);
             }
-            const comment_delay_time = Math.max(buffered_end - this.player.video.currentTime, 0);
+            const comment_delay_time = resolveLiveCommentDelaySeconds(
+                this.live_playback_policy,
+                buffered_end,
+                this.player.video.currentTime,
+            );
             if (Utils.isSafari() === false) {
                 console.debug(`[LiveCommentManager][CommentSession] Delay: ${comment_delay_time} sec.`);
             }
-            await Utils.sleep(comment_delay_time);
+            // 再接続や PlayerController 再生成で旧コメントセッションが破棄された場合は、
+            // 待機を即座に終了し、旧セッションのコメントを新しい映像へ描画しない。
+            const comment_session_signal = this.abort_controller.signal;
+            await Utils.sleep(comment_delay_time, comment_session_signal);
+            if (comment_session_signal.aborted === true) return;
 
             // コメントを一時バッファに格納し、スロットルを設定してイベントリスナーに送信する
             // コメントの受信間隔が 333ms 以上あれば、今回のコールバックで取得したコメントがダイレクトにイベントリスナーに送信される

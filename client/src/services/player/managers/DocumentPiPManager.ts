@@ -39,7 +39,20 @@ class DocumentPiPManager implements PlayerManager {
     private readonly watch_player_element: HTMLDivElement;
 
     // ネイティブの HTMLVideoElement.requestPictureInPicture() メソッド
-    private request_picture_in_picture: (() => Promise<PictureInPictureWindow>) | null = null;
+    // Firefox の Document Picture-in-Picture 対応環境では映像単体のネイティブ API が存在しないため、undefined も保持する
+    private request_picture_in_picture: (() => Promise<PictureInPictureWindow>) | undefined = undefined;
+
+    // DPlayer がネイティブ Picture-in-Picture 非対応時に非表示にした Picture-in-Picture ボタン
+    // Document Picture-in-Picture の入口として再利用し、destroy() で元の表示状態へ戻す
+    private pip_button_element: HTMLElement | null = null;
+
+    // DPlayer が登録しなかった Picture-in-Picture ボタンのクリックイベントリスナー
+    // ネイティブ Picture-in-Picture 対応時は DPlayer のリスナーと重複しないよう null のままにする
+    private pip_button_click_event_listener: (() => void) | null = null;
+
+    // DPlayer が Picture-in-Picture ボタンへ設定した元のインライン display 値
+    // destroy() で DPlayer 管理下の表示状態を正確に復元するために保持する
+    private pip_button_original_display = '';
 
 
     /**
@@ -106,12 +119,46 @@ class DocumentPiPManager implements PlayerManager {
                 height: 304,
             });
 
+            // requestWindow() が返った直後から外部操作で閉じられ得るため、DOM 準備より先に
+            // pagehide を所有する。setup途中で閉じても watch-player を閉じたDocumentへ移さない。
+            let pip_cleanup_started = false;
+            let stop_theme_watcher: (() => void) | null = null;
+            let stop_control_display_watcher: (() => void) | null = null;
+            let keyboard_shortcut_manager: KeyboardShortcutManager | null = null;
+            let playing_in_pip_container: HTMLDivElement | null = null;
+            const cleanup_pip_window = (): void => {
+                if (pip_cleanup_started === true) return;
+                pip_cleanup_started = true;
+                player_store.is_document_pip = false;
+                stop_control_display_watcher?.();
+                stop_theme_watcher?.();
+                void keyboard_shortcut_manager?.destroy();
+                playing_in_pip_container?.remove();
+                // setupのどの段階で閉じても、所有DOMを必ずメインウインドウへ戻す。
+                this.watch_content_element.append(this.watch_header_element);
+                this.watch_content_element.append(this.watch_player_element);
+                console.log('[DocumentPiPManager] Picture-in-Picture window exited.');
+            };
+            // TypeScript の同期制御フローによる false 固定を避け、pagehide から更新される状態を毎回読み直す。
+            const is_pip_window_closed = (): boolean => {
+                return pip_cleanup_started === true || pip_window.closed === true;
+            };
+            pip_window.onpagehide = cleanup_pip_window;
+            if (is_pip_window_closed()) {
+                cleanup_pip_window();
+                return {} as PictureInPictureWindow;
+            }
+
             // Dark Reader 拡張機能を使っている場合、何故か Document Picture-in-Picture ウインドウでは
             // サイトごとの無効化設定に関わらずダークモード CSS が追加されてしまうため、Dark Reader 自体を無効化する
             // ref: https://github.com/darkreader/darkreader/blob/main/CONTRIBUTING.md#disabling-dark-reader-on-your-site
             const lock = pip_window.document.createElement('meta');
             lock.name = 'darkreader-lock';
             pip_window.document.head.appendChild(lock);
+            if (is_pip_window_closed()) {
+                cleanup_pip_window();
+                return {} as PictureInPictureWindow;
+            }
 
             // すべてのスタイルシートを Document Picture-in-Picture ウインドウにコピー
             // 以前の仕様には copyStyleSheets オプションがあったが、議論の末に削除されてしまったらしい
@@ -154,10 +201,10 @@ class DocumentPiPManager implements PlayerManager {
                 pip_window.document.body.classList.add(`v-theme--${theme_name}`);
             };
             apply_theme(settings_store.settings.ui_theme);
-            const stop_theme_watcher = watch(() => settings_store.settings.ui_theme, apply_theme);
+            stop_theme_watcher = watch(() => settings_store.settings.ui_theme, apply_theme);
 
             // player_store.is_control_display が変更された時に .watch-container--control-display クラスを追加・削除する
-            const stop_control_display_watcher = watch(() => player_store.is_control_display, (value) => {
+            stop_control_display_watcher = watch(() => player_store.is_control_display, (value) => {
                 if (value) {
                     pip_window.document.body.classList.add('watch-container--control-display');
                 } else {
@@ -166,6 +213,10 @@ class DocumentPiPManager implements PlayerManager {
             });
 
             // Document Picture-in-Picture ウインドウに DOM 要素を移動
+            if (is_pip_window_closed()) {
+                cleanup_pip_window();
+                return {} as PictureInPictureWindow;
+            }
             const watch_content = pip_window.document.createElement('div');
             watch_content.classList.add('watch-content');
             watch_content.style.height = '100vh';  // ここで 100vh を指定しないと、Chrome 131 以降データ放送表示時に高さが 0px になり PiP ウインドウが真っ黒になる
@@ -174,7 +225,7 @@ class DocumentPiPManager implements PlayerManager {
             pip_window.document.body.append(watch_content);
 
             // メインウインドウ側に「ピクチャー イン ピクチャーを再生しています」というテキストを追加
-            const playing_in_pip_container = document.createElement('div');
+            playing_in_pip_container = document.createElement('div');
             playing_in_pip_container.classList.add('playing-in-pip');
             const playing_in_pip_text = document.createElement('span');
             playing_in_pip_text.classList.add('playing-in-pip__text');
@@ -206,26 +257,8 @@ class DocumentPiPManager implements PlayerManager {
             // キーボードショートカットイベントが登録されておらず、さらにウインドウが閉じられればウインドウ内に登録したイベントも全削除されるため、
             // 別途このウインドウにおいてキーボードショートカットを管理する KeyboardShortcutManager を生成・初期化している
             // 第3引数に Document Picture-in-Picture ウインドウの Document オブジェクトを渡しているのがポイント
-            const keyboard_shortcut_manager = new KeyboardShortcutManager(this.player, this.playback_mode, pip_window.document);
+            keyboard_shortcut_manager = new KeyboardShortcutManager(this.player, this.playback_mode, pip_window.document);
             keyboard_shortcut_manager.init();  // 完了を待たない
-
-            // Document Picture-in-Picture ウインドウが閉じられた際のイベントを登録
-            // すでに登録されている場合は上書きされる
-            pip_window.onpagehide = async () => {
-                player_store.is_document_pip = false;
-                // is_control_display の watcher を停止
-                stop_control_display_watcher();
-                // カラーテーマの watcher を停止
-                stop_theme_watcher();
-                // キーボードショートカットを削除
-                keyboard_shortcut_manager.destroy();  // 完了を待たない
-                // メインウインドウ側の「ピクチャー イン ピクチャーを再生しています」テキストを削除
-                playing_in_pip_container.remove();
-                // DOM 要素を視聴画面内に戻す
-                this.watch_content_element.append(this.watch_header_element);
-                this.watch_content_element.append(this.watch_player_element);
-                console.log('[DocumentPiPManager] Picture-in-Picture window exited.');
-            };
 
             return {} as PictureInPictureWindow;  // 無理やり PictureInPictureWindow 型にキャスト
         };
@@ -234,6 +267,29 @@ class DocumentPiPManager implements PlayerManager {
         this.request_picture_in_picture = this.player.video.requestPictureInPicture;
         // 独自のフックで上書きする
         this.player.video.requestPictureInPicture = new_request_picture_in_picture;
+
+        // Firefox のように Document Picture-in-Picture API には対応していても映像単体のネイティブ
+        // Picture-in-Picture API には対応していないブラウザでは、DPlayer がボタンを非表示にした上で
+        // クリックイベントも登録しない。その場合に限ってボタンを表示し、Document Picture-in-Picture の入口を補う。
+        // ネイティブ API 対応時は DPlayer の既存クリックイベントをそのまま利用し、二重起動を防ぐ。
+        if (document.pictureInPictureEnabled !== true) {
+            this.pip_button_element = this.player.container.querySelector<HTMLElement>('.dplayer-pip-icon');
+            if (this.pip_button_element !== null) {
+                this.pip_button_original_display = this.pip_button_element.style.display;
+                this.pip_button_element.style.removeProperty('display');
+                this.pip_button_click_event_listener = () => {
+                    this.player.video.requestPictureInPicture().catch((reason) => {
+                        console.error(reason);
+                        if (this.player.options.lang.includes('ja')) {
+                            this.player.notice('Picture-in-Picture を開始できませんでした。', undefined, undefined, '#FF6F6A');
+                        } else {
+                            this.player.notice('Picture-in-Picture could not be started.', undefined, undefined, '#FF6F6A');
+                        }
+                    });
+                };
+                this.pip_button_element.addEventListener('click', this.pip_button_click_event_listener);
+            }
+        }
 
         // 画質切り替え後に新しい映像要素が生成されるため、画質切り替え後に再度フックする
         this.player.on('quality_end', () => {
@@ -269,9 +325,21 @@ class DocumentPiPManager implements PlayerManager {
         // Document Picture-in-Picture ウインドウが表示された時のイベントを削除
         documentPictureInPicture.onenter = null;
 
+        // DPlayer が登録しなかった Picture-in-Picture ボタンのクリックイベントを削除し、
+        // Manager 初期化前のインライン display 値へ戻す
+        if (this.pip_button_element !== null && this.pip_button_click_event_listener !== null) {
+            this.pip_button_element.removeEventListener('click', this.pip_button_click_event_listener);
+            this.pip_button_element.style.display = this.pip_button_original_display;
+            this.pip_button_element = null;
+            this.pip_button_click_event_listener = null;
+        }
+
         // DPlayer 上で Picture-in-Picture が開始された際のイベントを削除
-        if (this.request_picture_in_picture !== null) {
+        if (this.request_picture_in_picture !== undefined) {
             this.player.video.requestPictureInPicture = this.request_picture_in_picture;  // 元のメソッドに戻す
+        } else {
+            // Firefox では元々 requestPictureInPicture() が存在しないため、init() で追加した own property 自体を削除する
+            Reflect.deleteProperty(this.player.video, 'requestPictureInPicture');
         }
 
         console.log('[DocumentPiPManager] Destroyed.');

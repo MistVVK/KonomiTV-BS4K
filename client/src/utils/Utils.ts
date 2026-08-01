@@ -463,10 +463,22 @@ export default class Utils {
     /**
      * async/await で秒単位でスリープする
      * @param seconds 待機する秒数 (ミリ秒単位ではないので注意)
+     * @param signal 待機を途中で打ち切る AbortSignal
      * @returns Promise を返すので、await sleep(1); のように使う
      */
-    static async sleep(seconds: number): Promise<number> {
-        return await new Promise(resolve => setTimeout(resolve, seconds * 1000));
+    static async sleep(seconds: number, signal?: AbortSignal): Promise<void> {
+        if (signal?.aborted === true) return;
+        await new Promise<void>((resolve) => {
+            const timer_id = setTimeout(() => {
+                signal?.removeEventListener('abort', handle_abort);
+                resolve();
+            }, seconds * 1000);
+            const handle_abort = () => {
+                clearTimeout(timer_id);
+                resolve();
+            };
+            signal?.addEventListener('abort', handle_abort, {once: true});
+        });
     }
 
 

@@ -396,14 +396,15 @@ const useChannelsStore = defineStore('channels', {
         /**
          * チャンネルリストを更新する
          * @param force 強制的に更新するかどうか
+         * @param signal 呼び出し元のライフサイクル終了時にストア更新を中断する AbortSignal
          */
-        async update(force: boolean = false): Promise<void> {
+        async update(force: boolean = false, signal?: AbortSignal): Promise<void> {
 
             const update = async (): Promise<boolean> => {
 
                 // 最新のすべてのチャンネルの情報を取得
-                const channels_list = await Channels.fetchAllChannels();
-                if (channels_list === null) {
+                const channels_list = await Channels.fetchAllChannels(signal);
+                if (channels_list === null || signal?.aborted === true) {
                     console.warn('[ChannelsStore] Failed to fetch channels list. Skip updating cache.');
                     return false;
                 }

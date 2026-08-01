@@ -106,16 +106,19 @@ class Channels {
 
     /**
      * すべてのチャンネルの情報を取得する
+     * @param signal 呼び出し元のライフサイクル終了時にリクエストを中断する AbortSignal
      * @return すべてのチャンネルの情報
      */
-    static async fetchAllChannels(): Promise<ILiveChannelsList | null> {
+    static async fetchAllChannels(signal?: AbortSignal): Promise<ILiveChannelsList | null> {
 
         // API リクエストを実行
-        const response = await APIClient.get<ILiveChannelsList>('/channels');
+        const response = await APIClient.get<ILiveChannelsList>('/channels', {signal});
 
         // エラー処理
         if (response.type === 'error') {
-            APIClient.showGenericError(response, 'チャンネル情報を取得できませんでした。');
+            if (signal?.aborted !== true) {
+                APIClient.showGenericError(response, 'チャンネル情報を取得できませんでした。');
+            }
             return null;
         }
 

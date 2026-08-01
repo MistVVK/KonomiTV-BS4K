@@ -67,15 +67,14 @@
                         <span v-if="!iconOnly" class="navigation__link-text">視聴履歴</span>
                     </router-link>
                     <v-spacer></v-spacer>
-                    <router-link v-ripple class="navigation__link navigation__link--analysis" active-class="navigation__link--active"
-                        to="/analysis-history/"
+                    <div class="navigation__link navigation__link--analysis"
                         :class="{
                             'navigation__link--active': $route.path.startsWith('/analysis-history'),
                             'navigation__link--analysis-active': analysisTasksStore.activeTaskStatus !== null,
                             'navigation__link--icon-only': iconOnly,
                         }"
                         v-ftooltip.right="iconOnly ? analysisTaskTooltip : ''">
-                        <div class="navigation-analysis__heading">
+                        <router-link v-ripple class="navigation-analysis__heading" to="/analysis-history/">
                             <span class="navigation__link-icon navigation__link-icon--status">
                                 <Icon icon="fluent:database-search-20-regular" width="26px" />
                                 <span v-if="analysisTasksStore.activeTaskStatus !== null"
@@ -87,11 +86,13 @@
                                 class="navigation-analysis__status-label">
                                 {{analysisTasksStore.activeTaskStatus === 'Running' ? '実行中' : '待機中'}}
                             </small>
-                        </div>
+                        </router-link>
                         <div v-if="!iconOnly && analysisTasksStore.activeTaskGroups.length > 0"
                             class="navigation-analysis__tasks">
-                            <div v-for="group in analysisTasksStore.activeTaskGroups" :key="group.task_type"
-                                class="navigation-analysis__task">
+                            <button v-for="group in analysisTasksStore.activeTaskGroups" :key="group.task_type"
+                                v-ripple type="button" class="navigation-analysis__task"
+                                :aria-label="`${taskTypeLabel(group.task_type)}の現在の処理を表示`"
+                                @click="openActiveAnalysisTaskDialog(group.task_type)">
                                 <div class="navigation-analysis__task-line">
                                     <strong>{{taskTypeLabel(group.task_type)}}</strong>
                                     <small>{{group.running_count}}件実行中<span v-if="group.queued_count">・{{group.queued_count}}件待機</span></small>
@@ -100,9 +101,9 @@
                                 <v-progress-linear v-if="group.progress !== null" class="mt-1" color="primary" height="4"
                                     rounded :model-value="group.progress * 100" />
                                 <v-progress-linear v-else class="mt-1" color="primary" height="4" rounded indeterminate />
-                            </div>
+                            </button>
                         </div>
-                    </router-link>
+                    </div>
                     <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/settings/"
                         :class="{
                             'navigation__link--active': $route.path.startsWith('/settings'),
@@ -133,6 +134,8 @@
             </nav>
         </div>
         <BottomNavigation />
+        <KonomiTVBS4KActiveAnalysisTaskDialog v-model="activeAnalysisTaskDialog"
+            :task-type="selectedActiveTaskType" />
     </div>
 </template>
 <script lang="ts">
@@ -141,6 +144,8 @@ import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
 import BottomNavigation from '@/components/BottomNavigation.vue';
+import KonomiTVBS4KActiveAnalysisTaskDialog from '@/components/KonomiTVBS4KActiveAnalysisTaskDialog.vue';
+import { AnalysisTaskType } from '@/services/AnalysisTasks';
 import useAnalysisTasksStore, { stageLabel, taskTypeLabel } from '@/stores/AnalysisTasksStore';
 import useVersionStore from '@/stores/VersionStore';
 
@@ -148,6 +153,7 @@ export default defineComponent({
     name: 'Navigation',
     components: {
         BottomNavigation,
+        KonomiTVBS4KActiveAnalysisTaskDialog,
     },
     props: {
         // アイコンのみモード: テキストを非表示にし、幅を縮小する
@@ -156,6 +162,12 @@ export default defineComponent({
             type: Boolean,
             default: false,
         },
+    },
+    data() {
+        return {
+            activeAnalysisTaskDialog: false,
+            selectedActiveTaskType: null as AnalysisTaskType | null,
+        };
     },
     computed: {
         ...mapStores(useAnalysisTasksStore),
@@ -169,6 +181,10 @@ export default defineComponent({
     methods: {
         stageLabel,
         taskTypeLabel,
+        openActiveAnalysisTaskDialog(taskType: AnalysisTaskType): void {
+            this.selectedActiveTaskType = taskType;
+            this.activeAnalysisTaskDialog = true;
+        },
     },
     async created() {
         this.analysisTasksStore.startOverviewPolling();
@@ -364,6 +380,8 @@ export default defineComponent({
                         flex-shrink: 0;
                         width: 100%;
                         min-height: 26px;
+                        color: inherit;
+                        text-decoration: none;
                     }
 
                     .navigation-analysis__status-label {
@@ -382,9 +400,22 @@ export default defineComponent({
                     }
 
                     .navigation-analysis__task {
+                        width: 100%;
                         min-width: 0;
-                        padding-top: 7px;
+                        padding: 7px 3px 2px;
+                        border: 0;
                         border-top: 1px solid rgb(var(--v-theme-background-lighten-2));
+                        border-radius: 4px;
+                        cursor: pointer;
+                        color: inherit;
+                        text-align: left;
+                        background: transparent;
+                        transition: background-color 0.15s ease;
+
+                        &:hover,
+                        &:focus-visible {
+                            background: rgb(var(--v-theme-background-lighten-2));
+                        }
                     }
 
                     .navigation-analysis__task-line {
@@ -445,14 +476,22 @@ export default defineComponent({
                     display: flex;
                     flex-direction: column;
                     color: rgb(var(--v-theme-text-darken-1));
+                    font-size: 12px;
                     line-height: 1.15;
+                    white-space: nowrap;
+                    @include smartphone-horizontal {
+                        font-size: 11px;
+                    }
+                    @include smartphone-horizontal-short {
+                        font-size: 10px;
+                    }
                 }
 
                 .navigation__link-commit {
                     margin-top: 3px;
                     color: rgb(var(--v-theme-text-darken-2));
                     font-family: monospace;
-                    font-size: 11px;
+                    font-size: 9px;
                 }
 
                 // アイコンのみモード: 正方形のアイコンボタンに変更

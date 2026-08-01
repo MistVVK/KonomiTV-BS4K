@@ -22,6 +22,12 @@ interface ILiveStreamStatusEvent {
     client_count: number;
 }
 
+type LiveStreamStatus = ILiveStreamStatusEvent['status'];
+type KonomiTVBS4KPlaybackPipelineErrorHandler = (
+    status: LiveStreamStatus,
+    detail: string,
+) => boolean;
+
 
 /**
  * ライブ視聴: ライブストリームのステータスを監視し随時 UI に反映する PlayerManager
@@ -35,18 +41,33 @@ class LiveEventManager implements PlayerManager {
     // 設計上コンストラクタ以降で変更すべきでないため readonly にしている
     private readonly player: DPlayer;
 
+    // 高度codec固有のサーバー側失敗を、PlayerControllerの一度限りfallbackへ渡すコールバック
+    private readonly konomitv_bs4k_playback_pipeline_error_handler:
+    KonomiTVBS4KPlaybackPipelineErrorHandler;
+
     // EventSource のインスタンス
     private eventsource: EventSource | null = null;
 
     // 破棄済みかどうか
     private destroyed = false;
 
+    // init() ごとの世代番号
+    // 同じインスタンスを画質切り替え後に再利用するため、旧 EventSource の queued event や
+    // init() 内で開始した遅延処理が新しい再生世代へ書き込まないように利用する
+    private lifecycle_generation = 0;
+
     /**
      * コンストラクタ
      * @param player DPlayer のインスタンス
      */
-    constructor(player: DPlayer) {
+    constructor(
+        player: DPlayer,
+        konomitv_bs4k_playback_pipeline_error_handler:
+        KonomiTVBS4KPlaybackPipelineErrorHandler = () => false,
+    ) {
         this.player = player;
+        this.konomitv_bs4k_playback_pipeline_error_handler =
+            konomitv_bs4k_playback_pipeline_error_handler;
     }
 
 
@@ -57,6 +78,13 @@ class LiveEventManager implements PlayerManager {
         const channels_store = useChannelsStore();
         const player_store = usePlayerStore();
 
+        // 旧 init() から発火する可能性があるイベント・遅延処理を無効化する
+        const lifecycle_generation = ++this.lifecycle_generation;
+        const is_current = (): boolean => (
+            this.destroyed === false &&
+            this.lifecycle_generation === lifecycle_generation
+        );
+
         // 破棄済みかどうかのフラグを下ろす
         this.destroyed = false;
 
@@ -64,14 +92,18 @@ class LiveEventManager implements PlayerManager {
         // PlayerManager の設計上、同一の PlayerManager インスタンスはチャンネルが変更されない限り再利用される可能性がある
         // 接続先の API URL は DPlayer 上で再生中の画質設定によって変化するため、
         // 画質切り替え後の再起動も想定しコンストラクタではなくあえて init() 内で API URL を取得している
-        const api_quality = PlayerUtils.extractLiveAPIQualityFromDPlayer(this.player);
-        const eventsource_url = `${Utils.api_base_url}/streams/live/${channels_store.display_channel_id}/${api_quality}/events`;
-        this.eventsource = new EventSource(eventsource_url);
+        const konomitv_bs4k_eventsource_url =
+            PlayerUtils.buildKonomiTVBS4KLiveAPIEndpointURLFromDPlayer(
+                this.player,
+                channels_store.display_channel_id,
+                'events',
+            );
+        this.eventsource = new EventSource(konomitv_bs4k_eventsource_url);
 
         // EventSource 自体が開かれたときのイベント
         let is_eventsource_opened = false;
         this.eventsource.addEventListener('open', () => {
-            if (this.destroyed === true)  return;
+            if (is_current() === false) return;
             if (is_eventsource_opened === false) {
                 console.log('\u001b[33m[LiveEventManager]', 'EventSource opened.');
             }
@@ -80,7 +112,7 @@ class LiveEventManager implements PlayerManager {
 
         // 初回接続時のイベント
         this.eventsource.addEventListener('initial_update', (event_raw: MessageEvent) => {
-            if (this.destroyed === true)  return;
+            if (is_current() === false) return;
 
             // イベントを取得
             const event: ILiveStreamStatusEvent = JSON.parse(event_raw.data);
@@ -88,6 +120,14 @@ class LiveEventManager implements PlayerManager {
 
             // ライブストリームのステータスを設定
             player_store.live_stream_status = event.status;
+
+            // 初回接続時点ですでにcodec固有のOfflineなら、通常のOffline表示より先に互換profileへ移る。
+            if (
+                this.konomitv_bs4k_playback_pipeline_error_handler(
+                    event.status,
+                    event.detail,
+                ) === true
+            ) return;
 
             // ステータスごとに処理を振り分け
             switch (event.status) {
@@ -108,7 +148,7 @@ class LiveEventManager implements PlayerManager {
 
         // ステータスが更新されたときのイベント
         this.eventsource.addEventListener('status_update', async (event_raw: MessageEvent) => {
-            if (this.destroyed === true)  return;
+            if (is_current() === false) return;
 
             // イベントを取得
             const event: ILiveStreamStatusEvent = JSON.parse(event_raw.data);
@@ -119,6 +159,15 @@ class LiveEventManager implements PlayerManager {
 
             // 視聴者数を更新
             channels_store.viewer_count = event.client_count;
+
+            // Bridge・高度codec固有の失敗だけは、同じ高度profileの再起動を繰り返さず互換profileへ移る。
+            // チューナー・回線・放送休止の一般障害はコールバック側でfalseとなり、従来処理をそのまま続ける。
+            if (
+                this.konomitv_bs4k_playback_pipeline_error_handler(
+                    event.status,
+                    event.detail,
+                ) === true
+            ) return;
 
             // ステータスごとに処理を振り分け
             switch (event.status) {
@@ -176,6 +225,9 @@ class LiveEventManager implements PlayerManager {
                     if (this.destroyed === false) {
                         await Utils.sleep(1);
                     }
+                    // 待機中に画質切り替え・再初期化が完了していた場合、旧ストリームの
+                    // Idling を新しい再生世代の再起動要求へ伝播させない
+                    if (is_current() === false) return;
 
                     // 本来誰も視聴していないことを示す Idling ステータスを受信している場合、何らかの理由で
                     // ライブストリーミング API への接続が切断された可能性が高いので、PlayerController にプレイヤーの再起動を要求する
@@ -245,7 +297,7 @@ class LiveEventManager implements PlayerManager {
 
         // ステータス詳細が更新されたときのイベント
         this.eventsource.addEventListener('detail_update', (event_raw: MessageEvent) => {
-            if (this.destroyed === true)  return;
+            if (is_current() === false) return;
 
             // イベントを取得
             const event: ILiveStreamStatusEvent = JSON.parse(event_raw.data);
@@ -277,7 +329,7 @@ class LiveEventManager implements PlayerManager {
 
         // クライアント数 (だけ) が更新されたときのイベント
         this.eventsource.addEventListener('clients_update', (event_raw: MessageEvent) => {
-            if (this.destroyed === true)  return;
+            if (is_current() === false) return;
 
             // イベントを取得
             const event: ILiveStreamStatusEvent = JSON.parse(event_raw.data);
@@ -294,6 +346,10 @@ class LiveEventManager implements PlayerManager {
 
             // 3秒待機
             await Utils.sleep(3);
+
+            // 待機中に破棄・再初期化されていた場合、旧接続の結果で新しい再生世代の
+            // バッファリング表示を上書きしない
+            if (is_current() === false) return;
 
             // まだ接続できていなかった場合
             if (is_eventsource_opened === false) {
@@ -315,6 +371,10 @@ class LiveEventManager implements PlayerManager {
         const channels_store = useChannelsStore();
         const player_store = usePlayerStore();
 
+        // EventSource の close より先に世代を無効化し、queued event と遅延処理を同期的に遮断する
+        this.lifecycle_generation += 1;
+        this.destroyed = true;
+
         // PlayerStore にセットしたライブストリームのステータスをリセット
         player_store.live_stream_status = null;
 
@@ -322,10 +382,6 @@ class LiveEventManager implements PlayerManager {
         // ここで削除しないといつまで経っても古い番組情報が参照され続けてしまう
         // ストリーミングが開始され Server-Sent Events から再度最新の視聴者数を取得するまでの間は、サーバー API から取得した視聴者数が表示される
         channels_store.viewer_count = null;
-
-        // 破棄済みかどうかのフラグを立てる
-        // もしかすると EventSource の破棄に時間がかかるかもしれないので、先にフラグを立てておく
-        this.destroyed = true;
 
         // EventSource を破棄し、Server-Sent Events のストリーミングを終了する
         if (this.eventsource !== null) {

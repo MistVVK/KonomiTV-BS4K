@@ -463,8 +463,8 @@ const handleSettingCoverClick = () => {
         .dplayer-setting-quality-item:hover,
         .dplayer-setting-speed-item:hover,
         .dplayer-setting-audio-item:hover,
-        .dplayer-setting-video-codec-item:hover,
-        .dplayer-setting-audio-codec-item:hover,
+        .dplayer-konomitv-bs4k-setting-video-codec-item:hover,
+        .dplayer-konomitv-bs4k-setting-audio-codec-item:hover,
         .dplayer-setting-header:hover {
             background: rgba(var(--v-theme-primary), 0.12) !important;
         }
@@ -472,8 +472,8 @@ const handleSettingCoverClick = () => {
         .dplayer-setting-quality-panel,
         .dplayer-setting-speed-panel,
         .dplayer-setting-audio-panel,
-        .dplayer-setting-video-codec-panel,
-        .dplayer-setting-audio-codec-panel {
+        .dplayer-konomitv-bs4k-setting-video-codec-panel,
+        .dplayer-konomitv-bs4k-setting-audio-codec-panel {
             scrollbar-color: rgba(var(--v-theme-player-on-overlay), 0.24) transparent;
             &::-webkit-scrollbar-thumb {
                 background: rgba(var(--v-theme-player-on-overlay), 0.24) !important;
@@ -492,28 +492,29 @@ const handleSettingCoverClick = () => {
             // DPlayer の固定値 (2トラック分) ではなく、実際に表示する音声トラック数に合わせる
             clip-path: inset(calc(100% - var(--audio-panel-height, 114px)) 0 0 round 7px) !important;
         }
-        &.dplayer-setting-box-video-codec,
-        &.dplayer-setting-box-audio-codec {
+        &.dplayer-konomitv-bs4k-setting-box-video-codec,
+        &.dplayer-konomitv-bs4k-setting-box-audio-codec {
             // DPlayer が保持する元パネルの inline clip-path を壊さず、独自サブパネルの表示中だけ元パネルを退避する
             .dplayer-setting-origin-panel {
                 transform: translateX(-100%);
             }
         }
-        &.dplayer-setting-box-video-codec {
-            clip-path: inset(calc(100% - var(--video-codec-panel-height, 114px)) 0 0 round 7px) !important;
+        &.dplayer-konomitv-bs4k-setting-box-video-codec {
+            clip-path: inset(calc(100% - var(--konomitv-bs4k-video-codec-panel-height, 114px)) 0 0 round 7px) !important;
 
-            .dplayer-setting-video-codec-panel {
+            .dplayer-konomitv-bs4k-setting-video-codec-panel {
                 transform: translateX(0%) !important;
             }
         }
-        &.dplayer-setting-box-audio-codec {
-            clip-path: inset(calc(100% - var(--audio-codec-panel-height, 114px)) 0 0 round 7px) !important;
+        &.dplayer-konomitv-bs4k-setting-box-audio-codec {
+            clip-path: inset(calc(100% - var(--konomitv-bs4k-audio-codec-panel-height, 114px)) 0 0 round 7px) !important;
 
-            .dplayer-setting-audio-codec-panel {
+            .dplayer-konomitv-bs4k-setting-audio-codec-panel {
                 transform: translateX(0%) !important;
             }
         }
-        .dplayer-setting-audio-codec-item--disabled {
+        .dplayer-konomitv-bs4k-setting-video-codec-item--disabled,
+        .dplayer-konomitv-bs4k-setting-audio-codec-item--disabled {
             cursor: default !important;
             opacity: 0.45;
             pointer-events: none;

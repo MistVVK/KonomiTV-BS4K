@@ -27,6 +27,8 @@ export type PlayerEvents = {
         message_delay_seconds?: number;  // メッセージを表示するまでの待機時間 (秒)
         is_error_message?: boolean;  // メッセージをエラーメッセージとして表示するか (既定は true)
         should_resume_quality?: boolean;  // 再起動後に直前の画質を引き継ぐかどうか (既定は true)
+        // KonomiTV-BS4K の画質能力 guard が、切替開始前の対応画質を明示的に復元する場合だけ指定する
+        konomitv_bs4k_resume_quality?: string;
     };
     // PlayerController.setControlDisplayTimer() をそのまま呼び出す
     SetControlDisplayTimer: {

@@ -1,10 +1,14 @@
 
 import type { IAnalysisTaskAccepted } from '@/services/AnalysisTasks';
-import type { RecordedStreamingAudioCodec } from '@/stores/SettingsStore';
+import type {
+    IKonomiTVBS4KPlaybackVideoProfile,
+    KonomiTVBS4KPlaybackAudioCodec,
+    KonomiTVBS4KPlaybackVideoCodec,
+} from '@/stores/SettingsStore';
 
 import APIClient from  '@/services/APIClient';
 import { IChannel } from '@/services/Channels';
-import { CommentUtils } from '@/utils';
+import { CommentUtils, type KonomiTVBS4KPlaybackSelectableQuality, PlayerUtils } from '@/utils';
 
 /** ソート順序を表す型 */
 export type SortOrder = 'desc' | 'asc';
@@ -12,26 +16,94 @@ export type SortOrder = 'desc' | 'asc';
 /** マイリストのソート順序を表す型 */
 export type MylistSortOrder = 'mylist_added_desc' | 'mylist_added_asc' | 'recorded_desc' | 'recorded_asc';
 
-export interface IRecordedPlaybackCapability {
-    encoder: 'FFmpeg' | 'QSVEncC' | 'NVEncC' | 'VCEEncC';
-    codec: 'avc' | 'hevc' | 'vp9' | 'av1';
+export type IKonomiTVBS4KPlaybackEncoder = 'FFmpeg' | 'QSV' | 'NVENC' | 'AMF';
+export type KonomiTVBS4KPlaybackCapabilityReason = (
+    'BinaryUnavailable' |
+    'BridgeUnavailable' |
+    'FeatureDisabled' |
+    'DeviceUnavailable' |
+    'DeviceInitializationFailed' |
+    'FilterUnavailable' |
+    'EncodeFailed' |
+    'ProbeFailed' |
+    'CodecMismatch' |
+    'BitDepthMismatch' |
+    'ProfileMismatch' |
+    'UnsupportedCombination'
+);
+type KonomiTVBS4KPlaybackOptionUnavailableReason = (
+    KonomiTVBS4KPlaybackCapabilityReason |
+    'BrowserMSEUnsupported'
+);
+
+export interface IKonomiTVBS4KPlaybackVideoCapability {
+    encoder: 'FFmpeg' | 'QSV' | 'NVENC' | 'AMF';
+    codec: KonomiTVBS4KPlaybackVideoCodec;
     bit_depth: 8 | 10;
-    available: boolean;
     profile: string;
-    reason_code: string | null;
+    live_available: boolean;
+    recorded_available: boolean;
+    live_reason_code: KonomiTVBS4KPlaybackCapabilityReason | null;
+    recorded_reason_code: KonomiTVBS4KPlaybackCapabilityReason | null;
 }
 
-export interface IRecordedPlaybackCodecOption {
+export interface IKonomiTVBS4KPlaybackAudioCapability {
+    codec: KonomiTVBS4KPlaybackAudioCodec;
+    live_available: boolean;
+    recorded_available: boolean;
+    live_reason_code: KonomiTVBS4KPlaybackCapabilityReason | null;
+    recorded_reason_code: KonomiTVBS4KPlaybackCapabilityReason | null;
+}
+
+export interface IKonomiTVBS4KPlaybackLiveCombinationCapability {
+    encoder: IKonomiTVBS4KPlaybackEncoder;
+    video_codec: KonomiTVBS4KPlaybackVideoCodec;
+    video_bit_depth: 8 | 10;
+    audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+    available: boolean;
+    reason_code: KonomiTVBS4KPlaybackCapabilityReason | null;
+}
+
+export interface IKonomiTVBS4KPlaybackCapabilities {
+    video: IKonomiTVBS4KPlaybackVideoCapability[];
+    audio: IKonomiTVBS4KPlaybackAudioCapability[];
+    live_combinations: IKonomiTVBS4KPlaybackLiveCombinationCapability[];
+}
+
+export interface IKonomiTVBS4KResolvedPlaybackCombination {
+    video: IKonomiTVBS4KPlaybackVideoCapability;
+    audio: IKonomiTVBS4KPlaybackAudioCapability;
+    live: IKonomiTVBS4KPlaybackLiveCombinationCapability;
+}
+
+export interface IKonomiTVBS4KPlaybackVideoCodecOption {
     title: string;
-    value: 'avc' | 'hevc' | 'vp9' | 'av1';
+    value: KonomiTVBS4KPlaybackVideoCodec;
+    reason: string | null;
     props: {disabled: boolean};
 }
 
-export interface IRecordedPlaybackAudioCodecOption {
+export interface IKonomiTVBS4KPlaybackAudioCodecOption {
     title: string;
-    value: RecordedStreamingAudioCodec;
+    value: KonomiTVBS4KPlaybackAudioCodec;
+    reason: string | null;
     props: {disabled: boolean};
 }
+
+export interface IKonomiTVBS4KPlaybackQualityOption<
+    KonomiTVBS4KQuality extends KonomiTVBS4KPlaybackSelectableQuality =
+    KonomiTVBS4KPlaybackSelectableQuality,
+> {
+    title: string;
+    value: KonomiTVBS4KQuality;
+    reason: string | null;
+    props: {disabled: boolean};
+}
+
+// 旧録画専用名は既存import互換のため最低1リリース維持する。
+export type IRecordedPlaybackCapability = IKonomiTVBS4KPlaybackVideoCapability;
+export type IRecordedPlaybackCodecOption = IKonomiTVBS4KPlaybackVideoCodecOption;
+export type IRecordedPlaybackAudioCodecOption = IKonomiTVBS4KPlaybackAudioCodecOption;
 
 export interface IRecordedPlaybackIndex {
     status: 'Pending' | 'Analyzing' | 'Ready' | 'Failed';
@@ -401,77 +473,647 @@ class Videos {
         return index;
     }
 
-    /** 録画用 FFmpeg 8 の実機能力行列を取得する。 */
-    static async fetchRecordedPlaybackCapabilities(): Promise<IRecordedPlaybackCapability[]> {
-        const response = await APIClient.get<IRecordedPlaybackCapability[]>('/streams/video/capabilities');
-        if (response.type === 'error') {
-            return [];
+    /** ライブ・録画共通の映像・音声能力行列を取得する。 */
+    static async fetchKonomiTVBS4KPlaybackCapabilities(): Promise<IKonomiTVBS4KPlaybackCapabilities> {
+        const konomitv_bs4k_response = await APIClient.get<IKonomiTVBS4KPlaybackCapabilities>(
+            '/streams/video/konomitv-bs4k-playback-capabilities',
+        );
+        if (konomitv_bs4k_response.type === 'error') {
+            return {video: [], audio: [], live_combinations: []};
         }
-        return response.data;
+        return konomitv_bs4k_response.data;
     }
 
-    /** サーバーとブラウザの積集合から、理由付きの録画コーデック選択肢を作る。 */
-    static async buildRecordedPlaybackCodecOptions(
-        encoder: IRecordedPlaybackCapability['encoder'],
-    ): Promise<IRecordedPlaybackCodecOption[]> {
-        const capabilities = await this.fetchRecordedPlaybackCapabilities();
-        const media_source = (
-            window as Window & {ManagedMediaSource?: {isTypeSupported: (mime_type: string) => boolean}}
-        ).ManagedMediaSource ?? window.MediaSource;
-        const definitions: Record<
-        IRecordedPlaybackCodecOption['value'],
-        {title: string; mime_types: Partial<Record<8 | 10, string>>}
-        > = {
-            avc: {title: 'H.264 / AVC（互換性優先）', mime_types: {8: 'video/mp4; codecs="avc1.640028"'}},
-            hevc: {title: 'H.265 / HEVC', mime_types: {
-                8: 'video/mp4; codecs="hvc1.1.6.L153.B0"',
-                10: 'video/mp4; codecs="hvc1.2.4.L153.B0"',
-            }},
-            vp9: {title: 'Google VP9', mime_types: {
-                8: 'video/mp4; codecs="vp09.00.40.08"',
-                10: 'video/mp4; codecs="vp09.02.40.10"',
-            }},
-            av1: {title: 'Alliance for Open Media AV1', mime_types: {
-                8: 'video/mp4; codecs="av01.0.08M.08"',
-                10: 'video/mp4; codecs="av01.0.10M.10"',
-            }},
+    /**
+     * 現在の再生候補とAVC/AAC互換fallbackだけを取得し、設定画面用の全行列probeを避ける。
+     *
+     * 能力API自体へ到達できない場合も旧AVC/AAC再生を一度試せるようにするが、
+     * 未確認の高度codecを利用可能として合成することはない。
+     */
+    static async fetchKonomiTVBS4KTargetedPlaybackCapabilities(
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_requested_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_requested_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_video_profile: IKonomiTVBS4KPlaybackVideoProfile,
+        konomitv_bs4k_has_video: boolean,
+    ): Promise<IKonomiTVBS4KPlaybackCapabilities> {
+        const konomitv_bs4k_video_bit_depths = this.getKonomiTVBS4KPlaybackBitDepthOrder(
+            konomitv_bs4k_requested_video_codec,
+            konomitv_bs4k_video_profile,
+        );
+        const konomitv_bs4k_response = await APIClient.get<IKonomiTVBS4KPlaybackCapabilities>(
+            '/streams/video/konomitv-bs4k-playback-capabilities/targeted',
+            {
+                params: {
+                    encoder: konomitv_bs4k_encoder,
+                    video_codec: konomitv_bs4k_requested_video_codec,
+                    video_bit_depths: konomitv_bs4k_video_bit_depths.join(','),
+                    audio_codec: konomitv_bs4k_requested_audio_codec,
+                    has_video: konomitv_bs4k_has_video,
+                },
+            },
+        );
+        if (konomitv_bs4k_response.type === 'error') {
+            return this.buildKonomiTVBS4KCompatibilityPlaybackCapabilities(
+                konomitv_bs4k_encoder,
+                konomitv_bs4k_has_video,
+            );
+        }
+        return konomitv_bs4k_response.data;
+    }
+
+    /** 能力API障害時に限り、旧再生経路と同じAVC 8bit/AACだけをfallback候補として表現する。 */
+    private static buildKonomiTVBS4KCompatibilityPlaybackCapabilities(
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_has_video: boolean,
+    ): IKonomiTVBS4KPlaybackCapabilities {
+        return {
+            video: konomitv_bs4k_has_video === false ? [] : [{
+                encoder: konomitv_bs4k_encoder,
+                codec: 'avc',
+                bit_depth: 8,
+                profile: 'High',
+                live_available: true,
+                recorded_available: true,
+                live_reason_code: null,
+                recorded_reason_code: null,
+            }],
+            audio: [{
+                codec: 'aac',
+                live_available: true,
+                recorded_available: true,
+                live_reason_code: null,
+                recorded_reason_code: null,
+            }],
+            live_combinations: konomitv_bs4k_has_video === false ? [] : [{
+                encoder: konomitv_bs4k_encoder,
+                video_codec: 'avc',
+                video_bit_depth: 8,
+                audio_codec: 'aac',
+                available: true,
+                reason_code: null,
+            }],
         };
-        return (Object.keys(definitions) as IRecordedPlaybackCodecOption['value'][]).map((codec) => {
-            const server_capabilities = capabilities.filter((capability) =>
-                capability.encoder === encoder && capability.codec === codec,
+    }
+
+    /** 旧録画専用呼び出し向けに、共通能力の映像行だけを返す。 */
+    static async fetchRecordedPlaybackCapabilities(): Promise<IRecordedPlaybackCapability[]> {
+        return (await this.fetchKonomiTVBS4KPlaybackCapabilities()).video;
+    }
+
+    /** 能力 API の機械可読 reason code を、利用者が判断できる日本語へ変換する。 */
+    static getKonomiTVBS4KPlaybackUnavailableReasonLabel(
+        konomitv_bs4k_reason: KonomiTVBS4KPlaybackOptionUnavailableReason,
+    ): string {
+        const konomitv_bs4k_labels: Record<KonomiTVBS4KPlaybackOptionUnavailableReason, string> = {
+            BinaryUnavailable: '固定 FFmpeg が利用できません',
+            BridgeUnavailable: 'TS Codec Bridge が利用できません',
+            FeatureDisabled: '高度コーデック機能が無効です',
+            DeviceUnavailable: '対応するエンコーダーデバイスがありません',
+            DeviceInitializationFailed: 'エンコーダーデバイスを初期化できません',
+            FilterUnavailable: '必要な映像フィルターが利用できません',
+            EncodeFailed: '実エンコードに失敗しました',
+            ProbeFailed: '実再生能力の検証に失敗しました',
+            CodecMismatch: '出力コーデックを確認できません',
+            BitDepthMismatch: '出力ビット深度を確認できません',
+            ProfileMismatch: '出力プロファイルを確認できません',
+            UnsupportedCombination: 'このコーデック構成は利用できません',
+            BrowserMSEUnsupported: 'このブラウザの MSE が対応していません',
+        };
+        return konomitv_bs4k_labels[konomitv_bs4k_reason];
+    }
+
+    /** codecと画質から、実際に優先するbit depth順を返す。 */
+    private static getKonomiTVBS4KPlaybackBitDepthOrder(
+        konomitv_bs4k_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): (8 | 10)[] {
+        return konomitv_bs4k_codec === 'avc' ||
+            (konomitv_bs4k_codec === 'hevc' && konomitv_bs4k_profile.is_bs4k) ?
+            [8] : [10, 8];
+    }
+
+    /** backend・映像・深度・音声が一致するライブ組み合わせ能力を返す。 */
+    private static findKonomiTVBS4KPlaybackLiveCombination(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_video_bit_depth: 8 | 10,
+        konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+    ): IKonomiTVBS4KPlaybackLiveCombinationCapability | undefined {
+        return konomitv_bs4k_capabilities.live_combinations.find((konomitv_bs4k_combination) =>
+            konomitv_bs4k_combination.encoder === konomitv_bs4k_encoder &&
+            konomitv_bs4k_combination.video_codec === konomitv_bs4k_video_codec &&
+            konomitv_bs4k_combination.video_bit_depth === konomitv_bs4k_video_bit_depth &&
+            konomitv_bs4k_combination.audio_codec === konomitv_bs4k_audio_codec
+        );
+    }
+
+    /** 指定した1組がlive・recorded・ブラウザの全条件を満たす場合だけ返す。 */
+    private static resolveKonomiTVBS4KPlaybackCombinationCandidate(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_video_bit_depth: 8 | 10,
+        konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): IKonomiTVBS4KResolvedPlaybackCombination | null {
+        const konomitv_bs4k_video = konomitv_bs4k_capabilities.video.find((konomitv_bs4k_item) =>
+            konomitv_bs4k_item.encoder === konomitv_bs4k_encoder &&
+            konomitv_bs4k_item.codec === konomitv_bs4k_video_codec &&
+            konomitv_bs4k_item.bit_depth === konomitv_bs4k_video_bit_depth
+        );
+        const konomitv_bs4k_audio = konomitv_bs4k_capabilities.audio.find((konomitv_bs4k_item) =>
+            konomitv_bs4k_item.codec === konomitv_bs4k_audio_codec
+        );
+        const konomitv_bs4k_live = this.findKonomiTVBS4KPlaybackLiveCombination(
+            konomitv_bs4k_capabilities,
+            konomitv_bs4k_encoder,
+            konomitv_bs4k_video_codec,
+            konomitv_bs4k_video_bit_depth,
+            konomitv_bs4k_audio_codec,
+        );
+        if (
+            konomitv_bs4k_video === undefined ||
+            konomitv_bs4k_audio === undefined ||
+            konomitv_bs4k_live?.available !== true ||
+            konomitv_bs4k_video.recorded_available !== true ||
+            konomitv_bs4k_audio.recorded_available !== true ||
+            PlayerUtils.isKonomiTVBS4KPlaybackVideoCodecSupported(
+                konomitv_bs4k_video_codec,
+                konomitv_bs4k_video_bit_depth,
+                konomitv_bs4k_profile,
+            ) === false ||
+            PlayerUtils.isKonomiTVBS4KPlaybackAudioCodecSupported(konomitv_bs4k_audio_codec) === false
+        ) {
+            return null;
+        }
+        return {
+            video: konomitv_bs4k_video,
+            audio: konomitv_bs4k_audio,
+            live: konomitv_bs4k_live,
+        };
+    }
+
+    /**
+     * 指定した映像・音声 codec の exact combination だけを bit depth 順に試す。
+     * 汎用 resolver のように別映像 codec へ fallback しない。
+     */
+    static resolveKonomiTVBS4KExactPlaybackCombination(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): IKonomiTVBS4KResolvedPlaybackCombination | null {
+        for (
+            const konomitv_bs4k_video_bit_depth of
+            this.getKonomiTVBS4KPlaybackBitDepthOrder(konomitv_bs4k_video_codec, konomitv_bs4k_profile)
+        ) {
+            const konomitv_bs4k_combination = this.resolveKonomiTVBS4KPlaybackCombinationCandidate(
+                konomitv_bs4k_capabilities,
+                konomitv_bs4k_encoder,
+                konomitv_bs4k_video_codec,
+                konomitv_bs4k_video_bit_depth,
+                konomitv_bs4k_audio_codec,
+                konomitv_bs4k_profile,
             );
-            const server_available = server_capabilities.some((capability) => capability.available === true);
-            const jointly_available = server_capabilities.some((capability) =>
-                capability.available === true &&
-                media_source?.isTypeSupported(definitions[codec].mime_types[capability.bit_depth] ?? '') === true,
+            if (konomitv_bs4k_combination !== null) {
+                return konomitv_bs4k_combination;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 保存した映像・音声を同一のlive combinationとして解決する。
+     *
+     * 映像を優先してから音声を互換順に試し、互いに別の組み合わせへfallbackする状態を作らない。
+     * 自動画質の段階的 codec 落としには resolveKonomiTVBS4KExactPlaybackCombination を使うこと。
+     */
+    static resolveKonomiTVBS4KPlaybackCombination(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_requested_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_requested_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): IKonomiTVBS4KResolvedPlaybackCombination | null {
+        // 要求 codec 失敗時のフォールバック順は効率寄り（hevc/vp9 を avc より先に試す）
+        const konomitv_bs4k_video_codec_order = Array.from(new Set<KonomiTVBS4KPlaybackVideoCodec>([
+            konomitv_bs4k_requested_video_codec,
+            'av1',
+            'vp9',
+            'hevc',
+            'avc',
+        ]));
+        const konomitv_bs4k_audio_codec_order = Array.from(new Set<KonomiTVBS4KPlaybackAudioCodec>([
+            konomitv_bs4k_requested_audio_codec,
+            'aac',
+            'opus',
+        ]));
+        for (const konomitv_bs4k_video_codec of konomitv_bs4k_video_codec_order) {
+            for (const konomitv_bs4k_audio_codec of konomitv_bs4k_audio_codec_order) {
+                const konomitv_bs4k_combination = this.resolveKonomiTVBS4KExactPlaybackCombination(
+                    konomitv_bs4k_capabilities,
+                    konomitv_bs4k_encoder,
+                    konomitv_bs4k_video_codec,
+                    konomitv_bs4k_audio_codec,
+                    konomitv_bs4k_profile,
+                );
+                if (konomitv_bs4k_combination !== null) return konomitv_bs4k_combination;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * ユーザーが映像codecを変更したとき、選択した映像を固定したまま音声だけを互換順で解決する。
+     *
+     * 汎用resolverの映像fallbackを使うと、選択した映像が利用できない場合に別の映像を返してしまうため、
+     * 設定画面の片軸変更ではこのresolverを使って映像・音声の2値を同時に確定させる。
+     */
+    static resolveKonomiTVBS4KPlaybackCombinationForVideoCodecChange(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_selected_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_current_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): IKonomiTVBS4KResolvedPlaybackCombination | null {
+        const konomitv_bs4k_audio_codec_order =
+            Array.from(new Set<KonomiTVBS4KPlaybackAudioCodec>([
+                konomitv_bs4k_current_audio_codec,
+                'aac',
+                'opus',
+            ]));
+        for (
+            const konomitv_bs4k_video_bit_depth of
+            this.getKonomiTVBS4KPlaybackBitDepthOrder(
+                konomitv_bs4k_selected_video_codec,
+                konomitv_bs4k_profile,
+            )
+        ) {
+            for (const konomitv_bs4k_audio_codec of konomitv_bs4k_audio_codec_order) {
+                const konomitv_bs4k_combination =
+                    this.resolveKonomiTVBS4KPlaybackCombinationCandidate(
+                        konomitv_bs4k_capabilities,
+                        konomitv_bs4k_encoder,
+                        konomitv_bs4k_selected_video_codec,
+                        konomitv_bs4k_video_bit_depth,
+                        konomitv_bs4k_audio_codec,
+                        konomitv_bs4k_profile,
+                    );
+                if (konomitv_bs4k_combination !== null) return konomitv_bs4k_combination;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * ユーザーが音声codecを変更したとき、選択した音声を固定したまま映像だけを互換順で解決する。
+     *
+     * 現在の映像との組み合わせを最優先し、成立しない場合だけ互換映像へ切り替えることで、
+     * 選択した音声と不整合な映像値が LocalStorage に残ることを防ぐ。
+     */
+    static resolveKonomiTVBS4KPlaybackCombinationForAudioCodecChange(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_current_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_selected_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): IKonomiTVBS4KResolvedPlaybackCombination | null {
+        const konomitv_bs4k_video_codec_order =
+            Array.from(new Set<KonomiTVBS4KPlaybackVideoCodec>([
+                konomitv_bs4k_current_video_codec,
+                'avc',
+                'hevc',
+                'vp9',
+                'av1',
+            ]));
+        for (const konomitv_bs4k_video_codec of konomitv_bs4k_video_codec_order) {
+            for (
+                const konomitv_bs4k_video_bit_depth of
+                this.getKonomiTVBS4KPlaybackBitDepthOrder(
+                    konomitv_bs4k_video_codec,
+                    konomitv_bs4k_profile,
+                )
+            ) {
+                const konomitv_bs4k_combination =
+                    this.resolveKonomiTVBS4KPlaybackCombinationCandidate(
+                        konomitv_bs4k_capabilities,
+                        konomitv_bs4k_encoder,
+                        konomitv_bs4k_video_codec,
+                        konomitv_bs4k_video_bit_depth,
+                        konomitv_bs4k_selected_audio_codec,
+                        konomitv_bs4k_profile,
+                    );
+                if (konomitv_bs4k_combination !== null) return konomitv_bs4k_combination;
+            }
+        }
+        return null;
+    }
+
+    /** 共通profileに利用できる映像能力を、指定音声との厳密な組み合わせで解決する。 */
+    static resolveKonomiTVBS4KPlaybackVideoCapability(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_requested_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+        konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec = 'aac',
+    ): IKonomiTVBS4KPlaybackVideoCapability | null {
+        return this.resolveKonomiTVBS4KPlaybackCombination(
+            konomitv_bs4k_capabilities,
+            konomitv_bs4k_encoder,
+            konomitv_bs4k_requested_codec,
+            konomitv_bs4k_audio_codec,
+            konomitv_bs4k_profile,
+        )?.video ?? null;
+    }
+
+    /** 共通profileに利用できる音声能力を、指定映像との厳密な組み合わせで解決する。 */
+    static resolveKonomiTVBS4KPlaybackAudioCapability(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_requested_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder = 'FFmpeg',
+        konomitv_bs4k_video_codec: KonomiTVBS4KPlaybackVideoCodec = 'avc',
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile = {
+            is_bs4k: false,
+            streaming_quality: '1080p',
+        },
+    ): IKonomiTVBS4KPlaybackAudioCapability | null {
+        return this.resolveKonomiTVBS4KPlaybackCombination(
+            konomitv_bs4k_capabilities,
+            konomitv_bs4k_encoder,
+            konomitv_bs4k_video_codec,
+            konomitv_bs4k_requested_codec,
+            konomitv_bs4k_profile,
+        )?.audio ?? null;
+    }
+
+    /** 映像 SourceBuffer を持たないラジオ・音声のみ録画の音声能力を解決する。 */
+    static resolveKonomiTVBS4KPlaybackAudioOnlyCapability(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_requested_codec: KonomiTVBS4KPlaybackAudioCodec,
+    ): IKonomiTVBS4KPlaybackAudioCapability | null {
+        const konomitv_bs4k_codec_order =
+            Array.from(new Set<KonomiTVBS4KPlaybackAudioCodec>([
+                konomitv_bs4k_requested_codec,
+                'aac',
+                'opus',
+            ]));
+        for (const konomitv_bs4k_codec of konomitv_bs4k_codec_order) {
+            const konomitv_bs4k_capability =
+                konomitv_bs4k_capabilities.audio.find((konomitv_bs4k_item) =>
+                    konomitv_bs4k_item.codec === konomitv_bs4k_codec &&
+                    konomitv_bs4k_item.live_available === true &&
+                    konomitv_bs4k_item.recorded_available === true
+                );
+            if (
+                konomitv_bs4k_capability !== undefined &&
+                PlayerUtils.isKonomiTVBS4KPlaybackAudioCodecSupported(konomitv_bs4k_codec)
+            ) {
+                return konomitv_bs4k_capability;
+            }
+        }
+        return null;
+    }
+
+    /** 1組の設定項目を無効化する理由を、exact combinationを正本として返す。 */
+    private static getKonomiTVBS4KPlaybackCombinationUnavailableReason(
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+    ): KonomiTVBS4KPlaybackOptionUnavailableReason | null {
+        const konomitv_bs4k_video_capabilities =
+            this.getKonomiTVBS4KPlaybackBitDepthOrder(
+                konomitv_bs4k_video_codec,
+                konomitv_bs4k_profile,
+            ).map((konomitv_bs4k_video_bit_depth) =>
+                konomitv_bs4k_capabilities.video.find((konomitv_bs4k_item) =>
+                    konomitv_bs4k_item.encoder === konomitv_bs4k_encoder &&
+                    konomitv_bs4k_item.codec === konomitv_bs4k_video_codec &&
+                    konomitv_bs4k_item.bit_depth === konomitv_bs4k_video_bit_depth
+                )
+            ).filter((konomitv_bs4k_item) =>
+                konomitv_bs4k_item !== undefined
             );
-            const reason = server_available === false ?
-                (server_capabilities.find((capability) => capability.reason_code !== null)?.reason_code ?? 'ProbeFailed') :
-                (jointly_available === false ? 'BrowserUnsupported' : null);
+        const konomitv_bs4k_audio_capability =
+            konomitv_bs4k_capabilities.audio.find((konomitv_bs4k_item) =>
+                konomitv_bs4k_item.codec === konomitv_bs4k_audio_codec
+            );
+        // 能力行そのものが無い（targeted 応答の切り詰めなど）ときは ProbeFailed と誤表示しない。
+        if (konomitv_bs4k_audio_capability === undefined) {
+            return 'UnsupportedCombination';
+        }
+        if (konomitv_bs4k_audio_capability.recorded_available !== true) {
+            return konomitv_bs4k_audio_capability.recorded_reason_code ?? 'ProbeFailed';
+        }
+        if (konomitv_bs4k_video_capabilities.length === 0) {
+            return 'UnsupportedCombination';
+        }
+        const konomitv_bs4k_recorded_video_capabilities =
+            konomitv_bs4k_video_capabilities.filter((konomitv_bs4k_item) =>
+                konomitv_bs4k_item.recorded_available === true
+            );
+        if (konomitv_bs4k_recorded_video_capabilities.length === 0) {
+            return konomitv_bs4k_video_capabilities.find((konomitv_bs4k_item) =>
+                konomitv_bs4k_item.recorded_reason_code !== null
+            )?.recorded_reason_code ?? 'ProbeFailed';
+        }
+        const konomitv_bs4k_server_combinations =
+            konomitv_bs4k_recorded_video_capabilities.map((konomitv_bs4k_video_capability) => ({
+                video: konomitv_bs4k_video_capability,
+                live: this.findKonomiTVBS4KPlaybackLiveCombination(
+                    konomitv_bs4k_capabilities,
+                    konomitv_bs4k_encoder,
+                    konomitv_bs4k_video_codec,
+                    konomitv_bs4k_video_capability.bit_depth,
+                    konomitv_bs4k_audio_codec,
+                ),
+            }));
+        const konomitv_bs4k_available_server_combinations =
+            konomitv_bs4k_server_combinations.filter((konomitv_bs4k_combination) =>
+                konomitv_bs4k_combination.live?.available === true
+            );
+        if (konomitv_bs4k_available_server_combinations.length === 0) {
+            return konomitv_bs4k_server_combinations.find((konomitv_bs4k_combination) =>
+                konomitv_bs4k_combination.live?.reason_code !== null &&
+                konomitv_bs4k_combination.live?.reason_code !== undefined
+            )?.live?.reason_code ?? 'UnsupportedCombination';
+        }
+        const konomitv_bs4k_browser_available =
+            PlayerUtils.isKonomiTVBS4KPlaybackAudioCodecSupported(konomitv_bs4k_audio_codec) &&
+            konomitv_bs4k_available_server_combinations.some((konomitv_bs4k_combination) =>
+                PlayerUtils.isKonomiTVBS4KPlaybackVideoCodecSupported(
+                    konomitv_bs4k_video_codec,
+                    konomitv_bs4k_combination.video.bit_depth,
+                    konomitv_bs4k_profile,
+                )
+            );
+        return konomitv_bs4k_browser_available ? null : 'BrowserMSEUnsupported';
+    }
+
+    /** サーバーのexact live combination・recorded能力・ブラウザMSEから映像選択肢を作る。 */
+    static buildKonomiTVBS4KPlaybackVideoCodecOptions(
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+        konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec = 'aac',
+    ): IKonomiTVBS4KPlaybackVideoCodecOption[] {
+        const konomitv_bs4k_definitions: Record<KonomiTVBS4KPlaybackVideoCodec, string> = {
+            avc: 'H.264 / AVC（互換性優先）',
+            hevc: 'H.265 / HEVC',
+            vp9: 'Google VP9（WebUI 専用 TS・実験的）',
+            av1: `Alliance for Open Media AV1${konomitv_bs4k_encoder === 'FFmpeg' ? '（実験的）' : ''}`,
+        };
+        return (Object.keys(konomitv_bs4k_definitions) as KonomiTVBS4KPlaybackVideoCodec[]).map(
+            (konomitv_bs4k_codec) => {
+                const konomitv_bs4k_resolved_combination =
+                    this.resolveKonomiTVBS4KPlaybackCombinationForVideoCodecChange(
+                        konomitv_bs4k_capabilities,
+                        konomitv_bs4k_encoder,
+                        konomitv_bs4k_codec,
+                        konomitv_bs4k_audio_codec,
+                        konomitv_bs4k_profile,
+                    );
+                const konomitv_bs4k_reason_code = konomitv_bs4k_resolved_combination !== null ?
+                    null :
+                    this.getKonomiTVBS4KPlaybackCombinationUnavailableReason(
+                        konomitv_bs4k_encoder,
+                        konomitv_bs4k_capabilities,
+                        konomitv_bs4k_codec,
+                        konomitv_bs4k_audio_codec,
+                        konomitv_bs4k_profile,
+                    );
+                const konomitv_bs4k_reason = konomitv_bs4k_reason_code === null ?
+                    null : this.getKonomiTVBS4KPlaybackUnavailableReasonLabel(konomitv_bs4k_reason_code);
+                return {
+                    title: `${konomitv_bs4k_definitions[konomitv_bs4k_codec]}` +
+                    `${konomitv_bs4k_reason !== null ? `（${konomitv_bs4k_reason}）` : ''}`,
+                    value: konomitv_bs4k_codec,
+                    reason: konomitv_bs4k_reason,
+                    props: {disabled: konomitv_bs4k_reason !== null},
+                };
+            },
+        );
+    }
+
+    /**
+     * 現在選択中の映像 codec で再生できる画質だけを選択可能にする。
+     *
+     * codec 選択後に画質だけを変更して MSE 非対応の組み合わせを LocalStorage へ保存できないよう、
+     * codec 選択肢と同じ live / recorded / browser の積集合判定を画質候補側にも適用する。
+     */
+    static buildKonomiTVBS4KPlaybackQualityOptions<
+        KonomiTVBS4KQuality extends KonomiTVBS4KPlaybackSelectableQuality,
+    >(
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder,
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        is_konomitv_bs4k: boolean,
+        konomitv_bs4k_quality_options: readonly {
+            title: string;
+            value: KonomiTVBS4KQuality;
+        }[],
+        konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec = 'aac',
+    ): IKonomiTVBS4KPlaybackQualityOption<KonomiTVBS4KQuality>[] {
+        return konomitv_bs4k_quality_options.map((konomitv_bs4k_quality_option) => {
+            const konomitv_bs4k_video_codec_option =
+                this.buildKonomiTVBS4KPlaybackVideoCodecOptions(
+                    konomitv_bs4k_encoder,
+                    konomitv_bs4k_capabilities,
+                    {
+                        is_bs4k: is_konomitv_bs4k,
+                        streaming_quality: konomitv_bs4k_quality_option.value,
+                    },
+                    konomitv_bs4k_audio_codec,
+                ).find((konomitv_bs4k_option) =>
+                    konomitv_bs4k_option.value === konomitv_bs4k_video_codec
+                );
+            const konomitv_bs4k_reason = konomitv_bs4k_video_codec_option === undefined ?
+                this.getKonomiTVBS4KPlaybackUnavailableReasonLabel('ProbeFailed') :
+                konomitv_bs4k_video_codec_option.reason;
             return {
-                title: `${definitions[codec].title}${reason !== null ? `（${reason}）` : ''}`,
-                value: codec,
-                props: {disabled: reason !== null},
+                title: konomitv_bs4k_reason === null ?
+                    konomitv_bs4k_quality_option.title :
+                    `${konomitv_bs4k_quality_option.title}（${konomitv_bs4k_reason}）`,
+                value: konomitv_bs4k_quality_option.value,
+                reason: konomitv_bs4k_reason,
+                props: {disabled: konomitv_bs4k_reason !== null},
             };
         });
     }
 
-    /** このブラウザが fMP4 コンテナ内の Opus 音声を再生できるかどうかを返す。 */
-    static isOpusAudioSupported(): boolean {
-        const media_source = (
-            window as Window & {ManagedMediaSource?: {isTypeSupported: (mime_type: string) => boolean}}
-        ).ManagedMediaSource ?? window.MediaSource;
-        return media_source?.isTypeSupported('audio/mp4; codecs="opus"') === true;
+    /** 旧録画専用名からも共通profile用の選択肢を返す。 */
+    static async buildRecordedPlaybackCodecOptions(
+        encoder: IKonomiTVBS4KPlaybackEncoder,
+    ): Promise<IRecordedPlaybackCodecOption[]> {
+        return this.buildKonomiTVBS4KPlaybackVideoCodecOptions(
+            encoder,
+            await this.fetchKonomiTVBS4KPlaybackCapabilities(),
+            {is_bs4k: false, streaming_quality: '1080p'},
+        );
     }
 
-    /** ブラウザの対応状況を反映した録画音声コーデックの選択肢を作る。 */
+    /** このブラウザが fMP4 コンテナ内の Opus 音声を再生できるかどうかを返す。 */
+    static isOpusAudioSupported(): boolean {
+        return PlayerUtils.isKonomiTVBS4KPlaybackAudioCodecSupported('opus');
+    }
+
+    /** 現在の映像を含むexact combination・recorded能力・ブラウザMSEから音声選択肢を作る。 */
+    static buildKonomiTVBS4KPlaybackAudioCodecOptions(
+        konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
+        konomitv_bs4k_encoder: IKonomiTVBS4KPlaybackEncoder = 'FFmpeg',
+        konomitv_bs4k_video_codec: KonomiTVBS4KPlaybackVideoCodec = 'avc',
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile = {
+            is_bs4k: false,
+            streaming_quality: '1080p',
+        },
+    ): IKonomiTVBS4KPlaybackAudioCodecOption[] {
+        const konomitv_bs4k_definitions: Record<KonomiTVBS4KPlaybackAudioCodec, string> = {
+            aac: 'AAC（互換性優先）',
+            opus: 'Opus（音質・圧縮効率優先）',
+        };
+        return (Object.keys(konomitv_bs4k_definitions) as KonomiTVBS4KPlaybackAudioCodec[]).map((konomitv_bs4k_codec) => {
+            const konomitv_bs4k_resolved_combination =
+                this.resolveKonomiTVBS4KPlaybackCombinationForAudioCodecChange(
+                    konomitv_bs4k_capabilities,
+                    konomitv_bs4k_encoder,
+                    konomitv_bs4k_video_codec,
+                    konomitv_bs4k_codec,
+                    konomitv_bs4k_profile,
+                );
+            const konomitv_bs4k_reason_code = konomitv_bs4k_resolved_combination !== null ?
+                null :
+                this.getKonomiTVBS4KPlaybackCombinationUnavailableReason(
+                    konomitv_bs4k_encoder,
+                    konomitv_bs4k_capabilities,
+                    konomitv_bs4k_video_codec,
+                    konomitv_bs4k_codec,
+                    konomitv_bs4k_profile,
+                );
+            const konomitv_bs4k_reason = konomitv_bs4k_reason_code === null ?
+                null : this.getKonomiTVBS4KPlaybackUnavailableReasonLabel(konomitv_bs4k_reason_code);
+            return {
+                title: `${konomitv_bs4k_definitions[konomitv_bs4k_codec]}` +
+                    `${konomitv_bs4k_reason !== null ? `（${konomitv_bs4k_reason}）` : ''}`,
+                value: konomitv_bs4k_codec,
+                reason: konomitv_bs4k_reason,
+                props: {disabled: konomitv_bs4k_reason !== null},
+            };
+        });
+    }
+
+    /** 旧録画専用UI向けの同期API。サーバー能力は再生開始時に改めて検証する。 */
     static buildRecordedPlaybackAudioCodecOptions(): IRecordedPlaybackAudioCodecOption[] {
         const is_opus_supported = this.isOpusAudioSupported();
         return [
-            {title: 'AAC（互換性優先）', value: 'aac', props: {disabled: false}},
+            {title: 'AAC（互換性優先）', value: 'aac', reason: null, props: {disabled: false}},
             {
                 title: `Opus（音質・圧縮効率優先）${is_opus_supported ? '' : '（ブラウザ非対応）'}`,
                 value: 'opus',
+                reason: is_opus_supported ? null : 'このブラウザの MSE が対応していません',
                 props: {disabled: is_opus_supported === false},
             },
         ];

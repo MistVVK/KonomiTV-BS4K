@@ -4,7 +4,7 @@
 <script lang="ts">
 
 import { mapStores } from 'pinia';
-import { defineComponent } from 'vue';
+import { defineComponent, markRaw } from 'vue';
 
 import Watch from '@/components/Watch/Watch.vue';
 import PlayerController from '@/services/player/PlayerController';
@@ -12,15 +12,9 @@ import Series from '@/services/Series';
 import Videos from '@/services/Videos';
 import usePlayerStore, { type PlayerEvents } from '@/stores/PlayerStore';
 import useRecordedSeriesStore from '@/stores/RecordedSeriesStore';
+import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import useVersionStore from '@/stores/VersionStore';
-
-// PlayerController のインスタンス
-// data() 内に記述すると再帰的にリアクティブ化され重くなる上リアクティブにする必要自体がないので、グローバル変数にしている
-let player_controller: PlayerController | null = null;
-
-// 録画再生索引の監視は画面遷移時に確実に中断し、前の録画の完了通知を反映させない
-let playback_index_abort_controller: AbortController | null = null;
 
 export default defineComponent({
     name: 'Video-Watch',
@@ -32,10 +26,18 @@ export default defineComponent({
             // ended が多重発火しても、Series API とルート遷移を1回だけ実行する。
             is_next_recorded_program_transitioning: false,
             next_recorded_program_request_sequence: 0,
+            // このコンポーネントが所有する PlayerController
+            player_controller: null as PlayerController | null,
+            // 非同期初期化を route 世代ごとに無効化するための単調増加値
+            lifecycle_generation: 0,
+            // 最初の fetch を含む現在世代の全待機を中断する
+            lifecycle_abort_controller: markRaw(new AbortController()),
+            // unmount 後に新しい世代を開始しないためのフラグ
+            is_component_mounted: true,
         };
     },
     computed: {
-        ...mapStores(usePlayerStore, useRecordedSeriesStore, useSettingsStore, useVersionStore),
+        ...mapStores(usePlayerStore, useRecordedSeriesStore, useServerSettingsStore, useSettingsStore, useVersionStore),
     },
     // 開始時に実行
     created() {
@@ -49,7 +51,7 @@ export default defineComponent({
         this.playerStore.event_emitter.on('RecordedPlaybackEnded', this.handleRecordedPlaybackEnded);
 
         // 再生セッションを初期化
-        this.init();
+        void this.startPlayback(Number(this.$route.params.video_id));
     },
     // チャンネル切り替え時に実行
     // コンポーネント（インスタンス）は再利用される
@@ -59,9 +61,10 @@ export default defineComponent({
         // 次話照会中に別ルートへ移動した場合は、戻ってきた古いレスポンスから遷移させない。
         this.invalidateNextRecordedProgramTransition();
 
-        // 前の再生セッションを破棄して終了し、完了を待ってから再度初期化する
-        const destroy_promise = this.destroy();
-        destroy_promise.then(() => this.init());
+        // 前の再生セッションを無効化し、最後の route だけを初期化する
+        void this.startPlayback(Number(to.params.video_id)).catch((error) => {
+            console.error('[Videos/Watch] Previous player cleanup failed during route update.', error);
+        });
 
         // 次のルートに置き換え
         next();
@@ -69,10 +72,14 @@ export default defineComponent({
     // 終了前に実行
     beforeUnmount() {
 
+        this.is_component_mounted = false;
+
         // destroy() を実行
         // 別のページへ遷移するため、DPlayer のインスタンスを確実に破棄する
         // さもなければ、ブラウザがリロードされるまでバックグラウンドで永遠に再生され続けてしまう
-        this.destroy();
+        void this.destroy().catch((error) => {
+            console.error('[Videos/Watch] Player cleanup failed during unmount.', error);
+        });
         this.playerStore.event_emitter.off('RetryRecordedPlaybackIndex', this.retryRecordedPlaybackIndex);
         this.playerStore.event_emitter.off('RecordedPlaybackEnded', this.handleRecordedPlaybackEnded);
         this.invalidateNextRecordedProgramTransition();
@@ -80,6 +87,42 @@ export default defineComponent({
         // 上記以外の視聴画面の終了処理は Watch コンポーネントの方で自動的に行われる
     },
     methods: {
+
+        /** 指定世代が現在もこのコンポーネントに所有されているかを返す。 */
+        isLifecycleActive(generation: number, signal: AbortSignal): boolean {
+            return (
+                this.is_component_mounted === true &&
+                this.lifecycle_generation === generation &&
+                signal.aborted === false
+            );
+        },
+
+        /** route 世代を更新し、旧 controller の回収後に最後の route だけを初期化する。 */
+        async startPlayback(video_id: number): Promise<void> {
+            const generation = ++this.lifecycle_generation;
+            this.lifecycle_abort_controller.abort();
+            const abort_controller = markRaw(new AbortController());
+            this.lifecycle_abort_controller = abort_controller;
+
+            // 進行中 destroy へ後続 route も合流できるよう、完了までは共有参照を保持する。
+            // 完了後は対象 instance がまだ共有参照と同一の場合だけ null 化する。
+            const previous_controller = this.player_controller;
+            if (previous_controller !== null) {
+                await previous_controller.destroy();
+            }
+            if (this.player_controller === previous_controller) {
+                this.player_controller = null;
+            }
+            if (this.isLifecycleActive(generation, abort_controller.signal) === false) return;
+
+            try {
+                await this.init(generation, abort_controller, video_id);
+            } catch (error) {
+                if (this.isLifecycleActive(generation, abort_controller.signal)) {
+                    console.error('[Video-Watch] Failed to initialize playback:', error);
+                }
+            }
+        },
 
         /** Series API の未完了レスポンスと重複遷移を無効化する。 */
         invalidateNextRecordedProgramTransition(): void {
@@ -160,26 +203,33 @@ export default defineComponent({
         },
 
         // 再生セッションを初期化する
-        async init() {
-
-            // 前の初期化処理が残っている場合は、別録画へ状態を書き戻す前に中断する
-            playback_index_abort_controller?.abort();
-            playback_index_abort_controller = new AbortController();
-            const abort_controller = playback_index_abort_controller;
+        async init(generation: number, abort_controller: AbortController, video_id: number): Promise<void> {
 
             // 実況機能のサーバー側有効状態をプレイヤー生成前に確定する
             // 取得に失敗した場合は VersionStore がフェイルクローズで無効として扱う
-            await this.versionStore.fetchServerVersion(true);
+            await this.versionStore.fetchServerVersion(true, abort_controller.signal);
+            if (this.isLifecycleActive(generation, abort_controller.signal) === false) return;
+
+            // 録画 codec 能力の絞り込みに server 設定の既定値を使わないよう、
+            // controller 生成前に実設定を hydrate する。失敗時は 422 を誘発する再生を開始しない。
+            const server_settings = await this.serverSettingsStore.fetchServerSettingsOnce(abort_controller.signal);
+            if (
+                server_settings === null ||
+                this.isLifecycleActive(generation, abort_controller.signal) === false
+            ) {
+                return;
+            }
 
             // URL 上の録画番組 ID が未定義なら実行しない (フェイルセーフ)
             // 基本あり得ないはずだが、念のため
-            if (this.$route.params.video_id === undefined) {
+            if (Number.isInteger(video_id) === false) {
                 this.$router.push({path: '/not-found/'});
                 return;
             }
 
             // 録画番組情報を更新する
-            let recorded_program = await Videos.fetchVideo(parseFloat(this.$route.params.video_id as string));
+            let recorded_program = await Videos.fetchVideo(video_id);
+            if (this.isLifecycleActive(generation, abort_controller.signal) === false) return;
             if (recorded_program === null) {
                 this.$router.push({path: '/not-found/'});
                 return;
@@ -192,14 +242,16 @@ export default defineComponent({
                 const metadata_program = await Videos.waitForRecordedMetadata(
                     recorded_program,
                     (program) => {
-                        this.playerStore.recorded_program = program;
+                        if (this.isLifecycleActive(generation, abort_controller.signal)) {
+                            this.playerStore.recorded_program = program;
+                        }
                     },
                     abort_controller.signal,
                 );
                 if (
                     metadata_program === null ||
                     metadata_program.recorded_video.status !== 'Recorded' ||
-                    abort_controller.signal.aborted
+                    this.isLifecycleActive(generation, abort_controller.signal) === false
                 ) {
                     return;
                 }
@@ -213,6 +265,7 @@ export default defineComponent({
                 const playback_index = await Videos.waitForRecordedPlaybackIndex(
                     recorded_program.id,
                     (index) => {
+                        if (this.isLifecycleActive(generation, abort_controller.signal) === false) return;
                         Object.assign(this.playerStore.recorded_program.recorded_video, {
                             playback_index_status: index.status,
                             playback_index_state: index.state,
@@ -226,47 +279,74 @@ export default defineComponent({
                     },
                     abort_controller.signal,
                 );
-                if (playback_index === null || playback_index.state !== 'Ready' || abort_controller.signal.aborted) {
+                if (
+                    playback_index === null ||
+                    playback_index.state !== 'Ready' ||
+                    this.isLifecycleActive(generation, abort_controller.signal) === false
+                ) {
                     return;
                 }
 
                 // 索引生成で更新された映像・音声・字幕タイムラインをプレイヤーへ渡すため、番組情報も再取得する。
                 const refreshed_program = await Videos.fetchVideo(recorded_program.id);
-                if (refreshed_program === null || abort_controller.signal.aborted) return;
+                if (
+                    refreshed_program === null ||
+                    this.isLifecycleActive(generation, abort_controller.signal) === false
+                ) return;
                 this.playerStore.recorded_program = refreshed_program;
             }
 
+            // PlayerController のコンストラクタには非同期処理を開始する責務はないが、
+            // 将来の変更でも旧世代の instance を生成しないよう、生成直前にも所有世代を確認する。
+            if (this.isLifecycleActive(generation, abort_controller.signal) === false) return;
+
             // PlayerController を初期化
-            player_controller = new PlayerController('Video');
-            await player_controller.init();
+            const controller = markRaw(new PlayerController('Video', abort_controller.signal));
+            if (this.isLifecycleActive(generation, abort_controller.signal) === false) {
+                // 生成後に同期的な再入などで世代が変わった場合も、View の共有参照へ載せる前に必ず回収する。
+                await controller.destroy();
+                return;
+            }
+            this.player_controller = controller;
+            await controller.init();
+            if (this.isLifecycleActive(generation, abort_controller.signal) === false) {
+                await controller.destroy();
+                if (this.player_controller === controller) {
+                    this.player_controller = null;
+                }
+            }
         },
 
         // 再生セッションを破棄する
         // 再生する録画番組を切り替える際にも実行される
         async destroy() {
-
-            // 索引監視中ならHTTP要求とポーリングタイマーを停止する
-            playback_index_abort_controller?.abort();
-            playback_index_abort_controller = null;
+            ++this.lifecycle_generation;
+            this.lifecycle_abort_controller.abort();
 
             // PlayerController を破棄
-            if (player_controller !== null) {
-                await player_controller.destroy();
-                player_controller = null;
+            const controller = this.player_controller;
+            if (controller !== null) {
+                await controller.destroy();
+            }
+            if (this.player_controller === controller) {
+                this.player_controller = null;
             }
         },
 
         // 解析失敗後に同じ録画の索引生成を再要求する
         async retryRecordedPlaybackIndex() {
+            const generation = this.lifecycle_generation;
+            const signal = this.lifecycle_abort_controller.signal;
             if (this.playerStore.recorded_program.recorded_video.status === 'AnalysisFailed') {
                 this.playerStore.recorded_program.recorded_video.status = 'Analyzing';
                 const succeeded = await Videos.reanalyzeVideo(this.playerStore.recorded_program.id);
+                if (this.isLifecycleActive(generation, signal) === false) return;
                 if (succeeded === false) {
                     this.playerStore.recorded_program.recorded_video.status = 'AnalysisFailed';
                     return;
                 }
             }
-            void this.init();
+            void this.startPlayback(Number(this.$route.params.video_id));
         }
     }
 });
