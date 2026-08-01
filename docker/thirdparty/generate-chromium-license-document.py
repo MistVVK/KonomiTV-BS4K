@@ -29,10 +29,13 @@ MAX_CHROMIUM_LICENSE_SIZE = 1024 * 1024
 MINIMUM_BUNDLED_PROJECT_COUNT = 100
 CDP_EVALUATION_TIMEOUT_SECONDS = 60.0
 
-# Chromium 150.0.7871.124 の chrome://credits に埋め込まれた一部の一次配布 notice は、
+# Chromium 150.0.7871.124 / 150.0.7871.181 の chrome://credits に埋め込まれた一部の一次配布 notice は、
 # 元の引用符と copyright sign が U+FFFD に変換された状態で収録されている。
 # 別バージョンや別 project へ推測で置換を広げず、一次ソースと照合した固定文字列だけを修復する。
-ENCODING_REPAIR_CHROMIUM_VERSION = '150.0.7871.124'
+ENCODING_REPAIR_CHROMIUM_VERSIONS = frozenset({
+    '150.0.7871.124',
+    '150.0.7871.181',
+})
 ANDROID_NOTICE_REPAIR_PROJECTS = (
     'common',
     'core-common',
@@ -536,10 +539,10 @@ def repairKnownCreditsEncoding(
     }
     if not affected_projects:
         return raw_credits, []
-    if chromium_version != ENCODING_REPAIR_CHROMIUM_VERSION:
+    if chromium_version not in ENCODING_REPAIR_CHROMIUM_VERSIONS:
         raise ValueError(
             f'Chromium {chromium_version} credits contains Unicode replacement characters; '
-            f'known repairs apply only to Chromium {ENCODING_REPAIR_CHROMIUM_VERSION}.',
+            f'known repairs apply only to Chromium {sorted(ENCODING_REPAIR_CHROMIUM_VERSIONS)!r}.',
         )
 
     expected_projects = set(ANDROID_NOTICE_REPAIR_PROJECTS) | {'FreeType'}

@@ -67,7 +67,10 @@ def test_chromium_credits_require_complete_text_and_supported_homepages() -> Non
         ])
 
 
-def test_known_chromium_credits_encoding_damage_is_repaired_only_for_fixed_version() -> None:
+@pytest.mark.parametrize('chromium_version', ['150.0.7871.124', '150.0.7871.181'])
+def test_known_chromium_credits_encoding_damage_is_repaired_only_for_fixed_versions(
+    chromium_version: str,
+) -> None:
     android_license = (
         GENERATOR.ANDROID_BROKEN_LICENSE_LINE + '\n' +
         GENERATOR.ANDROID_BROKEN_MULTIPLE_LICENSED_LINE + '\n' +
@@ -83,7 +86,7 @@ def test_known_chromium_credits_encoding_damage_is_repaired_only_for_fixed_versi
         'license': GENERATOR.FREETYPE_BROKEN_COPYRIGHT_LINE,
     })
 
-    repaired, repairs = GENERATOR.repairKnownCreditsEncoding('150.0.7871.124', credits)
+    repaired, repairs = GENERATOR.repairKnownCreditsEncoding(chromium_version, credits)
     assert len(repairs) == 16
     assert sum(character_count for _, character_count in repairs) == 121
     assert all('\ufffd' not in credit['license'] for credit in repaired)

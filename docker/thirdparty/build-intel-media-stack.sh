@@ -1,11 +1,12 @@
 #!/bin/bash
 set -euo pipefail
 
-# QSVEncC が依存する Intel Media Stack の構成ライブラリ (gmmlib / libva / media-driver / MediaSDK runtime / oneVPL GPU runtime) を
-# Ubuntu 22.04 の Docker builder 上でビルドし、thirdparty/Library/ 以下へそのままコピーできる形へ整えるスクリプト
+# FFmpeg 8 の QSV 経路が依存する Intel Media Stack
+# (gmmlib / libva / media-driver / MediaSDK runtime / oneVPL GPU runtime) を Ubuntu 22.04 の Docker builder 上でビルドし、
+# thirdparty/Library/ 以下へそのままコピーできる形へ整えるスクリプト
 ## Intel Media Stack の構成ライブラリ (OpenCL ランタイムを除く) をすべて自己完結型でビルドすることで、
-## サードパーティーライブラリ上の QSVEncC がシステム側の iHD_drv_video.so や libmfx に依存しないようにし、
-## どのような OS 環境・CPU 世代でも QSVEncC を安定的に動作させ続けることが狙い
+## 同梱 FFmpeg 8 がシステム側の iHD_drv_video.so や libmfx 実装に依存しないようにし、
+## どのような OS 環境・CPU 世代でも QSV 経路を安定的に動作させ続けることが狙い
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_DIR="${SCRIPT_DIR}/patches"
@@ -189,7 +190,7 @@ grep -Fx 'BUILD_CMRTLIB:BOOL=ON' "${MEDIA_DRIVER_CMRT_BUILD_DIR}/CMakeCache.txt"
 ninja -C "${MEDIA_DRIVER_CMRT_BUILD_DIR}" -j"$(nproc)" igfxcmrt
 
 # 旧世代 GPU 向けの後方互換性を維持するため、MediaSDK 系の実ランタイムのみをビルドする
-# QSVEncC は libvpl のディスパッチャー相当を静的リンクしているため、libmfx.so.1 は同梱しない
+# FFmpeg 8 はランタイムコンテナの oneVPL dispatcher を使うため、旧 MediaSDK dispatcher の libmfx.so.1 は同梱しない
 cmake -S "${SRC_ROOT}/MediaSDK" -B "${BUILD_DIR}/MediaSDK" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${PREFIX_DIR}" \

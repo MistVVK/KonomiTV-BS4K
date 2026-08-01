@@ -36,15 +36,10 @@ required_files=(
     CMAnalysis/libavutil.so.60
     CMAnalysis/libswresample.so.6
     CMAnalysis/libswscale.so.9
-    FFmpeg/ffmpeg.elf
-    FFmpeg/ffprobe.elf
     FFmpeg8/ffmpeg8-amd.sh
     FFmpeg8/ffmpeg8.elf
     FFmpeg8/ffprobe8.elf
-    NVEncC/NVEncC.elf
     Python/bin/python
-    QSVEncC/QSVEncC.elf
-    VCEEncC/VCEEncC.elf
     psisiarc/psisiarc.elf
     tsreadex/tsreadex.elf
     Library/dri/iHD_drv_video.so
@@ -221,18 +216,6 @@ for library in libavcodec libavformat libavutil libswresample libswscale; do
 done
 nm -D "${cm_root}/libffms2.so.3" | grep -F ' FFMS_CreateVideoSource2'
 strings "${cm_root}/logoframe" | grep -F 'native luma:'
-echo "Expected FFmpeg: ${FFMPEG_VERSION}"
-ffmpeg_version="$(${THIRDPARTY_ROOT}/FFmpeg/ffmpeg.elf -version 2>&1)" || { echo "${ffmpeg_version}" >&2; exit 1; }
-echo "${ffmpeg_version}"
-echo "${ffmpeg_version}" | grep -F "ffmpeg version n${FFMPEG_VERSION}"
-ffprobe_version="$(${THIRDPARTY_ROOT}/FFmpeg/ffprobe.elf -version 2>&1)" || { echo "${ffprobe_version}" >&2; exit 1; }
-echo "${ffprobe_version}"
-echo "${ffprobe_version}" | grep -F "ffprobe version n${FFMPEG_VERSION}"
-ffmpeg_encoders="$(${THIRDPARTY_ROOT}/FFmpeg/ffmpeg.elf -hide_banner -encoders 2>&1)"
-grep -Eq '[[:space:]]libwebp[[:space:]]' <<< "${ffmpeg_encoders}" || {
-    echo 'Missing FFmpeg WebP encoder.' >&2
-    exit 1
-}
 echo "Expected FFmpeg 8: ${FFMPEG8_VERSION}"
 ffmpeg8="${THIRDPARTY_ROOT}/FFmpeg8/ffmpeg8.elf"
 ffprobe8="${THIRDPARTY_ROOT}/FFmpeg8/ffprobe8.elf"
@@ -277,6 +260,10 @@ ffmpeg8_encoders="$(${ffmpeg8} -hide_banner -encoders 2>&1)"
 for encoder in pcm_s16le av1_amf h264_amf hevc_amf av1_nvenc h264_nvenc hevc_nvenc av1_qsv h264_qsv hevc_qsv; do
     grep -Eq "[[:space:]]${encoder}[[:space:]]" <<< "${ffmpeg8_encoders}" || { echo "Missing encoder: ${encoder}" >&2; exit 1; }
 done
+grep -Eq '[[:space:]]libwebp[[:space:]]' <<< "${ffmpeg8_encoders}" || {
+    echo 'Missing FFmpeg 8 WebP encoder.' >&2
+    exit 1
+}
 
 ffmpeg8_muxers="$(${ffmpeg8} -hide_banner -muxers 2>&1)"
 grep -Eq '[[:space:]]wav[[:space:]]' <<< "${ffmpeg8_muxers}" || {
@@ -308,24 +295,6 @@ echo "Expected Python: ${PYTHON_VERSION}"
 "${THIRDPARTY_ROOT}/Python/bin/python" --version | grep -F "Python ${PYTHON_VERSION}"
 echo "Expected Poetry: ${POETRY_VERSION}"
 "${THIRDPARTY_ROOT}/Python/bin/python" -m poetry --version | grep -F "Poetry (version ${POETRY_VERSION})"
-echo "Expected QSVEncC: ${QSVENCC_VERSION}"
-"${THIRDPARTY_ROOT}/QSVEncC/QSVEncC.elf" --version | grep -F "${QSVENCC_VERSION}"
-echo "Expected NVEncC: ${NVENCC_VERSION}"
-if ! nvencc_version="$("${THIRDPARTY_ROOT}/NVEncC/NVEncC.elf" --version 2>&1)"; then
-    echo "${nvencc_version}"
-    echo "${nvencc_version}" | grep -F 'libcuda.so.1' > /dev/null
-    echo 'NVEncC --version is deferred to the runtime container with the host NVIDIA driver.'
-else
-    echo "${nvencc_version}" | grep -F "${NVENCC_VERSION}"
-fi
-echo "Expected VCEEncC: ${VCEENCC_VERSION}"
-if ! vceencc_version="$("${THIRDPARTY_ROOT}/VCEEncC/VCEEncC.elf" --version 2>&1)"; then
-    echo "${vceencc_version}"
-    echo "${vceencc_version}" | grep -E 'libamfrt|libOpenCL' > /dev/null
-    echo 'VCEEncC --version is deferred to the runtime container with the AMD runtime.'
-else
-    echo "${vceencc_version}" | grep -F "${VCEENCC_VERSION}"
-fi
 
 for executable in \
     CMAnalysis/chapter_exe \
@@ -339,23 +308,10 @@ for executable in \
     CMAnalysis/libavutil.so.60 \
     CMAnalysis/libswresample.so.6 \
     CMAnalysis/libswscale.so.9 \
-    FFmpeg/ffmpeg.elf \
-    FFmpeg/ffprobe.elf \
     FFmpeg8/ffmpeg8.elf \
-    FFmpeg8/ffprobe8.elf \
-    QSVEncC/QSVEncC.elf \
-    NVEncC/NVEncC.elf \
-    VCEEncC/VCEEncC.elf; do
+    FFmpeg8/ffprobe8.elf; do
     echo "Verifying dynamic dependencies: ${executable}"
     missing_dependencies="$(ldd "${THIRDPARTY_ROOT}/${executable}" | awk '/not found/ { print $1 }')"
-    case "${executable}" in
-        NVEncC/*)
-            missing_dependencies="$(echo "${missing_dependencies}" | grep -Ev '^(libcuda\.so\.1|libnvidia-encode\.so\.1)?$' || true)"
-            ;;
-        VCEEncC/*)
-            missing_dependencies="$(echo "${missing_dependencies}" | grep -Ev '^(libamfrt64\.so\.1|libOpenCL\.so\.1)?$' || true)"
-            ;;
-    esac
     if [ -n "${missing_dependencies}" ]; then
         ldd "${THIRDPARTY_ROOT}/${executable}" >&2
         exit 1
@@ -364,7 +320,14 @@ done
 
 test "$(patchelf --print-rpath "${THIRDPARTY_ROOT}/FFmpeg8/ffmpeg8.elf")" = '$ORIGIN'
 test "$(patchelf --print-rpath "${THIRDPARTY_ROOT}/FFmpeg8/ffprobe8.elf")" = '$ORIGIN'
-test "$(patchelf --print-rpath "${THIRDPARTY_ROOT}/QSVEncC/QSVEncC.elf")" = '$ORIGIN:$ORIGIN/../Library'
+# 完成 artifact に旧 FFmpeg 7 と独立ハードウェアエンコーダーのディレクトリが再混入していないことを保証する
+for removed_directory in FFmpeg QSVEncC NVEncC VCEEncC; do
+    echo "Verifying removed artifact directory: ${removed_directory}"
+    if [ -e "${THIRDPARTY_ROOT}/${removed_directory}" ]; then
+        echo "Removed artifact directory still exists: ${removed_directory}" >&2
+        exit 1
+    fi
+done
 test ! -d "${THIRDPARTY_ROOT}/Library/lib"
 test ! -d "${THIRDPARTY_ROOT}/Library/usr"
 

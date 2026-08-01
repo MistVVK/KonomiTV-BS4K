@@ -10,7 +10,12 @@ import subprocess
 from pathlib import Path
 
 
-LICENSE_PATTERN = re.compile(r'^(?:licen[cs]e|copying|notices?|copyright|third[-_ ]party)(?:$|[._ -])', re.IGNORECASE)
+# Bridge の Apache-2.0-LICENSE のように「*-LICENSE」で終わるファイルも拾う。
+LICENSE_PATTERN = re.compile(
+    r'^(?:licen[cs]e|copying|notices?|copyright|third[-_ ]party)(?:$|[._ -])'
+    r'|.+[._-]licen[cs]e$',
+    re.IGNORECASE,
+)
 COMMON_LICENSE_PATTERN = re.compile(r'/usr/share/common-licenses/([A-Za-z0-9.+-]+)')
 COMMON_LICENSE_ALIASES = {
     'GFDL-3': 'GFDL-1.3',

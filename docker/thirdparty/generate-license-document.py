@@ -119,26 +119,13 @@ def main() -> None:
         LicenseSource('KonomiTV upstream', manifest['KONOMITV_UPSTREAM_VERSION'], manifest['KONOMITV_UPSTREAM_REPOSITORY'], manifest['KONOMITV_UPSTREAM_COMMIT'], (
             ('License.txt', f'{github_raw}/tsukumijima/KonomiTV/{manifest["KONOMITV_UPSTREAM_COMMIT"]}/License.txt', manifest['KONOMITV_UPSTREAM_LICENSE_SHA256']),
         )),
-        LicenseSource('FFmpeg', manifest['FFMPEG_VERSION'], manifest['FFMPEG_REPOSITORY'], manifest['FFMPEG_COMMIT'], (
-            ('LICENSE.md', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG_COMMIT"]}/LICENSE.md', manifest['FFMPEG_LICENSE_SHA256']),
-            ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG_COMMIT"]}/COPYING.GPLv3', manifest['FFMPEG_GPLV3_SHA256']),
-        )),
         LicenseSource('FFmpeg', manifest['FFMPEG8_VERSION'], manifest['FFMPEG8_REPOSITORY'], manifest['FFMPEG8_COMMIT'], (
             ('LICENSE.md', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/LICENSE.md', manifest['FFMPEG8_LICENSE_SHA256']),
             ('GNU LGPL version 2.1', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.LGPLv2.1', manifest['FFMPEG8_LGPLV21_SHA256']),
-            ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.GPLv3', manifest['FFMPEG_GPLV3_SHA256']),
+            ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.GPLv3', manifest['FFMPEG8_GPLV3_SHA256']),
         )),
         LicenseSource('AMD Advanced Media Framework headers', manifest['AMF_VERSION'], manifest['AMF_REPOSITORY'], manifest['AMF_COMMIT'], (
             ('LICENSE.txt', f'{github_raw}/GPUOpen-LibrariesAndSDKs/AMF/{manifest["AMF_COMMIT"]}/LICENSE.txt', manifest['AMF_LICENSE_SHA256']),
-        )),
-        LicenseSource('QSVEncC', manifest['QSVENCC_VERSION'], manifest['QSVENCC_REPOSITORY'], manifest['QSVENCC_COMMIT'], (
-            ('license.txt', f'{github_raw}/rigaya/QSVEnc/{manifest["QSVENCC_COMMIT"]}/license.txt', manifest['QSVENCC_LICENSE_SHA256']),
-        )),
-        LicenseSource('NVEncC', manifest['NVENCC_VERSION'], manifest['NVENCC_REPOSITORY'], manifest['NVENCC_COMMIT'], (
-            ('NVEnc_license.txt', f'{github_raw}/rigaya/NVEnc/{manifest["NVENCC_COMMIT"]}/NVEnc_license.txt', manifest['NVENCC_LICENSE_SHA256']),
-        )),
-        LicenseSource('VCEEncC', manifest['VCEENCC_VERSION'], manifest['VCEENCC_REPOSITORY'], manifest['VCEENCC_COMMIT'], (
-            ('VCEEnc_license.txt', f'{github_raw}/rigaya/VCEEnc/{manifest["VCEENCC_COMMIT"]}/VCEEnc_license.txt', manifest['VCEENCC_LICENSE_SHA256']),
         )),
         LicenseSource('tsreadex', manifest['TSREADEX_COMMIT'][:12], 'https://github.com/MistVVK/tsreadex', manifest['TSREADEX_COMMIT'], (
             ('License.txt', str(REPOSITORY_ROOT / 'thirdparty-src/tsreadex/License.txt'), manifest['TSREADEX_LICENSE_SHA256']),

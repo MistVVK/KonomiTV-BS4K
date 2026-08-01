@@ -63,82 +63,10 @@ copy-license() {
     install -m 0644 "${source}" "${destination}"
 }
 
-# FFmpeg は短期保持の外部 autobuild に依存せず、公式ソースの完全 commit から構築する。
-clone-commit "${FFMPEG_REPOSITORY}" "${FFMPEG_COMMIT}" "${SOURCE_ROOT}/ffmpeg" "refs/tags/${FFMPEG_TAG}"
-pushd "${SOURCE_ROOT}/ffmpeg"
-./configure \
-    --prefix=/opt/ffmpeg \
-    --cc='ccache gcc' \
-    --cxx='ccache g++' \
-    --disable-autodetect \
-    --disable-debug \
-    --disable-doc \
-    --disable-ffplay \
-    --enable-gpl \
-    --enable-version3 \
-    --enable-shared \
-    --disable-static \
-    --enable-libopus \
-    --enable-libwebp \
-    --enable-libx264 \
-    --enable-libx265 \
-    --enable-zlib \
-    --extra-ldflags='-Wl,-rpath,$ORIGIN'
-make -j"$(nproc)"
-make install
-popd
-
-mkdir -p "${OUTPUT_ROOT}/FFmpeg"
-install -m 0755 /opt/ffmpeg/bin/ffmpeg "${OUTPUT_ROOT}/FFmpeg/ffmpeg.elf"
-install -m 0755 /opt/ffmpeg/bin/ffprobe "${OUTPUT_ROOT}/FFmpeg/ffprobe.elf"
-cp -a /opt/ffmpeg/lib/libav*.so* /opt/ffmpeg/lib/libpostproc.so* /opt/ffmpeg/lib/libsw*.so* "${OUTPUT_ROOT}/FFmpeg/"
-copy-license "${SOURCE_ROOT}/ffmpeg/LICENSE.md" "${OUTPUT_ROOT}/FFmpeg/License.txt"
-copy-license "${SOURCE_ROOT}/ffmpeg/COPYING.GPLv3" "${OUTPUT_ROOT}/FFmpeg/COPYING.GPLv3"
-find "${OUTPUT_ROOT}/FFmpeg" -type f -name '*.so*' -exec patchelf --set-rpath '$ORIGIN' {} +
-patchelf --set-rpath '$ORIGIN' "${OUTPUT_ROOT}/FFmpeg/ffmpeg.elf"
-patchelf --set-rpath '$ORIGIN' "${OUTPUT_ROOT}/FFmpeg/ffprobe.elf"
-
-# 既存 FFmpeg 7 とは共有ライブラリも含めて分離し、将来の HW 処理向け FFmpeg 8 を構築する。
+# ライブ・録画・メタデータ解析で共有する FFmpeg 8 を、公式ソースの固定 commit から構築する。
 SOURCE_ROOT="${SOURCE_ROOT}" OUTPUT_ROOT="${OUTPUT_ROOT}" "${SCRIPT_DIR}/build-ffmpeg8.sh"
 
-# encoder の deb とライセンスは同一 release tag に対応する完全 commit へ固定する。
-for encoder in QSVENCC NVENCC VCEENCC; do
-    version_variable="${encoder}_VERSION"
-    url_variable="${encoder}_URL"
-    sha256_variable="${encoder}_SHA256"
-    repository_variable="${encoder}_REPOSITORY"
-    commit_variable="${encoder}_COMMIT"
-    lowercase_name="$(echo "${encoder}" | tr '[:upper:]' '[:lower:]')"
-    download_path="${DOWNLOAD_ROOT}/${lowercase_name}_${!version_variable}_amd64.deb"
-    source_path="${SOURCE_ROOT}/${lowercase_name}"
-
-    download-verified "${!url_variable}" "${!sha256_variable}" "${download_path}"
-    package_version="$(dpkg-deb --field "${download_path}" Version)"
-    test "${package_version%%-*}" = "${!version_variable}"
-    clone-commit "${!repository_variable}" "${!commit_variable}" "${source_path}"
-    rm -rf "${SOURCE_ROOT}/${lowercase_name}-deb"
-    dpkg-deb --extract "${download_path}" "${SOURCE_ROOT}/${lowercase_name}-deb"
-done
-
-mkdir -p "${OUTPUT_ROOT}/QSVEncC" "${OUTPUT_ROOT}/NVEncC" "${OUTPUT_ROOT}/VCEEncC"
-install -m 0755 "${SOURCE_ROOT}/qsvencc-deb/usr/bin/qsvencc" "${OUTPUT_ROOT}/QSVEncC/QSVEncC.elf"
-install -m 0755 "${SOURCE_ROOT}/nvencc-deb/usr/bin/nvencc" "${OUTPUT_ROOT}/NVEncC/NVEncC.elf"
-install -m 0755 "${SOURCE_ROOT}/vceencc-deb/usr/bin/vceencc" "${OUTPUT_ROOT}/VCEEncC/VCEEncC.elf"
-copy-license "${SOURCE_ROOT}/qsvencc/license.txt" "${OUTPUT_ROOT}/QSVEncC/License.txt"
-copy-license "${SOURCE_ROOT}/nvencc/NVEnc_license.txt" "${OUTPUT_ROOT}/NVEncC/License.txt"
-copy-license "${SOURCE_ROOT}/vceencc/VCEEnc_license.txt" "${OUTPUT_ROOT}/VCEEncC/License.txt"
-
-# QSVEncC の静的 dispatcher が host の /usr/lib* を優先しないよう、固定長の置換を適用する。
-perl -0pi -e 's#/usr/lib/x86_64-linux-gnu#/bundle/disabled/path/001#g; s#/usr/lib64#/bad/path9#g; s#/usr/lib#/bad/lib#g' "${OUTPUT_ROOT}/QSVEncC/QSVEncC.elf"
-if strings "${OUTPUT_ROOT}/QSVEncC/QSVEncC.elf" | grep -Fxq '/usr/lib'; then
-    echo 'Failed to disable the QSVEncC system library search path.' >&2
-    exit 1
-fi
-patchelf --force-rpath --set-rpath '$ORIGIN:$ORIGIN/../Library' "${OUTPUT_ROOT}/QSVEncC/QSVEncC.elf"
-patchelf --set-rpath '$ORIGIN:$ORIGIN/../FFmpeg:$ORIGIN/../Library' "${OUTPUT_ROOT}/NVEncC/NVEncC.elf"
-patchelf --set-rpath '$ORIGIN:$ORIGIN/../FFmpeg:$ORIGIN/../Library' "${OUTPUT_ROOT}/VCEEncC/VCEEncC.elf"
-
-# Intel Media Stack を固定 commit と既存の修正 patch から構築する。
+# FFmpeg 8 の QSV 経路で使う Intel Media Stack を、固定 commit と既存の修正 patch から構築する。
 NONFREE="${NONFREE}" OUTPUT_ROOT="${SOURCE_ROOT}/intel-media-stack" \
     "${SCRIPT_DIR}/build-intel-media-stack.sh" "${SOURCE_ROOT}/intel-media-stack"
 cp -a "${SOURCE_ROOT}/intel-media-stack/artifact/Library" "${OUTPUT_ROOT}/Library"
