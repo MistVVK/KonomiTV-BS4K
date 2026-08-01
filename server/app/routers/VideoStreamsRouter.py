@@ -2,10 +2,9 @@
 import asyncio
 import json
 import math
-from enum import IntEnum
-from typing import Annotated, Literal, cast
+from typing import Annotated, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
 from fastapi.responses import Response
 from sse_starlette.sse import EventSourceResponse
 
@@ -14,19 +13,23 @@ from app.config import Config
 from app.metadata.RecordedPlaybackIndex import IsRecordedPlaybackIndexReady
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.models.RecordedProgram import RecordedProgram
-from app.streams.RecordedEncodingCodecs import (
-    AudioCodec,
-    VideoCodec,
+from app.streams.KonomiTVBS4KPlaybackCapabilities import (
+    KonomiTVBS4KPlaybackCapabilityProbe,
+)
+from app.streams.KonomiTVBS4KPlaybackEncoding import (
+    KonomiTVBS4KAudioCodec,
+    KonomiTVBS4KPlaybackEncoder,
+    KonomiTVBS4KVideoBitDepth,
+    KonomiTVBS4KVideoBitDepthQuery,
+    KonomiTVBS4KVideoCodec,
 )
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
-from app.streams.RecordedPlaybackCapabilities import (
-    RecordedPlaybackCapabilityProbe,
-)
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.StreamEncodingOptions import (
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
 )
+from app.streams.TSCodecBridgeRuntime import TSCodecBridgeRuntimeVerifier
 
 
 # ルーター
@@ -35,11 +38,25 @@ router = APIRouter(
     prefix = '/api/streams/video',
 )
 
-class VideoBitDepthQuery(IntEnum):
-    """クエリ文字列から整数へ変換可能な録画映像bit depth。"""
+VideoBitDepthQuery = KonomiTVBS4KVideoBitDepthQuery
 
-    BIT_8 = 8
-    BIT_10 = 10
+
+def SetTSCodecBridgeProcessCounterHeaders(response: Response) -> None:
+    """互換API隔離の前後で比較するBridge process世代と用途別回数を設定する。"""
+
+    if Config().general.konomitv_bs4k_acceptance_diagnostics_enabled is False:
+        return
+    generation, total_count, live_count, probe_count, verification_count = (
+        TSCodecBridgeRuntimeVerifier.getProcessStartSnapshot()
+    )
+    prefix = 'X-KonomiTV-BS4K-TSCodecBridge'
+    response.headers[f'{prefix}-Process-Generation'] = generation
+    response.headers[f'{prefix}-Process-Start-Count'] = str(total_count)
+    response.headers[f'{prefix}-Live-Process-Start-Count'] = str(live_count)
+    response.headers[f'{prefix}-Probe-Process-Start-Count'] = str(probe_count)
+    response.headers[f'{prefix}-Verification-Process-Start-Count'] = str(
+        verification_count
+    )
 
 
 def GetRecordedStream(
@@ -47,6 +64,7 @@ def GetRecordedStream(
     recorded_program: RecordedProgram,
     stream_quality: StreamQualityWithOptions,
     is_new_session_allowed: bool = False,
+    client_key: str = 'unknown',
 ) -> RecordedFMP4Stream:
     """FFmpeg 8・fMP4録画視聴セッションを返す。"""
 
@@ -57,6 +75,7 @@ def GetRecordedStream(
             stream_quality.quality,
             encoding_options=stream_quality.encoding_options,
             is_new_session_allowed=False,
+            client_key=client_key,
         )
     if IsRecordedPlaybackIndexReady(
         recorded_program.recorded_video.playback_index_status,
@@ -75,7 +94,24 @@ def GetRecordedStream(
         stream_quality.quality,
         stream_quality.encoding_options,
         is_new_session_allowed=is_new_session_allowed,
+        client_key=client_key,
     )
+
+
+def GetClientKey(request: Request) -> str:
+    """
+    admission control 用の接続元識別子を取得する。
+
+    Args:
+        request (Request): FastAPI リクエスト
+
+    Returns:
+        str: クライアント IP または unknown
+    """
+
+    if request.client is None:
+        return 'unknown'
+    return request.client.host or 'unknown'
 
 
 async def EnsurePlaybackIndexReady(recorded_program: RecordedProgram, session_id: str) -> None:
@@ -118,25 +154,136 @@ async def EnsurePlaybackIndexReady(recorded_program: RecordedProgram, session_id
 
 
 @router.get(
-    '/capabilities',
-    summary = '録画再生エンコード能力 API',
-    response_model = list[schemas.RecordedPlaybackCapability],
+    '/konomitv-bs4k-playback-capabilities',
+    summary = 'KonomiTV-BS4K 共通再生エンコード能力 API',
+    response_model = schemas.KonomiTVBS4KPlaybackCapabilities,
 )
-async def RecordedPlaybackCapabilitiesAPI() -> list[schemas.RecordedPlaybackCapability]:
-    """録画用FFmpeg 8で利用できるエンコーダー・コーデック・bit depthの組み合わせを返す。"""
+async def KonomiTVBS4KPlaybackCapabilitiesAPI(
+    response: Response,
+) -> schemas.KonomiTVBS4KPlaybackCapabilities:
+    """ライブと録画の映像・音声能力と、ライブの厳密な組み合わせ行列を返す。"""
 
-    capabilities = await RecordedPlaybackCapabilityProbe.getCapabilities()
-    return [
-        schemas.RecordedPlaybackCapability(
-            encoder = capability.encoder,
-            codec = capability.codec,
-            bit_depth = capability.bit_depth,
-            available = capability.available,
-            profile = capability.profile,
-            reason_code = capability.reason_code,
-        )
-        for capability in capabilities
-    ]
+    capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getCapabilities()
+    SetTSCodecBridgeProcessCounterHeaders(response)
+    return schemas.KonomiTVBS4KPlaybackCapabilities(
+        video = [
+            schemas.KonomiTVBS4KPlaybackVideoCapability(
+                encoder = capability.encoder,
+                codec = capability.codec,
+                bit_depth = capability.bit_depth,
+                profile = capability.profile,
+                live_available = capability.live_available,
+                recorded_available = capability.recorded_available,
+                live_reason_code = capability.live_reason_code,
+                recorded_reason_code = capability.recorded_reason_code,
+            )
+            for capability in capabilities.video
+        ],
+        audio = [
+            schemas.KonomiTVBS4KPlaybackAudioCapability(
+                codec = capability.codec,
+                live_available = capability.live_available,
+                recorded_available = capability.recorded_available,
+                live_reason_code = capability.live_reason_code,
+                recorded_reason_code = capability.recorded_reason_code,
+            )
+            for capability in capabilities.audio
+        ],
+        live_combinations = [
+            schemas.KonomiTVBS4KPlaybackLiveCombinationCapability(
+                encoder = capability.encoder,
+                video_codec = capability.video_codec,
+                video_bit_depth = capability.video_bit_depth,
+                audio_codec = capability.audio_codec,
+                available = capability.available,
+                reason_code = capability.reason_code,
+            )
+            for capability in capabilities.live_combinations
+        ],
+    )
+
+
+@router.get(
+    '/konomitv-bs4k-playback-capabilities/targeted',
+    summary = 'KonomiTV-BS4K 再生開始用部分エンコード能力 API',
+    response_model = schemas.KonomiTVBS4KPlaybackCapabilities,
+)
+async def KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
+    response: Response,
+    encoder: Annotated[
+        KonomiTVBS4KPlaybackEncoder,
+        Query(description='現在の再生で実際に使用するエンコーダー。'),
+    ],
+    video_codec: Annotated[
+        KonomiTVBS4KVideoCodec,
+        Query(description='保存設定から選ばれた出力映像コーデック。'),
+    ],
+    video_bit_depths: Annotated[
+        str,
+        Query(
+            pattern = r'^(8|10)(,(8|10))?$',
+            description='現在の画質とブラウザで候補になるbit depthの優先順。',
+        ),
+    ],
+    audio_codec: Annotated[
+        KonomiTVBS4KAudioCodec,
+        Query(description='保存設定から選ばれた出力音声コーデック。'),
+    ],
+    has_video: Annotated[
+        bool,
+        Query(description='映像SourceBufferを使う再生対象かどうか。'),
+    ],
+) -> schemas.KonomiTVBS4KPlaybackCapabilities:
+    """再生開始に必要なexact行とAVC/AAC互換fallback行だけを返す。"""
+
+    parsed_video_bit_depths = cast(
+        tuple[KonomiTVBS4KVideoBitDepth, ...],
+        tuple(int(value) for value in video_bit_depths.split(',')),
+    )
+    capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
+        encoder,
+        video_codec,
+        parsed_video_bit_depths,
+        audio_codec,
+        has_video,
+    )
+    SetTSCodecBridgeProcessCounterHeaders(response)
+    return schemas.KonomiTVBS4KPlaybackCapabilities(
+        video = [
+            schemas.KonomiTVBS4KPlaybackVideoCapability(
+                encoder = capability.encoder,
+                codec = capability.codec,
+                bit_depth = capability.bit_depth,
+                profile = capability.profile,
+                live_available = capability.live_available,
+                recorded_available = capability.recorded_available,
+                live_reason_code = capability.live_reason_code,
+                recorded_reason_code = capability.recorded_reason_code,
+            )
+            for capability in capabilities.video
+        ],
+        audio = [
+            schemas.KonomiTVBS4KPlaybackAudioCapability(
+                codec = capability.codec,
+                live_available = capability.live_available,
+                recorded_available = capability.recorded_available,
+                live_reason_code = capability.live_reason_code,
+                recorded_reason_code = capability.recorded_reason_code,
+            )
+            for capability in capabilities.audio
+        ],
+        live_combinations = [
+            schemas.KonomiTVBS4KPlaybackLiveCombinationCapability(
+                encoder = capability.encoder,
+                video_codec = capability.video_codec,
+                video_bit_depth = capability.video_bit_depth,
+                audio_codec = capability.audio_codec,
+                available = capability.available,
+                reason_code = capability.reason_code,
+            )
+            for capability in capabilities.live_combinations
+        ],
+    )
 
 
 async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番組の ID 。')]) -> RecordedProgram:
@@ -156,12 +303,78 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
     return recorded_program
 
 
+async def ValidateRecordedPlaybackCapabilities(
+    recorded_program: RecordedProgram,
+    stream_quality: StreamQualityWithOptions,
+) -> None:
+    """
+    明示codec queryに対応する録画エンコード能力を、現在の録画メタデータで検証する。
+
+    Args:
+        recorded_program (RecordedProgram): 再生対象の録画番組。
+        stream_quality (StreamQualityWithOptions): queryの明示状態を保持した生成条件。
+
+    Returns:
+        None
+    """
+
+    if (
+        stream_quality.is_video_encoding_explicitly_requested is False
+        and stream_quality.is_audio_encoding_explicitly_requested is False
+    ):
+        return
+
+    is_bs4k_recorded_video = recorded_program.network_id == 0x000B
+    selected_encoder = (
+        Config().general.encoder_bs4k
+        if is_bs4k_recorded_video is True
+        else Config().general.encoder
+    )
+    if (
+        recorded_program.recorded_video.has_video is True
+        and stream_quality.is_video_encoding_explicitly_requested is True
+    ):
+        video_capability = (
+            await KonomiTVBS4KPlaybackCapabilityProbe.getRecordedVideoCapability(
+                selected_encoder,
+                stream_quality.encoding_options.video_codec,
+                stream_quality.encoding_options.video_bit_depth,
+            )
+        )
+        if video_capability.recorded_available is False:
+            reason_code = video_capability.recorded_reason_code or 'ProbeFailed'
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = {
+                    'code': reason_code,
+                    'message': 'The requested recorded encoding is unavailable.',
+                },
+            )
+
+    if stream_quality.is_audio_encoding_explicitly_requested is True:
+        # 録画Opusは固定FFmpegの可否だけで判定し、無関係なlive radio pipeを起動しない。
+        audio_capability = (
+            await KonomiTVBS4KPlaybackCapabilityProbe.getRecordedAudioCapability(
+                stream_quality.encoding_options.audio_codec
+            )
+        )
+        if audio_capability.recorded_available is False:
+            reason_code = audio_capability.recorded_reason_code or 'ProbeFailed'
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = {
+                    'code': reason_code,
+                    'message': 'The requested recorded audio encoding is unavailable.',
+                },
+            )
+
+
 async def ValidateQuality(
     quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
-    video_codec: Annotated[VideoCodec | None, Query(description='出力映像コーデック。省略時は旧画質URLから判定。')] = None,
+    video_codec: Annotated[KonomiTVBS4KVideoCodec | None, Query(description='出力映像コーデック。省略時は旧画質URLから判定。')] = None,
     video_bit_depth: Annotated[VideoBitDepthQuery | None, Query(description='出力映像bit depth。')] = None,
-    audio_codec: Annotated[AudioCodec, Query(description='出力音声コーデック。')] = 'aac',
+    audio_codec: Annotated[KonomiTVBS4KAudioCodec, Query(description='出力音声コーデック。')] = 'aac',
     audio_track: Annotated[str | None, Query(description='映像と多重化する音声レンディション ID。')] = None,
 ) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
@@ -174,7 +387,10 @@ async def ValidateQuality(
         Config().general.encoder_bs4k if is_bs4k_recorded_video is True else None,
         is_24fps_mode_allowed = is_bs4k_recorded_video is False,
         video_codec = video_codec,
-        video_bit_depth = cast(Literal[8, 10] | None, int(video_bit_depth) if video_bit_depth is not None else None),
+        video_bit_depth = cast(
+            KonomiTVBS4KVideoBitDepth | None,
+            int(video_bit_depth) if video_bit_depth is not None else None,
+        ),
         audio_codec = audio_codec,
         audio_rendition_id = audio_track,
     )
@@ -185,34 +401,13 @@ async def ValidateQuality(
             detail = 'Specified quality was not found',
         )
 
-    # 新経路を明示した要求は、能力APIと同じ実検査結果で事前に拒否する。
-    if (
-        IsRecordedPlaybackIndexReady(
-            recorded_program.recorded_video.playback_index_status,
-            recorded_program.recorded_video.playback_index_version,
-        ) and
-        (video_codec is not None or video_bit_depth is not None)
+    # Ready済み録画は依存解決時に早期拒否する。Pending/Staleはmaster handlerが
+    # index生成後の最新メタデータで同じhelperを必ず再実行する。
+    if IsRecordedPlaybackIndexReady(
+        recorded_program.recorded_video.playback_index_status,
+        recorded_program.recorded_video.playback_index_version,
     ):
-        selected_encoder = Config().general.encoder_bs4k \
-            if is_bs4k_recorded_video else Config().general.encoder
-        capability = next(
-            (
-                item for item in await RecordedPlaybackCapabilityProbe.getCapabilities()
-                if item.encoder == selected_encoder and
-                item.codec == stream_quality.encoding_options.video_codec and
-                item.bit_depth == stream_quality.encoding_options.video_bit_depth
-            ),
-            None,
-        )
-        if capability is None or capability.available is False:
-            reason_code = capability.reason_code if capability is not None else 'ProbeFailed'
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail={
-                    'code': reason_code,
-                    'message': 'The requested recorded encoding is unavailable.',
-                },
-            )
+        await ValidateRecordedPlaybackCapabilities(recorded_program, stream_quality)
 
     return stream_quality
 
@@ -229,6 +424,7 @@ async def ValidateQuality(
     }
 )
 async def VideoHLSPlaylistAPI(
+    request: Request,
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query(description='セッション ID（クライアント側で適宜生成したランダム値を指定する）。')],
@@ -242,8 +438,19 @@ async def VideoHLSPlaylistAPI(
     # 旧録画経路の削除後は、未解析の録画もオンデマンド索引が完了し次第そのまま再生を開始する。
     await EnsurePlaybackIndexReady(recorded_program, session_id)
 
+    # Pending/Staleだった要求も、index生成後のhas_videoと同じ明示query契約で必ず検査する。
+    ## Ready要求ではcache済みのexact結果を再利用し、codec無指定の従来URLはhelper内で即時returnする。
+    await ValidateRecordedPlaybackCapabilities(recorded_program, stream_quality)
+
     # 品質とオプション指定に対応する録画視聴セッションを作成または取得
-    video_stream = GetRecordedStream(session_id, recorded_program, stream_quality, is_new_session_allowed = True)
+    ## 新規 session は接続元 IP 単位の admission control を通す
+    video_stream = GetRecordedStream(
+        session_id,
+        recorded_program,
+        stream_quality,
+        is_new_session_allowed=True,
+        client_key=GetClientKey(request),
+    )
     virtual_playlist = await video_stream.getMasterPlaylist(cache_key)
     return Response(
         content = virtual_playlist,

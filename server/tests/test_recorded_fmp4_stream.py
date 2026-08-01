@@ -16,6 +16,42 @@ from app.streams.RecordedFMP4Stream import (
 )
 
 
+def test_subprocess_is_killed_and_reaped_when_communication_is_cancelled() -> None:
+    """録画セグメント生成のキャンセル時にFFmpegを残留させない。"""
+
+    class CancelledProcess:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.kill_count = 0
+            self.wait_count = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            raise asyncio.CancelledError
+
+        def kill(self) -> None:
+            self.kill_count += 1
+
+        async def wait(self) -> int:
+            self.wait_count += 1
+            self.returncode = -9
+            return self.returncode
+
+    process = CancelledProcess()
+
+    async def Communicate() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await RecordedFMP4Stream._RecordedFMP4Stream__communicateSubprocess(  # pyright: ignore[reportAttributeAccessIssue]
+                process,  # pyright: ignore[reportArgumentType]
+            )
+
+    asyncio.run(Communicate())
+
+    assert process.kill_count == 1
+    assert process.wait_count == 1
+    assert process.returncode == -9
+
+
 def _build_aac_init(
     audio_object_type: int = 2,
     sampling_frequency_index: int = 3,
@@ -715,6 +751,55 @@ def test_opus_fallback_master_keeps_declared_multichannel_count(monkeypatch) -> 
     assert stream._RecordedFMP4Stream__getSilentAudioChannelLayout(rendition) == '4.0'  # pyright: ignore[reportPrivateUsage]
 
 
+def test_audio_only_master_uses_primary_audio_without_video_generation(monkeypatch) -> None:
+    """音声のみ録画は映像initを要求せず、主音声playlistをvariantとして返す。"""
+
+    track = {
+        'index': 1, 'stream_index': 0, 'codec': 'AAC-LC', 'channel': 'Stereo',
+        'sampling_rate': 48_000, 'language': 'ja', 'channel_layout': 'stereo',
+    }
+    stream = object.__new__(RecordedFMP4Stream)
+    stream.session_id = 'audio-only-session'
+    stream.quality = '1080p'
+    stream.encoding_options = SimpleNamespace(video_codec='avc', video_bit_depth=8, audio_codec='aac')
+    stream._effective_audio_codec = 'aac'
+    stream._segments = [RecordedFMP4Segment(0, 0.0, 6.0, 0, 0)]
+    stream._completed_sequences = set()
+    stream._active_operations = 0
+    stream.recorded_program = SimpleNamespace(recorded_video=SimpleNamespace(
+        has_video=False,
+        container_format='MP4',
+        audio_tracks=[track],
+        audio_track_timeline=[{'start_time': 0.0, 'end_time': 6.0, 'tracks': [track]}],
+        subtitle_tracks=[],
+    ))
+    get_video_init = AsyncMock()
+
+    async def GetAudioInitSegment(_self, _rendition_id: str, _sequence: int) -> bytes:
+        return _build_aac_init()
+
+    get_audio_segment = AsyncMock(return_value=b'audio-segment')
+    monkeypatch.setattr(RecordedFMP4Stream, 'keepAlive', lambda _self: None)
+    monkeypatch.setattr(RecordedFMP4Stream, 'getAudioInitSegment', GetAudioInitSegment)
+    monkeypatch.setattr(RecordedFMP4Stream, 'getVideoInitSegment', get_video_init)
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__getTranscodedAudioSegment',
+        get_audio_segment,
+    )
+
+    master = asyncio.run(stream._RecordedFMP4Stream__getMasterPlaylist('cache'))  # pyright: ignore[reportPrivateUsage]
+    segment = asyncio.run(stream.getAudioSegment('1', 0))
+
+    assert 'CODECS="mp4a.40.2"' in master
+    assert 'audio/1/playlist?session_id=audio-only-session' in master
+    assert 'video/playlist' not in master
+    assert 'video_codec=avc' in master
+    assert segment == b'audio-segment'
+    assert stream._completed_sequences == {0}
+    get_video_init.assert_not_awaited()
+
+
 def test_video_and_audio_playlists_share_discontinuity_boundaries(monkeypatch) -> None:
     """hls.jsが代替音声のinit PTSを対応付けられるよう、構成境界を両プレイリストで揃える。"""
 
@@ -1374,10 +1459,13 @@ def test_continuous_audio_generation_uses_exact_boundaries_and_atomic_fallback(
 
     async def Encode() -> bool:
         class NoopSemaphore:
-            async def __aenter__(self):
-                return self
+            def locked(self) -> bool:
+                return False
 
-            async def __aexit__(self, _exception_type, _exception, _traceback):
+            async def acquire(self) -> bool:
+                return True
+
+            def release(self) -> None:
                 return None
 
         stream._cpu_semaphore = NoopSemaphore()

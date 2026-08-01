@@ -3,6 +3,10 @@ import base64
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+import app.streams.RecordedSubtitleStream as recorded_subtitle_stream_module
+from app.models.RecordedVideo import RecordedVideo
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 
 
@@ -363,3 +367,201 @@ def test_arib_ttml_range_returns_prior_packets_for_seek_restore(monkeypatch) -> 
     assert [packet['pts'] for packet in result['packets']] == [3.0]
     assert result['packets'][0]['transport_timestamp'] == 93.0
     assert result['packets'][0]['is_restore_point'] is False
+
+
+def test_orphan_cleanup_preserves_reachable_active_and_third_party_caches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reachable・active lockを保持し、deleted hash・旧version・中断tmpだけを削除する。"""
+
+    file_hash = 'a' * 32
+    deleted_hash = 'b' * 32
+    reachable = tmp_path / f'v3-{file_hash}-1-7.vtt'
+    reachable_ttml = tmp_path / f'ttml-v2-{file_hash}-7-101.json'
+    old_cache_version = tmp_path / f'v2-{file_hash}-1-7.vtt'
+    old_index_version = tmp_path / f'v3-{file_hash}-1-6.vtt'
+    deleted_cache = tmp_path / f'v3-{deleted_hash}-1-7.vtt'
+    active_cache = tmp_path / f'v3-{deleted_hash}-2-7.arib.json'
+    interrupted_temporary = tmp_path / f'v3-{deleted_hash}-3-7.vtt.tmp'
+    third_party = tmp_path / f'copy-v3-{deleted_hash}-1-7.vtt'
+    managed_name_symlink = tmp_path / f'v3-{deleted_hash}-4-7.vtt'
+    symlink_target = tmp_path / 'third-party-target'
+    for path in (
+        reachable,
+        reachable_ttml,
+        old_cache_version,
+        old_index_version,
+        deleted_cache,
+        active_cache,
+        interrupted_temporary,
+        third_party,
+        symlink_target,
+    ):
+        path.write_bytes(b'cache')
+    managed_name_symlink.symlink_to(symlink_target)
+
+    class RecordedVideoQuery:
+        async def values(self, *_fields: str) -> list[dict[str, object]]:
+            return [{
+                'file_hash': file_hash,
+                'playback_index_version': 7,
+                'subtitle_tracks': [
+                    {'index': 1, 'stream_index': 3, 'codec': 'subrip'},
+                    {'index': 2, 'stream_index': 4, 'codec': 'arib_caption'},
+                    {'index': 3, 'codec': 'arib_ttml', 'program_number': 101},
+                ],
+            }]
+
+    async def RunSynchronously(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """終了不能なhost ThreadPoolExecutorを避け、GCの同期I/O本体だけを検証する。"""
+
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(recorded_subtitle_stream_module, 'RECORDED_SUBTITLES_DIR', tmp_path)
+    monkeypatch.setattr(recorded_subtitle_stream_module.asyncio, 'to_thread', RunSynchronously)
+    monkeypatch.setattr(RecordedVideo, 'all', classmethod(lambda _cls: RecordedVideoQuery()))
+
+    async def Run() -> None:
+        # 削除対象TTMLがメモリLRUにも残っている状態を作り、disk削除と同時に除外されることを確認する。
+        orphan_ttml = tmp_path / f'ttml-v2-{deleted_hash}-7-all.json'
+        orphan_ttml.write_text('[]')
+        RecordedSubtitleStream._RecordedSubtitleStream__rememberARIBTTMLPacketIndex(  # pyright: ignore[reportPrivateUsage]
+            orphan_ttml,
+            [],
+        )
+        async with RecordedSubtitleStream._RecordedSubtitleStream__cacheLock(active_cache):  # pyright: ignore[reportPrivateUsage]
+            await RecordedSubtitleStream.cleanupOrphanedCaches()
+            assert active_cache.is_file() is True
+        await RecordedSubtitleStream.cleanupOrphanedCaches()
+        assert orphan_ttml not in RecordedSubtitleStream._arib_ttml_memory_cache  # pyright: ignore[reportPrivateUsage]
+        assert orphan_ttml not in RecordedSubtitleStream._arib_ttml_memory_cache_bytes  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(Run())
+
+    assert reachable.is_file() is True
+    assert reachable_ttml.is_file() is True
+    assert active_cache.exists() is False
+    assert old_cache_version.exists() is False
+    assert old_index_version.exists() is False
+    assert deleted_cache.exists() is False
+    assert interrupted_temporary.exists() is False
+    assert third_party.is_file() is True
+    assert managed_name_symlink.is_symlink() is True
+    assert symlink_target.read_bytes() == b'cache'
+
+
+def test_orphan_cleanup_is_fail_closed_when_db_enumeration_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DBからreachable集合を確定できない場合は管理形式のファイルも削除しない。"""
+
+    cache_path = tmp_path / f'v3-{"a" * 32}-1-7.vtt'
+    cache_path.write_bytes(b'cache')
+
+    class FailingRecordedVideoQuery:
+        async def values(self, *_fields: str) -> list[dict[str, object]]:
+            raise RuntimeError('simulated database failure')
+
+    async def RunSynchronously(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """終了不能なhost ThreadPoolExecutorを避け、GCの同期I/O本体だけを検証する。"""
+
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(recorded_subtitle_stream_module, 'RECORDED_SUBTITLES_DIR', tmp_path)
+    monkeypatch.setattr(recorded_subtitle_stream_module.asyncio, 'to_thread', RunSynchronously)
+    monkeypatch.setattr(RecordedVideo, 'all', classmethod(lambda _cls: FailingRecordedVideoQuery()))
+
+    asyncio.run(RecordedSubtitleStream.cleanupOrphanedCaches())
+
+    assert cache_path.is_file() is True
+
+
+def test_orphan_cleanup_is_fail_closed_when_db_row_is_invalid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1件でもreachable判定不能なDB行があれば、管理形式のorphanも削除しない。"""
+
+    cache_path = tmp_path / f'v3-{"a" * 32}-1-7.vtt'
+    cache_path.write_bytes(b'cache')
+
+    class InvalidRecordedVideoQuery:
+        async def values(self, *_fields: str) -> list[dict[str, object]]:
+            return [{
+                'file_hash': 'invalid-hash',
+                'playback_index_version': 7,
+                'subtitle_tracks': [],
+            }]
+
+    async def RunSynchronously(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """終了不能なhost ThreadPoolExecutorを避け、GCの同期I/O本体だけを検証する。"""
+
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(recorded_subtitle_stream_module, 'RECORDED_SUBTITLES_DIR', tmp_path)
+    monkeypatch.setattr(recorded_subtitle_stream_module.asyncio, 'to_thread', RunSynchronously)
+    monkeypatch.setattr(RecordedVideo, 'all', classmethod(lambda _cls: InvalidRecordedVideoQuery()))
+
+    asyncio.run(RecordedSubtitleStream.cleanupOrphanedCaches())
+
+    assert cache_path.is_file() is True
+
+
+def test_orphan_cleanup_blocks_new_writer_until_temporary_unlink_finishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """active判定後に始まる生成もGCのtmp削除完了まで待機し、atomic replaceを成功させる。"""
+
+    completed_path = tmp_path / f'v3-{"a" * 32}-1-7.vtt'
+    temporary_path = completed_path.with_name(f'{completed_path.name}.tmp')
+    temporary_path.write_bytes(b'interrupted')
+
+    class RecordedVideoQuery:
+        async def values(self, *_fields: str) -> list[dict[str, object]]:
+            return []
+
+    unlink_started = asyncio.Event()
+    allow_unlink = asyncio.Event()
+
+    async def RunControlled(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        """GCのunlinkだけを停止し、active判定後の生成参入順序を決定的に作る。"""
+
+        if getattr(function, '__self__', None) == temporary_path and getattr(function, '__name__', '') == 'unlink':
+            unlink_started.set()
+            await allow_unlink.wait()
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(recorded_subtitle_stream_module, 'RECORDED_SUBTITLES_DIR', tmp_path)
+    monkeypatch.setattr(recorded_subtitle_stream_module.asyncio, 'to_thread', RunControlled)
+    monkeypatch.setattr(RecordedVideo, 'all', classmethod(lambda _cls: RecordedVideoQuery()))
+
+    async def Run() -> None:
+        writer_entered = asyncio.Event()
+
+        async def GenerateCache() -> None:
+            async with RecordedSubtitleStream._RecordedSubtitleStream__cacheLock(  # pyright: ignore[reportPrivateUsage]
+                completed_path,
+            ):
+                writer_entered.set()
+                temporary_path.write_bytes(b'generated')
+                temporary_path.replace(completed_path)
+
+        cleanup_task = asyncio.create_task(RecordedSubtitleStream.cleanupOrphanedCaches())
+        await unlink_started.wait()
+        writer_task = asyncio.create_task(GenerateCache())
+        await asyncio.sleep(0)
+
+        # GCが同じpathのlockを保持している間は、新規生成をtmpへ進めてはならない。
+        assert writer_entered.is_set() is False
+        allow_unlink.set()
+        await asyncio.wait_for(cleanup_task, timeout=1)
+        await asyncio.wait_for(writer_task, timeout=1)
+
+    asyncio.run(Run())
+
+    assert completed_path.read_bytes() == b'generated'
+    assert temporary_path.exists() is False
+    assert completed_path not in RecordedSubtitleStream._locks  # pyright: ignore[reportPrivateUsage]

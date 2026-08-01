@@ -38,12 +38,14 @@ class TSStreamInfo:
         pcr_pid (int): PCR が流れる PID
         codec (Literal['MPEG-2', 'H.264', 'H.265']): 映像コーデック
         packet_size (int): ファイル上の TS パケットサイズ (188 または 192)
+        stream_start_offset (int): 先頭 junk を除いた最初の物理パケット先頭位置
     """
 
     video_pid: int
     pcr_pid: int
     codec: Literal['MPEG-2', 'H.264', 'H.265']
     packet_size: int
+    stream_start_offset: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,22 +192,22 @@ class TSKeyFrameSeeker:
     ) -> list[dict[int, int]]:
         """録画内の複数位置にあるPAT/PMTから、program単位の音声PID集合を列挙する。"""
 
-        packet_size = TSKeyFrameSeeker.__detectPacketSize(path)
+        packet_size, stream_start_offset = TSKeyFrameSeeker.__detectPacketSizeAndOffset(path)
         file_size = path.stat().st_size
         audio_stream_types = {0x03, 0x04, 0x0F, 0x11, 0x81, 0x87}
         audio_pids_by_program: dict[int, dict[int, int]] = {}
         if sample_count <= 1:
-            sample_offsets = [0]
+            sample_offsets = [stream_start_offset]
         else:
-            max_start = max(0, file_size - max_scan_bytes_per_sample)
+            max_start = max(stream_start_offset, file_size - max_scan_bytes_per_sample)
             sample_offsets = [
-                int(max_start * index / (sample_count - 1))
+                int(stream_start_offset + (max_start - stream_start_offset) * index / (sample_count - 1))
                 for index in range(sample_count)
             ]
 
         with path.open('rb') as file:
             for sample_offset in sample_offsets:
-                aligned_offset = max(0, (sample_offset // packet_size) * packet_size)
+                aligned_offset = TSKeyFrameSeeker.__alignToPacket(sample_offset, packet_size, stream_start_offset)
                 file.seek(aligned_offset)
                 pat_parser = SectionParser(PATSection)
                 pmt_parsers: dict[int, SectionParser[PMTSection]] = {}
@@ -250,13 +252,14 @@ class TSKeyFrameSeeker:
         データ放送と区別できない。ARIB STD-B10で字幕を示すdata_component_id 0x0008を使う。
         """
 
-        packet_size = TSKeyFrameSeeker.__detectPacketSize(path)
+        packet_size, stream_start_offset = TSKeyFrameSeeker.__detectPacketSizeAndOffset(path)
         pat_parser = SectionParser(PATSection)
         pmt_parsers: dict[int, SectionParser[PMTSection]] = {}
         caption_candidates: set[int] = set()
         caption_pids: set[int] = set()
         max_packet_count = max(1, max_scan_bytes // packet_size)
         with path.open('rb') as file:
+            file.seek(stream_start_offset)
             for _ in range(max_packet_count):
                 packet = TSKeyFrameSeeker.normalizePacket(file.read(packet_size), packet_size)
                 if packet is None:
@@ -416,18 +419,21 @@ class TSKeyFrameSeeker:
             PMT記述子と実ID3 PRIV ownerの双方を確認できたstream一覧。
         """
 
-        packet_size = TSKeyFrameSeeker.__detectPacketSize(path)
+        packet_size, stream_start_offset = TSKeyFrameSeeker.__detectPacketSizeAndOffset(path)
         file_size = path.stat().st_size
         if sample_count <= 1:
-            sample_offsets = [0]
+            sample_offsets = [stream_start_offset]
         else:
-            max_start = max(0, file_size - max_scan_bytes_per_sample)
+            max_start = max(stream_start_offset, file_size - max_scan_bytes_per_sample)
             sample_offsets = [
-                int(max_start * index / (sample_count - 1))
+                int(stream_start_offset + (max_start - stream_start_offset) * index / (sample_count - 1))
                 for index in range(sample_count)
             ]
         # 短い録画では複数の割合位置が同じpacketへ丸められるため、同じ窓を再走査しない。
-        aligned_offsets = sorted({max(0, (offset // packet_size) * packet_size) for offset in sample_offsets})
+        aligned_offsets = sorted({
+            TSKeyFrameSeeker.__alignToPacket(offset, packet_size, stream_start_offset)
+            for offset in sample_offsets
+        })
         candidates: dict[int, set[tuple[int, int]]] = {}
         verified: set[tuple[int, int, int]] = set()
         with path.open('rb') as file:
@@ -556,11 +562,15 @@ class TSKeyFrameSeeker:
             TSStreamInfo: オンデマンド探索に必要なストリーム情報
         """
 
-        packet_size = TSKeyFrameSeeker.__detectPacketSize(path)
+        packet_size, stream_start_offset = TSKeyFrameSeeker.__detectPacketSizeAndOffset(path)
         pat_parser = SectionParser(PATSection)
         pmt_parser = SectionParser(PMTSection)
         pmt_pid: int | None = None
-        aligned_start_offset = max(0, (start_offset // packet_size) * packet_size)
+        aligned_start_offset = TSKeyFrameSeeker.__alignToPacket(
+            max(start_offset, stream_start_offset),
+            packet_size,
+            stream_start_offset,
+        )
         max_packet_count = 300000 if max_scan_bytes is None else max(1, max_scan_bytes // packet_size)
 
         with path.open('rb') as file:
@@ -587,11 +597,17 @@ class TSKeyFrameSeeker:
                             continue
                         for stream_type, elementary_pid, _ in pmt:
                             if stream_type == 0x02:
-                                return TSStreamInfo(elementary_pid, pmt.PCR_PID, 'MPEG-2', packet_size)
+                                return TSStreamInfo(
+                                    elementary_pid, pmt.PCR_PID, 'MPEG-2', packet_size, stream_start_offset,
+                                )
                             if stream_type == 0x1B:
-                                return TSStreamInfo(elementary_pid, pmt.PCR_PID, 'H.264', packet_size)
+                                return TSStreamInfo(
+                                    elementary_pid, pmt.PCR_PID, 'H.264', packet_size, stream_start_offset,
+                                )
                             if stream_type == 0x24:
-                                return TSStreamInfo(elementary_pid, pmt.PCR_PID, 'H.265', packet_size)
+                                return TSStreamInfo(
+                                    elementary_pid, pmt.PCR_PID, 'H.265', packet_size, stream_start_offset,
+                                )
 
         raise RuntimeError(f'Video stream information was not found: {path}')
 
@@ -614,6 +630,8 @@ class TSKeyFrameSeeker:
         scanned_bytes = 0
 
         with path.open('rb') as file:
+            # 先頭 junk がある場合でも検出済みの物理パケット先頭から読む
+            file.seek(stream_info.stream_start_offset)
             while scanned_bytes < TSKeyFrameSeeker.MAX_KEYFRAME_SCAN_BYTES:
                 current_file_offset = file.tell()
                 packet = TSKeyFrameSeeker.normalizePacket(file.read(stream_info.packet_size), stream_info.packet_size)
@@ -716,9 +734,43 @@ class TSKeyFrameSeeker:
 
 
     @staticmethod
+    def __detectPacketSizeAndOffset(path: Path) -> tuple[int, int]:
+        """
+        TS パケットサイズと先頭 junk を除いた物理パケット先頭オフセットを推定する。
+
+        188-byte TS は各パケット先頭が sync (0x47)。
+        192-byte TTS は [4byte timestamp][188byte TS] なので、物理先頭から 4 バイト先が sync。
+        normalizePacket は 192 のとき先頭 4 バイトを捨てる前提のため、戻り値の
+        start_offset は常に「ファイル上のパケット境界」であり、sync 位置ではない。
+
+        Args:
+            path (Path): TS コンテナの録画ファイルパス
+
+        Returns:
+            tuple[int, int]: (packet_size, stream_start_offset)
+        """
+
+        with path.open('rb') as file:
+            head = file.read(8192)
+        for packet_size in (ts.PACKET_SIZE, 192):
+            # 192-byte TTS は timestamp 4 バイトの後ろに sync がある
+            sync_within_packet = 4 if packet_size == 192 else 0
+            for physical_start in range(packet_size):
+                if all(
+                    physical_start + sync_within_packet + packet_size * index < len(head) and
+                    head[physical_start + sync_within_packet + packet_size * index] == ts.SYNC_BYTE[0]
+                    for index in range(5)
+                ) is True:
+                    return (packet_size, physical_start)
+        return (ts.PACKET_SIZE, 0)
+
+
+    @staticmethod
     def __detectPacketSize(path: Path) -> int:
         """
-        TS パケットサイズを 188 バイトまたは 192 バイトから推定する
+        TS パケットサイズを 188 バイトまたは 192 バイトから推定する。
+
+        互換のため packet_size のみ返す。新規コードは __detectPacketSizeAndOffset を使う。
 
         Args:
             path (Path): TS コンテナの録画ファイルパス
@@ -727,17 +779,28 @@ class TSKeyFrameSeeker:
             int: 検出した TS パケットサイズ
         """
 
-        with path.open('rb') as file:
-            head = file.read(8192)
-        for packet_size in (ts.PACKET_SIZE, 192):
-            for start_offset in range(packet_size):
-                if all(
-                    start_offset + packet_size * index < len(head) and
-                    head[start_offset + packet_size * index] == ts.SYNC_BYTE[0]
-                    for index in range(5)
-                ) is True:
-                    return packet_size
-        return ts.PACKET_SIZE
+        packet_size, _start_offset = TSKeyFrameSeeker.__detectPacketSizeAndOffset(path)
+        return packet_size
+
+
+    @staticmethod
+    def __alignToPacket(offset: int, packet_size: int, stream_start_offset: int) -> int:
+        """
+        検出済み sync 位置を基準にファイルオフセットを TS パケット境界へ揃える。
+
+        Args:
+            offset (int): 揃えたい概算ファイル位置
+            packet_size (int): 188 または 192
+            stream_start_offset (int): 先頭 junk を除いた最初の sync 位置
+
+        Returns:
+            int: stream_start_offset 以上で packet 境界に揃えたオフセット
+        """
+
+        if offset <= stream_start_offset:
+            return stream_start_offset
+        relative = offset - stream_start_offset
+        return stream_start_offset + (relative // packet_size) * packet_size
 
 
     @staticmethod
@@ -782,7 +845,11 @@ class TSKeyFrameSeeker:
             tuple[int, int] | None: ファイル位置と PCR 90kHz 値
         """
 
-        aligned_offset = max(0, (start_offset // stream_info.packet_size) * stream_info.packet_size)
+        aligned_offset = TSKeyFrameSeeker.__alignToPacket(
+            start_offset,
+            stream_info.packet_size,
+            stream_info.stream_start_offset,
+        )
         scanned_bytes = 0
         with path.open('rb') as file:
             file.seek(aligned_offset)
@@ -894,7 +961,11 @@ class TSKeyFrameSeeker:
             _KeyFrameScanResult | None: 検出したキーフレーム情報
         """
 
-        aligned_start_offset = max(0, (start_offset // stream_info.packet_size) * stream_info.packet_size)
+        aligned_start_offset = TSKeyFrameSeeker.__alignToPacket(
+            start_offset,
+            stream_info.packet_size,
+            stream_info.stream_start_offset,
+        )
         parser = TSKeyFrameSeeker.createPESParser(stream_info.codec)
         pending_pes_start: int | None = None
         last_keyframe_before: tuple[int, int] | None = None
@@ -970,11 +1041,11 @@ class TSKeyFrameSeeker:
         first_pcr = TSKeyFrameSeeker.__readFirstPCRNear(
             path,
             stream_info,
-            0,
+            stream_info.stream_start_offset,
             TSKeyFrameSeeker.PCR_SEARCH_WINDOW_BYTES,
         )
         if first_pcr is None:
-            return 0
+            return stream_info.stream_start_offset
 
         first_offset, first_pcr_value = first_pcr
         target_pcr = first_pcr_value + round(playlist_start_seconds * ts.HZ)
@@ -982,7 +1053,13 @@ class TSKeyFrameSeeker:
         hi = max(first_offset, file_size - stream_info.packet_size)
 
         while hi - lo > TSKeyFrameSeeker.PCR_SEARCH_WINDOW_BYTES:
-            mid = ((lo + hi) // 2 // stream_info.packet_size) * stream_info.packet_size
+            mid = TSKeyFrameSeeker.__alignToPacket(
+                (lo + hi) // 2,
+                stream_info.packet_size,
+                stream_info.stream_start_offset,
+            )
+            if mid <= lo:
+                mid = lo + stream_info.packet_size
             mid_pcr = TSKeyFrameSeeker.__readFirstPCRNear(
                 path,
                 stream_info,
@@ -1033,7 +1110,7 @@ class TSKeyFrameSeeker:
         last_result: _KeyFrameScanResult | None = None
         for backtrack_bytes, max_scan_bytes in scan_attempts:
             # PCR は映像 PES と別 PID で流れるため、少し手前から映像 PES を読んで直前キーフレームを探す
-            scan_start_offset = max(0, pcr_offset - backtrack_bytes)
+            scan_start_offset = max(stream_info.stream_start_offset, pcr_offset - backtrack_bytes)
             result = TSKeyFrameSeeker.__findKeyFrameBefore(
                 path,
                 stream_info,

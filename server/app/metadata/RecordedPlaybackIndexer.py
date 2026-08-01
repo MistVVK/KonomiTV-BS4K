@@ -40,6 +40,75 @@ class RecordedPlaybackIndexAnalysisError(Exception):
         self.error_code = error_code
 
 
+# FFprobe compact writer が使う C 風 escape (\\| / \\\\ / \\n / \\r / \\t など)
+_FFPROBE_COMPACT_ESCAPES: dict[str, str] = {
+    'n': '\n',
+    'r': '\r',
+    't': '\t',
+    '\\': '\\',
+    '|': '|',
+    "'": "'",
+    '"': '"',
+    'b': '\b',
+    'f': '\f',
+}
+
+
+def splitFFprobeCompactFields(line: str) -> list[str]:
+    """
+    FFprobe compact writer の escape を解釈して field へ分割する。
+
+    compact 形式では `|` と `\\` が `\\|` / `\\\\` として escape され、
+    改行は `\\n` / `\\r` として埋め込まれる。単純な split('|') では壊れる。
+
+    Args:
+        line (str): compact 1 行 (または side_data セクション)
+
+    Returns:
+        list[str]: unescape 済みの field 一覧
+    """
+
+    fields: list[str] = []
+    current: list[str] = []
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if char == '\\' and index + 1 < len(line):
+            next_char = line[index + 1]
+            current.append(_FFPROBE_COMPACT_ESCAPES.get(next_char, next_char))
+            index += 2
+            continue
+        if char == '|':
+            fields.append(''.join(current))
+            current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    fields.append(''.join(current))
+    return fields
+
+
+def parseFFprobeCompactKeyValues(line: str) -> dict[str, str]:
+    """
+    compact 行を key=value 辞書へ変換する。
+
+    Args:
+        line (str): compact 形式の 1 セクション
+
+    Returns:
+        dict[str, str]: key と unescape 済み value
+    """
+
+    values: dict[str, str] = {}
+    for item in splitFFprobeCompactFields(line):
+        if '=' not in item:
+            continue
+        key, value = item.split('=', maxsplit=1)
+        values[key] = value
+    return values
+
+
 def _getAudioChannelLabel(channels: int, channel_layout: str | None) -> str:
     """実チャンネル数とFFprobeのlayoutから画面表示用ラベルを返す。"""
 
@@ -528,6 +597,16 @@ class RecordedPlaybackIndexer:
             )
             await cls.__markFailed(recorded_video_id, 'ProbeTimeout')
             return False
+        except asyncio.CancelledError:
+            # worker の cancel で communicate() だけを消すと FFprobe と pipe が残る。
+            # process を終了して stdout / stderr と wait を最後まで回収してから cancel を再送出する。
+            if process.returncode is None:
+                process.kill()
+            try:
+                await process.communicate()
+            except Exception:
+                pass
+            raise
         if process.returncode != 0:
             logging.warning(
                 '[RecordedPlaybackIndexer] FFprobe 8 failed. '
@@ -1313,14 +1392,12 @@ class RecordedPlaybackIndexer:
                 if raw_line == b'':
                     break
 
-                sections = raw_line.decode(errors='ignore').strip().split('|side_data|')
-                section_kind = sections[0].split('|', maxsplit=1)[0]
-                values = {
-                    key: value
-                    for item in sections[0].split('|')
-                    if '=' in item
-                    for key, value in [item.split('=', maxsplit=1)]
-                }
+                decoded_line = raw_line.decode(errors='ignore').strip()
+                # side_data 区切り自体も escape 対象になりうるが、FFprobe は固定トークンで出力する
+                sections = decoded_line.split('|side_data|')
+                section_fields = splitFFprobeCompactFields(sections[0])
+                section_kind = section_fields[0] if len(section_fields) > 0 else ''
+                values = parseFFprobeCompactKeyValues(sections[0])
                 if section_kind == 'stream':
                     cls.__applyDiscoveredStreamMetadata(
                         values,
@@ -1467,66 +1544,91 @@ class RecordedPlaybackIndexer:
             stderr=asyncio.subprocess.PIPE,
         )
         assert process.stdout is not None
+        stdout_reader = process.stdout
+        stderr_reader = process.stderr
+        assert stderr_reader is not None
+
+        async def DrainStderr() -> bytes:
+            stderr_tail = bytearray()
+            while chunk := await stderr_reader.read():
+                stderr_tail.extend(chunk)
+                if len(stderr_tail) > 64 * 1024:
+                    del stderr_tail[:-64 * 1024]
+            return bytes(stderr_tail)
+
+        stderr_task = asyncio.create_task(DrainStderr())
+
+        async def TerminateAndReapProcess() -> bytes:
+            """packet probeを終了し、両pipeをdrainしてから子processを回収する。"""
+
+            if process.returncode is None:
+                process.kill()
+            _, stderr_result = await asyncio.gather(
+                stdout_reader.read(),
+                stderr_task,
+                return_exceptions=True,
+            )
+            await process.wait()
+            return stderr_result if isinstance(stderr_result, bytes) else b''
+
         states: dict[int, tuple[float, float, AudioTrackTimelineTrack]] = {}
         ranges: list[tuple[float, float, AudioTrackTimelineTrack]] = []
-        while True:
-            try:
-                raw_line = await asyncio.wait_for(
-                    process.stdout.readline(),
-                    timeout=cls.FRAME_PROBE_INACTIVITY_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                process.kill()
-                _, stderr = await process.communicate()
-                logging.warning(
-                    '[RecordedPlaybackIndexer] FFprobe 8 audio packet scan timed out after no output. '
-                    f'[recorded_video_id: {recorded_video_id}, '
-                    f'stderr: {stderr.decode(errors="ignore").strip()}]'
-                )
-                raise RecordedPlaybackIndexAnalysisError('AudioPacketProbeTimeout')
-            if raw_line == b'':
-                break
-            values = {
-                key: value
-                for item in raw_line.decode(errors='ignore').strip().split('|')
-                if '=' in item
-                for key, value in [item.split('=', maxsplit=1)]
-            }
-            try:
-                stream_index = int(values['stream_index'])
-                pts_time = float(values['pts_time'])
-            except (KeyError, ValueError):
-                continue
-            if stream_index not in missing_stream_indexes:
-                continue
-            base_track = tracks_by_stream_index.get(stream_index)
-            if base_track is None:
-                continue
-            try:
-                packet_duration = max(0.0, float(values.get('duration_time') or 0.0))
-            except ValueError:
-                packet_duration = 0.0
-            if packet_duration == 0.0:
-                packet_duration = 1024 / int(base_track.get('sampling_rate') or 48_000)
-            packet_start = max(0.0, min(duration, pts_time - source_start_time))
-            packet_end = max(packet_start, min(duration, packet_start + packet_duration))
-            previous = states.get(stream_index)
-            if previous is None:
-                states[stream_index] = (
-                    packet_start,
-                    packet_end,
-                    AudioTrackTimelineTrack(**base_track),
-                )
-                continue
-            interval_start, previous_end, timeline_track = previous
-            if packet_start - previous_end > 1.0:
-                ranges.append((interval_start, previous_end, timeline_track))
-                states[stream_index] = (packet_start, packet_end, timeline_track)
-            else:
-                states[stream_index] = (interval_start, max(previous_end, packet_end), timeline_track)
+        try:
+            while True:
+                try:
+                    raw_line = await asyncio.wait_for(
+                        process.stdout.readline(),
+                        timeout=cls.FRAME_PROBE_INACTIVITY_TIMEOUT_SECONDS,
+                    )
+                except TimeoutError:
+                    stderr = await TerminateAndReapProcess()
+                    logging.warning(
+                        '[RecordedPlaybackIndexer] FFprobe 8 audio packet scan timed out after no output. '
+                        f'[recorded_video_id: {recorded_video_id}, '
+                        f'stderr: {stderr.decode(errors="ignore").strip()}]'
+                    )
+                    raise RecordedPlaybackIndexAnalysisError('AudioPacketProbeTimeout')
+                if raw_line == b'':
+                    break
+                values = parseFFprobeCompactKeyValues(raw_line.decode(errors='ignore').strip())
+                try:
+                    stream_index = int(values['stream_index'])
+                    pts_time = float(values['pts_time'])
+                except (KeyError, ValueError):
+                    continue
+                if stream_index not in missing_stream_indexes:
+                    continue
+                base_track = tracks_by_stream_index.get(stream_index)
+                if base_track is None:
+                    continue
+                try:
+                    packet_duration = max(0.0, float(values.get('duration_time') or 0.0))
+                except ValueError:
+                    packet_duration = 0.0
+                if packet_duration == 0.0:
+                    packet_duration = 1024 / int(base_track.get('sampling_rate') or 48_000)
+                packet_start = max(0.0, min(duration, pts_time - source_start_time))
+                packet_end = max(packet_start, min(duration, packet_start + packet_duration))
+                previous = states.get(stream_index)
+                if previous is None:
+                    states[stream_index] = (
+                        packet_start,
+                        packet_end,
+                        AudioTrackTimelineTrack(**base_track),
+                    )
+                    continue
+                interval_start, previous_end, timeline_track = previous
+                if packet_start - previous_end > 1.0:
+                    ranges.append((interval_start, previous_end, timeline_track))
+                    states[stream_index] = (packet_start, packet_end, timeline_track)
+                else:
+                    states[stream_index] = (interval_start, max(previous_end, packet_end), timeline_track)
+        except asyncio.CancelledError:
+            await TerminateAndReapProcess()
+            raise
 
-        stderr = await process.stderr.read() if process.stderr is not None else b''
         return_code = await process.wait()
+        stderr = await stderr_task
         if return_code != 0:
             logging.warning(
                 '[RecordedPlaybackIndexer] FFprobe 8 audio packet analysis failed. '
@@ -1741,12 +1843,7 @@ class RecordedPlaybackIndexer:
         mastering_display_metadata: dict[str, object] | None = None
         content_light_level: dict[str, object] | None = None
         for side_data_section in side_data_sections:
-            side_data = {
-                key: value
-                for item in side_data_section.split('|')
-                if '=' in item
-                for key, value in [item.split('=', maxsplit=1)]
-            }
+            side_data = parseFFprobeCompactKeyValues(side_data_section)
             if side_data.get('side_data_type') == 'Mastering display metadata':
                 mastering_display_metadata = dict(side_data)
             elif side_data.get('side_data_type') == 'Content light level metadata':

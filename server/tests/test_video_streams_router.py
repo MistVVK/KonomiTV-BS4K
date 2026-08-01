@@ -245,3 +245,62 @@ def test_metadata_analysis_blocks_index_enqueue(monkeypatch) -> None:
 
     assert index.state == 'Stale'
     assert enqueue_calls == []
+
+
+def test_session_id_format_and_admission_limits() -> None:
+    """session_id 形式と global/per-client 上限で 422/429 を返す。"""
+
+    original_global = RecordedFMP4Stream.MAX_GLOBAL_SESSIONS
+    original_per_client = RecordedFMP4Stream.MAX_SESSIONS_PER_CLIENT
+    original_instances = dict(RecordedFMP4Stream._instances)
+    original_clients = dict(RecordedFMP4Stream._session_client_keys)
+    RecordedFMP4Stream.MAX_GLOBAL_SESSIONS = 2
+    RecordedFMP4Stream.MAX_SESSIONS_PER_CLIENT = 1
+    RecordedFMP4Stream._instances.clear()
+    RecordedFMP4Stream._session_client_keys.clear()
+    try:
+        with pytest.raises(HTTPException) as invalid:
+            RecordedFMP4Stream.validateSessionId('short')
+        assert invalid.value.status_code == 422
+
+        # 既存 session 数を stubs で作り、admission 判定だけを検証する
+        RecordedFMP4Stream._instances['session01'] = object()  # type: ignore[assignment]
+        RecordedFMP4Stream._session_client_keys['session01'] = '10.0.0.1'
+
+        with pytest.raises(HTTPException) as per_client:
+            RecordedFMP4Stream.admitNewSession('session02', '10.0.0.1')
+        assert per_client.value.status_code == 429
+
+        RecordedFMP4Stream.admitNewSession('session02', '10.0.0.2')
+        RecordedFMP4Stream._instances['session02'] = object()  # type: ignore[assignment]
+        RecordedFMP4Stream._session_client_keys['session02'] = '10.0.0.2'
+
+        with pytest.raises(HTTPException) as global_limit:
+            RecordedFMP4Stream.admitNewSession('session03', '10.0.0.3')
+        assert global_limit.value.status_code == 429
+    finally:
+        RecordedFMP4Stream.MAX_GLOBAL_SESSIONS = original_global
+        RecordedFMP4Stream.MAX_SESSIONS_PER_CLIENT = original_per_client
+        RecordedFMP4Stream._instances.clear()
+        RecordedFMP4Stream._instances.update(original_instances)
+        RecordedFMP4Stream._session_client_keys.clear()
+        RecordedFMP4Stream._session_client_keys.update(original_clients)
+
+
+def test_encoder_wait_queue_returns_429_when_full() -> None:
+    """encoder waiters が上限を超えた場合は 429 になる。"""
+
+    async def Run() -> None:
+        original = RecordedFMP4Stream.MAX_ENCODER_WAITERS
+        RecordedFMP4Stream.MAX_ENCODER_WAITERS = 0
+        semaphore = asyncio.Semaphore(0)
+        try:
+            with pytest.raises(HTTPException) as ex_info:
+                async with RecordedFMP4Stream.acquireEncoderSlot(semaphore):
+                    pass
+            assert ex_info.value.status_code == 429
+        finally:
+            RecordedFMP4Stream.MAX_ENCODER_WAITERS = original
+            RecordedFMP4Stream._encoder_waiters = 0
+
+    asyncio.run(Run())

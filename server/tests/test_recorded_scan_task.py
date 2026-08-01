@@ -15,11 +15,26 @@ from app.constants import JST
 from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
-from app.metadata.RecordedScanTask import RecordedScanTask, RecordedVideoSummary
+from app.metadata.RecordedScanTask import (
+    FileRecordingInfo,
+    RecordedScanTask,
+    RecordedVideoSummary,
+)
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.models.RecordedVideo import RecordedVideo
+from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.ProcessLimiter import ProcessLimiter
+
+
+@pytest.fixture(autouse=True)
+def RunRecordedScanIOInline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """終了不能なhost ThreadPoolExecutorを避け、scannerの同期I/O本体だけを検証する。"""
+
+    async def RunInline(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr('app.metadata.RecordedScanTask.asyncio.to_thread', RunInline)
 
 
 def CreateSummary() -> RecordedVideoSummary:
@@ -37,6 +52,77 @@ def CreateSummary() -> RecordedVideoSummary:
     )
 
 
+@pytest.mark.parametrize('cpu_count', [1, 2, None])
+def test_process_limiter_always_grants_at_least_one_permit(
+    cpu_count: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """1論理CPU・CPU数不明でも外部処理を永久待機させない。"""
+
+    ProcessLimiter._semaphores.clear()  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr('app.utils.ProcessLimiter.psutil.cpu_count', lambda logical: cpu_count)
+
+    async def AcquirePermit() -> None:
+        semaphore = ProcessLimiter.getSemaphore(f'cpu-{cpu_count}')
+        await asyncio.wait_for(semaphore.acquire(), timeout=0.1)
+        semaphore.release()
+
+    asyncio.run(AcquirePermit())
+    ProcessLimiter._semaphores.clear()  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize('failure', ['exception', 'cancel'])
+def test_batch_scan_releases_running_flag_and_joins_pipeline_tasks(
+    failure: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DB例外・cancelのどちらでもflagを解除し、次の一括スキャンを受け付ける。"""
+
+    scan_task = object.__new__(RecordedScanTask)
+    scan_task._is_batch_scan_running = False
+    scan_task._batch_scan_pipeline_tasks = set()
+    pipeline_cancelled = False
+    invocation_count = 0
+    subtitle_cleanup_count = 0
+
+    async def RunPipeline() -> None:
+        nonlocal pipeline_cancelled
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            pipeline_cancelled = True
+            raise
+
+    async def RunBatchScanInternal(_self: RecordedScanTask) -> None:
+        nonlocal invocation_count
+        invocation_count += 1
+        if invocation_count == 1:
+            _self._batch_scan_pipeline_tasks.add(asyncio.create_task(RunPipeline()))
+            await asyncio.sleep(0)
+            if failure == 'cancel':
+                raise asyncio.CancelledError
+            raise OSError('simulated scan failure')
+
+    async def CleanupOrphanedSubtitleCaches() -> None:
+        nonlocal subtitle_cleanup_count
+        subtitle_cleanup_count += 1
+
+    monkeypatch.setattr(RecordedScanTask, '_RecordedScanTask__runBatchScan', RunBatchScanInternal)
+    monkeypatch.setattr(RecordedSubtitleStream, 'cleanupOrphanedCaches', CleanupOrphanedSubtitleCaches)
+
+    async def Verify() -> None:
+        expected_error = asyncio.CancelledError if failure == 'cancel' else OSError
+        with pytest.raises(expected_error):
+            await scan_task.runBatchScan()
+        assert scan_task._is_batch_scan_running is False
+        assert scan_task._batch_scan_pipeline_tasks == set()
+        assert pipeline_cancelled is True
+        await scan_task.runBatchScan()
+        assert subtitle_cleanup_count == 1
+
+    asyncio.run(Verify())
+
+
 def test_recorded_folder_watch_filter_ignores_cm_workspace_exact_component() -> None:
     """watchfiles段階でCM workspaceの大量イベントを落とし、似た名前は監視対象に残す。"""
 
@@ -50,6 +136,10 @@ def test_recorded_folder_watch_filter_ignores_cm_workspace_exact_component() -> 
         Change.modified,
         f'/recordings/{CMAnalysisWorkspace.ROOT_DIRECTORY_NAME}-copy/program.mkv',
     ) is True
+    assert watch_filter(
+        Change.modified,
+        '/recordings/.konomitv-cm-analysis/157-token/normalized-media.cmwork',
+    ) is False
 
 
 def test_batch_path_iterator_prunes_and_recovers_workspace_roots(
@@ -63,6 +153,11 @@ def test_batch_path_iterator_prunes_and_recovers_workspace_roots(
     workspace_job.mkdir(parents=True)
     temporary_media = workspace_job / 'prepared.cmwork.mkv'
     temporary_media.write_bytes(b'temporary')
+    legacy_workspace_root = nested_folder / '.konomitv-cm-analysis'
+    legacy_workspace_job = legacy_workspace_root / '2-deadbeef'
+    legacy_workspace_job.mkdir(parents=True)
+    legacy_temporary_media = legacy_workspace_job / 'legacy-prepared.cmwork.mkv'
+    legacy_temporary_media.write_bytes(b'temporary')
     recording = nested_folder / 'program.ts'
     recording.write_bytes(b'recording')
     cleaned_parents: list[set[pathlib.Path]] = []
@@ -88,7 +183,10 @@ def test_batch_path_iterator_prunes_and_recovers_workspace_roots(
     assert workspace_root not in paths
     assert workspace_job not in paths
     assert temporary_media not in paths
-    assert cleaned_parents == [{nested_folder}]
+    assert legacy_workspace_root not in paths
+    assert legacy_workspace_job not in paths
+    assert legacy_temporary_media not in paths
+    assert cleaned_parents == [{nested_folder}, {nested_folder}]
 
 
 def test_batch_scan_recovers_workspace_next_to_external_symlink_target_once(
@@ -460,8 +558,14 @@ def test_recorded_folder_watcher_routes_all_konomitv_bs4k_yaml_events(
         del path
         return False
 
+    async def ResolveRecordedPath(path: anyio.Path) -> anyio.Path:
+        """ThreadPoolExecutorへ依存せず、watcher routingだけを検証する。"""
+
+        return path
+
     monkeypatch.setattr('app.metadata.RecordedScanTask.awatch', Watch)
     monkeypatch.setattr(anyio.Path, 'is_dir', IsDirectory)
+    monkeypatch.setattr(RecordedScanTask, 'resolveRecordedPath', staticmethod(ResolveRecordedPath))
     monkeypatch.setattr(
         RecordedScanTask,
         '_RecordedScanTask__checkRecordingCompletion',
@@ -480,3 +584,255 @@ def test_recorded_folder_watcher_routes_all_konomitv_bs4k_yaml_events(
     asyncio.run(asyncio.wait_for(scan_task.watchRecordedFolders(), timeout=1.0))
 
     assert handled_paths == [chapter_path]
+
+
+@pytest.mark.parametrize(
+    ('path', 'pattern', 'expected'),
+    [
+        ('/recordings/temp', '/recordings/temp', True),
+        ('/recordings/temp/', '/recordings/temp', True),
+        ('/recordings/temp/file.ts', '/recordings/temp', True),
+        ('/recordings/temporary', '/recordings/temp', False),
+        ('/recordings/temporary/file.ts', '/recordings/temp', False),
+        ('/recordings/temp-backup', '/recordings/temp', False),
+        ('/recordings/other', '/recordings/temp', False),
+    ],
+)
+def test_exclude_scan_paths_respect_path_component_boundary(path: str, pattern: str, expected: bool) -> None:
+    """exact / child / prefix sibling / trailing slash を境界付き除外で検証する。"""
+
+    assert RecordedScanTask.isPathExcludedByPatterns(path, [pattern]) is expected
+
+
+def test_exclude_scan_paths_empty_pattern_never_matches() -> None:
+    """空パターンは全パス除外にならないこと。"""
+
+    assert RecordedScanTask.isPathExcludedByPatterns('/recordings/a.ts', ['']) is False
+    assert RecordedScanTask.isPathExcludedByPatterns('/recordings/a.ts', ['   ']) is False
+
+
+def test_resolve_recorded_path_rebases_host_absolute_symlink(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Docker-like namespace で host absolute symlink を /host-rootfs へ rebase する。"""
+
+    host_root = tmp_path / 'host-rootfs'
+    real_dir = host_root / 'mnt' / 'archive'
+    real_dir.mkdir(parents=True)
+    real_file = real_dir / 'program.ts'
+    real_file.write_bytes(b'ts')
+
+    link_dir = tmp_path / 'recorded'
+    link_dir.mkdir()
+    link_path = link_dir / 'program.ts'
+    # host 絶対 path を指す symlink（コンテナ root 基準だと存在しない）
+    link_path.symlink_to('/mnt/archive/program.ts')
+
+    monkeypatch.setattr(RecordedScanTask, 'DOCKER_HOST_ROOTFS', host_root)
+
+    resolved = asyncio.run(RecordedScanTask.resolveRecordedPath(anyio.Path(link_path)))
+    assert pathlib.Path(str(resolved)).resolve() == real_file.resolve()
+
+
+def test_resolve_recorded_path_keeps_broken_and_relative_symlink(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """broken / relative / cycle を安全に扱うこと。"""
+
+    host_root = tmp_path / 'host-rootfs'
+    host_root.mkdir()
+    monkeypatch.setattr(RecordedScanTask, 'DOCKER_HOST_ROOTFS', host_root)
+
+    base = tmp_path / 'links'
+    base.mkdir()
+    relative_target = base / 'real.ts'
+    relative_target.write_bytes(b'x')
+    relative_link = base / 'relative.ts'
+    relative_link.symlink_to('real.ts')
+
+    broken_link = base / 'broken.ts'
+    broken_link.symlink_to('/does/not/exist.ts')
+
+    cycle_a = base / 'cycle-a.ts'
+    cycle_b = base / 'cycle-b.ts'
+    cycle_a.symlink_to(cycle_b)
+    cycle_b.symlink_to(cycle_a)
+
+    relative_resolved = asyncio.run(RecordedScanTask.resolveRecordedPath(anyio.Path(relative_link)))
+    assert pathlib.Path(str(relative_resolved)).resolve() == relative_target.resolve()
+
+    broken_resolved = asyncio.run(RecordedScanTask.resolveRecordedPath(anyio.Path(broken_link)))
+    assert str(broken_resolved) == str(broken_link) or not pathlib.Path(str(broken_resolved)).exists()
+
+    cycle_resolved = asyncio.run(RecordedScanTask.resolveRecordedPath(anyio.Path(cycle_a)))
+    # cycle は例外にせず何らかの path を返す
+    assert str(cycle_resolved)
+
+
+def test_reconciliation_interval_is_900_seconds() -> None:
+    """NFS/CIFS 向け reconciliation 間隔が 900 秒であること。"""
+
+    assert RecordedScanTask.RECONCILIATION_INTERVAL_SECONDS == 900
+
+
+def test_periodic_reconciliation_registers_without_watcher_and_skips_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """watcher event なしでも次周期の reconciliation で batch scan が走り、batch 中は skip すること。"""
+
+    task = RecordedScanTask.__new__(RecordedScanTask)
+    task._is_running = True
+    task._is_batch_scan_running = False
+    scan_calls: list[str] = []
+    skip_logs: list[str] = []
+    sleep_count = 0
+
+    async def FakeSleep(_seconds: float) -> None:
+        nonlocal sleep_count
+        sleep_count += 1
+        # 1 周期目: batch 中で skip、2 周期目: scan 実行、3 周期目で停止
+        if sleep_count == 1:
+            task._is_batch_scan_running = True
+        elif sleep_count == 2:
+            task._is_batch_scan_running = False
+        elif sleep_count >= 3:
+            task._is_running = False
+
+    async def FakeBatchScan() -> None:
+        scan_calls.append('scan')
+
+    def CaptureDebug(message: str, *args: Any, **kwargs: Any) -> None:
+        skip_logs.append(message % args if args else message)
+
+    monkeypatch.setattr(asyncio, 'sleep', FakeSleep)
+    monkeypatch.setattr(task, 'runBatchScan', FakeBatchScan)
+    # Config 未初期化でも通るよう logging を差し替える
+    monkeypatch.setattr(logging, 'info', lambda *args, **kwargs: None)
+    monkeypatch.setattr(logging, 'debug', CaptureDebug)
+    monkeypatch.setattr(logging, 'error', lambda *args, **kwargs: None)
+
+    asyncio.run(task._RecordedScanTask__runPeriodicReconciliation())  # pyright: ignore[reportPrivateUsage]
+
+    # batch 中の 1 周期は skip され、batch 終了後の 1 回だけ scan される
+    assert scan_calls == ['scan']
+    assert any('Skipping periodic reconciliation' in message for message in skip_logs)
+    assert sleep_count >= 3
+
+
+def test_recording_completion_uses_snapshot_and_defers_replaced_or_added_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stat()中の追加・削除・差し替えで巡回を壊さず、新しいentryを次周期に処理する。"""
+
+    scan_task = object.__new__(RecordedScanTask)
+    first_path = anyio.Path('/recordings/first.ts')
+    removed_path = anyio.Path('/recordings/removed.ts')
+    added_path = anyio.Path('/recordings/added.ts')
+    old_timestamp = datetime.now(tz=JST) - timedelta(minutes=5)
+    first_original = FileRecordingInfo(old_timestamp, old_timestamp, 100, None)
+    removed_info = FileRecordingInfo(old_timestamp, old_timestamp, 200, None)
+    first_replacement = FileRecordingInfo(old_timestamp, old_timestamp, 101, None)
+    added_info = FileRecordingInfo(old_timestamp, old_timestamp, 300, None)
+    scan_task._recording_files = {
+        first_path: first_original,
+        removed_path: removed_info,
+    }
+    scan_task._is_running = True
+    mutation_performed = False
+    sleep_count = 0
+    processed_paths: list[anyio.Path] = []
+
+    async def Stat(path: anyio.Path) -> SimpleNamespace:
+        nonlocal mutation_performed
+        if path == first_path and mutation_performed is False:
+            mutation_performed = True
+            # await stat()中にwatcherが既存entryを差し替え、別entryを削除・追加する競合を再現する。
+            scan_task._recording_files[first_path] = first_replacement
+            scan_task._recording_files.pop(removed_path)
+            scan_task._recording_files[added_path] = added_info
+        expected_sizes = {
+            first_path: 101,
+            removed_path: 200,
+            added_path: 300,
+        }
+        return SimpleNamespace(st_mtime=old_timestamp.timestamp(), st_size=expected_sizes[path])
+
+    async def IsFileExists(_path: anyio.Path) -> bool:
+        return True
+
+    async def ProcessRecordedFile(path: anyio.Path) -> None:
+        processed_paths.append(path)
+
+    async def Sleep(_seconds: float) -> None:
+        nonlocal sleep_count
+        sleep_count += 1
+        # 1周期目はsnapshot競合を処理し、2周期目で新しいentryを完了させて停止する。
+        if sleep_count >= 2:
+            scan_task._is_running = False
+
+    monkeypatch.setattr(anyio.Path, 'stat', Stat)
+    monkeypatch.setattr(scan_task, 'isFileExists', IsFileExists)
+    monkeypatch.setattr(scan_task, 'processRecordedFile', ProcessRecordedFile)
+    monkeypatch.setattr(asyncio, 'sleep', Sleep)
+
+    asyncio.run(scan_task._RecordedScanTask__checkRecordingCompletion())  # pyright: ignore[reportPrivateUsage]
+
+    assert mutation_performed is True
+    assert processed_paths == [first_path, added_path]
+    assert removed_path not in processed_paths
+    assert scan_task._recording_files == {}
+    assert sleep_count == 2
+
+
+def test_file_lock_registry_tracks_holder_waiters_cancel_and_unique_paths() -> None:
+    """holder・waiter・cancel後に同一entryを保ち、最後の解放後はregistryを空へ戻す。"""
+
+    scan_task = object.__new__(RecordedScanTask)
+    target_path = anyio.Path('/recordings/shared.ts')
+
+    async def Run() -> None:
+        scan_task._file_locks = {}
+        scan_task._file_locks_dict_lock = asyncio.Lock()
+        holder_entered = asyncio.Event()
+        release_holder = asyncio.Event()
+        successful_waiter_entered = asyncio.Event()
+
+        async def Holder() -> None:
+            async with scan_task._RecordedScanTask__fileLock(target_path):  # pyright: ignore[reportPrivateUsage]
+                holder_entered.set()
+                await release_holder.wait()
+
+        async def CancelledWaiter() -> None:
+            async with scan_task._RecordedScanTask__fileLock(target_path):  # pyright: ignore[reportPrivateUsage]
+                raise AssertionError('cancelled waiter acquired the lock unexpectedly')
+
+        async def SuccessfulWaiter() -> None:
+            async with scan_task._RecordedScanTask__fileLock(target_path):  # pyright: ignore[reportPrivateUsage]
+                successful_waiter_entered.set()
+
+        holder_task = asyncio.create_task(Holder())
+        await holder_entered.wait()
+        cancelled_waiter_task = asyncio.create_task(CancelledWaiter())
+        successful_waiter_task = asyncio.create_task(SuccessfulWaiter())
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        entry = scan_task._file_locks[target_path]
+        assert entry.reference_count == 3
+        assert entry.lock.locked() is True
+
+        cancelled_waiter_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter_task
+        assert scan_task._file_locks[target_path] is entry
+        assert entry.reference_count == 2
+
+        release_holder.set()
+        await holder_task
+        await successful_waiter_task
+        assert successful_waiter_entered.is_set() is True
+        assert scan_task._file_locks == {}
+
+        # 大量の一意pathを順次処理してもregistryが単調増加しないことを確認する。
+        for index in range(100):
+            unique_path = anyio.Path(f'/recordings/unique-{index}.ts')
+            async with scan_task._RecordedScanTask__fileLock(unique_path):  # pyright: ignore[reportPrivateUsage]
+                assert scan_task._file_locks[unique_path].reference_count == 1
+            assert scan_task._file_locks == {}
+
+    asyncio.run(Run())

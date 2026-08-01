@@ -63,15 +63,27 @@ class RecordedFMP4CacheManager:
         r'(?:video-init-\d+\.mp4|video-\d+\.m4s|audio-[A-Za-z0-9_-]+-\d+-init\.mp4|'
         r'audio-[A-Za-z0-9_-]+-\d+\.m4s)(?:\.tmp-[0-9a-f-]+)?$',
     )
+    # bd4e0b2c のnamespace移行前に生成された既知形式だけをmigration cleanup対象にする。
+    # layoutやsuffixの未知形式まで広げると第三者ファイルを所有物と誤認するため、旧v1へ完全固定する。
+    _LEGACY_FILE_PATTERN: ClassVar[re.Pattern[str]] = re.compile(
+        r'^\.konomitv-fmp4-v1-\d+-[0-9a-f]+-[0-9a-f]{24}-'
+        r'(?:video-init-\d+\.mp4|video-\d+\.m4s|audio-[A-Za-z0-9_-]+-\d+-init\.mp4|'
+        r'audio-[A-Za-z0-9_-]+-\d+\.m4s)(?:\.tmp-[0-9a-f-]+)?$',
+    )
     _references: ClassVar[dict[str, set[str]]] = {}
     _release_tasks: ClassVar[dict[str, asyncio.Task[None]]] = {}
     _locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    # writeAtomic() が open/fsync 中の一時 path を保護し、watcher が途中 unlink しないようにする
+    _in_progress_paths: ClassVar[set[str]] = set()
 
     @classmethod
     def isCacheFileName(cls, file_name: str) -> bool:
-        """ファイル名がKonomiTV-BS4K管理下のfMP4予約形式と完全一致するかを返す。"""
+        """ファイル名が現行または既知legacyのfMP4予約形式と完全一致するかを返す。"""
 
-        return cls._FILE_PATTERN.fullmatch(file_name) is not None
+        return (
+            cls._FILE_PATTERN.fullmatch(file_name) is not None
+            or cls._LEGACY_FILE_PATTERN.fullmatch(file_name) is not None
+        )
 
     @staticmethod
     def getCacheFolder(recorded_video: RecordedVideo) -> Path:
@@ -111,10 +123,18 @@ class RecordedFMP4CacheManager:
     async def writeAtomic(cls, destination: Path, data: bytes) -> None:
         """同じディレクトリの一時ファイルをfsync後、完成パスへatomic renameする。"""
 
-        if cls.isCacheFileName(destination.name) is False:
+        # migration cleanupで認識する旧prefixを新規生成へ再利用させず、書込みは現行namespaceへ限定する。
+        if cls._FILE_PATTERN.fullmatch(destination.name) is None:
             raise ValueError(f'Unmanaged fMP4 cache path: {destination}')
         await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
         temporary_path = destination.with_name(f'{destination.name}.tmp-{uuid.uuid4()}')
+        temporary_key = str(temporary_path)
+        destination_key = str(destination)
+
+        # open 中の tmp と rename 先 path を in-progress として保護する
+        ## 参照表は完成 path の session 参照しか持たないため、書き込み中 tmp は別 set で守る
+        cls._in_progress_paths.add(temporary_key)
+        cls._in_progress_paths.add(destination_key)
 
         def WriteAndReplace() -> None:
             """イベントループを塞がずキャッシュを書き込み、ディレクトリエントリまで同期する。"""
@@ -133,6 +153,8 @@ class RecordedFMP4CacheManager:
         try:
             await asyncio.to_thread(WriteAndReplace)
         finally:
+            cls._in_progress_paths.discard(temporary_key)
+            cls._in_progress_paths.discard(destination_key)
             await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
 
     @classmethod
@@ -198,7 +220,8 @@ class RecordedFMP4CacheManager:
         if cls.isCacheFileName(cache_path.name) is False:
             return
         cache_key = str(cache_path)
-        if cache_key in cls._references:
+        # session 参照中、または atomic write 進行中の path は削除しない
+        if cache_key in cls._references or cache_key in cls._in_progress_paths:
             return
         try:
             await asyncio.to_thread(cache_path.unlink, missing_ok=True)

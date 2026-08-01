@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import tempfile
 import uuid
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import ClassVar, Literal, cast
+from typing import ClassVar, Literal
 
 from fastapi import HTTPException, status
 
@@ -18,6 +19,12 @@ from app.config import Config
 from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
 from app.models.RecordedProgram import RecordedProgram
 from app.schemas import AudioTrack
+from app.streams.KonomiTVBS4KPlaybackEncoding import (
+    KONOMITV_BS4K_VIDEO_BITRATE_MINIMUM_GAP_KBPS,
+    KONOMITV_BS4K_VIDEO_BITRATE_RATIOS_FROM_HEVC,
+    KonomiTVBS4KPlaybackVideoBitrate,
+    ResolveKonomiTVBS4KPlaybackVideoBitrate,
+)
 from app.streams.RecordedEncodingCodecs import AudioCodec, VideoCodec
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager, RecordedFMP4Variant
 from app.streams.RecordedPlaybackCapabilities import (
@@ -28,6 +35,7 @@ from app.streams.RecordedPlaybackCapabilities import (
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.StreamEncodingOptions import StreamEncodingOptions
 from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
+from app.utils.HLSText import sanitizeHLSQuotedString
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,12 +54,7 @@ class RecordedFMP4Segment:
     transcoded_audio_sample_count: int | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class RecordedVideoBitrate:
-    """録画映像エンコードに適用する指定ビットレートと最大ビットレートを表す。"""
-
-    video_bitrate: str
-    video_bitrate_max: str
+RecordedVideoBitrate = KonomiTVBS4KPlaybackVideoBitrate
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +103,15 @@ class RecordedFMP4Stream:
     _cpu_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
     _gpu_semaphores: ClassVar[dict[str, asyncio.Semaphore]] = {}
     _instances: ClassVar[dict[str, RecordedFMP4Stream]] = {}
+    # session_id -> 接続元識別子（IP 等）。per-client 上限判定に使う。
+    _session_client_keys: ClassVar[dict[str, str]] = {}
+    # encoder semaphore 待ち行列の長さ。concurrency 上限とは別の admission 用カウンタ。
+    _encoder_waiters: ClassVar[int] = 0
+    # クライアントが発行する session_id の形式・長さ（UUID 先頭 8 hex 以上を想定）。
+    SESSION_ID_PATTERN: ClassVar[re.Pattern[str]] = re.compile(r'^[0-9A-Za-z_-]{8,64}$')
+    MAX_GLOBAL_SESSIONS: ClassVar[int] = 64
+    MAX_SESSIONS_PER_CLIENT: ClassVar[int] = 8
+    MAX_ENCODER_WAITERS: ClassVar[int] = 32
     SESSION_TIMEOUT: ClassVar[float] = 30.0
     SEEK_PREROLL_SECONDS: ClassVar[float] = 10.0
     AAC_ENCODER_DELAY_SAMPLES: ClassVar[int] = 1024
@@ -118,13 +130,9 @@ class RecordedFMP4Stream:
     )
     # AVC / HEVC の既存調整値を保ちながら、VP9 と AV1 は HEVC より段階的に帯域を抑える。
     # ユーザーが選んだコーデックごとの通信量の差を明確にしつつ、全画質で同じ比率を適用する。
-    VIDEO_BITRATE_RATIOS_FROM_HEVC: ClassVar[dict[VideoCodec, tuple[int, int]]] = {
-        'hevc': (100, 100),
-        'vp9': (90, 100),
-        'av1': (70, 100),
-    }
+    VIDEO_BITRATE_RATIOS_FROM_HEVC = KONOMITV_BS4K_VIDEO_BITRATE_RATIOS_FROM_HEVC
     # 240p の既存最大値は AVC / HEVC とも 650K のため、録画再生だけ最低 50K の差を確保する。
-    VIDEO_BITRATE_MINIMUM_GAP_KBPS: ClassVar[int] = 50
+    VIDEO_BITRATE_MINIMUM_GAP_KBPS = KONOMITV_BS4K_VIDEO_BITRATE_MINIMUM_GAP_KBPS
 
     # セッションを識別し、ルーターの後続API要求とキャッシュ参照に利用する。
     session_id: str
@@ -154,12 +162,18 @@ class RecordedFMP4Stream:
         quality: QUALITY_TYPES,
         encoding_options: StreamEncodingOptions | None = None,
         is_new_session_allowed: bool = False,
+        client_key: str = 'unknown',
     ) -> RecordedFMP4Stream:
         """session ID単位で単一の新録画視聴セッションを返す。"""
+
+        # 既存・新規を問わず session_id 形式を先に検査する
+        cls.validateSessionId(session_id)
 
         if session_id not in cls._instances:
             if is_new_session_allowed is False or encoding_options is None:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session does not exist')
+            # 新規作成時だけ global / per-client 上限で admission control する
+            cls.admitNewSession(session_id, client_key)
             instance = super().__new__(cls)
             instance.session_id = session_id
             instance.recorded_program = recorded_program
@@ -175,6 +189,7 @@ class RecordedFMP4Stream:
                 lambda: asyncio.create_task(instance.__destroyIfIdle()),
             )
             cls._instances[session_id] = instance
+            cls._session_client_keys[session_id] = client_key
         instance = cls._instances[session_id]
         if instance.recorded_program.id != recorded_program.id or instance.quality != quality:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session conditions mismatch')
@@ -255,7 +270,7 @@ class RecordedFMP4Stream:
 
     @classmethod
     def getVideoBitrate(cls, quality: QUALITY_TYPES, codec: VideoCodec) -> RecordedVideoBitrate:
-        """録画画質と映像コーデックから指定値・最大値を解決する。
+        """共通画質と映像コーデックから指定値・最大値を解決する。
 
         Args:
             quality: 解像度・フレームレートを表す既存画質キー。
@@ -265,46 +280,100 @@ class RecordedFMP4Stream:
             FFmpeg と HLS マスターで共有するコーデック別ビットレート。
         """
 
-        # QUALITY はライブと録画で共用されているため定義自体は変更せず、同じ解像度の
-        # AVC / HEVC ペアを録画専用ポリシーの基準値として利用する。
-        quality_without_codec = quality.removesuffix('-hevc')
-        avc_quality_key = cast(QUALITY_TYPES, quality_without_codec)
-        hevc_quality_key = cast(QUALITY_TYPES, f'{quality_without_codec}-hevc')
-        if avc_quality_key not in QUALITY or hevc_quality_key not in QUALITY:
-            raise ValueError(f'Video bitrate is not defined for quality: {quality}')
-        avc_quality = QUALITY[avc_quality_key]
-        hevc_quality = QUALITY[hevc_quality_key]
+        return ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, codec)
 
-        def ParseKbps(value: str) -> int:
-            """QUALITY の Kbps 文字列を整数へ変換する。"""
+    @classmethod
+    def validateSessionId(cls, session_id: str) -> None:
+        """
+        session_id の形式と長さを検査し、不正なら 422 を送出する。
 
-            if value.endswith('K') is False:
-                raise ValueError(f'Invalid video bitrate: {value}')
-            return int(value[:-1])
+        Args:
+            session_id (str): クライアントが発行した視聴セッション ID
 
-        avc_bitrate_kbps = ParseKbps(avc_quality.video_bitrate)
-        avc_bitrate_max_kbps = ParseKbps(avc_quality.video_bitrate_max)
-        if codec == 'avc':
-            return RecordedVideoBitrate(
-                video_bitrate = f'{avc_bitrate_kbps}K',
-                video_bitrate_max = f'{avc_bitrate_max_kbps}K',
+        Returns:
+            None
+        """
+
+        if cls.SESSION_ID_PATTERN.fullmatch(session_id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail='Invalid session_id format or length',
             )
 
-        # HEVC は既存値を維持する。ただし AVC と同値になる端点だけは 50K 下へ制限し、
-        # 指定値・最大値の双方で AV1 < VP9 < HEVC < AVC を厳密に成立させる。
-        hevc_bitrate_kbps = min(
-            ParseKbps(hevc_quality.video_bitrate),
-            avc_bitrate_kbps - cls.VIDEO_BITRATE_MINIMUM_GAP_KBPS,
-        )
-        hevc_bitrate_max_kbps = min(
-            ParseKbps(hevc_quality.video_bitrate_max),
-            avc_bitrate_max_kbps - cls.VIDEO_BITRATE_MINIMUM_GAP_KBPS,
-        )
-        ratio_numerator, ratio_denominator = cls.VIDEO_BITRATE_RATIOS_FROM_HEVC[codec]
-        return RecordedVideoBitrate(
-            video_bitrate = f'{hevc_bitrate_kbps * ratio_numerator // ratio_denominator}K',
-            video_bitrate_max = f'{hevc_bitrate_max_kbps * ratio_numerator // ratio_denominator}K',
-        )
+    @classmethod
+    def admitNewSession(cls, session_id: str, client_key: str) -> None:
+        """
+        新規 session の global / per-client 上限を検査し、超過なら 429 を送出する。
+
+        Args:
+            session_id (str): これから作成する視聴セッション ID
+            client_key (str): 接続元識別子（通常はクライアント IP）
+
+        Returns:
+            None
+        """
+
+        if len(cls._instances) >= cls.MAX_GLOBAL_SESSIONS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail='Too many active recorded playback sessions',
+            )
+        client_session_count = sum(1 for key in cls._session_client_keys.values() if key == client_key)
+        if client_session_count >= cls.MAX_SESSIONS_PER_CLIENT:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail='Too many active recorded playback sessions for this client',
+            )
+
+    @classmethod
+    @asynccontextmanager
+    async def acquireEncoderSlot(cls, semaphore: asyncio.Semaphore) -> AsyncGenerator[None]:
+        """
+        encoder 用 semaphore を取得する。待ち行列が上限を超える場合は 429 にする。
+
+        Args:
+            semaphore (asyncio.Semaphore): CPU/GPU エンコード同時実行制限
+
+        Returns:
+            AsyncGenerator[None]: 取得中コンテキスト
+        """
+
+        # locked かつ waiters が上限以上なら、これ以上待たせず拒否する
+        if semaphore.locked() is True and cls._encoder_waiters >= cls.MAX_ENCODER_WAITERS:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail='Recorded encoder wait queue is full',
+            )
+        cls._encoder_waiters += 1
+        try:
+            await semaphore.acquire()
+        finally:
+            cls._encoder_waiters -= 1
+        try:
+            yield
+        finally:
+            semaphore.release()
+
+    @staticmethod
+    async def __communicateSubprocess(
+        process: asyncio.subprocess.Process,
+    ) -> tuple[bytes, bytes]:
+        """子プロセスをdrainし、キャンセルや例外時も必ず終了・回収する。"""
+
+        try:
+            stdout, stderr = await process.communicate()
+            return stdout or b'', stderr or b''
+        except BaseException:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    await process.wait()
+                except (ProcessLookupError, OSError):
+                    pass
+            raise
 
     async def destroy(self) -> None:
         """セッション参照を解放し、キャッシュの60秒削除猶予を開始する。"""
@@ -313,6 +382,7 @@ class RecordedFMP4Stream:
             return
         self._destroy_handle.cancel()
         self._instances.pop(self.session_id, None)
+        self._session_client_keys.pop(self.session_id, None)
         for cache_path in self._referenced_paths:
             RecordedFMP4CacheManager.release(cache_path, self.session_id)
         self._referenced_paths.clear()
@@ -344,14 +414,12 @@ class RecordedFMP4Stream:
 
         self.keepAlive()
         cache_key = cache_key or uuid.uuid4().hex[:8]
-        video_bitrate = self.getVideoBitrate(self.quality, self.encoding_options.video_codec)
-        bandwidth = int(video_bitrate.video_bitrate_max.removesuffix('K')) * 1000
         lines = ['#EXTM3U', '#EXT-X-VERSION:7']
         renditions = self.getAudioRenditions()
         for index, rendition in enumerate(renditions):
             default = 'YES' if index == 0 else 'NO'
-            language = rendition.language.replace('"', '')
-            name = rendition.name.replace('"', '')
+            language = sanitizeHLSQuotedString(rendition.language, default='und')
+            name = sanitizeHLSQuotedString(rendition.name, default=f'Audio {index + 1}')
             channels = self.__getMaximumDeclaredAudioRenditionChannelCount(rendition)
             channels_attribute = f',CHANNELS="{channels}"' if channels is not None else ''
             lines.append(
@@ -366,13 +434,53 @@ class RecordedFMP4Stream:
             if subtitle_stream.getTrackKind(track['index']) != 'Text':
                 continue
             subtitle_group_enabled = True
-            name = (track.get('title') or track.get('language') or f'Subtitle {track["index"]}').replace('"', '')
+            name = sanitizeHLSQuotedString(
+                track.get('title') or track.get('language') or f'Subtitle {track["index"]}',
+                default=f'Subtitle {track["index"]}',
+            )
+            language = sanitizeHLSQuotedString(track.get('language'), default='und')
             lines.append(
                 '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subtitles",'
-                f'NAME="{name}",DEFAULT=NO,AUTOSELECT=YES,LANGUAGE="{track.get("language") or "und"}",'
+                f'NAME="{name}",DEFAULT=NO,AUTOSELECT=YES,LANGUAGE="{language}",'
                 f'URI="subtitle/{track["index"]}/playlist?session_id={self.session_id}&cache_key={cache_key}'
                 f'&{self.getCodecQuery()}"'
             )
+
+        # 音声のみ録画は黒映像を生成せず、主音声のfMP4 playlistをmaster variantとして直接返す。
+        # URL queryの映像条件は既存APIとの互換placeholderとして維持するが、映像init / FFmpegは呼ばない。
+        if getattr(self.recorded_program.recorded_video, 'has_video', True) is False:
+            if len(renditions) == 0 or len(self._segments) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail='Audio rendition could not be generated',
+                )
+            primary_rendition = renditions[0]
+            audio_init = await self.getAudioInitSegment(primary_rendition.id, self._segments[0].sequence)
+            audio_codec_string = self.extractAudioCodecString(audio_init) if audio_init is not None else None
+            if audio_codec_string is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail={
+                        'code': 'CodecMismatch',
+                        'message': 'The generated audio initialization segment has no supported codec configuration.',
+                    },
+                )
+            stream_attributes = [
+                f'BANDWIDTH={self.__getAudioBandwidth(renditions)}',
+                f'CODECS="{audio_codec_string}"',
+                'AUDIO="audio"',
+            ]
+            if subtitle_group_enabled:
+                stream_attributes.append('SUBTITLES="subtitles"')
+            lines.append('#EXT-X-STREAM-INF:' + ','.join(stream_attributes))
+            lines.append(
+                f'audio/{primary_rendition.id}/playlist?session_id={self.session_id}'
+                f'&cache_key={cache_key}&{self.getCodecQuery()}'
+            )
+            return '\n'.join(lines) + '\n'
+
+        video_bitrate = self.getVideoBitrate(self.quality, self.encoding_options.video_codec)
+        bandwidth = int(video_bitrate.video_bitrate_max.removesuffix('K')) * 1000
         # CODECSは要求条件から推測せず、実際に配信するinit内のconfiguration boxから得る。
         # エンコーダーが選択したlevelやconstraintも実データと一致する値をブラウザーへ渡す。
         generation_segments = {
@@ -1034,7 +1142,10 @@ class RecordedFMP4Stream:
         rendition = self.__getAudioRendition(rendition_id)
         if segment is None or rendition is None:
             return None
-        return await self.__getTranscodedAudioSegment(segment, rendition, self._effective_audio_codec)
+        segment_data = await self.__getTranscodedAudioSegment(segment, rendition, self._effective_audio_codec)
+        if segment_data is not None and getattr(self.recorded_program.recorded_video, 'has_video', True) is False:
+            self._completed_sequences.add(sequence)
+        return segment_data
 
     async def getVideoInitSegment(self, generation: int, sequence: int) -> bytes | None:
         """指定世代の実エンコード結果から得た初期化セグメントを返す。"""
@@ -1413,8 +1524,8 @@ class RecordedFMP4Stream:
             RecordedPlaybackBackend.getExecutable(backend), '-hide_banner', '-loglevel', 'error',
         ]
         device: str | None = None
-        if backend in ('QSVEncC', 'VCEEncC'):
-            selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(backend)
+        if backend in ('QSV', 'AMF'):
+            selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(backend, codec, bit_depth)
             devices = [selected_device] if selected_device is not None else \
                 RecordedPlaybackBackend.discoverRenderDevices(backend)
             if len(devices) == 0:
@@ -1423,17 +1534,17 @@ class RecordedFMP4Stream:
                     detail={'code': 'DeviceUnavailable', 'message': 'A compatible render device was not found.'},
                 )
             device = devices[0]
-        if backend == 'QSVEncC':
+        if backend == 'QSV':
             command += [
                 '-init_hw_device', f'qsv=recorded_qsv:{device}', '-filter_hw_device', 'recorded_qsv',
                 '-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv',
             ]
-        elif backend == 'NVEncC':
+        elif backend == 'NVENC':
             command += [
                 '-init_hw_device', 'cuda=recorded_cuda:0', '-filter_hw_device', 'recorded_cuda',
                 '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda',
             ]
-        elif backend == 'VCEEncC':
+        elif backend == 'AMF':
             command += [
                 '-init_hw_device', f'vaapi=recorded_vaapi:{device}', '-filter_hw_device', 'recorded_vaapi',
                 '-hwaccel', 'vaapi', '-hwaccel_device', 'recorded_vaapi', '-hwaccel_output_format', 'vaapi',
@@ -1446,7 +1557,7 @@ class RecordedFMP4Stream:
             '-t', f'{input_duration:.6f}',
             '-map', '0:v:0', '-an',
         ]
-        if backend == 'QSVEncC':
+        if backend == 'QSV':
             if is_interlaced:
                 filters.append(
                     f'vpp_qsv=deinterlace=advanced:rate={"field" if quality.is_60fps else "frame"}:'
@@ -1465,7 +1576,7 @@ class RecordedFMP4Stream:
                 f'trim=start={trim_start:.6f}:duration={segment.duration:.6f}',
                 'setpts=PTS-STARTPTS',
             ]
-        elif backend == 'NVEncC':
+        elif backend == 'NVENC':
             if is_interlaced:
                 filters.append(f'bwdif_cuda=mode={"send_field" if quality.is_60fps else "send_frame"}:parity=auto')
             filters.append(f'scale_cuda=w={quality.width}:h={quality.height}:format={spec.encoder_pixel_format}')
@@ -1478,7 +1589,7 @@ class RecordedFMP4Stream:
                 f'trim=start={trim_start:.6f}:duration={segment.duration:.6f}',
                 'setpts=PTS-STARTPTS',
             ]
-        elif backend == 'VCEEncC':
+        elif backend == 'AMF':
             if is_interlaced:
                 filters.append(
                     f'deinterlace_vaapi=rate={"field" if quality.is_60fps else "frame"}:auto=1'
@@ -1503,9 +1614,9 @@ class RecordedFMP4Stream:
         ]
         if backend == 'FFmpeg':
             command += ['-pix_fmt', spec.pixel_format]
-        elif backend == 'NVEncC':
+        elif backend == 'NVENC':
             command += ['-pix_fmt', 'cuda']
-        elif backend == 'VCEEncC':
+        elif backend == 'AMF':
             command += ['-pix_fmt', spec.encoder_pixel_format]
         command += self.__getProfileArguments(backend, codec, bit_depth)
         command += RecordedPlaybackBackend.getTuningArguments(backend, codec)
@@ -1528,14 +1639,14 @@ class RecordedFMP4Stream:
             semaphore_key,
             asyncio.Semaphore(1),
         )
-        async with semaphore:
+        async with self.acquireEncoderSlot(semaphore):
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdout = asyncio.subprocess.PIPE,
                 stderr = asyncio.subprocess.PIPE,
                 env = RecordedPlaybackBackend.getEnvironment(backend),
             )
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await self.__communicateSubprocess(process)
             if (
                 process.returncode != 0 and backend != 'FFmpeg' and
                 self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
@@ -1550,7 +1661,7 @@ class RecordedFMP4Stream:
                     stderr=asyncio.subprocess.PIPE,
                     env=RecordedPlaybackBackend.getEnvironment(backend),
                 )
-                stdout, stderr = await process.communicate()
+                stdout, stderr = await self.__communicateSubprocess(process)
         if process.returncode != 0:
             logging.error(
                 '[RecordedFMP4Stream] FFmpeg 8 video segment failed. '
@@ -1628,9 +1739,9 @@ class RecordedFMP4Stream:
             index += 1
         filter_index = fallback_command.index('-vf') + 1
         upload_filter = {
-            'QSVEncC': f'format={pixel_format},hwupload=extra_hw_frames=32',
-            'NVEncC': f'format={pixel_format},hwupload_cuda',
-            'VCEEncC': f'format={pixel_format},hwupload',
+            'QSV': f'format={pixel_format},hwupload=extra_hw_frames=32',
+            'NVENC': f'format={pixel_format},hwupload_cuda',
+            'AMF': f'format={pixel_format},hwupload',
         }[backend]
         fallback_command[filter_index] = f'{upload_filter},{fallback_command[filter_index]}'
         return fallback_command
@@ -1655,11 +1766,11 @@ class RecordedFMP4Stream:
         if codec == 'hevc':
             return ['-profile:v', 'main10' if bit_depth == 10 else 'main']
         if codec == 'vp9':
-            if backend == 'QSVEncC':
+            if backend == 'QSV':
                 return ['-profile:v', 'profile2' if bit_depth == 10 else 'profile0']
             return ['-profile:v', '2' if bit_depth == 10 else '0']
         if codec == 'av1':
-            if backend == 'NVEncC':
+            if backend == 'NVENC':
                 return []
             return ['-profile:v', 'main' if backend != 'FFmpeg' else '0']
         return []
@@ -1899,14 +2010,14 @@ class RecordedFMP4Stream:
                     '-reset_timestamps', '0',
                     output_pattern,
                 ]
-                async with self._cpu_semaphore:
+                async with self.acquireEncoderSlot(self._cpu_semaphore):
                     if normalization_command is not None:
                         normalization_process = await asyncio.create_subprocess_exec(
                             *normalization_command,
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                         )
-                        _, stderr = await normalization_process.communicate()
+                        _, stderr = await self.__communicateSubprocess(normalization_process)
                         if normalization_process.returncode != 0 or normalized_audio_path.is_file() is False:
                             logging.warning(
                                 '[RecordedFMP4Stream] FFmpeg 8 audio normalization source failed; '
@@ -1922,7 +2033,7 @@ class RecordedFMP4Stream:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr = await process.communicate()
+                    _, stderr = await self.__communicateSubprocess(process)
                 output_paths = sorted(Path(temporary_directory).glob('segment-*.mp4'))
                 if process.returncode != 0 or len(output_paths) != len(generation_segments):
                     if use_recorded_audio:

@@ -1234,7 +1234,7 @@ class ThumbnailGenerator:
         preset = 'drawing' if self.face_detection_mode == 'Anime' else 'picture'
         process = subprocess.Popen(
             [
-                LIBRARY_PATH['FFmpeg'],
+                LIBRARY_PATH['FFmpeg8'],
                 '-y',
                 '-nostdin',
                 '-f', 'image2pipe',

@@ -6,6 +6,7 @@ import concurrent.futures
 import os
 import pathlib
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import ClassVar, Literal, cast
@@ -43,6 +44,7 @@ from app.models.Channel import Channel
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
+from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.Git import GetGitCommit
@@ -62,6 +64,14 @@ class FileRecordingInfo:
     last_checked: datetime
     file_size: int
     mtime_continuous_start_at: datetime | None
+
+
+@dataclass(slots=True)
+class RecordedFileLockEntry:
+    """録画path単位のholder・waiter参照と排他lockを一体で管理する。"""
+
+    lock: asyncio.Lock
+    reference_count: int = 0
 
 
 @dataclass(slots=True)
@@ -100,7 +110,13 @@ class RecordedScanTask:
     - サーバー起動時の録画フォルダの一括スキャン・同期
     - 録画フォルダ以下のファイルシステム変更の監視を開始し、変更があれば随時メタデータを解析後、DB に永続化
     - 録画中ファイルの状態管理
+    - NFS / CIFS など OS notification が来ない共有ストレージ向けの低頻度 periodic reconciliation
     """
+
+    # watcher event が欠落しても別 host 書き込みを発見するための強制再スキャン間隔
+    RECONCILIATION_INTERVAL_SECONDS: ClassVar[int] = 900
+    # Docker 上で host / を参照する bind 先
+    DOCKER_HOST_ROOTFS: ClassVar[pathlib.Path] = pathlib.Path('/host-rootfs')
 
     # シングルトンインスタンス
     __instance: ClassVar[RecordedScanTask | None] = None
@@ -174,6 +190,9 @@ class RecordedScanTask:
 
         # 録画フォルダ以下の一括スキャンを実行中かどうか
         self._is_batch_scan_running = False
+        # 一括スキャンが起動した録画単位の pipeline task
+        # runBatchScan() の例外・キャンセル時に未完了 task を cancel / join するために保持する
+        self._batch_scan_pipeline_tasks: set[asyncio.Task[None]] = set()
 
         # バックグラウンドタスクの状態管理
         self._background_tasks: dict[anyio.Path, asyncio.Task[None]] = {}
@@ -182,8 +201,8 @@ class RecordedScanTask:
         self._symlink_path_map: dict[str, str] = {}
         self._symlink_path_map_lock = asyncio.Lock()
 
-        # ファイルパスごとのロックを管理する辞書
-        self._file_locks: dict[anyio.Path, asyncio.Lock] = {}
+        # ファイルパスごとのlockとholder・waiter参照数を管理する辞書
+        self._file_locks: dict[anyio.Path, RecordedFileLockEntry] = {}
         # _file_locks 辞書自体へのアクセスを保護するためのロック
         self._file_locks_dict_lock = asyncio.Lock()
         # 録画専用チャンネルの枝番計算と保存を直列化するためのロック
@@ -191,6 +210,30 @@ class RecordedScanTask:
 
         # 初期化済みフラグをセット
         self._initialized = True
+
+
+    @asynccontextmanager
+    async def __fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None, None]:
+        """path単位lockのholder・waiterを参照数へ含め、最後の解放後にentryを回収する。"""
+
+        # lock待機へ入る前に参照数を増やし、holder解放時に待機者のentryを誤って削除しない。
+        async with self._file_locks_dict_lock:
+            entry = self._file_locks.get(file_path)
+            if entry is None:
+                entry = RecordedFileLockEntry(asyncio.Lock())
+                self._file_locks[file_path] = entry
+            entry.reference_count += 1
+
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            # holderのlock解放後、またはwaiterのcancel後に参照を外す。
+            # 同じpathへ別entryが作られていた場合はidentity guardで新entryを保持する。
+            async with self._file_locks_dict_lock:
+                entry.reference_count -= 1
+                if entry.reference_count == 0 and self._file_locks.get(file_path) is entry:
+                    self._file_locks.pop(file_path, None)
 
 
     @staticmethod
@@ -203,7 +246,7 @@ class RecordedScanTask:
 
         return DefaultFilter(ignore_dirs=(
             *DefaultFilter.ignore_dirs,
-            CMAnalysisWorkspace.ROOT_DIRECTORY_NAME,
+            *CMAnalysisWorkspace.getRootDirectoryNames(),
         ))
 
 
@@ -228,7 +271,7 @@ class RecordedScanTask:
                 continue
             for entry_path, is_directory in entries:
                 if CMAnalysisWorkspace.isWorkspacePath(entry_path):
-                    if is_directory and entry_path.name == CMAnalysisWorkspace.ROOT_DIRECTORY_NAME:
+                    if is_directory and CMAnalysisWorkspace.isWorkspaceRootName(entry_path.name):
                         # DB行が消えて起動時DB列挙で見つからなかった残骸もmarker/lock検証付きで回収する。
                         await CMAnalysisWorkspace.cleanupStaleInParents({entry_path.parent})
                     continue
@@ -318,6 +361,8 @@ class RecordedScanTask:
                 self.runBatchScan(),
                 # 録画フォルダの監視を開始
                 self.watchRecordedFolders(),
+                # NFS/CIFS 向けの低頻度 reconciliation
+                self.__runPeriodicReconciliation(),
             )
         except asyncio.CancelledError:
             raise
@@ -329,14 +374,10 @@ class RecordedScanTask:
 
     async def runBatchScan(self) -> None:
         """
-        録画フォルダ以下の一括スキャンと DB への同期を実行する
-        - 録画フォルダ内の全 TS ファイルをスキャン
-        - 追加・変更があったファイルのみメタデータを解析し、DB に永続化
-        - 存在しない録画ファイルに対応するレコードを一括削除
+        録画フォルダ以下の一括スキャンを排他実行し、成否にかかわらず状態と子タスクを回収する。
         """
 
-        # 既に一括スキャンを実行中の場合は HTTPException を発生させる
-        # API から手動で一括スキャンを実行した際に重複して実行されないようにするためのバリデーション
+        # API から手動で一括スキャンを実行した際に重複して実行されないようにする
         if self._is_batch_scan_running:
             raise HTTPException(
                 status_code = status.HTTP_429_TOO_MANY_REQUESTS,
@@ -345,6 +386,30 @@ class RecordedScanTask:
 
         logging.info('Batch scan of recording folders has been started.')
         self._is_batch_scan_running = True
+        self._batch_scan_pipeline_tasks.clear()
+        try:
+            await self.__runBatchScan()
+            # 削除・再解析・索引version更新をDBへ反映し終えた集合を基準に字幕cacheをreconcileする。
+            await RecordedSubtitleStream.cleanupOrphanedCaches()
+        finally:
+            # DB / I/O 例外やサーバー停止によるキャンセルでも、録画単位の解析を孤児化させない
+            pipeline_tasks = tuple(self._batch_scan_pipeline_tasks)
+            for pipeline_task in pipeline_tasks:
+                if pipeline_task.done() is False:
+                    pipeline_task.cancel()
+            if len(pipeline_tasks) > 0:
+                await asyncio.gather(*pipeline_tasks, return_exceptions=True)
+            self._batch_scan_pipeline_tasks.clear()
+            self._is_batch_scan_running = False
+
+
+    async def __runBatchScan(self) -> None:
+        """
+        録画フォルダ以下の一括スキャンと DB への同期を実行する
+        - 録画フォルダ内の全 TS ファイルをスキャン
+        - 追加・変更があったファイルのみメタデータを解析し、DB に永続化
+        - 存在しない録画ファイルに対応するレコードを一括削除
+        """
 
         # 現在登録されている全ての RecordedVideo レコードの情報をキャッシュ
         ## すべての情報をキャッシュすると key_frames フィールドのデータ量が大きすぎてメモリとディスク I/O を大量に食うため、
@@ -449,7 +514,6 @@ class RecordedScanTask:
         logging.info('Scanning recorded folders...')
         processed_canonical_paths: set[str] = set()
         cleaned_symlink_target_parents: set[pathlib.Path] = set()
-        scan_tasks: set[asyncio.Task[None]] = set()
         for folder in self.recorded_folders:
             async for file_path in self.iterRecordedFolderPaths(folder):
                 try:
@@ -465,8 +529,7 @@ class RecordedScanTask:
                         continue
                     # 除外パターンのチェック（シンボリックリンク解決前）
                     original_path_str = str(file_path)
-                    original_path_for_match = self.__normalizePathForPrefixMatch(original_path_str)
-                    if any(original_path_for_match.startswith(pattern) for pattern in exclude_scan_paths) is True:
+                    if self.isPathExcludedByPatterns(original_path_str, exclude_scan_paths) is True:
                         continue
                     # シンボリックリンクを含むパスは実体に解決して処理する
                     canonical_path = await self.resolveRecordedPath(file_path)
@@ -475,9 +538,7 @@ class RecordedScanTask:
                     if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(canonical_path_str)):
                         continue
                     # 除外パターンのチェック（シンボリックリンク解決後）
-                    # 空文字列は全パスにマッチしてしまうため除外する
-                    canonical_path_for_match = self.__normalizePathForPrefixMatch(canonical_path_str)
-                    if any(canonical_path_for_match.startswith(pattern) for pattern in exclude_scan_paths) is True:
+                    if self.isPathExcludedByPatterns(canonical_path_str, exclude_scan_paths) is True:
                         continue
                     # シンボリックリンクのマッピングを更新する
                     await self.__updateSymlinkMapping(original_path_str, canonical_path_str)
@@ -503,24 +564,27 @@ class RecordedScanTask:
 
                     # 録画ごとに独立したパイプラインとして処理する。
                     # 上限へ達した時だけ完了済みタスクを回収し、別録画のMetadata/Index/CM/Thumbnailを重ねる。
-                    scan_tasks.add(asyncio.create_task(self.processRecordedFile(
+                    scan_task = asyncio.create_task(self.processRecordedFile(
                         file_path = canonical_path,
                         original_path = file_path,
                         existing_db_recorded_videos = existing_db_recorded_videos,
-                    )))
-                    if len(scan_tasks) >= self.BATCH_PIPELINE_CONCURRENCY:
-                        done_tasks, scan_tasks = await asyncio.wait(
-                            scan_tasks,
+                    ))
+                    self._batch_scan_pipeline_tasks.add(scan_task)
+                    if len(self._batch_scan_pipeline_tasks) >= self.BATCH_PIPELINE_CONCURRENCY:
+                        done_tasks, _ = await asyncio.wait(
+                            self._batch_scan_pipeline_tasks,
                             return_when=asyncio.FIRST_COMPLETED,
                         )
                         for done_task in done_tasks:
                             done_task.result()
+                        self._batch_scan_pipeline_tasks.difference_update(done_tasks)
                 except Exception as ex:
                     logging.error(f'{file_path}: Failed to process recorded file:', exc_info=ex)
 
         # ファイル消失判定や不要サムネイル削除は、全パイプラインがDB保存まで完了してから行う。
-        if len(scan_tasks) > 0:
-            await asyncio.gather(*scan_tasks)
+        if len(self._batch_scan_pipeline_tasks) > 0:
+            await asyncio.gather(*self._batch_scan_pipeline_tasks)
+            self._batch_scan_pipeline_tasks.clear()
 
         # 存在しない録画ファイルに対応するレコードを一括削除
         ## トランザクション配下に入れることでパフォーマンスが向上する
@@ -623,7 +687,6 @@ class RecordedScanTask:
                 f'Re-run metadata analysis after checking source files.',
             )
         logging.info('Batch scan of recording folders has been completed.')
-        self._is_batch_scan_running = False
 
 
     async def processRecordedFile(
@@ -645,17 +708,12 @@ class RecordedScanTask:
             analysis_request: 自動判定、手動メタデータ再解析、索引再実行、CM再判定のいずれか。
         """
 
-        # ファイルパスに対応するロックを取得または作成
         file_path = await self.resolveRecordedPath(file_path)
         file_path_str = str(file_path)
         original_path_str = str(original_path) if original_path is not None else None
-        async with self._file_locks_dict_lock:
-            if file_path not in self._file_locks:
-                self._file_locks[file_path] = asyncio.Lock()
-            file_lock = self._file_locks[file_path]
 
         # 同一ファイルパスへの DB レコード操作を排他制御する
-        async with file_lock:
+        async with self.__fileLock(file_path):
             metadata_analysis_recorded_video_id: int | None = None
             metadata_history: AnalysisTaskHandle | None = None
             try:
@@ -663,10 +721,6 @@ class RecordedScanTask:
                 # ファイル変更イベント発火後に即座にファイルが削除される可能性も考慮
                 if not await self.isFileExists(file_path):
                     logging.warning(f'{file_path}: File does not exist after acquiring lock! ignored.')
-                    # ロック管理辞書から不要になったロックを削除
-                    async with self._file_locks_dict_lock:
-                        if file_path in self._file_locks and not file_lock.locked():
-                           self._file_locks.pop(file_path, None)
                     return
 
                 # ファイルの状態をチェック
@@ -795,7 +849,11 @@ class RecordedScanTask:
                     'MetadataAnalysis',
                     recorded_video_id=metadata_analysis_recorded_video_id,
                     title=file_path.name,
-                    trigger='Automatic' if analysis_request == 'Automatic' else 'Manual',
+                    # DB 未登録の解析失敗でも履歴からフルパスを辿れるようにする。
+                    file_path=file_path_str,
+                    trigger='Automatic'
+                    if analysis_request == 'Automatic'
+                    else 'Manual',
                 )
                 try:
                     await metadata_history.setStage('Probing')
@@ -967,11 +1025,6 @@ class RecordedScanTask:
                 logging.error(f'{file_path}: Error processing file inside lock:', exc_info=ex)
                 if metadata_analysis_recorded_video_id is not None:
                     await RecordedVideo.filter(id=metadata_analysis_recorded_video_id).update(status='AnalysisFailed')
-            finally:
-                # 不要になったロックを管理辞書から削除 (ロックが解放された後に行う)
-                async with self._file_locks_dict_lock:
-                     if file_path in self._file_locks and not file_lock.locked():
-                        self._file_locks.pop(file_path, None)
 
 
     @staticmethod
@@ -1052,10 +1105,13 @@ class RecordedScanTask:
             await CMAnalysisOrchestrator().syncIfChapterChanged(recorded_video_id)
 
 
-    @staticmethod
-    async def resolveRecordedPath(file_path: anyio.Path) -> anyio.Path:
+    @classmethod
+    async def resolveRecordedPath(cls, file_path: anyio.Path) -> anyio.Path:
         """
         シンボリックリンクを解決して実体のパスを取得する。解決に失敗した場合は元のパスを返す。
+
+        Docker 環境では host 絶対 path を指す symlink を /host-rootfs 配下へ再解決する。
+        relative / broken / cycle symlink は安全に元 path（または解決可能な範囲）を返す。
 
         Args:
             file_path (anyio.Path): ファイルパス
@@ -1064,9 +1120,94 @@ class RecordedScanTask:
             anyio.Path: シンボリックの参照先である実体のパス
         """
         try:
-            return await file_path.resolve()
+            resolved = await asyncio.to_thread(cls._resolveRecordedPathSync, pathlib.Path(str(file_path)))
+            return anyio.Path(resolved)
         except (OSError, RuntimeError) as ex:
             logging.warning(f'{file_path}: Failed to resolve symlink. Using original path:', exc_info=ex)
+            return file_path
+
+
+    @classmethod
+    def _resolveRecordedPathSync(cls, file_path: pathlib.Path) -> pathlib.Path:
+        """
+        host absolute symlink を Docker の /host-rootfs へ rebase しつつ同期解決する。
+
+        Args:
+            file_path (pathlib.Path): 解決対象パス
+
+        Returns:
+            pathlib.Path: 解決後パス。broken / cycle 時は安全に元 path。
+        """
+
+        host_rootfs = cls.DOCKER_HOST_ROOTFS
+        use_host_rootfs = host_rootfs.is_dir()
+        seen: set[pathlib.Path] = set()
+        current = file_path
+
+        # 親ディレクトリを含む path 全体を先頭から解決する
+        parts = current.parts
+        if len(parts) == 0:
+            return current
+
+        # 絶対 path の先頭は '/' のみ
+        if current.is_absolute():
+            resolved = pathlib.Path(parts[0])
+            remaining = parts[1:]
+        else:
+            resolved = pathlib.Path()
+            remaining = parts
+
+        for part in remaining:
+            candidate = resolved / part
+            try:
+                if candidate.is_symlink() is False:
+                    resolved = candidate
+                    continue
+            except OSError:
+                return file_path
+
+            # 循環 symlink は元 path を返す
+            try:
+                identity = candidate.resolve(strict=False)
+            except (OSError, RuntimeError):
+                return file_path
+            if identity in seen:
+                return file_path
+            seen.add(identity)
+
+            try:
+                target = pathlib.Path(os.readlink(candidate))
+            except OSError:
+                return file_path
+
+            if target.is_absolute():
+                # Docker: host 絶対 target を /host-rootfs 配下へ rebase する
+                if use_host_rootfs is True and not str(target).startswith(str(host_rootfs)):
+                    rebased = host_rootfs / target.relative_to(target.anchor)
+                    if rebased.exists() or rebased.is_symlink():
+                        resolved = rebased
+                    else:
+                        # broken は安全に元 path 扱い
+                        return file_path
+                else:
+                    if target.exists() or target.is_symlink():
+                        resolved = target
+                    else:
+                        return file_path
+            else:
+                resolved = (candidate.parent / target)
+
+            # 中間 symlink の先がさらに symlink なら再帰相当の再解決を行う
+            try:
+                if resolved.is_symlink():
+                    nested = cls._resolveRecordedPathSync(resolved)
+                    resolved = nested
+            except (OSError, RuntimeError):
+                return file_path
+
+        try:
+            return resolved.resolve(strict=False)
+        except (OSError, RuntimeError):
             return file_path
 
 
@@ -1084,6 +1225,75 @@ class RecordedScanTask:
 
         # Windows ではパス区切り文字として / と \\ の両方が使えるため、比較前に / に統一する
         return path_str.replace('\\', '/')
+
+
+    @classmethod
+    def isPathExcludedByPatterns(cls, path_str: str, exclude_patterns: list[str]) -> bool:
+        """
+        path component 境界を考慮して除外パターンに一致するかを判定する。
+
+        指定 folder 自身とその子孫だけを除外し、同 prefix の兄弟 folder は除外しない。
+        例: 除外 `/recordings/temp` は `/recordings/temporary` に一致しない。
+
+        Args:
+            path_str (str): 判定対象のパス
+            exclude_patterns (list[str]): 正規化済み除外パターン一覧
+
+        Returns:
+            bool: 除外対象なら True
+        """
+
+        normalized_path = cls.__normalizePathForPrefixMatch(path_str).rstrip('/')
+        if normalized_path == '':
+            return False
+        for pattern in exclude_patterns:
+            normalized_pattern = cls.__normalizePathForPrefixMatch(pattern).rstrip('/')
+            if normalized_pattern == '':
+                continue
+            if normalized_path == normalized_pattern:
+                return True
+            if normalized_path.startswith(normalized_pattern + '/'):
+                return True
+        return False
+
+
+    async def __runPeriodicReconciliation(self) -> None:
+        """
+        watcher event が来ない NFS/CIFS 上の新規ファイルを低頻度で強制再スキャンする。
+
+        batch scan 実行中はスキップし、完了後の次周期で再試行する。
+        """
+
+        logging.info(
+            'Starting periodic recorded folder reconciliation '
+            f'(interval={self.RECONCILIATION_INTERVAL_SECONDS}s).'
+        )
+        try:
+            while self._is_running:
+                await asyncio.sleep(self.RECONCILIATION_INTERVAL_SECONDS)
+                if self._is_running is False:
+                    break
+                if self._is_batch_scan_running is True:
+                    logging.debug('Skipping periodic reconciliation because batch scan is running.')
+                    continue
+                try:
+                    logging.info('Periodic recorded folder reconciliation started.')
+                    await self.runBatchScan()
+                    logging.info('Periodic recorded folder reconciliation finished.')
+                except HTTPException as ex:
+                    # 手動 batch scan と衝突した場合は次周期まで待つ
+                    if ex.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+                        logging.debug('Periodic reconciliation deferred: batch scan already running.')
+                        continue
+                    logging.error('Periodic reconciliation failed:', exc_info=ex)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logging.error('Periodic reconciliation failed:', exc_info=ex)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            logging.info('Periodic recorded folder reconciliation has been stopped.')
 
 
     async def __updateSymlinkMapping(self, original_path_str: str | None, canonical_path_str: str) -> None:
@@ -1519,20 +1729,16 @@ class RecordedScanTask:
                         await RecordedFMP4CacheManager.cleanupDiscovered(pathlib.Path(str(file_path)))
                         continue
                     # 除外パターンのチェック（シンボリックリンク解決前）
-                    # 空文字列は全パスにマッチしてしまうため除外する
                     original_path_str = str(file_path)
-                    original_path_for_match = self.__normalizePathForPrefixMatch(original_path_str)
-                    if any(original_path_for_match.startswith(pattern) for pattern in exclude_scan_paths) is True:
+                    if self.isPathExcludedByPatterns(original_path_str, exclude_scan_paths) is True:
                         continue
                     # シンボリックリンクを含むパスは実体に解決して処理する
                     canonical_path = await self.resolveRecordedPath(file_path)
                     if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(canonical_path))):
                         continue
                     # 除外パターンのチェック（シンボリックリンク解決後）
-                    # 空文字列は全パスにマッチしてしまうため除外する
                     canonical_path_str = str(canonical_path)
-                    canonical_path_for_match = self.__normalizePathForPrefixMatch(canonical_path_str)
-                    if any(canonical_path_for_match.startswith(pattern) for pattern in exclude_scan_paths) is True:
+                    if self.isPathExcludedByPatterns(canonical_path_str, exclude_scan_paths) is True:
                         continue
                     if await canonical_path.is_dir():
                         continue
@@ -1741,14 +1947,8 @@ class RecordedScanTask:
             original_file_path (anyio.Path | None): 監視で検知した元のファイルパス
         """
 
-        # ファイルパスに対応するロックを取得または作成
-        async with self._file_locks_dict_lock:
-            if file_path not in self._file_locks:
-                self._file_locks[file_path] = asyncio.Lock()
-            file_lock = self._file_locks[file_path]
-
         # 同一ファイルパスへの DB レコード操作を排他制御する
-        async with file_lock:
+        async with self.__fileLock(file_path):
             try:
                 mapped_canonical_path: str | None = None
                 async with self._symlink_path_map_lock:
@@ -1774,11 +1974,6 @@ class RecordedScanTask:
 
             except Exception as ex:
                 logging.error(f'{file_path}: Error handling file deletion inside lock:', exc_info=ex)
-            finally:
-                # 不要になったロックを管理辞書から削除 (ロックが解放された後に行う)
-                async with self._file_locks_dict_lock:
-                    if file_path in self._file_locks and not file_lock.locked():
-                        self._file_locks.pop(file_path, None)
 
 
     async def __checkRecordingCompletion(self) -> None:
@@ -1791,29 +1986,38 @@ class RecordedScanTask:
         while self._is_running:
             try:
                 now = datetime.now(tz=JST)
-                completed_files: list[anyio.Path] = []
+                completed_files: list[tuple[anyio.Path, FileRecordingInfo]] = []
 
-                # 録画中ファイルをチェック
-                for file_path, recording_info in self._recording_files.items():
+                # await中にwatcherが辞書を変更できるため、周期開始時点のsnapshotだけを巡回する。
+                recording_files_snapshot = tuple(self._recording_files.items())
+                for file_path, recording_info in recording_files_snapshot:
                     try:
                         # ファイルの現在の状態を取得
                         stat = await file_path.stat()
                         current_modified = datetime.fromtimestamp(stat.st_mtime, tz=JST)
                         current_size = stat.st_size
 
+                        # stat()待機中に削除・差し替えられた状態は、現entryを誤完了させず次周期へ送る。
+                        if self._recording_files.get(file_path) is not recording_info:
+                            continue
+
                         # RECORDING_COMPLETE_SECONDS 秒以上更新がなく、かつファイルサイズが変化していない場合は録画完了と判断
                         if ((now - current_modified).total_seconds() >= self.RECORDING_COMPLETE_SECONDS and
                             current_size == recording_info.file_size):
-                            completed_files.append(file_path)
+                            completed_files.append((file_path, recording_info))
                     except FileNotFoundError:
-                        # ファイルが削除された場合は記録から削除
-                        completed_files.append(file_path)
+                        # snapshotと同じentryが残っている場合だけ、削除済み録画として完了処理へ送る。
+                        if self._recording_files.get(file_path) is recording_info:
+                            completed_files.append((file_path, recording_info))
                     except Exception as ex:
                         logging.error(f'{file_path}: Error checking recording completion:', exc_info=ex)
 
                 # 完了したファイルを処理
-                for file_path in completed_files:
+                for file_path, recording_info in completed_files:
                     try:
+                        # 巡回完了後にもwatcherが状態を更新できるため、同じsnapshot entryだけを処理する。
+                        if self._recording_files.get(file_path) is not recording_info:
+                            continue
                         # 記録から削除
                         self._recording_files.pop(file_path, None)
 

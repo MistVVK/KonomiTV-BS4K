@@ -15,6 +15,7 @@ from app import logging, schemas
 from app.config import Config, LoadConfig
 from app.constants import JST, LIBRARY_PATH
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
+from app.utils.HLSText import sanitizeHLSQuotedString
 from app.utils.TSInformation import TSInformation
 from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker
 
@@ -519,8 +520,9 @@ class MetadataAnalyzer:
                 'channel': audio_channel,
                 'channel_layout': audio_stream.channel_layout,
                 'sampling_rate': audio_sampling_rate,
-                'language': audio_stream.tags.get('language'),
-                'title': audio_stream.tags.get('title'),
+                # HLS quoted-string に埋め込む language / title は保存時点で正規化する
+                'language': sanitizeHLSQuotedString(audio_stream.tags.get('language')) or None,
+                'title': sanitizeHLSQuotedString(audio_stream.tags.get('title')) or None,
                 'is_dual_mono': False,
             }
             if audio_pid is not None:
@@ -548,8 +550,8 @@ class MetadataAnalyzer:
                 'index': len(subtitle_tracks) + 1,
                 'stream_index': subtitle_stream.index,
                 'codec': subtitle_stream.codec_name,
-                'language': subtitle_stream.tags.get('language'),
-                'title': subtitle_stream.tags.get('title'),
+                'language': sanitizeHLSQuotedString(subtitle_stream.tags.get('language')) or None,
+                'title': sanitizeHLSQuotedString(subtitle_stream.tags.get('title')) or None,
             }
             try:
                 subtitle_pid = int(str(subtitle_stream.id), 0) if subtitle_stream.id is not None else None
@@ -588,8 +590,8 @@ class MetadataAnalyzer:
                     'index': len(subtitle_tracks) + 1,
                     'stream_index': data_stream.index,
                     'codec': 'arib_caption',
-                    'language': data_stream.tags.get('language'),
-                    'title': data_stream.tags.get('title'),
+                    'language': sanitizeHLSQuotedString(data_stream.tags.get('language')) or None,
+                    'title': sanitizeHLSQuotedString(data_stream.tags.get('title')) or None,
                     'pid': data_pid,
                 })
 
@@ -636,8 +638,14 @@ class MetadataAnalyzer:
                 subtitle_track: schemas.SubtitleTrack = {
                     'index': len(subtitle_tracks) + 1,
                     'codec': 'arib_ttml',
-                    'language': data_stream.tags.get('language') if data_stream is not None else 'jpn',
-                    'title': data_stream.tags.get('title') if data_stream is not None else None,
+                    'language': (
+                        sanitizeHLSQuotedString(data_stream.tags.get('language'), default='jpn')
+                        if data_stream is not None else 'jpn'
+                    ),
+                    'title': (
+                        sanitizeHLSQuotedString(data_stream.tags.get('title')) or None
+                        if data_stream is not None else None
+                    ),
                     'pid': stream_info.pid,
                     'component_tag': stream_info.component_tag,
                     'program_number': stream_info.program_number,
@@ -1186,7 +1194,7 @@ class MetadataAnalyzer:
         """
 
         try:
-            cmd = [LIBRARY_PATH['FFprobe'], *args]
+            cmd = [LIBRARY_PATH['FFprobe8'], *args]
             if input_bytes is None:
                 proc = subprocess.run(cmd, capture_output=True)
             else:

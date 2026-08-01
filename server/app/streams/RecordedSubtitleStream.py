@@ -3,8 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
+import stat
 from bisect import bisect_left, bisect_right
 from collections import OrderedDict
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Literal, NamedTuple, cast
 
@@ -62,13 +67,30 @@ class ARIBTTMLPacketIndex(NamedTuple):
     pts_by_component: dict[int, list[float]]
 
 
+@dataclass(slots=True)
+class RecordedSubtitleCacheLockEntry:
+    """字幕cache生成中のholder・waiter参照と排他lockを一体で管理する。"""
+
+    lock: asyncio.Lock
+    reference_count: int = 0
+
+
 class RecordedSubtitleStream:
     """録画映像・音声と独立して字幕キャッシュと時間範囲APIを管理する。"""
 
-    _locks: ClassVar[dict[Path, asyncio.Lock]] = {}
+    _locks: ClassVar[dict[Path, RecordedSubtitleCacheLockEntry]] = {}
     _image_codecs: ClassVar[set[str]] = {'hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'}
     _cache_version = 3
     _arib_ttml_cache_version = 2
+    _file_hash_pattern: ClassVar[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
+    _cache_file_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r'^v(?:0|[1-9]\d*)-[0-9a-f]{32}-(?:0|[1-9]\d*)-(?:0|[1-9]\d*)'
+        r'\.(?:vtt|arib\.json)$',
+    )
+    _arib_ttml_cache_file_pattern: ClassVar[re.Pattern[str]] = re.compile(
+        r'^ttml-v(?:0|[1-9]\d*)-[0-9a-f]{32}-(?:0|[1-9]\d*)-'
+        r'(?:all|(?:0|[1-9]\d*)(?:-(?:0|[1-9]\d*))*)\.json$',
+    )
     _arib_ttml_memory_cache_size = 8
     _arib_ttml_memory_cache_bytes_limit = 128 * 1024 * 1024
     _arib_ttml_memory_cache: ClassVar[OrderedDict[Path, ARIBTTMLPacketIndex]] = OrderedDict()
@@ -77,6 +99,190 @@ class RecordedSubtitleStream:
 
     def __init__(self, recorded_video: RecordedVideo) -> None:
         self.recorded_video = recorded_video
+
+    @classmethod
+    @asynccontextmanager
+    async def __cacheLock(cls, cache_path: Path) -> AsyncGenerator[None, None]:
+        """cache pathのholder・waiterを参照数へ含め、最後の解放後にentryを回収する。"""
+
+        # asyncio taskはawait地点でのみ切り替わるため、entry作成と参照追加を連続して行えば、
+        # GCが同じイベントループ上でactive判定する前に必ず利用中として可視化される。
+        entry = cls._locks.setdefault(cache_path, RecordedSubtitleCacheLockEntry(asyncio.Lock()))
+        entry.reference_count += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            # waiterのcancelも参照から外し、同じpathへ作り直された別entryは削除しない。
+            entry.reference_count -= 1
+            if entry.reference_count == 0 and cls._locks.get(cache_path) is entry:
+                cls._locks.pop(cache_path, None)
+
+    @classmethod
+    async def cleanupOrphanedCaches(cls) -> None:
+        """DBから到達不能な厳密所有cacheと中断後tmpだけを回収する。"""
+
+        # DB取得・JSON field解釈のどちらかが不完全な場合、reachableを過小評価してはならない。
+        # そのため全行から集合を構築し終えるまでファイル削除を一切開始しない。
+        try:
+            rows = await RecordedVideo.all().values('file_hash', 'playback_index_version', 'subtitle_tracks')
+            reachable_paths = cls.__buildReachableCachePaths(rows)
+        except Exception as ex:
+            logging.warning(
+                '[RecordedSubtitleStream] Failed to determine reachable subtitle caches; cleanup skipped.',
+                exc_info=ex,
+            )
+            return
+
+        try:
+            entries = await asyncio.to_thread(lambda: list(RECORDED_SUBTITLES_DIR.iterdir()))
+        except FileNotFoundError:
+            return
+        except OSError as ex:
+            logging.warning('[RecordedSubtitleStream] Failed to enumerate subtitle caches:', exc_info=ex)
+            return
+
+        deleted_count = 0
+        for cache_path in entries:
+            parsed_path = cls.__parseManagedCachePath(cache_path)
+            if parsed_path is None:
+                continue
+            completed_path, is_temporary = parsed_path
+
+            # 完成済みの現行cacheはDBから到達できる限り保持する。tmpは完成cacheがreachableでも
+            # 正常終了時には存在しないため、active生成で保護されていなければ中断残骸として回収する。
+            if is_temporary is False and completed_path in reachable_paths:
+                continue
+            lock_entry = cls._locks.get(completed_path)
+            if lock_entry is not None and lock_entry.reference_count > 0:
+                continue
+
+            # active判定後に生成側が同じpathへ参入すると、GCのunlinkが生成中tmpを消し得る。
+            # GC自身も同じlockのholderとして登録し、削除完了まで新規生成を待機させる。
+            async with cls.__cacheLock(completed_path):
+                # lock取得までにentryが消滅・置換され得るため、通常ファイルかを改めて確認する。
+                # 同名symlinkやdirectoryは第三者entryとして保持する。
+                try:
+                    cache_stat = await asyncio.to_thread(cache_path.lstat)
+                except FileNotFoundError:
+                    continue
+                except OSError as ex:
+                    logging.warning(
+                        f'[RecordedSubtitleStream] Failed to inspect subtitle cache: {cache_path}',
+                        exc_info=ex,
+                    )
+                    continue
+                if stat.S_ISREG(cache_stat.st_mode) is False:
+                    continue
+
+                try:
+                    # taskのcancel時もworkerのunlink完了までは同じlockを保持し、生成側との競合を防ぐ。
+                    unlink_task = asyncio.create_task(asyncio.to_thread(cache_path.unlink))
+                    try:
+                        await asyncio.shield(unlink_task)
+                    except asyncio.CancelledError:
+                        try:
+                            await unlink_task
+                        except OSError:
+                            # cleanupのcancelを優先しつつ、workerが終わるまではlockを解放しない。
+                            pass
+                        raise
+                except FileNotFoundError:
+                    continue
+                except OSError as ex:
+                    logging.warning(
+                        f'[RecordedSubtitleStream] Failed to remove orphaned subtitle cache: {cache_path}',
+                        exc_info=ex,
+                    )
+                    continue
+
+                deleted_count += 1
+                if is_temporary is False:
+                    cls.__forgetARIBTTMLMemoryCache(completed_path)
+
+        if deleted_count > 0:
+            logging.info(f'[RecordedSubtitleStream] Deleted {deleted_count} orphaned subtitle cache files.')
+
+    @classmethod
+    def __buildReachableCachePaths(cls, rows: list[dict[str, Any]]) -> set[Path]:
+        """DB行から現実装が参照しうる完成cache pathを過不足なく再構築する。"""
+
+        reachable_paths: set[Path] = set()
+        for row in rows:
+            file_hash = row.get('file_hash')
+            playback_index_version = row.get('playback_index_version')
+            subtitle_tracks = row.get('subtitle_tracks')
+            if (
+                not isinstance(file_hash, str)
+                or cls._file_hash_pattern.fullmatch(file_hash) is None
+                or (
+                    playback_index_version is not None
+                    and (type(playback_index_version) is not int or playback_index_version < 0)
+                )
+                or not isinstance(subtitle_tracks, list)
+            ):
+                raise ValueError('Recorded subtitle cache ownership fields are invalid.')
+            index_version = playback_index_version or 0
+            arib_ttml_program_numbers: set[int] = set()
+            has_arib_ttml_track = False
+            for track in subtitle_tracks:
+                if not isinstance(track, dict):
+                    raise ValueError('Recorded subtitle track is invalid.')
+                subtitle_index = track.get('index')
+                codec = track.get('codec')
+                stream_index = track.get('stream_index')
+                if (
+                    type(subtitle_index) is not int
+                    or subtitle_index < 0
+                    or not isinstance(codec, str)
+                    or (stream_index is not None and (type(stream_index) is not int or stream_index < 0))
+                ):
+                    raise ValueError('Recorded subtitle track cache fields are invalid.')
+                normalized_codec = codec.lower()
+                if normalized_codec == 'arib_ttml':
+                    has_arib_ttml_track = True
+                    program_number = track.get('program_number')
+                    if program_number is not None:
+                        if type(program_number) is not int or program_number < 0:
+                            raise ValueError('Recorded ARIB-TTML program number is invalid.')
+                        arib_ttml_program_numbers.add(program_number)
+                elif 'arib' in normalized_codec:
+                    if stream_index is not None:
+                        reachable_paths.add(RECORDED_SUBTITLES_DIR / (
+                            f'v{cls._cache_version}-{file_hash}-{subtitle_index}-{index_version}.arib.json'
+                        ))
+                elif normalized_codec not in cls._image_codecs and stream_index is not None:
+                    reachable_paths.add(RECORDED_SUBTITLES_DIR / (
+                        f'v{cls._cache_version}-{file_hash}-{subtitle_index}-{index_version}.vtt'
+                    ))
+
+            if has_arib_ttml_track is True:
+                program_key = '-'.join(str(number) for number in sorted(arib_ttml_program_numbers)) \
+                    if len(arib_ttml_program_numbers) > 0 else 'all'
+                reachable_paths.add(RECORDED_SUBTITLES_DIR / (
+                    f'ttml-v{cls._arib_ttml_cache_version}-{file_hash}-{index_version}-{program_key}.json'
+                ))
+        return reachable_paths
+
+    @classmethod
+    def __parseManagedCachePath(cls, cache_path: Path) -> tuple[Path, bool] | None:
+        """厳密な管理cache名を完成pathとtmp種別へ分解する。"""
+
+        is_temporary = cache_path.name.endswith('.tmp')
+        completed_path = cache_path.with_name(cache_path.name[:-4]) if is_temporary is True else cache_path
+        if (
+            cls._cache_file_pattern.fullmatch(completed_path.name) is None
+            and cls._arib_ttml_cache_file_pattern.fullmatch(completed_path.name) is None
+        ):
+            return None
+        return (completed_path, is_temporary)
+
+    @classmethod
+    def __forgetARIBTTMLMemoryCache(cls, cache_path: Path) -> None:
+        """削除済み永続cacheに対応するLRU索引とbyte counterを同期して除外する。"""
+
+        cls._arib_ttml_memory_cache.pop(cache_path, None)
+        cls._arib_ttml_memory_cache_bytes_total -= cls._arib_ttml_memory_cache_bytes.pop(cache_path, 0)
 
     def getTrack(self, subtitle_index: int) -> SubtitleTrack | None:
         """論理トラック番号に一致する字幕を返す。"""
@@ -108,7 +314,7 @@ class RecordedSubtitleStream:
         cache_path = self.__getCachePath(subtitle_index, 'vtt')
         if cache_path.is_file():
             return await asyncio.to_thread(cache_path.read_bytes)
-        async with self._locks.setdefault(cache_path, asyncio.Lock()):
+        async with self.__cacheLock(cache_path):
             if cache_path.is_file():
                 return await asyncio.to_thread(cache_path.read_bytes)
             process = await asyncio.create_subprocess_exec(
@@ -243,7 +449,7 @@ class RecordedSubtitleStream:
         if memory_cache is not None:
             self._arib_ttml_memory_cache.move_to_end(cache_path)
             return memory_cache
-        async with self._locks.setdefault(cache_path, asyncio.Lock()):
+        async with self.__cacheLock(cache_path):
             memory_cache = self._arib_ttml_memory_cache.get(cache_path)
             if memory_cache is not None:
                 self._arib_ttml_memory_cache.move_to_end(cache_path)
@@ -428,7 +634,7 @@ class RecordedSubtitleStream:
         if stream_index is None:
             return []
         cache_path = self.__getCachePath(subtitle_index, 'arib.json')
-        async with self._locks.setdefault(cache_path, asyncio.Lock()):
+        async with self.__cacheLock(cache_path):
             if cache_path.is_file():
                 try:
                     return cast(list[ARIBSubtitlePacket], json.loads(await asyncio.to_thread(cache_path.read_text)))
