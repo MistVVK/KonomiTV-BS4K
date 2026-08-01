@@ -4,7 +4,7 @@
  * API レスポンスの受け取りと、エラーが発生した際のエラーハンドリング (エラーメッセージ表示) までを責務として負う
  */
 
-import axios, { AxiosError, AxiosRequestConfig, AxiosResponse, AxiosResponseHeaders, RawAxiosResponseHeaders } from 'axios';
+import axios, { AxiosError, AxiosHeaders, AxiosRequestConfig, AxiosResponse, AxiosResponseHeaders, RawAxiosResponseHeaders } from 'axios';
 
 import Message from '@/message';
 import useUserStore from '@/stores/UserStore';
@@ -42,6 +42,11 @@ export interface IErrorResponseData {
     }]
 }
 
+/** 更新APIから返されるアクセストークンの最小型 */
+interface IRefreshedAccessToken {
+    access_token: string;
+}
+
 
 /**
  * services/ 以下の各クラスから呼び出される、Axios の薄いラッパー
@@ -50,12 +55,69 @@ export interface IErrorResponseData {
  */
 class APIClient {
 
+    // 複数リクエストが同時に401になった場合、更新リクエストを一つにまとめる
+    private static refresh_promise: Promise<string | null> | null = null;
+
+    /** 同一オリジンのリクエストだけをKonomiTV内部リクエストとして扱う */
+    private static isInternalRequest(url: string | undefined): boolean {
+
+        if (url === undefined) return true;
+
+        try {
+            return new URL(url, Utils.api_base_url).origin === new URL(Utils.api_base_url).origin;
+        } catch {
+            return false;
+        }
+    }
+
+    /** 更新API自身やログインAPIを自動更新の対象外にする */
+    private static isRefreshExcluded(url: string | undefined): boolean {
+        const path = url?.split('?')[0] ?? '';
+        return path.endsWith('/users/token') || path.endsWith('/users/refresh') || path.endsWith('/users/logout');
+    }
+
+    /** HttpOnly Cookie の更新トークンでアクセストークンを更新する */
+    private static async refreshAccessToken(): Promise<string | null> {
+
+        if (APIClient.refresh_promise === null) {
+            APIClient.refresh_promise = (async () => {
+                try {
+                    const response = await axios.post<IRefreshedAccessToken>(
+                        `${Utils.api_base_url}/users/refresh`,
+                        undefined,
+                        {
+                            withCredentials: true,
+                            timeout: 30 * 1000,
+                            transitional: {clarifyTimeoutError: true},
+                        },
+                    );
+                    if (typeof response.data.access_token !== 'string' || response.data.access_token.length === 0) {
+                        return null;
+                    }
+                    return response.data.access_token;
+                } catch {
+                    // 更新に失敗した場合は元の401レスポンスを呼び出し側へ返す
+                    return null;
+                }
+            })();
+        }
+
+        const refresh_promise = APIClient.refresh_promise;
+        try {
+            return await refresh_promise;
+        } finally {
+            if (APIClient.refresh_promise === refresh_promise) {
+                APIClient.refresh_promise = null;
+            }
+        }
+    }
+
     /**
      * Axios で HTTP リクエストを送信し、レスポンスを受け取る
      * @param request AxiosRequestConfig
      * @returns 成功なら ISuccessResponse 、失敗なら IErrorResponse を返す
      */
-    static async request<T>(request: AxiosRequestConfig): Promise<ISuccessResponse<T> | IErrorResponse> {
+    static async request<T>(request: AxiosRequestConfig, allow_access_token_refresh: boolean = true): Promise<ISuccessResponse<T> | IErrorResponse> {
 
         // API のベース URL を設定 (config.baseURL が指定されていない場合のみ)
         if (request.baseURL === undefined) {
@@ -68,7 +130,7 @@ class APIClient {
         }
 
         // 外部サイトへの HTTP/HTTPS リクエストでは実行しない
-        if (request.url?.startsWith('http') === false) {
+        if (APIClient.isInternalRequest(request.url)) {
 
             // アクセストークンが取得できたら (=ログインされていれば)
             // 取得したアクセストークンを Authorization ヘッダーに Bearer トークンとしてセット
@@ -77,6 +139,9 @@ class APIClient {
             if (access_token !== null) {
                 request.headers['Authorization'] = `Bearer ${access_token}`;
             }
+
+            // 更新トークンCookieを送受信できるようにする
+            request.withCredentials = true;
 
             // KonomiTV クライアントのバージョンを設定
             // 今のところ使わないが、将来的にクライアントとサーバーを分離することを見据えて念のため
@@ -99,7 +164,35 @@ class APIClient {
 
         // エラーが発生した場合は IErrorResponse を返す
         if (result instanceof AxiosError) {
-            console.error(result);
+
+            // アクセストークンの期限切れなどは、HttpOnly更新トークンで一度だけ再試行する
+            if (
+                allow_access_token_refresh
+                && result.response?.status === 401
+                && Utils.getAccessToken() !== null
+                && APIClient.isInternalRequest(request.url)
+                && APIClient.isRefreshExcluded(request.url) === false
+            ) {
+                const access_token = await APIClient.refreshAccessToken();
+                if (access_token !== null) {
+                    Utils.saveAccessToken(access_token);
+                    if (request.headers instanceof AxiosHeaders) {
+                        request.headers.set('Authorization', `Bearer ${access_token}`);
+                    } else {
+                        request.headers = {
+                            ...request.headers,
+                            'Authorization': `Bearer ${access_token}`,
+                        };
+                    }
+                    return await APIClient.request<T>(request, false);
+                }
+            }
+
+            // AxiosError全体にはAuthorizationヘッダーやリクエストボディが含まれるため、秘密情報をコンソールへ出さない
+            const request_method = result.config?.method?.toUpperCase() ?? 'UNKNOWN';
+            const request_path = result.config?.url?.split('?')[0] ?? '(unknown URL)';
+            const response_status = result.response?.status ?? 'network error';
+            console.error(`[APIClient] ${request_method} ${request_path} failed: ${result.message} (${response_status})`);
 
             // エラーレスポンスがあれば、エラー内容と AxiosError を IErrorResponse に入れて返す
             if (result.response) {
@@ -211,6 +304,10 @@ class APIClient {
     static showGenericError(error_response: IErrorResponse, template: string): void {
         const user_store = useUserStore();
         switch (error_response.data.detail) {
+            case 'Too many login attempts': {
+                Message.error(`${template}\nしばらく待ってから、もう一度お試しください。`);
+                return;
+            }
             case 'Not authenticated': {
                 user_store.logout(true);
                 Message.error(`${template}\nログインし直してください。`);

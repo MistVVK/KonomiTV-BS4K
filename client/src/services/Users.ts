@@ -123,24 +123,21 @@ class Users {
 
         // エラー処理
         if (response.type === 'error') {
-            switch (response.data.detail) {
-                case 'Incorrect username': {
-                    Message.error('ログインできませんでした。そのユーザー名のアカウントは存在しません。');
-                    break;
-                }
-                case 'Incorrect password': {
-                    Message.error('ログインできませんでした。パスワードを間違えていませんか？');
-                    break;
-                }
-                default: {
-                    APIClient.showGenericError(response, 'ログインできませんでした。');
-                    break;
-                }
-            }
+            APIClient.showGenericError(response, 'ログインできませんでした。');
             return null;
         }
 
         return response.data;
+    }
+
+
+    /**
+     * 更新トークンを失効させる
+     * ローカル状態のログアウトとは分離し、ネットワークエラーは無視する
+     */
+    static async logout(): Promise<void> {
+
+        await APIClient.post('/users/logout').catch(() => undefined);
     }
 
 
