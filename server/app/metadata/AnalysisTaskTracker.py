@@ -16,6 +16,7 @@ from app.models.AnalysisTask import (
     AnalysisTaskType,
 )
 from app.models.RecordedVideo import RecordedVideo
+from app.utils.HostPath import ToUserHostPathText
 
 
 _current_execution_id: ContextVar[int | None] = ContextVar('analysis_task_execution_id', default=None)
@@ -34,6 +35,33 @@ class AnalysisTaskHandle:
         # executionはtrack()のコンテキスト中だけ更新し、terminal後は変更しない。
         self.execution = execution
         self.terminal = execution.status in ('Succeeded', 'Failed', 'Interrupted', 'Skipped')
+        # finish 開始直後から progress 保存を拒否するバリア (await 前に立てる)
+        self.finishing = self.terminal
+        # handle 単位で最新 1 件の遅延 progress 保存タスクを管理する
+        self._progress_save_task: asyncio.Task[None] | None = None
+
+    def replaceProgressSaveTask(self, task: asyncio.Task[None] | None) -> asyncio.Task[None] | None:
+        """遅延 progress 保存タスクを差し替え、直前のタスクを返す。"""
+
+        previous = self._progress_save_task
+        self._progress_save_task = task
+        return previous
+
+    async def waitForPendingProgressSave(self) -> None:
+        """進行中の遅延 progress 保存を cancel / wait して直列化する。"""
+
+        task = self.replaceProgressSaveTask(None)
+        if task is None:
+            return
+        if task.done() is False:
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # 保存失敗は finish 本体を阻害しない
+            pass
 
     async def setStage(self, stage: str, progress: float | None = None) -> None:
         """処理段階を切り替え、直前段階の終了時刻も保存する。"""
@@ -69,7 +97,8 @@ class AnalysisTaskHandle:
     async def setProgress(self, progress: float) -> None:
         """0～1へ正規化した進捗をメモリとDBへ反映する。"""
 
-        if self.terminal:
+        # finish 進行中・完了後は terminal progress を巻き戻さない
+        if self.terminal or self.finishing:
             return
         self.execution.progress = max(0.0, min(1.0, progress))
         await self.execution.save(update_fields=['progress', 'updated_at'])
@@ -119,6 +148,12 @@ class AnalysisTaskHandle:
     ) -> None:
         """実行を一度だけ終端状態へ確定する。"""
 
+        if self.terminal or self.finishing:
+            return
+        # 最初の await より前にバリアを立て、並行の progress save を拒否する
+        self.finishing = True
+        # 遅延 progress が terminal を巻き戻さないよう、先に cancel / wait する
+        await self.waitForPendingProgressSave()
         if self.terminal:
             return
         now = datetime.now(tz=JST)
@@ -131,7 +166,11 @@ class AnalysisTaskHandle:
         self.execution.stage_history = history
         self.execution.summary = summary
         self.execution.error_code = error_code
-        self.execution.error_message = error_message[-8192:] if error_message else None
+        self.execution.error_message = (
+            ToUserHostPathText(error_message)[-8192:]
+            if error_message
+            else None
+        )
         await self.execution.save(update_fields=[
             'status', 'completed_at', 'progress', 'stage_history', 'summary', 'error_code', 'error_message', 'updated_at',
         ])
@@ -154,6 +193,7 @@ class AnalysisTaskTracker:
         *,
         recorded_video_id: int | None = None,
         title: str | None = None,
+        file_path: str | None = None,
         trigger: AnalysisTaskTrigger = 'Automatic',
         total_count: int = 0,
         parent_id: int | None = None,
@@ -167,6 +207,7 @@ class AnalysisTaskTracker:
                 task_type,
                 recorded_video_id=recorded_video_id,
                 title=title,
+                file_path=file_path,
                 trigger=trigger,
                 total_count=total_count,
                 parent_id=parent_id,
@@ -204,18 +245,49 @@ class AnalysisTaskTracker:
         *,
         recorded_video_id: int | None = None,
         title: str | None = None,
+        file_path: str | None = None,
         trigger: AnalysisTaskTrigger = 'Automatic',
         total_count: int = 0,
         parent_id: int | None = None,
         initial_status: AnalysisTaskStatus = 'Running',
         inherit_parent: bool = True,
     ) -> AnalysisTaskHandle:
-        """コンテキストを占有せず、明示的に終了する子履歴を開始する。"""
+        """コンテキストを占有せず、明示的に終了する子履歴を開始する。
 
-        if title is None and recorded_video_id is not None:
-            video = await RecordedVideo.get_or_none(id=recorded_video_id).select_related('recorded_program')
+        Args:
+            task_type: 履歴に記録する処理種別。
+            recorded_video_id: 対象録画がある場合の ID。
+            title: 一覧表示用タイトル。省略時は録画番組名または処理種別名。
+            file_path: 対象ファイルのパス。省略時は recorded_video から補完する。
+            trigger: 実行契機。
+            total_count: 一括処理の総件数。
+            parent_id: 親履歴 ID。省略時は現在コンテキストの親を継承できる。
+            initial_status: 開始時の状態。
+            inherit_parent: 現在のコンテキスト親を引き継ぐか。
+
+        Returns:
+            作成した実行履歴の更新ハンドル。
+        """
+
+        # タイトルとパスは一度の録画取得でそろえ、履歴からファイルを辿れるようにする。
+        stored_file_path = (
+            ToUserHostPathText(file_path)
+            if file_path is not None and file_path != ''
+            else None
+        )
+        if recorded_video_id is not None and (
+            title is None or stored_file_path is None
+        ):
+            video = await RecordedVideo.get_or_none(
+                id=recorded_video_id
+            ).select_related(
+                'recorded_program',
+            )
             if video is not None:
-                title = video.recorded_program.title
+                if title is None:
+                    title = video.recorded_program.title
+                if stored_file_path is None and video.file_path:
+                    stored_file_path = ToUserHostPathText(video.file_path)
         execution = await AnalysisTaskExecution.create(
             parent_id=(parent_id if parent_id is not None else _current_execution_id.get()) if inherit_parent else None,
             recorded_video_id=recorded_video_id,
@@ -223,6 +295,7 @@ class AnalysisTaskTracker:
             status=initial_status,
             trigger=trigger,
             title=title or cls.getTaskLabel(task_type),
+            file_path=stored_file_path,
             total_count=total_count,
             started_at=datetime.now(tz=JST) if initial_status == 'Running' else None,
         )
@@ -245,15 +318,34 @@ class AnalysisTaskTracker:
         """高頻度の走査進捗を5秒に一度だけDBへ非同期保存する。"""
 
         handle = cls.currentHandle()
-        if handle is None or handle.terminal:
+        if handle is None or handle.terminal or handle.finishing:
             return
         normalized = max(0.0, min(1.0, progress))
+        # メモリ上の進捗は即時更新し、DB 保存だけを間引く
         handle.execution.progress = normalized
         now = time.monotonic()
         if now - cls._progress_saved_at.get(handle.execution.id, 0.0) < 5.0:
             return
         cls._progress_saved_at[handle.execution.id] = now
-        task = asyncio.create_task(handle.setProgress(normalized))
+
+        # handle ごとに最新 1 件だけを保持し、古い遅延 save を cancel する
+        previous = handle.replaceProgressSaveTask(None)
+        if previous is not None and previous.done() is False:
+            previous.cancel()
+
+        async def SaveProgress() -> None:
+            if previous is not None and previous.done() is False:
+                try:
+                    await previous
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # finish 中・terminal 後の progress だけの save は拒否する
+            if handle.terminal or handle.finishing:
+                return
+            await handle.setProgress(normalized)
+
+        task = asyncio.create_task(SaveProgress())
+        handle.replaceProgressSaveTask(task)
         task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
 
     @staticmethod

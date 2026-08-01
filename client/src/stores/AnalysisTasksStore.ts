@@ -48,7 +48,7 @@ export function stageLabel(stage: string | null): string {
 
 const useAnalysisTasksStore = defineStore('analysisTasks', {
     state: () => ({
-        analysisOverview: {active: [], recent: []} as IAnalysisTaskOverview,
+        analysisOverview: {active: [], active_children: [], recent: []} as IAnalysisTaskOverview,
     }),
     getters: {
         activeTaskGroups(state): IActiveAnalysisTaskGroup[] {
@@ -82,7 +82,13 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
         async updateAnalysisOverview(showError = false): Promise<void> {
             const overview = await AnalysisTasks.fetchOverview(showError);
             // 一時的な API エラーで実行中表示が突然消えないよう、正常取得時だけ状態を差し替える。
-            if (overview !== null) this.analysisOverview = overview;
+            // Docker の段階更新中など旧 API から応答された場合も、ルート処理の表示自体は維持する。
+            if (overview !== null) {
+                this.analysisOverview = {
+                    ...overview,
+                    active_children: overview.active_children ?? [],
+                };
+            }
         },
         startOverviewPolling(showError = false): void {
             // 未ログイン画面では認証必須 API を定期呼び出ししない。
@@ -104,7 +110,7 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
             overviewPollingTimer = null;
             // ログアウト後に別ユーザーへ前ユーザー権限で取得した概要を一瞬見せないよう、認証情報がなければ破棄する。
             if (Utils.getAccessToken() === null) {
-                this.analysisOverview = {active: [], recent: []};
+                this.analysisOverview = {active: [], active_children: [], recent: []};
             }
         },
     },

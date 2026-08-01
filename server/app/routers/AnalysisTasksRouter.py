@@ -12,6 +12,7 @@ from app.models.AnalysisTask import AnalysisTaskExecution
 from app.models.CMAnalysis import CMLogoGenerationAttempt
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentUser
+from app.utils.HostPath import ToUserHostPathText
 
 
 router = APIRouter(tags=['Analysis Tasks'], prefix='/api/analysis-tasks')
@@ -19,6 +20,14 @@ router = APIRouter(tags=['Analysis Tasks'], prefix='/api/analysis-tasks')
 
 def SerializeExecution(execution: AnalysisTaskExecution, is_admin: bool) -> schemas.AnalysisTaskExecution:
     """DB実行履歴を、権限に応じてエラー本文を伏せたAPI形式へ変換する。"""
+
+    # 保存済みパスを優先し、未移行の旧履歴だけ関連録画から補完する。
+    raw_file_path = execution.file_path
+    if raw_file_path is None:
+        recorded_video = execution.recorded_video
+        if recorded_video is not None and recorded_video.file_path:
+            raw_file_path = recorded_video.file_path
+    file_path = ToUserHostPathText(raw_file_path) if raw_file_path else None
 
     return schemas.AnalysisTaskExecution(
         id=execution.id,
@@ -28,6 +37,7 @@ def SerializeExecution(execution: AnalysisTaskExecution, is_admin: bool) -> sche
         status=execution.status,
         trigger=execution.trigger,
         title=execution.title,
+        file_path=file_path,
         stage=execution.stage,
         progress=execution.progress,
         stage_history=execution.stage_history,
@@ -50,18 +60,42 @@ def SerializeExecution(execution: AnalysisTaskExecution, is_admin: bool) -> sche
 async def AnalysisTaskOverviewAPI(
     current_user: Annotated[User, Depends(GetCurrentUser)],
 ) -> schemas.AnalysisTaskOverview:
-    """マイページ用に実行中ルート処理と直近5件を返す。"""
+    """ナビゲーションとマイページ用に実行中処理と直近5件を返す。"""
 
-    active = await AnalysisTaskExecution.filter(
-        parent_id=None,
-        status__in=['Queued', 'Running'],
-    ).order_by('created_at').limit(500)
-    recent = await AnalysisTaskExecution.filter(
-        parent_id=None,
-        status__in=['Succeeded', 'Failed', 'Interrupted', 'Skipped'],
-    ).order_by('-completed_at').limit(5)
+    active = (
+        await AnalysisTaskExecution.filter(
+            parent_id=None,
+            status__in=['Queued', 'Running'],
+        )
+        .prefetch_related('recorded_video')
+        .order_by('created_at')
+        .limit(500)
+    )
+    active_children: list[AnalysisTaskExecution] = []
+    if active:
+        # 一括処理のルートにはファイルパスがないため、現在動作中の子処理も返す。
+        # 完了済みの子処理は履歴詳細 API に任せ、3秒間隔の概要ポーリングが肥大化しないようにする。
+        active_children = (
+            await AnalysisTaskExecution.filter(
+                parent_id__in=[item.id for item in active],
+                status__in=['Queued', 'Running'],
+            )
+            .prefetch_related('recorded_video')
+            .order_by('created_at')
+            .limit(500)
+        )
+    recent = (
+        await AnalysisTaskExecution.filter(
+            parent_id=None,
+            status__in=['Succeeded', 'Failed', 'Interrupted', 'Skipped'],
+        )
+        .prefetch_related('recorded_video')
+        .order_by('-completed_at')
+        .limit(5)
+    )
     return schemas.AnalysisTaskOverview(
         active=[SerializeExecution(item, current_user.is_admin) for item in active],
+        active_children=[SerializeExecution(item, current_user.is_admin) for item in active_children],
         recent=[SerializeExecution(item, current_user.is_admin) for item in recent],
     )
 
@@ -90,14 +124,20 @@ async def AnalysisTasksAPI(
     if task_status:
         filters &= Q(status=task_status)
     if keyword:
-        filters &= Q(title__icontains=keyword)
+        # 番組名だけでなく、失敗時にファイル名だけで並ぶ履歴もパスから探せるようにする。
+        filters &= Q(title__icontains=keyword) | Q(file_path__icontains=keyword)
     if started_after:
         filters &= Q(started_at__gte=started_after)
     if started_before:
         filters &= Q(started_at__lte=started_before)
     query = query.filter(filters)
     total = await query.count()
-    items = await query.order_by('-created_at').offset((page - 1) * page_size).limit(page_size)
+    items = await (
+        query.prefetch_related('recorded_video')
+        .order_by('-created_at')
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
     return schemas.AnalysisTaskList(
         total=total,
         page=page,
@@ -113,10 +153,20 @@ async def AnalysisTaskDetailAPI(
 ) -> schemas.AnalysisTaskDetail:
     """単一履歴の段階、子処理、既存CMロゴ生成試行を返す。"""
 
-    execution = await AnalysisTaskExecution.get_or_none(id=execution_id)
+    execution = await AnalysisTaskExecution.get_or_none(
+        id=execution_id
+    ).prefetch_related(
+        'recorded_video',
+    )
     if execution is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Analysis task was not found')
-    children = await AnalysisTaskExecution.filter(parent_id=execution.id).order_by('created_at')
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail='Analysis task was not found'
+        )
+    children = await (
+        AnalysisTaskExecution.filter(parent_id=execution.id)
+        .prefetch_related('recorded_video')
+        .order_by('created_at')
+    )
     attempts: list[CMLogoGenerationAttempt] = []
     if execution.cm_logo_generation_batch_id is not None:
         attempts = await CMLogoGenerationAttempt.filter(

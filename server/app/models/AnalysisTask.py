@@ -64,6 +64,8 @@ class AnalysisTaskExecution(TortoiseModel):
     status = cast(TortoiseField[AnalysisTaskStatus], fields.CharField(32, db_index=True))
     trigger = cast(TortoiseField[AnalysisTaskTrigger], fields.CharField(32))
     title = fields.TextField()
+    # 録画ごとの処理ではホスト向けファイルパスを保持する。一括処理は null。
+    file_path = cast(TortoiseField[str | None], fields.TextField(null=True))
     stage = cast(TortoiseField[str | None], fields.CharField(64, null=True))
     progress = cast(TortoiseField[float | None], fields.FloatField(null=True))
     stage_history = cast(TortoiseField[list[dict[str, object]]], fields.JSONField(default=[]))

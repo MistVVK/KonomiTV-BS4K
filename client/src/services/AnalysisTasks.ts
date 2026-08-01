@@ -15,6 +15,7 @@ export interface IAnalysisTaskExecution {
     status: AnalysisTaskStatus;
     trigger: 'Automatic' | 'Manual' | 'Maintenance' | 'StartupBackfill';
     title: string;
+    file_path: string | null;
     stage: string | null;
     progress: number | null;
     stage_history: {stage: string; started_at: string; completed_at: string | null}[];
@@ -34,6 +35,7 @@ export interface IAnalysisTaskExecution {
 
 export interface IAnalysisTaskOverview {
     active: IAnalysisTaskExecution[];
+    active_children: IAnalysisTaskExecution[];
     recent: IAnalysisTaskExecution[];
 }
 

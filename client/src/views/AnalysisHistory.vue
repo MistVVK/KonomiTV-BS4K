@@ -12,7 +12,7 @@
                 <div class="history-filters">
                     <v-select v-model="selectedType" label="処理種別" :items="typeOptions" clearable hide-details />
                     <v-select v-model="selectedStatus" label="状態" :items="statusOptions" clearable hide-details />
-                    <v-text-field v-model="keyword" label="番組名を検索" clearable hide-details />
+                    <v-text-field v-model="keyword" label="番組名・ファイルパスを検索" clearable hide-details />
                 </div>
                 <div v-if="tasks.length === 0" class="history-empty">該当する解析履歴はありません。</div>
                 <button v-for="task in tasks" :key="task.id" class="history-row" @click="openDetail(task.id)">
@@ -23,6 +23,7 @@
                             <small>{{dateLabel(task.completed_at ?? task.started_at)}}</small>
                         </div>
                         <span>{{task.title}}</span>
+                        <small v-if="task.file_path" class="history-row__path">{{task.file_path}}</small>
                         <small>{{resultLabel(task)}}・{{durationLabel(task)}}</small>
                         <v-progress-linear v-if="task.status === 'Running' && task.progress !== null" class="mt-2"
                             color="primary" height="4" rounded :model-value="task.progress * 100" />
@@ -39,6 +40,8 @@
                     <h3>{{detail.execution.title}}</h3>
                     <dl>
                         <dt>状態</dt><dd>{{statusLabel(detail.execution.status)}}</dd>
+                        <dt>ファイル</dt>
+                        <dd class="detail-path">{{detail.execution.file_path || '（パスなし）'}}</dd>
                         <dt>開始</dt><dd>{{dateLabel(detail.execution.started_at, true)}}</dd>
                         <dt>終了</dt><dd>{{dateLabel(detail.execution.completed_at, true) || '実行中'}}</dd>
                         <dt>所要時間</dt><dd>{{durationLabel(detail.execution)}}</dd>
@@ -57,7 +60,11 @@
                     <template v-if="detail.children.length">
                         <h4>録画ごとの結果</h4>
                         <div v-for="child in detail.children" :key="child.id" class="detail-child">
-                            <span>{{child.title}}</span><small>{{statusLabel(child.status)}}{{child.error_code ? `・${child.error_code}` : ''}}</small>
+                            <div class="detail-child__body">
+                                <span>{{child.title}}</span>
+                                <small v-if="child.file_path" class="detail-path">{{child.file_path}}</small>
+                            </div>
+                            <small>{{statusLabel(child.status)}}{{child.error_code ? `・${child.error_code}` : ''}}</small>
                         </div>
                     </template>
                     <template v-if="detail.logo_attempts.length">
@@ -227,6 +234,14 @@ onUnmounted(() => {
 .history-row__body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .history-row__body > span { margin: 2px 0; overflow-wrap: anywhere; }
 .history-row__body small { color: rgb(var(--v-theme-text-darken-1)); }
+.history-row__path, .detail-path {
+    display: block;
+    overflow-wrap: anywhere;
+    word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    opacity: 0.9;
+}
 .history-row__heading { display: flex; justify-content: space-between; gap: 8px; }
 .history-row__heading small { flex-shrink: 0; }
 .history-empty { padding: 40px; text-align: center; opacity: 0.65; }
@@ -242,6 +257,7 @@ onUnmounted(() => {
 .detail-stages { padding-left: 22px; } .detail-stages li { margin: 5px 0; }
 .detail-stages small { margin-left: 8px; color: rgb(var(--v-theme-text-darken-1)); }
 .detail-child { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0; border-bottom: 1px solid rgb(var(--v-theme-background-lighten-2)); }
+.detail-child__body { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .detail-child span { overflow-wrap: anywhere; } .detail-child small { flex-shrink: 0; color: rgb(var(--v-theme-text-darken-1)); }
 @include smartphone-vertical { .history-container { width: calc(100% - 28px); padding-top: 18px; } .history-filters { grid-template-columns: 1fr; }
     .detail-child { flex-direction: column; gap: 2px; } }
