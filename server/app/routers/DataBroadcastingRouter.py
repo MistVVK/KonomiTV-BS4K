@@ -11,6 +11,10 @@ from ping3 import ping
 
 from app import logging, schemas
 from app.constants import API_REQUEST_HEADERS
+from app.utils.DataBroadcastingHTTPClient import (
+    RequestWithSafeRedirects,
+    UpstreamURLRejected,
+)
 
 
 # ルーター
@@ -26,18 +30,13 @@ router = APIRouter(
 _MAX_POST_BODY_BYTES = 4096
 
 
-def _validateUpstreamURL(request_url: str) -> None:
-    """上流プロキシ対象 URL が HTTP/HTTPS であることを検証する。"""
+async def _IterResponseContent(content: bytes):
+    """上流応答本文を非同期ストリームとして1回だけ返す。"""
 
-    if not (request_url.startswith('http://') or request_url.startswith('https://')):
-        logging.error(f'[DataBroadcastingRouter] Request URL must be http or https URL: {request_url}')
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Request URL must be http or https URL',
-        )
+    yield content
 
 
-def _filterResponseHeaders(response: httpx.Response) -> dict[str, str]:
+def _filterResponseHeaders(response_headers: httpx.Headers) -> dict[str, str]:
     """データ放送クライアントへ返す許可済み応答ヘッダだけを取り出す。"""
 
     allowed_response_headers = {
@@ -55,7 +54,7 @@ def _filterResponseHeaders(response: httpx.Response) -> dict[str, str]:
     }
     return {
         key: value
-        for key, value in response.headers.items()
+        for key, value in response_headers.items()
         if key.lower() in allowed_response_headers
     }
 
@@ -77,8 +76,7 @@ async def BMLBrowserRequestGETProxyAPI(
     サーバーは追加の unquote を行わず FastAPI が path として復元した URL をそのまま上流へ送る。
     """
 
-    _validateUpstreamURL(request_url)
-    logging.debug(f'Request URL: {request_url}')
+    logging.debug('Data broadcast upstream GET request received.')
 
     headers = {
         'Accept': '*/*',
@@ -90,25 +88,33 @@ async def BMLBrowserRequestGETProxyAPI(
         if key.lower() in allowed_request_headers:
             headers[key] = value
 
-    # タイムアウトはデータ放送の動作を壊さないようにあえて設定しない
-    # さらにデータ放送からアクセスされるサイトは HTTPS の場合でも証明書が切れていることが日常茶飯事なので、証明書の検証を行わない
-    ## 正確には放送波経由で古い規格の HTTPS 証明書が降ってきているらしいが、どのみち実装困難なので証明書の状態は無視する
-    async with httpx.AsyncClient(headers={**API_REQUEST_HEADERS, **headers}, follow_redirects=True, verify=False) as client:
-        try:
-            response = await client.get(request_url)
-        except Exception as ex:
-            # リクエスト中に例外が発生した場合は、エラーメッセージをログに出力して 500 エラーを返す
-            ## HTTP リクエスト自体が DNS 名前解決エラーや接続エラーで失敗した場合に発生する
-            logging.error('[DataBroadcastingRouter][BMLBrowserRequestGETProxyAPI] Failed to request:', exc_info=ex)
-            raise HTTPException(
-                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail = f'Failed to request: {ex}',
-            )
+    # scheme、接続先IP、DNS rebinding、redirect先を共通ポリシーで検証する。
+    # 期限切れ証明書を使う放送局との互換性はHTTP client側で維持するが、
+    # 検証済みIP以外へ接続できないことをこの時点で保証する。
+    try:
+        response = await RequestWithSafeRedirects(
+            'GET',
+            request_url,
+            headers={**API_REQUEST_HEADERS, **headers},
+        )
+    except UpstreamURLRejected as ex:
+        logging.warning('[DataBroadcastingRouter][BMLBrowserRequestGETProxyAPI] Upstream URL rejected by egress policy.')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Request URL is not allowed',
+        ) from ex
+    except Exception as ex:
+        # 上流の接続失敗理由やURLを外部へ返さず、詳細はサーバーログだけに残す。
+        logging.error('[DataBroadcastingRouter][BMLBrowserRequestGETProxyAPI] Failed to request:', exc_info=ex)
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = 'Failed to request upstream resource',
+        ) from ex
 
     return StreamingResponse(
-        response.iter_bytes(),
+        _IterResponseContent(response.content),
         status_code = response.status_code,
-        headers = _filterResponseHeaders(response),
+        headers = _filterResponseHeaders(response.headers),
     )
 
 
@@ -129,8 +135,7 @@ async def BMLBrowserRequestPOSTProxyAPI(
     （Shift_JIS / EUC-JP の Denbun 電文を UTF-8 として壊さないため）。
     """
 
-    _validateUpstreamURL(request_url)
-    logging.debug(f'Request URL: {request_url}')
+    logging.debug('Data broadcast upstream POST request received.')
 
     # Starlette FormParser を経由せず raw body を透過する
     raw_body = await request.body()
@@ -147,25 +152,32 @@ async def BMLBrowserRequestPOSTProxyAPI(
         'Content-Type': content_type,
     }
 
-    # タイムアウトはデータ放送の動作を壊さないようにあえて設定しない
-    # さらにデータ放送からアクセスされるサイトは HTTPS の場合でも証明書が切れていることが日常茶飯事なので、証明書の検証を行わない
-    ## 正確には放送波経由で古い規格の HTTPS 証明書が降ってきているらしいが、どのみち実装困難なので証明書の状態は無視する
-    async with httpx.AsyncClient(headers={**API_REQUEST_HEADERS, **headers}, follow_redirects=True, verify=False) as client:
-        try:
-            response = await client.post(request_url, content=raw_body)
-        except Exception as ex:
-            # リクエスト中に例外が発生した場合は、エラーメッセージをログに出力して 500 エラーを返す
-            ## HTTP リクエスト自体が DNS 名前解決エラーや接続エラーで失敗した場合に発生する
-            logging.error('[DataBroadcastingRouter][BMLBrowserRequestPOSTProxyAPI] Failed to request:', exc_info=ex)
-            raise HTTPException(
-                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail = f'Failed to request: {ex}',
-            )
+    # GETと同じ接続先ポリシーをPOSTにも適用し、redirect時もraw bodyの扱いを共通化する。
+    try:
+        response = await RequestWithSafeRedirects(
+            'POST',
+            request_url,
+            headers={**API_REQUEST_HEADERS, **headers},
+            content=raw_body,
+        )
+    except UpstreamURLRejected as ex:
+        logging.warning('[DataBroadcastingRouter][BMLBrowserRequestPOSTProxyAPI] Upstream URL rejected by egress policy.')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Request URL is not allowed',
+        ) from ex
+    except Exception as ex:
+        # 上流の接続失敗理由やURLを外部へ返さず、詳細はサーバーログだけに残す。
+        logging.error('[DataBroadcastingRouter][BMLBrowserRequestPOSTProxyAPI] Failed to request:', exc_info=ex)
+        raise HTTPException(
+            status_code = status.HTTP_502_BAD_GATEWAY,
+            detail = 'Failed to request upstream resource',
+        ) from ex
 
     return StreamingResponse(
-        response.iter_bytes(),
+        _IterResponseContent(response.content),
         status_code = response.status_code,
-        headers = _filterResponseHeaders(response),
+        headers = _filterResponseHeaders(response.headers),
     )
 
 

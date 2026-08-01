@@ -4013,4 +4013,4 @@ websockets = ">=14.0"
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.11,<3.12"
-content-hash = "5c8b5811b746c84efee9b92b32ad54d1d6919e540f5c316363544f69119f1b69"
+content-hash = "b2d3b61ac96f0c87a388f1a7311adb1440d48ff4ad949cf79f340de31385e7a7"
