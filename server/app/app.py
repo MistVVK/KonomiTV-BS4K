@@ -21,6 +21,7 @@ from app.constants import (
 )
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.models.Channel import Channel
+from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.Program import Program
 from app.routers import (
     BlueskyRouter,
@@ -223,6 +224,9 @@ recorded_scan_task: RecordedScanTask | None = None
 async def Startup():
     global recorded_scan_task
 
+    # サーバー停止中を含めて期限切れになった OAuth state の PKCE verifier を起動直後に消去
+    await NiconicoOAuthState.cleanupExpired()
+
     # チャンネル情報を更新
     await Channel.update()
 
@@ -262,6 +266,13 @@ async def UpdateChannelAndProgram():
 @repeat_every(seconds=0.5 * 60, wait_first=0.5 * 60, logger=logging.logger)
 async def UpdateChannelJikkyoStatus():
     await Channel.updateJikkyoStatus()
+
+# 1分に1回、放置された期限切れ OAuth state の PKCE verifier を消去する
+# OAuth が再度利用されない環境でも、秘密文字列の保持期間を有効期限後1分以内に制限する
+@app.on_event('startup')
+@repeat_every(seconds=1 * 60, wait_first=1 * 60, logger=logging.logger)
+async def CleanupExpiredNiconicoOAuthStates():
+    await NiconicoOAuthState.cleanupExpired()
 
 # サーバーの終了時に実行する
 cleanup = False

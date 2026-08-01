@@ -1,15 +1,15 @@
 
 import base64
 import json
-from typing import Annotated, Any, cast
+from typing import Annotated
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.security.utils import get_authorization_scheme_param
+from fastapi import APIRouter, Depends, Query, Request, status
 from jose import jwt
 
 from app import logging, schemas
 from app.constants import API_REQUEST_HEADERS, HTTPX_CLIENT, NICONICO_OAUTH_CLIENT_ID
+from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentUser
 from app.utils import Interlaced
@@ -21,6 +21,18 @@ router = APIRouter(
     tags = ['Niconico'],
     prefix = '/api/niconico',
 )
+
+
+def _BuildSettingsJikkyoRedirectUrl(client_url: str) -> str:
+    """クライアント URL から実況設定画面へのリダイレクト先を組み立てる。"""
+
+    return f'{client_url.rstrip("/")}/settings/jikkyo'
+
+
+def _NormalizeClientUrl(client_url: str) -> str:
+    """クライアント URL を末尾スラッシュ付きで正規化する。"""
+
+    return client_url.rstrip('/') + '/'
 
 
 @router.get(
@@ -42,7 +54,9 @@ async def NiconicoAuthURLAPI(
 
     # クライアント (フロントエンド) の URL を Origin ヘッダーから取得
     ## Origin ヘッダーがリクエストに含まれていない場合はこの API サーバーの URL を使う
-    client_url = request.headers.get('Origin', f'https://{request.url.netloc}').rstrip('/') + '/'
+    client_url = _NormalizeClientUrl(
+        request.headers.get('Origin', f'https://{request.url.netloc}')
+    )
 
     # コールバック URL を設定
     ## ニコニコ API の OAuth 連携では、事前にコールバック先の URL を運営側に設定しておく必要がある
@@ -50,20 +64,25 @@ async def NiconicoAuthURLAPI(
     ## この API は、リクエストを認証 URL の "state" パラメーター内で指定された KonomiTV サーバーの NiconicoAuthCallbackAPI にリダイレクトする
     ## 最後に KonomiTV サーバーがリダイレクトを受け取ることで、コールバック対象の URL が定まらなくても OAuth 連携ができるようになる
     ## ref: https://github.com/tsukumijima/KonomiTV-API
+    ## app.konomi.tv は state JSON の server 以外のキーをクエリへ転送する（user_access_token は載せない）
     callback_url = 'https://app.konomi.tv/api/redirect/niconico'
 
-    # リクエストの Authorization ヘッダーで渡されたログイン中ユーザーの JWT アクセストークンを取得
-    # このトークンをコールバック先の NiconicoAuthCallbackAPI に渡し、ログイン中のユーザーアカウントとニコニコアカウントを紐づける
-    _, user_access_token = get_authorization_scheme_param(request.headers.get('Authorization'))
+    # ログイン用 JWT は URL / 外部サービスへ出さない。
+    # 代わりにサーバ側の短命・使い捨て state を発行し、その ID だけを OAuth state に載せる。
+    oauth_state_id, code_challenge = await NiconicoOAuthState.issue(
+        user_id = current_user.id,
+        client_url = client_url,
+    )
 
     # コールバック後の NiconicoAuthCallbackAPI に渡す state の値
+    ## client も state 経由で転送されるが、サーバは DB 上の client_url を正本として使う
     state = {
         # リダイレクト先の KonomiTV サーバー
         'server': f'https://{request.url.netloc}/',
-        # スマホ・タブレットでの NiconicoAuthCallbackAPI のリダイレクト先 URL
+        # スマホ・タブレットでのフォールバック用クライアント URL（表示・旧経路向け）
         'client': client_url,
-        # ログイン中ユーザーの JWT アクセストークン
-        'user_access_token': user_access_token,
+        # サーバ側セッション ID（ログイン JWT ではない）
+        'oauth_state': oauth_state_id,
     }
 
     # state は URL パラメータとして送らないといけないので、JSON エンコードしたあと Base64 でエンコードする
@@ -85,7 +104,8 @@ async def NiconicoAuthURLAPI(
     # 認証 URL を作成
     authorization_url = (
         f'https://oauth.nicovideo.jp/oauth2/authorize?response_type=code&'
-        f'scope={scope}&client_id={NICONICO_OAUTH_CLIENT_ID}&redirect_uri={callback_url}&state={state_base64}'
+        f'scope={scope}&client_id={NICONICO_OAUTH_CLIENT_ID}&redirect_uri={callback_url}&state={state_base64}&'
+        f'code_challenge={code_challenge}&code_challenge_method=S256'
     )
 
     return {'authorization_url': authorization_url}
@@ -98,17 +118,52 @@ async def NiconicoAuthURLAPI(
     response_description = 'ユーザーアカウントにニコニコアカウントのアクセストークン・リフレッシュトークンが登録できたことを示す。',
 )
 async def NiconicoAuthCallbackAPI(
-    client: Annotated[str, Query(description='OAuth 連携元の KonomiTV クライアントの URL 。')],
-    user_access_token: Annotated[str, Query(description='コールバック元から渡された、ユーザーの JWT アクセストークン。')],
+    oauth_state: Annotated[str | None, Query(description='サーバ発行の OAuth state ID。ログイン JWT ではない。')] = None,
+    client: Annotated[str | None, Query(description='OAuth 連携元クライアント URL（リダイレクト用フォールバック）。')] = None,
     code: Annotated[str | None, Query(description='コールバック元から渡された認証コード。OAuth 認証が成功したときのみセットされる。')] = None,
     error: Annotated[str | None, Query(description='このパラメーターがセットされているとき、OAuth 認証がユーザーによって拒否されたことを示す。')] = None,
+    # 旧実装が state に載せていたログイン JWT。受理してユーザー認証に使わない（SEC-001）。
+    user_access_token: Annotated[str | None, Query(description='互換のため残す。無視される。', include_in_schema=False)] = None,
 ):
     """
     ニコニコの OAuth 認証のコールバックを受け取り、ログイン中のユーザーアカウントとニコニコアカウントを紐づける。
     """
 
-    # スマホ・タブレット向けのリダイレクト先 URL を生成
-    redirect_url = f'{client.rstrip("/")}/settings/jikkyo'
+    del user_access_token  # 意図的に未使用。クエリに残っていてもセッション認証には使わない。
+
+    # エラー応答用のリダイレクト先（state 消費前はクエリ client をフォールバックに使う）
+    if client:
+        redirect_url = _BuildSettingsJikkyoRedirectUrl(client)
+    else:
+        # client も無い場合は最低限の相対パス相当を避け、自サーバ設定画面を示すプレースホルダ
+        redirect_url = '/settings/jikkyo'
+
+    # state は OAuth の成功・拒否にかかわらず、callback へ到達した時点で一度だけ消費する。
+    pending_state: NiconicoOAuthState | None = None
+    if oauth_state is not None:
+        try:
+            pending_state = await NiconicoOAuthState.consume(oauth_state)
+        except ValueError:
+            pass
+
+    if oauth_state is None:
+        logging.warning('[NiconicoRouter][NiconicoAuthCallbackAPI] OAuth state is missing.')
+        return OAuthCallbackResponse(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = 'OAuth state is missing',
+            redirect_to = redirect_url,
+        )
+
+    if pending_state is None:
+        logging.warning('[NiconicoRouter][NiconicoAuthCallbackAPI] OAuth state is invalid or expired.')
+        return OAuthCallbackResponse(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = 'OAuth state is invalid or expired',
+            redirect_to = redirect_url,
+        )
+
+    # リダイレクト先は発行時に保存した client_url を正本にする（クエリ改ざんを無視）
+    redirect_url = _BuildSettingsJikkyoRedirectUrl(pending_state.client_url)
 
     # "error" パラメーターがセットされている
     # OAuth 認証がユーザーによって拒否されたことを示しているので、401 エラーにする
@@ -132,14 +187,15 @@ async def NiconicoAuthCallbackAPI(
             redirect_to = redirect_url,
         )
 
-    # JWT アクセストークンに基づくユーザーアカウントを取得
-    # この時点でユーザーアカウントが取得できなければ 401 エラーが送出される
-    try:
-        current_user = await GetCurrentUser(token=user_access_token)
-    except HTTPException as ex:
+    current_user = await User.filter(id=pending_state.user_id).get_or_none()
+    if current_user is None:
+        logging.warning(
+            f'[NiconicoRouter][NiconicoAuthCallbackAPI] User for OAuth state does not exist. '
+            f'[user_id: {pending_state.user_id}]'
+        )
         return OAuthCallbackResponse(
-            status_code = ex.status_code,
-            detail = cast(Any, ex).message,
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = 'User associated with OAuth state does not exist',
             redirect_to = redirect_url,
         )
 
@@ -156,6 +212,7 @@ async def NiconicoAuthCallbackAPI(
                     'client_id': NICONICO_OAUTH_CLIENT_ID,
                     'client_secret': Interlaced(3),
                     'code': code,
+                    'code_verifier': pending_state.code_verifier,
                     'redirect_uri': 'https://app.konomi.tv/api/redirect/niconico',
                 },
             )
