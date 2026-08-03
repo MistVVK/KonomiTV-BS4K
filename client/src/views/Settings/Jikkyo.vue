@@ -191,6 +191,12 @@ import useSettingsStore from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
 import useVersionStore from '@/stores/VersionStore';
 import Utils from '@/utils';
+import {
+    createNiconicoOAuthPopupMessage,
+    isNiconicoOAuthPopupMessageEvent,
+    parseNiconicoOAuthResult,
+    type NiconicoOAuthResult,
+} from '@/utils/NiconicoOAuth';
 
 export default defineComponent({
     name: 'Settings-Jikkyo',
@@ -225,6 +231,12 @@ export default defineComponent({
 
             // コメントの不透明度 (LocalStorage: dplayer-danmaku-opacity)
             comment_opacity: 0.5,
+
+            // OAuth 連携中の popup と、完了・中断時に必ず解除するイベントリスナー / タイマー
+            oauth_popup_window: null as Window | null,
+            oauth_popup_message_listener: null as ((event: MessageEvent) => void) | null,
+            oauth_popup_close_timer_id: null as number | null,
+            oauth_popup_timeout_timer_id: null as number | null,
         };
     },
     watch: {
@@ -270,31 +282,35 @@ export default defineComponent({
             this.comment_opacity = parseFloat(comment_opacity_raw);
         }
 
-        // コメント表示設定だけを表示するときは、ニコニコ連携情報を取得する必要はない
-        if (this.section !== 'comments' && this.settingsStore.is_jikkyo_enabled === true) {
-
-            // アカウント情報を更新
-            await this.userStore.fetchUser();
-
-            // もしハッシュ (# から始まるフラグメント) に何か指定されていたら、
-            // OAuth 連携のコールバックの結果が入っている可能性が高いので、パースを試みる
-            // アカウント情報更新より後にしないと Snackbar がうまく表示されない
-            if (location.hash !== '') {
-                const params = new URLSearchParams(location.hash.replace('#', ''));
-                if (params.get('status') !== null && params.get('detail') !== null) {
-                    // コールバックの結果を取得できたので、OAuth 連携の結果を画面に通知する
-                    const authorization_status = parseInt(params.get('status')!);
-                    const authorization_detail = params.get('detail')!;
-                    this.onOAuthCallbackReceived(authorization_status, authorization_detail);
-                    // URL からフラグメントを削除
-                    // ref: https://stackoverflow.com/a/49373716/17124142
-                    history.replaceState(null, '', ' ');
-                }
+        // callback は API サーバーからこの設定画面へ 303 で戻る。
+        // popup 内なら同一 Origin の opener だけへ固定形式の結果を送り、画面の初期化前に閉じる。
+        const oauth_result = parseNiconicoOAuthResult(location.hash);
+        if (oauth_result !== null) {
+            history.replaceState(null, '', `${location.pathname}${location.search}`);
+            if (window.opener !== null && window.opener !== window) {
+                window.opener.postMessage(createNiconicoOAuthPopupMessage(oauth_result), window.location.origin);
+                window.close();
+                return;
             }
+        }
+
+        // コメント表示設定だけを表示するときや実況を個人設定で止めているときは、連携情報を取得しない。
+        if (this.section !== 'comments' && this.settingsStore.is_jikkyo_enabled === true) {
+            await this.userStore.fetchUser();
+        }
+
+        // モバイルのリダイレクト経路では、この画面自身が固定形式の結果を通知する。
+        // アカウント情報更新より後にしないと Snackbar がうまく表示されない。
+        if (oauth_result !== null) {
+            await this.onOAuthCallbackReceived(oauth_result);
         }
 
         // ローディング状態を解除
         this.is_loading = false;
+    },
+    beforeUnmount() {
+        // 設定画面を離れた後に OAuth 結果を処理しないよう、popup を閉じてすべての監視を解除する。
+        this.cleanupOAuthPopup(true);
     },
     methods: {
         setDefaultIcon(event: Event) {
@@ -302,6 +318,9 @@ export default defineComponent({
         },
 
         async loginNiconicoAccount() {
+
+            // 再試行時に以前の popup やリスナーを残さない。
+            this.cleanupOAuthPopup(true);
 
             // 設定変更直後などに非表示になる前の UI から呼ばれても、外部認証 API へは接続しない
             if (this.settingsStore.is_jikkyo_enabled === false) {
@@ -335,51 +354,86 @@ export default defineComponent({
                 return;
             }
 
-            // 認証完了 or 失敗後、ポップアップウインドウから送信される文字列を受信
-            const onMessage = async (event) => {
+            this.oauth_popup_window = popup_window;
 
-                // すでにウインドウが閉じている場合は実行しない
-                if (popup_window.closed) return;
+            // API callback は保存済み Origin の設定画面へ遷移してから結果を送る。
+            // そのため、同一 Origin かつ window.open() で得た popup 自身のメッセージだけを受理する。
+            const onMessage = async (event: MessageEvent) => {
+                if (isNiconicoOAuthPopupMessageEvent(event, popup_window, window.location.origin) === false) {
+                    return;
+                }
 
-                // 受け取ったオブジェクトに KonomiTV-OAuthPopup キーがない or そもそもオブジェクトではない際は実行しない
-                // ブラウザの拡張機能から結構余計な message が飛んでくるっぽい…。
-                if (Utils.typeof(event.data) !== 'object') return;
-                if (('KonomiTV-OAuthPopup' in event.data) === false) return;
-
-                // 認証は完了したので、ポップアップウインドウを閉じ、リスナーを解除する
-                if (popup_window) popup_window.close();
-                window.removeEventListener('message', onMessage);
-
-                // ステータスコードと詳細メッセージを取得
-                const authorization_status = event.data['KonomiTV-OAuthPopup']['status'] as number;
-                const authorization_detail = event.data['KonomiTV-OAuthPopup']['detail'] as string;
-                this.onOAuthCallbackReceived(authorization_status, authorization_detail);
+                const oauth_result = event.data['KonomiTV-OAuthPopup'].result;
+                this.cleanupOAuthPopup(true);
+                await this.onOAuthCallbackReceived(oauth_result);
             };
+            this.oauth_popup_message_listener = onMessage;
 
             // postMessage() を受信するリスナーを登録
             window.addEventListener('message', onMessage);
+
+            // ユーザーが popup を閉じた場合は、結果を待つリスナーとタイマーをすぐに解除する。
+            this.oauth_popup_close_timer_id = window.setInterval(() => {
+                if (this.oauth_popup_window === popup_window && popup_window.closed) {
+                    this.cleanupOAuthPopup(false);
+                }
+            }, 500);
+
+            // サーバー側 state と同じ10分で待機を打ち切り、古い popup から後で結果を受理しない。
+            this.oauth_popup_timeout_timer_id = window.setTimeout(() => {
+                if (this.oauth_popup_window === popup_window) {
+                    this.cleanupOAuthPopup(true);
+                    Message.error('ニコニコアカウントとの連携がタイムアウトしました。');
+                }
+            }, 10 * 60 * 1000);
         },
 
-        async onOAuthCallbackReceived(authorization_status: number, authorization_detail: string) {
-            console.log(`NiconicoAuthCallbackAPI: Status: ${authorization_status} / Detail: ${authorization_detail}`);
+        cleanupOAuthPopup(close_popup: boolean) {
 
-            // OAuth 連携に失敗した
-            if (authorization_status !== 200) {
-                if (authorization_detail.startsWith('Authorization was denied (access_denied)')) {
-                    Message.error('ニコニコアカウントとの連携がキャンセルされました。');
-                } else if (authorization_detail.startsWith('Failed to get access token (HTTP Error ')) {
-                    const error = authorization_detail.replace('Failed to get access token ', '');
-                    Message.error(`アクセストークンの取得に失敗しました。${error}`);
-                } else if (authorization_detail.startsWith('Failed to get access token (Connection Timeout)')) {
-                    Message.error('アクセストークンの取得に失敗しました。ニコニコで障害が発生している可能性があります。');
-                } else if (authorization_detail.startsWith('Failed to get user information (HTTP Error ')) {
-                    const error = authorization_detail.replace('Failed to get user information ', '');
-                    Message.error(`ニコニコアカウントのユーザー情報の取得に失敗しました。${error}`);
-                } else if (authorization_detail.startsWith('Failed to get user information (Connection Timeout)')) {
-                    Message.error('ニコニコアカウントのユーザー情報の取得に失敗しました。ニコニコで障害が発生している可能性があります。');
-                } else {
-                    Message.error(`ニコニコアカウントとの連携に失敗しました。(${authorization_detail})`);
-                }
+            // リスナーを先に外し、popup.close() に伴うイベントを処理しないようにする。
+            if (this.oauth_popup_message_listener !== null) {
+                window.removeEventListener('message', this.oauth_popup_message_listener);
+                this.oauth_popup_message_listener = null;
+            }
+            if (this.oauth_popup_close_timer_id !== null) {
+                window.clearInterval(this.oauth_popup_close_timer_id);
+                this.oauth_popup_close_timer_id = null;
+            }
+            if (this.oauth_popup_timeout_timer_id !== null) {
+                window.clearTimeout(this.oauth_popup_timeout_timer_id);
+                this.oauth_popup_timeout_timer_id = null;
+            }
+            if (close_popup && this.oauth_popup_window !== null && this.oauth_popup_window.closed === false) {
+                this.oauth_popup_window.close();
+            }
+            this.oauth_popup_window = null;
+        },
+
+        async onOAuthCallbackReceived(oauth_result: NiconicoOAuthResult) {
+            console.log(`NiconicoAuthCallbackAPI: Result: ${oauth_result}`);
+
+            if (oauth_result === 'AccessDenied') {
+                Message.error('ニコニコアカウントとの連携がキャンセルされました。');
+                return;
+            }
+            if (oauth_result === 'TokenAPIError') {
+                Message.error('アクセストークンの取得に失敗しました。');
+                return;
+            }
+            if (oauth_result === 'TokenAPITimeout') {
+                Message.error('アクセストークンの取得に失敗しました。ニコニコで障害が発生している可能性があります。');
+                return;
+            }
+            if (oauth_result === 'UserAPIError') {
+                Message.error('ニコニコアカウントのユーザー情報の取得に失敗しました。');
+                return;
+            }
+            if (oauth_result === 'UserAPITimeout') {
+                Message.error('ニコニコアカウントのユーザー情報の取得に失敗しました。ニコニコで障害が発生している可能性があります。');
+                return;
+            }
+            if (oauth_result !== 'Success') {
+                Message.error('ニコニコアカウントとの連携に失敗しました。');
                 return;
             }
 

@@ -110,6 +110,8 @@ const useUserStore = defineStore('user', {
             // ブラウザからアクセストークンを削除
             // これをもってログアウトしたことになる（それ以降の Axios のリクエストにはアクセストークンが含まれなくなる）
             Utils.deleteAccessToken();
+            // サーバー側の更新トークンも失効させる（失敗してもローカルログアウトは完了させる）
+            void Users.logout();
 
             // 未ログイン状態に設定
             this.is_logged_in = false;
@@ -175,13 +177,18 @@ const useUserStore = defineStore('user', {
                 return;  // 更新失敗 (エラーハンドリングは services 層で行われる)
             }
 
+            // パスワード変更時は全端末のJWTが失効しているため、現在の端末もログアウトする
+            if (user_update_request.password !== undefined) {
+                this.logout(true);
+                Message.show('パスワードを更新しました。もう一度ログインしてください。');
+                return;
+            }
+
             // ユーザーアカウントの情報を再取得する
             await this.fetchUser(true);
 
             if (user_update_request.username !== undefined) {
                 Message.show('ユーザー名を更新しました。');
-            } else if (user_update_request.password !== undefined) {
-                Message.show('パスワードを更新しました。');
             }
         },
 

@@ -176,7 +176,6 @@ Windows では Windows サービス、Linux では pm2 サービスとして動�
     - `JikkyoClient.py`: ニコニコ実況・NX-Jikkyo 連携用の API クライアント実装
     - `TwitterGraphQLAPI.py`: Twitter API 連携用にリバースエンジニアリングして開発した API クライアント実装
     - `TSInformation.py`: 日本のテレビ放送で用いられている MPEG2-TS から情報を取得する際に役立つユーティリティ群
-    - `OAuthCallbackResponse.py`: OAuth 認証のコールバック時にブラウザに情報を渡すために返す特殊なレスポンス
     - `DriveIOLimiter.py`: ドライブごとの同時実行数を制限するためのユーティリティクラス
     - `ProcessLimiter.py`: プロセスごとの同時実行数を制限するためのユーティリティクラス
   - `app.py`: FastAPI アプリケーションやルーターの初期化・バックグラウンドタスクの定義

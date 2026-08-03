@@ -19,6 +19,7 @@ from app.utils import Interlaced
 if TYPE_CHECKING:
     from app.models.AccountLink import AccountLink
     from app.models.BlueskyAccount import BlueskyAccount
+    from app.models.RefreshToken import RefreshToken
     from app.models.TwitterAccount import TwitterAccount
 
 
@@ -38,6 +39,7 @@ class User(TortoiseModel):
     name = fields.TextField()
     password = fields.TextField()
     is_admin = fields.BooleanField()
+    token_version = fields.IntField(default=0)
     # allow_nan=False で NaN/Inf の DB 汚染を拒否する (Starlette JSONResponse も非有限値を拒否するため)
     client_settings = cast(
         TortoiseField[dict[str, Any]],
@@ -50,6 +52,7 @@ class User(TortoiseModel):
     niconico_refresh_token = cast(TortoiseField[str | None], fields.TextField(null=True))
     twitter_accounts: fields.ReverseRelation[TwitterAccount]
     bluesky_accounts: fields.ReverseRelation[BlueskyAccount]
+    refresh_tokens: fields.ReverseRelation[RefreshToken]
     account_links: fields.ReverseRelation[AccountLink]
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)

@@ -33,7 +33,9 @@ from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.metadata.RecordedSeriesResolver import RecordedSeriesResolver
 from app.models.Channel import Channel
+from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.Program import Program
+from app.models.RefreshToken import RefreshToken
 from app.routers import (
     AnalysisTasksRouter,
     BlueskyRouter,
@@ -271,6 +273,12 @@ recorded_scan_task: RecordedScanTask | None = None
 async def Startup():
     global recorded_scan_task
 
+    # 期限切れの更新トークンを起動時に削除し、認証テーブルの無制限増加を防ぐ
+    await RefreshToken.cleanupExpired()
+
+    # サーバー停止中を含めて期限切れになった OAuth state の PKCE verifier を起動直後に消去
+    await NiconicoOAuthState.cleanupExpired()
+
     # 前回プロセスに残った構造化履歴とCM解析状態を中断へ確定する。
     await AnalysisTaskTracker.initialize()
     await CMAnalysisOrchestrator.markInterruptedAtStartup()
@@ -351,6 +359,13 @@ async def UpdateChannelJikkyoStatus():
     # 無効時には30秒周期の実況更新処理自体を実行しない
     if CONFIG.general.jikkyo_enabled is True:
         await Channel.updateJikkyoStatus()
+
+# 1分に1回、放置された期限切れ OAuth state の PKCE verifier を消去する
+# OAuth が再度利用されない環境でも、秘密文字列の保持期間を有効期限後1分以内に制限する
+@app.on_event('startup')
+@repeat_every(seconds=1 * 60, wait_first=1 * 60, logger=logging.logger)
+async def CleanupExpiredNiconicoOAuthStates():
+    await NiconicoOAuthState.cleanupExpired()
 
 # サーバーの終了処理は FastAPI と atexit のどちらから呼ばれても同じ Task を共有する
 _shutdown_completed = False
