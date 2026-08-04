@@ -12,6 +12,7 @@
         "prebuild": "patch-package",
         "preview": "concurrently --raw \"npm:akebi\" \"vite preview\"",
         "lint": "eslint . --fix --ignore-path .gitignore",
+        "test": "vitest run",
         "test:licenses": "node --test scripts/generate-license-document.test.mjs",
         "typecheck": "vue-tsc --noEmit"
     },
@@ -68,6 +69,7 @@
         "eslint-plugin-unused-imports": "^3.2.0",
         "eslint-plugin-vue": "^9.27.0",
         "eslint-plugin-vuetify": "^2.4.0",
+        "happy-dom": "^15.11.7",
         "network-information-types": "^0.1.1",
         "patch-package": "8.0.1",
         "run-script-os": "^1.1.6",
@@ -77,6 +79,7 @@
         "vite-plugin-comlink": "^5.0.1",
         "vite-plugin-pwa": "^0.21.2",
         "vite-plugin-vuetify": "^2.0.4",
+        "vitest": "^2.1.9",
         "vue-tsc": "^2.0.29"
     },
     "browserslist": [
