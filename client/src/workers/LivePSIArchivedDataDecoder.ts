@@ -9,7 +9,7 @@ import { decodeTS, ResponseMessage } from 'web-bml/worker';
 
 import { ILiveChannel } from '@/services/Channels';
 import { IProgram, IProgramPF, IProgramDefault } from '@/services/Programs';
-import Utils, { dayjs, PlayerUtils, ProgramUtils } from '@/utils';
+import Utils, { dayjs, ProgramUtils } from '@/utils';
 
 
 interface IPSIArchivedDataContext {
@@ -30,7 +30,7 @@ export interface ILivePSIArchivedDataDecoder {
 }
 
 export interface ILivePSIArchivedDataDecoderConstructor {
-    new (channel: ILiveChannel, api_quality: string, codec_query: string): ILivePSIArchivedDataDecoder;
+    new (channel: ILiveChannel, api_quality: string): ILivePSIArchivedDataDecoder;
 }
 
 
@@ -46,9 +46,6 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
     // 現在視聴中の API 上の画質 ID (ex: 1080p-60fps)
     private readonly api_quality: string;
 
-    // MPEG-TS と同一の LiveStream 共有キーへ接続する codec query
-    private readonly codec_query: string;
-
     // PSI/SI アーカイブデータの読み込みに必要な情報
     private psi_archived_data: Uint8Array = new Uint8Array(0);
     private psi_archived_data_api_abort_controller: AbortController | null = null;
@@ -60,12 +57,10 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
      * ここで渡すチャンネル情報はメインスレッドから渡された後は当然更新されないが、実際に利用するのは不変のチャンネル ID 系のみなので問題ない
      * @param channel 対象のチャンネル情報
      * @param api_quality 現在視聴中の API 上の画質 ID (ex: 1080p-60fps)
-     * @param codec_query MPEG-TS と同一の codec query
      */
-    constructor(channel: ILiveChannel, api_quality: string, codec_query: string) {
+    constructor(channel: ILiveChannel, api_quality: string) {
         this.channel = channel;
         this.api_quality = api_quality;
-        this.codec_query = codec_query;
     }
 
 
@@ -115,21 +110,12 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
         });
 
         // ライブ PSI/SI アーカイブデータストリーミング API の URL を作成
-        const konomitv_bs4k_psi_archived_data_api_url =
-            PlayerUtils.buildKonomiTVBS4KLiveAPIEndpointURL(
-                this.channel.display_channel_id,
-                this.api_quality,
-                'psi-archived-data',
-                this.codec_query,
-            );
+        const psi_archived_data_api_url = `${Utils.api_base_url}/streams/live/${this.channel.display_channel_id}/${this.api_quality}/psi-archived-data`;
 
         // ライブ PSI/SI アーカイブデータストリーミング API にリクエスト
         // 以降の処理はエンドレスなので非同期で実行
         this.psi_archived_data_api_abort_controller = new AbortController();
-        fetch(
-            konomitv_bs4k_psi_archived_data_api_url,
-            {signal: this.psi_archived_data_api_abort_controller.signal},
-        ).then(async (response) => {
+        fetch(psi_archived_data_api_url, {signal: this.psi_archived_data_api_abort_controller.signal}).then(async (response) => {
 
             // ReadableStreamDefaultReader を取得
             const reader = response.body?.getReader();

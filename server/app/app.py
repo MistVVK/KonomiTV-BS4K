@@ -59,8 +59,6 @@ from app.routers import (
     VideosRouter,
     VideoStreamsRouter,
 )
-from app.streams.LivePrepareCoordinator import LIVE_PREPARE_COORDINATOR
-from app.streams.LiveSourceCoordinator import LIVE_SOURCE_COORDINATOR
 from app.streams.LiveStream import LiveStream
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
@@ -385,17 +383,6 @@ async def _RunShutdownCleanup() -> None:
 
     cleanup_failures: list[BaseException] = []
 
-    def RecordUnconfirmedCleanup(label: str, result: object) -> None:
-        """bool 契約が True でない cleanup 結果を失敗として記録する。"""
-
-        failure = (
-            result
-            if isinstance(result, BaseException)
-            else RuntimeError(f'{label}:{result!r}')
-        )
-        cleanup_failures.append(failure)
-        logging.error(f'{label} Shutdown cleanup was not confirmed: {result!r}')
-
     async def RunCleanupStep(
         label: str,
         operation: Awaitable[object],
@@ -409,44 +396,9 @@ async def _RunShutdownCleanup() -> None:
             logging.error(f'{label} Shutdown cleanup failed.', exc_info=ex)
             return False, None
 
-    # LiveStream の接続・エンコーダーと共有 source producer を同時に停止する
-    ## LiveStream.shutdown() は HTTP 要求から分離した session Retire / Prepare cleanup も回収する
-    live_streams = LiveStream.getAllLiveStreams()
-    shutdown_results = await asyncio.gather(
-        *(live_stream.shutdown() for live_stream in live_streams),
-        LIVE_SOURCE_COORDINATOR.shutdown(),
-        return_exceptions = True,
-    )
-    for live_stream, result in zip(live_streams, shutdown_results[:len(live_streams)]):
-        if result is not True:
-            RecordUnconfirmedCleanup(live_stream.log_prefix, result)
-    source_shutdown_result = shutdown_results[-1]
-    if source_shutdown_result is not True:
-        RecordUnconfirmedCleanup('[LiveSourceCoordinator]', source_shutdown_result)
-
-    # 切断により生成された Prepare finalize を待ち、そこから増えた LiveStream cleanup も再度回収する
-    prepare_drain_succeeded, prepare_drain_result = await RunCleanupStep(
-        '[LivePrepareCoordinator] finalize drain',
-        LIVE_PREPARE_COORDINATOR.drainFinalizeTasks(),
-    )
-    if prepare_drain_succeeded and prepare_drain_result is not True:
-        RecordUnconfirmedCleanup(
-            '[LivePrepareCoordinator] finalize drain',
-            prepare_drain_result,
-        )
-    redrain_results = await asyncio.gather(
-        *(live_stream.drainCleanupTasks() for live_stream in live_streams),
-        return_exceptions = True,
-    )
-    for live_stream, result in zip(live_streams, redrain_results):
-        if result is not True:
-            RecordUnconfirmedCleanup(f'{live_stream.log_prefix} redrain', result)
-
-    # cleanup 完了後も残っている lease だけを shutdown fallback として解放する
-    await RunCleanupStep(
-        '[LivePrepareCoordinator] release all',
-        LIVE_PREPARE_COORDINATOR.releaseAll(reason='shutdown'),
-    )
+    # 単一パイプライン版の全ライブストリームを Offline にして終了させる。
+    for live_stream in LiveStream.getAllLiveStreams():
+        live_stream.setStatus('Offline', 'ライブストリームは Offline です。', True)
 
     # 全てのチューナーインスタンスを終了する (ライブ放送波を EDCB から受信している場合のみ)
     if CONFIG.general.live_stream_backend == 'EDCB':

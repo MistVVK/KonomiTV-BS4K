@@ -31,8 +31,9 @@ class ProcessLimiter:
 
         if process_key not in cls._semaphores:
             # CPU 論理コア数を取得
-            # 取得不能時は最小構成の1コアとして扱い、Semaphore(0) による永久待機を防ぐ
-            cpu_count = psutil.cpu_count(logical=True) or 1
-            # 同時実行数を CPU コア数の 50% に制限しつつ、最低1プロセスは進行可能にする
-            cls._semaphores[process_key] = asyncio.Semaphore(max(1, cpu_count // 2))
+            cpu_count = psutil.cpu_count(logical=True)
+            if cpu_count is None:
+                cpu_count = 4  # 取得できない場合は4コアと仮定
+            # 同時実行数を CPU コア数の 50% に制限
+            cls._semaphores[process_key] = asyncio.Semaphore(cpu_count // 2)
         return cls._semaphores[process_key]
