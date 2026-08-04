@@ -5,6 +5,9 @@ from typing import Literal
 
 from app.config import Config
 from app.constants import QUALITY, QUALITY_TYPES
+from app.streams.KonomiTVBS4KPlaybackEncoding import (
+    IsKonomiTVBS4KVideoCodecBitDepthSupported,
+)
 from app.streams.RecordedEncodingCodecs import AudioCodec, VideoCodec
 
 
@@ -148,6 +151,12 @@ class StreamQualityWithOptions:
     ## HEVC 10bit や 24fps モードは、ベース画質から分けてストリーム ID やエンコード引数へ渡す
     encoding_options: StreamEncodingOptions
 
+    # query で映像 codec または bit depth が明示されたかどうか
+    is_video_encoding_explicitly_requested: bool = False
+
+    # query で従来値以外の音声 codec が明示されたかどうか
+    is_audio_encoding_explicitly_requested: bool = False
+
 
 def SplitQualityAndEncodingOptions(
     quality: str,
@@ -195,6 +204,16 @@ def SplitQualityAndEncodingOptions(
     if base_quality not in QUALITY:
         return None
 
+    # 明示 bit depth と旧 -10bit suffix のどちらでも、codec 仕様外の組み合わせは拒否する
+    requested_video_bit_depth = video_bit_depth
+    if requested_video_bit_depth is None and is_hevc_10bit_requested and resolved_video_codec != 'hevc':
+        return None
+    if (
+        requested_video_bit_depth is not None and
+        IsKonomiTVBS4KVideoCodecBitDepthSupported(resolved_video_codec, requested_video_bit_depth) is False
+    ):
+        return None
+
     # 画質とサーバー側の対応状況を見て、実際に使えるオプションだけを残す
     ## HEVC 10bit 非対応エンコーダーや 1080p-60fps の 24fps モード要求はここで無効化される
     encoding_options = StreamEncodingOptions.fromRequest(
@@ -211,4 +230,8 @@ def SplitQualityAndEncodingOptions(
     return StreamQualityWithOptions(
         quality = base_quality,
         encoding_options = encoding_options,
+        is_video_encoding_explicitly_requested = (
+            video_codec is not None or video_bit_depth is not None
+        ),
+        is_audio_encoding_explicitly_requested = audio_codec != 'aac',
     )
