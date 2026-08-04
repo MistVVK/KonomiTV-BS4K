@@ -15,11 +15,27 @@ from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 from tortoise import Tortoise, timezone
 
+import app.routers.JikkyoDependency as jikkyo_dependency_module
 import app.routers.NiconicoRouter as niconico_router_module
 from app.constants import PASSWORD_CONTEXT
 from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.User import User
 from app.routers.UsersRouter import GenerateAccessToken, GetCurrentUser
+
+
+class _EnabledSettings:
+    """BS4K の実況ハードオフに左右されず、OAuth 本体を検証する設定。"""
+
+    class general:
+        jikkyo_enabled = True
+
+
+@pytest.fixture(autouse=True)
+def _EnableJikkyo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SEC-001 / SEC-002 テストでは実況機能を明示的に有効化する。"""
+
+    monkeypatch.setattr(niconico_router_module, 'Config', lambda: _EnabledSettings())
+    monkeypatch.setattr(jikkyo_dependency_module, 'Config', lambda: _EnabledSettings())
 
 
 async def _InitializeDatabase() -> None:
@@ -113,7 +129,7 @@ def test_niconico_oauth_state_cleans_up_expired_verifiers() -> None:
             abandoned_user = await _CreateUser(name='abandoned-oauth-user')
             abandoned_state_id, _ = await NiconicoOAuthState.issue(
                 user_id=abandoned_user.id,
-                client_url='https://client.example/',
+                client_url='https://client.example',
             )
             abandoned_state_hash = NiconicoOAuthState.hashStateId(abandoned_state_id)
             await NiconicoOAuthState.filter(state_hash=abandoned_state_hash).update(
@@ -124,7 +140,7 @@ def test_niconico_oauth_state_cleans_up_expired_verifiers() -> None:
             active_user = await _CreateUser(name='active-oauth-user')
             active_state_id, _ = await NiconicoOAuthState.issue(
                 user_id=active_user.id,
-                client_url='https://client.example/',
+                client_url='https://client.example',
             )
             abandoned_record = await NiconicoOAuthState.get(user_id=abandoned_user.id)
             active_record = await NiconicoOAuthState.get(user_id=active_user.id)
