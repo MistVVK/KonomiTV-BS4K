@@ -73,12 +73,16 @@
                 </v-text-field>
             </div>
             <div class="settings__item settings__item--switch">
-                <label class="settings__item-heading" for="encoder_bs4k_low_latency">BS4K エンコーダーを即時出力優先にする</label>
+                <label class="settings__item-heading" for="encoder_bs4k_low_latency">
+                    <span>BS4K エンコーダーを即時出力優先にする</span>
+                    <span class="bs4k-warning-badge">注意</span>
+                </label>
                 <label class="settings__item-label" for="encoder_bs4k_low_latency">
                     有効にすると、BS4K のライブ視聴と ONID=11 の録画再生時だけエンコーダーに即時出力系のオプションを付けます。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="encoder_bs4k_low_latency" hide-details
-                    v-model="server_settings.general.encoder_bs4k_low_latency">
+                    :model-value="server_settings.general.encoder_bs4k_low_latency"
+                    @update:model-value="updateEncoderBS4KLowLatency($event)">
                 </v-switch>
             </div>
             <div class="settings__item settings__item--switch">
@@ -259,6 +263,25 @@
                 <Icon icon="fluent:save-16-filled" class="mr-2" height="23px" />BS4K設定を更新
             </v-btn>
         </div>
+        <v-dialog v-model="encoder_bs4k_low_latency_warning_dialog" max-width="560">
+            <v-card>
+                <v-card-title>BS4K エンコーダーの即時出力優先を有効化</v-card-title>
+                <v-card-text>
+                    <v-alert class="mb-4" color="warning" variant="tonal">
+                        BS4K 再生時に、プチフリーズのような再読み込みが多発するおそれがあります。
+                    </v-alert>
+                    再生の安定性よりもエンコーダーからの即時出力を優先する設定です。<br>
+                    内容を理解した上で、それでも利用する場合だけ有効にしてください。
+                </v-card-text>
+                <v-card-actions>
+                    <v-spacer />
+                    <v-btn variant="text" @click="encoder_bs4k_low_latency_warning_dialog = false">キャンセル</v-btn>
+                    <v-btn color="warning" variant="flat" @click="confirmEncoderBS4KLowLatency()">
+                        それでも有効にする
+                    </v-btn>
+                </v-card-actions>
+            </v-card>
+        </v-dialog>
     </SettingsViewContainer>
 </template>
 <script lang="ts" setup>
@@ -406,6 +429,7 @@ settings_store.settings.bs4k_video_streaming_quality =
 settings_store.settings.bs4k_video_streaming_quality_cellular =
     legacy_bs4k_quality_map[settings_store.settings.bs4k_video_streaming_quality_cellular] ?? settings_store.settings.bs4k_video_streaming_quality_cellular;
 const player_tab = ref<number | null>(0);
+const encoder_bs4k_low_latency_warning_dialog = ref(false);
 const network_circuits = ['Wi-Fi 回線時', 'モバイル回線時'];
 const streaming_video_codecs = [
     {title: 'H.264 / AVC（互換性優先）', value: 'avc'},
@@ -458,6 +482,24 @@ const server_settings = computed<IServerSettings>({
         }
     },
 });
+
+/** 注意事項への明示的な同意が得られるまで、即時出力優先を有効化しない。 */
+function updateEncoderBS4KLowLatency(enabled: boolean | null): void {
+    if (enabled !== true) {
+        server_settings.value.general.encoder_bs4k_low_latency = false;
+        encoder_bs4k_low_latency_warning_dialog.value = false;
+        return;
+    }
+    if (server_settings.value.general.encoder_bs4k_low_latency === false) {
+        encoder_bs4k_low_latency_warning_dialog.value = true;
+    }
+}
+
+/** 警告を確認して利用継続を選んだ場合だけ、即時出力優先を有効化する。 */
+function confirmEncoderBS4KLowLatency(): void {
+    server_settings.value.general.encoder_bs4k_low_latency = true;
+    encoder_bs4k_low_latency_warning_dialog.value = false;
+}
 
 function resetServerSettingsDraft(): void {
     local_server_settings.value = structuredClone(toRaw(base_server_settings.value));
@@ -513,3 +555,20 @@ async function updateServerSettings() {
 }
 
 </script>
+
+<style lang="scss" scoped>
+
+.bs4k-warning-badge {
+    flex-shrink: 0;
+    margin-left: 8px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgb(var(--v-theme-warning));
+    color: rgb(var(--v-theme-on-warning));
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 18px;
+    letter-spacing: 0.08em;
+}
+
+</style>
