@@ -236,13 +236,17 @@
                 <span class="ml-2">プレイヤー</span>
             </div>
             <div class="settings__item settings__item--switch" :class="{'settings__item--disabled': is_disabled}">
-                <label class="settings__item-heading" for="bs4k_ignore_viewer_low_latency">BS4K プレイヤーを通常バッファで再生する</label>
+                <label class="settings__item-heading" for="bs4k_ignore_viewer_low_latency">
+                    <span>BS4K プレイヤーを通常バッファで再生する</span>
+                    <span class="bs4k-warning-badge">注意</span>
+                </label>
                 <label class="settings__item-label" for="bs4k_ignore_viewer_low_latency">
                     有効にすると、BS4K のライブ視聴時だけユーザーの低遅延視聴設定を使わず、通常の再生バッファを使います。<br>
                     変更を反映するには BS4K設定を更新し、KonomiTV-BS4K サーバーを再起動してください。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="bs4k_ignore_viewer_low_latency" hide-details
-                    v-model="server_settings.general.bs4k_ignore_viewer_low_latency" :disabled="is_disabled">
+                    :model-value="server_settings.general.bs4k_ignore_viewer_low_latency" :disabled="is_disabled"
+                    @update:model-value="updateBS4KIgnoreViewerLowLatency($event)">
                 </v-switch>
             </div>
         </div>
@@ -278,6 +282,25 @@
                     <v-btn variant="text" @click="encoder_bs4k_low_latency_warning_dialog = false">キャンセル</v-btn>
                     <v-btn color="warning" variant="flat" @click="confirmEncoderBS4KLowLatency()">
                         それでも有効にする
+                    </v-btn>
+                </v-card-actions>
+            </v-card>
+        </v-dialog>
+        <v-dialog v-model="bs4k_ignore_viewer_low_latency_warning_dialog" max-width="560">
+            <v-card>
+                <v-card-title>BS4K プレイヤーの通常バッファを無効化</v-card-title>
+                <v-card-text>
+                    <v-alert class="mb-4" color="warning" variant="tonal">
+                        ユーザー側で低遅延視聴が有効な場合、BS4K 再生時にプチフリーズのような再読み込みが多発するおそれがあります。
+                    </v-alert>
+                    通常バッファの強制を解除し、ユーザーごとの低遅延視聴設定を優先します。<br>
+                    内容を理解した上で、それでも利用する場合だけオフにしてください。
+                </v-card-text>
+                <v-card-actions>
+                    <v-spacer />
+                    <v-btn variant="text" @click="bs4k_ignore_viewer_low_latency_warning_dialog = false">キャンセル</v-btn>
+                    <v-btn color="warning" variant="flat" @click="confirmBS4KIgnoreViewerLowLatencyDisabled()">
+                        それでもオフにする
                     </v-btn>
                 </v-card-actions>
             </v-card>
@@ -430,6 +453,7 @@ settings_store.settings.bs4k_video_streaming_quality_cellular =
     legacy_bs4k_quality_map[settings_store.settings.bs4k_video_streaming_quality_cellular] ?? settings_store.settings.bs4k_video_streaming_quality_cellular;
 const player_tab = ref<number | null>(0);
 const encoder_bs4k_low_latency_warning_dialog = ref(false);
+const bs4k_ignore_viewer_low_latency_warning_dialog = ref(false);
 const network_circuits = ['Wi-Fi 回線時', 'モバイル回線時'];
 const streaming_video_codecs = [
     {title: 'H.264 / AVC（互換性優先）', value: 'avc'},
@@ -499,6 +523,24 @@ function updateEncoderBS4KLowLatency(enabled: boolean | null): void {
 function confirmEncoderBS4KLowLatency(): void {
     server_settings.value.general.encoder_bs4k_low_latency = true;
     encoder_bs4k_low_latency_warning_dialog.value = false;
+}
+
+/** 通常バッファをオフにする場合だけ警告し、オンへの切り替えはそのまま反映する。 */
+function updateBS4KIgnoreViewerLowLatency(enabled: boolean | null): void {
+    if (enabled === true) {
+        server_settings.value.general.bs4k_ignore_viewer_low_latency = true;
+        bs4k_ignore_viewer_low_latency_warning_dialog.value = false;
+        return;
+    }
+    if (server_settings.value.general.bs4k_ignore_viewer_low_latency === true) {
+        bs4k_ignore_viewer_low_latency_warning_dialog.value = true;
+    }
+}
+
+/** 警告を確認して利用継続を選んだ場合だけ、通常バッファの強制を解除する。 */
+function confirmBS4KIgnoreViewerLowLatencyDisabled(): void {
+    server_settings.value.general.bs4k_ignore_viewer_low_latency = false;
+    bs4k_ignore_viewer_low_latency_warning_dialog.value = false;
 }
 
 function resetServerSettingsDraft(): void {
