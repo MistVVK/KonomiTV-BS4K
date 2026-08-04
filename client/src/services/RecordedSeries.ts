@@ -1,6 +1,10 @@
 import type { IAnalysisTaskAccepted } from '@/services/AnalysisTasks';
 
 import APIClient from '@/services/APIClient';
+import {
+    ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC,
+    ACP_HARD_TIMEOUT_SEC,
+} from '@/utils/RecordedEpisodeResolution';
 
 
 export type RecordedEpisodeNumberAcceptanceMode = 'HighConfidenceOnly' | 'Always';
@@ -28,6 +32,8 @@ export interface IRecordedSeriesSettings {
     // ACP 共通（モデル名と推論深さは分離）
     acp_model: string | null;
     acp_reasoning_effort: AcpReasoningEffort | null;
+    // KonomiTV-BS4K 固有の Codex Fast service tier 設定
+    konomitv_bs4k_acp_codex_fast_mode_enabled: boolean;
     acp_timeout_sec: number;
     // Gemini CLI / Vertex AI 用
     google_cloud_project: string | null;
@@ -48,6 +54,7 @@ export interface IRecordedSeriesSettingsUpdate {
     model: string;
     acp_model: string | null;
     acp_reasoning_effort: AcpReasoningEffort | null;
+    konomitv_bs4k_acp_codex_fast_mode_enabled: boolean;
     acp_timeout_sec: number;
     google_cloud_project: string | null;
     google_cloud_location: string | null;
@@ -56,12 +63,15 @@ export interface IRecordedSeriesSettingsUpdate {
 
 /** 全ユーザーの録画シリーズ処理で共有する、内容非公開の ACP 資格情報状態。 */
 export interface IKonomiTVBS4KACPCredentialStatus {
+    acp_operation_running: boolean;
     codex_host_auth_available: boolean;
     codex_auth_imported: boolean;
     codex_auth_imported_at: string | null;
+    codex_auth_in_use: boolean;
     grok_host_auth_available: boolean;
     grok_auth_imported: boolean;
     grok_auth_imported_at: string | null;
+    grok_auth_in_use: boolean;
     google_adc_available: boolean;
 }
 
@@ -366,13 +376,44 @@ export default class RecordedSeries {
         return true;
     }
 
-    /** 現在の入力内容を保存せずに AI バックエンドへの接続を確認する。 */
+    /**
+     * 現在の入力内容を保存せずに AI バックエンドへの接続を確認する。
+     *
+     * サーバー側の ACP は壁時計ではなく無通信タイムアウトで打ち切る。
+     * Codex Luna Max のように推論・結果整形が長い場合でも進捗がある限り待つため、
+     * クライアントの既定 30 秒 HTTP タイムアウトでは足りない。
+     * ACP はサーバー hard limit + 回収余裕、OpenAI 互換は設定由来の式で待つ。
+     */
     static async testConnection(
         request: IRecordedSeriesConnectionTestRequest,
     ): Promise<IRecordedSeriesConnectionTestResult | null> {
+        let client_timeout_ms: number;
+        if (request.ai_backend !== 'OpenAICompatible') {
+            // ACP: サーバー側の絶対上限に process / DB 回収の余裕を加えて待つ。
+            // 同じ hard limit 秒で切ると、サーバーの安全停止応答と Axios timeout が競合する。
+            client_timeout_ms = (
+                ACP_HARD_TIMEOUT_SEC + ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC
+            ) * 1000;
+        } else {
+            // OpenAI 互換: 無通信タイムアウト (最大 600 秒) の数倍 + 起動/回収余裕。
+            // 接続試験は Web 検索込みで 30 秒を超え得る。
+            const configured_timeout_sec = Number(request.acp_timeout_sec);
+            const inactivity_budget_sec = (
+                Number.isFinite(configured_timeout_sec) && configured_timeout_sec > 0
+            ) ?
+                configured_timeout_sec :
+                120;
+            client_timeout_ms = Math.min(
+                Math.max(inactivity_budget_sec * 30 + 60, 600) * 1000,
+                ACP_HARD_TIMEOUT_SEC * 1000,
+            );
+        }
         const response = await APIClient.post<IRecordedSeriesConnectionTestResult>(
             '/recorded-series/settings/test',
             request,
+            {
+                timeout: client_timeout_ms,
+            },
         );
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'AI バックエンドへの接続を確認できませんでした。');

@@ -101,6 +101,11 @@ describe('RecordedEpisodeResolution 表示契約', () => {
     it.each([
         ['LowConfidence', 'Web 検索結果の信頼度が受理条件を満たしませんでした。'],
         ['EpisodeLookupFailed', '話数 Web 検索に失敗しました。'],
+        ['Timeout', 'AI バックエンドからの応答が一定時間途絶えたためタイムアウトしました。'],
+        [
+            'HardTimeout',
+            'AI バックエンドの総実行時間（他の ACP 実行待ちを含む）が安全上限の 60 分を超えたため停止しました。',
+        ],
     ])('既知コード %s を安全な日本語へ補完する', (errorCode, expected) => {
         const resolution = createResolution({error_code: errorCode});
 

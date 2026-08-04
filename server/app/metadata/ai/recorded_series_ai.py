@@ -11,10 +11,12 @@ import json
 import os
 import secrets
 import threading
+import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, TypeVar, cast
 
 from app import logging
 from app.constants import DATA_DIR
@@ -25,11 +27,18 @@ from app.metadata.ai.backends import (
     RecordedSeriesAIBackend,
 )
 from app.metadata.ai.episode_lookup import EpisodeLookupResult
-from app.metadata.ai.KonomiTVBS4KACPCredentials import KonomiTVBS4KACPCredentials
+from app.metadata.ai.KonomiTVBS4KACPCredentials import (
+    KonomiTVBS4KACPCredentials,
+    KonomiTVBS4KACPImportProvider,
+)
 from app.metadata.ai.openai_compatible import OpenAICompatibleBackend
 from app.metadata.RecordedEpisodeContext import (
     BuildEpisodeProviderFingerprint,
     RecordedEpisodeLookupContext,
+)
+from app.metadata.RecordedEpisodeMessages import (
+    ACP_HARD_TIMEOUT_SEC,
+    FormatAcpHardTimeoutMessage,
 )
 from app.metadata.RecordedSeriesCandidates import (
     AIChoiceResult,
@@ -57,9 +66,55 @@ _EPISODE_LOOKUP_CAPABILITY_PROOFS_LOCK = threading.RLock()
 # fingerprint 挿入順を保ち、上限超過時は最古を捨てる。
 _EPISODE_LOOKUP_CAPABILITY_PROOFS: OrderedDict[str, str] = OrderedDict()
 _EPISODE_LOOKUP_CAPABILITY_PROOFS_LOADED = False
-# ACP subprocess が可変 credential profile / ADC を使用している間は、
-# 管理 API の import/delete と同時実行しない。
-ACP_CREDENTIAL_OPERATION_LOCK = asyncio.Lock()
+# ACP agent は全 provider 合計で1件だけ実行する。acp_client 側の Semaphore も
+# 最終防衛として維持するが、公開 facade でも backend 構築前から直列化する。
+ACP_OPERATION_LOCK = asyncio.Lock()
+# Codex / Grok の可変 credential profile は provider ごとに独立している。
+# 実行中 provider の import/delete だけを止め、別 provider の認証操作を巻き添えにしない。
+ACP_CREDENTIAL_OPERATION_LOCKS: dict[KonomiTVBS4KACPImportProvider, asyncio.Lock] = {
+    'codex': asyncio.Lock(),
+    'grok': asyncio.Lock(),
+}
+# 公開 facade の実行待ち・credential lock 待機から backend 回収までに適用する絶対上限。
+# acp_client 内部にも同じ上限を残し、facade を経由しない呼出しも有限に保つ。
+_ACP_OPERATION_HARD_TIMEOUT_SEC = ACP_HARD_TIMEOUT_SEC
+
+_AcpOperationResult = TypeVar('_AcpOperationResult')
+
+
+async def _RunACPOperationWithDeadline(
+    operation: Callable[[], Awaitable[_AcpOperationResult]],
+    credential_provider: KonomiTVBS4KACPImportProvider | None,
+) -> _AcpOperationResult:
+    """直列実行待ちと credential lock 待機を含む ACP 公開操作へ絶対期限を適用する。
+
+    Args:
+        operation: lock 取得後に backend を生成して実行する非同期処理。
+        credential_provider: 実行中の世代変更を止める Codex / Grok provider。
+            Gemini は管理 API から ADC を変更しないため None。
+
+    Returns:
+        backend が返した操作結果。
+
+    Raises:
+        RecordedSeriesAIError: lock 待機から cleanup 完了までが安全上限を超えた場合。
+    """
+
+    started_at = time.monotonic()
+    try:
+        # 全 ACP の直列実行待ちと、対象 provider の認証排他待ちを総実行時間に含める。
+        # backend は両 lock 取得後に生成し、期限切れ要求が新しい ACP process を起動しないようにする。
+        async with asyncio.timeout(_ACP_OPERATION_HARD_TIMEOUT_SEC):
+            async with ACP_OPERATION_LOCK:
+                if credential_provider is None:
+                    return await operation()
+                async with ACP_CREDENTIAL_OPERATION_LOCKS[credential_provider]:
+                    return await operation()
+    except TimeoutError as ex:
+        raise RecordedSeriesAIError(
+            'HardTimeout',
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+        ) from ex
 
 
 def _loadEpisodeLookupCapabilityProofsLocked() -> None:
@@ -393,7 +448,14 @@ def _create_backend(
     # provider ごとの専用プロファイルを構築し、ホスト home と共有しない固定環境を取得する。
     profile_backend = _backend_to_profile_name(settings.ai_backend)
     try:
-        profile_dir = ensure_acp_profile(backend=profile_backend)
+        profile_dir = ensure_acp_profile(
+            backend=profile_backend,
+            konomitv_bs4k_fast_mode_enabled=(
+                settings.konomitv_bs4k_acp_codex_fast_mode_enabled
+                if settings.ai_backend == 'AcpCodex'
+                else False
+            ),
+        )
         profile_env = get_profile_environment(
             profile_backend,
             profile_dir,
@@ -715,6 +777,50 @@ def _backend_to_profile_name(
         raise AcpBackendNotImplementedError(backend_kind) from ex
 
 
+def GetACPCredentialOperationLock(
+    provider: KonomiTVBS4KACPImportProvider,
+) -> asyncio.Lock:
+    """指定 provider の実行と認証変更を排他する lock を返す。
+
+    Args:
+        provider: Codex または Grok の資格情報 provider。
+
+    Returns:
+        provider 専用の process-local asyncio lock。
+    """
+
+    return ACP_CREDENTIAL_OPERATION_LOCKS[provider]
+
+
+def IsACPOperationRunning() -> bool:
+    """公開 facade で ACP agent が1件実行中かを返す。
+
+    Returns:
+        ACP の直列実行 lock が保持されている場合は True。
+    """
+
+    return ACP_OPERATION_LOCK.locked()
+
+
+def _GetACPCredentialProvider(
+    backend_kind: str,
+) -> KonomiTVBS4KACPImportProvider | None:
+    """backend が使用する可変 credential provider を返す。
+
+    Args:
+        backend_kind: 録画シリーズ AI backend の識別子。
+
+    Returns:
+        Codex / Grok の provider。Gemini は管理 API から ADC を変更しないため None。
+    """
+
+    mapping: dict[str, KonomiTVBS4KACPImportProvider] = {
+        'AcpCodex': 'codex',
+        'AcpGrok': 'grok',
+    }
+    return mapping.get(backend_kind)
+
+
 # === 公開 facade 関数 ===
 
 
@@ -758,8 +864,10 @@ async def select_candidate(
     if settings.ai_backend == 'OpenAICompatible':
         result = await RunSelection()
     else:
-        async with ACP_CREDENTIAL_OPERATION_LOCK:
-            result = await RunSelection()
+        result = await _RunACPOperationWithDeadline(
+            RunSelection,
+            _GetACPCredentialProvider(settings.ai_backend),
+        )
     return AIChoiceResult(
         choice_id=result.choice_id,
         confidence=result.confidence,
@@ -803,8 +911,10 @@ async def resolve_series_metadata(
     if settings.ai_backend == 'OpenAICompatible':
         result = await RunGeneration()
     else:
-        async with ACP_CREDENTIAL_OPERATION_LOCK:
-            result = await RunGeneration()
+        result = await _RunACPOperationWithDeadline(
+            RunGeneration,
+            _GetACPCredentialProvider(settings.ai_backend),
+        )
     return replace(result, model=get_audit_model(settings))
 
 
@@ -852,8 +962,10 @@ async def lookup_episode(
     else:
         # proof 再照合から subprocess 終了まで credential import/delete を止め、
         # 検証した世代と実際に CLI が読む世代を一致させる。
-        async with ACP_CREDENTIAL_OPERATION_LOCK:
-            result = await RunLookup()
+        result = await _RunACPOperationWithDeadline(
+            RunLookup,
+            _GetACPCredentialProvider(settings.ai_backend),
+        )
     return replace(result, model=get_audit_model(settings))
 
 
@@ -890,8 +1002,42 @@ async def test_connection(
 
     if settings.ai_backend == 'OpenAICompatible':
         return await RunTest()
-    async with ACP_CREDENTIAL_OPERATION_LOCK:
-        return await RunTest()
+    try:
+        return await _RunACPOperationWithDeadline(
+            RunTest,
+            _GetACPCredentialProvider(settings.ai_backend),
+        )
+    except RecordedSeriesAIError as ex:
+        if ex.code != 'HardTimeout':
+            raise
+
+        # lock 待機中なら backend process は未起動で、実行中なら acp_client が cleanup を完了してから戻る。
+        # EpisodeLookup の6項目は到達段階を推測せず、期限制御だけを Passed とする。
+        checks: EpisodeLookupConnectionChecks | None = None
+        if capability == 'EpisodeLookup':
+            not_run = ConnectionTestCheck(
+                status='NotRun',
+                message='総実行時間の安全上限により、この能力の確認を完了できませんでした。',
+            )
+            checks = EpisodeLookupConnectionChecks(
+                backend_connection=not_run,
+                web_search=not_run,
+                source_url=not_run,
+                strict_schema=not_run,
+                timeout_cancel=ConnectionTestCheck(
+                    status='Passed',
+                    message='絶対実行時間の安全上限を ACP credential / 実行待ちにも適用しました。',
+                ),
+                permission_policy=not_run,
+            )
+        return ConnectionTestResult(
+            success=False,
+            latency_ms=ex.latency_ms or 0,
+            model=get_audit_model(settings),
+            message=FormatAcpHardTimeoutMessage(subject='ACP'),
+            checks=checks,
+            error_code='HardTimeout',
+        )
 
 
 def get_backend_kind() -> str:

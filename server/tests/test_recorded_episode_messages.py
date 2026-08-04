@@ -1,6 +1,9 @@
 import pytest
 
-from app.metadata.RecordedEpisodeMessages import GetRecordedEpisodeErrorMessage
+from app.metadata.RecordedEpisodeMessages import (
+    FormatAcpHardTimeoutMessage,
+    GetRecordedEpisodeErrorMessage,
+)
 
 
 @pytest.mark.parametrize(
@@ -13,6 +16,14 @@ from app.metadata.RecordedEpisodeMessages import GetRecordedEpisodeErrorMessage
         (
             'EpisodeLookupFailed',
             '話数 Web 検索に失敗しました。',
+        ),
+        (
+            'Timeout',
+            'AI プロバイダーからの応答が一定時間途絶えたためタイムアウトしました。',
+        ),
+        (
+            'HardTimeout',
+            FormatAcpHardTimeoutMessage(subject='AI プロバイダー'),
         ),
     ],
 )

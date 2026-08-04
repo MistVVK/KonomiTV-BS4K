@@ -42,13 +42,33 @@ class AcpProfileError(Exception):
     """ACP プロファイル構築に関するエラー。"""
 
 
+def _buildKonomiTVBS4KCodexManagedConfig(
+    *,
+    konomitv_bs4k_fast_mode_enabled: bool,
+) -> str:
+    """KonomiTV-BS4K 管理下の Codex config.toml を生成する。"""
+
+    if konomitv_bs4k_fast_mode_enabled is False:
+        return _CODEX_MANAGED_CONFIG
+    return (
+        f'{_CODEX_MANAGED_CONFIG}'
+        'service_tier = "fast"\n'
+        '\n'
+        '[features]\n'
+        'fast_mode = true\n'
+    )
+
+
 def ensure_acp_profile(
     backend: KonomiTVBS4KACPProfileBackend,
+    *,
+    konomitv_bs4k_fast_mode_enabled: bool = False,
 ) -> Path:
     """KonomiTV-BS4K 管理下に provider 専用の隔離 home を構築する。
 
     Args:
         backend: ACP バックエンド種別。
+        konomitv_bs4k_fast_mode_enabled: Codex の Fast service tier を有効にするか。
 
     Returns:
         Path: provider 専用 profile のランタイム絶対パス。
@@ -91,9 +111,14 @@ def ensure_acp_profile(
             ):
                 raise AcpProfileError('Imported ACP auth must be a 0600 regular file.')
 
-    # Codex はホスト config.toml を継承せず、認証保存方式だけを KonomiTV-BS4K が固定する。
+    # Codex はホスト config.toml を継承せず、認証方式と Fast 設定を KonomiTV-BS4K が固定する。
     if backend == 'codex':
-        _writeManagedFile(profile_dir / 'config.toml', _CODEX_MANAGED_CONFIG)
+        _writeManagedFile(
+            profile_dir / 'config.toml',
+            _buildKonomiTVBS4KCodexManagedConfig(
+                konomitv_bs4k_fast_mode_enabled=konomitv_bs4k_fast_mode_enabled,
+            ),
+        )
 
     if backend == 'gemini':
         # 旧実装やホスト home 共有で残った settings.json symlink は追跡せず、実ファイルへ置き換える。

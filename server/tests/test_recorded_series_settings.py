@@ -589,6 +589,7 @@ def test_recorded_series_settings_api_never_returns_api_key(
                 'model': 'gpt-5-nano',
                 'acp_model': None,
                 'acp_reasoning_effort': None,
+                'konomitv_bs4k_acp_codex_fast_mode_enabled': False,
                 'acp_timeout_sec': 120,
                 'google_cloud_project': None,
                 'google_cloud_location': None,
@@ -744,6 +745,17 @@ def test_acp_connection_test_uses_unsaved_backend_draft_with_fixed_preset(
 
     ConfigureTemporaryStore(monkeypatch, tmp_path)
     RecordedSeriesSettingsStore.saveSettings(RecordedSeriesSettings())
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'getStatus',
+        classmethod(
+            lambda _cls: SimpleNamespace(
+                codex_auth_imported=True,
+                grok_auth_imported=True,
+                google_adc_available=True,
+            )
+        ),
+    )
     captured_settings: RecordedSeriesSettings | None = None
     audit_records: list[dict[str, object]] = []
 
@@ -803,6 +815,132 @@ def test_acp_connection_test_uses_unsaved_backend_draft_with_fixed_preset(
     assert captured_settings.acp_timeout_sec == 90
     assert audit_records[0]['purpose'] == 'ConnectionTest'
     assert audit_records[0]['status'] == 'Succeeded'
+
+
+@pytest.mark.parametrize(
+    ('backend', 'expected_message'),
+    [
+        ('AcpCodex', 'Codex 認証が未取り込み'),
+        ('AcpGrok', 'Grok Build 認証が未取り込み'),
+        ('AcpGemini', 'Google ADC が未検出'),
+    ],
+)
+def test_acp_connection_test_rejects_missing_auth_before_backend_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend: Literal['AcpCodex', 'AcpGrok', 'AcpGemini'],
+    expected_message: str,
+) -> None:
+    """未設定認証では ACP agent を起動せず、0ms の固定結果を返す。"""
+
+    ConfigureTemporaryStore(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'getStatus',
+        classmethod(
+            lambda _cls: SimpleNamespace(
+                codex_auth_imported=False,
+                grok_auth_imported=False,
+                google_adc_available=False,
+            )
+        ),
+    )
+
+    async def TestConnection(*_args: object, **_kwargs: object) -> ConnectionTestResult:
+        raise AssertionError('認証 preflight 失敗時に backend を起動してはならない')
+
+    async def CreateAudit(**_kwargs: object) -> object:
+        return object()
+
+    monkeypatch.setattr(RecordedSeriesRouter, 'test_connection', TestConnection)
+    monkeypatch.setattr(RecordedSeriesRouter.RecordedSeriesAIRequest, 'create', CreateAudit)
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            request_body: dict[str, object] = {
+                'capability': 'EpisodeLookup',
+                'ai_backend': backend,
+            }
+            if backend == 'AcpGemini':
+                request_body.update({
+                    'google_cloud_project': 'fixture-project',
+                    'google_cloud_location': 'asia-northeast1',
+                })
+            response = await client.post(
+                '/api/recorded-series/settings/test',
+                json=request_body,
+            )
+
+        assert response.status_code == 200
+        assert response.json()['success'] is False
+        assert response.json()['latency_ms'] == 0
+        assert expected_message in response.json()['message']
+        assert response.json()['checks']['backend_connection']['status'] == 'NotRun'
+
+    asyncio.run(Run())
+
+
+def test_acp_connection_test_rejects_another_running_agent_without_queueing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """別 ACP 実行中の手動接続試験は待機キューへ積まず即時結果を返す。"""
+
+    ConfigureTemporaryStore(monkeypatch, tmp_path)
+    operation_lock = asyncio.Lock()
+    monkeypatch.setattr(RecordedSeriesAIModule, 'ACP_OPERATION_LOCK', operation_lock)
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'getStatus',
+        classmethod(
+            lambda _cls: SimpleNamespace(
+                codex_auth_imported=True,
+                grok_auth_imported=True,
+                google_adc_available=True,
+            )
+        ),
+    )
+
+    async def TestConnection(*_args: object, **_kwargs: object) -> ConnectionTestResult:
+        raise AssertionError('実行中 preflight 失敗時に backend を起動してはならない')
+
+    async def CreateAudit(**_kwargs: object) -> object:
+        return object()
+
+    monkeypatch.setattr(RecordedSeriesRouter, 'test_connection', TestConnection)
+    monkeypatch.setattr(RecordedSeriesRouter.RecordedSeriesAIRequest, 'create', CreateAudit)
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        await operation_lock.acquire()
+        try:
+            async with HTTPXAsyncClient(
+                transport=ASGITransport(app=app),
+                base_url='http://test',
+            ) as client:
+                response = await asyncio.wait_for(
+                    client.post(
+                        '/api/recorded-series/settings/test',
+                        json={
+                            'capability': 'CandidateSelection',
+                            'ai_backend': 'AcpGrok',
+                        },
+                    ),
+                    timeout=0.5,
+                )
+        finally:
+            operation_lock.release()
+
+        assert response.status_code == 200
+        assert response.json()['success'] is False
+        assert response.json()['latency_ms'] == 0
+        assert '別の ACP AI 処理を実行中' in response.json()['message']
+
+    asyncio.run(Run())
 
 
 def test_connection_test_does_not_send_saved_key_to_a_different_base_url(

@@ -22,7 +22,8 @@ AIBackendKind = Literal[
     'AcpGemini',
 ]
 # ACP 共通の推論深さ。CLI / agent には lowercase で渡す。
-# Codex は XHigh/Max/Ultra まで、Grok は Low/Medium/High のみ。
+# Codex は XHigh/Max/Ultra まで。ただし Ultra は Sol 系統だけで使用する。
+# Grok は Low/Medium/High のみ。
 # Gemini CLI 0.52.0 の ACP は推論深さの設定口を広告しないため、Gemini では保存しない。
 AcpReasoningEffort = Literal['Low', 'Medium', 'High', 'XHigh', 'Max', 'Ultra']
 _ACP_REASONING_EFFORT_FROM_LOWER: dict[str, AcpReasoningEffort] = {
@@ -53,6 +54,20 @@ _ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND: dict[str, AcpReasoningEffort] = {
     'AcpCodex': 'Medium',
     'AcpGrok': 'High',
 }
+
+
+def _isKonomiTVBS4KCodexSolModel(konomitv_bs4k_model: str | None) -> bool:
+    """Codex のモデル ID が Sol 系統かを判定する。"""
+
+    if konomitv_bs4k_model is None:
+        return False
+    konomitv_bs4k_normalized_model = konomitv_bs4k_model.strip().lower()
+    return (
+        konomitv_bs4k_normalized_model == 'sol' or
+        konomitv_bs4k_normalized_model.endswith('-sol')
+    )
+
+
 _LEGACY_ACP_AUTH_SETTINGS_KEYS = {
     'acp_user_codex_home',
     'acp_user_grok_home',
@@ -133,6 +148,10 @@ class RecordedSeriesSettings(BaseModel):
     acp_model: Annotated[str | None, Field(max_length=255)] = None
     # Codex: Low…Ultra / Grok: Low…High。backend ごとの default は model_validator で埋める。
     acp_reasoning_effort: Annotated[AcpReasoningEffort | None, Field()] = None
+    # KonomiTV-BS4K 固有。Codex の専用 profile へ Fast service tier を設定する。
+    konomitv_bs4k_acp_codex_fast_mode_enabled: Annotated[bool, Field()] = False
+    # 壁時計の総実行上限ではなく、ACP stdio の無通信打ち切り秒数。
+    # thought / tool update などの NDJSON 行が届くたびにタイマーはリセットされる。
     acp_timeout_sec: Annotated[int, Field(ge=30, le=600)] = 120
 
     # Gemini CLI / Vertex AI 用（資格情報ではない環境依存設定）
@@ -217,6 +236,10 @@ class RecordedSeriesSettings(BaseModel):
     def normalizeBackendCapabilities(self) -> RecordedSeriesSettings:
         """ACP 能力とプリセットごとの固定実行経路を正規化する。"""
 
+        if self.ai_backend != 'AcpCodex':
+            # Fast service tier は Codex 専用で、他 provider へ持ち越さない。
+            self.konomitv_bs4k_acp_codex_fast_mode_enabled = False
+
         if self.ai_backend == 'OpenAICompatible':
             # OpenAI 互換では ACP の model / effort を使わない。
             self.acp_reasoning_effort = None
@@ -242,6 +265,12 @@ class RecordedSeriesSettings(BaseModel):
                 self.acp_model = _ACP_DEFAULT_MODEL_BY_BACKEND['AcpCodex']
             if self.acp_reasoning_effort is None:
                 self.acp_reasoning_effort = _ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND['AcpCodex']
+            if (
+                self.acp_reasoning_effort == 'Ultra' and
+                _isKonomiTVBS4KCodexSolModel(self.acp_model) is False
+            ):
+                # 旧保存値や直接 API 入力も、非 Sol では Max へ安全に補正する。
+                self.acp_reasoning_effort = 'Max'
         elif self.ai_backend == 'AcpGemini':
             if self.acp_model is None:
                 self.acp_model = _ACP_DEFAULT_MODEL_BY_BACKEND['AcpGemini']

@@ -263,6 +263,14 @@ def Main() -> None:
         }
     Respond(session_new, session_result)
 
+    if MODE == 'stdin_block':
+        # session 確立後は stdin を一切読まず、大きな prompt の drain を意図的に詰まらせる。
+        # SIGTERM も無視し、client が無通信 timeout 後に SIGKILL と wait まで行うことを検証する。
+        Log('stdin_block_started', {'pid': os.getpid()})
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True:
+            time.sleep(0.05)
+
     # model / reasoning_effort の set_config_option や set_model を任意回数受け付ける。
     prompt = Read()
     while prompt.get('method') in {'session/set_config_option', 'session/set_model'}:
@@ -289,13 +297,22 @@ def Main() -> None:
     assert prompt['params']['prompt'][0]['type'] == 'text'
 
     if MODE == 'timeout':
+        # 無通信タイムアウト検証用: 進捗を出さず SIGTERM も無視してハングする。
+        # 以前は thought chunk を送り続けていたが、それでは無通信打ち切りを再現できない。
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         while True:
             readable, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if readable:
-                message = Read()
-                if message.get('method') == 'session/cancel':
-                    Log('cancel_received', message)
+            if not readable:
+                continue
+            message = Read()
+            if message.get('method') == 'session/cancel':
+                Log('cancel_received', message)
+
+    if MODE == 'slow_but_active':
+        # 無通信タイムアウトより長く進捗を出し続けたあと、正常に完了する。
+        # timeout_sec より総実行時間が長くても、行が届いていれば打ち切られないことを示す。
+        active_until = time.monotonic() + 2.5
+        while time.monotonic() < active_until:
             Send({
                 'jsonrpc': '2.0',
                 'method': 'session/update',
@@ -307,7 +324,31 @@ def Main() -> None:
                     },
                 },
             })
-            time.sleep(0.01)
+            time.sleep(0.2)
+        # 通常経路へ落として最終 JSON を返す（この直後の共通処理が OUTPUT を送る）
+
+    if MODE == 'active_forever':
+        # 無通信 window より短い間隔で進捗を永久送信し、絶対実行時間だけを発火させる。
+        # cancel は読み取って記録し、hard timeout 経路が session 回収へ到達したことを示す。
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        while True:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if readable:
+                message = Read()
+                if message.get('method') == 'session/cancel':
+                    Log('cancel_received', message)
+                    return
+            Send({
+                'jsonrpc': '2.0',
+                'method': 'session/update',
+                'params': {
+                    'sessionId': 'fake-session',
+                    'update': {
+                        'sessionUpdate': 'agent_thought_chunk',
+                        'content': {'type': 'text', 'text': 'still running'},
+                    },
+                },
+            })
 
     if MODE == 'term_ignoring_child':
         # leader は cancel 後に終了し、子孫だけが TERM を無視して残るケースを再現する。

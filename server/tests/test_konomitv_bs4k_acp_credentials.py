@@ -15,6 +15,7 @@ from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 
 import app.metadata.ai.KonomiTVBS4KACPCredentials as ACPCredentials
+import app.metadata.ai.recorded_series_ai as RecordedSeriesAIModule
 from app.routers import RecordedSeriesRouter
 
 
@@ -538,6 +539,67 @@ def test_admin_api_imports_gets_and_deletes_auth_without_returning_content(
     assert secret not in import_response.text
     assert secret not in delete_response.text
     assert source_path.read_bytes() == source_before
+
+
+def test_admin_api_rejects_only_the_in_use_provider_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex 実行中は Codex import だけを即時拒否し、Grok import は巻き添えにしない。"""
+
+    ConfigureCredentialPaths(monkeypatch, tmp_path)
+    WriteCredential(
+        ACPCredentials._KONOMITV_BS4K_HOST_AUTH_PATHS['codex'],
+        'busy-codex-fixture',
+    )
+    WriteCredential(
+        ACPCredentials._KONOMITV_BS4K_HOST_AUTH_PATHS['grok'],
+        'independent-grok-fixture',
+    )
+    credential_locks = {
+        'codex': asyncio.Lock(),
+        'grok': asyncio.Lock(),
+    }
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'ACP_CREDENTIAL_OPERATION_LOCKS',
+        credential_locks,
+    )
+    app = CreateAdminApp()
+
+    async def Run():
+        await credential_locks['codex'].acquire()
+        try:
+            async with HTTPXAsyncClient(
+                transport=ASGITransport(app=app),
+                base_url='http://test',
+            ) as client:
+                codex_response = await asyncio.wait_for(
+                    client.post(
+                        '/api/recorded-series/settings/acp-credentials/codex/import'
+                    ),
+                    timeout=0.5,
+                )
+                grok_response = await client.post(
+                    '/api/recorded-series/settings/acp-credentials/grok/import'
+                )
+                status_response = await client.get(
+                    '/api/recorded-series/settings/acp-credentials'
+                )
+        finally:
+            credential_locks['codex'].release()
+        return codex_response, grok_response, status_response
+
+    codex_response, grok_response, status_response = asyncio.run(Run())
+
+    assert codex_response.status_code == 409
+    assert codex_response.json() == {
+        'detail': 'The ACP authentication is currently in use by an AI operation.',
+    }
+    assert grok_response.status_code == 200
+    assert grok_response.json()['grok_auth_imported'] is True
+    assert status_response.json()['codex_auth_in_use'] is True
+    assert status_response.json()['grok_auth_in_use'] is False
 
 
 def test_admin_api_returns_sanitized_error_for_invalid_host_auth(

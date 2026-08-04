@@ -453,10 +453,16 @@ def test_acp_lookup_holds_credential_generation_lock_until_backend_finishes(
 ) -> None:
     """proof 再照合から ACP 終了まで credential import/delete lock を保持する。"""
 
+    operation_lock = asyncio.Lock()
+    credential_locks = {
+        'codex': asyncio.Lock(),
+        'grok': asyncio.Lock(),
+    }
+    monkeypatch.setattr(RecordedSeriesAIModule, 'ACP_OPERATION_LOCK', operation_lock)
     monkeypatch.setattr(
         RecordedSeriesAIModule,
-        'ACP_CREDENTIAL_OPERATION_LOCK',
-        asyncio.Lock(),
+        'ACP_CREDENTIAL_OPERATION_LOCKS',
+        credential_locks,
     )
     settings = RecordedSeriesSettings(ai_backend='AcpCodex')
     passed = ConnectionTestCheck(status='Passed', message='verified')
@@ -497,7 +503,8 @@ def test_acp_lookup_holds_credential_generation_lock_until_backend_finishes(
     )
     lookup_started = asyncio.Event()
     finish_lookup = asyncio.Event()
-    mutation_entered = asyncio.Event()
+    same_provider_mutation_entered = asyncio.Event()
+    other_provider_mutation_entered = asyncio.Event()
 
     class FakeBackend:
         async def lookupEpisode(self, _program: object) -> EpisodeLookupResult:
@@ -533,9 +540,9 @@ def test_acp_lookup_holds_credential_generation_lock_until_backend_finishes(
         CreateBackend,
     )
 
-    async def MutateCredential() -> None:
-        async with RecordedSeriesAIModule.ACP_CREDENTIAL_OPERATION_LOCK:
-            mutation_entered.set()
+    async def MutateCredential(provider: str, entered: asyncio.Event) -> None:
+        async with credential_locks[provider]:  # type: ignore[index]
+            entered.set()
 
     async def Run() -> None:
         lookup_task = asyncio.create_task(
@@ -546,14 +553,101 @@ def test_acp_lookup_holds_credential_generation_lock_until_backend_finishes(
             )
         )
         await asyncio.wait_for(lookup_started.wait(), timeout=1)
-        mutation_task = asyncio.create_task(MutateCredential())
+        same_provider_mutation_task = asyncio.create_task(
+            MutateCredential('codex', same_provider_mutation_entered)
+        )
+        other_provider_mutation_task = asyncio.create_task(
+            MutateCredential('grok', other_provider_mutation_entered)
+        )
         await asyncio.sleep(0)
-        assert mutation_entered.is_set() is False
+        assert same_provider_mutation_entered.is_set() is False
+        # Codex の実行は独立した Grok 資格情報の更新を巻き添えにしない。
+        assert other_provider_mutation_entered.is_set() is True
         finish_lookup.set()
         result = await asyncio.wait_for(lookup_task, timeout=1)
-        await asyncio.wait_for(mutation_task, timeout=1)
+        await asyncio.wait_for(same_provider_mutation_task, timeout=1)
+        await asyncio.wait_for(other_provider_mutation_task, timeout=1)
         assert result.outcome == 'Resolved'
-        assert mutation_entered.is_set() is True
+        assert same_provider_mutation_entered.is_set() is True
+
+    asyncio.run(Run())
+
+
+def test_acp_facade_hard_timeout_includes_credential_lock_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全公開操作が credential lock 待機中に期限切れし、backend を新規起動しない。"""
+
+    operation_lock = asyncio.Lock()
+    monkeypatch.setattr(RecordedSeriesAIModule, 'ACP_OPERATION_LOCK', operation_lock)
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'ACP_CREDENTIAL_OPERATION_LOCKS',
+        {
+            'codex': asyncio.Lock(),
+            'grok': asyncio.Lock(),
+        },
+    )
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        '_ACP_OPERATION_HARD_TIMEOUT_SEC',
+        0.05,
+    )
+    backend_creation_count = 0
+
+    def CreateBackend(*_args: object, **_kwargs: object) -> object:
+        nonlocal backend_creation_count
+        backend_creation_count += 1
+        raise AssertionError('期限切れ要求で backend を起動してはならない')
+
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        '_create_backend',
+        CreateBackend,
+    )
+    settings = RecordedSeriesSettings(ai_backend='AcpCodex')
+
+    async def Run() -> None:
+        await operation_lock.acquire()
+        try:
+            # 候補選択・シリーズ生成・話数検索は既存の例外契約で HardTimeout を返す。
+            with pytest.raises(RecordedSeriesAIError) as selection_error:
+                await RecordedSeriesAIModule.select_candidate(
+                    program={},  # type: ignore[arg-type]
+                    candidates=[],
+                    settings=settings,
+                )
+            assert selection_error.value.code == 'HardTimeout'
+
+            with pytest.raises(RecordedSeriesAIError) as generation_error:
+                await RecordedSeriesAIModule.resolve_series_metadata(
+                    program={},  # type: ignore[arg-type]
+                    hints={},  # type: ignore[arg-type]
+                    settings=settings,
+                )
+            assert generation_error.value.code == 'HardTimeout'
+
+            with pytest.raises(RecordedSeriesAIError) as lookup_error:
+                await RecordedSeriesAIModule.lookup_episode(
+                    program={},  # type: ignore[arg-type]
+                    settings=settings,
+                )
+            assert lookup_error.value.code == 'HardTimeout'
+
+            # 接続試験は例外ではなく既存の ConnectionTestResult 契約へ正規化する。
+            connection_result = await RecordedSeriesAIModule.test_connection(
+                'EpisodeLookup',
+                settings=settings,
+            )
+            assert connection_result.success is False
+            assert connection_result.error_code == 'HardTimeout'
+            assert connection_result.checks is not None
+            assert connection_result.checks.backend_connection.status == 'NotRun'
+            assert connection_result.checks.timeout_cancel.status == 'Passed'
+        finally:
+            operation_lock.release()
+
+        assert backend_creation_count == 0
 
     asyncio.run(Run())
 

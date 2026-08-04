@@ -32,7 +32,8 @@ from app.metadata.ai.KonomiTVBS4KACPCredentials import (
     KonomiTVBS4KACPImportProvider,
 )
 from app.metadata.ai.recorded_series_ai import (
-    ACP_CREDENTIAL_OPERATION_LOCK,
+    GetACPCredentialOperationLock,
+    IsACPOperationRunning,
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
     invalidate_episode_lookup_capability_fingerprint,
@@ -132,12 +133,15 @@ class KonomiTVBS4KACPCredentialStatusResponse(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    acp_operation_running: bool
     codex_host_auth_available: bool
     codex_auth_imported: bool
     codex_auth_imported_at: datetime | None
+    codex_auth_in_use: bool
     grok_host_auth_available: bool
     grok_auth_imported: bool
     grok_auth_imported_at: datetime | None
+    grok_auth_in_use: bool
     google_adc_available: bool
 
 
@@ -554,6 +558,54 @@ def _connectionErrorMessage(
     return "応答が Chat Completions 互換形式ではないか、シリーズ生成結果を検証できませんでした。"
 
 
+def _ACPConnectionTestPreflightError(
+    settings: RecordedSeriesSettings,
+) -> tuple[str, str] | None:
+    """ACP 接続試験を agent 起動前に拒否すべき理由を返す。
+
+    Args:
+        settings: 画面のドラフトから検証済みの接続試験設定。
+
+    Returns:
+        固定エラーコードと利用者向け理由。起動可能なら None。
+    """
+
+    if settings.ai_backend == "OpenAICompatible":
+        return None
+
+    credential_status = KonomiTVBS4KACPCredentials.getStatus()
+    if (
+        settings.ai_backend == "AcpCodex"
+        and credential_status.codex_auth_imported is False
+    ):
+        return (
+            "ACPAuthenticationUnavailable",
+            "Codex 認証が未取り込みのため接続テストを実行できません。",
+        )
+    if (
+        settings.ai_backend == "AcpGrok"
+        and credential_status.grok_auth_imported is False
+    ):
+        return (
+            "ACPAuthenticationUnavailable",
+            "Grok Build 認証が未取り込みのため接続テストを実行できません。",
+        )
+    if (
+        settings.ai_backend == "AcpGemini"
+        and credential_status.google_adc_available is False
+    ):
+        return (
+            "ACPAuthenticationUnavailable",
+            "Google ADC が未検出のため接続テストを実行できません。",
+        )
+    if IsACPOperationRunning():
+        return (
+            "ACPOperationBusy",
+            "別の ACP AI 処理を実行中のため、完了後に接続テストを実行してください。",
+        )
+    return None
+
+
 def _notRunEpisodeLookupConnectionChecks(
     message: str,
     *,
@@ -823,12 +875,15 @@ def _KonomiTVBS4KACPCredentialStatusResponse() -> (
 
     credential_status = KonomiTVBS4KACPCredentials.getStatus()
     return KonomiTVBS4KACPCredentialStatusResponse(
+        acp_operation_running=IsACPOperationRunning(),
         codex_host_auth_available=credential_status.codex_host_auth_available,
         codex_auth_imported=credential_status.codex_auth_imported,
         codex_auth_imported_at=credential_status.codex_auth_imported_at,
+        codex_auth_in_use=GetACPCredentialOperationLock('codex').locked(),
         grok_host_auth_available=credential_status.grok_host_auth_available,
         grok_auth_imported=credential_status.grok_auth_imported,
         grok_auth_imported_at=credential_status.grok_auth_imported_at,
+        grok_auth_in_use=GetACPCredentialOperationLock('grok').locked(),
         google_adc_available=credential_status.google_adc_available,
     )
 
@@ -860,6 +915,20 @@ def _KonomiTVBS4KACPCredentialHTTPException(
     return HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="Failed to update the imported authentication state.",
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def _KonomiTVBS4KACPCredentialInUseHTTPException() -> HTTPException:
+    """実行中 ACP の認証世代を変更しないための固定競合応答を返す。
+
+    Returns:
+        HTTP 409 と no-store を持つ、秘密情報を含まない例外。
+    """
+
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="The ACP authentication is currently in use by an AI operation.",
         headers=NO_STORE_HEADERS,
     )
 
@@ -914,7 +983,12 @@ async def KonomiTVBS4KACPCredentialImportAPI(
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    async with ACP_CREDENTIAL_OPERATION_LOCK:
+    credential_lock = GetACPCredentialOperationLock(provider)
+    # 同じ provider の AI が認証を読んでいる場合、最大60分の終了待ちを API に持ち込まない。
+    if credential_lock.locked():
+        raise _KonomiTVBS4KACPCredentialInUseHTTPException()
+    await credential_lock.acquire()
+    try:
         try:
             KonomiTVBS4KACPCredentials.importProviderAuth(provider)
         except KonomiTVBS4KACPCredentialError as ex:
@@ -926,6 +1000,8 @@ async def KonomiTVBS4KACPCredentialImportAPI(
         invalidate_episode_lookup_capability_proof(
             backend_kind="AcpCodex" if provider == "codex" else "AcpGrok",
         )
+    finally:
+        credential_lock.release()
     return _KonomiTVBS4KACPCredentialStatusResponse()
 
 
@@ -956,7 +1032,12 @@ async def KonomiTVBS4KACPCredentialDeleteAPI(
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    async with ACP_CREDENTIAL_OPERATION_LOCK:
+    credential_lock = GetACPCredentialOperationLock(provider)
+    # 削除も import と同じく、実行中世代を壊さず即時に競合を通知する。
+    if credential_lock.locked():
+        raise _KonomiTVBS4KACPCredentialInUseHTTPException()
+    await credential_lock.acquire()
+    try:
         try:
             KonomiTVBS4KACPCredentials.deleteProviderAuth(provider)
         except KonomiTVBS4KACPCredentialError as ex:
@@ -967,6 +1048,8 @@ async def KonomiTVBS4KACPCredentialDeleteAPI(
         invalidate_episode_lookup_capability_proof(
             backend_kind="AcpCodex" if provider == "codex" else "AcpGrok",
         )
+    finally:
+        credential_lock.release()
     return _KonomiTVBS4KACPCredentialStatusResponse()
 
 
@@ -1041,11 +1124,33 @@ async def RecordedSeriesConnectionTestAPI(
 
     audit_model = get_audit_model(validated_settings)
 
-    # OpenAI 互換だけ URL ごとの保存キーを解決する。ACP へ API キーを渡さない。
+    # ACP は資格情報が無い状態や、別 agent の実行中に新しい接続試験をキューへ積まない。
+    # ブラウザを再読込してローカルの loading 状態を失っていても、サーバー状態で即時判定する。
     effective_api_key = api_key
     preflight_result: ConnectionTestResult | None = None
+    acp_preflight_error = _ACPConnectionTestPreflightError(validated_settings)
+    if acp_preflight_error is not None:
+        acp_preflight_error_code, acp_preflight_message = acp_preflight_error
+        preflight_result = ConnectionTestResult(
+            success=False,
+            latency_ms=0,
+            model=audit_model,
+            message=acp_preflight_message,
+            checks=(
+                _notRunEpisodeLookupConnectionChecks(
+                    acp_preflight_message,
+                    permission_not_applicable=False,
+                )
+                if capability == "EpisodeLookup"
+                else None
+            ),
+            error_code=acp_preflight_error_code,
+        )
+
+    # OpenAI 互換だけ URL ごとの保存キーを解決する。ACP へ API キーを渡さない。
     if (
-        validated_settings.ai_backend == "OpenAICompatible"
+        preflight_result is None
+        and validated_settings.ai_backend == "OpenAICompatible"
         and effective_api_key is None
     ):
         try:

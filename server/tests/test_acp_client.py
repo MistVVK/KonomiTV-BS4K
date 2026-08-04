@@ -240,6 +240,36 @@ def ReadLog(log_path: Path) -> list[dict[str, Any]]:
     ]
 
 
+def IsProcessRunning(pid: int) -> bool:
+    """Linux process が実行中かを、終了済み zombie と区別して確認する。
+
+    Args:
+        pid: 確認する process ID。
+
+    Returns:
+        process が存在し、かつ zombie ではない場合は True。
+    """
+
+    try:
+        stat_content = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return False
+
+    # comm は括弧内に空白や閉じ括弧を含み得るため、最後の閉じ括弧より後ろを解析する。
+    rparen_index = stat_content.rfind(')')
+    if rparen_index != -1:
+        fields = stat_content[rparen_index + 1:].split()
+        if fields and fields[0] == 'Z':
+            return False
+
+    # stat 読取り後に終了する競合もあるため、最後に signal 0 で存在を再確認する。
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def RunSelection(
     tmp_path: Path,
     *,
@@ -1230,7 +1260,7 @@ def test_acp_episode_lookup_maps_failed_web_tool_to_search_failed(tmp_path: Path
 
 
 def test_acp_episode_lookup_timeout_cancels_and_returns_search_failed(tmp_path: Path) -> None:
-    """EpisodeLookup の全体 deadline でも session を cancel して安全な結果を返す。"""
+    """EpisodeLookup の無通信タイムアウトでも session を cancel して安全な結果を返す。"""
 
     result, log_path = RunEpisodeLookup(
         tmp_path,
@@ -1241,6 +1271,37 @@ def test_acp_episode_lookup_timeout_cancels_and_returns_search_failed(tmp_path: 
 
     assert result.outcome == 'SearchFailed'
     assert result.error_code == 'Timeout'
+    assert any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
+
+
+def test_acp_episode_lookup_hard_timeout_returns_search_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """EpisodeLookup も進捗継続中の絶対上限で HardTimeout を返す。"""
+
+    monkeypatch.setattr(AcpClient, '_ACP_HARD_TIMEOUT_SEC', 0.75)
+    monkeypatch.setattr(AcpClient, '_PROCESS_TERM_TIMEOUT_SEC', 0.1)
+    monkeypatch.setattr(AcpClient, '_PROCESS_KILL_TIMEOUT_SEC', 0.5)
+
+    env, log_path = AgentEnvironment(tmp_path, mode='active_forever')
+    started = time.monotonic()
+    result = asyncio.run(AcpClient.run_acp_episode_lookup(
+        command=FAKE_AGENT_COMMAND,
+        args=[str(FAKE_AGENT_PATH)],
+        env=env,
+        program=EpisodeProgram(),
+        backend_kind='AcpCodex',
+        model='test-model',
+        timeout_sec=1,
+        cwd=str(tmp_path),
+        profile_dir=str(tmp_path),
+        readable_files=(str(FAKE_AGENT_PATH),),
+    ))
+
+    assert time.monotonic() - started < 3.0
+    assert result.outcome == 'SearchFailed'
+    assert result.error_code == 'HardTimeout'
     assert any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
 
 
@@ -1625,7 +1686,7 @@ def test_acp_episode_lookup_connection_test_preserves_checks_after_invalid_schem
 def test_acp_episode_lookup_connection_test_reports_no_tool_and_timeout_stages(
     tmp_path: Path,
 ) -> None:
-    """Web tool 未実行と deadline 回収を、一括 NotRun に潰さず段階別に返す。"""
+    """Web tool 未実行と無通信タイムアウト回収を、一括 NotRun に潰さず段階別に返す。"""
 
     no_tool_env, _log_path = AgentEnvironment(
         tmp_path,
@@ -1668,6 +1729,69 @@ def test_acp_episode_lookup_connection_test_reports_no_tool_and_timeout_stages(
     assert timeout.checks.backend_connection.status == 'Passed'
     assert timeout.checks.web_search.status == 'Failed'
     assert timeout.checks.timeout_cancel.status == 'Passed'
+
+
+def test_acp_episode_lookup_connection_test_reports_hard_timeout_stage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """EpisodeLookup 接続試験も HardTimeout を timeout_cancel 段階として返す。"""
+
+    monkeypatch.setattr(AcpClient, '_ACP_HARD_TIMEOUT_SEC', 0.75)
+    monkeypatch.setattr(AcpClient, '_PROCESS_TERM_TIMEOUT_SEC', 0.1)
+    monkeypatch.setattr(AcpClient, '_PROCESS_KILL_TIMEOUT_SEC', 0.5)
+
+    env, log_path = AgentEnvironment(tmp_path, mode='active_forever')
+    started = time.monotonic()
+    result = asyncio.run(AcpClient.run_acp_episode_lookup_connection_test(
+        command=FAKE_AGENT_COMMAND,
+        args=[str(FAKE_AGENT_PATH)],
+        env=env,
+        backend_kind='AcpCodex',
+        model='test-model',
+        timeout_sec=1,
+        cwd=str(tmp_path),
+        profile_dir=str(tmp_path),
+        readable_files=(str(FAKE_AGENT_PATH),),
+    ))
+
+    assert time.monotonic() - started < 3.0
+    assert result.error_code == 'HardTimeout'
+    assert result.checks is not None
+    assert result.checks.timeout_cancel.status == 'Passed'
+    assert '絶対実行時間' in result.checks.timeout_cancel.message
+    assert any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
+
+
+def test_acp_connection_test_reports_hard_timeout_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """シリーズ接続試験の HardTimeout は定数導出の固定メッセージを返す。"""
+
+    from app.metadata.RecordedEpisodeMessages import FormatAcpHardTimeoutMessage
+
+    monkeypatch.setattr(AcpClient, '_ACP_HARD_TIMEOUT_SEC', 0.75)
+    monkeypatch.setattr(AcpClient, '_PROCESS_TERM_TIMEOUT_SEC', 0.1)
+    monkeypatch.setattr(AcpClient, '_PROCESS_KILL_TIMEOUT_SEC', 0.5)
+
+    env, log_path = AgentEnvironment(tmp_path, mode='active_forever')
+    started = time.monotonic()
+    result = asyncio.run(AcpClient.run_acp_connection_test(
+        command=FAKE_AGENT_COMMAND,
+        args=[str(FAKE_AGENT_PATH)],
+        env=env,
+        model='test-model',
+        timeout_sec=1,
+        cwd=str(tmp_path),
+        profile_dir=str(tmp_path),
+        readable_files=(str(FAKE_AGENT_PATH),),
+    ))
+
+    assert time.monotonic() - started < 3.0
+    assert result.success is False
+    assert result.message == FormatAcpHardTimeoutMessage(subject='ACP')
+    assert any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
 
 
 def test_acp_vertex_auth_is_performed_before_session_new(
@@ -1945,10 +2069,12 @@ def test_acp_cancels_when_tool_use_cannot_be_safely_denied(
     assert any(entry['kind'] == 'cancel_received' for entry in log)
 
 
-def test_acp_timeout_is_global_and_cancels_then_kills_process(
+def test_acp_timeout_is_inactivity_based_and_cancels_then_kills_process(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """stdio 無通信が続く場合だけ timeout し、session/cancel と process 回収を行う。"""
+
     monkeypatch.setattr(AcpClient, '_PROCESS_TERM_TIMEOUT_SEC', 0.1)
     monkeypatch.setattr(AcpClient, '_PROCESS_KILL_TIMEOUT_SEC', 0.5)
     env, log_path = AgentEnvironment(tmp_path, mode='timeout')
@@ -1977,6 +2103,145 @@ def test_acp_timeout_is_global_and_cancels_then_kills_process(
         if entry['kind'] == 'received' and entry['message'].get('method') == 'session/cancel'
     ]
     assert len(sent_processes) == 1
+
+
+def test_acp_active_progress_extends_beyond_inactivity_window(
+    tmp_path: Path,
+) -> None:
+    """進捗 NDJSON が届いている間は、無通信ウィンドウより総実行が長くても完了する。"""
+
+    env, _log_path = AgentEnvironment(tmp_path, mode='slow_but_active')
+    started = time.monotonic()
+    result = asyncio.run(AcpClient.run_acp_candidate_selection(
+        command=FAKE_AGENT_COMMAND,
+        args=[str(FAKE_AGENT_PATH)],
+        env=env,
+        program=Program(),
+        candidates=Candidates(),
+        model='test-model',
+        # 総実行は約 2.5 秒だが、0.2 秒間隔の thought で無通信はリセットされる。
+        timeout_sec=1,
+        cwd=str(tmp_path),
+        profile_dir=str(tmp_path),
+        readable_files=(str(FAKE_AGENT_PATH),),
+    ))
+    elapsed = time.monotonic() - started
+
+    assert result.choice_id == 'candidate-1'
+    assert elapsed >= 2.0
+
+
+def test_acp_active_progress_cannot_exceed_hard_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """進捗が永久に続いても絶対上限で回収し、同じloopの後続sessionを通す。"""
+
+    monkeypatch.setattr(AcpClient, '_ACP_HARD_TIMEOUT_SEC', 0.75)
+    monkeypatch.setattr(AcpClient, '_PROCESS_TERM_TIMEOUT_SEC', 0.1)
+    monkeypatch.setattr(AcpClient, '_PROCESS_KILL_TIMEOUT_SEC', 0.5)
+
+    async def Run() -> tuple[RecordedSeriesAIError, AcpClient.AIChoiceResult, Path]:
+        active_env, log_path = AgentEnvironment(tmp_path, mode='active_forever')
+        started = time.monotonic()
+        try:
+            await AcpClient.run_acp_candidate_selection(
+                command=FAKE_AGENT_COMMAND,
+                args=[str(FAKE_AGENT_PATH)],
+                env=active_env,
+                program=Program(),
+                candidates=Candidates(),
+                model='test-model',
+                timeout_sec=1,
+                cwd=str(tmp_path),
+                profile_dir=str(tmp_path),
+                readable_files=(str(FAKE_AGENT_PATH),),
+            )
+        except RecordedSeriesAIError as ex:
+            hard_timeout_error = ex
+        else:
+            raise AssertionError('active_forever agent unexpectedly completed')
+        assert time.monotonic() - started < 3.0
+
+        normal_env, _normal_log_path = AgentEnvironment(tmp_path)
+        normal_result = await asyncio.wait_for(
+            AcpClient.run_acp_candidate_selection(
+                command=FAKE_AGENT_COMMAND,
+                args=[str(FAKE_AGENT_PATH)],
+                env=normal_env,
+                program=Program(),
+                candidates=Candidates(),
+                model='test-model',
+                timeout_sec=1,
+                cwd=str(tmp_path),
+                profile_dir=str(tmp_path),
+                readable_files=(str(FAKE_AGENT_PATH),),
+            ),
+            timeout=3,
+        )
+        return hard_timeout_error, normal_result, log_path
+
+    error, normal_result, log_path = asyncio.run(Run())
+
+    assert error.code == 'HardTimeout'
+    assert normal_result.choice_id == 'candidate-1'
+    assert any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
+
+
+def test_acp_stdin_drain_uses_inactivity_timeout_and_releases_semaphore(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """agentが大きなpromptを読まなくてもstdin drainを打ち切り、後続sessionを通す。"""
+
+    monkeypatch.setattr(AcpClient, '_ACP_HARD_TIMEOUT_SEC', 5)
+    monkeypatch.setattr(AcpClient, '_PROCESS_TERM_TIMEOUT_SEC', 0.1)
+    monkeypatch.setattr(AcpClient, '_PROCESS_KILL_TIMEOUT_SEC', 0.5)
+
+    async def Run() -> tuple[AcpClient.AIChoiceResult, Path]:
+        blocked_env, log_path = AgentEnvironment(tmp_path, mode='stdin_block')
+        started = time.monotonic()
+        with pytest.raises(AcpClient._AcpInactivityTimeoutError):
+            await AcpClient._run_acp_with_deadline(
+                command=FAKE_AGENT_COMMAND,
+                args=[str(FAKE_AGENT_PATH)],
+                env=blocked_env,
+                prompt_text='x' * (2 * 1024 * 1024),
+                model=None,
+                timeout_sec=1,
+                cwd=str(tmp_path),
+                profile_dir=str(tmp_path),
+                readable_files=(str(FAKE_AGENT_PATH),),
+            )
+        assert time.monotonic() - started < 3.0
+
+        normal_env, _normal_log_path = AgentEnvironment(tmp_path)
+        normal_result = await asyncio.wait_for(
+            AcpClient.run_acp_candidate_selection(
+                command=FAKE_AGENT_COMMAND,
+                args=[str(FAKE_AGENT_PATH)],
+                env=normal_env,
+                program=Program(),
+                candidates=Candidates(),
+                model='test-model',
+                timeout_sec=1,
+                cwd=str(tmp_path),
+                profile_dir=str(tmp_path),
+                readable_files=(str(FAKE_AGENT_PATH),),
+            ),
+            timeout=3,
+        )
+        return normal_result, log_path
+
+    normal_result, log_path = asyncio.run(Run())
+
+    assert normal_result.choice_id == 'candidate-1'
+    log = ReadLog(log_path)
+    started_entries = [entry for entry in log if entry['kind'] == 'stdin_block_started']
+    assert len(started_entries) == 1
+    blocked_pid = int(started_entries[0]['message']['pid'])
+    # SIGTERM を無視する agent でも SIGKILL と wait まで完了し、実行中 process が残らないこと。
+    assert IsProcessRunning(blocked_pid) is False
 
 
 def test_acp_connection_test_uses_production_generation_schema(tmp_path: Path) -> None:
@@ -2093,6 +2358,21 @@ def test_acp_total_output_limit_cancels_and_stops_process(
     assert any(entry['kind'] == 'cancel_received' for entry in log)
 
 
+def test_is_process_running_treats_zombie_as_stopped() -> None:
+    # 親が waitpid() するまで PID が残る zombie を作り、signal 0 だけに依存しないことを固定する。
+    child_pid = os.fork()
+    if child_pid == 0:
+        os._exit(0)
+
+    try:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and IsProcessRunning(child_pid):
+            time.sleep(0.01)
+        assert IsProcessRunning(child_pid) is False
+    finally:
+        os.waitpid(child_pid, 0)
+
+
 def test_acp_stop_process_kills_term_ignoring_descendants(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2122,12 +2402,11 @@ def test_acp_stop_process_kills_term_ignoring_descendants(
     child_entries = [entry for entry in log if entry['kind'] == 'spawned_term_ignoring_child']
     assert len(child_entries) == 1
     child_pid = int(child_entries[0]['message']['pid'])
-    # 関数復帰後、子孫 PID が存在しないこと
+    # PID namespace の init が wait するまで zombie は PID を保持するため、
+    # PID の存在だけではなく実行状態を確認し、終了済み zombie は回収成功として扱う。
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
-        try:
-            os.kill(child_pid, 0)
-        except ProcessLookupError:
+        if IsProcessRunning(child_pid) is False:
             break
         time.sleep(0.05)
     else:

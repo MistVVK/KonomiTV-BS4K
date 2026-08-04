@@ -40,7 +40,11 @@ from app.metadata.RecordedEpisodeContext import (
     RecordedEpisodeLookupContext,
     SerializeEpisodeLookupContext,
 )
-from app.metadata.RecordedEpisodeMessages import GetRecordedEpisodeErrorMessage
+from app.metadata.RecordedEpisodeMessages import (
+    ACP_HARD_TIMEOUT_SEC,
+    FormatAcpHardTimeoutMessage,
+    GetRecordedEpisodeErrorMessage,
+)
 from app.metadata.RecordedSeriesCandidates import (
     AIChoiceResult,
     RecordedSeriesAIError,
@@ -64,6 +68,10 @@ from app.metadata.RecordedSeriesGeneration import (
 
 _ACP_PROTOCOL_VERSION = 1
 _ACP_SEMAPHORE = asyncio.Semaphore(1)
+# agent が進捗を出し続けても、Semaphore 待機から process 回収までを必ず有限にする。
+# 利用者が調整する無通信タイムアウトとは独立した、サーバー側の最終安全上限。
+# 文言導出元は RecordedEpisodeMessages.ACP_HARD_TIMEOUT_SEC。テストは本名を monkeypatch する。
+_ACP_HARD_TIMEOUT_SEC = ACP_HARD_TIMEOUT_SEC
 _MAX_LINE_BYTES = 1_048_576
 # 候補選択の期待出力は小さな JSON のみ。1 行上限 (1 MiB) より十分小さい総量で OOM を防ぐ。
 # 70 KiB 超の単一行受け入れテストと両立するため 256 KiB とする。
@@ -207,6 +215,20 @@ class _AcpProtocolError(Exception):
 
         super().__init__(message)
         self.user_message = user_message
+
+
+class _AcpInactivityTimeoutError(TimeoutError):
+    """ACP stdio の読書きが設定時間進まなかった。
+
+    TimeoutError の subclass なので、捕捉時は必ず本 class を generic TimeoutError より先に書くこと。
+    """
+
+
+class _AcpHardTimeoutError(TimeoutError):
+    """ACP 実行全体がサーバー側の最終安全上限を超えた。
+
+    TimeoutError の subclass なので、捕捉時は必ず Inactivity を本 class / TimeoutError より先に書くこと。
+    """
 
 
 class _AcpCancelRequiredError(_AcpProtocolError):
@@ -1086,21 +1108,54 @@ async def _write_json(
 ) -> None:
     """JSON-RPC メッセージを1行のUTF-8 NDJSONとして送る。
 
-    drain_timeout_sec を指定した場合、stdin pipe が詰まってもその秒数で打ち切る。
+    Args:
+        stream: ACP agent の標準入力。
+        data: 送信する JSON-RPC object。
+        drain_timeout_sec: stdin pipe の書込みが進まない場合に打ち切る秒数。
+
+    Returns:
+        None
     """
 
     stream.write((json.dumps(data, ensure_ascii=False, separators=(',', ':')) + '\n').encode())
     if drain_timeout_sec is None:
         await stream.drain()
         return
-    await asyncio.wait_for(stream.drain(), timeout=drain_timeout_sec)
+    try:
+        await asyncio.wait_for(stream.drain(), timeout=drain_timeout_sec)
+    except TimeoutError as ex:
+        # stdout と同じ無通信失敗へ正規化し、session 側の cancel / cleanup を必ず通す。
+        raise _AcpInactivityTimeoutError from ex
 
 
-async def _read_json(stream: asyncio.StreamReader) -> dict[str, Any]:
-    """ACP stdio からJSON-RPC objectを1件読む。"""
+async def _read_json(
+    stream: asyncio.StreamReader,
+    *,
+    inactivity_timeout_sec: float | None = None,
+) -> dict[str, Any]:
+    """ACP stdio からJSON-RPC objectを1件読む。
+
+    Args:
+        stream: ACP agent の標準出力。
+        inactivity_timeout_sec: NDJSON 1 行が届かない場合に打ち切る秒数。
+
+    Returns:
+        検証済みの JSON-RPC object。
+    """
 
     try:
-        line = await stream.readline()
+        # 壁時計の総実行上限ではなく、stdio 無通信だけを打ち切り条件にする。
+        # Codex Luna Max のように推論や結果整形が長くても、進捗が流れていれば待つ。
+        if inactivity_timeout_sec is None:
+            line = await stream.readline()
+        else:
+            line = await asyncio.wait_for(
+                stream.readline(),
+                timeout=inactivity_timeout_sec,
+            )
+    except TimeoutError as ex:
+        # read と write を同じ無通信失敗へ正規化し、上位で hard timeout と区別する。
+        raise _AcpInactivityTimeoutError from ex
     except ValueError as ex:
         # StreamReader 自身の limit 超過も、内部例外文字列を公開せず固定エラーへ正規化する。
         raise _AcpProtocolError('ACP message exceeded the maximum line length.') from ex
@@ -1286,6 +1341,7 @@ class _AcpDispatcher:
         operation: AcpOperation,
         backend_kind: str,
         trace: _AcpExecutionTrace,
+        inactivity_timeout_sec: float,
     ) -> None:
         """ACP turn の operation ごとに権限と tool trace を分離する。
 
@@ -1294,6 +1350,8 @@ class _AcpDispatcher:
             stdin: ACP agent の標準入力。
             operation: CandidateSelection、SeriesMetadata、または EpisodeLookup。
             backend_kind: 固定 ACP preset の識別子。
+            trace: 接続試験や失敗診断用の実行トレース。
+            inactivity_timeout_sec: stdio 無通信を打ち切る秒数。行が届くたびリセット。
         """
 
         self._stdout = stdout
@@ -1303,6 +1361,8 @@ class _AcpDispatcher:
         self._operation = operation
         self._backend_kind = backend_kind
         self._trace = trace
+        # 壁時計の総実行時間ではなく、stdout の無通信時間だけを打ち切り条件にする。
+        self._inactivity_timeout_sec = inactivity_timeout_sec
         self._next_request_id = 0
         self._session_id: str | None = None
         self._cancel_sent = False
@@ -1379,15 +1439,23 @@ class _AcpDispatcher:
         self._next_request_id += 1
         self._active_request_method = method
         try:
-            await _write_json(self._stdin, {
-                'jsonrpc': '2.0',
-                'id': request_id,
-                'method': method,
-                'params': dict(params),
-            })
+            await _write_json(
+                self._stdin,
+                {
+                    'jsonrpc': '2.0',
+                    'id': request_id,
+                    'method': method,
+                    'params': dict(params),
+                },
+                drain_timeout_sec=self._inactivity_timeout_sec,
+            )
 
             while True:
-                message = await _read_json(self._stdout)
+                # 進捗通知・tool update・最終 response のいずれでも行が届けば無通信タイマーは戻る。
+                message = await _read_json(
+                    self._stdout,
+                    inactivity_timeout_sec=self._inactivity_timeout_sec,
+                )
                 incoming_method = message.get('method')
                 if isinstance(incoming_method, str):
                     await self._handle_incoming_method(message)
@@ -1462,14 +1530,18 @@ class _AcpDispatcher:
         # filesystem、terminal、elicitation を含む未知 client method は、
         # notification か request かを問わず現在 turn を cancel する。
         if 'id' in message:
-            await _write_json(self._stdin, {
-                'jsonrpc': '2.0',
-                'id': message['id'],
-                'error': {
-                    'code': -32601,
-                    'message': f'Client method is not available: {method}',
+            await _write_json(
+                self._stdin,
+                {
+                    'jsonrpc': '2.0',
+                    'id': message['id'],
+                    'error': {
+                        'code': -32601,
+                        'message': f'Client method is not available: {method}',
+                    },
                 },
-            })
+                drain_timeout_sec=self._inactivity_timeout_sec,
+            )
         raise _AcpCancelRequiredError(
             f'ACP agent requested unsupported client method: {method}.',
             category=(
@@ -1853,16 +1925,20 @@ class _AcpDispatcher:
             self._tool_calls[tool_call_id] = observed_call
         observed_call.permission_requested = True
         observed_call.permission_granted = True
-        await _write_json(self._stdin, {
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'outcome': {
-                    'outcome': 'selected',
-                    'optionId': allow_once_option['optionId'],
+        await _write_json(
+            self._stdin,
+            {
+                'jsonrpc': '2.0',
+                'id': request_id,
+                'result': {
+                    'outcome': {
+                        'outcome': 'selected',
+                        'optionId': allow_once_option['optionId'],
+                    },
                 },
             },
-        })
+            drain_timeout_sec=self._inactivity_timeout_sec,
+        )
         self._trace.permission_allow_once_responses += 1
 
     async def _reject_episode_lookup_permission(
@@ -1879,16 +1955,20 @@ class _AcpDispatcher:
             if option.get('kind') == 'reject_once'
         ]
         if len(reject_once_options) == 1:
-            await _write_json(self._stdin, {
-                'jsonrpc': '2.0',
-                'id': request_id,
-                'result': {
-                    'outcome': {
-                        'outcome': 'selected',
-                        'optionId': reject_once_options[0]['optionId'],
+            await _write_json(
+                self._stdin,
+                {
+                    'jsonrpc': '2.0',
+                    'id': request_id,
+                    'result': {
+                        'outcome': {
+                            'outcome': 'selected',
+                            'optionId': reject_once_options[0]['optionId'],
+                        },
                     },
                 },
-            })
+                drain_timeout_sec=self._inactivity_timeout_sec,
+            )
             self._trace.permission_denied_responses += 1
         else:
             await self._cancel_permission_request(request_id)
@@ -1898,11 +1978,15 @@ class _AcpDispatcher:
     async def _cancel_permission_request(self, request_id: Any) -> None:
         """permission request を権限付与なしの cancelled で終端する。"""
 
-        await _write_json(self._stdin, {
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {'outcome': {'outcome': 'cancelled'}},
-        })
+        await _write_json(
+            self._stdin,
+            {
+                'jsonrpc': '2.0',
+                'id': request_id,
+                'result': {'outcome': {'outcome': 'cancelled'}},
+            },
+            drain_timeout_sec=self._inactivity_timeout_sec,
+        )
         if self._operation == 'EpisodeLookup':
             self._trace.permission_denied_responses += 1
 
@@ -1959,23 +2043,31 @@ class _AcpDispatcher:
                 break
 
         if reject_option is None:
-            await _write_json(self._stdin, {
-                'jsonrpc': '2.0',
-                'id': request_id,
-                'result': {'outcome': {'outcome': 'cancelled'}},
-            })
+            await _write_json(
+                self._stdin,
+                {
+                    'jsonrpc': '2.0',
+                    'id': request_id,
+                    'result': {'outcome': {'outcome': 'cancelled'}},
+                },
+                drain_timeout_sec=self._inactivity_timeout_sec,
+            )
             raise _AcpCancelRequiredError('Permission request did not offer a reject option.')
 
-        await _write_json(self._stdin, {
-            'jsonrpc': '2.0',
-            'id': request_id,
-            'result': {
-                'outcome': {
-                    'outcome': 'selected',
-                    'optionId': reject_option['optionId'],
+        await _write_json(
+            self._stdin,
+            {
+                'jsonrpc': '2.0',
+                'id': request_id,
+                'result': {
+                    'outcome': {
+                        'outcome': 'selected',
+                        'optionId': reject_option['optionId'],
+                    },
                 },
             },
-        })
+            drain_timeout_sec=self._inactivity_timeout_sec,
+        )
 
 
 def _find_model_config_id(session_result: Mapping[str, Any]) -> str | None:
@@ -2186,9 +2278,29 @@ async def _run_acp_session(
     readable_files: tuple[str, ...],
     operation: AcpOperation,
     backend_kind: str,
+    inactivity_timeout_sec: int,
     trace: _AcpExecutionTrace,
 ) -> _AcpSessionResult:
-    """1プロセスで initialize から1 prompt turnまで実行する。"""
+    """1プロセスで initialize から1 prompt turnまで実行する。
+
+    Args:
+        command: sandbox 経由で起動する ACP agent コマンド。
+        args: agent へ渡す引数。
+        env: agent へ渡す追加環境変数。
+        prompt_text: session/prompt に載せる本文。
+        model: 適用するモデル ID。未指定時は agent 既定。
+        reasoning_effort: 適用する推論深さ。未指定時は変更しない。
+        cwd: agent の作業ディレクトリ。
+        profile_dir: Landlock 書込みを許可する profile ディレクトリ。
+        readable_files: 追加の read-only ファイル。
+        operation: CandidateSelection / SeriesMetadata / EpisodeLookup。
+        backend_kind: 固定 ACP preset の識別子。
+        inactivity_timeout_sec: stdio 無通信を打ち切る秒数。行が届くたびリセット。
+        trace: 接続試験や失敗診断用の実行トレース。
+
+    Returns:
+        agent の最終出力と Web tool 相関結果。
+    """
 
     # 親プロセスに偶然設定された API key / ADC は ACP プリセットへ継承しない。
     # 呼び出し側が provider ごとに固定した値だけを後から加える。
@@ -2235,6 +2347,7 @@ async def _run_acp_session(
         operation=operation,
         backend_kind=backend_kind,
         trace=trace,
+        inactivity_timeout_sec=float(inactivity_timeout_sec),
     )
     try:
         initialize_result = await dispatcher.request('initialize', {
@@ -2334,8 +2447,13 @@ async def _run_acp_session(
             citations=dispatcher.verified_citations,
             web_search_failed=dispatcher.web_search_failed,
         )
+    except _AcpInactivityTimeoutError:
+        # stdio 無通信タイムアウト。cancel は短い独立 timeout 付きなので永久待機しない。
+        await dispatcher.cancel()
+        await asyncio.sleep(_CANCEL_GRACE_SEC)
+        raise
     except asyncio.CancelledError:
-        # asyncio.timeout() による全体deadline超過もここを通る。
+        # 外側からのタスク cancel でも session を回収する。
         # cancel 自体は短い独立 timeout 付きなので、ここでも永久待機しない。
         await dispatcher.cancel()
         await asyncio.sleep(_CANCEL_GRACE_SEC)
@@ -2433,25 +2551,55 @@ async def _run_acp_with_deadline(
     backend_kind: str = 'AcpCodex',
     trace: _AcpExecutionTrace | None = None,
 ) -> _AcpSessionResult:
-    """Semaphore待機・起動・通信・cleanupを含む全体deadlineを適用する。"""
+    """Semaphore 待機を含む絶対上限内で、無通信監視付き ACP turn を実行する。
+
+    Args:
+        command: sandbox 経由で起動する ACP agent コマンド。
+        args: agent へ渡す引数。
+        env: agent へ渡す追加環境変数。
+        prompt_text: session/prompt に載せる本文。
+        model: 適用するモデル ID。未指定時は agent 既定。
+        timeout_sec: stdio 無通信を打ち切る秒数。行が届くたびリセット。
+        cwd: agent の作業ディレクトリ。
+        profile_dir: Landlock 書込みを許可する profile ディレクトリ。
+        reasoning_effort: 適用する推論深さ。未指定時は変更しない。
+        readable_files: 追加の read-only ファイル。
+        operation: CandidateSelection / SeriesMetadata / EpisodeLookup。
+        backend_kind: 固定 ACP preset の識別子。
+        trace: 接続試験や失敗診断用の実行トレース。
+
+    Returns:
+        agent の最終出力と Web tool 相関結果。
+    """
 
     execution_trace = trace or _AcpExecutionTrace()
-    async with asyncio.timeout(timeout_sec):
-        async with _ACP_SEMAPHORE:
-            return await _run_acp_session(
-                command,
-                args,
-                env,
-                prompt_text,
-                model=model,
-                reasoning_effort=reasoning_effort,
-                cwd=cwd,
-                profile_dir=profile_dir,
-                readable_files=readable_files,
-                operation=operation,
-                backend_kind=backend_kind,
-                trace=execution_trace,
-            )
+    try:
+        # 待ち行列を含む実行全体には固定の最終上限を設ける。通常の長時間推論は
+        # 行ごとの無通信タイマーを更新しながら続行できるが、永久占有は許可しない。
+        async with asyncio.timeout(_ACP_HARD_TIMEOUT_SEC):
+            async with _ACP_SEMAPHORE:
+                return await _run_acp_session(
+                    command,
+                    args,
+                    env,
+                    prompt_text,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    cwd=cwd,
+                    profile_dir=profile_dir,
+                    readable_files=readable_files,
+                    operation=operation,
+                    backend_kind=backend_kind,
+                    inactivity_timeout_sec=timeout_sec,
+                    trace=execution_trace,
+                )
+    except _AcpInactivityTimeoutError:
+        # 内側の stdio 無通信は asyncio.timeout() の絶対上限と混同しない。
+        # TimeoutError の subclass なので、必ず generic TimeoutError より先に捕捉する。
+        raise
+    except TimeoutError as ex:
+        # hard timeout (asyncio.timeout) およびそれ以外の TimeoutError を HardTimeout へ正規化する。
+        raise _AcpHardTimeoutError from ex
 
 
 def _build_candidate_selection_prompt(
@@ -2643,7 +2791,12 @@ async def run_acp_candidate_selection(
             operation='CandidateSelection',
             backend_kind=backend_kind,
         )
-    except TimeoutError as ex:
+    except _AcpHardTimeoutError as ex:
+        raise RecordedSeriesAIError(
+            'HardTimeout',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except _AcpInactivityTimeoutError as ex:
         raise RecordedSeriesAIError(
             'Timeout',
             latency_ms=int((time.monotonic() - start_time) * 1000),
@@ -2724,7 +2877,12 @@ async def run_acp_series_metadata(
             operation='SeriesMetadata',
             backend_kind=backend_kind,
         )
-    except TimeoutError as ex:
+    except _AcpHardTimeoutError as ex:
+        raise RecordedSeriesAIError(
+            'HardTimeout',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except _AcpInactivityTimeoutError as ex:
         raise RecordedSeriesAIError(
             'Timeout',
             latency_ms=int((time.monotonic() - start_time) * 1000),
@@ -2981,7 +3139,16 @@ async def _runAcpEpisodeLookupDetailed(
             backend_kind=backend_kind,
             trace=trace,
         )
-    except TimeoutError:
+    except _AcpHardTimeoutError:
+        return _episodeLookupFailureResult(
+            outcome='SearchFailed',
+            error_code='HardTimeout',
+            model=effective_model,
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+            web_search_performed=trace.completed_web_calls > 0,
+            citations=trace.citations,
+        )
+    except _AcpInactivityTimeoutError:
         return _episodeLookupFailureResult(
             outcome='SearchFailed',
             error_code='Timeout',
@@ -3265,11 +3432,16 @@ def _buildAcpEpisodeLookupConnectionChecks(
             message='モデル出力の strict schema 検証までは到達しませんでした。',
         )
 
-    if result.error_code == 'Timeout':
+    if result.error_code in {'Timeout', 'HardTimeout'}:
+        is_hard_timeout = result.error_code == 'HardTimeout'
         if trace.process_started is False:
             timeout_cancel = ConnectionTestCheck(
                 status='Passed',
-                message='全体 deadline を process 起動前にも適用しました。',
+                message=(
+                    '絶対実行時間の安全上限を process 起動前にも適用しました。'
+                    if is_hard_timeout
+                    else '無通信タイムアウトを process 起動前にも適用しました。'
+                ),
             )
         elif (
             trace.cleanup_completed and
@@ -3277,12 +3449,20 @@ def _buildAcpEpisodeLookupConnectionChecks(
         ):
             timeout_cancel = ConnectionTestCheck(
                 status='Passed',
-                message='全体 deadline 後に ACP process を回収しました。',
+                message=(
+                    '絶対実行時間の安全上限到達後に ACP process を回収しました。'
+                    if is_hard_timeout
+                    else '無通信タイムアウト後に ACP process を回収しました。'
+                ),
             )
         else:
             timeout_cancel = ConnectionTestCheck(
                 status='Failed',
-                message='全体 deadline は発生しましたが、ACP process の回収を確認できませんでした。',
+                message=(
+                    '絶対実行時間の安全上限へ到達しましたが、ACP process の回収を確認できませんでした。'
+                    if is_hard_timeout
+                    else '無通信タイムアウトは発生しましたが、ACP process の回収を確認できませんでした。'
+                ),
             )
     elif trace.cancel_attempted:
         timeout_cancel = ConnectionTestCheck(
@@ -3397,12 +3577,19 @@ async def run_acp_connection_test(
             operation='SeriesMetadata',
             backend_kind=backend_kind,
         )
-    except TimeoutError:
+    except _AcpHardTimeoutError:
         return ConnectionTestResult(
             False,
             int((time.monotonic() - start_time) * 1000),
             effective_model,
-            f'ACP コマンドがタイムアウトしました（{timeout_sec}秒）。',
+            FormatAcpHardTimeoutMessage(subject='ACP'),
+        )
+    except _AcpInactivityTimeoutError:
+        return ConnectionTestResult(
+            False,
+            int((time.monotonic() - start_time) * 1000),
+            effective_model,
+            f'ACP からの応答が {timeout_sec} 秒間途絶えたためタイムアウトしました。',
         )
     except FileNotFoundError:
         return ConnectionTestResult(

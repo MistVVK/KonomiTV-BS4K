@@ -222,7 +222,9 @@
                 <div class="settings__item-label">
                     モデル名とは別に、思考の深さを選びます。<br>
                     <template v-if="settings.ai_backend === 'AcpCodex'">
-                        Codex は Low〜Ultra。初期値は <strong>Medium</strong> です。<br>
+                        Codex は Low〜Ultra。ただし <strong>Ultra</strong> は GPT-5.6 Sol 系統だけ選べます。<br>
+                        Sol 以外で保存済みの Ultra は、サーバー側で <strong>Max</strong> に自動補正します。<br>
+                        初期値は <strong>Medium</strong> です。<br>
                     </template>
                     <template v-else>
                         Grok は Low / Medium / High。初期値は <strong>High</strong> です。<br>
@@ -238,11 +240,25 @@
                     適用プレビュー: <code>{{acp_wire_preview}}</code>
                 </div>
             </div>
-            <!-- ACP タイムアウト -->
+            <div class="settings__item settings__item--switch" v-if="settings.ai_backend === 'AcpCodex'">
+                <label class="settings__item-heading" for="recorded_series_konomitv_bs4k_codex_fast_mode">
+                    Codex Fast モードを有効化
+                </label>
+                <label class="settings__item-label" for="recorded_series_konomitv_bs4k_codex_fast_mode">
+                    Codex の Fast service tier を使い、対応モデルの処理速度を上げます。<br>
+                    通常よりクレジット消費が増えるため、必要な場合だけ有効にしてください。<br>
+                    Fast モードは Codex 専用 profile の設定として適用されます。<br>
+                </label>
+                <v-switch id="recorded_series_konomitv_bs4k_codex_fast_mode" class="settings__item-switch" color="primary"
+                    hide-details v-model="settings.konomitv_bs4k_acp_codex_fast_mode_enabled" />
+            </div>
+            <!-- ACP 無通信タイムアウト -->
             <div class="settings__item">
-                <div class="settings__item-heading">ACP タイムアウト（秒）</div>
+                <div class="settings__item-heading">ACP 無通信タイムアウト（秒）</div>
                 <div class="settings__item-label">
-                    シリーズ生成と話数 Web 検索の最大実行時間です。30〜600 秒の間で指定してください。<br>
+                    シリーズ生成・話数 Web 検索・接続試験で、ACP からの進捗や応答が途絶えてから打ち切るまでの秒数です。<br>
+                    推論や結果整形の途中でも、thought / tool update などが届いている間は延長されます。30〜600 秒の間で指定してください。<br>
+                    進捗が継続している場合でも、サーバー保護のため総実行時間（他の ACP 実行待ちを含む）が {{ acp_hard_timeout_minutes }} 分を超えると停止します。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number"
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -276,17 +292,22 @@
                     <small v-if="acp_credential_status?.codex_auth_imported_at">
                         最終取り込み: {{formatACPAuthImportedAt(acp_credential_status.codex_auth_imported_at)}}
                     </small>
+                    <small v-if="acp_credential_status?.codex_auth_in_use">
+                        Codex の AI 処理が認証を使用中です。完了するまで再取り込み・削除はできません。
+                    </small>
                 </div>
                 <div class="recorded-series-actions mt-3">
                     <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :disabled="acp_credential_status?.codex_host_auth_available !== true"
+                        :disabled="acp_credential_status?.codex_host_auth_available !== true ||
+                            acp_credential_status?.codex_auth_in_use === true"
                         :loading="is_updating_acp_authentication"
                         @click="openACPAuthenticationDialog('codex', 'Import')">
                         <Icon icon="fluent:key-20-filled" class="mr-2" width="21px" />
                         {{acp_credential_status?.codex_auth_imported ? '認証を再取り込み' : '認証を取り込む'}}
                     </v-btn>
                     <v-btn class="settings__save-button" color="error" variant="flat"
-                        :disabled="acp_credential_status?.codex_auth_imported !== true"
+                        :disabled="acp_credential_status?.codex_auth_imported !== true ||
+                            acp_credential_status?.codex_auth_in_use === true"
                         :loading="is_updating_acp_authentication"
                         @click="openACPAuthenticationDialog('codex', 'Delete')">
                         <Icon icon="fluent:key-reset-20-filled" class="mr-2" width="21px" />取り込んだ認証を削除
@@ -318,17 +339,22 @@
                     <small v-if="acp_credential_status?.grok_auth_imported_at">
                         最終取り込み: {{formatACPAuthImportedAt(acp_credential_status.grok_auth_imported_at)}}
                     </small>
+                    <small v-if="acp_credential_status?.grok_auth_in_use">
+                        Grok Build の AI 処理が認証を使用中です。完了するまで再取り込み・削除はできません。
+                    </small>
                 </div>
                 <div class="recorded-series-actions mt-3">
                     <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :disabled="acp_credential_status?.grok_host_auth_available !== true"
+                        :disabled="acp_credential_status?.grok_host_auth_available !== true ||
+                            acp_credential_status?.grok_auth_in_use === true"
                         :loading="is_updating_acp_authentication"
                         @click="openACPAuthenticationDialog('grok', 'Import')">
                         <Icon icon="fluent:key-20-filled" class="mr-2" width="21px" />
                         {{acp_credential_status?.grok_auth_imported ? '認証を再取り込み' : '認証を取り込む'}}
                     </v-btn>
                     <v-btn class="settings__save-button" color="error" variant="flat"
-                        :disabled="acp_credential_status?.grok_auth_imported !== true"
+                        :disabled="acp_credential_status?.grok_auth_imported !== true ||
+                            acp_credential_status?.grok_auth_in_use === true"
                         :loading="is_updating_acp_authentication"
                         @click="openACPAuthenticationDialog('grok', 'Delete')">
                         <Icon icon="fluent:key-reset-20-filled" class="mr-2" width="21px" />取り込んだ認証を削除
@@ -383,6 +409,9 @@
 
             <!-- ACP 接続試験 -->
             <div class="settings__item">
+                <v-alert v-if="acp_connection_preflight_error !== ''" class="mb-3" color="warning" variant="tonal">
+                    {{acp_connection_preflight_error}}
+                </v-alert>
                 <div class="recorded-series-actions mt-3">
                     <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
                         :loading="testing_connection_capability === 'CandidateSelection'"
@@ -702,9 +731,12 @@ import RecordedSeries, {
 import { stageLabel } from '@/stores/AnalysisTasksStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { dayjs } from '@/utils';
+import { ACP_HARD_TIMEOUT_SEC } from '@/utils/RecordedEpisodeResolution';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
+/** サーバー側 ACP hard timeout の表示用分。ACP_HARD_TIMEOUT_SEC から導出する。 */
+const acp_hard_timeout_minutes = Math.floor(ACP_HARD_TIMEOUT_SEC / 60);
 const model_presets = [
     'gpt-5.6-luna',
     'gpt-5.4-nano',
@@ -804,6 +836,7 @@ const settings = ref<IRecordedSeriesSettings>({
     model: 'gpt-5.6-luna',
     acp_model: null,
     acp_reasoning_effort: null,
+    konomitv_bs4k_acp_codex_fast_mode_enabled: false,
     acp_timeout_sec: 120,
     google_cloud_project: null,
     google_cloud_location: null,
@@ -914,11 +947,43 @@ const acp_model_preset_items = computed(() => {
     return acp_model_presets_by_backend[settings.value.ai_backend]
         ?? [];
 });
+function isKonomiTVBS4KCodexSolModel(konomitv_bs4k_model: string | null): boolean {
+    const konomitv_bs4k_normalized_model = konomitv_bs4k_model?.trim().toLowerCase() ?? '';
+    return konomitv_bs4k_normalized_model === 'sol' || konomitv_bs4k_normalized_model.endsWith('-sol');
+}
+const konomitv_bs4k_acp_effective_model = computed(() => {
+    const konomitv_bs4k_current_model = settings.value.acp_model?.trim() ?? '';
+    return konomitv_bs4k_current_model || acp_defaults_by_backend[settings.value.ai_backend]?.model || '';
+});
+const is_konomitv_bs4k_codex_sol_model = computed(() =>
+    settings.value.ai_backend === 'AcpCodex' &&
+    isKonomiTVBS4KCodexSolModel(konomitv_bs4k_acp_effective_model.value),
+);
 /** 現在の ACP バックエンド向け推論深さ候補。 */
 const acp_reasoning_effort_options = computed(() => {
-    return acp_reasoning_effort_presets_by_backend[settings.value.ai_backend]
-        ?? [];
+    const konomitv_bs4k_reasoning_effort_options =
+        acp_reasoning_effort_presets_by_backend[settings.value.ai_backend] ?? [];
+    if (settings.value.ai_backend !== 'AcpCodex' || is_konomitv_bs4k_codex_sol_model.value) {
+        return konomitv_bs4k_reasoning_effort_options;
+    }
+    return konomitv_bs4k_reasoning_effort_options.filter(option => option.value !== 'Ultra');
 });
+
+function normalizeKonomiTVBS4KCodexReasoningEffort(
+    konomitv_bs4k_effort: AcpReasoningEffort | null,
+    konomitv_bs4k_model: string | null,
+    konomitv_bs4k_backend: AIBackendKind,
+): AcpReasoningEffort | null {
+    if (
+        konomitv_bs4k_backend === 'AcpCodex' &&
+        konomitv_bs4k_effort === 'Ultra' &&
+        isKonomiTVBS4KCodexSolModel(konomitv_bs4k_model) === false
+    ) {
+        return 'Max';
+    }
+    return konomitv_bs4k_effort;
+}
+
 /**
  * モデル選択。Grok は保存値が null でも表示上 grok-4.5 を出す。
  */
@@ -945,22 +1010,40 @@ const acp_model_selection = computed<string | null>({
         }
         if (value === null || value === undefined) {
             settings.value.acp_model = null;
+            settings.value.acp_reasoning_effort = normalizeKonomiTVBS4KCodexReasoningEffort(
+                settings.value.acp_reasoning_effort,
+                settings.value.acp_model,
+                settings.value.ai_backend,
+            );
             return;
         }
         const trimmed = value.trim();
         settings.value.acp_model = trimmed === '' ? null : trimmed;
+        settings.value.acp_reasoning_effort = normalizeKonomiTVBS4KCodexReasoningEffort(
+            settings.value.acp_reasoning_effort,
+            settings.value.acp_model,
+            settings.value.ai_backend,
+        );
     },
 });
 /** 推論深さ。未設定時は backend 既定を表示し、set で settings へ書き戻す。 */
 const acp_reasoning_effort_selection = computed<AcpReasoningEffort | null>({
     get() {
         if (settings.value.acp_reasoning_effort !== null) {
-            return settings.value.acp_reasoning_effort;
+            return normalizeKonomiTVBS4KCodexReasoningEffort(
+                settings.value.acp_reasoning_effort,
+                konomitv_bs4k_acp_effective_model.value,
+                settings.value.ai_backend,
+            );
         }
         return acp_defaults_by_backend[settings.value.ai_backend]?.effort ?? null;
     },
     set(value) {
-        settings.value.acp_reasoning_effort = value;
+        settings.value.acp_reasoning_effort = normalizeKonomiTVBS4KCodexReasoningEffort(
+            value,
+            konomitv_bs4k_acp_effective_model.value,
+            settings.value.ai_backend,
+        );
     },
 });
 /** 実際に ACP agent へ適用するモデルと推論深さ、または Grok CLI 引数を表示する。 */
@@ -971,13 +1054,12 @@ const acp_wire_preview = computed(() => {
         const effort_cli = (effort ?? 'High').toLowerCase();
         return `grok --reasoning-effort ${effort_cli} agent stdio`;
     }
-    let model = settings.value.acp_model?.trim() ?? '';
-    if (model === '') {
-        model = acp_defaults_by_backend[backend]?.model ?? '';
-    }
+    const model = konomitv_bs4k_acp_effective_model.value;
     if (model === '') return '';
     if (backend === 'AcpCodex' && effort) {
-        return `${model} / reasoning_effort=${effort.toLowerCase()}`;
+        const konomitv_bs4k_fast_mode_suffix =
+            settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled ? ' / fast' : '';
+        return `${model} / reasoning_effort=${effort.toLowerCase()}${konomitv_bs4k_fast_mode_suffix}`;
     }
     return model;
 });
@@ -997,7 +1079,7 @@ const acp_timeout_error = computed(() => {
     const timeout = Number(settings.value.acp_timeout_sec);
     return Number.isInteger(timeout) && timeout >= 30 && timeout <= 600 ?
         '' :
-        'ACP タイムアウトは 30 ～ 600 秒の整数で入力してください。';
+        'ACP 無通信タイムアウトは 30 ～ 600 秒の整数で入力してください。';
 });
 const daily_ai_request_limit_error = computed(() => {
     if (String(settings.value.daily_ai_request_limit).trim() === '') return '0 ～ 1000 の整数を入力してください。';
@@ -1019,9 +1101,28 @@ const has_provider_validation_error = computed(() => settings.value.ai_backend =
     api_base_url_error.value !== '' || model_error.value !== '' :
     has_acp_validation_error.value,
 );
+/** 選択中 ACP を新規起動せず、先に解消すべき認証・直列実行状態を説明する。 */
+const acp_connection_preflight_error = computed(() => {
+    if (settings.value.ai_backend === 'OpenAICompatible') return '';
+    if (acp_credential_status.value === null) return 'ACP 認証状態を確認しています。';
+    if (settings.value.ai_backend === 'AcpCodex' && acp_credential_status.value.codex_auth_imported === false) {
+        return 'Codex 認証を取り込んでから接続テストを実行してください。';
+    }
+    if (settings.value.ai_backend === 'AcpGrok' && acp_credential_status.value.grok_auth_imported === false) {
+        return 'Grok Build 認証を取り込んでから接続テストを実行してください。';
+    }
+    if (settings.value.ai_backend === 'AcpGemini' && acp_credential_status.value.google_adc_available === false) {
+        return 'Google ADC をホストへ設定してから接続テストを実行してください。';
+    }
+    if (acp_credential_status.value.acp_operation_running) {
+        return '別の ACP AI 処理を実行中です。完了後に接続テストを実行してください。';
+    }
+    return '';
+});
 const has_connection_validation_error = computed(() =>
     has_provider_validation_error.value ||
-    (settings.value.ai_backend === 'OpenAICompatible' && api_key_length_error.value !== ''),
+    (settings.value.ai_backend === 'OpenAICompatible' && api_key_length_error.value !== '') ||
+    acp_connection_preflight_error.value !== '',
 );
 const has_settings_validation_error = computed(() =>
     has_provider_validation_error.value ||
@@ -1064,26 +1165,38 @@ function nullableTrimmed(value: string | null): string | null {
 
 /** 画面上の全ドラフトを backend 非依存の保存 payload へ変換する。 */
 function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
+    const konomitv_bs4k_selected_backend = settings.value.ai_backend;
+    const konomitv_bs4k_acp_model = konomitv_bs4k_selected_backend === 'AcpGrok' ?
+        null :
+        nullableTrimmed(settings.value.acp_model)
+            ?? acp_defaults_by_backend[konomitv_bs4k_selected_backend]?.model
+            ?? null;
+    const konomitv_bs4k_acp_reasoning_effort = ['AcpCodex', 'AcpGrok'].includes(
+        konomitv_bs4k_selected_backend,
+    ) ?
+        normalizeKonomiTVBS4KCodexReasoningEffort(
+            settings.value.acp_reasoning_effort
+                ?? acp_defaults_by_backend[konomitv_bs4k_selected_backend]?.effort
+                ?? null,
+            konomitv_bs4k_acp_model,
+            konomitv_bs4k_selected_backend,
+        ) :
+        null;
     return {
         enabled: settings.value.enabled,
         ai_enabled: settings.value.ai_enabled,
         ai_episode_number_search_enabled: settings.value.ai_episode_number_search_enabled,
         ai_episode_number_acceptance_mode: settings.value.ai_episode_number_acceptance_mode,
         daily_ai_request_limit: Number(settings.value.daily_ai_request_limit),
-        ai_backend: settings.value.ai_backend,
+        ai_backend: konomitv_bs4k_selected_backend,
         api_base_url: normalizeAPIBaseURL(settings.value.api_base_url),
         model: settings.value.model.trim(),
         // モデル名と推論深さは分離して送る。Grok の model はサーバー側でも null に正規化される。
-        acp_model: settings.value.ai_backend === 'AcpGrok' ?
-            null :
-            nullableTrimmed(settings.value.acp_model)
-                ?? acp_defaults_by_backend[settings.value.ai_backend]?.model
-                ?? null,
-        acp_reasoning_effort: ['AcpCodex', 'AcpGrok'].includes(settings.value.ai_backend) ?
-            (settings.value.acp_reasoning_effort
-                ?? acp_defaults_by_backend[settings.value.ai_backend]?.effort
-                ?? null) :
-            null,
+        acp_model: konomitv_bs4k_acp_model,
+        acp_reasoning_effort: konomitv_bs4k_acp_reasoning_effort,
+        konomitv_bs4k_acp_codex_fast_mode_enabled:
+            konomitv_bs4k_selected_backend === 'AcpCodex' &&
+            settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled === true,
         acp_timeout_sec: Number(settings.value.acp_timeout_sec),
         google_cloud_project: nullableTrimmed(settings.value.google_cloud_project),
         google_cloud_location: nullableTrimmed(settings.value.google_cloud_location),
@@ -1099,14 +1212,28 @@ function applyFetchedSettings(fetched_settings: IRecordedSeriesSettings): void {
     // ローリング更新中の旧サーバーや古い mock が廃止済み backend を返しても、
     // 一覧外の値を表示したり任意コマンド設定へ戻ったりしないようクライアントでも fail-closed にする。
     const is_supported_backend = ai_backend_options.some(option => option.value === fetched_settings.ai_backend);
+    const konomitv_bs4k_normalized_fetched_settings: IRecordedSeriesSettings = {
+        ...fetched_settings,
+        // 旧サーバーから field が返らない場合も Fast は安全側で無効にする。
+        konomitv_bs4k_acp_codex_fast_mode_enabled:
+            fetched_settings.konomitv_bs4k_acp_codex_fast_mode_enabled === true,
+    };
     settings.value = is_supported_backend ?
-        fetched_settings :
+        konomitv_bs4k_normalized_fetched_settings :
         {
-            ...fetched_settings,
+            ...konomitv_bs4k_normalized_fetched_settings,
             ai_backend: 'OpenAICompatible',
             ai_enabled: false,
             acp_reasoning_effort: null,
         };
+    settings.value.acp_reasoning_effort = normalizeKonomiTVBS4KCodexReasoningEffort(
+        settings.value.acp_reasoning_effort,
+        settings.value.acp_model,
+        settings.value.ai_backend,
+    );
+    if (settings.value.ai_backend !== 'AcpCodex') {
+        settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled = false;
+    }
     // 同期的に watch が走ったあとにフラグを戻す。
     queueMicrotask(() => {
         suppress_acp_default_injection = false;
@@ -1378,6 +1505,7 @@ watch(() => settings.value.ai_backend, (backend, previous) => {
     }
     if (backend === 'OpenAICompatible') {
         settings.value.acp_reasoning_effort = null;
+        settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled = false;
         return;
     }
     // ユーザーが backend を切り替えたときだけ、その ACP の推奨初期値を埋める。
@@ -1385,6 +1513,7 @@ watch(() => settings.value.ai_backend, (backend, previous) => {
     if (defaults === undefined) return;
     settings.value.acp_model = defaults.model;
     settings.value.acp_reasoning_effort = defaults.effort;
+    settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled = false;
 });
 
 

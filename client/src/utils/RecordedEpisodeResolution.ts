@@ -43,6 +43,23 @@ const EPISODE_RESOLUTION_SOURCE_LABELS: Record<RecordedEpisodeResolutionSource, 
     AI: 'AI 一括生成',
 };
 
+/**
+ * server/app/metadata/RecordedEpisodeMessages.py の ACP_HARD_TIMEOUT_SEC と揃える。
+ * credential lock / Semaphore 待ちを含む ACP 絶対実行上限（秒）。
+ */
+export const ACP_HARD_TIMEOUT_SEC = 60 * 60;
+/** 接続試験 HTTP がサーバー hard stop 応答より先に切れないよう足す余裕（秒）。 */
+export const ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC = 10 * 60;
+
+/** HardTimeout の利用者向け文言。上限分は ACP_HARD_TIMEOUT_SEC から導出する。 */
+export function formatAcpHardTimeoutMessage(subject: string): string {
+    const minutes = Math.floor(ACP_HARD_TIMEOUT_SEC / 60);
+    return (
+        `${subject}の総実行時間（他の ACP 実行待ちを含む）が` +
+        `安全上限の ${minutes} 分を超えたため停止しました。`
+    );
+}
+
 /** 旧データに error_message がない場合だけ使う、安全な決定論的表示文。 */
 const RECORDED_EPISODE_ERROR_MESSAGES: Record<string, string> = {
     RecordedSeriesIsDisabled: '録画シリーズの自動判定が無効です。',
@@ -72,7 +89,8 @@ const RECORDED_EPISODE_ERROR_MESSAGES: Record<string, string> = {
     MultipleOutputTexts: 'AI プロバイダーから複数の判定本文が返りました。',
     InvalidOutputSchema: 'AI の応答が必要な形式を満たしていません。',
     InvalidModelOutput: 'AI の応答内容が必要な条件を満たしていません。',
-    Timeout: 'AI バックエンドとの通信がタイムアウトしました。',
+    Timeout: 'AI バックエンドからの応答が一定時間途絶えたためタイムアウトしました。',
+    HardTimeout: formatAcpHardTimeoutMessage('AI バックエンド'),
     NetworkError: 'AI バックエンドへ接続できませんでした。',
     InvalidURL: 'AI バックエンドの接続先 URL が正しくありません。',
     RedirectRejected: '安全のため、AI バックエンドからのリダイレクトを拒否しました。',

@@ -51,6 +51,27 @@ def test_codex_profile_generates_only_managed_config_and_isolates_runtime_state(
     assert (profile / 'settings.json').exists() is False
 
 
+def test_konomitv_bs4k_codex_profile_can_enable_and_then_clear_fast_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex Fast 設定は専用 config だけへ書き、無効化時に残さない。"""
+
+    profiles_root = tmp_path / 'profiles'
+    monkeypatch.setattr(AcpProfiles, '_ACP_PROFILES_ROOT', profiles_root)
+
+    profile = AcpProfiles.ensure_acp_profile('codex', konomitv_bs4k_fast_mode_enabled=True)
+    fast_config = (profile / 'config.toml').read_text(encoding='utf-8')
+    assert 'service_tier = "fast"' in fast_config
+    assert '[features]' in fast_config
+    assert 'fast_mode = true' in fast_config
+
+    AcpProfiles.ensure_acp_profile('codex', konomitv_bs4k_fast_mode_enabled=False)
+    assert (profile / 'config.toml').read_text(encoding='utf-8') == (
+        'cli_auth_credentials_store = "file"\n'
+    )
+
+
 def test_gemini_profile_writes_vertex_ai_settings_and_removes_legacy_symlink(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -208,8 +229,11 @@ def test_create_backend_uses_fixed_codex_command_workspace_and_environment(
 
     def EnsureProfile(
         backend: AcpProfiles.KonomiTVBS4KACPProfileBackend,
+        *,
+        konomitv_bs4k_fast_mode_enabled: bool = False,
     ) -> Path:
         assert backend == 'codex'
+        assert konomitv_bs4k_fast_mode_enabled is False
         return profile
 
     monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
@@ -227,6 +251,36 @@ def test_create_backend_uses_fixed_codex_command_workspace_and_environment(
     assert 'OPENAI_API_KEY' not in backend._env
 
 
+def test_konomitv_bs4k_create_backend_passes_codex_fast_mode_to_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Codex 設定の Fast 有効化を専用 profile 構築へ渡す。"""
+
+    profile = tmp_path / 'profile'
+    (profile / 'workspace').mkdir(parents=True)
+    captured: dict[str, bool] = {}
+
+    def EnsureProfile(
+        backend: AcpProfiles.KonomiTVBS4KACPProfileBackend,
+        *,
+        konomitv_bs4k_fast_mode_enabled: bool = False,
+    ) -> Path:
+        assert backend == 'codex'
+        captured['konomitv_bs4k_fast_mode_enabled'] = konomitv_bs4k_fast_mode_enabled
+        return profile
+
+    monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
+    settings = RecordedSeriesSettings(
+        ai_backend='AcpCodex',
+        konomitv_bs4k_acp_codex_fast_mode_enabled=True,
+    )
+
+    RecordedSeriesAI._create_backend(settings)
+
+    assert captured == {'konomitv_bs4k_fast_mode_enabled': True}
+
+
 def test_acp_profile_setup_failure_is_normalized_for_ai_audit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -236,8 +290,11 @@ def test_acp_profile_setup_failure_is_normalized_for_ai_audit(
 
     def FailToEnsureProfile(
         backend: AcpProfiles.KonomiTVBS4KACPProfileBackend,
+        *,
+        konomitv_bs4k_fast_mode_enabled: bool = False,
     ) -> Path:
         del backend
+        del konomitv_bs4k_fast_mode_enabled
         raise AcpProfiles.AcpProfileError('test profile failure')
 
     monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', FailToEnsureProfile)
@@ -330,8 +387,11 @@ def test_create_backend_injects_grok_reasoning_effort_cli_flag(
 
     def EnsureProfile(
         backend: AcpProfiles.KonomiTVBS4KACPProfileBackend,
+        *,
+        konomitv_bs4k_fast_mode_enabled: bool = False,
     ) -> Path:
         assert backend == 'grok'
+        assert konomitv_bs4k_fast_mode_enabled is False
         return profile
 
     monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
@@ -410,6 +470,39 @@ def test_codex_splits_composite_model_and_applies_defaults() -> None:
     assert defaults.acp_model == 'gpt-5.6-luna'
     assert defaults.acp_reasoning_effort == 'Medium'
     assert RecordedSeriesAI.get_audit_model(defaults) == 'acp:codex:gpt-5.6-luna[medium]'
+
+
+def test_konomitv_bs4k_codex_ultra_is_reserved_for_sol_and_fast_mode_is_codex_only() -> None:
+    """Ultra は Sol だけに残し、Fast 設定は Codex 以外へ持ち越さない。"""
+
+    non_sol = RecordedSeriesSettings(
+        ai_backend='AcpCodex',
+        acp_model='gpt-5.6-terra',
+        acp_reasoning_effort='Ultra',
+        konomitv_bs4k_acp_codex_fast_mode_enabled=True,
+    )
+    assert non_sol.acp_reasoning_effort == 'Max'
+    assert non_sol.konomitv_bs4k_acp_codex_fast_mode_enabled is True
+
+    legacy_non_sol = RecordedSeriesSettings(
+        ai_backend='AcpCodex',
+        acp_model='gpt-5.6-luna[ultra]',
+    )
+    assert legacy_non_sol.acp_model == 'gpt-5.6-luna'
+    assert legacy_non_sol.acp_reasoning_effort == 'Max'
+
+    sol = RecordedSeriesSettings(
+        ai_backend='AcpCodex',
+        acp_model='gpt-5.6-sol',
+        acp_reasoning_effort='Ultra',
+    )
+    assert sol.acp_reasoning_effort == 'Ultra'
+
+    grok = RecordedSeriesSettings(
+        ai_backend='AcpGrok',
+        konomitv_bs4k_acp_codex_fast_mode_enabled=True,
+    )
+    assert grok.konomitv_bs4k_acp_codex_fast_mode_enabled is False
 
 
 def test_gemini_defaults_model_without_unsupported_effort() -> None:
