@@ -179,6 +179,7 @@ COPY --from=tscodecbridge-builder /build/konomitv-bs4k-tscodecbridge/source/ \
 COPY --from=tscodecbridge-builder /opt/konomitv-bs4k-tscodecbridge-runtime/ \
     /opt/konomitv-bs4k-tscodecbridge-runtime/
 RUN KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_ROOT=/opt/thirdparty/FFmpeg8 \
+        TSREADEX_BINARY=/opt/thirdparty/tsreadex/tsreadex.elf \
         /build/docker/ts-codec-bridge/build.sh test-ffmpeg-integration
 
 # --------------------------------------------------------------------------------------------------------------

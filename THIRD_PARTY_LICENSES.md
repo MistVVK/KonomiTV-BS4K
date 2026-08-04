@@ -1417,10 +1417,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-#### tsreadex 33ea51d46b5b
+#### tsreadex 3dde76d4c954
 
 - Source: <https://github.com/MistVVK/tsreadex>
-- Fixed revision or artifact: `33ea51d46b5bb6a66a35b15793394c0765c0167a`
+- Fixed revision or artifact: `3dde76d4c954f74247fd5cacdc2624dc3b9045b5`
 
 ##### License.txt
 
