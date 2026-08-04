@@ -76,9 +76,15 @@ const useVersionStore = defineStore('version', {
          * バージョン情報を取得する
          * すでに取得済みの情報がある場合は API リクエストを行わずにそれを返す
          * @param force 強制的に API リクエストを行う場合は true
+         * @param signal 呼び出し元のライフサイクル終了時にストア更新を中断する AbortSignal
          * @returns バージョン情報 or バージョン情報の取得に失敗した場合は null
          */
-        async fetchServerVersion(force: boolean = false): Promise<IVersionInformation | null> {
+        async fetchServerVersion(force: boolean = false, signal?: AbortSignal): Promise<IVersionInformation | null> {
+
+            const isCallerActive = () => signal?.aborted !== true;
+            if (isCallerActive() === false) {
+                return null;
+            }
 
             // バージョン情報がある場合はそれを返す
             // force が true の場合は無視される
@@ -91,7 +97,12 @@ const useVersionStore = defineStore('version', {
             }
 
             // サーバーのバージョン情報を取得する
-            const version_info = await Version.fetchServerVersion();
+            // Store の force と Service の suppress_error は意味が異なる。
+            // AbortSignal 起因の失敗は Service 側で抑止されるため、通常の通信失敗は従来どおり通知する。
+            const version_info = await Version.fetchServerVersion(false, signal);
+            if (isCallerActive() === false) {
+                return null;
+            }
             if (version_info === null) {
                 this.is_server_version_fetch_failed = true;
                 return null;
