@@ -132,3 +132,24 @@ Update: [Upstream] upstream/master の更新を取り込む
 - 原則としてファイル丸ごとの `git add <file>` は使わず、変更の意味ごとに hunk / 行単位でステージする
 - 新規ファイル全体・削除全体・ドキュメントの置き換えなど、ファイル単位が自然な場合は例外としてよい
 - コミット前に `git diff --cached` で意図した差分だけが staged か確認する
+
+### ブランチの使い分けと運用ルール
+
+基本となるブランチ構成と運用ルールは以下の通り。
+
+1. **`main` ブランチ (`origin/main`)**
+   - KonomiTV-BS4K の基本・デフォルトブランチ。
+   - BS4K 独自の機能拡張、最適化、互換 API など、プロダクトとしての最終的なコードが集約される。
+
+2. **`upstream-fix` ブランチ (`origin/upstream-fix`)**
+   - 上流（`tsukumijima/KonomiTV`）由来のバグ修正・共通改善を行う専用ブランチ。
+   - `main` には上流へ還元できない BS4K 固有の変更が多く含まれるため、上流バグの修正は本ブランチで実施する。
+   - **運用要件**:
+     - その都合上、**`upstream/master` から作成（ブランチを切る）すること**。
+     - `origin/main` と `upstream/master` の双方へクリーンにマージ（または Pull Request）できる状態を維持する。BS4K 固有のコードや依存関係を一切混入させてはならない。
+   - 修正完了後は `main` へマージするとともに、必要に応じて上流本家への PR に活用する。
+
+3. **`upstream` リモート・関連ブランチ (`upstream/master` 等)**
+   - 上流リポジトリ（`https://github.com/tsukumijima/KonomiTV.git`）のコードベース。
+   - 上流側の新機能やバグ修正を取り込む際の参照元として使用する。
+   - upstream からの取り込みコミットは Git コミット規約に従い `Update: [Upstream] upstream/master の更新を取り込む` とする。
