@@ -458,12 +458,9 @@ class LiveDataBroadcastingManager implements PlayerManager {
         // ライブ PSI/SI アーカイブデータデコーダーを初期化
         // Comlink を挟んでいる関係上、コンストラクタにも関わらず Promise を返すため await する必要がある
         const api_quality = PlayerUtils.extractLiveAPIQualityFromDPlayer(this.player);
-        const konomitv_bs4k_codec_query =
-            PlayerUtils.extractKonomiTVBS4KLivePlaybackCodecQueryFromDPlayer(this.player);
         const live_psi_archived_data_decoder = await new LivePSIArchivedDataDecoderProxy(
             channels_store.channel.current,
             api_quality,
-            konomitv_bs4k_codec_query,
         );
         // Proxy の非同期生成中に destroy() または次世代 init() が走った場合、この Proxy は
         // インスタンス変数へ公開せず、その場で Worker を終了する
