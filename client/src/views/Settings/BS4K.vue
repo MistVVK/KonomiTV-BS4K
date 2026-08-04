@@ -201,6 +201,28 @@
                         v-if="network_circuit === 'モバイル回線時'" v-model="settings_store.settings.bs4k_video_audio_encoding_codec_cellular">
                     </v-select>
                 </div>
+                <div class="settings__item settings__item--switch settings__item--sync-disabled">
+                    <label class="settings__item-heading" :for="`tv_low_latency_mode_for_bs4k${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
+                        BS4K を低遅延で視聴する
+                    </label>
+                    <label class="settings__item-label" :for="`tv_low_latency_mode_for_bs4k${network_circuit === 'モバイル回線時' ? '_cellular' : ''}`">
+                        低遅延ストリーミングをオンにすると、<b>放送波との遅延を最短 0.9 秒に抑えて視聴できます！</b><br>
+                        また、約 3 秒以上遅延したときに少しだけ再生速度を早める (1.1x) ことで、滑らかにストリーミングの遅延を取り戻します。<br>
+                    </label>
+                    <div class="settings__item-label mt-1">
+                        映像がカクつきやすくなるため、<b>通信が不安定になりがちなモバイル回線やフリー Wi-Fi から視聴するときは、オフにすることをおすすめします。</b><br>
+                        通常放送の低遅延設定とは独立して、BS4K ライブ視聴だけに適用されます。<br>
+                        サーバー側で「BS4K プレイヤーを通常バッファで再生する」が有効なときは、この設定よりそちらが優先されます。<br>
+                    </div>
+                    <v-switch class="settings__item-switch" color="primary" id="tv_low_latency_mode_for_bs4k" hide-details
+                        v-if="network_circuit !== 'モバイル回線時'"
+                        v-model="settings_store.settings.tv_low_latency_mode_for_bs4k">
+                    </v-switch>
+                    <v-switch class="settings__item-switch" color="primary" id="tv_low_latency_mode_for_bs4k_cellular" hide-details
+                        v-if="network_circuit === 'モバイル回線時'"
+                        v-model="settings_store.settings.tv_low_latency_mode_for_bs4k_cellular">
+                    </v-switch>
+                </div>
             </div>
         </div>
         <div class="settings__content" v-if="isSectionVisible('server')"
