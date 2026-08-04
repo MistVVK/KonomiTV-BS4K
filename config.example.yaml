@@ -56,7 +56,8 @@ general:
     encoder_bs4k_max_interleave_delta: 800
 
     # BS4K のライブ視聴でエンコーダーを即時出力優先にするか
-    encoder_bs4k_low_latency: true
+    # 既定は安定性優先（無効）。有効にすると再読み込みが多発するおそれがあります。
+    encoder_bs4k_low_latency: false
 
     # 受入試験中だけBridge起動counterを能力APIの応答headerへ公開するか
     # 通常運用では視聴活動の推測を防ぐため、必ず無効のままにしてください。
@@ -64,7 +65,8 @@ general:
 
     # BS4K のライブ視聴ではプレイヤーを通常バッファで再生するか
     # 有効にすると、BS4K のライブ視聴時だけユーザーの低遅延視聴設定を使わず、通常の再生バッファを使います。
-    bs4k_ignore_viewer_low_latency: false
+    # 既定は安定性優先（有効）。無効にすると低遅延視聴時に再読み込みが多発するおそれがあります。
+    bs4k_ignore_viewer_low_latency: true
 
     # BS4K のライブ視聴開始時に先頭 TS を捨てるか
     # 有効にすると、チューナー切替直後の不安定な TS をエンコーダーに渡さず破棄します。

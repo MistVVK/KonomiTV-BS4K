@@ -248,9 +248,9 @@ class _ServerSettingsGeneral(BaseModel):
     encoder_bs4k_input_analyze: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.5
     encoder_bs4k_input_analysis_enabled: bool = True
     encoder_bs4k_max_interleave_delta: PositiveInt = 800
-    encoder_bs4k_low_latency: bool = True
+    encoder_bs4k_low_latency: bool = False
     konomitv_bs4k_acceptance_diagnostics_enabled: bool = False
-    bs4k_ignore_viewer_low_latency: bool = False
+    bs4k_ignore_viewer_low_latency: bool = True
     bs4k_live_startup_discard_enabled: bool = True
     bs4k_live_startup_discard_seconds: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 2.0
     program_update_interval: Annotated[float, Field(ge=0.1, allow_inf_nan=False)] = 5.0
