@@ -689,7 +689,6 @@ class Videos {
      * 保存した映像・音声を同一のlive combinationとして解決する。
      *
      * 映像を優先してから音声を互換順に試し、互いに別の組み合わせへfallbackする状態を作らない。
-     * 自動画質の段階的 codec 落としには resolveKonomiTVBS4KExactPlaybackCombination を使うこと。
      */
     static resolveKonomiTVBS4KPlaybackCombination(
         konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,

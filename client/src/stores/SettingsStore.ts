@@ -170,14 +170,6 @@ export interface ILocalClientSettings extends IClientSettings {
     konomitv_bs4k_playback_audio_codec_cellular: KonomiTVBS4KPlaybackAudioCodec;
     konomitv_bs4k_playback_audio_codec_for_bs4k: KonomiTVBS4KPlaybackAudioCodec;
     konomitv_bs4k_playback_audio_codec_for_bs4k_cellular: KonomiTVBS4KPlaybackAudioCodec;
-    // 自動画質選択モード (回線ごと / 通常・BS4K 共通フラグ)
-    konomitv_bs4k_playback_auto_quality_mode: boolean;
-    konomitv_bs4k_playback_auto_quality_mode_cellular: boolean;
-    // 自動モード時の上限画質 (通常 / BS4K / 回線別)
-    konomitv_bs4k_playback_auto_quality_max: KonomiTVBS4KPlaybackStreamingQuality;
-    konomitv_bs4k_playback_auto_quality_max_cellular: KonomiTVBS4KPlaybackStreamingQuality;
-    konomitv_bs4k_playback_auto_quality_max_for_bs4k: BS4KLiveStreamingQuality;
-    konomitv_bs4k_playback_auto_quality_max_for_bs4k_cellular: BS4KLiveStreamingQuality;
     konomitv_bs4k_playback_24fps_mode: boolean;
     konomitv_bs4k_playback_24fps_mode_cellular: boolean;
     konomitv_bs4k_playback_24fps_mode_for_bs4k: boolean;
@@ -408,18 +400,6 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     konomitv_bs4k_playback_audio_codec_for_bs4k: 'aac',
     // BS4K の共通音声コーデック (モバイル回線時) (Default: AAC) (同期無効)
     konomitv_bs4k_playback_audio_codec_for_bs4k_cellular: 'aac',
-    // 自動画質選択モード (Wi-Fi 回線時) (Default: オン) (同期無効)
-    konomitv_bs4k_playback_auto_quality_mode: true,
-    // 自動画質選択モード (モバイル回線時) (Default: オン) (同期無効)
-    konomitv_bs4k_playback_auto_quality_mode_cellular: true,
-    // 自動モード時の通常放送上限画質 (Wi-Fi) (Default: 1080p-60fps) (同期無効)
-    konomitv_bs4k_playback_auto_quality_max: '1080p-60fps',
-    // 自動モード時の通常放送上限画質 (モバイル) (Default: 720p) (同期無効)
-    konomitv_bs4k_playback_auto_quality_max_cellular: '720p',
-    // 自動モード時の BS4K 上限画質 (Wi-Fi) (Default: 2160p) (同期無効)
-    konomitv_bs4k_playback_auto_quality_max_for_bs4k: '2160p',
-    // 自動モード時の BS4K 上限画質 (モバイル) (Default: 1080p-60fps) (同期無効)
-    konomitv_bs4k_playback_auto_quality_max_for_bs4k_cellular: '1080p-60fps',
     // 通常放送の共通 24fps モード (Wi-Fi 回線時) (Default: オフ) (同期無効)
     konomitv_bs4k_playback_24fps_mode: false,
     // 通常放送の共通 24fps モード (モバイル回線時) (Default: オフ) (同期無効)
@@ -635,12 +615,6 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     // konomitv_bs4k_playback_audio_codec_cellular: 同期無効
     // konomitv_bs4k_playback_audio_codec_for_bs4k: 同期無効
     // konomitv_bs4k_playback_audio_codec_for_bs4k_cellular: 同期無効
-    // konomitv_bs4k_playback_auto_quality_mode: 同期無効
-    // konomitv_bs4k_playback_auto_quality_mode_cellular: 同期無効
-    // konomitv_bs4k_playback_auto_quality_max: 同期無効
-    // konomitv_bs4k_playback_auto_quality_max_cellular: 同期無効
-    // konomitv_bs4k_playback_auto_quality_max_for_bs4k: 同期無効
-    // konomitv_bs4k_playback_auto_quality_max_for_bs4k_cellular: 同期無効
     // konomitv_bs4k_playback_24fps_mode: 同期無効
     // konomitv_bs4k_playback_24fps_mode_cellular: 同期無効
     // konomitv_bs4k_playback_24fps_mode_for_bs4k: 同期無効
@@ -1172,8 +1146,6 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
     const konomitv_bs4k_common_bs4k_quality_keys = [
         'konomitv_bs4k_playback_streaming_quality_for_bs4k',
         'konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular',
-        'konomitv_bs4k_playback_auto_quality_max_for_bs4k',
-        'konomitv_bs4k_playback_auto_quality_max_for_bs4k_cellular',
     ] as const;
     for (const konomitv_bs4k_key of konomitv_bs4k_common_bs4k_quality_keys) {
         const konomitv_bs4k_value = normalized_settings[konomitv_bs4k_key];
@@ -1186,23 +1158,7 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
             konomitv_bs4k_normalized_value as BS4KLiveStreamingQuality :
             ILocalClientSettingsDefault[konomitv_bs4k_key];
     }
-    const konomitv_bs4k_auto_normal_quality_keys = [
-        'konomitv_bs4k_playback_auto_quality_max',
-        'konomitv_bs4k_playback_auto_quality_max_cellular',
-    ] as const;
-    for (const konomitv_bs4k_key of konomitv_bs4k_auto_normal_quality_keys) {
-        if (
-            LIVE_STREAMING_QUALITIES.includes(
-                normalized_settings[konomitv_bs4k_key] as KonomiTVBS4KPlaybackStreamingQuality,
-            ) === false
-        ) {
-            normalized_settings[konomitv_bs4k_key] =
-                ILocalClientSettingsDefault[konomitv_bs4k_key];
-        }
-    }
     const konomitv_bs4k_common_boolean_keys = [
-        'konomitv_bs4k_playback_auto_quality_mode',
-        'konomitv_bs4k_playback_auto_quality_mode_cellular',
         'konomitv_bs4k_playback_24fps_mode',
         'konomitv_bs4k_playback_24fps_mode_cellular',
         'konomitv_bs4k_playback_24fps_mode_for_bs4k',
