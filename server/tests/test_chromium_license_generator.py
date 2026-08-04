@@ -67,7 +67,10 @@ def test_chromium_credits_require_complete_text_and_supported_homepages() -> Non
         ])
 
 
-@pytest.mark.parametrize('chromium_version', ['150.0.7871.124', '150.0.7871.181'])
+@pytest.mark.parametrize(
+    'chromium_version',
+    ['150.0.7871.124', '150.0.7871.181', '150.0.7871.186'],
+)
 def test_known_chromium_credits_encoding_damage_is_repaired_only_for_fixed_versions(
     chromium_version: str,
 ) -> None:
