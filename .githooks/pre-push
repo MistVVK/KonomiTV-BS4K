@@ -5,24 +5,28 @@ set -euo pipefail
 repository_root="$(git rev-parse --show-toplevel)"
 
 if ! command -v poetry > /dev/null 2>&1; then
-    echo '[pre-push] Poetry is required to run the server test suite.' >&2
+    echo '[pre-push] Poetry is required to run the server lint.' >&2
     exit 1
 fi
-if ! command -v node > /dev/null 2>&1; then
-    echo '[pre-push] Node.js is required to run the client test suite.' >&2
+if command -v yarn > /dev/null 2>&1; then
+    yarn_command=(yarn)
+elif command -v corepack > /dev/null 2>&1; then
+    yarn_command=(corepack yarn)
+else
+    echo '[pre-push] Yarn or Corepack is required to run the client typecheck.' >&2
     exit 1
 fi
 
-echo '[pre-push] Running server tests...'
+echo '[pre-push] Running server lint...'
 (
     cd "${repository_root}/server"
-    poetry run task test
+    poetry run task lint
 )
 
-echo '[pre-push] Running client tests...'
+echo '[pre-push] Running client typecheck...'
 (
     cd "${repository_root}/client"
-    node --test scripts/generate-license-document.test.mjs
+    "${yarn_command[@]}" typecheck
 )
 
-echo '[pre-push] All local tests passed.'
+echo '[pre-push] Static checks passed.'
