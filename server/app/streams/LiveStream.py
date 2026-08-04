@@ -114,13 +114,17 @@ class LiveStream:
         display_channel_id: str,
         quality: QUALITY_TYPES,
         encoding_options: StreamEncodingOptions | None = None,
+        stream_anchor_enabled: bool = True,
     ) -> LiveStream:
 
         # まだ同じライブストリーム ID のインスタンスがないときだけ、インスタンスを生成する
         # (チャンネル ID)-(映像の品質)-(追加エンコードオプション) で一意な ID になる
         if encoding_options is None:
             encoding_options = StreamEncodingOptions()
-        live_stream_id = f'{display_channel_id}-{quality}{encoding_options.buildSuffix()}'
+        live_stream_id = (
+            f'{display_channel_id}-{quality}{encoding_options.buildSuffix()}'
+            f'{"-compat" if stream_anchor_enabled is False else ""}'
+        )
         if live_stream_id not in cls.__instances:
 
             # 新しいライブストリームのインスタンスを生成する
@@ -133,6 +137,7 @@ class LiveStream:
             instance.display_channel_id = display_channel_id
             instance.quality = quality
             instance.encoding_options = encoding_options
+            instance.stream_anchor_enabled = stream_anchor_enabled
 
             # ライブストリームクライアントが入るリスト
             ## クライアントの接続が切断された場合、このリストからも削除される
@@ -191,6 +196,7 @@ class LiveStream:
         display_channel_id: str,
         quality: QUALITY_TYPES,
         encoding_options: StreamEncodingOptions | None = None,
+        stream_anchor_enabled: bool = True,
     ) -> None:
         """
         ライブストリームのインスタンスを取得する
@@ -199,6 +205,7 @@ class LiveStream:
             display_channel_id (str): チャンネルID
             quality (QUALITY_TYPES): 映像の品質 (1080p-60fps ~ 240p)
             encoding_options (StreamEncodingOptions | None): ベース画質に追加するエンコードオプション
+            stream_anchor_enabled (bool): 最終 TS に Stream Anchor v1 を付与するか
         """
 
         # インスタンス変数の型ヒントを定義
@@ -207,6 +214,7 @@ class LiveStream:
         self.display_channel_id: str
         self.quality: QUALITY_TYPES
         self.encoding_options: StreamEncodingOptions
+        self.stream_anchor_enabled: bool
         self._clients: list[LiveStreamClient]
         self._status: Literal['Offline', 'Standby', 'ONAir', 'Idling', 'Restart']
         self._detail: str

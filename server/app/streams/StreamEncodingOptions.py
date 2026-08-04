@@ -86,13 +86,13 @@ class StreamEncodingOptions:
         if encoder is None:
             encoder = Config().general.encoder
 
-        # HEVC 10bit は HEVC 画質かつ QSVEncC / NVEncC の場合だけ有効化する
-        ## VCEEncC は HEVC 10bit 対応の機種かを判定できないため設定しない
+        # HEVC 10bit は HEVC 画質かつ FFmpeg 8 の QSV / NVENC の場合だけ有効化する
+        ## AMF は HEVC 10bit 対応の機種かを判定できないため設定しない
         resolved_video_codec: VideoCodec = video_codec or ('hevc' if QUALITY[quality].is_hevc else 'avc')
         is_hevc_10bit_enabled = (
             is_hevc_10bit_requested is True and
             resolved_video_codec == 'hevc' and
-            encoder in ['QSVEncC', 'NVEncC']
+            encoder in ['QSV', 'NVENC']
         )
 
         # 24fps モードは 60fps 画質以外で有効化する

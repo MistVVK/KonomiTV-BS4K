@@ -7,6 +7,7 @@ import asyncio
 import gc
 import os
 import re
+import secrets
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
@@ -29,8 +30,16 @@ from app.constants import (
     QUALITY_TYPES,
 )
 from app.models.Channel import Channel
+from app.streams.KonomiTVBS4KPlaybackEncoding import (
+    BuildKonomiTVBS4KLiveAspectPreservingScaleFilters,
+    KonomiTVBS4KPlaybackEncoder,
+    ResolveKonomiTVBS4KAdvancedLiveMuxrate,
+    ResolveKonomiTVBS4KLiveEncodePlan,
+)
 from app.streams.LivePSIDataArchiver import LivePSIDataArchiver
+from app.streams.RecordedPlaybackCapabilities import RecordedPlaybackBackend
 from app.streams.StreamEncodingOptions import GetEncoderForLiveChannel
+from app.streams.TSCodecBridgeRuntime import TSCodecBridgeRuntimeVerifier
 from app.utils import GetMirakurunAPIEndpointURL
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.edcb.PipeStreamReader import PipeStreamReader
@@ -41,6 +50,9 @@ if TYPE_CHECKING:
 
 
 class LiveEncodingTask:
+
+    # KonomiTV-BS4K TS Codec Bridge の LIBRARY_PATH キー
+    TS_CODEC_BRIDGE_LIBRARY_PATH_KEY: ClassVar[str] = 'KonomiTVBS4KTSCodecBridge'
 
     # H.264 再生時のエンコード後のストリームの GOP 長 (秒)
     GOP_LENGTH_SECONDS_H264: ClassVar[float] = 0.5
@@ -78,6 +90,169 @@ class LiveEncodingTask:
 
         # エンコードタスクのリトライ回数のカウント
         self._retry_count = 0
+
+
+    @staticmethod
+    def GenerateStreamAnchorGenerationID() -> int:
+        """ライブ実行ごとに重複しない非ゼロの Stream Anchor generation ID を生成する。"""
+
+        generation_id = 0
+        while generation_id == 0:
+            generation_id = secrets.randbits(64)
+        return generation_id
+
+
+    def IsStreamAnchorEnabled(self) -> bool:
+        """このライブストリームで最終 Stream Anchor を確定するか返す。"""
+
+        return getattr(self.live_stream, 'stream_anchor_enabled', False)
+
+
+    def BuildTSCodecBridgeOptions(self) -> list[str]:
+        """現在の標準 AVC/HEVC + AAC ライブ経路向け Bridge オプションを返す。"""
+
+        return [
+            '--video-codec', 'passthrough',
+            '--audio-codec', 'aac',
+            '--stream-anchor-v1',
+        ]
+
+
+    def buildFFmpeg8HardwareOptions(
+        self,
+        quality: QUALITY_TYPES,
+        encoder_type: Literal['QSV', 'NVENC', 'AMF'],
+        channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'],
+        is_fullhd_channel: bool,
+        is_oneseg: bool = False,
+    ) -> list[str]:
+        """現 main の単一 pipeline 向け FFmpeg 8 HW エンコードオプションを返す。"""
+
+        config = Config()
+        codec: Literal['avc', 'hevc'] = 'hevc' if QUALITY[quality].is_hevc is True else 'avc'
+        encoder_name = RecordedPlaybackBackend.getEncoderName(encoder_type, codec)
+        if encoder_name is None:
+            raise RuntimeError(f'Unsupported FFmpeg 8 live encoder: {encoder_type}/{codec}')
+
+        # 現 main では source coordinator を持たないため、デコードと表示アスペクト処理は
+        # system memory で行い、エンコード直前だけ選択 backend へ upload する。
+        options: list[str] = []
+        if encoder_type == 'QSV':
+            render_devices = RecordedPlaybackBackend.discoverRenderDevices('QSV')
+            if len(render_devices) == 0:
+                raise RuntimeError('No compatible render device was found for QSV.')
+            options += [
+                '-init_hw_device', f'qsv=live_qsv:{render_devices[0]}',
+                '-filter_hw_device', 'live_qsv',
+            ]
+        elif encoder_type == 'NVENC':
+            options += [
+                '-init_hw_device', 'cuda=live_cuda:0',
+                '-filter_hw_device', 'live_cuda',
+            ]
+
+        if is_oneseg is True:
+            analyzeduration = round(2_500_000 + (self._retry_count * 200_000))
+        elif channel_type == 'BS4K' and config.general.encoder_bs4k_input_analysis_enabled is True:
+            analyzeduration = round(
+                (config.general.encoder_bs4k_input_analyze * 1_000_000) +
+                (self._retry_count * 200_000)
+            )
+        elif channel_type == 'SKY':
+            analyzeduration = round(700_000 + (self._retry_count * 200_000))
+        else:
+            analyzeduration = round(500_000 + (self._retry_count * 200_000))
+
+        low_latency = channel_type != 'BS4K' or config.general.encoder_bs4k_low_latency is True
+        if low_latency is True:
+            options += ['-fflags', 'nobuffer', '-flags', 'low_delay']
+        options += [
+            '-f', 'mpegts',
+            '-analyzeduration', str(analyzeduration),
+            '-i', 'pipe:0',
+            '-ignore_unknown',
+            '-map', '0:v:0',
+            '-map', '0:a?',
+            '-map', '0:d?',
+        ]
+
+        encode_plan = ResolveKonomiTVBS4KLiveEncodePlan(
+            QUALITY[quality].width,
+            QUALITY[quality].height,
+            video_codec = codec,
+            is_fullhd_channel = is_fullhd_channel,
+        )
+        filters: list[str] = []
+        if is_oneseg is False and channel_type != 'BS4K':
+            if self.live_stream.encoding_options.is_24fps_mode_enabled is True:
+                filters += ['pullup', 'dejudder']
+            elif QUALITY[quality].is_60fps is True:
+                filters.append('yadif=mode=1:parity=-1:deint=1')
+            else:
+                filters.append('yadif=mode=0:parity=-1:deint=1')
+        filters += BuildKonomiTVBS4KLiveAspectPreservingScaleFilters(encode_plan)
+        filters.append('format=p010le' if self.live_stream.encoding_options.is_hevc_10bit_enabled is True else 'format=nv12')
+        if encoder_type == 'QSV':
+            filters.append('hwupload=extra_hw_frames=64')
+        elif encoder_type == 'NVENC':
+            filters.append('hwupload_cuda')
+        options += ['-vf', ','.join(filters)]
+
+        options += [
+            '-c:v', encoder_name,
+            '-b:v', QUALITY[quality].video_bitrate,
+            '-maxrate', QUALITY[quality].video_bitrate_max,
+            '-aspect', '16:9',
+        ]
+        if encoder_type == 'QSV':
+            options += ['-preset', 'medium', '-async_depth', '1', '-look_ahead', '0', '-bf', '0']
+        elif encoder_type == 'NVENC':
+            options += [
+                '-preset', 'p4', '-tune', 'll', '-rc', 'vbr', '-rc-lookahead', '0',
+                '-spatial-aq', '1', '-temporal-aq', '1', '-zerolatency', '1', '-bf', '0',
+            ]
+        else:
+            options += ['-quality', 'balanced', '-rc', 'vbr_latency', '-usage', 'lowlatency', '-bf', '0']
+
+        if codec == 'hevc':
+            options += [
+                '-profile:v',
+                'main10' if self.live_stream.encoding_options.is_hevc_10bit_enabled is True else 'main',
+            ]
+        else:
+            options += ['-profile:v', 'high']
+
+        if is_oneseg is True:
+            options += ['-fps_mode', 'vfr', '-g', '30' if codec == 'hevc' else '8']
+        elif channel_type == 'BS4K':
+            frame_rate = 30 if '-30fps' in quality else 60
+            options += [
+                '-r', '30000/1001' if frame_rate == 30 else '60000/1001',
+                '-g', str(frame_rate),
+            ]
+        elif self.live_stream.encoding_options.is_24fps_mode_enabled is True:
+            options += ['-fps_mode', 'vfr', '-g', '30']
+        elif QUALITY[quality].is_60fps is True:
+            options += ['-r', '60000/1001', '-g', '30']
+        else:
+            options += ['-r', '30000/1001', '-g', '15']
+
+        audio_bitrate = '96K' if is_oneseg is True else QUALITY[quality].audio_bitrate
+        options += [
+            '-c:a', 'aac', '-aac_coder', 'twoloop', '-ac', '2', '-b:a', audio_bitrate, '-ar', '48000',
+            '-c:d', 'copy',
+            '-max_delay', '250000',
+            '-max_interleave_delta', f'{round(500 + (self._retry_count * 100))}K',
+        ]
+        if self.IsStreamAnchorEnabled() is True:
+            options += [
+                '-muxrate', ResolveKonomiTVBS4KAdvancedLiveMuxrate(QUALITY[quality].video_bitrate_max),
+                '-pcr_period', '20',
+            ]
+        if low_latency is True:
+            options += ['-flush_packets', '1']
+        options += ['-y', '-f', 'mpegts', 'pipe:1']
+        return options
 
 
     def isFullHDChannel(self, network_id: int, service_id: int) -> bool:
@@ -243,6 +418,14 @@ class LiveEncodingTask:
         else:
             # 通常放送は実在する音声トラックをすべてそのまま保持する
             options.append('-map 0:v:0 -map 0:a? -map 0:d? -acodec copy')
+
+        # Bridge は PCR gap を fail closed で検証するため、Anchor 経路の TS は
+        # codec にかかわらず固定 muxrate と 20ms PCR 周期で出力する。
+        if self.IsStreamAnchorEnabled() is True:
+            options.append(
+                f'-muxrate {ResolveKonomiTVBS4KAdvancedLiveMuxrate(QUALITY[quality].video_bitrate_max)} '
+                '-pcr_period 20'
+            )
 
         # 出力
         options.append('-y -f mpegts')  # MPEG-TS 出力ということを明示
@@ -514,6 +697,11 @@ class LiveEncodingTask:
             video_width = 1920
         options.append(f'--output-res {video_width}x{video_height}')
 
+        # HWEncC 内部の FFmpeg MPEG-TS muxer にも、Anchor 経路と同じ搬送契約を渡す。
+        if self.IsStreamAnchorEnabled() is True:
+            muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(QUALITY[quality].video_bitrate_max)
+            options.append(f'-m muxrate:{muxrate} -m pcr_period:20')
+
         # 出力
         options.append('--output-format mpegts')  # MPEG-TS 出力ということを明示
         options.append('--output -')  # 標準出力へ出力
@@ -654,6 +842,26 @@ class LiveEncodingTask:
         # エンコーダーの種類を取得
         ENCODER_TYPE = GetEncoderForLiveChannel(self.live_stream.display_channel_id)
 
+        # Stream Anchor は映像 access unit と対応付けるため、通常 API の映像付きライブだけで有効にする。
+        # Compatibility API とラジオは従来 TS 経路を維持する。
+        stream_anchor_enabled = (
+            self.IsStreamAnchorEnabled() is True and
+            channel.is_radiochannel is False
+        )
+        bridge_path: str | None = None
+        if stream_anchor_enabled is True:
+            bridge_path = LIBRARY_PATH[self.TS_CODEC_BRIDGE_LIBRARY_PATH_KEY]
+            if TSCodecBridgeRuntimeVerifier.isAvailable(bridge_path) is False:
+                self.live_stream.setStatus(
+                    'Offline',
+                    'TS Codec Bridge を利用できないためライブ配信を開始できません。(E-17)',
+                )
+                self.live_stream.disconnectAll()
+                return
+            stream_anchor_generation_id = self.GenerateStreamAnchorGenerationID()
+        else:
+            stream_anchor_generation_id = None
+
         # 現在の番組情報を取得する
         program_present = (await channel.getCurrentAndNextProgram())[0]
         if program_present is not None:
@@ -696,6 +904,11 @@ class LiveEncodingTask:
             ## +4 を残すと FFmpeg 6.1 以降では字幕が表示されなくなるため、常に +8 のみを付与する
             '-d', '9',
         ]
+
+        # Encoder 前の source marker は実行ごとの generation ID で識別し、
+        # Encoder 後に TS Codec Bridge が実際の映像 AU 時刻へ確定する。
+        if stream_anchor_generation_id is not None:
+            tsreadex_options += ['-g', str(stream_anchor_generation_id)]
 
         if CONFIG.tv.debug_mode_ts_path is None:
             # 通常は標準入力を指定
@@ -748,7 +961,46 @@ class LiveEncodingTask:
         if channel.is_radiochannel is True:
             ENCODER_TYPE = 'FFmpeg'
 
-        # FFmpeg
+        # Anchor 有効時だけ Encoder 出力と Bridge 入力を OS pipe で直結する。
+        # Python で TS を往復させず、最終的な Bridge stdout だけを配信側が読む。
+        bridge: asyncio.subprocess.Process | None = None
+        bridge_write_pipe: int | None = None
+        encoder_stdout: int = asyncio.subprocess.PIPE
+        if stream_anchor_enabled is True:
+            assert bridge_path is not None
+            bridge_read_pipe, bridge_write_pipe = os.pipe()
+            bridge_options = self.BuildTSCodecBridgeOptions()
+            logging.info(
+                f'{self.live_stream.log_prefix} TS Codec Bridge Commands:\n'
+                f'{bridge_path} {" ".join(bridge_options)}'
+            )
+            try:
+                bridge = await asyncio.subprocess.create_subprocess_exec(
+                    bridge_path,
+                    *bridge_options,
+                    stdin = bridge_read_pipe,
+                    stdout = asyncio.subprocess.PIPE,
+                    stderr = asyncio.subprocess.PIPE,
+                )
+                TSCodecBridgeRuntimeVerifier.recordProcessStart('live')
+                encoder_stdout = bridge_write_pipe
+            except BaseException:
+                os.close(bridge_write_pipe)
+                bridge_write_pipe = None
+                try:
+                    tsreadex.kill()
+                except Exception:
+                    pass
+                raise
+            finally:
+                os.close(bridge_read_pipe)
+
+        # 現 main の公開設定 FFmpeg / QSV / NVENC / AMF は、すべて同梱 FFmpeg 8 で実行する。
+        ffmpeg8_encoder_type = cast(KonomiTVBS4KPlaybackEncoder, ENCODER_TYPE)
+        encoder_executable = RecordedPlaybackBackend.getExecutable(ffmpeg8_encoder_type)
+        encoder_environment = RecordedPlaybackBackend.getEnvironment(ffmpeg8_encoder_type)
+
+        # FFmpeg software backend
         if ENCODER_TYPE == 'FFmpeg':
 
             # オプションを取得
@@ -759,15 +1011,20 @@ class LiveEncodingTask:
                 encoder_options = self.buildFFmpegOptions(
                     self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg,
                 )
-            logging.info(f'{self.live_stream.log_prefix} FFmpeg Commands:\nffmpeg {" ".join(encoder_options)}')
+            logging.info(
+                f'{self.live_stream.log_prefix} FFmpeg 8 Commands:\n'
+                f'{encoder_executable} {" ".join(encoder_options)}'
+            )
 
             # エンコーダープロセスを非同期で作成・実行
             try:
                 encoder = await asyncio.subprocess.create_subprocess_exec(
-                    *[LIBRARY_PATH['FFmpeg'], *encoder_options],
+                    encoder_executable,
+                    *encoder_options,
                     stdin = tsreadex_read_pipe,  # tsreadex からの入力
-                    stdout = asyncio.subprocess.PIPE,  # ストリーム出力
+                    stdout = encoder_stdout,  # Bridge またはストリーム出力へ接続
                     stderr = asyncio.subprocess.PIPE,  # ログ出力
+                    env = encoder_environment,
                 )
             except BaseException:
                 # tsreadex の起動後にエンコーダーの起動に失敗した場合、
@@ -776,28 +1033,40 @@ class LiveEncodingTask:
                     tsreadex.kill()
                 except Exception:
                     pass
+                try:
+                    if bridge is not None:
+                        bridge.kill()
+                except Exception:
+                    pass
                 raise
             finally:
                 # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
                 os.close(tsreadex_read_pipe)
+                if bridge_write_pipe is not None:
+                    os.close(bridge_write_pipe)
 
-        # HWEncC
+        # FFmpeg 8 hardware backend
         else:
 
             # オプションを取得
-            hw_encoder_type = cast(Literal['QSVEncC', 'NVEncC', 'VCEEncC'], ENCODER_TYPE)
-            encoder_options = self.buildHWEncCOptions(
+            hw_encoder_type = cast(Literal['QSV', 'NVENC', 'AMF'], ENCODER_TYPE)
+            encoder_options = self.buildFFmpeg8HardwareOptions(
                 self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel, channel.is_oneseg,
             )
-            logging.info(f'{self.live_stream.log_prefix} {ENCODER_TYPE} Commands:\n{ENCODER_TYPE} {" ".join(encoder_options)}')
+            logging.info(
+                f'{self.live_stream.log_prefix} FFmpeg 8 ({ENCODER_TYPE}) Commands:\n'
+                f'{encoder_executable} {" ".join(encoder_options)}'
+            )
 
             # エンコーダープロセスを非同期で作成・実行
             try:
                 encoder = await asyncio.subprocess.create_subprocess_exec(
-                    *[LIBRARY_PATH[ENCODER_TYPE], *encoder_options],
+                    encoder_executable,
+                    *encoder_options,
                     stdin = tsreadex_read_pipe,  # tsreadex からの入力
-                    stdout = asyncio.subprocess.PIPE,  # ストリーム出力
+                    stdout = encoder_stdout,  # Bridge またはストリーム出力へ接続
                     stderr = asyncio.subprocess.PIPE,  # ログ出力
+                    env = encoder_environment,
                 )
             except BaseException:
                 # tsreadex の起動後にエンコーダーの起動に失敗した場合、
@@ -806,10 +1075,20 @@ class LiveEncodingTask:
                     tsreadex.kill()
                 except Exception:
                     pass
+                try:
+                    if bridge is not None:
+                        bridge.kill()
+                except Exception:
+                    pass
                 raise
             finally:
                 # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
                 os.close(tsreadex_read_pipe)
+                if bridge_write_pipe is not None:
+                    os.close(bridge_write_pipe)
+
+        pipeline_stdout = bridge.stdout if bridge is not None else encoder.stdout
+        assert pipeline_stdout is not None
 
         # ***** チューナーの起動と接続 *****
 
@@ -885,6 +1164,11 @@ class LiveEncodingTask:
                         encoder.kill()
                     except Exception:
                         pass
+                    try:
+                        if bridge is not None:
+                            bridge.kill()
+                    except Exception:
+                        pass
 
                     # エンコードタスクを停止する
                     await session.close()
@@ -938,6 +1222,11 @@ class LiveEncodingTask:
                         encoder.kill()
                     except Exception:
                         pass
+                    try:
+                        if bridge is not None:
+                            bridge.kill()
+                    except Exception:
+                        pass
 
                     # エンコードタスクを停止する
                     return
@@ -974,6 +1263,11 @@ class LiveEncodingTask:
                         pass
                     try:
                         encoder.kill()
+                    except Exception:
+                        pass
+                    try:
+                        if bridge is not None:
+                            bridge.kill()
                     except Exception:
                         pass
 
@@ -1117,10 +1411,10 @@ class LiveEncodingTask:
                 while True:
                     try:
 
-                        # エンコーダーからの出力を読み取る
+                        # 最終 pipeline (Bridge 有効時は Bridge、無効時は Encoder) から出力を読み取る
                         ## TS パケットのサイズが 188 bytes なので、1回の readexactly() で 188 bytes ずつ読み取る
                         ## read() ではなく厳密な readexactly() を使わないとぴったり 188 bytes にならない場合がある
-                        chunk = await cast(asyncio.StreamReader, encoder.stdout).readexactly(ts.PACKET_SIZE)
+                        chunk = await pipeline_stdout.readexactly(ts.PACKET_SIZE)
 
                         # 同時に chunk_buffer / chunk_written_at にアクセスするタスクが1つだけであることを保証する (排他ロック)
                         async with writer_lock:
@@ -1276,93 +1570,38 @@ class LiveEncodingTask:
                     # ライブストリームのステータスを取得
                     live_stream_status = self.live_stream.getStatus()
 
-                    # エンコードの進捗を判定し、ステータスを更新する
-                    # 誤作動防止のため、ステータスが Standby の間のみ更新できるようにする
+                    # 全 backend が FFmpeg 8 なので、同じ進捗形式で状態を更新する。
                     if live_stream_status.status == 'Standby':
-                        # FFmpeg
-                        if ENCODER_TYPE == 'FFmpeg':
-                            if 'arib parser was created' in line or 'Invalid frame dimensions 0x0.' in line:
-                                self.live_stream.setStatus('Standby', 'エンコードを開始しています…')
-                            elif 'frame=    1 fps=0.0 q=0.0' in line or 'size=       0kB time=00:00' in line:
-                                self.live_stream.setStatus('Standby', 'バッファリングしています…')
-                            elif 'frame=' in line or 'bitrate=' in line:
-                                self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
-                                # エラーから回復した場合は、エンコードタスクの再起動回数のカウントをリセットする
-                                if self._retry_count > 0:
-                                    self._retry_count = 0
-                        ## HWEncC
-                        else:
-                            if 'opened file "pipe:0"' in line:
-                                self.live_stream.setStatus('Standby', 'エンコードを開始しています…')
-                            elif 'starting output thread...' in line:
-                                self.live_stream.setStatus('Standby', 'バッファリングしています…')
-                            elif 'Encode Thread:' in line:
-                                self.live_stream.setStatus('Standby', 'バッファリングしています…')
-                            elif ' frames: ' in line:
-                                self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
-                                # エラーから回復した場合は、エンコードタスクの再起動回数のカウントをリセットする
-                                if self._retry_count > 0:
-                                    self._retry_count = 0
+                        if 'arib parser was created' in line or 'Invalid frame dimensions 0x0.' in line:
+                            self.live_stream.setStatus('Standby', 'エンコードを開始しています…')
+                        elif 'frame=    1 fps=0.0 q=0.0' in line or 'size=       0kB time=00:00' in line:
+                            self.live_stream.setStatus('Standby', 'バッファリングしています…')
+                        elif 'frame=' in line or 'bitrate=' in line:
+                            self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
+                            if self._retry_count > 0:
+                                self._retry_count = 0
 
-                    # 特定のエラーログが出力されている場合は回復が見込めないため、エンコーダーを終了する
-                    ## エンコーダーを再起動することで回復が期待できる場合は、ステータスを Restart に設定しエンコードタスクを再起動する
-                    ## FFmpeg
-                    if ENCODER_TYPE == 'FFmpeg':
-                        if 'Stream map \'0:v:0\' matches no streams.' in line:
-                            # 何らかの要因で tsreadex から放送波が受信できなかったことによるエラーのため、エンコーダーの再起動は行わない
-                            ## 番組名に「放送休止」などが入っていれば停波によるものとみなし、そうでないなら放送波の受信に失敗したものとする
-                            if program_present is None or program_present.isOffTheAirProgram():
-                                self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-04F)')
-                            else:
-                                self.live_stream.setStatus('Offline', 'チューナーからの放送波の受信に失敗したため、エンコードを開始できません。(E-04F)')
-                        elif 'Conversion failed!' in line:
-                            # 捕捉されないエラー
-                            ## エンコーダーの再起動で復帰できる可能性があるので、エンコードタスクを再起動する
-                            result = self.live_stream.setStatus('Restart', 'エンコード中に予期しないエラーが発生しました。エンコードタスクを再起動しています… (ER-01F)')
-                            # 直近 50 件のログを表示
-                            if result is True:
-                                for log in lines[-51:-1]:
-                                    logging.warning(log)
-                    ## HWEncC
-                    else:
-                        if 'error finding stream information.' in line:
-                            # 何らかの要因で tsreadex から放送波が受信できなかったことによるエラーのため、エンコーダーの再起動は行わない
-                            ## 番組名に「放送休止」などが入っていれば停波によるものとみなし、そうでないなら放送波の受信に失敗したものとする
-                            if program_present is None or program_present.isOffTheAirProgram():
-                                self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-05H)')
-                            else:
-                                self.live_stream.setStatus('Offline', 'チューナーからの放送波の受信に失敗したため、エンコードを開始できません。(E-05H)')
-                        elif ENCODER_TYPE == 'NVEncC' and 'due to the NVIDIA\'s driver limitation.' in line:
-                            # NVEncC で、同時にエンコードできるセッション数 (Geforceだと5つ) を全て使い果たしている時のエラー
-                            self.live_stream.setStatus('Offline', 'NVENC のエンコードセッションが不足しているため、エンコードを開始できません。(E-06HN)')
-                        elif ENCODER_TYPE == 'QSVEncC' and ('unable to decode by qsv.' in line or 'No device found for QSV encoding!' in line):
-                            # QSVEncC 非対応の環境
-                            self.live_stream.setStatus('Offline', 'お使いの PC 環境は QSVEncC エンコーダーに対応していません。(E-07HQ)')
-                        elif ENCODER_TYPE == 'QSVEncC' and 'iHD_drv_video.so init failed' in line:
-                            # QSVEncC 非対応の環境 (Linux かつ第5世代以前の Intel CPU)
-                            self.live_stream.setStatus('Offline', 'お使いの PC 環境は Linux 版 QSVEncC エンコーダーに対応していません。第5世代以前の古い CPU をお使いの可能性があります。(E-08HQ)')
-                        elif ENCODER_TYPE == 'NVEncC' and 'CUDA not available.' in line:
-                            # NVEncC 非対応の環境
-                            self.live_stream.setStatus('Offline', 'お使いの PC 環境は NVEncC エンコーダーに対応していません。(E-09HN)')
-                        elif ENCODER_TYPE == 'VCEEncC' and \
-                            ('Failed to initalize VCE factory:' in line or 'Assertion failed:Init() failed to vkCreateInstance' in line):
-                            # VCEEncC 非対応の環境
-                            self.live_stream.setStatus('Offline', 'お使いの PC 環境は VCEEncC エンコーダーに対応していません。(E-10HV)')
-                        elif 'Consider increasing the value for the --input-analyze and/or --input-probesize!' in line:
-                            # --input-probesize or --input-analyze の期間内に入力ストリームの解析が終わらなかった
-                            ## エンコーダーの再起動で復帰できる可能性があるので、エンコードタスクを再起動する
-                            self.live_stream.setStatus('Restart', '入力ストリームの解析に失敗しました。エンコードタスクを再起動しています… (ER-02H)')
-                        elif 'finished with error!' in line:
-                            # 捕捉されないエラー
-                            ## Controller 非同期タスク側で完全にエンコーダープロセスが落ちたタイミングで HEVC 非対応かなどを判断しているため、
-                            ## ここで 0.5 秒待機してから実行する
-                            await asyncio.sleep(0.5)
-                            ## エンコーダーの再起動で復帰できる可能性があるので、エンコードタスクを再起動する
-                            result = self.live_stream.setStatus('Restart', 'エンコード中に予期しないエラーが発生しました。エンコードタスクを再起動しています… (ER-03H)')
-                            # 直近 150 件のログを表示
-                            if result is True:
-                                for log in lines[-151:-1]:
-                                    logging.warning(log)
+                    # 全 backend の FFmpeg 8 ログを同じ経路で診断する。
+                    if 'Stream map \'0:v:0\' matches no streams.' in line:
+                        if program_present is None or program_present.isOffTheAirProgram():
+                            self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-04F)')
+                        else:
+                            self.live_stream.setStatus('Offline', 'チューナーからの放送波の受信に失敗したため、エンコードを開始できません。(E-04F)')
+                    elif ENCODER_TYPE == 'NVENC' and (
+                        'No capable devices found' in line or 'Cannot load libcuda' in line
+                    ):
+                        self.live_stream.setStatus('Offline', 'お使いの PC 環境は NVENC エンコーダーに対応していません。(E-09HN)')
+                    elif ENCODER_TYPE == 'QSV' and (
+                        'Error initializing an MFX session' in line or 'No device available' in line
+                    ):
+                        self.live_stream.setStatus('Offline', 'お使いの PC 環境は QSV エンコーダーに対応していません。(E-07HQ)')
+                    elif ENCODER_TYPE == 'AMF' and 'AMF failed to initialise' in line:
+                        self.live_stream.setStatus('Offline', 'お使いの PC 環境は AMF エンコーダーに対応していません。(E-10HV)')
+                    elif 'Conversion failed!' in line:
+                        result = self.live_stream.setStatus('Restart', 'エンコード中に予期しないエラーが発生しました。エンコードタスクを再起動しています… (ER-01F)')
+                        if result is True:
+                            for log in lines[-51:-1]:
+                                logging.warning(log)
 
                     # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
                     if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
@@ -1374,6 +1613,27 @@ class LiveEncodingTask:
 
             # タスクを非同期で実行
             background_tasks.add(asyncio.create_task(EncoderObServer()))
+
+            # Bridge の stderr を読み続け、pipe 満杯による停止を防ぎつつ失敗理由を保持する。
+            bridge_lines: list[str] = []
+
+            async def BridgeObserver() -> None:
+                if bridge is None or bridge.stderr is None:
+                    return
+                while True:
+                    line_bytes = await bridge.stderr.readline()
+                    if line_bytes == b'':
+                        break
+                    line = line_bytes.decode('utf-8', errors='replace').strip()
+                    if line == '':
+                        continue
+                    bridge_lines.append(line)
+                    if len(bridge_lines) > 100:
+                        del bridge_lines[:-100]
+                    logging.warning(f'{self.live_stream.log_prefix} [TSCodecBridge] {line}')
+
+            if bridge is not None:
+                background_tasks.add(asyncio.create_task(BridgeObserver()))
 
             # ***** エンコードタスク全体の制御 *****
 
@@ -1453,7 +1713,7 @@ class LiveEncodingTask:
                     # ENCODER_TS_READ_TIMEOUT_ONAIR 秒以上が経過している場合も、エンコーダーがフリーズしたものとみなす
                     ## 何らかの理由でエンコードが途中で停止した場合、live_stream.write() が実行されなくなることを利用している
                     encoder_ts_read_timeout_onair = \
-                        self.ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC if ENCODER_TYPE == 'VCEEncC' else self.ENCODER_TS_READ_TIMEOUT_ONAIR
+                        self.ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC if ENCODER_TYPE == 'AMF' else self.ENCODER_TS_READ_TIMEOUT_ONAIR
                     stream_data_last_write_time = time.time() - self.live_stream.getStreamDataWrittenAt()
                     if ((live_stream_status.status == 'Standby' and stream_data_last_write_time > self.ENCODER_TS_READ_TIMEOUT_STANDBY) or
                         (live_stream_status.status == 'ONAir' and stream_data_last_write_time > encoder_ts_read_timeout_onair)):
@@ -1499,12 +1759,12 @@ class LiveEncodingTask:
                         # 基本的にこれらのエラーでリトライが発生することはないので、初回のみチェックする (偽陽性を減らす意味合いもある)
                         if self._retry_count == 0:
                             for line in lines:
-                                # QSVEncC: H.265/HEVC でのエンコードに非対応の環境
-                                if ENCODER_TYPE == 'QSVEncC' and 'HEVC encoding is not supported on current platform.' in line:
+                                # QSV: H.265/HEVC でのエンコードに非対応の環境
+                                if ENCODER_TYPE == 'QSV' and 'HEVC encoding is not supported on current platform.' in line:
                                     self.live_stream.setStatus('Offline', 'お使いの Intel GPU は H.265/HEVC でのエンコードに対応していません。(E-14HQ)')
                                     break
-                                # NVEncC: H.265/HEVC でのエンコードに非対応の環境
-                                elif ENCODER_TYPE == 'NVEncC' and 'does not support H.265/HEVC encoding.' in line:
+                                # NVENC: H.265/HEVC でのエンコードに非対応の環境
+                                elif ENCODER_TYPE == 'NVENC' and 'does not support H.265/HEVC encoding.' in line:
                                     # 他の行に available for encode. という文字列が含まれている場合は除外
                                     available_for_encode = False
                                     for line2 in lines:
@@ -1514,8 +1774,8 @@ class LiveEncodingTask:
                                     if not available_for_encode:
                                         self.live_stream.setStatus('Offline', 'お使いの NVIDIA GPU は H.265/HEVC でのエンコードに対応していません。(E-15HN)')
                                         break
-                                # VCEEncC: H.265/HEVC でのエンコードに非対応の環境
-                                elif ENCODER_TYPE == 'VCEEncC' and 'HW Acceleration of H.265/HEVC is not supported on this platform.' in line:
+                                # AMF: H.265/HEVC でのエンコードに非対応の環境
+                                elif ENCODER_TYPE == 'AMF' and 'HW Acceleration of H.265/HEVC is not supported on this platform.' in line:
                                     self.live_stream.setStatus('Offline', 'お使いの AMD GPU は H.265/HEVC でのエンコードに対応していません。(E-16HV)')
                                     break
 
@@ -1537,6 +1797,17 @@ class LiveEncodingTask:
                         # エンコーダーが既に終了しているため、後続の異常検出処理を実行する意味がない
                         # この時点でステータスは Offline か Restart のいずれかに設定されているはずなので、
                         # 直接ループを抜けてエンコードタスクの終了処理に移る
+                        break
+
+                    # Bridge が意図せず終了した場合、未確定または欠落した Anchor を配信せず再起動する。
+                    if bridge is not None and bridge.returncode is not None:
+                        result = self.live_stream.setStatus(
+                            'Restart',
+                            'TS Codec Bridge が強制終了されました。エンコードタスクを再起動しています… (ER-07B)',
+                        )
+                        if result is True:
+                            for line in bridge_lines:
+                                logging.warning(line)
                         break
 
                     # この時点で最新のライブストリームのステータスが Offline か Restart に変更されていたら、エンコードタスクの終了処理に移る
@@ -1570,6 +1841,11 @@ class LiveEncodingTask:
             pass
         try:
             encoder.kill()
+        except Exception:
+            pass
+        try:
+            if bridge is not None:
+                bridge.kill()
         except Exception:
             pass
 

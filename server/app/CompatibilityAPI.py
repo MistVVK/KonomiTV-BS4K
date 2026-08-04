@@ -183,13 +183,7 @@ async def ValidateCompatibilityLiveStreamQuality(
     # 互換ルートの依存関係には高度 codec query を宣言しない。
     # FastAPI が未知 query を無視しても、通常 API の validator へは固定値だけを渡すため、
     # VP9 / AV1 / Opus や Bridge 起動条件へ到達できない。
-    return await LiveStreamsRouter.ValidateQuality(
-        quality,
-        display_channel_id,
-        None,
-        None,
-        'aac',
-    )
+    return await LiveStreamsRouter.ValidateQuality(quality, display_channel_id)
 
 
 async def ValidateCompatibilityRecordedStreamQuality(

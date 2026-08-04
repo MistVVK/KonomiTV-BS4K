@@ -133,6 +133,7 @@ async def LiveStreamAPI(
     }
 )
 async def LiveStreamEventAPI(
+    request: Request,
     display_channel_id: Annotated[str, Depends(ValidateChannelID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
 ):
@@ -152,7 +153,12 @@ async def LiveStreamEventAPI(
 
     # 品質とオプション指定に対応する LiveStream を取得する
     # ステータスを取得したいだけなので、接続はしない
-    live_stream = LiveStream(display_channel_id, stream_quality.quality, stream_quality.encoding_options)
+    live_stream = LiveStream(
+        display_channel_id,
+        stream_quality.quality,
+        stream_quality.encoding_options,
+        getattr(request.state, 'stream_anchor_enabled', True),
+    )
 
     # ステータスの変更を監視し、変更があればステータスをイベントストリームとして出力する
     async def generator():
@@ -239,7 +245,12 @@ async def LivePSIArchivedDataAPI(
 
     # 品質とオプション指定に対応する LiveStream を取得する
     # PSI/SI アーカイブデータを取得したいだけなので、接続はしない
-    live_stream = LiveStream(display_channel_id, stream_quality.quality, stream_quality.encoding_options)
+    live_stream = LiveStream(
+        display_channel_id,
+        stream_quality.quality,
+        stream_quality.encoding_options,
+        getattr(request.state, 'stream_anchor_enabled', True),
+    )
 
     # LivePSIDataArchiver がまだ初期化されていない場合は、起動するまで最大10秒待つ
     ## LivePSIDataArchiver は LiveEncodingTask が起動次第自動的に初期化されるので、ここでは待つだけ
@@ -309,7 +320,12 @@ async def LiveMPEGTSStreamAPI(
 
     # 品質とオプション指定に対応する LiveStream に接続し、ライブストリームクライアントを取得する
     ## 接続時に Offline だった場合は自動的にエンコードタスクが起動される
-    live_stream = LiveStream(display_channel_id, stream_quality.quality, stream_quality.encoding_options)
+    live_stream = LiveStream(
+        display_channel_id,
+        stream_quality.quality,
+        stream_quality.encoding_options,
+        getattr(request.state, 'stream_anchor_enabled', True),
+    )
     live_stream_client = await live_stream.connect('mpegts')
 
     # ライブストリームを出力するジェネレーター
