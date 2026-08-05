@@ -24,8 +24,34 @@ import Videos from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
-import useSettingsStore, { BS4KLiveStreamingQuality, BS4K_LIVE_STREAMING_QUALITIES, LiveStreamingQuality, LIVE_STREAMING_QUALITIES, RecordedStreamingAudioCodec, RecordedStreamingVideoCodec, VideoStreamingQuality, VIDEO_STREAMING_QUALITIES } from '@/stores/SettingsStore';
+import useSettingsStore, {
+    BS4KLiveStreamingQuality,
+    BS4K_LIVE_STREAMING_QUALITIES,
+    getKonomiTVBS4KPlayback24FPSModeSettingKey,
+    getKonomiTVBS4KPlaybackAudioCodecSettingKey,
+    getKonomiTVBS4KPlaybackStreamingQualitySettingKey,
+    getKonomiTVBS4KPlaybackVideoCodecSettingKey,
+    KonomiTVBS4KPlaybackAudioCodec,
+    KonomiTVBS4KPlaybackVideoCodec,
+    LiveStreamingQuality,
+    LIVE_STREAMING_QUALITIES,
+    VideoStreamingQuality,
+    VIDEO_STREAMING_QUALITIES,
+} from '@/stores/SettingsStore';
 import Utils, { dayjs, PlayerUtils } from '@/utils';
+
+
+/**
+ * 録画 HLS のセッション ID として使う8桁の16進文字列を生成する。
+ * crypto.randomUUID() は非 HTTPS オリジンで公開されないため、非セキュアコンテキストでも
+ * 利用可能な getRandomValues() だけを使う。
+ */
+export function generateRecordedPlaybackSessionID(
+    random_source: Pick<Crypto, 'getRandomValues'> = crypto,
+): string {
+    const random_bytes = random_source.getRandomValues(new Uint8Array(4));
+    return Array.from(random_bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
 
 
 /**
@@ -107,18 +133,6 @@ class PlayerController {
     // シークやHLS再読み込みでhls.jsがTrack 1へ初期化しても、選択中の録画音声を復元するための安定キー
     private recorded_selected_audio_track_name: string | null = null;
 
-    // 現在の録画HLSセッションに要求した実効音声コーデック
-    // SourceBuffer の codec pipeline エラーを、同一 tuple の短時間再起動として識別するために保持する
-    private recorded_audio_codec_for_current_playback: RecordedStreamingAudioCodec = 'aac';
-
-    // 現在の再生で利用する実効映像コーデックと bit depth
-    // PlayerController.init() をまたいで同じ codec tuple の再起動が繰り返されたか判定するために保持する
-    private konomitv_bs4k_video_codec_for_current_playback: RecordedStreamingVideoCodec = 'avc';
-    private konomitv_bs4k_video_bit_depth_for_current_playback: 8 | 10 = 8;
-
-    // 同一再生対象・同一 codec tuple の短時間再起動ループを、init() をまたいで検出する
-    private readonly konomitv_bs4k_playback_restart_guard = new KonomiTVBS4KPlaybackRestartGuard();
-
     // fMP4 録画のARIB字幕先読みハンドラーを解除する関数
     private recorded_arib_subtitle_cancel: (() => void) | null = null;
 
@@ -172,6 +186,16 @@ class PlayerController {
     // 破棄済みかどうか
     private destroyed = false;
 
+    // 視聴画面の寿命。route離脱後の能力API応答が共有StoreやDOMを書き戻さないように使う。
+    private readonly owner_signal: AbortSignal | null;
+
+    // init()/destroy()ごとに更新する世代。同じcontrollerの再起動中でも古いpreflightを無効化する。
+    private initialization_generation = 0;
+
+    // 同一再生対象・同一 codec tuple の短時間再起動ループを、init() をまたいで検出する。
+    // codec を自動変更せず、最初の同一 codec 再起動でも復旧できなかった場合はユーザーの明示変更へ委ねる。
+    private readonly konomitv_bs4k_playback_restart_guard = new KonomiTVBS4KPlaybackRestartGuard();
+
     // ライブ再生開始時の一時ミュートを、保存済みミュートと区別するフラグ
     // 一時ミュートで発火した volumechange を、ユーザー操作として保存しないために使う
     private is_live_startup_temporary_muted = false;
@@ -184,10 +208,11 @@ class PlayerController {
      * コンストラクタ
      * 実際の DPlayer の初期化処理は await init() で行われる
      */
-    constructor(playback_mode: 'Live' | 'Video', _owner_signal: AbortSignal | null = null) {
+    constructor(playback_mode: 'Live' | 'Video', owner_signal: AbortSignal | null = null) {
 
         // 再生モードをセット
         this.playback_mode = playback_mode;
+        this.owner_signal = owner_signal;
 
         const player_store = usePlayerStore();
         if (player_store.selected_quality_profile_type !== null) {
@@ -232,56 +257,44 @@ class PlayerController {
      * 現在の画質プロファイルタイプに応じた画質プロファイル
      */
     private get quality_profile(): {
-        tv_streaming_quality: LiveStreamingQuality;
-        bs4k_streaming_quality: BS4KLiveStreamingQuality;
-        bs4k_video_streaming_quality: BS4KLiveStreamingQuality;
-        tv_encoding_codec: 'avc' | 'hevc';
-        bs4k_tv_encoding_codec: 'avc' | 'hevc';
+        playback_streaming_quality: LiveStreamingQuality;
+        bs4k_playback_streaming_quality: BS4KLiveStreamingQuality;
+        playback_video_codec: KonomiTVBS4KPlaybackVideoCodec;
+        bs4k_playback_video_codec: KonomiTVBS4KPlaybackVideoCodec;
+        playback_audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+        bs4k_playback_audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+        playback_24fps_mode: boolean;
         tv_low_latency_mode: boolean;
-        tv_24fps_mode: boolean;
-        video_streaming_quality: VideoStreamingQuality;
-        video_encoding_codec: RecordedStreamingVideoCodec;
-        bs4k_video_encoding_codec: RecordedStreamingVideoCodec;
-        video_audio_encoding_codec: RecordedStreamingAudioCodec;
-        bs4k_video_audio_encoding_codec: RecordedStreamingAudioCodec;
-        video_24fps_mode: boolean;
     } {
         const settings_store = useSettingsStore();
-        // モバイル回線向けの画質プロファイルを返す
-        if (this.quality_profile_type === 'Cellular') {
-            return {
-                tv_streaming_quality: settings_store.settings.tv_streaming_quality_cellular,
-                bs4k_streaming_quality: settings_store.settings.bs4k_streaming_quality_cellular,
-                bs4k_video_streaming_quality: settings_store.settings.bs4k_video_streaming_quality_cellular,
-                tv_encoding_codec: settings_store.settings.tv_encoding_codec_cellular,
-                bs4k_tv_encoding_codec: settings_store.settings.bs4k_tv_encoding_codec_cellular,
-                tv_low_latency_mode: settings_store.settings.tv_low_latency_mode_cellular,
-                tv_24fps_mode: settings_store.settings.tv_24fps_mode_cellular,
-                video_streaming_quality: settings_store.settings.video_streaming_quality_cellular,
-                video_encoding_codec: settings_store.settings.video_encoding_codec_cellular,
-                bs4k_video_encoding_codec: settings_store.settings.bs4k_video_encoding_codec_cellular,
-                video_audio_encoding_codec: settings_store.settings.video_audio_encoding_codec_cellular,
-                bs4k_video_audio_encoding_codec: settings_store.settings.bs4k_video_audio_encoding_codec_cellular,
-                video_24fps_mode: settings_store.settings.video_24fps_mode_cellular,
-            };
-        // Wi-Fi 回線向けの画質プロファイルを返す
-        } else {
-            return {
-                tv_streaming_quality: settings_store.settings.tv_streaming_quality,
-                bs4k_streaming_quality: settings_store.settings.bs4k_streaming_quality,
-                bs4k_video_streaming_quality: settings_store.settings.bs4k_video_streaming_quality,
-                tv_encoding_codec: settings_store.settings.tv_encoding_codec,
-                bs4k_tv_encoding_codec: settings_store.settings.bs4k_tv_encoding_codec,
-                tv_low_latency_mode: settings_store.settings.tv_low_latency_mode,
-                tv_24fps_mode: settings_store.settings.tv_24fps_mode,
-                video_streaming_quality: settings_store.settings.video_streaming_quality,
-                video_encoding_codec: settings_store.settings.video_encoding_codec,
-                bs4k_video_encoding_codec: settings_store.settings.bs4k_video_encoding_codec,
-                video_audio_encoding_codec: settings_store.settings.video_audio_encoding_codec,
-                bs4k_video_audio_encoding_codec: settings_store.settings.bs4k_video_audio_encoding_codec,
-                video_24fps_mode: settings_store.settings.video_24fps_mode,
-            };
-        }
+        const is_cellular = this.quality_profile_type === 'Cellular';
+        return {
+            playback_streaming_quality: settings_store.settings[
+                getKonomiTVBS4KPlaybackStreamingQualitySettingKey(false, is_cellular)
+            ] as LiveStreamingQuality,
+            bs4k_playback_streaming_quality: settings_store.settings[
+                getKonomiTVBS4KPlaybackStreamingQualitySettingKey(true, is_cellular)
+            ] as BS4KLiveStreamingQuality,
+            playback_video_codec: settings_store.settings[
+                getKonomiTVBS4KPlaybackVideoCodecSettingKey(false, is_cellular)
+            ],
+            bs4k_playback_video_codec: settings_store.settings[
+                getKonomiTVBS4KPlaybackVideoCodecSettingKey(true, is_cellular)
+            ],
+            playback_audio_codec: settings_store.settings[
+                getKonomiTVBS4KPlaybackAudioCodecSettingKey(false, is_cellular)
+            ],
+            bs4k_playback_audio_codec: settings_store.settings[
+                getKonomiTVBS4KPlaybackAudioCodecSettingKey(true, is_cellular)
+            ],
+            playback_24fps_mode: settings_store.settings[
+                getKonomiTVBS4KPlayback24FPSModeSettingKey(false, is_cellular)
+            ],
+            // 低遅延はライブ固有機能であり、旧 live/recorded 重複設定ではないため既存キーを維持する。
+            tv_low_latency_mode: is_cellular ?
+                settings_store.settings.tv_low_latency_mode_cellular :
+                settings_store.settings.tv_low_latency_mode,
+        };
     }
 
 
@@ -325,21 +338,47 @@ class PlayerController {
     }
 
 
-    /** 現在の再生対象と実効 codec pipeline を、短時間再起動ループの判定キーにする。 */
-    private getKonomiTVBS4KPlaybackRestartKey(): string {
+    /** 現在の再生対象と回線プロファイルを、pinを分離する安定キーにする。 */
+    private getPlaybackTargetKey(): string {
         const channels_store = useChannelsStore();
         const player_store = usePlayerStore();
         const playback_target_id = this.playback_mode === 'Live' ?
             channels_store.channel.current.display_channel_id :
             player_store.recorded_program.id.toString();
+        return `${this.playback_mode}:${playback_target_id}:${this.quality_profile_type}`;
+    }
+
+
+    /** 現在の再生対象と実効 codec pipeline を、短時間再起動ループの判定キーにする。 */
+    private getKonomiTVBS4KPlaybackRestartKey(): string {
+        const effective_profile = usePlayerStore().konomitv_bs4k_effective_playback_profile;
+
+        // 通常は DPlayer 構築前の preflight で実効 profile が確定している。
+        // 初期化途中の例外などで未確定の場合も、同じ対象の Unknown pipeline として無制限再起動を避ける。
+        if (effective_profile === null) {
+            return `${this.getPlaybackTargetKey()}:Unknown`;
+        }
         return [
-            this.playback_mode,
-            playback_target_id,
-            this.quality_profile_type,
-            this.konomitv_bs4k_video_codec_for_current_playback,
-            this.konomitv_bs4k_video_bit_depth_for_current_playback,
-            this.recorded_audio_codec_for_current_playback,
+            effective_profile.target_key,
+            effective_profile.encoder,
+            effective_profile.video_codec,
+            effective_profile.video_bit_depth,
+            effective_profile.audio_codec,
         ].join(':');
+    }
+
+
+    /** 非同期初期化が現在のroute/再生対象に属することを確実にする。 */
+    private assertInitializationIsCurrent(generation: number, playback_target_key: string): void {
+        if (
+            this.owner_signal?.aborted === true ||
+            generation !== this.initialization_generation ||
+            this.destroying === true ||
+            this.destroyed === true ||
+            this.getPlaybackTargetKey() !== playback_target_key
+        ) {
+            throw new DOMException('Player initialization was superseded.', 'AbortError');
+        }
     }
 
     /**
@@ -362,6 +401,9 @@ class PlayerController {
 
         // 破棄済みかどうかのフラグを下ろす
         this.destroyed = false;
+        const initialization_generation = ++this.initialization_generation;
+        const playback_target_key = this.getPlaybackTargetKey();
+        this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
         this.is_live_startup_temporary_muted = false;
         this.recorded_playback_ended = false;
         this.recorded_playback_end_blocked_by_seek = false;
@@ -373,108 +415,88 @@ class PlayerController {
         // KeyboardShortcutManager がこのタイミングで破棄される
         player_store.is_player_initialized = true;
 
-        // 通常 / BS4K、ライブ / 録画、回線プロファイルごとの設定から映像コーデックを決める。
-        // 非対応時は保存設定を書き換えず、この再生だけ互換コーデックへ戻す。
+        // 通常 / BS4K × Wi-Fi / モバイルの共通設定だけを永続的な希望値として参照する。
+        // プレイヤー内で明示された一時 override は SettingsStore を変更せず、視聴画面を離れるまで優先する。
         const is_bs4k_stream = this.playback_mode === 'Live' ?
             channels_store.channel.current.display_channel_id.startsWith('bs4k') :
             player_store.recorded_program.network_id === 0x000B;
-        const selected_video_codec = this.playback_mode === 'Live' ?
-            (is_bs4k_stream ? this.quality_profile.bs4k_tv_encoding_codec : this.quality_profile.tv_encoding_codec) :
-            (is_bs4k_stream ? this.quality_profile.bs4k_video_encoding_codec : this.quality_profile.video_encoding_codec);
-        let recorded_video_codec: RecordedStreamingVideoCodec = 'avc';
-        let recorded_video_bit_depth: 8 | 10 = 8;
-        if (this.playback_mode === 'Video') {
-            const encoder = is_bs4k_stream === true ?
-                server_settings_store.server_settings.general.encoder_bs4k :
-                server_settings_store.server_settings.general.encoder;
-            const capabilities = await Videos.fetchRecordedPlaybackCapabilities();
-            const media_source = (
-                window as Window & {ManagedMediaSource?: {isTypeSupported: (mime_type: string) => boolean}}
-            ).ManagedMediaSource ?? window.MediaSource;
-            const codec_mime_types: Record<RecordedStreamingVideoCodec, Record<8 | 10, string | null>> = {
-                avc: {8: 'video/mp4; codecs="avc1.640028"', 10: null},
-                hevc: {8: 'video/mp4; codecs="hvc1.1.6.L153.B0"', 10: 'video/mp4; codecs="hvc1.2.4.L153.B0"'},
-                vp9: {8: 'video/mp4; codecs="vp09.00.40.08"', 10: 'video/mp4; codecs="vp09.02.40.10"'},
-                av1: {8: 'video/mp4; codecs="av01.0.08M.08"', 10: 'video/mp4; codecs="av01.0.10M.10"'},
-            };
-            const codec_order = Array.from(new Set<RecordedStreamingVideoCodec>([
-                selected_video_codec as RecordedStreamingVideoCodec,
-                'avc',
-                'hevc',
-                'vp9',
-                'av1',
-            ]));
-            let selected_capability: {codec: RecordedStreamingVideoCodec; bit_depth: 8 | 10} | null = null;
-            for (const codec of codec_order) {
-                const bit_depths: (8 | 10)[] = codec === 'avc' ? [8] : [10, 8];
-                for (const bit_depth of bit_depths) {
-                    const mime_type = codec_mime_types[codec][bit_depth];
-                    if (
-                        mime_type !== null && media_source?.isTypeSupported(mime_type) === true &&
-                        capabilities.some((capability) =>
-                            capability.encoder === encoder && capability.codec === codec &&
-                            capability.bit_depth === bit_depth && capability.recorded_available === true,
-                        )
-                    ) {
-                        selected_capability = {codec, bit_depth};
-                        break;
-                    }
-                }
-                if (selected_capability !== null) {
-                    break;
-                }
-            }
-            if (selected_capability === null) {
-                throw new Error('No recorded playback codec is supported by both the server and this browser.');
-            }
-            recorded_video_codec = selected_capability.codec;
-            recorded_video_bit_depth = selected_capability.bit_depth;
+        const saved_video_codec = is_bs4k_stream ?
+            this.quality_profile.bs4k_playback_video_codec :
+            this.quality_profile.playback_video_codec;
+        const saved_audio_codec = is_bs4k_stream ?
+            this.quality_profile.bs4k_playback_audio_codec :
+            this.quality_profile.playback_audio_codec;
+        const requested_video_codec =
+            player_store.konomitv_bs4k_playback_codec_override?.video_codec ?? saved_video_codec;
+        const requested_audio_codec =
+            player_store.konomitv_bs4k_playback_codec_override?.audio_codec ?? saved_audio_codec;
+        const encoder = is_bs4k_stream === true ?
+            server_settings_store.server_settings.general.encoder_bs4k :
+            server_settings_store.server_settings.general.encoder;
+        const has_video = this.playback_mode === 'Live' ?
+            channels_store.channel.current.is_radiochannel === false :
+            player_store.recorded_program.recorded_video.has_video;
+        const saved_streaming_quality = is_bs4k_stream ?
+            this.quality_profile.bs4k_playback_streaming_quality :
+            this.quality_profile.playback_streaming_quality;
+        const available_streaming_qualities = is_bs4k_stream ?
+            BS4K_LIVE_STREAMING_QUALITIES :
+            (this.playback_mode === 'Live' ? LIVE_STREAMING_QUALITIES : VIDEO_STREAMING_QUALITIES);
+        const preflight_streaming_quality = has_video === false ? saved_streaming_quality :
+            PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
+                options.default_quality ?? saved_streaming_quality,
+                is_bs4k_stream,
+                available_streaming_qualities,
+            );
+        if (preflight_streaming_quality === null) {
+            throw new Error(`Unknown playback quality for codec preflight: ${options.default_quality}`);
         }
-        const is_hevc_playback = this.playback_mode === 'Live' ?
-            PlayerUtils.isHEVCVideoSupported() && selected_video_codec === 'hevc' :
-            recorded_video_codec === 'hevc';
 
-        // 録画HLSの音声コーデックも、通常 / BS4K と現在の回線プロファイルに対応する設定から決める。
-        // Opus が MSE / ManagedMediaSource で利用できない場合だけ、再生開始前に AAC へフォールバックする。
-        const selected_recorded_audio_codec: RecordedStreamingAudioCodec = this.playback_mode === 'Video' ?
-            (is_bs4k_stream ? this.quality_profile.bs4k_video_audio_encoding_codec : this.quality_profile.video_audio_encoding_codec) :
-            'aac';
-        const is_recorded_opus_audio_supported = Videos.isOpusAudioSupported();
-        const recorded_audio_codec: RecordedStreamingAudioCodec = (
-            selected_recorded_audio_codec === 'opus' &&
-            is_recorded_opus_audio_supported === false
-        ) ? 'aac' : selected_recorded_audio_codec;
-        this.recorded_audio_codec_for_current_playback = recorded_audio_codec;
-
-        // BS4K は入力 TS が HEVC Main10 で、QSVEncC ではさらに HEVC 10bit 出力を要求すると
-        // MFXDEC が device operation failure で落ちることがあるため、HEVC 10bit 要求は通常チャンネルだけに限定する
-        const is_bs4k_playback_for_hevc_10bit = (
-            (
-                this.playback_mode === 'Live' &&
-                channels_store.channel.current.display_channel_id.startsWith('bs4k')
-            ) ||
-            (
-                this.playback_mode === 'Video' &&
-                player_store.recorded_program.network_id === 0x000B
-            )
-        );
-
-        // HEVC 10bit は HEVC 選択中の対応環境にだけ透過的に要求する
-        // MediaCapabilities で滑らかに再生できると判断できない場合は、通常の HEVC 8bit に留めて互換性を優先する
-        const is_hevc_10bit_playback = (
-            is_hevc_playback === true &&
-            is_bs4k_playback_for_hevc_10bit === false &&
-            await PlayerUtils.isHEVC10bitVideoSupported()
-        );
-
-        // 自動再起動上限は実際に DPlayer へ渡す codec tuple 単位で判定する。
-        this.konomitv_bs4k_video_codec_for_current_playback = this.playback_mode === 'Live' ?
-            selected_video_codec as RecordedStreamingVideoCodec : recorded_video_codec;
-        this.konomitv_bs4k_video_bit_depth_for_current_playback = this.playback_mode === 'Live' ?
-            (is_hevc_10bit_playback === true ? 10 : 8) : recorded_video_bit_depth;
+        let effective_playback_profile = player_store.konomitv_bs4k_effective_playback_profile;
+        if (
+            effective_playback_profile === null ||
+            effective_playback_profile.target_key !== playback_target_key ||
+            effective_playback_profile.encoder !== encoder ||
+            effective_playback_profile.requested_video_codec !== requested_video_codec ||
+            effective_playback_profile.requested_audio_codec !== requested_audio_codec
+        ) {
+            const preflight_profile = await Videos.preflightKonomiTVBS4KPlaybackProfile(
+                encoder,
+                requested_video_codec,
+                requested_audio_codec,
+                {
+                    is_bs4k: is_bs4k_stream,
+                    streaming_quality: preflight_streaming_quality,
+                },
+                this.playback_mode,
+                has_video,
+                this.owner_signal ?? undefined,
+            );
+            this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
+            if (preflight_profile === null) {
+                throw new Error('No playback codec is supported by the server and this browser.');
+            }
+            effective_playback_profile = {
+                target_key: playback_target_key,
+                encoder,
+                requested_video_codec,
+                requested_audio_codec,
+                video_codec: preflight_profile.video_codec,
+                video_bit_depth: preflight_profile.video_bit_depth,
+                audio_codec: preflight_profile.audio_codec,
+            };
+            player_store.konomitv_bs4k_effective_playback_profile = effective_playback_profile;
+        }
+        const effective_video_codec = effective_playback_profile.video_codec;
+        const effective_video_bit_depth = effective_playback_profile.video_bit_depth;
+        const effective_audio_codec = effective_playback_profile.audio_codec;
+        const is_hevc_playback = effective_video_codec === 'hevc';
+        const is_hevc_10bit_playback =
+            effective_video_codec === 'hevc' && effective_video_bit_depth === 10;
 
         // ブラウザが MSE in Worker での H.265 / HEVC 再生に対応しているかどうか
         const is_hevc_video_supported_in_worker = await mpegts.supportWorkerForMSEH265Playback();
+        this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
 
         const is_bs4k_live_playback = (
             this.playback_mode === 'Live' &&
@@ -628,11 +650,7 @@ class PlayerController {
                         is_bs4k_live === false &&
                         is_bs4k_recorded_video === false &&
                         quality_name !== '1080p-60fps' &&
-                        (
-                            this.playback_mode === 'Live' ?
-                                this.quality_profile.tv_24fps_mode :
-                                this.quality_profile.video_24fps_mode
-                        ) === true
+                        this.quality_profile.playback_24fps_mode === true
                     ) {
                         api_quality += '-24fps';
                     }
@@ -680,7 +698,12 @@ class PlayerController {
                 // ライブ視聴: チャンネル情報がセットされているはず
                 if (this.playback_mode === 'Live') {
                     // ライブストリーミング API のベース URL
-                    const streaming_api_base_url = `${Utils.api_base_url}/streams/live/${channels_store.channel.current.display_channel_id}`;
+                    const live_playback_codec_query =
+                        PlayerUtils.buildKonomiTVBS4KLivePlaybackCodecQuery({
+                            video_codec: effective_video_codec,
+                            video_bit_depth: effective_video_bit_depth,
+                            audio_codec: effective_audio_codec,
+                        });
                     // ラジオチャンネルの場合
                     // API が受け付ける画質の値は通常のチャンネルと同じだが (手抜き…)、実際の画質は 48KHz/192kbps で固定される
                     // ラジオチャンネルの場合は、1080p と渡しても 48kHz/192kbps 固定の音声だけの MPEG-TS が配信される
@@ -688,7 +711,12 @@ class PlayerController {
                         qualities.push({
                             name: '48kHz/192kbps',
                             type: 'mpegts',
-                            url: `${streaming_api_base_url}/1080p/mpegts`,
+                            url: PlayerUtils.buildKonomiTVBS4KLiveAPIEndpointURL(
+                                channels_store.channel.current.display_channel_id,
+                                '1080p',
+                                'mpegts',
+                                live_playback_codec_query,
+                            ),
                         });
                     // 通常のチャンネルの場合
                     } else {
@@ -698,13 +726,20 @@ class PlayerController {
                             qualities.push({
                                 name: get_quality_display_name(quality_name),
                                 type: 'mpegts',
-                                url: `${streaming_api_base_url}/${build_api_quality(quality_name)}/mpegts`,
+                                url: PlayerUtils.buildKonomiTVBS4KLiveAPIEndpointURL(
+                                    channels_store.channel.current.display_channel_id,
+                                    build_api_quality(quality_name),
+                                    'mpegts',
+                                    live_playback_codec_query,
+                                ),
                             });
                         }
                     }
                     // デフォルトの画質
                     const live_streaming_qualities = is_bs4k_live === true ? BS4K_LIVE_STREAMING_QUALITIES : LIVE_STREAMING_QUALITIES;
-                    let default_quality: string = is_bs4k_live === true ? this.quality_profile.bs4k_streaming_quality : this.quality_profile.tv_streaming_quality;
+                    let default_quality: string = is_bs4k_live === true ?
+                        this.quality_profile.bs4k_playback_streaming_quality :
+                        this.quality_profile.playback_streaming_quality;
                     if (options.default_quality !== null) {
                         // PlayerController.init() のオプションでデフォルト画質が指定されている場合は
                         // 画質プロファイルに記載の画質ではなく、指定された（前回再生時の）画質を使ってレジュームする
@@ -730,22 +765,23 @@ class PlayerController {
                     const initial_audio_rendition = first_audio_track === undefined ? null :
                         `${first_audio_track.index}${first_audio_track.is_dual_mono === true ? '-main' : ''}`;
                     for (const quality_name of video_streaming_qualities) {
-                        // 画質ごとに異なるセッション ID を生成 (セッション ID は UUID の - で区切って一番左側のみを使う)
-                        const session_id = crypto.randomUUID().split('-')[0];
+                        // 画質ごとに異なる8桁のセッション ID を生成する。
+                        const session_id = generateRecordedPlaybackSessionID();
                         // 画質設定を追加
                         qualities.push({
                             name: get_quality_display_name(quality_name),
                             type: 'hls',
                             url: `${streaming_api_base_url}/${build_api_quality(quality_name)}/playlist?session_id=${session_id}` +
-                                `&video_codec=${recorded_video_codec}&video_bit_depth=${recorded_video_bit_depth}` +
-                                `&audio_codec=${recorded_audio_codec}` +
+                                `&video_codec=${effective_video_codec}&video_bit_depth=${effective_video_bit_depth}` +
+                                `&audio_codec=${effective_audio_codec}` +
                                 (initial_audio_rendition !== null ? `&audio_track=${initial_audio_rendition}` : ''),
                         });
                     }
                     // デフォルトの画質
                     // ビデオ視聴時はラジオは考慮しない
                     let default_quality: string = is_bs4k_recorded_video === true ?
-                        this.quality_profile.bs4k_video_streaming_quality : this.quality_profile.video_streaming_quality;
+                        this.quality_profile.bs4k_playback_streaming_quality :
+                        this.quality_profile.playback_streaming_quality;
                     if (options.default_quality !== null) {
                         // PlayerController.init() のオプションでデフォルト画質が指定されている場合は
                         // 画質プロファイルに記載の画質ではなく、指定された（前回再生時の）画質を使ってレジュームする
@@ -1314,15 +1350,15 @@ class PlayerController {
         // デバッグ用にプレイヤーインスタンスも window 直下に入れる
         (window as any).player = this.player;
 
-        if (selected_video_codec === 'hevc' && is_hevc_playback === false) {
-            this.player.notice('このブラウザは HEVC に対応していないため、今回の再生では AVC を使用します。');
-        }
         if (
-            this.playback_mode === 'Video' &&
-            selected_recorded_audio_codec === 'opus' &&
-            is_recorded_opus_audio_supported === false
+            requested_video_codec !== effective_video_codec ||
+            requested_audio_codec !== effective_audio_codec
         ) {
-            this.player.notice('このブラウザは fMP4 の Opus 音声に対応していないため、今回の再生では AAC を使用します。');
+            this.player.notice(
+                `希望設定 ${requested_video_codec.toUpperCase()} / ${requested_audio_codec.toUpperCase()} は` +
+                `利用できないため、再生開始前に ${effective_video_codec.toUpperCase()} / ` +
+                `${effective_audio_codec.toUpperCase()} を選択しました。`,
+            );
         }
         // この時点で DPlayer のコンテナ要素に dplayer-mobile クラスが付与されている場合、
         // DPlayer は音量コントロールがないスマホ向けの UI になっている
@@ -1454,7 +1490,7 @@ class PlayerController {
             }
 
             // codec pipeline の実行時失敗だけは、同一再生対象・同一 codec tuple で最初の1回だけ自動再起動する。
-            // MEDIA_ERR_DECODE や SourceBuffer エラーだけでは codec 非対応と断定できないため、設定は自動変更しない。
+            // MEDIA_ERR_DECODE や SourceBuffer エラーだけでは codec 非対応と断定できないため、pin や override は変更しない。
             if (
                 event.konomitv_bs4k_restart_reason === 'RuntimeCodecPipelineError' &&
                 this.konomitv_bs4k_playback_restart_guard.requestAutomaticRestart(
@@ -1486,23 +1522,30 @@ class PlayerController {
             const current_playback_rate = this.player.video.playbackRate ?? null;
             const current_time = this.player.video.currentTime ?? null;
 
-            // PlayerController 自身を破棄
-            await this.destroy();
+            try {
+                // PlayerController 自身を破棄
+                await this.destroy();
 
-            // ライブ視聴時のみ即座に再起動すると諸々問題があるので、少し待つ
-            if (this.playback_mode === 'Live') {
-                await Utils.sleep(0.5);
+                // ライブ視聴時のみ即座に再起動すると諸々問題があるので、少し待つ
+                if (this.playback_mode === 'Live') {
+                    await Utils.sleep(0.5);
+                }
+
+                // PlayerController 自身を再初期化
+                await this.init({
+                    default_quality: current_quality ? current_quality.name : null,
+                    playback_rate: this.playback_mode === 'Video' ? current_playback_rate : null,
+                    seek_seconds: this.playback_mode === 'Video' ? current_time : null,
+                });
+            } catch (error) {
+                if (!(error instanceof DOMException && error.name === 'AbortError')) {
+                    console.error('[PlayerController] Failed to restart player.', error);
+                    this.player?.notice('プレイヤーの再起動に失敗しました。', -1);
+                }
+                return;
+            } finally {
+                is_player_restarting = false;
             }
-
-            // PlayerController 自身を再初期化
-            // 再起動完了時点でこの PlayerRestartRequired のイベントハンドラーは再登録されているはず
-            await this.init({
-                // 現在の再生画質・再生速度 (ビデオ視聴時のみ)・再生位置 (ビデオ視聴時のみ) を引き継ぐ
-                default_quality: current_quality ? current_quality.name : null,
-                playback_rate: this.playback_mode === 'Video' ? current_playback_rate : null,
-                seek_seconds: this.playback_mode === 'Video' ? current_time : null,
-            });
-            is_player_restarting = false;
 
             // プレイヤー側にイベントの発火元から送られたメッセージ (プレイヤーを再起動中である旨) を通知する
             // 再初期化により、作り直した DPlayer が再び this.player にセットされているはず
@@ -1551,7 +1594,8 @@ class PlayerController {
 
             // 現在の再生画質・再生速度・再生位置を取得
             // この情報がプレイヤー再起動後にレジュームされる
-            const current_quality = this.player?.qualityIndex ? this.player.options.video.quality![this.player.qualityIndex] : null;
+            const current_quality = typeof this.player?.qualityIndex === 'number' ?
+                this.player.options.video.quality?.[this.player.qualityIndex] ?? null : null;
             const current_playback_rate = this.player?.video.playbackRate ?? null;
             const current_time = this.player?.video.currentTime ?? null;
 
@@ -2183,7 +2227,7 @@ class PlayerController {
                         return;
                     }
 
-                    // ライブ視聴時とは異なり、録画なので待たなくても再起動できる。
+                    // ライブ視聴時とは異なり、録画なので待たなくても再起動できる
                     const media_error = this.player.video.error;
                     if (media_error) {
                         console.error('\u001b[31m[PlayerController] HTMLVideoElement error event:', media_error);
@@ -2680,6 +2724,7 @@ class PlayerController {
         }, 1000);
     }
 
+
     /** 録画HLSの代替音声レンディションを、映像を維持したまま切り替える。 */
     private setupRecordedHLSAudioTrackSelector(): void {
 
@@ -2688,6 +2733,8 @@ class PlayerController {
         if (hls === undefined) return;  // 録画再生はhls.js必須。非対応表示は初期化処理側で行う。
         if (this.recorded_hls_audio_selector_instances.has(hls)) return;
         this.recorded_hls_audio_selector_instances.add(hls);
+
+        const player_store = usePlayerStore();
 
         // MSE 型判定を通過していても、実際の SourceBuffer 追加・append 時に Opus が拒否されることがある。
         // 自動で AAC へ変更せず、同一 codec での一度限りの再起動と、再発時の恒久通知へ送る。
@@ -2699,15 +2746,16 @@ class PlayerController {
             ].includes(data.details);
             if (
                 is_audio_source_buffer_error === true &&
-                this.recorded_audio_codec_for_current_playback === 'opus'
+                player_store.konomitv_bs4k_effective_playback_profile?.audio_codec === 'opus'
             ) {
-                usePlayerStore().event_emitter.emit('PlayerRestartRequired', {
+                player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: 'Opus 音声の再生処理でエラーが発生しました。プレイヤーを再起動しています…',
                     konomitv_bs4k_restart_reason: 'RuntimeCodecPipelineError',
                 });
             }
         });
-        const recorded_video = usePlayerStore().recorded_program.recorded_video;
+
+        const recorded_video = player_store.recorded_program.recorded_video;
         const renditions = recorded_video.audio_tracks.flatMap((track) => {
             const language_parts = (track.language ?? '').split('+').map((value) => value.trim()).filter(Boolean);
             if (track.is_dual_mono === true) {
@@ -3115,6 +3163,7 @@ class PlayerController {
         assert(this.player !== null);
         const player_store = usePlayerStore();
         const channels_store = useChannelsStore();
+        const server_settings_store = useServerSettingsStore();
         const settings_store = useSettingsStore();
 
         // 独自サブパネルの表示は modifier class だけで制御し、DPlayer が元パネル用に設定した
@@ -3122,15 +3171,39 @@ class PlayerController {
         // 戻る操作・外側クリック・別サブパネルへの移動のいずれでも元の寸法へ確実に戻す。
         const setting_box = this.player.template.settingBox;
         const codec_panel_class_names = [
-            'dplayer-setting-box-video-codec',
-            'dplayer-setting-box-audio-codec',
+            'dplayer-konomitv-bs4k-setting-box-video-codec',
+            'dplayer-konomitv-bs4k-setting-box-audio-codec',
         ];
         const close_codec_panel = () => {
             setting_box.classList.remove(...codec_panel_class_names);
         };
         const open_codec_panel = (panel_name: 'video-codec' | 'audio-codec') => {
             close_codec_panel();
-            setting_box.classList.add(`dplayer-setting-box-${panel_name}`);
+            // DPlayer 標準サブパネルの modifier が残っていると clip-path の優先順位が競合する。
+            setting_box.classList.remove(
+                'dplayer-setting-box-quality',
+                'dplayer-setting-box-speed',
+                'dplayer-setting-box-audio',
+            );
+            setting_box.classList.add(`dplayer-konomitv-bs4k-setting-box-${panel_name}`);
+        };
+        const consume_codec_panel_event = (event: Event) => {
+            // 設定パネル外の click/tap handler へ伝播させず、DPlayer の mask/hide と競合させない。
+            event.preventDefault();
+            event.stopPropagation();
+        };
+        const register_codec_panel_activation_handler = (
+            element: HTMLElement,
+            handler: (event: Event) => void,
+        ) => {
+            element.addEventListener('click', handler);
+            element.addEventListener('keydown', (event) => {
+                // role=button の独自要素をネイティブ button と同じ Enter / Space で起動する。
+                // Space のページスクロールとキーリピートによる多重 preflight はここで抑止する。
+                if ((event.key !== 'Enter' && event.key !== ' ') || event.repeat === true) return;
+                consume_codec_panel_event(event);
+                element.click();
+            });
         };
 
         // 設定パネルの開閉を把握するためモンキーパッチを追加し、PlayerStore に通知する
@@ -3145,43 +3218,45 @@ class PlayerController {
         };
         this.player.setting.show = () => {
             if (this.player === null) return;
+            close_codec_panel();
             original_show.call(this.player.setting);
             player_store.is_player_setting_panel_open = true;
         };
 
-        // 映像・録画音声コーデック選択と、モバイル回線プロファイルに切り替えるボタンを動的に追加する。
-        // ライブの映像は従来の AVC / HEVC、録画の映像は FFmpeg 8 経路の4種類、録画の音声は2種類を表示する。
-        const selectable_video_codecs: RecordedStreamingVideoCodec[] = this.playback_mode === 'Video' ?
-            ['avc', 'hevc', 'vp9', 'av1'] : ['avc', 'hevc'];
+        // ライブ・録画で同じ4映像 codec / 2音声 codec を一時 override として提供する。
+        // 非対応候補も希望値として選択でき、再起動前の preflight が lower-only 順で実効 tuple を決める。
+        const selectable_video_codecs: KonomiTVBS4KPlaybackVideoCodec[] = ['av1', 'vp9', 'hevc', 'avc'];
         const video_codec_item_html = selectable_video_codecs.map((codec) => `
-            <div class="dplayer-setting-video-codec-item" data-codec="${codec}"
-                style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer;">
-                <div class="dplayer-toggle dplayer-setting-video-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+            <div class="dplayer-konomitv-bs4k-setting-video-codec-item" data-codec="${codec}"
+                role="button" tabindex="0"
+                style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-video-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
                 <span class="dplayer-label">${codec.toUpperCase()}</span>
             </div>
         `).join('');
         const video_codec_panel_height = 54 + selectable_video_codecs.length * 30;
-        const audio_codec_labels: Record<RecordedStreamingAudioCodec, string> = {
+        const audio_codec_labels: Record<KonomiTVBS4KPlaybackAudioCodec, string> = {
             aac: 'AAC',
             opus: 'Opus',
         };
-        const audio_codec_options = this.playback_mode === 'Video' ? Videos.buildRecordedPlaybackAudioCodecOptions() : [];
-        const audio_codec_item_html = audio_codec_options.map((option) => `
-            <div class="dplayer-setting-audio-codec-item${option.props.disabled ? ' dplayer-setting-audio-codec-item--disabled' : ''}"
-                data-codec="${option.value}" aria-disabled="${option.props.disabled}"
-                style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer;">
-                <div class="dplayer-toggle dplayer-setting-audio-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
-                <span class="dplayer-label">${audio_codec_labels[option.value]}${option.props.disabled ? '（非対応）' : ''}</span>
+        const selectable_audio_codecs: KonomiTVBS4KPlaybackAudioCodec[] = ['opus', 'aac'];
+        const audio_codec_item_html = selectable_audio_codecs.map((codec) => `
+            <div class="dplayer-konomitv-bs4k-setting-audio-codec-item" data-codec="${codec}"
+                role="button" tabindex="0"
+                style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-audio-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                <span class="dplayer-label">${audio_codec_labels[codec]}</span>
             </div>
         `).join('');
-        const audio_codec_panel_height = 54 + audio_codec_options.length * 30;
-        const audio_codec_setting_item_html = this.playback_mode === 'Video' ? `
-            <div class="dplayer-setting-item dplayer-setting-audio-codec">
+        const audio_codec_panel_height = 54 + selectable_audio_codecs.length * 30;
+        const audio_codec_setting_item_html = `
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-audio-codec"
+                role="button" tabindex="0" style="touch-action:manipulation;">
                 <span class="dplayer-label">音声コーデック</span>
-                <span class="dplayer-label-value dplayer-setting-audio-codec-value"></span>
-                <div class="dplayer-toggle dplayer-setting-audio-codec-arrow"></div>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-audio-codec-value"></span>
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-audio-codec-arrow"></div>
             </div>
-        ` : '';
+        `;
         const auto_skip_cm_setting_item_html = this.playback_mode === 'Video' ? `
             <div class="dplayer-setting-item dplayer-setting-auto-skip-cm">
                 <span class="dplayer-label">CM自動スキップ</span>
@@ -3192,10 +3267,11 @@ class PlayerController {
             </div>
         ` : '';
         this.player.template.audio.insertAdjacentHTML('afterend', `
-            <div class="dplayer-setting-item dplayer-setting-video-codec">
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-video-codec"
+                role="button" tabindex="0" style="touch-action:manipulation;">
                 <span class="dplayer-label">映像コーデック</span>
-                <span class="dplayer-label-value dplayer-setting-video-codec-value"></span>
-                <div class="dplayer-toggle dplayer-setting-video-codec-arrow"></div>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-video-codec-value"></span>
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-video-codec-arrow"></div>
             </div>
             ${audio_codec_setting_item_html}
             ${auto_skip_cm_setting_item_html}
@@ -3209,24 +3285,26 @@ class PlayerController {
         `);
 
         // DPlayer の音声トラックと同じ構成の独自サブパネルを追加する。
-        const audio_codec_panel_html = this.playback_mode === 'Video' ? `
-            <div class="dplayer-setting-audio-codec-panel"
+        const audio_codec_panel_html = `
+            <div class="dplayer-konomitv-bs4k-setting-audio-codec-panel"
                 style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
-                <div class="dplayer-setting-header dplayer-setting-audio-codec-header"
-                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer;">
-                    <div class="dplayer-toggle dplayer-setting-audio-codec-back"
+                <div class="dplayer-setting-header dplayer-konomitv-bs4k-setting-audio-codec-header"
+                    role="button" tabindex="0"
+                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                    <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-audio-codec-back"
                         style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
                     <span class="dplayer-label">音声コーデック</span>
                 </div>
                 ${audio_codec_item_html}
             </div>
-        ` : '';
+        `;
         setting_box.insertAdjacentHTML('beforeend', `
-            <div class="dplayer-setting-video-codec-panel"
+            <div class="dplayer-konomitv-bs4k-setting-video-codec-panel"
                 style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
-                <div class="dplayer-setting-header dplayer-setting-video-codec-header"
-                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer;">
-                    <div class="dplayer-toggle dplayer-setting-video-codec-back"
+                <div class="dplayer-setting-header dplayer-konomitv-bs4k-setting-video-codec-header"
+                    role="button" tabindex="0"
+                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                    <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-video-codec-back"
                         style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
                     <span class="dplayer-label">映像コーデック</span>
                 </div>
@@ -3239,74 +3317,156 @@ class PlayerController {
         const audio_arrow_html = this.player.template.audio.querySelector<HTMLElement>('.dplayer-toggle')?.innerHTML ?? '';
         const audio_back_html = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-header .dplayer-toggle')?.innerHTML ?? '';
         const audio_check_html = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-item .dplayer-toggle')?.innerHTML ?? '';
-        this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-arrow')!.innerHTML = audio_arrow_html;
-        this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-back')!.innerHTML = audio_back_html;
-        this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-video-codec-check')
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-video-codec-arrow')!.innerHTML = audio_arrow_html;
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-video-codec-back')!.innerHTML = audio_back_html;
+        this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-video-codec-check')
             .forEach((element) => element.innerHTML = audio_check_html);
-        if (this.playback_mode === 'Video') {
-            this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-codec-arrow')!.innerHTML = audio_arrow_html;
-            this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-codec-back')!.innerHTML = audio_back_html;
-            this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-codec-check')
-                .forEach((element) => element.innerHTML = audio_check_html);
-        }
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-arrow')!.innerHTML = audio_arrow_html;
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-back')!.innerHTML = audio_back_html;
+        this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-check')
+            .forEach((element) => element.innerHTML = audio_check_html);
 
-        // 現在の再生種別・放送種別・回線プロファイルに対応する設定キーを取得する
+        // 現在の通常 / BS4K と回線プロファイルに対応する共通設定を、override がない場合だけ参照する。
         const is_bs4k = this.playback_mode === 'Live' ?
             channels_store.channel.current.display_channel_id.startsWith('bs4k') :
             player_store.recorded_program.network_id === 0x000B;
-        type VideoCodecSettingKey =
-            'tv_encoding_codec' | 'tv_encoding_codec_cellular' |
-            'bs4k_tv_encoding_codec' | 'bs4k_tv_encoding_codec_cellular' |
-            'video_encoding_codec' | 'video_encoding_codec_cellular' |
-            'bs4k_video_encoding_codec' | 'bs4k_video_encoding_codec_cellular';
-        const get_video_codec_setting_key = (): VideoCodecSettingKey => {
-            const cellular_suffix = this.quality_profile_type === 'Cellular' ? '_cellular' : '';
-            if (this.playback_mode === 'Live') {
-                return `${is_bs4k ? 'bs4k_' : ''}tv_encoding_codec${cellular_suffix}` as VideoCodecSettingKey;
+        const get_requested_video_codec = (): KonomiTVBS4KPlaybackVideoCodec =>
+            player_store.konomitv_bs4k_playback_codec_override?.video_codec ??
+            settings_store.settings[getKonomiTVBS4KPlaybackVideoCodecSettingKey(
+                is_bs4k,
+                this.quality_profile_type === 'Cellular',
+            )];
+        const get_requested_audio_codec = (): KonomiTVBS4KPlaybackAudioCodec =>
+            player_store.konomitv_bs4k_playback_codec_override?.audio_codec ??
+            settings_store.settings[getKonomiTVBS4KPlaybackAudioCodecSettingKey(
+                is_bs4k,
+                this.quality_profile_type === 'Cellular',
+            )];
+        let is_codec_preflight_in_progress = false;
+        const prepare_codec_override = async (
+            requested_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+            requested_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        ): Promise<boolean> => {
+            if (is_codec_preflight_in_progress === true || this.player === null) return false;
+            is_codec_preflight_in_progress = true;
+            const selection_generation = this.initialization_generation;
+            const playback_target_key = this.getPlaybackTargetKey();
+            const current_player = this.player;
+            try {
+                const has_video = this.playback_mode === 'Live' ?
+                    channels_store.channel.current.is_radiochannel === false :
+                    player_store.recorded_program.recorded_video.has_video;
+                const available_streaming_qualities = is_bs4k ?
+                    BS4K_LIVE_STREAMING_QUALITIES :
+                    (this.playback_mode === 'Live' ? LIVE_STREAMING_QUALITIES : VIDEO_STREAMING_QUALITIES);
+                const saved_streaming_quality = is_bs4k ?
+                    this.quality_profile.bs4k_playback_streaming_quality :
+                    this.quality_profile.playback_streaming_quality;
+                const current_quality_index = current_player.qualityIndex;
+                const current_quality_name = (
+                    typeof current_quality_index === 'number' && current_player.options.video.quality !== undefined
+                ) ? current_player.options.video.quality[current_quality_index]?.name : null;
+                const preflight_streaming_quality = has_video === false ? saved_streaming_quality :
+                    PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
+                        current_quality_name ?? saved_streaming_quality,
+                        is_bs4k,
+                        available_streaming_qualities,
+                    );
+                if (preflight_streaming_quality === null) {
+                    current_player.notice('現在の画質を能力検査できないため、コーデックを変更しませんでした。');
+                    return false;
+                }
+
+                const encoder = is_bs4k ?
+                    server_settings_store.server_settings.general.encoder_bs4k :
+                    server_settings_store.server_settings.general.encoder;
+                const preflight_profile = await Videos.preflightKonomiTVBS4KPlaybackProfile(
+                    encoder,
+                    requested_video_codec,
+                    requested_audio_codec,
+                    {
+                        is_bs4k,
+                        streaming_quality: preflight_streaming_quality,
+                    },
+                    this.playback_mode,
+                    has_video,
+                    this.owner_signal ?? undefined,
+                );
+                this.assertInitializationIsCurrent(selection_generation, playback_target_key);
+                if (this.player !== current_player) {
+                    throw new DOMException('Codec selection was superseded.', 'AbortError');
+                }
+                if (preflight_profile === null) {
+                    current_player.notice('この画質で利用できる下位互換コーデックがないため、現在の再生を継続します。');
+                    return false;
+                }
+
+                // 新tupleを確定できた後にだけoverride/pinを入れ替える。
+                // 失敗時は既存playerも旧pinもそのまま残る。
+                player_store.konomitv_bs4k_playback_codec_override = {
+                    video_codec: requested_video_codec,
+                    audio_codec: requested_audio_codec,
+                };
+                player_store.konomitv_bs4k_effective_playback_profile = {
+                    target_key: playback_target_key,
+                    encoder,
+                    requested_video_codec,
+                    requested_audio_codec,
+                    video_codec: preflight_profile.video_codec,
+                    video_bit_depth: preflight_profile.video_bit_depth,
+                    audio_codec: preflight_profile.audio_codec,
+                };
+                return true;
+            } catch (error) {
+                if (error instanceof DOMException && error.name === 'AbortError') return false;
+                console.error('[PlayerController] Codec preflight failed.', error);
+                current_player.notice('コーデックの能力検査に失敗したため、現在の再生を継続します。');
+                return false;
+            } finally {
+                is_codec_preflight_in_progress = false;
             }
-            return `${is_bs4k ? 'bs4k_' : ''}video_encoding_codec${cellular_suffix}` as VideoCodecSettingKey;
-        };
-        type AudioCodecSettingKey =
-            'video_audio_encoding_codec' | 'video_audio_encoding_codec_cellular' |
-            'bs4k_video_audio_encoding_codec' | 'bs4k_video_audio_encoding_codec_cellular';
-        const get_audio_codec_setting_key = (): AudioCodecSettingKey => {
-            const cellular_suffix = this.quality_profile_type === 'Cellular' ? '_cellular' : '';
-            return `${is_bs4k ? 'bs4k_' : ''}video_audio_encoding_codec${cellular_suffix}` as AudioCodecSettingKey;
         };
 
-        // サブパネルは設定画面と同じ SettingsStore の値を直接読み書きする
-        const video_codec_button = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec')!;
-        const video_codec_value = this.player.container.querySelector<HTMLElement>('.dplayer-setting-video-codec-value')!;
-        const video_codec_items = Array.from(this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-video-codec-item'));
-        setting_box.style.setProperty('--video-codec-panel-height', `${video_codec_panel_height}px`);
+        const video_codec_button = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-video-codec',
+        )!;
+        const video_codec_value = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-video-codec-value',
+        )!;
+        const video_codec_items = Array.from(this.player.container.querySelectorAll<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-video-codec-item',
+        ));
+        setting_box.style.setProperty('--konomitv-bs4k-video-codec-panel-height', `${video_codec_panel_height}px`);
         const update_video_codec_display = () => {
-            const selected_codec = settings_store.settings[get_video_codec_setting_key()];
+            const selected_codec = get_requested_video_codec();
             video_codec_value.textContent = selected_codec.toUpperCase();
             video_codec_items.forEach((item) => {
-                const check = item.querySelector<HTMLElement>('.dplayer-setting-video-codec-check');
+                const check = item.querySelector<HTMLElement>(
+                    '.dplayer-konomitv-bs4k-setting-video-codec-check',
+                );
                 if (check !== null) check.style.visibility = item.dataset.codec === selected_codec ? 'visible' : 'hidden';
             });
         };
         update_video_codec_display();
-        video_codec_button.addEventListener('click', () => {
+        register_codec_panel_activation_handler(video_codec_button, (event) => {
+            consume_codec_panel_event(event);
             update_video_codec_display();
             // DPlayer が計測した元パネル用の inline clip-path は上書きせず、
             // サブパネル表示中だけ専用クラスで切り替える。
             open_codec_panel('video-codec');
         });
-        this.player.container.querySelector('.dplayer-setting-video-codec-header')!.addEventListener('click', close_codec_panel);
+        const video_codec_header = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-video-codec-header',
+        )!;
+        register_codec_panel_activation_handler(video_codec_header, (event) => {
+            consume_codec_panel_event(event);
+            close_codec_panel();
+        });
         video_codec_items.forEach((item) => {
-            item.addEventListener('click', () => {
-                const codec = item.dataset.codec as RecordedStreamingVideoCodec;
-                const setting_key = get_video_codec_setting_key();
-                if (codec === 'vp9' || codec === 'av1') {
-                    const recorded_setting_key = setting_key as
-                        'video_encoding_codec' | 'video_encoding_codec_cellular' |
-                        'bs4k_video_encoding_codec' | 'bs4k_video_encoding_codec_cellular';
-                    settings_store.settings[recorded_setting_key] = codec;
-                } else {
-                    settings_store.settings[setting_key] = codec;
-                }
+            register_codec_panel_activation_handler(item, async (event) => {
+                consume_codec_panel_event(event);
+                const codec = item.dataset.codec as KonomiTVBS4KPlaybackVideoCodec;
+                if (await prepare_codec_override(codec, get_requested_audio_codec()) === false) return;
                 update_video_codec_display();
                 close_codec_panel();
                 // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
@@ -3320,49 +3480,55 @@ class PlayerController {
             });
         });
 
-        // 録画再生時のみ、音声コーデックも映像コーデックと同じ回線プロファイル単位で選択できるようにする。
-        // Opus 非対応ブラウザでは項目を残して理由を示すが、クリックは受け付けない。
-        let update_audio_codec_display: () => void = () => {};
-        if (this.playback_mode === 'Video') {
-            const audio_codec_button = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-codec')!;
-            const audio_codec_value = this.player.container.querySelector<HTMLElement>('.dplayer-setting-audio-codec-value')!;
-            const audio_codec_items = Array.from(
-                this.player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-codec-item'),
-            );
-            setting_box.style.setProperty('--audio-codec-panel-height', `${audio_codec_panel_height}px`);
-            update_audio_codec_display = () => {
-                const selected_codec = settings_store.settings[get_audio_codec_setting_key()];
-                audio_codec_value.textContent = audio_codec_labels[selected_codec];
-                audio_codec_items.forEach((item) => {
-                    const check = item.querySelector<HTMLElement>('.dplayer-setting-audio-codec-check');
-                    if (check !== null) check.style.visibility = item.dataset.codec === selected_codec ? 'visible' : 'hidden';
-                });
-            };
-            update_audio_codec_display();
-            audio_codec_button.addEventListener('click', () => {
-                update_audio_codec_display();
-                open_codec_panel('audio-codec');
-            });
-            this.player.container.querySelector('.dplayer-setting-audio-codec-header')!
-                .addEventListener('click', close_codec_panel);
+        const audio_codec_button = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-audio-codec',
+        )!;
+        const audio_codec_value = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-audio-codec-value',
+        )!;
+        const audio_codec_items = Array.from(
+            this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-item'),
+        );
+        setting_box.style.setProperty('--konomitv-bs4k-audio-codec-panel-height', `${audio_codec_panel_height}px`);
+        const update_audio_codec_display = () => {
+            const selected_codec = get_requested_audio_codec();
+            audio_codec_value.textContent = audio_codec_labels[selected_codec];
             audio_codec_items.forEach((item) => {
-                item.addEventListener('click', () => {
-                    if (item.classList.contains('dplayer-setting-audio-codec-item--disabled')) return;
-                    const codec = item.dataset.codec as RecordedStreamingAudioCodec;
-                    settings_store.settings[get_audio_codec_setting_key()] = codec;
-
-                    update_audio_codec_display();
-                    close_codec_panel();
-                    this.player?.setting.hide();
-                    player_store.event_emitter.emit('PlayerRestartRequired', {
-                        message: `音声コーデックを ${audio_codec_labels[codec]} に変更しました。`,
-                        message_delay_seconds: 2,
-                        is_error_message: false,
-                        should_resume_quality: true,
-                    });
+                const check = item.querySelector<HTMLElement>(
+                    '.dplayer-konomitv-bs4k-setting-audio-codec-check',
+                );
+                if (check !== null) check.style.visibility = item.dataset.codec === selected_codec ? 'visible' : 'hidden';
+            });
+        };
+        update_audio_codec_display();
+        register_codec_panel_activation_handler(audio_codec_button, (event) => {
+            consume_codec_panel_event(event);
+            update_audio_codec_display();
+            open_codec_panel('audio-codec');
+        });
+        const audio_codec_header = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-audio-codec-header',
+        )!;
+        register_codec_panel_activation_handler(audio_codec_header, (event) => {
+            consume_codec_panel_event(event);
+            close_codec_panel();
+        });
+        audio_codec_items.forEach((item) => {
+            register_codec_panel_activation_handler(item, async (event) => {
+                consume_codec_panel_event(event);
+                const codec = item.dataset.codec as KonomiTVBS4KPlaybackAudioCodec;
+                if (await prepare_codec_override(get_requested_video_codec(), codec) === false) return;
+                update_audio_codec_display();
+                close_codec_panel();
+                this.player?.setting.hide();
+                player_store.event_emitter.emit('PlayerRestartRequired', {
+                    message: `音声コーデックを ${audio_codec_labels[codec]} に変更しました。`,
+                    message_delay_seconds: 2,
+                    is_error_message: false,
+                    should_resume_quality: true,
                 });
             });
-        }
+        });
 
         // 録画再生時のみ、CM 自動スキップの有効状態を端末ローカル設定へ保存する
         // CM 区間が未解析・0件でも、今後再生する録画へ向けて常に切り替えられるようにする
@@ -3387,6 +3553,8 @@ class PlayerController {
         toggle_mobile_profile_button.addEventListener('click', () => {
             // チェックボックスの状態を切り替える
             toggle_mobile_profile_input.checked = !toggle_mobile_profile_input.checked;
+            // 回線プロファイルが変わった場合は、同じ一時希望値で切り替え先の能力を改めて評価する。
+            player_store.konomitv_bs4k_effective_playback_profile = null;
             // 画質プロファイルをモバイル回線向けに切り替えてから、プレイヤーを再起動
             if (toggle_mobile_profile_input.checked) {
                 this.quality_profile_type = 'Cellular';
@@ -3777,6 +3945,8 @@ class PlayerController {
             return;
         }
         this.destroying = true;
+        // この後の非同期cleanup中に古いpreflightが完了しても、Store/DOMを書き戻せない。
+        this.initialization_generation += 1;
 
         // 視聴履歴の最終位置を更新
         // 現在の再生位置を取得するため、プレイヤーの破棄前に実行する必要がある

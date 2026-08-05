@@ -23,10 +23,6 @@ interface ILiveStreamStatusEvent {
 }
 
 type LiveStreamStatus = ILiveStreamStatusEvent['status'];
-type KonomiTVBS4KPlaybackPipelineErrorHandler = (
-    status: LiveStreamStatus,
-    detail: string,
-) => boolean;
 
 
 /**
@@ -40,10 +36,6 @@ class LiveEventManager implements PlayerManager {
     // DPlayer のインスタンス
     // 設計上コンストラクタ以降で変更すべきでないため readonly にしている
     private readonly player: DPlayer;
-
-    // 高度codec固有のサーバー側失敗を、PlayerControllerの一度限りfallbackへ渡すコールバック
-    private readonly konomitv_bs4k_playback_pipeline_error_handler:
-    KonomiTVBS4KPlaybackPipelineErrorHandler;
 
     // EventSource のインスタンス
     private eventsource: EventSource | null = null;
@@ -60,14 +52,8 @@ class LiveEventManager implements PlayerManager {
      * コンストラクタ
      * @param player DPlayer のインスタンス
      */
-    constructor(
-        player: DPlayer,
-        konomitv_bs4k_playback_pipeline_error_handler:
-        KonomiTVBS4KPlaybackPipelineErrorHandler = () => false,
-    ) {
+    constructor(player: DPlayer) {
         this.player = player;
-        this.konomitv_bs4k_playback_pipeline_error_handler =
-            konomitv_bs4k_playback_pipeline_error_handler;
     }
 
 
@@ -121,14 +107,6 @@ class LiveEventManager implements PlayerManager {
             // ライブストリームのステータスを設定
             player_store.live_stream_status = event.status;
 
-            // 初回接続時点ですでにcodec固有のOfflineなら、通常のOffline表示より先に互換profileへ移る。
-            if (
-                this.konomitv_bs4k_playback_pipeline_error_handler(
-                    event.status,
-                    event.detail,
-                ) === true
-            ) return;
-
             // ステータスごとに処理を振り分け
             switch (event.status) {
 
@@ -159,15 +137,6 @@ class LiveEventManager implements PlayerManager {
 
             // 視聴者数を更新
             channels_store.viewer_count = event.client_count;
-
-            // Bridge・高度codec固有の失敗だけは、同じ高度profileの再起動を繰り返さず互換profileへ移る。
-            // チューナー・回線・放送休止の一般障害はコールバック側でfalseとなり、従来処理をそのまま続ける。
-            if (
-                this.konomitv_bs4k_playback_pipeline_error_handler(
-                    event.status,
-                    event.detail,
-                ) === true
-            ) return;
 
             // ステータスごとに処理を振り分け
             switch (event.status) {

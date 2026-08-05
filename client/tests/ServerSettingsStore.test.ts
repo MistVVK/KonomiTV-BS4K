@@ -5,6 +5,7 @@ import { createDeferred } from './helpers/deferred';
 
 import Settings, { type IServerSettings, IServerSettingsDefault } from '@/services/Settings';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
+import useSettingsStore from '@/stores/SettingsStore';
 
 
 describe('ServerSettingsStore lifecycle', () => {
@@ -105,5 +106,42 @@ describe('ServerSettingsStore lifecycle', () => {
                 upload_folders: ['/mnt/TV-Capture'],
             },
         }));
+    });
+
+
+    it('BS4K通常バッファ強制設定を取得しても両回線の低遅延希望値を保持する', async () => {
+        const local_settings = useSettingsStore();
+        local_settings.settings.tv_low_latency_mode_for_bs4k = true;
+        local_settings.settings.tv_low_latency_mode_for_bs4k_cellular = true;
+        const settings = structuredClone(IServerSettingsDefault);
+        settings.general.bs4k_ignore_viewer_low_latency = true;
+        vi.spyOn(Settings, 'fetchServerSettings').mockResolvedValue(settings);
+
+        await useServerSettingsStore().fetchServerSettingsOnce();
+
+        expect(local_settings.settings.tv_low_latency_mode_for_bs4k).toBe(true);
+        expect(local_settings.settings.tv_low_latency_mode_for_bs4k_cellular).toBe(true);
+    });
+
+
+    it('BS4K通常バッファ強制設定の保存成否にかかわらず低遅延希望値を保持する', async () => {
+        const local_settings = useSettingsStore();
+        local_settings.settings.tv_low_latency_mode_for_bs4k = true;
+        local_settings.settings.tv_low_latency_mode_for_bs4k_cellular = true;
+        const settings = structuredClone(IServerSettingsDefault);
+        settings.general.bs4k_ignore_viewer_low_latency = true;
+        const update = vi.spyOn(Settings, 'updateServerSettings')
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(true);
+        const store = useServerSettingsStore();
+
+        expect(await store.updateServerSettings(settings)).toBe(false);
+        expect(local_settings.settings.tv_low_latency_mode_for_bs4k).toBe(true);
+        expect(local_settings.settings.tv_low_latency_mode_for_bs4k_cellular).toBe(true);
+
+        expect(await store.updateServerSettings(settings)).toBe(true);
+        expect(local_settings.settings.tv_low_latency_mode_for_bs4k).toBe(true);
+        expect(local_settings.settings.tv_low_latency_mode_for_bs4k_cellular).toBe(true);
+        expect(update).toHaveBeenCalledTimes(2);
     });
 });

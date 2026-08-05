@@ -35,6 +35,16 @@ export type KonomiTVBS4KPlaybackAudioCodecSettingKey =
     'konomitv_bs4k_playback_audio_codec_cellular' |
     'konomitv_bs4k_playback_audio_codec_for_bs4k' |
     'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular';
+export type KonomiTVBS4KPlaybackStreamingQualitySettingKey =
+    'konomitv_bs4k_playback_streaming_quality' |
+    'konomitv_bs4k_playback_streaming_quality_cellular' |
+    'konomitv_bs4k_playback_streaming_quality_for_bs4k' |
+    'konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular';
+export type KonomiTVBS4KPlayback24FPSModeSettingKey =
+    'konomitv_bs4k_playback_24fps_mode' |
+    'konomitv_bs4k_playback_24fps_mode_cellular' |
+    'konomitv_bs4k_playback_24fps_mode_for_bs4k' |
+    'konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular';
 // 以下3型は旧キー・既存importを最低1リリース維持するための互換型。
 export type StreamingVideoCodec = 'avc' | 'hevc';
 export type RecordedStreamingVideoCodec = KonomiTVBS4KPlaybackVideoCodec;
@@ -70,6 +80,36 @@ export function getKonomiTVBS4KPlaybackAudioCodecSettingKey(
     return is_konomitv_bs4k_cellular === true ?
         'konomitv_bs4k_playback_audio_codec_cellular' :
         'konomitv_bs4k_playback_audio_codec';
+}
+
+/** 通常 / BS4K と回線種別に対応する共通画質設定キーを返す。 */
+export function getKonomiTVBS4KPlaybackStreamingQualitySettingKey(
+    is_konomitv_bs4k: boolean,
+    is_konomitv_bs4k_cellular: boolean,
+): KonomiTVBS4KPlaybackStreamingQualitySettingKey {
+    if (is_konomitv_bs4k === true) {
+        return is_konomitv_bs4k_cellular === true ?
+            'konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular' :
+            'konomitv_bs4k_playback_streaming_quality_for_bs4k';
+    }
+    return is_konomitv_bs4k_cellular === true ?
+        'konomitv_bs4k_playback_streaming_quality_cellular' :
+        'konomitv_bs4k_playback_streaming_quality';
+}
+
+/** 通常 / BS4K と回線種別に対応する共通24fps設定キーを返す。 */
+export function getKonomiTVBS4KPlayback24FPSModeSettingKey(
+    is_konomitv_bs4k: boolean,
+    is_konomitv_bs4k_cellular: boolean,
+): KonomiTVBS4KPlayback24FPSModeSettingKey {
+    if (is_konomitv_bs4k === true) {
+        return is_konomitv_bs4k_cellular === true ?
+            'konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular' :
+            'konomitv_bs4k_playback_24fps_mode_for_bs4k';
+    }
+    return is_konomitv_bs4k_cellular === true ?
+        'konomitv_bs4k_playback_24fps_mode_cellular' :
+        'konomitv_bs4k_playback_24fps_mode';
 }
 
 // 番組表関連の型定義
@@ -384,22 +424,22 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     konomitv_bs4k_playback_streaming_quality_for_bs4k: '1080p-60fps',
     // BS4K の共通再生画質 (モバイル回線時) (Default: 540p-30fps) (同期無効)
     konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular: '540p-30fps',
-    // 通常放送の共通映像コーデック (Wi-Fi 回線時) (Default: AVC) (同期無効)
-    konomitv_bs4k_playback_video_codec: 'avc',
-    // 通常放送の共通映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
-    konomitv_bs4k_playback_video_codec_cellular: 'hevc',
-    // BS4K の共通映像コーデック (Wi-Fi 回線時) (Default: HEVC) (同期無効)
-    konomitv_bs4k_playback_video_codec_for_bs4k: 'hevc',
-    // BS4K の共通映像コーデック (モバイル回線時) (Default: HEVC) (同期無効)
-    konomitv_bs4k_playback_video_codec_for_bs4k_cellular: 'hevc',
-    // 通常放送の共通音声コーデック (Wi-Fi 回線時) (Default: AAC) (同期無効)
-    konomitv_bs4k_playback_audio_codec: 'aac',
-    // 通常放送の共通音声コーデック (モバイル回線時) (Default: AAC) (同期無効)
-    konomitv_bs4k_playback_audio_codec_cellular: 'aac',
-    // BS4K の共通音声コーデック (Wi-Fi 回線時) (Default: AAC) (同期無効)
-    konomitv_bs4k_playback_audio_codec_for_bs4k: 'aac',
-    // BS4K の共通音声コーデック (モバイル回線時) (Default: AAC) (同期無効)
-    konomitv_bs4k_playback_audio_codec_for_bs4k_cellular: 'aac',
+    // 通常放送の共通映像コーデック (Wi-Fi 回線時) (Default: AV1) (同期無効)
+    konomitv_bs4k_playback_video_codec: 'av1',
+    // 通常放送の共通映像コーデック (モバイル回線時) (Default: AV1) (同期無効)
+    konomitv_bs4k_playback_video_codec_cellular: 'av1',
+    // BS4K の共通映像コーデック (Wi-Fi 回線時) (Default: AV1) (同期無効)
+    konomitv_bs4k_playback_video_codec_for_bs4k: 'av1',
+    // BS4K の共通映像コーデック (モバイル回線時) (Default: AV1) (同期無効)
+    konomitv_bs4k_playback_video_codec_for_bs4k_cellular: 'av1',
+    // 通常放送の共通音声コーデック (Wi-Fi 回線時) (Default: Opus) (同期無効)
+    konomitv_bs4k_playback_audio_codec: 'opus',
+    // 通常放送の共通音声コーデック (モバイル回線時) (Default: Opus) (同期無効)
+    konomitv_bs4k_playback_audio_codec_cellular: 'opus',
+    // BS4K の共通音声コーデック (Wi-Fi 回線時) (Default: Opus) (同期無効)
+    konomitv_bs4k_playback_audio_codec_for_bs4k: 'opus',
+    // BS4K の共通音声コーデック (モバイル回線時) (Default: Opus) (同期無効)
+    konomitv_bs4k_playback_audio_codec_for_bs4k_cellular: 'opus',
     // 通常放送の共通 24fps モード (Wi-Fi 回線時) (Default: オフ) (同期無効)
     konomitv_bs4k_playback_24fps_mode: false,
     // 通常放送の共通 24fps モード (モバイル回線時) (Default: オフ) (同期無効)

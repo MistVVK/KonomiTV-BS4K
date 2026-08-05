@@ -21,7 +21,6 @@ const useServerSettingsStore = defineStore('serverSettings', () => {
     // 進行中の取得 Promise を保持
     let fetch_promise: Promise<IServerSettings | null> | null = null;
 
-
     /**
      * サーバー設定を一度だけ取得する
      * @param signal 呼び出し元のライフサイクル終了時にストア更新を中断する AbortSignal

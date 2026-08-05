@@ -5,7 +5,10 @@ import { defineStore } from 'pinia';
 import { ITweetCapture } from '@/components/Watch/Panel/Twitter.vue';
 import { ICommentData } from '@/services/player/managers/LiveCommentManager';
 import { IRecordedProgram, IRecordedProgramDefault } from '@/services/Videos';
-import useSettingsStore from '@/stores/SettingsStore';
+import useSettingsStore, {
+    type KonomiTVBS4KPlaybackAudioCodec,
+    type KonomiTVBS4KPlaybackVideoCodec,
+} from '@/stores/SettingsStore';
 
 
 /**
@@ -147,6 +150,25 @@ const usePlayerStore = defineStore('player', {
         // null の間は回線種別から選び、チャンネル切り替えなどでプレイヤーを作り直すときは手動選択を引き継ぐ
         selected_quality_profile_type: null as 'Wi-Fi' | 'Cellular' | null,
 
+        // 視聴画面の設定パネルで選んだ一時 codec 設定。
+        // SettingsStore へは書き込まず、同じ視聴画面内のチャンネル・録画切替と再起動だけで引き継ぐ。
+        konomitv_bs4k_playback_codec_override: null as {
+            video_codec: KonomiTVBS4KPlaybackVideoCodec;
+            audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+        } | null,
+
+        // 再生開始前の能力検査で確定した実効 tuple。
+        // 同じ対象の再起動・画質切替では再利用し、再生開始後のエラーで codec を変更しない。
+        konomitv_bs4k_effective_playback_profile: null as {
+            target_key: string;
+            encoder: 'FFmpeg' | 'QSV' | 'NVENC' | 'AMF';
+            requested_video_codec: KonomiTVBS4KPlaybackVideoCodec;
+            requested_audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+            video_codec: KonomiTVBS4KPlaybackVideoCodec;
+            video_bit_depth: 8 | 10;
+            audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+        } | null,
+
         // プレイヤーのローディング状態
         // 既定でローディングとする
         is_loading: true,
@@ -253,6 +275,8 @@ const usePlayerStore = defineStore('player', {
             this.is_zapping = false;
             this.is_player_setting_panel_open = false;
             this.selected_quality_profile_type = null;
+            this.konomitv_bs4k_playback_codec_override = null;
+            this.konomitv_bs4k_effective_playback_profile = null;
             this.is_loading = true;
             this.is_video_buffering = true;
             this.is_video_paused = false;
