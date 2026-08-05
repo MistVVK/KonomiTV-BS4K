@@ -372,7 +372,7 @@ _shutdown_task: asyncio.Task[None] | None = None
 
 async def _RunShutdownCleanup() -> None:
     """
-    アプリ終了時に共有 source と Prepare lease をすべて解放する。
+    アプリ終了時にライブストリームとバックグラウンド資源をすべて停止する。
 
     Args:
         None

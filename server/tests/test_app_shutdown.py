@@ -138,49 +138,41 @@ def test_shutdown_retries_cancelled_task_from_closed_event_loop(
     assert cleanup_calls == 2
 
 
-def test_run_shutdown_cleanup_reports_unconfirmed_source_after_remaining_steps(
+def test_run_shutdown_cleanup_reports_failure_after_remaining_steps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """source停止未確認を成功扱いせず、後続cleanupをすべて試行してから失敗を送出する。"""
+    """一工程が失敗しても現存する後続cleanupをすべて試行してから失敗を送出する。"""
 
     completed_steps: list[str] = []
 
-    async def SourceShutdown() -> bool:
-        completed_steps.append('source')
-        return False
+    async def FailSeriesStop(_cls: object) -> None:
+        completed_steps.append('series-stop')
+        raise RuntimeError('test series stop failure')
 
-    async def DrainFinalizeTasks() -> bool:
-        completed_steps.append('prepare-drain')
-        return True
+    async def StopEpisode(_cls: object) -> None:
+        completed_steps.append('episode-stop')
 
-    async def ReleaseAll(*, reason: str) -> int:
-        assert reason == 'shutdown'
-        completed_steps.append('prepare-release')
-        return 0
+    async def StopCMAnalysis(_cls: object) -> None:
+        completed_steps.append('cm-stop')
 
-    async def StopStep(_cls: object) -> None:
-        completed_steps.append('metadata-stop')
+    async def StopPlaybackIndexer(_cls: object) -> None:
+        completed_steps.append('indexer-stop')
 
     async def CloseAll(_cls: object) -> None:
         completed_steps.append('edcb-close')
 
     monkeypatch.setattr(app_module.LiveStream, 'getAllLiveStreams', staticmethod(lambda: []))
-    monkeypatch.setattr(app_module.LIVE_SOURCE_COORDINATOR, 'shutdown', SourceShutdown)
-    monkeypatch.setattr(
-        app_module.LIVE_PREPARE_COORDINATOR,
-        'drainFinalizeTasks',
-        DrainFinalizeTasks,
-    )
-    monkeypatch.setattr(app_module.LIVE_PREPARE_COORDINATOR, 'releaseAll', ReleaseAll)
     monkeypatch.setattr(app_module, 'recorded_scan_task', None)
     monkeypatch.setattr(app_module.EDCBTuner, 'closeAll', classmethod(CloseAll))
-    monkeypatch.setattr(app_module.RecordedSeriesResolver, 'stop', classmethod(StopStep))
-    monkeypatch.setattr(app_module.RecordedEpisodeAutomation, 'stop', classmethod(StopStep))
-    monkeypatch.setattr(app_module.CMAnalysisTaskManager, 'stop', classmethod(StopStep))
-    monkeypatch.setattr(app_module.RecordedPlaybackIndexer, 'stop', classmethod(StopStep))
+    monkeypatch.setattr(app_module.RecordedSeriesResolver, 'stop', classmethod(FailSeriesStop))
+    monkeypatch.setattr(app_module.RecordedEpisodeAutomation, 'stop', classmethod(StopEpisode))
+    monkeypatch.setattr(app_module.CMAnalysisTaskManager, 'stop', classmethod(StopCMAnalysis))
+    monkeypatch.setattr(app_module.RecordedPlaybackIndexer, 'stop', classmethod(StopPlaybackIndexer))
 
     with pytest.raises(RuntimeError, match='shutdown_cleanup_failed'):
         asyncio.run(app_module._RunShutdownCleanup())
 
-    assert completed_steps[:3] == ['source', 'prepare-drain', 'prepare-release']
-    assert completed_steps.count('metadata-stop') == 4
+    expected_steps = ['series-stop', 'episode-stop', 'cm-stop', 'indexer-stop']
+    if app_module.CONFIG.general.live_stream_backend == 'EDCB':
+        expected_steps.insert(0, 'edcb-close')
+    assert completed_steps == expected_steps
