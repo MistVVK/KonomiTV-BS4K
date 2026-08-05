@@ -30,7 +30,7 @@ export interface ILivePSIArchivedDataDecoder {
 }
 
 export interface ILivePSIArchivedDataDecoderConstructor {
-    new (channel: ILiveChannel, api_quality: string): ILivePSIArchivedDataDecoder;
+    new (channel: ILiveChannel, psi_archived_data_api_url: string): ILivePSIArchivedDataDecoder;
 }
 
 
@@ -43,8 +43,8 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
     // 対象のチャンネル情報
     private readonly channel: ILiveChannel;
 
-    // 現在視聴中の API 上の画質 ID (ex: 1080p-60fps)
-    private readonly api_quality: string;
+    // 再生中の MPEG-TS と同じ画質・codec tuple を持つ PSI/SI API URL
+    private readonly psi_archived_data_api_url: string;
 
     // PSI/SI アーカイブデータの読み込みに必要な情報
     private psi_archived_data: Uint8Array = new Uint8Array(0);
@@ -56,11 +56,11 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
      * コンストラクタ
      * ここで渡すチャンネル情報はメインスレッドから渡された後は当然更新されないが、実際に利用するのは不変のチャンネル ID 系のみなので問題ない
      * @param channel 対象のチャンネル情報
-     * @param api_quality 現在視聴中の API 上の画質 ID (ex: 1080p-60fps)
+     * @param psi_archived_data_api_url 再生中の MPEG-TS と同じ画質・codec tuple を持つ API URL
      */
-    constructor(channel: ILiveChannel, api_quality: string) {
+    constructor(channel: ILiveChannel, psi_archived_data_api_url: string) {
         this.channel = channel;
-        this.api_quality = api_quality;
+        this.psi_archived_data_api_url = psi_archived_data_api_url;
     }
 
 
@@ -110,12 +110,10 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
         });
 
         // ライブ PSI/SI アーカイブデータストリーミング API の URL を作成
-        const psi_archived_data_api_url = `${Utils.api_base_url}/streams/live/${this.channel.display_channel_id}/${this.api_quality}/psi-archived-data`;
-
         // ライブ PSI/SI アーカイブデータストリーミング API にリクエスト
         // 以降の処理はエンドレスなので非同期で実行
         this.psi_archived_data_api_abort_controller = new AbortController();
-        fetch(psi_archived_data_api_url, {signal: this.psi_archived_data_api_abort_controller.signal}).then(async (response) => {
+        fetch(this.psi_archived_data_api_url, {signal: this.psi_archived_data_api_abort_controller.signal}).then(async (response) => {
 
             // ReadableStreamDefaultReader を取得
             const reader = response.body?.getReader();

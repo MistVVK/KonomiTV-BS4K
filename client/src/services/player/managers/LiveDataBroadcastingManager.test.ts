@@ -90,6 +90,8 @@ vi.mock('@/utils', async (import_original) => {
             ...original.PlayerUtils,
             extractLiveAPIQualityFromDPlayer: () => '1080p',
             extractKonomiTVBS4KLivePlaybackCodecQueryFromDPlayer: () => '?video_codec=hevc',
+            buildKonomiTVBS4KLiveAPIEndpointURLFromDPlayer: () =>
+                '/api/streams/live/gr011/1080p/psi-archived-data?video_codec=hevc',
         },
     };
 });
