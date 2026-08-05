@@ -29,6 +29,8 @@ export type PlayerEvents = {
         should_resume_quality?: boolean;  // 再起動後に直前の画質を引き継ぐかどうか (既定は true)
         // KonomiTV-BS4K の画質能力 guard が、切替開始前の対応画質を明示的に復元する場合だけ指定する
         konomitv_bs4k_resume_quality?: string;
+        // デコーダー・SourceBuffer の codec pipeline 失敗から自動復旧するときだけ指定する
+        konomitv_bs4k_restart_reason?: 'RuntimeCodecPipelineError';
     };
     // PlayerController.setControlDisplayTimer() をそのまま呼び出す
     SetControlDisplayTimer: {

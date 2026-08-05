@@ -10,6 +10,7 @@ import { watch } from 'vue';
 import APIClient from '@/services/APIClient';
 import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
+import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
 import CaptureManager from '@/services/player/managers/CaptureManager';
 import DocumentPiPManager from '@/services/player/managers/DocumentPiPManager';
 import KeyboardShortcutManager from '@/services/player/managers/KeyboardShortcutManager';
@@ -106,13 +107,17 @@ class PlayerController {
     // シークやHLS再読み込みでhls.jsがTrack 1へ初期化しても、選択中の録画音声を復元するための安定キー
     private recorded_selected_audio_track_name: string | null = null;
 
-    // この PlayerController 内で Opus の実再生に失敗した場合、この再生だけ AAC へフォールバックする
-    // 保存設定は書き換えず、ユーザーがプレイヤーから明示的に選び直した場合だけ再試行する
-    private force_recorded_aac_audio_codec = false;
-
     // 現在の録画HLSセッションに要求した実効音声コーデック
-    // HTMLMediaElement の実再生エラー時に Opus 固有の一度限りのフォールバックを判断するために保持する
+    // SourceBuffer の codec pipeline エラーを、同一 tuple の短時間再起動として識別するために保持する
     private recorded_audio_codec_for_current_playback: RecordedStreamingAudioCodec = 'aac';
+
+    // 現在の再生で利用する実効映像コーデックと bit depth
+    // PlayerController.init() をまたいで同じ codec tuple の再起動が繰り返されたか判定するために保持する
+    private konomitv_bs4k_video_codec_for_current_playback: RecordedStreamingVideoCodec = 'avc';
+    private konomitv_bs4k_video_bit_depth_for_current_playback: 8 | 10 = 8;
+
+    // 同一再生対象・同一 codec tuple の短時間再起動ループを、init() をまたいで検出する
+    private readonly konomitv_bs4k_playback_restart_guard = new KonomiTVBS4KPlaybackRestartGuard();
 
     // fMP4 録画のARIB字幕先読みハンドラーを解除する関数
     private recorded_arib_subtitle_cancel: (() => void) | null = null;
@@ -319,6 +324,24 @@ class PlayerController {
         return this.quality_profile.tv_low_latency_mode;
     }
 
+
+    /** 現在の再生対象と実効 codec pipeline を、短時間再起動ループの判定キーにする。 */
+    private getKonomiTVBS4KPlaybackRestartKey(): string {
+        const channels_store = useChannelsStore();
+        const player_store = usePlayerStore();
+        const playback_target_id = this.playback_mode === 'Live' ?
+            channels_store.channel.current.display_channel_id :
+            player_store.recorded_program.id.toString();
+        return [
+            this.playback_mode,
+            playback_target_id,
+            this.quality_profile_type,
+            this.konomitv_bs4k_video_codec_for_current_playback,
+            this.konomitv_bs4k_video_bit_depth_for_current_playback,
+            this.recorded_audio_codec_for_current_playback,
+        ].join(':');
+    }
+
     /**
      * DPlayer と PlayerManager を初期化し、再生準備を行う
      */
@@ -412,15 +435,14 @@ class PlayerController {
             recorded_video_codec === 'hevc';
 
         // 録画HLSの音声コーデックも、通常 / BS4K と現在の回線プロファイルに対応する設定から決める。
-        // Opus が MSE / ManagedMediaSource で利用できない場合や、直前の実再生で失敗した場合は、
-        // 保存設定を書き換えずにこの PlayerController の再生だけ AAC へフォールバックする。
+        // Opus が MSE / ManagedMediaSource で利用できない場合だけ、再生開始前に AAC へフォールバックする。
         const selected_recorded_audio_codec: RecordedStreamingAudioCodec = this.playback_mode === 'Video' ?
             (is_bs4k_stream ? this.quality_profile.bs4k_video_audio_encoding_codec : this.quality_profile.video_audio_encoding_codec) :
             'aac';
         const is_recorded_opus_audio_supported = Videos.isOpusAudioSupported();
         const recorded_audio_codec: RecordedStreamingAudioCodec = (
             selected_recorded_audio_codec === 'opus' &&
-            (is_recorded_opus_audio_supported === false || this.force_recorded_aac_audio_codec === true)
+            is_recorded_opus_audio_supported === false
         ) ? 'aac' : selected_recorded_audio_codec;
         this.recorded_audio_codec_for_current_playback = recorded_audio_codec;
 
@@ -444,6 +466,12 @@ class PlayerController {
             is_bs4k_playback_for_hevc_10bit === false &&
             await PlayerUtils.isHEVC10bitVideoSupported()
         );
+
+        // 自動再起動上限は実際に DPlayer へ渡す codec tuple 単位で判定する。
+        this.konomitv_bs4k_video_codec_for_current_playback = this.playback_mode === 'Live' ?
+            selected_video_codec as RecordedStreamingVideoCodec : recorded_video_codec;
+        this.konomitv_bs4k_video_bit_depth_for_current_playback = this.playback_mode === 'Live' ?
+            (is_hevc_10bit_playback === true ? 10 : 8) : recorded_video_bit_depth;
 
         // ブラウザが MSE in Worker での H.265 / HEVC 再生に対応しているかどうか
         const is_hevc_video_supported_in_worker = await mpegts.supportWorkerForMSEH265Playback();
@@ -1424,6 +1452,27 @@ class PlayerController {
                 console.warn('\u001b[31m[PlayerController] PlayerRestartRequired event received, but already restarting. Ignored.');
                 return;
             }
+
+            // codec pipeline の実行時失敗だけは、同一再生対象・同一 codec tuple で最初の1回だけ自動再起動する。
+            // MEDIA_ERR_DECODE や SourceBuffer エラーだけでは codec 非対応と断定できないため、設定は自動変更しない。
+            if (
+                event.konomitv_bs4k_restart_reason === 'RuntimeCodecPipelineError' &&
+                this.konomitv_bs4k_playback_restart_guard.requestAutomaticRestart(
+                    this.getKonomiTVBS4KPlaybackRestartKey(),
+                ) === false
+            ) {
+                console.error('[PlayerController] Repeated runtime codec pipeline error. Automatic restart stopped.');
+                this.player.video.pause();
+                player_store.is_loading = false;
+                player_store.is_video_buffering = false;
+                this.player.notice(
+                    '同じコーデック構成で再生エラーが繰り返されました。プレイヤーの設定から映像・音声コーデックを変更してください。',
+                    -1,
+                    undefined,
+                    'rgb(var(--v-theme-error-readable))',
+                );
+                return;
+            }
             is_player_restarting = true;
 
             // 現在の再生画質・再生速度・再生位置を取得
@@ -1885,10 +1934,13 @@ class PlayerController {
                     // すぐ再起動すると問題があるケースがあるので、少し待機する
                     await Utils.sleep(1);
 
-                    if (this.player.video.error) {
-                        console.error('\u001b[31m[PlayerController] HTMLVideoElement error event:', this.player.video.error);
+                    const media_error = this.player.video.error;
+                    if (media_error) {
+                        console.error('\u001b[31m[PlayerController] HTMLVideoElement error event:', media_error);
                         player_store.event_emitter.emit('PlayerRestartRequired', {
-                            message: `再生中にエラーが発生しました。(Native: ${this.player.video.error.code}: ${this.player.video.error.message}) プレイヤーを再起動しています…`,
+                            message: `再生中にエラーが発生しました。(Native: ${media_error.code}: ${media_error.message}) プレイヤーを再起動しています…`,
+                            konomitv_bs4k_restart_reason: media_error.code === media_error.MEDIA_ERR_DECODE ?
+                                'RuntimeCodecPipelineError' : undefined,
                         });
                     } else {
                         // MediaError オブジェクトは場合によっては存在しないことがあるらしい…
@@ -2131,19 +2183,14 @@ class PlayerController {
                         return;
                     }
 
-                    // ネットワークエラーや映像側の失敗では音声設定を変えない。
-                    // HTMLMediaElement がデコード失敗を報告した場合だけ、Opus 固有の一度限りのフォールバックを試す。
+                    // ライブ視聴時とは異なり、録画なので待たなくても再起動できる。
                     const media_error = this.player.video.error;
-                    if (
-                        media_error?.code === media_error?.MEDIA_ERR_DECODE &&
-                        this.requestRecordedOpusFallback() === true
-                    ) return;
-
-                    // ライブ視聴時とは異なり、録画なので待たなくても再起動できる
-                    if (this.player.video.error) {
-                        console.error('\u001b[31m[PlayerController] HTMLVideoElement error event:', this.player.video.error);
+                    if (media_error) {
+                        console.error('\u001b[31m[PlayerController] HTMLVideoElement error event:', media_error);
                         player_store.event_emitter.emit('PlayerRestartRequired', {
-                            message: `再生中にエラーが発生しました。(Native: ${this.player.video.error.code}: ${this.player.video.error.message}) プレイヤーを再起動しています…`,
+                            message: `再生中にエラーが発生しました。(Native: ${media_error.code}: ${media_error.message}) プレイヤーを再起動しています…`,
+                            konomitv_bs4k_restart_reason: media_error.code === media_error.MEDIA_ERR_DECODE ?
+                                'RuntimeCodecPipelineError' : undefined,
                         });
                     } else {
                         // MediaError オブジェクトは場合によっては存在しないことがあるらしい…
@@ -2633,31 +2680,6 @@ class PlayerController {
         }, 1000);
     }
 
-
-    /** Opus の実再生失敗時、この PlayerController の再生だけ一度限りで AAC へ切り替える。 */
-    private requestRecordedOpusFallback(): boolean {
-
-        if (
-            this.playback_mode !== 'Video' ||
-            this.recorded_audio_codec_for_current_playback !== 'opus' ||
-            this.force_recorded_aac_audio_codec === true
-        ) {
-            return false;
-        }
-
-        // 保存設定は変更せず、一時フラグだけを立てて同じ再生位置から新しい AAC セッションへ移行する。
-        this.force_recorded_aac_audio_codec = true;
-        console.warn('\u001b[31m[PlayerController] Opus playback failed. Falling back to AAC for this playback.');
-        usePlayerStore().event_emitter.emit('PlayerRestartRequired', {
-            message: 'Opus 音声の再生に失敗したため、今回の再生では AAC を使用します。',
-            message_delay_seconds: 2,
-            is_error_message: false,
-            should_resume_quality: true,
-        });
-        return true;
-    }
-
-
     /** 録画HLSの代替音声レンディションを、映像を維持したまま切り替える。 */
     private setupRecordedHLSAudioTrackSelector(): void {
 
@@ -2668,15 +2690,21 @@ class PlayerController {
         this.recorded_hls_audio_selector_instances.add(hls);
 
         // MSE 型判定を通過していても、実際の SourceBuffer 追加・append 時に Opus が拒否されることがある。
-        // 音声 SourceBuffer に限定し、ネットワークや映像側の失敗を誤って AAC フォールバック扱いにしない。
+        // 自動で AAC へ変更せず、同一 codec での一度限りの再起動と、再発時の恒久通知へ送る。
         hls.on(Hls.Events.ERROR, (_event, data) => {
             const is_audio_source_buffer_error = data.sourceBufferName === 'audio' && [
                 ErrorDetails.BUFFER_ADD_CODEC_ERROR,
                 ErrorDetails.BUFFER_APPEND_ERROR,
                 ErrorDetails.BUFFER_APPENDING_ERROR,
             ].includes(data.details);
-            if (is_audio_source_buffer_error === true) {
-                this.requestRecordedOpusFallback();
+            if (
+                is_audio_source_buffer_error === true &&
+                this.recorded_audio_codec_for_current_playback === 'opus'
+            ) {
+                usePlayerStore().event_emitter.emit('PlayerRestartRequired', {
+                    message: 'Opus 音声の再生処理でエラーが発生しました。プレイヤーを再起動しています…',
+                    konomitv_bs4k_restart_reason: 'RuntimeCodecPipelineError',
+                });
             }
         });
         const recorded_video = usePlayerStore().recorded_program.recorded_video;
@@ -3323,9 +3351,6 @@ class PlayerController {
                     const codec = item.dataset.codec as RecordedStreamingAudioCodec;
                     settings_store.settings[get_audio_codec_setting_key()] = codec;
 
-                    // ユーザーが明示的に選び直したときは、過去の実再生エラーによる一時フォールバックを解除する。
-                    // Opus を再選択した場合も、この操作をもって再試行を許可する。
-                    this.force_recorded_aac_audio_codec = false;
                     update_audio_codec_display();
                     close_codec_panel();
                     this.player?.setting.hide();
@@ -3362,8 +3387,6 @@ class PlayerController {
         toggle_mobile_profile_button.addEventListener('click', () => {
             // チェックボックスの状態を切り替える
             toggle_mobile_profile_input.checked = !toggle_mobile_profile_input.checked;
-            // 回線プロファイルが変わった場合は、切り替え先の保存設定を改めて評価する。
-            this.force_recorded_aac_audio_codec = false;
             // 画質プロファイルをモバイル回線向けに切り替えてから、プレイヤーを再起動
             if (toggle_mobile_profile_input.checked) {
                 this.quality_profile_type = 'Cellular';
