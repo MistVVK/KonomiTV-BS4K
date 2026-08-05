@@ -11,12 +11,36 @@ from hashids import Hashids
 
 from app import logging
 from app.config import Config
-from app.constants import QUALITY_TYPES
+from app.constants import QUALITY, QUALITY_TYPES
 from app.schemas import LiveStreamStatus
+from app.streams.KonomiTVBS4KPlaybackEncoding import (
+    KonomiTVBS4KAudioCodec,
+    KonomiTVBS4KVideoBitDepth,
+    KonomiTVBS4KVideoCodec,
+)
 from app.streams.LiveEncodingTask import LiveEncodingTask
 from app.streams.LivePSIDataArchiver import LivePSIDataArchiver
 from app.streams.StreamEncodingOptions import StreamEncodingOptions
 from app.utils.edcb.EDCBTuner import EDCBTuner
+
+
+KonomiTVBS4KLiveStreamKey = tuple[
+    str,
+    QUALITY_TYPES,
+    KonomiTVBS4KVideoCodec,
+    KonomiTVBS4KVideoBitDepth,
+    KonomiTVBS4KAudioCodec,
+    bool,
+]
+KonomiTVBS4KLiveStreamInstanceKey = tuple[
+    str,
+    QUALITY_TYPES,
+    KonomiTVBS4KVideoCodec,
+    KonomiTVBS4KVideoBitDepth,
+    KonomiTVBS4KAudioCodec,
+    bool,
+    bool,
+]
 
 
 class LiveStreamClient:
@@ -105,7 +129,7 @@ class LiveStream:
 
     # ライブストリームのインスタンスが入る、ライブストリーム ID をキーとした辞書
     # この辞書にライブストリームに関する全てのデータが格納されている
-    __instances: ClassVar[dict[str, LiveStream]] = {}
+    __instances: ClassVar[dict[KonomiTVBS4KLiveStreamInstanceKey, LiveStream]] = {}
 
 
     # 必ずライブストリーム ID ごとに1つのインスタンスになるように (Singleton)
@@ -120,18 +144,33 @@ class LiveStream:
         # まだ同じライブストリーム ID のインスタンスがないときだけ、インスタンスを生成する
         # (チャンネル ID)-(映像の品質)-(追加エンコードオプション) で一意な ID になる
         if encoding_options is None:
-            encoding_options = StreamEncodingOptions()
+            encoding_options = StreamEncodingOptions(
+                video_codec = 'hevc' if QUALITY[quality].is_hevc else 'avc',
+            )
+        live_stream_key: KonomiTVBS4KLiveStreamKey = (
+            display_channel_id,
+            quality,
+            encoding_options.video_codec,
+            encoding_options.video_bit_depth,
+            encoding_options.audio_codec,
+            encoding_options.is_24fps_mode_enabled,
+        )
+        instance_key: KonomiTVBS4KLiveStreamInstanceKey = (
+            *live_stream_key,
+            stream_anchor_enabled,
+        )
         live_stream_id = (
             f'{display_channel_id}-{quality}{encoding_options.buildSuffix()}'
             f'{"-compat" if stream_anchor_enabled is False else ""}'
         )
-        if live_stream_id not in cls.__instances:
+        if instance_key not in cls.__instances:
 
             # 新しいライブストリームのインスタンスを生成する
             instance = super().__new__(cls)
 
             # ライブストリーム ID を設定
             instance.live_stream_id = live_stream_id
+            instance.live_stream_key = live_stream_key
 
             # チャンネル ID と映像の品質を設定
             instance.display_channel_id = display_channel_id
@@ -185,10 +224,10 @@ class LiveStream:
             instance._tuner_lock = asyncio.Lock()
 
             # 生成したインスタンスを登録する
-            cls.__instances[live_stream_id] = instance
+            cls.__instances[instance_key] = instance
 
         # 登録されているインスタンスを返す
-        return cls.__instances[live_stream_id]
+        return cls.__instances[instance_key]
 
 
     def __init__(
@@ -211,6 +250,7 @@ class LiveStream:
         # インスタンス変数の型ヒントを定義
         # Singleton のためインスタンスの生成は __new__() で行うが、__init__() も定義しておかないと補完がうまく効かない
         self.live_stream_id: str
+        self.live_stream_key: KonomiTVBS4KLiveStreamKey
         self.display_channel_id: str
         self.quality: QUALITY_TYPES
         self.encoding_options: StreamEncodingOptions

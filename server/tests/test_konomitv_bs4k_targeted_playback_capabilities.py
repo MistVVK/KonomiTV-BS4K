@@ -16,6 +16,7 @@ from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KPlaybackCapabilities,
     KonomiTVBS4KPlaybackEncoder,
     KonomiTVBS4KPlaybackLiveCombinationCapability,
+    KonomiTVBS4KPlaybackMode,
     KonomiTVBS4KPlaybackVideoCapability,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KVideoBitDepthQuery,
@@ -53,7 +54,7 @@ def RunThreadWorkInlineOnHost(
 def test_targeted_capabilities_probe_only_requested_exact_and_avc_aac_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """優先depth成功後は低優先depthを止め、AVC/AAC fallbackをprobeしない。"""
+    """優先depth成功後は低優先depthを止め、fallbackはencoder実能力だけ確認する。"""
 
     recorded_calls: list[
         tuple[
@@ -149,6 +150,7 @@ def test_targeted_capabilities_probe_only_requested_exact_and_avc_aac_fallback(
     capabilities = asyncio.run(
         KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
             'QSV',
+            'Live',
             'av1',
             (10, 8),
             'opus',
@@ -156,7 +158,7 @@ def test_targeted_capabilities_probe_only_requested_exact_and_avc_aac_fallback(
         )
     )
 
-    assert recorded_calls == [('QSV', 'av1', 10)]
+    assert recorded_calls == [('QSV', 'av1', 10), ('QSV', 'avc', 8)]
     assert live_calls == [('QSV', 'av1', 10, 'opus')]
     assert [
         (item.codec, item.bit_depth)
@@ -235,6 +237,7 @@ def test_targeted_capabilities_try_next_depth_after_exact_probe_failure(
     capabilities = asyncio.run(
         KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
             'QSV',
+            'Live',
             'av1',
             (10, 8),
             'opus',
@@ -242,7 +245,7 @@ def test_targeted_capabilities_try_next_depth_after_exact_probe_failure(
         )
     )
 
-    assert recorded_calls == [('QSV', 'av1', 10), ('QSV', 'av1', 8)]
+    assert recorded_calls == [('QSV', 'av1', 10), ('QSV', 'av1', 8), ('QSV', 'avc', 8)]
     assert live_calls == [
         ('QSV', 'av1', 10, 'opus'),
         ('QSV', 'av1', 8, 'opus'),
@@ -260,6 +263,93 @@ def test_targeted_capabilities_try_next_depth_after_exact_probe_failure(
         ('av1', 8, 'opus', True),
         ('avc', 8, 'aac', True),
     ]
+
+
+def test_targeted_recorded_capabilities_do_not_require_live_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """録画再生は録画エンコーダー能力だけを使い、Bridge 不在でも成立する。"""
+
+    recorded_calls: list[tuple[str, str, int]] = []
+
+    async def GetCapability(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+        encoder: KonomiTVBS4KPlaybackEncoder,
+        codec: KonomiTVBS4KVideoCodec,
+        bit_depth: KonomiTVBS4KVideoBitDepth,
+    ) -> RecordedPlaybackCapability:
+        """要求された録画映像能力を利用可能として返す。"""
+
+        recorded_calls.append((encoder, codec, bit_depth))
+        return RecordedPlaybackCapability(
+            encoder = encoder,
+            codec = codec,
+            bit_depth = bit_depth,
+            available = True,
+            profile = 'Main',
+            reason_code = None,
+        )
+
+    async def UnexpectedLiveProbe(*_args: object, **_kwargs: object) -> bool:
+        """録画 targeted 検査がライブ搬送を調べた場合に失敗させる。"""
+
+        raise AssertionError('recorded playback must not start a live transport probe')
+
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        'getCapability',
+        classmethod(GetCapability),
+    )
+    monkeypatch.setattr(
+        KonomiTVBS4KPlaybackCapabilityProbe,
+        'isFFmpegAvailable',
+        classmethod(lambda _cls: True),
+    )
+    monkeypatch.setattr(
+        KonomiTVBS4KPlaybackCapabilityProbe,
+        'getLiveCombinationCapability',
+        classmethod(UnexpectedLiveProbe),
+    )
+
+    capabilities = asyncio.run(
+        KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
+            'QSV',
+            'Video',
+            'av1',
+            (10, 8),
+            'opus',
+            True,
+        )
+    )
+
+    assert recorded_calls == [('QSV', 'av1', 10), ('QSV', 'avc', 8)]
+    assert [
+        (item.codec, item.bit_depth, item.recorded_available)
+        for item in capabilities.video
+    ] == [('av1', 10, True), ('avc', 8, True)]
+    assert [
+        (item.codec, item.recorded_available)
+        for item in capabilities.audio
+    ] == [('opus', True), ('aac', True)]
+    assert capabilities.live_combinations == ()
+
+    audio_only_capabilities = asyncio.run(
+        KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
+            'QSV',
+            'Video',
+            'av1',
+            (10, 8),
+            'opus',
+            False,
+        )
+    )
+    assert recorded_calls == [('QSV', 'av1', 10), ('QSV', 'avc', 8)]
+    assert audio_only_capabilities.video == ()
+    assert [
+        (item.codec, item.recorded_available)
+        for item in audio_only_capabilities.audio
+    ] == [('opus', True), ('aac', True)]
+    assert audio_only_capabilities.live_combinations == ()
 
 
 def test_full_capabilities_probe_advanced_rows_with_bounded_parallelism(
@@ -355,20 +445,41 @@ def test_full_capabilities_probe_advanced_rows_with_bounded_parallelism(
 def test_targeted_legacy_avc_aac_counter_read_never_starts_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """counter取得用AVC 8bit/AAC APIは録画・live probeを起動せず値も増やさない。"""
+    """AVC 8bit/AAC APIもencoder/Bridgeをfail closed検査し、実encode probeは起動しない。"""
 
-    async def UnexpectedProbe(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError('legacy fallback must not start a capability probe')
+    recorded_calls: list[tuple[str, str, int]] = []
+
+    async def GetCapability(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+        encoder: KonomiTVBS4KPlaybackEncoder,
+        codec: KonomiTVBS4KVideoCodec,
+        bit_depth: KonomiTVBS4KVideoBitDepth,
+    ) -> RecordedPlaybackCapability:
+        recorded_calls.append((encoder, codec, bit_depth))
+        return RecordedPlaybackCapability(encoder, codec, bit_depth, True, 'High', None)
+
+    async def UnexpectedTransportProbe(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError('baseline AVC/AAC must not start an advanced transport probe')
 
     monkeypatch.setattr(
         RecordedPlaybackCapabilityProbe,
         'getCapability',
-        classmethod(UnexpectedProbe),
+        classmethod(GetCapability),
     )
     monkeypatch.setattr(
         KonomiTVBS4KPlaybackCapabilityProbe,
-        'getLiveCombinationCapability',
-        classmethod(UnexpectedProbe),
+        'isFFmpegAvailable',
+        classmethod(lambda _cls: True),
+    )
+    monkeypatch.setattr(
+        KonomiTVBS4KPlaybackCapabilityProbe,
+        'isBridgeAvailable',
+        classmethod(lambda _cls: True),
+    )
+    monkeypatch.setattr(
+        KonomiTVBS4KPlaybackCapabilityProbe,
+        'isLiveTransportAvailable',
+        classmethod(UnexpectedTransportProbe),
     )
     monkeypatch.setattr(
         VideoStreamsRouter.TSCodecBridgeRuntimeVerifier,
@@ -410,6 +521,7 @@ def test_targeted_legacy_avc_aac_counter_read_never_starts_probe(
         VideoStreamsRouter.KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
             api_response,
             'NVENC',
+            'Live',
             'avc',
             '8',
             'aac',
@@ -452,6 +564,7 @@ def test_targeted_legacy_avc_aac_counter_read_never_starts_probe(
         )
         for item in capabilities.live_combinations
     ] == [('avc', 8, 'aac', True)]
+    assert recorded_calls == [('NVENC', 'avc', 8)]
 
 
 def test_targeted_audio_only_capabilities_skip_every_video_probe(
@@ -495,6 +608,7 @@ def test_targeted_audio_only_capabilities_skip_every_video_probe(
     capabilities = asyncio.run(
         KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
             'NVENC',
+            'Live',
             'av1',
             (10, 8),
             'opus',
@@ -738,6 +852,7 @@ def test_targeted_capability_api_serializes_partial_matrix(
     requested: list[
         tuple[
             KonomiTVBS4KPlaybackEncoder,
+            KonomiTVBS4KPlaybackMode,
             KonomiTVBS4KVideoCodec,
             tuple[KonomiTVBS4KVideoBitDepth, ...],
             KonomiTVBS4KAudioCodec,
@@ -748,6 +863,7 @@ def test_targeted_capability_api_serializes_partial_matrix(
     async def GetTargetedCapabilities(
         _cls: type[KonomiTVBS4KPlaybackCapabilityProbe],
         encoder: KonomiTVBS4KPlaybackEncoder,
+        playback_mode: KonomiTVBS4KPlaybackMode,
         video_codec: KonomiTVBS4KVideoCodec,
         video_bit_depths: tuple[KonomiTVBS4KVideoBitDepth, ...],
         audio_codec: KonomiTVBS4KAudioCodec,
@@ -756,7 +872,7 @@ def test_targeted_capability_api_serializes_partial_matrix(
         """APIから受け取ったtargeted条件を記録して固定応答を返す。"""
 
         requested.append(
-            (encoder, video_codec, video_bit_depths, audio_codec, has_video)
+            (encoder, playback_mode, video_codec, video_bit_depths, audio_codec, has_video)
         )
         return KonomiTVBS4KPlaybackCapabilities(
             video = (
@@ -817,6 +933,7 @@ def test_targeted_capability_api_serializes_partial_matrix(
         VideoStreamsRouter.KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
             api_response,
             'QSV',
+            'Live',
             'av1',
             '10,8',
             'opus',
@@ -846,7 +963,7 @@ def test_targeted_capability_api_serializes_partial_matrix(
         == '20'
     )
 
-    assert requested == [('QSV', 'av1', (10, 8), 'opus', True)]
+    assert requested == [('QSV', 'Live', 'av1', (10, 8), 'opus', True)]
     assert response.model_dump() == {
         'video': [{
             'encoder': 'QSV',

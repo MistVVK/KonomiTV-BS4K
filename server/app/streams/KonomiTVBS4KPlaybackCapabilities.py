@@ -23,6 +23,7 @@ from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KPlaybackCapabilityReason,
     KonomiTVBS4KPlaybackEncoder,
     KonomiTVBS4KPlaybackLiveCombinationCapability,
+    KonomiTVBS4KPlaybackMode,
     KonomiTVBS4KPlaybackVideoCapability,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KVideoCodec,
@@ -190,6 +191,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
     async def getTargetedCapabilities(
         cls,
         encoder: KonomiTVBS4KPlaybackEncoder,
+        playback_mode: KonomiTVBS4KPlaybackMode,
         video_codec: KonomiTVBS4KVideoCodec,
         video_bit_depths: tuple[KonomiTVBS4KVideoBitDepth, ...],
         audio_codec: KonomiTVBS4KAudioCodec,
@@ -200,6 +202,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
 
         Args:
             encoder: 現在のチャンネルまたは録画で実際に使うエンコーダー。
+            playback_mode: ライブ能力と録画能力のどちらを検査するか。
             video_codec: 保存設定から選ばれた映像コーデック。
             video_bit_depths: 現在の画質とブラウザで候補になるbit depthの優先順。
             audio_codec: 保存設定から選ばれた音声コーデック。
@@ -208,6 +211,17 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         Returns:
             現在の再生候補と互換fallbackだけを含む部分能力行列。
         """
+
+        # 録画 fMP4 は TS Codec Bridge を通らないため、ライブ搬送能力と交差させない。
+        # 録画開始時は固定 FFmpeg と選択エンコーダーの能力だけを部分検査する。
+        if playback_mode == 'Video':
+            return await cls.__getTargetedRecordedCapabilities(
+                encoder,
+                video_codec,
+                video_bit_depths,
+                audio_codec,
+                has_video,
+            )
 
         # ラジオと音声のみ録画では映像backendを一切起動せず、要求音声とAAC fallbackだけを検査する。
         if has_video is False:
@@ -229,7 +243,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             )
 
         # 要求codecのdepth候補は優先順に一つずつ調べ、成功後の低優先depthを起動しない。
-        ## AVC 8bit/AAC fallbackは旧再生経路の既知構成なので、実encode probeなしで最後に付加する。
+        ## AVC 8bit/AAC fallbackも選択中のencoderとStream Anchorの実能力でfail closedとする。
         requested_combinations: list[
             tuple[
                 KonomiTVBS4KPlaybackEncoder,
@@ -303,26 +317,17 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             ) == fallback_target
             for recorded, combination in probe_results
         ):
-            is_fallback_recorded_available = cls.isFFmpegAvailable()
-            fallback_recorded = RecordedPlaybackCapability(
-                encoder = encoder,
-                codec = 'avc',
-                bit_depth = 8,
-                available = is_fallback_recorded_available,
-                profile = 'High',
-                reason_code = (
-                    None
-                    if is_fallback_recorded_available is True
-                    else 'BinaryUnavailable'
-                ),
+            fallback_recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                encoder,
+                'avc',
+                8,
             )
-            fallback_combination = KonomiTVBS4KPlaybackLiveCombinationCapability(
-                encoder = encoder,
-                video_codec = 'avc',
-                video_bit_depth = 8,
-                audio_codec = 'aac',
-                available = True,
-                reason_code = None,
+            fallback_combination = await cls.getLiveCombinationCapability(
+                fallback_recorded.encoder,
+                fallback_recorded.codec,
+                fallback_recorded.bit_depth,
+                'aac',
+                recorded_capability = fallback_recorded,
             )
             probe_results.append((fallback_recorded, fallback_combination))
 
@@ -435,6 +440,101 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                 combination
                 for _, combination in probe_results
             ),
+        )
+
+    @classmethod
+    async def __getTargetedRecordedCapabilities(
+        cls,
+        encoder: KonomiTVBS4KPlaybackEncoder,
+        video_codec: KonomiTVBS4KVideoCodec,
+        video_bit_depths: tuple[KonomiTVBS4KVideoBitDepth, ...],
+        audio_codec: KonomiTVBS4KAudioCodec,
+        has_video: bool,
+    ) -> KonomiTVBS4KPlaybackCapabilities:
+        """
+        録画再生に必要なエンコーダー能力だけを検査する。
+
+        Args:
+            encoder: 録画再生で使用するエンコーダー。
+            video_codec: 保存設定から選ばれた映像コーデック。
+            video_bit_depths: ブラウザで再生できる bit depth の優先順。
+            audio_codec: 保存設定から選ばれた音声コーデック。
+            has_video: 録画に映像ストリームが含まれるなら True。
+
+        Returns:
+            録画能力だけを保持し、ライブ組み合わせを含まない部分能力行列。
+        """
+
+        # 録画の音声出力はすべて固定 FFmpeg 8 が担当する。Opus でもライブ用 Bridge や
+        # radio probe は不要なので、録画側のバイナリ能力だけを明示する。
+        is_ffmpeg_available = cls.isFFmpegAvailable()
+        binary_reason: KonomiTVBS4KPlaybackCapabilityReason | None = (
+            None if is_ffmpeg_available else 'BinaryUnavailable'
+        )
+        target_audio_codecs: tuple[KonomiTVBS4KAudioCodec, ...] = tuple(
+            dict.fromkeys((audio_codec, 'aac'))
+        )
+        audio_capabilities = tuple(
+            KonomiTVBS4KPlaybackAudioCapability(
+                codec = target_audio_codec,
+                live_available = False,
+                recorded_available = is_ffmpeg_available,
+                live_reason_code = None,
+                recorded_reason_code = binary_reason,
+            )
+            for target_audio_codec in target_audio_codecs
+        )
+        if has_video is False:
+            return KonomiTVBS4KPlaybackCapabilities(
+                video = (),
+                audio = audio_capabilities,
+                live_combinations = (),
+            )
+
+        # 要求 codec の depth は優先順に検査し、録画能力が成立した時点で打ち切る。
+        # 要求側が成立しなくても、既知の AVC 8bit fallback は同じエンコーダーで必ず確認する。
+        recorded_capabilities: list[RecordedPlaybackCapability] = []
+        for video_bit_depth in video_bit_depths:
+            if IsKonomiTVBS4KVideoCodecBitDepthSupported(video_codec, video_bit_depth) is False:
+                continue
+            recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                encoder,
+                video_codec,
+                video_bit_depth,
+            )
+            recorded_capabilities.append(recorded)
+            if recorded.available is True:
+                break
+
+        fallback_target = (encoder, 'avc', 8)
+        if not any(
+            (recorded.encoder, recorded.codec, recorded.bit_depth) == fallback_target
+            for recorded in recorded_capabilities
+        ):
+            recorded_capabilities.append(
+                await RecordedPlaybackCapabilityProbe.getCapability(
+                    encoder,
+                    'avc',
+                    8,
+                )
+            )
+
+        return KonomiTVBS4KPlaybackCapabilities(
+            video = tuple(
+                KonomiTVBS4KPlaybackVideoCapability(
+                    encoder = recorded.encoder,
+                    codec = recorded.codec,
+                    bit_depth = recorded.bit_depth,
+                    profile = recorded.profile,
+                    live_available = False,
+                    recorded_available = recorded.available,
+                    live_reason_code = None,
+                    recorded_reason_code = recorded.reason_code,
+                )
+                for recorded in recorded_capabilities
+            ),
+            audio = audio_capabilities,
+            live_combinations = (),
         )
 
     @classmethod
@@ -1205,9 +1305,9 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             elif video_codec == 'av1':
                 ffmpeg_command += ['-lag-in-frames', '0']
         elif encoder == 'QSV':
-            ffmpeg_command += ['-async_depth', '1']
-            if video_codec in ('vp9', 'av1'):
-                ffmpeg_command += ['-look_ahead', '0', '-bf', '0']
+            ffmpeg_command += ['-async_depth', '1', '-bf', '0']
+            if video_codec == 'avc':
+                ffmpeg_command += ['-look_ahead', '0']
         elif encoder == 'NVENC':
             ffmpeg_command += [
                 '-preset',
@@ -1379,8 +1479,6 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             'volume=2.0',
             '-fflags',
             'nobuffer',
-            '-flags',
-            'low_delay',
             '-max_delay',
             '250000',
             '-max_interleave_delta',
@@ -1442,36 +1540,18 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             codec,
             bit_depth,
         )
-        live_available = recorded.available
-        live_reason_code = recorded.reason_code
-        if recorded.available is True and codec in ('vp9', 'av1'):
-            if cls.isFFmpegAvailable() is False:
-                live_available = False
-                live_reason_code = 'BinaryUnavailable'
-            elif await cls.isBridgeAvailableAsync() is False:
-                live_available = False
-                live_reason_code = 'BridgeUnavailable'
-            elif (
-                await cls.isLiveTransportAvailable(
-                    encoder,
-                    codec,
-                    bit_depth,
-                    'aac',
-                )
-                is False
-            ):
-                live_available = False
-                live_reason_code = 'ProbeFailed'
-            else:
-                live_reason_code = None
+        # main live は全 codec で Stream Anchor Bridge を通る。単一行 API も
+        # 全行列・targeted API と同じ exact AAC 組み合わせ契約から導出し、
+        # AVC / HEVC だけ Bridge 不在を利用可と返す不整合を防ぐ。
+        live_combination = await cls.__buildLiveCombinationCapability(recorded, 'aac')
         return KonomiTVBS4KPlaybackVideoCapability(
             encoder = encoder,
             codec = codec,
             bit_depth = bit_depth,
             profile = recorded.profile,
-            live_available = live_available,
+            live_available = live_combination.available,
             recorded_available = recorded.available,
-            live_reason_code = live_reason_code,
+            live_reason_code = live_combination.reason_code,
             recorded_reason_code = recorded.reason_code,
         )
 
@@ -1623,13 +1703,14 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             全行列やaudio-only probeを起動せず構築したexact live組み合わせ能力。
         """
 
-        is_advanced_combination = (
-            recorded.codec in ('vp9', 'av1') or audio_codec == 'opus'
-        )
+        is_advanced_combination = recorded.codec in ('vp9', 'av1') or audio_codec == 'opus'
         reason_code: KonomiTVBS4KPlaybackCapabilityReason | None = (
             recorded.reason_code if recorded.available is False else None
         )
-        if recorded.available is True and is_advanced_combination is True:
+        # メインのライブ経路はcodecにかかわらずStream Anchor Bridgeを必ず通る。
+        # そのためAVC/AACもBridge不在時に利用可と公開しない。実encode/transport
+        # probeは追加変換が必要な高度codecのみに限り、既存のAVC/HEVC TS経路は依存確認で判定する。
+        if recorded.available is True:
             if is_ffmpeg_available is None:
                 is_ffmpeg_available = cls.isFFmpegAvailable()
             if is_bridge_available is None and is_ffmpeg_available is True:
@@ -1638,7 +1719,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                 reason_code = 'BinaryUnavailable'
             elif is_bridge_available is False:
                 reason_code = 'BridgeUnavailable'
-            elif (
+            elif is_advanced_combination is True and (
                 await cls.isLiveTransportAvailable(
                     recorded.encoder,
                     recorded.codec,

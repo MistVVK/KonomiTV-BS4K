@@ -19,6 +19,7 @@ from app.streams.KonomiTVBS4KPlaybackCapabilities import (
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KAudioCodec,
     KonomiTVBS4KPlaybackEncoder,
+    KonomiTVBS4KPlaybackMode,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KVideoBitDepthQuery,
     KonomiTVBS4KVideoCodec,
@@ -214,6 +215,10 @@ async def KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
         KonomiTVBS4KPlaybackEncoder,
         Query(description='現在の再生で実際に使用するエンコーダー。'),
     ],
+    playback_mode: Annotated[
+        KonomiTVBS4KPlaybackMode,
+        Query(description='ライブまたは録画のどちらの能力を部分検査するか。'),
+    ],
     video_codec: Annotated[
         KonomiTVBS4KVideoCodec,
         Query(description='保存設定から選ばれた出力映像コーデック。'),
@@ -242,6 +247,7 @@ async def KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
     )
     capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
         encoder,
+        playback_mode,
         video_codec,
         parsed_video_bit_depths,
         audio_codec,

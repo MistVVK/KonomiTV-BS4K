@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -392,6 +393,43 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
     )
     assert hevc_stream_quality.encoding_options.video_codec == 'hevc'
     assert hevc_stream_quality.encoding_options.audio_codec == 'aac'
+
+    async def UnexpectedMainLiveCapability(*_args, **_kwargs):
+        raise AssertionError('compatibility route must not require Stream Anchor capability')
+
+    async def GetAvailableHEVC10BitCapability(*_args, **_kwargs):
+        return SimpleNamespace(recorded_available=True)
+
+    monkeypatch.setattr(
+        LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
+        'getLiveCombinationCapability',
+        classmethod(UnexpectedMainLiveCapability),
+    )
+    monkeypatch.setattr(
+        LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
+        'getRecordedVideoCapability',
+        classmethod(GetAvailableHEVC10BitCapability),
+    )
+    hevc_10bit_stream_quality = asyncio.run(
+        ValidateCompatibilityLiveStreamQuality('1080p-hevc-10bit', 'gr011')
+    )
+    assert hevc_10bit_stream_quality.encoding_options.video_codec == 'hevc'
+    assert hevc_10bit_stream_quality.encoding_options.video_bit_depth == 10
+
+    async def GetUnavailableHEVC10BitCapability(*_args, **_kwargs):
+        return SimpleNamespace(recorded_available=False)
+
+    monkeypatch.setattr(
+        LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
+        'getRecordedVideoCapability',
+        classmethod(GetUnavailableHEVC10BitCapability),
+    )
+    downgraded_hevc_stream_quality = asyncio.run(
+        ValidateCompatibilityLiveStreamQuality('1080p-hevc-10bit', 'gr011')
+    )
+    assert downgraded_hevc_stream_quality.encoding_options.video_codec == 'hevc'
+    assert downgraded_hevc_stream_quality.encoding_options.video_bit_depth == 8
+    assert downgraded_hevc_stream_quality.encoding_options.is_hevc_10bit_enabled is False
 
     compatibility_app = CreateCompatibilityAPI()
     openapi_paths = compatibility_app.openapi()['paths']

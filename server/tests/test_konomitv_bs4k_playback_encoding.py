@@ -611,6 +611,21 @@ def test_konomitv_bs4k_invalid_avc_10bit_is_rejected_without_silent_fallback() -
         )
 
 
+@pytest.mark.parametrize('encoder', ['FFmpeg', 'QSV', 'NVENC', 'AMF'])
+def test_konomitv_bs4k_legacy_hevc_10bit_suffix_stays_exact_for_every_backend(
+    encoder: str,
+) -> None:
+    """旧HEVC 10bit suffixもbackendによって8bitへ黙って降格しない。"""
+
+    stream_quality = SplitQualityAndEncodingOptions(
+        '1080p-hevc-10bit',
+        encoder = encoder,  # type: ignore[arg-type]
+    )
+    assert stream_quality is not None
+    assert stream_quality.encoding_options.video_codec == 'hevc'
+    assert stream_quality.encoding_options.video_bit_depth == 10
+
+
 def test_konomitv_bs4k_live_stream_key_separates_every_encoding_condition() -> None:
     """同一チャンネル・画質でもcodec、bit depth、音声、24fpsが違えば共有しない。"""
 
@@ -1087,6 +1102,69 @@ def test_konomitv_bs4k_exact_capability_getters_do_not_probe_full_matrix(
     assert radio_calls == 1
 
 
+def test_konomitv_bs4k_exact_baseline_video_capability_requires_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """単一AVC行もmain liveのAnchor Bridge不在を利用可として公開しない。"""
+
+    async def GetCapability(
+        _cls: type[RecordedPlaybackCapabilityProbe],
+        encoder: str,
+        codec: str,
+        bit_depth: int,
+    ) -> RecordedPlaybackCapability:
+        assert (encoder, codec, bit_depth) == ('FFmpeg', 'avc', 8)
+        return RecordedPlaybackCapability('FFmpeg', 'avc', 8, True, 'High', None)
+
+    async def IsBridgeAvailableAsync(
+        _cls: type[KonomiTVBS4KPlaybackCapabilityProbe],
+    ) -> bool:
+        return False
+
+    async def UnexpectedLiveTransportProbe(
+        _cls: type[KonomiTVBS4KPlaybackCapabilityProbe],
+        _encoder: str,
+        _codec: str,
+        _bit_depth: int,
+        _audio_codec: str,
+    ) -> bool:
+        raise AssertionError('baseline AVC/AAC must not run the advanced transport probe')
+
+    monkeypatch.setattr(
+        RecordedPlaybackCapabilityProbe,
+        'getCapability',
+        classmethod(GetCapability),
+    )
+    monkeypatch.setattr(
+        KonomiTVBS4KPlaybackCapabilityProbe,
+        'isFFmpegAvailable',
+        classmethod(lambda _cls: True),
+    )
+    monkeypatch.setattr(
+        KonomiTVBS4KPlaybackCapabilityProbe,
+        'isBridgeAvailableAsync',
+        classmethod(IsBridgeAvailableAsync),
+    )
+    monkeypatch.setattr(
+        KonomiTVBS4KPlaybackCapabilityProbe,
+        'isLiveTransportAvailable',
+        classmethod(UnexpectedLiveTransportProbe),
+    )
+
+    capability = asyncio.run(
+        KonomiTVBS4KPlaybackCapabilityProbe.getVideoCapability(
+            'FFmpeg',
+            'avc',
+            8,
+        )
+    )
+
+    assert capability is not None
+    assert capability.recorded_available is True
+    assert capability.live_available is False
+    assert capability.live_reason_code == 'BridgeUnavailable'
+
+
 def test_konomitv_bs4k_bridge_runtime_verification_runs_outside_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1498,10 +1576,10 @@ def test_konomitv_bs4k_live_query_rejects_invalid_or_unavailable_combinations(
     assert unavailable_error.value.detail['code'] == 'BridgeUnavailable'
 
 
-def test_konomitv_bs4k_live_legacy_avc_aac_query_does_not_probe_capabilities(
+def test_konomitv_bs4k_live_explicit_avc_aac_query_probes_exact_capability(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """旧AVC/AACの明示queryは能力probeを挟まず従来どおり解決する。"""
+    """AVC/AACの明示queryもStream Anchorを含むexact能力でfail closedにする。"""
 
     monkeypatch.setattr(
         LiveStreamsRouter,
@@ -1514,23 +1592,39 @@ def test_konomitv_bs4k_live_legacy_avc_aac_query_does_not_probe_capabilities(
         lambda **_kwargs: _LiveChannelQuery(is_radiochannel = False),
     )
 
-    async def UnexpectedProbe(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError('legacy AVC/AAC must not start a capability probe')
+    requested_combinations: list[tuple[str, str, int, str]] = []
+
+    async def GetLiveCombinationCapability(
+        _cls: type[KonomiTVBS4KPlaybackCapabilityProbe],
+        encoder: str,
+        codec: str,
+        bit_depth: int,
+        audio_codec: str,
+    ) -> KonomiTVBS4KPlaybackLiveCombinationCapability:
+        requested_combinations.append((encoder, codec, bit_depth, audio_codec))
+        return KonomiTVBS4KPlaybackLiveCombinationCapability(
+            encoder = 'QSV',
+            video_codec = 'avc',
+            video_bit_depth = 8,
+            audio_codec = 'aac',
+            available = True,
+            reason_code = None,
+        )
 
     monkeypatch.setattr(
         KonomiTVBS4KPlaybackCapabilityProbe,
         'getVideoCapability',
-        classmethod(UnexpectedProbe),
+        classmethod(lambda *_args, **_kwargs: None),
     )
     monkeypatch.setattr(
         KonomiTVBS4KPlaybackCapabilityProbe,
         'getAudioCapability',
-        classmethod(UnexpectedProbe),
+        classmethod(lambda *_args, **_kwargs: None),
     )
     monkeypatch.setattr(
         KonomiTVBS4KPlaybackCapabilityProbe,
         'getLiveCombinationCapability',
-        classmethod(UnexpectedProbe),
+        classmethod(GetLiveCombinationCapability),
     )
 
     stream_quality = asyncio.run(
@@ -1545,6 +1639,7 @@ def test_konomitv_bs4k_live_legacy_avc_aac_query_does_not_probe_capabilities(
     assert stream_quality.encoding_options.video_codec == 'avc'
     assert stream_quality.encoding_options.video_bit_depth == 8
     assert stream_quality.encoding_options.audio_codec == 'aac'
+    assert requested_combinations == [('QSV', 'avc', 8, 'aac')]
 
 
 def test_konomitv_bs4k_capability_api_exposes_video_and_audio(

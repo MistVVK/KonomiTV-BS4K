@@ -319,6 +319,7 @@ def BuildKonomiTVBS4KLiveHardwareVideoFilters(
 
 
 KonomiTVBS4KPlaybackEncoder = Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
+KonomiTVBS4KPlaybackMode = Literal['Live', 'Video']
 KonomiTVBS4KVideoCodec = Literal['avc', 'hevc', 'vp9', 'av1']
 KonomiTVBS4KAudioCodec = Literal['aac', 'opus']
 KonomiTVBS4KVideoBitDepth = Literal[8, 10]

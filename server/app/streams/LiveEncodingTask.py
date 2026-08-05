@@ -32,12 +32,19 @@ from app.constants import (
 from app.models.Channel import Channel
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     BuildKonomiTVBS4KLiveAspectPreservingScaleFilters,
-    KonomiTVBS4KPlaybackEncoder,
+    KonomiTVBS4KAudioCodec,
+    KonomiTVBS4KVideoBitDepth,
+    KonomiTVBS4KVideoCodec,
+    ParseKonomiTVBS4KAdvancedLiveMuxrateKbps,
     ResolveKonomiTVBS4KAdvancedLiveMuxrate,
     ResolveKonomiTVBS4KLiveEncodePlan,
+    ResolveKonomiTVBS4KPlaybackVideoBitrate,
 )
 from app.streams.LivePSIDataArchiver import LivePSIDataArchiver
-from app.streams.RecordedPlaybackCapabilities import RecordedPlaybackBackend
+from app.streams.RecordedPlaybackCapabilities import (
+    RecordedPlaybackBackend,
+    RecordedPlaybackCapabilityProbe,
+)
 from app.streams.StreamEncodingOptions import GetEncoderForLiveChannel
 from app.streams.TSCodecBridgeRuntime import TSCodecBridgeRuntimeVerifier
 from app.utils import GetMirakurunAPIEndpointURL
@@ -59,6 +66,10 @@ class LiveEncodingTask:
 
     # H.265 再生時のエンコード後のストリームの GOP 長 (秒)
     GOP_LENGTH_SECONDS_H265: ClassVar[float] = float(2)
+
+    # 放送入力の一時的な音声 PTS 欠落を無音で補完し、再エンコード後の時刻列を連続化する。
+    # TS Codec Bridge の連続性検査を緩めず、ブラウザへ不連続な Opus/AAC を渡さないために使う。
+    LIVE_TRANSCODE_AUDIO_FILTER: ClassVar[str] = 'aresample=48000:async=1'
 
     # エンコードタスクの最大リトライ回数
     ## この数を超えた場合はエンコードタスクを再起動しない（無限ループを避ける）
@@ -102,20 +113,79 @@ class LiveEncodingTask:
         return generation_id
 
 
+    def ResolveStreamAnchorGenerationID(self, stream_anchor_enabled: bool) -> int | None:
+        """source markerを最終化するAnchor経路でだけgeneration IDを生成する。"""
+
+        return self.GenerateStreamAnchorGenerationID() if stream_anchor_enabled is True else None
+
+
     def IsStreamAnchorEnabled(self) -> bool:
         """このライブストリームで最終 Stream Anchor を確定するか返す。"""
 
-        return getattr(self.live_stream, 'stream_anchor_enabled', False)
+        return self.live_stream.stream_anchor_enabled
 
 
-    def BuildTSCodecBridgeOptions(self) -> list[str]:
-        """現在の標準 AVC/HEVC + AAC ライブ経路向け Bridge オプションを返す。"""
+    def GetRequestedVideoCodec(self) -> KonomiTVBS4KVideoCodec:
+        """正規化済みの要求映像コーデックを返す。"""
 
-        return [
-            '--video-codec', 'passthrough',
-            '--audio-codec', 'aac',
-            '--stream-anchor-v1',
+        requested_codec = self.live_stream.encoding_options.video_codec
+        if requested_codec in ('avc', 'hevc', 'vp9', 'av1'):
+            return requested_codec
+        raise ValueError(f'Unsupported live video codec: {requested_codec}')
+
+
+    def GetRequestedVideoBitDepth(self) -> KonomiTVBS4KVideoBitDepth:
+        """正規化済みの要求映像 bit depth を返す。"""
+
+        requested_bit_depth = self.live_stream.encoding_options.video_bit_depth
+        if requested_bit_depth in (8, 10):
+            return requested_bit_depth
+        raise ValueError(f'Unsupported live video bit depth: {requested_bit_depth}')
+
+
+    def GetRequestedAudioCodec(self) -> KonomiTVBS4KAudioCodec:
+        """正規化済みの要求音声コーデックを返す。"""
+
+        requested_codec = self.live_stream.encoding_options.audio_codec
+        if requested_codec in ('aac', 'opus'):
+            return requested_codec
+        raise ValueError(f'Unsupported live audio codec: {requested_codec}')
+
+
+    def IsTSCodecBridgeRequired(self, is_radiochannel: bool = False) -> bool:
+        """VP9 / AV1 または Opus を最終 TS へ規格化する必要があるか返す。"""
+
+        return (
+            (is_radiochannel is False and self.GetRequestedVideoCodec() in ('vp9', 'av1')) or
+            self.GetRequestedAudioCodec() == 'opus'
+        )
+
+
+    def BuildTSCodecBridgeOptions(self, is_radiochannel: bool = False) -> list[str]:
+        """確定 codec tuple と Stream Anchor 条件から Bridge オプションを返す。"""
+
+        video_codec = self.GetRequestedVideoCodec()
+        options = [
+            '--video-codec',
+            video_codec if is_radiochannel is False and video_codec in ('vp9', 'av1') else 'passthrough',
+            '--audio-codec', self.GetRequestedAudioCodec(),
         ]
+        if self.IsStreamAnchorEnabled() is True and is_radiochannel is False:
+            options.append('--stream-anchor-v1')
+        if is_radiochannel is False and video_codec == 'av1':
+            muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
+                ResolveKonomiTVBS4KPlaybackVideoBitrate(
+                    self.live_stream.quality,
+                    video_codec,
+                ).video_bitrate_max,
+                quality = self.live_stream.quality,
+                video_codec = video_codec,
+            )
+            options += [
+                '--transport-rate-kbps',
+                ParseKonomiTVBS4KAdvancedLiveMuxrateKbps(muxrate),
+            ]
+        return options
 
 
     def buildFFmpeg8HardwareOptions(
@@ -129,7 +199,10 @@ class LiveEncodingTask:
         """現 main の単一 pipeline 向け FFmpeg 8 HW エンコードオプションを返す。"""
 
         config = Config()
-        codec: Literal['avc', 'hevc'] = 'hevc' if QUALITY[quality].is_hevc is True else 'avc'
+        codec = self.GetRequestedVideoCodec()
+        bit_depth = self.GetRequestedVideoBitDepth()
+        codec_spec = RecordedPlaybackBackend.getCodecSpec(codec, bit_depth)
+        bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, codec)
         encoder_name = RecordedPlaybackBackend.getEncoderName(encoder_type, codec)
         if encoder_name is None:
             raise RuntimeError(f'Unsupported FFmpeg 8 live encoder: {encoder_type}/{codec}')
@@ -137,12 +210,22 @@ class LiveEncodingTask:
         # 現 main では source coordinator を持たないため、デコードと表示アスペクト処理は
         # system memory で行い、エンコード直前だけ選択 backend へ upload する。
         options: list[str] = []
+        selected_device: str | None = None
+        if encoder_type in ('QSV', 'AMF'):
+            selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(
+                encoder_type,
+                codec,
+                bit_depth,
+            )
+            if selected_device is None:
+                # legacy URLはtargeted probeを通らないため、その場合だけ同vendorの先頭候補へ退避する。
+                render_devices = RecordedPlaybackBackend.discoverRenderDevices(encoder_type)
+                if len(render_devices) == 0:
+                    raise RuntimeError(f'No compatible render device was found for {encoder_type}.')
+                selected_device = render_devices[0]
         if encoder_type == 'QSV':
-            render_devices = RecordedPlaybackBackend.discoverRenderDevices('QSV')
-            if len(render_devices) == 0:
-                raise RuntimeError('No compatible render device was found for QSV.')
             options += [
-                '-init_hw_device', f'qsv=live_qsv:{render_devices[0]}',
+                '-init_hw_device', f'qsv=live_qsv:{selected_device}',
                 '-filter_hw_device', 'live_qsv',
             ]
         elif encoder_type == 'NVENC':
@@ -150,10 +233,17 @@ class LiveEncodingTask:
                 '-init_hw_device', 'cuda=live_cuda:0',
                 '-filter_hw_device', 'live_cuda',
             ]
+        elif encoder_type == 'AMF':
+            options += [
+                '-init_hw_device', f'vaapi=live_vaapi:{selected_device}',
+                '-filter_hw_device', 'live_vaapi',
+            ]
 
+        input_probesize: str | None = None
         if is_oneseg is True:
             analyzeduration = round(2_500_000 + (self._retry_count * 200_000))
         elif channel_type == 'BS4K' and config.general.encoder_bs4k_input_analysis_enabled is True:
+            input_probesize = f'{round(config.general.encoder_bs4k_input_probesize + (self._retry_count * 500))}K'
             analyzeduration = round(
                 (config.general.encoder_bs4k_input_analyze * 1_000_000) +
                 (self._retry_count * 200_000)
@@ -165,11 +255,14 @@ class LiveEncodingTask:
 
         low_latency = channel_type != 'BS4K' or config.general.encoder_bs4k_low_latency is True
         if low_latency is True:
-            options += ['-fflags', 'nobuffer', '-flags', 'low_delay']
+            # -flags low_delay は MPEG-2 の B フレームを復号順で出力し、表示 PTS を逆行させる。
+            # demux の先読みだけを抑える -fflags nobuffer は維持する。
+            options += ['-fflags', 'nobuffer']
+        options += ['-f', 'mpegts']
+        if input_probesize is not None:
+            options += ['-probesize', input_probesize]
         options += [
-            '-f', 'mpegts',
-            '-analyzeduration', str(analyzeduration),
-            '-i', 'pipe:0',
+            '-analyzeduration', str(analyzeduration), '-i', 'pipe:0',
             '-ignore_unknown',
             '-map', '0:v:0',
             '-map', '0:a?',
@@ -187,25 +280,48 @@ class LiveEncodingTask:
             if self.live_stream.encoding_options.is_24fps_mode_enabled is True:
                 filters += ['pullup', 'dejudder']
             elif QUALITY[quality].is_60fps is True:
-                filters.append('yadif=mode=1:parity=-1:deint=1')
+                # ISDB 1080i/480i は top-field-first。auto 判定は隣接 field を逆順にし得るため固定する。
+                filters.append('yadif=mode=1:parity=0:deint=1')
             else:
-                filters.append('yadif=mode=0:parity=-1:deint=1')
+                filters.append('yadif=mode=0:parity=0:deint=1')
         filters += BuildKonomiTVBS4KLiveAspectPreservingScaleFilters(encode_plan)
-        filters.append('format=p010le' if self.live_stream.encoding_options.is_hevc_10bit_enabled is True else 'format=nv12')
+        # HW encoder は system-memory の YUV420P ではなく NV12 / P010 を受け取る。
+        # QSV/CUDA は続く upload で hardware frame へ変換する。AMF はprobeと同じ
+        # VAAPI境界で選択済みdeviceを通した後、system-memoryの同形式へ戻して渡す。
+        filters.append(f'format={codec_spec.encoder_pixel_format}')
         if encoder_type == 'QSV':
             filters.append('hwupload=extra_hw_frames=64')
         elif encoder_type == 'NVENC':
             filters.append('hwupload_cuda')
+        else:
+            # probeで選ばれたAMD render nodeを実経路でも通し、AMFへはsystem-memoryで戻す。
+            filters += [
+                'hwupload',
+                f'scale_vaapi=w={encode_plan.encode_width}:h={encode_plan.encode_height}:'
+                f'format={codec_spec.encoder_pixel_format}',
+                f'hwdownload,format={codec_spec.encoder_pixel_format}',
+            ]
         options += ['-vf', ','.join(filters)]
 
         options += [
             '-c:v', encoder_name,
-            '-b:v', QUALITY[quality].video_bitrate,
-            '-maxrate', QUALITY[quality].video_bitrate_max,
+            '-b:v', bitrate.video_bitrate,
+            '-maxrate', bitrate.video_bitrate_max,
             '-aspect', '16:9',
         ]
+        if codec in ('vp9', 'av1'):
+            options += ['-bufsize', bitrate.video_bitrate_max]
+        # hwupload 後へ software pixel format を強制すると auto_scale が挿入される。
+        if encoder_type == 'NVENC':
+            options += ['-pix_fmt', 'cuda']
+        elif encoder_type == 'AMF':
+            options += ['-pix_fmt', codec_spec.encoder_pixel_format]
         if encoder_type == 'QSV':
-            options += ['-preset', 'medium', '-async_depth', '1', '-look_ahead', '0', '-bf', '0']
+            options += ['-preset', 'medium', '-async_depth', '1', '-bf', '0']
+            # look_ahead は h264_qsv 固有。HEVC / VP9 / AV1 へ渡すと未使用警告になり、
+            # 能力probeと実ライブ起動の引数契約も曖昧になるため AVC だけに限定する。
+            if codec == 'avc':
+                options += ['-look_ahead', '0']
         elif encoder_type == 'NVENC':
             options += [
                 '-preset', 'p4', '-tune', 'll', '-rc', 'vbr', '-rc-lookahead', '0',
@@ -217,13 +333,19 @@ class LiveEncodingTask:
         if codec == 'hevc':
             options += [
                 '-profile:v',
-                'main10' if self.live_stream.encoding_options.is_hevc_10bit_enabled is True else 'main',
+                'main10' if bit_depth == 10 else 'main',
             ]
-        else:
+        elif codec == 'avc':
             options += ['-profile:v', 'high']
+        elif codec == 'vp9':
+            # vp9_qsv は数値でなく profile0 / profile2 を受け付ける。
+            options += ['-profile:v', 'profile2' if bit_depth == 10 else 'profile0']
+        elif codec == 'av1' and encoder_type != 'NVENC':
+            # av1_nvenc は profile オプション自体を公開しない。QSV / AMF は main を受け付ける。
+            options += ['-profile:v', 'main']
 
         if is_oneseg is True:
-            options += ['-fps_mode', 'vfr', '-g', '30' if codec == 'hevc' else '8']
+            options += ['-fps_mode', 'vfr', '-g', '15' if codec in ('vp9', 'av1') else ('30' if codec == 'hevc' else '8')]
         elif channel_type == 'BS4K':
             frame_rate = 30 if '-30fps' in quality else 60
             options += [
@@ -237,16 +359,40 @@ class LiveEncodingTask:
         else:
             options += ['-r', '30000/1001', '-g', '15']
 
-        audio_bitrate = '96K' if is_oneseg is True else QUALITY[quality].audio_bitrate
+        if self.GetRequestedAudioCodec() == 'opus':
+            options += [
+                '-af', self.LIVE_TRANSCODE_AUDIO_FILTER,
+                '-c:a', 'libopus', '-application', 'audio', '-ac', '2', '-b:a', '192K', '-ar', '48000',
+            ]
+        elif is_oneseg is True:
+            # ワンセグは従来どおりAAC stereoへ正規化する。
+            options += [
+                '-af', self.LIVE_TRANSCODE_AUDIO_FILTER,
+                '-c:a', 'aac', '-aac_coder', 'twoloop', '-ac', '2', '-b:a', '96K', '-ar', '48000',
+            ]
+        else:
+            # 通常放送とCompatibility APIは実在AACトラックをそのまま保持し、
+            # 5.1ch・dual mono・複数音声をstereoへ黙って変換しない。
+            options += ['-c:a', 'copy']
+        max_interleave_delta = round(
+            (
+                config.general.encoder_bs4k_max_interleave_delta
+                if channel_type == 'BS4K'
+                else 500
+            ) + (self._retry_count * 100)
+        )
         options += [
-            '-c:a', 'aac', '-aac_coder', 'twoloop', '-ac', '2', '-b:a', audio_bitrate, '-ar', '48000',
             '-c:d', 'copy',
             '-max_delay', '250000',
-            '-max_interleave_delta', f'{round(500 + (self._retry_count * 100))}K',
+            '-max_interleave_delta', f'{max_interleave_delta}K',
         ]
-        if self.IsStreamAnchorEnabled() is True:
+        if self.IsStreamAnchorEnabled() is True or self.IsTSCodecBridgeRequired() is True:
             options += [
-                '-muxrate', ResolveKonomiTVBS4KAdvancedLiveMuxrate(QUALITY[quality].video_bitrate_max),
+                '-muxrate', ResolveKonomiTVBS4KAdvancedLiveMuxrate(
+                    bitrate.video_bitrate_max,
+                    quality = quality,
+                    video_codec = codec,
+                ),
                 '-pcr_period', '20',
             ]
         if low_latency is True:
@@ -308,16 +454,26 @@ class LiveEncodingTask:
             list[str]: FFmpeg に渡すオプションが連なる配列
         """
 
+        codec = self.GetRequestedVideoCodec()
+        bit_depth = self.GetRequestedVideoBitDepth()
+        codec_spec = RecordedPlaybackBackend.getCodecSpec(codec, bit_depth)
+        encoder_name = RecordedPlaybackBackend.getEncoderName('FFmpeg', codec)
+        if encoder_name is None:
+            raise RuntimeError(f'Unsupported FFmpeg 8 live encoder: FFmpeg/{codec}')
+        bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, codec)
+
         # オプションの入る配列
         options: list[str] = []
 
         # 入力ストリームの解析時間
         CONFIG = Config()
+        input_probesize: str | None = None
         if is_oneseg is True:
             # ワンセグは低フレームレートの H.264 で、GOP の途中から受信を開始すると
             # SPS/PPS・IDR の検出まで時間がかかるため、初回から十分な解析時間を確保する
             analyzeduration = round(2_500_000 + (self._retry_count * 200_000))
         elif channel_type == 'BS4K' and CONFIG.general.encoder_bs4k_input_analysis_enabled is True:
+            input_probesize = f'{round(CONFIG.general.encoder_bs4k_input_probesize + (self._retry_count * 500))}K'
             analyzeduration = round((CONFIG.general.encoder_bs4k_input_analyze * 1000000) + (self._retry_count * 200000))
         elif channel_type == 'SKY':
             # H.264 入力のスカパー！プレミアムサービスは入力ストリームの解析時間を長めにする
@@ -327,15 +483,15 @@ class LiveEncodingTask:
 
         # 入力
         ## -analyzeduration をつけることで、ストリームの分析時間を短縮できる
-        options.append(f'-f mpegts -analyzeduration {analyzeduration} -i pipe:0')
+        input_options = '-f mpegts'
+        if input_probesize is not None:
+            input_options += f' -probesize {input_probesize}'
+        input_options += f' -analyzeduration {analyzeduration} -i pipe:0'
+        options.append(input_options)
 
-        # ストリームのマッピング
-        ## 音声切り替えのため、主音声・副音声両方をエンコード後の TS に含む
-        ## ワンセグは音声が1ストリームだけの場合があるため、後段の optional な全音声マッピングだけを利用する
-        if is_oneseg is True:
-            options.append('-ignore_unknown')
-        else:
-            options.append('-map 0:v:0 -map 0:a:0 -map 0:a:1 -map 0:d? -ignore_unknown')
+        # 実在する全ストリームの optional map は音声codec確定後に一度だけ追加する。
+        # ここで旧個別mapも残すと映像・音声・dataが重複し、音声1本の番組は0:a:1で起動失敗する。
+        options.append('-ignore_unknown')
 
         # フラグ
         ## 主に FFmpeg の起動を高速化するための設定
@@ -348,45 +504,56 @@ class LiveEncodingTask:
         if channel_type == 'BS4K' and CONFIG.general.encoder_bs4k_low_latency is False:
             options.append(f'-max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
         else:
-            options.append(f'-fflags nobuffer -flags low_delay -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
+            # -flags low_delay は入力 B フレームの表示 PTS を逆行させるため指定しない。
+            options.append(f'-fflags nobuffer -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
 
         # 映像
         ## コーデック
-        if QUALITY[quality].is_hevc is True:
-            options.append('-vcodec libx265')  # H.265/HEVC
-        else:
-            options.append('-vcodec libx264')  # H.264
+        options.append(f'-vcodec {encoder_name}')
 
         ## ビットレートと品質
-        options.append(f'-flags +cgop -vb {QUALITY[quality].video_bitrate} -maxrate {QUALITY[quality].video_bitrate_max}')
-        options.append('-preset veryfast -aspect 16:9')
-        if QUALITY[quality].is_hevc is True:
-            options.append('-profile:v main')
-        else:
+        options.append(f'-flags +cgop -vb {bitrate.video_bitrate} -maxrate {bitrate.video_bitrate_max}')
+        if codec in ('vp9', 'av1'):
+            # 固定muxrateへ大きなI-frame burstを流さないよう、能力probeと同じVBV上限を持たせる。
+            options.append(f'-bufsize {bitrate.video_bitrate_max}')
+        options.append('-aspect 16:9')
+        options.append(' '.join(RecordedPlaybackBackend.getTuningArguments('FFmpeg', codec)))
+        options.append(f'-pix_fmt {codec_spec.pixel_format}')
+        if codec == 'hevc':
+            options.append(f'-profile:v {"main10" if bit_depth == 10 else "main"}')
+        elif codec == 'avc':
             options.append('-profile:v high')
+        elif codec == 'vp9':
+            options.append(f'-profile:v {2 if bit_depth == 10 else 0} -lag-in-frames 0 -auto-alt-ref 0')
+        else:
+            options.append('-profile:v 0 -lag-in-frames 0')
 
         ## フル HD 放送が行われているチャンネルかつ、指定された品質の解像度が 1440×1080 (1080p) の場合のみ、
         ## 特別に縦解像度を 1920 に変更してフル HD (1920×1080) でエンコードする
-        video_width = QUALITY[quality].width
-        video_height = QUALITY[quality].height
-        if video_width == 1440 and video_height == 1080 and is_fullhd_channel is True:
-            video_width = 1920
+        encode_plan = ResolveKonomiTVBS4KLiveEncodePlan(
+            QUALITY[quality].width,
+            QUALITY[quality].height,
+            video_codec = codec,
+            is_fullhd_channel = is_fullhd_channel,
+        )
+        aspect_filters = BuildKonomiTVBS4KLiveAspectPreservingScaleFilters(encode_plan)
+        aspect_filters.append(f'format={codec_spec.pixel_format}')
 
         ## 最大 GOP 長 (秒)
         ## 30fps なら ×30 、 60fps なら ×60 された値が --gop-len で使われる
         gop_length_second = self.GOP_LENGTH_SECONDS_H264
-        if QUALITY[quality].is_hevc is True:
+        if codec == 'hevc':
             ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
             gop_length_second = self.GOP_LENGTH_SECONDS_H265
 
         # ワンセグはプログレッシブかつ約 10～15fps の VFR で放送されているため、
         ## フレームレートの固定やインターレース解除を行わず、入力 PTS をそのまま維持する。
         if is_oneseg is True:
-            options.append(f'-vf scale={video_width}:{video_height}')
-            options.append(f'-fps_mode vfr -g {30 if QUALITY[quality].is_hevc is True else 8}')
+            options.append(f'-vf {",".join(aspect_filters)}')
+            options.append(f'-fps_mode vfr -g {15 if codec in ("vp9", "av1") else (30 if codec == "hevc" else 8)}')
         ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わない
         elif channel_type == "BS4K":
-            options.append(f'-vf scale={video_width}:{video_height}')
+            options.append(f'-vf {",".join(aspect_filters)}')
             if '-30fps' in quality:
                 options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
             else:
@@ -394,36 +561,42 @@ class LiveEncodingTask:
         else:
             ## インターレース解除 (60i → 60p (フレームレート: 60fps))
             if QUALITY[quality].is_60fps is True:
-                options.append(f'-vf yadif=mode=1:parity=-1:deint=1,scale={video_width}:{video_height}')
+                options.append(f'-vf yadif=mode=1:parity=0:deint=1,{",".join(aspect_filters)}')
                 options.append(f'-r 60000/1001 -g {int(gop_length_second * 60)}')
             ## インターレース解除 (60i → 30p (フレームレート: 30fps))
             else:
                 # 24fps モードでは、テレシネ由来の重複フレームを取り除いて 24/30p 混合 VFR で出力する
                 ## dejudder を併用すると、24fps 区間の PTS が 41.7ms 間隔に均されて本来の 24fps に近い時刻列になる
                 if self.live_stream.encoding_options.is_24fps_mode_enabled is True:
-                    options.append(f'-vf pullup,dejudder,scale={video_width}:{video_height}')
+                    options.append(f'-vf pullup,dejudder,{",".join(aspect_filters)}')
                     options.append(f'-fps_mode vfr -g {int(gop_length_second * 30)}')
                 else:
-                    options.append(f'-vf yadif=mode=0:parity=-1:deint=1,scale={video_width}:{video_height}')
+                    options.append(f'-vf yadif=mode=0:parity=0:deint=1,{",".join(aspect_filters)}')
                     options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
 
         # 音声
-        if is_oneseg is True:
-            # ワンセグでは、放送局や番組によって ADTS の channel_configuration=0 と
-            # PCE (Program Config Element) に依存する AAC が送出されることがある。
-            # そのままコピーするとブラウザ側の AAC デコーダーで再生できないため、
-            # 標準的なステレオ AAC (channel_configuration=2) へ正規化する。
-            options.append('-map 0:v:0 -map 0:a? -map 0:d?')
-            options.append('-acodec aac -aac_coder twoloop -ac 2 -ab 96K -ar 48000')
+        options.append('-map 0:v:0 -map 0:a? -map 0:d?')
+        if self.GetRequestedAudioCodec() == 'opus':
+            options.append(
+                f'-af {self.LIVE_TRANSCODE_AUDIO_FILTER} '
+                '-acodec libopus -application audio -ac 2 -ab 192K -ar 48000'
+            )
+        elif is_oneseg is True:
+            # ワンセグは従来どおりAAC stereoへ正規化する。
+            options.append(
+                f'-af {self.LIVE_TRANSCODE_AUDIO_FILTER} '
+                '-acodec aac -aac_coder twoloop -ac 2 -ab 96K -ar 48000'
+            )
         else:
-            # 通常放送は実在する音声トラックをすべてそのまま保持する
-            options.append('-map 0:v:0 -map 0:a? -map 0:d? -acodec copy')
+            # 通常放送とCompatibility APIは実在AACトラックをそのまま保持し、
+            # 5.1ch・dual mono・複数音声をstereoへ黙って変換しない。
+            options.append('-acodec copy')
 
         # Bridge は PCR gap を fail closed で検証するため、Anchor 経路の TS は
         # codec にかかわらず固定 muxrate と 20ms PCR 周期で出力する。
-        if self.IsStreamAnchorEnabled() is True:
+        if self.IsStreamAnchorEnabled() is True or self.IsTSCodecBridgeRequired() is True:
             options.append(
-                f'-muxrate {ResolveKonomiTVBS4KAdvancedLiveMuxrate(QUALITY[quality].video_bitrate_max)} '
+                f'-muxrate {ResolveKonomiTVBS4KAdvancedLiveMuxrate(bitrate.video_bitrate_max, quality=quality, video_codec=codec)} '
                 '-pcr_period 20'
             )
 
@@ -466,11 +639,19 @@ class LiveEncodingTask:
         ## max_interleave_delta: mux 時に影響するオプションで、増やしすぎると CM で詰まりがちになる
         ## リトライなしの場合は 500K (0.5秒) に設定し、リトライ回数に応じて 100K (0.1秒) ずつ増やす
         max_interleave_delta = round(500 + (self._retry_count * 100))
-        options.append(f'-fflags nobuffer -flags low_delay -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
+        options.append(f'-fflags nobuffer -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
 
-        # 音声
-        ## 音声が 5.1ch かどうかに関わらず、ステレオにダウンミックスする
-        options.append('-acodec aac -aac_coder twoloop -ac 2 -ab 192K -ar 48000 -af volume=2.0')
+        # 音声が 5.1ch かどうかに関わらずステレオへ正規化する。
+        if self.GetRequestedAudioCodec() == 'opus':
+            options.append(
+                '-acodec libopus -application audio -ac 2 -ab 192K -ar 48000 '
+                f'-af {self.LIVE_TRANSCODE_AUDIO_FILTER},volume=2.0'
+            )
+        else:
+            options.append(
+                '-acodec aac -aac_coder twoloop -ac 2 -ab 192K -ar 48000 '
+                f'-af {self.LIVE_TRANSCODE_AUDIO_FILTER},volume=2.0'
+            )
 
         # 出力
         options.append('-y -f mpegts')  # MPEG-TS 出力ということを明示
@@ -848,8 +1029,12 @@ class LiveEncodingTask:
             self.IsStreamAnchorEnabled() is True and
             channel.is_radiochannel is False
         )
+        codec_bridge_required = self.IsTSCodecBridgeRequired(
+            is_radiochannel = channel.is_radiochannel,
+        )
+        bridge_required = stream_anchor_enabled or codec_bridge_required
         bridge_path: str | None = None
-        if stream_anchor_enabled is True:
+        if bridge_required is True:
             bridge_path = LIBRARY_PATH[self.TS_CODEC_BRIDGE_LIBRARY_PATH_KEY]
             if TSCodecBridgeRuntimeVerifier.isAvailable(bridge_path) is False:
                 self.live_stream.setStatus(
@@ -858,9 +1043,7 @@ class LiveEncodingTask:
                 )
                 self.live_stream.disconnectAll()
                 return
-            stream_anchor_generation_id = self.GenerateStreamAnchorGenerationID()
-        else:
-            stream_anchor_generation_id = None
+        stream_anchor_generation_id = self.ResolveStreamAnchorGenerationID(stream_anchor_enabled)
 
         # 現在の番組情報を取得する
         program_present = (await channel.getCurrentAndNextProgram())[0]
@@ -961,15 +1144,17 @@ class LiveEncodingTask:
         if channel.is_radiochannel is True:
             ENCODER_TYPE = 'FFmpeg'
 
-        # Anchor 有効時だけ Encoder 出力と Bridge 入力を OS pipe で直結する。
+        # Anchor またはcodec変換でBridgeが必要な時だけ、Encoder 出力と Bridge 入力を OS pipe で直結する。
         # Python で TS を往復させず、最終的な Bridge stdout だけを配信側が読む。
         bridge: asyncio.subprocess.Process | None = None
         bridge_write_pipe: int | None = None
         encoder_stdout: int = asyncio.subprocess.PIPE
-        if stream_anchor_enabled is True:
+        if bridge_required is True:
             assert bridge_path is not None
             bridge_read_pipe, bridge_write_pipe = os.pipe()
-            bridge_options = self.BuildTSCodecBridgeOptions()
+            bridge_options = self.BuildTSCodecBridgeOptions(
+                is_radiochannel = channel.is_radiochannel,
+            )
             logging.info(
                 f'{self.live_stream.log_prefix} TS Codec Bridge Commands:\n'
                 f'{bridge_path} {" ".join(bridge_options)}'
@@ -996,7 +1181,7 @@ class LiveEncodingTask:
                 os.close(bridge_read_pipe)
 
         # 現 main の公開設定 FFmpeg / QSV / NVENC / AMF は、すべて同梱 FFmpeg 8 で実行する。
-        ffmpeg8_encoder_type = cast(KonomiTVBS4KPlaybackEncoder, ENCODER_TYPE)
+        ffmpeg8_encoder_type = ENCODER_TYPE
         encoder_executable = RecordedPlaybackBackend.getExecutable(ffmpeg8_encoder_type)
         encoder_environment = RecordedPlaybackBackend.getEnvironment(ffmpeg8_encoder_type)
 
@@ -1049,7 +1234,7 @@ class LiveEncodingTask:
         else:
 
             # オプションを取得
-            hw_encoder_type = cast(Literal['QSV', 'NVENC', 'AMF'], ENCODER_TYPE)
+            hw_encoder_type = ENCODER_TYPE
             encoder_options = self.buildFFmpeg8HardwareOptions(
                 self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel, channel.is_oneseg,
             )

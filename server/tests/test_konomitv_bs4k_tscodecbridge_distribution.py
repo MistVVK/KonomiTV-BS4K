@@ -294,7 +294,14 @@ def test_bridge_build_script_uses_verified_archives_and_records_runtime_provenan
     )
 
     assert syntax_result.returncode == 0, syntax_result.stderr
-    assert stat.S_IMODE(BUILD_SCRIPT_PATH.stat().st_mode) == 0o755
+    build_script_stat = BUILD_SCRIPT_PATH.stat()
+    build_script_mode = stat.S_IMODE(build_script_stat.st_mode)
+    # Git は executable bit だけを配布契約として保持し、group-write は共有
+    # worktree の umask / mount policy で変わり得る。固定 0755 ではなく、
+    # 実行に必要な regular file・owner executable と world-writable 禁止を検証する。
+    assert stat.S_ISREG(build_script_stat.st_mode)
+    assert build_script_mode & stat.S_IXUSR
+    assert build_script_mode & stat.S_IWOTH == 0
     assert (
         'https://codeload.github.com/${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}/'
         '${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME}/tar.gz/'
@@ -308,7 +315,7 @@ def test_bridge_build_script_uses_verified_archives_and_records_runtime_provenan
     assert 'konomitv-bs4k-tscodecbridge.asd' in script
     assert 'SBLINT_SOURCE_DIR=' in script
     assert 'MALLET_BINARY=' in script
-    assert re.search(r'\bci\n', script)
+    assert re.search(r'\bcheck \\\n[ \t]+test-executable\n', script)
     assert 'test-ffmpeg-integration' in script
     assert '--help' not in script
     assert 'BUILDER_PACKAGE\\t%s\\t%s\\t%s' in script

@@ -50,7 +50,12 @@ def test_live_stream_backend_truth_table(
     assert 'live_stream_backend' not in settings.general.model_dump()
 
 
-def _build_encoding_task(monkeypatch: pytest.MonkeyPatch, *, is_24fps_mode_enabled: bool) -> LiveEncodingTask:
+def _build_encoding_task(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    is_24fps_mode_enabled: bool,
+    video_codec: str,
+) -> LiveEncodingTask:
     """
     エンコードオプションの単体テストに必要な最小構成のタスクを作成する。
 
@@ -68,9 +73,13 @@ def _build_encoding_task(monkeypatch: pytest.MonkeyPatch, *, is_24fps_mode_enabl
     task = object.__new__(LiveEncodingTask)
     task._retry_count = 0
     task.live_stream = SimpleNamespace(
+        stream_anchor_enabled=True,
         encoding_options=SimpleNamespace(
             is_24fps_mode_enabled=is_24fps_mode_enabled,
             is_hevc_10bit_enabled=False,
+            video_codec=video_codec,
+            video_bit_depth=8,
+            audio_codec='aac',
         ),
     )
     return task
@@ -100,7 +109,11 @@ def test_ffmpeg_oneseg_options_preserve_progressive_vfr(
         None
     """
 
-    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=True)
+    task = _build_encoding_task(
+        monkeypatch,
+        is_24fps_mode_enabled=True,
+        video_codec='hevc' if quality.endswith('-hevc') else 'avc',
+    )
     options = task.buildFFmpegOptions(quality, 'GR', False, True)  # type: ignore[arg-type]
 
     assert options[options.index('-analyzeduration') + 1] == '2500000'
@@ -145,7 +158,7 @@ def test_hwenc_oneseg_options_preserve_progressive_vfr(
         None
     """
 
-    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=True)
+    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=True, video_codec='avc')
     options = task.buildHWEncCOptions(  # type: ignore[arg-type]
         quality,
         encoder_type,
@@ -182,13 +195,14 @@ def test_non_oneseg_encoding_options_keep_existing_interlaced_path(monkeypatch: 
         None
     """
 
-    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=False)
+    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=False, video_codec='avc')
 
     ffmpeg_options = task.buildFFmpegOptions('240p', 'GR', False)
     assert ffmpeg_options[ffmpeg_options.index('-analyzeduration') + 1] == '500000'
     assert ffmpeg_options[ffmpeg_options.index('-r') + 1] == '30000/1001'
     assert any('yadif=mode=0' in option for option in ffmpeg_options)
     assert ffmpeg_options[ffmpeg_options.index('-acodec') + 1] == 'copy'
+    assert '-ac' not in ffmpeg_options
 
     hwenc_options = task.buildHWEncCOptions('240p', 'QSVEncC', 'GR', False)
     assert hwenc_options[hwenc_options.index('--input-probesize') + 1] == '1000K'
@@ -203,7 +217,7 @@ def test_non_oneseg_encoding_options_keep_existing_interlaced_path(monkeypatch: 
 def test_oneseg_input_analysis_keeps_retry_increments(monkeypatch: pytest.MonkeyPatch) -> None:
     """ワンセグ専用の初期解析値にも既存のリトライ増分を適用する。"""
 
-    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=False)
+    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=False, video_codec='avc')
     task._retry_count = 1
 
     ffmpeg_options = task.buildFFmpegOptions('240p', 'GR', False, True)

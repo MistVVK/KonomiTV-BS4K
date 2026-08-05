@@ -1,20 +1,31 @@
 
 import asyncio
 import copy
-from typing import Annotated
+from typing import Annotated, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from fastapi.requests import Request
 from fastapi.responses import Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 from starlette.types import Receive
 
 from app import logging, schemas
+from app.constants import QUALITY_TYPES
 from app.models.Channel import Channel
+from app.streams.KonomiTVBS4KPlaybackCapabilities import (
+    KonomiTVBS4KPlaybackCapabilityProbe,
+)
+from app.streams.KonomiTVBS4KPlaybackEncoding import (
+    KonomiTVBS4KAudioCodec,
+    KonomiTVBS4KVideoBitDepth,
+    KonomiTVBS4KVideoBitDepthQuery,
+    KonomiTVBS4KVideoCodec,
+)
 from app.streams.LiveStream import LiveStream, LiveStreamStatus
 from app.streams.StreamEncodingOptions import (
     GetEncoderForLiveChannel,
     SplitQualityAndEncodingOptions,
+    StreamEncodingOptions,
     StreamQualityWithOptions,
 )
 
@@ -52,12 +63,34 @@ async def ValidateChannelID(display_channel_id: Annotated[str, Path(description=
 async def ValidateQuality(
     quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
     display_channel_id: Annotated[str, Depends(ValidateChannelID)],
+    video_codec: Annotated[
+        KonomiTVBS4KVideoCodec | None,
+        Query(description='出力映像コーデック。省略時は旧画質URLから判定。'),
+    ] = None,
+    video_bit_depth: Annotated[
+        KonomiTVBS4KVideoBitDepthQuery | None,
+        Query(description='出力映像 bit depth。'),
+    ] = None,
+    audio_codec: Annotated[
+        KonomiTVBS4KAudioCodec,
+        Query(description='出力音声コーデック。'),
+    ] = 'aac',
 ) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
 
     # 指定された品質が存在するか確認
     ## 品質の指定に -10bit や -24fps が付いていれば分解する
-    stream_quality = SplitQualityAndEncodingOptions(quality, GetEncoderForLiveChannel(display_channel_id))
+    selected_encoder = GetEncoderForLiveChannel(display_channel_id)
+    stream_quality = SplitQualityAndEncodingOptions(
+        quality,
+        selected_encoder,
+        video_codec = video_codec,
+        video_bit_depth = cast(
+            KonomiTVBS4KVideoBitDepth | None,
+            int(video_bit_depth) if video_bit_depth is not None else None,
+        ),
+        audio_codec = audio_codec,
+    )
     if stream_quality is None:
         logging.error(f'[LiveStreamsRouter][ValidateQuality] Specified quality was not found. [quality: {quality}]')
         raise HTTPException(
@@ -65,6 +98,61 @@ async def ValidateQuality(
             detail = 'Specified quality was not found',
         )
 
+    # ラジオは映像 backend を使わない。映像・深度・24fpsを中立値へ正規化し、音声だけを共有キーに残す。
+    capability_encoder = selected_encoder
+    channel = await Channel.filter(display_channel_id = display_channel_id).get_or_none()
+    is_radiochannel = channel is not None and channel.is_radiochannel is True
+    if is_radiochannel is True:
+        capability_encoder = 'FFmpeg'
+        stream_quality = StreamQualityWithOptions(
+            quality = cast(QUALITY_TYPES, stream_quality.quality.removesuffix('-hevc')),
+            encoding_options = StreamEncodingOptions(audio_codec = audio_codec),
+        )
+
+    resolved_video_codec = stream_quality.encoding_options.video_codec
+    resolved_video_bit_depth = stream_quality.encoding_options.video_bit_depth
+    resolved_audio_codec = stream_quality.encoding_options.audio_codec
+    is_advanced_combination = resolved_video_codec in ('vp9', 'av1') or resolved_audio_codec == 'opus'
+    is_encoding_explicitly_requested = (
+        stream_quality.is_video_encoding_explicitly_requested is True
+        or stream_quality.is_audio_encoding_explicitly_requested is True
+        # 旧URLのHEVC 10bitも実エンコーダーがexact 10bitを扱えるか事前検査する。
+        or '-10bit' in quality
+    )
+
+    if is_radiochannel is True and resolved_audio_codec != 'aac':
+        audio_capability = await KonomiTVBS4KPlaybackCapabilityProbe.getAudioCapability(audio_codec)
+        if audio_capability is None or audio_capability.live_available is False:
+            reason_code = audio_capability.live_reason_code if audio_capability is not None else 'ProbeFailed'
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = {
+                    'code': reason_code,
+                    'message': 'The requested live audio encoding is unavailable.',
+                },
+            )
+    elif (
+        is_radiochannel is False
+        and (is_advanced_combination is True or is_encoding_explicitly_requested is True)
+    ):
+        live_combination = await KonomiTVBS4KPlaybackCapabilityProbe.getLiveCombinationCapability(
+            capability_encoder,
+            resolved_video_codec,
+            resolved_video_bit_depth,
+            resolved_audio_codec,
+        )
+        if live_combination is None or live_combination.available is False:
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = {
+                    'code': (
+                        live_combination.reason_code
+                        if live_combination is not None and live_combination.reason_code is not None
+                        else 'UnsupportedCombination'
+                    ),
+                    'message': 'The requested live video and audio encoding combination is unavailable.',
+                },
+            )
     return stream_quality
 
 

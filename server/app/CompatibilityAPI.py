@@ -1,13 +1,15 @@
 import json
 import re
 from collections.abc import Sequence
-from typing import Annotated, Any, Literal
+from dataclasses import replace
+from typing import Annotated, Any, Literal, cast
 
 from fastapi import (
     APIRouter,
     Body,
     Depends,
     FastAPI,
+    HTTPException,
     Path,
     Query,
     Request,
@@ -19,7 +21,7 @@ from pydantic import BaseModel
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app import schemas
-from app.constants import VERSION
+from app.constants import QUALITY_TYPES, VERSION
 from app.models.RecordedProgram import RecordedProgram
 from app.routers import (
     ChannelsRouter,
@@ -30,7 +32,10 @@ from app.routers import (
     VideosRouter,
     VideoStreamsRouter,
 )
-from app.streams.StreamEncodingOptions import StreamQualityWithOptions
+from app.streams.StreamEncodingOptions import (
+    StreamEncodingOptions,
+    StreamQualityWithOptions,
+)
 from app.utils.edcb import ReserveDataRequired
 from app.utils.edcb.CtrlCmdUtil import CtrlCmdUtil
 from app.utils.HTTPS import ReverseProxyMiddleware
@@ -180,10 +185,48 @@ async def ValidateCompatibilityLiveStreamQuality(
 ) -> StreamQualityWithOptions:
     """互換 API のライブ出力を旧 AVC / HEVC + AAC 契約へ固定する。"""
 
-    # 互換ルートの依存関係には高度 codec query を宣言しない。
-    # FastAPI が未知 query を無視しても、通常 API の validator へは固定値だけを渡すため、
-    # VP9 / AV1 / Opus や Bridge 起動条件へ到達できない。
-    return await LiveStreamsRouter.ValidateQuality(quality, display_channel_id)
+    # 互換ルートはStream Anchorを使わないため、mainルートのBridge必須能力は検査しない。
+    # 品質名から旧 AVC / HEVC + AAC tupleを正規化し、不正品質だけを422で拒否する。
+    selected_encoder = LiveStreamsRouter.GetEncoderForLiveChannel(display_channel_id)
+    stream_quality = LiveStreamsRouter.SplitQualityAndEncodingOptions(
+        quality,
+        selected_encoder,
+    )
+    if stream_quality is None:
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified quality was not found',
+        )
+
+    channel = await LiveStreamsRouter.Channel.filter(
+        display_channel_id = display_channel_id,
+    ).get_or_none()
+    if channel is not None and channel.is_radiochannel is True:
+        stream_quality = StreamQualityWithOptions(
+            quality = cast(QUALITY_TYPES, stream_quality.quality.removesuffix('-hevc')),
+            encoding_options = StreamEncodingOptions(audio_codec = 'aac'),
+        )
+    elif (
+        stream_quality.encoding_options.video_codec == 'hevc'
+        and stream_quality.encoding_options.video_bit_depth == 10
+    ):
+        # Komorebi V1 の旧 -10bit は可能なら10bitを使う希望指定であり、exact指定ではない。
+        # main API の exact 契約は変えず、互換 API だけ選択エンコーダーの能力不足時に8bitへ戻す。
+        capability = await LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe.getRecordedVideoCapability(
+            selected_encoder,
+            'hevc',
+            10,
+        )
+        if capability.recorded_available is False:
+            stream_quality = replace(
+                stream_quality,
+                encoding_options = replace(
+                    stream_quality.encoding_options,
+                    is_hevc_10bit_enabled = False,
+                    video_bit_depth = 8,
+                ),
+            )
+    return stream_quality
 
 
 async def ValidateCompatibilityRecordedStreamQuality(
