@@ -1,9 +1,8 @@
 """録画シリーズ ACP の KonomiTV-BS4K 専用プロファイル。
 
-Codex / Grok / Gemini の各 CLI には、ユーザーの対話用 home と
-一切共有しない専用 HOME を割り当てる。Codex / Grok の認証は資格情報専用
-モジュールが明示 import した ``auth.json`` だけを使用し、Gemini は固定 mount
-の Google ADC を読み取り専用で直接参照する。
+Codex / Grok の各 CLI には、ユーザーの対話用 home と一切共有しない専用 HOME を
+割り当てる。Codex / Grok の認証は資格情報専用モジュールが明示 import した
+``auth.json`` だけを使用する。
 """
 
 from __future__ import annotations
@@ -17,25 +16,11 @@ from typing import Literal
 from app.constants import DATA_DIR
 
 
-KonomiTVBS4KACPProfileBackend = Literal['codex', 'grok', 'gemini']
+KonomiTVBS4KACPProfileBackend = Literal['codex', 'grok']
 
 _ACP_PROFILES_ROOT = DATA_DIR / 'acp-profiles' / 'recorded-series'
-_GOOGLE_ADC_PATH = Path(
-    '/run/konomitv-bs4k-host-auth/google/application_default_credentials.json',
-)
 _ISOLATED_DIRS = ['sessions', 'logs', 'memories', 'history', 'tmp', 'workspace', 'cache']
 _CODEX_MANAGED_CONFIG = 'cli_auth_credentials_store = "file"\n'
-# Gemini CLI は profile 内 .gemini/settings.json の selectedType で auth 経路を固定する。
-# Vertex AI + ADC を使う KonomiTV-BS4K では vertex-ai を明示する。
-_GEMINI_MANAGED_SETTINGS_JSON = (
-    '{\n'
-    '  "security": {\n'
-    '    "auth": {\n'
-    '      "selectedType": "vertex-ai"\n'
-    '    }\n'
-    '  }\n'
-    '}\n'
-)
 
 
 class AcpProfileError(Exception):
@@ -120,47 +105,21 @@ def ensure_acp_profile(
             ),
         )
 
-    if backend == 'gemini':
-        # 旧実装やホスト home 共有で残った settings.json symlink は追跡せず、実ファイルへ置き換える。
-        legacy_settings = profile_dir / 'settings.json'
-        if legacy_settings.is_symlink() or legacy_settings.exists():
-            try:
-                legacy_settings.unlink()
-            except OSError as ex:
-                raise AcpProfileError('Failed to remove legacy Gemini settings path.') from ex
-        gemini_config_dir = profile_dir / '.gemini'
-        if gemini_config_dir.is_symlink():
-            raise AcpProfileError('Gemini config directory must not be a symlink.')
-        gemini_config_dir.mkdir(mode=0o700, exist_ok=True)
-        os.chmod(gemini_config_dir, 0o700)
-        _writeManagedFile(
-            gemini_config_dir / 'settings.json',
-            _GEMINI_MANAGED_SETTINGS_JSON,
-        )
-
     return profile_dir
 
 
 def get_profile_environment(
     backend: KonomiTVBS4KACPProfileBackend,
     profile_dir: Path,
-    *,
-    google_cloud_project: str | None = None,
-    google_cloud_location: str | None = None,
 ) -> dict[str, str]:
     """provider 専用 profile と固定認証経路を子プロセス環境へ設定する。
 
     Args:
         backend: ACP バックエンド種別。
         profile_dir: ``ensure_acp_profile()`` で構築した専用 profile。
-        google_cloud_project: Gemini / Vertex AI のプロジェクト ID。
-        google_cloud_location: Gemini / Vertex AI のリージョン。
 
     Returns:
         dict[str, str]: 親環境へ上書きする provider 固有の固定値。
-
-    Raises:
-        AcpProfileError: Gemini に必要な環境依存値が未設定の場合。
     """
 
     profile_path = str(profile_dir)
@@ -177,16 +136,6 @@ def get_profile_environment(
         })
     elif backend == 'grok':
         environment['GROK_HOME'] = profile_path
-    elif backend == 'gemini':
-        if google_cloud_project is None or google_cloud_location is None:
-            raise AcpProfileError('Gemini Vertex AI settings are not configured.')
-        environment.update({
-            'GEMINI_CLI_HOME': profile_path,
-            'GOOGLE_APPLICATION_CREDENTIALS': str(_GOOGLE_ADC_PATH),
-            'GOOGLE_GENAI_USE_VERTEXAI': 'true',
-            'GOOGLE_CLOUD_PROJECT': google_cloud_project,
-            'GOOGLE_CLOUD_LOCATION': google_cloud_location,
-        })
     return environment
 
 

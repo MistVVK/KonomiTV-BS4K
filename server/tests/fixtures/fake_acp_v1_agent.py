@@ -95,7 +95,7 @@ def Main() -> None:
         while True:
             time.sleep(0.05)
     if MODE == 'require_vertex_auth':
-        # Gemini 相当: 非対話 method を広告し、authenticate 後だけ session/new を許可する。
+        # 非対話 method を広告し、authenticate 後だけ session/new を許可する。
         Respond(initialize, {
             'protocolVersion': 1,
             'agentCapabilities': {},
@@ -504,15 +504,15 @@ def Main() -> None:
 
         if MODE in {
             'episode_codex_other_no_permission',
-            'episode_gemini_search_no_permission',
-            'episode_gemini_mixed_fetch_empty_urls',
-            'episode_gemini_mixed_fetch_public',
+            'episode_search_no_permission',
+            'episode_mixed_fetch_empty_urls',
+            'episode_mixed_fetch_public',
         }:
             is_codex = MODE == 'episode_codex_other_no_permission'
             search_source_url = (
                 'https://example.com/codex-other-source'
                 if is_codex
-                else 'https://example.com/gemini-search-source'
+                else 'https://example.com/search-source'
             )
             search_raw_input: dict[str, Any] = (
                 {
@@ -558,18 +558,18 @@ def Main() -> None:
 
             if MODE in {
                 'episode_codex_other_no_permission',
-                'episode_gemini_search_no_permission',
+                'episode_search_no_permission',
             }:
                 FinishPrompt(prompt)
                 return
 
         if MODE in {
-            'episode_gemini_mixed_fetch_empty_urls',
-            'episode_gemini_mixed_fetch_public',
-            'episode_gemini_standalone_fetch_public',
+            'episode_mixed_fetch_empty_urls',
+            'episode_mixed_fetch_public',
+            'episode_standalone_fetch_public',
         }:
-            is_empty_target = MODE == 'episode_gemini_mixed_fetch_empty_urls'
-            fetch_url = 'https://example.com/gemini-fetch-source'
+            is_empty_target = MODE == 'episode_mixed_fetch_empty_urls'
+            fetch_url = 'https://example.com/fetch-source'
             fetch_raw_input: dict[str, Any] = {
                 'type': 'web_fetch',
                 'urls': [] if is_empty_target else [fetch_url],
@@ -632,20 +632,20 @@ def Main() -> None:
             }
             source_url = 'https://example.com/grok-source'
         elif MODE in {
-            'episode_gemini',
-            'episode_gemini_current',
-            'episode_gemini_permission_first',
-            'episode_gemini_permission_then_tool_call',
+            'episode_web_search',
+            'episode_current',
+            'episode_permission_first',
+            'episode_permission_then_tool_call',
         }:
             is_permission_first = MODE in {
-                'episode_gemini_permission_first',
-                'episode_gemini_permission_then_tool_call',
+                'episode_permission_first',
+                'episode_permission_then_tool_call',
             }
             tool_call = {
                 'sessionUpdate': 'tool_call',
                 'toolCallId': 'episode-search',
                 'title': (
-                    'Fetching content from: https://example.com/gemini-source'
+                    'Fetching content from: https://example.com/source'
                     if is_permission_first
                     else 'Searching the web for: "official episode"'
                 ),
@@ -657,10 +657,10 @@ def Main() -> None:
             if is_permission_first:
                 tool_call['rawInput'] = {
                     'type': 'web_fetch',
-                    'url': 'https://example.com/gemini-source',
-                    'urls': ['https://example.com/gemini-source'],
+                    'url': 'https://example.com/source',
+                    'urls': ['https://example.com/source'],
                 }
-            source_url = 'https://example.com/gemini-source'
+            source_url = 'https://example.com/source'
         else:
             raw_input: dict[str, Any] = {
                 'type': 'web_search',
@@ -686,8 +686,8 @@ def Main() -> None:
             source_url = 'https://example.com/codex-source'
 
         if MODE not in {
-            'episode_gemini_permission_first',
-            'episode_gemini_permission_then_tool_call',
+            'episode_permission_first',
+            'episode_permission_then_tool_call',
         }:
             Send({
                 'jsonrpc': '2.0',
@@ -749,8 +749,8 @@ def Main() -> None:
                         if key != 'sessionUpdate'
                     }
                     if MODE in {
-                        'episode_gemini_permission_first',
-                        'episode_gemini_permission_then_tool_call',
+                        'episode_permission_first',
+                        'episode_permission_then_tool_call',
                     }
                     else {'toolCallId': 'episode-search'}
                 ),
@@ -772,7 +772,7 @@ def Main() -> None:
                 'optionId': 'allow-once',
             },
         }
-        if MODE == 'episode_gemini_permission_then_tool_call':
+        if MODE == 'episode_permission_then_tool_call':
             Send({
                 'jsonrpc': '2.0',
                 'method': 'session/update',
@@ -801,8 +801,8 @@ def Main() -> None:
             'status': 'completed',
         }
         if MODE in {
-            'episode_gemini_permission_first',
-            'episode_gemini_permission_then_tool_call',
+            'episode_permission_first',
+            'episode_permission_then_tool_call',
         }:
             completed_update.update({
                 'title': tool_call['title'],
@@ -850,7 +850,7 @@ def Main() -> None:
         elif MODE not in {
             'episode_no_source',
             'episode_codex_open_page',
-            'episode_gemini_current',
+            'episode_current',
         }:
             completed_update['rawOutput'] = {
                 'sources': [

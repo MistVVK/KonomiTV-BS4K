@@ -236,7 +236,7 @@ def test_provider_fingerprint_separates_backend_endpoint_model_and_key() -> None
     """provider fingerprint v2 は backend 固有値を区別し秘密値自体を保持しない。"""
 
     base = BuildEpisodeProviderFingerprint(
-        backend_kind='OpenAICompatible',
+        backend_kind='OpenCode',
         effective_model='model-a',
         endpoint_identifier='https://api.example/v1',
         api_key='provider-secret',
@@ -245,7 +245,7 @@ def test_provider_fingerprint_separates_backend_endpoint_model_and_key() -> None
     assert len(base) == 64
     assert 'provider-secret' not in base
     assert base == BuildEpisodeProviderFingerprint(
-        backend_kind=' OpenAICompatible ',
+        backend_kind=' OpenCode ',
         effective_model=' model-a ',
         endpoint_identifier=' https://api.example/v1 ',
         api_key=' provider-secret ',
@@ -257,19 +257,19 @@ def test_provider_fingerprint_separates_backend_endpoint_model_and_key() -> None
         api_key='provider-secret',
     )
     assert base != BuildEpisodeProviderFingerprint(
-        backend_kind='OpenAICompatible',
+        backend_kind='OpenCode',
         effective_model='model-b',
         endpoint_identifier='https://api.example/v1',
         api_key='provider-secret',
     )
     assert base != BuildEpisodeProviderFingerprint(
-        backend_kind='OpenAICompatible',
+        backend_kind='OpenCode',
         effective_model='model-a',
         endpoint_identifier='https://other.example/v1',
         api_key='provider-secret',
     )
     assert base != BuildEpisodeProviderFingerprint(
-        backend_kind='OpenAICompatible',
+        backend_kind='OpenCode',
         effective_model='model-a',
         endpoint_identifier='https://api.example/v1',
         api_key='different-secret',

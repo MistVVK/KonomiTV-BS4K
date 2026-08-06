@@ -559,7 +559,6 @@ function main() {
     const requiredDirect = [
         ['@agentclientprotocol/codex-acp', '1.1.7'],
         ['@openai/codex', '0.145.0'],
-        ['@google/gemini-cli', '0.52.0'],
         ['@xai-official/grok', '0.2.112'],
     ];
     for (const [name, version] of requiredDirect) {

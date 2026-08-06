@@ -212,7 +212,7 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
 
     assert "CODEX_ACP_VERSION='1.1.7'" in manifest
     assert "CODEX_CLI_VERSION='0.145.0'" in manifest
-    assert "GEMINI_CLI_VERSION='0.52.0'" in manifest
+    assert 'GEMINI_CLI' not in manifest
     assert "GROK_NPM_PACKAGE='@xai-official/grok'" in manifest
     assert "GROK_PLATFORM_NPM_PACKAGE='@xai-official/grok-linux-x64'" in manifest
     assert "GROK_BUILD_VERSION='0.2.112'" in manifest
@@ -236,7 +236,6 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
     assert dependencies == {
         '@agentclientprotocol/codex-acp': '1.1.7',
         '@openai/codex': '0.145.0',
-        '@google/gemini-cli': '0.52.0',
         '@xai-official/grok': '0.2.112',
     }
     # exact version のみ（^ や ~ を禁止）
@@ -286,11 +285,13 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
     assert 'codex-acp --version | grep' not in acp_builder_section
     assert 'codex --version | grep' not in acp_builder_section
     assert 'gemini --version | grep' not in acp_builder_section
+    assert 'gemini_cli_version' not in acp_builder_section
+    assert 'GEMINI_CLI_VERSION' not in manifest
+    assert '@google/gemini-cli' not in dockerfile
     assert 'codex_acp_version="$(/opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp --version)"' in dockerfile
     # 各 CLI の既知の完全1行出力と一致させる（部分一致や pipeline 隠蔽を禁止）
     assert 'test "${codex_acp_version}" = "@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}"' in dockerfile
     assert 'test "${codex_cli_version}" = "codex-cli ${CODEX_CLI_VERSION}"' in dockerfile
-    assert 'test "${gemini_cli_version}" = "${GEMINI_CLI_VERSION}"' in dockerfile
     assert 'test "${grok_version_line}" = "${GROK_BUILD_VERSION_LINE}"' in dockerfile
     assert 'Google Cloud CLI must not be included in the final image.' in dockerfile
     assert 'google-cloud-cli' not in dockerfile
@@ -328,16 +329,12 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
     assert 'expected exactly one unpatched marker' in telemetry_normalizer
     assert 'unexpected pre-patch sha256' in telemetry_normalizer
     assert '0deb6b820dfed8804cd76b16a50210fe12202e5e339b5edaa23f6987f1742e0a' in telemetry_normalizer
-    assert '07430020fdabce0f685daed01a4040e7820cf68b28259feda156abfa217c03ea' in telemetry_normalizer
     assert 'snippet' not in telemetry_normalizer
     assert '...args,' not in telemetry_normalizer
-    assert 'typeof args.url === "string"' in telemetry_normalizer
-    assert 'fc.name === "google_web_search" && acpToolKind === "search"' in telemetry_normalizer
-    assert 'fc.name === "web_fetch" && acpToolKind === "fetch"' in telemetry_normalizer
-    assert 'const acpRawInput = acpIsWebTool ? {' in telemetry_normalizer
-    assert 'status: toolResult.error ? "failed" : "completed"' in telemetry_normalizer
+    assert '@google/gemini-cli' not in telemetry_normalizer
     assert 'rawOutput' in telemetry_normalizer
     assert 'rawInput' in telemetry_normalizer
+    assert 'createWebSearchCompleteUpdate' in telemetry_normalizer
     assert (REPOSITORY_ROOT / 'docker/acp/assemble-acp-license-section.py').is_file()
 
 

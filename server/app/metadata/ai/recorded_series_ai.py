@@ -1,7 +1,7 @@
 """録画シリーズ AI 統合 facade。
 
 プロバイダー非依存のインターフェースを提供し、
-設定に基づいて適切なバックエンド（OpenAI 互換 / ACP）へ routing する。
+設定に基づいて適切なバックエンド（OpenCode / ACP）へ routing する。
 """
 
 from __future__ import annotations
@@ -427,7 +427,7 @@ def _create_backend(
     """設定に基づいてバックエンドインスタンスを生成する。
 
     OpenCode は service_id から OpenCodeBackend を構築する。
-    AcpCodex / AcpGrok は従来どおり ACP アダプタを生成する（Phase 6 まで併存）。
+    AcpCodex / AcpGrok は従来どおり ACP アダプタを生成する。
 
     Args:
         settings: 判定開始時点の録画シリーズ判定設定（immutable snapshot）。
@@ -479,8 +479,6 @@ def _create_backend(
         profile_env = get_profile_environment(
             profile_backend,
             profile_dir,
-            google_cloud_project=settings.google_cloud_project,
-            google_cloud_location=settings.google_cloud_location,
         )
     except (AcpProfileError, OSError) as ex:
         # AI 監査予約後の profile 構築失敗を生例外にすると、Resolver の想定外失敗経路で
@@ -545,7 +543,7 @@ class _AcpAdapter:
         self._cwd = cwd
         # Landlock launcher が書込みを許可する、選択中 provider 専用 profile。
         self._profile_dir = profile_dir
-        # Gemini ADC など、provider ごとに明示した read-only 資格情報ファイル。
+        # provider ごとに明示した read-only 資格情報ファイル（現状は未使用）。
         self._readable_files = readable_files
 
     @property
@@ -557,7 +555,6 @@ class _AcpAdapter:
         backend_prefix_map: dict[str, str] = {
             'AcpCodex': 'acp:codex',
             'AcpGrok': 'acp:grok',
-            'AcpGemini': 'acp:gemini',
         }
         prefix = backend_prefix_map.get(self._backend_kind, 'acp')
         if self._model:
@@ -779,12 +776,11 @@ class _AcpAdapter:
 
 def _backend_to_profile_name(
     backend_kind: str,
-) -> Literal['codex', 'grok', 'gemini']:
+) -> Literal['codex', 'grok']:
     """バックエンド種別をプロファイルディレクトリ名に変換する。"""
-    mapping: dict[str, Literal['codex', 'grok', 'gemini']] = {
+    mapping: dict[str, Literal['codex', 'grok']] = {
         'AcpCodex': 'codex',
         'AcpGrok': 'grok',
-        'AcpGemini': 'gemini',
     }
     try:
         return mapping[backend_kind]
@@ -826,7 +822,7 @@ def _GetACPCredentialProvider(
         backend_kind: 録画シリーズ AI backend の識別子。
 
     Returns:
-        Codex / Grok の provider。Gemini は管理 API から ADC を変更しないため None。
+        Codex / Grok の provider。それ以外は None。
     """
 
     mapping: dict[str, KonomiTVBS4KACPImportProvider] = {

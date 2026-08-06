@@ -72,31 +72,6 @@ def test_konomitv_bs4k_codex_profile_can_enable_and_then_clear_fast_mode(
     )
 
 
-def test_gemini_profile_writes_vertex_ai_settings_and_removes_legacy_symlink(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Gemini profile は Vertex AI を選んだ settings を実ファイルで固定する。"""
-
-    profiles_root = tmp_path / 'profiles'
-    profile = profiles_root / 'gemini'
-    profile.mkdir(parents=True)
-    legacy_target = tmp_path / 'host-gemini-settings.json'
-    legacy_target.write_text('{"legacy": true}\n', encoding='utf-8')
-    (profile / 'settings.json').symlink_to(legacy_target)
-    monkeypatch.setattr(AcpProfiles, '_ACP_PROFILES_ROOT', profiles_root)
-
-    ensured = AcpProfiles.ensure_acp_profile('gemini')
-
-    assert ensured == profile
-    assert (profile / 'settings.json').exists() is False
-    settings_path = profile / '.gemini' / 'settings.json'
-    assert settings_path.is_file()
-    assert settings_path.is_symlink() is False
-    assert 'vertex-ai' in settings_path.read_text(encoding='utf-8')
-    assert legacy_target.read_text(encoding='utf-8') == '{"legacy": true}\n'
-
-
 def test_codex_managed_config_replaces_legacy_symlink_without_modifying_target(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -168,8 +143,7 @@ def test_preset_commands_are_fixed_inside_container() -> None:
     [
         ('codex', 'CODEX_HOME'),
         ('grok', 'GROK_HOME'),
-        ('gemini', 'GEMINI_CLI_HOME'),
-    ],
+            ],
 )
 def test_provider_environment_uses_only_its_dedicated_profile(
     tmp_path: Path,
@@ -183,39 +157,15 @@ def test_provider_environment_uses_only_its_dedicated_profile(
         (profile / isolated_name).mkdir(parents=True, exist_ok=True)
     environment = AcpProfiles.get_profile_environment(
         backend,
-        profile,
-        google_cloud_project='fixture-project' if backend == 'gemini' else None,
-        google_cloud_location='asia-northeast1' if backend == 'gemini' else None,
+        profile
     )
 
     assert environment['HOME'] == str(profile)
     assert environment[expected_home_key] == str(profile)
     assert environment['TMPDIR'] == str(profile / 'tmp')
     assert environment['XDG_CACHE_HOME'] == str(profile / 'cache')
-    provider_home_keys = {'CODEX_HOME', 'GROK_HOME', 'GEMINI_CLI_HOME'}
+    provider_home_keys = {'CODEX_HOME', 'GROK_HOME'}
     assert {key for key in provider_home_keys if key in environment} == {expected_home_key}
-
-
-def test_gemini_environment_uses_read_only_adc_mount_and_vertex_settings(tmp_path: Path) -> None:
-    """Gemini へ固定 ADC path と明示 project/location を渡し、profile へコピーしない。"""
-
-    profile = tmp_path / 'gemini'
-    profile.mkdir()
-
-    environment = AcpProfiles.get_profile_environment(
-        'gemini',
-        profile,
-        google_cloud_project='fixture-project',
-        google_cloud_location='asia-northeast1',
-    )
-
-    assert environment['GOOGLE_APPLICATION_CREDENTIALS'] == (
-        '/run/konomitv-bs4k-host-auth/google/application_default_credentials.json'
-    )
-    assert environment['GOOGLE_GENAI_USE_VERTEXAI'] == 'true'
-    assert environment['GOOGLE_CLOUD_PROJECT'] == 'fixture-project'
-    assert environment['GOOGLE_CLOUD_LOCATION'] == 'asia-northeast1'
-    assert list(profile.iterdir()) == []
 
 
 def test_create_backend_uses_fixed_codex_command_workspace_and_environment(

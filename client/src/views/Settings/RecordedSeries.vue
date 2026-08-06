@@ -693,8 +693,6 @@ const settings = ref<IRecordedSeriesSettings>({
     acp_reasoning_effort: null,
     konomitv_bs4k_acp_codex_fast_mode_enabled: false,
     acp_timeout_sec: 120,
-    google_cloud_project: null,
-    google_cloud_location: null,
 });
 const opencode_services = ref<{title: string; value: string;}[]>([]);
 const status = ref<IRecordedSeriesStatus | null>(null);
@@ -991,8 +989,6 @@ function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
             konomitv_bs4k_selected_backend === 'AcpCodex' &&
             settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled === true,
         acp_timeout_sec: Number(settings.value.acp_timeout_sec),
-        google_cloud_project: nullableTrimmed(settings.value.google_cloud_project),
-        google_cloud_location: nullableTrimmed(settings.value.google_cloud_location),
     };
 }
 

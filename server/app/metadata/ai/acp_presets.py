@@ -15,7 +15,7 @@ class AcpPreset:
     default_args: list[str] = field(default_factory=list)
 
 
-# Codex / Grok / Gemini は Docker イメージ内へ固定導入し、Web UI から command を上書きさせない。
+# Codex / Grok は Docker イメージ内へ固定導入し、Web UI から command を上書きさせない。
 ACP_PRESETS: dict[str, AcpPreset] = {
     'AcpCodex': AcpPreset(
         backend_kind='AcpCodex',
@@ -28,12 +28,6 @@ ACP_PRESETS: dict[str, AcpPreset] = {
         display_name='ACP / Grok Build',
         default_command='/usr/local/bin/grok',
         default_args=['agent', 'stdio'],
-    ),
-    'AcpGemini': AcpPreset(
-        backend_kind='AcpGemini',
-        display_name='ACP / Gemini CLI',
-        default_command='/usr/local/bin/gemini',
-        default_args=['--acp'],
     ),
 }
 

@@ -203,7 +203,7 @@ def BuildEpisodeProviderFingerprint(
     """backend 非依存の固定引数から provider fingerprint v2 を作る。
 
     Args:
-        backend_kind: OpenAICompatible / AcpCodex などの backend 種別。
+        backend_kind: OpenCode / AcpCodex などの backend 種別。
         effective_model: 実際に適用するモデルと推論深さの監査ラベル。
         endpoint_identifier: OpenAI endpoint または ACP preset/profile の安全な識別子。
         api_key: OpenAI 互換 API キー。値自体は保持せず hash だけを使う。

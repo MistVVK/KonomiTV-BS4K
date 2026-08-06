@@ -1,6 +1,6 @@
 """録画シリーズ AI バックエンドパッケージ。
 
-OpenAI 互換 API と ACP（Agent Client Protocol）の両方をサポートする
+OpenCode と ACP（Agent Client Protocol）をサポートする
 プロバイダー非依存の facade を提供する。
 """
 

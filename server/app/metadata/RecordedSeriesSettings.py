@@ -88,6 +88,11 @@ _LEGACY_ACP_CUSTOM_SETTINGS_KEYS = frozenset({
     'acp_args',
     'acp_env',
 })
+# 旧 AcpGemini 専用の環境依存値。読取時のみ除外する（OpenCode VertexAdc は AIBackendSettings 側）。
+_LEGACY_ACP_GEMINI_SETTINGS_KEYS = frozenset({
+    'google_cloud_project',
+    'google_cloud_location',
+})
 
 
 def _isKonomiTVBS4KCodexSolModel(konomitv_bs4k_model: str | None) -> bool:
@@ -170,11 +175,6 @@ class RecordedSeriesSettings(BaseModel):
     # thought / tool update などの NDJSON 行が届くたびにタイマーはリセットされる。
     acp_timeout_sec: Annotated[int, Field(ge=30, le=600)] = 120
 
-    # Gemini CLI / Vertex AI 用（資格情報ではない環境依存設定）。
-    # AcpGemini はクリーンブレークで拒否済みだが、旧設定読取互換のため Phase 6 まで維持する。
-    google_cloud_project: Annotated[str | None, Field(max_length=255)] = None
-    google_cloud_location: Annotated[str | None, Field(max_length=255)] = None
-
     @field_validator('ai_backend_service_id')
     @classmethod
     def validateServiceID(cls, value: str | None) -> str | None:
@@ -200,15 +200,6 @@ class RecordedSeriesSettings(BaseModel):
         if model is None:
             return None
         return model.strip() or None
-
-    @field_validator('google_cloud_project', 'google_cloud_location')
-    @classmethod
-    def validateGoogleCloudSetting(cls, value: str | None) -> str | None:
-        """Google Cloud の環境依存値を空文字から未指定へ正規化する。"""
-
-        if value is None:
-            return None
-        return value.strip() or None
 
     @model_validator(mode='after')
     def normalizeBackendCapabilities(self) -> RecordedSeriesSettings:
@@ -316,7 +307,8 @@ class RecordedSeriesSettingsStore:
                 for key, value in settings_json.items()
                 if (
                     key not in _LEGACY_ACP_AUTH_SETTINGS_KEYS and
-                    key not in _LEGACY_ACP_CUSTOM_SETTINGS_KEYS
+                    key not in _LEGACY_ACP_CUSTOM_SETTINGS_KEYS and
+                    key not in _LEGACY_ACP_GEMINI_SETTINGS_KEYS
                 )
             }
             # OpenAICompatible 専用フィールド / 日次制限は拒否する。

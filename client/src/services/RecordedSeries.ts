@@ -34,9 +34,6 @@ export interface IRecordedSeriesSettings {
     // KonomiTV-BS4K 固有の Codex Fast service tier 設定
     konomitv_bs4k_acp_codex_fast_mode_enabled: boolean;
     acp_timeout_sec: number;
-    // 旧 AcpGemini 読取互換フィールド（UI では非表示）
-    google_cloud_project: string | null;
-    google_cloud_location: string | null;
 }
 
 /** 録画シリーズ判定設定の更新リクエスト。 */
@@ -51,8 +48,6 @@ export interface IRecordedSeriesSettingsUpdate {
     acp_reasoning_effort: AcpReasoningEffort | null;
     konomitv_bs4k_acp_codex_fast_mode_enabled: boolean;
     acp_timeout_sec: number;
-    google_cloud_project: string | null;
-    google_cloud_location: string | null;
 }
 
 /** 全ユーザーの録画シリーズ処理で共有する、内容非公開の ACP 資格情報状態。 */

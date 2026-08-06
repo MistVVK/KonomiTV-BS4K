@@ -382,7 +382,7 @@ def test_google_adc_status_requires_a_readable_json_object(
     assert ACPCredentials.KonomiTVBS4KACPCredentials.getStatus().google_adc_available is True
     assert (
         ACPCredentials._KONOMITV_BS4K_ACP_PROFILES_ROOT /
-        'gemini' /
+        'codex' /
         'application_default_credentials.json'
     ).exists() is False
 

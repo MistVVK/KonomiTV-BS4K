@@ -218,18 +218,15 @@ RUN set -eu && \
     npm ls --depth=0 && \
     test "$(node -p "require('./node_modules/@agentclientprotocol/codex-acp/package.json').version")" = "${CODEX_ACP_VERSION}" && \
     test "$(node -p "require('./node_modules/@openai/codex/package.json').version")" = "${CODEX_CLI_VERSION}" && \
-    test "$(node -p "require('./node_modules/@google/gemini-cli/package.json').version")" = "${GEMINI_CLI_VERSION}" && \
     test "$(node -p "require('./node_modules/${GROK_NPM_PACKAGE}/package.json').version")" = "${GROK_BUILD_VERSION}" && \
     test "$(node -p "require('./node_modules/${GROK_PLATFORM_NPM_PACKAGE}/package.json').version")" = "${GROK_BUILD_VERSION}" && \
     node -e 'const fs=require("fs");const path=require("path");const lock=JSON.parse(fs.readFileSync("package-lock.json","utf8"));const packages=lock.packages||{};function walk(dir,rel,found){if(!fs.existsSync(dir))return;for(const entry of fs.readdirSync(dir,{withFileTypes:true})){if(!entry.isDirectory()||entry.name.startsWith("."))continue;const full=path.join(dir,entry.name);const nextRel=rel?rel+"/"+entry.name:entry.name;if(entry.name.startsWith("@")&&!fs.existsSync(path.join(full,"package.json"))){walk(full,nextRel,found);continue;}const pkgJson=path.join(full,"package.json");if(fs.existsSync(pkgJson)){const pkg=JSON.parse(fs.readFileSync(pkgJson,"utf8"));const lockPath="node_modules/"+nextRel;found.set(lockPath,{name:pkg.name||entry.name,version:pkg.version||""});const nested=path.join(full,"node_modules");if(fs.existsSync(nested))walk(nested,nextRel+"/node_modules",found);}}}const installed=new Map();walk("node_modules","",installed);for(const [lockPath,info] of installed.entries()){const locked=packages[lockPath];if(!locked){console.error("installed path missing from lockfile:",lockPath);process.exit(1);}if(locked.version&&info.version&&locked.version!==info.version){console.error("version mismatch",lockPath,locked.version,info.version);process.exit(1);}if(locked.name&&info.name&&locked.name!==info.name){console.error("name mismatch",lockPath,locked.name,info.name);process.exit(1);}}for(const [lockPath,locked] of Object.entries(packages)){if(!lockPath.startsWith("node_modules/"))continue;if(locked.optional)continue;if(!installed.has(lockPath)){console.error("required lock path not installed:",lockPath);process.exit(1);}}console.log("installed package path/name/version match lockfile");' && \
     # CLI --version は終了成功と既知の完全1行出力の双方を要求する（部分一致 grep は禁止）。
     codex_acp_version="$(/opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp --version)" && \
     codex_cli_version="$(/opt/konomitv-bs4k-acp/node_modules/.bin/codex --version)" && \
-    gemini_cli_version="$(/opt/konomitv-bs4k-acp/node_modules/.bin/gemini --version)" && \
     grok_version_line="$(/opt/konomitv-bs4k-acp/grok-distribution/bin/grok --version)" && \
     test "${codex_acp_version}" = "@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}" && \
     test "${codex_cli_version}" = "codex-cli ${CODEX_CLI_VERSION}" && \
-    test "${gemini_cli_version}" = "${GEMINI_CLI_VERSION}" && \
     test "${grok_version_line}" = "${GROK_BUILD_VERSION_LINE}" && \
     printf '%s  %s\n' \
         "${GROK_BUILD_LINUX_X86_64_SHA256}" \
@@ -254,7 +251,6 @@ RUN set -eu && \
     grep -F '### Node.js 20.16.0' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
     grep -F '### @agentclientprotocol/codex-acp 1.1.7' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
     grep -F '### @openai/codex 0.145.0' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
-    grep -F '### @google/gemini-cli 0.52.0' /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
     grep -F "### @xai-official/grok ${GROK_BUILD_VERSION}" /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
     grep -F "### @xai-official/grok-linux-x64 ${GROK_BUILD_VERSION}" \
         /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md && \
@@ -471,16 +467,13 @@ COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PAR
 COPY ./docker/opencode/opencode.json /usr/local/share/konomitv-bs4k-opencode/opencode.json
 RUN ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp /usr/local/bin/codex-acp && \
     ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex /usr/local/bin/codex && \
-    ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/gemini /usr/local/bin/gemini && \
     ln -s /opt/konomitv-bs4k-acp/grok-distribution/bin/grok /usr/local/bin/grok && \
     codex_acp_version="$(codex-acp --version)" && \
     codex_cli_version="$(codex --version)" && \
-    gemini_cli_version="$(gemini --version)" && \
     grok_version_line="$(grok --version)" && \
     opencode_version="$(opencode --version)" && \
     test "${codex_acp_version}" = '@agentclientprotocol/codex-acp 1.1.7' && \
     test "${codex_cli_version}" = 'codex-cli 0.145.0' && \
-    test "${gemini_cli_version}" = '0.52.0' && \
     test "${grok_version_line}" = 'grok 0.2.112 (9bbd559437)' && \
     test "${opencode_version}" = '1.18.13' && \
     test "$(stat -c '%U:%G:%a' /usr/local/libexec/konomitv-bs4k-acp-sandbox)" = 'root:root:755' && \
@@ -697,7 +690,6 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     grep -F '### Node.js 20.16.0' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
     grep -F '### @agentclientprotocol/codex-acp 1.1.7' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
     grep -F '### @openai/codex 0.145.0' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
-    grep -F '### @google/gemini-cli 0.52.0' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
     grep -F '### @xai-official/grok 0.2.112' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
     grep -F '### @xai-official/grok-linux-x64 0.2.112' /tmp/ACP_THIRD_PARTY_LICENSES.md && \
     python3 /tmp/assemble-runtime-license-document.py \
@@ -714,7 +706,6 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     grep -F '### Node.js 20.16.0' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### @agentclientprotocol/codex-acp 1.1.7' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### @openai/codex 0.145.0' /code/THIRD_PARTY_LICENSES.md && \
-    grep -F '### @google/gemini-cli 0.52.0' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### @xai-official/grok 0.2.112' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### @xai-official/grok-linux-x64 0.2.112' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '## OpenCode Runtime Dependencies' /code/THIRD_PARTY_LICENSES.md && \

@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Annotated, Literal, NotRequired, cast
+from typing import Annotated, Literal, cast
 
-import httpx
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -18,9 +16,7 @@ from pydantic import (
 )
 from typing_extensions import TypedDict
 
-from app.constants import API_REQUEST_HEADERS
 from app.metadata.RecordedSeriesCandidates import (
-    BuildChatCompletionsURL,
     RecordedSeriesAIError,
     RecordedSeriesProgramPrompt,
 )
@@ -78,23 +74,8 @@ class _SeriesMetadataPromptData(TypedDict):
     hints: SeriesMetadataHints
 
 
-class _ChatMessage(TypedDict):
-    role: Literal['system', 'user']
-    content: str
-
-
-class _ChatCompletionRequest(TypedDict):
-    model: str
-    messages: list[_ChatMessage]
-
-
-class _UsageData(TypedDict):
-    prompt_tokens: NotRequired[int]
-    completion_tokens: NotRequired[int]
-
-
 class AISeriesMetadataOutput(BaseModel):
-    """OpenAI / ACP の双方で再検証する、モデル由来の厳格な出力。"""
+    """OpenCode / ACP の双方で再検証する、モデル由来の厳格な出力。"""
 
     model_config = ConfigDict(extra='forbid', strict=True)
 
@@ -323,117 +304,5 @@ def ValidateSeriesMetadataOutput(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         http_status=http_status,
-        latency_ms=latency_ms,
-    )
-
-
-def _extractMessageContent(payload: object) -> tuple[str, str, _UsageData]:
-    """Chat Completions 応答から本文・モデル・利用量だけを取り出す。"""
-
-    if not isinstance(payload, dict):
-        raise RecordedSeriesAIError('InvalidResponse')
-    typed_payload = cast(dict[str, object], payload)
-    choices = typed_payload.get('choices')
-    if not isinstance(choices, list) or len(choices) == 0:
-        raise RecordedSeriesAIError('MissingChoices')
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        raise RecordedSeriesAIError('MissingChoices')
-    message = first_choice.get('message')
-    if not isinstance(message, dict):
-        raise RecordedSeriesAIError('MissingMessage')
-    content = message.get('content')
-    if not isinstance(content, str):
-        raise RecordedSeriesAIError('MissingContent')
-    response_model = typed_payload.get('model')
-    usage = _UsageData()
-    usage_payload = typed_payload.get('usage')
-    if isinstance(usage_payload, dict):
-        if isinstance(usage_payload.get('prompt_tokens'), int):
-            usage['prompt_tokens'] = cast(int, usage_payload['prompt_tokens'])
-        if isinstance(usage_payload.get('completion_tokens'), int):
-            usage['completion_tokens'] = cast(int, usage_payload['completion_tokens'])
-    return content, response_model if isinstance(response_model, str) else '', usage
-
-
-async def ResolveRecordedSeriesMetadata(
-    *,
-    api_base_url: str,
-    api_key: str | None,
-    model: str,
-    program: RecordedSeriesProgramPrompt,
-    hints: SeriesMetadataHints,
-) -> AISeriesMetadataResult:
-    """OpenAI 互換 Chat Completions でシリーズ情報を一括生成する。"""
-
-    prompt_data = _SeriesMetadataPromptData(program=program, hints=hints)
-    request_payload = _ChatCompletionRequest(
-        model=model,
-        messages=[
-            _ChatMessage(role='system', content=BuildSeriesMetadataSystemPrompt()),
-            _ChatMessage(
-                role='user',
-                content=json.dumps(prompt_data, ensure_ascii=False, separators=(',', ':')),
-            ),
-        ],
-    )
-    headers = {
-        **API_REQUEST_HEADERS,
-        'Content-Type': 'application/json',
-    }
-    if api_key is not None and api_key.strip() != '':
-        headers['Authorization'] = f'Bearer {api_key.strip()}'
-
-    started_at = time.monotonic()
-    try:
-        async with httpx.AsyncClient(
-            headers=headers,
-            timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
-            follow_redirects=False,
-        ) as client:
-            response = await client.post(
-                BuildChatCompletionsURL(api_base_url),
-                json=request_payload,
-            )
-    except httpx.TimeoutException as ex:
-        latency_ms = round((time.monotonic() - started_at) * 1000)
-        raise RecordedSeriesAIError('Timeout', latency_ms=latency_ms) from ex
-    except (httpx.InvalidURL, ValueError) as ex:
-        latency_ms = round((time.monotonic() - started_at) * 1000)
-        raise RecordedSeriesAIError('InvalidURL', latency_ms=latency_ms) from ex
-    except httpx.HTTPError as ex:
-        latency_ms = round((time.monotonic() - started_at) * 1000)
-        raise RecordedSeriesAIError('NetworkError', latency_ms=latency_ms) from ex
-
-    latency_ms = round((time.monotonic() - started_at) * 1000)
-    if response.is_redirect:
-        raise RecordedSeriesAIError(
-            'RedirectRejected',
-            http_status=response.status_code,
-            latency_ms=latency_ms,
-        )
-    if response.is_success is False:
-        raise RecordedSeriesAIError(
-            f'HTTP{response.status_code}',
-            http_status=response.status_code,
-            latency_ms=latency_ms,
-        )
-    try:
-        response_payload = response.json()
-    except json.JSONDecodeError as ex:
-        raise RecordedSeriesAIError(
-            'InvalidResponseJSON',
-            http_status=response.status_code,
-            latency_ms=latency_ms,
-        ) from ex
-    content, response_model, usage = _extractMessageContent(response_payload)
-    output_data = ParseStrictSeriesMetadataJSONObject(content)
-    return ValidateSeriesMetadataOutput(
-        output_data,
-        hints=hints,
-        model=response_model or model,
-        prompt_tokens=usage.get('prompt_tokens'),
-        completion_tokens=usage.get('completion_tokens'),
-        http_status=response.status_code,
         latency_ms=latency_ms,
     )

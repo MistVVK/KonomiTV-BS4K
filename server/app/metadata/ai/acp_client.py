@@ -189,7 +189,7 @@ _EpisodeLookupFailureOutcome = Literal[
     'RateLimited',
     'Cancelled',
 ]
-_ACP_FIXED_BACKENDS = frozenset({'AcpCodex', 'AcpGrok', 'AcpGemini'})
+_ACP_FIXED_BACKENDS = frozenset({'AcpCodex', 'AcpGrok'})
 
 # 親プロセス環境は継承しない。起動に必要な非秘密の基本値だけを固定する。
 # SSL_CERT_* / HTTP(S)_PROXY は認証情報を含み得るため親から暗黙継承しない。
@@ -757,7 +757,7 @@ def _classifyWebToolUpdate(
             else 'Unsupported'
         )
 
-    # rawInput を公開しない Gemini WebFetch などは kind/title の組で識別する。
+    # rawInput を公開しない WebFetch などは kind/title の組で識別する。
     identifiers = _toolIdentifierStrings(update)
     has_web_identifier = any(
         _isWebToolIdentifier(identifier, kind=kind)
@@ -1070,8 +1070,6 @@ def _extractCompletedToolTargetCitations(
 # 対話ログインを要求せず、既存 credential / env だけで成立し得る auth method。
 # oauth-personal / grok.com はブラウザや device code に入り得るため自動では呼ばない。
 _NON_INTERACTIVE_AUTH_METHOD_IDS = frozenset({
-    'vertex-ai',
-    'gemini-api-key',
     'api-key',
     'gateway',
 })
@@ -2141,14 +2139,6 @@ def _select_non_interactive_auth_method_id(
     if not available:
         return None
 
-    # Gemini: Vertex AI 用 env が揃っているときは vertex-ai を最優先する。
-    # ADC path があることも条件にし、誤って API key 経路へ落ちないようにする。
-    use_vertex = env.get('GOOGLE_GENAI_USE_VERTEXAI', '').lower() in {'1', 'true', 'yes'}
-    has_adc = bool(env.get('GOOGLE_APPLICATION_CREDENTIALS'))
-    if use_vertex and has_adc and 'vertex-ai' in available:
-        return 'vertex-ai'
-    if (env.get('GEMINI_API_KEY') or env.get('GOOGLE_API_KEY')) and 'gemini-api-key' in available:
-        return 'gemini-api-key'
     if env.get('OPENAI_API_KEY') and 'api-key' in available:
         return 'api-key'
     # 条件が揃わない非対話 method（api-key のみ広告など）は勝手に呼ばない。
@@ -2185,16 +2175,7 @@ def _user_message_for_auth_failure(
             'Grok の認証が無効または期限切れです。'
             'ホストで grok login を実行し、設定画面から認証を再取り込みしてください。'
         )
-    if 'vertex-ai' in method_ids or 'gemini-api-key' in method_ids:
-        if attempted_method_id == 'vertex-ai':
-            return (
-                'Gemini Vertex AI 認証に失敗しました。'
-                'Google ADC の mount とプロジェクト ID / リージョンを確認してください。'
-            )
-        return (
-            'Gemini の認証が未設定です。'
-            'ADC (Vertex AI) または Gemini API キーを確認してください。'
-        )
+    _ = attempted_method_id
     return 'ACP agent の認証に失敗しました。ホスト側の認証状態を確認してください。'
 
 

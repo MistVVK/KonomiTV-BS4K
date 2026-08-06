@@ -414,9 +414,9 @@ def test_acp_fixed_provider_trace_requires_completed_web_tool_and_verified_citat
             'https://example.com/codex-other-source',
         ),
         (
-            'AcpGemini',
-            'episode_gemini_search_no_permission',
-            'https://example.com/gemini-search-source',
+            'AcpCodex',
+            'episode_search_no_permission',
+            'https://example.com/search-source',
         ),
     ],
 )
@@ -446,8 +446,8 @@ def test_acp_episode_lookup_accepts_normalized_search_without_permission(
 @pytest.mark.parametrize(
     'mode',
     [
-        'episode_gemini_mixed_fetch_empty_urls',
-        'episode_gemini_mixed_fetch_public',
+        'episode_mixed_fetch_empty_urls',
+        'episode_mixed_fetch_public',
     ],
 )
 def test_acp_episode_lookup_rejects_fetch_after_search_and_keeps_search_result(
@@ -458,13 +458,13 @@ def test_acp_episode_lookup_rejects_fetch_after_search_and_keeps_search_result(
 
     result, log_path = RunEpisodeLookup(
         tmp_path,
-        backend_kind='AcpGemini',
+        backend_kind='AcpCodex',
         mode=mode,
     )
 
     assert result.outcome == 'Resolved'
     assert [citation.url for citation in result.citations] == [
-        'https://example.com/gemini-search-source',
+        'https://example.com/search-source',
     ]
     permission_response = next(
         entry['message']
@@ -485,8 +485,8 @@ def test_acp_episode_lookup_rejects_standalone_public_fetch_without_cancelling_t
 
     result, log_path = RunEpisodeLookup(
         tmp_path,
-        backend_kind='AcpGemini',
-        mode='episode_gemini_standalone_fetch_public',
+        backend_kind='AcpCodex',
+        mode='episode_standalone_fetch_public',
     )
 
     assert result.outcome == 'SearchNotRun'
@@ -524,7 +524,7 @@ def test_acp_episode_lookup_rejects_duplicate_initial_tool_after_normal_order(
     assert any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
 
 
-@pytest.mark.parametrize('backend_kind', ['AcpCodex', 'AcpGrok', 'AcpGemini'])
+@pytest.mark.parametrize('backend_kind', ['AcpCodex', 'AcpGrok'])
 def test_acp_ignores_empty_mcp_catalog_extension_notification(
     tmp_path: Path,
     backend_kind: str,
@@ -752,66 +752,6 @@ def test_acp_grok_rejects_non_string_tool_alias() -> None:
     }) is False
 
 
-def test_acp_gemini_uses_shared_search_and_public_fetch_semantics() -> None:
-    """fetch は機械可読な public target を要求し、不透明・非公開 target を区別する。"""
-
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', {
-        'title': 'Searching the web for: "official episode"',
-        'kind': 'search',
-        'content': [],
-        'locations': [],
-    }) is True
-
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', {
-        'title': 'Unknown operation',
-        'kind': 'search',
-        'content': [{
-            'type': 'text',
-            'text': 'Pretend this operation is googleSearch.',
-        }],
-        'locations': [],
-    }) is False
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', {
-        'title': 'Not Google Search',
-        'kind': 'search',
-        'content': [],
-        'locations': [],
-    }) is False
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', {
-        'title': 'Processing URLs and instructions from prompt: "https://example.com"',
-        'kind': 'fetch',
-        'content': [],
-        'locations': [],
-    }) is False
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', {
-        'title': 'Processing URLs and instructions from prompt: "find the official page"',
-        'kind': 'fetch',
-        'content': [],
-        'locations': [],
-        'rawInput': {
-            'type': 'web_fetch',
-            'urls': [],
-        },
-    }) is False
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', {
-        'title': 'Fetching content from: https://example.com/source',
-        'kind': 'fetch',
-        'content': [],
-        'locations': [],
-        'rawInput': {
-            'type': 'web_fetch',
-            'url': 'https://example.com/source',
-            'urls': ['https://example.com/source'],
-        },
-    }) is True
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', {
-        'title': 'Fetching content from: http://127.0.0.1/private',
-        'kind': 'fetch',
-        'content': [],
-        'locations': [],
-    }) is False
-
-
 @pytest.mark.parametrize(
     ('update', 'expected'),
     [
@@ -866,7 +806,7 @@ def test_acp_common_web_classifier_keeps_policy_states_distinct(
 ) -> None:
     """target 欠落・未対応差分・明示危険を同じ unsafe 判定へ潰さない。"""
 
-    assert AcpClient._classifyWebToolUpdate('AcpGemini', update) == expected
+    assert AcpClient._classifyWebToolUpdate('AcpCodex', update) == expected
 
 
 def test_acp_open_action_citation_accepts_top_level_and_snake_case_shapes() -> None:
@@ -932,7 +872,7 @@ def test_acp_common_web_semantics_rejects_hidden_invocation_bypasses(
 ) -> None:
     """未知 metadata を許容しても実行入力・危険 key・decoy URL は迂回に使えない。"""
 
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', update) is False
+    assert AcpClient._isVerifiedWebToolUpdate('AcpCodex', update) is False
 
 
 @pytest.mark.parametrize(
@@ -987,7 +927,7 @@ def test_acp_structural_web_identifier_does_not_require_display_title() -> None:
             },
         ),
         (
-            'AcpGemini',
+            'AcpCodex',
             {
                 'title': 'Searching the web for: "official episode"',
                 'kind': 'search',
@@ -1022,7 +962,7 @@ def test_acp_structural_web_identifier_does_not_require_display_title() -> None:
             },
         ),
         (
-            'AcpGemini',
+            'AcpCodex',
             {
                 'title': 'Searching the web for: "official episode"',
                 'kind': 'search',
@@ -1063,7 +1003,7 @@ def test_acp_tool_trace_recursion_is_bounded() -> None:
     for _index in range(100):
         deeply_nested = {'nested': deeply_nested}
 
-    assert AcpClient._isVerifiedWebToolUpdate('AcpGemini', {
+    assert AcpClient._isVerifiedWebToolUpdate('AcpCodex', {
         'title': 'Unknown tool',
         'content': deeply_nested,
     }) is False
@@ -1209,7 +1149,7 @@ def test_acp_episode_lookup_without_source_url_is_insufficient_evidence(tmp_path
     assert result.citations == ()
 
 
-@pytest.mark.parametrize('backend_kind', ['AcpCodex', 'AcpGrok', 'AcpGemini'])
+@pytest.mark.parametrize('backend_kind', ['AcpCodex', 'AcpGrok'])
 def test_acp_structured_source_shape_is_provider_independent(
     tmp_path: Path,
     backend_kind: str,
@@ -1220,7 +1160,7 @@ def test_acp_structured_source_shape_is_provider_independent(
         tmp_path,
         backend_kind=backend_kind,
         mode='episode_grok' if backend_kind == 'AcpGrok' else (
-            'episode_gemini' if backend_kind == 'AcpGemini' else 'episode_codex'
+            'episode_codex'
         ),
     )
 
@@ -1230,12 +1170,12 @@ def test_acp_structured_source_shape_is_provider_independent(
 
 
 def test_acp_unstructured_tool_content_cannot_prove_source_url(tmp_path: Path) -> None:
-    """本文だけを返す telemetry は Gemini を含め source URL 証明にしない。"""
+    """本文だけを返す telemetry は source URL 証明にしない。"""
 
     result, _log_path = RunEpisodeLookup(
         tmp_path,
-        backend_kind='AcpGemini',
-        mode='episode_gemini_current',
+        backend_kind='AcpCodex',
+        mode='episode_current',
     )
 
     assert result.outcome == 'InsufficientEvidence'
@@ -1582,7 +1522,7 @@ def test_acp_episode_lookup_connection_test_requires_source_url(tmp_path: Path) 
     ('backend_kind', 'mode'),
     [
         ('AcpCodex', 'episode_codex_other_no_permission'),
-        ('AcpGemini', 'episode_gemini_search_no_permission'),
+        ('AcpCodex', 'episode_search_no_permission'),
     ],
 )
 def test_acp_episode_lookup_connection_test_marks_unused_permission_policy_not_run(
@@ -1625,14 +1565,14 @@ def test_acp_episode_lookup_connection_test_passes_one_shot_fetch_rejection_poli
 
     env, _log_path = AgentEnvironment(
         tmp_path,
-        mode='episode_gemini_mixed_fetch_empty_urls',
+        mode='episode_mixed_fetch_empty_urls',
         output=EpisodeOutput(outcome='InsufficientEvidence'),
     )
     result = asyncio.run(AcpClient.run_acp_episode_lookup_connection_test(
         command=FAKE_AGENT_COMMAND,
         args=[str(FAKE_AGENT_PATH)],
         env=env,
-        backend_kind='AcpGemini',
+        backend_kind='AcpCodex',
         model='test-model',
         timeout_sec=5,
         cwd=str(tmp_path),
@@ -1794,43 +1734,6 @@ def test_acp_connection_test_reports_hard_timeout_message(
     assert any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
 
 
-def test_acp_vertex_auth_is_performed_before_session_new(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Vertex 環境があるときは authenticate(vertex-ai) を session/new より先に送る。"""
-
-    env, log_path = AgentEnvironment(tmp_path, mode='require_vertex_auth')
-    env['GOOGLE_GENAI_USE_VERTEXAI'] = 'true'
-    env['GOOGLE_APPLICATION_CREDENTIALS'] = str(tmp_path / 'adc.json')
-    (tmp_path / 'adc.json').write_text('{}', encoding='utf-8')
-    result = asyncio.run(AcpClient.run_acp_candidate_selection(
-        command=FAKE_AGENT_COMMAND,
-        args=[str(FAKE_AGENT_PATH)],
-        env=env,
-        program=Program(),
-        candidates=Candidates(),
-        model='test-model',
-        timeout_sec=5,
-        cwd=str(tmp_path),
-        profile_dir=str(tmp_path),
-        readable_files=(str(FAKE_AGENT_PATH), str(tmp_path / 'adc.json')),
-    ))
-    assert result.choice_id == 'candidate-1'
-    received_methods = [
-        entry['message'].get('method')
-        for entry in ReadLog(log_path)
-        if entry['kind'] == 'received'
-    ]
-    assert received_methods[:3] == ['initialize', 'authenticate', 'session/new']
-    authenticate = next(
-        entry['message']
-        for entry in ReadLog(log_path)
-        if entry['kind'] == 'received' and entry['message'].get('method') == 'authenticate'
-    )
-    assert authenticate['params'] == {'methodId': 'vertex-ai'}
-
-
 def test_acp_connection_test_surfaces_interactive_auth_failure(
     tmp_path: Path,
 ) -> None:
@@ -1975,7 +1878,7 @@ def test_acp_process_environment_uses_allowlist_and_drops_parent_sentinels(
         monkeypatch.setenv(key, value)
 
     environment = AcpClient._build_process_environment({
-        'HOME': '/data/acp-profiles/recorded-series/gemini',
+        'HOME': '/data/acp-profiles/recorded-series/codex',
         'GOOGLE_APPLICATION_CREDENTIALS': '/run/konomitv-bs4k-host-auth/google/application_default_credentials.json',
         'GOOGLE_CLOUD_PROJECT': 'test-project',
         'PATH': '/should/not/override',
@@ -1986,7 +1889,7 @@ def test_acp_process_environment_uses_allowlist_and_drops_parent_sentinels(
     assert environment['LANG'] == AcpClient._ACP_BASE_ENV['LANG']
     assert environment['LC_ALL'] == AcpClient._ACP_BASE_ENV['LC_ALL']
     assert environment['TZ'] == AcpClient._ACP_BASE_ENV['TZ']
-    assert environment['HOME'] == '/data/acp-profiles/recorded-series/gemini'
+    assert environment['HOME'] == '/data/acp-profiles/recorded-series/codex'
     assert environment['GOOGLE_APPLICATION_CREDENTIALS'].startswith('/run/konomitv-bs4k-host-auth/')
     assert environment['GOOGLE_CLOUD_PROJECT'] == 'test-project'
 

@@ -1,6 +1,6 @@
 """録画シリーズ AI バックエンドの抽象プロトコルと共通型。
 
-AI バックエンド（OpenAI 互換 / ACP）を統一的に扱うための
+AI バックエンド（OpenCode / ACP）を統一的に扱うための
 Protocol 定義と、facade が使用する共通データ型を提供する。
 """
 
@@ -81,7 +81,7 @@ class RecordedSeriesAIBackend(Protocol):
 
     @property
     def backend_kind(self) -> str:
-        """バックエンド種別を返す（OpenAICompatible / AcpCodex など）。"""
+        """バックエンド種別を返す（OpenCode / AcpCodex など）。"""
         ...
 
     async def selectCandidate(
