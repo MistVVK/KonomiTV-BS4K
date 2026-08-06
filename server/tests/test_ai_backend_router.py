@@ -1,10 +1,11 @@
-"""AIBackendRouter の unit テスト（Phase 2: connection-test / availability）。"""
+"""AIBackendRouter の unit テスト（Phase 2: connection-test / availability / ACP）。"""
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import pytest
@@ -12,12 +13,24 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 
+from app.metadata.ai import recorded_series_ai as RecordedSeriesAIModule
+from app.metadata.ai.ACPSettings import ACPSettingsStore
 from app.metadata.ai.AIBackendSettings import (
     AIBackendServiceCreate,
     AIBackendSettingsStore,
 )
-from app.metadata.ai.backends import ConnectionTestResult
+from app.metadata.ai.backends import (
+    ConnectionTestCheck,
+    ConnectionTestResult,
+    EpisodeLookupConnectionChecks,
+)
+from app.metadata.ai.KonomiTVBS4KACPCredentials import KonomiTVBS4KACPCredentials
 from app.metadata.ai.opencode_backend import OpenCodeBackend
+from app.metadata.ai.recorded_series_ai import (
+    has_episode_lookup_capability_proof,
+    reset_episode_lookup_capability_proofs_for_tests,
+)
+from app.metadata.RecordedSeriesSettings import RecordedSeriesSettings
 from app.routers import AIBackendRouter
 
 
@@ -42,6 +55,59 @@ def ai_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(AIBackendSettingsStore, 'SETTINGS_PATH', settings_path)
     monkeypatch.setattr(AIBackendSettingsStore, 'SECRETS_PATH', secrets_path)
     return tmp_path
+
+
+@pytest.fixture()
+def acp_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """ACP 設定・能力証明を一時ディレクトリへ indirection する。"""
+
+    monkeypatch.setattr(
+        ACPSettingsStore,
+        'SETTINGS_PATH',
+        tmp_path / 'acp-settings.json',
+    )
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'EPISODE_LOOKUP_CAPABILITY_PROOFS_PATH',
+        tmp_path / 'recorded-series-episode-lookup-proofs.json',
+    )
+    reset_episode_lookup_capability_proofs_for_tests()
+    return tmp_path
+
+
+def SuccessfulEpisodeLookupConnectionChecks() -> EpisodeLookupConnectionChecks:
+    """ACP 接続試験 API 契約テストで使用する成功時の固定6項目。"""
+
+    return EpisodeLookupConnectionChecks(
+        backend_connection=ConnectionTestCheck(status='Passed', message='接続済み'),
+        web_search=ConnectionTestCheck(status='Passed', message='検索済み'),
+        source_url=ConnectionTestCheck(status='Passed', message='URL取得済み'),
+        strict_schema=ConnectionTestCheck(status='Passed', message='schema検証済み'),
+        timeout_cancel=ConnectionTestCheck(status='NotRun', message='未実行'),
+        permission_policy=ConnectionTestCheck(status='NotApplicable', message='対象外'),
+    )
+
+
+def PatchACPAuthImported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ACP preflight を通過させるため、Codex / Grok 認証を取り込み済みにする。"""
+
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'getStatus',
+        classmethod(
+            lambda _cls: SimpleNamespace(
+                codex_auth_imported=True,
+                grok_auth_imported=True,
+                google_adc_available=False,
+            )
+        ),
+    )
+    # fingerprint を決定的にするため、credential 世代を固定する。
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'getCredentialGeneration',
+        classmethod(lambda _cls, _provider: 'test-generation'),
+    )
 
 
 def _draft_body(**overrides: Any) -> dict[str, Any]:
@@ -241,11 +307,11 @@ def test_connection_test_draft_cleans_unshared_auth(
     asyncio.run(Run())
 
 
-def test_connection_test_draft_keeps_shared_provider_auth(
+def test_connection_test_draft_rejects_shared_provider_temp_key(
     ai_paths: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """同一 provider を使う保存 service がある場合は deleteAuth しない。"""
+    """同一 provider を使う保存 service がある draft 一時キー試験は 409。"""
 
     AIBackendSettingsStore.createService(
         AIBackendServiceCreate(
@@ -257,6 +323,7 @@ def test_connection_test_draft_keeps_shared_provider_auth(
         ),
     )
     deleted: list[str] = []
+    tested = {'called': False}
 
     class FakeClient:
         async def deleteAuth(self, provider_id: str) -> None:
@@ -264,13 +331,13 @@ def test_connection_test_draft_keeps_shared_provider_auth(
 
     async def FakeTestConnection(self: OpenCodeBackend, capability: str) -> ConnectionTestResult:
         _ = (self, capability)
+        tested['called'] = True
         return ConnectionTestResult(
-            success=False,
+            success=True,
             latency_ms=5,
             model='opencode:deepseek/deepseek-chat',
-            message='fail',
-            error_code='HTTP401',
-            http_status=401,
+            message='should-not-run',
+            http_status=200,
         )
 
     monkeypatch.setattr(AIBackendRouter, 'IsOpenCodeAvailable', lambda: True)
@@ -287,11 +354,89 @@ def test_connection_test_draft_keeps_shared_provider_auth(
                 '/api/ai-backends/connection-test',
                 json=_draft_body(),
             )
+            assert response.status_code == 409
+            assert tested['called'] is False
+            assert deleted == []
+            assert 'sk-test-not-for-production' not in response.text
+
+    asyncio.run(Run())
+
+
+def test_connection_test_saved_episode_lookup_records_proof(
+    ai_paths: Path,
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """保存済み OpenCode service の話数試験成功で proof を記録する。"""
+
+    _ = (ai_paths, acp_paths)
+    service = AIBackendSettingsStore.createService(
+        AIBackendServiceCreate(
+            service_name='DeepSeek Proof',
+            opencode_provider_id='deepseek',
+            opencode_model_id='deepseek-chat',
+            auth_mode='ApiKey',
+            billing_mode='Metered',
+        ),
+    )
+    AIBackendSettingsStore.setAPIKey(service.service_id, 'sk-saved')
+
+    async def FakeTestConnection(self: OpenCodeBackend, capability: str) -> ConnectionTestResult:
+        _ = self
+        assert capability == 'EpisodeLookup'
+        return ConnectionTestResult(
+            success=True,
+            latency_ms=40,
+            model='opencode:deepseek/deepseek-chat',
+            message='ok',
+            checks=SuccessfulEpisodeLookupConnectionChecks(),
+            prompt_tokens=10,
+            completion_tokens=4,
+            http_status=200,
+        )
+
+    class FakeClient:
+        async def putApiKey(self, provider_id: str, api_key: str) -> None:
+            _ = (provider_id, api_key)
+
+        async def deleteAuth(self, provider_id: str) -> None:
+            _ = provider_id
+
+    async def _save(**_kw: Any) -> None:
+        return None
+
+    async def CreateAuditRecord(**_kwargs: Any) -> object:
+        return SimpleNamespace(status='Succeeded', error_code=None, save=_save)
+
+    monkeypatch.setattr(AIBackendRouter, 'IsOpenCodeAvailable', lambda: True)
+    monkeypatch.setattr(OpenCodeBackend, 'testConnection', FakeTestConnection)
+    monkeypatch.setattr(AIBackendRouter, 'OpenCodeClient', FakeClient)
+    monkeypatch.setattr(AIBackendRouter.RecordedSeriesAIRequest, 'create', CreateAuditRecord)
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.post(
+                '/api/ai-backends/connection-test',
+                json={
+                    'capability': 'EpisodeLookup',
+                    'service_id': service.service_id,
+                },
+            )
             assert response.status_code == 200
             payload = response.json()
-            assert payload['success'] is False
-            assert payload['error_code'] == 'HTTP401'
-            assert deleted == []
+            assert payload['success'] is True
+            assert payload['checks'] is not None
+            assert payload['checks']['web_search']['status'] == 'Passed'
+            settings = RecordedSeriesSettings(
+                ai_backend='OpenCode',
+                ai_enabled=True,
+                ai_backend_service_id=service.service_id,
+            )
+            assert has_episode_lookup_capability_proof(settings, None) is True
 
     asyncio.run(Run())
 
@@ -671,5 +816,516 @@ def test_provider_list_returns_503_when_opencode_unavailable(
         ) as client:
             response = await client.get('/api/ai-backends/providers')
             assert response.status_code == 503
+
+    asyncio.run(Run())
+
+
+# ===== ACP 固定プリセット（Codex / Grok Build） =====
+
+
+def test_acp_settings_get_and_update_round_trip(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACP 設定は GET でき、PUT で全体置き換え・再取得できる。"""
+
+    _ = acp_paths
+    _ = monkeypatch
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            fetched = await client.get('/api/ai-backends/acp-settings')
+            assert fetched.status_code == 200
+            body = fetched.json()
+            assert body['codex']['model'] == 'gpt-5.6-luna'
+            assert body['codex']['reasoning_effort'] == 'Medium'
+            assert body['grok']['reasoning_effort'] == 'High'
+
+            updated = await client.put('/api/ai-backends/acp-settings', json={
+                'codex': {
+                    'model': 'gpt-5.6-sol',
+                    'reasoning_effort': 'Ultra',
+                    'codex_fast_mode_enabled': True,
+                    'timeout_sec': 90,
+                },
+                'grok': {
+                    'model': 'grok-4',
+                    'reasoning_effort': 'Low',
+                    'codex_fast_mode_enabled': True,
+                    'timeout_sec': 60,
+                },
+            })
+            assert updated.status_code == 204
+
+            refetched = await client.get('/api/ai-backends/acp-settings')
+            assert refetched.status_code == 200
+            refetched_body = refetched.json()
+            assert refetched_body['codex']['model'] == 'gpt-5.6-sol'
+            assert refetched_body['codex']['reasoning_effort'] == 'Ultra'
+            assert refetched_body['codex']['codex_fast_mode_enabled'] is True
+            assert refetched_body['codex']['timeout_sec'] == 90
+            # Grok はモデル固定・Fast 無効へ正規化される。
+            assert refetched_body['grok']['model'] is None
+            assert refetched_body['grok']['reasoning_effort'] == 'Low'
+            assert refetched_body['grok']['codex_fast_mode_enabled'] is False
+            assert refetched_body['grok']['timeout_sec'] == 60
+
+    asyncio.run(Run())
+
+
+@pytest.mark.parametrize('tested_capability', ['CandidateSelection', 'EpisodeLookup'])
+def test_acp_connection_test_uses_saved_settings_with_fixed_preset(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tested_capability: Literal['CandidateSelection', 'EpisodeLookup'],
+) -> None:
+    """ACP の各機能試験は保存済み ACP 設定を使用する。"""
+
+    _ = acp_paths
+    PatchACPAuthImported(monkeypatch)
+    captured_settings: RecordedSeriesSettings | None = None
+    audit_records: list[dict[str, object]] = []
+
+    async def TestConnection(
+        capability: str,
+        *,
+        settings: RecordedSeriesSettings | None = None,
+        api_key: str | None = None,
+    ) -> ConnectionTestResult:
+        nonlocal captured_settings
+        assert capability == tested_capability
+        assert api_key is None
+        captured_settings = settings
+        return ConnectionTestResult(
+            success=True,
+            latency_ms=5,
+            model='acp:codex:test-model',
+            message='ok',
+            checks=(
+                SuccessfulEpisodeLookupConnectionChecks()
+                if tested_capability == 'EpisodeLookup'
+                else None
+            ),
+        )
+
+    async def CreateAudit(**kwargs: object) -> object:
+        audit_records.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(AIBackendRouter, 'test_connection', TestConnection)
+    monkeypatch.setattr(AIBackendRouter.RecordedSeriesAIRequest, 'create', CreateAudit)
+    app = CreateAdminApp()
+
+    async def Scenario() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://testserver',
+        ) as client:
+            response = await client.post('/api/ai-backends/acp/test', json={
+                'capability': tested_capability,
+                'backend_kind': 'AcpCodex',
+            })
+            assert response.status_code == 200
+            assert response.json()['success'] is True
+            assert response.json()['model'] == 'acp:codex:test-model'
+            if tested_capability == 'EpisodeLookup':
+                assert response.json()['checks']['backend_connection']['status'] == 'Passed'
+                assert response.json()['checks']['timeout_cancel']['status'] == 'NotRun'
+            else:
+                assert response.json()['checks'] is None
+
+    asyncio.run(Scenario())
+    assert captured_settings is not None
+    assert captured_settings.ai_backend == 'AcpCodex'
+    assert audit_records[0]['purpose'] == 'ConnectionTest'
+    assert audit_records[0]['status'] == 'Succeeded'
+
+
+@pytest.mark.parametrize(
+    ('backend', 'expected_message'),
+    [
+        ('AcpCodex', 'Codex 認証が未取り込み'),
+        ('AcpGrok', 'Grok Build 認証が未取り込み'),
+    ],
+)
+def test_acp_connection_test_rejects_missing_auth_before_backend_start(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    backend: Literal['AcpCodex', 'AcpGrok'],
+    expected_message: str,
+) -> None:
+    """未設定認証では ACP agent を起動せず、0ms の固定結果を返す。"""
+
+    _ = acp_paths
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'getStatus',
+        classmethod(
+            lambda _cls: SimpleNamespace(
+                codex_auth_imported=False,
+                grok_auth_imported=False,
+                google_adc_available=False,
+            )
+        ),
+    )
+
+    async def TestConnection(*_args: object, **_kwargs: object) -> ConnectionTestResult:
+        raise AssertionError('認証 preflight 失敗時に backend を起動してはならない')
+
+    async def CreateAudit(**_kwargs: object) -> object:
+        return object()
+
+    monkeypatch.setattr(AIBackendRouter, 'test_connection', TestConnection)
+    monkeypatch.setattr(AIBackendRouter.RecordedSeriesAIRequest, 'create', CreateAudit)
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.post('/api/ai-backends/acp/test', json={
+                'capability': 'EpisodeLookup',
+                'backend_kind': backend,
+            })
+
+        assert response.status_code == 200
+        assert response.json()['success'] is False
+        assert response.json()['latency_ms'] == 0
+        assert expected_message in response.json()['message']
+        assert response.json()['checks']['backend_connection']['status'] == 'NotRun'
+
+    asyncio.run(Run())
+
+
+def test_acp_connection_test_rejects_another_running_agent_without_queueing(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """別 ACP 実行中の手動接続試験は待機キューへ積まず即時結果を返す。"""
+
+    _ = acp_paths
+    operation_lock = asyncio.Lock()
+    monkeypatch.setattr(RecordedSeriesAIModule, 'ACP_OPERATION_LOCK', operation_lock)
+    PatchACPAuthImported(monkeypatch)
+
+    async def TestConnection(*_args: object, **_kwargs: object) -> ConnectionTestResult:
+        raise AssertionError('実行中 preflight 失敗時に backend を起動してはならない')
+
+    async def CreateAudit(**_kwargs: object) -> object:
+        return object()
+
+    monkeypatch.setattr(AIBackendRouter, 'test_connection', TestConnection)
+    monkeypatch.setattr(AIBackendRouter.RecordedSeriesAIRequest, 'create', CreateAudit)
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        await operation_lock.acquire()
+        try:
+            async with HTTPXAsyncClient(
+                transport=ASGITransport(app=app),
+                base_url='http://test',
+            ) as client:
+                response = await asyncio.wait_for(
+                    client.post('/api/ai-backends/acp/test', json={
+                        'capability': 'CandidateSelection',
+                        'backend_kind': 'AcpGrok',
+                    }),
+                    timeout=0.5,
+                )
+        finally:
+            operation_lock.release()
+
+        assert response.status_code == 200
+        assert response.json()['success'] is False
+        assert response.json()['latency_ms'] == 0
+        assert '別の ACP AI 処理を実行中' in response.json()['message']
+
+    asyncio.run(Run())
+
+
+def test_acp_connection_test_can_validate_episode_web_search_capability(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """話数側の接続試験は Web Search を呼び、候補選択とは別に監査する。"""
+
+    _ = acp_paths
+    PatchACPAuthImported(monkeypatch)
+    app = CreateAdminApp()
+    captured_settings: RecordedSeriesSettings | None = None
+    captured_api_key: str | None = None
+    audit_records: list[dict[str, object]] = []
+
+    async def TestConnection(
+        capability: str,
+        *,
+        settings: RecordedSeriesSettings | None = None,
+        api_key: str | None = None,
+    ) -> ConnectionTestResult:
+        assert capability == 'EpisodeLookup'
+        nonlocal captured_settings, captured_api_key
+        captured_settings = settings
+        captured_api_key = api_key
+        return ConnectionTestResult(
+            success=True,
+            latency_ms=48,
+            model='episode-model-response',
+            message='ACP Web Search 互換を確認しました。',
+            checks=SuccessfulEpisodeLookupConnectionChecks(),
+            prompt_tokens=20,
+            completion_tokens=5,
+            http_status=200,
+            selected_choice_id='S1E3',
+        )
+
+    async def CreateAudit(**kwargs: object) -> object:
+        audit_records.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(AIBackendRouter, 'test_connection', TestConnection)
+    monkeypatch.setattr(AIBackendRouter.RecordedSeriesAIRequest, 'create', CreateAudit)
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/api/ai-backends/acp/test', json={
+                'capability': 'EpisodeLookup',
+                'backend_kind': 'AcpCodex',
+            })
+
+        assert response.status_code == 200
+        assert response.json() == {
+            'success': True,
+            'latency_ms': 48,
+            'model': 'episode-model-response',
+            'message': 'ACP Web Search 互換を確認しました。',
+            'checks': {
+                'backend_connection': {'status': 'Passed', 'message': '接続済み'},
+                'web_search': {'status': 'Passed', 'message': '検索済み'},
+                'source_url': {'status': 'Passed', 'message': 'URL取得済み'},
+                'strict_schema': {'status': 'Passed', 'message': 'schema検証済み'},
+                'timeout_cancel': {'status': 'NotRun', 'message': '未実行'},
+                'permission_policy': {'status': 'NotApplicable', 'message': '対象外'},
+            },
+        }
+
+    asyncio.run(Run())
+    assert captured_settings is not None
+    assert captured_settings.ai_backend == 'AcpCodex'
+    assert captured_api_key is None
+    assert has_episode_lookup_capability_proof(
+        captured_settings,
+        captured_api_key,
+    ) is True
+    assert audit_records[0]['candidate_ids'] == ['episode-lookup']
+    assert audit_records[0]['selected_choice_id'] == 'S1E3'
+
+
+def test_acp_connection_test_rejects_a_result_from_a_stale_provider_generation(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """facade が実使用した世代と現在世代が違う接続成功は proof にしない。"""
+
+    _ = acp_paths
+    PatchACPAuthImported(monkeypatch)
+    app = CreateAdminApp()
+    used_provider_fingerprint = 'b' * 64
+    audit_records: list[dict[str, object]] = []
+
+    async def TestConnection(
+        capability: str,
+        *,
+        settings: RecordedSeriesSettings | None = None,
+        api_key: str | None = None,
+    ) -> ConnectionTestResult:
+        assert capability == 'EpisodeLookup'
+        assert settings is not None
+        assert api_key is None
+        return ConnectionTestResult(
+            success=True,
+            latency_ms=1,
+            model='stale-generation-model',
+            message='verified old generation',
+            checks=SuccessfulEpisodeLookupConnectionChecks(),
+            provider_fingerprint=used_provider_fingerprint,
+        )
+
+    class FakeAudit:
+        """接続試験 API が確定後に更新する監査レコードを模擬する。"""
+
+        def __init__(self, record: dict[str, object]) -> None:
+            """監査レコードの可変フィールドを保持する。
+
+            Args:
+                record: create 時の監査フィールド。
+
+            Returns:
+                None
+            """
+
+            self._record = record
+            self.status = cast(
+                Literal['Pending', 'Succeeded', 'Rejected', 'Failed'],
+                record['status'],
+            )
+            self.error_code = cast(str | None, record['error_code'])
+
+        async def save(self, *, update_fields: list[str]) -> None:
+            """指定された監査フィールドをテスト記録へ反映する。
+
+            Args:
+                update_fields: API が更新対象に指定したフィールド名。
+
+            Returns:
+                None
+            """
+
+            assert update_fields == ['status', 'error_code']
+            self._record['status'] = self.status
+            self._record['error_code'] = self.error_code
+
+    async def CreateAudit(**kwargs: object) -> FakeAudit:
+        audit_records.append(kwargs)
+        return FakeAudit(kwargs)
+
+    monkeypatch.setattr(AIBackendRouter, 'test_connection', TestConnection)
+    monkeypatch.setattr(AIBackendRouter.RecordedSeriesAIRequest, 'create', CreateAudit)
+
+    async def Run() -> dict[str, object]:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.post('/api/ai-backends/acp/test', json={
+                'capability': 'EpisodeLookup',
+                'backend_kind': 'AcpCodex',
+            })
+        assert response.status_code == 200
+        return response.json()
+
+    response = asyncio.run(Run())
+    assert response['success'] is False
+    assert response['message'] == (
+        '接続試験中に AI 設定または認証状態が変更されました。もう一度試してください。'
+    )
+    assert audit_records[0]['status'] == 'Failed'
+    assert audit_records[0]['error_code'] == 'ConnectionTestStateChanged'
+    current_settings = RecordedSeriesSettings(ai_backend='AcpCodex', ai_enabled=True)
+    assert (
+        has_episode_lookup_capability_proof(
+            current_settings,
+            None,
+        )
+        is False
+    )
+
+
+def test_acp_credentials_status_returns_shared_state(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACP 認証状態 API は認証内容を含まない安全な状態を返す。"""
+
+    _ = acp_paths
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'getStatus',
+        classmethod(
+            lambda _cls: SimpleNamespace(
+                codex_host_auth_available=True,
+                codex_auth_imported=True,
+                codex_auth_imported_at=None,
+                grok_host_auth_available=False,
+                grok_auth_imported=False,
+                grok_auth_imported_at=None,
+                google_adc_available=False,
+            )
+        ),
+    )
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.get('/api/ai-backends/acp-credentials')
+            assert response.status_code == 200
+            body = response.json()
+            assert body['acp_operation_running'] is False
+            assert body['codex_host_auth_available'] is True
+            assert body['codex_auth_imported'] is True
+            assert body['grok_host_auth_available'] is False
+            assert body['grok_auth_imported'] is False
+            assert body['google_adc_available'] is False
+
+    asyncio.run(Run())
+
+
+def test_acp_credential_import_calls_provider_auth_and_revokes_proof(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """auth.json 取り込みは provider 管理 API を呼び、backend proof を失効させる。"""
+
+    _ = acp_paths
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'importProviderAuth',
+        classmethod(lambda _cls, _provider: None),
+    )
+    invalidated_backends: list[str] = []
+    monkeypatch.setattr(
+        AIBackendRouter,
+        'invalidate_episode_lookup_capability_proof',
+        lambda *, backend_kind: invalidated_backends.append(backend_kind),
+    )
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.post('/api/ai-backends/acp-credentials/codex/import')
+            assert response.status_code == 200
+            assert invalidated_backends == ['AcpCodex']
+
+    asyncio.run(Run())
+
+
+def test_acp_credential_delete_calls_provider_auth_and_revokes_proof(
+    acp_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """取り込み済み認証の削除は provider 管理 API を呼び、backend proof を失効させる。"""
+
+    _ = acp_paths
+    monkeypatch.setattr(
+        KonomiTVBS4KACPCredentials,
+        'deleteProviderAuth',
+        classmethod(lambda _cls, _provider: None),
+    )
+    invalidated_backends: list[str] = []
+    monkeypatch.setattr(
+        AIBackendRouter,
+        'invalidate_episode_lookup_capability_proof',
+        lambda *, backend_kind: invalidated_backends.append(backend_kind),
+    )
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.delete('/api/ai-backends/acp-credentials/grok')
+            assert response.status_code == 200
+            assert invalidated_backends == ['AcpGrok']
 
     asyncio.run(Run())

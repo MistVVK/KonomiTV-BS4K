@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import AIBackend from '@/services/AIBackend';
 import APIClient from '@/services/APIClient';
-import RecordedSeries, { type IRecordedSeriesConnectionTestRequest } from '@/services/RecordedSeries';
 import {
     ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC,
     ACP_HARD_TIMEOUT_SEC,
@@ -16,7 +16,7 @@ vi.mock('@/services/APIClient', () => ({
 }));
 
 
-describe('RecordedSeries 接続試験', () => {
+describe('AIBackend ACP 接続試験', () => {
     beforeEach(() => {
         vi.mocked(APIClient.post).mockReset();
         vi.mocked(APIClient.showGenericError).mockReset();
@@ -35,17 +35,13 @@ describe('RecordedSeries 接続試験', () => {
                 checks: null,
             },
         });
-        const request = {
-            ai_backend: 'AcpCodex',
-            capability: 'CandidateSelection',
-        } as IRecordedSeriesConnectionTestRequest;
 
-        await RecordedSeries.testConnection(request);
+        await AIBackend.testACPConnection('AcpCodex', 'CandidateSelection');
 
         expect(ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC).toBe(10 * 60);
         expect(APIClient.post).toHaveBeenCalledWith(
-            '/recorded-series/settings/test',
-            request,
+            '/ai-backends/acp/test',
+            {backend_kind: 'AcpCodex', capability: 'CandidateSelection'},
             {
                 timeout: (ACP_HARD_TIMEOUT_SEC + 10 * 60) * 1000,
             },

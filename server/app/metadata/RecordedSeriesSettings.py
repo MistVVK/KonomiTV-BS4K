@@ -1,8 +1,8 @@
-"""録画シリーズ判定の固有設定（AI バックエンド種別と EpisodeLookup 設定）。
+"""録画シリーズ判定の固有設定（AI バックエンド選択と EpisodeLookup 設定）。
 
 AI バックエンド接続・秘密・月次上限は AIBackendSettings 側が正本。
 OpenCode 時は ai_backend_service_id で AI バックエンド service を参照する。
-AcpCodex / AcpGrok は従来どおり ACP フィールドで実行する（Phase 2 以降も併存）。
+AcpCodex / AcpGrok のモデル・推論深さ・Fast・タイムアウトは ACPSettings 側が正本。
 旧 OpenAICompatible / AcpGemini / 日次制限はクリーンブレークで拒否する。
 """
 
@@ -22,41 +22,9 @@ from app.constants import DATA_DIR
 
 
 RecordedEpisodeNumberAcceptanceMode = Literal['HighConfidenceOnly', 'Always']
-# Phase 1 時点の AI バックエンド種別。OpenCode に加えて ACP の Codex / Grok を併存させる。
+# AI バックエンド種別。OpenCode に加えて ACP の Codex / Grok を併存させる。
 # OpenAICompatible / AcpGemini はクリーンブレークで拒否する。
 AIBackendKind = Literal['OpenCode', 'AcpCodex', 'AcpGrok']
-
-# ACP 共通の推論深さ。CLI / agent には lowercase で渡す。
-# Codex は XHigh/Max/Ultra まで。ただし Ultra は Sol 系統だけで使用する。
-# Grok は Low/Medium/High のみ。
-AcpReasoningEffort = Literal['Low', 'Medium', 'High', 'XHigh', 'Max', 'Ultra']
-_ACP_REASONING_EFFORT_FROM_LOWER: dict[str, AcpReasoningEffort] = {
-    'low': 'Low',
-    'medium': 'Medium',
-    'high': 'High',
-    'xhigh': 'XHigh',
-    'max': 'Max',
-    'ultra': 'Ultra',
-}
-# 旧 UI の連結 ID（gpt-5.6-luna[medium]）を model + effort に分解する。
-_ACP_COMPOSITE_MODEL_RE = re.compile(
-    r'^(?P<model>[^\[\]]+?)(?:\[(?P<effort>low|medium|high|xhigh|max|ultra)\])?$',
-    re.IGNORECASE,
-)
-_ACP_BASIC_REASONING_EFFORTS: frozenset[AcpReasoningEffort] = frozenset({
-    'Low',
-    'Medium',
-    'High',
-})
-# backend ごとの未設定時デフォルト（CLI 既定ではなく明示プリセット）。
-_ACP_DEFAULT_MODEL_BY_BACKEND: dict[str, str | None] = {
-    'AcpCodex': 'gpt-5.6-luna',
-    'AcpGrok': None,
-}
-_ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND: dict[str, AcpReasoningEffort] = {
-    'AcpCodex': 'Medium',
-    'AcpGrok': 'High',
-}
 
 _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
@@ -82,6 +50,14 @@ _LEGACY_ACP_AUTH_SETTINGS_KEYS = frozenset({
     'acp_user_gemini_home',
     'acp_auth_share_mode',
 })
+# ACPSettings へ移行した ACP 実行設定（モデル・推論深さ・Fast・タイムアウト）。
+# 旧 recorded-series-settings.json に残っていても読取時に無視する（ACPSettings 側が移行して正本化）。
+_LEGACY_ACP_EXECUTION_SETTINGS_KEYS = frozenset({
+    'acp_model',
+    'acp_reasoning_effort',
+    'konomitv_bs4k_acp_codex_fast_mode_enabled',
+    'acp_timeout_sec',
+})
 _LEGACY_ACP_CUSTOM_SETTINGS_KEYS = frozenset({
     'acp_cwd',
     'acp_command',
@@ -93,57 +69,6 @@ _LEGACY_ACP_GEMINI_SETTINGS_KEYS = frozenset({
     'google_cloud_project',
     'google_cloud_location',
 })
-
-
-def _isKonomiTVBS4KCodexSolModel(konomitv_bs4k_model: str | None) -> bool:
-    """Codex のモデル ID が Sol 系統かを判定する。"""
-
-    if konomitv_bs4k_model is None:
-        return False
-    konomitv_bs4k_normalized_model = konomitv_bs4k_model.strip().lower()
-    return (
-        konomitv_bs4k_normalized_model == 'sol' or
-        konomitv_bs4k_normalized_model.endswith('-sol')
-    )
-
-
-def ParseAcpCompositeModel(
-    raw_model: str | None,
-) -> tuple[str | None, AcpReasoningEffort | None]:
-    """連結モデル ID（model[effort]）を model と effort に分解する。
-
-    Args:
-        raw_model: UI または旧設定のモデル文字列。
-
-    Returns:
-        (model, effort)。effort 括弧が無い場合は effort は None。
-        空文字は (None, None)。
-
-    Raises:
-        ValueError: 角括弧の形が不正な場合。
-    """
-
-    if raw_model is None:
-        return None, None
-    trimmed = raw_model.strip()
-    if trimmed == '':
-        return None, None
-    matched = _ACP_COMPOSITE_MODEL_RE.fullmatch(trimmed)
-    if matched is None:
-        raise ValueError(
-            'ACP モデル ID の形式が不正です。'
-            'モデル名、または model[effort] 形式で指定してください。'
-        )
-    model = matched.group('model').strip()
-    if model == '':
-        return None, None
-    effort_raw = matched.group('effort')
-    if effort_raw is None:
-        return model, None
-    effort = _ACP_REASONING_EFFORT_FROM_LOWER.get(effort_raw.lower())
-    if effort is None:
-        raise ValueError('ACP 推論深さの値が不正です。')
-    return model, effort
 
 
 class RecordedSeriesSettings(BaseModel):
@@ -165,16 +90,6 @@ class RecordedSeriesSettings(BaseModel):
     # OpenCode 時のみ参照する AIBackendSettings の service_id（UUID）。
     ai_backend_service_id: Annotated[str | None, Field(max_length=36)] = None
 
-    # ACP 共通（モデル名と推論深さは分離して保存する）
-    acp_model: Annotated[str | None, Field(max_length=255)] = None
-    # Codex: Low…Ultra / Grok: Low…High。backend ごとの default は model_validator で埋める。
-    acp_reasoning_effort: Annotated[AcpReasoningEffort | None, Field()] = None
-    # KonomiTV-BS4K 固有。Codex の専用 profile へ Fast service tier を設定する。
-    konomitv_bs4k_acp_codex_fast_mode_enabled: Annotated[bool, Field()] = False
-    # 壁時計の総実行上限ではなく、ACP stdio の無通信打ち切り秒数。
-    # thought / tool update などの NDJSON 行が届くたびにタイマーはリセットされる。
-    acp_timeout_sec: Annotated[int, Field(ge=30, le=600)] = 120
-
     @field_validator('ai_backend_service_id')
     @classmethod
     def validateServiceID(cls, value: str | None) -> str | None:
@@ -189,66 +104,17 @@ class RecordedSeriesSettings(BaseModel):
             raise ValueError('ai_backend_service_id は UUID である必要があります。')
         return normalized
 
-    @field_validator('acp_model')
-    @classmethod
-    def validateAcpModel(cls, model: str | None) -> str | None:
-        """ACP モデル ID の空文字を未指定へ正規化する。
-
-        連結 ID の分解は model_validator 側で行い、ここは前後空白のみ整える。
-        """
-
-        if model is None:
-            return None
-        return model.strip() or None
-
     @model_validator(mode='after')
     def normalizeBackendCapabilities(self) -> RecordedSeriesSettings:
-        """ACP 能力とプリセットごとの固定実行経路を正規化する。
+        """バックエンド選択を正規化する。
 
-        OpenCode 時は ACP の model / effort / Fast tier を使わず、service_id が必須。
-        AcpCodex / AcpGrok は従来どおりの ACP 正規化を適用する。
+        OpenCode 時は service_id が必須。
+        AcpCodex / AcpGrok のモデル・推論深さ・Fast・タイムアウトは
+        ACPSettings 側が正本のため、ここでは検証しない。
         """
 
-        if self.ai_backend == 'OpenCode':
-            # OpenCode では ACP の model / effort / Fast service tier を持ち越さない。
-            self.acp_model = None
-            self.acp_reasoning_effort = None
-            self.konomitv_bs4k_acp_codex_fast_mode_enabled = False
-            if self.ai_enabled and self.ai_backend_service_id is None:
-                raise ValueError('OpenCode を利用する場合は ai_backend_service_id が必要です。')
-            return self
-
-        if self.ai_backend != 'AcpCodex':
-            # Fast service tier は Codex 専用で、他 provider へ持ち越さない。
-            self.konomitv_bs4k_acp_codex_fast_mode_enabled = False
-
-        # 旧 UI の連結 ID を model + effort に分解する。
-        # 明示された acp_reasoning_effort がある場合は括弧側より優先する。
-        if self.acp_model is not None:
-            bare_model, embedded_effort = ParseAcpCompositeModel(self.acp_model)
-            self.acp_model = bare_model
-            if self.acp_reasoning_effort is None and embedded_effort is not None:
-                self.acp_reasoning_effort = embedded_effort
-
-        if self.ai_backend == 'AcpGrok':
-            # Grok Build の ACP は grok-4.5 固定。モデル ID は保存せず深さだけを持つ。
-            self.acp_model = None
-            if self.acp_reasoning_effort is None:
-                self.acp_reasoning_effort = _ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND['AcpGrok']
-            if self.acp_reasoning_effort not in _ACP_BASIC_REASONING_EFFORTS:
-                raise ValueError('Grok の推論深さは Low / Medium / High のみです。')
-        elif self.ai_backend == 'AcpCodex':
-            if self.acp_model is None:
-                self.acp_model = _ACP_DEFAULT_MODEL_BY_BACKEND['AcpCodex']
-            if self.acp_reasoning_effort is None:
-                self.acp_reasoning_effort = _ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND['AcpCodex']
-            if (
-                self.acp_reasoning_effort == 'Ultra' and
-                _isKonomiTVBS4KCodexSolModel(self.acp_model) is False
-            ):
-                # 旧保存値や直接 API 入力も、非 Sol では Max へ安全に補正する。
-                self.acp_reasoning_effort = 'Max'
-
+        if self.ai_backend == 'OpenCode' and self.ai_enabled and self.ai_backend_service_id is None:
+            raise ValueError('OpenCode を利用する場合は ai_backend_service_id が必要です。')
         return self
 
 
@@ -299,14 +165,16 @@ class RecordedSeriesSettingsStore:
                     'Legacy AI backend is not supported: '
                     f'{backend_value}. Delete recorded-series-settings.json and reconfigure.',
                 )
-            # 未リリース WIP の旧 home / Symlink / Copy / Custom ACP 設定だけを
-            # 保存済み JSON 読取時に除外する。API 入力は extra='forbid' のままにし、
-            # 旧クライアントの危険な path・command 指定を受理しない。
+            # 旧 ACP 実行設定（ACPSettings へ移行）と、未リリース WIP の旧 home /
+            # Symlink / Copy / Custom ACP 設定を保存済み JSON 読取時に除外する。
+            # API 入力は extra='forbid' のままにし、旧クライアントの危険な
+            # path・command 指定を受理しない。
             settings_json = {
                 key: value
                 for key, value in settings_json.items()
                 if (
                     key not in _LEGACY_ACP_AUTH_SETTINGS_KEYS and
+                    key not in _LEGACY_ACP_EXECUTION_SETTINGS_KEYS and
                     key not in _LEGACY_ACP_CUSTOM_SETTINGS_KEYS and
                     key not in _LEGACY_ACP_GEMINI_SETTINGS_KEYS
                 )

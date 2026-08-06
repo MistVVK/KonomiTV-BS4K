@@ -73,6 +73,22 @@ export interface IAIBackendServiceUpdate {
     clear_monthly_token_limit?: boolean;
 }
 
+/** 接続試験の1能力チェック。 */
+export interface IAIBackendConnectionTestCheck {
+    status: 'Passed' | 'Failed' | 'NotRun' | 'NotApplicable';
+    message: string;
+}
+
+/** EpisodeLookup 接続試験の固定6項目。 */
+export interface IAIBackendEpisodeLookupConnectionChecks {
+    backend_connection: IAIBackendConnectionTestCheck;
+    web_search: IAIBackendConnectionTestCheck;
+    source_url: IAIBackendConnectionTestCheck;
+    strict_schema: IAIBackendConnectionTestCheck;
+    timeout_cancel: IAIBackendConnectionTestCheck;
+    permission_policy: IAIBackendConnectionTestCheck;
+}
+
 /** 接続試験結果。 */
 export interface IAIBackendConnectionTestResult {
     success: boolean;
@@ -83,6 +99,8 @@ export interface IAIBackendConnectionTestResult {
     completion_tokens: number | null;
     http_status: number | null;
     error_code: string | null;
+    /** EpisodeLookup 時のみ。生成試験では null。 */
+    checks: IAIBackendEpisodeLookupConnectionChecks | null;
 }
 
 /** 月次利用量（推定料金）。 */
@@ -148,6 +166,69 @@ export interface IAIBackendOAuthStartResult {
     authorization_method: 'auto' | 'code' | null;
     instructions: string | null;
     authorize: Record<string, unknown>;
+}
+
+
+// ===== ACP 固定プリセット（Codex / Grok Build） =====
+
+/** ACP の推論深さ。Codex は XHigh/Max/Ultra まで、Grok は Low〜High。 */
+export type AcpReasoningEffort = 'Low' | 'Medium' | 'High' | 'XHigh' | 'Max' | 'Ultra';
+/** ACP 固定プリセットのバックエンド種別。 */
+export type ACPBackendKind = 'AcpCodex' | 'AcpGrok';
+
+/** 1 プロバイダ（Codex / Grok）分の ACP 実行設定。 */
+export interface IACPBackendSettings {
+    model: string | null;
+    reasoning_effort: AcpReasoningEffort | null;
+    /** Codex 専用。Grok では常に false。 */
+    codex_fast_mode_enabled: boolean;
+    /** ACP stdio の無通信打ち切り秒数（30〜600）。 */
+    timeout_sec: number;
+}
+
+/** ACP 固定プリセット全体の設定。 */
+export interface IACPSettings {
+    codex: IACPBackendSettings;
+    grok: IACPBackendSettings;
+}
+
+/** 認証内容を含まない ACP 共有資格情報状態。 */
+export interface IACPBackendCredentialStatus {
+    acp_operation_running: boolean;
+    codex_host_auth_available: boolean;
+    codex_auth_imported: boolean;
+    codex_auth_imported_at: string | null;
+    codex_auth_in_use: boolean;
+    grok_host_auth_available: boolean;
+    grok_auth_imported: boolean;
+    grok_auth_imported_at: string | null;
+    grok_auth_in_use: boolean;
+    google_adc_available: boolean;
+}
+
+/** ACP 接続試験の1能力の状態。 */
+export interface IACPBackendConnectionTestCheck {
+    status: 'Passed' | 'Failed' | 'NotRun' | 'NotApplicable';
+    message: string;
+}
+
+/** ACP EpisodeLookup 接続試験の固定6項目。 */
+export interface IACPBackendEpisodeLookupConnectionChecks {
+    backend_connection: IACPBackendConnectionTestCheck;
+    web_search: IACPBackendConnectionTestCheck;
+    source_url: IACPBackendConnectionTestCheck;
+    strict_schema: IACPBackendConnectionTestCheck;
+    timeout_cancel: IACPBackendConnectionTestCheck;
+    permission_policy: IACPBackendConnectionTestCheck;
+}
+
+/** ACP 接続試験結果。 */
+export interface IACPBackendConnectionTestResult {
+    success: boolean;
+    latency_ms: number;
+    model: string;
+    message: string;
+    checks: IACPBackendEpisodeLookupConnectionChecks | null;
 }
 
 
@@ -325,6 +406,91 @@ export default class AIBackend {
         });
         if (response.type === 'error') {
             APIClient.showGenericError(response, '月次利用量を取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    // ===== ACP 固定プリセット（Codex / Grok Build） =====
+
+    /** ACP 固定プリセット設定を取得する。 */
+    static async fetchACPSettings(): Promise<IACPSettings | null> {
+        const response = await APIClient.get<IACPSettings>('/ai-backends/acp-settings');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'ACP 設定を取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    /** ACP 固定プリセット設定を保存する（全体置き換え）。 */
+    static async updateACPSettings(settings: IACPSettings): Promise<boolean> {
+        const response = await APIClient.put('/ai-backends/acp-settings', settings);
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'ACP 設定を保存できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** ACP 認証状態を取得する。 */
+    static async fetchACPCredentialStatus(): Promise<IACPBackendCredentialStatus | null> {
+        const response = await APIClient.get<IACPBackendCredentialStatus>('/ai-backends/acp-credentials');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'ACP 認証状態を取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    /** ホストの auth.json を KonomiTV-BS4K 専用プロファイルへ取り込む。 */
+    static async importACPAuthentication(
+        provider: 'codex' | 'grok',
+    ): Promise<IACPBackendCredentialStatus | null> {
+        const response = await APIClient.post<IACPBackendCredentialStatus>(
+            `/ai-backends/acp-credentials/${provider}/import`,
+            {},
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(
+                response,
+                'ACP 認証を取り込めませんでした。ホスト側の認証と Compose 設定を確認してください。',
+            );
+            return null;
+        }
+        return response.data;
+    }
+
+    /** KonomiTV-BS4K 専用プロファイルの auth.json コピーを削除する。 */
+    static async deleteACPAuthentication(
+        provider: 'codex' | 'grok',
+    ): Promise<IACPBackendCredentialStatus | null> {
+        const response = await APIClient.delete<IACPBackendCredentialStatus>(
+            `/ai-backends/acp-credentials/${provider}`,
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, '取り込んだ ACP 認証を削除できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    /**
+     * 保存済み ACP 設定で接続試験を実行する。
+     * サーバー hard limit + 回収余裕で待つ。
+     */
+    static async testACPConnection(
+        backend_kind: ACPBackendKind,
+        capability: AIBackendConnectionCapability = 'CandidateSelection',
+    ): Promise<IACPBackendConnectionTestResult | null> {
+        const response = await APIClient.post<IACPBackendConnectionTestResult>(
+            '/ai-backends/acp/test',
+            {backend_kind, capability},
+            // ACP はサーバー hard limit + 回収余裕で待つ（60分 + 10分）。
+            {timeout: 70 * 60 * 1000},
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'ACP 接続試験を実行できませんでした。');
             return null;
         }
         return response.data;

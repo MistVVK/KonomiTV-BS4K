@@ -12,6 +12,11 @@ from tortoise import Tortoise, transactions
 from tortoise.backends.base.client import BaseDBAsyncClient
 
 from app.constants import JST
+from app.metadata.ai.ACPSettings import (
+    ACPBackendSettings,
+    ACPSettings,
+    ACPSettingsStore,
+)
 from app.metadata.RecordedEpisodeResolver import (
     ParsedEpisodeNumber,
     RecordedEpisodeResolver,
@@ -1035,8 +1040,8 @@ def test_zero_ai_request_limit_skips_daily_count_and_checks_recent_attempt_cache
 @pytest.mark.parametrize(
     'ai_backend,acp_model,expected_audit_model,failure_code',
     [
-        ('AcpCodex', 'test-acp-model', 'acp:codex:test-acp-model', None),
-        ('AcpCodex', 'test-acp-model', 'acp:codex:test-acp-model', 'HostCLIStartFailed'),
+        ('AcpCodex', 'test-acp-model', 'acp:codex:test-acp-model[medium]', None),
+        ('AcpCodex', 'test-acp-model', 'acp:codex:test-acp-model[medium]', 'HostCLIStartFailed'),
     ],
     ids=['acp-success', 'acp-setup-failure'],
 )
@@ -1178,6 +1183,18 @@ def test_ai_generation_audit_uses_backend_prefix_and_closes_failures(
         events.append('needs-review')
 
     async def Scenario() -> None:
+        # ACP のモデル・推論深さは ACPSettings が正本（AI バックエンドページ管理）。
+        monkeypatch.setattr(
+            ACPSettingsStore,
+            'getSettings',
+            classmethod(lambda _cls: ACPSettings(
+                codex=ACPBackendSettings(
+                    backend_kind='AcpCodex',
+                    model=acp_model,
+                ),
+                grok=ACPBackendSettings(backend_kind='AcpGrok'),
+            )),
+        )
         monkeypatch.setattr(
             RecordedSeriesSettingsStore,
             'getSettingsAndAPIKey',
@@ -1186,7 +1203,6 @@ def test_ai_generation_audit_uses_backend_prefix_and_closes_failures(
                     enabled=True,
                     ai_enabled=True,
                     ai_backend=ai_backend,
-                    acp_model=acp_model,
                     ai_backend_service_id=None,
                 ),
                 None,
@@ -1454,7 +1470,7 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
         return [{'page_id': 789, 'title': '監査予約世代更新テスト', 'extract': '候補本文'}]
 
     async def CreateAIRequest(**kwargs: object) -> FakeAIRequest:
-        assert kwargs['model'] == 'acp:codex:test-acp-model'
+        assert kwargs['model'] == 'acp:codex:test-acp-model[medium]'
         events.append('audit-created')
         RecordedSeriesResolver._snapshot_generation += 1
         return ai_request
@@ -1464,6 +1480,18 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
         generation_called = True
 
     async def Scenario() -> None:
+        # ACP のモデルは ACPSettings が正本（AI バックエンドページ管理）。
+        monkeypatch.setattr(
+            ACPSettingsStore,
+            'getSettings',
+            classmethod(lambda _cls: ACPSettings(
+                codex=ACPBackendSettings(
+                    backend_kind='AcpCodex',
+                    model='test-acp-model',
+                ),
+                grok=ACPBackendSettings(backend_kind='AcpGrok'),
+            )),
+        )
         monkeypatch.setattr(
             RecordedSeriesSettingsStore,
             'getSettingsAndAPIKey',
@@ -1472,7 +1500,6 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
                     enabled=True,
                     ai_enabled=True,
                     ai_backend='AcpCodex',
-                    acp_model='test-acp-model',
                     ai_backend_service_id=None,
                 ),
                 None,
@@ -2466,5 +2493,3 @@ def test_manual_resolution_has_priority_over_ai_generation(
             await Tortoise.close_connections()
 
     asyncio.run(Scenario())
-
-

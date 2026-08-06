@@ -16,7 +16,7 @@ from httpx import AsyncClient as HTTPXAsyncClient
 
 import app.metadata.ai.KonomiTVBS4KACPCredentials as ACPCredentials
 import app.metadata.ai.recorded_series_ai as RecordedSeriesAIModule
-from app.routers import RecordedSeriesRouter
+from app.routers import AIBackendRouter
 
 
 def ConfigureCredentialPaths(
@@ -65,15 +65,15 @@ def CreateAdminApp() -> FastAPI:
     """管理者依存をテスト用に置き換えた FastAPI app を作る。
 
     Returns:
-        FastAPI: 録画シリーズ router を登録済みの app。
+        FastAPI: AI バックエンド router を登録済みの app。
     """
 
     async def GetAdminUser() -> object:
         return object()
 
     app = FastAPI()
-    app.include_router(RecordedSeriesRouter.router)
-    app.dependency_overrides[RecordedSeriesRouter.GetCurrentAdminUser] = GetAdminUser
+    app.include_router(AIBackendRouter.router)
+    app.dependency_overrides[AIBackendRouter.GetCurrentAdminUser] = GetAdminUser
     return app
 
 
@@ -517,9 +517,9 @@ def test_admin_api_imports_gets_and_deletes_auth_without_returning_content(
 
     async def Run():
         async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
-            initial_response = await client.get('/api/recorded-series/settings/acp-credentials')
-            import_response = await client.post('/api/recorded-series/settings/acp-credentials/codex/import')
-            delete_response = await client.delete('/api/recorded-series/settings/acp-credentials/codex')
+            initial_response = await client.get('/api/ai-backends/acp-credentials')
+            import_response = await client.post('/api/ai-backends/acp-credentials/codex/import')
+            delete_response = await client.delete('/api/ai-backends/acp-credentials/codex')
         return initial_response, import_response, delete_response
 
     initial_response, import_response, delete_response = asyncio.run(Run())
@@ -576,15 +576,15 @@ def test_admin_api_rejects_only_the_in_use_provider_without_waiting(
             ) as client:
                 codex_response = await asyncio.wait_for(
                     client.post(
-                        '/api/recorded-series/settings/acp-credentials/codex/import'
+                        '/api/ai-backends/acp-credentials/codex/import'
                     ),
                     timeout=0.5,
                 )
                 grok_response = await client.post(
-                    '/api/recorded-series/settings/acp-credentials/grok/import'
+                    '/api/ai-backends/acp-credentials/grok/import'
                 )
                 status_response = await client.get(
-                    '/api/recorded-series/settings/acp-credentials'
+                    '/api/ai-backends/acp-credentials'
                 )
         finally:
             credential_locks['codex'].release()
@@ -617,7 +617,7 @@ def test_admin_api_returns_sanitized_error_for_invalid_host_auth(
 
     async def Run():
         async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
-            return await client.post('/api/recorded-series/settings/acp-credentials/grok/import')
+            return await client.post('/api/ai-backends/acp-credentials/grok/import')
 
     response = asyncio.run(Run())
 
@@ -636,13 +636,13 @@ def test_acp_credential_api_requires_admin_authentication(
 
     ConfigureCredentialPaths(monkeypatch, tmp_path)
     app = FastAPI()
-    app.include_router(RecordedSeriesRouter.router)
+    app.include_router(AIBackendRouter.router)
 
     async def Run():
         async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
-            get_response = await client.get('/api/recorded-series/settings/acp-credentials')
-            import_response = await client.post('/api/recorded-series/settings/acp-credentials/codex/import')
-            delete_response = await client.delete('/api/recorded-series/settings/acp-credentials/codex')
+            get_response = await client.get('/api/ai-backends/acp-credentials')
+            import_response = await client.post('/api/ai-backends/acp-credentials/codex/import')
+            delete_response = await client.delete('/api/ai-backends/acp-credentials/codex')
         return get_response, import_response, delete_response
 
     get_response, import_response, delete_response = asyncio.run(Run())

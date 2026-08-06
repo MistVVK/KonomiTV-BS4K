@@ -22,6 +22,24 @@
         </div>
 
         <template v-else>
+            <v-tabs v-model="tab" color="primary" bg-color="transparent" class="mt-4"
+                :density="is_form_dense ? 'compact' : 'default'">
+                <v-tab value="opencode">
+                    <Icon icon="fluent:cloud-20-filled" width="17px" />
+                    <span class="ml-1">OpenCode</span>
+                </v-tab>
+                <v-tab value="acp-codex">
+                    <Icon icon="fluent:brain-circuit-20-filled" width="17px" />
+                    <span class="ml-1">ACP / Codex</span>
+                </v-tab>
+                <v-tab value="acp-grok">
+                    <Icon icon="fluent:sparkle-20-filled" width="17px" />
+                    <span class="ml-1">ACP / Grok Build</span>
+                </v-tab>
+            </v-tabs>
+
+            <v-window v-model="tab" class="mt-2">
+            <v-window-item value="opencode">
             <div class="settings__content" :class="{'settings__content--disabled': is_busy}">
                 <div class="settings__content-heading">
                     <Icon icon="fluent:heart-pulse-20-filled" width="22px" />
@@ -238,6 +256,28 @@
                     </div>
                 </div>
             </div>
+            </v-window-item>
+
+            <v-window-item value="acp-codex">
+                <ACPBackendSection provider="codex"
+                    :settings="acp_settings?.codex ?? empty_acp_settings"
+                    :credential-status="acp_credential_status"
+                    :saving="is_saving_acp"
+                    @update:settings="updateACPDraft('codex', $event)"
+                    @update:credential-status="acp_credential_status = $event"
+                    @save="saveACPSettings()" />
+            </v-window-item>
+
+            <v-window-item value="acp-grok">
+                <ACPBackendSection provider="grok"
+                    :settings="acp_settings?.grok ?? empty_acp_settings"
+                    :credential-status="acp_credential_status"
+                    :saving="is_saving_acp"
+                    @update:settings="updateACPDraft('grok', $event)"
+                    @update:credential-status="acp_credential_status = $event"
+                    @save="saveACPSettings()" />
+            </v-window-item>
+            </v-window>
         </template>
 
         <!-- 追加・編集ダイアログ（OpenCode Web 相当: プロバイダ → 認証方式） -->
@@ -425,6 +465,7 @@
 
 import { computed, onMounted, ref } from 'vue';
 
+import ACPBackendSection from '@/components/Settings/ACPBackendSection.vue';
 import Message from '@/message';
 import AIBackend, {
     type AIAuthMode,
@@ -435,6 +476,9 @@ import AIBackend, {
     type IAIBackendProviderAuthMethod,
     type IAIBackendService,
     type IAIBackendUsage,
+    type IACPBackendCredentialStatus,
+    type IACPBackendSettings,
+    type IACPSettings,
     type IOpenCodeAvailability,
 } from '@/services/AIBackend';
 import useUserStore from '@/stores/UserStore';
@@ -485,6 +529,54 @@ const usage_list = ref<IAIBackendUsage[]>([]);
 const test_results = ref<Record<string, IAIBackendConnectionTestResult | null>>({});
 /** `${service_id}:${capability}` 形式。同時に1試験のみ。 */
 const testing_service_id = ref<string | null>(null);
+
+/** ACP タブの切り替え状態。 */
+const tab = ref<'opencode' | 'acp-codex' | 'acp-grok'>('opencode');
+/** ACP 固定プリセット設定（サーバー保存済み）。 */
+const acp_settings = ref<IACPSettings | null>(null);
+/** 認証内容を含まない ACP 資格情報状態。 */
+const acp_credential_status = ref<IACPBackendCredentialStatus | null>(null);
+/** ACP 設定全体の保存中フラグ（ACPBackendSection の保存ボタンと連動）。 */
+const is_saving_acp = ref(false);
+/** 取得前の ACPBackendSection へ渡す無害な初期値。 */
+const empty_acp_settings = computed<IACPBackendSettings>(() => ({
+    model: null,
+    reasoning_effort: null,
+    codex_fast_mode_enabled: false,
+    timeout_sec: 120,
+}));
+/** ACPBackendSection のドラフト更新を ACP 設定へ反映する。 */
+function updateACPDraft(provider: 'codex' | 'grok', settings: IACPBackendSettings): void {
+    if (acp_settings.value === null) {
+        // 取得前に編集が入った場合も、codex / grok で同じオブジェクト参照を共有しない。
+        acp_settings.value = {
+            codex: {...empty_acp_settings.value},
+            grok: {...empty_acp_settings.value},
+        };
+    }
+    acp_settings.value = {
+        ...acp_settings.value,
+        [provider]: settings,
+    };
+}
+
+/** ACP 固定プリセット設定を全体置き換えで保存し、サーバーの正規化値を再取得する。 */
+async function saveACPSettings(): Promise<void> {
+    if (is_saving_acp.value || acp_settings.value === null) return;
+    is_saving_acp.value = true;
+    try {
+        const ok = await AIBackend.updateACPSettings(acp_settings.value);
+        if (ok) {
+            Message.success('ACP 設定を保存しました。');
+            const fetched = await AIBackend.fetchACPSettings();
+            if (fetched !== null) {
+                acp_settings.value = fetched;
+            }
+        }
+    } finally {
+        is_saving_acp.value = false;
+    }
+}
 
 /** service カードへ埋め込む当月 usage（削除済みは別枠）。 */
 const usageByServiceId = computed(() => {
@@ -778,12 +870,14 @@ function formatLimitFlags(usage: IAIBackendUsage): string {
 }
 
 async function reloadAll(): Promise<void> {
-    // health / services / usage / providers を同時更新（再読込ボタンからも同じ経路）
-    const [health_result, list, usage, provider_list] = await Promise.all([
+    // health / services / usage / providers / ACP 設定・認証を同時更新（再読込ボタンからも同じ経路）
+    const [health_result, list, usage, provider_list, acp_settings_result, acp_credential_result] = await Promise.all([
         AIBackend.fetchHealth(),
         AIBackend.fetchServices(),
         AIBackend.fetchUsageList(),
         AIBackend.fetchProviders(),
+        AIBackend.fetchACPSettings(),
+        AIBackend.fetchACPCredentialStatus(),
     ]);
     health.value = health_result;
     if (list !== null) {
@@ -794,6 +888,12 @@ async function reloadAll(): Promise<void> {
     }
     if (provider_list !== null) {
         providers.value = provider_list;
+    }
+    if (acp_settings_result !== null) {
+        acp_settings.value = acp_settings_result;
+    }
+    if (acp_credential_result !== null) {
+        acp_credential_status.value = acp_credential_result;
     }
 }
 

@@ -1,13 +1,15 @@
-"""AI バックエンド（OpenCode service）管理 API。
+"""AI バックエンド（OpenCode service / ACP）管理 API。
 
 含む: service CRUD / APIキー set・delete / OAuth 開始・callback・切断 /
 OpenCode auth 注入と DELETE /auth/{id} 連動 / health・availability /
 provider カタログ（OpenCode Web 相当の認証方式選択）/
-draft 接続試験（Phase 2）/ 月次利用量 GET（Phase 3）。
+draft 接続試験（Phase 2）/ 月次利用量 GET（Phase 3）/
+ACP 固定プリセット（Codex / Grok）の設定・認証・接続試験。
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
@@ -15,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, st
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import logging
+from app.metadata.ai.ACPSettings import ACPSettings, ACPSettingsStore
 from app.metadata.ai.AIAPIUsageLedger import (
     AIAPIUsageLedger,
     CurrentYearMonth,
@@ -28,7 +31,16 @@ from app.metadata.ai.AIBackendSettings import (
     AIBackendSettingsStore,
     IsRecordedSeriesReferencingService,
 )
-from app.metadata.ai.backends import ConnectionTestResult
+from app.metadata.ai.backends import (
+    ConnectionTestCheck,
+    ConnectionTestResult,
+    EpisodeLookupConnectionChecks,
+)
+from app.metadata.ai.KonomiTVBS4KACPCredentials import (
+    KonomiTVBS4KACPCredentialError,
+    KonomiTVBS4KACPCredentials,
+    KonomiTVBS4KACPImportProvider,
+)
 from app.metadata.ai.opencode_backend import (
     BuildOpenCodeBackendFromDraft,
     BuildOpenCodeBackendFromServiceID,
@@ -42,7 +54,21 @@ from app.metadata.ai.opencode_serve import (
     IsOpenCodeAvailable,
     ProbeOpenCodeAvailability,
 )
+from app.metadata.ai.recorded_series_ai import (
+    GetACPCredentialOperationLock,
+    IsACPOperationRunning,
+    get_audit_model,
+    get_episode_lookup_provider_fingerprint,
+    invalidate_episode_lookup_capability_fingerprint,
+    invalidate_episode_lookup_capability_proof,
+    record_episode_lookup_capability_proof,
+    test_connection,
+)
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
+from app.metadata.RecordedSeriesSettings import (
+    RecordedSeriesSettings,
+)
+from app.models.RecordedSeries import RecordedSeriesAIRequest
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
 
@@ -65,17 +91,6 @@ _COMPLEX_UNSUPPORTED_PROVIDER_IDS = frozenset({
     'gitlab',
     'snowflake-cortex',
 })
-
-
-# EpisodeLookup proof 無効化は Phase 4 まで no-op でもよいが、
-# 鍵削除時に呼ぶフックを先に用意する。
-try:
-    from app.metadata.ai.recorded_series_ai import (
-        invalidate_episode_lookup_capability_proof as _invalidate_episode_lookup_proof,
-    )
-except Exception:  # pragma: no cover - 起動時の循環・未実装耐性
-    def _invalidate_episode_lookup_proof(*_args: Any, **_kwargs: Any) -> None:
-        return None
 
 
 router = APIRouter(
@@ -108,6 +123,57 @@ class OpenCodeAvailabilityResponse(BaseModel):
     pinned_version: str
     pid: int | None
     workspace: str
+
+
+class ACPBackendConnectionTestCheckResponse(BaseModel):
+    """ACP 接続試験の1能力について、実測できた状態と安全な説明を返す。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    status: Literal['Passed', 'Failed', 'NotRun', 'NotApplicable']
+    message: str
+
+
+class ACPBackendEpisodeLookupConnectionChecksResponse(BaseModel):
+    """ACP EpisodeLookup 接続試験の固定6項目。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    backend_connection: ACPBackendConnectionTestCheckResponse
+    web_search: ACPBackendConnectionTestCheckResponse
+    source_url: ACPBackendConnectionTestCheckResponse
+    strict_schema: ACPBackendConnectionTestCheckResponse
+    timeout_cancel: ACPBackendConnectionTestCheckResponse
+    permission_policy: ACPBackendConnectionTestCheckResponse
+
+
+class ACPBackendConnectionTestResponse(BaseModel):
+    """秘密情報を含まない ACP 接続試験結果。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    success: bool
+    latency_ms: int
+    model: str
+    message: str
+    checks: ACPBackendEpisodeLookupConnectionChecksResponse | None
+
+
+class ACPBackendCredentialStatusResponse(BaseModel):
+    """認証内容を含まない ACP 共有資格情報状態。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    acp_operation_running: bool
+    codex_host_auth_available: bool
+    codex_auth_imported: bool
+    codex_auth_imported_at: datetime | None
+    codex_auth_in_use: bool
+    grok_host_auth_available: bool
+    grok_auth_imported: bool
+    grok_auth_imported_at: datetime | None
+    grok_auth_in_use: bool
+    google_adc_available: bool
 
 
 class OAuthStartRequest(BaseModel):
@@ -264,6 +330,28 @@ class AIBackendConnectionTestRequest(BaseModel):
     api_key: Annotated[str | None, Field(min_length=1, max_length=MAX_API_KEY_LENGTH)] = None
 
 
+class AIBackendConnectionTestCheckResponse(BaseModel):
+    """OpenCode 接続試験の1能力について、実測できた状態と安全な説明を返す。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    status: Literal['Passed', 'Failed', 'NotRun', 'NotApplicable']
+    message: str
+
+
+class AIBackendEpisodeLookupConnectionChecksResponse(BaseModel):
+    """OpenCode EpisodeLookup 接続試験の固定6項目。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    backend_connection: AIBackendConnectionTestCheckResponse
+    web_search: AIBackendConnectionTestCheckResponse
+    source_url: AIBackendConnectionTestCheckResponse
+    strict_schema: AIBackendConnectionTestCheckResponse
+    timeout_cancel: AIBackendConnectionTestCheckResponse
+    permission_policy: AIBackendConnectionTestCheckResponse
+
+
 class AIBackendConnectionTestResponse(BaseModel):
     """接続試験結果（キー非返却）。"""
 
@@ -277,6 +365,27 @@ class AIBackendConnectionTestResponse(BaseModel):
     completion_tokens: int | None = None
     http_status: int | None = None
     error_code: str | None = None
+    # EpisodeLookup 時のみ。生成試験では null。
+    checks: AIBackendEpisodeLookupConnectionChecksResponse | None = None
+
+
+class ACPBackendConnectionTestRequest(BaseModel):
+    """ACP 接続試験リクエスト。
+
+    保存済み ACP 設定（ACPSettings）を使用して、選択した AI 機能を1回だけ試す。
+    ドラフト上書きは行わず、AI バックエンドページで保存した設定が正本。
+    """
+
+    model_config = ConfigDict(extra='forbid')
+
+    backend_kind: Annotated[
+        Literal['AcpCodex', 'AcpGrok'],
+        Field(),
+    ]
+    capability: Annotated[
+        Literal['CandidateSelection', 'EpisodeLookup'],
+        Field(),
+    ] = 'CandidateSelection'
 
 
 def _httpErrorFromOpenCode(error: OpenCodeClientError) -> HTTPException:
@@ -653,6 +762,606 @@ async def AIBackendUsageListAPI(
         ) from error
 
 
+# === ACP 固定プリセット（Codex / Grok Build） ===
+
+
+def _ACPBackendCredentialStatusResponse() -> ACPBackendCredentialStatusResponse:
+    """資格情報管理モジュールの状態を API response model へ変換する。
+
+    Returns:
+        ACPBackendCredentialStatusResponse: 認証内容を含まない現在状態。
+    """
+
+    credential_status = KonomiTVBS4KACPCredentials.getStatus()
+    return ACPBackendCredentialStatusResponse(
+        acp_operation_running=IsACPOperationRunning(),
+        codex_host_auth_available=credential_status.codex_host_auth_available,
+        codex_auth_imported=credential_status.codex_auth_imported,
+        codex_auth_imported_at=credential_status.codex_auth_imported_at,
+        codex_auth_in_use=GetACPCredentialOperationLock('codex').locked(),
+        grok_host_auth_available=credential_status.grok_host_auth_available,
+        grok_auth_imported=credential_status.grok_auth_imported,
+        grok_auth_imported_at=credential_status.grok_auth_imported_at,
+        grok_auth_in_use=GetACPCredentialOperationLock('grok').locked(),
+        google_adc_available=credential_status.google_adc_available,
+    )
+
+
+def _ACPBackendCredentialHTTPException(
+    error: KonomiTVBS4KACPCredentialError,
+) -> HTTPException:
+    """内部 path・JSON・例外詳細を公開しない固定 HTTP error へ変換する。
+
+    Args:
+        error: 資格情報管理モジュールの固定コード付きエラー。
+
+    Returns:
+        HTTPException: ``no-store`` を付与した無害なエラー。
+    """
+
+    if error.code == 'HostAuthUnavailable':
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='The host authentication file is not available.',
+            headers=NO_STORE_HEADERS,
+        )
+    if error.code == 'InvalidHostAuth':
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='The host authentication file is invalid.',
+            headers=NO_STORE_HEADERS,
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail='Failed to update the imported authentication state.',
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def _ACPBackendCredentialInUseHTTPException() -> HTTPException:
+    """実行中 ACP の認証世代を変更しないための固定競合応答を返す。
+
+    Returns:
+        HTTP 409 と no-store を持つ、秘密情報を含まない例外。
+    """
+
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail='The ACP authentication is currently in use by an AI operation.',
+        headers=NO_STORE_HEADERS,
+    )
+
+
+def _ACPBackendConnectionTestPreflightError(
+    backend_kind: Literal['AcpCodex', 'AcpGrok'],
+) -> tuple[str, str] | None:
+    """ACP 接続試験を agent 起動前に拒否すべき理由を返す。
+
+    Args:
+        backend_kind: 接続試験対象の ACP バックエンド種別。
+
+    Returns:
+        固定エラーコードと利用者向け理由。起動可能なら None。
+    """
+
+    credential_status = KonomiTVBS4KACPCredentials.getStatus()
+    if backend_kind == 'AcpCodex' and credential_status.codex_auth_imported is False:
+        return (
+            'ACPAuthenticationUnavailable',
+            'Codex 認証が未取り込みのため接続テストを実行できません。',
+        )
+    if backend_kind == 'AcpGrok' and credential_status.grok_auth_imported is False:
+        return (
+            'ACPAuthenticationUnavailable',
+            'Grok Build 認証が未取り込みのため接続テストを実行できません。',
+        )
+    if IsACPOperationRunning():
+        return (
+            'ACPOperationBusy',
+            '別の ACP AI 処理を実行中のため、完了後に接続テストを実行してください。',
+        )
+    return None
+
+
+def _ACPBackendNotRunEpisodeLookupConnectionChecks(
+    message: str,
+) -> ACPBackendEpisodeLookupConnectionChecksResponse:
+    """接続試験を開始できなかった場合の固定6項目を構築する。"""
+
+    not_run = ACPBackendConnectionTestCheckResponse(status='NotRun', message=message)
+    return ACPBackendEpisodeLookupConnectionChecksResponse(
+        backend_connection=not_run,
+        web_search=not_run,
+        source_url=not_run,
+        strict_schema=not_run,
+        timeout_cancel=not_run,
+        permission_policy=not_run,
+    )
+
+
+def _ACPBackendConnectionChecksResponse(
+    checks: EpisodeLookupConnectionChecks | None,
+) -> ACPBackendEpisodeLookupConnectionChecksResponse | None:
+    """内部 dataclass を秘密情報のない API response へ変換する。"""
+
+    if checks is None:
+        return None
+
+    def Convert(check: ConnectionTestCheck) -> ACPBackendConnectionTestCheckResponse:
+        return ACPBackendConnectionTestCheckResponse(
+            status=check.status,
+            message=check.message,
+        )
+
+    return ACPBackendEpisodeLookupConnectionChecksResponse(
+        backend_connection=Convert(checks.backend_connection),
+        web_search=Convert(checks.web_search),
+        source_url=Convert(checks.source_url),
+        strict_schema=Convert(checks.strict_schema),
+        timeout_cancel=Convert(checks.timeout_cancel),
+        permission_policy=Convert(checks.permission_policy),
+    )
+
+
+def _ACPBackendConnectionErrorMessage(
+    error_code: str,
+    capability: Literal['CandidateSelection', 'EpisodeLookup'],
+) -> str:
+    """内部エラーコードをキーや外部レスポンスを含まない表示文へ変換する。"""
+
+    if error_code in {'Timeout', 'NetworkError'}:
+        return 'ACP CLI へ接続できませんでした。ホストの稼働状態を確認してください。'
+    if error_code == 'HardTimeout':
+        return '総実行時間の安全上限に達したため、接続テストを中断しました。'
+    if capability == 'EpisodeLookup':
+        return '話数 Web 検索に必要な能力（Web 検索・構造化出力）を確認できませんでした。'
+    return 'シリーズ生成結果を検証できませんでした。設定と認証状態を確認してください。'
+
+
+@router.get(
+    '/acp-settings',
+    summary='ACP 固定プリセット設定取得 API',
+    response_model=ACPSettings,
+)
+async def ACPBackendSettingsAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPSettings:
+    """Codex / Grok の ACP 実行設定（モデル・推論深さ・Fast・タイムアウト）を返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        現在の ACP 固定プリセット設定。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        return ACPSettingsStore.getSettings()
+    except (OSError, ValueError) as error:
+        logging.error('[ACPBackendSettingsAPI] Failed to load ACP settings:', exc_info=error)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load ACP settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+
+@router.put(
+    '/acp-settings',
+    summary='ACP 固定プリセット設定更新 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def ACPBackendSettingsUpdateAPI(
+    body: ACPSettings,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """Codex / Grok の ACP 実行設定を全体置き換えで保存する。
+
+    モデル・推論深さの変更は話数 Web 検索の能力証明 fingerprint を変えるため、
+    保存後に既存 proof を backend 単位で失効させる。
+
+    Args:
+        body: 保存する ACP 固定プリセット設定。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        ACPSettingsStore.saveSettings(body)
+    except (OSError, ValueError) as error:
+        logging.error('[ACPBackendSettingsUpdateAPI] Failed to save ACP settings:', exc_info=error)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to save ACP settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    # 設定変更は証明済み fingerprint を変えるため、両 backend の proof を失効させる。
+    for backend_kind in ('AcpCodex', 'AcpGrok'):
+        invalidate_episode_lookup_capability_proof(backend_kind=backend_kind)
+
+
+@router.get(
+    '/acp-credentials',
+    summary='ACP 認証状態取得 API',
+    response_model=ACPBackendCredentialStatusResponse,
+)
+async def ACPBackendCredentialStatusAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPBackendCredentialStatusResponse:
+    """管理者へ共有 ACP 資格情報の存在状態と取り込み日時だけを返す。
+
+    Args:
+        response: ``Cache-Control: no-store`` を設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        ACPBackendCredentialStatusResponse: token・JSON・hash を含まない状態。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    return _ACPBackendCredentialStatusResponse()
+
+
+@router.post(
+    '/acp-credentials/{provider}/import',
+    summary='ACP 認証取り込み API',
+    response_model=ACPBackendCredentialStatusResponse,
+)
+async def ACPBackendCredentialImportAPI(
+    provider: Annotated[
+        KonomiTVBS4KACPImportProvider, Path(description='取り込む ACP provider。')
+    ],
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPBackendCredentialStatusResponse:
+    """管理者の明示操作で固定 mount の auth.json だけを専用 profile へ取り込む。
+
+    Args:
+        provider: ``codex`` または ``grok``。
+        response: ``Cache-Control: no-store`` を設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        ACPBackendCredentialStatusResponse: 更新後の安全な状態。
+
+    Raises:
+        HTTPException: host-auth が不正、または専用コピーを保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    credential_lock = GetACPCredentialOperationLock(provider)
+    # 同じ provider の AI が認証を読んでいる場合、最大60分の終了待ちを API に持ち込まない。
+    if credential_lock.locked():
+        raise _ACPBackendCredentialInUseHTTPException()
+    await credential_lock.acquire()
+    try:
+        try:
+            KonomiTVBS4KACPCredentials.importProviderAuth(provider)
+        except KonomiTVBS4KACPCredentialError as ex:
+            # 内容や OS 例外をログへ渡さず、provider と固定コードだけを記録する。
+            logging.error(
+                f'[ACPBackendCredentialImportAPI] Failed to import {provider} auth ({ex.code}).',
+            )
+            raise _ACPBackendCredentialHTTPException(ex) from ex
+        invalidate_episode_lookup_capability_proof(
+            backend_kind='AcpCodex' if provider == 'codex' else 'AcpGrok',
+        )
+    finally:
+        credential_lock.release()
+    return _ACPBackendCredentialStatusResponse()
+
+
+@router.delete(
+    '/acp-credentials/{provider}',
+    summary='ACP 認証削除 API',
+    response_model=ACPBackendCredentialStatusResponse,
+)
+async def ACPBackendCredentialDeleteAPI(
+    provider: Annotated[
+        KonomiTVBS4KACPImportProvider, Path(description='削除する ACP provider。')
+    ],
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPBackendCredentialStatusResponse:
+    """管理者の明示操作で KonomiTV-BS4K 専用コピーだけを削除する。
+
+    Args:
+        provider: ``codex`` または ``grok``。
+        response: ``Cache-Control: no-store`` を設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        ACPBackendCredentialStatusResponse: 更新後の安全な状態。
+
+    Raises:
+        HTTPException: 専用コピーを削除できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    credential_lock = GetACPCredentialOperationLock(provider)
+    # 削除も import と同じく、実行中世代を壊さず即時に競合を通知する。
+    if credential_lock.locked():
+        raise _ACPBackendCredentialInUseHTTPException()
+    await credential_lock.acquire()
+    try:
+        try:
+            KonomiTVBS4KACPCredentials.deleteProviderAuth(provider)
+        except KonomiTVBS4KACPCredentialError as ex:
+            logging.error(
+                f'[ACPBackendCredentialDeleteAPI] Failed to delete {provider} auth ({ex.code}).',
+            )
+            raise _ACPBackendCredentialHTTPException(ex) from ex
+        invalidate_episode_lookup_capability_proof(
+            backend_kind='AcpCodex' if provider == 'codex' else 'AcpGrok',
+        )
+    finally:
+        credential_lock.release()
+    return _ACPBackendCredentialStatusResponse()
+
+
+@router.post(
+    '/acp/test',
+    summary='ACP 接続試験 API',
+    response_model=ACPBackendConnectionTestResponse,
+)
+async def ACPBackendConnectionTestAPI(
+    body: ACPBackendConnectionTestRequest,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPBackendConnectionTestResponse:
+    """保存済み ACP 設定を使用して選択した AI 機能を1回だけ試す。
+
+    録画シリーズ側の接続試験 API から移設した ACP 専用の試験。
+    EpisodeLookup の成功 proof は監査レコードと一体で記録される。
+
+    Args:
+        body: 接続試験対象の ACP バックエンドと能力。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        ACPBackendConnectionTestResponse: 秘密情報を含まない接続試験結果。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    capability = body.capability
+    # ACP バックエンド用の最小 settings（ACPSettings は実行時に正本参照される）。
+    settings = RecordedSeriesSettings(ai_backend=body.backend_kind, ai_enabled=True)
+    audit_model = get_audit_model(settings)
+    # EpisodeLookup 時に実際に試験した provider fingerprint。preflight 失敗時は None のまま。
+    tested_provider_fingerprint: str | None = None
+
+    # ACP の起動前 preflight（認証未取り込み・busy 等）。
+    preflight_error = _ACPBackendConnectionTestPreflightError(body.backend_kind)
+    if preflight_error is not None:
+        preflight_error_code, preflight_message = preflight_error
+        result = ConnectionTestResult(
+            success=False,
+            latency_ms=0,
+            model=audit_model,
+            message=preflight_message,
+            checks=(
+                EpisodeLookupConnectionChecks(
+                    backend_connection=ConnectionTestCheck(
+                        status='NotRun',
+                        message=preflight_message,
+                    ),
+                    web_search=ConnectionTestCheck(
+                        status='NotRun',
+                        message=preflight_message,
+                    ),
+                    source_url=ConnectionTestCheck(
+                        status='NotRun',
+                        message=preflight_message,
+                    ),
+                    strict_schema=ConnectionTestCheck(
+                        status='NotRun',
+                        message=preflight_message,
+                    ),
+                    timeout_cancel=ConnectionTestCheck(
+                        status='NotRun',
+                        message=preflight_message,
+                    ),
+                    permission_policy=ConnectionTestCheck(
+                        status='NotRun',
+                        message=preflight_message,
+                    ),
+                )
+                if capability == 'EpisodeLookup'
+                else None
+            ),
+            error_code=preflight_error_code,
+        )
+    else:
+        tested_provider_fingerprint = (
+            get_episode_lookup_provider_fingerprint(settings, None)
+            if capability == 'EpisodeLookup'
+            else None
+        )
+        try:
+            # 接続試験の正本 facade と immutable snapshot を使う。
+            result = await test_connection(
+                capability,
+                settings=settings,
+                api_key=None,
+            )
+        except RecordedSeriesAIError as ex:
+            message = _ACPBackendConnectionErrorMessage(ex.code, capability)
+            result = ConnectionTestResult(
+                success=False,
+                latency_ms=ex.latency_ms or 0,
+                model=audit_model,
+                message=message,
+                checks=(
+                    EpisodeLookupConnectionChecks(
+                        backend_connection=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        web_search=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        source_url=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        strict_schema=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        timeout_cancel=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        permission_policy=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                    )
+                    if capability == 'EpisodeLookup'
+                    else None
+                ),
+                http_status=ex.http_status,
+                error_code=ex.code,
+            )
+        except Exception:
+            # CLI・provider 由来の例外には path や認証詳細が含まれ得るため公開しない。
+            logging.error('[ACPBackendConnectionTestAPI] Connection test failed.')
+            message = 'ACP 接続テストに失敗しました。設定と認証状態を確認してください。'
+            result = ConnectionTestResult(
+                success=False,
+                latency_ms=0,
+                model=audit_model,
+                message=message,
+                checks=(
+                    EpisodeLookupConnectionChecks(
+                        backend_connection=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        web_search=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        source_url=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        strict_schema=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        timeout_cancel=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                        permission_policy=ConnectionTestCheck(
+                            status='NotRun',
+                            message=message,
+                        ),
+                    )
+                    if capability == 'EpisodeLookup'
+                    else None
+                ),
+                error_code='ConnectionTestFailed',
+            )
+        if capability == 'EpisodeLookup' and result.provider_fingerprint is not None:
+            # facade が operation lock 内で実際に試験した世代を正本にする。
+            tested_provider_fingerprint = result.provider_fingerprint
+
+    rejected_error_codes = {
+        'ChoiceOutsideCandidateSet',
+        'InvalidOutputSchema',
+        'InvalidJSON',
+        'InvalidJSONType',
+        'InvalidModelOutput',
+        'LowConfidence',
+        'MissingWebSearchCall',
+        'SearchNotRun',
+    }
+    audit_error_code = (
+        None if result.success else result.error_code or 'ConnectionTestFailed'
+    )
+    connection_test_audit = await RecordedSeriesAIRequest.create(
+        resolution_id=None,
+        purpose='ConnectionTest',
+        status=(
+            'Succeeded'
+            if result.success
+            else 'Rejected'
+            if audit_error_code in rejected_error_codes
+            else 'Failed'
+        ),
+        model=audit_model,
+        candidate_ids=(
+            ['episode-lookup'] if capability == 'EpisodeLookup' else ['unresolved']
+        ),
+        selected_choice_id=result.selected_choice_id,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        http_status=result.http_status,
+        latency_ms=result.latency_ms,
+        error_code=audit_error_code,
+    )
+    if capability == 'EpisodeLookup' and tested_provider_fingerprint is not None:
+        invalidate_episode_lookup_capability_fingerprint(
+            tested_provider_fingerprint,
+        )
+        proof_recorded = record_episode_lookup_capability_proof(
+            settings,
+            None,
+            result,
+            tested_provider_fingerprint=tested_provider_fingerprint,
+        )
+        if result.success and proof_recorded is False:
+            current_provider_fingerprint = get_episode_lookup_provider_fingerprint(
+                settings,
+                None,
+            )
+            state_changed = current_provider_fingerprint != tested_provider_fingerprint
+            result = ConnectionTestResult(
+                success=False,
+                latency_ms=result.latency_ms,
+                model=audit_model,
+                message=(
+                    '接続試験中に AI 設定または認証状態が変更されました。もう一度試してください。'
+                    if state_changed
+                    else '話数 Web 検索に必要な能力をすべて確認できませんでした。'
+                ),
+                checks=result.checks,
+                error_code=(
+                    'ConnectionTestStateChanged'
+                    if state_changed
+                    else 'EpisodeLookupCapabilityNotVerified'
+                ),
+            )
+            # 監査保存後に provider / credential 世代が変わった場合も、API 応答と
+            # 監査履歴を同じ失敗状態へそろえる。
+            connection_test_audit.status = 'Failed'
+            connection_test_audit.error_code = result.error_code
+            await connection_test_audit.save(
+                update_fields=['status', 'error_code'],
+            )
+    return ACPBackendConnectionTestResponse(
+        success=result.success,
+        latency_ms=result.latency_ms,
+        model=result.model,
+        message=result.message,
+        checks=_ACPBackendConnectionChecksResponse(result.checks),
+    )
+
+
 @router.get(
     '/{service_id}/usage',
     summary='AI バックエンド月次利用量 API',
@@ -865,15 +1574,9 @@ async def AIBackendServiceDeleteAPI(
             headers=NO_STORE_HEADERS,
         ) from error
 
-    try:
-        _invalidate_episode_lookup_proof(service_id=removed.service_id)
-    except TypeError:
-        try:
-            _invalidate_episode_lookup_proof()
-        except Exception:
-            pass
-    except Exception as error:
-        logging.warning(f'[AIBackendServiceDeleteAPI] Proof invalidation failed: {error}')
+    # OpenCode service の削除・認証変更は話数 Web 検索の能力証明 fingerprint を変えるため、
+    # OpenCode 全体の proof を失効させる（fingerprint は service 定義を含むため再試験で再取得される）。
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
 
     # 順序: KonomiTV secrets/settings 更新済み → OpenCode auth 除去
     try:
@@ -939,12 +1642,7 @@ async def AIBackendAPIKeySetAPI(
     except OpenCodeClientError as error:
         raise _httpErrorFromOpenCode(error) from error
 
-    try:
-        _invalidate_episode_lookup_proof(service_id=service.service_id)
-    except TypeError:
-        pass
-    except Exception:
-        pass
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
 
 
 @router.delete(
@@ -978,12 +1676,7 @@ async def AIBackendAPIKeyDeleteAPI(
             headers=NO_STORE_HEADERS,
         ) from error
 
-    try:
-        _invalidate_episode_lookup_proof(service_id=service.service_id)
-    except TypeError:
-        pass
-    except Exception:
-        pass
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
 
     try:
         await _removeOpenCodeAuthIfUnshared(
@@ -1139,12 +1832,7 @@ async def AIBackendOAuthCallbackAPI(
             headers=NO_STORE_HEADERS,
         ) from error
 
-    try:
-        _invalidate_episode_lookup_proof(service_id=service.service_id)
-    except TypeError:
-        pass
-    except Exception:
-        pass
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
 
 
 @router.post(
@@ -1190,12 +1878,7 @@ async def AIBackendOAuthDisconnectAPI(
             headers=NO_STORE_HEADERS,
         ) from error
 
-    try:
-        _invalidate_episode_lookup_proof(service_id=service.service_id)
-    except TypeError:
-        pass
-    except Exception:
-        pass
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
 
     try:
         await _removeOpenCodeAuthIfUnshared(
@@ -1207,6 +1890,30 @@ async def AIBackendOAuthDisconnectAPI(
         logging.warning(
             f'[AIBackendOAuthDisconnectAPI] OpenCode auth removal failed: {error}',
         )
+
+
+def _OpenCodeConnectionChecksResponse(
+    checks: EpisodeLookupConnectionChecks | None,
+) -> AIBackendEpisodeLookupConnectionChecksResponse | None:
+    """OpenCode EpisodeLookup checks を API 応答へ変換する。"""
+
+    if checks is None:
+        return None
+
+    def Convert(check: ConnectionTestCheck) -> AIBackendConnectionTestCheckResponse:
+        return AIBackendConnectionTestCheckResponse(
+            status=check.status,
+            message=check.message,
+        )
+
+    return AIBackendEpisodeLookupConnectionChecksResponse(
+        backend_connection=Convert(checks.backend_connection),
+        web_search=Convert(checks.web_search),
+        source_url=Convert(checks.source_url),
+        strict_schema=Convert(checks.strict_schema),
+        timeout_cancel=Convert(checks.timeout_cancel),
+        permission_policy=Convert(checks.permission_policy),
+    )
 
 
 def _ConnectionTestResponse(result: ConnectionTestResult) -> AIBackendConnectionTestResponse:
@@ -1221,6 +1928,7 @@ def _ConnectionTestResponse(result: ConnectionTestResult) -> AIBackendConnection
         completion_tokens=result.completion_tokens,
         http_status=result.http_status,
         error_code=result.error_code,
+        checks=_OpenCodeConnectionChecksResponse(result.checks),
     )
 
 
@@ -1236,8 +1944,12 @@ async def AIBackendConnectionTestAPI(
 ) -> AIBackendConnectionTestResponse:
     """保存済み service または draft から OpenCode 接続試験を実行する。
 
-    draft + 一時 api_key の場合、他 service が同一 provider を使っていなければ
-    試験後に OpenCode auth を削除する。
+    保存済み service の EpisodeLookup 成功時は能力 proof を記録する
+    （単票再検索の許可に必要。draft 試験は proof 対象外）。
+
+    draft / 一時 api_key で他 service が同一 provider を使う場合は、
+    共有 auth を汚染しないよう 409 で拒否する。
+    他 service が無い場合のみ試験後に OpenCode auth を削除する。
     """
 
     response.headers.update(NO_STORE_HEADERS)
@@ -1252,10 +1964,32 @@ async def AIBackendConnectionTestAPI(
     backend = None
     remove_auth_on_cleanup = False
     provider_id_for_cleanup: str | None = None
+    # 保存済み service の EpisodeLookup のみ proof 対象。
+    proof_settings: RecordedSeriesSettings | None = None
+    tested_provider_fingerprint: str | None = None
+    is_draft_test = body.service_id is None
 
     try:
         if body.service_id is not None:
             try:
+                # 一時キー上書きは共有 provider を汚染するため禁止する。
+                if body.api_key is not None:
+                    existing = AIBackendSettingsStore.getService(body.service_id)
+                    if existing is not None:
+                        remaining = AIBackendSettingsStore.countServicesUsingProvider(
+                            existing.opencode_provider_id,
+                            excluding_service_id=existing.service_id,
+                        )
+                        if remaining > 0:
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail=(
+                                    'Temporary API key override is not allowed while other '
+                                    'services share the same OpenCode provider. '
+                                    'Update the saved API key instead.'
+                                ),
+                                headers=NO_STORE_HEADERS,
+                            )
                 backend = BuildOpenCodeBackendFromServiceID(
                     body.service_id,
                     api_key=body.api_key,
@@ -1276,6 +2010,16 @@ async def AIBackendConnectionTestAPI(
                 )
                 remove_auth_on_cleanup = remaining == 0
                 provider_id_for_cleanup = backend.service.opencode_provider_id
+            if body.capability == 'EpisodeLookup':
+                proof_settings = RecordedSeriesSettings(
+                    ai_backend='OpenCode',
+                    ai_enabled=True,
+                    ai_backend_service_id=backend.service.service_id,
+                )
+                tested_provider_fingerprint = get_episode_lookup_provider_fingerprint(
+                    proof_settings,
+                    None,
+                )
         else:
             # draft から一時 service を組み立てる。
             if (
@@ -1314,6 +2058,16 @@ async def AIBackendConnectionTestAPI(
             remaining = AIBackendSettingsStore.countServicesUsingProvider(
                 draft_service.opencode_provider_id,
             )
+            # 共有 provider へ一時キーを流し込むと本番 auth を上書きするため拒否する。
+            if body.api_key is not None and remaining > 0:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=(
+                        'Draft API key connection test is not allowed while other services '
+                        'share the same OpenCode provider. Save a dedicated service first.'
+                    ),
+                    headers=NO_STORE_HEADERS,
+                )
             # 他 service が同一 provider を使っていなければ、試験後に auth を残さない。
             remove_auth_on_cleanup = remaining == 0 and body.api_key is not None
             provider_id_for_cleanup = draft_service.opencode_provider_id
@@ -1335,6 +2089,86 @@ async def AIBackendConnectionTestAPI(
                 http_status=error.http_status,
                 error_code=error.code,
             )
+
+        # 保存済み service の EpisodeLookup のみ proof / 監査を記録する。
+        if (
+            is_draft_test is False
+            and body.capability == 'EpisodeLookup'
+            and proof_settings is not None
+            and tested_provider_fingerprint is not None
+        ):
+            rejected_error_codes = {
+                'ChoiceOutsideCandidateSet',
+                'InvalidOutputSchema',
+                'InvalidJSON',
+                'InvalidJSONType',
+                'InvalidModelOutput',
+                'LowConfidence',
+                'MissingWebSearchCall',
+                'SearchNotRun',
+                'OpenCodeWebSearchNotObserved',
+                'OpenCodeWebSearchFailed',
+                'OpenCodeEpisodeLookupLocalDisabled',
+            }
+            audit_error_code = (
+                None if result.success else result.error_code or 'ConnectionTestFailed'
+            )
+            connection_test_audit = await RecordedSeriesAIRequest.create(
+                resolution_id=None,
+                purpose='ConnectionTest',
+                status=(
+                    'Succeeded'
+                    if result.success
+                    else 'Rejected'
+                    if audit_error_code in rejected_error_codes
+                    else 'Failed'
+                ),
+                model=result.model,
+                candidate_ids=['episode-lookup'],
+                selected_choice_id=result.selected_choice_id,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                http_status=result.http_status,
+                latency_ms=result.latency_ms,
+                error_code=audit_error_code,
+            )
+            invalidate_episode_lookup_capability_fingerprint(
+                tested_provider_fingerprint,
+            )
+            proof_recorded = record_episode_lookup_capability_proof(
+                proof_settings,
+                None,
+                result,
+                tested_provider_fingerprint=tested_provider_fingerprint,
+            )
+            if result.success and proof_recorded is False:
+                current_fp = get_episode_lookup_provider_fingerprint(proof_settings, None)
+                state_changed = current_fp != tested_provider_fingerprint
+                result = ConnectionTestResult(
+                    success=False,
+                    latency_ms=result.latency_ms,
+                    model=result.model,
+                    message=(
+                        '接続試験中に AI 設定または認証状態が変更されました。もう一度試してください。'
+                        if state_changed
+                        else '話数 Web 検索に必要な能力をすべて確認できませんでした。'
+                    ),
+                    checks=result.checks,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                    http_status=result.http_status,
+                    error_code=(
+                        'ConnectionTestStateChanged'
+                        if state_changed
+                        else 'EpisodeLookupCapabilityNotVerified'
+                    ),
+                )
+                connection_test_audit.status = 'Failed'
+                connection_test_audit.error_code = result.error_code
+                await connection_test_audit.save(
+                    update_fields=['status', 'error_code'],
+                )
+
         return _ConnectionTestResponse(result)
     finally:
         # 一時キー試験後の OpenCode auth 掃除（共有 provider は壊さない）。

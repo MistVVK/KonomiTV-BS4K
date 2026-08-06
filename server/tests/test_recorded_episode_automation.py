@@ -2894,4 +2894,3 @@ def test_single_relookup_returns_accepted_and_reuses_running_execution(
             await Tortoise.close_connections()
 
     asyncio.run(Run())
-

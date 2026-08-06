@@ -118,245 +118,17 @@
             </div>
             </template>
 
-            <!-- ACP 設定（Codex / Grok） -->
+            <!-- ACP 選択時は AI バックエンドページへ案内（モデル・認証・接続試験はそちらで設定） -->
             <template v-if="settings.ai_backend === 'AcpCodex' || settings.ai_backend === 'AcpGrok'">
-            <!-- モデル名と推論深さは分離。ACP ごとに候補と初期値が異なる -->
-            <div class="settings__item">
-                <div class="settings__item-heading">モデル</div>
-                <div class="settings__item-label">
-                    <template v-if="settings.ai_backend === 'AcpGrok'">
-                        Grok Build の ACP モデルは <code>grok-4.5</code> 固定です。<br>
-                    </template>
-                    <template v-else>
-                        Codex のモデル系統を選びます。深さは下の「推論の深さ」で別指定します。<br>
-                        初期値は <strong>GPT-5.6 Luna</strong> です。<br>
-                    </template>
-                </div>
-                <v-select class="settings__item-form" color="primary" variant="outlined"
-                    :density="is_form_dense ? 'compact' : 'default'"
-                    :items="acp_model_preset_items"
-                    item-title="title"
-                    item-value="value"
-                    :disabled="settings.ai_backend === 'AcpGrok'"
-                    :error-messages="acp_model_error"
-                    v-model="acp_model_selection" />
-            </div>
-            <div class="settings__item">
-                <div class="settings__item-heading">推論の深さ</div>
-                <div class="settings__item-label">
-                    モデル名とは別に、思考の深さを選びます。<br>
-                    <template v-if="settings.ai_backend === 'AcpCodex'">
-                        Codex は Low〜Ultra。ただし <strong>Ultra</strong> は GPT-5.6 Sol 系統だけ選べます。<br>
-                        Sol 以外で保存済みの Ultra は、サーバー側で <strong>Max</strong> に自動補正します。<br>
-                        初期値は <strong>Medium</strong> です。<br>
-                    </template>
-                    <template v-else>
-                        Grok は Low / Medium / High。初期値は <strong>High</strong> です。<br>
-                    </template>
-                </div>
-                <v-select class="settings__item-form" color="primary" variant="outlined"
-                    :density="is_form_dense ? 'compact' : 'default'"
-                    :items="acp_reasoning_effort_options"
-                    item-title="title"
-                    item-value="value"
-                    v-model="acp_reasoning_effort_selection" />
-                <div class="settings__item-label mt-2" v-if="acp_wire_preview">
-                    適用プレビュー: <code>{{acp_wire_preview}}</code>
-                </div>
-            </div>
-            <div class="settings__item settings__item--switch" v-if="settings.ai_backend === 'AcpCodex'">
-                <label class="settings__item-heading" for="recorded_series_konomitv_bs4k_codex_fast_mode">
-                    Codex Fast モードを有効化
-                </label>
-                <label class="settings__item-label" for="recorded_series_konomitv_bs4k_codex_fast_mode">
-                    Codex の Fast service tier を使い、対応モデルの処理速度を上げます。<br>
-                    通常よりクレジット消費が増えるため、必要な場合だけ有効にしてください。<br>
-                    Fast モードは Codex 専用 profile の設定として適用されます。<br>
-                </label>
-                <v-switch id="recorded_series_konomitv_bs4k_codex_fast_mode" class="settings__item-switch" color="primary"
-                    hide-details v-model="settings.konomitv_bs4k_acp_codex_fast_mode_enabled" />
-            </div>
-            <!-- ACP 無通信タイムアウト -->
-            <div class="settings__item">
-                <div class="settings__item-heading">ACP 無通信タイムアウト（秒）</div>
-                <div class="settings__item-label">
-                    シリーズ生成・話数 Web 検索・接続試験で、ACP からの進捗や応答が途絶えてから打ち切るまでの秒数です。<br>
-                    推論や結果整形の途中でも、thought / tool update などが届いている間は延長されます。30〜600 秒の間で指定してください。<br>
-                    進捗が継続している場合でも、サーバー保護のため総実行時間（他の ACP 実行待ちを含む）が {{ acp_hard_timeout_minutes }} 分を超えると停止します。<br>
-                </div>
-                <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number"
-                    :density="is_form_dense ? 'compact' : 'default'"
-                    :min="30" :max="600" :step="1"
-                    :error-messages="acp_timeout_error"
-                    v-model.number="settings.acp_timeout_sec" />
-            </div>
-
-            <!-- Codex / Grok の明示取り込みと Gemini ADC の固定 mount 状態 -->
-            <div class="settings__item" v-if="settings.ai_backend === 'AcpCodex'">
-                <div class="settings__item-heading">Codex 認証</div>
-                <div class="settings__item-label">
-                    ホストで <code>codex login</code> を実行し、Compose override に auth.json の絶対パスを指定します。<br>
-                    OS keyring だけを利用している場合は <code>cli_auth_credentials_store = "file"</code> を設定してください。<br>
-                </div>
-                <div class="recorded-series-auth-status mt-3">
-                    <span>
-                        ホスト認証ファイル:
-                        <strong :class="{'recorded-series-auth-status--ok':
-                            acp_credential_status?.codex_host_auth_available}">
-                            {{acp_credential_status?.codex_host_auth_available ? '検出済み' : '未検出'}}
-                        </strong>
-                    </span>
-                    <span>
-                        KonomiTV-BS4K への取り込み:
-                        <strong :class="{'recorded-series-auth-status--ok':
-                            acp_credential_status?.codex_auth_imported}">
-                            {{acp_credential_status?.codex_auth_imported ? '取り込み済み' : '未取り込み'}}
-                        </strong>
-                    </span>
-                    <small v-if="acp_credential_status?.codex_auth_imported_at">
-                        最終取り込み: {{formatACPAuthImportedAt(acp_credential_status.codex_auth_imported_at)}}
-                    </small>
-                    <small v-if="acp_credential_status?.codex_auth_in_use">
-                        Codex の AI 処理が認証を使用中です。完了するまで再取り込み・削除はできません。
-                    </small>
-                </div>
-                <div class="recorded-series-actions mt-3">
-                    <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :disabled="acp_credential_status?.codex_host_auth_available !== true ||
-                            acp_credential_status?.codex_auth_in_use === true"
-                        :loading="is_updating_acp_authentication"
-                        @click="openACPAuthenticationDialog('codex', 'Import')">
-                        <Icon icon="fluent:key-20-filled" class="mr-2" width="21px" />
-                        {{acp_credential_status?.codex_auth_imported ? '認証を再取り込み' : '認証を取り込む'}}
-                    </v-btn>
-                    <v-btn class="settings__save-button" color="error" variant="flat"
-                        :disabled="acp_credential_status?.codex_auth_imported !== true ||
-                            acp_credential_status?.codex_auth_in_use === true"
-                        :loading="is_updating_acp_authentication"
-                        @click="openACPAuthenticationDialog('codex', 'Delete')">
-                        <Icon icon="fluent:key-reset-20-filled" class="mr-2" width="21px" />取り込んだ認証を削除
-                    </v-btn>
-                </div>
-            </div>
-            <div class="settings__item" v-if="settings.ai_backend === 'AcpGrok'">
-                <div class="settings__item-heading">Grok Build 認証</div>
-                <div class="settings__item-label">
-                    ホストで <code>grok login</code> を実行します。ブラウザーを使えない場合は
-                    <code>grok login --device-auth</code> を使用できます。<br>
-                    Compose override には生成された auth.json の絶対パスを指定します。<br>
-                </div>
-                <div class="recorded-series-auth-status mt-3">
-                    <span>
-                        ホスト認証ファイル:
-                        <strong :class="{'recorded-series-auth-status--ok':
-                            acp_credential_status?.grok_host_auth_available}">
-                            {{acp_credential_status?.grok_host_auth_available ? '検出済み' : '未検出'}}
-                        </strong>
-                    </span>
-                    <span>
-                        KonomiTV-BS4K への取り込み:
-                        <strong :class="{'recorded-series-auth-status--ok':
-                            acp_credential_status?.grok_auth_imported}">
-                            {{acp_credential_status?.grok_auth_imported ? '取り込み済み' : '未取り込み'}}
-                        </strong>
-                    </span>
-                    <small v-if="acp_credential_status?.grok_auth_imported_at">
-                        最終取り込み: {{formatACPAuthImportedAt(acp_credential_status.grok_auth_imported_at)}}
-                    </small>
-                    <small v-if="acp_credential_status?.grok_auth_in_use">
-                        Grok Build の AI 処理が認証を使用中です。完了するまで再取り込み・削除はできません。
-                    </small>
-                </div>
-                <div class="recorded-series-actions mt-3">
-                    <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :disabled="acp_credential_status?.grok_host_auth_available !== true ||
-                            acp_credential_status?.grok_auth_in_use === true"
-                        :loading="is_updating_acp_authentication"
-                        @click="openACPAuthenticationDialog('grok', 'Import')">
-                        <Icon icon="fluent:key-20-filled" class="mr-2" width="21px" />
-                        {{acp_credential_status?.grok_auth_imported ? '認証を再取り込み' : '認証を取り込む'}}
-                    </v-btn>
-                    <v-btn class="settings__save-button" color="error" variant="flat"
-                        :disabled="acp_credential_status?.grok_auth_imported !== true ||
-                            acp_credential_status?.grok_auth_in_use === true"
-                        :loading="is_updating_acp_authentication"
-                        @click="openACPAuthenticationDialog('grok', 'Delete')">
-                        <Icon icon="fluent:key-reset-20-filled" class="mr-2" width="21px" />取り込んだ認証を削除
-                    </v-btn>
-                </div>
-            </div>
-            <v-alert class="mb-4" color="warning" variant="tonal">
-                この認証は録画シリーズのバックグラウンド AI 処理全体で共有する管理者資格情報です。
-                KonomiTV-BS4K の一般ユーザーごとの認証ではありません。<br>
-                ホストで再ログインしても自動反映されないため、Codex / Grok は再取り込みが必要です。
-                ホストで logout しても取り込み済みコピーは自動削除されません。直ちに無効化する場合は、
-                この画面でコピーを削除し、プロバイダー側でもセッションを失効してください。
-            </v-alert>
-
-            <!-- ACP 接続試験 -->
-            <div class="settings__item">
-                <v-alert v-if="acp_connection_preflight_error !== ''" class="mb-3" color="warning" variant="tonal">
-                    {{acp_connection_preflight_error}}
-                </v-alert>
-                <div class="recorded-series-actions mt-3">
-                    <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :loading="testing_connection_capability === 'CandidateSelection'"
-                        :disabled="has_connection_validation_error || testing_connection_capability !== null"
-                        @click="testConnection('CandidateSelection')">
-                        <Icon icon="fluent:plug-connected-checkmark-20-filled" class="mr-2" width="21px" />シリーズ生成をテスト
-                    </v-btn>
-                    <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :loading="testing_connection_capability === 'EpisodeLookup'"
-                        :disabled="has_connection_validation_error || testing_connection_capability !== null"
-                        @click="testConnection('EpisodeLookup')">
-                        <Icon icon="fluent:globe-search-20-filled" class="mr-2" width="21px" />話数 Web 検索をテスト
-                    </v-btn>
-                </div>
-                <div class="settings__item-label mt-2">
-                    話数検索の接続テストでは、Web 検索の実行・出典取得・構造化結果を一体で確認します。<br>
-                    シリーズ生成だけ成功した場合でも、話数検索を利用できるとは限りません。<br>
-                </div>
-            </div>
-            </template>
-
-            <!-- 接続試験結果（共通） -->
-            <div v-if="has_connection_test_result" class="recorded-series-connection-results mt-3">
-                <template v-for="capability in connection_test_capabilities" :key="capability.value">
-                    <div v-if="connection_test_results[capability.value] !== null"
-                        class="recorded-series-connection-result"
-                        :class="{'recorded-series-connection-result--error':
-                            connection_test_results[capability.value]?.success === false}">
-                        <Icon :icon="connection_test_results[capability.value]?.success ?
-                            'fluent:checkmark-circle-20-filled' : 'fluent:error-circle-20-filled'" width="21px" />
-                        <div>
-                            <strong>{{capability.title}}</strong>
-                            <span>{{connection_test_results[capability.value]?.message}}</span>
-                            <small>
-                                {{connection_test_results[capability.value]?.model}} /
-                                {{connection_test_results[capability.value]?.latency_ms.toLocaleString()}} ms
-                            </small>
-                            <ul v-if="connection_test_results[capability.value]?.checks !== null"
-                                class="recorded-series-connection-checks">
-                                <li v-for="check in episode_lookup_connection_checks" :key="check.value"
-                                    :class="`recorded-series-connection-checks--${
-                                        connectionCheck(connection_test_results[capability.value], check.value)?.status ?? 'NotRun'
-                                    }`">
-                                    <Icon :icon="connectionCheckIcon(
-                                        connectionCheck(connection_test_results[capability.value], check.value)?.status,
-                                    )" width="16px" />
-                                    <span>
-                                        <b>{{check.title}}</b>:
-                                        {{connectionCheckStatusLabel(
-                                            connectionCheck(connection_test_results[capability.value], check.value)?.status,
-                                        )}} —
-                                        {{connectionCheck(connection_test_results[capability.value], check.value)?.message}}
-                                    </span>
-                                </li>
-                            </ul>
-                        </div>
+                <div class="settings__item">
+                    <div class="settings__item-heading">モデル・認証・接続試験</div>
+                    <div class="settings__item-label">
+                        ACP / Codex・Grok Build のモデル・推論深さ・認証・接続試験は
+                        「AIバックエンド」ページで設定します。<br>
+                        <router-link to="/settings/server/ai-backends">AIバックエンド設定を開く</router-link><br>
                     </div>
-                </template>
-            </div>
+                </div>
+            </template>
             <v-btn class="settings__save-button bg-secondary mt-6" variant="flat"
                 :loading="is_saving"
                 :disabled="has_settings_validation_error"
@@ -523,38 +295,6 @@
             </div>
         </template>
 
-        <v-dialog v-model="acp_authentication_dialog" max-width="560">
-            <v-card class="recorded-series-dialog">
-                <v-card-title>
-                    {{pending_acp_authentication_action?.action === 'Delete' ?
-                        '取り込んだ ACP 認証を削除' :
-                        'ホストの ACP 認証を取り込む'}}
-                </v-card-title>
-                <v-card-text v-if="pending_acp_authentication_action !== null">
-                    <template v-if="pending_acp_authentication_action.action === 'Import'">
-                        Compose で読み取り専用 mount した
-                        {{pending_acp_authentication_action.provider === 'codex' ? 'Codex' : 'Grok Build'}}
-                        の auth.json を、KonomiTV-BS4K 専用プロファイルへ取り込みます。<br>
-                        既存の取り込み済みコピーがある場合は atomic に置き換えます。続行しますか？
-                    </template>
-                    <template v-else>
-                        KonomiTV-BS4K 専用プロファイルの
-                        {{pending_acp_authentication_action.provider === 'codex' ? 'Codex' : 'Grok Build'}}
-                        auth.json コピーだけを削除します。ホスト側ファイルは変更しません。続行しますか？
-                    </template>
-                </v-card-text>
-                <v-card-actions>
-                    <v-spacer />
-                    <v-btn variant="text" :disabled="is_updating_acp_authentication"
-                        @click="closeACPAuthenticationDialog()">キャンセル</v-btn>
-                    <v-btn :color="pending_acp_authentication_action?.action === 'Delete' ? 'error' : 'primary'"
-                        variant="flat" :loading="is_updating_acp_authentication"
-                        @click="confirmACPAuthenticationAction()">
-                        {{pending_acp_authentication_action?.action === 'Delete' ? '削除' : '取り込む'}}
-                    </v-btn>
-                </v-card-actions>
-            </v-card>
-        </v-dialog>
         <v-dialog v-model="episode_number_search_warning_dialog" max-width="560">
             <v-card class="recorded-series-dialog">
                 <v-card-title>話数 Web 検索（BETA）を有効化</v-card-title>
@@ -579,72 +319,24 @@
 
 <script setup lang="ts">
 
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 
 import Message from '@/message';
 import AIBackend from '@/services/AIBackend';
 import AnalysisTasks, { type IAnalysisTaskExecution } from '@/services/AnalysisTasks';
 import RecordedSeries, {
-    type AcpReasoningEffort,
     type AIBackendKind,
-    type IKonomiTVBS4KACPCredentialStatus,
-    type IRecordedSeriesConnectionTestCheck,
-    type IRecordedSeriesConnectionTestRequest,
-    type IRecordedSeriesConnectionTestResult,
     type IRecordedSeriesSettings,
     type IRecordedSeriesSettingsUpdate,
     type IRecordedSeriesStatus,
-    type KonomiTVBS4KACPImportProvider,
     type RecordedEpisodeNumberAcceptanceMode,
-    type RecordedSeriesConnectionTestCheckStatus,
-    type RecordedSeriesConnectionTestCapability,
-    type RecordedSeriesEpisodeLookupConnectionCheckName,
 } from '@/services/RecordedSeries';
 import { stageLabel } from '@/stores/AnalysisTasksStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { dayjs } from '@/utils';
-import { ACP_HARD_TIMEOUT_SEC } from '@/utils/RecordedEpisodeResolution';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
-/** サーバー側 ACP hard timeout の表示用分。ACP_HARD_TIMEOUT_SEC から導出する。 */
-const acp_hard_timeout_minutes = Math.floor(ACP_HARD_TIMEOUT_SEC / 60);
-/** バックエンド別のモデル候補（角括弧なし）。Grok は 4.5 固定表示。 */
-const acp_model_presets_by_backend: Record<string, {title: string; value: string;}[]> = {
-    AcpCodex: [
-        {title: 'GPT-5.6 Luna', value: 'gpt-5.6-luna'},
-        {title: 'GPT-5.6 Terra', value: 'gpt-5.6-terra'},
-        {title: 'GPT-5.6 Sol', value: 'gpt-5.6-sol'},
-        {title: 'GPT-5.5', value: 'gpt-5.5'},
-        {title: 'GPT-5.4', value: 'gpt-5.4'},
-        {title: 'GPT-5.4 Mini', value: 'gpt-5.4-mini'},
-        {title: 'GPT-5.3 Codex Spark', value: 'gpt-5.3-codex-spark'},
-    ],
-    AcpGrok: [
-        {title: 'Grok 4.5（固定）', value: 'grok-4.5'},
-    ],
-};
-/** backend 別の推論深さ候補。 */
-const acp_reasoning_effort_presets_by_backend: Record<string, {title: string; value: AcpReasoningEffort;}[]> = {
-    AcpCodex: [
-        {title: 'Low（速い）', value: 'Low'},
-        {title: 'Medium', value: 'Medium'},
-        {title: 'High（深い）', value: 'High'},
-        {title: 'XHigh', value: 'XHigh'},
-        {title: 'Max', value: 'Max'},
-        {title: 'Ultra', value: 'Ultra'},
-    ],
-    AcpGrok: [
-        {title: 'Low（速い）', value: 'Low'},
-        {title: 'Medium', value: 'Medium'},
-        {title: 'High（深い）', value: 'High'},
-    ],
-};
-/** backend 初回選択時のデフォルト。 */
-const acp_defaults_by_backend: Record<string, {model: string | null; effort: AcpReasoningEffort | null;}> = {
-    AcpCodex: {model: 'gpt-5.6-luna', effort: 'Medium'},
-    AcpGrok: {model: null, effort: 'High'},
-};
 const ai_backend_options: {title: string; value: AIBackendKind;}[] = [
     {title: 'OpenCode（AIバックエンド service）', value: 'OpenCode'},
     {title: 'ACP / Codex', value: 'AcpCodex'},
@@ -654,32 +346,6 @@ const episode_acceptance_modes: {title: string; value: RecordedEpisodeNumberAcce
     {title: '高信頼度の結果のみ受理', value: 'HighConfidenceOnly'},
     {title: '有効な数値なら常に受理', value: 'Always'},
 ];
-const connection_test_capabilities: {title: string; value: RecordedSeriesConnectionTestCapability;}[] = [
-    {title: 'シリーズ情報生成', value: 'CandidateSelection'},
-    {title: '話数 Web 検索', value: 'EpisodeLookup'},
-];
-const episode_lookup_connection_checks: {
-    title: string;
-    value: RecordedSeriesEpisodeLookupConnectionCheckName;
-}[] = [
-    {title: 'バックエンド接続', value: 'backend_connection'},
-    {title: 'Web 検索の実行', value: 'web_search'},
-    {title: '検索元 URL', value: 'source_url'},
-    {title: 'strict schema', value: 'strict_schema'},
-    {title: 'timeout / cancel', value: 'timeout_cancel'},
-    {title: 'permission policy', value: 'permission_policy'},
-];
-const connection_check_status_labels: Record<RecordedSeriesConnectionTestCheckStatus, string> = {
-    Passed: '確認済み',
-    Failed: '失敗',
-    NotRun: '未実行',
-    NotApplicable: '対象外',
-};
-type ConnectionTestResults = Record<RecordedSeriesConnectionTestCapability, IRecordedSeriesConnectionTestResult | null>;
-type ACPAuthenticationAction = {
-    provider: KonomiTVBS4KACPImportProvider;
-    action: 'Import' | 'Delete';
-};
 
 // API 取得前は入力欄を操作できないため、安全側の無効値を初期値にする。
 const settings = ref<IRecordedSeriesSettings>({
@@ -689,29 +355,16 @@ const settings = ref<IRecordedSeriesSettings>({
     ai_episode_number_acceptance_mode: 'Always',
     ai_backend: 'AcpCodex',
     ai_backend_service_id: null,
-    acp_model: null,
-    acp_reasoning_effort: null,
-    konomitv_bs4k_acp_codex_fast_mode_enabled: false,
-    acp_timeout_sec: 120,
 });
 const opencode_services = ref<{title: string; value: string;}[]>([]);
 const status = ref<IRecordedSeriesStatus | null>(null);
-const acp_credential_status = ref<IKonomiTVBS4KACPCredentialStatus | null>(null);
 
-// API キーは共有ストアへ入れず、この画面が開いている間だけローカルメモリに保持する。
-const acp_authentication_dialog = ref(false);
-const pending_acp_authentication_action = ref<ACPAuthenticationAction | null>(null);
+// 話数 Web 検索（BETA）の警告ダイアログ状態。
 const episode_number_search_warning_dialog = ref(false);
 
 const is_loading = ref(true);
 const is_disabled = ref(true);
 const is_saving = ref(false);
-const testing_connection_capability = ref<RecordedSeriesConnectionTestCapability | null>(null);
-const connection_test_results = ref<ConnectionTestResults>({
-    CandidateSelection: null,
-    EpisodeLookup: null,
-});
-const is_updating_acp_authentication = ref(false);
 const is_starting_backfill = ref(false);
 const is_monitoring_backfill = ref(false);
 const is_starting_episode_backfill = ref(false);
@@ -750,131 +403,6 @@ function confirmEpisodeNumberSearchEnabled(): void {
 }
 
 
-/** API の URL が OpenAI 互換 API の接続先として扱える HTTP(S) URL かを確認する。 */
-const acp_model_error = computed(() =>
-    (settings.value.acp_model?.trim().length ?? 0) > 255 ? 'ACP モデル ID は 255 文字以内で入力してください。' : '',
-);
-/** 現在の ACP バックエンド向けモデル候補。 */
-const acp_model_preset_items = computed(() => {
-    return acp_model_presets_by_backend[settings.value.ai_backend]
-        ?? [];
-});
-function isKonomiTVBS4KCodexSolModel(konomitv_bs4k_model: string | null): boolean {
-    const konomitv_bs4k_normalized_model = konomitv_bs4k_model?.trim().toLowerCase() ?? '';
-    return konomitv_bs4k_normalized_model === 'sol' || konomitv_bs4k_normalized_model.endsWith('-sol');
-}
-const konomitv_bs4k_acp_effective_model = computed(() => {
-    const konomitv_bs4k_current_model = settings.value.acp_model?.trim() ?? '';
-    return konomitv_bs4k_current_model || acp_defaults_by_backend[settings.value.ai_backend]?.model || '';
-});
-const is_konomitv_bs4k_codex_sol_model = computed(() =>
-    settings.value.ai_backend === 'AcpCodex' &&
-    isKonomiTVBS4KCodexSolModel(konomitv_bs4k_acp_effective_model.value),
-);
-/** 現在の ACP バックエンド向け推論深さ候補。 */
-const acp_reasoning_effort_options = computed(() => {
-    const konomitv_bs4k_reasoning_effort_options =
-        acp_reasoning_effort_presets_by_backend[settings.value.ai_backend] ?? [];
-    if (settings.value.ai_backend !== 'AcpCodex' || is_konomitv_bs4k_codex_sol_model.value) {
-        return konomitv_bs4k_reasoning_effort_options;
-    }
-    return konomitv_bs4k_reasoning_effort_options.filter(option => option.value !== 'Ultra');
-});
-
-function normalizeKonomiTVBS4KCodexReasoningEffort(
-    konomitv_bs4k_effort: AcpReasoningEffort | null,
-    konomitv_bs4k_model: string | null,
-    konomitv_bs4k_backend: AIBackendKind,
-): AcpReasoningEffort | null {
-    if (
-        konomitv_bs4k_backend === 'AcpCodex' &&
-        konomitv_bs4k_effort === 'Ultra' &&
-        isKonomiTVBS4KCodexSolModel(konomitv_bs4k_model) === false
-    ) {
-        return 'Max';
-    }
-    return konomitv_bs4k_effort;
-}
-
-/**
- * モデル選択。Grok は保存値が null でも表示上 grok-4.5 を出す。
- */
-const acp_model_selection = computed<string | null>({
-    get() {
-        if (settings.value.ai_backend === 'AcpGrok') {
-            return 'grok-4.5';
-        }
-        const current = settings.value.acp_model?.trim() ?? '';
-        const matched = acp_model_preset_items.value.find(item => item.value === current);
-        if (matched) return matched.value;
-        if (current === '') {
-            // 未設定時は backend 既定の先頭候補を表示する。
-            return acp_model_preset_items.value[0]?.value ?? null;
-        }
-        // 旧バージョンなどで保存された一覧外 ID は、そのまま文字列で返す。
-        return current;
-    },
-    set(value) {
-        if (settings.value.ai_backend === 'AcpGrok') {
-            // Grok は常にモデル固定。保存は null。
-            settings.value.acp_model = null;
-            return;
-        }
-        if (value === null || value === undefined) {
-            settings.value.acp_model = null;
-            settings.value.acp_reasoning_effort = normalizeKonomiTVBS4KCodexReasoningEffort(
-                settings.value.acp_reasoning_effort,
-                settings.value.acp_model,
-                settings.value.ai_backend,
-            );
-            return;
-        }
-        const trimmed = value.trim();
-        settings.value.acp_model = trimmed === '' ? null : trimmed;
-        settings.value.acp_reasoning_effort = normalizeKonomiTVBS4KCodexReasoningEffort(
-            settings.value.acp_reasoning_effort,
-            settings.value.acp_model,
-            settings.value.ai_backend,
-        );
-    },
-});
-/** 推論深さ。未設定時は backend 既定を表示し、set で settings へ書き戻す。 */
-const acp_reasoning_effort_selection = computed<AcpReasoningEffort | null>({
-    get() {
-        if (settings.value.acp_reasoning_effort !== null) {
-            return normalizeKonomiTVBS4KCodexReasoningEffort(
-                settings.value.acp_reasoning_effort,
-                konomitv_bs4k_acp_effective_model.value,
-                settings.value.ai_backend,
-            );
-        }
-        return acp_defaults_by_backend[settings.value.ai_backend]?.effort ?? null;
-    },
-    set(value) {
-        settings.value.acp_reasoning_effort = normalizeKonomiTVBS4KCodexReasoningEffort(
-            value,
-            konomitv_bs4k_acp_effective_model.value,
-            settings.value.ai_backend,
-        );
-    },
-});
-/** 実際に ACP agent へ適用するモデルと推論深さ、または Grok CLI 引数を表示する。 */
-const acp_wire_preview = computed(() => {
-    const backend = settings.value.ai_backend;
-    const effort = acp_reasoning_effort_selection.value;
-    if (backend === 'AcpGrok') {
-        const effort_cli = (effort ?? 'High').toLowerCase();
-        return `grok --reasoning-effort ${effort_cli} agent stdio`;
-    }
-    const model = konomitv_bs4k_acp_effective_model.value;
-    if (model === '') return '';
-    if (backend === 'AcpCodex' && effort) {
-        const konomitv_bs4k_fast_mode_suffix =
-            settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled ? ' / fast' : '';
-        return `${model} / reasoning_effort=${effort.toLowerCase()}${konomitv_bs4k_fast_mode_suffix}`;
-    }
-    return model;
-});
 const opencode_service_error = computed(() => {
     if (settings.value.ai_backend !== 'OpenCode') return '';
     if (settings.value.ai_enabled && !settings.value.ai_backend_service_id) {
@@ -882,53 +410,11 @@ const opencode_service_error = computed(() => {
     }
     return '';
 });
-const acp_timeout_error = computed(() => {
-    if (settings.value.ai_backend === 'OpenCode') return '';
-    const timeout = Number(settings.value.acp_timeout_sec);
-    return Number.isInteger(timeout) && timeout >= 30 && timeout <= 600 ?
-        '' :
-        'ACP 無通信タイムアウトは 30 ～ 600 秒の整数で入力してください。';
-});
-const has_acp_validation_error = computed(() =>
-    settings.value.ai_backend !== 'OpenCode' && (
-        acp_model_error.value !== '' ||
-        acp_timeout_error.value !== ''
-    ),
-);
-const has_provider_validation_error = computed(() => settings.value.ai_backend === 'OpenCode' ?
-    opencode_service_error.value !== '' :
-    has_acp_validation_error.value,
-);
-/** 選択中 ACP を新規起動せず、先に解消すべき認証・直列実行状態を説明する。 */
-const acp_connection_preflight_error = computed(() => {
-    if (settings.value.ai_backend === 'OpenCode') return '';
-    if (acp_credential_status.value === null) return 'ACP 認証状態を取得できませんでした。';
-    if (settings.value.ai_backend === 'AcpCodex' && acp_credential_status.value.codex_auth_imported === false) {
-        return 'Codex の認証が未取り込みです。接続テストの前にホスト auth.json を取り込んでください。';
-    }
-    if (settings.value.ai_backend === 'AcpGrok' && acp_credential_status.value.grok_auth_imported === false) {
-        return 'Grok の認証が未取り込みです。接続テストの前にホスト auth.json を取り込んでください。';
-    }
-    if (acp_credential_status.value.acp_operation_running) {
-        return '別の ACP AI 処理を実行中です。完了後に接続テストを実行してください。';
-    }
-    return '';
-});
-const has_connection_validation_error = computed(() =>
-    has_provider_validation_error.value ||
-    acp_connection_preflight_error.value !== '',
-);
 const has_settings_validation_error = computed(() =>
-    has_provider_validation_error.value,
-);
-const has_connection_test_result = computed(() =>
-    connection_test_results.value.CandidateSelection !== null ||
-    connection_test_results.value.EpisodeLookup !== null,
+    opencode_service_error.value !== '',
 );
 const is_settings_action_running = computed(() =>
-    is_saving.value ||
-    testing_connection_capability.value !== null ||
-    is_updating_acp_authentication.value,
+    is_saving.value,
 );
 const is_backfill_running = computed(() =>
     is_starting_backfill.value || is_monitoring_backfill.value || status.value?.is_running === true,
@@ -949,84 +435,32 @@ const episode_backfill_progress = computed(() => {
     return Math.max(0, Math.min(100, episode_backfill_task.value.progress * 100));
 });
 
-function nullableTrimmed(value: string | null): string | null {
-    const normalized = value?.trim() ?? '';
-    return normalized === '' ? null : normalized;
-}
-
-/** 画面上の全ドラフトを backend 非依存の保存 payload へ変換する。 */
+/** 画面上の全ドラフトを保存 payload へ変換する。 */
 function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
-    const konomitv_bs4k_selected_backend = settings.value.ai_backend;
-    const konomitv_bs4k_acp_model = konomitv_bs4k_selected_backend === 'AcpGrok' ?
-        null :
-        nullableTrimmed(settings.value.acp_model)
-            ?? acp_defaults_by_backend[konomitv_bs4k_selected_backend]?.model
-            ?? null;
-    const konomitv_bs4k_acp_reasoning_effort = ['AcpCodex', 'AcpGrok'].includes(
-        konomitv_bs4k_selected_backend,
-    ) ?
-        normalizeKonomiTVBS4KCodexReasoningEffort(
-            settings.value.acp_reasoning_effort
-                ?? acp_defaults_by_backend[konomitv_bs4k_selected_backend]?.effort
-                ?? null,
-            konomitv_bs4k_acp_model,
-            konomitv_bs4k_selected_backend,
-        ) :
-        null;
     return {
         enabled: settings.value.enabled,
         ai_enabled: settings.value.ai_enabled,
         ai_episode_number_search_enabled: settings.value.ai_episode_number_search_enabled,
         ai_episode_number_acceptance_mode: settings.value.ai_episode_number_acceptance_mode,
-        ai_backend: konomitv_bs4k_selected_backend,
-        ai_backend_service_id: konomitv_bs4k_selected_backend === 'OpenCode'
+        ai_backend: settings.value.ai_backend,
+        ai_backend_service_id: settings.value.ai_backend === 'OpenCode'
             ? settings.value.ai_backend_service_id
             : null,
-        // モデル名と推論深さは分離して送る。Grok の model はサーバー側でも null に正規化される。
-        acp_model: konomitv_bs4k_acp_model,
-        acp_reasoning_effort: konomitv_bs4k_acp_reasoning_effort,
-        konomitv_bs4k_acp_codex_fast_mode_enabled:
-            konomitv_bs4k_selected_backend === 'AcpCodex' &&
-            settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled === true,
-        acp_timeout_sec: Number(settings.value.acp_timeout_sec),
     };
 }
 
-// 設定 GET 反映中は backend 切替 watch の初期値注入を抑止する。
-let suppress_acp_default_injection = false;
-
-/** GET の保存済み snapshot を、backend 切替 watch の初期値注入を抑止しながら反映する。 */
+/** GET の保存済み snapshot を画面へ反映する。 */
 function applyFetchedSettings(fetched_settings: IRecordedSeriesSettings): void {
-    suppress_acp_default_injection = true;
     // ローリング更新中の旧サーバーや古い mock が廃止済み backend を返しても、
     // 一覧外の値を表示したり任意コマンド設定へ戻ったりしないようクライアントでも fail-closed にする。
     const is_supported_backend = ai_backend_options.some(option => option.value === fetched_settings.ai_backend);
-    const konomitv_bs4k_normalized_fetched_settings: IRecordedSeriesSettings = {
-        ...fetched_settings,
-        // 旧サーバーから field が返らない場合も Fast は安全側で無効にする。
-        konomitv_bs4k_acp_codex_fast_mode_enabled:
-            fetched_settings.konomitv_bs4k_acp_codex_fast_mode_enabled === true,
-    };
     settings.value = is_supported_backend ?
-        konomitv_bs4k_normalized_fetched_settings :
+        fetched_settings :
         {
-            ...konomitv_bs4k_normalized_fetched_settings,
+            ...fetched_settings,
             ai_backend: 'AcpCodex',
             ai_enabled: false,
-            acp_reasoning_effort: null,
         };
-    settings.value.acp_reasoning_effort = normalizeKonomiTVBS4KCodexReasoningEffort(
-        settings.value.acp_reasoning_effort,
-        settings.value.acp_model,
-        settings.value.ai_backend,
-    );
-    if (settings.value.ai_backend !== 'AcpCodex') {
-        settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled = false;
-    }
-    // 同期的に watch が走ったあとにフラグを戻す。
-    queueMicrotask(() => {
-        suppress_acp_default_injection = false;
-    });
 }
 
 /** 判定状況を更新し、バックフィル終了後は定期取得を止める。 */
@@ -1077,96 +511,6 @@ async function saveSettings(): Promise<void> {
     is_saving.value = false;
 }
 
-/** 固定6項目のうち指定した接続試験結果を安全に取得する。 */
-function connectionCheck(
-    result: IRecordedSeriesConnectionTestResult | null,
-    check_name: RecordedSeriesEpisodeLookupConnectionCheckName,
-): IRecordedSeriesConnectionTestCheck | null {
-    return result?.checks?.[check_name] ?? null;
-}
-
-/** 接続試験項目の状態を日本語表示へ変換する。 */
-function connectionCheckStatusLabel(
-    status: RecordedSeriesConnectionTestCheckStatus | undefined,
-): string {
-    return status === undefined ? '未実行' : connection_check_status_labels[status];
-}
-
-/** 接続試験項目の状態に対応するアイコンを返す。 */
-function connectionCheckIcon(
-    status: RecordedSeriesConnectionTestCheckStatus | undefined,
-): string {
-    if (status === 'Passed') return 'fluent:checkmark-circle-20-filled';
-    if (status === 'Failed') return 'fluent:error-circle-20-filled';
-    if (status === 'NotApplicable') return 'fluent:subtract-circle-20-filled';
-    return 'fluent:clock-20-filled';
-}
-
-/** 現在のドラフトを保存せず、指定した本番能力と同じ最小リクエストを試す。 */
-async function testConnection(capability: RecordedSeriesConnectionTestCapability): Promise<void> {
-    if (has_connection_validation_error.value || is_settings_action_running.value) return;
-
-    testing_connection_capability.value = capability;
-    connection_test_results.value[capability] = null;
-    const request: IRecordedSeriesConnectionTestRequest = {
-        ...buildSettingsRequest(),
-        capability,
-    };
-    const result = await RecordedSeries.testConnection(request);
-    const capability_title = connection_test_capabilities.find(item => item.value === capability)?.title ?? capability;
-    connection_test_results.value[capability] = result;
-    if (result?.success) {
-        Message.success(`${capability_title}の接続テストに成功しました。（${result.model} / ${result.latency_ms.toLocaleString()} ms）`);
-    } else if (result !== null) {
-        Message.error(`${capability_title}の接続テストに失敗しました。\n${result.message}`);
-    }
-    testing_connection_capability.value = null;
-}
-
-/** Codex / Grok の import / delete を確認ダイアログで明示する。 */
-function openACPAuthenticationDialog(
-    provider: KonomiTVBS4KACPImportProvider,
-    action: ACPAuthenticationAction['action'],
-): void {
-    if (is_settings_action_running.value) return;
-    pending_acp_authentication_action.value = {provider, action};
-    acp_authentication_dialog.value = true;
-}
-
-/** 実行中でない認証確認ダイアログを閉じ、対象 provider を破棄する。 */
-function closeACPAuthenticationDialog(): void {
-    if (is_updating_acp_authentication.value) return;
-    acp_authentication_dialog.value = false;
-    pending_acp_authentication_action.value = null;
-}
-
-/** 確認済みの auth.json import / 専用コピー delete を管理 API へ送信する。 */
-async function confirmACPAuthenticationAction(): Promise<void> {
-    const pending_action = pending_acp_authentication_action.value;
-    if (pending_action === null || is_updating_acp_authentication.value) return;
-
-    is_updating_acp_authentication.value = true;
-    const updated_status = pending_action.action === 'Import' ?
-        await RecordedSeries.importACPAuthentication(pending_action.provider) :
-        await RecordedSeries.deleteACPAuthentication(pending_action.provider);
-    is_updating_acp_authentication.value = false;
-    if (updated_status === null) return;
-
-    acp_credential_status.value = updated_status;
-    acp_authentication_dialog.value = false;
-    pending_acp_authentication_action.value = null;
-    const provider_name = pending_action.provider === 'codex' ? 'Codex' : 'Grok Build';
-    if (pending_action.action === 'Import') {
-        Message.success(`${provider_name} 認証を KonomiTV-BS4K 専用プロファイルへ取り込みました。`);
-    } else {
-        Message.success(`KonomiTV-BS4K の ${provider_name} 認証コピーを削除しました。`);
-    }
-}
-
-/** サーバー側で記録した認証取り込み日時をローカル表示へ変換する。 */
-function formatACPAuthImportedAt(imported_at: string): string {
-    return dayjs(imported_at).format('YYYY/M/D HH:mm:ss');
-}
 
 /** 既存録画を対象に、バックグラウンドでシリーズ判定を実行する。 */
 async function startBackfill(): Promise<void> {
@@ -1258,25 +602,6 @@ function formatLastRunAt(value: string | null): string {
     return value === null ? '未実行' : dayjs(value).format('YYYY/M/D HH:mm:ss');
 }
 
-watch(() => settings.value.ai_backend, (backend, previous) => {
-    connection_test_results.value = {CandidateSelection: null, EpisodeLookup: null};
-    // 設定取得反映中や初回マウントでは初期値注入しない。
-    if (suppress_acp_default_injection || previous === undefined || previous === backend) {
-        return;
-    }
-    if (backend === 'OpenCode') {
-        settings.value.acp_reasoning_effort = null;
-        settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled = false;
-        return;
-    }
-    // ユーザーが backend を切り替えたときだけ、その ACP の推奨初期値を埋める。
-    const defaults = acp_defaults_by_backend[backend];
-    if (defaults === undefined) return;
-    settings.value.acp_model = defaults.model;
-    settings.value.acp_reasoning_effort = defaults.effort;
-    settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled = false;
-});
-
 
 onMounted(async () => {
     // 管理者と確認できるまでは設定 API へアクセスしない。
@@ -1293,10 +618,9 @@ onMounted(async () => {
         is_loading.value = false;
         return;
     }
-    const [fetched_settings, fetched_status, fetched_acp_credential_status, fetched_services] = await Promise.all([
+    const [fetched_settings, fetched_status, fetched_services] = await Promise.all([
         RecordedSeries.fetchSettings(),
         RecordedSeries.fetchStatus(),
-        RecordedSeries.fetchACPCredentialStatus(),
         AIBackend.fetchServices(),
     ]);
     if (fetched_services !== null) {
@@ -1313,9 +637,6 @@ onMounted(async () => {
         status.value = fetched_status;
         if (fetched_status.is_running || fetched_status.is_episode_running) startStatusPolling();
     }
-    if (fetched_acp_credential_status !== null) {
-        acp_credential_status.value = fetched_acp_credential_status;
-    }
     is_loading.value = false;
 });
 
@@ -1328,31 +649,6 @@ onUnmounted(() => {
 </script>
 
 <style lang="scss" scoped>
-
-.recorded-series-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-}
-
-.recorded-series-auth-status {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-    padding: 11px 13px;
-    border-radius: 6px;
-    background: rgb(var(--v-theme-background-lighten-1));
-    color: rgb(var(--v-theme-text-darken-1));
-    font-size: 12px;
-
-    strong {
-        color: rgb(var(--v-theme-error-readable));
-    }
-
-    &--ok {
-        color: rgb(var(--v-theme-success-readable)) !important;
-    }
-}
 
 .recorded-series-beta-badge {
     flex-shrink: 0;
@@ -1375,88 +671,6 @@ onUnmounted(() => {
 
     &--disabled {
         opacity: 0.5;
-    }
-}
-
-.recorded-series-connection-results {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
-
-.recorded-series-connection-result {
-    display: flex;
-    align-items: flex-start;
-    gap: 9px;
-    padding: 10px 12px;
-    border-radius: 6px;
-    color: rgb(var(--v-theme-success-readable));
-    background: rgba(var(--v-theme-success), 0.1);
-
-    > div {
-        display: flex;
-        flex-direction: column;
-        min-width: 0;
-    }
-
-    strong,
-    span,
-    small {
-        overflow-wrap: anywhere;
-    }
-
-    strong {
-        color: rgb(var(--v-theme-text));
-        font-size: 12.5px;
-    }
-
-    span {
-        margin-top: 2px;
-        color: rgb(var(--v-theme-text-darken-1));
-        font-size: 11.5px;
-    }
-
-    small {
-        margin-top: 3px;
-        color: rgb(var(--v-theme-text-darken-1));
-        font-size: 10.5px;
-    }
-
-    &--error {
-        color: rgb(var(--v-theme-error-readable));
-        background: rgba(var(--v-theme-error), 0.1);
-    }
-}
-
-.recorded-series-connection-checks {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin: 8px 0 0;
-    padding: 0;
-    list-style: none;
-
-    li {
-        display: flex;
-        align-items: flex-start;
-        gap: 5px;
-        color: rgb(var(--v-theme-text-darken-1));
-        font-size: 11px;
-
-        svg {
-            flex-shrink: 0;
-            margin-top: 1px;
-        }
-    }
-
-    &--Passed,
-    &--Passed span {
-        color: rgb(var(--v-theme-success-readable)) !important;
-    }
-
-    &--Failed,
-    &--Failed span {
-        color: rgb(var(--v-theme-error-readable)) !important;
     }
 }
 

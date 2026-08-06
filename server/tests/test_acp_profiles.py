@@ -16,12 +16,42 @@ import app.metadata.ai.acp_client as AcpClient
 import app.metadata.ai.acp_presets as AcpPresets
 import app.metadata.ai.acp_profiles as AcpProfiles
 import app.metadata.ai.recorded_series_ai as RecordedSeriesAI
+from app.metadata.ai.ACPSettings import (
+    ACPBackendSettings,
+    ACPSettings,
+    ACPSettingsStore,
+)
 from app.metadata.ai.episode_lookup import (
     EpisodeLookupCitation,
     EpisodeLookupResult,
 )
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettings
+
+
+def _PatchACPSettings(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    codex: ACPBackendSettings | None = None,
+    grok: ACPBackendSettings | None = None,
+) -> ACPSettings:
+    """ACPSettingsStore.getSettings() を指定内容で差し替える。
+
+    Args:
+        monkeypatch: pytest の monkeypatch。
+        codex: Codex 設定。未指定時は既定。
+        grok: Grok 設定。未指定時は既定。
+
+    Returns:
+        差し替え後の ACPSettings。
+    """
+
+    settings = ACPSettings(
+        codex=codex or ACPBackendSettings(backend_kind='AcpCodex'),
+        grok=grok or ACPBackendSettings(backend_kind='AcpGrok'),
+    )
+    monkeypatch.setattr(ACPSettingsStore, 'getSettings', classmethod(lambda cls: settings))
+    return settings
 
 
 def test_codex_profile_generates_only_managed_config_and_isolates_runtime_state(
@@ -221,10 +251,14 @@ def test_konomitv_bs4k_create_backend_passes_codex_fast_mode_to_profile(
         return profile
 
     monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
-    settings = RecordedSeriesSettings(
-        ai_backend='AcpCodex',
-        konomitv_bs4k_acp_codex_fast_mode_enabled=True,
+    _PatchACPSettings(
+        monkeypatch,
+        codex=ACPBackendSettings(
+            backend_kind='AcpCodex',
+            codex_fast_mode_enabled=True,
+        ),
     )
+    settings = RecordedSeriesSettings(ai_backend='AcpCodex')
 
     RecordedSeriesAI._create_backend(settings)
 
@@ -258,17 +292,24 @@ def test_acp_profile_setup_failure_is_normalized_for_ai_audit(
 def test_acp_settings_preserve_episode_lookup_and_normalize_fixed_provider_model() -> None:
     """固定 provider でも話数検索を維持し、provider 固有モデルだけを正規化する。"""
 
-    settings = RecordedSeriesSettings(
-        ai_backend='AcpGrok',
-        ai_episode_number_search_enabled=True,
-        # Grok はモデル ID ではなく推論深さで切り替えるため、古い model 指定は捨てる。
-        acp_model='grok-4',
-        acp_reasoning_effort='High',
+    settings = ACPSettings(
+        codex=ACPBackendSettings(backend_kind='AcpCodex'),
+        grok=ACPBackendSettings(
+            backend_kind='AcpGrok',
+            # Grok はモデル ID ではなく推論深さで切り替えるため、古い model 指定は捨てる。
+            model='grok-4',
+            reasoning_effort='High',
+        ),
     )
 
-    assert settings.ai_episode_number_search_enabled is True
-    assert settings.acp_model is None
-    assert settings.acp_reasoning_effort == 'High'
+    assert settings.grok.model is None
+    assert settings.grok.reasoning_effort == 'High'
+    # 録画シリーズ側の話数検索設定は ACP 設定とは独立して保持される。
+    recorded_settings = RecordedSeriesSettings(
+        ai_backend='AcpGrok',
+        ai_episode_number_search_enabled=True,
+    )
+    assert recorded_settings.ai_episode_number_search_enabled is True
 
 
 def test_acp_adapter_routes_episode_lookup_with_fixed_operation_context(
@@ -345,12 +386,16 @@ def test_create_backend_injects_grok_reasoning_effort_cli_flag(
         return profile
 
     monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
-    settings = RecordedSeriesSettings(
-        ai_backend='AcpGrok',
-        acp_reasoning_effort='Medium',
+    _PatchACPSettings(
+        monkeypatch,
+        grok=ACPBackendSettings(
+            backend_kind='AcpGrok',
+            reasoning_effort='Medium',
+        ),
     )
+    settings = RecordedSeriesSettings(ai_backend='AcpGrok')
     # 未指定時の既定は High。
-    assert RecordedSeriesSettings(ai_backend='AcpGrok').acp_reasoning_effort == 'High'
+    assert ACPSettings().grok.reasoning_effort == 'High'
 
     backend = RecordedSeriesAI._create_backend(settings)
 
@@ -397,62 +442,66 @@ def test_grok_adapter_maps_common_operation_schema_to_cli_argument() -> None:
     assert backend._args == base_args
 
 
-def test_codex_splits_composite_model_and_applies_defaults() -> None:
+def test_codex_splits_composite_model_and_applies_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Codex は連結 ID を分解し、未指定時は Luna + Medium を既定にする。"""
 
-    split_settings = RecordedSeriesSettings(
-        ai_backend='AcpCodex',
-        acp_model='gpt-5.6-luna[medium]',
+    split_settings = ACPBackendSettings(
+        backend_kind='AcpCodex',
+        model='gpt-5.6-luna[medium]',
     )
-    assert split_settings.acp_model == 'gpt-5.6-luna'
-    assert split_settings.acp_reasoning_effort == 'Medium'
+    assert split_settings.model == 'gpt-5.6-luna'
+    assert split_settings.reasoning_effort == 'Medium'
 
     # 明示 effort は括弧側より優先する。
-    preferred = RecordedSeriesSettings(
-        ai_backend='AcpCodex',
-        acp_model='gpt-5.6-terra[low]',
-        acp_reasoning_effort='High',
+    preferred = ACPBackendSettings(
+        backend_kind='AcpCodex',
+        model='gpt-5.6-terra[low]',
+        reasoning_effort='High',
     )
-    assert preferred.acp_model == 'gpt-5.6-terra'
-    assert preferred.acp_reasoning_effort == 'High'
+    assert preferred.model == 'gpt-5.6-terra'
+    assert preferred.reasoning_effort == 'High'
 
-    defaults = RecordedSeriesSettings(ai_backend='AcpCodex')
-    assert defaults.acp_model == 'gpt-5.6-luna'
-    assert defaults.acp_reasoning_effort == 'Medium'
-    assert RecordedSeriesAI.get_audit_model(defaults) == 'acp:codex:gpt-5.6-luna[medium]'
+    defaults = ACPBackendSettings(backend_kind='AcpCodex')
+    assert defaults.model == 'gpt-5.6-luna'
+    assert defaults.reasoning_effort == 'Medium'
+    _PatchACPSettings(monkeypatch)
+    recorded_settings = RecordedSeriesSettings(ai_backend='AcpCodex')
+    assert RecordedSeriesAI.get_audit_model(recorded_settings) == 'acp:codex:gpt-5.6-luna[medium]'
 
 
 def test_konomitv_bs4k_codex_ultra_is_reserved_for_sol_and_fast_mode_is_codex_only() -> None:
     """Ultra は Sol だけに残し、Fast 設定は Codex 以外へ持ち越さない。"""
 
-    non_sol = RecordedSeriesSettings(
-        ai_backend='AcpCodex',
-        acp_model='gpt-5.6-terra',
-        acp_reasoning_effort='Ultra',
-        konomitv_bs4k_acp_codex_fast_mode_enabled=True,
+    non_sol = ACPBackendSettings(
+        backend_kind='AcpCodex',
+        model='gpt-5.6-terra',
+        reasoning_effort='Ultra',
+        codex_fast_mode_enabled=True,
     )
-    assert non_sol.acp_reasoning_effort == 'Max'
-    assert non_sol.konomitv_bs4k_acp_codex_fast_mode_enabled is True
+    assert non_sol.reasoning_effort == 'Max'
+    assert non_sol.codex_fast_mode_enabled is True
 
-    legacy_non_sol = RecordedSeriesSettings(
-        ai_backend='AcpCodex',
-        acp_model='gpt-5.6-luna[ultra]',
+    legacy_non_sol = ACPBackendSettings(
+        backend_kind='AcpCodex',
+        model='gpt-5.6-luna[ultra]',
     )
-    assert legacy_non_sol.acp_model == 'gpt-5.6-luna'
-    assert legacy_non_sol.acp_reasoning_effort == 'Max'
+    assert legacy_non_sol.model == 'gpt-5.6-luna'
+    assert legacy_non_sol.reasoning_effort == 'Max'
 
-    sol = RecordedSeriesSettings(
-        ai_backend='AcpCodex',
-        acp_model='gpt-5.6-sol',
-        acp_reasoning_effort='Ultra',
+    sol = ACPBackendSettings(
+        backend_kind='AcpCodex',
+        model='gpt-5.6-sol',
+        reasoning_effort='Ultra',
     )
-    assert sol.acp_reasoning_effort == 'Ultra'
+    assert sol.reasoning_effort == 'Ultra'
 
-    grok = RecordedSeriesSettings(
-        ai_backend='AcpGrok',
-        konomitv_bs4k_acp_codex_fast_mode_enabled=True,
+    grok = ACPBackendSettings(
+        backend_kind='AcpGrok',
+        codex_fast_mode_enabled=True,
     )
-    assert grok.konomitv_bs4k_acp_codex_fast_mode_enabled is False
+    assert grok.codex_fast_mode_enabled is False
 
 
 
@@ -473,3 +522,85 @@ def test_acp_imported_auth_requires_mode_0600(
 
     with pytest.raises(AcpProfiles.AcpProfileError, match='0600 regular file'):
         AcpProfiles.ensure_acp_profile('codex')
+
+
+def test_acp_settings_migrates_legacy_codex_fields_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """旧 recorded-series-settings.json の ACP 設定は Codex 側へ一度だけ移行する。"""
+
+    legacy_path = tmp_path / 'recorded-series-settings.json'
+    legacy_path.write_text(json.dumps({
+        'ai_backend': 'AcpCodex',
+        'acp_model': 'gpt-5.6-sol',
+        'acp_reasoning_effort': 'High',
+        'konomitv_bs4k_acp_codex_fast_mode_enabled': True,
+        'acp_timeout_sec': 90,
+    }), encoding='utf-8')
+    settings_path = tmp_path / 'acp-settings.json'
+    monkeypatch.setattr(ACPSettingsStore, 'SETTINGS_PATH', settings_path)
+    import app.metadata.ai.ACPSettings as ACPSettingsModule
+    monkeypatch.setattr(ACPSettingsModule, 'DATA_DIR', tmp_path)
+
+    migrated = ACPSettingsStore.getSettings()
+
+    assert settings_path.is_file() is True
+    assert migrated.codex.model == 'gpt-5.6-sol'
+    assert migrated.codex.reasoning_effort == 'High'
+    assert migrated.codex.codex_fast_mode_enabled is True
+    assert migrated.codex.timeout_sec == 90
+    assert migrated.grok.reasoning_effort == 'High'
+
+    # 2回目は移行せず保存済み JSON を読む（正本化済み）。
+    migrated_again = ACPSettingsStore.getSettings()
+    assert migrated_again.codex.model == 'gpt-5.6-sol'
+
+
+def test_acp_settings_migrates_legacy_grok_fields_to_grok_side(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """旧 ai_backend=AcpGrok の ACP 設定は Grok 側へ移行する。"""
+
+    legacy_path = tmp_path / 'recorded-series-settings.json'
+    legacy_path.write_text(json.dumps({
+        'ai_backend': 'AcpGrok',
+        'acp_reasoning_effort': 'Low',
+        'acp_timeout_sec': 60,
+    }), encoding='utf-8')
+    settings_path = tmp_path / 'acp-settings.json'
+    monkeypatch.setattr(ACPSettingsStore, 'SETTINGS_PATH', settings_path)
+    import app.metadata.ai.ACPSettings as ACPSettingsModule
+    monkeypatch.setattr(ACPSettingsModule, 'DATA_DIR', tmp_path)
+
+    migrated = ACPSettingsStore.getSettings()
+
+    assert migrated.grok.reasoning_effort == 'Low'
+    assert migrated.grok.timeout_sec == 60
+    # Grok 側には移行しない（既定のまま）。
+    assert migrated.codex.model == 'gpt-5.6-luna'
+    assert migrated.codex.timeout_sec == 120
+
+
+def test_acp_settings_skips_migration_without_legacy_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """ACP 実行設定が無い旧 JSON では移行せず既定設定を返す。"""
+
+    legacy_path = tmp_path / 'recorded-series-settings.json'
+    legacy_path.write_text(json.dumps({
+        'ai_backend': 'AcpCodex',
+        'ai_enabled': False,
+    }), encoding='utf-8')
+    settings_path = tmp_path / 'acp-settings.json'
+    monkeypatch.setattr(ACPSettingsStore, 'SETTINGS_PATH', settings_path)
+    import app.metadata.ai.ACPSettings as ACPSettingsModule
+    monkeypatch.setattr(ACPSettingsModule, 'DATA_DIR', tmp_path)
+
+    settings = ACPSettingsStore.getSettings()
+
+    assert settings_path.is_file() is False
+    assert settings.codex.model == 'gpt-5.6-luna'
+    assert settings.grok.reasoning_effort == 'High'

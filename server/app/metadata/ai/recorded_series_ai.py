@@ -457,6 +457,11 @@ def _create_backend(
         get_profile_environment,
     )
 
+    # モデル・推論深さ・Fast・タイムアウトは ACPSettings が正本（AI バックエンドページ管理）。
+    from app.metadata.ai.ACPSettings import ACPSettingsStore
+
+    acp_settings = ACPSettingsStore.getSettings().forBackend(settings.ai_backend)
+
     # コマンド解決
     try:
         runtime_command, preset_args = resolve_command(
@@ -470,11 +475,7 @@ def _create_backend(
     try:
         profile_dir = ensure_acp_profile(
             backend=profile_backend,
-            konomitv_bs4k_fast_mode_enabled=(
-                settings.konomitv_bs4k_acp_codex_fast_mode_enabled
-                if settings.ai_backend == 'AcpCodex'
-                else False
-            ),
+            konomitv_bs4k_fast_mode_enabled=acp_settings.codex_fast_mode_enabled,
         )
         profile_env = get_profile_environment(
             profile_backend,
@@ -495,10 +496,10 @@ def _create_backend(
 
     # Grok Build はモデルが grok-4.5 固定のため、CLI の --reasoning-effort で深さを切り替える。
     # `grok --reasoning-effort {low,medium,high} agent stdio` の形になるよう先頭へ挿入する。
-    if settings.ai_backend == 'AcpGrok' and settings.acp_reasoning_effort is not None:
+    if settings.ai_backend == 'AcpGrok' and acp_settings.reasoning_effort is not None:
         all_args = [
             '--reasoning-effort',
-            settings.acp_reasoning_effort.lower(),
+            acp_settings.reasoning_effort.lower(),
             *all_args,
         ]
 
@@ -507,9 +508,9 @@ def _create_backend(
         command=runtime_command,
         args=all_args,
         env=profile_env,
-        timeout_sec=settings.acp_timeout_sec,
-        model=settings.acp_model,
-        reasoning_effort=settings.acp_reasoning_effort,
+        timeout_sec=acp_settings.timeout_sec,
+        model=acp_settings.model,
+        reasoning_effort=acp_settings.reasoning_effort,
         cwd=runtime_cwd,
         profile_dir=str(profile_dir),
     )
@@ -1098,13 +1099,17 @@ def get_audit_model(settings: RecordedSeriesSettings | None = None) -> str:
         'AcpGrok': 'acp:grok',
     }
     prefix = backend_prefix_map.get(effective_settings.ai_backend, 'acp')
-    acp_model = effective_settings.acp_model
+    # モデル・推論深さは ACPSettings が正本（AI バックエンドページ管理）。
+    from app.metadata.ai.ACPSettings import ACPSettingsStore
+
+    acp_settings = ACPSettingsStore.getSettings().forBackend(effective_settings.ai_backend)
+    acp_model = acp_settings.model
     if acp_model:
         label = f'{prefix}:{acp_model}'
     else:
         label = prefix
     # モデル名と分離保存した推論深さを、Codex 互換の [effort] 表記で監査へ載せる。
-    reasoning_effort = getattr(effective_settings, 'acp_reasoning_effort', None)
+    reasoning_effort = acp_settings.reasoning_effort
     if reasoning_effort is not None:
         return f'{label}[{reasoning_effort.lower()}]'
     return label

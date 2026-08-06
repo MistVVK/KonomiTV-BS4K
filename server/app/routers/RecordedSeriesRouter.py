@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Literal, Self, cast
+from typing import Annotated, Literal, Self
 
 from fastapi import (
     APIRouter,
@@ -20,27 +19,8 @@ from tortoise.expressions import Q
 from typing_extensions import TypedDict
 
 from app import logging, schemas
-from app.metadata.ai.backends import (
-    ConnectionTestCheck,
-    ConnectionTestResult,
-    EpisodeLookupConnectionChecks,
-)
 from app.metadata.ai.episode_lookup import EpisodeLookupOutcome, IsPublicHTTPURL
-from app.metadata.ai.KonomiTVBS4KACPCredentials import (
-    KonomiTVBS4KACPCredentialError,
-    KonomiTVBS4KACPCredentials,
-    KonomiTVBS4KACPImportProvider,
-)
-from app.metadata.ai.recorded_series_ai import (
-    GetACPCredentialOperationLock,
-    IsACPOperationRunning,
-    get_audit_model,
-    get_episode_lookup_provider_fingerprint,
-    invalidate_episode_lookup_capability_fingerprint,
-    invalidate_episode_lookup_capability_proof,
-    record_episode_lookup_capability_proof,
-    test_connection,
-)
+from app.metadata.ai.KonomiTVBS4KACPCredentials import KonomiTVBS4KACPImportProvider
 from app.metadata.RecordedEpisodeAutomation import (
     RecordedEpisodeAutomation,
     RecordedEpisodeRelookupConflictError,
@@ -58,7 +38,6 @@ from app.metadata.RecordedEpisodeResolver import (
     RecordedEpisodeSeriesNotAssignedError,
     RecordedEpisodeTargetNotFoundError,
 )
-from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
 from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesResolver import (
     RecordedSeriesChannelUnavailableError,
@@ -77,7 +56,6 @@ from app.metadata.RecordedSeriesSettings import (
 )
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
-from app.models.RecordedSeries import RecordedSeriesAIRequest
 from app.models.Series import Series
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
@@ -92,57 +70,6 @@ NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 MAX_API_KEY_LENGTH = 8192
 RECORDED_SERIES_MANAGEMENT_DEFAULT_PAGE_SIZE = 30
 RECORDED_SERIES_MANAGEMENT_MAX_PAGE_SIZE = 100
-
-
-class RecordedSeriesConnectionTestCheckResponse(BaseModel):
-    """接続試験の1能力について、実測できた状態と安全な説明を返す。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    status: Literal["Passed", "Failed", "NotRun", "NotApplicable"]
-    message: str
-
-
-class RecordedSeriesEpisodeLookupConnectionChecksResponse(BaseModel):
-    """EpisodeLookup 接続試験の固定6項目。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    backend_connection: RecordedSeriesConnectionTestCheckResponse
-    web_search: RecordedSeriesConnectionTestCheckResponse
-    source_url: RecordedSeriesConnectionTestCheckResponse
-    strict_schema: RecordedSeriesConnectionTestCheckResponse
-    timeout_cancel: RecordedSeriesConnectionTestCheckResponse
-    permission_policy: RecordedSeriesConnectionTestCheckResponse
-
-
-class RecordedSeriesConnectionTestResponse(BaseModel):
-    """秘密情報を含まないAIバックエンド接続試験結果。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    success: bool
-    latency_ms: int
-    model: str
-    message: str
-    checks: RecordedSeriesEpisodeLookupConnectionChecksResponse | None
-
-
-class KonomiTVBS4KACPCredentialStatusResponse(BaseModel):
-    """認証内容を含まない録画シリーズ ACP の共有管理者資格情報状態。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    acp_operation_running: bool
-    codex_host_auth_available: bool
-    codex_auth_imported: bool
-    codex_auth_imported_at: datetime | None
-    codex_auth_in_use: bool
-    grok_host_auth_available: bool
-    grok_auth_imported: bool
-    grok_auth_imported_at: datetime | None
-    grok_auth_in_use: bool
-    google_adc_available: bool
 
 
 class RecordedSeriesStatusResponse(BaseModel):
@@ -506,151 +433,6 @@ async def _buildRecordedSeriesManagementItems(
             )
         )
     return items
-
-
-def _connectionErrorMessage(
-    error_code: str,
-    capability: Literal["CandidateSelection", "EpisodeLookup"],
-) -> str:
-    """内部エラーコードをキーや外部レスポンスを含まない表示文へ変換する。"""
-
-    if error_code == "HTTP401":
-        return "認証に失敗しました。API キーを確認してください。"
-    if error_code == "HTTP404":
-        endpoint_name = (
-            "Responses / Web Search"
-            if capability == "EpisodeLookup"
-            else "Chat Completions"
-        )
-        return f"{endpoint_name} の URL またはモデル ID を確認してください。"
-    if error_code.startswith("HTTP"):
-        return f"OpenAI 互換 API がエラーを返しました。（{error_code}）"
-    if error_code in {"Timeout", "NetworkError"}:
-        return (
-            "OpenAI 互換 API へ接続できませんでした。URL と稼働状態を確認してください。"
-        )
-    if error_code == "RedirectRejected":
-        return "接続先からのリダイレクトは安全のため拒否しました。最終 URL を指定してください。"
-    if capability == "EpisodeLookup":
-        return "Responses API のWeb検索・構造化出力に対応していないか、結果を検証できませんでした。"
-    return "応答が Chat Completions 互換形式ではないか、シリーズ生成結果を検証できませんでした。"
-
-
-def _ACPConnectionTestPreflightError(
-    settings: RecordedSeriesSettings,
-) -> tuple[str, str] | None:
-    """接続試験を agent 起動前に拒否すべき理由を返す。
-
-    Args:
-        settings: 画面のドラフトから検証済みの接続試験設定。
-
-    Returns:
-        固定エラーコードと利用者向け理由。起動可能なら None。
-    """
-
-    if settings.ai_backend == 'OpenCode':
-        # OpenCode は service_id と auth 設定済みが前提。serve 不可は backend 側で 503 相当。
-        if settings.ai_backend_service_id is None:
-            return (
-                'OpenCodeServiceNotFound',
-                'OpenCode の AI バックエンド service が未選択です。',
-            )
-        from app.metadata.ai.AIBackendSettings import (
-            AIBackendSettingsStore as AIBackendStore,
-        )
-        try:
-            service = AIBackendStore.getService(settings.ai_backend_service_id)
-        except (OSError, ValueError):
-            service = None
-        if service is None:
-            return (
-                'OpenCodeServiceNotFound',
-                '選択中の AI バックエンド service が見つかりません。',
-            )
-        if AIBackendStore.isAuthConfigured(service) is False:
-            return (
-                'OpenCodeAuthNotConfigured',
-                '選択中の AI バックエンドの認証が未設定です。',
-            )
-        return None
-
-    credential_status = KonomiTVBS4KACPCredentials.getStatus()
-    if (
-        settings.ai_backend == "AcpCodex"
-        and credential_status.codex_auth_imported is False
-    ):
-        return (
-            "ACPAuthenticationUnavailable",
-            "Codex 認証が未取り込みのため接続テストを実行できません。",
-        )
-    if (
-        settings.ai_backend == "AcpGrok"
-        and credential_status.grok_auth_imported is False
-    ):
-        return (
-            "ACPAuthenticationUnavailable",
-            "Grok Build 認証が未取り込みのため接続テストを実行できません。",
-        )
-    if IsACPOperationRunning():
-        return (
-            "ACPOperationBusy",
-            "別の ACP AI 処理を実行中のため、完了後に接続テストを実行してください。",
-        )
-    return None
-
-
-def _notRunEpisodeLookupConnectionChecks(
-    message: str,
-    *,
-    permission_not_applicable: bool,
-) -> EpisodeLookupConnectionChecks:
-    """接続試験を開始できなかった場合の固定6項目を構築する。"""
-
-    not_run = ConnectionTestCheck(status="NotRun", message=message)
-    permission_policy = (
-        ConnectionTestCheck(
-            status="NotApplicable",
-            message="OpenAI 互換 Responses API では ACP permission policy は対象外です。",
-        )
-        if permission_not_applicable
-        else not_run
-    )
-    return EpisodeLookupConnectionChecks(
-        backend_connection=not_run,
-        web_search=not_run,
-        source_url=not_run,
-        strict_schema=not_run,
-        timeout_cancel=not_run,
-        permission_policy=permission_policy,
-    )
-
-
-def _connectionChecksResponse(
-    checks: EpisodeLookupConnectionChecks | None,
-) -> RecordedSeriesEpisodeLookupConnectionChecksResponse | None:
-    """内部 dataclass を秘密情報のない API response へ変換する。"""
-
-    if checks is None:
-        return None
-
-    def Convert(
-        check: ConnectionTestCheck,
-    ) -> RecordedSeriesConnectionTestCheckResponse:
-        return RecordedSeriesConnectionTestCheckResponse(
-            status=check.status,
-            message=check.message,
-        )
-
-    return RecordedSeriesEpisodeLookupConnectionChecksResponse(
-        backend_connection=Convert(checks.backend_connection),
-        web_search=Convert(checks.web_search),
-        source_url=Convert(checks.source_url),
-        strict_schema=Convert(checks.strict_schema),
-        timeout_cancel=Convert(checks.timeout_cancel),
-        permission_policy=Convert(checks.permission_policy),
-    )
-
-
 async def ParseRecordedSeriesSettingsUpdate(
     request: Request,
 ) -> RecordedSeriesSettings:
@@ -842,102 +624,37 @@ async def RecordedSeriesAPIKeyDeleteAPI(
     )
 
 
-def _KonomiTVBS4KACPCredentialStatusResponse() -> (
-    KonomiTVBS4KACPCredentialStatusResponse
-):
-    """資格情報管理モジュールの状態を API response model へ変換する。
-
-    Returns:
-        KonomiTVBS4KACPCredentialStatusResponse: 認証内容を含まない現在状態。
-    """
-
-    credential_status = KonomiTVBS4KACPCredentials.getStatus()
-    return KonomiTVBS4KACPCredentialStatusResponse(
-        acp_operation_running=IsACPOperationRunning(),
-        codex_host_auth_available=credential_status.codex_host_auth_available,
-        codex_auth_imported=credential_status.codex_auth_imported,
-        codex_auth_imported_at=credential_status.codex_auth_imported_at,
-        codex_auth_in_use=GetACPCredentialOperationLock('codex').locked(),
-        grok_host_auth_available=credential_status.grok_host_auth_available,
-        grok_auth_imported=credential_status.grok_auth_imported,
-        grok_auth_imported_at=credential_status.grok_auth_imported_at,
-        grok_auth_in_use=GetACPCredentialOperationLock('grok').locked(),
-        google_adc_available=credential_status.google_adc_available,
-    )
-
-
-def _KonomiTVBS4KACPCredentialHTTPException(
-    error: KonomiTVBS4KACPCredentialError,
-) -> HTTPException:
-    """内部 path・JSON・例外詳細を公開しない固定 HTTP error へ変換する。
-
-    Args:
-        error: 資格情報管理モジュールの固定コード付きエラー。
-
-    Returns:
-        HTTPException: ``no-store`` を付与した無害なエラー。
-    """
-
-    if error.code == "HostAuthUnavailable":
-        return HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The host authentication file is not available.",
-            headers=NO_STORE_HEADERS,
-        )
-    if error.code == "InvalidHostAuth":
-        return HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="The host authentication file is invalid.",
-            headers=NO_STORE_HEADERS,
-        )
-    return HTTPException(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        detail="Failed to update the imported authentication state.",
-        headers=NO_STORE_HEADERS,
-    )
-
-
-def _KonomiTVBS4KACPCredentialInUseHTTPException() -> HTTPException:
-    """実行中 ACP の認証世代を変更しないための固定競合応答を返す。
-
-    Returns:
-        HTTP 409 と no-store を持つ、秘密情報を含まない例外。
-    """
-
-    return HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail="The ACP authentication is currently in use by an AI operation.",
-        headers=NO_STORE_HEADERS,
-    )
-
-
 @router.get(
     "/settings/acp-credentials",
-    summary="KonomiTV-BS4K 録画シリーズ ACP 認証状態取得 API",
-    response_model=KonomiTVBS4KACPCredentialStatusResponse,
+    summary="ACP 認証状態取得 API（廃止）",
+    status_code=status.HTTP_410_GONE,
 )
 async def KonomiTVBS4KACPCredentialStatusAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-) -> KonomiTVBS4KACPCredentialStatusResponse:
-    """管理者へ共有 ACP 資格情報の存在状態と取り込み日時だけを返す。
+):
+    """ACP 認証状態取得。AI バックエンド API へ移行済み。
 
     Args:
-        response: ``Cache-Control: no-store`` を設定するレスポンス。
+        response: Cache-Control ヘッダーを設定するレスポンス。
         _current_user: 管理者認証済みのユーザー。
 
     Returns:
-        KonomiTVBS4KACPCredentialStatusResponse: token・JSON・hash を含まない状態。
+        None
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    return _KonomiTVBS4KACPCredentialStatusResponse()
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Use GET /api/ai-backends/acp-credentials instead.",
+        headers=NO_STORE_HEADERS,
+    )
 
 
 @router.post(
     "/settings/acp-credentials/{provider}/import",
-    summary="KonomiTV-BS4K 録画シリーズ ACP 認証取り込み API",
-    response_model=KonomiTVBS4KACPCredentialStatusResponse,
+    summary="ACP 認証取り込み API（廃止）",
+    status_code=status.HTTP_410_GONE,
 )
 async def KonomiTVBS4KACPCredentialImportAPI(
     provider: Annotated[
@@ -945,48 +662,31 @@ async def KonomiTVBS4KACPCredentialImportAPI(
     ],
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-) -> KonomiTVBS4KACPCredentialStatusResponse:
-    """管理者の明示操作で固定 mount の auth.json だけを専用 profile へ取り込む。
+):
+    """ACP 認証取り込み。AI バックエンド API へ移行済み。
 
     Args:
         provider: ``codex`` または ``grok``。
-        response: ``Cache-Control: no-store`` を設定するレスポンス。
+        response: Cache-Control ヘッダーを設定するレスポンス。
         _current_user: 管理者認証済みのユーザー。
 
     Returns:
-        KonomiTVBS4KACPCredentialStatusResponse: 更新後の安全な状態。
-
-    Raises:
-        HTTPException: host-auth が不正、または専用コピーを保存できない場合。
+        None
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    credential_lock = GetACPCredentialOperationLock(provider)
-    # 同じ provider の AI が認証を読んでいる場合、最大60分の終了待ちを API に持ち込まない。
-    if credential_lock.locked():
-        raise _KonomiTVBS4KACPCredentialInUseHTTPException()
-    await credential_lock.acquire()
-    try:
-        try:
-            KonomiTVBS4KACPCredentials.importProviderAuth(provider)
-        except KonomiTVBS4KACPCredentialError as ex:
-            # 内容や OS 例外をログへ渡さず、provider と固定コードだけを記録する。
-            logging.error(
-                f"[KonomiTVBS4KACPCredentialImportAPI] Failed to import {provider} auth ({ex.code}).",
-            )
-            raise _KonomiTVBS4KACPCredentialHTTPException(ex) from ex
-        invalidate_episode_lookup_capability_proof(
-            backend_kind="AcpCodex" if provider == "codex" else "AcpGrok",
-        )
-    finally:
-        credential_lock.release()
-    return _KonomiTVBS4KACPCredentialStatusResponse()
+    _ = provider
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Use POST /api/ai-backends/acp-credentials/{provider}/import instead.",
+        headers=NO_STORE_HEADERS,
+    )
 
 
 @router.delete(
     "/settings/acp-credentials/{provider}",
-    summary="KonomiTV-BS4K 録画シリーズ ACP 認証削除 API",
-    response_model=KonomiTVBS4KACPCredentialStatusResponse,
+    summary="ACP 認証削除 API（廃止）",
+    status_code=status.HTTP_410_GONE,
 )
 async def KonomiTVBS4KACPCredentialDeleteAPI(
     provider: Annotated[
@@ -994,301 +694,54 @@ async def KonomiTVBS4KACPCredentialDeleteAPI(
     ],
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-) -> KonomiTVBS4KACPCredentialStatusResponse:
-    """管理者の明示操作で KonomiTV-BS4K 専用コピーだけを削除する。
+):
+    """ACP 認証削除。AI バックエンド API へ移行済み。
 
     Args:
         provider: ``codex`` または ``grok``。
-        response: ``Cache-Control: no-store`` を設定するレスポンス。
+        response: Cache-Control ヘッダーを設定するレスポンス。
         _current_user: 管理者認証済みのユーザー。
 
     Returns:
-        KonomiTVBS4KACPCredentialStatusResponse: 更新後の安全な状態。
-
-    Raises:
-        HTTPException: 専用コピーを削除できない場合。
+        None
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    credential_lock = GetACPCredentialOperationLock(provider)
-    # 削除も import と同じく、実行中世代を壊さず即時に競合を通知する。
-    if credential_lock.locked():
-        raise _KonomiTVBS4KACPCredentialInUseHTTPException()
-    await credential_lock.acquire()
-    try:
-        try:
-            KonomiTVBS4KACPCredentials.deleteProviderAuth(provider)
-        except KonomiTVBS4KACPCredentialError as ex:
-            logging.error(
-                f"[KonomiTVBS4KACPCredentialDeleteAPI] Failed to delete {provider} auth ({ex.code}).",
-            )
-            raise _KonomiTVBS4KACPCredentialHTTPException(ex) from ex
-        invalidate_episode_lookup_capability_proof(
-            backend_kind="AcpCodex" if provider == "codex" else "AcpGrok",
-        )
-    finally:
-        credential_lock.release()
-    return _KonomiTVBS4KACPCredentialStatusResponse()
+    _ = provider
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Use DELETE /api/ai-backends/acp-credentials/{provider} instead.",
+        headers=NO_STORE_HEADERS,
+    )
 
 
 @router.post(
     "/settings/test",
-    summary="AI バックエンド接続試験 API",
-    response_model=RecordedSeriesConnectionTestResponse,
+    summary="AI バックエンド接続試験 API（廃止）",
+    status_code=status.HTTP_410_GONE,
 )
 async def RecordedSeriesConnectionTestAPI(
     request: Request,
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-) -> RecordedSeriesConnectionTestResponse:
-    """保存済みバックエンド設定を使用して選択したAI機能を1回だけ試す。
+):
+    """AI バックエンド接続試験。AI バックエンド API へ移行済み。
 
-    OpenAI 互換バックエンドでは、入力中のURL・モデル・任意キーを使用する。
-    ACP バックエンドでは保存前のドラフト設定から一時 backend を構築する。
+    Args:
+        request: 無視される。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    try:
-        request_body = await request.json()
-    except Exception as ex:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Connection test request must be a JSON object.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    if not isinstance(request_body, dict):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Connection test request must be a JSON object.",
-            headers=NO_STORE_HEADERS,
-        )
-
-    draft = dict(request_body)
-    capability_value = draft.pop("capability", "CandidateSelection")
-    if not isinstance(capability_value, str) or capability_value not in {
-        "CandidateSelection",
-        "EpisodeLookup",
-    }:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Connection test capability is invalid.",
-            headers=NO_STORE_HEADERS,
-        )
-    capability = cast(Literal["CandidateSelection", "EpisodeLookup"], capability_value)
-
-    # 旧 draft の api_key・OpenAI 互換接続 field・日次制限は無視する（AI バックエンド API へ移行）。
-    # AcpCodex / AcpGrok の ACP field は draft 上書きを許可する。
-    draft.pop('api_key', None)
-    for legacy_key in (
-        'api_base_url', 'model', 'daily_ai_request_limit',
-    ):
-        draft.pop(legacy_key, None)
-    try:
-        saved_settings = RecordedSeriesSettingsStore.getSettings()
-    except (OSError, ValueError) as ex:
-        logging.error(
-            "[RecordedSeriesConnectionTestAPI] Failed to load settings:", exc_info=ex
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to load recorded series settings.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    try:
-        # 旧クライアントの OpenAI 部分 payload も維持しつつ、新 UI は全ドラフトを送れる。
-        # ACP の backend / model / effort もドラフトで差し替え可能にする。
-        merged_settings = saved_settings.model_dump(mode="json")
-        merged_settings.update(draft)
-        validated_settings = RecordedSeriesSettings.model_validate(merged_settings)
-    except ValidationError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Connection test settings are invalid.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-
-    audit_model = get_audit_model(validated_settings)
-
-    # OpenCode / ACP の起動前 preflight（認証未設定・busy 等）。
-    preflight_result: ConnectionTestResult | None = None
-    acp_preflight_error = _ACPConnectionTestPreflightError(validated_settings)
-    if acp_preflight_error is not None:
-        acp_preflight_error_code, acp_preflight_message = acp_preflight_error
-        preflight_result = ConnectionTestResult(
-            success=False,
-            latency_ms=0,
-            model=audit_model,
-            message=acp_preflight_message,
-            checks=(
-                _notRunEpisodeLookupConnectionChecks(
-                    acp_preflight_message,
-                    permission_not_applicable=False,
-                )
-                if capability == "EpisodeLookup"
-                else None
-            ),
-            error_code=acp_preflight_error_code,
-        )
-
-    # OpenAI 互換キー解決は廃止。Phase 2 の draft 接続試験で service 単位に扱う。
-    tested_provider_fingerprint = (
-        get_episode_lookup_provider_fingerprint(
-            validated_settings,
-            None,
-        )
-        if capability == "EpisodeLookup"
-        else None
-    )
-    if preflight_result is not None:
-        result = preflight_result
-    else:
-        try:
-            # OpenAI / ACP とも、接続試験の正本 facade と immutable draft snapshot を使う。
-            result = await test_connection(
-                capability,
-                settings=validated_settings,
-                api_key=None,
-            )
-        except RecordedSeriesAIError as ex:
-            message = _connectionErrorMessage(ex.code, capability)
-            result = ConnectionTestResult(
-                success=False,
-                latency_ms=ex.latency_ms or 0,
-                model=audit_model,
-                message=message,
-                checks=(
-                    _notRunEpisodeLookupConnectionChecks(
-                        message,
-                        permission_not_applicable=(
-                            False
-                        ),
-                    )
-                    if capability == "EpisodeLookup"
-                    else None
-                ),
-                http_status=ex.http_status,
-                error_code=ex.code,
-            )
-        except Exception:
-            # CLI・provider 由来の例外には path や認証詳細が含まれ得るため公開しない。
-            logging.error("[RecordedSeriesConnectionTestAPI] Connection test failed.")
-            message = "AI バックエンド接続テストに失敗しました。設定と認証状態を確認してください。"
-            result = ConnectionTestResult(
-                success=False,
-                latency_ms=0,
-                model=audit_model,
-                message=message,
-                checks=(
-                    _notRunEpisodeLookupConnectionChecks(
-                        message,
-                        permission_not_applicable=False,
-                    )
-                    if capability == "EpisodeLookup"
-                    else None
-                ),
-                error_code="ConnectionTestFailed",
-            )
-    if (
-        capability == "EpisodeLookup"
-        and result.provider_fingerprint is not None
-    ):
-        # facade が operation lock 内で実際に試験した世代を正本にする。
-        # Router の事前観測値は preflight / 例外時の失効対象にだけ使う。
-        tested_provider_fingerprint = result.provider_fingerprint
-
-    rejected_error_codes = {
-        "ChoiceOutsideCandidateSet",
-        "InvalidOutputSchema",
-        "InvalidJSON",
-        "InvalidJSONType",
-        "InvalidModelOutput",
-        "LowConfidence",
-        "MissingWebSearchCall",
-        "SearchNotRun",
-    }
-    if capability == "EpisodeLookup":
-        # 成功 proof は監査レコードと一体で成立させる。監査保存中は旧 proof
-        # も使わせず、DB 保存失敗時に未監査 proof だけが残らないようにする。
-        assert tested_provider_fingerprint is not None
-        invalidate_episode_lookup_capability_fingerprint(
-            tested_provider_fingerprint,
-        )
-    audit_error_code = (
-        None
-        if result.success
-        else result.error_code or "ConnectionTestFailed"
-    )
-    connection_test_audit = await RecordedSeriesAIRequest.create(
-        resolution_id=None,
-        purpose="ConnectionTest",
-        status=(
-            "Succeeded"
-            if result.success
-            else "Rejected"
-            if audit_error_code in rejected_error_codes
-            else "Failed"
-        ),
-        model=audit_model,
-        candidate_ids=(
-            ["episode-lookup"]
-            if capability == "EpisodeLookup"
-            else ["unresolved"]
-        ),
-        selected_choice_id=result.selected_choice_id,
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-        http_status=result.http_status,
-        latency_ms=result.latency_ms,
-        error_code=audit_error_code,
-    )
-    proof_recorded: bool | None = None
-    if capability == "EpisodeLookup":
-        assert tested_provider_fingerprint is not None
-        proof_recorded = record_episode_lookup_capability_proof(
-            validated_settings,
-            None,
-            result,
-            tested_provider_fingerprint=tested_provider_fingerprint,
-        )
-        if result.success and proof_recorded is False:
-            current_provider_fingerprint = (
-                get_episode_lookup_provider_fingerprint(
-                    validated_settings,
-                    None,
-                )
-            )
-            state_changed = (
-                current_provider_fingerprint
-                != tested_provider_fingerprint
-            )
-            result = replace(
-                result,
-                success=False,
-                message=(
-                    "接続試験中に AI 設定または認証状態が変更されました。もう一度試してください。"
-                    if state_changed
-                    else "話数 Web 検索に必要な能力をすべて確認できませんでした。"
-                ),
-                error_code=(
-                    "ConnectionTestStateChanged"
-                    if state_changed
-                    else "EpisodeLookupCapabilityNotVerified"
-                ),
-            )
-            # 監査保存後に provider / credential 世代が変わった場合も、API 応答と
-            # 監査履歴を同じ失敗状態へそろえる。成功監査だけが残ると、能力証明が
-            # 登録されていない実態と履歴表示が食い違う。
-            connection_test_audit.status = 'Failed'
-            connection_test_audit.error_code = result.error_code
-            await connection_test_audit.save(
-                update_fields=['status', 'error_code'],
-            )
-    return RecordedSeriesConnectionTestResponse(
-        success=result.success,
-        latency_ms=result.latency_ms,
-        model=result.model,
-        message=result.message,
-        checks=_connectionChecksResponse(result.checks),
+    _ = request
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail="Use POST /api/ai-backends/connection-test or /api/ai-backends/acp/test instead.",
+        headers=NO_STORE_HEADERS,
     )
 
 

@@ -1,25 +1,17 @@
 import type { IAnalysisTaskAccepted } from '@/services/AnalysisTasks';
 
 import APIClient from '@/services/APIClient';
-import {
-    ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC,
-    ACP_HARD_TIMEOUT_SEC,
-} from '@/utils/RecordedEpisodeResolution';
 
 
 export type RecordedEpisodeNumberAcceptanceMode = 'HighConfidenceOnly' | 'Always';
-export type RecordedSeriesConnectionTestCapability = 'CandidateSelection' | 'EpisodeLookup';
 /** 録画シリーズが選択できる AI バックエンド。OpenCode は AIBackend service_id を参照する。 */
 export type AIBackendKind = 'OpenCode' | 'AcpCodex' | 'AcpGrok';
 export type EpisodeLookupOutcome =
     'Pending' | 'Resolved' | 'NotNumbered' | 'InsufficientEvidence' | 'SearchFailed' |
     'SearchNotRun' | 'InvalidModelOutput' | 'Disabled' | 'RateLimited' | 'Cancelled';
-/** ACP 推論深さ。Codex は XHigh/Max/Ultra まで、Grok は Low〜High。CLI には lowercase。 */
-export type AcpReasoningEffort = 'Low' | 'Medium' | 'High' | 'XHigh' | 'Max' | 'Ultra';
-export type KonomiTVBS4KACPImportProvider = 'codex' | 'grok';
 
 
-/** 録画シリーズ判定のサーバー共有設定。OpenCode の秘密は AI バックエンド API 側。 */
+/** 録画シリーズ判定のサーバー共有設定。AI 接続・認証・モデルは AI バックエンド側が正本。 */
 export interface IRecordedSeriesSettings {
     enabled: boolean;
     ai_enabled: boolean;
@@ -28,12 +20,6 @@ export interface IRecordedSeriesSettings {
     ai_backend: AIBackendKind;
     // OpenCode 時の AIBackend service UUID
     ai_backend_service_id: string | null;
-    // ACP 共通（モデル名と推論深さは分離）
-    acp_model: string | null;
-    acp_reasoning_effort: AcpReasoningEffort | null;
-    // KonomiTV-BS4K 固有の Codex Fast service tier 設定
-    konomitv_bs4k_acp_codex_fast_mode_enabled: boolean;
-    acp_timeout_sec: number;
 }
 
 /** 録画シリーズ判定設定の更新リクエスト。 */
@@ -44,58 +30,6 @@ export interface IRecordedSeriesSettingsUpdate {
     ai_episode_number_acceptance_mode: RecordedEpisodeNumberAcceptanceMode;
     ai_backend: AIBackendKind;
     ai_backend_service_id: string | null;
-    acp_model: string | null;
-    acp_reasoning_effort: AcpReasoningEffort | null;
-    konomitv_bs4k_acp_codex_fast_mode_enabled: boolean;
-    acp_timeout_sec: number;
-}
-
-/** 全ユーザーの録画シリーズ処理で共有する、内容非公開の ACP 資格情報状態。 */
-export interface IKonomiTVBS4KACPCredentialStatus {
-    acp_operation_running: boolean;
-    codex_host_auth_available: boolean;
-    codex_auth_imported: boolean;
-    codex_auth_imported_at: string | null;
-    codex_auth_in_use: boolean;
-    grok_host_auth_available: boolean;
-    grok_auth_imported: boolean;
-    grok_auth_imported_at: string | null;
-    grok_auth_in_use: boolean;
-    google_adc_available: boolean;
-}
-
-/** 保存前の AI バックエンド設定を使う接続テストリクエスト。 */
-export interface IRecordedSeriesConnectionTestRequest extends IRecordedSeriesSettingsUpdate {
-    capability: RecordedSeriesConnectionTestCapability;
-}
-
-export type RecordedSeriesConnectionTestCheckStatus = 'Passed' | 'Failed' | 'NotRun' | 'NotApplicable';
-
-/** 接続試験の1能力について、実測できた状態と安全な説明。 */
-export interface IRecordedSeriesConnectionTestCheck {
-    status: RecordedSeriesConnectionTestCheckStatus;
-    message: string;
-}
-
-/** EpisodeLookup 接続試験で個別表示する固定6項目。 */
-export interface IRecordedSeriesEpisodeLookupConnectionChecks {
-    backend_connection: IRecordedSeriesConnectionTestCheck;
-    web_search: IRecordedSeriesConnectionTestCheck;
-    source_url: IRecordedSeriesConnectionTestCheck;
-    strict_schema: IRecordedSeriesConnectionTestCheck;
-    timeout_cancel: IRecordedSeriesConnectionTestCheck;
-    permission_policy: IRecordedSeriesConnectionTestCheck;
-}
-
-export type RecordedSeriesEpisodeLookupConnectionCheckName = keyof IRecordedSeriesEpisodeLookupConnectionChecks;
-
-/** AI バックエンドの接続テスト結果。 */
-export interface IRecordedSeriesConnectionTestResult {
-    success: boolean;
-    latency_ms: number;
-    model: string;
-    message: string;
-    checks: IRecordedSeriesEpisodeLookupConnectionChecks | null;
 }
 
 /** 録画シリーズ判定の全体状況。 */
@@ -303,73 +237,6 @@ export default class RecordedSeries {
             return false;
         }
         return true;
-    }
-
-    /** 管理者向けに、認証内容を含まない ACP 資格情報状態を取得する。 */
-    static async fetchACPCredentialStatus(): Promise<IKonomiTVBS4KACPCredentialStatus | null> {
-        const response = await APIClient.get<IKonomiTVBS4KACPCredentialStatus>(
-            '/recorded-series/settings/acp-credentials',
-        );
-        if (response.type === 'error') {
-            APIClient.showGenericError(response, 'ACP 認証状態を取得できませんでした。');
-            return null;
-        }
-        return response.data;
-    }
-
-    /** 固定 mount の Codex / Grok auth.json を KonomiTV-BS4K 専用 profile へ取り込む。 */
-    static async importACPAuthentication(
-        provider: KonomiTVBS4KACPImportProvider,
-    ): Promise<IKonomiTVBS4KACPCredentialStatus | null> {
-        const response = await APIClient.post<IKonomiTVBS4KACPCredentialStatus>(
-            `/recorded-series/settings/acp-credentials/${provider}/import`,
-        );
-        if (response.type === 'error') {
-            APIClient.showGenericError(response, 'ACP 認証を取り込めませんでした。ホスト側の認証と Compose 設定を確認してください。');
-            return null;
-        }
-        return response.data;
-    }
-
-    /** KonomiTV-BS4K 専用の Codex / Grok auth.json コピーだけを削除する。 */
-    static async deleteACPAuthentication(
-        provider: KonomiTVBS4KACPImportProvider,
-    ): Promise<IKonomiTVBS4KACPCredentialStatus | null> {
-        const response = await APIClient.delete<IKonomiTVBS4KACPCredentialStatus>(
-            `/recorded-series/settings/acp-credentials/${provider}`,
-        );
-        if (response.type === 'error') {
-            APIClient.showGenericError(response, '取り込んだ ACP 認証を削除できませんでした。');
-            return null;
-        }
-        return response.data;
-    }
-
-    /**
-     * 現在の入力内容を保存せずに AI バックエンドへの接続を確認する。
-     *
-     * OpenCode は AI バックエンド API の connection-test を使う。
-     * ACP はサーバー hard limit + 回収余裕で待つ。
-     */
-    static async testConnection(
-        request: IRecordedSeriesConnectionTestRequest,
-    ): Promise<IRecordedSeriesConnectionTestResult | null> {
-        // ACP / OpenCode ともサーバー側の長時間処理に合わせ、絶対上限 + 回収余裕で待つ。
-        const client_timeout_ms = (
-            ACP_HARD_TIMEOUT_SEC + ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC
-        ) * 1000;
-        const response = await APIClient.post<IRecordedSeriesConnectionTestResult>(
-            '/recorded-series/settings/test',
-            request,
-            {
-                timeout: client_timeout_ms,
-            },
-        );
-        if (response.type === 'error') {
-            APIClient.showGenericError(response, 'AI バックエンドへの接続を確認できませんでした。');
-            return null;
-        }
-        return response.data;
     }
 
     /** 録画シリーズ判定の件数・実行状況を取得する。 */
