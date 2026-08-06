@@ -407,3 +407,269 @@ def test_service_response_never_includes_api_key(ai_paths: Path) -> None:
             assert 'sk-must-not-appear' not in one.text
 
     asyncio.run(Run())
+
+
+def test_provider_list_endpoint_returns_catalog_with_auth_methods(
+    ai_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/ai-backends/providers が OpenCode Web 相当のカタログを返す。"""
+
+    _ = ai_paths
+
+    async def FakeListAllProviders(_self: object) -> dict[str, Any]:
+        return {
+            'all': [
+                {
+                    'id': 'openai',
+                    'name': 'OpenAI',
+                    'env': ['OPENAI_API_KEY'],
+                    'models': {
+                        'gpt-5.6': {
+                            'name': 'GPT-5.6',
+                            'default': True,
+                        },
+                    },
+                },
+                {
+                    'id': 'deepseek',
+                    'name': 'DeepSeek',
+                    'env': ['DEEPSEEK_API_KEY'],
+                    'models': {
+                        'deepseek-chat': {
+                            'name': 'DeepSeek Chat',
+                            'capabilities': {'WebSearch': True},
+                            'default': True,
+                        },
+                        'deepseek-v4-pro': {
+                            'name': 'DeepSeek V4 Pro',
+                        },
+                    },
+                },
+                {
+                    'id': 'google-vertex',
+                    'name': 'Vertex',
+                    'env': [
+                        'GOOGLE_VERTEX_PROJECT',
+                        'GOOGLE_VERTEX_LOCATION',
+                        'GOOGLE_APPLICATION_CREDENTIALS',
+                    ],
+                    'models': {},
+                },
+                {
+                    'id': 'azure',
+                    'name': 'Azure',
+                    'env': ['AZURE_RESOURCE_NAME', 'AZURE_API_KEY'],
+                    'models': {},
+                },
+                {
+                    'id': 12345,  # 不正エントリはスキップする
+                    'models': {},
+                },
+            ],
+            'connected': ['deepseek', 'google-vertex'],
+        }
+
+    async def FakeListProviderAuthMethods(_self: object) -> dict[str, list[dict[str, Any]]]:
+        return {
+            'openai': [
+                {'type': 'oauth', 'label': 'ChatGPT Pro/Plus (browser)'},
+                {'type': 'oauth', 'label': 'ChatGPT Pro/Plus (headless)'},
+                {'type': 'api', 'label': 'Manually enter API Key'},
+            ],
+            'azure': [
+                {
+                    'type': 'api',
+                    'label': 'API key',
+                    'prompts': [
+                        {'type': 'text', 'key': 'resourceName', 'message': 'Enter Azure Resource Name'},
+                    ],
+                },
+            ],
+        }
+
+    monkeypatch.setattr(
+        AIBackendRouter.OpenCodeClient,
+        'listAllProviders',
+        FakeListAllProviders,
+    )
+    monkeypatch.setattr(
+        AIBackendRouter.OpenCodeClient,
+        'listProviderAuthMethods',
+        FakeListProviderAuthMethods,
+    )
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.get('/api/ai-backends/providers')
+            assert response.status_code == 200
+            payload = response.json()
+            providers = payload['providers']
+            # 不正エントリ除外で 4 件
+            assert len(providers) == 4
+
+            openai = next(p for p in providers if p['provider_id'] == 'openai')
+            assert openai['provider_name'] == 'OpenAI'
+            assert openai['connected'] is False
+            assert openai['support_kind'] == 'Supported'
+            # OpenCode Web と同じく OAuth ×2 + API Key
+            assert len(openai['auth_methods']) == 3
+            assert openai['auth_methods'][0]['type'] == 'oauth'
+            assert openai['auth_methods'][0]['label'] == 'ChatGPT Pro/Plus (browser)'
+            assert openai['auth_methods'][0]['auth_mode'] == 'OAuthSubscription'
+            assert openai['auth_methods'][0]['method_index'] == 0
+            assert openai['auth_methods'][2]['type'] == 'api'
+            assert openai['auth_methods'][2]['auth_mode'] == 'ApiKey'
+            assert openai['default_model_id'] == 'gpt-5.6'
+
+            deepseek = next(p for p in providers if p['provider_id'] == 'deepseek')
+            assert deepseek['connected'] is True
+            assert deepseek['support_kind'] == 'Supported'
+            # /provider/auth に無い → ベストエフォート API キー
+            assert len(deepseek['auth_methods']) == 1
+            assert deepseek['auth_methods'][0]['type'] == 'api'
+            chat = next(m for m in deepseek['models'] if m['model_id'] == 'deepseek-chat')
+            assert chat['model_name'] == 'DeepSeek Chat'
+            assert chat['capabilities'].get('WebSearch') is True
+
+            vertex = next(p for p in providers if p['provider_id'] == 'google-vertex')
+            assert vertex['support_kind'] == 'Supported'
+            assert len(vertex['auth_methods']) == 1
+            assert vertex['auth_methods'][0]['type'] == 'vertex_adc'
+            assert vertex['auth_methods'][0]['auth_mode'] == 'VertexAdc'
+
+            azure = next(p for p in providers if p['provider_id'] == 'azure')
+            assert azure['support_kind'] == 'UnsupportedComplex'
+            assert azure['auth_methods'] == []
+            assert response.headers.get('cache-control') == 'no-store'
+
+    asyncio.run(Run())
+
+
+def test_oauth_start_passes_method_and_returns_url(
+    ai_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST oauth/start が method を OpenCode に渡し URL を返す。"""
+
+    _ = ai_paths
+    service = AIBackendSettingsStore.createService(AIBackendServiceCreate(
+        service_name='OpenAI OAuth',
+        opencode_provider_id='openai',
+        opencode_model_id='gpt-5.6',
+        auth_mode='OAuthSubscription',
+        billing_mode='Subscription',
+    ))
+
+    async def FakeStart(
+        _self: object,
+        provider_id: str,
+        *,
+        method: int = 0,
+        inputs: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        assert provider_id == 'openai'
+        assert method == 1
+        assert inputs is None
+        return {
+            'url': 'https://auth.openai.com/codex/device',
+            'method': 'auto',
+            'instructions': 'Enter code: ABCD-1234',
+        }
+
+    monkeypatch.setattr(AIBackendRouter.OpenCodeClient, 'startOAuthAuthorize', FakeStart)
+    monkeypatch.setattr(AIBackendRouter, 'IsOpenCodeAvailable', lambda: True)
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.post(
+                f'/api/ai-backends/{service.service_id}/oauth/start',
+                json={'method': 1},
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body['provider_id'] == 'openai'
+            assert body['method'] == 1
+            assert body['url'] == 'https://auth.openai.com/codex/device'
+            assert body['authorization_method'] == 'auto'
+            assert 'ABCD-1234' in (body['instructions'] or '')
+
+    asyncio.run(Run())
+
+
+def test_oauth_callback_sets_connected(
+    ai_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST oauth/callback 成功で oauth_connected が立つ。"""
+
+    _ = ai_paths
+    service = AIBackendSettingsStore.createService(AIBackendServiceCreate(
+        service_name='OpenAI OAuth',
+        opencode_provider_id='openai',
+        opencode_model_id='gpt-5.6',
+        auth_mode='OAuthSubscription',
+        billing_mode='Subscription',
+    ))
+    assert service.oauth_connected is False
+
+    async def FakeCallback(
+        _self: object,
+        provider_id: str,
+        *,
+        method: int = 0,
+        code: str | None = None,
+    ) -> bool:
+        assert provider_id == 'openai'
+        assert method == 1
+        assert code == 'ABCD-1234'
+        return True
+
+    monkeypatch.setattr(AIBackendRouter.OpenCodeClient, 'completeOAuthCallback', FakeCallback)
+    monkeypatch.setattr(AIBackendRouter, 'IsOpenCodeAvailable', lambda: True)
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.post(
+                f'/api/ai-backends/{service.service_id}/oauth/callback',
+                json={'method': 1, 'code': 'ABCD-1234'},
+            )
+            assert response.status_code == 204
+
+    asyncio.run(Run())
+    updated = AIBackendSettingsStore.getService(service.service_id)
+    assert updated is not None
+    assert updated.oauth_connected is True
+
+
+def test_provider_list_returns_503_when_opencode_unavailable(
+    ai_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """serve が unavailable のとき providers は 503。"""
+
+    _ = ai_paths
+    monkeypatch.setattr(AIBackendRouter, 'IsOpenCodeAvailable', lambda: False)
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.get('/api/ai-backends/providers')
+            assert response.status_code == 503
+
+    asyncio.run(Run())

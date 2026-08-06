@@ -426,6 +426,43 @@ def test_extract_web_tool_evidence_without_tools() -> None:
     assert evidence['citations'] == []
 
 
+def test_merge_web_tool_evidence_prefers_completed_over_failed() -> None:
+    """failed → completed の順でも合算後は performed=True と citation を残す。"""
+
+    from app.metadata.ai.opencode_backend import _MergeOpenCodeWebToolEvidence
+
+    failed = ExtractOpenCodeWebToolEvidence({
+        'parts': [
+            {
+                'type': 'tool',
+                'tool': 'websearch',
+                'state': {'status': 'error', 'output': 'timeout'},
+            },
+        ],
+    })
+    completed = ExtractOpenCodeWebToolEvidence({
+        'parts': [
+            {
+                'type': 'tool',
+                'tool': 'websearch',
+                'state': {
+                    'status': 'completed',
+                    'output': 'Title: ok\nURL: https://example.com/ok\n',
+                },
+            },
+        ],
+    })
+    merged = _MergeOpenCodeWebToolEvidence([failed, completed])
+    assert merged['web_search_performed'] is True
+    assert merged['web_search_failed'] is False
+    assert merged['completed_web_calls'] == 1
+    assert merged['failed_web_calls'] == 1
+    assert any(
+        item['url'] == 'https://example.com/ok'
+        for item in merged['citations']
+    )
+
+
 def test_extract_web_tool_evidence_exa_text_output() -> None:
     """Exa のテキスト形式出力（URL: https://...）から public URL を抽出する。"""
 

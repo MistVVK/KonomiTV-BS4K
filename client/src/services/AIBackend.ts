@@ -8,6 +8,8 @@ import APIClient from '@/services/APIClient';
 export type AIAuthMode = 'ApiKey' | 'OAuthSubscription' | 'VertexAdc' | 'NoneLocal';
 export type AIBillingMode = 'Metered' | 'Subscription' | 'Local';
 export type AIBackendConnectionCapability = 'CandidateSelection' | 'EpisodeLookup';
+export type AIProviderSupportKind = 'Supported' | 'UnsupportedComplex';
+export type AIProviderAuthMethodType = 'api' | 'oauth' | 'vertex_adc';
 
 /** OpenCode serve の availability。 */
 export interface IOpenCodeAvailability {
@@ -107,6 +109,47 @@ export interface IAIBackendUsage {
     service_deleted: boolean;
 }
 
+/** service 追加 UI 用の provider モデル 1 件。 */
+export interface IAIBackendProviderModel {
+    model_id: string;
+    model_name: string;
+    capabilities: Record<string, unknown>;
+}
+
+/**
+ * OpenCode Web 相当の認証方式 1 件。
+ * provider 選択後に「API Key / OAuth (browser) / …」として並べる。
+ */
+export interface IAIBackendProviderAuthMethod {
+    method_index: number | null;
+    type: AIProviderAuthMethodType;
+    label: string;
+    auth_mode: Exclude<AIAuthMode, 'NoneLocal'>;
+    billing_mode_default: 'Metered' | 'Subscription';
+}
+
+/** service 追加 UI 用の provider 1 件（全カタログ）。 */
+export interface IAIBackendProvider {
+    provider_id: string;
+    provider_name: string;
+    connected: boolean;
+    support_kind: AIProviderSupportKind;
+    support_note: string | null;
+    auth_methods: IAIBackendProviderAuthMethod[];
+    models: IAIBackendProviderModel[];
+    default_model_id: string | null;
+}
+
+/** OAuth 開始応答（browser で URL を開く）。 */
+export interface IAIBackendOAuthStartResult {
+    provider_id: string;
+    method: number;
+    url: string | null;
+    authorization_method: 'auto' | 'code' | null;
+    instructions: string | null;
+    authorize: Record<string, unknown>;
+}
+
 
 export default class AIBackend {
 
@@ -118,6 +161,19 @@ export default class AIBackend {
             return null;
         }
         return response.data;
+    }
+
+    /**
+     * provider カタログ（OpenCode Web 相当）を取得する。
+     * 未接続を含み、各 provider の認証方式一覧を返す。
+     */
+    static async fetchProviders(): Promise<IAIBackendProvider[] | null> {
+        const response = await APIClient.get<{providers: IAIBackendProvider[]}>('/ai-backends/providers');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenCode の provider 一覧を取得できませんでした。');
+            return null;
+        }
+        return response.data.providers;
     }
 
     /** service 一覧を取得する。 */
@@ -187,20 +243,48 @@ export default class AIBackend {
         return true;
     }
 
-    /** OAuth 開始（仮）。 */
-    static async startOAuth(service_id: string): Promise<Record<string, unknown> | null> {
-        const response = await APIClient.post<{provider_id: string; authorize: Record<string, unknown>;}>(
+    /**
+     * OAuth を開始する。返却 URL を browser で開くこと。
+     * method は provider.auth_methods[].method_index。
+     */
+    static async startOAuth(
+        service_id: string,
+        method: number = 0,
+    ): Promise<IAIBackendOAuthStartResult | null> {
+        const response = await APIClient.post<IAIBackendOAuthStartResult>(
             `/ai-backends/${service_id}/oauth/start`,
-            {},
+            {method},
         );
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'OAuth を開始できませんでした。');
             return null;
         }
-        return response.data.authorize;
+        return response.data;
     }
 
-    /** OAuth 切断（仮）。 */
+    /**
+     * OAuth callback を完了する。
+     * browser (auto) は code 無し、headless/device は code を渡す。
+     */
+    static async completeOAuth(
+        service_id: string,
+        method: number = 0,
+        code: string | null = null,
+    ): Promise<boolean> {
+        const response = await APIClient.post(
+            `/ai-backends/${service_id}/oauth/callback`,
+            {method, code},
+            // callback は provider 側との往復で時間がかかることがある
+            {timeout: 120 * 1000},
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OAuth の完了処理に失敗しました。');
+            return false;
+        }
+        return true;
+    }
+
+    /** OAuth を切断する。 */
     static async disconnectOAuth(service_id: string): Promise<boolean> {
         const response = await APIClient.post(`/ai-backends/${service_id}/oauth/disconnect`, {});
         if (response.type === 'error') {

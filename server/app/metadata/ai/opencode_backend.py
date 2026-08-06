@@ -286,6 +286,55 @@ def _EpisodeLookupFailureResult(
     )
 
 
+def _MergeOpenCodeWebToolEvidence(
+    evidences: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """複数 message の web tool evidence を合算する。
+
+    Args:
+        evidences: ExtractOpenCodeWebToolEvidence の結果リスト。
+
+    Returns:
+        completed/failed を加算し、citations を URL 一意でマージした dict。
+        web_search_performed / web_search_failed は合算後に再計算する。
+    """
+
+    completed = 0
+    failed = 0
+    citations: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for evidence in evidences:
+        completed += int(evidence.get('completed_web_calls') or 0)
+        failed += int(evidence.get('failed_web_calls') or 0)
+        raw_items = evidence.get('citations')
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            url = item.get('url')
+            if not isinstance(url, str) or url.strip() == '':
+                continue
+            normalized = url.strip()
+            if normalized in seen_urls:
+                continue
+            seen_urls.add(normalized)
+            title = item.get('title')
+            citations.append({
+                'url': normalized,
+                'title': title.strip() if isinstance(title, str) and title.strip() else normalized,
+            })
+    web_search_performed = completed > 0
+    web_search_failed = web_search_performed is False and failed > 0
+    return {
+        'web_search_performed': web_search_performed,
+        'web_search_failed': web_search_failed,
+        'citations': citations,
+        'completed_web_calls': completed,
+        'failed_web_calls': failed,
+    }
+
+
 def _CitationsFromEvidence(evidence: dict[str, Any]) -> tuple[EpisodeLookupCitation, ...]:
     """ExtractOpenCodeWebToolEvidence の citations を型付きへ変換する。"""
 
@@ -1030,7 +1079,8 @@ class OpenCodeBackend:
                             structured = extracted
                             break
             # POST /message の応答は最終メッセージのみで web ツール part が欠落する。
-            # session の全メッセージを取得して tool telemetry の証明を抽出する。
+            # session の全メッセージを取得し、evidence を合算する
+            # （失敗→再試行成功で first-match が誤判定するのを防ぐ）。
             evidence = ExtractOpenCodeWebToolEvidence(message)
             try:
                 all_messages = await self._client.listMessages(session_id)
@@ -1040,14 +1090,9 @@ class OpenCodeBackend:
                 )
                 all_messages = []
             if all_messages:
-                for historical in all_messages:
-                    historical_evidence = ExtractOpenCodeWebToolEvidence(historical)
-                    if (
-                        int(historical_evidence.get('completed_web_calls') or 0) > 0
-                        or int(historical_evidence.get('failed_web_calls') or 0) > 0
-                    ):
-                        evidence = historical_evidence
-                        break
+                evidence = _MergeOpenCodeWebToolEvidence(
+                    [ExtractOpenCodeWebToolEvidence(item) for item in all_messages],
+                )
             completed_web_calls = int(evidence.get('completed_web_calls') or 0)
             latency_ms = int((time.monotonic() - started) * 1000)
             result = _ValidatedOpenCodeEpisodeLookupResult(

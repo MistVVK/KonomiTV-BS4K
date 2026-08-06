@@ -6,6 +6,7 @@ auth / health に加え、Phase 2 の session create → prompt → abort → de
 
 from __future__ import annotations
 
+import hashlib
 import json
 import unicodedata
 from typing import Any
@@ -136,10 +137,15 @@ class OpenCodeClient:
                 f'OpenCode instance dispose request failed: {error}',
             ) from error
 
+    # provider_id → 最後に注入した API キーの SHA-256（キー本体は保持しない）。
+    # 同一キーの再注入では dispose を避け、進行中 session を壊さない。
+    _injected_api_key_fingerprints: dict[str, str] = {}
+
     async def putApiKey(self, provider_id: str, api_key: str) -> None:
         """PUT /auth/{providerID} で API キーを注入する。
 
         注入後に instance dispose し、provider connected を auth.json と整合させる。
+        直前と同じキー指紋なら PUT/dispose をスキップする（並行実行の破壊を抑える）。
 
         Args:
             provider_id: OpenCode provider ID（例: deepseek）。
@@ -159,6 +165,10 @@ class OpenCodeClient:
             raise ValueError('provider_id is empty.')
         if normalized_key == '':
             raise ValueError('api_key is empty.')
+        key_fingerprint = hashlib.sha256(normalized_key.encode('utf-8')).hexdigest()
+        if OpenCodeClient._injected_api_key_fingerprints.get(normalized_provider) == key_fingerprint:
+            # 同一キーが既に注入済みなら dispose しない。
+            return
         self._requireAvailable()
         body: OpenCodeApiAuth = {'type': 'api', 'key': normalized_key}
         path = f'/auth/{quote(normalized_provider, safe="")}'
@@ -178,6 +188,7 @@ class OpenCodeClient:
             raise OpenCodeClientError(f'OpenCode auth set request failed: {error}') from error
         # auth.json は書けても in-memory provider が古いまま残るため dispose する。
         await self.disposeInstance()
+        OpenCodeClient._injected_api_key_fingerprints[normalized_provider] = key_fingerprint
 
     async def deleteAuth(self, provider_id: str) -> None:
         """DELETE /auth/{providerID} で資格情報を除去する。
@@ -223,43 +234,7 @@ class OpenCodeClient:
         if deleted:
             # auth ファイル削除後も connected が残るため dispose で揃える。
             await self.disposeInstance()
-
-    async def startOAuthAuthorize(self, provider_id: str) -> dict[str, Any]:
-        """POST /provider/{id}/oauth/authorize（仮実装・Phase 7b）。
-
-        Args:
-            provider_id: OpenCode provider ID。
-
-        Returns:
-            OpenCode が返す authorize 応答（URL 等）。秘密は呼び出し側で扱わない。
-
-        Raises:
-            OpenCodeClientError: 失敗。
-        """
-
-        normalized_provider = provider_id.strip()
-        if normalized_provider == '':
-            raise ValueError('provider_id is empty.')
-        self._requireAvailable()
-        path = f'/provider/{quote(normalized_provider, safe="")}/oauth/authorize'
-        try:
-            async with httpx.AsyncClient(
-                base_url=self._base_url,
-                timeout=self._timeout_sec,
-            ) as client:
-                response = await client.post(path, json={})
-                response.raise_for_status()
-                payload = response.json()
-        except httpx.HTTPStatusError as error:
-            raise OpenCodeClientError(
-                f'OpenCode OAuth authorize failed with HTTP {error.response.status_code}.',
-                status_code=error.response.status_code,
-            ) from error
-        except httpx.HTTPError as error:
-            raise OpenCodeClientError(f'OpenCode OAuth authorize request failed: {error}') from error
-        if isinstance(payload, dict) is False:
-            raise OpenCodeClientError('OpenCode OAuth authorize payload is invalid.')
-        return payload
+            OpenCodeClient._injected_api_key_fingerprints.pop(normalized_provider, None)
 
     async def createSession(self) -> str:
         """POST /session で新規 session を作成する。
@@ -366,6 +341,233 @@ class OpenCodeClient:
         if isinstance(payload, list) is False:
             raise OpenCodeClientError('OpenCode message list payload is invalid.')
         return [message for message in payload if isinstance(message, dict)]
+
+    async def listProviders(self) -> list[dict[str, Any]]:
+        """GET /config/providers で接続済み provider 一覧を取得する。
+
+        認証設定済み（auth 注入済み）provider と、そのモデル一覧を返す。
+        未接続 provider は含まれない。
+
+        Returns:
+            provider のリスト。各要素は {id, models: {model_id: ModelInfo}, ...}。
+
+        Raises:
+            OpenCodeClientError: 通信または HTTP 失敗。
+        """
+
+        self._requireAvailable()
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=self._timeout_sec,
+            ) as client:
+                response = await client.get('/config/providers')
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPStatusError as error:
+            raise OpenCodeClientError(
+                f'OpenCode provider list failed with HTTP {error.response.status_code}.',
+                status_code=error.response.status_code,
+            ) from error
+        except httpx.HTTPError as error:
+            raise OpenCodeClientError(f'OpenCode provider list request failed: {error}') from error
+        if isinstance(payload, dict) is False:
+            raise OpenCodeClientError('OpenCode provider list payload is invalid.')
+        providers = payload.get('providers')
+        if isinstance(providers, list) is False:
+            raise OpenCodeClientError('OpenCode provider list payload missing providers.')
+        return [provider for provider in providers if isinstance(provider, dict)]
+
+    async def listAllProviders(self) -> dict[str, Any]:
+        """GET /provider で全 provider カタログと connected を取得する。
+
+        OpenCode Web の provider 選択 UI と同様に、未接続を含む全カタログを返す。
+        models.dev 相当の一覧（約 180 件）と、現在 auth 済みの ID 配列を含む。
+
+        Returns:
+            {'all': [provider...], 'connected': [provider_id...], 'default': ...}。
+
+        Raises:
+            OpenCodeClientError: 通信または HTTP 失敗。
+        """
+
+        self._requireAvailable()
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=self._timeout_sec,
+            ) as client:
+                response = await client.get('/provider')
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPStatusError as error:
+            raise OpenCodeClientError(
+                f'OpenCode provider catalog failed with HTTP {error.response.status_code}.',
+                status_code=error.response.status_code,
+            ) from error
+        except httpx.HTTPError as error:
+            raise OpenCodeClientError(
+                f'OpenCode provider catalog request failed: {error}',
+            ) from error
+        if isinstance(payload, dict) is False:
+            raise OpenCodeClientError('OpenCode provider catalog payload is invalid.')
+        return payload
+
+    async def listProviderAuthMethods(self) -> dict[str, list[dict[str, Any]]]:
+        """GET /provider/auth で provider ごとの認証 method 一覧を取得する。
+
+        OpenCode Web と同じく、例: openai → OAuth (browser) / OAuth (headless) / API Key。
+        prompts 付きの面倒な method も生のまま返す（呼び出し側でフィルタする）。
+
+        Returns:
+            provider_id → method 配列。各 method は {type, label, prompts?}。
+
+        Raises:
+            OpenCodeClientError: 通信または HTTP 失敗。
+        """
+
+        self._requireAvailable()
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=self._timeout_sec,
+            ) as client:
+                response = await client.get('/provider/auth')
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPStatusError as error:
+            raise OpenCodeClientError(
+                f'OpenCode provider auth methods failed with HTTP {error.response.status_code}.',
+                status_code=error.response.status_code,
+            ) from error
+        except httpx.HTTPError as error:
+            raise OpenCodeClientError(
+                f'OpenCode provider auth methods request failed: {error}',
+            ) from error
+        if isinstance(payload, dict) is False:
+            raise OpenCodeClientError('OpenCode provider auth methods payload is invalid.')
+        result: dict[str, list[dict[str, Any]]] = {}
+        for provider_id, methods in payload.items():
+            if isinstance(provider_id, str) is False or provider_id.strip() == '':
+                continue
+            if isinstance(methods, list) is False:
+                continue
+            cleaned: list[dict[str, Any]] = [
+                method for method in methods if isinstance(method, dict)
+            ]
+            if cleaned:
+                result[provider_id.strip()] = cleaned
+        return result
+
+    async def startOAuthAuthorize(
+        self,
+        provider_id: str,
+        *,
+        method: int = 0,
+        inputs: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """POST /provider/{id}/oauth/authorize で OAuth を開始する。
+
+        Args:
+            provider_id: OpenCode provider ID。
+            method: GET /provider/auth が返す method 配列の 0 始まり index。
+            inputs: method が要求する追加入力（通常は使わない。prompts 付きは非対応）。
+
+        Returns:
+            {url, method: 'auto'|'code', instructions}。秘密は含めない。
+
+        Raises:
+            OpenCodeClientError: 失敗。
+            ValueError: provider_id が空、method が負。
+        """
+
+        normalized_provider = provider_id.strip()
+        if normalized_provider == '':
+            raise ValueError('provider_id is empty.')
+        if method < 0:
+            raise ValueError('method must be >= 0.')
+        self._requireAvailable()
+        path = f'/provider/{quote(normalized_provider, safe="")}/oauth/authorize'
+        body: dict[str, Any] = {'method': int(method)}
+        if inputs:
+            # OpenCode が受け付ける追加 inputs（現状 UI では prompts 付き method を出さない）。
+            body['inputs'] = inputs
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=self._timeout_sec,
+            ) as client:
+                response = await client.post(path, json=body)
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPStatusError as error:
+            raise OpenCodeClientError(
+                f'OpenCode OAuth authorize failed with HTTP {error.response.status_code}.',
+                status_code=error.response.status_code,
+            ) from error
+        except httpx.HTTPError as error:
+            raise OpenCodeClientError(
+                f'OpenCode OAuth authorize request failed: {error}',
+            ) from error
+        if isinstance(payload, dict) is False:
+            raise OpenCodeClientError('OpenCode OAuth authorize payload is invalid.')
+        return payload
+
+    async def completeOAuthCallback(
+        self,
+        provider_id: str,
+        *,
+        method: int = 0,
+        code: str | None = None,
+    ) -> bool:
+        """POST /provider/{id}/oauth/callback で OAuth を完了する。
+
+        browser (auto) では code 無し、headless/device では code が必要。
+        成功後に instance dispose し、connected を auth.json と整合させる。
+
+        Args:
+            provider_id: OpenCode provider ID。
+            method: authorize 時と同じ method index。
+            code: 認可コード / device code（不要なら None）。
+
+        Returns:
+            OpenCode が true を返したら True。
+
+        Raises:
+            OpenCodeClientError: 失敗。
+            ValueError: provider_id が空、method が負。
+        """
+
+        normalized_provider = provider_id.strip()
+        if normalized_provider == '':
+            raise ValueError('provider_id is empty.')
+        if method < 0:
+            raise ValueError('method must be >= 0.')
+        self._requireAvailable()
+        path = f'/provider/{quote(normalized_provider, safe="")}/oauth/callback'
+        body: dict[str, Any] = {'method': int(method)}
+        if code is not None and code.strip() != '':
+            body['code'] = code.strip()
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=max(self._timeout_sec, 60.0),
+            ) as client:
+                response = await client.post(path, json=body)
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPStatusError as error:
+            raise OpenCodeClientError(
+                f'OpenCode OAuth callback failed with HTTP {error.response.status_code}.',
+                status_code=error.response.status_code,
+            ) from error
+        except httpx.HTTPError as error:
+            raise OpenCodeClientError(
+                f'OpenCode OAuth callback request failed: {error}',
+            ) from error
+        # 成功後は in-memory connected を auth.json に揃える。
+        await self.disposeInstance()
+        return payload is True
 
     async def abortSession(self, session_id: str) -> None:
         """POST /session/{id}/abort。
