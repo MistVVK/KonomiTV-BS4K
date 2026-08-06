@@ -234,11 +234,23 @@ def get_episode_lookup_provider_fingerprint(
     """接続試験と実行前検証で共有する、安全な能力証明キーを返す。"""
 
     if settings.ai_backend == 'OpenCode':
-        # OpenCode は service_id を fingerprint の核にする（Phase 4 で精緻化）。
+        # OpenCode は service 定義（provider/model/auth）が変わると旧 proof を失効させる。
+        from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
+
+        service = None
+        if settings.ai_backend_service_id is not None:
+            service = AIBackendSettingsStore.getService(settings.ai_backend_service_id)
         endpoint_identifier = json.dumps(
             {
                 'backend': 'OpenCode',
                 'service_id': settings.ai_backend_service_id,
+                'provider_id': (
+                    service.opencode_provider_id if service is not None else None
+                ),
+                'model_id': (
+                    service.opencode_model_id if service is not None else None
+                ),
+                'auth_mode': service.auth_mode if service is not None else None,
             },
             ensure_ascii=False,
             sort_keys=True,

@@ -84,6 +84,9 @@ class OpenCodePromptRequest(TypedDict):
     format: NotRequired[OpenCodeJsonSchemaFormat]
     system: NotRequired[str]
     noReply: NotRequired[bool]
+    # ツールの有効/無効（例: {'websearch': True}）。デフォルトのツールセットに
+    # websearch は含まれないため、web 検索を使う agent では明示指定が必要。
+    tools: NotRequired[dict[str, bool]]
 
 
 class OpenCodeNormalizedUsage(TypedDict):

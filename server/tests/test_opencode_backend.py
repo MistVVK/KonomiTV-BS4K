@@ -4,20 +4,29 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
-from typing import Any, cast
+from typing import Any
 from uuid import uuid4
 
 import pytest
 
 from app.metadata.ai.AIAPIUsageLedger import AIAPIUsageLedger, AIAPIUsageReservation
 from app.metadata.ai.AIBackendSettings import AIBackendService
-from app.metadata.ai.backends import UnsupportedOperationError
+from app.metadata.ai.episode_lookup import EpisodeLookupResult
 from app.metadata.ai.opencode_backend import OpenCodeBackend
 from app.metadata.ai.opencode_client import (
+    ExtractOpenCodeJSONObjectFromText,
     ExtractOpenCodeStructuredOutput,
     ExtractOpenCodeUsage,
+    ExtractOpenCodeWebToolEvidence,
 )
-from app.metadata.RecordedEpisodeContext import RecordedEpisodeLookupContext
+from app.metadata.RecordedEpisodeContext import (
+    RECORDED_EPISODE_CONTEXT_VERSION,
+    RecordedEpisodeContextFile,
+    RecordedEpisodeContextLocalParse,
+    RecordedEpisodeContextProgram,
+    RecordedEpisodeContextSeries,
+    RecordedEpisodeLookupContext,
+)
 from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesAIError,
     RecordedSeriesProgramPrompt,
@@ -314,9 +323,516 @@ def test_connection_test_candidate_selection(monkeypatch: pytest.MonkeyPatch) ->
     assert result.prompt_tokens == 10
 
 
-def test_lookup_episode_unsupported() -> None:
-    """EpisodeLookup は Phase 4 まで Unsupported。"""
+def _lookup_context() -> RecordedEpisodeLookupContext:
+    return RecordedEpisodeLookupContext(
+        pipeline_version=RECORDED_EPISODE_CONTEXT_VERSION,
+        series=RecordedEpisodeContextSeries(
+            title='Test Series',
+            genres=['Anime'],
+            description='',
+            known_episode_count=0,
+            known_episode_min=None,
+            known_episode_max=None,
+            known_episode_sample=[],
+        ),
+        program=RecordedEpisodeContextProgram(
+            title='Test Episode',
+            subtitle=None,
+            description='desc',
+            detail_items=[],
+            broadcast_datetime='2024-01-01',
+            channel=None,
+            duration_seconds=0.0,
+        ),
+        local_parse=RecordedEpisodeContextLocalParse(
+            legacy_value=None,
+            season_number=None,
+            episode_number=None,
+            unresolved_reason='MissingLegacyValue',
+        ),
+        neighbors=[],
+        file=RecordedEpisodeContextFile(basename=None),
+        constraints=[],
+    )
 
-    backend = OpenCodeBackend(_service(), api_key='sk-test')
-    with pytest.raises(UnsupportedOperationError):
-        asyncio.run(backend.lookupEpisode(cast(RecordedEpisodeLookupContext, {})))
+
+def test_extract_web_tool_evidence_from_completed_websearch() -> None:
+    """完了 websearch から public citation を取り出す。"""
+
+    message = {
+        'parts': [
+            {
+                'type': 'tool',
+                'tool': 'websearch',
+                'state': {
+                    'status': 'completed',
+                    'output': {
+                        'sources': [
+                            {
+                                'url': 'https://example.com/episode/1',
+                                'title': 'Official episode list',
+                            },
+                            {
+                                'url': 'http://127.0.0.1/private',
+                                'title': 'private',
+                            },
+                        ],
+                    },
+                },
+            },
+            {
+                'type': 'tool',
+                'tool': 'StructuredOutput',
+                'state': {
+                    'status': 'completed',
+                    'input': {
+                        'outcome': 'Resolved',
+                        'season_number': 1,
+                        'episode_number': '12',
+                        'confidence': 0.9,
+                        'rationale_short': 'official list',
+                    },
+                },
+            },
+        ],
+    }
+    evidence = ExtractOpenCodeWebToolEvidence(message)
+    assert evidence['web_search_performed'] is True
+    assert evidence['completed_web_calls'] == 1
+    urls = [item['url'] for item in evidence['citations']]
+    assert 'https://example.com/episode/1' in urls
+    assert 'http://127.0.0.1/private' not in urls
+    structured = ExtractOpenCodeStructuredOutput(message)
+    assert structured is not None
+    assert structured['outcome'] == 'Resolved'
+
+
+def test_extract_web_tool_evidence_without_tools() -> None:
+    """tool 無しは web_search_performed=False。"""
+
+    evidence = ExtractOpenCodeWebToolEvidence({
+        'parts': [
+            {
+                'type': 'tool',
+                'tool': 'StructuredOutput',
+                'state': {
+                    'status': 'completed',
+                    'input': {'outcome': 'Resolved'},
+                },
+            },
+        ],
+    })
+    assert evidence['web_search_performed'] is False
+    assert evidence['citations'] == []
+
+
+def test_extract_web_tool_evidence_exa_text_output() -> None:
+    """Exa のテキスト形式出力（URL: https://...）から public URL を抽出する。"""
+
+    message = {
+        'parts': [
+            {
+                'type': 'tool',
+                'tool': 'websearch',
+                'state': {
+                    'status': 'completed',
+                    'input': {'query': 'latest news about OpenAI August 2026'},
+                    'output': (
+                        'Title: OpenAI reportedly slows research\n'
+                        'URL: https://the-decoder.com/openai-reportedly-slows-research/\n'
+                        'Published: 2026-08-06T11:49:26.000Z\n'
+                        'Highlights:\nSome text here\n'
+                        'Another URL: http://127.0.0.1/private\n'
+                    ),
+                    'title': 'Exa Web Search: latest news',
+                    'metadata': {'provider': 'exa', 'truncated': False},
+                },
+            },
+        ],
+    }
+    evidence = ExtractOpenCodeWebToolEvidence(message)
+    assert evidence['web_search_performed'] is True
+    assert evidence['completed_web_calls'] == 1
+    urls = [item['url'] for item in evidence['citations']]
+    assert 'https://the-decoder.com/openai-reportedly-slows-research/' in urls
+    # 非公開ホスト（localhost / ループバック）は抽出しない。
+    assert not any(url.startswith('http://127.0.0.1') for url in urls)
+
+
+def test_extract_json_object_from_text() -> None:
+    """format なし応答の末尾 JSON object を抽出し、平文付きは受理しない。"""
+
+    assert ExtractOpenCodeJSONObjectFromText(
+        '{"outcome":"InsufficientEvidence","season_number":null,'
+        '"episode_number":null,"confidence":0.5,"rationale_short":"test"}',
+    ) == {
+        'outcome': 'InsufficientEvidence',
+        'season_number': None,
+        'episode_number': None,
+        'confidence': 0.5,
+        'rationale_short': 'test',
+    }
+    # 短い平文 prefix は無視して JSON を抽出する。
+    extracted = ExtractOpenCodeJSONObjectFromText(
+        'OK\n{"outcome":"Resolved","season_number":1,"episode_number":"1",'
+        '"confidence":0.9,"rationale_short":"ok"}',
+    )
+    assert extracted is not None
+    assert extracted['outcome'] == 'Resolved'
+    # Markdown や説明文が残るものは受理しない（厳格契約）。
+    assert ExtractOpenCodeJSONObjectFromText(
+        '```json\n{"outcome":"Resolved"}```',
+    ) is None
+    assert ExtractOpenCodeJSONObjectFromText(
+        '{"outcome":"Resolved"}\n説明が続く',
+    ) is None
+    assert ExtractOpenCodeJSONObjectFromText(None) is None
+    assert ExtractOpenCodeJSONObjectFromText('') is None
+
+
+def test_lookup_episode_with_web_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """web tool 完了 + citation + schema で Resolved を返す。"""
+
+    service = _service()
+    backend = OpenCodeBackend(service, api_key='sk-test')
+
+    async def FakeEnsure() -> None:
+        return None
+
+    async def FakeRun(
+        program: RecordedEpisodeLookupContext,
+        *,
+        timeout_sec: float = 120.0,
+    ) -> tuple[EpisodeLookupResult, Any, dict[str, Any]]:
+        _ = (program, timeout_sec)
+        from app.metadata.ai.episode_lookup import EpisodeLookupCitation
+
+        result = EpisodeLookupResult(
+            outcome='Resolved',
+            season_number=1,
+            episode_number=Decimal('12'),
+            confidence=0.91,
+            rationale_short='official source',
+            citations=(EpisodeLookupCitation(
+                url='https://example.com/ep12',
+                title='ep12',
+            ),),
+            web_search_performed=True,
+            model='opencode:deepseek/deepseek-chat',
+            prompt_tokens=10,
+            completion_tokens=5,
+            http_status=200,
+            latency_ms=40,
+            sources=(EpisodeLookupCitation(
+                url='https://example.com/ep12',
+                title='ep12',
+            ),),
+        )
+        return result, None, {
+            'backend_connected': True,
+            'completed_web_calls': 1,
+            'session_cleaned_up': True,
+            'timed_out': False,
+        }
+
+    monkeypatch.setattr(backend, 'ensureAuthInjected', FakeEnsure)
+    monkeypatch.setattr(backend, '_runEpisodeLookupSession', FakeRun)
+    result = asyncio.run(backend.lookupEpisode(_lookup_context()))
+    assert result.outcome == 'Resolved'
+    assert result.web_search_performed is True
+    assert len(result.citations) == 1
+
+
+def test_lookup_episode_local_disabled() -> None:
+    """NoneLocal は既定で EpisodeLookup 非対応。"""
+
+    backend = OpenCodeBackend(
+        _service(
+            auth_mode='NoneLocal',
+            billing_mode='Local',
+            api_base_url='http://127.0.0.1:11434/v1',
+        ),
+        api_key=None,
+    )
+    result = asyncio.run(backend.lookupEpisode(_lookup_context()))
+    assert result.outcome == 'Disabled'
+    assert result.error_code == 'OpenCodeEpisodeLookupLocalDisabled'
+
+
+def test_connection_test_episode_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """EpisodeLookup 接続試験は 4 checks Passed で success。"""
+
+    service = _service()
+    backend = OpenCodeBackend(service, api_key='sk-test')
+
+    async def FakeEnsure() -> None:
+        return None
+
+    async def FakeRun(
+        program: RecordedEpisodeLookupContext,
+        *,
+        timeout_sec: float = 120.0,
+    ) -> tuple[EpisodeLookupResult, Any, dict[str, Any]]:
+        _ = (program, timeout_sec)
+        from app.metadata.ai.episode_lookup import EpisodeLookupCitation
+
+        result = EpisodeLookupResult(
+            outcome='InsufficientEvidence',
+            season_number=None,
+            episode_number=None,
+            confidence=0.4,
+            rationale_short='connection test',
+            citations=(EpisodeLookupCitation(
+                url='https://example.com/docs',
+                title='docs',
+            ),),
+            web_search_performed=True,
+            model='opencode:deepseek/deepseek-chat',
+            prompt_tokens=11,
+            completion_tokens=6,
+            http_status=200,
+            latency_ms=55,
+            sources=(EpisodeLookupCitation(
+                url='https://example.com/docs',
+                title='docs',
+            ),),
+        )
+        return result, None, {
+            'backend_connected': True,
+            'completed_web_calls': 1,
+            'session_cleaned_up': True,
+            'timed_out': False,
+        }
+
+    monkeypatch.setattr(backend, 'ensureAuthInjected', FakeEnsure)
+    monkeypatch.setattr(backend, '_runEpisodeLookupSession', FakeRun)
+    result = asyncio.run(backend.testConnection('EpisodeLookup'))
+    assert result.success is True
+    assert result.checks is not None
+    assert result.checks.backend_connection.status == 'Passed'
+    assert result.checks.web_search.status == 'Passed'
+    assert result.checks.source_url.status == 'Passed'
+    assert result.checks.strict_schema.status == 'Passed'
+    assert result.checks.permission_policy.status == 'NotApplicable'
+
+
+def test_validated_lookup_requires_citations() -> None:
+    """citation 0 件の Resolved は InsufficientEvidence に降格する。"""
+
+    from app.metadata.ai.opencode_backend import _ValidatedOpenCodeEpisodeLookupResult
+
+    result = _ValidatedOpenCodeEpisodeLookupResult(
+        {
+            'outcome': 'Resolved',
+            'season_number': 1,
+            'episode_number': '3',
+            'confidence': 0.95,
+            'rationale_short': 'model only',
+        },
+        evidence={
+            'web_search_performed': True,
+            'web_search_failed': False,
+            'citations': [],
+            'completed_web_calls': 1,
+            'failed_web_calls': 0,
+        },
+        model='opencode:deepseek/deepseek-chat',
+        latency_ms=10,
+        prompt_tokens=1,
+        completion_tokens=1,
+    )
+    assert result.outcome == 'InsufficientEvidence'
+    assert result.season_number is None
+    assert result.web_search_performed is True
+
+
+def test_validated_lookup_without_web_search() -> None:
+    """web tool 無しは SearchNotRun。"""
+
+    from app.metadata.ai.opencode_backend import _ValidatedOpenCodeEpisodeLookupResult
+
+    result = _ValidatedOpenCodeEpisodeLookupResult(
+        {
+            'outcome': 'Resolved',
+            'season_number': 1,
+            'episode_number': '3',
+            'confidence': 0.95,
+            'rationale_short': 'no tools',
+        },
+        evidence={
+            'web_search_performed': False,
+            'web_search_failed': False,
+            'citations': [],
+            'completed_web_calls': 0,
+            'failed_web_calls': 0,
+        },
+        model='opencode:deepseek/deepseek-chat',
+        latency_ms=10,
+        prompt_tokens=1,
+        completion_tokens=1,
+    )
+    assert result.outcome == 'SearchNotRun'
+    assert result.error_code == 'OpenCodeWebSearchNotObserved'
+
+
+def test_run_episode_lookup_session_evidence_from_message_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /message 応答に tool が無くても、GET 一覧から evidence を復元する。
+
+    OpenCode 1.18.13 の POST /session/{id}/message は最終メッセージしか返さず、
+    web ツールの tool part は GET /session/{id}/message の一覧にのみ含まれる。
+    実機で判明したこの挙動に合わせ、一覧を走査して証明を抽出できること。
+    """
+
+    from app.metadata.ai.opencode_backend import (
+        _BuildEpisodeLookupPrompt,
+        _ValidatedOpenCodeEpisodeLookupResult,
+    )
+
+    service = _service()
+    backend = OpenCodeBackend(service, api_key='sk-test')
+
+    final_message = {
+        'info': {
+            'id': 'msg_final',
+            'tokens': {
+                'input': 11,
+                'output': 4,
+                'reasoning': 0,
+                'cache': {'read': 0, 'write': 0},
+                'total': 15,
+            },
+        },
+        'parts': [
+            {'type': 'step-start'},
+            {'type': 'text', 'text': (
+                '{"outcome":"Resolved","season_number":1,"episode_number":"1",'
+                '"confidence":0.9,"rationale_short":"official source"}'
+            )},
+            {'type': 'step-finish'},
+        ],
+    }
+    historical_messages = [
+        {
+            'info': {'id': 'msg_user', 'role': 'user'},
+            'parts': [{'type': 'text', 'text': _BuildEpisodeLookupPrompt(
+                RecordedEpisodeLookupContext(
+                    series=RecordedEpisodeContextSeries(
+                        id=1,
+                        title='Test Series',
+                        normalized_key='testseries',
+                    ),
+                    program=RecordedEpisodeContextProgram(
+                        title='Test Program',
+                        subtitle=None,
+                        description='',
+                        detail_items=[],
+                        broadcast_datetime='2026-08-01T00:00:00',
+                        channel=None,
+                        duration_seconds=0.0,
+                    ),
+                    local_parse=RecordedEpisodeContextLocalParse(
+                        legacy_value=None,
+                        season_number=None,
+                        episode_number=None,
+                        unresolved_reason='MissingLegacyValue',
+                    ),
+                    neighbors=[],
+                    file=RecordedEpisodeContextFile(basename=None),
+                    constraints=[],
+                ),
+            )}],
+        },
+        {
+            'info': {'id': 'msg_tool'},
+            'parts': [
+                {'type': 'step-start'},
+                {
+                    'type': 'tool',
+                    'tool': 'websearch',
+                    'state': {
+                        'status': 'completed',
+                        'input': {'query': 'Test Series episode 1'},
+                        'output': (
+                            'Title: Test Series official page\n'
+                            'URL: https://example.com/testseries\n'
+                        ),
+                        'metadata': {'provider': 'exa'},
+                    },
+                },
+                {'type': 'step-finish'},
+            ],
+        },
+    ]
+
+    async def FakeCreateSession() -> str:
+        return 'ses_test'
+
+    async def FakePromptJsonSchema(_session_id: str, **_kwargs: Any) -> dict[str, Any]:
+        return final_message
+
+    async def FakeListMessages(_session_id: str) -> list[dict[str, Any]]:
+        return historical_messages
+
+    async def FakeDeleteSession(_session_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(backend._client, 'createSession', FakeCreateSession)
+    monkeypatch.setattr(backend._client, 'promptJsonSchema', FakePromptJsonSchema)
+    monkeypatch.setattr(backend._client, 'listMessages', FakeListMessages)
+    monkeypatch.setattr(backend._client, 'deleteSession', FakeDeleteSession)
+
+    result, _usage, trace = asyncio.run(backend._runEpisodeLookupSession(
+        RecordedEpisodeLookupContext(
+            series=RecordedEpisodeContextSeries(
+                id=1,
+                title='Test Series',
+                normalized_key='testseries',
+            ),
+            program=RecordedEpisodeContextProgram(
+                title='Test Program',
+                subtitle=None,
+                description='',
+                detail_items=[],
+                broadcast_datetime='2026-08-01T00:00:00',
+                channel=None,
+                duration_seconds=0.0,
+            ),
+            local_parse=RecordedEpisodeContextLocalParse(
+                legacy_value=None,
+                season_number=None,
+                episode_number=None,
+                unresolved_reason='MissingLegacyValue',
+            ),
+            neighbors=[],
+            file=RecordedEpisodeContextFile(basename=None),
+            constraints=[],
+        ),
+    ))
+    assert trace['completed_web_calls'] == 1
+    assert result.web_search_performed is True
+    assert result.outcome == 'Resolved'
+    assert result.season_number == 1
+    assert result.episode_number == Decimal('1')
+    assert any(
+        citation.url == 'https://example.com/testseries'
+        for citation in result.citations
+    )
+    validated = _ValidatedOpenCodeEpisodeLookupResult(
+        {'outcome': 'Resolved', 'season_number': 1, 'episode_number': '1',
+         'confidence': 0.9, 'rationale_short': 'official source'},
+        evidence={
+            'web_search_performed': True,
+            'web_search_failed': False,
+            'citations': [{'url': 'https://example.com/testseries',
+                           'title': 'Test Series official page'}],
+            'completed_web_calls': 1,
+            'failed_web_calls': 0,
+        },
+        model='opencode:deepseek/deepseek-chat',
+        latency_ms=40,
+        prompt_tokens=11,
+        completion_tokens=4,
+    )
+    assert validated.outcome == 'Resolved'

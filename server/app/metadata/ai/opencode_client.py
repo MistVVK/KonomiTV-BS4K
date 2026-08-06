@@ -6,6 +6,8 @@ auth / health に加え、Phase 2 の session create → prompt → abort → de
 
 from __future__ import annotations
 
+import json
+import unicodedata
 from typing import Any
 from urllib.parse import quote
 
@@ -324,6 +326,47 @@ class OpenCodeClient:
         except httpx.HTTPError as error:
             raise OpenCodeClientError(f'OpenCode session delete request failed: {error}') from error
 
+    async def listMessages(self, session_id: str) -> list[dict[str, Any]]:
+        """GET /session/{id}/message で session の全メッセージを取得する。
+
+        POST /session/{id}/message の応答は「最終メッセージ」しか含まれず、
+        web ツール呼び出しのような途中の part が欠落する。話数検索のように
+        tool telemetry から evidence を抽出する場合は、この一覧を併用する。
+
+        Args:
+            session_id: 対象 session。
+
+        Returns:
+            message のリスト（各要素は {info, parts}）。
+
+        Raises:
+            OpenCodeClientError: 通信または HTTP 失敗。
+        """
+
+        normalized_session = session_id.strip()
+        if normalized_session == '':
+            raise ValueError('session_id is empty.')
+        self._requireAvailable()
+        path = f'/session/{quote(normalized_session, safe="")}/message'
+        try:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=self._timeout_sec,
+            ) as client:
+                response = await client.get(path)
+                response.raise_for_status()
+                payload = response.json()
+        except httpx.HTTPStatusError as error:
+            raise OpenCodeClientError(
+                f'OpenCode message list failed with HTTP {error.response.status_code}.',
+                status_code=error.response.status_code,
+            ) from error
+        except httpx.HTTPError as error:
+            raise OpenCodeClientError(f'OpenCode message list request failed: {error}') from error
+        if isinstance(payload, list) is False:
+            raise OpenCodeClientError('OpenCode message list payload is invalid.')
+        return [message for message in payload if isinstance(message, dict)]
+
     async def abortSession(self, session_id: str) -> None:
         """POST /session/{id}/abort。
 
@@ -367,6 +410,8 @@ class OpenCodeClient:
         schema: dict[str, Any],
         retry_count: int = 1,
         timeout_sec: float = 120.0,
+        tools: dict[str, bool] | None = None,
+        include_format: bool = True,
     ) -> dict[str, Any]:
         """POST /session/{id}/message で json_schema 付き prompt を送る。
 
@@ -376,9 +421,15 @@ class OpenCodeClient:
             provider_id: OpenCode provider ID。
             model_id: OpenCode model ID。
             agent: 製品 agent 名。
-            schema: JSON Schema 本体。
+            schema: JSON Schema 本体（include_format=True 時に送信）。
             retry_count: OpenCode 側の format.retryCount。
             timeout_sec: この prompt 専用の HTTP タイムアウト。
+            tools: ツールの有効/無効指定（例: {'websearch': True}）。websearch は
+                デフォルトのツールセットに含まれないため、web 検索を使う agent で
+                明示的に有効化する必要がある。
+            include_format: json_schema format を送るか。web ツール併用時は
+                StructuredOutput モードでモデルが web ツールを呼ばなくなるため
+                False にして、テキストから JSON を抽出する方式にする。
 
         Returns:
             生の message 応答 dict（info / parts）。
@@ -397,18 +448,24 @@ class OpenCodeClient:
             'providerID': provider_id.strip(),
             'modelID': model_id.strip(),
         }
-        format_body: OpenCodeJsonSchemaFormat = {
-            'type': 'json_schema',
-            'schema': schema,
-            'retryCount': max(0, int(retry_count)),
-        }
         part: OpenCodeTextPartInput = {'type': 'text', 'text': text}
         body: OpenCodePromptRequest = {
             'parts': [part],
             'model': model_ref,
             'agent': agent,
-            'format': format_body,
         }
+        if include_format is False:
+            # format を送らない場合は schema / retry_count は使用しない。
+            pass
+        else:
+            format_body: OpenCodeJsonSchemaFormat = {
+                'type': 'json_schema',
+                'schema': schema,
+                'retryCount': max(0, int(retry_count)),
+            }
+            body['format'] = format_body
+        if tools is not None:
+            body['tools'] = tools
         path = f'/session/{quote(normalized_session, safe="")}/message'
         try:
             async with httpx.AsyncClient(
@@ -433,6 +490,31 @@ class OpenCodeClient:
         if isinstance(payload, dict) is False:
             raise OpenCodeClientError('OpenCode prompt payload is invalid.')
         return payload
+
+
+def _NormalizeOpenCodeToolName(value: object) -> str:
+    """OpenCode tool 名を比較用の英数字へ正規化する。"""
+
+    if not isinstance(value, str):
+        return ''
+    return ''.join(character for character in value.lower() if character.isalnum())
+
+
+def _ParseMaybeJSONObject(value: object) -> dict[str, Any] | None:
+    """dict または JSON オブジェクト文字列を dict へ正規化する。"""
+
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text == '' or text[0] != '{':
+        return None
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def ExtractOpenCodeStructuredOutput(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -460,10 +542,214 @@ def ExtractOpenCodeStructuredOutput(message: dict[str, Any]) -> dict[str, Any] |
         state = part.get('state')
         if isinstance(state, dict) is False:
             continue
-        structured = state.get('input')
-        if isinstance(structured, dict):
+        structured = _ParseMaybeJSONObject(state.get('input'))
+        if structured is not None:
+            return structured
+        # 一部実装は output に JSON を載せる。
+        structured = _ParseMaybeJSONObject(state.get('output'))
+        if structured is not None:
             return structured
     return None
+
+
+def ExtractOpenCodeJSONObjectFromText(text: object) -> dict[str, Any] | None:
+    """テキスト応答の末尾にある単一 JSON object を抽出する。
+
+    json_schema format を送らない agent（web ツール併用）では、モデルが JSON
+    の前後に短い平文を残すことがある。検索済みの安全な prefix を無視して
+    末尾の JSON object を取り出し、それ以降に説明文や Markdown が残る場合は
+    受理しない（ACP の EpisodeLookup 抽出契約に合わせる）。
+
+    Args:
+        text: モデルの text part。
+
+    Returns:
+        抽出できた JSON object。不正な場合は None。
+    """
+
+    if not isinstance(text, str):
+        return None
+    if text.strip() == '':
+        return None
+    stripped = text.strip()
+    try:
+        decoded, object_end = json.JSONDecoder().raw_decode(stripped)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        decoded = None
+        object_end = 0
+    if (
+        isinstance(decoded, dict) and
+        object_end == len(stripped)
+    ):
+        return decoded
+    # 先頭の平文 prefix（最大 512 bytes）をスキップして末尾の JSON object を探す。
+    object_start = text.find('{')
+    if object_start <= 0:
+        return None
+    prefix = text[:object_start]
+    if len(prefix.encode('utf-8')) > 512:
+        return None
+    # Markdown 記法や不可視制御文字を含む prefix は受理しない。
+    for marker in ('```', 'json', 'JSON'):
+        if marker in prefix:
+            return None
+    if any(
+        unicodedata.category(character).startswith('C') and
+        character not in {'\t', '\n', '\r'}
+        for character in prefix
+    ):
+        return None
+    try:
+        decoded, object_end = json.JSONDecoder().raw_decode(text, idx=object_start)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if isinstance(decoded, dict) is False:
+        return None
+    # JSON 以降に説明文が残る場合は受理しない（厳格契約の維持）。
+    if any(
+        character not in {' ', '\t', '\n', '\r'}
+        for character in text[object_end:]
+    ):
+        return None
+    return decoded
+
+
+def ExtractOpenCodeWebToolEvidence(message: dict[str, Any]) -> dict[str, Any]:
+    """message parts から websearch/webfetch の完了証明と public citation を取り出す。
+
+    モデル JSON 本文の URL は使わない。tool state（input/output/metadata）と
+    構造化 sources/citations からのみ抽出する。
+
+    Args:
+        message: POST /session/{id}/message の応答。
+
+    Returns:
+        {
+            'web_search_performed': bool,  # completed web tool が1件以上
+            'web_search_failed': bool,     # failed web tool のみで completed が無い
+            'citations': list[dict],       # {url, title}（呼び出し側で EpisodeLookupCitation 化）
+            'completed_web_calls': int,
+            'failed_web_calls': int,
+        }
+    """
+
+    from app.metadata.ai.episode_lookup import IsPublicHTTPURL
+
+    completed_web_calls = 0
+    failed_web_calls = 0
+    citations: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+
+    def AddCitation(url: object, title: object = '') -> None:
+        if not isinstance(url, str):
+            return
+        normalized = url.strip()
+        if normalized == '' or IsPublicHTTPURL(normalized) is False:
+            return
+        if normalized in seen_urls:
+            return
+        seen_urls.add(normalized)
+        title_text = title.strip() if isinstance(title, str) else ''
+        if title_text == '':
+            title_text = normalized
+        citations.append({'url': normalized, 'title': title_text[:300]})
+
+    def WalkForURLs(value: object, *, depth: int = 0) -> None:
+        if depth > 6 or value is None:
+            return
+        if isinstance(value, str):
+            text = value.strip()
+            # 単純な URL 文字列、または JSON 内の URL を拾う。
+            if text.startswith('http://') or text.startswith('https://'):
+                # 空白や引用で終わる場合を軽く切る
+                candidate = text.split()[0].rstrip(')>,]"\'')
+                AddCitation(candidate)
+            else:
+                # Exa の検索結果は "Title: ...\nURL: https://..." のような
+                # テキスト形式で返るため、行頭以外の URL トークンも拾う。
+                for token in text.split():
+                    if token.startswith('http://') or token.startswith('https://'):
+                        candidate = token.rstrip(')>,]"\'')
+                        AddCitation(candidate)
+            if text.startswith('{') or text.startswith('['):
+                parsed = None
+                try:
+                    parsed = json.loads(text)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed = None
+                if parsed is not None:
+                    WalkForURLs(parsed, depth=depth + 1)
+            return
+        if isinstance(value, dict):
+            typed = value
+            # 構造化 container を優先（本文の偶然 URL より明確なキー）。
+            for key in ('url', 'href', 'link', 'uri'):
+                if key in typed:
+                    AddCitation(typed.get(key), typed.get('title') or typed.get('name') or '')
+            for key in ('sources', 'citations', 'results', 'items', 'locations'):
+                if key in typed:
+                    WalkForURLs(typed.get(key), depth=depth + 1)
+            # webfetch の input.url など
+            for key, child in typed.items():
+                if key in {'url', 'href', 'link', 'uri', 'sources', 'citations', 'results', 'items', 'locations'}:
+                    continue
+                if key in {'input', 'output', 'metadata', 'data', 'content', 'result'}:
+                    WalkForURLs(child, depth=depth + 1)
+            return
+        if isinstance(value, list):
+            for item in value[:50]:
+                WalkForURLs(item, depth=depth + 1)
+
+    parts = message.get('parts')
+    if isinstance(parts, list):
+        for part in parts:
+            if isinstance(part, dict) is False:
+                continue
+            if part.get('type') != 'tool':
+                continue
+            normalized_tool = _NormalizeOpenCodeToolName(part.get('tool'))
+            is_websearch = (
+                'websearch' in normalized_tool
+                or normalized_tool in {'search', 'googlesearch'}
+            )
+            is_webfetch = (
+                'webfetch' in normalized_tool
+                or 'webbrowse' in normalized_tool
+                or normalized_tool in {'fetch', 'browse', 'openpage'}
+            )
+            if is_websearch is False and is_webfetch is False:
+                continue
+            state = part.get('state')
+            status = ''
+            if isinstance(state, dict):
+                raw_status = state.get('status')
+                status = raw_status.strip().lower() if isinstance(raw_status, str) else ''
+            if status in {'completed', 'complete', 'success', 'succeeded', 'done'}:
+                completed_web_calls += 1
+                WalkForURLs(state)
+                # title があれば先頭 citation の補助
+                title = state.get('title') if isinstance(state, dict) else None
+                if isinstance(title, str) and citations:
+                    # 既に URL がある場合は触らない
+                    pass
+            elif status in {'error', 'failed', 'failure', 'rejected', 'cancelled', 'canceled'}:
+                failed_web_calls += 1
+            elif status in {'running', 'pending', 'in_progress', 'inprogress'}:
+                # 未完了は performed に数えない
+                pass
+            else:
+                # status 不明でも output がある場合は完了扱いしない（甘くしない）
+                failed_web_calls += 0
+
+    web_search_performed = completed_web_calls > 0
+    web_search_failed = web_search_performed is False and failed_web_calls > 0
+    return {
+        'web_search_performed': web_search_performed,
+        'web_search_failed': web_search_failed,
+        'citations': citations,
+        'completed_web_calls': completed_web_calls,
+        'failed_web_calls': failed_web_calls,
+    }
 
 
 def ExtractOpenCodeUsage(message: dict[str, Any]) -> OpenCodeNormalizedUsage:
