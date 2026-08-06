@@ -64,6 +64,7 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
         items: [
             {type: 'Route', label: '基本・接続', icon: 'fluent:server-surface-16-filled', to: '/settings/server/basic'},
             {type: 'Route', label: '配信・エンコーダー', icon: 'fluent:video-settings-20-filled', to: '/settings/server/streaming'},
+            {type: 'Route', label: 'AIバックエンド', icon: 'fluent:bot-20-filled', to: '/settings/server/ai-backends'},
             {type: 'Route', label: '録画・ストレージ', icon: 'fluent:hard-drive-20-filled', to: '/settings/server/storage'},
             {
                 type: 'Route',
@@ -187,6 +188,11 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         path: '/settings/server/streaming',
         name: 'Settings Server Streaming',
         component: () => import('@/views/Settings/Streaming.vue'),
+    },
+    {
+        path: '/settings/server/ai-backends',
+        name: 'Settings Server AI Backend',
+        component: () => import('@/views/Settings/AIBackend.vue'),
     },
     {
         path: '/settings/server/storage',
