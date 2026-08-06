@@ -511,25 +511,6 @@ async def _buildRecordedSeriesManagementItems(
     return items
 
 
-def _parseOptionalAPIKey(request_body: dict[str, object]) -> str | None:
-    """リクエストからAPIキーを取り除き、本文へ再露出しない形で検証する。"""
-
-    api_key_value = request_body.pop("api_key", None)
-    if api_key_value is None:
-        return None
-    if (
-        not isinstance(api_key_value, str)
-        or api_key_value.strip() == ""
-        or len(api_key_value) > MAX_API_KEY_LENGTH
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="API key is invalid.",
-            headers=NO_STORE_HEADERS,
-        )
-    return api_key_value.strip()
-
-
 def _connectionErrorMessage(
     error_code: str,
     capability: Literal["CandidateSelection", "EpisodeLookup"],
@@ -561,7 +542,7 @@ def _connectionErrorMessage(
 def _ACPConnectionTestPreflightError(
     settings: RecordedSeriesSettings,
 ) -> tuple[str, str] | None:
-    """ACP 接続試験を agent 起動前に拒否すべき理由を返す。
+    """接続試験を agent 起動前に拒否すべき理由を返す。
 
     Args:
         settings: 画面のドラフトから検証済みの接続試験設定。
@@ -570,7 +551,30 @@ def _ACPConnectionTestPreflightError(
         固定エラーコードと利用者向け理由。起動可能なら None。
     """
 
-    if settings.ai_backend == "OpenAICompatible":
+    if settings.ai_backend == 'OpenCode':
+        # OpenCode は service_id と auth 設定済みが前提。serve 不可は backend 側で 503 相当。
+        if settings.ai_backend_service_id is None:
+            return (
+                'OpenCodeServiceNotFound',
+                'OpenCode の AI バックエンド service が未選択です。',
+            )
+        from app.metadata.ai.AIBackendSettings import (
+            AIBackendSettingsStore as AIBackendStore,
+        )
+        try:
+            service = AIBackendStore.getService(settings.ai_backend_service_id)
+        except (OSError, ValueError):
+            service = None
+        if service is None:
+            return (
+                'OpenCodeServiceNotFound',
+                '選択中の AI バックエンド service が見つかりません。',
+            )
+        if AIBackendStore.isAuthConfigured(service) is False:
+            return (
+                'OpenCodeAuthNotConfigured',
+                '選択中の AI バックエンドの認証が未設定です。',
+            )
         return None
 
     credential_status = KonomiTVBS4KACPCredentials.getStatus()
@@ -589,14 +593,6 @@ def _ACPConnectionTestPreflightError(
         return (
             "ACPAuthenticationUnavailable",
             "Grok Build 認証が未取り込みのため接続テストを実行できません。",
-        )
-    if (
-        settings.ai_backend == "AcpGemini"
-        and credential_status.google_adc_available is False
-    ):
-        return (
-            "ACPAuthenticationUnavailable",
-            "Google ADC が未検出のため接続テストを実行できません。",
         )
     if IsACPOperationRunning():
         return (
@@ -660,22 +656,22 @@ def _connectionChecksResponse(
 
 async def ParseRecordedSeriesSettingsUpdate(
     request: Request,
-) -> tuple[RecordedSeriesSettings, str | None]:
-    """API キーを検証エラーに含めず、設定更新リクエストを解析する。
+) -> RecordedSeriesSettings:
+    """録画シリーズ固有設定の更新リクエストを解析する。
+
+    API キー・OpenAI 互換接続情報・日次制限は受理しない（AI バックエンド API へ移行済み）。
+    AcpCodex / AcpGrok の ACP フィールドは引き続き受理する。
 
     Args:
         request: Web UI から送信された HTTP リクエスト。
 
     Returns:
-        検証済み設定と、置き換える API キーの組。
-        API キーが省略または null の場合は None。
+        検証済み設定。
 
     Raises:
-        HTTPException: JSON、設定、または API キーが不正な場合。
+        HTTPException: JSON または設定が不正な場合。
     """
 
-    # FastAPI 標準の request body 検証は、422 レスポンスの input に API キーを含めることがある。
-    # そのため JSON を手動で解析し、最初に API キーを分離してから残りの設定を Pydantic で検証する。
     try:
         request_body = await request.json()
     except Exception as ex:
@@ -692,9 +688,30 @@ async def ParseRecordedSeriesSettingsUpdate(
         )
 
     settings_body = dict(request_body)
-    api_key_value = _parseOptionalAPIKey(settings_body)
+    # 旧クライアントの秘密・OpenAI 互換接続 field・日次制限は受理せず拒否する（クリーンブレーク）。
+    rejected_keys = [
+        key
+        for key in (
+            'api_key',
+            'api_base_url',
+            'model',
+            'daily_ai_request_limit',
+        )
+        if key in settings_body
+    ]
+    if rejected_keys:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                'Legacy AI connection fields are not accepted. '
+                f'Use /api/ai-backends instead (rejected: {", ".join(rejected_keys)}).'
+            ),
+            headers=NO_STORE_HEADERS,
+        )
     # 旧クライアントの廃止済み field は受理するが、保存値や runtime 分岐へ反映しない。
     settings_body.pop("ai_candidate_selection_enabled", None)
+    settings_body.pop("ai_backend_service_name", None)
+    settings_body.pop("ai_backend_auth_configured", None)
 
     try:
         settings = RecordedSeriesSettings.model_validate(settings_body)
@@ -713,33 +730,32 @@ async def ParseRecordedSeriesSettingsUpdate(
             detail=sanitized_errors,
             headers=NO_STORE_HEADERS,
         ) from ex
-    return settings, api_key_value
+    return settings
 
 
 @router.get(
     "/settings",
     summary="録画シリーズ判定設定取得 API",
-    response_description="API キー本体を含まない録画シリーズ判定設定。",
+    response_description="録画シリーズ固有設定（AI 接続秘密は含まない）。",
     response_model=RecordedSeriesSettingsResponse,
 )
 async def RecordedSeriesSettingsAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> RecordedSeriesSettingsResponse:
-    """録画シリーズ判定設定を API キー本体を公開せず取得する。
+    """録画シリーズ判定設定を取得する。
 
     Args:
         response: Cache-Control ヘッダーを設定するレスポンス。
         _current_user: 管理者認証済みのユーザー。
 
     Returns:
-        API キー本体を含まない現在の設定。
+        AI service 参照情報付きの現在の設定。
     """
 
     response.headers.update(NO_STORE_HEADERS)
     try:
-        settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-        api_key_configured = api_key is not None
+        return RecordedSeriesSettingsStore.getSettingsResponse()
     except (OSError, ValueError) as ex:
         logging.error(
             "[RecordedSeriesSettingsAPI] Failed to load recorded series settings:",
@@ -750,10 +766,6 @@ async def RecordedSeriesSettingsAPI(
             detail="Failed to load recorded series settings.",
             headers=NO_STORE_HEADERS,
         ) from ex
-    return RecordedSeriesSettingsResponse(
-        **settings.model_dump(),
-        api_key_configured=api_key_configured,
-    )
 
 
 @router.put(
@@ -766,10 +778,10 @@ async def RecordedSeriesSettingsUpdateAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ):
-    """録画シリーズ判定設定と、指定された場合のみ API キーを更新する。
+    """録画シリーズ判定の固有設定を更新する。
 
     Args:
-        request: API キーを含み得る設定更新リクエスト。
+        request: 設定更新リクエスト。
         response: Cache-Control ヘッダーを設定するレスポンス。
         _current_user: 管理者認証済みのユーザー。
 
@@ -778,9 +790,9 @@ async def RecordedSeriesSettingsUpdateAPI(
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    settings, api_key = await ParseRecordedSeriesSettingsUpdate(request)
+    settings = await ParseRecordedSeriesSettingsUpdate(request)
     try:
-        RecordedSeriesSettingsStore.saveSettings(settings, api_key=api_key)
+        RecordedSeriesSettingsStore.saveSettings(settings)
     except (OSError, ValueError) as ex:
         logging.error(
             "[RecordedSeriesSettingsUpdateAPI] Failed to save recorded series settings:",
@@ -799,8 +811,8 @@ async def RecordedSeriesSettingsUpdateAPI(
 
 @router.delete(
     "/settings/api-key",
-    summary="録画シリーズ判定 API キー削除 API",
-    status_code=status.HTTP_204_NO_CONTENT,
+    summary="録画シリーズ判定 API キー削除 API（廃止）",
+    status_code=status.HTTP_410_GONE,
 )
 async def RecordedSeriesAPIKeyDeleteAPI(
     response: Response,
@@ -809,59 +821,28 @@ async def RecordedSeriesAPIKeyDeleteAPI(
         str | None,
         Query(
             max_length=2048,
-            description="削除対象のベースURL。省略時は保存済み設定URL。",
+            description="廃止。",
         ),
     ] = None,
 ):
-    """保存済みの OpenAI 互換 API キーを再定義可能な形で削除する。
-
-    url パラメータを指定すると、その URL のキーだけを削除する。
-    指定しない場合は現在の設定の api_base_url に対応するキーを削除する。
+    """旧 OpenAI 互換 API キー削除。AI バックエンド API へ移行済み。
 
     Args:
         response: Cache-Control ヘッダーを設定するレスポンス。
         _current_user: 管理者認証済みのユーザー。
-        url: 削除対象の API ベース URL（省略可）。
+        url: 無視される。
 
     Returns:
         None
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    normalized_url = url
-    if url is not None:
-        try:
-            # 削除対象 URL も通常設定と同等に正規化・検証する（認証情報・query 等を拒否）
-            normalized_url = RecordedSeriesSettings.validateAPIBaseURL(url)
-        except ValueError as ex:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Invalid API base URL.",
-                headers=NO_STORE_HEADERS,
-            ) from ex
-    try:
-        RecordedSeriesSettingsStore.deleteAPIKey(url=normalized_url)
-    except OSError as ex:
-        logging.error(
-            "[RecordedSeriesAPIKeyDeleteAPI] Failed to delete recorded series API key:",
-            exc_info=ex,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete recorded series API key.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except ValueError as ex:
-        # 構造不正は store 側で全体 unlink 済み。ここへ来るのは URL 検証失敗など。
-        logging.error(
-            "[RecordedSeriesAPIKeyDeleteAPI] Failed to delete recorded series API key:",
-            exc_info=ex,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Failed to delete recorded series API key.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
+    _ = url
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail='Use DELETE /api/ai-backends/{service_id}/api-key instead.',
+        headers=NO_STORE_HEADERS,
+    )
 
 
 def _KonomiTVBS4KACPCredentialStatusResponse() -> (
@@ -1098,7 +1079,13 @@ async def RecordedSeriesConnectionTestAPI(
         )
     capability = cast(Literal["CandidateSelection", "EpisodeLookup"], capability_value)
 
-    api_key = _parseOptionalAPIKey(draft)
+    # 旧 draft の api_key・OpenAI 互換接続 field・日次制限は無視する（AI バックエンド API へ移行）。
+    # AcpCodex / AcpGrok の ACP field は draft 上書きを許可する。
+    draft.pop('api_key', None)
+    for legacy_key in (
+        'api_base_url', 'model', 'daily_ai_request_limit',
+    ):
+        draft.pop(legacy_key, None)
     try:
         saved_settings = RecordedSeriesSettingsStore.getSettings()
     except (OSError, ValueError) as ex:
@@ -1112,6 +1099,7 @@ async def RecordedSeriesConnectionTestAPI(
         ) from ex
     try:
         # 旧クライアントの OpenAI 部分 payload も維持しつつ、新 UI は全ドラフトを送れる。
+        # ACP の backend / model / effort もドラフトで差し替え可能にする。
         merged_settings = saved_settings.model_dump(mode="json")
         merged_settings.update(draft)
         validated_settings = RecordedSeriesSettings.model_validate(merged_settings)
@@ -1124,9 +1112,7 @@ async def RecordedSeriesConnectionTestAPI(
 
     audit_model = get_audit_model(validated_settings)
 
-    # ACP は資格情報が無い状態や、別 agent の実行中に新しい接続試験をキューへ積まない。
-    # ブラウザを再読込してローカルの loading 状態を失っていても、サーバー状態で即時判定する。
-    effective_api_key = api_key
+    # OpenCode / ACP の起動前 preflight（認証未設定・busy 等）。
     preflight_result: ConnectionTestResult | None = None
     acp_preflight_error = _ACPConnectionTestPreflightError(validated_settings)
     if acp_preflight_error is not None:
@@ -1147,66 +1133,11 @@ async def RecordedSeriesConnectionTestAPI(
             error_code=acp_preflight_error_code,
         )
 
-    # OpenAI 互換だけ URL ごとの保存キーを解決する。ACP へ API キーを渡さない。
-    if (
-        preflight_result is None
-        and validated_settings.ai_backend == "OpenAICompatible"
-        and effective_api_key is None
-    ):
-        try:
-            effective_api_key = RecordedSeriesSettingsStore.getAPIKeyForURL(
-                validated_settings.api_base_url,
-            )
-        except ValueError:
-            # 秘密 map が構造不正のときは fail-closed し、外部通信を開始しない。
-            logging.error(
-                "[RecordedSeriesConnectionTestAPI] API key map is invalid; refusing connection test.",
-            )
-            message = "APIキー設定が不正なため接続テストを実行できません。"
-            preflight_result = ConnectionTestResult(
-                success=False,
-                latency_ms=0,
-                model=audit_model,
-                message=message,
-                checks=(
-                    _notRunEpisodeLookupConnectionChecks(
-                        message,
-                        permission_not_applicable=True,
-                    )
-                    if capability == "EpisodeLookup"
-                    else None
-                ),
-                error_code="APIKeyMapInvalid",
-            )
-        except OSError as ex:
-            logging.error(
-                "[RecordedSeriesConnectionTestAPI] Failed to resolve API key for connection test URL:",
-                exc_info=ex,
-            )
-            message = "APIキーを読み取れないため接続テストを実行できません。"
-            preflight_result = ConnectionTestResult(
-                success=False,
-                latency_ms=0,
-                model=audit_model,
-                message=message,
-                checks=(
-                    _notRunEpisodeLookupConnectionChecks(
-                        message,
-                        permission_not_applicable=True,
-                    )
-                    if capability == "EpisodeLookup"
-                    else None
-                ),
-                error_code="APIKeyReadFailed",
-            )
+    # OpenAI 互換キー解決は廃止。Phase 2 の draft 接続試験で service 単位に扱う。
     tested_provider_fingerprint = (
         get_episode_lookup_provider_fingerprint(
             validated_settings,
-            (
-                effective_api_key
-                if validated_settings.ai_backend == "OpenAICompatible"
-                else None
-            ),
+            None,
         )
         if capability == "EpisodeLookup"
         else None
@@ -1219,9 +1150,7 @@ async def RecordedSeriesConnectionTestAPI(
             result = await test_connection(
                 capability,
                 settings=validated_settings,
-                api_key=effective_api_key
-                if validated_settings.ai_backend == "OpenAICompatible"
-                else None,
+                api_key=None,
             )
         except RecordedSeriesAIError as ex:
             message = _connectionErrorMessage(ex.code, capability)
@@ -1234,7 +1163,7 @@ async def RecordedSeriesConnectionTestAPI(
                     _notRunEpisodeLookupConnectionChecks(
                         message,
                         permission_not_applicable=(
-                            validated_settings.ai_backend == "OpenAICompatible"
+                            False
                         ),
                     )
                     if capability == "EpisodeLookup"
@@ -1246,11 +1175,7 @@ async def RecordedSeriesConnectionTestAPI(
         except Exception:
             # CLI・provider 由来の例外には path や認証詳細が含まれ得るため公開しない。
             logging.error("[RecordedSeriesConnectionTestAPI] Connection test failed.")
-            message = (
-                "ACP 接続テストに失敗しました。設定と認証状態を確認してください。"
-                if validated_settings.ai_backend != "OpenAICompatible"
-                else "AI バックエンド接続テストに失敗しました。"
-            )
+            message = "AI バックエンド接続テストに失敗しました。設定と認証状態を確認してください。"
             result = ConnectionTestResult(
                 success=False,
                 latency_ms=0,
@@ -1259,9 +1184,7 @@ async def RecordedSeriesConnectionTestAPI(
                 checks=(
                     _notRunEpisodeLookupConnectionChecks(
                         message,
-                        permission_not_applicable=(
-                            validated_settings.ai_backend == "OpenAICompatible"
-                        ),
+                        permission_not_applicable=False,
                     )
                     if capability == "EpisodeLookup"
                     else None
@@ -1326,11 +1249,7 @@ async def RecordedSeriesConnectionTestAPI(
         assert tested_provider_fingerprint is not None
         proof_recorded = record_episode_lookup_capability_proof(
             validated_settings,
-            (
-                effective_api_key
-                if validated_settings.ai_backend == "OpenAICompatible"
-                else None
-            ),
+            None,
             result,
             tested_provider_fingerprint=tested_provider_fingerprint,
         )
@@ -1338,11 +1257,7 @@ async def RecordedSeriesConnectionTestAPI(
             current_provider_fingerprint = (
                 get_episode_lookup_provider_fingerprint(
                     validated_settings,
-                    (
-                        effective_api_key
-                        if validated_settings.ai_backend == "OpenAICompatible"
-                        else None
-                    ),
+                    None,
                 )
             )
             state_changed = (

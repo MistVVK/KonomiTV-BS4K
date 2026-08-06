@@ -37,6 +37,7 @@ from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.Program import Program
 from app.models.RefreshToken import RefreshToken
 from app.routers import (
+    AIBackendRouter,
     AnalysisTasksRouter,
     BlueskyRouter,
     CapturesRouter,
@@ -115,6 +116,7 @@ app.include_router(ReservationsRouter.router)
 app.include_router(ReservationConditionsRouter.router)
 app.include_router(RecordingPresetsRouter.router)
 app.include_router(RecordedSeriesRouter.router)
+app.include_router(AIBackendRouter.router)
 app.include_router(CapturesRouter.router)
 app.include_router(CMAnalysisRouter.router)
 app.include_router(DataBroadcastingRouter.router)
