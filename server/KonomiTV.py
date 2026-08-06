@@ -257,6 +257,12 @@ def main(
             port = CONFIG.compatibility_api.port,
         )
 
+    # 製品用 opencode serve を reload 親で 1 回だけ常駐起動する（Akebi と同パターン）。
+    # 失敗しても本体は継続し、AI 経路は opencode_available=false を明示する。
+    from app.metadata.ai.opencode_serve import StartOpenCodeServe, StopOpenCodeServe
+    StartOpenCodeServe()
+    atexit.register(StopOpenCodeServe)
+
     # akebi モードのリスナごとに Akebi Keyless Server を起動する
     reverse_proxy_processes: list[subprocess.Popen[bytes]] = []
     akebi_listeners: list[tuple[int, ServerStartupSettings]] = []
@@ -332,6 +338,9 @@ def main(
     # akebi モードの場合だけ Akebi を終了する
     for reverse_proxy_process in reverse_proxy_processes:
         reverse_proxy_process.terminate()
+
+    # 製品用 opencode serve を terminate+wait で回収する（orphan 防止）
+    StopOpenCodeServe()
 
     # この時点ではタイミングの関係でまだロックファイルが作成されていないことがあるので、1秒待機する
     time.sleep(1)

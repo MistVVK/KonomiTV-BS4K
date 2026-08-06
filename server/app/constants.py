@@ -70,6 +70,8 @@ KONOMITV_SERVER_LOG_PATH = LOGS_DIR / 'KonomiTV-BS4K-Server.log'
 KONOMITV_ACCESS_LOG_PATH = LOGS_DIR / 'KonomiTV-BS4K-Access.log'
 ## Akebi (HTTPS リバースプロキシ) のログファイルのパス
 AKEBI_LOG_PATH = LOGS_DIR / 'Akebi-HTTPS-Server.log'
+## 製品用 opencode serve のログファイルのパス
+OPENCODE_SERVE_LOG_PATH = LOGS_DIR / 'opencode-serve.log'
 
 # サードパーティーライブラリのあるディレクトリ
 LIBRARY_DIR = BASE_DIR / 'thirdparty'
@@ -85,7 +87,38 @@ LIBRARY_PATH = {
     ),
     'tsreadex': str(LIBRARY_DIR / 'tsreadex/tsreadex.elf'),
     'psisiarc': str(LIBRARY_DIR / 'psisiarc/psisiarc.elf'),
+    # 製品用 opencode serve バイナリ（Docker 同梱 SEA）。ホスト開発時は PATH 上の同名でも可。
+    'OpenCode': '/usr/local/bin/opencode',
 }
+
+# ----- 製品用 opencode serve（録画シリーズ AI）-----
+# 監査用 OpenCode（port 4096 想定）と port / home / workspace / auth を完全分離する。
+OPENCODE_SERVE_HOST = '127.0.0.1'
+OPENCODE_SERVE_PORT = 4097
+OPENCODE_SERVE_BASE_URL = f'http://{OPENCODE_SERVE_HOST}:{OPENCODE_SERVE_PORT}'
+## config / data / PID を置く製品専用 home ルート
+OPENCODE_HOME_ROOT = DATA_DIR / 'opencode-home'
+## XDG_CONFIG_HOME（opencode.json / auth.json 等がぶら下がる）
+OPENCODE_XDG_CONFIG_HOME = OPENCODE_HOME_ROOT / 'config'
+## XDG_DATA_HOME
+OPENCODE_XDG_DATA_HOME = OPENCODE_HOME_ROOT / 'data'
+## serve の cwd。ソースツリーを置かない空の最小化 workspace
+OPENCODE_WORKSPACE_DIR = DATA_DIR / 'opencode-workspace'
+## orphan 回収用 PID ファイル
+OPENCODE_SERVE_PID_PATH = OPENCODE_HOME_ROOT / 'opencode-serve.pid'
+## イメージ同梱の製品用 config 雛形（初回 seed 元）
+OPENCODE_BUNDLED_CONFIG_PATH = Path('/usr/local/share/konomitv-bs4k-opencode/opencode.json')
+## リポジトリ内の雛形（開発・テスト用フォールバック）
+OPENCODE_REPO_CONFIG_PATH = BASE_DIR.parent / 'docker' / 'opencode' / 'opencode.json'
+## health リトライ（起動直後の bind 待ち）
+OPENCODE_HEALTH_RETRY_ATTEMPTS = 30
+OPENCODE_HEALTH_RETRY_INTERVAL_SEC = 0.2
+OPENCODE_HEALTH_TIMEOUT_SEC = 2.0
+## 固定 version（Dockerfile / package.json と一致させる）
+OPENCODE_PINNED_VERSION = '1.18.13'
+## 生成 agent / EpisodeLookup agent 名（opencode.json と一致）
+OPENCODE_AGENT_GENERATE = 'recorded-series-generate'
+OPENCODE_AGENT_EPISODE = 'recorded-series-episode'
 
 # データベース (Tortoise ORM) の設定
 __model_list = [name for _, name, _ in pkgutil.iter_modules(path=['app/models'])]
