@@ -1,0 +1,55 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "share": "disabled",
+  "autoupdate": false,
+  "agent": {
+    "recorded-series-generate": {
+      "description": "KonomiTV-BS4K recorded series candidate selection and metadata generation",
+      "mode": "primary",
+      "hidden": true,
+      "permission": {
+        "bash": "deny",
+        "edit": "deny",
+        "write": "deny",
+        "patch": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "question": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "external_directory": "deny",
+        "doom_loop": "deny",
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "todowrite": "deny",
+        "lsp": "deny"
+      }
+    },
+    "recorded-series-episode": {
+      "description": "KonomiTV-BS4K recorded series episode number lookup with web tools",
+      "mode": "primary",
+      "hidden": true,
+      "permission": {
+        "bash": "deny",
+        "edit": "deny",
+        "write": "deny",
+        "patch": "deny",
+        "task": "deny",
+        "skill": "deny",
+        "question": "deny",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "external_directory": "deny",
+        "doom_loop": "deny",
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "todowrite": "deny",
+        "lsp": "deny"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "konomitv-bs4k-opencode",
+  "private": true,
+  "description": "Pinned opencode-ai runtime for KonomiTV-BS4K Docker images",
+  "dependencies": {
+    "opencode-ai": "1.18.13"
+  }
+}

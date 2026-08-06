@@ -261,6 +261,48 @@ RUN set -eu && \
     npm cache clean --force
 
 # --------------------------------------------------------------------------------------------------------------
+# 録画シリーズ AI 用 opencode serve バイナリを固定導入するステージ
+# final には SEA 実行バイナリとライセンス断片のみを持ち込み、node_modules は残さない。
+# --------------------------------------------------------------------------------------------------------------
+
+FROM node:20.16.0 AS opencode-builder
+
+WORKDIR /opt/konomitv-bs4k-opencode
+COPY ./docker/opencode/package.json ./docker/opencode/package-lock.json /opt/konomitv-bs4k-opencode/
+COPY ./docker/opencode/manifest.env /build/docker/opencode/manifest.env
+COPY ./docker/opencode/assemble-opencode-license-section.py /build/docker/opencode/
+RUN set -eu && \
+    . /build/docker/opencode/manifest.env && \
+    npm ci --omit=dev --no-audit --no-fund && \
+    test "$(node -p "require('./node_modules/opencode-ai/package.json').version")" = "${OPENCODE_VERSION}" && \
+    test "$(node -p "require('./node_modules/${OPENCODE_PLATFORM_PACKAGE}/package.json').version")" = "${OPENCODE_VERSION}" && \
+    OPENCODE_BIN="/opt/konomitv-bs4k-opencode/node_modules/${OPENCODE_PLATFORM_PACKAGE}/bin/opencode" && \
+    test -x "${OPENCODE_BIN}" && \
+    # SEA バイナリは Node ランタイム不要。--version は完全1行一致のみ許可する。
+    opencode_version="$("${OPENCODE_BIN}" --version)" && \
+    test "${opencode_version}" = "${OPENCODE_VERSION}" && \
+    mkdir -p /opt/konomitv-bs4k-opencode/dist && \
+    cp "${OPENCODE_BIN}" /opt/konomitv-bs4k-opencode/dist/opencode && \
+    chmod 755 /opt/konomitv-bs4k-opencode/dist/opencode && \
+    test -s /opt/konomitv-bs4k-opencode/node_modules/opencode-ai/LICENSE && \
+    cp /opt/konomitv-bs4k-opencode/node_modules/opencode-ai/LICENSE \
+        /opt/konomitv-bs4k-opencode/dist/LICENSE && \
+    python3 /build/docker/opencode/assemble-opencode-license-section.py \
+        --license /opt/konomitv-bs4k-opencode/dist/LICENSE \
+        --version "${OPENCODE_VERSION}" \
+        --platform-package "${OPENCODE_PLATFORM_PACKAGE}" \
+        --output /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PARTY_LICENSES.md && \
+    grep -F '## OpenCode Runtime Dependencies' \
+        /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PARTY_LICENSES.md && \
+    grep -F "### opencode-ai ${OPENCODE_VERSION}" \
+        /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PARTY_LICENSES.md && \
+    grep -F "### ${OPENCODE_PLATFORM_PACKAGE} ${OPENCODE_VERSION}" \
+        /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PARTY_LICENSES.md && \
+    # final へ持ち込むのは dist のみ。node_modules 丸ごとは禁止。
+    test ! -e /opt/konomitv-bs4k-opencode/dist/node_modules && \
+    npm cache clean --force
+
+# --------------------------------------------------------------------------------------------------------------
 # KonomiTV-BS4K の実行ステージ (Linux amd64 専用)
 # --------------------------------------------------------------------------------------------------------------
 
@@ -420,6 +462,13 @@ COPY --from=acp-builder /usr/local/bin/node /usr/local/bin/node
 COPY --from=acp-builder /opt/konomitv-bs4k-acp/ /opt/konomitv-bs4k-acp/
 COPY --from=thirdparty-builder /opt/konomitv-bs4k-acp-sandbox \
     /usr/local/libexec/konomitv-bs4k-acp-sandbox
+# opencode は SEA バイナリのみ。node_modules は final に持ち込まない。
+COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/opencode /usr/local/bin/opencode
+COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/LICENSE \
+    /usr/local/share/licenses/opencode/LICENSE
+COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PARTY_LICENSES.md \
+    /usr/local/share/licenses/opencode/OPENCODE_THIRD_PARTY_LICENSES.md
+COPY ./docker/opencode/opencode.json /usr/local/share/konomitv-bs4k-opencode/opencode.json
 RUN ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp /usr/local/bin/codex-acp && \
     ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex /usr/local/bin/codex && \
     ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/gemini /usr/local/bin/gemini && \
@@ -428,11 +477,18 @@ RUN ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp /usr/local/bin/code
     codex_cli_version="$(codex --version)" && \
     gemini_cli_version="$(gemini --version)" && \
     grok_version_line="$(grok --version)" && \
+    opencode_version="$(opencode --version)" && \
     test "${codex_acp_version}" = '@agentclientprotocol/codex-acp 1.1.7' && \
     test "${codex_cli_version}" = 'codex-cli 0.145.0' && \
     test "${gemini_cli_version}" = '0.52.0' && \
     test "${grok_version_line}" = 'grok 0.2.112 (9bbd559437)' && \
+    test "${opencode_version}" = '1.18.13' && \
     test "$(stat -c '%U:%G:%a' /usr/local/libexec/konomitv-bs4k-acp-sandbox)" = 'root:root:755' && \
+    test "$(stat -c '%a' /usr/local/bin/opencode)" = '755' && \
+    test -s /usr/local/share/licenses/opencode/LICENSE && \
+    test -s /usr/local/share/konomitv-bs4k-opencode/opencode.json && \
+    # node_modules 丸ごと持ち込み禁止（バイナリ単体のみ）。
+    test ! -e /opt/konomitv-bs4k-opencode && \
     if command -v gcloud >/dev/null 2>&1; then \
         echo 'Google Cloud CLI must not be included in the final image.' >&2; \
         exit 1; \
@@ -603,6 +659,8 @@ COPY ./docker/thirdparty/licenses/grapheme-0.6.0-LICENSE /tmp/grapheme-0.6.0-LIC
 COPY --from=client-builder /tmp/CLIENT_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md
 COPY --from=thirdparty-builder /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/BUILDER_THIRD_PARTY_LICENSES.md
 COPY --from=acp-builder /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md /tmp/ACP_THIRD_PARTY_LICENSES.md
+COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PARTY_LICENSES.md \
+    /tmp/OPENCODE_THIRD_PARTY_LICENSES.md
 RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree-runtime'; else nonfree_license_option=''; fi && \
     printf '%s  %s\n' \
         '8c09b6ef3ef6bf62858af66af73138b5a234231266c4736009d27233681a5dcf' \
@@ -648,6 +706,7 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
         --manifest /tmp/BUILDER_THIRD_PARTY_LICENSES.md \
         --manifest /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
         --manifest /tmp/ACP_THIRD_PARTY_LICENSES.md \
+        --manifest /tmp/OPENCODE_THIRD_PARTY_LICENSES.md \
         --cuda-version "${CUDA_VERSION}" \
         ${nonfree_license_option} \
         --output /code/THIRD_PARTY_LICENSES.md && \
@@ -658,6 +717,9 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     grep -F '### @google/gemini-cli 0.52.0' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### @xai-official/grok 0.2.112' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### @xai-official/grok-linux-x64 0.2.112' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '## OpenCode Runtime Dependencies' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### opencode-ai 1.18.13' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### opencode-linux-x64 1.18.13' /code/THIRD_PARTY_LICENSES.md && \
     if [ "${NONFREE}" = 'false' ]; then \
         grep -Eq '^#### mesa-va-drivers(:amd64)? ' /code/THIRD_PARTY_LICENSES.md; \
         if grep -Eq 'NONFREE_RUNTIME_WARNING|amf-amdgpu-pro|libamdenc-amdgpu-pro|mesa-amdgpu-va-drivers|vulkan-amdgpu-pro' \
@@ -668,7 +730,7 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     fi && \
     rm /tmp/BASE_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md \
         /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
-        /tmp/ACP_THIRD_PARTY_LICENSES.md \
+        /tmp/ACP_THIRD_PARTY_LICENSES.md /tmp/OPENCODE_THIRD_PARTY_LICENSES.md \
         /tmp/assemble-runtime-license-document.py /tmp/collect-license-manifest.py \
         /tmp/generate-chromium-license-document.py /tmp/chromium-LICENSE \
         /tmp/grapheme-0.6.0-LICENSE

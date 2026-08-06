@@ -341,6 +341,53 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
     assert (REPOSITORY_ROOT / 'docker/acp/assemble-acp-license-section.py').is_file()
 
 
+def test_opencode_runtime_is_pinned_and_binary_only_in_final_image() -> None:
+    """opencode-ai 1.18.13 が固定導入され、final は SEA バイナリのみを持つ。"""
+
+    import json
+
+    dockerfile = (REPOSITORY_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+    manifest = (REPOSITORY_ROOT / 'docker/opencode/manifest.env').read_text(encoding='utf-8')
+    package_json = json.loads(
+        (REPOSITORY_ROOT / 'docker/opencode/package.json').read_text(encoding='utf-8'),
+    )
+    package_lock = json.loads(
+        (REPOSITORY_ROOT / 'docker/opencode/package-lock.json').read_text(encoding='utf-8'),
+    )
+
+    assert "OPENCODE_VERSION='1.18.13'" in manifest
+    assert "OPENCODE_PLATFORM_PACKAGE='opencode-linux-x64'" in manifest
+    assert package_json['dependencies'] == {'opencode-ai': '1.18.13'}
+    assert package_lock['packages']['node_modules/opencode-ai']['version'] == '1.18.13'
+    assert package_lock['packages']['node_modules/opencode-linux-x64']['version'] == '1.18.13'
+    assert package_lock['packages']['node_modules/opencode-linux-x64'].get('optional') is True
+
+    assert 'FROM node:20.16.0 AS opencode-builder' in dockerfile
+    opencode_section = dockerfile.split(
+        'FROM node:20.16.0 AS opencode-builder', 1,
+    )[1].split('FROM ', 1)[0]
+    assert 'npm ci --omit=dev --no-audit --no-fund' in opencode_section
+    assert 'npm install' not in opencode_section
+    assert 'opencode --version | grep' not in opencode_section
+    assert 'test "${opencode_version}" = "${OPENCODE_VERSION}"' in opencode_section
+    # final はバイナリ + ライセンスのみ。node_modules 丸ごとは禁止。
+    assert 'COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/opencode /usr/local/bin/opencode' in dockerfile
+    # node_modules ツリー全体の COPY は禁止（dist 配下のみ）。
+    assert 'COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/node_modules' not in dockerfile
+    assert 'COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/ /' not in dockerfile
+    assert 'test ! -e /opt/konomitv-bs4k-opencode' in dockerfile
+    assert 'test "${opencode_version}" = \'1.18.13\'' in dockerfile
+    assert '## OpenCode Runtime Dependencies' in dockerfile
+    assert '### opencode-ai 1.18.13' in dockerfile
+    assert (REPOSITORY_ROOT / 'docker/opencode/opencode.json').is_file()
+    assert (REPOSITORY_ROOT / 'docker/opencode/assemble-opencode-license-section.py').is_file()
+    config = (REPOSITORY_ROOT / 'docker/opencode/opencode.json').read_text(encoding='utf-8')
+    assert 'recorded-series-generate' in config
+    assert 'recorded-series-episode' in config
+    assert '"bash": "deny"' in config
+    assert '"webfetch": "allow"' in config
+
+
 def test_acp_subprocess_is_always_started_through_hardened_landlock_launcher() -> None:
     """ACP provider は追加 privilege なしの root-owned Landlock launcher だけを経由する。"""
 
