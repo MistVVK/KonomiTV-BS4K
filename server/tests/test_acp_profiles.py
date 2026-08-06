@@ -505,17 +505,6 @@ def test_konomitv_bs4k_codex_ultra_is_reserved_for_sol_and_fast_mode_is_codex_on
     assert grok.konomitv_bs4k_acp_codex_fast_mode_enabled is False
 
 
-def test_gemini_defaults_model_without_unsupported_effort() -> None:
-    """Gemini は既定モデルだけを保存し、非対応の推論深さを監査へ残さない。"""
-
-    settings = RecordedSeriesSettings(
-        ai_backend='AcpGemini',
-        google_cloud_project='example-project',
-        google_cloud_location='asia-northeast1',
-    )
-    assert settings.acp_model == 'gemini-3.6-flash'
-    assert settings.acp_reasoning_effort is None
-    assert RecordedSeriesAI.get_audit_model(settings) == 'acp:gemini:gemini-3.6-flash'
 
 
 def test_acp_imported_auth_requires_mode_0600(

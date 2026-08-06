@@ -2076,26 +2076,7 @@ class RecordedSeriesResolver:
     ) -> RecordedSeriesResolveResult:
         """AI ON の常時生成、監査、既存 Series すり合わせを完結させる。"""
 
-        # 日次上限を超えた場合は dirty な Local title へ暗黙フォールバックしない。
-        daily_ai_request_limit = settings.daily_ai_request_limit
-        if daily_ai_request_limit > 0:
-            today_start = datetime.combine(datetime.now(tz=JST).date(), datetime_time.min, tzinfo=JST)
-            requests_today = await RecordedSeriesAIRequest.filter(
-                purpose__in=['Resolution', 'EpisodeLookup'],
-                created_at__gte=today_start,
-            ).filter(
-                Q(error_code=None) | Q(error_code__not_in=NON_BILLABLE_AI_REQUEST_ERROR_CODES),
-            ).count()
-            if requests_today >= daily_ai_request_limit:
-                await cls._applyNeedsReview(
-                    snapshot=snapshot,
-                    resolution=resolution,
-                    expected_generation=expected_generation,
-                    source='AI',
-                    error_code='DailyAIRequestLimitReached',
-                    clear_series=force is False,
-                )
-                return RecordedSeriesResolveResult(snapshot.id, 'NeedsReview', 'AI', False)
+        # 日次上限は廃止。月次 cost/token 上限は Phase 3 の AIBackend 台帳で扱う。
 
         # 高コスト・外部の hints は Manual / Rule / 上限ゲート通過後にだけ遅延構築する。
         # hints と生成後の既存 Series すり合わせで同じスナップショットを共有し、
@@ -2164,7 +2145,8 @@ class RecordedSeriesResolver:
             input_fingerprint=_buildInputFingerprint(snapshot),
             evidence_hash=cluster.evidence_hash,
             candidate_set_hash=candidate_set_hash,
-            api_base_url=settings.api_base_url,
+            # OpenCode 移行後は service_id を endpoint 識別子として使う。
+            api_base_url=settings.ai_backend_service_id or 'opencode',
             model=audit_model,
             api_key=runtime_api_key,
         )

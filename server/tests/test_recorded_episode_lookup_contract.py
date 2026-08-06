@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 
 import app.metadata.ai.acp_client as AcpClientModule
-import app.metadata.ai.openai_compatible as OpenAICompatibleModule
 import app.metadata.ai.recorded_series_ai as RecordedSeriesAIModule
 from app.metadata.ai.backends import (
     ConnectionTestCheck,
@@ -21,7 +20,6 @@ from app.metadata.ai.episode_lookup import (
     IsPublicHTTPURL,
     MapLookupOutcomeToResolutionStatus,
 )
-from app.metadata.ai.openai_compatible import OpenAICompatibleBackend
 from app.metadata.RecordedEpisodeSearch import IsEpisodeLookupResultAccepted
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettings
@@ -221,183 +219,12 @@ def test_citation_normalizes_bounded_public_url_and_title() -> None:
     assert len(citation.title) == 300
 
 
-@pytest.mark.parametrize(
-    ('error_code', 'http_status', 'expected_outcome', 'expected_web_search'),
-    [
-        ('MissingWebSearchCall', 200, 'SearchNotRun', False),
-        ('InvalidJSON', 200, 'InvalidModelOutput', True),
-        ('InvalidOutputSchema', 200, 'InvalidModelOutput', True),
-        ('InvalidResponse', 200, 'SearchFailed', False),
-        ('InvalidResponseJSON', 200, 'SearchFailed', False),
-        ('HTTP429', 429, 'RateLimited', False),
-        ('HTTP500', 500, 'SearchFailed', False),
-        ('Timeout', None, 'SearchFailed', False),
-        ('RedirectRejected', 307, 'SearchFailed', False),
-    ],
-)
-def test_openai_adapter_normalizes_all_provider_failure_classes(
-    monkeypatch: pytest.MonkeyPatch,
-    error_code: str,
-    http_status: int | None,
-    expected_outcome: EpisodeLookupOutcome,
-    expected_web_search: bool,
-) -> None:
-    """Responses API の tool/schema/transport 終端を共通 outcome へ写像する。"""
-
-    async def RaiseError(**_kwargs: object) -> EpisodeLookupResult:
-        raise RecordedSeriesAIError(error_code, http_status=http_status, latency_ms=25)
-
-    monkeypatch.setattr(OpenAICompatibleModule, 'SearchRecordedEpisodeNumber', RaiseError)
-    backend = OpenAICompatibleBackend(
-        settings=RecordedSeriesSettings(
-            ai_enabled=True,
-            ai_episode_number_search_enabled=True,
-            api_base_url='https://api.example/v1',
-            model='test-model',
-        ),
-        api_key='test-key',
-    )
-    result = asyncio.run(backend.lookupEpisode({}))  # type: ignore[arg-type]
-
-    assert result.outcome == expected_outcome
-    assert result.web_search_performed is expected_web_search
-    assert result.error_code == error_code
-    assert result.error_message is not None
-    assert result.season_number is None
-    assert result.episode_number is None
-    assert result.rationale_short is None
-    if error_code == 'HTTP429':
-        assert result.error_message == 'AI プロバイダーの利用上限に達しました。'
 
 
-@pytest.mark.parametrize(
-    ('lookup_result', 'expected_success', 'expected_source_status', 'expected_schema_status'),
-    [
-        (
-            _result(
-                'Resolved',
-                citations=(EpisodeLookupCitation(
-                    url='https://example.com/official/episode',
-                    title='公式ページ',
-                ),),
-                http_status=200,
-            ),
-            True,
-            'Passed',
-            'Passed',
-        ),
-        (
-            _result('InsufficientEvidence', http_status=200),
-            False,
-            'Failed',
-            'Passed',
-        ),
-        (
-            _result(
-                'InvalidModelOutput',
-                error_code='InvalidOutputSchema',
-                http_status=200,
-            ),
-            False,
-            'NotRun',
-            'Failed',
-        ),
-    ],
-)
-def test_openai_episode_connection_test_returns_six_individual_checks(
-    monkeypatch: pytest.MonkeyPatch,
-    lookup_result: EpisodeLookupResult,
-    expected_success: bool,
-    expected_source_status: str,
-    expected_schema_status: str,
-) -> None:
-    """接続試験は出典0件を成功扱いせず、固定6項目を個別返却する。"""
-
-    async def ReturnResult(**_kwargs: object) -> EpisodeLookupResult:
-        return lookup_result
-
-    monkeypatch.setattr(OpenAICompatibleModule, 'SearchRecordedEpisodeNumber', ReturnResult)
-    backend = OpenAICompatibleBackend(
-        settings=RecordedSeriesSettings(
-            ai_enabled=True,
-            ai_episode_number_search_enabled=True,
-            api_base_url='https://api.example/v1',
-            model='test-model',
-        ),
-        api_key='test-key',
-    )
-
-    result = asyncio.run(backend.testConnection('EpisodeLookup'))
-
-    assert result.success is expected_success
-    assert result.checks is not None
-    assert result.checks.backend_connection.status == 'Passed'
-    assert result.checks.web_search.status == 'Passed'
-    assert result.checks.source_url.status == expected_source_status
-    assert result.checks.strict_schema.status == expected_schema_status
-    assert result.checks.timeout_cancel.status == 'NotRun'
-    assert result.checks.permission_policy.status == 'NotApplicable'
 
 
-def test_openai_episode_connection_test_reports_observed_timeout_recovery(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """実際に timeout outcome を受けた場合だけ timeout check を確認済みにする。"""
-
-    async def RaiseTimeout(**_kwargs: object) -> EpisodeLookupResult:
-        raise RecordedSeriesAIError('Timeout', latency_ms=25)
-
-    monkeypatch.setattr(OpenAICompatibleModule, 'SearchRecordedEpisodeNumber', RaiseTimeout)
-    backend = OpenAICompatibleBackend(
-        settings=RecordedSeriesSettings(
-            ai_enabled=True,
-            ai_episode_number_search_enabled=True,
-            api_base_url='https://api.example/v1',
-            model='test-model',
-        ),
-        api_key='test-key',
-    )
-
-    result = asyncio.run(backend.testConnection('EpisodeLookup'))
-
-    assert result.success is False
-    assert result.checks is not None
-    assert result.checks.backend_connection.status == 'Failed'
-    assert result.checks.web_search.status == 'NotRun'
-    assert result.checks.timeout_cancel.status == 'Passed'
 
 
-def test_openai_episode_connection_test_distinguishes_search_not_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """backend 応答成功と Web 検索未実行を別の check として返す。"""
-
-    async def MissingSearch(**_kwargs: object) -> EpisodeLookupResult:
-        return _result(
-            'SearchNotRun',
-            error_code='MissingWebSearchCall',
-            http_status=200,
-        )
-
-    monkeypatch.setattr(OpenAICompatibleModule, 'SearchRecordedEpisodeNumber', MissingSearch)
-    backend = OpenAICompatibleBackend(
-        settings=RecordedSeriesSettings(
-            ai_enabled=True,
-            ai_episode_number_search_enabled=True,
-            api_base_url='https://api.example/v1',
-            model='test-model',
-        ),
-        api_key='test-key',
-    )
-
-    result = asyncio.run(backend.testConnection('EpisodeLookup'))
-
-    assert result.success is False
-    assert result.checks is not None
-    assert result.checks.backend_connection.status == 'Passed'
-    assert result.checks.web_search.status == 'Failed'
-    assert result.checks.source_url.status == 'NotRun'
-    assert result.checks.strict_schema.status == 'NotRun'
 
 
 @pytest.mark.parametrize('success', [True, False])

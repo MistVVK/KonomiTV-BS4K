@@ -31,7 +31,6 @@ from app.metadata.ai.KonomiTVBS4KACPCredentials import (
     KonomiTVBS4KACPCredentials,
     KonomiTVBS4KACPImportProvider,
 )
-from app.metadata.ai.openai_compatible import OpenAICompatibleBackend
 from app.metadata.RecordedEpisodeContext import (
     BuildEpisodeProviderFingerprint,
     RecordedEpisodeLookupContext,
@@ -234,15 +233,23 @@ def get_episode_lookup_provider_fingerprint(
 ) -> str:
     """接続試験と実行前検証で共有する、安全な能力証明キーを返す。"""
 
-    if settings.ai_backend == 'OpenAICompatible':
-        endpoint_identifier = settings.api_base_url
+    if settings.ai_backend == 'OpenCode':
+        # OpenCode は service_id を fingerprint の核にする（Phase 4 で精緻化）。
+        endpoint_identifier = json.dumps(
+            {
+                'backend': 'OpenCode',
+                'service_id': settings.ai_backend_service_id,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(',', ':'),
+        )
+        backend_kind_for_fingerprint = 'OpenCode'
+        effective_api_key: str | None = None
     else:
-        provider_by_backend: dict[str, Literal['codex', 'grok', 'google']] = {
-            'AcpCodex': 'codex',
-            'AcpGrok': 'grok',
-            'AcpGemini': 'google',
-        }
-        credential_provider = provider_by_backend[settings.ai_backend]
+        # ACP は credential 世代と profile 名を fingerprint に含める。
+        # 検証した世代と実際に CLI が読む世代を一致させるための核になる。
+        credential_provider = _GetACPCredentialProvider(settings.ai_backend)
         endpoint_identifier = json.dumps(
             {
                 'profile': f'{settings.ai_backend}:recorded-series-profile',
@@ -250,15 +257,7 @@ def get_episode_lookup_provider_fingerprint(
                     KonomiTVBS4KACPCredentials.getCredentialGeneration(
                         credential_provider,
                     )
-                ),
-                'google_cloud_project': (
-                    settings.google_cloud_project
-                    if settings.ai_backend == 'AcpGemini'
-                    else None
-                ),
-                'google_cloud_location': (
-                    settings.google_cloud_location
-                    if settings.ai_backend == 'AcpGemini'
+                    if credential_provider is not None
                     else None
                 ),
             },
@@ -266,11 +265,13 @@ def get_episode_lookup_provider_fingerprint(
             sort_keys=True,
             separators=(',', ':'),
         )
+        backend_kind_for_fingerprint = settings.ai_backend
+        effective_api_key = None
     return BuildEpisodeProviderFingerprint(
-        backend_kind=settings.ai_backend,
+        backend_kind=backend_kind_for_fingerprint,
         effective_model=get_audit_model(settings),
         endpoint_identifier=endpoint_identifier,
-        api_key=api_key if settings.ai_backend == 'OpenAICompatible' else None,
+        api_key=effective_api_key,
     )
 
 
@@ -413,21 +414,28 @@ def _create_backend(
 ) -> RecordedSeriesAIBackend:
     """設定に基づいてバックエンドインスタンスを生成する。
 
+    OpenCode は service_id から OpenCodeBackend を構築する。
+    AcpCodex / AcpGrok は従来どおり ACP アダプタを生成する（Phase 6 まで併存）。
+
     Args:
         settings: 判定開始時点の録画シリーズ判定設定（immutable snapshot）。
-        api_key: 同じ時点で解決した API キー。OpenAI 互換時のみ使用する。
+        api_key: 同じ時点で解決した API キー。OpenCode では未使用（secrets 参照）。
 
     Returns:
         RecordedSeriesAIBackend: 適切なバックエンドインスタンス。
 
     Raises:
         AcpBackendNotImplementedError: ACP バックエンドのコマンドが未設定の場合。
+        RecordedSeriesAIError: OpenCode service が未設定の場合。
     """
-    if settings.ai_backend == 'OpenAICompatible':
-        return cast(
-            RecordedSeriesAIBackend,
-            OpenAICompatibleBackend(settings=settings, api_key=api_key),
-        )
+    if settings.ai_backend == 'OpenCode':
+        from app.metadata.ai.opencode_backend import BuildOpenCodeBackendFromServiceID
+
+        _ = api_key
+        service_id = settings.ai_backend_service_id
+        if service_id is None or service_id.strip() == '':
+            raise RecordedSeriesAIError('OpenCodeServiceNotFound')
+        return BuildOpenCodeBackendFromServiceID(service_id)
 
     # ACP バックエンド
     from app.metadata.ai.acp_presets import resolve_command
@@ -494,11 +502,6 @@ def _create_backend(
         reasoning_effort=settings.acp_reasoning_effort,
         cwd=runtime_cwd,
         profile_dir=str(profile_dir),
-        readable_files=(
-            (profile_env['GOOGLE_APPLICATION_CREDENTIALS'],)
-            if settings.ai_backend == 'AcpGemini'
-            else ()
-        ),
     )
 
 
@@ -861,7 +864,8 @@ async def select_candidate(
             minimum_confidence=minimum_confidence,
         )
 
-    if settings.ai_backend == 'OpenAICompatible':
+    if settings.ai_backend == 'OpenCode':
+        # Phase 2 で OpenCodeBackend を直接呼ぶ（ACP 直列 lock は使わない）。
         result = await RunSelection()
     else:
         result = await _RunACPOperationWithDeadline(
@@ -908,7 +912,8 @@ async def resolve_series_metadata(
         backend = _create_backend(settings, api_key=api_key)
         return await backend.resolveSeriesMetadata(program, hints)
 
-    if settings.ai_backend == 'OpenAICompatible':
+    if settings.ai_backend == 'OpenCode':
+        # Phase 2 で OpenCodeBackend を直接呼ぶ。
         result = await RunGeneration()
     else:
         result = await _RunACPOperationWithDeadline(
@@ -957,7 +962,8 @@ async def lookup_episode(
         backend = _create_backend(settings, api_key=api_key)
         return await backend.lookupEpisode(program)
 
-    if settings.ai_backend == 'OpenAICompatible':
+    if settings.ai_backend == 'OpenCode':
+        # Phase 2 で OpenCodeBackend を直接呼ぶ。
         result = await RunLookup()
     else:
         # proof 再照合から subprocess 終了まで credential import/delete を止め、
@@ -980,10 +986,14 @@ async def test_connection(
     Args:
         capability: 'CandidateSelection' または 'EpisodeLookup'。
         settings: 接続試験に使う設定 snapshot。未指定時は保存済み設定。
-        api_key: OpenAI 互換時の API キー snapshot。settings 指定時に併用する。
+        api_key: 未使用（互換引数）。settings 指定時に併用する。
 
     Returns:
         ConnectionTestResult: 接続試験結果。
+
+    Note:
+        OpenCode は service 単位 backend で接続試験する。draft 一時キー試験は
+        AIBackendRouter の connection-test API を使う。
     """
     if settings is None:
         settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
@@ -1000,7 +1010,7 @@ async def test_connection(
             provider_fingerprint=provider_fingerprint,
         )
 
-    if settings.ai_backend == 'OpenAICompatible':
+    if settings.ai_backend == 'OpenCode':
         return await RunTest()
     try:
         return await _RunACPOperationWithDeadline(
@@ -1049,8 +1059,8 @@ def get_backend_kind() -> str:
 def get_audit_model(settings: RecordedSeriesSettings | None = None) -> str:
     """監査用のモデル文字列（backend prefix 付き）を返す。
 
-    OpenAI 互換: "openai:gpt-5.6-luna"
     ACP: "acp:codex:claude-sonnet-4-5" または "acp:codex"
+    OpenCode: "opencode:{provider}/{model}" または service 未設定時 "opencode"
 
     Args:
         settings: 監査ラベルへ変換する設定。未指定時は保存済み設定を使用する。
@@ -1058,16 +1068,28 @@ def get_audit_model(settings: RecordedSeriesSettings | None = None) -> str:
     Returns:
         backend 種別とモデルを識別できる監査ラベル。
     """
+
     effective_settings = settings or RecordedSeriesSettingsStore.getSettings()
-    backend_kind = effective_settings.ai_backend
-    if backend_kind == 'OpenAICompatible':
-        return f'openai:{effective_settings.model}'
+    if effective_settings.ai_backend == 'OpenCode':
+        service_id = effective_settings.ai_backend_service_id
+        if service_id is None:
+            return 'opencode'
+        try:
+            from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
+            service = AIBackendSettingsStore.getService(service_id)
+        except (OSError, ValueError):
+            service = None
+        if service is None:
+            return f'opencode:service:{service_id}'
+        return (
+            f'opencode:{service.opencode_provider_id}/{service.opencode_model_id}'
+        )
+
     backend_prefix_map: dict[str, str] = {
         'AcpCodex': 'acp:codex',
         'AcpGrok': 'acp:grok',
-        'AcpGemini': 'acp:gemini',
     }
-    prefix = backend_prefix_map.get(backend_kind, 'acp')
+    prefix = backend_prefix_map.get(effective_settings.ai_backend, 'acp')
     acp_model = effective_settings.acp_model
     if acp_model:
         label = f'{prefix}:{acp_model}'

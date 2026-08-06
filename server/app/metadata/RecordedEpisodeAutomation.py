@@ -5,13 +5,11 @@ import hashlib
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime
-from datetime import time as datetime_time
 from decimal import Decimal
 from typing import Literal, cast
 
 from tortoise import transactions
 from tortoise.backends.base.client import BaseDBAsyncClient
-from tortoise.expressions import Q
 from typing_extensions import TypedDict
 
 from app import logging
@@ -1394,16 +1392,12 @@ class RecordedEpisodeAutomation:
                     "LegacyRequiresManualBackfill",
                 )
 
-            settings, runtime_api_key = (
-                RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-            )
+            settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
             audit_model = get_audit_model(settings)
             provider_fingerprint = get_episode_lookup_provider_fingerprint(
                 settings,
                 (
-                    runtime_api_key
-                    if settings.ai_backend == "OpenAICompatible"
-                    else None
+                    None  # OpenCode: API key not on recorded-series settings
                 ),
             )
 
@@ -1440,9 +1434,7 @@ class RecordedEpisodeAutomation:
                 or has_episode_lookup_capability_proof(
                     settings,
                     (
-                        runtime_api_key
-                        if settings.ai_backend == "OpenAICompatible"
-                        else None
+                        None  # OpenCode: API key not on recorded-series settings
                     ),
                 )
                 is False
@@ -1473,38 +1465,7 @@ class RecordedEpisodeAutomation:
                     error_code,
                 )
 
-            # 予約作成までを共有 lock 内に置き、候補選択と合わせた日次上限を原子的に守る。
-            if settings.daily_ai_request_limit > 0:
-                today_start = datetime.combine(
-                    datetime.now(tz=JST).date(), datetime_time.min, tzinfo=JST
-                )
-                requests_today = (
-                    await RecordedSeriesAIRequest.filter(
-                        purpose__in=["Resolution", "EpisodeLookup"],
-                        created_at__gte=today_start,
-                    )
-                    .filter(
-                        Q(error_code=None)
-                        | Q(error_code__not="InputChangedBeforeRequest"),
-                    )
-                    .count()
-                )
-                if requests_today >= settings.daily_ai_request_limit:
-                    await cls._recordPreflightOutcome(
-                        snapshot=snapshot,
-                        resolution=resolution,
-                        input_fingerprint=input_fingerprint,
-                        provider_fingerprint=provider_fingerprint,
-                        outcome="RateLimited",
-                        error_code="DailyAIRequestLimitReached",
-                    )
-                    return RecordedEpisodeAutomationResult(
-                        recorded_program_id,
-                        "Skipped",
-                        "DailyLimit",
-                        False,
-                        "DailyAIRequestLimitReached",
-                    )
+            # 日次上限は廃止。月次 cost/token 上限は Phase 3 の AIBackend 台帳で扱う。
 
             # 確定値はそのまま表示し、lookup 監査だけを Pending にする。
             # 前回成功時の evidence（web_search_performed / citations / proposed_*）は
@@ -1559,7 +1520,7 @@ class RecordedEpisodeAutomation:
             result = await ai_lookup_episode(
                 program=context,
                 settings=settings,
-                api_key=runtime_api_key,
+                api_key=None,
                 expected_provider_fingerprint=provider_fingerprint,
                 require_capability_proof=(
                     expected_provider_fingerprint is not None
@@ -1856,9 +1817,7 @@ class RecordedEpisodeAutomation:
             ):
                 raise RecordedEpisodeRelookupConflictError
 
-            settings, runtime_api_key = (
-                RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-            )
+            settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
             if (
                 settings.enabled is False
                 or settings.ai_enabled is False
@@ -1866,9 +1825,7 @@ class RecordedEpisodeAutomation:
                 or has_episode_lookup_capability_proof(
                     settings,
                     (
-                        runtime_api_key
-                        if settings.ai_backend == "OpenAICompatible"
-                        else None
+                        None  # OpenCode: API key not on recorded-series settings
                     ),
                 )
                 is False
@@ -1878,33 +1835,12 @@ class RecordedEpisodeAutomation:
                 get_episode_lookup_provider_fingerprint(
                     settings,
                     (
-                        runtime_api_key
-                        if settings.ai_backend == "OpenAICompatible"
-                        else None
+                        None  # OpenCode: API key not on recorded-series settings
                     ),
                 )
             )
 
-            async with RECORDED_SERIES_RESOLUTION_LOCK:
-                if settings.daily_ai_request_limit > 0:
-                    today_start = datetime.combine(
-                        datetime.now(tz=JST).date(),
-                        datetime_time.min,
-                        tzinfo=JST,
-                    )
-                    requests_today = (
-                        await RecordedSeriesAIRequest.filter(
-                            purpose__in=["Resolution", "EpisodeLookup"],
-                            created_at__gte=today_start,
-                        )
-                        .filter(
-                            Q(error_code=None)
-                            | Q(error_code__not="InputChangedBeforeRequest"),
-                        )
-                        .count()
-                    )
-                    if requests_today >= settings.daily_ai_request_limit:
-                        raise RecordedEpisodeRelookupRateLimitedError
+            # 日次上限は廃止。月次上限は Phase 3。
 
             handle = await AnalysisTaskTracker.start(
                 "BatchEpisodeResolution",
@@ -2134,7 +2070,7 @@ class RecordedEpisodeAutomation:
             return
         await cls.start()
         await cls.promoteStoredProposals()
-        settings, runtime_api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+        settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
         # OFFへの設定変更では、旧Web検索の提案・引用をUnknownへ上書きしない。
         # 再有効化時には同じsettingsUpdated()を通るため、その時点で再試行できる。
         if (
@@ -2147,9 +2083,7 @@ class RecordedEpisodeAutomation:
             provider_fingerprint=get_episode_lookup_provider_fingerprint(
                 settings,
                 (
-                    runtime_api_key
-                    if settings.ai_backend == "OpenAICompatible"
-                    else None
+                    None  # OpenCode: API key not on recorded-series settings
                 ),
             )
         )
@@ -2175,9 +2109,7 @@ class RecordedEpisodeAutomation:
                 )
 
             await cls.start()
-            settings, runtime_api_key = (
-                RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-            )
+            settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
             # 一括処理を受け付けてから全件 Skipped にするのではなく、保存済み設定と
             # 接続試験で話数 Web 検索能力を確認できる場合だけ実行履歴を作成する。
             if (
@@ -2186,9 +2118,7 @@ class RecordedEpisodeAutomation:
                 or has_episode_lookup_capability_proof(
                     settings,
                     (
-                        runtime_api_key
-                        if settings.ai_backend == "OpenAICompatible"
-                        else None
+                        None  # OpenCode: API key not on recorded-series settings
                     ),
                 )
                 is False
@@ -2197,9 +2127,7 @@ class RecordedEpisodeAutomation:
             provider_fingerprint = get_episode_lookup_provider_fingerprint(
                 settings,
                 (
-                    runtime_api_key
-                    if settings.ai_backend == 'OpenAICompatible'
-                    else None
+                    None  # OpenCode: API key not on recorded-series settings
                 ),
             )
             candidates = await cls._loadBackfillCandidateIDs(

@@ -1,14 +1,17 @@
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import tempfile
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, cast
 
 import pytest
 from tortoise import Tortoise
 
+import app.metadata.ai.recorded_series_ai as RecordedSeriesAIModule
 import app.metadata.RecordedEpisodeAutomation as RecordedEpisodeAutomationModule
 from app.constants import JST
 from app.metadata.ai.backends import (
@@ -21,6 +24,7 @@ from app.metadata.ai.recorded_series_ai import (
     get_episode_lookup_provider_fingerprint,
     has_episode_lookup_capability_proof,
     record_episode_lookup_capability_proof,
+    reset_episode_lookup_capability_proofs_for_tests,
 )
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle
 from app.metadata.RecordedEpisodeAutomation import (
@@ -28,7 +32,6 @@ from app.metadata.RecordedEpisodeAutomation import (
     RecordedEpisodeRelookupConflictError,
     RecordedEpisodeRelookupDisabledError,
     RecordedEpisodeRelookupNotFoundError,
-    RecordedEpisodeRelookupRateLimitedError,
 )
 from app.metadata.RecordedEpisodeContext import (
     BuildEpisodeInputFingerprint,
@@ -162,19 +165,25 @@ async def CreateRecordedProgram(
 def InstallAISettings(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    daily_limit: int = 20,
     acceptance_mode: str = "HighConfidenceOnly",
 ) -> RecordedSeriesSettings:
     """AI話数検索ONの設定とダミーキーをメモリ上で返す。"""
+
+    # 能力証明はテスト専用の一時ファイルへ書き、本番 DATA_DIR を汚染しない。
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'EPISODE_LOOKUP_CAPABILITY_PROOFS_PATH',
+        Path(tempfile.mkdtemp()) / 'recorded-series-episode-lookup-proofs.json',
+    )
+    reset_episode_lookup_capability_proofs_for_tests()
 
     settings = RecordedSeriesSettings(
         enabled=True,
         ai_enabled=True,
         ai_episode_number_search_enabled=True,
         ai_episode_number_acceptance_mode=acceptance_mode,  # type: ignore[arg-type]
-        api_base_url="https://api.example/v1",
-        model="test-model",
-        daily_ai_request_limit=daily_limit,
+        ai_backend="OpenCode",
+        ai_backend_service_id="00000000-0000-4000-8000-000000000001",
     )
 
     def GetSettingsAndAPIKey(
@@ -520,7 +529,6 @@ def test_acp_episode_lookup_uses_the_common_facade_and_persists_result(
         ai_enabled=True,
         ai_backend="AcpCodex",
         ai_episode_number_search_enabled=True,
-        model="unused-for-acp",
     )
     assert settings.ai_episode_number_search_enabled is True
 
@@ -1428,8 +1436,8 @@ def test_in_flight_lookup_uses_latest_acceptance_mode_after_external_wait(
         ai_enabled=True,
         ai_episode_number_search_enabled=True,
         ai_episode_number_acceptance_mode="HighConfidenceOnly",
-        api_base_url="https://api.example/v1",
-        model="test-model",
+        ai_backend="OpenCode",
+        ai_backend_service_id="00000000-0000-4000-8000-000000000001",
     )
     lookup_started = asyncio.Event()
     finish_lookup = asyncio.Event()
@@ -1525,8 +1533,8 @@ def test_disabled_settings_update_does_not_enqueue_provider_retry(
         ai_enabled=False,
         ai_episode_number_search_enabled=True,
         ai_episode_number_acceptance_mode="HighConfidenceOnly",
-        api_base_url="https://provider-b.example/v1",
-        model="provider-b-model",
+        ai_backend="OpenCode",
+        ai_backend_service_id="00000000-0000-4000-8000-000000000001",
     )
     enqueue_calls = 0
 
@@ -1578,116 +1586,6 @@ def test_disabled_settings_update_does_not_enqueue_provider_retry(
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
             RecordedEpisodeAutomation._worker_task = None
-
-    asyncio.run(Run())
-
-
-def test_episode_search_respects_shared_daily_ai_quota(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """同日のSeries候補選択が上限を使い切った場合、Episode検索は予約も送信もしない。"""
-
-    InstallAISettings(monkeypatch, daily_limit=1)
-
-    async def SearchMustNotRun(**_kwargs: object) -> AIEpisodeLookupResult:
-        raise AssertionError("Shared daily limit must block Episode Web Search.")
-
-    monkeypatch.setattr(
-        RecordedEpisodeAutomationModule, "ai_lookup_episode", SearchMustNotRun
-    )
-
-    async def Run() -> None:
-        await InitializeDatabase()
-        try:
-            series = await Series.create(
-                title="上限シリーズ", description="", genres=ANIME_GENRES
-            )
-            channel = await CreateChannel()
-            program = await CreateRecordedProgram(
-                1, series=series, channel=channel, episode_number=None
-            )
-            await RecordedSeriesAIRequest.create(
-                resolution_id=None,
-                episode_resolution_id=None,
-                purpose="Resolution",
-                status="Succeeded",
-                model="candidate-model",
-                candidate_ids=["unresolved"],
-                selected_choice_id="unresolved",
-                error_code=None,
-            )
-
-            result = await RecordedEpisodeAutomation.resolveProgram(program.id)
-
-            assert result.status == "Skipped"
-            assert result.source == "DailyLimit"
-            assert result.ai_requested is False
-            assert result.error_code == "DailyAIRequestLimitReached"
-            resolution = await RecordedEpisodeResolution.get(
-                recorded_program_id=program.id
-            )
-            assert resolution.status == "Unknown"
-            assert resolution.source == "Local"
-            assert resolution.lookup_outcome == "RateLimited"
-            assert resolution.error_code == "DailyAIRequestLimitReached"
-            assert resolution.error_message is not None
-            assert await RecordedSeriesAIRequest.all().count() == 1
-        finally:
-            await Tortoise.close_connections()
-
-    asyncio.run(Run())
-
-
-def test_input_changed_before_request_does_not_consume_daily_quota(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """外部POST前に入力変更で閉じた監査は共有上限から除外し、次の検索を許可する。"""
-
-    InstallAISettings(monkeypatch, daily_limit=1)
-    search_calls = 0
-
-    async def SearchEpisode(**_kwargs: object) -> AIEpisodeLookupResult:
-        nonlocal search_calls
-        search_calls += 1
-        return CreateAIResult()
-
-    monkeypatch.setattr(
-        RecordedEpisodeAutomationModule, "ai_lookup_episode", SearchEpisode
-    )
-
-    async def Run() -> None:
-        await InitializeDatabase()
-        try:
-            series = await Series.create(
-                title="上限除外シリーズ", description="", genres=ANIME_GENRES
-            )
-            channel = await CreateChannel()
-            program = await CreateRecordedProgram(
-                1, series=series, channel=channel, episode_number=None
-            )
-            await RecordedSeriesAIRequest.create(
-                resolution_id=None,
-                episode_resolution_id=None,
-                purpose="EpisodeLookup",
-                status="Failed",
-                model="previous-model",
-                candidate_ids=[],
-                error_code="InputChangedBeforeRequest",
-            )
-
-            result = await RecordedEpisodeAutomation.resolveProgram(program.id)
-
-            assert result.status == "Resolved"
-            assert result.source == "WebSearch"
-            assert result.ai_requested is True
-            assert search_calls == 1
-            assert await RecordedSeriesAIRequest.all().count() == 2
-            latest_audit = await RecordedSeriesAIRequest.all().order_by("-id").first()
-            assert latest_audit is not None
-            assert latest_audit.status == "Succeeded"
-            assert latest_audit.error_code is None
-        finally:
-            await Tortoise.close_connections()
 
     asyncio.run(Run())
 
@@ -2745,14 +2643,19 @@ def test_single_relookup_validates_not_found_stale_and_manual(
 def test_single_relookup_requires_matching_capability_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """接続試験の provider fingerprint と異なるキーでは単票再検索を開始しない。"""
+    """接続試験の provider fingerprint と異なる provider では単票再検索を開始しない。"""
 
     settings = InstallAISettings(monkeypatch)
+    # OpenCode では API キーは fingerprint の核にならないため、provider が異なることを
+    # service_id の違いで表現して、登録済み proof と fingerprint を不一致にする。
+    changed_settings = settings.model_copy(
+        update={"ai_backend_service_id": "00000000-0000-4000-8000-000000000002"},
+    )
 
     def GetUnprovenSettingsAndAPIKey(
         _cls: type[RecordedSeriesSettingsStore],
     ) -> tuple[RecordedSeriesSettings, str]:
-        return settings, "unproven-episode-lookup-key"
+        return changed_settings, "unproven-episode-lookup-key"
 
     monkeypatch.setattr(
         RecordedSeriesSettingsStore,
@@ -2800,7 +2703,7 @@ def test_relookup_rechecks_the_accepted_provider_before_external_call(
         "test-secret",
     )
     changed_settings = accepted_settings.model_copy(
-        update={"api_base_url": "https://changed-provider.example/v1"},
+        update={"ai_backend_service_id": "00000000-0000-4000-8000-000000000002"},
     )
 
     def GetChangedSettingsAndAPIKey(
@@ -2992,41 +2895,3 @@ def test_single_relookup_returns_accepted_and_reuses_running_execution(
 
     asyncio.run(Run())
 
-
-def test_single_relookup_rejects_exhausted_daily_limit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """単票再検索も候補選択と共有する日次上限を予約前に検証する。"""
-
-    InstallAISettings(monkeypatch, daily_limit=1)
-
-    async def Run() -> None:
-        await InitializeDatabase()
-        try:
-            series = await Series.create(
-                title="単票上限シリーズ", description="", genres=ANIME_GENRES
-            )
-            channel = await CreateChannel()
-            program = await CreateRecordedProgram(
-                1, series=series, channel=channel, episode_number=None
-            )
-            await RecordedSeriesAIRequest.create(
-                resolution_id=None,
-                episode_resolution_id=None,
-                purpose="Resolution",
-                status="Succeeded",
-                model="candidate-model",
-                candidate_ids=[],
-            )
-
-            with pytest.raises(RecordedEpisodeRelookupRateLimitedError):
-                await RecordedEpisodeAutomation.startRelookup(
-                    program.id,
-                    expected_series_id=series.id,
-                    expected_series_episode_id=None,
-                )
-            assert RecordedEpisodeAutomation._relookup_tasks == {}
-        finally:
-            await Tortoise.close_connections()
-
-    asyncio.run(Run())

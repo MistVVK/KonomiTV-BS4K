@@ -192,7 +192,6 @@ async def CreateGenerationProgram(
 def GenerationSettings(
     *,
     ai_enabled: bool,
-    daily_limit: int = 0,
     legacy_candidate_selection_enabled: bool = True,
 ) -> RecordedSeriesSettings:
     """外部接続を mock する Resolver 用設定を返す。"""
@@ -202,9 +201,7 @@ def GenerationSettings(
         ai_enabled=ai_enabled,
         ai_candidate_selection_enabled=legacy_candidate_selection_enabled,
         ai_episode_number_search_enabled=True,
-        daily_ai_request_limit=daily_limit,
-        api_base_url='https://example.invalid/v1',
-        model='test-model',
+        ai_backend='AcpCodex',
     )
 
 
@@ -416,9 +413,9 @@ def test_snapshot_generation_change_is_rejected_before_resolution_update(
             staticmethod(lambda: (
                 SimpleNamespace(
                     enabled=True,
-                    ai_backend='OpenAICompatible',
-                    model='test-model',
+                    ai_backend='AcpCodex',
                     acp_model=None,
+                    ai_backend_service_id=None,
                 ),
                 None,
             )),
@@ -984,13 +981,11 @@ def test_zero_ai_request_limit_skips_daily_count_and_checks_recent_attempt_cache
                 SimpleNamespace(
                     enabled=True,
                     ai_enabled=True,
-                    ai_backend='OpenAICompatible',
-                    api_base_url='https://example.invalid/v1',
-                    model='test-model',
+                    ai_backend='AcpCodex',
                     acp_model=None,
-                    daily_ai_request_limit=0,
+                    ai_backend_service_id=None,
                 ),
-                'test-key',
+                None,
             )),
         )
         monkeypatch.setattr(RecordedSeriesResolver, '_snapshot_generation', 0)
@@ -1040,11 +1035,10 @@ def test_zero_ai_request_limit_skips_daily_count_and_checks_recent_attempt_cache
 @pytest.mark.parametrize(
     'ai_backend,acp_model,expected_audit_model,failure_code',
     [
-        ('OpenAICompatible', None, 'openai:test-model', None),
         ('AcpCodex', 'test-acp-model', 'acp:codex:test-acp-model', None),
         ('AcpCodex', 'test-acp-model', 'acp:codex:test-acp-model', 'HostCLIStartFailed'),
     ],
-    ids=['openai-success', 'acp-success', 'acp-setup-failure'],
+    ids=['acp-success', 'acp-setup-failure'],
 )
 def test_ai_generation_audit_uses_backend_prefix_and_closes_failures(
     monkeypatch: pytest.MonkeyPatch,
@@ -1192,12 +1186,10 @@ def test_ai_generation_audit_uses_backend_prefix_and_closes_failures(
                     enabled=True,
                     ai_enabled=True,
                     ai_backend=ai_backend,
-                    api_base_url='https://example.invalid/v1',
-                    model='test-model',
                     acp_model=acp_model,
-                    daily_ai_request_limit=20,
+                    ai_backend_service_id=None,
                 ),
-                'test-key',
+                None,
             )),
         )
         monkeypatch.setattr(RecordedSeriesResolver, '_snapshot_generation', 0)
@@ -1329,13 +1321,11 @@ def test_generation_change_while_building_wikipedia_candidates_stops_before_ai_r
                 SimpleNamespace(
                     enabled=True,
                     ai_enabled=True,
-                    ai_backend='OpenAICompatible',
-                    api_base_url='https://example.invalid/v1',
-                    model='test-model',
+                    ai_backend='AcpCodex',
                     acp_model=None,
-                    daily_ai_request_limit=20,
+                    ai_backend_service_id=None,
                 ),
-                'test-key',
+                None,
             )),
         )
         monkeypatch.setattr(RecordedSeriesResolver, '_snapshot_generation', 0)
@@ -1464,7 +1454,7 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
         return [{'page_id': 789, 'title': '監査予約世代更新テスト', 'extract': '候補本文'}]
 
     async def CreateAIRequest(**kwargs: object) -> FakeAIRequest:
-        assert kwargs['model'] == 'openai:test-model'
+        assert kwargs['model'] == 'acp:codex:test-acp-model'
         events.append('audit-created')
         RecordedSeriesResolver._snapshot_generation += 1
         return ai_request
@@ -1481,13 +1471,11 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
                 SimpleNamespace(
                     enabled=True,
                     ai_enabled=True,
-                    ai_backend='OpenAICompatible',
-                    api_base_url='https://example.invalid/v1',
-                    model='test-model',
-                    acp_model=None,
-                    daily_ai_request_limit=20,
+                    ai_backend='AcpCodex',
+                    acp_model='test-acp-model',
+                    ai_backend_service_id=None,
                 ),
-                'test-key',
+                None,
             )),
         )
         monkeypatch.setattr(RecordedSeriesResolver, '_snapshot_generation', 0)
@@ -1685,7 +1673,7 @@ def test_generation_change_while_applying_ai_result_closes_audit_as_failed(
         try:
             await CreateGenerationChannel()
             program = await CreateGenerationProgram(13)
-            settings = GenerationSettings(ai_enabled=True, daily_limit=20)
+            settings = GenerationSettings(ai_enabled=True)
             monkeypatch.setattr(
                 RecordedSeriesSettingsStore,
                 'getSettingsAndAPIKey',
@@ -2479,76 +2467,3 @@ def test_manual_resolution_has_priority_over_ai_generation(
     asyncio.run(Scenario())
 
 
-@pytest.mark.parametrize(
-    ('ai_enabled', 'daily_limit', 'expected_status', 'expected_source'),
-    [
-        (False, 0, 'Resolved', 'Local'),
-        (True, 1, 'NeedsReview', 'AI'),
-    ],
-)
-def test_ai_off_keeps_local_path_and_daily_limit_never_falls_back(
-    monkeypatch: pytest.MonkeyPatch,
-    ai_enabled: bool,
-    daily_limit: int,
-    expected_status: str,
-    expected_source: str,
-) -> None:
-    """AI OFF は明示話数 Local を維持し、AI ON の上限超過は Local へ逃がさない。"""
-
-    async def SearchWikipedia(_title: str, *, limit: int) -> list[dict[str, object]]:
-        raise AssertionError(f'この分岐では Wikipedia hints を作ってはいけない: {limit}')
-
-    async def ResolveMetadata(**_kwargs: object) -> None:
-        raise AssertionError('この分岐では AI 生成を呼んではいけない')
-
-    async def Scenario() -> None:
-        await InitializeGenerationDatabase()
-        try:
-            await CreateGenerationChannel()
-            program = await CreateGenerationProgram(25)
-            if ai_enabled:
-                await RecordedSeriesAIRequest.create(
-                    resolution=None,
-                    purpose='Resolution',
-                    status='Succeeded',
-                    model='openai:previous-model',
-                    candidate_ids=[],
-                    selected_choice_id='series:generated',
-                )
-            settings = GenerationSettings(ai_enabled=ai_enabled, daily_limit=daily_limit)
-            monkeypatch.setattr(
-                RecordedSeriesSettingsStore,
-                'getSettingsAndAPIKey',
-                staticmethod(lambda: (settings, 'test-key')),
-            )
-            monkeypatch.setattr(
-                'app.metadata.RecordedSeriesResolver.SearchWikipediaCandidates',
-                SearchWikipedia,
-            )
-            monkeypatch.setattr(
-                'app.metadata.RecordedSeriesResolver.ai_resolve_series_metadata',
-                ResolveMetadata,
-            )
-            monkeypatch.setattr(RecordedSeriesResolver, '_resolve_lock', asyncio.Lock())
-            monkeypatch.setattr(RecordedSeriesResolver, '_snapshot_generation', 0)
-            monkeypatch.setattr(RecordedSeriesResolver, '_ai_attempt_keys', {})
-
-            result = await RecordedSeriesResolver.resolveProgram(program.id)
-
-            await program.refresh_from_db()
-            resolution = await RecordedSeriesResolution.get(recorded_program_id=program.id)
-            assert result.status == expected_status
-            assert result.source == expected_source
-            assert result.ai_requested is False
-            if ai_enabled:
-                assert program.series_id is None
-                assert resolution.status == 'NeedsReview'
-                assert resolution.error_code == 'DailyAIRequestLimitReached'
-            else:
-                assert program.series_id is not None
-                assert resolution.status == 'Resolved'
-                assert resolution.source == 'Local'
-        finally:
-            await Tortoise.close_connections()
-
-    asyncio.run(Scenario())
