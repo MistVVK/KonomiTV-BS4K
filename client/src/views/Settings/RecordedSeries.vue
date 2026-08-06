@@ -421,7 +421,7 @@
                         話数判定: {{formatLastRunAt(status.episode_last_run_at)}}<br>
                         OpenCode の月次利用量は
                         <router-link to="/settings/server/ai-backends">AIバックエンド</router-link>
-                        で確認します（Phase 5c でカード表示予定）。<br>
+                        で確認します。<br>
                     </div>
                 </div>
             </template>

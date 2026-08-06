@@ -233,8 +233,7 @@ export default class AIBackend {
     }
 
     /**
-     * 月次利用量一覧（Phase 5c の当月カード用。削除済み履歴も含む）。
-     * 5a 時点では画面未配線。API 契約の先行定義。
+     * 月次利用量一覧（当月カード用。削除済み履歴も含む）。
      */
     static async fetchUsageList(year_month?: string): Promise<IAIBackendUsage[] | null> {
         const response = await APIClient.get<IAIBackendUsage[]>('/ai-backends/usage', {

@@ -75,6 +75,14 @@
                             · OAuth: {{ service.oauth_connected ? '接続中' : '未接続' }}
                         </template>
                     </div>
+                    <div v-if="usageByServiceId[service.service_id]" class="ai-backend-card__usage">
+                        <div class="ai-backend-card__usage-title">
+                            当月の利用状況（{{ usageByServiceId[service.service_id]!.year_month }}）
+                        </div>
+                        <div class="ai-backend-card__usage-body">
+                            {{ formatUsageSummary(usageByServiceId[service.service_id]!) }}
+                        </div>
+                    </div>
                     <div class="ai-backend-card__actions">
                         <v-btn size="small" variant="tonal" color="primary" :disabled="is_busy"
                             @click="openEditDialog(service)">編集</v-btn>
@@ -107,6 +115,67 @@
                         <template v-if="test_results[service.service_id]!.latency_ms">
                             （{{ test_results[service.service_id]!.latency_ms }} ms）
                         </template>
+                    </div>
+                </div>
+            </div>
+
+            <div class="settings__content mt-6" :class="{'settings__content--disabled': is_busy}">
+                <div class="settings__content-heading">
+                    <Icon icon="fluent:data-usage-20-filled" width="22px" />
+                    <span class="ml-2">当月の利用状況</span>
+                </div>
+                <div class="settings__item-label mt-2">
+                    表示は OpenCode が返す <strong>推定料金</strong> です。プロバイダの請求額そのものではありません。<br>
+                    上限到達・予約中トークンもここに反映されます。削除済み service の履歴はバッジ付きで残ります。<br>
+                </div>
+                <div v-if="usage_list.length === 0" class="settings__item-label mt-3">
+                    当月の利用履歴はまだありません。
+                </div>
+                <div v-for="usage in usage_list" :key="`${usage.service_id}-${usage.year_month}`"
+                    class="ai-backend-usage-card">
+                    <div class="ai-backend-usage-card__header">
+                        <div class="ai-backend-usage-card__title">
+                            {{ usage.service_name_snapshot || usage.service_id }}
+                        </div>
+                        <div class="ai-backend-usage-card__badges">
+                            <span class="ai-backend-usage-badge">{{ formatBillingMode(usage.billing_mode) }}</span>
+                            <span v-if="usage.service_deleted" class="ai-backend-usage-badge ai-backend-usage-badge--deleted">
+                                削除済み
+                            </span>
+                            <span v-if="usage.token_limit_reached"
+                                class="ai-backend-usage-badge ai-backend-usage-badge--warn">token 上限</span>
+                            <span v-if="usage.cost_limit_reached"
+                                class="ai-backend-usage-badge ai-backend-usage-badge--warn">料金上限</span>
+                        </div>
+                    </div>
+                    <div class="ai-backend-usage-card__meta">
+                        {{ usage.opencode_provider_id_snapshot }} / {{ usage.opencode_model_id_snapshot }}
+                        · {{ usage.year_month }}
+                    </div>
+                    <div class="ai-backend-usage-card__grid">
+                        <div>
+                            <span>確定 token</span>
+                            <strong>{{ formatTokenCount(usage.settled_total_tokens) }}</strong>
+                            <small>
+                                in {{ formatTokenCount(usage.settled_prompt_tokens) }}
+                                / out {{ formatTokenCount(usage.settled_completion_tokens) }}
+                            </small>
+                        </div>
+                        <div>
+                            <span>推定料金（請求額ではない）</span>
+                            <strong>{{ formatUsd(usage.settled_estimated_cost_usd) }}</strong>
+                            <small>確定リクエスト {{ usage.settled_request_count.toLocaleString() }} 回</small>
+                        </div>
+                        <div>
+                            <span>予約中</span>
+                            <strong>{{ formatTokenCount(usage.reserved_total_tokens) }}</strong>
+                            <small>推定 {{ formatUsd(usage.reserved_estimated_cost_usd) }}</small>
+                        </div>
+                        <div>
+                            <span>月次上限</span>
+                            <strong>{{ formatUsageLimits(usage) }}</strong>
+                            <small>{{ formatLimitFlags(usage) }}</small>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -213,6 +282,7 @@ import AIBackend, {
     type AIBillingMode,
     type IAIBackendConnectionTestResult,
     type IAIBackendService,
+    type IAIBackendUsage,
     type IOpenCodeAvailability,
 } from '@/services/AIBackend';
 import useUserStore from '@/stores/UserStore';
@@ -265,8 +335,21 @@ const is_loading = ref(true);
 const authorization_error = ref<'AdminRequired' | 'UserUnavailable' | null>(null);
 const health = ref<IOpenCodeAvailability | null>(null);
 const services = ref<IAIBackendService[]>([]);
+const usage_list = ref<IAIBackendUsage[]>([]);
 const test_results = ref<Record<string, IAIBackendConnectionTestResult | null>>({});
 const testing_service_id = ref<string | null>(null);
+
+/** service カードへ埋め込む当月 usage（削除済みは一覧側のみ）。 */
+const usageByServiceId = computed(() => {
+    const map: Record<string, IAIBackendUsage> = {};
+    for (const usage of usage_list.value) {
+        if (usage.service_deleted) {
+            continue;
+        }
+        map[usage.service_id] = usage;
+    }
+    return map;
+});
 
 const edit_dialog = ref(false);
 const editing_service_id = ref<string | null>(null);
@@ -287,14 +370,102 @@ const is_busy = computed(() =>
     is_saving.value || is_saving_key.value || is_deleting.value || testing_service_id.value !== null,
 );
 
+function formatTokenCount(value: number): string {
+    return value.toLocaleString();
+}
+
+function formatUsd(value: string | null | undefined): string {
+    if (value === null || value === undefined || value.trim() === '') {
+        return '$0';
+    }
+    const amount = Number(value);
+    if (Number.isFinite(amount) === false) {
+        return `$${value}`;
+    }
+    // 推定料金は小数が細かいことがあるため最大 6 桁まで残す
+    return `$${amount.toLocaleString(undefined, {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 6,
+    })}`;
+}
+
+function formatBillingMode(mode: string): string {
+    if (mode === 'Metered') {
+        return 'Metered（従量）';
+    }
+    if (mode === 'Subscription') {
+        return 'Subscription';
+    }
+    if (mode === 'Local') {
+        return 'Local';
+    }
+    return mode;
+}
+
+function formatUsageLimits(usage: IAIBackendUsage): string {
+    if (usage.billing_mode === 'Subscription') {
+        return '上限対象外';
+    }
+    const parts: string[] = [];
+    if (usage.billing_mode === 'Metered') {
+        parts.push(
+            usage.monthly_cost_limit_usd
+                ? `料金 ${formatUsd(usage.monthly_cost_limit_usd)}`
+                : '料金 なし',
+        );
+    }
+    if (usage.billing_mode === 'Metered' || usage.billing_mode === 'Local') {
+        parts.push(
+            usage.monthly_token_limit !== null
+                ? `token ${formatTokenCount(usage.monthly_token_limit)}`
+                : 'token なし',
+        );
+    }
+    return parts.length > 0 ? parts.join(' / ') : 'なし';
+}
+
+function formatLimitFlags(usage: IAIBackendUsage): string {
+    if (usage.service_deleted) {
+        return '履歴のみ（上限 enforce 対象外）';
+    }
+    if (usage.billing_mode === 'Subscription') {
+        return 'サブスク課金のため月次上限は適用しません';
+    }
+    const flags: string[] = [];
+    if (usage.token_limit_reached) {
+        flags.push('token 上限到達');
+    }
+    if (usage.cost_limit_reached) {
+        flags.push('料金上限到達');
+    }
+    if (flags.length === 0) {
+        return usage.cost_limit_effective ? '上限監視中' : '上限なし';
+    }
+    return flags.join(' · ');
+}
+
+function formatUsageSummary(usage: IAIBackendUsage): string {
+    const cost_label = `推定料金 ${formatUsd(usage.settled_estimated_cost_usd)}（請求額ではない）`;
+    const token_label = `確定 token ${formatTokenCount(usage.settled_total_tokens)}`;
+    const reserved_label = usage.reserved_total_tokens > 0
+        ? ` · 予約中 ${formatTokenCount(usage.reserved_total_tokens)}`
+        : '';
+    return `${token_label} · ${cost_label}${reserved_label} · ${formatUsageLimits(usage)}`;
+}
+
 async function reloadAll(): Promise<void> {
-    const [health_result, list] = await Promise.all([
+    // health / services / usage を同時更新（再読込ボタンからも同じ経路）
+    const [health_result, list, usage] = await Promise.all([
         AIBackend.fetchHealth(),
         AIBackend.fetchServices(),
+        AIBackend.fetchUsageList(),
     ]);
     health.value = health_result;
     if (list !== null) {
         services.value = list;
+    }
+    if (usage !== null) {
+        usage_list.value = usage;
     }
 }
 
@@ -519,4 +690,89 @@ onMounted(async () => {
 }
 .ai-backend-card__test--ok { color: #176b4d; }
 .ai-backend-card__test--ng { color: #9b2c2c; }
+.ai-backend-card__usage {
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: rgba(var(--v-theme-primary), 0.06);
+    border: 1px solid rgba(var(--v-theme-primary), 0.14);
+}
+.ai-backend-card__usage-title {
+    font-size: 0.82rem;
+    font-weight: 700;
+    color: rgb(var(--v-theme-text-darken-1));
+}
+.ai-backend-card__usage-body {
+    margin-top: 4px;
+    font-size: 0.88rem;
+    line-height: 1.5;
+}
+.ai-backend-usage-card {
+    margin-top: 14px;
+    padding: 14px 16px;
+    border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
+    border-radius: 10px;
+    background: rgba(var(--v-theme-surface-light), 0.35);
+}
+.ai-backend-usage-card__header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.ai-backend-usage-card__title {
+    font-weight: 700;
+    font-size: 1.02rem;
+}
+.ai-backend-usage-card__badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.ai-backend-usage-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    background: rgba(var(--v-theme-primary), 0.12);
+    color: rgb(var(--v-theme-primary));
+}
+.ai-backend-usage-badge--deleted {
+    background: rgba(155, 44, 44, 0.12);
+    color: #9b2c2c;
+}
+.ai-backend-usage-badge--warn {
+    background: rgba(138, 88, 0, 0.14);
+    color: #8a5800;
+}
+.ai-backend-usage-card__meta {
+    margin-top: 4px;
+    font-size: 0.88rem;
+    color: rgb(var(--v-theme-text-darken-1));
+}
+.ai-backend-usage-card__grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-top: 12px;
+}
+.ai-backend-usage-card__grid > div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.ai-backend-usage-card__grid span {
+    font-size: 0.78rem;
+    color: rgb(var(--v-theme-text-darken-1));
+}
+.ai-backend-usage-card__grid strong {
+    font-size: 1.02rem;
+}
+.ai-backend-usage-card__grid small {
+    font-size: 0.78rem;
+    color: rgb(var(--v-theme-text-darken-1));
+    line-height: 1.4;
+}
 </style>
