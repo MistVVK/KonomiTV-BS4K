@@ -91,9 +91,9 @@
                 <div class="settings__item-heading">バックエンド</div>
                 <div class="settings__item-label">
                     AI によるシリーズ情報生成と話数検索に使用するバックエンドを選択します。<br>
-                    OpenAI 互換 API は Chat Completions / Responses を使用し、ACP はホスト上の CLI を起動します。<br>
+                    OpenCode は「設定 → AIバックエンド」で登録した service を使います。<br>
+                    ACP / Codex・Grok はホスト上の CLI を起動します。<br>
                     シリーズ情報生成と話数 Web 検索は必要な能力が異なるため、それぞれ個別に接続テストしてください。<br>
-                    任意コマンド型の AcpCustom は、安全な固定実行契約と能力証明がないため現在は利用できません。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -101,96 +101,25 @@
                     v-model="settings.ai_backend" />
             </div>
 
-            <!-- OpenAI 互換 API 設定 -->
-            <template v-if="settings.ai_backend === 'OpenAICompatible'">
+            <!-- OpenCode service 選択 -->
+            <template v-if="settings.ai_backend === 'OpenCode'">
             <div class="settings__item">
-                <div class="settings__item-heading">API のベース URL</div>
+                <div class="settings__item-heading">OpenCode service</div>
                 <div class="settings__item-label">
-                    OpenAI または OpenAI 互換サービスの API URL を指定します。末尾のスラッシュはどちらでも構いません。<br>
-                    インターネット上のサービスには HTTPS を使用してください。<br>
+                    AI バックエンド画面で登録した service を選びます。API キーや月次上限はそちらで管理します。<br>
+                    <router-link to="/settings/server/ai-backends">AIバックエンド設定を開く</router-link><br>
                 </div>
-                <v-text-field class="settings__item-form" color="primary" variant="outlined"
+                <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
-                    :error-messages="api_base_url_error"
-                    placeholder="https://api.openai.com/v1"
-                    spellcheck="false" autocapitalize="off"
-                    v-model="settings.api_base_url" />
-            </div>
-            <div class="settings__item">
-                <div class="settings__item-heading">モデル</div>
-                <div class="settings__item-label">
-                    推奨候補から選ぶか、利用する互換サービスのモデル ID を直接入力してください。<br>
-                </div>
-                <v-combobox class="settings__item-form" color="primary" variant="outlined"
-                    :density="is_form_dense ? 'compact' : 'default'"
-                    :items="model_presets"
-                    :error-messages="model_error"
-                    hide-no-data spellcheck="false" autocapitalize="off"
-                    v-model="settings.model" />
-            </div>
-            <div class="settings__item">
-                <div class="settings__item-heading">1 日の AI API リクエスト上限</div>
-                <div class="settings__item-label">
-                    想定外の大量呼び出しを防ぐ上限です。0 を指定すると無制限になります。<br>
-                    Wikipedia の検索と AI を使わない判定は数えません。<br>
-                </div>
-                <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number"
-                    :density="is_form_dense ? 'compact' : 'default'"
-                    :min="0" :max="1000" :step="1"
-                    :error-messages="daily_ai_request_limit_error"
-                    v-model.number="settings.daily_ai_request_limit" />
-            </div>
-            <div class="settings__item">
-                <div class="settings__item-heading">API キー</div>
-                <div class="settings__item-label">
-                    保存済み設定 URL（{{saved_api_base_url}}）用のキー:
-                    <strong>{{settings.api_key_configured ? '設定済み' : '未設定'}}</strong><br>
-                    <template v-if="is_saved_api_base_url_draft === false">
-                        入力中の URL は未保存のため、保存済みキーの有無は接続テストまたは保存後に確認されます。<br>
-                    </template>
-                    保存済みのキーはブラウザへ返しません。新しいキーを入力した場合だけサーバー上のキーを置き換えます。<br>
-                    認証不要のローカル API を利用する場合は空欄のまま設定できます。<br>
-                    ベース URL ごとにキーが保存されるため、過去に設定した URL へ戻すだけでキーが自動選択されます。<br>
-                    入力欄を空のまま保存しても、保存済みのキーは維持されます。<br>
-                    キーを削除するには「保存済みキーを削除」ボタンを使用してください。<br>
-                </div>
-                <v-text-field class="settings__item-form" color="primary" variant="outlined"
-                    :density="is_form_dense ? 'compact' : 'default'"
-                    :type="api_key_showing ? 'text' : 'password'"
-                    :append-inner-icon="api_key_showing ? 'mdi-eye' : 'mdi-eye-off'"
-                    :error-messages="api_key_error"
-                    placeholder="新しい API キー"
-                    autocomplete="new-password" spellcheck="false" autocapitalize="off"
-                    v-model="api_key_input"
-                    @click:appendInner="api_key_showing = !api_key_showing" />
-                <div class="recorded-series-actions mt-3">
-                    <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :loading="testing_connection_capability === 'CandidateSelection'"
-                        :disabled="has_connection_validation_error || testing_connection_capability !== null"
-                        @click="testConnection('CandidateSelection')">
-                        <Icon icon="fluent:plug-connected-checkmark-20-filled" class="mr-2" width="21px" />シリーズ生成をテスト
-                    </v-btn>
-                    <v-btn class="settings__save-button" color="background-lighten-2" variant="flat"
-                        :loading="testing_connection_capability === 'EpisodeLookup'"
-                        :disabled="has_connection_validation_error || testing_connection_capability !== null"
-                        @click="testConnection('EpisodeLookup')">
-                        <Icon icon="fluent:globe-search-20-filled" class="mr-2" width="21px" />話数 Web 検索をテスト
-                    </v-btn>
-                    <v-btn v-if="settings.api_key_configured"
-                        class="settings__save-button" color="error" variant="flat"
-                        :loading="is_deleting_api_key" @click="api_key_delete_dialog = true">
-                        <Icon icon="fluent:key-reset-20-filled" class="mr-2" width="21px" />保存済みキーを削除
-                    </v-btn>
-                </div>
-                <div class="settings__item-label mt-2">
-                    シリーズ生成は Chat Completions、話数検索は Responses API と Web Search の能力を個別に確認します。<br>
-                    本番と同じ API へ最小リクエストを送るため、少量の API 利用が発生します。入力内容は保存されません。<br>
-                </div>
+                    :items="opencode_services" item-title="title" item-value="value"
+                    :error-messages="opencode_service_error"
+                    no-data-text="登録済み service がありません"
+                    v-model="settings.ai_backend_service_id" />
             </div>
             </template>
 
-            <!-- ACP 設定 -->
-            <template v-if="settings.ai_backend !== 'OpenAICompatible'">
+            <!-- ACP 設定（Codex / Grok） -->
+            <template v-if="settings.ai_backend === 'AcpCodex' || settings.ai_backend === 'AcpGrok'">
             <!-- モデル名と推論深さは分離。ACP ごとに候補と初期値が異なる -->
             <div class="settings__item">
                 <div class="settings__item-heading">モデル</div>
@@ -198,14 +127,9 @@
                     <template v-if="settings.ai_backend === 'AcpGrok'">
                         Grok Build の ACP モデルは <code>grok-4.5</code> 固定です。<br>
                     </template>
-                    <template v-else-if="settings.ai_backend === 'AcpCodex'">
+                    <template v-else>
                         Codex のモデル系統を選びます。深さは下の「推論の深さ」で別指定します。<br>
                         初期値は <strong>GPT-5.6 Luna</strong> です。<br>
-                    </template>
-                    <template v-else>
-                        Gemini CLI のモデル ID を選びます。<br>
-                        Gemini CLI 0.52.0 の ACP では推論の深さを個別指定できないため、モデル側の既定を使います。<br>
-                        初期値は <strong>gemini-3.6-flash</strong> です。<br>
                     </template>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
@@ -217,7 +141,7 @@
                     :error-messages="acp_model_error"
                     v-model="acp_model_selection" />
             </div>
-            <div class="settings__item" v-if="settings.ai_backend !== 'AcpGemini'">
+            <div class="settings__item">
                 <div class="settings__item-heading">推論の深さ</div>
                 <div class="settings__item-label">
                     モデル名とは別に、思考の深さを選びます。<br>
@@ -361,44 +285,6 @@
                     </v-btn>
                 </div>
             </div>
-            <template v-if="settings.ai_backend === 'AcpGemini'">
-                <div class="settings__item">
-                    <div class="settings__item-heading">Google ADC</div>
-                    <div class="settings__item-label">
-                        Google Cloud CLI はホストだけにインストールし、
-                        <code>gcloud auth application-default login</code> を実行します。<br>
-                        ADC は Compose override から読み取り専用で直接参照し、KonomiTV-BS4K へコピーしません。<br>
-                    </div>
-                    <div class="recorded-series-auth-status mt-3">
-                        <span>
-                            Google ADC:
-                            <strong :class="{'recorded-series-auth-status--ok':
-                                acp_credential_status?.google_adc_available}">
-                                {{acp_credential_status?.google_adc_available ? '検出済み・読取り可能' : '未検出'}}
-                            </strong>
-                        </span>
-                    </div>
-                </div>
-                <div class="settings__item">
-                    <div class="settings__item-heading">Google Cloud プロジェクト ID</div>
-                    <v-text-field class="settings__item-form" color="primary" variant="outlined"
-                        :density="is_form_dense ? 'compact' : 'default'"
-                        :error-messages="google_cloud_project_error"
-                        placeholder="my-google-cloud-project"
-                        spellcheck="false" autocapitalize="off"
-                        v-model="settings.google_cloud_project" />
-                </div>
-                <div class="settings__item">
-                    <div class="settings__item-heading">Google Cloud リージョン</div>
-                    <v-text-field class="settings__item-form" color="primary" variant="outlined"
-                        :density="is_form_dense ? 'compact' : 'default'"
-                        :error-messages="google_cloud_location_error"
-                        placeholder="asia-northeast1"
-                        spellcheck="false" autocapitalize="off"
-                        v-model="settings.google_cloud_location" />
-                </div>
-            </template>
-
             <v-alert class="mb-4" color="warning" variant="tonal">
                 この認証は録画シリーズのバックグラウンド AI 処理全体で共有する管理者資格情報です。
                 KonomiTV-BS4K の一般ユーザーごとの認証ではありません。<br>
@@ -529,14 +415,13 @@
                     </div>
                 </div>
                 <div class="settings__item">
-                    <div class="settings__item-heading">本日の AI API 利用</div>
+                    <div class="settings__item-heading">最終実行</div>
                     <div class="settings__item-label">
-                        {{status.ai_requests_today.toLocaleString()}} /
-                        {{settings.daily_ai_request_limit === 0 ? '無制限' : settings.daily_ai_request_limit.toLocaleString()}} リクエスト<br>
-                        内訳: シリーズ生成 {{status.series_ai_requests_today.toLocaleString()}}・
-                        話数検索 {{status.episode_ai_requests_today.toLocaleString()}}<br>
-                        シリーズ判定の最終実行: {{formatLastRunAt(status.last_run_at)}}<br>
-                        話数判定の最終実行: {{formatLastRunAt(status.episode_last_run_at)}}<br>
+                        シリーズ判定: {{formatLastRunAt(status.last_run_at)}}<br>
+                        話数判定: {{formatLastRunAt(status.episode_last_run_at)}}<br>
+                        OpenCode の月次利用量は
+                        <router-link to="/settings/server/ai-backends">AIバックエンド</router-link>
+                        で確認します（Phase 5c でカード表示予定）。<br>
                     </div>
                 </div>
             </template>
@@ -585,7 +470,7 @@
                 <div class="settings__item-label">
                     Series 所属済みで、話数が未処理・ローカル判定で不明・移行データで要確認の既存録画を、<br>
                     保存済みの AI 設定で順番に Web 検索します。<br>
-                    手動で訂正した話数は変更せず、1日の AI API リクエスト上限に達した時点で残りを保留します。<br>
+                    手動で訂正した話数は変更せず、月次の AI 利用上限に達した時点で残りを保留します。<br>
                 </div>
             </div>
             <div class="settings__item settings__item--switch">
@@ -638,20 +523,6 @@
             </div>
         </template>
 
-        <v-dialog v-model="api_key_delete_dialog" max-width="480">
-            <v-card class="recorded-series-dialog">
-                <v-card-title>保存済み API キーを削除</v-card-title>
-                <v-card-text>
-                    保存済み設定 URL「{{saved_api_base_url}}」に紐付いた API キーだけを削除します。<br>
-                    入力中の未保存 URL や、他の URL のキーは変更しません。
-                </v-card-text>
-                <v-card-actions>
-                    <v-spacer />
-                    <v-btn variant="text" @click="api_key_delete_dialog = false">キャンセル</v-btn>
-                    <v-btn color="error" variant="flat" :loading="is_deleting_api_key" @click="deleteAPIKey()">削除</v-btn>
-                </v-card-actions>
-            </v-card>
-        </v-dialog>
         <v-dialog v-model="acp_authentication_dialog" max-width="560">
             <v-card class="recorded-series-dialog">
                 <v-card-title>
@@ -711,6 +582,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 
 import Message from '@/message';
+import AIBackend from '@/services/AIBackend';
 import AnalysisTasks, { type IAnalysisTaskExecution } from '@/services/AnalysisTasks';
 import RecordedSeries, {
     type AcpReasoningEffort,
@@ -737,11 +609,6 @@ import SettingsBase from '@/views/Settings/Base.vue';
 
 /** サーバー側 ACP hard timeout の表示用分。ACP_HARD_TIMEOUT_SEC から導出する。 */
 const acp_hard_timeout_minutes = Math.floor(ACP_HARD_TIMEOUT_SEC / 60);
-const model_presets = [
-    'gpt-5.6-luna',
-    'gpt-5.4-nano',
-    'gpt-5-nano',
-];
 /** バックエンド別のモデル候補（角括弧なし）。Grok は 4.5 固定表示。 */
 const acp_model_presets_by_backend: Record<string, {title: string; value: string;}[]> = {
     AcpCodex: [
@@ -755,14 +622,6 @@ const acp_model_presets_by_backend: Record<string, {title: string; value: string
     ],
     AcpGrok: [
         {title: 'Grok 4.5（固定）', value: 'grok-4.5'},
-    ],
-    AcpGemini: [
-        {title: 'Gemini 3.6 Flash', value: 'gemini-3.6-flash'},
-        {title: 'Gemini 3.5 Flash', value: 'gemini-3.5-flash'},
-        {title: 'Gemini 2.5 Flash', value: 'gemini-2.5-flash'},
-        {title: 'Gemini 2.5 Pro', value: 'gemini-2.5-pro'},
-        {title: 'Gemini 3.1 Pro Preview', value: 'gemini-3.1-pro-preview'},
-        {title: 'auto', value: 'auto'},
     ],
 };
 /** backend 別の推論深さ候補。 */
@@ -785,13 +644,11 @@ const acp_reasoning_effort_presets_by_backend: Record<string, {title: string; va
 const acp_defaults_by_backend: Record<string, {model: string | null; effort: AcpReasoningEffort | null;}> = {
     AcpCodex: {model: 'gpt-5.6-luna', effort: 'Medium'},
     AcpGrok: {model: null, effort: 'High'},
-    AcpGemini: {model: 'gemini-3.6-flash', effort: null},
 };
 const ai_backend_options: {title: string; value: AIBackendKind;}[] = [
-    {title: 'OpenAI 互換 API', value: 'OpenAICompatible'},
+    {title: 'OpenCode（AIバックエンド service）', value: 'OpenCode'},
     {title: 'ACP / Codex', value: 'AcpCodex'},
     {title: 'ACP / Grok Build', value: 'AcpGrok'},
-    {title: 'ACP / Gemini CLI', value: 'AcpGemini'},
 ];
 const episode_acceptance_modes: {title: string; value: RecordedEpisodeNumberAcceptanceMode;}[] = [
     {title: '高信頼度の結果のみ受理', value: 'HighConfidenceOnly'},
@@ -830,26 +687,20 @@ const settings = ref<IRecordedSeriesSettings>({
     ai_enabled: false,
     ai_episode_number_search_enabled: false,
     ai_episode_number_acceptance_mode: 'Always',
-    daily_ai_request_limit: 20,
-    ai_backend: 'OpenAICompatible',
-    api_base_url: 'https://api.openai.com/v1',
-    model: 'gpt-5.6-luna',
+    ai_backend: 'AcpCodex',
+    ai_backend_service_id: null,
     acp_model: null,
     acp_reasoning_effort: null,
     konomitv_bs4k_acp_codex_fast_mode_enabled: false,
     acp_timeout_sec: 120,
     google_cloud_project: null,
     google_cloud_location: null,
-    api_key_configured: false,
 });
-const saved_api_base_url = ref(settings.value.api_base_url);
+const opencode_services = ref<{title: string; value: string;}[]>([]);
 const status = ref<IRecordedSeriesStatus | null>(null);
 const acp_credential_status = ref<IKonomiTVBS4KACPCredentialStatus | null>(null);
 
 // API キーは共有ストアへ入れず、この画面が開いている間だけローカルメモリに保持する。
-const api_key_input = ref('');
-const api_key_showing = ref(false);
-const api_key_delete_dialog = ref(false);
 const acp_authentication_dialog = ref(false);
 const pending_acp_authentication_action = ref<ACPAuthenticationAction | null>(null);
 const episode_number_search_warning_dialog = ref(false);
@@ -862,7 +713,6 @@ const connection_test_results = ref<ConnectionTestResults>({
     CandidateSelection: null,
     EpisodeLookup: null,
 });
-const is_deleting_api_key = ref(false);
 const is_updating_acp_authentication = ref(false);
 const is_starting_backfill = ref(false);
 const is_monitoring_backfill = ref(false);
@@ -903,42 +753,6 @@ function confirmEpisodeNumberSearchEnabled(): void {
 
 
 /** API の URL が OpenAI 互換 API の接続先として扱える HTTP(S) URL かを確認する。 */
-function isValidAPIBaseURL(value: string): boolean {
-    try {
-        const parsed_url = new URL(value);
-        return (
-            (parsed_url.protocol === 'http:' || parsed_url.protocol === 'https:') &&
-            parsed_url.username === '' &&
-            parsed_url.password === '' &&
-            parsed_url.search === '' &&
-            parsed_url.hash === ''
-        );
-    } catch {
-        return false;
-    }
-}
-
-function normalizeAPIBaseURL(value: string): string {
-    return value.trim().replace(/\/+$/, '');
-}
-
-const normalized_draft_api_base_url = computed(() => normalizeAPIBaseURL(settings.value.api_base_url));
-const is_saved_api_base_url_draft = computed(() =>
-    normalized_draft_api_base_url.value === saved_api_base_url.value,
-);
-const api_base_url_error = computed(() => {
-    const value = settings.value.api_base_url.trim();
-    if (value === '') return 'API のベース URL を入力してください。';
-    if (value.length > 2048) return 'API のベース URL は 2048 文字以内で入力してください。';
-    if (isValidAPIBaseURL(value) === false) return 'ユーザー情報・クエリ・フラグメントを含まない HTTP(S) URL を入力してください。';
-    return '';
-});
-const model_error = computed(() => {
-    const value = settings.value.model.trim();
-    if (value === '') return 'モデル ID を入力してください。';
-    if (value.length > 255) return 'モデル ID は 255 文字以内で入力してください。';
-    return '';
-});
 const acp_model_error = computed(() =>
     (settings.value.acp_model?.trim().length ?? 0) > 255 ? 'ACP モデル ID は 255 文字以内で入力してください。' : '',
 );
@@ -1063,56 +877,39 @@ const acp_wire_preview = computed(() => {
     }
     return model;
 });
-const google_cloud_project_error = computed(() => {
-    if (settings.value.ai_backend !== 'AcpGemini') return '';
-    const project = settings.value.google_cloud_project?.trim() ?? '';
-    if (project === '') return 'Google Cloud プロジェクト ID を入力してください。';
-    return project.length <= 255 ? '' : 'Google Cloud プロジェクト ID は 255 文字以内で入力してください。';
-});
-const google_cloud_location_error = computed(() => {
-    if (settings.value.ai_backend !== 'AcpGemini') return '';
-    const location = settings.value.google_cloud_location?.trim() ?? '';
-    if (location === '') return 'Google Cloud リージョンを入力してください。';
-    return location.length <= 255 ? '' : 'Google Cloud リージョンは 255 文字以内で入力してください。';
+const opencode_service_error = computed(() => {
+    if (settings.value.ai_backend !== 'OpenCode') return '';
+    if (settings.value.ai_enabled && !settings.value.ai_backend_service_id) {
+        return 'OpenCode service を選択してください。';
+    }
+    return '';
 });
 const acp_timeout_error = computed(() => {
+    if (settings.value.ai_backend === 'OpenCode') return '';
     const timeout = Number(settings.value.acp_timeout_sec);
     return Number.isInteger(timeout) && timeout >= 30 && timeout <= 600 ?
         '' :
         'ACP 無通信タイムアウトは 30 ～ 600 秒の整数で入力してください。';
 });
-const daily_ai_request_limit_error = computed(() => {
-    if (String(settings.value.daily_ai_request_limit).trim() === '') return '0 ～ 1000 の整数を入力してください。';
-    const value = Number(settings.value.daily_ai_request_limit);
-    return Number.isInteger(value) && value >= 0 && value <= 1000 ? '' : '0 ～ 1000 の整数を入力してください。';
-});
-// OpenAI 互換 API はローカル運用などで認証不要の場合もあるため、API キーは必須にしない。
-const api_key_length_error = computed(() =>
-    api_key_input.value.length > 8192 ? 'API キーは 8192 文字以内で入力してください。' : '',
-);
-const api_key_error = computed(() => api_key_length_error.value);
 const has_acp_validation_error = computed(() =>
-    acp_model_error.value !== '' ||
-    acp_timeout_error.value !== '' ||
-    google_cloud_project_error.value !== '' ||
-    google_cloud_location_error.value !== '',
+    settings.value.ai_backend !== 'OpenCode' && (
+        acp_model_error.value !== '' ||
+        acp_timeout_error.value !== ''
+    ),
 );
-const has_provider_validation_error = computed(() => settings.value.ai_backend === 'OpenAICompatible' ?
-    api_base_url_error.value !== '' || model_error.value !== '' :
+const has_provider_validation_error = computed(() => settings.value.ai_backend === 'OpenCode' ?
+    opencode_service_error.value !== '' :
     has_acp_validation_error.value,
 );
 /** 選択中 ACP を新規起動せず、先に解消すべき認証・直列実行状態を説明する。 */
 const acp_connection_preflight_error = computed(() => {
-    if (settings.value.ai_backend === 'OpenAICompatible') return '';
-    if (acp_credential_status.value === null) return 'ACP 認証状態を確認しています。';
+    if (settings.value.ai_backend === 'OpenCode') return '';
+    if (acp_credential_status.value === null) return 'ACP 認証状態を取得できませんでした。';
     if (settings.value.ai_backend === 'AcpCodex' && acp_credential_status.value.codex_auth_imported === false) {
-        return 'Codex 認証を取り込んでから接続テストを実行してください。';
+        return 'Codex の認証が未取り込みです。接続テストの前にホスト auth.json を取り込んでください。';
     }
     if (settings.value.ai_backend === 'AcpGrok' && acp_credential_status.value.grok_auth_imported === false) {
-        return 'Grok Build 認証を取り込んでから接続テストを実行してください。';
-    }
-    if (settings.value.ai_backend === 'AcpGemini' && acp_credential_status.value.google_adc_available === false) {
-        return 'Google ADC をホストへ設定してから接続テストを実行してください。';
+        return 'Grok の認証が未取り込みです。接続テストの前にホスト auth.json を取り込んでください。';
     }
     if (acp_credential_status.value.acp_operation_running) {
         return '別の ACP AI 処理を実行中です。完了後に接続テストを実行してください。';
@@ -1121,13 +918,10 @@ const acp_connection_preflight_error = computed(() => {
 });
 const has_connection_validation_error = computed(() =>
     has_provider_validation_error.value ||
-    (settings.value.ai_backend === 'OpenAICompatible' && api_key_length_error.value !== '') ||
     acp_connection_preflight_error.value !== '',
 );
 const has_settings_validation_error = computed(() =>
-    has_provider_validation_error.value ||
-    daily_ai_request_limit_error.value !== '' ||
-    (settings.value.ai_backend === 'OpenAICompatible' && api_key_error.value !== ''),
+    has_provider_validation_error.value,
 );
 const has_connection_test_result = computed(() =>
     connection_test_results.value.CandidateSelection !== null ||
@@ -1136,7 +930,6 @@ const has_connection_test_result = computed(() =>
 const is_settings_action_running = computed(() =>
     is_saving.value ||
     testing_connection_capability.value !== null ||
-    is_deleting_api_key.value ||
     is_updating_acp_authentication.value,
 );
 const is_backfill_running = computed(() =>
@@ -1187,10 +980,10 @@ function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
         ai_enabled: settings.value.ai_enabled,
         ai_episode_number_search_enabled: settings.value.ai_episode_number_search_enabled,
         ai_episode_number_acceptance_mode: settings.value.ai_episode_number_acceptance_mode,
-        daily_ai_request_limit: Number(settings.value.daily_ai_request_limit),
         ai_backend: konomitv_bs4k_selected_backend,
-        api_base_url: normalizeAPIBaseURL(settings.value.api_base_url),
-        model: settings.value.model.trim(),
+        ai_backend_service_id: konomitv_bs4k_selected_backend === 'OpenCode'
+            ? settings.value.ai_backend_service_id
+            : null,
         // モデル名と推論深さは分離して送る。Grok の model はサーバー側でも null に正規化される。
         acp_model: konomitv_bs4k_acp_model,
         acp_reasoning_effort: konomitv_bs4k_acp_reasoning_effort,
@@ -1222,7 +1015,7 @@ function applyFetchedSettings(fetched_settings: IRecordedSeriesSettings): void {
         konomitv_bs4k_normalized_fetched_settings :
         {
             ...konomitv_bs4k_normalized_fetched_settings,
-            ai_backend: 'OpenAICompatible',
+            ai_backend: 'AcpCodex',
             ai_enabled: false,
             acp_reasoning_effort: null,
         };
@@ -1238,15 +1031,6 @@ function applyFetchedSettings(fetched_settings: IRecordedSeriesSettings): void {
     queueMicrotask(() => {
         suppress_acp_default_injection = false;
     });
-    saved_api_base_url.value = normalizeAPIBaseURL(fetched_settings.api_base_url);
-}
-
-
-/** 設定画面のドラフトから、保存または接続テストに使う API キーを必要な場合だけ追加する。 */
-function appendDraftAPIKey<T extends object>(request: T): T & {api_key?: string} {
-    const api_key = api_key_input.value.trim();
-    if (api_key === '') return request;
-    return {...request, api_key};
 }
 
 /** 判定状況を更新し、バックフィル終了後は定期取得を止める。 */
@@ -1285,17 +1069,13 @@ async function saveSettings(): Promise<void> {
     if (has_settings_validation_error.value || is_settings_action_running.value) return;
 
     is_saving.value = true;
-    let request = buildSettingsRequest();
-    if (settings.value.ai_backend === 'OpenAICompatible') request = appendDraftAPIKey(request);
+    const request = buildSettingsRequest();
     const result = await RecordedSeries.updateSettings(request);
     if (result) {
-        // サーバーから最新の設定を再取得し、URL 切替後も正しい api_key_configured を表示する。
         const fetched_settings = await RecordedSeries.fetchSettings();
         if (fetched_settings !== null) {
             applyFetchedSettings(fetched_settings);
         }
-        api_key_input.value = '';
-        api_key_showing.value = false;
         Message.success('録画シリーズ判定設定を更新しました。');
     }
     is_saving.value = false;
@@ -1332,11 +1112,10 @@ async function testConnection(capability: RecordedSeriesConnectionTestCapability
 
     testing_connection_capability.value = capability;
     connection_test_results.value[capability] = null;
-    let request: IRecordedSeriesConnectionTestRequest = {
+    const request: IRecordedSeriesConnectionTestRequest = {
         ...buildSettingsRequest(),
         capability,
     };
-    if (settings.value.ai_backend === 'OpenAICompatible') request = appendDraftAPIKey(request);
     const result = await RecordedSeries.testConnection(request);
     const capability_title = connection_test_capabilities.find(item => item.value === capability)?.title ?? capability;
     connection_test_results.value[capability] = result;
@@ -1346,20 +1125,6 @@ async function testConnection(capability: RecordedSeriesConnectionTestCapability
         Message.error(`${capability_title}の接続テストに失敗しました。\n${result.message}`);
     }
     testing_connection_capability.value = null;
-}
-
-/** 保存済み API キーを、確認ダイアログから明示的に削除する。 */
-async function deleteAPIKey(): Promise<void> {
-    if (is_settings_action_running.value) return;
-    is_deleting_api_key.value = true;
-    if (await RecordedSeries.deleteAPIKey(saved_api_base_url.value)) {
-        settings.value.api_key_configured = false;
-        api_key_input.value = '';
-        api_key_showing.value = false;
-        api_key_delete_dialog.value = false;
-        Message.success('保存済みの API キーを削除しました。');
-    }
-    is_deleting_api_key.value = false;
 }
 
 /** Codex / Grok の import / delete を確認ダイアログで明示する。 */
@@ -1503,7 +1268,7 @@ watch(() => settings.value.ai_backend, (backend, previous) => {
     if (suppress_acp_default_injection || previous === undefined || previous === backend) {
         return;
     }
-    if (backend === 'OpenAICompatible') {
+    if (backend === 'OpenCode') {
         settings.value.acp_reasoning_effort = null;
         settings.value.konomitv_bs4k_acp_codex_fast_mode_enabled = false;
         return;
@@ -1518,7 +1283,7 @@ watch(() => settings.value.ai_backend, (backend, previous) => {
 
 
 onMounted(async () => {
-    // API キーの設定状態を含むため、管理者と確認できるまでは設定 API へアクセスしない。
+    // 管理者と確認できるまでは設定 API へアクセスしない。
     const fetched_user = await user_store.fetchUser();
     // fetchUser() はアイコン取得だけが失敗した場合も null を返すが、ユーザー本体は Store に残る。
     const user = fetched_user ?? user_store.user;
@@ -1532,11 +1297,18 @@ onMounted(async () => {
         is_loading.value = false;
         return;
     }
-    const [fetched_settings, fetched_status, fetched_acp_credential_status] = await Promise.all([
+    const [fetched_settings, fetched_status, fetched_acp_credential_status, fetched_services] = await Promise.all([
         RecordedSeries.fetchSettings(),
         RecordedSeries.fetchStatus(),
         RecordedSeries.fetchACPCredentialStatus(),
+        AIBackend.fetchServices(),
     ]);
+    if (fetched_services !== null) {
+        opencode_services.value = fetched_services.map(service => ({
+            title: `${service.service_name} (${service.opencode_provider_id}/${service.opencode_model_id})`,
+            value: service.service_id,
+        }));
+    }
     if (fetched_settings !== null) {
         applyFetchedSettings(fetched_settings);
         is_disabled.value = false;
@@ -1552,8 +1324,6 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-    // 画面を離れたら API キー入力とポーリングを即座に破棄する。
-    api_key_input.value = '';
     backfill_abort_controller?.abort();
     episode_backfill_abort_controller?.abort();
     stopStatusPolling();

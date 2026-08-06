@@ -9,7 +9,8 @@ import {
 
 export type RecordedEpisodeNumberAcceptanceMode = 'HighConfidenceOnly' | 'Always';
 export type RecordedSeriesConnectionTestCapability = 'CandidateSelection' | 'EpisodeLookup';
-export type AIBackendKind = 'OpenAICompatible' | 'AcpCodex' | 'AcpGrok' | 'AcpGemini';
+/** 録画シリーズが選択できる AI バックエンド。OpenCode は AIBackend service_id を参照する。 */
+export type AIBackendKind = 'OpenCode' | 'AcpCodex' | 'AcpGrok';
 export type EpisodeLookupOutcome =
     'Pending' | 'Resolved' | 'NotNumbered' | 'InsufficientEvidence' | 'SearchFailed' |
     'SearchNotRun' | 'InvalidModelOutput' | 'Disabled' | 'RateLimited' | 'Cancelled';
@@ -18,47 +19,40 @@ export type AcpReasoningEffort = 'Low' | 'Medium' | 'High' | 'XHigh' | 'Max' | '
 export type KonomiTVBS4KACPImportProvider = 'codex' | 'grok';
 
 
-/** 録画シリーズ判定のサーバー共有設定。API キーそのものは取得レスポンスに含めない。 */
+/** 録画シリーズ判定のサーバー共有設定。OpenCode の秘密は AI バックエンド API 側。 */
 export interface IRecordedSeriesSettings {
     enabled: boolean;
     ai_enabled: boolean;
     ai_episode_number_search_enabled: boolean;
     ai_episode_number_acceptance_mode: RecordedEpisodeNumberAcceptanceMode;
-    daily_ai_request_limit: number;
     ai_backend: AIBackendKind;
-    // OpenAICompatible 用
-    api_base_url: string;
-    model: string;
+    // OpenCode 時の AIBackend service UUID
+    ai_backend_service_id: string | null;
     // ACP 共通（モデル名と推論深さは分離）
     acp_model: string | null;
     acp_reasoning_effort: AcpReasoningEffort | null;
     // KonomiTV-BS4K 固有の Codex Fast service tier 設定
     konomitv_bs4k_acp_codex_fast_mode_enabled: boolean;
     acp_timeout_sec: number;
-    // Gemini CLI / Vertex AI 用
+    // 旧 AcpGemini 読取互換フィールド（UI では非表示）
     google_cloud_project: string | null;
     google_cloud_location: string | null;
-    // レスポンス専用
-    api_key_configured: boolean;
 }
 
-/** 録画シリーズ判定設定の更新リクエスト。API キー省略時は保存済みの値を維持する。 */
+/** 録画シリーズ判定設定の更新リクエスト。 */
 export interface IRecordedSeriesSettingsUpdate {
     enabled: boolean;
     ai_enabled: boolean;
     ai_episode_number_search_enabled: boolean;
     ai_episode_number_acceptance_mode: RecordedEpisodeNumberAcceptanceMode;
-    daily_ai_request_limit: number;
     ai_backend: AIBackendKind;
-    api_base_url: string;
-    model: string;
+    ai_backend_service_id: string | null;
     acp_model: string | null;
     acp_reasoning_effort: AcpReasoningEffort | null;
     konomitv_bs4k_acp_codex_fast_mode_enabled: boolean;
     acp_timeout_sec: number;
     google_cloud_project: string | null;
     google_cloud_location: string | null;
-    api_key?: string;
 }
 
 /** 全ユーザーの録画シリーズ処理で共有する、内容非公開の ACP 資格情報状態。 */
@@ -122,9 +116,6 @@ export interface IRecordedSeriesStatus {
     episode_not_numbered: number;
     episode_needs_review: number;
     episode_failed: number;
-    ai_requests_today: number;
-    series_ai_requests_today: number;
-    episode_ai_requests_today: number;
     last_run_at: string | null;
     episode_last_run_at: string | null;
     is_running: boolean;
@@ -359,55 +350,19 @@ export default class RecordedSeries {
         return response.data;
     }
 
-    /** 保存済みの OpenAI 互換 API キーを削除する。
-     * url を指定するとその URL のキーだけを削除し、省略時はサーバー保存設定の URL を対象にする。
-     */
-    static async deleteAPIKey(url?: string): Promise<boolean> {
-        const params: Record<string, string> = {};
-        if (url) {
-            params.url = url.trim().replace(/\/+$/, '');
-        }
-        const query = Object.keys(params).length > 0 ? '?' + new URLSearchParams(params).toString() : '';
-        const response = await APIClient.delete(`/recorded-series/settings/api-key${query}`);
-        if (response.type === 'error') {
-            APIClient.showGenericError(response, '保存済みの API キーを削除できませんでした。');
-            return false;
-        }
-        return true;
-    }
-
     /**
      * 現在の入力内容を保存せずに AI バックエンドへの接続を確認する。
      *
-     * サーバー側の ACP は壁時計ではなく無通信タイムアウトで打ち切る。
-     * Codex Luna Max のように推論・結果整形が長い場合でも進捗がある限り待つため、
-     * クライアントの既定 30 秒 HTTP タイムアウトでは足りない。
-     * ACP はサーバー hard limit + 回収余裕、OpenAI 互換は設定由来の式で待つ。
+     * OpenCode は AI バックエンド API の connection-test を使う。
+     * ACP はサーバー hard limit + 回収余裕で待つ。
      */
     static async testConnection(
         request: IRecordedSeriesConnectionTestRequest,
     ): Promise<IRecordedSeriesConnectionTestResult | null> {
-        let client_timeout_ms: number;
-        if (request.ai_backend !== 'OpenAICompatible') {
-            // ACP: サーバー側の絶対上限に process / DB 回収の余裕を加えて待つ。
-            // 同じ hard limit 秒で切ると、サーバーの安全停止応答と Axios timeout が競合する。
-            client_timeout_ms = (
-                ACP_HARD_TIMEOUT_SEC + ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC
-            ) * 1000;
-        } else {
-            // OpenAI 互換: 無通信タイムアウト (最大 600 秒) の数倍 + 起動/回収余裕。
-            // 接続試験は Web 検索込みで 30 秒を超え得る。
-            const configured_timeout_sec = Number(request.acp_timeout_sec);
-            const inactivity_budget_sec = (
-                Number.isFinite(configured_timeout_sec) && configured_timeout_sec > 0
-            ) ?
-                configured_timeout_sec :
-                120;
-            client_timeout_ms = Math.min(
-                Math.max(inactivity_budget_sec * 30 + 60, 600) * 1000,
-                ACP_HARD_TIMEOUT_SEC * 1000,
-            );
-        }
+        // ACP / OpenCode ともサーバー側の長時間処理に合わせ、絶対上限 + 回収余裕で待つ。
+        const client_timeout_ms = (
+            ACP_HARD_TIMEOUT_SEC + ACP_CONNECTION_TEST_CLIENT_EXTRA_SEC
+        ) * 1000;
         const response = await APIClient.post<IRecordedSeriesConnectionTestResult>(
             '/recorded-series/settings/test',
             request,

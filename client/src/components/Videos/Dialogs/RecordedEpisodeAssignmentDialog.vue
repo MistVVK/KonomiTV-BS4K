@@ -521,7 +521,7 @@ async function startEpisodeRelookup(): Promise<void> {
         return;
     }
     if (result.type === 'RateLimited') {
-        Message.warning('本日の AI API 利用上限、またはプロバイダーの利用上限に達しています。');
+        Message.warning('今月の AI 利用上限、またはプロバイダーの利用上限に達しています。');
         await loadAssignments();
         return;
     }

@@ -67,7 +67,10 @@ const RECORDED_EPISODE_ERROR_MESSAGES: Record<string, string> = {
     AIEpisodeNumberSearchIsDisabled: '話数 Web 検索が無効です。',
     EpisodeLookupCapabilityNotVerified: '現在の AI 設定では話数 Web 検索能力が未確認です。接続試験を実行してください。',
     AcpEpisodeLookupUnsupported: '選択中の ACP バックエンドでは話数 Web 検索を検証できません。',
+    // 旧日次制限コード（互換表示用。新規発生はしない）
     DailyAIRequestLimitReached: '本日の AI API 利用上限に達しました。',
+    MonthlyTokenLimitReached: '今月の AI トークン利用上限に達しました。',
+    MonthlyCostLimitReached: '今月の AI 推定料金上限に達しました。',
     ProviderRateLimited: 'AI プロバイダーの利用上限に達しました。',
     LegacyEpisodeMissing: '元の番組情報に話数がありません。',
     LegacyEpisodeUnknown: '元の番組情報から話数を読み取れませんでした。',
