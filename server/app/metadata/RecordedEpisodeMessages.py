@@ -35,7 +35,10 @@ _ERROR_MESSAGES: dict[str, str] = {
     'AIIsDisabled': 'AI 判定機能が無効です。',
     'AIEpisodeNumberSearchIsDisabled': '話数 Web 検索が無効です。',
     'EpisodeLookupCapabilityNotVerified': '現在の AI 設定では話数 Web 検索能力が未確認です。接続試験を実行してください。',
+    # 旧日次制限コード（互換表示用。新規発生はしない）
     'DailyAIRequestLimitReached': '本日の AI 利用上限に達しました。',
+    'MonthlyTokenLimitReached': '今月の AI トークン利用上限に達しました。',
+    'MonthlyCostLimitReached': '今月の AI 推定料金上限に達しました。',
     'ProviderRateLimited': 'AI プロバイダーの利用上限に達しました。',
     'LegacyEpisodeMissing': '既存録画に話数情報がありません。',
     'LegacyEpisodeUnknown': '既存の話数表記を構造化できませんでした。',

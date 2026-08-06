@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import pytest
 
+from app.metadata.ai.AIAPIUsageLedger import AIAPIUsageLedger, AIAPIUsageReservation
 from app.metadata.ai.AIBackendSettings import AIBackendService
 from app.metadata.ai.backends import UnsupportedOperationError
 from app.metadata.ai.opencode_backend import OpenCodeBackend
@@ -43,6 +44,38 @@ def _service(**overrides: Any) -> AIBackendService:
     }
     base.update(overrides)
     return AIBackendService.model_validate(base)
+
+
+@pytest.fixture(autouse=True)
+def _skip_monthly_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """backend unit は DB 無しで回すため台帳を no-op にする。"""
+
+    from decimal import Decimal
+
+    async def FakeReserve(
+        _cls: type[AIAPIUsageLedger],
+        service: AIBackendService,
+        **_kwargs: Any,
+    ) -> AIAPIUsageReservation:
+        return AIAPIUsageReservation(
+            reservation_id='test',
+            service_id=service.service_id,
+            year_month='2026-08',
+            billing_mode=service.billing_mode,
+            skipped=True,
+            reserved_total_tokens=0,
+            reserved_estimated_cost_usd=Decimal('0'),
+        )
+
+    async def FakeSettle(
+        _cls: type[AIAPIUsageLedger],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        return None
+
+    monkeypatch.setattr(AIAPIUsageLedger, 'Reserve', classmethod(FakeReserve))
+    monkeypatch.setattr(AIAPIUsageLedger, 'Settle', classmethod(FakeSettle))
 
 
 def _program() -> RecordedSeriesProgramPrompt:

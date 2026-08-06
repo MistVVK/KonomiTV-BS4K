@@ -196,7 +196,13 @@ def _episodeLookupErrorResult(
     }:
         outcome = "InvalidModelOutput"
         web_search_performed = True
-    elif code in {"HTTP429", "ProviderRateLimited", "DailyAIRequestLimitReached"}:
+    elif code in {
+        "HTTP429",
+        "ProviderRateLimited",
+        "DailyAIRequestLimitReached",
+        "MonthlyTokenLimitReached",
+        "MonthlyCostLimitReached",
+    }:
         outcome = "RateLimited"
         web_search_performed = False
     elif code in {"Cancelled", "AIRequestInterrupted"}:
@@ -2236,7 +2242,7 @@ class RecordedEpisodeAutomation:
                 needs_review_count = 0
                 preserved_count = 0
                 ai_request_count = 0
-                stopped_by_daily_limit = False
+                stopped_by_usage_limit = False
                 for index, recorded_program_id in enumerate(candidate_ids, start=1):
                     try:
                         result = await cls.resolveProgram(
@@ -2296,9 +2302,13 @@ class RecordedEpisodeAutomation:
                         failed=failed_count,
                         skipped=skipped_count,
                     )
-                    if result.error_code == "DailyAIRequestLimitReached":
-                        # 翌日に自動再開せず、残りは次回の明示操作まで保留する。
-                        stopped_by_daily_limit = True
+                    if result.error_code in {
+                        "DailyAIRequestLimitReached",
+                        "MonthlyTokenLimitReached",
+                        "MonthlyCostLimitReached",
+                    }:
+                        # 上限到達時は自動再開せず、残りは次回の明示操作まで保留する。
+                        stopped_by_usage_limit = True
                         skipped_count += len(candidate_ids) - index
                         await history.setCounts(
                             current=len(candidate_ids),
@@ -2322,7 +2332,7 @@ class RecordedEpisodeAutomation:
                             "failed": failed_count,
                             "skipped": skipped_count,
                             "ai_requests": ai_request_count,
-                            "stopped_by_daily_limit": stopped_by_daily_limit,
+                            "stopped_by_usage_limit": stopped_by_usage_limit,
                         },
                     ),
                     error_code="PartialFailure" if failed_count > 0 else None,

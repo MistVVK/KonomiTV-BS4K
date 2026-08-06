@@ -1701,7 +1701,8 @@ def test_generation_change_while_applying_ai_result_closes_audit_as_failed(
             assert request.status == 'Failed'
             assert request.error_code == 'InputChangedBeforeApply'
             assert request.selected_choice_id is None
-            assert status['ai_requests_today'] == 0
+            assert 'ai_requests_today' not in status
+            assert status['total'] >= 1
         finally:
             await Tortoise.close_connections()
 

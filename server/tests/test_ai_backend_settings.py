@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from app.metadata.ai.AIBackendSettings import (
+    AIBackendService,
     AIBackendServiceCreate,
     AIBackendServiceUpdate,
     AIBackendSettingsStore,
@@ -40,6 +41,23 @@ def test_normalize_api_base_url_rejects_credentials() -> None:
 
     with pytest.raises(ValueError):
         NormalizeAPIBaseURL('https://user:pass@example.com/v1')
+
+
+def test_monthly_limits_zero_normalize_to_none() -> None:
+    """月次上限 0 / 空文字は上限なし (None) に正規化する。"""
+
+    service = AIBackendService.model_validate({
+        'service_id': '11111111-1111-4111-8111-111111111111',
+        'service_name': 'Zero Limit',
+        'opencode_provider_id': 'deepseek',
+        'opencode_model_id': 'deepseek-chat',
+        'auth_mode': 'ApiKey',
+        'billing_mode': 'Metered',
+        'monthly_token_limit': 0,
+        'monthly_cost_limit_usd': '0',
+    })
+    assert service.monthly_token_limit is None
+    assert service.monthly_cost_limit_usd is None
 
 
 def test_create_and_list_service(ai_paths: Path) -> None:

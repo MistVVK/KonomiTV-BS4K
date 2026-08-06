@@ -44,6 +44,34 @@ _LEGACY_BACKEND_VALUES = frozenset({
 })
 
 
+def NormalizeMonthlyCostLimitInput(value: object) -> object:
+    """月次料金上限の入力を正規化する。空文字・0 は上限なし (None)。"""
+
+    if value is None or value == '':
+        return None
+    try:
+        as_decimal = Decimal(str(value))
+    except Exception:
+        return value
+    if as_decimal == 0:
+        return None
+    return value
+
+
+def NormalizeMonthlyTokenLimitInput(value: object) -> object:
+    """月次 token 上限の入力を正規化する。空文字・0 は上限なし (None)。"""
+
+    if value is None or value == '':
+        return None
+    try:
+        as_int = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return value
+    if as_int == 0:
+        return None
+    return value
+
+
 def NewAIBackendServiceID() -> str:
     """新しい service_id（UUID4）を発行する。
 
@@ -100,10 +128,25 @@ class AIBackendService(BaseModel):
     api_base_url: Annotated[str | None, Field(max_length=2048)] = None
     google_cloud_project: Annotated[str | None, Field(max_length=255)] = None
     google_cloud_location: Annotated[str | None, Field(max_length=255)] = None
+    # 0 は UI「空欄=なし」と衝突するため validator で None へ正規化する（上限なし）。
     monthly_cost_limit_usd: Annotated[Decimal | None, Field(ge=0, le=1_000_000)] = None
     monthly_token_limit: Annotated[int | None, Field(ge=0, le=10_000_000_000)] = None
     # OAuth 接続済みフラグ（token 本体は OpenCode auth 側。KonomiTV は状態だけ）
     oauth_connected: Annotated[bool, Field()] = False
+
+    @field_validator('monthly_cost_limit_usd', mode='before')
+    @classmethod
+    def normalizeMonthlyCostLimit(cls, value: object) -> object:
+        """空文字・0 を上限なし (None) にする。"""
+
+        return NormalizeMonthlyCostLimitInput(value)
+
+    @field_validator('monthly_token_limit', mode='before')
+    @classmethod
+    def normalizeMonthlyTokenLimit(cls, value: object) -> object:
+        """空文字・0 を上限なし (None) にする。"""
+
+        return NormalizeMonthlyTokenLimitInput(value)
 
     @field_validator('service_id')
     @classmethod
@@ -233,6 +276,16 @@ class AIBackendServiceCreate(BaseModel):
     monthly_cost_limit_usd: Annotated[Decimal | None, Field(ge=0, le=1_000_000)] = None
     monthly_token_limit: Annotated[int | None, Field(ge=0, le=10_000_000_000)] = None
 
+    @field_validator('monthly_cost_limit_usd', mode='before')
+    @classmethod
+    def normalizeMonthlyCostLimit(cls, value: object) -> object:
+        return NormalizeMonthlyCostLimitInput(value)
+
+    @field_validator('monthly_token_limit', mode='before')
+    @classmethod
+    def normalizeMonthlyTokenLimit(cls, value: object) -> object:
+        return NormalizeMonthlyTokenLimitInput(value)
+
 
 class AIBackendServiceUpdate(BaseModel):
     """service 更新リクエスト（未指定フィールドは維持）。"""
@@ -253,6 +306,16 @@ class AIBackendServiceUpdate(BaseModel):
     clear_api_base_url: Annotated[bool, Field()] = False
     clear_monthly_cost_limit_usd: Annotated[bool, Field()] = False
     clear_monthly_token_limit: Annotated[bool, Field()] = False
+
+    @field_validator('monthly_cost_limit_usd', mode='before')
+    @classmethod
+    def normalizeMonthlyCostLimit(cls, value: object) -> object:
+        return NormalizeMonthlyCostLimitInput(value)
+
+    @field_validator('monthly_token_limit', mode='before')
+    @classmethod
+    def normalizeMonthlyTokenLimit(cls, value: object) -> object:
+        return NormalizeMonthlyTokenLimitInput(value)
 
 
 class AIBackendServiceResponse(AIBackendService):

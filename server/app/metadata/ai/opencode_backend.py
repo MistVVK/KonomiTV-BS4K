@@ -21,6 +21,7 @@ from app.constants import (
     OPENCODE_AGENT_EPISODE,
     OPENCODE_AGENT_GENERATE,
 )
+from app.metadata.ai.AIAPIUsageLedger import AIAPIUsageLedger
 from app.metadata.ai.AIBackendSettings import (
     AIBackendService,
     AIBackendSettingsStore,
@@ -311,6 +312,59 @@ class OpenCodeBackend:
         async with semaphore:
             return await operation()
 
+    async def _withMonthlyReservation(
+        self,
+        operation: Callable[[], Awaitable[tuple[_T, OpenCodeNormalizedUsage | None]]],
+    ) -> _T:
+        """月次台帳の予約→実行→精算で operation を包む。
+
+        operation は (結果, 合計 usage) を返す。usage が None かつ例外なしは予約解放のみ。
+        draft / 一時 service（temporary_auth）は台帳に載せない（orphan 行防止）。
+        保存済み service の接続試験・本番呼び出しのみ算入する。
+        """
+
+        # 未保存 draft 接続試験は service_id が一時 UUID のため台帳対象外。
+        if self._temporary_auth:
+            result, _usage = await operation()
+            return result
+
+        reservation = await AIAPIUsageLedger.Reserve(self._service)
+        settled = False
+        try:
+            result, usage = await operation()
+            await AIAPIUsageLedger.Settle(reservation, usage)
+            settled = True
+            return result
+        except RecordedSeriesAIError as error:
+            # 外部呼出前・認証失敗など課金なしが明確なコードは予約解放のみ。
+            free_codes = {
+                'OpenCodeAPIKeyMissing',
+                'OpenCodeOAuthNotConnected',
+                'OpenCodeUnavailable',
+                'OpenCodeServiceNotFound',
+                'MonthlyTokenLimitReached',
+                'MonthlyCostLimitReached',
+                'EmptyCandidateSet',
+            }
+            if error.code in free_codes:
+                await AIAPIUsageLedger.Settle(reservation, free_failure=True)
+            elif error.http_status in {401, 403}:
+                # 認証失敗は通常課金されない。
+                await AIAPIUsageLedger.Settle(reservation, free_failure=True)
+            else:
+                # timeout / 5xx / schema 失敗後など: 実 usage を部分回収できていないため
+                # 予約見積を安全側で settled へ振り替える（unknown_interrupt）。
+                await AIAPIUsageLedger.Settle(reservation, unknown_interrupt=True)
+            settled = True
+            raise
+        except Exception:
+            await AIAPIUsageLedger.Settle(reservation, unknown_interrupt=True)
+            settled = True
+            raise
+        finally:
+            if settled is False:
+                await AIAPIUsageLedger.Settle(reservation, unknown_interrupt=True)
+
     async def _selectCandidateUnlocked(
         self,
         program: RecordedSeriesProgramPrompt,
@@ -325,63 +379,83 @@ class OpenCodeBackend:
             raise RecordedSeriesAIError('EmptyCandidateSet')
 
         await self.ensureAuthInjected()
-        prompt = _BuildCandidateSelectionPrompt(program, candidates)
-        last_error: RecordedSeriesAIError | None = None
-        total_prompt = 0
-        total_completion = 0
-        latency_ms = 0
-        for attempt in range(_OPENCODE_LOCAL_VALIDATION_ATTEMPTS):
-            try:
-                structured, usage, latency_ms = await self._runStructured(
-                    prompt_text=prompt,
-                    schema_model=_AIChoiceOutput,
-                    agent=OPENCODE_AGENT_GENERATE,
-                )
-                total_prompt += usage['prompt_tokens']
-                total_completion += usage['completion_tokens']
+
+        async def Run() -> tuple[AIChoiceResult, OpenCodeNormalizedUsage | None]:
+            prompt = _BuildCandidateSelectionPrompt(program, candidates)
+            last_error: RecordedSeriesAIError | None = None
+            total_prompt = 0
+            total_completion = 0
+            total_reasoning = 0
+            total_cost = 0.0
+            has_cost = False
+            latency_ms = 0
+            for attempt in range(_OPENCODE_LOCAL_VALIDATION_ATTEMPTS):
                 try:
-                    validated = _AIChoiceOutput.model_validate(structured)
-                except ValidationError as error:
-                    last_error = RecordedSeriesAIError(
+                    structured, usage, latency_ms = await self._runStructured(
+                        prompt_text=prompt,
+                        schema_model=_AIChoiceOutput,
+                        agent=OPENCODE_AGENT_GENERATE,
+                    )
+                    total_prompt += usage['prompt_tokens']
+                    total_completion += usage['completion_tokens']
+                    total_reasoning += usage['reasoning_tokens']
+                    if usage['estimated_cost_usd'] is not None:
+                        total_cost += float(usage['estimated_cost_usd'])
+                        has_cost = True
+                    try:
+                        validated = _AIChoiceOutput.model_validate(structured)
+                    except ValidationError as error:
+                        last_error = RecordedSeriesAIError(
+                            'InvalidOutputSchema',
+                            latency_ms=latency_ms,
+                        )
+                        if attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS:
+                            continue
+                        raise last_error from error
+                    if validated.choice_id not in allowed_ids:
+                        last_error = RecordedSeriesAIError(
+                            'ChoiceOutsideCandidateSet',
+                            latency_ms=latency_ms,
+                        )
+                        if attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS:
+                            continue
+                        raise last_error
+                    if validated.confidence < minimum_confidence:
+                        raise RecordedSeriesAIError(
+                            'LowConfidence',
+                            latency_ms=latency_ms,
+                        )
+                    combined = OpenCodeNormalizedUsage(
+                        prompt_tokens=total_prompt,
+                        completion_tokens=total_completion,
+                        reasoning_tokens=total_reasoning,
+                        total_tokens=total_prompt + total_completion + total_reasoning,
+                        estimated_cost_usd=total_cost if has_cost else None,
+                    )
+                    return AIChoiceResult(
+                        choice_id=validated.choice_id,
+                        confidence=float(validated.confidence),
+                        model=self._audit_model,
+                        prompt_tokens=total_prompt or None,
+                        completion_tokens=total_completion or None,
+                        http_status=200,
+                        latency_ms=latency_ms,
+                    ), combined
+                except RecordedSeriesAIError as error:
+                    last_error = error
+                    if error.code in {
                         'InvalidOutputSchema',
-                        latency_ms=latency_ms,
-                    )
-                    if attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS:
-                        continue
-                    raise last_error from error
-                if validated.choice_id not in allowed_ids:
-                    last_error = RecordedSeriesAIError(
+                        'OpenCodeStructuredOutputMissing',
                         'ChoiceOutsideCandidateSet',
-                        latency_ms=latency_ms,
-                    )
-                    if attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS:
+                    } and attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS:
                         continue
-                    raise last_error
-                if validated.confidence < minimum_confidence:
-                    raise RecordedSeriesAIError(
-                        'LowConfidence',
-                        latency_ms=latency_ms,
-                    )
-                return AIChoiceResult(
-                    choice_id=validated.choice_id,
-                    confidence=float(validated.confidence),
-                    model=self._audit_model,
-                    prompt_tokens=total_prompt or None,
-                    completion_tokens=total_completion or None,
-                    http_status=200,
-                    latency_ms=latency_ms,
-                )
-            except RecordedSeriesAIError as error:
-                last_error = error
-                if error.code in {
-                    'InvalidOutputSchema',
-                    'OpenCodeStructuredOutputMissing',
-                    'ChoiceOutsideCandidateSet',
-                } and attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS:
-                    continue
-                raise
-        assert last_error is not None
-        raise last_error
+                    # 失敗時の usage は _withMonthlyReservation が unknown_interrupt
+                    # （予約見積の安全側確定）で扱う。部分 usage の精算は行わない。
+                    raise
+            assert last_error is not None
+            raise last_error
+
+        return await self._withMonthlyReservation(Run)
 
     async def selectCandidate(
         self,
@@ -408,55 +482,74 @@ class OpenCodeBackend:
         """シリーズ情報生成本体（セマフォは呼び出し側）。"""
 
         await self.ensureAuthInjected()
-        prompt = BuildSeriesMetadataPrompt(program, hints)
-        last_error: RecordedSeriesAIError | None = None
-        total_prompt = 0
-        total_completion = 0
-        latency_ms = 0
-        for attempt in range(_OPENCODE_LOCAL_VALIDATION_ATTEMPTS):
-            try:
-                structured, usage, latency_ms = await self._runStructured(
-                    prompt_text=prompt,
-                    schema_model=AISeriesMetadataOutput,
-                    agent=OPENCODE_AGENT_GENERATE,
-                )
-                total_prompt += usage['prompt_tokens']
-                total_completion += usage['completion_tokens']
+
+        async def Run() -> tuple[AISeriesMetadataResult, OpenCodeNormalizedUsage | None]:
+            prompt = BuildSeriesMetadataPrompt(program, hints)
+            last_error: RecordedSeriesAIError | None = None
+            total_prompt = 0
+            total_completion = 0
+            total_reasoning = 0
+            total_cost = 0.0
+            has_cost = False
+            latency_ms = 0
+            for attempt in range(_OPENCODE_LOCAL_VALIDATION_ATTEMPTS):
                 try:
-                    return ValidateSeriesMetadataOutput(
-                        structured,
-                        hints=hints,
-                        model=self._audit_model,
-                        prompt_tokens=total_prompt or None,
-                        completion_tokens=total_completion or None,
-                        http_status=200,
-                        latency_ms=latency_ms,
+                    structured, usage, latency_ms = await self._runStructured(
+                        prompt_text=prompt,
+                        schema_model=AISeriesMetadataOutput,
+                        agent=OPENCODE_AGENT_GENERATE,
                     )
+                    total_prompt += usage['prompt_tokens']
+                    total_completion += usage['completion_tokens']
+                    total_reasoning += usage['reasoning_tokens']
+                    if usage['estimated_cost_usd'] is not None:
+                        total_cost += float(usage['estimated_cost_usd'])
+                        has_cost = True
+                    try:
+                        result = ValidateSeriesMetadataOutput(
+                            structured,
+                            hints=hints,
+                            model=self._audit_model,
+                            prompt_tokens=total_prompt or None,
+                            completion_tokens=total_completion or None,
+                            http_status=200,
+                            latency_ms=latency_ms,
+                        )
+                        combined = OpenCodeNormalizedUsage(
+                            prompt_tokens=total_prompt,
+                            completion_tokens=total_completion,
+                            reasoning_tokens=total_reasoning,
+                            total_tokens=total_prompt + total_completion + total_reasoning,
+                            estimated_cost_usd=total_cost if has_cost else None,
+                        )
+                        return result, combined
+                    except RecordedSeriesAIError as error:
+                        last_error = error
+                        if (
+                            error.code in {
+                                'InvalidSeriesMetadataSchema',
+                                'InvalidJSON',
+                                'InvalidJSONType',
+                            }
+                            and attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS
+                        ):
+                            continue
+                        raise
                 except RecordedSeriesAIError as error:
                     last_error = error
                     if (
                         error.code in {
                             'InvalidSeriesMetadataSchema',
-                            'InvalidJSON',
-                            'InvalidJSONType',
+                            'OpenCodeStructuredOutputMissing',
                         }
                         and attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS
                     ):
                         continue
                     raise
-            except RecordedSeriesAIError as error:
-                last_error = error
-                if (
-                    error.code in {
-                        'InvalidSeriesMetadataSchema',
-                        'OpenCodeStructuredOutputMissing',
-                    }
-                    and attempt + 1 < _OPENCODE_LOCAL_VALIDATION_ATTEMPTS
-                ):
-                    continue
-                raise
-        assert last_error is not None
-        raise last_error
+            assert last_error is not None
+            raise last_error
+
+        return await self._withMonthlyReservation(Run)
 
     async def resolveSeriesMetadata(
         self,
@@ -654,10 +747,11 @@ def BuildOpenCodeBackendFromDraft(
         OpenCodeBackend。
     """
 
+    # draft は常に temporary（台帳 skip）。api_key 無しの NoneLocal 試験も含む。
     return OpenCodeBackend(
         service,
         api_key=api_key,
         client=client,
-        temporary_auth=api_key is not None,
+        temporary_auth=True,
         remove_auth_on_cleanup=remove_auth_on_cleanup,
     )

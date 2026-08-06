@@ -2,9 +2,7 @@
 
 含む: service CRUD / APIキー set・delete / OAuth 開始・切断（仮） /
 OpenCode auth 注入と DELETE /auth/{id} 連動 / health・availability /
-draft 接続試験（Phase 2）。
-
-含まない（後続 Phase）: 月次利用量本実装（P3）。
+draft 接続試験（Phase 2）/ 月次利用量 GET（Phase 3）。
 """
 
 from __future__ import annotations
@@ -12,10 +10,15 @@ from __future__ import annotations
 from typing import Annotated, Any, Literal
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from app import logging
+from app.metadata.ai.AIAPIUsageLedger import (
+    AIAPIUsageLedger,
+    CurrentYearMonth,
+    SnapshotToDict,
+)
 from app.metadata.ai.AIBackendSettings import (
     AIBackendService,
     AIBackendServiceCreate,
@@ -94,6 +97,33 @@ class OAuthStartResponse(BaseModel):
     provider_id: str
     # OpenCode が返す authorize 情報（URL 等）。token は含めない想定。
     authorize: dict[str, Any]
+
+
+class AIBackendUsageResponse(BaseModel):
+    """月次利用量スナップショット（キー非返却・推定料金）。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    service_id: str
+    year_month: str
+    billing_mode: str
+    settled_prompt_tokens: int
+    settled_completion_tokens: int
+    settled_total_tokens: int
+    settled_estimated_cost_usd: str
+    reserved_total_tokens: int
+    reserved_estimated_cost_usd: str
+    settled_request_count: int
+    monthly_token_limit: int | None = None
+    monthly_cost_limit_usd: str | None = None
+    cost_limit_effective: bool
+    token_limit_reached: bool
+    cost_limit_reached: bool
+    service_name_snapshot: str
+    opencode_provider_id_snapshot: str
+    opencode_model_id_snapshot: str
+    # 設定から削除済みの service 履歴行（上限 enforce 対象外・表示用）
+    service_deleted: bool = False
 
 
 class AIBackendConnectionTestRequest(BaseModel):
@@ -206,6 +236,73 @@ async def OpenCodeHealthAPI(
     response.headers.update(NO_STORE_HEADERS)
     snapshot = ProbeOpenCodeAvailability()
     return OpenCodeAvailabilityResponse.model_validate(snapshot)
+
+
+@router.get(
+    '/usage',
+    summary='AI バックエンド月次利用量一覧 API',
+    response_model=list[AIBackendUsageResponse],
+)
+async def AIBackendUsageListAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+    year_month: Annotated[str | None, Query(pattern=r'^\d{4}-\d{2}$')] = None,
+) -> list[AIBackendUsageResponse]:
+    """登録済み + 削除済み履歴の指定月（省略時は Asia/Tokyo 当月）利用量を返す。"""
+
+    response.headers.update(NO_STORE_HEADERS)
+    month = year_month or CurrentYearMonth()
+    try:
+        services = AIBackendSettingsStore.listServices()
+        snapshots = await AIAPIUsageLedger.ListMonthSnapshots(
+            services,
+            year_month=month,
+            include_deleted=True,
+        )
+        return [
+            AIBackendUsageResponse.model_validate(SnapshotToDict(item))
+            for item in snapshots
+        ]
+    except (OSError, ValueError) as error:
+        logging.error('[AIBackendUsageListAPI] Failed to load usage:', exc_info=error)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load AI backend usage.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+
+@router.get(
+    '/{service_id}/usage',
+    summary='AI バックエンド月次利用量 API',
+    response_model=AIBackendUsageResponse,
+)
+async def AIBackendUsageGetAPI(
+    service_id: Annotated[str, Path(min_length=36, max_length=36)],
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+    year_month: Annotated[str | None, Query(pattern=r'^\d{4}-\d{2}$')] = None,
+) -> AIBackendUsageResponse:
+    """1 service の月次利用量を返す（削除済み履歴も snapshot で返す）。"""
+
+    response.headers.update(NO_STORE_HEADERS)
+    month = year_month or CurrentYearMonth()
+    service = AIBackendSettingsStore.getService(service_id)
+    if service is not None:
+        snapshot = await AIAPIUsageLedger.GetMonthSnapshot(service, year_month=month)
+        return AIBackendUsageResponse.model_validate(SnapshotToDict(snapshot))
+    # 設定から消えた service でも台帳履歴があれば返す。
+    deleted = await AIAPIUsageLedger.GetDeletedMonthSnapshot(
+        service_id,
+        year_month=month,
+    )
+    if deleted is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='AI backend service not found.',
+            headers=NO_STORE_HEADERS,
+        )
+    return AIBackendUsageResponse.model_validate(SnapshotToDict(deleted))
 
 
 @router.get(

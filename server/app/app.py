@@ -310,6 +310,13 @@ async def Startup():
     # 録画スキャンとは分離したシリーズ判定ワーカーを開始する。
     await RecordedSeriesResolver.start()
 
+    # OpenCode 月次台帳の起動時 reserved リセット（前回プロセスの張り付きを解消）。
+    try:
+        from app.metadata.ai.AIAPIUsageLedger import AIAPIUsageLedger
+        await AIAPIUsageLedger.EnsureStartupReservedReset()
+    except Exception as ex:
+        logging.warning('[AIAPIUsageLedger] Startup reserved reset failed:', exc_info=ex)
+
     # Series確定後の話数解析・Web検索も別ワーカーで開始し、録画スキャンを待たせない。
     await RecordedEpisodeAutomation.start()
 

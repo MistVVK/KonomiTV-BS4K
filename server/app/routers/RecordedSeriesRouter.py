@@ -161,9 +161,6 @@ class RecordedSeriesStatusResponse(BaseModel):
     episode_not_numbered: int
     episode_needs_review: int
     episode_failed: int
-    ai_requests_today: int
-    series_ai_requests_today: int
-    episode_ai_requests_today: int
     last_run_at: str | None
     episode_last_run_at: str | None
     is_running: bool

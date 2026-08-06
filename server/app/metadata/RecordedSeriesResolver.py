@@ -6,7 +6,6 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from datetime import time as datetime_time
 from difflib import SequenceMatcher
 from typing import Literal, cast
 
@@ -72,10 +71,6 @@ from app.schemas import Genre
 
 RECORDED_SERIES_RESOLVER_VERSION = f'2-parser{SERIES_TITLE_PARSER_VERSION}'
 AI_ATTEMPT_CACHE_TTL_SECONDS = 300.0
-NON_BILLABLE_AI_REQUEST_ERROR_CODES = (
-    'InputChangedBeforeRequest',
-    'InputChangedBeforeApply',
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2868,19 +2863,6 @@ class RecordedSeriesResolver:
             ).count()
             for status in ('Pending', 'Resolved', 'NotSeries', 'NeedsReview', 'Failed')
         }
-        today_start = datetime.combine(datetime.now(tz=JST).date(), datetime_time.min, tzinfo=JST)
-        series_ai_requests_today = await RecordedSeriesAIRequest.filter(
-            purpose='Resolution',
-            created_at__gte=today_start,
-        ).filter(
-            Q(error_code=None) | Q(error_code__not_in=NON_BILLABLE_AI_REQUEST_ERROR_CODES),
-        ).count()
-        episode_ai_requests_today = await RecordedSeriesAIRequest.filter(
-            purpose='EpisodeLookup',
-            created_at__gte=today_start,
-        ).filter(
-            Q(error_code=None) | Q(error_code__not_in=NON_BILLABLE_AI_REQUEST_ERROR_CODES),
-        ).count()
         last_resolution = await RecordedSeriesResolution.all().order_by('-updated_at').first()
         resolved_count = status_counts['Resolved']
         not_series_count = status_counts['NotSeries']
@@ -2890,6 +2872,7 @@ class RecordedSeriesResolver:
             status_counts['Pending'],
             total - resolved_count - not_series_count - needs_review_count - failed_count,
         )
+        # 日次 AI 利用カウントは廃止。月次 cost/token は AIBackend usage API を参照する。
         return {
             'total': total,
             'pending': pending_count,
@@ -2897,9 +2880,6 @@ class RecordedSeriesResolver:
             'not_series': not_series_count,
             'needs_review': needs_review_count,
             'failed': failed_count,
-            'ai_requests_today': series_ai_requests_today + episode_ai_requests_today,
-            'series_ai_requests_today': series_ai_requests_today,
-            'episode_ai_requests_today': episode_ai_requests_today,
             'last_run_at': last_resolution.updated_at.isoformat() if last_resolution is not None else None,
             'is_running': cls._backfill_task is not None and cls._backfill_task.done() is False,
         }

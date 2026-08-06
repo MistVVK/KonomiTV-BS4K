@@ -1084,9 +1084,6 @@ def test_status_and_backfill_endpoints_return_task_contract(
             'not_series': 20,
             'needs_review': 29,
             'failed': 1,
-            'ai_requests_today': 3,
-            'series_ai_requests_today': 2,
-            'episode_ai_requests_today': 1,
             'last_run_at': '2026-07-21T12:34:56+09:00',
             'is_running': False,
         }
@@ -1135,8 +1132,7 @@ def test_status_and_backfill_endpoints_return_task_contract(
         assert status_response.status_code == 200
         assert status_response.json()['total'] == 160
         assert status_response.json()['episode_resolved'] == 90
-        assert status_response.json()['series_ai_requests_today'] == 2
-        assert status_response.json()['episode_ai_requests_today'] == 1
+        assert 'ai_requests_today' not in status_response.json()
         assert backfill_response.status_code == 202
         assert backfill_response.json() == {'execution_id': 42, 'reused': False}
         assert episode_backfill_response.status_code == 202
