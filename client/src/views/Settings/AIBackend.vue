@@ -100,9 +100,15 @@
                             OAuth切断
                         </v-btn>
                         <v-btn size="small" variant="tonal" color="primary" :disabled="is_busy || !health?.available"
-                            :loading="testing_service_id === service.service_id"
-                            @click="runConnectionTest(service)">
-                            接続試験
+                            :loading="testing_service_id === `${service.service_id}:CandidateSelection`"
+                            @click="runConnectionTest(service, 'CandidateSelection')">
+                            生成試験
+                        </v-btn>
+                        <v-btn size="small" variant="tonal" color="primary"
+                            :disabled="is_busy || !health?.available || service.auth_mode === 'NoneLocal'"
+                            :loading="testing_service_id === `${service.service_id}:EpisodeLookup`"
+                            @click="runConnectionTest(service, 'EpisodeLookup')">
+                            話数試験
                         </v-btn>
                         <v-btn size="small" variant="tonal" color="error" :disabled="is_busy"
                             @click="confirmDelete(service)">削除</v-btn>
@@ -279,6 +285,7 @@ import { computed, onMounted, ref } from 'vue';
 import Message from '@/message';
 import AIBackend, {
     type AIAuthMode,
+    type AIBackendConnectionCapability,
     type AIBillingMode,
     type IAIBackendConnectionTestResult,
     type IAIBackendService,
@@ -337,6 +344,7 @@ const health = ref<IOpenCodeAvailability | null>(null);
 const services = ref<IAIBackendService[]>([]);
 const usage_list = ref<IAIBackendUsage[]>([]);
 const test_results = ref<Record<string, IAIBackendConnectionTestResult | null>>({});
+/** `${service_id}:${capability}` 形式。同時に1試験のみ。 */
 const testing_service_id = ref<string | null>(null);
 
 /** service カードへ埋め込む当月 usage（削除済みは一覧側のみ）。 */
@@ -595,14 +603,27 @@ async function runOAuthDisconnect(service: IAIBackendService): Promise<void> {
     }
 }
 
-async function runConnectionTest(service: IAIBackendService): Promise<void> {
-    testing_service_id.value = service.service_id;
+async function runConnectionTest(
+    service: IAIBackendService,
+    capability: AIBackendConnectionCapability = 'CandidateSelection',
+): Promise<void> {
+    const test_key = `${service.service_id}:${capability}`;
+    testing_service_id.value = test_key;
     try {
-        const result = await AIBackend.testConnection(service.service_id, 'CandidateSelection');
+        const result = await AIBackend.testConnection(service.service_id, capability);
         if (result !== null) {
-            test_results.value = {...test_results.value, [service.service_id]: result};
+            // 同一 service の最新結果を表示（capability はメッセージに含まれる）
+            const labeled: IAIBackendConnectionTestResult = {
+                ...result,
+                message: `[${capability === 'EpisodeLookup' ? '話数' : '生成'}] ${result.message}`,
+            };
+            test_results.value = {...test_results.value, [service.service_id]: labeled};
             if (result.success) {
-                Message.success('接続試験に成功しました。');
+                Message.success(
+                    capability === 'EpisodeLookup'
+                        ? '話数 Web 検索の接続試験に成功しました。'
+                        : 'シリーズ生成の接続試験に成功しました。',
+                );
             } else {
                 Message.warning(result.message || '接続試験に失敗しました。');
             }
