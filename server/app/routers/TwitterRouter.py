@@ -1,7 +1,14 @@
 
-from typing import Annotated, Literal
-from urllib.parse import urlparse
+import asyncio
+import ipaddress
+import socket
+import ssl
+from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
+from typing import Annotated, Literal, Protocol, cast
+from urllib.parse import urlsplit
 
+import httpcore
 import httpx
 from fastapi import (
     APIRouter,
@@ -17,13 +24,14 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from starlette.background import BackgroundTask
+from fastapi.security.utils import get_authorization_scheme_param
 
 from app import logging, schemas
 from app.constants import API_REQUEST_HEADERS
 from app.models.TwitterAccount import TwitterAccount
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentUser
+from app.utils.DataBroadcastingHTTPClient import PinnedNetworkBackend
 from app.utils.TwitterGraphQLAPI import TwitterGraphQLAPI
 from app.utils.TwitterScrapeBrowser import TwitterScrapeBrowser
 
@@ -33,6 +41,456 @@ router = APIRouter(
     tags = ['Twitter'],
     prefix = '/api/twitter',
 )
+
+# Twitter 動画プロキシで許可する CDN ホスト名。
+# 完全一致のみを許可し、サブドメインの追加や外部ドメインへの redirect を拒否する。
+ALLOWED_VIDEO_PROXY_DOMAINS = frozenset({
+    'video.twimg.com',
+    'pbs.twimg.com',
+})
+
+# 自動 redirect を無効化したうえで、手動で追う hop 数の上限。
+# redirect loop と、許可 CDN 外への連鎖転送をここで打ち切る。
+MAX_VIDEO_PROXY_REDIRECTS = 3
+
+# 1 リクエストあたり上流から転送してよい最大バイト数。
+# Range 再生は維持しつつ、未認証に近い帯域悪用や巨大応答の中継を防ぐ。
+MAX_VIDEO_PROXY_BYTES = 100 * 1024 * 1024
+
+# 上流接続・読み取りのタイムアウト (秒)。
+VIDEO_PROXY_TIMEOUT_SECONDS = 30.0
+
+# `<video>` が Authorization ヘッダを送れない場合に使う、path 限定の認証 Cookie 名。
+TWITTER_VIDEO_PROXY_ACCESS_TOKEN_COOKIE = 'KonomiTV-TwitterVideoAccessToken'
+
+
+class TwitterVideoProxyURLRejected(ValueError):
+    """Twitter 動画プロキシの接続先ポリシーで拒否された URL。"""
+
+
+class TwitterVideoProxyLimitExceeded(ValueError):
+    """Twitter 動画プロキシの転送量上限を超えた。"""
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedTwitterVideoProxyURL:
+    """接続先検証済みの Twitter CDN URL と、接続時に再解決しない IP 一覧。"""
+
+    url: httpx.URL
+    host: str
+    port: int
+    addresses: tuple[str, ...]
+
+
+class _ClosableAsyncByteStream(Protocol):
+    """httpcore 応答 stream のうち、この transport が必要とする操作。"""
+
+    def __aiter__(self) -> AsyncIterator[bytes]: ...
+
+    async def aclose(self) -> None: ...
+
+
+class _TwitterVideoProxyResponseStream(httpx.AsyncByteStream):
+    """httpcore の応答 stream を httpx の transport 応答へ橋渡しする。"""
+
+    def __init__(self, stream: _ClosableAsyncByteStream) -> None:
+        """
+        Args:
+            stream: httpcore が返した非同期応答 stream。
+        """
+
+        self.stream = stream
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self.stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        await self.stream.aclose()
+
+
+class _TwitterVideoProxyNetworkBackend(httpcore.AsyncNetworkBackend):
+    """hop ごとに検証した CDN ホストと IP の組だけへ接続する backend。"""
+
+    def __init__(self) -> None:
+        # redirect の各 hop で検証済みになったホストに対応する pinned backend。
+        self.backends: dict[str, PinnedNetworkBackend] = {}
+
+    def setAllowedAddresses(self, host: str, addresses: tuple[str, ...]) -> None:
+        """host の接続先を、その hop で検証した公開 IP 一覧へ固定する。"""
+
+        self.backends[host] = PinnedNetworkBackend(host, addresses)
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        backend = self.backends.get(host)
+        if backend is None:
+            raise httpcore.ConnectError('Upstream host was not pinned before connection')
+        return await backend.connect_tcp(host, port, timeout, local_address, socket_options)
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        """Twitter CDN への接続で Unix domain socket は許可しない。"""
+
+        raise httpcore.ConnectError('Unix socket upstreams are not allowed')
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+
+class _TwitterVideoProxyTransport(httpx.AsyncBaseTransport):
+    """検証済み IP だけへ接続する Twitter 動画用 httpx transport。"""
+
+    def __init__(self, network_backend: _TwitterVideoProxyNetworkBackend) -> None:
+        """
+        Args:
+            network_backend: hop ごとの検証済み IP を保持する backend。
+        """
+
+        # Twitter CDN は通常の公開証明書を使うため、OS の信頼ストアで厳格に検証する。
+        self.pool = httpcore.AsyncConnectionPool(
+            ssl_context=ssl.create_default_context(),
+            max_connections=1,
+            max_keepalive_connections=0,
+            http1=True,
+            http2=False,
+            network_backend=network_backend,
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if not isinstance(request.stream, httpx.AsyncByteStream):
+            raise TypeError('Twitter video proxy request stream must be asynchronous')
+
+        core_response = await self.pool.handle_async_request(httpcore.Request(
+            method=request.method,
+            url=httpcore.URL(
+                scheme=request.url.raw_scheme,
+                host=request.url.raw_host,
+                port=request.url.port,
+                target=request.url.raw_path,
+            ),
+            headers=request.headers.raw,
+            content=request.stream,
+            extensions=request.extensions,
+        ))
+        response_stream = cast(_ClosableAsyncByteStream, core_response.stream)
+        return httpx.Response(
+            status_code=core_response.status,
+            headers=core_response.headers,
+            stream=_TwitterVideoProxyResponseStream(response_stream),
+            extensions=core_response.extensions,
+        )
+
+    async def aclose(self) -> None:
+        await self.pool.aclose()
+
+
+def _IsAllowedGlobalAddress(address: str) -> bool:
+    """外部インターネット向け接続先として許可できる IP か判定する。"""
+
+    try:
+        parsed_address = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+
+    # IPv4-mapped IPv6 は内側の IPv4 へ戻し、::ffff:127.0.0.1 などを弾く。
+    if isinstance(parsed_address, ipaddress.IPv6Address) and parsed_address.ipv4_mapped is not None:
+        parsed_address = parsed_address.ipv4_mapped
+
+    return (
+        parsed_address.is_global
+        and not parsed_address.is_private
+        and not parsed_address.is_loopback
+        and not parsed_address.is_link_local
+        and not parsed_address.is_reserved
+        and not parsed_address.is_multicast
+        and not parsed_address.is_unspecified
+    )
+
+
+async def _ResolveAllowedAddresses(host: str, port: int) -> tuple[str, ...]:
+    """
+    host を一度だけ解決し、全結果がグローバル IP であることを確認する。
+
+    Args:
+        host: 接続先ホスト名。
+        port: 接続先ポート。
+
+    Returns:
+        検証済みの公開 IP 一覧。
+
+    Raises:
+        TwitterVideoProxyURLRejected: 解決失敗、または非公開 IP を含む場合。
+    """
+
+    loop = asyncio.get_running_loop()
+    try:
+        address_records = await loop.getaddrinfo(
+            host,
+            port,
+            family = socket.AF_UNSPEC,
+            type = socket.SOCK_STREAM,
+        )
+    except socket.gaierror as ex:
+        raise TwitterVideoProxyURLRejected('Upstream host could not be resolved') from ex
+
+    resolved_addresses: list[str] = []
+    for _family, _socktype, _protocol, _canonname, sockaddr in address_records:
+        address = sockaddr[0]
+        if isinstance(address, str):
+            resolved_addresses.append(address)
+
+    addresses = tuple(dict.fromkeys(resolved_addresses))
+    if not addresses or any(not _IsAllowedGlobalAddress(address) for address in addresses):
+        raise TwitterVideoProxyURLRejected('Upstream host resolved to a non-global address')
+    return addresses
+
+
+async def ValidateTwitterVideoProxyURL(url: str) -> ResolvedTwitterVideoProxyURL:
+    """
+    Twitter 動画プロキシで許可する URL か検証し、接続先 IP を固定して返す。
+
+    scheme・hostname・認証情報・制御文字を検査したうえで DNS を解決し、
+    解決結果に private / loopback / link-local が含まれる場合は拒否する。
+
+    Args:
+        url: 初期 URL、または redirect 先 URL。
+
+    Returns:
+        正規化済み URL と検証済み公開 IP 一覧。
+
+    Raises:
+        TwitterVideoProxyURLRejected: ポリシー違反の URL。
+    """
+
+    # CRLF や NUL を含む値はヘッダ注入やパーサ差分の温床になるため先に拒否する。
+    if any(control_character in url for control_character in ('\r', '\n', '\x00')):
+        raise TwitterVideoProxyURLRejected('Upstream URL contains a control character')
+
+    try:
+        parsed_url = httpx.URL(url)
+        parsed_parts = urlsplit(url)
+        parsed_port = parsed_url.port
+    except (httpx.InvalidURL, ValueError) as ex:
+        raise TwitterVideoProxyURLRejected('Upstream URL is invalid') from ex
+
+    if parsed_url.scheme != 'https':
+        raise TwitterVideoProxyURLRejected('Upstream URL scheme must be https')
+    if not parsed_url.host:
+        raise TwitterVideoProxyURLRejected('Upstream URL host is missing')
+    # userinfo 付き URL は認証情報の持ち込みとパーサ差分を避けるため拒否する。
+    if '@' in parsed_parts.netloc or parsed_url.userinfo != b'':
+        raise TwitterVideoProxyURLRejected('Upstream URL credentials are not allowed')
+    if parsed_url.fragment:
+        raise TwitterVideoProxyURLRejected('Upstream URL fragments are not allowed')
+    if parsed_url.host not in ALLOWED_VIDEO_PROXY_DOMAINS:
+        raise TwitterVideoProxyURLRejected('Upstream URL domain is not allowed')
+    if parsed_port not in (None, 443):
+        raise TwitterVideoProxyURLRejected('Upstream URL port is not allowed')
+
+    port = parsed_port or 443
+    # hop ごとに DNS を再解決し、検証結果を接続時まで保持して再解決を防ぐ。
+    addresses = await _ResolveAllowedAddresses(parsed_url.host, port)
+    return ResolvedTwitterVideoProxyURL(
+        url=parsed_url,
+        host=parsed_url.host,
+        port=port,
+        addresses=addresses,
+    )
+
+
+async def GetCurrentUserForTwitterVideoProxy(
+    request: Request,
+) -> User:
+    """
+    Twitter 動画プロキシ用に現在のユーザーを取得する。
+
+    `<video src>` は Authorization ヘッダを送れないため、通常の Bearer に加えて
+    path 限定の Secure Cookie も受け付ける。どちらか一方で GetCurrentUser と同じ検証を行う。
+
+    Args:
+        request: クライアントからのリクエスト。
+    Returns:
+        認証済みユーザー。
+
+    Raises:
+        HTTPException: トークンが欠落または不正な場合。
+    """
+
+    authorization = request.headers.get('Authorization')
+    scheme, param = get_authorization_scheme_param(authorization)
+    token: str | None = None
+    if scheme.lower() == 'bearer' and param != '':
+        token = param
+    else:
+        cookie_token = request.cookies.get(TWITTER_VIDEO_PROXY_ACCESS_TOKEN_COOKIE)
+        if cookie_token is not None and cookie_token != '':
+            # video 要素は Authorization を送れないため、同一 JWT を path 限定 Cookie で受け取る。
+            token = cookie_token
+
+    if token is None:
+        logging.warning('[TwitterRouter][GetCurrentUserForTwitterVideoProxy] Access token is missing.')
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = 'Not authenticated',
+            headers = {'WWW-Authenticate': 'Bearer'},
+        )
+
+    return await GetCurrentUser(token = token)
+
+
+async def _IterUpstreamBytesWithLimit(
+    upstream_response: httpx.Response,
+    max_bytes: int = MAX_VIDEO_PROXY_BYTES,
+) -> AsyncIterator[bytes]:
+    """
+    上流レスポンスをチャンク転送し、累積転送量が上限を超えたら打ち切る。
+
+    Args:
+        upstream_response: stream=True で取得した上流レスポンス。
+        max_bytes: 許可する最大転送バイト数。
+
+    Yields:
+        上流から読み取ったチャンク。
+
+    Raises:
+        TwitterVideoProxyLimitExceeded: 累積転送量が上限を超えた場合。
+    """
+
+    total_bytes = 0
+    async for chunk in upstream_response.aiter_bytes(chunk_size = 65536):
+        if not chunk:
+            continue
+        total_bytes += len(chunk)
+        if total_bytes > max_bytes:
+            raise TwitterVideoProxyLimitExceeded('Upstream response body exceeds the limit')
+        yield chunk
+
+
+async def _OpenTwitterVideoUpstream(
+    request: Request,
+    url: str,
+) -> tuple[httpx.AsyncClient, httpx.Response]:
+    """
+    許可 CDN への上流 GET を開き、必要なら redirect を手動で辿る。
+
+    自動 redirect は使わず、各 hop で scheme・hostname・解決 IP を再検証する。
+    成功時はストリーミング中の client / response を呼び出し側へ渡し、失敗時は両方閉じる。
+
+    Args:
+        request: クライアントからのリクエスト。Range 等の転送対象ヘッダを含む。
+        url: 初期の Twitter 動画 URL。
+
+    Returns:
+        (httpx.AsyncClient, httpx.Response) の組。response は stream オープン済み。
+
+    Raises:
+        TwitterVideoProxyURLRejected: URL ポリシー違反、redirect 過多。
+        HTTPException: 上流接続失敗、上流 4xx/5xx、Content-Length 超過。
+    """
+
+    # Range など再生に必要なヘッダだけを転送し、Cookie や Authorization は漏らさない。
+    proxy_headers: dict[str, str] = {
+        'User-Agent': API_REQUEST_HEADERS['User-Agent'],
+        # httpx の自動復号で Content-Length / Range と実転送 byte がずれないよう identity に固定する。
+        'Accept-Encoding': 'identity',
+    }
+    allowed_request_headers = {
+        'range',
+        'accept',
+        'if-range',
+        'if-none-match',
+        'if-modified-since',
+    }
+    for key, value in request.headers.items():
+        if key.lower() in allowed_request_headers:
+            proxy_headers[key] = value
+
+    # follow_redirects=False で自動追従を止め、hop ごとの再検証と IP pinning を強制する。
+    network_backend = _TwitterVideoProxyNetworkBackend()
+    client = httpx.AsyncClient(
+        follow_redirects = False,
+        timeout = VIDEO_PROXY_TIMEOUT_SECONDS,
+        transport = _TwitterVideoProxyTransport(network_backend),
+    )
+    current_url = url
+    upstream_response: httpx.Response | None = None
+
+    try:
+        for redirect_count in range(MAX_VIDEO_PROXY_REDIRECTS + 1):
+            # 初期 URL と redirect 先の両方で許可 CDN・公開 IP を確認し、接続先を検証結果へ固定する。
+            resolved_url = await ValidateTwitterVideoProxyURL(current_url)
+            network_backend.setAllowedAddresses(resolved_url.host, resolved_url.addresses)
+
+            try:
+                upstream_request = client.build_request('GET', resolved_url.url, headers = proxy_headers)
+                upstream_response = await client.send(upstream_request, stream = True)
+            except Exception as ex:
+                logging.error('[TwitterRouter][_OpenTwitterVideoUpstream] Failed to request upstream:', exc_info = ex)
+                raise HTTPException(
+                    status_code = status.HTTP_502_BAD_GATEWAY,
+                    detail = 'Failed to request upstream resource',
+                ) from ex
+
+            # redirect 系は Location を取り出し、本文は読まずに次 hop へ進む。
+            if upstream_response.status_code in {301, 302, 303, 307, 308}:
+                location = upstream_response.headers.get('location')
+                await upstream_response.aclose()
+                upstream_response = None
+                if location is None or location == '':
+                    raise TwitterVideoProxyURLRejected('Redirect response is missing Location')
+                if redirect_count >= MAX_VIDEO_PROXY_REDIRECTS:
+                    raise TwitterVideoProxyURLRejected('Too many upstream redirects')
+                # 相対 Location も現在 URL 基準で解決し、その結果を次 hop で再検証する。
+                current_url = str(resolved_url.url.join(location))
+                continue
+
+            # 上流エラー本文は攻撃者が任意サイズにできるため読み込まず、status だけを記録する。
+            if upstream_response.status_code >= 400:
+                upstream_status_code = upstream_response.status_code
+                await upstream_response.aclose()
+                upstream_response = None
+                logging.error(
+                    f'[TwitterRouter][_OpenTwitterVideoUpstream] Upstream returned HTTP {upstream_status_code}.',
+                )
+                raise HTTPException(
+                    status_code = status.HTTP_502_BAD_GATEWAY,
+                    detail = 'Upstream returned an error response',
+                )
+
+            # Content-Length が分かる場合はストリーム開始前に拒否し、巨大応答の中継を防ぐ。
+            content_length_header = upstream_response.headers.get('content-length')
+            if content_length_header is not None:
+                try:
+                    content_length = int(content_length_header.strip())
+                except ValueError:
+                    content_length = MAX_VIDEO_PROXY_BYTES + 1
+                # 304 の Content-Length は本文ではなく選択された表現のサイズなので上限判定に使わない。
+                if upstream_response.status_code != 304 and content_length > MAX_VIDEO_PROXY_BYTES:
+                    await upstream_response.aclose()
+                    upstream_response = None
+                    raise TwitterVideoProxyLimitExceeded('Upstream response Content-Length exceeds the limit')
+
+            return client, upstream_response
+
+        raise TwitterVideoProxyURLRejected('Too many upstream redirects')
+    except Exception:
+        # 例外経路では必ず接続を閉じ、呼び出し側へリークさせない。
+        if upstream_response is not None:
+            await upstream_response.aclose()
+        await client.aclose()
+        raise
+
 
 def ParseAcceptLanguageHeader(accept_language: str | None) -> list[str]:
     """
@@ -534,92 +992,72 @@ async def TwitterSearchAPI(
 async def TwitterVideoProxyAPI(
     request: Request,
     url: Annotated[str, Query(description='プロキシ対象の Twitter 動画 URL 。')],
+    current_user: Annotated[User, Depends(GetCurrentUserForTwitterVideoProxy)],
 ):
     """
     Twitter の動画を KonomiTV-BS4K サーバー経由でプロキシ配信する。<br>
     Twitter 側の仕様変更により、許可されたオリジン以外からの動画 URL への直接アクセスが<br>
     403 Forbidden で拒否されるようになったため、サーバー側でリクエストを中継することでこの制限を回避する。<br>
     Range リクエストに対応しており、動画のシーク操作が可能。<br>
-    セキュリティ上の理由から、`video.twimg.com` および `pbs.twimg.com` ドメインの HTTPS URL のみプロキシを許可する。
+    ログイン中のユーザーのみ利用でき、`video.twimg.com` / `pbs.twimg.com` の HTTPS URL だけを中継する。<br>
+    自動 redirect は行わず、各 hop で scheme・hostname・解決 IP を再検証し、hop 数と転送量に上限を設ける。
     """
 
-    # Twitter 動画のプロキシで許可するドメインのリスト
-    ALLOWED_VIDEO_PROXY_DOMAINS = ['video.twimg.com', 'pbs.twimg.com']
+    # Depends で認証済みであることを保証する。ユーザー本体はこの API では使わない。
+    del current_user
 
-    # URL のバリデーション: スキームが https であること
-    parsed_url = urlparse(url)
-    if parsed_url.scheme != 'https':
-        logging.error(f'[TwitterRouter][TwitterVideoProxyAPI] URL scheme must be https: {parsed_url.scheme}')
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'URL scheme must be https.',
-        )
-
-    # URL のバリデーション: Twitter の動画ドメインのみ許可
-    if parsed_url.hostname not in ALLOWED_VIDEO_PROXY_DOMAINS:
-        logging.error(f'[TwitterRouter][TwitterVideoProxyAPI] URL domain is not allowed: {parsed_url.hostname}')
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = f'URL domain is not allowed. Only {", ".join(ALLOWED_VIDEO_PROXY_DOMAINS)} are allowed.',
-        )
-
-    # リクエストヘッダの構築
-    ## Range ヘッダを転送することで、動画のシーク操作に対応する
-    proxy_headers: dict[str, str] = {
-        'User-Agent': API_REQUEST_HEADERS['User-Agent'],
-    }
-    allowed_request_headers = ['range', 'accept', 'accept-encoding', 'if-range', 'if-none-match', 'if-modified-since']
-    for key, value in request.headers.items():
-        if key.lower() in allowed_request_headers:
-            proxy_headers[key] = value
-
-    # httpx クライアントを作成し、ストリーミングモードでリクエストを送信
-    ## メモリ効率のためにレスポンスボディを一括で読み込まず、チャンク単位でストリーミング転送する
-    client = httpx.AsyncClient(follow_redirects=True, timeout=30.0)
     try:
-        upstream_request = client.build_request('GET', url, headers=proxy_headers)
-        upstream_response = await client.send(upstream_request, stream=True)
-    except Exception as ex:
-        await client.aclose()
-        logging.error('[TwitterRouter][TwitterVideoProxyAPI] Failed to request upstream:', exc_info=ex)
+        client, upstream_response = await _OpenTwitterVideoUpstream(request, url)
+    except TwitterVideoProxyURLRejected:
+        logging.warning('[TwitterRouter][TwitterVideoProxyAPI] Upstream URL rejected by proxy policy.')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'URL is not allowed',
+        )
+    except TwitterVideoProxyLimitExceeded:
+        logging.warning('[TwitterRouter][TwitterVideoProxyAPI] Upstream response exceeded transfer limit.')
         raise HTTPException(
             status_code = status.HTTP_502_BAD_GATEWAY,
-            detail = f'Failed to request upstream: {ex}',
+            detail = 'Upstream response is too large',
         )
 
-    # 上流サーバーからエラーレスポンスが返された場合はクリーンアップしてエラーを返す
-    if upstream_response.status_code >= 400:
-        error_body = await upstream_response.aread()
-        await upstream_response.aclose()
-        await client.aclose()
-        error_text = error_body[:200].decode('utf-8', errors='replace')
-        logging.error(f'[TwitterRouter][TwitterVideoProxyAPI] Upstream returned HTTP {upstream_response.status_code}: {error_text}')
-        raise HTTPException(
-            status_code = upstream_response.status_code,
-            detail = f'Upstream returned HTTP {upstream_response.status_code}.',
-        )
-
-    # レスポンスヘッダの構築
-    ## 動画のストリーミング再生に必要なヘッダを転送する
-    allowed_response_headers = [
+    # 動画のストリーミング再生に必要なヘッダだけを転送する。
+    allowed_response_headers = {
         'content-type',
         'content-length',
         'content-range',
         'accept-ranges',
-        'cache-control',
         'etag',
         'last-modified',
-    ]
-    response_headers = {key: value for key, value in upstream_response.headers.items() if key.lower() in allowed_response_headers}
+    }
+    response_headers = {
+        key: value
+        for key, value in upstream_response.headers.items()
+        if key.lower() in allowed_response_headers
+    }
+    upstream_status_code = upstream_response.status_code
+    # 認証 Cookie を使うレスポンスを共有キャッシュへ保存させず、URL を Referer に使わせない。
+    response_headers['Cache-Control'] = 'private, no-store'
+    response_headers['Referrer-Policy'] = 'no-referrer'
+    if upstream_status_code == status.HTTP_304_NOT_MODIFIED:
+        response_headers.pop('content-length', None)
 
-    # ストリーミングレスポンスの完了後にクリーンアップを行う BackgroundTask
-    async def cleanup() -> None:
-        await upstream_response.aclose()
-        await client.aclose()
+    async def stream_with_limit() -> AsyncIterator[bytes]:
+        """転送量上限付きで上流チャンクを返し、完了・中断を問わず接続を閉じる。"""
+
+        try:
+            async for chunk in _IterUpstreamBytesWithLimit(upstream_response):
+                yield chunk
+        except TwitterVideoProxyLimitExceeded:
+            # ヘッダ送信後は status を変えられないため例外を再送出し、正常完了に見せず接続を中断する。
+            logging.warning('[TwitterRouter][TwitterVideoProxyAPI] Aborted stream after transfer limit.')
+            raise
+        finally:
+            await upstream_response.aclose()
+            await client.aclose()
 
     return StreamingResponse(
-        upstream_response.aiter_bytes(chunk_size=65536),
-        status_code = upstream_response.status_code,
+        stream_with_limit(),
+        status_code = upstream_status_code,
         headers = response_headers,
-        background = BackgroundTask(cleanup),
     )

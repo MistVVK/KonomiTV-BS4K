@@ -99,11 +99,19 @@ const formattedQuotedText = computed(() => displayedTweet.value.quoted_tweet ?
 
 // Twitter 側の仕様変更により、許可されたオリジン以外からの動画 URL への直接アクセスが 403 になるため、
 // KonomiTV サーバーの動画プロキシ API 経由で動画を配信する
+// <video src> は Authorization ヘッダを送れないため、ログイン中の JWT を path 限定 Cookie で渡す
 const proxyMovieUrl = computed(() => {
     const movieUrl = displayedTweet.value.movie_url;
     if (!movieUrl) return null;
     if (displayedTweet.value.source === 'Bluesky') return movieUrl;
-    return `${Utils.api_base_url}/twitter/video-proxy?url=${encodeURIComponent(movieUrl)}`;
+    const accessToken = Utils.getAccessToken();
+    if (accessToken === null) return null;
+    // 既存ログインセッションでも、動画表示時に Cookie が最新 JWT と一致するよう同期する
+    Utils.syncTwitterVideoAccessTokenCookie(accessToken);
+    const params = new URLSearchParams({
+        url: movieUrl,
+    });
+    return `${Utils.api_base_url}/twitter/video-proxy?${params.toString()}`;
 });
 
 const getUserUrl = (user: ITweetUser) => {

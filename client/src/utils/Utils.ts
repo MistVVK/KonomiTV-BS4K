@@ -9,6 +9,10 @@ import useSettingsStore from '@/stores/SettingsStore';
  */
 export default class Utils {
 
+    // <video> が Authorization ヘッダを送れないために使う、動画プロキシ専用 Cookie。
+    // Server 側と同じ名前を維持し、Path を動画 endpoint だけへ限定する。
+    private static readonly twitter_video_access_token_cookie_name = 'KonomiTV-TwitterVideoAccessToken';
+
     // バージョン情報
     // ビルド時の環境変数 (vue.config.js に記載) から取得
     static readonly version: string = import.meta.env.KONOMITV_VERSION;
@@ -54,6 +58,7 @@ export default class Utils {
 
         // そのまま LocalStorage に保存
         localStorage.setItem('KonomiTV-AccessToken', access_token);
+        Utils.syncTwitterVideoAccessTokenCookie(access_token);
     }
 
 
@@ -63,11 +68,26 @@ export default class Utils {
      */
     static deleteAccessToken(): void {
 
-        // LocalStorage に KonomiTV-AccessToken キーが存在しない
-        if (localStorage.getItem('KonomiTV-AccessToken') === null) return;
-
         // KonomiTV-AccessToken キーを削除
         localStorage.removeItem('KonomiTV-AccessToken');
+        Utils.syncTwitterVideoAccessTokenCookie(null);
+    }
+
+
+    /**
+     * Twitter 動画プロキシ専用の認証 Cookie を現在のアクセストークンへ同期する
+     * @param access_token JWT アクセストークン（削除する場合は null）
+     */
+    static syncTwitterVideoAccessTokenCookie(access_token: string | null): void {
+
+        const cookie_value = access_token === null ? '' : encodeURIComponent(access_token);
+        const max_age = access_token === null ? '; Max-Age=0' : '';
+        document.cookie = [
+            `${Utils.twitter_video_access_token_cookie_name}=${cookie_value}`,
+            'Path=/api/twitter/video-proxy',
+            'SameSite=Strict',
+            'Secure',
+        ].join('; ') + max_age;
     }
 
 

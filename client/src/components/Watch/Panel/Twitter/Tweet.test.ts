@@ -1,10 +1,10 @@
 import { DOMWrapper, mount } from '@vue/test-utils';
 import { createPinia } from 'pinia';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import Tweet from '@/components/Watch/Panel/Twitter/Tweet.vue';
 import { ITweet } from '@/services/Twitter';
-import { dayjs } from '@/utils';
+import Utils, { dayjs } from '@/utils';
 
 // テスト用のツイートを生成する
 const createTweet = (text: string, extra: Partial<ITweet> = {}): ITweet => ({
@@ -105,5 +105,33 @@ describe('Tweet', () => {
         const quotedTextContainer = wrapper.find('.tweet__quoted-text');
         expectNoInjectionIn(quotedTextContainer);
         expect(quotedTextContainer.text()).toContain('<img src=x onerror=alert(1)>');
+    });
+
+    it('Twitter 動画は JWT を URL に含めず path 限定 Cookie へ同期する', () => {
+        vi.spyOn(Utils, 'getAccessToken').mockReturnValue('test-access-token');
+        const syncCookie = vi.spyOn(Utils, 'syncTwitterVideoAccessTokenCookie').mockImplementation(() => undefined);
+        const movieUrl = 'https://video.twimg.com/ext_tw_video/1.mp4';
+        const wrapper = mountTweet(createTweet('動画', { movie_url: movieUrl }));
+        const video = wrapper.find('video.tweet__movie');
+        expect(video.exists()).toBe(true);
+        const src = video.attributes('src') ?? '';
+        expect(src.startsWith(`${Utils.api_base_url}/twitter/video-proxy?`)).toBe(true);
+        const params = new URL(src).searchParams;
+        expect(params.get('url')).toBe(movieUrl);
+        expect(params.has('access_token')).toBe(false);
+        expect(src).not.toContain('test-access-token');
+        expect(syncCookie).toHaveBeenCalledWith('test-access-token');
+    });
+
+    it('未ログイン時は Twitter 動画プロキシ URL を出さない', () => {
+        vi.spyOn(Utils, 'getAccessToken').mockReturnValue(null);
+        const wrapper = mountTweet(createTweet('動画', {
+            movie_url: 'https://video.twimg.com/ext_tw_video/1.mp4',
+        }));
+        expect(wrapper.find('video.tweet__movie').exists()).toBe(false);
+    });
+
+    afterEach(() => {
+        vi.restoreAllMocks();
     });
 });
