@@ -18,7 +18,12 @@
                     </div>
                     <span class="tweet__timestamp">{{ Utils.apply28HourClock(dayjs(displayedTweet.created_at).format('MM/DD HH:mm:ss')) }}</span>
                 </div>
-                <p class="tweet__text" v-html="formattedText"></p>
+                <p class="tweet__text">
+                    <template v-for="(segment, index) in formattedText" :key="index">
+                        <a v-if="segment.type === 'link'" class="tweet-link" :href="segment.url" target="_blank" rel="noopener">{{ segment.text }}</a>
+                        <template v-else>{{ segment.text }}</template>
+                    </template>
+                </p>
                 <div class="tweet__images" v-if="displayedTweet.image_urls && displayedTweet.image_urls.length > 0">
                     <a v-for="(url, index) in displayedTweet.image_urls" :key="index" :href="url" target="_blank" @click.stop>
                         <img :src="url" alt="Tweet Image" class="tweet__image" loading="lazy" decoding="async">
@@ -32,7 +37,12 @@
                         <span class="tweet__quoted-user-name">{{ displayedTweet.quoted_tweet.user.name }}</span>
                         <span class="tweet__quoted-user-screen-name">@{{ displayedTweet.quoted_tweet.user.screen_name }}</span>
                     </div>
-                    <p class="tweet__quoted-text" v-html="formattedQuotedText"></p>
+                    <p class="tweet__quoted-text">
+                        <template v-for="(segment, index) in formattedQuotedText" :key="index">
+                            <a v-if="segment.type === 'link'" class="tweet-link" :href="segment.url" target="_blank" rel="noopener">{{ segment.text }}</a>
+                            <template v-else>{{ segment.text }}</template>
+                        </template>
+                    </p>
                 </a>
                 <div class="tweet__actions">
                     <button v-ripple class="tweet__action tweet__action--retweet" :class="{ 'tweet__action--active': displayedTweet.retweeted }"
@@ -66,7 +76,7 @@ import Bluesky from '@/services/Bluesky';
 import Twitter, { ITweet } from '@/services/Twitter';
 import { ITweetUser } from '@/services/Twitter';
 import useTwitterStore from '@/stores/TwitterStore';
-import Utils, { dayjs } from '@/utils';
+import Utils, { dayjs, TweetUtils } from '@/utils';
 
 const props = defineProps<{
     tweet: ITweet;
@@ -80,43 +90,12 @@ const tweet = toRef(props, 'tweet');
 // RT / リポスト表示では外側の「誰が共有したか」と内側の原投稿を分け、本文や画像は原投稿側を表示する
 const displayedTweet = computed(() => tweet.value.retweeted_tweet || tweet.value);
 
-const formatText = (text: string, source: ITweet['source']) => {
-    const urlRegex = /(https?:\/\/[^\s]+)/g;
-    const mentionRegex = source === 'Bluesky' ? /@([a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z][a-zA-Z0-9.-]*)/g : /@(\w+)/g;
-    const hashtagRegex = /[#＃]([\w\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}ー]+)/gu;
-
-    // URLを先に処理し、プレースホルダーで置き換える
-    const urls: string[] = [];
-    let formattedText = text.replace(urlRegex, (url) => {
-        urls.push(url);
-        return `__URL_PLACEHOLDER_${urls.length - 1}__`;
-    });
-
-    // メンションとハッシュタグを処理
-    // Bluesky 投稿は bsky.app のプロフィール・ハッシュタグページに飛ばし、Twitter 投稿の既存導線と混ざらないようにする
-    formattedText = formattedText.replace(mentionRegex, (_match, screenName) => {
-        const mentionUrl = source === 'Bluesky' ? `https://bsky.app/profile/${screenName}` : `https://x.com/${screenName}`;
-        return `<a class="tweet-link" href="${mentionUrl}" target="_blank">@${screenName}</a>`;
-    });
-    formattedText = formattedText.replace(hashtagRegex, (_match, hashtag) => {
-        const hashtagUrl = source === 'Bluesky' ?
-            `https://bsky.app/hashtag/${encodeURIComponent(hashtag)}` :
-            `https://x.com/hashtag/${encodeURIComponent(hashtag)}`;
-        return `<a class="tweet-link" href="${hashtagUrl}" target="_blank">#${hashtag}</a>`;
-    });
-
-    // プレースホルダーを実際のURLリンクに置き換える
-    formattedText = formattedText.replace(/__URL_PLACEHOLDER_(\d+)__/g, (_, index) => {
-        const url = urls[parseInt(index)];
-        return `<a class="tweet-link" href="${url}" target="_blank">${url}</a>`;
-    });
-
-    return formattedText;
-};
-
-const formattedText = computed(() => formatText(displayedTweet.value.text, displayedTweet.value.source));
+// Tweet 本文を描画用のセグメントへ分解する
+// URL・メンション・ハッシュタグは固定属性のリンクとして、それ以外の本文はテキストノードとして表示し、
+// 本文中の任意文字列が HTML として解釈されないようにする (v-html での表示は行わない)
+const formattedText = computed(() => TweetUtils.tokenizeTweetText(displayedTweet.value.text, displayedTweet.value.source));
 const formattedQuotedText = computed(() => displayedTweet.value.quoted_tweet ?
-    formatText(displayedTweet.value.quoted_tweet.text, displayedTweet.value.quoted_tweet.source) : '');
+    TweetUtils.tokenizeTweetText(displayedTweet.value.quoted_tweet.text, displayedTweet.value.quoted_tweet.source) : []);
 
 // Twitter 側の仕様変更により、許可されたオリジン以外からの動画 URL への直接アクセスが 403 になるため、
 // KonomiTV サーバーの動画プロキシ API 経由で動画を配信する

@@ -32,6 +32,12 @@ export interface IReplyThreadDecision {
     clear_state: boolean;
 }
 
+// Tweet 本文を描画用に分解したセグメント
+// text はテキストノードとして表示し、link は固定属性の <a> 要素として表示する
+export type TweetTextSegment =
+    | { type: 'text'; text: string }
+    | { type: 'link'; text: string; url: string };
+
 /**
  * ツイート (Twitter / Bluesky 投稿) を扱う共通ユーティリティ
  * Twitter タブ配下の Timeline / Search 双方で同じ重複検出・並び替えロジックを使うためにまとめている
@@ -170,5 +176,78 @@ export class TweetUtils {
 
         const unknown_mode: never = args.mode;
         throw new Error(`Unknown reply thread mode: ${unknown_mode}`);
+    }
+
+    /**
+     * Tweet 本文を URL・メンション・ハッシュタグのリンクセグメントとテキストセグメントへ分解する
+     * 以前は HTML 文字列を組み立てて v-html へ渡していたが、本文に含まれる任意の文字列が
+     * そのまま HTML として解釈される stored XSS になるため、リンク要素とテキストを分離して
+     * 呼び出し側でテキストノードと固定属性の <a> 要素として描画する
+     * なお、本文を書き換えるプレースホルダー方式は本文中の文字列と衝突して欠落・重複が起きるため使わず、
+     * URL の前後へ挟まれたテキスト部分だけへメンション・ハッシュタグの走査を行う
+     * @param text 表示対象のツイート本文
+     * @param source 投稿元サービス (Twitter / Bluesky)
+     * @returns 描画用に分解したセグメント配列
+     */
+    static tokenizeTweetText(text: string, source: ITweet['source']): TweetTextSegment[] {
+
+        const urlRegex = /(https?:\/\/[^\s]+)/g;
+        const segments: TweetTextSegment[] = [];
+
+        // URL を先に確定させ、URL 内部の @ や # をメンション・ハッシュタグとして処理しないようにする
+        // テキストを書き換えないため、URL と本文の境界をカーソルで走査して URL の前後のテキスト部分だけへ走査を行う
+        let cursor = 0;
+        for (const urlMatch of text.matchAll(urlRegex)) {
+            // URL より前のテキスト部分を追加する
+            TweetUtils.appendInlineSegments(segments, text.slice(cursor, urlMatch.index), source);
+            // URL は固定属性のリンクセグメントとして追加する
+            segments.push({ type: 'link', text: urlMatch[0], url: urlMatch[0] });
+            cursor = urlMatch.index + urlMatch[0].length;
+        }
+        // 最後の URL 以降のテキスト部分を追加する
+        TweetUtils.appendInlineSegments(segments, text.slice(cursor), source);
+        return segments;
+    }
+
+    /**
+     * テキスト部分に含まれるメンション・ハッシュタグをセグメント化して末尾へ追加する
+     * @param segments 追加先のセグメント配列
+     * @param text メンション・ハッシュタグを探すテキスト部分
+     * @param source 投稿元サービス (Twitter / Bluesky)
+     */
+    private static appendInlineSegments(segments: TweetTextSegment[], text: string, source: ITweet['source']): void {
+
+        // メンションとハッシュタグをセグメントとして切り出す正規表現
+        // Bluesky のメンションは handle 形式 (例: @user.example.com) で、Twitter は @ に英数字・アンダースコアが続く短縮形
+        // キャプチャグループ: 1=メンション全体, 2=スクリーンネーム, 3=ハッシュタグ全体, 4=ハッシュタグ文字列
+        const mentionPattern = source === 'Bluesky' ? '@([a-zA-Z0-9][a-zA-Z0-9.-]*\\.[a-zA-Z][a-zA-Z0-9.-]*)' : '@(\\w+)';
+        const hashtagPattern = '[#＃]([\\w\\p{Script=Hiragana}\\p{Script=Katakana}\\p{Script=Han}ー]+)';
+        const inlineRegex = new RegExp(`(${mentionPattern})|(${hashtagPattern})`, 'gu');
+
+        let cursor = 0;
+        for (const match of text.matchAll(inlineRegex)) {
+            // マッチ位置までのテキスト部分をテキストセグメントとして追加する
+            if (match.index > cursor) {
+                segments.push({ type: 'text', text: text.slice(cursor, match.index) });
+            }
+            if (match[1] !== undefined) {
+                // メンションはサービスごとのプロフィール URL へのリンクにする
+                const screenName = match[2];
+                const mentionUrl = source === 'Bluesky' ? `https://bsky.app/profile/${screenName}` : `https://x.com/${screenName}`;
+                segments.push({ type: 'link', text: `@${screenName}`, url: mentionUrl });
+            } else {
+                // ハッシュタグはサービスごとのハッシュタグ検索 URL へのリンクにする
+                const hashtag = match[4];
+                const hashtagUrl = source === 'Bluesky' ?
+                    `https://bsky.app/hashtag/${encodeURIComponent(hashtag)}` :
+                    `https://x.com/hashtag/${encodeURIComponent(hashtag)}`;
+                segments.push({ type: 'link', text: `#${hashtag}`, url: hashtagUrl });
+            }
+            cursor = match.index + match[0].length;
+        }
+        // 最後のマッチ以降のテキスト部分を追加する
+        if (cursor < text.length) {
+            segments.push({ type: 'text', text: text.slice(cursor) });
+        }
     }
 }
