@@ -142,7 +142,6 @@ import Videos, {
     type IKonomiTVBS4KPlaybackCapabilities,
     type IKonomiTVBS4KResolvedPlaybackCombination,
 } from '@/services/Videos';
-import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore, {
     BS4K_LIVE_STREAMING_QUALITIES,
     getKonomiTVBS4KPlayback24FPSModeSettingKey,
@@ -153,10 +152,11 @@ import useSettingsStore, {
     type KonomiTVBS4KPlaybackVideoCodec,
     LIVE_STREAMING_QUALITIES,
 } from '@/stores/SettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 const settingsStore = useSettingsStore();
-const serverSettingsStore = useServerSettingsStore();
+const versionStore = useVersionStore();
 const broadcast_tab = ref(0);
 const network_tab = ref(0);
 const migration_conflict_notice = ref(false);
@@ -184,7 +184,7 @@ const selected_24fps = computed(() => is_bs4k.value === true ? false : settingsS
 const selected_low_latency = computed(() => {
     if (
         is_bs4k.value &&
-        serverSettingsStore.server_settings.general.bs4k_ignore_viewer_low_latency === true
+        versionStore.server_version_info?.bs4k_ignore_viewer_low_latency === true
     ) return false;
     if (is_bs4k.value) {
         return is_cellular.value ?
@@ -197,12 +197,13 @@ const selected_low_latency = computed(() => {
 });
 const is_bs4k_low_latency_forced = computed(() =>
     is_bs4k.value &&
-    serverSettingsStore.server_settings.general.bs4k_ignore_viewer_low_latency === true,
+    versionStore.server_version_info?.bs4k_ignore_viewer_low_latency === true,
 );
 
+// 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
 const encoder = computed(() => is_bs4k.value ?
-    serverSettingsStore.server_settings.general.encoder_bs4k :
-    serverSettingsStore.server_settings.general.encoder,
+    (versionStore.server_version_info?.encoder_bs4k ?? 'FFmpeg') :
+    (versionStore.server_version_info?.encoder ?? 'FFmpeg'),
 );
 const base_quality_options = computed(() => (
     is_bs4k.value ? BS4K_LIVE_STREAMING_QUALITIES : LIVE_STREAMING_QUALITIES
@@ -310,8 +311,8 @@ const updateLowLatency = (value: boolean | null): void => {
 onMounted(async () => {
     migration_conflict_notice.value =
         settingsStore.consumeKonomiTVBS4KPlaybackProfileMigrationConflictNotice();
-    // encoder と BS4K 通常バッファ強制値を実サーバーから確定してから能力表示を解決する。
-    await serverSettingsStore.fetchServerSettingsOnce();
+    // encoder と BS4K 通常バッファ強制値を公開 runtime 情報から確定してから能力表示を解決する。
+    await versionStore.fetchServerVersion(true);
     capabilities.value = await Videos.fetchKonomiTVBS4KPlaybackCapabilities();
     capabilities_failed.value =
         capabilities.value.video.length === 0 && capabilities.value.audio.length === 0;

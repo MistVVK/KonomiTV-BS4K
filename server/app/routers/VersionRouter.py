@@ -511,15 +511,19 @@ async def VersionInformationAPI():
     # サーバーが稼働している環境を取得
     environment = GetPlatformEnvironment()
 
+    general = Config().general
     result: dict[str, Any] = {
         'version': BS4K_VERSION,
         'upstream_version': VERSION,
         'git_commit': await GetGitCommit(),
         'latest_version': latest_version,
         'environment': environment,
-        'backend': Config().general.backend,
-        'encoder': Config().general.encoder,
+        'backend': general.backend,
+        'encoder': general.encoder,
+        # 管理者専用のフル設定 GET から分離した、視聴経路向けの非機密 runtime 情報
+        'encoder_bs4k': general.encoder_bs4k,
+        'bs4k_ignore_viewer_low_latency': general.bs4k_ignore_viewer_low_latency,
         # 保存直後の設定値ではなく、このプロセスで実際に有効な実況機能の状態を返す
-        'jikkyo_enabled': Config().general.jikkyo_enabled,
+        'jikkyo_enabled': general.jikkyo_enabled,
     }
     return result

@@ -187,8 +187,8 @@ import { defineComponent } from 'vue';
 
 import SettingsViewContainer from '@/components/Settings/SettingsViewContainer.vue';
 import Videos, { IRecordedPlaybackCodecOption } from '@/services/Videos';
-import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore, { type RecordedStreamingVideoCodec } from '@/stores/SettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 import Utils, { PlayerUtils } from '@/utils';
 
 const QUALITY_H264 = [
@@ -288,13 +288,13 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(useSettingsStore, useServerSettingsStore),
+        ...mapStores(useSettingsStore, useVersionStore),
     },
     async mounted() {
-        // サーバー設定の取得前の初期値で録画コーデック候補を固定しない
-        const server_settings = await this.serverSettingsStore.fetchServerSettingsOnce();
+        // 公開 runtime 情報の取得前の初期値で録画コーデック候補を固定しない
+        const version_info = await this.versionStore.fetchServerVersion(true);
         this.recorded_streaming_video_codecs = await Videos.buildRecordedPlaybackCodecOptions(
-            server_settings?.general.encoder ?? this.serverSettingsStore.server_settings.general.encoder,
+            version_info?.encoder ?? 'FFmpeg',
         );
     },
     watch: {

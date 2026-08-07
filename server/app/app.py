@@ -137,6 +137,10 @@ app.include_router(SettingsRouter.router)
 app.include_router(MaintenanceRouter.router)
 app.include_router(VersionRouter.router)
 
+# Capture upload は multipart 解析前に HTTP 本文サイズを制限する。
+# add_middleware は後から登録した方が外側になるため、先に BodyLimit を入れ、その後 CORS を被せる。
+app.add_middleware(CapturesRouter.CaptureUploadBodyLimitMiddleware)
+
 # CORS の設定
 ## 開発環境では全てのオリジンからのリクエストを許可
 ## 本番環境では app.konomi.tv 以外のオリジンからのリクエストを拒否

@@ -18,15 +18,15 @@ describe('再生・画質設定ルート契約', () => {
         expect(settings_routes_source).toContain('component: () => import(\'@/views/Settings/Playback.vue\')');
     });
 
-    it('実サーバー設定を先に取得してから能力表示を解決する', () => {
-        const settings_fetch_index = playback_source.indexOf(
-            'await serverSettingsStore.fetchServerSettingsOnce()',
+    it('公開 runtime 情報を先に取得してから能力表示を解決する', () => {
+        const version_fetch_index = playback_source.indexOf(
+            'await versionStore.fetchServerVersion(true)',
         );
         const capabilities_fetch_index = playback_source.indexOf(
             'await Videos.fetchKonomiTVBS4KPlaybackCapabilities()',
         );
-        expect(settings_fetch_index).toBeGreaterThan(-1);
-        expect(capabilities_fetch_index).toBeGreaterThan(settings_fetch_index);
+        expect(version_fetch_index).toBeGreaterThan(-1);
+        expect(capabilities_fetch_index).toBeGreaterThan(version_fetch_index);
     });
 
     it('ライブと録画の実効候補を別々の能力で解決して表示する', () => {

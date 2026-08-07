@@ -39,7 +39,7 @@ from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
 from app.routers.JikkyoDependency import EnsureJikkyoEnabled
-from app.routers.UsersRouter import GetCurrentAdminUser
+from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.JikkyoClient import JikkyoClient
 
@@ -859,10 +859,15 @@ async def VideoPlaybackIndexAPI(
     status_code = status.HTTP_202_ACCEPTED,
 )
 async def VideoPlaybackIndexCreateAPI(
+    current_user: Annotated[User, Depends(GetCurrentUser)],
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
 ) -> schemas.RecordedPlaybackIndex:
-    """未解析・旧Version・失敗済みの録画再生索引を最優先キューへ投入する。"""
+    """
+    未解析・旧Version・失敗済みの録画再生索引を最優先キューへ投入する。<br>
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。
+    """
 
+    del current_user
     await recorded_program.recorded_video.refresh_from_db()
     index = BuildRecordedPlaybackIndex(recorded_program)
     # 軽量メタデータ解析中・録画中・解析失敗中は、現ファイルに対応する索引入力が未確定。
@@ -1020,12 +1025,15 @@ async def VideoJikkyoCommentsAPI(
     status_code = status.HTTP_204_NO_CONTENT,
 )
 async def VideoReanalyzeAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
 ):
     """
-    指定された録画番組のメタデータと再生索引を再解析する。CM区間とサムネイルは保持する。
+    指定された録画番組のメタデータと再生索引を再解析する。CM区間とサムネイルは保持する。<br>
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
+    del current_user
     try:
         file_path = anyio.Path(recorded_program.recorded_video.file_path)
         # メタデータ再解析を実行し、索引の再構築まで待つ。
@@ -1050,6 +1058,7 @@ async def VideoReanalyzeAPI(
 )
 async def VideoDetectCMSectionsAPI(
     response: Response,
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
     replace_existing_chapter: Annotated[
         bool,
@@ -1061,8 +1070,12 @@ async def VideoDetectCMSectionsAPI(
         ),
     ] = False,
 ) -> schemas.AnalysisTaskAccepted:
-    """個別CM再判定をバックグラウンドで受け付け、ポーリング可能な実行IDを返す。"""
+    """
+    個別CM再判定をバックグラウンドで受け付け、ポーリング可能な実行IDを返す。<br>
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    """
 
+    del current_user
     file_path = anyio.Path(recorded_program.recorded_video.file_path)
     if not await file_path.is_file():
         raise HTTPException(
@@ -1127,13 +1140,16 @@ async def VideoThumbnailTileAPI(
     status_code = status.HTTP_204_NO_CONTENT,
 )
 async def VideoThumbnailRegenerateAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
 ):
     """
     指定された録画番組のサムネイル画像を再生成する。<br>
-    サムネイル画像の再生成には数分程度かかる場合がある。
+    サムネイル画像の再生成には数分程度かかる場合がある。<br>
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
+    del current_user
     try:
         # RecordedProgram モデルを schemas.RecordedProgram に変換
         recorded_program_schema = schemas.RecordedProgram.model_validate(recorded_program, from_attributes=True)

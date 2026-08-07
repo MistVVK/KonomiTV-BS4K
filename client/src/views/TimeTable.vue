@@ -137,8 +137,8 @@ import Message from '@/message';
 import { IChannel, ChannelTypePretty } from '@/services/Channels';
 import { IProgram, ITimeTableProgram } from '@/services/Programs';
 import Reservations, { IReservation, IRecordSettings, IRecordSettingsDefault } from '@/services/Reservations';
-import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useTimeTableStore, { CHANNEL_TYPE_DISPLAY_ORDER } from '@/stores/TimeTableStore';
+import useVersionStore from '@/stores/VersionStore';
 import Utils, { dayjs } from '@/utils';
 
 
@@ -148,14 +148,14 @@ const timetableStore = useTimeTableStore();
 // コンポーネント参照
 const timetableGridRef = ref<InstanceType<typeof TimeTableGrid> | null>(null);
 
-// サーバー設定（バックエンド種別の判定用）
-const serverSettingsStore = useServerSettingsStore();
-const serverSettings = computed(() => serverSettingsStore.server_settings);
+// バックエンド種別は公開 runtime 情報 (/version) から判定する
+// フルの /settings/server は管理者専用のため、番組表では使わない
+const versionStore = useVersionStore();
 
 // EDCB バックエンドかどうか
-// サーバー設定がまだ取得されていない場合は EDCB と判定しない
-// (デフォルト値が 'EDCB' のため、未取得状態で誤って true を返すと Mirakurun バックエンドでも予約操作が有効化されてしまう)
-const isEDCBBackend = computed(() => serverSettingsStore.is_loaded === true && serverSettings.value.general.backend === 'EDCB');
+// バージョン情報がまだ取得されていない場合は EDCB と判定しない
+// (未取得状態で誤って true を返すと Mirakurun バックエンドでも予約操作が有効化されてしまう)
+const isEDCBBackend = computed(() => versionStore.server_version_info?.backend === 'EDCB');
 
 // デフォルト録画設定のキャッシュ (初回 API 呼出時に取得され、以降はキャッシュから返される)
 let defaultRecordSettingsCache: IRecordSettings | null = null;
@@ -700,8 +700,8 @@ onMounted(async () => {
     // 画面回転やウィンドウサイズ変更時に、レイアウト判定の再計算をトリガーする
     window.addEventListener('resize', onWindowResize);
 
-    // サーバー設定を取得（バックエンド種別の判定用）
-    await serverSettingsStore.fetchServerSettingsOnce();
+    // バックエンド種別の判定用に公開 runtime 情報を取得する
+    await versionStore.fetchServerVersion();
 
     // 番組表データの初期ロード
     await timetableStore.initialLoad();

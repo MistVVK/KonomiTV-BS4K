@@ -193,7 +193,7 @@ import Message from '@/message';
 import { type IChannel } from '@/services/Channels';
 import { type IProgram } from '@/services/Programs';
 import Reservations, { type IReservation, type IRecordSettings, type IRecordSettingsPresets } from '@/services/Reservations';
-import useServerSettingsStore from '@/stores/ServerSettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 import { ProgramUtils } from '@/utils';
 
 // Props
@@ -224,9 +224,8 @@ const isVisible = computed({
     set: (value) => emit('update:modelValue', value),
 });
 
-// サーバー設定（バックエンド種別の判定用）
-const serverSettingsStore = useServerSettingsStore();
-const serverSettings = computed(() => serverSettingsStore.server_settings);
+// バックエンド種別は公開 runtime 情報 (/version) から判定する
+const versionStore = useVersionStore();
 
 // アクティブなタブ
 const activeTab = ref<'info' | 'settings'>('info');
@@ -267,9 +266,9 @@ const hasRealReservation = computed(() => hasReservation.value && !isMockReserva
 const displayProgram = computed(() => props.reservation?.program ?? props.program ?? null);
 
 // EDCB バックエンドかどうか
-// サーバー設定がまだ取得されていない場合は EDCB と判定しない
-// (デフォルト値が 'EDCB' のため、未取得状態で誤って true を返すと Mirakurun バックエンドでも予約操作が有効化されてしまう)
-const isEDCBBackend = computed(() => serverSettingsStore.is_loaded === true && serverSettings.value.general.backend === 'EDCB');
+// バージョン情報がまだ取得されていない場合は EDCB と判定しない
+// (未取得状態で誤って true を返すと Mirakurun バックエンドでも予約操作が有効化されてしまう)
+const isEDCBBackend = computed(() => versionStore.server_version_info?.backend === 'EDCB');
 
 // 録画設定タブを表示するかどうか
 // - 実際の予約がある場合: 表示 (既存予約の設定編集)
@@ -302,9 +301,9 @@ const isPartialRecording = computed(() => recordingAvailability.value === 'Parti
 // チューナー不足（録画不可）
 const isUnavailableRecording = computed(() => recordingAvailability.value === 'Unavailable');
 
-// サーバー設定を取得し、EDCB バックエンドの場合は録画設定プリセットも取得する
+// 公開 runtime 情報を取得し、EDCB バックエンドの場合は録画設定プリセットも取得する
 onMounted(async () => {
-    await serverSettingsStore.fetchServerSettingsOnce();
+    await versionStore.fetchServerVersion();
     // EDCB バックエンドの場合のみプリセットを取得
     if (isEDCBBackend.value) {
         presets.value = await Reservations.fetchRecordingPresets();

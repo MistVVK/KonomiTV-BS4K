@@ -53,9 +53,16 @@ _MAX_LOGO_UPLOAD_BYTES = 64 * 1024 * 1024
     summary='CM解析設定取得 API',
     response_model=schemas.CMAnalysisSettings,
 )
-async def CMAnalysisSettingsAPI() -> schemas.CMAnalysisSettings:
-    """サーバー全体で共有するCM解析設定を返す。"""
+async def CMAnalysisSettingsAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> schemas.CMAnalysisSettings:
+    """
+    サーバー全体で共有するCM解析設定を返す。<br>
+    logo_directory などホスト絶対パスを含むため、管理者アカウントのみが取得できる。<br>
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    """
 
+    del current_user
     # config.yaml 由来。Docker 内部表現はホストパスへ戻して返す。
     host_settings = HostServerSettings.fromServerSettings(Config())
     cm = host_settings.cm_analysis

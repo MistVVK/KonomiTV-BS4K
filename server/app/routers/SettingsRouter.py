@@ -156,12 +156,18 @@ async def ClientSettingsUpdateAPI(
     response_description = '現在稼働中の KonomiTV-BS4K サーバーのサーバー設定。',
     response_model = HostServerSettings,
 )
-async def ServerSettingsAPI() -> HostServerSettings:
+async def ServerSettingsAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> HostServerSettings:
     """
     現在稼働中の KonomiTV-BS4K サーバーのサーバー設定を取得する。<br>
     Docker環境でも、ユーザーが設定するすべてのパス項目はホスト側の絶対パスで返される。<br>
+    ホスト絶対パスや内部構成を含むため、管理者アカウントのみが取得できる。<br>
+    視聴画面が必要とする backend / encoder 等の非機密情報は /api/version を参照する。<br>
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
+    del current_user
     return HostServerSettings.fromServerSettings(Config())
 
 

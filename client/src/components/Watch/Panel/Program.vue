@@ -168,8 +168,8 @@ import type { IProgramDisplay } from '@/services/Programs';
 import Message from '@/message';
 import Reservations, { IReservation } from '@/services/Reservations';
 import useChannelsStore from '@/stores/ChannelsStore';
-import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore from '@/stores/SettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 import Utils, { ChannelUtils, ProgramUtils } from '@/utils';
 
 export default defineComponent({
@@ -200,7 +200,7 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(useChannelsStore, useServerSettingsStore, useSettingsStore),
+        ...mapStores(useChannelsStore, useSettingsStore, useVersionStore),
 
         // 実際のワンセグ現在番組がなければ、親フルセグ局由来の最小表示情報を利用する
         programPresentForDisplay(): IProgramDisplay | null {
@@ -216,13 +216,10 @@ export default defineComponent({
         },
 
         // EDCB バックエンドかどうか
-        // サーバー設定がまだ取得されていない場合は EDCB と判定しない
-        // (デフォルト値が 'EDCB' のため、未取得状態で誤って true を返すと Mirakurun バックエンドでも予約 API が呼ばれてしまう)
+        // 公開 runtime 情報 (/version) がまだ取得されていない場合は EDCB と判定しない
+        // (未取得状態で誤って true を返すと Mirakurun バックエンドでも予約 API が呼ばれてしまう)
         isEDCBBackend(): boolean {
-            if (this.serverSettingsStore.is_loaded !== true) {
-                return false;
-            }
-            return this.serverSettingsStore.server_settings.general.backend === 'EDCB';
+            return this.versionStore.server_version_info?.backend === 'EDCB';
         },
 
         // 現在の番組が録画中かどうか
@@ -492,7 +489,7 @@ export default defineComponent({
         // サーバー設定を取得してから録画予約関連の処理を開始する
         // デフォルト値が 'EDCB' のため、Mirakurun バックエンドでもサーバー設定取得前は isEDCBBackend が
         // true になってしまい、不要な予約 API 呼び出しでエラーが出続けるのを防ぐ
-        await this.serverSettingsStore.fetchServerSettingsOnce();
+        await this.versionStore.fetchServerVersion();
         // 初期状態の録画予約状態をチェックしバックグラウンドポーリングを開始
         // PSI/SI デコード結果が未取得でも channels API のデータで仮チェックを行い、
         // 既に録画中の番組であれば初回表示時から「録画中」と表示する

@@ -23,7 +23,6 @@ import PlayerManager from '@/services/player/PlayerManager';
 import Videos from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
-import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore, {
     BS4KLiveStreamingQuality,
     BS4K_LIVE_STREAMING_QUALITIES,
@@ -38,6 +37,7 @@ import useSettingsStore, {
     VideoStreamingQuality,
     VIDEO_STREAMING_QUALITIES,
 } from '@/stores/SettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 import Utils, { dayjs, PlayerUtils } from '@/utils';
 
 
@@ -323,9 +323,10 @@ class PlayerController {
         }
 
         const channels_store = useChannelsStore();
-        const server_settings_store = useServerSettingsStore();
+        const version_store = useVersionStore();
         if (channels_store.channel.current.display_channel_id.startsWith('bs4k')) {
-            if (server_settings_store.server_settings.general.bs4k_ignore_viewer_low_latency === true) {
+            // 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
+            if (version_store.server_version_info?.bs4k_ignore_viewer_low_latency === true) {
                 return false;
             }
             const settings_store = useSettingsStore();
@@ -395,7 +396,7 @@ class PlayerController {
     }): Promise<void> {
         const channels_store = useChannelsStore();
         const player_store = usePlayerStore();
-        const server_settings_store = useServerSettingsStore();
+        const version_store = useVersionStore();
         const settings_store = useSettingsStore();
         console.log('\u001b[31m[PlayerController] Initializing...');
 
@@ -430,9 +431,10 @@ class PlayerController {
             player_store.konomitv_bs4k_playback_codec_override?.video_codec ?? saved_video_codec;
         const requested_audio_codec =
             player_store.konomitv_bs4k_playback_codec_override?.audio_codec ?? saved_audio_codec;
+        // 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
         const encoder = is_bs4k_stream === true ?
-            server_settings_store.server_settings.general.encoder_bs4k :
-            server_settings_store.server_settings.general.encoder;
+            (version_store.server_version_info?.encoder_bs4k ?? 'FFmpeg') :
+            (version_store.server_version_info?.encoder ?? 'FFmpeg');
         const has_video = this.playback_mode === 'Live' ?
             channels_store.channel.current.is_radiochannel === false :
             player_store.recorded_program.recorded_video.has_video;
@@ -3163,7 +3165,7 @@ class PlayerController {
         assert(this.player !== null);
         const player_store = usePlayerStore();
         const channels_store = useChannelsStore();
-        const server_settings_store = useServerSettingsStore();
+        const version_store = useVersionStore();
         const settings_store = useSettingsStore();
 
         // 独自サブパネルの表示は modifier class だけで制御し、DPlayer が元パネル用に設定した
@@ -3377,9 +3379,10 @@ class PlayerController {
                     return false;
                 }
 
+                // 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
                 const encoder = is_bs4k ?
-                    server_settings_store.server_settings.general.encoder_bs4k :
-                    server_settings_store.server_settings.general.encoder;
+                    (version_store.server_version_info?.encoder_bs4k ?? 'FFmpeg') :
+                    (version_store.server_version_info?.encoder ?? 'FFmpeg');
                 const preflight_profile = await Videos.preflightKonomiTVBS4KPlaybackProfile(
                     encoder,
                     requested_video_codec,

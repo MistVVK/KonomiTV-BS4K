@@ -12,7 +12,6 @@ import Series from '@/services/Series';
 import Videos from '@/services/Videos';
 import usePlayerStore, { type PlayerEvents } from '@/stores/PlayerStore';
 import useRecordedSeriesStore from '@/stores/RecordedSeriesStore';
-import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import useVersionStore from '@/stores/VersionStore';
 
@@ -37,7 +36,7 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(usePlayerStore, useRecordedSeriesStore, useServerSettingsStore, useSettingsStore, useVersionStore),
+        ...mapStores(usePlayerStore, useRecordedSeriesStore, useSettingsStore, useVersionStore),
     },
     // 開始時に実行
     created() {
@@ -205,16 +204,13 @@ export default defineComponent({
         // 再生セッションを初期化する
         async init(generation: number, abort_controller: AbortController, video_id: number): Promise<void> {
 
-            // 実況機能のサーバー側有効状態をプレイヤー生成前に確定する
-            // 取得に失敗した場合は VersionStore がフェイルクローズで無効として扱う
-            await this.versionStore.fetchServerVersion(true, abort_controller.signal);
-            if (this.isLifecycleActive(generation, abort_controller.signal) === false) return;
-
-            // 録画 codec 能力の絞り込みに server 設定の既定値を使わないよう、
-            // controller 生成前に実設定を hydrate する。失敗時は 422 を誘発する再生を開始しない。
-            const server_settings = await this.serverSettingsStore.fetchServerSettingsOnce(abort_controller.signal);
+            // 実況機能の有効状態と録画 codec 能力の encoder を、同じ /version 応答から一度だけ確定する。
+            // force=true の連続呼び出しは同一初期化で二重リクエストになるため避ける。
+            // フルの /settings/server は管理者専用のため、公開 runtime 情報を使う。
+            // 取得に失敗した場合は VersionStore が実況をフェイルクローズで無効として扱う。
+            const version_info = await this.versionStore.fetchServerVersion(true, abort_controller.signal);
             if (
-                server_settings === null ||
+                version_info === null ||
                 this.isLifecycleActive(generation, abort_controller.signal) === false
             ) {
                 return;

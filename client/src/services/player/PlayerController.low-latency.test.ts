@@ -4,8 +4,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { ILiveChannelDefault } from '@/services/Channels';
 import PlayerController from '@/services/player/PlayerController';
 import useChannelsStore from '@/stores/ChannelsStore';
-import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useSettingsStore from '@/stores/SettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 
 
 type LowLatencyController = {
@@ -38,11 +38,27 @@ function resolveLowLatencyMode(controller: LowLatencyController): boolean {
 }
 
 
+function setBS4KIgnoreViewerLowLatency(value: boolean): void {
+    useVersionStore().server_version_info = {
+        version: '1.0.0',
+        upstream_version: '0.14.1',
+        git_commit: 'test',
+        latest_version: null,
+        environment: 'Linux-Docker',
+        backend: 'EDCB',
+        encoder: 'FFmpeg',
+        encoder_bs4k: 'FFmpeg',
+        bs4k_ignore_viewer_low_latency: value,
+        jikkyo_enabled: false,
+    };
+}
+
+
 describe('BS4K低遅延モード', () => {
     beforeEach(() => {
         localStorage.clear();
         setActivePinia(createPinia());
-        useServerSettingsStore().server_settings.general.bs4k_ignore_viewer_low_latency = false;
+        setBS4KIgnoreViewerLowLatency(false);
     });
 
     it('Wi-FiとモバイルでBS4K専用設定を個別に参照する', () => {
@@ -56,7 +72,7 @@ describe('BS4K低遅延モード', () => {
 
     it('サーバー側の通常バッファ強制設定を優先する', () => {
         useSettingsStore().settings.tv_low_latency_mode_for_bs4k = true;
-        useServerSettingsStore().server_settings.general.bs4k_ignore_viewer_low_latency = true;
+        setBS4KIgnoreViewerLowLatency(true);
 
         expect(resolveLowLatencyMode(createBS4KController('Wi-Fi'))).toBe(false);
     });

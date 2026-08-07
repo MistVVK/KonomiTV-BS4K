@@ -145,13 +145,16 @@ def LogStreamAPI(
     summary = 'データベース更新 API',
     status_code = status.HTTP_204_NO_CONTENT,
 )
-async def UpdateDatabaseAPI():
+async def UpdateDatabaseAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+):
     """
     データベースに保存されている、チャンネル情報・番組情報・Twitter アカウント情報などの外部 API に依存するデータをすべて更新する。<br>
     即座に外部 API からのデータ更新を反映させたい場合に利用する。<br>
-    このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
+    del current_user
     await Channel.update()
     # 実況機能が無効な間は、手動 DB 更新からも実況サービスへ接続しない
     if Config().general.jikkyo_enabled is True:
@@ -164,14 +167,17 @@ async def UpdateDatabaseAPI():
     summary = '録画フォルダ一括スキャン API',
     status_code = status.HTTP_204_NO_CONTENT,
 )
-async def BatchScanAPI():
+async def BatchScanAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+):
     """
     録画フォルダ内の全 TS ファイルをスキャンし、メタデータを解析して DB に永続化する。<br>
     追加・変更があったファイルのみメタデータを解析し、DB に永続化する。<br>
     存在しない録画ファイルに対応するレコードを一括削除する。<br>
-    このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
+    del current_user
     global batch_scan_task
 
     async def BatchScan():
@@ -207,13 +213,16 @@ async def BatchScanAPI():
     summary = '全録画ファイルメタデータ再解析 API',
     status_code = status.HTTP_204_NO_CONTENT,
 )
-async def ReanalyzeAllRecordedVideosAPI():
+async def ReanalyzeAllRecordedVideosAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+):
     """
     データベースに登録されているすべての録画ファイルのメタデータを強制的に再解析する。<br>
     録画ごとの処理順序を保ちつつ、別録画の解析パイプラインは上限付きで並行実行する。<br>
-    このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
+    del current_user
     global metadata_reanalysis_task
 
     async def ReanalyzeAllRecordedVideos():
@@ -294,6 +303,7 @@ async def ReanalyzeAllRecordedVideosAPI():
     status_code = status.HTTP_204_NO_CONTENT,
 )
 async def DetectCMSectionsForAllRecordedVideosAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
     replace_existing_chapter: Annotated[
         bool,
         Query(
@@ -304,8 +314,12 @@ async def DetectCMSectionsForAllRecordedVideosAPI(
         ),
     ] = False,
 ):
-    """登録済み録画を再判定し、明示指定時だけKonomiTV-BS4K自動解析YAMLを再生成する。"""
+    """
+    登録済み録画を再判定し、明示指定時だけKonomiTV-BS4K自動解析YAMLを再生成する。<br>
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    """
 
+    del current_user
     global cm_detection_task
 
     async def DetectCMSectionsForAllRecordedVideos() -> None:
@@ -390,13 +404,16 @@ async def DetectCMSectionsForAllRecordedVideosAPI(
     summary = 'バックグラウンド解析タスク手動実行 API',
     status_code = status.HTTP_204_NO_CONTENT,
 )
-async def BackgroundAnalysisAPI():
+async def BackgroundAnalysisAPI(
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+):
     """
     CM 区間情報が未解析の録画ファイルに対して CM 区間情報を解析し、<br>
     サムネイルが未生成の録画ファイルに対してサムネイルを生成する。<br>
-    このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
+    del current_user
     global background_analysis_task
 
     async def BackgroundAnalysis():
