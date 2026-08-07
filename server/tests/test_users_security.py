@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 from jose import jwt
+from pydantic import ValidationError
 from tortoise import Tortoise
 
 import app.routers.UsersRouter as users_router_module
@@ -19,9 +20,11 @@ from app.routers.UsersRouter import (
     REFRESH_TOKEN_COOKIE_NAME,
     GenerateAccessToken,
     GetCurrentUser,
+    SpecifiedUserUpdateAPI,
+    UserCreateAPI,
     UserUpdateAPI,
 )
-from app.schemas import UserUpdateRequest
+from app.schemas import UserCreateRequest, UserUpdateRequest, UserUpdateRequestForAdmin
 from app.utils.AuthSecurity import (
     DUMMY_PASSWORD_HASH,
     LOGIN_ATTEMPT_LIMITER,
@@ -37,6 +40,9 @@ async def _InitializeDatabase() -> None:
             'models': [
                 'app.models.User',
                 'app.models.RefreshToken',
+                'app.models.TwitterAccount',
+                'app.models.BlueskyAccount',
+                'app.models.AccountLink',
             ],
         },
         timezone = 'Asia/Tokyo',
@@ -285,3 +291,132 @@ def test_refresh_token_rotates_and_reuse_revokes_family() -> None:
             await _CloseDatabase()
 
     asyncio.run(Run())
+
+
+def test_concurrent_registration_creates_no_duplicate_username() -> None:
+    """同じユーザー名の同時登録では片方だけが成功し、重複レコードが作られない。"""
+
+    async def Run() -> None:
+        await _InitializeDatabase()
+        try:
+            # 同じユーザー名で同時に 2 回登録する
+            ## 事前チェック (filter().get_or_none()) は両方通過しうるが、UNIQUE 制約により
+            ## 片方の create だけが成功し、もう片方は IntegrityError から 422 へ変換される
+            results = await asyncio.gather(
+                UserCreateAPI(user_create_request=UserCreateRequest(username='concurrent-user', password='correct-password')),
+                UserCreateAPI(user_create_request=UserCreateRequest(username='concurrent-user', password='correct-password')),
+                return_exceptions = True,
+            )
+
+            # 片方だけ 201 (成功)、もう片方は 422 になる
+            statuses = [result.status_code if isinstance(result, HTTPException) else 201 for result in results]
+            assert sorted(statuses) == [201, 422]
+            assert await User.filter(name='concurrent-user').count() == 1
+        finally:
+            await _CloseDatabase()
+
+    asyncio.run(Run())
+
+
+def test_concurrent_registration_creates_exactly_one_first_admin() -> None:
+    """空の DB への同時登録でも、最初の管理者は 1 人だけが付与される。"""
+
+    async def Run() -> None:
+        await _InitializeDatabase()
+        try:
+            # 空の状態から別のユーザー名で同時に 2 回登録する
+            results = await asyncio.gather(
+                UserCreateAPI(user_create_request=UserCreateRequest(username='first-admin-a', password='correct-password')),
+                UserCreateAPI(user_create_request=UserCreateRequest(username='first-admin-b', password='correct-password')),
+                return_exceptions = True,
+            )
+
+            # 両方とも成功し (User が返り)、2 人のユーザーが作成されるが、管理者は 1 人だけ
+            ## HTTPException 以外の例外 (OperationalError など) を成功扱いにしないよう、戻り値を明示的に確認する
+            assert all(isinstance(result, User) for result in results)
+            assert await User.all().count() == 2
+            assert await User.filter(is_admin=True).count() == 1
+        finally:
+            await _CloseDatabase()
+
+    asyncio.run(Run())
+
+
+def test_concurrent_admin_revocation_keeps_at_least_one_admin() -> None:
+    """複数管理者の同時剥奪でも、管理者が 0 人にならない。"""
+
+    async def Run() -> None:
+        await _InitializeDatabase()
+        try:
+            admin1 = await _CreateUser(name='admin-1')
+            admin2 = await _CreateUser(name='admin-2')
+
+            # 両方の管理者を同時に剥奪する
+            results = await asyncio.gather(
+                SpecifiedUserUpdateAPI(user_update_request=UserUpdateRequestForAdmin(is_admin=False), user=admin1),
+                SpecifiedUserUpdateAPI(user_update_request=UserUpdateRequestForAdmin(is_admin=False), user=admin2),
+                return_exceptions = True,
+            )
+
+            # 片方は成功 (None)、もう片方は 422 になる
+            assert results.count(None) == 1
+            http_exceptions = [result for result in results if isinstance(result, HTTPException)]
+            assert len(http_exceptions) == 1
+            assert http_exceptions[0].status_code == 422
+            assert await User.filter(is_admin=True).count() == 1
+        finally:
+            await _CloseDatabase()
+
+    asyncio.run(Run())
+
+
+def test_admin_revocation_does_not_overwrite_concurrent_password_change() -> None:
+    """管理者剥奪時に古いスナップショットで save しても、並行したパスワード変更を上書きしない。"""
+
+    async def Run() -> None:
+        await _InitializeDatabase()
+        try:
+            target_admin = await _CreateUser(name='target-admin')
+            # 剥奪時に他の管理者が残っている状態にする (残っていないと剥奪自体が 422 になる)
+            await _CreateUser(name='other-admin')
+
+            # 管理者剥奪の直前に、対象ユーザーのパスワード変更で token_version が進んだ状況を再現する
+            ## 剥奪 API はトランザクション開始前に取得された古いスナップショット (user) を受け取るため、
+            ## そのまま save() すると旧パスワード・旧 token_version まで書き戻されてしまう
+            stale_snapshot = await User.get(id=target_admin.id)
+            await UserUpdateAPI(
+                user_update_request = UserUpdateRequest(password = 'new-password'),
+                current_user = target_admin,
+            )
+
+            # 古いスナップショットを使って管理者権限を剥奪する
+            await SpecifiedUserUpdateAPI(
+                user_update_request = UserUpdateRequestForAdmin(is_admin=False),
+                user = stale_snapshot,
+            )
+
+            # 並行したパスワード変更の結果が上書きされていないことを確認する
+            ## 旧実装では update_fields なしの save() により、token_version が 0 に戻り旧 JWT が再び有効になる
+            updated_user = await User.get(id=target_admin.id)
+            assert updated_user.token_version == 1
+            assert updated_user.is_admin is False
+            assert updated_user.password != stale_snapshot.password
+            assert PASSWORD_CONTEXT.verify('new-password', updated_user.password) is True
+        finally:
+            await _CloseDatabase()
+
+    asyncio.run(Run())
+
+
+def test_password_byte_length_is_validated_by_utf8_bytes() -> None:
+    """パスワードの上限が文字数ではなく UTF-8 換算 72 bytes で検証される。"""
+
+    # 'あ' は UTF-8 で 3 bytes。24 文字 = 72 bytes は許可される
+    UserCreateRequest(username = 'boundary-ok', password = 'あ' * 24)
+    # 25 文字 = 75 bytes は拒否される
+    with pytest.raises(ValidationError):
+        UserCreateRequest(username = 'boundary-ng', password = 'あ' * 25)
+    # 更新リクエストでも同様に検証される
+    UserUpdateRequest(password = 'あ' * 24)
+    with pytest.raises(ValidationError):
+        UserUpdateRequest(password = 'あ' * 25)

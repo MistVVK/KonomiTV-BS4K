@@ -5,10 +5,17 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Literal, NotRequired
+from typing import Annotated, Literal, NotRequired, cast
 from uuid import UUID
 
-from pydantic import BaseModel, Field, PlainSerializer, RootModel, computed_field
+from pydantic import (
+    BaseModel,
+    Field,
+    PlainSerializer,
+    RootModel,
+    computed_field,
+    field_validator,
+)
 from tortoise.contrib.pydantic import PydanticModel
 from typing_extensions import TypedDict
 
@@ -712,13 +719,49 @@ class ReservationConditionUpdateRequest(BaseModel):
 
 # ***** ユーザー *****
 
+# bcrypt は入力の先頭 72 bytes しか使用しないため、文字数ではなく UTF-8 換算のバイト数で上限を検証する
+# 文字数で検証すると日本語など多バイト文字を含むパスワードで 72 bytes を超え、黙って切り詰められてしまう
+def ValidatePasswordByteLength(password: str | None) -> str | None:
+    """パスワードの UTF-8 換算バイト数が bcrypt の上限 (72 bytes) 以下であることを検証する。
+
+    Args:
+        password: 検証するパスワード (None の場合はスキップ)。
+
+    Returns:
+        検証済みのパスワード (変更なしでそのまま返す)。
+
+    Raises:
+        ValueError: UTF-8 換算 72 bytes を超える場合。
+    """
+
+    # パスワードが省略される場合はスキップする
+    if password is None:
+        return None
+
+    # UTF-8 換算のバイト数が 72 bytes を超えていたらエラー
+    if len(password.encode('utf-8')) > 72:
+        raise ValueError('Password must be at most 72 bytes in UTF-8 encoding')
+    return password
+
 class UserCreateRequest(BaseModel):
     username: str
     password: str
 
+    @field_validator('password')
+    @classmethod
+    def ValidatePasswordByteLength(cls, value: str) -> str:
+        # bcrypt は入力の先頭 72 bytes しか使用しないため、UTF-8 換算のバイト数で検証する
+        return cast(str, ValidatePasswordByteLength(value))
+
 class UserUpdateRequest(BaseModel):
     username: str | None = None
     password: str | None = None
+
+    @field_validator('password')
+    @classmethod
+    def ValidatePasswordByteLength(cls, value: str | None) -> str | None:
+        # bcrypt は入力の先頭 72 bytes しか使用しないため、UTF-8 換算のバイト数で検証する
+        return ValidatePasswordByteLength(value)
 
 class UserUpdateRequestForAdmin(BaseModel):
     is_admin: bool | None = None

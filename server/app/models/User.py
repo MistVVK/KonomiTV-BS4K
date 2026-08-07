@@ -36,7 +36,10 @@ class User(TortoiseModel):
         table: str = 'users'
 
     id = fields.IntField(pk=True)
-    name = fields.TextField()
+    # ユーザー名はそのままログイン ID になるため、DB レベルの UNIQUE 制約で重複を最終保証する
+    ## アプリケーション側の事前チェックだけでは、同時登録時に同じユーザー名のアカウントが複数作られてしまうため
+    ## Tortoise の TextField は UNIQUE 制約をサポートしないため、CharField を利用する
+    name = fields.CharField(max_length=64, unique=True)
     password = fields.TextField()
     is_admin = fields.BooleanField()
     token_version = fields.IntField(default=0)

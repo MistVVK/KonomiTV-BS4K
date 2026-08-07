@@ -339,12 +339,28 @@ async def UserCreateAPI(
         )
 
     # 新しいユーザーアカウントのモデルを作成・保存
-    current_user = await User.create(
-        name = user_create_request.username,  # ユーザー名
-        password = PASSWORD_CONTEXT.hash(user_create_request.password),  # ハッシュ化されたパスワード
-        is_admin = False if await User.all().count() > 0 else True,  # 他のユーザーアカウントがまだ作成されていないなら、特別に管理者権限を付与
-        client_settings = {},  # クライアント側の設定（ひとまず空の辞書を設定）
-    )
+    ## 最初の管理者判定 (count) と作成を同一トランザクション内で直列化する
+    ## 同時に最初のユーザーが作成された場合でも、最初の1人だけが管理者権限を付与される
+    ## UNIQUE 制約があるため、同時登録で同じユーザー名が作られた場合は IntegrityError が発生し、422 を返す
+    ## bcrypt のハッシュ化は重いため、トランザクションの外で先に実行する
+    password_hash = PASSWORD_CONTEXT.hash(user_create_request.password)
+    try:
+        async with in_transaction() as connection:
+            is_first_user = await User.all().using_db(connection).count() == 0  # 他のユーザーアカウントがまだ作成されていないなら、特別に管理者権限を付与
+            current_user = await User.create(
+                name = user_create_request.username,  # ユーザー名
+                password = password_hash,  # ハッシュ化されたパスワード
+                is_admin = is_first_user,
+                client_settings = {},  # クライアント側の設定（ひとまず空の辞書を設定）
+                using_db = connection,
+            )
+    except IntegrityError as ex:
+        # 同時登録などで UNIQUE 制約に違反した場合は重複エラーとして返す
+        logging.warning(f'[UsersRouter][UserCreateAPI] Specified username is duplicated. [username: {user_create_request.username}]')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified username is duplicated',
+        ) from ex
 
     # 外部テーブルのデータを取得してから返す
     await current_user.fetch_related(
@@ -719,28 +735,44 @@ async def UserUpdateAPI(
     ## 並行するパスワード変更で token_version の増分が失われないようにする
     if user_update_request.password is not None:
         password_hash = PASSWORD_CONTEXT.hash(user_update_request.password)
-        async with in_transaction() as connection:
-            locked_user = await User.filter(id=current_user.id).select_for_update().using_db(connection).get()
-            if user_update_request.username is not None:
-                locked_user.name = current_user.name
-            locked_user.password = password_hash
-            locked_user.token_version += 1
-            update_fields = ['password', 'token_version']
-            if user_update_request.username is not None:
-                update_fields.append('name')
-            await locked_user.save(
-                using_db = connection,
-                update_fields = update_fields,
-            )
+        try:
+            async with in_transaction() as connection:
+                locked_user = await User.filter(id=current_user.id).select_for_update().using_db(connection).get()
+                if user_update_request.username is not None:
+                    locked_user.name = current_user.name
+                locked_user.password = password_hash
+                locked_user.token_version += 1
+                update_fields = ['password', 'token_version']
+                if user_update_request.username is not None:
+                    update_fields.append('name')
+                await locked_user.save(
+                    using_db = connection,
+                    update_fields = update_fields,
+                )
 
-            # パスワード変更時は、全端末の更新トークンも失効させる
-            await RefreshToken.filter(
-                user_id = locked_user.id,
-                revoked_at__isnull = True,
-            ).using_db(connection).update(revoked_at = timezone.now())
+                # パスワード変更時は、全端末の更新トークンも失効させる
+                await RefreshToken.filter(
+                    user_id = locked_user.id,
+                    revoked_at__isnull = True,
+                ).using_db(connection).update(revoked_at = timezone.now())
+        except IntegrityError as ex:
+            # 同時更新でユーザー名が UNIQUE 制約に違反した場合は重複エラーとして返す
+            logging.warning(f'[UsersRouter][UserUpdateAPI] Specified username is duplicated. [username: {user_update_request.username}]')
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Specified username is duplicated',
+            ) from ex
     else:
         # パスワードを変更しない場合は従来どおりユーザー名などだけを保存する
-        await current_user.save()
+        ## UNIQUE 制約があるため、同時更新でユーザー名が重複した場合は IntegrityError が発生する
+        try:
+            await current_user.save()
+        except IntegrityError as ex:
+            logging.warning(f'[UsersRouter][UserUpdateAPI] Specified username is duplicated. [username: {user_update_request.username}]')
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Specified username is duplicated',
+            ) from ex
 
 
 @router.get(
@@ -824,15 +856,17 @@ async def UserDeleteAPI(
 
     # 現在ログイン中のユーザーアカウント（自分自身）を削除
     # アカウントを削除すると、それ以降は（当然ながら）ログインを要求する API へアクセスできなくなる
-    await current_user.delete()
+    ## 削除と管理者数の確認を同一トランザクション内で直列化し、同時削除で管理者 0 人にならないようにする
+    async with in_transaction() as connection:
+        await current_user.delete(using_db = connection)
 
-    # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
-    ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
-    if await User.filter(is_admin=True).count() == 0:
-        id_young_user = await User.all().order_by('id').first()
-        if id_young_user is not None:
-            id_young_user.is_admin = True
-            await id_young_user.save()
+        # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
+        ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
+        if await User.filter(is_admin=True).using_db(connection).count() == 0:
+            id_young_user = await User.all().order_by('id').using_db(connection).first()
+            if id_young_user is not None:
+                id_young_user.is_admin = True
+                await id_young_user.save(using_db = connection)
 
 
 # ***** 指定ユーザーアカウント情報 API (管理者用) *****
@@ -869,22 +903,39 @@ async def SpecifiedUserUpdateAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
-    # 管理者権限を付与/剥奪
-    if user_update_request.is_admin is not None:
-        user.is_admin = user_update_request.is_admin
-
     # 管理者権限を剥奪する場合、この処理によってシステム内に管理者が一人もいなくならないかを確認
+    ## 確認と保存を同一トランザクション内で直列化し、同時に複数の管理者が剥奪されても管理者 0 人にならないようにする
     if user_update_request.is_admin is False:
-        remaining_admins = await User.filter(is_admin=True).exclude(id=user.id).count()
-        if remaining_admins == 0:
-            logging.warning('[UsersRouter][SpecifiedUserUpdateAPI] Cannot revoke admin permission because there are no more admins.')
-            raise HTTPException(
-                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail = 'Cannot revoke admin permission because there are no more admins',
-            )
+        async with in_transaction() as connection:
+            # 同時実行されるパスワード変更などとの競合で古い値を書き戻さないよう、トランザクション内で最新のユーザーを再取得する
+            ## トランザクション開始前に取得した user は古いスナップショットであり、そのまま save() すると
+            ## 旧パスワード・旧ユーザー名・旧 token_version まで書き戻されてしまうため
+            locked_user = await User.filter(id=user.id).select_for_update().using_db(connection).get()
+            remaining_admins = await User.filter(is_admin=True).exclude(id=user.id).using_db(connection).count()
+            if remaining_admins == 0:
+                logging.warning('[UsersRouter][SpecifiedUserUpdateAPI] Cannot revoke admin permission because there are no more admins.')
+                raise HTTPException(
+                    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail = 'Cannot revoke admin permission because there are no more admins',
+                )
 
-    # レコードを保存する
-    await user.save()
+            # 管理者権限の変更のみを保存する
+            locked_user.is_admin = False
+            await locked_user.save(
+                using_db = connection,
+                update_fields = ['is_admin'],
+            )
+    else:
+        # 管理者権限を付与/剥奪
+        if user_update_request.is_admin is not None:
+            # 同時実行されるパスワード変更などとの競合で古い値を書き戻さないよう、最新のユーザーを再取得してから権限のみを更新する
+            ## トランザクション外のため行ロックは効かないが、更新フィールドを is_admin に限定することで
+            ## 旧パスワード・旧ユーザー名・旧 token_version の書き戻しを防ぐ
+            locked_user = await User.filter(id=user.id).get()
+            locked_user.is_admin = True
+            await locked_user.save(
+                update_fields = ['is_admin'],
+            )
 
 
 @router.get(
@@ -940,12 +991,14 @@ async def SpecifiedUserDeleteAPI(
         await icon_save_path.unlink()
 
     # 指定されたユーザーを削除
-    await user.delete()
+    ## 削除と管理者数の確認を同一トランザクション内で直列化し、同時削除で管理者 0 人にならないようにする
+    async with in_transaction() as connection:
+        await user.delete(using_db = connection)
 
-    # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
-    ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
-    if await User.filter(is_admin=True).count() == 0:
-        id_young_user = await User.all().order_by('id').first()
-        if id_young_user is not None:
-            id_young_user.is_admin = True
-            await id_young_user.save()
+        # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
+        ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
+        if await User.filter(is_admin=True).using_db(connection).count() == 0:
+            id_young_user = await User.all().order_by('id').using_db(connection).first()
+            if id_young_user is not None:
+                id_young_user.is_admin = True
+                await id_young_user.save(using_db = connection)
