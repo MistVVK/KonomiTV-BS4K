@@ -7,7 +7,7 @@ from urllib.parse import quote
 
 import httpx
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from starlette.requests import Request
 from starlette.responses import StreamingResponse
 
@@ -47,15 +47,39 @@ def _make_response(
     )
 
 
-def _make_request(method: str, path: str, body: bytes = b'', content_type: str | None = None) -> Request:
+def _make_request(
+    method: str,
+    path: str,
+    body: bytes = b'',
+    content_type: str | None = None,
+    *,
+    content_length: int | None = None,
+    include_content_length: bool = False,
+    body_chunks: list[bytes] | None = None,
+) -> Request:
     """Starlette Request を最小構成で組み立てる。"""
 
     headers: list[tuple[bytes, bytes]] = []
     if content_type is not None:
         headers.append((b'content-type', content_type.encode('ascii')))
+    if include_content_length is True:
+        length_value = content_length if content_length is not None else len(body)
+        headers.append((b'content-length', str(length_value).encode('ascii')))
+
+    chunks = list(body_chunks) if body_chunks is not None else [body]
+    chunk_index = 0
 
     async def receive() -> dict[str, Any]:
-        return {'type': 'http.request', 'body': body, 'more_body': False}
+        nonlocal chunk_index
+        if chunk_index >= len(chunks):
+            return {'type': 'http.request', 'body': b'', 'more_body': False}
+        current = chunks[chunk_index]
+        chunk_index += 1
+        return {
+            'type': 'http.request',
+            'body': current,
+            'more_body': chunk_index < len(chunks),
+        }
 
     scope: dict[str, Any] = {
         'type': 'http',
@@ -182,7 +206,7 @@ def test_post_proxy_forwards_raw_body_byte_for_byte(monkeypatch: pytest.MonkeyPa
 
 
 def test_post_proxy_rejects_body_larger_than_4096_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """上限を超えるraw bodyは上流へ送信せず422にする。"""
+    """上限を超えるraw bodyは上流へ送信せず413にする。"""
 
     calls = _install_router_request_fake(monkeypatch, _make_response())
 
@@ -196,7 +220,7 @@ def test_post_proxy_rejects_body_larger_than_4096_bytes(monkeypatch: pytest.Monk
         )
         with pytest.raises(HTTPException) as ex_info:
             await DataBroadcastingRouter.BMLBrowserRequestPOSTProxyAPI(target, request)
-        assert ex_info.value.status_code == 422
+        assert ex_info.value.status_code == 413
         assert calls == []
 
     asyncio.run(Run())
@@ -297,7 +321,7 @@ def test_pinned_backend_does_not_resolve_again(monkeypatch: pytest.MonkeyPatch) 
         return FakeReader(), FakeWriter()
 
     monkeypatch.setattr(data_broadcasting_http_client.asyncio, 'open_connection', fake_open_connection)
-    backend = data_broadcasting_http_client._PinnedNetworkBackend(
+    backend = data_broadcasting_http_client.PinnedNetworkBackend(
         'public.example',
         ('93.184.216.34',),
     )
@@ -448,5 +472,382 @@ def test_redirect_to_rejected_target_never_reaches_second_request(monkeypatch: p
                 headers={},
             )
         assert request_count == 1
+
+    asyncio.run(Run())
+
+
+# ---------------------------------------------------------------------------
+# R-05: probe 公開IPポリシー / timeout 上下限 / request・response body 上限
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize('destination', [
+    '127.0.0.1',
+    '10.0.0.1',
+    '192.168.0.1',
+    '169.254.169.254',
+    '::1',
+    'fc00::1',
+    '::ffff:127.0.0.1',
+])
+def test_probe_destination_rejects_non_global_literals(destination: str) -> None:
+    """probe は loopback / private / link-local リテラルを公開IPポリシーで拒否する。"""
+
+    async def Run() -> None:
+        with pytest.raises(data_broadcasting_http_client.UpstreamURLRejected):
+            await data_broadcasting_http_client.ResolveProbeDestination(destination)
+
+    asyncio.run(Run())
+
+
+def test_probe_destination_allows_public_literal() -> None:
+    """probe は公開IPv4リテラルを許可する。"""
+
+    async def Run() -> None:
+        addresses = await data_broadcasting_http_client.ResolveProbeDestination('93.184.216.34')
+        assert addresses == ('93.184.216.34',)
+
+    asyncio.run(Run())
+
+
+@pytest.mark.parametrize('timeout_milliseconds', [99, 5001])
+def test_probe_api_rejects_timeout_outside_bounds(timeout_milliseconds: int) -> None:
+    """internet-status は FastAPI 境界で 100〜5000ms 以外を拒否する。"""
+
+    test_app = FastAPI()
+    test_app.include_router(DataBroadcastingRouter.router)
+
+    async def Run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=test_app),
+            base_url='http://test',
+        ) as client:
+            response = await client.get(
+                '/api/data-broadcasting/internet-status',
+                params={
+                    'destination': '93.184.216.34',
+                    'timeout_milliseconds': timeout_milliseconds,
+                },
+            )
+        assert response.status_code == 422
+
+    asyncio.run(Run())
+
+
+def test_probe_api_rejects_private_destination_without_connecting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """internet-status は private destination を接続前に 422 にする。"""
+
+    open_connection_calls: list[Any] = []
+    ping_calls: list[Any] = []
+
+    async def fake_open_connection(*args: Any, **kwargs: Any) -> tuple[Any, Any]:
+        open_connection_calls.append((args, kwargs))
+        raise AssertionError('must not connect to rejected destination')
+
+    def fake_ping(*args: Any, **kwargs: Any) -> float | None:
+        ping_calls.append((args, kwargs))
+        raise AssertionError('must not ping rejected destination')
+
+    monkeypatch.setattr(DataBroadcastingRouter.asyncio, 'open_connection', fake_open_connection)
+    monkeypatch.setattr(DataBroadcastingRouter, 'ping', fake_ping)
+
+    async def Run() -> None:
+        with pytest.raises(HTTPException) as ex_info:
+            await DataBroadcastingRouter.BMLBrowserInternetStatusAPI(
+                destination='127.0.0.1',
+                is_icmp=False,
+                timeout_milliseconds=1000,
+            )
+        assert ex_info.value.status_code == 422
+        assert ex_info.value.detail == 'Probe destination is not allowed'
+        assert open_connection_calls == []
+        assert ping_calls == []
+
+    asyncio.run(Run())
+
+
+def test_probe_api_tcp_uses_pinned_public_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TCP probe は検証済み公開IPへ直接接続し、hostname を再解決しない。"""
+
+    connect_calls: list[dict[str, Any]] = []
+
+    class FakeWriter:
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def fake_resolve(destination: str) -> tuple[str, ...]:
+        assert destination == 'public.example'
+        return ('93.184.216.34',)
+
+    async def fake_open_connection(*args: Any, **kwargs: Any) -> tuple[object, FakeWriter]:
+        connect_calls.append({'args': args, 'kwargs': kwargs})
+        return object(), FakeWriter()
+
+    monkeypatch.setattr(DataBroadcastingRouter, 'ResolveProbeDestination', fake_resolve)
+    monkeypatch.setattr(DataBroadcastingRouter.asyncio, 'open_connection', fake_open_connection)
+
+    async def Run() -> None:
+        result = await DataBroadcastingRouter.BMLBrowserInternetStatusAPI(
+            destination='public.example',
+            is_icmp=False,
+            timeout_milliseconds=1000,
+        )
+        assert result.success is True
+        assert result.ip_address == '93.184.216.34'
+        assert connect_calls[0]['args'][0] == '93.184.216.34'
+        assert connect_calls[0]['args'][1] == 80
+
+    asyncio.run(Run())
+
+
+def test_probe_api_icmp_runs_in_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ICMP ping は to_thread 経由で実行され、検証済みIPだけを対象にする。"""
+
+    ping_calls: list[tuple[Any, ...]] = []
+    to_thread_calls: list[Any] = []
+
+    async def fake_resolve(destination: str) -> tuple[str, ...]:
+        return ('93.184.216.34',)
+
+    def fake_ping(address: str, timeout: float = 4) -> float:
+        ping_calls.append((address, timeout))
+        return 0.012
+
+    async def fake_to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        to_thread_calls.append((func, args, kwargs))
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(DataBroadcastingRouter, 'ResolveProbeDestination', fake_resolve)
+    monkeypatch.setattr(DataBroadcastingRouter, 'ping', fake_ping)
+    monkeypatch.setattr(DataBroadcastingRouter.asyncio, 'to_thread', fake_to_thread)
+
+    async def Run() -> None:
+        result = await DataBroadcastingRouter.BMLBrowserInternetStatusAPI(
+            destination='public.example',
+            is_icmp=True,
+            timeout_milliseconds=1500,
+        )
+        assert result.success is True
+        assert result.ip_address == '93.184.216.34'
+        assert result.response_time_milliseconds == 12
+        assert to_thread_calls[0][0] is fake_ping
+        assert ping_calls == [('93.184.216.34', 1.5)]
+
+    asyncio.run(Run())
+
+
+def test_probe_api_icmp_false_result_is_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ping3 が送受信エラーを False で返した場合は成功として扱わない。"""
+
+    async def fake_resolve(destination: str) -> tuple[str, ...]:
+        return ('93.184.216.34',)
+
+    def fake_ping(address: str, timeout: float = 4) -> bool:
+        return False
+
+    monkeypatch.setattr(DataBroadcastingRouter, 'ResolveProbeDestination', fake_resolve)
+    monkeypatch.setattr(DataBroadcastingRouter, 'ping', fake_ping)
+
+    async def Run() -> None:
+        result = await DataBroadcastingRouter.BMLBrowserInternetStatusAPI(
+            destination='public.example',
+            is_icmp=True,
+            timeout_milliseconds=1000,
+        )
+        assert result.success is False
+        assert result.ip_address is None
+        assert result.response_time_milliseconds is None
+
+    asyncio.run(Run())
+
+
+def test_post_proxy_rejects_oversized_content_length_before_body_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """巨大 Content-Length は body stream を読まずに 413 にする。"""
+
+    calls = _install_router_request_fake(monkeypatch, _make_response())
+    receive_calls = {'count': 0}
+
+    async def Run() -> None:
+        target = 'http://example.com/post'
+        request = _make_request(
+            'POST',
+            f'/api/data-broadcasting/request/{quote(target, safe="")}',
+            body=b'never-read',
+            content_type='application/x-www-form-urlencoded',
+            content_length=DataBroadcastingRouter._MAX_POST_BODY_BYTES + 1,
+            include_content_length=True,
+        )
+        original_receive = request._receive
+
+        async def tracking_receive() -> dict[str, Any]:
+            receive_calls['count'] += 1
+            return await original_receive()
+
+        request._receive = tracking_receive  # type: ignore[method-assign]
+        with pytest.raises(HTTPException) as ex_info:
+            await DataBroadcastingRouter.BMLBrowserRequestPOSTProxyAPI(target, request)
+        assert ex_info.value.status_code == 413
+        assert receive_calls['count'] == 0
+        assert calls == []
+
+    asyncio.run(Run())
+
+
+def test_post_proxy_rejects_streamed_body_over_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Content-Length 無しの巨大 stream は累積上限で 413 にし上流へ送らない。"""
+
+    calls = _install_router_request_fake(monkeypatch, _make_response())
+    chunk = b'x' * 1024
+    chunks = [chunk] * 5  # 5120 > 4096
+
+    async def Run() -> None:
+        target = 'http://example.com/post'
+        request = _make_request(
+            'POST',
+            f'/api/data-broadcasting/request/{quote(target, safe="")}',
+            content_type='application/x-www-form-urlencoded',
+            body_chunks=chunks,
+        )
+        with pytest.raises(HTTPException) as ex_info:
+            await DataBroadcastingRouter.BMLBrowserRequestPOSTProxyAPI(target, request)
+        assert ex_info.value.status_code == 413
+        assert calls == []
+
+    asyncio.run(Run())
+
+
+def test_read_response_body_rejects_content_length_over_limit() -> None:
+    """上流 Content-Length 超過は stream 読取前に拒否する。"""
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.status = 200
+            self.headers = [(b'content-length', str(data_broadcasting_http_client.MAX_UPSTREAM_RESPONSE_BYTES + 1).encode('ascii'))]
+            self.stream_calls = 0
+
+        async def aiter_stream(self):
+            self.stream_calls += 1
+            yield b'should-not-read'
+
+    async def Run() -> None:
+        response = FakeResponse()
+        with pytest.raises(data_broadcasting_http_client.UpstreamBodyLimitExceeded):
+            await data_broadcasting_http_client._ReadResponseBodyWithLimit(response)  # type: ignore[arg-type]
+        assert response.stream_calls == 0
+
+    asyncio.run(Run())
+
+
+def test_read_response_body_ignores_representation_length_on_304() -> None:
+    """304 の Content-Length は本文長ではないため、表現が4MiB超でも空本文を受理する。"""
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.status = 304
+            self.headers = [(b'content-length', str(data_broadcasting_http_client.MAX_UPSTREAM_RESPONSE_BYTES + 1).encode('ascii'))]
+
+        async def aiter_stream(self):
+            yield b''
+
+    async def Run() -> None:
+        body = await data_broadcasting_http_client._ReadResponseBodyWithLimit(FakeResponse())  # type: ignore[arg-type]
+        assert body == b''
+
+    asyncio.run(Run())
+
+
+def test_read_response_body_rejects_streamed_body_over_limit() -> None:
+    """Content-Length 無しの巨大上流応答は累積上限で拒否する。"""
+
+    class FakeResponse:
+        def __init__(self) -> None:
+            self.status = 200
+            self.headers: list[tuple[bytes, bytes]] = []
+
+        async def aiter_stream(self):
+            chunk_size = 1024 * 1024
+            total_chunks = (data_broadcasting_http_client.MAX_UPSTREAM_RESPONSE_BYTES // chunk_size) + 2
+            for _ in range(total_chunks):
+                yield b'y' * chunk_size
+
+    async def Run() -> None:
+        with pytest.raises(data_broadcasting_http_client.UpstreamBodyLimitExceeded):
+            await data_broadcasting_http_client._ReadResponseBodyWithLimit(FakeResponse())  # type: ignore[arg-type]
+
+    asyncio.run(Run())
+
+
+def test_get_proxy_maps_upstream_body_limit_to_502(monkeypatch: pytest.MonkeyPatch) -> None:
+    """上流応答上限超過はクライアントへ 502 として返す。"""
+
+    async def oversized_request(*args: Any, **kwargs: Any) -> DataBroadcastingHTTPResponse:
+        raise data_broadcasting_http_client.UpstreamBodyLimitExceeded('too large')
+
+    monkeypatch.setattr(DataBroadcastingRouter, 'RequestWithSafeRedirects', oversized_request)
+
+    async def Run() -> None:
+        target = 'http://example.com/big'
+        request = _make_request('GET', f'/api/data-broadcasting/request/{quote(target, safe="")}')
+        with pytest.raises(HTTPException) as ex_info:
+            await DataBroadcastingRouter.BMLBrowserRequestGETProxyAPI(target, request)
+        assert ex_info.value.status_code == 502
+        assert ex_info.value.detail == 'Upstream response is too large'
+
+    asyncio.run(Run())
+
+
+def test_request_once_closes_connection_when_response_exceeds_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """上流応答超過時は aclose して接続を残さない。"""
+
+    connect_calls: list[dict[str, Any]] = []
+
+    class FakeWriter:
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def get_extra_info(self, info: str) -> object:
+            return None
+
+        def close(self) -> None:
+            return None
+
+        async def wait_closed(self) -> None:
+            return None
+
+    async def fake_open_connection(**kwargs: Any) -> tuple[asyncio.StreamReader, FakeWriter]:
+        connect_calls.append(kwargs)
+        reader = asyncio.StreamReader()
+        oversized = data_broadcasting_http_client.MAX_UPSTREAM_RESPONSE_BYTES + 1
+        reader.feed_data(
+            f'HTTP/1.1 200 OK\r\nContent-Length: {oversized}\r\nContent-Type: text/plain\r\n\r\n'.encode('ascii'),
+        )
+        reader.feed_data(b'z' * min(oversized, 64))
+        reader.feed_eof()
+        return reader, FakeWriter()
+
+    async def Run() -> None:
+        monkeypatch.setattr(data_broadcasting_http_client.asyncio, 'open_connection', fake_open_connection)
+
+        # Content-Length 先行拒否後も _RequestOnce の finally で response.aclose が走り、
+        # 接続プールが閉じられることを例外が外へ伝播することと合わせて確認する。
+        with pytest.raises(data_broadcasting_http_client.UpstreamBodyLimitExceeded):
+            await data_broadcasting_http_client._RequestOnce(
+                ResolvedUpstreamURL(
+                    url=httpx.URL('http://public.example/big'),
+                    host='public.example',
+                    port=80,
+                    addresses=('93.184.216.34',),
+                ),
+                'GET',
+                {'Accept': '*/*'},
+                None,
+            )
+        assert connect_calls == [{'host': '93.184.216.34', 'port': 80, 'local_addr': None}]
 
     asyncio.run(Run())

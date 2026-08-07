@@ -15,9 +15,22 @@ import httpx
 
 _UPSTREAM_REQUEST_TIMEOUT_SECONDS = 5.0
 
+# データ放送 upstream 応答の本文上限。
+# BML ネット接続は小さな HTML / 画像を想定し、未認証の巨大応答によるメモリ枯渇を防ぐ。
+MAX_UPSTREAM_RESPONSE_BYTES = 4 * 1024 * 1024
+
+# probe API が受け付ける timeout の下限・上限 (ミリ秒)。
+# 下限は誤って 0 に近い値で即失敗するのを防ぎ、上限は event loop 拘束時間を抑える。
+PROBE_TIMEOUT_MILLISECONDS_MIN = 100
+PROBE_TIMEOUT_MILLISECONDS_MAX = 5000
+
 
 class UpstreamURLRejected(ValueError):
     """データ放送プロキシの接続先ポリシーで拒否された URL。"""
+
+
+class UpstreamBodyLimitExceeded(ValueError):
+    """データ放送プロキシの上流応答本文が設定上限を超えた。"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +133,7 @@ class _AsyncioNetworkStream(httpcore.AsyncNetworkStream):
         return self._writer.get_extra_info(info)
 
 
-class _PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
+class PinnedNetworkBackend(httpcore.AsyncNetworkBackend):
     """あらかじめ検証したIP一覧へだけ接続するhttpcoreバックエンド。"""
 
     def __init__(self, host: str, addresses: tuple[str, ...]) -> None:
@@ -321,15 +334,110 @@ async def ResolveUpstreamURL(request_url: str) -> ResolvedUpstreamURL:
     )
 
 
+async def ResolveProbeDestination(destination: str) -> tuple[str, ...]:
+    """
+    probe API の destination を公開IPポリシーで検証し、接続に使うIP一覧を返す。
+
+    hostname の場合は DNS を一度だけ解決し、全結果が公開IPであることを確認する。
+    接続時は返したIPへ直接つなぎ、DNS rebinding で private IP へ差し替わらないようにする。
+
+    Args:
+        destination: クライアントが指定したホスト名または IP アドレス。
+
+    Returns:
+        検証済みの公開IP一覧。順序は DNS 解決結果の出現順を維持する。
+
+    Raises:
+        UpstreamURLRejected: destination が空・不正、または非公開IPを含む場合。
+    """
+
+    # URL やパス風の入力、制御文字は probe の destination として受け付けない。
+    if (
+        not destination
+        or any(control_character in destination for control_character in ('\r', '\n', '\x00', '\t', ' '))
+        or '/' in destination
+        or '@' in destination
+        or '://' in destination
+    ):
+        raise UpstreamURLRejected('Probe destination is invalid')
+
+    # リテラル IP は DNS を経由せず、そのアドレス自体を公開IPポリシーで判定する。
+    try:
+        literal_address = ipaddress.ip_address(destination)
+    except ValueError:
+        literal_address = None
+    if literal_address is not None:
+        address_text = str(literal_address)
+        if not _IsAllowedGlobalAddress(address_text):
+            raise UpstreamURLRejected('Probe destination is not a global address')
+        return (address_text,)
+
+    # ホスト名は HTTP proxy と同じ解決・公開IP検査を共有する。
+    # getaddrinfo は asyncio 経由で thread に退避され、event loop を塞がない。
+    return await _ResolveAllowedAddresses(destination, 80)
+
+
+def _ExtractContentLength(headers: list[tuple[bytes, bytes]]) -> int | None:
+    """HTTP ヘッダーから Content-Length を取り出す。不正値は上限超過扱いにする。"""
+
+    for key, value in headers:
+        if key.lower() != b'content-length':
+            continue
+        try:
+            return int(value.decode('ascii').strip())
+        except (UnicodeDecodeError, ValueError):
+            # 不正な Content-Length は巨大本文と同じく拒否する。
+            return MAX_UPSTREAM_RESPONSE_BYTES + 1
+    return None
+
+
+async def _ReadResponseBodyWithLimit(
+    response: httpcore.Response,
+    max_body_bytes: int = MAX_UPSTREAM_RESPONSE_BYTES,
+) -> bytes:
+    """
+    上流応答本文を Content-Length 先行拒否と stream 累積上限の両方で読み取る。
+
+    Args:
+        response: httpcore の上流応答。本文は未読であること。
+        max_body_bytes: 許可する最大バイト数。
+
+    Returns:
+        上限以内で読み取った本文。
+
+    Raises:
+        UpstreamBodyLimitExceeded: Content-Length または累積読取量が上限を超えた場合。
+    """
+
+    content_length = _ExtractContentLength(list(response.headers))
+    # 304 の Content-Length は message body ではなく、選択された表現のサイズを示す。
+    # 実際の本文は存在しないため、ここで上限判定へ使うと正当なキャッシュ応答を誤拒否する。
+    if response.status != 304 and content_length is not None and content_length > max_body_bytes:
+        raise UpstreamBodyLimitExceeded('Upstream response Content-Length exceeds the limit')
+
+    chunks: list[bytes] = []
+    total_bytes = 0
+    # aread() は全量を一度に保持するため使わず、chunk ごとに上限を検査する。
+    # slow stream は connection 側の read timeout で打ち切る。
+    async for chunk in response.aiter_stream():
+        if not chunk:
+            continue
+        total_bytes += len(chunk)
+        if total_bytes > max_body_bytes:
+            raise UpstreamBodyLimitExceeded('Upstream response body exceeds the limit')
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
 async def _RequestOnce(
     resolved_url: ResolvedUpstreamURL,
     method: str,
     headers: dict[str, str],
     content: bytes | None,
 ) -> DataBroadcastingHTTPResponse:
-    """検証済みIPへ一度だけHTTPリクエストを送り、本文を読み切って接続を閉じる。"""
+    """検証済みIPへ一度だけHTTPリクエストを送り、本文を上限付きで読み切って接続を閉じる。"""
 
-    network_backend = _PinnedNetworkBackend(resolved_url.host, resolved_url.addresses)
+    network_backend = PinnedNetworkBackend(resolved_url.host, resolved_url.addresses)
     connection_pool = httpcore.AsyncConnectionPool(
         ssl_context=_CreateInsecureTLSContext(),
         max_connections=1,
@@ -367,14 +475,17 @@ async def _RequestOnce(
             },
         )
         response = await connection_pool.handle_async_request(request)
-        response_content = await response.aread()
-        response_headers = httpx.Headers(response.headers)
-        await response.aclose()
-        return DataBroadcastingHTTPResponse(
-            status_code=response.status,
-            headers=response_headers,
-            content=response_content,
-        )
+        try:
+            response_content = await _ReadResponseBodyWithLimit(response)
+            response_headers = httpx.Headers(response.headers)
+            return DataBroadcastingHTTPResponse(
+                status_code=response.status,
+                headers=response_headers,
+                content=response_content,
+            )
+        finally:
+            # 上限超過や途中失敗でも接続を残さず閉じる。
+            await response.aclose()
     finally:
         await connection_pool.aclose()
 
