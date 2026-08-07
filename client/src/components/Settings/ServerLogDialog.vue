@@ -33,13 +33,16 @@
                 </div>
                 <div class="server-log-dialog__console-container">
                     <!-- サーバーログ表示エリア -->
+                    <!-- LogLine がログレベル部分だけを span 化して本文はテキスト表示する (行全体の v-html は使わない) -->
                     <VirtuaList
                         ref="server_scroller"
                         class="server-log-dialog__console"
                         :class="{ 'hidden': active_tab !== 'server' }"
                         :data="server_log_lines"
                         #default="{ item }">
-                        <div class="server-log-dialog__line" v-html="formatLogLine(item)"></div>
+                        <div class="server-log-dialog__line">
+                            <LogLine :line="item" />
+                        </div>
                     </VirtuaList>
 
                     <!-- アクセスログ表示エリア -->
@@ -49,7 +52,9 @@
                         :class="{ 'hidden': active_tab !== 'access' }"
                         :data="access_log_lines"
                         #default="{ item }">
-                        <div class="server-log-dialog__line" v-html="formatLogLine(item)"></div>
+                        <div class="server-log-dialog__line">
+                            <LogLine :line="item" />
+                        </div>
                     </VirtuaList>
                 </div>
             </div>
@@ -61,6 +66,7 @@
 import { VList as VirtuaList } from 'virtua/vue';
 import { PropType, ref, watch, onMounted, onBeforeUnmount, useTemplateRef, nextTick } from 'vue';
 
+import LogLine from '@/components/Settings/LogLine.vue';
 import Maintenance from '@/services/Maintenance';
 
 // 親コンポーネントと子コンポーネントでモーダルの表示状態を同期する
@@ -89,7 +95,7 @@ watch(server_log_dialog_modal, (newValue) => {
 // 最大表示行数
 const MAX_LINES = 10000;
 
-// ログ表示用の変数
+// ログ表示用の変数 (表示は LogLine コンポーネントが行う)
 const server_log_lines = ref<string[]>([]);
 const access_log_lines = ref<string[]>([]);
 const server_scroller = useTemplateRef('server_scroller');
@@ -99,39 +105,6 @@ const active_tab = ref<string>('server');
 const auto_scroll_enabled = ref<boolean>(true);
 let server_abort_controller: AbortController | null = null;
 let access_abort_controller: AbortController | null = null;
-
-// ログレベルに応じた色付けを行う関数
-function formatLogLine(line: string): string {
-    // ログレベルのパターン
-    const logLevelPattern = /(DEBUG|INFO|WARNING|ERROR|CRITICAL):/;
-    const match = line.match(logLevelPattern);
-
-    if (match) {
-        const logLevel = match[1];
-        let color = '';
-
-        // ログレベルに応じた色を設定
-        switch (logLevel) {
-            case 'DEBUG':
-                color = '#7cbfcb';
-                break;
-            case 'INFO':
-                color = '#aeca91';
-                break;
-            case 'WARNING':
-                color = '#e5cb95';
-                break;
-            case 'ERROR':
-                color = '#da8789';
-                break;
-        }
-
-        // ログレベル部分のみ色付け
-        return line.replace(logLevelPattern, `<span style="color: ${color};">${logLevel}</span>:`);
-    }
-
-    return line;
-}
 
 // すべてのログストリーミングを開始する関数
 function startAllLogStreaming() {
