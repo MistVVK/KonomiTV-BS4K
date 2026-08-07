@@ -126,6 +126,8 @@ Update: [Upstream] upstream/master の更新を取り込む
 - 小文字だけの conventional commits のみ（例: `fix: ...` / `feat: ...`）。BS4K では `Fix:` / `Add:` / `Update:` を使う
 - 領域タグなしで Server と Client をまたぐ大きな変更を 1 行に押し込む（タグで所在を示す）
 - 1 コミットに無関係な複数テーマを詰め込む
+- PRなどのgit標準ではないことはしないこと。とくにPRはするな！
+- upstreamにpushは厳禁！
 
 ### ステージング
 
@@ -153,3 +155,5 @@ Update: [Upstream] upstream/master の更新を取り込む
    - 上流リポジトリ（`https://github.com/tsukumijima/KonomiTV.git`）のコードベース。
    - 上流側の新機能やバグ修正を取り込む際の参照元として使用する。
    - upstream からの取り込みコミットは Git コミット規約に従い `Update: [Upstream] upstream/master の更新を取り込む` とする。
+   - pushは絶対にしない
+   - PRもしない
