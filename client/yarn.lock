@@ -4560,9 +4560,9 @@ mitt@^3.0.1:
   resolved "https://registry.yarnpkg.com/mitt/-/mitt-3.0.1.tgz#ea36cf0cc30403601ae074c8f77b7092cdab36d1"
   integrity sha512-vKivATfr97l2/QBCYAkXYDbrIWPM2IIKEl7YPhjCvKlG3kE2gm+uBo6nEXK3M5/Ffh/FLpKExzOQ3JJoJGFKBw==
 
-mpegts.js@^1.7.3, "mpegts.js@github:MistVVK/mpegts.js#a1b7041fe9d1f603d85fa46d9aee66e8c4e12289":
+mpegts.js@^1.7.3, "mpegts.js@github:MistVVK/mpegts.js#18c48ca6e741a4af94790de649e48b8b6c2486c0":
   version "1.8.0"
-  resolved "https://codeload.github.com/MistVVK/mpegts.js/tar.gz/a1b7041fe9d1f603d85fa46d9aee66e8c4e12289"
+  resolved "https://codeload.github.com/MistVVK/mpegts.js/tar.gz/18c48ca6e741a4af94790de649e48b8b6c2486c0"
   dependencies:
     es6-promise "^4.2.5"
 
