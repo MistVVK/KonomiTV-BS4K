@@ -1187,118 +1187,100 @@ async def VideoDeleteAPI(
 ):
     """
     指定された録画番組のファイルとメタデータを削除する。不可逆な処理であるため、慎重に実行すること。
-    - データベースから録画番組情報・録画ファイル情報を削除
     - 録画ファイルに紐づくサムネイルファイルを削除
     - 録画ファイルに関連する補助ファイル (.ts.program.txt, .ts.err) を削除
     - 録画ファイル本体を削除
+    - 全ファイルの削除完了後にデータベースから録画番組情報・録画ファイル情報を削除
 
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
-    # 録画ファイルの情報を取得
+    # 録画ファイルの情報を取得する
+    # 実際の削除対象は DB に保存されたパスのままとし、スキャナーとの排他だけcanonical pathへ統一する
     file_path = anyio.Path(recorded_program.recorded_video.file_path)
+    recorded_scan_task = RecordedScanTask()
+    lock_file_path = await recorded_scan_task.resolveRecordedPath(file_path)
     file_hash = recorded_program.recorded_video.file_hash
     file_name = file_path.name
     file_dir = file_path.parent
 
-    # 万が一処理が失敗してもダメージが比較的少ない順に実行する
-    try:
-        # 1. データベースから録画番組情報・録画ファイル情報を削除
-        # RecordedVideo も CASCADE 制約で削除される
-        try:
-            # 同じ file_hash を持つ他のレコードが存在するかチェック
-            duplicate_records = await RecordedProgram.filter(
-                recorded_video__file_hash=file_hash,
-            ).exclude(id=recorded_program.id).count()
-            has_duplicates = duplicate_records > 0
+    # スキャナーの解析・DB更新と削除を同じpath lockで直列化し、削除中のレコードが再生成される競合を防ぐ
+    async with recorded_scan_task.fileLock(lock_file_path):
+        # 同じ file_hash の録画が存在する場合、共有サムネイルは削除しない
+        duplicate_records = await RecordedProgram.filter(
+            recorded_video__file_hash=file_hash,
+        ).exclude(id=recorded_program.id).count()
+        has_duplicates = duplicate_records > 0
 
-            # データベースから録画番組情報を削除
-            await recorded_program.delete()
-        except Exception as ex:
-            logging.error('[VideoDeleteAPI] Failed to delete recorded program from database:', exc_info=ex)
+        # DB の状態を先に Deleting へ遷移させ、同じ録画への並行した削除処理を1件だけに制限する
+        transitioned_count = await RecordedVideo.filter(id=recorded_program.recorded_video.id) \
+            .exclude(status='Deleting') \
+            .update(status='Deleting')
+        if transitioned_count == 0:
             raise HTTPException(
-                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail = f'Failed to delete recorded program from database: {ex!s}',
+                status_code = status.HTTP_409_CONFLICT,
+                detail = 'Recorded program deletion is already in progress or has completed',
             )
+        recorded_program.recorded_video.status = 'Deleting'
 
-        # 2. サムネイルファイルの削除
-        # 同じ file_hash を持つ他のレコードが存在する場合はスキップ
-        thumbnails_dir = anyio.Path(str(THUMBNAILS_DIR))
-        if await thumbnails_dir.is_dir() and not has_duplicates:
-            # 通常サムネイル (.webp、旧仕様の .jpg)
-            for ext in ['.webp', '.jpg']:
-                thumbnail_path = thumbnails_dir / f'{file_hash}{ext}'
-                if await thumbnail_path.is_file():
-                    try:
+        deletion_stage = 'thumbnail files'
+        try:
+            # 1. サムネイルファイルを削除する
+            # 同じ file_hash を持つ他のレコードが存在する場合は共有中なのでスキップする
+            thumbnails_dir = anyio.Path(str(THUMBNAILS_DIR))
+            if await thumbnails_dir.is_dir() and not has_duplicates:
+                # 通常サムネイル (.webp、旧仕様の .jpg)
+                for ext in ['.webp', '.jpg']:
+                    thumbnail_path = thumbnails_dir / f'{file_hash}{ext}'
+                    if await thumbnail_path.is_file():
                         await thumbnail_path.unlink()
-                    except Exception as ex:
-                        logging.error(f'[VideoDeleteAPI] Failed to delete thumbnail file: {thumbnail_path}', exc_info=ex)
-                        raise HTTPException(
-                            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail = f'Failed to delete thumbnail file: {ex!s}',
-                        )
-                elif ext == '.webp':  # JPEG はよほど長尺でない限り発生しないので WebP のみチェック
-                    logging.warning(f'[VideoDeleteAPI] Thumbnail file does not exist: {thumbnail_path}')
+                    elif ext == '.webp':  # JPEG はよほど長尺でない限り発生しないので WebP のみチェック
+                        logging.warning(f'[VideoDeleteAPI] Thumbnail file does not exist: {thumbnail_path}')
 
-            # タイルサムネイル (.webp、旧仕様の .jpg)
-            for ext in ['.webp', '.jpg']:
-                tile_thumbnail_path = thumbnails_dir / f'{file_hash}_tile{ext}'
-                if await tile_thumbnail_path.is_file():
-                    try:
+                # タイルサムネイル (.webp、旧仕様の .jpg)
+                for ext in ['.webp', '.jpg']:
+                    tile_thumbnail_path = thumbnails_dir / f'{file_hash}_tile{ext}'
+                    if await tile_thumbnail_path.is_file():
                         await tile_thumbnail_path.unlink()
-                    except Exception as ex:
-                        logging.error(f'[VideoDeleteAPI] Failed to delete tile thumbnail file: {tile_thumbnail_path}', exc_info=ex)
-                        raise HTTPException(
-                            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                            detail = f'Failed to delete tile thumbnail file: {ex!s}',
-                        )
-                elif ext == '.webp':  # JPEG はよほど長尺でない限り発生しないので WebP のみチェック
-                    logging.warning(f'[VideoDeleteAPI] Tile thumbnail file does not exist: {tile_thumbnail_path}')
-        elif has_duplicates:
-            logging.info(f'[VideoDeleteAPI] Skip deleting thumbnail files because other records with the same file_hash exist: {file_hash}')
+                    elif ext == '.webp':  # JPEG はよほど長尺でない限り発生しないので WebP のみチェック
+                        logging.warning(f'[VideoDeleteAPI] Tile thumbnail file does not exist: {tile_thumbnail_path}')
+            elif has_duplicates:
+                logging.info(f'[VideoDeleteAPI] Skip deleting thumbnail files because other records with the same file_hash exist: {file_hash}')
 
-        # 3. 関連する補助ファイルの削除 (.ts.program.txt, .ts.err)
-        ## .ts.program.txt ファイル (録画ファイルが hoge.ts の場合は hoge.ts.program.txt)
-        ts_program_txt_path = anyio.Path(f'{file_dir}/{file_name}.program.txt')
-        if await ts_program_txt_path.is_file():
-            try:
+            # 2. 関連する補助ファイルを削除する (.ts.program.txt, .ts.err)
+            deletion_stage = 'program information file'
+            ts_program_txt_path = anyio.Path(f'{file_dir}/{file_name}.program.txt')
+            if await ts_program_txt_path.is_file():
                 await ts_program_txt_path.unlink()
-            except Exception as ex:
-                logging.error(f'[VideoDeleteAPI] Failed to delete .ts.program.txt file: {ts_program_txt_path}', exc_info=ex)
-                raise HTTPException(
-                    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail = f'Failed to delete .ts.program.txt file: {ex!s}',
-                )
-        ## .ts.err ファイル (録画ファイルが hoge.ts の場合は hoge.ts.err)
-        ts_err_path = anyio.Path(f'{file_dir}/{file_name}.err')
-        if await ts_err_path.is_file():
-            try:
-                await ts_err_path.unlink()
-            except Exception as ex:
-                logging.error(f'[VideoDeleteAPI] Failed to delete .ts.err file: {ts_err_path}', exc_info=ex)
-                raise HTTPException(
-                    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail = f'Failed to delete .ts.err file: {ex!s}',
-                )
 
-        # 4. 録画ファイル本体の削除
-        if await file_path.is_file():
-            try:
+            deletion_stage = 'recording error file'
+            ts_err_path = anyio.Path(f'{file_dir}/{file_name}.err')
+            if await ts_err_path.is_file():
+                await ts_err_path.unlink()
+
+            # 3. 録画ファイル本体を削除する
+            deletion_stage = 'recorded video file'
+            if await file_path.is_file():
                 await file_path.unlink()
                 logging.info(f'[VideoDeleteAPI] Successfully deleted recorded video file: {file_path}')
-            except Exception as ex:
-                # 録画ファイル本体の削除に失敗した場合はクリティカルなエラー
-                logging.error(f'[VideoDeleteAPI] Failed to delete recorded video file: {file_path}', exc_info=ex)
-                raise HTTPException(
-                    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail = f'Failed to delete recorded video file: {ex!s}',
-                )
-        else:
-            logging.warning(f'[VideoDeleteAPI] Recorded video file does not exist: {file_path}')
+            else:
+                # 再試行時は前回処理で録画本体だけ削除済みの場合があるため、存在しなくても処理を継続する
+                logging.warning(f'[VideoDeleteAPI] Recorded video file does not exist: {file_path}')
 
-    except Exception as ex:
-        logging.error('[VideoDeleteAPI] Failed to delete recorded program:', exc_info=ex)
-        raise HTTPException(
-            status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail = f'Failed to delete recorded program: {ex!s}',
-        )
+            # 4. 全ファイルの削除完了後に DB レコードを削除する
+            # RecordedVideo も CASCADE 制約で削除される
+            deletion_stage = 'database record'
+            await recorded_program.delete()
+
+        except Exception as ex:
+            # DB レコードを保持したまま失敗状態へ遷移させ、同じ DELETE API から安全に再試行できるようにする
+            recorded_program.recorded_video.status = 'DeleteFailed'
+            try:
+                await RecordedVideo.filter(id=recorded_program.recorded_video.id).update(status='DeleteFailed')
+            except Exception as state_ex:
+                logging.error('[VideoDeleteAPI] Failed to persist DeleteFailed state:', exc_info=state_ex)
+            logging.error(f'[VideoDeleteAPI] Failed to delete {deletion_stage}:', exc_info=ex)
+            raise HTTPException(
+                status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail = f'Failed to delete recorded program during {deletion_stage}: {ex!s}',
+            ) from ex

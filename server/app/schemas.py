@@ -217,7 +217,7 @@ class SubtitleTrack(TypedDict):
 class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け
     id: int = -1  # メタデータ取得時は ID が定まらないため -1 を設定
-    status: Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed']
+    status: Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed', 'Deleting', 'DeleteFailed']
     file_path: str
     file_hash: str
     file_size: int

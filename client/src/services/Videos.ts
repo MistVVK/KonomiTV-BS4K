@@ -163,7 +163,7 @@ export interface ISubtitleTrack {
 /** 録画ファイル情報を表すインターフェース */
 export interface IRecordedVideo {
     id: number;
-    status: 'Recording' | 'Analyzing' | 'Recorded' | 'AnalysisFailed';
+    status: 'Recording' | 'Analyzing' | 'Recorded' | 'AnalysisFailed' | 'Deleting' | 'DeleteFailed';
     file_path: string;
     file_hash: string;
     file_size: number;

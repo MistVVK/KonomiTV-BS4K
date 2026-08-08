@@ -39,7 +39,9 @@ class RecordedVideo(TortoiseModel):
     recorded_program: fields.OneToOneRelation[RecordedProgram] = \
         fields.OneToOneField('models.RecordedProgram', related_name='recorded_video', on_delete=fields.CASCADE)
     recorded_program_id: int
-    status = cast(TortoiseField[Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed']], fields.CharField(255, db_index=True))
+    status = cast(TortoiseField[Literal[
+        'Recording', 'Analyzing', 'Recorded', 'AnalysisFailed', 'Deleting', 'DeleteFailed',
+    ]], fields.CharField(255, db_index=True))
     file_path = fields.TextField()  # ファイルパスは可変長だが、TextField には unique 制約が付けられない
     file_hash = fields.TextField()
     file_size = fields.IntField()

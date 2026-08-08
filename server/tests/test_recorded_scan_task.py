@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import anyio
 import pytest
@@ -50,6 +50,108 @@ def CreateSummary() -> RecordedVideoSummary:
         file_size=1024,
         file_hash='hash',
     )
+
+
+@pytest.mark.parametrize(
+    ('recorded_video_status', 'should_delete'),
+    [('Deleting', False), ('DeleteFailed', False), ('Recorded', True)],
+)
+def test_file_deletion_handler_preserves_deletion_retry_states(
+    monkeypatch: pytest.MonkeyPatch,
+    recorded_video_status: Literal['Deleting', 'DeleteFailed', 'Recorded'],
+    should_delete: bool,
+) -> None:
+    """watcherのファイル消失処理が削除再試行中のDBレコードを回収しないことを検証する。"""
+
+    scan_task = object.__new__(RecordedScanTask)
+    scan_task._file_locks = {}
+    scan_task._file_locks_dict_lock = asyncio.Lock()
+    scan_task._symlink_path_map = {}
+    scan_task._symlink_path_map_lock = asyncio.Lock()
+    scan_task._recording_files = {}
+    file_path = anyio.Path('/recorded/deleted.ts')
+    recorded_program_deleted = False
+
+    async def DeleteRecordedProgram() -> None:
+        nonlocal recorded_program_deleted
+        recorded_program_deleted = True
+
+    recorded_program = SimpleNamespace(delete=DeleteRecordedProgram)
+    recorded_video = SimpleNamespace(status=recorded_video_status, recorded_program=recorded_program)
+
+    async def GetRecordedVideoOrNone(**conditions: str) -> SimpleNamespace:
+        assert conditions == {'file_path': str(file_path)}
+        return recorded_video
+
+    monkeypatch.setattr(RecordedVideo, 'get_or_none', GetRecordedVideoOrNone)
+
+    asyncio.run(
+        scan_task._RecordedScanTask__handleFileDeletion(file_path)  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert recorded_program_deleted is should_delete
+
+
+@pytest.mark.parametrize(
+    ('summary_status', 'current_status', 'should_delete'),
+    [
+        ('Deleting', 'Deleting', False),
+        ('DeleteFailed', 'DeleteFailed', False),
+        ('Recorded', 'Recorded', True),
+        ('Recorded', 'DeleteFailed', False),
+    ],
+)
+def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
+    monkeypatch: pytest.MonkeyPatch,
+    summary_status: Literal['Deleting', 'DeleteFailed', 'Recorded'],
+    current_status: Literal['Deleting', 'DeleteFailed', 'Recorded'],
+    should_delete: bool,
+) -> None:
+    """batch scanの消失レコード回収が削除再試行中のDBレコードを削除しないことを検証する。"""
+
+    scan_task = object.__new__(RecordedScanTask)
+    file_path = anyio.Path('/recorded/deleted.ts')
+    summary = CreateSummary()
+    summary.status = summary_status
+    recorded_program_deleted = False
+
+    async def IsFileExists(_file_path: anyio.Path) -> bool:
+        return False
+
+    class FakeRecordedProgramQuery:
+        excluded_statuses: list[str] = []
+
+        def exclude(self, *, recorded_video__status__in: list[str]) -> 'FakeRecordedProgramQuery':
+            self.excluded_statuses = recorded_video__status__in
+            return self
+
+        async def delete(self) -> int:
+            nonlocal recorded_program_deleted
+            if current_status in self.excluded_statuses:
+                return 0
+            recorded_program_deleted = True
+            return 1
+
+    @asynccontextmanager
+    async def InTransaction() -> AsyncGenerator[None, None]:
+        yield
+
+    monkeypatch.setattr(scan_task, 'isFileExists', IsFileExists)
+    monkeypatch.setattr(
+        'app.metadata.RecordedScanTask.RecordedProgram.filter',
+        lambda **conditions: FakeRecordedProgramQuery()
+        if conditions == {'id': summary.recorded_program_id}
+        else pytest.fail(),
+    )
+    monkeypatch.setattr('app.metadata.RecordedScanTask.transactions.in_transaction', InTransaction)
+
+    asyncio.run(
+        scan_task._RecordedScanTask__cleanupNonExistentRecordedVideoRecords(  # pyright: ignore[reportPrivateUsage]
+            {file_path: summary}
+        )
+    )
+
+    assert recorded_program_deleted is should_delete
 
 
 @pytest.mark.parametrize('cpu_count', [1, 2, None])
@@ -794,16 +896,16 @@ def test_file_lock_registry_tracks_holder_waiters_cancel_and_unique_paths() -> N
         successful_waiter_entered = asyncio.Event()
 
         async def Holder() -> None:
-            async with scan_task._RecordedScanTask__fileLock(target_path):  # pyright: ignore[reportPrivateUsage]
+            async with scan_task.fileLock(target_path):
                 holder_entered.set()
                 await release_holder.wait()
 
         async def CancelledWaiter() -> None:
-            async with scan_task._RecordedScanTask__fileLock(target_path):  # pyright: ignore[reportPrivateUsage]
+            async with scan_task.fileLock(target_path):
                 raise AssertionError('cancelled waiter acquired the lock unexpectedly')
 
         async def SuccessfulWaiter() -> None:
-            async with scan_task._RecordedScanTask__fileLock(target_path):  # pyright: ignore[reportPrivateUsage]
+            async with scan_task.fileLock(target_path):
                 successful_waiter_entered.set()
 
         holder_task = asyncio.create_task(Holder())
@@ -831,7 +933,7 @@ def test_file_lock_registry_tracks_holder_waiters_cancel_and_unique_paths() -> N
         # 大量の一意pathを順次処理してもregistryが単調増加しないことを確認する。
         for index in range(100):
             unique_path = anyio.Path(f'/recordings/unique-{index}.ts')
-            async with scan_task._RecordedScanTask__fileLock(unique_path):  # pyright: ignore[reportPrivateUsage]
+            async with scan_task.fileLock(unique_path):
                 assert scan_task._file_locks[unique_path].reference_count == 1
             assert scan_task._file_locks == {}
 

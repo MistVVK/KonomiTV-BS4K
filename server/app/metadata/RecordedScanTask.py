@@ -85,7 +85,7 @@ class RecordedVideoSummary:
     file_path: str
     created_at: datetime
     recorded_program_id: int
-    status: Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed']
+    status: Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed', 'Deleting', 'DeleteFailed']
     file_created_at: datetime
     file_modified_at: datetime
     file_size: int
@@ -213,8 +213,15 @@ class RecordedScanTask:
 
 
     @asynccontextmanager
-    async def __fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None, None]:
-        """path単位lockのholder・waiterを参照数へ含め、最後の解放後にentryを回収する。"""
+    async def fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None, None]:
+        """path単位lockのholder・waiterを参照数へ含め、最後の解放後にentryを回収する。
+
+        Args:
+            file_path: 排他制御する録画ファイルのcanonical path。
+
+        Yields:
+            指定pathの処理権を保持している間のコンテキスト。
+        """
 
         # lock待機へ入る前に参照数を増やし、holder解放時に待機者のentryを誤って削除しない。
         async with self._file_locks_dict_lock:
@@ -320,9 +327,16 @@ class RecordedScanTask:
         # 既に実行中の場合は何もしない
         if self._is_running:
             return
-        self._is_running = True
+
+        # 前回プロセスが削除処理の途中で終了した場合、同じ DELETE API から再試行できる状態へ戻す
+        interrupted_deletion_count = await RecordedVideo.filter(status='Deleting').update(status='DeleteFailed')
+        if interrupted_deletion_count > 0:
+            logging.warning(
+                f'Recovered {interrupted_deletion_count} interrupted recorded video deletion(s).'
+            )
 
         # バックグラウンドタスクとして実行
+        self._is_running = True
         self._task = asyncio.create_task(self.run())
 
 
@@ -587,19 +601,7 @@ class RecordedScanTask:
             self._batch_scan_pipeline_tasks.clear()
 
         # 存在しない録画ファイルに対応するレコードを一括削除
-        ## トランザクション配下に入れることでパフォーマンスが向上する
-        logging.info('Deleting records for non-existent files...')
-        async with transactions.in_transaction():
-            for index, (file_path, existing_recorded_video_summary) in enumerate(existing_db_recorded_videos.items(), start=1):
-                # ファイルの存在確認を非同期に行う
-                if not await self.isFileExists(file_path):
-                    # RecordedVideo の親テーブルである RecordedProgram を削除すると、
-                    # CASCADE 制約により RecordedVideo も同時に削除される (Channel は親テーブルにあたるため削除されない)
-                    await RecordedProgram.filter(id=existing_recorded_video_summary.recorded_program_id).delete()
-                    logging.info(f'{file_path}: Deleted record for non-existent file.')
-                if index % 50 == 0:
-                    # 既存レコードの走査がイベントループを占有し続けないよう適宜制御を返す
-                    await asyncio.sleep(0)
+        await self.__cleanupNonExistentRecordedVideoRecords(existing_db_recorded_videos)
 
         # DB に存在する全ての RecordedVideo レコードのハッシュを取得
         logging.info('Gathering all recorded video hashes...')
@@ -689,6 +691,53 @@ class RecordedScanTask:
         logging.info('Batch scan of recording folders has been completed.')
 
 
+    async def __cleanupNonExistentRecordedVideoRecords(
+        self,
+        existing_db_recorded_videos: dict[anyio.Path, RecordedVideoSummary],
+    ) -> None:
+        """存在しない録画ファイルのDBレコードを、削除再試行状態を保護しながら回収する。
+
+        Args:
+            existing_db_recorded_videos: batch scan後もファイルとの対応を確認できなかった録画の一覧。
+
+        Returns:
+            None
+        """
+
+        # トランザクション配下でまとめて削除することで、大量の消失レコードがある場合のDB処理を高速化する
+        logging.info('Deleting records for non-existent files...')
+        async with transactions.in_transaction():
+            for index, (file_path, existing_recorded_video_summary) in enumerate(
+                existing_db_recorded_videos.items(),
+                start=1,
+            ):
+                # ファイルが消失した録画だけをDBレコード回収の対象にする
+                if not await self.isFileExists(file_path):
+                    # 削除APIが録画本体を削除した後に失敗したレコードは、同じAPIからの再試行対象として保持する
+                    # ここでDBを消すと未削除の補助ファイルを辿れなくなるため、自動回収の対象から除外する
+                    if existing_recorded_video_summary.status in ('Deleting', 'DeleteFailed'):
+                        logging.info(
+                            f'{file_path}: Preserved record for deletion retry. '
+                            f'Status: {existing_recorded_video_summary.status}'
+                        )
+                    else:
+                        # batch開始後に削除APIが状態遷移した場合も保護できるよう、削除時点の永続statusも条件へ含める
+                        # RecordedProgram を削除すると、CASCADE 制約により RecordedVideo も同時に削除される
+                        deleted_count = await RecordedProgram.filter(
+                            id=existing_recorded_video_summary.recorded_program_id,
+                        ).exclude(
+                            recorded_video__status__in=['Deleting', 'DeleteFailed'],
+                        ).delete()
+                        if deleted_count > 0:
+                            logging.info(f'{file_path}: Deleted record for non-existent file.')
+                        else:
+                            logging.info(f'{file_path}: Preserved record after deletion status changed during batch scan.')
+
+                if index % 50 == 0:
+                    # 既存レコードの走査がイベントループを占有し続けないよう適宜制御を返す
+                    await asyncio.sleep(0)
+
+
     async def processRecordedFile(
         self,
         file_path: anyio.Path,
@@ -713,7 +762,7 @@ class RecordedScanTask:
         original_path_str = str(original_path) if original_path is not None else None
 
         # 同一ファイルパスへの DB レコード操作を排他制御する
-        async with self.__fileLock(file_path):
+        async with self.fileLock(file_path):
             metadata_analysis_recorded_video_id: int | None = None
             metadata_history: AnalysisTaskHandle | None = None
             try:
@@ -784,6 +833,14 @@ class RecordedScanTask:
                             playback_index_version = row['playback_index_version'],
                         )
                         existing_recorded_video_summary.file_path = file_path_str
+
+                # 削除処理中または削除失敗後のレコードは、APIからの再試行まで状態とファイルをそのまま保持する
+                # 自動スキャンで Analyzing / Recorded へ戻すと削除状態を失い、再試行不能になるため処理対象外とする
+                if (
+                    existing_recorded_video_summary is not None and
+                    existing_recorded_video_summary.status in ('Deleting', 'DeleteFailed')
+                ):
+                    return
 
                 # 更新日時とサイズが一致する既存録画は、内容をUnchangedと確定できる。
                 # マトリックスから処理集合を決め、索引単独更新などMetadataAnalyzer不要の経路をここで完結させる。
@@ -1948,7 +2005,7 @@ class RecordedScanTask:
         """
 
         # 同一ファイルパスへの DB レコード操作を排他制御する
-        async with self.__fileLock(file_path):
+        async with self.fileLock(file_path):
             try:
                 mapped_canonical_path: str | None = None
                 async with self._symlink_path_map_lock:
@@ -1967,6 +2024,15 @@ class RecordedScanTask:
                 if db_recorded_video is None and original_file_path is not None:
                     db_recorded_video = await RecordedVideo.get_or_none(file_path=str(original_file_path))
                 if db_recorded_video is not None:
+                    # 削除APIが録画本体を削除した後に失敗したレコードは、同じAPIからの再試行対象として保持する
+                    # watcherは削除APIのpath lock解放後に到達するため、lockだけでなく永続statusも必ず確認する
+                    if db_recorded_video.status in ('Deleting', 'DeleteFailed'):
+                        logging.info(
+                            f'{file_path}: Preserved record for deletion retry. '
+                            f'Status: {db_recorded_video.status}'
+                        )
+                        return
+
                     # RecordedVideo の親テーブルである RecordedProgram を削除すると、
                     # CASCADE 制約により RecordedVideo も同時に削除される (Channel は親テーブルにあたるため削除されない)
                     await db_recorded_video.recorded_program.delete()
