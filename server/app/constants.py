@@ -1,8 +1,12 @@
 
 import base64
 import hashlib
+import os
 import pkgutil
 import secrets
+import stat
+import sys
+import time
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -653,14 +657,158 @@ QUALITY: dict[QUALITY_TYPES, Quality] = {
 NICONICO_OAUTH_CLIENT_ID = '4JTJdyBZLwMJwaI7'
 
 # JWT のエンコード/デコードに使うシークレットキー
-## jwt_secret.dat がない場合は自動生成する
+## KonomiTV-BS4K は POSIX 環境専用のため、POSIX のファイル API で安全に生成・読み込みする
 JWT_SECRET_KEY_PATH = DATA_DIR / 'jwt_secret.dat'
-if Path.exists(JWT_SECRET_KEY_PATH) is False:
-    with open(JWT_SECRET_KEY_PATH, mode='w', encoding='utf-8') as file:
-        file.write(secrets.token_hex(32))  # 32ビット (256文字) の乱数を書き込む
+_JWT_SECRET_HEX_LENGTH = 64
+_JWT_SECRET_HEX_CHARS = frozenset('0123456789abcdefABCDEF')
+
+
+def _WriteAllBytes(fd: int, data: bytes) -> None:
+    """ファイルディスクリプタへバイト列全体を書き込む。
+
+    Args:
+        fd: 書き込み先のファイルディスクリプタ。
+        data: 書き込むバイト列。
+
+    Returns:
+        None
+
+    Raises:
+        RuntimeError: 書き込みが進まない場合。
+    """
+
+    # os.write() は短い書き込みを返す可能性があるため、全体を書き切るまで繰り返す
+    offset = 0
+    while offset < len(data):
+        written = os.write(fd, data[offset:])
+        if written <= 0:
+            raise RuntimeError('Failed to write JWT secret key file.')
+        offset += written
+
+
+def _ValidateJWTSecretKey(secret_key: str) -> str:
+    """JWT シークレットが 64 hex 文字であることを検証する。
+
+    Args:
+        secret_key: 検証対象のシークレット文字列。
+
+    Returns:
+        検証済みのシークレット文字列。
+
+    Raises:
+        RuntimeError: 長さまたは文字種が契約と異なる場合。
+    """
+
+    # 不完全または改変された値を暗号鍵として受理しない
+    if len(secret_key) != _JWT_SECRET_HEX_LENGTH:
+        raise RuntimeError('JWT secret key file has invalid length.')
+    if any(char not in _JWT_SECRET_HEX_CHARS for char in secret_key):
+        raise RuntimeError('JWT secret key file has invalid format.')
+    return secret_key
+
+
+def _RemoveIncompleteJWTSecretKey(path: Path, fd: int) -> None:
+    """生成中の同一ファイルだけを安全に削除する。
+
+    Args:
+        path: jwt_secret.dat のパス。
+        fd: 生成したファイルのファイルディスクリプタ。
+
+    Returns:
+        None
+    """
+
+    # 別ファイルへ差し替えられていた場合に誤削除しないよう、開いている inode と一致するときだけ削除する
+    try:
+        descriptor_stat = os.fstat(fd)
+        path_stat = os.lstat(path)
+    except OSError:
+        # 元の例外を隠さないため、ベストエフォートの後始末に失敗した場合は呼び出し元へ戻る
+        return
+    if stat.S_ISREG(path_stat.st_mode) and (
+        descriptor_stat.st_dev,
+        descriptor_stat.st_ino,
+    ) == (
+        path_stat.st_dev,
+        path_stat.st_ino,
+    ):
+        try:
+            os.unlink(path)
+        except OSError:
+            # 元の例外を優先し、削除失敗は次回起動時の不完全キー検査に委ねる
+            return
+
+
+def _LoadOrCreateJWTSecretKey(path: Path) -> str:
+    """JWT シークレットキーを POSIX のファイル API で安全に生成または読み込む。
+
+    Args:
+        path: jwt_secret.dat のパス。
+
+    Returns:
+        JWT シークレットキーを表す 64 hex 文字。
+
+    Raises:
+        RuntimeError: Windows で実行された、ファイル属性が安全でない、またはキーが不正な場合。
+        OSError: symlink が張られているなど、ファイルを安全に開けない場合。
+    """
+
+    # KonomiTV-BS4K は Linux / POSIX 環境専用であり、不完全な Windows 互換処理は持ち込まない
+    if sys.platform == 'win32':
+        raise RuntimeError('KonomiTV-BS4K does not support Windows.')
+
+    # O_EXCL で同時初期化を直列化し、O_NOFOLLOW で最終パスの symlink を原子的に拒否する
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        is_new_file = True
+    except FileExistsError:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        is_new_file = False
+
+    try:
+        if is_new_file is True:
+            # os.open() の mode は umask の影響を受けるため、生成した同じ FD を必ず 0600 へ固定する
+            os.fchmod(fd, 0o600)
+            _WriteAllBytes(fd, secrets.token_hex(32).encode('ascii'))  # 32 bytes (256 bits)
+            os.lseek(fd, 0, os.SEEK_SET)
+        else:
+            # path ではなく開いた FD を検査し、検査後のパス差し替えによる TOCTOU を避ける
+            stat_result = os.fstat(fd)
+            if stat.S_ISREG(stat_result.st_mode) is False:
+                raise RuntimeError('JWT secret key file must be a regular file.')
+            if stat_result.st_uid != os.getuid():
+                raise RuntimeError('JWT secret key file must be owned by the current user.')
+            if stat_result.st_nlink != 1:
+                raise RuntimeError('JWT secret key file must not have multiple hard links.')
+            # S_IMODE には特殊 permission bit も含まれるため、0600 以外を残さず修復する
+            if stat.S_IMODE(stat_result.st_mode) != 0o600:
+                os.fchmod(fd, 0o600)
+
+        # 同時生成に負けた側は生成側の書き込み完了を最大 1 秒待つ
+        for _ in range(100):
+            try:
+                secret_key = os.read(fd, 1024).decode('ascii').strip()
+            except UnicodeDecodeError:
+                raise RuntimeError('JWT secret key file has invalid format.') from None
+            if len(secret_key) == _JWT_SECRET_HEX_LENGTH:
+                return _ValidateJWTSecretKey(secret_key)
+            # 64 bytes 以上存在するのに 64文字として読めない場合は、待機しても正常化しない
+            if os.fstat(fd).st_size >= _JWT_SECRET_HEX_LENGTH:
+                raise RuntimeError('JWT secret key file has invalid length.')
+            os.lseek(fd, 0, os.SEEK_SET)
+            time.sleep(0.01)
+        raise RuntimeError('JWT secret key file is empty or incomplete.')
+    except BaseException:
+        # 新規生成中の失敗だけを対象に、不完全な最終ファイルが残って永続的に起動不能になることを防ぐ
+        if is_new_file is True:
+            _RemoveIncompleteJWTSecretKey(path, fd)
+        raise
+    finally:
+        os.close(fd)
+
+
 ## jwt_secret.dat からシークレットキーをロードする
-with open(JWT_SECRET_KEY_PATH, encoding='utf-8') as file:
-    JWT_SECRET_KEY = file.read().strip()
+JWT_SECRET_KEY = _LoadOrCreateJWTSecretKey(JWT_SECRET_KEY_PATH)
 
 # 暗号化された Cookie の接頭辞
 TWITTER_ACCOUNT_COOKIE_ENCRYPTION_PREFIX = 'enc:'
