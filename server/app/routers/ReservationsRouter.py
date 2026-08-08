@@ -963,6 +963,71 @@ async def GetIsRecordingInProgress(reserve_data: ReserveDataRequired, edcb: Ctrl
     return isinstance(await edcb.sendGetRecFilePath(reserve_data['reserve_id']), str)
 
 
+# 録画中判定の EDCB への同時問い合わせ数の上限
+## CtrlCmd プロトコルは 1 コマンドごとに EpgTimerSrv へ新規接続を開く (CtrlCmdUtil.__sendAndReceive) ため、
+## 現在時刻 ±2 時間の判定対象予約が多い環境や複数クライアントからの同時リクエストでは、
+## 無制限の並列だと EpgTimerSrv への同時接続数が予約数 × 同時リクエスト数に比例して増えてしまう
+## EpgTimerSrv は多重度の高い接続を想定していないため、少なすぎない程度の上限で並列性を制限する
+EDCB_RECORDING_CHECK_CONCURRENCY_LIMIT = 8
+
+# 録画中判定の EDCB への同時問い合わせをプロセス全体で制限するセマフォ
+## リクエストごとに生成すると同時リクエスト数だけ上限が増えてしまうため、プロセスで共有する
+## イベントループが存在しない import 時の生成を避けるため、初回利用時に遅延生成する (ProcessLimiter と同じパターン)
+_edcb_recording_check_semaphore: asyncio.Semaphore | None = None
+
+
+def GetEDCBRecordingCheckSemaphore() -> asyncio.Semaphore:
+    """
+    録画中判定の EDCB への同時問い合わせを制限する、プロセス全体で共有されるセマフォを取得する。
+
+    Returns:
+        asyncio.Semaphore: プロセス全体で共有されるセマフォ
+    """
+
+    global _edcb_recording_check_semaphore
+    if _edcb_recording_check_semaphore is None:
+        _edcb_recording_check_semaphore = asyncio.Semaphore(EDCB_RECORDING_CHECK_CONCURRENCY_LIMIT)
+    return _edcb_recording_check_semaphore
+
+
+async def GetIsRecordingInProgressByReserveId(
+    reserve_data_list: list[ReserveDataRequired],
+    edcb: CtrlCmdUtil,
+) -> dict[int, bool]:
+    """
+    すべての予約が現在録画中かどうかをまとめて判定し、予約 ID をキーとする辞書で返す。
+
+    録画中判定が必要な予約のみ EDCB へ問い合わせる。
+    必要最小限の予約に絞ることで、視聴中の定期更新時の EDCB 負荷を抑える。
+    データベーストランザクション外で実行し、かつ並列にリクエストすることで通信によるトランザクションの長時間ブロックを防ぐ。
+    ただし同時問い合わせ数は EDCB_RECORDING_CHECK_CONCURRENCY_LIMIT で制限し、
+    判定対象の予約が多い場合でも EpgTimerSrv への同時接続数が増えすぎないようにする。
+
+    Args:
+        reserve_data_list (list[ReserveDataRequired]): 判定対象の予約情報のリスト
+        edcb (CtrlCmdUtil): EDCB API クライアント
+
+    Returns:
+        dict[int, bool]: 予約 ID をキー、録画中かどうかを値とする辞書
+    """
+
+    # 同時問い合わせ数を制限するプロセス共有のセマフォ
+    ## 複数クライアントからの同時リクエストを含めて、EDCB への同時接続数が上限を超えないようにする
+    semaphore = GetEDCBRecordingCheckSemaphore()
+
+    async def CheckWithLimit(reserve_data: ReserveDataRequired) -> bool:
+        # EDCB への問い合わせが発生しない予約 (判定時間範囲外・視聴予約・無効予約) もセマフォを通すが、
+        # その場合は取得後すぐに解放されるため、実際の並列数への影響はない
+        async with semaphore:
+            return await GetIsRecordingInProgress(reserve_data, edcb)
+
+    results = await asyncio.gather(*(CheckWithLimit(reserve_data) for reserve_data in reserve_data_list))
+    return {
+        reserve_data['reserve_id']: result
+        for reserve_data, result in zip(reserve_data_list, results, strict=True)
+    }
+
+
 @router.get(
     '',
     summary = '録画予約情報一覧 API',
@@ -982,17 +1047,8 @@ async def ReservationsAPI(
         # None が返ってきた場合は空のリストを返す
         return schemas.Reservations(total=0, reservations=[])
 
-    # 録画中判定が必要な予約のみ EDCB へ問い合わせる
-    ## 必要最小限の予約に絞ることで、視聴中の定期更新時の EDCB 負荷を抑える
-    ## データベーストランザクション外で実行し、かつ並列にリクエストすることで通信によるトランザクションの長時間ブロックを防ぐ
-    is_recording_in_progress_tasks = []
-    for reserve_data in reserve_data_list:
-        is_recording_in_progress_tasks.append(GetIsRecordingInProgress(reserve_data, edcb))
-
-    is_recording_in_progress_results = await asyncio.gather(*is_recording_in_progress_tasks)
-    is_recording_in_progress_by_reserve_id: dict[int, bool] = {}
-    for i, reserve_data in enumerate(reserve_data_list):
-        is_recording_in_progress_by_reserve_id[reserve_data['reserve_id']] = is_recording_in_progress_results[i]
+    # 録画中判定が必要な予約のみ EDCB へ問い合わせる (同時問い合わせ数はヘルパー内で制限される)
+    is_recording_in_progress_by_reserve_id = await GetIsRecordingInProgressByReserveId(reserve_data_list, edcb)
 
     # データベースアクセスを伴うので、トランザクション下に入れた上で並行して行う
     async with transactions.in_transaction():
