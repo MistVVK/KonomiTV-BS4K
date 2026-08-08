@@ -26,7 +26,11 @@ from app.streams.KonomiTVBS4KPlaybackEncoding import (
     ResolveKonomiTVBS4KPlaybackVideoBitrate,
 )
 from app.streams.RecordedEncodingCodecs import AudioCodec, VideoCodec
-from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager, RecordedFMP4Variant
+from app.streams.RecordedFMP4Cache import (
+    KonomiTVBS4KRecordedFMP4PathLock,
+    RecordedFMP4CacheManager,
+    RecordedFMP4Variant,
+)
 from app.streams.RecordedPlaybackCapabilities import (
     RecordedPlaybackBackend,
     RecordedPlaybackCapabilityProbe,
@@ -384,7 +388,7 @@ class RecordedFMP4Stream:
         self._instances.pop(self.session_id, None)
         self._session_client_keys.pop(self.session_id, None)
         for cache_path in self._referenced_paths:
-            RecordedFMP4CacheManager.release(cache_path, self.session_id)
+            await RecordedFMP4CacheManager.release(cache_path, self.session_id)
         self._referenced_paths.clear()
 
     async def getMasterPlaylist(self, cache_key: str | None = None) -> str:
@@ -2321,7 +2325,10 @@ class RecordedFMP4Stream:
             }[declared_channels]
         return 'stereo'
 
-    async def __acquire(self, cache_path: Path) -> asyncio.Lock:
+    async def __acquire(
+        self,
+        cache_path: Path,
+    ) -> KonomiTVBS4KRecordedFMP4PathLock:
         """初回参照時だけキャッシュへのセッション参照を登録する。"""
 
         if cache_path not in self._referenced_paths:

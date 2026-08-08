@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -90,12 +91,12 @@ def test_recorded_fmp4_reference_delays_deletion_and_reuse_cancels_it(tmp_path: 
         RecordedFMP4CacheManager.RELEASE_DELAY_SECONDS = 0.02
         try:
             await RecordedFMP4CacheManager.acquire(path, 'session-1')
-            RecordedFMP4CacheManager.release(path, 'session-1')
+            await RecordedFMP4CacheManager.release(path, 'session-1')
             await asyncio.sleep(0.005)
             await RecordedFMP4CacheManager.acquire(path, 'session-2')
             await asyncio.sleep(0.03)
             assert path.is_file()
-            RecordedFMP4CacheManager.release(path, 'session-2')
+            await RecordedFMP4CacheManager.release(path, 'session-2')
             await asyncio.sleep(0.03)
             assert path.exists() is False
         finally:
@@ -228,9 +229,7 @@ def test_recorded_scan_cleanup_preserves_referenced_cache(tmp_path: Path) -> Non
         await RecordedFMP4CacheManager.acquire(path, 'session')
         await RecordedFMP4CacheManager.cleanupDiscovered(path)
         assert path.is_file()
-        RecordedFMP4CacheManager.release(path, 'session')
-        release_task = RecordedFMP4CacheManager._release_tasks.pop(str(path))  # pyright: ignore[reportPrivateUsage]
-        release_task.cancel()
+        await RecordedFMP4CacheManager.release(path, 'session')
         await RecordedFMP4CacheManager.cleanupDiscovered(path)
         assert path.exists() is False
 
@@ -241,6 +240,220 @@ def test_recorded_scan_cleanup_preserves_referenced_cache(tmp_path: Path) -> Non
 
     with patch('app.streams.RecordedFMP4Cache.asyncio.to_thread', side_effect=RunSynchronously):
         asyncio.run(asyncio.wait_for(Run(), timeout=1.0))
+
+
+def test_startup_cleanup_preserves_referenced_cache(monkeypatch, tmp_path: Path) -> None:
+    """起動時 cleanup も scanner と同じ path lock 規約で active reference を保護する。"""
+
+    class EmptyRecordedVideoQuery:
+        """起動時 cleanup へ空の録画ファイル一覧を返す。"""
+
+        async def values_list(self, _field: str, *, flat: bool) -> list[str]:
+            assert flat is True
+            return []
+
+    async def Run() -> None:
+        path = tmp_path / ('.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-16.m4s')
+        path.write_bytes(b'fragment')
+        settings = ServerSettings()
+        settings.video.recorded_fmp4_cache_folder = tmp_path
+        monkeypatch.setattr('app.streams.RecordedFMP4Cache.Config', lambda: settings)
+
+        with patch(
+            'app.streams.RecordedFMP4Cache.RecordedVideo.all',
+            return_value=EmptyRecordedVideoQuery(),
+        ):
+            await RecordedFMP4CacheManager.acquire(path, 'session-startup')
+            await RecordedFMP4CacheManager.cleanupStale()
+            assert path.read_bytes() == b'fragment'
+            await RecordedFMP4CacheManager.release(path, 'session-startup')
+            await RecordedFMP4CacheManager.cleanupDiscovered(path)
+
+    asyncio.run(asyncio.wait_for(Run(), timeout=1.0))
+
+
+def test_cleanup_discovered_and_acquire_are_serialized_by_path_lock(tmp_path: Path) -> None:
+    """cleanup の参照確認後に acquire が割り込んで参照中ファイルを消す競合を防ぐ。"""
+
+    async def Run() -> None:
+        path = tmp_path / ('.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-11.m4s')
+        path.write_bytes(b'old-fragment')
+        unlink_started = asyncio.Event()
+        allow_unlink = asyncio.Event()
+
+        async def ControlledToThread(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+            unlink_started.set()
+            await allow_unlink.wait()
+            return function(*args, **kwargs)
+
+        with patch('app.streams.RecordedFMP4Cache.asyncio.to_thread', side_effect=ControlledToThread):
+            cleanup_task = asyncio.create_task(RecordedFMP4CacheManager.cleanupDiscovered(path))
+            await unlink_started.wait()
+            acquire_task = asyncio.create_task(RecordedFMP4CacheManager.acquire(path, 'session-race'))
+            await asyncio.sleep(0)
+            # cleanup が unlink worker を待つ間は acquire が path lock の外へ出ない。
+            assert acquire_task.done() is False
+            allow_unlink.set()
+            await cleanup_task
+            await acquire_task
+
+            # acquire 後に再生成したファイルは active reference 中の scanner cleanup から保護される。
+            path.write_bytes(b'new-fragment')
+            await RecordedFMP4CacheManager.cleanupDiscovered(path)
+            assert path.read_bytes() == b'new-fragment'
+            await RecordedFMP4CacheManager.release(path, 'session-race')
+            await RecordedFMP4CacheManager.cleanupDiscovered(path)
+
+    asyncio.run(asyncio.wait_for(Run(), timeout=1.0))
+
+
+def test_delayed_delete_reacquire_waits_for_unlink_worker(tmp_path: Path) -> None:
+    """遅延 unlink 開始後の再取得は worker 完了を待ち、新しいキャッシュを消されない。"""
+
+    async def Run() -> None:
+        path = tmp_path / ('.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-12.m4s')
+        path.write_bytes(b'old-fragment')
+        original_delay = RecordedFMP4CacheManager.RELEASE_DELAY_SECONDS
+        RecordedFMP4CacheManager.RELEASE_DELAY_SECONDS = 0
+        unlink_started = asyncio.Event()
+        allow_unlink = asyncio.Event()
+
+        async def ControlledToThread(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+            unlink_started.set()
+            await allow_unlink.wait()
+            return function(*args, **kwargs)
+
+        try:
+            with patch('app.streams.RecordedFMP4Cache.asyncio.to_thread', side_effect=ControlledToThread):
+                await RecordedFMP4CacheManager.acquire(path, 'session-old')
+                await RecordedFMP4CacheManager.release(path, 'session-old')
+                await unlink_started.wait()
+
+                acquire_task = asyncio.create_task(
+                    RecordedFMP4CacheManager.acquire(path, 'session-new'),
+                )
+                await asyncio.sleep(0)
+                assert acquire_task.done() is False
+                allow_unlink.set()
+                await acquire_task
+
+                path.write_bytes(b'new-fragment')
+                await asyncio.sleep(0)
+                assert path.read_bytes() == b'new-fragment'
+                await RecordedFMP4CacheManager.release(path, 'session-new')
+                await asyncio.sleep(0)
+        finally:
+            allow_unlink.set()
+            RecordedFMP4CacheManager.RELEASE_DELAY_SECONDS = original_delay
+
+    asyncio.run(asyncio.wait_for(Run(), timeout=1.0))
+
+
+def test_acquire_waits_for_cancelled_release_task_before_propagating_caller_cancel(tmp_path: Path) -> None:
+    """acquire 自身の cancel 時も旧遅延削除 task の完了前に呼び出し元へ戻らない。"""
+
+    async def Run() -> None:
+        path = tmp_path / ('.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-15.m4s')
+        release_cancelled = asyncio.Event()
+        allow_release_finish = asyncio.Event()
+
+        async def PendingRelease() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                release_cancelled.set()
+                await allow_release_finish.wait()
+                raise
+
+        cache_key = str(path)
+        release_task = asyncio.create_task(PendingRelease())
+        RecordedFMP4CacheManager._release_tasks[cache_key] = release_task  # pyright: ignore[reportPrivateUsage]
+        acquire_task = asyncio.create_task(
+            RecordedFMP4CacheManager.acquire(path, 'session-cancelled'),
+        )
+        try:
+            await release_cancelled.wait()
+            acquire_task.cancel()
+            await asyncio.sleep(0)
+            assert acquire_task.done() is False
+
+            allow_release_finish.set()
+            with pytest.raises(asyncio.CancelledError):
+                await acquire_task
+            assert release_task.done() is True
+        finally:
+            allow_release_finish.set()
+            if acquire_task.done() is False:
+                acquire_task.cancel()
+            if release_task.done() is False:
+                release_task.cancel()
+            await asyncio.gather(acquire_task, release_task, return_exceptions=True)
+            RecordedFMP4CacheManager._release_tasks.pop(cache_key, None)  # pyright: ignore[reportPrivateUsage]
+            RecordedFMP4CacheManager._references.pop(cache_key, None)  # pyright: ignore[reportPrivateUsage]
+            RecordedFMP4CacheManager._locks.pop(cache_key, None)  # pyright: ignore[reportPrivateUsage]
+            RecordedFMP4CacheManager._lock_users.pop(cache_key, None)  # pyright: ignore[reportPrivateUsage]
+
+    asyncio.run(asyncio.wait_for(Run(), timeout=1.0))
+
+
+def test_cancelled_atomic_write_holds_path_lock_until_worker_finishes(tmp_path: Path) -> None:
+    """writeAtomic cancel 後も thread worker 完了まで path lock と in-progress を保持する。"""
+
+    async def Run() -> None:
+        destination = tmp_path / ('.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-13.m4s')
+        real_to_thread = asyncio.to_thread
+        worker_started = threading.Event()
+        allow_worker = threading.Event()
+
+        async def ControlledToThread(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if getattr(function, '__name__', '') == 'WriteAndReplace':
+                def BlockingWorker():  # type: ignore[no-untyped-def]
+                    worker_started.set()
+                    allow_worker.wait(timeout=1)
+                    return function(*args, **kwargs)
+
+                return await real_to_thread(BlockingWorker)
+            return await real_to_thread(function, *args, **kwargs)
+
+        try:
+            with patch('app.streams.RecordedFMP4Cache.asyncio.to_thread', side_effect=ControlledToThread):
+                write_task = asyncio.create_task(
+                    RecordedFMP4CacheManager.writeAtomic(destination, b'fragment-data'),
+                )
+                while worker_started.is_set() is False:
+                    await asyncio.sleep(0.001)
+                write_task.cancel()
+                cleanup_task = asyncio.create_task(
+                    RecordedFMP4CacheManager.cleanupDiscovered(destination),
+                )
+                await asyncio.sleep(0.01)
+                assert write_task.done() is False
+                assert cleanup_task.done() is False
+
+                allow_worker.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await write_task
+                await cleanup_task
+                assert destination.exists() is False
+        finally:
+            allow_worker.set()
+
+    asyncio.run(asyncio.wait_for(Run(), timeout=2.0))
+
+
+def test_write_atomic_reenters_generation_path_lock(tmp_path: Path) -> None:
+    """生成 lock 保持 task から同じ path の writeAtomic を呼んでも自己 deadlock しない。"""
+
+    async def Run() -> None:
+        path = tmp_path / ('.konomitv-bs4k-fmp4-v1-12-abcd-' + ('0' * 24) + '-video-14.m4s')
+        generation_lock = await RecordedFMP4CacheManager.acquire(path, 'session-generation')
+        async with generation_lock:
+            await RecordedFMP4CacheManager.writeAtomic(path, b'fragment-data')
+        assert path.read_bytes() == b'fragment-data'
+        await RecordedFMP4CacheManager.release(path, 'session-generation')
+        await RecordedFMP4CacheManager.cleanupDiscovered(path)
+
+    asyncio.run(asyncio.wait_for(Run(), timeout=1.0))
 
 
 def test_recorded_fmp4_cache_host_path_is_prefixed_for_docker(monkeypatch, tmp_path: Path) -> None:
