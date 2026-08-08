@@ -320,15 +320,16 @@ async def Startup():
     except Exception as ex:
         logging.error('[RecordedEpisodeResolver] Failed to backfill legacy episodes:', exc_info=ex)
 
-    # 録画スキャンとは分離したシリーズ判定ワーカーを開始する。
-    await RecordedSeriesResolver.start()
-
-    # OpenCode 月次台帳の起動時 reserved リセット（前回プロセスの張り付きを解消）。
+    # AI ワーカーを開始する前に、OpenCode 月次台帳の未精算 reservation を予約上界で回復する。
+    ## 新規 Reserve と前プロセスの Reserved 回復が競合しないよう、必ず worker start より先に行う。
     try:
         from app.metadata.ai.AIAPIUsageLedger import AIAPIUsageLedger
-        await AIAPIUsageLedger.EnsureStartupReservedReset()
+        await AIAPIUsageLedger.EnsureStartupReservationRecovery()
     except Exception as ex:
-        logging.warning('[AIAPIUsageLedger] Startup reserved reset failed:', exc_info=ex)
+        logging.warning('[AIAPIUsageLedger] Startup reservation recovery failed:', exc_info=ex)
+
+    # 録画スキャンとは分離したシリーズ判定ワーカーを開始する。
+    await RecordedSeriesResolver.start()
 
     # Series確定後の話数解析・Web検索も別ワーカーで開始し、録画スキャンを待たせない。
     await RecordedEpisodeAutomation.start()

@@ -17,7 +17,10 @@ from app.metadata.ai.AIAPIUsageLedger import (
 )
 from app.metadata.ai.AIBackendSettings import AIBackendService
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
-from app.models.AIAPIUsage import AIAPIUsageMonth
+from app.models.AIAPIUsage import (
+    AIAPIUsageMonth,
+    KonomiTVBS4KAIAPIUsageReservation,
+)
 
 
 def _service(**overrides: object) -> AIBackendService:
@@ -42,7 +45,7 @@ async def _InitDB() -> None:
         timezone='Asia/Tokyo',
     )
     await Tortoise.generate_schemas()
-    ledger_mod._startup_reset_done = False
+    ledger_mod._startup_recovery_done = False
 
 
 async def _CloseDB() -> None:
@@ -82,6 +85,11 @@ def test_reserve_and_settle_success() -> None:
             assert row.settled_completion_tokens == 20
             assert Decimal(str(row.settled_estimated_cost_usd)) == Decimal('0.02')
             assert row.settled_request_count == 1
+            reservation_row = await KonomiTVBS4KAIAPIUsageReservation.get(
+                reservation_id=reservation.reservation_id,
+            )
+            assert reservation_row.state == 'Settled'
+            assert reservation_row.settled_total_tokens == 30
         finally:
             await _CloseDB()
 
@@ -210,11 +218,15 @@ def test_free_failure_releases_reservation() -> None:
                 estimate_total_tokens=80,
                 estimate_cost_usd=Decimal('0.1'),
             )
-            await AIAPIUsageLedger.Settle(reservation, free_failure=True)
+            await AIAPIUsageLedger.Release(reservation)
             row = await AIAPIUsageMonth.get(service_id=service.service_id)
             assert row.reserved_total_tokens == 0
             assert row.settled_total_tokens == 0
             assert row.settled_request_count == 0
+            reservation_row = await KonomiTVBS4KAIAPIUsageReservation.get(
+                reservation_id=reservation.reservation_id,
+            )
+            assert reservation_row.state == 'Released'
         finally:
             await _CloseDB()
 
@@ -273,28 +285,176 @@ def test_concurrent_reserve_respects_limit() -> None:
     asyncio.run(Run())
 
 
-def test_startup_resets_reserved() -> None:
-    """起動時リセットで reserved が 0 になる。"""
+def test_startup_recovers_reserved_once() -> None:
+    """再起動時は未精算予約を予約上界で一度だけ Settled へ回復する。"""
 
     async def Run() -> None:
         await _InitDB()
         try:
             service = _service()
-            await AIAPIUsageMonth.create(
-                service_id=service.service_id,
-                year_month=CurrentYearMonth(),
-                reserved_total_tokens=999,
-                reserved_estimated_cost_usd=Decimal('1.5'),
-                service_name_snapshot=service.service_name,
-                opencode_provider_id_snapshot=service.opencode_provider_id,
-                opencode_model_id_snapshot=service.opencode_model_id,
-                billing_mode_snapshot=service.billing_mode,
+            reservation = await AIAPIUsageLedger.Reserve(
+                service,
+                estimate_total_tokens=40,
+                estimate_cost_usd=Decimal('0.2'),
             )
-            ledger_mod._startup_reset_done = False
-            await AIAPIUsageLedger.EnsureStartupReservedReset()
+            # Reserve 済みの DB を残してプロセスだけ再起動した状態を再現する。
+            ledger_mod._startup_recovery_done = False
+            await AIAPIUsageLedger.EnsureStartupReservationRecovery()
             row = await AIAPIUsageMonth.get(service_id=service.service_id)
             assert row.reserved_total_tokens == 0
+            assert row.settled_total_tokens == 40
+            assert row.settled_request_count == 1
             assert Decimal(str(row.reserved_estimated_cost_usd)) == Decimal('0')
+            assert Decimal(str(row.settled_estimated_cost_usd)) == Decimal('0.2')
+            reservation_row = await KonomiTVBS4KAIAPIUsageReservation.get(
+                reservation_id=reservation.reservation_id,
+            )
+            assert reservation_row.state == 'Settled'
+
+            # 回復処理自体が再実行されても同じ reservation は二重計上しない。
+            ledger_mod._startup_recovery_done = False
+            await AIAPIUsageLedger.EnsureStartupReservationRecovery()
+            await row.refresh_from_db()
+            assert row.settled_total_tokens == 40
+            assert row.settled_request_count == 1
+        finally:
+            await _CloseDB()
+
+    asyncio.run(Run())
+
+
+def test_double_settle_is_idempotent() -> None:
+    """同じ reservation の並行 Settle は token と request を1回だけ計上する。"""
+
+    async def Run() -> None:
+        await _InitDB()
+        try:
+            service = _service()
+            reservation = await AIAPIUsageLedger.Reserve(
+                service,
+                estimate_total_tokens=100,
+                estimate_cost_usd=Decimal('0.1'),
+            )
+            usage = {
+                'prompt_tokens': 20,
+                'completion_tokens': 10,
+                'reasoning_tokens': 0,
+                'total_tokens': 30,
+                'estimated_cost_usd': 0.03,
+            }
+
+            results = await asyncio.gather(
+                AIAPIUsageLedger.Settle(reservation, usage),
+                AIAPIUsageLedger.Settle(reservation, usage),
+            )
+
+            assert results.count(True) == 1
+            assert results.count(False) == 1
+            row = await AIAPIUsageMonth.get(service_id=service.service_id)
+            assert row.reserved_total_tokens == 0
+            assert row.settled_total_tokens == 30
+            assert row.settled_request_count == 1
+        finally:
+            await _CloseDB()
+
+    asyncio.run(Run())
+
+
+def test_release_then_retry_uses_new_reservation_only() -> None:
+    """cancel 解放直後の再試行でも旧 reservation を確定実績へ二重計上しない。"""
+
+    async def Run() -> None:
+        await _InitDB()
+        try:
+            service = _service()
+            cancelled = await AIAPIUsageLedger.Reserve(
+                service,
+                estimate_total_tokens=50,
+                estimate_cost_usd=Decimal('0.05'),
+            )
+            assert await AIAPIUsageLedger.Release(cancelled) is True
+            assert await AIAPIUsageLedger.Release(cancelled) is False
+            assert await AIAPIUsageLedger.Settle(
+                cancelled,
+                {
+                    'prompt_tokens': 100,
+                    'completion_tokens': 100,
+                    'reasoning_tokens': 0,
+                    'total_tokens': 200,
+                    'estimated_cost_usd': 0.2,
+                },
+            ) is False
+
+            retried = await AIAPIUsageLedger.Reserve(
+                service,
+                estimate_total_tokens=50,
+                estimate_cost_usd=Decimal('0.05'),
+            )
+            assert await AIAPIUsageLedger.Settle(
+                retried,
+                {
+                    'prompt_tokens': 7,
+                    'completion_tokens': 5,
+                    'reasoning_tokens': 0,
+                    'total_tokens': 12,
+                    'estimated_cost_usd': 0.01,
+                },
+            ) is True
+
+            row = await AIAPIUsageMonth.get(service_id=service.service_id)
+            assert row.reserved_total_tokens == 0
+            assert row.settled_total_tokens == 12
+            assert row.settled_request_count == 1
+        finally:
+            await _CloseDB()
+
+    asyncio.run(Run())
+
+
+def test_settle_keeps_original_month_across_month_boundary() -> None:
+    """月境界後の Settle も永続 reservation が指す予約月へ1回だけ計上する。"""
+
+    async def Run() -> None:
+        await _InitDB()
+        try:
+            service = _service()
+            reservation = await AIAPIUsageLedger.Reserve(
+                service,
+                estimate_total_tokens=50,
+                estimate_cost_usd=Decimal('0.05'),
+                year_month='2026-08',
+            )
+            assert await AIAPIUsageLedger.Settle(
+                reservation,
+                {
+                    'prompt_tokens': 6,
+                    'completion_tokens': 4,
+                    'reasoning_tokens': 0,
+                    'total_tokens': 10,
+                    'estimated_cost_usd': 0.01,
+                },
+            ) is True
+            assert await AIAPIUsageLedger.Settle(
+                reservation,
+                {
+                    'prompt_tokens': 6,
+                    'completion_tokens': 4,
+                    'reasoning_tokens': 0,
+                    'total_tokens': 10,
+                    'estimated_cost_usd': 0.01,
+                },
+            ) is False
+
+            august = await AIAPIUsageMonth.get(
+                service_id=service.service_id,
+                year_month='2026-08',
+            )
+            assert august.settled_total_tokens == 10
+            assert august.settled_request_count == 1
+            assert await AIAPIUsageMonth.filter(
+                service_id=service.service_id,
+                year_month='2026-09',
+            ).exists() is False
         finally:
             await _CloseDB()
 

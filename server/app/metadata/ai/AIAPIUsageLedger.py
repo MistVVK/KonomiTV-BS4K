@@ -3,17 +3,19 @@
 Asia/Tokyo 暦月 × service_id で集約する。
 Subscription は enforce せず no-op。Local は cost 上限を無視し token のみ。
 Metered は cost（取得可能なとき）と token の両方を見る。
-プロセス再起動時は reserved を 0 に戻す（進行中呼び出しは失効とみなす）。
+プロセス再起動時は永続 Reserved reservation を予約見積額で一度だけ安全側精算する。
 """
 
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
+from weakref import WeakKeyDictionary
 
 from tortoise.transactions import in_transaction
 
@@ -22,7 +24,10 @@ from app.constants import JST
 from app.metadata.ai.AIBackendSettings import AIBackendService
 from app.metadata.ai.opencode_types import OpenCodeNormalizedUsage
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
-from app.models.AIAPIUsage import AIAPIUsageMonth
+from app.models.AIAPIUsage import (
+    AIAPIUsageMonth,
+    KonomiTVBS4KAIAPIUsageReservation,
+)
 
 
 # 1 回の OpenCode 呼び出しに対する安全な予約上界。
@@ -30,10 +35,36 @@ DEFAULT_RESERVE_TOTAL_TOKENS = 100_000
 DEFAULT_RESERVE_COST_USD = Decimal('0.50')
 
 _ZERO = Decimal('0')
-_reserve_lock = asyncio.Lock()
-# 起動時 reserved リセットを一度だけ行う。
-_startup_reset_done = False
-_startup_reset_lock = asyncio.Lock()
+# 起動時の未精算 reservation 回復を一度だけ行う。
+_startup_recovery_done = False
+
+# pytest の asyncio.run() やプロセス内の event loop 再生成でも Lock の loop affinity を交差させない。
+_reserve_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
+_startup_recovery_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = WeakKeyDictionary()
+_loop_locks_guard = threading.Lock()
+
+_FinalReservationState = Literal['Settled', 'Released']
+
+
+def _GetLoopLock(
+    lock_map: WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock],
+) -> asyncio.Lock:
+    """現在の event loop 専用 Lock を返す。
+
+    Args:
+        lock_map: 用途別の event loop → Lock map。
+
+    Returns:
+        現在の event loop にだけ bind される Lock。
+    """
+
+    event_loop = asyncio.get_running_loop()
+    with _loop_locks_guard:
+        lock = lock_map.get(event_loop)
+        if lock is None:
+            lock = asyncio.Lock()
+            lock_map[event_loop] = lock
+        return lock
 
 
 def CurrentYearMonth(*, now: datetime | None = None) -> str:
@@ -121,39 +152,47 @@ class AIAPIUsageLedger:
     """月次利用台帳の操作入口。"""
 
     @classmethod
-    async def EnsureStartupReservedReset(cls) -> None:
-        """起動時に全月の reserved を 0 へ戻す（1 プロセス 1 回）。"""
+    async def EnsureStartupReservationRecovery(cls) -> None:
+        """起動時に未精算 Reserved reservation を一度だけ安全側精算する。
 
-        global _startup_reset_done
-        if _startup_reset_done:
+        Returns:
+            None
+        """
+
+        global _startup_recovery_done
+        if _startup_recovery_done:
             return
-        async with _startup_reset_lock:
-            if _startup_reset_done:
+        async with _GetLoopLock(_startup_recovery_locks):
+            if _startup_recovery_done:
                 return
             try:
-                updated = await AIAPIUsageMonth.filter(
-                    reserved_total_tokens__gt=0,
-                ).update(
-                    reserved_total_tokens=0,
-                    reserved_estimated_cost_usd=_ZERO,
+                reservation_ids = await KonomiTVBS4KAIAPIUsageReservation.filter(
+                    state='Reserved',
+                ).values_list(
+                    'reservation_id',
+                    flat=True,
                 )
-                # cost だけ残っている行も掃除
-                updated += await AIAPIUsageMonth.filter(
-                    reserved_total_tokens=0,
-                    reserved_estimated_cost_usd__gt=_ZERO,
-                ).update(
-                    reserved_estimated_cost_usd=_ZERO,
-                )
-                if updated:
+                recovered_count = 0
+                # crash 前に課金が発生した可能性を捨てず、各予約上界を Settled へ一度だけ振り替える。
+                for reservation_id in reservation_ids:
+                    recovered = await cls._FinalizeReservation(
+                        str(reservation_id),
+                        final_state='Settled',
+                        unknown_interrupt=True,
+                    )
+                    if recovered:
+                        recovered_count += 1
+                if recovered_count > 0:
                     logging.info(
-                        f'[AIAPIUsageLedger] Cleared stale reserved usage on {updated} month row(s).',
+                        f'[AIAPIUsageLedger] Recovered {recovered_count} pending reservation(s).',
                     )
             except Exception as error:
-                # DB 未初期化などでは警告のみ（本体起動を止めない）。
+                # DB 未初期化などでは警告し、done にせず次回の Reserve / snapshot で再試行する。
                 logging.warning(
-                    f'[AIAPIUsageLedger] Failed to reset reserved usage: {error}',
+                    f'[AIAPIUsageLedger] Failed to recover pending reservations: {error}',
                 )
-            _startup_reset_done = True
+                return
+            _startup_recovery_done = True
 
     @classmethod
     async def Reserve(
@@ -179,7 +218,7 @@ class AIAPIUsageLedger:
             RecordedSeriesAIError: 上限超過。
         """
 
-        await cls.EnsureStartupReservedReset()
+        await cls.EnsureStartupReservationRecovery()
         month = year_month or CurrentYearMonth()
         billing = service.billing_mode
         if billing == 'Subscription':
@@ -206,7 +245,8 @@ class AIAPIUsageLedger:
             billing in {'Metered', 'Local'} and service.monthly_token_limit is not None
         )
 
-        async with _reserve_lock:
+        reservation_id = str(uuid.uuid4())
+        async with _GetLoopLock(_reserve_locks):
             async with in_transaction() as connection:
                 row = await AIAPIUsageMonth.filter(
                     service_id=service.service_id,
@@ -253,6 +293,17 @@ class AIAPIUsageLedger:
                             http_status=429,
                         )
 
+                # reservation 行と月次予約値を同じ transaction で作り、片方だけ残る状態を防ぐ。
+                await KonomiTVBS4KAIAPIUsageReservation.create(
+                    reservation_id=reservation_id,
+                    service_id=service.service_id,
+                    year_month=month,
+                    billing_mode_snapshot=billing,
+                    state='Reserved',
+                    reserved_total_tokens=tokens,
+                    reserved_estimated_cost_usd=cost,
+                    using_db=connection,
+                )
                 row.reserved_total_tokens = int(row.reserved_total_tokens) + tokens
                 row.reserved_estimated_cost_usd = (
                     _asDecimal(row.reserved_estimated_cost_usd) + cost
@@ -271,7 +322,7 @@ class AIAPIUsageLedger:
                 )
 
         return AIAPIUsageReservation(
-            reservation_id=str(uuid.uuid4()),
+            reservation_id=reservation_id,
             service_id=service.service_id,
             year_month=month,
             billing_mode=billing,
@@ -286,95 +337,170 @@ class AIAPIUsageLedger:
         reservation: AIAPIUsageReservation,
         usage: OpenCodeNormalizedUsage | None = None,
         *,
-        free_failure: bool = False,
         unknown_interrupt: bool = False,
-    ) -> None:
-        """予約を精算または解放する。
+    ) -> bool:
+        """Reserved reservation を実 usage または予約上界で精算する。
 
         Args:
             reservation: Reserve の戻り値。
-            usage: 実 usage。free_failure 時は無視。
-            free_failure: 課金なし確定（予約解放のみ）。
+            usage: 実 usage。
             unknown_interrupt: 不明中断。予約額を settled へ振り替える。
+
+        Returns:
+            Reserved から Settled へ遷移できた場合だけ True。
+
+        Raises:
+            ValueError: usage なしで通常精算しようとした場合。
         """
 
         if reservation.skipped:
-            return
+            return False
+        if usage is None and unknown_interrupt is False:
+            raise ValueError('usage is required unless unknown_interrupt is true.')
+        return await cls._FinalizeReservation(
+            reservation.reservation_id,
+            final_state='Settled',
+            usage=usage,
+            unknown_interrupt=unknown_interrupt,
+        )
 
-        async with _reserve_lock:
+    @classmethod
+    async def Release(cls, reservation: AIAPIUsageReservation) -> bool:
+        """Reserved reservation を課金なしとして解放する。
+
+        Args:
+            reservation: Reserve の戻り値。
+
+        Returns:
+            Reserved から Released へ遷移できた場合だけ True。
+        """
+
+        if reservation.skipped:
+            return False
+        return await cls._FinalizeReservation(
+            reservation.reservation_id,
+            final_state='Released',
+        )
+
+    @classmethod
+    async def _FinalizeReservation(
+        cls,
+        reservation_id: str,
+        *,
+        final_state: _FinalReservationState,
+        usage: OpenCodeNormalizedUsage | None = None,
+        unknown_interrupt: bool = False,
+    ) -> bool:
+        """reservation を compare-and-set し、勝者だけが月次集約を更新する。
+
+        Args:
+            reservation_id: 永続 reservation UUID。
+            final_state: Settled または Released。
+            usage: Settled へ反映する実 usage。
+            unknown_interrupt: 実 usage 不明のため予約上界を確定値にするか。
+
+        Returns:
+            Reserved から final_state へ遷移できた場合だけ True。
+        """
+
+        async with _GetLoopLock(_reserve_locks):
             async with in_transaction() as connection:
-                row = await AIAPIUsageMonth.filter(
-                    service_id=reservation.service_id,
-                    year_month=reservation.year_month,
+                reservation_row = await KonomiTVBS4KAIAPIUsageReservation.filter(
+                    reservation_id=reservation_id,
                 ).using_db(connection).first()
-                if row is None:
+                if reservation_row is None:
                     logging.warning(
-                        '[AIAPIUsageLedger] Settle target month row missing '
-                        f'(service={reservation.service_id}, month={reservation.year_month}).',
+                        '[AIAPIUsageLedger] Reservation not found during finalization '
+                        f'(reservation_id={reservation_id}).',
                     )
-                    return
+                    return False
+                if reservation_row.state != 'Reserved':
+                    return False
 
-                # 予約を戻す（下限 0）。
-                row.reserved_total_tokens = max(
+                month_row = await AIAPIUsageMonth.filter(
+                    service_id=reservation_row.service_id,
+                    year_month=reservation_row.year_month,
+                ).using_db(connection).first()
+                if month_row is None:
+                    logging.warning(
+                        '[AIAPIUsageLedger] Reservation month row missing '
+                        f'(reservation_id={reservation_id}, service={reservation_row.service_id}, '
+                        f'month={reservation_row.year_month}).',
+                    )
+                    return False
+
+                add_prompt = 0
+                add_completion = 0
+                add_tokens = 0
+                add_cost = _ZERO
+                if final_state == 'Settled':
+                    if unknown_interrupt:
+                        # crash / timeout は課金済みの可能性があるため、予約上界を安全側で確定する。
+                        add_tokens = max(0, int(reservation_row.reserved_total_tokens))
+                        add_completion = add_tokens
+                        add_cost = max(
+                            _ZERO,
+                            _asDecimal(reservation_row.reserved_estimated_cost_usd),
+                        )
+                    elif usage is not None:
+                        add_prompt = max(0, int(usage.get('prompt_tokens') or 0))
+                        add_completion = max(0, int(usage.get('completion_tokens') or 0))
+                        reasoning = max(0, int(usage.get('reasoning_tokens') or 0))
+                        add_tokens = max(
+                            0,
+                            int(usage.get('total_tokens') or (add_prompt + add_completion + reasoning)),
+                        )
+                        raw_cost = usage.get('estimated_cost_usd')
+                        add_cost = max(
+                            _ZERO,
+                            _asDecimal(raw_cost) if raw_cost is not None else _ZERO,
+                        )
+                    else:
+                        raise ValueError('usage is required to settle a reservation.')
+
+                    # Local は実 usage に料金が含まれても cost 集計へ加えない。
+                    if reservation_row.billing_mode_snapshot == 'Local':
+                        add_cost = _ZERO
+
+                # 状態がまだ Reserved の場合だけ更新する。0 rows は別 retry が先に確定済み。
+                updated = await KonomiTVBS4KAIAPIUsageReservation.filter(
+                    reservation_id=reservation_id,
+                    state='Reserved',
+                ).using_db(connection).update(
+                    state=final_state,
+                    settled_prompt_tokens=add_prompt,
+                    settled_completion_tokens=add_completion,
+                    settled_total_tokens=add_tokens,
+                    settled_estimated_cost_usd=add_cost,
+                    updated_at=datetime.now(tz=JST),
+                )
+                if updated != 1:
+                    return False
+
+                # CAS 勝者だけが予約値を戻し、Settled の場合だけ確定実績を1回加算する。
+                month_row.reserved_total_tokens = max(
                     0,
-                    int(row.reserved_total_tokens) - int(reservation.reserved_total_tokens),
+                    int(month_row.reserved_total_tokens)
+                    - int(reservation_row.reserved_total_tokens),
                 )
-                row.reserved_estimated_cost_usd = max(
+                month_row.reserved_estimated_cost_usd = max(
                     _ZERO,
-                    _asDecimal(row.reserved_estimated_cost_usd)
-                    - _asDecimal(reservation.reserved_estimated_cost_usd),
+                    _asDecimal(month_row.reserved_estimated_cost_usd)
+                    - _asDecimal(reservation_row.reserved_estimated_cost_usd),
                 )
-
-                if free_failure:
-                    await row.save(
-                        update_fields=[
-                            'reserved_total_tokens',
-                            'reserved_estimated_cost_usd',
-                            'updated_at',
-                        ],
-                        using_db=connection,
+                if final_state == 'Settled':
+                    month_row.settled_prompt_tokens = (
+                        int(month_row.settled_prompt_tokens) + add_prompt
                     )
-                    return
-
-                if unknown_interrupt:
-                    # 安全側: 予約見積を確定へ。
-                    add_tokens = int(reservation.reserved_total_tokens)
-                    add_cost = _asDecimal(reservation.reserved_estimated_cost_usd)
-                    add_prompt = 0
-                    add_completion = add_tokens
-                elif usage is not None:
-                    add_prompt = max(0, int(usage.get('prompt_tokens') or 0))
-                    add_completion = max(0, int(usage.get('completion_tokens') or 0))
-                    reasoning = max(0, int(usage.get('reasoning_tokens') or 0))
-                    add_tokens = max(
-                        0,
-                        int(usage.get('total_tokens') or (add_prompt + add_completion + reasoning)),
+                    month_row.settled_completion_tokens = (
+                        int(month_row.settled_completion_tokens) + add_completion
                     )
-                    raw_cost = usage.get('estimated_cost_usd')
-                    add_cost = _asDecimal(raw_cost) if raw_cost is not None else _ZERO
-                else:
-                    # usage 無し・free でも unknown でもない → 予約解放のみ
-                    await row.save(
-                        update_fields=[
-                            'reserved_total_tokens',
-                            'reserved_estimated_cost_usd',
-                            'updated_at',
-                        ],
-                        using_db=connection,
+                    month_row.settled_total_tokens = int(month_row.settled_total_tokens) + add_tokens
+                    month_row.settled_estimated_cost_usd = (
+                        _asDecimal(month_row.settled_estimated_cost_usd) + add_cost
                     )
-                    return
-
-                if reservation.billing_mode == 'Local':
-                    add_cost = _ZERO
-
-                row.settled_prompt_tokens = int(row.settled_prompt_tokens) + add_prompt
-                row.settled_completion_tokens = int(row.settled_completion_tokens) + add_completion
-                row.settled_total_tokens = int(row.settled_total_tokens) + add_tokens
-                row.settled_estimated_cost_usd = (
-                    _asDecimal(row.settled_estimated_cost_usd) + add_cost
-                )
-                row.settled_request_count = int(row.settled_request_count) + 1
-                await row.save(
+                    month_row.settled_request_count = int(month_row.settled_request_count) + 1
+                await month_row.save(
                     update_fields=[
                         'reserved_total_tokens',
                         'reserved_estimated_cost_usd',
@@ -387,6 +513,7 @@ class AIAPIUsageLedger:
                     ],
                     using_db=connection,
                 )
+                return True
 
     @classmethod
     async def GetMonthSnapshot(
@@ -405,7 +532,7 @@ class AIAPIUsageLedger:
             集約値と上限状態。行が無ければ 0 埋め。
         """
 
-        await cls.EnsureStartupReservedReset()
+        await cls.EnsureStartupReservationRecovery()
         month = year_month or CurrentYearMonth()
         row = await AIAPIUsageMonth.filter(
             service_id=service.service_id,
@@ -477,7 +604,7 @@ class AIAPIUsageLedger:
             行が無ければ None。
         """
 
-        await cls.EnsureStartupReservedReset()
+        await cls.EnsureStartupReservationRecovery()
         month = year_month or CurrentYearMonth()
         row = await AIAPIUsageMonth.filter(
             service_id=service_id.strip().lower(),
@@ -550,7 +677,7 @@ class AIAPIUsageLedger:
         for service in services:
             result.append(await cls.GetMonthSnapshot(service, year_month=month))
         if include_deleted:
-            await cls.EnsureStartupReservedReset()
+            await cls.EnsureStartupReservationRecovery()
             orphan_rows = await AIAPIUsageMonth.filter(year_month=month).exclude(
                 service_id__in=list(known_ids) if known_ids else ['__none__'],
             )

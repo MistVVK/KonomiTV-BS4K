@@ -33,7 +33,7 @@ class AIAPIUsageMonth(TortoiseModel):
         decimal_places=8,
         default=Decimal('0'),
     )
-    # 進行中呼び出しの予約。プロセス再起動時に Ledger が 0 へ戻す。
+    # 進行中呼び出しの予約。下の reservation 行の Reserved 状態と常に対応する。
     reserved_total_tokens = fields.IntField(default=0)
     reserved_estimated_cost_usd = fields.DecimalField(
         max_digits=16,
@@ -46,5 +46,39 @@ class AIAPIUsageMonth(TortoiseModel):
     opencode_provider_id_snapshot = fields.CharField(64)
     opencode_model_id_snapshot = fields.CharField(255)
     billing_mode_snapshot = fields.CharField(32)
+    created_at = fields.DatetimeField(auto_now_add=True)
+    updated_at = fields.DatetimeField(auto_now=True)
+
+
+class KonomiTVBS4KAIAPIUsageReservation(TortoiseModel):
+    """BS4K AI API 呼び出し1回分の予約・精算状態を永続化する。"""
+
+    class Meta(TortoiseModel.Meta):
+        table: str = 'konomitv_bs4k_ai_api_usage_reservations'
+
+    # 呼び出し側へ返す UUID。Settle / Release の compare-and-set キーとして使う。
+    reservation_id = fields.CharField(36, pk=True)
+    # 月次集約行を特定するキー。service 削除後も回復できるよう FK は張らない。
+    service_id = fields.CharField(36, index=True)
+    year_month = fields.CharField(7, index=True)
+    billing_mode_snapshot = fields.CharField(32)
+    # Reserved から Settled または Released への一方向状態遷移だけを許可する。
+    state = fields.CharField(16, default='Reserved', index=True)
+    # Reserve 時に月次集約へ加算した上界値。再起動回復でもこの値を使用する。
+    reserved_total_tokens = fields.IntField(default=0)
+    reserved_estimated_cost_usd = fields.DecimalField(
+        max_digits=16,
+        decimal_places=8,
+        default=Decimal('0'),
+    )
+    # Settled 時に月次集約へ反映した確定値。Released の場合はすべて 0 のまま。
+    settled_prompt_tokens = fields.IntField(default=0)
+    settled_completion_tokens = fields.IntField(default=0)
+    settled_total_tokens = fields.IntField(default=0)
+    settled_estimated_cost_usd = fields.DecimalField(
+        max_digits=16,
+        decimal_places=8,
+        default=Decimal('0'),
+    )
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)

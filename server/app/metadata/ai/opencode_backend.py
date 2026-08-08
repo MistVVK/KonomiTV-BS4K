@@ -799,7 +799,10 @@ class OpenCodeBackend:
         settled = False
         try:
             result, usage = await operation()
-            await AIAPIUsageLedger.Settle(reservation, usage)
+            if usage is None:
+                await AIAPIUsageLedger.Release(reservation)
+            else:
+                await AIAPIUsageLedger.Settle(reservation, usage)
             settled = True
             return result
         except RecordedSeriesAIError as error:
@@ -814,10 +817,10 @@ class OpenCodeBackend:
                 'EmptyCandidateSet',
             }
             if error.code in free_codes:
-                await AIAPIUsageLedger.Settle(reservation, free_failure=True)
+                await AIAPIUsageLedger.Release(reservation)
             elif error.http_status in {401, 403}:
                 # 認証失敗は通常課金されない。
-                await AIAPIUsageLedger.Settle(reservation, free_failure=True)
+                await AIAPIUsageLedger.Release(reservation)
             else:
                 # timeout / 5xx / schema 失敗後など: 実 usage を部分回収できていないため
                 # 予約見積を安全側で settled へ振り替える（unknown_interrupt）。

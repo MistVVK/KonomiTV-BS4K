@@ -94,8 +94,16 @@ def _skip_monthly_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
     ) -> None:
         return None
 
+    async def FakeRelease(
+        _cls: type[AIAPIUsageLedger],
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        return None
+
     monkeypatch.setattr(AIAPIUsageLedger, 'Reserve', classmethod(FakeReserve))
     monkeypatch.setattr(AIAPIUsageLedger, 'Settle', classmethod(FakeSettle))
+    monkeypatch.setattr(AIAPIUsageLedger, 'Release', classmethod(FakeRelease))
 
 
 def _program() -> RecordedSeriesProgramPrompt:
