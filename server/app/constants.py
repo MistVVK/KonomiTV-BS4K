@@ -62,12 +62,15 @@ JIKKYO_CHANNELS_PATH = STATIC_DIR / 'jikkyo_channels.json'
 
 # ログディレクトリ
 LOGS_DIR = BASE_DIR / 'logs'
-## サーバーログのアーカイブ（日付別ログ）を格納するサブディレクトリ
+## サーバーログ・アクセスログのアーカイブ（日付別ログ）を格納するサブディレクトリ
 ## ログディレクトリ直下にアーカイブが大量に並ぶとノイズになるため、サブディレクトリに分離する
 LOGS_ARCHIVES_DIR = LOGS_DIR / 'archives'
 ## サーバーログのアーカイブの保持期限 (日数)
 ## 30 日を超えたアーカイブログを自動削除する
 SERVER_LOG_ARCHIVE_RETENTION_DAYS: int | None = 30
+## アクセスログのアーカイブの保持期限 (日数)
+## 30 日を超えたアーカイブログを自動削除する
+ACCESS_LOG_ARCHIVE_RETENTION_DAYS: int | None = 30
 ## KonomiTV-BS4K のサーバーログのパス
 KONOMITV_SERVER_LOG_PATH = LOGS_DIR / 'KonomiTV-BS4K-Server.log'
 ## KonomiTV-BS4K のアクセスログのパス
@@ -221,10 +224,10 @@ LOGGING_CONFIG: dict[str, Any] = {
         },
         'access_file': {
             'formatter': 'access_file',
-            'class': 'app.utils.LogRotation.SecureFileHandler',
+            'class': 'app.utils.LogRotation.DailyRotatingFileHandler',
             'filename': KONOMITV_ACCESS_LOG_PATH,
-            'mode': 'a',
             'encoding': 'utf-8',
+            'retention_days': ACCESS_LOG_ARCHIVE_RETENTION_DAYS,
         },
     },
     'loggers': {

@@ -385,8 +385,7 @@ class DailyRotatingFileHandler(TimedRotatingFileHandler):
             self._using_safe_sink = True
             return open(os.devnull, mode='a', encoding=self.encoding or 'utf-8', errors=self.errors)
 
-    @staticmethod
-    def _namer(default_name: str) -> str:
+    def _namer(self, default_name: str) -> str:
         """
         ローテーション後のファイル名を archives ディレクトリ配下に変換する。
 
@@ -398,7 +397,7 @@ class DailyRotatingFileHandler(TimedRotatingFileHandler):
         """
 
         date_suffix = default_name.rsplit('.', 1)[1]
-        return str(GetArchiveFilePath(date_suffix))
+        return str(GetArchiveFilePath(date_suffix, Path(self.baseFilename)))
 
     def doRollover(self) -> None:
         """
@@ -422,7 +421,7 @@ class DailyRotatingFileHandler(TimedRotatingFileHandler):
             if self.delay is False:
                 self.stream = self._open()
             self.rolloverAt = self.computeRollover(current_time)
-            CleanupOldArchiveLogs(self.retention_days)
+            CleanupOldArchiveLogs(self.retention_days, Path(self.baseFilename))
             return
 
         # ハンドラー設定に応じて、ローテーション対象日時の time tuple を取得する
@@ -512,15 +511,16 @@ class DailyRotatingFileHandler(TimedRotatingFileHandler):
         self.rolloverAt = self.computeRollover(current_time)
 
         # ローテーション完了後に期限切れアーカイブを整理する
-        CleanupOldArchiveLogs(self.retention_days)
+        CleanupOldArchiveLogs(self.retention_days, Path(self.baseFilename))
 
 
-def GetArchiveFilePath(date_key: str) -> Path:
+def GetArchiveFilePath(date_key: str, log_path: Path | None = None) -> Path:
     """
     日付キー (YYYYMMDD) からアーカイブファイルのパスを生成する。
 
     Args:
         date_key (str): 日付キー（例: '20260212'）
+        log_path (Path | None): アーカイブ元ログ。None の場合はサーバーログ。
 
     Returns:
         Path: アーカイブファイルのパス（例: logs/archives/KonomiTV-BS4K-Server.20260212.log）
@@ -528,15 +528,17 @@ def GetArchiveFilePath(date_key: str) -> Path:
 
     # アーカイブ命名規則を 1 箇所に集約して、生成と解析の不一致を防ぐ
     ## 例: KonomiTV-BS4K-Server.log -> KonomiTV-BS4K-Server.20260212.log
-    return LOGS_ARCHIVES_DIR / f'{KONOMITV_SERVER_LOG_PATH.stem}.{date_key}{KONOMITV_SERVER_LOG_PATH.suffix}'
+    source_log_path = KONOMITV_SERVER_LOG_PATH if log_path is None else log_path
+    return LOGS_ARCHIVES_DIR / f'{source_log_path.stem}.{date_key}{source_log_path.suffix}'
 
 
-def CleanupOldArchiveLogs(retention_days: int | None) -> None:
+def CleanupOldArchiveLogs(retention_days: int | None, log_path: Path | None = None) -> None:
     """
     保存期間を超えたアーカイブログを削除する。
 
     Args:
         retention_days (int | None): アーカイブ保持日数。None の場合は無期限保持。
+        log_path (Path | None): 整理対象のアーカイブ元ログ。None の場合はサーバーログ。
     """
 
     # 保持日数が無効（未設定または 0 以下）の場合は、安全のため削除処理を行わない
@@ -549,6 +551,11 @@ def CleanupOldArchiveLogs(retention_days: int | None) -> None:
     delete_before_date = today_in_jst - timedelta(days=retention_days)
 
     # アーカイブディレクトリ自体を symlink 追跡なしで開き、相対 unlink の基準 FD とする
+    source_log_path = KONOMITV_SERVER_LOG_PATH if log_path is None else log_path
+    archive_file_pattern = ARCHIVE_FILE_PATTERN if log_path is None else re.compile(
+        rf'^{re.escape(source_log_path.stem)}\.(\d{{8}}){re.escape(source_log_path.suffix)}$',
+    )
+
     try:
         archive_directory_fd = OpenSecureLogDirectory(LOGS_ARCHIVES_DIR)
     except FileNotFoundError:
@@ -561,7 +568,7 @@ def CleanupOldArchiveLogs(retention_days: int | None) -> None:
         # 命名規則に一致し、安全性を確認できた regular file だけをクリーンアップする
         with os.scandir(archive_directory_fd) as entries:
             for entry in entries:
-                match = ARCHIVE_FILE_PATTERN.match(entry.name)
+                match = archive_file_pattern.match(entry.name)
 
                 # 命名規則から外れるファイルは、他用途の可能性があるため触らない
                 if match is None:

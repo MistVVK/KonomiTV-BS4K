@@ -1,12 +1,14 @@
 
 import asyncio
+import io
 import json
 import os
+import pathlib
 import signal
 import sys
 import threading
 import time
-from collections.abc import Coroutine
+from collections.abc import Coroutine, Iterator
 from typing import Annotated, Any, Literal, cast
 
 import anyio
@@ -37,6 +39,7 @@ from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.utils.LogRotation import OpenSecureLogFile
 
 
 # ルーター
@@ -50,6 +53,154 @@ batch_scan_task: asyncio.Task[None] | None = None
 metadata_reanalysis_task: asyncio.Task[None] | None = None
 cm_detection_task: asyncio.Task[None] | None = None
 background_analysis_task: asyncio.Task[None] | None = None
+
+# SSE 初回接続時に返すログ量の上限
+# 行数とbyte数の両方を制限し、長期稼働後もファイル全体に比例したメモリを消費しないようにする
+LOG_STREAM_INITIAL_MAX_LINES = 1000
+LOG_STREAM_INITIAL_MAX_BYTES = 1024 * 1024
+# リアルタイム追従時に1回で読み込む上限
+LOG_STREAM_UPDATE_READ_BYTES = 256 * 1024
+
+
+def ReadLogTail(log_file: io.TextIOWrapper, max_bytes: int, max_lines: int) -> tuple[list[str], int]:
+    """ログFDの末尾をbyte・行数上限付きで読み込む。
+
+    Args:
+        log_file: OpenSecureLogFile() で検証済みのテキストストリーム。
+        max_bytes: 末尾から読み込む最大byte数。
+        max_lines: 返す最大行数。
+
+    Returns:
+        初期表示するログ行と、読み取り完了後のbyte位置。
+    """
+
+    binary_file = cast(io.BufferedReader, log_file.buffer)
+    file_size = os.fstat(log_file.fileno()).st_size
+    read_start = max(0, file_size - max_bytes)
+    binary_file.seek(read_start)
+
+    # ファイル途中から読み始める場合、切断された先頭行を捨てて次の完全な行から返す
+    if read_start > 0:
+        binary_file.readline()
+    log_bytes = binary_file.read(max_bytes)
+    current_position = binary_file.tell()
+    lines = [
+        line.decode('utf-8', errors='replace').rstrip('\r\n')
+        for line in log_bytes.splitlines(keepends=True)
+        if line.strip()
+    ]
+    return lines[-max_lines:], current_position
+
+
+def IterLogStreamEvents(
+    log_path: pathlib.Path,
+    poll_interval: float = 0.5,
+    initial_max_bytes: int = LOG_STREAM_INITIAL_MAX_BYTES,
+    initial_max_lines: int = LOG_STREAM_INITIAL_MAX_LINES,
+) -> Iterator[dict[str, str]]:
+    """ログ末尾と追記をrotationへ追従しながらSSEイベントとして返す。
+
+    Args:
+        log_path: 追従するログファイルのパス。
+        poll_interval: ファイル更新を確認する間隔（秒）。
+        initial_max_bytes: 初回読み込みの最大byte数。
+        initial_max_lines: 初回読み込みの最大行数。
+
+    Yields:
+        EventSourceResponseへ渡すSSEイベント。
+    """
+
+    log_file = OpenSecureLogFile(log_path, mode='r', encoding='utf-8', errors='replace', file_mode=None)
+    pending_line = b''
+
+    def ReadUpdates(read_limit: int) -> Iterator[dict[str, str]]:
+        """現在のFDから上限付きで追記を読み、完全な行だけをイベント化する。
+
+        Args:
+            read_limit: 1回で読み込む最大byte数。
+
+        Yields:
+            完全な追記行に対応するSSEイベント。
+        """
+
+        nonlocal pending_line
+        binary_file = cast(io.BufferedReader, log_file.buffer)
+        update_bytes = binary_file.read(read_limit)
+        if update_bytes == b'':
+            return
+        split_lines = (pending_line + update_bytes).splitlines(keepends=True)
+        pending_line = b''
+        for index, line in enumerate(split_lines):
+            is_complete = line.endswith((b'\n', b'\r'))
+            if is_complete is False and index == len(split_lines) - 1:
+                pending_line = line
+                continue
+            decoded_line = line.decode('utf-8', errors='replace').rstrip('\r\n')
+            if decoded_line:
+                yield {
+                    'event': 'log_update',
+                    'data': json.dumps(decoded_line, ensure_ascii=False),
+                }
+
+    try:
+        initial_lines, current_position = ReadLogTail(log_file, initial_max_bytes, initial_max_lines)
+        current_file_stat = os.fstat(log_file.fileno())
+        current_identity = (current_file_stat.st_dev, current_file_stat.st_ino)
+        yield {
+            'event': 'initial_log_update',
+            'data': json.dumps(initial_lines, ensure_ascii=False),
+        }
+
+        while True:
+            # rotationで固定パスのinodeが変わった場合、旧FDの最終追記を排出してから新しいログへ切り替える
+            try:
+                path_stat = os.stat(log_path, follow_symlinks=False)
+                path_identity = (path_stat.st_dev, path_stat.st_ino)
+            except FileNotFoundError:
+                time.sleep(poll_interval)
+                continue
+
+            if path_identity != current_identity:
+                old_file_size = os.fstat(log_file.fileno()).st_size
+                old_binary_file = cast(io.BufferedReader, log_file.buffer)
+                old_binary_file.seek(current_position)
+                while current_position < old_file_size:
+                    yield from ReadUpdates(LOG_STREAM_UPDATE_READ_BYTES)
+                    current_position = old_binary_file.tell()
+
+                # 新しい固定パスが安全に開けるまで旧FDを保持し、unsafe pathを追跡しない
+                try:
+                    new_log_file = OpenSecureLogFile(
+                        log_path,
+                        mode='r',
+                        encoding='utf-8',
+                        errors='replace',
+                        file_mode=None,
+                    )
+                except OSError:
+                    time.sleep(poll_interval)
+                    continue
+                log_file.close()
+                log_file = new_log_file
+                current_file_stat = os.fstat(log_file.fileno())
+                current_identity = (current_file_stat.st_dev, current_file_stat.st_ino)
+                current_position = 0
+                pending_line = b''
+
+            # copytruncateなど同一inodeの縮小時は先頭へ戻り、新しい内容を取りこぼさない
+            current_file_size = os.fstat(log_file.fileno()).st_size
+            if current_file_size < current_position:
+                current_position = 0
+                pending_line = b''
+            current_binary_file = cast(io.BufferedReader, log_file.buffer)
+            current_binary_file.seek(current_position)
+            while current_position < current_file_size:
+                yield from ReadUpdates(LOG_STREAM_UPDATE_READ_BYTES)
+                current_position = current_binary_file.tell()
+
+            time.sleep(poll_interval)
+    finally:
+        log_file.close()
 
 
 @router.get(
@@ -71,11 +222,11 @@ def LogStreamAPI(
     サーバーログまたはアクセスログを Server-Sent Events で随時配信する。
 
     イベントには、
-    - 初回にログファイルの先頭から現在の最新行までのすべての行を送信する **initial_log_update**
+    - 初回にログファイル末尾の上限付き範囲を送信する **initial_log_update**
     - リアルタイムに追加されたログを送信する **log_update**
     の2種類がある。
 
-    初回接続時にはログファイルの先頭から現在の最新行までのすべての行が initial_log_update イベントで一括送信され、<br>
+    初回接続時にはログファイル末尾の最大1000行・1MiBが initial_log_update イベントで一括送信され、<br>
     その後ログに更新があれば log_update イベントで1行ずつ送信される。
 
     ファイル I/O を伴うため敢えて同期関数として実装している。<br>
@@ -93,51 +244,8 @@ def LogStreamAPI(
             detail = f'Log file not found: {log_path}',
         )
 
-    # ログの変更を監視し、変更があればログ行をイベントストリームとして出力する
-    def generator():
-        """イベントストリームを出力するジェネレーター"""
-
-        # ファイルを開く
-        ## ログファイルは基本 UTF-8 だが、稀に外部プロセス由来の文字化けや別エンコーディングが混入し、
-        ## UTF-8 としてデコードできないバイト列が含まれることがある
-        ## その場合でもログストリームの配信を継続できるよう、errors='replace' でデコード不能なバイトは
-        ## 置換文字 (U+FFFD) に置き換えて読み取る
-        with open(log_path, encoding='utf-8', errors='replace') as f:
-            # 初回接続時に全ての行を送信
-            all_lines = [line.rstrip('\n') for line in f.readlines() if line.strip()]  # 空行は除外
-            yield {
-                'event': 'initial_log_update',
-                'data': json.dumps(all_lines, ensure_ascii=False),
-            }
-
-            # ファイルの現在位置を記録
-            current_position = f.tell()
-
-            # 継続的に新しい行を監視
-            while True:
-                # ファイルが更新されたかチェック
-                f.seek(0, os.SEEK_END)
-                if f.tell() > current_position:
-                    # ファイルが更新された場合、前回の位置に戻る
-                    f.seek(current_position)
-
-                    # 新しい行を読み込む
-                    for line in f:
-                        line = line.rstrip('\n')
-                        if line:  # 空行は送信しない
-                            yield {
-                                'event': 'log_update',
-                                'data': json.dumps(line, ensure_ascii=False),
-                            }
-
-                    # 現在位置を更新
-                    current_position = f.tell()
-
-                # 少し待機
-                time.sleep(0.5)
-
     # EventSourceResponse でイベントストリームを配信する
-    return EventSourceResponse(generator())
+    return EventSourceResponse(IterLogStreamEvents(log_path))
 
 
 @router.post(

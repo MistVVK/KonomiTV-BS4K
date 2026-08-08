@@ -385,6 +385,49 @@ def test_dual_daily_handlers_share_one_safe_rollover(
     assert 'Refused unsafe log path' not in capsys.readouterr().err
 
 
+def test_access_log_daily_rotation_uses_distinct_archive_and_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """access logを固有名で日次rotateし、retentionがserver log archiveへ干渉しないことを検証する。
+
+    Args:
+        tmp_path: pytestが提供する一時ディレクトリ。
+        monkeypatch: archive directoryを一時パスへ差し替えるfixture。
+
+    Returns:
+        None
+    """
+
+    logs_directory = tmp_path / 'logs'
+    logs_directory.mkdir()
+    archives_directory = logs_directory / 'archives'
+    monkeypatch.setattr(LogRotation, 'LOGS_ARCHIVES_DIR', archives_directory)
+    access_log_path = logs_directory / 'KonomiTV-BS4K-Access.log'
+    handler = DailyRotatingFileHandler(access_log_path, encoding='utf-8', retention_days=30)
+    try:
+        handler.suffix = 'fixed'
+        handler.emit(logging.LogRecord('access', logging.INFO, __file__, 1, 'before', (), None))
+        handler.flush()
+        handler.doRollover()
+    finally:
+        handler.close()
+
+    access_archive_path = archives_directory / 'KonomiTV-BS4K-Access.fixed.log'
+    assert access_archive_path.read_text(encoding='utf-8') == 'before\n'
+
+    old_date = timezone.now().date() - timedelta(days=60)
+    expired_access_archive = archives_directory / f'KonomiTV-BS4K-Access.{old_date:%Y%m%d}.log'
+    unrelated_server_archive = archives_directory / f'KonomiTV-BS4K-Server.{old_date:%Y%m%d}.log'
+    expired_access_archive.write_text('expired access', encoding='utf-8')
+    unrelated_server_archive.write_text('expired server', encoding='utf-8')
+
+    CleanupOldArchiveLogs(30, access_log_path)
+
+    assert expired_access_archive.exists() is False
+    assert unrelated_server_archive.read_text(encoding='utf-8') == 'expired server'
+
+
 def test_open_secure_log_directory_rejects_intermediate_symlink(tmp_path: Path) -> None:
     """
     途中 path 要素が symlink の場合、最終要素だけでなく中間も O_NOFOLLOW で拒否する。

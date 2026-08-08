@@ -23,7 +23,6 @@ from app.constants import (
     BASE_DIR,
     BS4K_VERSION,
     DATABASE_CONFIG,
-    KONOMITV_ACCESS_LOG_PATH,
     LIBRARY_PATH,
     LOGGING_CONFIG,
     RESTART_REQUIRED_LOCK_PATH,
@@ -155,14 +154,6 @@ def main(
     ## デフォルトを Asia/Tokyo に変更することで、万が一のタイムゾーン関連のバグを防ぐ防波堤としての意味合いもある
     os.environ['TZ'] = 'Asia/Tokyo'
     time.tzset()
-
-    # 前回のアクセスログを削除する
-    ## サーバーログは起動時に日付別分割されるため、ここでは削除しない
-    try:
-        # unlink() は symlink を追跡しないため、dangling symlink を含めて固定名だけを安全に削除できる
-        KONOMITV_ACCESS_LOG_PATH.unlink(missing_ok=True)
-    except PermissionError:
-        pass
 
     # サーバーログに過去日付のエントリが含まれている場合、日付別アーカイブに分割する
     ## DailyRotatingFileHandler がファイルを開く前に分割を完了させるために、ロガーの初期化前に実行する必要がある
