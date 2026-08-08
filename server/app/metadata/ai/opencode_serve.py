@@ -10,9 +10,11 @@ import atexit
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -43,10 +45,20 @@ from app.constants import (
 _process_lock = threading.RLock()
 # 自プロセスが spawn した Popen。None は未起動または外部回収のみ。
 _serve_process: subprocess.Popen[bytes] | None = None
+# 自プロセスが spawn した PID と Linux starttime。PID 再利用時の誤 kill 防止に使う。
+_serve_process_identity: _OpenCodeProcessIdentity | None = None
 # health 成功後に True。失敗・停止後は False。
 _opencode_available = False
 # atexit 登録は 1 回だけ。
 _atexit_registered = False
+
+
+@dataclass(frozen=True)
+class _OpenCodeProcessIdentity:
+    """OpenCode serve の PID と Linux 起動時刻を組にした identity。"""
+
+    pid: int
+    start_time_ticks: int
 
 
 def IsOpenCodeAvailable() -> bool:
@@ -93,6 +105,8 @@ def ResolveOpenCodeExecutable() -> Path | None:
     return None
 
 
+
+
 def EnsureOpenCodeRuntimeDirectories() -> None:
     """home / workspace / logs を作成し、製品用 config を seed する。
 
@@ -135,11 +149,58 @@ def EnsureOpenCodeRuntimeDirectories() -> None:
         break
 
 
-def _readPidFile() -> int | None:
-    """PID ファイルから整数 PID を読む。
+
+def _ReadProcessStartTime(pid: int) -> int | None:
+    """Linux /proc から PID の starttime tick を読む。
+
+    Args:
+        pid: 読み取り対象 PID。
 
     Returns:
-        PID。不正・不在時は None。
+        /proc/<pid>/stat field 22 の starttime。不在・不正なら None。
+    """
+
+    try:
+        process_stat = Path(f'/proc/{pid}/stat').read_text(encoding='utf-8')
+    except OSError:
+        return None
+    # comm field は空白や ')' を含み得るため、最後の ')' より後ろから field 3 以降を分割する。
+    _prefix, separator, remaining_fields_text = process_stat.rpartition(')')
+    if separator == '':
+        return None
+    remaining_fields = remaining_fields_text.strip().split()
+    # remaining_fields[0] が field 3 (state) なので field 22 (starttime) は index 19。
+    if len(remaining_fields) <= 19 or remaining_fields[19].isdigit() is False:
+        return None
+    start_time_ticks = int(remaining_fields[19])
+    if start_time_ticks <= 0:
+        return None
+    return start_time_ticks
+
+
+def _GetProcessIdentity(pid: int) -> _OpenCodeProcessIdentity | None:
+    """現在の PID から再利用検証用 identity を構築する。
+
+    Args:
+        pid: 対象 PID。
+
+    Returns:
+        有効な PID/starttime。対象が不在・不正なら None。
+    """
+
+    if pid <= 1:
+        return None
+    start_time_ticks = _ReadProcessStartTime(pid)
+    if start_time_ticks is None:
+        return None
+    return _OpenCodeProcessIdentity(pid=pid, start_time_ticks=start_time_ticks)
+
+
+def _readPidFile() -> _OpenCodeProcessIdentity | None:
+    """PID ファイルから PID と starttime の組を読む。
+
+    Returns:
+        process identity。不正・不在・旧 PID 単独形式なら None。
     """
 
     if OPENCODE_SERVE_PID_PATH.is_file() is False:
@@ -148,19 +209,42 @@ def _readPidFile() -> int | None:
         raw = OPENCODE_SERVE_PID_PATH.read_text(encoding='utf-8').strip()
     except OSError:
         return None
-    if raw.isdigit() is False:
+    fields = raw.split()
+    # PID 単独の旧形式は starttime を証明できず、PID 再利用時の誤 kill になるため受理しない。
+    if len(fields) != 2 or any(field.isdigit() is False for field in fields):
         return None
-    pid = int(raw)
-    if pid <= 1:
+    pid = int(fields[0])
+    start_time_ticks = int(fields[1])
+    if pid <= 1 or start_time_ticks <= 0:
         return None
-    return pid
+    return _OpenCodeProcessIdentity(pid=pid, start_time_ticks=start_time_ticks)
 
 
-def _isProcessAlive(pid: int) -> bool:
-    """PID が生存しているか（権限不足は生存扱い）を返す。"""
+def _IsProcessIdentityCurrent(identity: _OpenCodeProcessIdentity) -> bool:
+    """PID が現在も保存済み starttime と一致するかを返す。
+
+    Args:
+        identity: 検証する PID/starttime。
+
+    Returns:
+        同じプロセスが現在も存在すれば True。
+    """
+
+    return _ReadProcessStartTime(identity.pid) == identity.start_time_ticks
+
+
+def _IsProcessGroupAlive(process_group_id: int) -> bool:
+    """process group に signal 可能なプロセスが残っているかを返す。
+
+    Args:
+        process_group_id: 確認する process group ID。
+
+    Returns:
+        group が存在すれば True。権限不足も存在扱い。
+    """
 
     try:
-        os.kill(pid, 0)
+        os.killpg(process_group_id, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -195,24 +279,57 @@ def _isListeningOnProductPort() -> bool:
     return False
 
 
-def _terminatePid(pid: int, *, timeout_sec: float = 5.0) -> None:
-    """PID に SIGTERM → 待機 → 必要なら SIGKILL。"""
+def _TerminateProcessGroup(
+    identity: _OpenCodeProcessIdentity,
+    *,
+    process: subprocess.Popen[bytes] | subprocess.Popen[str] | None = None,
+    timeout_sec: float = 5.0,
+) -> None:
+    """identity を検証して process group へ TERM、待機、KILL の順で停止する。
 
-    if _isProcessAlive(pid) is False:
+    Args:
+        identity: 起動時に記録した PID/starttime。
+        process: 自プロセスが spawn した場合の Popen。poll で leader を reap する。
+        timeout_sec: SIGTERM 後に group の終了を待つ秒数。
+
+    Returns:
+        None
+    """
+
+    # PID が再利用済みなら無関係な process group へ signal を送らない。
+    if _IsProcessIdentityCurrent(identity) is False:
         return
     try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+        process_group_id = os.getpgid(identity.pid)
+    except (ProcessLookupError, PermissionError):
         return
-    except PermissionError:
+    # start_new_session=True の session leader だけを回収対象にし、呼び出し元 group を巻き込まない。
+    if process_group_id != identity.pid or _IsProcessIdentityCurrent(identity) is False:
         return
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+
+    # leader が zombie のままだと group 生存判定に残るため、管理中 Popen は poll で随時 reap する。
     deadline = time.monotonic() + timeout_sec
     while time.monotonic() < deadline:
-        if _isProcessAlive(pid) is False:
+        if process is not None:
+            process.poll()
+        if _IsProcessGroupAlive(process_group_id) is False:
             return
         time.sleep(0.1)
+
+    if process is not None:
+        process.poll()
+    if _IsProcessGroupAlive(process_group_id) is False:
+        return
+    # TERM 待機中に同じ PID が別プロセスへ再利用された場合は KILL を中止する。
+    current_start_time = _ReadProcessStartTime(identity.pid)
+    if current_start_time is not None and current_start_time != identity.start_time_ticks:
+        return
     try:
-        os.kill(pid, signal.SIGKILL)
+        os.killpg(process_group_id, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
 
@@ -228,14 +345,14 @@ def ReclaimStaleOpenCodeServe() -> None:
         None
     """
 
-    pid = _readPidFile()
-    if pid is not None:
-        if _isProcessAlive(pid):
-            _terminatePid(pid)
-        try:
-            OPENCODE_SERVE_PID_PATH.unlink(missing_ok=True)
-        except OSError:
-            pass
+    identity = _readPidFile()
+    if identity is not None:
+        _TerminateProcessGroup(identity)
+    # identity を証明できない旧形式・破損ファイルも signal は送らず破棄する。
+    try:
+        OPENCODE_SERVE_PID_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def CheckOpenCodeHealth(*, timeout_sec: float = OPENCODE_HEALTH_TIMEOUT_SEC) -> tuple[bool, str | None]:
@@ -265,14 +382,24 @@ def CheckOpenCodeHealth(*, timeout_sec: float = OPENCODE_HEALTH_TIMEOUT_SEC) -> 
     return True, version
 
 
-def _writePidFile(pid: int) -> None:
-    """PID を atomic に書き込む。"""
+def _writePidFile(identity: _OpenCodeProcessIdentity) -> None:
+    """PID と starttime を atomic に書き込む。
+
+    Args:
+        identity: spawn 直後に取得した PID/starttime。
+
+    Returns:
+        None
+    """
 
     OPENCODE_HOME_ROOT.mkdir(parents=True, exist_ok=True)
     temporary_path = OPENCODE_SERVE_PID_PATH.with_name(
         f'.{OPENCODE_SERVE_PID_PATH.name}.{os.getpid()}.tmp',
     )
-    temporary_path.write_text(f'{pid}\n', encoding='utf-8')
+    temporary_path.write_text(
+        f'{identity.pid} {identity.start_time_ticks}\n',
+        encoding='utf-8',
+    )
     os.chmod(temporary_path, 0o600)
     os.replace(temporary_path, OPENCODE_SERVE_PID_PATH)
 
@@ -284,25 +411,33 @@ def StopOpenCodeServe() -> None:
         None
     """
 
-    global _serve_process, _opencode_available
+    global _serve_process, _serve_process_identity, _opencode_available
     with _process_lock:
         process = _serve_process
+        managed_identity = _serve_process_identity
         _serve_process = None
+        _serve_process_identity = None
         _opencode_available = False
         if process is not None:
             if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
+                if managed_identity is not None:
+                    _TerminateProcessGroup(managed_identity, process=process)
+                else:
+                    # /proc identity 取得前の起動失敗だけは Popen が指す直接の子を最低限回収する。
+                    process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                # identity が無い例外経路では group を安全に特定できないため、直接の子だけを KILL する。
+                if managed_identity is None:
                     process.kill()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        pass
-        pid = _readPidFile()
-        if pid is not None:
-            _terminatePid(pid)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        persisted_identity = _readPidFile()
+        if persisted_identity is not None and persisted_identity != managed_identity:
+            _TerminateProcessGroup(persisted_identity)
         try:
             OPENCODE_SERVE_PID_PATH.unlink(missing_ok=True)
         except OSError:
@@ -318,7 +453,7 @@ def StartOpenCodeServe() -> bool:
         health 成功なら True。
     """
 
-    global _serve_process, _opencode_available, _atexit_registered
+    global _serve_process, _serve_process_identity, _opencode_available, _atexit_registered
 
     # logging は KonomiTV.py が SplitServerLog 後に import する。
     from app import logging
@@ -367,11 +502,8 @@ def StartOpenCodeServe() -> bool:
         environment['XDG_CONFIG_HOME'] = str(OPENCODE_XDG_CONFIG_HOME)
         environment['XDG_DATA_HOME'] = str(OPENCODE_XDG_DATA_HOME)
         # 監査用やユーザー shell の OPENCODE_* を持ち込まない。
-        # ただし OPENCODE_ENABLE_EXA は Exa AI のホスト型 websearch（API キー不要）を
-        # 有効化する機能フラグのため、製品 serve へ明示的に維持する。
-        allowed_opencode_env_keys = {'OPENCODE_ENABLE_EXA'}
         for key in list(environment):
-            if key.startswith('OPENCODE_') and key not in allowed_opencode_env_keys:
+            if key.startswith('OPENCODE_'):
                 environment.pop(key, None)
 
         try:
@@ -409,8 +541,16 @@ def StartOpenCodeServe() -> bool:
                 pass
 
         _serve_process = process
+        process_identity = _GetProcessIdentity(process.pid)
+        if process_identity is None:
+            logging.warning(
+                'Failed to capture OpenCode process identity. Stopping unmanaged child.',
+            )
+            StopOpenCodeServe()
+            return False
+        _serve_process_identity = process_identity
         try:
-            _writePidFile(process.pid)
+            _writePidFile(process_identity)
         except OSError as error:
             logging.warning(f'Failed to write OpenCode PID file: {error}')
 
@@ -459,7 +599,14 @@ def ProbeOpenCodeAvailability() -> dict[str, object]:
 
     with _process_lock:
         available = IsOpenCodeAvailable()
-        pid = _serve_process.pid if _serve_process is not None else _readPidFile()
+        persisted_identity = _readPidFile()
+        pid = (
+            _serve_process.pid
+            if _serve_process is not None
+            else persisted_identity.pid
+            if persisted_identity is not None
+            else None
+        )
     version: str | None = None
     if available:
         healthy, detail = CheckOpenCodeHealth()
