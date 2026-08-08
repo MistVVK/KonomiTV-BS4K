@@ -1733,27 +1733,24 @@ class _AcpDispatcher:
                 )
 
         observed_call = self._tool_calls[tool_call_id]
+        operation_kind = (
+            _normalizeToolIdentifier(cast(str, combined_update['kind']))
+            if classification in {'Verified', 'TargetNotExposed'}
+            else None
+        )
+        # F-03 / R-08: permission を要求しない agent でも standalone fetch は許可しない。
+        ## completed 後の拒否では host network への副作用を取り消せないため、
+        ## 初回 tool telemetry または search から fetch へ変化した時点で turn ごと停止する。
+        if operation_kind == 'fetch':
+            raise _AcpCancelRequiredError(
+                'ACP standalone fetch was blocked by the search-only egress policy.',
+                category='PermissionPolicy',
+            )
+
         status = update.get('status')
         if status in {'failed', 'cancelled'}:
             observed_call.failed = True
             self.capture_trace()
-            return
-        if classification == 'TargetNotExposed':
-            if status == 'completed':
-                raise _AcpCancelRequiredError(
-                    'ACP fetch completed without exposing a verifiable target.',
-                    category='PermissionPolicy',
-                )
-            return
-        operation_kind = _normalizeToolIdentifier(cast(str, combined_update['kind']))
-        if operation_kind == 'fetch':
-            if status == 'completed':
-                # hostname の文字列検査だけでは DNS rebinding / private 解決先を
-                # 防げないため、host-network 上の standalone fetch は許可しない。
-                raise _AcpCancelRequiredError(
-                    'ACP standalone fetch completed outside the permission policy.',
-                    category='PermissionPolicy',
-                )
             return
         if update_kind == 'tool_call_update':
             for citation in _extractVerifiedCompletedToolCitations(

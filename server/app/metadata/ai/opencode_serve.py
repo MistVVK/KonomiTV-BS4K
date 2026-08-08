@@ -12,6 +12,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -105,6 +106,100 @@ def ResolveOpenCodeExecutable() -> Path | None:
     return None
 
 
+def _ReadRegularFileText(path: Path) -> str | None:
+    """symlink を辿らず、通常ファイルだけを読む。
+
+    Args:
+        path: 読み取り対象パス。
+
+    Returns:
+        ファイル本文。不在なら None。
+
+    Raises:
+        OSError: symlink または通常ファイル以外の場合。
+    """
+
+    # open 前に lstat で判定し、symlink を明確なメッセージで拒否する。
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(path_stat.st_mode):
+        raise OSError(f'OpenCode product config path must not be a symlink: {path}')
+    if stat.S_ISREG(path_stat.st_mode) is False:
+        raise OSError(f'OpenCode product config must be a regular file: {path}')
+
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        file_stat = os.fstat(fd)
+        if stat.S_ISREG(file_stat.st_mode) is False:
+            raise OSError(f'OpenCode product config must be a regular file: {path}')
+        return os.read(fd, file_stat.st_size + 1).decode('utf-8')
+    finally:
+        os.close(fd)
+
+
+def _WriteOpenCodeConfigAtomically(path: Path, content: str) -> None:
+    """製品用 opencode.json を一時ファイル + fsync + replace で原子的に書く。
+
+    Args:
+        path: 最終 config パス。
+        content: テンプレート本文。
+
+    Returns:
+        None
+
+    Raises:
+        OSError: symlink 拒否、書き込み失敗、権限固定失敗。
+    """
+
+    # 最終パスが symlink のときは追跡せず拒否する。権限境界を差し替えられないようにする。
+    try:
+        path_stat = os.lstat(path)
+    except FileNotFoundError:
+        path_stat = None
+    if path_stat is not None and stat.S_ISLNK(path_stat.st_mode):
+        raise OSError(f'OpenCode product config path must not be a symlink: {path}')
+    if path_stat is not None and stat.S_ISREG(path_stat.st_mode) is False:
+        raise OSError(f'OpenCode product config must be a regular file: {path}')
+
+    directory = path.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary_fd, temporary_path = tempfile.mkstemp(
+        prefix='.opencode.json.',
+        suffix='.tmp',
+        dir=directory,
+    )
+    try:
+        with os.fdopen(temporary_fd, 'w', encoding='utf-8') as temporary_file:
+            temporary_file.write(content)
+            temporary_file.flush()
+            os.fchmod(temporary_file.fileno(), 0o600)
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+        # rename 後の directory entry も永続化し、再起動後に旧 allow 設定へ戻ることを防ぐ。
+        directory_fd = os.open(
+            directory,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary_path)
+        except OSError:
+            # 原因例外を隠さない。ランダム名の一時ファイルは製品configとして読み込まれない。
+            pass
+        raise
+
+    # replace 後の最終 inode を O_NOFOLLOW で開き、umask に依らず 0600 へ固定する。
+    final_fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(final_fd, 0o600)
+    finally:
+        os.close(final_fd)
 
 
 def EnsureOpenCodeRuntimeDirectories() -> None:
@@ -127,19 +222,31 @@ def EnsureOpenCodeRuntimeDirectories() -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     # OpenCode は XDG_CONFIG_HOME/opencode/opencode.json を読む。
+    # 製品用 agent permission はテンプレートが正本であり、起動のたびに同期する。
+    # R-08 の検索専用モード (websearch allow / webfetch deny) を既存 home へも適用する。
     config_dir = OPENCODE_XDG_CONFIG_HOME / 'opencode'
     config_dir.mkdir(parents=True, exist_ok=True)
     config_path = config_dir / 'opencode.json'
-    if config_path.is_file() is False:
+    # bind source tree がある開発環境では変更中の repo template を優先する。
+    ## 本番イメージには repo path が無いため、immutable な bundled template へフォールバックする。
+    source = OPENCODE_REPO_CONFIG_PATH
+    if source.is_file() is False:
         source = OPENCODE_BUNDLED_CONFIG_PATH
-        if source.is_file() is False:
-            source = OPENCODE_REPO_CONFIG_PATH
-        if source.is_file() is False:
-            raise FileNotFoundError(
-                f'OpenCode product config template not found: {source}',
-            )
-        config_path.write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
-        os.chmod(config_path, 0o600)
+    if source.is_file() is False:
+        raise FileNotFoundError(
+            f'OpenCode product config template not found: {source}',
+        )
+    template_text = source.read_text(encoding='utf-8')
+    current_text = _ReadRegularFileText(config_path)
+    if current_text != template_text:
+        _WriteOpenCodeConfigAtomically(config_path, template_text)
+    else:
+        # 内容が同じでも権限だけ劣化するケースを修復する。
+        config_fd = os.open(config_path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(config_fd, 0o600)
+        finally:
+            os.close(config_fd)
 
     # workspace にソースを置かないことを保証する（.gitkeep のみ許可）。
     for child in OPENCODE_WORKSPACE_DIR.iterdir():
@@ -147,7 +254,6 @@ def EnsureOpenCodeRuntimeDirectories() -> None:
             continue
         # 予期しないファイルがあっても削除はしない（ユーザーデータ保護）。警告は呼び出し側ログ。
         break
-
 
 
 def _ReadProcessStartTime(pid: int) -> int | None:
@@ -502,8 +608,11 @@ def StartOpenCodeServe() -> bool:
         environment['XDG_CONFIG_HOME'] = str(OPENCODE_XDG_CONFIG_HOME)
         environment['XDG_DATA_HOME'] = str(OPENCODE_XDG_DATA_HOME)
         # 監査用やユーザー shell の OPENCODE_* を持ち込まない。
+        # ただし OPENCODE_ENABLE_EXA は Exa AI のホスト型 websearch（API キー不要）を
+        # 有効化する機能フラグのため、製品 serve へ明示的に維持する。
+        allowed_opencode_env_keys = {'OPENCODE_ENABLE_EXA'}
         for key in list(environment):
-            if key.startswith('OPENCODE_'):
+            if key.startswith('OPENCODE_') and key not in allowed_opencode_env_keys:
                 environment.pop(key, None)
 
         try:

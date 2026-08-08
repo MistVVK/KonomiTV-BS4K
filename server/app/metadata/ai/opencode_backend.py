@@ -23,6 +23,7 @@ from app.constants import (
     OPENCODE_AGENT_EPISODE,
     OPENCODE_AGENT_GENERATE,
 )
+from app.metadata.ai.ai_egress_policy import BuildOpenCodeEpisodeToolPermissions
 from app.metadata.ai.AIAPIUsageLedger import AIAPIUsageLedger
 from app.metadata.ai.AIBackendSettings import (
     AIBackendService,
@@ -227,7 +228,7 @@ def _BuildEpisodeLookupPrompt(program: RecordedEpisodeLookupContext) -> str:
 MANDATORY web search:
 - You MUST call the websearch tool at least once before producing any JSON. Never answer without a web search.
 - Even if the episode number seems obvious from the context, you must still search the Web to verify it.
-- webfetch may be used only for pages found by search.
+- Do not request webfetch or any standalone URL retrieval tool. Use only the hosted websearch tool.
 - If the searched evidence is not enough, use InsufficientEvidence.
 
 Security and evidence rules:
@@ -1077,9 +1078,9 @@ class OpenCodeBackend:
                 schema=_JsonSchemaForModel(_OpenCodeEpisodeLookupOutput),
                 retry_count=_OPENCODE_FORMAT_RETRY_COUNT,
                 timeout_sec=timeout_sec,
-                # websearch はデフォルトのツールセットに含まれないため明示的に有効化する。
-                # webfetch も prompt の指示（検索で見つけたページの取得）に沿って許可する。
-                tools={'websearch': True, 'webfetch': True},
+                # F-03 / R-08: host network 上では任意 URL 取得 (webfetch) を拒否し、
+                # Exa ホスト型 websearch だけを有効化する。
+                tools=BuildOpenCodeEpisodeToolPermissions(),
                 include_format=False,
             )
             usage = ExtractOpenCodeUsage(message)

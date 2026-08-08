@@ -470,6 +470,42 @@ def Main() -> None:
             Log('cancel_received', cancel)
             return
 
+        if MODE in {
+            'episode_fetch_no_permission',
+            'episode_search_to_fetch_no_permission',
+        }:
+            tool_call_id = 'episode-fetch-without-permission'
+            if MODE == 'episode_search_to_fetch_no_permission':
+                SendSessionUpdate({
+                    'sessionUpdate': 'tool_call',
+                    'toolCallId': tool_call_id,
+                    'title': 'Web search',
+                    'kind': 'search',
+                    'rawInput': {
+                        'type': 'web_search',
+                        'query': 'official episode',
+                    },
+                    'status': 'in_progress',
+                })
+                session_update = 'tool_call_update'
+            else:
+                session_update = 'tool_call'
+            SendSessionUpdate({
+                'sessionUpdate': session_update,
+                'toolCallId': tool_call_id,
+                'title': 'Fetching content from: https://example.com/source',
+                'kind': 'fetch',
+                'rawInput': {
+                    'type': 'web_fetch',
+                    'url': 'https://example.com/source',
+                },
+                'status': 'in_progress',
+            })
+            cancel = Read()
+            assert cancel['method'] == 'session/cancel'
+            Log('cancel_received', cancel)
+            return
+
         if MODE == 'episode_private_fetch':
             Send({
                 'jsonrpc': '2.0',

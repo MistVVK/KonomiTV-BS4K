@@ -382,7 +382,11 @@ def test_opencode_runtime_is_pinned_and_binary_only_in_final_image() -> None:
     assert 'recorded-series-generate' in config
     assert 'recorded-series-episode' in config
     assert '"bash": "deny"' in config
-    assert '"webfetch": "allow"' in config
+    # F-03 / R-08: 検索専用モード。websearch のみ allow、webfetch は deny。
+    episode_section = config.split('"recorded-series-episode"', 1)[1]
+    assert '"webfetch": "deny"' in episode_section
+    assert '"websearch": "allow"' in episode_section
+    assert '"webfetch": "allow"' not in episode_section
 
 
 def test_acp_subprocess_is_always_started_through_hardened_landlock_launcher() -> None:

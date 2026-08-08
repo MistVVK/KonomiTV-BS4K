@@ -508,6 +508,31 @@ def test_acp_episode_lookup_rejects_standalone_public_fetch_without_cancelling_t
     assert not any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
 
 
+@pytest.mark.parametrize(
+    'mode',
+    [
+        'episode_fetch_no_permission',
+        'episode_search_to_fetch_no_permission',
+    ],
+)
+def test_acp_episode_lookup_cancels_fetch_without_permission_before_completion(
+    tmp_path: Path,
+    mode: str,
+) -> None:
+    """permission なしの fetch は completed を待たず、最初の telemetry で停止する。"""
+
+    result, log_path = RunEpisodeLookup(
+        tmp_path,
+        backend_kind='AcpCodex',
+        mode=mode,
+    )
+
+    assert result.outcome == 'SearchFailed'
+    assert result.error_code == 'ACPProtocolError'
+    assert result.web_search_performed is False
+    assert any(entry['kind'] == 'cancel_received' for entry in ReadLog(log_path))
+
+
 def test_acp_episode_lookup_rejects_duplicate_initial_tool_after_normal_order(
     tmp_path: Path,
 ) -> None:

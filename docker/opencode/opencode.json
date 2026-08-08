@@ -39,7 +39,7 @@
         "task": "deny",
         "skill": "deny",
         "question": "deny",
-        "webfetch": "allow",
+        "webfetch": "deny",
         "websearch": "allow",
         "external_directory": "deny",
         "doom_loop": "deny",
