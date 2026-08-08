@@ -83,6 +83,12 @@
         "vitest": "^2.1.9",
         "vue-tsc": "^2.0.29"
     },
+    "resolutions": {
+        "@tsukumijima/aribts": "github:tsukumijima/node-aribts#v1.5.3",
+        "postcss": "^8.5.26",
+        "web-bml/css": "github:otya128/reworkcss-css#v3.0.1",
+        "web-bml/fast-xml-parser": "^5.7.0"
+    },
     "browserslist": [
         "> 1%",
         "last 2 versions",
