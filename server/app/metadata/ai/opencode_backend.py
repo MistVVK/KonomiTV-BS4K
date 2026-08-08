@@ -45,6 +45,7 @@ from app.metadata.ai.opencode_client import (
     ExtractOpenCodeWebToolEvidence,
     OpenCodeClient,
     OpenCodeClientError,
+    OpenCodeProviderLease,
     OpenCodeUnavailableError,
 )
 from app.metadata.ai.opencode_types import OpenCodeNormalizedUsage
@@ -658,8 +659,11 @@ class OpenCodeBackend:
 
         return self._service
 
-    async def ensureAuthInjected(self) -> None:
-        """必要なら API キーを OpenCode auth へ注入する。
+    async def ensureAuthInjected(self) -> OpenCodeProviderLease:
+        """必要なら API キーを注入し、provider の利用中 lease を取得する。
+
+        Returns:
+            AI セッション終了まで保持する provider lease。
 
         Raises:
             RecordedSeriesAIError: キー不足または注入失敗。
@@ -667,14 +671,14 @@ class OpenCodeBackend:
 
         if self._service.auth_mode == 'NoneLocal':
             # ローカル推論は OpenCode 側 provider 設定前提。キー注入は不要。
-            return
+            return await self._client.acquireProviderLease(self._service.opencode_provider_id)
         if self._service.auth_mode == 'VertexAdc':
             # Vertex は ADC。OpenCode 側の env/config 前提（Phase 7b）。
-            return
+            return await self._client.acquireProviderLease(self._service.opencode_provider_id)
         if self._service.auth_mode == 'OAuthSubscription':
             if self._service.oauth_connected is False:
                 raise RecordedSeriesAIError('OpenCodeOAuthNotConnected')
-            return
+            return await self._client.acquireProviderLease(self._service.opencode_provider_id)
         # ApiKey
         key = self._api_key
         if key is None:
@@ -682,7 +686,10 @@ class OpenCodeBackend:
         if key is None or key.strip() == '':
             raise RecordedSeriesAIError('OpenCodeAPIKeyMissing')
         try:
-            await self._client.putApiKey(self._service.opencode_provider_id, key)
+            return await self._client.acquireProviderLease(
+                self._service.opencode_provider_id,
+                api_key=key,
+            )
         except OpenCodeClientError as error:
             raise _MapClientError(error, latency_ms=0) from error
 
@@ -838,7 +845,7 @@ class OpenCodeBackend:
         if len(allowed_ids) == 0:
             raise RecordedSeriesAIError('EmptyCandidateSet')
 
-        await self.ensureAuthInjected()
+        provider_lease = await self.ensureAuthInjected()
 
         async def Run() -> tuple[AIChoiceResult, OpenCodeNormalizedUsage | None]:
             prompt = _BuildCandidateSelectionPrompt(program, candidates)
@@ -915,7 +922,9 @@ class OpenCodeBackend:
             assert last_error is not None
             raise last_error
 
-        return await self._withMonthlyReservation(Run)
+        # provider auth は session の delete が完了するまで lease し、別キー PUT / deleteAuth を待たせる。
+        async with provider_lease:
+            return await self._withMonthlyReservation(Run)
 
     async def selectCandidate(
         self,
@@ -941,7 +950,7 @@ class OpenCodeBackend:
     ) -> AISeriesMetadataResult:
         """シリーズ情報生成本体（セマフォは呼び出し側）。"""
 
-        await self.ensureAuthInjected()
+        provider_lease = await self.ensureAuthInjected()
 
         async def Run() -> tuple[AISeriesMetadataResult, OpenCodeNormalizedUsage | None]:
             prompt = BuildSeriesMetadataPrompt(program, hints)
@@ -1009,7 +1018,9 @@ class OpenCodeBackend:
             assert last_error is not None
             raise last_error
 
-        return await self._withMonthlyReservation(Run)
+        # 同一 provider の認証主体が処理中に切り替わらないよう session 全体を lease する。
+        async with provider_lease:
+            return await self._withMonthlyReservation(Run)
 
     async def resolveSeriesMetadata(
         self,
@@ -1160,13 +1171,15 @@ class OpenCodeBackend:
                 error_message='ローカル OpenCode service は話数 Web 検索に対応していません。',
             )
 
-        await self.ensureAuthInjected()
+        provider_lease = await self.ensureAuthInjected()
 
         async def Run() -> tuple[EpisodeLookupResult, OpenCodeNormalizedUsage | None]:
             result, usage, _trace = await self._runEpisodeLookupSession(program)
             return result, usage
 
-        return await self._withMonthlyReservation(Run)
+        # Web 検索 tool と message 一覧取得・session cleanup まで同じ provider auth を保持する。
+        async with provider_lease:
+            return await self._withMonthlyReservation(Run)
 
     async def lookupEpisode(
         self,
@@ -1315,7 +1328,7 @@ class OpenCodeBackend:
             )
 
         try:
-            await self.ensureAuthInjected()
+            provider_lease = await self.ensureAuthInjected()
         except RecordedSeriesAIError as error:
             failed = ConnectionTestCheck(
                 status='Failed',
@@ -1355,7 +1368,9 @@ class OpenCodeBackend:
             return (result, trace), usage
 
         try:
-            pair = await self._withMonthlyReservation(Run)
+            # 接続試験中も通常処理と同じ provider lease を保持する。
+            async with provider_lease:
+                pair = await self._withMonthlyReservation(Run)
         except RecordedSeriesAIError as error:
             failed = ConnectionTestCheck(
                 status='Failed',

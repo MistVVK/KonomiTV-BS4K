@@ -6,9 +6,12 @@ auth / health に加え、Phase 2 の session create → prompt → abort → de
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import threading
 import unicodedata
+from types import TracebackType
 from typing import Any
 from urllib.parse import quote
 
@@ -48,6 +51,105 @@ class OpenCodeUnavailableError(OpenCodeClientError):
 
     def __init__(self) -> None:
         super().__init__('OpenCode serve is unavailable.', status_code=503)
+
+
+class _OpenCodeProviderState:
+    """同一 OpenCode provider の認証変更と利用中 lease を直列化する。"""
+
+    def __init__(self) -> None:
+        """provider 状態を初期化する。"""
+
+        # 認証変更・lease 取得・lease 解放を通知し合う Condition。
+        self.condition = asyncio.Condition()
+        # OpenCode へ最後に注入できた API キーの SHA-256。キー本体は保持しない。
+        self.api_key_fingerprint: str | None = None
+        # provider の認証状態を現在利用している AI セッション数。
+        self.active_lease_count = 0
+        # PUT / DELETE / OAuth callback と dispose を実行中または実行待ちなら True。
+        self.auth_mutation_pending = False
+
+
+class OpenCodeProviderLease:
+    """provider 認証を AI セッションの終了まで保持する lease。"""
+
+    def __init__(self, state: _OpenCodeProviderState) -> None:
+        """取得済み lease を初期化する。
+
+        Args:
+            state: active_lease_count を加算済みの provider 状態。
+        """
+
+        # release 時に参照数を戻す provider 状態。
+        self._state = state
+        # finally と明示 release が重なっても参照数を二重に減らさないための状態。
+        self._released = False
+
+    async def __aenter__(self) -> OpenCodeProviderLease:
+        """取得済み lease を async with へ渡す。
+
+        Returns:
+            この lease 自身。
+        """
+
+        return self
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc_value: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        """処理成否にかかわらず provider lease を解放する。
+
+        Returns:
+            None
+        """
+
+        await self.release()
+
+    async def release(self) -> None:
+        """provider の active lease 数を1つ減らす。
+
+        Returns:
+            None
+        """
+
+        # 同じ lease の二重解放は何もしない。
+        if self._released:
+            return
+        async with self._state.condition:
+            if self._released:
+                return
+            self._released = True
+            self._state.active_lease_count -= 1
+            assert self._state.active_lease_count >= 0
+            self._state.condition.notify_all()
+
+
+# 同じ製品 serve と provider を使う全 OpenCodeClient instance で状態を共有する。
+_provider_states: dict[tuple[str, str], _OpenCodeProviderState] = {}
+_provider_states_lock = threading.Lock()
+
+
+def _GetProviderState(base_url: str, provider_id: str) -> _OpenCodeProviderState:
+    """serve URL と provider ID に対応する共有状態を返す。
+
+    Args:
+        base_url: OpenCode serve の base URL。
+        provider_id: 正規化済み OpenCode provider ID。
+
+    Returns:
+        provider 共有状態。
+    """
+
+    state_key = (base_url, provider_id)
+    # 複数 event loop thread から client が作られても状態生成を重複させない。
+    with _provider_states_lock:
+        state = _provider_states.get(state_key)
+        if state is None:
+            state = _OpenCodeProviderState()
+            _provider_states[state_key] = state
+        return state
 
 
 class OpenCodeClient:
@@ -108,12 +210,13 @@ class OpenCodeClient:
             raise OpenCodeClientError('OpenCode health payload is invalid.')
         return payload
 
-    async def disposeInstance(self) -> None:
+    async def _disposeInstance(self) -> None:
         """POST /instance/dispose でインスタンス状態を破棄し、auth 反映を促す。
 
         OpenCode 1.18.13 では PUT/DELETE /auth だけでは provider の connected
         状態が更新されず、Model not found になる。dispose 後の次回アクセスで
         auth.json が再読込されることを実測で確認した。
+        呼び出し元は provider 状態の auth mutation を取得済みでなければならない。
 
         Raises:
             OpenCodeClientError: dispose 失敗。
@@ -137,9 +240,62 @@ class OpenCodeClient:
                 f'OpenCode instance dispose request failed: {error}',
             ) from error
 
-    # provider_id → 最後に注入した API キーの SHA-256（キー本体は保持しない）。
-    # 同一キーの再注入では dispose を避け、進行中 session を壊さない。
-    _injected_api_key_fingerprints: dict[str, str] = {}
+    async def acquireProviderLease(
+        self,
+        provider_id: str,
+        *,
+        api_key: str | None = None,
+    ) -> OpenCodeProviderLease:
+        """provider 認証を必要なら更新し、利用中 lease を取得する。
+
+        同一キーの lease は並行利用を許可する。一方、異なるキーへの PUT と
+        DELETE / OAuth callback は既存 lease がすべて解放されるまで待機する。
+
+        Args:
+            provider_id: OpenCode provider ID。
+            api_key: 注入してから保持する API キー。非 API キー認証なら None。
+
+        Returns:
+            呼び出し側が AI セッション終了まで保持する lease。
+
+        Raises:
+            OpenCodeClientError: API キー注入または dispose 失敗。
+            ValueError: provider_id または指定した api_key が空。
+        """
+
+        normalized_provider = provider_id.strip()
+        if normalized_provider == '':
+            raise ValueError('provider_id is empty.')
+        normalized_key: str | None = None
+        key_fingerprint: str | None = None
+        if api_key is not None:
+            normalized_key = api_key.strip()
+            if normalized_key == '':
+                raise ValueError('api_key is empty.')
+            key_fingerprint = hashlib.sha256(normalized_key.encode('utf-8')).hexdigest()
+
+        state = _GetProviderState(self._base_url, normalized_provider)
+        async with state.condition:
+            # 先に待っている認証変更がある間は、新規 lease を増やさず既存 lease を drain させる。
+            while state.auth_mutation_pending:
+                await state.condition.wait()
+
+            # API キーが異なる場合だけ、新規 lease を止めて active session の終了を待つ。
+            if key_fingerprint is not None and state.api_key_fingerprint != key_fingerprint:
+                state.auth_mutation_pending = True
+                try:
+                    while state.active_lease_count > 0:
+                        await state.condition.wait()
+                    assert normalized_key is not None
+                    await self._putApiKeyUnlocked(normalized_provider, normalized_key)
+                    state.api_key_fingerprint = key_fingerprint
+                finally:
+                    state.auth_mutation_pending = False
+                    state.condition.notify_all()
+
+            # fingerprint 確認・必要な PUT/dispose と lease 加算を同じ Condition 内で完結させる。
+            state.active_lease_count += 1
+            return OpenCodeProviderLease(state)
 
     async def putApiKey(self, provider_id: str, api_key: str) -> None:
         """PUT /auth/{providerID} で API キーを注入する。
@@ -159,16 +315,24 @@ class OpenCodeClient:
             ValueError: provider_id / api_key が空。
         """
 
-        normalized_provider = provider_id.strip()
-        normalized_key = api_key.strip()
-        if normalized_provider == '':
-            raise ValueError('provider_id is empty.')
-        if normalized_key == '':
-            raise ValueError('api_key is empty.')
-        key_fingerprint = hashlib.sha256(normalized_key.encode('utf-8')).hexdigest()
-        if OpenCodeClient._injected_api_key_fingerprints.get(normalized_provider) == key_fingerprint:
-            # 同一キーが既に注入済みなら dispose しない。
-            return
+        # 単発 PUT も lease 取得経路へ通し、並行 session との認証交差を防ぐ。
+        lease = await self.acquireProviderLease(provider_id, api_key=api_key)
+        await lease.release()
+
+    async def _putApiKeyUnlocked(self, normalized_provider: str, normalized_key: str) -> None:
+        """provider mutation 取得中に API キーを PUT して instance を破棄する。
+
+        Args:
+            normalized_provider: 正規化済み provider ID。
+            normalized_key: 正規化済み API キー。
+
+        Returns:
+            None
+
+        Raises:
+            OpenCodeClientError: 注入または dispose 失敗。
+        """
+
         self._requireAvailable()
         body: OpenCodeApiAuth = {'type': 'api', 'key': normalized_key}
         path = f'/auth/{quote(normalized_provider, safe="")}'
@@ -187,8 +351,7 @@ class OpenCodeClient:
         except httpx.HTTPError as error:
             raise OpenCodeClientError(f'OpenCode auth set request failed: {error}') from error
         # auth.json は書けても in-memory provider が古いまま残るため dispose する。
-        await self.disposeInstance()
-        OpenCodeClient._injected_api_key_fingerprints[normalized_provider] = key_fingerprint
+        await self._disposeInstance()
 
     async def deleteAuth(self, provider_id: str) -> None:
         """DELETE /auth/{providerID} で資格情報を除去する。
@@ -209,6 +372,34 @@ class OpenCodeClient:
         normalized_provider = provider_id.strip()
         if normalized_provider == '':
             raise ValueError('provider_id is empty.')
+        state = _GetProviderState(self._base_url, normalized_provider)
+        async with state.condition:
+            # delete を待つ task がある時点から新規 lease を止め、既存 session を先に完了させる。
+            while state.auth_mutation_pending:
+                await state.condition.wait()
+            state.auth_mutation_pending = True
+            try:
+                while state.active_lease_count > 0:
+                    await state.condition.wait()
+                await self._deleteAuthUnlocked(normalized_provider)
+                state.api_key_fingerprint = None
+            finally:
+                state.auth_mutation_pending = False
+                state.condition.notify_all()
+
+    async def _deleteAuthUnlocked(self, normalized_provider: str) -> None:
+        """provider mutation 取得中に資格情報を削除して instance を破棄する。
+
+        Args:
+            normalized_provider: 正規化済み provider ID。
+
+        Returns:
+            None
+
+        Raises:
+            OpenCodeClientError: 削除または dispose 失敗。
+        """
+
         self._requireAvailable()
         path = f'/auth/{quote(normalized_provider, safe="")}'
         deleted = False
@@ -233,8 +424,7 @@ class OpenCodeClient:
             raise OpenCodeClientError(f'OpenCode auth delete request failed: {error}') from error
         if deleted:
             # auth ファイル削除後も connected が残るため dispose で揃える。
-            await self.disposeInstance()
-            OpenCodeClient._injected_api_key_fingerprints.pop(normalized_provider, None)
+            await self._disposeInstance()
 
     async def createSession(self) -> str:
         """POST /session で新規 session を作成する。
@@ -543,6 +733,48 @@ class OpenCodeClient:
             raise ValueError('provider_id is empty.')
         if method < 0:
             raise ValueError('method must be >= 0.')
+        state = _GetProviderState(self._base_url, normalized_provider)
+        async with state.condition:
+            # OAuth callback も auth.json と instance を変更するため、同じ provider の session を drain する。
+            while state.auth_mutation_pending:
+                await state.condition.wait()
+            state.auth_mutation_pending = True
+            try:
+                while state.active_lease_count > 0:
+                    await state.condition.wait()
+                result = await self._completeOAuthCallbackUnlocked(
+                    normalized_provider,
+                    method=method,
+                    code=code,
+                )
+                # OAuth 資格情報へ切り替わったため、API キー fingerprint は無効化する。
+                state.api_key_fingerprint = None
+                return result
+            finally:
+                state.auth_mutation_pending = False
+                state.condition.notify_all()
+
+    async def _completeOAuthCallbackUnlocked(
+        self,
+        normalized_provider: str,
+        *,
+        method: int,
+        code: str | None,
+    ) -> bool:
+        """provider mutation 取得中に OAuth callback と instance dispose を行う。
+
+        Args:
+            normalized_provider: 正規化済み provider ID。
+            method: authorize 時と同じ method index。
+            code: 認可コード / device code（不要なら None）。
+
+        Returns:
+            OpenCode が true を返したら True。
+
+        Raises:
+            OpenCodeClientError: callback または dispose 失敗。
+        """
+
         self._requireAvailable()
         path = f'/provider/{quote(normalized_provider, safe="")}/oauth/callback'
         body: dict[str, Any] = {'method': int(method)}
@@ -566,7 +798,7 @@ class OpenCodeClient:
                 f'OpenCode OAuth callback request failed: {error}',
             ) from error
         # 成功後は in-memory connected を auth.json に揃える。
-        await self.disposeInstance()
+        await self._disposeInstance()
         return payload is True
 
     async def abortSession(self, session_id: str) -> None:

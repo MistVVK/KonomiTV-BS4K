@@ -18,6 +18,7 @@ from app.metadata.ai.opencode_client import (
     ExtractOpenCodeStructuredOutput,
     ExtractOpenCodeUsage,
     ExtractOpenCodeWebToolEvidence,
+    OpenCodeClient,
 )
 from app.metadata.RecordedEpisodeContext import (
     RECORDED_EPISODE_CONTEXT_VERSION,
@@ -40,6 +41,16 @@ from app.metadata.RecordedSeriesGeneration import (
     SeriesMetadataLocalParseHint,
     SeriesMetadataWikipediaHint,
 )
+
+
+class _NoopProviderLease:
+    """provider lease が不要な backend unit 向け async context manager。"""
+
+    async def __aenter__(self) -> _NoopProviderLease:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
 
 
 def _service(**overrides: Any) -> AIBackendService:
@@ -171,14 +182,166 @@ def test_extract_structured_output_from_tool_part() -> None:
     assert usage['estimated_cost_usd'] == 0.001
 
 
+def test_provider_lease_concurrent_same_key_mutates_auth_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同じ provider・同じキーの並行 session は PUT/dispose 1 回で lease を共有する。"""
+
+    client = OpenCodeClient(base_url='http://same-key.test')
+    auth_mutations: list[tuple[str, str]] = []
+    active_count = 0
+    maximum_active_count = 0
+    both_active = asyncio.Event()
+
+    async def FakePut(provider_id: str, api_key: str) -> None:
+        auth_mutations.append((provider_id, api_key))
+
+    monkeypatch.setattr(client, '_putApiKeyUnlocked', FakePut)
+
+    async def UseProvider() -> None:
+        nonlocal active_count, maximum_active_count
+        lease = await client.acquireProviderLease('deepseek', api_key='same-secret')
+        async with lease:
+            active_count += 1
+            maximum_active_count = max(maximum_active_count, active_count)
+            if active_count == 2:
+                both_active.set()
+            await asyncio.wait_for(both_active.wait(), timeout=1)
+            active_count -= 1
+
+    async def Run() -> None:
+        await asyncio.gather(UseProvider(), UseProvider())
+
+    asyncio.run(Run())
+    assert auth_mutations == [('deepseek', 'same-secret')]
+    assert maximum_active_count == 2
+
+
+def test_provider_lease_concurrent_different_keys_waits_for_active_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同じ provider の別キー PUT は利用中 session が lease を解放するまで待つ。"""
+
+    client = OpenCodeClient(base_url='http://different-key.test')
+    auth_mutations: list[str] = []
+    first_acquired = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    second_acquired = asyncio.Event()
+
+    async def FakePut(_provider_id: str, api_key: str) -> None:
+        auth_mutations.append(api_key)
+
+    monkeypatch.setattr(client, '_putApiKeyUnlocked', FakePut)
+
+    async def UseFirstKey() -> None:
+        lease = await client.acquireProviderLease('deepseek', api_key='first-secret')
+        async with lease:
+            first_acquired.set()
+            await release_first.wait()
+
+    async def UseSecondKey() -> None:
+        await first_acquired.wait()
+        second_started.set()
+        lease = await client.acquireProviderLease('deepseek', api_key='second-secret')
+        async with lease:
+            second_acquired.set()
+
+    async def Run() -> None:
+        first_task = asyncio.create_task(UseFirstKey())
+        second_task = asyncio.create_task(UseSecondKey())
+        await second_started.wait()
+        await asyncio.sleep(0)
+        assert second_acquired.is_set() is False
+        assert auth_mutations == ['first-secret']
+        release_first.set()
+        await asyncio.gather(first_task, second_task)
+
+    asyncio.run(Run())
+    assert auth_mutations == ['first-secret', 'second-secret']
+
+
+def test_provider_auth_delete_waits_for_active_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一時 auth cleanup は同じ provider の active session を途中で dispose しない。"""
+
+    client = OpenCodeClient(base_url='http://delete-wait.test')
+    deleted: list[str] = []
+    lease_acquired = asyncio.Event()
+    release_lease = asyncio.Event()
+    delete_started = asyncio.Event()
+
+    async def FakePut(_provider_id: str, _api_key: str) -> None:
+        return None
+
+    async def FakeDelete(provider_id: str) -> None:
+        deleted.append(provider_id)
+
+    monkeypatch.setattr(client, '_putApiKeyUnlocked', FakePut)
+    monkeypatch.setattr(client, '_deleteAuthUnlocked', FakeDelete)
+
+    async def UseProvider() -> None:
+        lease = await client.acquireProviderLease('deepseek', api_key='temporary-secret')
+        async with lease:
+            lease_acquired.set()
+            await release_lease.wait()
+
+    async def DeleteAuth() -> None:
+        await lease_acquired.wait()
+        delete_started.set()
+        await client.deleteAuth('deepseek')
+
+    async def Run() -> None:
+        use_task = asyncio.create_task(UseProvider())
+        delete_task = asyncio.create_task(DeleteAuth())
+        await delete_started.wait()
+        await asyncio.sleep(0)
+        assert deleted == []
+        release_lease.set()
+        await asyncio.gather(use_task, delete_task)
+
+    asyncio.run(Run())
+    assert deleted == ['deepseek']
+
+
+def test_provider_leases_for_different_providers_do_not_block_each_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """provider ID が異なる認証変更は互いを不要に直列化しない。"""
+
+    client = OpenCodeClient(base_url='http://different-provider.test')
+    entered_providers: set[str] = set()
+    both_entered = asyncio.Event()
+
+    async def FakePut(provider_id: str, _api_key: str) -> None:
+        entered_providers.add(provider_id)
+        if len(entered_providers) == 2:
+            both_entered.set()
+        await asyncio.wait_for(both_entered.wait(), timeout=1)
+
+    monkeypatch.setattr(client, '_putApiKeyUnlocked', FakePut)
+
+    async def UseProvider(provider_id: str) -> None:
+        lease = await client.acquireProviderLease(provider_id, api_key='shared-secret')
+        async with lease:
+            return None
+
+    async def Run() -> None:
+        await asyncio.gather(UseProvider('deepseek'), UseProvider('openai'))
+
+    asyncio.run(Run())
+    assert entered_providers == {'deepseek', 'openai'}
+
+
 def test_select_candidate_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """候補選択が structured 結果を検証して返す。"""
 
     service = _service()
     backend = OpenCodeBackend(service, api_key='sk-test')
 
-    async def FakeEnsure() -> None:
-        return None
+    async def FakeEnsure() -> _NoopProviderLease:
+        return _NoopProviderLease()
 
     async def FakeRunStructured(**_kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], int]:
         usage = {
@@ -221,8 +384,8 @@ def test_select_candidate_rejects_outside_set(monkeypatch: pytest.MonkeyPatch) -
     backend = OpenCodeBackend(service, api_key='sk-test')
     calls = {'n': 0}
 
-    async def FakeEnsure() -> None:
-        return None
+    async def FakeEnsure() -> _NoopProviderLease:
+        return _NoopProviderLease()
 
     async def FakeRunStructured(**_kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], int]:
         calls['n'] += 1
@@ -258,8 +421,8 @@ def test_resolve_series_metadata_success(monkeypatch: pytest.MonkeyPatch) -> Non
     service = _service()
     backend = OpenCodeBackend(service, api_key='sk-test')
 
-    async def FakeEnsure() -> None:
-        return None
+    async def FakeEnsure() -> _NoopProviderLease:
+        return _NoopProviderLease()
 
     async def FakeRunStructured(**_kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], int]:
         usage = {
@@ -533,8 +696,8 @@ def test_lookup_episode_with_web_evidence(monkeypatch: pytest.MonkeyPatch) -> No
     service = _service()
     backend = OpenCodeBackend(service, api_key='sk-test')
 
-    async def FakeEnsure() -> None:
-        return None
+    async def FakeEnsure() -> _NoopProviderLease:
+        return _NoopProviderLease()
 
     async def FakeRun(
         program: RecordedEpisodeLookupContext,
@@ -602,8 +765,8 @@ def test_connection_test_episode_lookup(monkeypatch: pytest.MonkeyPatch) -> None
     service = _service()
     backend = OpenCodeBackend(service, api_key='sk-test')
 
-    async def FakeEnsure() -> None:
-        return None
+    async def FakeEnsure() -> _NoopProviderLease:
+        return _NoopProviderLease()
 
     async def FakeRun(
         program: RecordedEpisodeLookupContext,
