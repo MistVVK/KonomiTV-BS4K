@@ -210,8 +210,13 @@
             <div class="settings__item">
                 <div class="settings__item-heading">既存録画をシリーズ判定</div>
                 <div class="settings__item-label">
-                    未判定の録画を対象に、ローカル照合から順にシリーズを判定します。確定済みの結果は再利用します。<br>
-                    現在サーバーに保存されている設定を使用し、AI 生成が有効な場合は Manual / Rule 以外を生成します。<br>
+                    未判定の録画を対象に、ローカル照合と保存済みの AI バックエンドを利用してシリーズを判定します。<br>
+                    Manual / Rule の確定結果は再利用し、それ以外の録画では AI による判定と利用量が発生します。<br>
+                    実行前に <router-link to="/settings/server/ai-backends">AIバックエンド</router-link>を設定してください。<br>
+                </div>
+                <div v-if="series_backfill_unavailable_message !== null"
+                    class="settings__item-label mt-2 text-warning">
+                    {{series_backfill_unavailable_message}}
                 </div>
             </div>
             <div class="settings__item settings__item--switch">
@@ -235,7 +240,8 @@
                 </div>
                 <v-btn class="settings__save-button mt-4" color="background-lighten-2" variant="flat"
                     :loading="is_starting_backfill"
-                    :disabled="is_backfill_running || is_episode_backfill_running"
+                    :disabled="is_backfill_running || is_episode_backfill_running ||
+                        is_series_backfill_available === false"
                     @click="startBackfill()">
                     <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="22px" />
                     {{force_backfill ? 'すべての録画を再判定' : '既存録画の判定を開始'}}
@@ -367,7 +373,11 @@ const settings = ref<IRecordedSeriesSettings>({
     ai_episode_number_acceptance_mode: 'Always',
     ai_backend: 'AcpCodex',
     ai_backend_service_id: null,
+    ai_backend_service_name: null,
+    ai_backend_auth_configured: false,
 });
+// 一括判定は未保存のフォーム値ではなく、サーバーに保存済みの AI 設定だけを利用する。
+const saved_settings = ref<IRecordedSeriesSettings | null>(null);
 const opencode_services = ref<{title: string; value: string;}[]>([]);
 const status = ref<IRecordedSeriesStatus | null>(null);
 
@@ -436,6 +446,24 @@ const is_episode_backfill_running = computed(() =>
     is_monitoring_episode_backfill.value ||
     status.value?.is_episode_running === true,
 );
+const series_backfill_unavailable_message = computed(() => {
+    if (saved_settings.value?.ai_backend_auth_configured !== true) {
+        return 'AIバックエンドが未設定のため、シリーズ判定を開始できません。';
+    }
+    if (saved_settings.value.ai_enabled === false) {
+        return '「AI でシリーズ名・話数・話名を生成する」を有効にして設定を保存してください。';
+    }
+    return null;
+});
+const is_series_backfill_available = computed(() => series_backfill_unavailable_message.value === null);
+const saved_ai_backend_label = computed(() => {
+    const savedSettings = saved_settings.value;
+    if (savedSettings === null) return '保存済みの AI バックエンド';
+    if (savedSettings.ai_backend === 'OpenCode') {
+        return savedSettings.ai_backend_service_name ?? 'OpenCode';
+    }
+    return savedSettings.ai_backend === 'AcpCodex' ? 'ACP / Codex' : 'ACP / Grok Build';
+});
 const backfill_progress = computed(() => {
     if (backfill_task.value?.progress === null || backfill_task.value?.progress === undefined) return null;
     return Math.max(0, Math.min(100, backfill_task.value.progress * 100));
@@ -466,13 +494,15 @@ function applyFetchedSettings(fetched_settings: IRecordedSeriesSettings): void {
     // ローリング更新中の旧サーバーや古い mock が廃止済み backend を返しても、
     // 一覧外の値を表示したり任意コマンド設定へ戻ったりしないようクライアントでも fail-closed にする。
     const is_supported_backend = ai_backend_options.some(option => option.value === fetched_settings.ai_backend);
-    settings.value = is_supported_backend ?
+    const normalized_settings: IRecordedSeriesSettings = is_supported_backend ?
         fetched_settings :
         {
             ...fetched_settings,
             ai_backend: 'AcpCodex',
             ai_enabled: false,
         };
+    settings.value = {...normalized_settings};
+    saved_settings.value = {...normalized_settings};
 }
 
 /** 判定状況を更新し、バックフィル終了後は定期取得を止める。 */
@@ -527,9 +557,13 @@ async function saveSettings(): Promise<void> {
 /** 既存録画を対象に、バックグラウンドでシリーズ判定を実行する。 */
 async function startBackfill(): Promise<void> {
     if (is_episode_backfill_running.value) return;
+    if (is_series_backfill_available.value === false) {
+        Message.warning('AIバックエンドを設定してからシリーズ判定を実行してください。');
+        return;
+    }
     const confirmation_message = force_backfill.value ?
-        'シリーズ確定・単発番組を含むすべての録画を再判定します。既存の判定結果が更新され、AI API が有効な場合は API 利用が再度発生することがあります。続行しますか？' :
-        '確定済みの結果を再利用して、未判定の既存録画をシリーズ判定します。AI 生成が有効な場合は、Manual / Rule 以外で API 利用が発生します。続行しますか？';
+        `「${saved_ai_backend_label.value}」AIバックエンドを利用し、シリーズ確定・単発番組を含むすべての録画を再判定します。既存の判定結果が更新され、録画件数に応じた AI 利用が発生します。続行しますか？` :
+        `「${saved_ai_backend_label.value}」AIバックエンドを利用し、未判定の既存録画をシリーズ判定します。Manual / Rule 以外では、録画件数に応じた AI 利用が発生します。続行しますか？`;
     const confirmed = window.confirm(confirmation_message);
     if (confirmed === false) return;
 

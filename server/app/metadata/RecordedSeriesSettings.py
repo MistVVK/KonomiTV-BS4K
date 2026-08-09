@@ -229,22 +229,59 @@ class RecordedSeriesSettingsStore:
 
         settings = cls.getSettings()
         service_name: str | None = None
-        auth_configured = False
         if settings.ai_backend == 'OpenCode' and settings.ai_backend_service_id is not None:
             try:
                 from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
                 service = AIBackendSettingsStore.getService(settings.ai_backend_service_id)
                 if service is not None:
                     service_name = service.service_name
-                    auth_configured = AIBackendSettingsStore.isAuthConfigured(service)
             except (OSError, ValueError):
                 service_name = None
-                auth_configured = False
         return RecordedSeriesSettingsResponse(
             **settings.model_dump(),
             ai_backend_service_name=service_name,
-            ai_backend_auth_configured=auth_configured,
+            ai_backend_auth_configured=cls.isAIBackendConfigured(settings),
         )
+
+    @classmethod
+    def isAIBackendConfigured(
+        cls,
+        settings: RecordedSeriesSettings | None = None,
+    ) -> bool:
+        """録画シリーズ判定で選択中の AI バックエンドに有効な認証があるかを返す。
+
+        Args:
+            settings: 検査する保存済み設定。省略時は設定ストアから取得する。
+
+        Returns:
+            OpenCode service または ACP 専用プロファイルを利用できる場合は True。
+        """
+
+        effective_settings = settings or cls.getSettings()
+        if effective_settings.ai_backend == 'OpenCode':
+            if effective_settings.ai_backend_service_id is None:
+                return False
+            try:
+                from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
+                service = AIBackendSettingsStore.getService(
+                    effective_settings.ai_backend_service_id,
+                )
+                return (
+                    service is not None and
+                    AIBackendSettingsStore.isAuthConfigured(service)
+                )
+            except (OSError, ValueError):
+                return False
+
+        # ACP はホスト側認証の存在だけでは実行せず、KonomiTV-BS4K 専用
+        # プロファイルへ取り込み済みで有効な世代だけを設定済みとみなす。
+        from app.metadata.ai.KonomiTVBS4KACPCredentials import (
+            KonomiTVBS4KACPCredentials,
+        )
+        provider: Literal['codex', 'grok'] = (
+            'codex' if effective_settings.ai_backend == 'AcpCodex' else 'grok'
+        )
+        return KonomiTVBS4KACPCredentials.getCredentialGeneration(provider) != 'missing'
 
     @classmethod
     def _writeAtomic(cls, destination: Path, content: str) -> None:

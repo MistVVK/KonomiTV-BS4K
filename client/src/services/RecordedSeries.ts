@@ -20,6 +20,10 @@ export interface IRecordedSeriesSettings {
     ai_backend: AIBackendKind;
     // OpenCode 時の AIBackend service UUID
     ai_backend_service_id: string | null;
+    // 選択中の OpenCode service 表示名。ACP または未設定時は null。
+    ai_backend_service_name: string | null;
+    // 選択中の OpenCode / ACP バックエンドに利用可能な認証があるか。
+    ai_backend_auth_configured: boolean;
 }
 
 /** 録画シリーズ判定設定の更新リクエスト。 */

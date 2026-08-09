@@ -613,10 +613,21 @@ def test_status_and_backfill_endpoints_return_task_contract(
         received_force_values.append(force)
         return RecordedEpisodeBackfillAccepted(execution_id=43, reused=True)
 
+    def IsAIBackendConfigured(
+        settings: RecordedSeriesSettings | None = None,
+    ) -> bool:
+        del settings
+        return True
+
     monkeypatch.setattr(RecordedSeriesRouter.RecordedSeriesResolver, 'getStatus', GetStatus)
     monkeypatch.setattr(RecordedSeriesRouter.RecordedSeriesResolver, 'startBackfill', StartBackfill)
     monkeypatch.setattr(RecordedSeriesRouter.RecordedEpisodeAutomation, 'getStatus', GetEpisodeStatus)
     monkeypatch.setattr(RecordedSeriesRouter.RecordedEpisodeAutomation, 'startBackfill', StartEpisodeBackfill)
+    monkeypatch.setattr(
+        RecordedSeriesSettingsStore,
+        'isAIBackendConfigured',
+        staticmethod(IsAIBackendConfigured),
+    )
 
     async def Run() -> None:
         async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
@@ -639,6 +650,64 @@ def test_status_and_backfill_endpoints_return_task_contract(
 
     asyncio.run(Run())
     assert received_force_values == [True, False]
+
+
+def test_series_backfill_endpoint_rejects_unconfigured_ai_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """一括シリーズ判定は AI が無効または未設定なら処理を開始しない。"""
+
+    ConfigureTemporaryStore(monkeypatch, tmp_path)
+    RecordedSeriesSettingsStore.saveSettings(RecordedSeriesSettings(ai_enabled=True))
+    start_called = False
+
+    def IsAIBackendConfigured(
+        settings: RecordedSeriesSettings | None = None,
+    ) -> bool:
+        del settings
+        return False
+
+    async def StartBackfill(
+        *,
+        trigger: Literal['Manual', 'StartupBackfill'],
+        force: bool = False,
+    ) -> RecordedSeriesBackfillAccepted:
+        nonlocal start_called
+        del trigger, force
+        start_called = True
+        return RecordedSeriesBackfillAccepted(execution_id=42, reused=False)
+
+    monkeypatch.setattr(
+        RecordedSeriesRouter.RecordedSeriesResolver,
+        'startBackfill',
+        StartBackfill,
+    )
+    monkeypatch.setattr(
+        RecordedSeriesSettingsStore,
+        'isAIBackendConfigured',
+        staticmethod(IsAIBackendConfigured),
+    )
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.post(
+                '/api/recorded-series/backfill',
+                json={'force': False},
+            )
+
+        assert response.status_code == 409
+        assert response.headers['cache-control'] == 'no-store'
+        assert response.json() == {
+            'detail': 'AI backend is not configured for recorded series resolution.',
+        }
+
+    asyncio.run(Run())
+    assert start_called is False
 
 
 def test_episode_backfill_endpoint_rejects_unavailable_ai_settings(

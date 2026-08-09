@@ -1284,6 +1284,16 @@ async def RecordedSeriesBackfillAPI(
     """未判定・入力変更済みの既存録画をバックグラウンドで二段階判定する。"""
 
     response.headers.update(NO_STORE_HEADERS)
+    settings = RecordedSeriesSettingsStore.getSettings()
+    if (
+        settings.ai_enabled is False or
+        RecordedSeriesSettingsStore.isAIBackendConfigured(settings) is False
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='AI backend is not configured for recorded series resolution.',
+            headers=NO_STORE_HEADERS,
+        )
     accepted = await RecordedSeriesResolver.startBackfill(
         trigger="Manual", force=request.force
     )
