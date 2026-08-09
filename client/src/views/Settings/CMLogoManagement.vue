@@ -271,11 +271,30 @@ async function deleteSelectedLogo(): Promise<void> {
 <style lang="scss" scoped>
 
 .logo-toolbar { display: grid; grid-template-columns: 1fr auto auto; gap: 12px; }
-.logo-manager { display: grid; grid-template-columns: 150px minmax(220px, 1fr) minmax(300px, 1.2fr); gap: 12px; min-height: 520px; }
+
+// minmax 下限を 0 にし、狭い本文幅でも列の最小 intrinsic で親を押し広げない
+// 高さ上限は PC / タブだけに付け、スマホはページスクロールを維持する
+.logo-manager {
+    display: grid;
+    grid-template-columns: 150px minmax(0, 1fr) minmax(0, 1.2fr);
+    grid-template-rows: minmax(0, 1fr);
+    gap: 12px;
+    min-width: 0;
+    min-height: 520px;
+}
 .logo-manager--loading { opacity: 0.65; pointer-events: none; }
 .logo-manager--readonly .assignment-form,
 .logo-manager--readonly .assignment-row v-btn { opacity: 0.85; }
-.logo-pane { padding: 14px; border-radius: 10px; background: rgb(var(--v-theme-background-lighten-2)); overflow: auto; }
+
+// 親に高さ上限があるとき内部スクロールさせるため、grid 子の min-height を 0 にする
+.logo-pane {
+    min-width: 0;
+    min-height: 0;
+    padding: 14px;
+    border-radius: 10px;
+    background: rgb(var(--v-theme-background-lighten-2));
+    overflow: auto;
+}
 .logo-pane h3 { margin-bottom: 12px; font-size: 17px; }
 .logo-services button { display: flex; flex-direction: column; width: 100%; padding: 10px; margin-bottom: 6px; border-radius: 8px; text-align: left; }
 .logo-services button:hover, .logo-services__item--active { background: rgb(var(--v-theme-primary) / 18%); }
@@ -306,20 +325,62 @@ async function deleteSelectedLogo(): Promise<void> {
 .assignment-row { display: flex; align-items: center; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid rgb(var(--v-theme-background-lighten-1)); font-size: 12px; }
 .assignment-form { display: grid; gap: 8px; }
 
+// PC: 3 ペインのまま高さ上限を付け、各ペインを内部スクロールにする
+@include desktop {
+    .logo-manager {
+        height: min(640px, calc(100dvh - 220px));
+        max-height: calc(100dvh - 180px);
+    }
+}
+
+// タブ横 (1024 横など): 設定ナビが残って本文が狭いので 2 列化し詳細を下段へ
+// 上段 (サービス+ロゴ) と下段 (詳細) で高さを分け合い、各ペインがスクロールする
+@include tablet-horizontal {
+    .logo-manager {
+        grid-template-columns: 120px minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1.1fr) minmax(0, 1fr);
+        height: min(640px, calc(100dvh - 200px));
+        max-height: calc(100dvh - 160px);
+    }
+    .logo-detail { grid-column: 1 / -1; }
+}
+
 @include tablet-vertical {
-    .logo-manager { grid-template-columns: 120px 1fr; }
+    .logo-manager {
+        grid-template-columns: 120px minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1.1fr) minmax(0, 1fr);
+        height: min(720px, calc(100dvh - 200px));
+        max-height: calc(100dvh - 160px);
+    }
     .logo-detail { grid-column: 1 / -1; }
 }
+
+// スマホ横: 2 列折りたたみのみ。高さ拘束はせずページスクロールを維持する
 @include smartphone-horizontal {
-    .logo-manager { grid-template-columns: 120px 1fr; }
+    .logo-manager {
+        grid-template-columns: 120px minmax(0, 1fr);
+        grid-template-rows: auto auto;
+        min-height: 0;
+    }
     .logo-detail { grid-column: 1 / -1; }
 }
+
+// スマホ縦: 1 列 + サービス横並び。高さ拘束なしでページスクロール
 @include smartphone-vertical {
     .logo-toolbar { grid-template-columns: 1fr; }
-    .logo-manager { grid-template-columns: 1fr; }
-    .logo-services { display: flex; gap: 6px; }
+    .logo-manager {
+        grid-template-columns: 1fr;
+        grid-template-rows: auto;
+        min-height: 0;
+    }
+    .logo-services {
+        display: flex;
+        gap: 6px;
+        overflow-x: auto;
+        overflow-y: hidden;
+    }
     .logo-services h3 { display: none; }
-    .logo-services button { min-width: 0; flex: 0 0 clamp(150px, 42vw, 220px); }
+    .logo-services button { min-width: 0; flex: 0 0 clamp(150px, 42vw, 220px); margin-bottom: 0; }
 }
 
 </style>
