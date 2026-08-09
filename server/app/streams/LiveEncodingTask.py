@@ -992,6 +992,70 @@ class LiveEncodingTask:
         return False
 
 
+    def KillSubprocesses(self, *targets: tuple[str, asyncio.subprocess.Process | None]) -> list[tuple[str, asyncio.subprocess.Process]]:
+        """
+        起動済みのサブプロセス群へまとめて kill を送信する (このメソッドは一切 await しない)
+        先に全プロセスへの kill を済ませておけば、後続の wait 中に再キャンセルされても SIGKILL は全プロセスへ送信済みになる
+
+        Args:
+            *targets (tuple[str, asyncio.subprocess.Process | None]): (ログ識別用のサブプロセス名, 終了させるプロセス) の組。
+                未起動 (None) または終了済みのプロセスは無視する
+
+        Returns:
+            list[tuple[str, asyncio.subprocess.Process]]: kill に成功し、終了待機が必要なプロセスの組
+        """
+
+        killed: list[tuple[str, asyncio.subprocess.Process]] = []
+        for name, process in targets:
+            # 未起動 (TS Codec Bridge 未使用など) や既に終了済みのプロセスへは不要な kill を行わない
+            if process is None or process.returncode is not None:
+                continue
+            try:
+                process.kill()
+            except ProcessLookupError:
+                # kill 直前にプロセスが終了していた正常な競合
+                continue
+            except OSError as ex:
+                # kill に失敗しても他のプロセスの回収を中断させない
+                logging.debug(f'{self.live_stream.log_prefix} Failed to kill {name} subprocess:', exc_info=ex)
+                continue
+            killed.append((name, process))
+        return killed
+
+
+    async def WaitSubprocesses(self, killed: list[tuple[str, asyncio.subprocess.Process]]) -> None:
+        """
+        KillSubprocesses() で kill 済みのプロセスの終了を順に待機し、ゾンビプロセス化を防ぐ
+
+        Args:
+            killed (list[tuple[str, asyncio.subprocess.Process]]): (ログ識別用のサブプロセス名, kill 済みプロセス) の組
+        """
+
+        ## asyncio.CancelledError (BaseException) はここでは捕捉せず、LiveStream.connect() からの
+        ## キャンセルを妨げないよう呼び出し元へそのまま伝播させる (この時点で全プロセスへの kill は完了済み)
+        for name, process in killed:
+            try:
+                await process.wait()
+            except (ProcessLookupError, OSError) as ex:
+                # 終了待機に失敗しても他のプロセスの回収を中断させない
+                logging.debug(f'{self.live_stream.log_prefix} Failed to wait for {name} subprocess termination:', exc_info=ex)
+
+
+    async def TerminateSubprocesses(self, *targets: tuple[str, asyncio.subprocess.Process | None]) -> None:
+        """
+        起動済みのサブプロセス群をすべて kill してから、それぞれの終了を待機する
+        起動失敗時など、kill 後に他の解放処理を挟む必要がない経路から呼び出す
+        (run() の終了処理のように kill と wait の間に解放処理を挟む必要がある経路では、
+        KillSubprocesses() / WaitSubprocesses() を直接呼び出す)
+
+        Args:
+            *targets (tuple[str, asyncio.subprocess.Process | None]): (ログ識別用のサブプロセス名, 終了させるプロセス) の組。
+                未起動 (None) または終了済みのプロセスは無視する
+        """
+
+        await self.WaitSubprocesses(self.KillSubprocesses(*targets))
+
+
     async def run(self) -> None:
         """
         エンコードタスクを実行する
@@ -1105,175 +1169,215 @@ class LiveEncodingTask:
                 CONFIG.tv.debug_mode_ts_path
             ]
 
-        # tsreadex の読み込み用パイプと書き込み用パイプを作成
-        tsreadex_read_pipe, tsreadex_write_pipe = os.pipe()
-
-        # tsreadex のプロセスを非同期で作成・実行
+        # tsreadex のパイプ作成・プロセス起動の途中で失敗しても回収できるよう、すべて事前初期化する
+        ## 各パイプは子プロセスへ引き渡した後に親プロセス側で閉じ、二重 close を防ぐため None に戻す
+        tsreadex: asyncio.subprocess.Process | None = None
+        tsreadex_read_pipe: int | None = None
+        tsreadex_write_pipe: int | None = None
         try:
-            tsreadex = await asyncio.subprocess.create_subprocess_exec(
-                *[LIBRARY_PATH['tsreadex'], *tsreadex_options],
-                stdin = asyncio.subprocess.PIPE,  # 受信した放送波を書き込む
-                stdout = tsreadex_write_pipe,  # エンコーダーに繋ぐ
-                stderr = asyncio.subprocess.DEVNULL,  # 利用しない
-            )
+            # tsreadex の読み込み用パイプと書き込み用パイプを作成
+            tsreadex_read_pipe, tsreadex_write_pipe = os.pipe()
+
+            # tsreadex のプロセスを非同期で作成・実行
+            try:
+                tsreadex = await asyncio.subprocess.create_subprocess_exec(
+                    *[LIBRARY_PATH['tsreadex'], *tsreadex_options],
+                    stdin = asyncio.subprocess.PIPE,  # 受信した放送波を書き込む
+                    stdout = tsreadex_write_pipe,  # エンコーダーに繋ぐ
+                    stderr = asyncio.subprocess.DEVNULL,  # 利用しない
+                )
+            finally:
+                # tsreadex の書き込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
+                if tsreadex_write_pipe is not None:
+                    os.close(tsreadex_write_pipe)
+                    tsreadex_write_pipe = None
         except BaseException:
-            # tsreadex の起動自体に失敗した場合は、この時点ではまだ tsreadex_read_pipe を誰にも渡していない
-            ## ここで close しないと run() が例外で脱出した際に read 側 FD だけが残る
-            try:
-                os.close(tsreadex_read_pipe)
-            except OSError:
-                pass
+            # パイプ作成・tsreadex 起動中の例外やキャンセルでも、生成済みプロセスを先に停止する
+            killed = self.KillSubprocesses(('tsreadex', tsreadex))
+            # close 自体の失敗で後続の状態回復を妨げないよう、残っている親プロセス側 FD を個別に回収する
+            for pipe_name, pipe in (
+                ('tsreadex read', tsreadex_read_pipe),
+                ('tsreadex write', tsreadex_write_pipe),
+            ):
+                if pipe is not None:
+                    try:
+                        os.close(pipe)
+                    except OSError as ex:
+                        logging.debug(f'{self.live_stream.log_prefix} Failed to close {pipe_name} pipe:', exc_info=ex)
+            tsreadex_read_pipe = tsreadex_write_pipe = None
+            # Standby のまま残すと次回接続でタスクを再起動できないため、共有資源を解放して Offline へ戻す
+            self.live_stream.disconnectAll()
+            if self.live_stream.psi_data_archiver is not None:
+                self.live_stream.psi_data_archiver.destroy()
+                self.live_stream.psi_data_archiver = None
+            self.live_stream.setStatus('Offline', 'ライブストリームの処理中に予期しないエラーが発生しました。(E-18)')
+            # tsreadex が起動済みだった場合は、元の例外を再送出する前に終了を確認する
+            await self.WaitSubprocesses(killed)
             raise
-        finally:
-            # tsreadex の書き込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
-            os.close(tsreadex_write_pipe)
 
-        # ***** エンコーダープロセスの作成と実行 *****
+        # ここまで到達した時点で tsreadex は起動済み
+        assert tsreadex is not None
 
-        # エンコーダーの起動には時間がかかるので、先にエンコーダーを起動しておいた後、あとからチューナーを起動する
-        # チューナーの起動後にエンコーダー (正確には tsreadex) に受信した放送波が書き込まれる
-        # チューナーの起動にも時間がかかるが、エンコーダーの起動は非同期なのに対し、チューナーの起動は EDCB の場合は同期的
-
-        # フル HD 放送が行われているチャンネルかを取得
-        is_fullhd_channel = (
-            channel.is_oneseg is False and
-            self.isFullHDChannel(channel.network_id, channel.service_id)
-        )
-
-        ## ラジオチャンネルでは HW エンコードの意味がないため、FFmpeg に固定する
-        if channel.is_radiochannel is True:
-            ENCODER_TYPE = 'FFmpeg'
-
-        # Anchor またはcodec変換でBridgeが必要な時だけ、Encoder 出力と Bridge 入力を OS pipe で直結する。
-        # Python で TS を往復させず、最終的な Bridge stdout だけを配信側が読む。
+        # エンコーダー・Bridge の生成フェーズで例外やキャンセル (オプション構築・os.pipe・サブプロセス生成の失敗など) が
+        # 発生しても、生成済みの tsreadex / bridge / encoder と親プロセス側パイプが残留しないよう、生成フェーズ全体を回収スコープで覆う
         bridge: asyncio.subprocess.Process | None = None
+        encoder: asyncio.subprocess.Process | None = None
+        # Bridge 用パイプも生成直後から外側の回収スコープで管理するため、None で事前初期化する
+        ## 子プロセスへ引き渡してクローズした時点で None を代入し、外側の except での二重 close を防ぐ
+        bridge_read_pipe: int | None = None
         bridge_write_pipe: int | None = None
-        encoder_stdout: int = asyncio.subprocess.PIPE
-        if bridge_required is True:
-            assert bridge_path is not None
-            bridge_read_pipe, bridge_write_pipe = os.pipe()
-            bridge_options = self.BuildTSCodecBridgeOptions(
-                is_radiochannel = channel.is_radiochannel,
+        try:
+            # ***** エンコーダープロセスの作成と実行 *****
+
+            # エンコーダーの起動には時間がかかるので、先にエンコーダーを起動しておいた後、あとからチューナーを起動する
+            # チューナーの起動後にエンコーダー (正確には tsreadex) に受信した放送波が書き込まれる
+            # チューナーの起動にも時間がかかるが、エンコーダーの起動は非同期なのに対し、チューナーの起動は EDCB の場合は同期的
+
+            # フル HD 放送が行われているチャンネルかを取得
+            is_fullhd_channel = (
+                channel.is_oneseg is False and
+                self.isFullHDChannel(channel.network_id, channel.service_id)
             )
-            logging.info(
-                f'{self.live_stream.log_prefix} TS Codec Bridge Commands:\n'
-                f'{bridge_path} {" ".join(bridge_options)}'
-            )
-            try:
-                bridge = await asyncio.subprocess.create_subprocess_exec(
-                    bridge_path,
-                    *bridge_options,
-                    stdin = bridge_read_pipe,
-                    stdout = asyncio.subprocess.PIPE,
-                    stderr = asyncio.subprocess.PIPE,
-                )
-                TSCodecBridgeRuntimeVerifier.recordProcessStart('live')
-                encoder_stdout = bridge_write_pipe
-            except BaseException:
-                os.close(bridge_write_pipe)
-                bridge_write_pipe = None
-                try:
-                    tsreadex.kill()
-                except Exception:
-                    pass
-                raise
-            finally:
-                os.close(bridge_read_pipe)
 
-        # 現 main の公開設定 FFmpeg / QSV / NVENC / AMF は、すべて同梱 FFmpeg 8 で実行する。
-        ffmpeg8_encoder_type = ENCODER_TYPE
-        encoder_executable = RecordedPlaybackBackend.getExecutable(ffmpeg8_encoder_type)
-        encoder_environment = RecordedPlaybackBackend.getEnvironment(ffmpeg8_encoder_type)
-
-        # FFmpeg software backend
-        if ENCODER_TYPE == 'FFmpeg':
-
-            # オプションを取得
-            # ラジオチャンネルかどうかでエンコードオプションを切り替え
+            ## ラジオチャンネルでは HW エンコードの意味がないため、FFmpeg に固定する
             if channel.is_radiochannel is True:
-                encoder_options = self.buildFFmpegOptionsForRadio()
+                ENCODER_TYPE = 'FFmpeg'
+
+            # Anchor またはcodec変換でBridgeが必要な時だけ、Encoder 出力と Bridge 入力を OS pipe で直結する。
+            # Python で TS を往復させず、最終的な Bridge stdout だけを配信側が読む。
+            encoder_stdout: int = asyncio.subprocess.PIPE
+            if bridge_required is True:
+                assert bridge_path is not None
+                bridge_read_pipe, bridge_write_pipe = os.pipe()
+                bridge_options = self.BuildTSCodecBridgeOptions(
+                    is_radiochannel = channel.is_radiochannel,
+                )
+                logging.info(
+                    f'{self.live_stream.log_prefix} TS Codec Bridge Commands:\n'
+                    f'{bridge_path} {" ".join(bridge_options)}'
+                )
+                try:
+                    bridge = await asyncio.subprocess.create_subprocess_exec(
+                        bridge_path,
+                        *bridge_options,
+                        stdin = bridge_read_pipe,
+                        stdout = asyncio.subprocess.PIPE,
+                        stderr = asyncio.subprocess.PIPE,
+                    )
+                    TSCodecBridgeRuntimeVerifier.recordProcessStart('live')
+                    encoder_stdout = bridge_write_pipe
+                except BaseException:
+                    # パイプと生成済みプロセスの回収は、生成フェーズ全体を覆う外側の except で一括して行う
+                    raise
+                finally:
+                    # Bridge の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
+                    ## 外側の except での再クローズを防ぐため、クローズ後は None を代入する
+                    if bridge_read_pipe is not None:
+                        os.close(bridge_read_pipe)
+                        bridge_read_pipe = None
+
+            # 現 main の公開設定 FFmpeg / QSV / NVENC / AMF は、すべて同梱 FFmpeg 8 で実行する。
+            ffmpeg8_encoder_type = ENCODER_TYPE
+            encoder_executable = RecordedPlaybackBackend.getExecutable(ffmpeg8_encoder_type)
+            encoder_environment = RecordedPlaybackBackend.getEnvironment(ffmpeg8_encoder_type)
+
+            # FFmpeg software backend
+            if ENCODER_TYPE == 'FFmpeg':
+
+                # オプションを取得
+                # ラジオチャンネルかどうかでエンコードオプションを切り替え
+                if channel.is_radiochannel is True:
+                    encoder_options = self.buildFFmpegOptionsForRadio()
+                else:
+                    encoder_options = self.buildFFmpegOptions(
+                        self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg,
+                    )
+                logging.info(
+                    f'{self.live_stream.log_prefix} FFmpeg 8 Commands:\n'
+                    f'{encoder_executable} {" ".join(encoder_options)}'
+                )
+
+                # エンコーダープロセスを非同期で作成・実行
+                try:
+                    encoder = await asyncio.subprocess.create_subprocess_exec(
+                        encoder_executable,
+                        *encoder_options,
+                        stdin = tsreadex_read_pipe,  # tsreadex からの入力
+                        stdout = encoder_stdout,  # Bridge またはストリーム出力へ接続
+                        stderr = asyncio.subprocess.PIPE,  # ログ出力
+                        env = encoder_environment,
+                    )
+                finally:
+                    # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
+                    ## 起動失敗時の再クローズを防ぐため、クローズ後は None を代入する
+                    if tsreadex_read_pipe is not None:
+                        os.close(tsreadex_read_pipe)
+                        tsreadex_read_pipe = None
+                    # Bridge の書き込み用パイプも子プロセスに渡したので、親プロセス側ではクローズする
+                    if bridge_write_pipe is not None:
+                        os.close(bridge_write_pipe)
+                        bridge_write_pipe = None
+
+            # FFmpeg 8 hardware backend
             else:
-                encoder_options = self.buildFFmpegOptions(
-                    self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg,
+
+                # オプションを取得
+                hw_encoder_type = ENCODER_TYPE
+                encoder_options = self.buildFFmpeg8HardwareOptions(
+                    self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel, channel.is_oneseg,
                 )
-            logging.info(
-                f'{self.live_stream.log_prefix} FFmpeg 8 Commands:\n'
-                f'{encoder_executable} {" ".join(encoder_options)}'
-            )
-
-            # エンコーダープロセスを非同期で作成・実行
-            try:
-                encoder = await asyncio.subprocess.create_subprocess_exec(
-                    encoder_executable,
-                    *encoder_options,
-                    stdin = tsreadex_read_pipe,  # tsreadex からの入力
-                    stdout = encoder_stdout,  # Bridge またはストリーム出力へ接続
-                    stderr = asyncio.subprocess.PIPE,  # ログ出力
-                    env = encoder_environment,
+                logging.info(
+                    f'{self.live_stream.log_prefix} FFmpeg 8 ({ENCODER_TYPE}) Commands:\n'
+                    f'{encoder_executable} {" ".join(encoder_options)}'
                 )
-            except BaseException:
-                # tsreadex の起動後にエンコーダーの起動に失敗した場合、
-                ## このままでは親プロセスが例外で脱出して tsreadex だけ残留するため、ここで回収する
-                try:
-                    tsreadex.kill()
-                except Exception:
-                    pass
-                try:
-                    if bridge is not None:
-                        bridge.kill()
-                except Exception:
-                    pass
-                raise
-            finally:
-                # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
-                os.close(tsreadex_read_pipe)
-                if bridge_write_pipe is not None:
-                    os.close(bridge_write_pipe)
 
-        # FFmpeg 8 hardware backend
-        else:
-
-            # オプションを取得
-            hw_encoder_type = ENCODER_TYPE
-            encoder_options = self.buildFFmpeg8HardwareOptions(
-                self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel, channel.is_oneseg,
-            )
-            logging.info(
-                f'{self.live_stream.log_prefix} FFmpeg 8 ({ENCODER_TYPE}) Commands:\n'
-                f'{encoder_executable} {" ".join(encoder_options)}'
-            )
-
-            # エンコーダープロセスを非同期で作成・実行
-            try:
-                encoder = await asyncio.subprocess.create_subprocess_exec(
-                    encoder_executable,
-                    *encoder_options,
-                    stdin = tsreadex_read_pipe,  # tsreadex からの入力
-                    stdout = encoder_stdout,  # Bridge またはストリーム出力へ接続
-                    stderr = asyncio.subprocess.PIPE,  # ログ出力
-                    env = encoder_environment,
-                )
-            except BaseException:
-                # tsreadex の起動後にエンコーダーの起動に失敗した場合、
-                ## このままでは親プロセスが例外で脱出して tsreadex だけ残留するため、ここで回収する
+                # エンコーダープロセスを非同期で作成・実行
                 try:
-                    tsreadex.kill()
-                except Exception:
-                    pass
-                try:
-                    if bridge is not None:
-                        bridge.kill()
-                except Exception:
-                    pass
-                raise
-            finally:
-                # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
-                os.close(tsreadex_read_pipe)
-                if bridge_write_pipe is not None:
-                    os.close(bridge_write_pipe)
+                    encoder = await asyncio.subprocess.create_subprocess_exec(
+                        encoder_executable,
+                        *encoder_options,
+                        stdin = tsreadex_read_pipe,  # tsreadex からの入力
+                        stdout = encoder_stdout,  # Bridge またはストリーム出力へ接続
+                        stderr = asyncio.subprocess.PIPE,  # ログ出力
+                        env = encoder_environment,
+                    )
+                finally:
+                    # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
+                    ## 起動失敗時の再クローズを防ぐため、クローズ後は None を代入する
+                    if tsreadex_read_pipe is not None:
+                        os.close(tsreadex_read_pipe)
+                        tsreadex_read_pipe = None
+                    # Bridge の書き込み用パイプも子プロセスに渡したので、親プロセス側ではクローズする
+                    if bridge_write_pipe is not None:
+                        os.close(bridge_write_pipe)
+                        bridge_write_pipe = None
 
-        pipeline_stdout = bridge.stdout if bridge is not None else encoder.stdout
-        assert pipeline_stdout is not None
+            pipeline_stdout = bridge.stdout if bridge is not None else encoder.stdout
+            assert pipeline_stdout is not None
+
+        except BaseException:
+            # 生成フェーズ途中の例外・キャンセルでは、まず生成済みの全プロセスへ kill を送信する (この段階では await しない)
+            killed = self.KillSubprocesses(('tsreadex', tsreadex), ('encoder', encoder), ('bridge', bridge))
+            # 終了待機の停滞で解放処理がスキップされないよう、wait へ入る前に残っているパイプをすべて閉じる
+            ## 子プロセスへ引き渡されてクローズ済みのパイプは None になっている
+            for pipe in (tsreadex_read_pipe, bridge_read_pipe, bridge_write_pipe):
+                if pipe is not None:
+                    os.close(pipe)
+            tsreadex_read_pipe = bridge_read_pipe = bridge_write_pipe = None
+            # クライアント切断とアーカイバー破棄も wait 前に済ませる
+            self.live_stream.disconnectAll()
+            if self.live_stream.psi_data_archiver is not None:
+                self.live_stream.psi_data_archiver.destroy()
+                self.live_stream.psi_data_archiver = None
+            # Standby のまま例外を投げると LiveStream.connect() が次回接続でエンコードタスクを起動せず
+            # 配信不能に陥るため、主要資源の解放後に Offline へ遷移させて再試行可能にする
+            self.live_stream.setStatus('Offline', 'ライブストリームの処理中に予期しないエラーが発生しました。(E-18)')
+            # kill 済みプロセスの終了を待機してから再送出する
+            await self.WaitSubprocesses(killed)
+            raise
+
+        # ここまで到達した時点で tsreadex / encoder は起動済み (bridge は未使用の場合 None)
+        assert encoder is not None
 
         # ***** チューナーの起動と接続 *****
 
@@ -1291,6 +1395,11 @@ class LiveEncodingTask:
         ## run() の実行が完了するまで、ガベージコレクタにより非同期実行タスクが勝手に破棄されることを防ぐ
         ## ref: https://docs.astral.sh/ruff/rules/asyncio-dangling-task/
         background_tasks: set[asyncio.Task[None]] = set()
+
+        # 想定外例外による脱出かどうか
+        ## finally で主要資源の解放後に Offline 遷移と EDCB チューナー解放を行うためのフラグ
+        ## (CancelledError によるチャンネル切り替えでは handoff との競合を避けるためこれらを行わない)
+        unexpected_error = False
 
         # チューナー起動フェーズから Controller 実行までを CancelledError から保護する
         # チャンネル切り替え時に LiveStream.connect() からこのタスクがキャンセルされると、チューナー起動フェーズで
@@ -1341,19 +1450,7 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
-                    try:
-                        tsreadex.kill()
-                    except Exception:
-                        pass
-                    try:
-                        encoder.kill()
-                    except Exception:
-                        pass
-                    try:
-                        if bridge is not None:
-                            bridge.kill()
-                    except Exception:
-                        pass
+                    await self.TerminateSubprocesses(('tsreadex', tsreadex), ('encoder', encoder), ('bridge', bridge))
 
                     # エンコードタスクを停止する
                     await session.close()
@@ -1399,19 +1496,7 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
-                    try:
-                        tsreadex.kill()
-                    except Exception:
-                        pass
-                    try:
-                        encoder.kill()
-                    except Exception:
-                        pass
-                    try:
-                        if bridge is not None:
-                            bridge.kill()
-                    except Exception:
-                        pass
+                    await self.TerminateSubprocesses(('tsreadex', tsreadex), ('encoder', encoder), ('bridge', bridge))
 
                     # エンコードタスクを停止する
                     return
@@ -1442,19 +1527,7 @@ class LiveEncodingTask:
 
                     # 明示的にエンコーダープロセスを終了する
                     ## エンコーダープロセスはチューナー接続よりも前に起動されているため、ここで終了しないとプロセスがリークする
-                    try:
-                        tsreadex.kill()
-                    except Exception:
-                        pass
-                    try:
-                        encoder.kill()
-                    except Exception:
-                        pass
-                    try:
-                        if bridge is not None:
-                            bridge.kill()
-                    except Exception:
-                        pass
+                    await self.TerminateSubprocesses(('tsreadex', tsreadex), ('encoder', encoder), ('bridge', bridge))
 
                     # エンコードタスクを停止する
                     return
@@ -2013,34 +2086,64 @@ class LiveEncodingTask:
             ## CancelledError をキャッチしないとエンコーダープロセスの終了処理に到達せず、プロセスがリークしてしまう
             logging.debug(f'{self.live_stream.log_prefix} Encoding task was cancelled by channel switch.')
 
-        # ***** エンコードタスクの終了処理 *****
+        except Exception as ex:
+            # チューナー接続や Controller 内で想定外の例外が発生した場合でも、
+            ## finally の回収処理へ必ず到達させるため、ここでは記録だけ行って例外をそのまま再送出する
+            logging.error(f'{self.live_stream.log_prefix} Unexpected error in the encoding task:', exc_info=ex)
+            # Offline 遷移と EDCB チューナー解放は finally で主要資源の解放後に行う
+            ## ここで tuner.close() などを await すると、それが停滞した場合に finally のプロセス回収へ到達できない
+            unexpected_error = True
+            raise
 
-        # 稼働中フラグをオフにし、Reader・Writer・SubWriter・EncoderObServer のすべての非同期タスクを終了させる
-        is_running = False
+        finally:
+            # ***** エンコードタスクの終了処理 (パイプライン回収) *****
+            ## 想定外の例外で脱出する経路でも起動済みプロセスや HTTP セッションを残留させないよう finally で覆う
+            ## Restart / 通常終了のチューナー後処理 (handoff・Cancelling 判定を含む) はこの finally の外側で従来どおり行う
 
-        # 明示的にエンコーダープロセスを終了する
-        ## 何らかの理由で既に終了している場合は何もしない
-        try:
-            tsreadex.kill()
-        except Exception:
-            pass
-        try:
-            encoder.kill()
-        except Exception:
-            pass
-        try:
-            if bridge is not None:
-                bridge.kill()
-        except Exception:
-            pass
+            # 稼働中フラグをオフにし、Reader・Writer・SubWriter・EncoderObServer のすべての非同期タスクを終了させる
+            is_running = False
 
-        # すべての視聴中クライアントのライブストリームへの接続を切断する
-        self.live_stream.disconnectAll()
+            # まず全プロセスへ kill を送信する (この段階では await しない)
+            ## 終了待機の停滞や再キャンセルで後続の解放処理がスキップされないよう、kill 完了後に解放処理を行ってから wait する
+            killed = self.KillSubprocesses(('tsreadex', tsreadex), ('encoder', encoder), ('bridge', bridge))
 
-        # PSI/SI データアーカイバーを終了・破棄する
-        if self.live_stream.psi_data_archiver is not None:
-            self.live_stream.psi_data_archiver.destroy()
-            self.live_stream.psi_data_archiver = None
+            # await を伴わない解放処理を最初に済ませる
+            ## 以降の await (session.close() / tuner.close() / プロセス終了待機) が停滞・再キャンセルされても、
+            ## レスポンス close・クライアント切断・アーカイバー破棄は確実に完了している
+            if response is not None and response.closed is False:
+                response.close()
+            self.live_stream.disconnectAll()
+            if self.live_stream.psi_data_archiver is not None:
+                self.live_stream.psi_data_archiver.destroy()
+                self.live_stream.psi_data_archiver = None
+
+            # Mirakurun の HTTP セッションが残っていれば閉じる (正常経路では Writer 内で閉じ済み)
+            ## 閉じる途中で再キャンセルされてもチューナー解放と終了待機へ到達できるよう try/finally で囲む
+            try:
+                if session is not None and session.closed is False:
+                    await session.close()
+            finally:
+                try:
+                    # 想定外例外で脱出した場合は、主要資源の解放後に Offline へ遷移させ、
+                    # 所有中の EDCB チューナーを閉じて次回接続での再試行を可能にする
+                    ## 二重操作防止の所有権チェックは close() 側のガードに委ね、handoff 中 (Cancelling) は閉じない
+                    if unexpected_error is True:
+                        self.live_stream.setStatus('Offline', 'ライブストリームの処理中に予期しないエラーが発生しました。(E-18)')
+                        if LIVE_STREAM_BACKEND == 'EDCB' and self.live_stream.tuner is not None:
+                            if self.live_stream.tuner.getState() != 'Cancelling':
+                                try:
+                                    if await self.live_stream.tuner.close(self.live_stream.live_stream_id) is True:
+                                        self.live_stream.tuner = None
+                                except Exception as ex:
+                                    # close() は EDCB 通信・ストリーム破棄など複数の失敗要因を持つため例外型を限定できない
+                                    ## cleanup 例外で本来のエンコード例外を上書きせず、調査可能なログを残して終了待機を続行する
+                                    logging.error(
+                                        f'{self.live_stream.log_prefix} Failed to close EDCB tuner during unexpected error cleanup:',
+                                        exc_info=ex,
+                                    )
+                finally:
+                    # tuner.close() の失敗や再キャンセルでも、kill 済みプロセスの終了待機へ必ず到達する
+                    await self.WaitSubprocesses(killed)
 
         # エンコードタスクを再起動する（エンコーダーの再起動が必要な場合）
         if self.live_stream.getStatus().status == 'Restart':
