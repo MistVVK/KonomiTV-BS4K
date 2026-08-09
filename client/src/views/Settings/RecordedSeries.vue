@@ -107,8 +107,11 @@
                 <div class="settings__item-heading">OpenCode service</div>
                 <div class="settings__item-label">
                     AI バックエンド画面で登録した service を選びます。API キーや月次上限はそちらで管理します。<br>
-                    <router-link to="/settings/server/ai-backends">AIバックエンド設定を開く</router-link><br>
                 </div>
+                <v-btn class="settings__save-button mt-3" variant="flat" to="/settings/server/ai-backends">
+                    <Icon icon="fluent:settings-20-regular" class="mr-2" width="21px" />
+                    AIバックエンド設定を開く
+                </v-btn>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
                     :items="opencode_services" item-title="title" item-value="value"
@@ -124,9 +127,12 @@
                     <div class="settings__item-heading">モデル・認証・接続試験</div>
                     <div class="settings__item-label">
                         ACP / Codex・Grok Build のモデル・推論深さ・認証・接続試験は
-                        「AIバックエンド」ページで設定します。<br>
-                        <router-link to="/settings/server/ai-backends">AIバックエンド設定を開く</router-link><br>
+                        「AIバックエンド」ページで設定します。
                     </div>
+                    <v-btn class="settings__save-button mt-3" variant="flat" to="/settings/server/ai-backends">
+                        <Icon icon="fluent:settings-20-regular" class="mr-2" width="21px" />
+                        AIバックエンド設定を開く
+                    </v-btn>
                 </div>
             </template>
             <v-btn class="settings__save-button bg-secondary mt-6" variant="flat"
@@ -322,7 +328,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 
 import Message from '@/message';
-import AIBackend from '@/services/AIBackend';
+import AIBackend, { type AIAuthMode } from '@/services/AIBackend';
 import AnalysisTasks, { type IAnalysisTaskExecution } from '@/services/AnalysisTasks';
 import RecordedSeries, {
     type AIBackendKind,
@@ -346,6 +352,12 @@ const episode_acceptance_modes: {title: string; value: RecordedEpisodeNumberAcce
     {title: '高信頼度の結果のみ受理', value: 'HighConfidenceOnly'},
     {title: '有効な数値なら常に受理', value: 'Always'},
 ];
+const ai_auth_mode_labels: Record<AIAuthMode, string> = {
+    ApiKey: 'API キー',
+    OAuthSubscription: 'OAuth',
+    VertexAdc: 'Vertex ADC',
+    NoneLocal: '認証なし',
+};
 
 // API 取得前は入力欄を操作できないため、安全側の無効値を初期値にする。
 const settings = ref<IRecordedSeriesSettings>({
@@ -625,7 +637,7 @@ onMounted(async () => {
     ]);
     if (fetched_services !== null) {
         opencode_services.value = fetched_services.map(service => ({
-            title: `${service.service_name} (${
+            title: `${service.service_name} (${ai_auth_mode_labels[service.auth_mode]} · ${
                 service.opencode_provider_type === 'Catalog' ? service.opencode_provider_id : 'カスタムAPI'
             }/${service.opencode_model_id}${
                 service.opencode_model_variant ? `[${service.opencode_model_variant}]` : ''
