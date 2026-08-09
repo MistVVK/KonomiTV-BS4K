@@ -365,6 +365,15 @@ export default defineComponent({
                         }
                     }
 
+                    // 同期無効バッジは見出し右端のままにし、スイッチだけ見出し行の下へずらして重ねない
+                    // （全 settings__item--switch + --sync-disabled 共通）
+                    &.settings__item--sync-disabled {
+                        .settings__item-switch {
+                            // 見出し 16.5px + バッジ余白ぶんを空け、以降の説明文エリアで縦中央にする
+                            top: 28px;
+                        }
+                    }
+
                     .settings__item-heading, .settings__item-label {
                         cursor: pointer;
                     }
