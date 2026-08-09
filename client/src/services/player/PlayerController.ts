@@ -1161,6 +1161,14 @@ class PlayerController {
             }
         });
 
+        // DPlayer は画質切り替え用の新しい video 要素を、videoWrapAspect 内の最初の子孫 div の直前へ挿入する。
+        // ARIB-TTML の SVG foreignObject 内にも div があるため、直接の子でない要素を insertBefore() の基準にして
+        // NotFoundError になる。現在の video 直後へ非表示の直接子 div を置き、常に安全な挿入基準を先に見つけさせる。
+        const quality_switch_anchor = document.createElement('div');
+        quality_switch_anchor.hidden = true;
+        quality_switch_anchor.className = 'dplayer-quality-switch-anchor';
+        this.player.template.videoWrapAspect.insertBefore(quality_switch_anchor, this.player.video.nextSibling);
+
         if (this.playback_mode === 'Video' && player_store.recorded_program.recorded_video.has_video === false) {
             this.player.container.classList.add('dplayer-audio-only');
         }
