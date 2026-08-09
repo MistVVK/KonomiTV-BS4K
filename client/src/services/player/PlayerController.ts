@@ -955,6 +955,9 @@ class PlayerController {
                         // MSE in Worker が使えない環境では自動的に mpegts.js 側でフォールバックされるため、基本的に true を設定する
                         // ただし Windows 版 Microsoft Edge では MSE in Worker 有効時のみ H.265 / HEVC 再生が動作しないため、この場合のみ無効化する
                         enableWorkerForMSE: (is_hevc_playback === true && is_hevc_video_supported_in_worker === false) ? false : true,
+                        // duration 不明のライブ fMP4 とハードウェアデコーダーの組み合わせでは、十分な MSE バッファがあっても
+                        // フレームドロップが発生する環境があるため、有限 duration の init segment を使う
+                        forceMSEStreamLivenessRecorded: true,
                         // 再生開始まで 2048KB のバッファを貯める (?)
                         // あまり大きくしすぎてもどうも効果がないようだが、小さくしたり無効化すると特に Safari で不安定になる
                         enableStashBuffer: true,
