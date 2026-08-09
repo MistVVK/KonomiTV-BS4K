@@ -280,8 +280,8 @@ export default defineComponent({
             video_streaming_quality_cellular: QUALITY_H264,
 
             streaming_video_codecs: [
-                {title: 'H.264 / AVC（互換性優先）', value: 'avc'},
-                {title: 'H.265 / HEVC（通信量優先）', value: 'hevc'},
+                {title: 'H.264 / AVC', value: 'avc'},
+                {title: 'H.265 / HEVC', value: 'hevc'},
             ],
             recorded_streaming_video_codecs: [] as IRecordedPlaybackCodecOption[],
             recorded_streaming_audio_codecs: Videos.buildRecordedPlaybackAudioCodecOptions(),

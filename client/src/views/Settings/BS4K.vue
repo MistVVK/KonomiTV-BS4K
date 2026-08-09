@@ -456,8 +456,8 @@ const encoder_bs4k_low_latency_warning_dialog = ref(false);
 const bs4k_ignore_viewer_low_latency_warning_dialog = ref(false);
 const network_circuits = ['Wi-Fi 回線時', 'モバイル回線時'];
 const streaming_video_codecs = [
-    {title: 'H.264 / AVC（互換性優先）', value: 'avc'},
-    {title: 'H.265 / HEVC（通信量優先）', value: 'hevc'},
+    {title: 'H.264 / AVC', value: 'avc'},
+    {title: 'H.265 / HEVC', value: 'hevc'},
 ];
 const recorded_streaming_video_codecs = ref<IRecordedPlaybackCodecOption[]>([]);
 const recorded_streaming_audio_codecs = Videos.buildRecordedPlaybackAudioCodecOptions();

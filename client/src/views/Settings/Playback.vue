@@ -32,7 +32,7 @@
             </div>
 
             <div class="settings__item settings__item--sync-disabled">
-                <div class="settings__item-heading">ライブ・録画共通のデフォルト画質</div>
+                <div class="settings__item-heading">画質</div>
                 <div class="settings__item-label">
                     ライブ視聴と録画再生の開始時に同じ画質を使います。視聴中の一時変更は保存値を書き換えません。<br>
                 </div>
@@ -43,7 +43,7 @@
             </div>
 
             <div class="settings__item settings__item--sync-disabled">
-                <div class="settings__item-heading">ライブ・録画共通の映像コーデック</div>
+                <div class="settings__item-heading">映像コーデック</div>
                 <div class="settings__item-label">
                     AV1 を既定とし、再生前にブラウザ MSE とライブ・録画それぞれの能力から実効値を確定します。<br>
                     理由が付いた項目も将来の能力追加に備えた希望値として選択できます。
@@ -55,7 +55,7 @@
             </div>
 
             <div class="settings__item settings__item--sync-disabled">
-                <div class="settings__item-heading">ライブ・録画共通の音声コーデック</div>
+                <div class="settings__item-heading">音声コーデック</div>
                 <div class="settings__item-label">
                     Opus を既定とし、利用できない場合だけ再生開始前に AAC を選びます。再生開始後の自動変更は行いません。
                 </div>
@@ -91,7 +91,7 @@
 
             <div v-else class="settings__item settings__item--switch settings__item--sync-disabled">
                 <label class="settings__item-heading" :for="`playback-24fps-${broadcast_tab}-${network_tab}`">
-                    ライブ・録画共通の24fpsモード
+                    24fpsモード
                 </label>
                 <label class="settings__item-label" :for="`playback-24fps-${broadcast_tab}-${network_tab}`">
                     映画やアニメのテレシネ由来フレームを検出し、本来の動きに近づけます。60fps画質では60fpsを優先します。<br>
@@ -167,7 +167,7 @@ const capabilities = ref<IKonomiTVBS4KPlaybackCapabilities>({video: [], audio: [
 const is_bs4k = computed(() => broadcast_tab.value === 1);
 const is_cellular = computed(() => network_tab.value === 1);
 const profile_title = computed(() =>
-    `${is_bs4k.value ? 'BS4K' : '通常放送'}・${is_cellular.value ? 'モバイル回線' : 'Wi-Fi'} プロファイル`,
+    `${is_bs4k.value ? 'BS4K' : '通常放送'} / ${is_cellular.value ? 'モバイル' : 'Wi-Fi'}`,
 );
 const selected_quality = computed(() => settingsStore.settings[
     getKonomiTVBS4KPlaybackStreamingQualitySettingKey(is_bs4k.value, is_cellular.value)

@@ -1160,10 +1160,10 @@ class Videos {
         konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec = 'aac',
     ): IKonomiTVBS4KPlaybackVideoCodecOption[] {
         const konomitv_bs4k_definitions: Record<KonomiTVBS4KPlaybackVideoCodec, string> = {
-            avc: 'H.264 / AVC（互換性優先）',
+            avc: 'H.264 / AVC',
             hevc: 'H.265 / HEVC',
-            vp9: 'Google VP9（WebUI 専用 TS・実験的）',
-            av1: `Alliance for Open Media AV1${konomitv_bs4k_encoder === 'FFmpeg' ? '（実験的）' : ''}`,
+            vp9: 'VP9',
+            av1: 'AV1',
         };
         return (Object.keys(konomitv_bs4k_definitions) as KonomiTVBS4KPlaybackVideoCodec[]).map(
             (konomitv_bs4k_codec) => {
@@ -1277,8 +1277,8 @@ class Videos {
         },
     ): IKonomiTVBS4KPlaybackAudioCodecOption[] {
         const konomitv_bs4k_definitions: Record<KonomiTVBS4KPlaybackAudioCodec, string> = {
-            aac: 'AAC（互換性優先）',
-            opus: 'Opus（音質・圧縮効率優先）',
+            aac: 'AAC',
+            opus: 'Opus',
         };
         return (Object.keys(konomitv_bs4k_definitions) as KonomiTVBS4KPlaybackAudioCodec[]).map((konomitv_bs4k_codec) => {
             const konomitv_bs4k_resolved_combination =
@@ -1322,9 +1322,9 @@ class Videos {
     static buildRecordedPlaybackAudioCodecOptions(): IRecordedPlaybackAudioCodecOption[] {
         const is_opus_supported = this.isOpusAudioSupported();
         return [
-            {title: 'AAC（互換性優先）', value: 'aac', reason: null, props: {disabled: false}},
+            {title: 'AAC', value: 'aac', reason: null, props: {disabled: false}},
             {
-                title: `Opus（音質・圧縮効率優先）${is_opus_supported ? '' : '（ブラウザ非対応）'}`,
+                title: `Opus${is_opus_supported ? '' : '（ブラウザ非対応）'}`,
                 value: 'opus',
                 reason: is_opus_supported ? null : 'このブラウザの MSE が対応していません',
                 props: {disabled: false},
