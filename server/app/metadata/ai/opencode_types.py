@@ -84,9 +84,32 @@ class OpenCodePromptRequest(TypedDict):
     format: NotRequired[OpenCodeJsonSchemaFormat]
     system: NotRequired[str]
     noReply: NotRequired[bool]
+    # OpenCode が provider/model ごとに広告する推論深度などの variant 名。
+    variant: NotRequired[str]
     # ツールの有効/無効（例: {'websearch': True}）。デフォルトのツールセットに
     # websearch は含まれないため、web 検索を使う agent では明示指定が必要。
     tools: NotRequired[dict[str, bool]]
+
+
+class KonomiTVBS4KOpenCodeProviderOptions(TypedDict):
+    """KonomiTV-BS4K 管理カスタム provider の接続オプション。"""
+
+    baseURL: str
+
+
+class KonomiTVBS4KOpenCodeProviderModel(TypedDict):
+    """カスタム provider が OpenCode へ公開する1モデル。"""
+
+    name: str
+
+
+class KonomiTVBS4KOpenCodeProviderConfig(TypedDict):
+    """opencode.json の provider 1件分。"""
+
+    npm: Literal['@ai-sdk/openai-compatible', '@ai-sdk/anthropic']
+    name: str
+    options: KonomiTVBS4KOpenCodeProviderOptions
+    models: dict[str, KonomiTVBS4KOpenCodeProviderModel]
 
 
 class OpenCodeNormalizedUsage(TypedDict):

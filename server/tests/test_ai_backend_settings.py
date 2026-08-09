@@ -14,6 +14,7 @@ from app.metadata.ai.AIBackendSettings import (
     AIBackendServiceCreate,
     AIBackendServiceUpdate,
     AIBackendSettingsStore,
+    BuildKonomiTVBS4KOpenCodeProviderID,
     IsRecordedSeriesReferencingService,
     NormalizeAPIBaseURL,
 )
@@ -68,6 +69,7 @@ def test_create_and_list_service(ai_paths: Path) -> None:
             service_name='DeepSeek',
             opencode_provider_id='deepseek',
             opencode_model_id='deepseek-chat',
+            opencode_model_variant='high',
             auth_mode='ApiKey',
             billing_mode='Metered',
             monthly_cost_limit_usd=Decimal('10.00'),
@@ -77,9 +79,56 @@ def test_create_and_list_service(ai_paths: Path) -> None:
     listed = AIBackendSettingsStore.listServices()
     assert len(listed) == 1
     assert listed[0].service_name == 'DeepSeek'
+    assert listed[0].opencode_model_variant == 'high'
+    assert listed[0].getAuditModelLabel() == 'opencode:deepseek/deepseek-chat[high]'
     response = AIBackendSettingsStore.toResponse(service)
     assert response.auth_configured is False
     assert 'api_key' not in response.model_dump()
+
+
+@pytest.mark.parametrize(
+    ('provider_type', 'api_base_url'),
+    [
+        ('OpenAICompatible', 'https://api.example.com/v1'),
+        ('AnthropicCompatible', 'https://api.example.com'),
+    ],
+)
+def test_create_custom_provider_service(
+    ai_paths: Path,
+    provider_type: str,
+    api_base_url: str,
+) -> None:
+    """互換 API は service 固有 provider ID と構造化出力方式を保存する。"""
+
+    _ = ai_paths
+    service = AIBackendSettingsStore.createService(AIBackendServiceCreate.model_validate({
+        'service_name': 'Custom Provider',
+        'opencode_provider_type': provider_type,
+        'opencode_model_id': 'custom-model',
+        'structured_output_mode': 'JSONText',
+        'auth_mode': 'ApiKey',
+        'billing_mode': 'Metered',
+        'api_base_url': api_base_url,
+    }))
+    assert service.opencode_provider_id == BuildKonomiTVBS4KOpenCodeProviderID(service.service_id)
+    assert service.opencode_provider_type == provider_type
+    assert service.structured_output_mode == 'JSONText'
+    assert service.api_base_url == api_base_url
+
+
+def test_custom_provider_rejects_oauth(ai_paths: Path) -> None:
+    """カスタム provider は共有 provider 向け OAuth 認証を受け付けない。"""
+
+    _ = ai_paths
+    with pytest.raises(ValueError, match='ApiKey または NoneLocal'):
+        AIBackendSettingsStore.createService(AIBackendServiceCreate.model_validate({
+            'service_name': 'Invalid Custom Provider',
+            'opencode_provider_type': 'OpenAICompatible',
+            'opencode_model_id': 'custom-model',
+            'auth_mode': 'OAuthSubscription',
+            'billing_mode': 'Subscription',
+            'api_base_url': 'https://api.example.com/v1',
+        }))
 
 
 def test_reject_legacy_backend_kind(ai_paths: Path) -> None:
@@ -251,6 +300,7 @@ def test_update_service_clear_limits(ai_paths: Path) -> None:
             service_name='U',
             opencode_provider_id='deepseek',
             opencode_model_id='m',
+            opencode_model_variant='high',
             auth_mode='ApiKey',
             billing_mode='Metered',
             monthly_token_limit=1000,
@@ -258,8 +308,12 @@ def test_update_service_clear_limits(ai_paths: Path) -> None:
     )
     updated = AIBackendSettingsStore.updateService(
         service.service_id,
-        AIBackendServiceUpdate(clear_monthly_token_limit=True),
+        AIBackendServiceUpdate(
+            clear_opencode_model_variant=True,
+            clear_monthly_token_limit=True,
+        ),
     )
+    assert updated.opencode_model_variant is None
     assert updated.monthly_token_limit is None
 
 

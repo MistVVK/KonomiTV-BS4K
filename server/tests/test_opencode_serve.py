@@ -12,6 +12,10 @@ from pathlib import Path
 import pytest
 
 from app.metadata.ai import opencode_serve
+from app.metadata.ai.AIBackendSettings import (
+    AIBackendServiceCreate,
+    AIBackendSettingsStore,
+)
 
 
 def test_ensure_runtime_directories_seeds_config(
@@ -42,6 +46,61 @@ def test_ensure_runtime_directories_seeds_config(
     assert seeded.is_file()
     assert seeded.read_text(encoding='utf-8') == '{"agent":{}}\n'
     assert workspace.is_dir()
+
+
+@pytest.mark.parametrize(
+    ('provider_type', 'expected_npm'),
+    [
+        ('OpenAICompatible', '@ai-sdk/openai-compatible'),
+        ('AnthropicCompatible', '@ai-sdk/anthropic'),
+    ],
+)
+def test_runtime_config_registers_custom_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_type: str,
+    expected_npm: str,
+) -> None:
+    """登録 service を秘密なしの OpenCode custom provider 設定へ変換する。"""
+
+    import json
+
+    home = tmp_path / 'opencode-home'
+    config_home = home / 'config'
+    data_home = home / 'data'
+    workspace = tmp_path / 'opencode-workspace'
+    log_path = tmp_path / 'logs' / 'opencode-serve.log'
+    template = tmp_path / 'template-opencode.json'
+    template.write_text('{"agent":{}}\n', encoding='utf-8')
+    monkeypatch.setattr(AIBackendSettingsStore, 'SETTINGS_PATH', tmp_path / 'ai-settings.json')
+    monkeypatch.setattr(AIBackendSettingsStore, 'SECRETS_PATH', tmp_path / 'secrets.json')
+    service = AIBackendSettingsStore.createService(AIBackendServiceCreate.model_validate({
+        'service_name': 'Custom Model',
+        'opencode_provider_type': provider_type,
+        'opencode_model_id': 'vendor/model-v1',
+        'auth_mode': 'ApiKey',
+        'billing_mode': 'Metered',
+        'api_base_url': 'https://api.example.com/v1',
+    }))
+
+    monkeypatch.setattr(opencode_serve, 'OPENCODE_HOME_ROOT', home)
+    monkeypatch.setattr(opencode_serve, 'OPENCODE_XDG_CONFIG_HOME', config_home)
+    monkeypatch.setattr(opencode_serve, 'OPENCODE_XDG_DATA_HOME', data_home)
+    monkeypatch.setattr(opencode_serve, 'OPENCODE_WORKSPACE_DIR', workspace)
+    monkeypatch.setattr(opencode_serve, 'OPENCODE_SERVE_LOG_PATH', log_path)
+    monkeypatch.setattr(opencode_serve, 'OPENCODE_BUNDLED_CONFIG_PATH', template)
+    monkeypatch.setattr(opencode_serve, 'OPENCODE_REPO_CONFIG_PATH', template)
+
+    opencode_serve.EnsureOpenCodeRuntimeDirectories()
+
+    runtime_config = json.loads(
+        (config_home / 'opencode' / 'opencode.json').read_text(encoding='utf-8'),
+    )
+    custom = runtime_config['provider'][service.opencode_provider_id]
+    assert custom['npm'] == expected_npm
+    assert custom['options'] == {'baseURL': 'https://api.example.com/v1'}
+    assert custom['models'] == {'vendor/model-v1': {'name': 'vendor/model-v1'}}
+    assert 'api_key' not in json.dumps(runtime_config).lower()
 
 
 def test_ensure_runtime_directories_resyncs_stale_episode_web_permissions(

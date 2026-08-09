@@ -29,7 +29,10 @@ from app.metadata.ai.AIBackendSettings import (
     AIBackendServiceResponse,
     AIBackendServiceUpdate,
     AIBackendSettingsStore,
+    IsKonomiTVBS4KManagedOpenCodeProviderID,
     IsRecordedSeriesReferencingService,
+    KonomiTVBS4KOpenCodeProviderType,
+    KonomiTVBS4KStructuredOutputMode,
 )
 from app.metadata.ai.backends import (
     ConnectionTestCheck,
@@ -53,6 +56,7 @@ from app.metadata.ai.opencode_client import (
 from app.metadata.ai.opencode_serve import (
     IsOpenCodeAvailable,
     ProbeOpenCodeAvailability,
+    SyncKonomiTVBS4KOpenCodeRuntimeConfig,
 )
 from app.metadata.ai.recorded_series_ai import (
     GetACPCredentialOperationLock,
@@ -220,6 +224,11 @@ class AIBackendProviderModelResponse(BaseModel):
 
     model_id: str
     model_name: str
+    # OpenCode が当該モデルへ広告する variant 名。推論モデルでは思考の深さに対応する。
+    variants: list[str] = Field(default_factory=list)
+    # OpenAI の Priority processing を使う Fast モデルかと、その通常版 / Fast 版の対を返す。
+    openai_fast_mode: bool = False
+    openai_paired_model_id: str | None = None
     # モデル能力（WebSearch 等）。無ければ空。
     capabilities: dict[str, Any] = Field(default_factory=dict)
 
@@ -314,8 +323,11 @@ class AIBackendConnectionTestRequest(BaseModel):
     service_id: Annotated[str | None, Field(min_length=36, max_length=36)] = None
     # draft（service_id 無し）用
     service_name: Annotated[str | None, Field(min_length=1, max_length=128)] = None
+    opencode_provider_type: Annotated[KonomiTVBS4KOpenCodeProviderType | None, Field()] = None
     opencode_provider_id: Annotated[str | None, Field(min_length=1, max_length=64)] = None
     opencode_model_id: Annotated[str | None, Field(min_length=1, max_length=255)] = None
+    opencode_model_variant: Annotated[str | None, Field(max_length=64)] = None
+    structured_output_mode: Annotated[KonomiTVBS4KStructuredOutputMode | None, Field()] = None
     auth_mode: Annotated[
         Literal['ApiKey', 'OAuthSubscription', 'VertexAdc', 'NoneLocal'] | None,
         Field(),
@@ -408,11 +420,13 @@ def _httpErrorFromOpenCode(error: OpenCodeClientError) -> HTTPException:
 
 
 def _ExtractProviderModels(
+    provider_id: str,
     raw_models: object,
 ) -> tuple[list[AIBackendProviderModelResponse], str | None]:
     """OpenCode provider.models を API 応答形へ整形する。
 
     Args:
+        provider_id: OpenCode provider ID。
         raw_models: dict[model_id, ModelInfo] または不正値。
 
     Returns:
@@ -420,6 +434,9 @@ def _ExtractProviderModels(
     """
 
     model_list: list[AIBackendProviderModelResponse] = []
+    # OpenAI Fast は同じ api.id の通常版 / serviceTier=priority 版として広告される。
+    # UI がモデル名の suffix に依存せず安全に切り替えられるよう、api.id ごとの対を記録する。
+    openai_model_pair_metadata: dict[str, tuple[str, bool]] = {}
     default_model_id: str | None = None
     if not isinstance(raw_models, dict):
         return model_list, default_model_id
@@ -428,6 +445,8 @@ def _ExtractProviderModels(
         if not isinstance(model_id, str) or model_id.strip() == '':
             continue
         model_name = model_id
+        variants: list[str] = []
+        openai_fast_mode = False
         capabilities: dict[str, Any] = {}
         if isinstance(model_info, dict):
             name = model_info.get('name')
@@ -436,13 +455,51 @@ def _ExtractProviderModels(
             caps = model_info.get('capabilities')
             if isinstance(caps, dict):
                 capabilities = caps
+            raw_variants = model_info.get('variants')
+            if isinstance(raw_variants, dict):
+                variants = [
+                    key for key in raw_variants
+                    if isinstance(key, str) and key.strip() != ''
+                ]
+            if provider_id == 'openai':
+                options = model_info.get('options')
+                openai_fast_mode = (
+                    isinstance(options, dict) and options.get('serviceTier') == 'priority'
+                )
+                api = model_info.get('api')
+                api_model_id = api.get('id') if isinstance(api, dict) else None
+                if isinstance(api_model_id, str) and api_model_id.strip() != '':
+                    openai_model_pair_metadata[model_id] = (
+                        api_model_id.strip(),
+                        openai_fast_mode,
+                    )
             if default_model_id is None and model_info.get('default') is True:
                 default_model_id = model_id
         model_list.append(AIBackendProviderModelResponse(
             model_id=model_id,
             model_name=model_name,
+            variants=variants,
+            openai_fast_mode=openai_fast_mode,
             capabilities=capabilities,
         ))
+
+    # 同じ OpenAI api.id で Fast 属性が反対のモデルだけを対として返す。
+    for model in model_list:
+        pair_metadata = openai_model_pair_metadata.get(model.model_id)
+        if pair_metadata is None:
+            continue
+        api_model_id, is_fast = pair_metadata
+        paired_model = next(
+            (
+                candidate
+                for candidate in model_list
+                if candidate.model_id != model.model_id
+                and openai_model_pair_metadata.get(candidate.model_id) == (api_model_id, not is_fast)
+            ),
+            None,
+        )
+        if paired_model is not None:
+            model.openai_paired_model_id = paired_model.model_id
     return model_list, default_model_id
 
 
@@ -601,6 +658,17 @@ def _BuildProviderCatalog(
     raw_all_value = catalog_payload.get('all')
     raw_all: list[Any] = raw_all_value if isinstance(raw_all_value, list) else []
     connected_raw = catalog_payload.get('connected')
+    defaults_raw = catalog_payload.get('default')
+    default_model_ids: dict[str, str] = {}
+    if isinstance(defaults_raw, dict):
+        default_model_ids = {
+            provider_id.strip(): model_id.strip()
+            for provider_id, model_id in defaults_raw.items()
+            if isinstance(provider_id, str)
+            and provider_id.strip() != ''
+            and isinstance(model_id, str)
+            and model_id.strip() != ''
+        }
     connected_ids: set[str] = set()
     if isinstance(connected_raw, list):
         for item in connected_raw:
@@ -619,6 +687,9 @@ def _BuildProviderCatalog(
         if not isinstance(provider_id, str) or provider_id.strip() == '':
             continue
         provider_id = provider_id.strip()
+        # service ごとのカスタム provider は専用フォームで編集し、標準カタログへ重複表示しない。
+        if IsKonomiTVBS4KManagedOpenCodeProviderID(provider_id):
+            continue
         name_raw = raw.get('name')
         provider_name = (
             name_raw.strip()
@@ -632,7 +703,10 @@ def _BuildProviderCatalog(
                 item.strip() for item in env_raw
                 if isinstance(item, str) and item.strip() != ''
             ]
-        models, default_model_id = _ExtractProviderModels(raw.get('models'))
+        models, default_model_id = _ExtractProviderModels(provider_id, raw.get('models'))
+        # 現行 OpenCode は provider ごとの既定を payload.default に返す。
+        # 旧 payload / テスト fixture の model.default は fallback として維持する。
+        default_model_id = default_model_ids.get(provider_id, default_model_id)
         auth_methods, support_kind, support_note = _BuildAuthMethodsForProvider(
             provider_id,
             env_names=env_names,
@@ -651,6 +725,27 @@ def _BuildProviderCatalog(
 
     providers.sort(key=lambda item: (item.provider_name.lower(), item.provider_id))
     return providers
+
+
+async def _SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange() -> None:
+    """service CRUD 後に runtime config を再生成し、必要なら OpenCode へ反映する。
+
+    Returns:
+        None
+
+    Raises:
+        OSError: runtime config の生成・保存に失敗した場合。
+    """
+
+    changed = SyncKonomiTVBS4KOpenCodeRuntimeConfig()
+    if changed is False or IsOpenCodeAvailable() is False:
+        return
+    try:
+        await OpenCodeClient().reloadConfiguration()
+    except OpenCodeClientError as error:
+        # 設定ファイルは更新済みで、次回 serve 起動または auth 更新時には反映される。
+        # service 自体を巻き戻すより安全なため警告に留める。
+        logging.warning(f'[AIBackend] Failed to reload OpenCode runtime config: {error}')
 
 
 async def _removeOpenCodeAuthIfUnshared(provider_id: str, *, excluding_service_id: str | None) -> None:
@@ -1435,6 +1530,7 @@ async def AIBackendServiceCreateAPI(
     response.headers.update(NO_STORE_HEADERS)
     try:
         service = AIBackendSettingsStore.createService(body)
+        await _SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange()
         return AIBackendSettingsStore.toResponse(service)
     except ValueError as error:
         raise HTTPException(
@@ -1501,6 +1597,7 @@ async def AIBackendServiceUpdateAPI(
         if previous is None:
             raise KeyError(service_id)
         service = AIBackendSettingsStore.updateService(service_id, body)
+        await _SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange()
         # provider が変わった場合、旧 provider の auth を参照カウント付きで掃除
         if previous.opencode_provider_id != service.opencode_provider_id:
             try:
@@ -1577,6 +1674,12 @@ async def AIBackendServiceDeleteAPI(
     # OpenCode service の削除・認証変更は話数 Web 検索の能力証明 fingerprint を変えるため、
     # OpenCode 全体の proof を失効させる（fingerprint は service 定義を含むため再試験で再取得される）。
     invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
+
+    try:
+        await _SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange()
+    except OSError as error:
+        # service は削除済み。次回起動時に必ず正本から再生成されるため 204 を維持する。
+        logging.warning(f'[AIBackendServiceDeleteAPI] Runtime config sync failed: {error}')
 
     # 順序: KonomiTV secrets/settings 更新済み → OpenCode auth 除去
     try:
@@ -2022,6 +2125,14 @@ async def AIBackendConnectionTestAPI(
                 )
         else:
             # draft から一時 service を組み立てる。
+            provider_type = body.opencode_provider_type or 'Catalog'
+            if provider_type != 'Catalog':
+                # カスタム provider は runtime config への登録が必要なため、先に service として保存する。
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail='Custom OpenCode providers must be saved before connection testing.',
+                    headers=NO_STORE_HEADERS,
+                )
             if (
                 body.service_name is None
                 or body.opencode_provider_id is None
@@ -2041,8 +2152,11 @@ async def AIBackendConnectionTestAPI(
                 draft_service = AIBackendService(
                     service_id=str(uuid4()),
                     service_name=body.service_name,
+                    opencode_provider_type=provider_type,
                     opencode_provider_id=body.opencode_provider_id,
                     opencode_model_id=body.opencode_model_id,
+                    opencode_model_variant=body.opencode_model_variant,
+                    structured_output_mode=body.structured_output_mode or 'Auto',
                     auth_mode=body.auth_mode,
                     billing_mode=body.billing_mode,
                     api_base_url=body.api_base_url,
@@ -2084,7 +2198,7 @@ async def AIBackendConnectionTestAPI(
             result = ConnectionTestResult(
                 success=False,
                 latency_ms=error.latency_ms or 0,
-                model=f'opencode:{backend.service.opencode_provider_id}/{backend.service.opencode_model_id}',
+                model=backend.service.getAuditModelLabel(),
                 message=str(error.code),
                 http_status=error.http_status,
                 error_code=error.code,

@@ -171,14 +171,14 @@ def test_opencode_episode_session_passes_search_only_tools(
     """OpenCode episode session は tools に websearch のみ True を渡す。"""
 
     backend = OpenCodeBackend(_service(), api_key='sk-test')
-    captured: dict[str, Any] = {}
+    captured_tools: list[dict[str, bool] | None] = []
 
     class FakeClient:
         async def createSession(self) -> str:
             return 'sess-1'
 
         async def promptJsonSchema(self, *_args: Any, **kwargs: Any) -> dict[str, Any]:
-            captured['tools'] = kwargs.get('tools')
+            captured_tools.append(kwargs.get('tools'))
             return {
                 'parts': [
                     {
@@ -229,6 +229,10 @@ def test_opencode_episode_session_passes_search_only_tools(
     monkeypatch.setattr(backend, '_client', FakeClient())
     monkeypatch.setattr(backend, 'ensureAuthInjected', FakeEnsure)
     result = asyncio.run(backend.lookupEpisode(_lookup_context()))
-    assert captured['tools'] == {'websearch': True, 'webfetch': False}
+    assert captured_tools[0] == {'websearch': True, 'webfetch': False}
+    assert all(
+        tools == {'websearch': False, 'webfetch': False}
+        for tools in captured_tools[1:]
+    )
     assert result.web_search_performed is True
     assert result.outcome in {'InsufficientEvidence', 'Resolved', 'NotNumbered'}

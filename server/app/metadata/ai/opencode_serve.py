@@ -7,6 +7,7 @@ KonomiTV.py の reload 親プロセスから 1 回だけ StartOpenCodeServe() �
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import shutil
 import signal
@@ -17,6 +18,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -39,6 +41,11 @@ from app.constants import (
     OPENCODE_WORKSPACE_DIR,
     OPENCODE_XDG_CONFIG_HOME,
     OPENCODE_XDG_DATA_HOME,
+)
+from app.metadata.ai.opencode_types import (
+    KonomiTVBS4KOpenCodeProviderConfig,
+    KonomiTVBS4KOpenCodeProviderModel,
+    KonomiTVBS4KOpenCodeProviderOptions,
 )
 
 
@@ -202,6 +209,101 @@ def _WriteOpenCodeConfigAtomically(path: Path, content: str) -> None:
         os.close(final_fd)
 
 
+def _BuildKonomiTVBS4KOpenCodeRuntimeConfig(template_text: str) -> str:
+    """正本テンプレートへ登録済みカスタム provider を合成する。
+
+    API キーは OpenCode の auth ストアへ別経路で注入するため、この設定には
+    provider 種別・base URL・model ID 以外を含めない。
+
+    Args:
+        template_text: docker/opencode/opencode.json の本文。
+
+    Returns:
+        カスタム provider を合成した製品用 OpenCode 設定 JSON。
+
+    Raises:
+        OSError: テンプレートまたは AI service 設定が不正な場合。
+    """
+
+    from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
+
+    try:
+        config = json.loads(template_text)
+        services = AIBackendSettingsStore.listServices()
+    except (json.JSONDecodeError, TypeError, ValueError, OSError) as error:
+        raise OSError('Failed to build OpenCode product config.') from error
+    if isinstance(config, dict) is False:
+        raise OSError('OpenCode product config template must be a JSON object.')
+
+    custom_services = [
+        service for service in services
+        if service.opencode_provider_type != 'Catalog'
+    ]
+    if not custom_services:
+        return template_text
+
+    raw_providers = config.get('provider')
+    providers: dict[str, object] = dict(raw_providers) if isinstance(raw_providers, dict) else {}
+    for service in custom_services:
+        assert service.api_base_url is not None
+        npm_package: Literal['@ai-sdk/openai-compatible', '@ai-sdk/anthropic']
+        if service.opencode_provider_type == 'OpenAICompatible':
+            npm_package = '@ai-sdk/openai-compatible'
+        else:
+            npm_package = '@ai-sdk/anthropic'
+        model = KonomiTVBS4KOpenCodeProviderModel(name=service.opencode_model_id)
+        provider = KonomiTVBS4KOpenCodeProviderConfig(
+            npm=npm_package,
+            name=service.service_name,
+            options=KonomiTVBS4KOpenCodeProviderOptions(baseURL=service.api_base_url),
+            models={service.opencode_model_id: model},
+        )
+        providers[service.opencode_provider_id] = provider
+
+    if providers:
+        config['provider'] = providers
+    else:
+        config.pop('provider', None)
+    return json.dumps(config, ensure_ascii=False, indent=2) + '\n'
+
+
+def SyncKonomiTVBS4KOpenCodeRuntimeConfig() -> bool:
+    """正本テンプレートと AI service から runtime config を再生成する。
+
+    Returns:
+        ファイル内容を更新した場合は True、既に同一なら False。
+
+    Raises:
+        OSError: テンプレート読込・設定生成・書込に失敗した場合。
+    """
+
+    config_dir = OPENCODE_XDG_CONFIG_HOME / 'opencode'
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / 'opencode.json'
+    # bind source tree がある開発環境では変更中の repo template を優先する。
+    # 本番イメージには repo path が無いため、immutable な bundled template へフォールバックする。
+    source = OPENCODE_REPO_CONFIG_PATH
+    if source.is_file() is False:
+        source = OPENCODE_BUNDLED_CONFIG_PATH
+    if source.is_file() is False:
+        raise FileNotFoundError(
+            f'OpenCode product config template not found: {source}',
+        )
+    runtime_text = _BuildKonomiTVBS4KOpenCodeRuntimeConfig(source.read_text(encoding='utf-8'))
+    current_text = _ReadRegularFileText(config_path)
+    if current_text != runtime_text:
+        _WriteOpenCodeConfigAtomically(config_path, runtime_text)
+        return True
+
+    # 内容が同じでも権限だけ劣化するケースを修復する。
+    config_fd = os.open(config_path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        os.fchmod(config_fd, 0o600)
+    finally:
+        os.close(config_fd)
+    return False
+
+
 def EnsureOpenCodeRuntimeDirectories() -> None:
     """home / workspace / logs を作成し、製品用 config を seed する。
 
@@ -221,32 +323,10 @@ def EnsureOpenCodeRuntimeDirectories() -> None:
     ):
         directory.mkdir(parents=True, exist_ok=True)
 
-    # OpenCode は XDG_CONFIG_HOME/opencode/opencode.json を読む。
-    # 製品用 agent permission はテンプレートが正本であり、起動のたびに同期する。
-    # R-08 の検索専用モード (websearch allow / webfetch deny) を既存 home へも適用する。
-    config_dir = OPENCODE_XDG_CONFIG_HOME / 'opencode'
-    config_dir.mkdir(parents=True, exist_ok=True)
-    config_path = config_dir / 'opencode.json'
-    # bind source tree がある開発環境では変更中の repo template を優先する。
-    ## 本番イメージには repo path が無いため、immutable な bundled template へフォールバックする。
-    source = OPENCODE_REPO_CONFIG_PATH
-    if source.is_file() is False:
-        source = OPENCODE_BUNDLED_CONFIG_PATH
-    if source.is_file() is False:
-        raise FileNotFoundError(
-            f'OpenCode product config template not found: {source}',
-        )
-    template_text = source.read_text(encoding='utf-8')
-    current_text = _ReadRegularFileText(config_path)
-    if current_text != template_text:
-        _WriteOpenCodeConfigAtomically(config_path, template_text)
-    else:
-        # 内容が同じでも権限だけ劣化するケースを修復する。
-        config_fd = os.open(config_path, os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            os.fchmod(config_fd, 0o600)
-        finally:
-            os.close(config_fd)
+    # OpenCode は XDG_CONFIG_HOME/opencode/opencode.json を読む。製品用 agent permission
+    # と登録済みカスタム provider を起動のたびに正本から再生成する。
+    # R-08 の検索専用モード (websearch allow / webfetch deny) も既存 home へ適用する。
+    SyncKonomiTVBS4KOpenCodeRuntimeConfig()
 
     # workspace にソースを置かないことを保証する（.gitkeep のみ許可）。
     for child in OPENCODE_WORKSPACE_DIR.iterdir():

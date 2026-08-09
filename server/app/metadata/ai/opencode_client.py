@@ -240,6 +240,49 @@ class OpenCodeClient:
                 f'OpenCode instance dispose request failed: {error}',
             ) from error
 
+    async def reloadConfiguration(self) -> None:
+        """runtime config 更新後に OpenCode instance を再生成させる。
+
+        既知の全 provider で新規 lease を止め、実行中 session が解放されてから
+        dispose する。config 更新は instance 全体へ影響するため、変更対象 provider
+        だけを待つのでは不十分。
+
+        Returns:
+            None
+
+        Raises:
+            OpenCodeClientError: instance dispose 失敗。
+        """
+
+        # provider ID 順に mutation 権を取ることで、並行 reload 同士の取得順を固定する。
+        with _provider_states_lock:
+            states = [
+                (provider_id, state)
+                for (base_url, provider_id), state in _provider_states.items()
+                if base_url == self._base_url
+            ]
+        states.sort(key=lambda item: item[0])
+        acquired_states: list[_OpenCodeProviderState] = []
+        try:
+            for _provider_id, state in states:
+                async with state.condition:
+                    while state.auth_mutation_pending:
+                        await state.condition.wait()
+                    state.auth_mutation_pending = True
+                    acquired_states.append(state)
+
+            # 全 provider の入口を閉じたあと、既に実行中の session が自然終了するまで待つ。
+            for state in acquired_states:
+                async with state.condition:
+                    while state.active_lease_count > 0:
+                        await state.condition.wait()
+            await self._disposeInstance()
+        finally:
+            for state in reversed(acquired_states):
+                async with state.condition:
+                    state.auth_mutation_pending = False
+                    state.condition.notify_all()
+
     async def acquireProviderLease(
         self,
         provider_id: str,
@@ -840,6 +883,7 @@ class OpenCodeClient:
         text: str,
         provider_id: str,
         model_id: str,
+        variant: str | None,
         agent: str,
         schema: dict[str, Any],
         retry_count: int = 1,
@@ -854,6 +898,7 @@ class OpenCodeClient:
             text: ユーザー入力本文。
             provider_id: OpenCode provider ID。
             model_id: OpenCode model ID。
+            variant: OpenCode model variant。None のときはモデル既定値を使う。
             agent: 製品 agent 名。
             schema: JSON Schema 本体（include_format=True 時に送信）。
             retry_count: OpenCode 側の format.retryCount。
@@ -861,9 +906,8 @@ class OpenCodeClient:
             tools: ツールの有効/無効指定（例: {'websearch': True}）。websearch は
                 デフォルトのツールセットに含まれないため、web 検索を使う agent で
                 明示的に有効化する必要がある。
-            include_format: json_schema format を送るか。web ツール併用時は
-                StructuredOutput モードでモデルが web ツールを呼ばなくなるため
-                False にして、テキストから JSON を抽出する方式にする。
+            include_format: json_schema format を送るか。web ツールを呼ぶ検索ターンでは
+                False にし、検索完了後の JSON 生成ターンで service 設定に従い指定する。
 
         Returns:
             生の message 応答 dict（info / parts）。
@@ -888,6 +932,8 @@ class OpenCodeClient:
             'model': model_ref,
             'agent': agent,
         }
+        if variant is not None and variant.strip() != '':
+            body['variant'] = variant.strip()
         if include_format is False:
             # format を送らない場合は schema / retry_count は使用しない。
             pass

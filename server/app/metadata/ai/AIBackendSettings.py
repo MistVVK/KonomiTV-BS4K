@@ -28,12 +28,15 @@ from app.constants import DATA_DIR
 AIBackendKind = Literal['OpenCode']
 AIAuthMode = Literal['ApiKey', 'OAuthSubscription', 'VertexAdc', 'NoneLocal']
 AIBillingMode = Literal['Metered', 'Subscription', 'Local']
+KonomiTVBS4KOpenCodeProviderType = Literal['Catalog', 'OpenAICompatible', 'AnthropicCompatible']
+KonomiTVBS4KStructuredOutputMode = Literal['Auto', 'StructuredOutput', 'JSONText']
 
 _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
     re.IGNORECASE,
 )
 _PROVIDER_ID_RE = re.compile(r'^[a-z0-9][a-z0-9._-]{0,63}$')
+_MODEL_VARIANT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 _LEGACY_BACKEND_VALUES = frozenset({
     'OpenAICompatible',
     'AcpCodex',
@@ -82,8 +85,41 @@ def NewAIBackendServiceID() -> str:
     return str(uuid.uuid4())
 
 
+def BuildKonomiTVBS4KOpenCodeProviderID(service_id: str) -> str:
+    """カスタム provider に割り当てる service 固有 OpenCode provider ID を返す。
+
+    Args:
+        service_id: AI バックエンド service UUID。
+
+    Returns:
+        OpenCode 設定と auth API で共用する provider ID。
+    """
+
+    normalized_service_id = service_id.strip().lower()
+    if _UUID_RE.fullmatch(normalized_service_id) is None:
+        raise ValueError('service_id は UUID である必要があります。')
+    return f'konomitv-bs4k-{normalized_service_id}'
+
+
+def IsKonomiTVBS4KManagedOpenCodeProviderID(provider_id: str) -> bool:
+    """KonomiTV-BS4K が生成したカスタム provider ID かを返す。
+
+    Args:
+        provider_id: 判定する OpenCode provider ID。
+
+    Returns:
+        管理対象 ID なら True。
+    """
+
+    normalized_provider_id = provider_id.strip().lower()
+    prefix = 'konomitv-bs4k-'
+    if normalized_provider_id.startswith(prefix) is False:
+        return False
+    return _UUID_RE.fullmatch(normalized_provider_id[len(prefix):]) is not None
+
+
 def NormalizeAPIBaseURL(api_base_url: str) -> str:
-    """OpenAI 互換カスタム base URL を正規化する。
+    """OpenAI / Anthropic 互換カスタム base URL を正規化する。
 
     Args:
         api_base_url: 入力 URL。
@@ -121,8 +157,14 @@ class AIBackendService(BaseModel):
     service_name: Annotated[str, Field(min_length=1, max_length=128)]
     # OpenCode 以外は拒否（クリーンブレーク）
     backend_kind: Annotated[AIBackendKind, Field()] = 'OpenCode'
+    # Catalog は OpenCode 標準カタログ、残り2種は KonomiTV-BS4K 管理のカスタム provider。
+    opencode_provider_type: Annotated[KonomiTVBS4KOpenCodeProviderType, Field()] = 'Catalog'
     opencode_provider_id: Annotated[str, Field(min_length=1, max_length=64)]
     opencode_model_id: Annotated[str, Field(min_length=1, max_length=255)]
+    # OpenCode がモデルごとに広告する variant。推論モデルでは思考の深さに対応する。
+    opencode_model_variant: Annotated[str | None, Field(max_length=64)] = None
+    # OpenCode の StructuredOutput tool と JSON text の選択方式。話数 Web 検索にも適用する。
+    structured_output_mode: Annotated[KonomiTVBS4KStructuredOutputMode, Field()] = 'Auto'
     auth_mode: Annotated[AIAuthMode, Field()]
     billing_mode: Annotated[AIBillingMode, Field()]
     api_base_url: Annotated[str | None, Field(max_length=2048)] = None
@@ -199,6 +241,20 @@ class AIBackendService(BaseModel):
             raise ValueError('opencode_model_id は空にできません。')
         return normalized
 
+    @field_validator('opencode_model_variant')
+    @classmethod
+    def validateModelVariant(cls, value: str | None) -> str | None:
+        """OpenCode model variant を安全な識別子として正規化する。"""
+
+        if value is None:
+            return None
+        normalized = value.strip()
+        if normalized == '':
+            return None
+        if _MODEL_VARIANT_RE.fullmatch(normalized) is None:
+            raise ValueError('opencode_model_variant の形式が不正です。')
+        return normalized
+
     @field_validator('api_base_url')
     @classmethod
     def validateAPIBaseURL(cls, value: str | None) -> str | None:
@@ -223,7 +279,19 @@ class AIBackendService(BaseModel):
 
     @model_validator(mode='after')
     def validateModeConsistency(self) -> AIBackendService:
-        """auth_mode / billing_mode / Vertex 条件を検証する。"""
+        """provider 種別 / auth_mode / billing_mode / Vertex 条件を検証する。"""
+
+        if self.opencode_provider_type == 'Catalog':
+            if IsKonomiTVBS4KManagedOpenCodeProviderID(self.opencode_provider_id):
+                raise ValueError('Catalog では管理対象カスタム provider ID を指定できません。')
+        else:
+            expected_provider_id = BuildKonomiTVBS4KOpenCodeProviderID(self.service_id)
+            if self.opencode_provider_id != expected_provider_id:
+                raise ValueError('カスタム provider ID が service_id と一致しません。')
+            if self.api_base_url is None:
+                raise ValueError('カスタム provider では api_base_url が必須です。')
+            if self.auth_mode not in {'ApiKey', 'NoneLocal'}:
+                raise ValueError('カスタム provider の認証方式は ApiKey または NoneLocal です。')
 
         if self.auth_mode == 'VertexAdc':
             if self.google_cloud_project is None:
@@ -259,6 +327,18 @@ class AIBackendService(BaseModel):
 
         return self
 
+    def getAuditModelLabel(self) -> str:
+        """provider・model・variant を含む監査ラベルを返す。
+
+        Returns:
+            OpenCode の実行条件を識別できる監査ラベル。
+        """
+
+        label = f'opencode:{self.opencode_provider_id}/{self.opencode_model_id}'
+        if self.opencode_model_variant is not None:
+            return f'{label}[{self.opencode_model_variant}]'
+        return label
+
 
 class AIBackendServiceCreate(BaseModel):
     """service 作成リクエスト（service_id はサーバー発行）。"""
@@ -266,8 +346,11 @@ class AIBackendServiceCreate(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     service_name: Annotated[str, Field(min_length=1, max_length=128)]
-    opencode_provider_id: Annotated[str, Field(min_length=1, max_length=64)]
+    opencode_provider_type: Annotated[KonomiTVBS4KOpenCodeProviderType, Field()] = 'Catalog'
+    opencode_provider_id: Annotated[str | None, Field(min_length=1, max_length=64)] = None
     opencode_model_id: Annotated[str, Field(min_length=1, max_length=255)]
+    opencode_model_variant: Annotated[str | None, Field(max_length=64)] = None
+    structured_output_mode: Annotated[KonomiTVBS4KStructuredOutputMode, Field()] = 'Auto'
     auth_mode: Annotated[AIAuthMode, Field()]
     billing_mode: Annotated[AIBillingMode, Field()]
     api_base_url: Annotated[str | None, Field(max_length=2048)] = None
@@ -293,8 +376,11 @@ class AIBackendServiceUpdate(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
     service_name: Annotated[str | None, Field(min_length=1, max_length=128)] = None
+    opencode_provider_type: Annotated[KonomiTVBS4KOpenCodeProviderType | None, Field()] = None
     opencode_provider_id: Annotated[str | None, Field(min_length=1, max_length=64)] = None
     opencode_model_id: Annotated[str | None, Field(min_length=1, max_length=255)] = None
+    opencode_model_variant: Annotated[str | None, Field(max_length=64)] = None
+    structured_output_mode: Annotated[KonomiTVBS4KStructuredOutputMode | None, Field()] = None
     auth_mode: Annotated[AIAuthMode | None, Field()] = None
     billing_mode: Annotated[AIBillingMode | None, Field()] = None
     api_base_url: Annotated[str | None, Field(max_length=2048)] = None
@@ -302,6 +388,8 @@ class AIBackendServiceUpdate(BaseModel):
     google_cloud_location: Annotated[str | None, Field(max_length=255)] = None
     monthly_cost_limit_usd: Annotated[Decimal | None, Field(ge=0, le=1_000_000)] = None
     monthly_token_limit: Annotated[int | None, Field(ge=0, le=10_000_000_000)] = None
+    # True のとき opencode_model_variant を明示的に null へ
+    clear_opencode_model_variant: Annotated[bool, Field()] = False
     # True のとき api_base_url を明示的に null へ
     clear_api_base_url: Annotated[bool, Field()] = False
     clear_monthly_cost_limit_usd: Annotated[bool, Field()] = False
@@ -420,11 +508,20 @@ class AIBackendSettingsStore:
 
         with cls._lock:
             document = cls.getDocument()
+            service_id = NewAIBackendServiceID()
+            provider_id = create.opencode_provider_id
+            if create.opencode_provider_type != 'Catalog':
+                provider_id = BuildKonomiTVBS4KOpenCodeProviderID(service_id)
+            elif provider_id is None:
+                raise ValueError('Catalog provider では opencode_provider_id が必須です。')
             service = AIBackendService(
-                service_id=NewAIBackendServiceID(),
+                service_id=service_id,
                 service_name=create.service_name,
-                opencode_provider_id=create.opencode_provider_id,
+                opencode_provider_type=create.opencode_provider_type,
+                opencode_provider_id=provider_id,
                 opencode_model_id=create.opencode_model_id,
+                opencode_model_variant=create.opencode_model_variant,
+                structured_output_mode=create.structured_output_mode,
                 auth_mode=create.auth_mode,
                 billing_mode=create.billing_mode,
                 api_base_url=create.api_base_url,
@@ -461,10 +558,18 @@ class AIBackendSettingsStore:
             data = current.model_dump()
             if update.service_name is not None:
                 data['service_name'] = update.service_name
+            if update.opencode_provider_type is not None:
+                data['opencode_provider_type'] = update.opencode_provider_type
             if update.opencode_provider_id is not None:
                 data['opencode_provider_id'] = update.opencode_provider_id
             if update.opencode_model_id is not None:
                 data['opencode_model_id'] = update.opencode_model_id
+            if update.clear_opencode_model_variant:
+                data['opencode_model_variant'] = None
+            elif update.opencode_model_variant is not None:
+                data['opencode_model_variant'] = update.opencode_model_variant
+            if update.structured_output_mode is not None:
+                data['structured_output_mode'] = update.structured_output_mode
             if update.auth_mode is not None:
                 data['auth_mode'] = update.auth_mode
             if update.billing_mode is not None:
@@ -485,6 +590,10 @@ class AIBackendSettingsStore:
                 data['monthly_token_limit'] = None
             elif update.monthly_token_limit is not None:
                 data['monthly_token_limit'] = update.monthly_token_limit
+
+            # カスタム provider ID は利用者入力にせず service_id から一意に導出する。
+            if data['opencode_provider_type'] != 'Catalog':
+                data['opencode_provider_id'] = BuildKonomiTVBS4KOpenCodeProviderID(current.service_id)
             updated = AIBackendService.model_validate(data)
             document.services[index] = updated
             document = AIBackendSettingsDocument.model_validate(document.model_dump())

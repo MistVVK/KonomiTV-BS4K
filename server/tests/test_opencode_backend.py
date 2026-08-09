@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from decimal import Decimal
 from typing import Any
 from uuid import uuid4
@@ -340,6 +341,46 @@ def test_provider_leases_for_different_providers_do_not_block_each_other(
 
     asyncio.run(Run())
     assert entered_providers == {'deepseek', 'openai'}
+
+
+def test_runtime_config_reload_waits_for_active_provider_lease(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """instance 全体の config 再読込は実行中 provider session の完了を待つ。"""
+
+    client = OpenCodeClient(base_url='http://config-reload.test')
+    lease_acquired = asyncio.Event()
+    release_lease = asyncio.Event()
+    reload_started = asyncio.Event()
+    disposed = asyncio.Event()
+
+    async def FakeDispose() -> None:
+        disposed.set()
+
+    monkeypatch.setattr(client, '_disposeInstance', FakeDispose)
+
+    async def UseProvider() -> None:
+        lease = await client.acquireProviderLease('custom-provider')
+        async with lease:
+            lease_acquired.set()
+            await release_lease.wait()
+
+    async def Reload() -> None:
+        await lease_acquired.wait()
+        reload_started.set()
+        await client.reloadConfiguration()
+
+    async def Run() -> None:
+        use_task = asyncio.create_task(UseProvider())
+        reload_task = asyncio.create_task(Reload())
+        await reload_started.wait()
+        await asyncio.sleep(0)
+        assert disposed.is_set() is False
+        release_lease.set()
+        await asyncio.gather(use_task, reload_task)
+
+    asyncio.run(Run())
+    assert disposed.is_set() is True
 
 
 def test_select_candidate_success(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -751,8 +792,8 @@ def test_lookup_episode_with_web_evidence(monkeypatch: pytest.MonkeyPatch) -> No
     assert len(result.citations) == 1
 
 
-def test_lookup_episode_local_disabled() -> None:
-    """NoneLocal は既定で EpisodeLookup 非対応。"""
+def test_lookup_episode_local_attempts_web_search() -> None:
+    """NoneLocal も OpenCode 経由の話数 Web 検索を実行対象にする。"""
 
     backend = OpenCodeBackend(
         _service(
@@ -763,8 +804,10 @@ def test_lookup_episode_local_disabled() -> None:
         api_key=None,
     )
     result = asyncio.run(backend.lookupEpisode(_lookup_context()))
-    assert result.outcome == 'Disabled'
-    assert result.error_code == 'OpenCodeEpisodeLookupLocalDisabled'
+    # テスト環境では製品 OpenCode serve が unavailable だが、旧 Disabled ではなく
+    # session 作成まで進んだ SearchFailed になることで経路が有効なことを確認する。
+    assert result.outcome == 'SearchFailed'
+    assert result.error_code == 'OpenCodeUnavailable'
 
 
 def test_connection_test_episode_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -890,7 +933,8 @@ def test_run_episode_lookup_session_evidence_from_message_list(
 
     OpenCode 1.18.13 の POST /session/{id}/message は最終メッセージしか返さず、
     web ツールの tool part は GET /session/{id}/message の一覧にのみ含まれる。
-    実機で判明したこの挙動に合わせ、一覧を走査して証明を抽出できること。
+    一方、json_schema format 付きターンを履歴へ追加した後の一覧 API は OpenCode 自身の
+    レスポンス検証で HTTP 400 になるため、その前に一覧を走査して証明を抽出できること。
     """
 
     from app.metadata.ai.opencode_backend import (
@@ -898,8 +942,9 @@ def test_run_episode_lookup_session_evidence_from_message_list(
         _ValidatedOpenCodeEpisodeLookupResult,
     )
 
-    service = _service()
+    service = _service(opencode_model_variant='high')
     backend = OpenCodeBackend(service, api_key='sk-test')
+    captured_prompts: list[dict[str, Any]] = []
 
     final_message = {
         'info': {
@@ -977,10 +1022,34 @@ def test_run_episode_lookup_session_evidence_from_message_list(
     async def FakeCreateSession() -> str:
         return 'ses_test'
 
-    async def FakePromptJsonSchema(_session_id: str, **_kwargs: Any) -> dict[str, Any]:
+    async def FakePromptJsonSchema(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        captured_prompts.append(kwargs)
+        if kwargs['include_format']:
+            return {
+                **final_message,
+                'parts': [
+                    {
+                        'type': 'tool',
+                        'tool': 'StructuredOutput',
+                        'state': {
+                            'status': 'completed',
+                            'input': {
+                                'outcome': 'Resolved',
+                                'season_number': 1,
+                                'episode_number': '1',
+                                'confidence': 0.9,
+                                'rationale_short': 'official source',
+                            },
+                        },
+                    },
+                ],
+            }
         return final_message
 
     async def FakeListMessages(_session_id: str) -> list[dict[str, Any]]:
+        # 検索ターンだけが完了し、json_schema format 付き最終ターンはまだ送られていない。
+        assert len(captured_prompts) == 1
+        assert captured_prompts[0]['include_format'] is False
         return historical_messages
 
     async def FakeDeleteSession(_session_id: str) -> None:
@@ -1019,6 +1088,12 @@ def test_run_episode_lookup_session_evidence_from_message_list(
         ),
     ))
     assert trace['completed_web_calls'] == 1
+    assert len(captured_prompts) == 2
+    assert captured_prompts[0]['include_format'] is False
+    assert captured_prompts[0]['tools'] == {'websearch': True, 'webfetch': False}
+    assert captured_prompts[1]['include_format'] is True
+    assert captured_prompts[1]['tools'] == {'websearch': False, 'webfetch': False}
+    assert all(item['variant'] == 'high' for item in captured_prompts)
     assert result.web_search_performed is True
     assert result.outcome == 'Resolved'
     assert result.season_number == 1
@@ -1044,3 +1119,115 @@ def test_run_episode_lookup_session_evidence_from_message_list(
         completion_tokens=4,
     )
     assert validated.outcome == 'Resolved'
+
+
+def test_auto_structured_output_falls_back_to_json_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Auto は schema 不正な StructuredOutput を同一 session の JSON text で補正する。"""
+
+    from app.metadata.ai.opencode_backend import _OpenCodeEpisodeLookupOutput
+
+    service = _service(structured_output_mode='Auto')
+    backend = OpenCodeBackend(service, api_key='sk-test')
+    calls: list[bool] = []
+
+    async def FakePromptJsonSchema(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(bool(kwargs['include_format']))
+        if kwargs['include_format']:
+            return {
+                'parts': [{
+                    'type': 'tool',
+                    'tool': 'StructuredOutput',
+                    'state': {
+                        'status': 'completed',
+                        # Synthetic / GLM で実測した nullable の文字列化を再現する。
+                        'input': {
+                            'outcome': 'InsufficientEvidence',
+                            'season_number': 'null',
+                            'episode_number': 'None',
+                            'confidence': 0.4,
+                            'rationale_short': 'insufficient',
+                        },
+                    },
+                }],
+            }
+        return {
+            'parts': [{
+                'type': 'text',
+                'text': (
+                    '{"outcome":"InsufficientEvidence","season_number":null,'
+                    '"episode_number":null,"confidence":0.4,'
+                    '"rationale_short":"insufficient"}'
+                ),
+            }],
+        }
+
+    monkeypatch.setattr(backend._client, 'promptJsonSchema', FakePromptJsonSchema)
+    structured, _usage = asyncio.run(backend._promptJSONInSession(
+        'ses-test',
+        prompt_text='Return JSON.',
+        schema_model=_OpenCodeEpisodeLookupOutput,
+        agent='recorded-series-episode',
+        timeout_sec=120.0,
+        tools={'websearch': False, 'webfetch': False},
+    ))
+    assert calls == [True, False]
+    assert structured is not None
+    assert structured['season_number'] is None
+    assert structured['episode_number'] is None
+
+
+@pytest.mark.parametrize(
+    ('mode', 'expected_include_format'),
+    [
+        ('StructuredOutput', True),
+        ('JSONText', False),
+    ],
+)
+def test_explicit_structured_output_mode_does_not_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    expected_include_format: bool,
+) -> None:
+    """明示方式は選択した OpenCode format の1回だけを実行する。"""
+
+    from app.metadata.ai.opencode_backend import _OpenCodeEpisodeLookupOutput
+
+    backend = OpenCodeBackend(
+        _service(structured_output_mode=mode),
+        api_key='sk-test',
+    )
+    calls: list[bool] = []
+
+    async def FakePromptJsonSchema(_session_id: str, **kwargs: Any) -> dict[str, Any]:
+        include_format = bool(kwargs['include_format'])
+        calls.append(include_format)
+        output = {
+            'outcome': 'InsufficientEvidence',
+            'season_number': None,
+            'episode_number': None,
+            'confidence': 0.4,
+            'rationale_short': 'insufficient',
+        }
+        if include_format:
+            return {
+                'parts': [{
+                    'type': 'tool',
+                    'tool': 'StructuredOutput',
+                    'state': {'status': 'completed', 'input': output},
+                }],
+            }
+        return {'parts': [{'type': 'text', 'text': json.dumps(output)}]}
+
+    monkeypatch.setattr(backend._client, 'promptJsonSchema', FakePromptJsonSchema)
+    structured, _usage = asyncio.run(backend._promptJSONInSession(
+        'ses-test',
+        prompt_text='Return JSON.',
+        schema_model=_OpenCodeEpisodeLookupOutput,
+        agent='recorded-series-episode',
+        timeout_sec=120.0,
+    ))
+    assert calls == [expected_include_format]
+    assert structured is not None
+    assert structured['outcome'] == 'InsufficientEvidence'

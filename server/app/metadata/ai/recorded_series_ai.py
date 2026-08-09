@@ -244,13 +244,23 @@ def get_episode_lookup_provider_fingerprint(
             {
                 'backend': 'OpenCode',
                 'service_id': settings.ai_backend_service_id,
+                'provider_type': (
+                    service.opencode_provider_type if service is not None else None
+                ),
                 'provider_id': (
                     service.opencode_provider_id if service is not None else None
                 ),
                 'model_id': (
                     service.opencode_model_id if service is not None else None
                 ),
+                'model_variant': (
+                    service.opencode_model_variant if service is not None else None
+                ),
+                'structured_output_mode': (
+                    service.structured_output_mode if service is not None else None
+                ),
                 'auth_mode': service.auth_mode if service is not None else None,
+                'api_base_url': service.api_base_url if service is not None else None,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -1090,9 +1100,7 @@ def get_audit_model(settings: RecordedSeriesSettings | None = None) -> str:
             service = None
         if service is None:
             return f'opencode:service:{service_id}'
-        return (
-            f'opencode:{service.opencode_provider_id}/{service.opencode_model_id}'
-        )
+        return service.getAuditModelLabel()
 
     backend_prefix_map: dict[str, str] = {
         'AcpCodex': 'acp:codex',

@@ -554,6 +554,52 @@ def test_service_response_never_includes_api_key(ai_paths: Path) -> None:
     asyncio.run(Run())
 
 
+def test_create_custom_provider_service_syncs_runtime_config(
+    ai_paths: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """カスタム service 作成 API は provider ID を発行して runtime config を同期する。"""
+
+    _ = ai_paths
+    sync_calls = 0
+
+    async def FakeSync() -> None:
+        nonlocal sync_calls
+        sync_calls += 1
+
+    monkeypatch.setattr(
+        AIBackendRouter,
+        '_SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange',
+        FakeSync,
+    )
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.post('/api/ai-backends', json={
+                'service_name': 'Custom GLM',
+                'opencode_provider_type': 'OpenAICompatible',
+                'opencode_model_id': 'glm-5.2',
+                'structured_output_mode': 'JSONText',
+                'auth_mode': 'ApiKey',
+                'billing_mode': 'Metered',
+                'api_base_url': 'https://api.example.com/v1',
+            })
+            assert response.status_code == 201
+            payload = response.json()
+            assert payload['opencode_provider_type'] == 'OpenAICompatible'
+            assert payload['opencode_provider_id'].startswith('konomitv-bs4k-')
+            assert payload['structured_output_mode'] == 'JSONText'
+            assert payload['auth_configured'] is False
+            assert 'api_key' not in payload
+
+    asyncio.run(Run())
+    assert sync_calls == 1
+
+
 def test_provider_list_endpoint_returns_catalog_with_auth_methods(
     ai_paths: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -572,7 +618,22 @@ def test_provider_list_endpoint_returns_catalog_with_auth_methods(
                     'models': {
                         'gpt-5.6': {
                             'name': 'GPT-5.6',
-                            'default': True,
+                            'api': {'id': 'gpt-5.6'},
+                            'variants': {
+                                'low': {'reasoningEffort': 'low'},
+                                'medium': {'reasoningEffort': 'medium'},
+                                'high': {'reasoningEffort': 'high'},
+                            },
+                        },
+                        'gpt-5.6-fast': {
+                            'name': 'GPT-5.6 Fast',
+                            'api': {'id': 'gpt-5.6'},
+                            'options': {'serviceTier': 'priority'},
+                            'variants': {
+                                'low': {'reasoningEffort': 'low'},
+                                'medium': {'reasoningEffort': 'medium'},
+                                'high': {'reasoningEffort': 'high'},
+                            },
                         },
                     },
                 },
@@ -608,10 +669,16 @@ def test_provider_list_endpoint_returns_catalog_with_auth_methods(
                     'models': {},
                 },
                 {
+                    'id': 'konomitv-bs4k-11111111-1111-4111-8111-111111111111',
+                    'name': 'Managed Custom Provider',
+                    'models': {},
+                },
+                {
                     'id': 12345,  # 不正エントリはスキップする
                     'models': {},
                 },
             ],
+            'default': {'openai': 'gpt-5.6-fast'},
             'connected': ['deepseek', 'google-vertex'],
         }
 
@@ -669,7 +736,14 @@ def test_provider_list_endpoint_returns_catalog_with_auth_methods(
             assert openai['auth_methods'][0]['method_index'] == 0
             assert openai['auth_methods'][2]['type'] == 'api'
             assert openai['auth_methods'][2]['auth_mode'] == 'ApiKey'
-            assert openai['default_model_id'] == 'gpt-5.6'
+            assert openai['default_model_id'] == 'gpt-5.6-fast'
+            standard_model = next(m for m in openai['models'] if m['model_id'] == 'gpt-5.6')
+            fast_model = next(m for m in openai['models'] if m['model_id'] == 'gpt-5.6-fast')
+            assert standard_model['variants'] == ['low', 'medium', 'high']
+            assert standard_model['openai_fast_mode'] is False
+            assert standard_model['openai_paired_model_id'] == 'gpt-5.6-fast'
+            assert fast_model['openai_fast_mode'] is True
+            assert fast_model['openai_paired_model_id'] == 'gpt-5.6'
 
             deepseek = next(p for p in providers if p['provider_id'] == 'deepseek')
             assert deepseek['connected'] is True
