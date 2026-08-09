@@ -106,6 +106,52 @@ def _parseSnapshots(programs: list[_ProgramSnapshot]) -> dict[int, SeriesTitlePa
     }
 
 
+def InstallGeneratedMetadataInputQueries(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshots: list[_ProgramSnapshot],
+) -> None:
+    """DB を使わない Resolver 単体テストへ生成 AI の補助入力を提供する。"""
+
+    class FakeRecordedProgramQuery:
+        def __init__(self, program_ids: list[int]) -> None:
+            self.program_ids = program_ids
+
+        def order_by(self, *_fields: str) -> 'FakeRecordedProgramQuery':
+            return self
+
+        def only(self, *_fields: str) -> 'FakeRecordedProgramQuery':
+            return self
+
+        async def values(self, *_fields: str) -> list[dict[str, object]]:
+            return [
+                {
+                    'title': snapshot.title,
+                    'description': snapshot.description,
+                    'start_time': snapshot.start_time,
+                    'duration': 3600.0,
+                }
+                for snapshot in snapshots
+                if snapshot.id in self.program_ids
+            ]
+
+        async def first(self) -> SimpleNamespace | None:
+            return SimpleNamespace(duration=3600.0) if len(self.program_ids) > 0 else None
+
+    class FakeChannelQuery:
+        async def first(self) -> SimpleNamespace:
+            return SimpleNamespace(name='テストチャンネル')
+
+    def FilterRecordedPrograms(**kwargs: object) -> FakeRecordedProgramQuery:
+        program_ids = kwargs.get('id__in')
+        if isinstance(program_ids, list):
+            return FakeRecordedProgramQuery(cast(list[int], program_ids))
+        program_id = kwargs.get('id')
+        return FakeRecordedProgramQuery([program_id] if isinstance(program_id, int) else [])
+
+    monkeypatch.setattr(RecordedProgram, 'filter', staticmethod(FilterRecordedPrograms))
+    monkeypatch.setattr(Channel, 'filter', staticmethod(lambda **_kwargs: FakeChannelQuery()))
+
+
 async def InitializeGenerationDatabase() -> None:
     """一括生成の Series / Episode 同時反映に必要なモデルを初期化する。"""
 
@@ -205,7 +251,6 @@ def GenerationSettings(
         enabled=True,
         ai_enabled=ai_enabled,
         ai_candidate_selection_enabled=legacy_candidate_selection_enabled,
-        ai_episode_number_search_enabled=True,
         ai_backend='AcpCodex',
     )
 
@@ -229,6 +274,7 @@ def GeneratedSeriesResult(
         season_number=season_number,
         episode_number=episode_number,
         episode_not_numbered=episode_not_numbered,
+        episode_no_published_number=False,
         subtitle=subtitle,
         confidence=confidence,
         existing_series_id=existing_series_id,
@@ -313,7 +359,7 @@ def test_epg_match_expands_cross_service_after_same_service_has_no_match(
 
     snapshot = _snapshot(
         101,
-        '星空探検隊 FRIDAY ANIME NIGHT[字][デ]',
+        '星空探検隊 深夜アニメ[字][デ]',
         '「謎の信号」',
         genres=ANIME_GENRES,
         network_id=12345,
@@ -899,6 +945,7 @@ def test_zero_ai_request_limit_skips_daily_count_and_checks_recent_attempt_cache
 
     snapshot = _snapshot(10, '候補構築テスト', 'シリーズか単発か曖昧な番組。')
     programs = [snapshot]
+    InstallGeneratedMetadataInputQueries(monkeypatch, programs)
     parses = _parseSnapshots(programs)
     evidence = _buildClusterEvidence(programs, parses)
     events: list[str] = []
@@ -1060,6 +1107,7 @@ def test_ai_generation_audit_uses_backend_prefix_and_closes_failures(
         '複数校の応募作品を紹介する特別番組。',
     )
     programs = [snapshot]
+    InstallGeneratedMetadataInputQueries(monkeypatch, programs)
     parses = _parseSnapshots(programs)
     evidence = _buildClusterEvidence(programs, parses)
     created_candidate_ids: list[str] = []
@@ -1257,6 +1305,7 @@ def test_generation_change_while_building_wikipedia_candidates_stops_before_ai_r
 
     snapshot = _snapshot(11, '候補世代更新テスト', 'シリーズか単発か曖昧な番組。')
     programs = [snapshot]
+    InstallGeneratedMetadataInputQueries(monkeypatch, programs)
     parses = _parseSnapshots(programs)
     evidence = _buildClusterEvidence(programs, parses)
     events: list[str] = []
@@ -1388,6 +1437,7 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
 
     snapshot = _snapshot(12, '監査予約世代更新テスト', 'シリーズか単発か曖昧な番組。')
     programs = [snapshot]
+    InstallGeneratedMetadataInputQueries(monkeypatch, programs)
     parses = _parseSnapshots(programs)
     evidence = _buildClusterEvidence(programs, parses)
     events: list[str] = []
@@ -2106,7 +2156,7 @@ def test_ai_null_episode_uses_first_local_parse_result(
     asyncio.run(Scenario())
 
 
-def test_ai_null_episode_without_local_evidence_is_not_numbered(
+def test_ai_null_episode_without_local_evidence_needs_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """AI の null 話数は Local 証拠がない場合に NotNumbered として保存する。"""
@@ -2157,7 +2207,7 @@ def test_ai_null_episode_without_local_evidence_is_not_numbered(
             assert result.status == 'Resolved'
             assert program.series_episode_id is None
             assert program.episode_number is None
-            assert resolution.status == 'NotNumbered'
+            assert resolution.status == 'NeedsReview'
             assert resolution.source == 'AI'
             assert resolution.episode_id is None
         finally:

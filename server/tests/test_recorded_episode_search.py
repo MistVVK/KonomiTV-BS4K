@@ -55,29 +55,24 @@ def test_get_episode_lookup_evidence_deduplicates_citation_and_source_urls() -> 
 
 def test_episode_lookup_acceptance_requires_verified_evidence() -> None:
     result = _result()
-    assert IsEpisodeLookupResultAccepted(result, 'HighConfidenceOnly') is True
+    assert IsEpisodeLookupResultAccepted(result) is True
     assert IsEpisodeLookupResultAccepted(
         replace(result, citations=()),
-        'HighConfidenceOnly',
     ) is True
     assert IsEpisodeLookupResultAccepted(
         replace(result, citations=(), sources=()),
-        'HighConfidenceOnly',
     ) is False
     assert IsEpisodeLookupResultAccepted(
         replace(result, confidence=0.25, citations=()),
-        'HighConfidenceOnly',
-    ) is False
-    assert IsEpisodeLookupResultAccepted(
-        replace(result, confidence=0.25, citations=()),
-        'Always',
     ) is True
 
 
-def test_not_numbered_acceptance_still_requires_high_confidence_evidence() -> None:
+def test_not_numbered_acceptance_is_confidence_independent_but_requires_evidence() -> None:
     result = _result(outcome='NotNumbered', confidence=0.91)
-    assert IsEpisodeLookupResultAccepted(result, 'Always') is True
+    assert IsEpisodeLookupResultAccepted(result) is True
     assert IsEpisodeLookupResultAccepted(
         replace(result, confidence=0.25, citations=()),
-        'Always',
+    ) is True
+    assert IsEpisodeLookupResultAccepted(
+        replace(result, citations=(), sources=()),
     ) is False

@@ -27,11 +27,13 @@ from app.metadata.RecordedEpisodeContext import (
 )
 from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesAIError,
+    RecordedSeriesProgramDetailItem,
     RecordedSeriesProgramPrompt,
     SeriesChoiceCandidate,
 )
 from app.metadata.RecordedSeriesGeneration import (
     SeriesMetadataClusterHint,
+    SeriesMetadataClusterProgramHint,
     SeriesMetadataExistingSeriesHint,
     SeriesMetadataHints,
     SeriesMetadataLocalParseHint,
@@ -57,9 +59,12 @@ def Program() -> RecordedSeriesProgramPrompt:
     return RecordedSeriesProgramPrompt(
         title='Test Program',
         description='Test Description',
+        detail_items=[RecordedSeriesProgramDetailItem(name='Detail', value='Test detail')],
         genres=['Anime'],
-        channel='test-channel',
-        start_date='2026-07-26',
+        channel_id='test-channel',
+        channel_name='Test Channel',
+        broadcast_datetime='2026-07-26T20:00:00+09:00',
+        duration_seconds=1800.0,
     )
 
 
@@ -88,6 +93,14 @@ def GenerationHints() -> SeriesMetadataHints:
             display_title='Dirty Test Program',
             normalized_key='dirtytestprogram',
             member_count=1,
+            representative_programs=[
+                SeriesMetadataClusterProgramHint(
+                    title='Test Program',
+                    description='Test Description',
+                    broadcast_datetime='2026-07-26T20:00:00+09:00',
+                    duration_seconds=1800.0,
+                ),
+            ],
         ),
         existing_series=[
             SeriesMetadataExistingSeriesHint(
@@ -95,6 +108,8 @@ def GenerationHints() -> SeriesMetadataHints:
                 title='Canonical Test Series',
                 description='Existing test Series.',
                 wikipedia_page_id=123,
+                similarity=0.9,
+                match_reason='FuzzySimilarity',
             ),
         ],
         wikipedia=[

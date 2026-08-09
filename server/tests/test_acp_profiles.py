@@ -213,7 +213,7 @@ def test_create_backend_uses_fixed_codex_command_workspace_and_environment(
         konomitv_bs4k_fast_mode_enabled: bool = False,
     ) -> Path:
         assert backend == 'codex'
-        assert konomitv_bs4k_fast_mode_enabled is False
+        assert konomitv_bs4k_fast_mode_enabled is True
         return profile
 
     monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
@@ -289,8 +289,8 @@ def test_acp_profile_setup_failure_is_normalized_for_ai_audit(
     assert error.value.code == 'HostCLIStartFailed'
 
 
-def test_acp_settings_preserve_episode_lookup_and_normalize_fixed_provider_model() -> None:
-    """固定 provider でも話数検索を維持し、provider 固有モデルだけを正規化する。"""
+def test_acp_settings_normalize_fixed_provider_model() -> None:
+    """固定 provider の provider 固有モデルだけを正規化する。"""
 
     settings = ACPSettings(
         codex=ACPBackendSettings(backend_kind='AcpCodex'),
@@ -304,12 +304,6 @@ def test_acp_settings_preserve_episode_lookup_and_normalize_fixed_provider_model
 
     assert settings.grok.model is None
     assert settings.grok.reasoning_effort == 'High'
-    # 録画シリーズ側の話数検索設定は ACP 設定とは独立して保持される。
-    recorded_settings = RecordedSeriesSettings(
-        ai_backend='AcpGrok',
-        ai_episode_number_search_enabled=True,
-    )
-    assert recorded_settings.ai_episode_number_search_enabled is True
 
 
 def test_acp_adapter_routes_episode_lookup_with_fixed_operation_context(

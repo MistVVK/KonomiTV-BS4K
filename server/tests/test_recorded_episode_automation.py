@@ -30,6 +30,7 @@ from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle
 from app.metadata.RecordedEpisodeAutomation import (
     RecordedEpisodeAutomation,
     RecordedEpisodeRelookupConflictError,
+    RecordedEpisodeRelookupDisabledError,
     RecordedEpisodeRelookupNotFoundError,
 )
 from app.metadata.RecordedEpisodeContext import (
@@ -163,10 +164,8 @@ async def CreateRecordedProgram(
 
 def InstallAISettings(
     monkeypatch: pytest.MonkeyPatch,
-    *,
-    acceptance_mode: str = "HighConfidenceOnly",
 ) -> RecordedSeriesSettings:
-    """AI話数検索ONの設定とダミーキーをメモリ上で返す。"""
+    """AI話数検索に必要な設定・能力証明をメモリ上で返す。"""
 
     # 能力証明はテスト専用の一時ファイルへ書き、本番 DATA_DIR を汚染しない。
     monkeypatch.setattr(
@@ -179,8 +178,6 @@ def InstallAISettings(
     settings = RecordedSeriesSettings(
         enabled=True,
         ai_enabled=True,
-        ai_episode_number_search_enabled=True,
-        ai_episode_number_acceptance_mode=acceptance_mode,  # type: ignore[arg-type]
         ai_backend="OpenCode",
         ai_backend_service_id="00000000-0000-4000-8000-000000000001",
     )
@@ -196,32 +193,38 @@ def InstallAISettings(
         "getSettingsAndAPIKey",
         classmethod(GetSettingsAndAPIKey),
     )
-    passed = ConnectionTestCheck(status="Passed", message="テストで確認済み")
     record_episode_lookup_capability_proof(
         settings,
         "test-secret",
-        ConnectionTestResult(
-            success=True,
-            latency_ms=1,
-            model="test-model",
-            message="EpisodeLookup capability verified.",
-            checks=EpisodeLookupConnectionChecks(
-                backend_connection=passed,
-                web_search=passed,
-                source_url=passed,
-                strict_schema=passed,
-                timeout_cancel=ConnectionTestCheck(
-                    status="NotRun",
-                    message="個別テスト対象外",
-                ),
-                permission_policy=ConnectionTestCheck(
-                    status="NotApplicable",
-                    message="OpenAI 互換では対象外",
-                ),
+        SuccessfulCapabilityProof(),
+    )
+    return settings
+
+
+def SuccessfulCapabilityProof() -> ConnectionTestResult:
+    """話数検索能力の検証に成功した接続試験結果を返す。"""
+
+    passed = ConnectionTestCheck(status='Passed', message='テストで確認済み')
+    return ConnectionTestResult(
+        success=True,
+        latency_ms=1,
+        model='test-model',
+        message='EpisodeLookup capability verified.',
+        checks=EpisodeLookupConnectionChecks(
+            backend_connection=passed,
+            web_search=passed,
+            source_url=passed,
+            strict_schema=passed,
+            timeout_cancel=ConnectionTestCheck(
+                status='NotRun',
+                message='個別テスト対象外',
+            ),
+            permission_policy=ConnectionTestCheck(
+                status='NotApplicable',
+                message='個別テスト対象外',
             ),
         ),
     )
-    return settings
 
 
 def CreateAIResult(
@@ -283,16 +286,18 @@ def CreateOutcomeResult(outcome: EpisodeLookupOutcome) -> EpisodeLookupResult:
             http_status=200,
             latency_ms=45,
         )
-    if outcome in {"NotNumbered", "InsufficientEvidence"}:
+    if outcome in {'NotNumbered', 'NoPublishedNumber', 'InsufficientEvidence'}:
         return EpisodeLookupResult(
             outcome=outcome,
-            season_number=None,
+            season_number=2 if outcome == 'NoPublishedNumber' else None,
             episode_number=None,
-            confidence=0.95 if outcome == "NotNumbered" else 0.35,
+            confidence=0.95 if outcome != 'InsufficientEvidence' else 0.35,
             rationale_short=(
-                "公式情報から話数を付けない番組だと確認しました。"
-                if outcome == "NotNumbered"
-                else "番組名は一致しましたが、放送日時を確認できませんでした。"
+                '公式情報から話数を付けない番組だと確認しました。'
+                if outcome == 'NotNumbered'
+                else '公式情報からシーズン2の特別編だと確認しました。'
+                if outcome == 'NoPublishedNumber'
+                else '番組名は一致しましたが、放送日時を確認できませんでした。'
             ),
             citations=evidence,
             web_search_performed=True,
@@ -471,7 +476,7 @@ def test_generated_ai_not_numbered_survives_disabled_web_search(
         SearchMustNotRun,
     )
     settings = InstallAISettings(monkeypatch)
-    settings.ai_episode_number_search_enabled = False
+    settings.ai_enabled = False
 
     async def Run() -> None:
         await InitializeDatabase()
@@ -506,11 +511,11 @@ def test_generated_ai_not_numbered_survives_disabled_web_search(
             assert result.status == 'Skipped'
             assert result.source == 'Disabled'
             assert result.ai_requested is False
-            assert result.error_code == 'AIEpisodeNumberSearchIsDisabled'
+            assert result.error_code == 'AIIsDisabled'
             assert resolution.status == 'NotNumbered'
             assert resolution.source == 'AI'
             assert resolution.lookup_outcome == 'Disabled'
-            assert resolution.error_code == 'AIEpisodeNumberSearchIsDisabled'
+            assert resolution.error_code == 'AIIsDisabled'
             assert await RecordedSeriesAIRequest.all().count() == 0
         finally:
             await Tortoise.close_connections()
@@ -527,9 +532,18 @@ def test_acp_episode_lookup_uses_the_common_facade_and_persists_result(
         enabled=True,
         ai_enabled=True,
         ai_backend="AcpCodex",
-        ai_episode_number_search_enabled=True,
     )
-    assert settings.ai_episode_number_search_enabled is True
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'EPISODE_LOOKUP_CAPABILITY_PROOFS_PATH',
+        Path(tempfile.mkdtemp()) / 'recorded-series-episode-lookup-proofs.json',
+    )
+    reset_episode_lookup_capability_proofs_for_tests()
+    assert record_episode_lookup_capability_proof(
+        settings,
+        None,
+        SuccessfulCapabilityProof(),
+    ) is True
 
     def GetSettingsAndAPIKey(
         cls: type[RecordedSeriesSettingsStore],
@@ -580,7 +594,7 @@ def test_acp_episode_lookup_uses_the_common_facade_and_persists_result(
             assert resolution.lookup_outcome == "Resolved"
             assert resolution.error_code is None
             assert received_context is not None
-            assert received_context["pipeline_version"] == "2"
+            assert received_context['pipeline_version'] == '3'
             assert await RecordedSeriesAIRequest.all().count() == 1
         finally:
             await Tortoise.close_connections()
@@ -798,7 +812,7 @@ def test_high_confidence_search_source_without_inline_citation_is_applied(
 ) -> None:
     """厳格JSON出力に本文引用がなくても、Web検索元があれば高信頼結果を確定する。"""
 
-    InstallAISettings(monkeypatch, acceptance_mode="HighConfidenceOnly")
+    InstallAISettings(monkeypatch)
 
     async def SearchEpisode(**_kwargs: object) -> AIEpisodeLookupResult:
         return CreateAIResult(with_citation=False, with_source=True)
@@ -921,12 +935,12 @@ def test_legacy_unknown_requires_explicit_manual_ai_permission(
     asyncio.run(Run())
 
 
-def test_low_confidence_ai_result_is_reviewed_audited_and_cached(
+def test_low_confidence_ai_result_with_verified_evidence_is_applied_and_cached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """高信頼モードで根拠不足の数値提案は保存するが、Episodeへは反映せず再課金もしない。"""
+    """confidence にかかわらず公開 Web 根拠のある数値結果を確定し、再課金しない。"""
 
-    InstallAISettings(monkeypatch, acceptance_mode="HighConfidenceOnly")
+    InstallAISettings(monkeypatch)
     search_calls = 0
 
     async def SearchEpisode(**_kwargs: object) -> AIEpisodeLookupResult:
@@ -936,7 +950,6 @@ def test_low_confidence_ai_result_is_reviewed_audited_and_cached(
             season_number=3,
             episode_number=Decimal("12.5"),
             confidence=0.45,
-            with_citation=False,
         )
 
     monkeypatch.setattr(
@@ -957,11 +970,11 @@ def test_low_confidence_ai_result_is_reviewed_audited_and_cached(
             first_result = await RecordedEpisodeAutomation.resolveProgram(program.id)
             second_result = await RecordedEpisodeAutomation.resolveProgram(program.id)
 
-            assert first_result.status == "NeedsReview"
+            assert first_result.status == 'Resolved'
             assert first_result.ai_requested is True
             assert first_result.error_code is None
-            assert second_result.status == "NeedsReview"
-            assert second_result.source == "Cache"
+            assert second_result.status == 'Resolved'
+            assert second_result.source == 'StructuredCache'
             assert second_result.ai_requested is False
             assert search_calls == 1
 
@@ -972,19 +985,19 @@ def test_low_confidence_ai_result_is_reviewed_audited_and_cached(
             audit = await RecordedSeriesAIRequest.get(
                 episode_resolution_id=resolution.id
             )
-            assert program.series_episode_id is None
-            assert resolution.status == "NeedsReview"
+            assert program.series_episode_id is not None
+            assert resolution.status == 'Resolved'
             assert resolution.source == "WebSearch"
             assert resolution.proposed_season_number == 3
             assert resolution.proposed_episode_number == Decimal("12.5")
             assert resolution.confidence == 0.45
             assert resolution.web_search_performed is True
-            assert resolution.lookup_outcome == "InsufficientEvidence"
+            assert resolution.lookup_outcome == 'Resolved'
             assert resolution.error_code is None
             assert resolution.error_message is None
-            assert audit.status == "Rejected"
+            assert audit.status == 'Succeeded'
             assert audit.selected_choice_id == "S3E12.5"
-            assert audit.error_code == "AcceptancePolicyRejected"
+            assert audit.error_code is None
             assert await RecordedSeriesAIRequest.all().count() == 1
         finally:
             await Tortoise.close_connections()
@@ -1062,6 +1075,7 @@ def test_interrupted_manual_override_closes_only_lookup_audit() -> None:
     [
         ("Resolved", "Resolved", "Succeeded"),
         ("NotNumbered", "NotNumbered", "Succeeded"),
+        ('NoPublishedNumber', 'NoPublishedNumber', 'Succeeded'),
         ("InsufficientEvidence", "NeedsReview", "Succeeded"),
         ("SearchFailed", "Failed", "Failed"),
         ("SearchNotRun", "NeedsReview", "Rejected"),
@@ -1114,20 +1128,76 @@ def test_all_lookup_outcomes_are_persisted_with_distinct_resolution_status(
                 in {
                     "Resolved",
                     "NotNumbered",
+                    'NoPublishedNumber',
                     "InsufficientEvidence",
                     "InvalidModelOutput",
                 }
             )
             assert audit.status == expected_audit_status
-            if outcome in {"Resolved", "NotNumbered", "InsufficientEvidence"}:
+            if outcome in {
+                'Resolved',
+                'NotNumbered',
+                'NoPublishedNumber',
+                'InsufficientEvidence',
+            }:
                 assert resolution.rationale_short is not None
                 assert resolution.error_code is None
                 assert resolution.error_message is None
+                if outcome == 'NoPublishedNumber':
+                    assert resolution.season_number == 2
+                    assert resolution.proposed_outcome == 'NoPublishedNumber'
+                    assert resolution.episode_id is None
             else:
                 assert resolution.rationale_short is None
                 assert resolution.error_code is not None
                 assert resolution.error_message is not None
                 assert "\n" not in resolution.error_message
+        finally:
+            await Tortoise.close_connections()
+
+    asyncio.run(Run())
+
+
+def test_insufficient_evidence_clears_stale_canonical_season(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """要確認へ戻すとき、以前の番号なし正本から残ったシーズンを消去する。"""
+
+    InstallAISettings(monkeypatch)
+
+    async def SearchEpisode(**_kwargs: object) -> EpisodeLookupResult:
+        return CreateOutcomeResult('InsufficientEvidence')
+
+    monkeypatch.setattr(
+        RecordedEpisodeAutomationModule, 'ai_lookup_episode', SearchEpisode
+    )
+
+    async def Run() -> None:
+        await InitializeDatabase()
+        try:
+            series = await Series.create(
+                title='正本シーズンクリアシリーズ', description='', genres=ANIME_GENRES
+            )
+            channel = await CreateChannel()
+            program = await CreateRecordedProgram(
+                1, series=series, channel=channel, episode_number=None
+            )
+            await RecordedEpisodeResolution.create(
+                recorded_program=program,
+                season_number=2,
+                status='Pending',
+                source='WebSearch',
+            )
+
+            await RecordedEpisodeAutomation.resolveProgram(program.id)
+
+            resolution = await RecordedEpisodeResolution.get(
+                recorded_program_id=program.id
+            )
+            assert resolution.status == 'NeedsReview'
+            assert resolution.lookup_outcome == 'InsufficientEvidence'
+            assert resolution.season_number is None
+            assert resolution.proposed_season_number is None
         finally:
             await Tortoise.close_connections()
 
@@ -1192,16 +1262,14 @@ def test_ai_audit_and_episode_update_roll_back_together(
     asyncio.run(Run())
 
 
-def test_stored_proposal_promotion_requires_enabled_ai_switches(
+def test_stored_proposal_promotion_requires_enabled_ai_and_public_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Always有効化で同一 Series の複数提案を自己 fingerprint 変化なく昇格する。"""
+    """AI有効化後も公開根拠を再検証できる旧提案だけを昇格する。"""
 
     current_settings = RecordedSeriesSettings(
         enabled=True,
         ai_enabled=False,
-        ai_episode_number_search_enabled=True,
-        ai_episode_number_acceptance_mode="Always",
     )
 
     def GetSettings(cls: type[RecordedSeriesSettingsStore]) -> RecordedSeriesSettings:
@@ -1225,6 +1293,18 @@ def test_stored_proposal_promotion_requires_enabled_ai_switches(
             )
             second_program = await CreateRecordedProgram(
                 2,
+                series=series,
+                channel=channel,
+                episode_number=None,
+            )
+            no_evidence_program = await CreateRecordedProgram(
+                3,
+                series=series,
+                channel=channel,
+                episode_number=None,
+            )
+            private_evidence_program = await CreateRecordedProgram(
+                4,
                 series=series,
                 channel=channel,
                 episode_number=None,
@@ -1277,6 +1357,46 @@ def test_stored_proposal_promotion_requires_enabled_ai_switches(
                 candidate_ids=[],
                 error_code="AcceptancePolicyRejected",
             )
+            no_evidence_context = await BuildRecordedEpisodeLookupContext(
+                no_evidence_program.id
+            )
+            assert no_evidence_context is not None
+            no_evidence_resolution = await RecordedEpisodeResolution.create(
+                recorded_program=no_evidence_program,
+                status='NeedsReview',
+                source='WebSearch',
+                lookup_outcome='InsufficientEvidence',
+                input_fingerprint=BuildEpisodeInputFingerprint(no_evidence_context),
+                provider_fingerprint='provider-a',
+                proposed_season_number=2,
+                proposed_episode_number=Decimal('10'),
+                confidence=0.75,
+                web_search_performed=True,
+                citations=[],
+                rationale_short='数値提案はありますが、保存済みの公開根拠がありません。',
+                ai_model='test-model',
+                error_code='AcceptancePolicyRejected',
+            )
+            private_evidence_context = await BuildRecordedEpisodeLookupContext(
+                private_evidence_program.id
+            )
+            assert private_evidence_context is not None
+            private_evidence_resolution = await RecordedEpisodeResolution.create(
+                recorded_program=private_evidence_program,
+                status='NeedsReview',
+                source='WebSearch',
+                lookup_outcome='InsufficientEvidence',
+                input_fingerprint=BuildEpisodeInputFingerprint(private_evidence_context),
+                provider_fingerprint='provider-a',
+                proposed_season_number=2,
+                proposed_episode_number=Decimal('11'),
+                confidence=0.8,
+                web_search_performed=True,
+                citations=[{'url': 'http://127.0.0.1/episode', 'title': 'ローカルURL'}],
+                rationale_short='公開されていないURLだけが保存されています。',
+                ai_model='test-model',
+                error_code='AcceptancePolicyRejected',
+            )
 
             assert await RecordedEpisodeAutomation.promoteStoredProposals() == 0
             current_settings = current_settings.model_copy(update={"ai_enabled": True})
@@ -1306,6 +1426,16 @@ def test_stored_proposal_promotion_requires_enabled_ai_switches(
                 second_resolution.rationale_short
                 == "公式の第9話と放送日時が一致しました。"
             )
+            await no_evidence_program.refresh_from_db()
+            await no_evidence_resolution.refresh_from_db()
+            assert no_evidence_program.series_episode_id is None
+            assert no_evidence_resolution.status == 'NeedsReview'
+            assert no_evidence_resolution.lookup_outcome == 'InsufficientEvidence'
+            await private_evidence_program.refresh_from_db()
+            await private_evidence_resolution.refresh_from_db()
+            assert private_evidence_program.series_episode_id is None
+            assert private_evidence_resolution.status == 'NeedsReview'
+            assert private_evidence_resolution.lookup_outcome == 'InsufficientEvidence'
             assert await RecordedSeriesAIRequest.all().count() == 1
         finally:
             await Tortoise.close_connections()
@@ -1363,8 +1493,6 @@ def test_proposal_promotion_waits_for_in_flight_resolution(
     settings = RecordedSeriesSettings(
         enabled=True,
         ai_enabled=True,
-        ai_episode_number_search_enabled=True,
-        ai_episode_number_acceptance_mode="Always",
     )
 
     def GetSettings(_cls: type[RecordedSeriesSettingsStore]) -> RecordedSeriesSettings:
@@ -1425,19 +1553,12 @@ def test_proposal_promotion_waits_for_in_flight_resolution(
     asyncio.run(Run())
 
 
-def test_in_flight_lookup_uses_latest_acceptance_mode_after_external_wait(
+def test_in_flight_lookup_accepts_low_confidence_with_verified_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """外部待機中に Always へ変わった場合、課金済み低信頼提案を応答時に受理する。"""
+    """外部待機中の低 confidence 結果も、Web 根拠があれば固定規則で受理する。"""
 
-    current_settings = RecordedSeriesSettings(
-        enabled=True,
-        ai_enabled=True,
-        ai_episode_number_search_enabled=True,
-        ai_episode_number_acceptance_mode="HighConfidenceOnly",
-        ai_backend="OpenCode",
-        ai_backend_service_id="00000000-0000-4000-8000-000000000001",
-    )
+    current_settings = InstallAISettings(monkeypatch)
     lookup_started = asyncio.Event()
     finish_lookup = asyncio.Event()
 
@@ -1477,7 +1598,6 @@ def test_in_flight_lookup_uses_latest_acceptance_mode_after_external_wait(
     )
 
     async def Run() -> None:
-        nonlocal current_settings
         await InitializeDatabase()
         try:
             series = await Series.create(
@@ -1497,11 +1617,8 @@ def test_in_flight_lookup_uses_latest_acceptance_mode_after_external_wait(
                 RecordedEpisodeAutomation.resolveProgram(program.id)
             )
             await asyncio.wait_for(lookup_started.wait(), timeout=1)
-            current_settings = current_settings.model_copy(
-                update={"ai_episode_number_acceptance_mode": "Always"}
-            )
 
-            # settingsUpdated() が実際に通る順序と同じく、応答前の走査は空になる。
+            # 応答前には保存済み提案がないため、旧提案の無課金昇格対象もない。
             assert await RecordedEpisodeAutomation.promoteStoredProposals() == 0
             finish_lookup.set()
             result = await asyncio.wait_for(resolve_task, timeout=1)
@@ -1530,8 +1647,6 @@ def test_disabled_settings_update_does_not_enqueue_provider_retry(
     settings = RecordedSeriesSettings(
         enabled=True,
         ai_enabled=False,
-        ai_episode_number_search_enabled=True,
-        ai_episode_number_acceptance_mode="HighConfidenceOnly",
         ai_backend="OpenCode",
         ai_backend_service_id="00000000-0000-4000-8000-000000000001",
     )
@@ -2639,10 +2754,10 @@ def test_single_relookup_validates_not_found_stale_and_manual(
     asyncio.run(Run())
 
 
-def test_single_relookup_does_not_require_connection_test_proof(
+def test_single_relookup_requires_connection_test_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """単票再検索は接続試験 proof がなくても実検索の検証を利用して開始する。"""
+    """単票再検索は接続試験 proof がない provider では開始しない。"""
 
     settings = InstallAISettings(monkeypatch)
     # OpenCode では API キーは fingerprint の核にならないため、provider が異なることを
@@ -2716,16 +2831,12 @@ def test_single_relookup_does_not_require_connection_test_proof(
                 episode_number=None,
             )
 
-            accepted = await RecordedEpisodeAutomation.startRelookup(
-                program.id,
-                expected_series_id=series.id,
-                expected_series_episode_id=None,
-            )
-            assert accepted.execution_id == 321
-            assert accepted.reused is False
-
-            tasks = list(RecordedEpisodeAutomation._relookup_tasks.values())
-            await asyncio.gather(*tasks)
+            with pytest.raises(RecordedEpisodeRelookupDisabledError):
+                await RecordedEpisodeAutomation.startRelookup(
+                    program.id,
+                    expected_series_id=series.id,
+                    expected_series_episode_id=None,
+                )
         finally:
             RecordedEpisodeAutomation._relookup_tasks = {}
             RecordedEpisodeAutomation._relookup_handles = {}
@@ -2734,10 +2845,10 @@ def test_single_relookup_does_not_require_connection_test_proof(
     asyncio.run(Run())
 
 
-def test_episode_backfill_does_not_require_connection_test_proof(
+def test_episode_backfill_requires_connection_test_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """一括話数判定も接続試験 proof がなくても実行を開始する。"""
+    """一括話数判定も接続試験 proof がない provider では開始しない。"""
 
     settings = InstallAISettings(monkeypatch)
     unproven_settings = settings.model_copy(
@@ -2809,11 +2920,8 @@ def test_episode_backfill_does_not_require_connection_test_proof(
 
     async def Run() -> None:
         try:
-            accepted = await RecordedEpisodeAutomation.startBackfill(force=False)
-            assert accepted.execution_id == 654
-            assert accepted.reused is False
-            assert RecordedEpisodeAutomation._backfill_task is not None
-            await RecordedEpisodeAutomation._backfill_task
+            with pytest.raises(RecordedEpisodeRelookupDisabledError):
+                await RecordedEpisodeAutomation.startBackfill(force=False)
         finally:
             RecordedEpisodeAutomation._backfill_task = None
             RecordedEpisodeAutomation._backfill_handle = None

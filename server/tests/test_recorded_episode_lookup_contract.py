@@ -62,6 +62,13 @@ def _result(
             'rationale_short': '公式番組表で話数が付かないことを確認',
             'web_search_performed': True,
         })
+    elif outcome == 'NoPublishedNumber':
+        values.update({
+            'season_number': 2,
+            'confidence': 0.35,
+            'rationale_short': '公式情報でシーズン2の総集編に公開話数がないことを確認',
+            'web_search_performed': True,
+        })
     elif outcome == 'InsufficientEvidence':
         values.update({
             'confidence': 0.32,
@@ -85,6 +92,7 @@ def _result(
         ('Pending', 'Pending'),
         ('Resolved', 'Resolved'),
         ('NotNumbered', 'NotNumbered'),
+        ('NoPublishedNumber', 'NoPublishedNumber'),
         ('InsufficientEvidence', 'NeedsReview'),
         ('SearchFailed', 'Failed'),
         ('SearchNotRun', 'NeedsReview'),
@@ -104,7 +112,7 @@ def test_all_lookup_outcomes_satisfy_common_contract_and_status_mapping(
 
     assert result.outcome == outcome
     assert MapLookupOutcomeToResolutionStatus(outcome) == expected_status
-    if outcome in {'Resolved', 'NotNumbered', 'InsufficientEvidence'}:
+    if outcome in {'Resolved', 'NotNumbered', 'NoPublishedNumber', 'InsufficientEvidence'}:
         assert result.rationale_short is not None
         assert result.error_code is None
         assert result.error_message is None
@@ -177,7 +185,7 @@ def test_failure_with_verified_trace_is_never_accepted_as_episode_result() -> No
         web_search_performed=True,
     )
 
-    assert IsEpisodeLookupResultAccepted(result, 'Always') is False
+    assert IsEpisodeLookupResultAccepted(result) is False
 
 
 @pytest.mark.parametrize(

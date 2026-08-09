@@ -61,7 +61,8 @@ def _CreateEpisodeResolutionDatabase() -> sqlite3.Connection:
             (22, 1, NULL),
             (23, 1, NULL),
             (24, 1, NULL),
-            (25, 1, NULL);
+            (25, 1, NULL),
+            (26, 1, NULL);
 
         UPDATE recorded_episode_resolutions
         SET
@@ -153,7 +154,18 @@ def _CreateEpisodeResolutionDatabase() -> sqlite3.Connection:
             (
                 'Resolved', 'Manual', 0, 1, '[]',
                 'LowConfidence', NULL, 25
+            ),
+            (
+                'NeedsReview', 'WebSearch', 1, 1,
+                '[{"url":"https://example.com/rejected-episode","title":"不受理提案"}]',
+                'AcceptancePolicyRejected', NULL, 26
             );
+        UPDATE recorded_episode_resolutions
+        SET proposed_season_number = 3, proposed_episode_number = '12'
+        WHERE recorded_program_id = 13;
+        UPDATE recorded_episode_resolutions
+        SET proposed_season_number = 4, proposed_episode_number = '8'
+        WHERE recorded_program_id = 26;
         UPDATE recorded_series_ai_requests
         SET episode_resolution_id = (
             SELECT id
@@ -266,6 +278,7 @@ def test_episode_lookup_outcome_migration_preserves_existing_episode_data() -> N
         (23, None),
         (24, None),
         (25, None),
+        (26, 'InsufficientEvidence'),
     ]
 
     manual_row = connection.execute("""
@@ -381,4 +394,48 @@ def test_episode_lookup_outcome_downgrade_removes_only_new_columns() -> None:
         FROM recorded_series_ai_requests
         WHERE id = 20
     """).fetchone() == (resolution_id,)
+    connection.close()
+
+
+def test_episode_resolution_canonical_season_migration_backfills_existing_rows() -> None:
+    """migration 33 は既存 Episode のシーズンと安全に再構築できる AI outcome だけを補完する。"""
+
+    connection = _CreateEpisodeResolutionDatabase()
+    outcome_migration = importlib.import_module('app.migrations.models.26_20260727000000_update')
+    connection.executescript(asyncio.run(outcome_migration.upgrade(None)))
+    migration = importlib.import_module('app.migrations.models.33_20260809220000_update')
+    connection.executescript(asyncio.run(migration.upgrade(None)))
+
+    columns = {
+        row[1]
+        for row in connection.execute('PRAGMA table_info(recorded_episode_resolutions)').fetchall()
+    }
+    assert {'season_number', 'proposed_outcome'} <= columns
+    rows = connection.execute("""
+        SELECT recorded_program_id, season_number, proposed_outcome
+        FROM recorded_episode_resolutions
+        WHERE recorded_program_id IN (10, 11, 12, 13, 26)
+        ORDER BY recorded_program_id
+    """).fetchall()
+    assert rows == [
+        (10, 1, None),
+        (11, None, 'Resolved'),
+        (12, None, 'NotNumbered'),
+        (13, None, 'InsufficientEvidence'),
+        (26, None, 'InsufficientEvidence'),
+    ]
+
+    # downgrade は追加列だけを除去し、既存 Episode との関連を維持する。
+    connection.executescript(asyncio.run(migration.downgrade(None)))
+    downgraded_columns = {
+        row[1]
+        for row in connection.execute('PRAGMA table_info(recorded_episode_resolutions)').fetchall()
+    }
+    assert 'season_number' not in downgraded_columns
+    assert 'proposed_outcome' not in downgraded_columns
+    assert connection.execute("""
+        SELECT series_episode_id
+        FROM recorded_programs
+        WHERE id = 10
+    """).fetchone() == (100,)
     connection.close()

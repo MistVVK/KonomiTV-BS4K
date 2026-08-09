@@ -167,8 +167,8 @@ def test_recorded_series_settings_defaults_are_safe(monkeypatch: pytest.MonkeyPa
     assert settings.enabled is True
     assert settings.ai_enabled is False
     assert settings.ai_candidate_selection_enabled is True
-    assert settings.ai_episode_number_search_enabled is False
-    assert settings.ai_episode_number_acceptance_mode == 'Always'
+    assert 'ai_episode_number_search_enabled' not in settings.model_dump()
+    assert 'ai_episode_number_acceptance_mode' not in settings.model_dump()
     # デフォルトは AcpCodex（OpenCode は service_id 必須のためデフォルトにできない）。
     assert settings.ai_backend == 'AcpCodex'
     assert settings.ai_backend_service_id is None
@@ -215,8 +215,8 @@ def test_legacy_settings_use_new_child_defaults(
 
     assert settings.ai_enabled is False
     assert settings.ai_candidate_selection_enabled is True
-    assert settings.ai_episode_number_search_enabled is False
-    assert settings.ai_episode_number_acceptance_mode == 'Always'
+    assert 'ai_episode_number_search_enabled' not in settings.model_dump()
+    assert 'ai_episode_number_acceptance_mode' not in settings.model_dump()
     assert settings.ai_backend == 'AcpCodex'
     # 旧 ACP 実行設定は ACPSettings へ移行したため、読取時に無視される。
     assert settings.model_dump().get('acp_model') is None
@@ -297,26 +297,32 @@ def test_legacy_acp_home_and_share_mode_keys_are_ignored_only_when_reading_saved
 
 
 
-@pytest.mark.parametrize(
-    ('backend', 'backend_settings'),
-    [
-        ('AcpCodex', {}),
-        ('AcpGrok', {}),
-    ],
-)
-def test_fixed_acp_presets_preserve_episode_lookup_setting(
-    backend: str,
-    backend_settings: dict[str, str],
+def test_removed_episode_search_settings_are_ignored_only_when_reading_saved_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    """固定 ACP preset でも話数検索設定を強制 OFF にしない。"""
+    """廃止した話数検索設定は旧 JSON から除外し、新しい schema では受理しない。"""
 
-    settings = RecordedSeriesSettings.model_validate({
-        'ai_backend': backend,
-        'ai_episode_number_search_enabled': True,
-        **backend_settings,
-    })
+    ConfigureTemporaryStore(monkeypatch, tmp_path)
+    RecordedSeriesSettingsStore.SETTINGS_PATH.write_text(
+        json.dumps({
+            **RecordedSeriesSettings().model_dump(mode='json'),
+            'ai_episode_number_search_enabled': False,
+            'ai_episode_number_acceptance_mode': 'HighConfidenceOnly',
+        }),
+        encoding='utf-8',
+    )
 
-    assert settings.ai_episode_number_search_enabled is True
+    settings = RecordedSeriesSettingsStore.getSettings()
+
+    assert settings == RecordedSeriesSettings()
+    for removed_key in (
+        'ai_episode_number_search_enabled',
+        'ai_episode_number_acceptance_mode',
+    ):
+        assert removed_key not in settings.model_dump()
+        with pytest.raises(ValidationError):
+            RecordedSeriesSettings.model_validate({removed_key: False})
 
 
 def test_legacy_acp_custom_saved_settings_are_disabled_and_migrated_safely(
@@ -372,7 +378,7 @@ def test_acp_custom_api_payload_is_rejected(
 
 
 
-def test_episode_number_acceptance_mode_rejects_unknown_values() -> None:
+def test_removed_episode_number_acceptance_mode_is_rejected() -> None:
     with pytest.raises(ValidationError):
         RecordedSeriesSettings(ai_episode_number_acceptance_mode='Unknown')  # type: ignore[arg-type]
 
@@ -454,7 +460,9 @@ def test_episode_assignment_api_returns_complete_safe_resolution(
         recorded_program_id=1000,
         status='Failed',
         source='WebSearch',
+        season_number=None,
         lookup_outcome='SearchFailed',
+        proposed_outcome=None,
         proposed_season_number=1,
         proposed_episode_number=Decimal('13'),
         confidence=0.42,
@@ -521,8 +529,10 @@ def test_episode_assignment_api_returns_complete_safe_resolution(
         resolution_body = body['programs'][0]['resolution']
         assert list(resolution_body) == [
             'status',
+            'season_number',
             'source',
             'lookup_outcome',
+            'proposed_outcome',
             'proposed_season_number',
             'proposed_episode_number',
             'confidence',
@@ -538,7 +548,9 @@ def test_episode_assignment_api_returns_complete_safe_resolution(
         assert resolution_body == {
             'status': 'Failed',
             'source': 'WebSearch',
+            'season_number': None,
             'lookup_outcome': 'SearchFailed',
+            'proposed_outcome': None,
             'proposed_season_number': 1,
             'proposed_episode_number': '13',
             'confidence': 0.42,
@@ -568,10 +580,7 @@ def test_status_and_backfill_endpoints_return_task_contract(
     tmp_path: Path,
 ) -> None:
     ConfigureTemporaryStore(monkeypatch, tmp_path)
-    RecordedSeriesSettingsStore.saveSettings(RecordedSeriesSettings(
-        ai_enabled=True,
-        ai_episode_number_search_enabled=True,
-    ))
+    RecordedSeriesSettingsStore.saveSettings(RecordedSeriesSettings(ai_enabled=True))
     app = CreateAdminApp()
 
     async def GetStatus() -> dict[str, int | str | bool | None]:
@@ -591,6 +600,7 @@ def test_status_and_backfill_endpoints_return_task_contract(
             'episode_resolved': 90,
             'episode_unknown': 8,
             'episode_not_numbered': 1,
+            'episode_no_published_number': 0,
             'episode_needs_review': 1,
             'episode_failed': 0,
             'episode_last_run_at': '2026-07-21T12:35:00+09:00',

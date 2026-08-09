@@ -354,6 +354,51 @@ def test_manual_assignment_validates_stale_and_cross_series_updates() -> None:
     asyncio.run(Run())
 
 
+def test_manual_no_published_number_keeps_optional_season_without_creating_episode() -> None:
+    """公開話数なしはシーズンだけを正本化し、架空の SeriesEpisode を作らない。"""
+
+    async def Run() -> None:
+        await InitializeDatabase()
+        try:
+            series = await Series.create(
+                title='特別編シリーズ',
+                description='',
+                genres=ANIME_GENRES,
+            )
+            channel = await CreateChannel('NID4-SID301', 301)
+            program = await CreateRecordedProgram(
+                1,
+                series=series,
+                channel=channel,
+                episode_number=None,
+                day=1,
+            )
+
+            await RecordedEpisodeResolver.assignProgramEpisode(
+                program.id,
+                expected_series_id=series.id,
+                expected_series_episode_id=None,
+                decision='NoPublishedNumber',
+                season_number=3,
+            )
+
+            program = await RecordedProgram.get(id=program.id)
+            resolution = await RecordedEpisodeResolution.get(recorded_program_id=program.id)
+            assert program.series_episode_id is None
+            assert program.episode_number is None
+            assert resolution.status == 'NoPublishedNumber'
+            assert resolution.source == 'Manual'
+            assert resolution.season_number == 3
+            assert resolution.manual_status == 'NoPublishedNumber'
+            assert resolution.manual_season_number == 3
+            assert resolution.manual_episode_number is None
+            assert await SeriesEpisode.filter(series_id=series.id).count() == 0
+        finally:
+            await Tortoise.close_connections()
+
+    asyncio.run(Run())
+
+
 def test_manual_assignment_preserves_ai_lane_and_adopt_ai_keeps_manual_lane() -> None:
     """手動保存は AI レーンを消しず、AdoptAI は手動レーンを残して正本だけ切り替える。"""
 
@@ -384,6 +429,7 @@ def test_manual_assignment_preserves_ai_lane_and_adopt_ai_keeps_manual_lane() ->
                 status='Resolved',
                 source='WebSearch',
                 lookup_outcome='Resolved',
+                proposed_outcome='Resolved',
                 proposed_season_number=1,
                 proposed_episode_number=Decimal('3'),
                 confidence=0.91,

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 import app.routers.VersionRouter as version_router_module
+from app.config import ServerSettings
 from app.constants import BS4K_VERSION, VERSION
 
 
@@ -69,13 +70,12 @@ def test_version_information_separates_bs4k_and_upstream_versions_and_caches_tag
     tags: list[dict[str, str]],
     expected_latest_version: str | None,
 ) -> None:
-    settings = SimpleNamespace(
-        general=SimpleNamespace(
-            backend='EDCB',
-            encoder='FFmpeg',
-            jikkyo_enabled=False,
-        ),
-    )
+    settings = ServerSettings()
+    settings.general.backend = 'EDCB'
+    settings.general.encoder = 'FFmpeg'
+    settings.general.encoder_bs4k = 'NVENC'
+    settings.general.bs4k_ignore_viewer_low_latency = False
+    settings.general.jikkyo_enabled = False
     tags_client = TagsClient(tags)
     http_client_factory = Mock(return_value=tags_client)
     monkeypatch.setattr(version_router_module, 'Config', lambda: settings)
@@ -92,6 +92,8 @@ def test_version_information_separates_bs4k_and_upstream_versions_and_caches_tag
     assert first_response['upstream_version'] == VERSION
     assert first_response['git_commit'] == 'test-commit'
     assert first_response['latest_version'] == expected_latest_version
+    assert first_response['encoder_bs4k'] == 'NVENC'
+    assert first_response['bs4k_ignore_viewer_low_latency'] is False
     assert second_response['latest_version'] == expected_latest_version
     assert tags_client.requested_urls == ['https://api.github.com/repos/MistVVK/KonomiTV-BS4K/tags']
     http_client_factory.assert_called_once_with()

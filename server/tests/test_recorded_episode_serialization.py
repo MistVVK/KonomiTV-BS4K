@@ -37,7 +37,9 @@ def test_episode_numbers_are_serialized_without_exponents(
     assignment_resolution = RecordedEpisodeAssignmentResolution(
         status='NeedsReview',
         source='WebSearch',
+        season_number=None,
         lookup_outcome='InsufficientEvidence',
+        proposed_outcome='InsufficientEvidence',
         proposed_season_number=1,
         proposed_episode_number=episode_number,
         confidence=0.75,
@@ -56,8 +58,10 @@ def test_episode_numbers_are_serialized_without_exponents(
     assert assignment_resolution.model_dump(mode='json')['proposed_episode_number'] == expected
     assert list(assignment_resolution.model_dump(mode='json')) == [
         'status',
+        'season_number',
         'source',
         'lookup_outcome',
+        'proposed_outcome',
         'proposed_season_number',
         'proposed_episode_number',
         'confidence',

@@ -132,6 +132,7 @@ def test_unauthenticated_sensitive_apis_return_401() -> None:
                 await client.post('/api/captures', files={
                     'image': ('shot.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg'),
                 }),
+                await client.post('/api/videos/1/playback-index'),
                 await client.post('/api/videos/1/reanalyze'),
                 await client.post('/api/videos/1/thumbnail/regenerate'),
             )

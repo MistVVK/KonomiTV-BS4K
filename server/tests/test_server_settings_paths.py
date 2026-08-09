@@ -16,6 +16,7 @@ import app.config as config_module
 import app.routers.SettingsRouter as settings_router_module
 import app.utils.HostPath as host_path_module
 from app.config import HostServerSettings
+from app.models.User import User
 
 
 def _PrepareDockerPaths(tmp_path: Path) -> tuple[Path, dict[str, str]]:
@@ -259,7 +260,9 @@ def test_server_settings_get_api_returns_only_host_paths(
     internal_settings = _BuildHostSettings(host_paths).toServerSettings(bypass_validation=True)
     monkeypatch.setattr(settings_router_module, 'Config', lambda: internal_settings)
 
-    response = asyncio.run(settings_router_module.ServerSettingsAPI())
+    response = asyncio.run(settings_router_module.ServerSettingsAPI(
+        User(name='test-admin', password='unused', is_admin=True),
+    ))
 
     _AssertHostSettingsPaths(response, host_paths)
 

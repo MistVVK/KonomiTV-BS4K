@@ -25,6 +25,11 @@ from app.metadata.RecordedEpisodeMessages import (
             'HardTimeout',
             FormatAcpHardTimeoutMessage(subject='AI プロバイダー'),
         ),
+        (
+            'EpisodeLookupCapabilityNotVerified',
+            '選択中の AI バックエンドでは話数 Web 検索の接続試験が完了していません。'
+            'AI バックエンド設定で接続試験を実行してください。',
+        ),
     ],
 )
 def test_episode_lookup_error_codes_have_safe_japanese_messages(

@@ -31,12 +31,14 @@ from app.metadata.RecordedEpisodeContext import (
 )
 from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesAIError,
+    RecordedSeriesProgramDetailItem,
     RecordedSeriesProgramPrompt,
     SeriesChoiceCandidate,
 )
 from app.metadata.RecordedSeriesGeneration import (
     AISeriesMetadataResult,
     SeriesMetadataClusterHint,
+    SeriesMetadataClusterProgramHint,
     SeriesMetadataExistingSeriesHint,
     SeriesMetadataHints,
     SeriesMetadataLocalParseHint,
@@ -111,9 +113,12 @@ def _program() -> RecordedSeriesProgramPrompt:
     return RecordedSeriesProgramPrompt(
         title='Test',
         description='Desc',
+        detail_items=[RecordedSeriesProgramDetailItem(name='Detail', value='Value')],
         genres=['Anime'],
-        channel='NHKBSP',
-        start_date='2024-01-01',
+        channel_id='NHKBSP',
+        channel_name='Test Channel',
+        broadcast_datetime='2024-01-01T20:00:00+09:00',
+        duration_seconds=1800.0,
     )
 
 
@@ -129,6 +134,14 @@ def _hints() -> SeriesMetadataHints:
             display_title='Connection Test Series',
             normalized_key='connectiontestseries',
             member_count=1,
+            representative_programs=[
+                SeriesMetadataClusterProgramHint(
+                    title='Test',
+                    description='Desc',
+                    broadcast_datetime='2024-01-01T20:00:00+09:00',
+                    duration_seconds=1800.0,
+                ),
+            ],
         ),
         existing_series=[
             SeriesMetadataExistingSeriesHint(
@@ -136,6 +149,8 @@ def _hints() -> SeriesMetadataHints:
                 title='Connection Test Series',
                 description='',
                 wikipedia_page_id=None,
+                similarity=1.0,
+                match_reason='NormalizedExact',
             ),
         ],
         wikipedia=[
@@ -516,6 +531,7 @@ def test_connection_test_candidate_selection(monkeypatch: pytest.MonkeyPatch) ->
             season_number=1,
             episode_number=Decimal('1'),
             episode_not_numbered=False,
+            episode_no_published_number=False,
             subtitle=None,
             confidence=0.9,
             existing_series_id=1,

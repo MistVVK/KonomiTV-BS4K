@@ -12,6 +12,7 @@ import app.utils.HostPath as host_path_module
 from app import schemas
 from app.config import HostServerSettings
 from app.metadata.CMAnalysisPaths import ValidateCMLogoDirectory
+from app.models.User import User
 
 
 def test_cm_logo_directory_uses_runtime_path_only_for_file_access(
@@ -59,7 +60,9 @@ def test_cm_settings_get_api_returns_host_paths(
     internal = host_settings.toServerSettings(bypass_validation=True)
     monkeypatch.setattr(cm_router_module, 'Config', lambda: internal)
 
-    response = asyncio.run(cm_router_module.CMAnalysisSettingsAPI())
+    response = asyncio.run(cm_router_module.CMAnalysisSettingsAPI(
+        User(name='test-admin', password='unused', is_admin=True),
+    ))
 
     assert response.enabled is True
     assert response.logo_directory == '/mnt/CM-Logos'
