@@ -35,6 +35,14 @@ from app.utils.TSInformation import TSInformation
 ariblib.constants.COMPONENT_TYPE.setdefault(0x01, {})[0x83] = '映像4320p、アスペクト比16:9'
 
 
+# TSInfoAnalyzer.readPSIData() の読み取り結果
+## Complete: 書庫の末尾まで正常に読み切った
+## Stopped: callback から False が返り、呼び出し側の都合で正常に途中終了した
+## Truncated: ブロックの途中でデータが尽きた (録画中の書庫の不完全な末尾など、ベストエフォート解析では正常なフォールバック)
+## Invalid: ヘッダや長さフィールドの矛盾などのフォーマットエラー (ファイル破損の可能性が高い)
+PSIDataReadResult = Literal['Complete', 'Stopped', 'Truncated', 'Invalid']
+
+
 class TSInfoAnalyzer:
     """
     録画 TS ファイルや録画データ関連ファイルに含まれる番組情報を解析するクラス
@@ -81,9 +89,9 @@ class TSInfoAnalyzer:
         # それ以外の場合、存在すれば PSI/SI 書庫 (.psc) を読み込んで仮想 TS ファイルを作成する
         else:
             packets = bytearray()
+            # 書庫があれば必要な PSI/SI セクションを取り出してインメモリの TS ファイルとして ariblib に入力する
+            psc_path = Path(self.recorded_video.file_path).with_suffix('.psc')
             try:
-                # 書庫があれば必要な PSI/SI セクションを取り出してインメモリの TS ファイルとして ariblib に入力する
-                psc_path = Path(self.recorded_video.file_path).with_suffix('.psc')
                 with open(psc_path, 'rb') as f:
                     # PID ごとの連続性指標
                     counters: dict[int, int] = {}
@@ -125,12 +133,41 @@ class TSInfoAnalyzer:
                         return True
 
                     # PAT, NIT, SDT, TOT, EIT を取り出す
-                    if not TSInfoAnalyzer.readPSIData(f, [0x00, 0x10, 0x11, 0x14, 0x12, 0x26, 0x27], callback):
+                    read_result = TSInfoAnalyzer.readPSIData(f, [0x00, 0x10, 0x11, 0x14, 0x12, 0x26, 0x27], callback)
+                    if read_result == 'Invalid':
+                        # ヘッダや長さフィールドの矛盾が検出された場合はファイル破損の可能性が高いため warning とする
                         logging.warning(f'{psc_path}: File contents may be invalid.')
-                    if last_tot_time_sec is not None:
-                        self.last_tot_timedelta = timedelta(seconds = last_time_sec - last_tot_time_sec)
-            except Exception:
+                        # 破損した書庫由来の部分的なデータでメタデータを誤生成しないよう、読み取り済みの内容を破棄して
+                        # 書庫なしと同じ状態へフォールバックする
+                        packets.clear()
+                        self.first_tot_timedelta = timedelta()
+                        self.last_tot_timedelta = timedelta()
+                    else:
+                        if read_result == 'Truncated':
+                            # 録画中の書庫などで末尾のブロックが不完全なだけのケースは正常なフォールバックとみなし、
+                            # 読み取れた部分までを使う (書庫が完成していないだけなので warning は出さない)
+                            logging.debug(f'{psc_path}: Archive ends in the middle of a section. Parsed data up to that point will be used.')
+                        if last_tot_time_sec is not None:
+                            self.last_tot_timedelta = timedelta(seconds = last_time_sec - last_tot_time_sec)
+            except FileNotFoundError:
+                # PSI/SI 書庫が存在しないのは正常 (書庫を残さない設定の録画など) なので、静かにフォールバックする
                 pass
+            except OSError as ex:
+                # 書庫が存在するのに開けない・読めない場合は利用者が調査すべき異常
+                logging.warning(f'{psc_path}: Failed to read the PSI/SI archive:', exc_info=ex)
+                # 部分的に読み取れたデータも信頼できないため破棄する
+                packets.clear()
+                self.first_tot_timedelta = timedelta()
+                self.last_tot_timedelta = timedelta()
+            except Exception as ex:
+                # readPSIData() は書庫フォーマットを検証済みだが、callback 内の TS パケット変換などで
+                # 想定外の例外が発生しうる。送出されうる例外型を網羅できないため broad exception で受け、
+                # 調査できるよう warning に記録する (フォールバック契約: 書庫なしと同じ空の仮想 TS で続行する)
+                logging.warning(f'{psc_path}: Failed to parse the PSI/SI archive:', exc_info=ex)
+                # 部分的に読み取れたデータも信頼できないため破棄する
+                packets.clear()
+                self.first_tot_timedelta = timedelta()
+                self.last_tot_timedelta = timedelta()
 
             # TODO: 物理ファイル以外を受け取れるよう ariblib を変更すべき
             # このやり方は ariblib の内部実装を仮定しているのでよくない
@@ -992,7 +1029,7 @@ class TSInfoAnalyzer:
 
 
     @staticmethod
-    def readPSIData(reader: BufferedReader, target_pids: list[int], callback: Callable[[float, int, bytes], bool]) -> bool:
+    def readPSIData(reader: BufferedReader, target_pids: list[int], callback: Callable[[float, int, bytes], bool]) -> PSIDataReadResult:
         """
         書庫から PSI/SI セクションを取り出す
 
@@ -1002,7 +1039,9 @@ class TSInfoAnalyzer:
             callback (Callable[[float, int, bytes], bool]): セクションを1つ取り出すごとに呼び出される関数
 
         Returns:
-            bool: フォーマットエラーか callback から False が返ったとき False を返す
+            PSIDataReadResult: 読み取り結果。
+                フォーマットエラーの場合は 'Invalid'、ブロック途中でデータが尽きた場合は 'Truncated'、
+                callback から False が返って途中終了した場合は 'Stopped'、末尾まで正常に読み切った場合は 'Complete' を返す
         """
 
         def GetUint16(buf: bytes, pos: int):
@@ -1017,9 +1056,15 @@ class TSInfoAnalyzer:
 
         while True:
             buf = reader.read(32)
-            if len(buf) != 32 or buf[0:8] != b'Pssc\x0d\x0a\x9a\x0a':
-                # 完了
+            if len(buf) == 0:
+                # 書庫の末尾まで正常に読み切った
                 break
+            if len(buf) != 32:
+                # ブロックヘッダの途中でデータが尽きた (録画中の書庫の不完全な末尾)
+                return 'Truncated'
+            if buf[0:8] != b'Pssc\x0d\x0a\x9a\x0a':
+                # ブロック境界にヘッダマジックがないのは構造的な破損とみなす
+                return 'Invalid'
 
             time_list_len = GetUint16(buf, 10)
             dictionary_len = GetUint16(buf, 12)
@@ -1030,11 +1075,12 @@ class TSInfoAnalyzer:
             if (dictionary_window_len < dictionary_len or
                 dictionary_buff_size < dictionary_data_size or
                 dictionary_window_len > 65536 - 4096):
-                return False
+                # 長さフィールド同士が矛盾する構造的なフォーマットエラー
+                return 'Invalid'
 
             time_buf = reader.read(time_list_len * 4 + dictionary_len * 2)
             if len(time_buf) != time_list_len * 4 + dictionary_len * 2:
-                return False
+                return 'Truncated'
 
             pos = time_list_len * 4
             remain = dictionary_data_size
@@ -1045,16 +1091,19 @@ class TSInfoAnalyzer:
                 if code_or_size >= 0:
                     # 前回辞書 ID の参照
                     if code_or_size >= len(last_pids) or last_pids[code_or_size] < 0:
-                        return False
+                        return 'Invalid'
                     pids.append(last_pids[code_or_size])
                     dict.append(last_dict[code_or_size])
                     last_pids[code_or_size] = -1
                 else:
                     # セクションサイズ
                     remain -= 2
+                    if remain < 0:
+                        # 宣言された dictionary_data_size に収まらない構造的な矛盾
+                        return 'Invalid'
                     buf = reader.read(2)
-                    if len(buf) != 2 or remain < 0:
-                        return False
+                    if len(buf) != 2:
+                        return 'Truncated'
                     pids.append(GetUint16(buf, 0) % 0x2000)
                     # このあとセクションデータに置き換える
                     dict.append(code_or_size)
@@ -1065,15 +1114,18 @@ class TSInfoAnalyzer:
                     # 新規なのでセクションデータを読む
                     size = cast(int, dict[i]) + 4097
                     remain -= size
+                    if remain < 0:
+                        # 宣言された dictionary_data_size に収まらない構造的な矛盾
+                        return 'Invalid'
                     buf = reader.read(size)
-                    if len(buf) != size or remain < 0:
-                        return False
+                    if len(buf) != size:
+                        return 'Truncated'
                     # 対象 PID 以外のセクションデータは無視
                     dict[i] = buf if pids[i] in target_pids else None
 
             for i in range(dictionary_window_len - dictionary_len):
                 if i >= len(last_pids):
-                    return False
+                    return 'Invalid'
                 # 前回辞書のうち未参照のものを引き継ぐ
                 if last_pids[i] >= 0:
                     pids.append(last_pids[i])
@@ -1083,7 +1135,7 @@ class TSInfoAnalyzer:
             # 残りは読み飛ばす
             remain += dictionary_data_size % 2
             if remain > 0 and len(reader.read(remain)) != remain:
-                return False
+                return 'Truncated'
 
             curr_time = -1
             for time_list_pos in range(0, time_list_len * 4, 4):
@@ -1100,18 +1152,19 @@ class TSInfoAnalyzer:
                     n = GetUint16(time_buf, time_list_pos + 2) + 1
                     buf = reader.read(n * 2)
                     if len(buf) != n * 2:
-                        return False
+                        return 'Truncated'
                     time_sec = (curr_time + 0x40000000 - init_time) % 0x40000000 / 11250
                     for i in range(n):
                         code = GetUint16(buf, i * 2) - 4096
                         if code < 0 or code >= len(pids):
-                            return False
+                            return 'Invalid'
                         if dict[code] is not None and not callback(time_sec, pids[code], cast(bytes, dict[code])):
-                            return False
+                            # callback 側の都合による途中終了は書庫の異常ではない
+                            return 'Stopped'
 
             trailer_size = 4 - (dictionary_len * 2 + (dictionary_data_size + 1) // 2 * 2 + code_list_len * 2) % 4
             buf = reader.read(trailer_size)
             if len(buf) != trailer_size:
-                return False
+                return 'Truncated'
 
-        return True
+        return 'Complete'

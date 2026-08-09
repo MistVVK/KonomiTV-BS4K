@@ -918,6 +918,67 @@ async def VideoDownloadAPI(
     )
 
 
+def ExtractTOTTimeListFromPSCArchive(psc_path: pathlib.Path) -> list[tuple[float, float, datetime, datetime]]:
+    """
+    PSI/SI 書庫 (.psc) から TOT 時刻リストをベストエフォートで抽出する
+    録画番組過去ログコメント API でカット編集分のコメント時刻ずれを補正するために利用する
+
+    Args:
+        psc_path (pathlib.Path): PSI/SI 書庫ファイルのパス
+
+    Returns:
+        list[tuple[float, float, datetime, datetime]]: 抽出した TOT 時刻リスト (解析失敗時は空リスト)
+    """
+
+    tot_time_list: list[tuple[float, float, datetime, datetime]] = []
+    try:
+        with open(psc_path, 'rb') as f:
+            def callback(time_sec: float, pid: int, section: bytes) -> bool:
+                tot = TimeOffsetSection(section)
+                tot_jst_time = tot.JST_time
+                if tot_jst_time is None:
+                    return False
+                back = tot_time_list[-1] if len(tot_time_list) > 0 else None
+                if ((back is not None and (time_sec < back[1] or tot_jst_time < back[3])) or
+                    (back is None and time_sec > 60)):
+                    # 時刻の巻き戻り、または間隔が空きすぎている
+                    return False
+                if (back is None or
+                    abs((time_sec - back[0]) - (tot_jst_time - back[2]).total_seconds()) > 5):
+                    # PCR と TOT の増分量に差があるので分割する
+                    tot_time_list.append((time_sec, time_sec, tot_jst_time, tot_jst_time))
+                else:
+                    tot_time_list[-1] = (back[0], time_sec, back[2], tot_jst_time)
+                return True
+            # TOT を取り出す
+            read_result = TSInfoAnalyzer.readPSIData(f, [0x14], callback)
+            if read_result == 'Invalid':
+                # ヘッダや長さフィールドの矛盾が検出された場合はファイル破損の可能性が高いため warning とする
+                logging.warning(f'{psc_path}: File contents may be invalid.')
+                tot_time_list.clear()
+            elif read_result == 'Truncated':
+                # 録画中の書庫などで末尾のブロックが不完全なだけのケースは正常なフォールバックとみなし、
+                # warning は出さない (不完全な末尾まで信頼するとコメント時刻の補正を誤るため従来どおり結果は破棄する)
+                logging.debug(f'{psc_path}: Archive ends in the middle of a section.')
+                tot_time_list.clear()
+            elif read_result == 'Stopped':
+                # callback が時刻の巻き戻りなどを検出して停止した場合は、それまでの結果を破棄する (従来どおりの契約)
+                tot_time_list.clear()
+    except FileNotFoundError:
+        # PSI/SI 書庫が存在しないのは正常 (書庫を残さない設定の録画など) なので、静かにフォールバックする
+        pass
+    except OSError as ex:
+        # 書庫が存在するのに開けない・読めない場合は利用者が調査すべき異常
+        logging.warning(f'{psc_path}: Failed to read the PSI/SI archive:', exc_info=ex)
+        tot_time_list.clear()
+    except Exception as ex:
+        # callback 内の TimeOffsetSection のパースでは、ariblib がデータ内容に応じて多様な例外を送出するため
+        # 具体的な例外へ限定できない。broad exception で受けて warning に記録した上で空リストへフォールバックする
+        logging.warning(f'{psc_path}: Failed to parse the PSI/SI archive:', exc_info=ex)
+        tot_time_list.clear()
+    return tot_time_list
+
+
 @router.get(
     '/{video_id}/jikkyo',
     summary = '録画番組過去ログコメント API',
@@ -948,37 +1009,11 @@ async def VideoJikkyoCommentsAPI(
         if recorded_program.recorded_video.container_format != 'MPEG-TS' and jikkyo_comments.comments:
             # PSI/SI の書庫があればそこから動画のカット編集情報を抽出して過去ログコメントのタイミングを調節する
             # TODO: コメントリストの時刻などは調節前のほうが望ましいので schemas.JikkyoComment に項目を追加すべき
-            def ExtractTOTTimeList() -> list[tuple[float, float, datetime, datetime]]:
-                tot_time_list: list[tuple[float, float, datetime, datetime]] = []
-                psc_path = pathlib.Path(recorded_program.recorded_video.file_path).with_suffix('.psc')
-                try:
-                    with open(psc_path, 'rb') as f:
-                        def callback(time_sec: float, pid: int, section: bytes) -> bool:
-                            tot = TimeOffsetSection(section)
-                            tot_jst_time = tot.JST_time
-                            if tot_jst_time is None:
-                                return False
-                            back = tot_time_list[-1] if len(tot_time_list) > 0 else None
-                            if ((back is not None and (time_sec < back[1] or tot_jst_time < back[3])) or
-                                (back is None and time_sec > 60)):
-                                # 時刻の巻き戻り、または間隔が空きすぎている
-                                return False
-                            if (back is None or
-                                abs((time_sec - back[0]) - (tot_jst_time - back[2]).total_seconds()) > 5):
-                                # PCR と TOT の増分量に差があるので分割する
-                                tot_time_list.append((time_sec, time_sec, tot_jst_time, tot_jst_time))
-                            else:
-                                tot_time_list[-1] = (back[0], time_sec, back[2], tot_jst_time)
-                            return True
-                        # TOT を取り出す
-                        if not TSInfoAnalyzer.readPSIData(f, [0x14], callback):
-                            logging.warning(f'{psc_path}: File contents may be invalid.')
-                            tot_time_list.clear()
-                except Exception:
-                    tot_time_list.clear()
-                return tot_time_list
-
-            tot_time_list = await asyncio.to_thread(ExtractTOTTimeList)
+            ## 書庫の解析に失敗しても過去ログコメント API 自体はエラーにせず、補正なしのコメントをそのまま返す
+            tot_time_list = await asyncio.to_thread(
+                ExtractTOTTimeListFromPSCArchive,
+                pathlib.Path(recorded_program.recorded_video.file_path).with_suffix('.psc'),
+            )
 
             if len(tot_time_list) >= 2:
                 # TOT 時刻を開始時刻からの相対秒数に変換する
