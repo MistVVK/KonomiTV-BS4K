@@ -25,7 +25,7 @@
                                 <path fill="currentColor" d="M248.039 381.326L355.039 67.8258C367.539 28.3257 395.039 34.3258 406.539 34.3258C431.039 34.3258 453.376 61.3258 441.039 96.8258C362.639 322.426 343.539 375.326 340.539 384.826C338.486 391.326 342.039 391.326 345.539 391.326C377.039 391.326 386.539 418.326 386.539 435.326C386.539 458.826 371.539 477.326 350.039 477.326H214.539C179.039 477.326 85.8269 431.3 88.0387 335.826C91.0387 206.326 192.039 183.326 243.539 183.326H296.539L265.539 272.326H243.539C185.539 272.326 174.113 314.826 176.039 334.326C180.039 374.826 215.039 389.814 237.039 390.326C244.539 390.5 246.039 386.826 248.039 381.326Z" />
                             </svg>
                             <Icon v-else :icon="item.icon" :width="item.iconWidth ?? '26px'" :style="item.iconStyle" />
-                            <span class="ml-4">{{item.label}}</span>
+                            <span class="settings-navigation__label ml-4">{{item.label}}</span>
                         </v-btn>
                     </section>
                 </nav>
@@ -144,10 +144,16 @@ export default defineComponent({
             letter-spacing: 0.04em;
         }
 
+        // 全項目共通: 短いラベルは1行、長いラベルだけ自然に2行へ折り返す
+        // （1項目だけ特別扱いせず、固定 height をやめて min-height にする）
         .settings-navigation__button {
             justify-content: left !important;
+            align-items: center !important;
             width: 100%;
-            height: 48px;
+            height: auto !important;
+            min-height: 48px;
+            padding-top: 8px !important;
+            padding-bottom: 8px !important;
             margin-bottom: 2px;
             border-radius: 11px;
             font-size: 14px;
@@ -156,6 +162,27 @@ export default defineComponent({
 
             &.v-btn--active {
                 color: rgb(var(--v-theme-primary)) !important;
+            }
+
+            :deep(.v-btn__content) {
+                width: 100%;
+                height: auto;
+                justify-content: flex-start;
+                white-space: normal;
+            }
+
+            // アイコン幅を確保し、残り幅でラベルを折り返す
+            :deep(.v-btn__content) > :first-child {
+                flex-shrink: 0;
+            }
+
+            .settings-navigation__label {
+                flex: 1 1 auto;
+                min-width: 0;
+                white-space: normal;
+                line-height: 1.25;
+                text-align: left;
+                overflow-wrap: anywhere;
             }
         }
     }
