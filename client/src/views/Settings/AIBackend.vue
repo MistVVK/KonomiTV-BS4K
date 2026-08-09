@@ -22,8 +22,9 @@
         </div>
 
         <template v-else>
-            <v-tabs v-model="tab" color="primary" bg-color="transparent" class="mt-4"
-                :density="is_form_dense ? 'compact' : 'default'">
+            <!-- 親幅が狭いと3タブ分の intrinsic 幅が溢れるため、超過時は左右矢印でスクロールする -->
+            <v-tabs v-model="tab" color="primary" bg-color="transparent" class="mt-4 ai-backend-tabs"
+                show-arrows :density="is_form_dense ? 'compact' : 'default'">
                 <v-tab value="opencode">
                     <Icon icon="fluent:cloud-20-filled" width="17px" />
                     <span class="ml-1">OpenCode</span>
@@ -1231,6 +1232,13 @@ onMounted(async () => {
 </script>
 
 <style lang="scss" scoped>
+// 設定本文の幅に収まるようタブバー自体を親幅に拘束する
+// （拘束しないと show-arrows でも intrinsic 幅のまま親外へはみ出す）
+.ai-backend-tabs {
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+}
 .ai-backend-access-state {
     display: flex;
     align-items: center;
