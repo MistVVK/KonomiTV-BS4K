@@ -521,8 +521,7 @@ def test_automatic_acp_lookup_rejects_a_changed_credential_generation(
                 program={},  # type: ignore[arg-type]
                 settings=settings,
                 expected_provider_fingerprint=expected_fingerprint,
-                require_capability_proof=False,
             )
-        assert error.value.code == 'EpisodeLookupCapabilityNotVerified'
+        assert error.value.code == 'AISettingsChangedBeforeRequest'
 
     asyncio.run(Run())

@@ -30,7 +30,6 @@ from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle
 from app.metadata.RecordedEpisodeAutomation import (
     RecordedEpisodeAutomation,
     RecordedEpisodeRelookupConflictError,
-    RecordedEpisodeRelookupDisabledError,
     RecordedEpisodeRelookupNotFoundError,
 )
 from app.metadata.RecordedEpisodeContext import (
@@ -2640,10 +2639,10 @@ def test_single_relookup_validates_not_found_stale_and_manual(
     asyncio.run(Run())
 
 
-def test_single_relookup_requires_matching_capability_proof(
+def test_single_relookup_does_not_require_connection_test_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """接続試験の provider fingerprint と異なる provider では単票再検索を開始しない。"""
+    """単票再検索は接続試験 proof がなくても実検索の検証を利用して開始する。"""
 
     settings = InstallAISettings(monkeypatch)
     # OpenCode では API キーは fingerprint の核にならないため、provider が異なることを
@@ -2663,6 +2662,44 @@ def test_single_relookup_requires_matching_capability_proof(
         classmethod(GetUnprovenSettingsAndAPIKey),
     )
 
+    async def Start(
+        _cls: type[object],
+        *_args: object,
+        **_kwargs: object,
+    ) -> AnalysisTaskHandle:
+        return cast(
+            AnalysisTaskHandle,
+            SimpleNamespace(execution=SimpleNamespace(id=321)),
+        )
+
+    async def RunRelookup(
+        _cls: type[RecordedEpisodeAutomation],
+        _handle: AnalysisTaskHandle,
+        _recorded_program_id: int,
+        *,
+        expected_series_id: int,
+        expected_series_episode_id: int | None,
+        override_manual: bool,
+        expected_provider_fingerprint: str,
+    ) -> None:
+        del (
+            expected_series_id,
+            expected_series_episode_id,
+            override_manual,
+            expected_provider_fingerprint,
+        )
+
+    monkeypatch.setattr(
+        RecordedEpisodeAutomationModule.AnalysisTaskTracker,
+        "start",
+        classmethod(Start),
+    )
+    monkeypatch.setattr(
+        RecordedEpisodeAutomation,
+        "_runRelookup",
+        classmethod(RunRelookup),
+    )
+
     async def Run() -> None:
         await InitializeDatabase()
         try:
@@ -2679,15 +2716,107 @@ def test_single_relookup_requires_matching_capability_proof(
                 episode_number=None,
             )
 
-            with pytest.raises(RecordedEpisodeRelookupDisabledError):
-                await RecordedEpisodeAutomation.startRelookup(
-                    program.id,
-                    expected_series_id=series.id,
-                    expected_series_episode_id=None,
-                )
-            assert RecordedEpisodeAutomation._relookup_tasks == {}
+            accepted = await RecordedEpisodeAutomation.startRelookup(
+                program.id,
+                expected_series_id=series.id,
+                expected_series_episode_id=None,
+            )
+            assert accepted.execution_id == 321
+            assert accepted.reused is False
+
+            tasks = list(RecordedEpisodeAutomation._relookup_tasks.values())
+            await asyncio.gather(*tasks)
         finally:
+            RecordedEpisodeAutomation._relookup_tasks = {}
+            RecordedEpisodeAutomation._relookup_handles = {}
             await Tortoise.close_connections()
+
+    asyncio.run(Run())
+
+
+def test_episode_backfill_does_not_require_connection_test_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """一括話数判定も接続試験 proof がなくても実行を開始する。"""
+
+    settings = InstallAISettings(monkeypatch)
+    unproven_settings = settings.model_copy(
+        update={"ai_backend_service_id": "00000000-0000-4000-8000-000000000002"},
+    )
+
+    def GetUnprovenSettingsAndAPIKey(
+        _cls: type[RecordedSeriesSettingsStore],
+    ) -> tuple[RecordedSeriesSettings, str]:
+        return unproven_settings, "unproven-episode-lookup-key"
+
+    async def StartAutomation(_cls: type[RecordedEpisodeAutomation]) -> None:
+        return None
+
+    async def LoadCandidateIDs(
+        _cls: type[RecordedEpisodeAutomation],
+        *,
+        force: bool,
+        provider_fingerprint: str | None = None,
+    ) -> list[int]:
+        del force, provider_fingerprint
+        return []
+
+    async def StartTask(
+        _cls: type[object],
+        *_args: object,
+        **_kwargs: object,
+    ) -> AnalysisTaskHandle:
+        return cast(
+            AnalysisTaskHandle,
+            SimpleNamespace(execution=SimpleNamespace(id=654)),
+        )
+
+    async def RunBackfill(
+        _cls: type[RecordedEpisodeAutomation],
+        _handle: AnalysisTaskHandle,
+        candidate_ids: list[int],
+        *,
+        force: bool,
+        expected_provider_fingerprint: str,
+    ) -> None:
+        del candidate_ids, force, expected_provider_fingerprint
+
+    monkeypatch.setattr(
+        RecordedSeriesSettingsStore,
+        "getSettingsAndAPIKey",
+        classmethod(GetUnprovenSettingsAndAPIKey),
+    )
+    monkeypatch.setattr(
+        RecordedEpisodeAutomation,
+        "start",
+        classmethod(StartAutomation),
+    )
+    monkeypatch.setattr(
+        RecordedEpisodeAutomation,
+        "_loadBackfillCandidateIDs",
+        classmethod(LoadCandidateIDs),
+    )
+    monkeypatch.setattr(
+        RecordedEpisodeAutomationModule.AnalysisTaskTracker,
+        "start",
+        classmethod(StartTask),
+    )
+    monkeypatch.setattr(
+        RecordedEpisodeAutomation,
+        "_runBackfill",
+        classmethod(RunBackfill),
+    )
+
+    async def Run() -> None:
+        try:
+            accepted = await RecordedEpisodeAutomation.startBackfill(force=False)
+            assert accepted.execution_id == 654
+            assert accepted.reused is False
+            assert RecordedEpisodeAutomation._backfill_task is not None
+            await RecordedEpisodeAutomation._backfill_task
+        finally:
+            RecordedEpisodeAutomation._backfill_task = None
+            RecordedEpisodeAutomation._backfill_handle = None
 
     asyncio.run(Run())
 
@@ -2695,7 +2824,7 @@ def test_single_relookup_requires_matching_capability_proof(
 def test_relookup_rechecks_the_accepted_provider_before_external_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """202 受付後に設定が変わっても、未証明 provider を外部実行しない。"""
+    """202 受付後に設定が変わっても、別 provider を外部実行しない。"""
 
     accepted_settings = InstallAISettings(monkeypatch)
     accepted_fingerprint = get_episode_lookup_provider_fingerprint(
@@ -2712,7 +2841,7 @@ def test_relookup_rechecks_the_accepted_provider_before_external_call(
         return changed_settings, "changed-unproven-key"
 
     async def SearchEpisode(**_kwargs: object) -> AIEpisodeLookupResult:
-        raise AssertionError("未証明 provider を呼び出してはならない")
+        raise AssertionError("受付後に変更された provider を呼び出してはならない")
 
     monkeypatch.setattr(
         RecordedSeriesSettingsStore,
@@ -2754,10 +2883,10 @@ def test_relookup_rechecks_the_accepted_provider_before_external_call(
                 recorded_program_id=program.id
             )
             assert result.ai_requested is False
-            assert result.error_code == "EpisodeLookupCapabilityNotVerified"
+            assert result.error_code == "AISettingsChangedBeforeRequest"
             assert resolution.lookup_outcome == "SearchNotRun"
             assert resolution.status == "NeedsReview"
-            assert resolution.error_code == "EpisodeLookupCapabilityNotVerified"
+            assert resolution.error_code == "AISettingsChangedBeforeRequest"
             assert await RecordedSeriesAIRequest.all().count() == 0
         finally:
             await Tortoise.close_connections()

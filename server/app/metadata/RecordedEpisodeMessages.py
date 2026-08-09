@@ -34,7 +34,9 @@ _ERROR_MESSAGES: dict[str, str] = {
     'RecordedSeriesIsDisabled': '録画シリーズ判定機能が無効です。',
     'AIIsDisabled': 'AI 判定機能が無効です。',
     'AIEpisodeNumberSearchIsDisabled': '話数 Web 検索が無効です。',
-    'EpisodeLookupCapabilityNotVerified': '現在の AI 設定では話数 Web 検索能力が未確認です。接続試験を実行してください。',
+    'AISettingsChangedBeforeRequest': '検索開始前に AI バックエンド設定が変更されたため、処理を中止しました。',
+    # 接続試験を必須としていた旧実装の永続データに対する互換表示用。
+    'EpisodeLookupCapabilityNotVerified': 'この話数検索は、旧バージョンで接続試験の確認前に中止されました。再検索できます。',
     # 旧日次制限コード（互換表示用。新規発生はしない）
     'DailyAIRequestLimitReached': '本日の AI 利用上限に達しました。',
     'MonthlyTokenLimitReached': '今月の AI トークン利用上限に達しました。',

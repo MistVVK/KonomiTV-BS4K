@@ -307,9 +307,9 @@ def record_episode_lookup_capability_proof(
     """EpisodeLookup 接続試験の実測結果を provider fingerprint に結び付ける。
 
     接続・Web 検索・検索元 URL・strict schema の4項目がすべて Passed の
-    場合だけ、単票再検索開始を許可する。設定やキーが変わると fingerprint も
-    変わるため、古い証明は再利用されない。証明はディスクへ永続化し、サーバー
-    再起動後も同一 fingerprint なら再試験なしで使える。
+    場合だけ、接続試験の診断結果を provider fingerprint に記録する。設定やキーが
+    変わると fingerprint も変わるため、古い診断結果は再利用されない。実検索は
+    同じ能力を実行時に検証するため、この記録の有無を開始条件にはしない。
     """
 
     fingerprint = get_episode_lookup_provider_fingerprint(settings, api_key)
@@ -948,7 +948,6 @@ async def lookup_episode(
     settings: RecordedSeriesSettings | None = None,
     api_key: str | None = None,
     expected_provider_fingerprint: str | None = None,
-    require_capability_proof: bool = False,
 ) -> EpisodeLookupResult:
     """バックエンド非依存の話数検索。
 
@@ -957,7 +956,6 @@ async def lookup_episode(
         settings: 判定開始時の設定 snapshot。未指定時はここで取得する。
         api_key: 同じ時点の API キー snapshot。settings 指定時に併用する。
         expected_provider_fingerprint: Automation が永続化する provider。
-        require_capability_proof: 単票再検索として接続試験 proof も要求するか。
 
     Returns:
         EpisodeLookupResult: 検証済みの話数検索結果。
@@ -972,12 +970,8 @@ async def lookup_episode(
         if expected_provider_fingerprint is not None and (
             get_episode_lookup_provider_fingerprint(settings, api_key)
             != expected_provider_fingerprint
-            or (
-                require_capability_proof
-                and has_episode_lookup_capability_proof(settings, api_key) is False
-            )
         ):
-            raise RecordedSeriesAIError('EpisodeLookupCapabilityNotVerified')
+            raise RecordedSeriesAIError('AISettingsChangedBeforeRequest')
         backend = _create_backend(settings, api_key=api_key)
         return await backend.lookupEpisode(program)
 

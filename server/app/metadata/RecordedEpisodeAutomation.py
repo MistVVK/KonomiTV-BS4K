@@ -22,7 +22,6 @@ from app.metadata.ai.episode_lookup import (
 from app.metadata.ai.recorded_series_ai import (
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
-    has_episode_lookup_capability_proof,
     invalidate_episode_lookup_capability_fingerprint,
 )
 from app.metadata.ai.recorded_series_ai import (
@@ -110,7 +109,7 @@ class RecordedEpisodeRelookupConflictError(Exception):
 
 
 class RecordedEpisodeRelookupDisabledError(Exception):
-    """話数 Web 検索を開始できる設定または能力がない。"""
+    """話数 Web 検索を開始できる設定がない。"""
 
 
 class RecordedEpisodeRelookupRateLimitedError(Exception):
@@ -182,6 +181,7 @@ def _episodeLookupErrorResult(
     if code in {
         "MissingWebSearchCall",
         "ACPWebSearchNotObserved",
+        "AISettingsChangedBeforeRequest",
         "EpisodeLookupCapabilityNotVerified",
     }:
         outcome: EpisodeLookupOutcome = "SearchNotRun"
@@ -1239,7 +1239,7 @@ class RecordedEpisodeAutomation:
                 受理成功時は AI 判定で置き換える。失敗時は既存値を維持する。
             expected_series_id: 単票受付時点の Series ID。指定時は不一致を拒否する。
             expected_series_episode_id: 単票受付時点の Episode ID。
-            expected_provider_fingerprint: 手動検索受付時に能力検証した provider。
+            expected_provider_fingerprint: 手動検索受付時に固定した provider。
 
         Returns:
             確定状態、出典、AI呼び出し有無。
@@ -1435,19 +1435,13 @@ class RecordedEpisodeAutomation:
                 unavailable = ("Disabled", "AIIsDisabled")
             elif settings.ai_episode_number_search_enabled is False:
                 unavailable = ("Disabled", "AIEpisodeNumberSearchIsDisabled")
-            elif expected_provider_fingerprint is not None and (
-                provider_fingerprint != expected_provider_fingerprint
-                or has_episode_lookup_capability_proof(
-                    settings,
-                    (
-                        None  # OpenCode: API key not on recorded-series settings
-                    ),
-                )
-                is False
+            elif (
+                expected_provider_fingerprint is not None
+                and provider_fingerprint != expected_provider_fingerprint
             ):
                 unavailable = (
                     "SearchNotRun",
-                    "EpisodeLookupCapabilityNotVerified",
+                    "AISettingsChangedBeforeRequest",
                 )
             if unavailable is not None:
                 outcome, error_code = unavailable
@@ -1528,9 +1522,6 @@ class RecordedEpisodeAutomation:
                 settings=settings,
                 api_key=None,
                 expected_provider_fingerprint=provider_fingerprint,
-                require_capability_proof=(
-                    expected_provider_fingerprint is not None
-                ),
             )
         except asyncio.CancelledError:
             cancelled = True
@@ -1567,8 +1558,8 @@ class RecordedEpisodeAutomation:
                 and len(GetEpisodeLookupEvidence(result)) == 0
             )
         ):
-            # 接続試験後でも、実 lookup で tool/schema/source 能力が否定された
-            # provider は次回の単票再検索前に再試験を要求する。
+            # 接続試験後でも実 lookup で tool/schema/source 能力が否定された場合は、
+            # 診断結果が実態と食い違ったまま残らないよう該当 proof を失効する。
             invalidate_episode_lookup_capability_fingerprint(
                 provider_fingerprint,
             )
@@ -1828,13 +1819,6 @@ class RecordedEpisodeAutomation:
                 settings.enabled is False
                 or settings.ai_enabled is False
                 or settings.ai_episode_number_search_enabled is False
-                or has_episode_lookup_capability_proof(
-                    settings,
-                    (
-                        None  # OpenCode: API key not on recorded-series settings
-                    ),
-                )
-                is False
             ):
                 raise RecordedEpisodeRelookupDisabledError
             expected_provider_fingerprint = (
@@ -2116,18 +2100,12 @@ class RecordedEpisodeAutomation:
 
             await cls.start()
             settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-            # 一括処理を受け付けてから全件 Skipped にするのではなく、保存済み設定と
-            # 接続試験で話数 Web 検索能力を確認できる場合だけ実行履歴を作成する。
+            # 一括処理を受け付けてから全件 Skipped にするのではなく、保存済み設定で
+            # 話数 Web 検索が有効な場合だけ実行履歴を作成する。接続試験は任意の診断であり、
+            # 実検索でも Web tool・出典・schema を検証するため開始条件にはしない。
             if (
                 settings.ai_enabled is False
                 or settings.ai_episode_number_search_enabled is False
-                or has_episode_lookup_capability_proof(
-                    settings,
-                    (
-                        None  # OpenCode: API key not on recorded-series settings
-                    ),
-                )
-                is False
             ):
                 raise RecordedEpisodeRelookupDisabledError
             provider_fingerprint = get_episode_lookup_provider_fingerprint(

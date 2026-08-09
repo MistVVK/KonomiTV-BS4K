@@ -62,7 +62,7 @@
                     <label class="settings__item-label" for="recorded_series_ai_episode_number_search_enabled">
                         Series が確定していて話数だけ不明な録画を、AI の Web 検索で判定します。<br>
                         既存録画は自動検索せず、下の一括話数判定または録画シリーズ管理から明示的に検索できます。<br>
-                        利用前に、選択したバックエンドの「話数 Web 検索」接続テストを実行してください。<br>
+                        接続テストは任意で、実際の検索前にバックエンドの Web 検索能力を確認したい場合に利用できます。<br>
                     </label>
                     <v-switch id="recorded_series_ai_episode_number_search_enabled" class="settings__item-switch"
                         color="primary" hide-details :model-value="settings.ai_episode_number_search_enabled"
@@ -93,7 +93,7 @@
                     AI によるシリーズ情報生成と話数検索に使用するバックエンドを選択します。<br>
                     OpenCode は「設定 → AIバックエンド」で登録した service を使います。<br>
                     ACP / Codex・Grok はホスト上の CLI を起動します。<br>
-                    シリーズ情報生成と話数 Web 検索は必要な能力が異なるため、それぞれ個別に接続テストしてください。<br>
+                    シリーズ情報生成と話数 Web 検索は、AIバックエンド画面から個別に接続確認できます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
