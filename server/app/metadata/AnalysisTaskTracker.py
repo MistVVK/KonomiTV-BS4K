@@ -58,9 +58,11 @@ class AnalysisTaskHandle:
         try:
             await task
         except asyncio.CancelledError:
+            # 遅延 progress 保存タスクのキャンセルは正常な終了手順なので静かに無視する
             pass
         except Exception:
             # 保存失敗は finish 本体を阻害しない
+            ## 保存失敗の warning は SaveProgress() 側で発生時に 1 回だけ記録されるため、ここでは再記録しない
             pass
 
     async def setStage(self, stage: str, progress: float | None = None) -> None:
@@ -342,7 +344,19 @@ class AnalysisTaskTracker:
             # finish 中・terminal 後の progress だけの save は拒否する
             if handle.terminal or handle.finishing:
                 return
-            await handle.setProgress(normalized)
+            try:
+                await handle.setProgress(normalized)
+            except asyncio.CancelledError:
+                # 遅延保存タスクのキャンセルは正常な終了手順なので warning は出さない
+                raise
+            except Exception as ex:
+                # 保存失敗が次の progress 保存への置換や finish のタイミングで沈黙しないよう、発生地点で 1 回だけ記録する
+                # 例外はここで握ってタスク自体は正常終了させる (finish 側の待機処理を失敗させない)
+                # ログには実行 ID のみを含め、ファイルパスなどのローカル環境情報は出さない
+                logging.warning(
+                    f'[AnalysisTaskTracker] Failed to save progress [execution_id: {handle.execution.id}]:',
+                    exc_info=ex,
+                )
 
         task = asyncio.create_task(SaveProgress())
         handle.replaceProgressSaveTask(task)

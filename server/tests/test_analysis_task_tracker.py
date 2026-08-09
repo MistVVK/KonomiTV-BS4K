@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -173,6 +174,104 @@ def test_delayed_progress_does_not_rewind_terminal_progress(monkeypatch: pytest.
 
     assert created[0].status == 'Succeeded'
     assert created[0].progress == 1.0
+
+
+def _CaptureWarnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """AnalysisTaskTracker モジュールの warning / error ログを記録するスタブを仕込む。"""
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        'app.metadata.AnalysisTaskTracker.logging',
+        SimpleNamespace(
+            warning=lambda message, exc_info=None: warnings.append(str(message)),
+            error=lambda message, exc_info=None: warnings.append(str(message)),
+        ),
+    )
+    return warnings
+
+
+def _SetupFakeExecution(monkeypatch: pytest.MonkeyPatch) -> list[FakeExecution]:
+    """DB を使わない実行レコード生成と prune を仕込む。"""
+
+    created: list[FakeExecution] = []
+
+    async def Create(**values: Any) -> FakeExecution:
+        execution = FakeExecution(**values)
+        created.append(execution)
+        return execution
+
+    async def Prune() -> None:
+        pass
+
+    monkeypatch.setattr('app.metadata.AnalysisTaskTracker.AnalysisTaskExecution.create', Create)
+    monkeypatch.setattr(AnalysisTaskTracker, 'prune', Prune)
+    AnalysisTaskTracker._progress_saved_at.clear()
+    return created
+
+
+def test_failed_progress_save_replaced_by_next_progress_logs_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """保存失敗した progress タスクが次の updateProgressSoon() で置換されても warning が 1 回だけ記録されること。"""
+
+    created = _SetupFakeExecution(monkeypatch)
+    warnings = _CaptureWarnings(monkeypatch)
+    state = {'fail': True}
+
+    async def Run() -> None:
+        async with AnalysisTaskTracker.track('PlaybackIndex', title='番組') as handle:
+            execution = created[0]
+            original_save = execution.save
+
+            async def ProgressSave(**kwargs: Any) -> None:
+                # 遅延 progress 保存 (update_fields が progress のみ) だけを一度失敗させる
+                if state['fail'] is True and kwargs.get('update_fields') == ['progress', 'updated_at']:
+                    raise RuntimeError('simulated progress save failure')
+                await original_save(**kwargs)
+
+            execution.save = ProgressSave  # type: ignore[method-assign]
+
+            # 1 回目の遅延保存は失敗する
+            AnalysisTaskTracker._progress_saved_at[handle.execution.id] = 0.0
+            AnalysisTaskTracker.updateProgressSoon(0.4)
+            first_task = handle._progress_save_task
+            assert first_task is not None
+            await first_task
+            state['fail'] = False
+
+            # finish より先に次の progress 保存が失敗済みタスクを置換する
+            AnalysisTaskTracker._progress_saved_at[handle.execution.id] = 0.0
+            AnalysisTaskTracker.updateProgressSoon(0.6)
+            second_task = handle._progress_save_task
+            assert second_task is not None and second_task is not first_task
+            await second_task
+
+    asyncio.run(Run())
+
+    # 保存失敗は置換されても沈黙せず、発生地点で 1 回だけ warning となる
+    assert len(warnings) == 1
+    assert str(created[0].id) in warnings[0]
+    # finish 本体は保存失敗に関わらず終端状態へ到達する
+    assert created[0].status == 'Succeeded'
+    assert created[0].progress == 1.0
+
+
+def test_pending_progress_save_cancellation_does_not_warn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pending progress 保存のキャンセルは正常な終了手順であり warning を出さないこと。"""
+
+    created = _SetupFakeExecution(monkeypatch)
+    warnings = _CaptureWarnings(monkeypatch)
+
+    async def Run() -> None:
+        handle = await AnalysisTaskTracker.start('PlaybackIndex', title='番組')
+        # finish 時点で実行中の遅延保存タスクはキャンセルされる
+        pending_task = asyncio.create_task(asyncio.sleep(60))
+        handle.replaceProgressSaveTask(pending_task)
+        await handle.finish('Succeeded')
+        assert pending_task.cancelled() is True
+
+    asyncio.run(Run())
+
+    assert created[0].status == 'Succeeded'
+    assert warnings == []
 
 
 def test_progress_during_finish_await_does_not_rewind_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
