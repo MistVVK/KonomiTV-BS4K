@@ -14,6 +14,7 @@ EpisodeLookupOutcome = Literal[
     'Pending',
     'Resolved',
     'NotNumbered',
+    'NoPublishedNumber',
     'InsufficientEvidence',
     'SearchFailed',
     'SearchNotRun',
@@ -22,12 +23,26 @@ EpisodeLookupOutcome = Literal[
     'RateLimited',
     'Cancelled',
 ]
-ModelEpisodeLookupOutcome = Literal['Resolved', 'NotNumbered', 'InsufficientEvidence']
-EpisodeResolutionStatus = Literal['Pending', 'Resolved', 'Unknown', 'NotNumbered', 'NeedsReview', 'Failed']
+ModelEpisodeLookupOutcome = Literal[
+    'Resolved',
+    'NotNumbered',
+    'NoPublishedNumber',
+    'InsufficientEvidence',
+]
+EpisodeResolutionStatus = Literal[
+    'Pending',
+    'Resolved',
+    'Unknown',
+    'NotNumbered',
+    'NoPublishedNumber',
+    'NeedsReview',
+    'Failed',
+]
 
 _MODEL_OUTCOMES: frozenset[EpisodeLookupOutcome] = frozenset({
     'Resolved',
     'NotNumbered',
+    'NoPublishedNumber',
     'InsufficientEvidence',
 })
 _ERROR_OUTCOMES: frozenset[EpisodeLookupOutcome] = frozenset({
@@ -144,7 +159,7 @@ class EpisodeLookupResult:
     """OpenAI 互換 API と ACP が返す共通の話数検索結果。
 
     モデルが選べる outcome は ``Resolved`` / ``NotNumbered`` /
-    ``InsufficientEvidence`` のみである。transport・tool・schema の失敗は
+    ``NoPublishedNumber`` / ``InsufficientEvidence`` のみである。transport・tool・schema の失敗は
     adapter が残りの outcome へ正規化する。
     """
 
@@ -181,6 +196,7 @@ class EpisodeLookupResult:
             'Pending',
             'Resolved',
             'NotNumbered',
+            'NoPublishedNumber',
             'InsufficientEvidence',
             'SearchFailed',
             'SearchNotRun',
@@ -207,8 +223,6 @@ class EpisodeLookupResult:
             raise ValueError('Episode lookup completion token count must not be negative.')
         if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
             raise ValueError('Episode lookup confidence must be between 0.0 and 1.0.')
-        if (self.season_number is None) != (self.episode_number is None):
-            raise ValueError('Episode lookup season and episode numbers must be paired.')
         if self.season_number is not None and not 0 <= self.season_number <= 2_147_483_647:
             raise ValueError('Episode lookup season number must not be negative.')
         if self.episode_number is not None:
@@ -235,10 +249,16 @@ class EpisodeLookupResult:
         ):
             raise ValueError('Resolved episode lookup requires season and episode numbers.')
         if self.outcome == 'NotNumbered' and (
+            self.episode_number is not None
+        ):
+            raise ValueError('NotNumbered episode lookup must not contain an episode number.')
+        if self.outcome == 'NoPublishedNumber' and self.episode_number is not None:
+            raise ValueError('NoPublishedNumber episode lookup must not contain an episode number.')
+        if self.outcome == 'InsufficientEvidence' and (
             self.season_number is not None or
             self.episode_number is not None
         ):
-            raise ValueError('NotNumbered episode lookup must not contain episode numbers.')
+            raise ValueError('InsufficientEvidence episode lookup must not contain episode numbers.')
         if self.outcome in _MODEL_OUTCOMES:
             if self.confidence is None:
                 raise ValueError('Model episode lookup outcomes require confidence.')
@@ -346,6 +366,7 @@ def MapLookupOutcomeToResolutionStatus(
         'Pending': 'Pending',
         'Resolved': 'Resolved',
         'NotNumbered': 'NotNumbered',
+        'NoPublishedNumber': 'NoPublishedNumber',
         'InsufficientEvidence': 'NeedsReview',
         'SearchFailed': 'Failed',
         'SearchNotRun': 'NeedsReview',

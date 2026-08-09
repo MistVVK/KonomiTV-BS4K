@@ -17,11 +17,14 @@ from app.constants import JST
 from app.metadata.ai.episode_lookup import (
     EpisodeLookupOutcome,
     EpisodeLookupResult,
+    IsPublicHTTPURL,
     MapLookupOutcomeToResolutionStatus,
+    ModelEpisodeLookupOutcome,
 )
 from app.metadata.ai.recorded_series_ai import (
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
+    has_episode_lookup_capability_proof,
     invalidate_episode_lookup_capability_fingerprint,
 )
 from app.metadata.ai.recorded_series_ai import (
@@ -82,7 +85,14 @@ class RecordedEpisodeAutomationResult:
     """録画1件の話数判定結果と一括処理用区分。"""
 
     recorded_program_id: int
-    status: Literal["Resolved", "NotNumbered", "NeedsReview", "Failed", "Skipped"]
+    status: Literal[
+        'Resolved',
+        'NotNumbered',
+        'NoPublishedNumber',
+        'NeedsReview',
+        'Failed',
+        'Skipped',
+    ]
     source: str
     ai_requested: bool
     error_code: str | None = None
@@ -387,7 +397,11 @@ class RecordedEpisodeAutomation:
                     ):
                         if (
                             resolution.source != "Manual"
-                            and resolution.status not in {"Resolved", "NotNumbered"}
+                            and resolution.status not in {
+                                'Resolved',
+                                'NotNumbered',
+                                'NoPublishedNumber',
+                            }
                         ):
                             # 外部 POST 済みかもしれない処理は自動再送せず、明示再検索可能な
                             # Unknown へ戻す。lookup 監査だけを Cancelled として残す。
@@ -506,10 +520,23 @@ class RecordedEpisodeAutomation:
     ) -> RecordedEpisodeResolution:
         """新規録画にだけ、自動判定可能な非legacy Resolutionを作成する。"""
 
+        structured_episode = (
+            await SeriesEpisode.filter(
+                id=snapshot.series_episode_id,
+                series_id=snapshot.series_id,
+            ).first()
+            if snapshot.series_episode_id is not None
+            else None
+        )
         resolution, _created = await RecordedEpisodeResolution.get_or_create(
             recorded_program_id=snapshot.id,
             defaults={
                 "episode_id": snapshot.series_episode_id,
+                'season_number': (
+                    structured_episode.season_number
+                    if structured_episode is not None
+                    else None
+                ),
                 "status": "Resolved"
                 if snapshot.series_episode_id is not None
                 else "Pending",
@@ -518,6 +545,7 @@ class RecordedEpisodeAutomation:
                 "is_legacy_recording": False,
                 "input_fingerprint": _buildInputFingerprint(snapshot),
                 "provider_fingerprint": None,
+                "proposed_outcome": None,
                 "proposed_season_number": None,
                 "proposed_episode_number": None,
                 "confidence": None,
@@ -632,15 +660,17 @@ class RecordedEpisodeAutomation:
             return
 
         resolution.manual_episode_id = resolution.episode_id
+        resolution.manual_season_number = resolution.season_number
         if resolution.status == 'Resolved':
             resolution.manual_status = 'Resolved'
         elif resolution.status == 'NotNumbered':
             resolution.manual_status = 'NotNumbered'
+        elif resolution.status == 'NoPublishedNumber':
+            resolution.manual_status = 'NoPublishedNumber'
         else:
             # Unknown および Failed 等の Manual は「話数不明」相当として退避する。
             resolution.manual_status = 'Unknown'
         if resolution.episode_id is None:
-            resolution.manual_season_number = None
             resolution.manual_episode_number = None
             return
 
@@ -754,6 +784,7 @@ class RecordedEpisodeAutomation:
             )
 
             resolution.episode_id = episode.id
+            resolution.season_number = episode.season_number
             resolution.status = "Resolved"
             resolution.source = source
             resolution.lookup_outcome = "Resolved" if source == "WebSearch" else None
@@ -761,6 +792,7 @@ class RecordedEpisodeAutomation:
                 _snapshotFromProgram(recorded_program) or snapshot
             )
             resolution.provider_fingerprint = provider_fingerprint
+            resolution.proposed_outcome = 'Resolved'
             resolution.proposed_season_number = season_number
             resolution.proposed_episode_number = episode_number
             resolution.confidence = confidence
@@ -798,7 +830,14 @@ class RecordedEpisodeAutomation:
         *,
         snapshot: _EpisodeProgramSnapshot,
         resolution_id: int,
-        status: Literal["Pending", "Unknown", "NotNumbered", "NeedsReview", "Failed"],
+        status: Literal[
+            'Pending',
+            'Unknown',
+            'NotNumbered',
+            'NoPublishedNumber',
+            'NeedsReview',
+            'Failed',
+        ],
         source: Literal["Local", "WebSearch", "Migration"],
         provider_fingerprint: str | None,
         error_code: str | None,
@@ -861,6 +900,13 @@ class RecordedEpisodeAutomation:
                 raise _RecordedEpisodeSnapshotChanged
 
             resolution.episode_id = None
+            # 正本シーズンは番号付き回または番号なし終端だけが保持する。
+            # 要確認・失敗へ遷移した際に、以前の確定シーズンを残してはならない。
+            resolution.season_number = (
+                result.season_number
+                if status in {'NotNumbered', 'NoPublishedNumber'} and result is not None
+                else None
+            )
             resolution.status = status
             resolution.source = source
             resolution.lookup_outcome = lookup_outcome or (
@@ -870,12 +916,15 @@ class RecordedEpisodeAutomation:
                 snapshot
             )
             resolution.provider_fingerprint = provider_fingerprint
-            resolution.proposed_season_number = (
-                result.season_number if result is not None else None
-            )
-            resolution.proposed_episode_number = (
-                result.episode_number if result is not None else None
-            )
+            if result is not None and result.outcome in {
+                'Resolved',
+                'NotNumbered',
+                'NoPublishedNumber',
+                'InsufficientEvidence',
+            }:
+                resolution.proposed_outcome = cast(ModelEpisodeLookupOutcome, result.outcome)
+                resolution.proposed_season_number = result.season_number
+                resolution.proposed_episode_number = result.episode_number
             resolution.confidence = result.confidence if result is not None else None
             resolution.web_search_performed = (
                 result.web_search_performed if result is not None else False
@@ -903,7 +952,7 @@ class RecordedEpisodeAutomation:
         return True
 
     @classmethod
-    async def _applyNotNumbered(
+    async def _applyUnnumberedOutcome(
         cls,
         *,
         snapshot: _EpisodeProgramSnapshot,
@@ -915,7 +964,7 @@ class RecordedEpisodeAutomation:
         input_fingerprint: str | None = None,
         allow_manual_overwrite: bool = False,
     ) -> bool:
-        """公式話数なしの受理時に、旧Episodeリンクと自動話数を原子的に解除する。
+        """番号なし outcome の受理時に、旧Episodeリンクと自動話数を原子的に解除する。
 
         Args:
             allow_manual_overwrite: 単票再検索の受理結果で Manual を WebSearch へ
@@ -968,15 +1017,22 @@ class RecordedEpisodeAutomation:
                 using_db=connection,
             )
 
+            assert result.outcome in {'NotNumbered', 'NoPublishedNumber'}
             resolution.episode_id = None
-            resolution.status = "NotNumbered"
+            resolution.season_number = result.season_number
+            unnumbered_outcome = cast(
+                Literal['NotNumbered', 'NoPublishedNumber'],
+                result.outcome,
+            )
+            resolution.status = unnumbered_outcome
             resolution.source = "WebSearch"
-            resolution.lookup_outcome = "NotNumbered"
+            resolution.lookup_outcome = result.outcome
             resolution.input_fingerprint = input_fingerprint or _buildInputFingerprint(
                 _snapshotFromProgram(recorded_program) or snapshot
             )
             resolution.provider_fingerprint = provider_fingerprint
-            resolution.proposed_season_number = None
+            resolution.proposed_outcome = unnumbered_outcome
+            resolution.proposed_season_number = result.season_number
             resolution.proposed_episode_number = None
             resolution.confidence = result.confidence
             resolution.web_search_performed = True
@@ -1047,13 +1103,19 @@ class RecordedEpisodeAutomation:
             resolution.error_message = GetRecordedEpisodeErrorMessage(
                 resolution.error_code
             )
-            if result.outcome in {"Resolved", "NotNumbered", "InsufficientEvidence"}:
+            if result.outcome in {
+                'Resolved',
+                'NotNumbered',
+                'NoPublishedNumber',
+                'InsufficientEvidence',
+            }:
                 # 提案付き outcome だけ evidence を今回の検索結果へ差し替える。
                 citations = [
                     _EpisodeCitationRecord(url=citation.url, title=citation.title)
                     for citation in GetEpisodeLookupEvidence(result)
                 ]
                 resolution.web_search_performed = result.web_search_performed
+                resolution.proposed_outcome = cast(ModelEpisodeLookupOutcome, result.outcome)
                 resolution.proposed_season_number = result.season_number
                 resolution.proposed_episode_number = result.episode_number
                 resolution.confidence = result.confidence
@@ -1069,7 +1131,12 @@ class RecordedEpisodeAutomation:
             request_status: Literal["Succeeded", "Failed", "Rejected"]
             if ai_request_status is not None:
                 request_status = ai_request_status
-            elif result.outcome in {"Resolved", "NotNumbered", "InsufficientEvidence"}:
+            elif result.outcome in {
+                'Resolved',
+                'NotNumbered',
+                'NoPublishedNumber',
+                'InsufficientEvidence',
+            }:
                 request_status = "Succeeded"
             elif result.outcome in {
                 "SearchNotRun",
@@ -1105,6 +1172,7 @@ class RecordedEpisodeAutomation:
         if resolution.source == "Manual" or resolution.status in {
             "Resolved",
             "NotNumbered",
+            'NoPublishedNumber',
         }:
             # 確定値・Manual の preflight 失敗でも前回成功 evidence は残す。
             # web_search_performed だけ False にすると出典表示と矛盾する。
@@ -1183,7 +1251,11 @@ class RecordedEpisodeAutomation:
                 )
                 return
 
-            if resolution.status not in {"Resolved", "NotNumbered"}:
+            if resolution.status not in {
+                'Resolved',
+                'NotNumbered',
+                'NoPublishedNumber',
+            }:
                 resolution.status = "Unknown"
             resolution.lookup_outcome = "Cancelled"
             resolution.web_search_performed = (
@@ -1277,13 +1349,18 @@ class RecordedEpisodeAutomation:
             refreshing_confirmed = force and resolution.status in {
                 "Resolved",
                 "NotNumbered",
+                'NoPublishedNumber',
             }
             # 単票再検索 (apply_accepted_lookup) では、受理成功時に AI 結果を正本化する。
             # それ以外の force 再検索は Local / EPG / Migration / Manual を壊さない。
             preserving_deterministic_value = (
                 force
                 and apply_accepted_lookup is False
-                and resolution.status in {'Resolved', 'NotNumbered'}
+                and resolution.status in {
+                    'Resolved',
+                    'NotNumbered',
+                    'NoPublishedNumber',
+                }
                 and resolution.source in {'Local', 'EPG', 'Migration', 'Manual', 'AI'}
             )
             preserving_current_value = (
@@ -1363,13 +1440,19 @@ class RecordedEpisodeAutomation:
             if resolution.is_legacy_recording and allow_legacy_ai is False:
                 if resolution.source == "WebSearch" and resolution.status in {
                     "NotNumbered",
+                    'NoPublishedNumber',
                     "NeedsReview",
                     "Failed",
                 }:
                     return RecordedEpisodeAutomationResult(
                         recorded_program_id,
                         cast(
-                            Literal["NotNumbered", "NeedsReview", "Failed"],
+                            Literal[
+                                'NotNumbered',
+                                'NoPublishedNumber',
+                                'NeedsReview',
+                                'Failed',
+                            ],
                             resolution.status,
                         ),
                         "LegacyCache",
@@ -1398,13 +1481,11 @@ class RecordedEpisodeAutomation:
                     "LegacyRequiresManualBackfill",
                 )
 
-            settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+            settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
             audit_model = get_audit_model(settings)
             provider_fingerprint = get_episode_lookup_provider_fingerprint(
                 settings,
-                (
-                    None  # OpenCode: API key not on recorded-series settings
-                ),
+                api_key,
             )
 
             # 同一 context / provider の終端結果は明示再検索まで再利用する。
@@ -1412,12 +1493,22 @@ class RecordedEpisodeAutomation:
                 force is False
                 and resolution.input_fingerprint == input_fingerprint
                 and resolution.provider_fingerprint == provider_fingerprint
-                and resolution.status in {"NotNumbered", "NeedsReview", "Failed"}
+                and resolution.status in {
+                    'NotNumbered',
+                    'NoPublishedNumber',
+                    'NeedsReview',
+                    'Failed',
+                }
             ):
                 return RecordedEpisodeAutomationResult(
                     recorded_program_id,
                     cast(
-                        Literal["NotNumbered", "NeedsReview", "Failed"],
+                        Literal[
+                            'NotNumbered',
+                            'NoPublishedNumber',
+                            'NeedsReview',
+                            'Failed',
+                        ],
                         resolution.status,
                     ),
                     "Cache",
@@ -1433,8 +1524,6 @@ class RecordedEpisodeAutomation:
                 unavailable = ("Disabled", "RecordedSeriesIsDisabled")
             elif settings.ai_enabled is False:
                 unavailable = ("Disabled", "AIIsDisabled")
-            elif settings.ai_episode_number_search_enabled is False:
-                unavailable = ("Disabled", "AIEpisodeNumberSearchIsDisabled")
             elif (
                 expected_provider_fingerprint is not None
                 and provider_fingerprint != expected_provider_fingerprint
@@ -1442,6 +1531,11 @@ class RecordedEpisodeAutomation:
                 unavailable = (
                     "SearchNotRun",
                     "AISettingsChangedBeforeRequest",
+                )
+            elif has_episode_lookup_capability_proof(settings, api_key) is False:
+                unavailable = (
+                    'SearchNotRun',
+                    'EpisodeLookupCapabilityNotVerified',
                 )
             if unavailable is not None:
                 outcome, error_code = unavailable
@@ -1491,7 +1585,8 @@ class RecordedEpisodeAutomation:
                 model=audit_model,
                 input_fingerprint=input_fingerprint,
                 candidate_set_hash=None,
-                candidate_ids=[],
+                # EpisodeLookup では候補 ID の代わりに、送信済みの安全な検索 query hint を監査する。
+                candidate_ids=context['query_hints'],
                 selected_choice_id=None,
                 prompt_tokens=None,
                 completion_tokens=None,
@@ -1582,12 +1677,15 @@ class RecordedEpisodeAutomation:
 
             # 外部待機中に受理条件が更新されても、課金済み結果を旧 snapshot の
             # 条件で取りこぼさない。backend や認証 snapshot は呼出し時点を維持する。
-            latest_settings, _latest_api_key = (
-                RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-            )
             selected_choice_id: str | None
             if result.outcome == "NotNumbered":
                 selected_choice_id = "not-numbered"
+            elif result.outcome == 'NoPublishedNumber':
+                selected_choice_id = (
+                    f'S{result.season_number}-no-published-number'
+                    if result.season_number is not None
+                    else 'no-published-number'
+                )
             elif result.season_number is not None and result.episode_number is not None:
                 selected_choice_id = f"S{result.season_number}E{result.episode_number}"
             elif result.outcome == "InsufficientEvidence":
@@ -1597,15 +1695,22 @@ class RecordedEpisodeAutomation:
 
             terminal_status: Literal["Succeeded", "Failed", "Rejected"]
             terminal_error: RecordedSeriesAIError | None = None
-            if result.outcome in {"Resolved", "NotNumbered"}:
-                accepted = IsEpisodeLookupResultAccepted(
-                    result,
-                    latest_settings.ai_episode_number_acceptance_mode,
-                )
+            if result.outcome in {
+                'Resolved',
+                'NotNumbered',
+                'NoPublishedNumber',
+            }:
+                accepted = IsEpisodeLookupResultAccepted(result)
                 if accepted:
                     terminal_status = "Succeeded"
                 else:
-                    result = replace(result, outcome="InsufficientEvidence")
+                    # 公開 URL の根拠を確認できない出力は、番号やシーズンを提案としても残さない。
+                    result = replace(
+                        result,
+                        outcome='InsufficientEvidence',
+                        season_number=None,
+                        episode_number=None,
+                    )
                     terminal_status = "Rejected"
                     terminal_error = RecordedSeriesAIError("AcceptancePolicyRejected")
             elif result.outcome == "InsufficientEvidence":
@@ -1649,6 +1754,7 @@ class RecordedEpisodeAutomation:
                 automation_status: Literal[
                     "Resolved",
                     "NotNumbered",
+                    'NoPublishedNumber',
                     "NeedsReview",
                     "Failed",
                     "Skipped",
@@ -1658,6 +1764,8 @@ class RecordedEpisodeAutomation:
                     if resolution.status == "Resolved"
                     else "NotNumbered"
                     if resolution.status == "NotNumbered"
+                    else 'NoPublishedNumber'
+                    if resolution.status == 'NoPublishedNumber'
                     else "Skipped"
                 )
                 response = RecordedEpisodeAutomationResult(
@@ -1698,20 +1806,23 @@ class RecordedEpisodeAutomation:
                     "WebSearch",
                     True,
                 )
-            elif result.outcome == "NotNumbered" and accepted:
-                applied = await cls._applyNotNumbered(
+            elif result.outcome in {'NotNumbered', 'NoPublishedNumber'} and accepted:
+                applied = await cls._applyUnnumberedOutcome(
                     snapshot=snapshot,
                     resolution_id=resolution.id,
                     provider_fingerprint=provider_fingerprint,
                     result=result,
                     ai_request=ai_request,
-                    selected_choice_id=selected_choice_id or "not-numbered",
+                    selected_choice_id=selected_choice_id or 'unnumbered',
                     input_fingerprint=input_fingerprint,
                     allow_manual_overwrite=apply_accepted_lookup,
                 )
                 response = RecordedEpisodeAutomationResult(
                     recorded_program_id,
-                    "NotNumbered" if applied else "Skipped",
+                    cast(
+                        Literal['NotNumbered', 'NoPublishedNumber'],
+                        result.outcome,
+                    ) if applied else 'Skipped',
                     "WebSearch",
                     True,
                 )
@@ -1814,19 +1925,17 @@ class RecordedEpisodeAutomation:
             ):
                 raise RecordedEpisodeRelookupConflictError
 
-            settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+            settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
             if (
                 settings.enabled is False
                 or settings.ai_enabled is False
-                or settings.ai_episode_number_search_enabled is False
+                or has_episode_lookup_capability_proof(settings, api_key) is False
             ):
                 raise RecordedEpisodeRelookupDisabledError
             expected_provider_fingerprint = (
                 get_episode_lookup_provider_fingerprint(
                     settings,
-                    (
-                        None  # OpenCode: API key not on recorded-series settings
-                    ),
+                    api_key,
                 )
             )
 
@@ -1952,7 +2061,7 @@ class RecordedEpisodeAutomation:
 
     @classmethod
     async def promoteStoredProposals(cls) -> int:
-        """Alwaysへ変更されたとき、保存済み数値提案を再課金なしでEpisodeへ昇格する。
+        """旧受理条件で保留された有効な数値提案を再課金なしでEpisodeへ昇格する。
 
         Returns:
             新たにEpisodeへ関連付けた録画件数。
@@ -1965,8 +2074,6 @@ class RecordedEpisodeAutomation:
             if (
                 settings.enabled is False
                 or settings.ai_enabled is False
-                or settings.ai_episode_number_search_enabled is False
-                or settings.ai_episode_number_acceptance_mode != "Always"
             ):
                 return 0
             promoted_count = 0
@@ -2018,14 +2125,21 @@ class RecordedEpisodeAutomation:
                 ):
                     # 提案取得後に番組情報やSeries所属が変わった場合、旧文脈の数値は昇格しない。
                     continue
-                citations = [
-                    _EpisodeCitationRecord(
-                        url=citation.get("url", ""),
-                        title=citation.get("title", ""),
+                citations: list[_EpisodeCitationRecord] = []
+                for citation in resolution.citations:
+                    citation_url = citation.get('url')
+                    citation_title = citation.get('title')
+                    # 旧受理条件が残した数値だけでは正本化せず、現行契約と同じ
+                    # public HTTP(S) 根拠を再検証できた提案だけを昇格候補にする。
+                    if not isinstance(citation_url, str) or not isinstance(citation_title, str):
+                        continue
+                    if IsPublicHTTPURL(citation_url) is False:
+                        continue
+                    citations.append(
+                        _EpisodeCitationRecord(url=citation_url, title=citation_title)
                     )
-                    for citation in resolution.citations
-                    if citation.get("url", "") != ""
-                ]
+                if len(citations) == 0:
+                    continue
                 promotable_proposals.append((snapshot, resolution, citations))
 
             # 同一 Series の先行提案を Episode 化すると rich context の既知話数
@@ -2060,21 +2174,18 @@ class RecordedEpisodeAutomation:
             return
         await cls.start()
         await cls.promoteStoredProposals()
-        settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-        # OFFへの設定変更では、旧Web検索の提案・引用をUnknownへ上書きしない。
-        # 再有効化時には同じsettingsUpdated()を通るため、その時点で再試行できる。
+        settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+        # AI OFFへの設定変更では、旧Web検索の提案・引用をUnknownへ上書きしない。
         if (
             settings.enabled is False
             or settings.ai_enabled is False
-            or settings.ai_episode_number_search_enabled is False
+            or has_episode_lookup_capability_proof(settings, api_key) is False
         ):
             return
         await cls._enqueueRecoverablePrograms(
             provider_fingerprint=get_episode_lookup_provider_fingerprint(
                 settings,
-                (
-                    None  # OpenCode: API key not on recorded-series settings
-                ),
+                api_key,
             )
         )
 
@@ -2099,20 +2210,17 @@ class RecordedEpisodeAutomation:
                 )
 
             await cls.start()
-            settings, _ = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+            settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
             # 一括処理を受け付けてから全件 Skipped にするのではなく、保存済み設定で
-            # 話数 Web 検索が有効な場合だけ実行履歴を作成する。接続試験は任意の診断であり、
-            # 実検索でも Web tool・出典・schema を検証するため開始条件にはしない。
+            # 話数 Web 検索能力を接続試験で確認済みの場合だけ実行履歴を作成する。
             if (
                 settings.ai_enabled is False
-                or settings.ai_episode_number_search_enabled is False
+                or has_episode_lookup_capability_proof(settings, api_key) is False
             ):
                 raise RecordedEpisodeRelookupDisabledError
             provider_fingerprint = get_episode_lookup_provider_fingerprint(
                 settings,
-                (
-                    None  # OpenCode: API key not on recorded-series settings
-                ),
+                api_key,
             )
             candidates = await cls._loadBackfillCandidateIDs(
                 force=force,
@@ -2217,6 +2325,7 @@ class RecordedEpisodeAutomation:
                 skipped_count = 0
                 resolved_count = 0
                 not_numbered_count = 0
+                no_published_number_count = 0
                 needs_review_count = 0
                 preserved_count = 0
                 ai_request_count = 0
@@ -2266,6 +2375,9 @@ class RecordedEpisodeAutomation:
                     elif result.status == "NotNumbered":
                         succeeded_count += 1
                         not_numbered_count += 1
+                    elif result.status == 'NoPublishedNumber':
+                        succeeded_count += 1
+                        no_published_number_count += 1
                     elif result.status == "NeedsReview":
                         succeeded_count += 1
                         needs_review_count += 1
@@ -2305,6 +2417,7 @@ class RecordedEpisodeAutomation:
                             "resolved_or_reviewed": succeeded_count,
                             "resolved": resolved_count,
                             "not_numbered": not_numbered_count,
+                            'no_published_number': no_published_number_count,
                             "needs_review": needs_review_count,
                             "preserved": preserved_count,
                             "failed": failed_count,
@@ -2344,6 +2457,7 @@ class RecordedEpisodeAutomation:
                 "Resolved",
                 "Unknown",
                 "NotNumbered",
+                'NoPublishedNumber',
                 "NeedsReview",
                 "Failed",
             )
@@ -2366,6 +2480,7 @@ class RecordedEpisodeAutomation:
             "episode_resolved": status_counts["Resolved"],
             "episode_unknown": unknown_count,
             "episode_not_numbered": status_counts["NotNumbered"],
+            'episode_no_published_number': status_counts['NoPublishedNumber'],
             "episode_needs_review": status_counts["NeedsReview"],
             "episode_failed": status_counts["Failed"],
             "episode_last_run_at": (

@@ -10,7 +10,6 @@ from app.metadata.ai.episode_lookup import (
 from app.metadata.RecordedEpisodeContext import (
     RecordedEpisodeLookupContext,
 )
-from app.metadata.RecordedSeriesSettings import RecordedEpisodeNumberAcceptanceMode
 
 
 RecordedEpisodeProgramPrompt = RecordedEpisodeLookupContext
@@ -96,32 +95,21 @@ def GetEpisodeLookupEvidence(
 
 def IsEpisodeLookupResultAccepted(
     result: EpisodeLookupResult,
-    acceptance_mode: RecordedEpisodeNumberAcceptanceMode,
-    minimum_confidence: float = 0.80,
 ) -> bool:
-    """設定された受理モードで、Web検索結果をEpisodeへ自動反映できるか判定する。
+    """Web検索と公開URLの根拠を検証できた有効な結果だけを自動反映する。
+
+    confidence はモデルの自己評価なので監査表示だけに使用し、受理判定には使わない。
 
     Args:
         result: Web検索実行と出力スキーマを検証済みの結果。
-        acceptance_mode: 数値があれば常に受理するか、高信頼結果だけに限るか。
-        minimum_confidence: HighConfidenceOnlyで必要な最低信頼度。
 
     Returns:
         自動反映条件を満たす場合はTrue。
     """
 
     has_verified_evidence = len(GetEpisodeLookupEvidence(result)) > 0
-    has_high_confidence_evidence = (
-        result.confidence is not None and
-        result.confidence >= minimum_confidence and
-        has_verified_evidence
+    return (
+        result.outcome in {'Resolved', 'NotNumbered', 'NoPublishedNumber'}
+        and result.web_search_performed
+        and has_verified_evidence
     )
-    if result.outcome not in {'Resolved', 'NotNumbered'} or has_verified_evidence is False:
-        return False
-    if result.outcome == 'NotNumbered':
-        # `Always` は有効な数値結果の受理を緩和する設定であり、
-        # 話数なし判定は破壊的なキャッシュになるため引き続き高信頼の根拠を必須とする。
-        return has_high_confidence_evidence
-    if acceptance_mode == 'Always':
-        return True
-    return has_high_confidence_evidence

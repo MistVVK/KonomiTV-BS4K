@@ -86,6 +86,7 @@ class RecordedSeriesStatusResponse(BaseModel):
     episode_resolved: int
     episode_unknown: int
     episode_not_numbered: int
+    episode_no_published_number: int
     episode_needs_review: int
     episode_failed: int
     last_run_at: str | None
@@ -296,12 +297,25 @@ class RecordedEpisodeAssignmentResolution(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: Literal[
-        "Pending", "Resolved", "Unknown", "NotNumbered", "NeedsReview", "Failed"
+        'Pending',
+        'Resolved',
+        'Unknown',
+        'NotNumbered',
+        'NoPublishedNumber',
+        'NeedsReview',
+        'Failed',
     ]
+    season_number: int | None
     # 現在の正本（採用中のレーン）。
     source: Literal['Local', 'EPG', 'WebSearch', 'Manual', 'Migration', 'AI'] | None
     lookup_outcome: EpisodeLookupOutcome | None
     # AI レーン。
+    proposed_outcome: Literal[
+        'Resolved',
+        'NotNumbered',
+        'NoPublishedNumber',
+        'InsufficientEvidence',
+    ] | None
     proposed_season_number: int | None
     proposed_episode_number: schemas.RecordedEpisodeNumber | None
     confidence: float | None
@@ -311,7 +325,12 @@ class RecordedEpisodeAssignmentResolution(BaseModel):
     # 手動レーン。
     manual_season_number: int | None
     manual_episode_number: schemas.RecordedEpisodeNumber | None
-    manual_status: Literal['Resolved', 'Unknown', 'NotNumbered'] | None
+    manual_status: Literal[
+        'Resolved',
+        'Unknown',
+        'NotNumbered',
+        'NoPublishedNumber',
+    ] | None
     error_code: str | None
     error_message: str | None
 
@@ -352,6 +371,20 @@ class RecordedEpisodeUnknownAssignmentRequest(_RecordedEpisodeAssignmentRequestB
     decision: Literal["Unknown"]
 
 
+class RecordedEpisodeNoPublishedNumberAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
+    """公開話数のない録画を、任意のシーズンへ所属させる手動判断。"""
+
+    decision: Literal['NoPublishedNumber']
+    season_number: Annotated[int | None, Field(ge=0, le=2_147_483_647)] = None
+
+
+class RecordedEpisodeNotNumberedAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
+    """話数番号制度を持たない録画を、任意のシーズンへ所属させる手動判断。"""
+
+    decision: Literal['NotNumbered']
+    season_number: Annotated[int | None, Field(ge=0, le=2_147_483_647)] = None
+
+
 class RecordedEpisodeAdoptAIAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
     """保存済み AI レーンの提案を正本として採用する判断。"""
 
@@ -361,6 +394,8 @@ class RecordedEpisodeAdoptAIAssignmentRequest(_RecordedEpisodeAssignmentRequestB
 RecordedEpisodeAssignmentRequest = Annotated[
     RecordedEpisodeExistingAssignmentRequest
     | RecordedEpisodeStructuredAssignmentRequest
+    | RecordedEpisodeNoPublishedNumberAssignmentRequest
+    | RecordedEpisodeNotNumberedAssignmentRequest
     | RecordedEpisodeUnknownAssignmentRequest
     | RecordedEpisodeAdoptAIAssignmentRequest,
     Field(discriminator='decision'),
@@ -489,6 +524,8 @@ async def ParseRecordedSeriesSettingsUpdate(
         )
     # 旧クライアントの廃止済み field は受理するが、保存値や runtime 分岐へ反映しない。
     settings_body.pop("ai_candidate_selection_enabled", None)
+    settings_body.pop('ai_episode_number_search_enabled', None)
+    settings_body.pop('ai_episode_number_acceptance_mode', None)
     settings_body.pop("ai_backend_service_name", None)
     settings_body.pop("ai_backend_auth_configured", None)
 
@@ -584,7 +621,7 @@ async def RecordedSeriesSettingsUpdateAPI(
         ) from ex
     # 起動時に設定破損などでPending回収できなかった場合も、設定修復直後に再試行する。
     await RecordedSeriesResolver.retryPendingRecovery()
-    # 話数側はAlwaysへの変更で既存提案を無課金昇格し、新規録画の保留だけを再評価する。
+    # 話数側は旧受理条件の保存済み提案を無課金昇格し、新規録画の保留だけを再評価する。
     await RecordedEpisodeAutomation.settingsUpdated()
 
 
@@ -1063,8 +1100,10 @@ async def RecordedEpisodeAssignmentListAPI(
         if resolution is not None:
             resolution_response = RecordedEpisodeAssignmentResolution(
                 status=resolution.status,
+                season_number=resolution.season_number,
                 source=resolution.source,
                 lookup_outcome=resolution.lookup_outcome,
+                proposed_outcome=resolution.proposed_outcome,
                 proposed_season_number=resolution.proposed_season_number,
                 proposed_episode_number=resolution.proposed_episode_number,
                 confidence=resolution.confidence,
@@ -1142,9 +1181,14 @@ async def RecordedEpisodeAssignmentUpdateAPI(
 
     response.headers.update(NO_STORE_HEADERS)
     episode_id = request.episode_id if request.decision == "ExistingEpisode" else None
-    season_number = (
-        request.season_number if request.decision == "StructuredEpisode" else None
-    )
+    if request.decision == 'StructuredEpisode':
+        season_number = request.season_number
+    elif request.decision == 'NoPublishedNumber':
+        season_number = request.season_number
+    elif request.decision == 'NotNumbered':
+        season_number = request.season_number
+    else:
+        season_number = None
     episode_number = (
         request.episode_number if request.decision == "StructuredEpisode" else None
     )

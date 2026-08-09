@@ -43,6 +43,7 @@ async def SeriesListAPI(
             'broadcast_periods__recorded_programs__recorded_video',
             'broadcast_periods__recorded_programs__channel',
             'broadcast_periods__recorded_programs__series_episode',
+            'broadcast_periods__recorded_programs__episode_resolution',
         ) \
         .order_by('-updated_at' if order == 'desc' else 'updated_at') \
         .offset((page - 1) * PAGE_SIZE) \
@@ -92,6 +93,7 @@ async def SeriesSearchAPI(
             'broadcast_periods__recorded_programs__recorded_video',
             'broadcast_periods__recorded_programs__channel',
             'broadcast_periods__recorded_programs__series_episode',
+            'broadcast_periods__recorded_programs__episode_resolution',
         ) \
         .order_by('-updated_at' if order == 'desc' else 'updated_at') \
         .offset((page - 1) * PAGE_SIZE) \
@@ -127,6 +129,7 @@ async def SeriesAPI(
             'broadcast_periods__recorded_programs__recorded_video',
             'broadcast_periods__recorded_programs__channel',
             'broadcast_periods__recorded_programs__series_episode',
+            'broadcast_periods__recorded_programs__episode_resolution',
         ) \
         .get_or_none(id=series_id)
     if series is None:

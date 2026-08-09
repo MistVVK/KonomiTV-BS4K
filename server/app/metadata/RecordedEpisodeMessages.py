@@ -35,8 +35,8 @@ _ERROR_MESSAGES: dict[str, str] = {
     'AIIsDisabled': 'AI 判定機能が無効です。',
     'AIEpisodeNumberSearchIsDisabled': '話数 Web 検索が無効です。',
     'AISettingsChangedBeforeRequest': '検索開始前に AI バックエンド設定が変更されたため、処理を中止しました。',
-    # 接続試験を必須としていた旧実装の永続データに対する互換表示用。
-    'EpisodeLookupCapabilityNotVerified': 'この話数検索は、旧バージョンで接続試験の確認前に中止されました。再検索できます。',
+    # 現行の検索開始ゲートと、同じコードを保存した旧データの双方で使う。
+    'EpisodeLookupCapabilityNotVerified': '選択中の AI バックエンドでは話数 Web 検索の接続試験が完了していません。AI バックエンド設定で接続試験を実行してください。',
     # 旧日次制限コード（互換表示用。新規発生はしない）
     'DailyAIRequestLimitReached': '本日の AI 利用上限に達しました。',
     'MonthlyTokenLimitReached': '今月の AI トークン利用上限に達しました。',
@@ -86,7 +86,8 @@ _STATUS_FALLBACKS: dict[RecordedEpisodeResolutionStatus, str] = {
     "Pending": "話数判定の処理待ちです。",
     "Resolved": "話数を確定しました。",
     "Unknown": "ローカル情報だけでは話数を確定できません。",
-    "NotNumbered": "公式に話数が付かない番組として判定しました。",
+    "NotNumbered": "話数番号を使わない番組として判定しました。",
+    'NoPublishedNumber': 'この録画には公開された話数番号がないと判定しました。',
     "NeedsReview": "自動判定だけでは確定できないため確認が必要です。",
     "Failed": "話数判定処理に失敗しました。",
 }
@@ -150,6 +151,6 @@ def GetRecordedEpisodeReason(
     error_message = GetRecordedEpisodeErrorMessage(error_code)
     if error_message is not None:
         return error_message
-    if status in {"Resolved", "NotNumbered"} and source is not None:
+    if status in {'Resolved', 'NotNumbered', 'NoPublishedNumber'} and source is not None:
         return _SOURCE_FALLBACKS[source]
     return _STATUS_FALLBACKS[status]
