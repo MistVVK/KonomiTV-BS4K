@@ -33,12 +33,14 @@ from app.metadata.RecordedEpisodeResolver import (
 )
 from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesAIError,
+    RecordedSeriesProgramDetailItem,
     RecordedSeriesProgramPrompt,
     SearchWikipediaCandidates,
 )
 from app.metadata.RecordedSeriesGeneration import (
     AISeriesMetadataResult,
     SeriesMetadataClusterHint,
+    SeriesMetadataClusterProgramHint,
     SeriesMetadataExistingSeriesHint,
     SeriesMetadataHints,
     SeriesMetadataLocalParseHint,
@@ -56,6 +58,7 @@ from app.metadata.SeriesTitleParser import (
     ParseSeriesTitle,
     SeriesTitleParseResult,
 )
+from app.models.Channel import Channel
 from app.models.Program import Program
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedSeries import (
@@ -266,7 +269,7 @@ def _candidateRootPrefixes(title: str) -> set[str]:
         if character not in {' ', '　', '「', '『', '【', '[', '▽', '▼'}:
             continue
         candidate = title[:index].strip()
-        if len(BuildSeriesGroupingKey(candidate)) >= 4:
+        if len(BuildSeriesGroupingKey(candidate)) >= 6:
             candidates.add(candidate)
     return candidates
 
@@ -309,16 +312,26 @@ def _buildClusterEvidence(
         root_title = parse.series_title
         member_ids = set(exact_groups.get(parse.normalized_key, [program.id]))
 
-        # 同一録画が属する候補のうち、最長rootを採用して過剰な上位グループ化を避ける。
+        # 明示話数から完全な作品名を得た録画は、弱い接頭辞クラスタで短縮しない。
+        # それ以外は同一録画が属する候補のうち最長rootを採用し、過剰な上位化を避ける。
         matching_prefixes: list[str] = []
-        for prefix, ids in prefix_groups.items():
+        for prefix, ids in prefix_groups.items() if parse.has_explicit_episode is False else []:
             if program.id not in ids or len(ids) < 2:
                 continue
             prefix_content_hashes = {
                 _buildContentEvidence(snapshots_by_id[member_id])
                 for member_id in ids
             }
-            if len(prefix_content_hashes) >= 2:
+            suffix_keys = {
+                BuildSeriesGroupingKey(parses[member_id].series_title[len(prefix):])
+                for member_id in ids
+                if _hasTitlePrefixBoundary(parses[member_id].series_title, prefix)
+            }
+            if (
+                len(prefix_content_hashes) >= 2
+                and len(suffix_keys) >= 2
+                and '' not in suffix_keys
+            ):
                 matching_prefixes.append(prefix)
         if len(matching_prefixes) > 0:
             root_title = max(matching_prefixes, key=lambda value: len(BuildSeriesGroupingKey(value)))
@@ -2082,6 +2095,15 @@ class RecordedSeriesResolver:
         except (httpx.HTTPError, ValueError):
             # Wikipedia は参考情報であり、停止条件ではない。空 hints で生成を継続する。
             wikipedia_candidates = []
+        representative_rows = await RecordedProgram.filter(
+            id__in=list(cluster.member_ids[:3]),
+            recorded_video__status='Recorded',
+        ).order_by('start_time', 'id').values(
+            'title',
+            'description',
+            'start_time',
+            'duration',
+        )
         hints = SeriesMetadataHints(
             local_parse=SeriesMetadataLocalParseHint(
                 series_title=local_parse.series_title,
@@ -2093,6 +2115,15 @@ class RecordedSeriesResolver:
                 display_title=cluster.display_title,
                 normalized_key=cluster.normalized_key,
                 member_count=len(cluster.member_ids),
+                representative_programs=[
+                    SeriesMetadataClusterProgramHint(
+                        title=row['title'][:400],
+                        description=row['description'][:600],
+                        broadcast_datetime=row['start_time'].isoformat(),
+                        duration_seconds=round(row['duration'], 3),
+                    )
+                    for row in representative_rows
+                ],
             ),
             existing_series=[
                 SeriesMetadataExistingSeriesHint(
@@ -2100,6 +2131,20 @@ class RecordedSeriesResolver:
                     title=series.title,
                     description=series.description[:600],
                     wikipedia_page_id=series.wikipedia_page_id,
+                    similarity=round(
+                        _seriesSimilarity(cluster.display_title, series.title)[0],
+                        4,
+                    ),
+                    match_reason=(
+                        'NormalizedExact'
+                        if BuildSeriesGroupingKey(cluster.display_title) == BuildSeriesGroupingKey(series.title)
+                        else 'TitleContains'
+                        if (
+                            BuildSeriesGroupingKey(cluster.display_title) in BuildSeriesGroupingKey(series.title)
+                            or BuildSeriesGroupingKey(series.title) in BuildSeriesGroupingKey(cluster.display_title)
+                        )
+                        else 'FuzzySimilarity'
+                    ),
                 )
                 for series in existing_series
             ],
@@ -2118,12 +2163,30 @@ class RecordedSeriesResolver:
             *[f'wiki:{candidate["page_id"]}' for candidate in hints['wikipedia']],
         ]
         candidate_snapshot = cast(list[object], [hints])
+        channel = (
+            await Channel.filter(id=snapshot.channel_id).first()
+            if snapshot.channel_id is not None
+            else None
+        )
+        current_program = await RecordedProgram.filter(id=snapshot.id).only('duration').first()
         program_prompt = RecordedSeriesProgramPrompt(
             title=snapshot.title,
             description=snapshot.description[:800],
-            genres=[genre['major'] for genre in snapshot.genres],
-            channel=snapshot.channel_id,
-            start_date=snapshot.start_time.date().isoformat(),
+            detail_items=[
+                RecordedSeriesProgramDetailItem(
+                    name=str(name)[:120],
+                    value=str(value)[:800],
+                )
+                for name, value in sorted(snapshot.detail.items())[:8]
+            ],
+            genres=[
+                f'{genre["major"]} / {genre["middle"]}'
+                for genre in snapshot.genres[:8]
+            ],
+            channel_id=snapshot.channel_id,
+            channel_name=channel.name if channel is not None else None,
+            broadcast_datetime=snapshot.start_time.isoformat(),
+            duration_seconds=round(current_program.duration, 3) if current_program is not None else 0.0,
         )
 
         # hints 構築中に録画入力が変わった場合は、日次枠を予約する前に中止する。
@@ -2344,7 +2407,11 @@ class RecordedSeriesResolver:
         )
         local_episode_fallback = (
             ParseLegacyEpisodeNumber(local_parse.episode_number)
-            if generated.episode_number is None and generated.episode_not_numbered is False
+            if (
+                generated.episode_number is None
+                and generated.episode_not_numbered is False
+                and generated.episode_no_published_number is False
+            )
             else None
         )
         generated_parse = SeriesTitleParseResult(

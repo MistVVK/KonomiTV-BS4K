@@ -35,9 +35,19 @@ class RecordedSeriesProgramPrompt(TypedDict):
 
     title: str
     description: str
+    detail_items: list[RecordedSeriesProgramDetailItem]
     genres: list[str]
-    channel: str | None
-    start_date: str
+    channel_id: str | None
+    channel_name: str | None
+    broadcast_datetime: str
+    duration_seconds: float
+
+
+class RecordedSeriesProgramDetailItem(TypedDict):
+    """入力上限を適用した番組詳細の1項目。"""
+
+    name: str
+    value: str
 
 
 class AIChoiceOutput(BaseModel):

@@ -8,7 +8,7 @@ from typing import Literal
 from app.schemas import Genre
 
 
-SERIES_TITLE_PARSER_VERSION = '2'
+SERIES_TITLE_PARSER_VERSION = '3'
 
 
 # ARIB の番組属性表示は作品名ではないため除去する。ただし、括弧そのものを一律で消すと
@@ -20,8 +20,6 @@ _PROGRAM_ATTRIBUTE_PATTERN = re.compile(
     r'[🈑🈓🈔🈕🈖🈗🈘🈙🈚🈞🈟🈡])',
     flags=re.IGNORECASE,
 )
-_BROADCAST_FRAME_PREFIX_PATTERN = re.compile(r'^(?:【BS時代劇】)')
-
 _EPISODE_PATTERN = re.compile(
     r'(?:第\s*(?P<japanese>[0-9一二三四五六七八九十百千]+)\s*'
     r'(?P<unit>話|回|夜|週|巻|章|幕|局|戦)|'
@@ -53,14 +51,7 @@ _NAMED_SERIES_EPISODE_PATTERN = re.compile(
 )
 
 # 放送枠や単発作品を「シリーズ」として束ねると、まったく異なる映画・公演が同じ一覧へ
-# 混ざってしまう。明示的な話数がある場合は後段でこの除外より優先する。
-_STANDALONE_TITLE_PREFIXES = (
-    '金曜ロードショー',
-    '土曜プレミアム',
-    '日曜洋画劇場',
-    '午後のロードショー',
-    'プレミアムシネマ',
-)
+# 混ざってしまう。固有の放送枠名は列挙せず、ジャンルと一般的な単発表現だけを使う。
 _STANDALONE_TITLE_MARKERS = (
     '試験電波',
     '劇場版',
@@ -71,15 +62,9 @@ _STANDALONE_MAJOR_GENRES = {
     '劇場・公演',
 }
 
-# 作品名の後ろへ付く放送枠名だけを限定的に除去する。空白での一律分割は行わない。
-_BROADCAST_SLOT_SUFFIX_PATTERN = re.compile(
-    r'[\s　]+(?:FRIDAY\s+ANIME\s+NIGHT|ANIME\+)[\s　]*$',
-    flags=re.IGNORECASE,
-)
-_SUBTITLE_OPENING_PATTERN = re.compile(r'[\s　]*[「『＜<](?P<subtitle>.+?)[」』＞>]')
-_DESCRIPTION_ONLY_SUBTITLE_PATTERN = re.compile(r'^[「『＜<](?P<subtitle>.+?)[」』＞>]$')
 _LEADING_SUBTITLE_SEPARATOR_PATTERN = re.compile(r'^[\s　:：\-―▽▼／/「『]+')
 _TRAILING_SUBTITLE_SEPARATOR_PATTERN = re.compile(r'[\s　」』＞>]+$')
+_QUOTE_PAIRS = {'「': '」', '『': '』', '＜': '＞', '<': '>'}
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +94,6 @@ def NormalizeProgramText(value: str) -> str:
 
     normalized = unicodedata.normalize('NFKC', value)
     normalized = _PROGRAM_ATTRIBUTE_PATTERN.sub('', normalized)
-    normalized = _BROADCAST_FRAME_PREFIX_PATTERN.sub('', normalized)
     normalized = re.sub(r'[\s　]+', ' ', normalized)
     return normalized.strip()
 
@@ -131,7 +115,6 @@ def BuildSeriesGroupingKey(value: str) -> str:
 def _cleanSeriesTitle(value: str) -> str:
     """抽出途中のシリーズ名から限定的な装飾だけを除去する。"""
 
-    value = _BROADCAST_SLOT_SUFFIX_PATTERN.sub('', value)
     value = re.sub(r'[\s　:：\-―▽▼／/]+$', '', value)
     value = re.sub(r'^[\s　:：\-―▽▼／/]+', '', value)
     return value.strip()
@@ -156,6 +139,82 @@ def _formatEpisodeNumber(match: re.Match[str]) -> str:
     return f'第{match.group("japanese")}{match.group("unit")}'
 
 
+def _findQuotedSegment(value: str) -> tuple[int, int, str] | None:
+    """入れ子を含む最初の対応済み引用区間を返す。
+
+    Args:
+        value: 引用符を検索する正規化済み文字列。
+
+    Returns:
+        開始位置、閉じ引用符の直後、外側引用符を除いた本文。対応しない場合は None。
+    """
+
+    for start, character in enumerate(value):
+        if character not in _QUOTE_PAIRS:
+            continue
+        stack = [_QUOTE_PAIRS[character]]
+        for index in range(start + 1, len(value)):
+            current = value[index]
+            if current in _QUOTE_PAIRS:
+                stack.append(_QUOTE_PAIRS[current])
+                continue
+            if current == stack[-1]:
+                stack.pop()
+                if len(stack) == 0:
+                    return start, index + 1, value[start + 1:index]
+        return None
+    return None
+
+
+def _isInsideQuotedSegment(value: str, position: int) -> bool:
+    """指定位置が対応済み引用区間内にあるかを返す。
+
+    Args:
+        value: 引用符を検査する正規化済み文字列。
+        position: 検査する文字位置。
+
+    Returns:
+        対応済み引用区間内なら True。
+    """
+
+    remaining = value
+    offset = 0
+    while (segment := _findQuotedSegment(remaining)) is not None:
+        start, end, _content = segment
+        absolute_start = offset + start
+        absolute_end = offset + end
+        if absolute_start <= position < absolute_end:
+            return True
+        offset = absolute_end
+        remaining = value[offset:]
+    return False
+
+
+def _stripLeadingStructuralDescriptor(value: str) -> str:
+    """明示話数を伴う作品名の前に付いた短い括弧属性を構造だけから除去する。
+
+    括弧直後が話数表記なら括弧内を作品名とみなし、除去しない。これにより
+    固有の放送枠名リストを持たず、先頭属性と括弧付き作品名を区別する。
+
+    Args:
+        value: 正規化済みタイトル。
+
+    Returns:
+        先頭の構造属性を除去できた場合は残りのタイトル。それ以外は元の値。
+    """
+
+    if value.startswith('【') is False:
+        return value
+    closing_index = value.find('】', 1)
+    if closing_index <= 1:
+        return value
+    remainder = value[closing_index + 1:].lstrip()
+    episode_match = _EPISODE_PATTERN.search(remainder) or _PARENTHESIZED_EPISODE_PATTERN.search(remainder)
+    if episode_match is None or episode_match.start() < 2:
+        return value
+    return remainder
+
+
 def _extractExplicitEpisode(
     value: str,
     *,
@@ -164,7 +223,13 @@ def _extractExplicitEpisode(
 ) -> tuple[re.Match[str] | None, str | None]:
     """1つのメタデータ文字列から明示的な話数を抽出する。"""
 
-    match = (_METADATA_EPISODE_PATTERN if metadata else _EPISODE_PATTERN).search(value)
+    match = None
+    for candidate in (_METADATA_EPISODE_PATTERN if metadata else _EPISODE_PATTERN).finditer(value):
+        # 作品名・副題の引用内にある「EP.1」などを現在回の話数として扱わない。
+        if _isInsideQuotedSegment(value, candidate.start()):
+            continue
+        match = candidate
+        break
     if match is not None:
         # 概要・詳細の本文中に現れる過去回への言及を、現在回の話数として誤採用しない。
         if metadata and value[:match.start()].strip(' \t:：-―ー▽▼「『＜<【[') != '':
@@ -196,7 +261,7 @@ def ParseSeriesTitle(
         ローカル解析で得られたシリーズ候補、話数、副題、単発除外判定。
     """
 
-    normalized_title = NormalizeProgramText(title)
+    normalized_title = _stripLeadingStructuralDescriptor(NormalizeProgramText(title))
     normalized_description = NormalizeProgramText(description)
     normalized_details = [NormalizeProgramText(value) for value in detail.values() if value.strip() != '']
     major_genres = {genre['major'] for genre in genres}
@@ -204,7 +269,6 @@ def ParseSeriesTitle(
     allow_parenthesized_episode = len(major_genres & {'アニメ・特撮', 'ドラマ', 'ドキュメンタリー・教養'}) > 0
     is_primary_movie = primary_major_genre == '映画'
     is_hard_standalone = (
-        any(normalized_title.startswith(prefix) for prefix in _STANDALONE_TITLE_PREFIXES) or
         any(marker in normalized_title for marker in _STANDALONE_TITLE_MARKERS)
     )
     is_soft_standalone = primary_major_genre in _STANDALONE_MAJOR_GENRES
@@ -277,10 +341,10 @@ def ParseSeriesTitle(
         # 末尾 (N) 形式では、その直前にある「作品名『副題』」を安全に分離する。
         if title_episode_match.re is _PARENTHESIZED_EPISODE_PATTERN:
             title_before_episode = normalized_title[:title_episode_match.start()].rstrip()
-            subtitle_match = _SUBTITLE_OPENING_PATTERN.search(title_before_episode)
-            if subtitle_match is not None and subtitle_match.start() >= 2:
-                series_title = _cleanSeriesTitle(title_before_episode[:subtitle_match.start()])
-                subtitle = _cleanSubtitle(subtitle_match.group('subtitle'))
+            subtitle_segment = _findQuotedSegment(title_before_episode)
+            if subtitle_segment is not None and subtitle_segment[0] >= 2:
+                series_title = _cleanSeriesTitle(title_before_episode[:subtitle_segment[0]])
+                subtitle = _cleanSubtitle(subtitle_segment[2])
             else:
                 series_title = _cleanSeriesTitle(title_before_episode)
         return SeriesTitleParseResult(
@@ -330,14 +394,18 @@ def ParseSeriesTitle(
     # 根拠にはせず、同じrootを持つ別録画の存在をResolver側で確認する。
     series_title = _cleanSeriesTitle(normalized_title)
     subtitle = None
-    subtitle_match = _SUBTITLE_OPENING_PATTERN.search(series_title)
-    if subtitle_match is not None and subtitle_match.start() >= 2:
-        subtitle = _cleanSubtitle(subtitle_match.group('subtitle'))
-        series_title = _cleanSeriesTitle(series_title[:subtitle_match.start()])
+    subtitle_segment = _findQuotedSegment(series_title)
+    if subtitle_segment is not None and subtitle_segment[0] >= 2:
+        subtitle = _cleanSubtitle(subtitle_segment[2])
+        series_title = _cleanSeriesTitle(series_title[:subtitle_segment[0]])
     if subtitle is None:
-        description_subtitle_match = _DESCRIPTION_ONLY_SUBTITLE_PATTERN.match(normalized_description)
-        if description_subtitle_match is not None:
-            subtitle = _cleanSubtitle(description_subtitle_match.group('subtitle'))
+        description_subtitle_segment = _findQuotedSegment(normalized_description)
+        if (
+            description_subtitle_segment is not None
+            and description_subtitle_segment[0] == 0
+            and description_subtitle_segment[1] == len(normalized_description)
+        ):
+            subtitle = _cleanSubtitle(description_subtitle_segment[2])
 
     return SeriesTitleParseResult(
         series_title=series_title,

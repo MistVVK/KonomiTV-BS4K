@@ -41,6 +41,16 @@ class SeriesMetadataClusterHint(TypedDict):
     display_title: str
     normalized_key: str
     member_count: int
+    representative_programs: list[SeriesMetadataClusterProgramHint]
+
+
+class SeriesMetadataClusterProgramHint(TypedDict):
+    """クラスタが同一シリーズ候補になった根拠を示す代表録画。"""
+
+    title: str
+    description: str
+    broadcast_datetime: str
+    duration_seconds: float
 
 
 class SeriesMetadataExistingSeriesHint(TypedDict):
@@ -50,6 +60,8 @@ class SeriesMetadataExistingSeriesHint(TypedDict):
     title: str
     description: str
     wikipedia_page_id: int | None
+    similarity: float
+    match_reason: str
 
 
 class SeriesMetadataWikipediaHint(TypedDict):
@@ -115,10 +127,12 @@ class AISeriesMetadataOutput(BaseModel):
                 raise ValueError('episode_number is out of range.')
             return str(value)
         normalized = value.strip()
-        if normalized == 'NotNumbered':
+        if normalized in {'NotNumbered', 'NoPublishedNumber'}:
             return normalized
         if _EPISODE_NUMBER_PATTERN.fullmatch(normalized) is None:
-            raise ValueError('episode_number must be a decimal string or NotNumbered.')
+            raise ValueError(
+                'episode_number must be a decimal string, NotNumbered, or NoPublishedNumber.'
+            )
         decimal_value = Decimal(normalized)
         decimal_text = format(decimal_value, 'f')
         if '.' in decimal_text:
@@ -156,9 +170,12 @@ class AISeriesMetadataOutput(BaseModel):
 
         if self.series_title is None:
             raise ValueError('Series output requires series_title.')
-        if self.episode_number in {None, 'NotNumbered'}:
+        if self.episode_number is None:
             if self.season_number is not None:
                 raise ValueError('An unknown episode number must not contain season_number.')
+        elif self.episode_number in {'NotNumbered', 'NoPublishedNumber'}:
+            # 番号なしの判定でも、所属シーズンを特定できる場合は保持する。
+            pass
         elif self.season_number is None:
             raise ValueError('A numbered episode requires season_number.')
         return self
@@ -173,6 +190,7 @@ class AISeriesMetadataResult:
     season_number: int | None
     episode_number: Decimal | None
     episode_not_numbered: bool
+    episode_no_published_number: bool
     subtitle: str | None
     confidence: float
     existing_series_id: int | None
@@ -197,10 +215,19 @@ def BuildSeriesMetadataSystemPrompt() -> str:
         'existing_series_id, wikipedia_page_id, rationale_short. '
         'decision must be Series, NotSeries, or Unresolved. '
         'For Series, freely generate a clean canonical series_title. '
-        'Return episode_number as a decimal string, integer JSON, "NotNumbered", or null. '
+        'Return episode_number as a decimal string, integer JSON, "NotNumbered", '
+        '"NoPublishedNumber", or null. '
+        'Use NoPublishedNumber for a special, recap, or other episode that belongs to the work '
+        'but has no published episode number. Use NotNumbered only when the continuing program '
+        'does not use episode numbering. Keep season_number when its season is identifiable. '
+        'A null episode_number means insufficient episode evidence, not an unnumbered episode. '
         'Copy an existing_series_id or wikipedia_page_id only when the same work appears in hints; '
         'otherwise return null and never invent an ID. '
         'Use NotSeries only for a one-off program and Unresolved when evidence is insufficient. '
+        'Treat a continuing program with changing per-broadcast content as Series. '
+        'Do not merge different works merely because they share a broadcast slot or short prefix. '
+        'A recap or special belongs to the same Series when program and cluster evidence identify the work. '
+        'Prefer the complete local_parse series title when explicit episode notation supports it. '
         'For NotSeries or Unresolved, all metadata and ID fields must be null. '
         'confidence is always a number from 0.0 through 1.0.'
     )
@@ -277,16 +304,22 @@ def ValidateSeriesMetadataOutput(
     wikipedia_ids = {candidate['page_id'] for candidate in hints['wikipedia']}
     episode_text = cast(str | None, output.episode_number)
     episode_not_numbered = episode_text == 'NotNumbered'
+    episode_no_published_number = episode_text == 'NoPublishedNumber'
     return AISeriesMetadataResult(
         decision=output.decision,
         series_title=output.series_title,
         season_number=output.season_number,
         episode_number=(
             Decimal(episode_text)
-            if episode_text is not None and episode_not_numbered is False
+            if (
+                episode_text is not None
+                and episode_not_numbered is False
+                and episode_no_published_number is False
+            )
             else None
         ),
         episode_not_numbered=episode_not_numbered,
+        episode_no_published_number=episode_no_published_number,
         subtitle=output.subtitle,
         confidence=float(output.confidence),
         existing_series_id=(

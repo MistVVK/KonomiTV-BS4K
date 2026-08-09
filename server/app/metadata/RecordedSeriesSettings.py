@@ -21,7 +21,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.constants import DATA_DIR
 
 
-RecordedEpisodeNumberAcceptanceMode = Literal['HighConfidenceOnly', 'Always']
 # AI バックエンド種別。OpenCode に加えて ACP の Codex / Grok を併存させる。
 # OpenAICompatible / AcpGemini はクリーンブレークで拒否する。
 AIBackendKind = Literal['OpenCode', 'AcpCodex', 'AcpGrok']
@@ -42,6 +41,11 @@ _LEGACY_SETTINGS_KEYS = frozenset({
     'api_base_url',
     'model',
     'daily_ai_request_limit',
+})
+# 話数 Web 検索は固定動作へ移行した。既存ファイルからは除外し、今後は保存しない。
+_REMOVED_EPISODE_SEARCH_SETTINGS_KEYS = frozenset({
+    'ai_episode_number_search_enabled',
+    'ai_episode_number_acceptance_mode',
 })
 # 未リリース WIP の旧 home / Symlink / Copy / Custom ACP 設定。読取時のみ除外する。
 _LEGACY_ACP_AUTH_SETTINGS_KEYS = frozenset({
@@ -80,11 +84,6 @@ class RecordedSeriesSettings(BaseModel):
     ai_enabled: Annotated[bool, Field()] = False
     # 旧 JSON の読取互換だけを保つ。保存・API 応答・Resolver 分岐では使用しない。
     ai_candidate_selection_enabled: Annotated[bool, Field(exclude=True)] = True
-    ai_episode_number_search_enabled: Annotated[bool, Field()] = False
-    ai_episode_number_acceptance_mode: Annotated[
-        RecordedEpisodeNumberAcceptanceMode,
-        Field(),
-    ] = 'Always'
     # AI バックエンド種別。OpenCode / AcpCodex / AcpGrok の 3 種のみ。
     ai_backend: Annotated[AIBackendKind, Field()] = 'AcpCodex'
     # OpenCode 時のみ参照する AIBackendSettings の service_id（UUID）。
@@ -176,7 +175,8 @@ class RecordedSeriesSettingsStore:
                     key not in _LEGACY_ACP_AUTH_SETTINGS_KEYS and
                     key not in _LEGACY_ACP_EXECUTION_SETTINGS_KEYS and
                     key not in _LEGACY_ACP_CUSTOM_SETTINGS_KEYS and
-                    key not in _LEGACY_ACP_GEMINI_SETTINGS_KEYS
+                    key not in _LEGACY_ACP_GEMINI_SETTINGS_KEYS and
+                    key not in _REMOVED_EPISODE_SEARCH_SETTINGS_KEYS
                 )
             }
             # OpenAICompatible 専用フィールド / 日次制限は拒否する。
