@@ -612,11 +612,24 @@ class SeriesBroadcastPeriod(PydanticModel):
 
 class SeriesRecordedProgram(RecordedProgram):
     series_episode: SeriesEpisode | None = None
+    episode_resolution: SeriesEpisodeResolution | None = None
 
 class SeriesEpisode(PydanticModel):
     id: int
     season_number: int
     episode_number: RecordedEpisodeNumber
+
+class SeriesEpisodeResolution(PydanticModel):
+    season_number: int | None
+    status: Literal[
+        'Pending',
+        'Resolved',
+        'Unknown',
+        'NotNumbered',
+        'NoPublishedNumber',
+        'NeedsReview',
+        'Failed',
+    ]
 
 # ***** ユーザー *****
 

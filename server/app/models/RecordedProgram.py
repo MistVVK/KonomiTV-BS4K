@@ -15,7 +15,7 @@ from app.schemas import Genre
 
 if TYPE_CHECKING:
     from app.models.Channel import Channel
-    from app.models.RecordedEpisode import SeriesEpisode
+    from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
     from app.models.RecordedSeries import RecordedSeriesResolution
     from app.models.RecordedVideo import RecordedVideo
     from app.models.Series import Series
@@ -31,6 +31,7 @@ class RecordedProgram(TortoiseModel):
     id = fields.IntField(pk=True)
     recorded_video: fields.OneToOneRelation[RecordedVideo]
     series_resolution: fields.OneToOneNullableRelation[RecordedSeriesResolution]
+    episode_resolution: fields.OneToOneNullableRelation[RecordedEpisodeResolution]
     recording_start_margin = fields.FloatField()
     recording_end_margin = fields.FloatField()
     is_partially_recorded = fields.BooleanField()

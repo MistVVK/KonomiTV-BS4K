@@ -8,7 +8,10 @@ from tortoise import fields
 from tortoise.fields import Field as TortoiseField
 from tortoise.models import Model as TortoiseModel
 
-from app.metadata.ai.episode_lookup import EpisodeLookupOutcome
+from app.metadata.ai.episode_lookup import (
+    EpisodeLookupOutcome,
+    ModelEpisodeLookupOutcome,
+)
 
 
 if TYPE_CHECKING:
@@ -21,6 +24,7 @@ RecordedEpisodeResolutionStatus = Literal[
     'Resolved',
     'Unknown',
     'NotNumbered',
+    'NoPublishedNumber',
     'NeedsReview',
     'Failed',
 ]
@@ -68,6 +72,9 @@ class RecordedEpisodeResolution(TortoiseModel):
         on_delete=fields.SET_NULL,
     )
     episode_id: int | None
+    # 現在の正本シーズン。番号付き回では episode.season_number と一致させ、
+    # 公開話数なしでは episode_id を作らずシーズン所属だけを保持する。
+    season_number = cast(TortoiseField[int | None], fields.IntField(null=True))
     status = cast(
         TortoiseField[RecordedEpisodeResolutionStatus], fields.CharField(32, index=True)
     )
@@ -85,6 +92,9 @@ class RecordedEpisodeResolution(TortoiseModel):
         TortoiseField[str | None], fields.CharField(64, null=True)
     )
     # AI レーン。手動確定しても残し、単票再検索や「AI を採用」で参照する。
+    proposed_outcome = cast(
+        TortoiseField[ModelEpisodeLookupOutcome | None], fields.CharField(32, null=True)
+    )
     proposed_season_number = cast(TortoiseField[int | None], fields.IntField(null=True))
     proposed_episode_number = cast(
         TortoiseField[Decimal | None],
@@ -106,7 +116,9 @@ class RecordedEpisodeResolution(TortoiseModel):
         fields.DecimalField(max_digits=10, decimal_places=3, null=True),
     )
     manual_status = cast(
-        TortoiseField[Literal['Resolved', 'Unknown', 'NotNumbered'] | None],
+        TortoiseField[
+            Literal['Resolved', 'Unknown', 'NotNumbered', 'NoPublishedNumber'] | None
+        ],
         fields.CharField(32, null=True),
     )
     confidence = cast(TortoiseField[float | None], fields.FloatField(null=True))
