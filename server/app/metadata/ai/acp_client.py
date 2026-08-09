@@ -217,6 +217,10 @@ class _AcpProtocolError(Exception):
         self.user_message = user_message
 
 
+class _AcpAuthenticationError(_AcpProtocolError):
+    """ACP agent が保存済み資格情報を受理できなかった。"""
+
+
 class _AcpInactivityTimeoutError(TimeoutError):
     """ACP stdio の読書きが設定時間進まなかった。
 
@@ -2153,7 +2157,12 @@ def _is_authentication_required_error(error: _AcpProtocolError) -> bool:
             'authentication required',
             'auth required',
             'api key is missing',
+            'could not be refreshed',
+            'invalid grant',
             'not configured',
+            'refresh token',
+            'token expired',
+            'token_expired',
             'unauthenticated',
             'unauthorized',
         )
@@ -2327,6 +2336,9 @@ async def _run_acp_session(
         trace=trace,
         inactivity_timeout_sec=float(inactivity_timeout_sec),
     )
+    # initialize 自体の protocol error でも認証再分類の後処理が安全に参照できる既定値。
+    method_ids: list[str] = []
+    preferred_auth_method_id: str | None = None
     try:
         initialize_result = await dispatcher.request('initialize', {
             'protocolVersion': _ACP_PROTOCOL_VERSION,
@@ -2354,7 +2366,7 @@ async def _run_acp_session(
                     'methodId': preferred_auth_method_id,
                 })
             except _AcpProtocolError as ex:
-                raise _AcpProtocolError(
+                raise _AcpAuthenticationError(
                     str(ex),
                     user_message=_user_message_for_auth_failure(
                         method_ids,
@@ -2373,7 +2385,7 @@ async def _run_acp_session(
                 preferred_auth_method_id is None
                 and _is_authentication_required_error(session_error)
             ):
-                raise _AcpProtocolError(
+                raise _AcpAuthenticationError(
                     str(session_error),
                     user_message=_user_message_for_auth_failure(
                         method_ids,
@@ -2381,7 +2393,7 @@ async def _run_acp_session(
                     ),
                 ) from session_error
             if _is_authentication_required_error(session_error):
-                raise _AcpProtocolError(
+                raise _AcpAuthenticationError(
                     str(session_error),
                     user_message=_user_message_for_auth_failure(
                         method_ids,
@@ -2439,6 +2451,20 @@ async def _run_acp_session(
     except _AcpCancelRequiredError:
         await dispatcher.cancel()
         await asyncio.sleep(_CANCEL_GRACE_SEC)
+        raise
+    except _AcpProtocolError as ex:
+        # Codex / Grok は session/new 後の prompt 開始時にも token refresh を行う。
+        # その段階の認証失敗も wire protocol 不整合へ丸めず、再取り込み可能な固定分類にする。
+        if isinstance(ex, _AcpAuthenticationError):
+            raise
+        if _is_authentication_required_error(ex):
+            raise _AcpAuthenticationError(
+                str(ex),
+                user_message=_user_message_for_auth_failure(
+                    method_ids,
+                    attempted_method_id=preferred_auth_method_id,
+                ),
+            ) from ex
         raise
     finally:
         dispatcher.capture_trace()
@@ -2789,6 +2815,11 @@ async def run_acp_candidate_selection(
             'HostCLIPermissionDenied',
             latency_ms=int((time.monotonic() - start_time) * 1000),
         ) from ex
+    except _AcpAuthenticationError as ex:
+        raise RecordedSeriesAIError(
+            'ACPAuthenticationFailed',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
     except _AcpProtocolError as ex:
         raise RecordedSeriesAIError(
             'ACPProtocolError',
@@ -2873,6 +2904,11 @@ async def run_acp_series_metadata(
     except PermissionError as ex:
         raise RecordedSeriesAIError(
             'HostCLIPermissionDenied',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except _AcpAuthenticationError as ex:
+        raise RecordedSeriesAIError(
+            'ACPAuthenticationFailed',
             latency_ms=int((time.monotonic() - start_time) * 1000),
         ) from ex
     except _AcpProtocolError as ex:
@@ -3163,6 +3199,16 @@ async def _runAcpEpisodeLookupDetailed(
             model=effective_model,
             latency_ms=int((time.monotonic() - start_time) * 1000),
             web_search_performed=trace.completed_web_calls > 0,
+            citations=trace.citations,
+        )
+    except _AcpAuthenticationError as ex:
+        return _episodeLookupFailureResult(
+            outcome='SearchFailed',
+            error_code='ACPAuthenticationFailed',
+            model=effective_model,
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+            web_search_performed=trace.completed_web_calls > 0,
+            error_message=ex.user_message,
             citations=trace.citations,
         )
     except _AcpProtocolError as ex:
@@ -3583,6 +3629,14 @@ async def run_acp_connection_test(
             effective_model,
             'ACP コマンドの実行権限がありません。',
         )
+    except _AcpAuthenticationError as authentication_error:
+        return ConnectionTestResult(
+            False,
+            int((time.monotonic() - start_time) * 1000),
+            effective_model,
+            authentication_error.user_message or 'ACP agent の認証に失敗しました。',
+            error_code='ACPAuthenticationFailed',
+        )
     except _AcpProtocolError as protocol_error:
         # 認証切れなど user_message がある場合は、汎用プロトコル失敗より具体文を優先する。
         message = protocol_error.user_message or 'ACP agent とのプロトコル検証に失敗しました。'
@@ -3591,6 +3645,7 @@ async def run_acp_connection_test(
             int((time.monotonic() - start_time) * 1000),
             effective_model,
             message,
+            error_code='ACPProtocolError',
         )
     except OSError:
         # cwd 不在・非 directory は command 未発見と誤診せず、起動失敗として返す。

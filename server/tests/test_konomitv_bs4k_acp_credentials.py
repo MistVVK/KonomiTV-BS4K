@@ -164,7 +164,7 @@ def test_credential_generation_tracks_import_delete_and_google_adc(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """proof 用世代 hash は内容を返さず、実際の固定 credential 更新だけで変わる。"""
+    """proof 用世代 hash は token refresh では変えず、明示 import ごとに更新する。"""
 
     ConfigureCredentialPaths(monkeypatch, tmp_path)
     codex_source = ACPCredentials._KONOMITV_BS4K_HOST_AUTH_PATHS['codex']
@@ -183,7 +183,20 @@ def test_credential_generation_tracks_import_delete_and_google_adc(
             'codex'
         )
     )
-    assert generation_a == hashlib.sha256(codex_source.read_bytes()).hexdigest()
+    destination_path = ACPCredentials._KONOMITV_BS4K_ACP_PROFILES_ROOT / 'codex' / 'auth.json'
+    marker_path = ACPCredentials._KONOMITV_BS4K_ACP_PROFILES_ROOT / 'codex' / '.auth-imported.json'
+    assert generation_a == hashlib.sha256(marker_path.read_bytes()).hexdigest()
+
+    # OAuth agent が専用 auth.json の access / refresh token を更新しても、
+    # 同じ明示 import 世代の能力証明は維持する。
+    WriteCredential(destination_path, 'agent-refreshed-generation-a')
+    os.chmod(destination_path, 0o600)
+    assert (
+        ACPCredentials.KonomiTVBS4KACPCredentials.getCredentialGeneration(
+            'codex'
+        )
+        == generation_a
+    )
 
     WriteCredential(codex_source, 'generation-b')
     ACPCredentials.KonomiTVBS4KACPCredentials.importProviderAuth('codex')
@@ -192,7 +205,7 @@ def test_credential_generation_tracks_import_delete_and_google_adc(
             'codex'
         )
     )
-    assert generation_b == hashlib.sha256(codex_source.read_bytes()).hexdigest()
+    assert generation_b == hashlib.sha256(marker_path.read_bytes()).hexdigest()
     assert generation_b != generation_a
 
     ACPCredentials.KonomiTVBS4KACPCredentials.deleteProviderAuth('codex')

@@ -1776,6 +1776,24 @@ def test_acp_connection_test_surfaces_interactive_auth_failure(
     ))
     assert result.success is False
     assert 'Grok' in result.message or '認証' in result.message
+    assert result.error_code == 'ACPAuthenticationFailed'
+
+
+def test_acp_episode_lookup_classifies_prompt_auth_failure(
+    tmp_path: Path,
+) -> None:
+    """session 作成後の token refresh 失敗を protocol error と区別する。"""
+
+    result, _log_path = RunEpisodeLookup(
+        tmp_path,
+        backend_kind='AcpCodex',
+        mode='prompt_auth_failure',
+    )
+
+    assert result.outcome == 'SearchFailed'
+    assert result.error_code == 'ACPAuthenticationFailed'
+    assert result.error_message is not None
+    assert '認証' in result.error_message
 
 
 def test_acp_legacy_models_advertisement_uses_set_model(tmp_path: Path) -> None:

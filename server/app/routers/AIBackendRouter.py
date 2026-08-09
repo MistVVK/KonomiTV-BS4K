@@ -1008,6 +1008,8 @@ def _ACPBackendConnectionErrorMessage(
         return 'ACP CLI へ接続できませんでした。ホストの稼働状態を確認してください。'
     if error_code == 'HardTimeout':
         return '総実行時間の安全上限に達したため、接続テストを中断しました。'
+    if error_code in {'ACPAuthenticationFailed', 'ACPAuthenticationUnavailable'}:
+        return 'ACP 認証が無効または未取り込みです。設定画面から認証を再取り込みしてください。'
     if capability == 'EpisodeLookup':
         return '話数 Web 検索に必要な能力（Web 検索・構造化出力）を確認できませんでした。'
     return 'シリーズ生成結果を検証できませんでした。設定と認証状態を確認してください。'

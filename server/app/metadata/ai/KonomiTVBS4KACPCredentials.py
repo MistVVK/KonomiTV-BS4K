@@ -99,9 +99,11 @@ class KonomiTVBS4KACPCredentials:
     ) -> str:
         """実行に使う資格情報の世代を、内容を露出しない hash で識別する。
 
-        Codex / Grok は専用 profile へ取り込んだコピー、Gemini は固定 read-only
-        mount の ADC を対象にする。資格情報が無い・不正な場合も固定値だけを返し、
-        path や JSON、token を呼び出し側へ渡さない。
+        Codex / Grok は明示的な import ごとに更新する marker、Gemini は固定
+        read-only mount の ADC を対象にする。OAuth agent は正常な token refresh でも
+        auth.json を更新するため、可変な token 本文を能力証明の世代に使わない。
+        資格情報が無い・不正な場合も固定値だけを返し、path や JSON、token を
+        呼び出し側へ渡さない。
 
         Args:
             provider: 固定 ACP provider の識別子。
@@ -111,14 +113,27 @@ class KonomiTVBS4KACPCredentials:
         """
 
         with cls._lock:
-            credential_path = (
-                cls._profileDirectory(cast(KonomiTVBS4KACPImportProvider, provider))
-                / _KONOMITV_BS4K_AUTH_FILENAME
-                if provider in {'codex', 'grok'}
-                else _KONOMITV_BS4K_HOST_AUTH_PATHS['google']
-            )
+            if provider in {'codex', 'grok'}:
+                profile_dir = cls._profileDirectory(
+                    cast(KonomiTVBS4KACPImportProvider, provider),
+                )
+                try:
+                    # agent が認証失敗時に auth.json を削除した場合は、marker が残っていても
+                    # 使用可能な世代として扱わない。marker 自体は明示 import だけが更新する。
+                    cls._readValidatedJSONObject(
+                        profile_dir / _KONOMITV_BS4K_AUTH_FILENAME,
+                    )
+                    marker_bytes = cls._readValidatedJSONObject(
+                        profile_dir / _KONOMITV_BS4K_IMPORT_MARKER_FILENAME,
+                    )
+                except KonomiTVBS4KACPCredentialError:
+                    return 'missing'
+                return hashlib.sha256(marker_bytes).hexdigest()
+
             try:
-                credential_bytes = cls._readValidatedJSONObject(credential_path)
+                credential_bytes = cls._readValidatedJSONObject(
+                    _KONOMITV_BS4K_HOST_AUTH_PATHS['google'],
+                )
             except KonomiTVBS4KACPCredentialError:
                 return 'missing'
             return hashlib.sha256(credential_bytes).hexdigest()

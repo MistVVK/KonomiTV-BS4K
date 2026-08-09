@@ -296,6 +296,18 @@ def Main() -> None:
     assert isinstance(prompt['params']['prompt'], list)
     assert prompt['params']['prompt'][0]['type'] == 'text'
 
+    if MODE == 'prompt_auth_failure':
+        # Codex 相当: session 作成後の prompt 開始時に token refresh が失敗する。
+        Send({
+            'jsonrpc': '2.0',
+            'id': prompt['id'],
+            'error': {
+                'code': -32000,
+                'message': 'Authentication required: access token could not be refreshed',
+            },
+        })
+        return
+
     if MODE == 'timeout':
         # 無通信タイムアウト検証用: 進捗を出さず SIGTERM も無視してハングする。
         # 以前は thought chunk を送り続けていたが、それでは無通信打ち切りを再現できない。

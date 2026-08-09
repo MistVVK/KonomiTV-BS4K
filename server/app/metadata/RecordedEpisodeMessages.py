@@ -65,6 +65,7 @@ _ERROR_MESSAGES: dict[str, str] = {
     'HardTimeout': FormatAcpHardTimeoutMessage(subject='AI プロバイダー'),
     'RedirectRejected': '安全のため AI プロバイダーのリダイレクトを拒否しました。',
     'InvalidURL': 'AI プロバイダーの接続先 URL が正しくありません。',
+    'ACPAuthenticationFailed': 'ACP agent の認証が無効または期限切れです。設定画面から認証を再取り込みしてください。',
     'ACPProtocolError': 'ACP agent との通信手順を検証できませんでした。',
     'ACPUnsafeToolRequested': 'ACP agent が許可されていない操作を要求しました。',
     'ACPWebSearchNotObserved': 'ACP agent の Web 検索実行を確認できませんでした。',
