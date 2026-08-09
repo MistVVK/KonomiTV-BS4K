@@ -107,10 +107,42 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.`;
 
+const nodableEntitiesLicense = `MIT License
+
+Copyright (c) 2026 Nodable
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+`;
+
 // npm 配布物に独立した LICENSE がない既知の版だけを、公式リポジトリの固定コミットと
 // npm 配布物に含まれる証拠ファイルの SHA-256 で結び付ける。任意の package.json の license 値から
 // 定型文を生成することはせず、ここにない版や内容が変化した配布物では必ず生成を停止する。
 const verifiedLicenseFallbacks = {
+    '@nodable/entities@3.0.0': {
+        evidenceFilename: 'package.json',
+        evidenceSha256: '548526ce0e1cad9ffe904fba19067013c9fea336eafd3cd52a337ec44406c9ed',
+        declaredLicense: 'MIT',
+        license: 'MIT',
+        source: 'https://github.com/nodable/val-parsers/blob/d2070d76a8ba07e6c7fa142caeb51ffd756e47eb/LICENSE',
+        sourceSha256: '750cb3fb6362804957ef52caaf9b5c824015be44d494637330d7cd8834d31d40',
+        sourceLicenseText: nodableEntitiesLicense,
+    },
     '@vue/devtools-api@6.6.4': {
         evidenceFilename: 'package.json',
         evidenceSha256: '16103b215db2ade43369020415869db5f7e89158c2c07524ef8fb5c8d71864cf',

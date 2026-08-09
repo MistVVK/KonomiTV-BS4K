@@ -109,6 +109,7 @@ test('all packages without bundled license files use exact-version verified fall
     const document = await readFile(outputPath, 'utf8');
 
     for (const [name, version] of [
+        ['@nodable/entities', '3.0.0'],
         ['@vue/devtools-api', '6.6.4'],
         ['cache-content-type', '1.0.1'],
         ['copy-to', '2.0.1'],
@@ -137,6 +138,7 @@ test('all packages without bundled license files use exact-version verified fall
     );
     assert.match(GetPackageSection(document, 'copy-to', '2.0.1'), /Copyright \(c\) 2014 dead_horse/);
     assert.match(GetPackageSection(document, 'mitt', '2.1.0'), /© Jason Miller/);
+    assert.match(GetPackageSection(document, '@nodable/entities', '3.0.0'), /Copyright \(c\) 2026 Nodable/);
 });
 
 test('README license text preserves only attribution and verifies humanize-number fallback', async () => {
