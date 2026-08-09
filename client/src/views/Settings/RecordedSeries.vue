@@ -625,7 +625,11 @@ onMounted(async () => {
     ]);
     if (fetched_services !== null) {
         opencode_services.value = fetched_services.map(service => ({
-            title: `${service.service_name} (${service.opencode_provider_id}/${service.opencode_model_id})`,
+            title: `${service.service_name} (${
+                service.opencode_provider_type === 'Catalog' ? service.opencode_provider_id : 'カスタムAPI'
+            }/${service.opencode_model_id}${
+                service.opencode_model_variant ? `[${service.opencode_model_variant}]` : ''
+            } · ${service.structured_output_mode})`,
             value: service.service_id,
         }));
     }

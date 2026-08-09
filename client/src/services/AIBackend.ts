@@ -10,6 +10,8 @@ export type AIBillingMode = 'Metered' | 'Subscription' | 'Local';
 export type AIBackendConnectionCapability = 'CandidateSelection' | 'EpisodeLookup';
 export type AIProviderSupportKind = 'Supported' | 'UnsupportedComplex';
 export type AIProviderAuthMethodType = 'api' | 'oauth' | 'vertex_adc';
+export type OpenCodeProviderType = 'Catalog' | 'OpenAICompatible' | 'AnthropicCompatible';
+export type StructuredOutputMode = 'Auto' | 'StructuredOutput' | 'JSONText';
 
 /** OpenCode serve の availability。 */
 export interface IOpenCodeAvailability {
@@ -28,8 +30,11 @@ export interface IAIBackendService {
     service_id: string;
     service_name: string;
     backend_kind: 'OpenCode';
+    opencode_provider_type: OpenCodeProviderType;
     opencode_provider_id: string;
     opencode_model_id: string;
+    opencode_model_variant: string | null;
+    structured_output_mode: StructuredOutputMode;
     auth_mode: AIAuthMode;
     billing_mode: AIBillingMode;
     api_base_url: string | null;
@@ -45,8 +50,11 @@ export interface IAIBackendService {
 /** service 作成リクエスト。 */
 export interface IAIBackendServiceCreate {
     service_name: string;
-    opencode_provider_id: string;
+    opencode_provider_type?: OpenCodeProviderType;
+    opencode_provider_id?: string | null;
     opencode_model_id: string;
+    opencode_model_variant?: string | null;
+    structured_output_mode?: StructuredOutputMode;
     auth_mode: AIAuthMode;
     billing_mode: AIBillingMode;
     api_base_url?: string | null;
@@ -59,8 +67,11 @@ export interface IAIBackendServiceCreate {
 /** service 更新リクエスト。 */
 export interface IAIBackendServiceUpdate {
     service_name?: string;
-    opencode_provider_id?: string;
+    opencode_provider_type?: OpenCodeProviderType;
+    opencode_provider_id?: string | null;
     opencode_model_id?: string;
+    opencode_model_variant?: string | null;
+    structured_output_mode?: StructuredOutputMode;
     auth_mode?: AIAuthMode;
     billing_mode?: AIBillingMode;
     api_base_url?: string | null;
@@ -68,6 +79,7 @@ export interface IAIBackendServiceUpdate {
     google_cloud_location?: string | null;
     monthly_cost_limit_usd?: string | null;
     monthly_token_limit?: number | null;
+    clear_opencode_model_variant?: boolean;
     clear_api_base_url?: boolean;
     clear_monthly_cost_limit_usd?: boolean;
     clear_monthly_token_limit?: boolean;
@@ -131,6 +143,9 @@ export interface IAIBackendUsage {
 export interface IAIBackendProviderModel {
     model_id: string;
     model_name: string;
+    variants: string[];
+    openai_fast_mode: boolean;
+    openai_paired_model_id: string | null;
     capabilities: Record<string, unknown>;
 }
 

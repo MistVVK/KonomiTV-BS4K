@@ -93,7 +93,16 @@
                         <div>
                             <div class="ai-backend-card__title">{{ service.service_name }}</div>
                             <div class="ai-backend-card__meta">
-                                {{ service.opencode_provider_id }} / {{ service.opencode_model_id }}<br>
+                                {{ service.opencode_provider_type === 'Catalog'
+                                    ? service.opencode_provider_id
+                                    : formatProviderType(service.opencode_provider_type) }}
+                                / {{ service.opencode_model_id }}
+                                <template v-if="service.opencode_model_variant">
+                                    [{{ service.opencode_model_variant }}]
+                                </template>
+                                <template v-if="isOpenAIFastService(service)"> · Fast</template><br>
+                                接続: {{ formatProviderType(service.opencode_provider_type) }} ·
+                                出力: {{ formatStructuredOutputMode(service.structured_output_mode) }}<br>
                                 auth: {{ service.auth_mode }} · billing: {{ service.billing_mode }} ·
                                 認証: {{ service.auth_configured ? '設定済み' : '未設定' }}
                                 <template v-if="service.auth_mode === 'OAuthSubscription'">
@@ -185,7 +194,7 @@
                             生成試験
                         </v-btn>
                         <v-btn size="small" variant="tonal" color="primary"
-                            :disabled="is_busy || !health?.available || service.auth_mode === 'NoneLocal'"
+                            :disabled="is_busy || !health?.available"
                             :loading="testing_service_id === `${service.service_id}:EpisodeLookup`"
                             @click="runConnectionTest(service, 'EpisodeLookup')">
                             話数試験
@@ -286,42 +295,94 @@
             <v-card>
                 <v-card-title>{{ editing_service_id ? 'service を編集' : 'service を追加' }}</v-card-title>
                 <v-card-text>
+                    <v-select v-model="form.opencode_provider_type" :items="provider_type_items" item-title="title"
+                        item-value="value" label="接続方式" variant="outlined" color="primary"
+                        :density="is_form_dense ? 'compact' : 'default'" class="mb-3"
+                        @update:model-value="onProviderTypeSelected" />
+                    <template v-if="form.opencode_provider_type === 'Catalog'">
+                        <div class="settings__item-label mb-3">
+                            OpenCode Web と同じく、<strong>プロバイダ</strong>を選んだあと
+                            <strong>認証方式</strong>（API キー / OAuth など）を選びます。<br>
+                            API キーと OAuth はベストエフォート対応です。Vertex AI 以外の面倒な認証
+                            （Azure / Bedrock / GitHub Enterprise 等）は非対応です。
+                        </div>
+                        <!-- 1. プロバイダ選択（全カタログ・検索可） -->
+                        <v-autocomplete v-model="selected_provider_id" :items="provider_items" item-title="title"
+                            item-value="value" label="プロバイダ" variant="outlined" color="primary"
+                            :density="is_form_dense ? 'compact' : 'default'" class="mb-2" clearable
+                            :item-props="providerItemProps"
+                            no-data-text="provider カタログを取得できませんでした"
+                            @update:model-value="onProviderSelected" />
+                        <div v-if="selected_provider?.support_note" class="settings__item-label mb-2">
+                            {{ selected_provider.support_note }}
+                        </div>
+                        <div v-if="selected_provider?.support_kind === 'UnsupportedComplex'"
+                            class="ai-backend-warn mb-3">
+                            このプロバイダは面倒な認証が必要なため選択できません（Vertex AI のみ例外対応）。
+                        </div>
+                        <!-- 2. 認証方式（OpenCode Web と同じラベル一覧） -->
+                        <v-select v-model="selected_auth_method_key" :items="auth_method_items" item-title="title"
+                            item-value="value" label="認証方式" variant="outlined" color="primary"
+                            :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
+                            :disabled="!selected_provider || selected_provider.support_kind !== 'Supported'"
+                            :no-data-text="selected_provider_id
+                                ? '利用できる認証方式がありません'
+                                : '先にプロバイダを選択してください'"
+                            @update:model-value="onAuthMethodSelected" />
+                        <!-- 3. モデル -->
+                        <v-autocomplete v-model="selected_model_id" :items="model_items" item-title="title"
+                            item-value="value" label="モデル" variant="outlined" color="primary"
+                            :density="is_form_dense ? 'compact' : 'default'" class="mb-3" clearable
+                            :disabled="!selected_provider_id"
+                            :no-data-text="selected_provider_id
+                                ? 'モデルがありません' : '先にプロバイダを選択してください'"
+                            @update:model-value="onModelSelected" />
+                        <!-- OpenCode の model variant をそのまま使い、モデルが対応する深さだけを表示する -->
+                        <v-select v-model="form.opencode_model_variant" :items="model_variant_items"
+                            item-title="title" item-value="value" label="思考の深さ" variant="outlined"
+                            color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
+                            :disabled="selected_model === null || selected_model.variants.length === 0" />
+                        <div class="settings__item-label mb-3">
+                            モデルが OpenCode へ公開している推論 variant だけを選択できます。
+                            「モデル既定」は OpenCode 側の標準値を使います。
+                        </div>
+                        <div v-if="selected_provider_id === 'openai' &&
+                            (openai_fast_mode_available || form.openai_fast_mode_enabled)"
+                            class="ai-backend-fast-mode mb-3">
+                            <v-switch color="primary" hide-details
+                                label="OpenAI Fast モード（Priority processing）"
+                                :disabled="!openai_fast_mode_available"
+                                :model-value="form.openai_fast_mode_enabled"
+                                @update:model-value="setOpenAIFastMode($event === true)" />
+                            <div class="settings__item-label">
+                                対応モデルの優先処理版へ切り替えます。思考の深さとは併用できますが、
+                                通常版より料金が高いため必要な場合だけ有効にしてください。
+                            </div>
+                        </div>
+                    </template>
+                    <template v-else>
+                        <div class="settings__item-label mb-3">
+                            OpenCode serve に service 専用 provider として登録します。
+                            API キーはこの画面の秘密ストアから OpenCode auth へ注入されます。
+                        </div>
+                        <v-text-field v-model="form.api_base_url" label="API ベース URL" variant="outlined"
+                            color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
+                            spellcheck="false" />
+                        <v-text-field v-model="form.opencode_model_id" label="モデル ID" variant="outlined"
+                            color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
+                            spellcheck="false" />
+                        <v-select v-model="form.auth_mode" :items="custom_auth_mode_items" item-title="title"
+                            item-value="value" label="認証方式" variant="outlined" color="primary"
+                            :density="is_form_dense ? 'compact' : 'default'" class="mb-3"
+                            @update:model-value="onCustomAuthModeSelected" />
+                    </template>
+                    <v-select v-model="form.structured_output_mode" :items="structured_output_mode_items"
+                        item-title="title" item-value="value" label="構造化出力方式" variant="outlined"
+                        color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2" />
                     <div class="settings__item-label mb-3">
-                        OpenCode Web と同じく、<strong>プロバイダ</strong>を選んだあと
-                        <strong>認証方式</strong>（API キー / OAuth など）を選びます。<br>
-                        API キーと OAuth はベストエフォート対応です。Vertex AI 以外の面倒な認証
-                        （Azure / Bedrock / GitHub Enterprise 等）は非対応です。
+                        生成と話数 Web 検索の両方へ適用します。Auto は StructuredOutput を先に試し、
+                        非対応または不正な応答だけ JSON テキストへフォールバックします。
                     </div>
-                    <!-- 1. プロバイダ選択（全カタログ・検索可） -->
-                    <v-autocomplete v-model="selected_provider_id" :items="provider_items" item-title="title"
-                        item-value="value" label="プロバイダ" variant="outlined" color="primary"
-                        :density="is_form_dense ? 'compact' : 'default'" class="mb-2" clearable
-                        :item-props="providerItemProps"
-                        no-data-text="provider カタログを取得できませんでした"
-                        @update:model-value="onProviderSelected" />
-                    <div v-if="selected_provider?.support_note" class="settings__item-label mb-2">
-                        {{ selected_provider.support_note }}
-                    </div>
-                    <div v-if="selected_provider?.support_kind === 'UnsupportedComplex'"
-                        class="ai-backend-warn mb-3">
-                        このプロバイダは面倒な認証が必要なため選択できません（Vertex AI のみ例外対応）。
-                    </div>
-                    <!-- 2. 認証方式（OpenCode Web と同じラベル一覧） -->
-                    <v-select v-model="selected_auth_method_key" :items="auth_method_items" item-title="title"
-                        item-value="value" label="認証方式" variant="outlined" color="primary"
-                        :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
-                        :disabled="!selected_provider || selected_provider.support_kind !== 'Supported'"
-                        :no-data-text="selected_provider_id
-                            ? '利用できる認証方式がありません'
-                            : '先にプロバイダを選択してください'"
-                        @update:model-value="onAuthMethodSelected" />
-                    <!-- 3. モデル -->
-                    <v-autocomplete v-model="selected_model_id" :items="model_items" item-title="title"
-                        item-value="value" label="モデル" variant="outlined" color="primary"
-                        :density="is_form_dense ? 'compact' : 'default'" class="mb-3" clearable
-                        :disabled="!selected_provider_id"
-                        :no-data-text="selected_provider_id ? 'モデルがありません' : '先にプロバイダを選択してください'"
-                        @update:model-value="onModelSelected" />
                     <v-divider class="mb-3" />
                     <v-text-field v-model="form.service_name" label="表示名" variant="outlined"
                         color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2" />
@@ -352,7 +413,8 @@
                                 <v-select v-model="form.billing_mode" :items="billing_mode_items" item-title="title"
                                     item-value="value" label="課金モード" variant="outlined" color="primary"
                                     :density="is_form_dense ? 'compact' : 'default'" class="mb-2" />
-                                <v-text-field v-if="form.auth_mode === 'NoneLocal' || form.api_base_url"
+                                <v-text-field v-if="form.opencode_provider_type === 'Catalog' &&
+                                    (form.auth_mode === 'NoneLocal' || form.api_base_url)"
                                     v-model="form.api_base_url" label="API ベース URL（任意 / ローカル時必須）"
                                     variant="outlined" color="primary" :density="is_form_dense ? 'compact' : 'default'"
                                     class="mb-2" spellcheck="false" />
@@ -481,6 +543,8 @@ import AIBackend, {
     type IACPBackendSettings,
     type IACPSettings,
     type IOpenCodeAvailability,
+    type OpenCodeProviderType,
+    type StructuredOutputMode,
 } from '@/services/AIBackend';
 import useUserStore from '@/stores/UserStore';
 import Utils from '@/utils';
@@ -489,8 +553,13 @@ import SettingsBase from '@/views/Settings/Base.vue';
 
 interface ServiceForm {
     service_name: string;
+    opencode_provider_type: OpenCodeProviderType;
     opencode_provider_id: string;
     opencode_model_id: string;
+    opencode_model_variant: string | null;
+    structured_output_mode: StructuredOutputMode;
+    /** UI 専用。保存時は OpenCode が広告する Fast model ID へ変換する。 */
+    openai_fast_mode_enabled: boolean;
     auth_mode: AIAuthMode;
     billing_mode: AIBillingMode;
     api_base_url: string;
@@ -502,8 +571,12 @@ interface ServiceForm {
 
 const emptyForm = (): ServiceForm => ({
     service_name: '',
+    opencode_provider_type: 'Catalog',
     opencode_provider_id: '',
     opencode_model_id: '',
+    opencode_model_variant: null,
+    structured_output_mode: 'Auto',
+    openai_fast_mode_enabled: false,
     auth_mode: 'ApiKey',
     billing_mode: 'Metered',
     api_base_url: '',
@@ -517,6 +590,23 @@ const billing_mode_items = [
     {title: 'Metered（従量・月次上限対象）', value: 'Metered'},
     {title: 'Subscription（上限対象外）', value: 'Subscription'},
     {title: 'Local（token 上限のみ任意）', value: 'Local'},
+];
+
+const provider_type_items: Array<{title: string; value: OpenCodeProviderType}> = [
+    {title: 'OpenCode カタログ', value: 'Catalog'},
+    {title: 'OpenAI 互換 API', value: 'OpenAICompatible'},
+    {title: 'Anthropic 互換 API', value: 'AnthropicCompatible'},
+];
+
+const custom_auth_mode_items: Array<{title: string; value: AIAuthMode}> = [
+    {title: 'API キー', value: 'ApiKey'},
+    {title: '認証なし / ローカル', value: 'NoneLocal'},
+];
+
+const structured_output_mode_items: Array<{title: string; value: StructuredOutputMode}> = [
+    {title: 'Auto（StructuredOutput → JSON テキスト）', value: 'Auto'},
+    {title: 'StructuredOutput（OpenCode json_schema）', value: 'StructuredOutput'},
+    {title: 'JSON テキスト', value: 'JSONText'},
 ];
 
 const is_form_dense = Utils.isSmartphoneHorizontal();
@@ -674,22 +764,64 @@ const selected_auth_method = computed<IAIBackendProviderAuthMethod | null>(() =>
 
 /** モデルセレクトの選択肢（選択した provider のモデル）。 */
 const model_items = computed(() => {
-    const items = (selected_provider.value?.models ?? []).map(model => ({
+    const providerModels = selected_provider.value?.models ?? [];
+    // OpenAI Fast は通常版と同じモデルとして専用スイッチで選ぶため、対がある Fast 行は重複表示しない。
+    const visibleModels = selected_provider.value?.provider_id === 'openai' ?
+        providerModels.filter(model => model.openai_fast_mode === false || model.openai_paired_model_id === null) :
+        providerModels;
+    const items = visibleModels.map(model => ({
         title: `${model.model_name}（${model.model_id}）`,
         value: model.model_id,
     }));
-    const current = form.value.opencode_model_id;
+    const current = selected_model_id.value ?? '';
     if (current !== '' && items.some(item => item.value === current) === false) {
         items.unshift({title: `${current}（一覧外）`, value: current});
     }
     return items;
 });
 
+/** モデル一覧上で選択している通常版モデル。 */
+const selected_model = computed(() =>
+    selected_provider.value?.models.find(model => model.model_id === selected_model_id.value) ?? null,
+);
+
+/** モデルが広告する variant と「モデル既定」を思考深度メニューへ出す。 */
+const model_variant_items = computed(() => {
+    const labels: Record<string, string> = {
+        none: 'None（思考なし）',
+        minimal: 'Minimal（最小）',
+        low: 'Low（浅い・速い）',
+        medium: 'Medium（標準）',
+        high: 'High（深い）',
+        xhigh: 'XHigh（より深い）',
+        max: 'Max（最大）',
+        thinking: 'Thinking（思考あり）',
+    };
+    return [
+        {title: 'モデル既定', value: null},
+        ...(selected_model.value?.variants ?? []).map(variant => ({
+            title: labels[variant.toLowerCase()] ?? variant,
+            value: variant,
+        })),
+    ];
+});
+
+/** 選択中 OpenAI モデルに通常版 / Fast 版の対があるか。 */
+const openai_fast_mode_available = computed(() =>
+    selected_provider.value?.provider_id === 'openai' &&
+    selected_model.value?.openai_fast_mode === false &&
+    selected_model.value.openai_paired_model_id !== null,
+);
+
 const canSaveService = computed(() => {
     if (form.value.service_name.trim() === '') return false;
-    if (form.value.opencode_provider_id.trim() === '') return false;
     if (form.value.opencode_model_id.trim() === '') return false;
-    if (selected_provider.value?.support_kind === 'UnsupportedComplex') return false;
+    if (form.value.opencode_provider_type === 'Catalog') {
+        if (form.value.opencode_provider_id.trim() === '') return false;
+        if (selected_provider.value?.support_kind === 'UnsupportedComplex') return false;
+    } else if (form.value.api_base_url.trim() === '') {
+        return false;
+    }
     return true;
 });
 
@@ -698,11 +830,34 @@ function authMethodKey(method: IAIBackendProviderAuthMethod): string {
     return `${method.type}:${method.method_index ?? 'x'}`;
 }
 
+/** 接続方式を切り替え、方式固有の入力だけを安全な既定値へ戻す。 */
+function onProviderTypeSelected(): void {
+    selected_provider_id.value = null;
+    selected_model_id.value = null;
+    selected_auth_method_key.value = null;
+    form.value.opencode_provider_id = '';
+    form.value.opencode_model_id = '';
+    form.value.opencode_model_variant = null;
+    form.value.openai_fast_mode_enabled = false;
+    form.value.auth_mode = 'ApiKey';
+    form.value.billing_mode = 'Metered';
+    if (form.value.opencode_provider_type === 'Catalog') {
+        form.value.api_base_url = '';
+    }
+}
+
+/** カスタム provider の認証方式に課金既定値を合わせる。 */
+function onCustomAuthModeSelected(): void {
+    form.value.billing_mode = form.value.auth_mode === 'NoneLocal' ? 'Local' : 'Metered';
+}
+
 /** provider 選択時: 認証方式一覧を出し、先頭 method と既定モデルを提案する。 */
 function onProviderSelected(): void {
     const provider = selected_provider.value;
     selected_model_id.value = null;
     selected_auth_method_key.value = null;
+    form.value.opencode_model_variant = null;
+    form.value.openai_fast_mode_enabled = false;
     if (provider === null) {
         form.value.opencode_provider_id = '';
         form.value.opencode_model_id = '';
@@ -720,9 +875,16 @@ function onProviderSelected(): void {
         provider.default_model_id !== null &&
         provider.models.some(model => model.model_id === provider.default_model_id)
     ) {
-        selected_model_id.value = provider.default_model_id;
+        const defaultModel = provider.models.find(model => model.model_id === provider.default_model_id)!;
+        // OpenAI のカタログ既定が Fast でも、高額な Priority processing は明示 opt-in にする。
+        selected_model_id.value = (
+            defaultModel.openai_fast_mode && defaultModel.openai_paired_model_id !== null
+        ) ? defaultModel.openai_paired_model_id : defaultModel.model_id;
     } else if (provider.models.length > 0) {
-        selected_model_id.value = provider.models[0].model_id;
+        const firstModel = provider.models[0];
+        selected_model_id.value = (
+            firstModel.openai_fast_mode && firstModel.openai_paired_model_id !== null
+        ) ? firstModel.openai_paired_model_id : firstModel.model_id;
     }
     onModelSelected();
 }
@@ -753,9 +915,23 @@ function onModelSelected(): void {
     form.value.opencode_provider_id = provider.provider_id;
     if (model === null) {
         form.value.opencode_model_id = selected_model_id.value ?? '';
+        form.value.opencode_model_variant = null;
+        form.value.openai_fast_mode_enabled = false;
         return;
     }
-    form.value.opencode_model_id = model.model_id;
+    // Fast を維持できるモデル間の切り替えでは Fast 側 ID を保存し、非対応なら通常版へ戻す。
+    if (form.value.openai_fast_mode_enabled && model.openai_paired_model_id !== null) {
+        form.value.opencode_model_id = model.openai_paired_model_id;
+    } else {
+        form.value.opencode_model_id = model.model_id;
+        form.value.openai_fast_mode_enabled = false;
+    }
+    if (
+        form.value.opencode_model_variant !== null &&
+        model.variants.includes(form.value.opencode_model_variant) === false
+    ) {
+        form.value.opencode_model_variant = null;
+    }
     // 表示名は未入力か前回の自動提案値のときだけモデル名で上書きする。
     if (
         form.value.service_name === '' ||
@@ -764,6 +940,17 @@ function onModelSelected(): void {
         form.value.service_name = model.model_name;
         auto_proposed_name.value = model.model_name;
     }
+}
+
+/** OpenAI Fast スイッチを実際の通常版 / Priority processing 版 model ID へ反映する。 */
+function setOpenAIFastMode(enabled: boolean): void {
+    const model = selected_model.value;
+    if (model === null || model.openai_paired_model_id === null || model.openai_fast_mode) {
+        form.value.openai_fast_mode_enabled = false;
+        return;
+    }
+    form.value.openai_fast_mode_enabled = enabled;
+    form.value.opencode_model_id = enabled ? model.openai_paired_model_id : model.model_id;
 }
 
 const key_dialog = ref(false);
@@ -826,6 +1013,27 @@ function formatBillingMode(mode: string): string {
         return 'Local';
     }
     return mode;
+}
+
+function formatProviderType(providerType: OpenCodeProviderType): string {
+    if (providerType === 'OpenAICompatible') return 'OpenAI 互換';
+    if (providerType === 'AnthropicCompatible') return 'Anthropic 互換';
+    return 'OpenCode カタログ';
+}
+
+function formatStructuredOutputMode(mode: StructuredOutputMode): string {
+    if (mode === 'StructuredOutput') return 'StructuredOutput';
+    if (mode === 'JSONText') return 'JSON テキスト';
+    return 'Auto';
+}
+
+/** service の保存済み model ID が OpenCode カタログ上の OpenAI Fast 版か。 */
+function isOpenAIFastService(service: IAIBackendService): boolean {
+    if (service.opencode_provider_type !== 'Catalog') return false;
+    if (service.opencode_provider_id !== 'openai') return false;
+    const provider = providers.value.find(item => item.provider_id === 'openai');
+    return provider?.models.find(model => model.model_id === service.opencode_model_id)?.openai_fast_mode ??
+        service.opencode_model_id.endsWith('-fast');
 }
 
 function formatUsageLimits(usage: IAIBackendUsage): string {
@@ -914,8 +1122,12 @@ function openEditDialog(service: IAIBackendService): void {
     editing_service_id.value = service.service_id;
     form.value = {
         service_name: service.service_name,
+        opencode_provider_type: service.opencode_provider_type,
         opencode_provider_id: service.opencode_provider_id,
         opencode_model_id: service.opencode_model_id,
+        opencode_model_variant: service.opencode_model_variant,
+        structured_output_mode: service.structured_output_mode,
+        openai_fast_mode_enabled: false,
         auth_mode: service.auth_mode,
         billing_mode: service.billing_mode,
         api_base_url: service.api_base_url || '',
@@ -925,13 +1137,20 @@ function openEditDialog(service: IAIBackendService): void {
         monthly_token_limit: service.monthly_token_limit,
     };
     // 既存 service の provider / model を選択状態へ復元（一覧外なら items に追加表示）。
-    selected_provider_id.value = service.opencode_provider_id;
-    selected_model_id.value = service.opencode_model_id;
+    selected_provider_id.value = service.opencode_provider_type === 'Catalog' ? service.opencode_provider_id : null;
+    const provider = service.opencode_provider_type === 'Catalog' ?
+        providers.value.find(item => item.provider_id === service.opencode_provider_id) ?? null : null;
+    const currentModel = provider?.models.find(model => model.model_id === service.opencode_model_id) ?? null;
+    if (currentModel?.openai_fast_mode && currentModel.openai_paired_model_id !== null) {
+        selected_model_id.value = currentModel.openai_paired_model_id;
+        form.value.openai_fast_mode_enabled = true;
+    } else {
+        selected_model_id.value = service.opencode_model_id;
+    }
     create_api_key_input.value = '';
     create_api_key_showing.value = false;
     auto_proposed_name.value = null;
     // 既存 auth_mode に合う method を復元（無ければ先頭）。
-    const provider = providers.value.find(item => item.provider_id === service.opencode_provider_id) ?? null;
     const matched = provider?.auth_methods.find(method => method.auth_mode === service.auth_mode) ?? null;
     selected_auth_method_key.value = matched
         ? authMethodKey(matched)
@@ -941,8 +1160,13 @@ function openEditDialog(service: IAIBackendService): void {
 
 async function saveService(): Promise<void> {
     const f = form.value;
-    if (f.service_name.trim() === '' || f.opencode_provider_id.trim() === '' || f.opencode_model_id.trim() === '') {
-        Message.warning('表示名・プロバイダ・モデルは必須です。');
+    if (
+        f.service_name.trim() === '' ||
+        f.opencode_model_id.trim() === '' ||
+        (f.opencode_provider_type === 'Catalog' && f.opencode_provider_id.trim() === '') ||
+        (f.opencode_provider_type !== 'Catalog' && f.api_base_url.trim() === '')
+    ) {
+        Message.warning('表示名・接続先・モデルは必須です。');
         return;
     }
     if (selected_provider.value?.support_kind === 'UnsupportedComplex') {
@@ -956,12 +1180,19 @@ async function saveService(): Promise<void> {
     if (f.auth_mode === 'ApiKey' && f.billing_mode === 'Subscription') {
         f.billing_mode = 'Metered';
     }
+    if (f.auth_mode === 'NoneLocal' && f.billing_mode === 'Subscription') {
+        f.billing_mode = 'Local';
+    }
     is_saving.value = true;
     try {
         const body = {
             service_name: f.service_name.trim(),
-            opencode_provider_id: f.opencode_provider_id.trim(),
+            opencode_provider_type: f.opencode_provider_type,
+            opencode_provider_id: f.opencode_provider_type === 'Catalog' ?
+                f.opencode_provider_id.trim() : null,
             opencode_model_id: f.opencode_model_id.trim(),
+            opencode_model_variant: f.opencode_model_variant,
+            structured_output_mode: f.structured_output_mode,
             auth_mode: f.auth_mode,
             billing_mode: f.billing_mode,
             api_base_url: f.api_base_url.trim() || null,
@@ -1001,6 +1232,7 @@ async function saveService(): Promise<void> {
         } else {
             result = await AIBackend.updateService(editing_service_id.value, {
                 ...body,
+                clear_opencode_model_variant: body.opencode_model_variant === null,
                 clear_api_base_url: body.api_base_url === null,
                 clear_monthly_cost_limit_usd: body.monthly_cost_limit_usd === null,
                 clear_monthly_token_limit: body.monthly_token_limit === null,
