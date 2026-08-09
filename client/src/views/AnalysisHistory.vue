@@ -164,7 +164,7 @@ function episodeResolutionResultLabel(task: IAnalysisTaskExecution): string {
         const labels = [
             `${task.current_count}/${task.total_count}件`,
             `話数確定${resolved_count}`,
-            `公式話数なし${not_numbered_count}`,
+            `話数番号なし${not_numbered_count}`,
             `要確認${needs_review_count}`,
         ];
         const failed_count = summaryCount(task, 'failed') ?? task.failed_count;

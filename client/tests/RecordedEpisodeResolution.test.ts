@@ -5,7 +5,9 @@ import type { IRecordedEpisodeAssignmentResolution } from '@/services/RecordedSe
 import {
     canAdoptAIEpisodeResolution,
     canCloseEpisodeAssignmentDialog,
+    episodeLookupOutcomeLabel,
     episodeLookupOutcomeDisplayLabel,
+    episodeResolutionStatusLabel,
     markResolutionLookupPending,
     recordedEpisodeResolutionErrorMessage,
     recordedEpisodeResolutionProposal,
@@ -18,8 +20,10 @@ function createResolution(
 ): IRecordedEpisodeAssignmentResolution {
     return {
         status: 'NeedsReview',
+        season_number: null,
         source: 'WebSearch',
         lookup_outcome: null,
+        proposed_outcome: null,
         proposed_season_number: null,
         proposed_episode_number: null,
         confidence: null,
@@ -73,6 +77,13 @@ describe('RecordedEpisodeResolution 表示契約', () => {
         );
     });
 
+    it('NotNumbered を NoPublishedNumber と区別して話数番号なしと表示する', () => {
+        expect(episodeLookupOutcomeLabel('NotNumbered')).toBe('検索根拠から話数番号なし');
+        expect(episodeResolutionStatusLabel('NotNumbered')).toBe('話数番号なし');
+        expect(episodeLookupOutcomeLabel('NoPublishedNumber')).toBe('検索根拠から公開話数なし');
+        expect(episodeResolutionStatusLabel('NoPublishedNumber')).toBe('公開話数なし');
+    });
+
     it('判定根拠と安全なエラーを互いに隠さず個別に返す', () => {
         const resolution = createResolution({
             rationale_short: '  公式の放送日と一致しました。  ',
@@ -85,6 +96,7 @@ describe('RecordedEpisodeResolution 表示契約', () => {
 
     it('完全な AI 提案だけを保存用の編集値として返す', () => {
         expect(recordedEpisodeResolutionProposal(createResolution({
+            proposed_outcome: 'Resolved',
             proposed_season_number: 2,
             proposed_episode_number: '12.5',
         }))).toEqual({
@@ -92,6 +104,7 @@ describe('RecordedEpisodeResolution 表示契約', () => {
             episodeNumber: '12.5',
         });
         expect(recordedEpisodeResolutionProposal(createResolution({
+            proposed_outcome: 'Resolved',
             proposed_season_number: 2,
             proposed_episode_number: null,
         }))).toBeNull();
@@ -143,14 +156,15 @@ describe('RecordedEpisodeResolution 表示契約', () => {
         });
     });
 
-    it('AI 提案または公式話数なし outcome があるときだけ採用可能と判定する', () => {
+    it('AI の番号付きまたは番号なし提案があるときだけ採用可能と判定する', () => {
         expect(canAdoptAIEpisodeResolution(createResolution())).toBe(false);
         expect(canAdoptAIEpisodeResolution(createResolution({
+            proposed_outcome: 'Resolved',
             proposed_season_number: 1,
             proposed_episode_number: '3',
         }))).toBe(true);
         expect(canAdoptAIEpisodeResolution(createResolution({
-            lookup_outcome: 'NotNumbered',
+            proposed_outcome: 'NotNumbered',
         }))).toBe(true);
     });
 });

@@ -134,6 +134,8 @@
                 <v-radio-group class="mt-3" v-model="assignment_mode" color="primary" hide-details>
                     <v-radio label="登録済みの話数を選ぶ" value="Existing" />
                     <v-radio label="シーズン・話数を入力する" value="Structured" />
+                    <v-radio label="公開話数なしとして確定する" value="NoPublishedNumber" />
+                    <v-radio label="話数番号を持たない番組として確定する" value="NotNumbered" />
                     <v-radio label="話数不明として確定する" value="Unknown" />
                     <v-radio label="AI 検索結果を採用する" value="AdoptAI"
                         :disabled="can_adopt_ai === false" />
@@ -154,9 +156,23 @@
                         hide-details="auto" />
                 </div>
 
+                <div v-else-if="assignment_mode === 'NoPublishedNumber' || assignment_mode === 'NotNumbered'"
+                    class="recorded-episode-dialog__structured mt-3">
+                    <v-text-field v-model.number="season_number" type="number" :min="0" :max="2147483647" :step="1"
+                        label="シーズン（任意）" placeholder="シーズン制でない場合は空欄"
+                        color="primary" variant="outlined" density="comfortable"
+                        :error-messages="optional_season_number_error" hide-details="auto" />
+                    <div class="recorded-episode-dialog__notice">
+                        {{assignment_mode === 'NoPublishedNumber' ?
+                            '総集編やスペシャルなど、作品には属するものの公開された話数番号がない録画として保存します。' :
+                            '継続番組自体が話数番号制度を持たない録画として保存します。'}}
+                    </div>
+                </div>
+
                 <div v-else-if="assignment_mode === 'AdoptAI'" class="recorded-episode-dialog__notice mt-3">
-                    <template v-if="target_program?.resolution?.lookup_outcome === 'NotNumbered'">
-                        保存済みの AI 判定「公式話数なし」を正本として採用します。手動レーンの値は残ります。
+                    <template v-if="target_program?.resolution?.proposed_outcome === 'NotNumbered' ||
+                        target_program?.resolution?.proposed_outcome === 'NoPublishedNumber'">
+                        保存済みの AI 判定「{{proposed_episode_label}}」を正本として採用します。手動レーンの値は残ります。
                     </template>
                     <template v-else>
                         保存済みの AI 提案（{{proposed_episode_label}}）を正本として採用します。手動レーンの値は残ります。
@@ -223,7 +239,11 @@ import RecordedSeries, {
 } from '@/services/RecordedSeries';
 import { stageLabel } from '@/stores/AnalysisTasksStore';
 import Utils, { dayjs } from '@/utils';
-import { formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
+import {
+    formatRecordedEpisodeLabel,
+    formatRecordedEpisodeNumber,
+    formatRecordedUnnumberedEpisodeLabel,
+} from '@/utils/RecordedEpisode';
 import {
     canAdoptAIEpisodeResolution,
     canCloseEpisodeAssignmentDialog,
@@ -238,7 +258,8 @@ import {
 } from '@/utils/RecordedEpisodeResolution';
 
 
-type AssignmentMode = 'Existing' | 'Structured' | 'Unknown' | 'AdoptAI';
+type AssignmentMode =
+    'Existing' | 'Structured' | 'NoPublishedNumber' | 'NotNumbered' | 'Unknown' | 'AdoptAI';
 
 const props = defineProps<{
     modelValue: boolean;
@@ -279,12 +300,26 @@ const episode_options = computed(() => assignments.value?.episodes.map(episode =
     title: formatEpisodeLabel(episode.season_number, episode.episode_number),
     value: episode.id,
 })) ?? []);
-const current_episode_label = computed(() => current_episode.value === null ?
-    '未設定' :
-    formatEpisodeLabel(current_episode.value.season_number, current_episode.value.episode_number));
+const current_episode_label = computed(() => {
+    if (current_episode.value !== null) {
+        return formatEpisodeLabel(current_episode.value.season_number, current_episode.value.episode_number);
+    }
+    const resolution = target_program.value?.resolution;
+    if (resolution?.status === 'NotNumbered' || resolution?.status === 'NoPublishedNumber') {
+        return formatRecordedUnnumberedEpisodeLabel(resolution.season_number, resolution.status);
+    }
+    return '未設定';
+});
 const proposed_episode_label = computed(() => {
     const resolution = target_program.value?.resolution;
     if (resolution === null || resolution === undefined) return '提案なし';
+    if (resolution.proposed_outcome === 'NotNumbered' || resolution.proposed_outcome === 'NoPublishedNumber') {
+        return formatRecordedUnnumberedEpisodeLabel(
+            resolution.proposed_season_number,
+            resolution.proposed_outcome,
+        );
+    }
+    if (resolution.proposed_outcome === 'InsufficientEvidence') return '根拠不足';
     if (resolution.proposed_season_number === null && resolution.proposed_episode_number === null) return '提案なし';
     if (resolution.proposed_episode_number === null) {
         return `シーズン ${resolution.proposed_season_number ?? '未提示'}・話数未提示`;
@@ -301,7 +336,12 @@ const manual_lane_label = computed(() => {
         return null;
     }
     if (resolution.manual_status === 'Unknown') return '話数不明として手動確定';
-    if (resolution.manual_status === 'NotNumbered') return '公式話数なしとして手動確定';
+    if (resolution.manual_status === 'NotNumbered' || resolution.manual_status === 'NoPublishedNumber') {
+        return `${formatRecordedUnnumberedEpisodeLabel(
+            resolution.manual_season_number,
+            resolution.manual_status,
+        )}として手動確定`;
+    }
     if (
         resolution.manual_season_number !== null &&
         resolution.manual_episode_number !== null
@@ -343,6 +383,14 @@ const season_number_error = computed(() => {
         '' :
         '0 ～ 2147483647 の整数を入力してください。';
 });
+const optional_season_number_error = computed(() => {
+    const rawValue = String(season_number.value).trim();
+    if (rawValue === '') return '';
+    const value = Number(rawValue);
+    return Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647 ?
+        '' :
+        '空欄、または 0 ～ 2147483647 の整数を入力してください。';
+});
 const episode_number_error = computed(() => {
     const value = episode_number.value.trim();
     if (value === '') return '話数を入力してください。';
@@ -357,13 +405,16 @@ const submit_disabled = computed(() => {
     if (assignment_mode.value === 'Structured') {
         return season_number_error.value !== '' || episode_number_error.value !== '';
     }
+    if (assignment_mode.value === 'NoPublishedNumber' || assignment_mode.value === 'NotNumbered') {
+        return optional_season_number_error.value !== '';
+    }
     if (assignment_mode.value === 'AdoptAI') return can_adopt_ai.value === false;
     return false;
 });
 
 
 function formatEpisodeLabel(season: number, episode: string): string {
-    return `シーズン ${season}・第 ${formatRecordedEpisodeNumber(episode)} 話`;
+    return formatRecordedEpisodeLabel(season, episode);
 }
 
 function assignmentDraftFingerprint(): string {
@@ -400,9 +451,26 @@ function initializeDraft(): void {
         episode_number.value = episode?.episode_number ?? '';
         return;
     }
+    if (program.resolution?.source === 'Manual' && program.resolution.status === 'Unknown') {
+        assignment_mode.value = 'Unknown';
+        selected_episode_id.value = null;
+        season_number.value = '';
+        episode_number.value = '';
+        return;
+    } else if (
+        program.resolution?.status === 'NoPublishedNumber' ||
+        program.resolution?.status === 'NotNumbered'
+    ) {
+        // AI / WebSearch 正本でも、現在の番号なし状態とシーズンをそのまま編集開始値にする。
+        assignment_mode.value = program.resolution.status;
+        season_number.value = program.resolution.season_number ?? '';
+        episode_number.value = '';
+        selected_episode_id.value = null;
+        return;
+    }
     if (
-        program.resolution?.proposed_season_number !== null &&
-        program.resolution?.proposed_season_number !== undefined &&
+        program.resolution?.proposed_outcome === 'Resolved' &&
+        program.resolution.proposed_season_number !== null &&
         program.resolution.proposed_episode_number !== null
     ) {
         assignment_mode.value = 'Structured';
@@ -411,11 +479,7 @@ function initializeDraft(): void {
         selected_episode_id.value = null;
         return;
     }
-    if (program.resolution?.source === 'Manual' && program.resolution.status === 'Unknown') {
-        assignment_mode.value = 'Unknown';
-    } else {
-        assignment_mode.value = 'Structured';
-    }
+    assignment_mode.value = 'Structured';
     selected_episode_id.value = null;
     season_number.value = 1;
     episode_number.value = '';
@@ -591,6 +655,13 @@ async function saveAssignment(): Promise<void> {
         };
     } else if (assignment_mode.value === 'AdoptAI') {
         update = {...common, decision: 'AdoptAI'};
+    } else if (assignment_mode.value === 'NoPublishedNumber' || assignment_mode.value === 'NotNumbered') {
+        const rawSeasonNumber = String(season_number.value).trim();
+        update = {
+            ...common,
+            decision: assignment_mode.value,
+            season_number: rawSeasonNumber === '' ? null : Number(rawSeasonNumber),
+        };
     } else {
         update = {...common, decision: 'Unknown'};
     }
@@ -622,6 +693,10 @@ async function saveAssignment(): Promise<void> {
     emit('update:modelValue', false);
     if (assignment_mode.value === 'Unknown') {
         Message.success('話数不明として保存しました。');
+    } else if (assignment_mode.value === 'NoPublishedNumber') {
+        Message.success('公開話数なしとして保存しました。');
+    } else if (assignment_mode.value === 'NotNumbered') {
+        Message.success('話数番号を持たない番組として保存しました。');
     } else if (assignment_mode.value === 'AdoptAI') {
         Message.success('AI 検索結果を正本として採用しました。');
     } else {

@@ -44,6 +44,28 @@ function compareEpisodeNumber(first: string, second: string): number {
     return first.localeCompare(second, 'en', {numeric: true});
 }
 
+interface IRecordedSeriesEpisodeSortValue {
+    seasonNumber: number | null;
+    episodeNumber: string | null;
+    rank: number;
+}
+
+/** 番号付き回、公開話数なし、話数番号なし、未確定の順で安定した比較値を作る。 */
+function getEpisodeSortValue(program: ISeriesRecordedProgram): IRecordedSeriesEpisodeSortValue {
+    const episode = program.series_episode ?? null;
+    if (episode !== null) {
+        return {seasonNumber: episode.season_number, episodeNumber: episode.episode_number, rank: 0};
+    }
+    const resolution = program.episode_resolution ?? null;
+    if (resolution?.status === 'NoPublishedNumber') {
+        return {seasonNumber: resolution.season_number, episodeNumber: null, rank: 1};
+    }
+    if (resolution?.status === 'NotNumbered') {
+        return {seasonNumber: resolution.season_number, episodeNumber: null, rank: 2};
+    }
+    return {seasonNumber: null, episodeNumber: null, rank: 3};
+}
+
 
 /** Series 一覧で実際に表示する録画タイトル。五十音順も同じ文字列を使う。 */
 export function getRecordedSeriesProgramDisplayTitle(program: ISeriesRecordedProgram): string {
@@ -64,17 +86,22 @@ export function sortRecordedSeriesPrograms(
     return [...programs].sort((first, second) => {
         if (sort_key === 'SeasonEpisode') {
             // ローリング更新中の旧 API 応答でフィールド自体がない場合も、話数不明として安全に扱う。
-            const first_episode = first.series_episode ?? null;
-            const second_episode = second.series_episode ?? null;
+            const firstEpisode = getEpisodeSortValue(first);
+            const secondEpisode = getEpisodeSortValue(second);
 
-            // 話数不明は昇順・降順のどちらでも末尾に固定する。
-            if (first_episode === null && second_episode !== null) return 1;
-            if (first_episode !== null && second_episode === null) return -1;
-            if (first_episode !== null && second_episode !== null) {
-                const episode_order =
-                    first_episode.season_number - second_episode.season_number ||
-                    compareEpisodeNumber(first_episode.episode_number, second_episode.episode_number);
-                if (episode_order !== 0) return episode_order * direction;
+            // シーズン不明は昇順・降順のどちらでも末尾に固定する。
+            if (firstEpisode.seasonNumber === null && secondEpisode.seasonNumber !== null) return 1;
+            if (firstEpisode.seasonNumber !== null && secondEpisode.seasonNumber === null) return -1;
+            if (firstEpisode.seasonNumber !== null && secondEpisode.seasonNumber !== null) {
+                const seasonOrder = firstEpisode.seasonNumber - secondEpisode.seasonNumber;
+                if (seasonOrder !== 0) return seasonOrder * direction;
+                // 同じシーズンでは方向にかかわらず番号付き回を先にし、番号なし状態を後ろへ置く。
+                const rankOrder = firstEpisode.rank - secondEpisode.rank;
+                if (rankOrder !== 0) return rankOrder;
+                if (firstEpisode.episodeNumber !== null && secondEpisode.episodeNumber !== null) {
+                    const episodeOrder = compareEpisodeNumber(firstEpisode.episodeNumber, secondEpisode.episodeNumber);
+                    if (episodeOrder !== 0) return episodeOrder * direction;
+                }
             }
             return compareByBroadcastDateAscending(first, second);
         }

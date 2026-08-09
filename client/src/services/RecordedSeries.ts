@@ -3,11 +3,10 @@ import type { IAnalysisTaskAccepted } from '@/services/AnalysisTasks';
 import APIClient from '@/services/APIClient';
 
 
-export type RecordedEpisodeNumberAcceptanceMode = 'HighConfidenceOnly' | 'Always';
 /** 録画シリーズが選択できる AI バックエンド。OpenCode は AIBackend service_id を参照する。 */
 export type AIBackendKind = 'OpenCode' | 'AcpCodex' | 'AcpGrok';
 export type EpisodeLookupOutcome =
-    'Pending' | 'Resolved' | 'NotNumbered' | 'InsufficientEvidence' | 'SearchFailed' |
+    'Pending' | 'Resolved' | 'NotNumbered' | 'NoPublishedNumber' | 'InsufficientEvidence' | 'SearchFailed' |
     'SearchNotRun' | 'InvalidModelOutput' | 'Disabled' | 'RateLimited' | 'Cancelled';
 
 
@@ -15,8 +14,6 @@ export type EpisodeLookupOutcome =
 export interface IRecordedSeriesSettings {
     enabled: boolean;
     ai_enabled: boolean;
-    ai_episode_number_search_enabled: boolean;
-    ai_episode_number_acceptance_mode: RecordedEpisodeNumberAcceptanceMode;
     ai_backend: AIBackendKind;
     // OpenCode 時の AIBackend service UUID
     ai_backend_service_id: string | null;
@@ -30,8 +27,6 @@ export interface IRecordedSeriesSettings {
 export interface IRecordedSeriesSettingsUpdate {
     enabled: boolean;
     ai_enabled: boolean;
-    ai_episode_number_search_enabled: boolean;
-    ai_episode_number_acceptance_mode: RecordedEpisodeNumberAcceptanceMode;
     ai_backend: AIBackendKind;
     ai_backend_service_id: string | null;
 }
@@ -47,6 +42,7 @@ export interface IRecordedSeriesStatus {
     episode_resolved: number;
     episode_unknown: number;
     episode_not_numbered: number;
+    episode_no_published_number: number;
     episode_needs_review: number;
     episode_failed: number;
     last_run_at: string | null;
@@ -131,11 +127,14 @@ export interface IRecordedEpisodeAssignmentEpisode {
 
 /** 録画ごとの話数判定状態と、AI Web 検索を含む判断根拠。 */
 export interface IRecordedEpisodeAssignmentResolution {
-    status: 'Pending' | 'Resolved' | 'Unknown' | 'NotNumbered' | 'NeedsReview' | 'Failed';
+    status: 'Pending' | 'Resolved' | 'Unknown' | 'NotNumbered' | 'NoPublishedNumber' | 'NeedsReview' | 'Failed';
+    /** 現在の正本シーズン。番号付き回以外では null の場合がある。 */
+    season_number: number | null;
     /** 現在の正本（採用中のレーン）。 */
     source: 'Local' | 'EPG' | 'WebSearch' | 'Manual' | 'Migration' | 'AI' | null;
     lookup_outcome: EpisodeLookupOutcome | null;
     /** AI レーン。 */
+    proposed_outcome: 'Resolved' | 'NotNumbered' | 'NoPublishedNumber' | 'InsufficientEvidence' | null;
     proposed_season_number: number | null;
     proposed_episode_number: string | null;
     confidence: number | null;
@@ -145,7 +144,7 @@ export interface IRecordedEpisodeAssignmentResolution {
     /** 手動レーン。 */
     manual_season_number: number | null;
     manual_episode_number: string | null;
-    manual_status: 'Resolved' | 'Unknown' | 'NotNumbered' | null;
+    manual_status: 'Resolved' | 'Unknown' | 'NotNumbered' | 'NoPublishedNumber' | null;
     error_code: string | null;
     error_message: string | null;
 }
@@ -189,6 +188,12 @@ export type IRecordedEpisodeAssignmentUpdate =
         decision: 'Unknown';
         expected_series_id: number;
         expected_series_episode_id: number | null;
+    }
+    | {
+        decision: 'NoPublishedNumber' | 'NotNumbered';
+        expected_series_id: number;
+        expected_series_episode_id: number | null;
+        season_number: number | null;
     }
     | {
         decision: 'AdoptAI';

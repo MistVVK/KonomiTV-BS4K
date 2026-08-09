@@ -270,7 +270,10 @@ import RecordedSeries, {
 } from '@/services/RecordedSeries';
 import useUserStore from '@/stores/UserStore';
 import { dayjs } from '@/utils';
-import { formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
+import {
+    formatRecordedEpisodeLabel,
+    formatRecordedUnnumberedEpisodeLabel,
+} from '@/utils/RecordedEpisode';
 import {
     episodeLookupOutcomeLabel,
     episodeResolutionSourceLabel,
@@ -498,8 +501,12 @@ function standaloneStatusLabel(program: IRecordedSeriesStandaloneProgram): strin
 
 function formatProgramEpisode(program: IRecordedEpisodeAssignmentProgram): string {
     const episode = episode_assignments.value?.episodes.find(candidate => candidate.id === program.series_episode_id);
-    if (episode === undefined) return '話数未設定';
-    return `S${episode.season_number}・第 ${formatRecordedEpisodeNumber(episode.episode_number)} 話`;
+    if (episode !== undefined) return formatRecordedEpisodeLabel(episode.season_number, episode.episode_number);
+    const resolution = program.resolution;
+    if (resolution?.status === 'NotNumbered' || resolution?.status === 'NoPublishedNumber') {
+        return formatRecordedUnnumberedEpisodeLabel(resolution.season_number, resolution.status);
+    }
+    return '話数未設定';
 }
 
 /** シリーズの表示情報を更新し、検索結果と件数をサーバーから同期し直す。 */

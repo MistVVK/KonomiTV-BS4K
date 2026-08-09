@@ -15,7 +15,8 @@ export interface IRecordedEpisodeResolutionProposal {
 const EPISODE_LOOKUP_OUTCOME_LABELS: Record<EpisodeLookupOutcome, string> = {
     Pending: 'Web 検索中',
     Resolved: '検索根拠から確定',
-    NotNumbered: '検索根拠から公式話数なし',
+    NotNumbered: '検索根拠から話数番号なし',
+    NoPublishedNumber: '検索根拠から公開話数なし',
     InsufficientEvidence: '検索済み・根拠不足',
     SearchFailed: '検索失敗',
     SearchNotRun: 'Web 検索未実行',
@@ -29,7 +30,8 @@ const EPISODE_RESOLUTION_STATUS_LABELS: Record<RecordedEpisodeResolutionStatus, 
     Pending: '判定待ち',
     Resolved: '確定',
     Unknown: '話数不明',
-    NotNumbered: '公式話数なし',
+    NotNumbered: '話数番号なし',
+    NoPublishedNumber: '公開話数なし',
     NeedsReview: '要確認',
     Failed: '判定失敗',
 };
@@ -66,8 +68,8 @@ const RECORDED_EPISODE_ERROR_MESSAGES: Record<string, string> = {
     AIIsDisabled: 'AI API の利用が無効です。',
     AIEpisodeNumberSearchIsDisabled: '話数 Web 検索が無効です。',
     AISettingsChangedBeforeRequest: '検索開始前に AI バックエンド設定が変更されたため、処理を中止しました。',
-    // 接続試験を必須としていた旧実装の永続データに対する互換表示用。
-    EpisodeLookupCapabilityNotVerified: 'この話数検索は、旧バージョンで接続試験の確認前に中止されました。再検索できます。',
+    // 現行の検索開始ゲートと、同じコードを保存した旧データの双方で使う。
+    EpisodeLookupCapabilityNotVerified: '選択中の AI バックエンドでは話数 Web 検索の接続試験が完了していません。AI バックエンド設定で接続試験を実行してください。',
     AcpEpisodeLookupUnsupported: '選択中の ACP バックエンドでは話数 Web 検索を検証できません。',
     // 旧日次制限コード（互換表示用。新規発生はしない）
     DailyAIRequestLimitReached: '本日の AI API 利用上限に達しました。',
@@ -187,6 +189,7 @@ export function recordedEpisodeResolutionProposal(
     resolution: IRecordedEpisodeAssignmentResolution | null | undefined,
 ): IRecordedEpisodeResolutionProposal | null {
     if (
+        resolution?.proposed_outcome !== 'Resolved' ||
         resolution?.proposed_season_number === null ||
         resolution?.proposed_season_number === undefined ||
         resolution.proposed_episode_number === null
@@ -201,13 +204,13 @@ export function recordedEpisodeResolutionProposal(
 
 /**
  * 話数訂正ダイアログで「AI 検索結果を採用」を選べるかを返す。
- * 数値提案がある場合、または公式話数なし outcome の場合に true。
+ * 数値提案、または番号なしの保存済み提案がある場合に true。
  */
 export function canAdoptAIEpisodeResolution(
     resolution: IRecordedEpisodeAssignmentResolution | null | undefined,
 ): boolean {
     if (resolution === null || resolution === undefined) return false;
-    if (resolution.lookup_outcome === 'NotNumbered') return true;
+    if (resolution.proposed_outcome === 'NotNumbered' || resolution.proposed_outcome === 'NoPublishedNumber') return true;
     return recordedEpisodeResolutionProposal(resolution) !== null;
 }
 
@@ -241,7 +244,8 @@ function episodeLookupOutcomeFallback(outcome: EpisodeLookupOutcome): string {
     return {
         Pending: '話数 Web 検索を実行しています。',
         Resolved: 'Web 検索の根拠から話数を確定しました。',
-        NotNumbered: 'Web 検索の根拠から公式話数がないと判定しました。',
+        NotNumbered: 'Web 検索の根拠から話数番号を使わない番組と判定しました。',
+        NoPublishedNumber: 'Web 検索の根拠から公開された話数番号がないと判定しました。',
         InsufficientEvidence: 'Web 検索は実行されましたが、確定できる根拠が不足しています。',
         SearchFailed: '話数 Web 検索に失敗しました。',
         SearchNotRun: 'AI の応答はありましたが、Web 検索の実行を確認できませんでした。',
@@ -259,8 +263,11 @@ function episodeResolutionStatusFallback(resolution: IRecordedEpisodeAssignmentR
         Resolved: sourceLabel === null ? '話数を確定しました。' : `${sourceLabel}から話数を確定しました。`,
         Unknown: '話数を確定できませんでした。',
         NotNumbered: sourceLabel === null ?
-            '公式の話数がない番組として確定しました。' :
-            `${sourceLabel}から公式の話数がない番組として確定しました。`,
+            '話数番号を使わない番組として確定しました。' :
+            `${sourceLabel}から話数番号を使わない番組として確定しました。`,
+        NoPublishedNumber: sourceLabel === null ?
+            '公開された話数番号がない録画として確定しました。' :
+            `${sourceLabel}から公開された話数番号がない録画として確定しました。`,
         NeedsReview: '話数を確定するには確認が必要です。',
         Failed: '話数判定を完了できませんでした。',
     }[resolution.status];

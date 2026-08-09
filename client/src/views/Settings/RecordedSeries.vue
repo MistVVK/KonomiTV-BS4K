@@ -51,35 +51,13 @@
                 <v-switch id="recorded_series_ai_enabled" class="settings__item-switch" color="primary" hide-details
                     v-model="settings.ai_enabled" />
             </div>
-            <div class="recorded-series-ai-options"
-                :class="{'recorded-series-ai-options--disabled': settings.ai_enabled === false}"
-                :inert="settings.ai_enabled === false">
-                <div class="settings__item settings__item--switch">
-                    <label class="settings__item-heading" for="recorded_series_ai_episode_number_search_enabled">
-                        <span>話数不明時の Web 検索に使う</span>
-                        <span class="recorded-series-beta-badge">BETA</span>
-                    </label>
-                    <label class="settings__item-label" for="recorded_series_ai_episode_number_search_enabled">
-                        Series が確定していて話数だけ不明な録画を、AI の Web 検索で判定します。<br>
-                        既存録画は自動検索せず、下の一括話数判定または録画シリーズ管理から明示的に検索できます。<br>
-                        接続テストは任意で、実際の検索前にバックエンドの Web 検索能力を確認したい場合に利用できます。<br>
-                    </label>
-                    <v-switch id="recorded_series_ai_episode_number_search_enabled" class="settings__item-switch"
-                        color="primary" hide-details :model-value="settings.ai_episode_number_search_enabled"
-                        @update:model-value="updateEpisodeNumberSearchEnabled" />
-                </div>
-                <div class="settings__item"
-                    :class="{'recorded-series-ai-options--disabled': settings.ai_episode_number_search_enabled === false}"
-                    :inert="settings.ai_episode_number_search_enabled === false">
-                    <div class="settings__item-heading">Web 検索結果の受理条件</div>
-                    <div class="settings__item-label">
-                        「高信頼度のみ」は引用または Web 検索元があり、信頼度 80% 以上の結果だけを確定します。<br>
-                        「常に受理」は Web 検索を実行して得た有効な数値を、信頼度にかかわらず確定します。<br>
-                    </div>
-                    <v-select class="settings__item-form" color="primary" variant="outlined"
-                        :density="is_form_dense ? 'compact' : 'default'"
-                        :items="episode_acceptance_modes" item-title="title" item-value="value"
-                        v-model="settings.ai_episode_number_acceptance_mode" />
+            <div class="settings__item">
+                <div class="settings__item-heading">話数不明時の Web 検索</div>
+                <div class="settings__item-label">
+                    AI が有効で Series が確定している話数不明録画は、接続確認済みのバックエンドで Web 検索します。<br>
+                    Web 検索・出力形式・公開 URL の根拠を確認できた結果は、AI の信頼度表示にかかわらず自動採用します。<br>
+                    根拠不足・検索失敗・不正な応答では現在の正本を変更しません。<br>
+                    既存録画は下の一括話数判定、または録画シリーズ管理から明示的に検索できます。<br>
                 </div>
             </div>
 
@@ -181,7 +159,10 @@
                             <span>話数不明</span><strong>{{status.episode_unknown.toLocaleString()}}</strong>
                         </div>
                         <div class="recorded-series-status-card">
-                            <span>公式話数なし</span><strong>{{status.episode_not_numbered.toLocaleString()}}</strong>
+                            <span>話数番号なし</span><strong>{{status.episode_not_numbered.toLocaleString()}}</strong>
+                        </div>
+                        <div class="recorded-series-status-card">
+                            <span>公開話数なし</span><strong>{{status.episode_no_published_number.toLocaleString()}}</strong>
                         </div>
                         <div class="recorded-series-status-card">
                             <span>要確認</span><strong>{{status.episode_needs_review.toLocaleString()}}</strong>
@@ -263,7 +244,7 @@
                 </label>
                 <label class="settings__item-label" for="recorded_series_force_episode_backfill">
                     有効にすると、AI・ローカル情報・EPG・移行データで確定済みの話数も最新の設定で再検索します。<br>
-                    公式話数なし・要確認・失敗の結果も再検索しますが、手動で訂正した話数は対象外です。<br>
+                    話数番号なし・要確認・失敗の結果も再検索しますが、手動で訂正した話数は対象外です。<br>
                 </label>
                 <v-switch id="recorded_series_force_episode_backfill" class="settings__item-switch"
                     color="primary" hide-details
@@ -307,25 +288,6 @@
             </div>
         </template>
 
-        <v-dialog v-model="episode_number_search_warning_dialog" max-width="560">
-            <v-card class="recorded-series-dialog">
-                <v-card-title>話数 Web 検索（BETA）を有効化</v-card-title>
-                <v-card-text>
-                    <v-alert class="mb-4" color="warning" variant="tonal">
-                        この機能は未成熟な BETA オプションのため、使用を推奨しません。
-                    </v-alert>
-                    Web 検索結果や AI の判定が誤っていても、受理条件によっては誤った話数を確定する可能性があります。<br>
-                    内容を理解した上で、それでも利用する場合だけ有効にしてください。
-                </v-card-text>
-                <v-card-actions>
-                    <v-spacer />
-                    <v-btn variant="text" @click="episode_number_search_warning_dialog = false">キャンセル</v-btn>
-                    <v-btn color="warning" variant="flat" @click="confirmEpisodeNumberSearchEnabled()">
-                        それでも有効にする
-                    </v-btn>
-                </v-card-actions>
-            </v-card>
-        </v-dialog>
     </SettingsBase>
 </template>
 
@@ -341,7 +303,6 @@ import RecordedSeries, {
     type IRecordedSeriesSettings,
     type IRecordedSeriesSettingsUpdate,
     type IRecordedSeriesStatus,
-    type RecordedEpisodeNumberAcceptanceMode,
 } from '@/services/RecordedSeries';
 import { stageLabel } from '@/stores/AnalysisTasksStore';
 import useUserStore from '@/stores/UserStore';
@@ -354,10 +315,6 @@ const ai_backend_options: {title: string; value: AIBackendKind;}[] = [
     {title: 'ACP / Codex', value: 'AcpCodex'},
     {title: 'ACP / Grok Build', value: 'AcpGrok'},
 ];
-const episode_acceptance_modes: {title: string; value: RecordedEpisodeNumberAcceptanceMode;}[] = [
-    {title: '高信頼度の結果のみ受理', value: 'HighConfidenceOnly'},
-    {title: '有効な数値なら常に受理', value: 'Always'},
-];
 const ai_auth_mode_labels: Record<AIAuthMode, string> = {
     ApiKey: 'API キー',
     OAuthSubscription: 'OAuth',
@@ -369,8 +326,6 @@ const ai_auth_mode_labels: Record<AIAuthMode, string> = {
 const settings = ref<IRecordedSeriesSettings>({
     enabled: true,
     ai_enabled: false,
-    ai_episode_number_search_enabled: false,
-    ai_episode_number_acceptance_mode: 'Always',
     ai_backend: 'AcpCodex',
     ai_backend_service_id: null,
     ai_backend_service_name: null,
@@ -380,9 +335,6 @@ const settings = ref<IRecordedSeriesSettings>({
 const saved_settings = ref<IRecordedSeriesSettings | null>(null);
 const opencode_services = ref<{title: string; value: string;}[]>([]);
 const status = ref<IRecordedSeriesStatus | null>(null);
-
-// 話数 Web 検索（BETA）の警告ダイアログ状態。
-const episode_number_search_warning_dialog = ref(false);
 
 const is_loading = ref(true);
 const is_disabled = ref(true);
@@ -404,25 +356,6 @@ const user_store = useUserStore();
 let backfill_abort_controller: AbortController | null = null;
 let episode_backfill_abort_controller: AbortController | null = null;
 let status_polling_timer: number | null = null;
-
-
-/** BETA 機能は警告への明示的な同意が得られるまで有効化しない。 */
-function updateEpisodeNumberSearchEnabled(enabled: boolean | null): void {
-    if (enabled !== true) {
-        settings.value.ai_episode_number_search_enabled = false;
-        episode_number_search_warning_dialog.value = false;
-        return;
-    }
-    if (settings.value.ai_episode_number_search_enabled === false) {
-        episode_number_search_warning_dialog.value = true;
-    }
-}
-
-/** BETA 警告で利用継続を選んだ場合だけ、話数 Web 検索を有効化する。 */
-function confirmEpisodeNumberSearchEnabled(): void {
-    settings.value.ai_episode_number_search_enabled = true;
-    episode_number_search_warning_dialog.value = false;
-}
 
 
 const opencode_service_error = computed(() => {
@@ -480,8 +413,6 @@ function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
     return {
         enabled: settings.value.enabled,
         ai_enabled: settings.value.ai_enabled,
-        ai_episode_number_search_enabled: settings.value.ai_episode_number_search_enabled,
-        ai_episode_number_acceptance_mode: settings.value.ai_episode_number_acceptance_mode,
         ai_backend: settings.value.ai_backend,
         ai_backend_service_id: settings.value.ai_backend === 'OpenCode'
             ? settings.value.ai_backend_service_id
@@ -700,30 +631,6 @@ onUnmounted(() => {
 
 <style lang="scss" scoped>
 
-.recorded-series-beta-badge {
-    flex-shrink: 0;
-    margin-left: 8px;
-    padding: 1px 6px;
-    border-radius: 4px;
-    background: rgb(var(--v-theme-warning));
-    color: rgb(var(--v-theme-on-warning));
-    font-size: 10px;
-    font-weight: 700;
-    line-height: 18px;
-    letter-spacing: 0.08em;
-}
-
-.recorded-series-ai-options {
-    margin-left: 18px;
-    padding-left: 17px;
-    border-left: 3px solid rgba(var(--v-theme-primary), 0.35);
-    transition: opacity 0.2s;
-
-    &--disabled {
-        opacity: 0.5;
-    }
-}
-
 .recorded-series-access-state {
     display: flex;
     align-items: center;
@@ -763,16 +670,7 @@ onUnmounted(() => {
     }
 }
 
-.recorded-series-dialog {
-    background: rgb(var(--v-theme-background-lighten-1));
-}
-
 @include smartphone-vertical {
-    .recorded-series-ai-options {
-        margin-left: 8px;
-        padding-left: 11px;
-    }
-
     .recorded-series-status-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }

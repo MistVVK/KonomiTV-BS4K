@@ -119,7 +119,10 @@ import useRecordedSeriesStore, { getRecordedSeriesProgramDisplayTitle } from '@/
 import useSettingsStore, { type VideoSeriesSortDirection, type VideoSeriesSortKey } from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { dayjs } from '@/utils';
-import { formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
+import {
+    formatRecordedEpisodeLabel,
+    formatRecordedUnnumberedEpisodeLabel,
+} from '@/utils/RecordedEpisode';
 
 
 export default defineComponent({
@@ -289,12 +292,17 @@ export default defineComponent({
             return getRecordedSeriesProgramDisplayTitle(program as ISeriesRecordedProgram);
         },
 
-        /** 構造化話数を優先し、同一話の局違いでも同じ短縮表記にそろえる。 */
+        /** 正本状態を優先し、同一話の局違いでも同じ短縮表記にそろえる。 */
         formatProgramEpisode(program: ISeriesRecordedProgram): string {
             const structured_episode = program.series_episode ?? null;
-            if (structured_episode === null) return program.episode_number ?? '—';
-            const episode_number = formatRecordedEpisodeNumber(structured_episode.episode_number);
-            return `S${structured_episode.season_number} #${episode_number}`;
+            if (structured_episode !== null) {
+                return formatRecordedEpisodeLabel(structured_episode.season_number, structured_episode.episode_number);
+            }
+            const resolution = program.episode_resolution ?? null;
+            if (resolution?.status === 'NotNumbered' || resolution?.status === 'NoPublishedNumber') {
+                return formatRecordedUnnumberedEpisodeLabel(resolution.season_number, resolution.status);
+            }
+            return program.episode_number ?? '—';
         },
 
         formatStartTime(start_time: string): string {
