@@ -155,9 +155,12 @@ def test_dockerignore_excludes_host_state_but_keeps_verification_sources() -> No
 
     dockerignore = (REPOSITORY_ROOT / '.dockerignore').read_text(encoding='utf-8')
 
+    assert '.env' in dockerignore
+    assert 'compose.override.yaml' in dockerignore
     assert '.git/' in dockerignore
     assert 'client/dist/' in dockerignore
     assert 'server/logs/*' in dockerignore
+    assert 'server/cutover-backups/' in dockerignore
     assert 'server/tests/' not in dockerignore
     assert 'client/scripts/*.test.mjs' not in dockerignore
 

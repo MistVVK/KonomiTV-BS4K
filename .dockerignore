@@ -2,6 +2,10 @@
 # config.yaml: ホスト側のファイルを利用するため不要
 config.yaml
 
+# 環境固有の Compose 変数・override: 認証ファイルの場所などを build context へ含めない
+.env
+compose.override.yaml
+
 # Git metadata: バージョン判定は実行時の read-only source tree bind mount を利用する
 .git/
 
@@ -26,6 +30,9 @@ server/data/*
 
 # サーバーログ: ホスト側の既存ログを build context へ含めない
 server/logs/*
+
+# 切替時のローカルバックアップ: DB や認証状態を完成イメージへ混入させない
+server/cutover-backups/
 
 # ACP / Google のホスト資格情報は配置場所にかかわらず build context へ含めない
 **/.codex/
