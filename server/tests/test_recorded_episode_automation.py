@@ -30,7 +30,6 @@ from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle
 from app.metadata.RecordedEpisodeAutomation import (
     RecordedEpisodeAutomation,
     RecordedEpisodeRelookupConflictError,
-    RecordedEpisodeRelookupDisabledError,
     RecordedEpisodeRelookupNotFoundError,
 )
 from app.metadata.RecordedEpisodeContext import (
@@ -165,9 +164,9 @@ async def CreateRecordedProgram(
 def InstallAISettings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> RecordedSeriesSettings:
-    """AI話数検索に必要な設定・能力証明をメモリ上で返す。"""
+    """AI話数検索に必要な設定を、能力証明なしでメモリ上に返す。"""
 
-    # 能力証明はテスト専用の一時ファイルへ書き、本番 DATA_DIR を汚染しない。
+    # 接続試験未実施を再現し、各検索経路が能力証明へ依存しないことも検証する。
     monkeypatch.setattr(
         RecordedSeriesAIModule,
         'EPISODE_LOOKUP_CAPABILITY_PROOFS_PATH',
@@ -192,11 +191,6 @@ def InstallAISettings(
         RecordedSeriesSettingsStore,
         "getSettingsAndAPIKey",
         classmethod(GetSettingsAndAPIKey),
-    )
-    record_episode_lookup_capability_proof(
-        settings,
-        "test-secret",
-        SuccessfulCapabilityProof(),
     )
     return settings
 
@@ -539,11 +533,6 @@ def test_acp_episode_lookup_uses_the_common_facade_and_persists_result(
         Path(tempfile.mkdtemp()) / 'recorded-series-episode-lookup-proofs.json',
     )
     reset_episode_lookup_capability_proofs_for_tests()
-    assert record_episode_lookup_capability_proof(
-        settings,
-        None,
-        SuccessfulCapabilityProof(),
-    ) is True
 
     def GetSettingsAndAPIKey(
         cls: type[RecordedSeriesSettingsStore],
@@ -1639,10 +1628,10 @@ def test_in_flight_lookup_accepts_low_confidence_with_verified_evidence(
     asyncio.run(Run())
 
 
-def test_disabled_settings_update_does_not_enqueue_provider_retry(
+def test_settings_update_enqueues_without_connection_test_proof_only_when_enabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """provider変更と同時にAIをOFFにしても、保存済みWeb提案を再評価キューへ入れない。"""
+    """設定更新は AI OFF なら保留し、未試験でも AI ON なら再評価をキューへ入れる。"""
 
     settings = RecordedSeriesSettings(
         enabled=True,
@@ -1696,6 +1685,9 @@ def test_disabled_settings_update_does_not_enqueue_provider_retry(
         try:
             await RecordedEpisodeAutomation.settingsUpdated()
             assert enqueue_calls == 0
+            settings.ai_enabled = True
+            await RecordedEpisodeAutomation.settingsUpdated()
+            assert enqueue_calls == 1
         finally:
             worker.cancel()
             await asyncio.gather(worker, return_exceptions=True)
@@ -2754,10 +2746,10 @@ def test_single_relookup_validates_not_found_stale_and_manual(
     asyncio.run(Run())
 
 
-def test_single_relookup_requires_connection_test_proof(
+def test_single_relookup_starts_without_connection_test_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """単票再検索は接続試験 proof がない provider では開始しない。"""
+    """単票再検索は接続試験 proof がない provider でも開始する。"""
 
     settings = InstallAISettings(monkeypatch)
     # OpenCode では API キーは fingerprint の核にならないため、provider が異なることを
@@ -2831,12 +2823,14 @@ def test_single_relookup_requires_connection_test_proof(
                 episode_number=None,
             )
 
-            with pytest.raises(RecordedEpisodeRelookupDisabledError):
-                await RecordedEpisodeAutomation.startRelookup(
-                    program.id,
-                    expected_series_id=series.id,
-                    expected_series_episode_id=None,
-                )
+            accepted = await RecordedEpisodeAutomation.startRelookup(
+                program.id,
+                expected_series_id=series.id,
+                expected_series_episode_id=None,
+            )
+            assert accepted.execution_id == 321
+            assert accepted.reused is False
+            await asyncio.gather(*RecordedEpisodeAutomation._relookup_tasks.values())
         finally:
             RecordedEpisodeAutomation._relookup_tasks = {}
             RecordedEpisodeAutomation._relookup_handles = {}
@@ -2845,10 +2839,10 @@ def test_single_relookup_requires_connection_test_proof(
     asyncio.run(Run())
 
 
-def test_episode_backfill_requires_connection_test_proof(
+def test_episode_backfill_starts_without_connection_test_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """一括話数判定も接続試験 proof がない provider では開始しない。"""
+    """一括話数判定も接続試験 proof がない provider で開始する。"""
 
     settings = InstallAISettings(monkeypatch)
     unproven_settings = settings.model_copy(
@@ -2920,8 +2914,11 @@ def test_episode_backfill_requires_connection_test_proof(
 
     async def Run() -> None:
         try:
-            with pytest.raises(RecordedEpisodeRelookupDisabledError):
-                await RecordedEpisodeAutomation.startBackfill(force=False)
+            accepted = await RecordedEpisodeAutomation.startBackfill(force=False)
+            assert accepted.execution_id == 654
+            assert accepted.reused is False
+            assert RecordedEpisodeAutomation._backfill_task is not None
+            await RecordedEpisodeAutomation._backfill_task
         finally:
             RecordedEpisodeAutomation._backfill_task = None
             RecordedEpisodeAutomation._backfill_handle = None
@@ -3005,9 +3002,14 @@ def test_relookup_rechecks_the_accepted_provider_before_external_call(
 def test_runtime_capability_failure_revokes_matching_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """実 lookup で Web tool 未実行が判明した provider は再試験まで失効する。"""
+    """実 lookup で Web tool 未実行なら、接続試験の診断記録を失効する。"""
 
     settings = InstallAISettings(monkeypatch)
+    assert record_episode_lookup_capability_proof(
+        settings,
+        "test-secret",
+        SuccessfulCapabilityProof(),
+    ) is True
     assert has_episode_lookup_capability_proof(settings, "test-secret") is True
 
     async def SearchEpisode(**_kwargs: object) -> EpisodeLookupResult:

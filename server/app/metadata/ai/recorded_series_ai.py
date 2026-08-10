@@ -979,8 +979,8 @@ async def lookup_episode(
         # Phase 2 で OpenCodeBackend を直接呼ぶ。
         result = await RunLookup()
     else:
-        # proof 再照合から subprocess 終了まで credential import/delete を止め、
-        # 検証した世代と実際に CLI が読む世代を一致させる。
+        # provider fingerprint の再照合から subprocess 終了まで credential import/delete を止め、
+        # 受付時の世代と実際に CLI が読む世代を一致させる。
         result = await _RunACPOperationWithDeadline(
             RunLookup,
             _GetACPCredentialProvider(settings.ai_backend),

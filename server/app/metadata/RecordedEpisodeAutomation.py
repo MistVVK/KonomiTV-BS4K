@@ -24,7 +24,6 @@ from app.metadata.ai.episode_lookup import (
 from app.metadata.ai.recorded_series_ai import (
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
-    has_episode_lookup_capability_proof,
     invalidate_episode_lookup_capability_fingerprint,
 )
 from app.metadata.ai.recorded_series_ai import (
@@ -1532,11 +1531,6 @@ class RecordedEpisodeAutomation:
                     "SearchNotRun",
                     "AISettingsChangedBeforeRequest",
                 )
-            elif has_episode_lookup_capability_proof(settings, api_key) is False:
-                unavailable = (
-                    'SearchNotRun',
-                    'EpisodeLookupCapabilityNotVerified',
-                )
             if unavailable is not None:
                 outcome, error_code = unavailable
                 await cls._recordPreflightOutcome(
@@ -1929,7 +1923,6 @@ class RecordedEpisodeAutomation:
             if (
                 settings.enabled is False
                 or settings.ai_enabled is False
-                or has_episode_lookup_capability_proof(settings, api_key) is False
             ):
                 raise RecordedEpisodeRelookupDisabledError
             expected_provider_fingerprint = (
@@ -2176,11 +2169,7 @@ class RecordedEpisodeAutomation:
         await cls.promoteStoredProposals()
         settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
         # AI OFFへの設定変更では、旧Web検索の提案・引用をUnknownへ上書きしない。
-        if (
-            settings.enabled is False
-            or settings.ai_enabled is False
-            or has_episode_lookup_capability_proof(settings, api_key) is False
-        ):
+        if settings.enabled is False or settings.ai_enabled is False:
             return
         await cls._enqueueRecoverablePrograms(
             provider_fingerprint=get_episode_lookup_provider_fingerprint(
@@ -2211,12 +2200,8 @@ class RecordedEpisodeAutomation:
 
             await cls.start()
             settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-            # 一括処理を受け付けてから全件 Skipped にするのではなく、保存済み設定で
-            # 話数 Web 検索能力を接続試験で確認済みの場合だけ実行履歴を作成する。
-            if (
-                settings.ai_enabled is False
-                or has_episode_lookup_capability_proof(settings, api_key) is False
-            ):
+            # 接続試験は診断専用のため、検索の有効設定だけで一括処理を開始する。
+            if settings.ai_enabled is False:
                 raise RecordedEpisodeRelookupDisabledError
             provider_fingerprint = get_episode_lookup_provider_fingerprint(
                 settings,

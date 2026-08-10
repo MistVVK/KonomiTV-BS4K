@@ -68,7 +68,7 @@ const RECORDED_EPISODE_ERROR_MESSAGES: Record<string, string> = {
     AIIsDisabled: 'AI API の利用が無効です。',
     AIEpisodeNumberSearchIsDisabled: '話数 Web 検索が無効です。',
     AISettingsChangedBeforeRequest: '検索開始前に AI バックエンド設定が変更されたため、処理を中止しました。',
-    // 現行の検索開始ゲートと、同じコードを保存した旧データの双方で使う。
+    // 接続試験を必須としていた旧バージョンの保存済みデータとの互換表示用。
     EpisodeLookupCapabilityNotVerified: '選択中の AI バックエンドでは話数 Web 検索の接続試験が完了していません。AI バックエンド設定で接続試験を実行してください。',
     AcpEpisodeLookupUnsupported: '選択中の ACP バックエンドでは話数 Web 検索を検証できません。',
     // 旧日次制限コード（互換表示用。新規発生はしない）
