@@ -3298,6 +3298,8 @@ class PlayerController {
                 style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
                 <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-video-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
                 <span class="dplayer-label">${codec.toUpperCase()}</span>
+                <span class="dplayer-konomitv-bs4k-setting-video-codec-status"
+                    style="margin-left:auto; font-size:11px; opacity:.65;"></span>
             </div>
         `).join('');
         const video_codec_panel_height = 54 + selectable_video_codecs.length * 30;
@@ -3312,6 +3314,8 @@ class PlayerController {
                 style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
                 <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-audio-codec-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
                 <span class="dplayer-label">${audio_codec_labels[codec]}</span>
+                <span class="dplayer-konomitv-bs4k-setting-audio-codec-status"
+                    style="margin-left:auto; font-size:11px; opacity:.65;"></span>
             </div>
         `).join('');
         const audio_codec_panel_height = 54 + selectable_audio_codecs.length * 30;
@@ -3429,6 +3433,11 @@ class PlayerController {
                 is_bs4k,
                 this.quality_profile_type === 'Cellular',
             )];
+        const get_effective_playback_profile = () => {
+            const effective_profile = player_store.konomitv_bs4k_effective_playback_profile;
+            // 別チャンネル・別録画の古い pin が残っていても、現在のメニューへ誤表示しない。
+            return effective_profile?.target_key === this.getPlaybackTargetKey() ? effective_profile : null;
+        };
         let is_codec_preflight_in_progress = false;
         const prepare_codec_override = async (
             requested_video_codec: KonomiTVBS4KPlaybackVideoCodec,
@@ -3540,13 +3549,24 @@ class PlayerController {
         ));
         setting_box.style.setProperty('--konomitv-bs4k-video-codec-panel-height', `${video_codec_panel_height}px`);
         const update_video_codec_display = () => {
-            const selected_codec = get_requested_video_codec();
-            video_codec_value.textContent = selected_codec.toUpperCase();
+            const requested_codec = get_requested_video_codec();
+            const effective_codec = get_effective_playback_profile()?.video_codec ?? requested_codec;
+            const is_fallback_active = requested_codec !== effective_codec;
+            video_codec_value.textContent = is_fallback_active === true ?
+                `${effective_codec.toUpperCase()}（${requested_codec.toUpperCase()}→自動）` :
+                effective_codec.toUpperCase();
             video_codec_items.forEach((item) => {
                 const check = item.querySelector<HTMLElement>(
                     '.dplayer-konomitv-bs4k-setting-video-codec-check',
                 );
-                if (check !== null) check.style.visibility = item.dataset.codec === selected_codec ? 'visible' : 'hidden';
+                if (check !== null) check.style.visibility = item.dataset.codec === effective_codec ? 'visible' : 'hidden';
+                const status = item.querySelector<HTMLElement>(
+                    '.dplayer-konomitv-bs4k-setting-video-codec-status',
+                );
+                if (status !== null) {
+                    status.textContent = is_fallback_active === true && item.dataset.codec === requested_codec ?
+                        '希望' : (is_fallback_active === true && item.dataset.codec === effective_codec ? '再生中' : '');
+                }
             });
         };
         update_video_codec_display();
@@ -3593,13 +3613,24 @@ class PlayerController {
         );
         setting_box.style.setProperty('--konomitv-bs4k-audio-codec-panel-height', `${audio_codec_panel_height}px`);
         const update_audio_codec_display = () => {
-            const selected_codec = get_requested_audio_codec();
-            audio_codec_value.textContent = audio_codec_labels[selected_codec];
+            const requested_codec = get_requested_audio_codec();
+            const effective_codec = get_effective_playback_profile()?.audio_codec ?? requested_codec;
+            const is_fallback_active = requested_codec !== effective_codec;
+            audio_codec_value.textContent = is_fallback_active === true ?
+                `${audio_codec_labels[effective_codec]}（${audio_codec_labels[requested_codec]}→自動）` :
+                audio_codec_labels[effective_codec];
             audio_codec_items.forEach((item) => {
                 const check = item.querySelector<HTMLElement>(
                     '.dplayer-konomitv-bs4k-setting-audio-codec-check',
                 );
-                if (check !== null) check.style.visibility = item.dataset.codec === selected_codec ? 'visible' : 'hidden';
+                if (check !== null) check.style.visibility = item.dataset.codec === effective_codec ? 'visible' : 'hidden';
+                const status = item.querySelector<HTMLElement>(
+                    '.dplayer-konomitv-bs4k-setting-audio-codec-status',
+                );
+                if (status !== null) {
+                    status.textContent = is_fallback_active === true && item.dataset.codec === requested_codec ?
+                        '希望' : (is_fallback_active === true && item.dataset.codec === effective_codec ? '再生中' : '');
+                }
             });
         };
         update_audio_codec_display();

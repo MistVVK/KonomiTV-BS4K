@@ -602,4 +602,81 @@ describe('DPlayer codecサブパネル: ワンセグライブ', () => {
         });
         expect(JSON.stringify(settings_store.settings)).toBe(saved_settings_json);
     });
+
+    it('実効HEVC/AACへチェックを移し、希望AV1/Opusとの自動フォールバックを表示する', () => {
+        const settings_store = useSettingsStore();
+        const player_store = usePlayerStore();
+        const saved_settings_json = JSON.stringify(settings_store.settings);
+        player_store.konomitv_bs4k_effective_playback_profile = {
+            target_key: 'Live:gr013:Wi-Fi',
+            encoder: 'FFmpeg',
+            requested_video_codec: 'av1',
+            requested_audio_codec: 'opus',
+            video_codec: 'hevc',
+            video_bit_depth: 8,
+            audio_codec: 'aac',
+        };
+
+        const { player } = createController('Live');
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-video-codec-value',
+        )?.textContent).toBe('HEVC（AV1→自動）');
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-audio-codec-value',
+        )?.textContent).toBe('AAC（Opus→自動）');
+
+        const video_items = Array.from(player.container.querySelectorAll<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-video-codec-item',
+        ));
+        const audio_items = Array.from(player.container.querySelectorAll<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-audio-codec-item',
+        ));
+        const av1_item = video_items.find((item) => item.dataset.codec === 'av1')!;
+        const hevc_item = video_items.find((item) => item.dataset.codec === 'hevc')!;
+        const opus_item = audio_items.find((item) => item.dataset.codec === 'opus')!;
+        const aac_item = audio_items.find((item) => item.dataset.codec === 'aac')!;
+
+        expect(av1_item.querySelector('.dplayer-konomitv-bs4k-setting-video-codec-status')?.textContent).toBe('希望');
+        expect(hevc_item.querySelector('.dplayer-konomitv-bs4k-setting-video-codec-status')?.textContent).toBe('再生中');
+        expect(hevc_item.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-video-codec-check',
+        )?.style.visibility).toBe('visible');
+        expect(av1_item.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-video-codec-check',
+        )?.style.visibility).toBe('hidden');
+        expect(opus_item.querySelector('.dplayer-konomitv-bs4k-setting-audio-codec-status')?.textContent).toBe('希望');
+        expect(aac_item.querySelector('.dplayer-konomitv-bs4k-setting-audio-codec-status')?.textContent).toBe('再生中');
+        expect(aac_item.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-audio-codec-check',
+        )?.style.visibility).toBe('visible');
+        expect(opus_item.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-audio-codec-check',
+        )?.style.visibility).toBe('hidden');
+        expect(JSON.stringify(settings_store.settings)).toBe(saved_settings_json);
+    });
+
+    it('フォールバックなしでは従来どおり希望値だけを表示する', () => {
+        const player_store = usePlayerStore();
+        player_store.konomitv_bs4k_effective_playback_profile = {
+            target_key: 'Live:gr013:Wi-Fi',
+            encoder: 'FFmpeg',
+            requested_video_codec: 'av1',
+            requested_audio_codec: 'opus',
+            video_codec: 'av1',
+            video_bit_depth: 8,
+            audio_codec: 'opus',
+        };
+
+        const { player } = createController('Live');
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-video-codec-value',
+        )?.textContent).toBe('AV1');
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-audio-codec-value',
+        )?.textContent).toBe('Opus');
+        expect(Array.from(player.container.querySelectorAll(
+            '.dplayer-konomitv-bs4k-setting-video-codec-status, ' +
+            '.dplayer-konomitv-bs4k-setting-audio-codec-status',
+        )).every((status) => status.textContent === '')).toBe(true);
+    });
 });
