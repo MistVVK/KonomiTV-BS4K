@@ -213,10 +213,11 @@ def test_create_backend_uses_fixed_codex_command_workspace_and_environment(
         konomitv_bs4k_fast_mode_enabled: bool = False,
     ) -> Path:
         assert backend == 'codex'
-        assert konomitv_bs4k_fast_mode_enabled is True
+        assert konomitv_bs4k_fast_mode_enabled is False
         return profile
 
     monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
+    _PatchACPSettings(monkeypatch)
     settings = RecordedSeriesSettings(
         ai_backend='AcpCodex',
     )
