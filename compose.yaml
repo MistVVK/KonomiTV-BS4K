@@ -1,0 +1,66 @@
+name: konomitv-bs4k-main
+
+services:
+  konomitv:
+    image: konomitv-bs4k-main
+    container_name: KonomiTV-BS4K-Main
+    build:
+      context: .
+      target: runtime
+      args:
+        CUDA_VERSION: '${KONOMITV_CUDA_VERSION:-12.4}'
+        NONFREE: '${KONOMITV_NONFREE:-true}'
+        KONOMITV_UID: '${KONOMITV_UID:-1000}'
+        KONOMITV_GID: '${KONOMITV_GID:-1000}'
+
+    # bind mount 先の所有者と一致する非 root UID/GID で実行する。
+    user: '${KONOMITV_UID:-1000}:${KONOMITV_GID:-1000}'
+    group_add:
+      - '${KONOMITV_VIDEO_GID:-44}'
+      - '${KONOMITV_RENDER_GID:-109}'
+    restart: always
+    network_mode: host
+    environment:
+      KONOMITV_BS4K_SOURCE_TREE: '/code/source-tree'
+
+    # host root 全体は公開せず、設定で利用するディレクトリだけを同じ絶対パスへ個別に公開する。
+    volumes:
+      - type: bind
+        source: './'
+        target: '/code/source-tree/'
+        read_only: true
+        bind:
+          selinux: z
+      - type: bind
+        source: './config.yaml'
+        target: '/code/config.yaml'
+        bind:
+          selinux: z
+      - type: bind
+        source: './server/data/'
+        target: '/code/server/data/'
+        bind:
+          selinux: z
+      - type: bind
+        source: './server/logs/'
+        target: '/code/server/logs/'
+        bind:
+          selinux: z
+      - type: bind
+        source: '${KONOMITV_RECORDED_FOLDER:-/mnt/TV-Record}'
+        target: '/host-rootfs${KONOMITV_RECORDED_FOLDER:-/mnt/TV-Record}'
+        bind:
+          create_host_path: false
+          selinux: z
+      - type: bind
+        source: '${KONOMITV_CAPTURE_FOLDER:-/mnt/TV-Capture}'
+        target: '/host-rootfs${KONOMITV_CAPTURE_FOLDER:-/mnt/TV-Capture}'
+        bind:
+          create_host_path: false
+          selinux: z
+
+    # Intel QSVとAMD VAAPI/AMFを使用しない環境では、この項目をローカルoverrideで無効化する。
+    devices:
+      - '/dev/dri/:/dev/dri/'
+
+    # NVIDIA NVENCを使用する場合は、ローカルoverrideでNVIDIA device reservationを追加する。

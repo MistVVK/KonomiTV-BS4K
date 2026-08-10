@@ -7,8 +7,8 @@ import ruamel.yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-# docker-compose.yaml は .gitignore 対象のローカル専用。リポジトリ正本は example のみ。
-COMPOSE_FILENAMES = ['docker-compose.example.yaml']
+# compose.yaml は公開・新メインの正本。docker-compose.example.yaml も移行期間中は同じ安全契約を保つ。
+COMPOSE_FILENAMES = ['compose.yaml', 'docker-compose.example.yaml']
 ACP_AUTH_OVERRIDE_EXPECTATIONS = {
     'docker-compose.acp-codex-auth.yaml': (
         '${KONOMITV_BS4K_CODEX_AUTH_FILE:',
@@ -65,6 +65,25 @@ def _load_compose_service(compose_filename: str) -> dict[str, Any]:
     yaml = ruamel.yaml.YAML(typ='safe')
     compose = cast(dict[str, Any], yaml.load(REPOSITORY_ROOT.joinpath(compose_filename).read_text()))
     return cast(dict[str, Any], compose['services']['konomitv'])
+
+
+def test_public_compose_uses_runtime_target_and_main_identifiers() -> None:
+    """公開 Compose が新メイン専用の識別子と runtime target を正本にする。
+
+    Returns:
+        None
+    """
+
+    yaml = ruamel.yaml.YAML(typ='safe')
+    compose = cast(dict[str, Any], yaml.load((REPOSITORY_ROOT / 'compose.yaml').read_text()))
+    service = cast(dict[str, Any], compose['services']['konomitv'])
+    build = cast(dict[str, Any], service['build'])
+
+    assert compose['name'] == 'konomitv-bs4k-main'
+    assert service['image'] == 'konomitv-bs4k-main'
+    assert service['container_name'] == 'KonomiTV-BS4K-Main'
+    assert build['context'] == '.'
+    assert build['target'] == 'runtime'
 
 
 def test_runtime_image_runs_as_non_root_user() -> None:
@@ -526,10 +545,11 @@ def test_authentication_files_are_excluded_from_build_context_and_git(ignore_fil
     assert '**/application_default_credentials.json' in ignore_content
 
 
-def test_local_docker_compose_yaml_is_gitignored() -> None:
-    """実機用 docker-compose.yaml は Git 管理外とし、example をテンプレート正本にする。"""
+def test_local_compose_overrides_are_gitignored() -> None:
+    """旧環境と環境固有の Compose override を Git 管理外に保つ。"""
 
     gitignore = (REPOSITORY_ROOT / '.gitignore').read_text(encoding='utf-8')
     assert re.search(r'(?m)^docker-compose\.yaml$', gitignore) is not None
-    # 追跡済みのままだと ignore が効かないため、index からも外れていること
+    assert re.search(r'(?m)^compose\.override\.yaml$', gitignore) is not None
+    assert (REPOSITORY_ROOT / 'compose.yaml').is_file()
     assert (REPOSITORY_ROOT / 'docker-compose.example.yaml').is_file()

@@ -774,6 +774,7 @@ RUN nala update && \
 # pytest には Dockerfile・配布スクリプト・Compose policy も検査するテストがあるため、
 # 秘密とホスト状態を .dockerignore で除外した上で、verify stage にだけ必要なリポジトリ面を配置する。
 COPY ./Dockerfile ./.dockerignore ./.gitignore ./THIRD_PARTY_LICENSES.md \
+     ./compose.yaml \
      ./docker-compose.example.yaml \
      ./docker-compose.acp-codex-auth.yaml \
      ./docker-compose.acp-grok-auth.yaml \
