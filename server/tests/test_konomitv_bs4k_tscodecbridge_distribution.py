@@ -462,7 +462,10 @@ def test_dockerfile_keeps_bridge_toolchain_out_of_the_final_image() -> None:
         'build.sh test-ffmpeg-integration'
     )
 
-    final_stage = 'FROM ' + dockerfile.rsplit('\nFROM ', maxsplit = 1)[1]
+    runtime_marker = f'{base} AS runtime'
+    final_stage = runtime_marker + dockerfile.split(runtime_marker, maxsplit = 1)[1].split(
+        '\nFROM ', maxsplit = 1,
+    )[0]
     assert (
         'COPY --from=tscodecbridge-integration /opt/konomitv-bs4k-tscodecbridge-runtime/ '
         '\\\n    /code/server/thirdparty/KonomiTVBS4KTSCodecBridge/'

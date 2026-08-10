@@ -302,7 +302,7 @@ RUN set -eu && \
 # KonomiTV-BS4K の実行ステージ (Linux amd64 専用)
 # --------------------------------------------------------------------------------------------------------------
 
-FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256}
+FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS runtime
 
 ARG CUDA_VERSION=12.4
 ARG NONFREE=true
@@ -637,7 +637,12 @@ COPY ./server/pyproject.toml ./server/poetry.lock ./server/poetry.toml /code/ser
 RUN /code/server/thirdparty/Python/bin/python -m poetry env use /code/server/thirdparty/Python/bin/python && \
     /code/server/thirdparty/Python/bin/python -m poetry install --only main --no-root
 
-COPY ./server/ /code/server/
+# verify stage からはテストを参照できるよう build context に残しつつ、runtime layer には
+# production source だけを記録する。bind mount 内のテストを同じ RUN で除去してから layer を確定する。
+RUN --mount=type=bind,source=server,target=/mnt/konomitv-bs4k-server-source \
+    cp --archive --no-preserve=ownership /mnt/konomitv-bs4k-server-source/. /code/server/ && \
+    rm -rf /code/server/tests && \
+    test ! -e /code/server/tests
 COPY --from=client-builder /code/client/dist/ /code/client/dist/
 COPY ./config.example.yaml /code/config.example.yaml
 COPY ./THIRD_PARTY_LICENSES.md /tmp/BASE_THIRD_PARTY_LICENSES.md
@@ -739,3 +744,74 @@ ENV HOME=/home/konomitv
 USER konomitv:konomitv
 
 ENTRYPOINT ["/code/server/.venv/bin/python", "KonomiTV.py"]
+
+# --------------------------------------------------------------------------------------------------------------
+# クライアントの非変更型 lint・型検査・単体試験・ライセンス試験を実行するステージ
+# --------------------------------------------------------------------------------------------------------------
+
+FROM client-builder AS client-verify
+
+RUN yarn lint:check && \
+    yarn typecheck && \
+    yarn test && \
+    yarn test:licenses && \
+    touch /tmp/konomitv-bs4k-client-verify.ok
+
+# --------------------------------------------------------------------------------------------------------------
+# サーバーの非変更型 lint・型検査・全 pytest を実行するステージ
+# --------------------------------------------------------------------------------------------------------------
+
+FROM runtime AS server-verify
+
+# runtime は非 root のまま維持し、build 中だけ C fixture の構築と開発依存導入に root を使う。
+USER root
+RUN nala update && \
+    apt-get install -y --fix-broken && \
+    apt-get install -y --no-install-recommends build-essential && \
+    command -v cc >/dev/null && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# pytest には Dockerfile・配布スクリプト・Compose policy も検査するテストがあるため、
+# 秘密とホスト状態を .dockerignore で除外した上で、verify stage にだけ必要なリポジトリ面を配置する。
+COPY ./Dockerfile ./.dockerignore ./.gitignore ./THIRD_PARTY_LICENSES.md \
+     ./docker-compose.example.yaml \
+     ./docker-compose.acp-codex-auth.yaml \
+     ./docker-compose.acp-grok-auth.yaml \
+     ./docker-compose.acp-google-adc.yaml \
+     /code/
+COPY ./docker/acp/ /code/docker/acp/
+COPY ./docker/opencode/ /code/docker/opencode/
+COPY ./docker/thirdparty/ /code/docker/thirdparty/
+COPY ./docker/ts-codec-bridge/ /code/docker/ts-codec-bridge/
+COPY ./server/ /code/server/
+# Python 側のライセンス generator 試験も Node.js package tree を検証するため、client-builder を共有する。
+COPY --from=client-builder /code/client/ /code/client/
+
+RUN /code/server/thirdparty/Python/bin/python -m poetry install --with dev --no-root && \
+    /code/server/thirdparty/Python/bin/python -m poetry run task lint-check && \
+    /code/server/thirdparty/Python/bin/python -m poetry run task test && \
+    touch /tmp/konomitv-bs4k-server-verify.ok
+
+# --------------------------------------------------------------------------------------------------------------
+# サーバー・クライアント双方の検証成功を集約するステージ
+# --------------------------------------------------------------------------------------------------------------
+
+FROM server-verify AS verify
+
+COPY --from=client-verify /tmp/konomitv-bs4k-client-verify.ok /tmp/konomitv-bs4k-client-verify.ok
+RUN test -f /tmp/konomitv-bs4k-server-verify.ok && \
+    test -f /tmp/konomitv-bs4k-client-verify.ok && \
+    touch /tmp/konomitv-bs4k-verify.ok
+
+# --------------------------------------------------------------------------------------------------------------
+# verify 成功を build 依存関係に持つ、開発者向けの検証済み runtime ステージ
+# --------------------------------------------------------------------------------------------------------------
+
+FROM runtime AS verified-runtime
+
+# verify の marker は read-only mount で確認し、完成イメージへテストや開発依存をコピーしない。
+RUN --mount=type=bind,from=verify,source=/tmp/konomitv-bs4k-verify.ok,target=/tmp/konomitv-bs4k-verify.ok \
+    test -f /tmp/konomitv-bs4k-verify.ok
+
+# target 未指定の既存 Compose build は従来どおり公開用 runtime を生成する。
+FROM runtime AS default-runtime

@@ -2,15 +2,17 @@
 # config.yaml: ホスト側のファイルを利用するため不要
 config.yaml
 
+# Git metadata: バージョン判定は実行時の read-only source tree bind mount を利用する
+.git/
+
 # node_modules: ファイル数が多すぎてコピーに時間がかかる
 client/node_modules/
 
+# ホスト側の既存 build 成果物: Docker 内で再生成する
+client/dist/
+
 # poetry の仮想環境: Docker 上で新たに作り直すため不要
 server/.venv/
-
-# 自動テスト: Git とローカル検証で利用し、Docker のビルドコンテキスト・実行イメージには含めない
-server/tests/
-client/scripts/*.test.mjs
 
 # Python のテスト・実行時キャッシュ: ホスト環境の生成物をコンテナへ持ち込まない
 **/__pycache__/
@@ -21,6 +23,9 @@ client/scripts/*.test.mjs
 
 # データベース: マイグレーションに失敗するのを防ぐ
 server/data/*
+
+# サーバーログ: ホスト側の既存ログを build context へ含めない
+server/logs/*
 
 # ACP / Google のホスト資格情報は配置場所にかかわらず build context へ含めない
 **/.codex/

@@ -25,6 +25,32 @@ ACP_AUTH_OVERRIDE_EXPECTATIONS = {
 }
 
 
+def _GetDockerfileStageLines(stage_name: str) -> list[str]:
+    """Dockerfile から指定した名前付き stage の行だけを返す。
+
+    Args:
+        stage_name (str): `FROM ... AS` で指定された stage 名。
+
+    Returns:
+        list[str]: stage の FROM から次の FROM 直前までの行。
+    """
+
+    dockerfile_lines = (REPOSITORY_ROOT / 'Dockerfile').read_text(encoding='utf-8').splitlines()
+    stage_start_index = next(
+        index
+        for index, line in enumerate(dockerfile_lines)
+        if re.search(rf'\sAS\s+{re.escape(stage_name)}$', line, flags=re.IGNORECASE)
+    )
+    stage_end_index = next(
+        (
+            index for index in range(stage_start_index + 1, len(dockerfile_lines))
+            if dockerfile_lines[index].startswith('FROM ')
+        ),
+        len(dockerfile_lines),
+    )
+    return dockerfile_lines[stage_start_index:stage_end_index]
+
+
 def _load_compose_service(compose_filename: str) -> dict[str, Any]:
     """
     Compose ファイルから konomitv サービス定義を読み込む。
@@ -41,24 +67,80 @@ def _load_compose_service(compose_filename: str) -> dict[str, Any]:
     return cast(dict[str, Any], compose['services']['konomitv'])
 
 
-def test_final_image_runs_as_non_root_user() -> None:
+def test_runtime_image_runs_as_non_root_user() -> None:
     """
-    final Docker stage が専用 USER を ENTRYPOINT より前に設定していることを検証する。
+    公開用 runtime stage が専用 USER を ENTRYPOINT より前に設定していることを検証する。
 
     Returns:
         None
     """
 
-    dockerfile_lines = (REPOSITORY_ROOT / 'Dockerfile').read_text(encoding='utf-8').splitlines()
-    final_stage_index = max(index for index, line in enumerate(dockerfile_lines) if line.startswith('FROM '))
-    final_stage_lines = dockerfile_lines[final_stage_index:]
-    user_indexes = [index for index, line in enumerate(final_stage_lines) if line.startswith('USER ')]
-    entrypoint_index = next(index for index, line in enumerate(final_stage_lines) if line.startswith('ENTRYPOINT '))
+    runtime_stage_lines = _GetDockerfileStageLines('runtime')
+    user_indexes = [index for index, line in enumerate(runtime_stage_lines) if line.startswith('USER ')]
+    entrypoint_index = next(index for index, line in enumerate(runtime_stage_lines) if line.startswith('ENTRYPOINT '))
 
     assert len(user_indexes) == 1
     assert user_indexes[0] < entrypoint_index
-    assert final_stage_lines[user_indexes[0]] not in {'USER root', 'USER 0', 'USER 0:0'}
-    assert any(line == 'ENV HOME=/home/konomitv' for line in final_stage_lines)
+    assert runtime_stage_lines[user_indexes[0]] not in {'USER root', 'USER 0', 'USER 0:0'}
+    assert any(line == 'ENV HOME=/home/konomitv' for line in runtime_stage_lines)
+
+
+def test_dockerfile_separates_runtime_and_verification_targets() -> None:
+    """検証をruntimeのbuild依存にでき、開発依存とテストを完成imageへ持ち込まない構造を検証する。
+
+    Returns:
+        None
+    """
+
+    dockerfile = (REPOSITORY_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+    runtime_stage = '\n'.join(_GetDockerfileStageLines('runtime'))
+    client_verify_stage = '\n'.join(_GetDockerfileStageLines('client-verify'))
+    server_verify_stage = '\n'.join(_GetDockerfileStageLines('server-verify'))
+    verify_stage = '\n'.join(_GetDockerfileStageLines('verify'))
+    verified_runtime_stage = '\n'.join(_GetDockerfileStageLines('verified-runtime'))
+
+    assert 'RUN --mount=type=bind,source=server' in runtime_stage
+    assert 'rm -rf /code/server/tests' in runtime_stage
+    assert 'test ! -e /code/server/tests' in runtime_stage
+    assert 'poetry install --with dev' not in runtime_stage
+    assert 'yarn lint:check' not in runtime_stage
+
+    assert client_verify_stage.startswith('FROM client-builder AS client-verify')
+    assert 'yarn lint:check' in client_verify_stage
+    assert 'yarn typecheck' in client_verify_stage
+    assert 'yarn test' in client_verify_stage
+    assert 'yarn test:licenses' in client_verify_stage
+
+    assert server_verify_stage.startswith('FROM runtime AS server-verify')
+    assert 'apt-get install -y --fix-broken' in server_verify_stage
+    assert 'apt-get install -y --no-install-recommends build-essential' in server_verify_stage
+    assert 'command -v cc >/dev/null' in server_verify_stage
+    assert 'poetry install --with dev --no-root' in server_verify_stage
+    assert 'poetry run task lint-check' in server_verify_stage
+    assert 'poetry run task test' in server_verify_stage
+
+    assert verify_stage.startswith('FROM server-verify AS verify')
+    assert 'COPY --from=client-verify' in verify_stage
+    assert verified_runtime_stage.startswith('FROM runtime AS verified-runtime')
+    assert 'type=bind,from=verify' in verified_runtime_stage
+    assert 'COPY --from=verify' not in verified_runtime_stage
+    assert dockerfile.rstrip().endswith('FROM runtime AS default-runtime')
+
+
+def test_dockerignore_excludes_host_state_but_keeps_verification_sources() -> None:
+    """巨大なホスト状態を除外しつつ、verifyに必要なテストをcontextへ残す。
+
+    Returns:
+        None
+    """
+
+    dockerignore = (REPOSITORY_ROOT / '.dockerignore').read_text(encoding='utf-8')
+
+    assert '.git/' in dockerignore
+    assert 'client/dist/' in dockerignore
+    assert 'server/logs/*' in dockerignore
+    assert 'server/tests/' not in dockerignore
+    assert 'client/scripts/*.test.mjs' not in dockerignore
 
 
 @pytest.mark.parametrize('compose_filename', COMPOSE_FILENAMES)

@@ -12,6 +12,7 @@
         "prebuild": "patch-package",
         "preview": "concurrently --raw \"npm:akebi\" \"vite preview\"",
         "lint": "eslint . --fix --ignore-path .gitignore",
+        "lint:check": "eslint . --ignore-path .gitignore",
         "test": "vitest run",
         "test:licenses": "node --test scripts/generate-license-document.test.mjs",
         "typecheck": "vue-tsc --noEmit"
