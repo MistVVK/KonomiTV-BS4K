@@ -23,27 +23,38 @@ def ConfigureCredentialPaths(
     monkeypatch: pytest.MonkeyPatch,
     temporary_directory: Path,
 ) -> tuple[Path, Path]:
-    """固定 host-auth mount と専用 profile をテスト用 directory へ差し替える。
+    """固定 host HOME mount と専用 profile をテスト用 directory へ差し替える。
 
     Args:
         monkeypatch: module 定数をテスト中だけ置き換える pytest fixture。
         temporary_directory: テスト専用の root directory。
 
     Returns:
-        tuple[Path, Path]: host-auth root と profile root。
+        tuple[Path, Path]: host HOME と profile root。
     """
 
-    host_auth_root = temporary_directory / 'host-auth'
+    host_home = temporary_directory / 'host-home'
     profiles_root = temporary_directory / 'profiles'
     host_auth_paths = {
-        'codex': host_auth_root / 'codex' / 'auth.json',
-        'grok': host_auth_root / 'grok' / 'auth.json',
-        'google': host_auth_root / 'google' / 'application_default_credentials.json',
+        'codex': host_home / '.codex' / 'auth.json',
+        'grok': host_home / '.grok' / 'auth.json',
+        'google': host_home / '.config' / 'gcloud' / 'application_default_credentials.json',
     }
-    monkeypatch.setattr(ACPCredentials, '_KONOMITV_BS4K_HOST_AUTH_ROOT', host_auth_root)
+    monkeypatch.setattr(ACPCredentials, '_KONOMITV_BS4K_HOST_HOME', host_home)
     monkeypatch.setattr(ACPCredentials, '_KONOMITV_BS4K_HOST_AUTH_PATHS', host_auth_paths)
     monkeypatch.setattr(ACPCredentials, '_KONOMITV_BS4K_ACP_PROFILES_ROOT', profiles_root)
-    return host_auth_root, profiles_root
+    return host_home, profiles_root
+
+
+def test_host_auth_paths_use_standard_locations_below_host_home() -> None:
+    """追加の Compose 変数なしで、各 CLI の標準資格情報を固定 host HOME から検出する。"""
+
+    assert ACPCredentials._KONOMITV_BS4K_HOST_HOME == Path('/host-home')
+    assert ACPCredentials._KONOMITV_BS4K_HOST_AUTH_PATHS == {
+        'codex': Path('/host-home/.codex/auth.json'),
+        'grok': Path('/host-home/.grok/auth.json'),
+        'google': Path('/host-home/.config/gcloud/application_default_credentials.json'),
+    }
 
 
 def WriteCredential(path: Path, value: str) -> None:
@@ -251,7 +262,7 @@ def test_delete_removes_only_konomitv_bs4k_copy_and_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """削除は専用コピーだけを対象とし、host-auth mount を変更しない。"""
+    """削除は専用コピーだけを対象とし、host HOME mount を変更しない。"""
 
     ConfigureCredentialPaths(monkeypatch, tmp_path)
     source_path = ACPCredentials._KONOMITV_BS4K_HOST_AUTH_PATHS['codex']

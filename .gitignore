@@ -155,9 +155,7 @@ cython_debug/
 # config.yaml
 config.yaml
 
-# ローカル Compose
-docker-compose.yaml
-compose.override.yaml
+# Development のローカル状態
 docker/development/state/
 
 # user files

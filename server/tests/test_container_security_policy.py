@@ -7,22 +7,8 @@ import ruamel.yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-# compose.yaml は公開・新メインの正本。docker-compose.example.yaml も移行期間中は同じ安全契約を保つ。
-COMPOSE_FILENAMES = ['compose.yaml', 'docker-compose.example.yaml']
-ACP_AUTH_OVERRIDE_EXPECTATIONS = {
-    'docker-compose.acp-codex-auth.yaml': (
-        '${KONOMITV_BS4K_CODEX_AUTH_FILE:',
-        '/run/konomitv-bs4k-host-auth/codex/auth.json',
-    ),
-    'docker-compose.acp-grok-auth.yaml': (
-        '${KONOMITV_BS4K_GROK_AUTH_FILE:',
-        '/run/konomitv-bs4k-host-auth/grok/auth.json',
-    ),
-    'docker-compose.acp-google-adc.yaml': (
-        '${KONOMITV_BS4K_GOOGLE_ADC_FILE:',
-        '/run/konomitv-bs4k-host-auth/google/application_default_credentials.json',
-    ),
-}
+# 公開・Main と Development は独立した完全な Compose とし、同じホストパス契約を保つ。
+COMPOSE_FILENAMES = ['compose.yaml', 'compose.development.yaml']
 
 
 def _GetDockerfileStageLines(stage_name: str) -> list[str]:
@@ -67,8 +53,8 @@ def _load_compose_service(compose_filename: str) -> dict[str, Any]:
     return cast(dict[str, Any], compose['services']['konomitv'])
 
 
-def test_public_compose_uses_runtime_target_and_main_identifiers() -> None:
-    """公開 Compose が新メイン専用の識別子と runtime target を正本にする。
+def test_public_compose_uses_runtime_target_and_public_identifiers() -> None:
+    """公開 Compose が一般配布用の識別子と runtime target を正本にする。
 
     Returns:
         None
@@ -79,9 +65,9 @@ def test_public_compose_uses_runtime_target_and_main_identifiers() -> None:
     service = cast(dict[str, Any], compose['services']['konomitv'])
     build = cast(dict[str, Any], service['build'])
 
-    assert compose['name'] == 'konomitv-bs4k-main'
-    assert service['image'] == 'konomitv-bs4k-main'
-    assert service['container_name'] == 'KonomiTV-BS4K-Main'
+    assert compose['name'] == 'konomitv-bs4k'
+    assert service['image'] == 'konomitv-bs4k'
+    assert service['container_name'] == 'KonomiTV-BS4K'
     assert build['context'] == '.'
     assert build['target'] == 'runtime'
 
@@ -166,9 +152,8 @@ def test_dockerignore_excludes_host_state_but_keeps_verification_sources() -> No
 
 
 @pytest.mark.parametrize('compose_filename', COMPOSE_FILENAMES)
-def test_compose_does_not_bind_host_root_or_entire_host_rootfs(compose_filename: str) -> None:
-    """
-    Compose policy が host / と /host-rootfs 全体の bind mount を禁止していることを検証する。
+def test_compose_mounts_host_root_for_host_path_compatibility(compose_filename: str) -> None:
+    """config.yaml のホスト絶対パスをそのまま使えるよう、host / 全体を mount する。
 
     Args:
         compose_filename (str): 検査対象の Compose ファイル名
@@ -178,23 +163,18 @@ def test_compose_does_not_bind_host_root_or_entire_host_rootfs(compose_filename:
     """
 
     service = _load_compose_service(compose_filename)
-    volumes = cast(list[dict[str, Any] | str], service['volumes'])
+    volumes = cast(list[dict[str, Any]], service['volumes'])
+    host_root_mounts = [volume for volume in volumes if str(volume['target']).rstrip('/') == '/host-rootfs']
 
-    for volume in volumes:
-        assert isinstance(volume, dict)
-        source = str(volume['source'])
-        target = str(volume['target'])
-
-        # host ルートそのもの、および空 source を禁止する
-        assert source not in {'', '/'}
-        assert source.rstrip('/') != ''
-
-        # /host-rootfs 全体ではなく、必要な部分 path だけを許可する
-        ## 実 compose は `/host-rootfs${KONOMITV_RECORDED_FOLDER:-/mnt/TV-Record}` 形式も使う
-        if target.startswith('/host-rootfs'):
-            assert target.rstrip('/') != '/host-rootfs'
-            assert len(target) > len('/host-rootfs')
-            assert target[len('/host-rootfs'):] not in {'', '/'}
+    assert len(host_root_mounts) == 1
+    assert host_root_mounts[0]['type'] == 'bind'
+    assert host_root_mounts[0]['source'] == '/'
+    assert host_root_mounts[0].get('read_only') is not True
+    assert all(
+        str(volume['target']).startswith('/host-rootfs/') is False
+        for volume in volumes
+        if volume is not host_root_mounts[0]
+    )
 
     # root 実行を既定で禁止する。UID 変数展開後も 0:0 リテラルは拒否する
     user = str(service['user'])
@@ -203,9 +183,8 @@ def test_compose_does_not_bind_host_root_or_entire_host_rootfs(compose_filename:
 
 
 @pytest.mark.parametrize('compose_filename', COMPOSE_FILENAMES)
-def test_compose_keeps_source_tree_read_only_and_uses_explicit_host_mounts(compose_filename: str) -> None:
-    """
-    source tree を read-only に保ち、host path は必要な個別 mount だけに限定する。
+def test_compose_keeps_source_tree_and_host_home_read_only(compose_filename: str) -> None:
+    """source tree と認証検出用の host HOME を read-only に保つ。
 
     Args:
         compose_filename (str): 検査対象の Compose ファイル名
@@ -217,27 +196,20 @@ def test_compose_keeps_source_tree_read_only_and_uses_explicit_host_mounts(compo
     service = _load_compose_service(compose_filename)
     volumes = cast(list[dict[str, Any]], service['volumes'])
     source_tree_mount = next(volume for volume in volumes if volume['target'] == '/code/source-tree/')
-    host_mounts = [volume for volume in volumes if str(volume['target']).startswith('/host-rootfs')]
+    host_home_mount = next(volume for volume in volumes if str(volume['target']).rstrip('/') == '/host-home')
 
     assert source_tree_mount['read_only'] is True
-
-    # 録画・Capture など 1 つ以上の個別 mount を要求し、件数上限は設けない
-    assert len(host_mounts) >= 1
-    for volume in host_mounts:
-        target = str(volume['target'])
-        assert target.startswith('/host-rootfs')
-        assert target.rstrip('/') != '/host-rootfs'
-        assert len(target) > len('/host-rootfs')
-        assert target[len('/host-rootfs'):] not in {'', '/'}
-        assert volume.get('bind', {}).get('create_host_path') is False
-        # SELinux enforcing host 向けに shared label z を要求する (root 全体の :Z は禁止)
-        assert volume.get('bind', {}).get('selinux') == 'z'
+    assert host_home_mount['type'] == 'bind'
+    assert host_home_mount['source'] == '${HOME}'
+    assert host_home_mount['read_only'] is True
+    assert service['environment']['GOOGLE_APPLICATION_CREDENTIALS'] == (
+        '/host-home/.config/gcloud/application_default_credentials.json'
+    )
 
 
 @pytest.mark.parametrize('compose_filename', COMPOSE_FILENAMES)
-def test_compose_bind_mounts_use_shared_selinux_label_z(compose_filename: str) -> None:
-    """
-    個別 bind mount が SELinux shared label z を持ち、host root を mount しないことを検証する。
+def test_compose_only_relabels_repository_bind_mounts(compose_filename: str) -> None:
+    """host root と HOME を relabel せず、リポジトリ内 bind だけ shared label z にする。
 
     Args:
         compose_filename (str): 検査対象の Compose ファイル名
@@ -250,53 +222,48 @@ def test_compose_bind_mounts_use_shared_selinux_label_z(compose_filename: str) -
     volumes = cast(list[dict[str, Any]], service['volumes'])
 
     for volume in volumes:
-        assert isinstance(volume, dict)
-        source = str(volume['source'])
-        assert source not in {'', '/'}
         bind = cast(dict[str, Any], volume.get('bind') or {})
-        # 全 bind に shared label z（private Z や root 全体 mount は使わない）
-        assert bind.get('selinux') == 'z'
+        if str(volume['target']).rstrip('/') in {'/host-rootfs', '/host-home'}:
+            assert bind.get('selinux') is None
+        else:
+            assert bind.get('selinux') == 'z'
 
 
 @pytest.mark.parametrize('compose_filename', COMPOSE_FILENAMES)
-def test_base_compose_does_not_require_or_mount_acp_credentials(compose_filename: str) -> None:
-    """認証 backend を使わない基本 Compose は host-auth mount なしで成立する。"""
+def test_compose_does_not_require_individual_host_path_variables(compose_filename: str) -> None:
+    """公開・Development Compose は個別の録画・Capture・認証 path 変数を要求しない。"""
 
-    service = _load_compose_service(compose_filename)
-    volumes = cast(list[dict[str, Any]], service['volumes'])
+    compose_text = REPOSITORY_ROOT.joinpath(compose_filename).read_text(encoding='utf-8')
 
-    assert all(
-        str(volume['target']).startswith('/run/konomitv-bs4k-host-auth/') is False
-        for volume in volumes
-    )
+    assert 'KONOMITV_RECORDED_FOLDER' not in compose_text
+    assert 'KONOMITV_CAPTURE_FOLDER' not in compose_text
+    assert 'KONOMITV_BS4K_CODEX_AUTH_FILE' not in compose_text
+    assert 'KONOMITV_BS4K_GROK_AUTH_FILE' not in compose_text
+    assert 'KONOMITV_BS4K_GOOGLE_ADC_FILE' not in compose_text
+    assert '/run/konomitv-bs4k-host-auth' not in compose_text
 
 
-@pytest.mark.parametrize(
-    'compose_filename,expected',
-    ACP_AUTH_OVERRIDE_EXPECTATIONS.items(),
-)
-def test_acp_auth_override_mounts_exactly_one_fixed_read_only_file(
-    compose_filename: str,
-    expected: tuple[str, str],
-) -> None:
-    """provider override は絶対 path 変数の単一ファイルだけを固定 target へ read-only mount する。"""
+def test_nvidia_compose_contains_all_nvidia_runtime_settings() -> None:
+    """公開・Developmentで共有するoverlayにNVIDIA runtime設定を集約する。"""
 
-    expected_source_prefix, expected_target = expected
-    service = _load_compose_service(compose_filename)
-    volumes = cast(list[dict[str, Any]], service['volumes'])
+    service = _load_compose_service('compose.nvidia.yaml')
+    environment = cast(dict[str, str], service['environment'])
+    devices = cast(list[dict[str, Any]], service['deploy']['resources']['reservations']['devices'])
 
-    assert len(volumes) == 1
-    volume = volumes[0]
-    source = str(volume['source'])
-    target = str(volume['target'])
-    assert source.startswith(expected_source_prefix)
-    assert target == expected_target
-    assert volume['type'] == 'bind'
-    assert volume['read_only'] is True
-    assert volume['bind']['create_host_path'] is False
-    assert volume['bind']['selinux'] == 'z'
-    assert source not in {'/', '/home', '~/.codex', '~/.grok', '~/.config/gcloud'}
-    assert target.startswith('/host-rootfs') is False
+    assert environment == {
+        'NVIDIA_VISIBLE_DEVICES': 'all',
+        'NVIDIA_DRIVER_CAPABILITIES': 'compute,utility,video',
+    }
+    assert devices == [{
+        'driver': 'nvidia',
+        'count': 'all',
+        'capabilities': ['compute', 'utility', 'video'],
+    }]
+    for compose_filename in COMPOSE_FILENAMES:
+        compose_text = REPOSITORY_ROOT.joinpath(compose_filename).read_text(encoding='utf-8')
+        assert 'NVIDIA_VISIBLE_DEVICES' not in compose_text
+        assert 'NVIDIA_DRIVER_CAPABILITIES' not in compose_text
+        assert 'driver: nvidia' not in compose_text
 
 
 def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> None:
@@ -548,11 +515,29 @@ def test_authentication_files_are_excluded_from_build_context_and_git(ignore_fil
     assert '**/application_default_credentials.json' in ignore_content
 
 
-def test_local_compose_overrides_are_gitignored() -> None:
-    """旧環境と環境固有の Compose override を Git 管理外に保つ。"""
+def test_compose_entrypoints_are_explicit() -> None:
+    """公開版と Development の完全な Compose だけを正本にし、暗黙のローカル override を残さない。"""
 
     gitignore = (REPOSITORY_ROOT / '.gitignore').read_text(encoding='utf-8')
-    assert re.search(r'(?m)^docker-compose\.yaml$', gitignore) is not None
-    assert re.search(r'(?m)^compose\.override\.yaml$', gitignore) is not None
+    assert re.search(r'(?m)^docker-compose\.yaml$', gitignore) is None
+    assert re.search(r'(?m)^compose\.override\.yaml$', gitignore) is None
     assert (REPOSITORY_ROOT / 'compose.yaml').is_file()
-    assert (REPOSITORY_ROOT / 'docker-compose.example.yaml').is_file()
+    assert (REPOSITORY_ROOT / 'compose.development.yaml').is_file()
+    assert (REPOSITORY_ROOT / 'compose.nvidia.yaml').is_file()
+    assert (REPOSITORY_ROOT / 'docker-compose.example.yaml').exists() is False
+
+
+def test_public_env_example_exposes_all_host_specific_compose_settings() -> None:
+    """実際の .env を追跡せず、利用者が変更する全Compose変数をexampleで公開する。"""
+
+    gitignore = (REPOSITORY_ROOT / '.gitignore').read_text(encoding='utf-8')
+    env_example = (REPOSITORY_ROOT / '.env.example').read_text(encoding='utf-8')
+
+    assert re.search(r'(?m)^\.env$', gitignore) is not None
+    assert 'COMPOSE_FILE=compose.yaml' in env_example
+    assert 'KONOMITV_UID=1000' in env_example
+    assert 'KONOMITV_GID=1000' in env_example
+    assert 'KONOMITV_VIDEO_GID=44' in env_example
+    assert 'KONOMITV_RENDER_GID=992' in env_example
+    assert 'KONOMITV_CUDA_VERSION=12.4' in env_example
+    assert 'KONOMITV_NONFREE=true' in env_example

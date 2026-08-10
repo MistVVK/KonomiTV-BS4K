@@ -424,34 +424,18 @@ RUN curl -fsSL https://fastly.linuxmint.io/pool/main/l/linuxmint-keyring/linuxmi
     apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/*
 
 # ACP adapter / Codex / Gemini / Grok は公式 npm package と lockfile integrity で固定する。
-# Google Cloud CLI は完成イメージへコピーせず、Gemini は host ADC の read-only mount だけを参照する。
+# Google Cloud CLI は完成イメージへコピーせず、Gemini は host HOME の read-only mount にある ADC だけを参照する。
 #
-# ----- ACP ホスト認証（イメージには含めない。実行時 bind mount 必須）-----
+# ----- ACP ホスト認証（イメージには含めない）-----
 # Dockerfile / イメージ内に auth.json や ADC を焼き込まない。
-# 録画シリーズ設定 UI の「検出済み / 未検出」は、コンテナ内の次の固定 path の読取り可否だけを見る。
+# Compose が host HOME を /host-home へ read-only mount し、録画シリーズ設定 UI の
+# 「検出済み / 未検出」は、コンテナ内の次の標準 path の読取り可否だけを見る。
 #
-#   Codex:  /run/konomitv-bs4k-host-auth/codex/auth.json
-#   Grok:   /run/konomitv-bs4k-host-auth/grok/auth.json
-#   Google: /run/konomitv-bs4k-host-auth/google/application_default_credentials.json
+#   Codex:  /host-home/.codex/auth.json
+#   Grok:   /host-home/.grok/auth.json
+#   Google: /host-home/.config/gcloud/application_default_credentials.json
 #
-# 起動時にホストの認証ファイルを上記 target へ read-only bind する。
-# リポジトリ同梱の差分 Compose（任意）:
-#   docker-compose.acp-codex-auth.yaml   … KONOMITV_BS4K_CODEX_AUTH_FILE
-#   docker-compose.acp-grok-auth.yaml    … KONOMITV_BS4K_GROK_AUTH_FILE
-#   docker-compose.acp-google-adc.yaml   … KONOMITV_BS4K_GOOGLE_ADC_FILE
-#
-# 例（ホストの file 認証を使う場合）:
-#   export KONOMITV_BS4K_CODEX_AUTH_FILE="$HOME/.codex/auth.json"
-#   export KONOMITV_BS4K_GROK_AUTH_FILE="$HOME/.grok/auth.json"
-#   export KONOMITV_BS4K_GOOGLE_ADC_FILE="$HOME/.config/gcloud/application_default_credentials.json"
-#   docker compose -f docker-compose.yaml \
-#     -f docker-compose.acp-codex-auth.yaml \
-#     -f docker-compose.acp-grok-auth.yaml \
-#     -f docker-compose.acp-google-adc.yaml \
-#     up -d
-#
-# 開発機など常に ACP を使う場合は、gitignore された docker-compose.yaml の volumes に
-# 上記 3 本を直接書いてよい（create_host_path: false / read_only / selinux: z）。
+# 各ファイルが存在しなくても Compose は起動でき、存在する provider だけを UI から利用できる。
 # Codex / Grok は UI から専用プロファイルへ「取り込み」、Google ADC は mount 読取りのみ。
 # OS keyring だけだと host に auth.json が無いことがある → cli_auth_credentials_store = "file"。
 COPY --from=acp-builder /usr/local/bin/node /usr/local/bin/node
@@ -773,12 +757,10 @@ RUN nala update && \
 
 # pytest には Dockerfile・配布スクリプト・Compose policy も検査するテストがあるため、
 # 秘密とホスト状態を .dockerignore で除外した上で、verify stage にだけ必要なリポジトリ面を配置する。
-COPY ./Dockerfile ./.dockerignore ./.gitignore ./THIRD_PARTY_LICENSES.md \
+COPY ./Dockerfile ./.dockerignore ./.gitignore ./.env.example ./THIRD_PARTY_LICENSES.md \
      ./compose.yaml \
-     ./docker-compose.example.yaml \
-     ./docker-compose.acp-codex-auth.yaml \
-     ./docker-compose.acp-grok-auth.yaml \
-     ./docker-compose.acp-google-adc.yaml \
+     ./compose.development.yaml \
+     ./compose.nvidia.yaml \
      /code/
 COPY ./docker/acp/ /code/docker/acp/
 COPY ./docker/opencode/ /code/docker/opencode/

@@ -1,30 +1,31 @@
-name: konomitv-bs4k
+name: konomitv-bs4k-development
 
 services:
   konomitv:
-    image: konomitv-bs4k
-    container_name: KonomiTV-BS4K
+    image: konomitv-bs4k-development
+    container_name: KonomiTV-BS4K-Development
     build:
       context: .
-      target: runtime
+      target: verified-runtime
       args:
         CUDA_VERSION: '${KONOMITV_CUDA_VERSION:-12.4}'
         NONFREE: '${KONOMITV_NONFREE:-true}'
         KONOMITV_UID: '${KONOMITV_UID:-1000}'
         KONOMITV_GID: '${KONOMITV_GID:-1000}'
 
-    # bind mount 先の所有者と一致する非 root UID/GID で実行する。
     user: '${KONOMITV_UID:-1000}:${KONOMITV_GID:-1000}'
     group_add:
       - '${KONOMITV_VIDEO_GID:-44}'
       - '${KONOMITV_RENDER_GID:-109}'
-    restart: always
+    restart: unless-stopped
     network_mode: host
+    mem_limit: 8g
+    memswap_limit: 8g
     environment:
       KONOMITV_BS4K_SOURCE_TREE: '/code/source-tree'
       GOOGLE_APPLICATION_CREDENTIALS: '/host-home/.config/gcloud/application_default_credentials.json'
+      OPENCODE_ENABLE_EXA: '1'
 
-    # Docker は配布用ビルドと実行環境の固定に使い、config.yaml にはホスト側の絶対パスをそのまま記述する。
     volumes:
       - type: bind
         source: './'
@@ -33,31 +34,27 @@ services:
         bind:
           selinux: z
       - type: bind
-        source: './config.yaml'
+        source: './docker/development/state/config.yaml'
         target: '/code/config.yaml'
         bind:
           selinux: z
       - type: bind
-        source: './server/data/'
+        source: './docker/development/state/data/'
         target: '/code/server/data/'
         bind:
           selinux: z
       - type: bind
-        source: './server/logs/'
+        source: './docker/development/state/logs/'
         target: '/code/server/logs/'
         bind:
           selinux: z
       - type: bind
         source: '/'
         target: '/host-rootfs/'
-      # ACP 認証は、存在が任意の各ファイルではなく必ず存在する HOME を固定パスへ read-only mount して検出する。
       - type: bind
         source: '${HOME}'
         target: '/host-home/'
         read_only: true
 
-    # Intel QSVとAMD VAAPI/AMFを使用しない環境では、この項目をローカルoverrideで無効化する。
     devices:
       - '/dev/dri/:/dev/dri/'
-
-    # NVIDIA NVENCを使用する場合は、compose.nvidia.yamlを組み合わせる。

@@ -1,8 +1,8 @@
 """KonomiTV-BS4K 録画シリーズ ACP の資格情報管理。
 
 Codex / Grok Build のホスト生成済み ``auth.json`` は、Docker Compose が
-固定パスへ読み取り専用 mount したファイルだけを明示操作時に取り込む。
-Gemini CLI の Google ADC はコピーせず、同じ固定 mount の読取り可否だけを確認する。
+固定パスへ読み取り専用 mount したホスト HOME から明示操作時に取り込む。
+Gemini CLI の Google ADC はコピーせず、同じ HOME 内の読取り可否だけを確認する。
 """
 
 from __future__ import annotations
@@ -23,11 +23,11 @@ from app.constants import DATA_DIR
 
 KonomiTVBS4KACPImportProvider = Literal['codex', 'grok']
 
-_KONOMITV_BS4K_HOST_AUTH_ROOT = Path('/run/konomitv-bs4k-host-auth')
+_KONOMITV_BS4K_HOST_HOME = Path('/host-home')
 _KONOMITV_BS4K_HOST_AUTH_PATHS: dict[str, Path] = {
-    'codex': _KONOMITV_BS4K_HOST_AUTH_ROOT / 'codex' / 'auth.json',
-    'grok': _KONOMITV_BS4K_HOST_AUTH_ROOT / 'grok' / 'auth.json',
-    'google': _KONOMITV_BS4K_HOST_AUTH_ROOT / 'google' / 'application_default_credentials.json',
+    'codex': _KONOMITV_BS4K_HOST_HOME / '.codex' / 'auth.json',
+    'grok': _KONOMITV_BS4K_HOST_HOME / '.grok' / 'auth.json',
+    'google': _KONOMITV_BS4K_HOST_HOME / '.config' / 'gcloud' / 'application_default_credentials.json',
 }
 _KONOMITV_BS4K_ACP_PROFILES_ROOT = DATA_DIR / 'acp-profiles' / 'recorded-series'
 _KONOMITV_BS4K_AUTH_FILENAME = 'auth.json'
@@ -66,7 +66,7 @@ class KonomiTVBS4KACPCredentialStatus:
 
 
 class KonomiTVBS4KACPCredentials:
-    """固定 mount と KonomiTV-BS4K 専用コピーの間だけで資格情報を管理する。"""
+    """ホスト HOME の固定 mount と KonomiTV-BS4K 専用コピーの間だけで資格情報を管理する。"""
 
     # 同一プロセス内の import / delete / status を直列化し、marker と auth.json の観測を一貫させる。
     _lock = threading.RLock()

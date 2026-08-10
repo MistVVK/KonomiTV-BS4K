@@ -1966,7 +1966,7 @@ def test_acp_process_environment_uses_allowlist_and_drops_parent_sentinels(
 
     environment = AcpClient._build_process_environment({
         'HOME': '/data/acp-profiles/recorded-series/codex',
-        'GOOGLE_APPLICATION_CREDENTIALS': '/run/konomitv-bs4k-host-auth/google/application_default_credentials.json',
+        'GOOGLE_APPLICATION_CREDENTIALS': '/host-home/.config/gcloud/application_default_credentials.json',
         'GOOGLE_CLOUD_PROJECT': 'test-project',
         'PATH': '/should/not/override',
     })
@@ -1977,7 +1977,7 @@ def test_acp_process_environment_uses_allowlist_and_drops_parent_sentinels(
     assert environment['LC_ALL'] == AcpClient._ACP_BASE_ENV['LC_ALL']
     assert environment['TZ'] == AcpClient._ACP_BASE_ENV['TZ']
     assert environment['HOME'] == '/data/acp-profiles/recorded-series/codex'
-    assert environment['GOOGLE_APPLICATION_CREDENTIALS'].startswith('/run/konomitv-bs4k-host-auth/')
+    assert environment['GOOGLE_APPLICATION_CREDENTIALS'].startswith('/host-home/')
     assert environment['GOOGLE_CLOUD_PROJECT'] == 'test-project'
 
     # 親 sentinel は一切渡らない

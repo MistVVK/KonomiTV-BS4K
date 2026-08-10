@@ -2,7 +2,7 @@
 # config.yaml: ホスト側のファイルを利用するため不要
 config.yaml
 
-# 環境固有の Compose 変数・override: 認証ファイルの場所などを build context へ含めない
+# 環境固有の Compose 変数・override を build context へ含めない
 .env
 compose.override.yaml
 
