@@ -321,7 +321,7 @@ class TestRunUnexpectedErrorCleanup:
         task.isFullHDChannel = lambda network_id, service_id: False  # type: ignore[method-assign]
         task.buildFFmpegOptions = lambda *args: ['-x']  # type: ignore[method-assign]
         task.IsTSCodecBridgeRequired = lambda is_radiochannel=False: bridge_required  # type: ignore[method-assign]
-        task.BuildTSCodecBridgeOptions = lambda is_radiochannel=False: ['--x']  # type: ignore[method-assign]
+        task.BuildTSCodecBridgeOptions = lambda is_radiochannel=False, is_oneseg=False: ['--x']  # type: ignore[method-assign]
         return task, spawned, live_stream
 
     def test_mirakurun_unexpected_error_cleans_up_all_processes_and_session(

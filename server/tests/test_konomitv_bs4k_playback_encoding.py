@@ -51,9 +51,9 @@ class _LiveChannelQuery:
         self.is_radiochannel = is_radiochannel
 
     async def get_or_none(self) -> SimpleNamespace:
-        """ラジオ種別だけを持つチャンネル代替を返す。"""
+        """ラジオ・ワンセグ種別を持つチャンネル代替を返す。"""
 
-        return SimpleNamespace(is_radiochannel = self.is_radiochannel)
+        return SimpleNamespace(is_radiochannel = self.is_radiochannel, is_oneseg = False)
 
 
 @pytest.fixture(autouse = True)
