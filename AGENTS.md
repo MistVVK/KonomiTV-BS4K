@@ -25,38 +25,38 @@
 
 ## 開発環境構成
 
-### サーバー API (port 7000、常にユーザー管理)
+### 基本方針
 
-- 依頼を受けた時点で、サーバー API は次のいずれかの状態で常駐しています。**いずれもユーザーが管理しているプロセスであり、エージェントが直接起動・停止すべきではありません**
-  - **リロードモード**: `server/` で `poetry run task dev` で起動。コード変更が hot reload されます。基本的にこの状態で依頼が来ます
-  - **リロードなしの開発サーバー**: `server/` で `poetry run task serve` で起動。hot reload なしのユーザー権限プロセスです
-  - **pm2 常駐**: `sudo pm2 start KonomiTV` で起動。KonomiTV は root 側の pm2 プロファイルにしかインストールされていないため、`pm2` コマンドの実行には必ず `sudo` が必要であり、**エージェントがユーザーの許可なく `pm2` を実行することはできません**
-- FastAPI の listen ポートは常に 7000 で固定です (Akebi HTTPS Server が `127.0.0.77:7010` をリバースプロキシしています)
-- サーバー側コードを変更して挙動を確認したい場合の手順:
-  - リロードモードで動いている場合は、変更が自動で反映されます
-  - リロードなし開発サーバー / pm2 常駐で動いている場合は、**ユーザーに「リロードモードでの起動への切り替え、もしくはサーバー再起動」を依頼してください**
-- エージェントが直接 `python KonomiTV.py` や `poetry run python KonomiTV.py` を実行するのは禁止です。サーバーの起動には必ず taskipy で定義済みの `poetry run task serve` / `poetry run task dev` を使用してください (それでも、上記の通り既存プロセスとの衝突を避けるためエージェント自身が起動することは原則避けてください)
+- KonomiTV-BS4K の実行ターゲットは Docker Linux のみです。通常の開発・動作確認も Docker の Development 環境で行います
+- Main 環境と Development 環境は、コンテナ・イメージ・設定・データ・ログを分離します。片方の操作で他方の状態を変更しないでください
+- 実際のホストパス、ドメイン、IP アドレス、リバースプロキシ構成はマシン固有の指示を参照し、Git 管理下の文書やコードへ記載しないでください
+- Compose のファイル構成、起動手順、状態保護、検証方法は `AGENTS-BS4K.md` の指示に従ってください
 
-### クライアント開発サーバー (port 7001、必要ならエージェントが起動可)
+### Main 環境 (port 7000、常にユーザー管理)
 
-- クライアントの開発サーバーは普段は起動していません
-- UI を検証する必要がある場合は、`client/` で `yarn dev` をエージェントが起動して構いません
-  - 起動すると port 7001 で Akebi HTTPS Server 経由でリッスンされます (内部の Vite は `127.0.0.77:7011` でリッスンします)
-- **重複起動は禁止**です。起動前に必ず `ps -ef | grep vite` などで既存プロセスの有無を確認してください
-- `yarn dev` で起動するクライアントは、開発モード時のみ同じドメインの `:7000` のサーバー API を直接叩くようハードコードされています ([client/src/utils/Utils.ts](client/src/utils/Utils.ts) の `Utils.api_base_url` を参照)。Vite の proxy 設定は不要です
-- Chrome DevTools MCP や Playwright からの検証時は `https://my.local.konomi.tv:7001` にアクセスしてください
-- クライアント開発サーバー経由で API リクエストが想定通りに動かない場合でも、**サーバーを立て直そうとしないでください**。まず `Utils.api_base_url` の DEV 分岐の挙動を読み直し、port 7000 で動いているサーバー側の状態を `ps -ef | grep KonomiTV` などで確認してください
+- Main 環境は、動作確認済みの `main` ブランチを提供する常用環境です
+- エージェントは、ユーザーの明示的な許可なく Main コンテナを起動・停止・再起動・再構築・再設定してはいけません
+- 通常のコード変更を Main 環境で直接検証してはいけません。Development 環境で検証してから Main へ反映します
 
-### Docker 版ステージング (port 7100、別物)
+### Development 環境 (port 7100)
 
-- `/Develop/KonomiTV-Docker` 以下には別途 Docker 版のステージング環境があります (port 7100、内部 HTTP は `127.0.0.77:7110`)
-- 本リポジトリの開発環境とは独立した別プロセスです
+- このリポジトリのワークツリーを、Development イメージのビルドコンテキスト兼 Compose project の起点として使用します
+- Development 固有の設定・データ・ログ・録画ミラー・キャプチャは `docker/development/state/` 以下へ隔離します
+- コンテナ内の実行コードはイメージに格納されています。ホストのソースツリーは参照用の read-only bind であり、コード変更は hot reload されません
+- コード変更を反映するときは、検証付き Development イメージをビルドしてから Development コンテナだけを再作成します
+- エージェントは必要な動作確認のために Development 環境をビルド・再作成できますが、事前確認と状態保護に関する `AGENTS-BS4K.md` の手順を省略してはいけません
+
+### ブラウザ検証
+
+- ブラウザからは、マシン固有の指示で定義された Development URL にアクセスします
+- 検証対象の画面に表示される Git commit と、Development API が返す Git commit が現在のワークツリーと一致することを確認します
+- Main URL と Development URL を取り違えないでください
 
 ### HTTPS が必須な理由
 
 - KonomiTV はクリップボードなど Secure Context (HTTPS) でしか動作しない API を使用しています
 - localhost 以外でも正規の HTTPS で提供できるよう、Akebi HTTPS Server が `akebi.konomi.tv` の keyless server を経由してリバースプロキシを行っています
-- HTTP に直接アクセスされると Secure Context API が動かず混乱を招くため、内部の HTTP は `127.0.0.77` でリッスンする構成になっています
+- HTTP に直接アクセスされると Secure Context API が動かず混乱を招くため、内部の HTTP は loopback アドレスだけでリッスンする構成になっています
 
 ## 技術スタック
 
@@ -64,8 +64,7 @@ KonomiTV は、クライアント・サーバーアーキテクチャに基づ�
 以下の2つの主要部分で構成されています。
 
 KonomiTV が一般的な Web サービスと異なる点は、フロントエンドと API サーバーの両方が各ユーザーの PC 環境で動作する点です。
-したがって、Windows と Linux の両方で動作するように開発する必要があります。
-Windows では Windows サービス、Linux では pm2 サービスとして動作するよう設計しています。
+upstream KonomiTV は Windows と Linux の双方を対象としていますが、KonomiTV-BS4K は Docker Linux のみを対象とします。
 
 - `client/`: KonomiTV のフロントエンドアプリケーション (PWA)
   - TypeScript

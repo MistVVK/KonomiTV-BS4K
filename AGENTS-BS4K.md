@@ -7,7 +7,14 @@ AGENTS.mdよりもAGENTS-BS4K.mdに記載された事項のほうが優先され
 
 ### ブラウザ検証
 
-UIなどのデバッグでwebブラウザを使用するときは、 `Chrome DevTools MCP` と `Playwright(Firefox)` の双方で動作確認する。
+UI などのデバッグで Web ブラウザを使用するときは、`Chrome DevTools MCP` と Firefox (`Playwright` または `Firefox DevTools MCP`) の双方で動作確認する。
+実際の検証 URL はマシン固有の指示を参照し、Git 管理下のファイルへ記載しない。
+
+### 公開情報の保護
+
+- 実ドメイン、個人ホームの絶対パス、ローカル IP アドレス、リバースプロキシ設定など、マシン固有の情報を Git 管理下の文書・コード・コミットへ含めない。
+- マシン固有の Main / Development URL と配置場所は、Git 管理外のユーザー指示を参照する。
+- push 前には、origin に存在しないコミットと未コミット差分を対象に、これらの情報が混入していないことを確認する。
 
 ### 製品名・識別子の命名規則
 
@@ -55,7 +62,50 @@ KonomiTV-BS4K は次の二層を分ける。
 
 ## ターゲット
 
-Docker Linuxオンリーとする
+Docker Linux オンリーとする。
+
+## Docker 開発運用
+
+### 環境の分離
+
+- Main と Development は、Compose project、コンテナ、イメージ、設定、データ、ログを分離する。
+- Main は動作確認済みの `main` ブランチを提供する常用環境とし、Development は現在の開発ワークツリーを検証する環境とする。
+- エージェントは、ユーザーの明示的な許可なく Main コンテナを起動・停止・再起動・再構築・再設定してはいけない。
+- マシン固有の指示で廃止済みと指定された旧パスは、Development の Compose 起点、bind source、状態保存先として使用してはいけない。
+
+### Development Compose
+
+- Development の Compose 操作は、現在のリポジトリルートを working directory として実行する。
+- `compose.yaml` と `compose.override.yaml` を必ず明示し、Development 専用の `docker/development/state/compose.env` を `--env-file` で必ず指定する。ルートの `.env` だけを使って Development を起動してはいけない。
+- Development は `verified-runtime` target を使用する。通常のコード変更を未検証の `runtime` target だけで起動してはいけない。
+- ビルド中は既存の Development コンテナを稼働させ、ビルド成功後にコンテナだけを再作成して停止時間を最小化する。
+- Development のビルドには次のコマンドを使用する。
+
+```bash
+docker compose \
+    --env-file docker/development/state/compose.env \
+    -f compose.yaml \
+    -f compose.override.yaml \
+    build konomitv
+```
+
+- ビルド成功後の再作成には次のコマンドを使用する。
+
+```bash
+docker compose \
+    --env-file docker/development/state/compose.env \
+    -f compose.yaml \
+    -f compose.override.yaml \
+    up -d --no-build --force-recreate konomitv
+```
+
+### 状態保護と事前確認
+
+- `docker/development/state/` 以下の `config.yaml`、`data/`、`logs/`、`recordings/`、`captures/` を Development 専用状態として保持する。
+- `docker compose down -v`、volume 削除、状態ディレクトリの削除、Main 状態の流用を行ってはいけない。
+- 再作成前に `docker compose config` で解決済み設定を確認し、すべての Development bind source が現在のリポジトリと `docker/development/state/` を指していることを確認する。
+- 再作成後にコンテナの Compose working directory、設定ファイル、environment file、bind source、イメージ ID、再起動回数を確認する。
+- Development API と画面が返す Git commit が現在のワークツリーと一致し、Main コンテナの状態・エンコーダー構成・API 応答が変化していないことを確認する。
 
 ## Dockerfileについて
 
@@ -147,11 +197,16 @@ Update: [Upstream] upstream/master の更新を取り込む
 
 基本となるブランチ構成と運用ルールは以下の通り。
 
-1. **`main` ブランチ (`origin/main`)**
+1. **`dev` ブランチ (`origin/dev`)**
+   - 通常の開発と Development 環境での検証に使用するブランチ。
+   - 現在の開発ワークツリーは原則として本ブランチを使用し、検証済みの変更を `main` へ反映する。
+
+2. **`main` ブランチ (`origin/main`)**
    - KonomiTV-BS4K の基本・デフォルトブランチ。
    - BS4K 独自の機能拡張、最適化、互換 API など、プロダクトとしての最終的なコードが集約される。
+   - Main 環境は本ブランチの動作確認済みコードだけを使用し、開発途中の変更を直接持ち込まない。
 
-2. **`upstream-fix` ブランチ (`origin/upstream-fix`)**
+3. **`upstream-fix` ブランチ (`origin/upstream-fix`)**
    - 上流（`tsukumijima/KonomiTV`）由来のバグ修正・共通改善を行う専用ブランチ。
    - `main` には上流へ還元できない BS4K 固有の変更が多く含まれるため、上流バグの修正は本ブランチで実施する。
    - **運用要件**:
@@ -159,7 +214,7 @@ Update: [Upstream] upstream/master の更新を取り込む
      - `origin/main` と `upstream/master` の双方へクリーンにマージ（または Pull Request）できる状態を維持する。BS4K 固有のコードや依存関係を一切混入させてはならない。
    - 修正完了後は `main` へマージするとともに、必要に応じて上流本家への PR に活用する。
 
-3. **`upstream` リモート・関連ブランチ (`upstream/master` 等)**
+4. **`upstream` リモート・関連ブランチ (`upstream/master` 等)**
    - 上流リポジトリ（`https://github.com/tsukumijima/KonomiTV.git`）のコードベース。
    - 上流側の新機能やバグ修正を取り込む際の参照元として使用する。
    - upstream からの取り込みコミットは Git コミット規約に従い `Update: [Upstream] upstream/master の更新を取り込む` とする。
