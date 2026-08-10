@@ -519,6 +519,13 @@ const handleSettingCoverClick = () => {
             opacity: 0.45;
             pointer-events: none;
         }
+        .dplayer-konomitv-bs4k-setting-low-latency-mode {
+            // 実効状態を示すだけの行なので、他の設定項目のように操作できる印象を与えない
+            cursor: default !important;
+            &:hover {
+                background: transparent !important;
+            }
+        }
         .dplayer-setting-origin-panel {
             .dplayer-setting-item.dplayer-setting-lshaped-screen-crop,
             .dplayer-setting-item.dplayer-setting-keyboard-shortcut {

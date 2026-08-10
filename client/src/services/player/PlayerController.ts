@@ -3332,6 +3332,16 @@ class PlayerController {
                 </div>
             </div>
         ` : '';
+        // 低遅延モードは再生セッションの実効状態だけを表示し、このパネルからは変更させない。
+        // 実効値を参照することで、回線プロファイルと BS4K のサーバー側通常バッファ強制も正しく反映する。
+        const low_latency_mode_setting_item_html = this.playback_mode === 'Live' ? `
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-low-latency-mode">
+                <span class="dplayer-label">低遅延モード</span>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-low-latency-mode-value">
+                    ${this.tv_low_latency_mode === true ? 'ON' : 'OFF'}
+                </span>
+            </div>
+        ` : '';
         this.player.template.audio.insertAdjacentHTML('afterend', `
             <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-video-codec"
                 role="button" tabindex="0" style="touch-action:manipulation;">
@@ -3348,6 +3358,7 @@ class PlayerController {
                     <label for="dplayer-toggle-mobile-profile" style="--theme-color:rgb(var(--v-theme-primary))"></label>
                 </div>
             </div>
+            ${low_latency_mode_setting_item_html}
         `);
 
         // DPlayer の音声トラックと同じ構成の独自サブパネルを追加する。

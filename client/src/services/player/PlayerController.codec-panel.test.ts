@@ -7,6 +7,7 @@ import Videos from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore, { LIVE_STREAMING_QUALITIES } from '@/stores/SettingsStore';
+import useVersionStore from '@/stores/VersionStore';
 import { PlayerUtils } from '@/utils';
 
 
@@ -165,6 +166,75 @@ describe('低解像度ライブ画質制約', () => {
             video_resolution,
             LIVE_STREAMING_QUALITIES,
         )).toEqual(expected_qualities);
+    });
+});
+
+
+describe('DPlayer設定パネル: 低遅延モード表示', () => {
+    beforeEach(() => {
+        localStorage.clear();
+        document.body.innerHTML = '';
+        setActivePinia(createPinia());
+
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.GR = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            display_channel_id: 'gr011',
+            type: 'GR' as const,
+        })];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'gr011';
+    });
+
+    it.each([true, false])('通常ライブの実効状態 %s を読み取り専用で表示する', (is_low_latency_mode) => {
+        useSettingsStore().settings.tv_low_latency_mode = is_low_latency_mode;
+        const { player } = createController('Live');
+        const setting_item = player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-low-latency-mode',
+        );
+
+        expect(setting_item).not.toBeNull();
+        expect(setting_item?.querySelector('.dplayer-label')?.textContent).toBe('低遅延モード');
+        expect(setting_item?.querySelector('.dplayer-konomitv-bs4k-setting-low-latency-mode-value')?.textContent?.trim())
+            .toBe(is_low_latency_mode === true ? 'ON' : 'OFF');
+        expect(setting_item?.querySelector('input')).toBeNull();
+        expect(setting_item?.hasAttribute('role')).toBe(false);
+        expect(setting_item?.hasAttribute('tabindex')).toBe(false);
+    });
+
+    it('録画再生には低遅延モードを表示しない', () => {
+        const { player } = createController('Video');
+
+        expect(player.container.querySelector('.dplayer-konomitv-bs4k-setting-low-latency-mode')).toBeNull();
+    });
+
+    it('BS4Kでサーバーが通常バッファを強制する場合はOFFと表示する', () => {
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.GR = [];
+        channels_store.channels_list.BS4K = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            display_channel_id: 'bs4k101',
+            type: 'BS4K' as const,
+        })];
+        channels_store.display_channel_id = 'bs4k101';
+        useSettingsStore().settings.tv_low_latency_mode_for_bs4k = true;
+        useVersionStore().server_version_info = {
+            version: '1.0.0',
+            upstream_version: '0.14.1',
+            git_commit: 'test',
+            latest_version: null,
+            environment: 'Linux-Docker',
+            backend: 'EDCB',
+            encoder: 'FFmpeg',
+            encoder_bs4k: 'FFmpeg',
+            bs4k_ignore_viewer_low_latency: true,
+            jikkyo_enabled: false,
+        };
+
+        const { player } = createController('Live');
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-low-latency-mode-value',
+        )?.textContent?.trim()).toBe('OFF');
     });
 });
 
