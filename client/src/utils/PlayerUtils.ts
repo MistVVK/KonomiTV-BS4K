@@ -233,6 +233,33 @@ export class PlayerUtils {
     }
 
 
+    /**
+     * EIT の映像解像度から、入力を超えてアップスケールしないライブ画質一覧を返す。
+     *
+     * 480i のサブチャンネルに保存画質の 1080p をそのまま適用すると、情報量が増えない一方で
+     * エンコード負荷と bitrate だけが増える。入力の走査方式は問わず、垂直解像度以下の画質だけを残す。
+     * EIT が未取得または未知の形式なら、誤って画質を制限しないよう元の一覧を維持する。
+     */
+    static getKonomiTVBS4KLiveStreamingQualitiesForSourceResolution(
+        konomitv_bs4k_video_resolution: string | null,
+        konomitv_bs4k_available_qualities: readonly LiveStreamingQuality[],
+    ): LiveStreamingQuality[] {
+        const konomitv_bs4k_resolution_match = konomitv_bs4k_video_resolution?.match(/^(\d+)[ip]$/);
+        if (konomitv_bs4k_resolution_match === undefined || konomitv_bs4k_resolution_match === null) {
+            return [...konomitv_bs4k_available_qualities];
+        }
+
+        const konomitv_bs4k_source_height = Number.parseInt(konomitv_bs4k_resolution_match[1], 10);
+        const konomitv_bs4k_limited_qualities = konomitv_bs4k_available_qualities.filter(
+            konomitv_bs4k_quality => Number.parseInt(konomitv_bs4k_quality, 10) <= konomitv_bs4k_source_height,
+        );
+        // 将来 240p 未満の入力解像度が追加されても画質一覧を空にせず、利用可能な最小画質へ制限する。
+        return konomitv_bs4k_limited_qualities.length > 0 ?
+            konomitv_bs4k_limited_qualities :
+            [konomitv_bs4k_available_qualities[konomitv_bs4k_available_qualities.length - 1]];
+    }
+
+
     /** 現在のブラウザが指定映像codecのMSE SourceBufferを作成できるか返す。 */
     static isKonomiTVBS4KPlaybackVideoCodecSupported(
         konomitv_bs4k_codec: KonomiTVBS4KPlaybackVideoCodec,

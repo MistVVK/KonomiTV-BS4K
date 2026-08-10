@@ -6,7 +6,8 @@ import PlayerController, { generateRecordedPlaybackSessionID } from '@/services/
 import Videos from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
-import useSettingsStore from '@/stores/SettingsStore';
+import useSettingsStore, { LIVE_STREAMING_QUALITIES } from '@/stores/SettingsStore';
+import { PlayerUtils } from '@/utils';
 
 
 type PlaybackMode = 'Live' | 'Video';
@@ -147,6 +148,23 @@ describe('ワンセグ再生コーデック制約', () => {
     it('録画ワンセグにはライブ専用制約を適用しない', () => {
         expect(Videos.getKonomiTVBS4KLowerVideoCodecOrder('av1', false)).toEqual(['av1', 'vp9', 'hevc', 'avc']);
         expect(Videos.getKonomiTVBS4KLowerAudioCodecOrder('opus', false)).toEqual(['opus', 'aac']);
+    });
+});
+
+
+describe('低解像度ライブ画質制約', () => {
+    it.each([
+        ['480i', ['480p', '360p', '240p']],
+        ['480p', ['480p', '360p', '240p']],
+        ['720p', ['720p', '540p', '480p', '360p', '240p']],
+        ['1080i', LIVE_STREAMING_QUALITIES],
+        [null, LIVE_STREAMING_QUALITIES],
+        ['Unknown', LIVE_STREAMING_QUALITIES],
+    ] as const)('入力解像度 %s に対して入力を超えない画質一覧を返す', (video_resolution, expected_qualities) => {
+        expect(PlayerUtils.getKonomiTVBS4KLiveStreamingQualitiesForSourceResolution(
+            video_resolution,
+            LIVE_STREAMING_QUALITIES,
+        )).toEqual(expected_qualities);
     });
 });
 
@@ -392,6 +410,66 @@ describe.each<PlaybackMode>(['Live', 'Video'])('DPlayer codecサブパネル: %s
             'dplayer-konomitv-bs4k-setting-box-video-codec',
         )).toBe(true);
     });
+});
+
+
+describe('DPlayer codecサブパネル: 480iライブ', () => {
+    beforeEach(() => {
+        localStorage.clear();
+        document.body.innerHTML = '';
+        setActivePinia(createPinia());
+
+        const channel = structuredClone(ILiveChannelDefault);
+        channel.display_channel_id = 'gr093';
+        channel.type = 'GR';
+        channel.is_subchannel = true;
+        channel.program_present!.video_resolution = '480i';
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.GR = [Object.preventExtensions(channel)];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'gr093';
+        vi.spyOn(Videos, 'preflightKonomiTVBS4KPlaybackProfile').mockImplementation(
+            async (_encoder, video_codec, audio_codec) => ({
+                video_codec,
+                video_bit_depth: video_codec === 'hevc' ? 10 : 8,
+                audio_codec,
+                fallback_reason: 'None',
+            }),
+        );
+    });
+
+    it.each(['av1', 'vp9'] as const)(
+        '%sとOpusを維持したまま能力検査画質だけ480pへ制限する',
+        async (video_codec) => {
+            const settings_store = useSettingsStore();
+            const player_store = usePlayerStore();
+            const saved_settings_json = JSON.stringify(settings_store.settings);
+            const restart_handler = vi.fn();
+            player_store.event_emitter.on('PlayerRestartRequired', restart_handler);
+            const { player } = createController('Live');
+
+            player.container.querySelector<HTMLElement>(
+                `.dplayer-konomitv-bs4k-setting-video-codec-item[data-codec="${video_codec}"]`,
+            )!.click();
+
+            await vi.waitFor(() => expect(restart_handler).toHaveBeenCalledTimes(1));
+            expect(Videos.preflightKonomiTVBS4KPlaybackProfile).toHaveBeenCalledWith(
+                expect.any(String),
+                video_codec,
+                'opus',
+                {is_bs4k: false, streaming_quality: '480p'},
+                'Live',
+                true,
+                false,
+                undefined,
+            );
+            expect(player_store.konomitv_bs4k_effective_playback_profile).toMatchObject({
+                video_codec,
+                audio_codec: 'opus',
+            });
+            expect(JSON.stringify(settings_store.settings)).toBe(saved_settings_json);
+        },
+    );
 });
 
 

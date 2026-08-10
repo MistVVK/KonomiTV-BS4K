@@ -185,6 +185,7 @@ describe('KonomiTV-BS4K playback profile resolver', () => {
             {is_bs4k: false, streaming_quality: '1080p'},
             'Live',
             true,
+            false,
             owner.signal,
         )).rejects.toMatchObject({name: 'AbortError'});
     });
