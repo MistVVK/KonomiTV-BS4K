@@ -99,10 +99,8 @@ LIBRARY_PATH = {
 }
 
 # ----- 製品用 opencode serve（録画シリーズ AI）-----
-# 監査用 OpenCode（port 4096 想定）と port / home / workspace / auth を完全分離する。
+# 監査用 OpenCode と listen port / home / workspace / auth を完全分離する。
 OPENCODE_SERVE_HOST = '127.0.0.1'
-OPENCODE_SERVE_PORT = 4097
-OPENCODE_SERVE_BASE_URL = f'http://{OPENCODE_SERVE_HOST}:{OPENCODE_SERVE_PORT}'
 ## config / data / PID を置く製品専用 home ルート
 OPENCODE_HOME_ROOT = DATA_DIR / 'opencode-home'
 ## XDG_CONFIG_HOME（opencode.json / auth.json 等がぶら下がる）

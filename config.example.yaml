@@ -95,6 +95,10 @@ server:
     # デフォルトのリッスンポートは 7000 です。
     port: 7000
 
+    # 録画シリーズ AI で使用する製品用 OpenCode serve のリッスンポート
+    # 通常はデフォルトの 4097 から変更する必要はありません。
+    opencode_serve_port: 4097
+
     # HTTPS / リバースプロキシの動作モード
     # akebi (既定): Akebi Keyless Server が port で HTTPS を提供します。証明書設定と trusted_proxy_cidrs は指定できません。
     # certificate: Uvicorn が port で直接 HTTPS を提供します。証明書と秘密鍵の両方が必須です。

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from app.metadata.ai.AIBackendSettings import (
     AIBackendServiceCreate,
     AIBackendSettingsStore,
 )
+from app.metadata.ai.opencode_client import OpenCodeClient
 
 
 def test_ensure_runtime_directories_seeds_config(
@@ -232,8 +234,14 @@ def test_ensure_runtime_directories_rejects_config_symlink(
     assert outside.read_text(encoding='utf-8') == '{"agent":{"evil":true}}\n'
 
 
-def test_probe_availability_shape() -> None:
-    """availability スナップショットのキーが揃う。"""
+def test_probe_availability_uses_configured_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """availability とクライアント接続先が設定されたポートへ揃って追従する。"""
+
+    monkeypatch.setattr(
+        opencode_serve,
+        'Config',
+        lambda: SimpleNamespace(server=SimpleNamespace(opencode_serve_port=11451)),
+    )
 
     snapshot = opencode_serve.ProbeOpenCodeAvailability()
     assert set(snapshot.keys()) >= {
@@ -246,8 +254,10 @@ def test_probe_availability_shape() -> None:
         'pid',
         'workspace',
     }
-    assert snapshot['port'] == 4097
+    assert snapshot['base_url'] == 'http://127.0.0.1:11451'
+    assert snapshot['port'] == 11451
     assert snapshot['pinned_version'] == '1.18.13'
+    assert OpenCodeClient().base_url == 'http://127.0.0.1:11451'
 
 
 def test_start_opencode_serve_keeps_exa_websearch_flag(
@@ -275,6 +285,11 @@ def test_start_opencode_serve_keeps_exa_websearch_flag(
     monkeypatch.setattr(opencode_serve, 'OPENCODE_BUNDLED_CONFIG_PATH', template)
     monkeypatch.setattr(opencode_serve, 'OPENCODE_REPO_CONFIG_PATH', template)
     monkeypatch.setattr(opencode_serve, 'OPENCODE_SERVE_PID_PATH', home / 'opencode-serve.pid')
+    monkeypatch.setattr(
+        opencode_serve,
+        'Config',
+        lambda: SimpleNamespace(server=SimpleNamespace(opencode_serve_port=11451)),
+    )
     monkeypatch.setattr(opencode_serve, 'ResolveOpenCodeExecutable', lambda: binary)
     monkeypatch.setattr(opencode_serve, 'ReclaimStaleOpenCodeServe', lambda: None)
     monkeypatch.setattr(opencode_serve, '_isListeningOnProductPort', lambda: False)
@@ -304,7 +319,8 @@ def test_start_opencode_serve_keeps_exa_websearch_flag(
     captured: dict[str, object] = {}
 
     class FakePopen:
-        def __init__(self, *_args: object, **kwargs: object) -> None:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            captured['command'] = args[0]
             captured['env'] = kwargs['env']
             self.pid = 4242
             self.returncode = None
@@ -337,6 +353,12 @@ def test_start_opencode_serve_keeps_exa_websearch_flag(
     assert isinstance(env, dict)
     assert env.get('OPENCODE_ENABLE_EXA') == '1'
     assert 'OPENCODE_OTHER' not in env
+    assert captured['command'] == [
+        str(binary),
+        'serve',
+        '--hostname', '127.0.0.1',
+        '--port', '11451',
+    ]
     opencode_serve.StopOpenCodeServe()
 
 

@@ -163,6 +163,7 @@ export interface IServerSettings {
     server: {
         https_mode: 'akebi' | 'certificate' | 'reverse_proxy';
         port: number;
+        opencode_serve_port: number;
         custom_https_certificate: HostAbsolutePath | null;
         custom_https_private_key: HostAbsolutePath | null;
         reverse_proxy_listen_address: string;
@@ -251,6 +252,7 @@ export const IServerSettingsDefault: IServerSettings = {
     server: {
         https_mode: 'akebi',
         port: 7000,
+        opencode_serve_port: 4097,
         custom_https_certificate: null,
         custom_https_private_key: null,
         reverse_proxy_listen_address: '0.0.0.0',

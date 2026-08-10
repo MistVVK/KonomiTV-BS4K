@@ -459,6 +459,7 @@ class _ServerSettingsGeneral(BaseModel):
 class _ServerSettingsServer(BaseModel):
     https_mode: Literal['akebi', 'certificate', 'reverse_proxy'] = 'akebi'
     port: PositiveInt = 7000
+    opencode_serve_port: Annotated[int, Field(ge=1024, le=65535)] = 4097
     custom_https_certificate: FilePath | None = None
     custom_https_private_key: FilePath | None = None
     reverse_proxy_listen_address: IPvAnyAddress = ipaddress.IPv4Address('0.0.0.0')
@@ -530,6 +531,31 @@ class _ServerSettingsServer(BaseModel):
             raise ValueError(
                 f'ポート {port + 10} ({port} + 10) は他のプロセスで使われているため、KonomiTV-BS4K を起動できません。\n'
                 f'重複して KonomiTV-BS4K を起動していないか、他のソフトでポート {port + 10} を使っていないかを確認してください。'
+            )
+        return port
+
+    @field_validator('opencode_serve_port')
+    def validateOpenCodeServePort(cls, port: int, info: ValidationInfo) -> int:
+        """製品用 OpenCode serve のポートが他プロセスと衝突しないことを検証する。
+
+        Args:
+            port (int): 検証する OpenCode serve のポート番号。
+            info (ValidationInfo): bypass_validation などの検証コンテキスト。
+
+        Returns:
+            int: 利用可能な OpenCode serve のポート番号。
+        """
+
+        # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する。
+        if type(info.context) is dict and info.context.get('bypass_validation') is True:
+            return port
+
+        # 同じ KonomiTV-BS4K 内のリスナとの衝突は、全セクションが揃う ServerSettings 側で検証する。
+        if port in _GetUsedListenPorts():
+            raise ValueError(
+                f'OpenCode serve のポート {port} は他のプロセスで使われているため、'
+                'KonomiTV-BS4K を起動できません。\n'
+                f'他のソフトでポート {port} を使っていないかを確認してください。'
             )
         return port
 
@@ -661,37 +687,51 @@ class ServerSettings(BaseModel):
     cm_analysis: _ServerSettingsCMAnalysis = _ServerSettingsCMAnalysis()
 
     @model_validator(mode='after')
-    def validate_compatibility_api(self, info: ValidationInfo) -> 'ServerSettings':
-        """互換 API と通常 API のリスナが互いに衝突しないことを検証する。"""
+    def validateListenPorts(self, info: ValidationInfo) -> 'ServerSettings':
+        """通常 API・互換 API・OpenCode serve のリスナが互いに衝突しないことを検証する。
+
+        Args:
+            info (ValidationInfo): bypass_validation などの検証コンテキスト。
+
+        Returns:
+            ServerSettings: ポートが互いに重複していないサーバー設定。
+        """
 
         if type(info.context) is dict and info.context.get('bypass_validation') is True:
             return self
-        if self.compatibility_api.enabled is False:
-            return self
 
-        compatibility_https_mode = (
-            self.server.https_mode
-            if self.compatibility_api.https_mode == 'inherit'
-            else self.compatibility_api.https_mode
-        )
         listen_ports = {
             '通常 API': self.server.port,
-            '互換 API': self.compatibility_api.port,
+            'OpenCode serve': self.server.opencode_serve_port,
         }
         if self.server.https_mode == 'akebi':
             listen_ports['通常 API の内部 Uvicorn'] = self.server.port + 10
-        if compatibility_https_mode == 'akebi':
-            listen_ports['互換 API の内部 Uvicorn'] = self.compatibility_api.port + 10
+
+        # 無効な互換 API はポートを予約せず、OpenCode serve に同じ値を設定できるようにする。
+        compatibility_https_mode: str | None = None
+        if self.compatibility_api.enabled:
+            compatibility_https_mode = (
+                self.server.https_mode
+                if self.compatibility_api.https_mode == 'inherit'
+                else self.compatibility_api.https_mode
+            )
+            listen_ports['互換 API'] = self.compatibility_api.port
+            if compatibility_https_mode == 'akebi':
+                listen_ports['互換 API の内部 Uvicorn'] = self.compatibility_api.port + 10
 
         port_owners: dict[int, str] = {}
         for owner, port in listen_ports.items():
             if port in port_owners:
                 raise ValueError(
                     f'{owner} のポート {port} が {port_owners[port]} と重複しています。\n'
-                    '通常 API と互換 API が使用するポートを重複しない値に変更してください。'
+                    'KonomiTV-BS4K が使用する各ポートを重複しない値に変更してください。'
                 )
             port_owners[port] = owner
 
+        if self.compatibility_api.enabled is False:
+            return self
+
+        assert compatibility_https_mode is not None
         used_ports = _GetUsedListenPorts()
         compatibility_ports = {'互換 API': self.compatibility_api.port}
         if compatibility_https_mode == 'akebi':

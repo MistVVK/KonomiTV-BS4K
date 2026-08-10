@@ -17,8 +17,8 @@ from urllib.parse import quote
 
 import httpx
 
-from app.constants import OPENCODE_HEALTH_TIMEOUT_SEC, OPENCODE_SERVE_BASE_URL
-from app.metadata.ai.opencode_serve import IsOpenCodeAvailable
+from app.constants import OPENCODE_HEALTH_TIMEOUT_SEC
+from app.metadata.ai.opencode_serve import GetOpenCodeBaseURL, IsOpenCodeAvailable
 from app.metadata.ai.opencode_types import (
     NormalizeOpenCodeUsage,
     OpenCodeApiAuth,
@@ -153,22 +153,30 @@ def _GetProviderState(base_url: str, provider_id: str) -> _OpenCodeProviderState
 
 
 class OpenCodeClient:
-    """127.0.0.1:4097 の製品用 serve を叩く非同期クライアント。"""
+    """設定された製品用 OpenCode serve を叩く非同期クライアント。"""
 
     def __init__(
         self,
         *,
-        base_url: str = OPENCODE_SERVE_BASE_URL,
+        base_url: str | None = None,
         timeout_sec: float = 30.0,
     ) -> None:
         """クライアントを初期化する。
 
         Args:
-            base_url: serve の base URL。
+            base_url: serve の base URL。None の場合はサーバー設定値を使用する。
             timeout_sec: 既定 HTTP タイムアウト（prompt 以外）。
+
+        Returns:
+            None
         """
 
-        # serve の base URL。テストで差し替え可能。
+        # None のときだけ製品管理下の serve として availability 状態を強制する。
+        # テストや明示的な外部URLは、製品プロセスの状態から独立して接続できる。
+        self._uses_managed_serve = base_url is None
+        if base_url is None:
+            base_url = GetOpenCodeBaseURL()
+        # 接続先の serve base URL。全 API メソッドから参照する。
         self._base_url = base_url.rstrip('/')
         # 既定タイムアウト秒。
         self._timeout_sec = timeout_sec
@@ -182,7 +190,7 @@ class OpenCodeClient:
     def _requireAvailable(self) -> None:
         """製品 serve が available でなければ例外を送出する。"""
 
-        if IsOpenCodeAvailable() is False and self._base_url == OPENCODE_SERVE_BASE_URL.rstrip('/'):
+        if self._uses_managed_serve and IsOpenCodeAvailable() is False:
             raise OpenCodeUnavailableError()
 
     async def getHealth(self) -> dict[str, Any]:

@@ -44,10 +44,11 @@ class HTTPSModeConfigTest(unittest.TestCase):
 
     @staticmethod
     def server_settings(**overrides: object):
-        return ServerSettings.model_validate(
-            {'server': {'port': 65420, **overrides}},
-            context={'bypass_validation': False},
-        ).server
+        with patch('app.config._GetUsedListenPorts', return_value=set()):
+            return ServerSettings.model_validate(
+                {'server': {'port': 65420, **overrides}},
+                context={'bypass_validation': False},
+            ).server
 
     def compatibility_settings(
         self,
@@ -233,6 +234,57 @@ class HTTPSModeConfigTest(unittest.TestCase):
         self.assertIsNone(settings.compatibility_api.custom_https_private_key)
         self.assertEqual(str(settings.compatibility_api.reverse_proxy_listen_address), '0.0.0.0')
         self.assertEqual(settings.compatibility_api.trusted_proxy_cidrs, [])
+
+    def test_opencode_serve_port_defaults_to_4097(self) -> None:
+        with patch('app.config._GetUsedListenPorts', return_value=set()):
+            settings = ServerSettings.model_validate({}, context={'bypass_validation': False})
+
+        self.assertEqual(settings.server.opencode_serve_port, 4097)
+
+    def test_opencode_serve_port_rejects_reserved_and_used_ports(self) -> None:
+        for opencode_serve_port in (65400, 65410, 65420, 65430):
+            with self.subTest(opencode_serve_port=opencode_serve_port):
+                with self.assertRaisesRegex(ValidationError, '重複しています'):
+                    self.compatibility_settings(
+                        server_port=65400,
+                        compatibility_port=65420,
+                        opencode_serve_port=opencode_serve_port,
+                    )
+
+        with patch('app.config._GetUsedListenPorts', return_value={11451}):
+            with self.assertRaisesRegex(ValidationError, '他のプロセスで使われている'):
+                ServerSettings.model_validate(
+                    {
+                        'server': {
+                            'port': 65400,
+                            'opencode_serve_port': 11451,
+                        },
+                    },
+                    context={'bypass_validation': False},
+                )
+
+    def test_opencode_serve_port_accepts_configured_available_port(self) -> None:
+        with patch('app.config._GetUsedListenPorts', return_value=set()):
+            settings = ServerSettings.model_validate(
+                {
+                    'server': {
+                        'port': 65400,
+                        'opencode_serve_port': 11451,
+                    },
+                },
+                context={'bypass_validation': False},
+            )
+
+        self.assertEqual(settings.server.opencode_serve_port, 11451)
+
+    def test_opencode_serve_port_rejects_out_of_range_values(self) -> None:
+        for opencode_serve_port in (1023, 65536):
+            with self.subTest(opencode_serve_port=opencode_serve_port):
+                with self.assertRaises(ValidationError):
+                    ServerSettings.model_validate(
+                        {'server': {'opencode_serve_port': opencode_serve_port}},
+                        context={'bypass_validation': False},
+                    )
 
     def test_compatibility_inherit_and_akebi_reject_dedicated_https_settings(self) -> None:
         for compatibility_mode in ('inherit', 'akebi'):

@@ -22,6 +22,7 @@ from typing import Literal
 
 import httpx
 
+from app.config import Config
 from app.constants import (
     LIBRARY_PATH,
     OPENCODE_AGENT_EPISODE,
@@ -33,11 +34,9 @@ from app.constants import (
     OPENCODE_HOME_ROOT,
     OPENCODE_PINNED_VERSION,
     OPENCODE_REPO_CONFIG_PATH,
-    OPENCODE_SERVE_BASE_URL,
     OPENCODE_SERVE_HOST,
     OPENCODE_SERVE_LOG_PATH,
     OPENCODE_SERVE_PID_PATH,
-    OPENCODE_SERVE_PORT,
     OPENCODE_WORKSPACE_DIR,
     OPENCODE_XDG_CONFIG_HOME,
     OPENCODE_XDG_DATA_HOME,
@@ -87,11 +86,14 @@ def IsOpenCodeAvailable() -> bool:
 def GetOpenCodeBaseURL() -> str:
     """製品用 serve の base URL を返す。
 
+    Args:
+        None
+
     Returns:
-        http://127.0.0.1:4097 形式の URL。
+        config.yaml で指定された製品用 OpenCode serve の URL。
     """
 
-    return OPENCODE_SERVE_BASE_URL
+    return f'http://{OPENCODE_SERVE_HOST}:{Config().server.opencode_serve_port}'
 
 
 def ResolveOpenCodeExecutable() -> Path | None:
@@ -439,10 +441,17 @@ def _IsProcessGroupAlive(process_group_id: int) -> bool:
 
 
 def _isListeningOnProductPort() -> bool:
-    """127.0.0.1:4097 が LISTEN しているかを /proc/net/tcp で判定する。"""
+    """設定された製品用 OpenCode serve ポートが LISTEN しているかを /proc/net/tcp で判定する。
+
+    Args:
+        None
+
+    Returns:
+        bool: 製品用アドレスで対象ポートが LISTEN している場合は True。
+    """
 
     # ポートを 16 進（ホストバイト順ではなくネットワークバイト順表記）で探す。
-    port_hex = f'{OPENCODE_SERVE_PORT:04X}'
+    port_hex = f'{Config().server.opencode_serve_port:04X}'
     try:
         lines = Path('/proc/net/tcp').read_text(encoding='utf-8').splitlines()
     except OSError:
@@ -521,7 +530,7 @@ def _TerminateProcessGroup(
 
 
 def ReclaimStaleOpenCodeServe() -> None:
-    """旧 PID ファイルと 4097 の残留プロセスを回収する。
+    """旧 PID ファイルに記録された製品用 OpenCode serve の残留プロセスを回収する。
 
     他人の無関係なプロセスを殺さないよう、PID ファイルの PID を優先する。
     PID ファイルが無く port だけが開いている場合は、可能なら接続で health を見て
@@ -552,7 +561,7 @@ def CheckOpenCodeHealth(*, timeout_sec: float = OPENCODE_HEALTH_TIMEOUT_SEC) -> 
     """
 
     try:
-        with httpx.Client(base_url=OPENCODE_SERVE_BASE_URL, timeout=timeout_sec) as client:
+        with httpx.Client(base_url=GetOpenCodeBaseURL(), timeout=timeout_sec) as client:
             response = client.get('/global/health')
             response.raise_for_status()
             payload = response.json()
@@ -706,7 +715,7 @@ def StartOpenCodeServe() -> bool:
             str(executable),
             'serve',
             '--hostname', OPENCODE_SERVE_HOST,
-            '--port', str(OPENCODE_SERVE_PORT),
+            '--port', str(Config().server.opencode_serve_port),
         ]
         try:
             process = subprocess.Popen(
@@ -763,7 +772,7 @@ def StartOpenCodeServe() -> bool:
                     )
                 _opencode_available = True
                 logging.info(
-                    f'OpenCode serve is ready at {OPENCODE_SERVE_BASE_URL} '
+                    f'OpenCode serve is ready at {GetOpenCodeBaseURL()} '
                     f'(version={version}, agents={OPENCODE_AGENT_GENERATE}/'
                     f'{OPENCODE_AGENT_EPISODE}).',
                 )
@@ -805,9 +814,9 @@ def ProbeOpenCodeAvailability() -> dict[str, object]:
             available = False
     return {
         'available': available,
-        'base_url': OPENCODE_SERVE_BASE_URL,
+        'base_url': GetOpenCodeBaseURL(),
         'host': OPENCODE_SERVE_HOST,
-        'port': OPENCODE_SERVE_PORT,
+        'port': Config().server.opencode_serve_port,
         'version': version,
         'pinned_version': OPENCODE_PINNED_VERSION,
         'pid': pid,
