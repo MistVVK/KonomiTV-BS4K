@@ -74,6 +74,10 @@ app.use(FloatingVue);
 // マウントを実行
 app.mount('#app');
 
+// Firefox Android 等で URL バー表示切替後に fixed 下端 UI がズレる問題を補正する
+// BottomNavigation / Snackbars / 番組表 FAB などが CSS 変数 --vv-bottom-offset を参照する
+Utils.startVisualViewportBottomOffsetSync();
+
 // ***** Service Worker のイベントを登録 *****
 
 const { updateServiceWorker } = useRegisterSW({

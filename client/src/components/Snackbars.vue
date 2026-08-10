@@ -36,6 +36,9 @@ import { useSnackbarsStore } from '@/stores/SnackbarsStore';
     align-items: center;
     position: fixed;
     bottom: 0;
+    // Firefox Android 等で URL バー表示切替後に下端がズレるのを --vv-bottom-offset で補正する
+    // translate は bottom を上書きせずに visual viewport 下端へ追従させる
+    translate: 0 calc(var(--vv-bottom-offset, 0px) * -1);
     left: 0;
     right: 0;
     pointer-events: none;

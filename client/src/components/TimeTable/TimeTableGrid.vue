@@ -1443,6 +1443,8 @@ watch(() => timetableStore.display_start_time, (value) => {
 
     &__next-day-button {
         bottom: 16px;
+        // Firefox Android 等の URL バー表示切替で下端がズレるのを --vv-bottom-offset で補正する
+        translate: 0 calc(var(--vv-bottom-offset, 0px) * -1);
         @include smartphone-vertical {
             // スマホ縦画面ではボトムナビゲーションバーの上に配置
             bottom: calc(56px + 14px + env(safe-area-inset-bottom));

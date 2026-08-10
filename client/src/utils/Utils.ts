@@ -353,6 +353,85 @@ export default class Utils {
 
 
     /**
+     * Visual Viewport の下端と layout viewport の下端の差分を CSS 変数 --vv-bottom-offset へ反映する
+     *
+     * Firefox Android などでは、スクロールで URL バーが隠れたあとも position: fixed; bottom: 0 が
+     * 古い layout 下端に留まり、ボトムナビゲーションの下に隙間が残ることがある。
+     * fixed 下端 UI は translate: 0 calc(var(--vv-bottom-offset) * -1) で visual viewport 下端へ追従する。
+     *
+     * 値の意味:
+     * - 正: layout 下端より上へずらす (URL バー表示中など visual が layout より短い場合)
+     * - 負: layout 下端より下へずらす (URL バー非表示後に visual が layout より伸びた場合)
+     * - 0: 補正不要
+     */
+    static syncVisualViewportBottomOffset(): void {
+        const root = document.documentElement;
+        const visual_viewport = window.visualViewport;
+        const offset = visual_viewport === null || visual_viewport === undefined ? 0 :
+            window.innerHeight - visual_viewport.height - visual_viewport.offsetTop;
+        const normalized_offset = Math.abs(offset) < 0.5 ? 0 : offset;
+
+        // visualViewport.height / offsetTop はズーム後の CSS px で返るため、scale を重ねて掛ける必要はない
+        // 前回と同じ補正値なら CSS 変数を更新せず、スクロール中のスタイル再計算を避ける
+        const current_offset = Number.parseFloat(root.style.getPropertyValue('--vv-bottom-offset'));
+        if (
+            Number.isFinite(current_offset) &&
+            Math.abs(normalized_offset - current_offset) < 0.1
+        ) {
+            return;
+        }
+        root.style.setProperty('--vv-bottom-offset', `${normalized_offset}px`);
+    }
+
+    /**
+     * Visual Viewport 下端補正の自動同期を開始する
+     * main.ts から一度だけ呼び出す想定
+     */
+    static startVisualViewportBottomOffsetSync(): void {
+
+        // この補正が必要なのは、ズーム許可時に layout viewport と visual viewport の追従が外れる Firefox Android のみ
+        // 他ブラウザは position: fixed が visual viewport へ正しく追従するため、二重補正を避ける
+        if (Utils.isAndroid() === false || Utils.isFirefox() === false) {
+            return;
+        }
+
+        // Utils は各 View でテンプレート用に Object.freeze() されるため、可変状態は static field ではなく
+        // main.ts から一度だけ呼ばれるこの関数のクロージャへ保持する
+        let animation_frame_id: number | null = null;
+        let settle_timer_id: number | null = null;
+
+        const schedule = (): void => {
+            // 同一フレーム内の多重更新を避ける
+            if (animation_frame_id === null) {
+                animation_frame_id = window.requestAnimationFrame(() => {
+                    animation_frame_id = null;
+                    Utils.syncVisualViewportBottomOffset();
+                });
+            }
+
+            // Firefox Android の URL バーはスクロール終了後もアニメーションするため、最終位置でも再同期する
+            if (settle_timer_id !== null) {
+                window.clearTimeout(settle_timer_id);
+            }
+            settle_timer_id = window.setTimeout(() => {
+                settle_timer_id = null;
+                Utils.syncVisualViewportBottomOffset();
+            }, 250);
+        };
+
+        // 初回反映
+        Utils.syncVisualViewportBottomOffset();
+
+        // 「すべてのウェブサイトでズームを許可」が有効な Firefox Android では、URL バーの表示切替時に
+        // visualViewport のイベントが発火せず window の scroll だけが発火することがあるため、両方を監視する
+        window.addEventListener('resize', schedule, {passive: true});
+        window.addEventListener('scroll', schedule, {passive: true});
+        window.visualViewport?.addEventListener('resize', schedule);
+        window.visualViewport?.addEventListener('scroll', schedule);
+    }
+
+
+    /**
      * ブラウザが Safari かどうか
      * @returns ブラウザが Safari なら true を返す
      */

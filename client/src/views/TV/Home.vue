@@ -1070,6 +1070,8 @@ export default defineComponent({
     position: fixed;
     // iPhone X 以降の Home Indicator の高さ分を考慮
     bottom: calc(72px + env(safe-area-inset-bottom));
+    // Firefox Android 等の URL バー表示切替で下端がズレるのを --vv-bottom-offset で補正する
+    translate: 0 calc(var(--vv-bottom-offset, 0px) * -1);
     right: 20px;
     padding: 12px 16px;
     background: rgb(var(--v-theme-background-lighten-2));

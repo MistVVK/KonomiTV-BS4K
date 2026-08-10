@@ -64,6 +64,9 @@ a, a:link, a:visited, a:hover, a:active {
 
 // 全体のスタイル
 html {
+    // Firefox Android 等の URL バー表示切替で fixed 下端 UI がズレる補正用
+    // Utils.startVisualViewportBottomOffsetSync() が実行時に上書きする
+    --vv-bottom-offset: 0px;
     overflow-y: auto !important;
     touch-action: manipulation;
     overscroll-behavior-x: none;
