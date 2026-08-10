@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -1383,6 +1384,34 @@ def test_acp_episode_lookup_rejects_invalid_final_schema_after_search(tmp_path: 
     assert [citation.url for citation in result.citations] == [
         'https://example.com/codex-source',
     ]
+
+
+def test_acp_episode_lookup_defaults_missing_resolved_season_to_one() -> None:
+    """ACP でも明示シーズンのない番号付き番組を Season 1 へ正規化する。"""
+
+    output = json.loads(EpisodeOutput())
+    output['season_number'] = None
+    output['episode_number'] = '1250'
+    citation = AcpClient.EpisodeLookupCitation(
+        url='https://example.com/episode-1250',
+        title='Episode 1250',
+    )
+
+    result = AcpClient._validatedEpisodeLookupResult(
+        json.dumps(output, ensure_ascii=False),
+        session_result=AcpClient._AcpSessionResult(
+            output_text='',
+            web_search_performed=True,
+            citations=(citation,),
+            web_search_failed=False,
+        ),
+        model='test-model',
+        latency_ms=1,
+    )
+
+    assert result.outcome == 'Resolved'
+    assert result.season_number == 1
+    assert result.episode_number == Decimal('1250')
 
 
 @pytest.mark.parametrize(

@@ -6,6 +6,7 @@ from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesProgramPrompt,
 )
 from app.metadata.RecordedSeriesGeneration import (
+    BuildSeriesMetadataSystemPrompt,
     ParseStrictSeriesMetadataJSONObject,
     SeriesMetadataClusterHint,
     SeriesMetadataClusterProgramHint,
@@ -146,6 +147,34 @@ def test_no_published_number_preserves_identified_season() -> None:
     assert result.episode_number is None
     assert result.episode_not_numbered is False
     assert result.episode_no_published_number is True
+
+
+def test_numbered_episode_without_explicit_season_defaults_to_one() -> None:
+    """明示シーズンのない番号付き番組を Season 1 へ正規化する。"""
+
+    result = Validate({
+        'decision': 'Series',
+        'series_title': '宝塚カフェブレイク',
+        'season_number': None,
+        'episode_number': '1266',
+        'subtitle': None,
+        'confidence': 0.95,
+        'existing_series_id': 42,
+        'wikipedia_page_id': None,
+        'rationale_short': '長期継続番組の第1266回',
+    })
+
+    assert result.season_number == 1
+    assert str(result.episode_number) == '1266'
+
+
+def test_system_prompt_defaults_numbered_program_without_explicit_season_to_one() -> None:
+    """生成指示とサーバー側の Season 1 正規化契約を一致させる。"""
+
+    assert (
+        'Use season_number 1 when a numbered program has no explicit seasons.'
+        in BuildSeriesMetadataSystemPrompt()
+    )
 
 
 @pytest.mark.parametrize(

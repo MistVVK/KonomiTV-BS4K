@@ -913,6 +913,40 @@ def test_validated_lookup_requires_citations() -> None:
     assert result.web_search_performed is True
 
 
+def test_validated_lookup_defaults_missing_resolved_season_to_one() -> None:
+    """明示シーズンのない連続番組は、番号付き検索結果を Season 1 へ正規化する。"""
+
+    from app.metadata.ai.opencode_backend import _ValidatedOpenCodeEpisodeLookupResult
+
+    result = _ValidatedOpenCodeEpisodeLookupResult(
+        {
+            'outcome': 'Resolved',
+            'season_number': None,
+            'episode_number': '1250',
+            'confidence': 0.95,
+            'rationale_short': 'The official listing identifies episode 1250.',
+        },
+        evidence={
+            'web_search_performed': True,
+            'web_search_failed': False,
+            'citations': [{
+                'url': 'https://example.com/episode-1250',
+                'title': 'Episode 1250',
+            }],
+            'completed_web_calls': 1,
+            'failed_web_calls': 0,
+        },
+        model='opencode:google-vertex/gemini-3.6-flash',
+        latency_ms=10,
+        prompt_tokens=1,
+        completion_tokens=1,
+    )
+
+    assert result.outcome == 'Resolved'
+    assert result.season_number == 1
+    assert result.episode_number == Decimal('1250')
+
+
 def test_validated_lookup_without_web_search() -> None:
     """web tool 無しは SearchNotRun。"""
 

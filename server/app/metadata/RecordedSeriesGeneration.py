@@ -177,7 +177,8 @@ class AISeriesMetadataOutput(BaseModel):
             # 番号なしの判定でも、所属シーズンを特定できる場合は保持する。
             pass
         elif self.season_number is None:
-            raise ValueError('A numbered episode requires season_number.')
+            # 長期継続番組など明示シーズンがない場合は、ローカルの #N 解析と同じ Season 1 に置く。
+            self.season_number = 1
         return self
 
 
@@ -220,6 +221,7 @@ def BuildSeriesMetadataSystemPrompt() -> str:
         'Use NoPublishedNumber for a special, recap, or other episode that belongs to the work '
         'but has no published episode number. Use NotNumbered only when the continuing program '
         'does not use episode numbering. Keep season_number when its season is identifiable. '
+        'Use season_number 1 when a numbered program has no explicit seasons. '
         'A null episode_number means insufficient episode evidence, not an unnumbered episode. '
         'Copy an existing_series_id or wikipedia_page_id only when the same work appears in hints; '
         'otherwise return null and never invent an ID. '
