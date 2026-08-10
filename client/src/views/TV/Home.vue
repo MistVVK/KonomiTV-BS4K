@@ -22,6 +22,7 @@
                     :observer="true" :observe-parents="true"
                     @swiper="swiper_instance = $event"
                     @slide-change="active_tab_index = $event.activeIndex"
+                    @slide-change-transition-end="restoreActiveTabScrollPosition"
                     v-show="channel_tabs.length > 0">
                     <SwiperSlide v-for="[channels_type, channels] in channel_tabs" :key="channels_type">
                         <div class="channels" :class="`channels--tab-${channels_type} channels--length-${channels.length}`">
@@ -162,6 +163,17 @@ export default defineComponent({
             // Swiper のインスタンス
             swiper_instance: null as SwiperClass | null,
 
+            // タブごとに最後に表示していたウィンドウのスクロール位置を保持する
+            // タブ構成が変化しても別のタブへ誤適用しないよう、index ではなく表示名をキーにする
+            tab_scroll_positions: {} as Record<string, number>,
+
+            // 横スライド中に表示位置を補正している移動先タブの情報
+            // Swiper のアニメーション終了時に、見た目を変えず実際のスクロール位置へ置き換えるために使う
+            pending_tab_scroll_restore: null as {
+                tab_index: number;
+                scroll_position: number;
+            } | null,
+
             // スクロールイベントを解除するための AbortController
             scroll_abort_controller: new AbortController(),
 
@@ -182,12 +194,33 @@ export default defineComponent({
         },
     },
     watch: {
-        active_tab_index() {
+        active_tab_index(active_tab_index, previous_active_tab_index) {
+            // 前回の横スライド中にさらにタブが切り替えられた場合は、まず前回の表示位置を確定する
+            this.restoreActiveTabScrollPosition();
+
+            // タブを切り替える直前のスクロール位置を、移動元のタブに記録する
+            if (active_tab_index !== previous_active_tab_index) {
+                const previous_channels_type = this.channel_tabs[previous_active_tab_index]?.[0];
+                if (previous_channels_type !== undefined) {
+                    this.tab_scroll_positions[previous_channels_type] = window.scrollY;
+                }
+            }
+
             // content-visibility: auto の指定の関係でうまく計算されないことがある Swiper の autoHeight を強制的に再計算する
             this.swiper_instance?.updateAutoHeight();
+
+            // 移動先タブの内容を、横スライド中から保存済みのスクロール位置に見えるよう一時的にずらす
+            this.prepareActiveTabScrollPosition();
+
             // 現在なアクティブなタブを Swiper 側に随時反映する
             // ローディング中のみスライドアニメーションを実行せずに即座に切り替える
-            this.swiper_instance?.slideTo(this.active_tab_index, this.is_loading === true ? 0 : undefined);
+            const slide_started = this.swiper_instance?.slideTo(this.active_tab_index, this.is_loading === true ? 0 : undefined);
+
+            // アニメーションが始まらない場合は transition-end が発火しないため、ここで表示位置を確定する
+            if (this.is_loading === true || this.swiper_instance === null ||
+                (slide_started === false && this.swiper_instance.animating === false)) {
+                this.restoreActiveTabScrollPosition();
+            }
             this.updateActiveTabHighlight();
         },
         channel_tabs(channel_tabs) {
@@ -250,6 +283,15 @@ export default defineComponent({
     // 終了前に実行
     beforeUnmount() {
 
+        // ページ遷移中にスクロール位置を変更しないよう、一時的な表示補正だけを解除する
+        const pending_restore = this.pending_tab_scroll_restore;
+        if (pending_restore !== null && this.swiper_instance !== null) {
+            this.swiper_instance.slides[pending_restore.tab_index]?.querySelector<HTMLElement>('.channels')
+                ?.style.removeProperty('transform');
+            this.swiper_instance.wrapperEl.style.removeProperty('min-height');
+            this.pending_tab_scroll_restore = null;
+        }
+
         // clearInterval() ですべての setInterval(), setTimeout() の実行を止める
         // clearInterval() と clearTimeout() は中身共通なので問題ない
         for (const interval_id of this.interval_ids) {
@@ -289,6 +331,49 @@ export default defineComponent({
         // チャンネルがピン留めされているか
         isPinnedChannel(channel: ILiveChannel): boolean {
             return this.settingsStore.settings.pinned_channel_ids.includes(channel.id);
+        },
+
+        // 横スライド中の移動先タブを、保存済みのスクロール位置に見えるよう一時的にずらす
+        prepareActiveTabScrollPosition(): void {
+            const channels_type = this.channel_tabs[this.active_tab_index]?.[0];
+            if (channels_type === undefined) {
+                return;
+            }
+
+            const scroll_position = this.tab_scroll_positions[channels_type] ?? 0;
+            const swiper = this.swiper_instance;
+            const target_channels = swiper?.slides[this.active_tab_index]?.querySelector<HTMLElement>('.channels');
+
+            // 現在のウィンドウ位置のまま、移動先だけを保存位置から見た表示と同じ位置へ補正する
+            if (target_channels !== undefined && target_channels !== null && swiper !== null) {
+                const scroll_offset = window.scrollY - scroll_position;
+                target_channels.style.transform = `translateY(${scroll_offset}px)`;
+
+                // 移動先が短いタブでもアニメーション中にページが縮んで現在位置が丸められないよう、高さを維持する
+                swiper.wrapperEl.style.minHeight = `${swiper.wrapperEl.getBoundingClientRect().height}px`;
+            }
+
+            this.pending_tab_scroll_restore = {
+                tab_index: this.active_tab_index,
+                scroll_position,
+            };
+        },
+
+        // 横スライド用の見た目の補正を、同じ表示になる実際のスクロール位置へ置き換える
+        restoreActiveTabScrollPosition(): void {
+            const pending_restore = this.pending_tab_scroll_restore;
+            if (pending_restore === null) {
+                return;
+            }
+
+            // スタイル解除・Swiper の高さ確定・実スクロールをブラウザの描画を挟まず行い、縦方向のジャンプを見せない
+            this.pending_tab_scroll_restore = null;
+            const swiper = this.swiper_instance;
+            swiper?.slides[pending_restore.tab_index]?.querySelector<HTMLElement>('.channels')
+                ?.style.removeProperty('transform');
+            swiper?.wrapperEl.style.removeProperty('min-height');
+            swiper?.updateAutoHeight(0);
+            window.scrollTo({top: pending_restore.scroll_position, left: window.scrollX, behavior: 'auto'});
         },
 
         // タブ一覧の内容に応じた初期選択indexを返す
