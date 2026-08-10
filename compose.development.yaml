@@ -24,6 +24,8 @@ services:
     environment:
       KONOMITV_BS4K_SOURCE_TREE: '/code/source-tree'
       GOOGLE_APPLICATION_CREDENTIALS: '/host-home/.config/gcloud/application_default_credentials.json'
+      GOOGLE_VERTEX_PROJECT: '${GOOGLE_VERTEX_PROJECT:-}'
+      GOOGLE_VERTEX_LOCATION: '${GOOGLE_VERTEX_LOCATION:-global}'
       OPENCODE_ENABLE_EXA: '1'
 
     volumes:

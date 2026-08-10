@@ -205,6 +205,9 @@ def test_compose_keeps_source_tree_and_host_home_read_only(compose_filename: str
     assert service['environment']['GOOGLE_APPLICATION_CREDENTIALS'] == (
         '/host-home/.config/gcloud/application_default_credentials.json'
     )
+    assert service['environment']['GOOGLE_VERTEX_PROJECT'] == '${GOOGLE_VERTEX_PROJECT:-}'
+    assert service['environment']['GOOGLE_VERTEX_LOCATION'] == '${GOOGLE_VERTEX_LOCATION:-global}'
+    assert service['environment']['OPENCODE_ENABLE_EXA'] == '1'
 
 
 @pytest.mark.parametrize('compose_filename', COMPOSE_FILENAMES)
@@ -541,3 +544,5 @@ def test_public_env_example_exposes_all_host_specific_compose_settings() -> None
     assert 'KONOMITV_RENDER_GID=992' in env_example
     assert 'KONOMITV_CUDA_VERSION=12.4' in env_example
     assert 'KONOMITV_NONFREE=true' in env_example
+    assert 'GOOGLE_VERTEX_PROJECT=' in env_example
+    assert 'GOOGLE_VERTEX_LOCATION=global' in env_example
