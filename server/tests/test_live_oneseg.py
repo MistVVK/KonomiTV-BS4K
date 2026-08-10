@@ -6,7 +6,7 @@ from fastapi import HTTPException
 
 from app.config import ServerSettings
 from app.models.Channel import Channel
-from app.routers.LiveStreamsRouter import ValidateChannelID
+from app.routers.LiveStreamsRouter import ValidateChannelID, ValidateQuality
 from app.streams.LiveEncodingTask import LiveEncodingTask
 
 
@@ -62,6 +62,7 @@ def _build_encoding_task(
     Args:
         monkeypatch (pytest.MonkeyPatch): Config() をテスト設定へ差し替える fixture。
         is_24fps_mode_enabled (bool): 24fps モード設定値。
+        video_codec (str): 出力映像コーデック。
 
     Returns:
         LiveEncodingTask: オプション生成に必要な属性を設定したタスク。
@@ -85,25 +86,14 @@ def _build_encoding_task(
     return task
 
 
-@pytest.mark.parametrize(
-    ('quality', 'expected_gop'),
-    [
-        ('240p', '8'),
-        ('240p-hevc', '30'),
-    ],
-)
-def test_ffmpeg_oneseg_options_preserve_progressive_vfr(
+def test_ffmpeg_oneseg_avc_options_copy_video_and_normalize_audio(
     monkeypatch: pytest.MonkeyPatch,
-    quality: str,
-    expected_gop: str,
 ) -> None:
     """
-    FFmpegのワンセグ入力へ固定fps・インターレース解除・24fps化を適用しない。
+    FFmpeg の AVC ワンセグは映像をコピーし、音声だけをブラウザ互換 AAC へ正規化する。
 
     Args:
         monkeypatch (pytest.MonkeyPatch): Config() をテスト設定へ差し替える fixture。
-        quality (str): テストする画質。
-        expected_gop (str): 期待する GOP 長。
 
     Returns:
         None
@@ -112,55 +102,80 @@ def test_ffmpeg_oneseg_options_preserve_progressive_vfr(
     task = _build_encoding_task(
         monkeypatch,
         is_24fps_mode_enabled=True,
-        video_codec='hevc' if quality.endswith('-hevc') else 'avc',
+        video_codec='avc',
     )
-    options = task.buildFFmpegOptions(quality, 'GR', False, True)  # type: ignore[arg-type]
+    options = task.buildFFmpegOptions('240p', 'GR', False, True)
 
     assert options[options.index('-analyzeduration') + 1] == '2500000'
-    assert options[options.index('-fps_mode') + 1] == 'vfr'
-    assert options[options.index('-g') + 1] == expected_gop
+    assert options[options.index('-c:v') + 1] == 'copy'
+    assert options[options.index('-c:a') + 1] == 'aac'
+    assert options[options.index('-ac') + 1] == '2'
+    assert options[options.index('-b:a') + 1] == '96K'
+    assert options[options.index('-ar') + 1] == '48000'
+    assert options[options.index('-max_interleave_delta') + 1] == '500K'
     assert '-r' not in options
+    assert '-g' not in options
+    assert '-copyts' not in options
     assert '0:a:1' not in options
     assert '0:a?' in options
+    assert '-muxrate' not in options
+    assert '-pcr_period' not in options
+    assert all('yadif' not in option for option in options)
+    assert all('pullup' not in option for option in options)
+    assert all('dejudder' not in option for option in options)
+
+
+def test_ffmpeg_oneseg_hevc_options_normalize_to_15fps_cfr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    FFmpeg の HEVC ワンセグはインターレース解除・24fps化をせず、15fps CFR へ正規化する。
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): Config() をテスト設定へ差し替える fixture。
+
+    Returns:
+        None
+    """
+
+    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=True, video_codec='hevc')
+    options = task.buildFFmpegOptions('240p-hevc', 'GR', False, True)  # type: ignore[arg-type]
+
+    assert options[options.index('-analyzeduration') + 1] == '2500000'
+    assert options[options.index('-r') + 1] == '15'
+    assert options[options.index('-g') + 1] == '30'
+    assert '-copyts' in options
+    assert '-fps_mode' not in options
     assert options[options.index('-acodec') + 1] == 'aac'
     assert options[options.index('-ac') + 1] == '2'
     assert options[options.index('-ab') + 1] == '96K'
     assert options[options.index('-ar') + 1] == '48000'
+    assert '-muxrate' not in options
+    assert '-pcr_period' not in options
     assert all('yadif' not in option for option in options)
     assert all('pullup' not in option for option in options)
     assert all('dejudder' not in option for option in options)
 
 
 @pytest.mark.parametrize('encoder_type', ['QSVEncC', 'NVEncC', 'VCEEncC'])
-@pytest.mark.parametrize(
-    ('quality', 'expected_gop'),
-    [
-        ('240p', '8'),
-        ('240p-hevc', '30'),
-    ],
-)
-def test_hwenc_oneseg_options_preserve_progressive_vfr(
+def test_hwenc_oneseg_hevc_options_normalize_to_15fps_cfr(
     monkeypatch: pytest.MonkeyPatch,
     encoder_type: str,
-    quality: str,
-    expected_gop: str,
 ) -> None:
     """
-    各HWEncCのワンセグ入力へ固定fps・インターレース解除・24fps化を適用しない。
+    各HWEncCのワンセグはインターレース解除・24fps化をせず、15fps CFR へ正規化する。
 
     Args:
         monkeypatch (pytest.MonkeyPatch): Config() をテスト設定へ差し替える fixture。
         encoder_type (str): テストする HWEncC の種類。
-        quality (str): テストする画質。
-        expected_gop (str): 期待する GOP 長。
 
     Returns:
         None
     """
 
-    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=True, video_codec='avc')
+    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=True, video_codec='hevc')
     options = task.buildHWEncCOptions(  # type: ignore[arg-type]
-        quality,
+        '240p-hevc',
         encoder_type,
         'GR',
         False,
@@ -169,9 +184,9 @@ def test_hwenc_oneseg_options_preserve_progressive_vfr(
 
     assert options[options.index('--input-probesize') + 1] == '3000K'
     assert float(options[options.index('--input-analyze') + 1]) == pytest.approx(2.5)
-    assert options[options.index('--avsync') + 1] == 'vfr'
-    assert options[options.index('--gop-len') + 1] == expected_gop
-    assert '--fps' not in options
+    assert options[options.index('--fps') + 1] == '15'
+    assert options[options.index('--avsync') + 1] == 'forcecfr'
+    assert options[options.index('--gop-len') + 1] == '30'
     assert '--interlace' not in options
     assert '--audio-copy' not in options
     assert options[options.index('--audio-codec') + 1] == 'aac'
@@ -179,9 +194,36 @@ def test_hwenc_oneseg_options_preserve_progressive_vfr(
     assert options[options.index('--audio-samplerate') + 1] == '48000'
     assert options[options.index('--audio-stream') + 1] == ':stereo'
     assert options[options.index('--audio-ignore-decode-error') + 1] == '100'
+    assert all(not option.startswith('muxrate:') for option in options)
     assert all(not option.startswith('--vpp-deinterlace') for option in options)
     assert all(not option.startswith('--vpp-yadif') for option in options)
     assert all(not option.startswith('--vpp-afs') for option in options)
+
+
+def test_oneseg_disables_stream_anchor_even_when_client_requests_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ワンセグは client が Anchor 有効でも marker 付与と Bridge の Anchor 最終化を行わない。"""
+
+    task = _build_encoding_task(monkeypatch, is_24fps_mode_enabled=False, video_codec='av1')
+    task.live_stream.quality = '240p'  # type: ignore[attr-defined]
+    task.live_stream.encoding_options.audio_codec = 'opus'  # type: ignore[attr-defined]
+
+    assert task.IsLiveStreamAnchorActive(is_oneseg=True) is False
+    assert task.IsLiveStreamAnchorActive(is_oneseg=False) is True
+    assert task.ResolveStreamAnchorGenerationID(False) is None
+
+    bridge_options = task.BuildTSCodecBridgeOptions(is_oneseg=True)
+    assert '--stream-anchor-v1' not in bridge_options
+    assert bridge_options[:4] == ['--video-codec', 'av1', '--audio-codec', 'opus']
+    # AV1 は codec Bridge のため transport-rate は維持する。
+    assert '--transport-rate-kbps' in bridge_options
+
+    ffmpeg_options = task.buildFFmpegOptions('240p', 'GR', False, True)  # type: ignore[arg-type]
+    assert ffmpeg_options[ffmpeg_options.index('-r') + 1] == '15'
+    assert '-copyts' in ffmpeg_options
+    assert '-muxrate' in ffmpeg_options
+    assert '-pcr_period' in ffmpeg_options
 
 
 def test_non_oneseg_encoding_options_keep_existing_interlaced_path(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -226,6 +268,87 @@ def test_oneseg_input_analysis_keeps_retry_increments(monkeypatch: pytest.Monkey
     hwenc_options = task.buildHWEncCOptions('240p', 'QSVEncC', 'GR', False, True)
     assert hwenc_options[hwenc_options.index('--input-probesize') + 1] == '3500K'
     assert float(hwenc_options[hwenc_options.index('--input-analyze') + 1]) == pytest.approx(2.7)
+
+
+@pytest.mark.parametrize(
+    ('video_codec', 'audio_codec'),
+    [
+        ('av1', 'aac'),
+        ('vp9', 'aac'),
+        ('hevc', 'opus'),
+    ],
+)
+def test_oneseg_quality_validation_rejects_bridge_codecs(
+    monkeypatch: pytest.MonkeyPatch,
+    video_codec: str,
+    audio_codec: str,
+) -> None:
+    """
+    ワンセグへの直接要求でも AV1 / VP9 / Opus を TS Codec Bridge へ流さず拒否する。
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): チャンネルとエンコーダーの取得結果を差し替える fixture。
+        video_codec (str): 要求する映像コーデック。
+        audio_codec (str): 要求する音声コーデック。
+
+    Returns:
+        None
+    """
+
+    class Query:
+        async def get_or_none(self) -> SimpleNamespace:
+            return SimpleNamespace(is_radiochannel=False, is_oneseg=True)
+
+    monkeypatch.setattr(Channel, 'filter', lambda **_kwargs: Query())
+    monkeypatch.setattr(
+        'app.routers.LiveStreamsRouter.GetEncoderForLiveChannel',
+        lambda _display_channel_id: 'FFmpeg',
+    )
+
+    with pytest.raises(HTTPException) as ex_info:
+        asyncio.run(ValidateQuality(  # type: ignore[arg-type]
+            '240p',
+            'gr013',
+            video_codec=video_codec,
+            audio_codec=audio_codec,
+        ))
+
+    assert ex_info.value.status_code == 422
+    assert ex_info.value.detail == {
+        'code': 'UnsupportedCombination',
+        'message': 'OneSeg live playback only supports AVC or HEVC video with normalized AAC audio.',
+    }
+
+
+def test_oneseg_quality_validation_limits_hevc_to_240p(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    ワンセグ HEVC は要求画質が高くても 240p へ制限し、AVC の既存契約は変更しない。
+
+    Args:
+        monkeypatch (pytest.MonkeyPatch): チャンネルとエンコーダーの取得結果を差し替える fixture。
+
+    Returns:
+        None
+    """
+
+    class Query:
+        async def get_or_none(self) -> SimpleNamespace:
+            return SimpleNamespace(is_radiochannel=False, is_oneseg=True)
+
+    monkeypatch.setattr(Channel, 'filter', lambda **_kwargs: Query())
+    monkeypatch.setattr(
+        'app.routers.LiveStreamsRouter.GetEncoderForLiveChannel',
+        lambda _display_channel_id: 'FFmpeg',
+    )
+
+    hevc_quality = asyncio.run(ValidateQuality('1080p-hevc', 'gr013'))
+    assert hevc_quality.quality == '240p-hevc'
+    assert hevc_quality.encoding_options.video_codec == 'hevc'
+    assert hevc_quality.encoding_options.audio_codec == 'aac'
+
+    avc_quality = asyncio.run(ValidateQuality('1080p', 'gr013'))
+    assert avc_quality.quality == '1080p'
+    assert avc_quality.encoding_options.video_codec == 'avc'
 
 
 def test_live_channel_validation_rejects_recording_only_channel(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -438,18 +438,26 @@ class PlayerController {
         const has_video = this.playback_mode === 'Live' ?
             channels_store.channel.current.is_radiochannel === false :
             player_store.recorded_program.recorded_video.has_video;
+        const is_oneseg_live_playback = (
+            this.playback_mode === 'Live' &&
+            channels_store.channel.current.is_oneseg === true
+        );
         const saved_streaming_quality = is_bs4k_stream ?
             this.quality_profile.bs4k_playback_streaming_quality :
             this.quality_profile.playback_streaming_quality;
         const available_streaming_qualities = is_bs4k_stream ?
             BS4K_LIVE_STREAMING_QUALITIES :
             (this.playback_mode === 'Live' ? LIVE_STREAMING_QUALITIES : VIDEO_STREAMING_QUALITIES);
-        const preflight_streaming_quality = has_video === false ? saved_streaming_quality :
-            PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
-                options.default_quality ?? saved_streaming_quality,
-                is_bs4k_stream,
-                available_streaming_qualities,
-            );
+        // 320×180 のワンセグを HEVC 候補として検査するときは、保存画質にかかわらず最小の 240p を使う。
+        // 実効 codec が AVC へフォールバックした場合も映像はパススルーされるため、この検査画質で問題ない。
+        const preflight_streaming_quality = is_oneseg_live_playback === true ? '240p' : (
+            has_video === false ? saved_streaming_quality :
+                PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
+                    options.default_quality ?? saved_streaming_quality,
+                    is_bs4k_stream,
+                    available_streaming_qualities,
+                )
+        );
         if (preflight_streaming_quality === null) {
             throw new Error(`Unknown playback quality for codec preflight: ${options.default_quality}`);
         }
@@ -472,6 +480,7 @@ class PlayerController {
                 },
                 this.playback_mode,
                 has_video,
+                is_oneseg_live_playback,
                 this.owner_signal ?? undefined,
             );
             this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
@@ -504,9 +513,10 @@ class PlayerController {
             this.playback_mode === 'Live' &&
             channels_store.channel.current.display_channel_id.startsWith('bs4k')
         );
-        const is_oneseg_playback = this.playback_mode === 'Live' ?
-            channels_store.channel.current.is_oneseg === true :
-            player_store.recorded_program.channel?.is_oneseg === true;
+        const is_oneseg_playback = is_oneseg_live_playback || (
+            this.playback_mode === 'Video' &&
+            player_store.recorded_program.channel?.is_oneseg === true
+        );
         this.aribb24_profile = is_oneseg_playback ? 'C' : 'A';
 
         // 文字スーパーの表示設定
@@ -673,6 +683,11 @@ class PlayerController {
                     }
                     return quality_name;
                 };
+                // ワンセグの HEVC 再エンコードでは、入力解像度を大幅に超える画質を表示・要求しない。
+                // AVC は映像パススルーのため、従来どおり画質一覧を維持する。
+                const live_streaming_qualities: (LiveStreamingQuality | BS4KLiveStreamingQuality)[] =
+                    is_oneseg_live_playback === true && is_hevc_playback === true ? ['240p'] :
+                        (is_bs4k_live === true ? BS4K_LIVE_STREAMING_QUALITIES : LIVE_STREAMING_QUALITIES);
                 const normalize_default_quality = (
                     default_quality: string,
                     quality_names: (LiveStreamingQuality | BS4KLiveStreamingQuality | VideoStreamingQuality)[],
@@ -723,7 +738,6 @@ class PlayerController {
                     // 通常のチャンネルの場合
                     } else {
                         // 画質リストを作成
-                        const live_streaming_qualities = is_bs4k_live === true ? BS4K_LIVE_STREAMING_QUALITIES : LIVE_STREAMING_QUALITIES;
                         for (const quality_name of live_streaming_qualities) {
                             qualities.push({
                                 name: get_quality_display_name(quality_name),
@@ -738,7 +752,6 @@ class PlayerController {
                         }
                     }
                     // デフォルトの画質
-                    const live_streaming_qualities = is_bs4k_live === true ? BS4K_LIVE_STREAMING_QUALITIES : LIVE_STREAMING_QUALITIES;
                     let default_quality: string = is_bs4k_live === true ?
                         this.quality_profile.bs4k_playback_streaming_quality :
                         this.quality_profile.playback_streaming_quality;
@@ -747,7 +760,9 @@ class PlayerController {
                         // 画質プロファイルに記載の画質ではなく、指定された（前回再生時の）画質を使ってレジュームする
                         default_quality = options.default_quality;
                     }
-                    default_quality = normalize_default_quality(default_quality, live_streaming_qualities);
+                    // 保存画質や再初期化前の画質は変更せず、このワンセグ HEVC セッションだけを 240p に固定する。
+                    default_quality = is_oneseg_live_playback === true && is_hevc_playback === true ?
+                        '240p' : normalize_default_quality(default_quality, live_streaming_qualities);
                     // ラジオチャンネルのみ常に 48KHz/192kbps に固定する
                     if (channels_store.channel.current.is_radiochannel) {
                         default_quality = '48kHz/192kbps';
@@ -3343,6 +3358,10 @@ class PlayerController {
         const is_bs4k = this.playback_mode === 'Live' ?
             channels_store.channel.current.display_channel_id.startsWith('bs4k') :
             player_store.recorded_program.network_id === 0x000B;
+        const is_oneseg_live_playback = (
+            this.playback_mode === 'Live' &&
+            channels_store.channel.current.is_oneseg === true
+        );
         const get_requested_video_codec = (): KonomiTVBS4KPlaybackVideoCodec =>
             player_store.konomitv_bs4k_playback_codec_override?.video_codec ??
             settings_store.settings[getKonomiTVBS4KPlaybackVideoCodecSettingKey(
@@ -3379,12 +3398,14 @@ class PlayerController {
                 const current_quality_name = (
                     typeof current_quality_index === 'number' && current_player.options.video.quality !== undefined
                 ) ? current_player.options.video.quality[current_quality_index]?.name : null;
-                const preflight_streaming_quality = has_video === false ? saved_streaming_quality :
-                    PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
-                        current_quality_name ?? saved_streaming_quality,
-                        is_bs4k,
-                        available_streaming_qualities,
-                    );
+                const preflight_streaming_quality = is_oneseg_live_playback === true ? '240p' : (
+                    has_video === false ? saved_streaming_quality :
+                        PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
+                            current_quality_name ?? saved_streaming_quality,
+                            is_bs4k,
+                            available_streaming_qualities,
+                        )
+                );
                 if (preflight_streaming_quality === null) {
                     current_player.notice('現在の画質を能力検査できないため、コーデックを変更しませんでした。');
                     return false;
@@ -3404,6 +3425,7 @@ class PlayerController {
                     },
                     this.playback_mode,
                     has_video,
+                    is_oneseg_live_playback,
                     this.owner_signal ?? undefined,
                 );
                 this.assertInitializationIsCurrent(selection_generation, playback_target_key);

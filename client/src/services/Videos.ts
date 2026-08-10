@@ -576,7 +576,13 @@ class Videos {
     /** 保存された映像 codec から、より互換性の低い側へは戻らない候補順を返す。 */
     static getKonomiTVBS4KLowerVideoCodecOrder(
         konomitv_bs4k_requested_video_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_is_oneseg_live_playback: boolean = false,
     ): KonomiTVBS4KPlaybackVideoCodec[] {
+        // ワンセグは TS Codec Bridge を必要としない AVC / HEVC に限定する。
+        // 既存の下位フォールバック順を維持しつつ、利用できない AV1 / VP9 だけを候補から除外する。
+        if (konomitv_bs4k_is_oneseg_live_playback === true) {
+            return konomitv_bs4k_requested_video_codec === 'avc' ? ['avc'] : ['hevc', 'avc'];
+        }
         const konomitv_bs4k_ladder: readonly KonomiTVBS4KPlaybackVideoCodec[] =
             ['av1', 'vp9', 'hevc', 'avc'];
         return konomitv_bs4k_ladder.slice(
@@ -587,7 +593,10 @@ class Videos {
     /** 保存された音声 codec から、Opus→AAC だけを許す候補順を返す。 */
     static getKonomiTVBS4KLowerAudioCodecOrder(
         konomitv_bs4k_requested_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
+        konomitv_bs4k_is_oneseg_live_playback: boolean = false,
     ): KonomiTVBS4KPlaybackAudioCodec[] {
+        // PCE 依存 AAC もブラウザで再生できるよう、音声は標準的な AAC stereo へ正規化する。
+        if (konomitv_bs4k_is_oneseg_live_playback === true) return ['aac'];
         return konomitv_bs4k_requested_audio_codec === 'opus' ? ['opus', 'aac'] : ['aac'];
     }
 
@@ -602,6 +611,7 @@ class Videos {
         konomitv_bs4k_video_profile: IKonomiTVBS4KPlaybackVideoProfile,
         konomitv_bs4k_playback_mode: IKonomiTVBS4KPlaybackMode,
         konomitv_bs4k_has_video: boolean,
+        konomitv_bs4k_is_oneseg_live_playback: boolean = false,
         signal?: AbortSignal,
     ): Promise<IKonomiTVBS4KPreflightPlaybackProfile | null> {
         if (signal?.aborted === true) {
@@ -611,6 +621,7 @@ class Videos {
             `${konomitv_bs4k_requested_video_codec}/${konomitv_bs4k_requested_audio_codec}`;
         const konomitv_bs4k_audio_codec_order = this.getKonomiTVBS4KLowerAudioCodecOrder(
             konomitv_bs4k_requested_audio_codec,
+            konomitv_bs4k_is_oneseg_live_playback,
         );
 
         // ラジオ・音声のみ録画でも URL / セッション契約上は AVC 8bit を中立な映像値として固定する。
@@ -654,7 +665,10 @@ class Videos {
 
         for (
             const konomitv_bs4k_video_codec of
-            this.getKonomiTVBS4KLowerVideoCodecOrder(konomitv_bs4k_requested_video_codec)
+            this.getKonomiTVBS4KLowerVideoCodecOrder(
+                konomitv_bs4k_requested_video_codec,
+                konomitv_bs4k_is_oneseg_live_playback,
+            )
         ) {
             // browser 判定を先に行い、非対応 codec のためにサーバー実 probe を起動しない。
             const konomitv_bs4k_browser_video_bit_depths =

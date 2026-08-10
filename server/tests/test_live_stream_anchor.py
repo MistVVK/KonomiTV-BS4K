@@ -264,6 +264,33 @@ def test_ffmpeg8_hardware_oneseg_keeps_aac_stereo_normalization(
     assert options[options.index('-ac') + 1] == '2'
     assert options[options.index('-b:a') + 1] == '96K'
     assert options[options.index('-af') + 1] == LiveEncodingTask.LIVE_TRANSCODE_AUDIO_FILTER
+    assert options[options.index('-r') + 1] == '15'
+    assert '-copyts' in options
+    assert '-fps_mode' not in options
+    assert '-muxrate' not in options
+
+
+def test_oneseg_disables_stream_anchor_bridge_option_even_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ワンセグは Stream Anchor 有効設定でも Bridge に --stream-anchor-v1 を渡さない。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=True,
+        video_codec='av1',
+        audio_codec='opus',
+    )
+
+    oneseg_options = task.BuildTSCodecBridgeOptions(is_oneseg=True)
+    fullseg_options = task.BuildTSCodecBridgeOptions(is_oneseg=False)
+
+    assert task.IsLiveStreamAnchorActive(is_oneseg=True) is False
+    assert oneseg_options[:4] == ['--video-codec', 'av1', '--audio-codec', 'opus']
+    assert '--stream-anchor-v1' not in oneseg_options
+    assert '--transport-rate-kbps' in oneseg_options
+    # 通常地デジでは従来どおり Anchor を付ける。
+    assert '--stream-anchor-v1' in fullseg_options
 
 
 def test_ffmpeg8_software_advanced_codec_uses_single_map_and_vbv(

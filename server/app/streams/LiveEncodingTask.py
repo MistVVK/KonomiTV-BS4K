@@ -125,6 +125,31 @@ class LiveEncodingTask:
         return self.live_stream.stream_anchor_enabled
 
 
+    def IsLiveStreamAnchorActive(
+        self,
+        *,
+        is_radiochannel: bool = False,
+        is_oneseg: bool = False,
+    ) -> bool:
+        """
+        最終 TS に Stream Anchor を載せる実行条件を返す。
+
+        Args:
+            is_radiochannel (bool): ラジオチャンネルかどうか。ラジオは従来 TS 経路を維持する。
+            is_oneseg (bool): ワンセグかどうか。約 15fps の再エンコードでは marker/PCR が
+                Bridge の fail-closed 閾値を超えやすいため無効化する。
+
+        Returns:
+            bool: Stream Anchor を付与するなら True。
+        """
+
+        return (
+            self.IsStreamAnchorEnabled() is True and
+            is_radiochannel is False and
+            is_oneseg is False
+        )
+
+
     def GetRequestedVideoCodec(self) -> KonomiTVBS4KVideoCodec:
         """正規化済みの要求映像コーデックを返す。"""
 
@@ -161,7 +186,11 @@ class LiveEncodingTask:
         )
 
 
-    def BuildTSCodecBridgeOptions(self, is_radiochannel: bool = False) -> list[str]:
+    def BuildTSCodecBridgeOptions(
+        self,
+        is_radiochannel: bool = False,
+        is_oneseg: bool = False,
+    ) -> list[str]:
         """確定 codec tuple と Stream Anchor 条件から Bridge オプションを返す。"""
 
         video_codec = self.GetRequestedVideoCodec()
@@ -170,7 +199,8 @@ class LiveEncodingTask:
             video_codec if is_radiochannel is False and video_codec in ('vp9', 'av1') else 'passthrough',
             '--audio-codec', self.GetRequestedAudioCodec(),
         ]
-        if self.IsStreamAnchorEnabled() is True and is_radiochannel is False:
+        # ラジオ・ワンセグでは Stream Anchor を付けず、codec 正規化だけを行う。
+        if self.IsLiveStreamAnchorActive(is_radiochannel=is_radiochannel, is_oneseg=is_oneseg) is True:
             options.append('--stream-anchor-v1')
         if is_radiochannel is False and video_codec == 'av1':
             muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
@@ -345,7 +375,14 @@ class LiveEncodingTask:
             options += ['-profile:v', 'main']
 
         if is_oneseg is True:
-            options += ['-fps_mode', 'vfr', '-g', '15' if codec in ('vp9', 'av1') else ('30' if codec == 'hevc' else '8')]
+            # ワンセグ入力は約 10～15fps の VFR だが、固定 muxrate / PCR と再生安定のため 15fps CFR へ正規化する。
+            # VFR のままだと PCR gap が 500ms を超え、TS Codec Bridge が fail-closed で落ちる。
+            # timed_id3 は copy のため、映像/音声だけ時刻を振り直すと DTS_BEFORE_PCR になるので -copyts を併用する。
+            options += [
+                '-r', '15',
+                '-g', '15' if codec in ('vp9', 'av1') else ('30' if codec == 'hevc' else '8'),
+                '-copyts',
+            ]
         elif channel_type == 'BS4K':
             frame_rate = 30 if '-30fps' in quality else 60
             options += [
@@ -386,7 +423,8 @@ class LiveEncodingTask:
             '-max_delay', '250000',
             '-max_interleave_delta', f'{max_interleave_delta}K',
         ]
-        if self.IsStreamAnchorEnabled() is True or self.IsTSCodecBridgeRequired() is True:
+        # ワンセグでは Stream Anchor を無効化するため、codec Bridge が必要なときだけ固定搬送を使う。
+        if self.IsLiveStreamAnchorActive(is_oneseg=is_oneseg) is True or self.IsTSCodecBridgeRequired() is True:
             options += [
                 '-muxrate', ResolveKonomiTVBS4KAdvancedLiveMuxrate(
                     bitrate.video_bitrate_max,
@@ -481,6 +519,36 @@ class LiveEncodingTask:
         else:
             analyzeduration = round(500000 + (self._retry_count * 200000))  # リトライ回数に応じて少し増やす
 
+        # ワンセグの H.264 映像は再エンコードせず、そのまま MPEG-TS へ remux する。
+        # 音声だけは放送局によって PCE 依存 AAC が含まれるため、ブラウザ互換の AAC stereo へ正規化する。
+        # 再エンコードと TS Codec Bridge を通さないことで、約 15fps の PCR / DTS 配置にも依存しない。
+        if is_oneseg is True and codec == 'avc':
+            max_interleave_delta = round(500 + (self._retry_count * 100))
+            return [
+                '-fflags', 'nobuffer',
+                '-f', 'mpegts',
+                '-analyzeduration', str(analyzeduration),
+                '-i', 'pipe:0',
+                '-ignore_unknown',
+                '-map', '0:v:0',
+                '-map', '0:a?',
+                '-map', '0:d?',
+                '-c:v', 'copy',
+                '-af', self.LIVE_TRANSCODE_AUDIO_FILTER,
+                '-c:a', 'aac',
+                '-aac_coder', 'twoloop',
+                '-ac', '2',
+                '-b:a', '96K',
+                '-ar', '48000',
+                '-c:d', 'copy',
+                '-max_delay', '250000',
+                '-max_interleave_delta', f'{max_interleave_delta}K',
+                '-flush_packets', '1',
+                '-y',
+                '-f', 'mpegts',
+                'pipe:1',
+            ]
+
         # 入力
         ## -analyzeduration をつけることで、ストリームの分析時間を短縮できる
         input_options = '-f mpegts'
@@ -546,11 +614,14 @@ class LiveEncodingTask:
             ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
             gop_length_second = self.GOP_LENGTH_SECONDS_H265
 
-        # ワンセグはプログレッシブかつ約 10～15fps の VFR で放送されているため、
-        ## フレームレートの固定やインターレース解除を行わず、入力 PTS をそのまま維持する。
+        # ワンセグはプログレッシブのためインターレース解除は行わない。
+        # 入力は約 10～15fps の VFR だが、PCR と再生を安定させるため 15fps CFR へ正規化する。
+        # timed_id3 は copy のため、映像/音声だけ時刻を振り直すと DTS_BEFORE_PCR になるので -copyts を併用する。
         if is_oneseg is True:
             options.append(f'-vf {",".join(aspect_filters)}')
-            options.append(f'-fps_mode vfr -g {15 if codec in ("vp9", "av1") else (30 if codec == "hevc" else 8)}')
+            options.append(
+                f'-r 15 -g {15 if codec in ("vp9", "av1") else (30 if codec == "hevc" else 8)} -copyts'
+            )
         ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わない
         elif channel_type == "BS4K":
             options.append(f'-vf {",".join(aspect_filters)}')
@@ -592,9 +663,9 @@ class LiveEncodingTask:
             # 5.1ch・dual mono・複数音声をstereoへ黙って変換しない。
             options.append('-acodec copy')
 
-        # Bridge は PCR gap を fail closed で検証するため、Anchor 経路の TS は
-        # codec にかかわらず固定 muxrate と 20ms PCR 周期で出力する。
-        if self.IsStreamAnchorEnabled() is True or self.IsTSCodecBridgeRequired() is True:
+        # Bridge は PCR gap を fail closed で検証するため、Anchor / codec Bridge 経路の TS は
+        # 固定 muxrate と 20ms PCR 周期で出力する。ワンセグは Anchor 無効のため codec Bridge 時のみ適用する。
+        if self.IsLiveStreamAnchorActive(is_oneseg=is_oneseg) is True or self.IsTSCodecBridgeRequired() is True:
             options.append(
                 f'-muxrate {ResolveKonomiTVBS4KAdvancedLiveMuxrate(bitrate.video_bitrate_max, quality=quality, video_codec=codec)} '
                 '-pcr_period 20'
@@ -718,11 +789,13 @@ class LiveEncodingTask:
         ## --input-probesize, --input-analyze をつけることで、ストリームの分析時間を短縮できる
         ## 両方つけるのが重要で、--input-analyze だけだとエンコーダーがフリーズすることがある
         options.append(f'--input-format mpegts --input-probesize {input_probesize} --input-analyze {input_analyze}')
-        ## BS4K とワンセグ以外では 29.97fps (59.94i) を指定する
+        ## BS4K 以外では入力 fps を明示する
         ## BS4K は MPEG-TS/avhw 入力の 59.94p をそのまま読ませ、30fps 品質は VPP で間引く
-        ## ワンセグは約 10～15fps の入力 PTS をそのまま読ませる
+        ## ワンセグは約 10～15fps の VFR 入力を 15fps として読み、後段で CFR 化する
         is_bs4k_30fps_quality = channel_type == 'BS4K' and '-30fps' in quality
-        if channel_type != 'BS4K' and is_oneseg is False:
+        if is_oneseg is True:
+            options.append('--fps 15')
+        elif channel_type != 'BS4K':
             options.append('--fps 30000/1001')
         ## 入力を指定する
         options.append('--input -')
@@ -828,10 +901,10 @@ class LiveEncodingTask:
             ## H.265/HEVC では高圧縮化のため、最大 GOP 長を長くする
             gop_length_second = self.GOP_LENGTH_SECONDS_H265
 
-        # ワンセグはプログレッシブかつ約 10～15fps の VFR で放送されているため、
-        ## フレームレートの固定やインターレース解除を行わず、入力 PTS をそのまま維持する。
+        # ワンセグはプログレッシブのためインターレース解除は行わない。
+        # 入力は約 10～15fps の VFR だが、PCR と再生を安定させるため 15fps CFR へ正規化する。
         if is_oneseg is True:
-            options.append(f'--avsync vfr --gop-len {30 if QUALITY[quality].is_hevc is True else 8}')
+            options.append(f'--avsync forcecfr --gop-len {30 if QUALITY[quality].is_hevc is True else 8}')
         ## BS4K は 60p (プログレッシブ) で放送されているので、インターレース解除を行わない
         elif channel_type == "BS4K":
             if is_bs4k_30fps_quality is True:
@@ -879,7 +952,8 @@ class LiveEncodingTask:
         options.append(f'--output-res {video_width}x{video_height}')
 
         # HWEncC 内部の FFmpeg MPEG-TS muxer にも、Anchor 経路と同じ搬送契約を渡す。
-        if self.IsStreamAnchorEnabled() is True:
+        # ワンセグは Stream Anchor を無効化するため、ここでは固定 muxrate を付けない。
+        if self.IsLiveStreamAnchorActive(is_oneseg=is_oneseg) is True:
             muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(QUALITY[quality].video_bitrate_max)
             options.append(f'-m muxrate:{muxrate} -m pcr_period:20')
 
@@ -1088,10 +1162,10 @@ class LiveEncodingTask:
         ENCODER_TYPE = GetEncoderForLiveChannel(self.live_stream.display_channel_id)
 
         # Stream Anchor は映像 access unit と対応付けるため、通常 API の映像付きライブだけで有効にする。
-        # Compatibility API とラジオは従来 TS 経路を維持する。
-        stream_anchor_enabled = (
-            self.IsStreamAnchorEnabled() is True and
-            channel.is_radiochannel is False
+        # Compatibility API・ラジオ・ワンセグは従来 TS 経路 (または codec Bridge のみ) を維持する。
+        stream_anchor_enabled = self.IsLiveStreamAnchorActive(
+            is_radiochannel = channel.is_radiochannel,
+            is_oneseg = channel.is_oneseg,
         )
         codec_bridge_required = self.IsTSCodecBridgeRequired(
             is_radiochannel = channel.is_radiochannel,
@@ -1239,8 +1313,11 @@ class LiveEncodingTask:
                 self.isFullHDChannel(channel.network_id, channel.service_id)
             )
 
-            ## ラジオチャンネルでは HW エンコードの意味がないため、FFmpeg に固定する
-            if channel.is_radiochannel is True:
+            ## ラジオと AVC 映像をパススルーするワンセグでは HW エンコードの意味がないため、FFmpeg に固定する
+            if (
+                channel.is_radiochannel is True or
+                (channel.is_oneseg is True and self.GetRequestedVideoCodec() == 'avc')
+            ):
                 ENCODER_TYPE = 'FFmpeg'
 
             # Anchor またはcodec変換でBridgeが必要な時だけ、Encoder 出力と Bridge 入力を OS pipe で直結する。
@@ -1251,6 +1328,7 @@ class LiveEncodingTask:
                 bridge_read_pipe, bridge_write_pipe = os.pipe()
                 bridge_options = self.BuildTSCodecBridgeOptions(
                     is_radiochannel = channel.is_radiochannel,
+                    is_oneseg = channel.is_oneseg,
                 )
                 logging.info(
                     f'{self.live_stream.log_prefix} TS Codec Bridge Commands:\n'

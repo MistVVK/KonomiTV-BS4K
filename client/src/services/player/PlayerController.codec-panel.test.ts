@@ -130,6 +130,27 @@ function createController(playback_mode: PlaybackMode): {
 }
 
 
+describe('ワンセグ再生コーデック制約', () => {
+    it.each([
+        ['av1', ['hevc', 'avc']],
+        ['vp9', ['hevc', 'avc']],
+        ['hevc', ['hevc', 'avc']],
+        ['avc', ['avc']],
+    ] as const)('保存映像コーデック %s から再生時だけ %j に制限する', (video_codec, expected_order) => {
+        expect(Videos.getKonomiTVBS4KLowerVideoCodecOrder(video_codec, true)).toEqual(expected_order);
+    });
+
+    it.each(['opus', 'aac'] as const)('保存音声コーデック %s から再生時だけ AAC に制限する', (audio_codec) => {
+        expect(Videos.getKonomiTVBS4KLowerAudioCodecOrder(audio_codec, true)).toEqual(['aac']);
+    });
+
+    it('録画ワンセグにはライブ専用制約を適用しない', () => {
+        expect(Videos.getKonomiTVBS4KLowerVideoCodecOrder('av1', false)).toEqual(['av1', 'vp9', 'hevc', 'avc']);
+        expect(Videos.getKonomiTVBS4KLowerAudioCodecOrder('opus', false)).toEqual(['opus', 'aac']);
+    });
+});
+
+
 describe.each<PlaybackMode>(['Live', 'Video'])('DPlayer codecサブパネル: %s', (playback_mode) => {
     beforeEach(() => {
         localStorage.clear();
@@ -279,6 +300,7 @@ describe.each<PlaybackMode>(['Live', 'Video'])('DPlayer codecサブパネル: %s
             {is_bs4k: false, streaming_quality: '720p'},
             playback_mode,
             true,
+            false,
             undefined,
         );
     });
@@ -369,5 +391,67 @@ describe.each<PlaybackMode>(['Live', 'Video'])('DPlayer codecサブパネル: %s
         expect(second.player.template.settingBox.classList.contains(
             'dplayer-konomitv-bs4k-setting-box-video-codec',
         )).toBe(true);
+    });
+});
+
+
+describe('DPlayer codecサブパネル: ワンセグライブ', () => {
+    beforeEach(() => {
+        localStorage.clear();
+        document.body.innerHTML = '';
+        setActivePinia(createPinia());
+
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.GR = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            display_channel_id: 'gr013',
+            type: 'GR' as const,
+            is_oneseg: true,
+        })];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'gr013';
+        vi.spyOn(Videos, 'preflightKonomiTVBS4KPlaybackProfile').mockResolvedValue({
+            video_codec: 'hevc',
+            video_bit_depth: 8,
+            audio_codec: 'aac',
+            fallback_reason: 'CapabilityFallback',
+        });
+    });
+
+    it('AV1選択を240p HEVC/AACへ一時フォールバックし、保存設定は変更しない', async () => {
+        const settings_store = useSettingsStore();
+        const player_store = usePlayerStore();
+        const saved_settings_json = JSON.stringify(settings_store.settings);
+        const restart_handler = vi.fn();
+        player_store.event_emitter.on('PlayerRestartRequired', restart_handler);
+        const { player } = createController('Live');
+
+        player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-video-codec')!.click();
+        player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-video-codec-item[data-codec="av1"]',
+        )!.click();
+
+        await vi.waitFor(() => expect(restart_handler).toHaveBeenCalledTimes(1));
+        expect(Videos.preflightKonomiTVBS4KPlaybackProfile).toHaveBeenCalledWith(
+            expect.any(String),
+            'av1',
+            'opus',
+            {is_bs4k: false, streaming_quality: '240p'},
+            'Live',
+            true,
+            true,
+            undefined,
+        );
+        expect(player_store.konomitv_bs4k_playback_codec_override).toEqual({
+            video_codec: 'av1',
+            audio_codec: 'opus',
+        });
+        expect(player_store.konomitv_bs4k_effective_playback_profile).toMatchObject({
+            requested_video_codec: 'av1',
+            requested_audio_codec: 'opus',
+            video_codec: 'hevc',
+            audio_codec: 'aac',
+        });
+        expect(JSON.stringify(settings_store.settings)).toBe(saved_settings_json);
     });
 });

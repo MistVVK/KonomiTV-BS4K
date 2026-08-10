@@ -102,11 +102,21 @@ async def ValidateQuality(
     capability_encoder = selected_encoder
     channel = await Channel.filter(display_channel_id = display_channel_id).get_or_none()
     is_radiochannel = channel is not None and channel.is_radiochannel is True
+    is_oneseg = channel is not None and channel.is_oneseg is True
     if is_radiochannel is True:
         capability_encoder = 'FFmpeg'
         stream_quality = StreamQualityWithOptions(
             quality = cast(QUALITY_TYPES, stream_quality.quality.removesuffix('-hevc')),
             encoding_options = StreamEncodingOptions(audio_codec = audio_codec),
+        )
+    elif is_oneseg is True and stream_quality.encoding_options.video_codec == 'hevc':
+        # 320×180 のワンセグを通常放送用の保存画質まで拡大しないよう、HEVC の実効画質を最小値へ制限する。
+        # codec・bit depth・音声の確定値と明示要求フラグは維持し、ストリームの解像度と bitrate だけを 240p 相当にする。
+        stream_quality = StreamQualityWithOptions(
+            quality = '240p-hevc',
+            encoding_options = stream_quality.encoding_options,
+            is_video_encoding_explicitly_requested = stream_quality.is_video_encoding_explicitly_requested,
+            is_audio_encoding_explicitly_requested = stream_quality.is_audio_encoding_explicitly_requested,
         )
 
     resolved_video_codec = stream_quality.encoding_options.video_codec
@@ -120,7 +130,17 @@ async def ValidateQuality(
         or '-10bit' in quality
     )
 
-    if is_radiochannel is True and resolved_audio_codec != 'aac':
+    # ワンセグは映像を AVC / HEVC、音声を PCE 非依存の AAC stereo に制限する。
+    # TS Codec Bridge が必要な codec の明示要求は、エンコード開始前に拒否する。
+    if is_oneseg is True and (resolved_video_codec not in ('avc', 'hevc') or resolved_audio_codec != 'aac'):
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = {
+                'code': 'UnsupportedCombination',
+                'message': 'OneSeg live playback only supports AVC or HEVC video with normalized AAC audio.',
+            },
+        )
+    elif is_radiochannel is True and resolved_audio_codec != 'aac':
         audio_capability = await KonomiTVBS4KPlaybackCapabilityProbe.getAudioCapability(audio_codec)
         if audio_capability is None or audio_capability.live_available is False:
             reason_code = audio_capability.live_reason_code if audio_capability is not None else 'ProbeFailed'
