@@ -247,7 +247,11 @@ def test_compose_does_not_require_individual_host_path_variables(compose_filenam
 
 
 def test_nvidia_compose_contains_all_nvidia_runtime_settings() -> None:
-    """公開・Developmentで共有するoverlayにNVIDIA runtime設定を集約する。"""
+    """公開・Developmentで共有するoverlayにNVIDIA runtime設定を集約する。
+
+    Returns:
+        None
+    """
 
     service = _load_compose_service('compose.nvidia.yaml')
     environment = cast(dict[str, str], service['environment'])
@@ -267,6 +271,21 @@ def test_nvidia_compose_contains_all_nvidia_runtime_settings() -> None:
         assert 'NVIDIA_VISIBLE_DEVICES' not in compose_text
         assert 'NVIDIA_DRIVER_CAPABILITIES' not in compose_text
         assert 'driver: nvidia' not in compose_text
+
+
+def test_intel_amd_compose_contains_dri_device() -> None:
+    """公開・Developmentで共有するoverlayにIntel・AMD DRMデバイスを集約する。
+
+    Returns:
+        None
+    """
+
+    service = _load_compose_service('compose.intel-amd.yaml')
+
+    assert service['devices'] == ['/dev/dri/:/dev/dri/']
+    for compose_filename in COMPOSE_FILENAMES:
+        service = _load_compose_service(compose_filename)
+        assert service.get('devices') is None
 
 
 def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> None:
@@ -526,6 +545,7 @@ def test_compose_entrypoints_are_explicit() -> None:
     assert re.search(r'(?m)^compose\.override\.yaml$', gitignore) is None
     assert (REPOSITORY_ROOT / 'compose.yaml').is_file()
     assert (REPOSITORY_ROOT / 'compose.development.yaml').is_file()
+    assert (REPOSITORY_ROOT / 'compose.intel-amd.yaml').is_file()
     assert (REPOSITORY_ROOT / 'compose.nvidia.yaml').is_file()
     assert (REPOSITORY_ROOT / 'docker-compose.example.yaml').exists() is False
 
@@ -537,7 +557,9 @@ def test_public_env_example_exposes_all_host_specific_compose_settings() -> None
     env_example = (REPOSITORY_ROOT / '.env.example').read_text(encoding='utf-8')
 
     assert re.search(r'(?m)^\.env$', gitignore) is not None
-    assert 'COMPOSE_FILE=compose.yaml' in env_example
+    assert 'COMPOSE_FILE=compose.yaml:compose.intel-amd.yaml' in env_example
+    assert '#COMPOSE_FILE=compose.yaml:compose.nvidia.yaml' in env_example
+    assert '#COMPOSE_FILE=compose.yaml:compose.intel-amd.yaml:compose.nvidia.yaml' in env_example
     assert 'KONOMITV_UID=1000' in env_example
     assert 'KONOMITV_GID=1000' in env_example
     assert 'KONOMITV_VIDEO_GID=44' in env_example

@@ -1,5 +1,6 @@
 name: konomitv-bs4k
 
+# GPU 構成は compose.intel-amd.yaml / compose.nvidia.yaml で追加する。
 services:
   konomitv:
     image: konomitv-bs4k
@@ -27,14 +28,15 @@ services:
       GOOGLE_VERTEX_PROJECT: '${GOOGLE_VERTEX_PROJECT:-}'
       GOOGLE_VERTEX_LOCATION: '${GOOGLE_VERTEX_LOCATION:-global}'
 
-    # Docker は配布用ビルドと実行環境の固定に使い、config.yaml にはホスト側の絶対パスをそのまま記述する。
     volumes:
+      # ワークツリーの Git commit を検出するため、ソースツリーを read-only で参照する。
       - type: bind
         source: './'
         target: '/code/source-tree/'
         read_only: true
         bind:
           selinux: z
+      # 公開環境の設定・DB・ログは Compose 起点の各パスへ保存する。
       - type: bind
         source: './config.yaml'
         target: '/code/config.yaml'
@@ -50,17 +52,12 @@ services:
         target: '/code/server/logs/'
         bind:
           selinux: z
+      # config.yaml のホスト絶対パスをコンテナ内の /host-rootfs 配下へ対応付ける。
       - type: bind
         source: '/'
         target: '/host-rootfs/'
-      # ACP 認証は、存在が任意の各ファイルではなく必ず存在する HOME を固定パスへ read-only mount して検出する。
+      # ACP CLI と Google ADC の認証情報をホストの標準パスから検出する。
       - type: bind
         source: '${HOME}'
         target: '/host-home/'
         read_only: true
-
-    # Intel QSVとAMD VAAPI/AMFを使用しない環境では、この項目をローカルoverrideで無効化する。
-    devices:
-      - '/dev/dri/:/dev/dri/'
-
-    # NVIDIA NVENCを使用する場合は、compose.nvidia.yamlを組み合わせる。

@@ -1,5 +1,6 @@
 name: konomitv-bs4k-development
 
+# GPU 構成は compose.intel-amd.yaml / compose.nvidia.yaml で追加する。
 services:
   konomitv:
     image: konomitv-bs4k-development
@@ -13,28 +14,32 @@ services:
         KONOMITV_UID: '${KONOMITV_UID:-1000}'
         KONOMITV_GID: '${KONOMITV_GID:-1000}'
 
+    # bind mount 先の所有者と一致する非 root UID/GID で実行する。
     user: '${KONOMITV_UID:-1000}:${KONOMITV_GID:-1000}'
     group_add:
       - '${KONOMITV_VIDEO_GID:-44}'
       - '${KONOMITV_RENDER_GID:-109}'
+    # Development は手動停止を維持し、実行時メモリを 8GB に制限する。
     restart: unless-stopped
     network_mode: host
     mem_limit: 8g
     memswap_limit: 8g
     environment:
       KONOMITV_BS4K_SOURCE_TREE: '/code/source-tree'
+      OPENCODE_ENABLE_EXA: '1'
       GOOGLE_APPLICATION_CREDENTIALS: '/host-home/.config/gcloud/application_default_credentials.json'
       GOOGLE_VERTEX_PROJECT: '${GOOGLE_VERTEX_PROJECT:-}'
       GOOGLE_VERTEX_LOCATION: '${GOOGLE_VERTEX_LOCATION:-global}'
-      OPENCODE_ENABLE_EXA: '1'
 
     volumes:
+      # ワークツリーの Git commit を検出するため、ソースツリーを read-only で参照する。
       - type: bind
         source: './'
         target: '/code/source-tree/'
         read_only: true
         bind:
           selinux: z
+      # Development の設定・DB・ログは専用の state ディレクトリへ隔離する。
       - type: bind
         source: './docker/development/state/config.yaml'
         target: '/code/config.yaml'
@@ -50,13 +55,12 @@ services:
         target: '/code/server/logs/'
         bind:
           selinux: z
+      # config.yaml のホスト絶対パスをコンテナ内の /host-rootfs 配下へ対応付ける。
       - type: bind
         source: '/'
         target: '/host-rootfs/'
+      # ACP CLI と Google ADC の認証情報をホストの標準パスから検出する。
       - type: bind
         source: '${HOME}'
         target: '/host-home/'
         read_only: true
-
-    devices:
-      - '/dev/dri/:/dev/dri/'

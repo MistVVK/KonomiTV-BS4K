@@ -1,0 +1,4 @@
+services:
+  konomitv:
+    devices:
+      - '/dev/dri/:/dev/dri/'
