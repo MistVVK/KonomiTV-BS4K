@@ -397,9 +397,11 @@ class LiveEncodingTask:
             options += ['-r', '30000/1001', '-g', '15']
 
         if self.GetRequestedAudioCodec() == 'opus':
+            # FFmpeg が入力から確定した channel layout をそのまま使い、mono や 5.1ch を
+            # stereo へ暗黙変換しない。MPEG-TS muxer は実 layout に対応する Opus descriptor を生成する。
             options += [
                 '-af', self.LIVE_TRANSCODE_AUDIO_FILTER,
-                '-c:a', 'libopus', '-application', 'audio', '-ac', '2', '-b:a', '192K', '-ar', '48000',
+                '-c:a', 'libopus', '-application', 'audio', '-b:a', '192K', '-ar', '48000',
             ]
         elif is_oneseg is True:
             # ワンセグは従来どおりAAC stereoへ正規化する。
@@ -648,9 +650,10 @@ class LiveEncodingTask:
         # 音声
         options.append('-map 0:v:0 -map 0:a? -map 0:d?')
         if self.GetRequestedAudioCodec() == 'opus':
+            # 入力の channel layout を保持し、mono や 5.1ch を stereo へ暗黙変換しない。
             options.append(
                 f'-af {self.LIVE_TRANSCODE_AUDIO_FILTER} '
-                '-acodec libopus -application audio -ac 2 -ab 192K -ar 48000'
+                '-acodec libopus -application audio -ab 192K -ar 48000'
             )
         elif is_oneseg is True:
             # ワンセグは従来どおりAAC stereoへ正規化する。
@@ -712,10 +715,10 @@ class LiveEncodingTask:
         max_interleave_delta = round(500 + (self._retry_count * 100))
         options.append(f'-fflags nobuffer -max_delay 250000 -max_interleave_delta {max_interleave_delta}K -threads auto')
 
-        # 音声が 5.1ch かどうかに関わらずステレオへ正規化する。
+        # Opus は入力の channel layout を保持する。AAC は従来どおりステレオへ正規化する。
         if self.GetRequestedAudioCodec() == 'opus':
             options.append(
-                '-acodec libopus -application audio -ac 2 -ab 192K -ar 48000 '
+                '-acodec libopus -application audio -ab 192K -ar 48000 '
                 f'-af {self.LIVE_TRANSCODE_AUDIO_FILTER},volume=2.0'
             )
         else:

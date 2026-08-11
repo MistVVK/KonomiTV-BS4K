@@ -317,6 +317,26 @@ def test_ffmpeg8_software_advanced_codec_uses_single_map_and_vbv(
     assert options[options.index('-af') + 1] == LiveEncodingTask.LIVE_TRANSCODE_AUDIO_FILTER
 
 
+def test_live_opus_preserves_input_channel_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """通常・HW・ラジオの全ライブOpus経路で入力チャンネル数を固定しない。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=False,
+        is_24fps_mode_enabled=False,
+        video_codec='avc',
+        audio_codec='opus',
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    software_options = task.buildFFmpegOptions('240p', 'GR', False)
+    hardware_options = task.buildFFmpeg8HardwareOptions('240p', 'QSV', 'GR', False)
+    radio_options = task.buildFFmpegOptionsForRadio()
+
+    for options in (software_options, hardware_options, radio_options):
+        assert '-ac' not in options
+
+
 @pytest.mark.parametrize('encoder_type', ['NVENC', 'AMF'])
 def test_ffmpeg8_hardware_rejects_unsupported_vp9_backend(
     monkeypatch: pytest.MonkeyPatch,
