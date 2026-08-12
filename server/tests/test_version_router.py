@@ -6,7 +6,7 @@ import pytest
 
 import app.routers.VersionRouter as version_router_module
 from app.config import ServerSettings
-from app.constants import BS4K_VERSION, VERSION
+from app.constants import VERSION
 
 
 class TagsClient:
@@ -61,7 +61,17 @@ class TagsClient:
 @pytest.mark.parametrize(
     ('tags', 'expected_latest_version'),
     [
-        ([{'name': 'v1.2.3'}], '1.2.3'),
+        # upstream の v0.x と混在しても bs4k-v* の semver 最大を選ぶ
+        (
+            [
+                {'name': 'v0.14.1'},
+                {'name': 'bs4k-v1.0.0'},
+                {'name': 'bs4k-v1.2.3'},
+                {'name': 'bs4k-v1.1.0'},
+            ],
+            '1.2.3',
+        ),
+        ([{'name': 'v0.14.1'}], None),
         ([], None),
     ],
 )
@@ -81,6 +91,7 @@ def test_version_information_separates_bs4k_and_upstream_versions_and_caches_tag
     monkeypatch.setattr(version_router_module, 'Config', lambda: settings)
     monkeypatch.setattr(version_router_module, 'GetPlatformEnvironment', lambda: 'Linux')
     monkeypatch.setattr(version_router_module, 'GetGitCommit', AsyncMock(return_value='test-commit'))
+    monkeypatch.setattr(version_router_module, 'resolveBS4KVersion', lambda: '1.1.1-dev')
     monkeypatch.setattr(version_router_module, 'HTTPX_CLIENT', http_client_factory)
     monkeypatch.setattr(version_router_module, 'latest_version', None)
     monkeypatch.setattr(version_router_module, 'latest_version_updated_at', 0)
@@ -88,7 +99,7 @@ def test_version_information_separates_bs4k_and_upstream_versions_and_caches_tag
     first_response = asyncio.run(version_router_module.VersionInformationAPI())
     second_response = asyncio.run(version_router_module.VersionInformationAPI())
 
-    assert first_response['version'] == BS4K_VERSION
+    assert first_response['version'] == '1.1.1-dev'
     assert first_response['upstream_version'] == VERSION
     assert first_response['git_commit'] == 'test-commit'
     assert first_response['latest_version'] == expected_latest_version

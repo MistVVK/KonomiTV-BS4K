@@ -12,8 +12,9 @@ from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
 from app import schemas
+from app.bs4k_version import pickLatestBS4KVersionFromGitHubTagNames, resolveBS4KVersion
 from app.config import Config
-from app.constants import BS4K_VERSION, HTTPX_CLIENT, THIRD_PARTY_LICENSES_PATH, VERSION
+from app.constants import HTTPX_CLIENT, THIRD_PARTY_LICENSES_PATH, VERSION
 from app.utils import GetPlatformEnvironment
 from app.utils.Git import GetGitCommit
 
@@ -497,13 +498,19 @@ async def VersionInformationAPI():
     # GitHub API で KonomiTV-BS4K の最新のタグ (=最新バージョン) を取得
     ## GitHub API は無認証だと60回/1時間までしかリクエストできないので、リクエスト結果を10分ほどキャッシュする
     ## タグが0件の場合も latest_version=None を正常な取得結果としてキャッシュする
+    ## upstream の v0.x タグと混在するため、bs4k-v* だけを semver 最大で選ぶ
     if latest_version_updated_at == 0 or (time.time() - latest_version_updated_at) > 60 * 10:
         try:
             async with HTTPX_CLIENT() as client:
                 response = await client.get('https://api.github.com/repos/MistVVK/KonomiTV-BS4K/tags')
             if response.status_code == 200:
                 tags = response.json()
-                latest_version = tags[0]['name'].removeprefix('v') if len(tags) > 0 else None
+                tag_names = [
+                    str(tag.get('name', ''))
+                    for tag in tags
+                    if isinstance(tag, dict)
+                ]
+                latest_version = pickLatestBS4KVersionFromGitHubTagNames(tag_names)
                 latest_version_updated_at = time.time()
         except (httpx.NetworkError, httpx.TimeoutException):
             pass
@@ -511,9 +518,13 @@ async def VersionInformationAPI():
     # サーバーが稼働している環境を取得
     environment = GetPlatformEnvironment()
 
+    # 起動後にタグが付いた開発ツリーでも、API では都度キャッシュ済みの解決結果を返す
+    # （プロセス内キャッシュ。force はテスト以外では使わない）
+    bs4k_version = resolveBS4KVersion()
+
     general = Config().general
     result: dict[str, Any] = {
-        'version': BS4K_VERSION,
+        'version': bs4k_version,
         'upstream_version': VERSION,
         'git_commit': await GetGitCommit(),
         'latest_version': latest_version,

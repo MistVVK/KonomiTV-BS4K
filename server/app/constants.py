@@ -19,12 +19,18 @@ from pydantic import BaseModel, PositiveInt
 
 # upstream KonomiTV のバージョン
 VERSION = '0.14.1'
-# KonomiTV-BS4K 固有のバージョン
-BS4K_VERSION = '1.0.0'
 
 # 日本標準時 (JST, UTC+9) の ZoneInfo
 ## KonomiTV は日本向けのアプリケーションのため、日時は JST で統一して扱う
 JST = ZoneInfo('Asia/Tokyo')
+
+# KonomiTV-BS4K 固有のバージョン
+## ハードコードせず bs4k-v* タグ（無ければ KONOMITV_BS4K_VERSION / 0.0.0-dev）から解決する
+## app.utils 経由だと utils/__init__ → constants の循環になるため app.bs4k_version を直接使う
+from app.bs4k_version import resolveBS4KVersion  # noqa: E402
+
+
+BS4K_VERSION = resolveBS4KVersion()
 
 # ベースディレクトリ
 BASE_DIR = Path(__file__).resolve().parent.parent
