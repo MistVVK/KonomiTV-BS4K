@@ -62,11 +62,14 @@
                     <v-btn variant="flat" class="settings-navigation__button settings-navigation__button--version mt-3"
                         :class="{'settings-navigation__button--version-highlight': versionStore.is_update_available}"
                         href="https://github.com/MistVVK/KonomiTV-BS4K" target="_blank">
-                        <Icon icon="fluent:info-20-regular" width="26px" />
-                        <span class="ml-4">
-                            KonomiTV-BS4K {{versionStore.display_version}}{{versionStore.is_update_available ? ' (Update Available)' : ''}}<br>
-                            <small>upstream: KonomiTV {{versionStore.upstream_version ?? '-'}}</small><br>
-                            <small>{{versionStore.client_git_commit}}</small>
+                        <Icon class="settings-navigation__version-icon" icon="fluent:info-20-regular" width="26px" />
+                        <span class="settings-navigation__version-text">
+                            <span class="settings-navigation__version-name">KonomiTV-BS4K {{versionStore.display_version}}</span>
+                            <small v-if="versionStore.is_update_available" class="settings-navigation__version-update">
+                                アップデートがあります ({{versionStore.latest_version}})
+                            </small>
+                            <small class="settings-navigation__version-meta">upstream: KonomiTV {{versionStore.upstream_version ?? '-'}}</small>
+                            <small class="settings-navigation__version-commit">{{versionStore.client_git_commit}}</small>
                         </span>
                     </v-btn>
                 </nav>
@@ -150,14 +153,66 @@ onUnmounted(() => {
 
             &--version {
                 display: none;
-                height: 72px;
+                // 更新通知行が増えても切れないよう固定高ではなく内容に追従する
+                height: auto !important;
+                min-height: 72px;
+                padding-top: 10px !important;
+                padding-bottom: 10px !important;
                 line-height: 1.2;
                 @include smartphone-vertical {
                     display: flex;
                 }
+                :deep(.v-btn__content) {
+                    align-items: flex-start;
+                    width: 100%;
+                    min-width: 0;
+                    overflow: hidden;
+                }
                 &-highlight {
                     color: rgb(var(--v-theme-secondary-readable)) !important;
                 }
+            }
+
+            .settings-navigation__version-icon {
+                flex-shrink: 0;
+                margin-top: 2px;
+            }
+
+            .settings-navigation__version-text {
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                min-width: 0;
+                margin-left: 16px;
+                text-align: left;
+                white-space: normal;
+            }
+
+            .settings-navigation__version-name,
+            .settings-navigation__version-update,
+            .settings-navigation__version-meta,
+            .settings-navigation__version-commit {
+                display: block;
+                max-width: 100%;
+                overflow: hidden;
+                white-space: nowrap;
+                text-overflow: ellipsis;
+            }
+
+            .settings-navigation__version-update {
+                margin-top: 2px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+
+            .settings-navigation__version-meta {
+                margin-top: 2px;
+            }
+
+            .settings-navigation__version-commit {
+                margin-top: 2px;
+                font-family: monospace;
+                font-size: 11px;
             }
         }
 
