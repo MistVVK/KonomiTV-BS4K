@@ -548,19 +548,26 @@ def repairKnownCreditsEncoding(
             f'known repairs apply only to Chromium {sorted(ENCODING_REPAIR_CHROMIUM_VERSIONS)!r}.',
         )
 
-    expected_projects = set(ANDROID_NOTICE_REPAIR_PROJECTS) | {'FreeType'}
-    if affected_projects != expected_projects:
-        affected_project_labels = sorted(repr(project_name) for project_name in affected_projects)
+    # 修復を許可する project は一次ソース照合済みの固定集合だけ。
+    # Chromium 版によって損傷 project が減ることはあるが、未知 project への推測修復はしない。
+    repairable_projects = set(ANDROID_NOTICE_REPAIR_PROJECTS) | {'FreeType'}
+    unexpected_projects = {
+        project_name
+        for project_name in affected_projects
+        if not isinstance(project_name, str) or project_name not in repairable_projects
+    }
+    if unexpected_projects:
+        unexpected_project_labels = sorted(repr(project_name) for project_name in unexpected_projects)
         raise ValueError(
             'Chromium credits Unicode replacement characters occur in unexpected projects: '
-            f'{affected_project_labels!r}.',
+            f'{unexpected_project_labels!r}.',
         )
 
     repaired_credits: list[Any] = []
     repairs: list[tuple[str, int]] = []
     repaired_project_names: set[str] = set()
     for index, credit in enumerate(raw_credits, start=1):
-        if not isinstance(credit, dict) or credit.get('name') not in expected_projects or not any(
+        if not isinstance(credit, dict) or credit.get('name') not in repairable_projects or not any(
             isinstance(value, str) and '\ufffd' in value
             for value in credit.values()
         ):
@@ -602,8 +609,12 @@ def repairKnownCreditsEncoding(
         repairs.append((project_name, repaired_character_count))
         repaired_project_names.add(project_name)
 
-    if repaired_project_names != expected_projects:
-        raise ValueError(f'Not all expected Chromium credits encoding repairs were applied: {sorted(repaired_project_names)!r}.')
+    # 損傷していた既知 project はすべて修復できていること（部分集合でも可）
+    if repaired_project_names != affected_projects:
+        raise ValueError(
+            'Not all Chromium credits encoding repairs were applied: '
+            f'{sorted(repr(name) for name in repaired_project_names)!r}.',
+        )
     if any(
         isinstance(value, str) and '\ufffd' in value
         for credit in repaired_credits

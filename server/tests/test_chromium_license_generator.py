@@ -100,6 +100,51 @@ def test_known_chromium_credits_encoding_damage_is_repaired_only_for_fixed_versi
         GENERATOR.repairKnownCreditsEncoding('152.0.0.0', credits)
 
 
+def test_known_chromium_credits_encoding_repair_allows_known_project_subset() -> None:
+    """Chromium 151 のように損傷 project が減っても、既知集合の部分集合なら修復する。"""
+
+    android_license = (
+        GENERATOR.ANDROID_BROKEN_LICENSE_LINE + '\n' +
+        GENERATOR.ANDROID_BROKEN_MULTIPLE_LICENSED_LINE + '\n' +
+        GENERATOR.ANDROID_BROKEN_LICENSE_LINE
+    )
+    # 151.0.7922.108 で実際に U+FFFD が残っていた project 群（cloud-messaging / location は無し）
+    subset_projects = [
+        'common',
+        'core-common',
+        'feature-delivery',
+        'googleid',
+        'play-services-auth',
+        'play-services-auth-api-phone',
+        'play-services-auth-base',
+        'play-services-auth-blockstore',
+        'play-services-cast',
+        'play-services-cast-framework',
+        'play-services-instantapps',
+        'play-services-time',
+        'review',
+    ]
+    credits = [
+        {'name': name, 'homepage': 'https://example.com/', 'license': android_license}
+        for name in subset_projects
+    ]
+    credits.append({
+        'name': 'FreeType',
+        'homepage': 'https://freetype.org/',
+        'license': GENERATOR.FREETYPE_BROKEN_COPYRIGHT_LINE,
+    })
+
+    repaired, repairs = GENERATOR.repairKnownCreditsEncoding('151.0.7922.108', credits)
+    assert len(repairs) == 14
+    assert all('\ufffd' not in credit['license'] for credit in repaired)
+
+    with pytest.raises(ValueError, match='unexpected projects'):
+        GENERATOR.repairKnownCreditsEncoding(
+            '151.0.7922.108',
+            credits + [{'name': 'UnknownLib', 'homepage': 'https://example.com/', 'license': 'bad \ufffd'}],
+        )
+
+
 def test_linux_mint_package_copyright_is_strict_utf8_and_hashed(tmp_path: Path) -> None:
     copyright_path = tmp_path / 'copyright'
     copyright_path.write_bytes(b'Package notice.\n')
