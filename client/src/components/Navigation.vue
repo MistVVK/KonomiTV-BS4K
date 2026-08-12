@@ -121,11 +121,11 @@
                             'navigation__link--icon-only': iconOnly,
                         }"
                         v-ftooltip.right="iconOnly ?
-                            (versionStore.is_update_available ? `アップデートがあります (KonomiTV-BS4K ${versionStore.latest_version})` : `KonomiTV-BS4K ${versionStore.client_version}`) :
+                            (versionStore.is_update_available ? `アップデートがあります (KonomiTV-BS4K ${versionStore.latest_version})` : `KonomiTV-BS4K ${versionStore.display_version}`) :
                             (versionStore.is_update_available ? `アップデートがあります (KonomiTV-BS4K ${versionStore.latest_version})` : '')">
                         <Icon class="navigation__link-icon" icon="fluent:info-16-regular" width="26px" />
                         <span v-if="!iconOnly" class="navigation__link-text navigation__link-version">
-                            <span>KonomiTV-BS4K {{versionStore.client_version}}</span>
+                            <span>KonomiTV-BS4K {{versionStore.display_version}}</span>
                             <span>upstream: KonomiTV {{versionStore.upstream_version ?? '-'}}</span>
                             <span class="navigation__link-commit">{{versionStore.client_git_commit}}</span>
                         </span>

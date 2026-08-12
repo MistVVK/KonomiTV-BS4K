@@ -23,7 +23,12 @@ const useVersionStore = defineStore('version', {
     }),
     getters: {
         client_version(): string {
+            // ビルド時埋め込み（フォールバック・リクエストヘッダ用）。UI 表示は display_version を使う
             return Utils.version;
+        },
+        // WebUI 表示用。サーバーが bs4k-v* タグから解決した version を優先する
+        display_version(): string {
+            return this.server_version ?? this.client_version;
         },
         client_git_commit(): string {
             return this.server_version_info?.git_commit ?? Utils.git_commit;
@@ -38,7 +43,7 @@ const useVersionStore = defineStore('version', {
             return this.server_version_info?.latest_version ?? null;
         },
         is_client_develop_version(): boolean {
-            return this.client_version.includes('-dev');
+            return this.display_version.includes('-dev');
         },
         is_server_develop_version(): boolean {
             return this.server_version?.includes('-dev') ?? false;
@@ -48,8 +53,9 @@ const useVersionStore = defineStore('version', {
             // 現在のサーバーバージョンが開発版 (-dev あり) で、かつ最新のバージョンがリリース版 (-dev なし) の場合も同様に表示する
             // つまり開発版だと同じバージョンのリリース版がリリースされたときにしかアップデート通知が表示されない事になるが、ひとまずこれで…
             if (this.server_version === null || this.latest_version === null) return false;
+            const server_base_version = this.server_version.replace(/-dev(?:\.|$|\+).*$|-dev$/, '');
             if ((this.is_server_develop_version === false && this.server_version !== this.latest_version) ||
-                (this.is_server_develop_version === true && this.server_version.replace('-dev', '') === this.latest_version)) {
+                (this.is_server_develop_version === true && server_base_version === this.latest_version)) {
                 return true;
             }
             return false;

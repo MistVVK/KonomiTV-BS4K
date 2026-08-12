@@ -64,7 +64,7 @@
                         href="https://github.com/MistVVK/KonomiTV-BS4K" target="_blank">
                         <Icon icon="fluent:info-20-regular" width="26px" />
                         <span class="ml-4">
-                            KonomiTV-BS4K {{versionStore.client_version}}{{versionStore.is_update_available ? ' (Update Available)' : ''}}<br>
+                            KonomiTV-BS4K {{versionStore.display_version}}{{versionStore.is_update_available ? ' (Update Available)' : ''}}<br>
                             <small>upstream: KonomiTV {{versionStore.upstream_version ?? '-'}}</small><br>
                             <small>{{versionStore.client_git_commit}}</small>
                         </span>
