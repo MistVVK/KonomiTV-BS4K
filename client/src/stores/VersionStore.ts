@@ -49,16 +49,15 @@ const useVersionStore = defineStore('version', {
             return this.server_version?.includes('-dev') ?? false;
         },
         is_update_available(): boolean {
-            // もし現在のサーバーバージョンと最新のバージョンが異なるなら、アップデートが利用できると判断する
-            // 現在のサーバーバージョンが開発版 (-dev あり) で、かつ最新のバージョンがリリース版 (-dev なし) の場合も同様に表示する
-            // つまり開発版だと同じバージョンのリリース版がリリースされたときにしかアップデート通知が表示されない事になるが、ひとまずこれで…
+            // -dev / dirty などの接尾辞は無視し、ベース版番号 (例: 1.1.2) だけを比較する
+            // 1.1.2 と 1.1.2-dev は同じ版として扱い、1.1.1 と 1.1.2 のように番号が違うときだけ更新ありとする
             if (this.server_version === null || this.latest_version === null) return false;
-            const server_base_version = this.server_version.replace(/-dev(?:\.|$|\+).*$|-dev$/, '');
-            if ((this.is_server_develop_version === false && this.server_version !== this.latest_version) ||
-                (this.is_server_develop_version === true && server_base_version === this.latest_version)) {
-                return true;
-            }
-            return false;
+            const stripDevSuffix = (version: string): string => {
+                return version.replace(/-dev(?:\.|$|\+).*$|-dev$/, '');
+            };
+            const server_base_version = stripDevSuffix(this.server_version);
+            const latest_base_version = stripDevSuffix(this.latest_version);
+            return server_base_version !== latest_base_version;
         },
         is_version_mismatch(): boolean {
             if (this.server_version === null) return false;
