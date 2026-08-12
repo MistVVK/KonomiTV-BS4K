@@ -228,6 +228,7 @@ def CreateAIResult(
     confidence: float = 0.95,
     with_citation: bool = True,
     with_source: bool | None = None,
+    recovery_attempt_summaries: tuple[str, ...] = (),
 ) -> AIEpisodeLookupResult:
     """受理可否の境界を指定できるモックWeb検索結果を作成する。"""
 
@@ -253,6 +254,7 @@ def CreateAIResult(
         completion_tokens=12,
         http_status=200,
         latency_ms=45,
+        recovery_attempt_summaries=recovery_attempt_summaries,
     )
 
 
@@ -939,6 +941,10 @@ def test_low_confidence_ai_result_with_verified_evidence_is_applied_and_cached(
             season_number=3,
             episode_number=Decimal("12.5"),
             confidence=0.45,
+            recovery_attempt_summaries=(
+                '1:Primary:AcpCodex:service=-:model=test:result=Resolved:adopted:'
+                'prompt_tokens=120:completion_tokens=12:latency_ms=45:http_status=200:error=-',
+            ),
         )
 
     monkeypatch.setattr(
@@ -987,6 +993,8 @@ def test_low_confidence_ai_result_with_verified_evidence_is_applied_and_cached(
             assert audit.status == 'Succeeded'
             assert audit.selected_choice_id == "S3E12.5"
             assert audit.error_code is None
+            assert len(audit.attempt_summaries) == 1
+            assert 'result=Resolved' in audit.attempt_summaries[0]
             assert await RecordedSeriesAIRequest.all().count() == 1
         finally:
             await Tortoise.close_connections()

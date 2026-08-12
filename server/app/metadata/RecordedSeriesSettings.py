@@ -3,6 +3,7 @@
 AI バックエンド接続・秘密・月次上限は AIBackendSettings 側が正本。
 OpenCode 時は ai_backend_service_id で AI バックエンド service を参照する。
 AcpCodex / AcpGrok のモデル・推論深さ・Fast・タイムアウトは ACPSettings 側が正本。
+主系失敗時の予備 AI と失敗時ポリシーもここで管理する。
 旧 OpenAICompatible / AcpGemini / 日次制限はクリーンブレークで拒否する。
 """
 
@@ -24,6 +25,8 @@ from app.constants import DATA_DIR
 # AI バックエンド種別。OpenCode に加えて ACP の Codex / Grok を併存させる。
 # OpenAICompatible / AcpGemini はクリーンブレークで拒否する。
 AIBackendKind = Literal['OpenCode', 'AcpCodex', 'AcpGrok']
+# 主系 AI 失敗後の回復方針。既定は追加試行なしの Fail。
+AIFailureRecoveryStrategy = Literal['FallbackBackend', 'RetrySameBackend', 'Fail']
 
 _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
@@ -84,12 +87,18 @@ class RecordedSeriesSettings(BaseModel):
     ai_enabled: Annotated[bool, Field()] = False
     # 旧 JSON の読取互換だけを保つ。保存・API 応答・Resolver 分岐では使用しない。
     ai_candidate_selection_enabled: Annotated[bool, Field(exclude=True)] = True
-    # AI バックエンド種別。OpenCode / AcpCodex / AcpGrok の 3 種のみ。
+    # AI バックエンド種別（主系）。OpenCode / AcpCodex / AcpGrok の 3 種のみ。
     ai_backend: Annotated[AIBackendKind, Field()] = 'AcpCodex'
-    # OpenCode 時のみ参照する AIBackendSettings の service_id（UUID）。
+    # 主系が OpenCode のとき参照する AIBackendSettings の service_id（UUID）。
     ai_backend_service_id: Annotated[str | None, Field(max_length=36)] = None
+    # 主系失敗後の回復方針。既定 Fail では追加の AI 実行を行わない。
+    ai_failure_recovery_strategy: Annotated[AIFailureRecoveryStrategy, Field()] = 'Fail'
+    # FallbackBackend 時のみ使う予備 AI バックエンド。
+    ai_fallback_backend: Annotated[AIBackendKind | None, Field()] = None
+    # 予備が OpenCode のとき参照する service_id（UUID）。
+    ai_fallback_backend_service_id: Annotated[str | None, Field(max_length=36)] = None
 
-    @field_validator('ai_backend_service_id')
+    @field_validator('ai_backend_service_id', 'ai_fallback_backend_service_id')
     @classmethod
     def validateServiceID(cls, value: str | None) -> str | None:
         """service_id を UUID または None に正規化する。"""
@@ -105,16 +114,82 @@ class RecordedSeriesSettings(BaseModel):
 
     @model_validator(mode='after')
     def normalizeBackendCapabilities(self) -> RecordedSeriesSettings:
-        """バックエンド選択を正規化する。
+        """主系・予備系のバックエンド選択と失敗時ポリシーを正規化する。
 
-        OpenCode 時は service_id が必須。
+        OpenCode 時は対応する service_id が必須。
+        Fail / RetrySameBackend では予備設定を保持せずクリアする。
+        FallbackBackend では主系と予備系が同一であってはならない。
         AcpCodex / AcpGrok のモデル・推論深さ・Fast・タイムアウトは
         ACPSettings 側が正本のため、ここでは検証しない。
         """
 
         if self.ai_backend == 'OpenCode' and self.ai_enabled and self.ai_backend_service_id is None:
             raise ValueError('OpenCode を利用する場合は ai_backend_service_id が必要です。')
+
+        # ACP 主系では OpenCode service_id を保存しない（誤参照を防ぐ）。
+        if self.ai_backend != 'OpenCode':
+            self.ai_backend_service_id = None
+
+        strategy = self.ai_failure_recovery_strategy
+        if strategy != 'FallbackBackend':
+            # 予備は FallbackBackend 選択時だけ意味を持つ。他方針では入力を捨てる。
+            self.ai_fallback_backend = None
+            self.ai_fallback_backend_service_id = None
+            return self
+
+        if self.ai_fallback_backend is None:
+            raise ValueError('FallbackBackend を選ぶ場合は ai_fallback_backend が必要です。')
+        if (
+            self.ai_fallback_backend == 'OpenCode'
+            and self.ai_enabled
+            and self.ai_fallback_backend_service_id is None
+        ):
+            raise ValueError(
+                '予備 AI に OpenCode を使う場合は ai_fallback_backend_service_id が必要です。',
+            )
+        if self.ai_fallback_backend != 'OpenCode':
+            self.ai_fallback_backend_service_id = None
+
+        # 主系と予備が同じ backend（OpenCode なら同じ service）だと切り替えても意味がない。
+        if AreAIBackendTargetsIdentical(
+            primary_backend=self.ai_backend,
+            primary_service_id=self.ai_backend_service_id,
+            fallback_backend=self.ai_fallback_backend,
+            fallback_service_id=self.ai_fallback_backend_service_id,
+        ):
+            raise ValueError('主系 AI と予備 AI は異なるバックエンドである必要があります。')
         return self
+
+
+def AreAIBackendTargetsIdentical(
+    *,
+    primary_backend: AIBackendKind,
+    primary_service_id: str | None,
+    fallback_backend: AIBackendKind | None,
+    fallback_service_id: str | None,
+) -> bool:
+    """主系と予備の実行ターゲットが同一かを返す。
+
+    Args:
+        primary_backend: 主系バックエンド種別。
+        primary_service_id: 主系 OpenCode service_id。
+        fallback_backend: 予備バックエンド種別。
+        fallback_service_id: 予備 OpenCode service_id。
+
+    Returns:
+        同じ実行主体とみなせる場合は True。
+    """
+
+    if fallback_backend is None:
+        return False
+    if primary_backend != fallback_backend:
+        return False
+    if primary_backend == 'OpenCode':
+        primary = (primary_service_id or '').strip().lower()
+        fallback = (fallback_service_id or '').strip().lower()
+        return primary != '' and primary == fallback
+    # 同じ ACP 種別はプロファイル・モデル設定も共有するため同一とみなす。
+    return True
 
 
 class RecordedSeriesSettingsResponse(RecordedSeriesSettings):
@@ -127,6 +202,10 @@ class RecordedSeriesSettingsResponse(RecordedSeriesSettings):
     ai_backend_service_name: Annotated[str | None, Field()] = None
     # 参照先 service の認証が設定済みか（未参照時は False）
     ai_backend_auth_configured: Annotated[bool, Field()] = False
+    # 予備 OpenCode service の表示名（未設定・非 OpenCode 時は None）
+    ai_fallback_backend_service_name: Annotated[str | None, Field()] = None
+    # 予備 backend の認証が設定済みか（未使用時は False）
+    ai_fallback_backend_auth_configured: Annotated[bool, Field()] = False
 
 
 class RecordedSeriesSettingsStore:
@@ -206,6 +285,14 @@ class RecordedSeriesSettingsStore:
 
         with cls._lock:
             validated = RecordedSeriesSettings.model_validate(settings.model_dump())
+            # AI を有効にして予備へ切り替える設定は、障害発生時に初めて認証不足が
+            # 判明しないよう保存時点で拒否する。AI 無効時は設定順序を妨げない。
+            if (
+                validated.ai_enabled
+                and validated.ai_failure_recovery_strategy == 'FallbackBackend'
+                and cls.isFallbackAIBackendConfigured(validated) is False
+            ):
+                raise ValueError('予備 AI バックエンドの認証が設定されていません。')
             payload = validated.model_dump(mode='json')
             content = json.dumps(payload, ensure_ascii=False, indent=4) + '\n'
             cls._writeAtomic(cls.SETTINGS_PATH, content)
@@ -229,6 +316,7 @@ class RecordedSeriesSettingsStore:
 
         settings = cls.getSettings()
         service_name: str | None = None
+        fallback_service_name: str | None = None
         if settings.ai_backend == 'OpenCode' and settings.ai_backend_service_id is not None:
             try:
                 from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
@@ -237,10 +325,27 @@ class RecordedSeriesSettingsStore:
                     service_name = service.service_name
             except (OSError, ValueError):
                 service_name = None
+        if (
+            settings.ai_fallback_backend == 'OpenCode'
+            and settings.ai_fallback_backend_service_id is not None
+        ):
+            try:
+                from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
+                fallback_service = AIBackendSettingsStore.getService(
+                    settings.ai_fallback_backend_service_id,
+                )
+                if fallback_service is not None:
+                    fallback_service_name = fallback_service.service_name
+            except (OSError, ValueError):
+                fallback_service_name = None
         return RecordedSeriesSettingsResponse(
             **settings.model_dump(),
             ai_backend_service_name=service_name,
             ai_backend_auth_configured=cls.isAIBackendConfigured(settings),
+            ai_fallback_backend_service_name=fallback_service_name,
+            ai_fallback_backend_auth_configured=cls.isFallbackAIBackendConfigured(
+                settings,
+            ),
         )
 
     @classmethod
@@ -280,6 +385,49 @@ class RecordedSeriesSettingsStore:
         )
         provider: Literal['codex', 'grok'] = (
             'codex' if effective_settings.ai_backend == 'AcpCodex' else 'grok'
+        )
+        return KonomiTVBS4KACPCredentials.getCredentialGeneration(provider) != 'missing'
+
+    @classmethod
+    def isFallbackAIBackendConfigured(
+        cls,
+        settings: RecordedSeriesSettings | None = None,
+    ) -> bool:
+        """失敗時ポリシーで選択中の予備 AI に有効な認証があるかを返す。
+
+        Args:
+            settings: 検査する設定。省略時は設定ストアから取得する。
+
+        Returns:
+            FallbackBackend の予備を実行できる認証がある場合は True。
+            予備を使用しない設定では False。
+        """
+
+        effective_settings = settings or cls.getSettings()
+        if effective_settings.ai_failure_recovery_strategy != 'FallbackBackend':
+            return False
+        fallback_backend = effective_settings.ai_fallback_backend
+        if fallback_backend is None:
+            return False
+        if fallback_backend == 'OpenCode':
+            service_id = effective_settings.ai_fallback_backend_service_id
+            if service_id is None:
+                return False
+            try:
+                from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
+                service = AIBackendSettingsStore.getService(service_id)
+                return (
+                    service is not None
+                    and AIBackendSettingsStore.isAuthConfigured(service)
+                )
+            except (OSError, ValueError):
+                return False
+
+        from app.metadata.ai.KonomiTVBS4KACPCredentials import (
+            KonomiTVBS4KACPCredentials,
+        )
+        provider: Literal['codex', 'grok'] = (
+            'codex' if fallback_backend == 'AcpCodex' else 'grok'
         )
         return KonomiTVBS4KACPCredentials.getCredentialGeneration(provider) != 'missing'
 

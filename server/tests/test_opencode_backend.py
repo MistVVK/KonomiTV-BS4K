@@ -70,6 +70,16 @@ def _service(**overrides: Any) -> AIBackendService:
 
 
 @pytest.fixture(autouse=True)
+def _mock_opencode_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Config 未初期化の unit でも OpenCodeClient を生成できるようにする。"""
+
+    monkeypatch.setattr(
+        'app.metadata.ai.opencode_client.GetOpenCodeBaseURL',
+        lambda: 'http://opencode.test',
+    )
+
+
+@pytest.fixture(autouse=True)
 def _skip_monthly_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
     """backend unit は DB 無しで回すため台帳を no-op にする。"""
 
@@ -517,6 +527,49 @@ def test_resolve_series_metadata_success(monkeypatch: pytest.MonkeyPatch) -> Non
     assert result.existing_series_id == 1
 
 
+def test_resolve_series_metadata_retries_invalid_schema_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail 方針でも従来の OpenCode schema session 再作成を維持する。"""
+
+    service = _service()
+    backend = OpenCodeBackend(service, api_key='sk-test')
+    calls = {'count': 0}
+
+    async def FakeEnsure() -> _NoopProviderLease:
+        return _NoopProviderLease()
+
+    async def FakeRunStructured(**_kwargs: Any) -> tuple[dict[str, Any], dict[str, Any], int]:
+        calls['count'] += 1
+        usage = {
+            'prompt_tokens': 1,
+            'completion_tokens': 1,
+            'reasoning_tokens': 0,
+            'total_tokens': 2,
+            'estimated_cost_usd': None,
+        }
+        if calls['count'] == 1:
+            return {'decision': 'Series'}, usage, 10
+        return {
+            'decision': 'Series',
+            'series_title': 'Connection Test Series',
+            'season_number': 1,
+            'episode_number': '3',
+            'subtitle': 'Ep',
+            'confidence': 0.9,
+            'existing_series_id': 1,
+            'wikipedia_page_id': None,
+            'rationale_short': 'ok',
+        }, usage, 20
+
+    monkeypatch.setattr(backend, 'ensureAuthInjected', FakeEnsure)
+    monkeypatch.setattr(backend, '_runStructured', FakeRunStructured)
+
+    result = asyncio.run(backend.resolveSeriesMetadata(_program(), _hints()))
+    assert result.decision == 'Series'
+    assert calls['count'] == 2
+
+
 def test_connection_test_candidate_selection(monkeypatch: pytest.MonkeyPatch) -> None:
     """接続試験がシリーズ生成成功を success にする。"""
 
@@ -768,8 +821,9 @@ def test_lookup_episode_with_web_evidence(monkeypatch: pytest.MonkeyPatch) -> No
         program: RecordedEpisodeLookupContext,
         *,
         timeout_sec: float = 120.0,
+        prompt_variant: str = 'Default',
     ) -> tuple[EpisodeLookupResult, Any, dict[str, Any]]:
-        _ = (program, timeout_sec)
+        _ = (program, timeout_sec, prompt_variant)
         from app.metadata.ai.episode_lookup import EpisodeLookupCitation
 
         result = EpisodeLookupResult(
@@ -839,8 +893,9 @@ def test_connection_test_episode_lookup(monkeypatch: pytest.MonkeyPatch) -> None
         program: RecordedEpisodeLookupContext,
         *,
         timeout_sec: float = 120.0,
+        prompt_variant: str = 'Default',
     ) -> tuple[EpisodeLookupResult, Any, dict[str, Any]]:
-        _ = (program, timeout_sec)
+        _ = (program, timeout_sec, prompt_variant)
         from app.metadata.ai.episode_lookup import EpisodeLookupCitation
 
         result = EpisodeLookupResult(

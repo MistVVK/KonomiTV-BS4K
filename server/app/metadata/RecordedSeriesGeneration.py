@@ -202,6 +202,8 @@ class AISeriesMetadataResult:
     completion_tokens: int | None
     http_status: int
     latency_ms: int
+    # 失敗時ポリシーによる試行サマリ（秘密なし）。単一試行時は空でもよい。
+    recovery_attempt_summaries: tuple[str, ...] = ()
 
 
 def BuildSeriesMetadataSystemPrompt() -> str:
@@ -235,15 +237,39 @@ def BuildSeriesMetadataSystemPrompt() -> str:
     )
 
 
+def BuildSeriesMetadataRecoveryRetryAddon() -> str:
+    """同一 backend 再実行時だけ付与する、schema 再確認向けの追加指示。"""
+
+    return (
+        'Recovery retry instructions:\n'
+        '- Re-validate the required JSON schema and field consistency carefully before answering.\n'
+        '- Prefer Series or NotSeries when program and cluster evidence identify the work or a one-off.\n'
+        '- Use Unresolved only when evidence remains insufficient after careful review.\n'
+        '- Copy existing_series_id or wikipedia_page_id only from hints; never invent IDs.\n'
+        '- For NotSeries or Unresolved, keep every metadata and ID field null.'
+    )
+
+
 def BuildSeriesMetadataPrompt(
     program: RecordedSeriesProgramPrompt,
     hints: SeriesMetadataHints,
+    *,
+    prompt_variant: Literal['Default', 'RecoveryRetry'] = 'Default',
 ) -> str:
-    """ACP 用に system 指示と bounded JSON 入力を1本文へまとめる。"""
+    """ACP / OpenCode 用に system 指示と bounded JSON 入力を1本文へまとめる。
+
+    Args:
+        program: 録画番組メタデータ。
+        hints: サーバーが固定した参考情報。
+        prompt_variant: Default は通常指示。RecoveryRetry は schema 再確認を追加する。
+
+    Returns:
+        モデルへ渡す単一プロンプト本文。
+    """
 
     prompt_data = _SeriesMetadataPromptData(program=program, hints=hints)
     input_json = json.dumps(prompt_data, ensure_ascii=False, separators=(',', ':'))
-    return (
+    body = (
         f'{BuildSeriesMetadataSystemPrompt()}\n\n'
         f'Input JSON:\n{input_json}\n\n'
         'Output example:\n'
@@ -251,6 +277,9 @@ def BuildSeriesMetadataPrompt(
         '"episode_number":"3","subtitle":"Episode title","confidence":0.9,'
         '"existing_series_id":null,"wikipedia_page_id":null,"rationale_short":"Short reason"}'
     )
+    if prompt_variant == 'RecoveryRetry':
+        return f'{body}\n\n{BuildSeriesMetadataRecoveryRetryAddon()}'
+    return body
 
 
 def _rejectDuplicateJSONObjectPairs(

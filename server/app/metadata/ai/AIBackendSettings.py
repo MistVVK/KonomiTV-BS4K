@@ -836,7 +836,7 @@ class AIBackendSettingsStore:
 
 
 def IsRecordedSeriesReferencingService(service_id: str) -> bool:
-    """録画シリーズ設定が service_id を参照しているか。
+    """録画シリーズ設定が service_id を主系または予備として参照しているか。
 
     循環 import を避けるため関数内で RecordedSeriesSettings を読む。
 
@@ -852,7 +852,13 @@ def IsRecordedSeriesReferencingService(service_id: str) -> bool:
         settings = RecordedSeriesSettingsStore.getSettings()
     except Exception:
         return True
-    referenced = getattr(settings, 'ai_backend_service_id', None)
-    if referenced is None:
-        return False
-    return str(referenced).strip().lower() == service_id.strip().lower()
+    normalized_target = service_id.strip().lower()
+    # 主系 OpenCode service。
+    primary = getattr(settings, 'ai_backend_service_id', None)
+    if primary is not None and str(primary).strip().lower() == normalized_target:
+        return True
+    # 予備 OpenCode service（失敗時ポリシー FallbackBackend 時）。
+    fallback = getattr(settings, 'ai_fallback_backend_service_id', None)
+    if fallback is not None and str(fallback).strip().lower() == normalized_target:
+        return True
+    return False

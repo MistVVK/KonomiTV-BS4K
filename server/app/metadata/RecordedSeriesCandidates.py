@@ -85,6 +85,7 @@ class RecordedSeriesAIError(Exception):
         *,
         http_status: int | None = None,
         latency_ms: int | None = None,
+        recovery_attempt_summaries: tuple[str, ...] = (),
     ) -> None:
         """監査ログへ保存可能な安全な情報だけで例外を初期化する。
 
@@ -92,12 +93,15 @@ class RecordedSeriesAIError(Exception):
             code: 呼び出し元が分岐・表示に使う固定エラーコード。
             http_status: APIが応答した場合のHTTPステータス。
             latency_ms: エラー確定までの経過時間。
+            recovery_attempt_summaries: 失敗時ポリシーによる試行サマリ（秘密なし）。
         """
 
         super().__init__(code)
         self.code = code
         self.http_status = http_status
         self.latency_ms = latency_ms
+        # 主系・予備系の試行列。単一試行失敗時は空または1件。
+        self.recovery_attempt_summaries = recovery_attempt_summaries
 
 
 async def SearchWikipediaCandidates(query: str, limit: int = 5) -> list[WikipediaCandidate]:

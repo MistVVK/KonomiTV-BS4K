@@ -178,6 +178,8 @@ class EpisodeLookupResult:
     error_code: str | None = None
     error_message: str | None = None
     sources: tuple[EpisodeLookupCitation, ...] = ()
+    # 失敗時ポリシーによる試行サマリ（秘密なし）。単一試行時は空でもよい。
+    recovery_attempt_summaries: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """結果内の値の組み合わせを厳格に検証する。

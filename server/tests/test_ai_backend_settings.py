@@ -239,6 +239,7 @@ def test_delete_service_blocked_when_referenced(ai_paths: Path) -> None:
     RecordedSeriesSettingsStore.saveSettings(
         RecordedSeriesSettings(
             ai_enabled=True,
+            ai_backend='OpenCode',
             ai_backend_service_id=service.service_id,
         ),
     )

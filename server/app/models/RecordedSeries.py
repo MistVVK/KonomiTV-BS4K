@@ -121,4 +121,6 @@ class RecordedSeriesAIRequest(TortoiseModel):
     http_status = cast(TortoiseField[int | None], fields.IntField(null=True))
     latency_ms = cast(TortoiseField[int | None], fields.IntField(null=True))
     error_code = cast(TortoiseField[str | None], fields.CharField(255, null=True))
+    # 主系・回復系を含む全 AI 試行。生プロンプト・応答・秘密は保存しない。
+    attempt_summaries = cast(TortoiseField[list[str]], fields.JSONField(default=[]))
     created_at = fields.DatetimeField(auto_now_add=True)

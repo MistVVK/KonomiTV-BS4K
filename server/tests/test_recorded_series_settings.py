@@ -172,6 +172,10 @@ def test_recorded_series_settings_defaults_are_safe(monkeypatch: pytest.MonkeyPa
     # デフォルトは AcpCodex（OpenCode は service_id 必須のためデフォルトにできない）。
     assert settings.ai_backend == 'AcpCodex'
     assert settings.ai_backend_service_id is None
+    # 失敗時ポリシーの既定は追加試行なし。
+    assert settings.ai_failure_recovery_strategy == 'Fail'
+    assert settings.ai_fallback_backend is None
+    assert settings.ai_fallback_backend_service_id is None
     # 廃止された OpenAICompatible 系フィールドは存在しない。
     assert 'api_base_url' not in settings.model_dump()
     assert 'daily_ai_request_limit' not in settings.model_dump()
@@ -179,6 +183,64 @@ def test_recorded_series_settings_defaults_are_safe(monkeypatch: pytest.MonkeyPa
     assert 'acp_model' not in settings.model_dump()
     assert 'acp_reasoning_effort' not in settings.model_dump()
     assert 'acp_timeout_sec' not in settings.model_dump()
+
+
+def test_fallback_backend_requires_configured_auth_when_ai_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AI 有効時は未認証の予備 backend を保存しない。"""
+
+    ConfigureTemporaryStore(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        'app.metadata.ai.KonomiTVBS4KACPCredentials.KonomiTVBS4KACPCredentials.getCredentialGeneration',
+        classmethod(lambda _cls, _provider: 'missing'),
+    )
+    settings = RecordedSeriesSettings(
+        ai_enabled=True,
+        ai_backend='AcpCodex',
+        ai_failure_recovery_strategy='FallbackBackend',
+        ai_fallback_backend='AcpGrok',
+    )
+    with pytest.raises(ValueError, match='予備 AI バックエンドの認証'):
+        RecordedSeriesSettingsStore.saveSettings(settings)
+
+    disabled = settings.model_copy(update={'ai_enabled': False})
+    RecordedSeriesSettingsStore.saveSettings(disabled)
+    assert RecordedSeriesSettingsStore.getSettings().ai_enabled is False
+
+
+def test_settings_api_rejects_unconfigured_fallback_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """設定 API は未認証の予備 AI を有効化する PUT を 422 で拒否する。"""
+
+    ConfigureTemporaryStore(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        'app.metadata.ai.KonomiTVBS4KACPCredentials.KonomiTVBS4KACPCredentials.getCredentialGeneration',
+        classmethod(lambda _cls, _provider: 'missing'),
+    )
+    app = CreateAdminApp()
+
+    async def Run() -> None:
+        async with HTTPXAsyncClient(
+            transport=ASGITransport(app=app),
+            base_url='http://test',
+        ) as client:
+            response = await client.put(
+                '/api/recorded-series/settings',
+                json=RecordedSeriesSettings(
+                    ai_enabled=True,
+                    ai_backend='AcpCodex',
+                    ai_failure_recovery_strategy='FallbackBackend',
+                    ai_fallback_backend='AcpGrok',
+                ).model_dump(mode='json'),
+            )
+            assert response.status_code == 422
+            assert '予備 AI バックエンドの認証' in response.json()['detail']
+
+    asyncio.run(Run())
 
 
 def test_legacy_settings_use_new_child_defaults(

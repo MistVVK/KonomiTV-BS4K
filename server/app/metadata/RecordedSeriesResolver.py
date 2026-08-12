@@ -18,6 +18,7 @@ from tortoise.expressions import Q
 from app import logging
 from app.constants import JST
 from app.metadata.ai.recorded_series_ai import (
+    GetAIExecutionFingerprint,
     get_audit_model,
 )
 from app.metadata.ai.recorded_series_ai import (
@@ -2057,6 +2058,13 @@ class RecordedSeriesResolver:
         request.http_status = result.http_status if result is not None else (error.http_status if error is not None else None)
         request.latency_ms = result.latency_ms if result is not None else (error.latency_ms if error is not None else None)
         request.error_code = error.code if error is not None else None
+        request.attempt_summaries = list(
+            result.recovery_attempt_summaries
+            if result is not None
+            else error.recovery_attempt_summaries
+            if error is not None
+            else ()
+        )
         await request.save(update_fields=[
             'status',
             'model',
@@ -2066,6 +2074,7 @@ class RecordedSeriesResolver:
             'http_status',
             'latency_ms',
             'error_code',
+            'attempt_summaries',
         ])
 
     @classmethod
@@ -2198,13 +2207,15 @@ class RecordedSeriesResolver:
         ):
             raise _RecordedProgramSnapshotChanged
 
+        # 主系・予備系の service / ACP 設定と認証世代を同一キーへ含め、
+        # 実行条件変更後に古い抑止キーを再利用しない。
+        ai_execution_fingerprint = GetAIExecutionFingerprint(settings)
         ai_attempt_key = _buildAIAttemptKey(
             resolution_id=resolution.id,
             input_fingerprint=_buildInputFingerprint(snapshot),
             evidence_hash=cluster.evidence_hash,
             candidate_set_hash=candidate_set_hash,
-            # OpenCode 移行後は service_id を endpoint 識別子として使う。
-            api_base_url=settings.ai_backend_service_id or 'opencode',
+            api_base_url=ai_execution_fingerprint,
             model=audit_model,
             api_key=runtime_api_key,
         )

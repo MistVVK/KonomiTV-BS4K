@@ -342,7 +342,14 @@ def test_acp_lookup_holds_credential_generation_lock_until_backend_finishes(
     other_provider_mutation_entered = asyncio.Event()
 
     class FakeBackend:
-        async def lookupEpisode(self, _program: object) -> EpisodeLookupResult:
+        async def lookupEpisode(
+            self,
+            _program: object,
+            *,
+            prompt_variant: str = 'Default',
+            execution_guard: object = None,
+        ) -> EpisodeLookupResult:
+            _ = (prompt_variant, execution_guard)
             lookup_started.set()
             await finish_lookup.wait()
             return _result(
@@ -361,8 +368,8 @@ def test_acp_lookup_holds_credential_generation_lock_until_backend_finishes(
                 ),
             )
 
-    def CreateBackend(
-        _settings: RecordedSeriesSettings,
+    def CreateBackendForTarget(
+        _target: object,
         *,
         api_key: str | None = None,
     ) -> FakeBackend:
@@ -371,8 +378,8 @@ def test_acp_lookup_holds_credential_generation_lock_until_backend_finishes(
 
     monkeypatch.setattr(
         RecordedSeriesAIModule,
-        '_create_backend',
-        CreateBackend,
+        'CreateBackendForTarget',
+        CreateBackendForTarget,
     )
 
     async def MutateCredential(provider: str, entered: asyncio.Event) -> None:
@@ -435,9 +442,15 @@ def test_acp_facade_hard_timeout_includes_credential_lock_wait(
         backend_creation_count += 1
         raise AssertionError('期限切れ要求で backend を起動してはならない')
 
+    # select_candidate は _create_backend、resolve/lookup は CreateBackendForTarget を使う。
     monkeypatch.setattr(
         RecordedSeriesAIModule,
         '_create_backend',
+        CreateBackend,
+    )
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'CreateBackendForTarget',
         CreateBackend,
     )
     settings = RecordedSeriesSettings(ai_backend='AcpCodex')
@@ -531,5 +544,88 @@ def test_automatic_acp_lookup_rejects_a_changed_credential_generation(
                 expected_provider_fingerprint=expected_fingerprint,
             )
         assert error.value.code == 'AISettingsChangedBeforeRequest'
+
+    asyncio.run(Run())
+
+
+def test_acp_lookup_rechecks_credential_generation_after_lock_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """credential lock 待機中の世代変更は process 起動前に拒否する。"""
+
+    generation = 'generation-a'
+    credential_lock = asyncio.Lock()
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'ACP_OPERATION_LOCK',
+        asyncio.Lock(),
+    )
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'ACP_CREDENTIAL_OPERATION_LOCKS',
+        {
+            'codex': credential_lock,
+            'grok': asyncio.Lock(),
+        },
+    )
+
+    def GetCredentialGeneration(
+        _cls: type[object],
+        _provider: object,
+    ) -> str:
+        return generation
+
+    monkeypatch.setattr(
+        RecordedSeriesAIModule.KonomiTVBS4KACPCredentials,
+        'getCredentialGeneration',
+        classmethod(GetCredentialGeneration),
+    )
+    settings = RecordedSeriesSettings(ai_backend='AcpCodex')
+    expected_fingerprint = (
+        RecordedSeriesAIModule.get_episode_lookup_provider_fingerprint(
+            settings,
+            None,
+        )
+    )
+    backend_started = False
+
+    class FakeBackend:
+        async def lookupEpisode(
+            self,
+            _program: object,
+            *,
+            prompt_variant: str = 'Default',
+            execution_guard: object = None,
+        ) -> EpisodeLookupResult:
+            nonlocal backend_started
+            _ = prompt_variant
+            assert callable(execution_guard)
+            execution_guard()
+            backend_started = True
+            return _result('Resolved')
+
+    monkeypatch.setattr(
+        RecordedSeriesAIModule,
+        'CreateBackendForTarget',
+        lambda *_args, **_kwargs: FakeBackend(),
+    )
+
+    async def Run() -> None:
+        nonlocal generation
+        await credential_lock.acquire()
+        lookup_task = asyncio.create_task(
+            RecordedSeriesAIModule.lookup_episode(
+                program={},  # type: ignore[arg-type]
+                settings=settings,
+                expected_provider_fingerprint=expected_fingerprint,
+            ),
+        )
+        await asyncio.sleep(0)
+        generation = 'generation-b'
+        credential_lock.release()
+        with pytest.raises(RecordedSeriesAIError) as error:
+            await lookup_task
+        assert error.value.code == 'AISettingsChangedBeforeRequest'
+        assert backend_started is False
 
     asyncio.run(Run())

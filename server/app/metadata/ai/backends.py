@@ -6,9 +6,11 @@ Protocol 定義と、facade が使用する共通データ型を提供する。
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
+from app.metadata.ai.ai_failure_recovery import AIPromptVariant
 from app.metadata.ai.episode_lookup import EpisodeLookupResult
 from app.metadata.RecordedEpisodeContext import RecordedEpisodeLookupContext
 from app.metadata.RecordedSeriesCandidates import (
@@ -98,15 +100,35 @@ class RecordedSeriesAIBackend(Protocol):
         self,
         program: RecordedSeriesProgramPrompt,
         hints: SeriesMetadataHints,
+        *,
+        prompt_variant: AIPromptVariant = 'Default',
+        execution_guard: Callable[[], None] | None = None,
+        local_validation_attempts: int = 2,
     ) -> AISeriesMetadataResult:
-        """シリーズ名・話数・話名を一括生成する。"""
+        """シリーズ名・話数・話名を一括生成する。
+
+        Args:
+            program: 録画番組メタデータ。
+            hints: サーバーが固定した参考情報。
+            prompt_variant: Default は通常プロンプト。RecoveryRetry は修正版。
+            execution_guard: backend の認証・設定排他内で実行する世代検証。
+            local_validation_attempts: backend 内の出力検証試行数。
+        """
         ...
 
     async def lookupEpisode(
         self,
         program: RecordedEpisodeLookupContext,
+        *,
+        prompt_variant: AIPromptVariant = 'Default',
+        execution_guard: Callable[[], None] | None = None,
     ) -> EpisodeLookupResult:
         """話数 Web 検索を実行する。
+
+        Args:
+            program: 話数検索コンテキスト。
+            prompt_variant: Default は通常プロンプト。RecoveryRetry は別検索戦略。
+            execution_guard: backend の認証・設定排他内で実行する世代検証。
 
         Raises:
             UnsupportedOperationError: バックエンドが話数検索をサポートしない場合。

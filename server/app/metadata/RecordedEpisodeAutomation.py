@@ -184,6 +184,7 @@ def _episodeLookupErrorResult(
     model: str,
     http_status: int | None = None,
     latency_ms: int | None = None,
+    recovery_attempt_summaries: tuple[str, ...] = (),
 ) -> EpisodeLookupResult:
     """旧例外経路も backend 共通の安全な lookup outcome へ正規化する。"""
 
@@ -237,6 +238,7 @@ def _episodeLookupErrorResult(
         latency_ms=latency_ms or 0,
         error_code=code,
         error_message=GetRecordedEpisodeErrorMessage(code),
+        recovery_attempt_summaries=recovery_attempt_summaries,
     )
 
 
@@ -619,6 +621,13 @@ class RecordedEpisodeAutomation:
             if result is not None
             else None
         )
+        request_to_update.attempt_summaries = list(
+            result.recovery_attempt_summaries
+            if result is not None
+            else error.recovery_attempt_summaries
+            if error is not None
+            else ()
+        )
         await request_to_update.save(
             update_fields=[
                 "status",
@@ -629,6 +638,7 @@ class RecordedEpisodeAutomation:
                 "http_status",
                 "latency_ms",
                 "error_code",
+                "attempt_summaries",
             ],
             using_db=connection,
         )
@@ -1621,6 +1631,7 @@ class RecordedEpisodeAutomation:
                 model=audit_model,
                 http_status=ex.http_status,
                 latency_ms=ex.latency_ms,
+                recovery_attempt_summaries=ex.recovery_attempt_summaries,
             )
         except Exception as ex:
             logging.error(

@@ -42,6 +42,7 @@ class AIEpisodeLookupResult(EpisodeLookupResult):
         web_search_performed: bool = True,
         error_code: str | None = None,
         error_message: str | None = None,
+        recovery_attempt_summaries: tuple[str, ...] = (),
     ) -> None:
         """新 outcome または旧 numbered から共通結果を初期化する。"""
 
@@ -68,6 +69,7 @@ class AIEpisodeLookupResult(EpisodeLookupResult):
             error_code=error_code,
             error_message=error_message,
             sources=sources,
+            recovery_attempt_summaries=recovery_attempt_summaries,
         )
 
 

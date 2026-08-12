@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import pytest
 from tortoise import Tortoise, transactions
@@ -1030,12 +1030,10 @@ def test_zero_ai_request_limit_skips_daily_count_and_checks_recent_attempt_cache
             RecordedSeriesSettingsStore,
             'getSettingsAndAPIKey',
             staticmethod(lambda: (
-                SimpleNamespace(
+                RecordedSeriesSettings(
                     enabled=True,
                     ai_enabled=True,
                     ai_backend='AcpCodex',
-                    acp_model=None,
-                    ai_backend_service_id=None,
                 ),
                 None,
             )),
@@ -1247,11 +1245,10 @@ def test_ai_generation_audit_uses_backend_prefix_and_closes_failures(
             RecordedSeriesSettingsStore,
             'getSettingsAndAPIKey',
             staticmethod(lambda: (
-                SimpleNamespace(
+                RecordedSeriesSettings(
                     enabled=True,
                     ai_enabled=True,
-                    ai_backend=ai_backend,
-                    ai_backend_service_id=None,
+                    ai_backend=cast(Any, ai_backend),
                 ),
                 None,
             )),
@@ -1469,6 +1466,7 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
         http_status: int | None = None
         latency_ms: int | None = None
         error_code: str | None = None
+        attempt_summaries: list[str] = []
 
         async def save(self, **_kwargs: object) -> None:
             events.append('audit-failed')
@@ -1546,11 +1544,10 @@ def test_generation_change_while_creating_ai_audit_closes_it_before_post(
             RecordedSeriesSettingsStore,
             'getSettingsAndAPIKey',
             staticmethod(lambda: (
-                SimpleNamespace(
+                RecordedSeriesSettings(
                     enabled=True,
                     ai_enabled=True,
                     ai_backend='AcpCodex',
-                    ai_backend_service_id=None,
                 ),
                 None,
             )),

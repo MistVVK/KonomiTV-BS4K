@@ -528,6 +528,8 @@ async def ParseRecordedSeriesSettingsUpdate(
     settings_body.pop('ai_episode_number_acceptance_mode', None)
     settings_body.pop("ai_backend_service_name", None)
     settings_body.pop("ai_backend_auth_configured", None)
+    settings_body.pop("ai_fallback_backend_service_name", None)
+    settings_body.pop("ai_fallback_backend_auth_configured", None)
 
     try:
         settings = RecordedSeriesSettings.model_validate(settings_body)
@@ -609,7 +611,13 @@ async def RecordedSeriesSettingsUpdateAPI(
     settings = await ParseRecordedSeriesSettingsUpdate(request)
     try:
         RecordedSeriesSettingsStore.saveSettings(settings)
-    except (OSError, ValueError) as ex:
+    except ValueError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(ex),
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    except OSError as ex:
         logging.error(
             "[RecordedSeriesSettingsUpdateAPI] Failed to save recorded series settings:",
             exc_info=ex,
