@@ -141,7 +141,7 @@ def test_known_chromium_credits_encoding_repair_allows_known_project_subset() ->
     with pytest.raises(ValueError, match='unexpected projects'):
         GENERATOR.repairKnownCreditsEncoding(
             '151.0.7922.108',
-            credits + [{'name': 'UnknownLib', 'homepage': 'https://example.com/', 'license': 'bad \ufffd'}],
+            [*credits, {'name': 'UnknownLib', 'homepage': 'https://example.com/', 'license': 'bad \ufffd'}],
         )
 
 
