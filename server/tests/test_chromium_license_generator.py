@@ -69,7 +69,7 @@ def test_chromium_credits_require_complete_text_and_supported_homepages() -> Non
 
 @pytest.mark.parametrize(
     'chromium_version',
-    ['150.0.7871.124', '150.0.7871.181', '150.0.7871.186'],
+    ['150.0.7871.124', '150.0.7871.181', '150.0.7871.186', '151.0.7922.108'],
 )
 def test_known_chromium_credits_encoding_damage_is_repaired_only_for_fixed_versions(
     chromium_version: str,
@@ -97,7 +97,7 @@ def test_known_chromium_credits_encoding_damage_is_repaired_only_for_fixed_versi
     assert GENERATOR.FREETYPE_REPAIRED_COPYRIGHT_LINE in repaired[-1]['license']
 
     with pytest.raises(ValueError, match='known repairs apply only'):
-        GENERATOR.repairKnownCreditsEncoding('151.0.0.0', credits)
+        GENERATOR.repairKnownCreditsEncoding('152.0.0.0', credits)
 
 
 def test_linux_mint_package_copyright_is_strict_utf8_and_hashed(tmp_path: Path) -> None:
