@@ -1,3 +1,4 @@
+
 import asyncio
 from pathlib import Path
 
@@ -26,7 +27,13 @@ def test_with_commit_date_appends_only_when_present() -> None:
     )
 
 
-def test_get_git_commit_includes_commit_date_from_source_tree(
+def test_with_dirty_suffix() -> None:
+    assert git_module._with_dirty_suffix('bs4k-v1.1.0', False) == 'bs4k-v1.1.0'
+    assert git_module._with_dirty_suffix('bs4k-v1.1.0', True) == 'bs4k-v1.1.0-dirty'
+    assert git_module._with_dirty_suffix('abc12345-dirty', True) == 'abc12345-dirty'
+
+
+def test_get_git_commit_uses_exact_bs4k_tag_when_head_matches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -35,32 +42,65 @@ def test_get_git_commit_includes_commit_date_from_source_tree(
 
     async def fake_run_git(source_tree: Path, *args: str) -> str | None:
         assert source_tree == tmp_path
-        if args[:1] == ('describe',):
-            return 'abc12345-dirty'
+        if args[:1] == ('describe',) and '--exact-match' in args:
+            return 'bs4k-v1.1.0'
         if args == ('show', '-s', '--format=%cI'):
             return '2026-07-30T17:04:47+09:00'
         raise AssertionError(f'unexpected git args: {args}')
 
+    async def fake_is_dirty(source_tree: Path) -> bool:
+        assert source_tree == tmp_path
+        return False
+
     monkeypatch.setattr(git_module, '_run_git', fake_run_git)
+    monkeypatch.setattr(git_module, '_is_worktree_dirty', fake_is_dirty)
 
     result = asyncio.run(git_module.GetGitCommit())
-    assert result == 'abc12345-dirty (2026-07-30 17:04:47)'
-    # 2 回目はキャッシュを返す
+    assert result == 'bs4k-v1.1.0 (2026-07-30 17:04:47)'
     assert asyncio.run(git_module.GetGitCommit()) == result
+
+
+def test_get_git_commit_uses_short_hash_when_not_exact_tag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / '.git').mkdir()
+    monkeypatch.setenv('KONOMITV_BS4K_SOURCE_TREE', str(tmp_path))
+
+    async def fake_run_git(source_tree: Path, *args: str) -> str | None:
+        assert source_tree == tmp_path
+        if args[:1] == ('describe',) and '--exact-match' in args:
+            # タグ近傍だが完全一致ではない
+            return None
+        if args[:1] == ('rev-parse',):
+            return 'b3d94ce3'
+        if args == ('show', '-s', '--format=%cI'):
+            return '2026-07-30T17:04:47+09:00'
+        raise AssertionError(f'unexpected git args: {args}')
+
+    async def fake_is_dirty(source_tree: Path) -> bool:
+        assert source_tree == tmp_path
+        return True
+
+    monkeypatch.setattr(git_module, '_run_git', fake_run_git)
+    monkeypatch.setattr(git_module, '_is_worktree_dirty', fake_is_dirty)
+
+    result = asyncio.run(git_module.GetGitCommit())
+    assert result == 'b3d94ce3-dirty (2026-07-30 17:04:47)'
 
 
 def test_get_git_commit_falls_back_to_env_with_optional_date(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    # .git はあるが describe に失敗した場合は環境変数へフォールバックする
+    # .git はあるがラベル解決に失敗した場合は環境変数へフォールバックする
     (tmp_path / '.git').mkdir()
     monkeypatch.setenv('KONOMITV_BS4K_SOURCE_TREE', str(tmp_path))
 
-    async def fake_run_git(*_: object) -> str | None:
+    async def fake_resolve_label(_: Path) -> str | None:
         return None
 
-    monkeypatch.setattr(git_module, '_run_git', fake_run_git)
+    monkeypatch.setattr(git_module, '_resolve_commit_label', fake_resolve_label)
     monkeypatch.setenv('KONOMITV_BS4K_GIT_COMMIT', 'deadbeef')
     monkeypatch.setenv('KONOMITV_BS4K_GIT_COMMIT_DATE', '2026-07-29T12:00:00+09:00')
 
@@ -75,10 +115,10 @@ def test_get_git_commit_env_without_date(
     (tmp_path / '.git').mkdir()
     monkeypatch.setenv('KONOMITV_BS4K_SOURCE_TREE', str(tmp_path))
 
-    async def fake_run_git(*_: object) -> str | None:
+    async def fake_resolve_label(_: Path) -> str | None:
         return None
 
-    monkeypatch.setattr(git_module, '_run_git', fake_run_git)
+    monkeypatch.setattr(git_module, '_resolve_commit_label', fake_resolve_label)
     monkeypatch.setenv('KONOMITV_BS4K_GIT_COMMIT', 'cafebabe')
     monkeypatch.delenv('KONOMITV_BS4K_GIT_COMMIT_DATE', raising=False)
 
@@ -86,18 +126,20 @@ def test_get_git_commit_env_without_date(
     assert result == 'cafebabe'
 
 
-def test_get_git_commit_keeps_hash_when_date_lookup_fails(
+def test_get_git_commit_keeps_label_when_date_lookup_fails(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     (tmp_path / '.git').mkdir()
     monkeypatch.setenv('KONOMITV_BS4K_SOURCE_TREE', str(tmp_path))
 
-    async def fake_run_git(source_tree: Path, *args: str) -> str | None:
-        if args[:1] == ('describe',):
-            return 'abc12345'
+    async def fake_resolve_label(_: Path) -> str:
+        return 'abc12345'
+
+    async def fake_run_git(*_: object) -> str | None:
         return None
 
+    monkeypatch.setattr(git_module, '_resolve_commit_label', fake_resolve_label)
     monkeypatch.setattr(git_module, '_run_git', fake_run_git)
 
     result = asyncio.run(git_module.GetGitCommit())
