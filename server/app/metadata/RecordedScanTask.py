@@ -45,6 +45,7 @@ from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
+from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.Git import GetGitCommit
@@ -507,6 +508,9 @@ class RecordedScanTask:
         else:
             logging.info('No duplicate records found.')
 
+        # 旧 key_frames が残っている録画は、再生開始位置キャッシュへ変換して DB サイズを抑える
+        await self.__migrateKeyFramesToSegmentMap()
+
         # 現在登録されている全ての RecordedVideo レコードをキャッシュ
         ## 重複削除処理で保持すると判断されたレコードのみを使う
         existing_db_recorded_videos: dict[anyio.Path, RecordedVideoSummary] = {}
@@ -636,9 +640,6 @@ class RecordedScanTask:
                         logging.info(f'{thumbnail_path.name}: Deleted orphaned thumbnail file.')
                 except Exception as ex:
                     logging.error(f'{thumbnail_path}: Error deleting orphaned thumbnail file:', exc_info=ex)
-
-        # サムネイル情報のマイグレーションを実行
-        await self.__migrateThumbnailInfo()
 
         # かつてのバグで RecordedVideo.file_hash が衝突している録画ファイルのメタデータを再解析する
         ## トランザクション配下に入れることでパフォーマンスが向上する
@@ -1646,97 +1647,132 @@ class RecordedScanTask:
             self._background_tasks.pop(file_path, None)
 
 
-    async def __migrateThumbnailInfo(self) -> None:
+    async def __migrateKeyFramesToSegmentMap(self) -> None:
         """
-        サムネイル情報 (thumbnail_info) が未保存の録画に対して、サムネイル情報の移行・補完を行う
+        旧 key_frames を再生開始位置キャッシュへ移行する
 
         このメソッドは runBatchScan() から呼び出され、以下の処理を行う:
-        - RecordedVideo.thumbnail_info が None のレコードを対象にサムネイル情報を移行
-        - 既存のサムネイルタイル画像が存在する場合は旧仕様 (480x270, 34列) から新仕様 (192x108, 85列) に変換
-        - サムネイルが存在しない場合は新規に生成
-
-        新仕様ではタイルサイズを小さくすることで、ファイルサイズを削減しつつシークバーでの表示品質を維持している
-        旧仕様のタイル画像は backup フォルダにバックアップされる (MIGRATION_BACKUP_ENABLED が True の場合)
+        - TS コンテナは key_frames から segment_map を生成して保存
+        - MPEG-4 コンテナは moov の同期サンプル表を再生時に読むため key_frames だけ破棄
+        - 変換後の key_frames は空配列へ戻し、巨大な JSON が残り続けないようにする
         """
 
-        logging.info('Starting thumbnail metadata migration...')
+        logging.info('Starting keyframe to segment map migration...')
 
-        # サムネイルフォルダが存在しない場合はマイグレーション不要
-        thumbnails_dir = anyio.Path(str(THUMBNAILS_DIR))
-        if not await thumbnails_dir.is_dir():
-            logging.info('Thumbnail directory does not exist. Skipping thumbnail metadata migration.')
-            return
+        migrated_count = 0
+        repaired_count = 0
+        skipped_count = 0
+        last_seen_id = 0
+        next_progress_log_count = 500
 
-        # thumbnail_info が未設定の録画済みファイルを一括取得
-        ## マイグレーション処理では RecordedVideo の情報のみで十分なため、RecordedProgram は取得しない
-        ## メモリ使用量を抑えるため、key_frames などの大きなフィールドは取得せず、必要最低限のフィールドのみを取得する
-        target_video_rows = await RecordedVideo.filter(status='Recorded', thumbnail_info=None).values(
-            'id',
-            'file_path',
-            'file_hash',
-            'duration',
-            'recorded_program_id',
-        )
-        if len(target_video_rows) == 0:
-            logging.info('No videos require thumbnail metadata migration.')
-            return
+        while True:
+            # key_frames は ORM 取得時に list へ復元されるため、Python 側で空配列かどうかを判定する
+            ## DB 側で巨大 JSON の文字列比較を走らせず、ID 順に少量ずつ読み出して移行する
+            video_rows = await RecordedVideo.filter(
+                status = 'Recorded',
+                id__gt = last_seen_id,
+            ).order_by('id').limit(50).values(
+                'id',
+                'file_path',
+                'duration',
+                'container_format',
+                'video_frame_rate',
+                'key_frames',
+                'segment_map',
+            )
+            if len(video_rows) == 0:
+                break
+
+            for video_row in video_rows:
+                last_seen_id = video_row['id']
+
+                try:
+                    segment_map = video_row['segment_map']
+                    if not isinstance(segment_map, list):
+                        segment_map = []
+
+                    is_broken_segment_map = False
+                    # 旧変換ロジックで同じ入力位置が連続保存された MPEG-TS は、再生時に同じ映像を繰り返す
+                    ## key_frames が既に空でも検出できるよう、移行対象判定より先に segment_map を確認する
+                    if (
+                        video_row['container_format'] == 'MPEG-TS' and
+                        len(segment_map) > 0 and
+                        VideoSegmentPlanner.isSegmentMapProbablyBroken(cast(list[schemas.SegmentMapEntry], segment_map)) is True
+                    ):
+                        is_broken_segment_map = True
+
+                    key_frames = video_row['key_frames']
+                    if not isinstance(key_frames, list) or len(key_frames) == 0:
+                        # 壊れた既存キャッシュだけを空に戻し、通常の未キャッシュ状態としてオンデマンド探索へ戻す
+                        ## key_frames が空の録画は旧データから再変換できないため、誤った値を温存しない
+                        if is_broken_segment_map is True:
+                            await RecordedVideo.filter(id=video_row['id']).update(segment_map = [])
+                            repaired_count += 1
+                            logging.warning(
+                                f'{video_row["file_path"]}: Broken segment map was cleared. '
+                                f'[video_id: {video_row["id"]}]'
+                            )
+                        continue
+
+                    # TS コンテナは既存 key_frames をオンデマンド探索と同じ規則のキャッシュへ変換できる
+                    if video_row['container_format'] == 'MPEG-TS':
+                        if len(segment_map) == 0 or is_broken_segment_map is True:
+                            video_frame_rate = video_row['video_frame_rate']
+                            # 旧 DB に壊れたフレームレートが混じっている場合、セグメント長を復元できないため移行対象から外す
+                            if (
+                                isinstance(video_frame_rate, bool) is True or
+                                isinstance(video_frame_rate, int | float) is False
+                            ):
+                                skipped_count += 1
+                                logging.warning(
+                                    f'{video_row["file_path"]}: Invalid video frame rate. '
+                                    f'[video_id: {video_row["id"]}, video_frame_rate: {video_frame_rate}]'
+                                )
+                                continue
+                            # 0 以下のフレームレートは segment_map の時刻計算で除算できないため移行対象から外す
+                            if video_frame_rate <= 0:
+                                skipped_count += 1
+                                logging.warning(
+                                    f'{video_row["file_path"]}: Invalid video frame rate. '
+                                    f'[video_id: {video_row["id"]}, video_frame_rate: {video_frame_rate}]'
+                                )
+                                continue
+                            segment_map = VideoSegmentPlanner.convertKeyFramesToSegmentMap(
+                                key_frames = key_frames,
+                                video_frame_rate = float(video_frame_rate),
+                                duration_seconds = video_row['duration'],
+                            )
+
+                        await RecordedVideo.filter(id=video_row['id']).update(
+                            segment_map = segment_map,
+                            key_frames = [],
+                        )
+                        migrated_count += 1
+                    # MP4 は moov から同期サンプル DTS を短時間で復元できるため、巨大な旧キャッシュだけ破棄する
+                    else:
+                        await RecordedVideo.filter(id=video_row['id']).update(key_frames = [])
+                        migrated_count += 1
+                except Exception as ex:
+                    skipped_count += 1
+                    logging.error(f'{video_row["file_path"]}: Failed to migrate keyframes to segment map:', exc_info=ex)
+
+            # 大量の録画を持つ環境では起動直後に沈黙すると不安になるため、500件ごとに進捗をログへ出す
+            processed_count = migrated_count + repaired_count + skipped_count
+            if processed_count >= next_progress_log_count:
+                logging.info(
+                    f'Keyframe to segment map migration progress. '
+                    f'[processed: {processed_count}, migrated: {migrated_count}, repaired: {repaired_count}, '
+                    f'skipped: {skipped_count}]'
+                )
+                next_progress_log_count += 500
+
+            # 移行処理がイベントループを占有し続けないよう適宜制御を返す
+            await asyncio.sleep(0)
 
         logging.info(
-            f'Thumbnail metadata migration target count: {len(target_video_rows)} '
-            f'(backup_enabled: {ThumbnailGenerator.MIGRATION_BACKUP_ENABLED}).'
+            f'Keyframe to segment map migration completed. '
+            f'[migrated: {migrated_count}, repaired: {repaired_count}, skipped: {skipped_count}]'
         )
-
-        # 各録画ファイルに対してサムネイル情報を移行
-        for index, video_row in enumerate(target_video_rows, start=1):
-            file_path = anyio.Path(video_row['file_path'])
-
-            # 録画ファイルが存在しない場合はスキップ (削除済みなど)
-            if not await self.isFileExists(file_path):
-                logging.warning(f'{file_path}: Recording file not found. Skipping thumbnail metadata migration. ({index}/{len(target_video_rows)})')
-                continue
-
-            # 既存のサムネイルファイルのパスを構築
-            tile_path = thumbnails_dir / f'{video_row["file_hash"]}_tile.webp'
-            thumbnail_path = thumbnails_dir / f'{video_row["file_hash"]}.webp'
-
-            try:
-                logging.info(f'{file_path}: Thumbnail migration started. ({index}/{len(target_video_rows)})')
-
-                # 同時実行数を制限しつつサムネイル処理を実行
-                async with ProcessLimiter.getSemaphore('ThumbnailMigration'):
-                    async with DriveIOLimiter.getSemaphore(file_path):
-                        # タイル画像と代表サムネイルの両方が存在する場合は既存タイルを新仕様に変換
-                        if await tile_path.is_file() and await thumbnail_path.is_file():
-                            generator = ThumbnailGenerator.forMigration(
-                                file_path = video_row['file_path'],
-                                file_hash = video_row['file_hash'],
-                                duration_sec = video_row['duration'],
-                            )
-                            await generator.migrateFromLegacyTile()
-                        # サムネイルが存在しない場合は新規生成する
-                        ## 新規生成を行うには RecordedProgram が必要なため、ここで随時取得する
-                        else:
-                            logging.info(f'{file_path}: Missing thumbnails. Regenerating with new settings. ({index}/{len(target_video_rows)})')
-                            recorded_program = await RecordedProgram.get_or_none(
-                                id=video_row['recorded_program_id'],
-                            ).select_related('recorded_video', 'channel')
-                            if recorded_program is None:
-                                logging.warning(f'{file_path}: RecordedProgram not found. Skipping thumbnail regeneration. ({index}/{len(target_video_rows)})')
-                                continue
-                            recorded_program_schema = schemas.RecordedProgram.model_validate(recorded_program, from_attributes=True)
-                            generator = ThumbnailGenerator.fromRecordedProgram(recorded_program_schema)
-                            await generator.generateAndSave()
-
-                logging.info(f'{file_path}: Thumbnail migration finished. ({index}/{len(target_video_rows)})')
-            except Exception as ex:
-                logging.error(f'{file_path}: Failed to migrate thumbnail metadata:', exc_info=ex)
-
-            # イベントループが他のタスクを処理できるよう定期的に制御を返す
-            if index % 20 == 0:
-                await asyncio.sleep(0)
-
-        logging.info('Thumbnail metadata migration completed.')
-
 
     async def watchRecordedFolders(self) -> None:
         """

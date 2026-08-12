@@ -31,7 +31,7 @@
         "comlink": "^4.4.1",
         "copy-image-clipboard": "^2.1.2",
         "dayjs": "^1.11.13",
-        "dplayer": "github:tsukumijima/DPlayer#v1.32.8",
+        "dplayer": "github:tsukumijima/DPlayer#v1.32.9",
         "floating-vue": "^5.2.2",
         "hls.js": "^1.6.9",
         "mitt": "^3.0.1",

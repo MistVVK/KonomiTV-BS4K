@@ -253,6 +253,7 @@ upstream KonomiTV は Windows と Linux の双方を対象としていますが�
 ### Vue / TypeScript コード
 
 - **コードの編集後には、必ず `yarn lint; yarn typecheck` コマンドで、ESLint によるコードリンターと TypeScript による型チェッカーを実行すること**
+- **`window.confirm()` / `window.alert()` などのブラウザ標準ダイアログは絶対に使用しないこと。Vuetify で既存 UI と一貫したダイアログを実装する。標準ダイアログで済ませるのは妥協・甘え・ボケナス実装であり、KonomiTV の UI として許容しない**
 - 文字列にはシングルクォートを用いる
 - 新規で実装する箇所に関しては Vue 3 Composition API パターンに従う
   - Vue.js 2 から移行した関係で Options API で書かれているコンポーネントがあるが、それらは Options API のまま維持する
