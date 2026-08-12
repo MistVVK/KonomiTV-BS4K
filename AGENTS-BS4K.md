@@ -81,34 +81,29 @@ Docker Linux オンリーとする。
 ### Development Compose
 
 - Development の Compose 操作は、現在のリポジトリルートを working directory として実行する。
-- `compose.development.yaml` を必ず明示する。Intel / AMD DRM と NVIDIA を使う現在の開発機では `compose.intel-amd.yaml` と `compose.nvidia.yaml` も明示する。公開・Main 用の `compose.yaml` に Development の状態を上書きする運用は行わない。
+- GPU 構成を含む Compose ファイルの組み合わせは `.env` の `COMPOSE_FILE` で切り替える（`.env.example` 参照）。`-f` を毎回手で並べない。
+  - Development 例: `COMPOSE_FILE=compose.development.yaml:compose.intel-amd.yaml:compose.nvidia.yaml`
+  - 公開・Main 例: `COMPOSE_FILE=compose.yaml` に必要なら `compose.intel-amd.yaml` / `compose.nvidia.yaml` を連結
+- 公開・Main 用の `compose.yaml` に Development の状態を上書きする運用は行わない。
 - Development は `verified-runtime` target を使用する。通常のコード変更を未検証の `runtime` target だけで起動してはいけない。
 - ビルド中は既存の Development コンテナを稼働させ、ビルド成功後にコンテナだけを再作成して停止時間を最小化する。
-- Development のビルドには次のコマンドを使用する。
+- Development のビルドには次のコマンドを使用する（`.env` の `COMPOSE_FILE` が効く前提）。
 
 ```bash
-docker compose \
-    -f compose.development.yaml \
-    -f compose.intel-amd.yaml \
-    -f compose.nvidia.yaml \
-    build konomitv
+docker compose build konomitv
 ```
 
 - ビルド成功後の再作成には次のコマンドを使用する。
 
 ```bash
-docker compose \
-    -f compose.development.yaml \
-    -f compose.intel-amd.yaml \
-    -f compose.nvidia.yaml \
-    up -d --no-build --force-recreate konomitv
+docker compose up -d --no-build --force-recreate konomitv
 ```
 
 ### 状態保護と事前確認
 
 - `docker/development/state/` 以下の `config.yaml`、`data/`、`logs/`、`recordings/`、`captures/` を Development 専用状態として保持する。
 - `docker compose down -v`、volume 削除、状態ディレクトリの削除、Main 状態の流用を行ってはいけない。
-- 再作成前に `docker compose -f compose.development.yaml -f compose.intel-amd.yaml -f compose.nvidia.yaml config` で解決済み設定を確認し、設定・データ・ログの Development bind source が現在のリポジトリの `docker/development/state/` を指していることを確認する。
+- 再作成前に `docker compose config` で解決済み設定を確認し、設定・データ・ログの Development bind source が現在のリポジトリの `docker/development/state/` を指していることを確認する。
 - 再作成後にコンテナの Compose working directory、設定ファイル、bind source、イメージ ID、再起動回数を確認する。
 - Development API と画面が返す Git commit が現在のワークツリーと一致し、Main コンテナの状態・エンコーダー構成・API 応答が変化していないことを確認する。
 
