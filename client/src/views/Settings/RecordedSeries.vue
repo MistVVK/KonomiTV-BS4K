@@ -63,12 +63,12 @@
 
             <div class="settings__content-heading mt-7">
                 <Icon icon="fluent:bot-20-filled" width="22px" />
-                <span class="ml-2">AI バックエンド</span>
+                <span class="ml-2">AI バックエンド（主系）</span>
             </div>
             <div class="settings__item">
                 <div class="settings__item-heading">バックエンド</div>
                 <div class="settings__item-label">
-                    AI によるシリーズ情報生成と話数検索に使用するバックエンドを選択します。<br>
+                    AI によるシリーズ情報生成と話数検索に最初に使用するバックエンドを選択します。<br>
                     OpenCode は「設定 → AIバックエンド」で登録した service を使います。<br>
                     ACP / Codex・Grok はホスト上の CLI を起動します。<br>
                     シリーズ情報生成と話数 Web 検索は、AIバックエンド画面から個別に接続確認できます。<br>
@@ -112,6 +112,65 @@
                         AIバックエンド設定を開く
                     </v-btn>
                 </div>
+            </template>
+
+            <div class="settings__content-heading mt-7">
+                <Icon icon="fluent:arrow-sync-20-filled" width="22px" />
+                <span class="ml-2">AI バックエンド（予備）</span>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">失敗時ポリシー</div>
+                <div class="settings__item-label">
+                    主系 AI が技術的に失敗したとき、または Unresolved / InsufficientEvidence のときにどうするかを決めます。<br>
+                    NotSeries / NoPublishedNumber / NotNumbered など正常な判定結果では切り替えません。<br>
+                    失敗時ポリシーによる AI 試行は最大 2 回です。OpenCode 内部の出力形式補修は別に行われます。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :items="ai_failure_recovery_options" item-title="title" item-value="value"
+                    v-model="settings.ai_failure_recovery_strategy" />
+            </div>
+            <template v-if="settings.ai_failure_recovery_strategy === 'FallbackBackend'">
+                <div class="settings__item">
+                    <div class="settings__item-heading">予備バックエンド</div>
+                    <div class="settings__item-label">
+                        主系とは独立したバックエンドを選びます。予備へは主系の回答や失敗理由を渡しません。<br>
+                        主系と同じバックエンド（OpenCode なら同じ service）は選べません。<br>
+                    </div>
+                    <v-select class="settings__item-form" color="primary" variant="outlined"
+                        :density="is_form_dense ? 'compact' : 'default'"
+                        :items="ai_backend_options" item-title="title" item-value="value"
+                        :error-messages="fallback_backend_error || (
+                            settings.ai_fallback_backend !== 'OpenCode' ? fallback_auth_error : ''
+                        )"
+                        v-model="settings.ai_fallback_backend" />
+                </div>
+                <template v-if="settings.ai_fallback_backend === 'OpenCode'">
+                    <div class="settings__item">
+                        <div class="settings__item-heading">予備 OpenCode service</div>
+                        <div class="settings__item-label">
+                            予備として使う OpenCode service を選びます。参照中の service は削除できません。<br>
+                        </div>
+                        <v-select class="settings__item-form" color="primary" variant="outlined"
+                            :density="is_form_dense ? 'compact' : 'default'"
+                            :items="opencode_services" item-title="title" item-value="value"
+                            :error-messages="fallback_opencode_service_error || fallback_auth_error"
+                            no-data-text="登録済み service がありません"
+                            v-model="settings.ai_fallback_backend_service_id" />
+                        <div class="settings__item-label mt-2">
+                            認証状態: {{ fallback_auth_configured ? '設定済み' : '未設定' }}
+                        </div>
+                    </div>
+                </template>
+                <template v-if="settings.ai_fallback_backend === 'AcpCodex' || settings.ai_fallback_backend === 'AcpGrok'">
+                    <div class="settings__item">
+                        <div class="settings__item-heading">予備 ACP のモデル・認証</div>
+                        <div class="settings__item-label">
+                            予備 ACP のモデル・推論深さ・認証も「AIバックエンド」ページの設定を共有します。<br>
+                            認証状態: {{ fallback_auth_configured ? '設定済み' : '未設定' }}
+                        </div>
+                    </div>
+                </template>
             </template>
             <v-btn class="settings__save-button bg-secondary mt-6" variant="flat"
                 :loading="is_saving"
@@ -296,10 +355,11 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 
 import Message from '@/message';
-import AIBackend, { type AIAuthMode } from '@/services/AIBackend';
+import AIBackend, { type AIAuthMode, type IACPBackendCredentialStatus } from '@/services/AIBackend';
 import AnalysisTasks, { type IAnalysisTaskExecution } from '@/services/AnalysisTasks';
 import RecordedSeries, {
     type AIBackendKind,
+    type AIFailureRecoveryStrategy,
     type IRecordedSeriesSettings,
     type IRecordedSeriesSettingsUpdate,
     type IRecordedSeriesStatus,
@@ -314,6 +374,11 @@ const ai_backend_options: {title: string; value: AIBackendKind;}[] = [
     {title: 'OpenCode（AIバックエンド service）', value: 'OpenCode'},
     {title: 'ACP / Codex', value: 'AcpCodex'},
     {title: 'ACP / Grok Build', value: 'AcpGrok'},
+];
+const ai_failure_recovery_options: {title: string; value: AIFailureRecoveryStrategy;}[] = [
+    {title: 'Fail（追加試行なし）', value: 'Fail'},
+    {title: 'RetrySameBackend（主系を修正版プロンプトで再実行）', value: 'RetrySameBackend'},
+    {title: 'FallbackBackend（予備 AI へ切り替え）', value: 'FallbackBackend'},
 ];
 const ai_auth_mode_labels: Record<AIAuthMode, string> = {
     ApiKey: 'API キー',
@@ -330,10 +395,16 @@ const settings = ref<IRecordedSeriesSettings>({
     ai_backend_service_id: null,
     ai_backend_service_name: null,
     ai_backend_auth_configured: false,
+    ai_failure_recovery_strategy: 'Fail',
+    ai_fallback_backend: null,
+    ai_fallback_backend_service_id: null,
+    ai_fallback_backend_service_name: null,
+    ai_fallback_backend_auth_configured: false,
 });
 // 一括判定は未保存のフォーム値ではなく、サーバーに保存済みの AI 設定だけを利用する。
 const saved_settings = ref<IRecordedSeriesSettings | null>(null);
-const opencode_services = ref<{title: string; value: string;}[]>([]);
+const opencode_services = ref<{title: string; value: string; authConfigured: boolean;}[]>([]);
+const acp_credential_status = ref<IACPBackendCredentialStatus | null>(null);
 const status = ref<IRecordedSeriesStatus | null>(null);
 
 const is_loading = ref(true);
@@ -365,9 +436,80 @@ const opencode_service_error = computed(() => {
     }
     return '';
 });
+const fallback_backend_error = computed(() => {
+    if (settings.value.ai_failure_recovery_strategy !== 'FallbackBackend') return '';
+    if (!settings.value.ai_fallback_backend) {
+        return '予備 AI バックエンドを選択してください。';
+    }
+    if (areBackendTargetsIdentical(
+        settings.value.ai_backend,
+        settings.value.ai_backend_service_id,
+        settings.value.ai_fallback_backend,
+        settings.value.ai_fallback_backend_service_id,
+    )) {
+        return '主系と同じバックエンドは予備に選べません。';
+    }
+    return '';
+});
+const fallback_opencode_service_error = computed(() => {
+    if (settings.value.ai_failure_recovery_strategy !== 'FallbackBackend') return '';
+    if (settings.value.ai_fallback_backend !== 'OpenCode') return '';
+    if (settings.value.ai_enabled && !settings.value.ai_fallback_backend_service_id) {
+        return '予備 OpenCode service を選択してください。';
+    }
+    if (
+        settings.value.ai_backend === 'OpenCode'
+        && settings.value.ai_backend_service_id
+        && settings.value.ai_fallback_backend_service_id
+        && settings.value.ai_backend_service_id.toLowerCase()
+            === settings.value.ai_fallback_backend_service_id.toLowerCase()
+    ) {
+        return '主系と同じ OpenCode service は予備に選べません。';
+    }
+    return '';
+});
+const fallback_auth_configured = computed(() => {
+    if (settings.value.ai_failure_recovery_strategy !== 'FallbackBackend') return false;
+    const fallbackBackend = settings.value.ai_fallback_backend;
+    if (fallbackBackend === 'OpenCode') {
+        const selectedServiceID = settings.value.ai_fallback_backend_service_id?.toLowerCase() ?? null;
+        const selectedService = opencode_services.value.find(service => service.value.toLowerCase() === selectedServiceID);
+        return selectedService?.authConfigured === true;
+    }
+    if (fallbackBackend === 'AcpCodex') return acp_credential_status.value?.codex_auth_imported === true;
+    if (fallbackBackend === 'AcpGrok') return acp_credential_status.value?.grok_auth_imported === true;
+    return false;
+});
+const fallback_auth_error = computed(() => {
+    if (settings.value.ai_enabled === false) return '';
+    if (settings.value.ai_failure_recovery_strategy !== 'FallbackBackend') return '';
+    return fallback_auth_configured.value ? '' : '予備 AI バックエンドの認証を設定してください。';
+});
 const has_settings_validation_error = computed(() =>
-    opencode_service_error.value !== '',
+    opencode_service_error.value !== ''
+    || fallback_backend_error.value !== ''
+    || fallback_opencode_service_error.value !== ''
+    || fallback_auth_error.value !== '',
 );
+
+/** 主系と予備の実行ターゲットが同一かを判定する。 */
+function areBackendTargetsIdentical(
+    primary_backend: AIBackendKind,
+    primary_service_id: string | null,
+    fallback_backend: AIBackendKind | null,
+    fallback_service_id: string | null,
+): boolean {
+    if (fallback_backend === null) return false;
+    if (primary_backend !== fallback_backend) return false;
+    if (primary_backend === 'OpenCode') {
+        return (
+            primary_service_id !== null
+            && fallback_service_id !== null
+            && primary_service_id.toLowerCase() === fallback_service_id.toLowerCase()
+        );
+    }
+    return true;
+}
 const is_settings_action_running = computed(() =>
     is_saving.value,
 );
@@ -410,6 +552,9 @@ const episode_backfill_progress = computed(() => {
 
 /** 画面上の全ドラフトを保存 payload へ変換する。 */
 function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
+    const strategy = settings.value.ai_failure_recovery_strategy;
+    const use_fallback = strategy === 'FallbackBackend';
+    const fallback_backend = use_fallback ? settings.value.ai_fallback_backend : null;
     return {
         enabled: settings.value.enabled,
         ai_enabled: settings.value.ai_enabled,
@@ -417,6 +562,11 @@ function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
         ai_backend_service_id: settings.value.ai_backend === 'OpenCode'
             ? settings.value.ai_backend_service_id
             : null,
+        ai_failure_recovery_strategy: strategy,
+        ai_fallback_backend: fallback_backend,
+        ai_fallback_backend_service_id: (
+            use_fallback && fallback_backend === 'OpenCode'
+        ) ? settings.value.ai_fallback_backend_service_id : null,
     };
 }
 
@@ -425,13 +575,33 @@ function applyFetchedSettings(fetched_settings: IRecordedSeriesSettings): void {
     // ローリング更新中の旧サーバーや古い mock が廃止済み backend を返しても、
     // 一覧外の値を表示したり任意コマンド設定へ戻ったりしないようクライアントでも fail-closed にする。
     const is_supported_backend = ai_backend_options.some(option => option.value === fetched_settings.ai_backend);
-    const normalized_settings: IRecordedSeriesSettings = is_supported_backend ?
-        fetched_settings :
-        {
-            ...fetched_settings,
-            ai_backend: 'AcpCodex',
-            ai_enabled: false,
-        };
+    const is_supported_fallback = (
+        fetched_settings.ai_fallback_backend === null
+        || ai_backend_options.some(option => option.value === fetched_settings.ai_fallback_backend)
+    );
+    const is_supported_strategy = ai_failure_recovery_options.some(
+        option => option.value === fetched_settings.ai_failure_recovery_strategy,
+    );
+    const normalized_settings: IRecordedSeriesSettings = {
+        ...fetched_settings,
+        ai_backend: is_supported_backend ? fetched_settings.ai_backend : 'AcpCodex',
+        ai_enabled: is_supported_backend ? fetched_settings.ai_enabled : false,
+        ai_failure_recovery_strategy: is_supported_strategy
+            ? fetched_settings.ai_failure_recovery_strategy
+            : 'Fail',
+        ai_fallback_backend: is_supported_fallback
+            ? fetched_settings.ai_fallback_backend
+            : null,
+        ai_fallback_backend_service_id: (
+            is_supported_fallback
+            && fetched_settings.ai_fallback_backend === 'OpenCode'
+        ) ? fetched_settings.ai_fallback_backend_service_id : null,
+        ai_fallback_backend_service_name: (
+            is_supported_fallback
+            && fetched_settings.ai_fallback_backend === 'OpenCode'
+        ) ? fetched_settings.ai_fallback_backend_service_name : null,
+        ai_fallback_backend_auth_configured: fetched_settings.ai_fallback_backend_auth_configured,
+    };
     settings.value = {...normalized_settings};
     saved_settings.value = {...normalized_settings};
 }
@@ -595,10 +765,11 @@ onMounted(async () => {
         is_loading.value = false;
         return;
     }
-    const [fetched_settings, fetched_status, fetched_services] = await Promise.all([
+    const [fetched_settings, fetched_status, fetched_services, fetched_acp_credentials] = await Promise.all([
         RecordedSeries.fetchSettings(),
         RecordedSeries.fetchStatus(),
         AIBackend.fetchServices(),
+        AIBackend.fetchACPCredentialStatus(),
     ]);
     if (fetched_services !== null) {
         opencode_services.value = fetched_services.map(service => ({
@@ -608,7 +779,11 @@ onMounted(async () => {
                 service.opencode_model_variant ? `[${service.opencode_model_variant}]` : ''
             } · ${service.structured_output_mode})`,
             value: service.service_id,
+            authConfigured: service.auth_configured,
         }));
+    }
+    if (fetched_acp_credentials !== null) {
+        acp_credential_status.value = fetched_acp_credentials;
     }
     if (fetched_settings !== null) {
         applyFetchedSettings(fetched_settings);

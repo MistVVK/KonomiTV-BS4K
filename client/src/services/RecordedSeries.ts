@@ -5,6 +5,8 @@ import APIClient from '@/services/APIClient';
 
 /** 録画シリーズが選択できる AI バックエンド。OpenCode は AIBackend service_id を参照する。 */
 export type AIBackendKind = 'OpenCode' | 'AcpCodex' | 'AcpGrok';
+/** 主系 AI 失敗後の回復方針。既定は追加試行なしの Fail。 */
+export type AIFailureRecoveryStrategy = 'FallbackBackend' | 'RetrySameBackend' | 'Fail';
 export type EpisodeLookupOutcome =
     'Pending' | 'Resolved' | 'NotNumbered' | 'NoPublishedNumber' | 'InsufficientEvidence' | 'SearchFailed' |
     'SearchNotRun' | 'InvalidModelOutput' | 'Disabled' | 'RateLimited' | 'Cancelled';
@@ -21,6 +23,16 @@ export interface IRecordedSeriesSettings {
     ai_backend_service_name: string | null;
     // 選択中の OpenCode / ACP バックエンドに利用可能な認証があるか。
     ai_backend_auth_configured: boolean;
+    // 主系失敗後の回復方針。
+    ai_failure_recovery_strategy: AIFailureRecoveryStrategy;
+    // FallbackBackend 時のみ使う予備 AI バックエンド。
+    ai_fallback_backend: AIBackendKind | null;
+    // 予備が OpenCode のときの service UUID。
+    ai_fallback_backend_service_id: string | null;
+    // 予備 OpenCode service 表示名。
+    ai_fallback_backend_service_name: string | null;
+    // 予備 OpenCode / ACP バックエンドに利用可能な認証があるか。
+    ai_fallback_backend_auth_configured: boolean;
 }
 
 /** 録画シリーズ判定設定の更新リクエスト。 */
@@ -29,6 +41,9 @@ export interface IRecordedSeriesSettingsUpdate {
     ai_enabled: boolean;
     ai_backend: AIBackendKind;
     ai_backend_service_id: string | null;
+    ai_failure_recovery_strategy: AIFailureRecoveryStrategy;
+    ai_fallback_backend: AIBackendKind | null;
+    ai_fallback_backend_service_id: string | null;
 }
 
 /** 録画シリーズ判定の全体状況。 */
