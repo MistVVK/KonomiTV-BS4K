@@ -29,10 +29,15 @@ UI などのデバッグで Web ブラウザを使用するときは、`Chrome D
 
 - upstream KonomiTV のバージョンと KonomiTV-BS4K のバージョンは、単一の文字列へ結合せず別々に管理する。
 - upstream 側の既存 `VERSION` は upstream KonomiTV のバージョンとして維持し、upstream 取り込み時に更新する。
-- KonomiTV-BS4K 固有のバージョンは `BS4K_VERSION` として管理する。最初の KonomiTV-BS4K バージョンは `1.0.0` とする。
+- KonomiTV-BS4K 固有のバージョンは Git タグ `bs4k-v*` から自動解決する（実装: `server/app/bs4k_version.py` → `BS4K_VERSION` / version API の `version`）。
+  - タグちょうど（clean）: `1.1.1`
+  - タグより先のコミット、または dirty: `1.1.1-dev`
+  - マッチするタグが無い: `0.0.0-dev`
+  - `.git` が無いイメージなどでは環境変数 `KONOMITV_BS4K_VERSION` をフォールバックとして使う
+- 定数へのハードコードや `client/package.json` の版数を WebUI 表示の正本にしない。WebUI は version API の `version`（`display_version`）を表示する。
 - upstream の Git コミットはバージョン情報として保持・表示しない。
-- WebUI などでは `KonomiTV-BS4K 1.0.0` と `upstream: KonomiTV 0.14.1` のように、両方のバージョンが分かる形で表示する。
-- KonomiTV-BS4K の Git タグと更新確認は、BS4K 側のバージョンだけを使う。
+- WebUI などでは `KonomiTV-BS4K 1.1.1` と `upstream: KonomiTV 0.14.1` のように、両方のバージョンが分かる形で表示する。
+- KonomiTV-BS4K の Git タグと更新確認は、BS4K 側の `bs4k-v*` タグだけを使う（upstream の `v0.x` と混同しない）。
 - メインのバージョン情報 API では、BS4K 側を `version`、upstream 側を `upstream_version` として別々に返す。
 - upstream 互換 API の既存 `version` には upstream 側の `VERSION` を返す。
 
