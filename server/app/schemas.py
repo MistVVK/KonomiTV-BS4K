@@ -396,6 +396,39 @@ class KonomiTVBS4KOfflineStreamEstimate(BaseModel):
     estimated_size_bytes: int
     required_size_bytes: int
 
+
+class KonomiTVBS4KOfflineStreamProgress(BaseModel):
+    """実行中のオフライン保存生成の進捗。"""
+
+    active: bool
+    completed_assets: int
+    total_assets: int
+    completed_bytes: int
+    progress: float
+
+
+KonomiTVBS4KOfflineJobState = Literal['Queued', 'Generating', 'Ready', 'Failed', 'Cancelled']
+KonomiTVBS4KOfflineJobPhase = Literal[
+    'Queued', 'Preparing', 'Encoding', 'Packaging', 'Ready', 'Failed', 'Cancelled',
+]
+
+
+class KonomiTVBS4KOfflineJob(BaseModel):
+    """HTTP 接続から独立して生成するオフライン保存パッケージの状態。"""
+
+    job_id: Annotated[str, Field(pattern=r'^[0-9a-f]{32}$')]
+    video_id: int
+    state: KonomiTVBS4KOfflineJobState
+    phase: KonomiTVBS4KOfflineJobPhase
+    progress: Annotated[float, Field(ge=0.0, le=1.0)]
+    completed_assets: Annotated[int, Field(ge=0)]
+    total_assets: Annotated[int, Field(ge=0)]
+    completed_bytes: Annotated[int, Field(ge=0)]
+    package_size_bytes: Annotated[int | None, Field(ge=0)]
+    error: str | None
+    created_at: float
+    updated_at: float
+
 # ***** バックグラウンド解析履歴 *****
 
 class AnalysisTaskExecution(BaseModel):

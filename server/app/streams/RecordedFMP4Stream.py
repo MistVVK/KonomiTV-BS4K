@@ -6,7 +6,7 @@ import math
 import re
 import tempfile
 import uuid
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -52,7 +52,8 @@ class RecordedFMP4Segment:
     generation: int
     # 元音声構成と映像DISCONTINUITYに対応する世代。
     audio_generation: int
-    # AAC/Opusの待ち時間を制限する最大6segmentのdelivery世代。
+    # 通常再生ではAAC/Opusの待ち時間を制限する最大6segmentのdelivery世代。
+    # オフライン保存では同じ音声構成全体を1つのdelivery世代として扱う。
     transcoded_audio_generation: int | None = None
     transcoded_audio_start_sample: int | None = None
     transcoded_audio_sample_count: int | None = None
@@ -86,6 +87,16 @@ class RecordedAudioFragmentInfo:
     total_duration: int
     sample_count: int
     sample_durations: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedAudioPacket:
+    """単一moofのtrunとmdatから対応付けた圧縮音声packetを表す。"""
+
+    duration: int
+    size: int
+    payload_offset: int
+    trun_entry: bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +136,11 @@ class RecordedFMP4Stream:
     AUDIO_BOUNDARY_COALESCE_SECONDS: ClassVar[float] = 1024 / 48_000
     AUDIO_DELIVERY_GENERATION_SEGMENTS: ClassVar[int] = 6
     AUDIO_INPUT_TAIL_MARGIN_SECONDS: ClassVar[float] = 0.1
+    # MPEG-TS の入力シーク先が新しい音声 PID の出現境界と一致すると、既定の probe size では
+    # 直前の PMT だけを見て対象 PID を入力Streamへ登録できないことがある。録画48では
+    # 24MB以下でPID 0x113を見失い、50MBなら開始時刻を動かさず検出できることを確認済み。
+    AUDIO_MPEGTS_PROBE_SIZE_BYTES: ClassVar[int] = 50_000_000
+    AUDIO_MPEGTS_ANALYZE_DURATION_MICROSECONDS: ClassVar[int] = 5_000_000
     OPUS_BITRATES: ClassVar[tuple[tuple[range, int], ...]] = (
         (range(1, 2), 64_000),
         (range(2, 3), 128_000),
@@ -137,6 +153,9 @@ class RecordedFMP4Stream:
     VIDEO_BITRATE_RATIOS_FROM_HEVC = KONOMITV_BS4K_VIDEO_BITRATE_RATIOS_FROM_HEVC
     # 240p の既存最大値は AVC / HEVC とも 650K のため、録画再生だけ最低 50K の差を確保する。
     VIDEO_BITRATE_MINIMUM_GAP_KBPS = KONOMITV_BS4K_VIDEO_BITRATE_MINIMUM_GAP_KBPS
+    # 端末へ長時間保持するオフライン映像は、通常再生の77%へ抑えて保存容量を削減する。
+    # 全codec・全画質で同じ比率を使い、1Kbps単位の四捨五入後も平均値と最大値の関係を維持する。
+    OFFLINE_VIDEO_BITRATE_PERCENT: ClassVar[int] = 77
 
     # セッションを識別し、ルーターの後続API要求とキャッシュ参照に利用する。
     session_id: str
@@ -158,6 +177,20 @@ class RecordedFMP4Stream:
     _active_operations: int
     # Keep-Aliveが途切れたセッションを破棄するイベントループタイマー。
     _destroy_handle: asyncio.TimerHandle
+    # オフライン保存セッションだけ、未キャッシュ映像区間を連続encodeする。
+    _is_offline_continuous: bool
+    # 連続encode中の sequence から実行中 Task への対応。同一区間の重複起動を防ぐ。
+    _offline_video_sequence_tasks: dict[int, asyncio.Task[bool]]
+    # 連続encodeが当該 sequence の cache 書き込みまたは失敗確定を知らせる。
+    _offline_video_segment_events: dict[int, asyncio.Event]
+    # 連続encodeの起動判定を直列化する。
+    _offline_video_encode_lock: asyncio.Lock
+    # オフライン保存全体へ通知する、媒体時間ベースのエンコード進捗コールバック。
+    _offline_progress_callback: Callable[[float], None] | None
+    # 映像世代・音声レンディション世代ごとの処理重み。媒体時間と媒体種別から計算する。
+    _offline_work_weights: dict[tuple[str, str], float]
+    # 各処理単位の0～1進捗。再試行や工程切替で後退しない値だけを保持する。
+    _offline_work_progress: dict[tuple[str, str], float]
 
     def __new__(
         cls,
@@ -167,6 +200,7 @@ class RecordedFMP4Stream:
         encoding_options: StreamEncodingOptions | None = None,
         is_new_session_allowed: bool = False,
         client_key: str = 'unknown',
+        is_offline_continuous: bool = False,
     ) -> RecordedFMP4Stream:
         """session ID単位で単一の新録画視聴セッションを返す。"""
 
@@ -183,6 +217,9 @@ class RecordedFMP4Stream:
             instance.recorded_program = recorded_program
             instance.quality = quality
             instance.encoding_options = encoding_options
+            # セグメント計画ではオフライン時だけ音声を構成世代全体へまとめるため、
+            # __buildSegments() より前に保存専用フラグを確定する。
+            instance._is_offline_continuous = is_offline_continuous
             instance._effective_audio_codec = cls.resolveEffectiveAudioCodec(
                 recorded_program,
                 encoding_options.audio_codec,
@@ -191,6 +228,12 @@ class RecordedFMP4Stream:
             instance._referenced_paths = set()
             instance._completed_sequences = set()
             instance._active_operations = 0
+            instance._offline_video_sequence_tasks = {}
+            instance._offline_video_segment_events = {}
+            instance._offline_video_encode_lock = asyncio.Lock()
+            instance._offline_progress_callback = None
+            instance._offline_work_weights = {}
+            instance._offline_work_progress = {}
             instance._destroy_handle = asyncio.get_running_loop().call_later(
                 cls.SESSION_TIMEOUT,
                 lambda: asyncio.create_task(instance.__destroyIfIdle()),
@@ -211,6 +254,109 @@ class RecordedFMP4Stream:
         ):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session conditions mismatch')
         return instance
+
+    def setOfflineProgressCallback(self, callback: Callable[[float], None] | None) -> None:
+        """オフライン一括生成の媒体時間ベース進捗を受け取るコールバックを設定する。
+
+        Args:
+            callback: 0～1の全体進捗を受け取る同期コールバック。Noneで通知を解除する。
+
+        Returns:
+            None
+        """
+
+        self._offline_progress_callback = callback
+        self._offline_work_weights = {}
+        self._offline_work_progress = {}
+        if callback is None or self._is_offline_continuous is False:
+            return
+
+        video_durations: dict[tuple[str, str], float] = {}
+        audio_durations: dict[tuple[str, str], float] = {}
+
+        # 映像は同じconfiguration generationを1回のGPUエンコードへまとめる。
+        if self.recorded_program.recorded_video.has_video is True:
+            for generation in sorted({segment.generation for segment in self._segments}):
+                key = self.__getOfflineVideoWorkKey(generation)
+                video_durations[key] = sum(
+                    segment.duration for segment in self._segments if segment.generation == generation
+                )
+
+        # 音声は論理レンディションごとに、同じcodec/layoutのdelivery generationを一括生成する。
+        for rendition in self.getAudioRenditions():
+            for generation in sorted({self.__getTranscodedAudioGeneration(segment) for segment in self._segments}):
+                generation_segments = [
+                    segment for segment in self._segments
+                    if self.__getTranscodedAudioGeneration(segment) == generation
+                ]
+                if len(generation_segments) == 0:
+                    continue
+                key = self.__getOfflineAudioWorkKey(rendition.id, generation)
+                audio_durations[key] = sum(segment.duration for segment in generation_segments)
+
+        # GPU映像処理が実時間の大半を占めるため、映像ありでは映像90%・全音声10%へ配分する。
+        # 各媒体内では構成世代とレンディションの媒体時間比を維持し、短い世代を過大評価しない。
+        video_share = 0.9 if len(video_durations) > 0 and len(audio_durations) > 0 else (
+            1.0 if len(video_durations) > 0 else 0.0
+        )
+        audio_share = 1.0 - video_share
+        for durations, share in ((video_durations, video_share), (audio_durations, audio_share)):
+            total_duration = sum(durations.values())
+            if total_duration <= 0:
+                continue
+            for key, duration in durations.items():
+                self._offline_work_weights[key] = share * duration / total_duration
+                self._offline_work_progress[key] = 0.0
+
+        callback(0.0)
+
+    @staticmethod
+    def __getOfflineVideoWorkKey(generation: int) -> tuple[str, str]:
+        """映像configuration generationの進捗キーを返す。"""
+
+        return ('Video', str(generation))
+
+    @staticmethod
+    def __getOfflineAudioWorkKey(rendition_id: str, generation: int) -> tuple[str, str]:
+        """音声レンディションとdelivery generationの進捗キーを返す。"""
+
+        return ('Audio', f'{rendition_id}:{generation}')
+
+    def __updateOfflineWorkProgress(self, key: tuple[str, str], progress: float) -> None:
+        """指定処理単位の進捗を単調増加させ、媒体時間で重み付けした全体値を通知する。"""
+
+        callback = getattr(self, '_offline_progress_callback', None)
+        work_weights = getattr(self, '_offline_work_weights', {})
+        work_progress = getattr(self, '_offline_work_progress', {})
+        if callback is None or key not in work_weights:
+            return
+        normalized = max(0.0, min(1.0, progress))
+        work_progress[key] = max(work_progress.get(key, 0.0), normalized)
+        total_weight = sum(work_weights.values())
+        if total_weight <= 0:
+            callback(1.0)
+            return
+        completed_weight = sum(
+            weight * work_progress.get(work_key, 0.0)
+            for work_key, weight in work_weights.items()
+        )
+        callback(min(1.0, completed_weight / total_weight))
+
+    def __updateOfflineVideoGenerationProgressFromCompletedSegments(self, generation: int) -> None:
+        """一括生成失敗時も、個別生成済みの媒体時間から映像世代の進捗を補完する。"""
+
+        generation_segments = [segment for segment in self._segments if segment.generation == generation]
+        total_duration = sum(segment.duration for segment in generation_segments)
+        if total_duration <= 0:
+            return
+        completed_duration = sum(
+            segment.duration for segment in generation_segments
+            if segment.sequence in self._completed_sequences
+        )
+        self.__updateOfflineWorkProgress(
+            self.__getOfflineVideoWorkKey(generation),
+            completed_duration / total_duration,
+        )
 
     def keepAlive(self) -> None:
         """視聴中のセッション破棄タイマーを延長する。"""
@@ -308,6 +454,40 @@ class RecordedFMP4Stream:
         """
 
         return ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, codec)
+
+    @classmethod
+    def getOfflineVideoBitrate(cls, quality: QUALITY_TYPES, codec: VideoCodec) -> RecordedVideoBitrate:
+        """通常再生値の77%へ抑えたオフライン保存用映像ビットレートを返す。
+
+        Args:
+            quality: 解像度・フレームレートを表す既存画質キー。
+            codec: オフライン保存で出力する映像コーデック。
+
+        Returns:
+            1Kbps単位で四捨五入したオフライン保存専用の指定値・最大値。
+        """
+
+        playback_bitrate = cls.getVideoBitrate(quality, codec)
+        video_bitrate_kbps = int(playback_bitrate.video_bitrate.removesuffix('K'))
+        video_bitrate_max_kbps = int(playback_bitrate.video_bitrate_max.removesuffix('K'))
+        offline_video_bitrate_kbps = (video_bitrate_kbps * cls.OFFLINE_VIDEO_BITRATE_PERCENT + 50) // 100
+        offline_video_bitrate_max_kbps = \
+            (video_bitrate_max_kbps * cls.OFFLINE_VIDEO_BITRATE_PERCENT + 50) // 100
+        return RecordedVideoBitrate(
+            f'{offline_video_bitrate_kbps}K',
+            f'{offline_video_bitrate_max_kbps}K',
+        )
+
+    def __getEffectiveVideoBitrate(self) -> RecordedVideoBitrate:
+        """現在のセッション用途に対応する映像ビットレートを返す。
+
+        Returns:
+            通常再生では既存値、オフライン保存ではその77%の指定値・最大値。
+        """
+
+        if self._is_offline_continuous is True:
+            return self.getOfflineVideoBitrate(self.quality, self.encoding_options.video_codec)
+        return self.getVideoBitrate(self.quality, self.encoding_options.video_codec)
 
     @classmethod
     def validateSessionId(cls, session_id: str) -> None:
@@ -408,6 +588,14 @@ class RecordedFMP4Stream:
         if self._instances.get(self.session_id) is not self:
             return
         self._destroy_handle.cancel()
+        offline_video_tasks = set(self._offline_video_sequence_tasks.values())
+        for task in offline_video_tasks:
+            task.cancel()
+        if len(offline_video_tasks) > 0:
+            await asyncio.gather(*offline_video_tasks, return_exceptions=True)
+        for event in self._offline_video_segment_events.values():
+            event.set()
+        self._offline_video_sequence_tasks.clear()
         self._instances.pop(self.session_id, None)
         self._session_client_keys.pop(self.session_id, None)
         for cache_path in self._referenced_paths:
@@ -506,14 +694,16 @@ class RecordedFMP4Stream:
             )
             return '\n'.join(lines) + '\n'
 
-        video_bitrate = self.getVideoBitrate(self.quality, self.encoding_options.video_codec)
+        video_bitrate = self.__getEffectiveVideoBitrate()
         bandwidth = int(video_bitrate.video_bitrate_max.removesuffix('K')) * 1000
         # CODECSは要求条件から推測せず、実際に配信するinit内のconfiguration boxから得る。
         # エンコーダーが選択したlevelやconstraintも実データと一致する値をブラウザーへ渡す。
-        generation_segments = {
-            segment.generation: segment
-            for segment in self._segments
-        }
+        generation_segments: dict[int, RecordedFMP4Segment] = {}
+        for segment in self._segments:
+            # 初期化情報は同じ映像世代で共通なので、最初のセグメントを代表にする。
+            # 最後のセグメントを選ぶと、オフライン連続エンコードが世代全体を完了するまで
+            # master playlist を返せず、保存進捗も長時間 0% のままになる。
+            generation_segments.setdefault(segment.generation, segment)
         codec_strings: list[str] = []
         for segment in generation_segments.values():
             init_segment = await self.getVideoInitSegment(segment.generation, segment.sequence)
@@ -1136,6 +1326,41 @@ class RecordedFMP4Stream:
                 return 'aac'
         return requested_codec
 
+    @classmethod
+    def getEstimatedAudioBitrateKbps(
+        cls,
+        recorded_program: RecordedProgram,
+        requested_codec: AudioCodec,
+    ) -> int:
+        """オフライン保存容量見積もり用の全レンディション合計音声ビットレートを返す。
+
+        Args:
+            recorded_program: 音声トラックと構成タイムラインが確定済みの録画番組。
+            requested_codec: クライアントが要求した音声コーデック。
+
+        Returns:
+            実効音声方式と各レンディションの実チャンネル数から求めた合計 kbps。
+        """
+
+        # 未知 layout は AAC へ落とすので、見積もりも実エンコードと同じ実効方式を使う。
+        effective_codec = cls.resolveEffectiveAudioCodec(recorded_program, requested_codec)
+        renditions = cls.getAudioRenditionsForProgram(recorded_program)
+        if effective_codec != 'opus':
+            return 192 * len(renditions)
+
+        total_bitrate_kbps = 0
+        for rendition in renditions:
+            # Dual Mono の main/sub は 1ch、通常トラックは全区間の最大 ch を使う。
+            channel_counts = cls.__getAudioRenditionChannelCountsForProgram(recorded_program, rendition)
+            bitrate = cls.getOpusBitrate(max(channel_counts)) if channel_counts is not None else None
+            if bitrate is None:
+                # resolveEffectiveAudioCodec が opus を返した時点では到達しない。
+                # 見積もりだけを止めないため、そのレンディションだけ 8ch 相当で積む。
+                total_bitrate_kbps += 320
+                continue
+            total_bitrate_kbps += bitrate // 1000
+        return total_bitrate_kbps
+
     def __getAudioSegmentTiming(self, segment: RecordedFMP4Segment) -> RecordedAudioSegmentTiming:
         """AAC/Opus音声fragmentの整数presentation sample境界を返す。"""
 
@@ -1228,6 +1453,9 @@ class RecordedFMP4Stream:
         if segment is None or segment.generation != generation:
             return None
         init_path = self.__buildCachePath(segment, is_init=True)
+        # 既存initも読み取り前にセッション参照へ登録し、別セッション終了後の遅延削除と競合させない。
+        # master playlist生成で一度読んだinitが、オフライン本体で再取得するまでに消えることを防ぐ。
+        await self.__acquire(init_path)
         # master生成や同じ映像世代の先行segmentですでにinitを確定済みなら、音声だけの
         # DISCONTINUITY境界に対応するsegment encodeを待たず即座に返す。
         if init_path.is_file():
@@ -1267,14 +1495,48 @@ class RecordedFMP4Stream:
         segment_lock = await self.__acquire(segment_path)
         await self.__acquire(init_path)
         async with segment_lock:
-            if segment_path.is_file():
+            # fragmentだけが残り、対になるinitが遅延削除済みなら再生成する。
+            # 片方だけをキャッシュヒットとして返すと、呼び出し元は再生不能なfragmentを受け取ってしまう。
+            if segment_path.is_file() and init_path.is_file():
                 self._completed_sequences.add(sequence)
+                generation_segments = [
+                    item for item in self._segments if item.generation == segment.generation
+                ]
+                if all(self.__buildCachePath(item, is_init=False).is_file() for item in generation_segments):
+                    self.__updateOfflineWorkProgress(
+                        self.__getOfflineVideoWorkKey(segment.generation),
+                        1.0,
+                    )
                 return await asyncio.to_thread(segment_path.read_bytes)
-            await self.__encodeSegment(segment, init_path, segment_path)
-            if segment_path.is_file() is False:
-                return None
-            self._completed_sequences.add(sequence)
-            return await asyncio.to_thread(segment_path.read_bytes)
+            if getattr(self, '_is_offline_continuous', False) is False:
+                await self.__encodeSegment(segment, init_path, segment_path)
+                # fragment 単体を成功扱いすると、直後の MAP 取得だけが失敗するため、
+                # 通常再生でも対応する init と fragment の両方が揃った場合だけ返す。
+                if segment_path.is_file() is False or init_path.is_file() is False:
+                    return None
+                self._completed_sequences.add(sequence)
+                self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
+                return await asyncio.to_thread(segment_path.read_bytes)
+            # 連続encodeの書き込みは別taskがpath lockを取るため、待ちに入る前に解放する。
+            await self.__startOfflineVideoEncodeIfNeeded(segment)
+
+        if self._is_offline_continuous is True:
+            await self.__waitOfflineVideoSegment(segment)
+            async with segment_lock:
+                # 連続生成 task の完了通知後にも、必ず init / fragment の組を再検査する。
+                # fragment だけが残った状態を返すと getVideoInitSegment() が直後に None となり、
+                # 長時間生成の全成果を破棄してしまうため、不完全な組は個別生成で復旧する。
+                if segment_path.is_file() and init_path.is_file():
+                    self._completed_sequences.add(sequence)
+                    return await asyncio.to_thread(segment_path.read_bytes)
+                # 連続encodeがこのsequenceを確定できなければ、現行の1本encodeへ落とす。
+                await self.__encodeSegment(segment, init_path, segment_path)
+                if segment_path.is_file() is False or init_path.is_file() is False:
+                    return None
+                self._completed_sequences.add(sequence)
+                self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
+                return await asyncio.to_thread(segment_path.read_bytes)
+        return None
 
     @staticmethod
     def __alignTranscodedAudioGenerationBoundaries(
@@ -1491,12 +1753,15 @@ class RecordedFMP4Stream:
                 segment for segment in segments
                 if segment.audio_generation == audio_generation
             ]
-            # 長時間番組の全編encode完了を先頭segment要求が待たないよう、同じ構成でも最大6
-            # segmentのdelivery generationへ分割する。各境界は両playlistのDISCONTINUITYと
-            # 専用initに反映され、3segment以上の連続decode検証と一定の初回待ちを両立する。
-            for group_start in range(0, len(configuration_segments), self.AUDIO_DELIVERY_GENERATION_SEGMENTS):
+            # 通常再生は先頭segmentの待ち時間を制限するため最大6segmentに分ける。一方、
+            # 完成後にしか再生しないオフライン保存は構成世代全体を1回のencodeへまとめ、
+            # encoder primingと一時ファイル生成を最小化する。
+            delivery_generation_segments = len(configuration_segments) \
+                if getattr(self, '_is_offline_continuous', False) is True \
+                else self.AUDIO_DELIVERY_GENERATION_SEGMENTS
+            for group_start in range(0, len(configuration_segments), delivery_generation_segments):
                 generation_segments = configuration_segments[
-                    group_start:group_start + self.AUDIO_DELIVERY_GENERATION_SEGMENTS
+                    group_start:group_start + delivery_generation_segments
                 ]
                 if len(generation_segments) == 0:
                     continue
@@ -1543,16 +1808,30 @@ class RecordedFMP4Stream:
                 next_audio_generation += 1
         return segments
 
-    async def __encodeSegment(
+    def __buildVideoEncodeCommand(
         self,
-        segment: RecordedFMP4Segment,
-        init_path: Path,
-        segment_path: Path,
-    ) -> None:
-        """FFmpeg 8で自己完結fMP4を生成し、initとfragmentへ分離する。"""
+        start_time: float,
+        duration: float,
+        output_arguments: list[str],
+        *,
+        force_keyframe_times: list[float] | None = None,
+        sequence_for_warning: int | None = None,
+    ) -> tuple[list[str], RecordedPlaybackEncoder, str | None, str] | None:
+        """映像filter・encoder・入出力引数を組み立てる。
+
+        Args:
+            start_time: 録画先頭基準の要求開始時刻。
+            duration: 切り出す映像の長さ。
+            output_arguments: pipe または segment muxer など、出力側のFFmpeg引数。
+            force_keyframe_times: 出力時刻0起点の強制キーフレーム時刻。連続encode用。
+            sequence_for_warning: 走査方式不明時のログに出す代表sequence。
+
+        Returns:
+            コマンド、backend、render device、encoder pixel format。encoderが無い場合はNone。
+        """
 
         quality = QUALITY[self.quality]
-        video_bitrate = self.getVideoBitrate(self.quality, self.encoding_options.video_codec)
+        video_bitrate = self.__getEffectiveVideoBitrate()
         video_bitrate_max_kbps = int(video_bitrate.video_bitrate_max.removesuffix('K'))
         backend = self.__getBackend()
         codec = self.encoding_options.video_codec
@@ -1560,15 +1839,15 @@ class RecordedFMP4Stream:
         spec = RecordedPlaybackBackend.getCodecSpec(codec, bit_depth)
         encoder_name = RecordedPlaybackBackend.getEncoderName(backend, codec)
         if encoder_name is None:
-            return
+            return None
         input_seek, trim_start, input_duration = self.computeInputSeekWindow(
-            segment.start_time,
-            segment.duration,
+            start_time,
+            duration,
         )
         filters: list[str] = []
         timeline = self.recorded_program.recorded_video.video_stream_timeline or []
         entry = next(
-            (item for item in timeline if float(item['start_time']) <= segment.start_time < float(item['end_time'])),
+            (item for item in timeline if float(item['start_time']) <= start_time < float(item['end_time'])),
             None,
         )
         scan_type = entry.get('scan_type') if entry else self.recorded_program.recorded_video.video_scan_type
@@ -1577,9 +1856,10 @@ class RecordedFMP4Stream:
             if backend == 'FFmpeg':
                 filters.append(f'bwdif=mode={"send_field" if quality.is_60fps else "send_frame"}:parity=auto:deint=interlaced')
         elif scan_type not in ('Progressive', None):
+            sequence_label = sequence_for_warning if sequence_for_warning is not None else -1
             logging.warning(
                 '[RecordedFMP4Stream] video scan type is unknown; deinterlace is disabled. '
-                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, sequence: {segment.sequence}]'
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, sequence: {sequence_label}]'
             )
         if backend == 'FFmpeg':
             filters += [
@@ -1589,7 +1869,7 @@ class RecordedFMP4Stream:
             if is_interlaced and self.encoding_options.is_24fps_mode_enabled:
                 filters += ['pullup', 'dejudder']
             filters += [
-                f'trim=start={trim_start:.6f}:duration={segment.duration:.6f}',
+                f'trim=start={trim_start:.6f}:duration={duration:.6f}',
                 'setpts=PTS-STARTPTS',
                 f'format={spec.pixel_format}',
             ]
@@ -1647,7 +1927,7 @@ class RecordedFMP4Stream:
                     f'format={spec.encoder_pixel_format}', 'hwupload=extra_hw_frames=32',
                 ]
             filters += [
-                f'trim=start={trim_start:.6f}:duration={segment.duration:.6f}',
+                f'trim=start={trim_start:.6f}:duration={duration:.6f}',
                 'setpts=PTS-STARTPTS',
             ]
         elif backend == 'NVENC':
@@ -1660,7 +1940,7 @@ class RecordedFMP4Stream:
                     f'format={spec.encoder_pixel_format}', 'hwupload_cuda',
                 ]
             filters += [
-                f'trim=start={trim_start:.6f}:duration={segment.duration:.6f}',
+                f'trim=start={trim_start:.6f}:duration={duration:.6f}',
                 'setpts=PTS-STARTPTS',
             ]
         elif backend == 'AMF':
@@ -1679,13 +1959,16 @@ class RecordedFMP4Stream:
                     f'hwdownload,format={spec.encoder_pixel_format}',
                 ]
             filters += [
-                f'trim=start={trim_start:.6f}:duration={segment.duration:.6f}',
+                f'trim=start={trim_start:.6f}:duration={duration:.6f}',
                 'setpts=PTS-STARTPTS',
             ]
         command += [
             '-vf', ','.join(filters),
             '-c:v', encoder_name,
         ]
+        if backend == 'QSV' and force_keyframe_times:
+            # 連続encodeでは区間境界をIDRにし、HLS fragmentを独立復号できるようにする。
+            command += ['-forced_idr', '1']
         if backend == 'FFmpeg':
             command += ['-pix_fmt', spec.pixel_format]
         elif backend == 'NVENC':
@@ -1703,11 +1986,64 @@ class RecordedFMP4Stream:
             # 入力が square pixel の 1920x1080 / 3840x2160 でも 4:3 と解釈されないよう、
             # encoder / MP4 muxer へ表示アスペクト比を明示する。
             '-aspect', '16:9',
-            # libaom-av1は最初のpacketでsequence headerを返すため、empty_moovでは空のav1Cが
-            # 出力される。delay_moovで全codecの実configurationを含むinitを確定してから書く。
-            '-movflags', '+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
-            '-f', 'mp4', 'pipe:1',
         ]
+        if force_keyframe_times:
+            command += ['-force_key_frames', ','.join(f'{time:.6f}' for time in force_keyframe_times)]
+        command += output_arguments
+        return command, backend, device, spec.encoder_pixel_format
+
+    async def __encodeSegment(
+        self,
+        segment: RecordedFMP4Segment,
+        init_path: Path,
+        segment_path: Path,
+    ) -> None:
+        """FFmpeg 8で自己完結fMP4を生成し、initとfragmentへ分離する。"""
+
+        plan = self.__buildVideoEncodeCommand(
+            segment.start_time,
+            segment.duration,
+            [
+                # libaom-av1は最初のpacketでsequence headerを返すため、empty_moovでは空のav1Cが
+                # 出力される。delay_moovで全codecの実configurationを含むinitを確定してから書く。
+                '-movflags', '+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
+                '-f', 'mp4', 'pipe:1',
+            ],
+            sequence_for_warning=segment.sequence,
+        )
+        if plan is None:
+            return
+        command, backend, device, encoder_pixel_format = plan
+        stdout, stderr, returncode = await self.__runVideoEncodeProcess(command, backend, device, encoder_pixel_format)
+        if returncode != 0:
+            logging.error(
+                '[RecordedFMP4Stream] FFmpeg 8 video segment failed. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, sequence: {segment.sequence}, '
+                f'stderr: {stderr.decode(errors="ignore").strip()}]'
+            )
+            return
+        if await self.__storeEncodedVideoFragment(segment, stdout, init_path, segment_path) is False:
+            logging.error('[RecordedFMP4Stream] FFmpeg 8 output did not contain init and media fragments.')
+
+    async def __runVideoEncodeProcess(
+        self,
+        command: list[str],
+        backend: RecordedPlaybackEncoder,
+        device: str | None,
+        encoder_pixel_format: str,
+    ) -> tuple[bytes, bytes, int]:
+        """映像encoderを1回実行し、HW decode失敗時だけ同じGPUへ再試行する。
+
+        Args:
+            command: 組み立て済みのFFmpegコマンド。
+            backend: 実行する録画再生バックエンド。
+            device: GPU render node。CPU encodeではNone。
+            encoder_pixel_format: software decode再試行時のupload先pixel format。
+
+        Returns:
+            stdout、stderr、終了コード。
+        """
+
         semaphore_key = 'CPU' if backend == 'FFmpeg' else f'{backend}:{device or 0}'
         semaphore = self._cpu_semaphore if backend == 'FFmpeg' else self._gpu_semaphores.setdefault(
             semaphore_key,
@@ -1721,14 +2057,15 @@ class RecordedFMP4Stream:
                 env = RecordedPlaybackBackend.getEnvironment(backend),
             )
             stdout, stderr = await self.__communicateSubprocess(process)
+            returncode = process.returncode if process.returncode is not None else 1
             if (
-                process.returncode != 0 and backend != 'FFmpeg' and
+                returncode != 0 and backend != 'FFmpeg' and
                 self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
                 self.shouldRetryWithSoftwareDecode(stderr)
             ):
                 # MP4/MKV/WebM でHW decodeだけが失敗した場合は、同じGPU encoderへ
                 # system-memoryフレームをuploadし直す。エンコーダーのCPU降格は行わない。
-                fallback_command = self.buildSoftwareDecodeFallback(command, backend, spec.encoder_pixel_format)
+                fallback_command = self.buildSoftwareDecodeFallback(command, backend, encoder_pixel_format)
                 process = await asyncio.create_subprocess_exec(
                     *fallback_command,
                     stdout=asyncio.subprocess.PIPE,
@@ -1736,17 +2073,31 @@ class RecordedFMP4Stream:
                     env=RecordedPlaybackBackend.getEnvironment(backend),
                 )
                 stdout, stderr = await self.__communicateSubprocess(process)
-        if process.returncode != 0:
-            logging.error(
-                '[RecordedFMP4Stream] FFmpeg 8 video segment failed. '
-                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, sequence: {segment.sequence}, '
-                f'stderr: {stderr.decode(errors="ignore").strip()}]'
-            )
-            return
-        init_data, media_data = self.splitFragmentedMP4(stdout)
+                returncode = process.returncode if process.returncode is not None else 1
+        return stdout, stderr, returncode
+
+    async def __storeEncodedVideoFragment(
+        self,
+        segment: RecordedFMP4Segment,
+        encoded_data: bytes,
+        init_path: Path,
+        segment_path: Path,
+    ) -> bool:
+        """自己完結fMP4をinitとHLS fragmentへ分けてcacheへ書く。
+
+        Args:
+            segment: 書き込む映像セグメント。
+            encoded_data: FFmpegが出力した自己完結fMP4。
+            init_path: generation共有のinitキャッシュ。
+            segment_path: このsequenceのfragmentキャッシュ。
+
+        Returns:
+            initとmediaを分離できた場合はTrue。
+        """
+
+        init_data, media_data = self.splitFragmentedMP4(encoded_data)
         if len(init_data) == 0 or len(media_data) == 0:
-            logging.error('[RecordedFMP4Stream] FFmpeg 8 output did not contain init and media fragments.')
-            return
+            return False
         media_data = self.normalizeFragmentTimeline(
             init_data,
             media_data,
@@ -1756,6 +2107,347 @@ class RecordedFMP4Stream:
         if init_path.is_file() is False:
             await RecordedFMP4CacheManager.writeAtomic(init_path, init_data)
         await RecordedFMP4CacheManager.writeAtomic(segment_path, media_data)
+        return True
+
+    def __getUncachedVideoRun(self, segment: RecordedFMP4Segment) -> list[RecordedFMP4Segment]:
+        """同じ映像generation内で、指定segmentを含む未キャッシュ連続区間を返す。
+
+        Args:
+            segment: 要求された映像セグメント。
+
+        Returns:
+            未キャッシュの連続セグメント。左右はキャッシュ済みまたはgeneration境界で止める。
+        """
+
+        # 完成後にしか再生しないオフライン保存は、途中キャッシュの有無で一括処理を分断しない。
+        # 1片でも欠けていればgeneration全体を単一fMP4へ再生成し、正確な媒体時間進捗を維持する。
+        if self._is_offline_continuous is True:
+            return [item for item in self._segments if item.generation == segment.generation]
+
+        start = segment.sequence
+        while start > 0:
+            previous = self._segments[start - 1]
+            if previous.generation != segment.generation:
+                break
+            if self.__buildCachePath(previous, is_init=False).is_file():
+                break
+            start -= 1
+        end = segment.sequence
+        while end + 1 < len(self._segments):
+            following = self._segments[end + 1]
+            if following.generation != segment.generation:
+                break
+            if self.__buildCachePath(following, is_init=False).is_file():
+                break
+            end += 1
+        return self._segments[start:end + 1]
+
+    @staticmethod
+    def __getVideoRunSplitTimes(segments: list[RecordedFMP4Segment]) -> list[float]:
+        """連続encode出力の0起点で、内部セグメント境界時刻を返す。
+
+        Args:
+            segments: 同じ連続encodeに載せる未キャッシュ区間。
+
+        Returns:
+            `-force_key_frames` と `-segment_times` に渡す内部境界。
+        """
+
+        split_times: list[float] = []
+        elapsed = 0.0
+        for item in segments[:-1]:
+            elapsed += item.duration
+            split_times.append(elapsed)
+        return split_times
+
+    async def __startOfflineVideoEncodeIfNeeded(self, segment: RecordedFMP4Segment) -> None:
+        """未キャッシュ連続区間の連続encodeを、未起動なら開始する。
+
+        Args:
+            segment: 要求された映像セグメント。
+
+        Returns:
+            None
+        """
+
+        async with self._offline_video_encode_lock:
+            if segment.sequence in self._offline_video_sequence_tasks:
+                return
+            run = self.__getUncachedVideoRun(segment)
+            # 1segmentだけの短いgenerationも同じ単一fMP4経路へ載せ、媒体時間進捗を維持する。
+            task = asyncio.create_task(self.__encodeOfflineVideoRun(run))
+            for item in run:
+                self._offline_video_sequence_tasks[item.sequence] = task
+                self._offline_video_segment_events.setdefault(item.sequence, asyncio.Event())
+
+    async def __waitOfflineVideoSegment(self, segment: RecordedFMP4Segment) -> None:
+        """連続encodeが当該sequenceを確定するまで待つ。
+
+        Args:
+            segment: 待ち対象の映像セグメント。
+
+        Returns:
+            None
+        """
+
+        event = self._offline_video_segment_events.get(segment.sequence)
+        if event is None:
+            return
+        await event.wait()
+
+    async def __encodeOfflineVideoRun(self, segments: list[RecordedFMP4Segment]) -> bool:
+        """未キャッシュ連続区間を単一fMP4へencodeし、完了後に無劣化分割してcacheへ書く。
+
+        Args:
+            segments: 同じ映像generationの未キャッシュ連続区間。
+
+        Returns:
+            全fragmentを書けた場合はTrue。
+        """
+
+        first_segment = segments[0]
+        total_duration = sum(item.duration for item in segments)
+        split_times = self.__getVideoRunSplitTimes(segments)
+        try:
+            with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-offline-video-') as temporary_directory:
+                temporary_directory_path = Path(temporary_directory)
+                encoded_path = temporary_directory_path / 'encoded.mp4'
+                output_arguments = [
+                    '-movflags', '+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
+                    '-progress', 'pipe:1', '-nostats',
+                    '-f', 'mp4', str(encoded_path),
+                ]
+                plan = self.__buildVideoEncodeCommand(
+                    first_segment.start_time,
+                    total_duration,
+                    output_arguments,
+                    force_keyframe_times=split_times,
+                    sequence_for_warning=first_segment.sequence,
+                )
+                if plan is None:
+                    return False
+                command, backend, device, encoder_pixel_format = plan
+                succeeded = await self.__runOfflineVideoEncodeProcess(
+                    command,
+                    backend,
+                    device,
+                    encoder_pixel_format,
+                    temporary_directory_path,
+                    segments,
+                    encoded_path,
+                    split_times,
+                )
+                return succeeded
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 独立 task の想定外例外も未回収にせず、必ず原因を記録して待ち側の
+            # 1セグメントencodeへ落とす。CancelledError は直前で再送出している。
+            logging.error(
+                '[RecordedFMP4Stream] Offline continuous video encode failed. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                f'start_sequence: {first_segment.sequence}, end_sequence: {segments[-1].sequence}]',
+                exc_info=True,
+            )
+            return False
+        finally:
+            for item in segments:
+                self._offline_video_segment_events.setdefault(item.sequence, asyncio.Event()).set()
+                self._offline_video_sequence_tasks.pop(item.sequence, None)
+
+    async def __runOfflineVideoEncodeProcess(
+        self,
+        command: list[str],
+        backend: RecordedPlaybackEncoder,
+        device: str | None,
+        encoder_pixel_format: str,
+        temporary_directory: Path,
+        segments: list[RecordedFMP4Segment],
+        encoded_path: Path,
+        split_times: list[float],
+    ) -> bool:
+        """単一fMP4を生成してからstream copyで分割し、全fragmentをcacheへ書く。
+
+        Args:
+            command: 組み立て済みのFFmpegコマンド。
+            backend: 実行する録画再生バックエンド。
+            device: GPU render node。CPU encodeではNone。
+            encoder_pixel_format: software decode再試行時のupload先pixel format。
+            temporary_directory: segment muxerの出力先。
+            segments: 書き込む映像セグメント。
+            encoded_path: 一括エンコード結果の単一fMP4パス。
+            split_times: 単一fMP4の先頭を0秒としたHLS分割境界。
+
+        Returns:
+            全fragmentを書けた場合はTrue。
+        """
+
+        semaphore_key = 'CPU' if backend == 'FFmpeg' else f'{backend}:{device or 0}'
+        semaphore = self._cpu_semaphore if backend == 'FFmpeg' else self._gpu_semaphores.setdefault(
+            semaphore_key,
+            asyncio.Semaphore(1),
+        )
+        work_key = self.__getOfflineVideoWorkKey(segments[0].generation)
+        total_duration = sum(segment.duration for segment in segments)
+        async with self.acquireEncoderSlot(semaphore):
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=RecordedPlaybackBackend.getEnvironment(backend),
+            )
+            stderr, returncode = await self.__communicateSubprocessWithProgress(
+                process,
+                total_duration,
+                lambda progress: self.__updateOfflineWorkProgress(work_key, progress * 0.95),
+            )
+            if (
+                returncode != 0 and
+                backend != 'FFmpeg' and
+                self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
+                self.shouldRetryWithSoftwareDecode(stderr)
+            ):
+                # 同じencoder slot内で再試行し、semaphoreを二重取得しない。
+                encoded_path.unlink(missing_ok=True)
+                fallback_command = self.buildSoftwareDecodeFallback(command, backend, encoder_pixel_format)
+                process = await asyncio.create_subprocess_exec(
+                    *fallback_command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=RecordedPlaybackBackend.getEnvironment(backend),
+                )
+                stderr, returncode = await self.__communicateSubprocessWithProgress(
+                    process,
+                    total_duration,
+                    lambda progress: self.__updateOfflineWorkProgress(work_key, progress * 0.95),
+                )
+            if returncode != 0 or encoded_path.is_file() is False or encoded_path.stat().st_size == 0:
+                logging.error(
+                    '[RecordedFMP4Stream] Offline continuous video encode produced no media. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'start_sequence: {segments[0].sequence}, '
+                    f'stderr: {stderr.decode(errors="ignore").strip()}]'
+                )
+                return False
+
+        # エンコード完了後にstream copyでHLS fragmentへ分割する。再エンコードは行わない。
+        output_pattern = str(temporary_directory / 'segment-%06d.mp4')
+        split_command = [
+            LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error', '-y',
+            '-i', str(encoded_path), '-map', '0:v:0', '-an', '-c:v', 'copy',
+        ]
+        if len(split_times) > 0:
+            split_command += ['-segment_times', ','.join(f'{time:.6f}' for time in split_times)]
+            split_command += [
+                '-f', 'segment', '-segment_format', 'mp4',
+                '-segment_format_options',
+                'movflags=+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
+                '-reset_timestamps', '0', '-progress', 'pipe:1', '-nostats', output_pattern,
+            ]
+        else:
+            # segment muxerは境界未指定時に既定の2秒で分割するため、1本だけなら通常のMP4へ直接remuxする。
+            split_command += [
+                '-movflags', '+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
+                '-progress', 'pipe:1', '-nostats',
+                '-f', 'mp4', str(temporary_directory / 'segment-000000.mp4'),
+            ]
+        split_process = await asyncio.create_subprocess_exec(
+            *split_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        split_stderr, split_returncode = await self.__communicateSubprocessWithProgress(
+            split_process,
+            total_duration,
+            # 分割コマンドが成功しても本数・fragment検証が残るため、検証完了までは99%に留める。
+            lambda progress: self.__updateOfflineWorkProgress(work_key, 0.95 + progress * 0.04),
+        )
+        output_paths = sorted(temporary_directory.glob('segment-*.mp4'))
+        if split_returncode != 0 or len(output_paths) != len(segments):
+            logging.error(
+                '[RecordedFMP4Stream] Offline continuous video stream-copy split failed. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                f'start_sequence: {segments[0].sequence}, expected: {len(segments)}, '
+                f'actual: {len(output_paths)}, stderr: {split_stderr.decode(errors="ignore").strip()}]'
+            )
+            return False
+
+        # 完成済みファイルだけを順番に検証・atomic writeし、途中状態をcacheへ公開しない。
+        for segment, output_path in zip(segments, output_paths, strict=True):
+            encoded_data = await asyncio.to_thread(output_path.read_bytes)
+            init_path = self.__buildCachePath(segment, is_init=True)
+            segment_path = self.__buildCachePath(segment, is_init=False)
+            await self.__acquire(init_path)
+            await self.__acquire(segment_path)
+            if await self.__storeEncodedVideoFragment(segment, encoded_data, init_path, segment_path) is False:
+                logging.error(
+                    '[RecordedFMP4Stream] Offline continuous video fragment is incomplete. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'sequence: {segment.sequence}]'
+                )
+                return False
+            self._completed_sequences.add(segment.sequence)
+            self._offline_video_segment_events.setdefault(segment.sequence, asyncio.Event()).set()
+        self.__updateOfflineWorkProgress(work_key, 1.0)
+        return True
+
+    async def __communicateSubprocessWithProgress(
+        self,
+        process: asyncio.subprocess.Process,
+        duration: float,
+        callback: Callable[[float], None],
+    ) -> tuple[bytes, int]:
+        """FFmpegのprogress出力を読みながら終了を待ち、キャンセル時は確実に回収する。
+
+        Args:
+            process: 実行中のFFmpeg。
+            duration: このプロセスが生成する媒体時間。
+            callback: 0～1の媒体時間進捗を受け取る同期コールバック。
+
+        Returns:
+            stderrと終了コード。
+        """
+
+        # loglevel errorでもstderr pipeが埋まるとFFmpegが止まるため、progressと並行してdrainする。
+        stderr_task = asyncio.create_task(process.stderr.read()) if process.stderr is not None else None
+        stderr = b''
+        latest_progress = 0.0
+        try:
+            if process.stdout is not None:
+                while True:
+                    line = await process.stdout.readline()
+                    if line == b'':
+                        break
+                    key, separator, value = line.decode(errors='ignore').strip().partition('=')
+                    if separator == '' or key not in ('out_time_us', 'out_time_ms'):
+                        continue
+                    try:
+                        out_time = int(value) / 1_000_000
+                    except ValueError:
+                        continue
+                    if duration > 0:
+                        latest_progress = max(latest_progress, min(1.0, out_time / duration))
+                        callback(latest_progress)
+            returncode = await process.wait()
+            if returncode == 0:
+                callback(1.0)
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    await process.wait()
+                except (ProcessLookupError, OSError):
+                    pass
+            raise
+        finally:
+            if stderr_task is not None:
+                stderr_result = await asyncio.gather(stderr_task, return_exceptions=True)
+                if len(stderr_result) == 1 and isinstance(stderr_result[0], bytes):
+                    stderr = stderr_result[0]
+        return stderr, process.returncode if process.returncode is not None else 1
 
     @staticmethod
     def computeInputSeekWindow(start_time: float, duration: float) -> tuple[float, float, float]:
@@ -1886,6 +2578,13 @@ class RecordedFMP4Stream:
             await self.__acquire(segment_path)
         async with generation_lock:
             if init_path.is_file() and all(path.is_file() for path in segment_paths.values()):
+                self.__updateOfflineWorkProgress(
+                    self.__getOfflineAudioWorkKey(
+                        rendition.id,
+                        self.__getTranscodedAudioGeneration(segment),
+                    ),
+                    1.0,
+                )
                 return await asyncio.to_thread(segment_paths[segment.sequence].read_bytes)
             is_succeeded = await self.__encodeTranscodedAudioGeneration(
                 generation_segments,
@@ -1915,7 +2614,12 @@ class RecordedFMP4Stream:
         expected_channel_count = self.__getAudioRenditionChannelCount(rendition, configuration_time)
         expected_channel_layout = self.__getAudioRenditionChannelLayout(rendition, configuration_time)
         availability = self.__getAudioRenditionAvailability(configuration_time, rendition)
-        source_attempts = [False] if availability is False else [True, False]
+        # 索引が不在を明示した区間だけ無音を生成する。存在を明示したTrackの抽出失敗まで
+        # 無音へ置換すると、オフライン一括生成では残り全区間が成功扱いの無音になる。
+        # タイムラインを持たない旧索引だけは、従来どおり実音声失敗時の無音fallbackを残す。
+        source_attempts = [False] if availability is False else (
+            [True] if availability is True else [True, False]
+        )
         timings = [self.__getAudioSegmentTiming(item) for item in generation_segments]
         total_input_samples = sum(timing.sample_count for timing in timings)
         if total_input_samples <= 0:
@@ -1923,7 +2627,8 @@ class RecordedFMP4Stream:
 
         stderr = b''
         for use_recorded_audio in source_attempts:
-            command = [LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error']
+            # 実音声失敗後の無音再試行で同じ一時パスを安全に置換できるよう上書きを明示する。
+            command = [LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error', '-y']
             normalization_command: list[str] | None = None
             trim_start_samples = 0
             if use_recorded_audio:
@@ -1959,6 +2664,14 @@ class RecordedFMP4Stream:
                 source_input_arguments: list[str] = []
                 if input_seek > 0:
                     source_input_arguments += ['-ss', f'{input_seek:.6f}']
+                if self.recorded_program.recorded_video.container_format == 'MPEG-TS':
+                    # 新PIDの構成境界へexact seekしても、後続PMTとAAC packetまでprobeして
+                    # PID指定mapを確定できるようにする。seek時刻自体は後ろへずらさないため、
+                    # 境界先頭の音声sampleとPTSを失わず既存の厳密timeline検証へ渡せる。
+                    source_input_arguments += [
+                        '-probesize', str(self.AUDIO_MPEGTS_PROBE_SIZE_BYTES),
+                        '-analyzeduration', str(self.AUDIO_MPEGTS_ANALYZE_DURATION_MICROSECONDS),
+                    ]
                 source_input_arguments += [
                     '-i', self.recorded_program.recorded_video.file_path,
                     '-t', f'{input_duration:.6f}',
@@ -1979,7 +2692,7 @@ class RecordedFMP4Stream:
                         f'channel_layouts={expected_channel_layout}'
                     )
                     normalization_command = [
-                        LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error',
+                        LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error', '-y',
                         *source_input_arguments,
                         '-af', ','.join(source_filters),
                         '-vn', '-c:a', 'pcm_f32le', '-ac', str(expected_channel_count), '-ar', '48000',
@@ -1996,8 +2709,9 @@ class RecordedFMP4Stream:
                     ])
                     command += [*source_input_arguments, '-af', ','.join(source_filters)]
             else:
-                # 入力読込・Track欠落のどちらでもgeneration全体を同じcodec/layoutの無音で作り直す。
-                # 一部segmentだけを差し替えるとencoder stateが切れて継ぎ目が生じるため禁止する。
+                # 索引がTrack不在を明示した区間、または旧索引で入力Trackを確認できなかった場合は、
+                # generation全体を同じcodec/layoutの無音で作る。一部segmentだけを差し替えると
+                # encoder stateが切れて継ぎ目が生じるため禁止する。
                 channel_layout = self.__getSilentAudioChannelLayout(rendition, configuration_time)
                 command += [
                     '-f', 'lavfi', '-i', f'anullsrc=r=48000:cl={channel_layout}',
@@ -2038,19 +2752,25 @@ class RecordedFMP4Stream:
             # generation終端のpaddingだけをMP4 muxerの最終sample durationでclipする。
             frame_limit = math.ceil((total_input_samples + encoder_delay) / frame_samples)
             encoder_arguments += ['-frames:a', str(frame_limit)]
-            cumulative_samples = 0
-            split_samples: list[int] = []
-            for timing in timings[:-1]:
-                cumulative_samples += timing.sample_count
-                split_samples.append(cumulative_samples + encoder_delay)
+            fragment_sample_counts = [timing.sample_count for timing in timings]
+            fragment_sample_counts[0] += encoder_delay
 
             with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-audio-generation-') as temporary_directory:
                 temporary_directory_path = Path(temporary_directory)
                 normalized_audio_path = temporary_directory_path / 'normalized-audio.nut'
-                output_pattern = str(Path(temporary_directory) / 'segment-%06d.mp4')
+                encoded_audio_path = temporary_directory_path / 'encoded-audio.mp4'
+                work_key = self.__getOfflineAudioWorkKey(
+                    rendition.id,
+                    self.__getTranscodedAudioGeneration(first_segment),
+                )
+                total_duration = total_input_samples / self.AUDIO_SAMPLE_RATE
+                normalization_share = 0.10 if normalization_command is not None else 0.0
                 if normalization_command is not None:
                     assert expected_channel_layout is not None
-                    normalization_command.append(str(normalized_audio_path))
+                    normalization_command += [
+                        '-progress', 'pipe:1', '-nostats',
+                        str(normalized_audio_path),
+                    ]
                     # 第2段は固定layout NUTだけを入力するため、PTS補完・trim・padの状態が
                     # Stereo/Monaural切替で再初期化されない。NUTのPCM layoutは明示指定し、
                     # 元PTSの64ms欠落を同じ位置へ無音として補完してから予定sample数へ揃える。
@@ -2071,18 +2791,11 @@ class RecordedFMP4Stream:
 
                 # 入力経路に関係なく、codecとsample上限は最終段だけへ適用する。
                 command += encoder_arguments
-                if len(split_samples) > 0:
-                    command += [
-                        '-segment_times',
-                        ','.join(f'{sample / self.AUDIO_SAMPLE_RATE:.9f}' for sample in split_samples),
-                    ]
                 command += [
                     '-initial_offset', f'{-encoder_delay / self.AUDIO_SAMPLE_RATE:.9f}',
-                    '-f', 'segment', '-segment_format', 'mp4',
-                    '-segment_format_options',
-                    'movflags=+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
-                    '-reset_timestamps', '0',
-                    output_pattern,
+                    '-movflags', '+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
+                    '-progress', 'pipe:1', '-nostats',
+                    '-f', 'mp4', str(encoded_audio_path),
                 ]
                 async with self.acquireEncoderSlot(self._cpu_semaphore):
                     if normalization_command is not None:
@@ -2091,11 +2804,22 @@ class RecordedFMP4Stream:
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.PIPE,
                         )
-                        _, stderr = await self.__communicateSubprocess(normalization_process)
-                        if normalization_process.returncode != 0 or normalized_audio_path.is_file() is False:
-                            logging.warning(
-                                '[RecordedFMP4Stream] FFmpeg 8 audio normalization source failed; '
-                                'retrying the entire generation with silence. '
+                        stderr, normalization_returncode = await self.__communicateSubprocessWithProgress(
+                            normalization_process,
+                            total_duration,
+                            lambda progress: self.__updateOfflineWorkProgress(
+                                work_key,
+                                progress * normalization_share,
+                            ),
+                        )
+                        if normalization_returncode != 0 or normalized_audio_path.is_file() is False:
+                            log_message = (
+                                '[RecordedFMP4Stream] FFmpeg 8 audio normalization source failed; ' +
+                                ('retrying the entire generation with silence. ' if availability is None else
+                                 'refusing to replace an indexed audio track with silence. ')
+                            )
+                            (logging.warning if availability is None else logging.error)(
+                                log_message +
                                 f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
                                 f'rendition: {rendition.id}, audio_generation: '
                                 f'{self.__getTranscodedAudioGeneration(first_segment)}, '
@@ -2107,35 +2831,98 @@ class RecordedFMP4Stream:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                     )
-                    _, stderr = await self.__communicateSubprocess(process)
-                output_paths = sorted(Path(temporary_directory).glob('segment-*.mp4'))
-                if process.returncode != 0 or len(output_paths) != len(generation_segments):
+                    stderr, returncode = await self.__communicateSubprocessWithProgress(
+                        process,
+                        total_duration,
+                        lambda progress: self.__updateOfflineWorkProgress(
+                            work_key,
+                            normalization_share + progress * (0.95 - normalization_share),
+                        ),
+                    )
+                if returncode != 0 or encoded_audio_path.is_file() is False or encoded_audio_path.stat().st_size == 0:
                     if use_recorded_audio:
-                        logging.warning(
-                            '[RecordedFMP4Stream] FFmpeg 8 audio generation source failed; '
-                            'retrying the entire generation with silence. '
+                        log_message = (
+                            '[RecordedFMP4Stream] FFmpeg 8 audio generation source failed; ' +
+                            ('retrying the entire generation with silence. ' if availability is None else
+                             'refusing to replace an indexed audio track with silence. ')
+                        )
+                        (logging.warning if availability is None else logging.error)(
+                            log_message +
                             f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
                             f'rendition: {rendition.id}, audio_generation: '
                             f'{self.__getTranscodedAudioGeneration(first_segment)}, '
                             f'stderr: {stderr.decode(errors="ignore").strip()}]'
                         )
                     continue
-                outputs = [await asyncio.to_thread(path.read_bytes) for path in output_paths]
 
-            media_fragments: list[bytes] = []
+                # 一括生成したmoof/trun/mdatを直接解析し、計画境界に対応するpacket群へ分ける。
+                # segment muxerへ再投入するとdurationが再量子化されるため、圧縮payloadはbyte単位で保持する。
+                try:
+                    encoded_data = await asyncio.to_thread(encoded_audio_path.read_bytes)
+                    init_data, media_fragments = await asyncio.to_thread(
+                        self.splitTranscodedAudioFMP4,
+                        encoded_data,
+                        fragment_sample_counts,
+                    )
+                except (OSError, ValueError) as ex:
+                    logging.error(
+                        '[RecordedFMP4Stream] FFmpeg 8 audio packet split failed. '
+                        f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                        f'rendition: {rendition.id}, audio_generation: '
+                        f'{self.__getTranscodedAudioGeneration(first_segment)}, '
+                        f'expected_segments: {len(generation_segments)}, error: {ex}]'
+                    )
+                    return False
+                # 厳密timeline検証とatomic cache writeが完了するまでは100%にしない。
+                self.__updateOfflineWorkProgress(work_key, 0.99)
+
+            normalized_media_fragments: list[bytes] = []
             common_init_data = b''
             next_decode_sample = first_timing.start_sample
             is_valid = True
-            for index, (generation_segment, timing, output) in enumerate(zip(
+
+            def LogTimelineValidationFailure(
+                media_data: bytes,
+                sequence: int,
+                phase: str,
+                expected_start_sample: int,
+                expected_sample_count: int,
+            ) -> None:
+                """音声fragment検証失敗時に予定値と解析可能な実測値を記録する。
+
+                Args:
+                    media_data: 検証に失敗したメディアfragment。
+                    sequence: 対象HLS sequence。
+                    phase: 正規化前後を識別する英語ラベル。
+                    expected_start_sample: 期待する48kHz decode開始sample。
+                    expected_sample_count: 期待する48kHz sample数。
+
+                Returns:
+                    None
+                """
+
+                actual_info = self.inspectAudioFragment(init_data, media_data)
+                actual_start_sample = actual_info.first_decode_time if actual_info is not None else None
+                actual_sample_count = actual_info.total_duration if actual_info is not None else None
+                actual_packet_count = actual_info.sample_count if actual_info is not None else None
+                expected_packet_count = math.ceil(expected_sample_count / frame_samples)
+                logging.error(
+                    '[RecordedFMP4Stream] FFmpeg 8 audio fragment timeline validation failed. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'rendition: {rendition.id}, audio_generation: '
+                    f'{self.__getTranscodedAudioGeneration(first_segment)}, sequence: {sequence}, '
+                    f'phase: {phase}, expected_start_sample: {expected_start_sample}, '
+                    f'actual_start_sample: {actual_start_sample}, '
+                    f'expected_sample_count: {expected_sample_count}, actual_sample_count: {actual_sample_count}, '
+                    f'expected_packet_count: {expected_packet_count}, actual_packet_count: {actual_packet_count}]'
+                )
+
+            for index, (generation_segment, media_data) in enumerate(zip(
                 generation_segments,
-                timings,
-                outputs,
+                media_fragments,
                 strict=True,
             )):
-                init_data, media_data = self.splitFragmentedMP4(output)
-                expected_duration = timing.sample_count
-                if index == 0:
-                    expected_duration += encoder_delay
+                expected_duration = fragment_sample_counts[index]
                 if self.validateTranscodedAudioFragmentTimeline(
                     init_data,
                     media_data,
@@ -2143,7 +2930,15 @@ class RecordedFMP4Stream:
                     expected_start_sample=0,
                     expected_sample_count=expected_duration,
                     expected_channel_count=expected_channel_count,
+                    validate_packet_timeline=False,
                 ) is False:
+                    LogTimelineValidationFailure(
+                        media_data,
+                        generation_segment.sequence,
+                        'BeforeNormalization',
+                        0,
+                        expected_duration,
+                    )
                     is_valid = False
                     break
                 try:
@@ -2153,7 +2948,15 @@ class RecordedFMP4Stream:
                         next_decode_sample / self.AUDIO_SAMPLE_RATE,
                         generation_segment.sequence,
                     )
-                except ValueError:
+                except ValueError as ex:
+                    logging.error(
+                        '[RecordedFMP4Stream] FFmpeg 8 audio fragment timeline normalization failed. '
+                        f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                        f'rendition: {rendition.id}, audio_generation: '
+                        f'{self.__getTranscodedAudioGeneration(first_segment)}, '
+                        f'sequence: {generation_segment.sequence}, '
+                        f'expected_start_sample: {next_decode_sample}, error: {ex}]'
+                    )
                     is_valid = False
                     break
                 if self.validateTranscodedAudioFragmentTimeline(
@@ -2163,7 +2966,15 @@ class RecordedFMP4Stream:
                     expected_start_sample=next_decode_sample,
                     expected_sample_count=expected_duration,
                     expected_channel_count=expected_channel_count,
+                    validate_packet_timeline=False,
                 ) is False:
+                    LogTimelineValidationFailure(
+                        normalized_media,
+                        generation_segment.sequence,
+                        'AfterNormalization',
+                        next_decode_sample,
+                        expected_duration,
+                    )
                     is_valid = False
                     break
                 if index == 0:
@@ -2175,13 +2986,76 @@ class RecordedFMP4Stream:
                         is_valid = False
                         break
                     common_init_data = patched_init
-                media_fragments.append(normalized_media)
+                normalized_media_fragments.append(normalized_media)
                 next_decode_sample += expected_duration
 
-            if is_valid and len(common_init_data) > 0 and len(media_fragments) == len(generation_segments):
+            # MP4 muxer の 959/961 samples のような丸め補償は、間に960-sample packetを挟んだり
+            # HLS fragment境界をまたいだりすることがある。各fragmentの開始・総時間は上で厳密に
+            # 確認し、packet境界の累積丸め誤差と最終partial packetはgeneration全体で検証する。
+            expected_generation_sample_count = sum(fragment_sample_counts)
+            for phase, fragments in (
+                ('BeforeNormalization', media_fragments),
+                ('AfterNormalization', normalized_media_fragments),
+            ):
+                if is_valid is False:
+                    break
+                if self.validateTranscodedAudioGenerationPacketTimeline(
+                    init_data,
+                    fragments,
+                    audio_codec,
+                    expected_generation_sample_count,
+                ) is True:
+                    continue
+                fragment_infos = [self.inspectAudioFragment(init_data, fragment) for fragment in fragments]
+                actual_generation_sample_count = sum(
+                    info.total_duration for info in fragment_infos if info is not None
+                )
+                actual_generation_packet_count = sum(
+                    info.sample_count for info in fragment_infos if info is not None
+                )
+                expected_generation_packet_count = math.ceil(expected_generation_sample_count / frame_samples)
+                duration_anomalies: list[str] = []
+                for generation_segment, info in zip(generation_segments, fragment_infos, strict=True):
+                    if info is None:
+                        duration_anomalies.append(f'{generation_segment.sequence}:Unparseable')
+                        continue
+                    for packet_index, duration in enumerate(info.sample_durations):
+                        if duration != frame_samples:
+                            duration_anomalies.append(
+                                f'{generation_segment.sequence}:{packet_index}:{duration}'
+                            )
+                            if len(duration_anomalies) >= 8:
+                                break
+                    if len(duration_anomalies) >= 8:
+                        break
+                logging.error(
+                    '[RecordedFMP4Stream] FFmpeg 8 audio generation packet timeline validation failed. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'rendition: {rendition.id}, audio_generation: '
+                    f'{self.__getTranscodedAudioGeneration(first_segment)}, '
+                    f'start_sequence: {generation_segments[0].sequence}, '
+                    f'end_sequence: {generation_segments[-1].sequence}, phase: {phase}, '
+                    f'expected_sample_count: {expected_generation_sample_count}, '
+                    f'actual_sample_count: {actual_generation_sample_count}, '
+                    f'expected_packet_count: {expected_generation_packet_count}, '
+                    f'actual_packet_count: {actual_generation_packet_count}, '
+                    f'duration_anomalies: {duration_anomalies}]'
+                )
+                is_valid = False
+
+            if (
+                is_valid and
+                len(common_init_data) > 0 and
+                len(normalized_media_fragments) == len(generation_segments)
+            ):
                 await RecordedFMP4CacheManager.writeAtomic(init_path, common_init_data)
-                for generation_segment, media_data in zip(generation_segments, media_fragments, strict=True):
+                for generation_segment, media_data in zip(
+                    generation_segments,
+                    normalized_media_fragments,
+                    strict=True,
+                ):
                     await RecordedFMP4CacheManager.writeAtomic(segment_paths[generation_segment.sequence], media_data)
+                self.__updateOfflineWorkProgress(work_key, 1.0)
                 return True
             if use_recorded_audio:
                 # 実音声を正常に生成できた後の検証失敗は、入力Track欠落とは異なる実装上の異常。
@@ -2214,6 +3088,7 @@ class RecordedFMP4Stream:
             backend = self.__getBackend(),
             configuration_generation = segment.generation,
             seek_generation = 0,
+            delivery_mode = 'Offline' if self._is_offline_continuous is True else 'Playback',
         )
         return RecordedFMP4CacheManager.buildPath(
             self.recorded_program.recorded_video,
@@ -2239,6 +3114,7 @@ class RecordedFMP4Stream:
             configuration_generation = self.__getTranscodedAudioGeneration(segment),
             seek_generation = 0,
             rendition = rendition.id,
+            delivery_mode = 'Offline' if self._is_offline_continuous is True else 'Playback',
         )
         return RecordedFMP4CacheManager.buildPath(
             self.recorded_program.recorded_video,
@@ -2475,6 +3351,295 @@ class RecordedFMP4Stream:
             raise ValueError('The fMP4 data ends with a truncated box header.')
 
     @staticmethod
+    def __buildMP4Box(box_type: bytes, payload: bytes) -> bytes:
+        """32bit sizeを持つISO BMFF boxを構築する。
+
+        Args:
+            box_type: 4byteのbox type。
+            payload: box header直後へ格納するpayload。
+
+        Returns:
+            size、type、payloadを連結したbox。
+
+        Raises:
+            ValueError: box typeまたは32bit box sizeの条件を満たさない場合。
+        """
+
+        if len(box_type) != 4:
+            raise ValueError('The ISO BMFF box type must be exactly four bytes.')
+        box_size = 8 + len(payload)
+        if box_size >= 1 << 32:
+            raise ValueError('The ISO BMFF box exceeds the 32-bit box size field.')
+        return box_size.to_bytes(4, 'big') + box_type + payload
+
+    @classmethod
+    def splitTranscodedAudioFMP4(
+        cls,
+        data: bytes,
+        segment_sample_counts: list[int],
+    ) -> tuple[bytes, list[bytes]]:
+        """単一fragmentの音声fMP4を圧縮packet境界で複数fragmentへ厳密に分割する。
+
+        Args:
+            data: FFmpegが一括生成した自己完結音声fMP4。
+            segment_sample_counts: codec delayを含めた各出力fragmentの48kHz sample数。
+
+        Returns:
+            共通初期化セグメントと、入力packetをそのまま保持したメディアfragment列。
+
+        Raises:
+            ValueError: 未対応box構造、矛盾したsample情報、packet途中の境界を検出した場合。
+        """
+
+        # 空の出力や0 sampleのfragmentはHLS側で表現できないため、box解析より先に拒否する。
+        if len(segment_sample_counts) == 0 or any(sample_count <= 0 for sample_count in segment_sample_counts):
+            raise ValueError('The audio fMP4 split plan must contain only positive sample counts.')
+
+        # この処理は自身が起動したFFmpegの既知出力だけを対象にする。将来movencの構造が
+        # 変わった場合にpacketを誤対応させないよう、既知のmfra以外を暗黙に読み飛ばさない。
+        top_level_boxes = list(cls.__iterateMP4Boxes(data, 0, len(data)))
+        top_level_types = tuple(box_type for _, _, _, box_type in top_level_boxes)
+        if top_level_types not in (
+            (b'ftyp', b'moov', b'moof', b'mdat'),
+            (b'ftyp', b'moov', b'moof', b'mdat', b'mfra'),
+        ):
+            raise ValueError(
+                'The audio fMP4 must contain only ftyp, moov, one moof/mdat pair, and optional mfra boxes.'
+            )
+        ftyp_box, moov_box, moof_box, mdat_box = top_level_boxes[:4]
+        ftyp_offset, ftyp_size, _, _ = ftyp_box
+        moov_offset, moov_size, _, _ = moov_box
+        moof_offset, moof_size, moof_header_size, _ = moof_box
+        mdat_offset, mdat_size, mdat_header_size, _ = mdat_box
+        init_data = data[ftyp_offset:ftyp_offset + ftyp_size] + data[moov_offset:moov_offset + moov_size]
+        mdat_payload_offset = mdat_offset + mdat_header_size
+        mdat_payload_end = mdat_offset + mdat_size
+        mdat_payload = data[mdat_payload_offset:mdat_payload_end]
+
+        # 音声専用出力ではmoof直下をmfhd + traf、traf直下をtfhd + tfdt + trunへ限定する。
+        # 複数track、複数run、暗号化補助boxを誤って単一mdatへ対応付けることを防ぐ。
+        moof_children = list(cls.__iterateMP4Boxes(
+            data,
+            moof_offset + moof_header_size,
+            moof_offset + moof_size,
+        ))
+        if tuple(box_type for _, _, _, box_type in moof_children) != (b'mfhd', b'traf'):
+            raise ValueError('The audio fMP4 moof must contain exactly one mfhd and one traf box.')
+        mfhd_offset, mfhd_size, mfhd_header_size, _ = moof_children[0]
+        traf_offset, traf_size, traf_header_size, _ = moof_children[1]
+        if mfhd_size != mfhd_header_size + 8:
+            raise ValueError('The audio fMP4 contains an invalid mfhd box.')
+        mfhd_payload_offset = mfhd_offset + mfhd_header_size
+        if data[mfhd_payload_offset:mfhd_payload_offset + 4] != b'\x00\x00\x00\x00':
+            raise ValueError('The audio fMP4 contains an unsupported mfhd version or flags.')
+        mfhd_data = data[mfhd_offset:mfhd_offset + mfhd_size]
+
+        traf_children = list(cls.__iterateMP4Boxes(
+            data,
+            traf_offset + traf_header_size,
+            traf_offset + traf_size,
+        ))
+        if tuple(box_type for _, _, _, box_type in traf_children) != (b'tfhd', b'tfdt', b'trun'):
+            raise ValueError('The audio fMP4 traf must contain exactly one tfhd, tfdt, and trun box.')
+        tfhd_offset, tfhd_size, tfhd_header_size, _ = traf_children[0]
+        tfdt_offset, tfdt_size, tfdt_header_size, _ = traf_children[1]
+        trun_offset, trun_size, trun_header_size, _ = traf_children[2]
+
+        # tfhdの既定duration/sizeは、movencが全packetで同じ値を省略した場合に必要になる。
+        # base-data-offsetやduration-is-emptyは、この分割処理の単一mdat契約と両立しない。
+        tfhd_payload_offset = tfhd_offset + tfhd_header_size
+        tfhd_end = tfhd_offset + tfhd_size
+        if tfhd_payload_offset + 8 > tfhd_end or data[tfhd_payload_offset] != 0:
+            raise ValueError('The audio fMP4 contains an invalid tfhd box.')
+        tfhd_flags = int.from_bytes(data[tfhd_payload_offset + 1:tfhd_payload_offset + 4], 'big')
+        known_tfhd_flags = 0x000001 | 0x000002 | 0x000008 | 0x000010 | 0x000020 | 0x010000 | 0x020000
+        if (
+            tfhd_flags & ~known_tfhd_flags != 0 or
+            tfhd_flags & 0x000001 != 0 or
+            tfhd_flags & 0x010000 != 0 or
+            tfhd_flags & 0x020000 == 0
+        ):
+            raise ValueError('The audio fMP4 tfhd must use default-base-is-moof without an explicit base offset.')
+        tfhd_cursor = tfhd_payload_offset + 8
+        if tfhd_flags & 0x000002:
+            tfhd_cursor += 4
+        default_sample_duration: int | None = None
+        if tfhd_flags & 0x000008:
+            if tfhd_cursor + 4 > tfhd_end:
+                raise ValueError('The audio fMP4 contains a truncated tfhd default sample duration.')
+            default_sample_duration = int.from_bytes(data[tfhd_cursor:tfhd_cursor + 4], 'big')
+            tfhd_cursor += 4
+        default_sample_size: int | None = None
+        if tfhd_flags & 0x000010:
+            if tfhd_cursor + 4 > tfhd_end:
+                raise ValueError('The audio fMP4 contains a truncated tfhd default sample size.')
+            default_sample_size = int.from_bytes(data[tfhd_cursor:tfhd_cursor + 4], 'big')
+            tfhd_cursor += 4
+        if tfhd_flags & 0x000020:
+            tfhd_cursor += 4
+        if tfhd_cursor != tfhd_end:
+            raise ValueError('The audio fMP4 tfhd fields do not match its box size.')
+        tfhd_data = data[tfhd_offset:tfhd_offset + tfhd_size]
+
+        # 各出力fragmentは既存normalizeFragmentTimeline()へ渡すため、元tfdtが0起点の
+        # 一括生成物であることを確認し、同じversionの0起点tfdtを後で再構築する。
+        tfdt_payload_offset = tfdt_offset + tfdt_header_size
+        tfdt_end = tfdt_offset + tfdt_size
+        if tfdt_payload_offset + 8 > tfdt_end:
+            raise ValueError('The audio fMP4 contains a truncated tfdt box.')
+        tfdt_version = data[tfdt_payload_offset]
+        tfdt_flags = int.from_bytes(data[tfdt_payload_offset + 1:tfdt_payload_offset + 4], 'big')
+        tfdt_decode_time_size = 8 if tfdt_version == 1 else 4
+        if tfdt_version not in (0, 1) or tfdt_flags != 0 or tfdt_payload_offset + 4 + tfdt_decode_time_size != tfdt_end:
+            raise ValueError('The audio fMP4 contains an unsupported tfdt version, flags, or size.')
+        source_decode_time = int.from_bytes(
+            data[tfdt_payload_offset + 4:tfdt_payload_offset + 4 + tfdt_decode_time_size],
+            'big',
+        )
+        if source_decode_time != 0:
+            raise ValueError('The audio fMP4 source tfdt must start at decode time zero.')
+        tfdt_fullbox = data[tfdt_payload_offset:tfdt_payload_offset + 4]
+
+        # trunの各entryをduration/sizeと対応付ける。entryのflagsやcomposition offsetは
+        # 解釈を変えずraw bytesのまま保持し、sample_countとdata_offsetだけを再構築する。
+        trun_payload_offset = trun_offset + trun_header_size
+        trun_end = trun_offset + trun_size
+        if trun_payload_offset + 8 > trun_end:
+            raise ValueError('The audio fMP4 contains a truncated trun box.')
+        trun_version = data[trun_payload_offset]
+        trun_flags = int.from_bytes(data[trun_payload_offset + 1:trun_payload_offset + 4], 'big')
+        known_trun_flags = 0x000001 | 0x000004 | 0x000100 | 0x000200 | 0x000400 | 0x000800
+        if trun_version not in (0, 1) or trun_flags & ~known_trun_flags != 0:
+            raise ValueError('The audio fMP4 contains unsupported trun version or flags.')
+        if trun_flags & 0x000001 == 0:
+            raise ValueError('The audio fMP4 trun must contain a data_offset field.')
+        # first_sample_flagsを各分割先へ複製すると2本目以降の意味が変わるため、未知構造として拒否する。
+        if trun_flags & 0x000004:
+            raise ValueError('The audio fMP4 trun first_sample_flags field cannot be split safely.')
+        sample_count = int.from_bytes(data[trun_payload_offset + 4:trun_payload_offset + 8], 'big')
+        if sample_count == 0 or sample_count > len(mdat_payload):
+            raise ValueError('The audio fMP4 trun contains an invalid sample count.')
+        trun_cursor = trun_payload_offset + 8
+        source_data_offset = int.from_bytes(data[trun_cursor:trun_cursor + 4], 'big', signed=True)
+        trun_cursor += 4
+        expected_source_data_offset = mdat_payload_offset - moof_offset
+        if source_data_offset != expected_source_data_offset:
+            raise ValueError('The audio fMP4 trun data_offset does not point to the mdat payload.')
+
+        packets: list[RecordedAudioPacket] = []
+        packet_payload_offset = 0
+        for packet_index in range(sample_count):
+            entry_offset = trun_cursor
+            duration = default_sample_duration
+            if trun_flags & 0x000100:
+                if trun_cursor + 4 > trun_end:
+                    raise ValueError(f'The audio fMP4 trun duration is truncated at packet {packet_index}.')
+                duration = int.from_bytes(data[trun_cursor:trun_cursor + 4], 'big')
+                trun_cursor += 4
+            size = default_sample_size
+            if trun_flags & 0x000200:
+                if trun_cursor + 4 > trun_end:
+                    raise ValueError(f'The audio fMP4 trun size is truncated at packet {packet_index}.')
+                size = int.from_bytes(data[trun_cursor:trun_cursor + 4], 'big')
+                trun_cursor += 4
+            if trun_flags & 0x000400:
+                trun_cursor += 4
+            if trun_flags & 0x000800:
+                trun_cursor += 4
+            if trun_cursor > trun_end:
+                raise ValueError(f'The audio fMP4 trun entry is truncated at packet {packet_index}.')
+            if duration is None or duration <= 0 or size is None or size <= 0:
+                raise ValueError(f'The audio fMP4 packet {packet_index} has no positive duration or size.')
+            packets.append(RecordedAudioPacket(
+                duration=duration,
+                size=size,
+                payload_offset=packet_payload_offset,
+                trun_entry=data[entry_offset:trun_cursor],
+            ))
+            packet_payload_offset += size
+        if trun_cursor != trun_end:
+            raise ValueError('The audio fMP4 trun fields do not match its box size.')
+        if packet_payload_offset != len(mdat_payload):
+            raise ValueError(
+                'The audio fMP4 packet sizes do not exactly cover the mdat payload. '
+                f'expected: {packet_payload_offset}, actual: {len(mdat_payload)}.'
+            )
+
+        # 計画境界をpacket durationの累積値と突き合わせる。1 sampleでもpacket途中へ入る
+        # 境界は、圧縮payloadを再エンコードなしで分割できないため即座に失敗させる。
+        expected_total_duration = sum(segment_sample_counts)
+        actual_total_duration = sum(packet.duration for packet in packets)
+        if expected_total_duration != actual_total_duration:
+            raise ValueError(
+                'The audio fMP4 split plan does not match the packet timeline. '
+                f'expected: {expected_total_duration}, actual: {actual_total_duration}.'
+            )
+        packet_ranges: list[tuple[int, int]] = []
+        packet_index = 0
+        decode_time = 0
+        for segment_index, segment_sample_count in enumerate(segment_sample_counts):
+            segment_packet_start = packet_index
+            expected_decode_end = decode_time + segment_sample_count
+            while decode_time < expected_decode_end and packet_index < len(packets):
+                decode_time += packets[packet_index].duration
+                packet_index += 1
+            if decode_time != expected_decode_end:
+                raise ValueError(
+                    f'The audio fMP4 boundary for segment {segment_index} falls inside a packet. '
+                    f'expected: {expected_decode_end}, actual: {decode_time}.'
+                )
+            if packet_index == segment_packet_start:
+                raise ValueError(f'The audio fMP4 segment {segment_index} contains no packets.')
+            packet_ranges.append((segment_packet_start, packet_index))
+        if packet_index != len(packets):
+            raise ValueError('The audio fMP4 split plan leaves unassigned packets.')
+
+        # 各fragmentではtfdtを0へ戻し、後段の既存normalizeFragmentTimeline()が録画先頭基準の
+        # tfdtとmfhd sequenceを設定する。mdat payloadは元packetのbyte列を一切変更せずコピーする。
+        media_fragments: list[bytes] = []
+        for packet_start, packet_end in packet_ranges:
+            segment_packets = packets[packet_start:packet_end]
+            trun_entries = b''.join(packet.trun_entry for packet in segment_packets)
+            tfdt_data = cls.__buildMP4Box(
+                b'tfdt',
+                tfdt_fullbox + bytes(tfdt_decode_time_size),
+            )
+
+            def BuildMoof(data_offset: int) -> bytes:
+                """新しいtrun data_offsetを持つ単一音声moofを構築する。
+
+                Args:
+                    data_offset: moof先頭からmdat payload先頭までの相対位置。
+
+                Returns:
+                    box sizeを再計算したmoof。
+                """
+
+                trun_data = cls.__buildMP4Box(
+                    b'trun',
+                    data[trun_payload_offset:trun_payload_offset + 4] +
+                    len(segment_packets).to_bytes(4, 'big') +
+                    data_offset.to_bytes(4, 'big', signed=True) +
+                    trun_entries,
+                )
+                traf_data = cls.__buildMP4Box(b'traf', tfhd_data + tfdt_data + trun_data)
+                return cls.__buildMP4Box(b'moof', mfhd_data + traf_data)
+
+            provisional_moof = BuildMoof(0)
+            output_data_offset = len(provisional_moof) + 8
+            if output_data_offset >= 1 << 31:
+                raise ValueError('The audio fMP4 output data_offset exceeds the signed 32-bit field.')
+            output_moof = BuildMoof(output_data_offset)
+            if len(output_moof) + 8 != output_data_offset:
+                raise ValueError('The audio fMP4 output moof size changed while rebuilding data_offset.')
+            payload_start = segment_packets[0].payload_offset
+            payload_end = segment_packets[-1].payload_offset + segment_packets[-1].size
+            output_mdat = cls.__buildMP4Box(b'mdat', mdat_payload[payload_start:payload_end])
+            media_fragments.append(output_moof + output_mdat)
+
+        return init_data, media_fragments
+
+    @staticmethod
     def __findMP4Box(data: bytes, box_type: bytes) -> tuple[int, int, int] | None:
         """任意階層にあるsize検証済みboxの位置を返す。"""
 
@@ -2499,7 +3664,7 @@ class RecordedFMP4Stream:
         """generation共通initの先頭codec delayだけをedit listで除外する。
 
         Args:
-            init_data: segment muxer先頭出力から分離した初期化セグメント。
+            init_data: 一括生成した音声fMP4から分離した共通初期化セグメント。
             encoder_delay: AAC primingまたはOpus pre-skipの48kHz sample数。
 
         Returns:
@@ -2769,14 +3934,26 @@ class RecordedFMP4Stream:
         expected_start_sample: int,
         expected_sample_count: int,
         expected_channel_count: int | None = None,
+        validate_packet_timeline: bool = True,
     ) -> bool:
-        """AAC/Opus変換fragmentが48kHzの予定timelineを連続して覆うか判定する。"""
+        """AAC/Opus変換fragmentが48kHzの予定timelineを連続して覆うか判定する。
+
+        Args:
+            init_data: codec構成とtimescaleを含む初期化セグメント。
+            media_data: 検証する単一メディアfragment。
+            audio_codec: 期待する音声codec。
+            expected_start_sample: 期待するdecode開始sample。
+            expected_sample_count: 期待するfragment総sample数。
+            expected_channel_count: 期待するチャンネル数。Noneなら検査しない。
+            validate_packet_timeline: packet数・duration配列までfragment単体で完結検証する場合はTrue。
+
+        Returns:
+            開始・総時間・codec構成と、要求時はpacket timelineも一致する場合はTrue。
+        """
 
         info = cls.inspectAudioFragment(init_data, media_data)
         expected_codec = 'mp4a.40.2' if audio_codec == 'aac' else 'opus'
         frame_samples = cls.AAC_PACKET_SAMPLES if audio_codec == 'aac' else 960
-        expected_packet_count = math.ceil(expected_sample_count / frame_samples)
-        expected_last_duration = expected_sample_count % frame_samples or frame_samples
         if info is None or not (
             cls.extractAudioCodecString(init_data) == expected_codec and
             (
@@ -2786,36 +3963,97 @@ class RecordedFMP4Stream:
             info.timescale == cls.AUDIO_SAMPLE_RATE and
             info.first_decode_time == expected_start_sample and
             info.total_duration == expected_sample_count and
-            info.sample_count == expected_packet_count
+            info.sample_count > 0
         ):
             return False
+        if validate_packet_timeline is False:
+            return True
 
-        # FFmpegのsegment muxerは境界時刻をTrack timebaseへ丸める際、連続する2 packetを
-        # 1023/1025 samples（Opusでは959/961）のような相殺済み±1 sampleへすることがある。
-        # 合計時間とdecode連続性はinspectAudioFragment()で厳密に確認済みなので、この隣接する
-        # 補償ペアだけを許容し、それ以外の短縮・伸長や末尾partial packetのずれは拒否する。
-        # 末尾がpartial packetのときだけ、その長さを補償対象から外して完全一致を要求する。
-        # 末尾も完全frameなら、直前packetとの補償ペアが境界に現れても同じ規則で許容する。
-        if expected_last_duration != frame_samples and info.sample_durations[-1] != expected_last_duration:
-            return False
-        full_frame_durations = info.sample_durations[:-1] \
-            if expected_last_duration != frame_samples else info.sample_durations
-        duration_index = 0
-        while duration_index < len(full_frame_durations):
-            duration = full_frame_durations[duration_index]
-            if duration == frame_samples:
-                duration_index += 1
-                continue
-            if (
-                duration in (frame_samples - 1, frame_samples + 1) and
-                duration_index + 1 < len(full_frame_durations) and
-                full_frame_durations[duration_index + 1] == frame_samples * 2 - duration
-            ):
-                duration_index += 2
-                continue
-            return False
+        return cls.__validateTranscodedAudioPacketDurations(
+            info.sample_durations,
+            expected_sample_count,
+            frame_samples,
+        )
 
-        return True
+    @staticmethod
+    def __validateTranscodedAudioPacketDurations(
+        sample_durations: tuple[int, ...],
+        expected_sample_count: int,
+        frame_samples: int,
+    ) -> bool:
+        """連結済みpacket durationの累積丸め誤差と最終partialを厳密に検証する。
+
+        Args:
+            sample_durations: decode順のpacket duration。
+            expected_sample_count: 全packetが覆うべき総sample数。
+            frame_samples: codecの通常packet sample数。
+
+        Returns:
+            packet数・総時間・各境界の丸め誤差が厳密なcodec packet列ならTrue。
+        """
+
+        if expected_sample_count <= 0 or frame_samples <= 0:
+            return False
+        expected_packet_count = math.ceil(expected_sample_count / frame_samples)
+        if len(sample_durations) != expected_packet_count or sum(sample_durations) != expected_sample_count:
+            return False
+        expected_last_duration = expected_sample_count % frame_samples or frame_samples
+
+        # FFmpegのMP4 muxerはpacket境界時刻をTrack timebaseへ丸めるため、通常durationから
+        # ±1 sampleのpacketが生じる。丸められた各境界は理想境界から最大1 sampleしか離れず、
+        # 959/960/961のように通常packetを挟んで補償される場合もある。したがって個々の差を
+        # 隣接ペアとして扱わず、先頭からの累積差が常に±1 sample以内で最後に0へ戻ることを
+        # 検証する。これなら正当な量子化だけを許容し、±2 sampleのpacketや累積driftを拒否できる。
+        # 末尾partial packetは丸め補償の対象外として、計画した残りsample数との完全一致を要求する。
+        if expected_last_duration != frame_samples and sample_durations[-1] != expected_last_duration:
+            return False
+        full_frame_durations = sample_durations[:-1] \
+            if expected_last_duration != frame_samples else sample_durations
+        cumulative_rounding_error = 0
+        for duration in full_frame_durations:
+            rounding_error = duration - frame_samples
+            if rounding_error not in (-1, 0, 1):
+                return False
+            cumulative_rounding_error += rounding_error
+            if abs(cumulative_rounding_error) > 1:
+                return False
+
+        return cumulative_rounding_error == 0
+
+    @classmethod
+    def validateTranscodedAudioGenerationPacketTimeline(
+        cls,
+        init_data: bytes,
+        media_fragments: list[bytes],
+        audio_codec: Literal['aac', 'opus'],
+        expected_sample_count: int,
+    ) -> bool:
+        """fragment境界を越えて連結したAAC/Opus packet timelineを厳密に検証する。
+
+        Args:
+            init_data: 全fragmentで共有する初期化セグメント。
+            media_fragments: generationのdecode順に並んだメディアfragment。
+            audio_codec: 期待する音声codec。
+            expected_sample_count: generation全体の期待sample数。
+
+        Returns:
+            fragment境界をまたぐ丸め補償を含め、packet列全体が正しい場合はTrue。
+        """
+
+        if len(media_fragments) == 0:
+            return False
+        sample_durations: list[int] = []
+        for media_data in media_fragments:
+            info = cls.inspectAudioFragment(init_data, media_data)
+            if info is None or info.timescale != cls.AUDIO_SAMPLE_RATE:
+                return False
+            sample_durations.extend(info.sample_durations)
+        frame_samples = cls.AAC_PACKET_SAMPLES if audio_codec == 'aac' else 960
+        return cls.__validateTranscodedAudioPacketDurations(
+            tuple(sample_durations),
+            expected_sample_count,
+            frame_samples,
+        )
 
     @staticmethod
     def normalizeFragmentTimeline(

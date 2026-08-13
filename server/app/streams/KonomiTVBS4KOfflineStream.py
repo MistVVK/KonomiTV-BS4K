@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import struct
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
@@ -27,17 +27,18 @@ class KonomiTVBS4KOfflineStream:
     MAX_MEDIA_TYPE_BYTES = 255
     MAX_ASSET_BYTES = 128 * 1024 * 1024
     TERMINATOR_PATH_LENGTH = 0xFFFF
-
     def __init__(
         self,
         video_stream: RecordedFMP4Stream,
         metadata: schemas.KonomiTVBS4KOfflineStreamMetadata,
+        progress_callback: Callable[[schemas.KonomiTVBS4KOfflineStreamProgress], None] | None = None,
     ) -> None:
         """オフライン保存ストリームを初期化する。
 
         Args:
             video_stream: 通常録画再生と生成条件・キャッシュを共有する fMP4 セッション。
             metadata: クライアントが保存ジョブとの一致を検証する応答メタデータ。
+            progress_callback: HTTP 接続と独立した生成ジョブへ進捗を通知するコールバック。
 
         Returns:
             None
@@ -47,6 +48,16 @@ class KonomiTVBS4KOfflineStream:
         self.video_stream = video_stream
         # 応答冒頭へ一度だけ書き、録画ID・ファイルハッシュ・exact生成条件を固定するメタデータ。
         self.metadata = metadata
+        # アセット数と媒体時間を合成した単調進捗を、所有する永続ジョブだけへ通知する。
+        self._progress_callback = progress_callback
+        # Generate() 開始時に確定する予定アセット数。0 は未計画。
+        self._planned_asset_count = 0
+        # これまでに応答へ書き出したアセット数。プログレスバーの分子。
+        self._completed_asset_count = 0
+        # これまでに応答へ書き出したアセット本体バイト数。
+        self._completed_asset_bytes = 0
+        # FFmpegが報告する媒体時間を全映像・音声処理時間で重み付けした生成進捗。
+        self._encoding_progress = 0.0
 
     @staticmethod
     def _ValidateAssetPath(path: str) -> None:
@@ -242,6 +253,66 @@ class KonomiTVBS4KOfflineStream:
                 previous_generation_key = generation_key
         return tuple(result)
 
+    def CountPlannedAssets(self) -> int:
+        """エンコード前に、保存応答へ載せるアセット総数を返す。
+
+        Returns:
+            master / playlist / init / fragment の合計。
+        """
+
+        segments = self.video_stream.getSegments()
+        renditions = self.video_stream.getAudioRenditions()
+        has_video = self.video_stream.recorded_program.recorded_video.has_video
+        total = 1
+        if has_video is True:
+            total += 1 + len(self._GetVideoInitializationSegments(segments)) + len(segments)
+        audio_init_count = len(self._GetAudioInitializationSegments(segments))
+        total += len(renditions) * (1 + audio_init_count + len(segments))
+        return total
+
+    def BuildProgressSnapshot(self) -> schemas.KonomiTVBS4KOfflineStreamProgress:
+        """現在の生成進捗を API 応答形へ変換する。
+
+        Returns:
+            予定アセット数で正規化した進捗。
+        """
+
+        total_assets = self._planned_asset_count
+        asset_progress = self._completed_asset_count / total_assets if total_assets > 0 else 0.0
+        # エンコードを95%、小さなplaylist/initを含む応答展開を5%として合成する。
+        # 各値は単調増加するため、映像から音声へ工程が切り替わっても表示は後退しない。
+        progress = min(1.0, self._encoding_progress * 0.95 + asset_progress * 0.05)
+        return schemas.KonomiTVBS4KOfflineStreamProgress(
+            active=True,
+            completed_assets=self._completed_asset_count,
+            total_assets=total_assets,
+            completed_bytes=self._completed_asset_bytes,
+            progress=progress,
+        )
+
+    def _notifyProgress(self) -> None:
+        """現在の単調進捗を、このストリームを所有する生成ジョブへ通知する。
+
+        Returns:
+            None
+        """
+
+        if self._progress_callback is not None:
+            self._progress_callback(self.BuildProgressSnapshot())
+
+    def _updateEncodingProgress(self, progress: float) -> None:
+        """RecordedFMP4Streamが報告した媒体時間進捗を単調増加させる。
+
+        Args:
+            progress: 全媒体処理時間で重み付け済みの0～1進捗。
+
+        Returns:
+            None
+        """
+
+        self._encoding_progress = max(self._encoding_progress, max(0.0, min(1.0, progress)))
+        self._notifyProgress()
+
     async def IterateAssets(self) -> AsyncGenerator[KonomiTVBS4KOfflineAsset]:
         """プレイリスト、init、fragment を再生に必要な順で生成する。
 
@@ -319,19 +390,31 @@ class KonomiTVBS4KOfflineStream:
         """
 
         metadata = self.metadata.model_dump_json().encode('utf-8')
-        yield self.MAGIC
-        yield struct.pack('>I', len(metadata))
-        yield metadata
+        self._planned_asset_count = self.CountPlannedAssets()
+        self._completed_asset_count = 0
+        self._completed_asset_bytes = 0
+        self._encoding_progress = 0.0
+        self._notifyProgress()
+        self.video_stream.setOfflineProgressCallback(self._updateEncodingProgress)
+        try:
+            yield self.MAGIC
+            yield struct.pack('>I', len(metadata))
+            yield metadata
 
-        asset_count = 0
-        total_asset_bytes = 0
-        async for asset in self.IterateAssets():
-            record = self.EncodeAsset(asset)
-            asset_count += 1
-            total_asset_bytes += len(asset.data)
-            yield record
-        logging.info(
-            '[KonomiTVBS4KOfflineStream] Offline stream generation completed. '
-            f'[video_id: {self.metadata.video_id}, assets: {asset_count}, bytes: {total_asset_bytes}]'
-        )
-        yield self.EncodeTerminator(asset_count, total_asset_bytes)
+            async for asset in self.IterateAssets():
+                record = self.EncodeAsset(asset)
+                self._completed_asset_count += 1
+                self._completed_asset_bytes += len(asset.data)
+                self._notifyProgress()
+                yield record
+            # 全アセットの厳密検証と展開が完了した時点だけ生成進捗を100%へ確定する。
+            self._encoding_progress = 1.0
+            self._notifyProgress()
+            logging.info(
+                '[KonomiTVBS4KOfflineStream] Offline stream generation completed. '
+                f'[video_id: {self.metadata.video_id}, assets: {self._completed_asset_count}, '
+                f'bytes: {self._completed_asset_bytes}]'
+            )
+            yield self.EncodeTerminator(self._completed_asset_count, self._completed_asset_bytes)
+        finally:
+            self.video_stream.setOfflineProgressCallback(None)

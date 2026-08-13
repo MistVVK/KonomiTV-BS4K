@@ -60,6 +60,7 @@ from app.routers import (
     VideosRouter,
     VideoStreamsRouter,
 )
+from app.streams.KonomiTVBS4KOfflineJobManager import KonomiTVBS4KOfflineJobManager
 from app.streams.LiveStream import LiveStream
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
@@ -357,6 +358,9 @@ async def Startup():
     # 異常終了した前プロセスが残したfMP4予約キャッシュだけを削除する。
     await RecordedFMP4CacheManager.cleanupStale()
 
+    # HTTP 接続から独立したオフライン保存ジョブを復旧し、完成済みパッケージだけを再公開する。
+    await KonomiTVBS4KOfflineJobManager.initialize()
+
 # サーバー設定で指定された時間 (デフォルト: 15分) ごとに1回、チャンネル情報と番組情報を更新する
 # チャンネル情報は頻繁に変わるわけではないけど、手動で再起動しなくても自動で変更が適用されてほしい
 # 番組情報の更新処理はかなり重くストリーム配信などの他の処理に影響してしまうため、マルチプロセスで実行する
@@ -387,6 +391,13 @@ async def UpdateChannelJikkyoStatus():
 @repeat_every(seconds=1 * 60, wait_first=1 * 60, logger=logging.logger)
 async def CleanupExpiredNiconicoOAuthStates():
     await NiconicoOAuthState.cleanupExpired()
+
+
+# 1時間に1回、端末へ引き渡されず保持期限を超えたオフライン保存パッケージを回収する
+@app.on_event('startup')
+@repeat_every(seconds=60 * 60, wait_first=60 * 60, logger=logging.logger)
+async def CleanupExpiredOfflineJobs():
+    await KonomiTVBS4KOfflineJobManager.cleanupExpired()
 
 # サーバーの終了処理は FastAPI と atexit のどちらから呼ばれても同じ Task を共有する
 _shutdown_completed = False
@@ -444,6 +455,9 @@ async def _RunShutdownCleanup() -> None:
 
     # DB接続が閉じられる前に、HTTP接続から分離した手動CM再判定を中断・回収する。
     await RunCleanupStep('[CMAnalysisTaskManager]', CMAnalysisTaskManager.stop())
+
+    # 録画モデル・fMP4キャッシュを参照する生成ジョブを、DB接続終了前に中断状態へ確定する。
+    await RunCleanupStep('[KonomiTVBS4KOfflineJobManager]', KonomiTVBS4KOfflineJobManager.stop())
 
     # DB接続が閉じられる前に録画再生用インデックスワーカーを停止する。
     await RunCleanupStep('[RecordedPlaybackIndexer]', RecordedPlaybackIndexer.stop())

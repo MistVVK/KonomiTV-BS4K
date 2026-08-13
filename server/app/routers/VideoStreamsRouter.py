@@ -6,16 +6,20 @@ import uuid
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import FileResponse, Response
 from sse_starlette.sse import EventSourceResponse
-from starlette.background import BackgroundTask
 
 from app import logging, schemas
 from app.config import Config
 from app.metadata.RecordedPlaybackIndex import IsRecordedPlaybackIndexReady
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.models.RecordedProgram import RecordedProgram
-from app.streams.KonomiTVBS4KOfflineStream import KonomiTVBS4KOfflineStream
+from app.streams.KonomiTVBS4KOfflineJobManager import (
+    KonomiTVBS4KOfflineJobConflictError,
+    KonomiTVBS4KOfflineJobManager,
+    KonomiTVBS4KOfflineJobNotFoundError,
+    KonomiTVBS4KOfflineJobNotReadyError,
+)
 from app.streams.KonomiTVBS4KPlaybackCapabilities import (
     KonomiTVBS4KPlaybackCapabilityProbe,
 )
@@ -44,10 +48,6 @@ router = APIRouter(
 
 VideoBitDepthQuery = KonomiTVBS4KVideoBitDepthQuery
 
-# 1要求が録画全体を生成するため、upstream と同じくオフライン保存はサーバー全体で3件に制限する。
-OFFLINE_STREAM_SEMAPHORE = asyncio.Semaphore(3)
-
-
 def SetTSCodecBridgeProcessCounterHeaders(response: Response) -> None:
     """互換API隔離の前後で比較するBridge process世代と用途別回数を設定する。"""
 
@@ -72,6 +72,7 @@ def GetRecordedStream(
     stream_quality: StreamQualityWithOptions,
     is_new_session_allowed: bool = False,
     client_key: str = 'unknown',
+    is_offline_continuous: bool = False,
 ) -> RecordedFMP4Stream:
     """FFmpeg 8・fMP4録画視聴セッションを返す。"""
 
@@ -83,6 +84,7 @@ def GetRecordedStream(
             encoding_options=stream_quality.encoding_options,
             is_new_session_allowed=False,
             client_key=client_key,
+            is_offline_continuous=is_offline_continuous,
         )
     if IsRecordedPlaybackIndexReady(
         recorded_program.recorded_video.playback_index_status,
@@ -102,6 +104,7 @@ def GetRecordedStream(
         stream_quality.encoding_options,
         is_new_session_allowed=is_new_session_allowed,
         client_key=client_key,
+        is_offline_continuous=is_offline_continuous,
     )
 
 
@@ -425,14 +428,16 @@ async def ValidateQuality(
 
 
 async def CreateOfflineRecordedStream(
-    request: Request,
+    session_id: str,
+    client_key: str,
     recorded_program: RecordedProgram,
     stream_quality: StreamQualityWithOptions,
 ) -> RecordedFMP4Stream:
     """能力検査済みの独立したオフライン保存セッションを作成する。
 
     Args:
-        request: 接続元ごとの admission control に使う HTTP リクエスト。
+        session_id: 永続ジョブだけが所有する録画再生セッション ID。
+        client_key: 接続元ごとの admission control に使う識別子。
         recorded_program: 保存対象の録画番組。
         stream_quality: 画質・映像 codec・bit depth・音声 codec の生成条件。
 
@@ -440,7 +445,6 @@ async def CreateOfflineRecordedStream(
         RecordedFMP4Stream: 通常再生キャッシュを共有する保存専用セッション。
     """
 
-    session_id = f'offline-{uuid.uuid4().hex}'
     await EnsurePlaybackIndexReady(recorded_program, session_id)
     await ValidateRecordedPlaybackCapabilities(recorded_program, stream_quality)
     return GetRecordedStream(
@@ -448,7 +452,8 @@ async def CreateOfflineRecordedStream(
         recorded_program,
         stream_quality,
         is_new_session_allowed = True,
-        client_key = GetClientKey(request),
+        client_key = client_key,
+        is_offline_continuous = True,
     )
 
 
@@ -470,21 +475,17 @@ def BuildOfflineStreamEstimate(
     video_bitrate = 0
     video_bitrate_max = 0
     if recorded_program.recorded_video.has_video is True:
-        bitrate = RecordedFMP4Stream.getVideoBitrate(
+        bitrate = RecordedFMP4Stream.getOfflineVideoBitrate(
             stream_quality.quality,
             stream_quality.encoding_options.video_codec,
         )
         video_bitrate = int(bitrate.video_bitrate.removesuffix('K'))
         video_bitrate_max = int(bitrate.video_bitrate_max.removesuffix('K'))
 
-    # AAC は実装上192K固定、Opusは1～8chの最大320Kを使い、全レンディション保存を安全側で見積もる。
-    effective_audio_codec = RecordedFMP4Stream.resolveEffectiveAudioCodec(
+    # AAC は 192K 固定、Opus は実チャンネル数の表と全レンディション合計を使う。
+    audio_bitrate = RecordedFMP4Stream.getEstimatedAudioBitrateKbps(
         recorded_program,
         stream_quality.encoding_options.audio_codec,
-    )
-    audio_bitrate_per_rendition = 320 if effective_audio_codec == 'opus' else 192
-    audio_bitrate = audio_bitrate_per_rendition * len(
-        RecordedFMP4Stream.getAudioRenditionsForProgram(recorded_program)
     )
     estimated_size_bytes = math.ceil((video_bitrate + audio_bitrate) * 1000 * duration / 8 * 1.05)
     required_size_bytes = math.ceil((video_bitrate_max + audio_bitrate) * 1000 * duration / 8 * 1.10)
@@ -517,31 +518,33 @@ async def KonomiTVBS4KOfflineStreamEstimateAPI(
     return BuildOfflineStreamEstimate(recorded_program, stream_quality)
 
 
-@router.get(
-    '/{video_id}/{quality}/offline-stream',
-    summary = 'KonomiTV-BS4K 録画番組オフライン保存ストリーム API',
-    response_class = StreamingResponse,
-    responses = {
-        status.HTTP_200_OK: {
-            'description': '保存用プレイリスト・init・fMP4 fragmentを格納したバイナリストリーム。',
-            'content': {'application/octet-stream': {}},
-        },
-        status.HTTP_409_CONFLICT: {
-            'description': '録画中のためオフライン保存を開始できない。',
-        },
-    },
+@router.post(
+    '/{video_id}/{quality}/offline-jobs',
+    summary = 'KonomiTV-BS4K 録画番組オフライン保存生成ジョブ作成 API',
+    response_model = schemas.KonomiTVBS4KOfflineJob,
+    status_code = status.HTTP_202_ACCEPTED,
 )
-async def KonomiTVBS4KOfflineStreamAPI(
+async def KonomiTVBS4KOfflineJobCreateAPI(
     request: Request,
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     quality: Annotated[str, Path(description='映像の品質。ex: 720p-24fps')],
-) -> StreamingResponse:
-    """RecordedFMP4Stream の全再生資産を先頭から生成し、単一応答として返す。"""
+) -> schemas.KonomiTVBS4KOfflineJob:
+    """生成を HTTP 応答から分離し、永続ジョブとして直ちに受け付ける。
+
+    Args:
+        request: 接続元識別子を取得する HTTP リクエスト。
+        recorded_program: ID 検証済みの保存対象録画番組。
+        stream_quality: 能力検証対象となる exact 生成条件。
+        quality: クライアントが指定した画質パス文字列。
+
+    Returns:
+        schemas.KonomiTVBS4KOfflineJob: 永続化済みの Queued ジョブ。
+    """
 
     if recorded_program.recorded_video.status == 'Recording':
         logging.error(
-            '[KonomiTVBS4KOfflineStreamAPI] Recording video cannot be saved for offline playback. '
+            '[KonomiTVBS4KOfflineJobCreateAPI] Recording video cannot be saved for offline playback. '
             f'[video_id: {recorded_program.id}]'
         )
         raise HTTPException(
@@ -549,67 +552,139 @@ async def KonomiTVBS4KOfflineStreamAPI(
             detail = 'Recording video cannot be saved for offline playback',
         )
 
-    # Waiting 表示を維持できるよう、実行枠を取得するまでHTTP応答を開始しない。
-    await OFFLINE_STREAM_SEMAPHORE.acquire()
-    video_stream: RecordedFMP4Stream | None = None
-    try:
-        video_stream = await CreateOfflineRecordedStream(request, recorded_program, stream_quality)
-        metadata = schemas.KonomiTVBS4KOfflineStreamMetadata(
-            video_id = recorded_program.id,
-            file_hash = recorded_program.recorded_video.file_hash,
-            quality = quality,
-            video_codec = stream_quality.encoding_options.video_codec,
-            video_bit_depth = stream_quality.encoding_options.video_bit_depth,
-            requested_audio_codec = stream_quality.encoding_options.audio_codec,
-            audio_codec = video_stream.effective_audio_codec,
+    client_key = GetClientKey(request)
+
+    async def CreateStream(
+        job_id: str,
+    ) -> tuple[RecordedFMP4Stream, schemas.KonomiTVBS4KOfflineStreamMetadata]:
+        """ジョブ実行枠の取得後に専用 fMP4 セッションと固定メタデータを作る。
+
+        Args:
+            job_id: サーバーが払い出した32桁ジョブ ID。
+
+        Returns:
+            tuple[RecordedFMP4Stream, schemas.KonomiTVBS4KOfflineStreamMetadata]:
+                保存専用セッションとパッケージ先頭へ格納する exact メタデータ。
+        """
+
+        video_stream = await CreateOfflineRecordedStream(
+            f'offline-{job_id}',
+            client_key,
+            recorded_program,
+            stream_quality,
         )
-        offline_stream = KonomiTVBS4KOfflineStream(video_stream, metadata)
-    except BaseException:
-        if video_stream is not None:
-            await video_stream.destroy()
-        OFFLINE_STREAM_SEMAPHORE.release()
-        raise
-
-    is_cleaned_up = False
-
-    async def CleanupOfflineStream() -> None:
-        """保存セッションと全体実行枠を最初の1回だけ解放する。"""
-
-        nonlocal is_cleaned_up
-        if is_cleaned_up is True:
-            return
-        is_cleaned_up = True
-        await video_stream.destroy()
-        OFFLINE_STREAM_SEMAPHORE.release()
-
-    async def GenerateOfflineStream():
-        """応答の backpressure 待ち中もセッションを維持してバイナリ本体を生成する。"""
-
-        async def KeepAlive() -> None:
-            """長時間ダウンロード中のセッション破棄タイマーを延長する。"""
-
-            while True:
-                await asyncio.sleep(5)
-                video_stream.keepAlive()
-
-        keep_alive_task = asyncio.create_task(KeepAlive())
         try:
-            async for chunk in offline_stream.Generate():
-                yield chunk
-        finally:
-            keep_alive_task.cancel()
-            await asyncio.gather(keep_alive_task, return_exceptions=True)
-            await CleanupOfflineStream()
+            metadata = schemas.KonomiTVBS4KOfflineStreamMetadata(
+                video_id = recorded_program.id,
+                file_hash = recorded_program.recorded_video.file_hash,
+                quality = quality,
+                video_codec = stream_quality.encoding_options.video_codec,
+                video_bit_depth = stream_quality.encoding_options.video_bit_depth,
+                requested_audio_codec = stream_quality.encoding_options.audio_codec,
+                audio_codec = video_stream.effective_audio_codec,
+            )
+            return video_stream, metadata
+        except BaseException:
+            # ストリーム作成後のメタデータ固定で失敗しても、未所有のセッションを残さない。
+            await video_stream.destroy()
+            raise
 
-    return StreamingResponse(
-        GenerateOfflineStream(),
+    try:
+        return await KonomiTVBS4KOfflineJobManager.createJob(recorded_program.id, CreateStream)
+    except KonomiTVBS4KOfflineJobConflictError as ex:
+        raise HTTPException(
+            status_code = status.HTTP_409_CONFLICT,
+            detail = 'An offline job is already active for this video',
+        ) from ex
+
+
+@router.get(
+    '/{video_id}/offline-jobs/{job_id}',
+    summary = 'KonomiTV-BS4K 録画番組オフライン保存生成ジョブ取得 API',
+    response_model = schemas.KonomiTVBS4KOfflineJob,
+)
+async def KonomiTVBS4KOfflineJobStatusAPI(
+    video_id: Annotated[int, Path(description='録画番組の ID 。', ge=1)],
+    job_id: Annotated[str, Path(description='オフライン保存生成ジョブ ID。', pattern=r'^[0-9a-f]{32}$')],
+) -> schemas.KonomiTVBS4KOfflineJob:
+    """元録画が削除された後も、完成済みパッケージの永続ジョブ状態を返す。
+
+    Args:
+        video_id: ジョブ所有対象の録画番組 ID。
+        job_id: 取得するサーバー側ジョブ ID。
+
+    Returns:
+        schemas.KonomiTVBS4KOfflineJob: 現在の永続ジョブ状態。
+    """
+
+    try:
+        return await KonomiTVBS4KOfflineJobManager.getJob(video_id, job_id)
+    except KonomiTVBS4KOfflineJobNotFoundError as ex:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Offline job was not found') from ex
+
+
+@router.get(
+    '/{video_id}/offline-jobs/{job_id}/download',
+    summary = 'KonomiTV-BS4K 録画番組オフライン保存完成パッケージ API',
+    response_class = FileResponse,
+)
+async def KonomiTVBS4KOfflineJobDownloadAPI(
+    video_id: Annotated[int, Path(description='録画番組の ID 。', ge=1)],
+    job_id: Annotated[str, Path(description='オフライン保存生成ジョブ ID。', pattern=r'^[0-9a-f]{32}$')],
+) -> FileResponse:
+    """Ready 後の不変パッケージだけを正確な Content-Length 付きで返す。
+
+    Args:
+        video_id: ジョブ所有対象の録画番組 ID。
+        job_id: ダウンロードするサーバー側ジョブ ID。
+
+    Returns:
+        FileResponse: atomic 公開済みパッケージの固定長応答。
+    """
+
+    try:
+        package_path, package_size = await KonomiTVBS4KOfflineJobManager.getDownloadPath(video_id, job_id)
+    except KonomiTVBS4KOfflineJobNotFoundError as ex:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Offline job was not found') from ex
+    except KonomiTVBS4KOfflineJobNotReadyError as ex:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Offline package is not ready') from ex
+    return FileResponse(
+        package_path,
         media_type = 'application/octet-stream',
+        filename = f'konomitv-offline-{video_id}-{job_id}.bin',
         headers = {
             'Cache-Control': 'no-store',
+            'Content-Length': str(package_size),
             'X-Content-Type-Options': 'nosniff',
         },
-        background = BackgroundTask(CleanupOfflineStream),
     )
+
+
+@router.delete(
+    '/{video_id}/offline-jobs/{job_id}',
+    summary = 'KonomiTV-BS4K 録画番組オフライン保存生成ジョブ削除 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+    response_class = Response,
+)
+async def KonomiTVBS4KOfflineJobDeleteAPI(
+    video_id: Annotated[int, Path(description='録画番組の ID 。', ge=1)],
+    job_id: Annotated[str, Path(description='オフライン保存生成ジョブ ID。', pattern=r'^[0-9a-f]{32}$')],
+) -> Response:
+    """生成中なら中止し、Ready パッケージを含む指定ジョブだけを回収する。
+
+    Args:
+        video_id: ジョブ所有対象の録画番組 ID。
+        job_id: 削除するサーバー側ジョブ ID。
+
+    Returns:
+        Response: 本体を持たない204応答。
+    """
+
+    try:
+        await KonomiTVBS4KOfflineJobManager.deleteJob(video_id, job_id)
+    except KonomiTVBS4KOfflineJobNotFoundError as ex:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Offline job was not found') from ex
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get(

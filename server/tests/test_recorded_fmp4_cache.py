@@ -35,6 +35,24 @@ def test_recorded_fmp4_pipeline_revision_changes_digest_without_changing_layout(
     assert RecordedFMP4CacheManager.isCacheFileName(layout_v1_cache_name) is True
 
 
+def test_recorded_fmp4_variant_separates_playback_and_offline_delivery_modes() -> None:
+    """同じ生成条件でも通常再生とオフライン保存のcache digestを分離する。"""
+
+    playback = RecordedFMP4Variant('720p', 'av1', 10, False, 'FFmpeg', 0, 0)
+    offline = RecordedFMP4Variant(
+        '720p',
+        'av1',
+        10,
+        False,
+        'FFmpeg',
+        0,
+        0,
+        delivery_mode='Offline',
+    )
+
+    assert playback.digest() != offline.digest()
+
+
 def test_recorded_fmp4_reserved_file_name_is_strict() -> None:
     """予約形式だけを除外し、一般MP4や部分一致を誤除外しないことを確認する。"""
 

@@ -28,7 +28,7 @@ class RecordedFMP4Variant:
 
     # 生成パイプラインの変更時にこの値を上げ、互換性のない旧キャッシュとの衝突を防ぐ。
     # キャッシュの配置形式は変わらないため、LAYOUT_VERSION とは独立した内部改訂値とする。
-    PIPELINE_REVISION: ClassVar[int] = 3
+    PIPELINE_REVISION: ClassVar[int] = 6
 
     quality: str
     codec: str
@@ -38,6 +38,9 @@ class RecordedFMP4Variant:
     configuration_generation: int
     seek_generation: int
     rendition: str | None = None
+    # 通常再生とオフライン保存では映像ビットレートと音声の連続生成単位が異なるため、
+    # 同じ画質・codecでも生成物を相互流用しないよう配信用途をdigestへ含める。
+    delivery_mode: Literal['Playback', 'Offline'] = 'Playback'
 
     def digest(self) -> str:
         """フィールド順に依存しない安定した短縮SHA-256を返す。"""

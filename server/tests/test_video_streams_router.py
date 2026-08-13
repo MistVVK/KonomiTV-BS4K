@@ -1,6 +1,7 @@
 import asyncio
 import json
 import struct
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated, cast
 
@@ -20,14 +21,19 @@ from app.routers.VideoStreamsRouter import (
     BuildOfflineStreamEstimate,
     EnsurePlaybackIndexReady,
     GetRecordedStream,
+    KonomiTVBS4KOfflineJobDownloadAPI,
     RecordedSubtitleARIBTTMLAPI,
 )
+from app.routers.VideoStreamsRouter import (
+    router as video_streams_router,
+)
+from app.streams.KonomiTVBS4KOfflineJobManager import KonomiTVBS4KOfflineJobManager
 from app.streams.KonomiTVBS4KOfflineStream import (
     KonomiTVBS4KOfflineAsset,
     KonomiTVBS4KOfflineStream,
 )
 from app.streams.RecordedEncodingCodecs import AudioCodec
-from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
+from app.streams.RecordedFMP4Stream import RecordedFMP4Segment, RecordedFMP4Stream
 from app.streams.StreamEncodingOptions import StreamEncodingOptions
 
 
@@ -367,6 +373,41 @@ def test_offline_asset_record_and_terminator_are_length_delimited() -> None:
     assert record[offset:] == b'fragment'
     assert KonomiTVBS4KOfflineStream.EncodeTerminator(7, 1234) == struct.pack('>HIQ', 0xffff, 7, 1234)
 
+
+def test_offline_planned_asset_count_includes_playlists_inits_and_fragments() -> None:
+    """映像1世代・音声1レンディションの保存アセット数を固定する。"""
+
+    segments = (
+        RecordedFMP4Segment(sequence=0, start_time=0.0, duration=6.0, generation=0, audio_generation=0),
+        RecordedFMP4Segment(sequence=1, start_time=6.0, duration=6.0, generation=0, audio_generation=0),
+    )
+    stream = object.__new__(KonomiTVBS4KOfflineStream)
+    stream.video_stream = SimpleNamespace(
+        getSegments=lambda: segments,
+        getAudioRenditions=lambda: [SimpleNamespace(id='1')],
+        recorded_program=SimpleNamespace(recorded_video=SimpleNamespace(has_video=True)),
+    )
+    # master + video playlist + video init + 2 video + audio playlist + audio init + 2 audio
+    assert stream.CountPlannedAssets() == 9
+
+
+def test_offline_progress_callback_reports_monotonic_generation() -> None:
+    """媒体時間とアセット数を合成した進捗を所有ジョブのコールバックへ通知する。"""
+
+    stream = object.__new__(KonomiTVBS4KOfflineStream)
+    stream._planned_asset_count = 10
+    stream._completed_asset_count = 4
+    stream._completed_asset_bytes = 4000
+    stream._encoding_progress = 0.5
+    snapshots = []
+    stream._progress_callback = snapshots.append
+    stream._notifyProgress()
+    snapshot = snapshots[-1]
+    assert snapshot.active is True
+    assert snapshot.completed_assets == 4
+    assert snapshot.total_assets == 10
+    assert snapshot.progress == pytest.approx(0.495)
+
     for invalid_path in ('../secret', '/absolute', 'video//0.m4s', 'video/0.m4s?token=x'):
         with pytest.raises(ValueError):
             KonomiTVBS4KOfflineStream.EncodeAsset(KonomiTVBS4KOfflineAsset(
@@ -376,10 +417,23 @@ def test_offline_asset_record_and_terminator_are_length_delimited() -> None:
             ))
 
 
-def test_offline_estimate_counts_all_audio_renditions(monkeypatch: pytest.MonkeyPatch) -> None:
-    """容量見積もりは映像と全音声レンディションの帯域を含める。"""
+def _BuildOfflineEstimateProgram(audio_track: dict[str, object]) -> SimpleNamespace:
+    """オフライン容量見積もりテスト用の録画番組を組み立てる。"""
 
-    audio_track = {
+    return SimpleNamespace(recorded_video=SimpleNamespace(
+        id=1,
+        duration=60.0,
+        has_video=True,
+        container_format='MP4',
+        audio_tracks=[audio_track],
+        audio_track_timeline=[{'start_time': 0.0, 'end_time': 60.0, 'tracks': [audio_track]}],
+    ))
+
+
+def test_offline_estimate_counts_all_audio_renditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """容量見積もりは Dual Mono を主/副の実 1ch Opus として合計する。"""
+
+    recorded_program = _BuildOfflineEstimateProgram({
         'index': 1,
         'stream_index': 1,
         'codec': 'AAC-LC',
@@ -388,29 +442,63 @@ def test_offline_estimate_counts_all_audio_renditions(monkeypatch: pytest.Monkey
         'language': 'ja+en',
         'channel_layout': 'stereo',
         'is_dual_mono': True,
-    }
-    recorded_program = SimpleNamespace(recorded_video=SimpleNamespace(
-        id=1,
-        duration=60.0,
-        has_video=True,
-        container_format='MP4',
-        audio_tracks=[audio_track],
-        audio_track_timeline=[{'start_time': 0.0, 'end_time': 60.0, 'tracks': [audio_track]}],
-    ))
+    })
     stream_quality = SimpleNamespace(
         quality='720p',
         encoding_options=SimpleNamespace(video_codec='av1', audio_codec='opus'),
     )
     monkeypatch.setattr(
         RecordedFMP4Stream,
-        'getVideoBitrate',
+        'getOfflineVideoBitrate',
         lambda _quality, _codec: SimpleNamespace(video_bitrate='1000K', video_bitrate_max='1500K'),
     )
 
     estimate = BuildOfflineStreamEstimate(recorded_program, stream_quality)
 
-    assert estimate.estimated_size_bytes == 12_915_000
-    assert estimate.required_size_bytes == 17_655_000
+    assert estimate.estimated_size_bytes == 8_883_000
+    assert estimate.required_size_bytes == 13_431_001
+
+
+@pytest.mark.parametrize(('channel', 'channel_layout', 'audio_codec', 'estimated', 'required'), [
+    ('Stereo', 'stereo', 'opus', 8_883_000, 13_431_001),
+    ('Stereo', 'stereo', 'aac', 9_387_000, 13_959_001),
+    ('5.1ch', '5.1', 'opus', 9_891_000, 14_487_001),
+    ('5.1ch', '5.1', 'aac', 9_387_000, 13_959_001),
+])
+def test_offline_estimate_uses_actual_channel_opus_bitrate(
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+    channel_layout: str,
+    audio_codec: str,
+    estimated: int,
+    required: int,
+) -> None:
+    """容量見積もりは Opus を実チャンネル数の表で積み、AAC は 192K 固定にする。"""
+
+    recorded_program = _BuildOfflineEstimateProgram({
+        'index': 1,
+        'stream_index': 1,
+        'codec': 'AAC-LC',
+        'channel': channel,
+        'sampling_rate': 48_000,
+        'language': 'ja',
+        'channel_layout': channel_layout,
+        'is_dual_mono': False,
+    })
+    stream_quality = SimpleNamespace(
+        quality='720p',
+        encoding_options=SimpleNamespace(video_codec='av1', audio_codec=audio_codec),
+    )
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        'getOfflineVideoBitrate',
+        lambda _quality, _codec: SimpleNamespace(video_bitrate='1000K', video_bitrate_max='1500K'),
+    )
+
+    estimate = BuildOfflineStreamEstimate(recorded_program, stream_quality)
+
+    assert estimate.estimated_size_bytes == estimated
+    assert estimate.required_size_bytes == required
 
 
 def test_offline_metadata_json_preserves_exact_encoding_tuple() -> None:
@@ -429,3 +517,41 @@ def test_offline_metadata_json_preserves_exact_encoding_tuple() -> None:
     encoded = json.dumps(metadata).encode('utf-8')
 
     assert json.loads(encoded) == metadata
+
+
+def test_offline_job_routes_replace_live_generation_stream() -> None:
+    """生成受付・状態・完成物・削除 API を公開し、旧ライブ生成応答を残さない。"""
+
+    method_paths = {
+        (method, route.path)
+        for route in video_streams_router.routes
+        for method in (route.methods or set())
+    }
+    prefix = '/api/streams/video'
+    assert ('POST', f'{prefix}/{{video_id}}/{{quality}}/offline-jobs') in method_paths
+    assert ('GET', f'{prefix}/{{video_id}}/offline-jobs/{{job_id}}') in method_paths
+    assert ('GET', f'{prefix}/{{video_id}}/offline-jobs/{{job_id}}/download') in method_paths
+    assert ('DELETE', f'{prefix}/{{video_id}}/offline-jobs/{{job_id}}') in method_paths
+    assert ('GET', f'{prefix}/{{video_id}}/{{quality}}/offline-stream') not in method_paths
+
+
+def test_offline_job_download_uses_exact_completed_package_size(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """download API は生成を起動せず、Ready ファイルの正確な Content-Length を返す。"""
+
+    package_path = tmp_path / 'ready.package'
+    package_path.write_bytes(b'completed-package')
+
+    async def GetDownloadPath(_cls, video_id: int, job_id: str) -> tuple[Path, int]:
+        assert video_id == 42
+        assert job_id == 'a' * 32
+        return package_path, package_path.stat().st_size
+
+    monkeypatch.setattr(KonomiTVBS4KOfflineJobManager, 'getDownloadPath', classmethod(GetDownloadPath))
+    response = asyncio.run(KonomiTVBS4KOfflineJobDownloadAPI(42, 'a' * 32))
+
+    assert response.path == package_path
+    assert response.headers['content-length'] == str(package_path.stat().st_size)
+    assert response.headers['cache-control'] == 'no-store'
