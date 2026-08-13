@@ -86,6 +86,7 @@ Docker Linux オンリーとする。
   - 公開・Main 例: `COMPOSE_FILE=compose.yaml` に必要なら `compose.intel-amd.yaml` / `compose.nvidia.yaml` を連結
 - 公開・Main 用の `compose.yaml` に Development の状態を上書きする運用は行わない。
 - Development は `verified-runtime` target を使用する。通常のコード変更を未検証の `runtime` target だけで起動してはいけない。
+- コード変更を Development で確認する必要があるときは、ユーザーへ再ビルド・再作成・再起動を依頼せず、エージェントが自ら実行する。
 - ビルド中は既存の Development コンテナを稼働させ、ビルド成功後にコンテナだけを再作成して停止時間を最小化する。
 - Development のビルドには次のコマンドを使用する（`.env` の `COMPOSE_FILE` が効く前提）。
 

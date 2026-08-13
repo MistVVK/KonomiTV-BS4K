@@ -43,8 +43,8 @@
 - このリポジトリのワークツリーを、Development イメージのビルドコンテキスト兼 Compose project の起点として使用します
 - Development 固有の設定・データ・ログ・録画ミラー・キャプチャは `docker/development/state/` 以下へ隔離します
 - コンテナ内の実行コードはイメージに格納されています。ホストのソースツリーは参照用の read-only bind であり、コード変更は hot reload されません
-- コード変更を反映するときは、検証付き Development イメージをビルドしてから Development コンテナだけを再作成します
-- エージェントは必要な動作確認のために Development 環境をビルド・再作成できますが、事前確認と状態保護に関する `AGENTS-BS4K.md` の手順を省略してはいけません
+- コード変更を Development で確認するときは、ユーザーに再ビルドや再作成を依頼せず、エージェントが検証付き Development イメージをビルドしてから Development コンテナだけを再作成する
+- Development のビルド・再作成・再起動はエージェントの通常作業である。事前確認と状態保護に関する `AGENTS-BS4K.md` の手順は省略してはいけない
 
 ### ブラウザ検証
 
