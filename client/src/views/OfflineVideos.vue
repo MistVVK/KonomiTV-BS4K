@@ -49,7 +49,7 @@
 </template>
 <script lang="ts" setup>
 
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
 import Breadcrumbs from '@/components/Breadcrumbs.vue';
 import HeaderBar from '@/components/HeaderBar.vue';
@@ -67,8 +67,8 @@ const storageUsageBytes = ref(0);
 const storageQuotaBytes = ref(0);
 const isLoading = ref(true);
 let isRefreshing = false;
+let refreshRevision = 0;
 
-const activeJobs = computed(() => jobs.value.filter(job => ['Waiting', 'Downloading', 'Finalizing'].includes(job.state)));
 const visibleOfflineJobs = computed(() => jobs.value.filter(job =>
     ['Waiting', 'Downloading', 'Finalizing', 'Failed'].includes(job.state),
 ));
@@ -95,94 +95,33 @@ const displayPrograms = computed((): IRecordedProgram[] => {
 
 const displayTotal = computed(() => displayPrograms.value.length);
 
-/** Background Fetch の受信量をジョブ配列へ反映する */
-const applyBackgroundFetchProgress = async (targetJobs: IOfflineDownloadJob[]): Promise<void> => {
-    if ('serviceWorker' in navigator === false) return;
-
-    const registration = await navigator.serviceWorker.getRegistration();
-    const backgroundFetchManager = registration?.backgroundFetch;
-    if (backgroundFetchManager === undefined) return;
-
-    await Promise.all(targetJobs.map(async (job) => {
-        // 応答展開中の Finalizing はブラウザの受信進捗で Downloading へ戻さない
-        if (job.background_fetch_id === null || ['Waiting', 'Downloading'].includes(job.state) === false) return;
-        const backgroundFetch = await backgroundFetchManager.get(job.background_fetch_id);
-        if (backgroundFetch === undefined) return;
-
-        // IndexedDB 側は Background Fetch 中ほぼ更新されないため、表示中の値より小さく戻さない
-        job.downloaded_bytes = Math.max(job.downloaded_bytes, backgroundFetch.downloaded);
-        job.state = job.downloaded_bytes > 0 ? 'Downloading' : 'Waiting';
-    }));
-};
-
-/** 実行中ジョブの進捗を IndexedDB と Background Fetch から既存配列へ反映する */
-const refreshActiveJobProgress = async (): Promise<void> => {
-    if (activeJobs.value.length === 0) return;
-    try {
-        const latestJobs = await OfflineVideos.getJobs();
-        let needsFullRefresh = false;
-
-        const registration = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : undefined;
-        const backgroundFetchManager = registration?.backgroundFetch;
-
-        for (const job of activeJobs.value) {
-            const latestJob = latestJobs.find(candidate => candidate.job_id === job.job_id);
-
-            // 完了・キャンセル時はジョブ自体を削除するため、IndexedDB から消えていれば一覧全体を読み直す
-            if (latestJob === undefined || ['Waiting', 'Downloading', 'Finalizing'].includes(latestJob.state) === false) {
-                needsFullRefresh = true;
-                continue;
-            }
-
-            // 非同期取得の途中で Waiting を画面へ反映せず、受信量と状態を確定してからまとめて更新する
-            let nextDownloadedBytes = Math.max(job.downloaded_bytes, latestJob.downloaded_bytes);
-            let nextState = latestJob.state;
-
-            // Background Fetch 中はブラウザ側の受信量の方が進んでいることが多い
-            if (latestJob.background_fetch_id !== null && backgroundFetchManager !== undefined &&
-                ['Waiting', 'Downloading'].includes(latestJob.state) === true) {
-                const backgroundFetch = await backgroundFetchManager.get(latestJob.background_fetch_id);
-                if (backgroundFetch === undefined) {
-                    needsFullRefresh = true;
-                    continue;
-                }
-                nextDownloadedBytes = Math.max(nextDownloadedBytes, backgroundFetch.downloaded);
-                nextState = nextDownloadedBytes > 0 ? 'Downloading' : 'Waiting';
-            }
-
-            // 関連する表示値を同じ同期処理内で代入し、状態ラベルとプログレスバーの中間表示を防ぐ
-            job.downloaded_bytes = nextDownloadedBytes;
-            job.state = nextState;
-            job.error = latestJob.error;
-        }
-
-        if (needsFullRefresh === true) {
-            await refresh();
-        }
-    } catch (error) {
-        console.error('[OfflineVideos] Failed to refresh active offline job progress:', error);
-    }
-};
-
 /** 保存済み動画、保存ジョブ、ブラウザ容量を IndexedDB と Storage API から読み直す */
 const refresh = async (): Promise<void> => {
-    if (isRefreshing === true) return;
+    // 保存確定と一覧読み取りが重なると、動画一覧は確定前・ジョブ一覧は確定後という組み合わせを
+    // 読み取る可能性がある。処理中の change 通知を捨てず、現在の読み取り後に必ず再実行する。
+    if (isRefreshing === true) {
+        refreshRevision += 1;
+        return;
+    }
     isRefreshing = true;
     try {
-        const nextVideos = await OfflineVideos.getVideos();
-        const nextJobs = await OfflineVideos.getJobs();
+        let processedRevision: number;
+        do {
+            processedRevision = refreshRevision;
+            try {
+                const nextVideos = await OfflineVideos.getVideos();
+                const nextJobs = await OfflineVideos.getJobs();
 
-        // jobs.value 代入前に Background Fetch 進捗を取り込み、0 バイト表示の中間フレームを出さない
-        await applyBackgroundFetchProgress(nextJobs);
-
-        videos.value = nextVideos;
-        jobs.value = nextJobs;
-        const storageEstimate = await navigator.storage.estimate();
-        storageUsageBytes.value = storageEstimate.usage ?? 0;
-        storageQuotaBytes.value = storageEstimate.quota ?? 0;
-    } catch (error) {
-        // 保存領域の読み取り失敗はログに残し、Promise の拒否を未処理のまま残さない
-        console.error('[OfflineVideos] Failed to refresh offline video data:', error);
+                videos.value = nextVideos;
+                jobs.value = nextJobs;
+                const storageEstimate = await navigator.storage.estimate();
+                storageUsageBytes.value = storageEstimate.usage ?? 0;
+                storageQuotaBytes.value = storageEstimate.quota ?? 0;
+            } catch (error) {
+                // 保存領域の読み取り失敗はログに残し、Promise の拒否を未処理のまま残さない
+                console.error('[OfflineVideos] Failed to refresh offline video data:', error);
+            }
+        } while (processedRevision !== refreshRevision);
     } finally {
         isLoading.value = false;
         isRefreshing = false;
@@ -211,24 +150,12 @@ const dismissJob = async (jobID: string): Promise<void> => {
     }
 };
 
-// 保存処理のイベントに加え、Background Fetch の進捗も画面表示中だけ定期的に読み直す
-let refreshTimerID: number | null = null;
-watch(() => activeJobs.value.length > 0, (hasActiveJobs) => {
-    // Background Fetch 進捗だけを1秒おきに反映し、IndexedDB 全読み直しによる UI の巻き戻りを避ける
-    if (hasActiveJobs === true && refreshTimerID === null) {
-        refreshTimerID = window.setInterval(refreshActiveJobProgress, 1000);
-    } else if (hasActiveJobs === false && refreshTimerID !== null) {
-        window.clearInterval(refreshTimerID);
-        refreshTimerID = null;
-    }
-});
 onMounted(() => {
     OfflineVideos.eventTarget.addEventListener('change', refresh);
     void refresh();
 });
 onBeforeUnmount(() => {
     OfflineVideos.eventTarget.removeEventListener('change', refresh);
-    if (refreshTimerID !== null) window.clearInterval(refreshTimerID);
 });
 
 </script>

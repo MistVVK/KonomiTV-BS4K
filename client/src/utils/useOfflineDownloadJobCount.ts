@@ -5,7 +5,6 @@ import OfflineVideos from '@/services/OfflineVideos';
 /** 処理中のオフライン保存ジョブ件数を監視して返す */
 export function useOfflineDownloadJobCount(): { activeJobCount: Ref<number> } {
     const activeJobCount = ref(0);
-    let refreshTimerID: number | null = null;
     let isRefreshing = false;
 
     /** IndexedDB の保存ジョブから表示する処理中件数を取得する */
@@ -26,13 +25,11 @@ export function useOfflineDownloadJobCount(): { activeJobCount: Ref<number> } {
 
     onMounted(() => {
         OfflineVideos.eventTarget.addEventListener('change', refresh);
-        // Service Worker 側の完了はページ側 EventTarget へ届かないため、表示中だけ低頻度で状態を読み直す
-        refreshTimerID = window.setInterval(refresh, 2000);
+        // Service Worker と別タブの更新も共通 BroadcastChannel から届くため、画面固有タイマーは持たない。
         void refresh();
     });
     onBeforeUnmount(() => {
         OfflineVideos.eventTarget.removeEventListener('change', refresh);
-        if (refreshTimerID !== null) window.clearInterval(refreshTimerID);
     });
 
     return { activeJobCount };

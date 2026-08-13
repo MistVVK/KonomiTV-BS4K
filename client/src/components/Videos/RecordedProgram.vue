@@ -177,8 +177,10 @@
                 </v-menu>
             </div>
         </div>
-        <div v-if="offlineDownloadProgress !== null" class="recorded-program__offline-progress">
-            <div class="recorded-program__offline-progress-bar" :style="`width: ${offlineDownloadProgress}%`"></div>
+        <div v-if="isOfflineJobActive" class="recorded-program__offline-progress">
+            <div v-if="offlineDownloadProgress !== null && offlineDownloadProgress >= 0.1"
+                class="recorded-program__offline-progress-bar" :style="`width: ${offlineDownloadProgress}%`"></div>
+            <div v-else class="recorded-program__offline-progress-bar recorded-program__offline-progress-bar--indeterminate"></div>
         </div>
     </component>
     <RecordedFileInfoDialog :program="program" v-model:show="show_video_info" />
@@ -436,9 +438,10 @@ const thumbnailURL = computed(() => {
     }
     return `${Utils.api_base_url}/videos/${props.program.id}/thumbnail`;
 });
-const isOfflineJobActive = computed(() => props.offlineDownloadJob !== null &&
+// 保存ジョブの状態は専用のオフライン保存一覧だけに表示し、通常の録画一覧へ進捗や失敗結果を混ぜない
+const isOfflineJobActive = computed(() => props.forOffline && props.offlineDownloadJob !== null &&
     ['Waiting', 'Downloading', 'Finalizing'].includes(props.offlineDownloadJob.state));
-const isOfflineJobFailed = computed(() => props.offlineDownloadJob?.state === 'Failed');
+const isOfflineJobFailed = computed(() => props.forOffline && props.offlineDownloadJob?.state === 'Failed');
 const isOfflineInteractionBlocked = computed(() => props.forOffline && props.offlineVideo === null &&
     (isOfflineJobActive.value || isOfflineJobFailed.value));
 const rootTag = computed(() => isOfflineInteractionBlocked.value ? 'div' : 'router-link');
@@ -448,9 +451,15 @@ const rootBindings = computed(() => rootTag.value === 'router-link' ? {
         {path: ''},
 } : {});
 const offlineDownloadStateLabel = computed(() => {
-    const labels = {Waiting: '待機中', Downloading: 'ダウンロード中', Finalizing: '保存処理中'} as const;
-    return props.offlineDownloadJob !== null && props.offlineDownloadJob.state in labels ?
-        labels[props.offlineDownloadJob.state as keyof typeof labels] : '';
+    const labels = {
+        Queued: '生成待機中',
+        Preparing: '生成準備中',
+        Encoding: '映像・音声生成中',
+        Packaging: '検証・梱包中',
+        Downloading: 'ダウンロード中',
+        Finalizing: '端末へ保存中',
+    } as const;
+    return props.offlineDownloadJob !== null ? labels[props.offlineDownloadJob.phase] : '';
 });
 const offlineQualityLabel = computed(() => {
     const quality = props.offlineDownloadJob?.quality ?? props.offlineVideo?.quality ?? null;
@@ -464,10 +473,8 @@ const offlineSizeLabel = computed(() => {
     return null;
 });
 const offlineDownloadProgress = computed(() => {
-    if (isOfflineJobActive.value === false || props.offlineDownloadJob === null ||
-        props.offlineDownloadJob.estimated_size_bytes <= 0) return null;
-    return Math.min(99, props.offlineDownloadJob.downloaded_bytes /
-        props.offlineDownloadJob.estimated_size_bytes * 100);
+    if (isOfflineJobActive.value === false || props.offlineDownloadJob === null) return null;
+    return Math.min(99.9, Math.max(0, props.offlineDownloadJob.progress * 100));
 });
 const cancelOfflineDownload = (): void => {
     if (props.offlineDownloadJob !== null) emit('cancelOfflineJob', props.offlineDownloadJob.job_id);
@@ -1021,12 +1028,18 @@ const deleteVideo = async () => {
         bottom: 0;
         left: 0;
         height: 3px;
+        overflow: hidden;
         background: rgba(0, 0, 0, 0.35);
 
         &-bar {
             height: 100%;
             background: rgb(var(--v-theme-secondary-lighten-1));
             transition: width 0.2s ease;
+
+            &--indeterminate {
+                width: 30%;
+                animation: recorded-program-offline-progress 1.2s ease-in-out infinite;
+            }
         }
     }
 
@@ -1075,6 +1088,11 @@ const deleteVideo = async () => {
     0% { opacity: 0; }
     50% { opacity: 1; }
     100% { opacity: 0; }
+}
+
+@keyframes recorded-program-offline-progress {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(400%); }
 }
 
 @keyframes playback-index-spin {

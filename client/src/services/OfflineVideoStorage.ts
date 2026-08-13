@@ -22,6 +22,17 @@ export default class OfflineVideoStorage {
 
     static readonly eventTarget = new EventTarget();
 
+    /** IndexedDB を共有する別タブへ、ジョブ・動画状態の変更を即時通知する。 */
+    private static readonly broadcastChannel = typeof BroadcastChannel !== 'undefined'
+        ? new BroadcastChannel('konomitv-bs4k-offline-video-storage')
+        : null;
+
+    static {
+        this.broadcastChannel?.addEventListener('message', () => {
+            this.eventTarget.dispatchEvent(new Event('change'));
+        });
+    }
+
     /** Service Worker が CacheStorage から返す保存済み HLS の URL プレフィックス */
     static readonly LOCAL_OFFLINE_VIDEOS_PATH_PREFIX = '/local/offline-videos/';
 
@@ -32,6 +43,12 @@ export default class OfflineVideoStorage {
     private static readonly CACHE_NAME = 'KonomiTV-BS4K-OfflineVideos';
     private static readonly GENERATION_URL_PATTERN = /\/local\/offline-videos\/(\d+)\/([^/]+)\//;
     private static databasePromise: Promise<IDBPDatabase<IOfflineVideoDB>> | null = null;
+
+    /** 同一コンテキストと別タブの双方へ、確定済み状態の再読込を通知する。 */
+    private static notifyChange(): void {
+        this.eventTarget.dispatchEvent(new Event('change'));
+        this.broadcastChannel?.postMessage('change');
+    }
 
     /**
      * 保存日時が新しい順に、欠損のない保存済み動画を取得する。
@@ -76,7 +93,7 @@ export default class OfflineVideoStorage {
             const database = await this.openDatabase();
             await database.delete(this.VIDEO_STORE_NAME, video.video_id);
             await this.deleteGeneration(video.video_id, video.generation_id);
-            this.eventTarget.dispatchEvent(new Event('change'));
+            this.notifyChange();
             return null;
         }
         return video;
@@ -142,7 +159,7 @@ export default class OfflineVideoStorage {
         }
         await transaction.store.put(job);
         await transaction.done;
-        this.eventTarget.dispatchEvent(new Event('change'));
+        this.notifyChange();
     }
 
     /** 実行中のジョブだけを更新する */
@@ -156,9 +173,29 @@ export default class OfflineVideoStorage {
             await transaction.done;
             return false;
         }
+
+        // coordinator と Service Worker が同時更新しても、Finalizing を Downloading へ戻さない。
+        const stateRanks: Record<IOfflineDownloadJob['state'], number> = {
+            Waiting: 0,
+            Downloading: 1,
+            Finalizing: 2,
+            Failed: 3,
+            Cancelled: 3,
+        };
+        if (stateRanks[latestJob.state] > stateRanks[job.state]) {
+            await transaction.done;
+            return true;
+        }
+
+        // 同じ工程の別コンテキスト更新では、受信量と全体進捗を必ず大きい側へ統合する。
+        job.downloaded_bytes = Math.max(job.downloaded_bytes, latestJob.downloaded_bytes);
+        job.progress = Math.max(job.progress ?? 0, latestJob.progress ?? 0);
+        job.total_assets = Math.max(job.total_assets ?? 0, latestJob.total_assets ?? 0);
+        job.package_size_bytes ??= latestJob.package_size_bytes ?? null;
+        job.server_job_id ??= latestJob.server_job_id ?? null;
         await transaction.store.put(job);
         await transaction.done;
-        this.eventTarget.dispatchEvent(new Event('change'));
+        this.notifyChange();
         return true;
     }
 
@@ -177,7 +214,7 @@ export default class OfflineVideoStorage {
         // 完成後の状態は videos ストアが正本になるため、番組スナップショットを含むジョブを重複保持しない
         await transaction.objectStore(this.JOB_STORE_NAME).delete(job.job_id);
         await transaction.done;
-        this.eventTarget.dispatchEvent(new Event('change'));
+        this.notifyChange();
         return true;
     }
 
@@ -200,7 +237,7 @@ export default class OfflineVideoStorage {
         job.error = error;
         await transaction.store.put(job);
         await transaction.done;
-        this.eventTarget.dispatchEvent(new Event('change'));
+        this.notifyChange();
         return job;
     }
 
@@ -209,14 +246,14 @@ export default class OfflineVideoStorage {
         await this.deleteGeneration(video.video_id, video.generation_id);
         const database = await this.openDatabase();
         await database.delete(this.VIDEO_STORE_NAME, video.video_id);
-        this.eventTarget.dispatchEvent(new Event('change'));
+        this.notifyChange();
     }
 
     /** 終端状態の保存ジョブを IndexedDB から削除する */
     static async deleteJob(jobID: string): Promise<void> {
         const database = await this.openDatabase();
         await database.delete(this.JOB_STORE_NAME, jobID);
-        this.eventTarget.dispatchEvent(new Event('change'));
+        this.notifyChange();
     }
 
     /** 有効な保存世代と実行中ジョブから参照されない CacheStorage の断片を削除する */
@@ -367,6 +404,6 @@ export default class OfflineVideoStorage {
         await transaction.store.delete(video.video_id);
         await transaction.done;
         await this.deleteGeneration(video.video_id, video.generation_id);
-        this.eventTarget.dispatchEvent(new Event('change'));
+        this.notifyChange();
     }
 }

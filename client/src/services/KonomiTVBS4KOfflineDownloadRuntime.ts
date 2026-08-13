@@ -34,6 +34,11 @@ export default class KonomiTVBS4KOfflineDownloadRuntime {
             throw new Error('保存ジョブまたはレスポンス本体が見つかりません。');
         }
         job.state = 'Downloading';
+        job.phase = 'Downloading';
+        job.progress = Math.max(Number.isFinite(job.progress) ? job.progress : 0, 0.8);
+        job.total_assets ??= 0;
+        job.package_size_bytes ??= null;
+        job.server_job_id ??= null;
         if (await OfflineVideoStorage.updateActiveJob(job) === false) {
             throw new Error('オフライン保存ジョブはすでに終了しています。');
         }
@@ -46,6 +51,7 @@ export default class KonomiTVBS4KOfflineDownloadRuntime {
         let isStreamFinished = false;
         let sizeBytes = 0;
         let assetCount = 0;
+        let responseReadBytes = 0;
         let lastPersistedProgressBytes = job.downloaded_bytes;
         let lastPersistedProgressAt = Date.now();
         const assetPaths: string[] = [];
@@ -63,7 +69,13 @@ export default class KonomiTVBS4KOfflineDownloadRuntime {
                 }
                 pendingChunks.push(result.value);
                 pendingLength += result.value.byteLength;
-                job.downloaded_bytes += result.value.byteLength;
+                responseReadBytes += result.value.byteLength;
+                // Background Fetch 済み応答の再読込バイトを二重加算せず、実転送と展開読込の大きい側を使う。
+                job.downloaded_bytes = Math.max(job.downloaded_bytes, responseReadBytes);
+                if (job.package_size_bytes !== null && job.package_size_bytes > 0) {
+                    const downloadProgress = Math.min(1, job.downloaded_bytes / job.package_size_bytes);
+                    job.progress = Math.max(job.progress, 0.8 + downloadProgress * 0.18);
+                }
 
                 // ネットワークチャンクごとの書き込みを避け、進捗表示に十分な間隔だけ IndexedDB を更新する
                 const currentTime = Date.now();
@@ -152,12 +164,18 @@ export default class KonomiTVBS4KOfflineDownloadRuntime {
                 assetPathSet.add(assetPath);
                 assetCount++;
                 sizeBytes += assetLength;
+                if (job.total_assets > 0) {
+                    const finalizationProgress = Math.min(1, assetCount / job.total_assets);
+                    job.progress = Math.max(job.progress, 0.98 + finalizationProgress * 0.019);
+                }
             }
 
             if (pendingLength !== 0 || (await reader.read()).done !== true) {
                 throw new Error('オフライン保存データの終端以降に余分なデータがあります。');
             }
             job.state = 'Finalizing';
+            job.phase = 'Finalizing';
+            job.progress = Math.max(job.progress, 0.999);
             if (await OfflineVideoStorage.updateActiveJob(job) === false) {
                 throw new Error('オフライン保存がキャンセルされました。');
             }
@@ -190,6 +208,7 @@ export default class KonomiTVBS4KOfflineDownloadRuntime {
             if (previousVideo !== null && previousVideo.generation_id !== video.generation_id) {
                 await OfflineVideoStorage.deleteGeneration(previousVideo.video_id, previousVideo.generation_id);
             }
+            await this.releaseServerJob(job);
             this.notifyWindowClients();
         } catch (error) {
             try {
@@ -210,6 +229,8 @@ export default class KonomiTVBS4KOfflineDownloadRuntime {
     static async markJobFailed(jobID: string, error: string): Promise<void> {
         const job = await OfflineVideoStorage.transitionActiveJobToTerminalState(jobID, 'Failed', error);
         if (job === null) return;
+        job.server_job_id ??= null;
+        await this.releaseServerJob(job);
         await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
         this.notifyWindowClients();
     }
@@ -218,9 +239,30 @@ export default class KonomiTVBS4KOfflineDownloadRuntime {
     static async markJobCancelled(jobID: string): Promise<void> {
         const job = await OfflineVideoStorage.transitionActiveJobToTerminalState(jobID, 'Cancelled', null);
         if (job === null) return;
+        job.server_job_id ??= null;
+        await this.releaseServerJob(job);
         await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
         await OfflineVideoStorage.deleteJob(job.job_id);
         this.notifyWindowClients();
+    }
+
+    /** 端末側の atomic 保存確定後に、サーバーの完成パッケージを best effort で解放する。 */
+    private static async releaseServerJob(job: IOfflineDownloadJob): Promise<void> {
+        if (job.server_job_id === null) return;
+        try {
+            const response = await fetch(
+                `/api/streams/video/${job.video_id}/offline-jobs/${job.server_job_id}`,
+                {method: 'DELETE'},
+            );
+            if (response.ok === false && response.status !== 404) {
+                console.warn(
+                    `[KonomiTVBS4KOfflineDownloadRuntime] Offline job delete API returned HTTP ${response.status}.`,
+                );
+            }
+        } catch (error) {
+            // 保存済み動画は端末で確定済みなので、通信断時はサーバーの保持期限 cleanup へ委ねる。
+            console.warn('[KonomiTVBS4KOfflineDownloadRuntime] Failed to release the server offline job:', error);
+        }
     }
 
     /** サーバーが許可する正規化済み相対アセットパスだけを受け入れる。 */

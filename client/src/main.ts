@@ -35,6 +35,9 @@ SeamlessScrollPolyfill();
 void OfflineVideos.recoverInterruptedForegroundDownloads().catch((error) => {
     // オフライン保存領域だけの読み取り失敗で、通常のオンライン視聴画面まで起動不能にはしない
     console.error('Failed to recover interrupted foreground offline downloads:', error);
+}).finally(() => {
+    // 複数タブのうち1タブだけが、サーバー生成から完成済みパッケージ転送への引き継ぎを担当する
+    OfflineVideos.startCoordinator();
 });
 
 // Vue アプリケーションを作成

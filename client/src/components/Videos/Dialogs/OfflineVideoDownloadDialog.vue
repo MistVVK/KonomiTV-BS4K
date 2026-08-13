@@ -341,7 +341,7 @@ const startDownload = async (): Promise<void> => {
         if (profile === null || estimate.value === null) throw new Error('利用可能な保存形式を選択してください。');
 
         // 永続化を拒否された環境では、専用ダイアログでブラウザによる削除可能性を伝える
-        if (navigator.storage?.persist !== undefined && await navigator.storage.persist() === false) {
+        if (await OfflineVideos.requestPersistentStorage() === false) {
             pendingDownload.value = {profile, estimate: estimate.value};
             showPersistenceWarning.value = true;
             return;

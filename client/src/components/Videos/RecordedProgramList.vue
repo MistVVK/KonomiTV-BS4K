@@ -210,6 +210,8 @@ const handleProgramDeleted = (id: number) => {
 
 /** 一覧に表示する保存ジョブを取得する */
 const getOfflineDownloadJob = (videoID: number): IOfflineDownloadJob | null => {
+    // 通常の録画一覧では保存ジョブをカードへ渡さず、状態表示と進捗バーをオフライン保存一覧へ限定する
+    if (props.forOffline === false) return null;
     return props.offlineJobs?.find(job =>
         job.video_id === videoID && ['Waiting', 'Downloading', 'Finalizing', 'Failed'].includes(job.state),
     ) ?? null;

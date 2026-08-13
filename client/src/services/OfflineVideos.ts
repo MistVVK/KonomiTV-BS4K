@@ -14,6 +14,10 @@ import Utils from '@/utils';
 /** オフライン保存ジョブの状態 */
 export type OfflineDownloadState = 'Waiting' | 'Downloading' | 'Finalizing' | 'Failed' | 'Cancelled';
 
+/** 画面へ表示するオフライン保存の現在工程 */
+export type OfflineDownloadPhase =
+    'Queued' | 'Preparing' | 'Encoding' | 'Packaging' | 'Downloading' | 'Finalizing';
+
 /** オフライン保存済み動画 */
 export interface IOfflineVideo {
     video_id: number;
@@ -46,6 +50,22 @@ export interface IKonomiTVBS4KOfflineStreamEstimate {
     required_size_bytes: number;
 }
 
+/** HTTP 接続から独立したサーバー側オフライン保存生成ジョブ */
+export interface IKonomiTVBS4KOfflineJob {
+    job_id: string;
+    video_id: number;
+    state: 'Queued' | 'Generating' | 'Ready' | 'Failed' | 'Cancelled';
+    phase: 'Queued' | 'Preparing' | 'Encoding' | 'Packaging' | 'Ready' | 'Failed' | 'Cancelled';
+    progress: number;
+    completed_assets: number;
+    total_assets: number;
+    completed_bytes: number;
+    package_size_bytes: number | null;
+    error: string | null;
+    created_at: number;
+    updated_at: number;
+}
+
 /** オフライン保存ジョブ */
 export interface IOfflineDownloadJob {
     job_id: string;
@@ -57,8 +77,13 @@ export interface IOfflineDownloadJob {
     video_bit_depth: 8 | 10;
     requested_audio_codec: KonomiTVBS4KPlaybackAudioCodec;
     state: OfflineDownloadState;
+    phase: OfflineDownloadPhase;
+    progress: number;
     estimated_size_bytes: number;
     downloaded_bytes: number;
+    total_assets: number;
+    package_size_bytes: number | null;
+    server_job_id: string | null;
     background_fetch_id: string | null;
     error: string | null;
 }
@@ -96,6 +121,10 @@ export default class OfflineVideos {
 
     private static foregroundAbortControllers = new Map<string, AbortController>();
     private static foregroundLockReleases = new Map<string, () => void>();
+    private static readonly PERSISTENT_STORAGE_REQUEST_TIMEOUT_SECONDS = 3;
+    private static readonly COORDINATOR_LOCK_NAME = 'konomitv-bs4k-offline-job-coordinator';
+    private static readonly COORDINATOR_INTERVAL_SECONDS = 1;
+    private static isCoordinatorStarted = false;
 
     /** 前景保存中にタブを閉じようとしたときの警告 */
     private static readonly onBeforeUnload = (event: BeforeUnloadEvent): void => {
@@ -115,6 +144,35 @@ export default class OfflineVideos {
         }
         const registration = await navigator.serviceWorker.getRegistration();
         return registration?.backgroundFetch !== undefined;
+    }
+
+    /**
+     * オフライン保存データの永続化を要求する。
+     * Firefox などで権限要求が解決されない場合も、既存の注意表示へ進めるため一定時間で打ち切る。
+     * @returns 永続ストレージを利用できる場合は true
+     */
+    static async requestPersistentStorage(): Promise<boolean> {
+
+        if (navigator.storage?.persist === undefined) return true;
+
+        let timeoutID: number | null = null;
+        try {
+            return await Promise.race([
+                navigator.storage.persist(),
+                new Promise<boolean>((resolve) => {
+                    timeoutID = window.setTimeout(
+                        () => resolve(false),
+                        this.PERSISTENT_STORAGE_REQUEST_TIMEOUT_SECONDS * 1000,
+                    );
+                }),
+            ]);
+        } catch (error) {
+            // 永続化要求の失敗だけで保存を禁止せず、ブラウザによる自動削除の可能性を利用者へ確認する
+            console.warn('[OfflineVideos] Failed to request persistent storage:', error);
+            return false;
+        } finally {
+            if (timeoutID !== null) window.clearTimeout(timeoutID);
+        }
     }
 
     /**
@@ -140,7 +198,23 @@ export default class OfflineVideos {
      */
     static async getJobs(): Promise<IOfflineDownloadJob[]> {
 
-        return await OfflineVideoStorage.getJobs();
+        return (await OfflineVideoStorage.getJobs()).map(job => this.normalizeJob(job));
+    }
+
+    /** 旧クライアントが残したジョブにも、新しい永続ジョブ契約の既定値を補う。 */
+    private static normalizeJob(job: IOfflineDownloadJob): IOfflineDownloadJob {
+        const fallbackProgress = job.estimated_size_bytes > 0
+            ? Math.min(0.98, job.downloaded_bytes / job.estimated_size_bytes)
+            : 0;
+        return {
+            ...job,
+            phase: job.phase ?? (job.state === 'Downloading' ? 'Downloading' :
+                job.state === 'Finalizing' ? 'Finalizing' : 'Queued'),
+            progress: Number.isFinite(job.progress) ? Math.max(0, Math.min(1, job.progress)) : fallbackProgress,
+            total_assets: job.total_assets ?? 0,
+            package_size_bytes: job.package_size_bytes ?? null,
+            server_job_id: job.server_job_id ?? null,
+        };
     }
 
     /**
@@ -172,22 +246,41 @@ export default class OfflineVideos {
     static async recoverInterruptedForegroundDownloads(): Promise<void> {
 
         const jobs = await this.getJobs();
+
+        // 旧ストリーミング方式で残った未完ジョブには対応するサーバージョブがないため、明示的に失敗へ移す。
+        for (const job of jobs) {
+            if (['Waiting', 'Downloading', 'Finalizing'].includes(job.state) && job.server_job_id === null) {
+                if (job.background_fetch_id !== null && 'serviceWorker' in navigator) {
+                    const registration = await navigator.serviceWorker.getRegistration();
+                    const backgroundFetch = await registration?.backgroundFetch?.get(job.background_fetch_id);
+                    await backgroundFetch?.abort();
+                } else {
+                    this.foregroundAbortControllers.get(job.job_id)?.abort();
+                }
+                await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(
+                    job.job_id,
+                    '保存方式が更新されたため、この未完了ジョブは再開できません。もう一度保存してください。',
+                );
+            }
+        }
+
         if ('locks' in navigator) {
             for (const job of jobs) {
-                if (job.background_fetch_id !== null || ['Waiting', 'Downloading', 'Finalizing'].includes(job.state) === false) continue;
+                // サーバー生成中の Waiting はページに依存しない。前景転送を開始済みのジョブだけを中断判定する。
+                if (job.background_fetch_id !== null || ['Downloading', 'Finalizing'].includes(job.state) === false) continue;
 
                 // Web Locks を取得できなければ別タブが保存中なので、共有 IndexedDB の状態へ触れない
                 await navigator.locks.request(this.getForegroundLockName(job.job_id), {ifAvailable: true}, async (lock) => {
                     if (lock === null) return;
                     const latestJob = await OfflineVideoStorage.getJob(job.job_id);
-                    if (latestJob === null || ['Waiting', 'Downloading', 'Finalizing'].includes(latestJob.state) === false) return;
+                    if (latestJob === null || ['Downloading', 'Finalizing'].includes(latestJob.state) === false) return;
                     await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(latestJob.job_id, 'ページが閉じられたため、オフライン保存が中断されました。');
                 });
             }
         } else {
             // Web Locks 非対応環境では所有タブを識別できないため、前景保存の実行中ジョブは起動時に失敗へ倒して断片を回収する
             for (const job of jobs) {
-                if (job.background_fetch_id !== null || ['Waiting', 'Downloading', 'Finalizing'].includes(job.state) === false) continue;
+                if (job.background_fetch_id !== null || ['Downloading', 'Finalizing'].includes(job.state) === false) continue;
                 await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(job.job_id, 'ページが閉じられたため、オフライン保存が中断されました。');
             }
         }
@@ -237,128 +330,111 @@ export default class OfflineVideos {
             video_bit_depth: profile.video_bit_depth,
             requested_audio_codec: profile.audio_codec,
             state: 'Waiting',
+            phase: 'Queued',
+            progress: 0,
             estimated_size_bytes: estimate.estimated_size_bytes,
             downloaded_bytes: 0,
+            total_assets: 0,
+            package_size_bytes: null,
+            server_job_id: null,
             background_fetch_id: isBackgroundFetchSupported === true ? `konomitv-bs4k-offline-${jobID}` : null,
             error: null,
         };
-        const releaseForegroundLock = isBackgroundFetchSupported === false ? await this.acquireForegroundLock(job.job_id) : null;
-        try {
-            // 同じ録画の重複開始は IndexedDB の readwrite transaction だけでタブ間も含めて直列化する
-            await OfflineVideoStorage.putJobIfVideoIdle(job);
-        } catch (error) {
-            releaseForegroundLock?.();
-            throw error;
-        }
+        // 同じ録画の重複開始は IndexedDB の readwrite transaction だけでタブ間も含めて直列化する
+        await OfflineVideoStorage.putJobIfVideoIdle(job);
 
-        let request: Request;
         try {
-            // オフライン保存 API は認証不要なので、ページ終了後もブラウザが単独で取得できる通常の Request を作成する
-            request = new Request(
-                `${Utils.api_base_url}/streams/video/${programSnapshot.id}/${apiQuality}/offline-stream?${codecQuery}`,
+            // POST は生成受付だけを行うため、長時間エンコード中にページや HTTP 接続が閉じてもサーバージョブは継続する。
+            const response = await fetch(
+                `${Utils.api_base_url}/streams/video/${programSnapshot.id}/${apiQuality}/offline-jobs?${codecQuery}`,
+                {method: 'POST'},
             );
-
-            // 番組一覧とシークバーが通信なしでも描画できるよう、小さな付随データは動画本体より先に同じ世代へ保存する
-            const cache = await OfflineVideoStorage.openCache();
-            const generationBaseURL = OfflineVideoStorage.getGenerationBaseURL(programSnapshot.id, generationID);
-            const assetRequests = [
-                {source: `${Utils.api_base_url}/videos/${programSnapshot.id}/thumbnail`, destination: `${generationBaseURL}/assets/thumbnail.webp`},
-                {source: `${Utils.api_base_url}/videos/${programSnapshot.id}/thumbnail/tiled`, destination: `${generationBaseURL}/assets/thumbnail-tiled.webp`},
-            ];
-            if (programSnapshot.channel !== null) {
-                assetRequests.push({
-                    source: `${Utils.api_base_url}/channels/${programSnapshot.channel.id}/logo`,
-                    destination: `${generationBaseURL}/assets/channel-logo`,
-                });
+            if (response.ok === false) {
+                throw new Error(`オフライン保存生成 API が HTTP ${response.status} を返しました。`);
             }
-            await Promise.all(assetRequests.map(async assetRequest => {
-                try {
-                    const assetResponse = await fetch(assetRequest.source);
-                    if (assetResponse.ok === true) {
-                        await cache.put(assetRequest.destination, assetResponse);
-                    }
-                } catch (error) {
-                    // 付随データの取得失敗は動画保存を止めず、映像本体を優先する
-                    console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
-                }
-            }));
-
-            // 実況 API は応答が遅くなりがちで、保存開始自体はコメントがなくても問題ないため、動画転送の登録を待たせない
-            void (async () => {
-                const jikkyoSource = `${Utils.api_base_url}/videos/${programSnapshot.id}/jikkyo`;
-                const jikkyoDestination = `${generationBaseURL}/assets/jikkyo.json`;
-                try {
-                    const assetResponse = await fetch(jikkyoSource);
-                    if (assetResponse.ok !== true) return;
-
-                    // 動画保存が先に完了するとジョブは削除されるため、完成済み動画も有効な保存先として扱う
-                    if (await OfflineVideoStorage.isGenerationReferenced(job.video_id, generationID) === false) {
-                        return;
-                    }
-                    await cache.put(jikkyoDestination, assetResponse);
-
-                    // 書き込み中にキャンセルや再保存で世代が破棄された場合は、遅れて作成した実況だけを回収する
-                    if (await OfflineVideoStorage.isGenerationReferenced(job.video_id, generationID) === false) {
-                        await cache.delete(jikkyoDestination);
-                    }
-                } catch (error) {
-                    console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
-                }
-            })();
-
-            // 付随データの取得中にも別画面からキャンセルできるため、実際の動画転送を登録する直前に最新状態を確認する
+            const serverJob = await response.json() as IKonomiTVBS4KOfflineJob;
+            job.server_job_id = serverJob.job_id;
+            if (serverJob.video_id !== job.video_id) {
+                throw new Error('サーバーが作成した保存ジョブの録画 ID が一致しません。');
+            }
+            this.applyServerJobProgress(job, serverJob);
             if (await OfflineVideoStorage.updateActiveJob(job) === false) {
+                await this.releaseServerJob(job);
                 throw new Error('オフライン保存はキャンセルされました。');
             }
+
+            // 小さな付随データは生成ジョブと並行して保存し、動画エンコード開始を待たせない。
+            void this.cacheOptionalAssets(job).catch((error: unknown) => {
+                console.warn('[OfflineVideos] Failed to open the optional offline asset cache:', error);
+            });
         } catch (error) {
-            // 動画転送へ所有権を渡す前の失敗では、作成済みの断片と前景ロックをこの呼び出し内で回収する
-            releaseForegroundLock?.();
+            // 受付失敗はローカルジョブへ理由を残し、生成済みの付随データ断片も共通 Runtime で回収する。
+            await this.releaseServerJob(job);
             await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(job.job_id, error instanceof Error ? error.message : 'オフライン保存を開始できませんでした。');
             throw error;
         }
+        return job;
+    }
 
-        if (isBackgroundFetchSupported === true && job.background_fetch_id !== null) {
+    /** サムネイル・ロゴ・実況を、動画パッケージ生成と独立して同じ保存世代へ格納する。 */
+    private static async cacheOptionalAssets(job: IOfflineDownloadJob): Promise<void> {
+        const cache = await OfflineVideoStorage.openCache();
+        const generationBaseURL = OfflineVideoStorage.getGenerationBaseURL(job.video_id, job.generation_id);
+        const assetRequests = [
+            {source: `${Utils.api_base_url}/videos/${job.video_id}/thumbnail`, destination: `${generationBaseURL}/assets/thumbnail.webp`},
+            {source: `${Utils.api_base_url}/videos/${job.video_id}/thumbnail/tiled`, destination: `${generationBaseURL}/assets/thumbnail-tiled.webp`},
+        ];
+        if (job.program.channel !== null) {
+            assetRequests.push({
+                source: `${Utils.api_base_url}/channels/${job.program.channel.id}/logo`,
+                destination: `${generationBaseURL}/assets/channel-logo`,
+            });
+        }
+        await Promise.all(assetRequests.map(async assetRequest => {
             try {
-                const registration = await navigator.serviceWorker.getRegistration();
-                if (registration === undefined) {
-                    throw new Error('Service Worker の登録が見つかりません。');
-                }
-                const backgroundFetchManager = registration.backgroundFetch;
-                if (backgroundFetchManager === undefined) {
-                    throw new Error('Background Fetch API を利用できません。');
-                }
-                await backgroundFetchManager.fetch(job.background_fetch_id, [request], {
-                    title: `${programSnapshot.title}をオフライン保存`,
-                    icons: [{src: '/assets/images/icons/icon-192px.png', sizes: '192x192', type: 'image/png'}],
-                    downloadTotal: estimate.required_size_bytes,
-                });
-
-                // 登録処理中にキャンセルされた場合は、ブラウザへ渡した直後の Background Fetch も確実に停止する
-                if (await OfflineVideoStorage.updateActiveJob(job) === false) {
-                    const backgroundFetch = await backgroundFetchManager.get(job.background_fetch_id);
-                    await backgroundFetch?.abort();
-                    await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
-                    throw new Error('オフライン保存はキャンセルされました。');
+                const assetResponse = await fetch(assetRequest.source);
+                if (assetResponse.ok === true &&
+                    await OfflineVideoStorage.isGenerationReferenced(job.video_id, job.generation_id)) {
+                    await cache.put(assetRequest.destination, assetResponse);
                 }
             } catch (error) {
-                // 登録失敗時は先に保存した付随データを残さず、一覧へ失敗理由を引き継ぐ
-                await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(job.job_id, error instanceof Error ? error.message : 'バックグラウンド保存を登録できませんでした。');
-                throw error;
+                // 付随データの取得失敗は動画保存を止めず、完成済み fMP4 パッケージを優先する。
+                console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
             }
-            return job;
+        }));
+
+        // 取得中に生成失敗・キャンセルが確定した場合は、遅れて保存した画像断片をまとめて回収する。
+        if (await OfflineVideoStorage.isGenerationReferenced(job.video_id, job.generation_id) === false) {
+            await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
+            return;
         }
 
-        // Safari などではページが存続している間だけ通常の Fetch で同じ応答を保存する
+        const jikkyoSource = `${Utils.api_base_url}/videos/${job.video_id}/jikkyo`;
+        const jikkyoDestination = `${generationBaseURL}/assets/jikkyo.json`;
         try {
-            job.state = 'Downloading';
-            if (await OfflineVideoStorage.updateActiveJob(job) === false) {
-                throw new Error('オフライン保存はキャンセルされました。');
+            const assetResponse = await fetch(jikkyoSource);
+            if (assetResponse.ok !== true) return;
+            if (await OfflineVideoStorage.isGenerationReferenced(job.video_id, job.generation_id) === false) {
+                return;
+            }
+            await cache.put(jikkyoDestination, assetResponse);
+            if (await OfflineVideoStorage.isGenerationReferenced(job.video_id, job.generation_id) === false) {
+                await cache.delete(jikkyoDestination);
             }
         } catch (error) {
-            // 転送処理へ引き渡す前の失敗は、この呼び出しで前景ロックを解放する
+            console.warn('[OfflineVideos] Failed to cache an optional offline asset:', error);
+        }
+    }
+
+    /** Background Fetch 非対応ブラウザで、Ready パッケージの前景取得と展開を開始する。 */
+    private static async beginForegroundDownload(job: IOfflineDownloadJob, request: Request): Promise<void> {
+        const releaseForegroundLock = await this.acquireForegroundLock(job.job_id);
+        job.state = 'Downloading';
+        job.phase = 'Downloading';
+        job.progress = Math.max(job.progress, 0.8);
+        if (await OfflineVideoStorage.updateActiveJob(job) === false) {
             releaseForegroundLock?.();
-            await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(job.job_id, error instanceof Error ? error.message : 'オフライン保存を開始できませんでした。');
-            throw error;
+            return;
         }
         const abortController = new AbortController();
         this.foregroundAbortControllers.set(job.job_id, abortController);
@@ -412,7 +488,6 @@ export default class OfflineVideos {
                 }
             }
         })();
-        return job;
     }
 
     /** 保存開始時に指定する API 画質文字列を組み立てる。 */
@@ -448,6 +523,192 @@ export default class OfflineVideos {
             throw new Error(`容量見積もり API が HTTP ${response.status} を返しました。`);
         }
         return await response.json() as IKonomiTVBS4KOfflineStreamEstimate;
+    }
+
+    /** サーバージョブの生成進捗を、全体の0～80%へ単調に割り当てる。 */
+    static applyServerJobProgress(job: IOfflineDownloadJob, serverJob: IKonomiTVBS4KOfflineJob): void {
+        const phaseMap: Partial<Record<IKonomiTVBS4KOfflineJob['phase'], OfflineDownloadPhase>> = {
+            Queued: 'Queued',
+            Preparing: 'Preparing',
+            Encoding: 'Encoding',
+            Packaging: 'Packaging',
+            Ready: 'Packaging',
+        };
+        job.phase = phaseMap[serverJob.phase] ?? job.phase;
+        job.progress = Math.max(job.progress, Math.min(0.8, serverJob.progress * 0.8));
+        job.total_assets = Math.max(job.total_assets, serverJob.total_assets);
+        job.package_size_bytes = serverJob.package_size_bytes ?? job.package_size_bytes;
+    }
+
+    /** 複数タブのうち Web Lock を取得した1タブだけで、全保存ジョブの同期を継続する。 */
+    static startCoordinator(): void {
+        if (this.isCoordinatorStarted === true) return;
+        this.isCoordinatorStarted = true;
+
+        const RunCoordinator = async (): Promise<void> => {
+            while (this.isCoordinatorStarted === true) {
+                try {
+                    await this.synchronizeJobsOnce();
+                } catch (error) {
+                    // 一時的な IndexedDB・Service Worker 障害でも leader を手放さず、次周期で回復を試みる。
+                    console.warn('[OfflineVideos] Offline job coordinator iteration failed:', error);
+                }
+                await Utils.sleep(this.COORDINATOR_INTERVAL_SECONDS);
+            }
+        };
+
+        if ('locks' in navigator) {
+            // 各タブは同じ名前で待機し、所有タブが閉じた場合だけ次のタブが自動的に同期を引き継ぐ。
+            void navigator.locks.request(this.COORDINATOR_LOCK_NAME, RunCoordinator).catch((error: unknown) => {
+                console.warn('[OfflineVideos] Offline job coordinator lock failed:', error);
+            });
+        } else {
+            // Web Locks 非対応ブラウザでは単一タブ利用を前提に同じ同期処理を実行する。
+            void RunCoordinator();
+        }
+    }
+
+    /** leader タブの1周期分だけ、サーバー生成・Background Fetch 進捗・Ready 遷移を同期する。 */
+    static async synchronizeJobsOnce(): Promise<void> {
+        const jobs = await this.getJobs();
+        for (const job of jobs) {
+            if (job.state === 'Waiting') {
+                if (job.server_job_id === null) continue;
+                const serverJob = await this.fetchServerJob(job);
+                if (serverJob === null) continue;
+                if (serverJob === 'Missing') {
+                    await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(
+                        job.job_id,
+                        'サーバー側のオフライン保存ジョブが見つかりません。もう一度保存してください。',
+                    );
+                    continue;
+                }
+                if (serverJob.state === 'Failed') {
+                    await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(
+                        job.job_id,
+                        serverJob.error ?? 'サーバーでオフライン保存パッケージを生成できませんでした。',
+                    );
+                    continue;
+                }
+                if (serverJob.state === 'Cancelled') {
+                    await KonomiTVBS4KOfflineDownloadRuntime.markJobCancelled(job.job_id);
+                    continue;
+                }
+                this.applyServerJobProgress(job, serverJob);
+                if (await OfflineVideoStorage.updateActiveJob(job) === false) {
+                    await this.releaseServerJob(job);
+                    continue;
+                }
+                if (serverJob.state === 'Ready') {
+                    await this.beginReadyDownload(job);
+                }
+            } else if (job.state === 'Downloading' && job.background_fetch_id !== null) {
+                await this.synchronizeBackgroundFetchProgress(job);
+            }
+        }
+    }
+
+    /** サーバー側ジョブ状態を取得し、通信失敗は再試行、404だけは永続欠損として区別する。 */
+    private static async fetchServerJob(job: IOfflineDownloadJob): Promise<IKonomiTVBS4KOfflineJob | 'Missing' | null> {
+        if (job.server_job_id === null) return 'Missing';
+        try {
+            const response = await fetch(
+                `${Utils.api_base_url}/streams/video/${job.video_id}/offline-jobs/${job.server_job_id}`,
+            );
+            if (response.status === 404) return 'Missing';
+            if (response.ok === false) {
+                console.warn(`[OfflineVideos] Offline job status API returned HTTP ${response.status}.`);
+                return null;
+            }
+            return await response.json() as IKonomiTVBS4KOfflineJob;
+        } catch (error) {
+            // サーバー生成は接続断中も続くため、ネットワークエラーでローカルジョブを失敗へ確定しない。
+            console.warn('[OfflineVideos] Failed to fetch offline job status:', error);
+            return null;
+        }
+    }
+
+    /** Ready パッケージを1回だけ Background Fetch または前景 Fetch へ引き渡す。 */
+    private static async beginReadyDownload(job: IOfflineDownloadJob): Promise<void> {
+        if (job.server_job_id === null || job.package_size_bytes === null || job.package_size_bytes <= 0) {
+            await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(job.job_id, '完成済みパッケージのサイズを取得できませんでした。');
+            return;
+        }
+        const latestJob = await OfflineVideoStorage.getJob(job.job_id);
+        if (latestJob === null || latestJob.state !== 'Waiting') return;
+        const currentJob = this.normalizeJob(latestJob);
+        currentJob.package_size_bytes = job.package_size_bytes;
+        currentJob.total_assets = job.total_assets;
+        currentJob.progress = Math.max(currentJob.progress, 0.8);
+        const request = new Request(
+            `${Utils.api_base_url}/streams/video/${job.video_id}/offline-jobs/${job.server_job_id}/download`,
+        );
+
+        if (currentJob.background_fetch_id !== null && 'serviceWorker' in navigator) {
+            try {
+                const registration = await navigator.serviceWorker.getRegistration();
+                const backgroundFetchManager = registration?.backgroundFetch;
+                if (backgroundFetchManager !== undefined) {
+                    const existingFetch = await backgroundFetchManager.get(currentJob.background_fetch_id);
+                    if (existingFetch === undefined) {
+                        await backgroundFetchManager.fetch(currentJob.background_fetch_id, [request], {
+                            title: `${currentJob.program.title}をオフライン保存`,
+                            icons: [{src: '/assets/images/icons/icon-192px.png', sizes: '192x192', type: 'image/png'}],
+                            downloadTotal: currentJob.package_size_bytes,
+                        });
+                    }
+                    currentJob.state = 'Downloading';
+                    currentJob.phase = 'Downloading';
+                    if (await OfflineVideoStorage.updateActiveJob(currentJob) === false) {
+                        const backgroundFetch = await backgroundFetchManager.get(currentJob.background_fetch_id);
+                        await backgroundFetch?.abort();
+                    }
+                    return;
+                }
+            } catch (error) {
+                await KonomiTVBS4KOfflineDownloadRuntime.markJobFailed(
+                    currentJob.job_id,
+                    error instanceof Error ? error.message : 'バックグラウンド保存を登録できませんでした。',
+                );
+                return;
+            }
+        }
+
+        // Firefox など Background Fetch 非対応環境では、Ready 後にだけ固定長ファイルを前景取得する。
+        currentJob.background_fetch_id = null;
+        await this.beginForegroundDownload(currentJob, request);
+    }
+
+    /** Background Fetch の正確な固定長受信量を、全体進捗の80～98%へ反映する。 */
+    private static async synchronizeBackgroundFetchProgress(job: IOfflineDownloadJob): Promise<void> {
+        if ('serviceWorker' in navigator === false || job.background_fetch_id === null) return;
+        const registration = await navigator.serviceWorker.getRegistration();
+        const backgroundFetch = await registration?.backgroundFetch?.get(job.background_fetch_id);
+        if (backgroundFetch === undefined) return;
+        job.downloaded_bytes = Math.max(job.downloaded_bytes, backgroundFetch.downloaded);
+        if (job.package_size_bytes !== null && job.package_size_bytes > 0) {
+            const downloadProgress = Math.min(1, job.downloaded_bytes / job.package_size_bytes);
+            job.progress = Math.max(job.progress, 0.8 + downloadProgress * 0.18);
+        }
+        job.phase = 'Downloading';
+        await OfflineVideoStorage.updateActiveJob(job);
+    }
+
+    /** サーバー側生成ジョブと完成パッケージを best effort で解放する。 */
+    private static async releaseServerJob(job: IOfflineDownloadJob): Promise<void> {
+        if (job.server_job_id === null) return;
+        try {
+            const response = await fetch(
+                `${Utils.api_base_url}/streams/video/${job.video_id}/offline-jobs/${job.server_job_id}`,
+                {method: 'DELETE'},
+            );
+            if (response.ok === false && response.status !== 404) {
+                console.warn(`[OfflineVideos] Offline job delete API returned HTTP ${response.status}.`);
+            }
+        } catch (error) {
+            // サーバー側にも保持期限があるため、通信断時は端末側 cleanup を優先して次回回収へ委ねる。
+            console.warn('[OfflineVideos] Failed to release the server offline job:', error);
+        }
     }
 
     /**
@@ -512,6 +773,10 @@ export default class OfflineVideos {
      * @param jobID 保存ジョブ ID
      */
     static async dismissJob(jobID: string): Promise<void> {
+        const job = await OfflineVideoStorage.getJob(jobID);
+        if (job !== null) {
+            await this.releaseServerJob(this.normalizeJob(job));
+        }
         await OfflineVideoStorage.deleteJob(jobID);
     }
 
@@ -535,7 +800,8 @@ export default class OfflineVideos {
                 this.foregroundAbortControllers.get(job.job_id)?.abort();
             }
         } finally {
-            // ブラウザ側の停止要求が失敗しても、ローカルではキャンセル済み世代を参照不能にして断片を回収する
+            // ブラウザ側の停止要求が失敗しても、サーバー生成とローカル未完成世代の双方を回収する。
+            await this.releaseServerJob(this.normalizeJob(job));
             await OfflineVideoStorage.deleteGeneration(job.video_id, job.generation_id);
             await OfflineVideoStorage.deleteJob(job.job_id);
         }
