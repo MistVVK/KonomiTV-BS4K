@@ -799,8 +799,9 @@ def _LoadOrCreateJWTSecretKey(path: Path) -> str:
                 raise RuntimeError('JWT secret key file has invalid format.') from None
             if len(secret_key) == _JWT_SECRET_HEX_LENGTH:
                 return _ValidateJWTSecretKey(secret_key)
-            # 64 bytes 以上存在するのに 64文字として読めない場合は、待機しても正常化しない
-            if os.fstat(fd).st_size >= _JWT_SECRET_HEX_LENGTH:
+            # 生成側の短い書き込み途中を読んだ直後にファイルだけが64 bytesへ伸びる場合があるため、
+            # 64文字未満はfstat()の瞬間値で破損扱いせず再読込する。64文字超だけは正常化しない。
+            if len(secret_key) > _JWT_SECRET_HEX_LENGTH:
                 raise RuntimeError('JWT secret key file has invalid length.')
             os.lseek(fd, 0, os.SEEK_SET)
             time.sleep(0.01)
