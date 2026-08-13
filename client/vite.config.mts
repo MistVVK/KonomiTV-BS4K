@@ -78,7 +78,9 @@ export default defineConfig({
         // ref: https://vite-pwa-org.netlify.app/guide/
         VitePWA({
             // Service Worker の登録方法
-            strategies: 'generateSW',
+            strategies: 'injectManifest',
+            srcDir: 'src',
+            filename: 'sw.ts',
             registerType: 'prompt',  // PWA の更新前にユーザーに確認する
             injectRegister: 'auto',
             // PWA のキャッシュに含めるファイル
@@ -124,31 +126,10 @@ export default defineConfig({
                     }
                 ]
             },
-            // Workbox の設定
-            workbox: {
-                // 古いキャッシュを自動削除する
-                cleanupOutdatedCaches: true,
-                // /api/, /cdn-cgi/(cloudflare) 以下のリクエストでは index.html を返さない
-                navigateFallbackDenylist: [/^\/api/, /^\/cdn-cgi/],
+            // 独自 Service Worker へ注入する事前キャッシュの設定
+            injectManifest: {
                 // キャッシュするファイルの最大サイズ
                 maximumFileSizeToCacheInBytes: 1024 * 1024 * 15,  // 15MB
-                // プレイヤー背景画像は実際に表示されたものだけを長期間キャッシュする
-                runtimeCaching: [
-                    {
-                        urlPattern: /\/assets\/images\/player-backgrounds\/\d{2}\.jpg$/,
-                        handler: 'CacheFirst',
-                        options: {
-                            cacheName: 'player-backgrounds',
-                            expiration: {
-                                maxAgeSeconds: 60 * 60 * 24 * 365,  // 1年間
-                                purgeOnQuotaError: true,
-                            },
-                            cacheableResponse: {
-                                statuses: [0, 200],
-                            },
-                        },
-                    },
-                ],
             }
         }),
     ],

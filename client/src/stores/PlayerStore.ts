@@ -2,6 +2,8 @@
 import mitt from 'mitt';
 import { defineStore } from 'pinia';
 
+import type { IOfflineVideo } from '@/services/OfflineVideos';
+
 import { ITweetCapture } from '@/components/Watch/Panel/Twitter.vue';
 import { ICommentData } from '@/services/player/managers/LiveCommentManager';
 import { IRecordedProgram, IRecordedProgramDefault } from '@/services/Videos';
@@ -169,6 +171,12 @@ const usePlayerStore = defineStore('player', {
             audio_codec: KonomiTVBS4KPlaybackAudioCodec;
         } | null,
 
+        // ビデオ視聴: CacheStorage に保存した単一画質を再生しているか
+        is_offline_playback: false,
+
+        // ビデオ視聴: 再生中の保存世代と生成条件
+        offline_video: null as IOfflineVideo | null,
+
         // プレイヤーのローディング状態
         // 既定でローディングとする
         is_loading: true,
@@ -277,6 +285,8 @@ const usePlayerStore = defineStore('player', {
             this.selected_quality_profile_type = null;
             this.konomitv_bs4k_playback_codec_override = null;
             this.konomitv_bs4k_effective_playback_profile = null;
+            this.is_offline_playback = false;
+            this.offline_video = null;
             this.is_loading = true;
             this.is_video_buffering = true;
             this.is_video_paused = false;

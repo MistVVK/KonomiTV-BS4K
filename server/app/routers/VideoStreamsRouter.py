@@ -2,17 +2,20 @@
 import asyncio
 import json
 import math
+import uuid
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
 
 from app import logging, schemas
 from app.config import Config
 from app.metadata.RecordedPlaybackIndex import IsRecordedPlaybackIndexReady
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.models.RecordedProgram import RecordedProgram
+from app.streams.KonomiTVBS4KOfflineStream import KonomiTVBS4KOfflineStream
 from app.streams.KonomiTVBS4KPlaybackCapabilities import (
     KonomiTVBS4KPlaybackCapabilityProbe,
 )
@@ -40,6 +43,9 @@ router = APIRouter(
 )
 
 VideoBitDepthQuery = KonomiTVBS4KVideoBitDepthQuery
+
+# 1要求が録画全体を生成するため、upstream と同じくオフライン保存はサーバー全体で3件に制限する。
+OFFLINE_STREAM_SEMAPHORE = asyncio.Semaphore(3)
 
 
 def SetTSCodecBridgeProcessCounterHeaders(response: Response) -> None:
@@ -416,6 +422,194 @@ async def ValidateQuality(
         await ValidateRecordedPlaybackCapabilities(recorded_program, stream_quality)
 
     return stream_quality
+
+
+async def CreateOfflineRecordedStream(
+    request: Request,
+    recorded_program: RecordedProgram,
+    stream_quality: StreamQualityWithOptions,
+) -> RecordedFMP4Stream:
+    """能力検査済みの独立したオフライン保存セッションを作成する。
+
+    Args:
+        request: 接続元ごとの admission control に使う HTTP リクエスト。
+        recorded_program: 保存対象の録画番組。
+        stream_quality: 画質・映像 codec・bit depth・音声 codec の生成条件。
+
+    Returns:
+        RecordedFMP4Stream: 通常再生キャッシュを共有する保存専用セッション。
+    """
+
+    session_id = f'offline-{uuid.uuid4().hex}'
+    await EnsurePlaybackIndexReady(recorded_program, session_id)
+    await ValidateRecordedPlaybackCapabilities(recorded_program, stream_quality)
+    return GetRecordedStream(
+        session_id,
+        recorded_program,
+        stream_quality,
+        is_new_session_allowed = True,
+        client_key = GetClientKey(request),
+    )
+
+
+def BuildOfflineStreamEstimate(
+    recorded_program: RecordedProgram,
+    stream_quality: StreamQualityWithOptions,
+) -> schemas.KonomiTVBS4KOfflineStreamEstimate:
+    """録画メタデータ・生成条件・全音声レンディション数から保存容量を見積もる。
+
+    Args:
+        recorded_program: 再生索引で音声構成まで確定済みの録画番組。
+        stream_quality: 能力検査済みの画質・映像・音声生成条件。
+
+    Returns:
+        schemas.KonomiTVBS4KOfflineStreamEstimate: 進捗表示用と空き容量判定用の概算値。
+    """
+
+    duration = recorded_program.recorded_video.duration
+    video_bitrate = 0
+    video_bitrate_max = 0
+    if recorded_program.recorded_video.has_video is True:
+        bitrate = RecordedFMP4Stream.getVideoBitrate(
+            stream_quality.quality,
+            stream_quality.encoding_options.video_codec,
+        )
+        video_bitrate = int(bitrate.video_bitrate.removesuffix('K'))
+        video_bitrate_max = int(bitrate.video_bitrate_max.removesuffix('K'))
+
+    # AAC は実装上192K固定、Opusは1～8chの最大320Kを使い、全レンディション保存を安全側で見積もる。
+    effective_audio_codec = RecordedFMP4Stream.resolveEffectiveAudioCodec(
+        recorded_program,
+        stream_quality.encoding_options.audio_codec,
+    )
+    audio_bitrate_per_rendition = 320 if effective_audio_codec == 'opus' else 192
+    audio_bitrate = audio_bitrate_per_rendition * len(
+        RecordedFMP4Stream.getAudioRenditionsForProgram(recorded_program)
+    )
+    estimated_size_bytes = math.ceil((video_bitrate + audio_bitrate) * 1000 * duration / 8 * 1.05)
+    required_size_bytes = math.ceil((video_bitrate_max + audio_bitrate) * 1000 * duration / 8 * 1.10)
+    return schemas.KonomiTVBS4KOfflineStreamEstimate(
+        estimated_size_bytes = estimated_size_bytes,
+        required_size_bytes = required_size_bytes,
+    )
+
+
+@router.get(
+    '/{video_id}/{quality}/offline-estimate',
+    summary = 'KonomiTV-BS4K 録画番組オフライン保存容量見積もり API',
+    response_model = schemas.KonomiTVBS4KOfflineStreamEstimate,
+)
+async def KonomiTVBS4KOfflineStreamEstimateAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+) -> schemas.KonomiTVBS4KOfflineStreamEstimate:
+    """全音声レンディションを含む fMP4 オフライン保存容量を返す。"""
+
+    if recorded_program.recorded_video.status == 'Recording':
+        raise HTTPException(
+            status_code = status.HTTP_409_CONFLICT,
+            detail = 'Recording video cannot be saved for offline playback',
+        )
+    # 見積もりにも本保存と同じ索引・能力契約を適用するが、セッション登録や全セグメント計画は行わない。
+    estimate_request_id = f'offline-estimate-{uuid.uuid4().hex}'
+    await EnsurePlaybackIndexReady(recorded_program, estimate_request_id)
+    await ValidateRecordedPlaybackCapabilities(recorded_program, stream_quality)
+    return BuildOfflineStreamEstimate(recorded_program, stream_quality)
+
+
+@router.get(
+    '/{video_id}/{quality}/offline-stream',
+    summary = 'KonomiTV-BS4K 録画番組オフライン保存ストリーム API',
+    response_class = StreamingResponse,
+    responses = {
+        status.HTTP_200_OK: {
+            'description': '保存用プレイリスト・init・fMP4 fragmentを格納したバイナリストリーム。',
+            'content': {'application/octet-stream': {}},
+        },
+        status.HTTP_409_CONFLICT: {
+            'description': '録画中のためオフライン保存を開始できない。',
+        },
+    },
+)
+async def KonomiTVBS4KOfflineStreamAPI(
+    request: Request,
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    quality: Annotated[str, Path(description='映像の品質。ex: 720p-24fps')],
+) -> StreamingResponse:
+    """RecordedFMP4Stream の全再生資産を先頭から生成し、単一応答として返す。"""
+
+    if recorded_program.recorded_video.status == 'Recording':
+        logging.error(
+            '[KonomiTVBS4KOfflineStreamAPI] Recording video cannot be saved for offline playback. '
+            f'[video_id: {recorded_program.id}]'
+        )
+        raise HTTPException(
+            status_code = status.HTTP_409_CONFLICT,
+            detail = 'Recording video cannot be saved for offline playback',
+        )
+
+    # Waiting 表示を維持できるよう、実行枠を取得するまでHTTP応答を開始しない。
+    await OFFLINE_STREAM_SEMAPHORE.acquire()
+    video_stream: RecordedFMP4Stream | None = None
+    try:
+        video_stream = await CreateOfflineRecordedStream(request, recorded_program, stream_quality)
+        metadata = schemas.KonomiTVBS4KOfflineStreamMetadata(
+            video_id = recorded_program.id,
+            file_hash = recorded_program.recorded_video.file_hash,
+            quality = quality,
+            video_codec = stream_quality.encoding_options.video_codec,
+            video_bit_depth = stream_quality.encoding_options.video_bit_depth,
+            requested_audio_codec = stream_quality.encoding_options.audio_codec,
+            audio_codec = video_stream.effective_audio_codec,
+        )
+        offline_stream = KonomiTVBS4KOfflineStream(video_stream, metadata)
+    except BaseException:
+        if video_stream is not None:
+            await video_stream.destroy()
+        OFFLINE_STREAM_SEMAPHORE.release()
+        raise
+
+    is_cleaned_up = False
+
+    async def CleanupOfflineStream() -> None:
+        """保存セッションと全体実行枠を最初の1回だけ解放する。"""
+
+        nonlocal is_cleaned_up
+        if is_cleaned_up is True:
+            return
+        is_cleaned_up = True
+        await video_stream.destroy()
+        OFFLINE_STREAM_SEMAPHORE.release()
+
+    async def GenerateOfflineStream():
+        """応答の backpressure 待ち中もセッションを維持してバイナリ本体を生成する。"""
+
+        async def KeepAlive() -> None:
+            """長時間ダウンロード中のセッション破棄タイマーを延長する。"""
+
+            while True:
+                await asyncio.sleep(5)
+                video_stream.keepAlive()
+
+        keep_alive_task = asyncio.create_task(KeepAlive())
+        try:
+            async for chunk in offline_stream.Generate():
+                yield chunk
+        finally:
+            keep_alive_task.cancel()
+            await asyncio.gather(keep_alive_task, return_exceptions=True)
+            await CleanupOfflineStream()
+
+    return StreamingResponse(
+        GenerateOfflineStream(),
+        media_type = 'application/octet-stream',
+        headers = {
+            'Cache-Control': 'no-store',
+            'X-Content-Type-Options': 'nosniff',
+        },
+        background = BackgroundTask(CleanupOfflineStream),
+    )
 
 
 @router.get(

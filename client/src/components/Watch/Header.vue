@@ -1,12 +1,12 @@
 <template>
     <header class="watch-header" :class="{'watch-header--video': playback_mode === 'Video'}">
-        <router-link class="watch-header__back-icon" v-ripple :to="playback_mode === 'Live' ? '/tv/' : '/videos/'">
+        <router-link class="watch-header__back-icon" v-ripple
+            :to="playback_mode === 'Live' ? '/tv/' : (playerStore.is_offline_playback ? '/offline-videos/' : '/videos/')">
             <Icon icon="fluent:chevron-left-12-filled" width="21px" />
         </router-link>
         <img class="watch-header__broadcaster"
             v-if="playback_mode === 'Live' || playerStore.recorded_program.channel !== null"
-            :src="`${Utils.api_base_url}/channels/${playback_mode === 'Live' ?
-                channelsStore.channel.current.id : playerStore.recorded_program.channel?.id}/logo`">
+            :src="broadcasterLogoURL">
         <span class="watch-header__program-title" v-html="ProgramUtils.decorateProgramInfo(
             playback_mode === 'Live' ? ChannelUtils.getProgramPresentForDisplay(channelsStore.channel.current) : playerStore.recorded_program, 'title'
         )"></span>
@@ -31,6 +31,7 @@ import { defineComponent, PropType } from 'vue';
 
 import type { Dayjs } from 'dayjs';
 
+import OfflineVideos from '@/services/OfflineVideos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
@@ -69,6 +70,14 @@ export default defineComponent({
         // 録画再生時かつ設定がオンの場合に true
         is_showing_original_broadcast_time(): boolean {
             return this.playback_mode === 'Video' && this.settingsStore.settings.show_original_broadcast_time_during_playback === true;
+        },
+        broadcasterLogoURL(): string {
+            if (this.playback_mode === 'Video' && this.playerStore.offline_video !== null) {
+                return OfflineVideos.getAssetURL(this.playerStore.offline_video, 'channel-logo');
+            }
+            const channel_id = this.playback_mode === 'Live' ?
+                this.channelsStore.channel.current.id : this.playerStore.recorded_program.channel?.id;
+            return `${Utils.api_base_url}/channels/${channel_id}/logo`;
         },
     },
     methods: {

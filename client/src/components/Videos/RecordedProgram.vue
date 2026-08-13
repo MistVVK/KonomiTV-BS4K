@@ -1,18 +1,27 @@
 <template>
-    <router-link v-ripple class="recorded-program"
-        :to="program.recorded_video.status === 'Recorded' ? `/videos/watch/${program.id}` : { path: '' }"
+    <component :is="rootTag" v-ripple class="recorded-program" v-bind="rootBindings"
         :class="{
             'recorded-program--recording': program.recorded_video.status === 'Recording',
             'recorded-program--failed': program.recorded_video.status === 'AnalysisFailed',
+            'recorded-program--offline': forOffline,
+            'recorded-program--offline-blocked': isOfflineInteractionBlocked,
         }">
         <div class="recorded-program__container">
             <div class="recorded-program__thumbnail">
                 <img class="recorded-program__thumbnail-image" loading="lazy" decoding="async"
-                    :src="`${Utils.api_base_url}/videos/${program.id}/thumbnail`">
+                    :src="thumbnailURL" @error="useFallbackThumbnail = true">
                 <div class="recorded-program__thumbnail-duration">{{ProgramUtils.getProgramDuration(program)}}</div>
                 <div v-if="program.recorded_video.status === 'Recording'" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--recording">
                     <div class="recorded-program__thumbnail-status-dot"></div>
                     録画中
+                </div>
+                <div v-else-if="isOfflineJobActive" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--downloading">
+                    <Icon icon="fluent:arrow-download-16-filled" width="13px" height="13px" />
+                    {{offlineDownloadStateLabel}}
+                </div>
+                <div v-else-if="isOfflineJobFailed" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--failed">
+                    <Icon icon="fluent:error-circle-12-regular" width="15px" height="15px" />
+                    保存失敗
                 </div>
                 <div v-else-if="program.recorded_video.status === 'AnalysisFailed'" class="recorded-program__thumbnail-status recorded-program__thumbnail-status--failed">
                     <Icon icon="fluent:error-circle-12-regular" width="15px" height="15px" />
@@ -38,10 +47,19 @@
             <div class="recorded-program__content">
                 <div class="recorded-program__content-title"
                     v-html="ProgramUtils.decorateProgramInfo(program, 'title')"></div>
+                <div v-if="forOffline" class="recorded-program__content-offline-meta">
+                    <v-chip v-if="offlineQualityLabel !== null" color="info" size="small" variant="tonal">
+                        {{offlineQualityLabel}}
+                    </v-chip>
+                    <v-chip v-if="offlineSizeLabel !== null" color="info" size="small" variant="tonal">
+                        {{offlineSizeLabel}}
+                    </v-chip>
+                </div>
                 <div class="recorded-program__content-meta">
                     <div class="recorded-program__content-meta-broadcaster" v-if="program.channel">
                         <img class="recorded-program__content-meta-broadcaster-icon" loading="lazy" decoding="async"
-                            :src="`${Utils.api_base_url}/channels/${program.channel.id}/logo`">
+                            :src="offlineVideo !== null ? OfflineVideos.getAssetURL(offlineVideo, 'channel-logo') :
+                                `${Utils.api_base_url}/channels/${program.channel.id}/logo`">
                         <span class="recorded-program__content-meta-broadcaster-name">Ch: {{program.channel.channel_number}} {{program.channel.name}}</span>
                     </div>
                     <div class="recorded-program__content-meta-broadcaster" v-else>
@@ -49,10 +67,13 @@
                     </div>
                     <div class="recorded-program__content-meta-time">{{ProgramUtils.getProgramTime(program)}}</div>
                 </div>
-                <div class="recorded-program__content-description"
+                <div v-if="isOfflineJobFailed && offlineDownloadJob?.error" class="recorded-program__content-description text-error-readable">
+                    {{offlineDownloadJob.error}}
+                </div>
+                <div v-else class="recorded-program__content-description"
                     v-html="ProgramUtils.decorateProgramInfo(program, 'description')"></div>
             </div>
-            <div v-if="!forWatchedHistory" v-ripple class="recorded-program__mylist"
+            <div v-if="!forWatchedHistory && !forOffline" v-ripple class="recorded-program__mylist"
                 :class="{'recorded-program__mylist--highlight': isInMylist && !forMylist}"
                 v-ftooltip="isInMylist ? 'マイリストから削除する' : 'マイリストに追加する'"
                 @click.prevent.stop="toggleMylist"
@@ -71,6 +92,19 @@
                     </svg>
                 </template>
             </div>
+            <div v-if="forOffline && isOfflineJobActive" v-ripple class="recorded-program__mylist"
+                v-ftooltip="'キャンセル'" @click.prevent.stop="cancelOfflineDownload" @mousedown.prevent.stop="">
+                <Icon icon="fluent:dismiss-16-regular" width="22px" height="22px" />
+            </div>
+            <div v-else-if="forOffline && isOfflineJobFailed" v-ripple class="recorded-program__mylist"
+                v-ftooltip="'閉じる'" @click.prevent.stop="dismissOfflineDownload" @mousedown.prevent.stop="">
+                <Icon icon="fluent:dismiss-16-regular" width="22px" height="22px" />
+            </div>
+            <div v-else-if="forOffline && offlineVideo !== null" v-ripple class="recorded-program__mylist"
+                v-ftooltip="'オフライン保存を削除する'" @click.prevent.stop="showOfflineDeleteConfirmation = true"
+                @mousedown.prevent.stop="">
+                <Icon icon="fluent:delete-20-regular" width="22px" height="22px" />
+            </div>
             <div v-if="forWatchedHistory" v-ripple class="recorded-program__mylist"
                 v-ftooltip="'視聴履歴から削除する'"
                 @click.prevent.stop="removeFromWatchedHistory"
@@ -79,7 +113,7 @@
                     <path fill="currentColor" d="M7 3h2a1 1 0 0 0-2 0M6 3a2 2 0 1 1 4 0h4a.5.5 0 0 1 0 1h-.564l-1.205 8.838A2.5 2.5 0 0 1 9.754 15H6.246a2.5 2.5 0 0 1-2.477-2.162L2.564 4H2a.5.5 0 0 1 0-1zm1 3.5a.5.5 0 0 0-1 0v5a.5.5 0 0 0 1 0zM9.5 6a.5.5 0 0 0-.5.5v5a.5.5 0 0 0 1 0v-5a.5.5 0 0 0-.5-.5"></path>
                 </svg>
             </div>
-            <div class="recorded-program__menu">
+            <div v-if="!forOffline" class="recorded-program__menu">
                 <v-menu location="bottom end" :close-on-content-click="true">
                     <template v-slot:activator="{ props }">
                         <div v-ripple class="recorded-program__menu-button"
@@ -92,6 +126,12 @@
                         </div>
                     </template>
                     <v-list density="compact" bg-color="background-lighten-1" class="recorded-program__menu-list">
+                        <v-list-item @click="showOfflineDownload = true" :disabled="program.recorded_video.status === 'Recording'">
+                            <template v-slot:prepend>
+                                <Icon icon="fluent:cloud-arrow-down-20-regular" width="20px" height="20px" />
+                            </template>
+                            <v-list-item-title class="ml-3">オフライン再生用に保存</v-list-item-title>
+                        </v-list-item>
                         <v-list-item @click="show_video_info = true">
                             <template v-slot:prepend>
                                 <svg width="20px" height="20px" viewBox="0 0 16 16">
@@ -137,8 +177,30 @@
                 </v-menu>
             </div>
         </div>
-    </router-link>
+        <div v-if="offlineDownloadProgress !== null" class="recorded-program__offline-progress">
+            <div class="recorded-program__offline-progress-bar" :style="`width: ${offlineDownloadProgress}%`"></div>
+        </div>
+    </component>
     <RecordedFileInfoDialog :program="program" v-model:show="show_video_info" />
+    <OfflineVideoDownloadDialog :program="program" v-model:show="showOfflineDownload" />
+
+    <v-dialog v-model="showOfflineDeleteConfirmation" max-width="620">
+        <v-card>
+            <v-card-title class="d-flex justify-center pt-6 font-weight-bold">オフライン保存を削除しますか？</v-card-title>
+            <v-card-text class="pt-2 pb-0">
+                <v-alert color="info" variant="tonal">
+                    端末に保存した再生用データだけを削除します。サーバー上の録画ファイルは削除されません。
+                </v-alert>
+            </v-card-text>
+            <v-card-actions class="pt-4 px-6 pb-6">
+                <v-spacer />
+                <v-btn color="text" variant="text" @click="showOfflineDeleteConfirmation = false">キャンセル</v-btn>
+                <v-btn color="error" variant="flat" :loading="isDeletingOfflineVideo" @click="deleteOfflineVideo">
+                    オフライン保存を削除
+                </v-btn>
+            </v-card-actions>
+        </v-card>
+    </v-dialog>
 
     <!-- 録画ファイル削除確認ダイアログ -->
     <v-dialog max-width="750" v-model="show_delete_confirmation">
@@ -167,11 +229,13 @@
 </template>
 <script lang="ts" setup>
 
-import { ref, computed, onBeforeUnmount } from 'vue';
+import { ref, computed, onBeforeUnmount, watch } from 'vue';
 
+import OfflineVideoDownloadDialog from '@/components/Videos/Dialogs/OfflineVideoDownloadDialog.vue';
 import RecordedFileInfoDialog from '@/components/Videos/Dialogs/RecordedFileInfoDialog.vue';
 import Message from '@/message';
 import AnalysisTasks from '@/services/AnalysisTasks';
+import OfflineVideos, { type IOfflineDownloadJob, type IOfflineVideo } from '@/services/OfflineVideos';
 import Videos, { IRecordedProgram } from '@/services/Videos';
 import useSettingsStore from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
@@ -182,20 +246,32 @@ const props = withDefaults(defineProps<{
     program: IRecordedProgram;
     forMylist?: boolean;
     forWatchedHistory?: boolean;
+    forOffline?: boolean;
+    offlineVideo?: IOfflineVideo | null;
+    offlineDownloadJob?: IOfflineDownloadJob | null;
 }>(), {
     forMylist: false,
     forWatchedHistory: false,
+    forOffline: false,
+    offlineVideo: null,
+    offlineDownloadJob: null,
 });
 
 // Emits
 const emit = defineEmits<{
     (e: 'deleted', id: number): void;
+    (e: 'cancelOfflineJob', jobID: string): void;
+    (e: 'dismissOfflineJob', jobID: string): void;
 }>();
 
 // ファイル情報ダイアログの表示状態
 const show_video_info = ref(false);
 // 削除確認ダイアログの表示状態
 const show_delete_confirmation = ref(false);
+const showOfflineDownload = ref(false);
+const showOfflineDeleteConfirmation = ref(false);
+const isDeletingOfflineVideo = ref(false);
+const useFallbackThumbnail = ref(false);
 // CM 再判定の受付・履歴ポーリングを同じ録画カード内で重複させない
 const isCMAnalysisRequesting = ref(false);
 let cmAnalysisAbortController: AbortController | null = null;
@@ -349,6 +425,71 @@ const removeFromWatchedHistory = () => {
     Message.show('視聴履歴から削除しました。');
 };
 
+watch(() => props.offlineVideo?.generation_id, () => {
+    useFallbackThumbnail.value = false;
+});
+
+const thumbnailURL = computed(() => {
+    if (props.offlineVideo !== null) {
+        return useFallbackThumbnail.value === false ?
+            OfflineVideos.getAssetURL(props.offlineVideo, 'thumbnail.webp') : '/assets/images/logo.svg';
+    }
+    return `${Utils.api_base_url}/videos/${props.program.id}/thumbnail`;
+});
+const isOfflineJobActive = computed(() => props.offlineDownloadJob !== null &&
+    ['Waiting', 'Downloading', 'Finalizing'].includes(props.offlineDownloadJob.state));
+const isOfflineJobFailed = computed(() => props.offlineDownloadJob?.state === 'Failed');
+const isOfflineInteractionBlocked = computed(() => props.forOffline && props.offlineVideo === null &&
+    (isOfflineJobActive.value || isOfflineJobFailed.value));
+const rootTag = computed(() => isOfflineInteractionBlocked.value ? 'div' : 'router-link');
+const rootBindings = computed(() => rootTag.value === 'router-link' ? {
+    to: props.program.recorded_video.status === 'Recorded' ?
+        (props.forOffline ? `/videos/watch/${props.program.id}?source=offline` : `/videos/watch/${props.program.id}`) :
+        {path: ''},
+} : {});
+const offlineDownloadStateLabel = computed(() => {
+    const labels = {Waiting: '待機中', Downloading: 'ダウンロード中', Finalizing: '保存処理中'} as const;
+    return props.offlineDownloadJob !== null && props.offlineDownloadJob.state in labels ?
+        labels[props.offlineDownloadJob.state as keyof typeof labels] : '';
+});
+const offlineQualityLabel = computed(() => {
+    const quality = props.offlineDownloadJob?.quality ?? props.offlineVideo?.quality ?? null;
+    return quality === null ? null : OfflineVideos.formatQualityLabel(quality);
+});
+const offlineSizeLabel = computed(() => {
+    if (props.offlineVideo !== null) return OfflineVideos.formatOfflineSize(props.offlineVideo.size_bytes, false);
+    if (props.offlineDownloadJob !== null) {
+        return OfflineVideos.formatOfflineSize(props.offlineDownloadJob.estimated_size_bytes, true);
+    }
+    return null;
+});
+const offlineDownloadProgress = computed(() => {
+    if (isOfflineJobActive.value === false || props.offlineDownloadJob === null ||
+        props.offlineDownloadJob.estimated_size_bytes <= 0) return null;
+    return Math.min(99, props.offlineDownloadJob.downloaded_bytes /
+        props.offlineDownloadJob.estimated_size_bytes * 100);
+});
+const cancelOfflineDownload = (): void => {
+    if (props.offlineDownloadJob !== null) emit('cancelOfflineJob', props.offlineDownloadJob.job_id);
+};
+const dismissOfflineDownload = (): void => {
+    if (props.offlineDownloadJob !== null) emit('dismissOfflineJob', props.offlineDownloadJob.job_id);
+};
+const deleteOfflineVideo = async (): Promise<void> => {
+    if (props.offlineVideo === null || isDeletingOfflineVideo.value) return;
+    isDeletingOfflineVideo.value = true;
+    try {
+        await OfflineVideos.deleteVideo(props.program.id);
+        showOfflineDeleteConfirmation.value = false;
+        emit('deleted', props.program.id);
+        Message.success('オフライン保存を削除しました。');
+    } catch (error) {
+        Message.error(error instanceof Error ? error.message : 'オフライン保存を削除できませんでした。');
+    } finally {
+        isDeletingOfflineVideo.value = false;
+    }
+};
+
 // 録画ファイル削除確認ダイアログを表示
 const showDeleteConfirmation = () => {
     const userStore = useUserStore();
@@ -487,6 +628,10 @@ const deleteVideo = async () => {
                 animation: playback-index-spin 1.5s linear infinite;
             }
 
+            &--downloading svg {
+                color: rgb(var(--v-theme-primary));
+            }
+
             &-dot {
                 width: 7px;
                 height: 7px;
@@ -559,6 +704,12 @@ const deleteVideo = async () => {
                 -webkit-line-clamp: 2;  // 2行までに制限
                 -webkit-box-orient: vertical;
             }
+        }
+
+        &-offline-meta {
+            display: flex;
+            gap: 6px;
+            margin-top: 5px;
         }
 
         &-meta {
@@ -864,7 +1015,22 @@ const deleteVideo = async () => {
         }
     }
 
-    &--recording, &--failed {
+    &__offline-progress {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        left: 0;
+        height: 3px;
+        background: rgba(0, 0, 0, 0.35);
+
+        &-bar {
+            height: 100%;
+            background: rgb(var(--v-theme-secondary-lighten-1));
+            transition: width 0.2s ease;
+        }
+    }
+
+    &--recording, &--failed, &--offline-blocked {
         pointer-events: none;
         &:hover {
             background: rgb(var(--v-theme-background-lighten-1));
@@ -878,6 +1044,10 @@ const deleteVideo = async () => {
         .recorded-program__menu {
             pointer-events: auto;
         }
+    }
+
+    &--offline .recorded-program__mylist {
+        top: 50%;
     }
 }
 

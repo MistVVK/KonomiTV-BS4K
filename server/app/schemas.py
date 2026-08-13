@@ -377,6 +377,25 @@ class KonomiTVBS4KPlaybackCapabilities(PydanticModel):
     audio: list[KonomiTVBS4KPlaybackAudioCapability]
     live_combinations: list[KonomiTVBS4KPlaybackLiveCombinationCapability]
 
+
+class KonomiTVBS4KOfflineStreamMetadata(BaseModel):
+    """KonomiTV-BS4K fMP4 オフライン保存ストリームの識別情報。"""
+
+    video_id: int
+    file_hash: str
+    quality: str
+    video_codec: Literal['avc', 'hevc', 'vp9', 'av1']
+    video_bit_depth: Literal[8, 10]
+    requested_audio_codec: Literal['aac', 'opus']
+    audio_codec: Literal['aac', 'opus']
+
+
+class KonomiTVBS4KOfflineStreamEstimate(BaseModel):
+    """オフライン保存に必要な概算容量。"""
+
+    estimated_size_bytes: int
+    required_size_bytes: int
+
 # ***** バックグラウンド解析履歴 *****
 
 class AnalysisTaskExecution(BaseModel):

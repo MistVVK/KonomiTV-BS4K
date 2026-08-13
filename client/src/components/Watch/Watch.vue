@@ -7,6 +7,7 @@
                 'watch-container--document-pip': playerStore.is_document_pip,
                 'watch-container--video': playback_mode === 'Video',
                 'watch-container--playback-index-waiting': playback_mode === 'Video' &&
+                    playerStore.is_offline_playback === false &&
                     playerStore.recorded_program.recorded_video.playback_index_state !== 'Ready',
             }">
             <WatchNavigation />

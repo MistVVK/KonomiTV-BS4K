@@ -8,6 +8,7 @@ import mpegts from 'mpegts.js';
 import { watch } from 'vue';
 
 import APIClient from '@/services/APIClient';
+import OfflineVideos from '@/services/OfflineVideos';
 import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
 import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
@@ -20,7 +21,7 @@ import LiveEventManager from '@/services/player/managers/LiveEventManager';
 import MediaSessionManager from '@/services/player/managers/MediaSessionManager';
 import RecordedCMSkipManager from '@/services/player/managers/RecordedCMSkipManager';
 import PlayerManager from '@/services/player/PlayerManager';
-import Videos from '@/services/Videos';
+import Videos, { type IJikkyoComments } from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore, {
@@ -126,6 +127,9 @@ class PlayerController {
 
     // ビデオ視聴: ビデオストリームのアクティブ状態を維持するために Keep-Alive API にリクエストを送るインターバルのキャンセルする関数
     private video_keep_alive_interval_timer_cancel: (() => void) | null = null;
+
+    // ビデオ視聴: 通信失敗時の保存版への切り替えが重複して走っているか
+    private is_offline_fallback_in_progress = false;
 
     // 同じ hls.js インスタンスへ音声トラックイベントを重複登録しないための記録
     private readonly recorded_hls_audio_selector_instances = new WeakSet<Hls>();
@@ -409,6 +413,7 @@ class PlayerController {
         this.recorded_playback_ended = false;
         this.recorded_playback_end_blocked_by_seek = false;
         this.recorded_auto_skip_cm_target = null;
+        this.is_offline_fallback_in_progress = false;
 
         // PlayerStore にプレイヤーを初期化したことを通知する
         // 実際にはこの時点ではプレイヤーの初期化は完了していないが、PlayerController.init() を実行したことが通知されることが重要
@@ -421,15 +426,17 @@ class PlayerController {
         const is_bs4k_stream = this.playback_mode === 'Live' ?
             channels_store.channel.current.display_channel_id.startsWith('bs4k') :
             player_store.recorded_program.network_id === 0x000B;
-        const saved_video_codec = is_bs4k_stream ?
+        const offline_video = this.playback_mode === 'Video' && player_store.is_offline_playback === true ?
+            player_store.offline_video : null;
+        const saved_video_codec = offline_video?.video_codec ?? (is_bs4k_stream ?
             this.quality_profile.bs4k_playback_video_codec :
-            this.quality_profile.playback_video_codec;
-        const saved_audio_codec = is_bs4k_stream ?
+            this.quality_profile.playback_video_codec);
+        const saved_audio_codec = offline_video?.audio_codec ?? (is_bs4k_stream ?
             this.quality_profile.bs4k_playback_audio_codec :
-            this.quality_profile.playback_audio_codec;
-        const requested_video_codec =
+            this.quality_profile.playback_audio_codec);
+        const requested_video_codec = offline_video?.video_codec ??
             player_store.konomitv_bs4k_playback_codec_override?.video_codec ?? saved_video_codec;
-        const requested_audio_codec =
+        const requested_audio_codec = offline_video?.requested_audio_codec ??
             player_store.konomitv_bs4k_playback_codec_override?.audio_codec ?? saved_audio_codec;
         // 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
         const encoder = is_bs4k_stream === true ?
@@ -442,9 +449,9 @@ class PlayerController {
             this.playback_mode === 'Live' &&
             channels_store.channel.current.is_oneseg === true
         );
-        const saved_streaming_quality = is_bs4k_stream ?
+        const saved_streaming_quality = (offline_video?.quality.replace(/-24fps$/, '') ?? (is_bs4k_stream ?
             this.quality_profile.bs4k_playback_streaming_quality :
-            this.quality_profile.playback_streaming_quality;
+            this.quality_profile.playback_streaming_quality)) as LiveStreamingQuality | BS4KLiveStreamingQuality;
         const available_streaming_qualities = is_bs4k_stream ?
             BS4K_LIVE_STREAMING_QUALITIES :
             (this.playback_mode === 'Live' ? LIVE_STREAMING_QUALITIES : VIDEO_STREAMING_QUALITIES);
@@ -481,7 +488,16 @@ class PlayerController {
             throw new Error(`Unknown playback quality for codec preflight: ${options.default_quality}`);
         }
 
-        let effective_playback_profile = player_store.konomitv_bs4k_effective_playback_profile;
+        let effective_playback_profile = offline_video === null ?
+            player_store.konomitv_bs4k_effective_playback_profile : {
+                target_key: playback_target_key,
+                encoder,
+                requested_video_codec: offline_video.video_codec,
+                requested_audio_codec: offline_video.requested_audio_codec,
+                video_codec: offline_video.video_codec,
+                video_bit_depth: offline_video.video_bit_depth,
+                audio_codec: offline_video.audio_codec,
+            };
         if (
             effective_playback_profile === null ||
             effective_playback_profile.target_key !== playback_target_key ||
@@ -515,8 +531,9 @@ class PlayerController {
                 video_bit_depth: preflight_profile.video_bit_depth,
                 audio_codec: preflight_profile.audio_codec,
             };
-            player_store.konomitv_bs4k_effective_playback_profile = effective_playback_profile;
         }
+        // 保存版でも設定パネル・エラー処理が同じ確定済み tuple を参照できるよう Store へ反映する
+        player_store.konomitv_bs4k_effective_playback_profile = effective_playback_profile;
         const effective_video_codec = effective_playback_profile.video_codec;
         const effective_video_bit_depth = effective_playback_profile.video_bit_depth;
         const effective_audio_codec = effective_playback_profile.audio_codec;
@@ -525,7 +542,8 @@ class PlayerController {
             effective_video_codec === 'hevc' && effective_video_bit_depth === 10;
 
         // ブラウザが MSE in Worker での H.265 / HEVC 再生に対応しているかどうか
-        const is_hevc_video_supported_in_worker = await mpegts.supportWorkerForMSEH265Playback();
+        const is_hevc_video_supported_in_worker = this.playback_mode === 'Live' ?
+            await mpegts.supportWorkerForMSEH265Playback() : true;
         this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
 
         const is_bs4k_live_playback = (
@@ -812,6 +830,27 @@ class PlayerController {
 
                 // ビデオ視聴: 録画番組情報がセットされているはず
                 } else {
+                    // 保存済みの master playlist は自己完結しているため、通常の録画セッション API を一切作らない
+                    if (offline_video !== null) {
+                        const offline_quality_name = `オフライン保存 (${OfflineVideos.formatQualityLabel(offline_video.quality)})`;
+                        const tile_info = player_store.recorded_program.recorded_video.thumbnail_info?.tile ?? null;
+                        return {
+                            quality: [{
+                                name: offline_quality_name,
+                                type: 'hls',
+                                url: OfflineVideos.getPlaylistURL(offline_video),
+                            }],
+                            defaultQuality: offline_quality_name,
+                            thumbnails: tile_info !== null ? {
+                                url: OfflineVideos.getAssetURL(offline_video, 'thumbnail-tiled.webp'),
+                                interval: tile_info.interval_sec,
+                                width: tile_info.tile_width,
+                                height: tile_info.tile_height,
+                                columnCount: tile_info.column_count,
+                            } : undefined,
+                        };
+                    }
+
                     // ビデオストリーミング API のベース URL
                     const streaming_api_base_url = `${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}`;
                     // 画質リストを作成
@@ -920,7 +959,30 @@ class PlayerController {
                         options.success([]);
                     } else {
                         // ビデオ視聴: 過去ログコメントを取得して返す
-                        const jikkyo_comments = await Videos.fetchVideoJikkyoComments(player_store.recorded_program.id);
+                        let jikkyo_comments: IJikkyoComments;
+                        if (player_store.is_offline_playback === true && player_store.offline_video !== null) {
+                            try {
+                                const response = await fetch(OfflineVideos.getAssetURL(
+                                    player_store.offline_video,
+                                    'jikkyo.json',
+                                ));
+                                jikkyo_comments = response.ok === true ? await response.json() as IJikkyoComments : {
+                                    is_success: true,
+                                    comments: [],
+                                    detail: '保存時点の過去ログコメントはありません。',
+                                };
+                            } catch (error) {
+                                // 付随データの欠損で保存映像の再生を止めず、コメントなしとして続行する
+                                console.warn('\u001b[31m[PlayerController] Failed to read saved jikkyo comments:', error);
+                                jikkyo_comments = {
+                                    is_success: true,
+                                    comments: [],
+                                    detail: '保存時点の過去ログコメントはありません。',
+                                };
+                            }
+                        } else {
+                            jikkyo_comments = await Videos.fetchVideoJikkyoComments(player_store.recorded_program.id);
+                        }
                         if (jikkyo_comments.is_success === false) {
                             // 取得に失敗した場合はコメントリストにエラーメッセージを表示する
                             // ただし「この録画番組の過去ログコメントは存在しないか、現在取得中です。」の場合はエラー扱いしない
@@ -1042,7 +1104,7 @@ class PlayerController {
                     startPosition: seek_seconds,
                     // カスタムバッファコントローラーを設定
                     // @ts-ignore
-                    bufferController: CustomBufferController,
+                    bufferController: offline_video === null ? CustomBufferController : Hls.DefaultConfig.bufferController,
                     // シーク前に開始済みだった古いFragment要求が、新しいエンコードタスクを
                     // キャンセルしないよう、全セグメント要求へ現在のシーク世代番号を付与する。
                     fetchSetup: (context: { url: string }, initParams: RequestInit) => {
@@ -1243,6 +1305,7 @@ class PlayerController {
         // fMP4 経路ではARIB生字幕を映像から分離し、シーク復元点と後続12秒を先読みする。
         if (
             this.playback_mode === 'Video' &&
+            player_store.is_offline_playback === false &&
             player_store.recorded_program.recorded_video.playback_index_status === 'Ready'
         ) {
             const arib_track = player_store.recorded_program.recorded_video.subtitle_tracks.find((track) =>
@@ -1914,7 +1977,7 @@ class PlayerController {
         // HLS プレイリストやセグメントのリクエストが行われたタイミングでも Keep-Alive が行われるが、
         // それだけではタイミング次第では十分ではないため、定期的に Keep-Alive を行う
         // Keep-Alive が行われなくなったタイミングで、サーバー側で自動的にビデオストリームの終了処理 (エンコードタスクの停止) が行われる
-        if (this.playback_mode === 'Video') {
+        if (this.playback_mode === 'Video' && player_store.is_offline_playback === false) {
             this.video_keep_alive_interval_timer_cancel = Utils.setIntervalInWorker(async () => {
                 // 画質切り替えでベース URL が変わることも想定し、あえて毎回 API URL を取得している
                 if (this.player === null) return;
@@ -2802,6 +2865,43 @@ class PlayerController {
 
         const player_store = usePlayerStore();
 
+        // オンライン HLS がサーバーへ届かない場合だけ、同じ録画の完成済み保存世代へ切り替える
+        // セッション切れや 4xx/5xx は通常のエラー処理へ任せ、画質の違う保存版へ落とさない
+        hls.on(Hls.Events.ERROR, async (_event, data) => {
+            const response_code = data.response?.code;
+            const is_unreachable = navigator.onLine === false ||
+                response_code === undefined ||
+                response_code === 0;
+            if (
+                data.fatal !== true ||
+                data.type !== Hls.ErrorTypes.NETWORK_ERROR ||
+                is_unreachable === false ||
+                player_store.is_offline_playback === true ||
+                this.is_offline_fallback_in_progress === true
+            ) return;
+            this.is_offline_fallback_in_progress = true;
+            try {
+                const offline_video = await OfflineVideos.getVideo(player_store.recorded_program.id);
+                if (this.destroyed === true || this.player === null || offline_video === null) return;
+                player_store.recorded_program = offline_video.program;
+                player_store.is_offline_playback = true;
+                player_store.offline_video = offline_video;
+                player_store.konomitv_bs4k_effective_playback_profile = null;
+                player_store.event_emitter.emit('PlayerRestartRequired', {
+                    message: '通信できないため、オフライン保存した映像へ切り替えました。',
+                    is_error_message: false,
+                    should_resume_quality: false,
+                });
+            } catch (error) {
+                // IndexedDB / CacheStorage の検査失敗を hls.js の非同期イベント外へ漏らさない
+                console.error('[PlayerController] Failed to switch to offline playback:', error);
+            } finally {
+                if (player_store.is_offline_playback === false) {
+                    this.is_offline_fallback_in_progress = false;
+                }
+            }
+        });
+
         // MSE 型判定を通過していても、実際の SourceBuffer 追加・append 時に Opus が拒否されることがある。
         // 自動で AAC へ変更せず、同一 codec での一度限りの再起動と、再発時の恒久通知へ送る。
         hls.on(Hls.Events.ERROR, (_event, data) => {
@@ -3364,6 +3464,19 @@ class PlayerController {
             </div>
             ${low_latency_mode_setting_item_html}
         `);
+
+        // 保存版は生成条件を固定しているため、通信を伴う codec・回線プロファイル変更を表示しない
+        if (player_store.is_offline_playback === true) {
+            this.player.container.querySelector<HTMLElement>(
+                '.dplayer-konomitv-bs4k-setting-video-codec',
+            )!.style.display = 'none';
+            this.player.container.querySelector<HTMLElement>(
+                '.dplayer-konomitv-bs4k-setting-audio-codec',
+            )!.style.display = 'none';
+            this.player.container.querySelector<HTMLElement>(
+                '.dplayer-setting-mobile-profile',
+            )!.style.display = 'none';
+        }
 
         // DPlayer の音声トラックと同じ構成の独自サブパネルを追加する。
         const audio_codec_panel_html = `

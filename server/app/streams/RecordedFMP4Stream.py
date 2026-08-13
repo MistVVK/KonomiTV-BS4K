@@ -183,7 +183,10 @@ class RecordedFMP4Stream:
             instance.recorded_program = recorded_program
             instance.quality = quality
             instance.encoding_options = encoding_options
-            instance._effective_audio_codec = instance.__resolveEffectiveAudioCodec(encoding_options.audio_codec)
+            instance._effective_audio_codec = cls.resolveEffectiveAudioCodec(
+                recorded_program,
+                encoding_options.audio_codec,
+            )
             instance._segments = instance.__buildSegments()
             instance._referenced_paths = set()
             instance._completed_sequences = set()
@@ -271,6 +274,26 @@ class RecordedFMP4Stream:
             return (0.0, 0.0)
         completed = [self._segments[sequence] for sequence in sorted(self._completed_sequences)]
         return (completed[0].start_time, completed[-1].start_time + completed[-1].duration)
+
+    def getSegments(self) -> tuple[RecordedFMP4Segment, ...]:
+        """このセッションで固定したセグメント計画を読み取り専用で返す。
+
+        Returns:
+            tuple[RecordedFMP4Segment, ...]: 録画先頭から順に並んだセグメント計画。
+        """
+
+        # オフライン保存は通常 HLS と同じ時間境界を使う必要があるため、コピーした immutable tuple を公開する。
+        return tuple(self._segments)
+
+    @property
+    def effective_audio_codec(self) -> AudioCodec:
+        """録画の実音声構成を反映した配信音声コーデックを返す。
+
+        Returns:
+            AudioCodec: Opus 非対応構成の AAC fallback も反映した実効値。
+        """
+
+        return self._effective_audio_codec
 
     @classmethod
     def getVideoBitrate(cls, quality: QUALITY_TYPES, codec: VideoCodec) -> RecordedVideoBitrate:
@@ -824,9 +847,22 @@ class RecordedFMP4Stream:
     def getAudioRenditions(self) -> list[RecordedAudioRendition]:
         """DBの音声トラックからDual Monoを展開したHLSレンディションを返す。"""
 
+        return self.getAudioRenditionsForProgram(self.recorded_program)
+
+    @classmethod
+    def getAudioRenditionsForProgram(cls, recorded_program: RecordedProgram) -> list[RecordedAudioRendition]:
+        """録画メタデータからDual Monoを展開したHLSレンディションを返す。
+
+        Args:
+            recorded_program: 音声トラックが再生索引で確定済みの録画番組。
+
+        Returns:
+            HLSへ公開する全論理音声レンディション。
+        """
+
         renditions: list[RecordedAudioRendition] = []
-        legacy_stream_offset = 1 if self.recorded_program.recorded_video.container_format == 'MPEG-TS' else 0
-        for fallback_index, track in enumerate(self.recorded_program.recorded_video.audio_tracks, start=1):
+        legacy_stream_offset = 1 if recorded_program.recorded_video.container_format == 'MPEG-TS' else 0
+        for fallback_index, track in enumerate(recorded_program.recorded_video.audio_tracks, start=1):
             track_index = int(track.get('index', fallback_index))
             stream_index = int(track.get('stream_index', track_index + legacy_stream_offset))
             language = track.get('language') or 'und'
@@ -935,17 +971,19 @@ class RecordedFMP4Stream:
                 return bitrate
         return None
 
-    def __getAudioSourceTrack(
-        self,
+    @classmethod
+    def __getAudioSourceTrackForProgram(
+        cls,
+        recorded_program: RecordedProgram,
         rendition: RecordedAudioRendition,
         start_time: float | None = None,
     ) -> AudioTrack | None:
-        """レンディションの指定時刻または代表構成に対応する索引Trackを返す。"""
+        """録画メタデータから指定時刻または代表構成に対応する索引Trackを返す。"""
 
         timeline_track = next(
             (
                 track
-                for interval in self.recorded_program.recorded_video.audio_track_timeline
+                for interval in recorded_program.recorded_video.audio_track_timeline
                 if start_time is None or
                 float(interval['start_time']) <= start_time < float(interval['end_time'])
                 for track in interval['tracks']
@@ -957,11 +995,20 @@ class RecordedFMP4Stream:
             return timeline_track
         return next(
             (
-                track for track in self.recorded_program.recorded_video.audio_tracks
+                track for track in recorded_program.recorded_video.audio_tracks
                 if int(track.get('index', 0)) == rendition.track_index
             ),
             None,
         )
+
+    def __getAudioSourceTrack(
+        self,
+        rendition: RecordedAudioRendition,
+        start_time: float | None = None,
+    ) -> AudioTrack | None:
+        """このセッションの指定時刻または代表構成に対応する索引Trackを返す。"""
+
+        return self.__getAudioSourceTrackForProgram(self.recorded_program, rendition, start_time)
 
     def __getAudioRenditionChannelCount(
         self,
@@ -976,24 +1023,34 @@ class RecordedFMP4Stream:
         source_track = self.__getAudioSourceTrack(rendition, start_time)
         return self.getAudioChannelCount(source_track) if source_track is not None else None
 
-    def __getAudioRenditionChannelCounts(self, rendition: RecordedAudioRendition) -> list[int] | None:
-        """録画全区間で出現するレンディションのチャンネル数を返す。"""
+    @classmethod
+    def __getAudioRenditionChannelCountsForProgram(
+        cls,
+        recorded_program: RecordedProgram,
+        rendition: RecordedAudioRendition,
+    ) -> list[int] | None:
+        """録画メタデータから全区間に出現するレンディションのチャンネル数を返す。"""
 
         if rendition.channel in ('main', 'sub'):
             return [1]
         source_tracks = [
             track
-            for interval in self.recorded_program.recorded_video.audio_track_timeline
+            for interval in recorded_program.recorded_video.audio_track_timeline
             for track in interval['tracks']
             if int(track.get('index', 0)) == rendition.track_index
         ]
         if len(source_tracks) == 0:
-            source_track = self.__getAudioSourceTrack(rendition)
+            source_track = cls.__getAudioSourceTrackForProgram(recorded_program, rendition)
             source_tracks = [source_track] if source_track is not None else []
-        channel_counts = [self.getAudioChannelCount(track) for track in source_tracks]
+        channel_counts = [cls.getAudioChannelCount(track) for track in source_tracks]
         if len(channel_counts) == 0 or any(channels is None for channels in channel_counts):
             return None
         return sorted({channels for channels in channel_counts if channels is not None})
+
+    def __getAudioRenditionChannelCounts(self, rendition: RecordedAudioRendition) -> list[int] | None:
+        """このセッションの録画全区間に出現するレンディションのチャンネル数を返す。"""
+
+        return self.__getAudioRenditionChannelCountsForProgram(self.recorded_program, rendition)
 
     def __getMaximumAudioRenditionChannelCount(self, rendition: RecordedAudioRendition) -> int | None:
         """masterのCHANNELS/BANDWIDTHへ使う録画全区間の最大チャンネル数を返す。"""
@@ -1046,22 +1103,35 @@ class RecordedFMP4Stream:
             return None
         return max(channels for channels in channel_counts if channels is not None)
 
-    def __resolveEffectiveAudioCodec(self, requested_codec: AudioCodec) -> AudioCodec:
-        """録画の実音声構成からセッション全体の実効音声方式を決定する。"""
+    @classmethod
+    def resolveEffectiveAudioCodec(
+        cls,
+        recorded_program: RecordedProgram,
+        requested_codec: AudioCodec,
+    ) -> AudioCodec:
+        """録画の実音声構成からセッション全体の実効音声方式を決定する。
+
+        Args:
+            recorded_program: 音声トラックと構成タイムラインが確定済みの録画番組。
+            requested_codec: クライアントが要求した音声コーデック。
+
+        Returns:
+            Opus非対応構成のAAC fallbackを反映した実効音声コーデック。
+        """
 
         if requested_codec == 'opus':
             # Opusは既知の1～8ch構成だけを保持してエンコードする。未知layoutを暗黙に
             # stereoへdownmixせず、セッション全体を互換性の高いAACへ切り替える。
-            renditions = self.getAudioRenditions()
+            renditions = cls.getAudioRenditionsForProgram(recorded_program)
             if len(renditions) == 0 or any(
                 channel_counts is None or
-                any(self.getOpusBitrate(channels) is None for channels in channel_counts)
+                any(cls.getOpusBitrate(channels) is None for channels in channel_counts)
                 for rendition in renditions
-                for channel_counts in [self.__getAudioRenditionChannelCounts(rendition)]
+                for channel_counts in [cls.__getAudioRenditionChannelCountsForProgram(recorded_program, rendition)]
             ):
                 logging.warning(
                     '[RecordedFMP4Stream] Opus channel layout is unsupported; falling back to AAC. '
-                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}]'
+                    f'[recorded_video_id: {recorded_program.recorded_video.id}]'
                 )
                 return 'aac'
         return requested_codec

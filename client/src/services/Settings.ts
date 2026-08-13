@@ -67,6 +67,13 @@ export interface IClientSettings {
     video_series_sort_key: VideoSeriesSortKey;
     video_series_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
+    // konomitv_bs4k_offline_video_streaming_quality: 同期無効
+    // konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
+    // konomitv_bs4k_offline_video_codec: 同期無効
+    // konomitv_bs4k_offline_video_codec_for_bs4k: 同期無効
+    // konomitv_bs4k_offline_audio_codec: 同期無効
+    // konomitv_bs4k_offline_audio_codec_for_bs4k: 同期無効
+    // konomitv_bs4k_offline_video_24fps_mode: 同期無効
     // tv_streaming_quality: 同期無効
     // tv_streaming_quality_cellular: 同期無効
     // bs4k_streaming_quality: 同期無効

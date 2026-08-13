@@ -20,11 +20,11 @@
                 :class="{'watch-panel__content--active': panel_active_tab === 'RecordedProgram'}" />
             <Channel class="watch-panel__content" v-if="playback_mode === 'Live'"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Channel'}" />
-            <Series class="watch-panel__content" v-if="playback_mode === 'Video'"
+            <Series class="watch-panel__content" v-if="playback_mode === 'Video' && playerStore.is_offline_playback === false"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Series'}" />
             <Comment class="watch-panel__content" v-if="settingsStore.is_jikkyo_enabled" :playback_mode="playback_mode"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Comment'}" />
-            <Twitter class="watch-panel__content" :playback_mode="playback_mode"
+            <Twitter class="watch-panel__content" v-if="playerStore.is_offline_playback === false" :playback_mode="playback_mode"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Twitter'}" />
             <button v-ripple class="watch-panel__content-remocon-button elevation-8" v-if="playback_mode === 'Live'"
                 :class="{'watch-panel__content-remocon-button--active': panel_active_tab === 'Program' || panel_active_tab === 'Channel'}"
@@ -43,8 +43,8 @@
                 <span class="panel-navigation-button__text">番組情報</span>
             </div>
             <div v-ripple class="panel-navigation-button" v-if="playback_mode === 'Video'"
-                 :class="{'panel-navigation-button--active': panel_active_tab === 'RecordedProgram'}"
-                 @click="playerStore.video_panel_active_tab = 'RecordedProgram'">
+                  :class="{'panel-navigation-button--active': panel_active_tab === 'RecordedProgram'}"
+                  @click="playerStore.video_panel_active_tab = 'RecordedProgram'">
                 <Icon class="panel-navigation-button__icon" icon="fa-solid:info-circle" width="33px" />
                 <span class="panel-navigation-button__text">番組情報</span>
             </div>
@@ -54,9 +54,9 @@
                 <Icon class="panel-navigation-button__icon" icon="fa-solid:broadcast-tower" width="34px" />
                 <span class="panel-navigation-button__text">チャンネル</span>
             </div>
-            <div v-ripple class="panel-navigation-button" v-if="playback_mode === 'Video'"
-                 :class="{'panel-navigation-button--active': panel_active_tab === 'Series'}"
-                 @click="playerStore.video_panel_active_tab = 'Series'">
+            <div v-ripple class="panel-navigation-button" v-if="playback_mode === 'Video' && playerStore.is_offline_playback === false"
+                  :class="{'panel-navigation-button--active': panel_active_tab === 'Series'}"
+                  @click="playerStore.video_panel_active_tab = 'Series'">
                 <Icon class="panel-navigation-button__icon" icon="fluent:video-clip-multiple-16-filled" width="34px"
                     style="width: 39px; height: 39px; margin-top: -4px; margin-bottom: -4px;" />
                 <span class="panel-navigation-button__text">シリーズ</span>
@@ -67,7 +67,7 @@
                 <Icon class="panel-navigation-button__icon" icon="bi:chat-left-text-fill" width="29px" />
                 <span class="panel-navigation-button__text">コメント</span>
             </div>
-            <div v-ripple class="panel-navigation-button"
+            <div v-ripple class="panel-navigation-button" v-if="playerStore.is_offline_playback === false"
                  :class="{'panel-navigation-button--active': panel_active_tab === 'Twitter'}"
                  @click="playback_mode === 'Live' ? playerStore.tv_panel_active_tab = 'Twitter' : playerStore.video_panel_active_tab = 'Twitter'">
                 <Icon class="panel-navigation-button__icon" icon="fa-brands:twitter" width="34px" />
@@ -128,6 +128,13 @@ export default defineComponent({
                 }
                 return this.playerStore.tv_panel_active_tab;
             } else {
+                // 保存版では通信が必要な Series / Twitter タブを表示せず、ローカルだけで描画できるタブへ退避する
+                if (
+                    this.playerStore.is_offline_playback === true &&
+                    ['Series', 'Twitter'].includes(this.playerStore.video_panel_active_tab)
+                ) {
+                    return 'RecordedProgram';
+                }
                 // 録画再生でも同様に、コメントタブの保存値は次回有効化時のために保持する
                 if (this.settingsStore.is_jikkyo_enabled === false && this.playerStore.video_panel_active_tab === 'Comment') {
                     return 'RecordedProgram';

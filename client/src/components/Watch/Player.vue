@@ -91,6 +91,7 @@ const settingsStore = useSettingsStore();
 // 軽量Metadataと現行Versionの再生索引だけを再生開始条件にする。
 // CM判定とサムネイル生成の状態はここへ含めない。
 const isRecordedAnalysisBlocking = computed(() => {
+    if (playerStore.is_offline_playback === true) return false;
     const recorded_video = playerStore.recorded_program.recorded_video;
     return recorded_video.status !== 'Recorded' || recorded_video.playback_index_state !== 'Ready';
 });

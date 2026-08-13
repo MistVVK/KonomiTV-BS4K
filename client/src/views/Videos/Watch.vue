@@ -7,6 +7,7 @@ import { mapStores } from 'pinia';
 import { defineComponent, markRaw } from 'vue';
 
 import Watch from '@/components/Watch/Watch.vue';
+import OfflineVideos from '@/services/OfflineVideos';
 import PlayerController from '@/services/player/PlayerController';
 import Series from '@/services/Series';
 import Videos from '@/services/Videos';
@@ -50,7 +51,7 @@ export default defineComponent({
         this.playerStore.event_emitter.on('RecordedPlaybackEnded', this.handleRecordedPlaybackEnded);
 
         // 再生セッションを初期化
-        void this.startPlayback(Number(this.$route.params.video_id));
+        void this.startPlayback(Number(this.$route.params.video_id), this.$route.query.source === 'offline');
     },
     // チャンネル切り替え時に実行
     // コンポーネント（インスタンス）は再利用される
@@ -61,7 +62,7 @@ export default defineComponent({
         this.invalidateNextRecordedProgramTransition();
 
         // 前の再生セッションを無効化し、最後の route だけを初期化する
-        void this.startPlayback(Number(to.params.video_id)).catch((error) => {
+        void this.startPlayback(Number(to.params.video_id), to.query.source === 'offline').catch((error) => {
             console.error('[Videos/Watch] Previous player cleanup failed during route update.', error);
         });
 
@@ -97,7 +98,7 @@ export default defineComponent({
         },
 
         /** route 世代を更新し、旧 controller の回収後に最後の route だけを初期化する。 */
-        async startPlayback(video_id: number): Promise<void> {
+        async startPlayback(video_id: number, is_offline_source: boolean): Promise<void> {
             const generation = ++this.lifecycle_generation;
             this.lifecycle_abort_controller.abort();
             const abort_controller = markRaw(new AbortController());
@@ -115,7 +116,7 @@ export default defineComponent({
             if (this.isLifecycleActive(generation, abort_controller.signal) === false) return;
 
             try {
-                await this.init(generation, abort_controller, video_id);
+                await this.init(generation, abort_controller, video_id, is_offline_source);
             } catch (error) {
                 if (this.isLifecycleActive(generation, abort_controller.signal)) {
                     console.error('[Video-Watch] Failed to initialize playback:', error);
@@ -132,6 +133,8 @@ export default defineComponent({
         /** 録画の自然完走時に、同じシリーズの次話があれば現在の再生画面から遷移する。 */
         async handleRecordedPlaybackEnded(event: PlayerEvents['RecordedPlaybackEnded']): Promise<void> {
             if (this.is_next_recorded_program_transitioning) return;
+            // 保存版の次話は端末に存在するとは限らないため、Series API を呼ばず現在の録画で停止する
+            if (this.playerStore.is_offline_playback === true) return;
 
             const ended_program_id = event.recorded_program_id;
             const route_program_id = Number(this.$route.params.video_id);
@@ -202,13 +205,32 @@ export default defineComponent({
         },
 
         // 再生セッションを初期化する
-        async init(generation: number, abort_controller: AbortController, video_id: number): Promise<void> {
+        async init(
+            generation: number,
+            abort_controller: AbortController,
+            video_id: number,
+            is_offline_source: boolean,
+        ): Promise<void> {
+
+            // オフライン保存ページからの明示遷移では、通信・能力 API・再生索引 API を呼ばず保存スナップショットを使う。
+            // 通常遷移でも番組 API が失敗した場合だけ、完成済み保存世代へフォールバックする。
+            let offline_video = is_offline_source ? await OfflineVideos.getVideo(video_id) : null;
+            if (is_offline_source === true && offline_video === null) {
+                this.$router.push({path: '/not-found/'});
+                return;
+            }
 
             // 実況機能の有効状態と録画 codec 能力の encoder を、同じ /version 応答から一度だけ確定する。
             // force=true の連続呼び出しは同一初期化で二重リクエストになるため避ける。
             // フルの /settings/server は管理者専用のため、公開 runtime 情報を使う。
             // 取得に失敗した場合は VersionStore が実況をフェイルクローズで無効として扱う。
-            const version_info = await this.versionStore.fetchServerVersion(true, abort_controller.signal);
+            let version_info = offline_video !== null ? true :
+                await this.versionStore.fetchServerVersion(true, abort_controller.signal);
+            // 通常 URL から開いた場合も、サーバーへ到達できなければ完成済み保存世代へ切り替える
+            if (version_info === null && this.isLifecycleActive(generation, abort_controller.signal) === true) {
+                offline_video = await OfflineVideos.getVideo(video_id);
+                version_info = offline_video !== null ? true : null;
+            }
             if (
                 version_info === null ||
                 this.isLifecycleActive(generation, abort_controller.signal) === false
@@ -224,17 +246,23 @@ export default defineComponent({
             }
 
             // 録画番組情報を更新する
-            let recorded_program = await Videos.fetchVideo(video_id);
+            let recorded_program = offline_video?.program ?? await Videos.fetchVideo(video_id);
             if (this.isLifecycleActive(generation, abort_controller.signal) === false) return;
+            if (recorded_program === null && offline_video === null) {
+                offline_video = await OfflineVideos.getVideo(video_id);
+                recorded_program = offline_video?.program ?? null;
+            }
             if (recorded_program === null) {
                 this.$router.push({path: '/not-found/'});
                 return;
             }
             this.playerStore.recorded_program = recorded_program;
+            this.playerStore.is_offline_playback = offline_video !== null;
+            this.playerStore.offline_video = offline_video;
 
             // 内容変更・手動再解析中は旧索引を起動せず、軽量Metadataが確定するまで待つ。
             // CM判定とサムネイル生成はこの待機条件へ含めない。
-            if (recorded_program.recorded_video.status !== 'Recorded') {
+            if (offline_video === null && recorded_program.recorded_video.status !== 'Recorded') {
                 const metadata_program = await Videos.waitForRecordedMetadata(
                     recorded_program,
                     (program) => {
@@ -257,7 +285,7 @@ export default defineComponent({
 
             // 現行Versionの索引がない間はメディアプレイヤーを生成せず、専用APIで解析を開始して待つ。
             // これにより長時間のマスタープレイリスト要求とhls.js側のタイムアウトを避ける。
-            if (recorded_program.recorded_video.playback_index_state !== 'Ready') {
+            if (offline_video === null && recorded_program.recorded_video.playback_index_state !== 'Ready') {
                 const playback_index = await Videos.waitForRecordedPlaybackIndex(
                     recorded_program.id,
                     (index) => {
@@ -331,6 +359,7 @@ export default defineComponent({
 
         // 解析失敗後に同じ録画の索引生成を再要求する
         async retryRecordedPlaybackIndex() {
+            if (this.playerStore.is_offline_playback === true) return;
             const generation = this.lifecycle_generation;
             const signal = this.lifecycle_abort_controller.signal;
             if (this.playerStore.recorded_program.recorded_video.status === 'AnalysisFailed') {
@@ -342,7 +371,7 @@ export default defineComponent({
                     return;
                 }
             }
-            void this.startPlayback(Number(this.$route.params.video_id));
+            void this.startPlayback(Number(this.$route.params.video_id), this.$route.query.source === 'offline');
         }
     }
 });

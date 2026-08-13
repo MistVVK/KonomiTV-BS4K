@@ -287,6 +287,62 @@ describe('共通再生プロファイル移行', () => {
         expect(normalized.video_encoding_codec).toBe('av1');
         expect('playback_video_codec' in normalized).toBe(false);
     });
+
+    it('不正なオフライン保存設定を現行の既定値へ戻す', () => {
+        const settings: Record<string, unknown> = structuredClone(ILocalClientSettingsDefault);
+        settings.konomitv_bs4k_offline_video_streaming_quality = 'invalid';
+        settings.konomitv_bs4k_offline_video_streaming_quality_for_bs4k = null;
+        settings.konomitv_bs4k_offline_video_codec = 'mpeg2';
+        settings.konomitv_bs4k_offline_video_codec_for_bs4k = 1;
+        settings.konomitv_bs4k_offline_audio_codec = 'mp3';
+        settings.konomitv_bs4k_offline_audio_codec_for_bs4k = false;
+        settings.konomitv_bs4k_offline_video_24fps_mode = 'false';
+
+        const normalized = getNormalizedLocalClientSettings(settings);
+
+        expect(normalized.konomitv_bs4k_offline_video_streaming_quality).toBe(
+            ILocalClientSettingsDefault.konomitv_bs4k_offline_video_streaming_quality,
+        );
+        expect(normalized.konomitv_bs4k_offline_video_streaming_quality_for_bs4k).toBe(
+            ILocalClientSettingsDefault.konomitv_bs4k_offline_video_streaming_quality_for_bs4k,
+        );
+        expect(normalized.konomitv_bs4k_offline_video_codec).toBe(
+            ILocalClientSettingsDefault.konomitv_bs4k_offline_video_codec,
+        );
+        expect(normalized.konomitv_bs4k_offline_video_codec_for_bs4k).toBe(
+            ILocalClientSettingsDefault.konomitv_bs4k_offline_video_codec_for_bs4k,
+        );
+        expect(normalized.konomitv_bs4k_offline_audio_codec).toBe(
+            ILocalClientSettingsDefault.konomitv_bs4k_offline_audio_codec,
+        );
+        expect(normalized.konomitv_bs4k_offline_audio_codec_for_bs4k).toBe(
+            ILocalClientSettingsDefault.konomitv_bs4k_offline_audio_codec_for_bs4k,
+        );
+        expect(normalized.konomitv_bs4k_offline_video_24fps_mode).toBe(
+            ILocalClientSettingsDefault.konomitv_bs4k_offline_video_24fps_mode,
+        );
+    });
+
+    it('有効なオフライン保存設定と旧 BS4K 画質を保持・移行する', () => {
+        const settings: Record<string, unknown> = structuredClone(ILocalClientSettingsDefault);
+        settings.konomitv_bs4k_offline_video_streaming_quality = '540p';
+        settings.konomitv_bs4k_offline_video_streaming_quality_for_bs4k = '720p';
+        settings.konomitv_bs4k_offline_video_codec = 'vp9';
+        settings.konomitv_bs4k_offline_video_codec_for_bs4k = 'hevc';
+        settings.konomitv_bs4k_offline_audio_codec = 'aac';
+        settings.konomitv_bs4k_offline_audio_codec_for_bs4k = 'opus';
+        settings.konomitv_bs4k_offline_video_24fps_mode = true;
+
+        const normalized = getNormalizedLocalClientSettings(settings);
+
+        expect(normalized.konomitv_bs4k_offline_video_streaming_quality).toBe('540p');
+        expect(normalized.konomitv_bs4k_offline_video_streaming_quality_for_bs4k).toBe('720p-30fps');
+        expect(normalized.konomitv_bs4k_offline_video_codec).toBe('vp9');
+        expect(normalized.konomitv_bs4k_offline_video_codec_for_bs4k).toBe('hevc');
+        expect(normalized.konomitv_bs4k_offline_audio_codec).toBe('aac');
+        expect(normalized.konomitv_bs4k_offline_audio_codec_for_bs4k).toBe('opus');
+        expect(normalized.konomitv_bs4k_offline_video_24fps_mode).toBe(true);
+    });
 });
 
 

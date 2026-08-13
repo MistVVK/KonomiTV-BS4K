@@ -48,6 +48,18 @@
                         <Icon class="navigation__link-icon" icon="fluent:image-multiple-24-regular" width="26px" />
                         <span v-if="!iconOnly" class="navigation__link-text">キャプチャ</span>
                     </router-link>
+                    <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/offline-videos/"
+                        :class="{
+                            'navigation__link--active': $route.path.startsWith('/offline-videos'),
+                            'navigation__link--icon-only': iconOnly,
+                        }"
+                        v-ftooltip.right="iconOnly ? 'オフライン保存' : ''">
+                        <span class="navigation__link-icon-wrapper">
+                            <Icon class="navigation__link-icon" icon="fluent:cloud-arrow-down-16-regular" width="26px" />
+                            <OfflineDownloadBadge />
+                        </span>
+                        <span v-if="!iconOnly" class="navigation__link-text">オフライン保存</span>
+                    </router-link>
                     <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/mylist/"
                         :class="{
                             'navigation__link--active': $route.path.startsWith('/mylist'),
@@ -145,6 +157,7 @@ import { defineComponent } from 'vue';
 
 import BottomNavigation from '@/components/BottomNavigation.vue';
 import KonomiTVBS4KActiveAnalysisTaskDialog from '@/components/KonomiTVBS4KActiveAnalysisTaskDialog.vue';
+import OfflineDownloadBadge from '@/components/OfflineDownloadBadge.vue';
 import { AnalysisTaskType } from '@/services/AnalysisTasks';
 import useAnalysisTasksStore, { stageLabel, taskTypeLabel } from '@/stores/AnalysisTasksStore';
 import useVersionStore from '@/stores/VersionStore';
@@ -154,6 +167,7 @@ export default defineComponent({
     components: {
         BottomNavigation,
         KonomiTVBS4KActiveAnalysisTaskDialog,
+        OfflineDownloadBadge,
     },
     props: {
         // アイコンのみモード: テキストを非表示にし、幅を縮小する
@@ -167,6 +181,7 @@ export default defineComponent({
         return {
             activeAnalysisTaskDialog: false,
             selectedActiveTaskType: null as AnalysisTaskType | null,
+            isAnalysisOverviewPollingStarted: false,
         };
     },
     computed: {
@@ -187,11 +202,16 @@ export default defineComponent({
         },
     },
     async created() {
+        // 保存一覧は IndexedDB と CacheStorage だけで描画し、接続判定に依存せずサーバー API を一切呼ばない
+        if (this.$route.path.startsWith('/offline-videos')) return;
         this.analysisTasksStore.startOverviewPolling();
+        this.isAnalysisOverviewPollingStarted = true;
         await this.versionStore.fetchServerVersion();
     },
     beforeUnmount() {
-        this.analysisTasksStore.stopOverviewPolling();
+        if (this.isAnalysisOverviewPollingStarted === true) {
+            this.analysisTasksStore.stopOverviewPolling();
+        }
     }
 });
 
@@ -346,6 +366,20 @@ export default defineComponent({
                     margin-right: 14px;
                     @include smartphone-horizontal {
                         margin-right: 10px;
+                    }
+                }
+
+                .navigation__link-icon-wrapper {
+                    position: relative;
+                    display: flex;
+                    flex-shrink: 0;
+                    margin-right: 14px;
+                    @include smartphone-horizontal {
+                        margin-right: 10px;
+                    }
+
+                    .navigation__link-icon {
+                        margin-right: 0;
                     }
                 }
 
@@ -510,6 +544,10 @@ export default defineComponent({
                     }
 
                     .navigation__link-icon {
+                        margin-right: 0;
+                    }
+
+                    .navigation__link-icon-wrapper {
                         margin-right: 0;
                     }
 

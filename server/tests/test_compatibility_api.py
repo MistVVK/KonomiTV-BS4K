@@ -337,6 +337,8 @@ def test_compatibility_app_does_not_publish_web_ui_or_server_settings() -> None:
     assert ('GET', '/api/streams/video/{video_id}/{quality}/video/playlist') in method_paths
     assert ('GET', '/api/streams/video/{video_id}/{quality}/audio/{rendition_id}/segment') in method_paths
     assert ('GET', '/api/streams/video/{video_id}/{quality}/subtitle/{subtitle_index}/webvtt') in method_paths
+    assert ('GET', '/api/streams/video/{video_id}/{quality}/offline-stream') not in method_paths
+    assert ('GET', '/api/streams/video/{video_id}/{quality}/offline-estimate') not in method_paths
     assert ('PUT', '/api/recording/reservations/{reservation_id}') in method_paths
     assert ('POST', '/api/videos/{video_id}/reanalyze') not in method_paths
     assert ('POST', '/api/videos/{video_id}/detect-cm-sections') not in method_paths

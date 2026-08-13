@@ -5,8 +5,7 @@
                 v-html="ProgramUtils.decorateProgramInfo(playerStore.recorded_program, 'title')">
             </h1>
             <div class="program-info__broadcaster">
-                <img class="program-info__broadcaster-icon"
-                    :src="`${Utils.api_base_url}/channels/${playerStore.recorded_program.channel?.id ?? 'NID0-SID0'}/logo`">
+                <img class="program-info__broadcaster-icon" :src="broadcasterLogoURL">
                 <div class="program-info__broadcaster-container">
                     <div class="d-flex align-center" v-if="playerStore.recorded_program.channel !== null">
                         <div class="program-info__broadcaster-number">Ch: {{playerStore.recorded_program.channel.channel_number}}</div>
@@ -40,25 +39,33 @@
                     <span class="ml-2">コメント数:</span>
                     <span class="ml-2">{{comment_count ?? '--'}}</span>
                 </div>
-                <div v-ripple class="program-info__button" @click="toggleMylist">
-                    <template v-if="isInMylist">
-                        <Icon icon="fluent:checkmark-16-filled" width="18px" height="18px"
-                            style="color: rgb(var(--v-theme-primary)); margin-bottom: -1px" />
-                        <span style="margin-left: 6px;">マイリストに追加済み</span>
-                    </template>
-                    <template v-else>
-                        <Icon icon="fluent:add-16-filled" width="18px" height="18px" style="margin-bottom: -1px" />
-                        <span style="margin-left: 6px;">マイリストに追加</span>
-                    </template>
-                </div>
-                <div v-ripple class="program-info__button program-info__button--file-info"
-                    @click="show_video_info = true">
-                    <Icon icon="fluent:document-20-filled" width="18px" height="18px" />
-                    <span style="margin-left: 6px;">録画ファイル情報</span>
+                <div class="program-info__buttons">
+                    <div v-ripple class="program-info__button" @click="toggleMylist">
+                        <template v-if="isInMylist">
+                            <Icon icon="fluent:checkmark-16-filled" width="18px" height="18px"
+                                style="color: rgb(var(--v-theme-primary)); margin-bottom: -1px" />
+                            <span style="margin-left: 6px;">マイリストに追加済み</span>
+                        </template>
+                        <template v-else>
+                            <Icon icon="fluent:add-16-filled" width="18px" height="18px" style="margin-bottom: -1px" />
+                            <span style="margin-left: 6px;">マイリストに追加</span>
+                        </template>
+                    </div>
+                    <div v-if="playerStore.is_offline_playback === false" v-ripple class="program-info__button"
+                        @click="showOfflineDownload = true">
+                        <Icon icon="fluent:cloud-arrow-down-20-regular" width="18px" height="18px" />
+                        <span style="margin-left: 6px;">オフライン保存</span>
+                    </div>
+                    <div v-ripple class="program-info__button program-info__button--file-info"
+                        @click="show_video_info = true">
+                        <Icon icon="fluent:document-20-filled" width="18px" height="18px" />
+                        <span style="margin-left: 6px;">録画ファイル情報</span>
+                    </div>
                 </div>
             </div>
         </section>
         <RecordedFileInfoDialog :program="playerStore.recorded_program" v-model:show="show_video_info" />
+        <OfflineVideoDownloadDialog :program="playerStore.recorded_program" v-model:show="showOfflineDownload" />
         <section class="program-detail-container">
             <div class="program-detail" :key="detail_heading"
                 v-for="(detail_text, detail_heading) in playerStore.recorded_program.detail ?? {}">
@@ -73,8 +80,10 @@
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
+import OfflineVideoDownloadDialog from '@/components/Videos/Dialogs/OfflineVideoDownloadDialog.vue';
 import RecordedFileInfoDialog from '@/components/Videos/Dialogs/RecordedFileInfoDialog.vue';
 import Message from '@/message';
+import OfflineVideos from '@/services/OfflineVideos';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import Utils, { ProgramUtils } from '@/utils';
@@ -83,17 +92,20 @@ export default defineComponent({
     name: 'Panel-RecordedProgramTab',
     components: {
         RecordedFileInfoDialog,
+        OfflineVideoDownloadDialog,
     },
     data() {
         return {
             // ユーティリティをテンプレートで使えるように
             Utils: Object.freeze(Utils),
             ProgramUtils: Object.freeze(ProgramUtils),
+            OfflineVideos: Object.freeze(OfflineVideos),
 
             // コメント数カウント
             comment_count: null as number | null,
             // 録画ファイル情報ダイアログの表示状態
             show_video_info: false,
+            showOfflineDownload: false,
         };
     },
     computed: {
@@ -104,6 +116,20 @@ export default defineComponent({
             return this.settingsStore.settings.mylist.some(item =>
                 item.type === 'RecordedProgram' && item.id === this.playerStore.recorded_program.id
             );
+        },
+        broadcasterLogoURL(): string {
+            // チャンネル情報がない録画では保存対象のロゴも存在しないため、サーバーへ問い合わせず同梱ロゴを表示する
+            if (this.playerStore.recorded_program.channel === null) {
+                return '/assets/images/logo.svg';
+            }
+            if (this.playerStore.offline_video !== null) {
+                return OfflineVideos.getAssetURL(this.playerStore.offline_video, 'channel-logo');
+            }
+            // オフライン録画の初期描画では保存メタデータの反映前でも API へフォールバックさせない
+            if (this.playerStore.is_offline_playback === true) {
+                return '/assets/images/logo.svg';
+            }
+            return `${Utils.api_base_url}/channels/${this.playerStore.recorded_program.channel.id}/logo`;
         },
     },
     methods: {
@@ -267,11 +293,17 @@ export default defineComponent({
             }
         }
 
+        .program-info__buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 16px;
+        }
+
         .program-info__button {
-            display: inline-flex;
+            display: flex;
             align-items: center;
             padding: 5px 8px;
-            margin-top: 16px;
             color: rgb(var(--v-theme-text-darken-1));
             font-size: 12.7px;
             line-height: 170%;
@@ -289,7 +321,7 @@ export default defineComponent({
             }
 
             &--file-info {
-                margin-left: 8px;
+                margin-left: 0;
             }
         }
     }

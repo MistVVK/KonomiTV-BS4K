@@ -45,6 +45,7 @@
                 </v-btn>
             </div>
         </div>
+        <slot name="after-header"></slot>
         <div class="recorded-program-list__grid"
             :class="{
                 'recorded-program-list__grid--loading': isLoading || isSearching,
@@ -76,7 +77,11 @@
             </div>
             <div class="recorded-program-list__grid-content">
                 <RecordedProgram v-for="program in displayPrograms" :key="program.id" :program="program"
-                    :forMylist="forMylist" :forWatchedHistory="forWatchedHistory" @deleted="handleProgramDeleted" />
+                    :forMylist="forMylist" :forWatchedHistory="forWatchedHistory" :forOffline="forOffline"
+                    :offlineVideo="offlineVideos?.find(video => video.video_id === program.id) ?? null"
+                    :offlineDownloadJob="getOfflineDownloadJob(program.id)" @deleted="handleProgramDeleted"
+                    @cancelOfflineJob="jobID => $emit('cancelOfflineJob', jobID)"
+                    @dismissOfflineJob="jobID => $emit('dismissOfflineJob', jobID)" />
             </div>
         </div>
         <div class="recorded-program-list__pagination" v-if="!hidePagination && displayTotal > 0">
@@ -95,6 +100,8 @@
 
 import { computed, ref, watch } from 'vue';
 import { useRouter } from 'vue-router';
+
+import type { IOfflineDownloadJob, IOfflineVideo } from '@/services/OfflineVideos';
 
 import RecordedProgram from '@/components/Videos/RecordedProgram.vue';
 import { IRecordedProgram, MylistSortOrder, SortOrder } from '@/services/Videos';
@@ -124,6 +131,9 @@ const props = withDefaults(defineProps<{
     isSearching?: boolean;
     forMylist?: boolean;
     forWatchedHistory?: boolean;
+    forOffline?: boolean;
+    offlineVideos?: IOfflineVideo[];
+    offlineJobs?: IOfflineDownloadJob[];
 }>(), {
     page: 1,
     sortOrder: 'desc',
@@ -140,6 +150,9 @@ const props = withDefaults(defineProps<{
     isSearching: false,
     forMylist: false,
     forWatchedHistory: false,
+    forOffline: false,
+    offlineVideos: undefined,
+    offlineJobs: undefined,
 });
 
 // Emits
@@ -147,6 +160,8 @@ defineEmits<{
     (e: 'update:page', page: number): void;
     (e: 'update:sortOrder', order: SortOrder | MylistSortOrder): void;
     (e: 'more'): void;
+    (e: 'cancelOfflineJob', jobID: string): void;
+    (e: 'dismissOfflineJob', jobID: string): void;
 }>();
 
 // 現在のページ番号
@@ -191,6 +206,13 @@ const handleProgramDeleted = (id: number) => {
     displayPrograms.value = displayPrograms.value.filter(program => program.id !== id);
     // 合計数を1減らす
     displayTotal.value--;
+};
+
+/** 一覧に表示する保存ジョブを取得する */
+const getOfflineDownloadJob = (videoID: number): IOfflineDownloadJob | null => {
+    return props.offlineJobs?.find(job =>
+        job.video_id === videoID && ['Waiting', 'Downloading', 'Finalizing', 'Failed'].includes(job.state),
+    ) ?? null;
 };
 
 </script>

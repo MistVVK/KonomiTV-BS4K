@@ -3,6 +3,7 @@
 import DPlayer from 'dplayer';
 
 import router from '@/router';
+import OfflineVideos from '@/services/OfflineVideos';
 import PlayerManager from '@/services/player/PlayerManager';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
@@ -63,7 +64,13 @@ class MediaSessionManager implements PlayerManager {
             {src: '/assets/images/icons/icon-maskable-192px.png', sizes: '192x192', type: 'image/png'},
             {src: '/assets/images/icons/icon-maskable-512px.png', sizes: '512x512', type: 'image/png'},
         ] : [
-            {src: `${Utils.api_base_url}/videos/${player_store.recorded_program.id}/thumbnail`, sizes: '480x270', type: 'image/webp'},
+            {
+                src: player_store.offline_video !== null ?
+                    OfflineVideos.getAssetURL(player_store.offline_video, 'thumbnail.webp') :
+                    `${Utils.api_base_url}/videos/${player_store.recorded_program.id}/thumbnail`,
+                sizes: '480x270',
+                type: 'image/webp',
+            },
         ];
 
         // メディア通知の表示をカスタマイズ

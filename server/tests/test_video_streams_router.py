@@ -1,4 +1,6 @@
 import asyncio
+import json
+import struct
 from types import SimpleNamespace
 from typing import Annotated, cast
 
@@ -15,9 +17,14 @@ from app.routers.VideosRouter import (
     VideoPlaybackIndexCreateAPI,
 )
 from app.routers.VideoStreamsRouter import (
+    BuildOfflineStreamEstimate,
     EnsurePlaybackIndexReady,
     GetRecordedStream,
     RecordedSubtitleARIBTTMLAPI,
+)
+from app.streams.KonomiTVBS4KOfflineStream import (
+    KonomiTVBS4KOfflineAsset,
+    KonomiTVBS4KOfflineStream,
 )
 from app.streams.RecordedEncodingCodecs import AudioCodec
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
@@ -308,3 +315,117 @@ def test_encoder_wait_queue_returns_429_when_full() -> None:
             RecordedFMP4Stream._encoder_waiters = 0
 
     asyncio.run(Run())
+
+
+def test_offline_playlists_reference_only_saved_fmp4_assets() -> None:
+    """master・映像・音声のオンラインqueryを保存世代内の相対URIへ変換する。"""
+
+    master = (
+        '#EXTM3U\n#EXT-X-VERSION:7\n'
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Main",DEFAULT=YES,AUTOSELECT=YES,'
+        'URI="audio/1/playlist?session_id=offline-session&cache_key=offline&audio_codec=opus"\n'
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subtitles",NAME="Japanese",DEFAULT=NO,'
+        'URI="subtitle/0/playlist?session_id=offline-session"\n'
+        '#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS="av01.0.10M.10,opus",AUDIO="audio",SUBTITLES="subtitles"\n'
+        'video/playlist?session_id=offline-session&cache_key=offline&video_codec=av1\n'
+    )
+    video = (
+        '#EXTM3U\n#EXT-X-MAP:URI="init?session_id=offline-session&generation=2&sequence=3"\n'
+        '#EXTINF:6.006000,\nsegment?session_id=offline-session&sequence=3\n#EXT-X-ENDLIST\n'
+    )
+    audio = (
+        '#EXTM3U\n#EXT-X-MAP:URI="init?session_id=offline-session&sequence=3"\n'
+        '#EXTINF:6.000000,\nsegment?session_id=offline-session&sequence=3\n#EXT-X-ENDLIST\n'
+    )
+
+    offline_master = KonomiTVBS4KOfflineStream.BuildMasterPlaylist(master)
+    assert 'audio/1/playlist.m3u8' in offline_master
+    assert 'video/playlist.m3u8' in offline_master
+    assert 'SUBTITLES' not in offline_master
+    assert 'session_id' not in offline_master
+    assert '#EXT-X-MAP:URI="init/2.mp4"' in KonomiTVBS4KOfflineStream.BuildVideoPlaylist(video)
+    assert 'segments/3.m4s' in KonomiTVBS4KOfflineStream.BuildVideoPlaylist(video)
+    assert '#EXT-X-MAP:URI="init/3.mp4"' in KonomiTVBS4KOfflineStream.BuildAudioPlaylist(audio)
+    assert 'segments/3.m4s' in KonomiTVBS4KOfflineStream.BuildAudioPlaylist(audio)
+
+
+def test_offline_asset_record_and_terminator_are_length_delimited() -> None:
+    """相対パス・MIME・本体長と、件数・総バイト数の終端を固定する。"""
+
+    record = KonomiTVBS4KOfflineStream.EncodeAsset(KonomiTVBS4KOfflineAsset(
+        path='video/segments/0.m4s',
+        media_type='video/mp4',
+        data=b'fragment',
+    ))
+    path_length, media_type_length, data_length = struct.unpack('>HHQ', record[:12])
+    offset = 12
+    assert record[offset:offset + path_length] == b'video/segments/0.m4s'
+    offset += path_length
+    assert record[offset:offset + media_type_length] == b'video/mp4'
+    offset += media_type_length
+    assert data_length == 8
+    assert record[offset:] == b'fragment'
+    assert KonomiTVBS4KOfflineStream.EncodeTerminator(7, 1234) == struct.pack('>HIQ', 0xffff, 7, 1234)
+
+    for invalid_path in ('../secret', '/absolute', 'video//0.m4s', 'video/0.m4s?token=x'):
+        with pytest.raises(ValueError):
+            KonomiTVBS4KOfflineStream.EncodeAsset(KonomiTVBS4KOfflineAsset(
+                path=invalid_path,
+                media_type='video/mp4',
+                data=b'fragment',
+            ))
+
+
+def test_offline_estimate_counts_all_audio_renditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """容量見積もりは映像と全音声レンディションの帯域を含める。"""
+
+    audio_track = {
+        'index': 1,
+        'stream_index': 1,
+        'codec': 'AAC-LC',
+        'channel': 'Dual Mono',
+        'sampling_rate': 48_000,
+        'language': 'ja+en',
+        'channel_layout': 'stereo',
+        'is_dual_mono': True,
+    }
+    recorded_program = SimpleNamespace(recorded_video=SimpleNamespace(
+        id=1,
+        duration=60.0,
+        has_video=True,
+        container_format='MP4',
+        audio_tracks=[audio_track],
+        audio_track_timeline=[{'start_time': 0.0, 'end_time': 60.0, 'tracks': [audio_track]}],
+    ))
+    stream_quality = SimpleNamespace(
+        quality='720p',
+        encoding_options=SimpleNamespace(video_codec='av1', audio_codec='opus'),
+    )
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        'getVideoBitrate',
+        lambda _quality, _codec: SimpleNamespace(video_bitrate='1000K', video_bitrate_max='1500K'),
+    )
+
+    estimate = BuildOfflineStreamEstimate(recorded_program, stream_quality)
+
+    assert estimate.estimated_size_bytes == 12_915_000
+    assert estimate.required_size_bytes == 17_655_000
+
+
+def test_offline_metadata_json_preserves_exact_encoding_tuple() -> None:
+    """クライアントが別条件の応答を拒否できるexact生成条件を保持する。"""
+
+    metadata = {
+        'video_id': 42,
+        'file_hash': '0123456789abcdef',
+        'quality': '720p-24fps',
+        'video_codec': 'av1',
+        'video_bit_depth': 10,
+        'requested_audio_codec': 'opus',
+        'audio_codec': 'aac',
+    }
+
+    encoded = json.dumps(metadata).encode('utf-8')
+
+    assert json.loads(encoded) == metadata

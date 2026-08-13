@@ -78,7 +78,8 @@ watch(() => route.fullPath, initializeSearchQuery);
 const isVideoSection = (path: string) => {
     return path.startsWith('/videos') ||
         path.startsWith('/mylist') ||
-        path.startsWith('/watched-history');
+        path.startsWith('/watched-history') ||
+        path.startsWith('/offline-videos');
 };
 
 const searchPlaceholder = computed(() => {

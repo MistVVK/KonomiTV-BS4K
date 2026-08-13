@@ -192,6 +192,13 @@ export interface ILocalClientSettings extends IClientSettings {
     video_series_sort_key: VideoSeriesSortKey;
     video_series_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
+    konomitv_bs4k_offline_video_streaming_quality: VideoStreamingQuality;
+    konomitv_bs4k_offline_video_streaming_quality_for_bs4k: BS4KLiveStreamingQuality;
+    konomitv_bs4k_offline_video_codec: KonomiTVBS4KPlaybackVideoCodec;
+    konomitv_bs4k_offline_video_codec_for_bs4k: KonomiTVBS4KPlaybackVideoCodec;
+    konomitv_bs4k_offline_audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+    konomitv_bs4k_offline_audio_codec_for_bs4k: KonomiTVBS4KPlaybackAudioCodec;
+    konomitv_bs4k_offline_video_24fps_mode: boolean;
     tv_streaming_quality: LiveStreamingQuality;
     tv_streaming_quality_cellular: LiveStreamingQuality;
     bs4k_streaming_quality: BS4KLiveStreamingQuality;
@@ -402,6 +409,21 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     video_watched_history_max_count: 50,
 
     // ***** 設定 → 画質 *****
+
+    // 通常録画の前回オフライン保存画質 (Default: 720p) (同期無効)
+    konomitv_bs4k_offline_video_streaming_quality: '720p',
+    // BS4K 録画の前回オフライン保存画質 (Default: 720p-30fps) (同期無効)
+    konomitv_bs4k_offline_video_streaming_quality_for_bs4k: '720p-30fps',
+    // 通常録画の前回オフライン保存映像コーデック (Default: AV1) (同期無効)
+    konomitv_bs4k_offline_video_codec: 'av1',
+    // BS4K 録画の前回オフライン保存映像コーデック (Default: AV1) (同期無効)
+    konomitv_bs4k_offline_video_codec_for_bs4k: 'av1',
+    // 通常録画の前回オフライン保存音声コーデック (Default: Opus) (同期無効)
+    konomitv_bs4k_offline_audio_codec: 'opus',
+    // BS4K 録画の前回オフライン保存音声コーデック (Default: Opus) (同期無効)
+    konomitv_bs4k_offline_audio_codec_for_bs4k: 'opus',
+    // 通常録画の前回オフライン保存 24fps モード (Default: オフ) (同期無効)
+    konomitv_bs4k_offline_video_24fps_mode: false,
 
     // テレビのデフォルトのストリーミング画質 (Wi-Fi 回線時) (Default: 1080p) (同期無効)
     tv_streaming_quality: '1080p',
@@ -637,6 +659,13 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'video_series_sort_key',
     'video_series_sort_direction',
     'video_watched_history_max_count',
+    // konomitv_bs4k_offline_video_streaming_quality: 同期無効
+    // konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
+    // konomitv_bs4k_offline_video_codec: 同期無効
+    // konomitv_bs4k_offline_video_codec_for_bs4k: 同期無効
+    // konomitv_bs4k_offline_audio_codec: 同期無効
+    // konomitv_bs4k_offline_audio_codec_for_bs4k: 同期無効
+    // konomitv_bs4k_offline_video_24fps_mode: 同期無効
     // tv_streaming_quality: 同期無効
     // tv_streaming_quality_cellular: 同期無効
     // bs4k_streaming_quality: 同期無効
@@ -1143,6 +1172,8 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         'konomitv_bs4k_playback_video_codec_cellular',
         'konomitv_bs4k_playback_video_codec_for_bs4k',
         'konomitv_bs4k_playback_video_codec_for_bs4k_cellular',
+        'konomitv_bs4k_offline_video_codec',
+        'konomitv_bs4k_offline_video_codec_for_bs4k',
     ] as const;
     for (const konomitv_bs4k_key of konomitv_bs4k_common_video_codec_keys) {
         if (
@@ -1159,6 +1190,8 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         'konomitv_bs4k_playback_audio_codec_cellular',
         'konomitv_bs4k_playback_audio_codec_for_bs4k',
         'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular',
+        'konomitv_bs4k_offline_audio_codec',
+        'konomitv_bs4k_offline_audio_codec_for_bs4k',
     ] as const;
     for (const konomitv_bs4k_key of konomitv_bs4k_common_audio_codec_keys) {
         if (
@@ -1172,6 +1205,7 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
     const konomitv_bs4k_common_quality_keys = [
         'konomitv_bs4k_playback_streaming_quality',
         'konomitv_bs4k_playback_streaming_quality_cellular',
+        'konomitv_bs4k_offline_video_streaming_quality',
     ] as const;
     for (const konomitv_bs4k_key of konomitv_bs4k_common_quality_keys) {
         if (
@@ -1186,6 +1220,7 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
     const konomitv_bs4k_common_bs4k_quality_keys = [
         'konomitv_bs4k_playback_streaming_quality_for_bs4k',
         'konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular',
+        'konomitv_bs4k_offline_video_streaming_quality_for_bs4k',
     ] as const;
     for (const konomitv_bs4k_key of konomitv_bs4k_common_bs4k_quality_keys) {
         const konomitv_bs4k_value = normalized_settings[konomitv_bs4k_key];
@@ -1204,6 +1239,7 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         'konomitv_bs4k_playback_24fps_mode_for_bs4k',
         'konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular',
         'konomitv_bs4k_playback_profile_migration_conflict_notice_pending',
+        'konomitv_bs4k_offline_video_24fps_mode',
         'tv_low_latency_mode',
         'tv_low_latency_mode_cellular',
         'tv_low_latency_mode_for_bs4k',
