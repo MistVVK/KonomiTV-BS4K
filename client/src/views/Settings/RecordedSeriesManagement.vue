@@ -16,8 +16,12 @@
 
         <div v-else-if="authorization_error !== null" class="recorded-series-access-state">
             <Icon icon="fluent:shield-error-20-filled" width="28px" />
-            <span v-if="authorization_error === 'AdminRequired'">この画面を表示するには管理者権限が必要です。</span>
-            <span v-else>ユーザー情報を取得できませんでした。ページを再読み込みしてください。</span>
+            <span v-if="authorization_error === 'LoginRequired'">
+                この画面を表示するにはログインが必要です。
+                <router-link class="link" to="/login/">ログイン</router-link>
+            </span>
+            <span v-else-if="authorization_error === 'AdminRequired'">この画面を表示するには管理者権限が必要です。</span>
+            <span v-else>サーバーに接続できないため、ユーザー情報を取得できませんでした。</span>
         </div>
 
         <template v-else>
@@ -269,7 +273,7 @@ import RecordedSeries, {
     type IRecordedSeriesStandaloneProgram,
 } from '@/services/RecordedSeries';
 import useUserStore from '@/stores/UserStore';
-import { dayjs } from '@/utils';
+import Utils, { dayjs } from '@/utils';
 import {
     formatRecordedEpisodeLabel,
     formatRecordedUnnumberedEpisodeLabel,
@@ -293,7 +297,7 @@ const series_search_query = ref<string | null>('');
 const is_loading = ref(true);
 const is_loading_series = ref(false);
 const series_load_failed = ref(false);
-const authorization_error = ref<'AdminRequired' | 'UserUnavailable' | null>(null);
+const authorization_error = ref<'LoginRequired' | 'AdminRequired' | 'UserUnavailable' | null>(null);
 
 // 編集ダイアログでは一覧オブジェクトを直接書き換えず、更新成功後だけサーバーの結果を反映する。
 const series_edit_dialog = ref(false);
@@ -630,10 +634,12 @@ function formatSeriesPeriod(first_recorded_at: string | null, last_recorded_at: 
 }
 
 onMounted(async () => {
+    // 管理者と確認できるまでは設定 API へアクセスしない。
     const fetched_user = await user_store.fetchUser();
+    // fetchUser() はアイコン取得だけが失敗した場合も null を返すが、ユーザー本体は Store に残る。
     const user = fetched_user ?? user_store.user;
     if (user === null) {
-        authorization_error.value = 'UserUnavailable';
+        authorization_error.value = Utils.getAccessToken() === null ? 'LoginRequired' : 'UserUnavailable';
         is_loading.value = false;
         return;
     }
