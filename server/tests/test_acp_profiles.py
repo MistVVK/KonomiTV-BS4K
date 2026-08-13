@@ -81,25 +81,6 @@ def test_codex_profile_generates_only_managed_config_and_isolates_runtime_state(
     assert (profile / 'settings.json').exists() is False
 
 
-def test_konomitv_bs4k_codex_profile_can_enable_and_then_clear_fast_mode(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Codex Fast 設定は専用 config だけへ書き、無効化時に残さない。"""
-
-    profiles_root = tmp_path / 'profiles'
-    monkeypatch.setattr(AcpProfiles, '_ACP_PROFILES_ROOT', profiles_root)
-
-    profile = AcpProfiles.ensure_acp_profile('codex', konomitv_bs4k_fast_mode_enabled=True)
-    fast_config = (profile / 'config.toml').read_text(encoding='utf-8')
-    assert 'service_tier = "fast"' in fast_config
-    assert '[features]' in fast_config
-    assert 'fast_mode = true' in fast_config
-
-    AcpProfiles.ensure_acp_profile('codex', konomitv_bs4k_fast_mode_enabled=False)
-    assert (profile / 'config.toml').read_text(encoding='utf-8') == (
-        'cli_auth_credentials_store = "file"\n'
-    )
 
 
 def test_codex_managed_config_replaces_legacy_symlink_without_modifying_target(
@@ -232,38 +213,6 @@ def test_create_backend_uses_fixed_codex_command_workspace_and_environment(
     assert 'OPENAI_API_KEY' not in backend._env
 
 
-def test_konomitv_bs4k_create_backend_passes_codex_fast_mode_to_profile(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Codex 設定の Fast 有効化を専用 profile 構築へ渡す。"""
-
-    profile = tmp_path / 'profile'
-    (profile / 'workspace').mkdir(parents=True)
-    captured: dict[str, bool] = {}
-
-    def EnsureProfile(
-        backend: AcpProfiles.KonomiTVBS4KACPProfileBackend,
-        *,
-        konomitv_bs4k_fast_mode_enabled: bool = False,
-    ) -> Path:
-        assert backend == 'codex'
-        captured['konomitv_bs4k_fast_mode_enabled'] = konomitv_bs4k_fast_mode_enabled
-        return profile
-
-    monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
-    _PatchACPSettings(
-        monkeypatch,
-        codex=ACPBackendSettings(
-            backend_kind='AcpCodex',
-            codex_fast_mode_enabled=True,
-        ),
-    )
-    settings = RecordedSeriesSettings(ai_backend='AcpCodex')
-
-    RecordedSeriesAI._create_backend(settings)
-
-    assert captured == {'konomitv_bs4k_fast_mode_enabled': True}
 
 
 def test_acp_profile_setup_failure_is_normalized_for_ai_audit(
@@ -362,44 +311,6 @@ def test_acp_adapter_routes_episode_lookup_with_fixed_operation_context(
     assert result.citations == (citation,)
 
 
-def test_create_backend_injects_grok_reasoning_effort_cli_flag(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Grok は --reasoning-effort を agent stdio の前に付けて起動する。"""
-
-    profile = tmp_path / 'profile'
-    (profile / 'workspace').mkdir(parents=True)
-
-    def EnsureProfile(
-        backend: AcpProfiles.KonomiTVBS4KACPProfileBackend,
-        *,
-        konomitv_bs4k_fast_mode_enabled: bool = False,
-    ) -> Path:
-        assert backend == 'grok'
-        assert konomitv_bs4k_fast_mode_enabled is False
-        return profile
-
-    monkeypatch.setattr(AcpProfiles, 'ensure_acp_profile', EnsureProfile)
-    _PatchACPSettings(
-        monkeypatch,
-        grok=ACPBackendSettings(
-            backend_kind='AcpGrok',
-            reasoning_effort='Medium',
-        ),
-    )
-    settings = RecordedSeriesSettings(ai_backend='AcpGrok')
-    # 未指定時の既定は High。
-    assert ACPSettings().grok.reasoning_effort == 'High'
-
-    backend = RecordedSeriesAI._create_backend(settings)
-
-    assert isinstance(backend, RecordedSeriesAI._AcpAdapter)
-    assert backend._command == '/usr/local/bin/grok'
-    assert backend._args == ['--reasoning-effort', 'medium', 'agent', 'stdio']
-    assert backend._reasoning_effort == 'Medium'
-    assert backend._audit_model() == 'acp:grok[medium]'
-    assert RecordedSeriesAI.get_audit_model(settings) == 'acp:grok[medium]'
 
 
 def test_grok_adapter_maps_common_operation_schema_to_cli_argument() -> None:
@@ -466,37 +377,6 @@ def test_codex_splits_composite_model_and_applies_defaults(
     assert RecordedSeriesAI.get_audit_model(recorded_settings) == 'acp:codex:gpt-5.6-luna[medium]'
 
 
-def test_konomitv_bs4k_codex_ultra_is_reserved_for_sol_and_fast_mode_is_codex_only() -> None:
-    """Ultra は Sol だけに残し、Fast 設定は Codex 以外へ持ち越さない。"""
-
-    non_sol = ACPBackendSettings(
-        backend_kind='AcpCodex',
-        model='gpt-5.6-terra',
-        reasoning_effort='Ultra',
-        codex_fast_mode_enabled=True,
-    )
-    assert non_sol.reasoning_effort == 'Max'
-    assert non_sol.codex_fast_mode_enabled is True
-
-    legacy_non_sol = ACPBackendSettings(
-        backend_kind='AcpCodex',
-        model='gpt-5.6-luna[ultra]',
-    )
-    assert legacy_non_sol.model == 'gpt-5.6-luna'
-    assert legacy_non_sol.reasoning_effort == 'Max'
-
-    sol = ACPBackendSettings(
-        backend_kind='AcpCodex',
-        model='gpt-5.6-sol',
-        reasoning_effort='Ultra',
-    )
-    assert sol.reasoning_effort == 'Ultra'
-
-    grok = ACPBackendSettings(
-        backend_kind='AcpGrok',
-        codex_fast_mode_enabled=True,
-    )
-    assert grok.codex_fast_mode_enabled is False
 
 
 

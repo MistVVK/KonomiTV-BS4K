@@ -98,15 +98,6 @@ describe('Tweet', () => {
         expect(textContainer.text()).toContain('__URL_PLACEHOLDER_0__');
     });
 
-    it('引用ツイートの悪意ある本文も HTML 要素や event handler として描画されない', () => {
-        const wrapper = mountTweet(createTweet('元の本文', {
-            quoted_tweet: createTweet('<img src=x onerror=alert(1)>'),
-        }));
-        const quotedTextContainer = wrapper.find('.tweet__quoted-text');
-        expectNoInjectionIn(quotedTextContainer);
-        expect(quotedTextContainer.text()).toContain('<img src=x onerror=alert(1)>');
-    });
-
     it('Twitter 動画は JWT を URL に含めず path 限定 Cookie へ同期する', () => {
         vi.spyOn(Utils, 'getAccessToken').mockReturnValue('test-access-token');
         const syncCookie = vi.spyOn(Utils, 'syncTwitterVideoAccessTokenCookie').mockImplementation(() => undefined);

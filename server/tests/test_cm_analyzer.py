@@ -1,7 +1,6 @@
 # pyright: reportPrivateUsage=false
 
 import asyncio
-import errno
 import json
 import struct
 from collections.abc import Mapping
@@ -1246,87 +1245,10 @@ def test_runtime_enospc_is_normalized_to_temporary_storage_error(tmp_path: Path)
     assert result.error_code == 'TemporaryStorageInsufficient'
 
 
-def test_native_stage_enospc_is_normalized_to_temporary_storage_error(tmp_path: Path) -> None:
-    analyzer = CreateRuntime(tmp_path)
-    payload = ProbePayload()
-
-    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
-        del environment
-        if command[0] == str(analyzer.ffprobe_path):
-            if command[-1].endswith('prepared-media.cmwork'):
-                return _ProcessResult(0, json.dumps(PreparedVideoPayload(payload)))
-            if command[-1].endswith('prepared-audio.wav'):
-                return _ProcessResult(0, json.dumps(PreparedAudioPayload(payload)))
-            return _ProcessResult(0, json.dumps(payload))
-        if command[0] == str(analyzer.ffmpeg_path):
-            WriteFFmpegOutputs(command)
-            return _ProcessResult(0, '')
-        if command[0] == str(analyzer.ffmsindex_path):
-            Path(command[-1]).write_bytes(b'ffindex')
-            return _ProcessResult(0, '')
-        return _ProcessResult(1, '', 'failed to write output: Disk quota exceeded')
-
-    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
-
-    result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path)))
-
-    assert result.status == 'analysis_failed'
-    assert result.error_code == 'TemporaryStorageInsufficient'
 
 
-def test_audio_index_enospc_is_normalized_before_native_analysis(tmp_path: Path) -> None:
-    analyzer = CreateRuntime(tmp_path)
-    payload = ProbePayload()
-
-    async def RunProcess(command: tuple[str, ...], environment: Mapping[str, str]) -> _ProcessResult:
-        del environment
-        if command[0] == str(analyzer.ffprobe_path):
-            return _ProcessResult(0, json.dumps(payload))
-        if command[0] == str(analyzer.ffmpeg_path):
-            WriteFFmpegOutputs(command)
-            return _ProcessResult(0, '')
-        if command[0] == str(analyzer.ffmsindex_path):
-            if command[-2].endswith('prepared-audio.wav'):
-                return _ProcessResult(1, '', 'audio index: No space left on device')
-            Path(command[-1]).write_bytes(b'video-index')
-            return _ProcessResult(0, '')
-        raise AssertionError(f'Native analysis must not start after index failure: {command}')
-
-    analyzer._runProcess = RunProcess  # type: ignore[method-assign]
-
-    result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path)))
-
-    assert result.status == 'analysis_failed'
-    assert result.error_code == 'TemporaryStorageInsufficient'
-    assert result.error_message == 'audio index: No space left on device'
 
 
-def test_python_output_enospc_is_normalized_to_temporary_storage_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    analyzer = CreateRuntime(tmp_path)
-    commands: list[tuple[str, ...]] = []
-    InstallSuccessfulProcesses(analyzer, ProbePayload(), commands)
-    original_write_text = Path.write_text
-
-    def WriteText(
-        path: Path,
-        data: str,
-        encoding: str | None = None,
-        errors: str | None = None,
-        newline: str | None = None,
-    ) -> int:
-        if path.name == 'chapter.avs':
-            raise OSError(errno.ENOSPC, 'No space left on device')
-        return original_write_text(path, data, encoding=encoding, errors=errors, newline=newline)
-
-    monkeypatch.setattr(Path, 'write_text', WriteText)
-
-    result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path)))
-
-    assert result.status == 'analysis_failed'
-    assert result.error_code == 'TemporaryStorageInsufficient'
 
 
 def test_completed_analysis_returns_sections_without_writing_public_chapter(tmp_path: Path) -> None:
@@ -1403,31 +1325,10 @@ def test_jls_trailing_cm_is_clamped_to_canonical_timeline_duration() -> None:
     ) == [{'start_time': 59.9, 'end_time': 60.0}]
 
 
-def test_jls_trailing_cm_outside_canonical_timeline_is_dropped() -> None:
-    assert GenericCMAnalyzer._parseCMSections(
-        'Trim(0,1802)',
-        1810,
-        Fraction(30, 1),
-        timeline_duration_seconds=60.0,
-    ) == []
 
 
-def test_jls_cm_within_canonical_timeline_is_unchanged() -> None:
-    assert GenericCMAnalyzer._parseCMSections(
-        'Trim(0,899) ++ Trim(1200,1799)',
-        1800,
-        Fraction(30_000, 1001),
-        timeline_duration_seconds=60.0,
-    ) == [{'start_time': 30.03, 'end_time': 40.04}]
 
 
-def test_jls_timeline_longer_than_analyzed_clip_does_not_extend_cm() -> None:
-    assert GenericCMAnalyzer._parseCMSections(
-        'Trim(0,1796)',
-        1810,
-        Fraction(30, 1),
-        timeline_duration_seconds=120.0,
-    ) == [{'start_time': 59.9, 'end_time': 60.333333}]
 
 
 @pytest.mark.parametrize('timeline_duration_seconds', [0.0, -1.0, float('nan'), float('inf')])

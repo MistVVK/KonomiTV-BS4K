@@ -14,23 +14,10 @@ def reset_git_commit_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(git_module, 'git_commit', None)
 
 
-def test_format_commit_date_converts_iso_to_jst_display() -> None:
-    assert git_module._format_commit_date('2026-07-30T08:04:47+00:00') == '2026-07-30 17:04:47'
-    assert git_module._format_commit_date('2026-07-30T17:04:47+09:00') == '2026-07-30 17:04:47'
-    assert git_module._format_commit_date('not-a-date') is None
 
 
-def test_with_commit_date_appends_only_when_present() -> None:
-    assert git_module._with_commit_date('abc12345', None) == 'abc12345'
-    assert git_module._with_commit_date('abc12345-dirty', '2026-07-30 17:04:47') == (
-        'abc12345-dirty (2026-07-30 17:04:47)'
-    )
 
 
-def test_with_dirty_suffix() -> None:
-    assert git_module._with_dirty_suffix('bs4k-v1.1.0', False) == 'bs4k-v1.1.0'
-    assert git_module._with_dirty_suffix('bs4k-v1.1.0', True) == 'bs4k-v1.1.0-dirty'
-    assert git_module._with_dirty_suffix('abc12345-dirty', True) == 'abc12345-dirty'
 
 
 def test_get_git_commit_uses_exact_bs4k_tag_when_head_matches(

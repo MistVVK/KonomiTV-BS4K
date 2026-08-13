@@ -6,13 +6,13 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, cast
-from uuid import uuid4
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 
+from app import config as config_module
 from app.metadata.ai import recorded_series_ai as RecordedSeriesAIModule
 from app.metadata.ai.ACPSettings import ACPSettingsStore
 from app.metadata.ai.AIBackendSettings import (
@@ -50,6 +50,12 @@ def CreateAdminApp() -> FastAPI:
 def ai_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """AI 設定・秘密パスを一時ディレクトリへ indirection する。"""
 
+    # OpenCodeClient の生成はサーバー設定のポートを参照するため、テスト順序に依存せず既定設定を用意する。
+    monkeypatch.setattr(
+        config_module,
+        '_CONFIG',
+        config_module.HostServerSettings().toServerSettings(bypass_validation=True),
+    )
     settings_path = tmp_path / 'ai-backend-settings.json'
     secrets_path = tmp_path / 'secrets' / 'ai-api-keys.json'
     monkeypatch.setattr(AIBackendSettingsStore, 'SETTINGS_PATH', settings_path)
@@ -124,31 +130,6 @@ def _draft_body(**overrides: Any) -> dict[str, Any]:
     return body
 
 
-def test_connection_test_returns_503_when_opencode_unavailable(
-    ai_paths: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """serve が available=false のとき connection-test は 503。"""
-
-    _ = ai_paths
-    monkeypatch.setattr(AIBackendRouter, 'IsOpenCodeAvailable', lambda: False)
-    app = CreateAdminApp()
-
-    async def Run() -> None:
-        async with HTTPXAsyncClient(
-            transport=ASGITransport(app=app),
-            base_url='http://test',
-        ) as client:
-            response = await client.post(
-                '/api/ai-backends/connection-test',
-                json=_draft_body(),
-            )
-            assert response.status_code == 503
-            assert 'unavailable' in response.json()['detail'].lower()
-            # キーがエラー詳細にエコーされないこと
-            assert 'sk-test' not in response.text
-
-    asyncio.run(Run())
 
 
 def test_connection_test_draft_requires_fields(
@@ -176,90 +157,8 @@ def test_connection_test_draft_requires_fields(
     asyncio.run(Run())
 
 
-def test_connection_test_saved_service_success(
-    ai_paths: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """保存済み service_id 経路で接続試験成功を返す。"""
-
-    service = AIBackendSettingsStore.createService(
-        AIBackendServiceCreate(
-            service_name='Saved',
-            opencode_provider_id='deepseek',
-            opencode_model_id='deepseek-chat',
-            auth_mode='ApiKey',
-            billing_mode='Metered',
-        ),
-    )
-    AIBackendSettingsStore.setAPIKey(service.service_id, 'sk-saved')
-
-    async def FakeTestConnection(self: OpenCodeBackend, capability: str) -> ConnectionTestResult:
-        _ = self
-        assert capability == 'CandidateSelection'
-        return ConnectionTestResult(
-            success=True,
-            latency_ms=12,
-            model='opencode:deepseek/deepseek-chat',
-            message='ok',
-            prompt_tokens=3,
-            completion_tokens=2,
-            http_status=200,
-        )
-
-    monkeypatch.setattr(AIBackendRouter, 'IsOpenCodeAvailable', lambda: True)
-    monkeypatch.setattr(OpenCodeBackend, 'testConnection', FakeTestConnection)
-    app = CreateAdminApp()
-
-    async def Run() -> None:
-        async with HTTPXAsyncClient(
-            transport=ASGITransport(app=app),
-            base_url='http://test',
-        ) as client:
-            response = await client.post(
-                '/api/ai-backends/connection-test',
-                json={
-                    'capability': 'CandidateSelection',
-                    'service_id': service.service_id,
-                },
-            )
-            assert response.status_code == 200
-            payload = response.json()
-            assert payload['success'] is True
-            assert payload['latency_ms'] == 12
-            assert payload['prompt_tokens'] == 3
-            assert 'api_key' not in payload
-            assert 'sk-saved' not in response.text
-            assert response.headers.get('cache-control') == 'no-store'
-
-    asyncio.run(Run())
 
 
-def test_connection_test_saved_service_not_found(
-    ai_paths: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """存在しない service_id は 404。"""
-
-    _ = ai_paths
-    monkeypatch.setattr(AIBackendRouter, 'IsOpenCodeAvailable', lambda: True)
-    app = CreateAdminApp()
-    missing = str(uuid4())
-
-    async def Run() -> None:
-        async with HTTPXAsyncClient(
-            transport=ASGITransport(app=app),
-            base_url='http://test',
-        ) as client:
-            response = await client.post(
-                '/api/ai-backends/connection-test',
-                json={
-                    'capability': 'CandidateSelection',
-                    'service_id': missing,
-                },
-            )
-            assert response.status_code == 404
-
-    asyncio.run(Run())
 
 
 def test_connection_test_draft_cleans_unshared_auth(

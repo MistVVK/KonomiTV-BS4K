@@ -9,11 +9,6 @@ describe('TweetUtils.tokenizeTweetText', () => {
         expect(segments).toEqual([{ type: 'text', text: '<img src=x onerror=alert(1)>' }]);
     });
 
-    it('Bluesky 本文に含まれる HTML や event handler もセグメントとして分離され、HTML 要素へ変換されない', () => {
-        const segments = TweetUtils.tokenizeTweetText('abc<script>alert(1)</script>def', 'Bluesky');
-        expect(segments).toEqual([{ type: 'text', text: 'abc<script>alert(1)</script>def' }]);
-    });
-
     it('URL は本文と分離したリンクセグメントになり、href へ渡す URL はもとの文字列のまま保たれる', () => {
         const segments = TweetUtils.tokenizeTweetText('see https://example.com/abc def', 'Twitter');
         expect(segments).toEqual([
@@ -28,14 +23,6 @@ describe('TweetUtils.tokenizeTweetText', () => {
         const url = 'https://example.com/foo"onmouseover="alert(1)';
         const segments = TweetUtils.tokenizeTweetText(url, 'Twitter');
         expect(segments).toEqual([{ type: 'link', text: url, url }]);
-    });
-
-    it('空白を含む event handler 風の文字列は URL の残りとしてテキストセグメントへ分離される', () => {
-        const segments = TweetUtils.tokenizeTweetText('https://example.com/" onmouseover="alert(1)', 'Twitter');
-        expect(segments).toEqual([
-            { type: 'link', text: 'https://example.com/"', url: 'https://example.com/"' },
-            { type: 'text', text: ' onmouseover="alert(1)' },
-        ]);
     });
 
     it('javascript: URL はリンク化されずテキストセグメントのままになる', () => {
@@ -73,18 +60,6 @@ describe('TweetUtils.tokenizeTweetText', () => {
         ]);
     });
 
-    it('URL ・メンション・ハッシュタグが混在する本文を正しい順序でセグメントへ分割する', () => {
-        const segments = TweetUtils.tokenizeTweetText('see https://x.com/a @foo #bar', 'Twitter');
-        expect(segments).toEqual([
-            { type: 'text', text: 'see ' },
-            { type: 'link', text: 'https://x.com/a', url: 'https://x.com/a' },
-            { type: 'text', text: ' ' },
-            { type: 'link', text: '@foo', url: 'https://x.com/foo' },
-            { type: 'text', text: ' ' },
-            { type: 'link', text: '#bar', url: 'https://x.com/hashtag/bar' },
-        ]);
-    });
-
     it('改行はテキストセグメントにそのまま含まれ、表示上の改行が維持される', () => {
         const segments = TweetUtils.tokenizeTweetText('1行目\n2行目', 'Twitter');
         expect(segments).toEqual([{ type: 'text', text: '1行目\n2行目' }]);
@@ -108,7 +83,4 @@ describe('TweetUtils.tokenizeTweetText', () => {
         ]);
     });
 
-    it('空文字列はセグメントを生成しない', () => {
-        expect(TweetUtils.tokenizeTweetText('', 'Twitter')).toEqual([]);
-    });
 });

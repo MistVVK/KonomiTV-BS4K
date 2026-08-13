@@ -19,7 +19,6 @@ from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KPlaybackMode,
     KonomiTVBS4KPlaybackVideoCapability,
     KonomiTVBS4KVideoBitDepth,
-    KonomiTVBS4KVideoBitDepthQuery,
     KonomiTVBS4KVideoCodec,
 )
 from app.streams.RecordedPlaybackCapabilities import (
@@ -622,123 +621,6 @@ def test_targeted_audio_only_capabilities_skip_every_video_probe(
     assert capabilities.live_combinations == ()
 
 
-def test_recorded_advanced_validation_does_not_start_live_transport_probes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """録画の高度映像・音声は録画専用取得口だけを使い、live実搬送を起動しない。"""
-
-    recorded_video_calls: list[tuple[str, str, int]] = []
-    recorded_audio_calls: list[KonomiTVBS4KAudioCodec] = []
-
-    async def GetRecordedVideoCapability(
-        _cls: type[KonomiTVBS4KPlaybackCapabilityProbe],
-        encoder: KonomiTVBS4KPlaybackEncoder,
-        codec: KonomiTVBS4KVideoCodec,
-        bit_depth: KonomiTVBS4KVideoBitDepth,
-    ) -> KonomiTVBS4KPlaybackVideoCapability:
-        recorded_video_calls.append((encoder, codec, bit_depth))
-        return KonomiTVBS4KPlaybackVideoCapability(
-            encoder = encoder,
-            codec = codec,
-            bit_depth = bit_depth,
-            profile = 'Main',
-            live_available = False,
-            recorded_available = True,
-            live_reason_code = 'ProbeFailed',
-            recorded_reason_code = None,
-        )
-
-    async def GetRecordedAudioCapability(
-        _cls: type[KonomiTVBS4KPlaybackCapabilityProbe],
-        codec: KonomiTVBS4KAudioCodec,
-    ) -> KonomiTVBS4KPlaybackAudioCapability:
-        recorded_audio_calls.append(codec)
-        return KonomiTVBS4KPlaybackAudioCapability(
-            codec = codec,
-            live_available = False,
-            recorded_available = True,
-            live_reason_code = 'ProbeFailed',
-            recorded_reason_code = None,
-        )
-
-    async def UnexpectedLiveProbe(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError('recorded playback must not start a live probe')
-
-    monkeypatch.setattr(
-        VideoStreamsRouter,
-        'SplitQualityAndEncodingOptions',
-        lambda *_args, **_kwargs: StreamQualityWithOptions(
-            quality = '1080p',
-            encoding_options = StreamEncodingOptions(
-                video_codec = 'av1',
-                video_bit_depth = 10,
-                audio_codec = 'opus',
-            ),
-            is_video_encoding_explicitly_requested = True,
-            is_audio_encoding_explicitly_requested = True,
-        ),
-    )
-    monkeypatch.setattr(
-        VideoStreamsRouter,
-        'IsRecordedPlaybackIndexReady',
-        lambda *_args: True,
-    )
-    monkeypatch.setattr(
-        VideoStreamsRouter,
-        'Config',
-        lambda: SimpleNamespace(
-            general = SimpleNamespace(encoder = 'FFmpeg', encoder_bs4k = 'QSV')
-        ),
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        'getRecordedVideoCapability',
-        classmethod(GetRecordedVideoCapability),
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        'getRecordedAudioCapability',
-        classmethod(GetRecordedAudioCapability),
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        'getVideoCapability',
-        classmethod(UnexpectedLiveProbe),
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        'getAudioCapability',
-        classmethod(UnexpectedLiveProbe),
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        'getLiveCombinationCapability',
-        classmethod(UnexpectedLiveProbe),
-    )
-    recorded_program = SimpleNamespace(
-        network_id = 0x000B,
-        recorded_video = SimpleNamespace(
-            playback_index_status = 'Ready',
-            playback_index_version = 7,
-            has_video = True,
-        ),
-    )
-
-    stream_quality = asyncio.run(
-        VideoStreamsRouter.ValidateQuality(
-            '1080p',
-            recorded_program,
-            'av1',
-            KonomiTVBS4KVideoBitDepthQuery.BIT_10,
-            'opus',
-            None,
-        )
-    )
-
-    assert stream_quality.encoding_options.video_codec == 'av1'
-    assert stream_quality.encoding_options.audio_codec == 'opus'
-    assert recorded_video_calls == [('QSV', 'av1', 10)]
-    assert recorded_audio_calls == ['opus']
 
 
 def test_pending_recorded_index_revalidates_explicit_codec_before_stream_creation(

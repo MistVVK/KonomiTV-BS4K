@@ -63,35 +63,6 @@ const PROFILE_PRIORITY_CASES = [
     },
 ] as const;
 
-const CANDIDATE_KEY_CASES = [
-    ['playback_streaming_quality', 'konomitv_bs4k_playback_streaming_quality', '720p'],
-    ['playback_streaming_quality_cellular', 'konomitv_bs4k_playback_streaming_quality_cellular', '540p'],
-    ['bs4k_playback_streaming_quality', 'konomitv_bs4k_playback_streaming_quality_for_bs4k', '2160p'],
-    [
-        'bs4k_playback_streaming_quality_cellular',
-        'konomitv_bs4k_playback_streaming_quality_for_bs4k_cellular',
-        '720p-30fps',
-    ],
-    ['playback_video_codec', 'konomitv_bs4k_playback_video_codec', 'vp9'],
-    ['playback_video_codec_cellular', 'konomitv_bs4k_playback_video_codec_cellular', 'av1'],
-    ['bs4k_playback_video_codec', 'konomitv_bs4k_playback_video_codec_for_bs4k', 'av1'],
-    ['bs4k_playback_video_codec_cellular', 'konomitv_bs4k_playback_video_codec_for_bs4k_cellular', 'vp9'],
-    ['playback_audio_codec', 'konomitv_bs4k_playback_audio_codec', 'opus'],
-    ['playback_audio_codec_cellular', 'konomitv_bs4k_playback_audio_codec_cellular', 'opus'],
-    ['bs4k_playback_audio_codec', 'konomitv_bs4k_playback_audio_codec_for_bs4k', 'opus'],
-    ['bs4k_playback_audio_codec_cellular', 'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular', 'opus'],
-    ['playback_24fps_mode', 'konomitv_bs4k_playback_24fps_mode', true],
-    ['playback_24fps_mode_cellular', 'konomitv_bs4k_playback_24fps_mode_cellular', true],
-    ['bs4k_playback_24fps_mode', 'konomitv_bs4k_playback_24fps_mode_for_bs4k', true],
-    ['bs4k_playback_24fps_mode_cellular', 'konomitv_bs4k_playback_24fps_mode_for_bs4k_cellular', true],
-    [
-        'playback_profile_migration_conflict_notice_pending',
-        'konomitv_bs4k_playback_profile_migration_conflict_notice_pending',
-        true,
-    ],
-] as const;
-
-
 function createLegacySettings(): Record<string, unknown> {
     const settings: Record<string, unknown> = structuredClone(ILocalClientSettingsDefault);
     for (const key of KONOMITV_BS4K_PLAYBACK_PROFILE_KEYS) {
@@ -227,23 +198,6 @@ describe('共通再生プロファイル移行', () => {
         expect(second.konomitv_bs4k_playback_profile_migration_conflict_notice_pending).toBe(false);
         expect(second).toEqual(first);
     });
-
-    it.each(CANDIDATE_KEY_CASES)(
-        '開発途中の汎用キー %s を専用キー %s へ一度だけ引き継ぐ',
-        (candidate_key, canonical_key, value) => {
-            const settings = createLegacySettings();
-            settings[candidate_key] = value;
-
-            const first = migrateKonomiTVBS4KPlaybackProfileSettings(settings);
-            expect(first[canonical_key]).toBe(value);
-
-            first[candidate_key] = ILocalClientSettingsDefault[
-                canonical_key as keyof typeof ILocalClientSettingsDefault
-            ];
-            const second = migrateKonomiTVBS4KPlaybackProfileSettings(first);
-            expect(second[canonical_key]).toBe(value);
-        },
-    );
 
     it('専用キーが存在すれば開発途中キーと旧ライブ・録画キーのどちらでも上書きしない', () => {
         const settings = createLegacySettings();

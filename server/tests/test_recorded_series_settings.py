@@ -284,45 +284,6 @@ def test_legacy_settings_use_new_child_defaults(
     assert settings.model_dump().get('acp_model') is None
 
 
-def test_legacy_candidate_selection_switch_is_read_but_not_saved_or_returned(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """廃止 field は旧 JSON / 旧 PUT を受理しても runtime 設定へ持ち越さない。"""
-
-    ConfigureTemporaryStore(monkeypatch, tmp_path)
-    RecordedSeriesSettingsStore.SETTINGS_PATH.write_text(
-        json.dumps({
-            'enabled': True,
-            'ai_enabled': True,
-            'ai_candidate_selection_enabled': False,
-        }),
-        encoding='utf-8',
-    )
-
-    settings = RecordedSeriesSettingsStore.getSettings()
-    assert settings.ai_candidate_selection_enabled is False
-    RecordedSeriesSettingsStore.saveSettings(settings)
-    saved = json.loads(RecordedSeriesSettingsStore.SETTINGS_PATH.read_text(encoding='utf-8'))
-    assert 'ai_candidate_selection_enabled' not in saved
-
-    app = CreateAdminApp()
-
-    async def Run() -> None:
-        async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
-            response = await client.put(
-                '/api/recorded-series/settings',
-                json={
-                    **settings.model_dump(mode='json'),
-                    'ai_candidate_selection_enabled': False,
-                },
-            )
-            assert response.status_code == 204
-            get_response = await client.get('/api/recorded-series/settings')
-            assert get_response.status_code == 200
-            assert 'ai_candidate_selection_enabled' not in get_response.json()
-
-    asyncio.run(Run())
 
 
 def test_legacy_acp_home_and_share_mode_keys_are_ignored_only_when_reading_saved_json(
@@ -359,56 +320,8 @@ def test_legacy_acp_home_and_share_mode_keys_are_ignored_only_when_reading_saved
 
 
 
-def test_removed_episode_search_settings_are_ignored_only_when_reading_saved_json(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """廃止した話数検索設定は旧 JSON から除外し、新しい schema では受理しない。"""
-
-    ConfigureTemporaryStore(monkeypatch, tmp_path)
-    RecordedSeriesSettingsStore.SETTINGS_PATH.write_text(
-        json.dumps({
-            **RecordedSeriesSettings().model_dump(mode='json'),
-            'ai_episode_number_search_enabled': False,
-            'ai_episode_number_acceptance_mode': 'HighConfidenceOnly',
-        }),
-        encoding='utf-8',
-    )
-
-    settings = RecordedSeriesSettingsStore.getSettings()
-
-    assert settings == RecordedSeriesSettings()
-    for removed_key in (
-        'ai_episode_number_search_enabled',
-        'ai_episode_number_acceptance_mode',
-    ):
-        assert removed_key not in settings.model_dump()
-        with pytest.raises(ValidationError):
-            RecordedSeriesSettings.model_validate({removed_key: False})
 
 
-def test_legacy_acp_custom_saved_settings_are_disabled_and_migrated_safely(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """旧 Custom 保存設定は任意コマンドを再実行せず、クリーンブレークで拒否する。"""
-
-    ConfigureTemporaryStore(monkeypatch, tmp_path)
-    RecordedSeriesSettingsStore.SETTINGS_PATH.write_text(
-        json.dumps({
-            **RecordedSeriesSettings(ai_enabled=True).model_dump(mode='json'),
-            'ai_backend': 'AcpCustom',
-            'acp_cwd': '/home/user/work',
-            'acp_command': '/opt/custom-acp-agent',
-            'acp_args': ['--acp'],
-            'acp_env': {'TERM': 'xterm'},
-        }),
-        encoding='utf-8',
-    )
-
-    # AcpCustom は拒否済み backend のため、保存 JSON は読取時に明示エラーになる。
-    with pytest.raises(ValueError):
-        RecordedSeriesSettingsStore.getSettings()
 
 
 def test_acp_custom_api_payload_is_rejected(

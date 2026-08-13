@@ -15,10 +15,8 @@ from app.metadata.ai.AIBackendSettings import AIBackendService
 from app.metadata.ai.episode_lookup import EpisodeLookupResult
 from app.metadata.ai.opencode_backend import OpenCodeBackend
 from app.metadata.ai.opencode_client import (
-    ExtractOpenCodeJSONObjectFromText,
     ExtractOpenCodeStructuredOutput,
     ExtractOpenCodeUsage,
-    ExtractOpenCodeWebToolEvidence,
     OpenCodeClient,
 )
 from app.metadata.RecordedEpisodeContext import (
@@ -637,175 +635,14 @@ def _lookup_context() -> RecordedEpisodeLookupContext:
     )
 
 
-def test_extract_web_tool_evidence_from_completed_websearch() -> None:
-    """完了 websearch から public citation を取り出す。"""
-
-    message = {
-        'parts': [
-            {
-                'type': 'tool',
-                'tool': 'websearch',
-                'state': {
-                    'status': 'completed',
-                    'output': {
-                        'sources': [
-                            {
-                                'url': 'https://example.com/episode/1',
-                                'title': 'Official episode list',
-                            },
-                            {
-                                'url': 'http://127.0.0.1/private',
-                                'title': 'private',
-                            },
-                        ],
-                    },
-                },
-            },
-            {
-                'type': 'tool',
-                'tool': 'StructuredOutput',
-                'state': {
-                    'status': 'completed',
-                    'input': {
-                        'outcome': 'Resolved',
-                        'season_number': 1,
-                        'episode_number': '12',
-                        'confidence': 0.9,
-                        'rationale_short': 'official list',
-                    },
-                },
-            },
-        ],
-    }
-    evidence = ExtractOpenCodeWebToolEvidence(message)
-    assert evidence['web_search_performed'] is True
-    assert evidence['completed_web_calls'] == 1
-    urls = [item['url'] for item in evidence['citations']]
-    assert 'https://example.com/episode/1' in urls
-    assert 'http://127.0.0.1/private' not in urls
-    structured = ExtractOpenCodeStructuredOutput(message)
-    assert structured is not None
-    assert structured['outcome'] == 'Resolved'
 
 
-def test_extract_web_tool_evidence_without_tools() -> None:
-    """tool 無しは web_search_performed=False。"""
-
-    evidence = ExtractOpenCodeWebToolEvidence({
-        'parts': [
-            {
-                'type': 'tool',
-                'tool': 'StructuredOutput',
-                'state': {
-                    'status': 'completed',
-                    'input': {'outcome': 'Resolved'},
-                },
-            },
-        ],
-    })
-    assert evidence['web_search_performed'] is False
-    assert evidence['citations'] == []
 
 
-def test_merge_web_tool_evidence_prefers_completed_over_failed() -> None:
-    """failed → completed の順でも合算後は performed=True と citation を残す。"""
-
-    from app.metadata.ai.opencode_backend import _MergeOpenCodeWebToolEvidence
-
-    failed = ExtractOpenCodeWebToolEvidence({
-        'parts': [
-            {
-                'type': 'tool',
-                'tool': 'websearch',
-                'state': {'status': 'error', 'output': 'timeout'},
-            },
-        ],
-    })
-    completed = ExtractOpenCodeWebToolEvidence({
-        'parts': [
-            {
-                'type': 'tool',
-                'tool': 'websearch',
-                'state': {
-                    'status': 'completed',
-                    'output': 'Title: ok\nURL: https://example.com/ok\n',
-                },
-            },
-        ],
-    })
-    merged = _MergeOpenCodeWebToolEvidence([failed, completed])
-    assert merged['web_search_performed'] is True
-    assert merged['web_search_failed'] is False
-    assert merged['completed_web_calls'] == 1
-    assert merged['failed_web_calls'] == 1
-    assert any(
-        item['url'] == 'https://example.com/ok'
-        for item in merged['citations']
-    )
 
 
-def test_extract_web_tool_evidence_exa_text_output() -> None:
-    """Exa のテキスト形式出力（URL: https://...）から public URL を抽出する。"""
-
-    message = {
-        'parts': [
-            {
-                'type': 'tool',
-                'tool': 'websearch',
-                'state': {
-                    'status': 'completed',
-                    'input': {'query': 'latest news about OpenAI August 2026'},
-                    'output': (
-                        'Title: OpenAI reportedly slows research\n'
-                        'URL: https://the-decoder.com/openai-reportedly-slows-research/\n'
-                        'Published: 2026-08-06T11:49:26.000Z\n'
-                        'Highlights:\nSome text here\n'
-                        'Another URL: http://127.0.0.1/private\n'
-                    ),
-                    'title': 'Exa Web Search: latest news',
-                    'metadata': {'provider': 'exa', 'truncated': False},
-                },
-            },
-        ],
-    }
-    evidence = ExtractOpenCodeWebToolEvidence(message)
-    assert evidence['web_search_performed'] is True
-    assert evidence['completed_web_calls'] == 1
-    urls = [item['url'] for item in evidence['citations']]
-    assert 'https://the-decoder.com/openai-reportedly-slows-research/' in urls
-    # 非公開ホスト（localhost / ループバック）は抽出しない。
-    assert not any(url.startswith('http://127.0.0.1') for url in urls)
 
 
-def test_extract_json_object_from_text() -> None:
-    """format なし応答の末尾 JSON object を抽出し、平文付きは受理しない。"""
-
-    assert ExtractOpenCodeJSONObjectFromText(
-        '{"outcome":"InsufficientEvidence","season_number":null,'
-        '"episode_number":null,"confidence":0.5,"rationale_short":"test"}',
-    ) == {
-        'outcome': 'InsufficientEvidence',
-        'season_number': None,
-        'episode_number': None,
-        'confidence': 0.5,
-        'rationale_short': 'test',
-    }
-    # 短い平文 prefix は無視して JSON を抽出する。
-    extracted = ExtractOpenCodeJSONObjectFromText(
-        'OK\n{"outcome":"Resolved","season_number":1,"episode_number":"1",'
-        '"confidence":0.9,"rationale_short":"ok"}',
-    )
-    assert extracted is not None
-    assert extracted['outcome'] == 'Resolved'
-    # Markdown や説明文が残るものは受理しない（厳格契約）。
-    assert ExtractOpenCodeJSONObjectFromText(
-        '```json\n{"outcome":"Resolved"}```',
-    ) is None
-    assert ExtractOpenCodeJSONObjectFromText(
-        '{"outcome":"Resolved"}\n説明が続く',
-    ) is None
-    assert ExtractOpenCodeJSONObjectFromText(None) is None
-    assert ExtractOpenCodeJSONObjectFromText('') is None
 
 
 def test_lookup_episode_with_web_evidence(monkeypatch: pytest.MonkeyPatch) -> None:

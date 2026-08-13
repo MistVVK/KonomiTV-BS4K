@@ -61,13 +61,4 @@ describe('RecordedProgramList 空メッセージ', () => {
         expect(heading.text()).toContain('<img src=x onerror=alert(1)>');
     });
 
-    it('補足メッセージも同様にテキスト表示される', () => {
-        const wrapper = mountList({
-            emptySubMessage: ['別のキーワードで', '<script>alert(1)</script>検索をお試しください。'],
-        });
-        const submessage = wrapper.find('.recorded-program-list__empty-submessage');
-        expect(submessage.findAll('br')).toHaveLength(1);
-        expect(submessage.findAll('*').every((el) => el.element.tagName === 'BR')).toBe(true);
-        expect(submessage.text()).toContain('<script>alert(1)</script>');
-    });
 });

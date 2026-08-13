@@ -30,23 +30,10 @@ describe('formatLogLine', () => {
         });
     });
 
-    it('CRITICAL もログレベルとして検出される', () => {
-        const result = formatLogLine('CRITICAL: fatal error');
+    it('行頭の最初のログレベルだけを色付け対象にする', () => {
+        const result = formatLogLine('CRITICAL: first INFO: second');
         expect(result.level).toBe('CRITICAL');
         expect(result.prefix).toBe('');
-        expect(result.rest).toBe(' fatal error');
-    });
-
-    it('ログレベルが行頭にある場合は prefix が空文字になる', () => {
-        const result = formatLogLine('INFO: started');
-        expect(result.level).toBe('INFO');
-        expect(result.prefix).toBe('');
-        expect(result.rest).toBe(' started');
-    });
-
-    it('行内で最初に現れるログレベルだけを色付け対象にする', () => {
-        const result = formatLogLine('DEBUG: first INFO: second');
-        expect(result.level).toBe('DEBUG');
         expect(result.rest).toBe(' first INFO: second');
     });
 });

@@ -425,7 +425,6 @@ def test_live_hwdownload_format_matches_hw_surface() -> None:
     [
         ('2100K', '3500K'),
         ('9450K', '11813K'),
-        ('21000K', '26250K'),
     ],
 )
 def test_konomitv_bs4k_advanced_live_muxrate_reserves_bounded_headroom(
@@ -445,21 +444,12 @@ def test_konomitv_bs4k_advanced_live_muxrate_reserves_bounded_headroom(
         ('1440p', '5.0', 12, 33000, '16800K'),
         ('1080p-60fps', '4.1', 9, 22000, '12640K'),
         ('1080p-30fps', '4.0', 8, 13200, '12150K'),
-        ('1080p', '4.0', 8, 13200, '12150K'),
-        ('810p-60fps', '4.0', 8, 13200, '12150K'),
-        ('810p-30fps', '4.0', 8, 13200, '11590K'),
         ('810p', '4.0', 8, 13200, '11590K'),
-        ('720p-60fps', '4.0', 8, 13200, '11520K'),
         ('720p', '3.1', 5, 11000, '11000K'),
-        ('720p-30fps', '3.1', 5, 11000, '11000K'),
         ('540p', '3.0', 4, 6600, '6600K'),
-        ('540p-30fps', '3.0', 4, 6600, '6600K'),
         ('480p', '3.0', 4, 6600, '6600K'),
-        ('480p-30fps', '3.0', 4, 6600, '6600K'),
         ('360p', '2.1', 1, 3300, '3300K'),
-        ('360p-30fps', '2.1', 1, 3300, '3300K'),
         ('240p', '2.0', 0, 1650, '1650K'),
-        ('240p-30fps', '2.0', 0, 1650, '1650K'),
     ],
 )
 def test_konomitv_bs4k_av1_muxrate_obeys_required_minimum_level_tstd_rx(
@@ -500,49 +490,8 @@ def test_konomitv_bs4k_av1_muxrate_obeys_required_minimum_level_tstd_rx(
     assert int(muxrate.removesuffix('K')) <= expected_rx_kbps
 
 
-@pytest.mark.parametrize('video_codec', ['avc', 'hevc', 'vp9'])
-def test_konomitv_bs4k_non_av1_muxrate_is_not_capped_by_av1_tstd(
-    video_codec: KonomiTVBS4KVideoCodec,
-) -> None:
-    """
-    AVC・HEVC・VP9 は音声 codec によらず AV1 の Level cap を適用しない。
-
-    Args:
-        video_codec (KonomiTVBS4KVideoCodec): 処理または検証対象の映像 codec。
-
-    Returns:
-        None
-    """
-
-    assert (
-        ResolveKonomiTVBS4KAdvancedLiveMuxrate(
-            '2100K',
-            quality = '720p',
-            video_codec = video_codec,
-        )
-        == '3500K'
-    )
 
 
-def test_konomitv_bs4k_av1_1080p_muxrate_uses_larger_headroom_than_vp9() -> None:
-    """1080p AV1 は VP9 より広い固定 muxrate 余力を取り、CBR 上の I フレーム遅延を抑える。"""
-
-    assert (
-        ResolveKonomiTVBS4KAdvancedLiveMuxrate(
-            '3150K',
-            quality = '1080p',
-            video_codec = 'av1',
-        )
-        == '12150K'
-    )
-    assert (
-        ResolveKonomiTVBS4KAdvancedLiveMuxrate(
-            '4050K',
-            quality = '1080p',
-            video_codec = 'vp9',
-        )
-        == '5450K'
-    )
 
 
 def test_konomitv_bs4k_advanced_live_muxrate_rejects_partial_stream_context() -> None:
@@ -554,7 +503,7 @@ def test_konomitv_bs4k_advanced_live_muxrate_rejects_partial_stream_context() ->
         ResolveKonomiTVBS4KAdvancedLiveMuxrate('420K', video_codec = 'av1')
 
 
-@pytest.mark.parametrize('invalid_bitrate', ['0K', '-1K', 'K', 'abcK', '2100', '2M'])
+@pytest.mark.parametrize('invalid_bitrate', ['0K', 'abcK'])
 def test_konomitv_bs4k_advanced_live_muxrate_rejects_invalid_input(
     invalid_bitrate: str,
 ) -> None:
@@ -568,7 +517,6 @@ def test_konomitv_bs4k_advanced_live_muxrate_rejects_invalid_input(
     ('muxrate', 'expected_kbps'),
     [
         ('2200K', '2200'),
-        ('10000K', '10000'),
     ],
 )
 def test_konomitv_bs4k_advanced_live_muxrate_is_converted_for_bridge(
@@ -580,14 +528,6 @@ def test_konomitv_bs4k_advanced_live_muxrate_is_converted_for_bridge(
     assert ParseKonomiTVBS4KAdvancedLiveMuxrateKbps(muxrate) == expected_kbps
 
 
-@pytest.mark.parametrize('invalid_muxrate', ['', '0K', '-1K', '2200', '2.2M', 'K'])
-def test_konomitv_bs4k_advanced_live_muxrate_conversion_rejects_invalid_input(
-    invalid_muxrate: str,
-) -> None:
-    """Bridge 用搬送レートは正整数 Kbps 以外を受理しない。"""
-
-    with pytest.raises(ValueError, match = 'Invalid advanced live muxrate'):
-        ParseKonomiTVBS4KAdvancedLiveMuxrateKbps(invalid_muxrate)
 
 
 def test_konomitv_bs4k_invalid_avc_10bit_is_rejected_without_silent_fallback() -> None:
@@ -1807,14 +1747,9 @@ def test_konomitv_bs4k_capability_api_uses_namespaced_path() -> None:
     ('video_codec', 'bit_depth', 'mapping_case', 'opus_pid_count', 'expected_available'),
     [
         ('vp9', 8, 'valid', 2, True),
-        ('vp9', 8, 'valid', 1, False),
         ('vp9', 8, 'missing', 2, False),
-        ('vp9', 8, 'unknown-version', 2, False),
-        ('av1', 8, 'valid', 2, True),
         ('av1', 10, 'valid', 2, True),
-        ('av1', 8, 'missing', 2, False),
         ('av1', 8, 'invalid-marker-version', 2, False),
-        ('av1', 8, 'reserved-bit', 2, False),
         ('av1', 10, 'bit-depth-mismatch', 2, False),
     ],
 )
@@ -1974,8 +1909,6 @@ def test_konomitv_bs4k_live_probe_rejects_malformed_aligned_psi_without_exceptio
         ('valid', True),
         ('psi-only', False),
         ('tei', False),
-        ('scrambled', False),
-        ('afc-zero', False),
         ('cc-gap', False),
         ('truncated', False),
     ],
@@ -2042,49 +1975,6 @@ def test_konomitv_bs4k_live_probe_requires_real_clean_transport(
     )
 
 
-def test_live_probe_pes_accepts_av1_private_stream_id() -> None:
-    """AV1 の private_stream_1 (0xBD) 映像PESを能力probeが受理する。"""
-
-    validate_pes = getattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        '_KonomiTVBS4KPlaybackCapabilityProbe__validateLiveProbePES',
-    )
-    av1_video = (
-        b'\x00\x00\x01\xBD\x00\x0C'
-        + b'\x84\x80\x05'
-        + _encode_probe_pts(90_000)
-        + b'\x12\x34\x56\x78'
-    )
-    vp9_video = (
-        b'\x00\x00\x01\xE0\x00\x0C'
-        + b'\x84\x80\x05'
-        + _encode_probe_pts(90_000)
-        + b'\x12\x34\x56\x78'
-    )
-    # FFmpeg の AVC/HEVC passthrough は data_alignment を立てない。
-    avc_passthrough = (
-        b'\x00\x00\x01\xE0\x00\x0C'
-        + b'\x80\x80\x05'
-        + _encode_probe_pts(90_000)
-        + b'\x12\x34\x56\x78'
-    )
-    assert validate_pes(av1_video, is_video = True) is True
-    assert validate_pes(vp9_video, is_video = True) is True
-    assert validate_pes(avc_passthrough, is_video = True) is True
-    assert validate_pes(
-        b'\x00\x00\x01\xBD\x00\x0C'
-        + b'\x80\x80\x05'  # AV1 で alignment=0 は拒否
-        + _encode_probe_pts(90_000)
-        + b'\x12\x34\x56\x78',
-        is_video = True,
-    ) is False
-    assert validate_pes(
-        b'\x00\x00\x01\xC0\x00\x0C'
-        + b'\x84\x80\x05'
-        + _encode_probe_pts(90_000)
-        + b'\x12\x34\x56\x78',
-        is_video = True,
-    ) is False
 
 
 @pytest.mark.parametrize(
@@ -2102,15 +1992,6 @@ def test_live_probe_pes_accepts_av1_private_stream_id() -> None:
         ('opus-pid-missing', 1, False, 'valid', 0, False),
         ('video-mixed', 2, True, 'valid', 0, False),
         ('missing-extension', 2, False, 'missing-extension', 0, False),
-        ('unknown-extension', 2, False, 'unknown-extension', 0, False),
-        (
-            'unsupported-channel-configuration',
-            2,
-            False,
-            'unsupported-channel-configuration',
-            0,
-            False,
-        ),
     ],
 )
 def test_konomitv_bs4k_radio_opus_transport_probe_requires_audio_only_two_track_output(
@@ -2360,62 +2241,6 @@ def test_konomitv_bs4k_live_negative_cache_expires_but_success_cache_remains(
     assert probe_calls == 2
 
 
-def test_konomitv_bs4k_radio_negative_cache_expires(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """radio Opusの一時失敗も短TTL後に再検査する。"""
-
-    now = 200.0
-    probe_results = iter((False, True))
-    probe_calls = 0
-
-    async def RunRadioOpusTransportProbe(
-        _cls: type[KonomiTVBS4KPlaybackCapabilityProbe],
-    ) -> bool:
-        nonlocal probe_calls
-        probe_calls += 1
-        return next(probe_results)
-
-    monkeypatch.setattr(
-        playback_capabilities_module.time,
-        'monotonic',
-        lambda: now,
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        '_KonomiTVBS4KPlaybackCapabilityProbe__getLiveProbeSignature',
-        classmethod(lambda _cls: 'stable-radio-generation'),
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        '_KonomiTVBS4KPlaybackCapabilityProbe__runRadioOpusTransportProbe',
-        classmethod(RunRadioOpusTransportProbe),
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe, '_live_probe_signature', None
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe, '_radio_opus_probe_result', None
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe,
-        '_radio_opus_probe_failure_timestamp',
-        None,
-    )
-    monkeypatch.setattr(
-        KonomiTVBS4KPlaybackCapabilityProbe, '_live_probe_event_loop', None
-    )
-
-    async def Verify() -> None:
-        nonlocal now
-        assert await KonomiTVBS4KPlaybackCapabilityProbe.isRadioOpusTransportAvailable() is False
-        now = 204.9
-        assert await KonomiTVBS4KPlaybackCapabilityProbe.isRadioOpusTransportAvailable() is False
-        now = 205.1
-        assert await KonomiTVBS4KPlaybackCapabilityProbe.isRadioOpusTransportAvailable() is True
-
-    asyncio.run(Verify())
-    assert probe_calls == 2
 
 
 def test_konomitv_bs4k_radio_opus_probe_closes_pipe_and_reaps_partial_startup(

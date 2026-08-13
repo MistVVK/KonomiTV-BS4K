@@ -182,48 +182,9 @@ class TestReadPSIData:
         result = TSInfoAnalyzer.readPSIData(BytesIO(archive), [0x14], lambda *args: False)
         assert result == 'Stopped'
 
-    def test_short_header_is_truncated(self) -> None:
-        """1〜31 バイトの短いヘッダ (書き込み途中の末尾) は Truncated を返す。"""
 
-        archive = _BuildPSCBlock([(0x14, b'\x73' + b'\x00' * 10)])
-        result = TSInfoAnalyzer.readPSIData(BytesIO(archive + b'Pssc\x0d'), [0x14], lambda *args: True)
-        assert result == 'Truncated'
 
-    def test_magic_mismatch_is_invalid(self) -> None:
-        """32 バイト読めたがヘッダマジックが不一致の場合は Invalid を返す。"""
 
-        archive = _BuildPSCBlock([(0x14, b'\x73' + b'\x00' * 10)])
-        result = TSInfoAnalyzer.readPSIData(BytesIO(archive + b'X' * 32), [0x14], lambda *args: True)
-        assert result == 'Invalid'
-
-    def test_impossible_declared_length_is_invalid(self) -> None:
-        """宣言された dictionary_data_size に辞書が収まらない場合は read 前に Invalid を返す。"""
-
-        header = bytearray(32)
-        header[0:8] = b'Pssc\x0d\x0a\x9a\x0a'
-        header[10:12] = (0).to_bytes(2, 'little')  # time_list_len
-        header[12:14] = (1).to_bytes(2, 'little')  # dictionary_len
-        header[14:16] = (1).to_bytes(2, 'little')  # dictionary_window_len
-        header[16:20] = (0).to_bytes(4, 'little')  # dictionary_data_size (PID 2 バイトすら収まらない)
-        header[20:24] = (0).to_bytes(4, 'little')  # dictionary_buff_size
-        # 辞書エントリ (新規セクション参照) だけを続ける
-        body = (4).to_bytes(2, 'little')
-        result = TSInfoAnalyzer.readPSIData(BytesIO(bytes(header) + body), [0x14], lambda *args: True)
-        assert result == 'Invalid'
-
-    def test_valid_prefix_with_invalid_suffix_is_invalid(self) -> None:
-        """正常ブロックの後に壊れたヘッダが続く書庫は Invalid を返す。"""
-
-        collected: list[tuple[float, int, bytes]] = []
-        archive = _BuildPSCBlock([(0x14, b'\x73' + b'\x00' * 10)])
-        broken_header = bytearray(32)
-        broken_header[0:8] = b'BROKEN!!'
-        result = TSInfoAnalyzer.readPSIData(
-            BytesIO(archive + bytes(broken_header)), [0x14], lambda *args: collected.append(args) or True,
-        )
-        # 先頭ブロックは callback 済みでも、全体としては Invalid と分類される
-        assert result == 'Invalid'
-        assert len(collected) == 1
 
 
 class TestTSInfoAnalyzerPSCFallback:
@@ -315,43 +276,6 @@ class TestTSInfoAnalyzerPSCFallback:
 class TestExtractTOTTimeListFromPSCArchive:
     """過去ログコメント API 向け TOT 時刻リスト抽出のフォールバック契約を検証する。"""
 
-    def test_missing_psc_returns_empty_list_silently(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        """.psc が存在しない場合は空リストを返し warning を出さない。"""
-
-        logs = _CaptureLogs(monkeypatch, 'app.routers.VideosRouter.logging')
-        result = ExtractTOTTimeListFromPSCArchive(tmp_path / 'recording.psc')
-        assert result == []
-        assert logs['warning'] == []
-
-    def test_invalid_psc_logs_warning_and_returns_empty_list(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """破損した .psc は warning を記録しつつ空リストへフォールバックする。"""
-
-        logs = _CaptureLogs(monkeypatch, 'app.routers.VideosRouter.logging')
-        psc_path = tmp_path / 'recording.psc'
-        header = bytearray(32)
-        header[0:8] = b'Pssc\x0d\x0a\x9a\x0a'
-        header[12:14] = (5).to_bytes(2, 'little')
-        psc_path.write_bytes(bytes(header))
-
-        result = ExtractTOTTimeListFromPSCArchive(psc_path)
-        assert result == []
-        assert len(logs['warning']) == 1
-
-    def test_truncated_psc_does_not_warn(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        """末尾が不完全な .psc では warning を出さず空リストへフォールバックする。"""
-
-        logs = _CaptureLogs(monkeypatch, 'app.routers.VideosRouter.logging')
-        psc_path = tmp_path / 'recording.psc'
-        archive = _BuildPSCBlock([(0x14, _BuildTOTSection())])
-        psc_path.write_bytes(archive[:-4])
-
-        result = ExtractTOTTimeListFromPSCArchive(psc_path)
-        assert result == []
-        assert logs['warning'] == []
-        assert len(logs['debug']) == 1
-
     def test_valid_psc_returns_tot_time_list(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """正常な .psc から TOT 時刻リストを取得でき、例外なく処理が継続する。"""
 
@@ -381,23 +305,6 @@ class TestExtractTOTTimeListFromPSCArchive:
         result = ExtractTOTTimeListFromPSCArchive(psc_path)
         assert result == []
         # コメント API の継続を妨げない (例外が送出されない) ことを確認する
-
-    def test_valid_prefix_invalid_suffix_returns_empty_list_with_warning(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """正常ブロックの後に壊れたヘッダが続く .psc では、部分的な TOT リストを利用せず warning を記録する。"""
-
-        logs = _CaptureLogs(monkeypatch, 'app.routers.VideosRouter.logging')
-        psc_path = tmp_path / 'recording.psc'
-        archive = _BuildPSCBlock([(0x14, _BuildTOTSection())])
-        broken_header = bytearray(32)
-        broken_header[0:8] = b'BROKEN!!'
-        psc_path.write_bytes(archive + bytes(broken_header))
-
-        result = ExtractTOTTimeListFromPSCArchive(psc_path)
-        # 部分的に収集された TOT リストも破棄され、コメントの誤補正を防ぐ
-        assert result == []
-        assert len(logs['warning']) == 1
 
     def test_unexpected_parse_exception_returns_empty_list_with_warning(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,

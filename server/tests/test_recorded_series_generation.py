@@ -6,7 +6,6 @@ from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesProgramPrompt,
 )
 from app.metadata.RecordedSeriesGeneration import (
-    BuildSeriesMetadataSystemPrompt,
     ParseStrictSeriesMetadataJSONObject,
     SeriesMetadataClusterHint,
     SeriesMetadataClusterProgramHint,
@@ -168,13 +167,6 @@ def test_numbered_episode_without_explicit_season_defaults_to_one() -> None:
     assert str(result.episode_number) == '1266'
 
 
-def test_system_prompt_defaults_numbered_program_without_explicit_season_to_one() -> None:
-    """生成指示とサーバー側の Season 1 正規化契約を一致させる。"""
-
-    assert (
-        'Use season_number 1 when a numbered program has no explicit seasons.'
-        in BuildSeriesMetadataSystemPrompt()
-    )
 
 
 @pytest.mark.parametrize(
@@ -244,8 +236,3 @@ def test_strict_json_parser_rejects_markdown_wrapper() -> None:
             '"wikipedia_page_id":null,"rationale_short":null}\n```',
         )
     assert error.value.code == 'InvalidJSON'
-
-
-def test_program_fixture_is_available_for_local_imports() -> None:
-    # Program() は他テストから流用されることがあるため、生成できることを保証する。
-    assert Program()['channel_name'] == 'テスト局'

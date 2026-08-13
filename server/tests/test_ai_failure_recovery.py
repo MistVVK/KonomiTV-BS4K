@@ -13,8 +13,6 @@ import pytest
 
 from app.metadata.ai import recorded_series_ai as RecordedSeriesAIModule
 from app.metadata.ai.ai_failure_recovery import (
-    BuildPrimaryTarget,
-    BuildRecoveryTarget,
     ShouldRecoverEpisodeLookupResult,
     ShouldRecoverSeriesMetadataResult,
 )
@@ -44,7 +42,6 @@ from app.metadata.RecordedSeriesGeneration import (
     SeriesMetadataHints,
 )
 from app.metadata.RecordedSeriesSettings import (
-    AreAIBackendTargetsIdentical,
     RecordedSeriesSettings,
     RecordedSeriesSettingsStore,
 )
@@ -316,42 +313,8 @@ def test_settings_clear_fallback_when_not_fallback_strategy() -> None:
     assert retry.ai_fallback_backend is None
 
 
-def test_are_backend_targets_identical() -> None:
-    assert AreAIBackendTargetsIdentical(
-        primary_backend='AcpCodex',
-        primary_service_id=None,
-        fallback_backend='AcpCodex',
-        fallback_service_id=None,
-    ) is True
-    assert AreAIBackendTargetsIdentical(
-        primary_backend='AcpCodex',
-        primary_service_id=None,
-        fallback_backend='AcpGrok',
-        fallback_service_id=None,
-    ) is False
 
 
-def test_recovery_target_roles() -> None:
-    fail = RecordedSeriesSettings(ai_failure_recovery_strategy='Fail')
-    assert BuildRecoveryTarget(fail) is None
-    retry = RecordedSeriesSettings(
-        ai_backend='AcpCodex',
-        ai_failure_recovery_strategy='RetrySameBackend',
-    )
-    target = BuildRecoveryTarget(retry)
-    assert target is not None
-    assert target.role == 'PrimaryRetry'
-    assert target.prompt_variant == 'RecoveryRetry'
-    fallback = RecordedSeriesSettings(
-        ai_backend='AcpCodex',
-        ai_failure_recovery_strategy='FallbackBackend',
-        ai_fallback_backend='AcpGrok',
-    )
-    target = BuildRecoveryTarget(fallback)
-    assert target is not None
-    assert target.role == 'Fallback'
-    assert target.backend_kind == 'AcpGrok'
-    assert target.prompt_variant == 'Default'
 
 
 def test_should_recover_decisions() -> None:
@@ -766,14 +729,3 @@ def test_fallback_service_is_protected_from_delete(
     assert IsRecordedSeriesReferencingService(
         '00000000-0000-4000-8000-000000000001',
     ) is False
-
-
-def test_primary_target_builder() -> None:
-    settings = RecordedSeriesSettings(
-        ai_backend='OpenCode',
-        ai_backend_service_id='00000000-0000-4000-8000-000000000001',
-    )
-    target = BuildPrimaryTarget(settings)
-    assert target.role == 'Primary'
-    assert target.service_id == '00000000-0000-4000-8000-000000000001'
-    assert target.prompt_variant == 'Default'

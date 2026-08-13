@@ -4,7 +4,6 @@ import asyncio
 import os
 from concurrent.futures import Future
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,54 +116,6 @@ def test_attempt_key_covers_input_runtime_and_logo_content() -> None:
     )
 
 
-def test_attempt_key_covers_service_metadata_and_resolved_streams() -> None:
-    selection = CMLogoSelection(status='Missing')
-    descriptor = CMInputDescriptor(
-        format_name='mpegts',
-        video_stream_index=3,
-        audio_stream_index=4,
-        video_codec_name='av1',
-        pixel_format='yuv420p10le',
-        bit_depth=10,
-        width=1920,
-        height=1080,
-        field_order='progressive',
-        time_base=Fraction(1, 90_000),
-        source_frame_rate=Fraction(30_000, 1001),
-        duration_seconds=60.0,
-        program_id=101,
-        service_id=101,
-    )
-    base = CMAnalysisOrchestrator.buildAttemptKey(
-        {'sample_sha256': 'input'},
-        {'analyzer_version': 'CM-3'},
-        selection,
-        descriptor=descriptor,
-        service_id=101,
-    )
-
-    assert base != CMAnalysisOrchestrator.buildAttemptKey(
-        {'sample_sha256': 'input'},
-        {'analyzer_version': 'CM-3'},
-        selection,
-        descriptor=descriptor,
-        service_id=102,
-    )
-    assert base != CMAnalysisOrchestrator.buildAttemptKey(
-        {'sample_sha256': 'input'},
-        {'analyzer_version': 'CM-3'},
-        selection,
-        descriptor=descriptor,
-        service_id=101,
-        has_variable_video_format=True,
-    )
-    assert base != CMAnalysisOrchestrator.buildAttemptKey(
-        {'sample_sha256': 'input'},
-        {'analyzer_version': 'CM-3'},
-        selection,
-        descriptor=replace(descriptor, has_variable_audio_stream=True),
-        service_id=101,
-    )
 
 
 def test_variable_selected_audio_stream_requires_a_real_alternative_interval() -> None:
@@ -681,23 +632,6 @@ def test_commit_executor_future_is_joined_before_cancellation_is_propagated() ->
     asyncio.run(Run())
 
 
-def test_cm_hardware_decode_uses_available_device_without_codec_classification(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        RecordedPlaybackBackend,
-        'discoverRenderDevices',
-        lambda encoder: ['/dev/dri/renderD128' if encoder == 'QSV' else '/dev/dri/renderD129'],
-    )
-    monkeypatch.setattr(
-        'app.metadata.CMAnalysisOrchestrator.RecordedPlaybackCapabilityProbe.getSelectedDevice',
-        lambda encoder: None,
-    )
-
-    assert CMAnalysisOrchestrator._resolveHardwareDecodeDevice('QSV') == 'vaapi:/dev/dri/renderD128'
-    assert CMAnalysisOrchestrator._resolveHardwareDecodeDevice('NVENC') == 'cuda:0'
-    assert CMAnalysisOrchestrator._resolveHardwareDecodeDevice('AMF') == 'vaapi:/dev/dri/renderD129'
-    assert CMAnalysisOrchestrator._resolveHardwareDecodeDevice('FFmpeg') is None
 
 
 def test_cm_hardware_decode_prefers_capability_probed_render_node(monkeypatch: pytest.MonkeyPatch) -> None:

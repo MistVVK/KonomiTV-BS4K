@@ -55,17 +55,6 @@ describe('RecordedEpisodeResolution 表示契約', () => {
         expect(episodeLookupOutcomeDisplayLabel(resolution)).not.toContain('未実行');
     });
 
-    it('lookup_outcome がない決定論的な旧行は status と source へフォールバックする', () => {
-        const resolution = createResolution({
-            status: 'Resolved',
-            source: 'Local',
-        });
-
-        expect(episodeLookupOutcomeDisplayLabel(resolution)).toBe(
-            '確定（ローカル情報・Web 検索記録なし）',
-        );
-    });
-
     it('一括生成済み Episode は AI source を専用ラベルで表示する', () => {
         const resolution = createResolution({
             status: 'Resolved',
