@@ -4582,8 +4582,8 @@ The fixed upstream revisions, complete local patches, dependency revisions, and 
 - AMF fixed commit: `16f7d73e0b45c473e903e46981ed0b91efc4c091`
 - Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`
 - Local patches:
-  - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`d1bcd3cff61ddc0e2bba708b6929276d85b80ccb1c9473f9fbe6a94203849a15`)
-  - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`aa1d9d43bfe40ca2601a90f60090375b2acbfa33a43bf316c69f1777468e6491`)
+  - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`ea2b9a95f2bf4368f3d61428d1f121f2406e6d5e27390a7b5fc016af757c256e`)
+  - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`016307760c5a71f1206b253c49904c33cf34ccdba007f8c0702fe3f676ee3a1e`)
   - `amf-1.4.36-display-capture-c.patch` (`3527641c277d534d223dcfb669fdff465be9ceca1fe60713c6dcc2880d939f25`)
 
 #### Intel media stack

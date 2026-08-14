@@ -1,6 +1,6 @@
 --- a/libavformat/libaribtlv.c
 +++ b/libavformat/libaribtlv.c
-@@ -40,10 +40,15 @@
+@@ -40,10 +40,16 @@
  #define ARIBTLV_SEEK_MAX_PREROLL (128LL * 1024 * 1024)
  #define ARIBTLV_SEEK_PROBE_SIZE (64LL * 1024 * 1024)
  #define ARIBTLV_SEEK_MAX_ATTEMPTS 5
@@ -8,6 +8,7 @@
 +#define ARIBTLV_ID3_PAYLOAD_VERSION 2
 +#define ARIBTLV_ID3_MAX_RAW_FRAGMENT (60 * 1024)
 +#define ARIBTLV_ID3_ENVELOPE_SIZE 28
++#define ARIBTLV_NTP_UNIX_EPOCH_SECONDS INT64_C(2208988800)
  
  typedef struct LibaribtlvTrack {
      uint64_t id;
@@ -16,33 +17,75 @@
  } LibaribtlvTrack;
  
  typedef struct LibaribtlvPacket {
-@@ -80,6 +85,48 @@
-     return -1;
- }
+@@ -60,6 +66,7 @@
+     LibaribtlvPacket *queue_head;
+     LibaribtlvPacket *queue_tail;
+     int64_t service;
++    int max_audio_channels;
+     int64_t bytes_read;
+     int seek_probe;
+     int seek_stream_index;
+@@ -69,15 +76,77 @@
+     int fatal_error;
+ } LibaribtlvContext;
  
-+static int libaribtlv_timed_id3_track_index(const LibaribtlvContext *ctx,
+-static int libaribtlv_track_index(const LibaribtlvContext *ctx, uint64_t id)
++static LibaribtlvTrack *libaribtlv_find_track(LibaribtlvContext *ctx,
++                                               uint64_t id)
+ {
+     size_t i;
+ 
+     for (i = 0; i < ctx->track_count; i++) {
+         if (ctx->tracks[i].id == id)
+-            return ctx->tracks[i].stream_index;
++            return &ctx->tracks[i];
+     }
+-    return -1;
++    return NULL;
++}
++
++static LibaribtlvTrack *libaribtlv_add_track(LibaribtlvContext *ctx,
++                                              uint64_t id)
++{
++    LibaribtlvTrack *tracks;
++    LibaribtlvTrack *track;
++
++    tracks = av_realloc_array(ctx->tracks, ctx->track_count + 1,
++                              sizeof(*ctx->tracks));
++    if (!tracks) {
++        ctx->fatal_error = AVERROR(ENOMEM);
++        return NULL;
++    }
++    ctx->tracks = tracks;
++    track = &ctx->tracks[ctx->track_count++];
++    track->id = id;
++    track->stream_index = -1;
++    track->timed_id3_stream_index = -1;
++    return track;
++}
++
++static int libaribtlv_track_index(LibaribtlvContext *ctx, uint64_t id)
++{
++    LibaribtlvTrack *track = libaribtlv_find_track(ctx, id);
++
++    return track ? track->stream_index : -1;
++}
++
++static int libaribtlv_timed_id3_track_index(LibaribtlvContext *ctx,
 +                                            uint64_t id)
 +{
-+    size_t i;
++    LibaribtlvTrack *track = libaribtlv_find_track(ctx, id);
 +
-+    for (i = 0; i < ctx->track_count; i++) {
-+        if (ctx->tracks[i].id == id)
-+            return ctx->tracks[i].timed_id3_stream_index;
-+    }
-+    return -1;
++    return track ? track->timed_id3_stream_index : -1;
 +}
 +
 +static void libaribtlv_set_timed_id3_track_index(LibaribtlvContext *ctx,
 +                                                  uint64_t id, int stream_index)
 +{
-+    size_t i;
++    LibaribtlvTrack *track = libaribtlv_find_track(ctx, id);
 +
-+    for (i = 0; i < ctx->track_count; i++) {
-+        if (ctx->tracks[i].id == id) {
-+            ctx->tracks[i].timed_id3_stream_index = stream_index;
-+            return;
-+        }
-+    }
++    if (track)
++        track->timed_id3_stream_index = stream_index;
 +}
 +
 +static int libaribtlv_queue_packet(LibaribtlvContext *ctx, AVPacket *packet)
@@ -60,20 +103,79 @@
 +        ctx->queue_head = queued;
 +    ctx->queue_tail = queued;
 +    return 0;
-+}
-+
+ }
+ 
  static enum AVMediaType libaribtlv_media_type(aribtlv_track_kind kind)
+@@ -103,16 +172,33 @@
+ static void libaribtlv_on_track(void *opaque, const aribtlv_track_info *track)
  {
-     switch (kind) {
-@@ -129,6 +176,7 @@
-         ctx->tracks = tracks;
-         ctx->tracks[ctx->track_count].id = track->track_id;
-         ctx->tracks[ctx->track_count].stream_index = st->index;
-+        ctx->tracks[ctx->track_count].timed_id3_stream_index = -1;
-         ctx->track_count++;
+     LibaribtlvContext *ctx = opaque;
+-    LibaribtlvTrack *tracks;
++    LibaribtlvTrack *stored_track;
+     AVStream *st;
+-    int stream_index;
+ 
+     if (ctx->fatal_error)
+         return;
+ 
+-    stream_index = libaribtlv_track_index(ctx, track->track_id);
+-    if (stream_index >= 0) {
+-        st = ctx->format->streams[stream_index];
++    stored_track = libaribtlv_find_track(ctx, track->track_id);
++    if (track->kind == ARIBTLV_TRACK_AUDIO &&
++        ctx->max_audio_channels > 0 &&
++        track->audio_channels > ctx->max_audio_channels) {
++        if (!stored_track)
++            stored_track = libaribtlv_add_track(ctx, track->track_id);
++        if (!stored_track)
++            return;
++        if (stored_track->stream_index >= 0)
++            ctx->format->streams[stored_track->stream_index]->discard = AVDISCARD_ALL;
++        stored_track->stream_index = -1;
++        av_log(ctx->format, AV_LOG_WARNING,
++               "Discarding audio track 0x%"PRIx64" (component_tag=0x%02x): "
++               "%d channels exceed max_audio_channels=%d\n",
++               track->track_id, track->component_tag, track->audio_channels,
++               ctx->max_audio_channels);
++        return;
++    }
++
++    if (stored_track && stored_track->stream_index >= 0) {
++        st = ctx->format->streams[stored_track->stream_index];
+         st->discard = AVDISCARD_DEFAULT;
+     } else {
+         st = avformat_new_stream(ctx->format, NULL);
+@@ -120,16 +206,11 @@
+             ctx->fatal_error = AVERROR(ENOMEM);
+             return;
+         }
+-        tracks = av_realloc_array(ctx->tracks, ctx->track_count + 1,
+-                                  sizeof(*ctx->tracks));
+-        if (!tracks) {
+-            ctx->fatal_error = AVERROR(ENOMEM);
++        if (!stored_track)
++            stored_track = libaribtlv_add_track(ctx, track->track_id);
++        if (!stored_track)
+             return;
+-        }
+-        ctx->tracks = tracks;
+-        ctx->tracks[ctx->track_count].id = track->track_id;
+-        ctx->tracks[ctx->track_count].stream_index = st->index;
+-        ctx->track_count++;
++        stored_track->stream_index = st->index;
      }
  
-@@ -151,6 +199,44 @@
+     st->id                   = track->packet_id;
+@@ -144,6 +225,8 @@
+     if (track->language && track->language[0])
+         av_dict_set(&st->metadata, "language", track->language, 0);
+     if (track->has_audio) {
++        av_dict_set_int(&st->metadata, "component_tag",
++                        track->component_tag, 0);
+         st->codecpar->sample_rate = track->audio_sample_rate;
+         if (track->audio_channels)
+             av_channel_layout_default(&st->codecpar->ch_layout,
+@@ -151,6 +234,44 @@
          if (track->audio_main_component)
              st->disposition |= AV_DISPOSITION_DEFAULT;
      }
@@ -118,7 +220,7 @@
  }
  
  static void libaribtlv_on_track_removed(void *opaque,
-@@ -161,13 +247,15 @@
+@@ -161,13 +248,15 @@
  
      if (stream_index >= 0)
          ctx->format->streams[stream_index]->discard = AVDISCARD_ALL;
@@ -135,7 +237,7 @@
      AVStream *st;
      AVPacket *packet;
      AVRational source_time_base;
-@@ -198,17 +286,13 @@
+@@ -198,17 +287,13 @@
          return;
      }
  
@@ -154,7 +256,7 @@
          av_packet_free(&packet);
          ctx->fatal_error = ret;
          return;
-@@ -224,12 +308,138 @@
+@@ -224,12 +309,149 @@
      if (unit->random_access)
          packet->flags |= AV_PKT_FLAG_KEY;
  
@@ -185,6 +287,7 @@
 +    const size_t owner_size = sizeof(owner) - 1;
 +    AVStream *st;
 +    AVRational source_time_base;
++    int64_t source_ntp_90khz;
 +    uint64_t pts_90khz;
 +    size_t fragment_count;
 +    size_t fragment_index;
@@ -193,7 +296,8 @@
 +
 +    if (ctx->fatal_error || ctx->seek_probe)
 +        return;
-+    if (mfu->size < 4 || mfu->size > UINT32_MAX ||
++    if (!mfu->source_ntp.timescale ||
++        mfu->size < 4 || mfu->size > UINT32_MAX ||
 +        mfu->additional_data_component_info_size > UINT16_MAX)
 +        return;
 +
@@ -201,11 +305,20 @@
 +    if (stream_index < 0)
 +        return;
 +    st = ctx->format->streams[stream_index];
++    /*
++     * TTML reference_start_time is absolute NTP time, while mfu->pts is only
++     * asset-relative. Map source NTP to the Unix-derived 33-bit clock used by
++     * the existing arib-ttml.js envelope before the browser schedules cues.
++     */
 +    source_time_base = (AVRational) {
-+        1, mfu->pts.timescale ? mfu->pts.timescale : 1
++        1, mfu->source_ntp.timescale
 +    };
-+    pts_90khz = (uint64_t)av_rescale_q(mfu->pts.value, source_time_base,
-+                                       (AVRational){ 1, 90000 }) &
++    source_ntp_90khz = av_rescale_q(mfu->source_ntp.value, source_time_base,
++                                    (AVRational){ 1, 90000 });
++    source_ntp_90khz -= ARIBTLV_NTP_UNIX_EPOCH_SECONDS * INT64_C(90000);
++    if (source_ntp_90khz < 0)
++        return;
++    pts_90khz = (uint64_t)source_ntp_90khz &
 +                ((UINT64_C(1) << 33) - 1);
 +    fragment_count = (mfu->size + ARIBTLV_ID3_MAX_RAW_FRAGMENT - 1) /
 +                     ARIBTLV_ID3_MAX_RAW_FRAGMENT;
@@ -299,7 +412,7 @@
  }
  
  static void libaribtlv_on_error(void *opaque, const aribtlv_error *error)
-@@ -405,6 +615,7 @@
+@@ -405,6 +627,7 @@
      callbacks.on_track = libaribtlv_on_track;
      callbacks.on_track_removed = libaribtlv_on_track_removed;
      callbacks.on_access_unit = libaribtlv_on_access_unit;
@@ -307,3 +420,49 @@
      callbacks.on_error = libaribtlv_on_error;
      aribtlv_config_init(&config);
      config.collect_application_resources = 0;
+@@ -572,6 +829,8 @@
+ static const AVOption libaribtlv_options[] = {
+     { "service", "select compressed-IP context/service (-1 for all)",
+       OFFSET(service), AV_OPT_TYPE_INT64, { .i64 = -1 }, -1, UINT32_MAX, DEC },
++    { "max_audio_channels", "discard audio tracks above this channel count (0 for unlimited)",
++      OFFSET(max_audio_channels), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, DEC },
+     { NULL }
+ };
+ 
+--- a/libavformat/mpegtsenc.c
++++ b/libavformat/mpegtsenc.c
+@@ -19,6 +19,8 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include <stdlib.h>
++
+ #include "libavutil/avassert.h"
+ #include "libavutil/bswap.h"
+ #include "libavutil/crc.h"
+@@ -539,6 +541,7 @@
+         AVStream *st = s->streams[i];
+         MpegTSWriteStream *ts_st = st->priv_data;
+         AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", NULL, 0);
++        AVDictionaryEntry *component_tag = av_dict_get(st->metadata, "component_tag", NULL, 0);
+         const char default_language[] = "und";
+         const char *language = lang && strlen(lang->value) >= 3 ? lang->value : default_language;
+         enum AVCodecID codec_id = st->codecpar->codec_id;
+@@ -832,6 +835,17 @@
+             break;
+         }
+ 
++        if (component_tag) {
++            char *end = NULL;
++            long value = strtol(component_tag->value, &end, 0);
++
++            if (component_tag->value[0] && end && !*end && value >= 0 && value <= UINT8_MAX) {
++                *q++ = STREAM_IDENTIFIER_DESCRIPTOR;
++                *q++ = 1;
++                *q++ = value;
++            }
++        }
++
+         val = 0xf000 | (q - desc_length_ptr - 2);
+         desc_length_ptr[0] = val >> 8;
+         desc_length_ptr[1] = val;

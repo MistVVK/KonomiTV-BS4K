@@ -2,7 +2,7 @@ diff --git a/include/aribtlv/aribtlv.h b/include/aribtlv/aribtlv.h
 index dbece1c..6140069 100644
 --- a/include/aribtlv/aribtlv.h
 +++ b/include/aribtlv/aribtlv.h
-@@ -106,6 +106,19 @@ typedef struct aribtlv_error {
+@@ -106,6 +106,20 @@ typedef struct aribtlv_error {
      const char *message;
  } aribtlv_error;
  
@@ -15,6 +15,7 @@ index dbece1c..6140069 100644
 +    size_t size;
 +    aribtlv_timestamp pts;
 +    aribtlv_timestamp dts;
++    aribtlv_timestamp source_ntp;
 +    uint64_t input_offset;
 +    uint8_t discontinuity;
 +} aribtlv_subtitle_mfu;
@@ -60,7 +61,7 @@ diff --git a/src/c_api.cpp b/src/c_api.cpp
 index e1441e1..2b634d0 100644
 --- a/src/c_api.cpp
 +++ b/src/c_api.cpp
-@@ -155,21 +155,42 @@ public:
+@@ -155,21 +155,43 @@ public:
      }
  
      void onAccessUnit(aribtlv::AccessUnit&& source) override {
@@ -93,6 +94,7 @@ index e1441e1..2b634d0 100644
 +                    raw_mfu.size(),
 +                    timestamp(source.pts),
 +                    timestamp(source.dts),
++                    source.source_ntp.has_value() ? timestamp(*source.source_ntp) : aribtlv_timestamp{},
 +                    source.input_offset,
 +                    static_cast<std::uint8_t>(source.discontinuity ? 1 : 0),
 +                };
