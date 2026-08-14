@@ -436,9 +436,10 @@ def test_konomitv_bs4k_advanced_live_muxrate_reserves_bounded_headroom(
     assert ResolveKonomiTVBS4KAdvancedLiveMuxrate(video_bitrate_max) == expected_muxrate
 
 
-@pytest.mark.parametrize(
-    ('quality', 'expected_level', 'expected_sequence_level_index', 'expected_rx_kbps', 'expected_muxrate'),
-    [
+def test_konomitv_bs4k_av1_muxrate_obeys_required_minimum_level_tstd_rx() -> None:
+    """全固定 AV1 画質で TS 全体を必要最小 Level の T-STD Rx 以下にする。"""
+
+    cases: tuple[tuple[QUALITY_TYPES, str, int, int, str], ...] = (
         ('4320p', '6.1', 17, 110000, '63000K'),
         ('2160p', '5.1', 13, 44000, '28350K'),
         ('1440p', '5.0', 12, 33000, '16800K'),
@@ -450,44 +451,23 @@ def test_konomitv_bs4k_advanced_live_muxrate_reserves_bounded_headroom(
         ('480p', '3.0', 4, 6600, '6600K'),
         ('360p', '2.1', 1, 3300, '3300K'),
         ('240p', '2.0', 0, 1650, '1650K'),
-    ],
-)
-def test_konomitv_bs4k_av1_muxrate_obeys_required_minimum_level_tstd_rx(
-    quality: QUALITY_TYPES,
-    expected_level: str,
-    expected_sequence_level_index: int,
-    expected_rx_kbps: int,
-    expected_muxrate: str,
-) -> None:
-    """
-    全固定 AV1 画質で、音声等を含む TS 全体を必要最小 Level の T-STD Rx 以下にする。
-
-    Args:
-        quality (QUALITY_TYPES): 処理または検証対象の画質。
-        expected_level (str): 期待する AV1 Level。
-        expected_sequence_level_index (int): 期待する AV1 sequence_level_index。
-        expected_rx_kbps (int): 期待する T-STD Rx 上限 Kbps。
-        expected_muxrate (str): 期待する固定 TS muxrate。
-
-    Returns:
-        None
-    """
-
-    bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, 'av1')
-    tstd_limit = KONOMITV_BS4K_AV1_MAIN_TIER_TSTD_LIMITS_BY_QUALITY[quality]
-    assert tstd_limit.minimum_level == expected_level
-    assert tstd_limit.minimum_sequence_level_index == expected_sequence_level_index
-    assert tstd_limit.maximum_transport_rate_kbps == expected_rx_kbps
-    assert tstd_limit.maximum_transport_rate_kbps == (
-        tstd_limit.maximum_bitrate_kbps * 11 // 10
     )
-    muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
-        bitrate.video_bitrate_max,
-        quality = quality,
-        video_codec = 'av1',
-    )
-    assert muxrate == expected_muxrate
-    assert int(muxrate.removesuffix('K')) <= expected_rx_kbps
+    for quality, expected_level, expected_sequence_level_index, expected_rx_kbps, expected_muxrate in cases:
+        bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, 'av1')
+        tstd_limit = KONOMITV_BS4K_AV1_MAIN_TIER_TSTD_LIMITS_BY_QUALITY[quality]
+        assert tstd_limit.minimum_level == expected_level
+        assert tstd_limit.minimum_sequence_level_index == expected_sequence_level_index
+        assert tstd_limit.maximum_transport_rate_kbps == expected_rx_kbps
+        assert tstd_limit.maximum_transport_rate_kbps == (
+            tstd_limit.maximum_bitrate_kbps * 11 // 10
+        )
+        muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
+            bitrate.video_bitrate_max,
+            quality = quality,
+            video_codec = 'av1',
+        )
+        assert muxrate == expected_muxrate
+        assert int(muxrate.removesuffix('K')) <= expected_rx_kbps
 
 
 
@@ -513,19 +493,10 @@ def test_konomitv_bs4k_advanced_live_muxrate_rejects_invalid_input(
         ResolveKonomiTVBS4KAdvancedLiveMuxrate(invalid_bitrate)
 
 
-@pytest.mark.parametrize(
-    ('muxrate', 'expected_kbps'),
-    [
-        ('2200K', '2200'),
-    ],
-)
-def test_konomitv_bs4k_advanced_live_muxrate_is_converted_for_bridge(
-    muxrate: str,
-    expected_kbps: str,
-) -> None:
+def test_konomitv_bs4k_advanced_live_muxrate_is_converted_for_bridge() -> None:
     """Bridge の T-STD 入力へ FFmpeg と同一の搬送レートを渡す。"""
 
-    assert ParseKonomiTVBS4KAdvancedLiveMuxrateKbps(muxrate) == expected_kbps
+    assert ParseKonomiTVBS4KAdvancedLiveMuxrateKbps('2200K') == '2200'
 
 
 
@@ -551,19 +522,17 @@ def test_konomitv_bs4k_invalid_avc_10bit_is_rejected_without_silent_fallback() -
         )
 
 
-@pytest.mark.parametrize('encoder', ['FFmpeg', 'QSV', 'NVENC', 'AMF'])
-def test_konomitv_bs4k_legacy_hevc_10bit_suffix_stays_exact_for_every_backend(
-    encoder: str,
-) -> None:
+def test_konomitv_bs4k_legacy_hevc_10bit_suffix_stays_exact_for_every_backend() -> None:
     """旧HEVC 10bit suffixもbackendによって8bitへ黙って降格しない。"""
 
-    stream_quality = SplitQualityAndEncodingOptions(
-        '1080p-hevc-10bit',
-        encoder = encoder,  # type: ignore[arg-type]
-    )
-    assert stream_quality is not None
-    assert stream_quality.encoding_options.video_codec == 'hevc'
-    assert stream_quality.encoding_options.video_bit_depth == 10
+    for encoder in ('FFmpeg', 'QSV', 'NVENC', 'AMF'):
+        stream_quality = SplitQualityAndEncodingOptions(
+            '1080p-hevc-10bit',
+            encoder = encoder,  # type: ignore[arg-type]
+        )
+        assert stream_quality is not None
+        assert stream_quality.encoding_options.video_codec == 'hevc'
+        assert stream_quality.encoding_options.video_bit_depth == 10
 
 
 def test_konomitv_bs4k_live_stream_key_separates_every_encoding_condition() -> None:

@@ -77,33 +77,27 @@ const mountProgram = (offlineDownloadJob: IOfflineDownloadJob, forOffline: boole
 
 describe('RecordedProgram のオフライン保存状態表示', () => {
 
-    it('通常の録画一覧では生成進捗を表示しない', () => {
-        const wrapper = mountProgram(createOfflineJob('Downloading', 'Encoding'), false);
+    it('通常の録画一覧ではオフライン保存の進捗・失敗結果を表示しない', () => {
+        const progress_wrapper = mountProgram(createOfflineJob('Downloading', 'Encoding'), false);
 
-        expect(wrapper.text()).not.toContain('映像・音声生成中');
-        expect(wrapper.find('.recorded-program__offline-progress').exists()).toBe(false);
+        expect(progress_wrapper.text()).not.toContain('映像・音声生成中');
+        expect(progress_wrapper.find('.recorded-program__offline-progress').exists()).toBe(false);
+
+        const failure_wrapper = mountProgram(createOfflineJob('Failed', 'Packaging'), false);
+        expect(failure_wrapper.text()).not.toContain('保存失敗');
+        expect(failure_wrapper.text()).not.toContain('テスト用の保存失敗結果');
+        expect(failure_wrapper.text()).toContain('通常の番組説明');
     });
 
-    it('通常の録画一覧では失敗結果を表示せず番組説明を維持する', () => {
-        const wrapper = mountProgram(createOfflineJob('Failed', 'Packaging'), false);
+    it('オフライン保存一覧では生成進捗と失敗結果を表示する', () => {
+        const progress_wrapper = mountProgram(createOfflineJob('Downloading', 'Encoding'), true);
 
-        expect(wrapper.text()).not.toContain('保存失敗');
-        expect(wrapper.text()).not.toContain('テスト用の保存失敗結果');
-        expect(wrapper.text()).toContain('通常の番組説明');
-    });
+        expect(progress_wrapper.text()).toContain('映像・音声生成中');
+        expect(progress_wrapper.find('.recorded-program__offline-progress').exists()).toBe(true);
+        expect(progress_wrapper.find('.recorded-program__offline-progress-bar').attributes('style')).toContain('width: 42%');
 
-    it('オフライン保存一覧では生成進捗を表示する', () => {
-        const wrapper = mountProgram(createOfflineJob('Downloading', 'Encoding'), true);
-
-        expect(wrapper.text()).toContain('映像・音声生成中');
-        expect(wrapper.find('.recorded-program__offline-progress').exists()).toBe(true);
-        expect(wrapper.find('.recorded-program__offline-progress-bar').attributes('style')).toContain('width: 42%');
-    });
-
-    it('オフライン保存一覧では失敗結果を表示する', () => {
-        const wrapper = mountProgram(createOfflineJob('Failed', 'Packaging'), true);
-
-        expect(wrapper.text()).toContain('保存失敗');
-        expect(wrapper.text()).toContain('テスト用の保存失敗結果');
+        const failure_wrapper = mountProgram(createOfflineJob('Failed', 'Packaging'), true);
+        expect(failure_wrapper.text()).toContain('保存失敗');
+        expect(failure_wrapper.text()).toContain('テスト用の保存失敗結果');
     });
 });

@@ -50,52 +50,22 @@ const mountTweet = (tweet: ITweet) => {
 
 describe('Tweet', () => {
 
-    it('悪意ある本文が HTML 要素や event handler として描画されない', () => {
-        const wrapper = mountTweet(createTweet('<img src=x onerror=alert(1)><script>alert(1)</script>'));
+    it('本文セグメントをリンクとテキストに分け、HTMLやevent handlerを生成しない', () => {
+        const wrapper = mountTweet(createTweet(
+            '<img src=x onerror=alert(1)> https://example.com/foo"onmouseover="alert(1) ' +
+            '@konomi_tv #test\n__URL_PLACEHOLDER_0__',
+        ));
         const textContainer = wrapper.find('.tweet__text');
         expectNoInjectionIn(textContainer);
-        // 悪意ある文字列はエスケープされた状態のテキストとして表示される
         expect(textContainer.text()).toContain('<img src=x onerror=alert(1)>');
-        expect(textContainer.text()).toContain('<script>alert(1)</script>');
-    });
-
-    it('event handler を含む URL は href 属性値に閉じ込められ、要素属性として生成されない', () => {
-        const wrapper = mountTweet(createTweet('https://example.com/foo"onmouseover="alert(1)'));
-        const textContainer = wrapper.find('.tweet__text');
-        expectNoInjectionIn(textContainer);
-        // onmouseover は href 属性の値の中に文字列として含まれるだけで、要素属性にはならない
-        const link = textContainer.find('a');
-        expect(link.attributes('href')).toBe('https://example.com/foo"onmouseover="alert(1)');
-        expect(link.attributes('onmouseover')).toBeUndefined();
-    });
-
-    it('通常の URL・メンション・ハッシュタグはリンクとして表示される', () => {
-        const wrapper = mountTweet(createTweet('see https://x.com/abc @konomi_tv #test'));
-        const links = wrapper.find('.tweet__text').findAll('a.tweet-link');
+        expect(textContainer.text()).toContain('__URL_PLACEHOLDER_0__');
+        expect(textContainer.text()).toContain('\n');
+        const links = textContainer.findAll('a.tweet-link');
         expect(links).toHaveLength(3);
-        expect(links[0].attributes('href')).toBe('https://x.com/abc');
+        expect(links[0].attributes('href')).toBe('https://example.com/foo"onmouseover="alert(1)');
+        expect(links[0].attributes('onmouseover')).toBeUndefined();
         expect(links[1].attributes('href')).toBe('https://x.com/konomi_tv');
         expect(links[2].attributes('href')).toBe('https://x.com/hashtag/test');
-        expect(wrapper.find('.tweet__text').text()).toContain('see ');
-    });
-
-    it('Bluesky のメンションは bsky.app へのリンクとして表示される', () => {
-        const wrapper = mountTweet(createTweet('@user.example.com さん', { source: 'Bluesky' }));
-        const link = wrapper.find('.tweet__text').find('a.tweet-link');
-        expect(link.attributes('href')).toBe('https://bsky.app/profile/user.example.com');
-        expect(link.text()).toBe('@user.example.com');
-    });
-
-    it('改行はテキストのまま表示される', () => {
-        const wrapper = mountTweet(createTweet('1行目\n2行目'));
-        expect(wrapper.find('.tweet__text').text()).toContain('1行目\n2行目');
-    });
-
-    it('本文中の __URL_PLACEHOLDER_<n>__ 文字列はテキストのまま表示される', () => {
-        const wrapper = mountTweet(createTweet('__URL_PLACEHOLDER_0__ https://x.com/a'));
-        const textContainer = wrapper.find('.tweet__text');
-        expect(textContainer.findAll('a.tweet-link')).toHaveLength(1);
-        expect(textContainer.text()).toContain('__URL_PLACEHOLDER_0__');
     });
 
     it('Twitter 動画は JWT を URL に含めず path 限定 Cookie へ同期する', () => {

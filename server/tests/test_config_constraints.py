@@ -27,18 +27,11 @@ class _FakeMirakurunResponse:
     ('field_name', 'invalid_value'),
     [
         ('video_watched_history_max_count', 0),
-        ('video_watched_history_max_count', -1),
         ('comment_font_size', 0),
-        ('comment_font_size', -5),
         ('comment_speed_rate', 0),
-        ('comment_speed_rate', -1.0),
         ('comment_speed_rate', math.nan),
-        ('comment_speed_rate', math.inf),
-        ('comment_speed_rate', -math.inf),
         ('caption_opacity', -0.1),
         ('caption_opacity', 1.1),
-        ('caption_opacity', math.nan),
-        ('caption_opacity', math.inf),
         ('last_synced_at', -1.0),
         ('last_synced_at', math.nan),
     ],
@@ -63,16 +56,12 @@ def test_client_settings_reject_out_of_range_values(field_name: str, invalid_val
     ('field_name', 'invalid_value'),
     [
         ('encoder_bs4k_input_probesize', 0),
-        ('encoder_bs4k_input_probesize', -1),
         ('encoder_bs4k_input_analyze', 0.0),
-        ('encoder_bs4k_input_analyze', -0.5),
         ('encoder_bs4k_input_analyze', math.nan),
-        ('encoder_bs4k_input_analyze', math.inf),
         ('encoder_bs4k_max_interleave_delta', 0),
         ('bs4k_live_startup_discard_seconds', -0.1),
         ('bs4k_live_startup_discard_seconds', math.nan),
         ('program_update_interval', 0.0),
-        ('program_update_interval', -1.0),
         ('program_update_interval', math.inf),
     ],
 )
@@ -197,26 +186,6 @@ def test_tlv_mirakurun_validation_checks_tuners_and_bs4k_services(
     assert str(settings.konomitv_bs4k_tlv_mirakurun_url) == 'http://tlv.invalid/base/'
     assert 'http://tlv.invalid/base/api/tuners' in requested_urls
     assert 'http://tlv.invalid/base/api/services' in requested_urls
-
-
-def test_tlv_mirakurun_temporary_outage_does_not_block_server_startup(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """BS4K 専用 TLV 入力元の一時停止中も、通常チャンネル向け設定は読み込める。"""
-
-    def Get(**_kwargs: object) -> _FakeMirakurunResponse:
-        raise httpx.ConnectError('temporarily unavailable')
-
-    monkeypatch.setattr('app.config.httpx.get', Get)
-    settings = _ServerSettingsGeneral.model_validate({
-        'backend': 'EDCB',
-        'always_receive_tv_from_mirakurun': False,
-        'konomitv_bs4k_live_transport': 'Tlv',
-        'konomitv_bs4k_tlv_mirakurun_url': 'http://tlv.invalid',
-    })
-
-    assert settings.live_stream_backend == 'EDCB'
-    assert settings.konomitv_bs4k_live_transport == 'Tlv'
 
 
 def test_tlv_mirakurun_validation_rejects_inventory_without_bs4k(

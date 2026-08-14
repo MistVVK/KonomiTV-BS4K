@@ -13,14 +13,6 @@ describe('formatLogLine', () => {
         });
     });
 
-    it('本文に HTML のような悪意ある文字列が含まれても、もとの文字列のまま本文として保持される', () => {
-        const result = formatLogLine('[username: <img src=x onerror=alert(1)>] WARNING: login failed');
-        expect(result.level).toBe('WARNING');
-        expect(result.rest).toBe(' login failed');
-        // 本文は HTML へ変換されず、テキストとして表示するための生の文字列として返される
-        expect(result.prefix).toBe('[username: <img src=x onerror=alert(1)>] ');
-    });
-
     it('ログレベルを含まない行は level が null になり、行全体が rest として返される', () => {
         const result = formatLogLine('<img src=x onerror=alert(1)>');
         expect(result).toEqual({

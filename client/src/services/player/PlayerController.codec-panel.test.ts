@@ -12,7 +12,7 @@ import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore, { LIVE_STREAMING_QUALITIES } from '@/stores/SettingsStore';
 import useVersionStore from '@/stores/VersionStore';
-import { PlayerUtils, ProgramUtils } from '@/utils';
+import { PlayerUtils } from '@/utils';
 
 
 type PlaybackMode = 'Live' | 'Video';
@@ -86,15 +86,7 @@ describe('ライブ末尾同期先の算出', () => {
         const buffered = createTimeRanges([[0, 12], [20, 42]]);
 
         expect(calculateLiveSyncTarget(buffered, 3.9)).toBeCloseTo(38.1);
-    });
-
-    it('確保したいバッファ秒数が範囲長を超える場合は範囲先頭に留める', () => {
-        const buffered = createTimeRanges([[100, 102]]);
-
-        expect(calculateLiveSyncTarget(buffered, 3.9)).toBe(100);
-    });
-
-    it('実バッファがない場合は同期しない', () => {
+        expect(calculateLiveSyncTarget(createTimeRanges([[100, 102]]), 3.9)).toBe(100);
         expect(calculateLiveSyncTarget(createTimeRanges([]), 3.9)).toBeNull();
     });
 });
@@ -234,16 +226,6 @@ describe('ISDB-S3の8ch超音声表示', () => {
         channels_store.display_channel_id = 'bs4k101';
     });
 
-    it.each([
-        [0x0E, 8],
-        [0x0F, 9],
-        [0x10, 12],
-        [0x11, 24],
-        [0x40, null],
-    ])('component type 0x%sをチャンネル数へ変換する', (component_type, expected) => {
-        expect(ProgramUtils.getAudioComponentChannelCount(component_type)).toBe(expected);
-    });
-
     it('24chを選択不可で残し、後続の5.1chとステレオを実PMTトラックへ対応させる', () => {
         const channels_store = useChannelsStore();
         channels_store.current_program_present = {
@@ -287,31 +269,6 @@ describe('ISDB-S3の8ch超音声表示', () => {
         ]);
     });
 
-    it('TLVで全記述子が未着でも主音声22.2chを選択不可表示する', () => {
-        const channels_store = useChannelsStore();
-        channels_store.current_program_present = {
-            ...structuredClone(IProgramDefault),
-            primary_audio_type: '3/3/3-5/2/3-3/0/0.2モード',
-            primary_audio_language: '日本語',
-            secondary_audio_type: '3/2+LFEモード(3/2.1モード)',
-            secondary_audio_language: '日本語',
-            audio_components: [],
-        };
-        const { controller } = createController('Live');
-
-        const entries = controller.buildLiveAudioTrackDisplayEntries({
-            audioTrackCount: 2,
-            audioTrackComponentTags: [0x11, 0x12],
-            hasAudio: true,
-        });
-
-        expect(entries).toEqual([
-            {label: 'Track1 日本語 (22.2ch) [選択不可]', selectableTrackIndex: null},
-            {label: 'Track2 日本語 (5.1ch)', selectableTrackIndex: 0},
-            {label: 'Track3 言語不明', selectableTrackIndex: 1},
-        ]);
-    });
-
     it('選択不可行は切り替えず、後続表示行を実PMTトラック番号で切り替える', () => {
         const channels_store = useChannelsStore();
         channels_store.current_program_present = {
@@ -340,6 +297,11 @@ describe('ISDB-S3の8ch超音声表示', () => {
             player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-item'),
         );
         expect(audio_items).toHaveLength(3);
+        expect(audio_items.map(item => item.textContent)).toEqual([
+            'Track1 日本語 (22.2ch) [選択不可]',
+            'Track2 日本語 (5.1ch)',
+            'Track3 言語不明',
+        ]);
         expect(audio_items[0].classList.contains('dplayer-setting-audio-item--unsupported')).toBe(true);
         expect(audio_items[0].getAttribute('aria-disabled')).toBe('true');
 

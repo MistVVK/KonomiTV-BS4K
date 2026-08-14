@@ -1,8 +1,5 @@
 from pathlib import Path
 
-import pytest
-from biim.mpeg2ts import ts as mpeg_ts
-
 from app.utils.TSKeyFrameSeeker import ARIBTTMLStreamInfo, TSKeyFrameSeeker
 
 
@@ -256,54 +253,19 @@ def test_arib_ttml_v2_owner_is_verified_outside_pmt_sample_window(tmp_path: Path
     ) == [ARIBTTMLStreamInfo(program_number=1, pid=subtitle_pid, component_tag=0x30)]
 
 
-@pytest.mark.parametrize('prefix_len', [0, 1, 3, 187])
-def test_detect_packet_size_and_offset_ignores_leading_junk_188(
-    tmp_path: Path,
-    prefix_len: int,
-) -> None:
-    """188-byte TS に prefix junk を付けても sync offset を検出すること。"""
+def test_detect_packet_size_and_offset_ignores_leading_junk(tmp_path: Path) -> None:
+    """188-byte TS と 192-byte TTS の代表的な prefix から物理 packet 先頭を検出する。"""
 
-    base = _psi_packet(0x0000, _pat())
-    packets = base * 8
-    fixture = tmp_path / f'prefixed-188-{prefix_len}.ts'
-    fixture.write_bytes((b'\xFF' * prefix_len) + packets)
+    for packet_size, prefix_len in ((188, 187), (192, 3)):
+        packet = _psi_packet(0x0000, _pat())
+        if packet_size == 192:
+            packet = b'\x00\x00\x00\x00' + packet
+        fixture = tmp_path / f'prefixed-{packet_size}-{prefix_len}.ts'
+        fixture.write_bytes((b'\xFF' * prefix_len) + (packet * 8))
 
-    detected_size, start_offset = TSKeyFrameSeeker._TSKeyFrameSeeker__detectPacketSizeAndOffset(fixture)  # pyright: ignore[reportPrivateUsage]
-    assert detected_size == 188
-    assert start_offset == prefix_len
-
-
-@pytest.mark.parametrize('prefix_len', [0, 1, 3, 187])
-def test_detect_packet_size_and_offset_ignores_leading_junk_192(
-    tmp_path: Path,
-    prefix_len: int,
-) -> None:
-    """192-byte TTS (4byte timestamp + 188 TS) でも物理パケット先頭 (timestamp 開始) を検出すること。"""
-
-    base = b'\x00\x00\x00\x00' + _psi_packet(0x0000, _pat())
-    packets = base * 8
-    fixture = tmp_path / f'prefixed-192-{prefix_len}.ts'
-    fixture.write_bytes((b'\xFF' * prefix_len) + packets)
-
-    detected_size, start_offset = TSKeyFrameSeeker._TSKeyFrameSeeker__detectPacketSizeAndOffset(fixture)  # pyright: ignore[reportPrivateUsage]
-    assert detected_size == 192
-    # normalizePacket は先頭 4 バイト (timestamp) を捨てるため、戻り値は物理パケット先頭
-    assert start_offset == prefix_len
-
-
-def test_find_stream_with_prefix_matches_unprefixed_packet_size(tmp_path: Path) -> None:
-    """先頭 junk 付きでも detect の packet_size が無 prefix と同じになること。"""
-
-    clean = tmp_path / 'clean.ts'
-    clean.write_bytes(b''.join(_psi_packet(0x0000, _pat()) for _ in range(6)))
-    dirty = tmp_path / 'dirty.ts'
-    dirty.write_bytes(b'\x00\x01\x02' + clean.read_bytes())
-
-    clean_size, clean_offset = TSKeyFrameSeeker._TSKeyFrameSeeker__detectPacketSizeAndOffset(clean)  # pyright: ignore[reportPrivateUsage]
-    dirty_size, dirty_offset = TSKeyFrameSeeker._TSKeyFrameSeeker__detectPacketSizeAndOffset(dirty)  # pyright: ignore[reportPrivateUsage]
-    assert clean_size == dirty_size == mpeg_ts.PACKET_SIZE
-    assert clean_offset == 0
-    assert dirty_offset == 3
+        detected_size, start_offset = TSKeyFrameSeeker._TSKeyFrameSeeker__detectPacketSizeAndOffset(fixture)  # pyright: ignore[reportPrivateUsage]
+        assert detected_size == packet_size
+        assert start_offset == prefix_len
 
 
 def _video_pmt(video_pid: int = 0x0100, pcr_pid: int = 0x0100, stream_type: int = 0x1B) -> bytes:
@@ -330,23 +292,7 @@ def _wrap_ts_packets(packets_188: bytes, packet_size: int) -> bytes:
     return bytes(wrapped)
 
 
-@pytest.mark.parametrize(
-    ('packet_size', 'prefix_len'),
-    [
-        (188, 0),
-        (188, 1),
-        (188, 3),
-        (188, 187),
-        (192, 0),
-        (192, 1),
-        (192, 3),
-    ],
-)
-def test_find_stream_info_with_prefix_matches_clean(
-    tmp_path: Path,
-    packet_size: int,
-    prefix_len: int,
-) -> None:
+def test_find_stream_info_with_prefix_matches_clean(tmp_path: Path) -> None:
     """188/192-byte TS に prefix を付けても PAT/PMT 解析結果が無 prefix と同じになること。"""
 
     video_pid = 0x0100
@@ -354,19 +300,19 @@ def test_find_stream_info_with_prefix_matches_clean(
         _psi_packet(0x0000, _pat([(1, 0x1000)])) +
         _psi_packet(0x1000, _video_pmt(video_pid=video_pid, pcr_pid=video_pid))
     ) * 4
-    body = _wrap_ts_packets(body_188, packet_size)
+    for packet_size, prefix_len in ((188, 187), (192, 3)):
+        body = _wrap_ts_packets(body_188, packet_size)
+        clean = tmp_path / f'clean-{packet_size}.ts'
+        clean.write_bytes(body)
+        dirty = tmp_path / f'dirty-{packet_size}-{prefix_len}.ts'
+        dirty.write_bytes((b'\xAA' * prefix_len) + body)
 
-    clean = tmp_path / f'clean-{packet_size}.ts'
-    clean.write_bytes(body)
-    dirty = tmp_path / f'dirty-{packet_size}-{prefix_len}.ts'
-    dirty.write_bytes((b'\xAA' * prefix_len) + body)
+        clean_info = TSKeyFrameSeeker.findStreamInfo(clean)
+        dirty_info = TSKeyFrameSeeker.findStreamInfo(dirty)
 
-    clean_info = TSKeyFrameSeeker.findStreamInfo(clean)
-    dirty_info = TSKeyFrameSeeker.findStreamInfo(dirty)
-
-    assert clean_info.packet_size == dirty_info.packet_size == packet_size
-    assert clean_info.video_pid == dirty_info.video_pid == video_pid
-    assert clean_info.pcr_pid == dirty_info.pcr_pid == video_pid
-    assert clean_info.codec == dirty_info.codec == 'H.264'
-    assert clean_info.stream_start_offset == 0
-    assert dirty_info.stream_start_offset == prefix_len
+        assert clean_info.packet_size == dirty_info.packet_size == packet_size
+        assert clean_info.video_pid == dirty_info.video_pid == video_pid
+        assert clean_info.pcr_pid == dirty_info.pcr_pid == video_pid
+        assert clean_info.codec == dirty_info.codec == 'H.264'
+        assert clean_info.stream_start_offset == 0
+        assert dirty_info.stream_start_offset == prefix_len

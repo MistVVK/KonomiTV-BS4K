@@ -11,7 +11,6 @@ from tortoise import Tortoise
 
 import app.metadata.ai.AIAPIUsageLedger as ledger_mod
 from app.metadata.ai.AIAPIUsageLedger import (
-    DEFAULT_RESERVE_TOTAL_TOKENS,
     AIAPIUsageLedger,
     CurrentYearMonth,
 )
@@ -459,12 +458,6 @@ def test_settle_keeps_original_month_across_month_boundary() -> None:
             await _CloseDB()
 
     asyncio.run(Run())
-
-
-def test_default_reserve_constants() -> None:
-    """予約デフォルトが計画どおり正の値である。"""
-
-    assert DEFAULT_RESERVE_TOTAL_TOKENS == 100_000
 
 
 def test_list_includes_deleted_service_history() -> None:

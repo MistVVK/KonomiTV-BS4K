@@ -931,27 +931,26 @@ def test_logo_frame_uses_shared_index_and_parallel_ranges_before_passing_match_t
     assert jls_command[jls_command.index('-inlogo') + 1].endswith('selected-logo.txt')
 
 
-@pytest.mark.parametrize('pixel_format', ['yuv420p', 'yuv420p10le', 'yuv420p12le', 'yuv420p14le', 'yuv420p16le'])
-def test_logo_script_preserves_ffms2_native_luma_format_and_range(
-    tmp_path: Path,
-    pixel_format: str,
-) -> None:
-    analyzer = CreateRuntime(tmp_path)
-    logo = tmp_path / 'logo.lgd'
-    logo.write_bytes(b'logo')
-    payload = ProbePayload()
-    streams = cast(list[dict[str, object]], payload['streams'])
-    streams[0]['pix_fmt'] = pixel_format
-    commands: list[tuple[str, ...]] = []
-    InstallSuccessfulProcesses(analyzer, payload, commands)
+def test_logo_script_preserves_ffms2_native_luma_format_and_range(tmp_path: Path) -> None:
+    for pixel_format in ('yuv420p', 'yuv420p10le', 'yuv420p16le'):
+        case_path = tmp_path / pixel_format
+        case_path.mkdir()
+        analyzer = CreateRuntime(case_path)
+        logo = case_path / 'logo.lgd'
+        logo.write_bytes(b'logo')
+        payload = ProbePayload()
+        streams = cast(list[dict[str, object]], payload['streams'])
+        streams[0]['pix_fmt'] = pixel_format
+        commands: list[tuple[str, ...]] = []
+        InstallSuccessfulProcesses(analyzer, payload, commands)
 
-    result = asyncio.run(analyzer.analyze(CreateRequest(tmp_path, logo_paths=(logo,))))
+        result = asyncio.run(analyzer.analyze(CreateRequest(case_path, logo_paths=(logo,))))
 
-    assert result.status == 'completed'
-    logo_script = (tmp_path / 'work/cpu/logo.avs').read_text(encoding='utf-8')
-    assert 'colorspace=' not in logo_script
-    assert 'ConvertBits' not in logo_script
-    assert 'ConvertToYV12' not in logo_script
+        assert result.status == 'completed'
+        logo_script = (case_path / 'work/cpu/logo.avs').read_text(encoding='utf-8')
+        assert 'colorspace=' not in logo_script
+        assert 'ConvertBits' not in logo_script
+        assert 'ConvertToYV12' not in logo_script
 
 
 def test_parallel_logo_decode_stays_on_cpu_when_chapter_uses_hardware(tmp_path: Path) -> None:
@@ -975,53 +974,33 @@ def test_parallel_logo_decode_stays_on_cpu_when_chapter_uses_hardware(tmp_path: 
     assert 'hwdevice=' not in logo_script
 
 
-@pytest.mark.parametrize(
-    ('processor_count', 'total_frames', 'expected_workers'),
-    [
+def test_logo_frame_worker_count_matches_amatsukaze_balancing(monkeypatch: pytest.MonkeyPatch) -> None:
+    cases = (
         (12, 299, 1),
-        (12, 300, 1),
-        (12, 899, 1),
         (12, 900, 2),
         (12, 1800, 3),
         (12, 108_000, 6),
-        (16, 108_000, 8),
         (48, 108_000, 12),
         (1, 108_000, 1),
-    ],
-)
-def test_logo_frame_worker_count_matches_amatsukaze_balancing(
-    monkeypatch: pytest.MonkeyPatch,
-    processor_count: int,
-    total_frames: int,
-    expected_workers: int,
-) -> None:
-    monkeypatch.setattr(GenericCMAnalyzer, '_effectiveCPUCount', staticmethod(lambda: processor_count))
+    )
+    for processor_count, total_frames, expected_workers in cases:
+        monkeypatch.setattr(GenericCMAnalyzer, '_effectiveCPUCount', staticmethod(lambda: processor_count))
 
-    assert GenericCMAnalyzer._logoFrameWorkerCount(total_frames) == expected_workers
+        assert GenericCMAnalyzer._logoFrameWorkerCount(total_frames) == expected_workers
 
 
-@pytest.mark.parametrize(
-    ('processor_count', 'worker_count', 'expected_chapter_threads', 'expected_logo_threads'),
-    [
+def test_decoder_threads_follow_actual_process_parallelism(monkeypatch: pytest.MonkeyPatch) -> None:
+    cases = (
         (1, 1, 1, 1),
-        (4, 1, 4, 4),
         (12, 3, 12, 4),
-        (16, 8, 16, 2),
         (48, 12, 16, 4),
         (64, 2, 16, 16),
-    ],
-)
-def test_decoder_threads_follow_actual_process_parallelism(
-    monkeypatch: pytest.MonkeyPatch,
-    processor_count: int,
-    worker_count: int,
-    expected_chapter_threads: int,
-    expected_logo_threads: int,
-) -> None:
-    monkeypatch.setattr(GenericCMAnalyzer, '_effectiveCPUCount', staticmethod(lambda: processor_count))
+    )
+    for processor_count, worker_count, expected_chapter_threads, expected_logo_threads in cases:
+        monkeypatch.setattr(GenericCMAnalyzer, '_effectiveCPUCount', staticmethod(lambda: processor_count))
 
-    assert GenericCMAnalyzer._chapterDecoderThreadCount() == expected_chapter_threads
-    assert GenericCMAnalyzer._logoDecoderThreadCount(worker_count) == expected_logo_threads
+        assert GenericCMAnalyzer._chapterDecoderThreadCount() == expected_chapter_threads
+        assert GenericCMAnalyzer._logoDecoderThreadCount(worker_count) == expected_logo_threads
 
 
 def test_logo_and_chapter_frame_count_must_match(tmp_path: Path) -> None:

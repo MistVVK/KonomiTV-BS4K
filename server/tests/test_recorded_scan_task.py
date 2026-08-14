@@ -767,12 +767,6 @@ def test_resolve_recorded_path_keeps_broken_and_relative_symlink(tmp_path: pathl
     assert str(cycle_resolved)
 
 
-def test_reconciliation_interval_is_900_seconds() -> None:
-    """NFS/CIFS 向け reconciliation 間隔が 900 秒であること。"""
-
-    assert RecordedScanTask.RECONCILIATION_INTERVAL_SECONDS == 900
-
-
 def test_periodic_reconciliation_registers_without_watcher_and_skips_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

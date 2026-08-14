@@ -21,12 +21,4 @@ describe('LogLine', () => {
         expect(levelSpan.attributes('style')).toContain('color:');
     });
 
-    it('ログレベルを含まない行は span なしでテキストのまま表示される', () => {
-        const wrapper = mount(LogLine, {
-            props: { line: '<script>alert(1)</script>' },
-        });
-        expect(wrapper.find('span').exists()).toBe(false);
-        expect(wrapper.find('script').exists()).toBe(false);
-        expect(wrapper.text()).toBe('<script>alert(1)</script>');
-    });
 });

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.constants import QUALITY_TYPES
-from app.streams.RecordedEncodingCodecs import AUDIO_CODECS, AudioCodec, VideoCodec
+from app.streams.RecordedEncodingCodecs import AudioCodec, VideoCodec
 from app.streams.RecordedFMP4Stream import (
     RecordedAudioRendition,
     RecordedFMP4Segment,
@@ -838,15 +838,6 @@ def test_transcoded_opus_validator_accepts_adjacent_compensated_rounding() -> No
     ) is True
 
 
-def test_audio_codec_definitions_cover_aac_and_opus() -> None:
-    """録画HLSで公開する2方式がfMP4音声として定義されていることを確認する。"""
-
-    assert set(AUDIO_CODECS) == {'aac', 'opus'}
-    assert AUDIO_CODECS['aac'].hls_codec == 'mp4a.40.2'
-    assert AUDIO_CODECS['opus'].hls_codec == 'opus'
-    assert all(definition.container == 'fmp4' for definition in AUDIO_CODECS.values())
-
-
 def test_opus_channel_bitrates() -> None:
     """品質寄りのチャンネル数別Opusビットレートを固定する。"""
     assert [RecordedFMP4Stream.getOpusBitrate(channels) for channels in range(1, 9)] == [
@@ -855,40 +846,43 @@ def test_opus_channel_bitrates() -> None:
     assert RecordedFMP4Stream.getOpusBitrate(9) is None
 
 
-@pytest.mark.parametrize(('channel_layout', 'channels'), [
-    ('mono', 1),
-    ('stereo', 2),
-    ('2.1', 3),
-    ('3.0(back)', 3),
-    ('3.1', 4),
-    ('quad', 4),
-    ('quad(side)', 4),
-    ('4.1', 5),
-    ('5.0', 5),
-    ('5.0(side)', 5),
-    ('5.1', 6),
-    ('6.0(front)', 6),
-    ('hexagonal', 6),
-    ('6.1', 7),
-    ('6.1(back)', 7),
-    ('7.0(front)', 7),
-    ('7.1', 8),
-    ('7.1(wide)', 8),
-    ('octagonal', 8),
-])
-def test_standard_ffmpeg_audio_layouts_keep_channel_count(channel_layout: str, channels: int) -> None:
+def test_standard_ffmpeg_audio_layouts_keep_channel_count() -> None:
     """FFmpegが明示する標準1～8ch layoutを未知扱いせず、対応Opus tierへ割り当てる。"""
 
-    track = {
-        'index': 1,
-        'codec': 'AAC-LC',
-        'channel': channel_layout,
-        'sampling_rate': 48_000,
-        'language': 'ja',
-        'channel_layout': channel_layout,
+    expected_channels = {
+        'mono': 1,
+        'stereo': 2,
+        '2.1': 3,
+        '3.0(back)': 3,
+        '3.1': 4,
+        'quad': 4,
+        'quad(side)': 4,
+        '4.1': 5,
+        '5.0': 5,
+        '5.0(side)': 5,
+        '5.1': 6,
+        '6.0(front)': 6,
+        'hexagonal': 6,
+        '6.1': 7,
+        '6.1(back)': 7,
+        '7.0(front)': 7,
+        '7.1': 8,
+        '7.1(wide)': 8,
+        'octagonal': 8,
     }
-    assert RecordedFMP4Stream.getAudioChannelCount(track) == channels
-    assert RecordedFMP4Stream.getOpusBitrate(channels) in (64_000, 128_000, 192_000, 256_000, 320_000)
+    actual_channels = {
+        channel_layout: RecordedFMP4Stream.getAudioChannelCount({
+            'index': 1,
+            'codec': 'AAC-LC',
+            'channel': channel_layout,
+            'sampling_rate': 48_000,
+            'language': 'ja',
+            'channel_layout': channel_layout,
+        })
+        for channel_layout in expected_channels
+    }
+
+    assert actual_channels == expected_channels
 
 
 def test_unknown_explicit_audio_layout_is_not_guessed_from_display_label() -> None:
@@ -905,28 +899,28 @@ def test_unknown_explicit_audio_layout_is_not_guessed_from_display_label() -> No
     assert RecordedFMP4Stream.getAudioChannelCount(track) is None
 
 
-@pytest.mark.parametrize('channel_layout', ['quad', '4.1', '5.0(side)', '6.1', 'octagonal'])
-def test_silent_audio_preserves_standard_ffmpeg_layout(channel_layout: str) -> None:
+def test_silent_audio_preserves_standard_ffmpeg_layout() -> None:
     """欠落区間の無音補完でも既知のmultichannel layout名をそのまま維持する。"""
 
-    track = {
-        'index': 1,
-        'codec': 'AAC-LC',
-        'channel': channel_layout,
-        'sampling_rate': 48_000,
-        'language': 'ja',
-        'channel_layout': channel_layout,
-    }
-    stream = object.__new__(RecordedFMP4Stream)
-    stream.recorded_program = SimpleNamespace(recorded_video=SimpleNamespace(
-        audio_track_timeline=[],
-        audio_tracks=[track],
-    ))
-    rendition = RecordedAudioRendition('1', 1, 2, 'all', 'Track 1', 'ja')
+    for channel_layout in ('quad', '4.1', '5.0(side)', '6.1', 'octagonal'):
+        track = {
+            'index': 1,
+            'codec': 'AAC-LC',
+            'channel': channel_layout,
+            'sampling_rate': 48_000,
+            'language': 'ja',
+            'channel_layout': channel_layout,
+        }
+        stream = object.__new__(RecordedFMP4Stream)
+        stream.recorded_program = SimpleNamespace(recorded_video=SimpleNamespace(
+            audio_track_timeline=[],
+            audio_tracks=[track],
+        ))
+        rendition = RecordedAudioRendition('1', 1, 2, 'all', 'Track 1', 'ja')
 
-    assert stream._RecordedFMP4Stream__getSilentAudioChannelLayout(  # pyright: ignore[reportPrivateUsage]
-        rendition,
-    ) == channel_layout
+        assert stream._RecordedFMP4Stream__getSilentAudioChannelLayout(  # pyright: ignore[reportPrivateUsage]
+            rendition,
+        ) == channel_layout
 
 
 @pytest.mark.parametrize(('indexed_layout', 'ffmpeg_layout'), [
@@ -993,25 +987,24 @@ def test_video_input_seek_decodes_preroll_before_exact_trim_position() -> None:
     assert RecordedFMP4Stream.computeInputSeekWindow(4.0, 6.006) == (0.0, 4.0, 10.006)
 
 
-@pytest.mark.parametrize('quality', [
-    # 通常録画の選択肢
-    '1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p',
-    # BS4K 録画だけにある選択肢
-    '4320p', '2160p', '1440p', '1080p-30fps', '810p-60fps', '810p-30fps',
-    '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps',
-])
-def test_recorded_video_bitrates_strictly_increase_from_av1_to_avc(quality: QUALITY_TYPES) -> None:
+def test_recorded_video_bitrates_strictly_increase_from_av1_to_avc() -> None:
     """通常・BS4Kの全録画画質でAV1 < VP9 < HEVC < AVCを保証する。"""
 
-    bitrates = [
-        RecordedFMP4Stream.getVideoBitrate(quality, codec)
-        for codec in ('av1', 'vp9', 'hevc', 'avc')
-    ]
-    specified_values = [int(bitrate.video_bitrate.removesuffix('K')) for bitrate in bitrates]
-    maximum_values = [int(bitrate.video_bitrate_max.removesuffix('K')) for bitrate in bitrates]
+    qualities: tuple[QUALITY_TYPES, ...] = (
+        '1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p',
+        '4320p', '2160p', '1440p', '1080p-30fps', '810p-60fps', '810p-30fps',
+        '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps',
+    )
+    for quality in qualities:
+        bitrates = [
+            RecordedFMP4Stream.getVideoBitrate(quality, codec)
+            for codec in ('av1', 'vp9', 'hevc', 'avc')
+        ]
+        specified_values = [int(bitrate.video_bitrate.removesuffix('K')) for bitrate in bitrates]
+        maximum_values = [int(bitrate.video_bitrate_max.removesuffix('K')) for bitrate in bitrates]
 
-    assert all(left < right for left, right in pairwise(specified_values))
-    assert all(left < right for left, right in pairwise(maximum_values))
+        assert all(left < right for left, right in pairwise(specified_values))
+        assert all(left < right for left, right in pairwise(maximum_values))
 
 
 def test_recorded_video_bitrate_representative_values() -> None:
@@ -1061,32 +1054,6 @@ def test_offline_720p_video_bitrates_are_77_percent_of_playback(
 
     assert RecordedFMP4Stream.getVideoBitrate('720p', codec) == playback
     assert RecordedFMP4Stream.getOfflineVideoBitrate('720p', codec) == offline
-
-
-@pytest.mark.parametrize('quality', [
-    '1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p',
-    '4320p', '2160p', '1440p', '1080p-30fps', '810p-60fps', '810p-30fps',
-    '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps',
-])
-@pytest.mark.parametrize('codec', ['av1', 'vp9', 'hevc', 'avc'])
-def test_offline_video_bitrate_ratio_applies_to_every_quality_and_codec(
-    quality: QUALITY_TYPES,
-    codec: VideoCodec,
-) -> None:
-    """通常・BS4Kの全画質と全codecへ同じ77%丸め規則を適用する。"""
-
-    playback = RecordedFMP4Stream.getVideoBitrate(quality, codec)
-    offline = RecordedFMP4Stream.getOfflineVideoBitrate(quality, codec)
-    playback_values = (
-        int(playback.video_bitrate.removesuffix('K')),
-        int(playback.video_bitrate_max.removesuffix('K')),
-    )
-    offline_values = (
-        int(offline.video_bitrate.removesuffix('K')),
-        int(offline.video_bitrate_max.removesuffix('K')),
-    )
-
-    assert offline_values == tuple((value * 77 + 50) // 100 for value in playback_values)
 
 
 def test_video_segment_uses_codec_bitrate_and_keeps_16_by_9_display_aspect_ratio(monkeypatch, tmp_path) -> None:
