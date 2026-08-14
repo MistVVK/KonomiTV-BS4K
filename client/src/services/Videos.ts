@@ -256,7 +256,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     playback_index_status: 'Pending',
     playback_index_state: 'Pending',
     playback_index_version: null,
-    playback_index_current_version: 11,
+    playback_index_current_version: 13,
     playback_indexed_at: null,
     playback_index_error_code: null,
     recording_start_time: null,

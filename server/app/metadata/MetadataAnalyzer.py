@@ -14,8 +14,14 @@ from rich import print
 from app import logging, schemas
 from app.config import Config, LoadConfig
 from app.constants import JST, LIBRARY_PATH
+from app.metadata.KonomiTVBS4KMMTSInfoAnalyzer import KonomiTVBS4KMMTSInfoAnalyzer
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.utils.HLSText import sanitizeHLSQuotedString
+from app.utils.KonomiTVBS4KMMTTLV import (
+    MMT_TLV_CONTAINER_FORMAT,
+    MMT_TLV_FILE_EXTENSIONS,
+    BuildKonomiTVBS4KMMTTLVInputArguments,
+)
 from app.utils.TSInformation import TSInformation
 from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker
 
@@ -304,6 +310,7 @@ class MetadataAnalyzer:
             LoadConfig(bypass_validation=True)
 
         # 必要な情報を一旦変数として保持
+        is_mmt_tlv = self.recorded_file_path.suffix.lower() in MMT_TLV_FILE_EXTENSIONS
         duration: float | None = None
         container_format: str | None = None
         video_codec: str | None = None
@@ -350,7 +357,9 @@ class MetadataAnalyzer:
         # 全般（コンテナ情報）
         ## コンテナ形式
         format_names = set(full_probe.format.format_name.lower().split(','))
-        if 'mpegts' in format_names:
+        if is_mmt_tlv is True:
+            container_format = MMT_TLV_CONTAINER_FORMAT
+        elif 'mpegts' in format_names:
             container_format = 'MPEG-TS'
         elif 'mp4' in format_names or 'mov' in format_names:
             container_format = 'MPEG-4'
@@ -509,10 +518,12 @@ class MetadataAnalyzer:
             audio_codec = GetAudioCodec(audio_stream.codec_name, audio_stream.profile)
             audio_channel = GetAudioChannelLabel(audio_stream.channels)
             audio_sampling_rate = int(audio_stream.sample_rate)
-            try:
-                audio_pid = int(str(audio_stream.id), 0) if audio_stream.id is not None else None
-            except ValueError:
-                audio_pid = None
+            audio_pid: int | None = None
+            if container_format == 'MPEG-TS':
+                try:
+                    audio_pid = int(str(audio_stream.id), 0) if audio_stream.id is not None else None
+                except ValueError:
+                    audio_pid = None
             audio_track: schemas.AudioTrackTimelineTrack = {
                 'index': len(audio_tracks) + 1,
                 'stream_index': audio_stream.index,
@@ -546,6 +557,11 @@ class MetadataAnalyzer:
         for subtitle_stream in full_probe.getSubtitleStreams():
             if selected_program_stream_indices is not None and subtitle_stream.index not in selected_program_stream_indices:
                 continue
+            # MMT/TLV の通常 TTML stream は libaribtlv が復号した文書だけで、画像 resource を含む
+            # 元 MFU を可逆に復元できない。直後で登録する timed ID3 data stream を唯一の
+            # ARIB-TTML track とし、同じ字幕を WebVTT と ARIB-TTML の二重トラックにしない。
+            if container_format == MMT_TLV_CONTAINER_FORMAT and subtitle_stream.codec_name.lower() == 'ttml':
+                continue
             subtitle_track: schemas.SubtitleTrack = {
                 'index': len(subtitle_tracks) + 1,
                 'stream_index': subtitle_stream.index,
@@ -553,13 +569,44 @@ class MetadataAnalyzer:
                 'language': sanitizeHLSQuotedString(subtitle_stream.tags.get('language')) or None,
                 'title': sanitizeHLSQuotedString(subtitle_stream.tags.get('title')) or None,
             }
-            try:
-                subtitle_pid = int(str(subtitle_stream.id), 0) if subtitle_stream.id is not None else None
-            except ValueError:
-                subtitle_pid = None
+            subtitle_pid: int | None = None
+            if container_format == 'MPEG-TS':
+                try:
+                    subtitle_pid = int(str(subtitle_stream.id), 0) if subtitle_stream.id is not None else None
+                except ValueError:
+                    subtitle_pid = None
             if subtitle_pid is not None:
                 subtitle_track['pid'] = subtitle_pid
             subtitle_tracks.append(subtitle_track)
+
+        # libaribtlv は通常 TTML stream と並行して、KonomiTV 用 raw MFU を timed ID3 data stream へ保持する。
+        # component_tag が字幕・文字スーパーの範囲にある stream だけを論理 ARIB-TTML track として登録する。
+        if container_format == MMT_TLV_CONTAINER_FORMAT:
+            known_component_tags = {
+                track.get('component_tag') for track in subtitle_tracks if track['codec'].lower() == 'arib_ttml'
+            }
+            for data_stream in full_probe.streams:
+                if (
+                    not isinstance(data_stream, FFprobeOtherStream) or
+                    data_stream.codec_type != 'data' or
+                    data_stream.codec_name not in ('timed_id3', 'timed id3')
+                ):
+                    continue
+                try:
+                    component_tag = int(data_stream.tags.get('component_tag', ''), 0)
+                except ValueError:
+                    continue
+                if not 0x30 <= component_tag <= 0x3F or component_tag in known_component_tags:
+                    continue
+                subtitle_tracks.append({
+                    'index': len(subtitle_tracks) + 1,
+                    'stream_index': data_stream.index,
+                    'codec': 'arib_ttml',
+                    'language': sanitizeHLSQuotedString(data_stream.tags.get('language'), default='jpn'),
+                    'title': sanitizeHLSQuotedString(data_stream.tags.get('title')) or None,
+                    'component_tag': component_tag,
+                })
+                known_component_tags.add(component_tag)
 
         # FFmpeg 8でも放送TSのARIB字幕がbin_dataとしてprobeされる場合がある。
         # PMT descriptorで字幕と確認できたPIDだけを採用し、データ放送は登録しない。
@@ -760,6 +807,11 @@ class MetadataAnalyzer:
                 if (now - recorded_video.file_modified_at).total_seconds() < 30:
                     logging.warning(f'{self.recorded_file_path}: MPEG-TS SDT/EIT analysis failed. (still recording?)')
                     return None
+        elif container_format == MMT_TLV_CONTAINER_FORMAT:
+            analyzer = KonomiTVBS4KMMTSInfoAnalyzer(recorded_video)
+            recorded_program = analyzer.analyze()
+            if recorded_program is not None:
+                logging.debug(f'{self.recorded_file_path}: MMT-SI Service/Event analysis completed.')
         else:
             # 何らかのメタ情報から番組情報・チャンネル情報を解析する
             analyzer = TSInfoAnalyzer(recorded_video)
@@ -1136,6 +1188,11 @@ class MetadataAnalyzer:
             '-show_streams',
             '-show_programs',
             '-of', 'json',
+            *BuildKonomiTVBS4KMMTTLVInputArguments(
+                MMT_TLV_CONTAINER_FORMAT
+                if self.recorded_file_path.suffix.lower() in MMT_TLV_FILE_EXTENSIONS
+                else '',
+            ),
             str(self.recorded_file_path),
         ]
         full_json = self.__runFFprobe(args_full)

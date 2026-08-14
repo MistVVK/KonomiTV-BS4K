@@ -40,6 +40,7 @@ from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.StreamEncodingOptions import StreamEncodingOptions
 from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
 from app.utils.HLSText import sanitizeHLSQuotedString
+from app.utils.KonomiTVBS4KMMTTLV import BuildKonomiTVBS4KMMTTLVInputArguments
 
 
 @dataclass(frozen=True, slots=True)
@@ -1904,6 +1905,9 @@ class RecordedFMP4Stream:
                 '-hwaccel', 'vaapi', '-hwaccel_device', 'recorded_vaapi', '-hwaccel_output_format', 'vaapi',
             ]
         command += [
+            *BuildKonomiTVBS4KMMTTLVInputArguments(
+                self.recorded_program.recorded_video.container_format,
+            ),
             # TSを要求位置から直接復号すると、直前キーフレームの参照画像を失い、次の
             # 復号可能なキーフレームまで数秒飛ぶ。手前から復号してfilterで要求位置へ切る。
             '-ss', f'{input_seek:.6f}',
@@ -2661,7 +2665,9 @@ class RecordedFMP4Stream:
                     (trim_start_samples + total_input_samples) / self.AUDIO_SAMPLE_RATE +
                     self.AUDIO_INPUT_TAIL_MARGIN_SECONDS
                 )
-                source_input_arguments: list[str] = []
+                source_input_arguments = BuildKonomiTVBS4KMMTTLVInputArguments(
+                    self.recorded_program.recorded_video.container_format,
+                )
                 if input_seek > 0:
                     source_input_arguments += ['-ss', f'{input_seek:.6f}']
                 if self.recorded_program.recorded_video.container_format == 'MPEG-TS':

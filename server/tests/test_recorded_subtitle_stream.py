@@ -265,6 +265,73 @@ def test_arib_ttml_packets_are_extracted_with_component_and_relative_pts(
     ]
 
 
+def test_mmt_tlv_arib_ttml_packets_are_indexed_by_ffprobe(monkeypatch) -> None:
+    """MMT/TLV の raw MFU timed ID3 を stream index 経由で取得し、v2 source PTS を保持する。"""
+
+    _packet, raw_id3 = _make_ttml_pes_packet(
+        0x0130,
+        0x30,
+        100 * 90_000,
+        envelope_version=2,
+    )
+    probe = {
+        'format': {'start_time': '90.0'},
+        'packets': [
+            {
+                'stream_index': 8,
+                'pts_time': '99.0',
+                'data': '00000000: ' + raw_id3.hex(),
+            },
+            {
+                'stream_index': 3,
+                'pts_time': '100.0',
+                'data': '00000000: ' + raw_id3.hex(),
+            },
+        ],
+    }
+    commands: list[tuple[object, ...]] = []
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            import json
+            return json.dumps(probe).encode(), b''
+
+    async def CreateSubprocess(*command: object, **_kwargs: object) -> FakeProcess:
+        commands.append(command)
+        return FakeProcess()
+
+    monkeypatch.setattr(recorded_subtitle_stream_module.asyncio, 'create_subprocess_exec', CreateSubprocess)
+    stream = RecordedSubtitleStream(SimpleNamespace(
+        id=1,
+        file_path='/recording.tlv',
+        container_format='MMT/TLV',
+        subtitle_tracks=[{
+            'index': 1,
+            'stream_index': 3,
+            'codec': 'arib_ttml',
+            'language': 'jpn',
+            'title': None,
+            'component_tag': 0x30,
+        }],
+    ))
+
+    packets = asyncio.run(
+        stream._RecordedSubtitleStream__extractARIBTTMLPacketsFromMMTTLV()  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert '-f' in commands[0]
+    assert commands[0][commands[0].index('-f') + 1] == 'libaribtlv'
+    assert packets == [{
+        'pts': 10.0,
+        'transport_timestamp': 100.0,
+        'component_tag': 0x30,
+        'data': base64.b64encode(raw_id3).decode(),
+        'is_restore_point': False,
+    }]
+
+
 def test_arib_ttml_track_is_not_routed_to_legacy_b24_range() -> None:
     """ARIB-TTML論理trackを既存B24 packet APIへ誤って渡さない。"""
 
@@ -378,7 +445,7 @@ def test_orphan_cleanup_preserves_reachable_active_and_third_party_caches(
     file_hash = 'a' * 32
     deleted_hash = 'b' * 32
     reachable = tmp_path / f'v3-{file_hash}-1-7.vtt'
-    reachable_ttml = tmp_path / f'ttml-v2-{file_hash}-7-101.json'
+    reachable_ttml = tmp_path / f'ttml-v3-{file_hash}-7-101.json'
     old_cache_version = tmp_path / f'v2-{file_hash}-1-7.vtt'
     old_index_version = tmp_path / f'v3-{file_hash}-1-6.vtt'
     deleted_cache = tmp_path / f'v3-{deleted_hash}-1-7.vtt'
@@ -424,7 +491,7 @@ def test_orphan_cleanup_preserves_reachable_active_and_third_party_caches(
 
     async def Run() -> None:
         # 削除対象TTMLがメモリLRUにも残っている状態を作り、disk削除と同時に除外されることを確認する。
-        orphan_ttml = tmp_path / f'ttml-v2-{deleted_hash}-7-all.json'
+        orphan_ttml = tmp_path / f'ttml-v3-{deleted_hash}-7-all.json'
         orphan_ttml.write_text('[]')
         RecordedSubtitleStream._RecordedSubtitleStream__rememberARIBTTMLPacketIndex(  # pyright: ignore[reportPrivateUsage]
             orphan_ttml,

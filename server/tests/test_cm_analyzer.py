@@ -97,6 +97,23 @@ def CreateRequest(
     )
 
 
+def test_mmt_tlv_is_stably_unsupported_before_cm_probe(tmp_path: Path, monkeypatch) -> None:
+    """MMT/TLV は CM 用 FFmpeg を起動せず、再試行不要の固定 error code を返す。"""
+
+    analyzer = CreateRuntime(tmp_path)
+    request = replace(CreateRequest(tmp_path), recorded_file_path=tmp_path / 'recording.tlv')
+    request.recorded_file_path.write_bytes(b'tlv')
+
+    async def RunProcess(*_args, **_kwargs):
+        pytest.fail('CM probe must not run for MMT/TLV input')
+
+    monkeypatch.setattr(analyzer, '_runProcess', RunProcess)
+    with pytest.raises(CMInputUnsupportedError) as ex:
+        asyncio.run(analyzer.resolveInputDescriptor(request))
+
+    assert ex.value.code == 'ContainerUnsupportedMMTTLV'
+
+
 def ProbePayload(*, format_name: str = 'matroska,webm', codec: str = 'av1') -> dict[str, object]:
     return {
         'format': {'format_name': format_name, 'duration': '60.06'},

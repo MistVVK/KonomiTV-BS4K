@@ -21,6 +21,7 @@ import av
 from typing_extensions import TypedDict
 
 from app import logging
+from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_FILE_EXTENSIONS
 
 
 CMAnalyzerStatus = Literal[
@@ -546,6 +547,13 @@ class GenericCMAnalyzer:
 
     async def resolveInputDescriptor(self, request: CMAnalyzerRequest) -> CMInputDescriptor:
         """FFprobe の実データから対象 stream を決定する。"""
+
+        # 現行の LGPL CM runtime は libaribtlv をリンクしないため、同じ入力での再試行を行わない。
+        if request.recorded_file_path.suffix.lower() in MMT_TLV_FILE_EXTENSIONS:
+            raise CMInputUnsupportedError(
+                'ContainerUnsupportedMMTTLV',
+                'MMT/TLV recordings are not supported by the CM analysis pipeline.',
+            )
 
         process = await self._runProcess((
             str(self.ffprobe_path),

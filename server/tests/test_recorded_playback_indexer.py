@@ -56,6 +56,7 @@ def test_initial_probe_cancel_kills_and_drains_process(
     recorded_video = SimpleNamespace(
         id=1,
         file_path='/recording.ts',
+        container_format='MPEG-TS',
         playback_index_status='Pending',
         playback_index_version=None,
         duration=60.0,
@@ -529,6 +530,7 @@ def test_initial_probe_requests_program_membership(monkeypatch) -> None:
         playback_index_status='Pending',
         playback_index_version=None,
         file_path='/recording.ts',
+        container_format='MPEG-TS',
         duration=120.0,
         has_video=True,
     )
@@ -573,6 +575,86 @@ def test_initial_probe_requests_program_membership(monkeypatch) -> None:
     assert command is not None
     assert command[command.index('-show_streams') + 1] == '-show_programs'
     mark_failed.assert_awaited_once_with(16, 'ProbeFailed')
+
+
+def test_mmt_tlv_initial_probe_forces_libaribtlv(monkeypatch) -> None:
+    """MMT/TLV 索引の全 probe 入口で libaribtlv demuxer を明示する。"""
+
+    recorded_video = SimpleNamespace(
+        playback_index_status='Pending',
+        playback_index_version=None,
+        file_path='/recording.tlv',
+        container_format='MMT/TLV',
+        duration=120.0,
+        has_video=True,
+    )
+
+    class FakeQuery:
+        async def update(self, **_kwargs) -> None:
+            return None
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b'invalid json', b''
+
+    command: tuple[str, ...] | None = None
+
+    async def CreateFakeProcess(*args, **_kwargs):
+        nonlocal command
+        command = args
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        'app.metadata.RecordedPlaybackIndexer.RecordedVideo.get_or_none',
+        AsyncMock(return_value=recorded_video),
+    )
+    monkeypatch.setattr('app.metadata.RecordedPlaybackIndexer.RecordedVideo.filter', lambda **_kwargs: FakeQuery())
+    monkeypatch.setattr('app.metadata.RecordedPlaybackIndexer.Path.is_file', lambda _path: True)
+    monkeypatch.setattr('app.metadata.RecordedPlaybackIndexer.asyncio.create_subprocess_exec', CreateFakeProcess)
+    mark_failed = AsyncMock()
+    monkeypatch.setattr(
+        RecordedPlaybackIndexer,
+        '_RecordedPlaybackIndexer__markFailed',
+        mark_failed,
+    )
+
+    assert asyncio.run(
+        RecordedPlaybackIndexer._RecordedPlaybackIndexer__analyze(16, 0)  # pyright: ignore[reportPrivateUsage]
+    ) is False
+    assert command is not None
+    input_index = command.index('/recording.tlv')
+    assert command[input_index - 2:input_index] == ('-f', 'libaribtlv')
+
+
+def test_mmt_tlv_audio_tracks_use_stream_indexes_without_packet_id() -> None:
+    """MMT packet_id を MPEG-TS PID と誤認せず、FFprobe stream index だけを保持する。"""
+
+    normalize = RecordedPlaybackIndexer._RecordedPlaybackIndexer__normalizeAudioTracks  # pyright: ignore[reportPrivateUsage]
+    tracks = normalize(
+        [{
+            'index': 1,
+            'stream_index': 2,
+            'pid': 0x111,
+            'codec': 'AAC-LC',
+            'channel': 'Stereo',
+            'sampling_rate': 48_000,
+            'language': 'jpn',
+        }],
+        {'streams': [{
+            'index': 2,
+            'id': '0x8001',
+            'codec_type': 'audio',
+            'codec_name': 'aac',
+            'channels': 2,
+            'sample_rate': '48000',
+        }]},
+        use_stream_ids_as_pids=False,
+    )
+
+    assert tracks[0]['stream_index'] == 2
+    assert 'pid' not in tracks[0]
 
 
 def test_audio_timeline_keeps_pid_presence_and_applies_frame_configuration() -> None:

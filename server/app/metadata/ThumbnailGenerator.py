@@ -23,6 +23,7 @@ from app.config import Config, LoadConfig
 from app.constants import DATABASE_CONFIG, LIBRARY_PATH, STATIC_DIR, THUMBNAILS_DIR
 from app.models.RecordedVideo import RecordedVideo
 from app.utils import ShutdownProcessPoolExecutor
+from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_CONTAINER_FORMAT
 
 
 class ThumbnailGenerator:
@@ -47,6 +48,7 @@ class ThumbnailGenerator:
     WEBP_MAX_SIZE: ClassVar[int] = 16383  # WebP の最大サイズ制限 (px)
     FFMPEG_TIMEOUT: ClassVar[int] = 300  # FFmpeg サブプロセスのタイムアウト時間 (秒)
     TSREADEX_FRAME_EXTRACTION_TIMEOUT: ClassVar[int] = 600  # tsreadex 経由のフレーム抽出タイムアウト時間 (秒)
+    MMT_TLV_FRAME_EXTRACTION_TIMEOUT: ClassVar[int] = 60  # TLV の候補1枚を FFmpeg 8 で抽出する上限 (秒)
     FRAME_EXTRACTION_MAX_DEMUX_PACKETS: ClassVar[int] = 20000  # 1候補位置でフレーム探索する最大パケット数
     FRAME_EXTRACTION_MAX_CONSECUTIVE_FAILURES: ClassVar[int] = 10  # 連続失敗時に残り候補を黒画像で埋める閾値
 
@@ -552,7 +554,9 @@ class ThumbnailGenerator:
         # 1. フレーム抽出を実行し、候補区間内のフレームをスコアリングして最良フレームを特定する
         ## 映像 PID や映像ストリーム構成が途中で変わる TS は PyAV のストリーム固定シークと相性が悪いため、
         ## 該当録画だけ tsreadex で映像 PID を固定化した TS を順次デコードする
-        if self.has_video_stream_changes is True and self.container_format == 'MPEG-TS':
+        if self.container_format == MMT_TLV_CONTAINER_FORMAT:
+            result = self.__extractAndScoreFramesWithFFmpeg(candidate_offsets)
+        elif self.has_video_stream_changes is True and self.container_format == 'MPEG-TS':
             result = self.__extractAndScoreFramesWithTSReadEx(candidate_offsets)
         else:
             result = self.__extractAndScoreFrames(candidate_offsets)
@@ -928,6 +932,90 @@ class ThumbnailGenerator:
                     tsreadex_process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     logging.warning(f'{self.file_path}: tsreadex process did not stop within timeout.')
+
+
+    def __extractAndScoreFramesWithFFmpeg(
+        self,
+        candidate_offsets: list[float],
+    ) -> tuple[list[NDArray[np.uint8]], int | None] | None:
+        """
+        libaribtlv 対応 FFmpeg 8 で MMT/TLV の候補フレームを順番に抽出する。
+
+        Args:
+            candidate_offsets (list[float]): 抽出するフレームのタイムスタンプ (秒) のリスト。
+
+        Returns:
+            tuple[list[NDArray[np.uint8]], int | None] | None: BGR フレーム一覧と最良インデックス。
+        """
+
+        scoring_width, scoring_height = self.SCORING_SCALE
+        expected_size = scoring_width * scoring_height * 3
+        bgr_frames: list[NDArray[np.uint8]] = []
+        consecutive_failed_frames = 0
+        start_time_frame_extraction = time.time()
+
+        # PyAV は同梱 FFmpeg 8 の libaribtlv demuxer を持たないため、この形式だけ固定バイナリへ委譲する。
+        # 1 process で大量 seek すると demuxer 状態が候補間で残るので、候補ごとに独立して fail closed にする。
+        for index, offset_sec in enumerate(candidate_offsets):
+            command = [
+                LIBRARY_PATH['FFmpeg8'],
+                '-hide_banner', '-loglevel', 'error',
+                '-f', 'libaribtlv',
+                '-ss', f'{offset_sec:.6f}',
+                '-i', str(self.file_path),
+                '-map', '0:v:0',
+                '-an', '-sn', '-dn',
+                '-frames:v', '1',
+                '-vf', (
+                    f'scale={scoring_width}:{scoring_height}:force_original_aspect_ratio=decrease,'
+                    f'pad={scoring_width}:{scoring_height}:(ow-iw)/2:(oh-ih)/2'
+                ),
+                '-pix_fmt', 'bgr24',
+                '-f', 'rawvideo',
+                'pipe:1',
+            ]
+            try:
+                process = subprocess.run(
+                    command,
+                    capture_output=True,
+                    timeout=self.MMT_TLV_FRAME_EXTRACTION_TIMEOUT,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as ex:
+                logging.warning(
+                    f'{self.file_path}: MMT/TLV frame extraction failed at {offset_sec:.2f}s.',
+                    exc_info=ex,
+                )
+                process = None
+
+            if process is None or process.returncode != 0 or len(process.stdout) != expected_size:
+                bgr_frames.append(np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8))
+                consecutive_failed_frames += 1
+            else:
+                frame = np.frombuffer(process.stdout, dtype=np.uint8).reshape(
+                    (scoring_height, scoring_width, 3),
+                ).copy()
+                bgr_frames.append(cast(NDArray[np.uint8], frame))
+                consecutive_failed_frames = 0
+
+            # 連続失敗後は残りを黒画像で埋め、破損録画に対する process 再生成を打ち切る。
+            if consecutive_failed_frames >= self.FRAME_EXTRACTION_MAX_CONSECUTIVE_FAILURES:
+                remaining_frame_count = len(candidate_offsets) - len(bgr_frames)
+                bgr_frames.extend(
+                    np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8)
+                    for _ in range(remaining_frame_count)
+                )
+                break
+            if (index + 1) % 50 == 0:
+                logging.debug(
+                    f'{self.file_path}: Extracted {index + 1}/{len(candidate_offsets)} MMT/TLV frames.'
+                )
+
+        logging.info(
+            f'{self.file_path}: MMT/TLV FFmpeg frame extraction completed. '
+            f'[frames: {len(bgr_frames)}, elapsed: {time.time() - start_time_frame_extraction:.2f}s]'
+        )
+        return (bgr_frames, self.__scoreFrames(bgr_frames))
 
 
     def __scoreFrames(self, bgr_frames: list[NDArray[np.uint8]]) -> int | None:

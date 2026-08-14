@@ -28,7 +28,7 @@ class RecordedFMP4Variant:
 
     # 生成パイプラインの変更時にこの値を上げ、互換性のない旧キャッシュとの衝突を防ぐ。
     # キャッシュの配置形式は変わらないため、LAYOUT_VERSION とは独立した内部改訂値とする。
-    PIPELINE_REVISION: ClassVar[int] = 6
+    PIPELINE_REVISION: ClassVar[int] = 7
 
     quality: str
     codec: str

@@ -29,6 +29,11 @@ from app.schemas import (
     SubtitleTrack,
     VideoStreamTimelineEntry,
 )
+from app.utils.KonomiTVBS4KMMTTLV import (
+    MMT_TLV_CONTAINER_FORMAT,
+    MMT_TLV_FILE_EXTENSIONS,
+    BuildKonomiTVBS4KMMTTLVInputArguments,
+)
 from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker
 
 
@@ -577,6 +582,7 @@ class RecordedPlaybackIndexer:
             '-show_format',
             '-of',
             'json',
+            *BuildKonomiTVBS4KMMTTLVInputArguments(recorded_video.container_format),
             str(file_path),
             stdout = asyncio.subprocess.PIPE,
             stderr = asyncio.subprocess.PIPE,
@@ -616,7 +622,11 @@ class RecordedPlaybackIndexer:
             return False
         try:
             probe = cast(dict[str, Any], json.loads(stdout))
-            timeline = cls.__buildTimeline(probe, index_source.duration)
+            timeline = cls.__buildTimeline(
+                probe,
+                index_source.duration,
+                use_stream_ids_as_pids=recorded_video.container_format == 'MPEG-TS',
+            )
         except (json.JSONDecodeError, TypeError, ValueError):
             await cls.__markFailed(recorded_video_id, 'ProbeFailed')
             return False
@@ -654,6 +664,7 @@ class RecordedPlaybackIndexer:
             index_source.audio_tracks,
             probe,
             detected_audio_stream_types,
+            use_stream_ids_as_pids=recorded_video.container_format == 'MPEG-TS',
         )
         try:
             refined_timeline, audio_timeline, discovered_audio_tracks = await cls.__buildFrameTimelines(
@@ -741,6 +752,7 @@ class RecordedPlaybackIndexer:
         audio_tracks: Sequence[AudioTrack],
         probe: dict[str, Any],
         detected_audio_stream_types: dict[int, int] | None = None,
+        use_stream_ids_as_pids: bool = True,
     ) -> list[AudioTrack]:
         """実ファイルの音声stream/PIDを基準に暫定Trackのstream indexを正規化する。"""
 
@@ -750,12 +762,13 @@ class RecordedPlaybackIndexer:
         ]
         streams_by_index = {int(stream['index']): stream for stream in audio_streams}
         streams_by_pid: dict[int, dict[str, Any]] = {}
-        for stream in audio_streams:
-            try:
-                if stream.get('id') is not None:
-                    streams_by_pid[int(str(stream['id']), 0)] = stream
-            except ValueError:
-                pass
+        if use_stream_ids_as_pids is True:
+            for stream in audio_streams:
+                try:
+                    if stream.get('id') is not None:
+                        streams_by_pid[int(str(stream['id']), 0)] = stream
+                except ValueError:
+                    pass
 
         normalized: list[AudioTrack] = []
         used_stream_indexes: set[int] = set()
@@ -785,11 +798,14 @@ class RecordedPlaybackIndexer:
             if stream_index in used_stream_indexes:
                 continue
             track['stream_index'] = stream_index
-            try:
-                if matched_stream.get('id') is not None:
-                    track['pid'] = int(str(matched_stream['id']), 0)
-            except ValueError:
-                pass
+            if use_stream_ids_as_pids is True:
+                try:
+                    if matched_stream.get('id') is not None:
+                        track['pid'] = int(str(matched_stream['id']), 0)
+                except ValueError:
+                    pass
+            else:
+                track.pop('pid', None)
             normalized.append(track)
             used_stream_indexes.add(stream_index)
             normalized_pid = track.get('pid')
@@ -829,11 +845,12 @@ class RecordedPlaybackIndexer:
                 channel_layout=channel_layout,
                 is_dual_mono=False,
             )
-            try:
-                if stream.get('id') is not None:
-                    track['pid'] = int(str(stream['id']), 0)
-            except ValueError:
-                pass
+            if use_stream_ids_as_pids is True:
+                try:
+                    if stream.get('id') is not None:
+                        track['pid'] = int(str(stream['id']), 0)
+                except ValueError:
+                    pass
             normalized.append(track)
             used_stream_indexes.add(stream_index)
             normalized_pid = track.get('pid')
@@ -1168,7 +1185,11 @@ class RecordedPlaybackIndexer:
         return subtitle_tracks
 
     @staticmethod
-    def __buildTimeline(probe: dict[str, Any], fallback_duration: float) -> list[VideoStreamTimelineEntry]:
+    def __buildTimeline(
+        probe: dict[str, Any],
+        fallback_duration: float,
+        use_stream_ids_as_pids: bool = True,
+    ) -> list[VideoStreamTimelineEntry]:
         """FFprobe JSONから映像ストリームごとの時間範囲を構築する。"""
 
         # MPEG-TS の start_time は録画先頭からの相対時刻ではなく、放送波由来の大きな PTS になる。
@@ -1201,10 +1222,12 @@ class RecordedPlaybackIndexer:
             frame_rate_text = str(stream.get('avg_frame_rate') or stream.get('r_frame_rate') or '0/1')
             numerator, denominator = frame_rate_text.split('/', maxsplit=1)
             frame_rate = float(numerator) / float(denominator) if float(denominator) != 0 else 0.0
-            try:
-                pid = int(str(stream['id']), 0) if stream.get('id') is not None else None
-            except ValueError:
-                pid = None
+            pid: int | None = None
+            if use_stream_ids_as_pids is True:
+                try:
+                    pid = int(str(stream['id']), 0) if stream.get('id') is not None else None
+                except ValueError:
+                    pid = None
             width = int(stream.get('width') or 0)
             height = int(stream.get('height') or 0)
             sample_aspect_ratio = _normalizeAspectRatio(stream.get('sample_aspect_ratio'))
@@ -1291,7 +1314,12 @@ class RecordedPlaybackIndexer:
             tracks_by_stream_index,
             hidden_audio_stream_indexes,
         ) if is_mpeg_ts and hidden_audio_stream_indexes else None
-        input_args = ['-f', 'mpegts', 'pipe:0'] if ts_audio_collector is not None else [str(file_path)]
+        input_args = ['-f', 'mpegts', 'pipe:0'] if ts_audio_collector is not None else [
+            *BuildKonomiTVBS4KMMTTLVInputArguments(
+                MMT_TLV_CONTAINER_FORMAT if file_path.suffix.lower() in MMT_TLV_FILE_EXTENSIONS else '',
+            ),
+            str(file_path),
+        ]
 
         process = await asyncio.create_subprocess_exec(
             *cls.__getFFprobeCommandPrefix(priority),
@@ -1539,6 +1567,9 @@ class RecordedPlaybackIndexer:
             '-show_packets',
             '-show_entries', 'packet=stream_index,pts_time,duration_time',
             '-of', 'compact=p=1:nk=0',
+            *BuildKonomiTVBS4KMMTTLVInputArguments(
+                MMT_TLV_CONTAINER_FORMAT if file_path.suffix.lower() in MMT_TLV_FILE_EXTENSIONS else '',
+            ),
             str(file_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

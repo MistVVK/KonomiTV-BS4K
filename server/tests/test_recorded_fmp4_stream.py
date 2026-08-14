@@ -2341,6 +2341,30 @@ def test_offline_continuous_video_command_uses_single_seek_and_output(monkeypatc
     assert command[-1] == str(Path('/tmp') / 'encoded.mp4')
 
 
+def test_mmt_tlv_video_command_forces_libaribtlv_before_input(monkeypatch) -> None:
+    """録画映像 fMP4 の TLV 入力へ libaribtlv を指定し、出力条件は共通経路を使う。"""
+
+    stream = _BuildOfflineVideoStream()
+    stream.recorded_program.recorded_video.container_format = 'MMT/TLV'
+    stream.recorded_program.recorded_video.file_path = '/recording.tlv'
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__getBackend',
+        lambda _self: 'FFmpeg',
+    )
+
+    command, _backend, _device, _pixel_format = stream._RecordedFMP4Stream__buildVideoEncodeCommand(  # pyright: ignore[reportPrivateUsage]
+        0.0,
+        6.0,
+        ['-f', 'mp4', 'pipe:1'],
+        sequence_for_warning=0,
+    )
+
+    input_index = command.index('/recording.tlv')
+    assert command[input_index - 5:input_index] == ['-f', 'libaribtlv', '-ss', '0.000000', '-i']
+    assert command[command.index('-f') + 1] == 'libaribtlv'
+
+
 def test_playback_video_segment_still_encodes_one_fragment(monkeypatch, tmp_path: Path) -> None:
     """通常再生は連続encodeせず、要求された1セグメントだけを生成する。"""
 

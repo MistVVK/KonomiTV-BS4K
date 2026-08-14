@@ -124,7 +124,8 @@ class RecordedScanTask:
 
     # スキャン対象の拡張子
     SCAN_TARGET_EXTENSIONS: ClassVar[list[str]] = [
-        '.ts', '.m2t', '.m2ts', '.mts', '.mp4', '.m4v', '.mov', '.mkv', '.webm', '.ogv', '.ogg',
+        '.ts', '.m2t', '.m2ts', '.mts', '.tlv', '.mmt', '.mmts',
+        '.mp4', '.m4v', '.mov', '.mkv', '.webm', '.ogv', '.ogg',
     ]
 
     # 録画中ファイルの更新イベントを間引く間隔 (ログ出力用) (秒)

@@ -23,6 +23,10 @@ from app import logging
 from app.constants import LIBRARY_PATH, RECORDED_SUBTITLES_DIR
 from app.models.RecordedVideo import RecordedVideo
 from app.schemas import SubtitleTrack
+from app.utils.KonomiTVBS4KMMTTLV import (
+    MMT_TLV_CONTAINER_FORMAT,
+    BuildKonomiTVBS4KMMTTLVInputArguments,
+)
 from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker
 
 
@@ -81,7 +85,7 @@ class RecordedSubtitleStream:
     _locks: ClassVar[dict[Path, RecordedSubtitleCacheLockEntry]] = {}
     _image_codecs: ClassVar[set[str]] = {'hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'}
     _cache_version = 3
-    _arib_ttml_cache_version = 2
+    _arib_ttml_cache_version = 3
     _file_hash_pattern: ClassVar[re.Pattern[str]] = re.compile(r'^[0-9a-f]{32}$')
     _cache_file_pattern: ClassVar[re.Pattern[str]] = re.compile(
         r'^v(?:0|[1-9]\d*)-[0-9a-f]{32}-(?:0|[1-9]\d*)-(?:0|[1-9]\d*)'
@@ -319,6 +323,7 @@ class RecordedSubtitleStream:
                 return await asyncio.to_thread(cache_path.read_bytes)
             process = await asyncio.create_subprocess_exec(
                 LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error',
+                *BuildKonomiTVBS4KMMTTLVInputArguments(self.recorded_video.container_format),
                 '-i', self.recorded_video.file_path, '-map', f'0:{stream_index}',
                 '-f', 'webvtt', 'pipe:1',
                 stdout=asyncio.subprocess.PIPE,
@@ -465,6 +470,7 @@ class RecordedSubtitleStream:
             process = await asyncio.create_subprocess_exec(
                 LIBRARY_PATH['FFprobe8'], '-v', 'error',
                 '-show_entries', 'format=start_time', '-of', 'json',
+                *BuildKonomiTVBS4KMMTTLVInputArguments(self.recorded_video.container_format),
                 self.recorded_video.file_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -483,12 +489,15 @@ class RecordedSubtitleStream:
                 source_start_time = float(format_start_time) if format_start_time is not None else 0.0
             except (json.JSONDecodeError, TypeError, ValueError):
                 return self.__buildARIBTTMLPacketIndex([])
-            packets = await asyncio.to_thread(
-                self.__extractARIBTTMLPacketsFromTS,
-                Path(self.recorded_video.file_path),
-                source_start_time,
-                self.__getARIBTTMLProgramNumbers(),
-            )
+            if self.recorded_video.container_format == MMT_TLV_CONTAINER_FORMAT:
+                packets = await self.__extractARIBTTMLPacketsFromMMTTLV()
+            else:
+                packets = await asyncio.to_thread(
+                    self.__extractARIBTTMLPacketsFromTS,
+                    Path(self.recorded_video.file_path),
+                    source_start_time,
+                    self.__getARIBTTMLProgramNumbers(),
+                )
             await self.__writeAtomic(cache_path, json.dumps(packets, separators=(',', ':')).encode())
             return self.__rememberARIBTTMLPacketIndex(cache_path, packets)
 
@@ -627,6 +636,109 @@ class RecordedSubtitleStream:
                         })
         return packets
 
+    async def __extractARIBTTMLPacketsFromMMTTLV(self) -> list[ARIBTTMLPacket]:
+        """
+        libaribtlv が公開する timed ID3 data stream を FFprobe 8 で全編索引化する。
+
+        Args:
+            なし。
+
+        Returns:
+            list[ARIBTTMLPacket]: 録画先頭 0 秒基準の raw ID3 packet 一覧。
+        """
+
+        process = await asyncio.create_subprocess_exec(
+            LIBRARY_PATH['FFprobe8'],
+            '-v', 'error',
+            '-select_streams', 'd',
+            '-show_packets',
+            '-show_data',
+            '-show_format',
+            '-show_entries', 'packet=stream_index,pts_time,data:format=start_time',
+            '-of', 'json',
+            '-f', 'libaribtlv',
+            self.recorded_video.file_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            logging.error(
+                '[RecordedSubtitleStream] MMT/TLV ARIB-TTML packet indexing failed. '
+                f'[recorded_video_id: {self.recorded_video.id}, '
+                f'stderr: {stderr.decode(errors="ignore").strip()}]'
+            )
+            return []
+        try:
+            probe = cast(dict[str, Any], json.loads(stdout))
+            source_packets = probe.get('packets', [])
+            source_start_time = float(probe.get('format', {}).get('start_time') or 0.0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+
+        component_tags = {
+            int(component_tag)
+            for track in self.recorded_video.subtitle_tracks
+            if track['codec'].lower() == 'arib_ttml'
+            if (component_tag := track.get('component_tag')) is not None
+        }
+        stream_indexes = {
+            int(stream_index)
+            for track in self.recorded_video.subtitle_tracks
+            if track['codec'].lower() == 'arib_ttml'
+            if (stream_index := track.get('stream_index')) is not None
+        }
+        packets: list[ARIBTTMLPacket] = []
+        for packet in source_packets if isinstance(source_packets, list) else []:
+            if not isinstance(packet, dict) or packet.get('pts_time') is None or packet.get('data') is None:
+                continue
+            try:
+                stream_index = int(packet['stream_index'])
+                packet_pts = float(packet['pts_time'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if stream_indexes and stream_index not in stream_indexes:
+                continue
+            raw_data = self.__decodeFFprobeData(str(packet['data']))
+            component_tag = TSKeyFrameSeeker.getARIBTTMLTimedID3ComponentTag(raw_data)
+            if component_tag is None or (component_tags and component_tag not in component_tags):
+                continue
+            transport_timestamp = self.__getARIBTTMLTransportTimestamp(raw_data)
+            packets.append({
+                'pts': max(0.0, packet_pts - source_start_time),
+                'transport_timestamp': (
+                    transport_timestamp
+                    if transport_timestamp is not None
+                    else packet_pts % ((1 << 33) / 90_000)
+                ),
+                'component_tag': component_tag,
+                'data': base64.b64encode(raw_data).decode(),
+                'is_restore_point': False,
+            })
+        return packets
+
+    @staticmethod
+    def __getARIBTTMLTransportTimestamp(data: bytes) -> float | None:
+        """
+        KonomiTV ARIB-TTML envelope v2 から 33bit source PTS を秒へ変換する。
+
+        Args:
+            data (bytes): timed ID3 tag 全体。
+
+        Returns:
+            float | None: source PTS の秒表現。v2 でなければ None。
+        """
+
+        marker = b'arib-ttml.js\x00'
+        marker_offset = data.find(marker)
+        while marker_offset >= 0:
+            envelope_offset = marker_offset + len(marker)
+            if envelope_offset + 28 <= len(data) and data[envelope_offset] == 2:
+                source_pts = int.from_bytes(data[envelope_offset + 20:envelope_offset + 28], 'big')
+                return (source_pts & 0x1FFFFFFFF) / 90_000
+            marker_offset = data.find(marker, marker_offset + 1)
+        return None
+
     async def __loadARIBPackets(self, subtitle_index: int, track: SubtitleTrack) -> list[ARIBSubtitlePacket]:
         """FFprobe 8の全packet索引をサーバーデータ領域へ永続化する。"""
 
@@ -644,6 +756,7 @@ class RecordedSubtitleStream:
                 LIBRARY_PATH['FFprobe8'], '-v', 'error', '-select_streams', str(stream_index),
                 '-show_packets', '-show_data', '-show_format',
                 '-show_entries', 'packet=pts_time,duration_time,data:format=start_time', '-of', 'json',
+                *BuildKonomiTVBS4KMMTTLVInputArguments(self.recorded_video.container_format),
                 self.recorded_video.file_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
