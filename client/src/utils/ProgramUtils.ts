@@ -323,6 +323,28 @@ export class ProgramUtils {
         },
     };
 
+    // ARIB STD-B10 の音声 component_type が表す実チャンネル数。
+    // 0x40 / 0x41 は利用目的であってチャンネル構成ではないため、ここには含めない。
+    private static readonly AUDIO_COMPONENT_CHANNEL_COUNT: Readonly<Record<number, number>> = {
+        0x01: 1,
+        0x02: 2,
+        0x03: 2,
+        0x04: 3,
+        0x05: 3,
+        0x06: 4,
+        0x07: 4,
+        0x08: 5,
+        0x09: 6,
+        0x0A: 7,
+        0x0B: 7,
+        0x0C: 8,
+        0x0D: 8,
+        0x0E: 8,
+        0x0F: 9,
+        0x10: 12,
+        0x11: 24,
+    };
+
     // ARIB-STD-B10-2-6.2.26 表6-45 サンプリング周波数
     static readonly SAMPLING_RATE = {
         0b000: '将来使用のためリザーブ',
@@ -337,6 +359,30 @@ export class ProgramUtils {
 
     // 事前に文字列の変換テーブルを構築しておく
     private static readonly format_string_translation_map = ProgramUtils.buildFormatStringTranslationMap();
+
+
+    /**
+     * ARIB 音声 component type から実チャンネル数を取得する
+     * @param component_type Audio Component Descriptor の component_type
+     * @returns 既知のチャンネル構成なら実チャンネル数、不明なら null
+     */
+    static getAudioComponentChannelCount(component_type: number): number | null {
+        return ProgramUtils.AUDIO_COMPONENT_CHANNEL_COUNT[component_type] ?? null;
+    }
+
+
+    /**
+     * 展開済みの音声種別名から実チャンネル数を取得する
+     * @param audio_type COMPONENT_TYPE で展開された音声種別名
+     * @returns 既知のチャンネル構成なら実チャンネル数、不明なら null
+     */
+    static getAudioTypeChannelCount(audio_type: string): number | null {
+        const component_type = Object.entries(ProgramUtils.COMPONENT_TYPE[0x02]).find(([, label]) => {
+            return label === audio_type;
+        })?.[0];
+        return component_type === undefined ? null :
+            ProgramUtils.getAudioComponentChannelCount(Number(component_type));
+    }
 
 
     /**

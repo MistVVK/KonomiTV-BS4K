@@ -2,13 +2,17 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ILiveChannelDefault } from '@/services/Channels';
-import PlayerController, { generateRecordedPlaybackSessionID } from '@/services/player/PlayerController';
+import PlayerController, {
+    calculateLiveSyncTarget,
+    generateRecordedPlaybackSessionID,
+} from '@/services/player/PlayerController';
+import { IProgramDefault } from '@/services/Programs';
 import Videos from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore, { LIVE_STREAMING_QUALITIES } from '@/stores/SettingsStore';
 import useVersionStore from '@/stores/VersionStore';
-import { PlayerUtils } from '@/utils';
+import { PlayerUtils, ProgramUtils } from '@/utils';
 
 
 type PlaybackMode = 'Live' | 'Video';
@@ -31,18 +35,28 @@ type FakePlayer = {
         };
     };
     notice: ReturnType<typeof vi.fn>;
+    plugins: {
+        mpegts: {
+            switchAudioTrack: ReturnType<typeof vi.fn>;
+        };
+    };
 };
 
 type TestablePlayerController = {
     playback_mode: PlaybackMode;
     quality_profile_type: 'Wi-Fi' | 'Cellular';
     player: FakePlayer;
-    applyAudioTrackLabels: () => void;
+    applyAudioTrackLabels: (media_info?: {[key: string]: any}) => void;
+    buildLiveAudioTrackDisplayEntries: (media_info: {[key: string]: any}) => Array<{
+        label: string;
+        selectableTrackIndex: number | null;
+    }>;
     setupSettingPanelHandler: () => void;
     initialization_generation: number;
     owner_signal: AbortSignal | null;
     destroyed: boolean;
     destroying: boolean;
+    live_selected_audio_track_index: number;
 };
 
 
@@ -55,6 +69,34 @@ it('非HTTPSでも利用可能な乱数から録画セッションIDを生成す
     };
 
     expect(generateRecordedPlaybackSessionID(random_source)).toBe('0001abff');
+});
+
+
+function createTimeRanges(ranges: Array<[number, number]>): TimeRanges {
+    return {
+        length: ranges.length,
+        start: (index: number) => ranges[index][0],
+        end: (index: number) => ranges[index][1],
+    };
+}
+
+
+describe('ライブ末尾同期先の算出', () => {
+    it('有限の擬似 duration ではなく最後の実バッファ範囲を基準にする', () => {
+        const buffered = createTimeRanges([[0, 12], [20, 42]]);
+
+        expect(calculateLiveSyncTarget(buffered, 3.9)).toBeCloseTo(38.1);
+    });
+
+    it('確保したいバッファ秒数が範囲長を超える場合は範囲先頭に留める', () => {
+        const buffered = createTimeRanges([[100, 102]]);
+
+        expect(calculateLiveSyncTarget(buffered, 3.9)).toBe(100);
+    });
+
+    it('実バッファがない場合は同期しない', () => {
+        expect(calculateLiveSyncTarget(createTimeRanges([]), 3.9)).toBeNull();
+    });
 });
 
 
@@ -106,6 +148,11 @@ function createFakePlayer(): { player: FakePlayer; original_hide: ReturnType<typ
                 },
             },
             notice: vi.fn(),
+            plugins: {
+                mpegts: {
+                    switchAudioTrack: vi.fn(),
+                },
+            },
         },
         original_hide,
     };
@@ -125,6 +172,7 @@ function createController(playback_mode: PlaybackMode): {
     controller.owner_signal = null;
     controller.destroyed = false;
     controller.destroying = false;
+    controller.live_selected_audio_track_index = 0;
     controller.player = player;
     controller.applyAudioTrackLabels = vi.fn();
     controller.setupSettingPanelHandler();
@@ -166,6 +214,141 @@ describe('低解像度ライブ画質制約', () => {
             video_resolution,
             LIVE_STREAMING_QUALITIES,
         )).toEqual(expected_qualities);
+    });
+});
+
+
+describe('ISDB-S3の8ch超音声表示', () => {
+    beforeEach(() => {
+        localStorage.clear();
+        document.body.innerHTML = '';
+        setActivePinia(createPinia());
+
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.BS4K = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            display_channel_id: 'bs4k101',
+            type: 'BS4K' as const,
+        })];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'bs4k101';
+    });
+
+    it.each([
+        [0x0E, 8],
+        [0x0F, 9],
+        [0x10, 12],
+        [0x11, 24],
+        [0x40, null],
+    ])('component type 0x%sをチャンネル数へ変換する', (component_type, expected) => {
+        expect(ProgramUtils.getAudioComponentChannelCount(component_type)).toBe(expected);
+    });
+
+    it('24chを選択不可で残し、後続の5.1chとステレオを実PMTトラックへ対応させる', () => {
+        const channels_store = useChannelsStore();
+        channels_store.current_program_present = {
+            ...structuredClone(IProgramDefault),
+            audio_components: [
+                {
+                    component_tag: 0x10,
+                    channel_count: 24,
+                    language: '日本語',
+                    audio_type: '3/3/3-5/2/3-3/0/0.2モード',
+                    sampling_rate: '48kHz',
+                },
+                {
+                    component_tag: 0x11,
+                    channel_count: 6,
+                    language: '日本語',
+                    audio_type: '3/2+LFEモード(3/2.1モード)',
+                    sampling_rate: '48kHz',
+                },
+                {
+                    component_tag: 0x12,
+                    channel_count: 2,
+                    language: '英語',
+                    audio_type: '2/0モード(ステレオ)',
+                    sampling_rate: '48kHz',
+                },
+            ],
+        };
+        const { controller } = createController('Live');
+
+        const entries = controller.buildLiveAudioTrackDisplayEntries({
+            audioTrackCount: 2,
+            audioTrackComponentTags: [0x11, 0x12],
+            hasAudio: true,
+        });
+
+        expect(entries).toEqual([
+            {label: 'Track1 日本語 (22.2ch) [選択不可]', selectableTrackIndex: null},
+            {label: 'Track2 日本語 (5.1ch)', selectableTrackIndex: 0},
+            {label: 'Track3 英語 (Stereo)', selectableTrackIndex: 1},
+        ]);
+    });
+
+    it('TLVで全記述子が未着でも主音声22.2chを選択不可表示する', () => {
+        const channels_store = useChannelsStore();
+        channels_store.current_program_present = {
+            ...structuredClone(IProgramDefault),
+            primary_audio_type: '3/3/3-5/2/3-3/0/0.2モード',
+            primary_audio_language: '日本語',
+            secondary_audio_type: '3/2+LFEモード(3/2.1モード)',
+            secondary_audio_language: '日本語',
+            audio_components: [],
+        };
+        const { controller } = createController('Live');
+
+        const entries = controller.buildLiveAudioTrackDisplayEntries({
+            audioTrackCount: 2,
+            audioTrackComponentTags: [0x11, 0x12],
+            hasAudio: true,
+        });
+
+        expect(entries).toEqual([
+            {label: 'Track1 日本語 (22.2ch) [選択不可]', selectableTrackIndex: null},
+            {label: 'Track2 日本語 (5.1ch)', selectableTrackIndex: 0},
+            {label: 'Track3 言語不明', selectableTrackIndex: 1},
+        ]);
+    });
+
+    it('選択不可行は切り替えず、後続表示行を実PMTトラック番号で切り替える', () => {
+        const channels_store = useChannelsStore();
+        channels_store.current_program_present = {
+            ...structuredClone(IProgramDefault),
+            primary_audio_type: '3/3/3-5/2/3-3/0/0.2モード',
+            primary_audio_language: '日本語',
+            secondary_audio_type: '3/2+LFEモード(3/2.1モード)',
+            secondary_audio_language: '日本語',
+            audio_components: [],
+        };
+        const { controller, player } = createController('Live');
+        const prototype = PlayerController.prototype as unknown as {
+            applyAudioTrackLabels(
+                this: TestablePlayerController,
+                media_info?: {[key: string]: any},
+            ): void;
+        };
+        controller.applyAudioTrackLabels = prototype.applyAudioTrackLabels.bind(controller);
+        controller.applyAudioTrackLabels({
+            audioTrackCount: 2,
+            audioTrackComponentTags: [0x11, 0x12],
+            hasAudio: true,
+        });
+
+        const audio_items = Array.from(
+            player.container.querySelectorAll<HTMLElement>('.dplayer-setting-audio-item'),
+        );
+        expect(audio_items).toHaveLength(3);
+        expect(audio_items[0].classList.contains('dplayer-setting-audio-item--unsupported')).toBe(true);
+        expect(audio_items[0].getAttribute('aria-disabled')).toBe('true');
+
+        audio_items[0].click();
+        expect(player.plugins.mpegts.switchAudioTrack).not.toHaveBeenCalled();
+        audio_items[1].click();
+        expect(player.plugins.mpegts.switchAudioTrack).toHaveBeenCalledWith(0);
+        audio_items[2].click();
+        expect(player.plugins.mpegts.switchAudioTrack).toHaveBeenLastCalledWith(1);
     });
 });
 

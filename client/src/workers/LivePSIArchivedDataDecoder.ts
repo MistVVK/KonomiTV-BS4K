@@ -418,6 +418,7 @@ class LivePSIArchivedDataDecoder implements ILivePSIArchivedDataDecoder {
             }
             return {
                 component_tag: descriptor.component_tag,
+                channel_count: ProgramUtils.getAudioComponentChannelCount(descriptor.component_type),
                 language,
                 audio_type,
                 sampling_rate: ProgramUtils.SAMPLING_RATE[descriptor.sampling_rate] ?? '',

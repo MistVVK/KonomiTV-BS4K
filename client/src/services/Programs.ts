@@ -35,6 +35,7 @@ export interface IProgram extends IProgramDisplay {
     /** EIT の全 Audio Component Descriptor。PMT の component tag と照合して表示名だけを補完する。 */
     audio_components?: {
         component_tag: number;
+        channel_count: number | null;
         language: string;
         audio_type: string;
         sampling_rate: string;

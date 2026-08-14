@@ -539,7 +539,7 @@ const handleSettingCoverClick = () => {
         .dplayer-setting-audio-panel {
             // ライブで配信 TS に存在しない DPlayer の固定音声項目は表示しない。
             // 録画だけは現在位置に存在しない音声も全体の候補として残し、選択不能であることを示す。
-            .dplayer-setting-audio-item.dplayer-setting-audio-item--disabled:not(.dplayer-setting-audio-item--status) {
+            .dplayer-setting-audio-item.dplayer-setting-audio-item--disabled:not(.dplayer-setting-audio-item--status):not(.dplayer-setting-audio-item--unsupported) {
                 display: none;
 
                 .watch-player--video & {
@@ -548,6 +548,13 @@ const handleSettingCoverClick = () => {
                     opacity: 0.45;
                     pointer-events: none;
                 }
+            }
+            // ISDB-S3 の8ch超音声は配信TSから除外しても、放送上の音声構成として選択不可表示する
+            .dplayer-setting-audio-item.dplayer-setting-audio-item--unsupported {
+                display: flex;
+                cursor: default;
+                opacity: 0.45;
+                pointer-events: none;
             }
             // 「音声不明」「音声なし」は選択できない状態表示として扱う
             .dplayer-setting-audio-item.dplayer-setting-audio-item--status {
