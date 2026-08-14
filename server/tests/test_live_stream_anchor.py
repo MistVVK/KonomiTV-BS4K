@@ -318,6 +318,7 @@ def test_mmt_tlv_uses_libaribtlv_and_disables_source_anchor(
 
     for options in (software_options, hardware_options):
         assert options[options.index('-f') + 1] == 'libaribtlv'
+        assert options[options.index('-max_audio_channels') + 1] == '8'
         assert options.count('0:a?') == 1
         assert options.count('0:d?') == 1
         assert '-ac' not in options
@@ -325,6 +326,32 @@ def test_mmt_tlv_uses_libaribtlv_and_disables_source_anchor(
     assert hardware_options[hardware_options.index('-c:a') + 1] == 'aac'
     assert task.IsLiveStreamAnchorActive(is_mmt_tlv=True) is False
     assert '--stream-anchor-v1' not in bridge_options
+
+
+def test_mpeg_ts_does_not_apply_isdb_s3_audio_channel_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """従来 MPEG-TS 入力へ libaribtlv 専用の音声上限を適用しない。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=True,
+        video_codec='avc',
+        audio_codec='aac',
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    software_options = task.buildFFmpegOptions('240p', 'BS4K', False, is_mmt_tlv=False)
+    hardware_options = task.buildFFmpeg8HardwareOptions(
+        '240p',
+        'QSV',
+        'BS4K',
+        False,
+        is_mmt_tlv=False,
+    )
+
+    assert '-max_audio_channels' not in software_options
+    assert '-max_audio_channels' not in hardware_options
 
 
 def test_ffmpeg8_software_advanced_codec_uses_single_map_and_vbv(

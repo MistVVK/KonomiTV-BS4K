@@ -197,8 +197,8 @@ class LiveStream:
             instance._updated_at = 0
 
             # ストリームデータの最終書き込み時刻のタイムスタンプ
-            ## 最終書き込み時刻が 5 秒 (ONAir 時) 20 秒 (Standby 時) 以上更新されていない場合は、
-            ## エンコーダーがフリーズしたものとみなしてエンコードタスクを再起動する
+            ## 最終書き込み時刻が通常 5 秒・BS4K 15 秒 (ONAir 時)、20 秒 (Standby 時) 以上
+            ## 更新されていない場合は、エンコーダーがフリーズしたものとみなしてエンコードタスクを再起動する
             instance._stream_data_written_at = 0
 
             # 実行中の LiveEncodingTask のタスクへの参照
@@ -647,6 +647,12 @@ class LiveStream:
         # ここで更新しておかないと、いつまで経っても初期化時の古いタイムスタンプが使われてしまう
         if ((self._status == 'Offline' or self._status == 'Restart') and status == 'Standby'):
             self._started_at = time.time()
+            self._stream_data_written_at = time.time()
+
+        # Standby 中は FFmpeg の進捗ログが先に ONAir 判定を成立させ、最終 TS が Python 側へ届くまで
+        # 数秒遅れることがある。起動に要した時間を ONAir の無出力時間へ混ぜないよう、遷移時点を
+        # ONAir 監視の新しい基準にする。Idling 復帰は既に配信実績があるため対象外とする。
+        if self._status == 'Standby' and status == 'ONAir':
             self._stream_data_written_at = time.time()
 
         # ステータス変更のログを出力

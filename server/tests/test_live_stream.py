@@ -3,6 +3,25 @@ import pytest
 from app.streams.LiveStream import LiveStream, LiveStreamClient
 
 
+def test_onair_transition_resets_stream_output_watchdog_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Standby の起動時間を ONAir の無出力時間へ持ち越さないことを検証する。"""
+
+    now = 100.0
+    monkeypatch.setattr('app.streams.LiveStream.time.time', lambda: now)
+
+    live_stream = object.__new__(LiveStream)
+    live_stream.live_stream_id = 'bs4k101-1080p'
+    live_stream._status = 'Standby'
+    live_stream._detail = '起動中'
+    live_stream._started_at = 90.0
+    live_stream._updated_at = 90.0
+    live_stream._stream_data_written_at = 90.0
+    live_stream.tuner = None
+
+    assert live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。', quiet=True) is True
+    assert live_stream.getStreamDataWrittenAt() == now
+
+
 @pytest.mark.parametrize('client_count', [1, 2, 5])
 def test_disconnect_all_notifies_every_client(client_count: int) -> None:
     """disconnectAll() が接続クライアント全員へ終了を通知することを検証する。"""

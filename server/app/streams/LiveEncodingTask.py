@@ -90,6 +90,10 @@ class LiveEncodingTask:
     # VCEEncC 利用時のみ起動時に OpenCL シェーダーがコンパイルされる関係で起動が遅いため、10 秒に設定
     ENCODER_TS_READ_TIMEOUT_ONAIR: ClassVar[int] = 5
     ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC: ClassVar[int] = 10
+    # ISDB-S3 は入力解析と最初の映像出力に時間がかかるため、ONAir 遷移後の初回出力を長めに待つ
+    ENCODER_TS_READ_TIMEOUT_ONAIR_BS4K: ClassVar[int] = 15
+    # Opus と一般的なブラウザ再生経路が扱える最大チャンネル数。ISDB-S3 demuxer の入力段階で適用する
+    ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS: ClassVar[int] = 8
 
 
     def __init__(self, live_stream: LiveStream) -> None:
@@ -335,6 +339,10 @@ class LiveEncodingTask:
             # demux の先読みだけを抑える -fflags nobuffer は維持する。
             options += ['-fflags', 'nobuffer']
         options += ['-f', 'libaribtlv' if is_mmt_tlv is True else 'mpegts']
+        if is_mmt_tlv is True:
+            # 22.2ch に限らず、ISDB-S3 で現れ得る 8ch 超の音声をエンコーダー初期化前に除外する。
+            # 出力側の -map で除外すると codec 初期化が先に失敗するため、demuxer private option を使う。
+            options += ['-max_audio_channels', str(self.ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS)]
         if input_probesize is not None:
             options += ['-probesize', input_probesize]
         options += [
@@ -607,6 +615,9 @@ class LiveEncodingTask:
         # 入力
         ## -analyzeduration をつけることで、ストリームの分析時間を短縮できる
         input_options = f'-f {"libaribtlv" if is_mmt_tlv is True else "mpegts"}'
+        if is_mmt_tlv is True:
+            # software backend も HW backend と同じ libaribtlv 入力制約を使い、サービス固有判定を持たない。
+            input_options += f' -max_audio_channels {self.ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS}'
         if input_probesize is not None:
             input_options += f' -probesize {input_probesize}'
         input_options += f' -analyzeduration {analyzeduration} -i pipe:0'
@@ -2229,8 +2240,12 @@ class LiveEncodingTask:
                     # 現在 ONAir でかつストリームデータの最終書き込み時刻から
                     # ENCODER_TS_READ_TIMEOUT_ONAIR 秒以上が経過している場合も、エンコーダーがフリーズしたものとみなす
                     ## 何らかの理由でエンコードが途中で停止した場合、live_stream.write() が実行されなくなることを利用している
-                    encoder_ts_read_timeout_onair = \
-                        self.ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC if ENCODER_TYPE == 'AMF' else self.ENCODER_TS_READ_TIMEOUT_ONAIR
+                    if channel.type == 'BS4K':
+                        encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR_BS4K
+                    elif ENCODER_TYPE == 'AMF':
+                        encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC
+                    else:
+                        encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR
                     stream_data_last_write_time = time.time() - self.live_stream.getStreamDataWrittenAt()
                     if ((live_stream_status.status == 'Standby' and stream_data_last_write_time > self.ENCODER_TS_READ_TIMEOUT_STANDBY) or
                         (live_stream_status.status == 'ONAir' and stream_data_last_write_time > encoder_ts_read_timeout_onair)):
