@@ -162,10 +162,10 @@ def test_bridge_manifest_has_one_fixed_fail_closed_schema() -> None:
     )
     assert manifest['KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION'] == 'n8.1.2'
     assert manifest['KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256'] == (
-        '5599c2bc61d987c7336ad4a7bf4b917fa8b260822fbb65c8b069188931339f76'
+        '23c8db30517a2434dbf8c11ea935ca723f739da798e156541da3809274c09a61'
     )
     assert manifest['KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256'] == (
-        '877ca4ba5b63cabde0378cb39af3be12e449b6079c2d975b37aaab20f758c191'
+        '3a0a5536fdb6287dde42502921d9ad9dfac44abeb027bb1769a9c328cb596c34'
     )
 
     source_commit = manifest['KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT']

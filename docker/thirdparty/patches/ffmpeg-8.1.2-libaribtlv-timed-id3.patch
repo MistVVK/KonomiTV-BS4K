@@ -1,0 +1,309 @@
+--- a/libavformat/libaribtlv.c
++++ b/libavformat/libaribtlv.c
+@@ -40,10 +40,15 @@
+ #define ARIBTLV_SEEK_MAX_PREROLL (128LL * 1024 * 1024)
+ #define ARIBTLV_SEEK_PROBE_SIZE (64LL * 1024 * 1024)
+ #define ARIBTLV_SEEK_MAX_ATTEMPTS 5
++#define ARIBTLV_ID3_OWNER "arib-ttml.js"
++#define ARIBTLV_ID3_PAYLOAD_VERSION 2
++#define ARIBTLV_ID3_MAX_RAW_FRAGMENT (60 * 1024)
++#define ARIBTLV_ID3_ENVELOPE_SIZE 28
+ 
+ typedef struct LibaribtlvTrack {
+     uint64_t id;
+     int stream_index;
++    int timed_id3_stream_index;
+ } LibaribtlvTrack;
+ 
+ typedef struct LibaribtlvPacket {
+@@ -80,6 +85,48 @@
+     return -1;
+ }
+ 
++static int libaribtlv_timed_id3_track_index(const LibaribtlvContext *ctx,
++                                            uint64_t id)
++{
++    size_t i;
++
++    for (i = 0; i < ctx->track_count; i++) {
++        if (ctx->tracks[i].id == id)
++            return ctx->tracks[i].timed_id3_stream_index;
++    }
++    return -1;
++}
++
++static void libaribtlv_set_timed_id3_track_index(LibaribtlvContext *ctx,
++                                                  uint64_t id, int stream_index)
++{
++    size_t i;
++
++    for (i = 0; i < ctx->track_count; i++) {
++        if (ctx->tracks[i].id == id) {
++            ctx->tracks[i].timed_id3_stream_index = stream_index;
++            return;
++        }
++    }
++}
++
++static int libaribtlv_queue_packet(LibaribtlvContext *ctx, AVPacket *packet)
++{
++    LibaribtlvPacket *queued = av_mallocz(sizeof(*queued));
++
++    if (!queued) {
++        av_packet_free(&packet);
++        return AVERROR(ENOMEM);
++    }
++    queued->packet = packet;
++    if (ctx->queue_tail)
++        ctx->queue_tail->next = queued;
++    else
++        ctx->queue_head = queued;
++    ctx->queue_tail = queued;
++    return 0;
++}
++
+ static enum AVMediaType libaribtlv_media_type(aribtlv_track_kind kind)
+ {
+     switch (kind) {
+@@ -129,6 +176,7 @@
+         ctx->tracks = tracks;
+         ctx->tracks[ctx->track_count].id = track->track_id;
+         ctx->tracks[ctx->track_count].stream_index = st->index;
++        ctx->tracks[ctx->track_count].timed_id3_stream_index = -1;
+         ctx->track_count++;
+     }
+ 
+@@ -151,6 +199,44 @@
+         if (track->audio_main_component)
+             st->disposition |= AV_DISPOSITION_DEFAULT;
+     }
++
++    /*
++     * Keep the decoded TTML stream above for regular libaribtlv consumers, and
++     * add a timed-ID3 data stream for KonomiTV's lossless ARIB-TTML envelope.
++     * The MPEG-TS muxer recognises AV_CODEC_ID_TIMED_ID3 and writes the metadata
++     * descriptor expected by the browser-side arib-ttml.js decoder.
++     */
++    if (track->kind == ARIBTLV_TRACK_SUBTITLE) {
++        int data_stream_index = libaribtlv_timed_id3_track_index(ctx,
++                                                                 track->track_id);
++        AVStream *data_st;
++
++        if (data_stream_index >= 0) {
++            data_st = ctx->format->streams[data_stream_index];
++            data_st->discard = AVDISCARD_DEFAULT;
++        } else {
++            data_st = avformat_new_stream(ctx->format, NULL);
++            if (!data_st) {
++                ctx->fatal_error = AVERROR(ENOMEM);
++                return;
++            }
++            libaribtlv_set_timed_id3_track_index(ctx, track->track_id,
++                                                 data_st->index);
++        }
++        data_st->id                   = track->packet_id;
++        data_st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
++        data_st->codecpar->codec_id   = AV_CODEC_ID_TIMED_ID3;
++        data_st->codecpar->codec_tag  = MKTAG('I', 'D', '3', ' ');
++        avpriv_set_pts_info(data_st, 33, 1, 90000);
++        if (ctx->format->duration != AV_NOPTS_VALUE)
++            data_st->duration = av_rescale_q(ctx->format->duration,
++                                             AV_TIME_BASE_Q,
++                                             data_st->time_base);
++        av_dict_set_int(&data_st->metadata, "component_tag",
++                        track->component_tag, 0);
++        if (track->language && track->language[0])
++            av_dict_set(&data_st->metadata, "language", track->language, 0);
++    }
+ }
+ 
+ static void libaribtlv_on_track_removed(void *opaque,
+@@ -161,13 +247,15 @@
+ 
+     if (stream_index >= 0)
+         ctx->format->streams[stream_index]->discard = AVDISCARD_ALL;
++    stream_index = libaribtlv_timed_id3_track_index(ctx, track->track_id);
++    if (stream_index >= 0)
++        ctx->format->streams[stream_index]->discard = AVDISCARD_ALL;
+ }
+ 
+ static void libaribtlv_on_access_unit(void *opaque,
+                                       const aribtlv_access_unit *unit)
+ {
+     LibaribtlvContext *ctx = opaque;
+-    LibaribtlvPacket *queued;
+     AVStream *st;
+     AVPacket *packet;
+     AVRational source_time_base;
+@@ -198,17 +286,13 @@
+         return;
+     }
+ 
+-    queued = av_mallocz(sizeof(*queued));
+     packet = av_packet_alloc();
+-    if (!queued || !packet) {
+-        av_free(queued);
+-        av_packet_free(&packet);
++    if (!packet) {
+         ctx->fatal_error = AVERROR(ENOMEM);
+         return;
+     }
+     ret = av_new_packet(packet, unit->size);
+     if (ret < 0) {
+-        av_free(queued);
+         av_packet_free(&packet);
+         ctx->fatal_error = ret;
+         return;
+@@ -224,12 +308,138 @@
+     if (unit->random_access)
+         packet->flags |= AV_PKT_FLAG_KEY;
+ 
+-    queued->packet = packet;
+-    if (ctx->queue_tail)
+-        ctx->queue_tail->next = queued;
+-    else
+-        ctx->queue_head = queued;
+-    ctx->queue_tail = queued;
++    ret = libaribtlv_queue_packet(ctx, packet);
++    if (ret < 0)
++        ctx->fatal_error = ret;
++}
++
++static void libaribtlv_write_synchsafe(uint8_t *destination, uint32_t value)
++{
++    destination[0] = (value >> 21) & 0x7f;
++    destination[1] = (value >> 14) & 0x7f;
++    destination[2] = (value >> 7) & 0x7f;
++    destination[3] = value & 0x7f;
++}
++
++static void libaribtlv_on_subtitle_mfu(void *opaque,
++                                       const aribtlv_subtitle_mfu *mfu)
++{
++    LibaribtlvContext *ctx = opaque;
++    static const char owner[] = ARIBTLV_ID3_OWNER;
++    const size_t owner_size = sizeof(owner) - 1;
++    AVStream *st;
++    AVRational source_time_base;
++    uint64_t pts_90khz;
++    size_t fragment_count;
++    size_t fragment_index;
++    size_t fragment_offset;
++    int stream_index;
++
++    if (ctx->fatal_error || ctx->seek_probe)
++        return;
++    if (mfu->size < 4 || mfu->size > UINT32_MAX ||
++        mfu->additional_data_component_info_size > UINT16_MAX)
++        return;
++
++    stream_index = libaribtlv_timed_id3_track_index(ctx, mfu->track_id);
++    if (stream_index < 0)
++        return;
++    st = ctx->format->streams[stream_index];
++    source_time_base = (AVRational) {
++        1, mfu->pts.timescale ? mfu->pts.timescale : 1
++    };
++    pts_90khz = (uint64_t)av_rescale_q(mfu->pts.value, source_time_base,
++                                       (AVRational){ 1, 90000 }) &
++                ((UINT64_C(1) << 33) - 1);
++    fragment_count = (mfu->size + ARIBTLV_ID3_MAX_RAW_FRAGMENT - 1) /
++                     ARIBTLV_ID3_MAX_RAW_FRAGMENT;
++    if (!fragment_count || fragment_count > UINT16_MAX)
++        return;
++
++    for (fragment_index = 0, fragment_offset = 0;
++         fragment_index < fragment_count;
++         fragment_index++, fragment_offset += ARIBTLV_ID3_MAX_RAW_FRAGMENT) {
++        const size_t fragment_size = FFMIN(ARIBTLV_ID3_MAX_RAW_FRAGMENT,
++                                           mfu->size - fragment_offset);
++        const size_t frame_payload_size = owner_size + 1 +
++                                          ARIBTLV_ID3_ENVELOPE_SIZE +
++                                          mfu->additional_data_component_info_size +
++                                          fragment_size;
++        const size_t tag_payload_size = 10 + frame_payload_size;
++        const size_t packet_size = 10 + tag_payload_size;
++        AVPacket *packet;
++        uint8_t *cursor;
++        int ret;
++
++        if (frame_payload_size > 0x0fffffff ||
++            tag_payload_size > 0x0fffffff || packet_size > INT_MAX) {
++            ctx->fatal_error = AVERROR_INVALIDDATA;
++            return;
++        }
++        packet = av_packet_alloc();
++        if (!packet) {
++            ctx->fatal_error = AVERROR(ENOMEM);
++            return;
++        }
++        ret = av_new_packet(packet, packet_size);
++        if (ret < 0) {
++            av_packet_free(&packet);
++            ctx->fatal_error = ret;
++            return;
++        }
++
++        cursor = packet->data;
++        memcpy(cursor, "ID3", 3);
++        cursor[3] = 4;
++        cursor[4] = 0;
++        cursor[5] = 0;
++        libaribtlv_write_synchsafe(cursor + 6, tag_payload_size);
++        cursor += 10;
++        memcpy(cursor, "PRIV", 4);
++        libaribtlv_write_synchsafe(cursor + 4, frame_payload_size);
++        cursor[8] = 0;
++        cursor[9] = 0;
++        cursor += 10;
++        memcpy(cursor, owner, owner_size);
++        cursor += owner_size;
++        *cursor++ = 0;
++        *cursor++ = ARIBTLV_ID3_PAYLOAD_VERSION;
++        *cursor++ = mfu->component_tag & 0xff;
++        memcpy(cursor, mfu->data, 4);
++        cursor += 4;
++        AV_WB16(cursor, mfu->additional_data_component_info_size);
++        cursor += 2;
++        AV_WB16(cursor, fragment_index);
++        cursor += 2;
++        AV_WB16(cursor, fragment_count);
++        cursor += 2;
++        AV_WB32(cursor, mfu->size);
++        cursor += 4;
++        AV_WB32(cursor, fragment_offset);
++        cursor += 4;
++        AV_WB64(cursor, pts_90khz);
++        cursor += 8;
++        if (mfu->additional_data_component_info_size)
++            memcpy(cursor, mfu->additional_data_component_info,
++                   mfu->additional_data_component_info_size);
++        cursor += mfu->additional_data_component_info_size;
++        memcpy(cursor, mfu->data + fragment_offset, fragment_size);
++
++        source_time_base.den = mfu->pts.timescale ? mfu->pts.timescale : 1;
++        packet->pts = av_rescale_q(mfu->pts.value, source_time_base,
++                                   st->time_base);
++        source_time_base.den = mfu->dts.timescale ? mfu->dts.timescale : 1;
++        packet->dts = av_rescale_q(mfu->dts.value, source_time_base,
++                                   st->time_base);
++        packet->stream_index = stream_index;
++        packet->pos = mfu->input_offset <= INT64_MAX ? mfu->input_offset : -1;
++        packet->flags |= AV_PKT_FLAG_KEY;
++        ret = libaribtlv_queue_packet(ctx, packet);
++        if (ret < 0) {
++            ctx->fatal_error = ret;
++            return;
++        }
++    }
+ }
+ 
+ static void libaribtlv_on_error(void *opaque, const aribtlv_error *error)
+@@ -405,6 +615,7 @@
+     callbacks.on_track = libaribtlv_on_track;
+     callbacks.on_track_removed = libaribtlv_on_track_removed;
+     callbacks.on_access_unit = libaribtlv_on_access_unit;
++    callbacks.on_subtitle_mfu = libaribtlv_on_subtitle_mfu;
+     callbacks.on_error = libaribtlv_on_error;
+     aribtlv_config_init(&config);
+     config.collect_application_resources = 0;

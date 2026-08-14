@@ -124,6 +124,12 @@ def main() -> None:
             ('GNU LGPL version 2.1', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.LGPLv2.1', manifest['FFMPEG8_LGPLV21_SHA256']),
             ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.GPLv3', manifest['FFMPEG8_GPLV3_SHA256']),
         )),
+        LicenseSource('libaribtlv', manifest['LIBARIBTLV_VERSION'], manifest['LIBARIBTLV_REPOSITORY'], manifest['LIBARIBTLV_COMMIT'], (
+            ('LICENSE', f'{github_raw}/makeding/libaribtlv/{manifest["LIBARIBTLV_COMMIT"]}/LICENSE', manifest['LIBARIBTLV_LICENSE_SHA256']),
+        )),
+        LicenseSource('FFmpeg libaribtlv integration patches', manifest['FFMPEG8_VERSION'], manifest['FFMPEG_LIBARIBTLV_REPOSITORY'], manifest['FFMPEG_LIBARIBTLV_COMMIT'], (
+            ('LICENSE', f'{github_raw}/makeding/ffmpeg-libaribtlv/{manifest["FFMPEG_LIBARIBTLV_COMMIT"]}/LICENSE', manifest['FFMPEG_LIBARIBTLV_LICENSE_SHA256']),
+        )),
         LicenseSource('AMD Advanced Media Framework headers', manifest['AMF_VERSION'], manifest['AMF_REPOSITORY'], manifest['AMF_COMMIT'], (
             ('LICENSE.txt', f'{github_raw}/GPUOpen-LibrariesAndSDKs/AMF/{manifest["AMF_COMMIT"]}/LICENSE.txt', manifest['AMF_LICENSE_SHA256']),
         )),
@@ -332,10 +338,14 @@ def main() -> None:
         '#### FFmpeg 8 and AMF', '',
         f'- FFmpeg source: <{manifest["FFMPEG8_REPOSITORY"]}>',
         f'- FFmpeg fixed commit: `{manifest["FFMPEG8_COMMIT"]}`',
+        f'- libaribtlv source: <{manifest["LIBARIBTLV_REPOSITORY"]}> (`{manifest["LIBARIBTLV_COMMIT"]}`)',
+        f'- FFmpeg libaribtlv patch source: <{manifest["FFMPEG_LIBARIBTLV_REPOSITORY"]}> (`{manifest["FFMPEG_LIBARIBTLV_COMMIT"]}`)',
         f'- AMF source: <{manifest["AMF_REPOSITORY"]}>',
         f'- AMF fixed commit: `{manifest["AMF_COMMIT"]}`',
         '- Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`',
         '- Local patches:',
+        f'  - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`{manifest["LIBARIBTLV_SUBTITLE_MFU_PATCH_SHA256"]}`)',
+        f'  - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`{manifest["FFMPEG_LIBARIBTLV_TIMED_ID3_PATCH_SHA256"]}`)',
         f'  - `amf-1.4.36-display-capture-c.patch` (`{manifest["AMF_DISPLAY_CAPTURE_C_PATCH_SHA256"]}`)',
         '',
         '#### Intel media stack', '',

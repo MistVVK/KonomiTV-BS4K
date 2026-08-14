@@ -39,6 +39,7 @@ required_files=(
     FFmpeg8/ffmpeg8-amd.sh
     FFmpeg8/ffmpeg8.elf
     FFmpeg8/ffprobe8.elf
+    KonomiTVBS4KTLVMetadata/KonomiTVBS4KTLVMetadata.elf
     Python/bin/python
     psisiarc/psisiarc.elf
     tsreadex/tsreadex.elf
@@ -71,6 +72,18 @@ required_cm_analysis_documents=(
 )
 for relative_path in "${required_cm_analysis_documents[@]}"; do
     test -s "${THIRDPARTY_ROOT}/${relative_path}" || { echo "Missing license/runtime document: ${relative_path}" >&2; exit 1; }
+done
+
+required_mmt_tlv_documents=(
+    FFmpeg8/License-libaribtlv-MIT.txt
+    FFmpeg8/License-ffmpeg-libaribtlv-MIT.txt
+    KonomiTVBS4KTLVMetadata/License-libaribtlv-MIT.txt
+)
+for relative_path in "${required_mmt_tlv_documents[@]}"; do
+    test -s "${THIRDPARTY_ROOT}/${relative_path}" || {
+        echo "Missing MMT/TLV license document: ${relative_path}" >&2
+        exit 1
+    }
 done
 
 echo 'Verifying the Amatsukaze-free CM analysis runtime layout.'
@@ -228,6 +241,7 @@ echo "${ffmpeg8_version}" | grep -F "ffmpeg version n${FFMPEG8_VERSION}"
 ffmpeg8_buildconf="$(${ffmpeg8} -buildconf 2>&1)"
 for option in \
     --enable-gpl --enable-version3 \
+    --enable-libaribtlv \
     --enable-muxer=wav --enable-encoder=pcm_s16le \
     --enable-filter=aresample --enable-filter=asetpts \
     --enable-amf --enable-cuvid --enable-ffnvcodec --enable-libvpl \
@@ -235,6 +249,16 @@ for option in \
     --enable-opencl --enable-cuda-llvm; do
     echo "${ffmpeg8_buildconf}" | grep -F -- "${option}"
 done
+
+ffmpeg8_demuxers="$(${ffprobe8} -hide_banner -demuxers 2>&1)"
+grep -Eq '[[:space:]]libaribtlv[[:space:]]' <<< "${ffmpeg8_demuxers}" || {
+    echo 'Missing demuxer: libaribtlv' >&2
+    exit 1
+}
+if ldd "${ffmpeg8}" | grep -F 'libaribtlv'; then
+    echo 'libaribtlv must be statically linked into FFmpeg 8.' >&2
+    exit 1
+fi
 for option in --enable-nonfree --enable-cuda-nvcc; do
     if echo "${ffmpeg8_buildconf}" | grep -F -- "${option}"; then
         echo "Unexpected configure option: ${option}" >&2
@@ -309,7 +333,8 @@ for executable in \
     CMAnalysis/libswresample.so.6 \
     CMAnalysis/libswscale.so.9 \
     FFmpeg8/ffmpeg8.elf \
-    FFmpeg8/ffprobe8.elf; do
+    FFmpeg8/ffprobe8.elf \
+    KonomiTVBS4KTLVMetadata/KonomiTVBS4KTLVMetadata.elf; do
     echo "Verifying dynamic dependencies: ${executable}"
     missing_dependencies="$(ldd "${THIRDPARTY_ROOT}/${executable}" | awk '/not found/ { print $1 }')"
     if [ -n "${missing_dependencies}" ]; then

@@ -1,0 +1,213 @@
+diff --git a/include/aribtlv/aribtlv.h b/include/aribtlv/aribtlv.h
+index dbece1c..6140069 100644
+--- a/include/aribtlv/aribtlv.h
++++ b/include/aribtlv/aribtlv.h
+@@ -106,6 +106,19 @@ typedef struct aribtlv_error {
+     const char *message;
+ } aribtlv_error;
+ 
++typedef struct aribtlv_subtitle_mfu {
++    uint64_t track_id;
++    uint16_t component_tag;
++    const uint8_t *additional_data_component_info;
++    size_t additional_data_component_info_size;
++    const uint8_t *data;
++    size_t size;
++    aribtlv_timestamp pts;
++    aribtlv_timestamp dts;
++    uint64_t input_offset;
++    uint8_t discontinuity;
++} aribtlv_subtitle_mfu;
++
+ /* Views passed to callbacks remain valid only until that callback returns. */
+ typedef struct aribtlv_callbacks {
+     size_t struct_size;
+@@ -114,6 +127,8 @@ typedef struct aribtlv_callbacks {
+     void (*on_track_removed)(void *opaque, const aribtlv_track_info *track);
+     void (*on_access_unit)(void *opaque, const aribtlv_access_unit *unit);
+     void (*on_error)(void *opaque, const aribtlv_error *error);
++    /* Append-only extension. Check struct_size before assigning from older clients. */
++    void (*on_subtitle_mfu)(void *opaque, const aribtlv_subtitle_mfu *mfu);
+ } aribtlv_callbacks;
+ 
+ typedef struct aribtlv_config {
+diff --git a/include/aribtlv/types.hpp b/include/aribtlv/types.hpp
+index 9f696d4..225e6cb 100644
+--- a/include/aribtlv/types.hpp
++++ b/include/aribtlv/types.hpp
+@@ -96,6 +96,9 @@ struct SubtitleInfo {
+     std::optional<std::uint64_t> reference_start_ntp;
+     // ARIB STD-B60 reference_start_time_leap_indicator.
+     std::uint8_t reference_start_time_leap_indicator = 0;
++    // asset_type_descriptor の additional_data_component_info は、ARIB-TTML
++    // MFU を別コンテナへ可逆に受け渡す際にも必要なので未加工のまま保持する。
++    std::vector<std::uint8_t> additional_data_component_info;
+ };
+ 
+ struct ServiceInfo {
+@@ -512,6 +515,10 @@ struct AccessUnit {
+     std::optional<std::uint8_t> subtitle_timing_mode;
+     std::vector<std::uint8_t> data;
+     std::vector<SubtitleResource> subtitle_resources;
++    // TTML 文書へ展開する前の MFU 一式。通常の TTML AccessUnit と同じ
++    // タイムスタンプで外部コンテナへ受け渡せるよう、字幕だけ保持する。
++    std::vector<std::vector<std::uint8_t>> raw_subtitle_mfus;
++    std::vector<std::uint8_t> subtitle_additional_data_component_info;
+     Timestamp pts;
+     Timestamp dts;
+     std::optional<Timestamp> source_ntp;
+diff --git a/src/c_api.cpp b/src/c_api.cpp
+index e1441e1..2b634d0 100644
+--- a/src/c_api.cpp
++++ b/src/c_api.cpp
+@@ -155,21 +155,42 @@ public:
+     }
+ 
+     void onAccessUnit(aribtlv::AccessUnit&& source) override {
+-        if (!callbacks_.on_access_unit) return;
+-        const aribtlv_access_unit event{
+-            source.track_id,
+-            codec(source.codec),
+-            source.component_tag,
+-            source.data.empty() ? nullptr : source.data.data(),
+-            source.data.size(),
+-            timestamp(source.pts),
+-            timestamp(source.dts),
+-            source.restart_offset,
+-            source.input_offset,
+-            static_cast<std::uint8_t>(source.random_access ? 1 : 0),
+-            static_cast<std::uint8_t>(source.discontinuity ? 1 : 0),
+-        };
+-        callbacks_.on_access_unit(opaque_, &event);
++        // 生の字幕 MFU は復号済み TTML AccessUnit と同じ時刻で通知する。
++        // C API の既存フィールドは変更せず、末尾へ追加した callback だけを使う。
++        if (callbacks_.on_subtitle_mfu) {
++            for (const auto& raw_mfu : source.raw_subtitle_mfus) {
++                const aribtlv_subtitle_mfu event{
++                    source.track_id,
++                    source.component_tag,
++                    source.subtitle_additional_data_component_info.empty()
++                        ? nullptr : source.subtitle_additional_data_component_info.data(),
++                    source.subtitle_additional_data_component_info.size(),
++                    raw_mfu.empty() ? nullptr : raw_mfu.data(),
++                    raw_mfu.size(),
++                    timestamp(source.pts),
++                    timestamp(source.dts),
++                    source.input_offset,
++                    static_cast<std::uint8_t>(source.discontinuity ? 1 : 0),
++                };
++                callbacks_.on_subtitle_mfu(opaque_, &event);
++            }
++        }
++        if (callbacks_.on_access_unit) {
++            const aribtlv_access_unit event{
++                source.track_id,
++                codec(source.codec),
++                source.component_tag,
++                source.data.empty() ? nullptr : source.data.data(),
++                source.data.size(),
++                timestamp(source.pts),
++                timestamp(source.dts),
++                source.restart_offset,
++                source.input_offset,
++                static_cast<std::uint8_t>(source.random_access ? 1 : 0),
++                static_cast<std::uint8_t>(source.discontinuity ? 1 : 0),
++            };
++            callbacks_.on_access_unit(opaque_, &event);
++        }
+     }
+ 
+     void onError(const aribtlv::Error& source) override {
+diff --git a/src/mmtp_media_parser.cpp b/src/mmtp_media_parser.cpp
+index 6b36bf8..04ccfa0 100644
+--- a/src/mmtp_media_parser.cpp
++++ b/src/mmtp_media_parser.cpp
+@@ -382,7 +382,8 @@ void MmtpParser::consume_complete_mfu(TrackState& track,
+     if (!slot.has_value()) {
+         slot = SubtitleAssembly::Subsample{
+             data_type,
+-            std::vector<std::uint8_t>(data + cursor, data + cursor + data_size)};
++            std::vector<std::uint8_t>(data + cursor, data + cursor + data_size),
++            std::vector<std::uint8_t>(data, data + size)};
+     }
+     if (!std::all_of(subtitle.subsamples.begin(), subtitle.subsamples.end(),
+                      [](const auto& value) { return value.has_value(); })) {
+@@ -407,7 +408,12 @@ void MmtpParser::consume_complete_mfu(TrackState& track,
+     }
+     std::vector<std::uint8_t> ttml = std::move(subtitle.subsamples[0]->data);
+     std::vector<SubtitleResource> resources;
++    std::vector<std::vector<std::uint8_t>> raw_mfus;
+     resources.reserve(subtitle.subsamples.size() - 1);
++    raw_mfus.reserve(subtitle.subsamples.size());
++    for (auto& value : subtitle.subsamples) {
++        raw_mfus.push_back(std::move(value->raw_mfu));
++    }
+     for (std::size_t index = 1; index < subtitle.subsamples.size(); ++index) {
+         auto& value = *subtitle.subsamples[index];
+         resources.push_back(SubtitleResource{
+@@ -418,7 +424,7 @@ void MmtpParser::consume_complete_mfu(TrackState& track,
+     const auto output_rap = subtitle.random_access;
+     subtitle = {};
+     emit_access_unit(track, mpu_sequence, std::move(ttml), output_rap, output_offset,
+-                     output_restart_offset, 0, std::move(resources));
++                     output_restart_offset, 0, std::move(resources), std::move(raw_mfus));
+ }
+ 
+ // ARIB STD-B60 §7.4.3.5: mpu_presentation_time is the PTS of the first access unit in
+@@ -441,7 +447,8 @@ void MmtpParser::emit_access_unit(TrackState& track, const std::uint32_t mpu_seq
+                                   const std::uint64_t input_offset,
+                                   const std::uint64_t restart_offset,
+                                   const std::uint32_t sample_number,
+-                                  std::vector<SubtitleResource> subtitle_resources) {
++                                  std::vector<SubtitleResource> subtitle_resources,
++                                  std::vector<std::vector<std::uint8_t>> raw_subtitle_mfus) {
+     std::size_t au_index = 0;
+     if (sample_number != 0) {
+         au_index = static_cast<std::size_t>(sample_number - 1);
+@@ -539,6 +546,11 @@ void MmtpParser::emit_access_unit(TrackState& track, const std::uint32_t mpu_seq
+     }
+     unit.data = std::move(data);
+     unit.subtitle_resources = std::move(subtitle_resources);
++    unit.raw_subtitle_mfus = std::move(raw_subtitle_mfus);
++    if (track.info.subtitle.has_value()) {
++        unit.subtitle_additional_data_component_info =
++            track.info.subtitle->additional_data_component_info;
++    }
+     unit.pts = Timestamp{pts_offset, track.info.timescale};
+     unit.dts = Timestamp{dts_offset, track.info.timescale};
+     unit.source_ntp = Timestamp{ntp_microseconds, 1000000};
+diff --git a/src/mmtp_parser.hpp b/src/mmtp_parser.hpp
+index fa99f83..96eec8d 100644
+--- a/src/mmtp_parser.hpp
++++ b/src/mmtp_parser.hpp
+@@ -140,6 +140,7 @@ private:
+         struct Subsample {
+             std::uint8_t data_type = 0;
+             std::vector<std::uint8_t> data;
++            std::vector<std::uint8_t> raw_mfu;
+         };
+ 
+         bool active = false;
+@@ -234,7 +235,8 @@ private:
+                           std::vector<std::uint8_t>, bool random_access,
+                           std::uint64_t input_offset, std::uint64_t restart_offset,
+                           std::uint32_t sample_number = 0,
+-                          std::vector<SubtitleResource> subtitle_resources = {});
++                          std::vector<SubtitleResource> subtitle_resources = {},
++                          std::vector<std::vector<std::uint8_t>> raw_subtitle_mfus = {});
+     void finalize_hevc(TrackState&);
+     void install_track(TrackInfo, AssetMetadata, std::uint64_t input_offset);
+     void release_all_states();
+diff --git a/src/mmtp_signalling_parser.cpp b/src/mmtp_signalling_parser.cpp
+index 55fa48f..07d78a8 100644
+--- a/src/mmtp_signalling_parser.cpp
++++ b/src/mmtp_signalling_parser.cpp
+@@ -203,6 +203,8 @@ bool parse_descriptors(ByteReader& reader, AssetMetadata& metadata,
+             if (additional_size < 8) return false;
+             metadata.language.assign(reinterpret_cast<const char*>(additional + 2), 3);
+             SubtitleInfo subtitle;
++            subtitle.additional_data_component_info.assign(
++                additional, additional + additional_size);
+             subtitle.tag = additional[0];
+             subtitle.info_version = static_cast<std::uint8_t>((additional[1] >> 4U) & 0x0fU);
+             const bool has_start_mpu_sequence_number = (additional[1] & 0x08U) != 0;

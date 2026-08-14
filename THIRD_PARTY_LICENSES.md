@@ -1376,6 +1376,68 @@ Public License instead of this License.  But first, please read
 <http://www.gnu.org/philosophy/why-not-lgpl.html>.
 ```
 
+#### libaribtlv 0.2.0
+
+- Source: <https://github.com/makeding/libaribtlv.git>
+- Fixed revision or artifact: `91bafe32479141c660a334cc03aed1f9869a18a5`
+
+##### LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2026 huggy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+#### FFmpeg libaribtlv integration patches 8.1.2
+
+- Source: <https://github.com/makeding/ffmpeg-libaribtlv.git>
+- Fixed revision or artifact: `29cc14822fae9cb8cd06bbfdd584d06aa7a6a1fa`
+
+##### LICENSE
+
+```text
+MIT License
+
+Copyright (c) 2026 huggy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 #### AMD Advanced Media Framework headers 1.4.36
 
 - Source: <https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git>
@@ -4514,10 +4576,14 @@ The fixed upstream revisions, complete local patches, dependency revisions, and 
 
 - FFmpeg source: <https://github.com/FFmpeg/FFmpeg.git>
 - FFmpeg fixed commit: `38b88335f99e76ed89ff3c93f877fdefce736c13`
+- libaribtlv source: <https://github.com/makeding/libaribtlv.git> (`91bafe32479141c660a334cc03aed1f9869a18a5`)
+- FFmpeg libaribtlv patch source: <https://github.com/makeding/ffmpeg-libaribtlv.git> (`29cc14822fae9cb8cd06bbfdd584d06aa7a6a1fa`)
 - AMF source: <https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git>
 - AMF fixed commit: `16f7d73e0b45c473e903e46981ed0b91efc4c091`
 - Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`
 - Local patches:
+  - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`d1bcd3cff61ddc0e2bba708b6929276d85b80ccb1c9473f9fbe6a94203849a15`)
+  - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`aa1d9d43bfe40ca2601a90f60090375b2acbfa33a43bf316c69f1777468e6491`)
   - `amf-1.4.36-display-capture-c.patch` (`3527641c277d534d223dcfb669fdff465be9ceca1fe60713c6dcc2880d939f25`)
 
 #### Intel media stack

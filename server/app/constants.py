@@ -97,6 +97,9 @@ LIBRARY_PATH = {
     'FFmpeg8': str(LIBRARY_DIR / 'FFmpeg8/ffmpeg8.elf'),
     'FFmpeg8AMD': str(LIBRARY_DIR / 'FFmpeg8/ffmpeg8-amd.sh'),
     'FFprobe8': str(LIBRARY_DIR / 'FFmpeg8/ffprobe8.elf'),
+    'KonomiTVBS4KTLVMetadata': str(
+        LIBRARY_DIR / 'KonomiTVBS4KTLVMetadata/KonomiTVBS4KTLVMetadata.elf'
+    ),
     'KonomiTVBS4KTSCodecBridge': str(
         LIBRARY_DIR / 'KonomiTVBS4KTSCodecBridge/ts-codec-bridge.elf'
     ),

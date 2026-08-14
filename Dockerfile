@@ -63,10 +63,13 @@ COPY ./docker/thirdparty/manifest.env \
      ./docker/thirdparty/build.sh \
      ./docker/thirdparty/build-ffmpeg8.sh \
      ./docker/thirdparty/ffmpeg8-amd.sh \
+     ./docker/thirdparty/KonomiTVBS4KTLVMetadata.cpp \
      ./docker/thirdparty/build-intel-media-stack.sh \
      ./docker/thirdparty/collect-license-manifest.py \
      /build/docker/thirdparty/
 COPY ./docker/thirdparty/patches/amf-1.4.36-display-capture-c.patch \
+     ./docker/thirdparty/patches/libaribtlv-0.2.0-konomitv-subtitle-mfu.patch \
+     ./docker/thirdparty/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch \
      ./docker/thirdparty/patches/intel-libva-standalone.patch \
      ./docker/thirdparty/patches/intel-media-driver-vpp-deinterlace-crash-fix.patch \
      ./docker/thirdparty/patches/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch \
