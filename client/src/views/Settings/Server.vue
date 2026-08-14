@@ -63,6 +63,31 @@
                     v-model="server_settings.general.mirakurun_url">
                 </v-text-field>
             </div>
+            <div class="settings__item" v-if="isSectionVisible('backend')">
+                <div class="settings__item-heading">BS4K の視聴方法</div>
+                <div class="settings__item-label">
+                    MPEG-TS は従来の受信経路を利用します。TLV は BS4K のライブ視聴だけを専用 Mirakurun / mirakc から受信します。<br>
+                    TLV を選択しても、番組情報・録画予約などの通常バックエンドは変更されません。<br>
+                    EDCB バックエンドでは、BS4K 以外のライブ視聴も従来どおり EDCB から受信できます。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :items="[{title: 'MPEG-TS', value: 'MpegTs'}, {title: 'TLV (MMT)', value: 'Tlv'}]"
+                    v-model="server_settings.general.konomitv_bs4k_live_transport">
+                </v-select>
+            </div>
+            <div class="settings__item"
+                v-if="isSectionVisible('backend') && server_settings.general.konomitv_bs4k_live_transport === 'Tlv'">
+                <div class="settings__item-heading">BS4K TLV 専用 Mirakurun / mirakc の HTTP API の URL</div>
+                <div class="settings__item-label">
+                    BS4K の TLV ストリームを decode=0 で取得できる Mirakurun / mirakc を指定してください。<br>
+                    保存時にチューナー一覧と BS4K サービス一覧を検証します。<br>
+                </div>
+                <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    v-model="server_settings.general.konomitv_bs4k_tlv_mirakurun_url">
+                </v-text-field>
+            </div>
             <div class="settings__item" v-if="isSectionVisible('streaming')">
                 <div class="settings__item-heading">通常</div>
                 <div class="settings__item-label">

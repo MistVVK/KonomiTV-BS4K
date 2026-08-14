@@ -27,6 +27,14 @@ general:
     # バックエンドに Mirakurun が選択されているときに利用されます。
     mirakurun_url: 'http://127.0.0.1:40772/'
 
+    # BS4K ライブ入力形式。MpegTs (従来経路) または Tlv (MMT/TLV 専用経路) を指定します。
+    # Tlv は BS4K ライブ視聴だけに適用され、番組情報や録画予約のバックエンドは変更しません。
+    konomitv_bs4k_live_transport: 'MpegTs'
+
+    # Tlv 選択時に BS4K TLV を decode=0 で取得する専用 Mirakurun / mirakc の URL
+    # MpegTs 選択時は null のままで構いません。
+    konomitv_bs4k_tlv_mirakurun_url: null
+
     # 利用するエンコーダー
     # BS4K のライブ視聴や録画視聴以外で使用されます。
     # FFmpeg・QSV・NVENC・AMF から選択してください。

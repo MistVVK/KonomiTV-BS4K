@@ -11,6 +11,7 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
+from urllib.parse import quote
 
 import aiofiles
 import aiohttp
@@ -50,6 +51,10 @@ from app.streams.TSCodecBridgeRuntime import TSCodecBridgeRuntimeVerifier
 from app.utils import GetMirakurunAPIEndpointURL
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.edcb.PipeStreamReader import PipeStreamReader
+from app.utils.KonomiTVBS4KMMTTLV import (
+    KonomiTVBS4KTLVSyncError,
+    KonomiTVBS4KTLVSynchronizer,
+)
 
 
 if TYPE_CHECKING:
@@ -119,6 +124,38 @@ class LiveEncodingTask:
         return self.GenerateStreamAnchorGenerationID() if stream_anchor_enabled is True else None
 
 
+    @staticmethod
+    def ResolveKonomiTVBS4KTLVChannelStreamEndpoint(service: object) -> str | None:
+        """Mirakurun service から生 TLV 用 Channel Stream API endpoint を構築する。
+
+        Args:
+            service (object): Mirakurun Service API が返した service オブジェクト。
+
+        Returns:
+            str | None: URL エンコード済み endpoint。channel 情報が不正なら None。
+        """
+
+        # Service Stream API は decode=0 でも TSFilter を通るため、MMT/TLV を取得できない。
+        # service に紐づく channel.type / channel.channel を使い、変換前の Channel Stream API を選ぶ。
+        if not isinstance(service, dict):
+            return None
+        channel = service.get('channel')
+        if not isinstance(channel, dict):
+            return None
+        channel_type = channel.get('type')
+        channel_identifier = channel.get('channel')
+        if not isinstance(channel_type, str) or not isinstance(channel_identifier, str):
+            return None
+        channel_type = channel_type.strip()
+        channel_identifier = channel_identifier.strip()
+        if channel_type == '' or channel_identifier == '':
+            return None
+        return (
+            f'/api/channels/{quote(channel_type, safe="")}/'
+            f'{quote(channel_identifier, safe="")}/stream?decode=0'
+        )
+
+
     def IsStreamAnchorEnabled(self) -> bool:
         """このライブストリームで最終 Stream Anchor を確定するか返す。"""
 
@@ -130,6 +167,7 @@ class LiveEncodingTask:
         *,
         is_radiochannel: bool = False,
         is_oneseg: bool = False,
+        is_mmt_tlv: bool = False,
     ) -> bool:
         """
         最終 TS に Stream Anchor を載せる実行条件を返す。
@@ -138,6 +176,7 @@ class LiveEncodingTask:
             is_radiochannel (bool): ラジオチャンネルかどうか。ラジオは従来 TS 経路を維持する。
             is_oneseg (bool): ワンセグかどうか。約 15fps の再エンコードでは marker/PCR が
                 Bridge の fail-closed 閾値を超えやすいため無効化する。
+            is_mmt_tlv (bool): TLV 入力かどうか。tsreadex の source marker を作れないため無効化する。
 
         Returns:
             bool: Stream Anchor を付与するなら True。
@@ -146,7 +185,8 @@ class LiveEncodingTask:
         return (
             self.IsStreamAnchorEnabled() is True and
             is_radiochannel is False and
-            is_oneseg is False
+            is_oneseg is False and
+            is_mmt_tlv is False
         )
 
 
@@ -190,6 +230,7 @@ class LiveEncodingTask:
         self,
         is_radiochannel: bool = False,
         is_oneseg: bool = False,
+        is_mmt_tlv: bool = False,
     ) -> list[str]:
         """確定 codec tuple と Stream Anchor 条件から Bridge オプションを返す。"""
 
@@ -200,7 +241,11 @@ class LiveEncodingTask:
             '--audio-codec', self.GetRequestedAudioCodec(),
         ]
         # ラジオ・ワンセグでは Stream Anchor を付けず、codec 正規化だけを行う。
-        if self.IsLiveStreamAnchorActive(is_radiochannel=is_radiochannel, is_oneseg=is_oneseg) is True:
+        if self.IsLiveStreamAnchorActive(
+            is_radiochannel = is_radiochannel,
+            is_oneseg = is_oneseg,
+            is_mmt_tlv = is_mmt_tlv,
+        ) is True:
             options.append('--stream-anchor-v1')
         if is_radiochannel is False and video_codec == 'av1':
             muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
@@ -225,6 +270,7 @@ class LiveEncodingTask:
         channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'],
         is_fullhd_channel: bool,
         is_oneseg: bool = False,
+        is_mmt_tlv: bool = False,
     ) -> list[str]:
         """現 main の単一 pipeline 向け FFmpeg 8 HW エンコードオプションを返す。"""
 
@@ -288,7 +334,7 @@ class LiveEncodingTask:
             # -flags low_delay は MPEG-2 の B フレームを復号順で出力し、表示 PTS を逆行させる。
             # demux の先読みだけを抑える -fflags nobuffer は維持する。
             options += ['-fflags', 'nobuffer']
-        options += ['-f', 'mpegts']
+        options += ['-f', 'libaribtlv' if is_mmt_tlv is True else 'mpegts']
         if input_probesize is not None:
             options += ['-probesize', input_probesize]
         options += [
@@ -409,6 +455,12 @@ class LiveEncodingTask:
                 '-af', self.LIVE_TRANSCODE_AUDIO_FILTER,
                 '-c:a', 'aac', '-aac_coder', 'twoloop', '-ac', '2', '-b:a', '96K', '-ar', '48000',
             ]
+        elif is_mmt_tlv is True:
+            # MMT の AAC-LATM はブラウザ向け MPEG-TS へそのまま copy せず、実 channel layout を保って AAC 化する。
+            options += [
+                '-af', self.LIVE_TRANSCODE_AUDIO_FILTER,
+                '-c:a', 'aac', '-aac_coder', 'twoloop', '-b:a', '192K', '-ar', '48000',
+            ]
         else:
             # 通常放送とCompatibility APIは実在AACトラックをそのまま保持し、
             # 5.1ch・dual mono・複数音声をstereoへ黙って変換しない。
@@ -426,7 +478,7 @@ class LiveEncodingTask:
             '-max_interleave_delta', f'{max_interleave_delta}K',
         ]
         # ワンセグでは Stream Anchor を無効化するため、codec Bridge が必要なときだけ固定搬送を使う。
-        if self.IsLiveStreamAnchorActive(is_oneseg=is_oneseg) is True or self.IsTSCodecBridgeRequired() is True:
+        if self.IsLiveStreamAnchorActive(is_oneseg=is_oneseg, is_mmt_tlv=is_mmt_tlv) is True or self.IsTSCodecBridgeRequired() is True:
             options += [
                 '-muxrate', ResolveKonomiTVBS4KAdvancedLiveMuxrate(
                     bitrate.video_bitrate_max,
@@ -480,6 +532,7 @@ class LiveEncodingTask:
         channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'],
         is_fullhd_channel: bool,
         is_oneseg: bool = False,
+        is_mmt_tlv: bool = False,
     ) -> list[str]:
         """
         FFmpeg に渡すオプションを組み立てる
@@ -553,7 +606,7 @@ class LiveEncodingTask:
 
         # 入力
         ## -analyzeduration をつけることで、ストリームの分析時間を短縮できる
-        input_options = '-f mpegts'
+        input_options = f'-f {"libaribtlv" if is_mmt_tlv is True else "mpegts"}'
         if input_probesize is not None:
             input_options += f' -probesize {input_probesize}'
         input_options += f' -analyzeduration {analyzeduration} -i pipe:0'
@@ -661,6 +714,12 @@ class LiveEncodingTask:
                 f'-af {self.LIVE_TRANSCODE_AUDIO_FILTER} '
                 '-acodec aac -aac_coder twoloop -ac 2 -ab 96K -ar 48000'
             )
+        elif is_mmt_tlv is True:
+            # MMT の AAC-LATM は実 channel layout を維持したまま、ブラウザ互換の AAC へ変換する。
+            options.append(
+                f'-af {self.LIVE_TRANSCODE_AUDIO_FILTER} '
+                '-acodec aac -aac_coder twoloop -ab 192K -ar 48000'
+            )
         else:
             # 通常放送とCompatibility APIは実在AACトラックをそのまま保持し、
             # 5.1ch・dual mono・複数音声をstereoへ黙って変換しない。
@@ -668,7 +727,7 @@ class LiveEncodingTask:
 
         # Bridge は PCR gap を fail closed で検証するため、Anchor / codec Bridge 経路の TS は
         # 固定 muxrate と 20ms PCR 周期で出力する。ワンセグは Anchor 無効のため codec Bridge 時のみ適用する。
-        if self.IsLiveStreamAnchorActive(is_oneseg=is_oneseg) is True or self.IsTSCodecBridgeRequired() is True:
+        if self.IsLiveStreamAnchorActive(is_oneseg=is_oneseg, is_mmt_tlv=is_mmt_tlv) is True or self.IsTSCodecBridgeRequired() is True:
             options.append(
                 f'-muxrate {ResolveKonomiTVBS4KAdvancedLiveMuxrate(bitrate.video_bitrate_max, quality=quality, video_codec=codec)} '
                 '-pcr_period 20'
@@ -972,7 +1031,11 @@ class LiveEncodingTask:
         return result
 
 
-    async def acquireMirakurunTuner(self, channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']) -> bool:
+    async def acquireMirakurunTuner(
+        self,
+        channel_type: Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K'],
+        base_url: str | None = None,
+    ) -> bool:
         """
         Mirakurun / mirakc で空きチューナーを確保できるまで待機する
         mirakc は空きチューナーがない場合に 404 を返すので (バグ？) 、それを避けるために予め空きチューナーがあるかどうかを確認する
@@ -980,13 +1043,11 @@ class LiveEncodingTask:
 
         Args:
             channel_type (Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']): チャンネルタイプ
+            base_url (str | None): 通常設定とは別の Mirakurun / mirakc URL。
 
         Returns:
             bool: チューナーを確保できたかどうか
         """
-
-        CONFIG = Config()
-        assert CONFIG.general.live_stream_backend == 'Mirakurun', 'This method is only for Mirakurun backend.'
 
         # Mirakurun / mirakc は通常チャンネルタイプが GR, BS, CS, SKY しかないので、
         # フォールバックとして BS4K を BS に、CATV を CS に変換する
@@ -1011,7 +1072,12 @@ class LiveEncodingTask:
 
                 # Mirakurun / mirakc からチューナーの状態を取得
                 try:
-                    response = await client.get(GetMirakurunAPIEndpointURL('/api/tuners'), timeout=5)
+                    tuner_endpoint_url = (
+                        GetMirakurunAPIEndpointURL('/api/tuners', base_url)
+                        if base_url is not None
+                        else GetMirakurunAPIEndpointURL('/api/tuners')
+                    )
+                    response = await client.get(tuner_endpoint_url, timeout=5)
                     # レスポンスヘッダーの server が mirakc であれば mirakc と判定できる
                     if ('server' in response.headers) and ('mirakc' in response.headers['server']):
                         mirakurun_or_mirakc = 'mirakc'
@@ -1140,9 +1206,6 @@ class LiveEncodingTask:
 
         CONFIG = Config()
 
-        # メタデータの取得元とは独立した、ライブ放送波の実際の受信元を取得する
-        LIVE_STREAM_BACKEND = CONFIG.general.live_stream_backend
-
         # まだ Standby になっていなければ、ステータスを Standby に設定
         # 基本はエンコードタスクの呼び出し元である self.live_stream.connect() の方で Standby に設定されるが、再起動の場合はそこを経由しないため必要
         if not (self.live_stream.getStatus().status == 'Standby' and self.live_stream.getStatus().detail == 'エンコードタスクを起動しています…'):
@@ -1151,10 +1214,65 @@ class LiveEncodingTask:
         # チャンネル情報からサービス ID とネットワーク ID を取得する
         channel = cast(Channel, await Channel.filter(display_channel_id=self.live_stream.display_channel_id).first())
 
+        # TLV は BS4K ライブだけの独立した入力経路とし、通常のメタデータ backend は変更しない。
+        # TS デバッグファイルは明示的に MPEG-TS なので、TLV 設定時も従来のデバッグ経路を優先する。
+        is_mmt_tlv = (
+            channel.type == 'BS4K' and
+            CONFIG.general.konomitv_bs4k_live_transport == 'Tlv' and
+            CONFIG.tv.debug_mode_ts_path is None
+        )
+        LIVE_STREAM_BACKEND: Literal['EDCB', 'Mirakurun'] = (
+            'Mirakurun' if is_mmt_tlv is True else CONFIG.general.live_stream_backend
+        )
+        tlv_mirakurun_base_url: str | None = None
+        tlv_stream_endpoint: str | None = None
+        if is_mmt_tlv is True:
+            assert CONFIG.general.konomitv_bs4k_tlv_mirakurun_url is not None
+            tlv_mirakurun_base_url = str(CONFIG.general.konomitv_bs4k_tlv_mirakurun_url)
+
+            # Mirakurun の Service Stream API は service 用 TSFilter を必ず通るため、生 TLV を返せない。
+            # 専用 Mirakurun 上の同じ NID/SID の service から実チューニング channel を解決し、
+            # TLV を変換せず返す Channel Stream API endpoint を先に確定する。
+            mirakurun_service_id = int(str(channel.network_id).zfill(5) + str(channel.service_id).zfill(5))
+            try:
+                async with HTTPX_CLIENT() as client:
+                    service_response = await client.get(
+                        GetMirakurunAPIEndpointURL(
+                            f'/api/services/{mirakurun_service_id}',
+                            tlv_mirakurun_base_url,
+                        ),
+                        headers=API_REQUEST_HEADERS,
+                        timeout=20,
+                    )
+                service_response.raise_for_status()
+                service = service_response.json()
+            except (httpx.HTTPError, ValueError):
+                logging.error(
+                    f'{self.live_stream.log_prefix} Failed to resolve MMT/TLV channel information from Mirakurun.'
+                )
+                self.live_stream.setStatus(
+                    'Offline',
+                    'TLV 入力元のチャンネル情報を取得できませんでした。設定を確認してください。(E-19T)',
+                )
+                self.live_stream.disconnectAll()
+                return
+            tlv_stream_endpoint = self.ResolveKonomiTVBS4KTLVChannelStreamEndpoint(service)
+            if tlv_stream_endpoint is None:
+                logging.error(
+                    f'{self.live_stream.log_prefix} MMT/TLV service did not contain valid channel information.'
+                )
+                self.live_stream.setStatus(
+                    'Offline',
+                    'TLV 入力元のチャンネル情報が不正です。専用 Mirakurun の設定を確認してください。(E-19T)',
+                )
+                self.live_stream.disconnectAll()
+                return
+
         # 3つのバックエンド構成のどれで動作しているかと、実際に選局するサービスを明示する
         ## 接続 URL は認証情報やローカル環境情報を含む可能性があるためログへ出力しない。
         logging.info(
-            f'{self.live_stream.log_prefix} Backend: Metadata={CONFIG.general.backend} / Live={LIVE_STREAM_BACKEND}'
+            f'{self.live_stream.log_prefix} Backend: Metadata={CONFIG.general.backend} / Live={LIVE_STREAM_BACKEND} / '
+            f'Transport={"MMT/TLV" if is_mmt_tlv is True else "MPEG-TS"}'
         )
         logging.info(
             f'{self.live_stream.log_prefix} Source: {LIVE_STREAM_BACKEND} / NID: {channel.network_id} / '
@@ -1169,6 +1287,7 @@ class LiveEncodingTask:
         stream_anchor_enabled = self.IsLiveStreamAnchorActive(
             is_radiochannel = channel.is_radiochannel,
             is_oneseg = channel.is_oneseg,
+            is_mmt_tlv = is_mmt_tlv,
         )
         codec_bridge_required = self.IsTSCodecBridgeRequired(
             is_radiochannel = channel.is_radiochannel,
@@ -1195,7 +1314,8 @@ class LiveEncodingTask:
 
         # PSI/SI データアーカイバーを初期化
         ## psisiarc は API リクエストがある度に都度起動される
-        self.live_stream.psi_data_archiver = LivePSIDataArchiver(channel.service_id)
+        if is_mmt_tlv is False:
+            self.live_stream.psi_data_archiver = LivePSIDataArchiver(channel.service_id)
 
         # ***** tsreadex プロセスの作成と実行 *****
 
@@ -1252,22 +1372,24 @@ class LiveEncodingTask:
         tsreadex_read_pipe: int | None = None
         tsreadex_write_pipe: int | None = None
         try:
-            # tsreadex の読み込み用パイプと書き込み用パイプを作成
-            tsreadex_read_pipe, tsreadex_write_pipe = os.pipe()
+            # TLV は tsreadex が解釈できないため、境界同期後の入力を FFmpeg 8 へ直接渡す。
+            if is_mmt_tlv is False:
+                # tsreadex の読み込み用パイプと書き込み用パイプを作成
+                tsreadex_read_pipe, tsreadex_write_pipe = os.pipe()
 
-            # tsreadex のプロセスを非同期で作成・実行
-            try:
-                tsreadex = await asyncio.subprocess.create_subprocess_exec(
-                    *[LIBRARY_PATH['tsreadex'], *tsreadex_options],
-                    stdin = asyncio.subprocess.PIPE,  # 受信した放送波を書き込む
-                    stdout = tsreadex_write_pipe,  # エンコーダーに繋ぐ
-                    stderr = asyncio.subprocess.DEVNULL,  # 利用しない
-                )
-            finally:
-                # tsreadex の書き込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
-                if tsreadex_write_pipe is not None:
-                    os.close(tsreadex_write_pipe)
-                    tsreadex_write_pipe = None
+                # tsreadex のプロセスを非同期で作成・実行
+                try:
+                    tsreadex = await asyncio.subprocess.create_subprocess_exec(
+                        *[LIBRARY_PATH['tsreadex'], *tsreadex_options],
+                        stdin = asyncio.subprocess.PIPE,  # 受信した放送波を書き込む
+                        stdout = tsreadex_write_pipe,  # エンコーダーに繋ぐ
+                        stderr = asyncio.subprocess.DEVNULL,  # 利用しない
+                    )
+                finally:
+                    # tsreadex の書き込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
+                    if tsreadex_write_pipe is not None:
+                        os.close(tsreadex_write_pipe)
+                        tsreadex_write_pipe = None
         except BaseException:
             # パイプ作成・tsreadex 起動中の例外やキャンセルでも、生成済みプロセスを先に停止する
             killed = self.KillSubprocesses(('tsreadex', tsreadex))
@@ -1292,8 +1414,10 @@ class LiveEncodingTask:
             await self.WaitSubprocesses(killed)
             raise
 
-        # ここまで到達した時点で tsreadex は起動済み
-        assert tsreadex is not None
+        # MPEG-TS 経路だけはここまでに tsreadex と Encoder 接続用パイプが必要になる。
+        if is_mmt_tlv is False:
+            assert tsreadex is not None
+            assert tsreadex_read_pipe is not None
 
         # エンコーダー・Bridge の生成フェーズで例外やキャンセル (オプション構築・os.pipe・サブプロセス生成の失敗など) が
         # 発生しても、生成済みの tsreadex / bridge / encoder と親プロセス側パイプが残留しないよう、生成フェーズ全体を回収スコープで覆う
@@ -1332,6 +1456,7 @@ class LiveEncodingTask:
                 bridge_options = self.BuildTSCodecBridgeOptions(
                     is_radiochannel = channel.is_radiochannel,
                     is_oneseg = channel.is_oneseg,
+                    is_mmt_tlv = is_mmt_tlv,
                 )
                 logging.info(
                     f'{self.live_stream.log_prefix} TS Codec Bridge Commands:\n'
@@ -1361,6 +1486,7 @@ class LiveEncodingTask:
             ffmpeg8_encoder_type = ENCODER_TYPE
             encoder_executable = RecordedPlaybackBackend.getExecutable(ffmpeg8_encoder_type)
             encoder_environment = RecordedPlaybackBackend.getEnvironment(ffmpeg8_encoder_type)
+            encoder_stdin = asyncio.subprocess.PIPE if is_mmt_tlv is True else tsreadex_read_pipe
 
             # FFmpeg software backend
             if ENCODER_TYPE == 'FFmpeg':
@@ -1371,7 +1497,7 @@ class LiveEncodingTask:
                     encoder_options = self.buildFFmpegOptionsForRadio()
                 else:
                     encoder_options = self.buildFFmpegOptions(
-                        self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg,
+                        self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg, is_mmt_tlv,
                     )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 Commands:\n'
@@ -1383,7 +1509,7 @@ class LiveEncodingTask:
                     encoder = await asyncio.subprocess.create_subprocess_exec(
                         encoder_executable,
                         *encoder_options,
-                        stdin = tsreadex_read_pipe,  # tsreadex からの入力
+                        stdin = encoder_stdin,  # tsreadex または同期済み TLV からの入力
                         stdout = encoder_stdout,  # Bridge またはストリーム出力へ接続
                         stderr = asyncio.subprocess.PIPE,  # ログ出力
                         env = encoder_environment,
@@ -1405,7 +1531,8 @@ class LiveEncodingTask:
                 # オプションを取得
                 hw_encoder_type = ENCODER_TYPE
                 encoder_options = self.buildFFmpeg8HardwareOptions(
-                    self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel, channel.is_oneseg,
+                    self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
+                    channel.is_oneseg, is_mmt_tlv,
                 )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 ({ENCODER_TYPE}) Commands:\n'
@@ -1417,7 +1544,7 @@ class LiveEncodingTask:
                     encoder = await asyncio.subprocess.create_subprocess_exec(
                         encoder_executable,
                         *encoder_options,
-                        stdin = tsreadex_read_pipe,  # tsreadex からの入力
+                        stdin = encoder_stdin,  # tsreadex または同期済み TLV からの入力
                         stdout = encoder_stdout,  # Bridge またはストリーム出力へ接続
                         stderr = asyncio.subprocess.PIPE,  # ログ出力
                         env = encoder_environment,
@@ -1457,8 +1584,21 @@ class LiveEncodingTask:
             await self.WaitSubprocesses(killed)
             raise
 
-        # ここまで到達した時点で tsreadex / encoder は起動済み (bridge は未使用の場合 None)
+        # ここまで到達した時点で Encoder は起動済み (tsreadex / bridge は未使用の場合 None)
         assert encoder is not None
+
+        def IsInputProcessorExited() -> bool:
+            """
+            MPEG-TS 経路の tsreadex が終了済みか返す。
+
+            Args:
+                なし。
+
+            Returns:
+                bool: tsreadex を使用中かつ終了済みなら True。
+            """
+
+            return tsreadex is not None and tsreadex.returncode is not None
 
         # ***** チューナーの起動と接続 *****
 
@@ -1493,19 +1633,33 @@ class LiveEncodingTask:
                 # チューナーを確保できるまで待機する
                 ## 確保できなかった場合でも共聴で受信できる可能性があるので、戻り値は無視する
                 self.live_stream.setStatus('Standby', 'チューナーを確保しています…')
-                await self.acquireMirakurunTuner(channel.type)
+                if tlv_mirakurun_base_url is not None:
+                    await self.acquireMirakurunTuner(channel.type, tlv_mirakurun_base_url)
+                else:
+                    await self.acquireMirakurunTuner(channel.type)
 
                 # Mirakurun 形式のサービス ID
                 # NID と SID を 5 桁でゼロ埋めした上で int に変換する
                 mirakurun_service_id = int(str(channel.network_id).zfill(5) + str(channel.service_id).zfill(5))
 
-                # Mirakurun の Service Stream API へ HTTP リクエストを開始
+                # Mirakurun の Stream API へ HTTP リクエストを開始
                 self.live_stream.setStatus('Standby', 'チューナーを起動しています…')
                 session = aiohttp.ClientSession()
                 mirakurun_stream_timeout = 40 if channel.type == 'BS4K' else 15
+                if is_mmt_tlv is True:
+                    # SMB400 側で MPEG-TS へ変換・service filter させず、放送 TLV をそのまま受け取る。
+                    assert tlv_stream_endpoint is not None
+                    stream_endpoint = tlv_stream_endpoint
+                else:
+                    stream_endpoint = f'/api/services/{mirakurun_service_id}/stream'
+                stream_endpoint_url = (
+                    GetMirakurunAPIEndpointURL(stream_endpoint, tlv_mirakurun_base_url)
+                    if tlv_mirakurun_base_url is not None
+                    else GetMirakurunAPIEndpointURL(stream_endpoint)
+                )
                 try:
                     response = await session.get(
-                        url = GetMirakurunAPIEndpointURL(f'/api/services/{mirakurun_service_id}/stream'),
+                        url = stream_endpoint_url,
                         headers = {**API_REQUEST_HEADERS, 'X-Mirakurun-Priority': '0'},
                         timeout = aiohttp.ClientTimeout(
                             connect=mirakurun_stream_timeout,
@@ -1625,18 +1779,22 @@ class LiveEncodingTask:
             tuner_ts_read_at_lock = asyncio.Lock()
             bs4k_startup_discard_seconds = (
                 CONFIG.general.bs4k_live_startup_discard_seconds
-                if channel.type == 'BS4K' and CONFIG.general.bs4k_live_startup_discard_enabled is True
+                if (
+                    channel.type == 'BS4K' and
+                    is_mmt_tlv is False and
+                    CONFIG.general.bs4k_live_startup_discard_enabled is True
+                )
                 else 0.0
             )
+            tuner_read_timeout = 40 if is_mmt_tlv is True else self.TUNER_TS_READ_TIMEOUT
 
             async def Reader() -> None:
                 nonlocal tuner_ts_read_at
 
-                # 受信した放送波が入るイテレータを作成
-                # R/W バッファ: 188B (TS Packet Size) * 256 = 48128B
+                # 受信した放送波が入るイテレータを作成する。TS はパケット整数倍、TLV は境界同期前提の 64KiB で読む。
                 async def GetIterator(
                         stream_reader: asyncio.StreamReader | PipeStreamReader | aiohttp.StreamReader,
-                        chunk_size: int = ts.PACKET_SIZE * 256,
+                        chunk_size: int,
                     ) -> AsyncIterator[bytes]:
                     while True:
                         try:
@@ -1648,7 +1806,13 @@ class LiveEncodingTask:
                             break
 
                 assert stream_reader is not None
-                stream_iterator = GetIterator(stream_reader)
+                stream_iterator = GetIterator(
+                    stream_reader,
+                    64 * 1024 if is_mmt_tlv is True else ts.PACKET_SIZE * 256,
+                )
+                tlv_synchronizer = KonomiTVBS4KTLVSynchronizer() if is_mmt_tlv is True else None
+                input_writer = encoder.stdin if is_mmt_tlv is True else (tsreadex.stdin if tsreadex is not None else None)
+                assert input_writer is not None
                 startup_discard_until = (
                     time.monotonic() + bs4k_startup_discard_seconds
                     if bs4k_startup_discard_seconds > 0
@@ -1669,29 +1833,43 @@ class LiveEncodingTask:
                         async with tuner_ts_read_at_lock:
                             tuner_ts_read_at = time.monotonic()
 
-                        # tsreadex の標準入力が閉じられていたら、タスクを終了
-                        if cast(asyncio.StreamWriter, tsreadex.stdin).is_closing():
+                        # Encoder または tsreadex の標準入力が閉じられていたら、タスクを終了
+                        if input_writer.is_closing():
                             break
+
+                        # TLV は任意 prefix・読み取り境界を吸収し、4 パケット連続で境界を確定してから渡す。
+                        if tlv_synchronizer is not None:
+                            try:
+                                chunk = tlv_synchronizer.feed(chunk)
+                            except KonomiTVBS4KTLVSyncError as ex:
+                                logging.error(f'{self.live_stream.log_prefix} MMT/TLV synchronization failed: {ex}')
+                                self.live_stream.setStatus(
+                                    'Offline',
+                                    '受信データを MMT/TLV として同期できませんでした。入力設定を確認してください。(E-19T)',
+                                )
+                                break
+                            if chunk == b'':
+                                continue
 
                         try:
                             # 生の放送波の TS パケットを PSI/SI データアーカイバーに送信する
                             ## 放送波の tsreadex への書き込みを最優先で行うため、非同期タスクとして実行する
                             ## ここで tsreadex への書き込みがブロックされると放送波の受信ループが止まり、ライブストリームの異常終了に繋がりかねない
-                            if self.live_stream.psi_data_archiver is not None:
+                            if is_mmt_tlv is False and self.live_stream.psi_data_archiver is not None:
                                 background_tasks.add(asyncio.create_task(self.live_stream.psi_data_archiver.pushTSPacketData(chunk)))
 
                             # BS4K ライブ開始直後の不安定な TS はエンコーダーへ渡さず破棄する
                             if startup_discard_until > 0 and time.monotonic() < startup_discard_until:
-                                if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                                if is_running is False or IsInputProcessorExited() is True or encoder.returncode is not None:
                                     break
                                 continue
                             if startup_discard_finished_logged is False:
                                 logging.info(f'{self.live_stream.log_prefix} BS4K startup TS discard finished.')
                                 startup_discard_finished_logged = True
 
-                            # ストリームデータを tsreadex の標準入力に書き込む
-                            cast(asyncio.StreamWriter, tsreadex.stdin).write(chunk)
-                            await cast(asyncio.StreamWriter, tsreadex.stdin).drain()
+                            # ストリームデータを tsreadex、または TLV 経路の Encoder 標準入力に書き込む
+                            input_writer.write(chunk)
+                            await input_writer.drain()
 
                         # 並列タスク処理中に何らかの例外が発生した
                         # BrokenPipeError・asyncio.TimeoutError などが想定されるが、何が発生するかわからないためすべての例外をキャッチする
@@ -1699,7 +1877,7 @@ class LiveEncodingTask:
                             break
 
                         # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
-                        if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                        if is_running is False or IsInputProcessorExited() is True or encoder.returncode is not None:
                             break
 
                 except OSError:
@@ -1707,7 +1885,7 @@ class LiveEncodingTask:
 
                 # タスクを終える前に、チューナーとの接続を明示的に閉じる
                 try:
-                    cast(asyncio.StreamWriter, tsreadex.stdin).close()
+                    input_writer.close()
                 except OSError:
                     pass
 
@@ -1779,7 +1957,7 @@ class LiveEncodingTask:
                         break
 
                     # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
-                    if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                    if is_running is False or IsInputProcessorExited() is True or encoder.returncode is not None:
                         break
 
             # 前回のチャンク書き込みから 0.025 秒以上経ったもののチャンクが 64KB に達していない際に Writer に代わってチャンク書き込みを行うタスク
@@ -1811,7 +1989,7 @@ class LiveEncodingTask:
                             chunk_written_at = time.monotonic()
 
                     # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
-                    if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                    if is_running is False or IsInputProcessorExited() is True or encoder.returncode is not None:
                         break
 
             # タスクを非同期で実行
@@ -1943,7 +2121,7 @@ class LiveEncodingTask:
                                 logging.warning(log)
 
                     # エンコードタスクが終了しているか既にエンコーダープロセスが終了していたら、タスクを終了
-                    if is_running is False or tsreadex.returncode is not None or encoder.returncode is not None:
+                    if is_running is False or IsInputProcessorExited() is True or encoder.returncode is not None:
                         break
 
                 # タスクを終える前にエンコーダーのログファイルを閉じる
@@ -2017,7 +2195,7 @@ class LiveEncodingTask:
                     # 前回チューナーからの放送波 TS を読み取ってから TUNER_TS_READ_TIMEOUT 秒以上経過していたら、
                     # 停波中もしくはチューナーからの放送波 TS の送信が停止したと判断して Offline に移行
                     async with tuner_ts_read_at_lock:
-                        if (time.monotonic() - tuner_ts_read_at) > self.TUNER_TS_READ_TIMEOUT:
+                        if (time.monotonic() - tuner_ts_read_at) > tuner_read_timeout:
 
                             # 番組名に「放送休止」などが入っていれば停波の可能性が高い
                             if program_present is None or program_present.isOffTheAirProgram():

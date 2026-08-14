@@ -249,6 +249,8 @@ class _ServerSettingsGeneral(BaseModel):
     always_receive_tv_from_mirakurun: bool = False
     edcb_url: Annotated[Url, UrlConstraints(allowed_schemes=['tcp'])] = Url('tcp://127.0.0.1:4510/')
     mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] = Url('http://127.0.0.1:40772/')
+    konomitv_bs4k_live_transport: Literal['MpegTs', 'Tlv'] = 'MpegTs'
+    konomitv_bs4k_tlv_mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] | None = None
     encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
     encoder_bs4k: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
     encoder_bs4k_input_probesize: PositiveInt = 3000
@@ -369,6 +371,102 @@ class _ServerSettingsGeneral(BaseModel):
             if info.data.get('always_receive_tv_from_mirakurun') is True:
                 logging.info(f'Always receive TV from {mirakurun_or_mirakc}.')
         return mirakurun_url
+
+    @field_validator('konomitv_bs4k_tlv_mirakurun_url')
+    def normalize_konomitv_bs4k_tlv_mirakurun_url(cls, mirakurun_url: Url | None) -> Url | None:
+        """
+        BS4K TLV 専用 Mirakurun URL の末尾をスラッシュありへ正規化する。
+
+        Args:
+            mirakurun_url (Url | None): WebUI または config.yaml から受け取った URL。
+
+        Returns:
+            Url | None: 正規化した URL。未設定なら None。
+        """
+
+        if mirakurun_url is None:
+            return None
+        return Url(str(mirakurun_url).rstrip('/') + '/')
+
+    @model_validator(mode='after')
+    def validate_konomitv_bs4k_tlv_mirakurun(self, info: ValidationInfo) -> '_ServerSettingsGeneral':
+        """
+        TLV 選択時に専用 Mirakurun の API と BS4K サービスを検証する。
+
+        Args:
+            info (ValidationInfo): bypass_validation などの検証コンテキスト。
+
+        Returns:
+            _ServerSettingsGeneral: TLV 入力元を検証済みの設定。
+        """
+
+        if type(info.context) is dict and info.context.get('bypass_validation') is True:
+            return self
+        if self.konomitv_bs4k_live_transport != 'Tlv':
+            return self
+        if self.konomitv_bs4k_tlv_mirakurun_url is None:
+            raise ValueError('BS4K ライブ入力形式が TLV の場合、TLV 専用 Mirakurun / mirakc の URL は必須です。')
+
+        # TLV 専用 URL は BS4K ライブだけが利用する独立した入力元なので、通常ライブの受信元が
+        # EDCB のままでも許可する。ここでは専用 URL 自体の接続性と BS4K サービスだけを検証する。
+        # URL には認証情報やローカル環境情報が含まれ得るため、例外・ログには URL 自体を含めない。
+        base_url = str(self.konomitv_bs4k_tlv_mirakurun_url).rstrip('/')
+        try:
+            tuners_response = httpx.get(
+                url = base_url + '/api/tuners',
+                headers = API_REQUEST_HEADERS,
+                timeout = 20,
+            )
+            services_response = httpx.get(
+                url = base_url + '/api/services',
+                headers = API_REQUEST_HEADERS,
+                timeout = 20,
+            )
+            tuners = tuners_response.json()
+            services = services_response.json()
+        except (httpx.HTTPError, ValueError):
+            raise ValueError(
+                'TLV 専用 Mirakurun / mirakc にアクセスできませんでした。\n'
+                'サービスが起動しているか、URL を確認してください。'
+            ) from None
+
+        if (
+            tuners_response.status_code != 200 or
+            services_response.status_code != 200 or
+            not isinstance(tuners, list) or
+            not isinstance(services, list)
+        ):
+            raise ValueError('TLV 専用 URL から有効な Mirakurun / mirakc API 応答を取得できませんでした。')
+
+        # 高度 BS デジタル放送の networkId は 0x000B。生 TLV は Service Stream API ではなく
+        # Channel Stream API から取得するため、実チューニング先の channel 情報も必須とする。
+        has_bs4k_service = False
+        for service in services:
+            if not isinstance(service, dict):
+                continue
+            try:
+                channel = service.get('channel')
+                if (
+                    int(service.get('networkId', -1)) == 0x000B and
+                    isinstance(channel, dict) and
+                    isinstance(channel.get('type'), str) and
+                    str(channel.get('type')).strip() != '' and
+                    isinstance(channel.get('channel'), str) and
+                    str(channel.get('channel')).strip() != ''
+                ):
+                    has_bs4k_service = True
+                    break
+            except (TypeError, ValueError):
+                continue
+        if has_bs4k_service is False:
+            raise ValueError(
+                'TLV 専用 Mirakurun / mirakc に Channel Stream API で受信可能な '
+                'BS4K サービス (networkId=11) が見つかりませんでした。'
+            )
+
+        from app import logging
+        logging.info('KonomiTV-BS4K MMT/TLV Mirakurun API validation succeeded.')
+        return self
 
     @classmethod
     def _validate_encoder_value(cls, encoder: str) -> str:

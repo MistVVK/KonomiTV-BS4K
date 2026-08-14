@@ -153,6 +153,8 @@ export interface IServerSettings {
         always_receive_tv_from_mirakurun: boolean;
         edcb_url: string;
         mirakurun_url: string;
+        konomitv_bs4k_live_transport: 'MpegTs' | 'Tlv';
+        konomitv_bs4k_tlv_mirakurun_url: string | null;
         encoder: ServerEncoder;
         encoder_bs4k: ServerEncoder;
         encoder_bs4k_input_probesize: number;
@@ -242,6 +244,8 @@ export const IServerSettingsDefault: IServerSettings = {
         always_receive_tv_from_mirakurun: false,
         edcb_url: 'tcp://127.0.0.1:4510/',
         mirakurun_url: 'http://127.0.0.1:40772/',
+        konomitv_bs4k_live_transport: 'MpegTs',
+        konomitv_bs4k_tlv_mirakurun_url: null,
         encoder: 'FFmpeg',
         encoder_bs4k: 'FFmpeg',
         encoder_bs4k_input_probesize: 3000,

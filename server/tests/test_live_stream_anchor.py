@@ -293,6 +293,40 @@ def test_oneseg_disables_stream_anchor_bridge_option_even_when_enabled(
     assert '--stream-anchor-v1' in fullseg_options
 
 
+def test_mmt_tlv_uses_libaribtlv_and_disables_source_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TLV は libaribtlv へ直結し、timed ID3 を含む全 data stream を維持する。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=True,
+        video_codec='avc',
+        audio_codec='aac',
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    software_options = task.buildFFmpegOptions('240p', 'BS4K', False, is_mmt_tlv=True)
+    hardware_options = task.buildFFmpeg8HardwareOptions(
+        '240p',
+        'QSV',
+        'BS4K',
+        False,
+        is_mmt_tlv=True,
+    )
+    bridge_options = task.BuildTSCodecBridgeOptions(is_mmt_tlv=True)
+
+    for options in (software_options, hardware_options):
+        assert options[options.index('-f') + 1] == 'libaribtlv'
+        assert options.count('0:a?') == 1
+        assert options.count('0:d?') == 1
+        assert '-ac' not in options
+    assert software_options[software_options.index('-acodec') + 1] == 'aac'
+    assert hardware_options[hardware_options.index('-c:a') + 1] == 'aac'
+    assert task.IsLiveStreamAnchorActive(is_mmt_tlv=True) is False
+    assert '--stream-anchor-v1' not in bridge_options
+
+
 def test_ffmpeg8_software_advanced_codec_uses_single_map_and_vbv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -58,12 +58,13 @@ def ClosestMultiple(n: int, multiple: int) -> int:
     return round(n / multiple) * multiple
 
 
-def GetMirakurunAPIEndpointURL(endpoint: str) -> str:
+def GetMirakurunAPIEndpointURL(endpoint: str, base_url: str | None = None) -> str:
     """
     /api/version などのエンドポイントを Mirakurun / mirakc API の URL に変換する
 
     Args:
         endpoint (str): エンドポイントのパス
+        base_url (str | None): 通常設定とは別の Mirakurun / mirakc URL。省略時は general.mirakurun_url。
 
     Returns:
         str: Mirakurun / mirakc API の URL
@@ -74,9 +75,13 @@ def GetMirakurunAPIEndpointURL(endpoint: str) -> str:
     # エンドポイントが / から始まっていない場合
     assert endpoint.startswith('/'), 'Endpoint must start with /.'
 
+    # 専用 URL が渡されなかった既存経路だけ、通常の Mirakurun 設定を参照する。
+    if base_url is None:
+        base_url = str(Config().general.mirakurun_url)
+
     # Mirakurun API は http://127.0.0.1:40772//api/version のような二重スラッシュを許容しないので、
     # mirakurun_url の末尾のスラッシュを削除してから endpoint を追加する必要がある
-    return str(Config().general.mirakurun_url).rstrip('/') + endpoint
+    return base_url.rstrip('/') + endpoint
 
 
 def GetPlatformEnvironment() -> Literal['Linux', 'Linux-Docker']:

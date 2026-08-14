@@ -260,7 +260,12 @@ class TestRunUnexpectedErrorCleanup:
         monkeypatch.setattr(
             'app.streams.LiveEncodingTask.Config',
             lambda: SimpleNamespace(
-                general=SimpleNamespace(live_stream_backend=backend, backend=backend),
+                general=SimpleNamespace(
+                    live_stream_backend=backend,
+                    backend=backend,
+                    konomitv_bs4k_live_transport='MpegTs',
+                    konomitv_bs4k_tlv_mirakurun_url=None,
+                ),
                 tv=SimpleNamespace(debug_mode_ts_path=None),
             ),
         )
@@ -321,7 +326,9 @@ class TestRunUnexpectedErrorCleanup:
         task.isFullHDChannel = lambda network_id, service_id: False  # type: ignore[method-assign]
         task.buildFFmpegOptions = lambda *args: ['-x']  # type: ignore[method-assign]
         task.IsTSCodecBridgeRequired = lambda is_radiochannel=False: bridge_required  # type: ignore[method-assign]
-        task.BuildTSCodecBridgeOptions = lambda is_radiochannel=False, is_oneseg=False: ['--x']  # type: ignore[method-assign]
+        task.BuildTSCodecBridgeOptions = (  # type: ignore[method-assign]
+            lambda is_radiochannel=False, is_oneseg=False, is_mmt_tlv=False: ['--x']
+        )
         return task, spawned, live_stream
 
     def test_mirakurun_unexpected_error_cleans_up_all_processes_and_session(

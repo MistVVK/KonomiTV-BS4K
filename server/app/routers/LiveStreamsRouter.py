@@ -10,6 +10,7 @@ from sse_starlette.sse import EventSourceResponse
 from starlette.types import Receive
 
 from app import logging, schemas
+from app.config import Config
 from app.constants import QUALITY_TYPES
 from app.models.Channel import Channel
 from app.streams.KonomiTVBS4KPlaybackCapabilities import (
@@ -350,6 +351,14 @@ async def LivePSIArchivedDataAPI(
 
     何らかの理由でライブストリームが終了しない限り、継続的にレスポンスが出力される（ストリーミング）。
     """
+
+    # MMT/TLV は MPEG-TS PSI/SI アーカイバーへ入力できない。クライアントは再生開始時にこの API を
+    # 常に接続するため、10 秒待って 500 にせず、空の正常応答でデコーダーを即座に終了させる。
+    if (
+        display_channel_id.startswith('bs4k') and
+        Config().general.konomitv_bs4k_live_transport == 'Tlv'
+    ):
+        return Response(content=b'', media_type='application/octet-stream')
 
     # 品質とオプション指定に対応する LiveStream を取得する
     # PSI/SI アーカイブデータを取得したいだけなので、接続はしない

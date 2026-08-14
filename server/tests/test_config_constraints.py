@@ -2,10 +2,25 @@ import math
 import subprocess
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
 from app.config import ClientSettings, ServerSettings, _ServerSettingsGeneral
+
+
+class _FakeMirakurunResponse:
+    """設定検証へ返す Mirakurun API 応答の代替。"""
+
+    def __init__(self, payload: object, status_code: int = 200) -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.headers = {'server': 'Mirakurun/4.1.0'}
+
+    def json(self) -> object:
+        """構築時に指定された JSON payload を返す。"""
+
+        return self._payload
 
 
 @pytest.mark.parametrize(
@@ -118,6 +133,136 @@ def test_constrained_settings_accept_valid_boundary_values() -> None:
     assert server.general.program_update_interval == 0.1
     schema = ClientSettings.model_json_schema()
     assert schema['properties']['comment_font_size']['exclusiveMinimum'] == 0
+
+
+def test_tlv_transport_requires_dedicated_mirakurun_url() -> None:
+    """BS4K TLV を選択した場合は専用 Mirakurun URL を必須にする。"""
+
+    with pytest.raises(ValidationError, match='TLV 専用 Mirakurun'):
+        _ServerSettingsGeneral.model_validate({
+            'backend': 'Mirakurun',
+            'konomitv_bs4k_live_transport': 'Tlv',
+        })
+
+
+def test_tlv_transport_accepts_edcb_for_non_bs4k_live_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BS4K だけを専用 TLV 経路にして、ほかのライブは EDCB から受信できる。"""
+
+    def Get(*, url: str, **_kwargs: object) -> _FakeMirakurunResponse:
+        if url.endswith('/api/services'):
+            return _FakeMirakurunResponse([{
+                'networkId': 0x000B,
+                'serviceId': 101,
+                'channel': {'type': 'BS4K', 'channel': '45328'},
+            }])
+        return _FakeMirakurunResponse([{'types': ['BS4K']}])
+
+    monkeypatch.setattr('app.config.httpx.get', Get)
+    settings = _ServerSettingsGeneral.model_validate({
+        'backend': 'EDCB',
+        'always_receive_tv_from_mirakurun': False,
+        'konomitv_bs4k_live_transport': 'Tlv',
+        'konomitv_bs4k_tlv_mirakurun_url': 'http://tlv.invalid',
+    })
+
+    assert settings.live_stream_backend == 'EDCB'
+    assert settings.konomitv_bs4k_live_transport == 'Tlv'
+
+
+def test_tlv_mirakurun_validation_checks_tuners_and_bs4k_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """専用 URL の tuner 一覧と BS4K service を検証し、末尾 slash を正規化する。"""
+
+    requested_urls: list[str] = []
+
+    def Get(*, url: str, **_kwargs: object) -> _FakeMirakurunResponse:
+        requested_urls.append(url)
+        if url.endswith('/api/services'):
+            return _FakeMirakurunResponse([{
+                'networkId': 0x000B,
+                'serviceId': 101,
+                'channel': {'type': 'BS4K', 'channel': '45328'},
+            }])
+        return _FakeMirakurunResponse([{'types': ['BS4K']}])
+
+    monkeypatch.setattr('app.config.httpx.get', Get)
+    settings = _ServerSettingsGeneral.model_validate({
+        'backend': 'Mirakurun',
+        'mirakurun_url': 'http://metadata.invalid',
+        'konomitv_bs4k_live_transport': 'Tlv',
+        'konomitv_bs4k_tlv_mirakurun_url': 'http://tlv.invalid/base',
+    })
+
+    assert str(settings.konomitv_bs4k_tlv_mirakurun_url) == 'http://tlv.invalid/base/'
+    assert 'http://tlv.invalid/base/api/tuners' in requested_urls
+    assert 'http://tlv.invalid/base/api/services' in requested_urls
+
+
+def test_tlv_mirakurun_validation_rejects_inventory_without_bs4k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """API が正常でも networkId 0x000B の service がなければ拒否する。"""
+
+    def Get(*, url: str, **_kwargs: object) -> _FakeMirakurunResponse:
+        if url.endswith('/api/services'):
+            return _FakeMirakurunResponse([{'networkId': 0x0004, 'serviceId': 101}])
+        return _FakeMirakurunResponse([{'types': ['BS']}])
+
+    monkeypatch.setattr('app.config.httpx.get', Get)
+    with pytest.raises(ValidationError, match='BS4K サービス'):
+        _ServerSettingsGeneral.model_validate({
+            'backend': 'Mirakurun',
+            'mirakurun_url': 'http://metadata.invalid',
+            'konomitv_bs4k_live_transport': 'Tlv',
+            'konomitv_bs4k_tlv_mirakurun_url': 'http://tlv.invalid',
+        })
+
+
+def test_tlv_mirakurun_validation_rejects_bs4k_service_without_channel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BS4K service があっても Channel Stream API 用情報がなければ拒否する。"""
+
+    def Get(*, url: str, **_kwargs: object) -> _FakeMirakurunResponse:
+        if url.endswith('/api/services'):
+            return _FakeMirakurunResponse([{'networkId': 0x000B, 'serviceId': 101}])
+        return _FakeMirakurunResponse([{'types': ['BS4K']}])
+
+    monkeypatch.setattr('app.config.httpx.get', Get)
+    with pytest.raises(ValidationError, match='Channel Stream API'):
+        _ServerSettingsGeneral.model_validate({
+            'backend': 'Mirakurun',
+            'konomitv_bs4k_live_transport': 'Tlv',
+            'konomitv_bs4k_tlv_mirakurun_url': 'http://tlv.invalid',
+        })
+
+
+def test_tlv_mirakurun_validation_hides_url_on_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """専用 URL の接続失敗メッセージへ URL や認証情報を混入させない。"""
+
+    calls = 0
+
+    def Get(*, url: str, **_kwargs: object) -> _FakeMirakurunResponse:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _FakeMirakurunResponse([{'types': ['BS']}])
+        raise httpx.ConnectError('secret-user:secret-password@tlv.invalid')
+
+    monkeypatch.setattr('app.config.httpx.get', Get)
+    with pytest.raises(ValidationError) as ex:
+        _ServerSettingsGeneral.model_validate({
+            'backend': 'Mirakurun',
+            'mirakurun_url': 'http://metadata.invalid',
+            'konomitv_bs4k_live_transport': 'Tlv',
+            'konomitv_bs4k_tlv_mirakurun_url': 'http://secret-user:secret-password@tlv.invalid',
+        })
+
+    assert 'secret-user' not in str(ex.value)
+    assert 'secret-password' not in str(ex.value)
 
 
 @pytest.mark.parametrize(
