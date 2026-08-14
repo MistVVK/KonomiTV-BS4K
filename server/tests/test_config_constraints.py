@@ -199,6 +199,26 @@ def test_tlv_mirakurun_validation_checks_tuners_and_bs4k_services(
     assert 'http://tlv.invalid/base/api/services' in requested_urls
 
 
+def test_tlv_mirakurun_temporary_outage_does_not_block_server_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BS4K 専用 TLV 入力元の一時停止中も、通常チャンネル向け設定は読み込める。"""
+
+    def Get(**_kwargs: object) -> _FakeMirakurunResponse:
+        raise httpx.ConnectError('temporarily unavailable')
+
+    monkeypatch.setattr('app.config.httpx.get', Get)
+    settings = _ServerSettingsGeneral.model_validate({
+        'backend': 'EDCB',
+        'always_receive_tv_from_mirakurun': False,
+        'konomitv_bs4k_live_transport': 'Tlv',
+        'konomitv_bs4k_tlv_mirakurun_url': 'http://tlv.invalid',
+    })
+
+    assert settings.live_stream_backend == 'EDCB'
+    assert settings.konomitv_bs4k_live_transport == 'Tlv'
+
+
 def test_tlv_mirakurun_validation_rejects_inventory_without_bs4k(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -240,8 +260,9 @@ def test_tlv_mirakurun_validation_rejects_bs4k_service_without_channel(
 
 def test_tlv_mirakurun_validation_hides_url_on_network_error(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """専用 URL の接続失敗メッセージへ URL や認証情報を混入させない。"""
+    """専用 URL の接続失敗を許容しつつ、警告ログへ URL や認証情報を混入させない。"""
 
     calls = 0
 
@@ -253,16 +274,16 @@ def test_tlv_mirakurun_validation_hides_url_on_network_error(
         raise httpx.ConnectError('secret-user:secret-password@tlv.invalid')
 
     monkeypatch.setattr('app.config.httpx.get', Get)
-    with pytest.raises(ValidationError) as ex:
-        _ServerSettingsGeneral.model_validate({
-            'backend': 'Mirakurun',
-            'mirakurun_url': 'http://metadata.invalid',
-            'konomitv_bs4k_live_transport': 'Tlv',
-            'konomitv_bs4k_tlv_mirakurun_url': 'http://secret-user:secret-password@tlv.invalid',
-        })
+    settings = _ServerSettingsGeneral.model_validate({
+        'backend': 'Mirakurun',
+        'mirakurun_url': 'http://metadata.invalid',
+        'konomitv_bs4k_live_transport': 'Tlv',
+        'konomitv_bs4k_tlv_mirakurun_url': 'http://secret-user:secret-password@tlv.invalid',
+    })
 
-    assert 'secret-user' not in str(ex.value)
-    assert 'secret-password' not in str(ex.value)
+    assert settings.konomitv_bs4k_live_transport == 'Tlv'
+    assert 'secret-user' not in caplog.text
+    assert 'secret-password' not in caplog.text
 
 
 @pytest.mark.parametrize(

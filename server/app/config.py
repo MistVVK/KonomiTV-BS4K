@@ -422,13 +422,21 @@ class _ServerSettingsGeneral(BaseModel):
                 headers = API_REQUEST_HEADERS,
                 timeout = 20,
             )
+        except httpx.HTTPError:
+            # TLV 入力元は BS4K ライブだけが利用するため、一時的な停止で通常チャンネルや録画再生まで
+            # 起動不能にしない。BS4K ライブ要求時の接続失敗は LiveEncodingTask 側で個別に通知する。
+            from app import logging
+            logging.warning(
+                'KonomiTV-BS4K MMT/TLV Mirakurun API is temporarily unavailable. '
+                'Startup will continue, but BS4K live streams may fail.'
+            )
+            return self
+
+        try:
             tuners = tuners_response.json()
             services = services_response.json()
-        except (httpx.HTTPError, ValueError):
-            raise ValueError(
-                'TLV 専用 Mirakurun / mirakc にアクセスできませんでした。\n'
-                'サービスが起動しているか、URL を確認してください。'
-            ) from None
+        except ValueError:
+            raise ValueError('TLV 専用 URL から有効な JSON 応答を取得できませんでした。') from None
 
         if (
             tuners_response.status_code != 200 or
