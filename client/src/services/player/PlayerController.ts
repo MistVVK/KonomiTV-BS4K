@@ -111,6 +111,12 @@ class PlayerController {
     // 録画末尾への直接シークと自然完走を区別するための許容誤差 (秒)
     private static readonly RECORDED_PLAYBACK_END_TOLERANCE_SECONDS = 0.25;
 
+    // 通常の録画再生で MSE に保持する前方・後方バッファの上限 (秒)
+    // hls.js は低ビットレート映像で maxBufferSize を満たすため、既定では最大600秒まで
+    // maxBufferLength を拡張する。ローカル変換ではその要求がサーバーの連続エンコードを誘発し、
+    // Chromium では大量の SourceBuffer append と描画を競合させるため、約5セグメントへ固定する。
+    private static readonly RECORDED_PLAYBACK_BUFFER_SECONDS = 30;
+
     // CM 自動スキップ先は HLS のタイムライン補正で指定位置からわずかにずれるため、その許容誤差 (秒)
     private static readonly RECORDED_CM_SKIP_TARGET_TOLERANCE_SECONDS = 1.0;
 
@@ -1134,6 +1140,15 @@ class PlayerController {
                     // startPosition に視聴履歴などから求めた再生位置を渡し、ロード開始時点で正しい Media Sequence を選択させる
                     // これを指定しないと manifest 解析後に sequence=0 からフラグメント取得が始まってしまう
                     startPosition: seek_seconds,
+                    // 通常の録画再生では低ビットレート時も前方バッファを際限なく拡張しない。
+                    // maxBufferLength だけでは maxBufferSize を満たすため maxMaxBufferLength まで伸びるので、
+                    // 両方を同じ値に固定する。後方も同じ範囲だけ残し、長時間視聴で MSE が肥大化しないようにする。
+                    maxBufferLength: offline_video === null ?
+                        PlayerController.RECORDED_PLAYBACK_BUFFER_SECONDS : Hls.DefaultConfig.maxBufferLength,
+                    maxMaxBufferLength: offline_video === null ?
+                        PlayerController.RECORDED_PLAYBACK_BUFFER_SECONDS : Hls.DefaultConfig.maxMaxBufferLength,
+                    backBufferLength: offline_video === null ?
+                        PlayerController.RECORDED_PLAYBACK_BUFFER_SECONDS : Hls.DefaultConfig.backBufferLength,
                     // カスタムバッファコントローラーを設定
                     // @ts-ignore
                     bufferController: offline_video === null ? CustomBufferController : Hls.DefaultConfig.bufferController,
