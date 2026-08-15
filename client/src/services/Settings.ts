@@ -156,6 +156,7 @@ export interface IServerSettings {
         konomitv_bs4k_live_transport: 'MpegTs' | 'Tlv';
         konomitv_bs4k_tlv_mirakurun_url: string | null;
         encoder: ServerEncoder;
+        konomitv_bs4k_live_sar_mode: 'CPU' | 'GPU';
         encoder_bs4k: ServerEncoder;
         encoder_bs4k_input_probesize: number;
         encoder_bs4k_input_analyze: number;
@@ -247,6 +248,7 @@ export const IServerSettingsDefault: IServerSettings = {
         konomitv_bs4k_live_transport: 'MpegTs',
         konomitv_bs4k_tlv_mirakurun_url: null,
         encoder: 'FFmpeg',
+        konomitv_bs4k_live_sar_mode: 'GPU',
         encoder_bs4k: 'FFmpeg',
         encoder_bs4k_input_probesize: 3000,
         encoder_bs4k_input_analyze: 1.5,

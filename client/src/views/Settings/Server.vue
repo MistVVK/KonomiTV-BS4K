@@ -105,6 +105,18 @@
                     v-model="server_settings.general.encoder">
                 </v-select>
             </div>
+            <div class="settings__item" v-if="isSectionVisible('streaming') && server_settings.general.encoder !== 'FFmpeg'">
+                <div class="settings__item-heading">SARモード</div>
+                <div class="settings__item-label">
+                    CPUを選択すると、放送中のアスペクト比を自動判断して最適な出力をします。<br>
+                    GPUは<strong>決め打ちで</strong>最終的に16:9になるように出力します。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :items="sar_mode_options"
+                    v-model="server_settings.general.konomitv_bs4k_live_sar_mode">
+                </v-select>
+            </div>
             <div class="settings__item" v-if="isSectionVisible('backend')">
                 <div class="settings__item-heading">番組情報の更新間隔 (分)</div>
                 <div class="settings__item-label">
@@ -608,6 +620,12 @@ const encoder_options = [
     {title: 'QSV (Intel Graphics 搭載 CPU / Intel Arc GPU で利用可能)', value: 'QSV'},
     {title: 'NVENC (NVIDIA GPU で利用可能)', value: 'NVENC'},
     {title: 'AMF (AMD GPU で利用可能)', value: 'AMF'},
+];
+
+// ライブ HW エンコード時の SAR (アスペクト比) モードの選択肢
+const sar_mode_options = [
+    {title: 'CPU', value: 'CPU'},
+    {title: 'GPU', value: 'GPU'},
 ];
 
 // KonomiTV 互換 API のプロファイル選択肢
