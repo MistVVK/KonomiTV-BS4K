@@ -344,6 +344,30 @@ export default class Utils {
 
 
     /**
+     * ブラウザが Chromium 系かどうか
+     * @returns ブラウザが Chromium 系なら true を返す
+     */
+    static isChromium(): boolean {
+        const brands = navigator.userAgentData?.brands;
+        if (brands !== undefined) {
+            return brands.some(brand => /Chromium|Google Chrome|Microsoft Edge|Opera|Brave/i.test(brand.brand));
+        }
+        return /Chrom(e|ium)|Edg|OPR/i.test(navigator.userAgent);
+    }
+
+
+    /**
+     * デバイスの OS がデスクトップ Linux かどうか
+     * @returns デバイスの OS がデスクトップ Linux なら true を返す
+     */
+    static isDesktopLinux(): boolean {
+        const platform = navigator.userAgentData?.platform;
+        if (platform !== undefined) return platform === 'Linux';
+        return /Linux/i.test(navigator.userAgent) && Utils.isAndroid() === false;
+    }
+
+
+    /**
      * ブラウザが Firefox かどうか
      * @returns ブラウザが Firefox なら true を返す
      */

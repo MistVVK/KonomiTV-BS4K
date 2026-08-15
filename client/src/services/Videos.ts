@@ -8,7 +8,7 @@ import type {
 
 import APIClient from  '@/services/APIClient';
 import { IChannel } from '@/services/Channels';
-import { CommentUtils, type KonomiTVBS4KPlaybackSelectableQuality, PlayerUtils } from '@/utils';
+import Utils, { CommentUtils, type KonomiTVBS4KPlaybackSelectableQuality, PlayerUtils } from '@/utils';
 
 /** ソート順序を表す型 */
 export type SortOrder = 'desc' | 'asc';
@@ -535,13 +535,17 @@ class Videos {
         konomitv_bs4k_browser_video_bit_depths?: readonly (8 | 10)[],
         signal?: AbortSignal,
     ): Promise<IKonomiTVBS4KTargetedPlaybackCapabilitiesResult> {
-        const konomitv_bs4k_video_bit_depths = this.getKonomiTVBS4KPlaybackBitDepthOrder(
+        const konomitv_bs4k_supported_video_bit_depths = this.getKonomiTVBS4KPlaybackBitDepthOrder(
             konomitv_bs4k_requested_video_codec,
             konomitv_bs4k_video_profile,
-        ).filter((konomitv_bs4k_video_bit_depth) =>
-            konomitv_bs4k_browser_video_bit_depths === undefined ||
-            konomitv_bs4k_browser_video_bit_depths.includes(konomitv_bs4k_video_bit_depth)
         );
+        // 呼び出し元がブラウザ上の優先順を確定済みなら、その順序をAPIにもそのまま渡す。
+        // 単なるfilterでサーバー既定順へ戻すと、Linux Chromium向け8bit優先が失われる。
+        const konomitv_bs4k_video_bit_depths = konomitv_bs4k_browser_video_bit_depths === undefined ?
+            konomitv_bs4k_supported_video_bit_depths :
+            konomitv_bs4k_browser_video_bit_depths.filter((konomitv_bs4k_video_bit_depth) =>
+                konomitv_bs4k_supported_video_bit_depths.includes(konomitv_bs4k_video_bit_depth)
+            );
         const konomitv_bs4k_response = await APIClient.get<IKonomiTVBS4KPlaybackCapabilities>(
             '/streams/video/konomitv-bs4k-playback-capabilities/targeted',
             {
@@ -672,9 +676,10 @@ class Videos {
         ) {
             // browser 判定を先に行い、非対応 codec のためにサーバー実 probe を起動しない。
             const konomitv_bs4k_browser_video_bit_depths =
-                this.getKonomiTVBS4KPlaybackBitDepthOrder(
+                this.getKonomiTVBS4KPreflightBitDepthOrder(
                     konomitv_bs4k_video_codec,
                     konomitv_bs4k_video_profile,
+                    konomitv_bs4k_playback_mode,
                 ).filter((konomitv_bs4k_video_bit_depth) =>
                     PlayerUtils.isKonomiTVBS4KPlaybackVideoCodecSupported(
                         konomitv_bs4k_video_codec,
@@ -727,6 +732,7 @@ class Videos {
                         konomitv_bs4k_audio_codec,
                         konomitv_bs4k_video_profile,
                         konomitv_bs4k_playback_mode,
+                        konomitv_bs4k_browser_video_bit_depths,
                     );
                 if (konomitv_bs4k_combination !== null) {
                     return {
@@ -814,6 +820,31 @@ class Videos {
             [8] : [10, 8];
     }
 
+    /** 再生開始前の実環境に合わせて、録画再生で試すbit depth順を補正する。 */
+    private static getKonomiTVBS4KPreflightBitDepthOrder(
+        konomitv_bs4k_codec: KonomiTVBS4KPlaybackVideoCodec,
+        konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
+        konomitv_bs4k_playback_mode: IKonomiTVBS4KPlaybackMode,
+    ): (8 | 10)[] {
+        const konomitv_bs4k_default_order = this.getKonomiTVBS4KPlaybackBitDepthOrder(
+            konomitv_bs4k_codec,
+            konomitv_bs4k_profile,
+        );
+        // Linux Chromium は MSE / MediaCapabilities で AV1 10bit を smooth=true と報告しても、
+        // VA-API 実装によっては最初の6秒を処理するだけで数十秒を要し、HLS sessionが失効する。
+        // AV1 自体は維持して8bitを先に試し、8bitが使えない環境では10bit候補も残す。
+        if (
+            konomitv_bs4k_playback_mode === 'Video' &&
+            konomitv_bs4k_codec === 'av1' &&
+            Utils.isChromium() === true &&
+            Utils.isDesktopLinux() === true &&
+            konomitv_bs4k_default_order.includes(8)
+        ) {
+            return [8, ...konomitv_bs4k_default_order.filter(bit_depth => bit_depth !== 8)];
+        }
+        return konomitv_bs4k_default_order;
+    }
+
     /** backend・映像・深度・音声が一致するライブ組み合わせ能力を返す。 */
     private static findKonomiTVBS4KPlaybackLiveCombination(
         konomitv_bs4k_capabilities: IKonomiTVBS4KPlaybackCapabilities,
@@ -894,9 +925,11 @@ class Videos {
         konomitv_bs4k_audio_codec: KonomiTVBS4KPlaybackAudioCodec,
         konomitv_bs4k_profile: IKonomiTVBS4KPlaybackVideoProfile,
         konomitv_bs4k_playback_mode: IKonomiTVBS4KPlaybackMode | 'LiveAndVideo' = 'LiveAndVideo',
+        konomitv_bs4k_video_bit_depth_order?: readonly (8 | 10)[],
     ): IKonomiTVBS4KResolvedPlaybackCombination | null {
         for (
             const konomitv_bs4k_video_bit_depth of
+            konomitv_bs4k_video_bit_depth_order ??
             this.getKonomiTVBS4KPlaybackBitDepthOrder(konomitv_bs4k_video_codec, konomitv_bs4k_profile)
         ) {
             const konomitv_bs4k_combination = this.resolveKonomiTVBS4KPlaybackCombinationCandidate(
