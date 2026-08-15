@@ -1,4 +1,4 @@
-"""本線の予約 API 認証境界と、KomorebiV1 互換 API の無認証 allowlist を検証する。"""
+"""本線と KomorebiV1 互換 API の予約が、upstream と同様に無認証で到達できることを検証する。"""
 
 from __future__ import annotations
 
@@ -31,14 +31,6 @@ _MAIN_RESERVATION_PATH_PREFIXES = (
 )
 
 
-class _RegularUser:
-    """一般ユーザー相当の最小スタブ。"""
-
-    id = 7
-    name = 'regular-user'
-    is_admin = False
-
-
 class _EmptyCtrlCmdUtil:
     """EDCB 通信を行わず、DB なしで空一覧レスポンスへ落とす最小スタブ。"""
 
@@ -61,10 +53,6 @@ class _EmptyCtrlCmdUtil:
 
     async def sendGetRecFilePath(self, _reserve_id: int):
         return None
-
-
-async def _GetRegularUser() -> _RegularUser:
-    return _RegularUser()
 
 
 async def _GetEmptyCtrlCmdUtil() -> _EmptyCtrlCmdUtil:
@@ -99,83 +87,24 @@ def _ClearMainAppOverrides() -> None:
     main_app.dependency_overrides.pop(ReservationConditionsRouter.GetCtrlCmdUtil, None)
 
 
-def test_main_app_reservation_routes_depend_on_get_current_user() -> None:
-    """本番 app.py が本線予約ルートへ GetCurrentUser を付与していることを構造検証する。"""
+def test_main_app_reservation_routes_do_not_require_get_current_user() -> None:
+    """本番 app.py が本線予約ルートへ GetCurrentUser を付けていないことを構造検証する。"""
 
     routes = list(_IterMainReservationRoutes())
     assert routes, '本線アプリに予約 API ルートが見つからない'
-    missing_paths = sorted({
+    authenticated_paths = sorted({
         f'{method} {route.path}'
         for route in routes
-        if not _RouteDependsOnGetCurrentUser(route)
+        if _RouteDependsOnGetCurrentUser(route)
         for method in sorted(route.methods or set())
     })
-    assert missing_paths == [], f'GetCurrentUser 未付与の本線予約ルート: {missing_paths}'
+    assert authenticated_paths == [], f'GetCurrentUser が付与された本線予約ルート: {authenticated_paths}'
 
 
-def test_main_reservation_apis_require_authentication() -> None:
-    """本番本線アプリの予約・自動予約 API は未認証で 401 になる。"""
-
-    _ClearMainAppOverrides()
-    reservation_record_settings = {
-        'is_enabled': True,
-        'priority': 2,
-        'recording_folders': [],
-        'recording_start_margin': None,
-        'recording_end_margin': None,
-        'recording_mode': 'SpecifiedService',
-        'caption_recording_mode': 'Default',
-        'data_broadcasting_recording_mode': 'Default',
-        'post_recording_mode': 'Default',
-        'post_recording_bat_file_path': None,
-        'is_event_relay_follow_enabled': True,
-        'is_exact_recording_enabled': False,
-        'is_oneseg_separate_output_enabled': False,
-        'is_sequential_recording_in_single_file_enabled': False,
-        'forced_tuner_id': None,
-    }
-
-    async def GetResponses():
-        async with HTTPXAsyncClient(transport=ASGITransport(app=main_app), base_url='http://test') as client:
-            return (
-                await client.get('/api/recording/reservations'),
-                await client.post('/api/recording/reservations', json={
-                    'program_id': 'NID1-SID2-EID3',
-                    'record_settings': reservation_record_settings,
-                }),
-                await client.put('/api/recording/reservations/1', json={
-                    'record_settings': reservation_record_settings,
-                }),
-                await client.delete('/api/recording/reservations/1'),
-                await client.get('/api/recording/conditions'),
-                await client.get('/api/recording/conditions/1'),
-                await client.post('/api/recording/conditions', json={
-                    'program_search_conditions': {
-                        'keyword': 'test',
-                    },
-                    'record_settings': reservation_record_settings,
-                }),
-                await client.put('/api/recording/conditions/1', json={
-                    'program_search_conditions': {
-                        'keyword': 'test',
-                    },
-                    'record_settings': reservation_record_settings,
-                }),
-                await client.delete('/api/recording/conditions/1'),
-            )
-
-    try:
-        responses = asyncio.run(GetResponses())
-    finally:
-        _ClearMainAppOverrides()
-    assert [response.status_code for response in responses] == [401] * len(responses)
-
-
-def test_main_reservation_apis_accept_regular_authenticated_user() -> None:
-    """本番本線アプリの予約 API は一般ユーザーの認証で到達できる。"""
+def test_main_reservation_apis_are_reachable_without_authentication() -> None:
+    """本番本線アプリの予約・自動予約 API は未認証でも一覧取得できる。"""
 
     _ClearMainAppOverrides()
-    main_app.dependency_overrides[GetCurrentUser] = _GetRegularUser
     main_app.dependency_overrides[ReservationsRouter.GetCtrlCmdUtil] = _GetEmptyCtrlCmdUtil
     main_app.dependency_overrides[ReservationConditionsRouter.GetCtrlCmdUtil] = _GetEmptyCtrlCmdUtil
 

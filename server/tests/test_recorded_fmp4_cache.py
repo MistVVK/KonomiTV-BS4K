@@ -9,7 +9,6 @@ import app.routers.SettingsRouter as settings_router_module
 import app.utils as utils_module
 import app.utils.HostPath as host_path_module
 from app.config import HostServerSettings, ServerSettings
-from app.models.User import User
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager, RecordedFMP4Variant
 
 
@@ -497,8 +496,6 @@ def test_recorded_fmp4_cache_api_returns_host_path(monkeypatch) -> None:
     monkeypatch.setattr(settings_router_module, 'Config', lambda: settings)
     monkeypatch.setattr(utils_module, 'GetPlatformEnvironment', lambda: 'Linux-Docker')
 
-    response = asyncio.run(settings_router_module.ServerSettingsAPI(
-        User(name='test-admin', password='unused', is_admin=True),
-    ))
+    response = asyncio.run(settings_router_module.ServerSettingsAPI())
 
     assert response.video.recorded_fmp4_cache_folder == Path('/mnt/recorded-cache')

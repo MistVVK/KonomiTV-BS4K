@@ -12,7 +12,6 @@ from httpx import AsyncClient as HTTPXAsyncClient
 from pydantic import TypeAdapter, ValidationError
 
 from app.metadata.RecordedPlaybackIndex import RECORDED_PLAYBACK_INDEX_VERSION
-from app.models.User import User
 from app.routers.VideosRouter import (
     BuildRecordedPlaybackIndex,
     VideoPlaybackIndexCreateAPI,
@@ -255,10 +254,7 @@ def test_metadata_analysis_blocks_index_enqueue(monkeypatch) -> None:
         lambda recorded_video_id, **_kwargs: enqueue_calls.append(recorded_video_id),
     )
 
-    index = asyncio.run(VideoPlaybackIndexCreateAPI(
-        User(name='test-user', password='unused', is_admin=False),
-        recorded_program,
-    ))
+    index = asyncio.run(VideoPlaybackIndexCreateAPI(recorded_program))
 
     assert index.state == 'Stale'
     assert enqueue_calls == []

@@ -1,4 +1,4 @@
-"""R-04: 重処理・Capture・設定 GET の権限と Capture 上限を回帰テストする。"""
+"""R-04: 重処理・設定 GET の権限と Capture 上限を回帰テストする。"""
 
 from __future__ import annotations
 
@@ -85,18 +85,12 @@ def _FindRoute(path: str, method: str) -> APIRoute:
 
 
 def test_maintenance_and_heavy_video_routes_require_admin() -> None:
-    """Maintenance 全件と手動再解析系は GetCurrentAdminUser に依存する。"""
+    """BS4K 独自の重処理と機密設定は GetCurrentAdminUser に依存する。"""
 
     admin_paths = [
-        ('POST', '/api/maintenance/update-database'),
-        ('POST', '/api/maintenance/run-batch-scan'),
         ('POST', '/api/maintenance/reanalyze-all-recorded-videos'),
         ('POST', '/api/maintenance/detect-cm-sections-for-all-recorded-videos'),
-        ('POST', '/api/maintenance/run-background-analysis'),
-        ('POST', '/api/videos/{video_id}/reanalyze'),
         ('POST', '/api/videos/{video_id}/detect-cm-sections'),
-        ('POST', '/api/videos/{video_id}/thumbnail/regenerate'),
-        ('GET', '/api/settings/server'),
         ('GET', '/api/cm-analysis/settings'),
     ]
     missing: list[str] = []
@@ -107,13 +101,32 @@ def test_maintenance_and_heavy_video_routes_require_admin() -> None:
     assert missing == [], f'GetCurrentAdminUser 未付与: {missing}'
 
 
-def test_capture_and_playback_index_require_current_user() -> None:
-    """Capture と再生索引生成はログインユーザー依存を持つ。"""
+def test_upstream_public_maintenance_and_video_routes_do_not_require_admin() -> None:
+    """upstream では無認証だった既存機能に、後付けの管理者依存が残っていない。"""
+
+    public_paths = [
+        ('POST', '/api/maintenance/update-database'),
+        ('POST', '/api/maintenance/run-batch-scan'),
+        ('POST', '/api/maintenance/run-background-analysis'),
+        ('POST', '/api/videos/{video_id}/reanalyze'),
+        ('POST', '/api/videos/{video_id}/thumbnail/regenerate'),
+        ('GET', '/api/settings/server'),
+    ]
+    authenticated_paths = [
+        f'{method} {path}'
+        for method, path in public_paths
+        if _RouteDependsOn(_FindRoute(path, method), GetCurrentAdminUser)
+    ]
+    assert authenticated_paths == [], f'GetCurrentAdminUser が残っている公開ルート: {authenticated_paths}'
+
+
+def test_capture_and_playback_index_do_not_require_current_user() -> None:
+    """Capture と再生索引生成は未ログインでも利用できる。"""
 
     capture_route = _FindRoute('/api/captures', 'POST')
-    assert _RouteDependsOn(capture_route, GetCurrentUser)
+    assert _RouteDependsOn(capture_route, GetCurrentUser) is False
     index_route = _FindRoute('/api/videos/{video_id}/playback-index', 'POST')
-    assert _RouteDependsOn(index_route, GetCurrentUser)
+    assert _RouteDependsOn(index_route, GetCurrentUser) is False
 
 
 def test_unauthenticated_sensitive_apis_return_401() -> None:
@@ -125,16 +138,9 @@ def test_unauthenticated_sensitive_apis_return_401() -> None:
         async with HTTPXAsyncClient(transport=ASGITransport(app=main_app), base_url='http://test') as client:
             # 録画 DB 依存の endpoint は GetRecordedProgram より先に auth が解決されることを確認する
             return (
-                await client.post('/api/maintenance/update-database'),
-                await client.post('/api/maintenance/run-batch-scan'),
-                await client.get('/api/settings/server'),
                 await client.get('/api/cm-analysis/settings'),
-                await client.post('/api/captures', files={
-                    'image': ('shot.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg'),
-                }),
-                await client.post('/api/videos/1/playback-index'),
-                await client.post('/api/videos/1/reanalyze'),
-                await client.post('/api/videos/1/thumbnail/regenerate'),
+                await client.post('/api/videos/1/detect-cm-sections'),
+                await client.post('/api/maintenance/reanalyze-all-recorded-videos'),
             )
 
     try:
@@ -154,26 +160,24 @@ def test_regular_user_is_forbidden_from_admin_settings_and_maintenance() -> None
     async def GetResponses():
         async with HTTPXAsyncClient(transport=ASGITransport(app=main_app), base_url='http://test') as client:
             return (
-                await client.get('/api/settings/server'),
                 await client.get('/api/cm-analysis/settings'),
-                await client.post('/api/maintenance/update-database'),
+                await client.post('/api/maintenance/reanalyze-all-recorded-videos'),
             )
 
     try:
         responses = asyncio.run(GetResponses())
     finally:
         _ClearMainAppOverrides()
-    assert [response.status_code for response in responses] == [403, 403, 403]
+    assert [response.status_code for response in responses] == [403, 403]
 
 
-def test_regular_user_can_reach_capture_endpoint_auth_boundary(
+def test_unauthenticated_user_can_upload_capture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """一般ユーザーは Capture API の認証境界を越え、保存処理まで到達できる。"""
+    """未ログインでも Capture API で保存処理まで到達できる。"""
 
     _ClearMainAppOverrides()
-    main_app.dependency_overrides[GetCurrentUser] = _GetRegularUser
     upload_dir = tmp_path / 'captures'
     upload_dir.mkdir()
     fake_config = MagicMock()
@@ -182,7 +186,7 @@ def test_regular_user_can_reach_capture_endpoint_auth_boundary(
 
     async def GetResponse():
         async with HTTPXAsyncClient(transport=ASGITransport(app=main_app), base_url='http://test') as client:
-            # 最小 JPEG を送り、auth を越えて 204 になることを確認する
+            # 最小 JPEG を送り、未認証のまま 204 になることを確認する
             return await client.post('/api/captures', files={
                 'image': ('shot.jpg', b'\xff\xd8\xff\xd9', 'image/jpeg'),
             })
@@ -193,6 +197,25 @@ def test_regular_user_can_reach_capture_endpoint_auth_boundary(
         _ClearMainAppOverrides()
     assert response.status_code == 204
     assert any(upload_dir.iterdir())
+
+
+def test_unauthenticated_user_can_read_server_settings() -> None:
+    """GET /api/settings/server は upstream と同じく未認証で取得できる。"""
+
+    _ClearMainAppOverrides()
+
+    async def GetResponse():
+        async with HTTPXAsyncClient(transport=ASGITransport(app=main_app), base_url='http://test') as client:
+            return await client.get('/api/settings/server')
+
+    try:
+        response = asyncio.run(GetResponse())
+    finally:
+        _ClearMainAppOverrides()
+    assert response.status_code == 200
+    payload = response.json()
+    assert 'general' in payload
+    assert 'backend' in payload['general']
 
 
 def test_version_api_exposes_non_sensitive_runtime_fields() -> None:
@@ -246,7 +269,7 @@ def test_capture_upload_rejects_oversize_and_removes_partial_file(
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        CapturesRouter.CaptureUploadAPI(image=upload, current_user=_RegularUser())  # type: ignore[arg-type]
+        CapturesRouter.CaptureUploadAPI(image=upload)
 
     assert exc_info.value.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE
     assert list(upload_dir.iterdir()) == []
@@ -281,7 +304,7 @@ def test_capture_upload_skips_folder_without_reserved_free_space(
         headers=Headers({'content-type': 'image/jpeg'}),
     )
     with pytest.raises(HTTPException) as exc_info:
-        CapturesRouter.CaptureUploadAPI(image=upload, current_user=_RegularUser())  # type: ignore[arg-type]
+        CapturesRouter.CaptureUploadAPI(image=upload)
     assert exc_info.value.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
     assert list(upload_dir.iterdir()) == []
 
