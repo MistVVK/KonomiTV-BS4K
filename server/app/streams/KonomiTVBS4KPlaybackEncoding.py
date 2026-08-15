@@ -298,17 +298,20 @@ def BuildKonomiTVBS4KLiveHardwareVideoFilters(
         filters.append(qsv_filter)
     elif encoder_type == 'NVENC':
         if is_interlaced is True:
+            # ISDB 1080i/480i は top-field-first。録画再生と異なり parity=auto にせず固定する。
             filters.append(
                 f'bwdif_cuda=mode={"send_field" if is_60fps is True else "send_frame"}:'
-                'parity=auto:deint=interlaced'
+                'parity=0:deint=interlaced'
             )
         filters.append(
             f'scale_cuda=w={encode_width}:h={encode_height}:format={encoder_pixel_format}'
         )
     else:
         if is_interlaced is True:
+            # deinterlace_vaapi に parity 指定は無いため auto=0 で常に解除する。
+            # auto=1 はプログレッシブ誤判定時に解除を飛ばし得るので使わない。フィールド順は bitstream に従う。
             filters.append(
-                f'deinterlace_vaapi=rate={"field" if is_60fps is True else "frame"}:auto=1'
+                f'deinterlace_vaapi=rate={"field" if is_60fps is True else "frame"}:auto=0'
             )
         filters.append(
             f'scale_vaapi=w={encode_width}:h={encode_height}:format={encoder_pixel_format}'

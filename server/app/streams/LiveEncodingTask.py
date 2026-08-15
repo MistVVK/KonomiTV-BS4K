@@ -33,12 +33,14 @@ from app.constants import (
 from app.models.Channel import Channel
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     BuildKonomiTVBS4KLiveAspectPreservingScaleFilters,
+    BuildKonomiTVBS4KLiveHardwareVideoFilters,
     KonomiTVBS4KAudioCodec,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KVideoCodec,
     ParseKonomiTVBS4KAdvancedLiveMuxrateKbps,
     ResolveKonomiTVBS4KAdvancedLiveMuxrate,
     ResolveKonomiTVBS4KLiveEncodePlan,
+    ResolveKonomiTVBS4KLiveHwDownloadFormat,
     ResolveKonomiTVBS4KPlaybackVideoBitrate,
 )
 from app.streams.LivePSIDataArchiver import LivePSIDataArchiver
@@ -287,8 +289,8 @@ class LiveEncodingTask:
         if encoder_name is None:
             raise RuntimeError(f'Unsupported FFmpeg 8 live encoder: {encoder_type}/{codec}')
 
-        # 現 main では source coordinator を持たないため、デコードと表示アスペクト処理は
-        # system memory で行い、エンコード直前だけ選択 backend へ upload する。
+        # decode も encode と同じ GPU で行うため、選択済み device へ hwaccel を接続する。
+        # QSV/AMF は probe で選ばれた render node、NVENC は CUDA device 0 を使う。
         options: list[str] = []
         selected_device: str | None = None
         if encoder_type in ('QSV', 'AMF'):
@@ -307,16 +309,23 @@ class LiveEncodingTask:
             options += [
                 '-init_hw_device', f'qsv=live_qsv:{selected_device}',
                 '-filter_hw_device', 'live_qsv',
+                '-hwaccel', 'qsv',
+                '-hwaccel_output_format', 'qsv',
             ]
         elif encoder_type == 'NVENC':
             options += [
                 '-init_hw_device', 'cuda=live_cuda:0',
                 '-filter_hw_device', 'live_cuda',
+                '-hwaccel', 'cuda',
+                '-hwaccel_output_format', 'cuda',
             ]
         elif encoder_type == 'AMF':
             options += [
                 '-init_hw_device', f'vaapi=live_vaapi:{selected_device}',
                 '-filter_hw_device', 'live_vaapi',
+                '-hwaccel', 'vaapi',
+                '-hwaccel_device', 'live_vaapi',
+                '-hwaccel_output_format', 'vaapi',
             ]
 
         input_probesize: str | None = None
@@ -359,32 +368,83 @@ class LiveEncodingTask:
             video_codec = codec,
             is_fullhd_channel = is_fullhd_channel,
         )
+
+        # decode を同じ GPU で行うようになったため、decode 直後のフレームは hardware frame になっている。
+        # SAR モードとチャンネル種別で「即 hwdownload して SW 処理する」か「そのまま GPU で処理する」かを分岐する。
+        sar_mode = config.general.konomitv_bs4k_live_sar_mode
+        is_24fps = self.live_stream.encoding_options.is_24fps_mode_enabled is True
+        # decode 直後の hwdownload が出力する system-memory 画素形式。HW 面の実フォーマットと一致させる。
+        download_format = ResolveKonomiTVBS4KLiveHwDownloadFormat(
+            encoder_type,
+            channel_type = channel_type,
+            encoder_pixel_format = codec_spec.encoder_pixel_format,
+        )
+        # SW 処理後に HW エンコーダーへ渡すための upload filter。
+        # AMF は system memory の NV12 / P010 をそのまま受け取るため upload は不要。
+        upload_filters: list[str] = []
+        if encoder_type == 'QSV':
+            upload_filters = ['hwupload=extra_hw_frames=64']
+        elif encoder_type == 'NVENC':
+            upload_filters = ['hwupload_cuda']
+
         filters: list[str] = []
-        if is_oneseg is False and channel_type != 'BS4K':
-            if self.live_stream.encoding_options.is_24fps_mode_enabled is True:
-                filters += ['pullup', 'dejudder']
-            elif QUALITY[quality].is_60fps is True:
+        if channel_type == 'BS4K':
+            # BS4K はプログレッシブ 4K のため DI せず、SAR モードに依らず常に GPU scale で 16:9 固定へ縮小する。
+            filters += BuildKonomiTVBS4KLiveHardwareVideoFilters(
+                encoder_type,
+                encode_width = encode_plan.encode_width,
+                encode_height = encode_plan.encode_height,
+                encoder_pixel_format = codec_spec.encoder_pixel_format,
+                is_interlaced = False,
+                is_60fps = QUALITY[quality].is_60fps is True,
+                low_latency = low_latency,
+            )
+        elif is_oneseg is True:
+            # ワンセグはプログレッシブ前提で DI しない。SAR モードに従い SW 追従か GPU stretch を選ぶ。
+            if sar_mode == 'CPU':
+                filters += [f'hwdownload,format={download_format}']
+                filters += BuildKonomiTVBS4KLiveAspectPreservingScaleFilters(encode_plan)
+                filters.append(f'format={codec_spec.encoder_pixel_format}')
+                filters += upload_filters
+            else:
+                filters += BuildKonomiTVBS4KLiveHardwareVideoFilters(
+                    encoder_type,
+                    encode_width = encode_plan.encode_width,
+                    encode_height = encode_plan.encode_height,
+                    encoder_pixel_format = codec_spec.encoder_pixel_format,
+                    is_interlaced = False,
+                    is_60fps = QUALITY[quality].is_60fps is True,
+                    low_latency = low_latency,
+                )
+        elif is_24fps is True:
+            # 24fps (逆テレシネ) は pullup/dejudder が SW 必須のため、SAR モードに依らず即 download して SW 経路へ落とす。
+            filters += [f'hwdownload,format={download_format}', 'pullup', 'dejudder']
+            filters += BuildKonomiTVBS4KLiveAspectPreservingScaleFilters(encode_plan)
+            filters.append(f'format={codec_spec.encoder_pixel_format}')
+            filters += upload_filters
+        elif sar_mode == 'CPU':
+            # CPU モード: decode 直後に即 download し、yadif / SAR 追従をすべて system memory で行う。
+            # vpp を挟むと SAR が落ちて画素比だけで 4:3 と誤判定されるため、decode 直後だけ download する。
+            filters += [f'hwdownload,format={download_format}']
+            if QUALITY[quality].is_60fps is True:
                 # ISDB 1080i/480i は top-field-first。auto 判定は隣接 field を逆順にし得るため固定する。
                 filters.append('yadif=mode=1:parity=0:deint=1')
             else:
                 filters.append('yadif=mode=0:parity=0:deint=1')
-        filters += BuildKonomiTVBS4KLiveAspectPreservingScaleFilters(encode_plan)
-        # HW encoder は system-memory の YUV420P ではなく NV12 / P010 を受け取る。
-        # QSV/CUDA は続く upload で hardware frame へ変換する。AMF はprobeと同じ
-        # VAAPI境界で選択済みdeviceを通した後、system-memoryの同形式へ戻して渡す。
-        filters.append(f'format={codec_spec.encoder_pixel_format}')
-        if encoder_type == 'QSV':
-            filters.append('hwupload=extra_hw_frames=64')
-        elif encoder_type == 'NVENC':
-            filters.append('hwupload_cuda')
+            filters += BuildKonomiTVBS4KLiveAspectPreservingScaleFilters(encode_plan)
+            filters.append(f'format={codec_spec.encoder_pixel_format}')
+            filters += upload_filters
         else:
-            # probeで選ばれたAMD render nodeを実経路でも通し、AMFへはsystem-memoryで戻す。
-            filters += [
-                'hwupload',
-                f'scale_vaapi=w={encode_plan.encode_width}:h={encode_plan.encode_height}:'
-                f'format={codec_spec.encoder_pixel_format}',
-                f'hwdownload,format={codec_spec.encoder_pixel_format}',
-            ]
+            # GPU モード (既定): decode から encode まで同じ GPU で DI と stretch を行い、出力だけ -aspect 16:9 にする。
+            filters += BuildKonomiTVBS4KLiveHardwareVideoFilters(
+                encoder_type,
+                encode_width = encode_plan.encode_width,
+                encode_height = encode_plan.encode_height,
+                encoder_pixel_format = codec_spec.encoder_pixel_format,
+                is_interlaced = True,
+                is_60fps = QUALITY[quality].is_60fps is True,
+                low_latency = low_latency,
+            )
         options += ['-vf', ','.join(filters)]
 
         options += [
