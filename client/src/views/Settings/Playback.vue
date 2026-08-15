@@ -200,7 +200,7 @@ const is_bs4k_low_latency_forced = computed(() =>
     versionStore.server_version_info?.bs4k_ignore_viewer_low_latency === true,
 );
 
-// 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
+// フルサーバー設定ではなく、公開 runtime 情報を参照する
 const encoder = computed(() => is_bs4k.value ?
     (versionStore.server_version_info?.encoder_bs4k ?? 'FFmpeg') :
     (versionStore.server_version_info?.encoder ?? 'FFmpeg'),

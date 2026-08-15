@@ -15,7 +15,7 @@ export interface IVersionInformation {
     environment: 'Linux' | 'Linux-Docker';
     backend: 'EDCB' | 'Mirakurun';
     encoder: ServerEncoder;
-    // フルの /settings/server は管理者専用のため、視聴経路向けの非機密 runtime 情報をここに含める
+    // フルの /settings/server はホストパスを含むため、視聴経路向けの非機密 runtime 情報をここに含める
     encoder_bs4k: ServerEncoder;
     bs4k_ignore_viewer_low_latency: boolean;
     jikkyo_enabled: boolean;

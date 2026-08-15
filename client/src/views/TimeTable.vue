@@ -149,7 +149,7 @@ const timetableStore = useTimeTableStore();
 const timetableGridRef = ref<InstanceType<typeof TimeTableGrid> | null>(null);
 
 // バックエンド種別は公開 runtime 情報 (/version) から判定する
-// フルの /settings/server は管理者専用のため、番組表では使わない
+// フルの /settings/server はホストパスを含むため、番組表では使わない
 const versionStore = useVersionStore();
 
 // EDCB バックエンドかどうか

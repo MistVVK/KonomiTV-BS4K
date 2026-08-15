@@ -222,7 +222,7 @@ export default defineComponent({
 
             // 実況機能の有効状態と録画 codec 能力の encoder を、同じ /version 応答から一度だけ確定する。
             // force=true の連続呼び出しは同一初期化で二重リクエストになるため避ける。
-            // フルの /settings/server は管理者専用のため、公開 runtime 情報を使う。
+            // フルの /settings/server はホストパスを含むため、公開 runtime 情報を使う。
             // 取得に失敗した場合は VersionStore が実況をフェイルクローズで無効として扱う。
             let version_info = offline_video !== null ? true :
                 await this.versionStore.fetchServerVersion(true, abort_controller.signal);

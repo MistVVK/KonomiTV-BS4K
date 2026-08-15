@@ -363,7 +363,7 @@ class PlayerController {
         const channels_store = useChannelsStore();
         const version_store = useVersionStore();
         if (channels_store.channel.current.display_channel_id.startsWith('bs4k')) {
-            // 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
+            // フルサーバー設定ではなく、公開 runtime 情報を参照する
             if (version_store.server_version_info?.bs4k_ignore_viewer_low_latency === true) {
                 return false;
             }
@@ -472,7 +472,7 @@ class PlayerController {
             player_store.konomitv_bs4k_playback_codec_override?.video_codec ?? saved_video_codec;
         const requested_audio_codec = offline_video?.requested_audio_codec ??
             player_store.konomitv_bs4k_playback_codec_override?.audio_codec ?? saved_audio_codec;
-        // 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
+        // フルサーバー設定ではなく、公開 runtime 情報を参照する
         const encoder = is_bs4k_stream === true ?
             (version_store.server_version_info?.encoder_bs4k ?? 'FFmpeg') :
             (version_store.server_version_info?.encoder ?? 'FFmpeg');
@@ -3791,7 +3791,7 @@ class PlayerController {
                     return false;
                 }
 
-                // 管理者専用のフルサーバー設定ではなく、公開 runtime 情報を参照する
+                // フルサーバー設定ではなく、公開 runtime 情報を参照する
                 const encoder = is_bs4k ?
                     (version_store.server_version_info?.encoder_bs4k ?? 'FFmpeg') :
                     (version_store.server_version_info?.encoder ?? 'FFmpeg');

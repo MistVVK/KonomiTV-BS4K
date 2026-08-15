@@ -1280,7 +1280,7 @@ class VersionInformation(BaseModel):
     backend: Literal['EDCB', 'Mirakurun']
     encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
     # 視聴・画質設定が必要とする非機密の runtime 情報。
-    # フルの /api/settings/server は管理者専用のため、ここに公開する。
+    # フルの /api/settings/server はホストパスを含むため、視聴経路ではこちらを使う。
     encoder_bs4k: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
     bs4k_ignore_viewer_low_latency: bool
     jikkyo_enabled: bool
