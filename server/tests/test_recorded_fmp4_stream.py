@@ -12,6 +12,7 @@ from app.streams.RecordedFMP4Stream import (
     RecordedAudioRendition,
     RecordedFMP4Segment,
     RecordedFMP4Stream,
+    RecordedPlaybackPrefetchRun,
     RecordedVideoBitrate,
 )
 
@@ -2193,6 +2194,10 @@ def _BuildOfflineVideoStream() -> RecordedFMP4Stream:
         ),
     )
     stream._is_offline_continuous = True
+    stream.session_id = 'recorded-prefetch-test'
+    stream._active_operations = 0
+    stream._playback_prefetch_run = None
+    stream._playback_prefetch_lock = asyncio.Lock()
     stream._offline_video_sequence_tasks = {}
     stream._offline_video_segment_events = {}
     stream._offline_video_encode_lock = asyncio.Lock()
@@ -2374,6 +2379,293 @@ def test_mmt_tlv_video_command_forces_libaribtlv_before_input(monkeypatch) -> No
     input_index = command.index('/recording.tlv')
     assert command[input_index - 5:input_index] == ['-f', 'libaribtlv', '-ss', '0.000000', '-i']
     assert command[command.index('-f') + 1] == 'libaribtlv'
+
+
+def test_playback_prefetch_segments_are_bounded_and_do_not_skip_cache(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """通常再生の先読みは直後2本だけを対象にし、cacheやgeneration境界を飛び越えない。"""
+
+    stream = _BuildOfflineVideoStream()
+    stream._is_offline_continuous = False
+    stream._segments = [
+        RecordedFMP4Segment(index, index * 6.0, 6.0, 0 if index < 4 else 1, 0)
+        for index in range(6)
+    ]
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__buildCachePath',
+        lambda _self, segment, is_init: tmp_path / (
+            f'init-{segment.generation}.mp4' if is_init else f'segment-{segment.sequence}.m4s'
+        ),
+    )
+
+    segments = stream._RecordedFMP4Stream__getPlaybackPrefetchSegments(  # pyright: ignore[reportPrivateUsage]
+        stream._segments[0],
+    )
+    assert [segment.sequence for segment in segments] == [1, 2]
+
+    # 直後がcache済みなら、さらに先のholeを探索して自動継続しない。
+    (tmp_path / 'segment-1.m4s').write_bytes(b'cached')
+    segments = stream._RecordedFMP4Stream__getPlaybackPrefetchSegments(  # pyright: ignore[reportPrivateUsage]
+        stream._segments[0],
+    )
+    assert segments == []
+
+    # generation境界直前からは同じgenerationに残る1本だけを対象にする。
+    segments = stream._RecordedFMP4Stream__getPlaybackPrefetchSegments(  # pyright: ignore[reportPrivateUsage]
+        stream._segments[2],
+    )
+    assert [segment.sequence for segment in segments] == [3]
+
+
+def test_playback_direct_encode_starts_one_bounded_prefetch(monkeypatch, tmp_path: Path) -> None:
+    """現在要求を単発生成した後だけ、直後2本を1回の連続encodeへまとめる。"""
+
+    async def RunSynchronously(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return function(*args, **kwargs)
+
+    async def Verify() -> None:
+        stream = _BuildOfflineVideoStream()
+        stream._is_offline_continuous = False
+        started = asyncio.Event()
+        release = asyncio.Event()
+        encoded_runs: list[list[int]] = []
+
+        def BuildPath(segment: RecordedFMP4Segment, is_init: bool) -> Path:
+            return tmp_path / ('init.mp4' if is_init else f'segment-{segment.sequence}.m4s')
+
+        async def EncodeSegment(
+            _self: RecordedFMP4Stream,
+            segment: RecordedFMP4Segment,
+            init_path: Path,
+            segment_path: Path,
+        ) -> None:
+            init_path.write_bytes(b'init')
+            segment_path.write_bytes(f'direct-{segment.sequence}'.encode())
+
+        async def EncodeContinuous(
+            _self: RecordedFMP4Stream,
+            segments: list[RecordedFMP4Segment],
+            purpose: str,
+        ) -> bool:
+            assert purpose == 'PlaybackPrefetch'
+            encoded_runs.append([segment.sequence for segment in segments])
+            started.set()
+            await release.wait()
+            for segment in segments:
+                BuildPath(segment, False).write_bytes(f'prefetch-{segment.sequence}'.encode())
+            return True
+
+        monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__encodeSegment', EncodeSegment)
+        monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__encodeContinuousVideoRun', EncodeContinuous)
+        monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__getBackend', lambda _self: 'FFmpeg')
+        monkeypatch.setattr(
+            RecordedFMP4Stream,
+            '_RecordedFMP4Stream__buildCachePath',
+            lambda _self, segment, is_init: BuildPath(segment, is_init),
+        )
+        monkeypatch.setattr(
+            RecordedFMP4Stream,
+            '_RecordedFMP4Stream__acquire',
+            AsyncMock(side_effect=lambda _path: _ImmediatePathLock()),
+        )
+        monkeypatch.setattr(
+            'app.streams.RecordedFMP4Stream.RecordedPlaybackBackend.isCombinationSupported',
+            staticmethod(lambda *_args, **_kwargs: True),
+        )
+        monkeypatch.setattr(asyncio, 'to_thread', RunSynchronously)
+
+        data = await stream._RecordedFMP4Stream__getVideoSegment(  # pyright: ignore[reportPrivateUsage]
+            0,
+            should_start_playback_prefetch=True,
+        )
+        await started.wait()
+        run = stream._playback_prefetch_run
+        assert run is not None
+        assert [segment.sequence for segment in run.segments] == [1, 2]
+        assert data == b'direct-0'
+        assert encoded_runs == [[1, 2]]
+
+        release.set()
+        await run.task
+        assert stream._playback_prefetch_run is None
+
+    asyncio.run(Verify())
+
+
+def test_playback_cache_hit_does_not_chain_prefetch(monkeypatch, tmp_path: Path) -> None:
+    """先読みcacheを返した要求から次の先読みを起動せず、ファイル末尾への連鎖を防ぐ。"""
+
+    async def RunSynchronously(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return function(*args, **kwargs)
+
+    stream = _BuildOfflineVideoStream()
+    stream._is_offline_continuous = False
+    init_path = tmp_path / 'init.mp4'
+    segment_path = tmp_path / 'segment-0.m4s'
+    init_path.write_bytes(b'init')
+    segment_path.write_bytes(b'cached-media')
+    start_prefetch = AsyncMock()
+    encode_segment = AsyncMock()
+
+    monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__startPlaybackPrefetchAfter', start_prefetch)
+    monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__encodeSegment', encode_segment)
+    monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__getBackend', lambda _self: 'FFmpeg')
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__buildCachePath',
+        lambda _self, segment, is_init: init_path if is_init else tmp_path / f'segment-{segment.sequence}.m4s',
+    )
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__acquire',
+        AsyncMock(side_effect=lambda _path: _ImmediatePathLock()),
+    )
+    monkeypatch.setattr(
+        'app.streams.RecordedFMP4Stream.RecordedPlaybackBackend.isCombinationSupported',
+        staticmethod(lambda *_args, **_kwargs: True),
+    )
+    monkeypatch.setattr(asyncio, 'to_thread', RunSynchronously)
+
+    data = asyncio.run(stream._RecordedFMP4Stream__getVideoSegment(  # pyright: ignore[reportPrivateUsage]
+        0,
+        should_start_playback_prefetch=True,
+    ))
+
+    assert data == b'cached-media'
+    encode_segment.assert_not_awaited()
+    start_prefetch.assert_not_awaited()
+
+
+def test_playback_request_waits_for_active_prefetch_without_duplicate_encode(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """先読み対象の要求は共有taskを待ち、同じsequenceを単発で重複生成しない。"""
+
+    async def RunSynchronously(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return function(*args, **kwargs)
+
+    async def Verify() -> None:
+        stream = _BuildOfflineVideoStream()
+        stream._is_offline_continuous = False
+        init_path = tmp_path / 'init.mp4'
+        release = asyncio.Event()
+
+        async def FinishPrefetch() -> bool:
+            await release.wait()
+            init_path.write_bytes(b'init')
+            (tmp_path / 'segment-1.m4s').write_bytes(b'prefetched-media')
+            return True
+
+        prefetch_task = asyncio.create_task(FinishPrefetch())
+        stream._playback_prefetch_run = RecordedPlaybackPrefetchRun(
+            segments=(stream._segments[1], stream._segments[2]),
+            task=prefetch_task,
+        )
+        encode_segment = AsyncMock()
+        start_prefetch = AsyncMock()
+        monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__encodeSegment', encode_segment)
+        monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__startPlaybackPrefetchAfter', start_prefetch)
+        monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__getBackend', lambda _self: 'FFmpeg')
+        monkeypatch.setattr(
+            RecordedFMP4Stream,
+            '_RecordedFMP4Stream__buildCachePath',
+            lambda _self, segment, is_init: init_path if is_init else tmp_path / f'segment-{segment.sequence}.m4s',
+        )
+        monkeypatch.setattr(
+            RecordedFMP4Stream,
+            '_RecordedFMP4Stream__acquire',
+            AsyncMock(side_effect=lambda _path: _ImmediatePathLock()),
+        )
+        monkeypatch.setattr(
+            'app.streams.RecordedFMP4Stream.RecordedPlaybackBackend.isCombinationSupported',
+            staticmethod(lambda *_args, **_kwargs: True),
+        )
+        monkeypatch.setattr(asyncio, 'to_thread', RunSynchronously)
+
+        request_task = asyncio.create_task(stream._RecordedFMP4Stream__getVideoSegment(  # pyright: ignore[reportPrivateUsage]
+            1,
+            should_start_playback_prefetch=True,
+        ))
+        await asyncio.sleep(0)
+        assert request_task.done() is False
+
+        release.set()
+        assert await request_task == b'prefetched-media'
+        encode_segment.assert_not_awaited()
+        start_prefetch.assert_not_awaited()
+        stream._playback_prefetch_run = None
+
+    asyncio.run(Verify())
+
+
+def test_priority_video_request_cancels_unrelated_playback_prefetch() -> None:
+    """実行範囲外へのシークでは古い先読みを回収してから現在要求を優先する。"""
+
+    async def Verify() -> None:
+        stream = _BuildOfflineVideoStream()
+        stream._is_offline_continuous = False
+
+        async def HoldPrefetch() -> bool:
+            await asyncio.Event().wait()
+            return True
+
+        task = asyncio.create_task(HoldPrefetch())
+        stream._playback_prefetch_run = RecordedPlaybackPrefetchRun(
+            segments=(stream._segments[1], stream._segments[2]),
+            task=task,
+        )
+        await asyncio.sleep(0)
+
+        result = await stream._RecordedFMP4Stream__preparePlaybackPrefetchRequest(3)  # pyright: ignore[reportPrivateUsage]
+
+        assert result is None
+        assert stream._playback_prefetch_run is None
+        assert task.cancelled()
+
+    asyncio.run(Verify())
+
+
+def test_video_init_generation_never_starts_playback_prefetch(monkeypatch, tmp_path: Path) -> None:
+    """HLS MAP用のinit生成は現在segmentだけを生成し、後続先読みを開始しない。"""
+
+    async def RunSynchronously(function, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return function(*args, **kwargs)
+
+    stream = _BuildOfflineVideoStream()
+    stream._is_offline_continuous = False
+    init_path = tmp_path / 'init.mp4'
+    received_prefetch_flags: list[bool] = []
+
+    async def GetVideoSegment(
+        _self: RecordedFMP4Stream,
+        _sequence: int,
+        should_start_playback_prefetch: bool = False,
+    ) -> bytes:
+        received_prefetch_flags.append(should_start_playback_prefetch)
+        init_path.write_bytes(b'generated-init')
+        return b'media'
+
+    monkeypatch.setattr(RecordedFMP4Stream, '_RecordedFMP4Stream__getVideoSegment', GetVideoSegment)
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__buildCachePath',
+        lambda _self, _segment, is_init: init_path if is_init else tmp_path / 'segment-0.m4s',
+    )
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__acquire',
+        AsyncMock(side_effect=lambda _path: _ImmediatePathLock()),
+    )
+    monkeypatch.setattr(asyncio, 'to_thread', RunSynchronously)
+
+    result = asyncio.run(stream.getVideoInitSegment(0, 0))
+
+    assert result == b'generated-init'
+    assert received_prefetch_flags == [False]
 
 
 def test_playback_video_segment_still_encodes_one_fragment(monkeypatch, tmp_path: Path) -> None:

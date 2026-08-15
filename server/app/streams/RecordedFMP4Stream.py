@@ -60,6 +60,16 @@ class RecordedFMP4Segment:
     transcoded_audio_sample_count: int | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RecordedPlaybackPrefetchRun:
+    """通常再生で後続映像をまとめて生成する単一の先読み実行を表す。"""
+
+    # この実行が生成する、同じ映像 generation の連続セグメント。
+    segments: tuple[RecordedFMP4Segment, ...]
+    # セッション破棄・シーク時にキャンセルし、対象要求から完了を待つ共有 task。
+    task: asyncio.Task[bool]
+
+
 RecordedVideoBitrate = KonomiTVBS4KPlaybackVideoBitrate
 
 
@@ -130,6 +140,10 @@ class RecordedFMP4Stream:
     MAX_ENCODER_WAITERS: ClassVar[int] = 32
     SESSION_TIMEOUT: ClassVar[float] = 30.0
     SEEK_PREROLL_SECONDS: ClassVar[float] = 10.0
+    # 現在要求は既存の単発経路で確実に返し、その直後だけを短い連続encodeへまとめる。
+    # 2セグメントなら約12秒で、6秒の再生中に完了しやすくしつつ、単発2回分のprerollを1回へ減らせる。
+    PLAYBACK_PREFETCH_MAX_SEGMENTS: ClassVar[int] = 2
+    PLAYBACK_PREFETCH_MAX_DURATION_SECONDS: ClassVar[float] = 18.0
     AAC_ENCODER_DELAY_SAMPLES: ClassVar[int] = 1024
     AAC_PACKET_SAMPLES: ClassVar[int] = 1024
     AUDIO_SAMPLE_RATE: ClassVar[int] = 48_000
@@ -178,6 +192,10 @@ class RecordedFMP4Stream:
     _active_operations: int
     # Keep-Aliveが途切れたセッションを破棄するイベントループタイマー。
     _destroy_handle: asyncio.TimerHandle
+    # 通常再生で現在実行中の短い後続先読み。キャッシュヒットから自動継続しない。
+    _playback_prefetch_run: RecordedPlaybackPrefetchRun | None
+    # 先読みの起動・シーク時キャンセル・完了時の参照解除を直列化する。
+    _playback_prefetch_lock: asyncio.Lock
     # オフライン保存セッションだけ、未キャッシュ映像区間を連続encodeする。
     _is_offline_continuous: bool
     # 連続encode中の sequence から実行中 Task への対応。同一区間の重複起動を防ぐ。
@@ -229,6 +247,8 @@ class RecordedFMP4Stream:
             instance._referenced_paths = set()
             instance._completed_sequences = set()
             instance._active_operations = 0
+            instance._playback_prefetch_run = None
+            instance._playback_prefetch_lock = asyncio.Lock()
             instance._offline_video_sequence_tasks = {}
             instance._offline_video_segment_events = {}
             instance._offline_video_encode_lock = asyncio.Lock()
@@ -589,6 +609,16 @@ class RecordedFMP4Stream:
         if self._instances.get(self.session_id) is not self:
             return
         self._destroy_handle.cancel()
+        # 通常再生の先読みはオフライン保存taskと独立しているため、先に参照から外して回収する。
+        # taskのfinallyも同じlockを取得するので、lock外へ出てから完了を待つ。
+        playback_prefetch_task: asyncio.Task[bool] | None = None
+        async with self._playback_prefetch_lock:
+            if self._playback_prefetch_run is not None:
+                playback_prefetch_task = self._playback_prefetch_run.task
+                self._playback_prefetch_run = None
+                playback_prefetch_task.cancel()
+        if playback_prefetch_task is not None:
+            await asyncio.gather(playback_prefetch_task, return_exceptions=True)
         offline_video_tasks = set(self._offline_video_sequence_tasks.values())
         for task in offline_video_tasks:
             task.cancel()
@@ -1463,19 +1493,34 @@ class RecordedFMP4Stream:
             # initは数KB以下の小さな固定データなので、executorへ渡すより同期読込の方が
             # 境界MAPへの応答を確実に即時化できる。
             return init_path.read_bytes()
-        await self.getVideoSegment(sequence)
+        # MAP取得は通常のmedia要求ではない。ここから先読みを開始すると、プレイリストにある
+        # 別generationのMAP取得同士が先読みをキャンセルし合うため、現在segmentだけを生成する。
+        async with self.__activeOperation():
+            await self.__getVideoSegment(sequence, should_start_playback_prefetch=False)
         if init_path.is_file() is False:
             return None
         return await asyncio.to_thread(init_path.read_bytes)
 
     async def getVideoSegment(self, sequence: int) -> bytes | None:
-        """要求シーケンスのAVC映像fragmentを生成またはキャッシュから返す。"""
+        """要求シーケンスの映像fragmentを生成またはキャッシュから返す。"""
 
         async with self.__activeOperation():
-            return await self.__getVideoSegment(sequence)
+            return await self.__getVideoSegment(sequence, should_start_playback_prefetch=True)
 
-    async def __getVideoSegment(self, sequence: int) -> bytes | None:
-        """映像fragment生成の本体処理を行う。"""
+    async def __getVideoSegment(
+        self,
+        sequence: int,
+        should_start_playback_prefetch: bool = False,
+    ) -> bytes | None:
+        """映像fragment生成の本体処理を行う。
+
+        Args:
+            sequence: 取得するHLSメディアシーケンス。
+            should_start_playback_prefetch: 通常のmedia要求として後続先読みを許可するか。
+
+        Returns:
+            生成済み映像fragment。生成できない場合はNone。
+        """
 
         self.keepAlive()
         segment = self.__getSegment(sequence)
@@ -1491,10 +1536,28 @@ class RecordedFMP4Stream:
                 status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail = {'code': 'UnsupportedCombination', 'message': 'The requested recorded encoding is unavailable.'},
             )
+        is_offline_continuous = getattr(self, '_is_offline_continuous', False)
+
+        # 先読み対象なら共有taskの完了を待ち、範囲外要求なら古い方向の先読みを先に回収する。
+        # path lockを保持したまま待つと、先読み側のatomic公開と相互待ちになるため必ず先に行う。
+        if is_offline_continuous is False and should_start_playback_prefetch is True:
+            playback_prefetch_task = await self.__preparePlaybackPrefetchRequest(sequence)
+            if playback_prefetch_task is not None:
+                try:
+                    await asyncio.shield(playback_prefetch_task)
+                except asyncio.CancelledError:
+                    # シークで共有先読みだけがcancelされた場合は単発生成へフォールバックする。
+                    # HTTP要求自体がcancelされた場合は、そのキャンセルを握り潰さず呼び出し元へ返す。
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling() > 0:
+                        raise
+
         segment_path = self.__buildCachePath(segment, is_init=False)
         init_path = self.__buildCachePath(segment, is_init=True)
         segment_lock = await self.__acquire(segment_path)
         await self.__acquire(init_path)
+        segment_data: bytes | None = None
+        did_encode_current_segment = False
         async with segment_lock:
             # fragmentだけが残り、対になるinitが遅延削除済みなら再生成する。
             # 片方だけをキャッシュヒットとして返すと、呼び出し元は再生不能なfragmentを受け取ってしまう。
@@ -1508,8 +1571,9 @@ class RecordedFMP4Stream:
                         self.__getOfflineVideoWorkKey(segment.generation),
                         1.0,
                     )
-                return await asyncio.to_thread(segment_path.read_bytes)
-            if getattr(self, '_is_offline_continuous', False) is False:
+                segment_data = await asyncio.to_thread(segment_path.read_bytes)
+            elif is_offline_continuous is False:
+                # 現在必要なfragmentは実績のある単発経路で確定し、後続先読みの成否へ依存させない。
                 await self.__encodeSegment(segment, init_path, segment_path)
                 # fragment 単体を成功扱いすると、直後の MAP 取得だけが失敗するため、
                 # 通常再生でも対応する init と fragment の両方が揃った場合だけ返す。
@@ -1517,11 +1581,24 @@ class RecordedFMP4Stream:
                     return None
                 self._completed_sequences.add(sequence)
                 self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
-                return await asyncio.to_thread(segment_path.read_bytes)
-            # 連続encodeの書き込みは別taskがpath lockを取るため、待ちに入る前に解放する。
-            await self.__startOfflineVideoEncodeIfNeeded(segment)
+                segment_data = await asyncio.to_thread(segment_path.read_bytes)
+                did_encode_current_segment = True
+            else:
+                # 連続encodeの書き込みは別taskがpath lockを取るため、待ちに入る前に解放する。
+                await self.__startOfflineVideoEncodeIfNeeded(segment)
 
-        if self._is_offline_continuous is True:
+        if is_offline_continuous is False:
+            # キャッシュヒットや先読みtaskの成果からは次を起動しない。直接単発生成した要求だけを
+            # 起点にすることで、短い先読みがファイル末尾まで自動連鎖することを防ぐ。
+            if (
+                segment_data is not None and
+                did_encode_current_segment is True and
+                should_start_playback_prefetch is True
+            ):
+                await self.__startPlaybackPrefetchAfter(segment)
+            return segment_data
+
+        if is_offline_continuous is True:
             await self.__waitOfflineVideoSegment(segment)
             async with segment_lock:
                 # 連続生成 task の完了通知後にも、必ず init / fragment の組を再検査する。
@@ -2125,6 +2202,147 @@ class RecordedFMP4Stream:
         await RecordedFMP4CacheManager.writeAtomic(segment_path, media_data)
         return True
 
+    def __getPlaybackPrefetchSegments(
+        self,
+        current_segment: RecordedFMP4Segment,
+    ) -> list[RecordedFMP4Segment]:
+        """直接生成した現在fragmentの直後から、短い未キャッシュ連続区間を返す。
+
+        Args:
+            current_segment: browserへ返すため単発生成した現在のセグメント。
+
+        Returns:
+            同じ映像generation内で本数・媒体時間上限に収まる後続セグメント。
+        """
+
+        segments: list[RecordedFMP4Segment] = []
+        total_duration = 0.0
+        sequence = current_segment.sequence + 1
+        while sequence < len(self._segments):
+            segment = self._segments[sequence]
+            # codec configurationが変わる境界を単一の連続encodeへ混在させない。
+            if segment.generation != current_segment.generation:
+                break
+            # cache済み区間を飛び越して遠方のholeを生成すると、cache hitだけで先読みが
+            # ファイル末尾まで連鎖するため、直後からの連続holeだけを対象にする。
+            if self.__buildCachePath(segment, is_init=False).is_file():
+                break
+            if len(segments) >= self.PLAYBACK_PREFETCH_MAX_SEGMENTS:
+                break
+            if total_duration + segment.duration > self.PLAYBACK_PREFETCH_MAX_DURATION_SECONDS:
+                break
+            segments.append(segment)
+            total_duration += segment.duration
+            sequence += 1
+        return segments
+
+    async def __preparePlaybackPrefetchRequest(self, sequence: int) -> asyncio.Task[bool] | None:
+        """現在要求を実行中の先読みに接続し、範囲外なら古い先読みを回収する。
+
+        Args:
+            sequence: browserが現在必要としているシーケンス。
+
+        Returns:
+            このsequenceを生成中なら共有task。それ以外はNone。
+        """
+
+        task_to_cancel: asyncio.Task[bool] | None = None
+        async with self._playback_prefetch_lock:
+            run = self._playback_prefetch_run
+            if run is None:
+                return None
+            if any(segment.sequence == sequence for segment in run.segments):
+                return run.task
+            # シーク先を含まない実行は参照から先に外す。taskのfinallyも同じlockを取るため、
+            # cancel完了はlock外で待たなければデッドロックする。
+            self._playback_prefetch_run = None
+            if run.task.done() is False:
+                task_to_cancel = run.task
+                task_to_cancel.cancel()
+        if task_to_cancel is not None:
+            await asyncio.gather(task_to_cancel, return_exceptions=True)
+            logging.info(
+                '[RecordedFMP4Stream] Cancelled playback prefetch for a priority segment request. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, sequence: {sequence}]'
+            )
+        return None
+
+    async def __startPlaybackPrefetchAfter(self, current_segment: RecordedFMP4Segment) -> None:
+        """現在fragmentの直後だけを単一FFmpegで短く先読みする。
+
+        Args:
+            current_segment: browserへ返すため単発生成した現在のセグメント。
+
+        Returns:
+            None
+        """
+
+        async with self._playback_prefetch_lock:
+            # 1セッションにつき1本だけを許可し、完了後もcache hitから自動継続しない。
+            if self._playback_prefetch_run is not None:
+                return
+            segments = self.__getPlaybackPrefetchSegments(current_segment)
+            if len(segments) == 0:
+                return
+            immutable_segments = tuple(segments)
+            task = asyncio.create_task(self.__encodePlaybackPrefetchRun(immutable_segments))
+            self._playback_prefetch_run = RecordedPlaybackPrefetchRun(
+                segments=immutable_segments,
+                task=task,
+            )
+            logging.info(
+                '[RecordedFMP4Stream] Started bounded playback prefetch. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                f'start_sequence: {segments[0].sequence}, end_sequence: {segments[-1].sequence}, '
+                f'count: {len(segments)}]'
+            )
+
+    async def __encodePlaybackPrefetchRun(
+        self,
+        segments: tuple[RecordedFMP4Segment, ...],
+    ) -> bool:
+        """短い後続区間を連続encodeし、実行参照を必ず解除する。
+
+        Args:
+            segments: 同じ映像generationの後続セグメント。
+
+        Returns:
+            全fragmentをatomic公開できた場合はTrue。
+        """
+
+        succeeded = False
+        try:
+            # background task自体をactive operationとして数え、Keep-Alive間隔の直前に
+            # セッションとcache参照が破棄されることを防ぐ。
+            async with self.__activeOperation():
+                succeeded = await self.__encodeContinuousVideoRun(
+                    list(segments),
+                    purpose='PlaybackPrefetch',
+                )
+            return succeeded
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.error(
+                '[RecordedFMP4Stream] Playback prefetch failed unexpectedly. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                f'start_sequence: {segments[0].sequence}, end_sequence: {segments[-1].sequence}]',
+                exc_info=True,
+            )
+            return False
+        finally:
+            current_task = asyncio.current_task()
+            async with self._playback_prefetch_lock:
+                run = self._playback_prefetch_run
+                if run is not None and run.task is current_task:
+                    self._playback_prefetch_run = None
+            if succeeded is False and current_task is not None and current_task.cancelling() == 0:
+                logging.warning(
+                    '[RecordedFMP4Stream] Bounded playback prefetch did not publish every fragment. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'start_sequence: {segments[0].sequence}, end_sequence: {segments[-1].sequence}]'
+                )
+
     def __getUncachedVideoRun(self, segment: RecordedFMP4Segment) -> list[RecordedFMP4Segment]:
         """同じ映像generation内で、指定segmentを含む未キャッシュ連続区間を返す。
 
@@ -2222,38 +2440,8 @@ class RecordedFMP4Stream:
         """
 
         first_segment = segments[0]
-        total_duration = sum(item.duration for item in segments)
-        split_times = self.__getVideoRunSplitTimes(segments)
         try:
-            with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-offline-video-') as temporary_directory:
-                temporary_directory_path = Path(temporary_directory)
-                encoded_path = temporary_directory_path / 'encoded.mp4'
-                output_arguments = [
-                    '-movflags', '+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
-                    '-progress', 'pipe:1', '-nostats',
-                    '-f', 'mp4', str(encoded_path),
-                ]
-                plan = self.__buildVideoEncodeCommand(
-                    first_segment.start_time,
-                    total_duration,
-                    output_arguments,
-                    force_keyframe_times=split_times,
-                    sequence_for_warning=first_segment.sequence,
-                )
-                if plan is None:
-                    return False
-                command, backend, device, encoder_pixel_format = plan
-                succeeded = await self.__runOfflineVideoEncodeProcess(
-                    command,
-                    backend,
-                    device,
-                    encoder_pixel_format,
-                    temporary_directory_path,
-                    segments,
-                    encoded_path,
-                    split_times,
-                )
-                return succeeded
+            return await self.__encodeContinuousVideoRun(segments, purpose='Offline')
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2271,7 +2459,57 @@ class RecordedFMP4Stream:
                 self._offline_video_segment_events.setdefault(item.sequence, asyncio.Event()).set()
                 self._offline_video_sequence_tasks.pop(item.sequence, None)
 
-    async def __runOfflineVideoEncodeProcess(
+    async def __encodeContinuousVideoRun(
+        self,
+        segments: list[RecordedFMP4Segment],
+        purpose: Literal['Offline', 'PlaybackPrefetch'],
+    ) -> bool:
+        """連続区間を1回の映像encodeへまとめ、完成後にHLS fragmentへ分割する。
+
+        Args:
+            segments: 同じ映像generationの連続セグメント。
+            purpose: オフライン保存または通常再生の短い先読み。
+
+        Returns:
+            全fragmentを書けた場合はTrue。
+        """
+
+        first_segment = segments[0]
+        total_duration = sum(item.duration for item in segments)
+        split_times = self.__getVideoRunSplitTimes(segments)
+        temporary_prefix = 'konomitv-bs4k-offline-video-' \
+            if purpose == 'Offline' else 'konomitv-bs4k-playback-prefetch-video-'
+        with tempfile.TemporaryDirectory(prefix=temporary_prefix) as temporary_directory:
+            temporary_directory_path = Path(temporary_directory)
+            encoded_path = temporary_directory_path / 'encoded.mp4'
+            output_arguments = [
+                '-movflags', '+frag_keyframe+delay_moov+default_base_moof+negative_cts_offsets',
+                '-progress', 'pipe:1', '-nostats',
+                '-f', 'mp4', str(encoded_path),
+            ]
+            plan = self.__buildVideoEncodeCommand(
+                first_segment.start_time,
+                total_duration,
+                output_arguments,
+                force_keyframe_times=split_times,
+                sequence_for_warning=first_segment.sequence,
+            )
+            if plan is None:
+                return False
+            command, backend, device, encoder_pixel_format = plan
+            return await self.__runContinuousVideoEncodeProcess(
+                command,
+                backend,
+                device,
+                encoder_pixel_format,
+                temporary_directory_path,
+                segments,
+                encoded_path,
+                split_times,
+                purpose,
+            )
+
+    async def __runContinuousVideoEncodeProcess(
         self,
         command: list[str],
         backend: RecordedPlaybackEncoder,
@@ -2281,6 +2519,7 @@ class RecordedFMP4Stream:
         segments: list[RecordedFMP4Segment],
         encoded_path: Path,
         split_times: list[float],
+        purpose: Literal['Offline', 'PlaybackPrefetch'],
     ) -> bool:
         """単一fMP4を生成してからstream copyで分割し、全fragmentをcacheへ書く。
 
@@ -2293,6 +2532,7 @@ class RecordedFMP4Stream:
             segments: 書き込む映像セグメント。
             encoded_path: 一括エンコード結果の単一fMP4パス。
             split_times: 単一fMP4の先頭を0秒としたHLS分割境界。
+            purpose: オフライン保存または通常再生の短い先読み。
 
         Returns:
             全fragmentを書けた場合はTrue。
@@ -2339,7 +2579,7 @@ class RecordedFMP4Stream:
                 )
             if returncode != 0 or encoded_path.is_file() is False or encoded_path.stat().st_size == 0:
                 logging.error(
-                    '[RecordedFMP4Stream] Offline continuous video encode produced no media. '
+                    f'[RecordedFMP4Stream] {purpose} continuous video encode produced no media. '
                     f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
                     f'start_sequence: {segments[0].sequence}, '
                     f'stderr: {stderr.decode(errors="ignore").strip()}]'
@@ -2381,7 +2621,7 @@ class RecordedFMP4Stream:
         output_paths = sorted(temporary_directory.glob('segment-*.mp4'))
         if split_returncode != 0 or len(output_paths) != len(segments):
             logging.error(
-                '[RecordedFMP4Stream] Offline continuous video stream-copy split failed. '
+                f'[RecordedFMP4Stream] {purpose} continuous video stream-copy split failed. '
                 f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
                 f'start_sequence: {segments[0].sequence}, expected: {len(segments)}, '
                 f'actual: {len(output_paths)}, stderr: {split_stderr.decode(errors="ignore").strip()}]'
@@ -2397,13 +2637,14 @@ class RecordedFMP4Stream:
             await self.__acquire(segment_path)
             if await self.__storeEncodedVideoFragment(segment, encoded_data, init_path, segment_path) is False:
                 logging.error(
-                    '[RecordedFMP4Stream] Offline continuous video fragment is incomplete. '
+                    f'[RecordedFMP4Stream] {purpose} continuous video fragment is incomplete. '
                     f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
                     f'sequence: {segment.sequence}]'
                 )
                 return False
             self._completed_sequences.add(segment.sequence)
-            self._offline_video_segment_events.setdefault(segment.sequence, asyncio.Event()).set()
+            if purpose == 'Offline':
+                self._offline_video_segment_events.setdefault(segment.sequence, asyncio.Event()).set()
         self.__updateOfflineWorkProgress(work_key, 1.0)
         return True
 
