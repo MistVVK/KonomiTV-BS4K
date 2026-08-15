@@ -13,9 +13,10 @@ from typing import Annotated, Any, Literal, cast
 
 import anyio
 import psutil
-from fastapi import APIRouter, Depends, Path, Query, status
+from fastapi import APIRouter, Depends, Path, Query, Request, status
 from fastapi.exceptions import HTTPException
 from fastapi.responses import Response
+from fastapi.security import OAuth2PasswordBearer
 from sse_starlette.sse import EventSourceResponse
 
 from app import logging, schemas
@@ -38,7 +39,7 @@ from app.models.Program import Program
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
-from app.routers.UsersRouter import GetCurrentAdminUser
+from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
 from app.utils.LogRotation import OpenSecureLogFile
 
 
@@ -60,6 +61,32 @@ LOG_STREAM_INITIAL_MAX_LINES = 1000
 LOG_STREAM_INITIAL_MAX_BYTES = 1024 * 1024
 # リアルタイム追従時に1回で読み込む上限
 LOG_STREAM_UPDATE_READ_BYTES = 256 * 1024
+
+
+async def GetCurrentAdminUserOrLocal(
+    request: Request,
+    token: Annotated[str | None, Depends(OAuth2PasswordBearer(tokenUrl='users/token', auto_error=False))],
+) -> User | None:
+    """
+    現在管理者ユーザーでログインしているか、http://127.0.0.77:7010 からのアクセスであるかを確認する。
+    KonomiTV の Windows サービスからサーバーをシャットダウンするために必要。
+    """
+
+    # HTTP リクエストの Host ヘッダーが 127.0.0.77:{port+10} である場合、ローカルサービスからのアクセスと見なす
+    # 通常アクセス時の Host ヘッダーは 192-168-1-11.local.konomi.tv:7000 のような形式になる
+    valid_host = f'127.0.0.77:{Config().server.port + 10}'
+    if request.headers.get('host', '').strip() == valid_host:
+        return None
+
+    # それ以外である場合、管理者ユーザーでログインしているかを確認する
+    if token is None:
+        logging.error('[MaintenanceRouter][GetCurrentAdminUserOrLocal] Not authenticated.')
+        raise HTTPException(
+            status_code = status.HTTP_401_UNAUTHORIZED,
+            detail = 'Not authenticated',
+            headers = {'WWW-Authenticate': 'Bearer'},
+        )
+    return await GetCurrentAdminUser(await GetCurrentUser(token))
 
 
 def ReadLogTail(log_file: io.TextIOWrapper, max_bytes: int, max_lines: int) -> tuple[list[str], int]:
@@ -253,16 +280,13 @@ def LogStreamAPI(
     summary = 'データベース更新 API',
     status_code = status.HTTP_204_NO_CONTENT,
 )
-async def UpdateDatabaseAPI(
-    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
+async def UpdateDatabaseAPI():
     """
     データベースに保存されている、チャンネル情報・番組情報・Twitter アカウント情報などの外部 API に依存するデータをすべて更新する。<br>
     即座に外部 API からのデータ更新を反映させたい場合に利用する。<br>
-    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
     """
 
-    del current_user
     await Channel.update()
     # 実況機能が無効な間は、手動 DB 更新からも実況サービスへ接続しない
     if Config().general.jikkyo_enabled is True:
@@ -275,17 +299,14 @@ async def UpdateDatabaseAPI(
     summary = '録画フォルダ一括スキャン API',
     status_code = status.HTTP_204_NO_CONTENT,
 )
-async def BatchScanAPI(
-    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
+async def BatchScanAPI():
     """
     録画フォルダ内の全 TS ファイルをスキャンし、メタデータを解析して DB に永続化する。<br>
     追加・変更があったファイルのみメタデータを解析し、DB に永続化する。<br>
     存在しない録画ファイルに対応するレコードを一括削除する。<br>
-    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
     """
 
-    del current_user
     global batch_scan_task
 
     async def BatchScan():
@@ -512,16 +533,13 @@ async def DetectCMSectionsForAllRecordedVideosAPI(
     summary = 'バックグラウンド解析タスク手動実行 API',
     status_code = status.HTTP_204_NO_CONTENT,
 )
-async def BackgroundAnalysisAPI(
-    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
+async def BackgroundAnalysisAPI():
     """
     CM 区間情報が未解析の録画ファイルに対して CM 区間情報を解析し、<br>
     サムネイルが未生成の録画ファイルに対してサムネイルを生成する。<br>
-    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    このメンテナンス機能は管理者ユーザーでなくてもアクセスできる。
     """
 
-    del current_user
     global background_analysis_task
 
     async def BackgroundAnalysis():
@@ -642,12 +660,15 @@ async def BackgroundAnalysisAPI(
     status_code = status.HTTP_204_NO_CONTENT,
 )
 def ServerRestartAPI(
-    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+    current_user: Annotated[User | None, Depends(GetCurrentAdminUserOrLocal)],
 ):
     """
     KonomiTV-BS4K サーバーを再起動する。<br>
-    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。<br>
+    例外として、127.0.0.77:{port+10} からのローカルアクセスは認証なしで許可する。
     """
+
+    del current_user
 
     def Restart():
 
@@ -676,13 +697,16 @@ def ServerRestartAPI(
     status_code = status.HTTP_204_NO_CONTENT,
 )
 def ServerShutdownAPI(
-    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+    current_user: Annotated[User | None, Depends(GetCurrentAdminUserOrLocal)],
 ):
     """
     KonomiTV-BS4K サーバーを終了する。<br>
     なお、PM2 環境 / Docker 環境ではサーバー終了後に自動的にプロセスが再起動されるため、事実上 /api/maintenance/restart と等価。<br>
-    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。<br>
+    例外として、127.0.0.77:{port+10} からのローカルアクセスは認証なしで許可する。
     """
+
+    del current_user
 
     def Shutdown():
 

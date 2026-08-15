@@ -7,7 +7,7 @@ from pathlib import Path
 
 import tortoise.contrib.fastapi
 import tortoise.log
-from fastapi import Depends, FastAPI, Request, status
+from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -113,17 +113,10 @@ app.include_router(VideosRouter.router)
 app.include_router(SeriesRouter.router)
 app.include_router(LiveStreamsRouter.router)
 app.include_router(VideoStreamsRouter.router)
-# 本線の予約 CRUD はログインユーザーのみ。互換 API は source router を共有するため、
-# 認証依存はここでの include 時だけ付与し、ReservationsRouter / ReservationConditionsRouter
-# 本体には global dependencies を書かない。
-app.include_router(
-    ReservationsRouter.router,
-    dependencies = [Depends(UsersRouter.GetCurrentUser)],
-)
-app.include_router(
-    ReservationConditionsRouter.router,
-    dependencies = [Depends(UsersRouter.GetCurrentUser)],
-)
+# 本線の予約 CRUD は upstream と同じく無認証で公開する。
+# 互換 API も同じ source router を共有するため、ここでも認証依存を付けない。
+app.include_router(ReservationsRouter.router)
+app.include_router(ReservationConditionsRouter.router)
 app.include_router(RecordingPresetsRouter.router)
 app.include_router(RecordedSeriesRouter.router)
 app.include_router(AIBackendRouter.router)

@@ -5,14 +5,12 @@ from pathlib import Path
 from typing import Annotated, BinaryIO, cast
 
 import puremagic
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app import logging
 from app.config import Config
-from app.models.User import User
-from app.routers.UsersRouter import GetCurrentUser
 
 
 # ルーター
@@ -227,18 +225,13 @@ class CaptureUploadBodyLimitMiddleware:
 )
 def CaptureUploadAPI(
     image: Annotated[UploadFile, File(description='アップロードするキャプチャ画像 (JPEG or PNG)。')],
-    current_user: Annotated[User, Depends(GetCurrentUser)],
 ):
     """
     クライアント側でキャプチャした画像をサーバーにアップロードする。<br>
     アップロードされた画像は、サーバー設定で指定されたフォルダに保存される。<br>
     同期ファイル I/O を伴うため敢えて同期関数として実装している。<br>
-    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。<br>
     HTTP 本文サイズは CaptureUploadBodyLimitMiddleware が multipart 解析前に制限する。
     """
-
-    # 認証済みユーザーであることを依存解決で保証する。以降の処理では user 本体は使わない。
-    del current_user
 
     # 画像が JPEG または PNG かをチェック
     ## 万が一悪意ある攻撃者から危険なファイルを送り込まれないように
