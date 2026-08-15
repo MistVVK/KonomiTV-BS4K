@@ -1983,6 +1983,18 @@ class RecordedFMP4Stream:
         command += RecordedPlaybackBackend.getTuningArguments(backend, codec)
         if codec == 'hevc':
             command += ['-tag:v', 'hvc1']
+        # 録画 MPEG-TS の PTS には局側の欠落や seek 直後の不連続が含まれることがあり、
+        # FFmpeg の自動同期へ任せると同じ約6秒の fragmentでも出力枚数が大きく変動する。
+        # 通常画質は画質名の契約どおり 29.97 / 59.94fps CFR へ正規化し、Chrome の
+        # decoder queueへ疎な timestamp列を渡さない。逆テレシネ時だけは24/30p混在を
+        # 保つ必要があるため、ライブ再生と同様に VFR を明示して -r を付けない。
+        if self.encoding_options.is_24fps_mode_enabled is True:
+            command += ['-fps_mode', 'vfr']
+        else:
+            command += [
+                '-r', '60000/1001' if quality.is_60fps is True else '30000/1001',
+                '-fps_mode', 'cfr',
+            ]
         command += [
             '-b:v', video_bitrate.video_bitrate, '-maxrate', video_bitrate.video_bitrate_max,
             '-bufsize', f'{video_bitrate_max_kbps * 2}K',

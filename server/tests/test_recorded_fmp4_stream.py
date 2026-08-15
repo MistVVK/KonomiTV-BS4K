@@ -2308,6 +2308,50 @@ def test_offline_continuous_video_command_uses_single_seek_and_output(monkeypatc
     assert command[-1] == str(Path('/tmp') / 'encoded.mp4')
 
 
+@pytest.mark.parametrize(
+    ('quality', 'is_24fps_mode_enabled', 'expected_frame_rate', 'expected_fps_mode'),
+    [
+        ('1080p-60fps', False, '60000/1001', 'cfr'),
+        ('1080p', False, '30000/1001', 'cfr'),
+        ('1080p', True, None, 'vfr'),
+    ],
+)
+def test_recorded_video_command_normalizes_output_frame_rate(
+    monkeypatch,
+    quality: QUALITY_TYPES,
+    is_24fps_mode_enabled: bool,
+    expected_frame_rate: str | None,
+    expected_fps_mode: str,
+) -> None:
+    """通常画質はCFRへ揃え、逆テレシネ時だけ24/30p混在VFRを保つ。"""
+
+    stream = _BuildOfflineVideoStream()
+    stream.quality = quality
+    stream.encoding_options = SimpleNamespace(
+        video_codec='av1',
+        video_bit_depth=10,
+        is_24fps_mode_enabled=is_24fps_mode_enabled,
+    )
+    monkeypatch.setattr(
+        RecordedFMP4Stream,
+        '_RecordedFMP4Stream__getBackend',
+        lambda _self: 'FFmpeg',
+    )
+
+    command, _backend, _device, _pixel_format = stream._RecordedFMP4Stream__buildVideoEncodeCommand(  # pyright: ignore[reportPrivateUsage]
+        0.0,
+        6.0,
+        ['-f', 'mp4', 'pipe:1'],
+        sequence_for_warning=0,
+    )
+
+    assert command[command.index('-fps_mode') + 1] == expected_fps_mode
+    if expected_frame_rate is None:
+        assert '-r' not in command
+    else:
+        assert command[command.index('-r') + 1] == expected_frame_rate
+
+
 def test_mmt_tlv_video_command_forces_libaribtlv_before_input(monkeypatch) -> None:
     """録画映像 fMP4 の TLV 入力へ libaribtlv を指定し、出力条件は共通経路を使う。"""
 
