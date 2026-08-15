@@ -421,11 +421,11 @@ def test_live_hwdownload_format_matches_hw_surface() -> None:
     ) == 'nv12'
 
 
-def test_konomitv_bs4k_live_sar_mode_defaults_to_gpu() -> None:
-    """yaml にキーが無いとき、ライブ SAR モードは GPU になる。"""
+def test_konomitv_bs4k_live_sar_mode_defaults_to_cpu() -> None:
+    """yaml にキーが無いとき、ライブ SAR モードは CPU になる。"""
 
     settings = ServerSettings.model_validate({}, context = {'bypass_validation': True})
-    assert settings.general.konomitv_bs4k_live_sar_mode == 'GPU'
+    assert settings.general.konomitv_bs4k_live_sar_mode == 'CPU'
 
 
 @pytest.mark.parametrize(('encode_width', 'encode_height'), [(1440, 1080), (1920, 1080), (426, 240)])

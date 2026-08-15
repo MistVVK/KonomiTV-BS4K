@@ -252,7 +252,7 @@ class _ServerSettingsGeneral(BaseModel):
     konomitv_bs4k_live_transport: Literal['MpegTs', 'Tlv'] = 'MpegTs'
     konomitv_bs4k_tlv_mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] | None = None
     encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
-    konomitv_bs4k_live_sar_mode: Literal['CPU', 'GPU'] = 'GPU'
+    konomitv_bs4k_live_sar_mode: Literal['CPU', 'GPU'] = 'CPU'
     encoder_bs4k: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
     encoder_bs4k_input_probesize: PositiveInt = 3000
     encoder_bs4k_input_analyze: Annotated[float, Field(gt=0, allow_inf_nan=False)] = 1.5

@@ -31,7 +31,7 @@ def BuildEncodingTask(
     video_bit_depth: int = 8,
     audio_codec: str = 'aac',
     bs4k_input_analysis_enabled: bool = True,
-    sar_mode: str = 'GPU',
+    sar_mode: str = 'CPU',
 ) -> LiveEncodingTask:
     """Anchor オプション生成に必要な最小構成のタスクを返す。"""
 
@@ -214,6 +214,7 @@ def test_ffmpeg8_sar_gpu_mode_uses_hardware_deinterlace(
         monkeypatch,
         stream_anchor_enabled=True,
         is_24fps_mode_enabled=False,
+        sar_mode='GPU',
     )
     monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
 
