@@ -18,6 +18,7 @@ from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KONOMITV_BS4K_AV1_MAIN_TIER_TSTD_LIMITS_BY_QUALITY,
     KONOMITV_BS4K_VIDEO_CODECS,
     BuildKonomiTVBS4KLiveAspectPreservingScaleFilters,
+    BuildKonomiTVBS4KLiveHardwareVideoFilters,
     KonomiTVBS4KPlaybackAudioCapability,
     KonomiTVBS4KPlaybackCapabilities,
     KonomiTVBS4KPlaybackLiveCombinationCapability,
@@ -418,6 +419,55 @@ def test_live_hwdownload_format_matches_hw_surface() -> None:
     assert ResolveKonomiTVBS4KLiveHwDownloadFormat(
         'NVENC', channel_type = 'GR', encoder_pixel_format = 'nv12',
     ) == 'nv12'
+
+
+def test_konomitv_bs4k_live_sar_mode_defaults_to_gpu() -> None:
+    """yaml にキーが無いとき、ライブ SAR モードは GPU になる。"""
+
+    settings = ServerSettings.model_validate({}, context = {'bypass_validation': True})
+    assert settings.general.konomitv_bs4k_live_sar_mode == 'GPU'
+
+
+@pytest.mark.parametrize(('encode_width', 'encode_height'), [(1440, 1080), (1920, 1080), (426, 240)])
+def test_konomitv_bs4k_live_hardware_filters_stretch_without_size_assumption(
+    encode_width: int,
+    encode_height: int,
+) -> None:
+    """GPU 縮小は入力解像度を決め打ちせず、coded size を encode size へ伸縮するだけ。"""
+
+    filters = BuildKonomiTVBS4KLiveHardwareVideoFilters(
+        'QSV',
+        encode_width = encode_width,
+        encode_height = encode_height,
+        encoder_pixel_format = 'nv12',
+        is_interlaced = False,
+        is_60fps = False,
+        low_latency = True,
+    )
+    combined = ','.join(filters)
+    assert f'w={encode_width}:h={encode_height}' in combined
+    assert 'iw*sar' not in combined
+    assert 'setsar' not in combined
+
+
+@pytest.mark.parametrize('encoder_type', ['QSV', 'NVENC', 'AMF'])
+def test_konomitv_bs4k_live_hardware_filters_use_top_field_first(encoder_type: str) -> None:
+    """ライブの HW DI は ISDB の top-field-first に固定し、自動判定で逆順にしない。"""
+
+    filters = BuildKonomiTVBS4KLiveHardwareVideoFilters(
+        encoder_type,  # type: ignore[arg-type]
+        encode_width = 426,
+        encode_height = 240,
+        encoder_pixel_format = 'nv12',
+        is_interlaced = True,
+        is_60fps = False,
+        low_latency = True,
+    )
+    combined = ','.join(filters)
+    if encoder_type == 'NVENC':
+        assert 'parity=0' in combined
+    elif encoder_type == 'AMF':
+        assert 'auto=0' in combined
 
 
 @pytest.mark.parametrize(

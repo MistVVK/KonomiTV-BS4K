@@ -31,11 +31,13 @@ def BuildEncodingTask(
     video_bit_depth: int = 8,
     audio_codec: str = 'aac',
     bs4k_input_analysis_enabled: bool = True,
+    sar_mode: str = 'GPU',
 ) -> LiveEncodingTask:
     """Anchor オプション生成に必要な最小構成のタスクを返す。"""
 
     settings = ServerSettings.model_validate({}, context={'bypass_validation': True})
     settings.general.encoder_bs4k_input_analysis_enabled = bs4k_input_analysis_enabled
+    settings.general.konomitv_bs4k_live_sar_mode = sar_mode  # type: ignore[assignment]
     monkeypatch.setattr('app.streams.LiveEncodingTask.Config', lambda: settings)
     task = object.__new__(LiveEncodingTask)
     task._retry_count = 0
@@ -168,11 +170,95 @@ def test_ffmpeg8_interlaced_filter_uses_top_field_first(monkeypatch: pytest.Monk
     monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
 
     software_options = task.buildFFmpegOptions('240p', 'GR', False)
-    hardware_options = task.buildFFmpeg8HardwareOptions('240p', 'QSV', 'GR', False)
 
     assert any('yadif=mode=0:parity=0:deint=1' in option for option in software_options)
+
+
+def test_ffmpeg8_sar_cpu_mode_keeps_sw_yadif(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SAR CPU モードでは decode 直後に download し、SW yadif と SAR 追従を使う。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=True,
+        is_24fps_mode_enabled=False,
+        sar_mode='CPU',
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    hardware_options = task.buildFFmpeg8HardwareOptions('240p', 'QSV', 'GR', False)
     hardware_filter = hardware_options[hardware_options.index('-vf') + 1]
+
+    assert '-hwaccel' in hardware_options
+    assert 'hwdownload' in hardware_filter
     assert 'yadif=mode=0:parity=0:deint=1' in hardware_filter
+    assert 'iw*sar' in hardware_filter
+    assert 'vpp_qsv' not in hardware_filter
+
+
+@pytest.mark.parametrize(
+    ('encoder_type', 'expected_deinterlace'),
+    [
+        ('QSV', 'vpp_qsv=deinterlace=advanced'),
+        ('NVENC', 'bwdif_cuda'),
+        ('AMF', 'deinterlace_vaapi'),
+    ],
+)
+def test_ffmpeg8_sar_gpu_mode_uses_hardware_deinterlace(
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_type: str,
+    expected_deinterlace: str,
+) -> None:
+    """SAR GPU モードでは SW yadif を使わず、同じ GPU の DI で解除する。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=True,
+        is_24fps_mode_enabled=False,
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    hardware_options = task.buildFFmpeg8HardwareOptions('240p', encoder_type, 'GR', False)  # type: ignore[arg-type]
+    hardware_filter = hardware_options[hardware_options.index('-vf') + 1]
+
+    assert '-hwaccel' in hardware_options
+    assert 'yadif' not in hardware_filter
+    assert expected_deinterlace in hardware_filter
+    assert 'iw*sar' not in hardware_filter
+    if encoder_type == 'NVENC':
+        assert 'parity=0' in hardware_filter
+
+
+@pytest.mark.parametrize(
+    ('encoder_type', 'expected_scale'),
+    [
+        ('QSV', 'vpp_qsv='),
+        ('NVENC', 'scale_cuda='),
+        ('AMF', 'scale_vaapi='),
+    ],
+)
+@pytest.mark.parametrize('sar_mode', ['CPU', 'GPU'])
+def test_ffmpeg8_bs4k_ignores_sar_mode_and_uses_gpu_scale(
+    monkeypatch: pytest.MonkeyPatch,
+    encoder_type: str,
+    sar_mode: str,
+    expected_scale: str,
+) -> None:
+    """BS4K は SAR モードに依らず、DI なしの GPU scale で縮小する。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=True,
+        is_24fps_mode_enabled=False,
+        sar_mode=sar_mode,
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    hardware_options = task.buildFFmpeg8HardwareOptions('240p', encoder_type, 'BS4K', False)  # type: ignore[arg-type]
+    hardware_filter = hardware_options[hardware_options.index('-vf') + 1]
+
+    assert 'yadif' not in hardware_filter
+    assert 'deinterlace' not in hardware_filter
+    assert expected_scale in hardware_filter
 
 
 @pytest.mark.parametrize(
