@@ -124,22 +124,7 @@ const router = createRouter({
     }
 });
 
-// ルーティングの変更時に View Transitions API を適用する
-// ref: https://developer.mozilla.org/ja/docs/Web/API/View_Transitions_API
-router.beforeResolve((to, from, next) => {
-    // View Transition API を適用しないルートの prefix
-    // to と from の両方のパスがこの prefix で始まる場合は View Transition API を適用しない
-    const no_transition_routes = [
-        '/tv/watch/',
-        '/videos/watch/',
-    ];
-    if (document.startViewTransition && !no_transition_routes.some((route) => to.path.startsWith(route) && from.path.startsWith(route))) {
-        document.startViewTransition(() => {
-            next();
-        });
-    } else {
-        next();
-    }
-});
+// 一覧・設定への遷移では View Transitions を使わない。
+// root 全体のスナップショット取得が、TV ホームのような大きな DOM からの遷移を体感的に止めてしまうため。
 
 export default router;
