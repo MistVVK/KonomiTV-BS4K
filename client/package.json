@@ -36,7 +36,7 @@
         "hls.js": "^1.6.9",
         "idb": "^8.0.3",
         "mitt": "^3.0.1",
-        "mpegts.js": "github:MistVVK/mpegts.js#b73668786d2b3793592f961ecd1a4ca2d04de67f",
+        "mpegts.js": "github:MistVVK/mpegts.js#74dbd04f71d8665c4551a722c78ef9ec5f3d8e74",
         "nanoid": "^5.1.16",
         "ohash": "^1.1.3",
         "piexifjs": "^2.0.0-beta.9",
