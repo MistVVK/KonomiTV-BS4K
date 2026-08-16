@@ -196,6 +196,37 @@ def BuildKonomiTVBS4KLiveAspectPreservingScaleFilters(
     return filters
 
 
+def ShouldUseKonomiTVBS4KLiveSoftwareDecodeForSar(
+    *,
+    channel_type: str,
+    sar_mode: Literal['CPU', 'GPU'],
+    is_24fps_mode_enabled: bool,
+) -> bool:
+    """
+    ライブで入力 SAR をフレームに残すため、SW decode すべきか返す。
+
+    QSV / NVDEC / VAAPI の HW decode は MPEG-2 sequence header や H.264 VUI の
+    SAR を落とすか 1:1 にする。そのあと iw*sar すると 1440x1080 が画素比だけで
+    4:3 と誤判定される。probe が間に合わず unspecified size のときも同じになる。
+    SW decode なら sequence header 到着後のフレームに SAR が残る。
+    BS4K は 16:9 決め打ちの GPU scale なので SW decode しない。
+
+    Args:
+        channel_type (str): チャンネル種別。
+        sar_mode (Literal['CPU', 'GPU']): ライブ SAR モード。
+        is_24fps_mode_enabled (bool): 24fps 逆テレシネを使うか。
+
+    Returns:
+        bool: SW decode が必要なら True。
+    """
+
+    if channel_type == 'BS4K':
+        return False
+    if is_24fps_mode_enabled is True:
+        return True
+    return sar_mode == 'CPU'
+
+
 def ResolveKonomiTVBS4KLiveHwDownloadFormat(
     encoder_type: KonomiTVBS4KPlaybackEncoder,
     *,

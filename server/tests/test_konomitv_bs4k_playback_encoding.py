@@ -32,6 +32,7 @@ from app.streams.KonomiTVBS4KPlaybackEncoding import (
     ResolveKonomiTVBS4KLiveEncodeSize,
     ResolveKonomiTVBS4KLiveOutputGeometry,
     ResolveKonomiTVBS4KPlaybackVideoBitrate,
+    ShouldUseKonomiTVBS4KLiveSoftwareDecodeForSar,
 )
 from app.streams.LiveStream import LiveStream
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
@@ -426,6 +427,33 @@ def test_konomitv_bs4k_live_sar_mode_defaults_to_cpu() -> None:
 
     settings = ServerSettings.model_validate({}, context = {'bypass_validation': True})
     assert settings.general.konomitv_bs4k_live_sar_mode == 'CPU'
+
+
+@pytest.mark.parametrize(
+    ('channel_type', 'sar_mode', 'is_24fps', 'expected'),
+    [
+        ('GR', 'CPU', False, True),
+        ('GR', 'GPU', False, False),
+        ('GR', 'GPU', True, True),
+        ('BS', 'CPU', False, True),
+        ('BS4K', 'CPU', False, False),
+        ('BS4K', 'CPU', True, False),
+        ('BS4K', 'GPU', True, False),
+    ],
+)
+def test_live_software_decode_is_required_to_keep_mpeg2_sar(
+    channel_type: str,
+    sar_mode: str,
+    is_24fps: bool,
+    expected: bool,
+) -> None:
+    """地デジ/BS の SAR 追従は SW decode、BS4K と GPU 決め打ちは HW decode。"""
+
+    assert ShouldUseKonomiTVBS4KLiveSoftwareDecodeForSar(
+        channel_type = channel_type,
+        sar_mode = sar_mode,  # type: ignore[arg-type]
+        is_24fps_mode_enabled = is_24fps,
+    ) is expected
 
 
 @pytest.mark.parametrize(('encode_width', 'encode_height'), [(1440, 1080), (1920, 1080), (426, 240)])

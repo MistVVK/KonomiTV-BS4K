@@ -174,8 +174,8 @@ def test_ffmpeg8_interlaced_filter_uses_top_field_first(monkeypatch: pytest.Monk
     assert any('yadif=mode=0:parity=0:deint=1' in option for option in software_options)
 
 
-def test_ffmpeg8_sar_cpu_mode_keeps_sw_yadif(monkeypatch: pytest.MonkeyPatch) -> None:
-    """SAR CPU モードでは decode 直後に download し、SW yadif と SAR 追従を使う。"""
+def test_ffmpeg8_sar_cpu_mode_uses_software_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SAR CPU モードは HW decode せず、SW yadif と SAR 追従で 1440x1080 の 16:9 を残す。"""
 
     task = BuildEncodingTask(
         monkeypatch,
@@ -188,10 +188,12 @@ def test_ffmpeg8_sar_cpu_mode_keeps_sw_yadif(monkeypatch: pytest.MonkeyPatch) ->
     hardware_options = task.buildFFmpeg8HardwareOptions('240p', 'QSV', 'GR', False)
     hardware_filter = hardware_options[hardware_options.index('-vf') + 1]
 
-    assert '-hwaccel' in hardware_options
-    assert 'hwdownload' in hardware_filter
+    assert '-init_hw_device' in hardware_options
+    assert '-hwaccel' not in hardware_options
+    assert 'hwdownload' not in hardware_filter
     assert 'yadif=mode=0:parity=0:deint=1' in hardware_filter
     assert 'iw*sar' in hardware_filter
+    assert 'hwupload=' in hardware_filter
     assert 'vpp_qsv' not in hardware_filter
 
 
@@ -227,6 +229,29 @@ def test_ffmpeg8_sar_gpu_mode_uses_hardware_deinterlace(
     assert 'iw*sar' not in hardware_filter
     if encoder_type == 'NVENC':
         assert 'parity=0' in hardware_filter
+
+
+def test_ffmpeg8_24fps_uses_software_decode_even_in_gpu_sar_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """24fps は pullup と SAR 追従のため、GPU SAR モードでも SW decode する。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=True,
+        is_24fps_mode_enabled=True,
+        sar_mode='GPU',
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    hardware_options = task.buildFFmpeg8HardwareOptions('240p', 'QSV', 'GR', False)
+    hardware_filter = hardware_options[hardware_options.index('-vf') + 1]
+
+    assert '-hwaccel' not in hardware_options
+    assert 'hwdownload' not in hardware_filter
+    assert 'pullup' in hardware_filter
+    assert 'iw*sar' in hardware_filter
+    assert 'vpp_qsv' not in hardware_filter
 
 
 @pytest.mark.parametrize(
