@@ -11,10 +11,10 @@ set -a
 source "${SCRIPT_DIR}/manifest.env"
 set +a
 
-case "${NONFREE:-}" in
+case "${INTEL_NONFREE:-}" in
     true|false) ;;
     *)
-        echo "NONFREE must be exactly 'true' or 'false'. actual: ${NONFREE:-<unset>}" >&2
+        echo "INTEL_NONFREE must be exactly 'true' or 'false'. actual: ${INTEL_NONFREE:-<unset>}" >&2
         exit 2
         ;;
 esac
@@ -67,7 +67,7 @@ copy-license() {
 SOURCE_ROOT="${SOURCE_ROOT}" OUTPUT_ROOT="${OUTPUT_ROOT}" "${SCRIPT_DIR}/build-ffmpeg8.sh"
 
 # FFmpeg 8 の QSV 経路で使う Intel Media Stack を、固定 commit と既存の修正 patch から構築する。
-NONFREE="${NONFREE}" OUTPUT_ROOT="${SOURCE_ROOT}/intel-media-stack" \
+INTEL_NONFREE="${INTEL_NONFREE}" OUTPUT_ROOT="${SOURCE_ROOT}/intel-media-stack" \
     "${SCRIPT_DIR}/build-intel-media-stack.sh" "${SOURCE_ROOT}/intel-media-stack"
 cp -a "${SOURCE_ROOT}/intel-media-stack/artifact/Library" "${OUTPUT_ROOT}/Library"
 

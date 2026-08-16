@@ -10,7 +10,7 @@ services:
       target: verified-runtime
       args:
         CUDA_VERSION: '${KONOMITV_CUDA_VERSION:-12.4}'
-        NONFREE: '${KONOMITV_NONFREE:-true}'
+        NONFREE: '${KONOMITV_NONFREE:-nonfree}'
         KONOMITV_UID: '${KONOMITV_UID:-1000}'
         KONOMITV_GID: '${KONOMITV_GID:-1000}'
 

@@ -2,24 +2,26 @@
 
 ARG UBUNTU_2204_IMAGE_SHA256=0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
+# プロファイル enum: nonfree / free / intel-nonfree / amd-nonfree（互換のため true → nonfree、false → free も受け付ける）
+# この ARG は FROM 行の stage 解決だけに使い、各 stage の cache key へ混ぜない。
+ARG NONFREE=nonfree
+
 # --------------------------------------------------------------------------------------------------------------
-# サードパーティー実行環境を固定構築するステージ
+# サードパーティー実行環境を固定構築するステージ群
 # --------------------------------------------------------------------------------------------------------------
 
-FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS thirdparty-builder
+# Intel 非自由カーネルに依存しない共通部分（apt 導入と build context の COPY）を
+# 先に構築し、下の Intel 派生 stage が共有する。ここに ARG NONFREE を宣言しないことが、
+# 8 プロファイル分のフルビルドを 4 本（CUDA 2種 × Intel 2種）へ抑える鍵になる。
+FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS thirdparty-builder-base
 
 ARG CUDA_VERSION=12.4
-ARG NONFREE=true
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN case "${CUDA_VERSION}" in \
         '12.4') CUDA_PACKAGE_SUFFIX='12-4' ;; \
         '12.8') CUDA_PACKAGE_SUFFIX='12-8' ;; \
         *) echo 'CUDA_VERSION must be either 12.4 or 12.8.' >&2; exit 1 ;; \
-    esac && \
-    case "${NONFREE}" in \
-        'true'|'false') ;; \
-        *) echo 'NONFREE must be either true or false.' >&2; exit 1 ;; \
     esac && \
     apt-get update && apt-get install -y --no-install-recommends ca-certificates nala && \
     printf '%s\n' \
@@ -75,18 +77,23 @@ COPY ./docker/thirdparty/patches/amf-1.4.36-display-capture-c.patch \
      ./docker/thirdparty/patches/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch \
      /build/docker/thirdparty/patches/
 COPY ./thirdparty-src/tsreadex/ /build/thirdparty-src/tsreadex/
+RUN chmod +x /build/docker/thirdparty/*.sh
+
+# Intel Media Driver の Full Feature 版を組み込むビルド（FFmpeg 8・Intel Media Stack・その他実行環境一式）
+# プロファイル nonfree / intel-nonfree がこの成果物を共有する。
+FROM thirdparty-builder-base AS thirdparty-intel-true
 
 RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downloads \
     --mount=type=cache,id=konomitv-bs4k-thirdparty-ccache,target=/root/.cache/ccache \
     --mount=type=cache,id=konomitv-bs4k-thirdparty-go-build,target=/root/.cache/go-build \
     --mount=type=cache,id=konomitv-bs4k-thirdparty-go-mod,target=/root/go/pkg/mod \
-    chmod +x /build/docker/thirdparty/*.sh && \
     ccache --max-size=20G && \
     ccache --zero-stats && \
-    NONFREE="${NONFREE}" /build/docker/thirdparty/build.sh && \
+    INTEL_NONFREE='true' /build/docker/thirdparty/build.sh && \
     ccache --show-stats
 
 # CM 解析ランタイムは再生用 FFmpeg と分離し、Amatsukaze 本体を含めず固定構築する。
+# build.sh が /opt/ffmpeg8-sdk を導入してから実行するため、この位置に置く。
 COPY ./docker/thirdparty/build-cm-analysis.sh /build/docker/thirdparty/build-cm-analysis.sh
 COPY ./docker/thirdparty/patches/ffms2-hardware-decoding.patch \
      ./docker/thirdparty/patches/chapter-exe-initialize-avisynth.patch \
@@ -98,8 +105,9 @@ COPY ./docker/thirdparty/patches/ffms2-hardware-decoding.patch \
 RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downloads \
     --mount=type=cache,id=konomitv-bs4k-thirdparty-ccache,target=/root/.cache/ccache \
     chmod +x /build/docker/thirdparty/build-cm-analysis.sh && \
-    /build/docker/thirdparty/build-cm-analysis.sh && \
-    python3 /build/docker/thirdparty/collect-license-manifest.py \
+    /build/docker/thirdparty/build-cm-analysis.sh
+
+RUN python3 /build/docker/thirdparty/collect-license-manifest.py \
         --stage 'Third-Party Builder Dependencies' \
         --dpkg --dpkg-prefix cuda- --dpkg-exclude cuda-keyring \
         --root /usr/share/vpl/licensing \
@@ -108,6 +116,69 @@ RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downl
         --go-module-cache /root/go/pkg/mod \
         --output /tmp/BUILDER_THIRD_PARTY_LICENSES.md
 
+COPY ./docker/thirdparty/verify.sh \
+     ./docker/thirdparty/generate-cm-smoke-fixture.py \
+     /build/docker/thirdparty/
+RUN chmod +x /build/docker/thirdparty/verify.sh && \
+    INTEL_NONFREE='true' /build/docker/thirdparty/verify.sh /opt/thirdparty
+
+# Intel Media Driver の Free Kernel 版を組み込むビルド。プロファイル free / amd-nonfree がこの成果物を共有する。
+FROM thirdparty-builder-base AS thirdparty-intel-false
+
+RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downloads \
+    --mount=type=cache,id=konomitv-bs4k-thirdparty-ccache,target=/root/.cache/ccache \
+    --mount=type=cache,id=konomitv-bs4k-thirdparty-go-build,target=/root/.cache/go-build \
+    --mount=type=cache,id=konomitv-bs4k-thirdparty-go-mod,target=/root/go/pkg/mod \
+    ccache --max-size=20G && \
+    ccache --zero-stats && \
+    INTEL_NONFREE='false' /build/docker/thirdparty/build.sh && \
+    ccache --show-stats
+
+# CM 解析ランタイムは再生用 FFmpeg と分離し、Amatsukaze 本体を含めず固定構築する。
+# build.sh が /opt/ffmpeg8-sdk を導入してから実行するため、この位置に置く。
+COPY ./docker/thirdparty/build-cm-analysis.sh /build/docker/thirdparty/build-cm-analysis.sh
+COPY ./docker/thirdparty/patches/ffms2-hardware-decoding.patch \
+     ./docker/thirdparty/patches/chapter-exe-initialize-avisynth.patch \
+     ./docker/thirdparty/patches/logoframe-error-lifetime.patch \
+     ./docker/thirdparty/patches/logoframe-parallel-scan.patch \
+     ./docker/thirdparty/patches/logoframe-native-luma.patch \
+     ./docker/thirdparty/patches/logoframe-high-bit-rgb-fallback.patch \
+     /build/docker/thirdparty/patches/
+RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downloads \
+    --mount=type=cache,id=konomitv-bs4k-thirdparty-ccache,target=/root/.cache/ccache \
+    chmod +x /build/docker/thirdparty/build-cm-analysis.sh && \
+    /build/docker/thirdparty/build-cm-analysis.sh
+
+RUN python3 /build/docker/thirdparty/collect-license-manifest.py \
+        --stage 'Third-Party Builder Dependencies' \
+        --dpkg --dpkg-prefix cuda- --dpkg-exclude cuda-keyring \
+        --root /usr/share/vpl/licensing \
+        --root /opt/thirdparty \
+        --root /build/sources/intel-media-stack \
+        --go-module-cache /root/go/pkg/mod \
+        --output /tmp/BUILDER_THIRD_PARTY_LICENSES.md
+
+COPY ./docker/thirdparty/verify.sh \
+     ./docker/thirdparty/generate-cm-smoke-fixture.py \
+     /build/docker/thirdparty/
+RUN chmod +x /build/docker/thirdparty/verify.sh && \
+    INTEL_NONFREE='false' /build/docker/thirdparty/verify.sh /opt/thirdparty
+
+# プロファイル enum と互換値から、Intel 非自由カーネル有無の stage を選ぶ素通し alias。
+# 実体を持たないため、ここでビルドコストが増えることはない。
+FROM thirdparty-intel-true AS thirdparty-nonfree
+FROM thirdparty-intel-true AS thirdparty-intel-nonfree
+FROM thirdparty-intel-false AS thirdparty-amd-nonfree
+FROM thirdparty-intel-false AS thirdparty-free
+FROM thirdparty-intel-true AS thirdparty-true
+FROM thirdparty-intel-false AS thirdparty-false
+
+# ビルド要求の NONFREE enum に応じて Intel 成果物 stage を動的に選択する。
+# AMD proprietary runtime はこの stage には入らず、runtime stage だけが NONFREE を見て導入する。
+FROM thirdparty-${NONFREE} AS thirdparty-builder
+
+# 基礎ライセンス文書はプロファイルに依存しない。エイリアスの後段に置くことで、
+# 文書・generator の変更が Intel 成果物の cache key を汚さないようにする。
 COPY ./docker/thirdparty/generate-license-document.py \
      ./docker/thirdparty/license-manifest.env \
      /build/docker/thirdparty/
@@ -115,14 +186,8 @@ COPY ./THIRD_PARTY_LICENSES.md /build/THIRD_PARTY_LICENSES.md
 RUN python3 /build/docker/thirdparty/generate-license-document.py --output /tmp/THIRD_PARTY_LICENSES.md && \
     cmp /build/THIRD_PARTY_LICENSES.md /tmp/THIRD_PARTY_LICENSES.md
 
-COPY ./docker/thirdparty/verify.sh \
-     ./docker/thirdparty/generate-cm-smoke-fixture.py \
-     /build/docker/thirdparty/
-RUN chmod +x /build/docker/thirdparty/verify.sh && \
-    NONFREE="${NONFREE}" /build/docker/thirdparty/verify.sh /opt/thirdparty
-
 # 同一 UID で動く ACP provider 間の資格情報を OS 強制で分離する Landlock launcher。
-# 既存の重い third-party build layer を C source 変更で無効化しないよう、独立した末尾 layer で構築する。
+# 重い Intel 成果物の cache key へ C source 変更を混ぜないよう、エイリアスの後段 layer で構築する。
 COPY ./docker/acp/KonomiTVBS4KACPSandbox.c /build/docker/acp/KonomiTVBS4KACPSandbox.c
 RUN cc -std=c17 -Wall -Wextra -Werror -Wconversion -Wformat=2 -Wshadow -Wstrict-prototypes \
         -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 -O2 \
@@ -308,7 +373,7 @@ RUN set -eu && \
 FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS runtime
 
 ARG CUDA_VERSION=12.4
-ARG NONFREE=true
+ARG NONFREE=nonfree
 ARG KONOMITV_UID=1000
 ARG KONOMITV_GID=1000
 LABEL cc.konomi.konomitv-bs4k.cuda-version="${CUDA_VERSION}" \
@@ -316,14 +381,21 @@ LABEL cc.konomi.konomitv-bs4k.cuda-version="${CUDA_VERSION}" \
 ENV TZ=Asia/Tokyo
 ENV DEBIAN_FRONTEND=noninteractive
 
+# 以降の RUN が同じ正規化結果を共有できるよう、展開済みプロファイルを固定パスへ残す（最終 RUN で削除する）
 RUN case "${CUDA_VERSION}" in \
         '12.4'|'12.8') ;; \
         *) echo 'CUDA_VERSION must be either 12.4 or 12.8.' >&2; exit 1 ;; \
     esac && \
     case "${NONFREE}" in \
-        'true'|'false') ;; \
-        *) echo 'NONFREE must be either true or false.' >&2; exit 1 ;; \
+        'nonfree'|'true') NONFREE_PROFILE='nonfree'; INTEL_NONFREE='true'; AMD_NONFREE='true' ;; \
+        'intel-nonfree') NONFREE_PROFILE='intel-nonfree'; INTEL_NONFREE='true'; AMD_NONFREE='false' ;; \
+        'amd-nonfree') NONFREE_PROFILE='amd-nonfree'; INTEL_NONFREE='false'; AMD_NONFREE='true' ;; \
+        'free'|'false') NONFREE_PROFILE='free'; INTEL_NONFREE='false'; AMD_NONFREE='false' ;; \
+        *) echo 'NONFREE must be one of nonfree, free, intel-nonfree or amd-nonfree (true and false are also accepted).' >&2; exit 1 ;; \
     esac && \
+    printf 'NONFREE_PROFILE=%s\nINTEL_NONFREE=%s\nAMD_NONFREE=%s\n' \
+        "${NONFREE_PROFILE}" "${INTEL_NONFREE}" "${AMD_NONFREE}" \
+        > /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
     apt-get update && apt-get install -y --no-install-recommends ca-certificates nala && \
     printf '%s\n' \
         'deb https://ftp.udx.icscoe.jp/Linux/ubuntu/ jammy main restricted universe multiverse' \
@@ -342,7 +414,7 @@ RUN case "${CUDA_VERSION}" in \
     nala update && nala upgrade -y && nala install -y --no-install-recommends curl git gpg tzdata && \
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics-keyring.gpg && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics-keyring.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2523 unified' > /etc/apt/sources.list.d/intel-gpu-jammy.list && \
-    if [ "${NONFREE}" = 'true' ]; then \
+    if [ "${AMD_NONFREE}" = 'true' ]; then \
         curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --yes --dearmor --output /usr/share/keyrings/rocm-keyring.gpg; \
         echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/amdgpu/6.4.4/ubuntu jammy main' > /etc/apt/sources.list.d/amdgpu.list; \
         echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/amdgpu/6.4.4/ubuntu jammy proprietary' > /etc/apt/sources.list.d/amdgpu-proprietary.list; \
@@ -357,7 +429,7 @@ RUN case "${CUDA_VERSION}" in \
         libtheora0 libtwolame0 libva-drm2 libva-x11-2 libvdpau1 libvidstab1.1 libvorbis0a libvorbisenc2 \
         libvpl2 libvpx7 libwebp7 libwebpmux3 libx11-xcb1 libx264-163 libx265-199 libxml2 libxvidcore4 \
         libzimg2 libzmq5 libzvbi0 libxxhash0 ocl-icd-libopencl1 && \
-    if [ "${NONFREE}" = 'true' ]; then \
+    if [ "${AMD_NONFREE}" = 'true' ]; then \
         nala install -y --no-install-recommends \
             amf-amdgpu-pro libamdenc-amdgpu-pro libdrm2-amdgpu mesa-amdgpu-va-drivers \
             rocm-opencl-runtime vulkan-amdgpu-pro; \
@@ -370,7 +442,7 @@ RUN case "${CUDA_VERSION}" in \
         nala install -y --no-install-recommends mesa-va-drivers; \
         if dpkg-query --show --showformat='${binary:Package}\n' 2>/dev/null | \
                 grep -Eq '^(amf-amdgpu-pro|libamdenc-amdgpu-pro|libdrm2-amdgpu|mesa-amdgpu-va-drivers|rocm-opencl-runtime|vulkan-amdgpu-pro)(:amd64)?$'; then \
-            echo 'AMD proprietary runtime package must not be installed when NONFREE=false.' >&2; \
+            echo 'AMD proprietary runtime package must not be installed when AMD_NONFREE=false.' >&2; \
             exit 1; \
         fi; \
         test ! -e /opt/amdgpu; \
@@ -379,7 +451,7 @@ RUN case "${CUDA_VERSION}" in \
         test ! -e /etc/apt/sources.list.d/amdgpu-proprietary.list; \
         test ! -e /etc/apt/sources.list.d/rocm.list; \
         if grep -RqsF 'repo.radeon.com' /etc/apt/sources.list /etc/apt/sources.list.d; then \
-            echo 'AMD repository must not be configured when NONFREE=false.' >&2; \
+            echo 'AMD repository must not be configured when AMD_NONFREE=false.' >&2; \
             exit 1; \
         fi; \
         test -e /usr/lib/x86_64-linux-gnu/dri/radeonsi_drv_video.so; \
@@ -476,7 +548,8 @@ RUN ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp /usr/local/bin/code
 
 WORKDIR /code/server/
 COPY --from=thirdparty-builder /opt/thirdparty/ /code/server/thirdparty/
-RUN test ! -e /code/server/thirdparty/Amatsukaze && \
+RUN . /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
+    test ! -e /code/server/thirdparty/Amatsukaze && \
     test ! -e /code/server/thirdparty/FFmpeg && \
     test ! -e /code/server/thirdparty/QSVEncC && \
     test ! -e /code/server/thirdparty/NVEncC && \
@@ -492,7 +565,9 @@ RUN test ! -e /code/server/thirdparty/Amatsukaze && \
     ffmpeg8_version="$(/code/server/thirdparty/FFmpeg8/ffmpeg8.elf -version | sed -n '1p')" && \
     ffmpeg8_amd_version="$(/code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh -version | sed -n '1p')" && \
     test "${ffmpeg8_amd_version}" = "${ffmpeg8_version}" && \
-    if [ "${NONFREE}" = 'true' ]; then \
+    grep -Fx "nonfree=${INTEL_NONFREE}" \
+        /code/server/thirdparty/Library/Intel-Media-Driver-Build-Configuration.txt && \
+    if [ "${AMD_NONFREE}" = 'true' ]; then \
         /code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh -hide_banner -filters 2>&1 | grep -Eq '[[:space:]]deinterlace_vaapi[[:space:]]'; \
     fi
 
@@ -646,7 +721,7 @@ COPY --from=thirdparty-builder /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/BUILDER
 COPY --from=acp-builder /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md /tmp/ACP_THIRD_PARTY_LICENSES.md
 COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PARTY_LICENSES.md \
     /tmp/OPENCODE_THIRD_PARTY_LICENSES.md
-RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree-runtime'; else nonfree_license_option=''; fi && \
+RUN . /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
     printf '%s  %s\n' \
         '8c09b6ef3ef6bf62858af66af73138b5a234231266c4736009d27233681a5dcf' \
         '/tmp/grapheme-0.6.0-LICENSE' | sha256sum --check --strict - && \
@@ -692,7 +767,7 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
         --manifest /tmp/ACP_THIRD_PARTY_LICENSES.md \
         --manifest /tmp/OPENCODE_THIRD_PARTY_LICENSES.md \
         --cuda-version "${CUDA_VERSION}" \
-        ${nonfree_license_option} \
+        --nonfree-profile "${NONFREE_PROFILE}" \
         --output /code/THIRD_PARTY_LICENSES.md && \
     grep -F '## ACP Runtime Dependencies' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### Node.js 20.16.0' /code/THIRD_PARTY_LICENSES.md && \
@@ -703,14 +778,35 @@ RUN if [ "${NONFREE}" = 'true' ]; then nonfree_license_option='--include-nonfree
     grep -F '## OpenCode Runtime Dependencies' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### opencode-ai 1.18.13' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### opencode-linux-x64 1.18.13' /code/THIRD_PARTY_LICENSES.md && \
-    if [ "${NONFREE}" = 'false' ]; then \
-        grep -Eq '^#### mesa-va-drivers(:amd64)? ' /code/THIRD_PARTY_LICENSES.md; \
-        if grep -Eq 'NONFREE_RUNTIME_WARNING|amf-amdgpu-pro|libamdenc-amdgpu-pro|mesa-amdgpu-va-drivers|vulkan-amdgpu-pro' \
-                /code/THIRD_PARTY_LICENSES.md; then \
-            echo 'NONFREE=false license document contains non-free runtime metadata.' >&2; \
+    # ライセンス文書が実際のビルドプロファイルと食い違っていないか、4 パターンで検査する。
+    # 警告見出しは free 以外で必須、Intel Full Feature と AMD proprietary の記述は各フラグと一致させる。
+    if [ "${NONFREE_PROFILE}" = 'free' ]; then \
+        if grep -Fq '再配布しないでください' /code/THIRD_PARTY_LICENSES.md; then \
+            echo 'free license document contains the redistribution warning.' >&2; \
             exit 1; \
         fi; \
+    else \
+        grep -Fq '重要: この Docker イメージは再配布しないでください。' /code/THIRD_PARTY_LICENSES.md; \
     fi && \
+    if [ "${INTEL_NONFREE}" = 'false' ]; then \
+        if grep -Fq 'ENABLE_NONFREE_KERNELS=ON' /code/THIRD_PARTY_LICENSES.md; then \
+            echo 'Intel free-kernel license document contains Full Feature metadata.' >&2; \
+            exit 1; \
+        fi; \
+    else \
+        grep -Fq 'ENABLE_NONFREE_KERNELS=ON' /code/THIRD_PARTY_LICENSES.md; \
+    fi && \
+    if [ "${AMD_NONFREE}" = 'false' ]; then \
+        grep -Eq '^#### mesa-va-drivers(:amd64)? ' /code/THIRD_PARTY_LICENSES.md; \
+        if grep -Eq 'amf-amdgpu-pro|libamdenc-amdgpu-pro|mesa-amdgpu-va-drivers|vulkan-amdgpu-pro' \
+                /code/THIRD_PARTY_LICENSES.md; then \
+            echo 'AMD-free license document contains proprietary runtime metadata.' >&2; \
+            exit 1; \
+        fi; \
+    else \
+        grep -Fq 'amf-amdgpu-pro' /code/THIRD_PARTY_LICENSES.md; \
+    fi && \
+    rm -f /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
     rm /tmp/BASE_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md \
         /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
         /tmp/ACP_THIRD_PARTY_LICENSES.md /tmp/OPENCODE_THIRD_PARTY_LICENSES.md \

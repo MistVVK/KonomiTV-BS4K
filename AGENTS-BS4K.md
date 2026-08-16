@@ -115,17 +115,21 @@ docker compose up -d --no-build --force-recreate konomitv
 
 ## 再配布について
 
-AMDのプロプライエタリを混ぜないDocker buildはffmpeg（libx265）などのGPL3+と両立するようにしたい。
-AMDのプロプライエタリを入れる選択の場合はユーザがビルドしてるのでセーフという立場をとる。
+free プロファイルのみ再配布可能とし、nonfree / intel-nonfree / amd-nonfree は再配布不可とする。
+free の Docker build は ffmpeg（libx265）などの GPL3+ と両立するようにしたい。
+AMD のプロプライエタリや Intel の非自由カーネルを入れる選択の場合はユーザがビルドしてるのでセーフという立場をとる。
 
 ## konomitv buildについて
 
 - CUDAバージョン
   - 12.4
   - 12.8
-- NONFREE
-  - TRUE
-  - FALSE
+- NONFREE（enum、Compose は `KONOMITV_NONFREE` 1本。Intel / AMD フラグへの展開は Dockerfile が行う）
+  - `nonfree`: Intel 非自由カーネル + AMD proprietary runtime（再配布不可）
+  - `intel-nonfree`: Intel 非自由カーネルのみ（再配布不可）
+  - `amd-nonfree`: AMD proprietary runtime のみ（再配布不可）
+  - `free`: 両方なし（再配布可能）
+  - 互換: `true` → `nonfree`、`false` → `free`（既存 .env を壊さない）
 
 ## Git コミットメッセージ規則
 
