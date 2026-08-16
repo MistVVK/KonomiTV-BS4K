@@ -9,6 +9,11 @@ from pathlib import Path
 
 NONFREE_WARNING_START = '<!-- NONFREE_RUNTIME_WARNING_START -->'
 NONFREE_WARNING_END = '<!-- NONFREE_RUNTIME_WARNING_END -->'
+INTEL_NONFREE_WARNING_START = '<!-- INTEL_NONFREE_WARNING_START -->'
+INTEL_NONFREE_WARNING_END = '<!-- INTEL_NONFREE_WARNING_END -->'
+AMD_NONFREE_WARNING_START = '<!-- AMD_NONFREE_WARNING_START -->'
+AMD_NONFREE_WARNING_END = '<!-- AMD_NONFREE_WARNING_END -->'
+NONFREE_PROFILES = ('nonfree', 'free', 'intel-nonfree', 'amd-nonfree')
 DOCUMENT_TITLE = '# Third-Party Software Licenses'
 CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 ATX_HEADING = re.compile(r'^(#{1,6})[ \t]+(.+?)\s*$')
@@ -111,6 +116,62 @@ def ValidateDocumentHierarchy(path: Path, document: str, *, contains_title: bool
         previous_level = level
 
 
+def AssembleNonfreeWarning(base_document: str, profile: str) -> tuple[str, int]:
+    """
+    基礎文書の警告ブロックをプロファイルに合わせて組み立て直す。
+
+    警告ブロックは見出しを共通にして、Intel Full Feature 節と AMD proprietary 節だけを
+    プロファイルに応じて出し分ける。マーカーは完成文書へ残さずすべて除去する。
+
+    Args:
+        base_document (str): 警告ブロックを含む基礎文書
+        profile (str): NONFREE_PROFILES のいずれかのプロファイル名
+
+    Returns:
+        tuple[str, int]: 警告ブロックを置換した文書と、警告ブロック末尾の文字位置
+    """
+
+    outer_start = base_document.index(NONFREE_WARNING_START)
+    outer_end_marker_start = base_document.index(NONFREE_WARNING_END)
+    outer_end = outer_end_marker_start + len(NONFREE_WARNING_END)
+    if profile == 'free':
+        # free プロファイルはブロックごと除去し、プロファイルカードを文書タイトルの直後へ置く
+        base_document = base_document[:outer_start] + base_document[outer_end:]
+        if not base_document.startswith(DOCUMENT_TITLE + '\n'):
+            raise ValueError(f'Base document must start with {DOCUMENT_TITLE!r}.')
+        return base_document, len(DOCUMENT_TITLE)
+
+    # 基礎文書は「見出し / Intel 節 / AMD 節 / 共通注記」の順で全節を持ち、
+    # 空の ">" 行（段落区切り）を節の外側に置くことで、必要な節だけを正しく連結できるようにする。
+    intel_start = base_document.index(INTEL_NONFREE_WARNING_START)
+    intel_end_marker_start = base_document.index(INTEL_NONFREE_WARNING_END)
+    intel_end = intel_end_marker_start + len(INTEL_NONFREE_WARNING_END)
+    amd_start = base_document.index(AMD_NONFREE_WARNING_START)
+    amd_end_marker_start = base_document.index(AMD_NONFREE_WARNING_END)
+    amd_end = amd_end_marker_start + len(AMD_NONFREE_WARNING_END)
+
+    heading_part = base_document[outer_start + len(NONFREE_WARNING_START):intel_start]
+    intel_part = base_document[intel_start + len(INTEL_NONFREE_WARNING_START):intel_end_marker_start]
+    between_part = base_document[intel_end:amd_start]
+    amd_part = base_document[amd_start + len(AMD_NONFREE_WARNING_START):amd_end_marker_start]
+    tail_part = base_document[amd_end:outer_end_marker_start]
+
+    include_intel = profile in ('nonfree', 'intel-nonfree')
+    include_amd = profile in ('nonfree', 'amd-nonfree')
+    sections = [heading_part.strip('\n')]
+    if include_intel:
+        sections.append(intel_part.strip('\n'))
+        # Intel 節と AMD 節の間の区切り行は、両節とも残る場合だけ必要
+        if include_amd:
+            sections.append(between_part.strip('\n'))
+    if include_amd:
+        sections.append(amd_part.strip('\n'))
+    sections.append(tail_part.strip('\n'))
+    assembled_block = '\n'.join(sections)
+    base_document = base_document[:outer_start] + assembled_block + base_document[outer_end:]
+    return base_document, outer_start + len(assembled_block)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--base', type=Path, required=True)
@@ -118,7 +179,7 @@ def main() -> None:
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--manifest', type=Path, action='append', default=[])
     parser.add_argument('--cuda-version', required=True)
-    parser.add_argument('--include-nonfree-runtime', action='store_true')
+    parser.add_argument('--nonfree-profile', required=True, choices=NONFREE_PROFILES)
     args = parser.parse_args()
 
     base_document = readDocument(args.base)
@@ -131,35 +192,28 @@ def main() -> None:
         ValidateDocumentHierarchy(manifest, manifest_document, contains_title=False)
         manifest_documents.append((manifest, manifest_document))
     cuda_version = args.cuda_version.replace('-', '.')
-    profile = f'cuda{cuda_version}-{"nonfree" if args.include_nonfree_runtime else "free"}'
-    if args.include_nonfree_runtime:
+    profile = args.nonfree_profile
+    if profile in ('nonfree', 'intel-nonfree'):
         intel_media_driver = 'Full Feature iHD (`ENABLE_NONFREE_KERNELS=ON`)'
-        amd_media_runtime = 'AMD proprietary runtime'
     else:
         intel_media_driver = 'Free Kernel iHD (`ENABLE_NONFREE_KERNELS=OFF`)'
+    if profile in ('nonfree', 'amd-nonfree'):
+        amd_media_runtime = 'AMD proprietary runtime'
+    else:
         amd_media_runtime = 'Mesa'
     target_document = '\n'.join([
         '> **Docker image build profile**',
         '>',
-        f'> - Profile: `{profile}`',
+        f'> - Profile: `cuda{cuda_version}-{profile}`',
         f'> - CUDA package series: `{cuda_version}`',
-        f'> - NONFREE runtime included: `{str(args.include_nonfree_runtime).lower()}`',
         f'> - Intel media driver: {intel_media_driver}',
         f'> - AMD media runtime: {amd_media_runtime}',
         '> - NVIDIA driver libraries are supplied by the host at runtime and are not included in this image.',
     ])
 
-    # NONFREE runtime を含む場合は、再配布警告を読んだ直後にビルド条件を確認できるよう警告全体の直後へ配置する
-    # NONFREE runtime を含まない場合は警告自体を除去し、文書タイトルの直後へ同じカードを配置する
-    if args.include_nonfree_runtime:
-        target_insertion_point = base_document.index(NONFREE_WARNING_END) + len(NONFREE_WARNING_END)
-    else:
-        warning_start = base_document.index(NONFREE_WARNING_START)
-        warning_end = base_document.index(NONFREE_WARNING_END) + len(NONFREE_WARNING_END)
-        base_document = base_document[:warning_start] + base_document[warning_end:]
-        if not base_document.startswith(DOCUMENT_TITLE + '\n'):
-            raise ValueError(f'Base document must start with {DOCUMENT_TITLE!r}.')
-        target_insertion_point = len(DOCUMENT_TITLE)
+    # 非自由コンポーネントを含む場合は、再配布警告を読んだ直後にビルド条件を確認できるよう警告全体の直後へ配置する
+    # 警告ブロックはプロファイルに合わせて節を出し分けてから、プロファイルカードの挿入位置をその直後に決める
+    base_document, target_insertion_point = AssembleNonfreeWarning(base_document, profile)
     base_document = (
         base_document[:target_insertion_point].rstrip() + '\n\n' + target_document + '\n\n' +
         base_document[target_insertion_point:].lstrip()

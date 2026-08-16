@@ -158,7 +158,7 @@ def _render_collapsible_licenses(markdown: MarkdownIt, source: str) -> str:
     # Raw HTML を許可せずに警告とビルド条件だけを専用カードとして装飾できるよう、
     # 生成文書で固定している先頭の強調テキストを基準に blockquote へ意味的なクラスを付与する
     blockquote_classes = {
-        '重要: NONFREE=true でビルドした Docker イメージは再配布しないでください。': 'redistribution-warning',
+        '重要: この Docker イメージは再配布しないでください。': 'redistribution-warning',
         'Docker image build profile': 'docker-build-target',
     }
     for index, token in enumerate(tokens):

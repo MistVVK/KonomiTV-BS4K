@@ -22,7 +22,7 @@ def test_third_party_licenses_api_renders_markdown_as_html(tmp_path: Path) -> No
     licenses_path = tmp_path / 'THIRD_PARTY_LICENSES.md'
     licenses_path.write_text(
         '# Licenses\n\n<!-- Internal note. -->\n\n'
-        '> **重要: `NONFREE=true` でビルドした Docker イメージは再配布しないでください。**\n>\n> Warning.\n\n'
+        '> **重要: この Docker イメージは再配布しないでください。**\n>\n> Warning.\n\n'
         '> **Docker image build profile**\n>\n> - Profile: `cuda12.4-nonfree`\n\n'
         'Paragraph with a [link](https://example.com).\n\n'
         '## Chromium 1.2.3\n\nCopyright text.\n\n```text\n## Not a section\n```\n\n'

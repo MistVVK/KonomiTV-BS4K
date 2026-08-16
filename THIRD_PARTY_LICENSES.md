@@ -1,11 +1,17 @@
 # Third-Party Software Licenses
 
 <!-- NONFREE_RUNTIME_WARNING_START -->
-> **重要: `NONFREE=true` でビルドした Docker イメージは再配布しないでください。**
+> **重要: この Docker イメージは再配布しないでください。**
 >
-> このビルドプロファイルには、Intel Media Driver の Full Feature 版（`ENABLE_NONFREE_KERNELS=ON`）と AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro` など）が含まれます。
+<!-- INTEL_NONFREE_WARNING_START -->
+> このビルドプロファイルには、Intel Media Driver の Full Feature 版（`ENABLE_NONFREE_KERNELS=ON`）が含まれます。
+<!-- INTEL_NONFREE_WARNING_END -->
+>
+<!-- AMD_NONFREE_WARNING_START -->
+> このビルドプロファイルには、AMD proprietary runtime（`amf-amdgpu-pro`、`libamdenc-amdgpu-pro`、`vulkan-amdgpu-pro` など）が含まれます。
 >
 > AMD proprietary runtime に同梱される AMD Software End User License Agreement は、Software の配布・公開・表示・サブライセンス・譲渡・移転を禁止し、AMD プロセッサーを組み込んだシステムまたはコンポーネントでのインストールと使用に限定しています。したがって、これらのパッケージを含む完成イメージを再配布または移転せず、EULA が許諾する AMD 環境でのローカル利用に限定してください。AMD の現行 EULA: <https://www.amd.com/en/legal/eula/amd-software-eula.html>
+<!-- AMD_NONFREE_WARNING_END -->
 >
 > また、完成イメージには GPL version 3 or later で提供される FFmpeg など、別の条件が適用されるソフトウェアも含まれます。この注意書きは各ライセンスの条件を変更したり、追加の権利を許諾したりするものではありません。利用者自身で、完成イメージに含まれるすべてのライセンス条件を確認してください。
 <!-- NONFREE_RUNTIME_WARNING_END -->

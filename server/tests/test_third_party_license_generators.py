@@ -12,17 +12,28 @@ CLIENT_GENERATOR_PATH = REPOSITORY_ROOT / 'client/scripts/generate-license-docum
 BASE_LICENSE_DOCUMENT_PATH = REPOSITORY_ROOT / 'THIRD_PARTY_LICENSES.md'
 
 
-def RunAssembler(tmp_path: Path, *, include_nonfree_runtime: bool) -> str:
+def RunAssembler(tmp_path: Path, *, profile: str) -> str:
     base_path = tmp_path / 'base.md'
     client_path = tmp_path / 'client.md'
     builder_path = tmp_path / 'builder.md'
     runtime_path = tmp_path / 'runtime.md'
-    output_path = tmp_path / ('nonfree.md' if include_nonfree_runtime else 'free.md')
+    output_path = tmp_path / f'{profile}.md'
     base_path.write_text(
         '# Third-Party Software Licenses\n\n'
         '<!-- NONFREE_RUNTIME_WARNING_START -->\n'
-        '> **重要: `NONFREE=true` でビルドした Docker イメージは再配布しないでください。**\n'
-        '>\n> Warning.\n'
+        '> **重要: この Docker イメージは再配布しないでください。**\n'
+        '>\n'
+        '<!-- INTEL_NONFREE_WARNING_START -->\n'
+        '> Intel Full Feature 節。\n'
+        '<!-- INTEL_NONFREE_WARNING_END -->\n'
+        '>\n'
+        '<!-- AMD_NONFREE_WARNING_START -->\n'
+        '> AMD proprietary 節。\n'
+        '>\n'
+        '> AMD EULA 節。\n'
+        '<!-- AMD_NONFREE_WARNING_END -->\n'
+        '>\n'
+        '> GPL 注記。\n'
         '<!-- NONFREE_RUNTIME_WARNING_END -->\n\n'
         '<!-- Document note. -->\n\n'
         '## Directly Managed Third-Party Components\n\n'
@@ -51,13 +62,40 @@ def RunAssembler(tmp_path: Path, *, include_nonfree_runtime: bool) -> str:
         '--client', str(client_path),
         '--output', str(output_path),
         '--cuda-version', '12-4',
+        '--nonfree-profile', profile,
         '--manifest', str(builder_path),
         '--manifest', str(runtime_path),
     ]
-    if include_nonfree_runtime:
-        command.append('--include-nonfree-runtime')
     subprocess.run(command, check = True)
     return output_path.read_text(encoding = 'utf-8')
+
+
+@pytest.mark.parametrize(
+    'profile, expected_warning, expected_intel, expected_amd',
+    [
+        ('nonfree', True, True, True),
+        ('free', False, False, False),
+        ('intel-nonfree', True, True, False),
+        ('amd-nonfree', True, False, True),
+    ],
+)
+def test_runtime_license_assembler_selects_warning_sections_by_profile(
+    tmp_path: Path, profile: str, expected_warning: bool, expected_intel: bool, expected_amd: bool,
+) -> None:
+    """警告ブロックの節とプロファイルカードがプロファイルどおりに出し分けられる。"""
+
+    document = RunAssembler(tmp_path, profile = profile)
+
+    heading = '> **重要: この Docker イメージは再配布しないでください。**'
+    assert (heading in document) == expected_warning
+    assert ('> Intel Full Feature 節。' in document) == expected_intel
+    assert ('> AMD proprietary 節。' in document) == expected_amd
+    assert ('> AMD EULA 節。' in document) == expected_amd
+    # GPL 注記は警告ブロックの一部であり、free では警告ごと除去される
+    assert ('> GPL 注記。' in document) == expected_warning
+    assert f'> - Profile: `cuda12.4-{profile}`' in document
+    # 出し分け用マーカーは完成文書へ一切残らない
+    assert 'NONFREE_WARNING' not in document
 
 
 
