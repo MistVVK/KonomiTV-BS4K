@@ -1,0 +1,18 @@
+--- a/libavformat/libaribtlv.c
++++ b/libavformat/libaribtlv.c
+@@ -214,6 +214,7 @@ static void libaribtlv_on_track(void *opaque, const aribtlv_track_info *track)
+     }
+ 
+     st->id                   = track->packet_id;
++    av_dict_set_int(&st->metadata, "context_id", track->context_id, 0);
+     st->codecpar->codec_type = libaribtlv_media_type(track->kind);
+     st->codecpar->codec_id   = libaribtlv_codec_id(track->codec);
+     st->codecpar->codec_tag  = 0;
+@@ -259,6 +260,7 @@ static void libaribtlv_on_track(void *opaque, const aribtlv_track_info *track)
+                                                  data_st->index);
+         }
+         data_st->id                   = track->packet_id;
++        av_dict_set_int(&data_st->metadata, "context_id", track->context_id, 0);
+         data_st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+         data_st->codecpar->codec_id   = AV_CODEC_ID_TIMED_ID3;
+         data_st->codecpar->codec_tag  = MKTAG('I', 'D', '3', ' ');

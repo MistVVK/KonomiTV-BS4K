@@ -4590,6 +4590,7 @@ The fixed upstream revisions, complete local patches, dependency revisions, and 
 - Local patches:
   - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`ea2b9a95f2bf4368f3d61428d1f121f2406e6d5e27390a7b5fc016af757c256e`)
   - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`016307760c5a71f1206b253c49904c33cf34ccdba007f8c0702fe3f676ee3a1e`)
+  - `ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch` (`5cbbae0849893d7cda9b5d7830be437298a4ed1887d0012af6f9259459e11107`)
   - `amf-1.4.36-display-capture-c.patch` (`3527641c277d534d223dcfb669fdff465be9ceca1fe60713c6dcc2880d939f25`)
 
 #### Intel media stack

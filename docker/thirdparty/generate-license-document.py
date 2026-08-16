@@ -352,6 +352,7 @@ def main() -> None:
         '- Local patches:',
         f'  - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`{manifest["LIBARIBTLV_SUBTITLE_MFU_PATCH_SHA256"]}`)',
         f'  - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`{manifest["FFMPEG_LIBARIBTLV_TIMED_ID3_PATCH_SHA256"]}`)',
+        f'  - `ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch` (`{manifest["FFMPEG_LIBARIBTLV_CONTEXT_ID_METADATA_PATCH_SHA256"]}`)',
         f'  - `amf-1.4.36-display-capture-c.patch` (`{manifest["AMF_DISPLAY_CAPTURE_C_PATCH_SHA256"]}`)',
         '',
         '#### Intel media stack', '',

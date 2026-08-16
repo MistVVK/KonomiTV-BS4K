@@ -72,6 +72,8 @@ echo "${LIBARIBTLV_SUBTITLE_MFU_PATCH_SHA256}  ${SCRIPT_DIR}/patches/libaribtlv-
     sha256sum --check --strict
 echo "${FFMPEG_LIBARIBTLV_TIMED_ID3_PATCH_SHA256}  ${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch" | \
     sha256sum --check --strict
+echo "${FFMPEG_LIBARIBTLV_CONTEXT_ID_METADATA_PATCH_SHA256}  ${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch" | \
+    sha256sum --check --strict
 git -C "${libaribtlv_source}" apply --check \
     "${SCRIPT_DIR}/patches/libaribtlv-0.2.0-konomitv-subtitle-mfu.patch"
 git -C "${libaribtlv_source}" apply \
@@ -98,7 +100,8 @@ for patch_path in \
     "${ffmpeg_libaribtlv_patch_directory}/0001-Add-ARIB-MMT-TLV-demuxer-support-via-libaribtlv.patch" \
     "${ffmpeg_libaribtlv_patch_directory}/0002-avformat-libaribtlv-report-recording-duration.patch" \
     "${ffmpeg_libaribtlv_patch_directory}/0003-avformat-libaribtlv-support-timestamp-seeking.patch" \
-    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch"; do
+    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch" \
+    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch"; do
     git -C "${ffmpeg_source}" apply --check "${patch_path}"
     git -C "${ffmpeg_source}" apply "${patch_path}"
 done
