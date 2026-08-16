@@ -158,6 +158,9 @@ config.yaml
 # Development のローカル状態
 docker/development/state/
 
+# opencode コンテナ用 Node.js 依存のホスト展開物
+/docker/opencode/node_modules/
+
 # user files
 server/data/*
 !server/data/account-icons/

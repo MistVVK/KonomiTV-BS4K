@@ -11,6 +11,7 @@ compose.override.yaml
 
 # node_modules: ファイル数が多すぎてコピーに時間がかかる
 client/node_modules/
+docker/opencode/node_modules/
 
 # ホスト側の既存 build 成果物: Docker 内で再生成する
 client/dist/
