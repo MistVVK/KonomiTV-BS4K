@@ -261,6 +261,7 @@ def test_nvidia_compose_contains_all_nvidia_runtime_settings() -> None:
         'NVIDIA_VISIBLE_DEVICES': 'all',
         'NVIDIA_DRIVER_CAPABILITIES': 'compute,utility,video',
     }
+    assert service.get('devices') is None
     assert devices == [{
         'driver': 'nvidia',
         'count': 'all',
