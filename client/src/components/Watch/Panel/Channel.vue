@@ -2,24 +2,26 @@
     <div class="channels-container channels-container--watch">
         <div class="channels-tab">
             <div class="channels-tab__buttons" :style="{
-                '--tab-length': Array.from(channelsStore.channels_list_with_pinned_for_watch).length,
+                '--tab-length': channel_tabs.length,
                 '--active-tab-index': active_tab_index,
             }">
                 <v-btn variant="flat" class="channels-tab__button"
-                    v-for="([channels_type,], index) in Array.from(channelsStore.channels_list_with_pinned_for_watch)" :key="channels_type"
+                    v-for="([channels_type,], index) in channel_tabs" :key="channels_type"
                     @click="active_tab_index = index">
                     {{channels_type}}
                 </v-btn>
                 <div class="channels-tab__highlight"></div>
             </div>
         </div>
-        <div class="channels-list-container">
+        <div ref="channels_list_container" class="channels-list-container">
             <Swiper class="channels-list" :space-between="32" :auto-height="true" :touch-start-prevent-default="false"
-                :observer="true" :observe-parents="true"
                 @swiper="swiper_instance = $event"
-                @slide-change="active_tab_index = $event.activeIndex">
-                <SwiperSlide v-for="[channels_type, channels] in Array.from(channelsStore.channels_list_with_pinned_for_watch)" :key="channels_type">
+                @slide-change="onSwiperSlideChange"
+                @slider-first-move="onSwiperSliderFirstMove"
+                @slide-change-transition-end="onSwiperSlideChangeTransitionEnd">
+                <SwiperSlide v-for="([channels_type, channels], index) in channel_tabs" :key="channels_type">
                     <div class="channels">
+                        <template v-if="isChannelTabMounted(index)">
                         <router-link v-ripple class="channel" draggable="false"
                             v-for="channel in channels" :key="channel.id" :to="`/tv/watch/${channel.display_channel_id}`">
                             <!-- 以下では Icon コンポーネントを使うとチャンネルが多いときに高負荷になるため、意図的に SVG を直書きしている -->
@@ -60,6 +62,7 @@
                                     :style="`width:${ProgramUtils.getProgramProgress(ChannelUtils.getProgramPresentForDisplay(channel))}%;`"></div>
                             </div>
                         </router-link>
+                        </template>
                     </div>
                 </SwiperSlide>
              </Swiper>
@@ -98,48 +101,125 @@ export default defineComponent({
 
             // Swiper のインスタンス
             swiper_instance: null as SwiperClass | null,
+
+            // タブごとに最後に表示していたリストのスクロール位置を保持する
+            tab_scroll_positions: {} as Record<string, number>,
+
+            // スワイプ開始方向の隣タブだけ先に載せる。非表示タブのカードを常時 DOM に残さないため。
+            swipe_neighbor_tab_index: null as number | null,
+
+            // スワイプアニメ中は移動元タブも残す。slideChange 直後に空スライドが横切らないようにする。
+            swipe_origin_tab_index: null as number | null,
         };
     },
     computed: {
         ...mapStores(useChannelsStore, usePlayerStore, useSettingsStore),
+        // 表示順を含めたタブ一覧を1か所で保持し、タブとスライドの対応を常に一致させる
+        channel_tabs() {
+            return Array.from(this.channelsStore.channels_list_with_pinned_for_watch);
+        },
     },
     watch: {
-        active_tab_index() {
-            // content-visibility: auto の指定の関係でうまく計算されないことがある Swiper の autoHeight を強制的に再計算する
-            this.swiper_instance?.updateAutoHeight();
-            // 現在なアクティブなタブを Swiper 側に随時反映する
-            this.swiper_instance?.slideTo(this.active_tab_index);
+        active_tab_index(active_tab_index, previous_active_tab_index) {
+            // タブを切り替える直前のスクロール位置を、移動元のタブに記録する
+            if (active_tab_index !== previous_active_tab_index) {
+                const previous_channels_type = this.channel_tabs[previous_active_tab_index]?.[0];
+                const scroll_container = this.getChannelsListContainer();
+                if (previous_channels_type !== undefined && scroll_container !== null) {
+                    this.tab_scroll_positions[previous_channels_type] = scroll_container.scrollTop;
+                }
+            }
+
+            const swiper = this.swiper_instance;
+            // タブボタンからの切替は中間タブを横切らないよう、即時に目的タブへ移す
+            if (swiper !== null && swiper.activeIndex !== active_tab_index) {
+                this.swipe_neighbor_tab_index = null;
+                this.swipe_origin_tab_index = null;
+                swiper.slideTo(active_tab_index, 0);
+                this.$nextTick(() => {
+                    this.restoreActiveTabScrollPosition();
+                });
+            }
+        },
+        channel_tabs(channel_tabs) {
+            if (channel_tabs.length === 0) {
+                this.active_tab_index = 0;
+            } else if (this.active_tab_index >= channel_tabs.length) {
+                this.active_tab_index = channel_tabs.length - 1;
+            }
+            if (this.swipe_neighbor_tab_index !== null && this.swipe_neighbor_tab_index >= channel_tabs.length) {
+                this.swipe_neighbor_tab_index = null;
+            }
+            if (this.swipe_origin_tab_index !== null && this.swipe_origin_tab_index >= channel_tabs.length) {
+                this.swipe_origin_tab_index = null;
+            }
         },
         async 'playerStore.tv_panel_active_tab'() {
-            // content-visibility: auto の指定の関係でうまく計算されないことがある Swiper の autoHeight を強制的に再計算する
-            await Utils.sleep(0.05);  // 少し待ってから
+            // 非表示パネルから戻った直後は高さが 0 のままなので、表示後に autoHeight を取り直す
+            await Utils.sleep(0.05);
             this.swiper_instance?.updateAutoHeight();
         },
         async 'playerStore.video_panel_active_tab'() {
-            // content-visibility: auto の指定の関係でうまく計算されないことがある Swiper の autoHeight を強制的に再計算する
-            await Utils.sleep(0.05);  // 少し待ってから
+            await Utils.sleep(0.05);
             this.swiper_instance?.updateAutoHeight();
         },
     },
     async mounted() {
-
-        // content-visibility: auto の指定の関係でうまく計算されないことがある Swiper の autoHeight を強制的に再計算する
-        await Utils.sleep(0.05);  // 少し待ってから
+        await this.$nextTick();
         this.swiper_instance?.updateAutoHeight();
+    },
+    methods: {
+        // 表示中タブと、スワイプ中の隣タブだけカードを DOM に載せる
+        isChannelTabMounted(index: number): boolean {
+            return index === this.active_tab_index ||
+                index === this.swipe_neighbor_tab_index ||
+                index === this.swipe_origin_tab_index;
+        },
 
-        // .channels-list-container がスクロールされたときに Swiper の autoHeight を再計算する
-        document.querySelector<HTMLDivElement>('.channels-list-container')?.addEventListener('scroll', () => {
-            this.swiper_instance?.updateAutoHeight();
-        }, { passive: true });
+        // 視聴パネル内のチャンネルリストは window ではなくこのコンテナがスクロールする
+        getChannelsListContainer(): HTMLElement | null {
+            return (this.$refs.channels_list_container as HTMLElement | undefined) ?? null;
+        },
 
-        // 既定のパネルのアクティブなタブがチャンネルタブ (つまりもうこのタブが表示されている) 場合は、さらに 0.1 秒間隔で 2 秒間繰り返す
-        // ゴリ押し以外になんとかする方法がなかった…
-        if (this.playerStore.tv_panel_active_tab === 'Channel') {
-            for (let i = 0; i < 20; i++) {
-                await Utils.sleep(0.1);
-                this.swiper_instance?.updateAutoHeight();
+        // スワイプ開始方向の隣タブだけ先読みする
+        onSwiperSliderFirstMove(swiper: SwiperClass): void {
+            const start_x = swiper.touches.startX;
+            const current_x = swiper.touches.currentX;
+            if (current_x === start_x) {
+                return;
             }
-        }
+            const neighbor_index = current_x < start_x ? this.active_tab_index + 1 : this.active_tab_index - 1;
+            if (neighbor_index < 0 || neighbor_index >= this.channel_tabs.length) {
+                this.swipe_neighbor_tab_index = null;
+                this.swipe_origin_tab_index = null;
+                return;
+            }
+            this.swipe_origin_tab_index = this.active_tab_index;
+            this.swipe_neighbor_tab_index = neighbor_index;
+        },
+
+        // 指での横スライドがタブ index を変えたときに、ボタン側の選択状態へ反映する
+        onSwiperSlideChange(swiper: SwiperClass): void {
+            this.active_tab_index = swiper.activeIndex;
+        },
+
+        // スワイプアニメ終了後に先読みを外し、保存済みの縦位置へ戻す
+        onSwiperSlideChangeTransitionEnd(): void {
+            this.swipe_neighbor_tab_index = null;
+            this.swipe_origin_tab_index = null;
+            this.restoreActiveTabScrollPosition();
+        },
+
+        // 表示中タブに保存してあるリストのスクロール位置を復元する
+        restoreActiveTabScrollPosition(): void {
+            const channels_type = this.channel_tabs[this.active_tab_index]?.[0];
+            const scroll_container = this.getChannelsListContainer();
+            if (channels_type === undefined || scroll_container === null) {
+                return;
+            }
+            this.swiper_instance?.updateAutoHeight(0);
+            scroll_container.scrollTop = this.tab_scroll_positions[channels_type] ?? 0;
+        },
     },
 });
 
