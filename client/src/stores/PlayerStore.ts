@@ -207,6 +207,9 @@ const usePlayerStore = defineStore('player', {
         // 既定で null (未視聴) とする
         live_stream_status: null as 'Offline' | 'Standby' | 'ONAir' | 'Idling' | 'Restart' | null,
 
+        // ライブ視聴: 現在のライブストリームが降雨対応放送 (1080p 低階層) を映像に使っているかどうか
+        is_rain_fallback: false,
+
         // ライブ視聴: ニコニコ実況への接続に失敗した際のエラーメッセージ
         // null のとき、エラーは発生していないとみなす
         live_comment_init_failed_message: null as string | null,
@@ -294,6 +297,7 @@ const usePlayerStore = defineStore('player', {
             this.background_url = '';
             this.shortcut_key_modal = false;
             this.live_stream_status = null;
+            this.is_rain_fallback = false;
             this.live_comment_init_failed_message = null;
             this.twitter_captures = [];
             this.twitter_zoom_capture_modal = false;

@@ -12,8 +12,9 @@ describe('KonomiTV-BS4K live URL helper', () => {
             video_codec: 'av1',
             video_bit_depth: 10,
             audio_codec: 'opus',
+            use_rain_fallback: true,
         });
-        expect(query).toBe('video_codec=av1&video_bit_depth=10&audio_codec=opus');
+        expect(query).toBe('video_codec=av1&video_bit_depth=10&audio_codec=opus&use_rain_fallback=1');
 
         const mpegts_url = PlayerUtils.buildKonomiTVBS4KLiveAPIEndpointURL(
             'bs4k101', '1080p-60fps-10bit', 'mpegts', query,

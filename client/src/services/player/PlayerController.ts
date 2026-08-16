@@ -217,6 +217,9 @@ class PlayerController {
     // L字画面のクロップ設定で使うウォッチャーを保持する配列
     private lshaped_screen_crop_watchers: (() => void)[] = [];
 
+    // 現在使用中の映像階層を設定パネルへ反映するウォッチャーを保持する配列
+    private rain_fallback_watchers: (() => void)[] = [];
+
     // 破棄中かどうか
     // 破棄中は destroy() が呼ばれても何もしない
     private destroying = false;
@@ -790,11 +793,20 @@ class PlayerController {
                 // ライブ視聴: チャンネル情報がセットされているはず
                 if (this.playback_mode === 'Live') {
                     // ライブストリーミング API のベース URL
+                    // 降雨対応放送の自動利用は BSP4K (SID 101) と BS8K (SID 102) で個別に設定できる。
+                    const use_rain_fallback = is_bs4k_live_playback === true ? (
+                        channels_store.channel.current.service_id === 102 ?
+                            settings_store.settings.tv_use_rain_fallback_for_bs8k :
+                            channels_store.channel.current.service_id === 101 ?
+                                settings_store.settings.tv_use_rain_fallback_for_bs4k :
+                                false
+                    ) : true;
                     const live_playback_codec_query =
                         PlayerUtils.buildKonomiTVBS4KLivePlaybackCodecQuery({
                             video_codec: effective_video_codec,
                             video_bit_depth: effective_video_bit_depth,
                             audio_codec: effective_audio_codec,
+                            use_rain_fallback,
                         });
                     // ラジオチャンネルの場合
                     // API が受け付ける画質の値は通常のチャンネルと同じだが (手抜き…)、実際の画質は 48KHz/192kbps で固定される
@@ -3638,6 +3650,33 @@ class PlayerController {
                 </span>
             </div>
         ` : '';
+        // 降雨対応放送の対象局かつ TLV ライブの場合だけ、現在このストリームが選択した映像階層を表示する。
+        // false は低階層の放送有無ではなく、自動利用 OFF や 4K 視聴を含めて主階層を使用中という意味になる。
+        const is_rain_fallback_available = (
+            this.playback_mode === 'Live' &&
+            channels_store.channel.current.display_channel_id.startsWith('bs4k') === true &&
+            [101, 102].includes(channels_store.channel.current.service_id) &&
+            version_store.server_version_info?.konomitv_bs4k_live_transport === 'Tlv'
+        );
+        const rain_fallback_status_item_html = is_rain_fallback_available === true ? `
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-rain-fallback-status">
+                <span class="dplayer-label">映像階層</span>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-rain-fallback-status-value">
+                    ${player_store.is_rain_fallback === true ? '降雨対応（低階層）' : '通常（主階層）'}
+                </span>
+            </div>
+        ` : '';
+        // 降雨対応放送の自動利用は、設定画面と同様にこのパネルからも ON/OFF を切り替えられる。
+        // 1080p 以下では再起動して反映し、1440p 以上では設定と後続の画質 URL だけを更新する。
+        const rain_fallback_setting_item_html = is_rain_fallback_available === true ? `
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-rain-fallback">
+                <span class="dplayer-label">降雨対応放送 自動使用</span>
+                <div class="dplayer-toggle">
+                    <input class="dplayer-rain-fallback-setting-input" type="checkbox" name="dplayer-toggle-rain-fallback">
+                    <label for="dplayer-toggle-rain-fallback" style="--theme-color:rgb(var(--v-theme-primary))"></label>
+                </div>
+            </div>
+        ` : '';
         this.player.template.audio.insertAdjacentHTML('afterend', `
             <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-video-codec"
                 role="button" tabindex="0" style="touch-action:manipulation;">
@@ -3655,6 +3694,8 @@ class PlayerController {
                 </div>
             </div>
             ${low_latency_mode_setting_item_html}
+            ${rain_fallback_status_item_html}
+            ${rain_fallback_setting_item_html}
         `);
 
         // 保存版は生成条件を固定しているため、通信を伴う codec・回線プロファイル変更を表示しない
@@ -3669,6 +3710,69 @@ class PlayerController {
                 '.dplayer-setting-mobile-profile',
             )!.style.display = 'none';
         }
+
+        // 降雨対応放送の自動利用トグルを初期化する。1080p 以下では切替を反映するため再起動するが、
+        // 低階層を利用できない 1440p 以上では設定と後続の画質 URL だけを更新し、現在の再生は継続する。
+        if (rain_fallback_setting_item_html !== '') {
+            const rain_fallback_setting_key = (
+                channels_store.channel.current.service_id === 102
+                    ? 'tv_use_rain_fallback_for_bs8k'
+                    : 'tv_use_rain_fallback_for_bs4k'
+            ) as 'tv_use_rain_fallback_for_bs4k' | 'tv_use_rain_fallback_for_bs8k';
+            const toggle_rain_fallback_input = this.player.container.querySelector<HTMLInputElement>(
+                '.dplayer-rain-fallback-setting-input',
+            )!;
+            toggle_rain_fallback_input.checked = settings_store.settings[rain_fallback_setting_key];
+            const toggle_rain_fallback_button = this.player.container.querySelector<HTMLElement>(
+                '.dplayer-konomitv-bs4k-setting-rain-fallback',
+            )!;
+            toggle_rain_fallback_button.addEventListener('click', () => {
+                toggle_rain_fallback_input.checked = !toggle_rain_fallback_input.checked;
+                settings_store.settings[rain_fallback_setting_key] = toggle_rain_fallback_input.checked;
+
+                // DPlayer の画質 URL は初期化時の設定を保持するため、再起動しない 4K 視聴から
+                // 後で 1080p 以下へ切り替えた場合にも新しい設定が使われるよう全候補を更新する。
+                for (const quality of this.player!.options.video.quality ?? []) {
+                    const quality_url = new URL(quality.url, window.location.origin);
+                    quality_url.searchParams.set(
+                        'use_rain_fallback',
+                        toggle_rain_fallback_input.checked === true ? '1' : '0',
+                    );
+                    quality.url = quality_url.toString();
+                }
+
+                const current_quality_index = this.player!.qualityIndex;
+                const current_quality_name = typeof current_quality_index === 'number' ?
+                    this.player!.options.video.quality?.[current_quality_index]?.name ?? null : null;
+                if (current_quality_name !== null && ['8K', '4K', '1440p'].includes(current_quality_name)) {
+                    this.player!.notice('設定を保存しました。1080p 以下の画質へ切り替えたときから適用されます。');
+                    return;
+                }
+                player_store.event_emitter.emit('PlayerRestartRequired', {
+                    message: toggle_rain_fallback_input.checked === true
+                        ? '降雨対応放送を自動で使用する設定に切り替えました。'
+                        : '降雨対応放送を自動で使用しない設定に切り替えました。',
+                    message_delay_seconds: 2,
+                    is_error_message: false,
+                    should_resume_quality: true,
+                });
+            });
+        }
+
+        // 使用中の映像階層は SSE 経由で変化するため、設定パネルの表示を追従させる。
+        const update_rain_fallback_status_display = () => {
+            if (this.player === null) return;
+            const value_element = this.player.container.querySelector<HTMLElement>(
+                '.dplayer-konomitv-bs4k-setting-rain-fallback-status-value',
+            );
+            if (value_element !== null) {
+                value_element.textContent = player_store.is_rain_fallback === true ?
+                    '降雨対応（低階層）' : '通常（主階層）';
+            }
+        };
+        this.rain_fallback_watchers = [
+            watch(() => player_store.is_rain_fallback, update_rain_fallback_status_display),
+        ];
 
         // DPlayer の音声トラックと同じ構成の独自サブパネルを追加する。
         const audio_codec_panel_html = `
@@ -4507,6 +4611,12 @@ class PlayerController {
         if (this.lshaped_screen_crop_watchers.length > 0) {
             this.lshaped_screen_crop_watchers.forEach((unwatcher) => unwatcher());
             this.lshaped_screen_crop_watchers = [];
+        }
+
+        // 使用中の映像階層を設定パネルへ反映するウォッチャーを破棄
+        if (this.rain_fallback_watchers.length > 0) {
+            this.rain_fallback_watchers.forEach((unwatcher) => unwatcher());
+            this.rain_fallback_watchers = [];
         }
 
         // DPlayer 本体を破棄

@@ -49,6 +49,7 @@ function setBS4KIgnoreViewerLowLatency(value: boolean): void {
         encoder: 'FFmpeg',
         encoder_bs4k: 'FFmpeg',
         bs4k_ignore_viewer_low_latency: value,
+        konomitv_bs4k_live_transport: 'Tlv',
         jikkyo_enabled: false,
     };
 }

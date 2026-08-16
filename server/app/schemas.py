@@ -892,6 +892,8 @@ class LiveStreamStatus(BaseModel):
     # JavaScript の Number では uint64 を正確に保持できないため10進文字列で返す
     anchor_generation_id: str | None = None
     anchor_sequence: int | None = None
+    # 現在このストリームが降雨対応放送 (1080p 低階層) を映像に使っているかどうか
+    is_rain_fallback: bool = False
 
 
 class LivePrepareLeaseRequest(BaseModel):
@@ -1283,4 +1285,5 @@ class VersionInformation(BaseModel):
     # フルの /api/settings/server はホストパスを含むため、視聴経路ではこちらを使う。
     encoder_bs4k: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
     bs4k_ignore_viewer_low_latency: bool
+    konomitv_bs4k_live_transport: Literal['MpegTs', 'Tlv']
     jikkyo_enabled: bool

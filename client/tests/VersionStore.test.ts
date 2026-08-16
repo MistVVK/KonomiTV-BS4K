@@ -16,6 +16,7 @@ function createVersionInfo(overrides: Partial<IVersionInformation> = {}): IVersi
         encoder: 'FFmpeg',
         encoder_bs4k: 'FFmpeg',
         bs4k_ignore_viewer_low_latency: true,
+        konomitv_bs4k_live_transport: 'Tlv',
         jikkyo_enabled: false,
         ...overrides,
     };

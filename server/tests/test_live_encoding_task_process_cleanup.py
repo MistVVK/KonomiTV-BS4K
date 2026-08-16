@@ -799,3 +799,295 @@ class TestRunUnexpectedErrorCleanup:
 
 async def _AsyncReturn(value: Any) -> Any:
     return value
+
+
+class TestTLVStreamProbeCleanup:
+    """connectTLVStreamAndProbe() がプローブ中のキャンセル・想定外例外を回収することを検証する。"""
+
+    def _BuildTask(self, monkeypatch: pytest.MonkeyPatch) -> tuple[LiveEncodingTask, SimpleNamespace]:
+        """TLV プローブ用の最小構成のタスクと live_stream を返す。"""
+
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.logging',
+            SimpleNamespace(
+                debug=lambda message, exc_info=None: None,
+                info=lambda message, exc_info=None: None,
+                warning=lambda message, exc_info=None: None,
+                error=lambda message, exc_info=None: None,
+            ),
+        )
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.GetMirakurunAPIEndpointURL',
+            lambda path, base_url=None: 'http://localhost/',
+        )
+        task = object.__new__(LiveEncodingTask)
+        status = SimpleNamespace(status='Standby', detail='')
+        live_stream = SimpleNamespace(
+            log_prefix='[Test] ',
+            quality='1080p',
+            encoding_options=SimpleNamespace(use_rain_fallback=True),
+            is_rain_fallback=False,
+            disconnected=0,
+            current_status=status,
+        )
+        def SetStatus(new_status: str, detail: str) -> bool:
+            status.status = new_status
+            status.detail = detail
+            return True
+
+        live_stream.setStatus = SetStatus
+        live_stream.disconnectAll = lambda: setattr(live_stream, 'disconnected', live_stream.disconnected + 1)
+        task.live_stream = live_stream
+
+        async def AcquireTuner(channel_type: str, base_url: str | None = None) -> bool:
+            return True
+
+        task.acquireMirakurunTuner = AcquireTuner  # type: ignore[method-assign]
+        return task, live_stream
+
+    def _MockConnection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[SimpleNamespace, SimpleNamespace]:
+        """指定した HTTP status の aiohttp session / response を返す fake を仕込む。"""
+
+        # 実物は aiohttp.StreamReader。ここでは iter_chunked だけを生やした fake content にする。
+        # resolver はテストでモックするため、iter_chunked の戻り値は何でもよい。
+        content = SimpleNamespace(iter_chunked=lambda size: object())
+        response = SimpleNamespace(
+            closed=False,
+            close_count=0,
+            content=content,
+            status=status,
+            headers=headers or {},
+        )
+        response.close = lambda: (setattr(response, 'closed', True), setattr(response, 'close_count', response.close_count + 1))
+
+        session = SimpleNamespace(closed=False, close_count=0)
+
+        async def Get(*args: Any, **kwargs: Any) -> SimpleNamespace:
+            return response
+
+        async def Close() -> None:
+            session.closed = True
+            session.close_count += 1
+
+        session.get = Get
+        session.close = Close
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.aiohttp',
+            SimpleNamespace(
+                ClientSession=lambda: session,
+                ClientTimeout=aiohttp.ClientTimeout,
+                ClientConnectorError=aiohttp.ClientConnectorError,
+            ),
+        )
+        return session, response
+
+    @pytest.mark.parametrize(
+        ('response_status', 'response_headers', 'expected_detail'),
+        [
+            (
+                503,
+                {},
+                'チューナーの起動に失敗しました。空きチューナーが不足している可能性があります。(E-12M)',
+            ),
+            (
+                404,
+                {'server': 'mirakc/1.0'},
+                'チューナーの起動に失敗しました。空きチューナーが不足している可能性があります。(E-12M)',
+            ),
+            (
+                404,
+                {'server': 'Mirakurun'},
+                '現在このチャンネルは受信できません。Mirakurun 側に問題があるかもしれません。'
+                '(HTTP Error 404) (E-12M)',
+            ),
+        ],
+    )
+    def test_probe_http_error_uses_existing_e12m_contract_before_resolver(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        response_status: int,
+        response_headers: dict[str, str],
+        expected_detail: str,
+    ) -> None:
+        """TLV Channel Stream の非200は metadata 失敗にせず、既存 Mirakurun 経路と同じ E-12M にする。"""
+
+        task, live_stream = self._BuildTask(monkeypatch)
+        session, response = self._MockConnection(
+            monkeypatch,
+            status=response_status,
+            headers=response_headers,
+        )
+
+        async def UnexpectedResolve(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError('HTTP error response must not be probed as MMT/TLV')
+
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.KonomiTVBS4KTLVServiceResolver',
+            SimpleNamespace(resolve=UnexpectedResolve),
+        )
+        channel = SimpleNamespace(type='BS4K', network_id=0x000B, service_id=101)
+
+        result = asyncio.run(task.connectTLVStreamAndProbe(
+            channel, 'http://tlv', '/api/channels/BS4K/x/stream?decode=0', None,
+        ))
+
+        assert result is None
+        assert session.closed is True
+        assert response.closed is True
+        assert live_stream.disconnected == 1
+        assert live_stream.current_status.status == 'Offline'
+        assert live_stream.current_status.detail == expected_detail
+
+    def test_probe_cancellation_closes_connection_and_reraises(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """プローブ中の選局キャンセルは接続を閉じて CancelledError を再送出し、Offline へ遷移させない。"""
+
+        task, live_stream = self._BuildTask(monkeypatch)
+        session, response = self._MockConnection(monkeypatch)
+
+        async def Resolve(*args: Any, **kwargs: Any) -> Any:
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.KonomiTVBS4KTLVServiceResolver',
+            SimpleNamespace(resolve=Resolve),
+        )
+
+        channel = SimpleNamespace(type='BS4K', network_id=0x000B, service_id=101)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(task.connectTLVStreamAndProbe(
+                channel, 'http://tlv', '/api/channels/BS4K/x/stream?decode=0', None,
+            ))
+
+        # 接続は閉じられているが、キャンセルなので disconnectAll / Offline は行わない
+        assert session.closed is True
+        assert response.closed is True
+        assert live_stream.disconnected == 0
+        assert live_stream.current_status.status == 'Standby'
+
+    def test_probe_unexpected_error_disconnects_and_marks_offline(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """プローブ中の想定外例外は接続を閉じて Offline へ遷移し、None を返して次回 connect() を可能にする。"""
+
+        task, live_stream = self._BuildTask(monkeypatch)
+        session, response = self._MockConnection(monkeypatch)
+
+        async def Resolve(*args: Any, **kwargs: Any) -> Any:
+            raise FileNotFoundError('metadata elf missing')
+
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.KonomiTVBS4KTLVServiceResolver',
+            SimpleNamespace(resolve=Resolve),
+        )
+
+        channel = SimpleNamespace(type='BS4K', network_id=0x000B, service_id=101)
+
+        result = asyncio.run(task.connectTLVStreamAndProbe(
+            channel, 'http://tlv', '/api/channels/BS4K/x/stream?decode=0', None,
+        ))
+
+        # 例外は伝播せず None を返し、接続・クライアントが回収されて Offline へ遷移する
+        assert result is None
+        assert session.closed is True
+        assert response.closed is True
+        assert live_stream.disconnected >= 1
+        assert live_stream.current_status.status == 'Offline'
+
+    def test_probe_unresolved_main_context_id_disconnects_and_marks_offline(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """主 SID の context_id が解決できない場合は 0:v:0 へ落とさず、接続を閉じて Offline へ遷移する。"""
+
+        task, live_stream = self._BuildTask(monkeypatch)
+        session, response = self._MockConnection(monkeypatch)
+
+        async def Resolve(*args: Any, **kwargs: Any) -> tuple[int | None, int | None, bytes]:
+            # 主 context_id が未解決 (SDT が読めないなど)。降雨対応も未観測。
+            return (None, None, b'')
+
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.KonomiTVBS4KTLVServiceResolver',
+            SimpleNamespace(resolve=Resolve),
+        )
+
+        channel = SimpleNamespace(type='BS4K', network_id=0x000B, service_id=101)
+
+        result = asyncio.run(task.connectTLVStreamAndProbe(
+            channel, 'http://tlv', '/api/channels/BS4K/x/stream?decode=0', None,
+        ))
+
+        # 主 context_id 未解決は配信失敗として扱い、接続・クライアントを回収して Offline へ遷移する。
+        # (先着順に依存する 0:v:0 へ黙ってフォールバックしない)
+        assert result is None
+        assert session.closed is True
+        assert response.closed is True
+        assert live_stream.disconnected >= 1
+        assert live_stream.current_status.status == 'Offline'
+
+    @pytest.mark.parametrize(
+        ('service_id', 'expected_rain_service_id'),
+        [
+            (101, 103),
+            (102, 104),
+            (191, None),
+        ],
+    )
+    def test_probe_limits_rain_fallback_to_explicit_services_and_notifies_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        service_id: int,
+        expected_rain_service_id: int | None,
+    ) -> None:
+        """101/102 だけを降雨対応 SID へ対応付け、決定直後の Standby 更新へ実効状態を含める。"""
+
+        task, live_stream = self._BuildTask(monkeypatch)
+        self._MockConnection(monkeypatch)
+        resolve_call: dict[str, Any] = {}
+
+        async def Resolve(*args: Any, **kwargs: Any) -> tuple[int, int | None, bytes]:
+            resolve_call['rain_service_id'] = args[2]
+            resolve_call['need_rain_fallback'] = kwargs['need_rain_fallback']
+            return (1, 2 if expected_rain_service_id is not None else None, b'probe')
+
+        class FakePump:
+            """HTTP 読み取りを開始せず、start 呼出回数だけを保持する fake pump。"""
+
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                self.start_count = 0
+
+            def start(self) -> None:
+                self.start_count += 1
+
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.KonomiTVBS4KTLVServiceResolver',
+            SimpleNamespace(resolve=Resolve),
+        )
+        monkeypatch.setattr('app.streams.LiveEncodingTask.KonomiTVBS4KTLVStreamPump', FakePump)
+        channel = SimpleNamespace(type='BS4K', network_id=0x000B, service_id=service_id)
+
+        result = asyncio.run(task.connectTLVStreamAndProbe(
+            channel, 'http://tlv', '/api/channels/BS4K/x/stream?decode=0', None,
+        ))
+
+        assert result is not None
+        assert resolve_call == {
+            'rain_service_id': expected_rain_service_id,
+            'need_rain_fallback': expected_rain_service_id is not None,
+        }
+        assert result[2].start_count == 1
+        assert live_stream.is_rain_fallback is (expected_rain_service_id is not None)
+        assert live_stream.current_status.status == 'Standby'
+        assert live_stream.current_status.detail == (
+            '降雨対応放送を使用してエンコードを開始しています…'
+            if expected_rain_service_id is not None
+            else 'エンコードを開始しています…'
+        )

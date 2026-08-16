@@ -48,6 +48,10 @@ class StreamEncodingOptions:
     ## 1080p-60fps では 60fps 化を優先し、24fps モードの要求があってもここでは無効にする
     is_24fps_mode_enabled: bool = False
 
+    # 降雨対応放送 (1080p 低階層) を自動利用するストリームかどうか
+    ## BS4K/BSP4K・BS8K の TLV ライブだけで参照し、画質が 1080p 以下のときだけ実効になる。
+    use_rain_fallback: bool = True
+
     # 録画HLSの出力コーデック。ライブでは既存画質から導出した既定値を使用する。
     video_codec: KonomiTVBS4KVideoCodec = 'avc'
     video_bit_depth: KonomiTVBS4KVideoBitDepth = 8
@@ -69,6 +73,7 @@ class StreamEncodingOptions:
         video_bit_depth: KonomiTVBS4KVideoBitDepth | None = None,
         audio_codec: KonomiTVBS4KAudioCodec = 'aac',
         audio_rendition_id: str | None = None,
+        use_rain_fallback: bool = True,
     ) -> StreamEncodingOptions:
         """
         API で指定されたオプションから、実際に使うストリームオプションを作る
@@ -79,6 +84,11 @@ class StreamEncodingOptions:
             is_24fps_mode_requested (bool): クライアントが 24fps モードを要求しているかどうか
             encoder (str | None): このストリームで利用するエンコーダー
             is_24fps_mode_allowed (bool): 24fps モードの適用を許可するかどうか
+            video_codec (KonomiTVBS4KVideoCodec | None): 明示要求された映像コーデック
+            video_bit_depth (KonomiTVBS4KVideoBitDepth | None): 明示要求された映像 bit depth
+            audio_codec (KonomiTVBS4KAudioCodec): 出力音声コーデック
+            audio_rendition_id (str | None): 録画再生で多重化する音声レンディション ID
+            use_rain_fallback (bool): 降雨対応放送 (1080p 低階層) の自動利用を許可するかどうか
 
         Returns:
             StreamEncodingOptions: 実際のストリーム生成に使うエンコードオプション
@@ -124,6 +134,13 @@ class StreamEncodingOptions:
             video_bit_depth = resolved_video_bit_depth,
             audio_codec = audio_codec,
             audio_rendition_id = audio_rendition_id,
+            # 1080p を超える画質では低階層を利用できないため、要求値にかかわらず既定値へ正規化する。
+            # 無効な false を残すと、実際の入力が同じでも -norain 付きの別ストリームが作られてしまう。
+            use_rain_fallback = (
+                use_rain_fallback
+                if QUALITY[quality].height <= 1080
+                else True
+            ),
         )
 
     def buildSuffix(self) -> str:
@@ -150,6 +167,10 @@ class StreamEncodingOptions:
         # 24fps モードが有効なストリームだけ -24fps を付ける
         if self.is_24fps_mode_enabled is True:
             suffix += '-24fps'
+
+        # 降雨対応放送の自動利用を無効化したストリームだけ -norain を付ける
+        if self.use_rain_fallback is False:
+            suffix += '-norain'
 
         return suffix
 
@@ -187,6 +208,7 @@ def SplitQualityAndEncodingOptions(
     video_bit_depth: KonomiTVBS4KVideoBitDepth | None = None,
     audio_codec: KonomiTVBS4KAudioCodec = 'aac',
     audio_rendition_id: str | None = None,
+    use_rain_fallback: bool = True,
 ) -> StreamQualityWithOptions | None:
     """
     API パスの品質指定 (例: 720p-hevc-10bit-24fps) を、ベース画質 (720p-hevc) と追加オプション (-10bit / -24fps) に分解する
@@ -195,6 +217,11 @@ def SplitQualityAndEncodingOptions(
         quality (str): API パスで指定された品質
         encoder (str | None): このストリームで利用するエンコーダー
         is_24fps_mode_allowed (bool): 24fps モードの適用を許可するかどうか
+        video_codec (KonomiTVBS4KVideoCodec | None): 明示要求された映像コーデック
+        video_bit_depth (KonomiTVBS4KVideoBitDepth | None): 明示要求された映像 bit depth
+        audio_codec (KonomiTVBS4KAudioCodec): 出力音声コーデック
+        audio_rendition_id (str | None): 録画再生で多重化する音声レンディション ID
+        use_rain_fallback (bool): 降雨対応放送 (1080p 低階層) の自動利用を許可するかどうか
 
     Returns:
         StreamQualityWithOptions | None: 分解結果 (不正な品質指定の場合は None)
@@ -247,6 +274,7 @@ def SplitQualityAndEncodingOptions(
         video_bit_depth,
         audio_codec,
         audio_rendition_id,
+        use_rain_fallback,
     )
     return StreamQualityWithOptions(
         quality = base_quality,

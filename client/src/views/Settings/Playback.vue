@@ -81,6 +81,30 @@
                     @update:model-value="updateLowLatency">
                 </v-switch>
             </div>
+            <div v-if="is_bs4k_tlv === true" class="settings__item settings__item--switch settings__item--sync-disabled">
+                <label class="settings__item-heading" for="playback-rain-fallback-bs4k">
+                    BSP4K で降雨対応放送を自動で使用する
+                </label>
+                <label class="settings__item-label" for="playback-rain-fallback-bs4k">
+                    1080p (60fps) 以下の画質で視聴を開始したとき、降雨対応放送（1080p 低階層）が送出されていれば自動で使用します。<br>
+                    視聴中に送出状態が変化しても映像階層は切り替わらず、次回の再生開始時に再選択します。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" hide-details id="playback-rain-fallback-bs4k"
+                    :model-value="selected_rain_fallback_bs4k" @update:model-value="updateRainFallbackBS4K">
+                </v-switch>
+            </div>
+            <div v-if="is_bs4k_tlv === true" class="settings__item settings__item--switch settings__item--sync-disabled">
+                <label class="settings__item-heading" for="playback-rain-fallback-bs8k">
+                    BS8K で降雨対応放送を自動で使用する
+                </label>
+                <label class="settings__item-label" for="playback-rain-fallback-bs8k">
+                    1080p (60fps) 以下の画質で視聴を開始したとき、降雨対応放送（1080p 低階層）が送出されていれば自動で使用します。<br>
+                    視聴中に送出状態が変化しても映像階層は切り替わらず、次回の再生開始時に再選択します。<br>
+                </label>
+                <v-switch class="settings__item-switch" color="primary" hide-details id="playback-rain-fallback-bs8k"
+                    :model-value="selected_rain_fallback_bs8k" @update:model-value="updateRainFallbackBS8K">
+                </v-switch>
+            </div>
             <div v-if="is_bs4k === true" class="settings__item settings__item--sync-disabled">
                 <div class="settings__item-heading">24fpsモード</div>
                 <div class="settings__item-label">
@@ -199,6 +223,11 @@ const is_bs4k_low_latency_forced = computed(() =>
     is_bs4k.value &&
     versionStore.server_version_info?.bs4k_ignore_viewer_low_latency === true,
 );
+// 降雨対応放送の設定は TLV (MMT/TLV 専用経路) を使う BS4K でのみ意味を持つため、その条件を満たす場合だけ表示する。
+const is_bs4k_tlv = computed(() =>
+    is_bs4k.value &&
+    versionStore.server_version_info?.konomitv_bs4k_live_transport === 'Tlv',
+);
 
 // フルサーバー設定ではなく、公開 runtime 情報を参照する
 const encoder = computed(() => is_bs4k.value ?
@@ -306,6 +335,14 @@ const updateLowLatency = (value: boolean | null): void => {
         (is_cellular.value ? 'tv_low_latency_mode_for_bs4k_cellular' : 'tv_low_latency_mode_for_bs4k') :
         (is_cellular.value ? 'tv_low_latency_mode_cellular' : 'tv_low_latency_mode');
     patchSetting(key, value === true);
+};
+const selected_rain_fallback_bs4k = computed(() => settingsStore.settings.tv_use_rain_fallback_for_bs4k);
+const selected_rain_fallback_bs8k = computed(() => settingsStore.settings.tv_use_rain_fallback_for_bs8k);
+const updateRainFallbackBS4K = (value: boolean | null): void => {
+    patchSetting('tv_use_rain_fallback_for_bs4k', value === true);
+};
+const updateRainFallbackBS8K = (value: boolean | null): void => {
+    patchSetting('tv_use_rain_fallback_for_bs8k', value === true);
 };
 
 onMounted(async () => {

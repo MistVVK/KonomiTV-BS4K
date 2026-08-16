@@ -231,6 +231,8 @@ export interface ILocalClientSettings extends IClientSettings {
     tv_low_latency_mode_cellular: boolean;
     tv_low_latency_mode_for_bs4k: boolean;
     tv_low_latency_mode_for_bs4k_cellular: boolean;
+    tv_use_rain_fallback_for_bs4k: boolean;
+    tv_use_rain_fallback_for_bs8k: boolean;
     tv_24fps_mode: boolean;
     tv_24fps_mode_cellular: boolean;
     video_streaming_quality: VideoStreamingQuality;
@@ -491,6 +493,9 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     tv_low_latency_mode_for_bs4k: true,
     // BS4K テレビを低遅延で視聴する (モバイル回線時)  (Default: 低遅延で視聴しない) (同期無効)
     tv_low_latency_mode_for_bs4k_cellular: false,
+    // BS4K/BSP4K・BS8K で降雨対応放送（1080p 低階層）を自動利用する (Default: 利用する) (同期無効)
+    tv_use_rain_fallback_for_bs4k: true,
+    tv_use_rain_fallback_for_bs8k: true,
     // テレビを 24fps モードで視聴する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
     tv_24fps_mode: false,
     // テレビを 24fps モードで視聴する (モバイル回線時)  (Default: オフ) (同期無効)
@@ -697,6 +702,8 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     // tv_low_latency_mode_cellular: 同期無効
     // tv_low_latency_mode_for_bs4k: 同期無効
     // tv_low_latency_mode_for_bs4k_cellular: 同期無効
+    // tv_use_rain_fallback_for_bs4k: 同期無効
+    // tv_use_rain_fallback_for_bs8k: 同期無効
     // tv_24fps_mode: 同期無効
     // tv_24fps_mode_cellular: 同期無効
     // video_streaming_quality: 同期無効
@@ -1244,6 +1251,8 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         'tv_low_latency_mode_cellular',
         'tv_low_latency_mode_for_bs4k',
         'tv_low_latency_mode_for_bs4k_cellular',
+        'tv_use_rain_fallback_for_bs4k',
+        'tv_use_rain_fallback_for_bs8k',
     ] as const;
     for (const konomitv_bs4k_key of konomitv_bs4k_common_boolean_keys) {
         if (typeof normalized_settings[konomitv_bs4k_key] !== 'boolean') {

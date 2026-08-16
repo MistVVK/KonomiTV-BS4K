@@ -141,4 +141,23 @@ describe('LiveEventManager lifecycle generation', () => {
         });
         expect(channels_store.viewer_count).toBe(2);
     });
+
+    it('detail_update で降雨対応映像の使用状態を直ちに反映する', async () => {
+        const player_store = usePlayerStore();
+        const manager = new LiveEventManager(createPlayer() as never);
+
+        await manager.init();
+        MockEventSource.instances[0].emit('detail_update', {
+            status: 'Standby',
+            detail: '降雨対応放送を使用してエンコードを開始しています…',
+            started_at: 0,
+            updated_at: 1,
+            client_count: 1,
+            is_rain_fallback: true,
+        });
+
+        expect(player_store.is_rain_fallback).toBe(true);
+        await manager.destroy();
+        expect(player_store.is_rain_fallback).toBe(false);
+    });
 });

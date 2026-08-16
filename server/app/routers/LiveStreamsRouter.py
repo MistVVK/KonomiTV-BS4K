@@ -1,6 +1,7 @@
 
 import asyncio
 import copy
+from dataclasses import replace
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
@@ -11,7 +12,7 @@ from starlette.types import Receive
 
 from app import logging, schemas
 from app.config import Config
-from app.constants import QUALITY_TYPES
+from app.constants import QUALITY, QUALITY_TYPES
 from app.models.Channel import Channel
 from app.streams.KonomiTVBS4KPlaybackCapabilities import (
     KonomiTVBS4KPlaybackCapabilityProbe,
@@ -76,6 +77,10 @@ async def ValidateQuality(
         KonomiTVBS4KAudioCodec,
         Query(description='出力音声コーデック。'),
     ] = 'aac',
+    use_rain_fallback: Annotated[
+        bool,
+        Query(description='降雨対応放送 (1080p 低階層) の自動利用。BS4K/BSP4K・BS8K の TLV ライブでのみ有効。'),
+    ] = True,
 ) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
 
@@ -91,6 +96,7 @@ async def ValidateQuality(
             int(video_bit_depth) if video_bit_depth is not None else None,
         ),
         audio_codec = audio_codec,
+        use_rain_fallback = use_rain_fallback,
     )
     if stream_quality is None:
         logging.error(f'[LiveStreamsRouter][ValidateQuality] Specified quality was not found. [quality: {quality}]')
@@ -104,6 +110,24 @@ async def ValidateQuality(
     channel = await Channel.filter(display_channel_id = display_channel_id).get_or_none()
     is_radiochannel = channel is not None and channel.is_radiochannel is True
     is_oneseg = channel is not None and channel.is_oneseg is True
+
+    # 降雨対応設定は MMT/TLV の対象サービスを 1080p 以下で視聴するときだけストリームを分ける。
+    # 対象外では false を既定値の true へ戻し、効かない query の違いで別エンコードが立つのを防ぐ。
+    is_rain_fallback_effective = (
+        channel is not None and
+        channel.type == 'BS4K' and
+        channel.network_id == 0x000B and
+        channel.service_id in (101, 102) and
+        Config().general.konomitv_bs4k_live_transport == 'Tlv' and
+        QUALITY[stream_quality.quality].height <= 1080
+    )
+    if is_rain_fallback_effective is False and stream_quality.encoding_options.use_rain_fallback is False:
+        stream_quality = StreamQualityWithOptions(
+            quality = stream_quality.quality,
+            encoding_options = replace(stream_quality.encoding_options, use_rain_fallback=True),
+            is_video_encoding_explicitly_requested = stream_quality.is_video_encoding_explicitly_requested,
+            is_audio_encoding_explicitly_requested = stream_quality.is_audio_encoding_explicitly_requested,
+        )
     if is_radiochannel is True:
         capability_encoder = 'FFmpeg'
         stream_quality = StreamQualityWithOptions(

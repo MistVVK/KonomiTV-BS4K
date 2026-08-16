@@ -18,7 +18,11 @@
 namespace {
 
 constexpr std::uint64_t DEFAULT_PROBE_SIZE = 256ULL * 1024ULL * 1024ULL;
-constexpr std::size_t READ_BUFFER_SIZE = 1024 * 1024;
+// stdin ストリーミングでは SDT をできるだけ早く出力できるよう小さめの読み取り単位にする。
+// 1 MiB まで読もうとすると SDT 到着後も読取り完了まで出力が遅れるため、64 KiB に抑える。
+constexpr std::size_t STDIN_READ_BUFFER_SIZE = 64 * 1024;
+// 録画ファイル解析は従来の 1 MiB 単位を維持し、大容量ファイルの読み取り syscall を増やさない。
+constexpr std::size_t FILE_READ_BUFFER_SIZE = 1024 * 1024;
 
 void WriteJSONString(std::ostream& output, const std::string_view value) {
     static constexpr char hexadecimal[] = "0123456789abcdef";
@@ -75,15 +79,21 @@ const char* CodecName(const aribtlv::Codec codec) {
 
 class MetadataSink final : public aribtlv::Sink {
 public:
+    // streaming 時はサービス・トラックの現在スナップショットを stdout へ出力し、
+    // 呼び出し側 (ライブ視聴のプローブ) が目的の service_id と映像を得たら早期終了できるようにする。
+    explicit MetadataSink(const bool streaming = false) : streaming_(streaming) {}
+
     void onService(const aribtlv::ServiceInfo&) override {}
 
     void onTrack(const aribtlv::TrackInfo& track) override {
         // 同じ安定 track ID の更新通知は、最新の MPT 情報で置き換える。
         tracks_[track.track_id] = track;
+        emitStreamingSnapshot();
     }
 
     void onTrackRemoved(const aribtlv::TrackInfo& track) override {
         tracks_.erase(track.track_id);
+        emitStreamingSnapshot();
     }
 
     void onAccessUnit(aribtlv::AccessUnit&&) override {}
@@ -112,6 +122,9 @@ public:
                 service,
             };
         }
+        // streaming では SDT 更新のたびに、その時点の services / tracks 全件を 1 行で出力する。
+        // 呼び出し側は最新の完了行だけでサービスと映像トラックの対応を検証できる。
+        emitStreamingSnapshot();
     }
 
     void onEventInfo(const aribtlv::EventInfo& event) override {
@@ -142,27 +155,24 @@ public:
         return *fatal_error_;
     }
 
-    void writeJSON(std::ostream& output) const {
-        output << "{\"services\":[";
-        bool first = true;
-        for (const auto& [key, record] : services_) {
-            static_cast<void>(key);
-            if (!first) output.put(',');
-            first = false;
-            output << "{\"context_id\":" << record.context_id
-                   << ",\"service_id\":" << record.service.service_id
-                   << ",\"tlv_stream_id\":" << record.tlv_stream_id
-                   << ",\"original_network_id\":" << record.original_network_id
-                   << ",\"service_type\":" << static_cast<unsigned int>(record.service.service_type)
-                   << ",\"provider_name\":";
-            WriteJSONString(output, record.service.provider_name);
-            output << ",\"service_name\":";
-            WriteJSONString(output, record.service.service_name);
-            output.put('}');
-        }
+    [[nodiscard]] bool hasEmittedStreamingSnapshot() const noexcept {
+        return has_emitted_streaming_snapshot_;
+    }
 
-        output << "],\"events\":[";
-        first = true;
+    void writeStreamingJSONLine(std::ostream& output) const {
+        output << '{';
+        writeServices(output);
+        output.put(',');
+        writeTracks(output);
+        output << "}\n";
+        output.flush();
+    }
+
+    void writeJSON(std::ostream& output) const {
+        output << '{';
+        writeServices(output);
+        output << ",\"events\":[";
+        bool first = true;
         for (const auto& [key, event] : events_) {
             static_cast<void>(key);
             if (!first) output.put(',');
@@ -228,8 +238,16 @@ public:
             }
         }
 
-        output << "],\"tracks\":[";
-        first = true;
+        output << "],";
+        writeTracks(output);
+        output << "}\n";
+    }
+
+private:
+    // tracks_ を「"tracks":[...]」の形で出力する。録画解析と stdin streaming の両方から使う。
+    void writeTracks(std::ostream& output) const {
+        output << "\"tracks\":[";
+        bool first = true;
         for (const auto& [track_id, track] : tracks_) {
             if (!first) output.put(',');
             first = false;
@@ -253,10 +271,37 @@ public:
             }
             output.put('}');
         }
-        output << "]}\n";
+        output.put(']');
     }
 
-private:
+    void emitStreamingSnapshot() {
+        if (!streaming_) return;
+        writeStreamingJSONLine(std::cout);
+        has_emitted_streaming_snapshot_ = true;
+    }
+
+    // services_ を「"services":[...]」の形で出力する。録画解析と stdin streaming の両方から使う。
+    void writeServices(std::ostream& output) const {
+        output << "\"services\":[";
+        bool first = true;
+        for (const auto& [key, record] : services_) {
+            static_cast<void>(key);
+            if (!first) output.put(',');
+            first = false;
+            output << "{\"context_id\":" << record.context_id
+                   << ",\"service_id\":" << record.service.service_id
+                   << ",\"tlv_stream_id\":" << record.tlv_stream_id
+                   << ",\"original_network_id\":" << record.original_network_id
+                   << ",\"service_type\":" << static_cast<unsigned int>(record.service.service_type)
+                   << ",\"provider_name\":";
+            WriteJSONString(output, record.service.provider_name);
+            output << ",\"service_name\":";
+            WriteJSONString(output, record.service.service_name);
+            output.put('}');
+        }
+        output.put(']');
+    }
+
     struct ServiceRecord {
         std::uint32_t context_id;
         std::uint16_t tlv_stream_id;
@@ -274,6 +319,10 @@ private:
     std::map<std::uint32_t, TotRange> tots_;
     std::map<std::uint64_t, aribtlv::TrackInfo> tracks_;
     std::optional<std::string> fatal_error_;
+    // サービス・トラック更新ごとに snapshot を逐次出力するか (stdin プローブ専用)
+    bool streaming_ = false;
+    // streaming snapshot を 1 回以上出力済みか (stdin で情報未取得のまま終了した場合の判定用)
+    bool has_emitted_streaming_snapshot_ = false;
 };
 
 std::uint64_t ParseProbeSize(const char* text) {
@@ -291,10 +340,52 @@ std::uint64_t ParseProbeSize(const char* text) {
 int main(const int argc, char* argv[]) {
     try {
         if (argc < 2 || argc > 3) {
-            std::cerr << "Usage: KonomiTVBS4KTLVMetadata.elf INPUT [MAX_BYTES]\n";
+            std::cerr << "Usage: KonomiTVBS4KTLVMetadata.elf INPUT|- [MAX_BYTES]\n";
             return 2;
         }
         const auto probe_size = argc == 3 ? ParseProbeSize(argv[2]) : DEFAULT_PROBE_SIZE;
+        const bool use_stdin = (std::string(argv[1]) == "-");
+
+        MetadataSink sink(use_stdin);
+        aribtlv::Limits limits;
+        limits.collect_application_resources = false;
+        aribtlv::Demuxer demuxer(sink, limits);
+        std::array<std::uint8_t, FILE_READ_BUFFER_SIZE> buffer{};
+
+        // stdin は非シークのため専用経路を使い、ifstream のサイズ検出・seek は行わない。
+        const auto read_window = [&](
+            std::istream& source,
+            const std::uint64_t maximum_bytes,
+            const std::size_t read_buffer_size = FILE_READ_BUFFER_SIZE
+        ) {
+            std::uint64_t total_read = 0;
+            while (source && total_read < maximum_bytes && !sink.hasFatalError()) {
+                const auto remaining = maximum_bytes - total_read;
+                const auto request_size = static_cast<std::streamsize>(
+                    std::min<std::uint64_t>(remaining, read_buffer_size));
+                source.read(reinterpret_cast<char*>(buffer.data()), request_size);
+                const auto bytes_read = source.gcount();
+                if (bytes_read <= 0) break;
+                demuxer.push(buffer.data(), static_cast<std::size_t>(bytes_read));
+                total_read += static_cast<std::uint64_t>(bytes_read);
+            }
+        };
+
+        if (use_stdin) {
+            // streaming snapshot は sink がサービス・トラック更新ごとに stdout へ出力済み。ここでは上限まで読み切る。
+            read_window(std::cin, probe_size, STDIN_READ_BUFFER_SIZE);
+            demuxer.flush();
+            if (sink.hasFatalError()) {
+                std::cerr << "MMT/TLV metadata demuxing failed: " << sink.fatalError() << '\n';
+                return 1;
+            }
+            // 情報を一度も取得できなかった場合だけ、空の snapshot を返して呼び出し側へ通知する。
+            if (!sink.hasEmittedStreamingSnapshot()) {
+                sink.writeStreamingJSONLine(std::cout);
+            }
+            return 0;
+        }
+
         std::ifstream input(argv[1], std::ios::binary | std::ios::ate);
         if (!input) {
             std::cerr << "Failed to open the input file.\n";
@@ -313,34 +404,14 @@ int main(const int argc, char* argv[]) {
         const auto file_size = static_cast<std::uint64_t>(file_size_offset);
         input.seekg(0, std::ios::beg);
 
-        MetadataSink sink;
-        aribtlv::Limits limits;
-        limits.collect_application_resources = false;
-        aribtlv::Demuxer demuxer(sink, limits);
-        std::array<std::uint8_t, READ_BUFFER_SIZE> buffer{};
-
-        const auto read_window = [&](const std::uint64_t maximum_bytes) {
-            std::uint64_t total_read = 0;
-            while (input && total_read < maximum_bytes && !sink.hasFatalError()) {
-                const auto remaining = maximum_bytes - total_read;
-                const auto request_size = static_cast<std::streamsize>(
-                    std::min<std::uint64_t>(remaining, buffer.size()));
-                input.read(reinterpret_cast<char*>(buffer.data()), request_size);
-                const auto bytes_read = input.gcount();
-                if (bytes_read <= 0) break;
-                demuxer.push(buffer.data(), static_cast<std::size_t>(bytes_read));
-                total_read += static_cast<std::uint64_t>(bytes_read);
-            }
-        };
-
         // 小さい録画は全体を、大きい録画は上限を二分して先頭と末尾を読む。
         // MH-TOT / MH-EIT の両端を得つつ、巨大録画でも解析 IO を一定に抑える。
         if (file_size <= probe_size) {
-            read_window(file_size);
+            read_window(input, file_size);
         } else {
             const auto front_size = (probe_size / 2) + (probe_size % 2);
             const auto back_size = probe_size - front_size;
-            read_window(front_size);
+            read_window(input, front_size);
             if (back_size > 0 && !sink.hasFatalError()) {
                 const auto back_offset = file_size - back_size;
                 input.clear();
@@ -350,7 +421,7 @@ int main(const int argc, char* argv[]) {
                     return 1;
                 }
                 demuxer.reposition(aribtlv::RepositionOptions{back_offset, false});
-                read_window(back_size);
+                read_window(input, back_size);
             }
         }
         demuxer.flush();

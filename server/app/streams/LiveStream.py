@@ -31,6 +31,7 @@ KonomiTVBS4KLiveStreamKey = tuple[
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KAudioCodec,
     bool,
+    bool,
 ]
 KonomiTVBS4KLiveStreamInstanceKey = tuple[
     str,
@@ -38,6 +39,7 @@ KonomiTVBS4KLiveStreamInstanceKey = tuple[
     KonomiTVBS4KVideoCodec,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KAudioCodec,
+    bool,
     bool,
     bool,
 ]
@@ -154,6 +156,7 @@ class LiveStream:
             encoding_options.video_bit_depth,
             encoding_options.audio_codec,
             encoding_options.is_24fps_mode_enabled,
+            encoding_options.use_rain_fallback,
         )
         instance_key: KonomiTVBS4KLiveStreamInstanceKey = (
             *live_stream_key,
@@ -223,6 +226,10 @@ class LiveStream:
             ## チューナー再利用の競合を避けるため、LiveStream ごとにロックを持つ
             instance._tuner_lock = asyncio.Lock()
 
+            # 現在このストリームが降雨対応放送 (1080p 低階層) を映像に使っているかどうか
+            ## LiveEncodingTask が降雨対応放送の検出に成功した時だけ True になる
+            instance.is_rain_fallback = False
+
             # 生成したインスタンスを登録する
             cls.__instances[instance_key] = instance
 
@@ -266,6 +273,7 @@ class LiveStream:
         self.psi_data_archiver: LivePSIDataArchiver | None
         self.tuner: EDCBTuner | None
         self._tuner_lock: asyncio.Lock
+        self.is_rain_fallback: bool
 
 
     @property
@@ -612,6 +620,7 @@ class LiveStream:
             started_at = self._started_at,  # ライブストリームが開始された (ステータスが Offline or Restart → Standby に移行した) 時刻
             updated_at = self._updated_at,  # ライブストリームのステータスが最後に更新された時刻
             client_count = len(self._clients),  # ライブストリームに接続中のクライアント数
+            is_rain_fallback = self.is_rain_fallback,  # 降雨対応放送 (1080p 低階層) を使っているかどうか
         )
 
 

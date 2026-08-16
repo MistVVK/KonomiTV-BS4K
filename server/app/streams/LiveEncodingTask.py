@@ -57,9 +57,12 @@ from app.utils.KonomiTVBS4KMMTTLV import (
     KonomiTVBS4KTLVSyncError,
     KonomiTVBS4KTLVSynchronizer,
 )
+from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
+from app.utils.KonomiTVBS4KTLVStreamPump import KonomiTVBS4KTLVStreamPump
 
 
 if TYPE_CHECKING:
+    from app.models.Program import Program
     from app.streams.LiveStream import LiveStream
 
 
@@ -96,6 +99,14 @@ class LiveEncodingTask:
     ENCODER_TS_READ_TIMEOUT_ONAIR_BS4K: ClassVar[int] = 15
     # Opus と一般的なブラウザ再生経路が扱える最大チャンネル数。ISDB-S3 demuxer の入力段階で適用する
     ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS: ClassVar[int] = 8
+
+    # 降雨対応放送 (低階層) が割り当てられている主サービスだけを明示する。
+    # Channel Stream API は同じトランスポンダの全サービスを含むため、全局へ SID + 2 を適用すると
+    # WOWOW などで無関係な別サービスを降雨対応放送として誤選択し得る。
+    RAIN_FALLBACK_SERVICE_IDS: ClassVar[dict[tuple[int, int], int]] = {
+        (0x000B, 101): 103,  # NHK BSP4K
+        (0x000B, 102): 104,  # NHK BS8K
+    }
 
 
     def __init__(self, live_stream: LiveStream) -> None:
@@ -277,6 +288,8 @@ class LiveEncodingTask:
         is_fullhd_channel: bool,
         is_oneseg: bool = False,
         is_mmt_tlv: bool = False,
+        tlv_main_context_id: int | None = None,
+        tlv_rain_context_id: int | None = None,
     ) -> list[str]:
         """現 main の単一 pipeline 向け FFmpeg 8 HW エンコードオプションを返す。"""
 
@@ -374,10 +387,23 @@ class LiveEncodingTask:
         options += [
             '-analyzeduration', str(analyzeduration), '-i', 'pipe:0',
             '-ignore_unknown',
-            '-map', '0:v:0',
-            '-map', '0:a?',
-            '-map', '0:d?',
         ]
+        # TLV かつ context_id が解決済みなら、映像・音声を context_id で固定する。
+        # 字幕・データ放送 (data) は低階層には存在しないため、0:d? のまま高階層から得られる。
+        if is_mmt_tlv is True and tlv_main_context_id is not None:
+            # 降雨対応時は映像だけ低階層、音声は高階層。それ以外は映像・音声とも高階層。
+            video_context_id = tlv_rain_context_id if tlv_rain_context_id is not None else tlv_main_context_id
+            options += [
+                '-map', f'0:v:m:context_id:{video_context_id}',
+                '-map', f'0:a:m:context_id:{tlv_main_context_id}',
+                '-map', '0:d?',
+            ]
+        else:
+            options += [
+                '-map', '0:v:0',
+                '-map', '0:a?',
+                '-map', '0:d?',
+            ]
 
         encode_plan = ResolveKonomiTVBS4KLiveEncodePlan(
             QUALITY[quality].width,
@@ -588,6 +614,8 @@ class LiveEncodingTask:
         is_fullhd_channel: bool,
         is_oneseg: bool = False,
         is_mmt_tlv: bool = False,
+        tlv_main_context_id: int | None = None,
+        tlv_rain_context_id: int | None = None,
     ) -> list[str]:
         """
         FFmpeg に渡すオプションを組み立てる
@@ -597,6 +625,9 @@ class LiveEncodingTask:
             channel_type (Literal['GR', 'BS', 'CS', 'CATV', 'SKY', 'BS4K']): チャンネルの種類
             is_fullhd_channel (bool): フル HD 放送が実施されているチャンネルかどうか
             is_oneseg (bool): ワンセグサービスかどうか
+            is_mmt_tlv (bool): MMT/TLV 入力かどうか
+            tlv_main_context_id (int | None): 主サービス (高階層) の context_id
+            tlv_rain_context_id (int | None): 降雨対応サービス (低階層) の context_id
 
         Returns:
             list[str]: FFmpeg に渡すオプションが連なる配列
@@ -759,7 +790,17 @@ class LiveEncodingTask:
                     options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
 
         # 音声
-        options.append('-map 0:v:0 -map 0:a? -map 0:d?')
+        # TLV かつ context_id が解決済みなら、映像・音声を context_id で固定する。
+        # 字幕・データ放送 (data) は低階層には存在しないため、0:d? のまま高階層から得られる。
+        if is_mmt_tlv is True and tlv_main_context_id is not None:
+            # 降雨対応時は映像だけ低階層、音声は高階層。それ以外は映像・音声とも高階層。
+            video_context_id = tlv_rain_context_id if tlv_rain_context_id is not None else tlv_main_context_id
+            options.append(
+                f'-map 0:v:m:context_id:{video_context_id} '
+                f'-map 0:a:m:context_id:{tlv_main_context_id} -map 0:d?'
+            )
+        else:
+            options.append('-map 0:v:0 -map 0:a? -map 0:d?')
         if self.GetRequestedAudioCodec() == 'opus':
             # 入力の channel layout を保持し、mono や 5.1ch を stereo へ暗黙変換しない。
             options.append(
@@ -1193,6 +1234,182 @@ class LiveEncodingTask:
         return False
 
 
+    async def connectTLVStreamAndProbe(
+        self,
+        channel: Channel,
+        tlv_mirakurun_base_url: str,
+        tlv_stream_endpoint: str,
+        program_present: Program | None,
+    ) -> tuple[
+        aiohttp.ClientSession,
+        aiohttp.ClientResponse,
+        KonomiTVBS4KTLVStreamPump,
+        int,
+        int | None,
+    ] | None:
+        """
+        TLV のチューナー確保・ストリーム接続・先頭バッファのプローブを行う。
+
+        FFmpeg は -map に context_id が必要なため、エンコーダー生成前に同じ Channel Stream を開いて
+        先頭バッファを読み、主/降雨対応 SID の context_id を解決する。プローブ後は入力 pump を直ちに起動し、
+        読み取った生バイトと後続入力をエンコーダー起動まで有限バッファへ保持する。
+
+        Args:
+            channel (Channel): 視聴対象のチャンネル。
+            tlv_mirakurun_base_url (str): 専用 Mirakurun の URL。
+            tlv_stream_endpoint (str): Channel Stream API の endpoint (decode=0)。
+            program_present (Program | None): 現在の番組情報 (停波判定に使用)。
+
+        Returns:
+            tuple[aiohttp.ClientSession, aiohttp.ClientResponse, KonomiTVBS4KTLVStreamPump, int, int | None] | None:
+                (session, response, 入力 pump, 主 context_id, 降雨対応 context_id)。
+                接続に失敗した場合は None (Offline 遷移と disconnectAll はこの中で済ませる)。
+        """
+
+        session: aiohttp.ClientSession | None = None
+        response: aiohttp.ClientResponse | None = None
+        stream_pump: KonomiTVBS4KTLVStreamPump | None = None
+
+        async def closeConnection() -> None:
+            """接続済みの pump / session / response を閉じる。未接続なら何もしない。"""
+            if stream_pump is not None:
+                stream_pump.cancel()
+            if response is not None and response.closed is False:
+                response.close()
+            if session is not None and session.closed is False:
+                await session.close()
+            if stream_pump is not None:
+                await stream_pump.wait()
+
+        try:
+            # チューナーを確保できるまで待機する
+            ## 確保できなかった場合でも共聴で受信できる可能性があるので、戻り値は無視する
+            self.live_stream.setStatus('Standby', 'チューナーを確保しています…')
+            await self.acquireMirakurunTuner(channel.type, tlv_mirakurun_base_url)
+
+            # Mirakurun の Channel Stream API へ HTTP リクエストを開始し、生 TLV を受け取る。
+            self.live_stream.setStatus('Standby', 'チューナーを起動しています…')
+            session = aiohttp.ClientSession()
+            stream_endpoint_url = GetMirakurunAPIEndpointURL(tlv_stream_endpoint, tlv_mirakurun_base_url)
+            mirakurun_stream_timeout = 40
+            try:
+                response = await session.get(
+                    url = stream_endpoint_url,
+                    headers = {**API_REQUEST_HEADERS, 'X-Mirakurun-Priority': '0'},
+                    timeout = aiohttp.ClientTimeout(
+                        connect=mirakurun_stream_timeout,
+                        sock_connect=mirakurun_stream_timeout,
+                        sock_read=mirakurun_stream_timeout,
+                    ),
+                )
+            except (TimeoutError, aiohttp.ClientConnectorError):
+                # 番組名に「放送休止」などが入っていれば停波によるものとみなし、そうでないなら接続失敗とする
+                if program_present is None or program_present.isOffTheAirProgram():
+                    self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-01M)')
+                else:
+                    self.live_stream.setStatus('Offline', 'チューナーへの接続に失敗しました。チューナー側に何らかの問題があるかもしれません。(E-01M)')
+                self.live_stream.disconnectAll()
+                await closeConnection()
+                return None
+
+            # Channel Stream API がエラーを返した場合は、空の本文を TLV としてプローブする前に
+            # 既存 MPEG-TS 経路と同じ E-12M へ分類する。特に 503 と mirakc の 404 はチューナー不足を表す。
+            if response.status != 200:
+                mirakurun_or_mirakc = (
+                    'mirakc'
+                    if 'server' in response.headers and 'mirakc' in response.headers['server']
+                    else 'Mirakurun'
+                )
+                if response.status == 503 or (response.status == 404 and mirakurun_or_mirakc == 'mirakc'):
+                    detail = 'チューナーの起動に失敗しました。空きチューナーが不足している可能性があります。(E-12M)'
+                elif response.status == 404:
+                    detail = (
+                        f'現在このチャンネルは受信できません。{mirakurun_or_mirakc} 側に問題があるかもしれません。'
+                        f'(HTTP Error {response.status}) (E-12M)'
+                    )
+                else:
+                    detail = (
+                        f'チューナーで不明なエラーが発生しました。{mirakurun_or_mirakc} 側に問題があるかもしれません。'
+                        f'(HTTP Error {response.status}) (E-12M)'
+                    )
+                self.live_stream.setStatus('Offline', detail)
+                self.live_stream.disconnectAll()
+                await closeConnection()
+                return None
+
+            # 先頭バッファを読んで主/降雨対応 SID の context_id を解決する。
+            # 画質 1080p 以下かつ降雨対応放送の自動利用が有効なときだけ降雨対応 SID が現れるまで待つ。
+            # aiohttp.StreamReader の __aiter__ は readline (\n 区切り) のため、生 TLV を渡すと
+            # 64KB を超える改行の無い入力で LineTooLong になり壊れる。iter_chunked で生バイト列を渡す。
+            rain_service_id = self.RAIN_FALLBACK_SERVICE_IDS.get((channel.network_id, channel.service_id))
+            need_rain_fallback = (
+                self.live_stream.encoding_options.use_rain_fallback is True and
+                QUALITY[self.live_stream.quality].height <= 1080 and
+                rain_service_id is not None
+            )
+            main_context_id, rain_context_id, head_buffer = await KonomiTVBS4KTLVServiceResolver.resolve(
+                response.content.iter_chunked(64 * 1024),
+                channel.service_id,
+                rain_service_id,
+                need_rain_fallback = need_rain_fallback,
+                log_prefix = self.live_stream.log_prefix,
+            )
+
+            if main_context_id is None:
+                # 主 SID の context_id が解決できない場合は、先着順に依存する 0:v:0 へ黙って落とさず失敗させる。
+                # 0:v:0 は降雨時に低階層映像を掴み得るため、本機能が直したい不具合そのもの。
+                logging.warning(
+                    f'{self.live_stream.log_prefix} Failed to resolve the main service context_id from MMT/TLV. '
+                    f'(SID: {channel.service_id})'
+                )
+                await closeConnection()
+                self.live_stream.disconnectAll()
+                self.live_stream.setStatus('Offline', 'TLV 入力から主サービスの情報を解決できませんでした。設定を確認してください。(E-19T)')
+                return None
+
+            # Resolver が止まった直後から HTTP 応答を読み続け、FFmpeg 起動中の Mirakurun 側滞留を防ぐ。
+            # 以後 response.content を直接読むのはこの pump だけに限定する。
+            stream_pump = KonomiTVBS4KTLVStreamPump(
+                response.content,
+                head_buffer,
+                self.live_stream.log_prefix,
+            )
+            stream_pump.start()
+
+            # 降雨対応放送を映像に使うかどうかを起動時に確定し、状態更新と同時にプレイヤーへ通知する。
+            # FFmpeg の -map はプロセス起動後に変更できないため、送出状態が途中で変わっても再起動までは再選択しない。
+            self.live_stream.is_rain_fallback = rain_context_id is not None
+            self.live_stream.setStatus(
+                'Standby',
+                (
+                    '降雨対応放送を使用してエンコードを開始しています…'
+                    if rain_context_id is not None
+                    else 'エンコードを開始しています…'
+                ),
+            )
+            if rain_context_id is not None:
+                logging.info(
+                    f'{self.live_stream.log_prefix} Rain fallback broadcast detected. '
+                    f'(SID: {rain_service_id})'
+                )
+
+            return (session, response, stream_pump, main_context_id, rain_context_id)
+
+        except asyncio.CancelledError:
+            # 選局キャンセル: 接続だけ閉じて再送出する (状態遷移は LiveStream.connect 側に任せる)。
+            await closeConnection()
+            raise
+        except Exception as ex:
+            # 予期せぬ失敗: 接続を閉じ、Offline へ遷移して次回 connect() で再試行できるようにする。
+            # ここで Standby のまま例外終了すると、次回 connect() がタスクを起こせなくなる。
+            # SystemExit / KeyboardInterrupt は BaseException のためここでは拾わず、通常の終了経路へ残す。
+            logging.error(f'{self.live_stream.log_prefix} Failed to connect or probe the MMT/TLV stream.', exc_info=ex)
+            await closeConnection()
+            self.live_stream.disconnectAll()
+            self.live_stream.setStatus('Offline', 'ライブストリームの処理中に予期しないエラーが発生しました。(E-18)')
+            return None
+
+
     def KillSubprocesses(self, *targets: tuple[str, asyncio.subprocess.Process | None]) -> list[tuple[str, asyncio.subprocess.Process]]:
         """
         起動済みのサブプロセス群へまとめて kill を送信する (このメソッドは一切 await しない)
@@ -1264,6 +1481,9 @@ class LiveEncodingTask:
 
         CONFIG = Config()
 
+        # 降雨対応放送の利用状態を毎回初期化する。再起動で前回の値が残らないようにする。
+        self.live_stream.is_rain_fallback = False
+
         # まだ Standby になっていなければ、ステータスを Standby に設定
         # 基本はエンコードタスクの呼び出し元である self.live_stream.connect() の方で Standby に設定されるが、再起動の場合はそこを経由しないため必要
         if not (self.live_stream.getStatus().status == 'Standby' and self.live_stream.getStatus().detail == 'エンコードタスクを起動しています…'):
@@ -1325,6 +1545,19 @@ class LiveEncodingTask:
                 )
                 self.live_stream.disconnectAll()
                 return
+
+        # TLV 経路はエンコーダー生成前にチューナー接続と先頭バッファのプローブを行うため、
+        # 放送波の受信元と context_id をここで事前初期化する。MPEG-TS 経路も同じ変数を使うが、
+        # そちらではチューナー接続後に設定する。
+        ## 放送波の MPEG2-TS / 生 TLV を受信する StreamReader
+        stream_reader: asyncio.StreamReader | PipeStreamReader | aiohttp.StreamReader | None = None
+        ## Mirakurun の aiohttp セッションとレスポンス (EDCB バックエンド利用時は常に None)
+        response: aiohttp.ClientResponse | None = None
+        session: aiohttp.ClientSession | None = None
+        ## TLV のプローブ後から HTTP 入力を読み続ける pump と、解決済みの context_id
+        tlv_stream_pump: KonomiTVBS4KTLVStreamPump | None = None
+        tlv_main_context_id: int | None = None
+        tlv_rain_context_id: int | None = None
 
         # 3つのバックエンド構成のどれで動作しているかと、実際に選局するサービスを明示する
         ## 接続 URL は認証情報やローカル環境情報を含む可能性があるためログへ出力しない。
@@ -1485,12 +1718,25 @@ class LiveEncodingTask:
         ## 子プロセスへ引き渡してクローズした時点で None を代入し、外側の except での二重 close を防ぐ
         bridge_read_pipe: int | None = None
         bridge_write_pipe: int | None = None
+
+        # TLV 経路はエンコーダー生成前にチューナー接続と先頭バッファのプローブを行う。
+        # map 確定後も入力 pump が同じ Channel Stream を読み続け、エンコーダー起動中の滞留を防ぐ。
+        if is_mmt_tlv is True:
+            assert tlv_mirakurun_base_url is not None
+            assert tlv_stream_endpoint is not None
+            tlv_stream_result = await self.connectTLVStreamAndProbe(
+                channel, tlv_mirakurun_base_url, tlv_stream_endpoint, program_present,
+            )
+            if tlv_stream_result is None:
+                # 接続失敗。Offline 遷移と disconnectAll は connectTLVStreamAndProbe 内で済んでいる。
+                return
+            session, response, tlv_stream_pump, tlv_main_context_id, tlv_rain_context_id = tlv_stream_result
+
         try:
             # ***** エンコーダープロセスの作成と実行 *****
 
-            # エンコーダーの起動には時間がかかるので、先にエンコーダーを起動しておいた後、あとからチューナーを起動する
-            # チューナーの起動後にエンコーダー (正確には tsreadex) に受信した放送波が書き込まれる
-            # チューナーの起動にも時間がかかるが、エンコーダーの起動は非同期なのに対し、チューナーの起動は EDCB の場合は同期的
+            # MPEG-TS 経路ではエンコーダーを先に起動してからチューナーへ接続する。
+            # TLV 経路は context_id の事前解決が必要なため既に接続済みだが、入力 pump が起動中も読み続けている。
 
             # フル HD 放送が行われているチャンネルかを取得
             is_fullhd_channel = (
@@ -1556,6 +1802,7 @@ class LiveEncodingTask:
                 else:
                     encoder_options = self.buildFFmpegOptions(
                         self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg, is_mmt_tlv,
+                        tlv_main_context_id, tlv_rain_context_id,
                     )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 Commands:\n'
@@ -1590,7 +1837,7 @@ class LiveEncodingTask:
                 hw_encoder_type = ENCODER_TYPE
                 encoder_options = self.buildFFmpeg8HardwareOptions(
                     self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
-                    channel.is_oneseg, is_mmt_tlv,
+                    channel.is_oneseg, is_mmt_tlv, tlv_main_context_id, tlv_rain_context_id,
                 )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 ({ENCODER_TYPE}) Commands:\n'
@@ -1624,6 +1871,8 @@ class LiveEncodingTask:
         except BaseException:
             # 生成フェーズ途中の例外・キャンセルでは、まず生成済みの全プロセスへ kill を送信する (この段階では await しない)
             killed = self.KillSubprocesses(('tsreadex', tsreadex), ('encoder', encoder), ('bridge', bridge))
+            if tlv_stream_pump is not None:
+                tlv_stream_pump.cancel()
             # 終了待機の停滞で解放処理がスキップされないよう、wait へ入る前に残っているパイプをすべて閉じる
             ## 子プロセスへ引き渡されてクローズ済みのパイプは None になっている
             for pipe in (tsreadex_read_pipe, bridge_read_pipe, bridge_write_pipe):
@@ -1635,15 +1884,27 @@ class LiveEncodingTask:
             if self.live_stream.psi_data_archiver is not None:
                 self.live_stream.psi_data_archiver.destroy()
                 self.live_stream.psi_data_archiver = None
+            # TLV 経路ではエンコーダー生成前にストリームへ接続済みのため、ここで切断する。
+            if response is not None and response.closed is False:
+                response.close()
+            if session is not None and session.closed is False:
+                await session.close()
             # Standby のまま例外を投げると LiveStream.connect() が次回接続でエンコードタスクを起動せず
             # 配信不能に陥るため、主要資源の解放後に Offline へ遷移させて再試行可能にする
             self.live_stream.setStatus('Offline', 'ライブストリームの処理中に予期しないエラーが発生しました。(E-18)')
-            # kill 済みプロセスの終了を待機してから再送出する
-            await self.WaitSubprocesses(killed)
+            # pump の待機中に再キャンセルされても、kill 済みプロセスの終了待機を必ず行う。
+            try:
+                if tlv_stream_pump is not None:
+                    await tlv_stream_pump.wait()
+            finally:
+                await self.WaitSubprocesses(killed)
             raise
 
         # ここまで到達した時点で Encoder は起動済み (tsreadex / bridge は未使用の場合 None)
         assert encoder is not None
+        if tlv_stream_pump is not None:
+            # 以後は起動時バッファからチャンクを破棄せず、有限 Queue の backpressure で入力速度を制御する。
+            tlv_stream_pump.switchToLosslessMode()
 
         def IsInputProcessorExited() -> bool:
             """
@@ -1663,13 +1924,6 @@ class LiveEncodingTask:
         # エンコードタスクが稼働中かどうか
         is_running: bool = True
 
-        # 放送波の MPEG2-TS を受信する StreamReader
-        stream_reader: asyncio.StreamReader | PipeStreamReader | aiohttp.StreamReader | None = None
-
-        # Mirakurun の aiohttp セッション (EDCB バックエンド利用時は常に None)
-        response: aiohttp.ClientResponse | None = None
-        session: aiohttp.ClientSession | None = None
-
         # 実行中の非同期実行タスクへの参照を保持しておく
         ## run() の実行が完了するまで、ガベージコレクタにより非同期実行タスクが勝手に破棄されることを防ぐ
         ## ref: https://docs.astral.sh/ruff/rules/asyncio-dangling-task/
@@ -1686,7 +1940,8 @@ class LiveEncodingTask:
         # CancelledError をキャッチしないとエンコーダープロセスの終了処理に到達せず、プロセスがリークしてしまう
         try:
             # Mirakurun バックエンド
-            if LIVE_STREAM_BACKEND == 'Mirakurun':
+            # TLV 経路はエンコーダー生成前に接続済み (connectTLVStreamAndProbe) のため、ここでは何もしない。
+            if LIVE_STREAM_BACKEND == 'Mirakurun' and is_mmt_tlv is False:
 
                 # チューナーを確保できるまで待機する
                 ## 確保できなかった場合でも共聴で受信できる可能性があるので、戻り値は無視する
@@ -1704,12 +1959,7 @@ class LiveEncodingTask:
                 self.live_stream.setStatus('Standby', 'チューナーを起動しています…')
                 session = aiohttp.ClientSession()
                 mirakurun_stream_timeout = 40 if channel.type == 'BS4K' else 15
-                if is_mmt_tlv is True:
-                    # SMB400 側で MPEG-TS へ変換・service filter させず、放送 TLV をそのまま受け取る。
-                    assert tlv_stream_endpoint is not None
-                    stream_endpoint = tlv_stream_endpoint
-                else:
-                    stream_endpoint = f'/api/services/{mirakurun_service_id}/stream'
+                stream_endpoint = f'/api/services/{mirakurun_service_id}/stream'
                 stream_endpoint_url = (
                     GetMirakurunAPIEndpointURL(stream_endpoint, tlv_mirakurun_base_url)
                     if tlv_mirakurun_base_url is not None
@@ -1863,11 +2113,13 @@ class LiveEncodingTask:
                                 yield ex.partial
                             break
 
-                assert stream_reader is not None
-                stream_iterator = GetIterator(
-                    stream_reader,
-                    64 * 1024 if is_mmt_tlv is True else ts.PACKET_SIZE * 256,
-                )
+                # TLV はプローブ直後から唯一の HTTP reader として動いている pump から受け取る。
+                # MPEG-TS は従来どおりチューナー接続の StreamReader を直接読む。
+                if tlv_stream_pump is not None:
+                    stream_iterator = tlv_stream_pump.iterChunks()
+                else:
+                    assert stream_reader is not None
+                    stream_iterator = GetIterator(stream_reader, ts.PACKET_SIZE * 256)
                 tlv_synchronizer = KonomiTVBS4KTLVSynchronizer() if is_mmt_tlv is True else None
                 input_writer = encoder.stdin if is_mmt_tlv is True else (tsreadex.stdin if tsreadex is not None else None)
                 assert input_writer is not None
@@ -1957,8 +2209,12 @@ class LiveEncodingTask:
 
                 # Mirakurun バックエンド: Service Stream API とのストリーミング接続を閉じる
                 if LIVE_STREAM_BACKEND == 'Mirakurun' and response is not None and session is not None:
-                    await session.close()
+                    if tlv_stream_pump is not None:
+                        tlv_stream_pump.cancel()
                     response.close()
+                    await session.close()
+                    if tlv_stream_pump is not None:
+                        await tlv_stream_pump.wait()
 
             # タスクを非同期で実行
             background_tasks.add(asyncio.create_task(Reader()))
@@ -2431,6 +2687,8 @@ class LiveEncodingTask:
             # await を伴わない解放処理を最初に済ませる
             ## 以降の await (session.close() / tuner.close() / プロセス終了待機) が停滞・再キャンセルされても、
             ## レスポンス close・クライアント切断・アーカイバー破棄は確実に完了している
+            if tlv_stream_pump is not None:
+                tlv_stream_pump.cancel()
             if response is not None and response.closed is False:
                 response.close()
             self.live_stream.disconnectAll()
@@ -2463,8 +2721,12 @@ class LiveEncodingTask:
                                         exc_info=ex,
                                     )
                 finally:
-                    # tuner.close() の失敗や再キャンセルでも、kill 済みプロセスの終了待機へ必ず到達する
-                    await self.WaitSubprocesses(killed)
+                    # pump の待機や tuner.close() の失敗・再キャンセルでも、kill 済みプロセスの終了待機へ必ず到達する
+                    try:
+                        if tlv_stream_pump is not None:
+                            await tlv_stream_pump.wait()
+                    finally:
+                        await self.WaitSubprocesses(killed)
 
         # エンコードタスクを再起動する（エンコーダーの再起動が必要な場合）
         if self.live_stream.getStatus().status == 'Restart':

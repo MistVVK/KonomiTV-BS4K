@@ -453,6 +453,63 @@ def test_mmt_tlv_uses_libaribtlv_and_disables_source_anchor(
     assert '-max_audio_channels' not in hardware_options
 
 
+def test_mmt_tlv_context_id_map_fixes_video_and_audio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TLV は context_id で映像・音声を固定し、降雨対応時は映像だけ低階層を選ぶ。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=False,
+        video_codec='avc',
+        audio_codec='aac',
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    # 高階層のみ (降雨対応なし): 映像・音声とも主 context へ固定し、0:v:0 の先着順に依存しない。
+    software_options = task.buildFFmpegOptions(
+        '240p', 'BS4K', False, is_mmt_tlv=True, tlv_main_context_id=0x0001,
+    )
+    hardware_options = task.buildFFmpeg8HardwareOptions(
+        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True, tlv_main_context_id=0x0001,
+    )
+
+    for options in (software_options, hardware_options):
+        assert '0:v:m:context_id:1' in options
+        assert '0:a:m:context_id:1' in options
+        assert '0:d?' in options
+        assert '0:v:0' not in options
+        assert '0:a?' not in options
+
+    # 降雨対応あり: 映像は低階層 (context 2)、音声は高階層 (context 1)。
+    software_options = task.buildFFmpegOptions(
+        '240p', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_context_id=0x0001, tlv_rain_context_id=0x0002,
+    )
+    hardware_options = task.buildFFmpeg8HardwareOptions(
+        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_context_id=0x0001, tlv_rain_context_id=0x0002,
+    )
+
+    for options in (software_options, hardware_options):
+        assert '0:v:m:context_id:2' in options
+        assert '0:a:m:context_id:1' in options
+        assert '0:d?' in options
+
+    # context_id 未解決 (プローブ失敗) は従来 map へフォールバックする。
+    software_options = task.buildFFmpegOptions(
+        '240p', 'BS4K', False, is_mmt_tlv=True, tlv_main_context_id=None,
+    )
+    hardware_options = task.buildFFmpeg8HardwareOptions(
+        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True, tlv_main_context_id=None,
+    )
+
+    for options in (software_options, hardware_options):
+        assert '0:v:0' in options
+        assert '0:a?' in options
+        assert '0:d?' in options
+
+
 def test_ffmpeg8_software_advanced_codec_uses_single_map_and_vbv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

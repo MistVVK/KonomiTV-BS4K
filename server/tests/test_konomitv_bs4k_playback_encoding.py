@@ -49,13 +49,29 @@ from app.streams.StreamEncodingOptions import (
 class _LiveChannelQuery:
     """ValidateQuality の実 backend 解決に使うチャンネルクエリ代替。"""
 
-    def __init__(self, is_radiochannel: bool) -> None:
+    def __init__(
+        self,
+        is_radiochannel: bool,
+        *,
+        channel_type: str = 'GR',
+        network_id: int = 0x7880,
+        service_id: int = 101,
+    ) -> None:
         self.is_radiochannel = is_radiochannel
+        self.channel_type = channel_type
+        self.network_id = network_id
+        self.service_id = service_id
 
     async def get_or_none(self) -> SimpleNamespace:
         """ラジオ・ワンセグ種別を持つチャンネル代替を返す。"""
 
-        return SimpleNamespace(is_radiochannel = self.is_radiochannel, is_oneseg = False)
+        return SimpleNamespace(
+            is_radiochannel = self.is_radiochannel,
+            is_oneseg = False,
+            type = self.channel_type,
+            network_id = self.network_id,
+            service_id = self.service_id,
+        )
 
 
 @pytest.fixture(autouse = True)
@@ -614,9 +630,9 @@ def test_konomitv_bs4k_legacy_hevc_10bit_suffix_stays_exact_for_every_backend() 
 
 
 def test_konomitv_bs4k_live_stream_key_separates_every_encoding_condition() -> None:
-    """同一チャンネル・画質でもcodec、bit depth、音声、24fpsが違えば共有しない。"""
+    """同一チャンネル・画質でもcodec、bit depth、音声、24fps、降雨対応が違えば共有しない。"""
 
-    display_channel_id = 'gr-konomitv-bs4k-key-contract'
+    display_channel_id = 'bs4k101-konomitv-bs4k-key-contract'
     profiles = (
         StreamEncodingOptions(),
         StreamEncodingOptions(video_codec = 'av1'),
@@ -628,13 +644,20 @@ def test_konomitv_bs4k_live_stream_key_separates_every_encoding_condition() -> N
             video_bit_depth = 10,
             audio_codec = 'opus',
         ),
+        StreamEncodingOptions(
+            is_24fps_mode_enabled = True,
+            video_codec = 'av1',
+            video_bit_depth = 10,
+            audio_codec = 'opus',
+            use_rain_fallback = False,
+        ),
     )
     streams = [LiveStream(display_channel_id, '1080p', profile) for profile in profiles]
 
     assert len({id(stream) for stream in streams}) == len(profiles)
     assert LiveStream(display_channel_id, '1080p', profiles[-1]) is streams[-1]
     assert streams[0].live_stream_id == f'{display_channel_id}-1080p'
-    assert streams[-1].live_stream_id == f'{display_channel_id}-1080p-av1-10bit-opus-24fps'
+    assert streams[-1].live_stream_id == f'{display_channel_id}-1080p-av1-10bit-opus-24fps-norain'
     assert streams[-1].live_stream_key == (
         display_channel_id,
         '1080p',
@@ -642,6 +665,83 @@ def test_konomitv_bs4k_live_stream_key_separates_every_encoding_condition() -> N
         10,
         'opus',
         True,
+        False,
+    )
+
+
+def test_konomitv_bs4k_rain_fallback_is_normalized_for_ineffective_quality() -> None:
+    """1080pを超える画質では無効な降雨設定を既定値へ戻し、-norainストリームを作らない。"""
+
+    stream_quality = SplitQualityAndEncodingOptions(
+        '2160p',
+        encoder='FFmpeg',
+        use_rain_fallback=False,
+    )
+
+    assert stream_quality is not None
+    assert stream_quality.encoding_options.use_rain_fallback is True
+    assert stream_quality.encoding_options.buildSuffix() == ''
+
+
+@pytest.mark.parametrize(
+    ('transport', 'channel_type', 'network_id', 'service_id', 'quality', 'expected_use_rain_fallback'),
+    [
+        ('Tlv', 'BS4K', 0x000B, 101, '1080p', False),
+        ('Tlv', 'BS4K', 0x000B, 102, '1080p', False),
+        ('Tlv', 'BS4K', 0x000B, 101, '2160p', True),
+        ('Tlv', 'BS4K', 0x000B, 191, '1080p', True),
+        ('Tlv', 'BS4K', 0x0004, 101, '1080p', True),
+        ('MpegTs', 'BS4K', 0x000B, 101, '1080p', True),
+    ],
+)
+def test_konomitv_bs4k_live_query_keeps_rain_setting_only_when_effective(
+    monkeypatch: pytest.MonkeyPatch,
+    transport: str,
+    channel_type: str,
+    network_id: int,
+    service_id: int,
+    quality: str,
+    expected_use_rain_fallback: bool,
+) -> None:
+    """TLVのSID 101/102かつ1080p以下だけ、降雨設定を共有キーへ残す。"""
+
+    monkeypatch.setattr(
+        LiveStreamsRouter,
+        'GetEncoderForLiveChannel',
+        lambda _display_channel_id: 'FFmpeg',
+    )
+    monkeypatch.setattr(
+        LiveStreamsRouter.Channel,
+        'filter',
+        lambda **_kwargs: _LiveChannelQuery(
+            is_radiochannel=False,
+            channel_type=channel_type,
+            network_id=network_id,
+            service_id=service_id,
+        ),
+    )
+    monkeypatch.setattr(
+        LiveStreamsRouter,
+        'Config',
+        lambda: SimpleNamespace(
+            general=SimpleNamespace(konomitv_bs4k_live_transport=transport),
+        ),
+    )
+
+    stream_quality = asyncio.run(
+        LiveStreamsRouter.ValidateQuality(
+            quality,
+            f'bs4k{service_id}',
+            None,
+            None,
+            'aac',
+            False,
+        )
+    )
+
+    assert stream_quality.encoding_options.use_rain_fallback is expected_use_rain_fallback
+    assert stream_quality.encoding_options.buildSuffix().endswith('-norain') is (
+        expected_use_rain_fallback is False
     )
 
 

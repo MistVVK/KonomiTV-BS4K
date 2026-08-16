@@ -20,6 +20,8 @@ interface ILiveStreamStatusEvent {
     updated_at: number;
     // このライブストリームを視聴しているクライアント数
     client_count: number;
+    // このライブストリームが降雨対応放送 (1080p 低階層) を映像に使っているかどうか
+    is_rain_fallback: boolean;
 }
 
 type LiveStreamStatus = ILiveStreamStatusEvent['status'];
@@ -106,6 +108,7 @@ class LiveEventManager implements PlayerManager {
 
             // ライブストリームのステータスを設定
             player_store.live_stream_status = event.status;
+            player_store.is_rain_fallback = event.is_rain_fallback;
 
             // ステータスごとに処理を振り分け
             switch (event.status) {
@@ -134,6 +137,7 @@ class LiveEventManager implements PlayerManager {
 
             // ライブストリームのステータスを設定
             player_store.live_stream_status = event.status;
+            player_store.is_rain_fallback = event.is_rain_fallback;
 
             // 視聴者数を更新
             channels_store.viewer_count = event.client_count;
@@ -272,6 +276,9 @@ class LiveEventManager implements PlayerManager {
             const event: ILiveStreamStatusEvent = JSON.parse(event_raw.data);
             console.log('\u001b[33m[LiveEventManager][detail_update]', `\nStatus: ${event.status} Detail:${event.detail}`);
 
+            // detail_update もステータス全体を含むため、映像階層の変更を ONAir 遷移まで遅らせず反映する。
+            player_store.is_rain_fallback = event.is_rain_fallback;
+
             // 視聴者数を更新
             channels_store.viewer_count = event.client_count;
 
@@ -346,6 +353,7 @@ class LiveEventManager implements PlayerManager {
 
         // PlayerStore にセットしたライブストリームのステータスをリセット
         player_store.live_stream_status = null;
+        player_store.is_rain_fallback = false;
 
         // ChannelsStore にセットしたリアルタイム視聴者数をリセット
         // ここで削除しないといつまで経っても古い番組情報が参照され続けてしまう

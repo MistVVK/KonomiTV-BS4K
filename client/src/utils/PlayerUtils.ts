@@ -321,11 +321,13 @@ export class PlayerUtils {
         video_codec: KonomiTVBS4KPlaybackVideoCodec;
         video_bit_depth: 8 | 10;
         audio_codec: KonomiTVBS4KPlaybackAudioCodec;
+        use_rain_fallback: boolean;
     }): string {
         return new URLSearchParams({
             video_codec: konomitv_bs4k_profile.video_codec,
             video_bit_depth: konomitv_bs4k_profile.video_bit_depth.toString(),
             audio_codec: konomitv_bs4k_profile.audio_codec,
+            use_rain_fallback: konomitv_bs4k_profile.use_rain_fallback === true ? '1' : '0',
         }).toString();
     }
 
@@ -357,7 +359,7 @@ export class PlayerUtils {
         const konomitv_bs4k_query = new URLSearchParams();
         for (
             const konomitv_bs4k_key of
-            ['video_codec', 'video_bit_depth', 'audio_codec'] as const
+            ['video_codec', 'video_bit_depth', 'audio_codec', 'use_rain_fallback'] as const
         ) {
             const konomitv_bs4k_value =
                 konomitv_bs4k_source_url.searchParams.get(konomitv_bs4k_key);

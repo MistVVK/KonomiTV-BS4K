@@ -31,7 +31,7 @@ type FakePlayer = {
     qualityIndex: number;
     options: {
         video: {
-            quality: Array<{name: string}>;
+            quality: Array<{name: string; url: string}>;
         };
     };
     notice: ReturnType<typeof vi.fn>;
@@ -92,7 +92,9 @@ describe('ライブ末尾同期先の算出', () => {
 });
 
 
-function createFakePlayer(): { player: FakePlayer; original_hide: ReturnType<typeof vi.fn> } {
+function createFakePlayer(
+    current_quality_name = '720p',
+): { player: FakePlayer; original_hide: ReturnType<typeof vi.fn> } {
     const container = document.createElement('div');
     container.innerHTML = `
         <div class="dplayer-setting-box">
@@ -136,7 +138,10 @@ function createFakePlayer(): { player: FakePlayer; original_hide: ReturnType<typ
             qualityIndex: 0,
             options: {
                 video: {
-                    quality: [{name: '720p'}],
+                    quality: [{
+                        name: current_quality_name,
+                        url: '/api/streams/live/bs4k101/720p/mpegts?use_rain_fallback=1',
+                    }],
                 },
             },
             notice: vi.fn(),
@@ -151,12 +156,12 @@ function createFakePlayer(): { player: FakePlayer; original_hide: ReturnType<typ
 }
 
 
-function createController(playback_mode: PlaybackMode): {
+function createController(playback_mode: PlaybackMode, current_quality_name = '720p'): {
     controller: TestablePlayerController;
     player: FakePlayer;
     original_hide: ReturnType<typeof vi.fn>;
 } {
-    const { player, original_hide } = createFakePlayer();
+    const { player, original_hide } = createFakePlayer(current_quality_name);
     const controller = Object.create(PlayerController.prototype) as TestablePlayerController;
     controller.playback_mode = playback_mode;
     controller.quality_profile_type = 'Wi-Fi';
@@ -373,6 +378,7 @@ describe('DPlayer設定パネル: 低遅延モード表示', () => {
             encoder: 'FFmpeg',
             encoder_bs4k: 'FFmpeg',
             bs4k_ignore_viewer_low_latency: true,
+            konomitv_bs4k_live_transport: 'Tlv',
             jikkyo_enabled: false,
         };
 
@@ -380,6 +386,125 @@ describe('DPlayer設定パネル: 低遅延モード表示', () => {
         expect(player.container.querySelector(
             '.dplayer-konomitv-bs4k-setting-low-latency-mode-value',
         )?.textContent?.trim()).toBe('OFF');
+    });
+});
+
+
+describe('DPlayer設定パネル: 降雨対応映像表示', () => {
+    beforeEach(() => {
+        localStorage.clear();
+        document.body.innerHTML = '';
+        setActivePinia(createPinia());
+
+        useVersionStore().server_version_info = {
+            version: '1.0.0',
+            upstream_version: '0.14.1',
+            git_commit: 'test',
+            latest_version: null,
+            environment: 'Linux-Docker',
+            backend: 'EDCB',
+            encoder: 'FFmpeg',
+            encoder_bs4k: 'FFmpeg',
+            bs4k_ignore_viewer_low_latency: false,
+            konomitv_bs4k_live_transport: 'Tlv',
+            jikkyo_enabled: false,
+        };
+    });
+
+    it.each([
+        [false, '通常（主階層）'],
+        [true, '降雨対応（低階層）'],
+    ])('SID 101 では実際に使用中の映像階層を表示する', (is_rain_fallback, expected) => {
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.BS4K = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            network_id: 0x000B,
+            service_id: 101,
+            display_channel_id: 'bs4k101',
+            type: 'BS4K' as const,
+        })];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'bs4k101';
+        usePlayerStore().is_rain_fallback = is_rain_fallback;
+
+        const { player } = createController('Live');
+
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback-status .dplayer-label',
+        )?.textContent).toBe('映像階層');
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback-status-value',
+        )?.textContent?.trim()).toBe(expected);
+        expect(player.container.querySelector('.dplayer-konomitv-bs4k-setting-rain-fallback')).not.toBeNull();
+    });
+
+    it('対象外 SID では降雨対応映像の状態とトグルを表示しない', () => {
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.BS4K = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            network_id: 0x000B,
+            service_id: 191,
+            display_channel_id: 'bs4k191',
+            type: 'BS4K' as const,
+        })];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'bs4k191';
+
+        const { player } = createController('Live');
+
+        expect(player.container.querySelector('.dplayer-konomitv-bs4k-setting-rain-fallback-status')).toBeNull();
+        expect(player.container.querySelector('.dplayer-konomitv-bs4k-setting-rain-fallback')).toBeNull();
+    });
+
+    it('4K 視聴中のトグル変更は設定と後続 URL だけを更新し、プレイヤーを再起動しない', () => {
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.BS4K = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            network_id: 0x000B,
+            service_id: 101,
+            display_channel_id: 'bs4k101',
+            type: 'BS4K' as const,
+        })];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'bs4k101';
+        const player_store = usePlayerStore();
+        const restart_handler = vi.fn();
+        player_store.event_emitter.on('PlayerRestartRequired', restart_handler);
+
+        const { player } = createController('Live', '4K');
+        player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback',
+        )!.click();
+
+        expect(useSettingsStore().settings.tv_use_rain_fallback_for_bs4k).toBe(false);
+        expect(new URL(player.options.video.quality[0].url).searchParams.get('use_rain_fallback')).toBe('0');
+        expect(restart_handler).not.toHaveBeenCalled();
+        expect(player.notice).toHaveBeenCalledWith(
+            '設定を保存しました。1080p 以下の画質へ切り替えたときから適用されます。',
+        );
+    });
+
+    it('1080p 以下の視聴中はトグル変更後にプレイヤーを再起動する', () => {
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.BS4K = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            network_id: 0x000B,
+            service_id: 102,
+            display_channel_id: 'bs4k102',
+            type: 'BS4K' as const,
+        })];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'bs4k102';
+        const player_store = usePlayerStore();
+        const restart_handler = vi.fn();
+        player_store.event_emitter.on('PlayerRestartRequired', restart_handler);
+
+        const { player } = createController('Live', '1080p (60fps)');
+        player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback',
+        )!.click();
+
+        expect(restart_handler).toHaveBeenCalledTimes(1);
     });
 });
 

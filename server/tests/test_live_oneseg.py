@@ -297,7 +297,13 @@ def test_oneseg_quality_validation_rejects_bridge_codecs(
 
     class Query:
         async def get_or_none(self) -> SimpleNamespace:
-            return SimpleNamespace(is_radiochannel=False, is_oneseg=True)
+            return SimpleNamespace(
+                is_radiochannel=False,
+                is_oneseg=True,
+                type='GR',
+                network_id=0x7880,
+                service_id=103,
+            )
 
     monkeypatch.setattr(Channel, 'filter', lambda **_kwargs: Query())
     monkeypatch.setattr(
@@ -333,7 +339,13 @@ def test_oneseg_quality_validation_limits_hevc_to_240p(monkeypatch: pytest.Monke
 
     class Query:
         async def get_or_none(self) -> SimpleNamespace:
-            return SimpleNamespace(is_radiochannel=False, is_oneseg=True)
+            return SimpleNamespace(
+                is_radiochannel=False,
+                is_oneseg=True,
+                type='GR',
+                network_id=0x7880,
+                service_id=103,
+            )
 
     monkeypatch.setattr(Channel, 'filter', lambda **_kwargs: Query())
     monkeypatch.setattr(
