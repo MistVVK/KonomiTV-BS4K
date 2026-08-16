@@ -432,7 +432,7 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
 
 
 def test_opencode_runtime_is_pinned_and_binary_only_in_final_image() -> None:
-    """opencode-ai 1.18.13 が固定導入され、final は SEA バイナリのみを持つ。"""
+    """opencode-ai 1.18.18 が固定導入され、final は SEA バイナリのみを持つ。"""
 
     import json
 
@@ -445,11 +445,11 @@ def test_opencode_runtime_is_pinned_and_binary_only_in_final_image() -> None:
         (REPOSITORY_ROOT / 'docker/opencode/package-lock.json').read_text(encoding='utf-8'),
     )
 
-    assert "OPENCODE_VERSION='1.18.13'" in manifest
+    assert "OPENCODE_VERSION='1.18.18'" in manifest
     assert "OPENCODE_PLATFORM_PACKAGE='opencode-linux-x64'" in manifest
-    assert package_json['dependencies'] == {'opencode-ai': '1.18.13'}
-    assert package_lock['packages']['node_modules/opencode-ai']['version'] == '1.18.13'
-    assert package_lock['packages']['node_modules/opencode-linux-x64']['version'] == '1.18.13'
+    assert package_json['dependencies'] == {'opencode-ai': '1.18.18'}
+    assert package_lock['packages']['node_modules/opencode-ai']['version'] == '1.18.18'
+    assert package_lock['packages']['node_modules/opencode-linux-x64']['version'] == '1.18.18'
     assert package_lock['packages']['node_modules/opencode-linux-x64'].get('optional') is True
 
     assert 'FROM node:20.16.0 AS opencode-builder' in dockerfile
@@ -466,9 +466,9 @@ def test_opencode_runtime_is_pinned_and_binary_only_in_final_image() -> None:
     assert 'COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/node_modules' not in dockerfile
     assert 'COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/ /' not in dockerfile
     assert 'test ! -e /opt/konomitv-bs4k-opencode' in dockerfile
-    assert 'test "${opencode_version}" = \'1.18.13\'' in dockerfile
+    assert 'test "${opencode_version}" = \'1.18.18\'' in dockerfile
     assert '## OpenCode Runtime Dependencies' in dockerfile
-    assert '### opencode-ai 1.18.13' in dockerfile
+    assert '### opencode-ai 1.18.18' in dockerfile
     assert (REPOSITORY_ROOT / 'docker/opencode/opencode.json').is_file()
     assert (REPOSITORY_ROOT / 'docker/opencode/assemble-opencode-license-section.py').is_file()
     config = (REPOSITORY_ROOT / 'docker/opencode/opencode.json').read_text(encoding='utf-8')

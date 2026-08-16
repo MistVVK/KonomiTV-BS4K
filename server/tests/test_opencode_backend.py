@@ -873,7 +873,7 @@ def test_run_episode_lookup_session_evidence_from_message_list(
 ) -> None:
     """POST /message 応答に tool が無くても、GET 一覧から evidence を復元する。
 
-    OpenCode 1.18.13 の POST /session/{id}/message は最終メッセージしか返さず、
+    OpenCode 1.18.18 の POST /session/{id}/message は最終メッセージしか返さず、
     web ツールの tool part は GET /session/{id}/message の一覧にのみ含まれる。
     一方、json_schema format 付きターンを履歴へ追加した後の一覧 API は OpenCode 自身の
     レスポンス検証で HTTP 400 になるため、その前に一覧を走査して証明を抽出できること。

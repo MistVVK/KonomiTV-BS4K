@@ -256,7 +256,7 @@ def test_probe_availability_uses_configured_port(monkeypatch: pytest.MonkeyPatch
     }
     assert snapshot['base_url'] == 'http://127.0.0.1:11451'
     assert snapshot['port'] == 11451
-    assert snapshot['pinned_version'] == '1.18.13'
+    assert snapshot['pinned_version'] == '1.18.18'
     assert OpenCodeClient().base_url == 'http://127.0.0.1:11451'
 
 

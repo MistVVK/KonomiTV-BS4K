@@ -1,4 +1,4 @@
-"""OpenCode 1.18.13 OpenAPI 契約の型定義土台（Phase 2 クライアントが利用）。
+"""OpenCode 1.18.18 OpenAPI 契約の型定義土台（Phase 2 クライアントが利用）。
 
 usage の正本位置:
 - AssistantMessage.tokens.input / output / reasoning / cache

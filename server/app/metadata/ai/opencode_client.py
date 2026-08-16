@@ -221,7 +221,7 @@ class OpenCodeClient:
     async def _disposeInstance(self) -> None:
         """POST /instance/dispose でインスタンス状態を破棄し、auth 反映を促す。
 
-        OpenCode 1.18.13 では PUT/DELETE /auth だけでは provider の connected
+        OpenCode 1.18.18 では PUT/DELETE /auth だけでは provider の connected
         状態が更新されず、Model not found になる。dispose 後の次回アクセスで
         auth.json が再読込されることを実測で確認した。
         呼び出し元は provider 状態の auth mutation を取得済みでなければならない。

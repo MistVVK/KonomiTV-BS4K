@@ -395,8 +395,8 @@ def test_health_endpoint_reports_availability(
             'base_url': 'http://127.0.0.1:4097',
             'host': '127.0.0.1',
             'port': 4097,
-            'version': '1.18.13',
-            'pinned_version': '1.18.13',
+            'version': '1.18.18',
+            'pinned_version': '1.18.18',
             'pid': 12345,
             'workspace': '/tmp/opencode-workspace',
         }
@@ -414,7 +414,7 @@ def test_health_endpoint_reports_availability(
             payload = response.json()
             assert payload['available'] is True
             assert payload['port'] == 4097
-            assert payload['version'] == '1.18.13'
+            assert payload['version'] == '1.18.18'
             assert response.headers.get('cache-control') == 'no-store'
 
     asyncio.run(Run())

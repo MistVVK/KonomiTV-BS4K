@@ -534,7 +534,7 @@ RUN ln -s /opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp /usr/local/bin/code
     test "${codex_acp_version}" = '@agentclientprotocol/codex-acp 1.1.7' && \
     test "${codex_cli_version}" = 'codex-cli 0.145.0' && \
     test "${grok_version_line}" = 'grok 0.2.112 (9bbd559437)' && \
-    test "${opencode_version}" = '1.18.13' && \
+    test "${opencode_version}" = '1.18.18' && \
     test "$(stat -c '%U:%G:%a' /usr/local/libexec/konomitv-bs4k-acp-sandbox)" = 'root:root:755' && \
     test "$(stat -c '%a' /usr/local/bin/opencode)" = '755' && \
     test -s /usr/local/share/licenses/opencode/LICENSE && \
@@ -776,8 +776,8 @@ RUN . /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
     grep -F '### @xai-official/grok 0.2.112' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '### @xai-official/grok-linux-x64 0.2.112' /code/THIRD_PARTY_LICENSES.md && \
     grep -F '## OpenCode Runtime Dependencies' /code/THIRD_PARTY_LICENSES.md && \
-    grep -F '### opencode-ai 1.18.13' /code/THIRD_PARTY_LICENSES.md && \
-    grep -F '### opencode-linux-x64 1.18.13' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### opencode-ai 1.18.18' /code/THIRD_PARTY_LICENSES.md && \
+    grep -F '### opencode-linux-x64 1.18.18' /code/THIRD_PARTY_LICENSES.md && \
     # ライセンス文書が実際のビルドプロファイルと食い違っていないか、4 パターンで検査する。
     # 警告見出しは free 以外で必須、Intel Full Feature と AMD proprietary の記述は各フラグと一致させる。
     if [ "${NONFREE_PROFILE}" = 'free' ]; then \

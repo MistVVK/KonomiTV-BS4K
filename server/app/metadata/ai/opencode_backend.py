@@ -1329,7 +1329,7 @@ class OpenCodeBackend:
             # 最終 JSON ターンが通信失敗しても、完了済み検索ターンの利用量は精算する。
             usage = search_usage
             # POST /message の応答は最終メッセージのみで web ツール part が欠落する。
-            # OpenCode 1.18.13 は json_schema format を持つメッセージを session 履歴へ追加した後、
+            # OpenCode 1.18.18 は json_schema format を持つメッセージを session 履歴へ追加した後、
             # GET /session/{id}/message の自分自身のレスポンス検証に失敗して HTTP 400 を返す。
             # そのため、format を使う最終 JSON ターンより前に検索履歴を取得して evidence を確定する。
             # 検索ターン内の失敗→再試行成功も全メッセージを合算して first-match の誤判定を防ぐ。

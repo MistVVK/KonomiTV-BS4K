@@ -131,7 +131,7 @@ OPENCODE_HEALTH_RETRY_ATTEMPTS = 30
 OPENCODE_HEALTH_RETRY_INTERVAL_SEC = 0.2
 OPENCODE_HEALTH_TIMEOUT_SEC = 2.0
 ## 固定 version（Dockerfile / package.json と一致させる）
-OPENCODE_PINNED_VERSION = '1.18.13'
+OPENCODE_PINNED_VERSION = '1.18.18'
 ## 生成 agent / EpisodeLookup agent 名（opencode.json と一致）
 OPENCODE_AGENT_GENERATE = 'recorded-series-generate'
 OPENCODE_AGENT_EPISODE = 'recorded-series-episode'
