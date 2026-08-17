@@ -57,6 +57,9 @@ from app.utils.KonomiTVBS4KMMTTLV import (
     KonomiTVBS4KTLVSyncError,
     KonomiTVBS4KTLVSynchronizer,
 )
+from app.utils.KonomiTVBS4KTLVRainFallbackMonitor import (
+    KonomiTVBS4KTLVRainFallbackMonitor,
+)
 from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
 from app.utils.KonomiTVBS4KTLVStreamPump import KonomiTVBS4KTLVStreamPump
 
@@ -205,6 +208,80 @@ class LiveEncodingTask:
             is_oneseg is False and
             is_mmt_tlv is False
         )
+
+
+    def updateRainFallbackBroadcastingState(self, broadcasting: bool | None) -> bool:
+        """
+        安定確認済みの送出状態を公開し、必要なら映像階層の計画再起動を要求する。
+
+        Args:
+            broadcasting (bool | None): 降雨対応Videoの送出状態。監視不能・判定中ならNone。
+
+        Returns:
+            bool: 映像階層を切り替えるRestart状態へ遷移した場合はTrue。
+        """
+
+        self.live_stream.is_rain_fallback_broadcasting = broadcasting
+        should_use_rain_fallback = (
+            self.live_stream.encoding_options.use_rain_fallback is True and
+            QUALITY[self.live_stream.quality].height <= 1080 and
+            broadcasting is True
+        )
+        if (
+            broadcasting is None or
+            self.live_stream.is_rain_fallback is None or
+            should_use_rain_fallback == self.live_stream.is_rain_fallback
+        ):
+            return False
+
+        detail = (
+            '降雨対応放送が開始されたため、低階層映像へ切り替えています…'
+            if should_use_rain_fallback is True
+            else '降雨対応放送が終了したため、主階層映像へ戻しています…'
+        )
+        if self.live_stream.setStatus('Restart', detail) is False:
+            return False
+        logging.info(
+            f'{self.live_stream.log_prefix} Switching video layer after rain fallback state changed. '
+            f'(Rain fallback: {broadcasting})'
+        )
+        return True
+
+
+    async def scheduleRestart(self) -> bool:
+        """
+        cleanup完了後に次世代LiveEncodingTaskを登録し、未起動ならRestart状態を解除する。
+
+        Args:
+            なし。
+
+        Returns:
+            bool: 次世代Taskを起動・登録できた場合はTrue。
+        """
+
+        successor_started = False
+        try:
+            await asyncio.sleep(0.1)
+            # 待機中に外部からOfflineへ変更された場合は、停止要求を優先して後継を起動しない。
+            if self.live_stream.getStatus().status != 'Restart':
+                return False
+            successor_task = asyncio.create_task(self.run())
+            try:
+                # 最新世代をLiveStreamへ登録し、チャンネル切替・停止時のcancel対象から外さない。
+                self.live_stream.replaceLiveEncodingTask(successor_task)
+            except BaseException:
+                # 登録できなかったTaskを独立して走らせず、finallyでRestart待ちも解除する。
+                successor_task.cancel()
+                raise
+            successor_started = True
+            return True
+        finally:
+            # sleep中のcancelやTask登録失敗で後継が存在しない場合は、Restart待ちを必ず解除する。
+            if successor_started is False and self.live_stream.getStatus().status == 'Restart':
+                self.live_stream.setStatus(
+                    'Offline',
+                    'エンコードタスクの再起動が中断されました。(E-17)',
+                )
 
 
     def GetRequestedVideoCodec(self) -> KonomiTVBS4KVideoCodec:
@@ -1244,6 +1321,7 @@ class LiveEncodingTask:
         aiohttp.ClientSession,
         aiohttp.ClientResponse,
         KonomiTVBS4KTLVStreamPump,
+        KonomiTVBS4KTLVRainFallbackMonitor | None,
         int,
         int | None,
     ] | None:
@@ -1261,25 +1339,35 @@ class LiveEncodingTask:
             program_present (Program | None): 現在の番組情報 (停波判定に使用)。
 
         Returns:
-            tuple[aiohttp.ClientSession, aiohttp.ClientResponse, KonomiTVBS4KTLVStreamPump, int, int | None] | None:
-                (session, response, 入力 pump, 主 context_id, 降雨対応 context_id)。
+            tuple[aiohttp.ClientSession, aiohttp.ClientResponse, KonomiTVBS4KTLVStreamPump,
+                KonomiTVBS4KTLVRainFallbackMonitor | None, int, int | None] | None:
+                (session, response, 入力 pump, 降雨対応monitor, 主 context_id, 選択する降雨対応 context_id)。
                 接続に失敗した場合は None (Offline 遷移と disconnectAll はこの中で済ませる)。
         """
 
         session: aiohttp.ClientSession | None = None
         response: aiohttp.ClientResponse | None = None
         stream_pump: KonomiTVBS4KTLVStreamPump | None = None
+        rain_fallback_monitor: KonomiTVBS4KTLVRainFallbackMonitor | None = None
 
         async def closeConnection() -> None:
             """接続済みの pump / session / response を閉じる。未接続なら何もしない。"""
             if stream_pump is not None:
                 stream_pump.cancel()
+            if rain_fallback_monitor is not None:
+                rain_fallback_monitor.cancel()
             if response is not None and response.closed is False:
                 response.close()
-            if session is not None and session.closed is False:
-                await session.close()
-            if stream_pump is not None:
-                await stream_pump.wait()
+            try:
+                if session is not None and session.closed is False:
+                    await session.close()
+            finally:
+                try:
+                    if stream_pump is not None:
+                        await stream_pump.wait()
+                finally:
+                    if rain_fallback_monitor is not None:
+                        await rain_fallback_monitor.wait()
 
         try:
             # チューナーを確保できるまで待機する
@@ -1347,7 +1435,7 @@ class LiveEncodingTask:
                 QUALITY[self.live_stream.quality].height <= 1080 and
                 rain_service_id is not None
             )
-            main_context_id, rain_context_id, head_buffer = await KonomiTVBS4KTLVServiceResolver.resolve(
+            resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
                 response.content.iter_chunked(64 * 1024),
                 channel.service_id,
                 rain_service_id,
@@ -1355,7 +1443,7 @@ class LiveEncodingTask:
                 log_prefix = self.live_stream.log_prefix,
             )
 
-            if main_context_id is None:
+            if resolution.main_context_id is None:
                 # 主 SID の context_id が解決できない場合は、先着順に依存する 0:v:0 へ黙って落とさず失敗させる。
                 # 0:v:0 は降雨時に低階層映像を掴み得るため、本機能が直したい不具合そのもの。
                 logging.warning(
@@ -1367,33 +1455,58 @@ class LiveEncodingTask:
                 self.live_stream.setStatus('Offline', 'TLV 入力から主サービスの情報を解決できませんでした。設定を確認してください。(E-19T)')
                 return None
 
+            # 自動利用の可否とは独立して対象SIDの送出状態を継続監視する。
+            # 起動時Resolverで確定済みの状態は引き継ぎ、同じ先頭バッファを再解析して後続MPTへ連続させる。
+            if rain_service_id is not None:
+                rain_fallback_monitor = KonomiTVBS4KTLVRainFallbackMonitor(
+                    channel.service_id,
+                    rain_service_id,
+                    self.live_stream.log_prefix,
+                    resolution.is_rain_fallback_broadcasting,
+                )
+                rain_fallback_monitor.start()
+
             # Resolver が止まった直後から HTTP 応答を読み続け、FFmpeg 起動中の Mirakurun 側滞留を防ぐ。
             # 以後 response.content を直接読むのはこの pump だけに限定する。
             stream_pump = KonomiTVBS4KTLVStreamPump(
                 response.content,
-                head_buffer,
+                resolution.head_buffer,
                 self.live_stream.log_prefix,
+                rain_fallback_monitor,
             )
             stream_pump.start()
 
-            # 降雨対応放送を映像に使うかどうかを起動時に確定し、状態更新と同時にプレイヤーへ通知する。
-            # FFmpeg の -map はプロセス起動後に変更できないため、送出状態が途中で変わっても再起動までは再選択しない。
-            self.live_stream.is_rain_fallback = rain_context_id is not None
+            # 自動利用の実効条件を満たし、完全MPTにVideoがある場合だけ低階層を選択する。
+            # FFmpegの-mapは固定なので、以後の状態変化はControllerが計画再起動して反映する。
+            selected_rain_context_id = (
+                resolution.rain_context_id
+                if need_rain_fallback is True and resolution.is_rain_fallback_broadcasting is True
+                else None
+            )
+            self.live_stream.is_rain_fallback = selected_rain_context_id is not None
+            self.live_stream.is_rain_fallback_broadcasting = resolution.is_rain_fallback_broadcasting
             self.live_stream.setStatus(
                 'Standby',
                 (
                     '降雨対応放送を使用してエンコードを開始しています…'
-                    if rain_context_id is not None
+                    if selected_rain_context_id is not None
                     else 'エンコードを開始しています…'
                 ),
             )
-            if rain_context_id is not None:
+            if selected_rain_context_id is not None:
                 logging.info(
                     f'{self.live_stream.log_prefix} Rain fallback broadcast detected. '
                     f'(SID: {rain_service_id})'
                 )
 
-            return (session, response, stream_pump, main_context_id, rain_context_id)
+            return (
+                session,
+                response,
+                stream_pump,
+                rain_fallback_monitor,
+                resolution.main_context_id,
+                selected_rain_context_id,
+            )
 
         except asyncio.CancelledError:
             # 選局キャンセル: 接続だけ閉じて再送出する (状態遷移は LiveStream.connect 側に任せる)。
@@ -1481,8 +1594,9 @@ class LiveEncodingTask:
 
         CONFIG = Config()
 
-        # 降雨対応放送の利用状態を毎回初期化する。再起動で前回の値が残らないようにする。
-        self.live_stream.is_rain_fallback = False
+        # 現世代のmapと継続監視が確定するまで、前世代の降雨対応放送状態を表示しない。
+        self.live_stream.is_rain_fallback = None
+        self.live_stream.is_rain_fallback_broadcasting = None
 
         # まだ Standby になっていなければ、ステータスを Standby に設定
         # 基本はエンコードタスクの呼び出し元である self.live_stream.connect() の方で Standby に設定されるが、再起動の場合はそこを経由しないため必要
@@ -1554,8 +1668,9 @@ class LiveEncodingTask:
         ## Mirakurun の aiohttp セッションとレスポンス (EDCB バックエンド利用時は常に None)
         response: aiohttp.ClientResponse | None = None
         session: aiohttp.ClientSession | None = None
-        ## TLV のプローブ後から HTTP 入力を読み続ける pump と、解決済みの context_id
+        ## TLV のプローブ後から HTTP 入力を読み続けるpump、降雨対応monitor、解決済みのcontext_id
         tlv_stream_pump: KonomiTVBS4KTLVStreamPump | None = None
+        tlv_rain_fallback_monitor: KonomiTVBS4KTLVRainFallbackMonitor | None = None
         tlv_main_context_id: int | None = None
         tlv_rain_context_id: int | None = None
 
@@ -1730,7 +1845,14 @@ class LiveEncodingTask:
             if tlv_stream_result is None:
                 # 接続失敗。Offline 遷移と disconnectAll は connectTLVStreamAndProbe 内で済んでいる。
                 return
-            session, response, tlv_stream_pump, tlv_main_context_id, tlv_rain_context_id = tlv_stream_result
+            (
+                session,
+                response,
+                tlv_stream_pump,
+                tlv_rain_fallback_monitor,
+                tlv_main_context_id,
+                tlv_rain_context_id,
+            ) = tlv_stream_result
 
         try:
             # ***** エンコーダープロセスの作成と実行 *****
@@ -1873,6 +1995,8 @@ class LiveEncodingTask:
             killed = self.KillSubprocesses(('tsreadex', tsreadex), ('encoder', encoder), ('bridge', bridge))
             if tlv_stream_pump is not None:
                 tlv_stream_pump.cancel()
+            if tlv_rain_fallback_monitor is not None:
+                tlv_rain_fallback_monitor.cancel()
             # 終了待機の停滞で解放処理がスキップされないよう、wait へ入る前に残っているパイプをすべて閉じる
             ## 子プロセスへ引き渡されてクローズ済みのパイプは None になっている
             for pipe in (tsreadex_read_pipe, bridge_read_pipe, bridge_write_pipe):
@@ -1894,8 +2018,12 @@ class LiveEncodingTask:
             self.live_stream.setStatus('Offline', 'ライブストリームの処理中に予期しないエラーが発生しました。(E-18)')
             # pump の待機中に再キャンセルされても、kill 済みプロセスの終了待機を必ず行う。
             try:
-                if tlv_stream_pump is not None:
-                    await tlv_stream_pump.wait()
+                try:
+                    if tlv_stream_pump is not None:
+                        await tlv_stream_pump.wait()
+                finally:
+                    if tlv_rain_fallback_monitor is not None:
+                        await tlv_rain_fallback_monitor.wait()
             finally:
                 await self.WaitSubprocesses(killed)
             raise
@@ -1933,6 +2061,8 @@ class LiveEncodingTask:
         ## finally で主要資源の解放後に Offline 遷移と EDCB チューナー解放を行うためのフラグ
         ## (CancelledError によるチャンネル切り替えでは handoff との競合を避けるためこれらを行わない)
         unexpected_error = False
+        # 降雨対応放送の送出開始・終了による計画再起動は障害retryへ数えず、FFmpeg解析条件も変えない。
+        is_planned_rain_fallback_restart = False
 
         # チューナー起動フェーズから Controller 実行までを CancelledError から保護する
         # チャンネル切り替え時に LiveStream.connect() からこのタスクがキャンセルされると、チューナー起動フェーズで
@@ -2472,12 +2602,20 @@ class LiveEncodingTask:
 
                 # 1つ上のスコープ (Enclosing Scope) の変数を書き替えるために必要
                 # ref: https://excel-ubara.com/python/python014.html#sec04
-                nonlocal lines, program_present
+                nonlocal lines, program_present, is_planned_rain_fallback_restart
 
                 while True:
 
                     # ライブストリームのステータスを取得
                     live_stream_status = self.live_stream.getStatus()
+
+                    # 継続監視の安定確認済み状態をSSEへ公開し、自動利用の希望階層と現在のmapが異なれば
+                    # 正常系の計画再起動で切り替える。Unknownでは古い状態を推測せず、再起動しない。
+                    if tlv_rain_fallback_monitor is not None:
+                        broadcasting = tlv_rain_fallback_monitor.is_rain_fallback_broadcasting
+                        if self.updateRainFallbackBroadcastingState(broadcasting) is True:
+                            is_planned_rain_fallback_restart = True
+                            break
 
                     # 現在放送中の番組が終了した際に program_present に保存している現在の番組情報を新しいものに更新する
                     # TODO: 番組情報のない時間帯から番組情報のある時間帯に移行する場合の処理が考慮されていない
@@ -2689,6 +2827,8 @@ class LiveEncodingTask:
             ## レスポンス close・クライアント切断・アーカイバー破棄は確実に完了している
             if tlv_stream_pump is not None:
                 tlv_stream_pump.cancel()
+            if tlv_rain_fallback_monitor is not None:
+                tlv_rain_fallback_monitor.cancel()
             if response is not None and response.closed is False:
                 response.close()
             self.live_stream.disconnectAll()
@@ -2723,8 +2863,12 @@ class LiveEncodingTask:
                 finally:
                     # pump の待機や tuner.close() の失敗・再キャンセルでも、kill 済みプロセスの終了待機へ必ず到達する
                     try:
-                        if tlv_stream_pump is not None:
-                            await tlv_stream_pump.wait()
+                        try:
+                            if tlv_stream_pump is not None:
+                                await tlv_stream_pump.wait()
+                        finally:
+                            if tlv_rain_fallback_monitor is not None:
+                                await tlv_rain_fallback_monitor.wait()
                     finally:
                         await self.WaitSubprocesses(killed)
 
@@ -2737,11 +2881,11 @@ class LiveEncodingTask:
             if LIVE_STREAM_BACKEND == 'EDCB' and self.live_stream.tuner is not None:
                 self.live_stream.tuner.unlock(self.live_stream.live_stream_id)
 
-            # 再起動回数が最大再起動回数に達していなければ、再起動する
-            if self._retry_count < self.MAX_RETRY_COUNT:
-                self._retry_count += 1  # カウントを増やす
-                await asyncio.sleep(0.1)  # 少し待つ
-                background_tasks.add(asyncio.create_task(self.run()))  # 新しいタスクを立ち上げる
+            # 計画的な映像階層切替は障害retryを消費せず、それ以外だけ既存の上限で制限する。
+            if is_planned_rain_fallback_restart is True or self._retry_count < self.MAX_RETRY_COUNT:
+                if is_planned_rain_fallback_restart is False:
+                    self._retry_count += 1  # 障害による再起動だけカウントを増やす
+                await self.scheduleRestart()
 
             # 最大再起動回数を使い果たしたので、Offline にする
             else:

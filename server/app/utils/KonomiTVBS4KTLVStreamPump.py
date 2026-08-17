@@ -7,6 +7,9 @@ from typing import ClassVar
 import aiohttp
 
 from app import logging
+from app.utils.KonomiTVBS4KTLVRainFallbackMonitor import (
+    KonomiTVBS4KTLVRainFallbackMonitor,
+)
 
 
 class KonomiTVBS4KTLVStreamPump:
@@ -18,7 +21,13 @@ class KonomiTVBS4KTLVStreamPump:
     # FFmpeg サブプロセスの生成中も Mirakurun から読み続けるための最新 16MiB の窓になる。
     MAX_BUFFERED_CHUNKS: ClassVar[int] = 256
 
-    def __init__(self, stream_reader: aiohttp.StreamReader, initial_data: bytes, log_prefix: str) -> None:
+    def __init__(
+        self,
+        stream_reader: aiohttp.StreamReader,
+        initial_data: bytes,
+        log_prefix: str,
+        rain_fallback_monitor: KonomiTVBS4KTLVRainFallbackMonitor | None = None,
+    ) -> None:
         """
         TLV stream pump を初期化する。
 
@@ -26,6 +35,7 @@ class KonomiTVBS4KTLVStreamPump:
             stream_reader (aiohttp.StreamReader): Channel Stream API の HTTP 応答本文。
             initial_data (bytes): context_id のプローブ中に読み取った生 TLV データ。
             log_prefix (str): ログへ付与するプレフィックス。
+            rain_fallback_monitor (KonomiTVBS4KTLVRainFallbackMonitor | None): 生TLVを複製する継続監視。
 
         Returns:
             None
@@ -43,10 +53,15 @@ class KonomiTVBS4KTLVStreamPump:
         self._error: BaseException | None = None
         # 入力終了の debug ログに利用するストリーム固有プレフィックス。
         self._log_prefix = log_prefix
+        # 監視遅延をprimary Queueへ波及させず、生TLVを複製する降雨対応放送monitor。
+        self._rain_fallback_monitor = rain_fallback_monitor
 
         # Resolver が読み取ったデータも64KiB以下へ分割し、後続データと同じ上限・順序で管理する。
+        # monitor は Resolver の確定値を初期状態として引き継ぐため、最大32MiBの先頭バッファを
+        # 8MiBの監視Queueへ再投入しない。再投入すると選局のたびにoverflowして確定値を失う。
         for offset in range(0, len(initial_data), self.CHUNK_SIZE):
-            self._putStartupChunk(initial_data[offset:offset + self.CHUNK_SIZE])
+            chunk = initial_data[offset:offset + self.CHUNK_SIZE]
+            self._putStartupChunk(chunk)
 
     @property
     def error(self) -> BaseException | None:
@@ -173,6 +188,9 @@ class KonomiTVBS4KTLVStreamPump:
         was_cancelled = False
         try:
             async for chunk in self._stream_reader.iter_chunked(self.CHUNK_SIZE):
+                # metadata監視は有限Queueへ非blockingで複製し、遅延・再同期をエンコーダー入力から分離する。
+                if self._rain_fallback_monitor is not None:
+                    self._rain_fallback_monitor.offerChunk(chunk)
                 # startup mode の Queue 操作間には await がないため、lossless 切替との順序が曖昧にならない。
                 if self._lossless_mode.is_set() is False:
                     self._putStartupChunk(chunk)
@@ -186,6 +204,8 @@ class KonomiTVBS4KTLVStreamPump:
             self._error = ex
             logging.debug(f'{self._log_prefix} MMT/TLV input pump stopped:', exc_info=ex)
         finally:
+            if self._rain_fallback_monitor is not None:
+                self._rain_fallback_monitor.finish()
             # startup 中またはキャンセル時は consumer がいない可能性があるため、終了通知でブロックしない。
             if self._lossless_mode.is_set() is False or was_cancelled is True:
                 if self._queue.full() is True:

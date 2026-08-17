@@ -893,7 +893,9 @@ class LiveStreamStatus(BaseModel):
     anchor_generation_id: str | None = None
     anchor_sequence: int | None = None
     # 現在このストリームが降雨対応放送 (1080p 低階層) を映像に使っているかどうか
-    is_rain_fallback: bool = False
+    is_rain_fallback: bool | None = None
+    # 降雨対応サービスの完全MPTにVideoが存在するか。未判定・監視不能ならNone
+    is_rain_fallback_broadcasting: bool | None = None
 
 
 class LivePrepareLeaseRequest(BaseModel):

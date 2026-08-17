@@ -3,10 +3,31 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterable
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import Any, Literal, cast
 
 from app import logging
 from app.constants import LIBRARY_PATH
+
+
+@dataclass(frozen=True)
+class KonomiTVBS4KTLVMetadataSnapshot:
+    """TLV metadata helper が通知したサービス・映像トラックのスナップショット。"""
+
+    snapshot_type: Literal['MPT', 'MHSDT'] | None
+    snapshot_context_id: int | None
+    service_contexts: dict[int, int]
+    video_context_ids: set[int]
+
+
+@dataclass(frozen=True)
+class KonomiTVBS4KTLVServiceResolution:
+    """起動時プローブで解決したTLVサービス情報と先頭バッファ。"""
+
+    main_context_id: int | None
+    rain_context_id: int | None
+    is_rain_fallback_broadcasting: bool | None
+    head_buffer: bytes
 
 
 class KonomiTVBS4KTLVServiceResolver:
@@ -32,7 +53,7 @@ class KonomiTVBS4KTLVServiceResolver:
     RAIN_FALLBACK_WAIT_SECONDS: float = 2.0
 
     @staticmethod
-    def parseMetadataLine(line: str) -> tuple[dict[int, int], set[int]] | None:
+    def parseMetadataLine(line: str) -> KonomiTVBS4KTLVMetadataSnapshot | None:
         """
         メタデータツールが出力した 1 行からサービスと映像トラックの context_id を抽出する。
 
@@ -40,8 +61,8 @@ class KonomiTVBS4KTLVServiceResolver:
             line (str): ストリーミング出力された JSON 行。
 
         Returns:
-            tuple[dict[int, int], set[int]] | None:
-                service_id → context_id と、映像トラックを持つ context_id の集合。解析不能なら None。
+            KonomiTVBS4KTLVMetadataSnapshot | None:
+                サービス・映像トラックと完全 snapshot の識別情報。解析不能なら None。
         """
 
         try:
@@ -54,6 +75,19 @@ class KonomiTVBS4KTLVServiceResolver:
         tracks = payload.get('tracks')
         if not isinstance(services, list) or not isinstance(tracks, list):
             return None
+
+        snapshot_type_raw = payload.get('snapshot_type')
+        snapshot_type: Literal['MPT', 'MHSDT'] | None = None
+        if snapshot_type_raw == 'MPT' or snapshot_type_raw == 'MHSDT':
+            snapshot_type = snapshot_type_raw
+
+        snapshot_context_id_raw = payload.get('snapshot_context_id')
+        snapshot_context_id: int | None = None
+        if not isinstance(snapshot_context_id_raw, bool):
+            try:
+                snapshot_context_id = int(cast(Any, snapshot_context_id_raw))
+            except (TypeError, ValueError):
+                pass
 
         service_contexts: dict[int, int] = {}
         for item in services:
@@ -84,7 +118,12 @@ class KonomiTVBS4KTLVServiceResolver:
             except (TypeError, ValueError):
                 continue
 
-        return (service_contexts, video_context_ids)
+        return KonomiTVBS4KTLVMetadataSnapshot(
+            snapshot_type=snapshot_type,
+            snapshot_context_id=snapshot_context_id,
+            service_contexts=service_contexts,
+            video_context_ids=video_context_ids,
+        )
 
     @classmethod
     async def resolve(
@@ -95,7 +134,7 @@ class KonomiTVBS4KTLVServiceResolver:
         *,
         need_rain_fallback: bool,
         log_prefix: str,
-    ) -> tuple[int | None, int | None, bytes]:
+    ) -> KonomiTVBS4KTLVServiceResolution:
         """
         生 TLV ストリームの先頭を読み、主 SID / 降雨対応 SID の context_id を解決する。
 
@@ -107,9 +146,8 @@ class KonomiTVBS4KTLVServiceResolver:
             log_prefix (str): ログへ付与するプレフィックス。
 
         Returns:
-            tuple[int | None, int | None, bytes]:
-                (主 context_id, 降雨対応 context_id, 読み取った生バイト)。
-                context_id が未観測の場合は None、生バイトは先頭付加用の raw データ (同期前)。
+            KonomiTVBS4KTLVServiceResolution:
+                主・降雨対応 context、降雨対応 Video の送出状態、先頭付加用の raw データ。
         """
 
         process = await asyncio.subprocess.create_subprocess_exec(
@@ -124,17 +162,20 @@ class KonomiTVBS4KTLVServiceResolver:
         stdout = process.stdout
         if stdin is None or stdout is None:
             await cls.__terminate(process, log_prefix)
-            return (None, None, b'')
+            return KonomiTVBS4KTLVServiceResolution(None, None, None, b'')
 
         head_buffer = bytearray()
         observed_service_contexts: dict[int, int] = {}
+        observed_mpt_contexts: set[int] = set()
+        latest_video_context_ids: set[int] = set()
         main_context_id: int | None = None
         rain_context_id: int | None = None
+        is_rain_fallback_broadcasting: bool | None = None
 
         # stdout 読取は独立タスクにし、stdin 書込と並行させる。
         # 先に全バイトを書いてから読むと、子プロセスの stdout pipe が詰まってデッドロックする。
         async def readMetadata() -> None:
-            nonlocal main_context_id, rain_context_id
+            nonlocal main_context_id, rain_context_id, is_rain_fallback_broadcasting
             while True:
                 line = await stdout.readline()
                 if line == b'':
@@ -142,19 +183,22 @@ class KonomiTVBS4KTLVServiceResolver:
                 metadata = cls.parseMetadataLine(line.decode('utf-8', errors='replace'))
                 if metadata is None:
                     continue
-                service_contexts, video_context_ids = metadata
 
                 # 実入力では同じ context_id の SDT が SID ごとに順次通知されるため、各行だけを見ると
                 # 直前に解決した主 SID が消える。プローブ期間内に観測したサービス対応は SID ごとに蓄積する。
-                observed_service_contexts.update(service_contexts)
+                observed_service_contexts.update(metadata.service_contexts)
+                latest_video_context_ids.clear()
+                latest_video_context_ids.update(metadata.video_context_ids)
+                if metadata.snapshot_type == 'MPT' and metadata.snapshot_context_id is not None:
+                    observed_mpt_contexts.add(metadata.snapshot_context_id)
                 if main_context_id is None:
                     main_context_id = observed_service_contexts.get(main_service_id)
-                if need_rain_fallback is True and rain_service_id is not None and rain_context_id is None:
-                    candidate_context_id = observed_service_contexts.get(rain_service_id)
-                    # SDT に SID があるだけでは FFmpeg の必須 map を満たせない。
-                    # 現在の snapshot で同じ context に映像トラックが存在する場合だけ低階層を採用する。
-                    if candidate_context_id in video_context_ids:
-                        rain_context_id = candidate_context_id
+                if rain_service_id is not None:
+                    rain_context_id = observed_service_contexts.get(rain_service_id)
+                    # MPT は対象 context の完全なトラック一覧なので、観測済みなら Video の有無を確定できる。
+                    # SDT だけを見て低階層を採用すると FFmpeg の必須 map を満たせないため、未観測は None のままにする。
+                    if rain_context_id in observed_mpt_contexts:
+                        is_rain_fallback_broadcasting = rain_context_id in latest_video_context_ids
 
         reader_task = asyncio.create_task(readMetadata())
         loop = asyncio.get_running_loop()
@@ -166,7 +210,7 @@ class KonomiTVBS4KTLVServiceResolver:
             # 主 SID は必須。降雨対応 SID は need_rain_fallback のときだけ待つ。
             if main_context_id is None:
                 return False
-            return (need_rain_fallback is False) or (rain_context_id is not None)
+            return (need_rain_fallback is False) or (is_rain_fallback_broadcasting is not None)
 
         iterator = stream.__aiter__()
         try:
@@ -202,7 +246,12 @@ class KonomiTVBS4KTLVServiceResolver:
             # 早期終了・失敗・キャンセルのいずれでも metadata 子プロセスを必ず終了する。
             await cls.__terminate(process, log_prefix, stdin, reader_task)
 
-        return (main_context_id, rain_context_id, bytes(head_buffer))
+        return KonomiTVBS4KTLVServiceResolution(
+            main_context_id=main_context_id,
+            rain_context_id=rain_context_id,
+            is_rain_fallback_broadcasting=is_rain_fallback_broadcasting,
+            head_buffer=bytes(head_buffer),
+        )
 
     @staticmethod
     async def __terminate(

@@ -328,8 +328,13 @@ async def LiveStreamEventAPI(
                         'event': 'status_update',  # status_update イベントを設定
                         'data': status.model_dump_json(),
                     }
-                # 詳細が以前と異なる
-                elif previous_status.detail != status.detail:
+                # 詳細または降雨対応放送の状態が以前と異なる
+                # 各イベントは同じ完全snapshotを返すため、既存detail_updateへ集約してイベント種別を増やさない。
+                elif (
+                    previous_status.detail != status.detail or
+                    previous_status.is_rain_fallback != status.is_rain_fallback or
+                    previous_status.is_rain_fallback_broadcasting != status.is_rain_fallback_broadcasting
+                ):
                     yield {
                         'event': 'detail_update',  # detail_update イベントを設定
                         'data': status.model_dump_json(),

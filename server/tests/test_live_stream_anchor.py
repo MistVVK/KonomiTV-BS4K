@@ -7,6 +7,7 @@ from fastapi import Request
 from app.config import ServerSettings
 from app.constants import QUALITY
 from app.routers import LiveStreamsRouter
+from app.schemas import LiveStreamStatus
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     ResolveKonomiTVBS4KAdvancedLiveMuxrate,
 )
@@ -632,3 +633,61 @@ def test_live_routes_propagate_compatibility_anchor_flag(monkeypatch: pytest.Mon
     asyncio.run(RunRoutes())
 
     assert observed_flags == [False, False]
+
+
+def test_live_event_api_emits_detail_update_for_rain_fallback_state_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """降雨対応放送フィールドだけが変わった場合もSSEで消費せず通知する。"""
+
+    statuses = [
+        LiveStreamStatus(
+            status='ONAir',
+            detail='ライブストリームは ONAir です。',
+            started_at=1,
+            updated_at=1,
+            client_count=1,
+            is_rain_fallback=False,
+            is_rain_fallback_broadcasting=False,
+        ),
+        LiveStreamStatus(
+            status='ONAir',
+            detail='ライブストリームは ONAir です。',
+            started_at=1,
+            updated_at=1,
+            client_count=1,
+            is_rain_fallback=False,
+            is_rain_fallback_broadcasting=True,
+        ),
+    ]
+
+    class FakeLiveStream:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.index = 0
+
+        def getStatus(self) -> LiveStreamStatus:
+            status = statuses[min(self.index, len(statuses) - 1)].model_copy()
+            self.index += 1
+            return status
+
+        @classmethod
+        def getViewerCount(cls, _display_channel_id: str) -> int:
+            return 1
+
+    monkeypatch.setattr(LiveStreamsRouter, 'LiveStream', FakeLiveStream)
+    request = Request({'type': 'http'})
+    request.state.stream_anchor_enabled = True
+    stream_quality = StreamQualityWithOptions('240p', StreamEncodingOptions())
+
+    async def Run() -> None:
+        response = await LiveStreamsRouter.LiveStreamEventAPI(request, 'gr991', stream_quality)
+        iterator = response.body_iterator.__aiter__()
+        initial = await iterator.__anext__()
+        update = await iterator.__anext__()
+        await iterator.aclose()
+
+        assert initial['event'] == 'initial_update'
+        assert update['event'] == 'detail_update'
+        assert '"is_rain_fallback_broadcasting":true' in update['data']
+
+    asyncio.run(Run())

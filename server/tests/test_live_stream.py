@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from app.streams.LiveStream import LiveStream, LiveStreamClient
@@ -57,3 +59,64 @@ def test_write_stream_data_does_not_skip_clients_after_timeout(monkeypatch: pyte
     assert live_stream._clients == active_clients
     assert all(client._queue.empty() is True for client in timed_out_clients)
     assert [client._queue.get_nowait() for client in active_clients] == [b'chunk', b'chunk']
+
+
+def test_replace_live_encoding_task_keeps_new_generation_after_old_completion() -> None:
+    """旧世代のdone callbackが、登録済みの次世代Task参照を消さないことを検証する。"""
+
+    async def scenario() -> None:
+        live_stream = object.__new__(LiveStream)
+        live_stream._live_encoding_task_ref = None
+        live_stream._detached_live_encoding_task_refs = set()
+        first_release = asyncio.Event()
+        second_release = asyncio.Event()
+
+        first = asyncio.create_task(first_release.wait())
+        second = asyncio.create_task(second_release.wait())
+        live_stream.replaceLiveEncodingTask(first)
+        live_stream.replaceLiveEncodingTask(second)
+        first_release.set()
+        await first
+        await asyncio.sleep(0)
+
+        assert live_stream._live_encoding_task_ref is second
+        second_release.set()
+        await second
+
+    asyncio.run(scenario())
+
+
+def test_connect_waits_until_restart_generation_finishes() -> None:
+    """連続Restartでも新規clientを旧世代へ登録せず、最終的な次世代Standbyまで待機させる。"""
+
+    async def scenario() -> None:
+        live_stream = object.__new__(LiveStream)
+        live_stream.live_stream_id = 'bs4k101-1080p'
+        live_stream._status = 'Restart'
+        live_stream._clients = []
+        live_stream._tuner_lock = asyncio.Lock()
+        first_restart_finished_event = asyncio.Event()
+        live_stream._restart_finished_event = first_restart_finished_event
+
+        connect_task = asyncio.create_task(live_stream.connect('mpegts'))
+        await asyncio.sleep(0)
+        assert connect_task.done() is False
+        assert live_stream._clients == []
+
+        # 1世代目の待機解除直後に2世代目のRestartへ入っても、set済みの古いEventで空回りしない。
+        live_stream._status = 'Standby'
+        first_restart_finished_event.set()
+        live_stream._status = 'Restart'
+        second_restart_finished_event = asyncio.Event()
+        live_stream._restart_finished_event = second_restart_finished_event
+        await asyncio.sleep(0)
+        assert connect_task.done() is False
+        assert live_stream._clients == []
+
+        live_stream._status = 'Standby'
+        second_restart_finished_event.set()
+        client = await connect_task
+
+        assert live_stream._clients == [client]
+
+    asyncio.run(scenario())

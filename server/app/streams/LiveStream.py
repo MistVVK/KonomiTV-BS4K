@@ -213,6 +213,9 @@ class LiveStream:
             # 終了待機がタイムアウトした古い LiveEncodingTask のタスクへの参照
             # イベントループ上の Task は弱参照で管理されるため、自然終了するまでここで強参照を保持する
             instance._detached_live_encoding_task_refs = set()
+            # Restart 中の旧世代 cleanup が新規クライアントを切断しないよう、次世代開始を通知するEvent。
+            instance._restart_finished_event = asyncio.Event()
+            instance._restart_finished_event.set()
 
             # PSI/SI データアーカイバーのインスタンス
             ## LiveStreamsRouter からアクセスする必要があるためここに設置している
@@ -228,7 +231,10 @@ class LiveStream:
 
             # 現在このストリームが降雨対応放送 (1080p 低階層) を映像に使っているかどうか
             ## LiveEncodingTask が降雨対応放送の検出に成功した時だけ True になる
-            instance.is_rain_fallback = False
+            instance.is_rain_fallback = None
+
+            # 降雨対応SIDの完全MPTにVideoが現在存在するか。未監視・再同期中はNone。
+            instance.is_rain_fallback_broadcasting = None
 
             # 生成したインスタンスを登録する
             cls.__instances[instance_key] = instance
@@ -270,10 +276,12 @@ class LiveStream:
         self._stream_data_written_at: float
         self._live_encoding_task_ref: asyncio.Task[None] | None
         self._detached_live_encoding_task_refs: set[asyncio.Task[None]]
+        self._restart_finished_event: asyncio.Event
         self.psi_data_archiver: LivePSIDataArchiver | None
         self.tuner: EDCBTuner | None
         self._tuner_lock: asyncio.Lock
-        self.is_rain_fallback: bool
+        self.is_rain_fallback: bool | None
+        self.is_rain_fallback_broadcasting: bool | None
 
 
     @property
@@ -316,6 +324,23 @@ class LiveStream:
 
         # 終了待機を打ち切った LiveEncodingTask のタスクへの参照を保持する
         self._detached_live_encoding_task_refs.add(live_encoding_task_ref)
+
+
+    def replaceLiveEncodingTask(self, live_encoding_task_ref: asyncio.Task[None]) -> None:
+        """
+        現在実行中のLiveEncodingTask参照を次世代Taskへ置き換える。
+
+        Args:
+            live_encoding_task_ref (asyncio.Task[None]): 新しく起動したLiveEncodingTaskのTask。
+
+        Returns:
+            None
+        """
+
+        # done callbackは自分が現在参照されている場合だけNoneへ戻すため、旧世代の完了が
+        # ここで登録した次世代参照を消すことはない。
+        self._live_encoding_task_ref = live_encoding_task_ref
+        self.__registerLiveEncodingTaskRef(live_encoding_task_ref)
 
 
     @classmethod
@@ -403,6 +428,14 @@ class LiveStream:
         """
 
         # ***** ステータスの切り替え *****
+
+        # Restart 中は旧世代のfinallyがdisconnectAll()を実行するため、新しいクライアントをまだ登録しない。
+        # 次世代がStandby、または再起動断念でOfflineへ移行してから通常の接続処理へ進む。
+        while self._status == 'Restart':
+            # Restart世代ごとにEventを作り直すため、待機解除直後に次のRestartへ入った場合も
+            # 新しいEventを待ち直し、旧世代へクライアントを登録しない。
+            restart_finished_event = self._restart_finished_event
+            await restart_finished_event.wait()
 
         current_status = self._status
         should_start_task: bool = False
@@ -546,8 +579,7 @@ class LiveStream:
             # エンコードタスクを非同期で実行
             if should_start_task is True:
                 instance = LiveEncodingTask(self)
-                self._live_encoding_task_ref = asyncio.create_task(instance.run())
-                self.__registerLiveEncodingTaskRef(self._live_encoding_task_ref)
+                self.replaceLiveEncodingTask(asyncio.create_task(instance.run()))
 
         # ***** クライアントの登録 *****
 
@@ -621,6 +653,7 @@ class LiveStream:
             updated_at = self._updated_at,  # ライブストリームのステータスが最後に更新された時刻
             client_count = len(self._clients),  # ライブストリームに接続中のクライアント数
             is_rain_fallback = self.is_rain_fallback,  # 降雨対応放送 (1080p 低階層) を使っているかどうか
+            is_rain_fallback_broadcasting = self.is_rain_fallback_broadcasting,  # 降雨対応放送が送出中かどうか
         )
 
 
@@ -651,6 +684,18 @@ class LiveStream:
         # ステータスは Offline から Restart に移行してはならない
         if self._status == 'Offline' and status == 'Restart':
             return False
+
+        # Restart 中は新規MPEG-TSクライアントを旧世代へ登録させず、次世代の開始まで待たせる。
+        if status == 'Restart':
+            # set済みEventの再利用では連続Restart時にwait()が空回りし得るため、世代ごとに作り直す。
+            self._restart_finished_event = asyncio.Event()
+        elif self._status == 'Restart':
+            self._restart_finished_event.set()
+
+        # Offline には実際の出力も監視中の入力も存在しないため、前世代の状態を残さない。
+        if status == 'Offline':
+            self.is_rain_fallback = None
+            self.is_rain_fallback_broadcasting = None
 
         # ストリーム開始 (Offline or Restart → Standby) 時、started_at と stream_data_written_at を更新する
         # ここで更新しておかないと、いつまで経っても初期化時の古いタイムスタンプが使われてしまう

@@ -10,6 +10,7 @@ import aiohttp
 import pytest
 
 from app.streams.LiveEncodingTask import LiveEncodingTask
+from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolution
 
 
 class FakeProcess:
@@ -836,6 +837,7 @@ class TestTLVStreamProbeCleanup:
             return True
 
         live_stream.setStatus = SetStatus
+        live_stream.getStatus = lambda: status
         live_stream.disconnectAll = lambda: setattr(live_stream, 'disconnected', live_stream.disconnected + 1)
         task.live_stream = live_stream
 
@@ -844,6 +846,86 @@ class TestTLVStreamProbeCleanup:
 
         task.acquireMirakurunTuner = AcquireTuner  # type: ignore[method-assign]
         return task, live_stream
+
+    @pytest.mark.parametrize(
+        ('quality', 'automatic', 'active', 'broadcasting', 'expected_restart', 'expected_detail'),
+        [
+            ('1080p', True, False, True, True, '降雨対応放送が開始されたため、低階層映像へ切り替えています…'),
+            ('1080p', True, True, False, True, '降雨対応放送が終了したため、主階層映像へ戻しています…'),
+            ('1080p', False, False, True, False, ''),
+            ('1440p', True, False, True, False, ''),
+            ('1080p', True, False, None, False, ''),
+        ],
+    )
+    def test_rain_fallback_transition_only_restarts_when_effective_selection_changes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        quality: str,
+        automatic: bool,
+        active: bool,
+        broadcasting: bool | None,
+        expected_restart: bool,
+        expected_detail: str,
+    ) -> None:
+        """安定済み送出状態と実効自動利用条件から、必要な階層変更だけをRestartへ遷移させる。"""
+
+        task, live_stream = self._BuildTask(monkeypatch)
+        live_stream.quality = quality
+        live_stream.encoding_options.use_rain_fallback = automatic
+        live_stream.is_rain_fallback = active
+
+        restarted = task.updateRainFallbackBroadcastingState(broadcasting)
+
+        assert restarted is expected_restart
+        assert live_stream.is_rain_fallback_broadcasting is broadcasting
+        if expected_restart is True:
+            assert live_stream.current_status.status == 'Restart'
+            assert live_stream.current_status.detail == expected_detail
+        else:
+            assert live_stream.current_status.status == 'Standby'
+
+    def test_schedule_restart_cancellation_returns_stream_to_offline(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """後継起動前のsleep中にcancelされてもRestartを残さず、接続待ちを解除できる状態へ戻す。"""
+
+        async def scenario() -> None:
+            task, live_stream = self._BuildTask(monkeypatch)
+            live_stream.current_status.status = 'Restart'
+            schedule_task = asyncio.create_task(task.scheduleRestart())
+            await asyncio.sleep(0)
+            schedule_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await schedule_task
+            assert live_stream.current_status.status == 'Offline'
+            assert live_stream.current_status.detail == 'エンコードタスクの再起動が中断されました。(E-17)'
+
+        asyncio.run(scenario())
+
+    def test_schedule_restart_registers_successor_generation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """後継Taskを最新世代としてLiveStreamへ登録してから旧世代を終了する。"""
+
+        async def scenario() -> None:
+            task, live_stream = self._BuildTask(monkeypatch)
+            live_stream.current_status.status = 'Restart'
+            successors: list[asyncio.Task[None]] = []
+
+            async def NextRun() -> None:
+                return None
+
+            live_stream.replaceLiveEncodingTask = successors.append
+            task.run = NextRun  # type: ignore[method-assign]
+
+            assert await task.scheduleRestart() is True
+            assert len(successors) == 1
+            await successors[0]
+
+        asyncio.run(scenario())
 
     def _MockConnection(
         self,
@@ -1010,9 +1092,9 @@ class TestTLVStreamProbeCleanup:
         task, live_stream = self._BuildTask(monkeypatch)
         session, response = self._MockConnection(monkeypatch)
 
-        async def Resolve(*args: Any, **kwargs: Any) -> tuple[int | None, int | None, bytes]:
+        async def Resolve(*args: Any, **kwargs: Any) -> KonomiTVBS4KTLVServiceResolution:
             # 主 context_id が未解決 (SDT が読めないなど)。降雨対応も未観測。
-            return (None, None, b'')
+            return KonomiTVBS4KTLVServiceResolution(None, None, None, b'')
 
         monkeypatch.setattr(
             'app.streams.LiveEncodingTask.KonomiTVBS4KTLVServiceResolver',
@@ -1053,13 +1135,27 @@ class TestTLVStreamProbeCleanup:
         self._MockConnection(monkeypatch)
         resolve_call: dict[str, Any] = {}
 
-        async def Resolve(*args: Any, **kwargs: Any) -> tuple[int, int | None, bytes]:
+        async def Resolve(*args: Any, **kwargs: Any) -> KonomiTVBS4KTLVServiceResolution:
             resolve_call['rain_service_id'] = args[2]
             resolve_call['need_rain_fallback'] = kwargs['need_rain_fallback']
-            return (1, 2 if expected_rain_service_id is not None else None, b'probe')
+            return KonomiTVBS4KTLVServiceResolution(
+                1,
+                2 if expected_rain_service_id is not None else None,
+                True if expected_rain_service_id is not None else None,
+                b'probe',
+            )
 
         class FakePump:
             """HTTP 読み取りを開始せず、start 呼出回数だけを保持する fake pump。"""
+
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                self.start_count = 0
+
+            def start(self) -> None:
+                self.start_count += 1
+
+        class FakeMonitor:
+            """helperを起動せず、start呼出回数だけを保持するfake monitor。"""
 
             def __init__(self, *_args: Any, **_kwargs: Any) -> None:
                 self.start_count = 0
@@ -1072,6 +1168,7 @@ class TestTLVStreamProbeCleanup:
             SimpleNamespace(resolve=Resolve),
         )
         monkeypatch.setattr('app.streams.LiveEncodingTask.KonomiTVBS4KTLVStreamPump', FakePump)
+        monkeypatch.setattr('app.streams.LiveEncodingTask.KonomiTVBS4KTLVRainFallbackMonitor', FakeMonitor)
         channel = SimpleNamespace(type='BS4K', network_id=0x000B, service_id=service_id)
 
         result = asyncio.run(task.connectTLVStreamAndProbe(
@@ -1084,6 +1181,7 @@ class TestTLVStreamProbeCleanup:
             'need_rain_fallback': expected_rain_service_id is not None,
         }
         assert result[2].start_count == 1
+        assert (result[3] is not None) is (expected_rain_service_id is not None)
         assert live_stream.is_rain_fallback is (expected_rain_service_id is not None)
         assert live_stream.current_status.status == 'Standby'
         assert live_stream.current_status.detail == (
@@ -1091,3 +1189,47 @@ class TestTLVStreamProbeCleanup:
             if expected_rain_service_id is not None
             else 'エンコードを開始しています…'
         )
+
+    def test_probe_does_not_select_rain_context_when_video_is_not_broadcasting(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """降雨SIDを解決済みでも完全MPTにVideoがなければ主階層を選択する。"""
+
+        task, live_stream = self._BuildTask(monkeypatch)
+        self._MockConnection(monkeypatch)
+
+        async def Resolve(*_args: Any, **_kwargs: Any) -> KonomiTVBS4KTLVServiceResolution:
+            return KonomiTVBS4KTLVServiceResolution(1, 2, False, b'probe')
+
+        class FakePump:
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                pass
+
+            def start(self) -> None:
+                pass
+
+        class FakeMonitor:
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                pass
+
+            def start(self) -> None:
+                pass
+
+        monkeypatch.setattr(
+            'app.streams.LiveEncodingTask.KonomiTVBS4KTLVServiceResolver',
+            SimpleNamespace(resolve=Resolve),
+        )
+        monkeypatch.setattr('app.streams.LiveEncodingTask.KonomiTVBS4KTLVStreamPump', FakePump)
+        monkeypatch.setattr('app.streams.LiveEncodingTask.KonomiTVBS4KTLVRainFallbackMonitor', FakeMonitor)
+        channel = SimpleNamespace(type='BS4K', network_id=0x000B, service_id=101)
+
+        result = asyncio.run(task.connectTLVStreamAndProbe(
+            channel, 'http://tlv', '/api/channels/BS4K/x/stream?decode=0', None,
+        ))
+
+        assert result is not None
+        assert result[5] is None
+        assert live_stream.is_rain_fallback is False
+        assert live_stream.is_rain_fallback_broadcasting is False
+        assert live_stream.current_status.detail == 'エンコードを開始しています…'

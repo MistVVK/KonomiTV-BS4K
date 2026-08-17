@@ -13,6 +13,9 @@ from app.utils.KonomiTVBS4KMMTTLV import (
     KonomiTVBS4KTLVSyncError,
     KonomiTVBS4KTLVSynchronizer,
 )
+from app.utils.KonomiTVBS4KTLVRainFallbackMonitor import (
+    KonomiTVBS4KTLVRainFallbackMonitor,
+)
 from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
 from app.utils.KonomiTVBS4KTLVStreamPump import KonomiTVBS4KTLVStreamPump
 
@@ -144,14 +147,23 @@ def test_service_resolver_parses_metadata_line() -> None:
 
     parse = KonomiTVBS4KTLVServiceResolver.parseMetadataLine
 
-    assert parse(
-        '{"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+    metadata = parse(
+        '{"snapshot_type":"MPT","snapshot_context_id":2,'
+        '"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
         '"tracks":[{"context_id":1,"kind":"Audio"},{"context_id":2,"kind":"Video"}]}'
-    ) == ({101: 1, 103: 2}, {2})
+    )
+    assert metadata is not None
+    assert metadata.snapshot_type == 'MPT'
+    assert metadata.snapshot_context_id == 2
+    assert metadata.service_contexts == {101: 1, 103: 2}
+    assert metadata.video_context_ids == {2}
     # 主/降雨対応以外のサービスや追加フィールドは無視しない (service_id さえあれば拾う)。
-    assert parse(
+    metadata = parse(
         '{"services":[{"context_id":1,"service_id":101,"service_name":"NHK BS4K"}],"tracks":[]}'
-    ) == ({101: 1}, set())
+    )
+    assert metadata is not None
+    assert metadata.service_contexts == {101: 1}
+    assert metadata.video_context_ids == set()
 
 
 def test_service_resolver_ignores_malformed_metadata_line() -> None:
@@ -163,9 +175,15 @@ def test_service_resolver_ignores_malformed_metadata_line() -> None:
     assert parse('{"events":[]}') is None
     assert parse('{"services":"not-a-list","tracks":[]}') is None
     # bool は int のサブクラスなので、service_id/context_id の bool は数値として扱わない。
-    assert parse('{"services":[{"service_id":true,"context_id":1}],"tracks":[]}') == ({}, set())
-    assert parse('{"services":[{"service_id":101,"context_id":true}],"tracks":[]}') == ({}, set())
-    assert parse('{"services":[],"tracks":[{"context_id":true,"kind":"Video"}]}') == ({}, set())
+    for line in (
+        '{"services":[{"service_id":true,"context_id":1}],"tracks":[]}',
+        '{"services":[{"service_id":101,"context_id":true}],"tracks":[]}',
+        '{"services":[],"tracks":[{"context_id":true,"kind":"Video"}]}',
+    ):
+        metadata = parse(line)
+        assert metadata is not None
+        assert metadata.service_contexts == {}
+        assert metadata.video_context_ids == set()
 
 
 class _FakeTLVMetadataStreamWriter:
@@ -205,6 +223,28 @@ class _FakeTLVMetadataProcess:
         return self.returncode if self.returncode is not None else 0
 
 
+class _FakeFollowingTLVMetadataProcess:
+    """継続monitor用に、killされるまでstdoutを開いたままにするfake subprocess。"""
+
+    def __init__(self) -> None:
+        self.stdin = _FakeTLVMetadataStreamWriter()
+        self.stdout = asyncio.StreamReader()
+        self.returncode: int | None = None
+        self.killed = False
+        self.wait_count = 0
+        self._exited = asyncio.Event()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self._exited.set()
+
+    async def wait(self) -> int:
+        self.wait_count += 1
+        await self._exited.wait()
+        return self.returncode if self.returncode is not None else 0
+
+
 def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -213,7 +253,8 @@ def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
     async def scenario() -> None:
         stdout_reader = asyncio.StreamReader()
         stdout_reader.feed_data(
-            b'{"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
             b'"tracks":[{"context_id":1,"kind":"Video"},{"context_id":2,"kind":"Video"}]}\n'
         )
         stdout_reader.feed_eof()
@@ -231,7 +272,7 @@ def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
             yield b'head-chunk'
             yield b'tail-chunk'
 
-        main_ctx, rain_ctx, head_buffer = await KonomiTVBS4KTLVServiceResolver.resolve(
+        resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
             stream(),
             main_service_id=101,
             rain_service_id=103,
@@ -239,10 +280,11 @@ def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
             log_prefix='test',
         )
 
-        assert main_ctx == 1
-        assert rain_ctx == 2
+        assert resolution.main_context_id == 1
+        assert resolution.rain_context_id == 2
+        assert resolution.is_rain_fallback_broadcasting is True
         # 早期終了により 2 番目の chunk は読まれない。先頭バッファは 1 番目だけ。
-        assert head_buffer == b'head-chunk'
+        assert resolution.head_buffer == b'head-chunk'
         assert process.stdin.closed is True
         assert process.killed is True
         assert process.wait_count == 1
@@ -254,13 +296,17 @@ def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
     'metadata_lines',
     [
         [
-            b'{"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],"tracks":[]}\n',
-            b'{"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],"tracks":[]}\n',
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
             b'"tracks":[{"context_id":2,"kind":"Video"}]}\n',
         ],
         [
-            b'{"services":[],"tracks":[{"context_id":2,"kind":"Video"}]}\n',
-            b'{"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,'
+            b'"services":[],"tracks":[{"context_id":2,"kind":"Video"}]}\n',
+            b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
             b'"tracks":[{"context_id":2,"kind":"Video"}]}\n',
         ],
     ],
@@ -289,7 +335,7 @@ def test_service_resolver_accepts_service_and_track_in_either_order(
         async def stream():
             yield b'head-chunk'
 
-        main_ctx, rain_ctx, _ = await KonomiTVBS4KTLVServiceResolver.resolve(
+        resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
             stream(),
             main_service_id=101,
             rain_service_id=103,
@@ -297,8 +343,9 @@ def test_service_resolver_accepts_service_and_track_in_either_order(
             log_prefix='test',
         )
 
-        assert main_ctx == 1
-        assert rain_ctx == 2
+        assert resolution.main_context_id == 1
+        assert resolution.rain_context_id == 2
+        assert resolution.is_rain_fallback_broadcasting is True
 
     asyncio.run(scenario())
 
@@ -376,7 +423,7 @@ def test_service_resolver_without_rain_fallback_stops_at_main(
             yield b'head-chunk'
             yield b'should-not-be-read'
 
-        main_ctx, rain_ctx, head_buffer = await KonomiTVBS4KTLVServiceResolver.resolve(
+        resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
             stream(),
             main_service_id=101,
             rain_service_id=103,
@@ -384,10 +431,11 @@ def test_service_resolver_without_rain_fallback_stops_at_main(
             log_prefix='test',
         )
 
-        assert main_ctx == 1
-        assert rain_ctx is None
+        assert resolution.main_context_id == 1
+        assert resolution.rain_context_id == 2
+        assert resolution.is_rain_fallback_broadcasting is None
         # 主 SID 解決で早期終了するため、2 番目の chunk は読まれない。
-        assert head_buffer == b'head-chunk'
+        assert resolution.head_buffer == b'head-chunk'
 
     asyncio.run(scenario())
 
@@ -425,7 +473,7 @@ def test_service_resolver_rain_timeout_returns_main_only(
             # 以後は yield せずブロックし、降雨対応 SID の待機窓がタイムアウトする。
             await asyncio.Event().wait()
 
-        main_ctx, rain_ctx, head_buffer = await KonomiTVBS4KTLVServiceResolver.resolve(
+        resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
             stream(),
             main_service_id=101,
             rain_service_id=103,
@@ -433,9 +481,10 @@ def test_service_resolver_rain_timeout_returns_main_only(
             log_prefix='test',
         )
 
-        assert main_ctx == 1
-        assert rain_ctx is None
-        assert head_buffer == b'head-chunk'
+        assert resolution.main_context_id == 1
+        assert resolution.rain_context_id == 2
+        assert resolution.is_rain_fallback_broadcasting is None
+        assert resolution.head_buffer == b'head-chunk'
 
     asyncio.run(scenario())
 
@@ -469,7 +518,7 @@ def test_service_resolver_starts_probe_timeout_after_first_byte(
             await asyncio.sleep(0.03)
             yield b'head-chunk'
 
-        main_ctx, rain_ctx, head_buffer = await KonomiTVBS4KTLVServiceResolver.resolve(
+        resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
             stream(),
             main_service_id=101,
             rain_service_id=None,
@@ -477,9 +526,202 @@ def test_service_resolver_starts_probe_timeout_after_first_byte(
             log_prefix='test',
         )
 
-        assert main_ctx == 1
-        assert rain_ctx is None
-        assert head_buffer == b'head-chunk'
+        assert resolution.main_context_id == 1
+        assert resolution.rain_context_id is None
+        assert resolution.head_buffer == b'head-chunk'
+
+    asyncio.run(scenario())
+
+
+def test_rain_fallback_monitor_tracks_stable_mpt_start_and_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """完全MPTのVideo有無を開始・終了それぞれの安定待ち後に公開する。"""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'START_STABILITY_SECONDS', 0.01)
+        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'END_STABILITY_SECONDS', 0.02)
+        process = _FakeFollowingTLVMetadataProcess()
+        exec_args: tuple[object, ...] | None = None
+
+        async def fake_exec(*args: object, **_kwargs: object) -> _FakeFollowingTLVMetadataProcess:
+            nonlocal exec_args
+            exec_args = args
+            return process
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVRainFallbackMonitor.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+        monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test')
+        monitor.start()
+        await asyncio.sleep(0)
+
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'"tracks":[]}\n'
+        )
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":1,"services":[],'
+            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+        )
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
+            b'"tracks":[{"context_id":1,"kind":"Video"},{"context_id":2,"kind":"Video"}]}\n'
+        )
+        await asyncio.sleep(0.015)
+        assert monitor.is_rain_fallback_broadcasting is True
+
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
+            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+        )
+        await asyncio.sleep(0.01)
+        assert monitor.is_rain_fallback_broadcasting is True
+        await asyncio.sleep(0.015)
+        assert monitor.is_rain_fallback_broadcasting is False
+
+        monitor.cancel()
+        await monitor.wait()
+        assert exec_args is not None
+        assert exec_args[-2:] == ('-', '--follow')
+        assert process.killed is True
+        assert process.wait_count >= 1
+
+    asyncio.run(scenario())
+
+
+def test_rain_fallback_monitor_cancels_unstable_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """安定待ち中に状態が戻った場合は公開状態と映像階層を変更しない。"""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'START_STABILITY_SECONDS', 0.03)
+        process = _FakeFollowingTLVMetadataProcess()
+
+        async def fake_exec(*_args: object, **_kwargs: object) -> _FakeFollowingTLVMetadataProcess:
+            return process
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVRainFallbackMonitor.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+        monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test', False)
+        monitor.start()
+        await asyncio.sleep(0)
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'"tracks":[]}\n'
+        )
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":1,"services":[],'
+            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+        )
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
+            b'"tracks":[{"context_id":1,"kind":"Video"},{"context_id":2,"kind":"Video"}]}\n'
+        )
+        await asyncio.sleep(0.01)
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
+            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+        )
+        await asyncio.sleep(0.04)
+        assert monitor.is_rain_fallback_broadcasting is False
+
+        monitor.cancel()
+        await monitor.wait()
+
+    asyncio.run(scenario())
+
+
+def test_rain_fallback_monitor_treats_missing_rain_service_as_not_broadcasting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """主映像が正常で降雨SIDが現れなければ、終了側の安定待ち後に未実施と確定する。"""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'END_STABILITY_SECONDS', 0.01)
+        process = _FakeFollowingTLVMetadataProcess()
+
+        async def fake_exec(*_args: object, **_kwargs: object) -> _FakeFollowingTLVMetadataProcess:
+            return process
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVRainFallbackMonitor.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+        monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test')
+        monitor.start()
+        await asyncio.sleep(0)
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1}],"tracks":[]}\n'
+        )
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":1,"services":[],'
+            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+        )
+        await asyncio.sleep(0.015)
+
+        assert monitor.is_rain_fallback_broadcasting is False
+        monitor.cancel()
+        await monitor.wait()
+
+    asyncio.run(scenario())
+
+
+def test_rain_fallback_monitor_queue_overflow_invalidates_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """監視Queueあふれは再生をブロックせず、古い確定状態を判定中へ戻す。"""
+
+    monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'MAX_BUFFERED_CHUNKS', 2)
+    monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test', True)
+
+    monitor.offerChunk(b'one')
+    monitor.offerChunk(b'two')
+    monitor.offerChunk(b'three')
+
+    assert monitor.is_rain_fallback_broadcasting is None
+
+
+def test_rain_fallback_monitor_recovers_from_reader_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """stdout readerの想定外例外を再生側へ漏らさず、状態を無効化してhelperを再生成する。"""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'RESTART_DELAY_SECONDS', 0.001)
+        processes: list[_FakeFollowingTLVMetadataProcess] = []
+        restarted = asyncio.Event()
+
+        async def fake_exec(*_args: object, **_kwargs: object) -> _FakeFollowingTLVMetadataProcess:
+            process = _FakeFollowingTLVMetadataProcess()
+            processes.append(process)
+            if len(processes) >= 2:
+                restarted.set()
+            return process
+
+        async def fail_reader(_stdout: asyncio.StreamReader) -> None:
+            raise ValueError('line exceeds limit')
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVRainFallbackMonitor.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+        monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test', True)
+        monitor._readMetadata = fail_reader  # type: ignore[method-assign]
+        monitor.start()
+        await asyncio.wait_for(restarted.wait(), timeout=1)
+
+        assert monitor.is_rain_fallback_broadcasting is None
+        monitor.cancel()
+        await monitor.wait()
+        assert all(process.killed is True for process in processes)
 
     asyncio.run(scenario())
 
@@ -518,6 +760,42 @@ def test_tlv_stream_pump_keeps_probe_data_before_live_chunks() -> None:
 
         pump.cancel()
         await pump.wait()
+
+    asyncio.run(scenario())
+
+
+def test_tlv_stream_pump_fans_out_only_live_chunks_without_second_reader() -> None:
+    """Resolverの先頭バッファは再投入せず、後続TLVだけを同じHTTP readerからmonitorへ複製する。"""
+
+    class FakeMonitor:
+        def __init__(self) -> None:
+            self.chunks: list[bytes] = []
+            self.finish_count = 0
+
+        def offerChunk(self, chunk: bytes) -> None:
+            self.chunks.append(chunk)
+
+        def finish(self) -> None:
+            self.finish_count += 1
+
+    async def scenario() -> None:
+        monitor = FakeMonitor()
+        stream_reader = _BlockingTLVHTTPStreamReader([b'live'])
+        pump = KonomiTVBS4KTLVStreamPump(
+            stream_reader,  # type: ignore[arg-type]
+            b'probe',
+            'test',
+            monitor,  # type: ignore[arg-type]
+        )
+        pump.start()
+        await stream_reader.sent_all_chunks.wait()
+
+        assert monitor.chunks == [b'live']
+        assert stream_reader.iter_chunked_count == 1
+
+        pump.cancel()
+        await pump.wait()
+        assert monitor.finish_count == 1
 
     asyncio.run(scenario())
 
