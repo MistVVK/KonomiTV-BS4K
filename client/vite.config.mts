@@ -130,6 +130,8 @@ export default defineConfig({
             injectManifest: {
                 // キャッシュするファイルの最大サイズ
                 maximumFileSizeToCacheInBytes: 1024 * 1024 * 15,  // 15MB
+                // LibreSpeed Worker は独立差し替え可能な LGPL 配布物であり、速度測定はサーバー接続必須なので precache しない
+                globIgnores: ['**/vendor/librespeed/**'],
             }
         }),
     ],

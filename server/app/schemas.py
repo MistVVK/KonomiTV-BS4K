@@ -429,6 +429,33 @@ class KonomiTVBS4KOfflineJob(BaseModel):
     created_at: float
     updated_at: float
 
+
+class KonomiTVBS4KSpeedTestSession(BaseModel):
+    """測定枠の公開応答。session ID や JWT は含めない。"""
+
+    expires_in_seconds: Annotated[int, Field(gt=0)]
+    limits: KonomiTVBS4KSpeedTestLimits
+    quality_thresholds: list[KonomiTVBS4KSpeedTestQualityThreshold]
+
+
+class KonomiTVBS4KSpeedTestLimits(BaseModel):
+    """Worker へ渡す測定時間と同時 stream 数。"""
+
+    download_streams: Annotated[int, Field(gt=0)]
+    upload_streams: Annotated[int, Field(gt=0)]
+    download_seconds: Annotated[int, Field(gt=0)]
+    upload_seconds: Annotated[int, Field(gt=0)]
+
+
+class KonomiTVBS4KSpeedTestQualityThreshold(BaseModel):
+    """下り Mbps と比較する codec / 画質ごとの必要帯域。"""
+
+    broadcast_type: Literal['Terrestrial', 'BS4K']
+    codec: Literal['AVC', 'HEVC', 'VP9', 'AV1']
+    quality: str
+    required_mbps: Annotated[float, Field(gt=0)]
+    basis: Literal['VariableBitrate', 'FixedMuxrate']
+
 # ***** バックグラウンド解析履歴 *****
 
 class AnalysisTaskExecution(BaseModel):

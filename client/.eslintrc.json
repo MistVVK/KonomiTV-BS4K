@@ -19,7 +19,8 @@
     ],
     "ignorePatterns": [
         "dist/",
-        "node_modules/"
+        "node_modules/",
+        "public/vendor/librespeed/"
     ],
     "rules": {
         "@typescript-eslint/indent": ["error", 4, {"SwitchCase": 1}],

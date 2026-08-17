@@ -8,6 +8,14 @@ const defaultRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const licensePattern = /^(?:licen[cs]e|copying|notice)(?:[._-].*)?$/i;
 const readmePattern = /^readme(?:[._-].*)?$/i;
 const unsafeControlCharacters = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
+export const LIBRESPEED_VENDOR_RELATIVE_DIRECTORY = 'public/vendor/librespeed';
+export const LIBRESPEED_VENDOR_REQUIRED_FILES = Object.freeze({
+    'speedtest_worker.js': '3dc577e830a7255eacd9335865af9c4a77ca1d7c115e8bfc7e1717d2c4ed08d0',
+    'LICENSE-LGPL-3.0.txt': 'e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118',
+    'LICENSE-GPL-3.0.txt': '3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986',
+});
+export const LIBRESPEED_VENDOR_MANIFEST_NAME = 'MANIFEST.md';
+
 const bundledWebFontLicenseMaterials = [
     ['Kosugi', ['Kosugi-LICENSE.txt']],
     ['Kosugi Maru', ['KosugiMaru-LICENSE.txt']],
@@ -455,6 +463,53 @@ export async function CollectPackage(directory, rootDirectory, packages) {
     }
 }
 
+function HashFileBuffer(buffer) {
+    return createHash('sha256').update(buffer).digest('hex');
+}
+
+/**
+ * LibreSpeed 固定 vendor ディレクトリが MANIFEST と完全一致することを検証する。
+ * 欠落・改変・未知ファイルはすべて失敗にする。
+ */
+export async function VerifyLibreSpeedVendorDirectory(vendorDirectory) {
+    let entries;
+    try {
+        entries = await readdir(vendorDirectory, { withFileTypes: true });
+    } catch {
+        throw new Error(`LibreSpeed vendor directory is missing: ${vendorDirectory}`);
+    }
+
+    const fileNames = entries.filter((entry) => entry.isFile()).map((entry) => entry.name).sort();
+    const expectedNames = [...Object.keys(LIBRESPEED_VENDOR_REQUIRED_FILES), LIBRESPEED_VENDOR_MANIFEST_NAME].sort();
+    if (fileNames.join('\n') !== expectedNames.join('\n')) {
+        throw new Error(
+            `LibreSpeed vendor directory must contain exactly ${expectedNames.join(', ')}. found: ${fileNames.join(', ')}`,
+        );
+    }
+    if (entries.some((entry) => !entry.isFile())) {
+        throw new Error('LibreSpeed vendor directory must not contain subdirectories.');
+    }
+
+    const manifest = await readFile(join(vendorDirectory, LIBRESPEED_VENDOR_MANIFEST_NAME), 'utf8');
+    if (!manifest.includes('892674a084a3dd354d823545cd0191023325b89c')) {
+        throw new Error('LibreSpeed vendor manifest must record the pinned upstream commit.');
+    }
+    if (!manifest.includes('https://github.com/librespeed/speedtest')) {
+        throw new Error('LibreSpeed vendor manifest must record the upstream source URL.');
+    }
+
+    for (const [fileName, expectedSha256] of Object.entries(LIBRESPEED_VENDOR_REQUIRED_FILES)) {
+        const fileBuffer = await readFile(join(vendorDirectory, fileName));
+        const actualSha256 = HashFileBuffer(fileBuffer);
+        if (actualSha256 !== expectedSha256) {
+            throw new Error(`LibreSpeed vendor file hash mismatch: ${fileName}`);
+        }
+        if (!manifest.includes(expectedSha256)) {
+            throw new Error(`LibreSpeed vendor manifest must record the hash of ${fileName}.`);
+        }
+    }
+}
+
 export async function GenerateLicenseDocument(rootDirectory, outputPath) {
     const packages = new Map();
     const application = JSON.parse(await readFile(join(rootDirectory, 'package.json'), 'utf8'));
@@ -499,6 +554,30 @@ export async function GenerateLicenseDocument(rootDirectory, outputPath) {
                 '',
             );
         }
+    }
+
+    const libreSpeedVendorDirectory = join(rootDirectory, LIBRESPEED_VENDOR_RELATIVE_DIRECTORY);
+    await VerifyLibreSpeedVendorDirectory(libreSpeedVendorDirectory);
+    const libreSpeedManifest = await readFile(
+        join(libreSpeedVendorDirectory, LIBRESPEED_VENDOR_MANIFEST_NAME),
+        'utf8',
+    );
+    const libreSpeedManifestBody = libreSpeedManifest.replace(/^# Bundled LibreSpeed Worker manifest\r?\n+/, '');
+    if (libreSpeedManifestBody === libreSpeedManifest) {
+        throw new Error('LibreSpeed vendor manifest must start with the expected document title.');
+    }
+    lines.push('### Bundled LibreSpeed Worker', '');
+    lines.push(libreSpeedManifestBody.trim(), '');
+    lines.push('', '以下に固定配布する LibreSpeed Worker へ適用されるライセンス全文と帰属表示を掲載します。', '');
+    for (const fileName of ['LICENSE-LGPL-3.0.txt', 'LICENSE-GPL-3.0.txt']) {
+        lines.push(
+            `#### ${fileName}`,
+            '',
+            '````text',
+            (await readFile(join(libreSpeedVendorDirectory, fileName), 'utf8')).trim(),
+            '````',
+            '',
+        );
     }
 
     lines.push('### JavaScript Package Licenses', '');

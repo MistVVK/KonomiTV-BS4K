@@ -44,6 +44,7 @@ from app.routers import (
     ChannelsRouter,
     CMAnalysisRouter,
     DataBroadcastingRouter,
+    KonomiTVBS4KSpeedTestRouter,
     LiveStreamsRouter,
     MaintenanceRouter,
     NiconicoRouter,
@@ -130,6 +131,7 @@ app.include_router(UsersRouter.router)
 app.include_router(SettingsRouter.router)
 app.include_router(MaintenanceRouter.router)
 app.include_router(VersionRouter.router)
+app.include_router(KonomiTVBS4KSpeedTestRouter.router)
 
 # Capture upload は multipart 解析前に HTTP 本文サイズを制限する。
 # add_middleware は後から登録した方が外側になるため、先に BodyLimit を入れ、その後 CORS を被せる。

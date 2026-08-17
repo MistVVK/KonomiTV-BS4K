@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -8,7 +8,9 @@ import { fileURLToPath } from 'node:url';
 import {
     CollectPackage,
     GenerateLicenseDocument,
+    LIBRESPEED_VENDOR_RELATIVE_DIRECTORY,
     ResolveMissingLicenseMaterials,
+    VerifyLibreSpeedVendorDirectory,
 } from './generate-license-document.mjs';
 
 
@@ -54,10 +56,16 @@ test('generated document includes browser and service worker runtime packages', 
     assert.deepEqual(headings.filter(({ level }) => level <= 3), [
         { level: 2, title: 'Client Third-Party Software Licenses' },
         { level: 3, title: 'Bundled web fonts' },
+        { level: 3, title: 'Bundled LibreSpeed Worker' },
         { level: 3, title: 'JavaScript Package Licenses' },
     ]);
+    assert.match(document, /LibreSpeed/);
+    assert.match(document, /892674a084a3dd354d823545cd0191023325b89c/);
+    assert.match(document, /GNU LESSER GENERAL PUBLIC LICENSE/);
+    assert.match(document, /GNU GENERAL PUBLIC LICENSE/);
     const javaScriptHeadingIndex = headings.findIndex(({ title }) => title === 'JavaScript Package Licenses');
-    assert.deepEqual(headings.slice(2, javaScriptHeadingIndex), [
+    const libreSpeedHeadingIndex = headings.findIndex(({ title }) => title === 'Bundled LibreSpeed Worker');
+    assert.deepEqual(headings.slice(2, libreSpeedHeadingIndex), [
         { level: 4, title: 'Kosugi' },
         { level: 5, title: 'Kosugi-LICENSE.txt' },
         { level: 4, title: 'Kosugi Maru' },
@@ -75,6 +83,11 @@ test('generated document includes browser and service worker runtime packages', 
         { level: 4, title: 'Twemoji Mozilla' },
         { level: 5, title: 'Twemoji-LICENSE.md' },
         { level: 5, title: 'CC-BY-4.0.txt' },
+    ]);
+    assert.deepEqual(headings.slice(libreSpeedHeadingIndex, javaScriptHeadingIndex), [
+        { level: 3, title: 'Bundled LibreSpeed Worker' },
+        { level: 4, title: 'LICENSE-LGPL-3.0.txt' },
+        { level: 4, title: 'LICENSE-GPL-3.0.txt' },
     ]);
     const javaScriptHeadings = headings.slice(javaScriptHeadingIndex + 1);
     assert.ok(javaScriptHeadings.length > 0);
@@ -211,5 +224,38 @@ test('declared dependency resolution fails closed with package and dependency na
     await assert.rejects(
         () => CollectPackage(packageDirectory, rootDirectory, new Map()),
         /parent-package@1\.0\.0: unable to resolve declared dependency: missing-package/,
+    );
+});
+
+async function CopyLibreSpeedVendorFixture() {
+    const fixtureDirectory = await mkdtemp(join(tmpdir(), 'konomitv-bs4k-librespeed-vendor-'));
+    await cp(join(clientRoot, LIBRESPEED_VENDOR_RELATIVE_DIRECTORY), fixtureDirectory, { recursive: true });
+    return fixtureDirectory;
+}
+
+test('LibreSpeed vendor directory matches the pinned manifest and hashes', async () => {
+    await VerifyLibreSpeedVendorDirectory(join(clientRoot, LIBRESPEED_VENDOR_RELATIVE_DIRECTORY));
+});
+
+test('LibreSpeed vendor verification fails closed on missing, modified, or unknown files', async () => {
+    const missingDirectory = await CopyLibreSpeedVendorFixture();
+    await rm(join(missingDirectory, 'speedtest_worker.js'));
+    await assert.rejects(
+        () => VerifyLibreSpeedVendorDirectory(missingDirectory),
+        /must contain exactly/,
+    );
+
+    const modifiedDirectory = await CopyLibreSpeedVendorFixture();
+    await writeFile(join(modifiedDirectory, 'speedtest_worker.js'), 'modified worker', 'utf8');
+    await assert.rejects(
+        () => VerifyLibreSpeedVendorDirectory(modifiedDirectory),
+        /hash mismatch/,
+    );
+
+    const unknownDirectory = await CopyLibreSpeedVendorFixture();
+    await writeFile(join(unknownDirectory, 'extra.txt'), 'unexpected', 'utf8');
+    await assert.rejects(
+        () => VerifyLibreSpeedVendorDirectory(unknownDirectory),
+        /must contain exactly/,
     );
 });
