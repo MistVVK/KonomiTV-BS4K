@@ -73,6 +73,8 @@ export function BuildKonomiTVBS4KSpeedTestWorkerOptions(
     api_base_url: string = Utils.api_base_url,
 ): IKonomiTVBS4KSpeedTestWorkerOptions {
     // Desktop / Mobile で負荷条件を分けず、8K 視聴を同じ基準で測る。
+    // 下り 100MiB は高ビットレート映像の連続受信、上り 20MiB は約 6 秒の 4K 相当セグメント。
+    // 小さい blob だと Gbps 級で HTTP オーバーヘッドが支配し、実測が低すぎる。
     return {
         test_order: 'P_D_U',
         time_auto: true,
@@ -136,7 +138,7 @@ function ParseMetricString(value: unknown): number | null {
         return null;
     }
     const parsed = Number(value);
-    if (Number.isFinite(parsed) === false) {
+    if (Number.isFinite(parsed) === false || parsed <= 0) {
         return null;
     }
     return parsed;

@@ -100,6 +100,18 @@ describe('KonomiTVBS4KSpeedTestWorker', () => {
             pingProgress: 1,
         }));
         expect(nanStatus).toBeNull();
+        const zeroUpload = ParseKonomiTVBS4KSpeedTestWorkerStatus(JSON.stringify({
+            testState: 4,
+            dlStatus: '1.51',
+            ulStatus: '0.00',
+            pingStatus: '33.00',
+            jitterStatus: '4.04',
+            dlProgress: 1,
+            ulProgress: 1,
+            pingProgress: 1,
+        }));
+        expect(zeroUpload).not.toBeNull();
+        expect(ResolveKonomiTVBS4KSpeedTestResult(zeroUpload!)).toBeNull();
     });
 
     it('200ms で status を送り、再測定時は Worker を再生成する', () => {

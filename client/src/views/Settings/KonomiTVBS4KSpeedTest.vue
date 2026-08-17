@@ -10,6 +10,7 @@
         <div class="settings__description">
             この画面はインターネット速度ではなく、<strong>この端末からこの KonomiTV-BS4K サーバーまで</strong>の速度を測ります。<br>
             測定は視聴と同じ同一オリジン HTTPS 経路を使い、計測本体は下り最大約 10 秒・5 本、上り最大約 10 秒・3 本です。<br>
+            下りは約 100MiB、上りは約 20MiB の塊を使い、高ビットレート映像の連続受信と約 6 秒の 4K 相当セグメントに近づけています。<br>
             計測本体の前には、接続を安定させるため下り約 1.5 秒・上り約 3 秒の準備時間があります。<br>
             下り測定中はブラウザが最大約 500MiB を同時に保持することがあります。視聴中に測ると帯域が競合します。<br>
             逆プロキシが圧縮や buffering を行うと、実測値が視聴時とずれることがあります。<br>
@@ -70,28 +71,28 @@
             <div v-if="result !== null && quality_thresholds.length > 0" class="speed-test-card">
                 <div class="settings__item-heading">推奨画質</div>
                 <div class="settings__item-label">
-                    下り実測値と、再生 bitrate / muxrate 正本から作った必要 Mbps をこの端末内で比較しています。<br>
-                    設定中の値は希望値であり、再生開始時の実効 codec とは限りません。測定後も設定は自動では変わりません。<br>
+                    下り実測値と、再生映像 bitrate 正本（映像最大 + 音声）から作った必要 Mbps をこの端末内で比較しています。<br>
+                    設定コーデックは再生・画質の希望値であり、再生開始時の実効 codec とは限りません。測定後も設定は自動では変わりません。<br>
                     測定値が十分でも、サーバーの encoder 能力や端末の decode 能力は別条件です。
                 </div>
                 <div class="speed-test-quality-grid">
                     <section>
                         <h3>通常放送</h3>
+                        <p class="speed-test-configured-codec">設定コーデック {{ configuredCodecLabel('Terrestrial') }}</p>
                         <ul>
                             <li v-for="codec in codecs" :key="`terrestrial-${codec}`">
                                 <span>{{ codec }}</span>
                                 <strong>{{ recommendedLabel('Terrestrial', codec) }}</strong>
-                                <em v-if="isConfigured('Terrestrial', codec)">設定中</em>
                             </li>
                         </ul>
                     </section>
                     <section>
                         <h3>BS4K</h3>
+                        <p class="speed-test-configured-codec">設定コーデック {{ configuredCodecLabel('BS4K') }}</p>
                         <ul>
                             <li v-for="codec in codecs" :key="`bs4k-${codec}`">
                                 <span>{{ codec }}</span>
                                 <strong>{{ recommendedLabel('BS4K', codec) }}</strong>
-                                <em v-if="isConfigured('BS4K', codec)">設定中</em>
                             </li>
                         </ul>
                     </section>
@@ -103,12 +104,12 @@
                 <div class="settings__item-label">
                     測定エンジンは LibreSpeed の固定 Worker です。UI と backend は KonomiTV-BS4K の独自実装です。<br>
                     作者: Federico Dossena / ライセンス: GNU LGPL-3.0 / commit:
-                    <code>{{ worker_commit }}</code>
+                    <code>{{ worker_commit }}</code><br>
+                    ライセンス全文はサードパーティーライセンスに含めています。
                 </div>
                 <div class="speed-test-license-links">
                     <a class="link" href="/vendor/librespeed/speedtest_worker.js" target="_blank" rel="noopener noreferrer">Worker</a>
-                    <a class="link" href="/vendor/librespeed/LICENSE-LGPL-3.0.txt" target="_blank" rel="noopener noreferrer">LGPL-3.0</a>
-                    <a class="link" href="/vendor/librespeed/LICENSE-GPL-3.0.txt" target="_blank" rel="noopener noreferrer">GPL-3.0</a>
+                    <a class="link" href="/api/version/third-party-licenses" target="_blank" rel="noopener noreferrer">サードパーティーライセンス</a>
                     <a class="link" :href="upstream_source_url" target="_blank" rel="noopener noreferrer">upstream source</a>
                 </div>
             </div>
@@ -212,15 +213,12 @@ function recommendedLabel(
     return recommended?.quality ?? '安定視聴が難しい可能性';
 }
 
-function isConfigured(
-    broadcast_type: KonomiTVBS4KSpeedTestBroadcastType,
-    codec: KonomiTVBS4KSpeedTestCodec,
-): boolean {
+function configuredCodecLabel(broadcast_type: KonomiTVBS4KSpeedTestBroadcastType): string {
     const settings = settings_store.settings;
     const current_codec = broadcast_type === 'BS4K' ?
         settings.konomitv_bs4k_playback_video_codec_for_bs4k :
         settings.konomitv_bs4k_playback_video_codec;
-    return current_codec.toUpperCase() === codec;
+    return current_codec.toUpperCase();
 }
 
 function cleanupMeasurement(): Promise<void> {
@@ -429,8 +427,13 @@ onBeforeUnmount(() => {
         grid-template-columns: 1fr;
     }
     h3 {
-        margin: 0 0 8px;
+        margin: 0 0 4px;
         font-size: 15px;
+    }
+    .speed-test-configured-codec {
+        margin: 0 0 10px;
+        color: rgb(var(--v-theme-text-darken-1));
+        font-size: 13px;
     }
     ul {
         margin: 0;
@@ -445,11 +448,6 @@ onBeforeUnmount(() => {
         span {
             width: 4.5em;
             color: rgb(var(--v-theme-text-darken-1));
-        }
-        em {
-            font-style: normal;
-            font-size: 12px;
-            color: rgb(var(--v-theme-primary));
         }
     }
 }
