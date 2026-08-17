@@ -21,7 +21,6 @@ from app.constants import JST, JWT_SECRET_KEY, QUALITY, QUALITY_TYPES
 from app.models.User import User
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KVideoCodec,
-    ResolveKonomiTVBS4KAdvancedLiveMuxrate,
     ResolveKonomiTVBS4KPlaybackVideoBitrate,
 )
 
@@ -58,7 +57,6 @@ KONOMITV_BS4K_SPEED_TEST_MAX_UPLOAD_REQUEST_BYTES = 20 * 1024 * 1024
 KONOMITV_BS4K_SPEED_TEST_MAX_SESSION_DOWNLOAD_BYTES = 16 * 1024 * 1024 * 1024
 KONOMITV_BS4K_SPEED_TEST_MAX_SESSION_UPLOAD_BYTES = 16 * 1024 * 1024 * 1024
 KONOMITV_BS4K_SPEED_TEST_DRAIN_TIMEOUT_SECONDS = 30.0
-KONOMITV_BS4K_SPEED_TEST_FIXED_MUXRATE_SAFETY_FACTOR = 1.15
 KONOMITV_BS4K_SPEED_TEST_VARIABLE_BITRATE_SAFETY_FACTOR = 1.30
 
 KonomiTVBS4KSpeedTestBroadcastType = Literal['Terrestrial', 'BS4K']
@@ -702,7 +700,11 @@ def ResolveKonomiTVBS4KSpeedTestAudioBitrateKbps(
 
 def BuildKonomiTVBS4KSpeedTestQualityThresholds() -> list[KonomiTVBS4KSpeedTestQualityThreshold]:
     """
-    再生 bitrate / muxrate 正本から推奨画質閾値表を作る。
+    再生映像 bitrate 正本から、視聴に必要な Mbps の閾値表を作る。
+
+    ライブ VP9 / AV1 の固定 muxrate は T-STD 用 stuffing 余力を含む。
+    推奨画質は視聴ペイロード（映像最大 + 音声）で比較し、
+    AV1 < VP9 < HEVC < AVC の再生 bitrate 順を崩さない。
 
     Returns:
         通常放送と BS4K、AVC / HEVC / VP9 / AV1、各画質の必要 Mbps。
@@ -720,30 +722,17 @@ def BuildKonomiTVBS4KSpeedTestQualityThresholds() -> list[KonomiTVBS4KSpeedTestQ
         for display_codec, video_codec in KONOMITV_BS4K_SPEED_TEST_CODECS:
             for quality in qualities:
                 video_bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, video_codec)
-                if video_codec in ('vp9', 'av1'):
-                    muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
-                        video_bitrate.video_bitrate_max,
-                        quality = quality,
-                        video_codec = video_codec,
-                    )
-                    required_kbps = (
-                        ParseKonomiTVBS4KSpeedTestBitrateKbps(muxrate) *
-                        KONOMITV_BS4K_SPEED_TEST_FIXED_MUXRATE_SAFETY_FACTOR
-                    )
-                    basis: KonomiTVBS4KSpeedTestBasis = 'FixedMuxrate'
-                else:
-                    audio_bitrate_kbps = ResolveKonomiTVBS4KSpeedTestAudioBitrateKbps(quality, video_codec)
-                    required_kbps = (
-                        ParseKonomiTVBS4KSpeedTestBitrateKbps(video_bitrate.video_bitrate_max) +
-                        audio_bitrate_kbps
-                    ) * KONOMITV_BS4K_SPEED_TEST_VARIABLE_BITRATE_SAFETY_FACTOR
-                    basis = 'VariableBitrate'
+                audio_bitrate_kbps = ResolveKonomiTVBS4KSpeedTestAudioBitrateKbps(quality, video_codec)
+                required_kbps = (
+                    ParseKonomiTVBS4KSpeedTestBitrateKbps(video_bitrate.video_bitrate_max) +
+                    audio_bitrate_kbps
+                ) * KONOMITV_BS4K_SPEED_TEST_VARIABLE_BITRATE_SAFETY_FACTOR
                 thresholds.append(KonomiTVBS4KSpeedTestQualityThreshold(
                     broadcast_type = broadcast_type,
                     codec = display_codec,
                     quality = quality,
                     required_mbps = required_kbps / 1000.0,
-                    basis = basis,
+                    basis = 'VariableBitrate',
                 ))
     return thresholds
 

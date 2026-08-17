@@ -19,7 +19,6 @@ from app.models.User import User
 from app.routers.KonomiTVBS4KSpeedTestRouter import router as speed_test_router
 from app.routers.UsersRouter import GenerateAccessToken
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
-    ResolveKonomiTVBS4KAdvancedLiveMuxrate,
     ResolveKonomiTVBS4KPlaybackVideoBitrate,
 )
 from app.utils.KonomiTVBS4KSpeedTest import (
@@ -27,7 +26,6 @@ from app.utils.KonomiTVBS4KSpeedTest import (
     KONOMITV_BS4K_SPEED_TEST_COOKIE_PATH,
     KONOMITV_BS4K_SPEED_TEST_DOWNLOAD_SECONDS,
     KONOMITV_BS4K_SPEED_TEST_DOWNLOAD_WINDOW_SECONDS,
-    KONOMITV_BS4K_SPEED_TEST_FIXED_MUXRATE_SAFETY_FACTOR,
     KONOMITV_BS4K_SPEED_TEST_JWT_ISSUER,
     KONOMITV_BS4K_SPEED_TEST_JWT_TYPE,
     KONOMITV_BS4K_SPEED_TEST_MAX_CK_SIZE,
@@ -513,19 +511,15 @@ def test_quality_thresholds_use_playback_source_and_are_monotonic() -> None:
         if threshold.broadcast_type == 'BS4K' and threshold.codec == 'AV1' and threshold.quality == '1080p-60fps'
     )
     av1_bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate('1080p-60fps', 'av1')
-    muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
-        av1_bitrate.video_bitrate_max,
-        quality = '1080p-60fps',
-        video_codec = 'av1',
-    )
-    expected_muxrate = (
-        ParseKonomiTVBS4KSpeedTestBitrateKbps(muxrate) *
-        KONOMITV_BS4K_SPEED_TEST_FIXED_MUXRATE_SAFETY_FACTOR / 1000.0
-    )
-    assert av1_sample.basis == 'FixedMuxrate'
-    assert av1_sample.required_mbps == pytest.approx(expected_muxrate)
+    av1_audio_kbps = ResolveKonomiTVBS4KSpeedTestAudioBitrateKbps('1080p-60fps', 'av1')
+    expected_av1 = (
+        ParseKonomiTVBS4KSpeedTestBitrateKbps(av1_bitrate.video_bitrate_max) + av1_audio_kbps
+    ) * KONOMITV_BS4K_SPEED_TEST_VARIABLE_BITRATE_SAFETY_FACTOR / 1000.0
+    assert av1_sample.basis == 'VariableBitrate'
+    assert av1_sample.required_mbps == pytest.approx(expected_av1)
 
-    # 表示順は高画質が先なので、required_mbps は広義の単調減少（同じ T-STD 上限は同値）になる。
+    # 表示順は高画質が先なので、required_mbps は広義の単調減少になる。
+    # 同一画質では再生 bitrate 正本どおり AV1 < VP9 < HEVC < AVC になる。
     for broadcast_type in ('Terrestrial', 'BS4K'):
         for codec in ('AVC', 'HEVC', 'VP9', 'AV1'):
             required = [
@@ -534,6 +528,17 @@ def test_quality_thresholds_use_playback_source_and_are_monotonic() -> None:
                 if threshold.broadcast_type == broadcast_type and threshold.codec == codec
             ]
             assert required == sorted(required, reverse=True)
+        lowest = {
+            codec: next(
+                threshold.required_mbps
+                for threshold in thresholds
+                if threshold.broadcast_type == broadcast_type and
+                threshold.codec == codec and
+                threshold.quality.startswith('240p')
+            )
+            for codec in ('AVC', 'HEVC', 'VP9', 'AV1')
+        }
+        assert lowest['AV1'] < lowest['VP9'] < lowest['HEVC'] < lowest['AVC']
 
 
 def test_delete_without_cookie_does_not_release_another_tabs_session() -> None:
