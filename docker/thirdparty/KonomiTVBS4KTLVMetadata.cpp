@@ -86,14 +86,16 @@ public:
     void onService(const aribtlv::ServiceInfo&) override {}
 
     void onTrack(const aribtlv::TrackInfo& track) override {
+        // streaming では完全な MPT snapshot を正本にする。個別 callback は MPT commit 後に順次呼ばれるため、
+        // ここで出力すると Video の置換途中を一時的な不在として通知してしまう。
+        if (streaming_) return;
         // 同じ安定 track ID の更新通知は、最新の MPT 情報で置き換える。
         tracks_[track.track_id] = track;
-        emitStreamingSnapshot();
     }
 
     void onTrackRemoved(const aribtlv::TrackInfo& track) override {
+        if (streaming_) return;
         tracks_.erase(track.track_id);
-        emitStreamingSnapshot();
     }
 
     void onAccessUnit(aribtlv::AccessUnit&&) override {}
@@ -124,6 +126,36 @@ public:
         }
         // streaming では SDT 更新のたびに、その時点の services / tracks 全件を 1 行で出力する。
         // 呼び出し側は最新の完了行だけでサービスと映像トラックの対応を検証できる。
+        streaming_snapshot_metadata_ = StreamingSnapshotMetadata{
+            "MHSDT",
+            snapshot.context_id,
+            snapshot.version,
+            snapshot.input_offset,
+        };
+        emitStreamingSnapshot();
+    }
+
+    void onMptSnapshot(const aribtlv::MptSnapshot& snapshot) override {
+        if (!streaming_) return;
+
+        // MptSnapshot は context 単位の完全で検証済みのトラック一覧なので、個別 onTrack callback を
+        // 合成せず、対象 context の状態を一括置換して原子的な Video 有無を通知する。
+        for (auto iterator = tracks_.begin(); iterator != tracks_.end();) {
+            if (iterator->second.context_id == snapshot.context_id) {
+                iterator = tracks_.erase(iterator);
+            } else {
+                ++iterator;
+            }
+        }
+        for (const auto& track : snapshot.tracks) {
+            tracks_[track.track_id] = track;
+        }
+        streaming_snapshot_metadata_ = StreamingSnapshotMetadata{
+            "MPT",
+            snapshot.context_id,
+            snapshot.version,
+            snapshot.input_offset,
+        };
         emitStreamingSnapshot();
     }
 
@@ -161,6 +193,16 @@ public:
 
     void writeStreamingJSONLine(std::ostream& output) const {
         output << '{';
+        output << "\"snapshot_type\":";
+        if (streaming_snapshot_metadata_.has_value()) {
+            WriteJSONString(output, streaming_snapshot_metadata_->type);
+            output << ",\"snapshot_context_id\":" << streaming_snapshot_metadata_->context_id
+                   << ",\"snapshot_version\":" << static_cast<unsigned int>(streaming_snapshot_metadata_->version)
+                   << ",\"input_offset\":" << streaming_snapshot_metadata_->input_offset;
+        } else {
+            output << "null,\"snapshot_context_id\":null,\"snapshot_version\":null,\"input_offset\":null";
+        }
+        output.put(',');
         writeServices(output);
         output.put(',');
         writeTracks(output);
@@ -309,6 +351,13 @@ private:
         aribtlv::ServiceDescriptionInfo service;
     };
 
+    struct StreamingSnapshotMetadata {
+        std::string type;
+        std::uint32_t context_id;
+        std::uint8_t version;
+        std::uint64_t input_offset;
+    };
+
     std::map<std::tuple<std::uint32_t, std::uint16_t>, ServiceRecord> services_;
     std::map<std::tuple<std::uint32_t, std::uint16_t, std::uint16_t>, aribtlv::EventInfo> events_;
     struct TotRange {
@@ -319,6 +368,8 @@ private:
     std::map<std::uint32_t, TotRange> tots_;
     std::map<std::uint64_t, aribtlv::TrackInfo> tracks_;
     std::optional<std::string> fatal_error_;
+    // 直近に出力した完全 snapshot の識別情報。入力未確定時の空行では null のままにする。
+    std::optional<StreamingSnapshotMetadata> streaming_snapshot_metadata_;
     // サービス・トラック更新ごとに snapshot を逐次出力するか (stdin プローブ専用)
     bool streaming_ = false;
     // streaming snapshot を 1 回以上出力済みか (stdin で情報未取得のまま終了した場合の判定用)
@@ -340,11 +391,16 @@ std::uint64_t ParseProbeSize(const char* text) {
 int main(const int argc, char* argv[]) {
     try {
         if (argc < 2 || argc > 3) {
-            std::cerr << "Usage: KonomiTVBS4KTLVMetadata.elf INPUT|- [MAX_BYTES]\n";
+            std::cerr << "Usage: KonomiTVBS4KTLVMetadata.elf INPUT|- [MAX_BYTES|--follow]\n";
             return 2;
         }
-        const auto probe_size = argc == 3 ? ParseProbeSize(argv[2]) : DEFAULT_PROBE_SIZE;
         const bool use_stdin = (std::string(argv[1]) == "-");
+        const bool follow_stdin = argc == 3 && std::string(argv[2]) == "--follow";
+        if (follow_stdin && !use_stdin) {
+            std::cerr << "--follow is only available for stdin input.\n";
+            return 2;
+        }
+        const auto probe_size = argc == 3 && !follow_stdin ? ParseProbeSize(argv[2]) : DEFAULT_PROBE_SIZE;
 
         MetadataSink sink(use_stdin);
         aribtlv::Limits limits;
@@ -372,8 +428,17 @@ int main(const int argc, char* argv[]) {
         };
 
         if (use_stdin) {
-            // streaming snapshot は sink がサービス・トラック更新ごとに stdout へ出力済み。ここでは上限まで読み切る。
-            read_window(std::cin, probe_size, STDIN_READ_BUFFER_SIZE);
+            // 継続監視では EOF まで読み、通常プローブでは従来どおり指定上限で打ち切る。
+            if (follow_stdin) {
+                while (std::cin && !sink.hasFatalError()) {
+                    std::cin.read(reinterpret_cast<char*>(buffer.data()), STDIN_READ_BUFFER_SIZE);
+                    const auto bytes_read = std::cin.gcount();
+                    if (bytes_read <= 0) break;
+                    demuxer.push(buffer.data(), static_cast<std::size_t>(bytes_read));
+                }
+            } else {
+                read_window(std::cin, probe_size, STDIN_READ_BUFFER_SIZE);
+            }
             demuxer.flush();
             if (sink.hasFatalError()) {
                 std::cerr << "MMT/TLV metadata demuxing failed: " << sink.fatalError() << '\n';
