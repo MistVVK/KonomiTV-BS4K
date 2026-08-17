@@ -520,7 +520,9 @@ const handleSettingCoverClick = () => {
             opacity: 0.45;
             pointer-events: none;
         }
-        .dplayer-konomitv-bs4k-setting-low-latency-mode {
+        .dplayer-konomitv-bs4k-setting-low-latency-mode,
+        .dplayer-konomitv-bs4k-setting-rain-fallback-status,
+        .dplayer-konomitv-bs4k-setting-rain-fallback-broadcasting-status {
             // 実効状態を示すだけの行なので、他の設定項目のように操作できる印象を与えない
             cursor: default !important;
             &:hover {

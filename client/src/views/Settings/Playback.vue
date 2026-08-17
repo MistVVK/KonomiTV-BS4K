@@ -86,8 +86,8 @@
                     BSP4K で降雨対応放送を自動で使用する
                 </label>
                 <label class="settings__item-label" for="playback-rain-fallback-bs4k">
-                    1080p (60fps) 以下の画質で視聴を開始したとき、降雨対応放送（1080p 低階層）が送出されていれば自動で使用します。<br>
-                    視聴中に送出状態が変化しても映像階層は切り替わらず、次回の再生開始時に再選択します。<br>
+                    1080p (60fps) 以下の画質では、降雨対応放送（1080p 低階層）の送出状態を継続して監視します。<br>
+                    送出の開始・終了を検知するとライブストリームを再接続し、低階層・主階層を自動で切り替えます。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" hide-details id="playback-rain-fallback-bs4k"
                     :model-value="selected_rain_fallback_bs4k" @update:model-value="updateRainFallbackBS4K">
@@ -98,8 +98,8 @@
                     BS8K で降雨対応放送を自動で使用する
                 </label>
                 <label class="settings__item-label" for="playback-rain-fallback-bs8k">
-                    1080p (60fps) 以下の画質で視聴を開始したとき、降雨対応放送（1080p 低階層）が送出されていれば自動で使用します。<br>
-                    視聴中に送出状態が変化しても映像階層は切り替わらず、次回の再生開始時に再選択します。<br>
+                    1080p (60fps) 以下の画質では、降雨対応放送（1080p 低階層）の送出状態を継続して監視します。<br>
+                    送出の開始・終了を検知するとライブストリームを再接続し、低階層・主階層を自動で切り替えます。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" hide-details id="playback-rain-fallback-bs8k"
                     :model-value="selected_rain_fallback_bs8k" @update:model-value="updateRainFallbackBS8K">

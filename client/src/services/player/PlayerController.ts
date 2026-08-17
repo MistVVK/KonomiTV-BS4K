@@ -217,7 +217,7 @@ class PlayerController {
     // L字画面のクロップ設定で使うウォッチャーを保持する配列
     private lshaped_screen_crop_watchers: (() => void)[] = [];
 
-    // 現在使用中の映像階層を設定パネルへ反映するウォッチャーを保持する配列
+    // 映像階層と降雨対応放送の送出状態を設定パネルへ反映するウォッチャーを保持する配列
     private rain_fallback_watchers: (() => void)[] = [];
 
     // 破棄中かどうか
@@ -3650,7 +3650,7 @@ class PlayerController {
                 </span>
             </div>
         ` : '';
-        // 降雨対応放送の対象局かつ TLV ライブの場合だけ、現在このストリームが選択した映像階層を表示する。
+        // 降雨対応放送の対象局かつ TLV ライブの場合だけ、現在の映像階層と送出状態を表示する。
         // false は低階層の放送有無ではなく、自動利用 OFF や 4K 視聴を含めて主階層を使用中という意味になる。
         const is_rain_fallback_available = (
             this.playback_mode === 'Live' &&
@@ -3658,11 +3658,27 @@ class PlayerController {
             [101, 102].includes(channels_store.channel.current.service_id) &&
             version_store.server_version_info?.konomitv_bs4k_live_transport === 'Tlv'
         );
+        const format_rain_fallback_status = (is_rain_fallback: boolean | null): string => {
+            if (is_rain_fallback === null) return '判定中';
+            return is_rain_fallback === true ? '降雨対応（低階層）' : '通常（主階層）';
+        };
+        const format_rain_fallback_broadcasting_status = (is_broadcasting: boolean | null): string => {
+            if (is_broadcasting === null) return '判定中';
+            return is_broadcasting === true ? '実施中' : '未実施';
+        };
         const rain_fallback_status_item_html = is_rain_fallback_available === true ? `
             <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-rain-fallback-status">
                 <span class="dplayer-label">映像階層</span>
                 <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-rain-fallback-status-value">
-                    ${player_store.is_rain_fallback === true ? '降雨対応（低階層）' : '通常（主階層）'}
+                    ${format_rain_fallback_status(player_store.is_rain_fallback)}
+                </span>
+            </div>
+        ` : '';
+        const rain_fallback_broadcasting_status_item_html = is_rain_fallback_available === true ? `
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-rain-fallback-broadcasting-status">
+                <span class="dplayer-label">降雨対応放送</span>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-rain-fallback-broadcasting-status-value">
+                    ${format_rain_fallback_broadcasting_status(player_store.is_rain_fallback_broadcasting)}
                 </span>
             </div>
         ` : '';
@@ -3695,6 +3711,7 @@ class PlayerController {
             </div>
             ${low_latency_mode_setting_item_html}
             ${rain_fallback_status_item_html}
+            ${rain_fallback_broadcasting_status_item_html}
             ${rain_fallback_setting_item_html}
         `);
 
@@ -3759,19 +3776,32 @@ class PlayerController {
             });
         }
 
-        // 使用中の映像階層は SSE 経由で変化するため、設定パネルの表示を追従させる。
+        // 使用中の映像階層と降雨対応放送の送出状態は SSE 経由で変化するため、設定パネルの表示を追従させる。
         const update_rain_fallback_status_display = () => {
             if (this.player === null) return;
-            const value_element = this.player.container.querySelector<HTMLElement>(
+            const rain_fallback_value_element = this.player.container.querySelector<HTMLElement>(
                 '.dplayer-konomitv-bs4k-setting-rain-fallback-status-value',
             );
-            if (value_element !== null) {
-                value_element.textContent = player_store.is_rain_fallback === true ?
-                    '降雨対応（低階層）' : '通常（主階層）';
+            if (rain_fallback_value_element !== null) {
+                rain_fallback_value_element.textContent = format_rain_fallback_status(player_store.is_rain_fallback);
+            }
+            const broadcasting_value_element = this.player.container.querySelector<HTMLElement>(
+                '.dplayer-konomitv-bs4k-setting-rain-fallback-broadcasting-status-value',
+            );
+            if (broadcasting_value_element !== null) {
+                broadcasting_value_element.textContent = format_rain_fallback_broadcasting_status(
+                    player_store.is_rain_fallback_broadcasting,
+                );
             }
         };
         this.rain_fallback_watchers = [
-            watch(() => player_store.is_rain_fallback, update_rain_fallback_status_display),
+            watch(
+                [
+                    () => player_store.is_rain_fallback,
+                    () => player_store.is_rain_fallback_broadcasting,
+                ],
+                update_rain_fallback_status_display,
+            ),
         ];
 
         // DPlayer の音声トラックと同じ構成の独自サブパネルを追加する。
@@ -4613,7 +4643,7 @@ class PlayerController {
             this.lshaped_screen_crop_watchers = [];
         }
 
-        // 使用中の映像階層を設定パネルへ反映するウォッチャーを破棄
+        // 映像階層と降雨対応放送の送出状態を設定パネルへ反映するウォッチャーを破棄
         if (this.rain_fallback_watchers.length > 0) {
             this.rain_fallback_watchers.forEach((unwatcher) => unwatcher());
             this.rain_fallback_watchers = [];

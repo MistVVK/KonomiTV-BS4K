@@ -1,5 +1,6 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { nextTick } from 'vue';
 
 import { ILiveChannelDefault } from '@/services/Channels';
 import PlayerController, {
@@ -412,9 +413,15 @@ describe('DPlayer設定パネル: 降雨対応映像表示', () => {
     });
 
     it.each([
-        [false, '通常（主階層）'],
-        [true, '降雨対応（低階層）'],
-    ])('SID 101 では実際に使用中の映像階層を表示する', (is_rain_fallback, expected) => {
+        [null, null, '判定中', '判定中'],
+        [false, true, '通常（主階層）', '実施中'],
+        [true, false, '降雨対応（低階層）', '未実施'],
+    ] as const)('SID 101 では映像階層 %s と送出状態 %s を独立して表示する', (
+        is_rain_fallback,
+        is_rain_fallback_broadcasting,
+        expected_rain_fallback,
+        expected_broadcasting,
+    ) => {
         const channels_store = useChannelsStore();
         channels_store.channels_list.BS4K = [Object.preventExtensions({
             ...structuredClone(ILiveChannelDefault),
@@ -425,7 +432,9 @@ describe('DPlayer設定パネル: 降雨対応映像表示', () => {
         })];
         channels_store.is_channels_list_initial_updated = true;
         channels_store.display_channel_id = 'bs4k101';
-        usePlayerStore().is_rain_fallback = is_rain_fallback;
+        const player_store = usePlayerStore();
+        player_store.is_rain_fallback = is_rain_fallback;
+        player_store.is_rain_fallback_broadcasting = is_rain_fallback_broadcasting;
 
         const { player } = createController('Live');
 
@@ -434,8 +443,43 @@ describe('DPlayer設定パネル: 降雨対応映像表示', () => {
         )?.textContent).toBe('映像階層');
         expect(player.container.querySelector(
             '.dplayer-konomitv-bs4k-setting-rain-fallback-status-value',
-        )?.textContent?.trim()).toBe(expected);
+        )?.textContent?.trim()).toBe(expected_rain_fallback);
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback-broadcasting-status .dplayer-label',
+        )?.textContent).toBe('降雨対応放送');
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback-broadcasting-status-value',
+        )?.textContent?.trim()).toBe(expected_broadcasting);
         expect(player.container.querySelector('.dplayer-konomitv-bs4k-setting-rain-fallback')).not.toBeNull();
+    });
+
+    it('単一の状態更新で両表示を追従させ、プレイヤーを再起動しない', async () => {
+        const channels_store = useChannelsStore();
+        channels_store.channels_list.BS4K = [Object.preventExtensions({
+            ...structuredClone(ILiveChannelDefault),
+            network_id: 0x000B,
+            service_id: 101,
+            display_channel_id: 'bs4k101',
+            type: 'BS4K' as const,
+        })];
+        channels_store.is_channels_list_initial_updated = true;
+        channels_store.display_channel_id = 'bs4k101';
+        const player_store = usePlayerStore();
+        const restart_handler = vi.fn();
+        player_store.event_emitter.on('PlayerRestartRequired', restart_handler);
+        const { player } = createController('Live');
+
+        player_store.is_rain_fallback = true;
+        player_store.is_rain_fallback_broadcasting = false;
+        await nextTick();
+
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback-status-value',
+        )?.textContent).toBe('降雨対応（低階層）');
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback-broadcasting-status-value',
+        )?.textContent).toBe('未実施');
+        expect(restart_handler).not.toHaveBeenCalled();
     });
 
     it('対象外 SID では降雨対応映像の状態とトグルを表示しない', () => {
@@ -453,10 +497,15 @@ describe('DPlayer設定パネル: 降雨対応映像表示', () => {
         const { player } = createController('Live');
 
         expect(player.container.querySelector('.dplayer-konomitv-bs4k-setting-rain-fallback-status')).toBeNull();
+        expect(player.container.querySelector(
+            '.dplayer-konomitv-bs4k-setting-rain-fallback-broadcasting-status',
+        )).toBeNull();
         expect(player.container.querySelector('.dplayer-konomitv-bs4k-setting-rain-fallback')).toBeNull();
     });
 
-    it('4K 視聴中のトグル変更は設定と後続 URL だけを更新し、プレイヤーを再起動しない', () => {
+    it.each(['8K', '4K', '1440p'])('%s 視聴中に自動使用をOFFにしてもプレイヤーを再起動しない', (
+        current_quality_name,
+    ) => {
         const channels_store = useChannelsStore();
         channels_store.channels_list.BS4K = [Object.preventExtensions({
             ...structuredClone(ILiveChannelDefault),
@@ -471,7 +520,7 @@ describe('DPlayer設定パネル: 降雨対応映像表示', () => {
         const restart_handler = vi.fn();
         player_store.event_emitter.on('PlayerRestartRequired', restart_handler);
 
-        const { player } = createController('Live', '4K');
+        const { player } = createController('Live', current_quality_name);
         player.container.querySelector<HTMLElement>(
             '.dplayer-konomitv-bs4k-setting-rain-fallback',
         )!.click();
