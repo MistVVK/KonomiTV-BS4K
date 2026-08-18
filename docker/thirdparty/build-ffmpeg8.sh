@@ -155,6 +155,15 @@ ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
     $(pkg-config --cflags --libs --static libaribtlv) \
     -Wl,-z,relro,-z,now -pie \
     -o "${metadata_output}/KonomiTVBS4KTLVMetadata.elf"
+# production 実装を同じ翻訳単位へ取り込み、reset 境界の JSON と状態消去を直接検証する。
+ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
+    -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+    "${SCRIPT_DIR}/KonomiTVBS4KTLVMetadataTest.cpp" \
+    $(pkg-config --cflags --libs --static libaribtlv) \
+    -Wl,-z,relro,-z,now -pie \
+    -o /tmp/KonomiTVBS4KTLVMetadataTest.elf
+/tmp/KonomiTVBS4KTLVMetadataTest.elf
+rm /tmp/KonomiTVBS4KTLVMetadataTest.elf
 install -m 0644 "${libaribtlv_source}/LICENSE" "${metadata_output}/License-libaribtlv-MIT.txt"
 
 pushd "${ffmpeg_source}"

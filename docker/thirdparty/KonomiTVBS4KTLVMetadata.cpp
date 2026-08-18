@@ -84,6 +84,8 @@ public:
     explicit MetadataSink(const bool streaming = false) : streaming_(streaming) {}
 
     void onServiceStateReset(const aribtlv::ServiceStateReset& reset) override {
+        // 現行 CLI は Demuxer::reset() / selectService() を呼ばないが、将来 Sink を別経路から再利用しても
+        // libaribtlv の reset 契約を満たせるよう、callback 自体は完全な状態消去として実装する。
         // libaribtlv は reset 時に onTrackRemoved() を呼ばず service state を全消去する。
         // stable track ID が再利用されても旧サービスの補助状態を引き継がないよう、こちらも全消去する。
         const auto input_offset = streaming_snapshot_metadata_.has_value()
@@ -98,7 +100,7 @@ public:
         // streaming consumer へも空の完全 MPT snapshot を通知し、次の MPT まで旧 track を使わせない。
         if (streaming_) {
             streaming_snapshot_metadata_ = StreamingSnapshotMetadata{
-                "MPT", reset.context_id.value_or(0), std::nullopt, input_offset,
+                "MPT", reset.context_id, std::nullopt, input_offset,
             };
             emitStreamingSnapshot();
         }
@@ -217,8 +219,9 @@ public:
         output << "\"snapshot_type\":";
         if (streaming_snapshot_metadata_.has_value()) {
             WriteJSONString(output, streaming_snapshot_metadata_->type);
-            output << ",\"snapshot_context_id\":" << streaming_snapshot_metadata_->context_id
-                   << ",\"snapshot_version\":";
+            output << ",\"snapshot_context_id\":";
+            WriteOptionalInteger(output, streaming_snapshot_metadata_->context_id);
+            output << ",\"snapshot_version\":";
             if (streaming_snapshot_metadata_->version.has_value()) {
                 output << static_cast<unsigned int>(*streaming_snapshot_metadata_->version);
             } else {
@@ -379,7 +382,7 @@ private:
 
     struct StreamingSnapshotMetadata {
         std::string type;
-        std::uint32_t context_id;
+        std::optional<std::uint32_t> context_id;
         std::optional<std::uint8_t> version;
         std::uint64_t input_offset;
     };
