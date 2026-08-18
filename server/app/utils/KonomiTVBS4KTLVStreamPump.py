@@ -7,9 +7,7 @@ from typing import ClassVar
 import aiohttp
 
 from app import logging
-from app.utils.KonomiTVBS4KTLVRainFallbackMonitor import (
-    KonomiTVBS4KTLVRainFallbackMonitor,
-)
+from app.utils.KonomiTVBS4KTLVMetadataMonitor import KonomiTVBS4KTLVMetadataMonitor
 
 
 class KonomiTVBS4KTLVStreamPump:
@@ -26,7 +24,7 @@ class KonomiTVBS4KTLVStreamPump:
         stream_reader: aiohttp.StreamReader,
         initial_data: bytes,
         log_prefix: str,
-        rain_fallback_monitor: KonomiTVBS4KTLVRainFallbackMonitor | None = None,
+        rain_fallback_monitor: KonomiTVBS4KTLVMetadataMonitor | None = None,
     ) -> None:
         """
         TLV stream pump を初期化する。
@@ -35,7 +33,7 @@ class KonomiTVBS4KTLVStreamPump:
             stream_reader (aiohttp.StreamReader): Channel Stream API の HTTP 応答本文。
             initial_data (bytes): context_id のプローブ中に読み取った生 TLV データ。
             log_prefix (str): ログへ付与するプレフィックス。
-            rain_fallback_monitor (KonomiTVBS4KTLVRainFallbackMonitor | None): 生TLVを複製する継続監視。
+            rain_fallback_monitor (KonomiTVBS4KTLVMetadataMonitor | None): 生TLVを複製する継続監視。
 
         Returns:
             None
@@ -53,12 +51,14 @@ class KonomiTVBS4KTLVStreamPump:
         self._error: BaseException | None = None
         # 入力終了の debug ログに利用するストリーム固有プレフィックス。
         self._log_prefix = log_prefix
-        # 監視遅延をprimary Queueへ波及させず、生TLVを複製する降雨対応放送monitor。
+        # 降雨対象局では LiveEncodingTask から渡された monitor へ生TLVを複製する。
+        # 対象外の局では helper を起動せず、エンコーダー入力だけを扱う。
         self._rain_fallback_monitor = rain_fallback_monitor
 
         # Resolver が読み取ったデータも64KiB以下へ分割し、後続データと同じ上限・順序で管理する。
-        # monitor は Resolver の確定値を初期状態として引き継ぐため、最大32MiBの先頭バッファを
-        # 8MiBの監視Queueへ再投入しない。再投入すると選局のたびにoverflowして確定値を失う。
+        # monitor へは有限 live Queue と分離した先頭データとして渡し、Resolver が消費した連続TLVを失わない。
+        if self._rain_fallback_monitor is not None:
+            self._rain_fallback_monitor.offerInitialData(initial_data)
         for offset in range(0, len(initial_data), self.CHUNK_SIZE):
             chunk = initial_data[offset:offset + self.CHUNK_SIZE]
             self._putStartupChunk(chunk)
@@ -90,6 +90,8 @@ class KonomiTVBS4KTLVStreamPump:
 
         if self._task is not None:
             return
+        if self._rain_fallback_monitor is not None:
+            self._rain_fallback_monitor.start()
         self._task = asyncio.create_task(self._run())
 
     def switchToLosslessMode(self) -> None:
@@ -135,6 +137,8 @@ class KonomiTVBS4KTLVStreamPump:
 
         if self._task is not None and self._task.done() is False:
             self._task.cancel()
+        if self._rain_fallback_monitor is not None:
+            self._rain_fallback_monitor.cancel()
 
     async def wait(self) -> None:
         """
@@ -147,15 +151,16 @@ class KonomiTVBS4KTLVStreamPump:
             None
         """
 
-        if self._task is None:
-            return
-        try:
-            await self._task
-        except asyncio.CancelledError:
-            # pump 自身へ送ったキャンセルは正常な回収だが、選局元タスクのキャンセルは握りつぶさない。
-            current_task = asyncio.current_task()
-            if current_task is not None and current_task.cancelling() > 0:
-                raise
+        if self._task is not None:
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                # pump 自身へ送ったキャンセルは正常な回収だが、選局元タスクのキャンセルは握りつぶさない。
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling() > 0:
+                    raise
+        if self._rain_fallback_monitor is not None:
+            await self._rain_fallback_monitor.wait()
 
     def _putStartupChunk(self, chunk: bytes) -> None:
         """

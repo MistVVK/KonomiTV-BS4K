@@ -166,7 +166,7 @@ class KonomiTVBS4KTLVServiceResolver:
 
         head_buffer = bytearray()
         observed_service_contexts: dict[int, int] = {}
-        observed_mpt_contexts: set[int] = set()
+        received_mpt_contexts: set[int] = set()
         latest_video_context_ids: set[int] = set()
         main_context_id: int | None = None
         rain_context_id: int | None = None
@@ -187,18 +187,22 @@ class KonomiTVBS4KTLVServiceResolver:
                 # 実入力では同じ context_id の SDT が SID ごとに順次通知されるため、各行だけを見ると
                 # 直前に解決した主 SID が消える。プローブ期間内に観測したサービス対応は SID ごとに蓄積する。
                 observed_service_contexts.update(metadata.service_contexts)
-                latest_video_context_ids.clear()
-                latest_video_context_ids.update(metadata.video_context_ids)
                 if metadata.snapshot_type == 'MPT' and metadata.snapshot_context_id is not None:
-                    observed_mpt_contexts.add(metadata.snapshot_context_id)
-                if main_context_id is None:
-                    main_context_id = observed_service_contexts.get(main_service_id)
+                    # MPTのtracksは完全snapshotとして置換する。受信済みcontextは別に保持することで、
+                    # tracks=[]を「MPT未受信」と混同せずVideoなしと確定できる。
+                    received_mpt_contexts.add(metadata.snapshot_context_id)
+                    latest_video_context_ids.clear()
+                    latest_video_context_ids.update(metadata.video_context_ids)
+
+                main_context_id = observed_service_contexts.get(main_service_id)
                 if rain_service_id is not None:
                     rain_context_id = observed_service_contexts.get(rain_service_id)
                     # MPT は対象 context の完全なトラック一覧なので、観測済みなら Video の有無を確定できる。
                     # SDT だけを見て低階層を採用すると FFmpeg の必須 map を満たせないため、未観測は None のままにする。
-                    if rain_context_id in observed_mpt_contexts:
+                    if rain_context_id is not None and rain_context_id in received_mpt_contexts:
                         is_rain_fallback_broadcasting = rain_context_id in latest_video_context_ids
+                    else:
+                        is_rain_fallback_broadcasting = None
 
         reader_task = asyncio.create_task(readMetadata())
         loop = asyncio.get_running_loop()

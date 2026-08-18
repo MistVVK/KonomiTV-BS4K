@@ -13,6 +13,9 @@ from app.utils.KonomiTVBS4KMMTTLV import (
     KonomiTVBS4KTLVSyncError,
     KonomiTVBS4KTLVSynchronizer,
 )
+from app.utils.KonomiTVBS4KTLVMetadataMonitor import (
+    KonomiTVBS4KTLVMetadataMonitor,
+)
 from app.utils.KonomiTVBS4KTLVRainFallbackMonitor import (
     KonomiTVBS4KTLVRainFallbackMonitor,
 )
@@ -255,7 +258,8 @@ def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
         stdout_reader.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,'
             b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
-            b'"tracks":[{"context_id":1,"kind":"Video"},{"context_id":2,"kind":"Video"}]}\n'
+            b'"tracks":[{"context_id":1,"track_id":10,"kind":"Video"},'
+            b'{"context_id":2,"track_id":20,"kind":"Video"}]}\n'
         )
         stdout_reader.feed_eof()
         process = _FakeTLVMetadataProcess(stdout_reader)
@@ -346,6 +350,53 @@ def test_service_resolver_accepts_service_and_track_in_either_order(
         assert resolution.main_context_id == 1
         assert resolution.rain_context_id == 2
         assert resolution.is_rain_fallback_broadcasting is True
+
+    asyncio.run(scenario())
+
+
+def test_service_resolver_treats_empty_mpt_as_received_complete_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """受信済み降雨contextの空MPTは未受信へ戻さず、Videoなしと確定する。"""
+
+    async def scenario() -> None:
+        stdout_reader = asyncio.StreamReader()
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'"tracks":[]}\n'
+        )
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
+            b'"tracks":[{"context_id":2,"track_id":20,"kind":"Video"}]}\n'
+        )
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,'
+            b'"services":[],"tracks":[]}\n'
+        )
+        stdout_reader.feed_eof()
+        process = _FakeTLVMetadataProcess(stdout_reader)
+
+        async def fake_exec(*_args: object, **_kwargs: object) -> _FakeTLVMetadataProcess:
+            return process
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVServiceResolver.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+
+        async def stream():
+            yield b'head-chunk'
+
+        resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
+            stream(),
+            main_service_id=101,
+            rain_service_id=103,
+            need_rain_fallback=True,
+            log_prefix='test',
+        )
+
+        assert resolution.is_rain_fallback_broadcasting is False
 
     asyncio.run(scenario())
 
@@ -533,14 +584,53 @@ def test_service_resolver_starts_probe_timeout_after_first_byte(
     asyncio.run(scenario())
 
 
+def test_tlv_metadata_monitor_replays_resolver_head_before_live_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolverが消費した大きい先頭データを分割しつつ欠落なく最初のhelperへ渡す。"""
+
+    async def scenario() -> None:
+        process = _FakeFollowingTLVMetadataProcess()
+
+        async def fake_exec(*_args: object, **_kwargs: object) -> _FakeFollowingTLVMetadataProcess:
+            return process
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVMetadataMonitor.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+        monitor = KonomiTVBS4KTLVMetadataMonitor(None, None, 'test')
+        initial_data = b'a' * (monitor.WRITE_CHUNK_SIZE + 1)
+        monitor.offerInitialData(initial_data)
+        monitor.offerChunk(b'live')
+        monitor.start()
+        for _ in range(20):
+            if b''.join(process.stdin.chunks) == initial_data + b'live':
+                break
+            await asyncio.sleep(0)
+
+        assert b''.join(process.stdin.chunks) == initial_data + b'live'
+        assert [len(chunk) for chunk in process.stdin.chunks] == [monitor.WRITE_CHUNK_SIZE, 1, 4]
+        monitor.cancel()
+        await monitor.wait()
+
+    asyncio.run(scenario())
+
+
+def test_rain_fallback_monitor_name_is_a_compatibility_alias() -> None:
+    """既存LiveEncodingTaskがimportする旧名を同じ汎用monitorへ結び付ける。"""
+
+    assert KonomiTVBS4KTLVRainFallbackMonitor is KonomiTVBS4KTLVMetadataMonitor
+
+
 def test_rain_fallback_monitor_tracks_stable_mpt_start_and_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """完全MPTのVideo有無を開始・終了それぞれの安定待ち後に公開する。"""
 
     async def scenario() -> None:
-        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'START_STABILITY_SECONDS', 0.01)
-        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'END_STABILITY_SECONDS', 0.02)
+        monkeypatch.setattr(KonomiTVBS4KTLVMetadataMonitor, 'START_STABILITY_SECONDS', 0.01)
+        monkeypatch.setattr(KonomiTVBS4KTLVMetadataMonitor, 'END_STABILITY_SECONDS', 0.02)
         process = _FakeFollowingTLVMetadataProcess()
         exec_args: tuple[object, ...] | None = None
 
@@ -550,10 +640,10 @@ def test_rain_fallback_monitor_tracks_stable_mpt_start_and_end(
             return process
 
         monkeypatch.setattr(
-            'app.utils.KonomiTVBS4KTLVRainFallbackMonitor.asyncio.subprocess.create_subprocess_exec',
+            'app.utils.KonomiTVBS4KTLVMetadataMonitor.asyncio.subprocess.create_subprocess_exec',
             fake_exec,
         )
-        monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test')
+        monitor = KonomiTVBS4KTLVMetadataMonitor(101, 103, 'test')
         monitor.start()
         await asyncio.sleep(0)
 
@@ -598,17 +688,17 @@ def test_rain_fallback_monitor_cancels_unstable_transition(
     """安定待ち中に状態が戻った場合は公開状態と映像階層を変更しない。"""
 
     async def scenario() -> None:
-        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'START_STABILITY_SECONDS', 0.03)
+        monkeypatch.setattr(KonomiTVBS4KTLVMetadataMonitor, 'START_STABILITY_SECONDS', 0.03)
         process = _FakeFollowingTLVMetadataProcess()
 
         async def fake_exec(*_args: object, **_kwargs: object) -> _FakeFollowingTLVMetadataProcess:
             return process
 
         monkeypatch.setattr(
-            'app.utils.KonomiTVBS4KTLVRainFallbackMonitor.asyncio.subprocess.create_subprocess_exec',
+            'app.utils.KonomiTVBS4KTLVMetadataMonitor.asyncio.subprocess.create_subprocess_exec',
             fake_exec,
         )
-        monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test', False)
+        monitor = KonomiTVBS4KTLVMetadataMonitor(101, 103, 'test', False)
         monitor.start()
         await asyncio.sleep(0)
         process.stdout.feed_data(
@@ -644,17 +734,17 @@ def test_rain_fallback_monitor_treats_missing_rain_service_as_not_broadcasting(
     """主映像が正常で降雨SIDが現れなければ、終了側の安定待ち後に未実施と確定する。"""
 
     async def scenario() -> None:
-        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'END_STABILITY_SECONDS', 0.01)
+        monkeypatch.setattr(KonomiTVBS4KTLVMetadataMonitor, 'END_STABILITY_SECONDS', 0.01)
         process = _FakeFollowingTLVMetadataProcess()
 
         async def fake_exec(*_args: object, **_kwargs: object) -> _FakeFollowingTLVMetadataProcess:
             return process
 
         monkeypatch.setattr(
-            'app.utils.KonomiTVBS4KTLVRainFallbackMonitor.asyncio.subprocess.create_subprocess_exec',
+            'app.utils.KonomiTVBS4KTLVMetadataMonitor.asyncio.subprocess.create_subprocess_exec',
             fake_exec,
         )
-        monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test')
+        monitor = KonomiTVBS4KTLVMetadataMonitor(101, 103, 'test')
         monitor.start()
         await asyncio.sleep(0)
         process.stdout.feed_data(
@@ -679,8 +769,8 @@ def test_rain_fallback_monitor_queue_overflow_invalidates_state(
 ) -> None:
     """監視Queueあふれは再生をブロックせず、古い確定状態を判定中へ戻す。"""
 
-    monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'MAX_BUFFERED_CHUNKS', 2)
-    monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test', True)
+    monkeypatch.setattr(KonomiTVBS4KTLVMetadataMonitor, 'MAX_BUFFERED_CHUNKS', 2)
+    monitor = KonomiTVBS4KTLVMetadataMonitor(101, 103, 'test', True)
 
     monitor.offerChunk(b'one')
     monitor.offerChunk(b'two')
@@ -695,7 +785,7 @@ def test_rain_fallback_monitor_recovers_from_reader_exception(
     """stdout readerの想定外例外を再生側へ漏らさず、状態を無効化してhelperを再生成する。"""
 
     async def scenario() -> None:
-        monkeypatch.setattr(KonomiTVBS4KTLVRainFallbackMonitor, 'RESTART_DELAY_SECONDS', 0.001)
+        monkeypatch.setattr(KonomiTVBS4KTLVMetadataMonitor, 'RESTART_DELAY_SECONDS', 0.001)
         processes: list[_FakeFollowingTLVMetadataProcess] = []
         restarted = asyncio.Event()
 
@@ -710,10 +800,10 @@ def test_rain_fallback_monitor_recovers_from_reader_exception(
             raise ValueError('line exceeds limit')
 
         monkeypatch.setattr(
-            'app.utils.KonomiTVBS4KTLVRainFallbackMonitor.asyncio.subprocess.create_subprocess_exec',
+            'app.utils.KonomiTVBS4KTLVMetadataMonitor.asyncio.subprocess.create_subprocess_exec',
             fake_exec,
         )
-        monitor = KonomiTVBS4KTLVRainFallbackMonitor(101, 103, 'test', True)
+        monitor = KonomiTVBS4KTLVMetadataMonitor(101, 103, 'test', True)
         monitor._readMetadata = fail_reader  # type: ignore[method-assign]
         monitor.start()
         await asyncio.wait_for(restarted.wait(), timeout=1)
@@ -743,12 +833,47 @@ class _BlockingTLVHTTPStreamReader:
         await self.release.wait()
 
 
+class _FakeTLVMetadataMonitor:
+    """pumpテストでmetadata helperを起動せず、複製順序とlifecycleだけを記録するfake。"""
+
+    def __init__(self) -> None:
+        self.initial_data: list[bytes] = []
+        self.chunks: list[bytes] = []
+        self.start_count = 0
+        self.finish_count = 0
+        self.cancel_count = 0
+
+    def offerInitialData(self, data: bytes) -> None:
+        self.initial_data.append(data)
+
+    def offerChunk(self, chunk: bytes) -> None:
+        self.chunks.append(chunk)
+
+    def start(self) -> None:
+        self.start_count += 1
+
+    def finish(self) -> None:
+        self.finish_count += 1
+
+    def cancel(self) -> None:
+        self.cancel_count += 1
+
+    async def wait(self) -> None:
+        return None
+
+
 def test_tlv_stream_pump_keeps_probe_data_before_live_chunks() -> None:
     """プローブ済みデータと後続 HTTP データを同じ FIFO から受信順に返す。"""
 
     async def scenario() -> None:
+        monitor = _FakeTLVMetadataMonitor()
         stream_reader = _BlockingTLVHTTPStreamReader([b'live-1', b'live-2'])
-        pump = KonomiTVBS4KTLVStreamPump(stream_reader, b'probe', 'test')  # type: ignore[arg-type]
+        pump = KonomiTVBS4KTLVStreamPump(
+            stream_reader,  # type: ignore[arg-type]
+            b'probe',
+            'test',
+            monitor,  # type: ignore[arg-type]
+        )
         pump.start()
         await stream_reader.sent_all_chunks.wait()
 
@@ -757,9 +882,13 @@ def test_tlv_stream_pump_keeps_probe_data_before_live_chunks() -> None:
         assert await iterator.__anext__() == b'live-1'
         assert await iterator.__anext__() == b'live-2'
         assert stream_reader.iter_chunked_count == 1
+        assert monitor.initial_data == [b'probe']
+        assert monitor.chunks == [b'live-1', b'live-2']
+        assert monitor.start_count == 1
 
         pump.cancel()
         await pump.wait()
+        assert monitor.cancel_count == 1
 
     asyncio.run(scenario())
 
@@ -769,14 +898,27 @@ def test_tlv_stream_pump_fans_out_only_live_chunks_without_second_reader() -> No
 
     class FakeMonitor:
         def __init__(self) -> None:
+            self.initial_data: list[bytes] = []
             self.chunks: list[bytes] = []
             self.finish_count = 0
+
+        def offerInitialData(self, data: bytes) -> None:
+            self.initial_data.append(data)
 
         def offerChunk(self, chunk: bytes) -> None:
             self.chunks.append(chunk)
 
+        def start(self) -> None:
+            return None
+
         def finish(self) -> None:
             self.finish_count += 1
+
+        def cancel(self) -> None:
+            return None
+
+        async def wait(self) -> None:
+            return None
 
     async def scenario() -> None:
         monitor = FakeMonitor()
@@ -790,6 +932,7 @@ def test_tlv_stream_pump_fans_out_only_live_chunks_without_second_reader() -> No
         pump.start()
         await stream_reader.sent_all_chunks.wait()
 
+        assert monitor.initial_data == [b'probe']
         assert monitor.chunks == [b'live']
         assert stream_reader.iter_chunked_count == 1
 
@@ -806,7 +949,13 @@ def test_tlv_stream_pump_drops_only_oldest_chunks_during_startup(monkeypatch: py
     async def scenario() -> None:
         monkeypatch.setattr(KonomiTVBS4KTLVStreamPump, 'MAX_BUFFERED_CHUNKS', 3)
         stream_reader = _BlockingTLVHTTPStreamReader([b'live-1', b'live-2', b'live-3'])
-        pump = KonomiTVBS4KTLVStreamPump(stream_reader, b'old-probe', 'test')  # type: ignore[arg-type]
+        monitor = _FakeTLVMetadataMonitor()
+        pump = KonomiTVBS4KTLVStreamPump(
+            stream_reader,  # type: ignore[arg-type]
+            b'old-probe',
+            'test',
+            monitor,  # type: ignore[arg-type]
+        )
         pump.start()
         await stream_reader.sent_all_chunks.wait()
 
@@ -831,7 +980,13 @@ def test_tlv_stream_pump_applies_backpressure_without_dropping_after_encoder_sta
         monkeypatch.setattr(KonomiTVBS4KTLVStreamPump, 'CHUNK_SIZE', 7)
         stream_reader = _BlockingTLVHTTPStreamReader([b'live'])
         # initial_data を2分割し、HTTP 読取開始前から Queue が満杯の状態を作る。
-        pump = KonomiTVBS4KTLVStreamPump(stream_reader, b'probe-1probe-2', 'test')  # type: ignore[arg-type]
+        monitor = _FakeTLVMetadataMonitor()
+        pump = KonomiTVBS4KTLVStreamPump(
+            stream_reader,  # type: ignore[arg-type]
+            b'probe-1probe-2',
+            'test',
+            monitor,  # type: ignore[arg-type]
+        )
         pump.switchToLosslessMode()
         pump.start()
         await asyncio.sleep(0)
