@@ -83,6 +83,16 @@ public:
     // 呼び出し側 (ライブ視聴のプローブ) が目的の service_id と映像を得たら早期終了できるようにする。
     explicit MetadataSink(const bool streaming = false) : streaming_(streaming) {}
 
+    void onServiceStateReset(const aribtlv::ServiceStateReset&) override {
+        // libaribtlv は reset 時に onTrackRemoved() を呼ばず service state を全消去する。
+        // stable track ID が再利用されても旧サービスの補助状態を引き継がないよう、こちらも全消去する。
+        services_.clear();
+        events_.clear();
+        tots_.clear();
+        tracks_.clear();
+        streaming_snapshot_metadata_.reset();
+    }
+
     void onService(const aribtlv::ServiceInfo&) override {}
 
     void onTrack(const aribtlv::TrackInfo& track) override {
