@@ -18,7 +18,6 @@ from starlette.requests import ClientDisconnect
 
 from app import logging
 from app.constants import JST, JWT_SECRET_KEY, QUALITY, QUALITY_TYPES
-from app.models.User import User
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KVideoCodec,
     ResolveKonomiTVBS4KPlaybackVideoBitrate,
@@ -30,7 +29,6 @@ KONOMITV_BS4K_SPEED_TEST_COOKIE_PATH = '/api/konomitv-bs4k/speed-test'
 KONOMITV_BS4K_SPEED_TEST_JWT_TYPE = 'SpeedTestSession'
 KONOMITV_BS4K_SPEED_TEST_JWT_ISSUER = 'KonomiTV Server'
 KONOMITV_BS4K_SPEED_TEST_SESSION_TTL_SECONDS = 90
-KONOMITV_BS4K_SPEED_TEST_MAX_SESSIONS_PER_USER = 1
 KONOMITV_BS4K_SPEED_TEST_MAX_SESSIONS_GLOBAL = 2
 KONOMITV_BS4K_SPEED_TEST_MAX_DOWNLOAD_STREAMS = 5
 KONOMITV_BS4K_SPEED_TEST_MAX_UPLOAD_STREAMS = 3
@@ -126,10 +124,6 @@ class KonomiTVBS4KSpeedTestSessionState:
 
     # 短命 JWT の sid と一致する測定枠 ID。releaseSession() と cookie 検証が参照する。
     session_id: str
-    # 枠を所有するユーザー。同一ユーザー1枠制限と token_version 照合の前提。
-    user_id: int
-    # 発行時点の User.token_version。パスワード変更後は cookie を拒否する。
-    token_version: int
     # 単調時刻での期限。壁時計の巻き戻しで枠が残らないようにする。
     expires_at_monotonic: float
     # 下り / 上り / ping の lease。同時数制限と、解放時に ASGI タスクを停止するために参照する。
@@ -159,8 +153,6 @@ class KonomiTVBS4KSpeedTestSessionManager:
         self._lock = asyncio.Lock()
         # session_id から枠状態を引く。cookie 検証と転送 API が参照する。
         self._sessions: dict[str, KonomiTVBS4KSpeedTestSessionState] = {}
-        # user_id から現在の session_id を引く。同一ユーザー1枠制限の前提。
-        self._sessions_by_user: dict[int, str] = {}
 
     async def resetForTests(self) -> None:
         """単体テスト間でプロセス内枠を空にする。"""
@@ -176,33 +168,20 @@ class KonomiTVBS4KSpeedTestSessionManager:
                         if lease.owner_task is not current_task and lease.owner_task.done() is False:
                             lease.owner_task.cancel()
             self._sessions.clear()
-            self._sessions_by_user.clear()
 
-    async def createSession(self, user: User) -> KonomiTVBS4KSpeedTestSessionState:
+    async def createSession(self) -> KonomiTVBS4KSpeedTestSessionState:
         """
-        ユーザー枠と全体枠に空きがあれば測定枠を作る。
-
-        Args:
-            user: Bearer 認証済みのログインユーザー。
+        全体枠に空きがあれば測定枠を作る。
 
         Returns:
             作成した測定枠。JWT と cookie の sid に使う。
 
         Raises:
-            HTTPException: 同一ユーザーまたは全体の枠が埋まっている場合は 429。
+            HTTPException: 全体の枠が埋まっている場合は 429。
         """
 
         async with self._lock:
             self._collectExpiredSessionsLocked()
-            existing_session_id = self._sessions_by_user.get(user.id)
-            if existing_session_id is not None:
-                existing = self._sessions[existing_session_id]
-                retry_after = self._retryAfterSeconds(existing)
-                logging.warning(
-                    '[KonomiTVBS4KSpeedTest] Rejected session create because the user already has a session. '
-                    f'[user_id: {user.id}]'
-                )
-                raise self._tooManyRequests(retry_after)
             if len(self._sessions) >= KONOMITV_BS4K_SPEED_TEST_MAX_SESSIONS_GLOBAL:
                 retry_after = min(
                     self._retryAfterSeconds(session)
@@ -210,15 +189,13 @@ class KonomiTVBS4KSpeedTestSessionManager:
                 )
                 logging.warning(
                     '[KonomiTVBS4KSpeedTest] Rejected session create because the global session limit is full. '
-                    f'[user_id: {user.id}]'
+                    f'[active_sessions: {len(self._sessions)}]'
                 )
                 raise self._tooManyRequests(retry_after)
 
             session_id = uuid.uuid4().hex
             session = KonomiTVBS4KSpeedTestSessionState(
                 session_id = session_id,
-                user_id = user.id,
-                token_version = user.token_version,
                 expires_at_monotonic = time.monotonic() + KONOMITV_BS4K_SPEED_TEST_SESSION_TTL_SECONDS,
                 download_leases = {},
                 upload_leases = {},
@@ -233,7 +210,6 @@ class KonomiTVBS4KSpeedTestSessionManager:
                 upload_window_task = None,
             )
             self._sessions[session_id] = session
-            self._sessions_by_user[user.id] = session_id
             session.expiry_task = asyncio.create_task(
                 self._expireSession(session_id),
                 name = f'konomitv-bs4k-speed-test-expire-{session_id}',
@@ -559,9 +535,6 @@ class KonomiTVBS4KSpeedTestSessionManager:
 
     def _forgetSessionLocked(self, session: KonomiTVBS4KSpeedTestSessionState) -> None:
         self._sessions.pop(session.session_id, None)
-        current_user_session_id = self._sessions_by_user.get(session.user_id)
-        if current_user_session_id == session.session_id:
-            self._sessions_by_user.pop(session.user_id, None)
 
     @staticmethod
     def _hasInFlightTransfers(session: KonomiTVBS4KSpeedTestSessionState) -> bool:
@@ -737,15 +710,11 @@ def BuildKonomiTVBS4KSpeedTestQualityThresholds() -> list[KonomiTVBS4KSpeedTestQ
     return thresholds
 
 
-def GenerateKonomiTVBS4KSpeedTestSessionToken(
-    user: User,
-    session_id: str,
-) -> str:
+def GenerateKonomiTVBS4KSpeedTestSessionToken(session_id: str) -> str:
     """
     測定専用の短命 JWT を発行する。
 
     Args:
-        user: 枠を所有するユーザー。
         session_id: プロセス内 registry の測定枠 ID。
 
     Returns:
@@ -757,8 +726,6 @@ def GenerateKonomiTVBS4KSpeedTestSessionToken(
         claims = {
             'iss': KONOMITV_BS4K_SPEED_TEST_JWT_ISSUER,
             'typ': KONOMITV_BS4K_SPEED_TEST_JWT_TYPE,
-            'sub': str(user.id),
-            'token_version': user.token_version,
             'sid': session_id,
             'iat': issued_at,
             'exp': issued_at + timedelta(seconds=KONOMITV_BS4K_SPEED_TEST_SESSION_TTL_SECONDS),
@@ -928,7 +895,7 @@ async def ResolveSpeedTestSessionFromCookie(request: Request) -> KonomiTVBS4KSpe
         有効な測定枠。
 
     Raises:
-        HTTPException: Cookie・JWT・registry・token_version のいずれかが無効なら 401。
+        HTTPException: Cookie・JWT・registry のいずれかが無効なら 401。
     """
 
     token = request.cookies.get(KONOMITV_BS4K_SPEED_TEST_COOKIE_NAME)
@@ -948,26 +915,11 @@ async def ResolveSpeedTestSessionFromCookie(request: Request) -> KonomiTVBS4KSpe
     if payload.get('typ') != KONOMITV_BS4K_SPEED_TEST_JWT_TYPE:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Unauthorized')
     session_id = payload.get('sid')
-    token_version = payload.get('token_version')
-    subject = payload.get('sub')
     if not isinstance(session_id, str) or session_id == '':
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Unauthorized')
-    if type(token_version) is not int or token_version < 0:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Unauthorized')
-    if not isinstance(subject, str):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Unauthorized')
-    try:
-        user_id = int(subject)
-    except (TypeError, ValueError) as ex:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Unauthorized') from ex
 
     session = await SPEED_TEST_SESSION_MANAGER.getActiveSession(session_id)
-    if session is None or session.user_id != user_id or session.token_version != token_version:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Unauthorized')
-
-    user = await User.filter(id=user_id).get_or_none()
-    if user is None or user.token_version != token_version:
-        await SPEED_TEST_SESSION_MANAGER.releaseSession(session_id)
+    if session is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Unauthorized')
     return session
 

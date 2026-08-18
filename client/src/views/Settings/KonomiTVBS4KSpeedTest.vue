@@ -16,24 +16,7 @@
             逆プロキシが圧縮や buffering を行うと、実測値が視聴時とずれることがあります。<br>
         </div>
 
-        <div v-if="authorization_state === 'Loading'" class="settings__content">
-            <v-progress-linear color="primary" indeterminate rounded />
-        </div>
-
-        <div v-else-if="authorization_state === 'LoginRequired'" class="settings__content">
-            <div class="speed-test-card">
-                <div class="settings__item-heading">ログインが必要です</div>
-                <div class="settings__item-label">
-                    サーバー接続速度の測定は、ログインしたユーザーだけが実行できます。<br>
-                    匿名での帯域測定はできません。
-                </div>
-                <v-btn class="mt-4" color="secondary" variant="flat" to="/login/">
-                    <Icon icon="fa:sign-in" class="mr-2" />ログイン
-                </v-btn>
-            </div>
-        </div>
-
-        <div v-else class="settings__content">
+        <div class="settings__content">
             <div class="speed-test-card">
                 <div class="settings__item-heading">測定開始</div>
                 <div class="settings__item-label">
@@ -124,7 +107,6 @@ import { onBeforeRouteLeave } from 'vue-router';
 
 import KonomiTVBS4KSpeedTest from '@/services/KonomiTVBS4KSpeedTest';
 import useSettingsStore from '@/stores/SettingsStore';
-import useUserStore from '@/stores/UserStore';
 import Utils from '@/utils';
 import {
     KONOMITV_BS4K_SPEED_TEST_WORKER_COMMIT,
@@ -146,9 +128,7 @@ const worker_commit = KONOMITV_BS4K_SPEED_TEST_WORKER_COMMIT;
 const upstream_source_url =
     `https://github.com/librespeed/speedtest/blob/${KONOMITV_BS4K_SPEED_TEST_WORKER_COMMIT}/speedtest_worker.js`;
 
-const user_store = useUserStore();
 const settings_store = useSettingsStore();
-const authorization_state = ref<'Loading' | 'LoginRequired' | 'Ready'>('Loading');
 const ui_state = ref<KonomiTVBS4KSpeedTestUiState>('Idle');
 const progress_percent = ref(0);
 const result = ref<IKonomiTVBS4KSpeedTestResult | null>(null);
@@ -159,7 +139,6 @@ const cleanup_in_progress = ref(false);
 const measurement_generation = ref(0);
 const worker_controller = new KonomiTVBS4KSpeedTestWorkerController();
 let cleanup_promise: Promise<void> | null = null;
-let component_unmounted = false;
 
 const is_busy = computed(() =>
     ui_state.value === 'Preparing' ||
@@ -330,15 +309,8 @@ function releaseSessionKeepAlive(): void {
     if (session_active.value === false) {
         return;
     }
-    const access_token = Utils.getAccessToken();
-    if (access_token === null) {
-        return;
-    }
     void fetch(`${Utils.api_base_url}/konomitv-bs4k/speed-test/session`, {
         method: 'DELETE',
-        headers: {
-            Authorization: `Bearer ${access_token}`,
-        },
         credentials: 'include',
         keepalive: true,
     });
@@ -363,13 +335,7 @@ function handlePageHide(): void {
     }
 }
 
-onMounted(async () => {
-    // fetchUser() はアイコン取得失敗時も null を返すが、ユーザー本体は Store に残る。
-    await user_store.fetchUser();
-    if (component_unmounted === true) {
-        return;
-    }
-    authorization_state.value = user_store.user === null ? 'LoginRequired' : 'Ready';
+onMounted(() => {
     window.addEventListener('pagehide', handlePageHide);
 });
 
@@ -378,7 +344,6 @@ onBeforeRouteLeave(() => {
 });
 
 onBeforeUnmount(() => {
-    component_unmounted = true;
     window.removeEventListener('pagehide', handlePageHide);
     abandonMeasurement();
 });

@@ -1,12 +1,10 @@
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
 from app import schemas
-from app.models.User import User
-from app.routers.UsersRouter import GetCurrentUser
 from app.utils.KonomiTVBS4KSpeedTest import (
     KONOMITV_BS4K_SPEED_TEST_DOWNLOAD_SECONDS,
     KONOMITV_BS4K_SPEED_TEST_MAX_DOWNLOAD_STREAMS,
@@ -42,23 +40,21 @@ router = APIRouter(
 async def KonomiTVBS4KSpeedTestSessionCreateAPI(
     request: Request,
     response: Response,
-    current_user: Annotated[User, Depends(GetCurrentUser)],
 ) -> schemas.KonomiTVBS4KSpeedTestSession:
     """
-    ログインユーザーの測定枠を確保し、短命 Cookie と推奨画質閾値を返す。
+    測定枠を確保し、短命 Cookie と推奨画質閾値を返す。
 
     Args:
         request: Fetch Metadata 検証に使うリクエスト。
         response: 専用 Cookie を付ける応答。
-        current_user: Bearer 認証済みユーザー。
 
     Returns:
         有効期限、stream 制限、推奨画質閾値。JWT 自体は返さない。
     """
 
     RequireSpeedTestFetchMetadata(request)
-    session = await SPEED_TEST_SESSION_MANAGER.createSession(current_user)
-    token = GenerateKonomiTVBS4KSpeedTestSessionToken(current_user, session.session_id)
+    session = await SPEED_TEST_SESSION_MANAGER.createSession()
+    token = GenerateKonomiTVBS4KSpeedTestSessionToken(session.session_id)
     SetKonomiTVBS4KSpeedTestSessionCookie(response, token)
     thresholds = BuildKonomiTVBS4KSpeedTestQualityThresholds()
     return schemas.KonomiTVBS4KSpeedTestSession(
@@ -89,14 +85,12 @@ async def KonomiTVBS4KSpeedTestSessionCreateAPI(
 )
 async def KonomiTVBS4KSpeedTestSessionDeleteAPI(
     request: Request,
-    current_user: Annotated[User, Depends(GetCurrentUser)],
 ) -> Response:
     """
     Cookie が指す測定枠を解放する。
 
     Args:
         request: Origin / Fetch Metadata / Cookie 検証に使うリクエスト。
-        current_user: Bearer 認証済みユーザー。Cookie の user と一致している必要がある。
 
     Returns:
         本文なしの 204。
@@ -104,12 +98,12 @@ async def KonomiTVBS4KSpeedTestSessionDeleteAPI(
 
     RequireSpeedTestFetchMetadata(request)
     RequireSpeedTestOrigin(request)
-    # Cookie が指す枠だけを解放する。Bearer だけでユーザー枠を消すと、測定中の別タブを落とす。
+    # Cookie が指す枠だけを解放する。別タブの測定を落とさない。
     try:
         session = await ResolveSpeedTestSessionFromCookie(request)
     except HTTPException:
         session = None
-    if session is not None and session.user_id == current_user.id:
+    if session is not None:
         await SPEED_TEST_SESSION_MANAGER.releaseSession(session.session_id)
     # HttpOnly Cookie は短命で、次の session 作成時に上書きされる。
     ## DELETE 応答で消すと、遅延した旧応答が新しい session Cookie を消すため、ここでは変更しない。
