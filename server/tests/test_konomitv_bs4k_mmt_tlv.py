@@ -401,6 +401,59 @@ def test_service_resolver_treats_empty_mpt_as_received_complete_snapshot(
     asyncio.run(scenario())
 
 
+def test_service_resolver_clears_all_track_state_on_null_context_mpt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """context未選択reset後は、再利用contextを新しいMPTなしで送出中と誤認しない。"""
+
+    async def scenario() -> None:
+        stdout_reader = asyncio.StreamReader()
+        # 対象外SIDのcontext 2でVideo送出状態を作り、reset前のMPT受信実績を残す。
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,'
+            b'"services":[{"service_id":999,"context_id":2}],'
+            b'"tracks":[{"context_id":2,"track_id":20,"kind":"Video"}]}\n'
+        )
+        # 未選択resetはhelperの全状態を消した完全空snapshotとして通知される。
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":null,'
+            b'"services":[],"tracks":[]}\n'
+        )
+        # reset後にcontext 2が降雨対応SIDへ再利用されても、新しいMPTまでは送出有無を未確定に保つ。
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},'
+            b'{"service_id":103,"context_id":2}],"tracks":[]}\n'
+        )
+        stdout_reader.feed_eof()
+        process = _FakeTLVMetadataProcess(stdout_reader)
+
+        async def fake_exec(*_args: object, **_kwargs: object) -> _FakeTLVMetadataProcess:
+            return process
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVServiceResolver.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+
+        async def stream():
+            yield b'head-chunk'
+
+        resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
+            stream(),
+            main_service_id=101,
+            rain_service_id=103,
+            need_rain_fallback=True,
+            log_prefix='test',
+        )
+
+        assert resolution.main_context_id == 1
+        assert resolution.rain_context_id == 2
+        assert resolution.is_rain_fallback_broadcasting is None
+
+    asyncio.run(scenario())
+
+
 def test_service_resolver_cancellation_still_kills_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -580,6 +633,31 @@ def test_service_resolver_starts_probe_timeout_after_first_byte(
         assert resolution.main_context_id == 1
         assert resolution.rain_context_id is None
         assert resolution.head_buffer == b'head-chunk'
+
+    asyncio.run(scenario())
+
+
+def test_tlv_metadata_monitor_clears_all_track_state_on_null_context_mpt() -> None:
+    """context未選択resetの完全空MPTは、サービス対応・MPT受信実績を全消去する。"""
+
+    async def scenario() -> None:
+        monitor = KonomiTVBS4KTLVMetadataMonitor(None, None, 'test')
+        stdout_reader = asyncio.StreamReader()
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,'
+            b'"services":[{"service_id":103,"context_id":2}],'
+            b'"tracks":[{"context_id":2,"track_id":20,"kind":"Video"}]}\n'
+        )
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":null,'
+            b'"services":[],"tracks":[]}\n'
+        )
+        stdout_reader.feed_eof()
+
+        await monitor._readMetadata(stdout_reader)  # type: ignore[reportPrivateUsage]
+
+        assert monitor._service_contexts == {}  # type: ignore[reportPrivateUsage]
+        assert monitor._mpt_video_availability == {}  # type: ignore[reportPrivateUsage]
 
     asyncio.run(scenario())
 

@@ -187,12 +187,19 @@ class KonomiTVBS4KTLVServiceResolver:
                 # 実入力では同じ context_id の SDT が SID ごとに順次通知されるため、各行だけを見ると
                 # 直前に解決した主 SID が消える。プローブ期間内に観測したサービス対応は SID ごとに蓄積する。
                 observed_service_contexts.update(metadata.service_contexts)
-                if metadata.snapshot_type == 'MPT' and metadata.snapshot_context_id is not None:
-                    # MPTのtracksは完全snapshotとして置換する。受信済みcontextは別に保持することで、
-                    # tracks=[]を「MPT未受信」と混同せずVideoなしと確定できる。
-                    received_mpt_contexts.add(metadata.snapshot_context_id)
-                    latest_video_context_ids.clear()
-                    latest_video_context_ids.update(metadata.video_context_ids)
+                if metadata.snapshot_type == 'MPT':
+                    # context未選択の空MPTはhelper全体のreset通知なので、再通知前のSID・MPT・trackを残さない。
+                    # context IDが再利用されても、reset前のVideo送出状態を新しいサービスへ誤適用させない。
+                    if metadata.snapshot_context_id is None:
+                        observed_service_contexts.clear()
+                        received_mpt_contexts.clear()
+                        latest_video_context_ids.clear()
+                    else:
+                        # MPTのtracksは完全snapshotとして置換する。受信済みcontextは別に保持することで、
+                        # tracks=[]を「MPT未受信」と混同せずVideoなしと確定できる。
+                        received_mpt_contexts.add(metadata.snapshot_context_id)
+                        latest_video_context_ids.clear()
+                        latest_video_context_ids.update(metadata.video_context_ids)
 
                 main_context_id = observed_service_contexts.get(main_service_id)
                 if rain_service_id is not None:

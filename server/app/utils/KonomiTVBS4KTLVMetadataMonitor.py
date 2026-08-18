@@ -322,15 +322,21 @@ class KonomiTVBS4KTLVMetadataMonitor:
 
             # 実入力ではSIDごとにSDTが順次通知されるため、helper世代内で観測した対応を蓄積する。
             self._service_contexts.update(metadata.service_contexts)
-            if metadata.snapshot_type == 'MPT' and metadata.snapshot_context_id is not None:
-                # MPTのtracksは全contextを含む完全snapshotなので、過去のtrackを累積せず丸ごと置き換える。
-                # 一方、snapshot_context_idはそのcontextのMPTを実際に受信した証拠として世代内で保持する。
-                received_context_ids = set(self._mpt_video_availability)
-                received_context_ids.add(metadata.snapshot_context_id)
-                self._mpt_video_availability = {
-                    context_id: context_id in metadata.video_context_ids
-                    for context_id in received_context_ids
-                }
+            if metadata.snapshot_type == 'MPT':
+                # context未選択の空MPTはlibaribtlvの完全reset通知であり、特定contextのMPT未受信とは異なる。
+                # helper側も全状態を消しているため、サービス対応・MPT受信実績を同時に破棄する。
+                if metadata.snapshot_context_id is None:
+                    self._service_contexts.clear()
+                    self._mpt_video_availability.clear()
+                else:
+                    # MPTのtracksは全contextを含む完全snapshotなので、過去のtrackを累積せず丸ごと置き換える。
+                    # 一方、snapshot_context_idはそのcontextのMPTを実際に受信した証拠として世代内で保持する。
+                    received_context_ids = set(self._mpt_video_availability)
+                    received_context_ids.add(metadata.snapshot_context_id)
+                    self._mpt_video_availability = {
+                        context_id: context_id in metadata.video_context_ids
+                        for context_id in received_context_ids
+                    }
 
             self._evaluateCandidateState()
 
