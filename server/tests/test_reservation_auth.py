@@ -6,7 +6,7 @@ import asyncio
 import importlib
 from collections.abc import Iterator
 
-from fastapi.routing import APIRoute
+from fastapi.routing import RouteContext
 from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 
@@ -14,6 +14,7 @@ from app import config as config_module
 from app.CompatibilityAPI import CreateCompatibilityAPI
 from app.routers import ReservationConditionsRouter, ReservationsRouter
 from app.routers.UsersRouter import GetCurrentUser
+from app.utils.KonomiTVBS4KFastAPIRouteUtils import IterateKonomiTVBS4KAPIRouteContexts
 
 
 # app.app は通常 KonomiTV.py で初期化済みの設定を参照するため、単体テストでは安全な既定値を先に設定する。
@@ -59,18 +60,16 @@ async def _GetEmptyCtrlCmdUtil() -> _EmptyCtrlCmdUtil:
     return _EmptyCtrlCmdUtil()
 
 
-def _IterMainReservationRoutes() -> Iterator[APIRoute]:
+def _IterMainReservationRoutes() -> Iterator[RouteContext]:
     """本線アプリに登録された予約・自動予約 APIRoute を列挙する。"""
 
-    for route in main_app.routes:
-        if not isinstance(route, APIRoute):
-            continue
+    for route in IterateKonomiTVBS4KAPIRouteContexts(main_app.routes):
         if not route.path.startswith(_MAIN_RESERVATION_PATH_PREFIXES):
             continue
         yield route
 
 
-def _RouteDependsOnGetCurrentUser(route: APIRoute) -> bool:
+def _RouteDependsOnGetCurrentUser(route: RouteContext) -> bool:
     """ルート依存に GetCurrentUser が含まれるかを返す。"""
 
     for dependency in route.dependencies:
@@ -131,8 +130,12 @@ def test_source_reservation_routers_remain_unauthenticated_for_compatibility_reu
     assert list(ReservationsRouter.router.dependencies) == []
     assert list(ReservationConditionsRouter.router.dependencies) == []
 
-    for route in (*ReservationsRouter.router.routes, *ReservationConditionsRouter.router.routes):
-        assert isinstance(route, APIRoute)
+    source_routes = list(IterateKonomiTVBS4KAPIRouteContexts([
+        *ReservationsRouter.router.routes,
+        *ReservationConditionsRouter.router.routes,
+    ]))
+    assert source_routes
+    for route in source_routes:
         assert list(route.dependencies) == []
 
     app = CreateCompatibilityAPI()

@@ -19,6 +19,7 @@ from app.CompatibilityAPI import (
 )
 from app.constants import VERSION
 from app.routers import LiveStreamsRouter
+from app.utils.KonomiTVBS4KFastAPIRouteUtils import IterateKonomiTVBS4KAPIRouteContexts
 
 
 def BuildRecordedProgramResponse() -> dict[str, Any]:
@@ -325,10 +326,11 @@ def test_compatibility_app_does_not_publish_web_ui_or_server_settings(monkeypatc
         lambda: SimpleNamespace(general=SimpleNamespace(backend='EDCB', encoder='QSV')),
     )
     app = CreateCompatibilityAPI()
-    paths = {route.path for route in app.routes}
+    routes = list(IterateKonomiTVBS4KAPIRouteContexts(app.routes))
+    paths = {route.path for route in routes}
     method_paths = {
         (method, route.path)
-        for route in app.routes
+        for route in routes
         for method in getattr(route, 'methods', set()) or set()
     }
 

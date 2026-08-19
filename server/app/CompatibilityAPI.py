@@ -41,6 +41,7 @@ from app.utils import GetPlatformEnvironment
 from app.utils.edcb import ReserveDataRequired
 from app.utils.edcb.CtrlCmdUtil import CtrlCmdUtil
 from app.utils.HTTPS import ReverseProxyMiddleware
+from app.utils.KonomiTVBS4KFastAPIRouteUtils import IterateKonomiTVBS4KAPIRouteContexts
 
 
 _VIDEO_DETAIL_PATH_PATTERN = re.compile(r'^/api/videos/[0-9]+/?$')
@@ -200,20 +201,57 @@ def IncludeKomorebiV1UpstreamRoutes(
     filtered_router = APIRouter()
     included_routes: set[tuple[str, str]] = set()
     for source_router in source_routers:
-        for route in source_router.routes:
-            if not isinstance(route, APIRoute) or route.methods is None:
-                continue
+        for route_context in IterateKonomiTVBS4KAPIRouteContexts(source_router.routes):
+            original_route = cast(APIRoute, route_context.original_route)
+            path = route_context.path
+            methods = route_context.methods
+            endpoint = route_context.endpoint
 
-            route_keys = {(method, route.path) for method in route.methods}
+            # APIRoute では常に揃う情報だが、不完全な route context を黙って除外すると
+            # allowlist の不足を見逃すため、互換 API の構築を明示的に失敗させる。
+            if path is None or methods is None or endpoint is None:
+                raise RuntimeError('Komorebi V1 互換 API のルート情報が不完全です')
+
+            route_keys = {(method, path) for method in methods}
             allowed_route_keys = route_keys & _KOMOREBI_V1_UPSTREAM_ROUTE_ALLOWLIST
             if not allowed_route_keys:
                 continue
             if allowed_route_keys != route_keys:
                 raise RuntimeError(
-                    f'Komorebi V1 互換 API の複数メソッドルートを部分的に公開できません: {route.path}',
+                    f'Komorebi V1 互換 API の複数メソッドルートを部分的に公開できません: {path}',
                 )
 
-            filtered_router.routes.append(route)
+            # nested include_router() の prefix・dependencies・レスポンス設定を含む有効な文脈を複製し、
+            # allowlist に一致したルートだけを従来どおり互換 API へ公開する。
+            filtered_router.add_api_route(
+                path = path,
+                endpoint = endpoint,
+                response_model = route_context.response_model,
+                status_code = route_context.status_code,
+                tags = route_context.tags,
+                dependencies = route_context.dependencies,
+                summary = route_context.summary,
+                description = route_context.description,
+                response_description = route_context.response_description,
+                responses = route_context.responses,
+                deprecated = route_context.deprecated,
+                methods = methods,
+                operation_id = route_context.operation_id,
+                response_model_include = route_context.response_model_include,
+                response_model_exclude = route_context.response_model_exclude,
+                response_model_by_alias = route_context.response_model_by_alias,
+                response_model_exclude_unset = route_context.response_model_exclude_unset,
+                response_model_exclude_defaults = route_context.response_model_exclude_defaults,
+                response_model_exclude_none = route_context.response_model_exclude_none,
+                include_in_schema = route_context.include_in_schema,
+                response_class = route_context.response_class,
+                name = route_context.name,
+                route_class_override = type(original_route),
+                callbacks = route_context.callbacks,
+                openapi_extra = route_context.openapi_extra,
+                generate_unique_id_function = route_context.generate_unique_id_function,
+                strict_content_type = route_context.strict_content_type,
+            )
             included_routes.update(route_keys)
 
     missing_routes = _KOMOREBI_V1_UPSTREAM_ROUTE_ALLOWLIST - included_routes
