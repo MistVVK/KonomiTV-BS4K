@@ -11,6 +11,10 @@ from app.constants import LIBRARY_PATH
 
 class LivePSIDataArchiver:
 
+    # 標準入力を閉じた psisiarc が自発終了するまで待つ上限 (秒)
+    # 通常は EOF を受け取って即座に終了するが、停止した場合は kill へフォールバックする
+    PROCESS_GRACEFUL_SHUTDOWN_TIMEOUT: float = 1.0
+
     def __init__(self, service_id: int) -> None:
         """
         ライブストリーミング (データ放送) 用 PSI/SI データアーカイバーを初期化する
@@ -93,34 +97,44 @@ class LivePSIDataArchiver:
         self._psisiarc_processes.append(psisiarc_process)
         logging.debug(f'[LivePSIDataArchiver] psisiarc started. (PID: {psisiarc_process.pid})')
 
-        # 受信した PSI/SI アーカイブデータを yield で返す
-        trailer_size: int = 0
-        while True:
+        # consumer 切断・generator cancellation・読み取り例外のどの経路でも、
+        # 起動した psisiarc とパイプを必ず回収できるよう generator 全体を finally で覆う
+        try:
+            # 受信した PSI/SI アーカイブデータを yield で返す
+            trailer_size: int = 0
+            while True:
 
-            # HTTP リクエストが途中で切断された
-            if await request.is_disconnected():
-                if psisiarc_process.returncode is None:
-                    psisiarc_process.kill()
-                if psisiarc_process in self._psisiarc_processes:
-                    self._psisiarc_processes.remove(psisiarc_process)
-                logging.debug(f'[LivePSIDataArchiver] psisiarc terminated. (Disconnected / PID: {psisiarc_process.pid})')
-                break
+                # HTTP リクエストが途中で切断された
+                if await request.is_disconnected():
+                    break
 
-            # PSI/SI アーカイブデータを psisiarc から読み取る
-            result = await self.__readPSIArchivedDataChunk(psisiarc_process, trailer_size)
+                # PSI/SI アーカイブデータを psisiarc から読み取る
+                result = await self.__readPSIArchivedDataChunk(psisiarc_process, trailer_size)
 
-            # LivePSIDataArchiver が破棄されたなどの理由で読み取り処理中に psisiarc が終了したか、データ構造が壊れている
-            if result is None:
-                if psisiarc_process.returncode is None:
-                    psisiarc_process.kill()
-                if psisiarc_process in self._psisiarc_processes:
-                    self._psisiarc_processes.remove(psisiarc_process)
-                logging.debug(f'[LivePSIDataArchiver] psisiarc terminated. (Destroyed / PID: {psisiarc_process.pid})')
-                break
+                # LivePSIDataArchiver が破棄されたなどの理由で読み取り処理中に psisiarc が終了したか、データ構造が壊れている
+                if result is None:
+                    break
 
-            # PSI/SI アーカイブデータを yield で返す
-            psi_archive, trailer_size = result
-            yield psi_archive
+                # PSI/SI アーカイブデータを yield で返す
+                psi_archive, trailer_size = result
+                yield psi_archive
+        finally:
+            # cleanup 中に StreamingResponse 側のタスクがキャンセルされても、子プロセスの回収は中断させない
+            ## shield() 自体は呼び出し元へ CancelledError を送出するため、cleanup 完了後に同じ例外を再送出する
+            cleanup_task = asyncio.create_task(self.__cleanupProcess(psisiarc_process))
+            cancellation_error: asyncio.CancelledError | None = None
+            while True:
+                try:
+                    await asyncio.shield(cleanup_task)
+                    break
+                except asyncio.CancelledError as ex:
+                    # cleanup task 自体がキャンセルされた場合は待ち直せないため、そのまま伝播する
+                    if cleanup_task.cancelled():
+                        raise
+                    cancellation_error = ex
+            logging.debug(f'[LivePSIDataArchiver] psisiarc terminated. (PID: {psisiarc_process.pid})')
+            if cancellation_error is not None:
+                raise cancellation_error
 
 
     def destroy(self) -> None:
@@ -131,9 +145,71 @@ class LivePSIDataArchiver:
         # 登録されているすべての psisiarc プロセスを終了する
         ## 基本ここに到達する前に HTTP リクエストが切断され psisiarc も終了されているはずだが、念のため
         ## タイミング次第では LivePSIDataArchiver.getPSIArchivedData() で psisiarc を終了する前に到達する可能性もある
-        for psisiarc_process in self._psisiarc_processes:
-            psisiarc_process.kill()
-        self._psisiarc_processes.clear()
+        ## リストを先に切り離すことで二重 destroy() を no-op にし、generator 側の finally に終了待機を委ねる
+        psisiarc_processes, self._psisiarc_processes = self._psisiarc_processes, []
+        for psisiarc_process in psisiarc_processes:
+            # generator が読み取り待機中でも EOF またはプロセス終了を検知して finally へ進めるようにする
+            if psisiarc_process.stdin is not None and psisiarc_process.stdin.is_closing() is False:
+                try:
+                    psisiarc_process.stdin.close()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            # LiveEncodingTask の終了処理では待機できないため、ここでは即座に kill だけを送信する
+            if psisiarc_process.returncode is None:
+                try:
+                    psisiarc_process.kill()
+                except ProcessLookupError:
+                    pass
+
+
+    async def __cleanupProcess(self, psisiarc_process: asyncio.subprocess.Process) -> None:
+        """
+        psisiarc の標準入力を閉じ、自発終了または強制終了を待ってから管理リストから除外する
+
+        Args:
+            psisiarc_process (asyncio.subprocess.Process): 回収する psisiarc プロセス
+
+        Returns:
+            None
+        """
+
+        try:
+            # まず標準入力を閉じて EOF を通知し、psisiarc が通常の終了処理を行えるようにする
+            if psisiarc_process.stdin is not None and psisiarc_process.stdin.is_closing() is False:
+                try:
+                    psisiarc_process.stdin.close()
+                    await asyncio.wait_for(
+                        psisiarc_process.stdin.wait_closed(),
+                        timeout=self.PROCESS_GRACEFUL_SHUTDOWN_TIMEOUT,
+                    )
+                except (BrokenPipeError, ConnectionResetError):
+                    # 子プロセスが先に終了した場合に起きる正常な競合
+                    pass
+                except TimeoutError:
+                    # pipe close の完了を待ち続けず、下のプロセス終了待機へ進む
+                    pass
+
+            # EOF で自発終了する正常経路を短時間待ち、応答しない場合だけ強制終了する
+            if psisiarc_process.returncode is None:
+                try:
+                    await asyncio.wait_for(
+                        psisiarc_process.wait(),
+                        timeout=self.PROCESS_GRACEFUL_SHUTDOWN_TIMEOUT,
+                    )
+                except TimeoutError:
+                    try:
+                        psisiarc_process.kill()
+                    except ProcessLookupError:
+                        # タイムアウト判定と kill の間に終了した正常な競合
+                        pass
+
+            # kill 済み・自然終了済みのどちらも wait() し、子プロセスと pipe transport を完全に回収する
+            await psisiarc_process.wait()
+        finally:
+            # destroy() が先にリストを切り離した場合もあるため、登録中の場合だけ除外する
+            if psisiarc_process in self._psisiarc_processes:
+                self._psisiarc_processes.remove(psisiarc_process)
 
 
     @staticmethod
