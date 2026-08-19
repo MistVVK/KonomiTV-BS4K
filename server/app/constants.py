@@ -141,7 +141,12 @@ __model_list = [name for _, name, _ in pkgutil.iter_modules(path=['app/models'])
 DATABASE_CONFIG = {
     'timezone': 'Asia/Tokyo',
     'connections': {
-        'default': f'sqlite://{DATA_DIR / "database.sqlite"!s}',
+        'default': {
+            'engine': 'app.utils.KonomiTVBS4KTransactionalSQLite',
+            'credentials': {
+                'file_path': str(DATA_DIR / 'database.sqlite'),
+            },
+        },
     },
     'apps': {
         'models': {
