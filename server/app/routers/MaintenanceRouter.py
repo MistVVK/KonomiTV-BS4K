@@ -13,10 +13,9 @@ from typing import Annotated, Any, Literal, cast
 
 import anyio
 import psutil
-from fastapi import APIRouter, Depends, Path, Query, Request, status
+from fastapi import APIRouter, Depends, Path, Query, status
 from fastapi.exceptions import HTTPException
 from fastapi.responses import Response
-from fastapi.security import OAuth2PasswordBearer
 from sse_starlette.sse import EventSourceResponse
 
 from app import logging, schemas
@@ -39,7 +38,7 @@ from app.models.Program import Program
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
-from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
+from app.routers.UsersRouter import GetCurrentAdminUser
 from app.utils.LogRotation import OpenSecureLogFile
 
 
@@ -61,32 +60,6 @@ LOG_STREAM_INITIAL_MAX_LINES = 1000
 LOG_STREAM_INITIAL_MAX_BYTES = 1024 * 1024
 # リアルタイム追従時に1回で読み込む上限
 LOG_STREAM_UPDATE_READ_BYTES = 256 * 1024
-
-
-async def GetCurrentAdminUserOrLocal(
-    request: Request,
-    token: Annotated[str | None, Depends(OAuth2PasswordBearer(tokenUrl='users/token', auto_error=False))],
-) -> User | None:
-    """
-    現在管理者ユーザーでログインしているか、http://127.0.0.77:7010 からのアクセスであるかを確認する。
-    KonomiTV の Windows サービスからサーバーをシャットダウンするために必要。
-    """
-
-    # HTTP リクエストの Host ヘッダーが 127.0.0.77:{port+10} である場合、ローカルサービスからのアクセスと見なす
-    # 通常アクセス時の Host ヘッダーは 192-168-1-11.local.konomi.tv:7000 のような形式になる
-    valid_host = f'127.0.0.77:{Config().server.port + 10}'
-    if request.headers.get('host', '').strip() == valid_host:
-        return None
-
-    # それ以外である場合、管理者ユーザーでログインしているかを確認する
-    if token is None:
-        logging.error('[MaintenanceRouter][GetCurrentAdminUserOrLocal] Not authenticated.')
-        raise HTTPException(
-            status_code = status.HTTP_401_UNAUTHORIZED,
-            detail = 'Not authenticated',
-            headers = {'WWW-Authenticate': 'Bearer'},
-        )
-    return await GetCurrentAdminUser(await GetCurrentUser(token))
 
 
 def ReadLogTail(log_file: io.TextIOWrapper, max_bytes: int, max_lines: int) -> tuple[list[str], int]:
@@ -660,12 +633,11 @@ async def BackgroundAnalysisAPI():
     status_code = status.HTTP_204_NO_CONTENT,
 )
 def ServerRestartAPI(
-    current_user: Annotated[User | None, Depends(GetCurrentAdminUserOrLocal)],
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ):
     """
     KonomiTV-BS4K サーバーを再起動する。<br>
-    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。<br>
-    例外として、127.0.0.77:{port+10} からのローカルアクセスは認証なしで許可する。
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
     del current_user
@@ -697,13 +669,12 @@ def ServerRestartAPI(
     status_code = status.HTTP_204_NO_CONTENT,
 )
 def ServerShutdownAPI(
-    current_user: Annotated[User | None, Depends(GetCurrentAdminUserOrLocal)],
+    current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ):
     """
     KonomiTV-BS4K サーバーを終了する。<br>
     なお、PM2 環境 / Docker 環境ではサーバー終了後に自動的にプロセスが再起動されるため、事実上 /api/maintenance/restart と等価。<br>
-    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。<br>
-    例外として、127.0.0.77:{port+10} からのローカルアクセスは認証なしで許可する。
+    JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
     del current_user
