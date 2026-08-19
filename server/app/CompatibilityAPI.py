@@ -21,6 +21,7 @@ from pydantic import BaseModel
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app import schemas
+from app.config import Config
 from app.constants import QUALITY_TYPES, VERSION
 from app.models.RecordedProgram import RecordedProgram
 from app.routers import (
@@ -36,6 +37,7 @@ from app.streams.StreamEncodingOptions import (
     StreamEncodingOptions,
     StreamQualityWithOptions,
 )
+from app.utils import GetPlatformEnvironment
 from app.utils.edcb import ReserveDataRequired
 from app.utils.edcb.CtrlCmdUtil import CtrlCmdUtil
 from app.utils.HTTPS import ReverseProxyMiddleware
@@ -51,6 +53,15 @@ _VIDEO_COLLECTION_PATHS = {
 _RESERVATION_COLLECTION_PATHS = {
     '/api/recording/reservations',
     '/api/recording/reservations/',
+}
+_KOMOREBI_V1_ENCODER_MAP: dict[
+    Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'],
+    Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC'],
+] = {
+    'FFmpeg': 'FFmpeg',
+    'QSV': 'QSVEncC',
+    'NVENC': 'NVEncC',
+    'AMF': 'VCEEncC',
 }
 
 # Komorebi V1 が利用・宣言する API と、録画 HLS プレイリストから間接参照される API だけを公開する。
@@ -91,6 +102,42 @@ class CompatibilityUser(BaseModel):
     id: int
     name: str
     pinned_channel_ids: list[str]
+
+
+class CompatibilityVersionInformation(BaseModel):
+    """upstream KonomiTV と同じ形で公開する互換バージョン情報。"""
+
+    version: str
+    latest_version: str | None
+    environment: Literal['Linux', 'Linux-Docker']
+    backend: Literal['EDCB', 'Mirakurun']
+    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC']
+
+
+version_router = APIRouter(tags = ['Compatibility - Version'])
+
+
+@version_router.get(
+    '/api/version',
+    summary = '互換バージョン情報 API',
+    response_model = CompatibilityVersionInformation,
+)
+async def CompatibilityVersionInformationAPI() -> CompatibilityVersionInformation:
+    """本線の BS4K 拡張情報を混ぜず、upstream KonomiTV のバージョン情報を返す。
+
+    Returns:
+        upstream KonomiTV と同じ形の互換バージョン情報。
+    """
+
+    general = Config().general
+    return CompatibilityVersionInformation(
+        version = VERSION,
+        # BS4K 本体の更新先は upstream KonomiTV ではないため、BS4K の最新バージョンを混ぜない。
+        latest_version = None,
+        environment = GetPlatformEnvironment(),
+        backend = general.backend,
+        encoder = _KOMOREBI_V1_ENCODER_MAP[general.encoder],
+    )
 
 
 users_router = APIRouter(tags = ['Compatibility - Users'])
@@ -898,6 +945,7 @@ def CreateCompatibilityAPI(
     compatibility_app.include_router(compatibility_live_streams_router)
     compatibility_app.include_router(compatibility_video_streams_router)
     compatibility_app.include_router(compatibility_reservations_router)
+    compatibility_app.include_router(version_router)
     compatibility_app.include_router(users_router)
     compatibility_app.include_router(histories_router)
 

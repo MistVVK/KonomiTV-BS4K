@@ -319,7 +319,11 @@ def test_port_dispatch_uses_destination_port_and_main_lifespan() -> None:
     ]
 
 
-def test_compatibility_app_does_not_publish_web_ui_or_server_settings() -> None:
+def test_compatibility_app_does_not_publish_web_ui_or_server_settings(monkeypatch) -> None:
+    monkeypatch.setattr(
+        'app.CompatibilityAPI.Config',
+        lambda: SimpleNamespace(general=SimpleNamespace(backend='EDCB', encoder='QSV')),
+    )
     app = CreateCompatibilityAPI()
     paths = {route.path for route in app.routes}
     method_paths = {
@@ -328,7 +332,21 @@ def test_compatibility_app_does_not_publish_web_ui_or_server_settings() -> None:
         for method in getattr(route, 'methods', set()) or set()
     }
 
+    async def GetVersionResponse():
+        async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+            return await client.get('/api/version')
+
+    version_response = asyncio.run(GetVersionResponse())
+    version_information = version_response.json()
+
     assert app.version == VERSION
+    assert version_response.status_code == 200
+    assert set(version_information) == {'version', 'latest_version', 'environment', 'backend', 'encoder'}
+    assert version_information['version'] == VERSION
+    assert version_information['latest_version'] is None
+    assert version_information['environment'] in ('Linux', 'Linux-Docker')
+    assert version_information['backend'] == 'EDCB'
+    assert version_information['encoder'] == 'QSVEncC'
     assert '/api/channels' in paths
     assert '/api/videos' in paths
     assert '/api/histories' in paths
@@ -350,7 +368,7 @@ def test_compatibility_app_does_not_publish_web_ui_or_server_settings() -> None:
     assert ('DELETE', '/api/videos/{video_id}') not in method_paths
     assert not any(path.startswith('/api/settings') for path in paths)
     assert not any(path.startswith('/api/maintenance') for path in paths)
-    assert '/api/version' not in paths
+    assert ('GET', '/api/version') in method_paths
     assert '/{file:path}' not in paths
 
 
