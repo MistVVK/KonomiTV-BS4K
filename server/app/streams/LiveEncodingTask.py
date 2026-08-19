@@ -2296,7 +2296,10 @@ class LiveEncodingTask:
                             ## 放送波の tsreadex への書き込みを最優先で行うため、非同期タスクとして実行する
                             ## ここで tsreadex への書き込みがブロックされると放送波の受信ループが止まり、ライブストリームの異常終了に繋がりかねない
                             if is_mmt_tlv is False and self.live_stream.psi_data_archiver is not None:
-                                background_tasks.add(asyncio.create_task(self.live_stream.psi_data_archiver.pushTSPacketData(chunk)))
+                                psi_push_task = asyncio.create_task(self.live_stream.psi_data_archiver.pushTSPacketData(chunk))
+                                background_tasks.add(psi_push_task)
+                                # 完了した短命タスクを取り除き、視聴時間に比例して強参照が蓄積しないようにする
+                                psi_push_task.add_done_callback(background_tasks.discard)
 
                             # BS4K ライブ開始直後の不安定な TS はエンコーダーへ渡さず破棄する
                             if startup_discard_until > 0 and time.monotonic() < startup_discard_until:
