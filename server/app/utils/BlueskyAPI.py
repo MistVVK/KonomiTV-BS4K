@@ -544,7 +544,8 @@ class BlueskyAPI:
                 bytes: Bluesky にアップロード可能な WebP 画像データ
             """
 
-            with Image.open(io.BytesIO(image_bytes)) as image:
+            # API 利用者が Content-Type を偽装しても、Bluesky 投稿で扱う画像形式以外はデコードしない
+            with Image.open(io.BytesIO(image_bytes), formats=['JPEG', 'PNG', 'WEBP']) as image:
                 # アルファチャンネル付き画像も WebP に保存できるよう RGBA に寄せる
                 if image.mode not in ('RGB', 'RGBA'):
                     image = image.convert('RGBA')
@@ -585,7 +586,8 @@ class BlueskyAPI:
                 tuple[int, int]: 画像の幅と高さ
             """
 
-            with Image.open(io.BytesIO(image_bytes)) as image:
+            # WebP は上の変換結果でも使うため許可し、それ以外の不要な Pillow decoder は起動しない
+            with Image.open(io.BytesIO(image_bytes), formats=['JPEG', 'PNG', 'WEBP']) as image:
                 return image.width, image.height
 
         # UploadFile は非同期に読み出し、サイズだけで分かる変換要否は Pillow を呼ぶ前に判定する

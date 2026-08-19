@@ -22,7 +22,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from tortoise import timezone
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
@@ -285,19 +285,26 @@ def ResizeAndSaveIcon(file: BinaryIO, save_path: pathlib.Path) -> None:
     # リサイズする画像の幅と高さ
     RESIZE_WIDTH_AND_HEIGHT = 512
 
-    # 画像を開く
-    pillow_image = Image.open(file)
+    # Content-Type はクライアントが偽装できるため、Pillow が実データから JPEG / PNG と判定した画像だけを開く
+    # 入力の解析・デコードに起因するエラーだけを入力不正として正規化し、保存先の I/O エラーとは区別する
+    try:
+        with Image.open(file, formats=['JPEG', 'PNG']) as pillow_image:
 
-    # 縦横どちらか長さが短い方に合わせて正方形にクロップ
-    pillow_image_crop = pillow_image.crop((
-        (pillow_image.size[0] - min(pillow_image.size)) // 2,
-        (pillow_image.size[1] - min(pillow_image.size)) // 2,
-        (pillow_image.size[0] + min(pillow_image.size)) // 2,
-        (pillow_image.size[1] + min(pillow_image.size)) // 2,
-    ))
+            # 縦横どちらか長さが短い方に合わせて正方形にクロップ
+            # crop() で遅延デコードも完了させ、不正な画像を保存処理へ進めない
+            pillow_image_crop = pillow_image.crop((
+                (pillow_image.size[0] - min(pillow_image.size)) // 2,
+                (pillow_image.size[1] - min(pillow_image.size)) // 2,
+                (pillow_image.size[0] + min(pillow_image.size)) // 2,
+                (pillow_image.size[1] + min(pillow_image.size)) // 2,
+            ))
 
-    # リサイズして保存
-    pillow_image_resize = pillow_image_crop.resize((RESIZE_WIDTH_AND_HEIGHT, RESIZE_WIDTH_AND_HEIGHT))
+            # デコード済み画像を保存用サイズへ変換する
+            pillow_image_resize = pillow_image_crop.resize((RESIZE_WIDTH_AND_HEIGHT, RESIZE_WIDTH_AND_HEIGHT))
+    except (OSError, Image.DecompressionBombError) as ex:
+        raise UnidentifiedImageError('Uploaded file is not a valid JPEG or PNG image.') from ex
+
+    # 保存先の権限・容量・I/O エラーは入力不正ではないため、422 に変換せず呼び出し元へ伝播させる
     pillow_image_resize.save(save_path, 'PNG')
 
 
@@ -833,9 +840,19 @@ async def UserUpdateIconAPI(
             detail = 'Please upload JPEG or PNG image',
         )
 
-    # 正方形の PNG にリサイズして保存
+    # 実データも JPEG / PNG のときだけ、正方形の PNG にリサイズして保存
     # 保存先ファイルパス: (ユーザー ID を0埋めしたもの).png
-    await asyncio.to_thread(ResizeAndSaveIcon, image.file, ACCOUNT_ICON_DIR / f'{current_user.id:02}.png')
+    try:
+        await asyncio.to_thread(ResizeAndSaveIcon, image.file, ACCOUNT_ICON_DIR / f'{current_user.id:02}.png')
+    except UnidentifiedImageError as ex:
+        logging.warning(
+            f'[UsersRouter][UserUpdateIconAPI] Invalid JPEG or PNG image was uploaded. '
+            f'[error_type: {type(ex).__name__}]',
+        )
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Please upload valid JPEG or PNG image',
+        ) from ex
 
 
 @router.delete(
