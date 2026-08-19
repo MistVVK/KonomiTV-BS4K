@@ -147,7 +147,7 @@ async def ClientSettingsUpdateAPI(
         ## Pydantic モデルのままだと JSON にシリアライズできないので怒られる
         ## mode='json' で非有限値が残らない形に正規化する
         user.client_settings = client_settings.model_dump(mode='json')
-        await user.save()
+        await user.save(update_fields=['client_settings', 'updated_at'])
 
 
 @router.get(

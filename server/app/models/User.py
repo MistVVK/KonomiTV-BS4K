@@ -109,6 +109,7 @@ class User(TortoiseModel):
         ## 仕様上リフレッシュトークンに有効期限はないが、一応このタイミングでリフレッシュトークンも更新することが推奨されている
         self.niconico_access_token = str(token_api_response_json['access_token'])
         self.niconico_refresh_token = str(token_api_response_json['refresh_token'])
+        update_fields = ['niconico_access_token', 'niconico_refresh_token', 'updated_at']
 
         try:
             # ついでなので、このタイミングでユーザー情報を取得し直す
@@ -124,10 +125,11 @@ class User(TortoiseModel):
                 self.niconico_user_name = str(user_api_response.json()['data']['user']['nickname'])
                 # プレミアム会員かどうか
                 self.niconico_user_premium = bool(user_api_response.json()['data']['user']['isPremium'])
+                update_fields.extend(['niconico_user_name', 'niconico_user_premium'])
 
         # 接続エラー（サーバー再起動やタイムアウトなど）
         except (httpx.NetworkError, httpx.TimeoutException):
             pass  # 取れなくてもセッション取得に支障はないのでパス
 
-        # 変更をデータベースに保存
-        await self.save()
+        # 外部 API の応答待ち中に更新されたパスワードや設定を古いモデルで上書きしないよう、変更列だけを保存
+        await self.save(update_fields=update_fields)

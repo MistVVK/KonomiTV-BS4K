@@ -763,16 +763,18 @@ async def UserUpdateAPI(
                 detail = 'Specified username is duplicated',
             ) from ex
     else:
-        # パスワードを変更しない場合は従来どおりユーザー名などだけを保存する
+        # パスワードを変更しない場合は、指定されたユーザー名だけを保存する
         ## UNIQUE 制約があるため、同時更新でユーザー名が重複した場合は IntegrityError が発生する
-        try:
-            await current_user.save()
-        except IntegrityError as ex:
-            logging.warning(f'[UsersRouter][UserUpdateAPI] Specified username is duplicated. [username: {user_update_request.username}]')
-            raise HTTPException(
-                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail = 'Specified username is duplicated',
-            ) from ex
+        ## dependency 解決後に並行更新されたパスワード・token_version・権限・設定を古いモデルで上書きしない
+        if user_update_request.username is not None:
+            try:
+                await current_user.save(update_fields=['name', 'updated_at'])
+            except IntegrityError as ex:
+                logging.warning(f'[UsersRouter][UserUpdateAPI] Specified username is duplicated. [username: {user_update_request.username}]')
+                raise HTTPException(
+                    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail = 'Specified username is duplicated',
+                ) from ex
 
 
 @router.get(
@@ -866,7 +868,10 @@ async def UserDeleteAPI(
             id_young_user = await User.all().order_by('id').using_db(connection).first()
             if id_young_user is not None:
                 id_young_user.is_admin = True
-                await id_young_user.save(using_db = connection)
+                await id_young_user.save(
+                    using_db = connection,
+                    update_fields = ['is_admin', 'updated_at'],
+                )
 
 
 # ***** 指定ユーザーアカウント情報 API (管理者用) *****
@@ -1001,4 +1006,7 @@ async def SpecifiedUserDeleteAPI(
             id_young_user = await User.all().order_by('id').using_db(connection).first()
             if id_young_user is not None:
                 id_young_user.is_admin = True
-                await id_young_user.save(using_db = connection)
+                await id_young_user.save(
+                    using_db = connection,
+                    update_fields = ['is_admin', 'updated_at'],
+                )
