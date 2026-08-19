@@ -134,6 +134,9 @@ const updateTwitterCookieRules = async () => {
         },
         condition: {
           regexFilter: `^https://${escapeRegex(requestTarget.hostname)}(?::\\d+)?${escapedCookiePath}${pathSuffix}`,
+          // API 要求の起点は KonomiTV ではなく、iframe 内の x.com または x.com の Service Worker になる
+          // x.com 起点に限定し、任意の外部サイトが発行した要求へ認証 Cookie を付加しない
+          initiatorDomains: ['x.com'],
           resourceTypes: ['xmlhttprequest', 'ping', 'other'],
         },
       });
