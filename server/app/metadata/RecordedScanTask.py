@@ -117,6 +117,9 @@ class RecordedScanTask:
 
     # watcher event が欠落しても別 host 書き込みを発見するための強制再スキャン間隔
     RECONCILIATION_INTERVAL_SECONDS: ClassVar[int] = 900
+    # watcher が一時的に停止した際の再起動間隔。連続失敗時は上限まで指数的に延ばす。
+    WATCH_RESTART_INITIAL_BACKOFF_SECONDS: ClassVar[float] = 1.0
+    WATCH_RESTART_MAX_BACKOFF_SECONDS: ClassVar[float] = 60.0
     # Docker 上で host / を参照する bind 先
     DOCKER_HOST_ROOTFS: ClassVar[pathlib.Path] = pathlib.Path('/host-rootfs')
 
@@ -391,8 +394,8 @@ class RecordedScanTask:
             await asyncio.gather(
                 # サーバー起動時の一括スキャン・同期を実行
                 self.runBatchScan(),
-                # 録画フォルダの監視を開始
-                self.watchRecordedFolders(),
+                # 録画フォルダの監視を開始し、一時障害で停止した場合は再起動する
+                self.__runRecordedFolderWatchSupervisor(),
                 # NFS/CIFS 向けの低頻度 reconciliation
                 self.__runPeriodicReconciliation(),
             )
@@ -402,6 +405,51 @@ class RecordedScanTask:
             logging.error('Error in RecordedScanTask:', exc_info=ex)
         finally:
             self._is_running = False
+
+
+    async def __runRecordedFolderWatchSupervisor(self) -> None:
+        """録画フォルダ監視を一時障害から再起動し、キャンセルだけは即座に伝播する。
+
+        Returns:
+            None
+        """
+
+        restart_backoff = self.WATCH_RESTART_INITIAL_BACKOFF_SECONDS
+        while self._is_running:
+            watch_started_at = asyncio.get_running_loop().time()
+            try:
+                await self.watchRecordedFolders()
+                # stop() と同時に watcher が正常終了した場合は再起動しない。
+                if self._is_running is False:
+                    return
+                # 上限時間以上は安定稼働できた場合、過去の一時障害を連続失敗として持ち越さない。
+                if asyncio.get_running_loop().time() - watch_started_at >= self.WATCH_RESTART_MAX_BACKOFF_SECONDS:
+                    restart_backoff = self.WATCH_RESTART_INITIAL_BACKOFF_SECONDS
+                logging.warning(
+                    'File system watch of recording folders stopped unexpectedly. '
+                    f'Restarting in {restart_backoff:g}s.'
+                )
+            except asyncio.CancelledError:
+                # shutdown を再起動待ちへ変換せず、run() と stop() へ即座に伝播する。
+                raise
+            except Exception as ex:
+                # watchfiles は root 不在や権限・I/O 異常を例外として送出する。
+                # root が復旧するまで再生成を続けるが、連続失敗時のログ洪水と busy loop は抑止する。
+                if self._is_running is False:
+                    return
+                if asyncio.get_running_loop().time() - watch_started_at >= self.WATCH_RESTART_MAX_BACKOFF_SECONDS:
+                    restart_backoff = self.WATCH_RESTART_INITIAL_BACKOFF_SECONDS
+                logging.error(
+                    'File system watch of recording folders failed. '
+                    f'Restarting in {restart_backoff:g}s.',
+                    exc_info=ex,
+                )
+
+            await asyncio.sleep(restart_backoff)
+            restart_backoff = min(
+                restart_backoff * 2,
+                self.WATCH_RESTART_MAX_BACKOFF_SECONDS,
+            )
 
 
     async def runBatchScan(self) -> None:
@@ -1838,6 +1886,7 @@ class RecordedScanTask:
 
         # 監視対象のディレクトリを設定
         watch_paths = [str(path) for path in self.recorded_folders]
+        watch_path_set = {pathlib.Path(path) for path in watch_paths}
 
         # スキャン対象から除外するフォルダ
         # 空文字列は全パスにマッチしてしまうため除外する
@@ -1866,6 +1915,10 @@ class RecordedScanTask:
                         break
 
                     file_path = anyio.Path(file_path_str)
+                    # Linux の inotify は監視 root 自体の削除後も generator を終了せず、同じ path が
+                    # 再作成されても新 inode を監視しない。監督ループで watcher を作り直して追従する。
+                    if change_type == Change.deleted and pathlib.Path(file_path_str) in watch_path_set:
+                        raise FileNotFoundError(f'Recorded folder watch root disappeared: {file_path_str}')
                     # chapter判定や録画拡張子判定より先に、CM解析workspaceの全イベントを除外する。
                     if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(file_path_str)):
                         continue
@@ -1914,8 +1967,6 @@ class RecordedScanTask:
 
         except asyncio.CancelledError:
             raise
-        except Exception as ex:
-            logging.error('Error in file system watch of recording folders:', exc_info=ex)
         finally:
             completion_check_task.cancel()
             try:
