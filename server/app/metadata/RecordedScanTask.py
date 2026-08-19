@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import os
 import pathlib
+import stat
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -260,17 +261,24 @@ class RecordedScanTask:
 
 
     @classmethod
-    async def iterRecordedFolderPaths(cls, folder: anyio.Path) -> AsyncGenerator[anyio.Path, None]:
+    async def iterRecordedFolderPaths(
+        cls,
+        folder: anyio.Path,
+        successfully_scanned_directories: set[pathlib.Path] | None = None,
+    ) -> AsyncGenerator[anyio.Path, None]:
         """CM解析workspaceを枝刈りしながら録画フォルダを列挙する。
 
         Args:
             folder: 列挙を開始する設定済み録画フォルダ。
+            successfully_scanned_directories: scandirが最後まで成功したディレクトリの記録先。
 
         Yields:
             workspace予約rootとその配下を除くファイル・ディレクトリ。
         """
 
-        directories = [pathlib.Path(str(folder))]
+        folder_path = pathlib.Path(str(folder))
+        canonical_folder = pathlib.Path(str(await cls.resolveRecordedPath(folder)))
+        directories = [folder_path]
         while directories:
             directory = directories.pop()
             try:
@@ -278,6 +286,14 @@ class RecordedScanTask:
             except OSError as ex:
                 logging.warning(f'{directory}: Failed to scan directory:', exc_info=ex)
                 continue
+            # scandirが途中で失敗した場合は_scanDirectory()自体が例外を送出するため、
+            # ここへ到達したディレクトリだけが直下エントリを完全に確認できたと判断できる。
+            if successfully_scanned_directories is not None:
+                successfully_scanned_directories.add(directory)
+                # 設定root自体がsymlinkの場合、DBには録画のcanonical pathが保存される。
+                # 列挙に使ったpathとcanonical pathの両方を記録し、同じ走査成功を対応付ける。
+                relative_directory = directory.relative_to(folder_path)
+                successfully_scanned_directories.add(canonical_folder / relative_directory)
             for entry_path, is_directory in entries:
                 if CMAnalysisWorkspace.isWorkspacePath(entry_path):
                     if is_directory and CMAnalysisWorkspace.isWorkspaceRootName(entry_path.name):
@@ -533,8 +549,9 @@ class RecordedScanTask:
         logging.info('Scanning recorded folders...')
         processed_canonical_paths: set[str] = set()
         cleaned_symlink_target_parents: set[pathlib.Path] = set()
+        successfully_scanned_directories: set[pathlib.Path] = set()
         for folder in self.recorded_folders:
-            async for file_path in self.iterRecordedFolderPaths(folder):
+            async for file_path in self.iterRecordedFolderPaths(folder, successfully_scanned_directories):
                 try:
                     # CM解析のcanonical MKVなどは録画と同じFSへ置くため、名前空間ごと最優先で除外する。
                     if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(file_path))):
@@ -606,7 +623,10 @@ class RecordedScanTask:
             self._batch_scan_pipeline_tasks.clear()
 
         # 存在しない録画ファイルに対応するレコードを一括削除
-        await self.__cleanupNonExistentRecordedVideoRecords(existing_db_recorded_videos)
+        await self.__cleanupNonExistentRecordedVideoRecords(
+            existing_db_recorded_videos,
+            successfully_scanned_directories,
+        )
 
         # DB に存在する全ての RecordedVideo レコードのハッシュを取得
         logging.info('Gathering all recorded video hashes...')
@@ -696,11 +716,13 @@ class RecordedScanTask:
     async def __cleanupNonExistentRecordedVideoRecords(
         self,
         existing_db_recorded_videos: dict[anyio.Path, RecordedVideoSummary],
+        successfully_scanned_directories: set[pathlib.Path],
     ) -> None:
         """存在しない録画ファイルのDBレコードを、削除再試行状態を保護しながら回収する。
 
         Args:
             existing_db_recorded_videos: batch scan後もファイルとの対応を確認できなかった録画の一覧。
+            successfully_scanned_directories: scandirが最後まで成功したディレクトリの一覧。
 
         Returns:
             None
@@ -708,13 +730,38 @@ class RecordedScanTask:
 
         # トランザクション配下でまとめて削除することで、大量の消失レコードがある場合のDB処理を高速化する
         logging.info('Deleting records for non-existent files...')
+        unverified_record_count = 0
         async with transactions.in_transaction():
             for index, (file_path, existing_recorded_video_summary) in enumerate(
                 existing_db_recorded_videos.items(),
                 start=1,
             ):
+                # 直親のscandirに成功していない場合、未検出はファイル消失ではなくNAS切断・権限異常などの
+                # 一時的な走査失敗である可能性がある。失敗したsubtreeだけをfail-closedで保持する。
+                file_parent = pathlib.Path(str(file_path)).parent
+                if file_parent not in successfully_scanned_directories:
+                    unverified_record_count += 1
+                    if index % 50 == 0:
+                        # 大量の保持対象がある場合もイベントループへ定期的に制御を返す。
+                        await asyncio.sleep(0)
+                    continue
+
+                # is_file()は権限・I/OエラーもFalseへ畳むため、破壊的cleanupではstat()を直接使う。
+                # 明確な不在または通常ファイル以外への置換だけを消失とし、アクセス不能時はfail-closedで保持する。
+                try:
+                    file_stat = await file_path.stat()
+                    is_file_missing = stat.S_ISREG(file_stat.st_mode) is False
+                except FileNotFoundError:
+                    is_file_missing = True
+                except OSError as ex:
+                    logging.warning(f'{file_path}: Preserved record because file existence could not be verified:', exc_info=ex)
+                    if index % 50 == 0:
+                        # アクセス不能な録画が大量にある場合もイベントループへ定期的に制御を返す。
+                        await asyncio.sleep(0)
+                    continue
+
                 # ファイルが消失した録画だけをDBレコード回収の対象にする
-                if not await self.isFileExists(file_path):
+                if is_file_missing is True:
                     # 削除APIが録画本体を削除した後に失敗したレコードは、同じAPIからの再試行対象として保持する
                     # ここでDBを消すと未削除の補助ファイルを辿れなくなるため、自動回収の対象から除外する
                     if existing_recorded_video_summary.status in ('Deleting', 'DeleteFailed'):
@@ -738,6 +785,13 @@ class RecordedScanTask:
                 if index % 50 == 0:
                     # 既存レコードの走査がイベントループを占有し続けないよう適宜制御を返す
                     await asyncio.sleep(0)
+
+        # NAS切断時などに録画件数分のwarningを出さず、保持した総数だけを利用者へ通知する。
+        if unverified_record_count > 0:
+            logging.warning(
+                f'Preserved {unverified_record_count} recorded video record(s) because '
+                'their parent directories were not scanned successfully.'
+            )
 
 
     async def processRecordedFile(

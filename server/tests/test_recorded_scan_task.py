@@ -115,8 +115,8 @@ def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
     summary.status = summary_status
     recorded_program_deleted = False
 
-    async def IsFileExists(_file_path: anyio.Path) -> bool:
-        return False
+    async def Stat(_file_path: anyio.Path) -> None:
+        raise FileNotFoundError
 
     class FakeRecordedProgramQuery:
         excluded_statuses: list[str] = []
@@ -136,7 +136,7 @@ def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
     async def InTransaction() -> AsyncGenerator[None, None]:
         yield
 
-    monkeypatch.setattr(scan_task, 'isFileExists', IsFileExists)
+    monkeypatch.setattr(anyio.Path, 'stat', Stat)
     monkeypatch.setattr(
         'app.metadata.RecordedScanTask.RecordedProgram.filter',
         lambda **conditions: FakeRecordedProgramQuery()
@@ -147,7 +147,8 @@ def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
 
     asyncio.run(
         scan_task._RecordedScanTask__cleanupNonExistentRecordedVideoRecords(  # pyright: ignore[reportPrivateUsage]
-            {file_path: summary}
+            {file_path: summary},
+            {pathlib.Path('/recorded')},
         )
     )
 
