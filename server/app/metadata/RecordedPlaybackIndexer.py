@@ -475,13 +475,16 @@ class RecordedPlaybackIndexer:
                 if future is not None and future.done() is False:
                     future.set_result(False)
             finally:
-                cls._progress.pop(recorded_video_id, None)
                 if priority == 2:
                     await cls.__discardRecordingFileCache(recorded_video_id)
                 cls._queue.task_done()
-                cls._futures.pop(recorded_video_id, None)
-                cls._metadata_seeds.pop(recorded_video_id, None)
-                cls._force_rebuild_ids.discard(recorded_video_id)
+                # キャッシュ返却中に同じ録画が再投入される場合があるため、旧workerが新しい世代の
+                # Futureと付随状態を削除しないよう、取り出し時のFutureとの同一性を確認する。
+                if future is not None and cls._futures.get(recorded_video_id) is future:
+                    cls._progress.pop(recorded_video_id, None)
+                    cls._futures.pop(recorded_video_id, None)
+                    cls._metadata_seeds.pop(recorded_video_id, None)
+                    cls._force_rebuild_ids.discard(recorded_video_id)
 
     @staticmethod
     def __hasActivePlaybackSessions() -> bool:
