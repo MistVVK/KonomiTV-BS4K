@@ -69,8 +69,9 @@ class TwitterGraphQLAPI:
     # ヘッドレスブラウザの自動シャットダウンまでの無操作時間 (秒)
     BROWSER_IDLE_TIMEOUT = 60
 
-    # Twitter アカウント ID ごとのシングルトンインスタンスを管理する辞書
-    __instances: ClassVar[dict[int | None, TwitterGraphQLAPI]] = {}
+    # 永続化済み Twitter アカウントの ID ごとのシングルトンインスタンスを管理する辞書
+    ## 未保存アカウントは ID がすべて None になるため、Cookie 認証同士を混在させないよう登録しない
+    __instances: ClassVar[dict[int, TwitterGraphQLAPI]] = {}
 
     # 必ず Twitter アカウント ID ごとに1つのインスタンスになるように (Singleton)
     def __new__(cls, twitter_account: TwitterAccount) -> TwitterGraphQLAPI:
@@ -86,10 +87,14 @@ class TwitterGraphQLAPI:
             TwitterGraphQLAPI: Twitter GraphQL API クライアントのインスタンス
         """
 
+        # 未保存アカウントは認証リクエストごとに独立させ、永続化済みアカウントだけ ID で共有する
+        twitter_account_id = twitter_account.id
+        instance = cls.__instances.get(twitter_account_id) if twitter_account_id is not None else None
+
         # まだ同じ Twitter アカウント ID のインスタンスがないときだけ、インスタンスを生成する
         ## __new__ は同期メソッドで await がないため、実行中は他のコルーチンに切り替わらない
         ## そのため、__instances へのアクセスはアトミックであり、ロックは不要
-        if twitter_account.id not in cls.__instances:
+        if instance is None:
 
             # 新しいインスタンスを作成する
             instance = super().__new__(cls)
@@ -123,20 +128,20 @@ class TwitterGraphQLAPI:
             # 一定回数連続で失敗したらブラウザを再起動し、フレッシュな状態で再挑戦する
             instance._consecutive_compose_failures = 0
 
-            # 生成したインスタンスを登録する
-            cls.__instances[twitter_account.id] = instance
+            # 永続化済みアカウントの場合だけ、生成したインスタンスを ID で登録する
+            if twitter_account_id is not None:
+                cls.__instances[twitter_account_id] = instance
         else:
             # 既存インスタンスが見つかった場合、twitter_account の情報を更新する
             ## DB から取得した新鮮な twitter_account の情報で既存インスタンスを更新することで、認証情報の変更などが反映される
-            existing_instance = cls.__instances[twitter_account.id]
-            existing_instance.twitter_account = twitter_account
+            instance.twitter_account = twitter_account
 
             # browser インスタンスが持っている twitter_account も更新する
             ## 次回 setup() が呼ばれた際に新しい Cookie が使われるようになる
-            existing_instance._browser.twitter_account = twitter_account
+            instance._browser.twitter_account = twitter_account
 
-        # 登録されているインスタンスを返す
-        return cls.__instances[twitter_account.id]
+        # 未保存アカウントでは独立インスタンス、永続化済みアカウントでは登録済みインスタンスを返す
+        return instance
 
     def __init__(self, twitter_account: TwitterAccount) -> None:
         """
@@ -166,6 +171,29 @@ class TwitterGraphQLAPI:
         """
         return f'[TwitterGraphQLAPI][@{self.twitter_account.screen_name}]'
 
+    async def shutdown(self) -> None:
+        """
+        このインスタンスが保持するシャットダウンタスクとヘッドレスブラウザを破棄する
+
+        Returns:
+            None
+        """
+
+        # シャットダウンタスクをキャンセルし、後から同じブラウザへ触れないようにする
+        async with self._shutdown_task_lock:
+            if self._shutdown_task is not None:
+                if not self._shutdown_task.done():
+                    self._shutdown_task.cancel()
+                self._shutdown_task = None
+
+        # セットアップ済みのヘッドレスブラウザだけをシャットダウンする
+        ## shutdown() が例外を投げてもレジストリの差し替えや認証エラー処理は継続させる
+        if self._browser.is_setup_complete is True:
+            try:
+                await self._browser.shutdown()
+            except Exception as ex:
+                logging.error(f'{self.log_prefix} Failed to shutdown browser:', exc_info=ex)
+
     @classmethod
     async def removeInstance(cls, twitter_account_id: int) -> None:
         """
@@ -173,66 +201,47 @@ class TwitterGraphQLAPI:
 
         Args:
             twitter_account_id (int): 削除する Twitter アカウントの ID
+
+        Returns:
+            None
         """
 
-        # __instances へのアクセスは await がないためアトミックであり、ロックは不要
-        ## __new__ は同期メソッドで await がないため、実行中は他のコルーチンに切り替わらない
-        ## removeInstance の __instances へのアクセス部分（チェック・取得・削除）も await がないため、その部分はアトミック
-        if twitter_account_id in cls.__instances:
-            instance = cls.__instances[twitter_account_id]
-            # シャットダウンタスクをキャンセル
-            ## 複数の同時リクエスト完了時の競合状態を防ぐため、ロックで保護する
-            async with instance._shutdown_task_lock:
-                if instance._shutdown_task is not None:
-                    if not instance._shutdown_task.done():
-                        instance._shutdown_task.cancel()
-                    instance._shutdown_task = None
-            # ヘッドレスブラウザをシャットダウン
-            ## browser.shutdown() が例外を投げた場合でもレジストリエントリは確実に削除する必要があるため、try/except で囲む
-            if instance._browser is not None and instance._browser.is_setup_complete is True:
-                try:
-                    await instance._browser.shutdown()
-                except Exception as ex:
-                    logging.error(f'Failed to shutdown browser for Twitter account {twitter_account_id}:', exc_info=ex)
-            # レジストリエントリを削除
-            del cls.__instances[twitter_account_id]
+        # await より先にレジストリから取り除き、終了処理中に同じインスタンスが再利用されるのを防ぐ
+        instance = cls.__instances.pop(twitter_account_id, None)
+        if instance is None:
+            return
+
+        await instance.shutdown()
 
     @classmethod
-    async def rebindInstance(cls, previous_account_id: int | None, twitter_account: TwitterAccount) -> None:
+    async def registerInstance(cls, instance: TwitterGraphQLAPI, twitter_account: TwitterAccount) -> None:
         """
-        Temporary アカウントで初期化したシングルトンを実際の Twitter アカウント ID に付け替える。
+        Cookie 認証専用の一時インスタンスを永続化済み Twitter アカウントの ID で登録する。
 
         Args:
-            previous_account_id (int | None): Temporary 状態の Twitter アカウント ID。
+            instance (TwitterGraphQLAPI): Cookie 認証リクエスト専用の一時インスタンス。
             twitter_account (TwitterAccount): 永続化済みの Twitter アカウントモデル。
+
+        Returns:
+            None
         """
 
         # 永続化済みの Twitter アカウント ID が取得できない場合は異常
         if twitter_account.id is None:
-            logging.error('[TwitterGraphQLAPI][rebindInstance] twitter_account.id is None. Skip rebinding.')
+            logging.error('[TwitterGraphQLAPI][registerInstance] twitter_account.id is None. Skip registration.')
             return
 
-        # ID の変化が無い場合は情報だけ更新する
-        if previous_account_id == twitter_account.id:
-            instance = cls.__instances.get(twitter_account.id)
-            if instance is not None:
-                instance.twitter_account = twitter_account
-                instance._browser.twitter_account = twitter_account
-            return
-
-        # Temporary なインスタンスが存在しない場合は何もしない
-        if previous_account_id not in cls.__instances:
-            return
-
-        instance = cls.__instances.pop(previous_account_id)
-
-        # 既に同じ ID に紐づくインスタンスが存在していた場合はリソースリークを防ぐため破棄する
-        await cls.removeInstance(twitter_account.id)
-
-        # インスタンスに最新の Twitter アカウント情報を適用し、新しい ID で登録する
+        # 認証に使った browser と Cookie を維持したまま、永続化後のアカウント情報へ差し替える
         instance.twitter_account = twitter_account
         instance._browser.twitter_account = twitter_account
+
+        # await より先に新しいインスタンスを登録し、同じ ID の再認証が重なっても最後の登録へ収束させる
+        previous_instance = cls.__instances.get(twitter_account.id)
         cls.__instances[twitter_account.id] = instance
+
+        # 再認証前の古い browser が残っている場合は、新しいインスタンスの登録後に回収する
+        if previous_instance is not None and previous_instance is not instance:
+            await previous_instance.shutdown()
 
     async def __scheduleShutdownTask(self) -> None:
         """

@@ -654,7 +654,8 @@ async def TwitterCookieAuthAPI(
     # TwitterAccount のレコードを作成
     ## アクセストークンは "NETSCAPE_COOKIE_FILE" の固定値、
     ## アクセストークンシークレットとして Netscape 形式の Cookie ファイルの内容をそのまま保存する
-    ## ここでは ORM インスタンスのみを作成し、実際にログイン中の Twitter アカウント情報を取得できた段階で DB に保存する
+    ## ここでは ORM インスタンスのみを作成するが、認証中に更新 Cookie を同期するため先に DB 保存される場合がある
+    ## その場合もプロフィール確定後に明示登録するまでは、TwitterGraphQLAPI の共有レジストリへ登録しない
     twitter_account = TwitterAccount(
         user = current_user,
         name = 'Temporary',
@@ -668,13 +669,15 @@ async def TwitterCookieAuthAPI(
         cookie_browser_info = cookie_browser_info,
     )
 
-    # 一時的に作成した TwitterAccount ORM インスタンスの ID (通常 None) を控えておき、後段でシングルトンを付け替える
-    temporary_account_id = twitter_account.id
+    # 未保存アカウント用の API インスタンスは共有レジストリへ登録せず、この認証リクエストだけで使用する
+    twitter_api = TwitterGraphQLAPI(twitter_account)
 
     # 上記で作成した TwitterAccount ORM インスタンスを使い、現在ログイン中の Twitter アカウント情報を取得
     try:
-        viewer_result = await TwitterGraphQLAPI(twitter_account).fetchLoggedViewer()
+        viewer_result = await twitter_api.fetchLoggedViewer()
     except Exception as ex:
+        # 認証失敗後に一時 browser と Cookie がメモリ上へ残り続けないよう即座に回収する
+        await twitter_api.shutdown()
         logging.error('[TwitterRouter][TwitterCookieAuthAPI] Failed to get user information:', exc_info=ex)
         raise HTTPException(
             status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -683,6 +686,7 @@ async def TwitterCookieAuthAPI(
 
     # ユーザー情報の取得に失敗した場合
     if isinstance(viewer_result, schemas.TwitterAPIResult) and viewer_result.is_success is False:
+        await twitter_api.shutdown()
         logging.error(f'[TwitterRouter][TwitterCookieAuthAPI] Failed to get user information: {viewer_result.detail}')
         raise HTTPException(
             status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -691,6 +695,7 @@ async def TwitterCookieAuthAPI(
 
     # viewer_result が TweetUser の場合のみ処理を続行
     if not isinstance(viewer_result, schemas.TweetUser):
+        await twitter_api.shutdown()
         logging.error('[TwitterRouter][TwitterCookieAuthAPI] Failed to get user information: Invalid response type')
         raise HTTPException(
             status_code = status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -747,9 +752,9 @@ async def TwitterCookieAuthAPI(
         # 永続化後に使う TwitterAccount を設定
         persisted_account = twitter_account
 
-    # Temporary で立ち上げた GraphQL API インスタンスを永続化後の ID に紐づけ直す
+    # 認証専用で立ち上げた GraphQL API インスタンスを、永続化後に初めて実 ID で登録する
     if persisted_account is not None:
-        await TwitterGraphQLAPI.rebindInstance(temporary_account_id, persisted_account)
+        await TwitterGraphQLAPI.registerInstance(twitter_api, persisted_account)
         twitter_account = persisted_account
 
     # 古い形式のレコード (access_token が "NETSCAPE_COOKIE_FILE" でない) を自動削除
