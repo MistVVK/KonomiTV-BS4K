@@ -221,11 +221,14 @@ class PlayerController {
     private rain_fallback_watchers: (() => void)[] = [];
 
     // 破棄中かどうか
-    // 破棄中は destroy() が呼ばれても何もしない
     private destroying = false;
 
     // 破棄済みかどうか
     private destroyed = false;
+
+    // 進行中の破棄処理
+    // route 更新と unmount が重なっても、すべての呼び出し元が同じ cleanup の完了を待つために保持する
+    private destroy_promise: Promise<void> | null = null;
 
     // 視聴画面の寿命。route離脱後の能力API応答が共有StoreやDOMを書き戻さないように使う。
     private readonly owner_signal: AbortSignal | null;
@@ -410,15 +413,20 @@ class PlayerController {
     }
 
 
-    /** 非同期初期化が現在のroute/再生対象に属することを確実にする。 */
-    private assertInitializationIsCurrent(generation: number, playback_target_key: string): void {
-        if (
+    /** 非同期初期化が現在の route / 再生対象に属するかを返す。 */
+    private isInitializationCurrent(generation: number, playback_target_key: string): boolean {
+        return !(
             this.owner_signal?.aborted === true ||
             generation !== this.initialization_generation ||
             this.destroying === true ||
             this.destroyed === true ||
             this.getPlaybackTargetKey() !== playback_target_key
-        ) {
+        );
+    }
+
+    /** 非同期初期化が現在の route / 再生対象に属することを確実にする。 */
+    private assertInitializationIsCurrent(generation: number, playback_target_key: string): void {
+        if (this.isInitializationCurrent(generation, playback_target_key) === false) {
             throw new DOMException('Player initialization was superseded.', 'AbortError');
         }
     }
@@ -1033,6 +1041,11 @@ class PlayerController {
                         } else {
                             jikkyo_comments = await Videos.fetchVideoJikkyoComments(player_store.recorded_program.id);
                         }
+                        // 取得中に route 離脱・再初期化された場合、旧録画のコメントを共有 Store へ反映しない
+                        if (
+                            this.player === null ||
+                            this.isInitializationCurrent(initialization_generation, playback_target_key) === false
+                        ) return;
                         if (jikkyo_comments.is_success === false) {
                             // 取得に失敗した場合はコメントリストにエラーメッセージを表示する
                             // ただし「この録画番組の過去ログコメントは存在しないか、現在取得中です。」の場合はエラー扱いしない
@@ -1072,6 +1085,10 @@ class PlayerController {
                             comment_seek_seconds = seek_seconds;
                         }
                         await Utils.sleep(0.1);  // 仮想スクローラーの準備ができるまで少し待つ
+                        if (
+                            this.player === null ||
+                            this.isInitializationCurrent(initialization_generation, playback_target_key) === false
+                        ) return;
                         player_store.event_emitter.emit('PlaybackPositionChanged', {
                             playback_position: comment_seek_seconds,
                         });
@@ -1295,8 +1312,10 @@ class PlayerController {
                         // resume() するまでに何らかのユーザーのジェスチャーが行われているはず…
                         // なくても動くこともあるみたいだけど、念のため
                         await this.romsounds_ready;
+                        if (this.isInitializationCurrent(initialization_generation, playback_target_key) === false) return;
                         if (this.romsounds_context.state === 'suspended') {
                             await this.romsounds_context.resume();
+                            if (this.isInitializationCurrent(initialization_generation, playback_target_key) === false) return;
                         }
                         // index で指定された音声データを読み込み
                         const buffer = this.romsounds_buffers.get(index);
@@ -1394,7 +1413,10 @@ class PlayerController {
                 let restore_after_fetch = false;
                 let subtitle_generation = 0;
                 const fetch_arib_subtitle = async (restore: boolean = false): Promise<void> => {
-                    if (this.player === null) return;
+                    if (
+                        this.player === null ||
+                        this.isInitializationCurrent(initialization_generation, playback_target_key) === false
+                    ) return;
                     if (is_fetching === true) {
                         // 画質切り替えやシーク中なら、進行中の取得完了後に新しい再生位置から状態を復元する。
                         restore_after_fetch ||= restore;
@@ -1415,6 +1437,7 @@ class PlayerController {
                         if (
                             response.type === 'success' &&
                             this.player !== null &&
+                            this.isInitializationCurrent(initialization_generation, playback_target_key) &&
                             fetch_generation === subtitle_generation
                         ) {
                             const decode = (data: string): Uint8Array => Uint8Array.from(atob(data), (character) =>
@@ -1432,7 +1455,10 @@ class PlayerController {
                         }
                     } finally {
                         is_fetching = false;
-                        if (restore_after_fetch === true) {
+                        if (
+                            restore_after_fetch === true &&
+                            this.isInitializationCurrent(initialization_generation, playback_target_key)
+                        ) {
                             restore_after_fetch = false;
                             void fetch_arib_subtitle(true);
                         }
@@ -1470,7 +1496,11 @@ class PlayerController {
                 let restore_after_fetch = false;
                 let subtitle_generation = 0;
                 const fetch_arib_ttml = async (restore: boolean = false): Promise<void> => {
-                    if (this.player === null || this.arib_ttml_renderer === null) return;
+                    if (
+                        this.player === null ||
+                        this.arib_ttml_renderer === null ||
+                        this.isInitializationCurrent(initialization_generation, playback_target_key) === false
+                    ) return;
                     if (is_fetching === true) {
                         restore_after_fetch ||= restore;
                         return;
@@ -1503,6 +1533,7 @@ class PlayerController {
                             response.type === 'success' &&
                             this.player !== null &&
                             this.arib_ttml_renderer !== null &&
+                            this.isInitializationCurrent(initialization_generation, playback_target_key) &&
                             fetch_generation === subtitle_generation
                         ) {
                             const decode = (data: string): Uint8Array => Uint8Array.from(atob(data), (character) =>
@@ -1524,7 +1555,10 @@ class PlayerController {
                         }
                     } finally {
                         is_fetching = false;
-                        if (restore_after_fetch === true) {
+                        if (
+                            restore_after_fetch === true &&
+                            this.isInitializationCurrent(initialization_generation, playback_target_key)
+                        ) {
                             restore_after_fetch = false;
                             void fetch_arib_ttml(true);
                         }
@@ -1758,8 +1792,11 @@ class PlayerController {
             // 通知を表示してから PlayerController を破棄すると DPlayer の DOM 要素ごと消えてしまうので、DPlayer を作り直した後に通知を表示する
             assert(this.player !== null);
             if (event.message) {
+                const restarted_generation = this.initialization_generation;
+                const restarted_playback_target_key = this.getPlaybackTargetKey();
                 // 遅延時間が指定されていれば待つ
                 await Utils.sleep(event.message_delay_seconds ?? 0);
+                if (this.isInitializationCurrent(restarted_generation, restarted_playback_target_key) === false) return;
                 // 明示的にエラーメッセージではないことが指定されていればデフォルトの色で通知を表示する
                 // デフォルトではメッセージは赤色で表示される
                 const color = event.is_error_message === false ? undefined : 'rgb(var(--v-theme-error-readable))';
@@ -1825,6 +1862,11 @@ class PlayerController {
         // 待つ必要はないので非同期で実行
         if ('wakeLock' in navigator) {
             navigator.wakeLock.request('screen').then((wake_lock) => {
+                // request() 待機中に破棄・再初期化された場合、旧世代の Wake Lock を保持せず即座に解放する
+                if (this.isInitializationCurrent(initialization_generation, playback_target_key) === false) {
+                    void wake_lock.release();
+                    return;
+                }
                 this.screen_wake_lock = wake_lock;  // 後で解除するために WakeLockSentinel を保持
                 console.log('\u001b[31m[PlayerController] Screen Wake Lock API: Screen Wake Lock acquired.');
             });
@@ -1865,6 +1907,7 @@ class PlayerController {
         // これにより各 PlayerManager での実際の処理が開始される
         // 同期処理すると時間が掛かるので、並行して実行する
         await Promise.all(this.player_managers.map((player_manager) => player_manager.init()));
+        this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
 
         console.log('\u001b[31m[PlayerController] Initialized.');
     }
@@ -1899,45 +1942,56 @@ class PlayerController {
     private async recoverPlayback(): Promise<void> {
         assert(this.player !== null);
         const player_store = usePlayerStore();
+        const player = this.player;
+        const initialization_generation = this.initialization_generation;
+        const playback_target_key = this.getPlaybackTargetKey();
+        const is_current = (): boolean => (
+            this.player === player &&
+            this.isInitializationCurrent(initialization_generation, playback_target_key)
+        );
 
         // 1 秒待つ
         await Utils.sleep(1);
+        if (is_current() === false) return;
 
         // この時点で映像が停止していて、かつ readyState が HAVE_FUTURE_DATA な場合、復旧を試みる
         // Safari ではタイミングによっては this.player.video が null になる場合があるらしいので ? を付ける
-        if (player_store.is_video_buffering === true && this.player?.video?.readyState < 3) {
+        if (player_store.is_video_buffering === true && player.video.readyState < 3) {
             console.warn('\u001b[31m[PlayerController] Video still buffering. (HTMLVideoElement.readyState < HAVE_FUTURE_DATA) Trying to recover.');
 
             // 一旦停止して、0.25 秒間を置く
-            this.player.video.pause();
+            player.video.pause();
             await Utils.sleep(0.25);
+            if (is_current() === false) return;
 
             // 再度再生を試みる
             try {
-                await this.player.video.play();
+                await player.video.play();
             } catch (error) {
-                assert(this.player !== null);
+                if (is_current() === false) return;
                 console.warn('\u001b[31m[PlayerController] HTMLVideoElement.play() rejected. paused.');
-                this.player.pause();
+                player.pause();
                 return;  // 再生開始がリジェクトされた場合はここで終了
             }
 
             // さらに 0.5 秒待った時点で映像が停止している場合、復旧を試みる
             await Utils.sleep(0.5);
-            if (player_store.is_video_buffering === true && this.player?.video?.readyState < 3) {
+            if (is_current() === false) return;
+            if (player_store.is_video_buffering === true && player.video.readyState < 3) {
                 console.warn('\u001b[31m[PlayerController] Video still buffering. (HTMLVideoElement.readyState < HAVE_FUTURE_DATA) Trying to recover.');
 
                 // 一旦停止して、0.25 秒間を置く
-                this.player.video.pause();
+                player.video.pause();
                 await Utils.sleep(0.25);
+                if (is_current() === false) return;
 
                 // 再度再生を試みる
                 try {
-                    await this.player.video.play();
+                    await player.video.play();
                 } catch (error) {
-                    assert(this.player !== null);
+                    if (is_current() === false) return;
                     console.warn('\u001b[31m[PlayerController] (retry) HTMLVideoElement.play() rejected. paused.');
-                    this.player.pause();
+                    player.pause();
                 }
             }
         }
@@ -2036,6 +2090,9 @@ class PlayerController {
         const channels_store = useChannelsStore();
         const player_store = usePlayerStore();
         const settings_store = useSettingsStore();
+        const initialization_generation = this.initialization_generation;
+        const playback_target_key = this.getPlaybackTargetKey();
+        let playback_handler_generation = 0;
 
         // ライブ視聴: 再生停止状態かつ現在の再生位置からバッファが 30 秒以上離れていないかを 60 秒おきに監視し、そうなっていたら強制的にシークする
         // mpegts.js の仕様上、MSE 側に未再生のバッファが貯まり過ぎると新規に SourceBuffer が追加できなくなるため、強制的に接続が切断されてしまう
@@ -2115,6 +2172,16 @@ class PlayerController {
         // 今回 (DPlayer 初期化直後) と画質切り替え開始時の両方のタイミングで実行する必要がある処理
         // mpegts.js などの DPlayer のプラグインは画質切り替え時に一旦破棄されるため、再度イベントハンドラーを登録する必要がある
         const on_init_or_quality_change = async (is_quality_change: boolean = false) => {
+            const current_playback_handler_generation = ++playback_handler_generation;
+            const current_player = this.player;
+            const is_current = (): boolean => (
+                current_playback_handler_generation === playback_handler_generation &&
+                current_player !== null &&
+                this.player === current_player &&
+                this.isInitializationCurrent(initialization_generation, playback_target_key)
+            );
+            if (is_current() === false) return;
+            assert(current_player !== null);
             assert(this.player !== null);
 
             // 画質切り替え時は DPlayer が内蔵字幕レンダラーを再生成するため、再度パッチ済み版へ差し替える。
@@ -2132,7 +2199,11 @@ class PlayerController {
             // 初回実行時はそもそもまだ PlayerManager が一つも初期化されていないので、何も起こらない
             for (const player_manager of this.player_managers) {
                 if (player_manager.restart_required_when_quality_switched === true) {
-                    player_manager.destroy().then(() => player_manager.init());  // 非同期で実行
+                    void player_manager.destroy().then(async () => {
+                        // controller 破棄や次の画質切替が始まっていれば、旧 callback から manager を復活させない
+                        if (is_current() === false || this.player_managers.includes(player_manager) === false) return;
+                        await player_manager.init();
+                    });
                 }
             }
 
@@ -2156,12 +2227,14 @@ class PlayerController {
 
                     // すぐ再起動すると問題があるケースがあるので、少し待機する
                     await Utils.sleep(1);
+                    if (is_current() === false) return;
 
                     // もしこの時点でオフラインの場合、ネットワーク接続の変更による接続切断の可能性が高いので、オンラインになるまで待機する
                     if (navigator.onLine === false) {
                         this.player.notice('現在ネットワーク接続がありません。オンラインになるまで待機しています…', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
                         console.warn('\u001b[31m[PlayerController] mpegts.js error event: Network error. Waiting for online...');
                         await Utils.waitUntilOnline();
+                        if (is_current() === false) return;
                     }
 
                     // PlayerController の再起動を要求する
@@ -2183,6 +2256,7 @@ class PlayerController {
 
                     // すぐ再起動すると問題があるケースがあるので、少し待機する
                     await Utils.sleep(1);
+                    if (is_current() === false) return;
 
                     const media_error = this.player.video.error;
                     if (media_error) {
@@ -2220,6 +2294,7 @@ class PlayerController {
                     const maxAttempts = 5;  // 試行回数
                     const attemptInterval = 0.05;  // 試行間隔 (秒)
                     const attemptPlay = async (): Promise<void> => {
+                        if (is_current() === false) return;
                         if (attempts >= maxAttempts) {
                             console.warn(`\u001b[31m[PlayerController] Failed to start playback after ${maxAttempts} attempts.`);
                             return;
@@ -2231,10 +2306,12 @@ class PlayerController {
                             console.warn(`\u001b[31m[PlayerController] Attempt ${attempts + 1} to start playback failed:`, error);
                             attempts++;
                             await Utils.sleep(attemptInterval);
+                            if (is_current() === false) return;
                             await attemptPlay();
                         }
                     };
                     await attemptPlay();
+                    if (is_current() === false) return;
                 }
 
                 // 再生準備ができた段階で再生バッファを調整し、再生準備ができた段階でローディング中の背景写真を非表示にするイベントハンドラーを登録
@@ -2242,7 +2319,8 @@ class PlayerController {
                 const on_canplay = async () => {
 
                     // 重複実行を回避する
-                    if (this.player === null) return;
+                    if (is_current() === false) return;
+                    assert(this.player !== null);
                     if (on_canplay_called === true) return;
                     this.player.video.oncanplay = null;
                     this.player.video.oncanplaythrough = null;
@@ -2259,10 +2337,11 @@ class PlayerController {
                     // live_playback_buffer_seconds の値は mpegts.js の liveSyncTargetLatency 設定に渡す値と共通
                     const live_playback_buffer_seconds = this.live_playback_buffer_seconds;  // 毎回取得すると負荷が掛かるのでキャッシュする
                     let current_playback_buffer_sec = this.getPlaybackBufferSeconds();
-                    while (current_playback_buffer_sec < live_playback_buffer_seconds) {
+                    while (is_current() && current_playback_buffer_sec < live_playback_buffer_seconds) {
                         await Utils.sleep(0.1);
                         current_playback_buffer_sec = this.getPlaybackBufferSeconds();
                     }
+                    if (is_current() === false) return;
 
                     // 再生バッファ調整のため一旦停止していた再生を再び開始
                     this.player.video.playbackRate = 1;
@@ -2299,6 +2378,7 @@ class PlayerController {
                         const volume_step = current_volume / 10;
                         for (let i = 0; i < 10; i++) {  // 10 回に分けて音量を上げる
                             await Utils.sleep(0.5 / 10);
+                            if (is_current() === false) return;
                             // 音量が current_volume を超えないようにする
                             // 浮動小数点絡みの問題 (丸め誤差) が出るため小数第3位で切り捨てる
                             this.player.video.volume = Math.min(Utils.mathFloor(this.player.video.volume + volume_step, 3), current_volume);
@@ -2316,12 +2396,14 @@ class PlayerController {
                 // 特に Safari 18 以降では MSE の canplay(through) が場合によっては発火しなかったり、発火が異常に遅かったりする…
                 // Safari 18 以降、MSE において canplay(through) の発火タイミングと readyState の値は信頼できない
                 this.player.plugins.mpegts?.on(mpegts.Events.MEDIA_INFO, async (info: {[key: string]: any}) => {
+                    if (is_current() === false) return;
                     console.log('\u001b[31m[PlayerController] mpegts.js media info:', info);
                     this.live_media_info = info;
                     this.applyAudioTrackLabels(info);
                     // 一応ブラウザネイティブの canplay(through) を優先したいので、0.25 秒待ってから再生開始を試みる
                     // 既に再生開始処理を実行済みの場合は実行しない
                     await Utils.sleep(0.25);
+                    if (is_current() === false) return;
                     if (on_canplay_called === false) {
                         console.warn('\u001b[31m[PlayerController] mpegts.js media info fired, but canplay(through) event not fired. Trying to manually start playback.');
                         on_canplay();
@@ -2335,10 +2417,10 @@ class PlayerController {
                 // ほとんどのケースでは 先に上記 mpegts.js の MEDIA_INFO イベントが発火するため、この処理は実行されない
                 (async () => {
                     let have_future_data_count = 0;
-                    while (this.player !== null && this.player.video.readyState < 4) {
+                    while (is_current() && current_player.video.readyState < 4) {
                         // プレイヤーが充分と判断する基準はまちまちでブラウザによっては HAVE_FUTURE_DATA のままタイムアウトするので
                         // HAVE_FUTURE_DATA がおおむね 5 秒つづけば HAVE_ENOUGH_DATA 扱いする
-                        if (this.player.video.readyState < 3) {
+                        if (current_player.video.readyState < 3) {
                             have_future_data_count = 0;
                         } else if (++have_future_data_count > 100) {
                             break;
@@ -2348,6 +2430,7 @@ class PlayerController {
                     // ループを終えた時点で readyState === HAVE_ENOUGH_DATA になっているので、再生開始を試みる
                     // 既に再生開始処理を実行済みの場合は実行しない
                     await Utils.sleep(0.1);
+                    if (is_current() === false) return;
                     if (on_canplay_called === false) {
                         console.warn('\u001b[31m[PlayerController] canplay(through) event not fired. Trying to manually start playback.');
                         on_canplay();
@@ -2357,7 +2440,7 @@ class PlayerController {
                 // もしライブストリームのステータスが ONAir にも関わらず 15 秒以上バッファリング中で canplaythrough が発火しない場合、
                 // ロードに失敗したとみなし PlayerController の再起動を要求する
                 await Utils.sleep(15);
-                if (this.destroyed === true || this.player === null) return;
+                if (is_current() === false) return;
                 if (player_store.live_stream_status === 'ONAir' && player_store.is_video_buffering === true && on_canplay_called === false) {
                     player_store.event_emitter.emit('PlayerRestartRequired', {
                         message: '再生開始までに時間が掛かっています。プレイヤーを再起動しています…',
@@ -2407,7 +2490,8 @@ class PlayerController {
                 const on_canplay = async () => {
 
                     // 重複実行を回避する
-                    if (this.player === null) return;
+                    if (is_current() === false) return;
+                    assert(this.player !== null);
                     if (on_canplay_called === true) return;
                     this.player.video.oncanplaythrough = null;
                     on_canplay_called = true;
@@ -3000,9 +3084,16 @@ class PlayerController {
                 this.is_offline_fallback_in_progress === true
             ) return;
             this.is_offline_fallback_in_progress = true;
+            const fallback_generation = this.initialization_generation;
+            const fallback_playback_target_key = this.getPlaybackTargetKey();
+            const fallback_player = this.player;
             try {
                 const offline_video = await OfflineVideos.getVideo(player_store.recorded_program.id);
-                if (this.destroyed === true || this.player === null || offline_video === null) return;
+                if (
+                    offline_video === null ||
+                    this.player !== fallback_player ||
+                    this.isInitializationCurrent(fallback_generation, fallback_playback_target_key) === false
+                ) return;
                 player_store.recorded_program = offline_video.program;
                 player_store.is_offline_playback = true;
                 player_store.offline_video = offline_video;
@@ -4507,18 +4598,28 @@ class PlayerController {
      * PlayerController の再起動を行う場合、基本外部から直接 await destroy() と await init() は呼び出さず、代わりに
      * player_store.event_emitter.emit('PlayerRestartRequired', 'プレイヤーを再起動しています…') のようにイベントを発火させるべき
      */
-    public async destroy(): Promise<void> {
-        const settings_store = useSettingsStore();
-        const player_store = usePlayerStore();
+    public destroy(): Promise<void> {
 
         // すでに破棄されているのに再度実行してはならない
         if (this.destroyed === true) {
-            return;
+            return Promise.resolve();
         }
-        // すでに破棄中なら何もしない
-        if (this.destroying === true) {
-            return;
+
+        // route 更新や unmount から破棄が重複した場合、先行する cleanup の完了へ合流する
+        if (this.destroy_promise !== null) {
+            return this.destroy_promise;
         }
+
+        this.destroy_promise = this.destroyPlayer();
+        return this.destroy_promise;
+    }
+
+
+    /** 実際の破棄処理を一度だけ実行する。 */
+    private async destroyPlayer(): Promise<void> {
+        const settings_store = useSettingsStore();
+        const player_store = usePlayerStore();
+
         this.destroying = true;
         // この後の非同期cleanup中に古いpreflightが完了しても、Store/DOMを書き戻せない。
         this.initialization_generation += 1;
@@ -4688,6 +4789,7 @@ class PlayerController {
         // 破棄済みかどうかのフラグを立てる
         this.destroying = false;
         this.destroyed = true;
+        this.destroy_promise = null;
 
         // PlayerStore にプレイヤーを破棄したことを通知
         player_store.is_player_initialized = false;

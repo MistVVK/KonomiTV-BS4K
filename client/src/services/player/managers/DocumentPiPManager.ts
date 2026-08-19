@@ -54,6 +54,10 @@ class DocumentPiPManager implements PlayerManager {
     // destroy() で DPlayer 管理下の表示状態を正確に復元するために保持する
     private pip_button_original_display = '';
 
+    // init() ごとの世代番号
+    // requestWindow() 待機中に破棄された旧処理が、視聴画面の DOM を PiP ウインドウへ移動しないために利用する
+    private lifecycle_generation = 0;
+
 
     /**
      * コンストラクタ
@@ -76,6 +80,9 @@ class DocumentPiPManager implements PlayerManager {
         const player_store = usePlayerStore();
         const settings_store = useSettingsStore();
 
+        const lifecycle_generation = ++this.lifecycle_generation;
+        const is_current = (): boolean => this.lifecycle_generation === lifecycle_generation;
+
         // Document Picture-in-Picture API がサポートされていない場合は何もしない
         if (('documentPictureInPicture' in window) === false) {
             console.log('[DocumentPiPManager] Initialized. (Document Picture-in-Picture API is not supported.)');
@@ -85,6 +92,8 @@ class DocumentPiPManager implements PlayerManager {
         // DPlayer 上で Picture-in-Picture が開始された際のイベントを登録
         // HTMLVideoElement.requestPictureInPicture() に上書きしてイベントハンドラーを登録している
         const new_request_picture_in_picture = async () => {
+
+            if (is_current() === false) return {} as PictureInPictureWindow;
 
             // すでに Document Picture-in-Picture が開始されている場合は終了
             // この時 Document Picture-in-Picture ウインドウでは pagehide イベントが発火する
@@ -103,6 +112,7 @@ class DocumentPiPManager implements PlayerManager {
             // Document Picture-in-Picture ウインドウが表示された時のイベントを登録
             // すでに登録されている場合は上書きされる
             documentPictureInPicture.onenter = (event) => {
+                if (is_current() === false) return;
                 console.log('[DocumentPiPManager] Picture-in-Picture window entered.');
                 player_store.is_document_pip = true;
                 // コントロール表示タイマーをリセット
@@ -114,10 +124,23 @@ class DocumentPiPManager implements PlayerManager {
 
             // Document Picture-in-Picture の開始をリクエスト
             // ここで指定する幅・高さはあくまで初期値で、ユーザーが手動でリサイズした後はリサイズ後の値が利用される
-            const pip_window = await documentPictureInPicture.requestWindow({
-                width: 540,
-                height: 304,
-            });
+            let pip_window: Window;
+            try {
+                pip_window = await documentPictureInPicture.requestWindow({
+                    width: 540,
+                    height: 304,
+                });
+            } catch (error) {
+                // 破棄後の reject を旧 DPlayer の通知へ伝播させず、現世代の失敗だけを呼び出し元へ返す
+                if (is_current() === false) return {} as PictureInPictureWindow;
+                throw error;
+            }
+
+            // requestWindow() 待機中に PlayerController が破棄された場合、旧 DOM を移動せずウインドウを閉じる
+            if (is_current() === false) {
+                pip_window.close();
+                return {} as PictureInPictureWindow;
+            }
 
             // requestWindow() が返った直後から外部操作で閉じられ得るため、DOM 準備より先に
             // pagehide を所有する。setup途中で閉じても watch-player を閉じたDocumentへ移さない。
@@ -293,6 +316,7 @@ class DocumentPiPManager implements PlayerManager {
 
         // 画質切り替え後に新しい映像要素が生成されるため、画質切り替え後に再度フックする
         this.player.on('quality_end', () => {
+            if (is_current() === false) return;
             if (!this.player || !this.player.video) {
                 return;
             }
@@ -310,6 +334,9 @@ class DocumentPiPManager implements PlayerManager {
      * Document Picture-in-Picture を開始するイベントハンドラーを削除する
      */
     public async destroy(): Promise<void> {
+
+        // requestWindow() の完了や queued quality_end より先に旧世代を無効化する
+        this.lifecycle_generation += 1;
 
         // Document Picture-in-Picture API がサポートされていない場合は何もしない
         if (('documentPictureInPicture' in window) === false) {
