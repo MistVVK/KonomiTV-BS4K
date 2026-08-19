@@ -130,6 +130,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import Message from '@/message';
 import CMAnalysis, { ICMAnalysisCapabilities, ICMLogo, ICMLogoServiceAssignment } from '@/services/CMAnalysis';
 import useUserStore from '@/stores/UserStore';
+import { dayjs } from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
@@ -262,8 +263,8 @@ async function createLogoAssignment(no_logo: boolean): Promise<void> {
         service_id: assignment_service_id.value,
         enabled: true,
         is_no_logo: no_logo,
-        valid_from: assignment_valid_from.value ? new Date(assignment_valid_from.value).toISOString() : null,
-        valid_until: assignment_valid_until.value ? new Date(assignment_valid_until.value).toISOString() : null,
+        valid_from: assignment_valid_from.value ? dayjs(assignment_valid_from.value).toISOString() : null,
+        valid_until: assignment_valid_until.value ? dayjs(assignment_valid_until.value).toISOString() : null,
     });
     if (result !== null) {
         assignments.value.push(result);

@@ -2465,14 +2465,14 @@ class PlayerController {
         // 番組情報タブ内の NEXT >> を 500ms 以内に3回連続でタップすると統計情報の表示/非表示が切り替わる
         // イベントを重複定義しないように、あえて ontouchstart を使う
         let tap_count = 0;
-        let last_tap = 0;
+        let last_tap: number | null = null;
         const element = document.querySelector<HTMLDivElement>('.program-info__next');
         if (element !== null) {
             element.ontouchstart = () => {
                 if (this.player === null) return;
-                const current_time = new Date().getTime();
-                const time_difference = current_time - last_tap;
-                if (time_difference < 500 && time_difference > 0) {
+                const current_time = performance.now();
+                const time_difference = last_tap === null ? null : current_time - last_tap;
+                if (time_difference !== null && time_difference < 500 && time_difference > 0) {
                     tap_count++;
                     if (tap_count === 3) {
                         this.player.infoPanel.toggle();
@@ -2551,14 +2551,17 @@ class PlayerController {
             // 視聴履歴の更新処理
             // timeupdate イベントを間引いて処理
             // ここで登録したイベントは、destroy() を実行した際にプレイヤーごと破棄される
-            let last_timeupdate_fired_at = 0;
+            let last_timeupdate_fired_at: number | null = null;
             this.player.on('timeupdate', () => {
                 if (!this.player || !this.player.video) {
                     return;
                 }
                 // 前回 timeupdate イベントが発火した時刻から WATCHED_HISTORY_UPDATE_INTERVAL 秒間は処理を実行しない（間引く）
-                const now = new Date().getTime();
-                if (now - last_timeupdate_fired_at < PlayerController.WATCHED_HISTORY_UPDATE_INTERVAL * 1000) {
+                const now = performance.now();
+                if (
+                    last_timeupdate_fired_at !== null &&
+                    now - last_timeupdate_fired_at < PlayerController.WATCHED_HISTORY_UPDATE_INTERVAL * 1000
+                ) {
                     return;
                 }
                 last_timeupdate_fired_at = now;

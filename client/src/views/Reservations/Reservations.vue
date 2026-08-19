@@ -40,6 +40,7 @@ import Navigation from '@/components/Navigation.vue';
 import ReservationList from '@/components/Reservations/ReservationList.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
 import Reservations, { IReservation } from '@/services/Reservations';
+import { dayjs } from '@/utils';
 
 const route = useRoute();
 const router = useRouter();
@@ -91,9 +92,9 @@ function updateDisplayData() {
     // 並び順に応じてソート
     let sortedReservations = [...allReservations.value];
     if (sortOrder.value === 'asc') {
-        sortedReservations.sort((a, b) => new Date(a.program.start_time).getTime() - new Date(b.program.start_time).getTime());
+        sortedReservations.sort((a, b) => dayjs(a.program.start_time).valueOf() - dayjs(b.program.start_time).valueOf());
     } else {
-        sortedReservations.sort((a, b) => new Date(b.program.start_time).getTime() - new Date(a.program.start_time).getTime());
+        sortedReservations.sort((a, b) => dayjs(b.program.start_time).valueOf() - dayjs(a.program.start_time).valueOf());
     }
 
     // ページネーション用の計算

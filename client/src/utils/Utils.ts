@@ -2,6 +2,7 @@
 import { AxiosResponseHeaders, RawAxiosResponseHeaders } from 'axios';
 
 import useSettingsStore from '@/stores/SettingsStore';
+import { dayjs } from '@/utils';
 
 
 /**
@@ -131,17 +132,8 @@ export default class Utils {
 
         // ユーティリティ: 日付文字列 YYYY/MM/DD を 1 日戻す
         const prevDateStr = (y: number, m: number, d: number, withWeek: boolean): string => {
-            const date = new Date(y, m - 1, d);
-            date.setDate(date.getDate() - 1);
-            const yy = date.getFullYear();
-            const mm = String(date.getMonth() + 1).padStart(2, '0');
-            const dd = String(date.getDate()).padStart(2, '0');
-            if (withWeek) {
-                const weeks = '日月火水木金土';
-                const w = weeks[date.getDay()];
-                return `${yy}/${mm}/${dd} (${w})`;
-            }
-            return `${yy}/${mm}/${dd}`;
+            const date = dayjs(`${y}-${m}-${d}`).subtract(1, 'day');
+            return date.format(withWeek ? 'YYYY/MM/DD (dd)' : 'YYYY/MM/DD');
         };
 
         // 1) YYYY/MM/DD (w) HH:mm[:ss]
@@ -171,18 +163,16 @@ export default class Utils {
         );
 
         // 3) MM/DD HH:mm[:ss]
-        const baseYear = new Date().getFullYear();
+        const baseYear = dayjs().year();
         text = text.replace(Utils.month_day_time_pattern,
             (_m, m, d, hh, mm, ss) => {
                 const hour = parseInt(hh, 10);
                 if (hour >= 0 && hour <= 3) {
                     // 年は表示されないため、現在年を基準に日付計算のみ行う
-                    const date = new Date(baseYear, parseInt(m, 10) - 1, parseInt(d, 10));
-                    date.setDate(date.getDate() - 1);
-                    const mm2 = String(date.getMonth() + 1).padStart(2, '0');
-                    const dd2 = String(date.getDate()).padStart(2, '0');
+                    const date = dayjs(`${baseYear}-${m}-${d}`).subtract(1, 'day');
+                    const previous_date = date.format('MM/DD');
                     const newH = String(hour + 24).padStart(2, '0');
-                    return `${mm2}/${dd2} ${newH}:${mm}${ss ? `:${ss}` : ''}`;
+                    return `${previous_date} ${newH}:${mm}${ss ? `:${ss}` : ''}`;
                 }
                 return `${m}/${d} ${hh}:${mm}${ss ? `:${ss}` : ''}`;
             }
