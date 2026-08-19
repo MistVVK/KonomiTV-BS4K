@@ -101,6 +101,25 @@
                 </template>
             </section>
         </div>
+
+        <v-dialog :model-value="delete_logo_dialog" :persistent="is_deleting_logo" max-width="520"
+            @update:model-value="updateDeleteLogoDialog">
+            <v-card>
+                <v-card-title>共有 .lgd を削除</v-card-title>
+                <v-card-text>
+                    共有 .lgd を削除します。同じフォルダを参照する外部ツールにも影響します。続行しますか？
+                </v-card-text>
+                <v-card-actions>
+                    <v-spacer />
+                    <v-btn variant="text" :disabled="is_deleting_logo"
+                        @click="updateDeleteLogoDialog(false)">キャンセル</v-btn>
+                    <v-btn color="error" variant="flat" :loading="is_deleting_logo"
+                        :disabled="delete_logo_target_id === null" @click="confirmDeleteSelectedLogo()">
+                        削除
+                    </v-btn>
+                </v-card-actions>
+            </v-card>
+        </v-dialog>
     </SettingsBase>
 </template>
 
@@ -135,6 +154,9 @@ const assignment_network_id = ref<number | null>(null);
 const assignment_transport_stream_id = ref<number | null>(null);
 const assignment_valid_from = ref('');
 const assignment_valid_until = ref('');
+const delete_logo_dialog = ref(false);
+const delete_logo_target_id = ref<number | null>(null);
+const is_deleting_logo = ref(false);
 
 const service_ids = computed<ServiceKey[]>(() => {
     const assigned = [...new Set(logos.value
@@ -256,14 +278,34 @@ async function deleteAssignment(assignment_id: number): Promise<void> {
     }
 }
 
-async function deleteSelectedLogo(): Promise<void> {
-    if (is_edit_disabled.value || selected_logo.value === null) return;
-    if (!window.confirm('共有 .lgd を削除します。同じフォルダを参照する外部ツールにも影響します。続行しますか？')) return;
-    if (await CMAnalysis.deleteLogo(selected_logo.value.id)) {
-        Message.success('共有ロゴを削除し、missing 履歴として保存しました。');
-        selected_logo_id.value = null;
-        await loadData(false);
-    }
+/** 選択中のロゴを削除対象として固定し、共有ファイルへの影響を確認する。 */
+function deleteSelectedLogo(): void {
+    if (is_edit_disabled.value || selected_logo.value === null || is_deleting_logo.value) return;
+    delete_logo_target_id.value = selected_logo.value.id;
+    delete_logo_dialog.value = true;
+}
+
+/** 削除中の意図しない close を防ぎ、閉じた後は削除対象を破棄する。 */
+function updateDeleteLogoDialog(value: boolean): void {
+    if (value === false && is_deleting_logo.value) return;
+    delete_logo_dialog.value = value;
+    if (value === false) delete_logo_target_id.value = null;
+}
+
+/** 確認時に固定した共有ロゴだけを削除し、成功後に一覧を更新する。 */
+async function confirmDeleteSelectedLogo(): Promise<void> {
+    const target_id = delete_logo_target_id.value;
+    if (target_id === null || is_deleting_logo.value) return;
+
+    is_deleting_logo.value = true;
+    const deleted = await CMAnalysis.deleteLogo(target_id);
+    is_deleting_logo.value = false;
+    if (deleted === false) return;
+
+    Message.success('共有ロゴを削除し、missing 履歴として保存しました。');
+    updateDeleteLogoDialog(false);
+    if (selected_logo_id.value === target_id) selected_logo_id.value = null;
+    await loadData(false);
 }
 
 </script>

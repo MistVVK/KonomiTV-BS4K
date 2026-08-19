@@ -351,6 +351,23 @@
             </div>
         </template>
 
+        <v-dialog :model-value="backfill_confirmation_dialog" :persistent="is_starting_selected_backfill"
+            max-width="560" @update:model-value="updateBackfillConfirmationDialog">
+            <v-card>
+                <v-card-title>{{backfill_confirmation_title}}</v-card-title>
+                <v-card-text>{{backfill_confirmation_message}}</v-card-text>
+                <v-card-actions>
+                    <v-spacer />
+                    <v-btn variant="text" :disabled="is_starting_selected_backfill"
+                        @click="updateBackfillConfirmationDialog(false)">キャンセル</v-btn>
+                    <v-btn color="primary" variant="flat" :loading="is_starting_selected_backfill"
+                        :disabled="backfill_confirmation_action === null" @click="confirmBackfill()">
+                        判定を開始
+                    </v-btn>
+                </v-card-actions>
+            </v-card>
+        </v-dialog>
+
     </SettingsBase>
 </template>
 
@@ -424,6 +441,11 @@ const backfill_task = ref<IAnalysisTaskExecution | null>(null);
 const episode_backfill_task = ref<IAnalysisTaskExecution | null>(null);
 const force_backfill = ref(false);
 const force_episode_backfill = ref(false);
+type BackfillConfirmationAction = 'Series' | 'Episode';
+const backfill_confirmation_dialog = ref(false);
+const backfill_confirmation_action = ref<BackfillConfirmationAction | null>(null);
+const backfill_confirmation_force = ref(false);
+const backfill_confirmation_message = ref('');
 
 const is_form_dense = Utils.isSmartphoneHorizontal();
 const user_store = useUserStore();
@@ -524,6 +546,16 @@ const is_episode_backfill_running = computed(() =>
     is_starting_episode_backfill.value ||
     is_monitoring_episode_backfill.value ||
     status.value?.is_episode_running === true,
+);
+const is_starting_selected_backfill = computed(() => {
+    if (backfill_confirmation_action.value === 'Series') return is_starting_backfill.value;
+    if (backfill_confirmation_action.value === 'Episode') return is_starting_episode_backfill.value;
+    return false;
+});
+const backfill_confirmation_title = computed(() =>
+    backfill_confirmation_action.value === 'Episode' ?
+        '既存録画の一括話数判定' :
+        '既存録画をシリーズ判定',
 );
 const series_backfill_unavailable_message = computed(() => {
     if (saved_settings.value?.ai_backend_auth_configured !== true) {
@@ -659,23 +691,52 @@ async function saveSettings(): Promise<void> {
 }
 
 
-/** 既存録画を対象に、バックグラウンドでシリーズ判定を実行する。 */
-async function startBackfill(): Promise<void> {
-    if (is_episode_backfill_running.value) return;
+/** 既存録画のシリーズ判定を開始する前に、利用量と更新範囲を確認する。 */
+function startBackfill(): void {
+    if (is_backfill_running.value || is_episode_backfill_running.value) return;
     if (is_series_backfill_available.value === false) {
         Message.warning('AIバックエンドを設定してからシリーズ判定を実行してください。');
         return;
     }
-    const confirmation_message = force_backfill.value ?
+    backfill_confirmation_action.value = 'Series';
+    backfill_confirmation_force.value = force_backfill.value;
+    backfill_confirmation_message.value = force_backfill.value ?
         `「${saved_ai_backend_label.value}」AIバックエンドを利用し、シリーズ確定・単発番組を含むすべての録画を再判定します。既存の判定結果が更新され、録画件数に応じた AI 利用が発生します。続行しますか？` :
         `「${saved_ai_backend_label.value}」AIバックエンドを利用し、未判定の既存録画をシリーズ判定します。Manual / Rule 以外では、録画件数に応じた AI 利用が発生します。続行しますか？`;
-    const confirmed = window.confirm(confirmation_message);
-    if (confirmed === false) return;
+    backfill_confirmation_dialog.value = true;
+}
+
+/** 確認ダイアログを閉じ、次に開いた操作へ古い対象を持ち越さない。 */
+function updateBackfillConfirmationDialog(value: boolean): void {
+    if (value === false && is_starting_selected_backfill.value) return;
+    backfill_confirmation_dialog.value = value;
+    if (value === false) {
+        backfill_confirmation_action.value = null;
+        backfill_confirmation_message.value = '';
+    }
+}
+
+/** 確認時に固定した操作種別と force 値で、対応する一括判定を開始する。 */
+async function confirmBackfill(): Promise<void> {
+    const action = backfill_confirmation_action.value;
+    const force = backfill_confirmation_force.value;
+    if (action === null || is_starting_selected_backfill.value) return;
+
+    if (action === 'Series') {
+        await runBackfill(force);
+    } else {
+        await runEpisodeBackfill(force);
+    }
+}
+
+/** 既存録画を対象に、バックグラウンドでシリーズ判定を実行する。 */
+async function runBackfill(force: boolean): Promise<void> {
 
     is_starting_backfill.value = true;
-    const accepted = await RecordedSeries.startBackfill(force_backfill.value);
+    const accepted = await RecordedSeries.startBackfill(force);
     is_starting_backfill.value = false;
     if (accepted === null) return;
+    updateBackfillConfirmationDialog(false);
 
     status.value = status.value === null ? null : {...status.value, is_running: true};
     is_monitoring_backfill.value = true;
@@ -703,19 +764,25 @@ async function startBackfill(): Promise<void> {
     }
 }
 
-/** Series所属済みの既存録画を対象に、バックグラウンドで話数Web検索を実行する。 */
-async function startEpisodeBackfill(): Promise<void> {
-    if (is_backfill_running.value) return;
-    const confirmation_message = force_episode_backfill.value ?
+/** 既存録画の一括話数判定を開始する前に、利用量と検索範囲を確認する。 */
+function startEpisodeBackfill(): void {
+    if (is_episode_backfill_running.value || is_backfill_running.value) return;
+    backfill_confirmation_action.value = 'Episode';
+    backfill_confirmation_force.value = force_episode_backfill.value;
+    backfill_confirmation_message.value = force_episode_backfill.value ?
         '手動訂正を除く判定済みの話数も、最新の AI 設定で再検索します。録画件数に応じて AI API 利用が発生します。続行しますか？' :
         '話数が未確定の既存録画を、保存済みの AI 設定で Web 検索します。録画件数に応じて AI API 利用が発生します。続行しますか？';
-    const confirmed = window.confirm(confirmation_message);
-    if (confirmed === false) return;
+    backfill_confirmation_dialog.value = true;
+}
+
+/** Series所属済みの既存録画を対象に、バックグラウンドで話数Web検索を実行する。 */
+async function runEpisodeBackfill(force: boolean): Promise<void> {
 
     is_starting_episode_backfill.value = true;
-    const accepted = await RecordedSeries.startEpisodeBackfill(force_episode_backfill.value);
+    const accepted = await RecordedSeries.startEpisodeBackfill(force);
     is_starting_episode_backfill.value = false;
     if (accepted === null) return;
+    updateBackfillConfirmationDialog(false);
 
     status.value = status.value === null ? null : {...status.value, is_episode_running: true};
     is_monitoring_episode_backfill.value = true;
