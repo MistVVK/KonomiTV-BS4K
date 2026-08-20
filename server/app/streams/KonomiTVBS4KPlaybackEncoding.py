@@ -338,6 +338,7 @@ def BuildKonomiTVBS4KLiveHardwareVideoFilters(
             f'scale_cuda=w={encode_width}:h={encode_height}:format={encoder_pixel_format}'
         )
     else:
+        # VAAPI encoder は VAAPI 面を直接受ける。system memory へ落とさない。
         if is_interlaced is True:
             # deinterlace_vaapi に parity 指定は無いため auto=0 で常に解除する。
             # auto=1 はプログレッシブ誤判定時に解除を飛ばし得るので使わない。フィールド順は bitstream に従う。
@@ -347,8 +348,6 @@ def BuildKonomiTVBS4KLiveHardwareVideoFilters(
         filters.append(
             f'scale_vaapi=w={encode_width}:h={encode_height}:format={encoder_pixel_format}'
         )
-        # AMF は system memory の NV12/P010 を受け取る
-        filters.append(f'hwdownload,format={encoder_pixel_format}')
     return filters
 
 

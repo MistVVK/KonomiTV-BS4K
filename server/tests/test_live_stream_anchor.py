@@ -298,9 +298,9 @@ def test_ffmpeg8_bs4k_ignores_sar_mode_and_uses_gpu_scale(
         ('NVENC', 'avc', 'h264_nvenc', 'high'),
         ('NVENC', 'hevc', 'hevc_nvenc', 'main'),
         ('NVENC', 'av1', 'av1_nvenc', None),
-        ('AMF', 'avc', 'h264_amf', 'high'),
-        ('AMF', 'hevc', 'hevc_amf', 'main'),
-        ('AMF', 'av1', 'av1_amf', 'main'),
+        ('AMF', 'avc', 'h264_vaapi', 'high'),
+        ('AMF', 'hevc', 'hevc_vaapi', 'main'),
+        ('AMF', 'av1', 'av1_vaapi', 'main'),
     ],
 )
 @pytest.mark.parametrize(('audio_codec', 'expected_audio_encoder'), [('aac', 'copy'), ('opus', 'libopus')])

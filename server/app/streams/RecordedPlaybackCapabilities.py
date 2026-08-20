@@ -79,7 +79,9 @@ class RecordedPlaybackBackend:
         'FFmpeg': {'avc': 'libx264', 'hevc': 'libx265', 'vp9': 'libvpx-vp9', 'av1': 'libaom-av1'},
         'QSV': {'avc': 'h264_qsv', 'hevc': 'hevc_qsv', 'vp9': 'vp9_qsv', 'av1': 'av1_qsv'},
         'NVENC': {'avc': 'h264_nvenc', 'hevc': 'hevc_nvenc', 'vp9': None, 'av1': 'av1_nvenc'},
-        'AMF': {'avc': 'h264_amf', 'hevc': 'hevc_amf', 'vp9': None, 'av1': 'av1_amf'},
+        # 公開名 AMF は設定互換のため残し、実エンコードは Mesa VAAPI を使う。
+        # proprietary AMF はホスト kernel と amdgpu-pro の ABI がずれると初期化できない。
+        'AMF': {'avc': 'h264_vaapi', 'hevc': 'hevc_vaapi', 'vp9': None, 'av1': 'av1_vaapi'},
     }
 
     _VENDOR_IDS: ClassVar[dict[RecordedPlaybackEncoder, str]] = {
@@ -343,15 +345,13 @@ class RecordedPlaybackBackend:
                 )
             command += ['-vf', ','.join(filters)]
         else:
-            # AMF自体はsystem-memoryのNV12/P010を受けるため、能力検査でも実再生と同じ
-            # VAAPI upload/download境界を通し、ドライバーとAMFの両方を検査する。
+            # QSV/NVENC と同様に、upload 後の VAAPI 面を encoder へ直接渡す。
             output_width = QUALITY[quality].width if quality is not None else 320
             output_height = QUALITY[quality].height if quality is not None else 192
             command += [
                 '-vf',
                 f'format={spec.encoder_pixel_format},hwupload,'
-                f'scale_vaapi=w={output_width}:h={output_height}:format={spec.encoder_pixel_format},'
-                f'hwdownload,format={spec.encoder_pixel_format}',
+                f'scale_vaapi=w={output_width}:h={output_height}:format={spec.encoder_pixel_format}',
             ]
 
         command += ['-an', '-c:v', ffmpeg_encoder]
@@ -364,7 +364,7 @@ class RecordedPlaybackBackend:
             # auto_scaleがhwupload_cuda後へ挿入されるのを防ぐ。
             command += ['-pix_fmt', 'cuda']
         elif encoder == 'AMF':
-            command += ['-pix_fmt', spec.encoder_pixel_format]
+            command += ['-pix_fmt', 'vaapi']
         if codec == 'avc':
             command += ['-profile:v', 'high']
         elif codec == 'hevc':

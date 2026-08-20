@@ -95,9 +95,9 @@ class LiveEncodingTask:
     ENCODER_TS_READ_TIMEOUT_STANDBY: ClassVar[int] = 20
 
     # エンコーダーの出力を読み取る際のタイムアウト (ONAir 時) (秒)
-    # VCEEncC 利用時のみ起動時に OpenCL シェーダーがコンパイルされる関係で起動が遅いため、10 秒に設定
     ENCODER_TS_READ_TIMEOUT_ONAIR: ClassVar[int] = 5
-    ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC: ClassVar[int] = 10
+    # AMD (公開名 AMF、実体は Mesa VAAPI) はドライバー初期化が重い場合があるため長めに維持する
+    ENCODER_TS_READ_TIMEOUT_ONAIR_AMD: ClassVar[int] = 10
     # ISDB-S3 は入力解析と最初の映像出力に時間がかかるため、ONAir 遷移後の初回出力を長めに待つ
     ENCODER_TS_READ_TIMEOUT_ONAIR_BS4K: ClassVar[int] = 15
     # Opus と一般的なブラウザ再生経路が扱える最大チャンネル数。ISDB-S3 demuxer の入力段階で適用する
@@ -429,10 +429,13 @@ class LiveEncodingTask:
                 '-filter_hw_device', 'live_vaapi',
             ]
             if use_software_decode is False:
+                # VAAPI hwaccel の decoder 名は hevc (native) のままだが、出力面は vaapi。
+                # extra_hw_frames を足して 4K60 の参照フレーム不足で SW へ落ちないようにする。
                 options += [
                     '-hwaccel', 'vaapi',
                     '-hwaccel_device', 'live_vaapi',
                     '-hwaccel_output_format', 'vaapi',
+                    '-extra_hw_frames', '16',
                 ]
 
         input_probesize: str | None = None
@@ -490,12 +493,14 @@ class LiveEncodingTask:
         )
 
         # SW 処理後に HW エンコーダーへ渡すための upload filter。
-        # AMF は system memory の NV12 / P010 をそのまま受け取るため upload は不要。
+        # AMF 公開名でも実エンコードは VAAPI なので、SW 経路では hwupload が必要。
         upload_filters: list[str] = []
         if encoder_type == 'QSV':
             upload_filters = ['hwupload=extra_hw_frames=64']
         elif encoder_type == 'NVENC':
             upload_filters = ['hwupload_cuda']
+        elif encoder_type == 'AMF':
+            upload_filters = ['hwupload']
 
         filters: list[str] = []
         if use_software_decode is True:
@@ -549,7 +554,7 @@ class LiveEncodingTask:
         if encoder_type == 'NVENC':
             options += ['-pix_fmt', 'cuda']
         elif encoder_type == 'AMF':
-            options += ['-pix_fmt', codec_spec.encoder_pixel_format]
+            options += ['-pix_fmt', 'vaapi']
         if encoder_type == 'QSV':
             options += ['-preset', 'medium', '-async_depth', '1', '-bf', '0']
             # look_ahead は h264_qsv 固有。HEVC / VP9 / AV1 へ渡すと未使用警告になり、
@@ -562,7 +567,8 @@ class LiveEncodingTask:
                 '-spatial-aq', '1', '-temporal-aq', '1', '-zerolatency', '1', '-bf', '0',
             ]
         else:
-            options += ['-quality', 'balanced', '-rc', 'vbr_latency', '-usage', 'lowlatency', '-bf', '0']
+            # h264_vaapi / hevc_vaapi は AMF 固有の -quality / -rc vbr_latency を受け付けない。
+            options += ['-bf', '0', '-rc_mode', 'VBR']
 
         if codec == 'hevc':
             options += [
@@ -2559,7 +2565,13 @@ class LiveEncodingTask:
                         'Error initializing an MFX session' in line or 'No device available' in line
                     ):
                         self.live_stream.setStatus('Offline', 'お使いの PC 環境は QSV エンコーダーに対応していません。(E-07HQ)')
-                    elif ENCODER_TYPE == 'AMF' and 'AMF failed to initialise' in line:
+                    # 公開名 AMF の実体は Mesa VAAPI のため、proprietary AMF ではなく
+                    # libva / render node の初期化失敗メッセージを検出する
+                    elif ENCODER_TYPE == 'AMF' and (
+                        'No VA display found' in line
+                        or 'Failed to initialise VAAPI connection' in line
+                        or 'Device creation failed' in line
+                    ):
                         self.live_stream.setStatus('Offline', 'お使いの PC 環境は AMF エンコーダーに対応していません。(E-10HV)')
                     elif 'Conversion failed!' in line:
                         result = self.live_stream.setStatus('Restart', 'エンコード中に予期しないエラーが発生しました。エンコードタスクを再起動しています… (ER-01F)')
@@ -2687,7 +2699,7 @@ class LiveEncodingTask:
                     if channel.type == 'BS4K':
                         encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR_BS4K
                     elif ENCODER_TYPE == 'AMF':
-                        encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC
+                        encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR_AMD
                     else:
                         encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR
                     stream_data_last_write_time = time.time() - self.live_stream.getStreamDataWrittenAt()
@@ -2750,8 +2762,14 @@ class LiveEncodingTask:
                                     if not available_for_encode:
                                         self.live_stream.setStatus('Offline', 'お使いの NVIDIA GPU は H.265/HEVC でのエンコードに対応していません。(E-15HN)')
                                         break
-                                # AMF: H.265/HEVC でのエンコードに非対応の環境
-                                elif ENCODER_TYPE == 'AMF' and 'HW Acceleration of H.265/HEVC is not supported on this platform.' in line:
+                                # AMF (実体は Mesa VAAPI): H.265/HEVC でのエンコードに非対応の環境
+                                # VAAPI はドライバーが対応 profile を持たない場合 "No usable encoding profile found." を
+                                # 出力するが、このメッセージはコーデック非依存のため、誤検出を避けるよう HEVC 要求時に限定する
+                                elif (
+                                    ENCODER_TYPE == 'AMF'
+                                    and self.GetRequestedVideoCodec() == 'hevc'
+                                    and 'No usable encoding profile found.' in line
+                                ):
                                     self.live_stream.setStatus('Offline', 'お使いの AMD GPU は H.265/HEVC でのエンコードに対応していません。(E-16HV)')
                                     break
 

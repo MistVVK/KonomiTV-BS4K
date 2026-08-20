@@ -120,8 +120,8 @@ def test_recorded_playback_amd_uses_mesa_without_proprietary_runtime(
     assert environment['LD_LIBRARY_PATH'].split(':')[0].endswith('/Library')
 
 
-def test_recorded_playback_amd_probe_uses_vaapi_download() -> None:
-    """AMF能力検査が実再生と同じVAAPIからsystem memoryへの境界を通ることを確認する。"""
+def test_recorded_playback_amd_probe_keeps_vaapi_frames() -> None:
+    """AMF能力検査がVAAPI面をencoderへ直接渡すことを確認する。"""
 
     command = RecordedPlaybackBackend.buildProbeCommand(
         'AMF',
@@ -134,9 +134,9 @@ def test_recorded_playback_amd_probe_uses_vaapi_download() -> None:
     assert command[0].endswith('/FFmpeg8/ffmpeg8-amd.sh')
     assert 'vaapi=recorded_vaapi:/dev/dri/renderD130' in command_text
     assert 'scale_vaapi' in command_text
-    assert 'hwdownload' in command_text
-    assert 'format=p010le' in command_text
-    assert 'hevc_amf' in command_text
+    assert 'hwdownload' not in command_text
+    assert command[command.index('-pix_fmt') + 1] == 'vaapi'
+    assert 'hevc_vaapi' in command_text
 
 
 def test_recorded_playback_qsv_probe_keeps_hardware_pixel_format() -> None:

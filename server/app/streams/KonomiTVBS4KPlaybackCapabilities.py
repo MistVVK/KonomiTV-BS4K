@@ -1283,7 +1283,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             ffmpeg_command += [
                 '-vf',
                 f'format={codec_spec.encoder_pixel_format},hwupload,'
-                f'scale_vaapi=w=640:h=360,hwdownload,format={codec_spec.encoder_pixel_format}',
+                f'scale_vaapi=w=640:h=360:format={codec_spec.encoder_pixel_format}',
             ]
 
         ffmpeg_command += [
@@ -1297,7 +1297,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         elif encoder == 'NVENC':
             ffmpeg_command += ['-pix_fmt', 'cuda']
         elif encoder == 'AMF':
-            ffmpeg_command += ['-pix_fmt', codec_spec.encoder_pixel_format]
+            ffmpeg_command += ['-pix_fmt', 'vaapi']
 
         if video_codec == 'vp9':
             ffmpeg_command += [
@@ -1346,16 +1346,13 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             if video_codec in ('vp9', 'av1'):
                 ffmpeg_command += ['-zerolatency', '1', '-bf', '0']
         else:
-            ffmpeg_command += [
-                '-quality',
-                'balanced',
-                '-rc',
-                'vbr_latency',
-                '-async_depth',
-                '1',
-            ]
-            if video_codec in ('vp9', 'av1'):
-                ffmpeg_command += ['-usage', 'lowlatency', '-latency', '1', '-bf', '0']
+            # VAAPI encode は AMF 固有オプションを使わない。
+            ffmpeg_command += ['-bf', '0', '-rc_mode', 'VBR']
+            # VAAPI の VBR はビットレート未指定だと "Bitrate must be set for VBR RC mode." で
+            # 必ず失敗する。実ライブ起動は常時 -b:v を渡すため、probe 側も AVC/HEVC で同じ条件を渡す。
+            # AV1 は後段の needs_fixed_muxrate ブロックで既にビットレートが付くため二重指定しない。
+            if video_codec not in ('vp9', 'av1'):
+                ffmpeg_command += ['-b:v', '600K', '-maxrate', '800K', '-bufsize', '800K']
 
         # Bridge が SELECTED_PCR_GAP で fail closed するため、VP9/AV1 だけでなく
         # Opus 付きの passthrough 映像 (AVC/HEVC) でも固定 muxrate と PCR 周期を使う。

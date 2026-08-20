@@ -2035,15 +2035,15 @@ class RecordedFMP4Stream:
                 filters.append(
                     f'deinterlace_vaapi=rate={"field" if quality.is_60fps else "frame"}:auto=1'
                 )
+            # VAAPI encoder へ VAAPI 面を直接渡す。
             filters += [
                 f'scale_vaapi=w={quality.width}:h={quality.height}:format={spec.encoder_pixel_format}',
-                f'hwdownload,format={spec.encoder_pixel_format}',
             ]
             if is_interlaced and self.encoding_options.is_24fps_mode_enabled:
                 filters += [
-                    'pullup', 'dejudder', f'format={spec.encoder_pixel_format}', 'hwupload',
+                    f'hwdownload,format={spec.encoder_pixel_format}', 'pullup', 'dejudder',
+                    f'format={spec.encoder_pixel_format}', 'hwupload',
                     f'scale_vaapi=w={quality.width}:h={quality.height}:format={spec.encoder_pixel_format}',
-                    f'hwdownload,format={spec.encoder_pixel_format}',
                 ]
             filters += [
                 f'trim=start={trim_start:.6f}:duration={duration:.6f}',
@@ -2061,7 +2061,7 @@ class RecordedFMP4Stream:
         elif backend == 'NVENC':
             command += ['-pix_fmt', 'cuda']
         elif backend == 'AMF':
-            command += ['-pix_fmt', spec.encoder_pixel_format]
+            command += ['-pix_fmt', 'vaapi']
         command += self.__getProfileArguments(backend, codec, bit_depth)
         command += RecordedPlaybackBackend.getTuningArguments(backend, codec)
         if codec == 'hevc':
