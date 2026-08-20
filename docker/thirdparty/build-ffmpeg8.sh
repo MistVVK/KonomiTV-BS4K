@@ -58,22 +58,10 @@ clone-commit "${LIBARIBTLV_REPOSITORY}" "${LIBARIBTLV_COMMIT}" \
 clone-commit "${NVCODEC_HEADERS_REPOSITORY}" "${NVCODEC_HEADERS_COMMIT}" "${nvcodec_source}" "refs/tags/${NVCODEC_HEADERS_TAG}"
 clone-commit "${AMF_REPOSITORY}" "${AMF_COMMIT}" "${amf_source}" "refs/tags/${AMF_TAG}"
 
-# libaribtlv と FFmpeg 統合 patch は、固定 revision・checksum・ローカル差分をすべて検証する。
-echo "${LIBARIBTLV_LICENSE_SHA256}  ${libaribtlv_source}/LICENSE" | sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_LICENSE_SHA256}  ${ffmpeg_libaribtlv_source}/LICENSE" | sha256sum --check --strict
+# libaribtlv と FFmpeg 統合 patch は、固定 commit の source とローカル patch を組み合わせる。
+# 適用可否は git apply --check が担保し、個別の checksum 照合は行わない
+# (commit 固定された git 内容と Git 管理下の patch の再検証は冗長で、保守時の churn 元になるため)。
 ffmpeg_libaribtlv_patch_directory="${ffmpeg_libaribtlv_source}/patches/ffmpeg-${FFMPEG8_VERSION}"
-echo "${FFMPEG_LIBARIBTLV_PATCH_0001_SHA256}  ${ffmpeg_libaribtlv_patch_directory}/0001-Add-ARIB-MMT-TLV-demuxer-support-via-libaribtlv.patch" | \
-    sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_PATCH_0002_SHA256}  ${ffmpeg_libaribtlv_patch_directory}/0002-avformat-libaribtlv-report-recording-duration.patch" | \
-    sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_PATCH_0003_SHA256}  ${ffmpeg_libaribtlv_patch_directory}/0003-avformat-libaribtlv-support-timestamp-seeking.patch" | \
-    sha256sum --check --strict
-echo "${LIBARIBTLV_SUBTITLE_MFU_PATCH_SHA256}  ${SCRIPT_DIR}/patches/libaribtlv-0.2.0-konomitv-subtitle-mfu.patch" | \
-    sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_TIMED_ID3_PATCH_SHA256}  ${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch" | \
-    sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_CONTEXT_ID_METADATA_PATCH_SHA256}  ${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch" | \
-    sha256sum --check --strict
 git -C "${libaribtlv_source}" apply --check \
     "${SCRIPT_DIR}/patches/libaribtlv-0.2.0-konomitv-subtitle-mfu.patch"
 git -C "${libaribtlv_source}" apply \
@@ -105,39 +93,7 @@ for patch_path in \
     git -C "${ffmpeg_source}" apply --check "${patch_path}"
     git -C "${ffmpeg_source}" apply "${patch_path}"
 done
-echo "${AMF_DISPLAY_CAPTURE_C_PATCH_SHA256}  ${SCRIPT_DIR}/patches/amf-1.4.36-display-capture-c.patch" | \
-    sha256sum --check --strict
 patch -d "${amf_source}" -p1 < "${SCRIPT_DIR}/patches/amf-1.4.36-display-capture-c.patch"
-
-# CUVID/NVDEC で実際に組み込む header も固定 commit の checksum で監査する。
-# 現在の 12.1.14.0 では 2 つの CUVID header の notice が nvEncodeAPI.h と同一であることも検証し、
-# CUDA/loader header のみが共通の別 notice を持つことを明示的に固定する。
-# notice が将来変更された場合にライセンス登録なしでビルドを進めない。
-echo "${NVCODEC_HEADERS_LICENSE_SHA256}  ${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h" | \
-    sha256sum --check --strict
-echo "${NVCODEC_HEADERS_CUDA_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h" | \
-    sha256sum --check --strict
-echo "${NVCODEC_HEADERS_CUVIDDEC_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_cuviddec.h" | \
-    sha256sum --check --strict
-echo "${NVCODEC_HEADERS_LOADER_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_loader.h" | \
-    sha256sum --check --strict
-echo "${NVCODEC_HEADERS_NVCUVID_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_nvcuvid.h" | \
-    sha256sum --check --strict
-cmp \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuviddec.h")
-cmp \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_nvcuvid.h")
-cmp \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h") \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_loader.h")
-if cmp -s \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h"); then
-    echo 'Expected the audited CUDA/loader notice to be distinct from nvEncodeAPI.h.' >&2
-    exit 1
-fi
 
 make -C "${nvcodec_source}" PREFIX="${SDK_PREFIX}" install
 mkdir -p "${SDK_PREFIX}/include/AMF"

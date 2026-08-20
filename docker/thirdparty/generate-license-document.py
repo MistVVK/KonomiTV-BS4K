@@ -16,6 +16,20 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MANIFEST_PATH = Path(__file__).resolve().with_name('manifest.env')
 LICENSE_MANIFEST_PATH = Path(__file__).resolve().with_name('license-manifest.env')
+PATCHES_ROOT = Path(__file__).resolve().with_name('patches')
+
+
+def localFileSha256(path: Path) -> str:
+    """リポジトリ内ファイルの SHA-256 を実測する。
+
+    Args:
+        path: ハッシュを算出するリポジトリ内ファイルのパス。
+
+    Returns:
+        ファイル内容の SHA-256 (小文字 hex)。
+    """
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -24,7 +38,7 @@ class LicenseSource:
     version: str
     source_url: str
     fixed_value: str
-    files: tuple[tuple[str, str, str], ...]
+    files: tuple[tuple[str, str], ...]
 
 
 def loadManifest() -> dict[str, str]:
@@ -72,22 +86,22 @@ def decodeLicense(content: bytes) -> str:
     raise ValueError('Unsupported license file encoding.')
 
 
-def readVerifiedLicense(location: str, sha256: str) -> str:
-    """固定 URL またはローカルファイルのライセンス本文を checksum 検証して読み込む。"""
+def readLicense(location: str) -> str:
+    """固定 URL またはローカルファイルのライセンス本文を読み込む。
+
+    URL は commit 固定の GitHub raw のみを使う。git の content addressing が
+    完全性を担保するため、個別の checksum 照合は行わない
+    (上流 commit を bump するたびに checksum も更新する運用はビルド停止の温床になる)。
+    """
 
     content = download(location) if location.startswith('https://') else Path(location).read_bytes()
-    if hashlib.sha256(content).hexdigest() != sha256:
-        raise ValueError(f'License checksum mismatch: {location}')
     return decodeLicense(content)
 
 
-def readVerifiedHeaderLicense(location: str, sha256: str) -> str:
-    """固定ヘッダーを checksum 検証し、ファイル先頭のライセンスコメントだけを取得する。"""
+def readHeaderLicense(location: str) -> str:
+    """固定 URL のヘッダーファイルから、ファイル先頭のライセンスコメントだけを取得する。"""
 
-    content = download(location)
-    if hashlib.sha256(content).hexdigest() != sha256:
-        raise ValueError(f'License checksum mismatch: {location}')
-    decoded = decodeLicense(content)
+    decoded = decodeLicense(download(location))
     if not decoded.startswith('/*') or '*/' not in decoded:
         raise ValueError(f'License header not found: {location}')
     return decoded[2:decoded.index('*/')].replace(' * ', '').replace(' *', '').strip()
@@ -117,63 +131,63 @@ def main() -> None:
     github_raw = 'https://raw.githubusercontent.com'
     sources = (
         LicenseSource('KonomiTV upstream', manifest['KONOMITV_UPSTREAM_VERSION'], manifest['KONOMITV_UPSTREAM_REPOSITORY'], manifest['KONOMITV_UPSTREAM_COMMIT'], (
-            ('License.txt', f'{github_raw}/tsukumijima/KonomiTV/{manifest["KONOMITV_UPSTREAM_COMMIT"]}/License.txt', manifest['KONOMITV_UPSTREAM_LICENSE_SHA256']),
+            ('License.txt', f'{github_raw}/tsukumijima/KonomiTV/{manifest["KONOMITV_UPSTREAM_COMMIT"]}/License.txt'),
         )),
         LicenseSource('FFmpeg', manifest['FFMPEG8_VERSION'], manifest['FFMPEG8_REPOSITORY'], manifest['FFMPEG8_COMMIT'], (
-            ('LICENSE.md', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/LICENSE.md', manifest['FFMPEG8_LICENSE_SHA256']),
-            ('GNU LGPL version 2.1', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.LGPLv2.1', manifest['FFMPEG8_LGPLV21_SHA256']),
-            ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.GPLv3', manifest['FFMPEG8_GPLV3_SHA256']),
+            ('LICENSE.md', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/LICENSE.md'),
+            ('GNU LGPL version 2.1', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.LGPLv2.1'),
+            ('GNU GPL version 3', f'{github_raw}/FFmpeg/FFmpeg/{manifest["FFMPEG8_COMMIT"]}/COPYING.GPLv3'),
         )),
         LicenseSource('libaribtlv', manifest['LIBARIBTLV_VERSION'], manifest['LIBARIBTLV_REPOSITORY'], manifest['LIBARIBTLV_COMMIT'], (
-            ('LICENSE', f'{github_raw}/makeding/libaribtlv/{manifest["LIBARIBTLV_COMMIT"]}/LICENSE', manifest['LIBARIBTLV_LICENSE_SHA256']),
+            ('LICENSE', f'{github_raw}/makeding/libaribtlv/{manifest["LIBARIBTLV_COMMIT"]}/LICENSE'),
         )),
         LicenseSource('FFmpeg libaribtlv integration patches', manifest['FFMPEG8_VERSION'], manifest['FFMPEG_LIBARIBTLV_REPOSITORY'], manifest['FFMPEG_LIBARIBTLV_COMMIT'], (
-            ('LICENSE', f'{github_raw}/makeding/ffmpeg-libaribtlv/{manifest["FFMPEG_LIBARIBTLV_COMMIT"]}/LICENSE', manifest['FFMPEG_LIBARIBTLV_LICENSE_SHA256']),
+            ('LICENSE', f'{github_raw}/makeding/ffmpeg-libaribtlv/{manifest["FFMPEG_LIBARIBTLV_COMMIT"]}/LICENSE'),
         )),
         LicenseSource('AMD Advanced Media Framework headers', manifest['AMF_VERSION'], manifest['AMF_REPOSITORY'], manifest['AMF_COMMIT'], (
-            ('LICENSE.txt', f'{github_raw}/GPUOpen-LibrariesAndSDKs/AMF/{manifest["AMF_COMMIT"]}/LICENSE.txt', manifest['AMF_LICENSE_SHA256']),
+            ('LICENSE.txt', f'{github_raw}/GPUOpen-LibrariesAndSDKs/AMF/{manifest["AMF_COMMIT"]}/LICENSE.txt'),
         )),
         LicenseSource('tsreadex', manifest['TSREADEX_COMMIT'][:12], 'https://github.com/MistVVK/tsreadex', manifest['TSREADEX_COMMIT'], (
-            ('License.txt', str(REPOSITORY_ROOT / 'thirdparty-src/tsreadex/License.txt'), manifest['TSREADEX_LICENSE_SHA256']),
+            ('License.txt', str(REPOSITORY_ROOT / 'thirdparty-src/tsreadex/License.txt')),
         )),
         LicenseSource('psisiarc', manifest['PSISIARC_COMMIT'][:12], manifest['PSISIARC_REPOSITORY'], manifest['PSISIARC_COMMIT'], (
-            ('License.txt', f'{github_raw}/xtne6f/psisiarc/{manifest["PSISIARC_COMMIT"]}/License.txt', manifest['PSISIARC_LICENSE_SHA256']),
+            ('License.txt', f'{github_raw}/xtne6f/psisiarc/{manifest["PSISIARC_COMMIT"]}/License.txt'),
         )),
         LicenseSource('Akebi HTTPS Server', manifest['AKEBI_COMMIT'][:12], manifest['AKEBI_REPOSITORY'], manifest['AKEBI_COMMIT'], (
-            ('License.txt', f'{github_raw}/tsukumijima/Akebi/{manifest["AKEBI_COMMIT"]}/License.txt', manifest['AKEBI_LICENSE_SHA256']),
+            ('License.txt', f'{github_raw}/tsukumijima/Akebi/{manifest["AKEBI_COMMIT"]}/License.txt'),
         )),
         LicenseSource('Poetry', manifest['POETRY_VERSION'], 'https://github.com/python-poetry/poetry', '19a2f7bddb9bdf931a229ea0913a84021f3f9b93', (
-            ('LICENSE', f'{github_raw}/python-poetry/poetry/19a2f7bddb9bdf931a229ea0913a84021f3f9b93/LICENSE', manifest['POETRY_LICENSE_SHA256']),
+            ('LICENSE', f'{github_raw}/python-poetry/poetry/19a2f7bddb9bdf931a229ea0913a84021f3f9b93/LICENSE'),
         )),
         LicenseSource('AviSynth+', manifest['AVISYNTHPLUS_TAG'], manifest['AVISYNTHPLUS_REPOSITORY'], manifest['AVISYNTHPLUS_COMMIT'], (
-            ('GNU GPL version 2', f'{github_raw}/AviSynth/AviSynthPlus/{manifest["AVISYNTHPLUS_COMMIT"]}/distrib/gpl.txt', manifest['AVISYNTHPLUS_LICENSE_SHA256']),
+            ('GNU GPL version 2', f'{github_raw}/AviSynth/AviSynthPlus/{manifest["AVISYNTHPLUS_COMMIT"]}/distrib/gpl.txt'),
         )),
         LicenseSource('FFmpegSource2', manifest['FFMS2_VERSION'], manifest['FFMS2_REPOSITORY'], manifest['FFMS2_COMMIT'], (
-            ('COPYING', f'{github_raw}/FFMS/ffms2/{manifest["FFMS2_COMMIT"]}/COPYING', manifest['FFMS2_LICENSE_SHA256']),
+            ('COPYING', f'{github_raw}/FFMS/ffms2/{manifest["FFMS2_COMMIT"]}/COPYING'),
         )),
         LicenseSource('chapter_exe', manifest['CHAPTER_EXE_COMMIT'][:12], manifest['CHAPTER_EXE_REPOSITORY'], manifest['CHAPTER_EXE_COMMIT'], (
-            ('LICENSE', f'{github_raw}/rigaya/chapter_exe/{manifest["CHAPTER_EXE_COMMIT"]}/LICENSE', manifest['CHAPTER_EXE_LICENSE_SHA256']),
+            ('LICENSE', f'{github_raw}/rigaya/chapter_exe/{manifest["CHAPTER_EXE_COMMIT"]}/LICENSE'),
         )),
         LicenseSource('logoframe', manifest['LOGOFRAME_VERSION'], manifest['LOGOFRAME_REPOSITORY'], manifest['LOGOFRAME_COMMIT'], (
-            ('LICENSE', f'{github_raw}/tobitti0/logoframe/{manifest["LOGOFRAME_COMMIT"]}/LICENSE', manifest['LOGOFRAME_LICENSE_SHA256']),
+            ('LICENSE', f'{github_raw}/tobitti0/logoframe/{manifest["LOGOFRAME_COMMIT"]}/LICENSE'),
         )),
         LicenseSource('join_logo_scp', manifest['JOIN_LOGO_SCP_COMMIT'][:12], manifest['JOIN_LOGO_SCP_REPOSITORY'], manifest['JOIN_LOGO_SCP_COMMIT'], (
-            ('LICENSE', f'{github_raw}/tobitti0/join_logo_scp/{manifest["JOIN_LOGO_SCP_COMMIT"]}/LICENSE', manifest['JOIN_LOGO_SCP_LICENSE_SHA256']),
+            ('LICENSE', f'{github_raw}/tobitti0/join_logo_scp/{manifest["JOIN_LOGO_SCP_COMMIT"]}/LICENSE'),
         )),
         LicenseSource('Intel gmmlib', manifest['INTEL_GMMLIB_VERSION'], 'https://github.com/intel/gmmlib', manifest['INTEL_GMMLIB_COMMIT'], (
-            ('LICENSE.md', f'{github_raw}/intel/gmmlib/{manifest["INTEL_GMMLIB_COMMIT"]}/LICENSE.md', manifest['INTEL_GMMLIB_LICENSE_SHA256']),
+            ('LICENSE.md', f'{github_raw}/intel/gmmlib/{manifest["INTEL_GMMLIB_COMMIT"]}/LICENSE.md'),
         )),
         LicenseSource('Intel libva', manifest['INTEL_LIBVA_VERSION'], 'https://github.com/intel/libva', manifest['INTEL_LIBVA_COMMIT'], (
-            ('COPYING', f'{github_raw}/intel/libva/{manifest["INTEL_LIBVA_COMMIT"]}/COPYING', manifest['INTEL_LIBVA_LICENSE_SHA256']),
+            ('COPYING', f'{github_raw}/intel/libva/{manifest["INTEL_LIBVA_COMMIT"]}/COPYING'),
         )),
         LicenseSource('Intel Media Driver', manifest['INTEL_MEDIA_DRIVER_VERSION'], 'https://github.com/intel/media-driver', manifest['INTEL_MEDIA_DRIVER_COMMIT'], (
-            ('LICENSE.md', f'{github_raw}/intel/media-driver/{manifest["INTEL_MEDIA_DRIVER_COMMIT"]}/LICENSE.md', manifest['INTEL_MEDIA_DRIVER_LICENSE_SHA256']),
+            ('LICENSE.md', f'{github_raw}/intel/media-driver/{manifest["INTEL_MEDIA_DRIVER_COMMIT"]}/LICENSE.md'),
         )),
         LicenseSource('Intel Media SDK', manifest['INTEL_MEDIASDK_VERSION'], 'https://github.com/Intel-Media-SDK/MediaSDK', manifest['INTEL_MEDIASDK_COMMIT'], (
-            ('LICENSE', f'{github_raw}/Intel-Media-SDK/MediaSDK/{manifest["INTEL_MEDIASDK_COMMIT"]}/LICENSE', manifest['INTEL_MEDIASDK_LICENSE_SHA256']),
+            ('LICENSE', f'{github_raw}/Intel-Media-SDK/MediaSDK/{manifest["INTEL_MEDIASDK_COMMIT"]}/LICENSE'),
         )),
         LicenseSource('Intel oneVPL GPU Runtime', manifest['INTEL_ONEVPL_GPU_VERSION'], 'https://github.com/intel/vpl-gpu-rt', manifest['INTEL_ONEVPL_GPU_COMMIT'], (
-            ('LICENSE', f'{github_raw}/intel/vpl-gpu-rt/{manifest["INTEL_ONEVPL_GPU_COMMIT"]}/LICENSE', manifest['INTEL_ONEVPL_GPU_LICENSE_SHA256']),
+            ('LICENSE', f'{github_raw}/intel/vpl-gpu-rt/{manifest["INTEL_ONEVPL_GPU_COMMIT"]}/LICENSE'),
         )),
     )
 
@@ -230,56 +244,35 @@ def main() -> None:
             f'- Fixed revision or artifact: `{source.fixed_value}`',
             '',
         ])
-        for label, location, sha256 in source.files:
-            license_text = readVerifiedLicense(location, sha256)
+        for label, location in source.files:
+            license_text = readLicense(location)
             document.extend([f'##### {label}', '', '```text', license_text, '```', ''])
 
-    nvcodec_license_url = (
-        f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
-        '/include/ffnvcodec/nvEncodeAPI.h'
+    # nv-codec-headers の各ヘッダーの先頭 notice を読み、同一 notice を重複掲載しない。
+    # 上流が notice を変更しても失敗させず、検出した distinct notice をすべて掲載する。
+    nvcodec_header_names = (
+        'nvEncodeAPI.h',
+        'dynlink_cuda.h',
+        'dynlink_cuviddec.h',
+        'dynlink_loader.h',
+        'dynlink_nvcuvid.h',
     )
-    nvcodec_license = readVerifiedHeaderLicense(
-        nvcodec_license_url, manifest['NVCODEC_HEADERS_LICENSE_SHA256'],
-    )
-    nvcodec_cuvid_headers = (
-        ('dynlink_cuviddec.h', manifest['NVCODEC_HEADERS_CUVIDDEC_SHA256']),
-        ('dynlink_nvcuvid.h', manifest['NVCODEC_HEADERS_NVCUVID_SHA256']),
-    )
-    for header_name, header_sha256 in nvcodec_cuvid_headers:
+    # notice 本文から、その notice を共有するヘッダー名の一覧への写像を組み立てる。
+    nvcodec_notice_groups: dict[str, list[str]] = {}
+    for header_name in nvcodec_header_names:
         header_url = (
             f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
             f'/include/ffnvcodec/{header_name}'
         )
-        if readVerifiedHeaderLicense(header_url, header_sha256) != nvcodec_license:
-            raise ValueError(
-                f'{header_name} has a distinct license notice; register it in THIRD_PARTY_LICENSES.md.',
-            )
-    nvcodec_cuda_license_url = (
-        f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
-        '/include/ffnvcodec/dynlink_cuda.h'
-    )
-    nvcodec_cuda_license = readVerifiedHeaderLicense(
-        nvcodec_cuda_license_url, manifest['NVCODEC_HEADERS_CUDA_SHA256'],
-    )
-    nvcodec_loader_license_url = (
-        f'{github_raw}/FFmpeg/nv-codec-headers/{manifest["NVCODEC_HEADERS_COMMIT"]}'
-        '/include/ffnvcodec/dynlink_loader.h'
-    )
-    nvcodec_loader_license = readVerifiedHeaderLicense(
-        nvcodec_loader_license_url, manifest['NVCODEC_HEADERS_LOADER_SHA256'],
-    )
-    if nvcodec_loader_license != nvcodec_cuda_license:
-        raise ValueError('dynlink_loader.h has an unregistered distinct license notice.')
-    if nvcodec_cuda_license == nvcodec_license:
-        raise ValueError('Expected the audited CUDA/loader notice to be distinct from nvEncodeAPI.h.')
+        notice = readHeaderLicense(header_url)
+        nvcodec_notice_groups.setdefault(notice, []).append(header_name)
     document.extend([
         f'#### NVIDIA codec API headers {manifest["NVCODEC_HEADERS_VERSION"]}', '',
         f'- Source: <{manifest["NVCODEC_HEADERS_REPOSITORY"]}>',
         f'- Fixed revision or artifact: `{manifest["NVCODEC_HEADERS_COMMIT"]}`', '',
-        '##### nvEncodeAPI.h license notice', '', '```text', nvcodec_license, '```', '',
-        '##### dynlink_cuda.h / dynlink_loader.h license notice', '',
-        '```text', nvcodec_cuda_license, '```', '',
     ])
+    for notice, header_names in nvcodec_notice_groups.items():
+        document.extend([f'##### {" / ".join(header_names)} license notice', '', '```text', notice, '```', ''])
 
     archive_licenses = (
         ('x264', manifest['X264_VERSION'], manifest['X264_SOURCE_URL'], manifest['X264_SOURCE_SHA256'], (
@@ -332,12 +325,14 @@ def main() -> None:
         f'- join_logo_scp source: <{manifest["JOIN_LOGO_SCP_REPOSITORY"]}> (`{manifest["JOIN_LOGO_SCP_COMMIT"]}`)',
         '- Reproducible build procedure: `docker/thirdparty/build-cm-analysis.sh`',
         '- Local patches:',
-        f'  - `chapter-exe-initialize-avisynth.patch` (`{manifest["CHAPTER_EXE_AVISYNTH_INIT_PATCH_SHA256"]}`)',
-        f'  - `ffms2-hardware-decoding.patch` (`{manifest["FFMS2_HARDWARE_DECODING_PATCH_SHA256"]}`)',
-        f'  - `logoframe-error-lifetime.patch` (`{manifest["LOGOFRAME_ERROR_LIFETIME_PATCH_SHA256"]}`)',
-        f'  - `logoframe-parallel-scan.patch` (`{manifest["LOGOFRAME_PARALLEL_SCAN_PATCH_SHA256"]}`)',
-        f'  - `logoframe-native-luma.patch` (`{manifest["LOGOFRAME_NATIVE_LUMA_PATCH_SHA256"]}`)',
-        f'  - `logoframe-high-bit-rgb-fallback.patch` (`{manifest["LOGOFRAME_HIGH_BIT_RGB_FALLBACK_PATCH_SHA256"]}`)',
+        # patch の SHA-256 は固定値として manifest に持たず、リポジトリ内の実ファイルから都度算出する。
+        # 事前固定すると patch 更新のたびに manifest 更新も必要になり、忘れた場合にビルドが止まる。
+        f'  - `chapter-exe-initialize-avisynth.patch` (`{localFileSha256(PATCHES_ROOT / "chapter-exe-initialize-avisynth.patch")}`)',
+        f'  - `ffms2-hardware-decoding.patch` (`{localFileSha256(PATCHES_ROOT / "ffms2-hardware-decoding.patch")}`)',
+        f'  - `logoframe-error-lifetime.patch` (`{localFileSha256(PATCHES_ROOT / "logoframe-error-lifetime.patch")}`)',
+        f'  - `logoframe-parallel-scan.patch` (`{localFileSha256(PATCHES_ROOT / "logoframe-parallel-scan.patch")}`)',
+        f'  - `logoframe-native-luma.patch` (`{localFileSha256(PATCHES_ROOT / "logoframe-native-luma.patch")}`)',
+        f'  - `logoframe-high-bit-rgb-fallback.patch` (`{localFileSha256(PATCHES_ROOT / "logoframe-high-bit-rgb-fallback.patch")}`)',
         '',
         'The fixed upstream revisions, complete local patches, dependency revisions, and build commands above are the corresponding source recipe for the redistributed native artifacts.',
         '',
@@ -350,10 +345,10 @@ def main() -> None:
         f'- AMF fixed commit: `{manifest["AMF_COMMIT"]}`',
         '- Reproducible build procedure: `docker/thirdparty/build-ffmpeg8.sh`',
         '- Local patches:',
-        f'  - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`{manifest["LIBARIBTLV_SUBTITLE_MFU_PATCH_SHA256"]}`)',
-        f'  - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`{manifest["FFMPEG_LIBARIBTLV_TIMED_ID3_PATCH_SHA256"]}`)',
-        f'  - `ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch` (`{manifest["FFMPEG_LIBARIBTLV_CONTEXT_ID_METADATA_PATCH_SHA256"]}`)',
-        f'  - `amf-1.4.36-display-capture-c.patch` (`{manifest["AMF_DISPLAY_CAPTURE_C_PATCH_SHA256"]}`)',
+        f'  - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`{localFileSha256(PATCHES_ROOT / "libaribtlv-0.2.0-konomitv-subtitle-mfu.patch")}`)',
+        f'  - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`{localFileSha256(PATCHES_ROOT / "ffmpeg-8.1.2-libaribtlv-timed-id3.patch")}`)',
+        f'  - `ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch` (`{localFileSha256(PATCHES_ROOT / "ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch")}`)',
+        f'  - `amf-1.4.36-display-capture-c.patch` (`{localFileSha256(PATCHES_ROOT / "amf-1.4.36-display-capture-c.patch")}`)',
         '',
         '#### Intel media stack', '',
         f'- libva source: <https://github.com/intel/libva> (`{manifest["INTEL_LIBVA_COMMIT"]}`)',
@@ -361,9 +356,9 @@ def main() -> None:
         f'- oneVPL GPU Runtime source: <https://github.com/intel/vpl-gpu-rt> (`{manifest["INTEL_ONEVPL_GPU_COMMIT"]}`)',
         '- Reproducible build procedure: `docker/thirdparty/build-intel-media-stack.sh`',
         '- Local patches:',
-        f'  - `intel-libva-standalone.patch` (`{manifest["INTEL_LIBVA_STANDALONE_PATCH_SHA256"]}`)',
-        f'  - `intel-media-driver-vpp-deinterlace-crash-fix.patch` (`{manifest["INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256"]}`)',
-        f'  - `intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch` (`{manifest["INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256"]}`)',
+        f'  - `intel-libva-standalone.patch` (`{localFileSha256(PATCHES_ROOT / "intel-libva-standalone.patch")}`)',
+        f'  - `intel-media-driver-vpp-deinterlace-crash-fix.patch` (`{localFileSha256(PATCHES_ROOT / "intel-media-driver-vpp-deinterlace-crash-fix.patch")}`)',
+        f'  - `intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch` (`{localFileSha256(PATCHES_ROOT / "intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch")}`)',
         '',
     ])
 

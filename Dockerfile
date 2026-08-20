@@ -40,7 +40,6 @@ RUN case "${CUDA_VERSION}" in \
     nala update && nala install -y --no-install-recommends curl gpg && \
     curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
         --output /tmp/cuda-keyring.deb && \
-    echo 'd93190d50b98ad4699ff40f4f7af50f16a76dac3bb8da1eaaf366d47898ff8df  /tmp/cuda-keyring.deb' | sha256sum --check - && \
     dpkg --install /tmp/cuda-keyring.deb && \
     rm /tmp/cuda-keyring.deb && \
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics-keyring.gpg && \

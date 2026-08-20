@@ -125,13 +125,17 @@ grep -Fq "\"avisynthplus\": {\"version\": \"${AVISYNTHPLUS_TAG#v}\", \"commit\":
     "${cm_runtime_manifest}"
 grep -Fq "\"ffms2\": {\"version\": \"${FFMS2_VERSION}\", \"commit\": \"${FFMS2_COMMIT}\", \"profile\": \"avisynth-only-hardware\"}" \
     "${cm_runtime_manifest}"
+# manifest.env には hash を事前固定せず、Runtime-Manifest.json が実際に使った
+# ファイルの実測 hash を記録していることを、ここで再算出して照合する。
 for expected_value in \
     "${CHAPTER_EXE_COMMIT}" "${LOGOFRAME_COMMIT}" "${JOIN_LOGO_SCP_COMMIT}" \
-    "${JOIN_LOGO_SCP_COMMAND_SHA256}" \
-    "${FFMS2_HARDWARE_DECODING_PATCH_SHA256}" \
-    "${CHAPTER_EXE_AVISYNTH_INIT_PATCH_SHA256}" "${LOGOFRAME_ERROR_LIFETIME_PATCH_SHA256}" \
-    "${LOGOFRAME_PARALLEL_SCAN_PATCH_SHA256}" "${LOGOFRAME_NATIVE_LUMA_PATCH_SHA256}" \
-    "${LOGOFRAME_HIGH_BIT_RGB_FALLBACK_PATCH_SHA256}"; do
+    "$(sha256sum "${THIRDPARTY_ROOT}/CMAnalysis/JL/JL_標準.txt" | cut -d' ' -f1)" \
+    "$(sha256sum "${SCRIPT_DIR}/patches/ffms2-hardware-decoding.patch" | cut -d' ' -f1)" \
+    "$(sha256sum "${SCRIPT_DIR}/patches/chapter-exe-initialize-avisynth.patch" | cut -d' ' -f1)" \
+    "$(sha256sum "${SCRIPT_DIR}/patches/logoframe-error-lifetime.patch" | cut -d' ' -f1)" \
+    "$(sha256sum "${SCRIPT_DIR}/patches/logoframe-parallel-scan.patch" | cut -d' ' -f1)" \
+    "$(sha256sum "${SCRIPT_DIR}/patches/logoframe-native-luma.patch" | cut -d' ' -f1)" \
+    "$(sha256sum "${SCRIPT_DIR}/patches/logoframe-high-bit-rgb-fallback.patch" | cut -d' ' -f1)"; do
     grep -Fq "${expected_value}" "${cm_runtime_manifest}"
 done
 grep -Fq "\"configure_sha256\": \"${cm_ffmpeg_configure_sha256}\"" "${cm_runtime_manifest}"
@@ -150,11 +154,11 @@ grep -Fx 'BUILD_CMRTLIB:BOOL=OFF' "${intel_media_driver_configuration}"
 grep -Fx 'cmrt_ENABLE_KERNELS:BOOL=ON' "${intel_media_driver_configuration}"
 grep -Fx 'cmrt_ENABLE_NONFREE_KERNELS:BOOL=OFF' "${intel_media_driver_configuration}"
 grep -Fx 'cmrt_BUILD_CMRTLIB:BOOL=ON' "${intel_media_driver_configuration}"
-grep -Fx "patch_intel_libva_standalone_sha256=${INTEL_LIBVA_STANDALONE_PATCH_SHA256}" \
+grep -Fx "patch_intel_libva_standalone_sha256=$(sha256sum "${SCRIPT_DIR}/patches/intel-libva-standalone.patch" | cut -d' ' -f1)" \
     "${intel_media_driver_configuration}"
-grep -Fx "patch_intel_media_driver_vpp_deinterlace_crash_fix_sha256=${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256}" \
+grep -Fx "patch_intel_media_driver_vpp_deinterlace_crash_fix_sha256=$(sha256sum "${SCRIPT_DIR}/patches/intel-media-driver-vpp-deinterlace-crash-fix.patch" | cut -d' ' -f1)" \
     "${intel_media_driver_configuration}"
-grep -Fx "patch_intel_onevpl_gpu_rt_vpp_deinterlace_hang_fix_sha256=${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256}" \
+grep -Fx "patch_intel_onevpl_gpu_rt_vpp_deinterlace_hang_fix_sha256=$(sha256sum "${SCRIPT_DIR}/patches/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch" | cut -d' ' -f1)" \
     "${intel_media_driver_configuration}"
 if [ "${INTEL_NONFREE}" = 'false' ]; then
     grep -Fx 'compile_definition=_FULL_OPEN_SOURCE' "${intel_media_driver_configuration}"

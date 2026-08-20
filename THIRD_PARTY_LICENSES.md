@@ -3358,7 +3358,7 @@ SOFTWARE.
 - Source: <https://github.com/FFmpeg/nv-codec-headers.git>
 - Fixed revision or artifact: `1889e62e2d35ff7aa9baca2bceb14f053785e6f1`
 
-##### nvEncodeAPI.h license notice
+##### nvEncodeAPI.h / dynlink_cuviddec.h / dynlink_nvcuvid.h license notice
 
 ```text
 This copyright notice applies to this header file only:
