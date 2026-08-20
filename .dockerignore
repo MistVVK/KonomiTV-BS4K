@@ -6,6 +6,9 @@ config.yaml
 .env
 compose.override.yaml
 
+# Development の設定・DB・ログ・録画などのローカル状態
+docker/development/state/
+
 # Git metadata: バージョン判定は実行時の read-only source tree bind mount を利用する
 .git/
 
