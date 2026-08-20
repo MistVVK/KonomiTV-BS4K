@@ -538,13 +538,22 @@ async def UserLogoutAPI(
     response: Response,
     refresh_token_cookie: Annotated[str | None, Cookie(alias=REFRESH_TOKEN_COOKIE_NAME)] = None,
 ):
-    """現在の更新トークンを失効させ、Cookieを削除する。"""
+    """現在の更新トークンファミリーを失効させ、Cookieを削除する。"""
 
     if refresh_token_cookie is not None:
-        await RefreshToken.filter(
-            token_hash = HashRefreshToken(refresh_token_cookie),
-            revoked_at__isnull = True,
-        ).update(revoked_at = timezone.now())
+        now = timezone.now()
+
+        # refresh と logout が同じトークンで競合しても、refresh が作成した後継を含めて失効させる。
+        ## すでにローテーション済みの古いトークンも検索対象に残し、同じ行をロックして refresh と直列化する。
+        async with in_transaction() as connection:
+            refresh_token = await RefreshToken.filter(
+                token_hash = HashRefreshToken(refresh_token_cookie),
+            ).select_for_update().using_db(connection).get_or_none()
+
+            if refresh_token is not None:
+                await RefreshToken.filter(
+                    family_id = refresh_token.family_id,
+                ).using_db(connection).update(revoked_at = now)
 
     DeleteRefreshTokenCookie(request, response)
 

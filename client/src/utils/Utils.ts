@@ -14,6 +14,9 @@ export default class Utils {
     // Server 側と同じ名前を維持し、Path を動画 endpoint だけへ限定する。
     private static readonly twitter_video_access_token_cookie_name = 'KonomiTV-TwitterVideoAccessToken';
 
+    // ログイン・ログアウトをまたいで古い非同期認証処理の結果を適用しないための、タブ内の認証世代
+    private static authentication_generation = 0;
+
     // バージョン情報
     // ビルド時の環境変数 (vue.config.js に記載) から取得
     static readonly version: string = import.meta.env.KONOMITV_VERSION;
@@ -48,6 +51,25 @@ export default class Utils {
         // LocalStorage の取得結果をそのまま返す
         // LocalStorage.getItem() はキーが存在しなければ（=ログインしていなければ）null を返す
         return localStorage.getItem('KonomiTV-AccessToken');
+    }
+
+
+    /**
+     * 現在のタブ内の認証世代を取得する
+     * @returns ログイン・ログアウトの開始ごとに増える認証世代
+     */
+    static getAuthenticationGeneration(): number {
+
+        return Utils.authentication_generation;
+    }
+
+
+    /**
+     * 進行中の古い認証処理を無効化するため、タブ内の認証世代を更新する
+     */
+    static invalidateAuthentication(): void {
+
+        Utils.authentication_generation += 1;
     }
 
 

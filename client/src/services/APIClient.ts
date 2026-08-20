@@ -47,6 +47,12 @@ interface IRefreshedAccessToken {
     access_token: string;
 }
 
+/** 同じ認証世代で共有するアクセストークン更新処理 */
+interface IAccessTokenRefreshState {
+    authentication_generation: number;
+    promise: Promise<string | null>;
+}
+
 
 /**
  * services/ 以下の各クラスから呼び出される、Axios の薄いラッパー
@@ -55,8 +61,8 @@ interface IRefreshedAccessToken {
  */
 class APIClient {
 
-    // 複数リクエストが同時に401になった場合、更新リクエストを一つにまとめる
-    private static refresh_promise: Promise<string | null> | null = null;
+    // 同じ認証世代で複数リクエストが同時に401になった場合、更新リクエストを一つにまとめる
+    private static refresh_state: IAccessTokenRefreshState | null = null;
 
     /** 同一オリジンのリクエストだけをKonomiTV内部リクエストとして扱う */
     private static isInternalRequest(url: string | undefined): boolean {
@@ -77,37 +83,40 @@ class APIClient {
     }
 
     /** HttpOnly Cookie の更新トークンでアクセストークンを更新する */
-    private static async refreshAccessToken(): Promise<string | null> {
+    private static async refreshAccessToken(authentication_generation: number): Promise<string | null> {
 
-        if (APIClient.refresh_promise === null) {
-            APIClient.refresh_promise = (async () => {
-                try {
-                    const response = await axios.post<IRefreshedAccessToken>(
-                        `${Utils.api_base_url}/users/refresh`,
-                        undefined,
-                        {
-                            withCredentials: true,
-                            timeout: 30 * 1000,
-                            transitional: {clarifyTimeoutError: true},
-                        },
-                    );
-                    if (typeof response.data.access_token !== 'string' || response.data.access_token.length === 0) {
+        if (APIClient.refresh_state === null || APIClient.refresh_state.authentication_generation !== authentication_generation) {
+            APIClient.refresh_state = {
+                authentication_generation,
+                promise: (async () => {
+                    try {
+                        const response = await axios.post<IRefreshedAccessToken>(
+                            `${Utils.api_base_url}/users/refresh`,
+                            undefined,
+                            {
+                                withCredentials: true,
+                                timeout: 30 * 1000,
+                                transitional: {clarifyTimeoutError: true},
+                            },
+                        );
+                        if (typeof response.data.access_token !== 'string' || response.data.access_token.length === 0) {
+                            return null;
+                        }
+                        return response.data.access_token;
+                    } catch {
+                        // 更新に失敗した場合は元の401レスポンスを呼び出し側へ返す
                         return null;
                     }
-                    return response.data.access_token;
-                } catch {
-                    // 更新に失敗した場合は元の401レスポンスを呼び出し側へ返す
-                    return null;
-                }
-            })();
+                })(),
+            };
         }
 
-        const refresh_promise = APIClient.refresh_promise;
+        const refresh_state = APIClient.refresh_state;
         try {
-            return await refresh_promise;
+            return await refresh_state.promise;
         } finally {
-            if (APIClient.refresh_promise === refresh_promise) {
-                APIClient.refresh_promise = null;
+            if (APIClient.refresh_state === refresh_state) {
+                APIClient.refresh_state = null;
             }
         }
     }
@@ -164,16 +173,27 @@ class APIClient {
 
         // エラーが発生した場合は IErrorResponse を返す
         if (result instanceof AxiosError) {
+            const authentication_generation = Utils.getAuthenticationGeneration();
+            const access_token_before_refresh = Utils.getAccessToken();
+
             // アクセストークンの期限切れなどは、HttpOnly更新トークンで一度だけ再試行する
             if (
                 allow_access_token_refresh
                 && result.response?.status === 401
-                && Utils.getAccessToken() !== null
+                && access_token_before_refresh !== null
                 && APIClient.isInternalRequest(request.url)
                 && APIClient.isRefreshExcluded(request.url) === false
             ) {
-                const access_token = await APIClient.refreshAccessToken();
-                if (access_token !== null) {
+                const access_token = await APIClient.refreshAccessToken(authentication_generation);
+                const current_access_token = Utils.getAccessToken();
+
+                // refresh の待機中にログイン・ログアウトや別タブでの認証変更があった場合、古い結果を保存しない
+                // 同じ共有 refresh を待つ別リクエストが先に保存済みの場合だけは、そのまま同じトークンで再試行する
+                if (
+                    access_token !== null
+                    && Utils.getAuthenticationGeneration() === authentication_generation
+                    && (current_access_token === access_token_before_refresh || current_access_token === access_token)
+                ) {
                     Utils.saveAccessToken(access_token);
                     if (request.headers instanceof AxiosHeaders) {
                         request.headers.set('Authorization', `Bearer ${access_token}`);

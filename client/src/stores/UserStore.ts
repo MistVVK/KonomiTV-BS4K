@@ -74,6 +74,9 @@ const useUserStore = defineStore('user', {
          */
         async login(username: string, password: string, silent: boolean = false): Promise<boolean> {
 
+            // 進行中の古いアクセストークン更新が、ログイン結果を後から上書きしないようにする
+            Utils.invalidateAuthentication();
+
             // アクセストークンを発行
             const access_token = await Users.createUserAccessToken(username, password);
             if (access_token === null) {
@@ -102,6 +105,9 @@ const useUserStore = defineStore('user', {
          * @param silent ログアウトしたことをメッセージで通知しない場合は true
          */
         logout(silent: boolean = false): void {
+
+            // 進行中のアクセストークン更新が、削除後に認証状態を復活させないようにする
+            Utils.invalidateAuthentication();
 
             // 設定の同期を無効化
             const settings_store = useSettingsStore();
