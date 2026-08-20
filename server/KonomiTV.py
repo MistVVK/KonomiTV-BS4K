@@ -14,6 +14,7 @@ from typing import cast
 import typer
 import uvicorn
 from aerich import Command
+from aerich.models import Aerich
 from tortoise import Tortoise
 from uvicorn.supervisors.watchfilesreload import WatchFilesReload
 
@@ -179,6 +180,23 @@ def main(
     async def UpgradeDatabase():
         command = Command(tortoise_config=DATABASE_CONFIG, app='models', location='./app/migrations/')
         await command.init()
+
+        # KonomiTV-BS4K 1.1.x で配布済みの migration は、既存の番号 12 と重複していた。
+        ## Aerich は先頭番号だけで file を並べるため、新しい一意な番号へ変更するとともに、
+        ## 適用済み DB の履歴も先に読み替えて同じ ALTER TABLE が再実行されないようにする。
+        old_version = '12_20260801220000_update.py'
+        new_version = '35_20260801220000_update.py'
+        old_migration = await Aerich.filter(app='models', version=old_version).first()
+        if old_migration is not None:
+            new_migration_exists = await Aerich.exists(app='models', version=new_version)
+            if new_migration_exists is True:
+                # 両方の履歴がある異常状態では、新しい正本だけを残す。
+                await old_migration.delete()
+            else:
+                old_migration.version = new_version
+                await old_migration.save(update_fields=['version'])
+            logging.info(f'Normalized database migration history from {old_version} to {new_version}.')
+
         migrated = await command.upgrade(run_in_transaction=True)
         await Tortoise.close_connections()
         if not migrated:
