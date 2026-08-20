@@ -270,11 +270,16 @@ def test_hardware_encoder_validator_rejects_failed_ffmpeg8_probe(
 ) -> None:
     """非0終了または出力ファイルを生成しない FFmpeg 8 能力検査を拒否する。"""
 
+    from app.streams.RecordedPlaybackCapabilities import RecordedPlaybackBackend
+
     def Run(command: list[str], **_kwargs) -> subprocess.CompletedProcess[bytes]:
         if create_output is True:
             Path(command[-1]).write_bytes(b'probe')
         return subprocess.CompletedProcess(command, returncode, b'', b'probe failed')
 
+    # validator は QSV/AMF で実在する render node を探すため、GPU の無い検証環境でも
+    # probe 失敗経路そのものを検査できるよう render node 列挙を固定する
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
     monkeypatch.setattr('app.config.subprocess.run', Run)
 
     with pytest.raises(ValueError):
@@ -286,12 +291,17 @@ def test_hardware_encoder_validator_accepts_successful_capability_and_version(
 ) -> None:
     """H.264/H.265 実出力と正常な FFmpeg 8 version を返す HW encoder は受理する。"""
 
+    from app.streams.RecordedPlaybackCapabilities import RecordedPlaybackBackend
+
     def Run(command: list[str], **_kwargs) -> subprocess.CompletedProcess[bytes]:
         if command[-1] == '-version':
             return subprocess.CompletedProcess(command, 0, b'ffmpeg version n8.1.2\n', b'')
         Path(command[-1]).write_bytes(b'probe')
         return subprocess.CompletedProcess(command, 0, b'', b'')
 
+    # validator は QSV/AMF で実在する render node を探すため、GPU の無い検証環境や
+    # Intel GPU を持たないホストでも受理経路を検査できるよう render node 列挙を固定する
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
     monkeypatch.setattr('app.config.subprocess.run', Run)
 
     assert _ServerSettingsGeneral._validate_encoder_value('QSV') == 'QSV'
@@ -300,9 +310,14 @@ def test_hardware_encoder_validator_accepts_successful_capability_and_version(
 def test_hardware_encoder_validator_rejects_probe_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     """応答しないHW encoderを設定時に受理しない。"""
 
+    from app.streams.RecordedPlaybackCapabilities import RecordedPlaybackBackend
+
     def Run(command: list[str], **_kwargs) -> subprocess.CompletedProcess[bytes]:
         raise subprocess.TimeoutExpired(command, 10)
 
+    # validator は QSV/AMF で実在する render node を探すため、GPU の無い検証環境でも
+    # probe 応答なし経路そのものを検査できるよう render node 列挙を固定する
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
     monkeypatch.setattr('app.config.subprocess.run', Run)
 
     with pytest.raises(ValueError):
