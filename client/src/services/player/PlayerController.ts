@@ -405,6 +405,16 @@ class PlayerController {
         );
     }
 
+
+    /** 画質切り替えやプレイヤー破棄で不要になった録画 HLS セッションを終了する。 */
+    private async destroyRecordedPlaybackSession(source_url: string | null): Promise<void> {
+        if (source_url === null) return;
+        const session_url = new URL(source_url);
+        if (session_url.pathname.endsWith('/playlist') === false) return;
+        session_url.pathname = `${session_url.pathname.slice(0, -'/playlist'.length)}/session`;
+        await APIClient.delete(session_url.toString());
+    }
+
     /** 非同期初期化が現在の route / 再生対象に属することを確実にする。 */
     private assertInitializationIsCurrent(generation: number, playback_target_key: string): void {
         if (this.isInitializationCurrent(generation, playback_target_key) === false) {
@@ -1667,12 +1677,33 @@ class PlayerController {
             // DPlayer の画質切り替え時にも現在の再生位置から HLS セグメントをロードさせるためのモンキーパッチを適用
             const dplayer_instance = this.player;
             const originalSwitchQuality = dplayer_instance.switchQuality.bind(dplayer_instance);
+            let is_recorded_quality_switch_pending = false;
             dplayer_instance.switchQuality = (index: number): void => {
-                if (dplayer_instance.options?.pluginOptions?.hls && dplayer_instance.video && dplayer_instance.options.live !== true) {
-                    // 画質切り替え前の再生位置を hls.js の startPosition に指定して、無駄な HLS セグメントの取得を抑止する
-                    dplayer_instance.options.pluginOptions.hls.startPosition = dplayer_instance.video.currentTime;
-                }
-                originalSwitchQuality(index);
+                if (
+                    dplayer_instance.options.video.quality === undefined ||
+                    dplayer_instance.qualityIndex === index ||
+                    dplayer_instance.switchingQuality === true ||
+                    is_recorded_quality_switch_pending === true
+                ) return;
+
+                // 旧 HLS の通信を止め、Server の admission 枠が解放されてから次画質を開始する。
+                // 終了 API が先着しても Server 側のバリアが遅着 playlist によるセッション復活を防ぐ。
+                is_recorded_quality_switch_pending = true;
+                const previous_source_url = dplayer_instance.quality?.url ?? null;
+                dplayer_instance.plugins.hls?.stopLoad();
+                void this.destroyRecordedPlaybackSession(previous_source_url).finally(() => {
+                    is_recorded_quality_switch_pending = false;
+                    if (
+                        this.player !== dplayer_instance ||
+                        this.destroying === true ||
+                        this.destroyed === true
+                    ) return;
+                    if (dplayer_instance.options?.pluginOptions?.hls && dplayer_instance.video) {
+                        // 切り替え直前の再生位置からロードし、終了 API の待機中に進んだ位置も引き継ぐ。
+                        dplayer_instance.options.pluginOptions.hls.startPosition = dplayer_instance.video.currentTime;
+                    }
+                    originalSwitchQuality(index);
+                });
             };
 
             this.setupRecordedHLSAudioTrackSelector();
@@ -4638,6 +4669,10 @@ class PlayerController {
     private async destroyPlayer(): Promise<void> {
         const settings_store = useSettingsStore();
         const player_store = usePlayerStore();
+        const recorded_playback_source_url = (
+            this.playback_mode === 'Video' &&
+            player_store.is_offline_playback === false
+        ) ? this.player?.quality?.url ?? null : null;
 
         // 視聴履歴の最終位置を更新
         // 現在の再生位置を取得するため、プレイヤーの破棄前に実行する必要がある
@@ -4811,6 +4846,9 @@ class PlayerController {
             }
             this.player = null;
         }
+
+        // hls.js の要求を止めた後に終了を通知し、同じ Controller の再起動が旧セッション枠と競合しないようにする。
+        await this.destroyRecordedPlaybackSession(recorded_playback_source_url);
 
         // PRA の AudioBufferSourceNode は各レンダラーの dispose() と DPlayer の destroy() で停止・切断済み。
         // close() の完了まで待って AudioContext の音声デバイス資源を解放し、遅延 decode の保持も無効化する。

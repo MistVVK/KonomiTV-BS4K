@@ -237,6 +237,10 @@ class RecordedFMP4Stream:
         # 既存・新規を問わず session_id 形式を先に検査する
         cls.validateSessionId(session_id)
 
+        # 画質切り替えで終了したセッションの遅着要求は、新規セッションとして復活させない。
+        if session_id in cls._destroying_session_ids:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Recorded stream is being destroyed')
+
         # 録画削除と競合して依存解決済みの古い要求が到着しても、元ファイルを再び開かせない。
         if recorded_program.id in cls._deleting_recorded_program_ids:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Recorded video is being deleted')
@@ -272,7 +276,7 @@ class RecordedFMP4Stream:
             instance._offline_work_progress = {}
             instance._destroy_handle = asyncio.get_running_loop().call_later(
                 cls.SESSION_TIMEOUT,
-                lambda: asyncio.create_task(instance.__destroyIfIdle()),
+                lambda: asyncio.create_task(instance.__destroyIfIdle(instance._destroy_handle)),
             )
             cls._instances[session_id] = instance
             cls._session_client_keys[session_id] = client_key
@@ -400,12 +404,23 @@ class RecordedFMP4Stream:
         self._destroy_handle.cancel()
         self._destroy_handle = asyncio.get_running_loop().call_later(
             self.SESSION_TIMEOUT,
-            lambda: asyncio.create_task(self.__destroyIfIdle()),
+            lambda: asyncio.create_task(self.__destroyIfIdle(self._destroy_handle)),
         )
 
-    async def __destroyIfIdle(self) -> None:
-        """生成中の要求があればセッション破棄を延期する。"""
+    async def __destroyIfIdle(self, destroy_handle: asyncio.TimerHandle | None = None) -> None:
+        """生成中の要求や更新済みタイマーがあればセッション破棄を延期する。
 
+        Args:
+            destroy_handle: この破棄 Task を起動した TimerHandle。テストからの直接呼び出しでは None。
+
+        Returns:
+            None
+        """
+
+        # call_later() 発火後、生成した Task の開始前に Keep-Alive が届くことがある。
+        # その場合は旧 TimerHandle が作った Task から更新後のセッションを破棄しない。
+        if destroy_handle is not None and destroy_handle is not self._destroy_handle:
+            return
         if self._active_operations > 0:
             self.keepAlive()
             return
@@ -455,6 +470,60 @@ class RecordedFMP4Stream:
         """
 
         return session_id in cls._instances
+
+    @classmethod
+    async def destroySession(
+        cls,
+        session_id: str,
+        recorded_program: RecordedProgram,
+        quality: QUALITY_TYPES,
+        encoding_options: StreamEncodingOptions,
+    ) -> None:
+        """指定した録画視聴セッションを終了し、遅着要求による再作成を防ぐ。
+
+        Args:
+            session_id: クライアントが発行した視聴セッションID。
+            recorded_program: セッションが再生している録画番組。
+            quality: セッションに固定された画質。
+            encoding_options: セッションに固定されたエンコード条件。
+
+        Returns:
+            None
+        """
+
+        cls.validateSessionId(session_id)
+        instance = cls._instances.get(session_id)
+        if instance is not None:
+            # 別録画・別生成条件の session_id を第三者が終了できないよう、既存の条件照合を通す。
+            instance = cls(
+                session_id,
+                recorded_program,
+                quality,
+                encoding_options=encoding_options,
+            )
+            await instance.destroy()
+            return
+
+        # playlist の依存解決中に終了要求が先着した場合も、遅れて来る新規作成を拒否する。
+        cls._destroying_session_ids.add(session_id)
+        cls.__scheduleDestroyBarrierRemoval(session_id)
+
+    @classmethod
+    def __scheduleDestroyBarrierRemoval(cls, session_id: str) -> None:
+        """遅着 HTTP 要求が消えるまでセッション終了バリアを保持する。
+
+        Args:
+            session_id: 終了した視聴セッションID。
+
+        Returns:
+            None
+        """
+
+        asyncio.get_running_loop().call_later(
+            cls.SESSION_TIMEOUT,
+            cls._destroying_session_ids.discard,
+            session_id,
+        )
 
     @classmethod
     async def destroyByRecordedProgramID(cls, recorded_program_id: int) -> None:
@@ -698,7 +767,8 @@ class RecordedFMP4Stream:
                     await RecordedFMP4CacheManager.release(cache_path, self.session_id)
                 self._referenced_paths.clear()
                 self._active_operation_tasks.pop(self.session_id, None)
-                self._destroying_session_ids.discard(self.session_id)
+                # 破棄と競合した playlist 要求が同じ ID を再作成しないよう、idle timeout 1回分はバリアを残す。
+                self.__scheduleDestroyBarrierRemoval(self.session_id)
         finally:
             if destroy_lock.locked() is False and self._destroy_locks.get(self.session_id) is destroy_lock:
                 self._destroy_locks.pop(self.session_id, None)

@@ -1089,3 +1089,32 @@ async def VideoHLSKeepAliveAPI(
 
     # セッションのアクティブ状態を維持する
     video_stream.keepAlive()
+
+
+@router.delete(
+    '/{video_id}/{quality}/session',
+    summary = '録画番組 HLS セッション終了 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def VideoHLSSessionDeleteAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query(description='終了するセッション ID。')],
+) -> None:
+    """画質切り替えやプレイヤー破棄で不要になった録画視聴セッションを直ちに終了する。
+
+    Args:
+        recorded_program: 再生対象の録画番組。
+        stream_quality: 終了するセッションに固定された画質と生成条件。
+        session_id: 終了する視聴セッションID。
+
+    Returns:
+        None
+    """
+
+    await RecordedFMP4Stream.destroySession(
+        session_id,
+        recorded_program,
+        stream_quality.quality,
+        stream_quality.encoding_options,
+    )
