@@ -774,13 +774,21 @@ export const ENVIRONMENT_SPECIFIC_SETTINGS_KEYS: (keyof ILocalClientSettings)[] 
 export function getLocalStorageSettings(): {[key: string]: any} {
     const settings = localStorage.getItem('KonomiTV-Settings');
     if (settings !== null) {
-        return JSON.parse(settings);
-    } else {
-        // もし LocalStorage に KonomiTV-Settings キーがまだない場合、あらかじめデフォルトの設定値を保存しておく
-        const default_settings = structuredClone(ILocalClientSettingsDefault);
-        setLocalStorageSettings(default_settings);
-        return default_settings;
+        try {
+            const parsed_settings: unknown = JSON.parse(settings);
+            if (typeof parsed_settings === 'object' && parsed_settings !== null && Array.isArray(parsed_settings) === false) {
+                return parsed_settings as {[key: string]: any};
+            }
+            console.warn('Client settings in LocalStorage are not a JSON object. Resetting to defaults.');
+        } catch {
+            console.warn('Failed to parse client settings from LocalStorage. Resetting to defaults.');
+        }
     }
+
+    // LocalStorage に設定がない場合や保存内容が破損している場合は、起動可能なデフォルト設定へ復旧する
+    const default_settings = structuredClone(ILocalClientSettingsDefault);
+    setLocalStorageSettings(default_settings);
+    return default_settings;
 }
 
 /**
