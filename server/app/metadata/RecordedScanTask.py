@@ -174,6 +174,8 @@ class RecordedScanTask:
     # 一括スキャンは録画単位のパイプラインを複数流し、別録画の各解析段階を重ねる。
     # 各MetadataAnalyzerが子プロセスを1つ使うため、CPUコア数の50%を上限とする。
     BATCH_PIPELINE_CONCURRENCY: ClassVar[int] = max(1, (os.cpu_count() or 2) // 2)
+    # watcherはイベント受信を索引・CM解析の完了待ちから分離しつつ、batchと同じ上限で処理する。
+    WATCH_PIPELINE_CONCURRENCY: ClassVar[int] = BATCH_PIPELINE_CONCURRENCY
 
 
     def __new__(cls) -> RecordedScanTask:
@@ -1956,6 +1958,63 @@ class RecordedScanTask:
         # 録画完了チェック用のタスク
         completion_check_task = asyncio.create_task(self.__checkRecordingCompletion())
 
+        # watchfilesのデバウンス後も同じpathへ連続イベントが届くため、待機中・処理中を問わず
+        # 最新イベント1件へ集約する。固定数workerだけがprocess pipelineへ入り、task数を増やさない。
+        change_queue: asyncio.Queue[str] = asyncio.Queue()
+        pending_changes: dict[str, Change] = {}
+        scheduled_paths: set[str] = set()
+
+        def EnqueueChange(change_type: Change, file_path_str: str) -> None:
+            """同一pathの最新イベントを保持し、未処理pathだけをworker queueへ追加する。
+
+            Args:
+                change_type: watchfilesが通知した変更種別。
+                file_path_str: watchfilesが通知した変更path。
+
+            Returns:
+                None
+            """
+
+            pending_changes[file_path_str] = change_type
+            if file_path_str in scheduled_paths:
+                return
+            scheduled_paths.add(file_path_str)
+            change_queue.put_nowait(file_path_str)
+
+        async def ProcessChanges() -> None:
+            """path単位に集約された変更を順次処理する。
+
+            Returns:
+                None
+            """
+
+            while True:
+                file_path_str = await change_queue.get()
+                change_type = pending_changes.pop(file_path_str)
+                try:
+                    await self.__processRecordedFolderChange(
+                        change_type,
+                        file_path_str,
+                        exclude_scan_paths,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logging.error(f'{file_path_str}: Error processing queued file system change:', exc_info=ex)
+                finally:
+                    # 処理中に同じpathの新世代が届いた場合は末尾へ戻し、他pathにも処理機会を渡す。
+                    # 新世代がなければscheduled状態を外し、次のイベントで再度queueへ追加できるようにする。
+                    if file_path_str in pending_changes:
+                        change_queue.put_nowait(file_path_str)
+                    else:
+                        scheduled_paths.discard(file_path_str)
+                    change_queue.task_done()
+
+        pipeline_tasks = [
+            asyncio.create_task(ProcessChanges())
+            for _ in range(self.WATCH_PIPELINE_CONCURRENCY)
+        ]
+
         try:
             # watchfiles によるファイル監視
             async for changes in awatch(
@@ -1971,66 +2030,88 @@ class RecordedScanTask:
                     if not self._is_running:
                         break
 
-                    file_path = anyio.Path(file_path_str)
                     # Linux の inotify は監視 root 自体の削除後も generator を終了せず、同じ path が
                     # 再作成されても新 inode を監視しない。監督ループで watcher を作り直して追従する。
                     if change_type == Change.deleted and pathlib.Path(file_path_str) in watch_path_set:
                         raise FileNotFoundError(f'Recorded folder watch root disappeared: {file_path_str}')
-                    # chapter判定や録画拡張子判定より先に、CM解析workspaceの全イベントを除外する。
-                    if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(file_path_str)):
-                        continue
-                    # Mac の metadata ファイルをスキップ
-                    if file_path.name.startswith('._'):
-                        continue
-                    # 再生中にも生成・削除イベントが発生するため、キャッシュ管理側だけに処理を任せる。
-                    if RecordedFMP4CacheManager.isCacheFileName(file_path.name):
-                        await RecordedFMP4CacheManager.cleanupDiscovered(pathlib.Path(str(file_path)))
-                        continue
-                    # 除外パターンのチェック（シンボリックリンク解決前）
-                    original_path_str = str(file_path)
-                    if self.isPathExcludedByPatterns(original_path_str, exclude_scan_paths) is True:
-                        continue
-                    # シンボリックリンクを含むパスは実体に解決して処理する
-                    canonical_path = await self.resolveRecordedPath(file_path)
-                    if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(canonical_path))):
-                        continue
-                    # 除外パターンのチェック（シンボリックリンク解決後）
-                    canonical_path_str = str(canonical_path)
-                    if self.isPathExcludedByPatterns(canonical_path_str, exclude_scan_paths) is True:
-                        continue
-                    if await canonical_path.is_dir():
-                        continue
-                    # chapterイベントは通常の録画拡張子フィルターより先に元録画へ関連付ける。
-                    # 削除イベントでは実体が存在しないため、イベント種別を問わずファイル名から逆引きする。
-                    if canonical_path.name.lower().endswith(('.chapter.txt', '.konomitv-bs4k-chapters.yaml')):
-                        try:
-                            await self.__handleChapterFileChange(canonical_path)
-                        except Exception as ex:
-                            logging.error(f'{file_path}: Error handling chapter file change:', exc_info=ex)
-                        continue
-                    # 対象拡張子のファイル以外は無視
-                    if canonical_path.suffix.lower() not in self.SCAN_TARGET_EXTENSIONS:
-                        continue
+                    EnqueueChange(change_type, file_path_str)
 
-                    try:
-                        # 追加 or 変更イベント
-                        if change_type == Change.added or change_type == Change.modified:
-                            await self.__handleFileChange(canonical_path, original_file_path=file_path)
-                        # 削除イベント
-                        elif change_type == Change.deleted:
-                            await self.__handleFileDeletion(canonical_path, original_file_path=file_path)
-                    except Exception as ex:
-                        logging.error(f'{file_path}: Error handling file change:', exc_info=ex)
+            # watcherが正常終了した場合は、受理済みイベントを失わず処理してからworkerを回収する。
+            await change_queue.join()
 
         except asyncio.CancelledError:
             raise
         finally:
             completion_check_task.cancel()
-            try:
-                await completion_check_task
-            except asyncio.CancelledError:
-                pass
+            for pipeline_task in pipeline_tasks:
+                pipeline_task.cancel()
+            await asyncio.gather(completion_check_task, *pipeline_tasks, return_exceptions=True)
             logging.info('File system watch of recording folders has been stopped.')
+
+
+    async def __processRecordedFolderChange(
+        self,
+        change_type: Change,
+        file_path_str: str,
+        exclude_scan_paths: list[str],
+    ) -> None:
+        """watcherから受理した単一pathの最新変更を録画処理へ振り分ける。
+
+        Args:
+            change_type: watchfilesが通知した変更種別。
+            file_path_str: watchfilesが通知した変更path。
+            exclude_scan_paths: component境界を正規化済みの除外path一覧。
+
+        Returns:
+            None
+        """
+
+        file_path = anyio.Path(file_path_str)
+        # chapter判定や録画拡張子判定より先に、CM解析workspaceの全イベントを除外する。
+        if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(file_path_str)):
+            return
+        # Mac の metadata ファイルをスキップ
+        if file_path.name.startswith('._'):
+            return
+        # 再生中にも生成・削除イベントが発生するため、キャッシュ管理側だけに処理を任せる。
+        if RecordedFMP4CacheManager.isCacheFileName(file_path.name):
+            await RecordedFMP4CacheManager.cleanupDiscovered(pathlib.Path(str(file_path)))
+            return
+        # 除外パターンのチェック（シンボリックリンク解決前）
+        original_path_str = str(file_path)
+        if self.isPathExcludedByPatterns(original_path_str, exclude_scan_paths) is True:
+            return
+        # シンボリックリンクを含むパスは実体に解決して処理する
+        canonical_path = await self.resolveRecordedPath(file_path)
+        if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(canonical_path))):
+            return
+        # 除外パターンのチェック（シンボリックリンク解決後）
+        canonical_path_str = str(canonical_path)
+        if self.isPathExcludedByPatterns(canonical_path_str, exclude_scan_paths) is True:
+            return
+        if await canonical_path.is_dir():
+            return
+        # chapterイベントは通常の録画拡張子フィルターより先に元録画へ関連付ける。
+        # 削除イベントでは実体が存在しないため、イベント種別を問わずファイル名から逆引きする。
+        if canonical_path.name.lower().endswith(('.chapter.txt', '.konomitv-bs4k-chapters.yaml')):
+            try:
+                await self.__handleChapterFileChange(canonical_path)
+            except Exception as ex:
+                logging.error(f'{file_path}: Error handling chapter file change:', exc_info=ex)
+            return
+        # 対象拡張子のファイル以外は無視
+        if canonical_path.suffix.lower() not in self.SCAN_TARGET_EXTENSIONS:
+            return
+
+        try:
+            # 追加 or 変更イベント
+            if change_type == Change.added or change_type == Change.modified:
+                await self.__handleFileChange(canonical_path, original_file_path=file_path)
+            # 削除イベント
+            elif change_type == Change.deleted:
+                await self.__handleFileDeletion(canonical_path, original_file_path=file_path)
+        except Exception as ex:
+            logging.error(f'{file_path}: Error handling file change:', exc_info=ex)
 
 
     async def __handleChapterFileChange(self, chapter_file_path: anyio.Path) -> None:
