@@ -151,6 +151,10 @@ class RecordedFMP4Stream:
     MAX_ENCODER_WAITERS: ClassVar[int] = 32
     SESSION_TIMEOUT: ClassVar[float] = 30.0
     SEEK_PREROLL_SECONDS: ClassVar[float] = 10.0
+    # CPUの低速codecとオフライン全編生成を許容しつつ、停止したencoderが処理枠を永久占有しない上限。
+    ENCODER_PROCESS_MIN_TIMEOUT_SECONDS: ClassVar[float] = 5 * 60.0
+    ENCODER_PROCESS_MAX_TIMEOUT_SECONDS: ClassVar[float] = 24 * 60 * 60.0
+    ENCODER_PROCESS_DURATION_MULTIPLIER: ClassVar[float] = 8.0
     # 現在要求は既存の単発経路で確実に返し、その直後だけを短い連続encodeへまとめる。
     # 2セグメントなら約12秒で、6秒の再生中に完了しやすくしつつ、単発2回分のprerollを1回へ減らせる。
     PLAYBACK_PREFETCH_MAX_SEGMENTS: ClassVar[int] = 2
@@ -749,11 +753,19 @@ class RecordedFMP4Stream:
     @staticmethod
     async def __communicateSubprocess(
         process: asyncio.subprocess.Process,
+        duration: float | None = None,
     ) -> tuple[bytes, bytes]:
-        """子プロセスをdrainし、キャンセルや例外時も必ず終了・回収する。"""
+        """子プロセスを有限時間でdrainし、キャンセルや例外時も必ず終了・回収する。"""
 
         try:
-            stdout, stderr = await process.communicate()
+            communicate = process.communicate()
+            if duration is None:
+                stdout, stderr = await communicate
+            else:
+                stdout, stderr = await asyncio.wait_for(
+                    communicate,
+                    timeout=RecordedFMP4Stream.__getEncoderProcessTimeout(duration),
+                )
             return stdout or b'', stderr or b''
         except BaseException:
             if process.returncode is None:
@@ -766,6 +778,24 @@ class RecordedFMP4Stream:
                 except (ProcessLookupError, OSError):
                     pass
             raise
+
+    @classmethod
+    def __getEncoderProcessTimeout(cls, duration: float) -> float:
+        """処理対象の媒体尺に比例する実エンコーダーの絶対タイムアウトを返す。
+
+        Args:
+            duration: エンコードまたは分割する媒体時間。
+
+        Returns:
+            低速なCPUエンコードも許容する5分から24時間までのタイムアウト秒数。
+        """
+
+        scaled_timeout = duration * cls.ENCODER_PROCESS_DURATION_MULTIPLIER \
+            if math.isfinite(duration) and duration > 0 else cls.ENCODER_PROCESS_MIN_TIMEOUT_SECONDS
+        return min(
+            cls.ENCODER_PROCESS_MAX_TIMEOUT_SECONDS,
+            max(cls.ENCODER_PROCESS_MIN_TIMEOUT_SECONDS, scaled_timeout),
+        )
 
     async def destroy(self) -> None:
         """セッション参照を解放し、キャッシュの60秒削除猶予を開始する。"""
@@ -2315,7 +2345,13 @@ class RecordedFMP4Stream:
         if plan is None:
             return
         command, backend, device, encoder_pixel_format = plan
-        stdout, stderr, returncode = await self.__runVideoEncodeProcess(command, backend, device, encoder_pixel_format)
+        stdout, stderr, returncode = await self.__runVideoEncodeProcess(
+            command,
+            backend,
+            device,
+            encoder_pixel_format,
+            segment.duration,
+        )
         if returncode != 0:
             logging.error(
                 '[RecordedFMP4Stream] FFmpeg 8 video segment failed. '
@@ -2332,6 +2368,7 @@ class RecordedFMP4Stream:
         backend: RecordedPlaybackEncoder,
         device: str | None,
         encoder_pixel_format: str,
+        duration: float,
     ) -> tuple[bytes, bytes, int]:
         """映像encoderを1回実行し、HW decode失敗時だけ同じGPUへ再試行する。
 
@@ -2340,6 +2377,7 @@ class RecordedFMP4Stream:
             backend: 実行する録画再生バックエンド。
             device: GPU render node。CPU encodeではNone。
             encoder_pixel_format: software decode再試行時のupload先pixel format。
+            duration: 生成する媒体時間。実行タイムアウトの算出に使う。
 
         Returns:
             stdout、stderr、終了コード。
@@ -2357,7 +2395,7 @@ class RecordedFMP4Stream:
                 stderr = asyncio.subprocess.PIPE,
                 env = RecordedPlaybackBackend.getEnvironment(backend),
             )
-            stdout, stderr = await self.__communicateSubprocess(process)
+            stdout, stderr = await self.__communicateSubprocess(process, duration)
             returncode = process.returncode if process.returncode is not None else 1
             if (
                 returncode != 0 and backend != 'FFmpeg' and
@@ -2373,7 +2411,7 @@ class RecordedFMP4Stream:
                     stderr=asyncio.subprocess.PIPE,
                     env=RecordedPlaybackBackend.getEnvironment(backend),
                 )
-                stdout, stderr = await self.__communicateSubprocess(process)
+                stdout, stderr = await self.__communicateSubprocess(process, duration)
                 returncode = process.returncode if process.returncode is not None else 1
         return stdout, stderr, returncode
 
@@ -2878,25 +2916,26 @@ class RecordedFMP4Stream:
         stderr = b''
         latest_progress = 0.0
         try:
-            if process.stdout is not None:
-                while True:
-                    line = await process.stdout.readline()
-                    if line == b'':
-                        break
-                    key, separator, value = line.decode(errors='ignore').strip().partition('=')
-                    if separator == '' or key not in ('out_time_us', 'out_time_ms'):
-                        continue
-                    try:
-                        out_time = int(value) / 1_000_000
-                    except ValueError:
-                        continue
-                    if duration > 0:
-                        latest_progress = max(latest_progress, min(1.0, out_time / duration))
-                        callback(latest_progress)
-            returncode = await process.wait()
-            if returncode == 0:
-                callback(1.0)
-        except asyncio.CancelledError:
+            async with asyncio.timeout(self.__getEncoderProcessTimeout(duration)):
+                if process.stdout is not None:
+                    while True:
+                        line = await process.stdout.readline()
+                        if line == b'':
+                            break
+                        key, separator, value = line.decode(errors='ignore').strip().partition('=')
+                        if separator == '' or key not in ('out_time_us', 'out_time_ms'):
+                            continue
+                        try:
+                            out_time = int(value) / 1_000_000
+                        except ValueError:
+                            continue
+                        if duration > 0:
+                            latest_progress = max(latest_progress, min(1.0, out_time / duration))
+                            callback(latest_progress)
+                returncode = await process.wait()
+                if returncode == 0:
+                    callback(1.0)
+        except (asyncio.CancelledError, TimeoutError):
             if process.returncode is None:
                 try:
                     process.kill()
