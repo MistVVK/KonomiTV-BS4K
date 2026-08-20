@@ -136,33 +136,43 @@ def CaptureUploadAPI(
         # 保存するファイルパス
         filepath = upload_folder / filename
 
-        # 既にファイルが存在していた場合は上書きしないようにリネーム
+        # 排他的にファイルを作成し、同名ファイルが存在した場合は連番を付けて再試行する。
+        # exists() で事前確認すると、並行リクエストが同じ未使用名を選ぶ TOCTOU 競合になるため行わない。
         ## ref: https://note.nkmk.me/python-pathlib-name-suffix-parent/
         count = 1
-        while filepath.exists():
-            filepath = upload_folder / f'{filename.stem}-{count}{filename.suffix}'
-            count += 1
-
-        # キャプチャを保存する。途中失敗時は部分ファイルを必ず削除する。
+        filepath_created = False
         try:
-            with open(filepath, mode='wb') as buffer:
+            while True:
+                try:
+                    buffer = open(filepath, mode='xb')
+                    filepath_created = True
+                    break
+                except FileExistsError:
+                    filepath = upload_folder / f'{filename.stem}-{count}{filename.suffix}'
+                    count += 1
+
+            # キャプチャを保存する。途中失敗時はこのリクエストが作成した部分ファイルだけを削除する。
+            with buffer:
                 _CopyUploadWithLimit(image.file, buffer, MAX_CAPTURE_UPLOAD_BYTES)
         except ValueError:
-            filepath.unlink(missing_ok=True)
+            if filepath_created is True:
+                filepath.unlink(missing_ok=True)
             logging.error('[CapturesRouter][CaptureUploadAPI] Capture upload exceeded the size limit.')
             raise HTTPException(
                 status_code = status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                 detail = 'Capture upload exceeds the 20 MiB limit',
             )
         except PermissionError:
-            filepath.unlink(missing_ok=True)
+            if filepath_created is True:
+                filepath.unlink(missing_ok=True)
             logging.error('[CapturesRouter][CaptureUploadAPI] Permission denied to save the file.')
             raise HTTPException(
                 status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail = 'Permission denied to save the file',
             )
         except OSError as ex:
-            filepath.unlink(missing_ok=True)
+            if filepath_created is True:
+                filepath.unlink(missing_ok=True)
             is_disk_full_error = False
             if hasattr(ex, 'winerror'):
                 is_disk_full_error = ex.winerror == 112  # type: ignore
