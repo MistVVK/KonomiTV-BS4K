@@ -58,6 +58,9 @@ export default defineComponent({
     // ref: https://v3.router.vuejs.org/ja/guide/advanced/navigation-guards.html#%E3%83%AB%E3%83%BC%E3%83%88%E5%8D%98%E4%BD%8D%E3%82%AB%E3%82%99%E3%83%BC%E3%83%88%E3%82%99
     beforeRouteUpdate(to, from, next) {
 
+        // このコンポーネントは録画切り替え時に再利用されるため、前番組の添付選択を明示的に解除する
+        this.playerStore.clearTwitterCaptureSelection();
+
         // 次話照会中に別ルートへ移動した場合は、戻ってきた古いレスポンスから遷移させない。
         this.invalidateNextRecordedProgramTransition();
 

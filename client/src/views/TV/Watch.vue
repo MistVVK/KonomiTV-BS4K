@@ -52,6 +52,9 @@ export default defineComponent({
     // ref: https://v3.router.vuejs.org/ja/guide/advanced/navigation-guards.html#%E3%83%AB%E3%83%BC%E3%83%88%E5%8D%98%E4%BD%8D%E3%82%AB%E3%82%99%E3%83%BC%E3%83%88%E3%82%99
     beforeRouteUpdate(to, from, next) {
 
+        // このコンポーネントはチャンネル切り替え時に再利用されるため、前チャンネルの添付選択を明示的に解除する
+        this.playerStore.clearTwitterCaptureSelection();
+
         // ザッピング時だけ 0.5 秒の猶予を設ける。連続 route update では AbortSignal により
         // 古い待機と初期化が無効化され、最後の route だけが controller を所有する。
         const delay_seconds = this.playerStore.is_zapping === true ? 0.5 : 0;

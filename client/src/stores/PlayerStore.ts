@@ -242,6 +242,32 @@ const usePlayerStore = defineStore('player', {
     actions: {
 
         /**
+         * Twitter パネルで選択中のキャプチャと、それに付随する UI 状態を解除する
+         * キャプチャ候補と Blob URL 自体は引き続き利用できる状態で保持する
+         */
+        clearTwitterCaptureSelection(): void {
+            for (const capture of this.twitter_captures) {
+                capture.selected = false;
+                capture.focused = false;
+            }
+            this.twitter_selected_capture_blobs = [];
+            this.twitter_zoom_capture_modal = false;
+            this.twitter_zoom_capture = null;
+        },
+
+        /**
+         * Twitter パネルのキャプチャをすべて破棄する
+         * Blob 自体は URL を持たないため、一覧側で生成した Object URL を一覧の消去前に revoke する
+         */
+        clearTwitterCaptures(): void {
+            for (const capture of this.twitter_captures) {
+                URL.revokeObjectURL(capture.image_url);
+            }
+            this.twitter_captures = [];
+            this.clearTwitterCaptureSelection();
+        },
+
+        /**
          * 視聴画面を開き、再生処理を開始する際に必ず呼び出さなければならない
          * 呼び出すと自動的に状態がリセットされ、is_watching が true になる
          */
@@ -305,9 +331,7 @@ const usePlayerStore = defineStore('player', {
             this.is_rain_fallback = null;
             this.is_rain_fallback_broadcasting = null;
             this.live_comment_init_failed_message = null;
-            this.twitter_captures = [];
-            this.twitter_zoom_capture_modal = false;
-            this.twitter_zoom_capture = null;
+            this.clearTwitterCaptures();
         }
     }
 });

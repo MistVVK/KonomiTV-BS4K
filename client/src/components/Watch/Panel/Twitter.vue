@@ -472,6 +472,8 @@ export default defineComponent({
                 if (this.playback_mode === 'Live') {
                     // NID-SID-EID の組が変わったときのみ更新する
                     if (new_program?.id !== old_program?.id) {
+                        // 前番組で選択したキャプチャを次番組の投稿へ意図せず添付しない
+                        this.playerStore.clearTwitterCaptureSelection();
                         // 「番組が切り替わったときにハッシュタグフォームをリセットする」がオンなら、ハッシュタグフォームを空にする
                         if (this.settingsStore.settings.reset_hashtag_when_program_switches === true) {
                             this.tweet_hashtag = this.formatHashtag('');
@@ -522,10 +524,8 @@ export default defineComponent({
     },
     beforeUnmount() {
 
-        // 終了前にすべてのキャプチャの Blob URL を revoke してリソースを解放する
-        for (const capture of this.playerStore.twitter_captures) {
-            URL.revokeObjectURL(capture.image_url);
-        }
+        // 終了前にキャプチャの Blob URL と、ストアに保持した関連状態をまとめて破棄する
+        this.playerStore.clearTwitterCaptures();
 
         // CaptureManager からキャプチャを受け取るイベントハンドラーを削除
         this.playerStore.event_emitter.off('CaptureCompleted');  // CaptureCompleted イベントの全てのイベントハンドラーを削除
@@ -933,11 +933,7 @@ export default defineComponent({
             // 送信した感を出す意味合いもある
             this.tweet_text = '';
             this.updateTweetLetterCount();
-            for (const capture of this.playerStore.twitter_captures) {
-                capture.selected = false;
-                capture.focused = false;
-            }
-            this.playerStore.twitter_selected_capture_blobs = [];
+            this.playerStore.clearTwitterCaptureSelection();
 
             const send_results: ITweetPostRequest[] = [];
             // 紐付けアカウントでもサーバー側の統合投稿 API は作らず、フロントから各サービスへ独立して送る
