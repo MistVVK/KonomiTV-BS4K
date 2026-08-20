@@ -1484,13 +1484,14 @@ const useSettingsStore = defineStore('settings', {
 
         /**
          * ログイン時かつ同期が有効な場合、サーバーに保存されている設定データをこのクライアントに同期する
-         * @param force ログイン中なら同期が有効かに関わらず実行する (デフォルト: false)
+         * @param force ログイン中なら同期状態と最終同期時刻に関わらずサーバー設定を適用し、成功時に同期を有効化する (デフォルト: false)
+         * @returns サーバー設定を取得して適用できた場合は true
          */
-        async syncClientSettingsFromServer(force: boolean = false): Promise<void> {
+        async syncClientSettingsFromServer(force: boolean = false): Promise<boolean> {
 
             // ログインしていない時、同期が無効なときは実行しない
             if (Utils.getAccessToken() === null || (this.settings.sync_settings === false && force === false)) {
-                return;
+                return false;
             }
 
             // ここから先、設定データの pull 中に syncClientSettingsToServer() が実行されないようロックする
@@ -1501,15 +1502,16 @@ const useSettingsStore = defineStore('settings', {
                 const settings_server = await Settings.fetchClientSettings();
                 if (settings_server === null) {
                     console.warn('Failed to fetch client settings from server. Skip syncing.');
-                    return;  // 取得できなくても後続の処理には影響しないので、サイレントに失敗する
+                    return false;
                 }
 
                 // サーバーから取得した設定データに含まれる最終同期時刻が、このクライアントが保持している最終同期時刻よりも古い場合、
                 // このまま同期を続行するとサーバーに保存されている古い設定データに巻き戻されてしまうため、同期を中断する
-                if (settings_server.last_synced_at < this.settings.last_synced_at) {
+                // ただし競合ダイアログでサーバー設定を明示的に選択した場合は、時計ずれを含めてユーザーの選択を優先する
+                if (force === false && settings_server.last_synced_at < this.settings.last_synced_at) {
                     console.warn('Server has older settings than this client. Skipping sync.');
-                    return;
-                } else if (settings_server.last_synced_at > this.settings.last_synced_at) {
+                    return false;
+                } else if (settings_server.last_synced_at !== this.settings.last_synced_at) {
                     console.log('Last Synced At Changed (From Server):', settings_server.last_synced_at);
                 }
 
@@ -1521,6 +1523,14 @@ const useSettingsStore = defineStore('settings', {
                         this.settings[settings_server_key] = settings_server_value;
                     }
                 }
+
+                // 競合ダイアログからの強制 pull では、同期有効化も pull ロック内で行う
+                // pull 完了直後の watcher がサーバー設定を再 push して、別デバイスの更新を巻き戻すことを防ぐ
+                if (force === true) {
+                    this.settings.sync_settings = true;
+                }
+
+                return true;
 
             // 成功・失敗に関わらずロックを解除する
             } finally {
