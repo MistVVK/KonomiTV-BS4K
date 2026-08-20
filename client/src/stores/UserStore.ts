@@ -122,6 +122,9 @@ const useUserStore = defineStore('user', {
             // 未ログイン状態に設定
             this.is_logged_in = false;
             this.user = null;
+            if (this.user_icon_url) {
+                URL.revokeObjectURL(this.user_icon_url);
+            }
             this.user_icon_url = '';
 
             if (silent === false) {
@@ -164,6 +167,9 @@ const useUserStore = defineStore('user', {
             const user_icon_url = await Users.fetchUserIcon();
             if (user_icon_url === null) {
                 return null;
+            }
+            if (this.user_icon_url) {
+                URL.revokeObjectURL(this.user_icon_url);
             }
             this.user_icon_url = user_icon_url;
 
