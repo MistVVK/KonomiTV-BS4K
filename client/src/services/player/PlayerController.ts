@@ -4610,7 +4610,15 @@ class PlayerController {
             return this.destroy_promise;
         }
 
-        this.destroy_promise = this.destroyPlayer();
+        // cleanup の同期処理から destroy() が再入しても同じ Promise へ合流できるよう、実処理より先に破棄状態を確定する
+        this.destroying = true;
+        // この後の非同期 cleanup 中に古い preflight が完了しても、Store / DOM を書き戻せない
+        this.initialization_generation += 1;
+        this.destroy_promise = Promise.resolve().then(() => this.destroyPlayer()).finally(() => {
+            // cleanup が失敗した場合は destroyed を立てず、失敗したリソースだけを次回 destroy() で再試行できるようにする
+            this.destroying = false;
+            this.destroy_promise = null;
+        });
         return this.destroy_promise;
     }
 
@@ -4619,10 +4627,6 @@ class PlayerController {
     private async destroyPlayer(): Promise<void> {
         const settings_store = useSettingsStore();
         const player_store = usePlayerStore();
-
-        this.destroying = true;
-        // この後の非同期cleanup中に古いpreflightが完了しても、Store/DOMを書き戻せない。
-        this.initialization_generation += 1;
 
         // 視聴履歴の最終位置を更新
         // 現在の再生位置を取得するため、プレイヤーの破棄前に実行する必要がある
@@ -4652,8 +4656,17 @@ class PlayerController {
         // 登録されている PlayerManager をすべて破棄
         // CSS アニメーションの関係上、ローディング状態にする前に破棄する必要がある (特に LiveDataBroadcastingManager)
         // 同期処理すると時間が掛かるので、並行して実行する
-        await Promise.all(this.player_managers.map(async (player_manager) => player_manager.destroy()));
-        this.player_managers = [];
+        // 1つが失敗しても他の破棄完了を待ち、再試行時に成功済み Manager を二重破棄しない
+        const player_managers = this.player_managers;
+        const player_manager_destroy_results = await Promise.allSettled(
+            player_managers.map((player_manager) => player_manager.destroy()),
+        );
+        this.player_managers = player_managers.filter(
+            (_, index) => player_manager_destroy_results[index].status === 'rejected',
+        );
+        const player_manager_destroy_errors = player_manager_destroy_results.flatMap((result) =>
+            result.status === 'rejected' ? [result.reason] : [],
+        );
 
         // Screen Wake Lock API で確保した起動ロックを解放
         // 起動ロックが確保できていない場合は何もしない
@@ -4690,7 +4703,9 @@ class PlayerController {
             }
             // 最後に音量を 0 に設定
             // 上記ロジックでは丸め誤差の関係で完全に 0 とは一致しないことがあるため
-            this.player.video.volume = 0;
+            if (this.player?.video) {
+                this.player.video.volume = 0;
+            }
         }
 
         // タイマーを破棄
@@ -4786,13 +4801,16 @@ class PlayerController {
             this.player = null;
         }
 
-        // 破棄済みかどうかのフラグを立てる
-        this.destroying = false;
-        this.destroyed = true;
-        this.destroy_promise = null;
-
         // PlayerStore にプレイヤーを破棄したことを通知
         player_store.is_player_initialized = false;
+
+        // Manager の破棄失敗を呼び出し元へ伝え、失敗した Manager だけを次回 destroy() で再試行する
+        if (player_manager_destroy_errors.length > 0) {
+            throw new AggregateError(player_manager_destroy_errors, 'Failed to destroy PlayerManager resources.');
+        }
+
+        // すべての cleanup が完了した場合だけ破棄済みとする
+        this.destroyed = true;
 
         console.log('\u001b[31m[PlayerController] Destroyed.');
     }
