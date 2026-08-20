@@ -76,6 +76,22 @@ class RecordedFileLockEntry:
     reference_count: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class ThumbnailGenerationRequest:
+    """バックグラウンドサムネイル生成へ渡す録画世代を保持する。"""
+
+    recorded_program: schemas.RecordedProgram
+    recorded_video_id: int
+
+
+@dataclass(slots=True)
+class ThumbnailGenerationTaskState:
+    """path 単位のサムネイルワーカーと、実行中に到着した最新世代を管理する。"""
+
+    task: asyncio.Task[None] | None = None
+    pending_request: ThumbnailGenerationRequest | None = None
+
+
 @dataclass(slots=True)
 class RecordedVideoSummary:
     """
@@ -200,8 +216,8 @@ class RecordedScanTask:
         # runBatchScan() の例外・キャンセル時に未完了 task を cancel / join するために保持する
         self._batch_scan_pipeline_tasks: set[asyncio.Task[None]] = set()
 
-        # バックグラウンドタスクの状態管理
-        self._background_tasks: dict[anyio.Path, asyncio.Task[None]] = {}
+        # path ごとに単一のサムネイルワーカーを保持し、実行中の内容変更は state の最新世代へ集約する。
+        self._background_tasks: dict[anyio.Path, ThumbnailGenerationTaskState] = {}
 
         # シンボリックリンクの元パスと実体パスのマッピング
         self._symlink_path_map: dict[str, str] = {}
@@ -694,6 +710,10 @@ class RecordedScanTask:
                     # ディレクトリは無視
                     if await thumbnail_path.is_dir():
                         continue
+                    # 実行中の生成処理が所有する一時ファイルは削除せず、失敗・キャンセル時の finally に任せる。
+                    # 前回プロセスから残った一時ファイルは active 集合にないため、通常の孤児判定で削除される。
+                    if ThumbnailGenerator.isTemporaryOutputActive(pathlib.Path(str(thumbnail_path))):
+                        continue
 
                     # ファイル名からハッシュを抽出
                     ## ファイル名は "{hash}.webp" または "{hash}_tile.webp" の形式
@@ -1148,12 +1168,22 @@ class RecordedScanTask:
                 # サムネイルだけは直列処理に含めず、従来どおりバックグラウンドで生成する。
                 # CMは索引完了後に直列実行するため、このタスクへ混在させない。
                 if 'GenerateThumbnail' in analysis_plan.actions:
-                    if file_path not in self._background_tasks:
-                        task = asyncio.create_task(self.__runThumbnailGeneration(
-                            recorded_program,
-                            saved_recorded_video_id,
+                    thumbnail_request = ThumbnailGenerationRequest(
+                        recorded_program = recorded_program,
+                        recorded_video_id = saved_recorded_video_id,
+                    )
+                    generation_state = self._background_tasks.get(file_path)
+                    if generation_state is None:
+                        generation_state = ThumbnailGenerationTaskState()
+                        generation_state.task = asyncio.create_task(self.__runThumbnailGeneration(
+                            thumbnail_request.recorded_program,
+                            thumbnail_request.recorded_video_id,
+                            generation_state,
                         ))
-                        self._background_tasks[file_path] = task
+                        self._background_tasks[file_path] = generation_state
+                    else:
+                        # 生成中に同じ path が追記・置換された場合、途中世代を捨てて最新要求だけを次に実行する。
+                        generation_state.pending_request = thumbnail_request
 
                 # 新規・内容変更・手動再解析は、DBへ暫定保存した後で全編索引を直列実行する。
                 # MetadataAnalyzerが得たEIT候補はDBの旧確定索引を上書きせず、今回の索引入力としてだけ渡す。
@@ -1711,6 +1741,7 @@ class RecordedScanTask:
         self,
         recorded_program: schemas.RecordedProgram,
         recorded_video_id: int,
+        generation_state: ThumbnailGenerationTaskState | None = None,
     ) -> None:
         """
         録画完了後のサムネイルをバックグラウンド生成する。
@@ -1718,36 +1749,62 @@ class RecordedScanTask:
         Args:
             recorded_program (schemas.RecordedProgram): 解析対象の録画番組情報
             recorded_video_id (int): DB 保存後に確定した RecordedVideo の ID
+            generation_state: path 単位ワーカーの実行状態。直接実行時はこのメソッド内で作成する。
         """
 
         # 録画ファイルのパスを anyio.Path に変換
         file_path = anyio.Path(recorded_program.recorded_video.file_path)
+        if generation_state is None:
+            generation_state = ThumbnailGenerationTaskState()
 
         try:
-            async with AnalysisTaskTracker.track(
-                'ThumbnailGeneration',
-                recorded_video_id=recorded_video_id,
-                title=recorded_program.title,
-            ) as history:
-                logging.info(f'{file_path}: Starting background analysis task...')
-                await history.setStage('Generating')
-                # ProcessLimiter で稼働中のバックグラウンドタスクの同時実行数を CPU コア数の 50% に制限
-                async with ProcessLimiter.getSemaphore('RecordedScanTask'):
-                    # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
-                    async with DriveIOLimiter.getSemaphore(file_path):
-                        if recorded_program.recorded_video.has_video is False:
-                            logging.info(f'{file_path}: Skipping thumbnail generation for audio-only recording.')
-                            await history.finish('Skipped', error_code='AudioOnly')
-                            return
-                        # シークバー用サムネイルとリスト表示用の代表サムネイルの両方を生成する。
-                        await ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave()
-                logging.info(f'{file_path}: Background analysis task completed.')
+            while True:
+                thumbnail_result: Literal['Succeeded', 'Failed', 'Stale'] | None = None
+                try:
+                    async with AnalysisTaskTracker.track(
+                        'ThumbnailGeneration',
+                        recorded_video_id=recorded_video_id,
+                        title=recorded_program.title,
+                    ) as history:
+                        logging.info(f'{file_path}: Starting background analysis task...')
+                        await history.setStage('Generating')
+                        # ProcessLimiter で稼働中のバックグラウンドタスクの同時実行数を CPU コア数の 50% に制限
+                        async with ProcessLimiter.getSemaphore('RecordedScanTask'):
+                            # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
+                            async with DriveIOLimiter.getSemaphore(file_path):
+                                if recorded_program.recorded_video.has_video is False:
+                                    logging.info(f'{file_path}: Skipping thumbnail generation for audio-only recording.')
+                                    await history.finish('Skipped', error_code='AudioOnly')
+                                else:
+                                    # MetadataAnalyzer の schema は未保存 ID のため、DB 保存後に確定した世代 ID で上書きする。
+                                    generator = ThumbnailGenerator.fromRecordedProgram(recorded_program)
+                                    generator.recorded_video_id = recorded_video_id
+                                    thumbnail_result = await generator.generateAndSave()
+                                    if thumbnail_result == 'Stale':
+                                        await history.finish('Skipped', error_code='GenerationChanged')
+                                    elif thumbnail_result == 'Failed':
+                                        await history.finish('Failed', error_code='ThumbnailGenerationFailed')
+                        if thumbnail_result in ('Succeeded', None):
+                            logging.info(f'{file_path}: Background analysis task completed.')
+                except Exception as ex:
+                    logging.error(f'{file_path}: Error in background analysis task:', exc_info=ex)
 
-        except Exception as ex:
-            logging.error(f'{file_path}: Error in background analysis task:', exc_info=ex)
+                # watcher より先に物理ファイルの変更を検出した場合は、同じワーカー内で再スキャンを要求する。
+                # 既に processRecordedFile() が最新世代を pending に積んでいれば重複解析しない。
+                if thumbnail_result == 'Stale' and generation_state.pending_request is None:
+                    await self.processRecordedFile(file_path)
+
+                # 実行中に複数世代が到着しても最新要求だけを取り出し、中間世代の無駄な生成を避ける。
+                pending_request = generation_state.pending_request
+                generation_state.pending_request = None
+                if pending_request is None:
+                    break
+                recorded_program = pending_request.recorded_program
+                recorded_video_id = pending_request.recorded_video_id
         finally:
-            # 完了したタスクを管理対象から削除
-            self._background_tasks.pop(file_path, None)
+            # 古いワーカーの finally が、同じ path に作られた新しい state を削除しないよう identity を確認する。
+            if self._background_tasks.get(file_path) is generation_state:
+                self._background_tasks.pop(file_path, None)
 
 
     async def __migrateKeyFramesToSegmentMap(self) -> None:

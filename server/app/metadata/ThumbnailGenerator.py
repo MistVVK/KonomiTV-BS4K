@@ -8,6 +8,8 @@ import pathlib
 import random
 import subprocess
 import time
+import uuid
+from datetime import datetime
 from typing import Any, ClassVar, Literal, cast
 
 import anyio
@@ -20,7 +22,7 @@ from tortoise import Tortoise
 
 from app import logging, schemas
 from app.config import Config, LoadConfig
-from app.constants import DATABASE_CONFIG, LIBRARY_PATH, STATIC_DIR, THUMBNAILS_DIR
+from app.constants import DATABASE_CONFIG, JST, LIBRARY_PATH, STATIC_DIR, THUMBNAILS_DIR
 from app.models.RecordedVideo import RecordedVideo
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_CONTAINER_FORMAT
@@ -54,6 +56,10 @@ class ThumbnailGenerator:
 
     # サムネイル情報のバージョン
     THUMBNAIL_INFO_VERSION: ClassVar[int] = 1
+
+    # 生成途中のファイルを起動時の孤児サムネイル削除から保護する。
+    # 正常終了・失敗・キャンセル時は generateAndSave() が必ず集合と実ファイルを回収する。
+    _active_temporary_output_paths: ClassVar[set[pathlib.Path]] = set()
 
     # サムネイルタイル移行時のバックアップ設定 (デバッグ用)
     MIGRATION_BACKUP_ENABLED: ClassVar[bool] = False
@@ -155,6 +161,9 @@ class ThumbnailGenerator:
         face_detection_mode: Literal['Human', 'Anime'] | None = None,
         has_video_stream_changes: bool = False,
         service_id: int | None = None,
+        recorded_video_id: int | None = None,
+        file_size: int | None = None,
+        file_modified_at: datetime | None = None,
     ) -> None:
         """
         プレイヤーのシークバー用タイル画像と、候補区間内で最も良い1枚の代表サムネイルを生成するクラスを初期化する
@@ -168,15 +177,25 @@ class ThumbnailGenerator:
             face_detection_mode (Literal['Human', 'Anime'] | None): 顔検出モード (デフォルト: None)
             has_video_stream_changes (bool): TS 内で映像 PID や映像ストリーム構成が変化しているかどうか
             service_id (int | None): 録画対象サービス ID (tsreadex のサービス選択に使用)
+            recorded_video_id (int | None): 生成開始世代の RecordedVideo ID
+            file_size (int | None): 生成開始世代のファイルサイズ
+            file_modified_at (datetime | None): 生成開始世代の最終更新日時
         """
 
+        # デコード元と出力名を決めるファイル情報。generateAndSave() の生成・公開処理から参照する。
         self.file_path = file_path
+        self.file_hash = file_hash
         self.container_format = container_format
         self.duration_sec = duration_sec
         self.candidate_intervals = candidate_time_ranges
         self.face_detection_mode = face_detection_mode
         self.has_video_stream_changes = has_video_stream_changes
         self.service_id = service_id
+
+        # DB 保存済み世代の識別情報。生成完了後に同じ録画内容へだけ結果を公開するために参照する。
+        self.recorded_video_id = recorded_video_id
+        self.file_size = file_size
+        self.file_modified_at = file_modified_at
 
         # 動画の長さに応じて適切なタイル化間隔を計算
         self.base_tile_interval_sec = self.__calculateBaseTileInterval(duration_sec)
@@ -305,6 +324,9 @@ class ThumbnailGenerator:
             face_detection_mode = face_detection_mode,
             has_video_stream_changes = recorded_program.recorded_video.has_video_stream_changes,
             service_id = recorded_program.channel.service_id if recorded_program.channel is not None else None,
+            recorded_video_id = recorded_program.recorded_video.id if recorded_program.recorded_video.id > 0 else None,
+            file_size = recorded_program.recorded_video.file_size,
+            file_modified_at = recorded_program.recorded_video.file_modified_at,
         )
 
 
@@ -336,19 +358,53 @@ class ThumbnailGenerator:
         )
 
 
-    async def generateAndSave(self) -> None:
+    @classmethod
+    def isTemporaryOutputActive(cls, output_path: pathlib.Path) -> bool:
+        """指定されたサムネイル一時出力が現在の生成処理に所有されているかを返す。
+
+        Args:
+            output_path: 孤児サムネイル削除が確認するファイルパス。
+
+        Returns:
+            現在実行中の generateAndSave() が所有している場合は True。
+        """
+
+        return output_path in cls._active_temporary_output_paths
+
+
+    async def generateAndSave(self) -> Literal['Succeeded', 'Failed', 'Stale']:
         """
         プレイヤーのシークバー用サムネイルタイル画像を生成し、
         さらに候補区間内のフレームから最も良い1枚を選び、代表サムネイルとして出力する
 
         処理フロー:
         1. サブプロセス内で PyAV でフレーム抽出 + スコアリング
-        2. サブプロセス内で代表サムネイルを保存
-        3. サブプロセス内でタイル画像を生成・保存
+        2. サブプロセス内で代表サムネイルとタイル画像を一時ファイルへ保存
+        3. 生成開始世代が現行 DB・実ファイルと一致する場合だけ生成物と DB 情報を公開
+
+        Returns:
+            Literal['Succeeded', 'Failed', 'Stale']: 生成・公開結果
         """
 
         start_time = time.time()
         logging.info(f'{self.file_path}: Generating thumbnail... / Face detection mode: {self.face_detection_mode}')
+
+        # 最終出力と同じディレクトリへ生成し、検証後の os.replace を同一ファイルシステム内で完結させる。
+        generation_token = uuid.uuid4().hex
+        temporary_representative_path = anyio.Path(str(
+            THUMBNAILS_DIR / f'.tmp-thumbnail-{self.file_hash}-{generation_token}.webp'
+        ))
+        temporary_tile_path = anyio.Path(str(
+            THUMBNAILS_DIR / f'.tmp-thumbnail-{self.file_hash}-{generation_token}_tile.webp'
+        ))
+        temporary_output_paths = (
+            pathlib.Path(str(temporary_representative_path)),
+            pathlib.Path(str(temporary_tile_path)),
+        )
+        published_output_paths: list[anyio.Path] = []
+        should_keep_published_outputs = False
+        require_generation_match = self.__getGenerationFilter() is not None
+        self._active_temporary_output_paths.update(temporary_output_paths)
 
         try:
             # 万が一出力先ディレクトリが無い場合は作成 (通常存在するはず)
@@ -372,6 +428,8 @@ class ThumbnailGenerator:
                     self._generateAndSaveThumbnails,
                     candidate_offsets,
                     self.tile_rows,
+                    temporary_output_paths[0],
+                    temporary_output_paths[1],
                 )
             except asyncio.CancelledError:
                 should_wait_executor = False
@@ -383,19 +441,58 @@ class ThumbnailGenerator:
 
             if not success:
                 logging.error(f'{self.file_path}: Failed to generate thumbnails in subprocess.')
-                return
+                return 'Failed'
 
-            # 3. サムネイル情報を DB に保存
-            await self.__saveThumbnailInfoToDB()
+            # 長時間の生成中に同じ path の録画が追記・置換された場合、旧世代の生成物を公開しない。
+            if require_generation_match is True and await self.__isGenerationCurrent() is False:
+                logging.info(f'{self.file_path}: Discarding stale thumbnail generation result before publishing.')
+                return 'Stale'
+
+            # 各出力は同じディレクトリの一時ファイルから atomic replace し、途中書き込みを配信しない。
+            await temporary_representative_path.replace(self.representative_thumbnail_path)
+            published_output_paths.append(self.representative_thumbnail_path)
+            await temporary_tile_path.replace(self.seekbar_thumbnails_tile_path)
+            published_output_paths.append(self.seekbar_thumbnails_tile_path)
+
+            # replace 中のファイル変更と DB 世代変更も再確認し、条件付き UPDATE で後勝ちの解析結果を保護する。
+            if require_generation_match is True and await self.__isGenerationCurrent() is False:
+                logging.info(f'{self.file_path}: Discarding stale thumbnail generation result after publishing.')
+                return 'Stale'
+            if (
+                require_generation_match is True and
+                await self.__saveThumbnailInfoToDB(require_generation_match=True) is False
+            ):
+                logging.info(f'{self.file_path}: Thumbnail metadata update skipped because the generation became stale.')
+                return 'Stale'
+            should_keep_published_outputs = True
+
+            # DB 未登録ファイルを扱うデバッグ CLI は従来どおり生成物を残し、DB 行があれば情報も更新する。
+            if require_generation_match is False:
+                await self.__saveThumbnailInfoToDB()
 
             logging.info(f'{self.file_path}: Thumbnail generation completed. (Total: {time.time() - start_time:.2f} sec)')
             logging.debug(f'Thumbnail tile -> {self.seekbar_thumbnails_tile_path.name}')
             logging.debug(f'Representative -> {self.representative_thumbnail_path.name}')
+            return 'Succeeded'
 
         except Exception as ex:
             # 予期せぬエラーのみここでキャッチ
             logging.error(f'{self.file_path}: Unexpected error in thumbnail generation:', exc_info=ex)
-            return
+            return 'Failed'
+        finally:
+            # 失敗・世代不一致・キャンセルでは、公開途中の生成物も含めて旧世代の出力を残さない。
+            if should_keep_published_outputs is False:
+                for published_output_path in published_output_paths:
+                    try:
+                        await published_output_path.unlink()
+                    except FileNotFoundError:
+                        pass
+            for temporary_output_path in (temporary_representative_path, temporary_tile_path):
+                try:
+                    await temporary_output_path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._active_temporary_output_paths.difference_update(temporary_output_paths)
 
 
     def __calculateBaseTileInterval(self, duration_sec: float) -> float:
@@ -529,6 +626,8 @@ class ThumbnailGenerator:
         self,
         candidate_offsets: list[float],
         tile_rows: int,
+        representative_output_path: pathlib.Path,
+        tile_output_path: pathlib.Path,
     ) -> bool:
         """
         サブプロセス内でフレーム抽出・スコアリング・タイル生成・代表サムネイル保存まで行う
@@ -539,6 +638,8 @@ class ThumbnailGenerator:
         Args:
             candidate_offsets (list[float]): 抽出するフレームのタイムスタンプ (秒) のリスト
             tile_rows (int): タイルの行数
+            representative_output_path (pathlib.Path): 代表サムネイルの一時出力先
+            tile_output_path (pathlib.Path): タイル画像の一時出力先
 
         Returns:
             bool: 成功時は True、失敗時は False
@@ -578,7 +679,7 @@ class ThumbnailGenerator:
             logging.warning(f'{self.file_path}: No frames found in candidate intervals. Selecting a random frame.')
             best_frame = random.choice(all_frames)
 
-        if not self.__saveRepresentativeThumbnail(best_frame):
+        if not self.__saveRepresentativeThumbnail(best_frame, representative_output_path):
             logging.error(f'{self.file_path}: Failed to save representative thumbnail.')
             return False
 
@@ -586,7 +687,7 @@ class ThumbnailGenerator:
 
         # 3. タイル画像を生成・保存
         start_time_tile = time.time()
-        if not self.__generateAndSaveTileImage(all_frames, tile_rows):
+        if not self.__generateAndSaveTileImage(all_frames, tile_rows, tile_output_path):
             logging.error(f'{self.file_path}: Failed to generate and save tile image.')
             return False
 
@@ -1090,12 +1191,17 @@ class ThumbnailGenerator:
         return best_frame_index
 
 
-    def __saveRepresentativeThumbnail(self, img_bgr: NDArray[np.uint8]) -> bool:
+    def __saveRepresentativeThumbnail(
+        self,
+        img_bgr: NDArray[np.uint8],
+        output_path: pathlib.Path,
+    ) -> bool:
         """
         代表サムネイルを WebP ファイルに同期的に保存する
 
         Args:
             img_bgr (NDArray[np.uint8]): 保存する画像データ (BGR)
+            output_path (pathlib.Path): 代表サムネイルの出力先
 
         Returns:
             bool: 成功時は True、失敗時は False
@@ -1108,7 +1214,7 @@ class ThumbnailGenerator:
                 thumbnails_dir.mkdir(parents=True, exist_ok=True)
 
             # WebP ファイルを書き込む
-            if not cv2.imwrite(str(self.representative_thumbnail_path), img_bgr, [
+            if not cv2.imwrite(str(output_path), img_bgr, [
                 cv2.IMWRITE_WEBP_QUALITY, self.WEBP_QUALITY_REPRESENTATIVE,
             ]):
                 logging.error(f'{self.file_path}: Failed to write representative thumbnail.')
@@ -1125,6 +1231,7 @@ class ThumbnailGenerator:
         self,
         bgr_frames: list[NDArray[np.uint8]],
         tile_rows: int,
+        output_path: pathlib.Path,
     ) -> bool:
         """
         BGR フレームからタイル画像を生成し、WebP として保存する
@@ -1134,6 +1241,7 @@ class ThumbnailGenerator:
         Args:
             bgr_frames (list[NDArray[np.uint8]]): BGR フレームのリスト (SCORING_SCALE)
             tile_rows (int): タイルの行数
+            output_path (pathlib.Path): タイル画像の出力先
 
         Returns:
             bool: 成功時は True、失敗時は False
@@ -1168,7 +1276,7 @@ class ThumbnailGenerator:
             tile_image = cast(NDArray[np.uint8], cv2.vconcat(rows))
 
             # タイル画像を WebP としてエンコードし、ファイルに保存する
-            if not self.__encodeTileImageToWebP(tile_image, pathlib.Path(str(self.seekbar_thumbnails_tile_path)), str(self.file_path)):
+            if not self.__encodeTileImageToWebP(tile_image, output_path, str(self.file_path)):
                 return False
 
             return True
@@ -1359,23 +1467,68 @@ class ThumbnailGenerator:
         return True
 
 
-    async def __saveThumbnailInfoToDB(self) -> None:
+    def __getGenerationFilter(self) -> dict[str, Any] | None:
+        """生成開始世代だけに一致する RecordedVideo の検索条件を構築する。
+
+        Returns:
+            ID・path・hash・size・mtime が揃っている場合は検索条件、不足時は None。
+        """
+
+        if (
+            self.recorded_video_id is None or
+            self.file_size is None or
+            self.file_modified_at is None
+        ):
+            return None
+        return {
+            'id': self.recorded_video_id,
+            'file_path': str(self.file_path),
+            'file_hash': self.file_hash,
+            'file_size': self.file_size,
+            'file_modified_at': self.file_modified_at,
+        }
+
+
+    async def __isGenerationCurrent(self) -> bool:
+        """生成開始世代が現在の DB 行と実ファイルの双方に一致するかを確認する。
+
+        Returns:
+            生成物を公開してよい世代の場合は True。
+        """
+
+        generation_filter = self.__getGenerationFilter()
+        if generation_filter is None:
+            logging.warning(f'{self.file_path}: Thumbnail generation identity is incomplete.')
+            return False
+        if await RecordedVideo.filter(**generation_filter).exists() is False:
+            return False
+
+        # DB 更新より先に物理ファイルだけが追記・置換された状態も検出する。
+        try:
+            file_stat = await self.file_path.stat()
+        except FileNotFoundError:
+            return False
+        current_modified_at = datetime.fromtimestamp(file_stat.st_mtime, tz=JST)
+        return file_stat.st_size == self.file_size and current_modified_at == self.file_modified_at
+
+
+    async def __saveThumbnailInfoToDB(self, require_generation_match: bool = False) -> bool:
         """
         生成済みサムネイル情報を DB に保存する
         再生成の場合、既存のサムネイル情報は上書きされる（この時点でサムネイル自体が上書き保存されているので正常な挙動）
-        """
 
-        # DB から RecordedVideo を取得
-        db_recorded_video = await RecordedVideo.get_or_none(file_path=str(self.file_path))
-        if db_recorded_video is None:
-            logging.warning(f'{self.file_path}: RecordedVideo not found for thumbnail metadata update.')
-            return
+        Args:
+            require_generation_match: 生成開始世代に一致する DB 行だけを条件付き更新するか。
+
+        Returns:
+            サムネイル情報を保存できた場合は True。
+        """
 
         tile_width, tile_height = self.TILE_SCALE
         scoring_width, scoring_height = self.SCORING_SCALE
 
-        # サムネイル情報を DB に保存
-        db_recorded_video.thumbnail_info = schemas.ThumbnailInfo(
+        # 生成時と移行時で同じレイアウト情報を保存する。
+        thumbnail_info = schemas.ThumbnailInfo(
             version = self.THUMBNAIL_INFO_VERSION,
             representative = schemas.ThumbnailImageInfo(
                 format = 'WebP',
@@ -1394,7 +1547,23 @@ class ThumbnailGenerator:
                 interval_sec = self.tile_interval_sec,
             ),
         )
+
+        # 通常生成は生成開始世代を SQL の UPDATE 条件にも含め、検証直後の後勝ち更新を防ぐ。
+        if require_generation_match is True:
+            generation_filter = self.__getGenerationFilter()
+            if generation_filter is None:
+                return False
+            updated_count = await RecordedVideo.filter(**generation_filter).update(thumbnail_info=thumbnail_info)
+            return updated_count == 1
+
+        # 旧サムネイル移行は従来どおり path で対象を取得する。
+        db_recorded_video = await RecordedVideo.get_or_none(file_path=str(self.file_path))
+        if db_recorded_video is None:
+            logging.warning(f'{self.file_path}: RecordedVideo not found for thumbnail metadata update.')
+            return False
+        db_recorded_video.thumbnail_info = thumbnail_info
         await db_recorded_video.save()
+        return True
 
 
     async def migrateFromLegacyTile(self) -> bool:
