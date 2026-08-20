@@ -218,19 +218,30 @@ def test_reservation_response_folders_and_nullable_numbers_are_transformed() -> 
             }],
         }
 
+    @app.put('/api/recording/reservations/{reservation_id}')
+    async def UpdateReservationAPI(reservation_id: int):
+        assert reservation_id == 1
+        return (await ReservationsAPI())['reservations'][0]
+
     app.add_middleware(KomorebiResponseMiddleware)
 
-    async def GetResponse():
+    async def GetResponses():
         async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
-            return await client.get('/api/recording/reservations')
+            return (
+                await client.get('/api/recording/reservations'),
+                await client.put('/api/recording/reservations/1'),
+            )
 
-    response = asyncio.run(GetResponse())
-    assert response.status_code == 200
-    record_settings = response.json()['reservations'][0]['record_settings']
-    assert record_settings['recording_folders'] == ['/recordings/primary']
-    assert record_settings['recording_start_margin'] == 0
-    assert record_settings['recording_end_margin'] == 0
-    assert record_settings['forced_tuner_id'] == 0
+    list_response, update_response = asyncio.run(GetResponses())
+    for response, record_settings in (
+        (list_response, list_response.json()['reservations'][0]['record_settings']),
+        (update_response, update_response.json()['record_settings']),
+    ):
+        assert response.status_code == 200
+        assert record_settings['recording_folders'] == ['/recordings/primary']
+        assert record_settings['recording_start_margin'] == 0
+        assert record_settings['recording_end_margin'] == 0
+        assert record_settings['forced_tuner_id'] == 0
 
 
 def test_reservation_request_body_is_replayed_after_transformation() -> None:

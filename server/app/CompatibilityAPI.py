@@ -55,6 +55,7 @@ _RESERVATION_COLLECTION_PATHS = {
     '/api/recording/reservations',
     '/api/recording/reservations/',
 }
+_RESERVATION_DETAIL_PATH_PATTERN = re.compile(r'^/api/recording/reservations/[0-9]+/?$')
 _KOMOREBI_V1_ENCODER_MAP: dict[
     Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'],
     Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC'],
@@ -654,6 +655,12 @@ def IsRecordedProgramResponsePath(path: str) -> bool:
     return path in _VIDEO_COLLECTION_PATHS or _VIDEO_DETAIL_PATH_PATTERN.fullmatch(path) is not None
 
 
+def IsReservationResponsePath(path: str) -> bool:
+    """Komorebi 向け単発録画予約変換を適用する API パスかどうかを返す。"""
+
+    return path in _RESERVATION_COLLECTION_PATHS or _RESERVATION_DETAIL_PATH_PATTERN.fullmatch(path) is not None
+
+
 def TransformRecordedProgramForKomorebi(recorded_program: dict[str, Any]) -> None:
     """録画番組レスポンスを Komorebi が安全に読み取れる形式へインプレース変換する。"""
 
@@ -721,10 +728,14 @@ def TransformReservationResponseForKomorebi(response_data: Any) -> Any:
     if not isinstance(response_data, dict):
         return response_data
     reservations = response_data.get('reservations')
-    if not isinstance(reservations, list):
+    if isinstance(reservations, list):
+        reservation_items = reservations
+    elif isinstance(response_data.get('record_settings'), dict):
+        reservation_items = [response_data]
+    else:
         return response_data
 
-    for reservation in reservations:
+    for reservation in reservation_items:
         if not isinstance(reservation, dict):
             continue
         record_settings = reservation.get('record_settings')
@@ -755,7 +766,7 @@ def TransformCompatibilityResponseForKomorebi(path: str, response_data: Any) -> 
 
     if IsRecordedProgramResponsePath(path):
         return TransformRecordedProgramResponseForKomorebi(response_data)
-    if path in _RESERVATION_COLLECTION_PATHS:
+    if IsReservationResponsePath(path):
         return TransformReservationResponseForKomorebi(response_data)
     return response_data
 
@@ -769,10 +780,10 @@ class KomorebiResponseMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
             scope['type'] != 'http' or
-            scope.get('method') != 'GET' or
+            scope.get('method') not in ('GET', 'PUT') or
             (
                 IsRecordedProgramResponsePath(scope.get('path', '')) is False and
-                scope.get('path', '') not in _RESERVATION_COLLECTION_PATHS
+                IsReservationResponsePath(scope.get('path', '')) is False
             )
         ):
             await self.app(scope, receive, send)
