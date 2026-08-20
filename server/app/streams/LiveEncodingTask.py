@@ -1538,6 +1538,10 @@ class LiveEncodingTask:
                     else 'エンコードを開始しています…'
                 ),
             )
+            # TLV プローブはチューナーロック待ちを含めて Standby 監視の許容時間 (20 秒) を超え得る。
+            # このままだとエンコーダー起動直後の Controller 初回判定がプローブ時間を無出力と誤認し、
+            # 正常なエンコーダーを再起動して接続中のクライアントを切断するため、監視基準時刻をリセットする。
+            self.live_stream.refreshStreamDataWrittenAt()
             if selected_rain_video_packet_id is not None:
                 logging.info(
                     f'{self.live_stream.log_prefix} Rain fallback broadcast detected. '

@@ -839,6 +839,8 @@ class TestTLVStreamProbeCleanup:
         live_stream.setStatus = SetStatus
         live_stream.getStatus = lambda: status
         live_stream.disconnectAll = lambda: setattr(live_stream, 'disconnected', live_stream.disconnected + 1)
+        # TLV プローブ完了時に Standby 監視基準をリセットする LiveStream 側の実装をスタブ化する。
+        live_stream.refreshStreamDataWrittenAt = lambda: None
         task.live_stream = live_stream
 
         async def AcquireTuner(channel_type: str, base_url: str | None = None) -> bool:

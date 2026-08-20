@@ -795,6 +795,23 @@ class LiveStream:
         return self._stream_data_written_at
 
 
+    def refreshStreamDataWrittenAt(self) -> None:
+        """
+        ストリームデータの最終書き込み時刻を現在時刻へ更新する
+
+        TLV ではエンコーダー起動前のメタデータプローブがチューナーロック待ちを含めて
+        Standby 監視の許容時間を超え得るため、プローブ完了後に呼び出して監視基準をリセットする。
+
+        Args:
+            なし。
+
+        Returns:
+            None
+        """
+
+        self._stream_data_written_at = time.time()
+
+
     def writeStreamData(self, stream_data: bytes) -> None:
         """
         接続している全ての mpegts クライアントの Queue にストリームデータを書き込む
