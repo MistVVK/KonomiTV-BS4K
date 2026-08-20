@@ -207,6 +207,10 @@ class RecordedFMP4Stream:
     _playback_prefetch_run: RecordedPlaybackPrefetchRun | None
     # 先読みの起動・シーク時キャンセル・完了時の参照解除を直列化する。
     _playback_prefetch_lock: asyncio.Lock
+    # クライアントのシーク世代。遅着した旧要求が新しい生成処理へ干渉しないよう比較する。
+    _latest_request_generation: int
+    # 世代付きsegment要求の実行Task。新しいシーク世代の到着時に旧世代だけを停止する。
+    _segment_request_tasks: dict[asyncio.Task[Any], int]
     # オフライン保存セッションだけ、未キャッシュ映像区間を連続encodeする。
     _is_offline_continuous: bool
     # 連続encode中の sequence から実行中 Task への対応。同一区間の重複起動を防ぐ。
@@ -268,6 +272,8 @@ class RecordedFMP4Stream:
             instance._active_operations = 0
             instance._playback_prefetch_run = None
             instance._playback_prefetch_lock = asyncio.Lock()
+            instance._latest_request_generation = 0
+            instance._segment_request_tasks = {}
             instance._offline_video_sequence_tasks = {}
             instance._offline_video_segment_events = {}
             instance._offline_video_encode_lock = asyncio.Lock()
@@ -451,6 +457,47 @@ class RecordedFMP4Stream:
             self._active_operations = max(0, self._active_operations - 1)
             if self._instances.get(self.session_id) is self:
                 self.keepAlive()
+
+    @asynccontextmanager
+    async def __segmentRequest(
+        self,
+        request_generation: int | None,
+    ) -> AsyncGenerator[bool, None]:
+        """segment要求をシーク世代へ登録し、古い実行を停止する。
+
+        Args:
+            request_generation: クライアントがシークごとに進める要求世代。旧クライアントではNone。
+
+        Yields:
+            現在の世代に属する要求ならTrue、遅着した旧要求ならFalse。
+        """
+
+        # queryを持たない旧クライアントは従来どおり処理し、世代付き要求との互換性を維持する。
+        if request_generation is None:
+            yield True
+            return
+
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError('Recorded segment request requires an asyncio task.')
+        if request_generation < self._latest_request_generation:
+            yield False
+            return
+
+        # event loop上で比較と更新の間にawaitを挟まないことで、最初の新世代要求だけが
+        # 旧映像・音声要求を停止する。writeAtomic中のcancelはatomic公開完了後に再送出されるため、
+        # 同じ生成条件・sequenceの正常なcacheだけが残り、破損した途中ファイルは公開されない。
+        if request_generation > self._latest_request_generation:
+            self._latest_request_generation = request_generation
+            for task, generation in tuple(self._segment_request_tasks.items()):
+                if generation < request_generation and task is not current_task:
+                    task.cancel()
+        self._segment_request_tasks[current_task] = request_generation
+        try:
+            yield True
+        finally:
+            if self._segment_request_tasks.get(current_task) == request_generation:
+                self._segment_request_tasks.pop(current_task, None)
 
     @classmethod
     def hasActiveSessions(cls) -> bool:
@@ -1598,11 +1645,19 @@ class RecordedFMP4Stream:
         init_path = self.__buildAudioCachePath(segment, rendition, is_init=True)
         return await asyncio.to_thread(init_path.read_bytes) if init_path.is_file() else None
 
-    async def getAudioSegment(self, rendition_id: str, sequence: int) -> bytes | None:
+    async def getAudioSegment(
+        self,
+        rendition_id: str,
+        sequence: int,
+        request_generation: int | None = None,
+    ) -> bytes | None:
         """映像とは独立して指定方式の音声fragmentを生成または再利用する。"""
 
         async with self.__activeOperation():
-            return await self.__getAudioSegment(rendition_id, sequence)
+            async with self.__segmentRequest(request_generation) as is_current:
+                if is_current is False:
+                    return b''
+                return await self.__getAudioSegment(rendition_id, sequence)
 
     async def __getAudioSegment(self, rendition_id: str, sequence: int) -> bytes | None:
         """音声fragment生成の本体処理を行う。"""
@@ -1641,11 +1696,18 @@ class RecordedFMP4Stream:
             return None
         return await asyncio.to_thread(init_path.read_bytes)
 
-    async def getVideoSegment(self, sequence: int) -> bytes | None:
+    async def getVideoSegment(
+        self,
+        sequence: int,
+        request_generation: int | None = None,
+    ) -> bytes | None:
         """要求シーケンスの映像fragmentを生成またはキャッシュから返す。"""
 
         async with self.__activeOperation():
-            return await self.__getVideoSegment(sequence, should_start_playback_prefetch=True)
+            async with self.__segmentRequest(request_generation) as is_current:
+                if is_current is False:
+                    return b''
+                return await self.__getVideoSegment(sequence, should_start_playback_prefetch=True)
 
     async def __getVideoSegment(
         self,

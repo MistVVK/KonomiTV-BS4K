@@ -791,9 +791,10 @@ async def VideoHLSVideoSegmentAPI(
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
     cache_key: CacheKeyQuery = None,
+    request_generation: Annotated[int | None, Query(ge=0)] = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
-    segment_data = await video_stream.getVideoSegment(sequence)
+    segment_data = await video_stream.getVideoSegment(sequence, request_generation)
     if segment_data is None:
         raise HTTPException(status_code=422, detail='Video segment was not found')
     return Response(content=segment_data, media_type='video/mp4', headers={'Cache-Control': 'max-age=10800'})
@@ -841,9 +842,10 @@ async def VideoHLSAudioSegmentAPI(
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
     cache_key: CacheKeyQuery = None,
+    request_generation: Annotated[int | None, Query(ge=0)] = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
-    segment_data = await video_stream.getAudioSegment(rendition_id, sequence)
+    segment_data = await video_stream.getAudioSegment(rendition_id, sequence, request_generation)
     if segment_data is None:
         raise HTTPException(status_code=422, detail='Audio segment was not found')
     return Response(
