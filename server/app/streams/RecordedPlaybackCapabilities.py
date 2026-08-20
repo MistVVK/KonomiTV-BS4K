@@ -11,12 +11,13 @@ from pathlib import Path
 from typing import ClassVar
 
 from app import logging
-from app.constants import LIBRARY_PATH
+from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KPlaybackCapabilityReason,
     KonomiTVBS4KPlaybackEncoder,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KVideoCodec,
+    ResolveKonomiTVBS4KPlaybackVideoBitrate,
 )
 
 
@@ -51,10 +52,16 @@ class RecordedPlaybackCapability:
     reason_code: RecordedPlaybackCapabilityReason | None
 
 
-RecordedPlaybackCapabilityKey = tuple[
+RecordedPlaybackCapabilityBaseKey = tuple[
     RecordedPlaybackEncoder,
     RecordedPlaybackVideoCodec,
     RecordedPlaybackBitDepth,
+]
+RecordedPlaybackCapabilityKey = RecordedPlaybackCapabilityBaseKey | tuple[
+    RecordedPlaybackEncoder,
+    RecordedPlaybackVideoCodec,
+    RecordedPlaybackBitDepth,
+    QUALITY_TYPES,
 ]
 
 
@@ -262,6 +269,8 @@ class RecordedPlaybackBackend:
         bit_depth: RecordedPlaybackBitDepth,
         output_path: Path,
         device: str | None,
+        *,
+        quality: QUALITY_TYPES | None = None,
     ) -> list[str]:
         """能力検査用の短いfMP4生成コマンドを構築する。
 
@@ -271,6 +280,7 @@ class RecordedPlaybackBackend:
             bit_depth: 出力bit depth。
             output_path: 検査用fMP4の出力先。
             device: QSV/AMFで使うrender node。CPU/NVENCではNone。
+            quality: 実再生相当の出力解像度・フレームレートを検査する画質。
 
         Returns:
             create_subprocess_exec()へそのまま渡せる完全な引数列。
@@ -298,21 +308,49 @@ class RecordedPlaybackBackend:
                 raise ValueError('AMD render device is required.')
             command += ['-init_hw_device', f'vaapi=recorded_vaapi:{device}', '-filter_hw_device', 'recorded_vaapi']
 
-        # 一部のQSV HEVC/AV1 encoderは極端に小さい解像度を拒否するため、
-        # 能力判定がfalse negativeにならない最小限の16:9 fixtureを使う。
-        command += ['-f', 'lavfi', '-i', 'testsrc2=size=320x192:rate=10:duration=0.6']
+        # 入力生成自体のCPU・メモリ負荷は小さく保ち、scale後のsurfaceとencoder設定だけを
+        # 実画質へ揃える。これで8K非対応GPUを検出しつつ、8K fixture生成の余計な負荷を避ける。
+        frame_rate = (
+            '60000/1001'
+            if quality is not None and QUALITY[quality].is_60fps is True
+            else ('30000/1001' if quality is not None else '10')
+        )
+        command += ['-f', 'lavfi', '-i', f'testsrc2=size=320x192:rate={frame_rate}:duration=0.6']
         if encoder == 'FFmpeg':
-            command += ['-vf', f'format={spec.pixel_format}']
+            filters = []
+            if quality is not None:
+                filters += [
+                    f'scale=w={QUALITY[quality].width}:h={QUALITY[quality].height}:'
+                    'force_original_aspect_ratio=decrease',
+                    f'pad={QUALITY[quality].width}:{QUALITY[quality].height}:(ow-iw)/2:(oh-ih)/2',
+                ]
+            filters.append(f'format={spec.pixel_format}')
+            command += ['-vf', ','.join(filters)]
         elif encoder == 'QSV':
-            command += ['-vf', f'format={spec.encoder_pixel_format},hwupload=extra_hw_frames=32']
+            filters = [f'format={spec.encoder_pixel_format}', 'hwupload=extra_hw_frames=32']
+            if quality is not None:
+                filters.append(
+                    f'vpp_qsv=w={QUALITY[quality].width}:h={QUALITY[quality].height}:'
+                    f'format={spec.encoder_pixel_format}'
+                )
+            command += ['-vf', ','.join(filters)]
         elif encoder == 'NVENC':
-            command += ['-vf', f'format={spec.encoder_pixel_format},hwupload_cuda']
+            filters = [f'format={spec.encoder_pixel_format}', 'hwupload_cuda']
+            if quality is not None:
+                filters.append(
+                    f'scale_cuda=w={QUALITY[quality].width}:h={QUALITY[quality].height}:'
+                    f'format={spec.encoder_pixel_format}'
+                )
+            command += ['-vf', ','.join(filters)]
         else:
             # AMF自体はsystem-memoryのNV12/P010を受けるため、能力検査でも実再生と同じ
             # VAAPI upload/download境界を通し、ドライバーとAMFの両方を検査する。
+            output_width = QUALITY[quality].width if quality is not None else 320
+            output_height = QUALITY[quality].height if quality is not None else 192
             command += [
                 '-vf',
-                f'format={spec.encoder_pixel_format},hwupload,scale_vaapi=w=320:h=192,'
+                f'format={spec.encoder_pixel_format},hwupload,'
+                f'scale_vaapi=w={output_width}:h={output_height}:format={spec.encoder_pixel_format},'
                 f'hwdownload,format={spec.encoder_pixel_format}',
             ]
 
@@ -345,6 +383,23 @@ class RecordedPlaybackBackend:
             elif encoder != 'NVENC':
                 command += ['-profile:v', 'main']
         command += cls.getTuningArguments(encoder, codec)
+        if quality is not None:
+            bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, codec)
+            bitrate_max_kbps = int(bitrate.video_bitrate_max.removesuffix('K'))
+            command += [
+                '-r',
+                frame_rate,
+                '-fps_mode',
+                'cfr',
+                '-b:v',
+                bitrate.video_bitrate,
+                '-maxrate',
+                bitrate.video_bitrate_max,
+                '-bufsize',
+                f'{bitrate_max_kbps * 2}K',
+                '-aspect',
+                '16:9',
+            ]
         command += [
             '-frames:v',
             '6',
@@ -381,7 +436,7 @@ class RecordedPlaybackCapabilityProbe:
         default = None,
     )
     _probe_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
-    _probe_version: ClassVar[int] = 4
+    _probe_version: ClassVar[int] = 5
     _probe_timeout_seconds: ClassVar[float] = 20.0
 
     @classmethod
@@ -425,10 +480,17 @@ class RecordedPlaybackCapabilityProbe:
         encoder: RecordedPlaybackEncoder,
         codec: RecordedPlaybackVideoCodec,
         bit_depth: RecordedPlaybackBitDepth,
+        *,
+        quality: QUALITY_TYPES | None = None,
     ) -> RecordedPlaybackCapability:
-        """指定した1組だけを実probeし、全32行の初回検査を強制せず返す。"""
+        """指定した1組・画質だけを実probeし、全32行の初回検査を強制せず返す。"""
 
-        key = (encoder, codec, bit_depth)
+        # 全行列の基礎能力と実画質能力を別キーにし、低解像度の成功を8Kへ流用しない。
+        key: RecordedPlaybackCapabilityKey = (
+            (encoder, codec, bit_depth)
+            if quality is None
+            else (encoder, codec, bit_depth, quality)
+        )
         while True:
             signature = await cls.__getSignature()
             async with cls._lock:
@@ -447,7 +509,7 @@ class RecordedPlaybackCapabilityProbe:
                         ),
                         name = (
                             f'RecordedPlaybackCapabilityProbe-{generation}-'
-                            f'{encoder}-{codec}-{bit_depth}'
+                            f'{encoder}-{codec}-{bit_depth}-{quality or "baseline"}'
                         ),
                     )
                     cls._inflight_tasks[task_key] = task
@@ -486,17 +548,23 @@ class RecordedPlaybackCapabilityProbe:
         encoder: RecordedPlaybackEncoder,
         codec: RecordedPlaybackVideoCodec | None = None,
         bit_depth: RecordedPlaybackBitDepth | None = None,
+        quality: QUALITY_TYPES | None = None,
     ) -> str | None:
-        """能力組み合わせで実際に成功したrender nodeを返す。"""
+        """能力組み合わせ・画質で実際に成功したrender nodeを返す。"""
 
         if codec is not None and bit_depth is not None:
-            return cls._selected_devices.get((encoder, codec, bit_depth))
+            key: RecordedPlaybackCapabilityKey = (
+                (encoder, codec, bit_depth)
+                if quality is None
+                else (encoder, codec, bit_depth, quality)
+            )
+            return cls._selected_devices.get(key)
         # CM解析のdecode専用候補ではcodecを固定できないため、同encoderで成功済みの任意deviceを返す。
         return next(
             (
                 device
-                for (selected_encoder, _, _), device in cls._selected_devices.items()
-                if selected_encoder == encoder
+                for key, device in cls._selected_devices.items()
+                if key[0] == encoder
             ),
             None,
         )
@@ -549,14 +617,14 @@ class RecordedPlaybackCapabilityProbe:
         encoders: tuple[RecordedPlaybackEncoder, ...] = ('FFmpeg', 'QSV', 'NVENC', 'AMF')
         codecs: tuple[RecordedPlaybackVideoCodec, ...] = ('avc', 'hevc', 'vp9', 'av1')
         bit_depths: tuple[RecordedPlaybackBitDepth, ...] = (8, 10)
-        keys: list[RecordedPlaybackCapabilityKey] = [
+        keys: list[RecordedPlaybackCapabilityBaseKey] = [
             (encoder, codec, bit_depth)
             for encoder in encoders
             for codec in codecs
             for bit_depth in bit_depths
         ]
         key_indexes = {key: index for index, key in enumerate(keys)}
-        probe_order: list[tuple[int, RecordedPlaybackCapabilityKey]] = [
+        probe_order: list[tuple[int, RecordedPlaybackCapabilityBaseKey]] = [
             (key_indexes[(encoder, codec, bit_depth)], (encoder, codec, bit_depth))
             for codec in codecs
             for bit_depth in bit_depths
@@ -586,7 +654,8 @@ class RecordedPlaybackCapabilityProbe:
         """署名世代と能力キーに対応する唯一の実probeを実行する。"""
 
         task_key = (generation, key)
-        encoder, codec, bit_depth = key
+        encoder, codec, bit_depth = key[:3]
+        quality = key[3] if len(key) == 4 else None
         try:
             # exact要求を全行列の後ろへ滞留させず、実probe総数は全backend合計2件に制限する。
             async with cls._probe_semaphore:
@@ -596,7 +665,15 @@ class RecordedPlaybackCapabilityProbe:
                 context = _RecordedPlaybackProbeContext()
                 token = cls._probe_context.set(context)
                 try:
-                    capability = await cls.__probeOne(encoder, codec, bit_depth)
+                    if quality is None:
+                        capability = await cls.__probeOne(encoder, codec, bit_depth)
+                    else:
+                        capability = await cls.__probeOne(
+                            encoder,
+                            codec,
+                            bit_depth,
+                            quality = quality,
+                        )
                 finally:
                     cls._probe_context.reset(token)
 
@@ -655,8 +732,10 @@ class RecordedPlaybackCapabilityProbe:
         encoder: RecordedPlaybackEncoder,
         codec: RecordedPlaybackVideoCodec,
         bit_depth: RecordedPlaybackBitDepth,
+        *,
+        quality: QUALITY_TYPES | None = None,
     ) -> RecordedPlaybackCapability:
-        """1つの能力キーを実エンコードとFFprobe 8で検査する。"""
+        """1つの能力キー・画質を実エンコードとFFprobe 8で検査する。"""
 
         spec = RecordedPlaybackBackend.getCodecSpec(codec, bit_depth)
         if RecordedPlaybackBackend.isCombinationSupported(encoder, codec, bit_depth) is False:
@@ -677,7 +756,23 @@ class RecordedPlaybackCapabilityProbe:
         for device in devices:
             with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-recorded-capability-') as temporary_directory:
                 output_path = Path(temporary_directory) / 'probe.mp4'
-                command = RecordedPlaybackBackend.buildProbeCommand(encoder, codec, bit_depth, output_path, device)
+                if quality is None:
+                    command = RecordedPlaybackBackend.buildProbeCommand(
+                        encoder,
+                        codec,
+                        bit_depth,
+                        output_path,
+                        device,
+                    )
+                else:
+                    command = RecordedPlaybackBackend.buildProbeCommand(
+                        encoder,
+                        codec,
+                        bit_depth,
+                        output_path,
+                        device,
+                        quality = quality,
+                    )
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *command,
@@ -697,7 +792,7 @@ class RecordedPlaybackCapabilityProbe:
                     logging.warning(
                         '[RecordedPlaybackCapabilityProbe] Probe encode failed. '
                         f'[encoder: {encoder}, codec: {codec}, bit_depth: {bit_depth}, '
-                        f'device: {device}, stderr: {decoded_stderr}]'
+                        f'quality: {quality}, device: {device}, stderr: {decoded_stderr}]'
                     )
                     last_reason = cls.classifyFailure(decoded_stderr)
                     continue
@@ -733,6 +828,26 @@ class RecordedPlaybackCapabilityProbe:
                 if int(stream.get('nb_read_frames', 0)) < 2:
                     last_reason = 'ProbeFailed'
                     continue
+                if quality is not None and (
+                    int(stream.get('width', 0)) != QUALITY[quality].width
+                    or int(stream.get('height', 0)) != QUALITY[quality].height
+                ):
+                    last_reason = 'ProbeFailed'
+                    continue
+                if quality is not None:
+                    try:
+                        frame_rate_numerator, frame_rate_denominator = (
+                            int(value)
+                            for value in str(stream.get('r_frame_rate', '0/1')).split('/', maxsplit=1)
+                        )
+                        actual_frame_rate = frame_rate_numerator / frame_rate_denominator
+                    except (ValueError, ZeroDivisionError):
+                        last_reason = 'ProbeFailed'
+                        continue
+                    expected_frame_rate = 60000 / 1001 if QUALITY[quality].is_60fps is True else 30000 / 1001
+                    if abs(actual_frame_rate - expected_frame_rate) > 0.01:
+                        last_reason = 'ProbeFailed'
+                        continue
                 actual_pixel_format = str(stream.get('pix_fmt', ''))
                 is_10bit = actual_pixel_format in ('yuv420p10le', 'p010le', 'p010')
                 if is_10bit != (bit_depth == 10):
@@ -745,7 +860,12 @@ class RecordedPlaybackCapabilityProbe:
                     context = cls._probe_context.get()
                     if context is None:
                         # private probeを単体利用する既存経路では従来どおり即時公開する。
-                        cls._selected_devices[(encoder, codec, bit_depth)] = device
+                        key: RecordedPlaybackCapabilityKey = (
+                            (encoder, codec, bit_depth)
+                            if quality is None
+                            else (encoder, codec, bit_depth, quality)
+                        )
+                        cls._selected_devices[key] = device
                     else:
                         # 通常経路では署名再確認後にだけ現在世代へ反映する。
                         context.selected_device = device

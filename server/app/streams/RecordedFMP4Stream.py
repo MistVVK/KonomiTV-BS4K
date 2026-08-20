@@ -1957,7 +1957,13 @@ class RecordedFMP4Stream:
         ]
         device: str | None = None
         if backend in ('QSV', 'AMF'):
-            selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(backend, codec, bit_depth)
+            # 能力検査で同じ画質を完走したrender nodeを使い、低解像度だけ成功する旧GPUへ戻さない。
+            selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(
+                backend,
+                codec,
+                bit_depth,
+                self.quality,
+            )
             devices = [selected_device] if selected_device is not None else \
                 RecordedPlaybackBackend.discoverRenderDevices(backend)
             if len(devices) == 0:

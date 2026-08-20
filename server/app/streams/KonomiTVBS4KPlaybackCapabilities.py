@@ -13,7 +13,7 @@ from biim.mpeg2ts.pat import PATSection
 from biim.mpeg2ts.pmt import PMTSection
 
 from app import logging
-from app.constants import LIBRARY_PATH
+from app.constants import LIBRARY_PATH, QUALITY_TYPES
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KONOMITV_BS4K_AUDIO_CODECS,
     IsKonomiTVBS4KVideoCodecBitDepthSupported,
@@ -196,6 +196,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         video_bit_depths: tuple[KonomiTVBS4KVideoBitDepth, ...],
         audio_codec: KonomiTVBS4KAudioCodec,
         has_video: bool,
+        quality: QUALITY_TYPES | None = None,
     ) -> KonomiTVBS4KPlaybackCapabilities:
         """
         再生開始に必要なexact行とAVC/AAC互換fallback行だけを検査する。
@@ -207,6 +208,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             video_bit_depths: 現在の画質とブラウザで候補になるbit depthの優先順。
             audio_codec: 保存設定から選ばれた音声コーデック。
             has_video: 映像SourceBufferを使う再生対象ならTrue。
+            quality: 録画再生で実際に生成する画質。ライブでは使用しない。
 
         Returns:
             現在の再生候補と互換fallbackだけを含む部分能力行列。
@@ -221,6 +223,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                 video_bit_depths,
                 audio_codec,
                 has_video,
+                quality,
             )
 
         # ラジオと音声のみ録画では映像backendを一切起動せず、要求音声とAAC fallbackだけを検査する。
@@ -450,6 +453,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         video_bit_depths: tuple[KonomiTVBS4KVideoBitDepth, ...],
         audio_codec: KonomiTVBS4KAudioCodec,
         has_video: bool,
+        quality: QUALITY_TYPES | None,
     ) -> KonomiTVBS4KPlaybackCapabilities:
         """
         録画再生に必要なエンコーダー能力だけを検査する。
@@ -460,6 +464,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             video_bit_depths: ブラウザで再生できる bit depth の優先順。
             audio_codec: 保存設定から選ばれた音声コーデック。
             has_video: 録画に映像ストリームが含まれるなら True。
+            quality: 実際に生成する録画画質。省略時は基礎能力だけを検査する。
 
         Returns:
             録画能力だけを保持し、ライブ組み合わせを含まない部分能力行列。
@@ -497,11 +502,19 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         for video_bit_depth in video_bit_depths:
             if IsKonomiTVBS4KVideoCodecBitDepthSupported(video_codec, video_bit_depth) is False:
                 continue
-            recorded = await RecordedPlaybackCapabilityProbe.getCapability(
-                encoder,
-                video_codec,
-                video_bit_depth,
-            )
+            if quality is None:
+                recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                    encoder,
+                    video_codec,
+                    video_bit_depth,
+                )
+            else:
+                recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                    encoder,
+                    video_codec,
+                    video_bit_depth,
+                    quality = quality,
+                )
             recorded_capabilities.append(recorded)
             if recorded.available is True:
                 break
@@ -511,13 +524,20 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             (recorded.encoder, recorded.codec, recorded.bit_depth) == fallback_target
             for recorded in recorded_capabilities
         ):
-            recorded_capabilities.append(
-                await RecordedPlaybackCapabilityProbe.getCapability(
+            if quality is None:
+                fallback_recorded = await RecordedPlaybackCapabilityProbe.getCapability(
                     encoder,
                     'avc',
                     8,
                 )
-            )
+            else:
+                fallback_recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                    encoder,
+                    'avc',
+                    8,
+                    quality = quality,
+                )
+            recorded_capabilities.append(fallback_recorded)
 
         return KonomiTVBS4KPlaybackCapabilities(
             video = tuple(
@@ -1600,14 +1620,24 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         encoder: KonomiTVBS4KPlaybackEncoder,
         codec: KonomiTVBS4KVideoCodec,
         bit_depth: KonomiTVBS4KVideoBitDepth,
+        *,
+        quality: QUALITY_TYPES | None = None,
     ) -> KonomiTVBS4KPlaybackVideoCapability:
         """録画映像の実encode可否だけを返し、live TS probeを起動しない。"""
 
-        recorded = await RecordedPlaybackCapabilityProbe.getCapability(
-            encoder,
-            codec,
-            bit_depth,
-        )
+        if quality is None:
+            recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                encoder,
+                codec,
+                bit_depth,
+            )
+        else:
+            recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                encoder,
+                codec,
+                bit_depth,
+                quality = quality,
+            )
         return KonomiTVBS4KPlaybackVideoCapability(
             encoder = recorded.encoder,
             codec = recorded.codec,

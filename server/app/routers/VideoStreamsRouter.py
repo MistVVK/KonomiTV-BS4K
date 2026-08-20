@@ -11,6 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from app import logging, schemas
 from app.config import Config
+from app.constants import QUALITY_TYPES
 from app.metadata.RecordedPlaybackIndex import IsRecordedPlaybackIndexReady
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.models.RecordedProgram import RecordedProgram
@@ -247,6 +248,10 @@ async def KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
         bool,
         Query(description='映像SourceBufferを使う再生対象かどうか。'),
     ],
+    quality: Annotated[
+        QUALITY_TYPES | None,
+        Query(description='録画再生で実際に生成する画質。ライブでは省略可能。'),
+    ] = None,
 ) -> schemas.KonomiTVBS4KPlaybackCapabilities:
     """再生開始に必要なexact行とAVC/AAC互換fallback行だけを返す。"""
 
@@ -254,14 +259,25 @@ async def KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
         tuple[KonomiTVBS4KVideoBitDepth, ...],
         tuple(int(value) for value in video_bit_depths.split(',')),
     )
-    capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
-        encoder,
-        playback_mode,
-        video_codec,
-        parsed_video_bit_depths,
-        audio_codec,
-        has_video,
-    )
+    if quality is None:
+        capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
+            encoder,
+            playback_mode,
+            video_codec,
+            parsed_video_bit_depths,
+            audio_codec,
+            has_video,
+        )
+    else:
+        capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
+            encoder,
+            playback_mode,
+            video_codec,
+            parsed_video_bit_depths,
+            audio_codec,
+            has_video,
+            quality,
+        )
     SetTSCodecBridgeProcessCounterHeaders(response)
     return schemas.KonomiTVBS4KPlaybackCapabilities(
         video = [
@@ -354,6 +370,7 @@ async def ValidateRecordedPlaybackCapabilities(
                 selected_encoder,
                 stream_quality.encoding_options.video_codec,
                 stream_quality.encoding_options.video_bit_depth,
+                quality = stream_quality.quality,
             )
         )
         if video_capability.recorded_available is False:

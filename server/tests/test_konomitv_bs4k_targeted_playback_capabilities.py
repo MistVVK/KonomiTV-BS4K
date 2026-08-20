@@ -628,7 +628,7 @@ def test_pending_recorded_index_revalidates_explicit_codec_before_stream_creatio
 ) -> None:
     """Pending録画はindex生成後の最新メタデータで非対応codecを422拒否する。"""
 
-    recorded_video_calls: list[tuple[str, str, int]] = []
+    recorded_video_calls: list[tuple[str, str, int, str | None]] = []
     recorded_program = SimpleNamespace(
         network_id = 0x000B,
         recorded_video = SimpleNamespace(
@@ -664,10 +664,12 @@ def test_pending_recorded_index_revalidates_explicit_codec_before_stream_creatio
         encoder: KonomiTVBS4KPlaybackEncoder,
         codec: KonomiTVBS4KVideoCodec,
         bit_depth: KonomiTVBS4KVideoBitDepth,
+        *,
+        quality: str | None = None,
     ) -> KonomiTVBS4KPlaybackVideoCapability:
         """index生成後のexact映像能力を非対応として返す。"""
 
-        recorded_video_calls.append((encoder, codec, bit_depth))
+        recorded_video_calls.append((encoder, codec, bit_depth, quality))
         return KonomiTVBS4KPlaybackVideoCapability(
             encoder = encoder,
             codec = codec,
@@ -723,7 +725,7 @@ def test_pending_recorded_index_revalidates_explicit_codec_before_stream_creatio
         'code': 'UnsupportedCombination',
         'message': 'The requested recorded encoding is unavailable.',
     }
-    assert recorded_video_calls == [('QSV', 'av1', 10)]
+    assert recorded_video_calls == [('QSV', 'av1', 10, '1080p')]
 
 
 def test_targeted_capability_api_serializes_partial_matrix(

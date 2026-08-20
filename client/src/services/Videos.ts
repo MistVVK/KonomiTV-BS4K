@@ -557,6 +557,7 @@ class Videos {
                     video_bit_depths: konomitv_bs4k_video_bit_depths.join(','),
                     audio_codec: konomitv_bs4k_requested_audio_codec,
                     has_video: konomitv_bs4k_has_video,
+                    quality: konomitv_bs4k_video_profile.streaming_quality,
                 },
             },
         );
