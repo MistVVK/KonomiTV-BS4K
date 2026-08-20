@@ -30,7 +30,7 @@
 - KonomiTV-BS4K の実行ターゲットは Docker Linux のみです。通常の開発・動作確認も Docker の Development 環境で行います
 - Main 環境と Development 環境は、コンテナ・イメージ・設定・データ・ログを分離します。片方の操作で他方の状態を変更しないでください
 - 実際のホストパス、ドメイン、IP アドレス、リバースプロキシ構成はマシン固有の指示を参照し、Git 管理下の文書やコードへ記載しないでください
-- Compose のファイル構成、起動手順、状態保護、検証方法は `AGENTS-BS4K.md` の指示に従ってください
+- Compose のファイル構成、起動手順、状態保護、検証方法は `docs_AGENTS/docker-development.md` の指示に従ってください
 
 ### Main 環境 (port 7000、常にユーザー管理)
 
@@ -44,7 +44,7 @@
 - Development 固有の設定・データ・ログ・録画ミラー・キャプチャは `docker/development/state/` 以下へ隔離します
 - コンテナ内の実行コードはイメージに格納されています。ホストのソースツリーは参照用の read-only bind であり、コード変更は hot reload されません
 - コード変更を Development で確認するときは、ユーザーに再ビルドや再作成を依頼せず、エージェントが検証付き Development イメージをビルドしてから Development コンテナだけを再作成する
-- Development のビルド・再作成・再起動はエージェントの通常作業である。事前確認と状態保護に関する `AGENTS-BS4K.md` の手順は省略してはいけない
+- Development のビルド・再作成・再起動はエージェントの通常作業である。事前確認と状態保護に関する `docs_AGENTS/docker-development.md` の手順は省略してはいけない
 
 ### ブラウザ検証
 
