@@ -252,6 +252,13 @@ class GenericCMAnalyzer:
     NORMALIZATION_POLICY_VERSION = 6
     _LOGO_FRAME_MAX_WORKERS = 15
     _LOGO_FRAME_MIN_FRAMES_PER_WORKER = 600
+    # stream列挙だけのFFprobeは録画尺に比例しないため、索引側と同じ短い上限で固着を防ぐ。
+    _PROBE_PROCESS_TIMEOUT_SECONDS = 60.0
+    # 全編処理は低速なCPU fallbackも許容しつつ、停止した1件が直列CM解析を永久に塞がない上限にする。
+    _MEDIA_PROCESS_MIN_TIMEOUT_SECONDS = 30 * 60.0
+    _MEDIA_PROCESS_MAX_TIMEOUT_SECONDS = 24 * 60 * 60.0
+    _MEDIA_PROCESS_DURATION_MULTIPLIER = 8.0
+    _PROCESS_TERMINATE_TIMEOUT_SECONDS = 10.0
     _TRIM_PATTERN = re.compile(r'\btrim\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)', re.IGNORECASE)
     _VIDEO_FRAME_COUNT_PATTERN = re.compile(r'Video Frames:\s*(\d+)\b')
     _FINAL_SCENE_PATTERN = re.compile(r'^#\s*SCPos:\s*(\d+)\s+(\d+)\s*$', re.MULTILINE)
@@ -430,13 +437,13 @@ class GenericCMAnalyzer:
         audio_index_path = request.work_directory / 'prepared-audio.ffindex'
         index_process, audio_index_process = await asyncio.gather(
             self._indexMedia(
-                request,
+                descriptor.duration_seconds,
                 prepared_media_path,
                 index_path,
                 self._buildEnvironment(request),
             ),
             self._indexMedia(
-                request,
+                descriptor.duration_seconds,
                 prepared_audio_path,
                 audio_index_path,
                 self._buildEnvironment(request),
@@ -563,7 +570,9 @@ class GenericCMAnalyzer:
             '-show_programs',
             '-of', 'json',
             str(request.recorded_file_path),
-        ), self._buildMediaEnvironment(request))
+        ), self._buildMediaEnvironment(request),
+            timeout_seconds=self._PROBE_PROCESS_TIMEOUT_SECONDS,
+        )
         if process.return_code != 0:
             raise OSError(process.diagnostic or 'FFprobe failed.')
         payload = json.loads(process.output)
@@ -707,7 +716,9 @@ class GenericCMAnalyzer:
                 if math.floor(float(analysis_frame_rate) + 0.5) >= 60
                 else '10'
             ),
-        ), environment)
+        ), environment,
+            timeout_seconds=self._mediaProcessTimeout(descriptor.duration_seconds),
+        )
         # chapter_exe は AviSynth の読み込み失敗時にも 0 を返し、不正な出力を
         # 作ることがある。出力中の明示的な AviSynth エラーも工程失敗として扱う。
         if (
@@ -765,6 +776,7 @@ class GenericCMAnalyzer:
                 environment,
                 logo_worker_count,
                 analysis_frame_rate,
+                self._mediaProcessTimeout(descriptor.duration_seconds),
             )
             if logo_process.return_code != 0:
                 return self._failure(
@@ -805,7 +817,11 @@ class GenericCMAnalyzer:
             'SERVICE_ID': str(descriptor.program_id or request.service_id or 0),
             'CLI_OUT_PATH': str(work_directory / 'result'),
         })
-        jls_process = await self._runProcess(tuple(command), jls_environment)
+        jls_process = await self._runProcess(
+            tuple(command),
+            jls_environment,
+            timeout_seconds=self._mediaProcessTimeout(descriptor.duration_seconds),
+        )
         if jls_process.return_code != 0 or trim_output.is_file() is False:
             return self._failure(
                 'JoinLogoScpFailed', jls_process, descriptor, decode_mode, warnings,
@@ -866,6 +882,7 @@ class GenericCMAnalyzer:
         environment: dict[str, str],
         worker_count: int,
         analysis_frame_rate: Fraction,
+        timeout_seconds: float,
     ) -> tuple[_ProcessResult, _LogoFrameOutput]:
         analysis_output = work_directory / 'logoframe-analysis.txt'
         command = [
@@ -879,7 +896,11 @@ class GenericCMAnalyzer:
         ]
         for index, logo_path in enumerate(logo_paths, start=1):
             command.extend((f'-logo{index}', str(logo_path)))
-        process = await self._runProcess(tuple(command), environment)
+        process = await self._runProcess(
+            tuple(command),
+            environment,
+            timeout_seconds=timeout_seconds,
+        )
         if process.return_code != 0:
             return process, _LogoFrameOutput(None, None, None)
         list_path = analysis_output.with_name(f'{analysis_output.stem}_list.ini')
@@ -1165,7 +1186,9 @@ class GenericCMAnalyzer:
                 '-map_metadata', '-1', '-map_chapters', '-1',
                 '-f', 'matroska',
                 str(video_partial_path),
-            ), environment)
+            ), environment,
+                timeout_seconds=self._mediaProcessTimeout(descriptor.duration_seconds),
+            )
             if process.return_code != 0:
                 self._removeFiles(temporary_paths)
                 return replace(
@@ -1225,7 +1248,11 @@ class GenericCMAnalyzer:
             command.extend(('--format-name', descriptor.format_name))
         if descriptor.audio_stream_id is not None:
             command.extend(('--stream-id', str(descriptor.audio_stream_id)))
-        process = await self._runProcess(tuple(command), environment)
+        process = await self._runProcess(
+            tuple(command),
+            environment,
+            timeout_seconds=self._mediaProcessTimeout(descriptor.duration_seconds),
+        )
         report = self._parseLogicalAudioRebuildReport(process.output)
         if report is not None:
             residual_statistics = {
@@ -1314,7 +1341,9 @@ class GenericCMAnalyzer:
             '-rf64', 'auto',
             '-f', 'wav',
             str(output_path),
-        ), environment)
+        ), environment,
+            timeout_seconds=self._mediaProcessTimeout(descriptor.duration_seconds),
+        )
 
     @staticmethod
     def _parseLogicalAudioRebuildReport(output: str) -> _LogicalAudioRebuildReport | None:
@@ -1490,20 +1519,21 @@ class GenericCMAnalyzer:
 
     async def _indexMedia(
         self,
-        request: CMAnalyzerRequest,
+        duration_seconds: float,
         media_path: Path,
         index_path: Path,
         environment: Mapping[str, str],
     ) -> _ProcessResult:
         """全trackを一度だけindexし、完成後に原子的に公開する。"""
 
-        del request
         partial_path = index_path.with_name(f'{index_path.name}.partial')
         process = await self._runProcess((
             str(self.ffmsindex_path),
             '-f', '-t', '-1',
             str(media_path), str(partial_path),
-        ), environment)
+        ), environment,
+            timeout_seconds=self._mediaProcessTimeout(duration_seconds),
+        )
         if process.return_code == 0 and partial_path.is_file():
             try:
                 os.replace(partial_path, index_path)
@@ -1520,7 +1550,9 @@ class GenericCMAnalyzer:
         process = await self._runProcess((
             str(self.ffprobe_path),
             '-v', 'error', '-show_streams', '-of', 'json', str(media_path),
-        ), self._buildMediaEnvironment(request))
+        ), self._buildMediaEnvironment(request),
+            timeout_seconds=self._PROBE_PROCESS_TIMEOUT_SECONDS,
+        )
         if process.return_code != 0:
             raise OSError(process.diagnostic or 'Prepared media FFprobe failed.')
         payload = json.loads(process.output)
@@ -1620,7 +1652,20 @@ class GenericCMAnalyzer:
         self,
         command: tuple[str, ...],
         environment: Mapping[str, str],
+        *,
+        timeout_seconds: float,
     ) -> _ProcessResult:
+        """有限のnative処理を絶対上限内で実行し、終了時にpipeとprocess groupを回収する。
+
+        Args:
+            command: 実行ファイルと引数。
+            environment: 子プロセスへ渡す環境変数。
+            timeout_seconds: 起動後の絶対タイムアウト秒数。
+
+        Returns:
+            終了コードと標準出力・標準エラー。タイムアウト時は負の終了コードを返す。
+        """
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -1632,26 +1677,79 @@ class GenericCMAnalyzer:
         except OSError as ex:
             return _ProcessResult(-1, '', str(ex))
         try:
-            stdout, stderr = await process.communicate()
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            await self._terminateProcessGroup(process)
+            return _ProcessResult(
+                -1,
+                '',
+                (
+                    f'ProcessTimeout: {Path(command[0]).name} exceeded '
+                    f'{timeout_seconds:.0f} seconds.'
+                ),
+            )
         except asyncio.CancelledError:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(process.wait(), timeout=10)
-            except TimeoutError:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await process.wait()
+            await self._terminateProcessGroup(process)
             raise
         return _ProcessResult(
             process.returncode or 0,
             stdout.decode('utf-8', errors='replace').strip(),
             stderr.decode('utf-8', errors='replace').strip(),
         )
+
+    @classmethod
+    def _mediaProcessTimeout(cls, duration_seconds: float) -> float:
+        """録画尺に比例しつつ有限な全編native処理の絶対上限を返す。
+
+        Args:
+            duration_seconds: 解析対象録画の秒数。
+
+        Returns:
+            低速なCPU fallbackを許容する30分から24時間までのタイムアウト秒数。
+        """
+
+        scaled_timeout = (
+            duration_seconds * cls._MEDIA_PROCESS_DURATION_MULTIPLIER
+            if math.isfinite(duration_seconds) and duration_seconds > 0
+            else cls._MEDIA_PROCESS_MIN_TIMEOUT_SECONDS
+        )
+        return min(
+            cls._MEDIA_PROCESS_MAX_TIMEOUT_SECONDS,
+            max(cls._MEDIA_PROCESS_MIN_TIMEOUT_SECONDS, scaled_timeout),
+        )
+
+    @classmethod
+    async def _terminateProcessGroup(cls, process: asyncio.subprocess.Process) -> None:
+        """native process groupを段階的に停止し、pipeと終了状態を回収する。
+
+        Args:
+            process: start_new_session=True で起動した子プロセス。
+
+        Returns:
+            None
+        """
+
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            # communicate() を再実行し、終了待機だけでなく未読の stdout / stderr も drain する。
+            await asyncio.wait_for(
+                process.communicate(),
+                timeout=cls._PROCESS_TERMINATE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            if process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            await process.communicate()
 
     def _buildEnvironment(self, request: CMAnalyzerRequest) -> dict[str, str]:
         """AviSynth/FFMS2用private libraryを優先するnative解析環境を返す。"""
@@ -1862,7 +1960,8 @@ class GenericCMAnalyzer:
         if result.status != 'analysis_failed':
             return False
         text = ' '.join(filter(None, (result.error_code, result.error_message))).lower()
-        return cls._HARDWARE_FAILURE_MARKER in text
+        # hardware試行中の固着もdecoderが応答しない失敗として、既存のCPU一回fallbackへ戻す。
+        return cls._HARDWARE_FAILURE_MARKER in text or 'processtimeout:' in text
 
     @classmethod
     def _isDecoderUnavailable(cls, message: str | None) -> bool:

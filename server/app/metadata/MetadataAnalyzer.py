@@ -231,6 +231,7 @@ class MetadataAnalyzer:
     # FFprobe が VPS/SPS/PPS を確実に読み込めるよう解析対象の尺とサイズを拡張する
     FFPROBE_ANALYZE_DURATION_US: ClassVar[str] = str(30 * 1_000_000)
     FFPROBE_PROBESIZE: ClassVar[str] = '80M'
+    FFPROBE_TIMEOUT_SECONDS: ClassVar[float] = 60.0
     # TS の映像ストリーム変化検出で、各サンプル位置から読み込む最大バイト数
     ## 末尾サンプルでも同じ値を使い、割合指定だけでは短くなりやすい小さめの録画でも PMT を拾える範囲を確保する
 
@@ -1253,13 +1254,29 @@ class MetadataAnalyzer:
         try:
             cmd = [LIBRARY_PATH['FFprobe8'], *args]
             if input_bytes is None:
-                proc = subprocess.run(cmd, capture_output=True)
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=self.FFPROBE_TIMEOUT_SECONDS,
+                )
             else:
-                proc = subprocess.run(cmd, input=input_bytes, capture_output=True)
+                proc = subprocess.run(
+                    cmd,
+                    input=input_bytes,
+                    capture_output=True,
+                    timeout=self.FFPROBE_TIMEOUT_SECONDS,
+                )
             if proc.returncode != 0:
                 logging.warning(f'{self.recorded_file_path}: ffprobe failed with return code {proc.returncode}: {proc.stderr.decode("utf-8", errors="ignore").strip()}')
                 return None
             return cast(dict[str, Any], json.loads(proc.stdout.decode('utf-8')))
+        except subprocess.TimeoutExpired:
+            # subprocess.run() は timeout 時に子プロセスを kill して wait まで完了してから例外を送出する。
+            logging.warning(
+                f'{self.recorded_file_path}: ffprobe timed out after '
+                f'{self.FFPROBE_TIMEOUT_SECONDS:.0f} seconds.'
+            )
+            return None
         except Exception as ex:
             logging.warning(f'{self.recorded_file_path}: Failed to run ffprobe:', exc_info=ex)
             return None
