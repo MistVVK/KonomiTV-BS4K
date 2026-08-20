@@ -48,6 +48,15 @@ router = APIRouter(
 )
 
 VideoBitDepthQuery = KonomiTVBS4KVideoBitDepthQuery
+# M3U8 の URI へ埋め込む値なので、全 HTTP 入口で改行や URI 区切り文字を拒否する。
+CacheKeyQuery = Annotated[
+    str | None,
+    Query(
+        description='キャッシュ制御用のキー。',
+        pattern=r'^[0-9A-Za-z_-]{1,64}$',
+    ),
+]
+
 
 def SetTSCodecBridgeProcessCounterHeaders(response: Response) -> None:
     """互換API隔離の前後で比較するBridge process世代と用途別回数を設定する。"""
@@ -720,7 +729,7 @@ async def VideoHLSPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query(description='セッション ID（クライアント側で適宜生成したランダム値を指定する）。')],
-    cache_key: Annotated[str | None, Query(description='キャッシュ制御用のキー。')] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     """
     指定された画質に対応する、録画番組のストリーミング用 HLS M3U8 プレイリストを返す。<br>
@@ -758,7 +767,7 @@ async def VideoHLSVideoPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     return Response(
@@ -774,7 +783,7 @@ async def VideoHLSVideoSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     segment_data = await video_stream.getVideoSegment(sequence)
@@ -790,7 +799,7 @@ async def VideoHLSVideoInitSegmentAPI(
     session_id: Annotated[str, Query()],
     generation: Annotated[int, Query()],
     sequence: Annotated[int, Query()] = 0,
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     """録画映像の初期化セグメントを返す。"""
 
@@ -807,7 +816,7 @@ async def VideoHLSAudioPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     return Response(
@@ -824,7 +833,7 @@ async def VideoHLSAudioSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     segment_data = await video_stream.getAudioSegment(rendition_id, sequence)
@@ -844,7 +853,7 @@ async def VideoHLSAudioInitSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()] = 0,
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     init_segment = await video_stream.getAudioInitSegment(rendition_id, sequence)
@@ -859,7 +868,7 @@ async def VideoHLSSubtitlePlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     subtitle_stream = RecordedSubtitleStream(recorded_program.recorded_video)
@@ -884,7 +893,7 @@ async def VideoHLSSubtitleSegmentAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     GetRecordedStream(session_id, recorded_program, stream_quality).keepAlive()
     segment_data = await RecordedSubtitleStream(recorded_program.recorded_video).getWebVTT(subtitle_index)

@@ -402,7 +402,7 @@ async def CompatibilityVideoHLSPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     """従来 codec に固定した録画 HLS master playlist を返す。"""
 
@@ -420,7 +420,7 @@ async def CompatibilityVideoHLSVideoPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSVideoPlaylistAPI(
         recorded_program,
@@ -437,7 +437,7 @@ async def CompatibilityVideoHLSVideoInitSegmentAPI(
     session_id: Annotated[str, Query()],
     generation: Annotated[int, Query()],
     sequence: Annotated[int, Query()] = 0,
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSVideoInitSegmentAPI(
         recorded_program,
@@ -455,7 +455,7 @@ async def CompatibilityVideoHLSVideoSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSVideoSegmentAPI(
         recorded_program,
@@ -475,7 +475,7 @@ async def CompatibilityVideoHLSAudioPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSAudioPlaylistAPI(
         rendition_id,
@@ -496,7 +496,7 @@ async def CompatibilityVideoHLSAudioInitSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()] = 0,
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSAudioInitSegmentAPI(
         rendition_id,
@@ -518,7 +518,7 @@ async def CompatibilityVideoHLSAudioSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSAudioSegmentAPI(
         rendition_id,
@@ -539,7 +539,7 @@ async def CompatibilityVideoHLSSubtitlePlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSSubtitlePlaylistAPI(
         subtitle_index,
