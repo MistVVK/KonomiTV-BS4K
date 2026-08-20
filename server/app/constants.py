@@ -846,6 +846,15 @@ BLUESKY_ACCOUNT_SESSION_FERNET_KEY = base64.urlsafe_b64encode(
 # Bluesky セッション文字列の暗号化に使う Fernet のインスタンス
 BLUESKY_ACCOUNT_SESSION_FERNET = Fernet(BLUESKY_ACCOUNT_SESSION_FERNET_KEY)
 
+# 暗号化されたニコニコ OAuth トークンの接頭辞
+NICONICO_TOKEN_ENCRYPTION_PREFIX = 'enc:'
+# ニコニコ OAuth トークンの暗号化に使う Fernet の暗号化キー
+NICONICO_TOKEN_FERNET_KEY = base64.urlsafe_b64encode(
+    hashlib.sha256(f'niconico:{JWT_SECRET_KEY}'.encode()).digest(),
+)
+# ニコニコ OAuth トークンの暗号化に使う Fernet のインスタンス
+NICONICO_TOKEN_FERNET = Fernet(NICONICO_TOKEN_FERNET_KEY)
+
 # パスワードハッシュ化のための設定
 PASSWORD_CONTEXT = CryptContext(
     schemes = ['bcrypt'],
