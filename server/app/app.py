@@ -2,6 +2,7 @@
 import asyncio
 import atexit
 import mimetypes
+import re
 from collections.abc import Awaitable
 from pathlib import Path
 
@@ -68,6 +69,11 @@ from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
 from app.utils.HTTPS import BuildServerStartupSettings, ReverseProxyMiddleware
+from app.utils.KonomiTVBS4KRequestBodyLimit import (
+    MULTIPART_FORM_DATA_OVERHEAD_BYTES,
+    KonomiTVBS4KRequestBodyLimit,
+    KonomiTVBS4KRequestBodyLimitMiddleware,
+)
 
 
 # もし Config() の実行時に AssertionError が発生した場合は、LoadConfig() を実行してサーバー設定データをロードする
@@ -133,9 +139,46 @@ app.include_router(MaintenanceRouter.router)
 app.include_router(VersionRouter.router)
 app.include_router(KonomiTVBS4KSpeedTestRouter.router)
 
-# Capture upload は multipart 解析前に HTTP 本文サイズを制限する。
-# add_middleware は後から登録した方が外側になるため、先に BodyLimit を入れ、その後 CORS を被せる。
-app.add_middleware(CapturesRouter.CaptureUploadBodyLimitMiddleware)
+# FastAPI は認証 dependency より前に form 全体を解析するため、対象ルートだけ ASGI 層で本文を制限する。
+## 画像は KonomiTV-BS4K が生成・保存できる Capture 1 枚 20 MiB を共通の入力上限とし、
+## Twitter / Bluesky は最大 4 枚、CM ロゴは endpoint の既存 64 MiB 上限に framing の余裕を加える。
+## OAuth2 ログインは username 64 bytes・password 72 bytes と任意の標準フィールドに対して十分な 64 KiB とする。
+REQUEST_BODY_LIMITS = (
+    CapturesRouter.CAPTURE_UPLOAD_BODY_LIMIT,
+    KonomiTVBS4KRequestBodyLimit(
+        method='PUT',
+        path_pattern=re.compile(r'/api/users/me/icon/?'),
+        max_body_bytes=CapturesRouter.MAX_CAPTURE_UPLOAD_BYTES + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
+        detail='User icon upload exceeds the 20 MiB limit',
+    ),
+    KonomiTVBS4KRequestBodyLimit(
+        method='POST',
+        path_pattern=re.compile(r'/api/twitter/accounts/[^/]+/tweets/?'),
+        max_body_bytes=(CapturesRouter.MAX_CAPTURE_UPLOAD_BYTES * 4) + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
+        detail='Twitter image upload exceeds the 80 MiB request limit',
+    ),
+    KonomiTVBS4KRequestBodyLimit(
+        method='POST',
+        path_pattern=re.compile(r'/api/bluesky/accounts/[^/]+/posts/?'),
+        max_body_bytes=(CapturesRouter.MAX_CAPTURE_UPLOAD_BYTES * 4) + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
+        detail='Bluesky image upload exceeds the 80 MiB request limit',
+    ),
+    KonomiTVBS4KRequestBodyLimit(
+        method='POST',
+        path_pattern=re.compile(r'/api/cm-analysis/logos/?'),
+        max_body_bytes=CMAnalysisRouter.MAX_LOGO_UPLOAD_BYTES + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
+        detail='The CM logo file exceeds the 64 MiB limit',
+    ),
+    KonomiTVBS4KRequestBodyLimit(
+        method='POST',
+        path_pattern=re.compile(r'/api/users/token/?'),
+        max_body_bytes=64 * 1024,
+        detail='Login form exceeds the 64 KiB limit',
+    ),
+)
+app.add_middleware(KonomiTVBS4KRequestBodyLimitMiddleware, limits=REQUEST_BODY_LIMITS)
+
+# add_middleware は後から登録した方が外側になるため、BodyLimit の後に CORS を被せる。
 
 # CORS の設定
 ## 開発環境では全てのオリジンからのリクエストを許可

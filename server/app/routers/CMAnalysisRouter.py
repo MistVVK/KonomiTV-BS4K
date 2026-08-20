@@ -45,7 +45,7 @@ router = APIRouter(
     prefix='/api/cm-analysis',
 )
 
-_MAX_LOGO_UPLOAD_BYTES = 64 * 1024 * 1024
+MAX_LOGO_UPLOAD_BYTES = 64 * 1024 * 1024
 
 
 @router.get(
@@ -241,8 +241,8 @@ async def CMLogoUploadAPI(
     if await asyncio.to_thread(destination_path.exists):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='A logo with the same filename already exists')
 
-    content = await logo_file.read(_MAX_LOGO_UPLOAD_BYTES + 1)
-    if len(content) > _MAX_LOGO_UPLOAD_BYTES:
+    content = await logo_file.read(MAX_LOGO_UPLOAD_BYTES + 1)
+    if len(content) > MAX_LOGO_UPLOAD_BYTES:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail='The CM logo file exceeds the 64 MiB limit',

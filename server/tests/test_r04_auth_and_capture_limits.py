@@ -28,6 +28,9 @@ from app.routers import (
 )
 from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
 from app.utils.KonomiTVBS4KFastAPIRouteUtils import IterateKonomiTVBS4KAPIRouteContexts
+from app.utils.KonomiTVBS4KRequestBodyLimit import (
+    KonomiTVBS4KRequestBodyLimitMiddleware,
+)
 
 
 if config_module._CONFIG is None:
@@ -348,7 +351,10 @@ def test_capture_body_limit_middleware_rejects_content_length_before_body_read()
     async def downstream_app(_scope: Scope, _receive: Receive, _send: Send) -> None:
         raise AssertionError('downstream app must not run when Content-Length exceeds the limit')
 
-    middleware = CapturesRouter.CaptureUploadBodyLimitMiddleware(downstream_app)
+    middleware = KonomiTVBS4KRequestBodyLimitMiddleware(
+        downstream_app,
+        (CapturesRouter.CAPTURE_UPLOAD_BODY_LIMIT,),
+    )
     asyncio.run(middleware(scope, tracking_receive, tracking_send))
 
     assert receive_call_count == 0
@@ -425,7 +431,10 @@ def test_capture_body_limit_middleware_stops_streamed_body_before_full_spool() -
             'more_body': False,
         })
 
-    middleware = CapturesRouter.CaptureUploadBodyLimitMiddleware(body_consuming_app)
+    middleware = KonomiTVBS4KRequestBodyLimitMiddleware(
+        body_consuming_app,
+        (CapturesRouter.CAPTURE_UPLOAD_BODY_LIMIT,),
+    )
     asyncio.run(middleware(scope, streaming_receive, tracking_send))
 
     # 超過検知後は source の残りも後段への本文も読まず、直ちに 413 へ切り替える
