@@ -40,6 +40,9 @@ def BuildEncodingTask(
     settings.general.encoder_bs4k_input_analysis_enabled = bs4k_input_analysis_enabled
     settings.general.konomitv_bs4k_live_sar_mode = sar_mode  # type: ignore[assignment]
     monkeypatch.setattr('app.streams.LiveEncodingTask.Config', lambda: settings)
+    # render node 固定指定は遅延 import される app.config.Config を直接参照するため、
+    # タスク側だけでなく参照元モジュールの Config も同じ最小設定へ差し替える
+    monkeypatch.setattr('app.config.Config', lambda: settings)
     task = object.__new__(LiveEncodingTask)
     task._retry_count = 0
     task.live_stream = SimpleNamespace(

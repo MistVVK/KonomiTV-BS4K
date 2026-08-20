@@ -145,8 +145,16 @@ export type HostAbsolutePath = string;
 export type ServerEncoder = 'FFmpeg' | 'QSV' | 'NVENC' | 'AMF';
 
 /**
+ * QSV / AMF の HW エンコード固定指定の候補となる DRM render node のインターフェイス
+ */
+export interface IKonomiTVBS4KRenderDevice {
+    path: string;
+    vendor_id: string;
+    vendor_name: string;
+}
+
+/**
  * サーバー設定を表すインターフェース
- * サーバー側の app.config.HostServerSettings で定義されているものと同じ
  */
 export interface IServerSettings {
     general: {
@@ -157,6 +165,7 @@ export interface IServerSettings {
         mirakurun_url: string;
         konomitv_bs4k_live_transport: 'MpegTs' | 'Tlv';
         konomitv_bs4k_tlv_mirakurun_url: string | null;
+        konomitv_bs4k_encoder_render_device: string | null;
         encoder: ServerEncoder;
         konomitv_bs4k_live_sar_mode: 'CPU' | 'GPU';
         encoder_bs4k: ServerEncoder;
@@ -249,6 +258,7 @@ export const IServerSettingsDefault: IServerSettings = {
         mirakurun_url: 'http://127.0.0.1:40772/',
         konomitv_bs4k_live_transport: 'MpegTs',
         konomitv_bs4k_tlv_mirakurun_url: null,
+        konomitv_bs4k_encoder_render_device: null,
         encoder: 'FFmpeg',
         konomitv_bs4k_live_sar_mode: 'CPU',
         encoder_bs4k: 'FFmpeg',
@@ -350,6 +360,25 @@ class Settings {
         return true;
     }
 
+
+    /**
+     * QSV / AMF の HW エンコードに利用できる DRM render node の一覧を取得する
+     * 設定画面での固定指定の候補表示に利用する
+     * @return render node の一覧 (取得に失敗した場合は空配列)
+     */
+    static async fetchKonomiTVBS4KRenderDevices(): Promise<IKonomiTVBS4KRenderDevice[]> {
+
+        // API リクエストを実行
+        const response = await APIClient.get<IKonomiTVBS4KRenderDevice[]>('/settings/konomitv-bs4k-render-devices');
+
+        // エラー処理
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'DRM render node の一覧を取得できませんでした。');
+            return [];
+        }
+
+        return response.data;
+    }
 
     /**
      * サーバー設定を取得する

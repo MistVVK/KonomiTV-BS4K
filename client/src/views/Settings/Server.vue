@@ -371,6 +371,20 @@
                     v-model="server_settings.tv.preferred_terrestrial_region">
                 </v-select>
             </div>
+            <div class="settings__item" v-if="isSectionVisible('streaming-common') && is_render_device_setting_visible">
+                <div class="settings__item-heading">ハードウェアエンコードで利用する GPU の固定指定</div>
+                <div class="settings__item-label">
+                    通常・BS4K の両方のハードウェアエンコード (QSV・AMF) で利用する DRM render node を指定します。デフォルトは自動選択です。<br>
+                    自動選択では、エンコーダーのベンダーに一致する render node が自動で選択されます。<br>
+                    複数 GPU 環境で特定の GPU だけを使いたい場合は、/dev/dri/renderD128 のようなパスを指定してください。<br>
+                    指定した render node が見えない環境では、警告を出した上で自動選択に戻ります。<br>
+                </div>
+                <v-combobox class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :items="render_device_options"
+                    v-model="encoder_render_device_selection">
+                </v-combobox>
+            </div>
             <div class="settings__item" v-if="isSectionVisible('streaming-common')">
                 <div class="settings__item-heading">誰も見ていないチャンネルのエンコードタスクを維持する秒数</div>
                 <div class="settings__item-label">
@@ -548,6 +562,7 @@ import type { IServerSettings } from '@/services/Settings';
 
 import AccountManageSettings from '@/components/Settings/AccountManageSettings.vue';
 import Message from '@/message';
+import Settings, { type IKonomiTVBS4KRenderDevice } from '@/services/Settings';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils from '@/utils';
@@ -723,6 +738,35 @@ const server_settings = computed<IServerSettings>({
         }
     },
 });
+
+// ハードウェアエンコード (QSV・AMF) で利用する DRM render node の固定指定
+// QSV・AMF がどちらのエンコーダーにも選ばれていないときは render node を使わないため非表示にする
+const render_devices = ref<IKonomiTVBS4KRenderDevice[]>([]);
+const is_render_device_setting_visible = computed(() => {
+    const encoders = [server_settings.value.general.encoder, server_settings.value.general.encoder_bs4k];
+    return encoders.includes('QSV') || encoders.includes('AMF');
+});
+// 自動選択は空文字で表現し、保存時は null へ正規化する
+const render_device_options = computed(() => [
+    { title: '自動選択（エンコーダーのベンダーに一致する render node を利用）', value: '' },
+    ...render_devices.value.map(device => ({
+        title: `${device.path} (${device.vendor_name})`,
+        value: device.path,
+    })),
+]);
+const encoder_render_device_selection = computed<string>({
+    get: () => server_settings.value.general.konomitv_bs4k_encoder_render_device ?? '',
+    set: (value) => {
+        const normalized = (value ?? '').trim();
+        server_settings.value.general.konomitv_bs4k_encoder_render_device = normalized === '' ? null : normalized;
+    },
+});
+// 候補はコンテナへ渡された render node から取得する。表示が必要になったタイミングで一度だけ取得する
+watch(is_render_device_setting_visible, async (visible) => {
+    if (visible === true && render_devices.value.length === 0) {
+        render_devices.value = await Settings.fetchKonomiTVBS4KRenderDevices();
+    }
+}, { immediate: true });
 
 // inherit の場合は通常 API の動作モードを利用して、実際に使用する物理リッスンポートを判定する
 const compatibility_api_effective_https_mode = computed<IServerSettings['server']['https_mode']>(() => {

@@ -9,6 +9,7 @@ from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 
 from app import schemas
+from app.config import ServerSettings
 from app.metadata.RecordedPlaybackIndexer import (
     RecordedPlaybackIndexAnalysisError,
     RecordedPlaybackIndexer,
@@ -278,6 +279,10 @@ def test_recorded_playback_capability_selects_device_per_codec_and_bit_depth(
         'app.streams.RecordedPlaybackCapabilities.asyncio.create_subprocess_exec',
         CreateProcess,
     )
+    # render node 固定指定は遅延 import される app.config.Config を参照するため、
+    # 未固定 (pin=None) の最小設定を返すよう差し替える
+    settings = ServerSettings.model_validate({}, context={'bypass_validation': True})
+    monkeypatch.setattr('app.config.Config', lambda: settings)
     RecordedPlaybackCapabilityProbe._selected_devices.clear()  # pyright: ignore[reportPrivateUsage]
 
     async def Verify() -> None:

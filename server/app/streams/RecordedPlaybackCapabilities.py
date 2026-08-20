@@ -65,6 +65,15 @@ RecordedPlaybackCapabilityKey = RecordedPlaybackCapabilityBaseKey | tuple[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class RecordedRenderDevice:
+    """設定画面での固定指定候補となる DRM render node を表す。"""
+
+    path: str
+    vendor_id: str
+    vendor_name: str
+
+
 @dataclass(slots=True)
 class _RecordedPlaybackProbeContext:
     """実probe Task内だけで成功したrender nodeを保持する。"""
@@ -87,6 +96,18 @@ class RecordedPlaybackBackend:
     _VENDOR_IDS: ClassVar[dict[RecordedPlaybackEncoder, str]] = {
         'QSV': '0x8086',
         'AMF': '0x1002',
+    }
+    # sysfs の vendor ID から設定画面へ表示する vendor 名への対応
+    _VENDOR_NAMES: ClassVar[dict[str, str]] = {
+        '0x8086': 'Intel',
+        '0x1002': 'AMD',
+    }
+    # 見えていない固定指定の警告は能力 probe の行列で繰り返し呼ばれても 1 プロセス 1 回に留める
+    _STALE_RENDER_DEVICE_WARNED: ClassVar[bool] = False
+    # sysfs の vendor ID から設定画面へ表示する vendor 名への対応
+    _VENDOR_NAMES: ClassVar[dict[str, str]] = {
+        '0x8086': 'Intel',
+        '0x1002': 'AMD',
     }
     _AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/opt/amdgpu/lib/x86_64-linux-gnu/dri')
     _AMD_MESA_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/usr/lib/x86_64-linux-gnu/dri')
@@ -262,6 +283,54 @@ class RecordedPlaybackBackend:
             except OSError:
                 continue
         return devices
+
+    @classmethod
+    def listRenderDevices(cls) -> list[RecordedRenderDevice]:
+        """コンテナから見える全 DRM render node を vendor 情報付きで列挙する。
+
+        Returns:
+            設定画面での固定指定の候補となる render node 一覧。
+        """
+
+        devices: list[RecordedRenderDevice] = []
+        for device_path in sorted(Path('/sys/class/drm').glob('renderD*/device')):
+            try:
+                vendor_id = device_path.joinpath('vendor').read_text().strip().lower()
+            except OSError:
+                continue
+            devices.append(RecordedRenderDevice(
+                path = f'/dev/dri/{device_path.parent.name}',
+                vendor_id = vendor_id,
+                vendor_name = cls._VENDOR_NAMES.get(vendor_id, 'Unknown'),
+            ))
+        return devices
+
+    @classmethod
+    def resolveRenderDevices(cls, encoder: RecordedPlaybackEncoder) -> list[str]:
+        """設定で固定指定された render node、または vendor ID が一致する自動列挙を返す。
+
+        Args:
+            encoder: QSVまたはAMFを表す公開エンコーダー名。
+
+        Returns:
+            デバイス初期化を試す順番のrender node一覧。
+        """
+
+        # config.py が validator から本モジュールを遅延 import するため、こちらからの参照も遅延させて循環を避ける
+        from app.config import Config
+        pinned_device = Config().general.konomitv_bs4k_encoder_render_device
+        if pinned_device is not None:
+            # render node の番号は再起動やハードウェア構成で入れ替わるため、見えていない固定指定は
+            # 起動不能にせず警告へ留め、自動選択へ退避する
+            if Path(pinned_device).exists():
+                return [pinned_device]
+            if cls._STALE_RENDER_DEVICE_WARNED is False:
+                cls._STALE_RENDER_DEVICE_WARNED = True
+                logging.warning(
+                    'Configured render device is not available, falling back to auto selection. '
+                    f'[device: {pinned_device}]'
+                )
+        return cls.discoverRenderDevices(encoder)
 
     @classmethod
     def buildProbeCommand(
@@ -748,7 +817,8 @@ class RecordedPlaybackCapabilityProbe:
         devices: list[str | None] = [None]
         if encoder in ('QSV', 'AMF'):
             # 同vendorでも世代ごとにcodec能力が異なるため、各能力キーで全deviceを試す。
-            devices = [*RecordedPlaybackBackend.discoverRenderDevices(encoder)]
+            # 固定指定がある場合は resolveRenderDevices がその render node だけを返す。
+            devices = [*RecordedPlaybackBackend.resolveRenderDevices(encoder)]
             if len(devices) == 0:
                 return RecordedPlaybackCapability(encoder, codec, bit_depth, False, spec.profile, 'DeviceUnavailable')
 

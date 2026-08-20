@@ -631,6 +631,15 @@ class CMLogoServiceAssignmentCreate(BaseModel):
     valid_from: Annotated[datetime | None, Field()]
     valid_until: Annotated[datetime | None, Field()]
 
+# ***** サーバー設定 *****
+
+class KonomiTVBS4KRenderDevice(BaseModel):
+    """QSV / AMF の HW エンコード固定指定の候補となる DRM render node。"""
+
+    path: str
+    vendor_id: str
+    vendor_name: str
+
 # ***** 録画番組 *****
 
 class RecordedProgram(PydanticModel):

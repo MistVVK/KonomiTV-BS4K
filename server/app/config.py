@@ -253,6 +253,10 @@ class _ServerSettingsGeneral(BaseModel):
     mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] = Url('http://127.0.0.1:40772/')
     konomitv_bs4k_live_transport: Literal['MpegTs', 'Tlv'] = 'MpegTs'
     konomitv_bs4k_tlv_mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] | None = None
+    # QSV / AMF の HW エンコードに使う DRM render node の固定指定
+    # null (既定) なら vendor ID が一致する render node を自動選択する。
+    # このフィールドを encoder より前に定義し、encoder の起動時 probe でも同じ固定指定を参照できるようにする。
+    konomitv_bs4k_encoder_render_device: str | None = None
     encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
     konomitv_bs4k_live_sar_mode: Literal['CPU', 'GPU'] = 'CPU'
     encoder_bs4k: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
@@ -479,8 +483,22 @@ class _ServerSettingsGeneral(BaseModel):
         logging.info('KonomiTV-BS4K MMT/TLV Mirakurun API validation succeeded.')
         return self
 
+    @field_validator('konomitv_bs4k_encoder_render_device', mode='before')
+    def validate_encoder_render_device(cls, value: Any) -> str | None:
+        # 空文字・空白は未指定（自動選択）として扱う
+        if value is None:
+            return None
+        if isinstance(value, str) is False:
+            raise ValueError('render node は文字列で指定してください。')
+        normalized = value.strip()
+        if normalized == '':
+            return None
+        if re.fullmatch(r'/dev/dri/renderD[0-9]+', normalized) is None:
+            raise ValueError('/dev/dri/renderD128 のような DRM render node のパスを指定してください。')
+        return normalized
+
     @classmethod
-    def _validate_encoder_value(cls, encoder: str) -> str:
+    def _validate_encoder_value(cls, encoder: str, pinned_render_device: str | None = None) -> str:
         from app import logging
         from app.streams.RecordedPlaybackCapabilities import (
             RecordedPlaybackBackend,
@@ -496,9 +514,15 @@ class _ServerSettingsGeneral(BaseModel):
         if encoder != 'FFmpeg':
             device: str | None = None
             if encoder_type in ('QSV', 'AMF'):
-                devices = RecordedPlaybackBackend.discoverRenderDevices(encoder_type)
-                if len(devices) > 0:
-                    device = devices[0]
+                # 固定指定がある場合はその render node だけを検査対象にする。
+                # render node の番号は再起動で入れ替わり得るため、見えていない固定指定は
+                # 起動不能にせず自動選択へ退避する（実行経路側の resolveRenderDevices と同じ契約）
+                if pinned_render_device is not None and Path(pinned_render_device).exists():
+                    device = pinned_render_device
+                else:
+                    devices = RecordedPlaybackBackend.discoverRenderDevices(encoder_type)
+                    if len(devices) > 0:
+                        device = devices[0]
             probe_results: dict[Literal['avc', 'hevc'], bool] = {}
             with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-live-encoder-probe-') as temporary_directory:
                 for codec in cast(tuple[Literal['avc', 'hevc'], ...], ('avc', 'hevc')):

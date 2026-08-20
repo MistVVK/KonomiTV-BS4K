@@ -2190,6 +2190,7 @@ class RecordedFMP4Stream:
         device: str | None = None
         if backend in ('QSV', 'AMF'):
             # 能力検査で同じ画質を完走したrender nodeを使い、低解像度だけ成功する旧GPUへ戻さない。
+            # 固定指定がある場合は resolveRenderDevices がその render node だけを返す。
             selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(
                 backend,
                 codec,
@@ -2197,7 +2198,7 @@ class RecordedFMP4Stream:
                 self.quality,
             )
             devices = [selected_device] if selected_device is not None else \
-                RecordedPlaybackBackend.discoverRenderDevices(backend)
+                RecordedPlaybackBackend.resolveRenderDevices(backend)
             if len(devices) == 0:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

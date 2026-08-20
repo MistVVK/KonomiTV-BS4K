@@ -12,6 +12,7 @@ from app import logging
 from app.config import ClientSettings, Config, HostServerSettings, SaveConfig
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
+from app.schemas import KonomiTVBS4KRenderDevice
 from app.utils.HostPath import HostPathError, ToUserHostPathText
 
 
@@ -164,6 +165,31 @@ async def ServerSettingsAPI() -> HostServerSettings:
     """
 
     return HostServerSettings.fromServerSettings(Config())
+
+
+@router.get(
+    '/konomitv-bs4k-render-devices',
+    summary = 'KonomiTV-BS4K render node 一覧取得 API',
+    response_description = 'コンテナから見える DRM render node の一覧。',
+    response_model = list[KonomiTVBS4KRenderDevice],
+)
+async def KonomiTVBS4KRenderDevicesAPI() -> list[KonomiTVBS4KRenderDevice]:
+    """
+    QSV / AMF の HW エンコードに利用できる DRM render node の一覧を取得する。<br>
+    エンコーダー設定で render node を固定指定する際の候補表示に利用する。<br>
+    取得できるのはコンテナへ渡されたデバイスだけであり、ホスト上の全 GPU とは限らない。
+    """
+
+    # サーバー設定の取得 API と同様に、ローカル動作前提の非機密情報なので認証は不要
+    from app.streams.RecordedPlaybackCapabilities import RecordedPlaybackBackend
+    return [
+        KonomiTVBS4KRenderDevice(
+            path = device.path,
+            vendor_id = device.vendor_id,
+            vendor_name = device.vendor_name,
+        )
+        for device in RecordedPlaybackBackend.listRenderDevices()
+    ]
 
 
 @router.put(

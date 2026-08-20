@@ -1095,7 +1095,8 @@ class CMAnalysisOrchestrator:
         selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(encoder)
         if selected_device is not None:
             return f'vaapi:{selected_device}'
-        devices = RecordedPlaybackBackend.discoverRenderDevices(encoder)
+        # 固定指定がある場合は resolveRenderDevices がその render node だけを返す
+        devices = RecordedPlaybackBackend.resolveRenderDevices(encoder)
         return f'vaapi:{devices[0]}' if devices else None
 
     async def _selectChapterPath(self, recorded_path: Path) -> CMChapterPathSelection:
