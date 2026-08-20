@@ -1,0 +1,185 @@
+# ディレクトリ構成
+
+リポジトリ内のディレクトリ・ファイル構成を把握する必要がある作業（新規ファイルの配置先の判断、参照先の探索など）の前に読むこと。
+このファイルは KonomiTV-BS4K の実際のツリーに合わせて管理する（upstream KonomiTV の AGENTS.md の同名セクションとは独立）。
+
+## クライアント (`client/`)
+
+- `public/`: 直接提供される静的ファイル
+- `src/`: ソースコード
+  - `views/`: Vue ルートコンポーネント/ページ
+    - `TV/`: テレビ視聴関連ページ (`Home.vue` / `Search.vue` / `Watch.vue`)
+    - `Videos/`: 動画関連ページ (`Home.vue` / `Programs.vue` / `Search.vue` / `Watch.vue`)
+    - `Reservations/`: 予約関連ページ (`Home.vue` / `Reservations.vue`)
+    - `Settings/`: アプリケーション設定ページ (`Base.vue` / `General.vue` / `BS4K.vue` / `Playback.vue` / `Quality.vue` / `Streaming.vue` / `Caption.vue` / `CaptionComments.vue` / `Capture.vue` / `ColorTheme.vue` / `DataBroadcasting.vue` / `Jikkyo.vue` / `Twitter.vue` / `Account.vue` / `Server.vue` / `Maintenance.vue` / `DiagnosticsMaintenance.vue` / `CMAnalysis.vue` / `CMLogoManagement.vue` / `AIBackend.vue` / `RecordedSeries.vue` / `RecordedSeriesManagement.vue` / `KonomiTVBS4KSpeedTest.vue` など)
+    - `Login.vue`: ログインページ
+    - `Register.vue`: アカウント登録ページ
+    - `Mylist.vue`: マイリストページ
+    - `WatchedHistory.vue`: 視聴履歴ページ
+    - `MyPage.vue`: マイページ
+    - `TimeTable.vue`: 番組表ページ (BS4K 独自)
+    - `OfflineVideos.vue`: オフライン視聴用にダウンロードした録画の管理ページ (BS4K 独自)
+    - `AnalysisHistory.vue`: CM 解析などの解析タスク履歴ページ (BS4K 独自)
+    - `NotFound.vue`: 404 エラーページ
+  - `components/`: Vue コンポーネント
+    - `Watch/`: テレビ・録画番組視聴画面向けコンポーネント群 (`Watch.vue` / `Player.vue` / `Header.vue` / `Navigation.vue` / `Panel.vue` / `KeyboardShortcutList.vue` / `LShapedScreenCropSettings.vue`)
+      - `Panel/`: 視聴画面右側のパネル内表示用コンポーネント群 (`Channel.vue` / `Program.vue` / `RecordedProgram.vue` / `Comment.vue` / `Remocon.vue` / `Series.vue`)
+        - `Twitter/`: ツイート検索/タイムライン表示/キャプチャ管理/ツイート表示用コンポーネント群
+    - `Settings/`: 設定ページから呼び出されるダイアログ・セクションコンポーネント群 (`SettingsData.vue` / `AccountManageSettings.vue` / `PinnedChannelSettings.vue` / `CommentMuteSettings.vue` / `TimeTableSettings.vue` / `ACPBackendSection.vue` / `RecordedSeriesAssignmentDialog.vue` / `ServerLogDialog.vue` / `LogLine.vue` など)
+    - `Programs/`: 番組表示関連コンポーネント群
+    - `Reservations/`: 予約表示関連コンポーネント群
+    - `Videos/`: 録画番組表示関連コンポーネント群
+    - `TimeTable/`: 番組表表示関連コンポーネント群 (BS4K 独自)
+    - `HeaderBar.vue`: ヘッダーバー
+    - `SPHeaderBar.vue`: スマートフォン用ヘッダーバー
+    - `Navigation.vue`: ナビゲーション
+    - `BottomNavigation.vue`: スマートフォン用下部ナビゲーション
+    - `Snackbars.vue`: 通知メッセージ表示コンポーネント
+    - `Breadcrumbs.vue`: パンくずリスト表示コンポーネント
+    - `KonomiTVBS4KActiveAnalysisTaskDialog.vue`: 実行中の解析タスク表示ダイアログ (BS4K 独自)
+    - `OfflineDownloadBadge.vue`: オフライン録画ダウンロードの進捗バッジ (BS4K 独自)
+  - `stores/`: 状態管理 (Pinia ストア)
+    - `SettingsStore.ts` / `ServerSettingsStore.ts` / `ChannelsStore.ts` / `PlayerStore.ts` / `TwitterStore.ts` / `UserStore.ts` / `VersionStore.ts` / `SnackbarsStore.ts` / `TimeTableStore.ts` / `RecordedSeriesStore.ts` / `AnalysisTasksStore.ts`
+  - `services/`: サーバー API へのサービスクライアント
+    - `APIClient.ts`: API クライアントの基盤
+    - `Channels.ts` / `Programs.ts` / `Videos.ts` / `Series.ts` / `Reservations.ts` / `ReservationConditions.ts` / `Captures.ts` / `Twitter.ts` / `Niconico.ts` / `Bluesky.ts` / `Users.ts` / `Settings.ts` / `Maintenance.ts` / `Version.ts`
+    - `CMAnalysis.ts` / `AnalysisTasks.ts` / `AIBackend.ts` / `RecordedSeries.ts` / `AccountLinks.ts` / `KonomiTVBS4KSpeedTest.ts`: BS4K 独自機能向けのサービスクライアント
+    - `OfflineVideos.ts` / `OfflineVideoStorage.ts` / `KonomiTVBS4KOfflineDownloadRuntime.ts`: オフライン録画ダウンロード関連 (BS4K 独自)
+    - `player/`: KonomiTV の視聴画面で用いられるライブ/ビデオプレイヤーのロジック (重要)
+      - `PlayerController.ts`: 動画プレイヤーである DPlayer に関連するロジックを丸ごとラップするクラスで、KonomiTV の再生系ロジックの中核を担う
+      - `PlayerManager.ts` / `managers/`: PlayerController に紐づく様々な機能のロジックを提供し、各機能に責任を持つ PlayerManager 群
+      - `ARIBTTMLDecoder.ts` / `ARIBTTMLRenderer.ts`: ARIB TTML 字幕のデコード・描画
+      - `CustomBufferController.ts`: バッファ制御のカスタム実装
+      - `KonomiTVBS4KID3.ts` / `KonomiTVBS4KPlaybackRestartGuard.ts`: BS4K 独自の再生補助ロジック
+  - `utils/`: ユーティリティ関数とヘルパー
+    - `Utils.ts` / `index.ts` / `ChannelUtils.ts` / `ProgramUtils.ts` / `PlayerUtils.ts` / `CommentUtils.ts` / `TweetUtils.ts` / `LogLineUtils.ts` / `NiconicoOAuth.ts` / `Semaphore.ts`
+    - `TimeTableUtils.ts` / `RecordedEpisode.ts` / `RecordedEpisodeResolution.ts` / `useOfflineDownloadJobCount.ts` / `KonomiTVBS4KSpeedTestWorker.ts`: BS4K 独自機能向けユーティリティ
+  - `workers/`: 重い処理をバックグラウンドで実行するための Web Workers コード (with Comlink)
+    - `CaptureCompositor.ts` / `CaptureCompositorProxy.ts`: キャプチャ画像合成
+    - `LivePSIArchivedDataDecoder.ts` / `LivePSIArchivedDataDecoderProxy.ts`: PSI/SI アーカイブデータのデコード
+  - `styles/`: グローバル CSS の定義 (グローバル CSS は `App.vue` の方がメイン)
+  - `router/`: Vue Router 設定
+  - `plugins/`: Vue プラグインの初期化定義
+  - `App.vue`: アプリケーションのルートコンポーネント (グローバル CSS 定義もここに含まれる)
+  - `main.ts`: アプリケーションのエントリーポイント・初期化処理
+  - `sw.ts`: Service Worker (PWA)
+  - `message.ts` / `themes.ts` / `vite-env.d.ts`
+- `package.json`: Node.js プロジェクト設定と依存関係 (yarn)
+- `vite.config.mts`: Vite ビルド設定
+- `tsconfig.json`: TypeScript 設定
+- `.eslintrc.json`: ESLint コードスタイル設定
+
+## サーバー (`server/`)
+
+- `app/`: FastAPI アプリケーションコード
+  - `routers/`: API ルートハンドラー
+    - `ChannelsRouter.py`: チャンネル関連メタデータ取得 API
+    - `ProgramsRouter.py`: 番組関連メタデータ取得 API
+    - `VideosRouter.py`: 録画番組メタデータ取得 API
+    - `SeriesRouter.py`: 番組シリーズ関連 API
+    - `LiveStreamsRouter.py`: 放送中テレビ放送のライブストリーミング配信関連 API
+    - `VideoStreamsRouter.py`: 録画番組のストリーミング配信関連 API
+    - `ReservationsRouter.py`: EDCB と連携したテレビ番組の録画予約関連 API
+    - `ReservationConditionsRouter.py`: EDCB と連携したテレビ番組の自動録画予約条件 (EPG 自動予約) 関連 API
+    - `RecordingPresetsRouter.py`: 録画プリセット関連 API
+    - `DataBroadcastingRouter.py`: データ放送のインターネット接続機能向け API
+    - `CapturesRouter.py`: キャプチャ画像管理 API
+    - `TwitterRouter.py`: Twitter 連携 API
+    - `NiconicoRouter.py`: ニコニコ実況連携 API
+    - `BlueskyRouter.py`: Bluesky 連携 API (BS4K 独自)
+    - `CMAnalysisRouter.py`: CM 解析関連 API (BS4K 独自)
+    - `AnalysisTasksRouter.py`: 解析タスク管理 API (BS4K 独自)
+    - `AIBackendRouter.py`: AI バックエンド (OpenCode service / ACP) 管理 API (BS4K 独自)
+    - `RecordedSeriesRouter.py`: 録画シリーズ関連 API (BS4K 独自)
+    - `KonomiTVBS4KSpeedTestRouter.py`: 回線速度計測 API (BS4K 独自)
+    - `UsersRouter.py`: ユーザーアカウント管理 API
+    - `SettingsRouter.py`: クライアント・サーバー設定管理 API
+    - `MaintenanceRouter.py`: サーバーメンテナンス用 API
+    - `VersionRouter.py`: バージョン情報 API
+    - `JikkyoDependency.py`: ニコニコ実況関連の共通依存定義
+  - `models/`: データベースモデルとスキーマ
+    - `Channel.py`: チャンネル情報を管理するモデル（放送局情報、チャンネル番号、ロゴ、ストリーム設定など）
+    - `Program.py`: 放送番組情報を管理するモデル（番組メタデータ、EPG 番組情報、タイトル、番組詳細、ジャンルなど）
+    - `RecordedProgram.py`: 録画済み番組のメタデータを管理するモデル（EPG 録画番組情報、録画開始/終了時刻など）
+    - `RecordedVideo.py`: 録画済み番組の動画ファイル情報を管理するモデル（ファイルパス、映像/音声コーデック、ファイルサイズなど）
+    - `RecordedEpisode.py`: 録画番組のエピソード情報を管理するモデル (BS4K 独自)
+    - `Series.py`: 番組シリーズ情報を管理するモデル（シリーズ名、シリーズ ID など）
+    - `SeriesBroadcastPeriod.py`: 番組シリーズの放送期間情報を管理するモデル
+    - `RecordedSeries.py`: 録画番組を束ねるシリーズ情報を管理するモデル (BS4K 独自)
+    - `CMAnalysis.py`: CM 解析結果を管理するモデル (BS4K 独自)
+    - `AnalysisTask.py`: 解析タスクの状態を管理するモデル (BS4K 独自)
+    - `AIAPIUsage.py`: AI API の使用量を管理するモデル (BS4K 独自)
+    - `TwitterAccount.py`: Twitter アカウント連携情報を管理するモデル（トークン、認証情報など）
+    - `BlueskyAccount.py`: Bluesky アカウント連携情報を管理するモデル (BS4K 独自)
+    - `NiconicoOAuthState.py`: ニコニコ OAuth 認証の状態を管理するモデル
+    - `AccountLink.py`: 外部アカウント連携情報を管理するモデル
+    - `User.py`: ユーザーアカウント情報を管理するモデル（認証情報、権限など）
+    - `RefreshToken.py`: リフレッシュトークンを管理するモデル
+  - `migrations/`: Tortoise ORM のマイグレーションツール: Aerich 向けの DB マイグレーション定義 (Aerich で自動生成されたコードを修正したもの)
+  - `streams/`: テレビ放送のライブストリーミング・録画番組のオンデマンドストリーミング関連の実装
+    - `LiveEncodingTask.py`: ライブストリーミング用のエンコード・ストリーミングタスクを管理
+    - `LiveStream.py`: 放送波のライブストリーミングの状態管理
+    - `LivePSIDataArchiver.py`: 放送波から PSI/SI データを抽出・アーカイブする機能の実装
+    - `RecordedFMP4Stream.py`: 録画番組の fMP4 オンデマンド生成・配信 (BS4K 独自。upstream の `VideoStream.py` / `VideoEncodingTask.py` は存在しない)
+    - `RecordedFMP4Cache.py`: 生成した fMP4 キャッシュの参照・排他・遅延削除の管理 (BS4K 独自)
+    - `RecordedPlaybackCapabilities.py` / `KonomiTVBS4KPlaybackCapabilities.py`: 再生能力 (エンコーダー・コーデック) の検査 (BS4K 独自)
+    - `RecordedEncodingCodecs.py` / `StreamEncodingOptions.py` / `VideoSegmentPlanner.py`: 録画再生のエンコード条件・セグメント計画 (BS4K 独自)
+    - `RecordedSubtitleStream.py`: 録画番組の字幕ストリーミング (BS4K 独自)
+    - `KonomiTVBS4KOfflineStream.py` / `KonomiTVBS4KOfflineJobManager.py`: オフライン視聴向け録画ダウンロード (BS4K 独自)
+    - `KonomiTVBS4KPlaybackEncoding.py`: BS4K 向け再生エンコードロジック (BS4K 独自)
+    - `TSCodecBridgeRuntime.py`: TSCodecBridge 連携のランタイム (BS4K 独自)
+  - `metadata/`: 録画番組データから番組情報などのメタデータを抽出・保存するための実装
+    - `RecordedScanTask.py`: 録画フォルダの監視とメタデータの DB への同期を行うタスク
+    - `MetadataAnalyzer.py`: 録画ファイルのメタデータを解析するクラス
+    - `TSInfoAnalyzer.py`: 録画 TS ファイルや録画データ関連ファイルに含まれる番組情報を解析するクラス
+    - `ThumbnailGenerator.py`: プレイヤーのシークバー用タイル画像と、候補区間内で最も良い1枚の代表サムネイルを生成するクラス
+    - `CMAnalyzer.py` / `CMAnalysisOrchestrator.py` / `CMAnalysisTaskManager.py` / `CMAnalysisPaths.py` / `CMAnalysisWorkspace.py` / `AnalysisTaskTracker.py`: CM 解析の実行・管理 (BS4K 独自)
+    - `CMLogoScanner.py` / `CMLogoGenerator.py` / `CMLogoSelector.py` / `CMLogoCandidateValidator.py`: ロゴ素材による CM 区間検出 (BS4K 独自)
+    - `CMChapterFile.py` / `KonomiTVBS4KChapterFile.py` / `CMLogicalAudioRebuilder.py`: CM 区間のチャプター出力・音声再構築 (BS4K 独自)
+    - `KonomiTVBS4KMMTSInfoAnalyzer.py`: MMT/TLV (BS4K 放送の伝送方式) 向け番組情報解析 (BS4K 独自)
+    - `RecordedEpisodeResolver.py` / `RecordedEpisodeContext.py` / `RecordedEpisodeSearch.py` / `RecordedEpisodeMessages.py` / `RecordedEpisodeAutomation.py`: 録画番組のエピソード特定 (BS4K 独自)
+    - `RecordedSeriesResolver.py` / `RecordedSeriesGeneration.py` / `RecordedSeriesCandidates.py` / `RecordedSeriesLocks.py` / `RecordedSeriesSettings.py` / `SeriesTitleParser.py`: 録画シリーズの自動生成・解決 (BS4K 独自)
+    - `RecordedAnalysisPlan.py` / `RecordedPlaybackIndex.py` / `RecordedPlaybackIndexer.py`: 録画解析計画・再生インデックス (BS4K 独自)
+    - `ai/`: AI バックエンド (OpenCode service / ACP) 連携 (BS4K 独自)
+  - `utils/`: ユーティリティ関数とヘルパー
+    - `edcb/`: EDCB 連携用の API クライアント実装
+    - `JikkyoClient.py`: ニコニコ実況・NX-Jikkyo 連携用の API クライアント実装
+    - `TwitterGraphQLAPI.py` / `TwitterScrapeBrowser.py`: Twitter API 連携用にリバースエンジニアリングして開発した API クライアント実装
+    - `BlueskyAPI.py`: Bluesky API 連携用のクライアント実装 (BS4K 独自)
+    - `TSInformation.py`: 日本のテレビ放送で用いられている MPEG2-TS から情報を取得する際に役立つユーティリティ群
+    - `TSKeyFrameSeeker.py`: TS キーフレームシーク用ユーティリティ
+    - `DriveIOLimiter.py`: ドライブごとの同時実行数を制限するためのユーティリティクラス
+    - `ProcessLimiter.py`: プロセスごとの同時実行数を制限するためのユーティリティクラス
+    - `AuthSecurity.py` / `DataBroadcastingHTTPClient.py` / `FastAPITaskUtil.py` / `Git.py` / `HLSText.py` / `HTTPS.py` / `HostPath.py` / `LogRotation.py`
+    - `KonomiTVBS4KMMTTLV.py` / `KonomiTVBS4KTLVServiceResolver.py` / `KonomiTVBS4KTLVStreamPump.py` / `KonomiTVBS4KTLVMetadataMonitor.py` / `KonomiTVBS4KTLVRainFallbackMonitor.py`: MMT/TLV (BS4K 放送) の受信・処理関連 (BS4K 独自)
+    - `KonomiTVBS4KFastAPIRouteUtils.py` / `KonomiTVBS4KRequestBodyLimit.py` / `KonomiTVBS4KSpeedTest.py` / `KonomiTVBS4KTransactionalSQLite.py`: BS4K 独自のサーバーユーティリティ
+  - `app.py`: FastAPI アプリケーションやルーターの初期化・バックグラウンドタスクの定義
+  - `CompatibilityAPI.py`: upstream KonomiTV 互換 API (KomorebiV1 プロファイル) の実装 (BS4K 独自)
+  - `bs4k_version.py`: KonomiTV-BS4K 固有バージョンの Git タグからの解決 (BS4K 独自)
+  - `config.py`: サーバー設定 (`config.yaml`) のロードとバリデーション
+  - `constants.py`: サーバー全体で用いられるグローバル定数
+  - `logging.py`: ロギング設定
+  - `schemas.py`: API リクエスト/レスポンス型に用いる Pydantic スキーマ
+- `data/`: アプリケーションデータ用ディレクトリ
+  - `database.sqlite`: SQLite データベースファイル
+- `logs/`: アプリケーションログ用ディレクトリ
+- `misc/`: メンテナンス・デバッグ用 Pythonスクリプト群
+- `static/`: サーバー API によって提供される静的ファイル (Git 管理下にあり、放送局ロゴなどが含まれる)
+- `tests/`: サーバー側テスト (BS4K 独自)
+- `thirdparty/`: FFmpeg や QSVEncC などのエンコーダーをはじめとした、ビルド済みのサードパーティー実行ファイル (Git 管理外で、`poetry run task update-thirdparty` で更新する)
+- `pyproject.toml`: Python プロジェクト設定と依存関係 (Poetry)
+- `KonomiTV.py`: KonomiTV サーバーのエントリーポイント
+
+## Docker (`docker/`)
+
+- `development/`: Development 環境用の Compose 関連ファイルと状態ディレクトリ (`state/`)
+- `thirdparty/`: イメージビルド用サードパーティー取得スクリプト
+- `acp/` / `opencode/`: AI バックエンド (ACP / OpenCode) 関連のコンテナ構成 (BS4K 独自)
+- `ts-codec-bridge/`: TSCodecBridge 連携用コンテナ構成 (BS4K 独自)
+
+## エージェント向け文書
+
+- `AGENTS.md`: エージェント向け基本指示 (upstream AGENTS.md に準拠)
+- `AGENTS-BS4K.md`: BS4K 固有の運用指示と docs_AGENTS への参照表
+- `docs_AGENTS/`: 条件付きで読む詳細指示 (このディレクトリ)
+- `.agents/skills/`: プロジェクト固有のエージェントスキル
