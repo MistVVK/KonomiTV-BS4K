@@ -179,7 +179,7 @@ class ClientSettings(BaseModel):
     caption_font: str = 'Rounded M+ 1m for ARIB'
     always_border_caption_text: bool = True
     specify_caption_opacity: bool = False
-    caption_opacity: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)] = 1.0
+    caption_opacity: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)] = 0.5
     tv_show_superimpose: bool = True
     video_show_superimpose: bool = False
     # tv_show_data_broadcasting: 同期無効
