@@ -1084,17 +1084,17 @@ class TestTLVStreamProbeCleanup:
         assert live_stream.disconnected >= 1
         assert live_stream.current_status.status == 'Offline'
 
-    def test_probe_unresolved_main_context_id_disconnects_and_marks_offline(
+    def test_probe_unresolved_main_packet_ids_disconnects_and_marks_offline(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """主 SID の context_id が解決できない場合は 0:v:0 へ落とさず、接続を閉じて Offline へ遷移する。"""
+        """主映像・主音声の packet_id が解決できない場合は従来 map へ落とさず、接続を閉じて Offline へ遷移する。"""
 
         task, live_stream = self._BuildTask(monkeypatch)
         session, response = self._MockConnection(monkeypatch)
 
         async def Resolve(*args: Any, **kwargs: Any) -> KonomiTVBS4KTLVServiceResolution:
-            # 主 context_id が未解決 (SDT が読めないなど)。降雨対応も未観測。
-            return KonomiTVBS4KTLVServiceResolution(None, None, None, b'')
+            # 主映像・主音声の packet_id が未解決 (MPT が読めないなど)。降雨対応も未観測。
+            return KonomiTVBS4KTLVServiceResolution(None, None, None, None, None, None, b'')
 
         monkeypatch.setattr(
             'app.streams.LiveEncodingTask.KonomiTVBS4KTLVServiceResolver',
@@ -1107,8 +1107,8 @@ class TestTLVStreamProbeCleanup:
             channel, 'http://tlv', '/api/channels/BS4K/x/stream?decode=0', None,
         ))
 
-        # 主 context_id 未解決は配信失敗として扱い、接続・クライアントを回収して Offline へ遷移する。
-        # (先着順に依存する 0:v:0 へ黙ってフォールバックしない)
+        # 主 packet_id 未解決は配信失敗として扱い、接続・クライアントを回収して Offline へ遷移する。
+        # (複数トラックへ拡大し得る context_id map や先着順の 0:v:0 へ黙ってフォールバックしない)
         assert result is None
         assert session.closed is True
         assert response.closed is True
@@ -1141,6 +1141,9 @@ class TestTLVStreamProbeCleanup:
             return KonomiTVBS4KTLVServiceResolution(
                 1,
                 2 if expected_rain_service_id is not None else None,
+                62208,
+                62224,
+                62240 if expected_rain_service_id is not None else None,
                 True if expected_rain_service_id is not None else None,
                 b'probe',
             )
@@ -1182,6 +1185,9 @@ class TestTLVStreamProbeCleanup:
         }
         assert result[2].start_count == 1
         assert (result[3] is not None) is (expected_rain_service_id is not None)
+        assert result[4] == 62208
+        assert result[5] == 62224
+        assert result[6] == (62240 if expected_rain_service_id is not None else None)
         assert live_stream.is_rain_fallback is (expected_rain_service_id is not None)
         assert live_stream.current_status.status == 'Standby'
         assert live_stream.current_status.detail == (
@@ -1194,13 +1200,13 @@ class TestTLVStreamProbeCleanup:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """降雨SIDを解決済みでも完全MPTにVideoがなければ主階層を選択する。"""
+        """降雨SIDを解決済みでも完全MPTに低階層Videoがなければ主階層を選択する。"""
 
         task, live_stream = self._BuildTask(monkeypatch)
         self._MockConnection(monkeypatch)
 
         async def Resolve(*_args: Any, **_kwargs: Any) -> KonomiTVBS4KTLVServiceResolution:
-            return KonomiTVBS4KTLVServiceResolution(1, 2, False, b'probe')
+            return KonomiTVBS4KTLVServiceResolution(1, 2, 62208, 62224, None, False, b'probe')
 
         class FakePump:
             def __init__(self, *_args: Any, **_kwargs: Any) -> None:
@@ -1229,7 +1235,9 @@ class TestTLVStreamProbeCleanup:
         ))
 
         assert result is not None
-        assert result[5] is None
+        assert result[4] == 62208
+        assert result[5] == 62224
+        assert result[6] is None
         assert live_stream.is_rain_fallback is False
         assert live_stream.is_rain_fallback_broadcasting is False
         assert live_stream.current_status.detail == 'エンコードを開始しています…'

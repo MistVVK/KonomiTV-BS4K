@@ -386,8 +386,9 @@ class LiveEncodingTask:
         is_fullhd_channel: bool,
         is_oneseg: bool = False,
         is_mmt_tlv: bool = False,
-        tlv_main_context_id: int | None = None,
-        tlv_rain_context_id: int | None = None,
+        tlv_main_video_packet_id: int | None = None,
+        tlv_main_audio_packet_id: int | None = None,
+        tlv_rain_video_packet_id: int | None = None,
     ) -> list[str]:
         """現 main の単一 pipeline 向け FFmpeg 8 HW エンコードオプションを返す。"""
 
@@ -490,14 +491,20 @@ class LiveEncodingTask:
             '-analyzeduration', str(analyzeduration), '-i', 'pipe:0',
             '-ignore_unknown',
         ]
-        # TLV かつ context_id が解決済みなら、映像・音声を context_id で固定する。
-        # 字幕・データ放送 (data) は低階層には存在しないため、0:d? のまま高階層から得られる。
-        if is_mmt_tlv is True and tlv_main_context_id is not None:
+        # TLV では context_id が主・低階層で共通になり得るため、Resolver が MPT から選んだ
+        # packet_id で映像・音声を一意に固定する。字幕・データ放送 (data) は低階層には存在しないため、
+        # 0:d? のまま高階層から得られる。
+        if is_mmt_tlv is True:
+            if tlv_main_video_packet_id is None or tlv_main_audio_packet_id is None:
+                raise RuntimeError('MMT/TLV main video/audio packet IDs are not resolved.')
             # 降雨対応時は映像だけ低階層、音声は高階層。それ以外は映像・音声とも高階層。
-            video_context_id = tlv_rain_context_id if tlv_rain_context_id is not None else tlv_main_context_id
+            video_packet_id = (
+                tlv_rain_video_packet_id
+                if tlv_rain_video_packet_id is not None else tlv_main_video_packet_id
+            )
             options += [
-                '-map', f'0:v:m:context_id:{video_context_id}',
-                '-map', f'0:a:m:context_id:{tlv_main_context_id}',
+                '-map', f'0:i:{video_packet_id}',
+                '-map', f'0:i:{tlv_main_audio_packet_id}',
                 '-map', '0:d?',
             ]
         else:
@@ -719,8 +726,9 @@ class LiveEncodingTask:
         is_fullhd_channel: bool,
         is_oneseg: bool = False,
         is_mmt_tlv: bool = False,
-        tlv_main_context_id: int | None = None,
-        tlv_rain_context_id: int | None = None,
+        tlv_main_video_packet_id: int | None = None,
+        tlv_main_audio_packet_id: int | None = None,
+        tlv_rain_video_packet_id: int | None = None,
     ) -> list[str]:
         """
         FFmpeg に渡すオプションを組み立てる
@@ -731,8 +739,9 @@ class LiveEncodingTask:
             is_fullhd_channel (bool): フル HD 放送が実施されているチャンネルかどうか
             is_oneseg (bool): ワンセグサービスかどうか
             is_mmt_tlv (bool): MMT/TLV 入力かどうか
-            tlv_main_context_id (int | None): 主サービス (高階層) の context_id
-            tlv_rain_context_id (int | None): 降雨対応サービス (低階層) の context_id
+            tlv_main_video_packet_id (int | None): 主映像トラックの packet_id
+            tlv_main_audio_packet_id (int | None): 主音声トラックの packet_id
+            tlv_rain_video_packet_id (int | None): 選択中の降雨対応映像トラックの packet_id
 
         Returns:
             list[str]: FFmpeg に渡すオプションが連なる配列
@@ -895,14 +904,20 @@ class LiveEncodingTask:
                     options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
 
         # 音声
-        # TLV かつ context_id が解決済みなら、映像・音声を context_id で固定する。
-        # 字幕・データ放送 (data) は低階層には存在しないため、0:d? のまま高階層から得られる。
-        if is_mmt_tlv is True and tlv_main_context_id is not None:
+        # TLV では context_id が主・低階層で共通になり得るため、Resolver が MPT から選んだ
+        # packet_id で映像・音声を一意に固定する。字幕・データ放送 (data) は低階層には存在しないため、
+        # 0:d? のまま高階層から得られる。
+        if is_mmt_tlv is True:
+            if tlv_main_video_packet_id is None or tlv_main_audio_packet_id is None:
+                raise RuntimeError('MMT/TLV main video/audio packet IDs are not resolved.')
             # 降雨対応時は映像だけ低階層、音声は高階層。それ以外は映像・音声とも高階層。
-            video_context_id = tlv_rain_context_id if tlv_rain_context_id is not None else tlv_main_context_id
+            video_packet_id = (
+                tlv_rain_video_packet_id
+                if tlv_rain_video_packet_id is not None else tlv_main_video_packet_id
+            )
             options.append(
-                f'-map 0:v:m:context_id:{video_context_id} '
-                f'-map 0:a:m:context_id:{tlv_main_context_id} -map 0:d?'
+                f'-map 0:i:{video_packet_id} '
+                f'-map 0:i:{tlv_main_audio_packet_id} -map 0:d?'
             )
         else:
             options.append('-map 0:v:0 -map 0:a? -map 0:d?')
@@ -1351,13 +1366,14 @@ class LiveEncodingTask:
         KonomiTVBS4KTLVStreamPump,
         KonomiTVBS4KTLVRainFallbackMonitor | None,
         int,
+        int,
         int | None,
     ] | None:
         """
         TLV のチューナー確保・ストリーム接続・先頭バッファのプローブを行う。
 
-        FFmpeg は -map に context_id が必要なため、エンコーダー生成前に同じ Channel Stream を開いて
-        先頭バッファを読み、主/降雨対応 SID の context_id を解決する。プローブ後は入力 pump を直ちに起動し、
+        FFmpeg は -map に一意な packet_id が必要なため、エンコーダー生成前に同じ Channel Stream を開いて
+        先頭バッファを読み、主/降雨対応トラックの packet_id を解決する。プローブ後は入力 pump を直ちに起動し、
         読み取った生バイトと後続入力をエンコーダー起動まで有限バッファへ保持する。
 
         Args:
@@ -1368,8 +1384,9 @@ class LiveEncodingTask:
 
         Returns:
             tuple[aiohttp.ClientSession, aiohttp.ClientResponse, KonomiTVBS4KTLVStreamPump,
-                KonomiTVBS4KTLVRainFallbackMonitor | None, int, int | None] | None:
-                (session, response, 入力 pump, 降雨対応monitor, 主 context_id, 選択する降雨対応 context_id)。
+                KonomiTVBS4KTLVRainFallbackMonitor | None, int, int, int | None] | None:
+                (session, response, 入力 pump, 降雨対応monitor, 主映像 packet_id, 主音声 packet_id,
+                選択する降雨対応映像 packet_id)。
                 接続に失敗した場合は None (Offline 遷移と disconnectAll はこの中で済ませる)。
         """
 
@@ -1453,7 +1470,7 @@ class LiveEncodingTask:
                 await closeConnection()
                 return None
 
-            # 先頭バッファを読んで主/降雨対応 SID の context_id を解決する。
+            # 先頭バッファを読んで主/降雨対応トラックの packet_id を解決する。
             # 画質 1080p 以下かつ降雨対応放送の自動利用が有効なときだけ降雨対応 SID が現れるまで待つ。
             # aiohttp.StreamReader の __aiter__ は readline (\n 区切り) のため、生 TLV を渡すと
             # 64KB を超える改行の無い入力で LineTooLong になり壊れる。iter_chunked で生バイト列を渡す。
@@ -1471,11 +1488,11 @@ class LiveEncodingTask:
                 log_prefix = self.live_stream.log_prefix,
             )
 
-            if resolution.main_context_id is None:
-                # 主 SID の context_id が解決できない場合は、先着順に依存する 0:v:0 へ黙って落とさず失敗させる。
-                # 0:v:0 は降雨時に低階層映像を掴み得るため、本機能が直したい不具合そのもの。
+            if resolution.main_video_packet_id is None or resolution.main_audio_packet_id is None:
+                # 主映像・主音声の packet_id が解決できない場合は、複数トラックへ拡大し得る
+                # context_id map や先着順の 0:v:0 へ黙って落とさず失敗させる。
                 logging.warning(
-                    f'{self.live_stream.log_prefix} Failed to resolve the main service context_id from MMT/TLV. '
+                    f'{self.live_stream.log_prefix} Failed to resolve the main service packet IDs from MMT/TLV. '
                     f'(SID: {channel.service_id})'
                 )
                 await closeConnection()
@@ -1504,27 +1521,27 @@ class LiveEncodingTask:
             )
             stream_pump.start()
 
-            # 自動利用の実効条件を満たし、完全MPTにVideoがある場合だけ低階層を選択する。
+            # 自動利用の実効条件を満たし、完全MPTに主映像とは別の低階層Videoがある場合だけ選択する。
             # FFmpegの-mapは固定なので、以後の状態変化はControllerが計画再起動して反映する。
-            selected_rain_context_id = (
-                resolution.rain_context_id
+            selected_rain_video_packet_id = (
+                resolution.rain_video_packet_id
                 if need_rain_fallback is True and resolution.is_rain_fallback_broadcasting is True
                 else None
             )
-            self.live_stream.is_rain_fallback = selected_rain_context_id is not None
+            self.live_stream.is_rain_fallback = selected_rain_video_packet_id is not None
             self.live_stream.is_rain_fallback_broadcasting = resolution.is_rain_fallback_broadcasting
             self.live_stream.setStatus(
                 'Standby',
                 (
                     '降雨対応放送を使用してエンコードを開始しています…'
-                    if selected_rain_context_id is not None
+                    if selected_rain_video_packet_id is not None
                     else 'エンコードを開始しています…'
                 ),
             )
-            if selected_rain_context_id is not None:
+            if selected_rain_video_packet_id is not None:
                 logging.info(
                     f'{self.live_stream.log_prefix} Rain fallback broadcast detected. '
-                    f'(SID: {rain_service_id})'
+                    f'(SID: {rain_service_id}, Packet ID: {selected_rain_video_packet_id})'
                 )
 
             return (
@@ -1532,8 +1549,9 @@ class LiveEncodingTask:
                 response,
                 stream_pump,
                 rain_fallback_monitor,
-                resolution.main_context_id,
-                selected_rain_context_id,
+                resolution.main_video_packet_id,
+                resolution.main_audio_packet_id,
+                selected_rain_video_packet_id,
             )
 
         except asyncio.CancelledError:
@@ -1689,18 +1707,19 @@ class LiveEncodingTask:
                 return
 
         # TLV 経路はエンコーダー生成前にチューナー接続と先頭バッファのプローブを行うため、
-        # 放送波の受信元と context_id をここで事前初期化する。MPEG-TS 経路も同じ変数を使うが、
+        # 放送波の受信元と FFmpeg map 用 packet_id をここで事前初期化する。MPEG-TS 経路も同じ変数を使うが、
         # そちらではチューナー接続後に設定する。
         ## 放送波の MPEG2-TS / 生 TLV を受信する StreamReader
         stream_reader: asyncio.StreamReader | PipeStreamReader | aiohttp.StreamReader | None = None
         ## Mirakurun の aiohttp セッションとレスポンス (EDCB バックエンド利用時は常に None)
         response: aiohttp.ClientResponse | None = None
         session: aiohttp.ClientSession | None = None
-        ## TLV のプローブ後から HTTP 入力を読み続けるpump、降雨対応monitor、解決済みのcontext_id
+        ## TLV のプローブ後から HTTP 入力を読み続けるpump、降雨対応monitor、FFmpeg map用の packet_id
         tlv_stream_pump: KonomiTVBS4KTLVStreamPump | None = None
         tlv_rain_fallback_monitor: KonomiTVBS4KTLVRainFallbackMonitor | None = None
-        tlv_main_context_id: int | None = None
-        tlv_rain_context_id: int | None = None
+        tlv_main_video_packet_id: int | None = None
+        tlv_main_audio_packet_id: int | None = None
+        tlv_rain_video_packet_id: int | None = None
 
         # 3つのバックエンド構成のどれで動作しているかと、実際に選局するサービスを明示する
         ## 接続 URL は認証情報やローカル環境情報を含む可能性があるためログへ出力しない。
@@ -1878,15 +1897,16 @@ class LiveEncodingTask:
                 response,
                 tlv_stream_pump,
                 tlv_rain_fallback_monitor,
-                tlv_main_context_id,
-                tlv_rain_context_id,
+                tlv_main_video_packet_id,
+                tlv_main_audio_packet_id,
+                tlv_rain_video_packet_id,
             ) = tlv_stream_result
 
         try:
             # ***** エンコーダープロセスの作成と実行 *****
 
             # MPEG-TS 経路ではエンコーダーを先に起動してからチューナーへ接続する。
-            # TLV 経路は context_id の事前解決が必要なため既に接続済みだが、入力 pump が起動中も読み続けている。
+            # TLV 経路は packet_id の事前解決が必要なため既に接続済みだが、入力 pump が起動中も読み続けている。
 
             # フル HD 放送が行われているチャンネルかを取得
             is_fullhd_channel = (
@@ -1952,7 +1972,9 @@ class LiveEncodingTask:
                 else:
                     encoder_options = self.buildFFmpegOptions(
                         self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg, is_mmt_tlv,
-                        tlv_main_context_id, tlv_rain_context_id,
+                        tlv_main_video_packet_id,
+                        tlv_main_audio_packet_id,
+                        tlv_rain_video_packet_id,
                     )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 Commands:\n'
@@ -1987,7 +2009,10 @@ class LiveEncodingTask:
                 hw_encoder_type = ENCODER_TYPE
                 encoder_options = self.buildFFmpeg8HardwareOptions(
                     self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
-                    channel.is_oneseg, is_mmt_tlv, tlv_main_context_id, tlv_rain_context_id,
+                    channel.is_oneseg, is_mmt_tlv,
+                    tlv_main_video_packet_id,
+                    tlv_main_audio_packet_id,
+                    tlv_rain_video_packet_id,
                 )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 ({ENCODER_TYPE}) Commands:\n'

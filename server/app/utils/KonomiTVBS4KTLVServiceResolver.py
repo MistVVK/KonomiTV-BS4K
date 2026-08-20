@@ -11,13 +11,24 @@ from app.constants import LIBRARY_PATH
 
 
 @dataclass(frozen=True)
+class KonomiTVBS4KTLVTrackSnapshot:
+    """TLV metadata helper が通知した1トラックの識別情報。"""
+
+    track_id: int
+    context_id: int
+    packet_id: int
+    component_tag: int | None
+    kind: Literal['Video', 'Audio', 'Subtitle']
+
+
+@dataclass(frozen=True)
 class KonomiTVBS4KTLVMetadataSnapshot:
-    """TLV metadata helper が通知したサービス・映像トラックのスナップショット。"""
+    """TLV metadata helper が通知したサービス・トラックのスナップショット。"""
 
     snapshot_type: Literal['MPT', 'MHSDT'] | None
     snapshot_context_id: int | None
     service_contexts: dict[int, int]
-    video_context_ids: set[int]
+    tracks: tuple[KonomiTVBS4KTLVTrackSnapshot, ...]
 
 
 @dataclass(frozen=True)
@@ -26,6 +37,9 @@ class KonomiTVBS4KTLVServiceResolution:
 
     main_context_id: int | None
     rain_context_id: int | None
+    main_video_packet_id: int | None
+    main_audio_packet_id: int | None
+    rain_video_packet_id: int | None
     is_rain_fallback_broadcasting: bool | None
     head_buffer: bytes
 
@@ -55,14 +69,14 @@ class KonomiTVBS4KTLVServiceResolver:
     @staticmethod
     def parseMetadataLine(line: str) -> KonomiTVBS4KTLVMetadataSnapshot | None:
         """
-        メタデータツールが出力した 1 行からサービスと映像トラックの context_id を抽出する。
+        メタデータツールが出力した 1 行からサービスとトラックの識別情報を抽出する。
 
         Args:
             line (str): ストリーミング出力された JSON 行。
 
         Returns:
             KonomiTVBS4KTLVMetadataSnapshot | None:
-                サービス・映像トラックと完全 snapshot の識別情報。解析不能なら None。
+                サービス・トラックと完全 snapshot の識別情報。解析不能なら None。
         """
 
         try:
@@ -105,25 +119,123 @@ class KonomiTVBS4KTLVServiceResolver:
                 continue
             service_contexts[sid] = context
 
-        video_context_ids: set[int] = set()
+        track_snapshots: list[KonomiTVBS4KTLVTrackSnapshot] = []
         for item in tracks:
-            if not isinstance(item, dict) or item.get('kind') != 'Video':
+            if not isinstance(item, dict):
                 continue
+            kind_raw = item.get('kind')
+            if kind_raw not in ('Video', 'Audio', 'Subtitle'):
+                continue
+            track_id = item.get('track_id')
             context_id = item.get('context_id')
+            packet_id = item.get('packet_id')
             # bool は int のサブクラスのため、誤って数値扱いしないよう先に除外する。
-            if isinstance(context_id, bool):
+            if (
+                isinstance(track_id, bool) or
+                isinstance(context_id, bool) or
+                isinstance(packet_id, bool)
+            ):
                 continue
             try:
-                video_context_ids.add(int(cast(Any, context_id)))
+                parsed_track_id = int(cast(Any, track_id))
+                parsed_context_id = int(cast(Any, context_id))
+                parsed_packet_id = int(cast(Any, packet_id))
             except (TypeError, ValueError):
                 continue
+            component_tag_raw = item.get('component_tag')
+            component_tag: int | None = None
+            if not isinstance(component_tag_raw, bool):
+                try:
+                    component_tag = int(cast(Any, component_tag_raw))
+                except (TypeError, ValueError):
+                    pass
+            track_snapshots.append(KonomiTVBS4KTLVTrackSnapshot(
+                track_id=parsed_track_id,
+                context_id=parsed_context_id,
+                packet_id=parsed_packet_id,
+                component_tag=component_tag,
+                kind=kind_raw,
+            ))
 
         return KonomiTVBS4KTLVMetadataSnapshot(
             snapshot_type=snapshot_type,
             snapshot_context_id=snapshot_context_id,
             service_contexts=service_contexts,
-            video_context_ids=video_context_ids,
+            tracks=tuple(track_snapshots),
         )
+
+    @staticmethod
+    def selectTrackPacketIds(
+        tracks: tuple[KonomiTVBS4KTLVTrackSnapshot, ...],
+        main_context_id: int | None,
+        rain_context_id: int | None,
+    ) -> tuple[int | None, int | None, int | None]:
+        """
+        MPT のトラック一覧から FFmpeg へ渡す主/降雨対応トラックの packet_id を選択する。
+
+        context_id は TLV 上の文脈識別子であり、主サービスと降雨対応の低階層が同じ context に
+        多重化される実放送がある。FFmpeg の map を一意にするため、component_tag と track_id の順で
+        主トラックを決め、降雨対応は主トラックと異なる Video packet_id を選ぶ。
+
+        Args:
+            tracks (tuple[KonomiTVBS4KTLVTrackSnapshot, ...]): 最新 snapshot の全トラック。
+            main_context_id (int | None): 主サービスの context_id。
+            rain_context_id (int | None): 降雨対応サービスの context_id。
+
+        Returns:
+            tuple[int | None, int | None, int | None]:
+                (主 Video packet_id, 主 Audio packet_id, 降雨対応 Video packet_id)。
+        """
+
+        if main_context_id is None:
+            return (None, None, None)
+
+        def trackSortKey(track: KonomiTVBS4KTLVTrackSnapshot) -> tuple[int, int]:
+            # ISDB-S3 の主トラックは低い component_tag が割り当てられる。タグが無い入力では
+            # libaribtlv が MPT から採番する安定 track_id の順をそのまま使う。
+            return (
+                track.component_tag if track.component_tag is not None else 0xFFFF,
+                track.track_id,
+            )
+
+        main_video_tracks = [
+            track for track in tracks
+            if track.context_id == main_context_id and track.kind == 'Video'
+        ]
+        main_audio_tracks = [
+            track for track in tracks
+            if track.context_id == main_context_id and track.kind == 'Audio'
+        ]
+        main_video_track = min(main_video_tracks, key=trackSortKey, default=None)
+        main_audio_track = min(main_audio_tracks, key=trackSortKey, default=None)
+
+        rain_video_track: KonomiTVBS4KTLVTrackSnapshot | None = None
+        if rain_context_id is not None:
+            rain_video_tracks = [
+                track for track in tracks
+                if track.context_id == rain_context_id and track.kind == 'Video'
+            ]
+            if rain_context_id == main_context_id and main_video_track is not None:
+                # NHK BSP4K / BS8K では主・低階層が同じ context_id に並ぶため、主映像と
+                # 異なる packet_id を低階層として選択する。component_tag も異なる候補を優先する。
+                distinct_tracks = [
+                    track for track in rain_video_tracks
+                    if track.packet_id != main_video_track.packet_id
+                ]
+                distinct_component_tracks = [
+                    track for track in distinct_tracks
+                    if track.component_tag is not None and
+                    track.component_tag != main_video_track.component_tag
+                ]
+                rain_video_tracks = distinct_component_tracks or distinct_tracks
+            rain_video_track = min(rain_video_tracks, key=trackSortKey, default=None)
+
+        return (
+            main_video_track.packet_id if main_video_track is not None else None,
+            main_audio_track.packet_id if main_audio_track is not None else None,
+            rain_video_track.packet_id if rain_video_track is not None else None,
+        )
+
 
     @classmethod
     async def resolve(
@@ -136,18 +248,19 @@ class KonomiTVBS4KTLVServiceResolver:
         log_prefix: str,
     ) -> KonomiTVBS4KTLVServiceResolution:
         """
-        生 TLV ストリームの先頭を読み、主 SID / 降雨対応 SID の context_id を解決する。
+        生 TLV ストリームの先頭を読み、主 SID / 降雨対応 SID の context_id と packet_id を解決する。
 
         Args:
             stream (AsyncIterable[bytes]): 生 TLV のバイト列イテレータ (HTTP は持たない)。
             main_service_id (int): 主サービス ID (channel.service_id)。
             rain_service_id (int | None): 対象局だけに設定する降雨対応サービス ID。
-            need_rain_fallback (bool): 降雨対応 context_id まで待つか (画質 1080p 以下で True)。
+            need_rain_fallback (bool): 降雨対応トラックまで待つか (画質 1080p 以下で True)。
             log_prefix (str): ログへ付与するプレフィックス。
 
         Returns:
             KonomiTVBS4KTLVServiceResolution:
-                主・降雨対応 context、降雨対応 Video の送出状態、先頭付加用の raw データ。
+                主・降雨対応 context、FFmpeg map 用の packet_id、降雨対応 Video の送出状態、
+                先頭付加用の raw データ。
         """
 
         process = await asyncio.subprocess.create_subprocess_exec(
@@ -162,20 +275,26 @@ class KonomiTVBS4KTLVServiceResolver:
         stdout = process.stdout
         if stdin is None or stdout is None:
             await cls.__terminate(process, log_prefix)
-            return KonomiTVBS4KTLVServiceResolution(None, None, None, b'')
+            return KonomiTVBS4KTLVServiceResolution(None, None, None, None, None, None, b'')
 
         head_buffer = bytearray()
         observed_service_contexts: dict[int, int] = {}
         received_mpt_contexts: set[int] = set()
-        latest_video_context_ids: set[int] = set()
+        latest_tracks: tuple[KonomiTVBS4KTLVTrackSnapshot, ...] = ()
         main_context_id: int | None = None
         rain_context_id: int | None = None
+        main_video_packet_id: int | None = None
+        main_audio_packet_id: int | None = None
+        rain_video_packet_id: int | None = None
         is_rain_fallback_broadcasting: bool | None = None
 
         # stdout 読取は独立タスクにし、stdin 書込と並行させる。
         # 先に全バイトを書いてから読むと、子プロセスの stdout pipe が詰まってデッドロックする。
         async def readMetadata() -> None:
-            nonlocal main_context_id, rain_context_id, is_rain_fallback_broadcasting
+            nonlocal latest_tracks
+            nonlocal main_context_id, rain_context_id
+            nonlocal main_video_packet_id, main_audio_packet_id, rain_video_packet_id
+            nonlocal is_rain_fallback_broadcasting
             while True:
                 line = await stdout.readline()
                 if line == b'':
@@ -187,27 +306,34 @@ class KonomiTVBS4KTLVServiceResolver:
                 # 実入力では同じ context_id の SDT が SID ごとに順次通知されるため、各行だけを見ると
                 # 直前に解決した主 SID が消える。プローブ期間内に観測したサービス対応は SID ごとに蓄積する。
                 observed_service_contexts.update(metadata.service_contexts)
+                # helper の tracks は SDT 行でも現在保持している全件を含む。MPT の完全 snapshot を
+                # 待つ送出判定とは分け、FFmpeg map 用の候補だけは最新行へ追従する。
+                latest_tracks = metadata.tracks
                 if metadata.snapshot_type == 'MPT':
                     # context未選択の空MPTはhelper全体のreset通知なので、再通知前のSID・MPT・trackを残さない。
                     # context IDが再利用されても、reset前のVideo送出状態を新しいサービスへ誤適用させない。
                     if metadata.snapshot_context_id is None:
                         observed_service_contexts.clear()
                         received_mpt_contexts.clear()
-                        latest_video_context_ids.clear()
+                        latest_tracks = ()
                     else:
                         # MPTのtracksは完全snapshotとして置換する。受信済みcontextは別に保持することで、
                         # tracks=[]を「MPT未受信」と混同せずVideoなしと確定できる。
                         received_mpt_contexts.add(metadata.snapshot_context_id)
-                        latest_video_context_ids.clear()
-                        latest_video_context_ids.update(metadata.video_context_ids)
 
                 main_context_id = observed_service_contexts.get(main_service_id)
                 if rain_service_id is not None:
                     rain_context_id = observed_service_contexts.get(rain_service_id)
+                (
+                    main_video_packet_id,
+                    main_audio_packet_id,
+                    rain_video_packet_id,
+                ) = cls.selectTrackPacketIds(latest_tracks, main_context_id, rain_context_id)
+                if rain_service_id is not None:
                     # MPT は対象 context の完全なトラック一覧なので、観測済みなら Video の有無を確定できる。
                     # SDT だけを見て低階層を採用すると FFmpeg の必須 map を満たせないため、未観測は None のままにする。
                     if rain_context_id is not None and rain_context_id in received_mpt_contexts:
-                        is_rain_fallback_broadcasting = rain_context_id in latest_video_context_ids
+                        is_rain_fallback_broadcasting = rain_video_packet_id is not None
                     else:
                         is_rain_fallback_broadcasting = None
 
@@ -218,8 +344,9 @@ class KonomiTVBS4KTLVServiceResolver:
         rain_deadline: float | None = None
 
         def isResolved() -> bool:
-            # 主 SID は必須。降雨対応 SID は need_rain_fallback のときだけ待つ。
-            if main_context_id is None:
+            # 主 SID と FFmpeg へ一意指定する主 Video / Audio packet_id は必須。
+            # 降雨対応 SID は need_rain_fallback のときだけ待つ。
+            if main_context_id is None or main_video_packet_id is None or main_audio_packet_id is None:
                 return False
             return (need_rain_fallback is False) or (is_rain_fallback_broadcasting is not None)
 
@@ -230,9 +357,14 @@ class KonomiTVBS4KTLVServiceResolver:
                     break
                 if len(head_buffer) >= cls.MAX_PROBE_BYTES:
                     break
-                # 主 SID が解決済みなら、降雨対応 SID は短い追加窓だけ待つ。
+                # 主トラックが解決済みなら、降雨対応 SID は短い追加窓だけ待つ。
                 # 降雨の無い通常運用では毎回フル待機して選局を遅らせない。
-                if need_rain_fallback is True and main_context_id is not None and rain_deadline is None:
+                if (
+                    need_rain_fallback is True and
+                    main_video_packet_id is not None and
+                    main_audio_packet_id is not None and
+                    rain_deadline is None
+                ):
                     rain_deadline = loop.time() + cls.RAIN_FALLBACK_WAIT_SECONDS
                 deadline = rain_deadline or main_deadline or first_byte_deadline
                 # first-byte までは従来と同じ 40 秒、その後の metadata 解析は 3 秒に分離する。
@@ -260,6 +392,9 @@ class KonomiTVBS4KTLVServiceResolver:
         return KonomiTVBS4KTLVServiceResolution(
             main_context_id=main_context_id,
             rain_context_id=rain_context_id,
+            main_video_packet_id=main_video_packet_id,
+            main_audio_packet_id=main_audio_packet_id,
+            rain_video_packet_id=rain_video_packet_id,
             is_rain_fallback_broadcasting=is_rain_fallback_broadcasting,
             head_buffer=bytes(head_buffer),
         )
