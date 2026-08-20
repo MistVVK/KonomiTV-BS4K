@@ -226,7 +226,8 @@ class LiveStream:
             instance.tuner = None
 
             # チューナー再利用時の排他ロック
-            ## チューナー再利用の競合を避けるため、LiveStream ごとにロックを持つ
+            ## 候補判定から所有権・LiveStream.tuner 参照の移譲までを直列化し、
+            ## チューナー移譲途中の Offline 状態へ同じストリームが再接続しないようにする
             instance._tuner_lock = asyncio.Lock()
 
             # 現在このストリームが降雨対応放送 (1080p 低階層) を映像に使っているかどうか
@@ -437,6 +438,14 @@ class LiveStream:
             restart_finished_event = self._restart_finished_event
             await restart_finished_event.wait()
 
+        # 自分のチューナーが別ストリームへ移譲されている途中なら、下の _tuner_lock で完了を待つ。
+        # 待機解除直後に移譲先の Standby ストリームから同じチューナーを取り返すと handoff が往復するため、
+        # この接続だけは別の再利用候補を探さず、新しいチューナーの割り当てへ進める。
+        tuner_handoff_was_in_progress = (
+            self._status == 'Offline' and
+            self.tuner is not None and
+            self._tuner_lock.locked() is True
+        )
         current_status = self._status
         should_start_task: bool = False
 
@@ -458,7 +467,11 @@ class LiveStream:
             is_edcb_backend = Config().general.live_stream_backend == 'EDCB'
 
             # EDCB バックエンドの場合は、再利用できるチューナーがあれば取得しておく
-            if should_start_task is True and is_edcb_backend is True:
+            if (
+                should_start_task is True and
+                is_edcb_backend is True and
+                tuner_handoff_was_in_progress is False
+            ):
 
                 # チューナー再利用の対象になりうる Standby / ONAir / Idling のストリームを探す
                 # (クライアントが 0 のもののみを対象にする)
@@ -472,78 +485,82 @@ class LiveStream:
                         if live_stream is self:
                             continue
 
-                        # ステータスを取得
+                        # 候補判定からチューナー参照の移譲までを、移譲元のロック内で完結させる
+                        ## disconnect() や旧タスクの終了待機中に移譲元へ再接続されると、再接続側が
+                        ## Cancelling 中のチューナーで新世代を開始し、その直後に handoff 側から切断されてしまう
+                        ## EDCBTuner の owner チェックは handoff 後の旧タスクによる二重操作を防ぐガードであり、
+                        ## handoff 前の中間状態に対する LiveStream.connect() の進入までは防げない
                         async with live_stream._tuner_lock:
                             live_stream_status = live_stream.getStatus()
 
-                        # クライアントが接続されている場合は対象外
-                        # ただし Standby 状態のストリームはまだクライアントに有意なデータを配信していないため、
-                        # client_count に関係なくチューナー再利用の対象にする (disconnectAll() で安全に切断できる)
-                        if live_stream_status.client_count != 0 and live_stream_status.status != 'Standby':
-                            # 近いタイミングで Idling に遷移する可能性があるため、リトライ対象とする
-                            if (live_stream_status.status == 'ONAir' or
-                                live_stream_status.status == 'Idling'):
-                                should_wait_next_retry = True
-                            continue
+                            # クライアントが接続されている場合は対象外
+                            # ただし Standby 状態のストリームはまだクライアントに有意なデータを配信していないため、
+                            # client_count に関係なくチューナー再利用の対象にする (disconnectAll() で安全に切断できる)
+                            if live_stream_status.client_count != 0 and live_stream_status.status != 'Standby':
+                                # 近いタイミングで Idling に遷移する可能性があるため、リトライ対象とする
+                                if (live_stream_status.status == 'ONAir' or
+                                    live_stream_status.status == 'Idling'):
+                                    should_wait_next_retry = True
+                                continue
 
-                        # Standby / ONAir / Idling 状態でない場合は対象外
-                        if live_stream_status.status not in ('Standby', 'ONAir', 'Idling'):
-                            continue
+                            # Standby / ONAir / Idling 状態でない場合は対象外
+                            if live_stream_status.status not in ('Standby', 'ONAir', 'Idling'):
+                                continue
 
-                        # チューナーが割り当てられていない場合は対象外
-                        if live_stream.tuner is None:
-                            continue
+                            # チューナーが割り当てられていない場合は対象外
+                            if live_stream.tuner is None:
+                                continue
 
-                        # チューナーが既にキャンセル中の場合は対象外
-                        if live_stream.tuner.getState() == 'Cancelling':
-                            continue
+                            # チューナーが既にキャンセル中の場合は対象外
+                            if live_stream.tuner.getState() == 'Cancelling':
+                                continue
 
-                        # チューナー再利用のため、チューナー状態をキャンセル中に切り替える
-                        live_stream.tuner.setState('Cancelling')
+                            # チューナー再利用のため、チューナー状態をキャンセル中に切り替える
+                            live_stream.tuner.setState('Cancelling')
 
-                        # ステータスを Offline に設定
-                        live_stream.setStatus('Offline', '新しいライブストリームが開始されたため、チューナーリソースを再利用します。')
+                            # ステータスを Offline に設定
+                            live_stream.setStatus('Offline', '新しいライブストリームが開始されたため、チューナーリソースを再利用します。')
 
-                        # すべての視聴中クライアントのライブストリームへの接続を切断する
-                        live_stream.disconnectAll()
+                            # すべての視聴中クライアントのライブストリームへの接続を切断する
+                            live_stream.disconnectAll()
 
-                        # PSI/SI データアーカイバーを終了・破棄する
-                        if live_stream.psi_data_archiver is not None:
-                            live_stream.psi_data_archiver.destroy()
-                            live_stream.psi_data_archiver = None
+                            # PSI/SI データアーカイバーを終了・破棄する
+                            if live_stream.psi_data_archiver is not None:
+                                live_stream.psi_data_archiver.destroy()
+                                live_stream.psi_data_archiver = None
 
-                        # チューナーとのストリーミング接続を明示的に閉じる
-                        await live_stream.tuner.disconnect(live_stream.live_stream_id)
+                            # チューナーとのストリーミング接続を明示的に閉じる
+                            await live_stream.tuner.disconnect(live_stream.live_stream_id)
 
-                        # チューナーの制御権限を移譲する
-                        if live_stream.tuner.handoff(live_stream.live_stream_id, self.live_stream_id) is False:
-                            continue
+                            # チューナーの制御権限を移譲する
+                            if live_stream.tuner.handoff(live_stream.live_stream_id, self.live_stream_id) is False:
+                                continue
 
-                        # 実行中のタスクがあればキャンセルする
-                        if live_stream._live_encoding_task_ref is not None:
-                            old_live_encoding_task = live_stream._live_encoding_task_ref
-                            old_live_encoding_task.cancel()
+                            # 実行中のタスクがあればキャンセルする
+                            if live_stream._live_encoding_task_ref is not None:
+                                old_live_encoding_task = live_stream._live_encoding_task_ref
+                                old_live_encoding_task.cancel()
 
-                            # タスクの完了を最大 10 秒待つ
-                            ## エンコーダープロセスの kill とバックグラウンドタスクの完了を含め、通常は 0.5 秒程度で完了する
-                            ## EDCB との通信ハングなどで無期限にブロックされることを防ぐためにタイムアウトを設ける
-                            ## asyncio.wait() はタスクの状態を変更しないため、タイムアウトしても旧タスクは自然終了を続ける
-                            done, _ = await asyncio.wait(
-                                {old_live_encoding_task},
-                                timeout=10.0,
-                            )
-                            if not done:
-                                live_stream.__detachLiveEncodingTaskRef(old_live_encoding_task)
-                                logging.warning(f'{live_stream.log_prefix} Encoding task cleanup did not complete within 10 seconds.')
+                                # タスクの完了を最大 10 秒待つ
+                                ## エンコーダープロセスの kill とバックグラウンドタスクの完了を含め、通常は 0.5 秒程度で完了する
+                                ## EDCB との通信ハングなどで無期限にブロックされることを防ぐためにタイムアウトを設ける
+                                ## asyncio.wait() はタスクの状態を変更しないため、タイムアウトしても旧タスクは自然終了を続ける
+                                done, _ = await asyncio.wait(
+                                    {old_live_encoding_task},
+                                    timeout=10.0,
+                                )
+                                if not done:
+                                    live_stream.__detachLiveEncodingTaskRef(old_live_encoding_task)
+                                    logging.warning(f'{live_stream.log_prefix} Encoding task cleanup did not complete within 10 seconds.')
 
-                            if live_stream._live_encoding_task_ref == old_live_encoding_task:
-                                live_stream._live_encoding_task_ref = None
+                                if live_stream._live_encoding_task_ref == old_live_encoding_task:
+                                    live_stream._live_encoding_task_ref = None
 
-                        # チューナーインスタンスを移譲する
-                        self.tuner = live_stream.tuner
-                        live_stream.tuner = None
-                        found_reusable_tuner = True
-                        break
+                            # チューナーインスタンスを移譲する
+                            self.tuner = live_stream.tuner
+                            live_stream.tuner = None
+                            found_reusable_tuner = True
+                            break
 
                     if found_reusable_tuner is True:
                         break
