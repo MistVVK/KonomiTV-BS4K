@@ -564,7 +564,7 @@ def test_public_env_example_exposes_all_host_specific_compose_settings() -> None
     assert 'KONOMITV_UID=1000' in env_example
     assert 'KONOMITV_GID=1000' in env_example
     assert 'KONOMITV_VIDEO_GID=44' in env_example
-    assert 'KONOMITV_RENDER_GID=992' in env_example
+    assert 'KONOMITV_RENDER_GID=109' in env_example
     assert 'KONOMITV_CUDA_VERSION=12.4' in env_example
     assert 'KONOMITV_NONFREE=nonfree' in env_example
     assert 'GOOGLE_VERTEX_PROJECT=' in env_example
