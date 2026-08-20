@@ -1,7 +1,6 @@
 import { defineStore } from 'pinia';
 
 import AnalysisTasks, { AnalysisTaskType, IAnalysisTaskExecution, IAnalysisTaskOverview } from '@/services/AnalysisTasks';
-import Utils from '@/utils';
 
 
 export interface IActiveAnalysisTaskGroup {
@@ -91,9 +90,7 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
             }
         },
         startOverviewPolling(showError = false): void {
-            // 未ログイン画面では認証必須 API を定期呼び出ししない。
-            if (Utils.getAccessToken() === null) return;
-
+            // 実行中概要は未ログインでも閲覧できるサーバー全体の状態なので、認証有無に関わらずポーリングする。
             overviewPollingConsumers += 1;
             // 既に別コンポーネントが開始済みなら、そのタイマーとストア状態を共有する。
             if (overviewPollingTimer !== null) return;
@@ -108,10 +105,6 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
 
             window.clearInterval(overviewPollingTimer);
             overviewPollingTimer = null;
-            // ログアウト後に別ユーザーへ前ユーザー権限で取得した概要を一瞬見せないよう、認証情報がなければ破棄する。
-            if (Utils.getAccessToken() === null) {
-                this.analysisOverview = {active: [], active_children: [], recent: []};
-            }
         },
     },
 });

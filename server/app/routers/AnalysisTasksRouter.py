@@ -57,10 +57,12 @@ def SerializeExecution(execution: AnalysisTaskExecution, is_admin: bool) -> sche
 
 
 @router.get('/overview', response_model=schemas.AnalysisTaskOverview)
-async def AnalysisTaskOverviewAPI(
-    current_user: Annotated[User, Depends(GetCurrentUser)],
-) -> schemas.AnalysisTaskOverview:
-    """ナビゲーションとマイページ用に実行中処理と直近5件を返す。"""
+async def AnalysisTaskOverviewAPI() -> schemas.AnalysisTaskOverview:
+    """ナビゲーションとマイページ用に実行中処理と直近5件を返す。
+
+    実行中表示はサーバー全体の状態であり、一括解析の開始 API と同様に未ログインでも閲覧できる。
+    エラー本文は管理者向け履歴 API に任せ、ここからは出さない。
+    """
 
     active = (
         await AnalysisTaskExecution.filter(
@@ -93,10 +95,11 @@ async def AnalysisTaskOverviewAPI(
         .order_by('-completed_at')
         .limit(5)
     )
+    # 未ログイン公開のため、管理者専用のエラー本文は常に伏せる。
     return schemas.AnalysisTaskOverview(
-        active=[SerializeExecution(item, current_user.is_admin) for item in active],
-        active_children=[SerializeExecution(item, current_user.is_admin) for item in active_children],
-        recent=[SerializeExecution(item, current_user.is_admin) for item in recent],
+        active=[SerializeExecution(item, False) for item in active],
+        active_children=[SerializeExecution(item, False) for item in active_children],
+        recent=[SerializeExecution(item, False) for item in recent],
     )
 
 
