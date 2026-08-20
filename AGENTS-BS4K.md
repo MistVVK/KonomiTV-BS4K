@@ -82,8 +82,10 @@ Docker Linux オンリーとする。
 
 - Development の Compose 操作は、現在のリポジトリルートを working directory として実行する。
 - GPU 構成を含む Compose ファイルの組み合わせは `.env` の `COMPOSE_FILE` で切り替える（`.env.example` 参照）。`-f` を毎回手で並べない。
-  - Development 例: `COMPOSE_FILE=compose.development.yaml:compose.intel-amd.yaml:compose.nvidia.yaml`
-  - 公開・Main 例: `COMPOSE_FILE=compose.yaml` に必要なら `compose.intel-amd.yaml` / `compose.nvidia.yaml` を連結
+  - Development 例: `COMPOSE_FILE=compose.development.yaml:compose.intel.yaml:compose.nvidia.yaml`
+  - 公開・Main 例: `COMPOSE_FILE=compose.yaml` に必要なら `compose.intel.yaml` / `compose.amd.yaml` / `compose.nvidia.yaml` を連結
+  - `compose.intel.yaml` / `compose.amd.yaml` は `NONFREE` ビルド引数の既定値をそれぞれ `intel-nonfree` / `amd-nonfree` にし、Intel / AMD 専用イメージのライセンス文書から不要なベンダーの警告を除く。Intel と AMD を併用する場合は `.env` に `KONOMITV_NONFREE=nonfree` を明示する（後勝ちマージで `amd-nonfree` になるため）
+  - `compose.intel.yaml` / `compose.amd.yaml` は `devices` に `${KONOMITV_INTEL_DRI_DEVICE:-/dev/dri/}` / `${KONOMITV_AMD_DRI_DEVICE:-/dev/dri/}` を使う。空なら `/dev/dri/` 全体を渡して自動選択、render node を書けばそのノードだけを渡す
 - 公開・Main 用の `compose.yaml` に Development の状態を上書きする運用は行わない。
 - Development は `verified-runtime` target を使用する。通常のコード変更を未検証の `runtime` target だけで起動してはいけない。
 - コード変更を Development で確認する必要があるときは、ユーザーへ再ビルド・再作成・再起動を依頼せず、エージェントが自ら実行する。
@@ -130,6 +132,7 @@ AMD のプロプライエタリや Intel の非自由カーネルを入れる選
   - `amd-nonfree`: AMD proprietary runtime のみ（再配布不可）
   - `free`: 両方なし（再配布可能）
   - 互換: `true` → `nonfree`、`false` → `free`（既存 .env を壊さない）
+  - `KONOMITV_NONFREE` を空にした場合の既定値は GPU overlay に連動する（`compose.intel.yaml` → `intel-nonfree`、`compose.amd.yaml` → `amd-nonfree`、それ以外 → `nonfree`）
 
 ## Git コミットメッセージ規則
 

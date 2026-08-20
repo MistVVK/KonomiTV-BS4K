@@ -787,7 +787,8 @@ RUN nala update && \
 COPY ./Dockerfile ./.dockerignore ./.gitignore ./.env.example ./THIRD_PARTY_LICENSES.md \
      ./compose.yaml \
      ./compose.development.yaml \
-     ./compose.intel-amd.yaml \
+     ./compose.intel.yaml \
+     ./compose.amd.yaml \
      ./compose.nvidia.yaml \
      /code/
 COPY ./docker/acp/ /code/docker/acp/

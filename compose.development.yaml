@@ -1,6 +1,6 @@
 name: konomitv-bs4k-development
 
-# GPU 構成は compose.intel-amd.yaml / compose.nvidia.yaml で追加する。
+# GPU 構成は compose.intel.yaml / compose.amd.yaml / compose.nvidia.yaml で追加する。
 services:
   konomitv:
     image: konomitv-bs4k-development

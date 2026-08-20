@@ -274,16 +274,35 @@ def test_nvidia_compose_contains_all_nvidia_runtime_settings() -> None:
         assert 'driver: nvidia' not in compose_text
 
 
-def test_intel_amd_compose_contains_dri_device() -> None:
-    """公開・Developmentで共有するoverlayにIntel・AMD DRMデバイスを集約する。
+def test_intel_compose_contains_dri_device_and_intel_nonfree_default() -> None:
+    """公開・Developmentで共有するIntel overlayにDRMデバイスとNONFREE既定を集約する。
 
     Returns:
         None
     """
 
-    service = _load_compose_service('compose.intel-amd.yaml')
+    service = _load_compose_service('compose.intel.yaml')
+    build = cast(dict[str, Any], service['build'])
 
-    assert service['devices'] == ['/dev/dri/:/dev/dri/']
+    assert build['args']['NONFREE'] == '${KONOMITV_NONFREE:-intel-nonfree}'
+    assert service['devices'] == ['${KONOMITV_INTEL_DRI_DEVICE:-/dev/dri/}']
+    for compose_filename in COMPOSE_FILENAMES:
+        service = _load_compose_service(compose_filename)
+        assert service.get('devices') is None
+
+
+def test_amd_compose_contains_dri_device_and_amd_nonfree_default() -> None:
+    """公開・Developmentで共有するAMD overlayにDRMデバイスとNONFREE既定を集約する。
+
+    Returns:
+        None
+    """
+
+    service = _load_compose_service('compose.amd.yaml')
+    build = cast(dict[str, Any], service['build'])
+
+    assert build['args']['NONFREE'] == '${KONOMITV_NONFREE:-amd-nonfree}'
+    assert service['devices'] == ['${KONOMITV_AMD_DRI_DEVICE:-/dev/dri/}']
     for compose_filename in COMPOSE_FILENAMES:
         service = _load_compose_service(compose_filename)
         assert service.get('devices') is None
@@ -470,8 +489,10 @@ def test_compose_entrypoints_are_explicit() -> None:
     assert re.search(r'(?m)^compose\.override\.yaml$', gitignore) is None
     assert (REPOSITORY_ROOT / 'compose.yaml').is_file()
     assert (REPOSITORY_ROOT / 'compose.development.yaml').is_file()
-    assert (REPOSITORY_ROOT / 'compose.intel-amd.yaml').is_file()
+    assert (REPOSITORY_ROOT / 'compose.intel.yaml').is_file()
+    assert (REPOSITORY_ROOT / 'compose.amd.yaml').is_file()
     assert (REPOSITORY_ROOT / 'compose.nvidia.yaml').is_file()
+    assert (REPOSITORY_ROOT / 'compose.intel-amd.yaml').exists() is False
     assert (REPOSITORY_ROOT / 'docker-compose.example.yaml').exists() is False
 
 
@@ -482,14 +503,18 @@ def test_public_env_example_exposes_all_host_specific_compose_settings() -> None
     env_example = (REPOSITORY_ROOT / '.env.example').read_text(encoding='utf-8')
 
     assert re.search(r'(?m)^\.env$', gitignore) is not None
-    assert 'COMPOSE_FILE=compose.yaml:compose.intel-amd.yaml' in env_example
+    assert 'COMPOSE_FILE=compose.yaml' in env_example
+    assert '#COMPOSE_FILE=compose.yaml:compose.intel.yaml' in env_example
+    assert '#COMPOSE_FILE=compose.yaml:compose.amd.yaml' in env_example
     assert '#COMPOSE_FILE=compose.yaml:compose.nvidia.yaml' in env_example
-    assert '#COMPOSE_FILE=compose.yaml:compose.intel-amd.yaml:compose.nvidia.yaml' in env_example
+    assert '#COMPOSE_FILE=compose.yaml:compose.intel.yaml:compose.amd.yaml' in env_example
     assert 'KONOMITV_UID=1000' in env_example
     assert 'KONOMITV_GID=1000' in env_example
     assert 'KONOMITV_VIDEO_GID=44' in env_example
     assert 'KONOMITV_RENDER_GID=109' in env_example
     assert 'KONOMITV_CUDA_VERSION=12.4' in env_example
-    assert 'KONOMITV_NONFREE=nonfree' in env_example
+    assert '#KONOMITV_NONFREE=' in env_example
+    assert 'KONOMITV_INTEL_DRI_DEVICE=' in env_example
+    assert 'KONOMITV_AMD_DRI_DEVICE=' in env_example
     assert 'GOOGLE_VERTEX_PROJECT=' in env_example
     assert 'GOOGLE_VERTEX_LOCATION=global' in env_example
