@@ -1,6 +1,4 @@
-# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
-
-ARG UBUNTU_2204_IMAGE_SHA256=0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
+# syntax=docker/dockerfile:1.7
 
 # プロファイル enum: nonfree / free / intel-nonfree / amd-nonfree（互換のため true → nonfree、false → free も受け付ける）
 # この ARG は FROM 行の stage 解決だけに使い、各 stage の cache key へ混ぜない。
@@ -13,7 +11,8 @@ ARG NONFREE=nonfree
 # Intel 非自由カーネルに依存しない共通部分（apt 導入と build context の COPY）を
 # 先に構築し、下の Intel 派生 stage が共有する。ここに ARG NONFREE を宣言しないことが、
 # 8 プロファイル分のフルビルドを 4 本（CUDA 2種 × Intel 2種）へ抑える鍵になる。
-FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS thirdparty-builder-base
+# ベースイメージは digest 固定しない。apt は後続の nala upgrade で archive の最新に揃える。
+FROM ubuntu:22.04 AS thirdparty-builder-base
 
 ARG CUDA_VERSION=12.4
 ENV DEBIAN_FRONTEND=noninteractive
@@ -204,11 +203,9 @@ RUN cc -std=c17 -Wall -Wextra -Werror -Wconversion -Wformat=2 -Wshadow -Wstrict-
 # KonomiTV-BS4K TS Codec Bridge を完全 commit と source archive SHA-256 から固定構築するステージ
 # --------------------------------------------------------------------------------------------------------------
 
-FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS tscodecbridge-toolchain
+FROM ubuntu:22.04 AS tscodecbridge-toolchain
 
-ARG UBUNTU_2204_IMAGE_SHA256
 ENV DEBIAN_FRONTEND=noninteractive
-ENV KONOMITV_BS4K_TSCODECBRIDGE_EXPECTED_UBUNTU_IMAGE_SHA256=${UBUNTU_2204_IMAGE_SHA256}
 
 # 公開済み commit の完全 SHA と codeload archive SHA-256 が未確定なら、apt や source 取得より前に失敗する。
 COPY ./docker/ts-codec-bridge/manifest.env \
@@ -217,7 +214,7 @@ COPY ./docker/ts-codec-bridge/manifest.env \
 RUN chmod 0755 /build/docker/ts-codec-bridge/build.sh && \
     /build/docker/ts-codec-bridge/build.sh validate-manifest
 
-# SBCL / cl-swank は Jammy 公式 archive の固定 package、SBLint / Mallet は固定 archive だけを使う。
+# SBCL / cl-swank は Jammy 公式 archive の最新 package、SBLint / Mallet は固定 archive だけを使う。
 RUN /build/docker/ts-codec-bridge/build.sh prepare
 
 FROM tscodecbridge-toolchain AS tscodecbridge-builder
@@ -239,9 +236,6 @@ RUN /build/docker/ts-codec-bridge/build.sh build && \
 # FFmpeg統合試験だけは、全依存を検証済みのthirdparty-builder環境でその成果物を直接用いて実行する。
 # Bridge source・toolchain・thirdparty build treeは中間stageに留め、最終imageへは実行形式と表示物だけを移す。
 FROM thirdparty-builder AS tscodecbridge-integration
-
-ARG UBUNTU_2204_IMAGE_SHA256
-ENV KONOMITV_BS4K_TSCODECBRIDGE_EXPECTED_UBUNTU_IMAGE_SHA256=${UBUNTU_2204_IMAGE_SHA256}
 
 COPY --from=tscodecbridge-builder /build/docker/ts-codec-bridge/ /build/docker/ts-codec-bridge/
 COPY --from=tscodecbridge-builder /build/konomitv-bs4k-tscodecbridge/source/ \
@@ -372,7 +366,7 @@ RUN set -eu && \
 # KonomiTV-BS4K の実行ステージ (Linux amd64 専用)
 # --------------------------------------------------------------------------------------------------------------
 
-FROM ubuntu:22.04@sha256:${UBUNTU_2204_IMAGE_SHA256} AS runtime
+FROM ubuntu:22.04 AS runtime
 
 ARG CUDA_VERSION=12.4
 ARG NONFREE=nonfree
@@ -413,7 +407,7 @@ RUN case "${CUDA_VERSION}" in \
         'deb https://ftp.tsukuba.wide.ad.jp/Linux/ubuntu/ jammy-backports main restricted universe multiverse' \
         'deb https://ftp.tsukuba.wide.ad.jp/Linux/ubuntu/ jammy-security main restricted universe multiverse' \
         > /etc/apt/sources.list && \
-    nala update && nala upgrade -y && nala install -y --no-install-recommends curl git gpg tzdata && \
+    nala update && nala upgrade -y && nala install -y --no-install-recommends curl git gpg tzdata libc6 zlib1g && \
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics-keyring.gpg && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics-keyring.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2523 unified' > /etc/apt/sources.list.d/intel-gpu-jammy.list && \
     if [ "${AMD_NONFREE}" = 'true' ]; then \
@@ -573,13 +567,11 @@ RUN . /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
         /code/server/thirdparty/FFmpeg8/ffmpeg8-amd.sh -hide_banner -filters 2>&1 | grep -Eq '[[:space:]]deinterlace_vaapi[[:space:]]'; \
     fi
 
-# Bridge final surface は保存実行形式、ライセンス・著作権表示、固定 runtime manifest だけにする。
+# Bridge final surface は保存実行形式、ライセンス・著作権表示、runtime manifest だけにする。
 COPY --from=tscodecbridge-integration /opt/konomitv-bs4k-tscodecbridge-runtime/ \
     /code/server/thirdparty/KonomiTVBS4KTSCodecBridge/
-RUN --mount=type=bind,from=tscodecbridge-builder,source=/opt/konomitv-bs4k-tscodecbridge-runtime-packages,target=/mnt/konomitv-bs4k-tscodecbridge-runtime-packages \
-    set -eu && \
+RUN set -eu && \
     bridge_root='/code/server/thirdparty/KonomiTVBS4KTSCodecBridge' && \
-    runtime_packages_root='/mnt/konomitv-bs4k-tscodecbridge-runtime-packages' && \
     expected_files="$(printf '%s\n' \
         Apache-2.0-LICENSE \
         COPYRIGHT-GLIBC \
@@ -609,40 +601,6 @@ RUN --mount=type=bind,from=tscodecbridge-builder,source=/opt/konomitv-bs4k-tscod
     test -s "${bridge_root}/GFDL-1.3-LICENSE" && \
     runtime_manifest="${bridge_root}/Runtime-Manifest.tsv" && \
     ! grep -Fq 'PENDING_' "${runtime_manifest}" && \
-    build_glibc_version="$(awk -F '\t' '$1 == "BUILD_GLIBC_PACKAGE_VERSION" { print $2 }' "${runtime_manifest}")" && \
-    build_glibc_package_sha256="$(awk -F '\t' '$1 == "LIBC6_PACKAGE_ARCHIVE_SHA256" { print $2 }' "${runtime_manifest}")" && \
-    build_glibc_package_url="$(awk -F '\t' '$1 == "LIBC6_PACKAGE_ARCHIVE_URL" { print $2 }' "${runtime_manifest}")" && \
-    build_glibc_sha256="$(awk -F '\t' '$1 == "BUILD_GLIBC_LIBRARY_SHA256" { print $2 }' "${runtime_manifest}")" && \
-    build_zlib_version="$(awk -F '\t' '$1 == "BUILD_ZLIB_PACKAGE_VERSION" { print $2 }' "${runtime_manifest}")" && \
-    build_zlib_package_sha256="$(awk -F '\t' '$1 == "ZLIB1G_PACKAGE_ARCHIVE_SHA256" { print $2 }' "${runtime_manifest}")" && \
-    build_zlib_package_url="$(awk -F '\t' '$1 == "ZLIB1G_PACKAGE_ARCHIVE_URL" { print $2 }' "${runtime_manifest}")" && \
-    build_zlib_sha256="$(awk -F '\t' '$1 == "BUILD_ZLIB_LIBRARY_SHA256" { print $2 }' "${runtime_manifest}")" && \
-    test -n "${build_glibc_version}" && \
-    printf '%s' "${build_glibc_package_sha256}" | grep -Eq '^[0-9a-f]{64}$' && \
-    test "${build_glibc_package_url}" = "https://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_${build_glibc_version}_amd64.deb" && \
-    printf '%s' "${build_glibc_sha256}" | grep -Eq '^[0-9a-f]{64}$' && \
-    test -n "${build_zlib_version}" && \
-    printf '%s' "${build_zlib_package_sha256}" | grep -Eq '^[0-9a-f]{64}$' && \
-    test "${build_zlib_package_url}" = "https://archive.ubuntu.com/ubuntu/pool/main/z/zlib/zlib1g_${build_zlib_version#*:}_amd64.deb" && \
-    printf '%s' "${build_zlib_sha256}" | grep -Eq '^[0-9a-f]{64}$' && \
-    expected_runtime_packages="$(printf '%s\n' libc6-amd64.deb zlib1g-amd64.deb | sort)" && \
-    actual_runtime_packages="$(find "${runtime_packages_root}" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | sort)" && \
-    test "${actual_runtime_packages}" = "${expected_runtime_packages}" && \
-    test -z "$(find "${runtime_packages_root}" -mindepth 1 -maxdepth 1 ! -type f -print -quit)" && \
-    printf '%s  %s\n' "${build_glibc_package_sha256}" "${runtime_packages_root}/libc6-amd64.deb" | \
-        sha256sum --check --strict - && \
-    printf '%s  %s\n' "${build_zlib_package_sha256}" "${runtime_packages_root}/zlib1g-amd64.deb" | \
-        sha256sum --check --strict - && \
-    test "$(dpkg-deb --field "${runtime_packages_root}/libc6-amd64.deb" Package)" = 'libc6' && \
-    test "$(dpkg-deb --field "${runtime_packages_root}/libc6-amd64.deb" Version)" = "${build_glibc_version}" && \
-    test "$(dpkg-deb --field "${runtime_packages_root}/libc6-amd64.deb" Architecture)" = 'amd64' && \
-    test "$(dpkg-deb --field "${runtime_packages_root}/zlib1g-amd64.deb" Package)" = 'zlib1g' && \
-    test "$(dpkg-deb --field "${runtime_packages_root}/zlib1g-amd64.deb" Version)" = "${build_zlib_version}" && \
-    test "$(dpkg-deb --field "${runtime_packages_root}/zlib1g-amd64.deb" Architecture)" = 'amd64' && \
-    dpkg --install \
-        "${runtime_packages_root}/libc6-amd64.deb" \
-        "${runtime_packages_root}/zlib1g-amd64.deb" && \
-    test -z "$(dpkg --audit)" && \
     awk -F '\t' ' \
         NF < 2 { invalid = 1 } \
         $1 == "BUILDER_PACKAGE" { \
@@ -675,16 +633,6 @@ RUN --mount=type=bind,from=tscodecbridge-builder,source=/opt/konomitv-bs4k-tscod
     ! printf '%s\n' "${ldd_output}" | grep -Fq 'not found' && \
     printf '%s\n' "${ldd_output}" | grep -Fq 'libc.so.6' && \
     printf '%s\n' "${ldd_output}" | grep -Fq 'libz.so.1' && \
-    runtime_glibc_path="$(printf '%s\n' "${ldd_output}" | awk '$1 == "libc.so.6" { print $3; exit }')" && \
-    runtime_zlib_path="$(printf '%s\n' "${ldd_output}" | awk '$1 == "libz.so.1" { print $3; exit }')" && \
-    test -n "${runtime_glibc_path}" && \
-    test -n "${runtime_zlib_path}" && \
-    test "$(dpkg-query --showformat='${Version}' --show libc6)" = "${build_glibc_version}" && \
-    test "$(dpkg-query --showformat='${Version}' --show zlib1g)" = "${build_zlib_version}" && \
-    printf '%s  %s\n' "${build_glibc_sha256}" "${runtime_glibc_path}" | \
-        sha256sum --check --strict - && \
-    printf '%s  %s\n' "${build_zlib_sha256}" "${runtime_zlib_path}" | \
-        sha256sum --check --strict - && \
     ! command -v sbcl >/dev/null 2>&1 && \
     ! command -v mallet >/dev/null 2>&1 && \
     ! command -v sblint >/dev/null 2>&1 && \
