@@ -210,9 +210,10 @@ class PlayerController {
     private screen_wake_lock: WakeLockSentinel | null = null;
 
     // RomSound の AudioContext と AudioBuffer のリスト
-    private readonly romsounds_context: AudioContext = new AudioContext();
+    // init() ごとに生成し、destroy() で close() してブラウザの音声リソースを確実に解放する
+    private romsounds_context: AudioContext | null = null;
     private readonly romsounds_buffers = new Map<number, AudioBuffer>();
-    private readonly romsounds_ready: Promise<void>;
+    private romsounds_ready: Promise<void> = Promise.resolve();
 
     // L字画面のクロップ設定で使うウォッチャーを保持する配列
     private lshaped_screen_crop_watchers: (() => void)[] = [];
@@ -274,26 +275,6 @@ class PlayerController {
             }
         }
 
-        // 01 ~ 14 を番号を崩さず並列取得し、初回再生は準備完了を待つ。
-        this.romsounds_ready = Promise.all(Array.from({length: 14}, (_, index) => index + 1).map(async (index) => {
-            try {
-                // ArrayBuffer をデコードして AudioBuffer にし、すぐ呼び出せるように貯めておく
-                // ref: https://ics.media/entry/200427/
-                const romsound_url = `/assets/romsounds/${index.toString().padStart(2, '0')}.wav`;
-                const romsound_response = await APIClient.get<ArrayBuffer>(romsound_url, {
-                    baseURL: '',  // BaseURL を明示的にクライアントのルートに設定
-                    responseType: 'arraybuffer',
-                });
-                if (romsound_response.type === 'success') {
-                    this.romsounds_buffers.set(
-                        index,
-                        await this.romsounds_context.decodeAudioData(romsound_response.data),
-                    );
-                }
-            } catch (error) {
-                console.warn(`[PlayerController] Failed to preload RomSound ${index}.`, error);
-            }
-        })).then(() => undefined);
     }
 
 
@@ -459,6 +440,34 @@ class PlayerController {
         this.recorded_playback_end_blocked_by_seek = false;
         this.recorded_auto_skip_cm_target = null;
         this.is_offline_fallback_in_progress = false;
+
+        // AudioContext は PlayerController の初期化単位で所有する。
+        // 同じ Controller を destroy() 後に再初期化する場合も、close 済みの Context を再利用しない。
+        const romsounds_context = new AudioContext();
+        this.romsounds_context = romsounds_context;
+        this.romsounds_buffers.clear();
+
+        // 01 ~ 14 を番号を崩さず並列取得し、初回再生は準備完了を待つ。
+        this.romsounds_ready = Promise.all(Array.from({length: 14}, (_, index) => index + 1).map(async (index) => {
+            try {
+                // ArrayBuffer をデコードして AudioBuffer にし、すぐ呼び出せるように貯めておく
+                // ref: https://ics.media/entry/200427/
+                const romsound_url = `/assets/romsounds/${index.toString().padStart(2, '0')}.wav`;
+                const romsound_response = await APIClient.get<ArrayBuffer>(romsound_url, {
+                    baseURL: '',  // BaseURL を明示的にクライアントのルートに設定
+                    responseType: 'arraybuffer',
+                });
+                if (romsound_response.type === 'success') {
+                    const romsound_buffer = await romsounds_context.decodeAudioData(romsound_response.data);
+                    // destroy() 後に遅れて decode が完了しても、解放済み世代の AudioBuffer を保持し直さない。
+                    if (this.romsounds_context === romsounds_context) {
+                        this.romsounds_buffers.set(index, romsound_buffer);
+                    }
+                }
+            } catch (error) {
+                console.warn(`[PlayerController] Failed to preload RomSound ${index}.`, error);
+            }
+        })).then(() => undefined);
 
         // PlayerStore にプレイヤーを初期化したことを通知する
         // 実際にはこの時点ではプレイヤーの初期化は完了していないが、PlayerController.init() を実行したことが通知されることが重要
@@ -1305,6 +1314,8 @@ class PlayerController {
                     })(),
                     // 文字スーパーの PRA (内蔵音再生コマンド) のコールバックを指定
                     PRACallback: async (index: number, loop: boolean = false, offset: number = 0) => {
+                        const romsounds_context = this.romsounds_context;
+                        if (romsounds_context === null) return;
                         // index に応じた内蔵音を鳴らす
                         // ref: https://ics.media/entry/200427/
                         // ref: https://www.ipentec.com/document/javascript-web-audio-api-change-volume
@@ -1313,21 +1324,21 @@ class PlayerController {
                         // なくても動くこともあるみたいだけど、念のため
                         await this.romsounds_ready;
                         if (this.isInitializationCurrent(initialization_generation, playback_target_key) === false) return;
-                        if (this.romsounds_context.state === 'suspended') {
-                            await this.romsounds_context.resume();
+                        if (romsounds_context.state === 'suspended') {
+                            await romsounds_context.resume();
                             if (this.isInitializationCurrent(initialization_generation, playback_target_key) === false) return;
                         }
                         // index で指定された音声データを読み込み
                         const buffer = this.romsounds_buffers.get(index);
-                        if (buffer === undefined || this.romsounds_context.state === 'closed') return;
-                        const buffer_source_node = this.romsounds_context.createBufferSource();
+                        if (buffer === undefined || romsounds_context.state === 'closed') return;
+                        const buffer_source_node = romsounds_context.createBufferSource();
                         buffer_source_node.buffer = buffer;
                         buffer_source_node.loop = loop;
                         // GainNode につなげる
-                        const gain_node = this.romsounds_context.createGain();
+                        const gain_node = romsounds_context.createGain();
                         buffer_source_node.connect(gain_node);
                         // 出力につなげる
-                        gain_node.connect(this.romsounds_context.destination);
+                        gain_node.connect(romsounds_context.destination);
                         // 音量を元の wav の3倍にする (1倍だと結構小さめ)
                         gain_node.gain.value = 3 * (
                             this.player?.video.muted === true ? 0 : this.player?.video.volume ?? 1
@@ -4799,6 +4810,19 @@ class PlayerController {
                 // 何もしない
             }
             this.player = null;
+        }
+
+        // PRA の AudioBufferSourceNode は各レンダラーの dispose() と DPlayer の destroy() で停止・切断済み。
+        // close() の完了まで待って AudioContext の音声デバイス資源を解放し、遅延 decode の保持も無効化する。
+        const romsounds_context = this.romsounds_context;
+        if (romsounds_context !== null) {
+            if (romsounds_context.state !== 'closed') {
+                await romsounds_context.close();
+            }
+            if (this.romsounds_context === romsounds_context) {
+                this.romsounds_context = null;
+                this.romsounds_buffers.clear();
+            }
         }
 
         // PlayerStore にプレイヤーを破棄したことを通知
