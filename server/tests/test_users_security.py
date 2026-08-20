@@ -246,7 +246,7 @@ def test_refresh_token_rotates_and_reuse_revokes_family() -> None:
             app = _CreateApp()
             async with HTTPXAsyncClient(
                 transport = ASGITransport(app=app),
-                base_url = 'http://testserver',
+                base_url = 'https://testserver',
             ) as client:
                 login_response = await client.post(
                     '/api/users/token',
@@ -273,7 +273,7 @@ def test_refresh_token_rotates_and_reuse_revokes_family() -> None:
 
             async with HTTPXAsyncClient(
                 transport = ASGITransport(app=app),
-                base_url = 'http://testserver',
+                base_url = 'https://testserver',
                 cookies = {REFRESH_TOKEN_COOKIE_NAME: old_refresh_token},
             ) as replay_client:
                 replay_response = await replay_client.post('/api/users/refresh')
@@ -282,7 +282,7 @@ def test_refresh_token_rotates_and_reuse_revokes_family() -> None:
 
             async with HTTPXAsyncClient(
                 transport = ASGITransport(app=app),
-                base_url = 'http://testserver',
+                base_url = 'https://testserver',
                 cookies = {REFRESH_TOKEN_COOKIE_NAME: new_refresh_token},
             ) as current_client:
                 family_response = await current_client.post('/api/users/refresh')

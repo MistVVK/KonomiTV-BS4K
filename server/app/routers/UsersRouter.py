@@ -67,6 +67,8 @@ REFRESH_TOKEN_COOKIE_NAME = 'KonomiTV-Refresh-Token'
 REFRESH_TOKEN_COOKIE_PATH = '/api/users'
 REFRESH_TOKEN_COOKIE_MAX_AGE = int(REFRESH_TOKEN_LIFETIME.total_seconds())
 
+# 公開経路はすべて HTTPS のため、Akebi が内部 HTTP へ転送した request.url.scheme から Secure 属性を落とさない
+
 
 def SetRefreshTokenCookie(request: Request, response: Response, refresh_token: str) -> None:
     """更新トークンをHttpOnly Cookieへ設定する。"""
@@ -76,7 +78,7 @@ def SetRefreshTokenCookie(request: Request, response: Response, refresh_token: s
         value = refresh_token,
         max_age = REFRESH_TOKEN_COOKIE_MAX_AGE,
         httponly = True,
-        secure = request.url.scheme == 'https',
+        secure = True,
         samesite = 'lax',
         path = REFRESH_TOKEN_COOKIE_PATH,
     )
@@ -88,7 +90,7 @@ def DeleteRefreshTokenCookie(request: Request, response: Response) -> None:
     response.delete_cookie(
         key = REFRESH_TOKEN_COOKIE_NAME,
         httponly = True,
-        secure = request.url.scheme == 'https',
+        secure = True,
         samesite = 'lax',
         path = REFRESH_TOKEN_COOKIE_PATH,
     )
