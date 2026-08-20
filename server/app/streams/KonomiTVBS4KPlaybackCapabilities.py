@@ -1573,6 +1573,54 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         )
 
     @classmethod
+    async def getLegacyLiveCombinationCapability(
+        cls,
+        encoder: KonomiTVBS4KPlaybackEncoder,
+        video_codec: KonomiTVBS4KVideoCodec,
+        video_bit_depth: KonomiTVBS4KVideoBitDepth,
+        audio_codec: KonomiTVBS4KAudioCodec,
+    ) -> KonomiTVBS4KPlaybackLiveCombinationCapability:
+        """
+        Bridgeを通らない旧AVC/HEVC + AACライブのbackend能力を返す。
+
+        Args:
+            encoder: 実際に使う映像エンコーダー。
+            video_codec: 出力映像コーデック。
+            video_bit_depth: 出力映像bit depth。
+            audio_codec: 出力音声コーデック。
+
+        Returns:
+            Bridge非依存の旧ライブ組み合わせ能力。
+        """
+
+        # 旧ライブ経路はBridgeによるcodec変換を行わないため、直接TS出力できる組み合わせだけを許可する。
+        if video_codec not in ('avc', 'hevc') or audio_codec != 'aac':
+            return KonomiTVBS4KPlaybackLiveCombinationCapability(
+                encoder = encoder,
+                video_codec = video_codec,
+                video_bit_depth = video_bit_depth,
+                audio_codec = audio_codec,
+                available = False,
+                reason_code = 'UnsupportedCombination',
+            )
+
+        # 基礎probeと実ライブは同じFFmpeg 8 backend・render node・codec設定を共有する。
+        # 録画配信全体の可否ではなく、共通backendのexact encode結果を能力根拠にする。
+        backend = await RecordedPlaybackCapabilityProbe.getCapability(
+            encoder,
+            video_codec,
+            video_bit_depth,
+        )
+        return KonomiTVBS4KPlaybackLiveCombinationCapability(
+            encoder = backend.encoder,
+            video_codec = backend.codec,
+            video_bit_depth = backend.bit_depth,
+            audio_codec = audio_codec,
+            available = backend.available,
+            reason_code = backend.reason_code,
+        )
+
+    @classmethod
     async def getAudioCapability(
         cls,
         codec: KonomiTVBS4KAudioCodec,

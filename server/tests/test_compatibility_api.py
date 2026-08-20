@@ -424,7 +424,7 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
         raise AssertionError('compatibility route must not require Stream Anchor capability')
 
     async def GetAvailableHEVC10BitCapability(*_args, **_kwargs):
-        return SimpleNamespace(recorded_available=True)
+        return SimpleNamespace(available=True)
 
     monkeypatch.setattr(
         LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
@@ -433,7 +433,7 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
     )
     monkeypatch.setattr(
         LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
-        'getRecordedVideoCapability',
+        'getLegacyLiveCombinationCapability',
         classmethod(GetAvailableHEVC10BitCapability),
     )
     hevc_10bit_stream_quality = asyncio.run(
@@ -443,11 +443,11 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
     assert hevc_10bit_stream_quality.encoding_options.video_bit_depth == 10
 
     async def GetUnavailableHEVC10BitCapability(*_args, **_kwargs):
-        return SimpleNamespace(recorded_available=False)
+        return SimpleNamespace(available=False)
 
     monkeypatch.setattr(
         LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
-        'getRecordedVideoCapability',
+        'getLegacyLiveCombinationCapability',
         classmethod(GetUnavailableHEVC10BitCapability),
     )
     downgraded_hevc_stream_quality = asyncio.run(

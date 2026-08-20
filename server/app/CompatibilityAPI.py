@@ -297,12 +297,13 @@ async def ValidateCompatibilityLiveStreamQuality(
     ):
         # Komorebi V1 の旧 -10bit は可能なら10bitを使う希望指定であり、exact指定ではない。
         # main API の exact 契約は変えず、互換 API だけ選択エンコーダーの能力不足時に8bitへ戻す。
-        capability = await LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe.getRecordedVideoCapability(
+        capability = await LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe.getLegacyLiveCombinationCapability(
             selected_encoder,
             'hevc',
             10,
+            'aac',
         )
-        if capability.recorded_available is False:
+        if capability.available is False:
             stream_quality = replace(
                 stream_quality,
                 encoding_options = replace(
