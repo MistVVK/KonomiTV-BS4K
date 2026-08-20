@@ -296,6 +296,11 @@ class RecordedPlaybackIndexer:
     _metadata_seeds: ClassVar[dict[int, schemas.RecordedVideo]] = {}
     _force_rebuild_ids: ClassVar[set[int]] = set()
     _history_handle_tasks: ClassVar[dict[int, asyncio.Task[AnalysisTaskHandle]]] = {}
+    # 実行中の録画 ID から、その解析を直接 await している worker Task を引く。
+    _active_worker_tasks: ClassVar[dict[int, asyncio.Task[None]]] = {}
+    # 録画削除開始後に、古い HTTP 要求やスキャナーから同じ索引を再投入させない。
+    _deleting_recorded_video_ids: ClassVar[set[int]] = set()
+    _is_stopping: ClassVar[bool] = False
 
     @classmethod
     def getProgress(
@@ -329,9 +334,8 @@ class RecordedPlaybackIndexer:
         """中断状態を復旧し、既存録画のバックフィルを開始する。"""
 
         await RecordedVideo.filter(playback_index_status='Analyzing').update(playback_index_status='Pending')
-        cls._worker_tasks = {task for task in cls._worker_tasks if task.done() is False}
-        while len(cls._worker_tasks) < cls.WORKER_COUNT:
-            cls._worker_tasks.add(asyncio.create_task(cls.__worker()))
+        cls._is_stopping = False
+        cls.__ensureWorkers()
         if Config().video.recorded_playback_index_backfill_enabled is True:
             await cls.__enqueuePendingBackfill()
 
@@ -357,6 +361,7 @@ class RecordedPlaybackIndexer:
     async def stop(cls) -> None:
         """バックグラウンドワーカーを停止する。"""
 
+        cls._is_stopping = True
         if len(cls._worker_tasks) == 0:
             return
         for worker_task in cls._worker_tasks:
@@ -383,6 +388,13 @@ class RecordedPlaybackIndexer:
         Returns:
             解析完了時に成功可否を返す共有Future。
         """
+
+        # 削除 API と競合した依存解決済み要求には、共有 Future と同じ形で即時失敗を返す。
+        if recorded_video_id in cls._deleting_recorded_video_ids:
+            loop = asyncio.get_running_loop()
+            unavailable_future: asyncio.Future[bool] = loop.create_future()
+            unavailable_future.set_result(False)
+            return unavailable_future
 
         if metadata_seed is not None:
             cls._metadata_seeds[recorded_video_id] = metadata_seed
@@ -435,6 +447,11 @@ class RecordedPlaybackIndexer:
             cls._queued_ids.discard(recorded_video_id)
             cls._queued_priorities.pop(recorded_video_id, None)
             future = cls._futures.get(recorded_video_id)
+            current_worker = asyncio.current_task()
+            if current_worker is None:
+                cls._queue.task_done()
+                continue
+            cls._active_worker_tasks[recorded_video_id] = current_worker
             try:
                 trigger = 'StartupBackfill' if priority == 2 else ('Automatic' if priority == 1 else 'Manual')
                 history_handle_task = cls._history_handle_tasks.pop(recorded_video_id, None)
@@ -477,6 +494,8 @@ class RecordedPlaybackIndexer:
             finally:
                 if priority == 2:
                     await cls.__discardRecordingFileCache(recorded_video_id)
+                if cls._active_worker_tasks.get(recorded_video_id) is current_worker:
+                    cls._active_worker_tasks.pop(recorded_video_id, None)
                 cls._queue.task_done()
                 # キャッシュ返却中に同じ録画が再投入される場合があるため、旧workerが新しい世代の
                 # Futureと付随状態を削除しないよう、取り出し時のFutureとの同一性を確認する。
@@ -485,6 +504,59 @@ class RecordedPlaybackIndexer:
                     cls._futures.pop(recorded_video_id, None)
                     cls._metadata_seeds.pop(recorded_video_id, None)
                     cls._force_rebuild_ids.discard(recorded_video_id)
+
+    @classmethod
+    def __ensureWorkers(cls) -> None:
+        """停止中でなければ規定数の索引 worker を維持する。
+
+        Returns:
+            None
+        """
+
+        cls._worker_tasks = {task for task in cls._worker_tasks if task.done() is False}
+        if cls._is_stopping is True:
+            return
+        while len(cls._worker_tasks) < cls.WORKER_COUNT:
+            cls._worker_tasks.add(asyncio.create_task(cls.__worker()))
+
+    @classmethod
+    async def cancelByRecordedVideoID(cls, recorded_video_id: int) -> None:
+        """録画削除を開始し、対象索引の待機・実行を停止して完了を待つ。
+
+        Args:
+            recorded_video_id: 削除する RecordedVideo の ID。
+
+        Returns:
+            None
+        """
+
+        # イベントループ上で await せずバリアとキュー正本を更新し、worker の新規開始を防ぐ。
+        cls._deleting_recorded_video_ids.add(recorded_video_id)
+        cls._queued_ids.discard(recorded_video_id)
+        cls._queued_priorities.pop(recorded_video_id, None)
+        future = cls._futures.get(recorded_video_id)
+        if future is not None and future.done() is False:
+            future.set_result(False)
+
+        worker_pool_was_running = len(cls._worker_tasks) > 0
+        active_worker = cls._active_worker_tasks.get(recorded_video_id)
+        if active_worker is not None:
+            # worker cancel は __analyze() 内の FFprobe と pipe を回収し、finally まで完了してから戻る。
+            active_worker.cancel()
+            await asyncio.gather(active_worker, return_exceptions=True)
+        else:
+            # まだ worker が取得していない待機履歴 Task も残さない。
+            history_handle_task = cls._history_handle_tasks.pop(recorded_video_id, None)
+            if history_handle_task is not None:
+                history_handle_task.cancel()
+                await asyncio.gather(history_handle_task, return_exceptions=True)
+
+        cls._progress.pop(recorded_video_id, None)
+        cls._futures.pop(recorded_video_id, None)
+        cls._metadata_seeds.pop(recorded_video_id, None)
+        cls._force_rebuild_ids.discard(recorded_video_id)
+        if worker_pool_was_running is True:
+            cls.__ensureWorkers()
 
     @staticmethod
     def __hasActivePlaybackSessions() -> bool:

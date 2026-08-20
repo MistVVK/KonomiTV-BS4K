@@ -6,11 +6,12 @@ import math
 import re
 import tempfile
 import uuid
+import weakref
 from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 from fastapi import HTTPException, status
 
@@ -129,6 +130,16 @@ class RecordedFMP4Stream:
     _cpu_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
     _gpu_semaphores: ClassVar[dict[str, asyncio.Semaphore]] = {}
     _instances: ClassVar[dict[str, RecordedFMP4Stream]] = {}
+    # 録画削除開始後は、依存解決済みの古い HTTP 要求からも新しいセッションを作らせない。
+    _deleting_recorded_program_ids: ClassVar[set[int]] = set()
+    # session ごとの直接 HTTP 生成 Task。destroy() が cancel / wait してから cache を解放する。
+    _active_operation_tasks: ClassVar[dict[str, set[asyncio.Task[Any]]]] = {}
+    # destroy() 開始後に同じセッションへ新しい処理が入ることを防ぐバリア。
+    _destroying_session_ids: ClassVar[set[str]] = set()
+    # registry から外れた古い instance を保持済みの要求も、再び処理へ入れない。
+    _destroyed_instances: ClassVar[weakref.WeakSet[RecordedFMP4Stream]] = weakref.WeakSet()
+    # idle timeout と録画削除が同時に destroy() を呼んでも回収処理を1回に直列化する。
+    _destroy_locks: ClassVar[dict[str, asyncio.Lock]] = {}
     # session_id -> 接続元識別子（IP 等）。per-client 上限判定に使う。
     _session_client_keys: ClassVar[dict[str, str]] = {}
     # encoder semaphore 待ち行列の長さ。concurrency 上限とは別の admission 用カウンタ。
@@ -225,6 +236,10 @@ class RecordedFMP4Stream:
 
         # 既存・新規を問わず session_id 形式を先に検査する
         cls.validateSessionId(session_id)
+
+        # 録画削除と競合して依存解決済みの古い要求が到着しても、元ファイルを再び開かせない。
+        if recorded_program.id in cls._deleting_recorded_program_ids:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Recorded video is being deleted')
 
         if session_id not in cls._instances:
             if is_new_session_allowed is False or encoding_options is None:
@@ -400,11 +415,24 @@ class RecordedFMP4Stream:
     async def __activeOperation(self) -> AsyncGenerator[None]:
         """長時間のエンコードやfsync中にセッションタイムアウトを防ぐ。"""
 
+        if (
+            self.session_id in self._destroying_session_ids or
+            self in self._destroyed_instances
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Recorded stream is being destroyed')
+        active_operation_tasks = self._active_operation_tasks.setdefault(self.session_id, set())
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            active_operation_tasks.add(current_task)
         self._active_operations += 1
         self.keepAlive()
         try:
             yield
         finally:
+            if current_task is not None:
+                active_operation_tasks.discard(current_task)
+            if len(active_operation_tasks) == 0:
+                self._active_operation_tasks.pop(self.session_id, None)
             self._active_operations = max(0, self._active_operations - 1)
             if self._instances.get(self.session_id) is self:
                 self.keepAlive()
@@ -427,6 +455,26 @@ class RecordedFMP4Stream:
         """
 
         return session_id in cls._instances
+
+    @classmethod
+    async def destroyByRecordedProgramID(cls, recorded_program_id: int) -> None:
+        """録画削除を開始し、対象録画の全セッションと進行中処理を回収する。
+
+        Args:
+            recorded_program_id: 削除する RecordedProgram の ID。
+
+        Returns:
+            None
+        """
+
+        # await より先にバリアを立て、依存解決済みの競合要求も __new__() で拒否する。
+        cls._deleting_recorded_program_ids.add(recorded_program_id)
+        streams = [
+            stream
+            for stream in cls._instances.values()
+            if stream.recorded_program.id == recorded_program_id
+        ]
+        await asyncio.gather(*(stream.destroy() for stream in streams))
 
     @property
     def log_prefix(self) -> str:
@@ -606,32 +654,54 @@ class RecordedFMP4Stream:
     async def destroy(self) -> None:
         """セッション参照を解放し、キャッシュの60秒削除猶予を開始する。"""
 
-        if self._instances.get(self.session_id) is not self:
-            return
-        self._destroy_handle.cancel()
-        # 通常再生の先読みはオフライン保存taskと独立しているため、先に参照から外して回収する。
-        # taskのfinallyも同じlockを取得するので、lock外へ出てから完了を待つ。
-        playback_prefetch_task: asyncio.Task[bool] | None = None
-        async with self._playback_prefetch_lock:
-            if self._playback_prefetch_run is not None:
-                playback_prefetch_task = self._playback_prefetch_run.task
-                self._playback_prefetch_run = None
-                playback_prefetch_task.cancel()
-        if playback_prefetch_task is not None:
-            await asyncio.gather(playback_prefetch_task, return_exceptions=True)
-        offline_video_tasks = set(self._offline_video_sequence_tasks.values())
-        for task in offline_video_tasks:
-            task.cancel()
-        if len(offline_video_tasks) > 0:
-            await asyncio.gather(*offline_video_tasks, return_exceptions=True)
-        for event in self._offline_video_segment_events.values():
-            event.set()
-        self._offline_video_sequence_tasks.clear()
-        self._instances.pop(self.session_id, None)
-        self._session_client_keys.pop(self.session_id, None)
-        for cache_path in self._referenced_paths:
-            await RecordedFMP4CacheManager.release(cache_path, self.session_id)
-        self._referenced_paths.clear()
+        destroy_lock = self._destroy_locks.setdefault(self.session_id, asyncio.Lock())
+        try:
+            async with destroy_lock:
+                if self._instances.get(self.session_id) is not self:
+                    return
+                self._destroying_session_ids.add(self.session_id)
+                self._destroyed_instances.add(self)
+                self._destroy_handle.cancel()
+
+                # HTTP 要求 Task は内部先読み Task とは別なので、キャッシュ解放より先に明示的に停止して待つ。
+                current_task = asyncio.current_task()
+                active_operation_tasks = {
+                    task for task in self._active_operation_tasks.get(self.session_id, set())
+                    if task is not current_task
+                }
+                for task in active_operation_tasks:
+                    task.cancel()
+                if len(active_operation_tasks) > 0:
+                    await asyncio.gather(*active_operation_tasks, return_exceptions=True)
+
+                # 通常再生の先読みはオフライン保存taskと独立しているため、先に参照から外して回収する。
+                # taskのfinallyも同じlockを取得するので、lock外へ出てから完了を待つ。
+                playback_prefetch_task: asyncio.Task[bool] | None = None
+                async with self._playback_prefetch_lock:
+                    if self._playback_prefetch_run is not None:
+                        playback_prefetch_task = self._playback_prefetch_run.task
+                        self._playback_prefetch_run = None
+                        playback_prefetch_task.cancel()
+                if playback_prefetch_task is not None:
+                    await asyncio.gather(playback_prefetch_task, return_exceptions=True)
+                offline_video_tasks = set(self._offline_video_sequence_tasks.values())
+                for task in offline_video_tasks:
+                    task.cancel()
+                if len(offline_video_tasks) > 0:
+                    await asyncio.gather(*offline_video_tasks, return_exceptions=True)
+                for event in self._offline_video_segment_events.values():
+                    event.set()
+                self._offline_video_sequence_tasks.clear()
+                self._instances.pop(self.session_id, None)
+                self._session_client_keys.pop(self.session_id, None)
+                for cache_path in self._referenced_paths:
+                    await RecordedFMP4CacheManager.release(cache_path, self.session_id)
+                self._referenced_paths.clear()
+                self._active_operation_tasks.pop(self.session_id, None)
+                self._destroying_session_ids.discard(self.session_id)
+        finally:
+            if destroy_lock.locked() is False and self._destroy_locks.get(self.session_id) is destroy_lock:
+                self._destroy_locks.pop(self.session_id, None)
 
     async def getMasterPlaylist(self, cache_key: str | None = None) -> str:
         """映像fMP4メディアプレイリストを参照するHLSマスターを返す。"""

@@ -340,6 +340,13 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
             detail = 'Specified video_id was not found',
         )
 
+    # 削除開始後や部分削除後の録画を新しい索引・再生・オフライン保存へ渡さない。
+    if recorded_program.recorded_video.status in ('Deleting', 'DeleteFailed'):
+        raise HTTPException(
+            status_code = status.HTTP_409_CONFLICT,
+            detail = 'Recorded video is being deleted',
+        )
+
     return recorded_program
 
 

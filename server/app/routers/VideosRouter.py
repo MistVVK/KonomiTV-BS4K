@@ -40,6 +40,9 @@ from app.models.RecordedVideo import RecordedVideo
 from app.models.User import User
 from app.routers.JikkyoDependency import EnsureJikkyoEnabled
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.streams.KonomiTVBS4KOfflineJobManager import KonomiTVBS4KOfflineJobManager
+from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
+from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.JikkyoClient import JikkyoClient
 
@@ -1245,10 +1248,24 @@ async def VideoDeleteAPI(
             )
         recorded_program.recorded_video.status = 'Deleting'
 
-        deletion_stage = 'thumbnail files'
+        deletion_stage = 'playback index task'
         try:
-            # 1. サムネイルファイルを削除する
+            # 1. 元ファイルを開く索引・オフライン保存・通常再生を順に停止し、完了まで待つ。
+            # 各 Manager に削除バリアも立てるため、依存解決済みの競合要求から再生成されない。
+            recorded_video_id = recorded_program.recorded_video.id
+            await RecordedPlaybackIndexer.cancelByRecordedVideoID(recorded_video_id)
+            deletion_stage = 'offline jobs'
+            await KonomiTVBS4KOfflineJobManager.deleteByVideoID(recorded_program.id)
+            deletion_stage = 'playback sessions'
+            await RecordedFMP4Stream.destroyByRecordedProgramID(recorded_program.id)
+
+            # 2. 全生成 Task の回収後、60秒の通常猶予を待たず対象録画の fMP4 キャッシュを削除する。
+            deletion_stage = 'fMP4 cache files'
+            await RecordedFMP4CacheManager.deleteForRecordedVideo(recorded_program.recorded_video)
+
+            # 3. サムネイルファイルを削除する
             # 同じ file_hash を持つ他のレコードが存在する場合は共有中なのでスキップする
+            deletion_stage = 'thumbnail files'
             thumbnails_dir = anyio.Path(str(THUMBNAILS_DIR))
             if await thumbnails_dir.is_dir() and not has_duplicates:
                 # 通常サムネイル (.webp、旧仕様の .jpg)
@@ -1269,7 +1286,7 @@ async def VideoDeleteAPI(
             elif has_duplicates:
                 logging.info(f'[VideoDeleteAPI] Skip deleting thumbnail files because other records with the same file_hash exist: {file_hash}')
 
-            # 2. 関連する補助ファイルを削除する (.ts.program.txt, .ts.err)
+            # 4. 関連する補助ファイルを削除する (.ts.program.txt, .ts.err)
             deletion_stage = 'program information file'
             ts_program_txt_path = anyio.Path(f'{file_dir}/{file_name}.program.txt')
             if await ts_program_txt_path.is_file():
@@ -1280,7 +1297,7 @@ async def VideoDeleteAPI(
             if await ts_err_path.is_file():
                 await ts_err_path.unlink()
 
-            # 3. 録画ファイル本体を削除する
+            # 5. 録画ファイル本体を削除する
             deletion_stage = 'recorded video file'
             if await file_path.is_file():
                 await file_path.unlink()
@@ -1289,7 +1306,7 @@ async def VideoDeleteAPI(
                 # 再試行時は前回処理で録画本体だけ削除済みの場合があるため、存在しなくても処理を継続する
                 logging.warning(f'[VideoDeleteAPI] Recorded video file does not exist: {file_path}')
 
-            # 4. 全ファイルの削除完了後に DB レコードを削除する
+            # 6. 全ファイルの削除完了後に DB レコードを削除する
             # RecordedVideo も CASCADE 制約で削除される
             deletion_stage = 'database record'
             await recorded_program.delete()
