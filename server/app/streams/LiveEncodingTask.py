@@ -129,6 +129,27 @@ class LiveEncodingTask:
 
 
     @staticmethod
+    def isOffTheAir(channel: Channel, program_present: Program | None) -> bool:
+        """
+        現在番組の状態から放送休止中と判断できるかを返す。
+
+        Args:
+            channel (Channel): 視聴対象のチャンネル。
+            program_present (Program | None): 現在の番組情報。
+
+        Returns:
+            bool: 放送休止中と判断できる場合は True。
+        """
+
+        # ワンセグでは放送中でも EPG が欠落するため、番組情報がないこと自体を停波の根拠にしない。
+        if channel.is_oneseg is True and (
+            program_present is None or program_present.title == '番組情報がありません'
+        ):
+            return False
+        return program_present is None or program_present.isOffTheAirProgram()
+
+
+    @staticmethod
     def GenerateStreamAnchorGenerationID() -> int:
         """ライブ実行ごとに重複しない非ゼロの Stream Anchor generation ID を生成する。"""
 
@@ -1398,7 +1419,7 @@ class LiveEncodingTask:
                 )
             except (TimeoutError, aiohttp.ClientConnectorError):
                 # 番組名に「放送休止」などが入っていれば停波によるものとみなし、そうでないなら接続失敗とする
-                if program_present is None or program_present.isOffTheAirProgram():
+                if self.isOffTheAir(channel, program_present):
                     self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-01M)')
                 else:
                     self.live_stream.setStatus('Offline', 'チューナーへの接続に失敗しました。チューナー側に何らかの問題があるかもしれません。(E-01M)')
@@ -2114,7 +2135,7 @@ class LiveEncodingTask:
                 except (TimeoutError, aiohttp.ClientConnectorError):
 
                     # 番組名に「放送休止」などが入っていれば停波によるものとみなし、そうでないならチューナーへの接続に失敗したものとする
-                    if program_present is None or program_present.isOffTheAirProgram():
+                    if self.isOffTheAir(channel, program_present):
                         self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-01M)')
                     else:
                         self.live_stream.setStatus('Offline', 'チューナーへの接続に失敗しました。チューナー側に何らかの問題があるかもしれません。(E-01M)')
@@ -2553,7 +2574,7 @@ class LiveEncodingTask:
 
                     # 全 backend の FFmpeg 8 ログを同じ経路で診断する。
                     if 'Stream map \'0:v:0\' matches no streams.' in line:
-                        if program_present is None or program_present.isOffTheAirProgram():
+                        if self.isOffTheAir(channel, program_present):
                             self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-04F)')
                         else:
                             self.live_stream.setStatus('Offline', 'チューナーからの放送波の受信に失敗したため、エンコードを開始できません。(E-04F)')
@@ -2665,7 +2686,7 @@ class LiveEncodingTask:
                         if (time.monotonic() - tuner_ts_read_at) > tuner_read_timeout:
 
                             # 番組名に「放送休止」などが入っていれば停波の可能性が高い
-                            if program_present is None or program_present.isOffTheAirProgram():
+                            if self.isOffTheAir(channel, program_present):
                                 self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-11)')
 
                             # それ以外は受信エラーとする
@@ -2709,7 +2730,7 @@ class LiveEncodingTask:
                         # 番組名に「放送休止」などが入っている場合、チューナーから出力された放送波 TS に映像/音声ストリームが
                         # 含まれていない可能性が高いので、ここでエンコードタスクを停止する
                         ## 映像/音声ストリームが含まれていない場合は当然ながらエンコーダーはフリーズする
-                        if program_present is None or program_present.isOffTheAirProgram():
+                        if self.isOffTheAir(channel, program_present):
                             self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-13)')
 
                         # それ以外なら、エンコーダーの再起動で復帰できる可能性があるのでエンコードタスクを再起動する
