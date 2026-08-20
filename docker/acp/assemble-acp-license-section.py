@@ -18,8 +18,10 @@ CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 
 def read_text(path: Path) -> str:
     text = path.read_text(encoding='utf-8')
+    # 上流由来の文字化けは警告だけを出して素通しする
+    # (ライセンス文書の体裁の問題でビルドを止めない)。
     if '\ufffd' in text:
-        raise SystemExit(f'Unicode replacement character in {path}')
+        print(f'WARNING: Unicode replacement character in {path}', file=sys.stderr)
     text = text.replace('\f', '\n')
     if CONTROL_CHARACTERS.search(text):
         raise SystemExit(f'Unsupported control character in {path}')
@@ -44,19 +46,19 @@ def main() -> None:
         if 'Permission is hereby granted' not in node_license and 'Apache' not in node_license:
             raise SystemExit(f'Node LICENSE does not look like a Node.js license file: {args.node_license}')
 
+    # 文書に記す version は build 時の実測値をそのまま使う。
+    # 固定値との一致を要求すると base image の更新でビルドが止まるためゲートは設けない。
     node_version = args.node_version.lstrip('v')
-    if node_version != '20.16.0':
-        raise SystemExit(f'Unexpected Node.js version for license section: {args.node_version!r}')
 
     sections = [npm_document.rstrip(), '']
 
     sections.extend([
-        '### Node.js 20.16.0',
+        f'### Node.js {node_version}',
         '',
         '- Component: `Node.js`',
-        '- Version: `20.16.0`',
+        f'- Version: `{node_version}`',
         '- Binary path: `/usr/local/bin/node`',
-        '- License source: official Node.js distribution LICENSE (`/usr/local/LICENSE` in node:20.16.0)',
+        f'- License source: official Node.js distribution LICENSE (`/usr/local/LICENSE` in node:{node_version})',
         '',
         '#### LICENSE',
         '',

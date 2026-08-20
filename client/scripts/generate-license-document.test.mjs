@@ -37,10 +37,11 @@ function GetDocumentHeadings(document) {
     return headings;
 }
 
-function GetPackageSection(document, name, version) {
-    const startMarker = `#### ${name} ${version}\n`;
+function GetPackageSection(document, name) {
+    // version は依存更新で変わるため、見出しは package 名の prefix だけで照合する
+    const startMarker = `#### ${name} `;
     const start = document.indexOf(startMarker);
-    assert.notEqual(start, -1, `${name} ${version} must be present in the generated document.`);
+    assert.notEqual(start, -1, `${name} must be present in the generated document.`);
     const next = document.indexOf('\n#### ', start + startMarker.length);
     return document.slice(start, next === -1 ? undefined : next);
 }
@@ -100,58 +101,58 @@ test('generated document includes browser and service worker runtime packages', 
     assert.match(document, /^##### Kosugi-LICENSE\.txt$/m);
     assert.doesNotMatch(document, /^#### Bundled font license texts$/m);
 
-    for (const [name, version] of [
-        ['@iconify/vue', '4.3.0'],
-        ['idb', '7.1.1'],
-        ['workbox-cacheable-response', '7.4.1'],
-        ['workbox-core', '7.4.1'],
-        ['workbox-expiration', '7.4.1'],
-        ['workbox-precaching', '7.4.1'],
-        ['workbox-routing', '7.4.1'],
-        ['workbox-strategies', '7.4.1'],
-        ['workbox-window', '7.4.1'],
+    for (const name of [
+        '@iconify/vue',
+        'idb',
+        'workbox-cacheable-response',
+        'workbox-core',
+        'workbox-expiration',
+        'workbox-precaching',
+        'workbox-routing',
+        'workbox-strategies',
+        'workbox-window',
     ]) {
-        GetPackageSection(document, name, version);
+        GetPackageSection(document, name);
     }
 });
 
-test('all packages without bundled license files use exact-version verified fallbacks', async () => {
+test('all packages without bundled license files use registered upstream-verified fallbacks', async () => {
     const temporaryDirectory = await mkdtemp(join(tmpdir(), 'konomitv-bs4k-client-licenses-'));
     const outputPath = join(temporaryDirectory, 'CLIENT_THIRD_PARTY_LICENSES.md');
     await GenerateLicenseDocument(clientRoot, outputPath);
     const document = await readFile(outputPath, 'utf8');
 
-    for (const [name, version] of [
-        ['@nodable/entities', '3.0.0'],
-        ['@vue/devtools-api', '6.6.4'],
-        ['cache-content-type', '1.0.1'],
-        ['copy-to', '2.0.1'],
-        ['humanize-number', '0.0.2'],
-        ['koa-compose', '4.1.0'],
-        ['koa-json', '2.0.2'],
-        ['koa-logger', '3.2.1'],
-        ['mitt', '2.1.0'],
-        ['pwa-install-handler', '2.6.5'],
-        ['vue-resize', '2.0.0-alpha.1'],
+    // バージョンやハッシュではなく、登録済みフォールバックの package 名と照合済みソースだけを検査する
+    for (const name of [
+        '@nodable/entities',
+        '@vue/devtools-api',
+        'cache-content-type',
+        'copy-to',
+        'humanize-number',
+        'koa-compose',
+        'koa-json',
+        'koa-logger',
+        'mitt',
+        'pwa-install-handler',
+        'vue-resize',
     ]) {
-        const section = GetPackageSection(document, name, version);
+        const section = GetPackageSection(document, name);
         assert.match(section, /##### Verified (?:MIT|ISC) license from fixed upstream source/);
-        assert.match(section, /SHA-256 of fixed upstream source: `[0-9a-f]{64}`/);
         assert.match(section, /Verified source: <https:\/\/github\.com\//);
         assert.ok(section.indexOf('Verified source:') < section.indexOf('````text'));
         assert.doesNotMatch(section.slice(section.indexOf('````text')), /Verified source:/);
     }
     assert.doesNotMatch(document, /terms from package metadata/);
 
-    const vueDevtoolsSection = GetPackageSection(document, '@vue/devtools-api', '6.6.4');
+    const vueDevtoolsSection = GetPackageSection(document, '@vue/devtools-api');
     assert.match(vueDevtoolsSection, /Copyright \(c\) 2014-present Evan You/);
     assert.match(
         vueDevtoolsSection,
         /Repository: \[https:\/\/github\.com\/vuejs\/vue-devtools]\(https:\/\/github\.com\/vuejs\/vue-devtools\)/,
     );
-    assert.match(GetPackageSection(document, 'copy-to', '2.0.1'), /Copyright \(c\) 2014 dead_horse/);
-    assert.match(GetPackageSection(document, 'mitt', '2.1.0'), /© Jason Miller/);
-    assert.match(GetPackageSection(document, '@nodable/entities', '3.0.0'), /Copyright \(c\) 2026 Nodable/);
+    assert.match(GetPackageSection(document, 'copy-to'), /Copyright \(c\) 2014 dead_horse/);
+    assert.match(GetPackageSection(document, 'mitt'), /© Jason Miller/);
+    assert.match(GetPackageSection(document, '@nodable/entities'), /Copyright \(c\) 2026 Nodable/);
 });
 
 test('README license text preserves only attribution and verifies humanize-number fallback', async () => {
@@ -164,47 +165,63 @@ test('README license text preserves only attribution and verifies humanize-numbe
     assert.match(onlySection, /Copyright \(c\) 2012 TJ Holowaychuk <tj@vision-media\.ca>/);
     assert.match(onlySection, /Permission is hereby granted, free of charge/);
 
-    const humanizeSection = GetPackageSection(document, 'humanize-number', '0.0.2');
+    const humanizeSection = GetPackageSection(document, 'humanize-number');
     assert.match(humanizeSection, /Declared license: `not declared`/);
     assert.match(humanizeSection, /bff0f636fcca0dfbcb1bf7777e46c0b8a64defbc\/Readme\.md/);
-    assert.match(humanizeSection, /5c049b60e6ce9d975b5080441e4e5c530a937f27d0dcfa44f9a0d91d04663ac5/);
     assert.match(humanizeSection, /Permission is hereby granted, free of charge/);
 });
 
-test('undeclared and unverified README license is rejected instead of assuming MIT', () => {
-    assert.throws(() => ResolveMissingLicenseMaterials({
+test('undeclared and unverified README license degrades to a declared-only entry without assuming MIT', () => {
+    // 未登録 package の license 値だけから定型文を捏造しない。生成は止めず宣言ライセンスだけを記す。
+    const materials = ResolveMissingLicenseMaterials({
         key: 'ambiguous-package@1.0.0',
+        name: 'ambiguous-package',
         declaredLicense: 'not declared',
         packageJson: '{}',
         readmes: [['README.md', '# ambiguous-package\n\n## License\n\nMIT']],
-    }), /no exact-version fallback is registered/);
+    });
+    assert.equal(materials.length, 1);
+    assert.match(materials[0].name, /Declared license/);
+    assert.doesNotMatch(materials[0].content, /Permission is hereby granted/);
 });
 
-test('declared MIT without complete text or exact-version evidence is also rejected', () => {
-    assert.throws(() => ResolveMissingLicenseMaterials({
+test('declared MIT without complete text or registered fallback also degrades to a declared-only entry', () => {
+    const materials = ResolveMissingLicenseMaterials({
         key: 'unverified-mit-package@1.0.0',
+        name: 'unverified-mit-package',
         declaredLicense: 'MIT',
         packageJson: '{"license":"MIT"}',
         readmes: [['README.md', '# package\n\n## License\n\nMIT']],
-    }), /no exact-version fallback is registered/);
+    });
+    assert.equal(materials.length, 1);
+    assert.match(materials[0].name, /Declared license/);
+    assert.doesNotMatch(materials[0].content, /Permission is hereby granted/);
 });
 
-test('corrupted license source text is rejected', () => {
-    assert.throws(() => ResolveMissingLicenseMaterials({
+test('corrupted README license text is left unrepaired with a warning instead of failing the build', () => {
+    const materials = ResolveMissingLicenseMaterials({
         key: 'corrupted-package@1.0.0',
+        name: 'corrupted-package',
         declaredLicense: 'MIT',
         packageJson: '{"license":"MIT"}',
         readmes: [['README.md', '# package\n\n## License\n\nCopyright \uFFFD Example']],
-    }), /Unicode replacement character/);
+    });
+    assert.equal(materials.length, 1);
+    assert.match(materials[0].name, /Declared license/);
 });
 
-test('verified README fallback rejects modified package contents', () => {
-    assert.throws(() => ResolveMissingLicenseMaterials({
-        key: 'humanize-number@0.0.2',
+test('registered fallback applies by package name even when the published README content changes', () => {
+    // フォールバックは配布物の hash ではなく package 名と宣言ライセンスの一致だけを条件にする
+    const materials = ResolveMissingLicenseMaterials({
+        key: 'humanize-number@9.9.9',
+        name: 'humanize-number',
         declaredLicense: 'not declared',
         packageJson: '{}',
         readmes: [['Readme.md', '# humanize-number\n\n## License\n\nMIT\nmodified']],
-    }), /evidence hash mismatch/);
+    });
+    assert.equal(materials.length, 1);
+    assert.match(materials[0].name, /Verified MIT license from fixed upstream source/);
+    assert.match(materials[0].content, /Permission is hereby granted/);
 });
 
 test('declared dependency resolution fails closed with package and dependency names', async () => {

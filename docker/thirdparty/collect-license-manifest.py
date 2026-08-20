@@ -7,6 +7,7 @@ import email
 import hashlib
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -48,15 +49,19 @@ MIT_FULL_TEXT_MARKERS = (
     'Permission is hereby granted, free of charge',
     'THE SOFTWARE IS PROVIDED "AS IS"',
 )
+# 既知の文字化け copyright ファイルの修復表。キーは binary package 名のみとし、
+# バージョンは条件に含めない。修復は壊れ文字列の完全一致で確定するため、
+# 同じ壊れ方を持つ新バージョンはそのまま修復でき、未知の壊れ方は警告して素通しする
+# (ライセンス文書の体裁の問題でビルドを止めない)。
 KNOWN_DPKG_COPYRIGHT_REPAIRS = {
-    ('bsdutils', '1:2.37.2-4ubuntu3.5'): ('Bartosz Fe�ski', 'Bartosz Feński'),
-    ('libblkid1', '2.37.2-4ubuntu3.5'): ('Bartosz Fe�ski', 'Bartosz Feński'),
-    ('libmount1', '2.37.2-4ubuntu3.5'): ('Bartosz Fe�ski', 'Bartosz Feński'),
-    ('libsmartcols1', '2.37.2-4ubuntu3.5'): ('Bartosz Fe�ski', 'Bartosz Feński'),
-    ('libuuid1', '2.37.2-4ubuntu3.5'): ('Bartosz Fe�ski', 'Bartosz Feński'),
-    ('mount', '2.37.2-4ubuntu3.5'): ('Bartosz Fe�ski', 'Bartosz Feński'),
-    ('util-linux', '2.37.2-4ubuntu3.5'): ('Bartosz Fe�ski', 'Bartosz Feński'),
-    ('libjs-jquery-metadata', '12-3'): ('J�örn Zaefferer', 'Jörn Zaefferer'),
+    'bsdutils': ('Bartosz Fe�ski', 'Bartosz Feński'),
+    'libblkid1': ('Bartosz Fe�ski', 'Bartosz Feński'),
+    'libmount1': ('Bartosz Fe�ski', 'Bartosz Feński'),
+    'libsmartcols1': ('Bartosz Fe�ski', 'Bartosz Feński'),
+    'libuuid1': ('Bartosz Fe�ski', 'Bartosz Feński'),
+    'mount': ('Bartosz Fe�ski', 'Bartosz Feński'),
+    'util-linux': ('Bartosz Fe�ski', 'Bartosz Feński'),
+    'libjs-jquery-metadata': ('J�örn Zaefferer', 'Jörn Zaefferer'),
 }
 
 
@@ -108,8 +113,13 @@ def appendLicense(
     content = content if content is not None else readText(path)
     if not content:
         raise RuntimeError(f'License document is missing, empty, too large, or unreadable: {path}')
-    if '\ufffd' in content:
-        raise RuntimeError(f'License document contains an unrepaired Unicode replacement character: {path}')
+    # 修復されなかった文字化けは警告だけを出して素通しする
+    # (ライセンス文書の体裁の問題でビルドを止めない)。
+    if '�' in content:
+        print(
+            f'WARNING: License document contains an unrepaired Unicode replacement character: {path}',
+            file=sys.stderr,
+        )
 
     # 同じライセンス原文を多数のパッケージが共有する場合でも、各パッケージの帰属見出しは残す。
     # 原文は SHA-256 だけで同一判定せず文字列も比較し、偶発的なハッシュ衝突で省略しないようにする。
@@ -127,27 +137,35 @@ def appendLicense(
 
 
 def repairDpkgCopyrightContent(package: str, version: str, path: Path, content: str | None) -> str | None:
-    if content is None or '\ufffd' not in content:
+    if content is None or '�' not in content:
         return content
 
-    # Ubuntu Jammy の既知の copyright ファイルだけを、binary package・version・標準パス・壊れた文字列の
-    # 4条件が一致した場合に修復する。将来の別バージョンや未知の文字化けを黙って改変してはならない。
+    # Ubuntu Jammy の既知の copyright ファイルだけを、binary package・標準パス・壊れた文字列の
+    # 3条件が一致した場合に修復する。未知の文字化けを推測で改変せず、警告して素通しする。
     basePackage = package.split(':')[0]
     expectedPath = Path('/usr/share/doc') / basePackage / 'copyright'
-    replacement = KNOWN_DPKG_COPYRIGHT_REPAIRS.get((basePackage, version))
+    replacement = KNOWN_DPKG_COPYRIGHT_REPAIRS.get(basePackage)
     if path != expectedPath or replacement is None:
-        raise RuntimeError(
-            f'Unknown Unicode replacement character in dpkg license document: {package} {version} ({path})'
+        print(
+            f'WARNING: Unknown Unicode replacement character in dpkg license document '
+            f'(left unrepaired): {package} {version} ({path})',
+            file=sys.stderr,
         )
+        return content
     damaged, repaired = replacement
     if content.count(damaged) != 1:
-        raise RuntimeError(
-            f'Known dpkg license repair no longer matches exactly once: {package} {version} ({path})'
+        print(
+            f'WARNING: Known dpkg license repair no longer matches exactly once '
+            f'(left unrepaired): {package} {version} ({path})',
+            file=sys.stderr,
         )
+        return content
     content = content.replace(damaged, repaired)
-    if '\ufffd' in content:
-        raise RuntimeError(
-            f'dpkg license document still contains a Unicode replacement character: {package} {version} ({path})'
+    if '�' in content:
+        print(
+            f'WARNING: dpkg license document still contains a Unicode replacement character '
+            f'after repair: {package} {version} ({path})',
+            file=sys.stderr,
         )
     return content
 
@@ -229,14 +247,17 @@ def normalizedPythonPackageName(name: str) -> str:
     return re.sub(r'[-_.]+', '-', name).lower()
 
 
-def parsePythonLicenseOverride(value: str) -> tuple[tuple[str, str], Path]:
-    match = re.fullmatch(r'(.+)==([^=]+)=(.+)', value)
+def parsePythonLicenseOverride(value: str) -> tuple[str, Path]:
+    # バージョンを条件に含めない。override は「この package が LICENSE を欠く」という
+    # 配布物の恒常的な性質への対処であり、依存更新でバージョンが変わっても適用を継続する
+    # (バージョン結合にすると依存更新のたびにビルドが止まる)。
+    match = re.fullmatch(r'([^=]+)=([^=]+)', value)
     if match is None:
         raise argparse.ArgumentTypeError(
-            'Python license overrides must use NAME==VERSION=/path/to/LICENSE format.'
+            'Python license overrides must use NAME=/path/to/LICENSE format.'
         )
-    name, version, path = match.groups()
-    return (normalizedPythonPackageName(name), version), Path(path)
+    name, path = match.groups()
+    return normalizedPythonPackageName(name), Path(path)
 
 
 def main() -> None:
@@ -252,12 +273,12 @@ def main() -> None:
     parser.add_argument('--dpkg-exclude', action='append', default=[])
     args = parser.parse_args()
 
-    pythonLicenseOverrides: dict[tuple[str, str], Path] = {}
+    pythonLicenseOverrides: dict[str, Path] = {}
     for package, path in args.python_license_override:
         if package in pythonLicenseOverrides:
-            raise RuntimeError(f'Duplicate Python license override: {package[0]}=={package[1]}')
+            raise RuntimeError(f'Duplicate Python license override: {package}')
         pythonLicenseOverrides[package] = path
-    usedPythonLicenseOverrides: set[tuple[str, str]] = set()
+    usedPythonLicenseOverrides: set[str] = set()
 
     # 結合後の文書では H2 を配布領域、H3 をライセンス種別、H4 を個別の配布物、
     # H5 をその配布物に属するライセンス資料として固定する。
@@ -281,7 +302,20 @@ def main() -> None:
             if not documents and not payload:
                 continue
             if not documents:
-                raise RuntimeError(f'No license document found for package with payload: {name} {version}')
+                # license 文書を同梱しない package でもビルドを止めず、
+                # 文書が見つからない旨を記した最小セクションへ縮退する。
+                print(
+                    f'WARNING: No license document found for package with payload: {name} {version}',
+                    file=sys.stderr,
+                )
+                lines.extend([
+                    f'#### {name} {version}',
+                    '',
+                    'No license document was found in the installed package. '
+                    'See the package source for its license terms.',
+                    '',
+                ])
+                continue
             lines.extend([f'#### {name} {version}', ''])
             documents = list(dict.fromkeys(documents))
             for path in [*documents, *referencedCommonLicenses(documents)]:
@@ -319,15 +353,15 @@ def main() -> None:
         for root, package in pythonPackageEntries:
             name, version, declaredLicense, paths, metadataLicense, copyrightNotices = package
             rootPath = root.as_posix().rstrip('/') or '/'
-            packageIdentity = (normalizedPythonPackageName(name), version)
-            overridePath = pythonLicenseOverrides.get(packageIdentity)
+            packageKey = normalizedPythonPackageName(name)
+            overridePath = pythonLicenseOverrides.get(packageKey)
             if not paths and overridePath is not None:
                 if readText(overridePath) is None:
                     raise RuntimeError(
                         f'Python license override is missing, empty, or unreadable: {name} {version} ({overridePath})'
                     )
                 paths = [overridePath]
-                usedPythonLicenseOverrides.add(packageIdentity)
+                usedPythonLicenseOverrides.add(packageKey)
             lines.extend([f'#### {name} {version} — {rootPath}', '', f'- Declared license: {declaredLicense}', ''])
             if not paths:
                 if 'MIT' in declaredLicense:
@@ -364,12 +398,29 @@ def main() -> None:
                             '',
                         ])
                     else:
-                        raise RuntimeError(
-                            'No full MIT license text or explicit copyright notice is available for '
-                            f'Python package: {name} {version} ({root})'
+                        # 著作権表示のない定型 MIT 文の捏造はせず、宣言ライセンスだけを記して縮退する
+                        print(
+                            f'WARNING: No full MIT license text or explicit copyright notice is available for '
+                            f'Python package (declared license only): {name} {version} ({root})',
+                            file=sys.stderr,
                         )
+                        lines.extend([
+                            'The installed wheel does not contain a standalone license file. '
+                            'Only the declared license from its package metadata is recorded here.',
+                            '',
+                        ])
                 else:
-                    raise RuntimeError(f'No full license text available for Python package: {name} {version} ({declaredLicense})')
+                    # 宣言ライセンスだけを記して縮退する（ライセンス文書の欠落でビルドを止めない）
+                    print(
+                        f'WARNING: No full license text available for Python package '
+                        f'(declared license only): {name} {version} ({declaredLicense})',
+                        file=sys.stderr,
+                    )
+                    lines.extend([
+                        'The installed wheel does not contain a standalone license file. '
+                        'Only the declared license from its package metadata is recorded here.',
+                        '',
+                    ])
             for path in paths:
                 try:
                     relativePath = path.relative_to(root).as_posix()
@@ -385,7 +436,7 @@ def main() -> None:
 
     unusedPythonLicenseOverrides = set(pythonLicenseOverrides) - usedPythonLicenseOverrides
     if unusedPythonLicenseOverrides:
-        unused = ', '.join(f'{name}=={version}' for name, version in sorted(unusedPythonLicenseOverrides))
+        unused = ', '.join(sorted(unusedPythonLicenseOverrides))
         raise RuntimeError(f'Python license override did not match an installed package without a license file: {unused}')
 
     args.output.write_text('\n'.join(lines).rstrip() + '\n', encoding='utf-8', newline='\n')

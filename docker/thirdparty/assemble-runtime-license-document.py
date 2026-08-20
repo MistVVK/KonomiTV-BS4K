@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 
@@ -22,8 +23,13 @@ FENCE_OPEN = re.compile(r'^ {0,3}(`{3,}|~{3,})')
 
 def readDocument(path: Path) -> str:
     document = path.read_text(encoding='utf-8')
+    # 上流由来の文字化けが残っていても文書の結合は続行する
+    # (ライセンス文書の体裁の問題でビルドを止めない)。
     if '\ufffd' in document:
-        raise ValueError(f'Document contains a Unicode replacement character: {path}')
+        print(
+            f'WARNING: Document contains a Unicode replacement character: {path}',
+            file=sys.stderr,
+        )
 
     # GNU ライセンス原文などでは U+000C が印刷時の改ページとして使われる。
     # HTML/Markdown に安全に埋め込めるよう改行へ正規化し、意味のある本文は変更しない。

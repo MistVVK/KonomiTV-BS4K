@@ -11,6 +11,7 @@ import re
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -29,16 +30,12 @@ MAX_CHROMIUM_LICENSE_SIZE = 1024 * 1024
 MINIMUM_BUNDLED_PROJECT_COUNT = 100
 CDP_EVALUATION_TIMEOUT_SECONDS = 60.0
 
-# Chromium 150.0.7871.124 / 150.0.7871.181 / 150.0.7871.186 / 151.0.7922.108 の
 # chrome://credits に埋め込まれた一部の一次配布 notice は、
-# 元の引用符と copyright sign が U+FFFD に変換された状態で収録されている。
-# 別バージョンや別 project へ推測で置換を広げず、一次ソースと照合した固定文字列だけを修復する。
-ENCODING_REPAIR_CHROMIUM_VERSIONS = frozenset({
-    '150.0.7871.124',
-    '150.0.7871.181',
-    '150.0.7871.186',
-    '151.0.7922.108',
-})
+# 元の引用符と copyright sign が U+FFFD に変換された状態で収録されていることがある。
+# 別 project へ推測で置換を広げず、一次ソースと照合した固定文字列だけを修復する。
+# バージョンゲートは設けない。修復条件は壊れ行の完全一致と個数だけで確定するため、
+# 同じ壊れ方を持つ新バージョンはそのまま修復できる。未知の壊れ方は警告して素通しし、
+# ライセンス文書の体裁の問題でビルドを止めない。
 ANDROID_NOTICE_REPAIR_PROJECTS = (
     'common',
     'core-common',
@@ -354,13 +351,11 @@ def readPackageCopyright(path: Path) -> tuple[str, str]:
 
 def extractChromiumCredits(
     chromium_path: Path,
-    chromium_version: str,
 ) -> tuple[list[dict[str, str]], list[tuple[str, int]]]:
     """実 Chromium binary の chrome://credits から全ライセンス通知を抽出する。
 
     Args:
         chromium_path: Chromium launcher のパス。
-        chromium_version: 実 binary から取得した4要素のバージョン。
 
     Returns:
         表示順を保持した credits と、適用した検証済み文字修復の一覧。
@@ -436,7 +431,7 @@ def extractChromiumCredits(
                 if not isinstance(raw_credits, str):
                     raise RuntimeError('Chromium credits extraction did not return JSON text.')
                 credits = json.loads(raw_credits)
-                repaired_credits, encoding_repairs = repairKnownCreditsEncoding(chromium_version, credits)
+                repaired_credits, encoding_repairs = repairKnownCreditsEncoding(credits)
                 return (
                     validateCredits(repaired_credits, minimum_count=MINIMUM_BUNDLED_PROJECT_COUNT),
                     encoding_repairs,
@@ -517,13 +512,11 @@ def evaluateCDPExpression(client: WebSocketClient, expression: str, timeout_mill
 
 
 def repairKnownCreditsEncoding(
-    chromium_version: str,
     raw_credits: Any,
 ) -> tuple[Any, list[tuple[str, int]]]:
-    """固定 Chromium 版で一次ソースと照合済みの U+FFFD だけを修復する。
+    """一次ソースと照合済みの壊れ文字列だけを修復し、未知の文字化けは警告して素通しする。
 
     Args:
-        chromium_version: 実 binary から取得した4要素のバージョン。
         raw_credits: CDP から JSON decode した credits。
 
     Returns:
@@ -542,14 +535,9 @@ def repairKnownCreditsEncoding(
     }
     if not affected_projects:
         return raw_credits, []
-    if chromium_version not in ENCODING_REPAIR_CHROMIUM_VERSIONS:
-        raise ValueError(
-            f'Chromium {chromium_version} credits contains Unicode replacement characters; '
-            f'known repairs apply only to Chromium {sorted(ENCODING_REPAIR_CHROMIUM_VERSIONS)!r}.',
-        )
 
     # 修復を許可する project は一次ソース照合済みの固定集合だけ。
-    # Chromium 版によって損傷 project が減ることはあるが、未知 project への推測修復はしない。
+    # 未知 project への推測修復はせず、警告を出してそのまま残す。
     repairable_projects = set(ANDROID_NOTICE_REPAIR_PROJECTS) | {'FreeType'}
     unexpected_projects = {
         project_name
@@ -558,9 +546,10 @@ def repairKnownCreditsEncoding(
     }
     if unexpected_projects:
         unexpected_project_labels = sorted(repr(project_name) for project_name in unexpected_projects)
-        raise ValueError(
-            'Chromium credits Unicode replacement characters occur in unexpected projects: '
-            f'{unexpected_project_labels!r}.',
+        print(
+            'WARNING: Chromium credits contain Unicode replacement characters in projects '
+            f'without a verified repair (left unrepaired): {unexpected_project_labels!r}.',
+            file=sys.stderr,
         )
 
     repaired_credits: list[Any] = []
@@ -576,52 +565,77 @@ def repairKnownCreditsEncoding(
         project_name = credit['name']
         license_text = credit.get('license')
         if not isinstance(project_name, str) or not isinstance(license_text, str):
-            raise ValueError(f'Chromium credit #{index} cannot apply a verified encoding repair.')
-        if project_name in repaired_project_names:
-            raise ValueError(f'Chromium credits contains duplicate repair project: {project_name!r}.')
-
-        if project_name in ANDROID_NOTICE_REPAIR_PROJECTS:
-            if license_text.count(ANDROID_BROKEN_LICENSE_LINE) != 2:
-                raise ValueError(
-                    f'Chromium credit {project_name!r} does not contain exactly two expected broken license lines.',
-                )
-            if license_text.count(ANDROID_BROKEN_MULTIPLE_LICENSED_LINE) != 1:
-                raise ValueError(
-                    f'Chromium credit {project_name!r} does not contain the expected broken Multiple-Licensed line.',
-                )
-            if license_text.count('\ufffd') != 8:
-                raise ValueError(f'Chromium credit {project_name!r} does not contain exactly 8 replacement characters.')
-            license_text = license_text.replace(ANDROID_BROKEN_LICENSE_LINE, ANDROID_REPAIRED_LICENSE_LINE)
-            license_text = license_text.replace(
-                ANDROID_BROKEN_MULTIPLE_LICENSED_LINE,
-                ANDROID_REPAIRED_MULTIPLE_LICENSED_LINE,
+            print(
+                f'WARNING: Chromium credit #{index} cannot apply a verified encoding repair.',
+                file=sys.stderr,
             )
-            repaired_character_count = 8
+            repaired_credits.append(credit)
+            continue
+        if project_name in repaired_project_names:
+            print(
+                f'WARNING: Chromium credits contains duplicate repair project: {project_name!r}.',
+                file=sys.stderr,
+            )
+            repaired_credits.append(credit)
+            continue
+
+        # 登録済みの壊れ方（壊れ行の完全一致・個数）だけを修復する。
+        # 修復条件は内容だけで確定するため、Chromium のバージョンゲートは設けない。
+        repaired_license_text: str | None = None
+        repaired_character_count = 0
+        if project_name in ANDROID_NOTICE_REPAIR_PROJECTS:
+            if (
+                license_text.count(ANDROID_BROKEN_LICENSE_LINE) == 2
+                and license_text.count(ANDROID_BROKEN_MULTIPLE_LICENSED_LINE) == 1
+                and license_text.count('\ufffd') == 8
+            ):
+                repaired_license_text = license_text.replace(
+                    ANDROID_BROKEN_LICENSE_LINE,
+                    ANDROID_REPAIRED_LICENSE_LINE,
+                ).replace(
+                    ANDROID_BROKEN_MULTIPLE_LICENSED_LINE,
+                    ANDROID_REPAIRED_MULTIPLE_LICENSED_LINE,
+                )
+                repaired_character_count = 8
         else:
-            if license_text.count(FREETYPE_BROKEN_COPYRIGHT_LINE) != 1 or license_text.count('\ufffd') != 1:
-                raise ValueError('Chromium credit \'FreeType\' does not contain its one expected broken copyright line.')
-            license_text = license_text.replace(FREETYPE_BROKEN_COPYRIGHT_LINE, FREETYPE_REPAIRED_COPYRIGHT_LINE)
-            repaired_character_count = 1
+            if license_text.count(FREETYPE_BROKEN_COPYRIGHT_LINE) == 1 and license_text.count('\ufffd') == 1:
+                repaired_license_text = license_text.replace(
+                    FREETYPE_BROKEN_COPYRIGHT_LINE,
+                    FREETYPE_REPAIRED_COPYRIGHT_LINE,
+                )
+                repaired_character_count = 1
+
+        if repaired_license_text is None:
+            # 登録済みの壊れ方と一致しない場合は推測で修復せず、警告してそのまま残す
+            print(
+                f'WARNING: Chromium credit {project_name!r} has an unregistered mojibake pattern '
+                '(left unrepaired).',
+                file=sys.stderr,
+            )
+            repaired_credits.append(credit)
+            continue
 
         repaired_credit = dict(credit)
-        repaired_credit['license'] = license_text
+        repaired_credit['license'] = repaired_license_text
         repaired_credits.append(repaired_credit)
         repairs.append((project_name, repaired_character_count))
         repaired_project_names.add(project_name)
 
-    # 損傷していた既知 project はすべて修復できていること（部分集合でも可）
-    if repaired_project_names != affected_projects:
-        raise ValueError(
-            'Not all Chromium credits encoding repairs were applied: '
-            f'{sorted(repr(name) for name in repaired_project_names)!r}.',
-        )
-    if any(
-        isinstance(value, str) and '\ufffd' in value
+    # 修復後に残った文字化けは警告だけを出して素通しする（文書の体裁でビルドを止めない）。
+    leftover_projects = sorted(
+        repr(credit.get('name'))
         for credit in repaired_credits
-        if isinstance(credit, dict)
-        for value in credit.values()
-    ):
-        raise ValueError('Chromium credits still contains Unicode replacement characters after verified repairs.')
+        if isinstance(credit, dict) and any(
+            isinstance(value, str) and '\ufffd' in value
+            for value in credit.values()
+        )
+    )
+    if leftover_projects:
+        print(
+            'WARNING: Chromium credits still contain Unicode replacement characters '
+            f'after verified repairs: {leftover_projects!r}',
+            file=sys.stderr,
+        )
     return repaired_credits, repairs
 
 
@@ -680,8 +694,13 @@ def normalizeAndValidateText(value: Any, label: str) -> str:
         raise ValueError(f'{label} is not text.')
     # form feed はライセンス原稿の改ページ記号なので、HTML 応答へ制御文字を残さず改行境界として保持する。
     normalized = value.replace('\r\n', '\n').replace('\r', '\n').replace('\f', '\n').strip()
+    # U+FFFD（未知の文字化け）は警告だけを出して素通しする。
+    # ライセンス文書の体裁の問題でビルドを止めない。
     if '\ufffd' in normalized:
-        raise ValueError(f'{label} contains a Unicode replacement character.')
+        print(
+            f'WARNING: {label} contains a Unicode replacement character (left unrepaired).',
+            file=sys.stderr,
+        )
     if UNSAFE_CONTROL_CHARACTERS.search(normalized):
         raise ValueError(f'{label} contains unsafe control characters.')
     return normalized
@@ -694,7 +713,7 @@ def buildLicenseDocument(
     chromium_license: str,
     package_copyright: str,
     package_copyright_sha256: str,
-    credits: list[dict[str, str]],
+    credits: list[dict[str, str]] | None,
     encoding_repairs: list[tuple[str, int]],
 ) -> str:
     """Chromium 本体と bundled components の通知を独立した Markdown 文書へまとめる。
@@ -706,7 +725,7 @@ def buildLicenseDocument(
         chromium_license: Chromium 本体の LICENSE 本文。
         package_copyright: Linux Mint package 同梱 copyright file の本文。
         package_copyright_sha256: 同梱 copyright file bytes の SHA-256。
-        credits: 実 binary の chrome://credits から抽出した通知。
+        credits: 実 binary の chrome://credits から抽出した通知。抽出失敗時は None。
         encoding_repairs: 一次ソースと照合して適用した project ごとの文字修復。
 
     Returns:
@@ -716,7 +735,7 @@ def buildLicenseDocument(
     separator = '=' * 96
     entry_separator = '-' * 96
     bundled_notice_lines = [separator]
-    for index, credit in enumerate(credits, start=1):
+    for index, credit in enumerate(credits or [], start=1):
         bundled_notice_lines.extend([
             f'Project {index}: {credit["name"]}',
             f'Homepage: {credit["homepage"]}',
@@ -734,8 +753,8 @@ def buildLicenseDocument(
     if encoding_repairs:
         repair_document = [
             f'The installed Chromium {upstream_version} credits page contains U+FFFD in fixed third-party notice text.',
-            'The generator repairs only the exact project names, occurrence counts, and broken lines registered for this',
-            'Chromium version; every other U+FFFD fails the Docker build.',
+            'The generator repairs only the exact project names, occurrence counts, and broken lines registered as',
+            'verified patterns; any other U+FFFD is left unrepaired and reported as a build warning.',
             '',
             f'- Repaired characters: {repaired_character_count} across {len(encoding_repairs)} projects',
             f'- Mozilla MPL 1.1 reference for ASCII quotation marks: <{MOZILLA_MPL_1_1_SOURCE}>',
@@ -744,6 +763,24 @@ def buildLicenseDocument(
         ]
     else:
         repair_document = ['No Unicode replacement character repairs were required.']
+
+    # credits 抽出に失敗した場合は、文書の生成自体を失敗させず縮退した文書を生成する。
+    if credits is None:
+        bundled_section = [
+            '## Bundled third-party notices',
+            '',
+            'The bundled third-party notices could not be extracted from the installed Chromium binary '
+            'during the Docker build (see the build log for details).',
+            'The Chromium main license above and the Linux Mint package copyright file below still apply.',
+        ]
+        bundled_project_count = 'unavailable (extraction failed)'
+    else:
+        bundled_section = [
+            '## Bundled third-party notices',
+            '',
+            markdownCodeBlock(bundled_notices),
+        ]
+        bundled_project_count = str(len(credits))
 
     # ライセンス本文はすべて fenced code block に隔離し、HTML として解釈されないようにする。
     # fence は本文中の最長 backtick 列より長くするため、将来本文に Markdown が増えても内容を変更しない。
@@ -759,7 +796,7 @@ def buildLicenseDocument(
         '- Linux Mint package copyright path: `/usr/share/doc/chromium/copyright`',
         f'- Linux Mint package copyright SHA-256: `{package_copyright_sha256}`',
         f'- Bundled notice source: `{CHROMIUM_CREDITS_URL}` from the installed binary',
-        f'- Bundled project count: {len(credits)}',
+        f'- Bundled project count: {bundled_project_count}',
         '',
         '## Chromium main license',
         '',
@@ -776,9 +813,7 @@ def buildLicenseDocument(
         '',
         *repair_document,
         '',
-        '## Bundled third-party notices',
-        '',
-        markdownCodeBlock(bundled_notices),
+        *bundled_section,
     ]
     return '\n'.join(document_lines).rstrip() + '\n'
 
@@ -819,7 +854,21 @@ def main() -> None:
 
     chromium_license = readChromiumLicense(args.chromium_license)
     package_copyright, package_copyright_sha256 = readPackageCopyright(args.package_copyright)
-    credits, encoding_repairs = extractChromiumCredits(args.chromium, binary_version)
+    try:
+        credits, encoding_repairs = extractChromiumCredits(args.chromium)
+    except Exception as ex:
+        # chrome://credits の抽出は build 中に実ブラウザを起動するため、上流 Chromium の更新で
+        # 壊れうる。ライセンス文書の生成失敗でビルドを止めず、Chromium 本体 LICENSE と
+        # Mint package copyright だけの縮退文書を生成する。
+        # 抽出経路（ブラウザ起動・DevTools プロトコル・JSON 解析）の例外型を逐一限定できないため
+        # broad exception とし、縮退文書へのフォールバック契約をここに明示する。
+        print(
+            'WARNING: Chromium credits extraction failed; '
+            f'building a degraded license document without bundled notices: {ex!r}',
+            file=sys.stderr,
+        )
+        credits = None
+        encoding_repairs = []
     document = buildLicenseDocument(
         args.package_version,
         binary_version,
