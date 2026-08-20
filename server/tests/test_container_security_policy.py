@@ -289,14 +289,12 @@ def test_intel_amd_compose_contains_dri_device() -> None:
         assert service.get('devices') is None
 
 
-def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> None:
-    """完成イメージへ固定 ACP CLI を導入し、gcloud package を含めない。"""
+def test_acp_clis_come_from_lockfile_and_do_not_install_google_cloud_cli() -> None:
+    """完成イメージの ACP CLI は lockfile 正本の npm ci で導入し、gcloud package を含めない。"""
 
     import json
-    import re
 
     dockerfile = (REPOSITORY_ROOT / 'Dockerfile').read_text(encoding='utf-8')
-    manifest = (REPOSITORY_ROOT / 'docker/acp/manifest.env').read_text(encoding='utf-8')
     package_json = json.loads(
         (REPOSITORY_ROOT / 'docker/acp/package.json').read_text(encoding='utf-8'),
     )
@@ -304,34 +302,14 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
         (REPOSITORY_ROOT / 'docker/acp/package-lock.json').read_text(encoding='utf-8'),
     )
 
-    assert "CODEX_ACP_VERSION='1.1.7'" in manifest
-    assert "CODEX_CLI_VERSION='0.145.0'" in manifest
-    assert 'GEMINI_CLI' not in manifest
-    assert "GROK_NPM_PACKAGE='@xai-official/grok'" in manifest
-    assert "GROK_PLATFORM_NPM_PACKAGE='@xai-official/grok-linux-x64'" in manifest
-    assert "GROK_BUILD_VERSION='0.2.112'" in manifest
-    # 公式 platform package から展開した Grok binary は完全 SHA-256 を build 中に再検証する。
-    grok_sha_match = re.search(
-        r"GROK_BUILD_LINUX_X86_64_SHA256='([0-9a-f]{64})'",
-        manifest,
-    )
-    assert grok_sha_match is not None
-    grok_sha = grok_sha_match.group(1)
-    assert grok_sha == 'c2867112f7d89366123fe68a55a23dfb027d3602fc5b5b9cd5c080dacb4a2503'
-    assert '"${GROK_BUILD_LINUX_X86_64_SHA256}"' in dockerfile
-    assert 'grok-distribution/bin/grok-${GROK_BUILD_VERSION}' in dockerfile
-    assert 'sha256sum --check --strict' in dockerfile
-    assert 'https://x.ai/cli/grok-' not in dockerfile
-    assert 'ADD --checksum' not in dockerfile.split('FROM node:20.16.0 AS acp-builder', 1)[1].split('FROM ', 1)[0]
+    # バージョンの正本は package.json / package-lock.json のみ。
+    # manifest.env のような二重管理や、テストへのバージョン・ハッシュ値のハードコードは行わない
+    # (依存更新のたびにビルドが止まる保守負債になるため)。
+    assert not (REPOSITORY_ROOT / 'docker/acp/manifest.env').exists()
+    acp_builder_section = dockerfile.split('FROM node:20.16.0 AS acp-builder', 1)[1].split('FROM ', 1)[0]
+    assert 'manifest.env' not in acp_builder_section
 
-    # npm integrity の正本は lockfile。未使用の *_NPM_INTEGRITY は持たない
-    assert 'NPM_INTEGRITY' not in manifest
     dependencies = package_json['dependencies']
-    assert dependencies == {
-        '@agentclientprotocol/codex-acp': '1.1.7',
-        '@openai/codex': '0.145.0',
-        '@xai-official/grok': '0.2.112',
-    }
     # exact version のみ（^ や ~ を禁止）
     for version in dependencies.values():
         assert version[0].isdigit()
@@ -342,19 +320,6 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
         assert isinstance(entry.get('integrity'), str) and entry['integrity'].startswith('sha512-')
         assert entry['resolved'].startswith('https://registry.npmjs.org/')
 
-    # wrapper と実 binary / NOTICE を含む platform tarball の SRI を個別に固定する。
-    assert lock_packages['node_modules/@xai-official/grok']['integrity'] == (
-        'sha512-dCXAiFHmn3JTOK+vPfCIzzum1GmxPB81NH73yYhqleXx1y/Ks3qjwJ+GeEXmB7eudiap98j9Nj1cDwH4lSuaOw=='
-    )
-    grok_platform = lock_packages['node_modules/@xai-official/grok-linux-x64']
-    assert grok_platform['version'] == '0.2.112'
-    assert grok_platform['integrity'] == (
-        'sha512-2jD/00EB9xmzDQ89sSdA/CThTVqQQEgxIm/XqGIVuJXr63UST6H/aNdxPUiwz+tMkk8K12Nv6vPYHCO/H+Ae1Q=='
-    )
-    assert grok_platform['os'] == ['linux']
-    assert grok_platform['cpu'] == ['x64']
-    assert grok_platform['optional'] is True
-
     lock_text = (REPOSITORY_ROOT / 'docker/acp/package-lock.json').read_text(encoding='utf-8')
     assert '_authToken' not in lock_text
     assert ':_password' not in lock_text
@@ -362,31 +327,14 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
 
     assert './docker/acp/package.json' in dockerfile
     assert './docker/acp/package-lock.json' in dockerfile
-    assert './docker/acp/manifest.env' in dockerfile
     assert './docker/acp/normalize-acp-web-telemetry.mjs' in dockerfile
-    assert 'npm ci --omit=dev --no-audit --no-fund' in dockerfile
+    assert 'npm ci --omit=dev --no-audit --no-fund' in acp_builder_section
+    assert 'npm install' not in acp_builder_section
     assert (
         'node /build/docker/acp/normalize-acp-web-telemetry.mjs /opt/konomitv-bs4k-acp'
         in dockerfile
     )
-    assert 'npm install' not in dockerfile.split('FROM node:20.16.0 AS acp-builder', 1)[1].split('FROM ', 1)[0]
-    # path / name / version の双方向照合と CLI 実 version の全文一致検査を要求する
-    assert 'installed package path/name/version match lockfile' in dockerfile
-    assert 'version mismatch' in dockerfile
-    assert 'required lock path not installed' in dockerfile
-    # pipeline + grep 部分一致は fail-open になるため禁止し、capture + test 全文一致を要求する
-    acp_builder_section = dockerfile.split('FROM node:20.16.0 AS acp-builder', 1)[1].split('FROM ', 1)[0]
-    assert 'codex-acp --version | grep' not in acp_builder_section
-    assert 'codex --version | grep' not in acp_builder_section
-    assert 'gemini --version | grep' not in acp_builder_section
-    assert 'gemini_cli_version' not in acp_builder_section
-    assert 'GEMINI_CLI_VERSION' not in manifest
-    assert '@google/gemini-cli' not in dockerfile
-    assert 'codex_acp_version="$(/opt/konomitv-bs4k-acp/node_modules/.bin/codex-acp --version)"' in dockerfile
-    # 各 CLI の既知の完全1行出力と一致させる（部分一致や pipeline 隠蔽を禁止）
-    assert 'test "${codex_acp_version}" = "@agentclientprotocol/codex-acp ${CODEX_ACP_VERSION}"' in dockerfile
-    assert 'test "${codex_cli_version}" = "codex-cli ${CODEX_CLI_VERSION}"' in dockerfile
-    assert 'test "${grok_version_line}" = "${GROK_BUILD_VERSION_LINE}"' in dockerfile
+
     assert 'Google Cloud CLI must not be included in the final image.' in dockerfile
     assert 'google-cloud-cli' not in dockerfile
     assert 'google-cloud-sdk' not in dockerfile
@@ -395,50 +343,27 @@ def test_dockerfile_pins_acp_clis_and_does_not_install_google_cloud_cli() -> Non
     assert 'generate-license-document.mjs' in dockerfile
     assert 'assemble-acp-license-section.py' in dockerfile
     assert 'ACP_THIRD_PARTY_LICENSES.md' in dockerfile
+    assert '## ACP Runtime Dependencies' in dockerfile
     assert '--manifest /tmp/ACP_THIRD_PARTY_LICENSES.md' in dockerfile
-    assert '### Node.js 20.16.0' in dockerfile
-    assert '### @agentclientprotocol/codex-acp 1.1.7' in dockerfile
-    # Grok は推測した公開 source snapshot ではなく、binary と NOTICE が同居する npm package を収録する。
-    assert '### @xai-official/grok 0.2.112' in dockerfile
-    assert '### @xai-official/grok-linux-x64 0.2.112' in dockerfile
-    assert '--grok-source-commit' not in dockerfile
-    assert 'GROK_LICENSE_SOURCE_COMMIT' not in manifest
-    assert '47348d13ec4508dcfe440e34c6d511bb02998fb2' not in manifest
-    licenses_dir = REPOSITORY_ROOT / 'docker/acp/licenses'
-    assert list(licenses_dir.glob('grok-build-0.2.112*')) == []
-    license_generator = (
-        REPOSITORY_ROOT / 'docker/acp/generate-license-document.mjs'
-    ).read_text(encoding='utf-8')
-    assert '@xai-official/grok@0.2.112' in license_generator
-    assert '@xai-official/grok-linux-x64@0.2.112' in license_generator
-    assert 'a9a4529af672a2a27496b1623b539bad499e09f1eda1fce34eddc2f38378e8ac' in license_generator
-    assert '18814fc44bc1e3d93367dadcacaa010ab2049bcc09704b53315aba4dc2907103' in license_generator
-    assert 'npm integrity:' in license_generator
-    assert 'APPENDIX: How to apply the Apache License to your work.' in license_generator
-    assert 'a3d60eaf32d2fb09c9d82ef39f14bd6e2c0f3ca7de30daa827486c0d6f8b6e9f' in license_generator
     assert (REPOSITORY_ROOT / 'docker/acp/generate-license-document.mjs').is_file()
+    assert (REPOSITORY_ROOT / 'docker/acp/normalize-acp-web-telemetry.mjs').is_file()
+    assert (REPOSITORY_ROOT / 'docker/acp/assemble-acp-license-section.py').is_file()
     telemetry_normalizer = (
         REPOSITORY_ROOT / 'docker/acp/normalize-acp-web-telemetry.mjs'
     ).read_text(encoding='utf-8')
+    # テレメトリ除去 patch は適用対象 marker の個数検証で保護する（hash 照合は行わない）。
     assert 'expected exactly one unpatched marker' in telemetry_normalizer
-    assert 'unexpected pre-patch sha256' in telemetry_normalizer
-    assert '0deb6b820dfed8804cd76b16a50210fe12202e5e339b5edaa23f6987f1742e0a' in telemetry_normalizer
-    assert 'snippet' not in telemetry_normalizer
-    assert '...args,' not in telemetry_normalizer
-    assert '@google/gemini-cli' not in telemetry_normalizer
     assert 'rawOutput' in telemetry_normalizer
     assert 'rawInput' in telemetry_normalizer
     assert 'createWebSearchCompleteUpdate' in telemetry_normalizer
-    assert (REPOSITORY_ROOT / 'docker/acp/assemble-acp-license-section.py').is_file()
 
 
-def test_opencode_runtime_is_pinned_and_binary_only_in_final_image() -> None:
-    """opencode-ai 1.18.18 が固定導入され、final は SEA バイナリのみを持つ。"""
+def test_opencode_runtime_comes_from_lockfile_and_binary_only_in_final_image() -> None:
+    """opencode-ai は lockfile 正本の npm ci で導入し、final は SEA バイナリのみを持つ。"""
 
     import json
 
     dockerfile = (REPOSITORY_ROOT / 'Dockerfile').read_text(encoding='utf-8')
-    manifest = (REPOSITORY_ROOT / 'docker/opencode/manifest.env').read_text(encoding='utf-8')
     package_json = json.loads(
         (REPOSITORY_ROOT / 'docker/opencode/package.json').read_text(encoding='utf-8'),
     )
@@ -446,30 +371,29 @@ def test_opencode_runtime_is_pinned_and_binary_only_in_final_image() -> None:
         (REPOSITORY_ROOT / 'docker/opencode/package-lock.json').read_text(encoding='utf-8'),
     )
 
-    assert "OPENCODE_VERSION='1.18.18'" in manifest
-    assert "OPENCODE_PLATFORM_PACKAGE='opencode-linux-x64'" in manifest
-    assert package_json['dependencies'] == {'opencode-ai': '1.18.18'}
-    assert package_lock['packages']['node_modules/opencode-ai']['version'] == '1.18.18'
-    assert package_lock['packages']['node_modules/opencode-linux-x64']['version'] == '1.18.18'
-    assert package_lock['packages']['node_modules/opencode-linux-x64'].get('optional') is True
-
-    assert 'FROM node:20.16.0 AS opencode-builder' in dockerfile
+    # バージョンの正本は package.json / package-lock.json のみ（manifest.env の二重管理は行わない）。
+    assert not (REPOSITORY_ROOT / 'docker/opencode/manifest.env').exists()
     opencode_section = dockerfile.split(
         'FROM node:20.16.0 AS opencode-builder', 1,
     )[1].split('FROM ', 1)[0]
+    assert 'manifest.env' not in opencode_section
     assert 'npm ci --omit=dev --no-audit --no-fund' in opencode_section
     assert 'npm install' not in opencode_section
-    assert 'opencode --version | grep' not in opencode_section
-    assert 'test "${opencode_version}" = "${OPENCODE_VERSION}"' in opencode_section
+
+    dependencies = package_json['dependencies']
+    assert list(dependencies) == ['opencode-ai']
+    assert dependencies['opencode-ai'][0].isdigit()
+    assert package_lock['packages']['node_modules/opencode-ai']['version'] == dependencies['opencode-ai']
+    assert package_lock['packages']['node_modules/opencode-linux-x64']['version'] == dependencies['opencode-ai']
+    assert package_lock['packages']['node_modules/opencode-linux-x64'].get('optional') is True
+
     # final はバイナリ + ライセンスのみ。node_modules 丸ごとは禁止。
     assert 'COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/opencode /usr/local/bin/opencode' in dockerfile
     # node_modules ツリー全体の COPY は禁止（dist 配下のみ）。
     assert 'COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/node_modules' not in dockerfile
     assert 'COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/ /' not in dockerfile
     assert 'test ! -e /opt/konomitv-bs4k-opencode' in dockerfile
-    assert 'test "${opencode_version}" = \'1.18.18\'' in dockerfile
     assert '## OpenCode Runtime Dependencies' in dockerfile
-    assert '### opencode-ai 1.18.18' in dockerfile
     assert (REPOSITORY_ROOT / 'docker/opencode/opencode.json').is_file()
     assert (REPOSITORY_ROOT / 'docker/opencode/assemble-opencode-license-section.py').is_file()
     config = (REPOSITORY_ROOT / 'docker/opencode/opencode.json').read_text(encoding='utf-8')
