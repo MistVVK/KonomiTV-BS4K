@@ -100,8 +100,11 @@ class LiveEncodingTask:
     ENCODER_TS_READ_TIMEOUT_ONAIR_AMD: ClassVar[int] = 10
     # ISDB-S3 は入力解析と最初の映像出力に時間がかかるため、ONAir 遷移後の初回出力を長めに待つ
     ENCODER_TS_READ_TIMEOUT_ONAIR_BS4K: ClassVar[int] = 15
-    # Opus と一般的なブラウザ再生経路が扱える最大チャンネル数。ISDB-S3 demuxer の入力段階で適用する
-    ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS: ClassVar[int] = 8
+    # Opus と一般的なブラウザ再生経路が扱える最大チャンネル数。ISDB-S3 demuxer の入力段階で適用する。
+    # Resolver が音声トラックを選択する際の除外条件と同じ値を共有する
+    ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS: ClassVar[int] = (
+        KonomiTVBS4KTLVServiceResolver.MAX_TRANSCODABLE_AUDIO_CHANNELS
+    )
 
     # 降雨対応放送 (低階層) が割り当てられている主サービスだけを明示する。
     # Channel Stream API は同じトランスポンダの全サービスを含むため、全局へ SID + 2 を適用すると

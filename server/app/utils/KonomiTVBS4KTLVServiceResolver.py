@@ -18,6 +18,9 @@ class KonomiTVBS4KTLVTrackSnapshot:
     context_id: int
     packet_id: int
     component_tag: int | None
+    # 音声トラックのチャンネル数 (映像・字幕トラックや helper が報告しない場合は None)。
+    # -max_audio_channels で破棄される音声を選択しないために使う
+    audio_channels: int | None
     kind: Literal['Video', 'Audio', 'Subtitle']
 
 
@@ -54,11 +57,17 @@ class KonomiTVBS4KTLVServiceResolver:
 
     HTTP 接続は持たず、呼び出し元から受け取った AsyncIterable[bytes] を読み込む。
     メタデータツール (KonomiTVBS4KTLVMetadata.elf) のストリーミング JSON 行を監視し、
-    目的の service_id と映像トラックが得られた時点で早期終了する。単体テストが可能な純粋な解析器。
+    目的の service_id と映像トラック、および SDT で観測した全 context の MPT が
+    得られた時点で早期終了する。単体テストが可能な純粋な解析器。
     """
 
     # プローブで読み取る生バイトの上限 (32 MiB)。8K でも SDT を確実に含みつつ、無制限読みを防ぐ。
     MAX_PROBE_BYTES: int = 32 * 1024 * 1024
+
+    # エンコード可能な音声チャンネル数の上限。LiveEncodingTask が demuxer へ渡す
+    # -max_audio_channels と同じ値で、これを超える音声トラックは FFmpeg が AVStream を
+    # 生成しないため、選択すると必須 map が matches no streams になりライブ開始が失敗する
+    MAX_TRANSCODABLE_AUDIO_CHANNELS: int = 8
 
     # HTTP response header の受信後、最初の TLV バイトが到着するまで待つ予算 (秒)。
     # Mirakurun のチューナー起動後に本体が遅れて届く場合も、従来経路と同じ 40 秒までは待機する。
@@ -154,11 +163,21 @@ class KonomiTVBS4KTLVServiceResolver:
                     component_tag = int(cast(Any, component_tag_raw))
                 except (TypeError, ValueError):
                     pass
+            # helper は非音声トラックへ audio_channels=null を出力する。bool は int の
+            # サブクラスのため誤って数値扱いしないよう先に除外する
+            audio_channels_raw = item.get('audio_channels')
+            audio_channels: int | None = None
+            if not isinstance(audio_channels_raw, bool):
+                try:
+                    audio_channels = int(cast(Any, audio_channels_raw))
+                except (TypeError, ValueError):
+                    pass
             track_snapshots.append(KonomiTVBS4KTLVTrackSnapshot(
                 track_id=parsed_track_id,
                 context_id=parsed_context_id,
                 packet_id=parsed_packet_id,
                 component_tag=component_tag,
+                audio_channels=audio_channels,
                 kind=kind_raw,
             ))
 
@@ -181,6 +200,7 @@ class KonomiTVBS4KTLVServiceResolver:
         context_id は TLV 上の文脈識別子であり、主サービスと降雨対応の低階層が同じ context に
         多重化される実放送がある。FFmpeg の map を一意にするため、component_tag と track_id の順で
         主トラックを決め、降雨対応は主トラックと異なる Video packet_id を選ぶ。
+        音声は -max_audio_channels を超えるチャンネル数のトラックを候補から除外する。
 
         Args:
             tracks (tuple[KonomiTVBS4KTLVTrackSnapshot, ...]): 最新 snapshot の全トラック。
@@ -207,9 +227,19 @@ class KonomiTVBS4KTLVServiceResolver:
             track for track in tracks
             if track.context_id == main_context_id and track.kind == 'Video'
         ]
+        # FFmpeg は -max_audio_channels を超える音声トラックの AVStream を生成しないため、
+        # 22.2ch (24ch) などの超過トラックを選ぶと必須 map が matches no streams になり
+        # ライブ開始が失敗する。チャンネル数が上限を超える音声は選択候補から除外する
         main_audio_tracks = [
             track for track in tracks
-            if track.context_id == main_context_id and track.kind == 'Audio'
+            if (
+                track.context_id == main_context_id and
+                track.kind == 'Audio' and
+                (
+                    track.audio_channels is None or
+                    track.audio_channels <= KonomiTVBS4KTLVServiceResolver.MAX_TRANSCODABLE_AUDIO_CHANNELS
+                )
+            )
         ]
         main_video_track = min(main_video_tracks, key=trackSortKey, default=None)
         main_audio_track = min(main_audio_tracks, key=trackSortKey, default=None)
@@ -342,6 +372,7 @@ class KonomiTVBS4KTLVServiceResolver:
         Returns:
             KonomiTVBS4KTLVServiceResolution:
                 主・降雨対応 context、FFmpeg map 用の packet_id、降雨対応 Video の送出状態、
+                packet_id が他 context と衝突する場合に負の map で除外する context_id 一覧、
                 先頭付加用の raw データ。
         """
 
@@ -430,7 +461,14 @@ class KonomiTVBS4KTLVServiceResolver:
             # 降雨対応 SID は need_rain_fallback のときだけ待つ。
             if main_context_id is None or main_video_packet_id is None or main_audio_packet_id is None:
                 return False
-            return (need_rain_fallback is False) or (is_rain_fallback_broadcasting is not None)
+            if (need_rain_fallback is True) and (is_rain_fallback_broadcasting is None):
+                return False
+            # packet_id map の衝突除外は解決時点の全トラックから計算するため、SDT で観測した
+            # 全 context の MPT が揃うまで終了を待つ。揃う前に終えると、後から到着する context の
+            # 同 packet_id トラックを除外できず、FFmpeg の probe 中に複数ストリームへ map され得る。
+            # SDT に現れない context の MPT は待てないため、その場合は期限打ち切り時の
+            # 部分集合で除外を計算する (従来と同じ挙動へ退化するだけで悪化はしない)
+            return received_mpt_contexts.issuperset(set(observed_service_contexts.values()))
 
         iterator = stream.__aiter__()
         try:
