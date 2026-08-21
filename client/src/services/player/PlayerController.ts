@@ -2160,9 +2160,25 @@ class PlayerController {
                 const player = this.player;
                 if (player.quality === null) return;
                 const api_quality = PlayerUtils.extractVideoAPIQualityFromDPlayer(player);
-                const source_url = new URL(player.quality.url);
-                const query = source_url.searchParams.toString();
-                await APIClient.put(`${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/keep-alive?${query}`);
+                const source_url = player.quality.url;
+                const query = new URL(source_url).searchParams.toString();
+                const response = await APIClient.put(`${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/keep-alive?${query}`);
+
+                // タブ休止などで Server 側のセッションが期限切れになった場合は、新しい session ID で再作成する。
+                // 遅着した旧画質の応答から現在のプレイヤーを再起動しないよう、要求時の source も照合する。
+                if (
+                    response.type === 'error' &&
+                    response.status === 422 &&
+                    response.data.detail === 'Session does not exist' &&
+                    this.player === player &&
+                    player.quality?.url === source_url &&
+                    this.isInitializationCurrent(initialization_generation, playback_target_key)
+                ) {
+                    player_store.event_emitter.emit('PlayerRestartRequired', {
+                        message: '録画再生セッションの有効期限が切れたため、プレイヤーを再起動しました。',
+                        is_error_message: false,
+                    });
+                }
             }, 5 * 1000);
         }
 
