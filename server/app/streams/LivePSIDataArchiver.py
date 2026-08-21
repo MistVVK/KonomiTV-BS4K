@@ -77,7 +77,7 @@ class LivePSIDataArchiver:
             # 特定サービスのみを選択して出力するフィルタを有効にする
             ## 有効にすると、特定のストリームのみ PID を固定して出力される
             ## 視聴対象のチャンネルのサービス ID を指定する
-            '-n ', str(self.service_id),
+            '-n', str(self.service_id),
             # PCR (Program Clock Reference) を基準に一定間隔でアーカイブデータを出力する
             # 1秒間隔でアーカイブデータを出力する
             '-i', '1',
