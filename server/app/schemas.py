@@ -20,7 +20,22 @@ from tortoise.contrib.pydantic import PydanticModel
 from typing_extensions import TypedDict
 
 from app.metadata.RecordedPlaybackIndex import RECORDED_PLAYBACK_INDEX_VERSION
+from app.utils.HostPath import ToHostPath
 from app.utils.TSInformation import TerrestrialRegion
+
+
+def SerializeHostPath(path: str) -> str:
+    """
+    内部処理用の runtime path を API へ公開するホスト絶対パスへ変換する。
+
+    Args:
+        path (str): KonomiTV-BS4K 内部で利用している実アクセス用パス。
+
+    Returns:
+        str: 外部へ公開できるホスト絶対パス。
+    """
+
+    return str(ToHostPath(path))
 
 
 def SerializeRecordedEpisodeNumber(episode_number: Decimal) -> str:
@@ -218,7 +233,8 @@ class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け
     id: int = -1  # メタデータ取得時は ID が定まらないため -1 を設定
     status: Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed', 'Deleting', 'DeleteFailed']
-    file_path: str
+    # 内部では再生・解析・削除に必要な runtime path を保ち、JSON 境界でだけホスト表現へ戻す。
+    file_path: Annotated[str, PlainSerializer(SerializeHostPath, return_type=str, when_used='json')]
     file_hash: str
     file_size: int
     file_created_at: datetime
