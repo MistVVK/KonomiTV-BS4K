@@ -312,9 +312,14 @@ class RecordedPlaybackBackend:
             return []
         devices: list[str] = []
         for device_path in sorted(Path('/sys/class/drm').glob('renderD*/device')):
+            # コンテナの sysfs にはホストの全 render node が見えるため、vendor 一致だけで選ぶと
+            # Compose で割り当てていない node を選び得る。/dev/dri に実在する node だけを候補にする
+            render_node = Path(f'/dev/dri/{device_path.parent.name}')
+            if render_node.exists() is False:
+                continue
             try:
                 if device_path.joinpath('vendor').read_text().strip().lower() == vendor_id:
-                    devices.append(f'/dev/dri/{device_path.parent.name}')
+                    devices.append(str(render_node))
             except OSError:
                 continue
         return devices
@@ -329,12 +334,17 @@ class RecordedPlaybackBackend:
 
         devices: list[RecordedRenderDevice] = []
         for device_path in sorted(Path('/sys/class/drm').glob('renderD*/device')):
+            # コンテナの sysfs にはホストの全 render node が見えるため、/dev/dri に実在しない
+            # (Compose で割り当てていない) node を設定画面の候補へ表示しない
+            render_node = Path(f'/dev/dri/{device_path.parent.name}')
+            if render_node.exists() is False:
+                continue
             try:
                 vendor_id = device_path.joinpath('vendor').read_text().strip().lower()
             except OSError:
                 continue
             devices.append(RecordedRenderDevice(
-                path = f'/dev/dri/{device_path.parent.name}',
+                path = str(render_node),
                 vendor_id = vendor_id,
                 vendor_name = cls._VENDOR_NAMES.get(vendor_id, 'Unknown'),
             ))
