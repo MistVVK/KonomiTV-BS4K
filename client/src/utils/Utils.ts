@@ -26,8 +26,8 @@ export default class Utils {
     // Worker からも参照できるように self.location を使う
     static readonly api_base_url = (() => {
         if (import.meta.env.DEV === true) {
-            // デバッグ時はポートを 7000 に強制する
-            return `${self.location.protocol}//${self.location.hostname}:7000/api`;
+            // デバッグ時は Development サーバーのポートを使う
+            return `${self.location.protocol}//${self.location.hostname}:7100/api`;
         } else {
             // ビルド後は同じポートを使う
             return `${self.location.protocol}//${self.location.host}/api`;
