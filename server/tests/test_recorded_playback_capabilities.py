@@ -32,6 +32,7 @@ def _reset_recorded_playback_probe_state(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_result', None)
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_individual_results', {})
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_individual_failure_timestamps', {})
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_signature', None)
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_signature_generation', 0)
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_inflight_tasks', {})

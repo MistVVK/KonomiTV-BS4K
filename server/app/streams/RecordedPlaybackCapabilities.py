@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
@@ -542,6 +543,7 @@ class RecordedPlaybackCapabilityProbe:
 
     _result: ClassVar[list[RecordedPlaybackCapability] | None] = None
     _individual_results: ClassVar[dict[RecordedPlaybackCapabilityKey, RecordedPlaybackCapability]] = {}
+    _individual_failure_timestamps: ClassVar[dict[RecordedPlaybackCapabilityKey, float]] = {}
     _signature: ClassVar[str | None] = None
     _signature_generation: ClassVar[int] = 0
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
@@ -562,6 +564,13 @@ class RecordedPlaybackCapabilityProbe:
     _probe_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
     _probe_version: ClassVar[int] = 5
     _probe_timeout_seconds: ClassVar[float] = 20.0
+    _negative_probe_ttl_seconds: ClassVar[float] = 5.0
+    _transient_failure_reasons: ClassVar[frozenset[RecordedPlaybackCapabilityReason]] = frozenset({
+        'DeviceUnavailable',
+        'DeviceInitializationFailed',
+        'EncodeFailed',
+        'ProbeFailed',
+    })
 
     @classmethod
     async def getCapabilities(cls) -> list[RecordedPlaybackCapability]:
@@ -575,6 +584,7 @@ class RecordedPlaybackCapabilityProbe:
             signature = await cls.__getSignature()
             async with cls._lock:
                 generation = cls.__resetCacheForSignature(signature)
+                cls.__discardExpiredNegativeResults()
                 if cls._result is not None:
                     return cls._result
                 task = cls._matrix_inflight_tasks.get(generation)
@@ -619,6 +629,7 @@ class RecordedPlaybackCapabilityProbe:
             signature = await cls.__getSignature()
             async with cls._lock:
                 generation = cls.__resetCacheForSignature(signature)
+                cls.__discardExpiredNegativeResults()
                 cached = cls._individual_results.get(key)
                 if cached is not None:
                     return cached
@@ -662,9 +673,28 @@ class RecordedPlaybackCapabilityProbe:
         cls._signature_generation += 1
         cls._result = None
         cls._individual_results.clear()
+        cls._individual_failure_timestamps.clear()
         cls._selected_devices.clear()
         cls._signature = signature
         return cls._signature_generation
+
+    @classmethod
+    def __discardExpiredNegativeResults(cls) -> None:
+        """一時的な負結果だけをTTL経過後に破棄し、次回要求で再probe可能にする。"""
+
+        now = time.monotonic()
+        expired_keys = [
+            key
+            for key, failure_timestamp in cls._individual_failure_timestamps.items()
+            if now - failure_timestamp >= cls._negative_probe_ttl_seconds
+        ]
+        for key in expired_keys:
+            cls._individual_results.pop(key, None)
+            cls._individual_failure_timestamps.pop(key, None)
+            cls._selected_devices.pop(key, None)
+            # 基礎能力の負結果を含む全行列も同時に失効させ、再構築時に成功cacheだけを再利用する。
+            if len(key) == 3:
+                cls._result = None
 
     @classmethod
     def getSelectedDevice(
@@ -723,7 +753,20 @@ class RecordedPlaybackCapabilityProbe:
             async with cls._lock:
                 latest_generation = cls.__resetCacheForSignature(latest_signature)
                 if latest_generation == generation and latest_signature == signature:
-                    cls._result = result
+                    cls.__discardExpiredNegativeResults()
+                    # 行列構築中に初期の負結果がTTL切れした場合、その古い一覧を再び全行列cacheへ戻さない。
+                    is_current_result = all(
+                        cls._individual_results.get((
+                            capability.encoder,
+                            capability.codec,
+                            capability.bit_depth,
+                        )) is capability
+                        for capability in result
+                    )
+                    if is_current_result is True:
+                        cls._result = result
+                    else:
+                        result = None
             return result
         finally:
             async with cls._lock:
@@ -806,7 +849,11 @@ class RecordedPlaybackCapabilityProbe:
             async with cls._lock:
                 latest_generation = cls.__resetCacheForSignature(latest_signature)
                 if latest_generation == generation and latest_signature == signature:
-                    cls._individual_results.setdefault(key, capability)
+                    cached = cls._individual_results.setdefault(key, capability)
+                    if cached.available is False and cached.reason_code in cls._transient_failure_reasons:
+                        cls._individual_failure_timestamps.setdefault(key, time.monotonic())
+                    else:
+                        cls._individual_failure_timestamps.pop(key, None)
                     if context.selected_device is not None:
                         cls._selected_devices.setdefault(key, context.selected_device)
             return outcome
