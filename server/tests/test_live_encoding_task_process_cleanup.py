@@ -840,7 +840,11 @@ class TestTLVStreamProbeCleanup:
         live_stream.getStatus = lambda: status
         live_stream.disconnectAll = lambda: setattr(live_stream, 'disconnected', live_stream.disconnected + 1)
         # TLV プローブ完了時に Standby 監視基準をリセットする LiveStream 側の実装をスタブ化する。
-        live_stream.refreshStreamDataWrittenAt = lambda: None
+        # プローブ完了時に必ず呼ばれる修正経路 (296cea45) 自体を検証できるよう、呼出回数を保持する
+        live_stream.refresh_stream_data_written_at_count = 0
+        def RefreshStreamDataWrittenAt() -> None:
+            live_stream.refresh_stream_data_written_at_count += 1
+        live_stream.refreshStreamDataWrittenAt = RefreshStreamDataWrittenAt
         task.live_stream = live_stream
 
         async def AcquireTuner(channel_type: str, base_url: str | None = None) -> bool:
@@ -1116,6 +1120,8 @@ class TestTLVStreamProbeCleanup:
         assert response.closed is True
         assert live_stream.disconnected >= 1
         assert live_stream.current_status.status == 'Offline'
+        # プローブが失敗した経路では Standby 監視基準をリセットしない。
+        assert live_stream.refresh_stream_data_written_at_count == 0
 
     @pytest.mark.parametrize(
         ('service_id', 'expected_rain_service_id'),
@@ -1197,6 +1203,8 @@ class TestTLVStreamProbeCleanup:
         assert result[8] == ()
         assert live_stream.is_rain_fallback is (expected_rain_service_id is not None)
         assert live_stream.current_status.status == 'Standby'
+        # プローブ完了時に Standby 監視基準時刻がリセットされる (プローブ時間を無出力と誤認させない)。
+        assert live_stream.refresh_stream_data_written_at_count == 1
         assert live_stream.current_status.detail == (
             '降雨対応放送を使用してエンコードを開始しています…'
             if expected_rain_service_id is not None
@@ -1248,3 +1256,4 @@ class TestTLVStreamProbeCleanup:
         assert live_stream.is_rain_fallback is False
         assert live_stream.is_rain_fallback_broadcasting is False
         assert live_stream.current_status.detail == 'エンコードを開始しています…'
+        assert live_stream.refresh_stream_data_written_at_count == 1
