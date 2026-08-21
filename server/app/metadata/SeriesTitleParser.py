@@ -8,7 +8,7 @@ from typing import Literal
 from app.schemas import Genre
 
 
-SERIES_TITLE_PARSER_VERSION = '3'
+SERIES_TITLE_PARSER_VERSION = '4'
 
 
 # ARIB の番組属性表示は作品名ではないため除去する。ただし、括弧そのものを一律で消すと
@@ -162,7 +162,6 @@ def _findQuotedSegment(value: str) -> tuple[int, int, str] | None:
                 stack.pop()
                 if len(stack) == 0:
                     return start, index + 1, value[start + 1:index]
-        return None
     return None
 
 
