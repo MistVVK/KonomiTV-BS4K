@@ -598,7 +598,11 @@ class _ServerSettingsGeneral(BaseModel):
         # バリデーションをスキップする場合はここで終了
         if type(info.context) is dict and info.context.get('bypass_validation') is True:
             return encoder
-        return cls._validate_encoder_value(encoder)
+        # konomitv_bs4k_encoder_render_device は encoder より前に定義されているため、
+        # 先行フィールドの検証済み値を info.data から取得できる。起動時検査も実行経路と
+        # 同じ固定 render node で行い、別 GPU の probe 成功で設定を誤って受理しないようにする
+        pinned_render_device = info.data.get('konomitv_bs4k_encoder_render_device')
+        return cls._validate_encoder_value(encoder, pinned_render_device)
 
 class _ServerSettingsServer(BaseModel):
     https_mode: Literal['akebi', 'certificate', 'reverse_proxy'] = 'akebi'
