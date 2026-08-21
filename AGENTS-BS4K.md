@@ -36,9 +36,9 @@ Docker Linux オンリーとする。
 | 条件 | ファイル |
 |------|---------|
 | リポジトリ内のディレクトリ構成を把握する必要がある作業 | `docs_AGENTS/directory-structure.md` |
-| Development コンテナのビルド・再作成・再起動、Dockerfile の変更 | `docs_AGENTS/docker-development.md` |
+| Development コンテナのビルド・再作成・再起動・停止・削除、volume や状態ディレクトリの操作、Dockerfile の変更 | `docs_AGENTS/docker-development.md` |
 | イメージのビルド設定 (CUDA / NONFREE) や再配布に関わる作業 | `docs_AGENTS/build.md` |
-| コミットの作成・ステージング・ブランチ操作・upstream からの取り込み | `docs_AGENTS/git.md` |
+| コミットの作成・ステージング・ブランチ操作・upstream からの取り込み、どのブランチで作業すべきかの判断 | `docs_AGENTS/git.md` |
 | 新機能の命名・製品名表記・バージョン情報に関わる作業 | `docs_AGENTS/naming.md` |
 | 互換 API に関わる変更、本線の大きな変更 | `docs_AGENTS/compatibility-api.md` |
 | 設計上の却下判断が確定したとき | `docs_AGENTS/rejected-proposals.md` に記録（skill: `record-rejected-proposal`） |
