@@ -47,7 +47,7 @@ export function stageLabel(stage: string | null): string {
 
 const useAnalysisTasksStore = defineStore('analysisTasks', {
     state: () => ({
-        analysisOverview: {active: [], active_children: [], recent: []} as IAnalysisTaskOverview,
+        analysisOverview: {active: [], active_children: []} as IAnalysisTaskOverview,
     }),
     getters: {
         activeTaskGroups(state): IActiveAnalysisTaskGroup[] {

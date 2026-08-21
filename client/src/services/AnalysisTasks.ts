@@ -36,7 +36,6 @@ export interface IAnalysisTaskExecution {
 export interface IAnalysisTaskOverview {
     active: IAnalysisTaskExecution[];
     active_children: IAnalysisTaskExecution[];
-    recent: IAnalysisTaskExecution[];
 }
 
 export interface IAnalysisTaskList {

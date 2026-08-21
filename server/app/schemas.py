@@ -490,7 +490,6 @@ class AnalysisTaskExecution(BaseModel):
 class AnalysisTaskOverview(BaseModel):
     active: list[AnalysisTaskExecution]
     active_children: list[AnalysisTaskExecution]
-    recent: list[AnalysisTaskExecution]
 
 class AnalysisTaskList(BaseModel):
     total: int

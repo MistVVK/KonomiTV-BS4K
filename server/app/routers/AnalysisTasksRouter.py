@@ -58,9 +58,10 @@ def SerializeExecution(execution: AnalysisTaskExecution, is_admin: bool) -> sche
 
 @router.get('/overview', response_model=schemas.AnalysisTaskOverview)
 async def AnalysisTaskOverviewAPI() -> schemas.AnalysisTaskOverview:
-    """ナビゲーションとマイページ用に実行中処理と直近5件を返す。
+    """ナビゲーションとマイページ用に実行中処理を返す。
 
     実行中表示はサーバー全体の状態であり、一括解析の開始 API と同様に未ログインでも閲覧できる。
+    完了済みの履歴はタイトルやファイルパスを含むため未認証へは返さず、認証済みの履歴 API に任せる。
     エラー本文は管理者向け履歴 API に任せ、ここからは出さない。
     """
 
@@ -86,20 +87,10 @@ async def AnalysisTaskOverviewAPI() -> schemas.AnalysisTaskOverview:
             .order_by('created_at')
             .limit(500)
         )
-    recent = (
-        await AnalysisTaskExecution.filter(
-            parent_id=None,
-            status__in=['Succeeded', 'Failed', 'Interrupted', 'Skipped'],
-        )
-        .prefetch_related('recorded_video')
-        .order_by('-completed_at')
-        .limit(5)
-    )
     # 未ログイン公開のため、管理者専用のエラー本文は常に伏せる。
     return schemas.AnalysisTaskOverview(
         active=[SerializeExecution(item, False) for item in active],
         active_children=[SerializeExecution(item, False) for item in active_children],
-        recent=[SerializeExecution(item, False) for item in recent],
     )
 
 
