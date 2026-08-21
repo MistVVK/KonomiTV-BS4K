@@ -389,6 +389,8 @@ class LiveEncodingTask:
         tlv_main_video_packet_id: int | None = None,
         tlv_main_audio_packet_id: int | None = None,
         tlv_rain_video_packet_id: int | None = None,
+        tlv_normal_excluded_context_ids: tuple[int, ...] = (),
+        tlv_rain_excluded_context_ids: tuple[int, ...] = (),
     ) -> list[str]:
         """現 main の単一 pipeline 向け FFmpeg 8 HW エンコードオプションを返す。"""
 
@@ -507,6 +509,15 @@ class LiveEncodingTask:
                 '-map', f'0:i:{tlv_main_audio_packet_id}',
                 '-map', '0:d?',
             ]
+            # -map 0:i:<packet_id> は context を跨いでマッチするため、別 context が同じ packet_id を
+            # 使うと複数ストリームが map される。FFmpeg は正の map を先に評価するため、後ろに付けた
+            # 負の metadata map で衝突元 context の誤マッチ分 (他サービスの data を含む) だけを除外する
+            excluded_context_ids = (
+                tlv_rain_excluded_context_ids
+                if tlv_rain_video_packet_id is not None else tlv_normal_excluded_context_ids
+            )
+            for excluded_context_id in excluded_context_ids:
+                options += ['-map', f'-0:m:context_id:{excluded_context_id}']
         else:
             options += [
                 '-map', '0:v:0',
@@ -729,6 +740,8 @@ class LiveEncodingTask:
         tlv_main_video_packet_id: int | None = None,
         tlv_main_audio_packet_id: int | None = None,
         tlv_rain_video_packet_id: int | None = None,
+        tlv_normal_excluded_context_ids: tuple[int, ...] = (),
+        tlv_rain_excluded_context_ids: tuple[int, ...] = (),
     ) -> list[str]:
         """
         FFmpeg に渡すオプションを組み立てる
@@ -742,6 +755,8 @@ class LiveEncodingTask:
             tlv_main_video_packet_id (int | None): 主映像トラックの packet_id
             tlv_main_audio_packet_id (int | None): 主音声トラックの packet_id
             tlv_rain_video_packet_id (int | None): 選択中の降雨対応映像トラックの packet_id
+            tlv_normal_excluded_context_ids (tuple[int, ...]): 通常モードで負の map により除外する context_id 一覧
+            tlv_rain_excluded_context_ids (tuple[int, ...]): 降雨対応モードで負の map により除外する context_id 一覧
 
         Returns:
             list[str]: FFmpeg に渡すオプションが連なる配列
@@ -915,9 +930,20 @@ class LiveEncodingTask:
                 tlv_rain_video_packet_id
                 if tlv_rain_video_packet_id is not None else tlv_main_video_packet_id
             )
+            # -map 0:i:<packet_id> は context を跨いでマッチするため、別 context が同じ packet_id を
+            # 使うと複数ストリームが map される。FFmpeg は正の map を先に評価するため、後ろに付けた
+            # 負の metadata map で衝突元 context の誤マッチ分 (他サービスの data を含む) だけを除外する
+            excluded_context_ids = (
+                tlv_rain_excluded_context_ids
+                if tlv_rain_video_packet_id is not None else tlv_normal_excluded_context_ids
+            )
+            exclusion_maps = ''.join(
+                f' -map -0:m:context_id:{excluded_context_id}'
+                for excluded_context_id in excluded_context_ids
+            )
             options.append(
                 f'-map 0:i:{video_packet_id} '
-                f'-map 0:i:{tlv_main_audio_packet_id} -map 0:d?'
+                f'-map 0:i:{tlv_main_audio_packet_id} -map 0:d?{exclusion_maps}'
             )
         else:
             options.append('-map 0:v:0 -map 0:a? -map 0:d?')
@@ -1368,6 +1394,8 @@ class LiveEncodingTask:
         int,
         int,
         int | None,
+        tuple[int, ...],
+        tuple[int, ...],
     ] | None:
         """
         TLV のチューナー確保・ストリーム接続・先頭バッファのプローブを行う。
@@ -1384,9 +1412,11 @@ class LiveEncodingTask:
 
         Returns:
             tuple[aiohttp.ClientSession, aiohttp.ClientResponse, KonomiTVBS4KTLVStreamPump,
-                KonomiTVBS4KTLVRainFallbackMonitor | None, int, int, int | None] | None:
+                KonomiTVBS4KTLVRainFallbackMonitor | None, int, int, int | None,
+                tuple[int, ...], tuple[int, ...]] | None:
                 (session, response, 入力 pump, 降雨対応monitor, 主映像 packet_id, 主音声 packet_id,
-                選択する降雨対応映像 packet_id)。
+                選択する降雨対応映像 packet_id, 通常モードの除外 context_id 一覧,
+                降雨対応モードの除外 context_id 一覧)。
                 接続に失敗した場合は None (Offline 遷移と disconnectAll はこの中で済ませる)。
         """
 
@@ -1556,6 +1586,8 @@ class LiveEncodingTask:
                 resolution.main_video_packet_id,
                 resolution.main_audio_packet_id,
                 selected_rain_video_packet_id,
+                resolution.normal_excluded_context_ids,
+                resolution.rain_excluded_context_ids,
             )
 
         except asyncio.CancelledError:
@@ -1719,11 +1751,14 @@ class LiveEncodingTask:
         response: aiohttp.ClientResponse | None = None
         session: aiohttp.ClientSession | None = None
         ## TLV のプローブ後から HTTP 入力を読み続けるpump、降雨対応monitor、FFmpeg map用の packet_id
+        ## と、packet_id が他 context と衝突した場合に負の map で除外する context_id 一覧 (通常/降雨対応)
         tlv_stream_pump: KonomiTVBS4KTLVStreamPump | None = None
         tlv_rain_fallback_monitor: KonomiTVBS4KTLVRainFallbackMonitor | None = None
         tlv_main_video_packet_id: int | None = None
         tlv_main_audio_packet_id: int | None = None
         tlv_rain_video_packet_id: int | None = None
+        tlv_normal_excluded_context_ids: tuple[int, ...] = ()
+        tlv_rain_excluded_context_ids: tuple[int, ...] = ()
 
         # 3つのバックエンド構成のどれで動作しているかと、実際に選局するサービスを明示する
         ## 接続 URL は認証情報やローカル環境情報を含む可能性があるためログへ出力しない。
@@ -1904,6 +1939,8 @@ class LiveEncodingTask:
                 tlv_main_video_packet_id,
                 tlv_main_audio_packet_id,
                 tlv_rain_video_packet_id,
+                tlv_normal_excluded_context_ids,
+                tlv_rain_excluded_context_ids,
             ) = tlv_stream_result
 
         try:
@@ -1979,6 +2016,8 @@ class LiveEncodingTask:
                         tlv_main_video_packet_id,
                         tlv_main_audio_packet_id,
                         tlv_rain_video_packet_id,
+                        tlv_normal_excluded_context_ids,
+                        tlv_rain_excluded_context_ids,
                     )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 Commands:\n'
@@ -2017,6 +2056,8 @@ class LiveEncodingTask:
                     tlv_main_video_packet_id,
                     tlv_main_audio_packet_id,
                     tlv_rain_video_packet_id,
+                    tlv_normal_excluded_context_ids,
+                    tlv_rain_excluded_context_ids,
                 )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 ({ENCODER_TYPE}) Commands:\n'

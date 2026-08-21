@@ -41,6 +41,11 @@ class KonomiTVBS4KTLVServiceResolution:
     main_audio_packet_id: int | None
     rain_video_packet_id: int | None
     is_rain_fallback_broadcasting: bool | None
+    # -map 0:i:<packet_id> は context を跨いでマッチするため、他 context の同 packet_id トラックを
+    # 負の map (-map -0:m:context_id:N) で除外する context_id 一覧。通常モードと降雨対応モードで
+    # map する packet_id が異なるため、除外一覧もモードごとに保持する
+    normal_excluded_context_ids: tuple[int, ...]
+    rain_excluded_context_ids: tuple[int, ...]
     head_buffer: bytes
 
 
@@ -237,6 +242,83 @@ class KonomiTVBS4KTLVServiceResolver:
         )
 
 
+    @staticmethod
+    def computeExcludedContextIds(
+        tracks: tuple[KonomiTVBS4KTLVTrackSnapshot, ...],
+        main_context_id: int | None,
+        rain_context_id: int | None,
+        main_video_packet_id: int | None,
+        main_audio_packet_id: int | None,
+        rain_video_packet_id: int | None,
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """
+        FFmpeg の packet_id map へ混入する他 context のストリームを負の map で除外する context_id 一覧を返す。
+
+        -map 0:i:<packet_id> は context_id を見ず全ストリームへマッチするため、別 context が同じ
+        packet_id を使うと複数ストリームが map されてしまう。正の map の後ろに
+        -map -0:m:context_id:<context_id> を付け、衝突元 context の誤マッチ分だけを除外する。
+        通常モードと降雨対応モードで map する packet_id が異なるため、除外一覧はモードごとに分ける。
+
+        Args:
+            tracks (tuple[KonomiTVBS4KTLVTrackSnapshot, ...]): プローブで観測した最新の全トラック。
+            main_context_id (int | None): 主サービスの context_id。
+            rain_context_id (int | None): 降雨対応サービスの context_id。
+            main_video_packet_id (int | None): 主映像トラックの packet_id。
+            main_audio_packet_id (int | None): 主音声トラックの packet_id。
+            rain_video_packet_id (int | None): 降雨対応映像トラックの packet_id (未選出なら None)。
+
+        Returns:
+            tuple[tuple[int, ...], tuple[int, ...]]:
+                (通常モードの除外 context_id 一覧, 降雨対応モードの除外 context_id 一覧)。
+
+        Raises:
+            RuntimeError: 必要な context 内で packet_id が重複し、負の map では除外できない場合。
+        """
+
+        if main_context_id is None or main_video_packet_id is None or main_audio_packet_id is None:
+            return ((), ())
+
+        def validateNoUnresolvableCollision(mapped_packet_ids: set[int], needed_context_ids: set[int]) -> None:
+            # map 対象と同じ packet_id を持つトラックが必要な context 内に複数あると、負の map では
+            # 主音声や data ストリームまで消えてしまうため除外できない。MMT では同一 package 内の
+            # packet_id は一意なので、通常は選択したトラック自身の1件だけがヒットする
+            for packet_id in mapped_packet_ids:
+                same_packet_tracks = [
+                    track for track in tracks
+                    if track.packet_id == packet_id and track.context_id in needed_context_ids
+                ]
+                if len(same_packet_tracks) > 1:
+                    raise RuntimeError(
+                        f'MMT/TLV packet ID {packet_id} is shared by multiple tracks in required contexts. '
+                        f'[tracks: {[(track.context_id, track.track_id) for track in same_packet_tracks]}]'
+                    )
+
+        def collidingContexts(mapped_packet_ids: set[int], needed_context_ids: set[int]) -> tuple[int, ...]:
+            # map 対象と同じ packet_id を持つトラックのうち、必要な context 以外にあるものの context を集める。
+            # 除外する context は安定した map 文字列になるようソートして返す
+            return tuple(sorted({
+                track.context_id for track in tracks
+                if track.packet_id in mapped_packet_ids and track.context_id not in needed_context_ids
+            }))
+
+        # 通常モードでは主映像・主音声を map し、必要な context は主 context のみ。
+        # このモードでは低階層 context を除外しても再生に影響しない
+        normal_mapped = {main_video_packet_id, main_audio_packet_id}
+        validateNoUnresolvableCollision(normal_mapped, {main_context_id})
+        normal_excluded = collidingContexts(normal_mapped, {main_context_id})
+
+        # 降雨対応モードでは低階層映像と主音声を map し、主・低階層の両 context が必要。
+        # このモードで衝突する context は除外できないため、除外不能な衝突として失敗させる
+        rain_excluded: tuple[int, ...] = ()
+        if rain_video_packet_id is not None and rain_context_id is not None:
+            rain_mapped = {rain_video_packet_id, main_audio_packet_id}
+            rain_needed = {main_context_id, rain_context_id}
+            validateNoUnresolvableCollision(rain_mapped, rain_needed)
+            rain_excluded = collidingContexts(rain_mapped, rain_needed)
+
+        return (normal_excluded, rain_excluded)
+
+
     @classmethod
     async def resolve(
         cls,
@@ -275,7 +357,7 @@ class KonomiTVBS4KTLVServiceResolver:
         stdout = process.stdout
         if stdin is None or stdout is None:
             await cls.__terminate(process, log_prefix)
-            return KonomiTVBS4KTLVServiceResolution(None, None, None, None, None, None, b'')
+            return KonomiTVBS4KTLVServiceResolution(None, None, None, None, None, None, (), (), b'')
 
         head_buffer = bytearray()
         observed_service_contexts: dict[int, int] = {}
@@ -389,6 +471,36 @@ class KonomiTVBS4KTLVServiceResolver:
             # 早期終了・失敗・キャンセルのいずれでも metadata 子プロセスを必ず終了する。
             await cls.__terminate(process, log_prefix, stdin, reader_task)
 
+        # -map 0:i:<packet_id> は context を跨いでマッチするため、他 context の同 packet_id
+        # トラックを負の map で除外する context 一覧をモードごとに計算する。
+        # 除外不能な衝突 (必要な context 内での重複) はここで RuntimeError として失敗させる
+        (
+            normal_excluded_context_ids,
+            rain_excluded_context_ids,
+        ) = cls.computeExcludedContextIds(
+            latest_tracks,
+            main_context_id,
+            rain_context_id,
+            main_video_packet_id,
+            main_audio_packet_id,
+            rain_video_packet_id,
+        )
+        # 実放送で context 間の packet_id 衝突が起きたか後から調べられるよう、衝突時は観測した
+        # 全トラックの context_id / packet_id / 種別を併せて記録する。
+        # logging.debug は Config 依存のため、Config 非依存の解析器としての単体テスト可能性を
+        # 維持するこのクラスでは使わず、衝突時の info ログに診断情報を集約する
+        if normal_excluded_context_ids or rain_excluded_context_ids:
+            logging.info(
+                f'{log_prefix} Colliding TLV contexts will be excluded from the FFmpeg map. '
+                f'[normal: {normal_excluded_context_ids}, rain: {rain_excluded_context_ids}, '
+                'tracks: [' +
+                ', '.join(
+                    f'(context: {track.context_id}, packet: {track.packet_id}, kind: {track.kind})'
+                    for track in latest_tracks
+                ) +
+                ']]'
+            )
+
         return KonomiTVBS4KTLVServiceResolution(
             main_context_id=main_context_id,
             rain_context_id=rain_context_id,
@@ -396,6 +508,8 @@ class KonomiTVBS4KTLVServiceResolver:
             main_audio_packet_id=main_audio_packet_id,
             rain_video_packet_id=rain_video_packet_id,
             is_rain_fallback_broadcasting=is_rain_fallback_broadcasting,
+            normal_excluded_context_ids=normal_excluded_context_ids,
+            rain_excluded_context_ids=rain_excluded_context_ids,
             head_buffer=bytes(head_buffer),
         )
 

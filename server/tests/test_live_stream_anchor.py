@@ -522,6 +522,62 @@ def test_mmt_tlv_packet_id_map_fixes_video_and_audio(
             task.buildFFmpeg8HardwareOptions('240p', 'QSV', 'BS4K', False, is_mmt_tlv=True, **missing)
 
 
+def test_mmt_tlv_packet_id_map_excludes_colliding_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """packet_id が他 context と衝突する場合、正の map の後ろに負の metadata map で衝突元を除外する。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=False,
+        video_codec='avc',
+        audio_codec='aac',
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    # 通常モード: 主映像・主音声の packet_id と衝突する context 9 を除外する。
+    # FFmpeg は正の map を先に評価するため、除外 map は必ず正の map の後ろに並ぶ必要がある。
+    software_options = task.buildFFmpegOptions(
+        '240p', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_normal_excluded_context_ids=(9,),
+        tlv_rain_excluded_context_ids=(8,),
+    )
+    hardware_options = task.buildFFmpeg8HardwareOptions(
+        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_normal_excluded_context_ids=(9,),
+        tlv_rain_excluded_context_ids=(8,),
+    )
+
+    for options in (software_options, hardware_options):
+        assert '-0:m:context_id:9' in options
+        assert '-0:m:context_id:8' not in options
+        # 除外 map は全ての正の map より後ろに配置される。
+        assert options.index('-0:m:context_id:9') > options.index('0:d?')
+
+    # 降雨対応モード: 降雨モード用の除外一覧 (context 8) を使う。
+    software_options = task.buildFFmpegOptions(
+        '240p', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_rain_video_packet_id=0xF201,
+        tlv_normal_excluded_context_ids=(9,),
+        tlv_rain_excluded_context_ids=(8,),
+    )
+    hardware_options = task.buildFFmpeg8HardwareOptions(
+        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_rain_video_packet_id=0xF201,
+        tlv_normal_excluded_context_ids=(9,),
+        tlv_rain_excluded_context_ids=(8,),
+    )
+
+    for options in (software_options, hardware_options):
+        assert '-0:m:context_id:8' in options
+        assert '-0:m:context_id:9' not in options
+        assert options.index('-0:m:context_id:8') > options.index('0:d?')
+
+
 def test_ffmpeg8_software_advanced_codec_uses_single_map_and_vbv(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

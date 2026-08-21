@@ -234,6 +234,66 @@ def test_select_track_packet_ids_prefers_component_tag_and_picks_distinct_rain_v
     assert select(tracks, None, 1) == (None, None, None)
 
 
+def test_compute_excluded_context_ids_excludes_colliding_contexts() -> None:
+    """他 context が map 対象と同じ packet_id を使う場合、その context だけをモードごとの除外一覧へ入れる。"""
+
+    compute = KonomiTVBS4KTLVServiceResolver.computeExcludedContextIds
+    # context 9 の別サービスが主と同じ packet_id を使い回している想定。
+    tracks = (
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=0, context_id=1, packet_id=62208, component_tag=0, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=1, context_id=1, packet_id=62224, component_tag=16, kind='Audio',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=2, context_id=2, packet_id=62240, component_tag=0, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=3, context_id=9, packet_id=62208, component_tag=0, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=4, context_id=9, packet_id=62224, component_tag=16, kind='Audio',
+        ),
+    )
+
+    # 通常モードでは主 context 以外が不要なため、衝突元の context 9 を除外できる。
+    assert compute(tracks, 1, 2, 62208, 62224, 62240) == ((9,), (9,))
+    # 低階層を選ばない場合は降雨モードの除外一覧を返さない。
+    assert compute(tracks, 1, 2, 62208, 62224, None) == ((9,), ())
+    # 衝突がなければ両モードとも除外しない。
+    assert compute(tracks[:3], 1, 2, 62208, 62224, 62240) == ((), ())
+    # 主 context 未解決では除外一覧を計算しない。
+    assert compute(tracks, None, 2, None, None, None) == ((), ())
+
+
+def test_compute_excluded_context_ids_rejects_unresolvable_collision() -> None:
+    """必要な context 内での packet_id 重複は負の map で除外できないため失敗させる。"""
+
+    compute = KonomiTVBS4KTLVServiceResolver.computeExcludedContextIds
+    # 主音声と同じ packet_id のトラックが低階層 context にあると、降雨モードでは
+    # 主・低階層の両 context が必要になり除外できない。
+    tracks = (
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=0, context_id=1, packet_id=62208, component_tag=0, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=1, context_id=1, packet_id=62224, component_tag=16, kind='Audio',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=2, context_id=2, packet_id=62240, component_tag=0, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=3, context_id=2, packet_id=62224, component_tag=16, kind='Audio',
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        compute(tracks, 1, 2, 62208, 62224, 62240)
+    # 低階層を選ばなければ低階層 context は不要なため、同じ入力でも除外で処理できる。
+    assert compute(tracks, 1, 2, 62208, 62224, None) == ((2,), ())
+
+
 class _FakeTLVMetadataStreamWriter:
     """resolve のテスト用に、書き込んだ chunk を保持するだけの fake StreamWriter。"""
 
@@ -336,6 +396,9 @@ def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
         assert resolution.main_audio_packet_id == 62224
         assert resolution.rain_video_packet_id == 62240
         assert resolution.is_rain_fallback_broadcasting is True
+        # 全 context で packet_id が一意なため、除外する context はない。
+        assert resolution.normal_excluded_context_ids == ()
+        assert resolution.rain_excluded_context_ids == ()
         # 早期終了により 2 番目の chunk は読まれない。先頭バッファは 1 番目だけ。
         assert resolution.head_buffer == b'head-chunk'
         assert process.stdin.closed is True
