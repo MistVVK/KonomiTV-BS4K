@@ -1009,7 +1009,34 @@ class RecordedFMP4Stream:
         return max(codec_strings, key=GetLevel)
 
     @staticmethod
-    def extractCodecString(init_segment: bytes) -> str | None:
+    def __extractVideoCodecConfiguration(init_segment: bytes) -> tuple[bytes, bytes] | None:
+        """init内の映像codec configuration boxを取得する。
+
+        Args:
+            init_segment: FFmpegが生成したfMP4初期化セグメント。
+
+        Returns:
+            box typeとpayload。対応boxがない場合はNone。
+        """
+
+        # configuration boxはVisualSampleEntry内にネストされるため、親固有の固定長領域に
+        # 依存せず、size/typeヘッダーがinit範囲内に収まる候補だけを採用する。
+        for box_type in (b'avcC', b'hvcC', b'vpcC', b'av1C'):
+            search_offset = 0
+            while True:
+                type_offset = init_segment.find(box_type, search_offset)
+                if type_offset < 0:
+                    break
+                if type_offset >= 4:
+                    size = int.from_bytes(init_segment[type_offset - 4:type_offset], 'big')
+                    box_start = type_offset - 4
+                    if size >= 8 and box_start + size <= len(init_segment):
+                        return box_type, init_segment[type_offset + 4:box_start + size]
+                search_offset = type_offset + 1
+        return None
+
+    @classmethod
+    def extractCodecString(cls, init_segment: bytes) -> str | None:
         """init内のcodec configuration boxからRFC 6381 codec stringを取得する。
 
         Args:
@@ -1019,56 +1046,40 @@ class RecordedFMP4Stream:
             AVC / HEVC / VP9 / AV1のcodec string。対応boxがない場合はNone。
         """
 
-        # configuration boxはVisualSampleEntry内にネストされるため、親固有の固定長領域に
-        # 依存せず、size/typeヘッダーがinit範囲内に収まる候補だけを採用する。
-        def FindBox(box_type: bytes) -> bytes | None:
-            """検証済みboxのpayloadを返す。"""
-
-            search_offset = 0
-            while True:
-                type_offset = init_segment.find(box_type, search_offset)
-                if type_offset < 0:
-                    return None
-                if type_offset >= 4:
-                    size = int.from_bytes(init_segment[type_offset - 4:type_offset], 'big')
-                    box_start = type_offset - 4
-                    if size >= 8 and box_start + size <= len(init_segment):
-                        return init_segment[type_offset + 4:box_start + size]
-                search_offset = type_offset + 1
+        configuration = cls.__extractVideoCodecConfiguration(init_segment)
+        if configuration is None:
+            return None
+        box_type, payload = configuration
 
         # AVCDecoderConfigurationRecordのprofile/compatibility/levelは先頭4 byteにある。
-        avcc = FindBox(b'avcC')
-        if avcc is not None and len(avcc) >= 4 and avcc[0] == 1:
-            return f'avc1.{avcc[1]:02X}{avcc[2]:02X}{avcc[3]:02X}'
+        if box_type == b'avcC' and len(payload) >= 4 and payload[0] == 1:
+            return f'avc1.{payload[1]:02X}{payload[2]:02X}{payload[3]:02X}'
 
         # HEVCのcompatibility flagsはcodec stringでbit順が逆になる。constraint bytesは
         # 末尾のゼロだけを省略し、実際のprofile/tier/levelとともに表現する。
-        hvcc = FindBox(b'hvcC')
-        if hvcc is not None and len(hvcc) >= 13 and hvcc[0] == 1:
-            profile_space = ('', 'A', 'B', 'C')[hvcc[1] >> 6]
-            profile_idc = hvcc[1] & 0x1F
-            compatibility = int.from_bytes(hvcc[2:6], 'big')
+        if box_type == b'hvcC' and len(payload) >= 13 and payload[0] == 1:
+            profile_space = ('', 'A', 'B', 'C')[payload[1] >> 6]
+            profile_idc = payload[1] & 0x1F
+            compatibility = int.from_bytes(payload[2:6], 'big')
             compatibility = int(f'{compatibility:032b}'[::-1], 2)
-            tier = 'H' if hvcc[1] & 0x20 else 'L'
-            constraints = hvcc[6:12].rstrip(b'\x00')
+            tier = 'H' if payload[1] & 0x20 else 'L'
+            constraints = payload[6:12].rstrip(b'\x00')
             constraint_suffix = ''.join(f'.{value:X}' for value in constraints)
             return (
                 f'hvc1.{profile_space}{profile_idc}.{compatibility:X}.'
-                f'{tier}{hvcc[12]}{constraint_suffix}'
+                f'{tier}{payload[12]}{constraint_suffix}'
             )
 
         # VPCodecConfigurationBoxのFullBoxヘッダー直後にある実profile/level/bit depthを使う。
-        vpcc = FindBox(b'vpcC')
-        if vpcc is not None and len(vpcc) >= 7:
-            return f'vp09.{vpcc[4]:02}.{vpcc[5]:02}.{vpcc[6] >> 4:02}'
+        if box_type == b'vpcC' and len(payload) >= 7:
+            return f'vp09.{payload[4]:02}.{payload[5]:02}.{payload[6] >> 4:02}'
 
         # AV1CodecConfigurationRecordから実profile/level/tier/bit depthを使う。
-        av1c = FindBox(b'av1C')
-        if av1c is not None and len(av1c) >= 3 and av1c[0] & 0x80:
-            profile = av1c[1] >> 5
-            level = av1c[1] & 0x1F
-            tier = 'H' if av1c[2] & 0x80 else 'M'
-            bit_depth = 10 if av1c[2] & 0x40 else 8
+        if box_type == b'av1C' and len(payload) >= 3 and payload[0] & 0x80:
+            profile = payload[1] >> 5
+            level = payload[1] & 0x1F
+            tier = 'H' if payload[2] & 0x80 else 'M'
+            bit_depth = 10 if payload[2] & 0x40 else 8
             return f'av01.{profile}.{level:02}{tier}.{bit_depth:02}'
 
         return None
@@ -1785,38 +1796,39 @@ class RecordedFMP4Stream:
 
         segment_path = self.__buildCachePath(segment, is_init=False)
         init_path = self.__buildCachePath(segment, is_init=True)
+        generation_lock = await self.__acquire(init_path)
         segment_lock = await self.__acquire(segment_path)
-        await self.__acquire(init_path)
         segment_data: bytes | None = None
         did_encode_current_segment = False
-        async with segment_lock:
-            # fragmentだけが残り、対になるinitが遅延削除済みなら再生成する。
-            # 片方だけをキャッシュヒットとして返すと、呼び出し元は再生不能なfragmentを受け取ってしまう。
-            if segment_path.is_file() and init_path.is_file():
-                self._completed_sequences.add(sequence)
-                generation_segments = [
-                    item for item in self._segments if item.generation == segment.generation
-                ]
-                if all(self.__buildCachePath(item, is_init=False).is_file() for item in generation_segments):
-                    self.__updateOfflineWorkProgress(
-                        self.__getOfflineVideoWorkKey(segment.generation),
-                        1.0,
-                    )
-                segment_data = await asyncio.to_thread(segment_path.read_bytes)
-            elif is_offline_continuous is False:
-                # 現在必要なfragmentは実績のある単発経路で確定し、後続先読みの成否へ依存させない。
-                await self.__encodeSegment(segment, init_path, segment_path)
-                # fragment 単体を成功扱いすると、直後の MAP 取得だけが失敗するため、
-                # 通常再生でも対応する init と fragment の両方が揃った場合だけ返す。
-                if segment_path.is_file() is False or init_path.is_file() is False:
-                    return None
-                self._completed_sequences.add(sequence)
-                self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
-                segment_data = await asyncio.to_thread(segment_path.read_bytes)
-                did_encode_current_segment = True
-            else:
-                # 連続encodeの書き込みは別taskがpath lockを取るため、待ちに入る前に解放する。
-                await self.__startOfflineVideoEncodeIfNeeded(segment)
+
+        # init pathをgeneration owner lockとして先に取得し、同じgenerationの別segmentが
+        # 独立FFmpegで生成したinitを後勝ちで置換しないようencodeと公開を直列化する。
+        async with generation_lock:
+            async with segment_lock:
+                # fragmentだけが残り、対になるinitが遅延削除済みなら再生成する。
+                # 片方だけをキャッシュヒットとして返すと、呼び出し元は再生不能なfragmentを受け取ってしまう。
+                if segment_path.is_file() and init_path.is_file():
+                    self._completed_sequences.add(sequence)
+                    generation_segments = [
+                        item for item in self._segments if item.generation == segment.generation
+                    ]
+                    if all(self.__buildCachePath(item, is_init=False).is_file() for item in generation_segments):
+                        self.__updateOfflineWorkProgress(
+                            self.__getOfflineVideoWorkKey(segment.generation),
+                            1.0,
+                        )
+                    segment_data = await asyncio.to_thread(segment_path.read_bytes)
+                elif is_offline_continuous is False:
+                    # 現在必要なfragmentは実績のある単発経路で確定し、後続先読みの成否へ依存させない。
+                    await self.__encodeSegment(segment, init_path, segment_path)
+                    # fragment 単体を成功扱いすると、直後の MAP 取得だけが失敗するため、
+                    # 通常再生でも対応する init と fragment の両方が揃った場合だけ返す。
+                    if segment_path.is_file() is False or init_path.is_file() is False:
+                        return None
+                    self._completed_sequences.add(sequence)
+                    self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
+                    segment_data = await asyncio.to_thread(segment_path.read_bytes)
+                    did_encode_current_segment = True
 
         if is_offline_continuous is False:
             # キャッシュヒットや先読みtaskの成果からは次を起動しない。直接単発生成した要求だけを
@@ -1830,21 +1842,25 @@ class RecordedFMP4Stream:
             return segment_data
 
         if is_offline_continuous is True:
+            # generation ownerを解放してから共有連続encodeを開始し、そのtask自身に所有させる。
+            # 待機側がlockを保持すると、連続encodeのatomic公開と相互待ちになる。
+            await self.__startOfflineVideoEncodeIfNeeded(segment)
             await self.__waitOfflineVideoSegment(segment)
-            async with segment_lock:
-                # 連続生成 task の完了通知後にも、必ず init / fragment の組を再検査する。
-                # fragment だけが残った状態を返すと getVideoInitSegment() が直後に None となり、
-                # 長時間生成の全成果を破棄してしまうため、不完全な組は個別生成で復旧する。
-                if segment_path.is_file() and init_path.is_file():
+            async with generation_lock:
+                async with segment_lock:
+                    # 連続生成 task の完了通知後にも、必ず init / fragment の組を再検査する。
+                    # fragment だけが残った状態を返すと getVideoInitSegment() が直後に None となり、
+                    # 長時間生成の全成果を破棄してしまうため、不完全な組は個別生成で復旧する。
+                    if segment_path.is_file() and init_path.is_file():
+                        self._completed_sequences.add(sequence)
+                        return await asyncio.to_thread(segment_path.read_bytes)
+                    # 連続encodeがこのsequenceを確定できなければ、現行の1本encodeへ落とす。
+                    await self.__encodeSegment(segment, init_path, segment_path)
+                    if segment_path.is_file() is False or init_path.is_file() is False:
+                        return None
                     self._completed_sequences.add(sequence)
+                    self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
                     return await asyncio.to_thread(segment_path.read_bytes)
-                # 連続encodeがこのsequenceを確定できなければ、現行の1本encodeへ落とす。
-                await self.__encodeSegment(segment, init_path, segment_path)
-                if segment_path.is_file() is False or init_path.is_file() is False:
-                    return None
-                self._completed_sequences.add(sequence)
-                self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
-                return await asyncio.to_thread(segment_path.read_bytes)
         return None
 
     @staticmethod
@@ -2443,7 +2459,24 @@ class RecordedFMP4Stream:
             segment.start_time,
             segment.sequence,
         )
-        if init_path.is_file() is False:
+        # 呼び出し元はinit pathのgeneration owner lockをencode開始前から保持する。
+        # その所有中にinitの決定とmedia公開を完結し、存在確認とatomic replaceのTOCTOUを防ぐ。
+        if init_path.is_file():
+            cached_init_data = await asyncio.to_thread(init_path.read_bytes)
+            if (
+                self.__extractVideoCodecConfiguration(cached_init_data) !=
+                self.__extractVideoCodecConfiguration(init_data)
+            ):
+                # 既存initと復号条件が違うmediaを公開すると、先行segmentか現在segmentの
+                # どちらかが必ず壊れる。既存generationを保持し、不整合fragmentだけを失敗させる。
+                logging.error(
+                    '[RecordedFMP4Stream] Refusing to publish a video fragment with a mismatched '
+                    'codec configuration. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'generation: {segment.generation}, sequence: {segment.sequence}]'
+                )
+                return False
+        else:
             await RecordedFMP4CacheManager.writeAtomic(init_path, init_data)
         await RecordedFMP4CacheManager.writeAtomic(segment_path, media_data)
         return True
@@ -2711,6 +2744,27 @@ class RecordedFMP4Stream:
         purpose: Literal['Offline', 'PlaybackPrefetch'],
     ) -> bool:
         """連続区間を1回の映像encodeへまとめ、完成後にHLS fragmentへ分割する。
+
+        Args:
+            segments: 同じ映像generationの連続セグメント。
+            purpose: オフライン保存または通常再生の短い先読み。
+
+        Returns:
+            全fragmentを書けた場合はTrue。
+        """
+
+        # 単発encodeと同じinit pathをgeneration owner lockにし、先読み・オフライン生成も
+        # 同一generationの別要求と並列にinitを決定しない。全fragment公開まで所有を維持する。
+        generation_lock = await self.__acquire(self.__buildCachePath(segments[0], is_init=True))
+        async with generation_lock:
+            return await self.__encodeContinuousVideoRunAsOwner(segments, purpose)
+
+    async def __encodeContinuousVideoRunAsOwner(
+        self,
+        segments: list[RecordedFMP4Segment],
+        purpose: Literal['Offline', 'PlaybackPrefetch'],
+    ) -> bool:
+        """generation ownerとして連続映像encodeと全fragment公開を行う。
 
         Args:
             segments: 同じ映像generationの連続セグメント。
