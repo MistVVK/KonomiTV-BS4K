@@ -514,10 +514,14 @@ class _ServerSettingsGeneral(BaseModel):
         if encoder != 'FFmpeg':
             device: str | None = None
             if encoder_type in ('QSV', 'AMF'):
-                # 固定指定がある場合はその render node だけを検査対象にする。
-                # render node の番号は再起動で入れ替わり得るため、見えていない固定指定は
-                # 起動不能にせず自動選択へ退避する（実行経路側の resolveRenderDevices と同じ契約）
-                if pinned_render_device is not None and Path(pinned_render_device).exists():
+                # 固定指定が存在し encoder の GPU vendor と一致する場合はその render node だけを検査対象にする。
+                # render node の番号は再起動で入れ替わり得るため、見えていない固定指定や vendor が
+                # 合わない固定指定は起動不能にせず自動選択へ退避する（実行経路側の resolveRenderDevices と同じ契約）
+                if (
+                    pinned_render_device is not None and
+                    Path(pinned_render_device).exists() and
+                    RecordedPlaybackBackend.matchesEncoderVendor(pinned_render_device, encoder_type) is True
+                ):
                     device = pinned_render_device
                 else:
                     devices = RecordedPlaybackBackend.discoverRenderDevices(encoder_type)

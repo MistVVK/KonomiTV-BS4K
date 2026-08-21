@@ -421,7 +421,7 @@ class LiveEncodingTask:
             )
             if selected_device is None:
                 # legacy URLはtargeted probeを通らないため、その場合だけ同vendorの先頭候補へ退避する。
-                # 固定指定がある場合は resolveRenderDevices がその render node だけを返す。
+                # 固定指定がある場合は resolveRenderDevices がその render node だけを返す (vendor 不一致時は自動選択へ退避)。
                 render_devices = RecordedPlaybackBackend.resolveRenderDevices(encoder_type)
                 if len(render_devices) == 0:
                     raise RuntimeError(f'No compatible render device was found for {encoder_type}.')

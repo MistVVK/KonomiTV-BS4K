@@ -1095,7 +1095,7 @@ class CMAnalysisOrchestrator:
         selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(encoder)
         if selected_device is not None:
             return f'vaapi:{selected_device}'
-        # 固定指定がある場合は resolveRenderDevices がその render node だけを返す
+        # 固定指定がある場合は resolveRenderDevices がその render node だけを返す (vendor 不一致時は自動選択へ退避)
         devices = RecordedPlaybackBackend.resolveRenderDevices(encoder)
         return f'vaapi:{devices[0]}' if devices else None
 

@@ -104,6 +104,8 @@ class RecordedPlaybackBackend:
     }
     # 見えていない固定指定の警告は能力 probe の行列で繰り返し呼ばれても 1 プロセス 1 回に留める
     _STALE_RENDER_DEVICE_WARNED: ClassVar[bool] = False
+    # vendor 不一致の固定指定の警告も同様に 1 プロセス 1 回に留める
+    _VENDOR_MISMATCH_RENDER_DEVICE_WARNED: ClassVar[bool] = False
     # sysfs の vendor ID から設定画面へ表示する vendor 名への対応
     _VENDOR_NAMES: ClassVar[dict[str, str]] = {
         '0x8086': 'Intel',
@@ -261,6 +263,39 @@ class RecordedPlaybackBackend:
             return cls._AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY
         return cls._AMD_MESA_VAAPI_DRIVER_DIRECTORY
 
+    @staticmethod
+    def getRenderDeviceVendorId(device_path: str) -> str | None:
+        """render node の sysfs vendor ID を返す。
+
+        Args:
+            device_path: /dev/dri/renderD* のパス。
+
+        Returns:
+            小文字の vendor ID (例: 0x8086)。sysfs から読めない場合は None。
+        """
+
+        try:
+            return Path(f'/sys/class/drm/{Path(device_path).name}/device/vendor').read_text().strip().lower()
+        except OSError:
+            return None
+
+    @classmethod
+    def matchesEncoderVendor(cls, device_path: str, encoder: RecordedPlaybackEncoder) -> bool:
+        """render node の vendor が encoder の対象 GPU vendor と一致するかを返す。
+
+        Args:
+            device_path: /dev/dri/renderD* のパス。
+            encoder: 公開設定上のエンコーダー名。
+
+        Returns:
+            vendor が一致する場合 True。QSV / AMF 以外の encoder や vendor が読めない場合は False。
+        """
+
+        expected_vendor_id = cls._VENDOR_IDS.get(encoder)
+        if expected_vendor_id is None:
+            return False
+        return cls.getRenderDeviceVendorId(device_path) == expected_vendor_id
+
     @classmethod
     def discoverRenderDevices(cls, encoder: RecordedPlaybackEncoder) -> list[str]:
         """vendor IDが一致するDRM render nodeを列挙する。
@@ -323,8 +358,18 @@ class RecordedPlaybackBackend:
             # render node の番号は再起動やハードウェア構成で入れ替わるため、見えていない固定指定は
             # 起動不能にせず警告へ留め、自動選択へ退避する
             if Path(pinned_device).exists():
-                return [pinned_device]
-            if cls._STALE_RENDER_DEVICE_WARNED is False:
+                # 固定指定は encoder / encoder_bs4k で共通の1つしかないため、vendor が合わない
+                # encoder へ無条件に適用すると Intel / AMD 併用環境で必ず片方の初期化が失敗する。
+                # vendor が一致する encoder にだけ固定を適用し、合わない側は自動選択へ退避する
+                if cls.matchesEncoderVendor(pinned_device, encoder) is True:
+                    return [pinned_device]
+                if cls._VENDOR_MISMATCH_RENDER_DEVICE_WARNED is False:
+                    cls._VENDOR_MISMATCH_RENDER_DEVICE_WARNED = True
+                    logging.warning(
+                        f'Configured render device does not match the {encoder} GPU vendor, '
+                        f'falling back to auto selection. [device: {pinned_device}]'
+                    )
+            elif cls._STALE_RENDER_DEVICE_WARNED is False:
                 cls._STALE_RENDER_DEVICE_WARNED = True
                 logging.warning(
                     'Configured render device is not available, falling back to auto selection. '
@@ -817,7 +862,7 @@ class RecordedPlaybackCapabilityProbe:
         devices: list[str | None] = [None]
         if encoder in ('QSV', 'AMF'):
             # 同vendorでも世代ごとにcodec能力が異なるため、各能力キーで全deviceを試す。
-            # 固定指定がある場合は resolveRenderDevices がその render node だけを返す。
+            # 固定指定がある場合は resolveRenderDevices がその render node だけを返す (vendor 不一致時は自動選択へ退避)。
             devices = [*RecordedPlaybackBackend.resolveRenderDevices(encoder)]
             if len(devices) == 0:
                 return RecordedPlaybackCapability(encoder, codec, bit_depth, False, spec.profile, 'DeviceUnavailable')

@@ -2190,7 +2190,7 @@ class RecordedFMP4Stream:
         device: str | None = None
         if backend in ('QSV', 'AMF'):
             # 能力検査で同じ画質を完走したrender nodeを使い、低解像度だけ成功する旧GPUへ戻さない。
-            # 固定指定がある場合は resolveRenderDevices がその render node だけを返す。
+            # 固定指定がある場合は resolveRenderDevices がその render node だけを返す (vendor 不一致時は自動選択へ退避)。
             selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(
                 backend,
                 codec,
