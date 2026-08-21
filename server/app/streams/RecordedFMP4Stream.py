@@ -1715,9 +1715,8 @@ class RecordedFMP4Stream:
         # master生成や同じ映像世代の先行segmentですでにinitを確定済みなら、音声だけの
         # DISCONTINUITY境界に対応するsegment encodeを待たず即座に返す。
         if init_path.is_file():
-            # initは数KB以下の小さな固定データなので、executorへ渡すより同期読込の方が
-            # 境界MAPへの応答を確実に即時化できる。
-            return init_path.read_bytes()
+            # init自体が小さくても、NAS上ではopen/read待ちがevent loop全体を止め得る。
+            return await asyncio.to_thread(init_path.read_bytes)
         # MAP取得は通常のmedia要求ではない。ここから先読みを開始すると、プレイリストにある
         # 別generationのMAP取得同士が先読みをキャンセルし合うため、現在segmentだけを生成する。
         async with self.__activeOperation():
