@@ -18,6 +18,7 @@ import aiohttp
 import anyio
 import httpx
 from aiofiles.threadpool.text import AsyncTextIOWrapper
+from aiohttp import ServerDisconnectedError
 from biim.mpeg2ts import ts
 
 from app import logging
@@ -1468,7 +1469,7 @@ class LiveEncodingTask:
                         sock_read=mirakurun_stream_timeout,
                     ),
                 )
-            except (TimeoutError, aiohttp.ClientConnectorError):
+            except (TimeoutError, aiohttp.ClientConnectorError, ServerDisconnectedError):
                 # 番組名に「放送休止」などが入っていれば停波によるものとみなし、そうでないなら接続失敗とする
                 if self.isOffTheAir(channel, program_present):
                     self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-01M)')
@@ -1597,6 +1598,17 @@ class LiveEncodingTask:
             # 選局キャンセル: 接続だけ閉じて再送出する (状態遷移は LiveStream.connect 側に任せる)。
             await closeConnection()
             raise
+        except ServerDisconnectedError as ex:
+            # Mirakurun が HTTP 200 応答後にストリームを切断した場合は、チューナー側の受信障害として案内する。
+            logging.error(f'{self.live_stream.log_prefix} The MMT/TLV stream was disconnected by Mirakurun.', exc_info=ex)
+            await closeConnection()
+            self.live_stream.disconnectAll()
+            self.live_stream.setStatus(
+                'Offline',
+                'チューナーから受信データが送られなかったか、受信中に接続が切断されました。'
+                'チューナー側の状態を確認してください。(E-20T)',
+            )
+            return None
         except Exception as ex:
             # 予期せぬ失敗: 接続を閉じ、Offline へ遷移して次回 connect() で再試行できるようにする。
             # ここで Standby のまま例外終了すると、次回 connect() がタスクを起こせなくなる。
