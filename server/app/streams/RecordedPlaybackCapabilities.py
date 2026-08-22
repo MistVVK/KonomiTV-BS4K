@@ -99,19 +99,16 @@ class RecordedPlaybackBackend:
         'AMF': '0x1002',
     }
     # sysfs の vendor ID から設定画面へ表示する vendor 名への対応
+    # NVIDIA は QSV / AMF の利用対象外だが、render node が列挙された際の識別表示のために含める
     _VENDOR_NAMES: ClassVar[dict[str, str]] = {
         '0x8086': 'Intel',
         '0x1002': 'AMD',
+        '0x10de': 'NVIDIA',
     }
     # 見えていない固定指定の警告は能力 probe の行列で繰り返し呼ばれても 1 プロセス 1 回に留める
     _STALE_RENDER_DEVICE_WARNED: ClassVar[bool] = False
     # vendor 不一致の固定指定の警告も同様に 1 プロセス 1 回に留める
     _VENDOR_MISMATCH_RENDER_DEVICE_WARNED: ClassVar[bool] = False
-    # sysfs の vendor ID から設定画面へ表示する vendor 名への対応
-    _VENDOR_NAMES: ClassVar[dict[str, str]] = {
-        '0x8086': 'Intel',
-        '0x1002': 'AMD',
-    }
     _AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/opt/amdgpu/lib/x86_64-linux-gnu/dri')
     _AMD_MESA_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/usr/lib/x86_64-linux-gnu/dri')
 
