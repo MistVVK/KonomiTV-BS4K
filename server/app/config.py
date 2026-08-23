@@ -166,6 +166,7 @@ class ClientSettings(BaseModel):
     # tv_low_latency_mode_for_bs4k_cellular: 同期無効
     # tv_use_rain_fallback_for_bs4k: 同期無効
     # tv_use_rain_fallback_for_bs8k: 同期無効
+    konomitv_bs4k_hdr_output: Literal['Auto', 'HDR', 'SDR'] = 'Auto'
     # tv_24fps_mode: 同期無効
     # tv_24fps_mode_cellular: 同期無効
     # video_streaming_quality: 同期無効

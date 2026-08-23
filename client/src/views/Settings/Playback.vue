@@ -105,6 +105,17 @@
                     :model-value="selected_rain_fallback_bs8k" @update:model-value="updateRainFallbackBS8K">
                 </v-switch>
             </div>
+            <div v-if="is_bs4k === true" class="settings__item">
+                <div class="settings__item-heading">HDR 映像の出力</div>
+                <div class="settings__item-label">
+                    デコードできるが HDR 表示できない端末向けに、HLG / PQ を canvas で SDR へ変換します。<br>
+                    Auto は表示能力を見て選び、判定できないときは SDR 変換します。視聴中の一時変更は保存しません。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :items="hdr_output_options" :model-value="selected_hdr_output"
+                    @update:model-value="updateHdrOutput">
+                </v-select>
+            </div>
             <div v-if="is_bs4k === true" class="settings__item settings__item--sync-disabled">
                 <div class="settings__item-heading">24fpsモード</div>
                 <div class="settings__item-label">
@@ -172,6 +183,7 @@ import useSettingsStore, {
     getKonomiTVBS4KPlaybackAudioCodecSettingKey,
     getKonomiTVBS4KPlaybackStreamingQualitySettingKey,
     getKonomiTVBS4KPlaybackVideoCodecSettingKey,
+    type KonomiTVBS4KHdrOutput,
     type KonomiTVBS4KPlaybackAudioCodec,
     type KonomiTVBS4KPlaybackVideoCodec,
     LIVE_STREAMING_QUALITIES,
@@ -343,6 +355,15 @@ const updateRainFallbackBS4K = (value: boolean | null): void => {
 };
 const updateRainFallbackBS8K = (value: boolean | null): void => {
     patchSetting('tv_use_rain_fallback_for_bs8k', value === true);
+};
+const hdr_output_options = [
+    {title: 'Auto（表示能力に合わせる）', value: 'Auto'},
+    {title: 'HDR（素通し）', value: 'HDR'},
+    {title: 'SDR（変換する）', value: 'SDR'},
+];
+const selected_hdr_output = computed(() => settingsStore.settings.konomitv_bs4k_hdr_output);
+const updateHdrOutput = (value: KonomiTVBS4KHdrOutput): void => {
+    patchSetting('konomitv_bs4k_hdr_output', value);
 };
 
 onMounted(async () => {
