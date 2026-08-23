@@ -333,7 +333,9 @@ async def LiveStreamEventAPI(
                 elif (
                     previous_status.detail != status.detail or
                     previous_status.is_rain_fallback != status.is_rain_fallback or
-                    previous_status.is_rain_fallback_broadcasting != status.is_rain_fallback_broadcasting
+                    previous_status.is_rain_fallback_broadcasting != status.is_rain_fallback_broadcasting or
+                    previous_status.b60_video_transfer != status.b60_video_transfer or
+                    previous_status.mh_eit_hdr_hint != status.mh_eit_hdr_hint
                 ):
                     yield {
                         'event': 'detail_update',  # detail_update イベントを設定

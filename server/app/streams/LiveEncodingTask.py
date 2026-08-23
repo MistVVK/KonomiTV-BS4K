@@ -1539,16 +1539,16 @@ class LiveEncodingTask:
                 self.live_stream.setStatus('Offline', 'TLV 入力から主サービスの情報を解決できませんでした。設定を確認してください。(E-19T)')
                 return None
 
-            # 自動利用の可否とは独立して対象SIDの送出状態を継続監視する。
+            # 自動利用の可否とは独立して対象SIDの送出状態と番組色ヒントを継続監視する。
             # 起動時Resolverで確定済みの状態は引き継ぎ、同じ先頭バッファを再解析して後続MPTへ連続させる。
-            if rain_service_id is not None:
-                rain_fallback_monitor = KonomiTVBS4KTLVRainFallbackMonitor(
-                    channel.service_id,
-                    rain_service_id,
-                    self.live_stream.log_prefix,
-                    resolution.is_rain_fallback_broadcasting,
-                )
-                rain_fallback_monitor.start()
+            # 降雨対象外の局でも B60 / MH-EIT を見るため、helper は TLV ライブで常に起動する。
+            rain_fallback_monitor = KonomiTVBS4KTLVRainFallbackMonitor(
+                channel.service_id,
+                rain_service_id,
+                self.live_stream.log_prefix,
+                resolution.is_rain_fallback_broadcasting,
+            )
+            rain_fallback_monitor.start()
 
             # Resolver が止まった直後から HTTP 応答を読み続け、FFmpeg 起動中の Mirakurun 側滞留を防ぐ。
             # 以後 response.content を直接読むのはこの pump だけに限定する。
@@ -1699,6 +1699,8 @@ class LiveEncodingTask:
         # 現世代のmapと継続監視が確定するまで、前世代の降雨対応放送状態を表示しない。
         self.live_stream.is_rain_fallback = None
         self.live_stream.is_rain_fallback_broadcasting = None
+        self.live_stream.b60_video_transfer = None
+        self.live_stream.mh_eit_hdr_hint = None
 
         # まだ Standby になっていなければ、ステータスを Standby に設定
         # 基本はエンコードタスクの呼び出し元である self.live_stream.connect() の方で Standby に設定されるが、再起動の場合はそこを経由しないため必要
@@ -2740,6 +2742,8 @@ class LiveEncodingTask:
                     # 正常系の計画再起動で切り替える。Unknownでは古い状態を推測せず、再起動しない。
                     if tlv_rain_fallback_monitor is not None:
                         broadcasting = tlv_rain_fallback_monitor.is_rain_fallback_broadcasting
+                        self.live_stream.b60_video_transfer = tlv_rain_fallback_monitor.b60_video_transfer
+                        self.live_stream.mh_eit_hdr_hint = tlv_rain_fallback_monitor.mh_eit_hdr_hint
                         if self.updateRainFallbackBroadcastingState(broadcasting) is True:
                             is_planned_rain_fallback_restart = True
                             break

@@ -947,6 +947,10 @@ class LiveStreamStatus(BaseModel):
     is_rain_fallback: bool | None = None
     # 降雨対応サービスの完全MPTにVideoが存在するか。未判定・監視不能ならNone
     is_rain_fallback_broadcasting: bool | None = None
+    # B60 0x8010 video_transfer_characteristics (1-5)。未観測なら None
+    b60_video_transfer: int | None = None
+    # MH-EIT 現在番組の HDR アイコン。未観測なら None、番組はあるがアイコンなしなら False
+    mh_eit_hdr_hint: bool | None = None
 
 
 class LivePrepareLeaseRequest(BaseModel):

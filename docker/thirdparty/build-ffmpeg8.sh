@@ -55,6 +55,9 @@ clone-commit "${FFMPEG_LIBARIBTLV_REPOSITORY}" "${FFMPEG_LIBARIBTLV_COMMIT}" \
     "${ffmpeg_libaribtlv_source}" "${FFMPEG_LIBARIBTLV_COMMIT}"
 clone-commit "${LIBARIBTLV_REPOSITORY}" "${LIBARIBTLV_COMMIT}" \
     "${libaribtlv_source}" "refs/tags/${LIBARIBTLV_TAG}"
+libaribtlv_si_source="${SOURCE_ROOT}/libaribtlv-si"
+clone-commit "${LIBARIBTLV_REPOSITORY}" "${LIBARIBTLV_SI_COMMIT}" \
+    "${libaribtlv_si_source}" "${LIBARIBTLV_SI_COMMIT}"
 clone-commit "${NVCODEC_HEADERS_REPOSITORY}" "${NVCODEC_HEADERS_COMMIT}" "${nvcodec_source}" "refs/tags/${NVCODEC_HEADERS_TAG}"
 clone-commit "${AMF_REPOSITORY}" "${AMF_COMMIT}" "${amf_source}" "refs/tags/${AMF_TAG}"
 
@@ -104,24 +107,38 @@ export PKG_CONFIG_PATH="${SDK_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 export CFLAGS="-I${SDK_PREFIX}/include"
 
 # SI/EPG 抽出は libaribtlv の C++ callback を直接利用する小さな専用ツールに限定する。
+# FFmpeg 用 0.2.0 とは別に、B60 / MH-EIT 色ヒント API がある master を helper だけへリンクする。
+# 0.2.0 向け subtitle patch は master に当たらないため、FFmpeg 側へは持ち込まない。
+si_sdk_prefix="${SOURCE_ROOT}/libaribtlv-si-sdk"
+cmake -S "${libaribtlv_si_source}" -B "${SOURCE_ROOT}/libaribtlv-si-build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="${si_sdk_prefix}" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DBUILD_TESTING=OFF
+cmake --build "${SOURCE_ROOT}/libaribtlv-si-build" --parallel "$(nproc)"
+cmake --install "${SOURCE_ROOT}/libaribtlv-si-build"
+sed -i 's/^Libs: \(.*\)$/Libs: \1 -lz -lstdc++/' "${si_sdk_prefix}/lib/pkgconfig/libaribtlv.pc"
+
 metadata_output="${OUTPUT_ROOT}/KonomiTVBS4KTLVMetadata"
 mkdir -p "${metadata_output}"
 ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
     -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
     "${SCRIPT_DIR}/KonomiTVBS4KTLVMetadata.cpp" \
-    $(pkg-config --cflags --libs --static libaribtlv) \
+    $(PKG_CONFIG_PATH="${si_sdk_prefix}/lib/pkgconfig" pkg-config --cflags --libs --static libaribtlv) \
     -Wl,-z,relro,-z,now -pie \
     -o "${metadata_output}/KonomiTVBS4KTLVMetadata.elf"
 # production 実装を同じ翻訳単位へ取り込み、reset 境界の JSON と状態消去を直接検証する。
 ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
     -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
     "${SCRIPT_DIR}/KonomiTVBS4KTLVMetadataTest.cpp" \
-    $(pkg-config --cflags --libs --static libaribtlv) \
+    $(PKG_CONFIG_PATH="${si_sdk_prefix}/lib/pkgconfig" pkg-config --cflags --libs --static libaribtlv) \
     -Wl,-z,relro,-z,now -pie \
     -o /tmp/KonomiTVBS4KTLVMetadataTest.elf
 /tmp/KonomiTVBS4KTLVMetadataTest.elf
 rm /tmp/KonomiTVBS4KTLVMetadataTest.elf
-install -m 0644 "${libaribtlv_source}/LICENSE" "${metadata_output}/License-libaribtlv-MIT.txt"
+install -m 0644 "${libaribtlv_si_source}/LICENSE" "${metadata_output}/License-libaribtlv-MIT.txt"
 
 pushd "${ffmpeg_source}"
 ./configure \

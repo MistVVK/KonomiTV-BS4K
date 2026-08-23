@@ -237,6 +237,12 @@ class LiveStream:
             # 降雨対応SIDの完全MPTにVideoが現在存在するか。未監視・再同期中はNone。
             instance.is_rain_fallback_broadcasting = None
 
+            # 主サービス映像の B60 0x8010 値。未観測は None。
+            instance.b60_video_transfer = None
+
+            # 主サービスの MH-EIT 現在番組 HDR アイコン。未観測は None。
+            instance.mh_eit_hdr_hint = None
+
             # 生成したインスタンスを登録する
             cls.__instances[instance_key] = instance
 
@@ -283,6 +289,10 @@ class LiveStream:
         self._tuner_lock: asyncio.Lock
         self.is_rain_fallback: bool | None
         self.is_rain_fallback_broadcasting: bool | None
+        # 主サービス映像の B60 0x8010 値。LiveEncodingTask が helper から転記する。
+        self.b60_video_transfer: int | None
+        # 主サービスの MH-EIT 現在番組 HDR アイコン。LiveEncodingTask が helper から転記する。
+        self.mh_eit_hdr_hint: bool | None
 
 
     @property
@@ -700,6 +710,8 @@ class LiveStream:
             client_count = len(self._clients),  # ライブストリームに接続中のクライアント数
             is_rain_fallback = self.is_rain_fallback,  # 降雨対応放送 (1080p 低階層) を使っているかどうか
             is_rain_fallback_broadcasting = self.is_rain_fallback_broadcasting,  # 降雨対応放送が送出中かどうか
+            b60_video_transfer = self.b60_video_transfer,  # B60 0x8010 の transfer 値
+            mh_eit_hdr_hint = self.mh_eit_hdr_hint,  # MH-EIT 現在番組の HDR アイコン
         )
 
 
@@ -742,6 +754,8 @@ class LiveStream:
         if status == 'Offline':
             self.is_rain_fallback = None
             self.is_rain_fallback_broadcasting = None
+            self.b60_video_transfer = None
+            self.mh_eit_hdr_hint = None
 
         # ストリーム開始 (Offline or Restart → Standby) 時、started_at と stream_data_written_at を更新する
         # ここで更新しておかないと、いつまで経っても初期化時の古いタイムスタンプが使われてしまう

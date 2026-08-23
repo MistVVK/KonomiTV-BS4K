@@ -22,16 +22,33 @@ class KonomiTVBS4KTLVTrackSnapshot:
     # -max_audio_channels で破棄される音声を選択しないために使う
     audio_channels: int | None
     kind: Literal['Video', 'Audio', 'Subtitle']
+    # B60 0x8010 の video_transfer_characteristics。1-5。helper が報告しない場合は None。
+    video_transfer_characteristics: int | None = None
+    # B60 0x800A の HDR_WCG_idc。helper が報告しない場合は None。
+    hdr_wcg_idc: int | None = None
 
 
 @dataclass(frozen=True)
 class KonomiTVBS4KTLVMetadataSnapshot:
     """TLV metadata helper が通知したサービス・トラックのスナップショット。"""
 
-    snapshot_type: Literal['MPT', 'MHSDT'] | None
+    snapshot_type: Literal['MPT', 'MHSDT', 'MHEIT'] | None
     snapshot_context_id: int | None
     service_contexts: dict[int, int]
     tracks: tuple[KonomiTVBS4KTLVTrackSnapshot, ...]
+    program_hints: tuple[KonomiTVBS4KTLVProgramHint, ...]
+
+
+@dataclass(frozen=True)
+class KonomiTVBS4KTLVProgramHint:
+    """MH-EIT p/f が通知した番組単位の HDR ヒント。"""
+
+    context_id: int
+    service_id: int
+    event_id: int
+    table_id: int
+    section_number: int
+    hdr_programme_icon: bool
 
 
 @dataclass(frozen=True)
@@ -105,8 +122,8 @@ class KonomiTVBS4KTLVServiceResolver:
             return None
 
         snapshot_type_raw = payload.get('snapshot_type')
-        snapshot_type: Literal['MPT', 'MHSDT'] | None = None
-        if snapshot_type_raw == 'MPT' or snapshot_type_raw == 'MHSDT':
+        snapshot_type: Literal['MPT', 'MHSDT', 'MHEIT'] | None = None
+        if snapshot_type_raw in ('MPT', 'MHSDT', 'MHEIT'):
             snapshot_type = snapshot_type_raw
 
         snapshot_context_id_raw = payload.get('snapshot_context_id')
@@ -172,6 +189,20 @@ class KonomiTVBS4KTLVServiceResolver:
                     audio_channels = int(cast(Any, audio_channels_raw))
                 except (TypeError, ValueError):
                     pass
+            video_transfer_raw = item.get('video_transfer_characteristics')
+            video_transfer_characteristics: int | None = None
+            if not isinstance(video_transfer_raw, bool):
+                try:
+                    video_transfer_characteristics = int(cast(Any, video_transfer_raw))
+                except (TypeError, ValueError):
+                    pass
+            hdr_wcg_idc_raw = item.get('hdr_wcg_idc')
+            hdr_wcg_idc: int | None = None
+            if not isinstance(hdr_wcg_idc_raw, bool):
+                try:
+                    hdr_wcg_idc = int(cast(Any, hdr_wcg_idc_raw))
+                except (TypeError, ValueError):
+                    pass
             track_snapshots.append(KonomiTVBS4KTLVTrackSnapshot(
                 track_id=parsed_track_id,
                 context_id=parsed_context_id,
@@ -179,13 +210,42 @@ class KonomiTVBS4KTLVServiceResolver:
                 component_tag=component_tag,
                 audio_channels=audio_channels,
                 kind=kind_raw,
+                video_transfer_characteristics=video_transfer_characteristics,
+                hdr_wcg_idc=hdr_wcg_idc,
             ))
+
+        program_hints: list[KonomiTVBS4KTLVProgramHint] = []
+        program_hints_raw = payload.get('program_hints')
+        if isinstance(program_hints_raw, list):
+            for item in program_hints_raw:
+                if not isinstance(item, dict):
+                    continue
+                if (
+                    isinstance(item.get('context_id'), bool) or
+                    isinstance(item.get('service_id'), bool) or
+                    isinstance(item.get('event_id'), bool) or
+                    isinstance(item.get('table_id'), bool) or
+                    isinstance(item.get('section_number'), bool)
+                ):
+                    continue
+                try:
+                    program_hints.append(KonomiTVBS4KTLVProgramHint(
+                        context_id=int(cast(Any, item.get('context_id'))),
+                        service_id=int(cast(Any, item.get('service_id'))),
+                        event_id=int(cast(Any, item.get('event_id'))),
+                        table_id=int(cast(Any, item.get('table_id'))),
+                        section_number=int(cast(Any, item.get('section_number'))),
+                        hdr_programme_icon=item.get('hdr_programme_icon') is True,
+                    ))
+                except (TypeError, ValueError):
+                    continue
 
         return KonomiTVBS4KTLVMetadataSnapshot(
             snapshot_type=snapshot_type,
             snapshot_context_id=snapshot_context_id,
             service_contexts=service_contexts,
             tracks=tuple(track_snapshots),
+            program_hints=tuple(program_hints),
         )
 
     @staticmethod

@@ -5,7 +5,10 @@ from typing import ClassVar
 
 from app import logging
 from app.constants import LIBRARY_PATH
-from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
+from app.utils.KonomiTVBS4KTLVServiceResolver import (
+    KonomiTVBS4KTLVMetadataSnapshot,
+    KonomiTVBS4KTLVServiceResolver,
+)
 
 
 class KonomiTVBS4KTLVMetadataMonitor:
@@ -65,6 +68,10 @@ class KonomiTVBS4KTLVMetadataMonitor:
         self._main_service_id = main_service_id
         self._rain_service_id = rain_service_id
         self._log_prefix = log_prefix
+        # 主サービスの B60 0x8010 値 (1-5)。未観測なら None。
+        self._b60_video_transfer: int | None = None
+        # 主サービスの MH-EIT 現在番組 HDR アイコン。未観測なら None、不在は False。
+        self._mh_eit_hdr_hint: bool | None = None
 
     @property
     def is_rain_fallback_broadcasting(self) -> bool | None:
@@ -79,6 +86,34 @@ class KonomiTVBS4KTLVMetadataMonitor:
         """
 
         return self._broadcasting_state
+
+    @property
+    def b60_video_transfer(self) -> int | None:
+        """
+        主サービス映像の B60 video_transfer_characteristics を返す。
+
+        Args:
+            なし。
+
+        Returns:
+            int | None: B60 値 1-5。未観測なら None。
+        """
+
+        return self._b60_video_transfer
+
+    @property
+    def mh_eit_hdr_hint(self) -> bool | None:
+        """
+        主サービスの MH-EIT 現在番組 HDR アイコンを返す。
+
+        Args:
+            なし。
+
+        Returns:
+            bool | None: アイコンあり True、現在番組はあるがアイコンなし False、未観測 None。
+        """
+
+        return self._mh_eit_hdr_hint
 
     def start(self) -> None:
         """
@@ -344,6 +379,42 @@ class KonomiTVBS4KTLVMetadataMonitor:
                     }
 
             self._evaluateCandidateState()
+            self._evaluateColorHint(metadata)
+
+    def _evaluateColorHint(self, metadata: KonomiTVBS4KTLVMetadataSnapshot) -> None:
+        """
+        主サービスの B60 transfer と MH-EIT HDR アイコンを公開する。
+
+        Args:
+            metadata (KonomiTVBS4KTLVMetadataSnapshot): parseMetadataLine が返した最新 snapshot。
+
+        Returns:
+            None
+        """
+
+        if self._main_service_id is None:
+            return
+        main_context_id = self._service_contexts.get(self._main_service_id)
+        if metadata.tracks:
+            video_tracks = [
+                track for track in metadata.tracks
+                if track.kind == 'Video' and (
+                    main_context_id is None or track.context_id == main_context_id
+                )
+            ]
+            video_tracks.sort(key=lambda track: (
+                track.component_tag if track.component_tag is not None else 1 << 30,
+                track.track_id,
+            ))
+            if video_tracks:
+                self._b60_video_transfer = video_tracks[0].video_transfer_characteristics
+        present_hints = [
+            hint for hint in metadata.program_hints
+            if hint.service_id == self._main_service_id and hint.section_number == 0
+        ]
+        if present_hints:
+            # 同じ現在番組が複数テーブルで来ても、HDR アイコンの有無だけを公開する。
+            self._mh_eit_hdr_hint = any(hint.hdr_programme_icon for hint in present_hints)
 
     def _evaluateCandidateState(self) -> None:
         """
@@ -448,6 +519,8 @@ class KonomiTVBS4KTLVMetadataMonitor:
         self._service_contexts.clear()
         self._mpt_video_packet_ids.clear()
         if clear_published_state is True:
+            self._b60_video_transfer = None
+            self._mh_eit_hdr_hint = None
             self._setCandidateState(None)
         else:
             self._candidate_state = self._broadcasting_state

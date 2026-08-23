@@ -28,7 +28,7 @@ bool TestServiceStateResetEmitsEmptyMptWithNullContext() {
 
     const std::string expected =
         "{\"snapshot_type\":\"MPT\",\"snapshot_context_id\":null,\"snapshot_version\":null,"
-        "\"input_offset\":0,\"services\":[],\"tracks\":[]}\n";
+        "\"input_offset\":0,\"services\":[],\"tracks\":[],\"program_hints\":[]}\n";
     return ExpectEqual(output.str(), expected, "service state reset snapshot");
 }
 
