@@ -1,0 +1,54 @@
+diff --git a/libavcodec/vaapi_encode_h265.c b/libavcodec/vaapi_encode_h265.c
+index baf0d77c8a..770158da2e 100644
+--- a/libavcodec/vaapi_encode_h265.c
++++ b/libavcodec/vaapi_encode_h265.c
+@@ -72,6 +72,7 @@ typedef struct VAAPIEncodeH265Context {
+     int profile;
+     int level;
+     int sei;
++    int mesa_hevc_alignment;
+ 
+     // Derived settings.
+     int fixed_qp_p;
+@@ -337,6 +338,31 @@ static int vaapi_encode_h265_init_sequence_params(AVCodecContext *avctx)
+     }
+ #endif
+ 
++    if (priv->mesa_hevc_alignment) {
++        int chroma_width_divisor =
++            sps->chroma_format_idc == 1 || sps->chroma_format_idc == 2 ? 2 : 1;
++        int chroma_height_divisor = sps->chroma_format_idc == 1 ? 2 : 1;
++
++        // Mesa's VCN encoder codes the complete 64x16-aligned picture.  Tell
++        // the driver which part is padding before it creates the bitstream so
++        // that it fills those samples instead of exposing uninitialised data.
++        sps->pic_width_in_luma_samples =
++            FFALIGN(sps->pic_width_in_luma_samples, 64);
++        sps->pic_height_in_luma_samples =
++            FFALIGN(sps->pic_height_in_luma_samples, 16);
++        sps->conformance_window_flag =
++            avctx->width != sps->pic_width_in_luma_samples ||
++            avctx->height != sps->pic_height_in_luma_samples;
++        sps->conf_win_left_offset = 0;
++        sps->conf_win_right_offset =
++            (sps->pic_width_in_luma_samples - avctx->width) /
++            chroma_width_divisor;
++        sps->conf_win_top_offset = 0;
++        sps->conf_win_bottom_offset =
++            (sps->pic_height_in_luma_samples - avctx->height) /
++            chroma_height_divisor;
++    }
++
+     // Fill VAAPI parameter buffers.
+ 
+     *vseq = (VAEncSequenceParameterBufferHEVC) {
+@@ -1111,6 +1137,9 @@ static const AVOption vaapi_encode_h265_options[] = {
+     { "aud", "Include AUD",
+       OFFSET(aud), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
+ 
++    { "mesa_hevc_alignment", "Signal Mesa VCN's coded-picture alignment as padding",
++      OFFSET(mesa_hevc_alignment), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
++
+     { "profile", "Set profile (general_profile_idc)",
+       OFFSET(profile), AV_OPT_TYPE_INT,
+       { .i64 = AV_PROFILE_UNKNOWN }, AV_PROFILE_UNKNOWN, 0xff, FLAGS, .unit = "profile" },

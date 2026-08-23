@@ -997,7 +997,7 @@ class RecordedFMP4Stream:
             if codec_string.startswith('avc1.') and len(codec_string) >= 11:
                 return int(codec_string[-2:], 16)
             parts = codec_string.split('.')
-            if codec_string.startswith('hvc1.'):
+            if codec_string.startswith(('hvc1.', 'hev1.')):
                 level = next((part[1:] for part in parts if part.startswith('L')), '0')
                 return int(level)
             if codec_string.startswith('vp09.') and len(parts) >= 3:
@@ -1058,6 +1058,11 @@ class RecordedFMP4Stream:
         # HEVCのcompatibility flagsはcodec stringでbit順が逆になる。constraint bytesは
         # 末尾のゼロだけを省略し、実際のprofile/tier/levelとともに表現する。
         if box_type == b'hvcC' and len(payload) >= 13 and payload[0] == 1:
+            if cls.__findMP4Box(init_segment, b'hev1') is not None:
+                sample_entry = 'hev1'
+            else:
+                # hvcC box単体を渡す既存利用では、従来どおりhvc1として解釈する。
+                sample_entry = 'hvc1'
             profile_space = ('', 'A', 'B', 'C')[payload[1] >> 6]
             profile_idc = payload[1] & 0x1F
             compatibility = int.from_bytes(payload[2:6], 'big')
@@ -1066,7 +1071,7 @@ class RecordedFMP4Stream:
             constraints = payload[6:12].rstrip(b'\x00')
             constraint_suffix = ''.join(f'.{value:X}' for value in constraints)
             return (
-                f'hvc1.{profile_space}{profile_idc}.{compatibility:X}.'
+                f'{sample_entry}.{profile_space}{profile_idc}.{compatibility:X}.'
                 f'{tier}{payload[12]}{constraint_suffix}'
             )
 
@@ -2333,9 +2338,15 @@ class RecordedFMP4Stream:
         elif backend == 'AMF':
             command += ['-pix_fmt', 'vaapi']
         command += self.__getProfileArguments(backend, codec, bit_depth)
+        if backend == 'AMF' and codec == 'hevc':
+            # ライブと同じく、Mesa VCN へ HEVC 符号化面の padding を事前通知する。
+            # fMP4 の global SPS と driver が生成する slice で同じ coded dimensions を共有させる。
+            command += ['-mesa_hevc_alignment', '1']
         command += RecordedPlaybackBackend.getTuningArguments(backend, codec)
         if codec == 'hevc':
-            command += ['-tag:v', 'hvc1']
+            # Mesa VCN は driver 側で VPS/SPS/PPS を再生成するため、AMF では in-band parameter sets を
+            # 保持できる hev1 を使う。hvc1 の global PPS だけでは VBR slice の CU QP 構造と一致しない。
+            command += ['-tag:v', 'hev1' if backend == 'AMF' else 'hvc1']
         # 録画 MPEG-TS の PTS には局側の欠落や seek 直後の不連続が含まれることがあり、
         # FFmpeg の自動同期へ任せると同じ約6秒の fragmentでも出力枚数が大きく変動する。
         # 通常画質は画質名の契約どおり 29.97 / 59.94fps CFR へ正規化し、Chrome の
@@ -2499,7 +2510,16 @@ class RecordedFMP4Stream:
         # その所有中にinitの決定とmedia公開を完結し、存在確認とatomic replaceのTOCTOUを防ぐ。
         if init_path.is_file():
             cached_init_data = await asyncio.to_thread(init_path.read_bytes)
+            # hev1 は各 fragment の先頭 sample に VPS/SPS/PPS を保持するため、Mesa が動的に生成した
+            # hvcC が generation 内で変化しても、その fragment 自身の parameter sets で復号できる。
+            allows_in_band_parameter_sets = (
+                self.__getBackend() == 'AMF' and
+                self.encoding_options.video_codec == 'hevc' and
+                self.__findMP4Box(cached_init_data, b'hev1') is not None and
+                self.__findMP4Box(init_data, b'hev1') is not None
+            )
             if (
+                allows_in_band_parameter_sets is False and
                 self.__extractVideoCodecConfiguration(cached_init_data) !=
                 self.__extractVideoCodecConfiguration(init_data)
             ):

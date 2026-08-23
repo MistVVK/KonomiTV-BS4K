@@ -504,7 +504,13 @@ class RecordedPlaybackBackend:
                 command += ['-profile:v', '0']
             elif encoder != 'NVENC':
                 command += ['-profile:v', 'main']
+        if encoder == 'AMF' and codec == 'hevc':
+            # 実再生と同じく、Mesa VCN へ HEVC 符号化面の padding を事前通知する。
+            command += ['-mesa_hevc_alignment', '1']
         command += cls.getTuningArguments(encoder, codec)
+        if codec == 'hevc':
+            # 実再生と同じ sample entry を検査し、AMF では driver の in-band parameter sets も確認する。
+            command += ['-tag:v', 'hev1' if encoder == 'AMF' else 'hvc1']
         if quality is not None:
             bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, codec)
             bitrate_max_kbps = int(bitrate.video_bitrate_max.removesuffix('K'))
@@ -559,7 +565,7 @@ class RecordedPlaybackCapabilityProbe:
         default = None,
     )
     _probe_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
-    _probe_version: ClassVar[int] = 5
+    _probe_version: ClassVar[int] = 6
     _probe_timeout_seconds: ClassVar[float] = 20.0
     _negative_probe_ttl_seconds: ClassVar[float] = 5.0
     _transient_failure_reasons: ClassVar[frozenset[RecordedPlaybackCapabilityReason]] = frozenset({

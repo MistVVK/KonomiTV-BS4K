@@ -42,7 +42,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
     """録画の実probeとライブTS経路の依存を分離して共通能力契約を作る。"""
 
     BRIDGE_LIBRARY_PATH_KEY = 'KonomiTVBS4KTSCodecBridge'
-    _live_probe_version: ClassVar[int] = 7
+    _live_probe_version: ClassVar[int] = 8
     _live_probe_signature: ClassVar[str | None] = None
     _live_probe_results: ClassVar[
         dict[
@@ -1315,6 +1315,10 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             ffmpeg_command += ['-profile:v', 'main10' if bit_depth == 10 else 'main']
         else:
             ffmpeg_command += ['-profile:v', 'high']
+
+        if encoder == 'AMF' and video_codec == 'hevc':
+            # 実ライブと同じく、Mesa VCN へ HEVC 符号化面の padding を事前通知する。
+            ffmpeg_command += ['-mesa_hevc_alignment', '1']
 
         ffmpeg_command += RecordedPlaybackBackend.getTuningArguments(
             encoder, video_codec

@@ -628,6 +628,11 @@ class LiveEncodingTask:
             # av1_nvenc は profile オプション自体を公開しない。QSV / AMF は main を受け付ける。
             options += ['-profile:v', 'main']
 
+        if encoder_type == 'AMF' and codec == 'hevc':
+            # Mesa VCN は HEVC の符号化面を 64x16 境界へ拡張するため、packed SPS で padding を事前通知する。
+            # driver に通知せず後段で SPS だけを補正すると、padding が未初期化のまま Firefox に露出する。
+            options += ['-mesa_hevc_alignment', '1']
+
         if is_oneseg is True:
             # ワンセグ入力は約 10～15fps の VFR だが、固定 muxrate / PCR と再生安定のため 15fps CFR へ正規化する。
             # VFR のままだと PCR gap が 500ms を超え、TS Codec Bridge が fail-closed で落ちる。

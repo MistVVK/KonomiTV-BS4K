@@ -348,6 +348,7 @@ def main() -> None:
         f'  - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`{localFileSha256(PATCHES_ROOT / "libaribtlv-0.2.0-konomitv-subtitle-mfu.patch")}`)',
         f'  - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`{localFileSha256(PATCHES_ROOT / "ffmpeg-8.1.2-libaribtlv-timed-id3.patch")}`)',
         f'  - `ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch` (`{localFileSha256(PATCHES_ROOT / "ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch")}`)',
+        f'  - `ffmpeg-8.1.2-vaapi-mesa-hevc-alignment.patch` (`{localFileSha256(PATCHES_ROOT / "ffmpeg-8.1.2-vaapi-mesa-hevc-alignment.patch")}`)',
         f'  - `amf-1.4.36-display-capture-c.patch` (`{localFileSha256(PATCHES_ROOT / "amf-1.4.36-display-capture-c.patch")}`)',
         '',
         '#### Intel media stack', '',

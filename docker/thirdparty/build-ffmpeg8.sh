@@ -89,7 +89,8 @@ for patch_path in \
     "${ffmpeg_libaribtlv_patch_directory}/0002-avformat-libaribtlv-report-recording-duration.patch" \
     "${ffmpeg_libaribtlv_patch_directory}/0003-avformat-libaribtlv-support-timestamp-seeking.patch" \
     "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch" \
-    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch"; do
+    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch" \
+    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-vaapi-mesa-hevc-alignment.patch"; do
     git -C "${ffmpeg_source}" apply --check "${patch_path}"
     git -C "${ffmpeg_source}" apply "${patch_path}"
 done
