@@ -1194,7 +1194,9 @@ class TestTLVStreamProbeCleanup:
             'need_rain_fallback': expected_rain_service_id is not None,
         }
         assert result[2].start_count == 1
-        assert (result[3] is not None) is (expected_rain_service_id is not None)
+        # B60 / MH-EIT の番組色ヒントを見るため、降雨対象外でも helper は起動する。
+        assert result[3] is not None
+        assert result[3].start_count == 1
         assert result[4] == 62208
         assert result[5] == 62224
         assert result[6] == (62240 if expected_rain_service_id is not None else None)
