@@ -42,7 +42,8 @@
                     :items="['EDCB', 'Mirakurun']" v-model="server_settings.general.backend">
                 </v-select>
             </div>
-            <div class="settings__item" v-if="isSectionVisible('backend')">
+            <div class="settings__item"
+                v-if="isSectionVisible('backend') && server_settings.general.backend === 'EDCB'">
                 <div class="settings__item-heading">EDCB (EpgTimerNW) の TCP API の URL</div>
                 <div class="settings__item-label">
                     バックエンドに EDCB が選択されているときに利用されます。<br>
@@ -53,10 +54,12 @@
                     v-model="server_settings.general.edcb_url">
                 </v-text-field>
             </div>
-            <div class="settings__item" v-if="isSectionVisible('backend')">
+            <div class="settings__item"
+                v-if="isSectionVisible('backend') && (server_settings.general.backend === 'Mirakurun' || server_settings.general.always_receive_tv_from_mirakurun)">
                 <div class="settings__item-heading">Mirakurun / mirakc の HTTP API の URL</div>
                 <div class="settings__item-label">
                     バックエンドに Mirakurun が選択されているときに利用されます。<br>
+                    バックエンドが EDCB でも、[常に Mirakurun / mirakc から放送波を受信する] が有効なときは利用されます。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
