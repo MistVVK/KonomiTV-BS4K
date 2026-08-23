@@ -2283,15 +2283,37 @@ class RecordedFMP4Stream:
                 filters.append(
                     f'deinterlace_vaapi=rate={"field" if quality.is_60fps else "frame"}:auto=1'
                 )
+            # decoderの並べ替えで構成境界後にも旧色メタデータのframeが残ることがあるため、
+            # 同じgenerationの全segmentが同じSPSを生成するよう索引上の構成へ正規化する。
+            scale_vaapi_options = [
+                f'w={quality.width}',
+                f'h={quality.height}',
+                f'format={spec.encoder_pixel_format}',
+                'out_chroma_location=left',
+            ]
+            if entry is not None:
+                color_space = entry.get('color_space')
+                color_range = entry.get('color_range')
+                color_primaries = entry.get('color_primaries')
+                color_transfer = entry.get('color_transfer')
+                if color_space is not None:
+                    scale_vaapi_options.append(f'out_color_matrix={color_space}')
+                if color_range in ('tv', 'pc'):
+                    scale_vaapi_options.append(f'out_range={color_range}')
+                if color_primaries is not None:
+                    scale_vaapi_options.append(f'out_color_primaries={color_primaries}')
+                if color_transfer is not None:
+                    scale_vaapi_options.append(f'out_color_transfer={color_transfer}')
+            scale_vaapi_filter = 'scale_vaapi=' + ':'.join(scale_vaapi_options)
             # VAAPI encoder へ VAAPI 面を直接渡す。
             filters += [
-                f'scale_vaapi=w={quality.width}:h={quality.height}:format={spec.encoder_pixel_format}',
+                scale_vaapi_filter,
             ]
             if is_interlaced and self.encoding_options.is_24fps_mode_enabled:
                 filters += [
                     f'hwdownload,format={spec.encoder_pixel_format}', 'pullup', 'dejudder',
                     f'format={spec.encoder_pixel_format}', 'hwupload',
-                    f'scale_vaapi=w={quality.width}:h={quality.height}:format={spec.encoder_pixel_format}',
+                    scale_vaapi_filter,
                 ]
             filters += [
                 f'trim=start={trim_start:.6f}:duration={duration:.6f}',
