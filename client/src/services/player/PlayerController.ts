@@ -11,7 +11,6 @@ import APIClient from '@/services/APIClient';
 import OfflineVideos from '@/services/OfflineVideos';
 import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
-import { classifyKonomiTVBS4KHdrSource } from '@/services/player/KonomiTVBS4KHdrPolicy';
 import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
 import CaptureManager from '@/services/player/managers/CaptureManager';
 import DocumentPiPManager from '@/services/player/managers/DocumentPiPManager';
@@ -3969,12 +3968,9 @@ class PlayerController {
         };
         const update_hdr_output_display = (): void => {
             if (hdr_output_item === null || hdr_output_value === null) return;
-            const is_hdr_source = classifyKonomiTVBS4KHdrSource(
-                player_store.sps_transfer_characteristics,
-            ) !== 'None';
-            hdr_output_item.style.display = (
-                this.playback_mode === 'Live' && is_hdr_source === true
-            ) ? '' : 'none';
+            // ライブでは SDR 番組でも項目を出し、次の HDR 番組に効く選択をその場で変えられるようにする。
+            // 録画再生には HDR 変換マネージャが無いので出さない。
+            hdr_output_item.style.display = this.playback_mode === 'Live' ? '' : 'none';
             const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
                 settings_store.settings.konomitv_bs4k_hdr_output;
             hdr_output_value.textContent = hdr_output_labels[current];
@@ -3996,7 +3992,6 @@ class PlayerController {
             ),
             watch(
                 [
-                    () => player_store.sps_transfer_characteristics,
                     () => player_store.konomitv_bs4k_playback_hdr_output_override,
                     () => settings_store.settings.konomitv_bs4k_hdr_output,
                 ],
