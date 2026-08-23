@@ -11,10 +11,12 @@ import APIClient from '@/services/APIClient';
 import OfflineVideos from '@/services/OfflineVideos';
 import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
+import { classifyKonomiTVBS4KHdrSource } from '@/services/player/KonomiTVBS4KHdrPolicy';
 import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
 import CaptureManager from '@/services/player/managers/CaptureManager';
 import DocumentPiPManager from '@/services/player/managers/DocumentPiPManager';
 import KeyboardShortcutManager from '@/services/player/managers/KeyboardShortcutManager';
+import KonomiTVBS4KHlgSdrManager from '@/services/player/managers/KonomiTVBS4KHlgSdrManager';
 import LiveCommentManager from '@/services/player/managers/LiveCommentManager';
 import LiveDataBroadcastingManager from '@/services/player/managers/LiveDataBroadcastingManager';
 import LiveEventManager from '@/services/player/managers/LiveEventManager';
@@ -1159,6 +1161,8 @@ class PlayerController {
                         // duration 不明のライブ fMP4 とハードウェアデコーダーの組み合わせでは、十分な MSE バッファがあっても
                         // フレームドロップが発生する環境があるため、有限 duration の init segment を使う
                         forceMSEStreamLivenessRecorded: true,
+                        // HLG/PQ のブラウザ HDR パス制御。実モードは HlgSdrManager が実行中に切り替える。
+                        videoColorRewrite: 'None',
                         // 再生開始まで 2048KB のバッファを貯める (?)
                         // あまり大きくしすぎてもどうも効果がないようだが、小さくしたり無効化すると特に Safari で不安定になる
                         enableStashBuffer: true,
@@ -1921,6 +1925,7 @@ class PlayerController {
             // ライブ視聴時に設定する PlayerManager
             this.player_managers = [
                 new LiveEventManager(this.player),
+                new KonomiTVBS4KHlgSdrManager(this.player),
                 // 実況機能が無効な場合は接続情報 API へのアクセスも WebSocket 接続も開始しない
                 ...(settings_store.is_jikkyo_enabled === true ? [new LiveCommentManager(this.player)] : []),
                 new LiveDataBroadcastingManager(this.player),
@@ -3853,6 +3858,11 @@ class PlayerController {
                 <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-video-codec-arrow"></div>
             </div>
             ${audio_codec_setting_item_html}
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-hdr-output"
+                role="button" tabindex="0" style="touch-action:manipulation;">
+                <span class="dplayer-label">HDR 出力</span>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-hdr-output-value"></span>
+            </div>
             ${auto_skip_cm_setting_item_html}
             <div class="dplayer-setting-item dplayer-setting-mobile-profile">
                 <span class="dplayer-label">モバイル回線向け画質</span>
@@ -3946,6 +3956,36 @@ class PlayerController {
                 );
             }
         };
+        const hdr_output_item = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-hdr-output',
+        );
+        const hdr_output_value = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-hdr-output-value',
+        );
+        const hdr_output_labels: Record<'Auto' | 'HDR' | 'SDR', string> = {
+            Auto: 'Auto',
+            HDR: 'HDR 素通し',
+            SDR: 'SDR 変換',
+        };
+        const update_hdr_output_display = (): void => {
+            if (hdr_output_item === null || hdr_output_value === null) return;
+            const is_hdr_source = classifyKonomiTVBS4KHdrSource(
+                player_store.sps_transfer_characteristics,
+            ) !== 'None';
+            hdr_output_item.style.display = (
+                this.playback_mode === 'Live' && is_hdr_source === true
+            ) ? '' : 'none';
+            const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
+                settings_store.settings.konomitv_bs4k_hdr_output;
+            hdr_output_value.textContent = hdr_output_labels[current];
+        };
+        hdr_output_item?.addEventListener('click', () => {
+            const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
+                settings_store.settings.konomitv_bs4k_hdr_output;
+            const next = current === 'Auto' ? 'HDR' : current === 'HDR' ? 'SDR' : 'Auto';
+            player_store.konomitv_bs4k_playback_hdr_output_override = next;
+            update_hdr_output_display();
+        });
         this.rain_fallback_watchers = [
             watch(
                 [
@@ -3953,6 +3993,15 @@ class PlayerController {
                     () => player_store.is_rain_fallback_broadcasting,
                 ],
                 update_rain_fallback_status_display,
+            ),
+            watch(
+                [
+                    () => player_store.sps_transfer_characteristics,
+                    () => player_store.konomitv_bs4k_playback_hdr_output_override,
+                    () => settings_store.settings.konomitv_bs4k_hdr_output,
+                ],
+                update_hdr_output_display,
+                {immediate: true},
             ),
         ];
 

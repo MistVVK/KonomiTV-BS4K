@@ -24,6 +24,10 @@ interface ILiveStreamStatusEvent {
     is_rain_fallback: boolean | null;
     // 現在の放送波で降雨対応放送が実施されているかどうか
     is_rain_fallback_broadcasting: boolean | null;
+    // B60 0x8010 の video_transfer_characteristics。未観測なら null
+    b60_video_transfer: number | null;
+    // MH-EIT 現在番組の HDR アイコン。未観測なら null
+    mh_eit_hdr_hint: boolean | null;
 }
 
 type LiveStreamStatus = ILiveStreamStatusEvent['status'];
@@ -80,6 +84,8 @@ class LiveEventManager implements PlayerManager {
         const apply_rain_fallback_state = (event: ILiveStreamStatusEvent): void => {
             player_store.is_rain_fallback = event.is_rain_fallback;
             player_store.is_rain_fallback_broadcasting = event.is_rain_fallback_broadcasting;
+            player_store.b60_video_transfer = event.b60_video_transfer ?? null;
+            player_store.mh_eit_hdr_hint = event.mh_eit_hdr_hint ?? null;
         };
 
         // 破棄済みかどうかのフラグを下ろす
@@ -365,6 +371,8 @@ class LiveEventManager implements PlayerManager {
         player_store.live_stream_status = null;
         player_store.is_rain_fallback = null;
         player_store.is_rain_fallback_broadcasting = null;
+        player_store.b60_video_transfer = null;
+        player_store.mh_eit_hdr_hint = null;
 
         // ChannelsStore にセットしたリアルタイム視聴者数をリセット
         // ここで削除しないといつまで経っても古い番組情報が参照され続けてしまう

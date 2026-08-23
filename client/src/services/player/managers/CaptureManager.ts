@@ -9,6 +9,7 @@ import type ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 
 import Captures from '@/services/Captures';
 import { ILiveChannelDefault } from '@/services/Channels';
+import { getKonomiTVBS4KHdrCaptureCanvas } from '@/services/player/managers/KonomiTVBS4KHlgSdrManager';
 import PlayerManager from '@/services/player/PlayerManager';
 import { IProgramDefault } from '@/services/Programs';
 import useChannelsStore from '@/stores/ChannelsStore';
@@ -384,9 +385,10 @@ class CaptureManager implements PlayerManager {
         // ***** キャプチャの実行・字幕/文字スーパー/コメントを合成 *****
 
         // 高速化のため、Promise.all() で並列に実行する
+        const hdr_canvas = getKonomiTVBS4KHdrCaptureCanvas(this.player);
         const create_image_bitmap_results = await Promise.all([
-            // 現在再生中の動画のキャプチャを ImageBitmap として取得
-            createImageBitmap(this.player.video),
+            // トーンマップ中は HDR canvas を撮る。素通し時は video 要素を撮る。
+            createImageBitmap(hdr_canvas ?? this.player.video),
             // 字幕が表示されていれば、字幕の Canvas を ImageBitmap として取得
             is_caption_showing ? createImageBitmap(caption_canvas!) : null,
             // 文字スーパーが表示されていれば、文字スーパーの Canvas を ImageBitmap として取得

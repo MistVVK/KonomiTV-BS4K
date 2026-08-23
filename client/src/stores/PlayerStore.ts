@@ -215,6 +215,18 @@ const usePlayerStore = defineStore('player', {
         // SSE から状態を受信するまでの間は null
         is_rain_fallback_broadcasting: null as boolean | null,
 
+        // ライブ視聴: B60 0x8010 の video_transfer_characteristics。SSE 受信までは null
+        b60_video_transfer: null as number | null,
+
+        // ライブ視聴: MH-EIT 現在番組の HDR アイコン。SSE 受信までは null
+        mh_eit_hdr_hint: null as boolean | null,
+
+        // 視聴画面の設定パネルで選んだ一時 HDR 出力。SettingsStore へは書かず、視聴終了で破棄する。
+        konomitv_bs4k_playback_hdr_output_override: null as 'Auto' | 'HDR' | 'SDR' | null,
+
+        // mpegts.js が検出した元の transfer_characteristics。HLG=18 / PQ=16。
+        sps_transfer_characteristics: null as number | null,
+
         // ライブ視聴: ニコニコ実況への接続に失敗した際のエラーメッセージ
         // null のとき、エラーは発生していないとみなす
         live_comment_init_failed_message: null as string | null,
@@ -330,6 +342,10 @@ const usePlayerStore = defineStore('player', {
             this.live_stream_status = null;
             this.is_rain_fallback = null;
             this.is_rain_fallback_broadcasting = null;
+            this.b60_video_transfer = null;
+            this.mh_eit_hdr_hint = null;
+            this.konomitv_bs4k_playback_hdr_output_override = null;
+            this.sps_transfer_characteristics = null;
             this.live_comment_init_failed_message = null;
             this.clearTwitterCaptures();
         }
