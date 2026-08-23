@@ -2435,14 +2435,28 @@ class RecordedFMP4Stream:
             )
             stdout, stderr = await self.__communicateSubprocess(process, duration)
             returncode = process.returncode if process.returncode is not None else 1
+            is_mpeg_ts_filter_reinitialization_failure = (
+                self.recorded_program.recorded_video.container_format == 'MPEG-TS' and
+                self.shouldRetryMPEGTSFilterReinitializationWithSoftwareDecode(stderr)
+            )
             if (
                 returncode != 0 and backend != 'FFmpeg' and
-                self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
-                self.shouldRetryWithSoftwareDecode(stderr)
+                (
+                    (
+                        self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
+                        self.shouldRetryWithSoftwareDecode(stderr)
+                    ) or
+                    is_mpeg_ts_filter_reinitialization_failure
+                )
             ):
-                # MP4/MKV/WebM でHW decodeだけが失敗した場合は、同じGPU encoderへ
-                # system-memoryフレームをuploadし直す。エンコーダーのCPU降格は行わない。
-                fallback_command = self.buildSoftwareDecodeFallback(command, backend, encoder_pixel_format)
+                # HW decodeだけが失敗した場合は、同じGPU encoderへsystem-memoryフレームをuploadし直す。
+                # MPEG-TS内の映像パラメータ切替ではfilter graphを固定し、preroll中の再初期化を避ける。
+                fallback_command = self.buildSoftwareDecodeFallback(
+                    command,
+                    backend,
+                    encoder_pixel_format,
+                    disable_filter_reinitialization=is_mpeg_ts_filter_reinitialization_failure,
+                )
                 process = await asyncio.create_subprocess_exec(
                     *fallback_command,
                     stdout=asyncio.subprocess.PIPE,
@@ -2882,12 +2896,27 @@ class RecordedFMP4Stream:
             if (
                 returncode != 0 and
                 backend != 'FFmpeg' and
-                self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
-                self.shouldRetryWithSoftwareDecode(stderr)
+                (
+                    (
+                        self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
+                        self.shouldRetryWithSoftwareDecode(stderr)
+                    ) or
+                    (
+                        self.recorded_program.recorded_video.container_format == 'MPEG-TS' and
+                        self.shouldRetryMPEGTSFilterReinitializationWithSoftwareDecode(stderr)
+                    )
+                )
             ):
                 # 同じencoder slot内で再試行し、semaphoreを二重取得しない。
                 encoded_path.unlink(missing_ok=True)
-                fallback_command = self.buildSoftwareDecodeFallback(command, backend, encoder_pixel_format)
+                fallback_command = self.buildSoftwareDecodeFallback(
+                    command,
+                    backend,
+                    encoder_pixel_format,
+                    disable_filter_reinitialization=(
+                        self.recorded_program.recorded_video.container_format == 'MPEG-TS'
+                    ),
+                )
                 process = await asyncio.create_subprocess_exec(
                     *fallback_command,
                     stdout=asyncio.subprocess.PIPE,
@@ -3067,10 +3096,32 @@ class RecordedFMP4Stream:
         return any(marker in normalized_stderr for marker in hardware_decode_failure_markers)
 
     @staticmethod
+    def shouldRetryMPEGTSFilterReinitializationWithSoftwareDecode(stderr: bytes) -> bool:
+        """MPEG-TSの映像パラメータ切替によるfilter再初期化失敗かを返す。
+
+        Args:
+            stderr: FFmpegが標準エラー出力へ書いた診断。
+
+        Returns:
+            HW decodeからsoftware decodeへ限定再試行すべき失敗の場合はTrue。
+        """
+
+        # 放送波では同じ映像PIDでも色メタデータなどが切り替わり、VAAPI decoderがhardware frame
+        # contextを再生成する。GPU filter/encoderはそのcontext変更を引き継げないため、両方の
+        # 診断が揃った場合だけsoftware decodeと固定filter graphで再試行する。
+        normalized_stderr = stderr.decode(errors='ignore').lower()
+        return (
+            'error reinitializing filters!' in normalized_stderr and
+            'impossible to convert between the formats supported by the filter' in normalized_stderr
+        )
+
+    @staticmethod
     def buildSoftwareDecodeFallback(
         command: list[str],
         backend: RecordedPlaybackEncoder,
         pixel_format: str,
+        *,
+        disable_filter_reinitialization: bool = False,
     ) -> list[str]:
         """HW decode引数だけを除き、同じGPU filter/encoderへuploadする。"""
 
@@ -3083,6 +3134,11 @@ class RecordedFMP4Stream:
                 continue
             fallback_command.append(command[index])
             index += 1
+        if disable_filter_reinitialization is True:
+            # software frameのpixel formatは直前のformat filterで固定するため、色メタデータなどの
+            # 変更だけで後段のhardware frame contextを作り直さない。
+            input_index = fallback_command.index('-i')
+            fallback_command[input_index:input_index] = ['-reinit_filter:v', '0']
         filter_index = fallback_command.index('-vf') + 1
         upload_filter = {
             'QSV': f'format={pixel_format},hwupload=extra_hw_frames=32',
