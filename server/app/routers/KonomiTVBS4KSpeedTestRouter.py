@@ -1,11 +1,10 @@
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
 from app import schemas
-from app.routers.UsersRouter import GetCurrentUser
 from app.utils.KonomiTVBS4KSpeedTest import (
     KONOMITV_BS4K_SPEED_TEST_DOWNLOAD_SECONDS,
     KONOMITV_BS4K_SPEED_TEST_MAX_DOWNLOAD_STREAMS,
@@ -32,14 +31,14 @@ router = APIRouter(
 )
 
 
-# LibreSpeed Worker は Bearer token を付けないため、測定枠の発行だけをユーザー認証で保護する。
+# スピードテストはログイン不要で提供し、測定枠の発行は Fetch Metadata / Origin と
+# プロセス内のセッション数制限で保護する。LibreSpeed Worker は Bearer token を付けないため、
 # 以降の転送は、この API が発行する短命な HttpOnly Cookie で認証する。
 @router.post(
     '/session',
     summary = 'サーバー接続速度測定セッション作成 API',
     response_description = '測定枠の制限と推奨画質閾値。session ID は HttpOnly Cookie のみ。',
     response_model = schemas.KonomiTVBS4KSpeedTestSession,
-    dependencies = [Depends(GetCurrentUser)],
 )
 async def KonomiTVBS4KSpeedTestSessionCreateAPI(
     request: Request,
@@ -57,6 +56,7 @@ async def KonomiTVBS4KSpeedTestSessionCreateAPI(
     """
 
     RequireSpeedTestFetchMetadata(request)
+    RequireSpeedTestOrigin(request)
     session = await SPEED_TEST_SESSION_MANAGER.createSession()
     token = GenerateKonomiTVBS4KSpeedTestSessionToken(session.session_id)
     SetKonomiTVBS4KSpeedTestSessionCookie(response, token)
