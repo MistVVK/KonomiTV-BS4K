@@ -39,7 +39,6 @@ def _reset_recorded_playback_probe_state(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_matrix_inflight_tasks', {})
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_selected_devices', {})
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_lock', asyncio.Lock())
-    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_probe_semaphore', asyncio.Semaphore(2))
 
 
 def test_recorded_playback_capability_matrix() -> None:

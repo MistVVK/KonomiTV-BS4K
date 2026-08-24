@@ -13,6 +13,9 @@ from typing import ClassVar
 
 from app import logging
 from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
+from app.streams.KonomiTVBS4KExternalProcessLimiter import (
+    KonomiTVBS4KExternalProcessLimiter,
+)
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KPlaybackCapabilityReason,
     KonomiTVBS4KPlaybackEncoder,
@@ -564,7 +567,6 @@ class RecordedPlaybackCapabilityProbe:
         'recorded_playback_probe_context',
         default = None,
     )
-    _probe_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
     _probe_version: ClassVar[int] = 6
     _probe_timeout_seconds: ClassVar[float] = 20.0
     _negative_probe_ttl_seconds: ClassVar[float] = 5.0
@@ -827,8 +829,8 @@ class RecordedPlaybackCapabilityProbe:
         encoder, codec, bit_depth = key[:3]
         quality = key[3] if len(key) == 4 else None
         try:
-            # exact要求を全行列の後ろへ滞留させず、実probe総数は全backend合計2件に制限する。
-            async with cls._probe_semaphore:
+            # exact要求を全行列の後ろへ滞留させず、実probe総数は全probe系合計2件に制限する。
+            async with KonomiTVBS4KExternalProcessLimiter.acquireSlot():
                 async with cls._lock:
                     if cls._signature_generation != generation or cls._signature != signature:
                         return None

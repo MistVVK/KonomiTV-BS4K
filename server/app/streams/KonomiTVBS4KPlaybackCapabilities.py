@@ -14,6 +14,9 @@ from biim.mpeg2ts.pmt import PMTSection
 
 from app import logging
 from app.constants import LIBRARY_PATH, QUALITY_TYPES
+from app.streams.KonomiTVBS4KExternalProcessLimiter import (
+    KonomiTVBS4KExternalProcessLimiter,
+)
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KONOMITV_BS4K_AUDIO_CODECS,
     IsKonomiTVBS4KVideoCodecBitDepthSupported,
@@ -83,7 +86,6 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
     _radio_opus_probe_tasks: ClassVar[dict[str, asyncio.Task[bool]]] = {}
     _live_probe_event_loop: ClassVar[asyncio.AbstractEventLoop | None] = None
     _live_probe_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
-    _live_probe_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
     _negative_probe_ttl_seconds: ClassVar[float] = 5.0
 
     @classmethod
@@ -593,7 +595,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         同一バイナリの組み合わせはプロセス内でキャッシュし、API 呼び出しごとの再エンコードを避ける。
         """
 
-        lock, semaphore = cls.__getLiveProbeSynchronization()
+        lock = cls.__getLiveProbeLock()
         key = (encoder, video_codec, bit_depth, audio_codec)
         while True:
             async with lock:
@@ -620,7 +622,6 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                             signature,
                             key,
                             lock,
-                            semaphore,
                         ),
                         name = (
                             'KonomiTVBS4KPlaybackCapabilityProbe-live-'
@@ -649,7 +650,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             bool: 映像なし・二音声の Opus TS が実 pipe で成立した場合は True。
         """
 
-        lock, semaphore = cls.__getLiveProbeSynchronization()
+        lock = cls.__getLiveProbeLock()
         while True:
             async with lock:
                 signature = cls.__resetLiveProbeCacheForCurrentSignature()
@@ -671,7 +672,6 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                         cls.__runRadioOpusTransportProbeAndCache(
                             signature,
                             lock,
-                            semaphore,
                         ),
                         name = 'KonomiTVBS4KPlaybackCapabilityProbe-radio-opus',
                     )
@@ -684,19 +684,16 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                     return result
 
     @classmethod
-    def __getLiveProbeSynchronization(
-        cls,
-    ) -> tuple[asyncio.Lock, asyncio.Semaphore]:
-        """実行中 event loop ごとに probe の共有 lock と同時実行上限を返す。"""
+    def __getLiveProbeLock(cls) -> asyncio.Lock:
+        """実行中 event loop ごとに probe の共有 lock を返す。"""
 
         event_loop = asyncio.get_running_loop()
         if cls._live_probe_event_loop is not event_loop:
             cls._live_probe_event_loop = event_loop
             cls._live_probe_lock = asyncio.Lock()
-            cls._live_probe_semaphore = asyncio.Semaphore(2)
             cls._live_probe_tasks.clear()
             cls._radio_opus_probe_tasks.clear()
-        return cls._live_probe_lock, cls._live_probe_semaphore
+        return cls._live_probe_lock
 
     @classmethod
     def __resetLiveProbeCacheForCurrentSignature(cls) -> str:
@@ -723,14 +720,14 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             KonomiTVBS4KAudioCodec,
         ],
         lock: asyncio.Lock,
-        semaphore: asyncio.Semaphore,
     ) -> bool:
         """同一exact probeを共有し、安定した署名世代の結果だけをcacheする。"""
 
         task_key = (signature, *key)
         current_task = asyncio.current_task()
         try:
-            async with semaphore:
+            # 外部プロセス総数の上限は全probe系で共有する。
+            async with KonomiTVBS4KExternalProcessLimiter.acquireSlot():
                 result = await cls.__runLiveTransportProbe(*key)
             async with lock:
                 if cls.__getLiveProbeSignature() == signature:
@@ -750,13 +747,13 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         cls,
         signature: str,
         lock: asyncio.Lock,
-        semaphore: asyncio.Semaphore,
     ) -> bool:
         """radio Opus probeを共有し、失敗だけ短時間cacheする。"""
 
         current_task = asyncio.current_task()
         try:
-            async with semaphore:
+            # 外部プロセス総数の上限は全probe系で共有する。
+            async with KonomiTVBS4KExternalProcessLimiter.acquireSlot():
                 result = await cls.__runRadioOpusTransportProbe()
             async with lock:
                 if cls.__getLiveProbeSignature() == signature:
