@@ -85,6 +85,7 @@
                         <div class="settings__item-label">
                             KonomiTV-BS4K 本線と比較対象の構成について、コーデック対応と指定構成を滑らかに処理できるかを表示します。<br>
                             Smooth / Power Efficient は MediaCapabilities の応答値であり、HW / SW の種別を示す値ではありません。<br>
+                            WebCodecs の 2 列は、prefer-hardware / no preference の条件で VideoDecoder.isConfigSupported() をそれぞれ別々に照会した結果です。prefer-hardware はブラウザへの希望であり、HW 処理の証拠ではありません。<br>
                             「MSE 構成」は実際に再生時に使う MediaSource / ManagedMediaSource の MIME 対応判定です。
                         </div>
                         <div class="codec-support-table-scroll">
@@ -96,7 +97,8 @@
                                         <th>ブラウザ対応</th>
                                         <th>Smooth</th>
                                         <th>Power Efficient</th>
-                                        <th>WebCodecs</th>
+                                        <th>WebCodecs (prefer-hardware)</th>
+                                        <th>WebCodecs (no preference)</th>
                                         <th>MSE 構成</th>
                                     </tr>
                                 </thead>
@@ -118,8 +120,10 @@
                                             <template v-else>{{ row.power_efficient === true ? 'true' : 'false' }}</template>
                                         </td>
                                         <td>
-                                            <span :class="`codec-support-badge ${webCodecsClass(row.web_codecs_prefer_hardware)}`" title="prefer-hardware">{{ webCodecsLabel(row.web_codecs_prefer_hardware) }}</span>
-                                            <span :class="`codec-support-badge ${webCodecsClass(row.web_codecs_no_preference)}`" title="no preference">{{ webCodecsLabel(row.web_codecs_no_preference) }}</span>
+                                            <span :class="`codec-support-badge ${webCodecsClass(row.web_codecs_prefer_hardware)}`">{{ webCodecsLabel(row.web_codecs_prefer_hardware) }}</span>
+                                        </td>
+                                        <td>
+                                            <span :class="`codec-support-badge ${webCodecsClass(row.web_codecs_no_preference)}`">{{ webCodecsLabel(row.web_codecs_no_preference) }}</span>
                                         </td>
                                         <td>
                                             <template v-if="row.konomitv_playback === null">-</template>
