@@ -11,7 +11,7 @@
     - `TV/`: テレビ視聴関連ページ (`Home.vue` / `Search.vue` / `Watch.vue`)
     - `Videos/`: 動画関連ページ (`Home.vue` / `Programs.vue` / `Search.vue` / `Watch.vue`)
     - `Reservations/`: 予約関連ページ (`Home.vue` / `Reservations.vue`)
-    - `Settings/`: アプリケーション設定ページ (`Base.vue` / `General.vue` / `BS4K.vue` / `Playback.vue` / `Quality.vue` / `Streaming.vue` / `Caption.vue` / `CaptionComments.vue` / `Capture.vue` / `ColorTheme.vue` / `DataBroadcasting.vue` / `Jikkyo.vue` / `Twitter.vue` / `Account.vue` / `Server.vue` / `Maintenance.vue` / `DiagnosticsMaintenance.vue` / `CMAnalysis.vue` / `CMLogoManagement.vue` / `AIBackend.vue` / `RecordedSeries.vue` / `RecordedSeriesManagement.vue` / `KonomiTVBS4KSpeedTest.vue` など)
+    - `Settings/`: アプリケーション設定ページ (`Base.vue` / `General.vue` / `BS4K.vue` / `Playback.vue` / `Quality.vue` / `Streaming.vue` / `Caption.vue` / `CaptionComments.vue` / `Capture.vue` / `ColorTheme.vue` / `DataBroadcasting.vue` / `Jikkyo.vue` / `Twitter.vue` / `Account.vue` / `Server.vue` / `Maintenance.vue` / `DiagnosticsMaintenance.vue` / `CMAnalysis.vue` / `CMLogoManagement.vue` / `AIBackend.vue` / `RecordedSeries.vue` / `RecordedSeriesManagement.vue` / `KonomiTVBS4KSpeedTest.vue` / `KonomiTVBS4KCodecSupport.vue` など)
     - `Login.vue`: ログインページ
     - `Register.vue`: アカウント登録ページ
     - `Mylist.vue`: マイリストページ
@@ -43,7 +43,7 @@
   - `services/`: サーバー API へのサービスクライアント
     - `APIClient.ts`: API クライアントの基盤
     - `Channels.ts` / `Programs.ts` / `Videos.ts` / `Series.ts` / `Reservations.ts` / `ReservationConditions.ts` / `Captures.ts` / `Twitter.ts` / `Niconico.ts` / `Bluesky.ts` / `Users.ts` / `Settings.ts` / `Maintenance.ts` / `Version.ts`
-    - `CMAnalysis.ts` / `AnalysisTasks.ts` / `AIBackend.ts` / `RecordedSeries.ts` / `AccountLinks.ts` / `KonomiTVBS4KSpeedTest.ts`: BS4K 独自機能向けのサービスクライアント
+    - `CMAnalysis.ts` / `AnalysisTasks.ts` / `AIBackend.ts` / `RecordedSeries.ts` / `AccountLinks.ts` / `KonomiTVBS4KSpeedTest.ts` / `KonomiTVBS4KCodecSupport.ts`: BS4K 独自機能向けのサービスクライアント
     - `OfflineVideos.ts` / `OfflineVideoStorage.ts` / `KonomiTVBS4KOfflineDownloadRuntime.ts`: オフライン録画ダウンロード関連 (BS4K 独自)
     - `player/`: KonomiTV の視聴画面で用いられるライブ/ビデオプレイヤーのロジック (重要)
       - `PlayerController.ts`: 動画プレイヤーである DPlayer に関連するロジックを丸ごとラップするクラスで、KonomiTV の再生系ロジックの中核を担う
@@ -53,12 +53,12 @@
       - `KonomiTVBS4KID3.ts` / `KonomiTVBS4KPlaybackRestartGuard.ts`: BS4K 独自の再生補助ロジック
   - `utils/`: ユーティリティ関数とヘルパー
     - `Utils.ts` / `index.ts` / `ChannelUtils.ts` / `ProgramUtils.ts` / `PlayerUtils.ts` / `CommentUtils.ts` / `TweetUtils.ts` / `LogLineUtils.ts` / `NiconicoOAuth.ts` / `Semaphore.ts`
-    - `TimeTableUtils.ts` / `RecordedEpisode.ts` / `RecordedEpisodeResolution.ts` / `useOfflineDownloadJobCount.ts` / `KonomiTVBS4KSpeedTestWorker.ts`: BS4K 独自機能向けユーティリティ
+    - `TimeTableUtils.ts` / `RecordedEpisode.ts` / `RecordedEpisodeResolution.ts` / `useOfflineDownloadJobCount.ts` / `KonomiTVBS4KSpeedTestWorker.ts` / `KonomiTVBS4KBrowserCodecSupport.ts`: BS4K 独自機能向けユーティリティ
   - `workers/`: 重い処理をバックグラウンドで実行するための Web Workers コード (with Comlink)
     - `CaptureCompositor.ts` / `CaptureCompositorProxy.ts`: キャプチャ画像合成
     - `LivePSIArchivedDataDecoder.ts` / `LivePSIArchivedDataDecoderProxy.ts`: PSI/SI アーカイブデータのデコード
   - `styles/`: グローバル CSS の定義 (グローバル CSS は `App.vue` の方がメイン)
-  - `router/`: Vue Router 設定
+  - `router/`: Vue Router 設定 (`settings.ts` に情報ページの回線速度計測・コーデック対応ルートを定義)
   - `plugins/`: Vue プラグインの初期化定義
   - `App.vue`: アプリケーションのルートコンポーネント (グローバル CSS 定義もここに含まれる)
   - `main.ts`: アプリケーションのエントリーポイント・初期化処理
@@ -92,6 +92,7 @@
     - `AIBackendRouter.py`: AI バックエンド (OpenCode service / ACP) 管理 API (BS4K 独自)
     - `RecordedSeriesRouter.py`: 録画シリーズ関連 API (BS4K 独自)
     - `KonomiTVBS4KSpeedTestRouter.py`: 回線速度計測 API (BS4K 独自)
+    - `KonomiTVBS4KCodecSupportRouter.py`: 管理者専用コーデック対応診断 API (BS4K 独自)
     - `UsersRouter.py`: ユーザーアカウント管理 API
     - `SettingsRouter.py`: クライアント・サーバー設定管理 API
     - `MaintenanceRouter.py`: サーバーメンテナンス用 API
@@ -152,7 +153,7 @@
     - `ProcessLimiter.py`: プロセスごとの同時実行数を制限するためのユーティリティクラス
     - `AuthSecurity.py` / `DataBroadcastingHTTPClient.py` / `FastAPITaskUtil.py` / `Git.py` / `HLSText.py` / `HTTPS.py` / `HostPath.py` / `LogRotation.py`
     - `KonomiTVBS4KMMTTLV.py` / `KonomiTVBS4KTLVServiceResolver.py` / `KonomiTVBS4KTLVStreamPump.py` / `KonomiTVBS4KTLVMetadataMonitor.py` / `KonomiTVBS4KTLVRainFallbackMonitor.py`: MMT/TLV (BS4K 放送) の受信・処理関連 (BS4K 独自)
-    - `KonomiTVBS4KFastAPIRouteUtils.py` / `KonomiTVBS4KRequestBodyLimit.py` / `KonomiTVBS4KSpeedTest.py` / `KonomiTVBS4KTransactionalSQLite.py`: BS4K 独自のサーバーユーティリティ
+    - `KonomiTVBS4KFastAPIRouteUtils.py` / `KonomiTVBS4KRequestBodyLimit.py` / `KonomiTVBS4KSpeedTest.py` / `KonomiTVBS4KCodecSupport.py` / `KonomiTVBS4KTransactionalSQLite.py`: BS4K 独自のサーバーユーティリティ
   - `app.py`: FastAPI アプリケーションやルーターの初期化・バックグラウンドタスクの定義
   - `CompatibilityAPI.py`: upstream KonomiTV 互換 API (KomorebiV1 プロファイル) の実装 (BS4K 独自)
   - `bs4k_version.py`: KonomiTV-BS4K 固有バージョンの Git タグからの解決 (BS4K 独自)
