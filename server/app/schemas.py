@@ -349,6 +349,7 @@ KonomiTVBS4KPlaybackCapabilityReason = Literal[
     'BitDepthMismatch',
     'ProfileMismatch',
     'UnsupportedCombination',
+    'UnsupportedByDevice',
 ]
 
 
@@ -471,6 +472,81 @@ class KonomiTVBS4KSpeedTestQualityThreshold(BaseModel):
     quality: str
     required_mbps: Annotated[float, Field(gt=0)]
     basis: Literal['VariableBitrate', 'FixedMuxrate']
+
+# ***** コーデック対応 (KonomiTV-BS4K サーバー診断) *****
+
+KonomiTVBS4KCodecSupportStatus = Literal['Idle', 'Running', 'Completed', 'Failed']
+KonomiTVBS4KCodecSupportMediaType = Literal['Video', 'Audio']
+KonomiTVBS4KCodecSupportDeviceKind = Literal['CPU', 'GPU']
+KonomiTVBS4KCodecSupportDeviceVendor = Literal['Intel', 'NVIDIA', 'AMD', 'None']
+KonomiTVBS4KCodecSupportOperationStatus = Literal['Supported', 'Likely', 'Unsupported', 'Unknown']
+KonomiTVBS4KCodecSupportEvidence = Literal[
+    'VerifiedProbe',
+    'Driver',
+    'Binary',
+    'ProbeFailed',
+    'Unavailable',
+]
+KonomiTVBS4KCodecSupportBackend = Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
+KonomiTVBS4KCodecSupportReasonCode = Literal[
+    'BinaryUnavailable',
+    'EncoderUnavailable',
+    'DecoderUnavailable',
+    'DeviceUnavailable',
+    'DeviceInitializationFailed',
+    'FilterUnavailable',
+    'EncodeFailed',
+    'DecodeFailed',
+    'CodecMismatch',
+    'BitDepthMismatch',
+    'ProfileMismatch',
+    'ProbeTimeout',
+    'ProbeFailed',
+    'ProbeInputUnavailable',
+    'UnsupportedCombination',
+    'UnsupportedByDevice',
+]
+
+
+class KonomiTVBS4KCodecSupportJob(BaseModel):
+    """管理者専用のサーバー診断共有ジョブの状態。実行中は部分結果を含む。"""
+
+    status: KonomiTVBS4KCodecSupportStatus
+    progress: Annotated[float, Field(ge=0.0, le=1.0)]
+    environment_signature: str | None
+    devices: list[KonomiTVBS4KCodecSupportDevice]
+
+
+class KonomiTVBS4KCodecSupportDevice(BaseModel):
+    """診断対象の CPU / GPU。render node パス・PCI BDF・UUID・stderr 全文は含めない。"""
+
+    id: str
+    label: str
+    kind: KonomiTVBS4KCodecSupportDeviceKind
+    vendor: KonomiTVBS4KCodecSupportDeviceVendor
+    capabilities: list[KonomiTVBS4KCodecSupportCapability]
+
+
+class KonomiTVBS4KCodecSupportCapability(BaseModel):
+    """1つの映像・音声コーデックの decode / encode 能力。"""
+
+    media_type: KonomiTVBS4KCodecSupportMediaType
+    codec: str
+    profile: str | None
+    bit_depth: Literal[8, 10] | None
+    decode: KonomiTVBS4KCodecSupportOperationSupport
+    encode: KonomiTVBS4KCodecSupportOperationSupport
+    used_by_konomitv_bs4k: bool
+
+
+class KonomiTVBS4KCodecSupportOperationSupport(BaseModel):
+    """1つの decode / encode operation の状態と根拠。"""
+
+    status: KonomiTVBS4KCodecSupportOperationStatus
+    evidence: KonomiTVBS4KCodecSupportEvidence
+    backend: KonomiTVBS4KCodecSupportBackend | None
+    reason_code: KonomiTVBS4KCodecSupportReasonCode | None
+    tested_configuration: str | None
 
 # ***** バックグラウンド解析履歴 *****
 

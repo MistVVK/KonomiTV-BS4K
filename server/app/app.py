@@ -45,6 +45,7 @@ from app.routers import (
     ChannelsRouter,
     CMAnalysisRouter,
     DataBroadcastingRouter,
+    KonomiTVBS4KCodecSupportRouter,
     KonomiTVBS4KSpeedTestRouter,
     LiveStreamsRouter,
     MaintenanceRouter,
@@ -69,6 +70,7 @@ from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
 from app.utils.HTTPS import BuildServerStartupSettings, ReverseProxyMiddleware
+from app.utils.KonomiTVBS4KCodecSupport import KonomiTVBS4KCodecSupportJobManager
 from app.utils.KonomiTVBS4KRequestBodyLimit import (
     MULTIPART_FORM_DATA_OVERHEAD_BYTES,
     KonomiTVBS4KRequestBodyLimit,
@@ -138,6 +140,8 @@ app.include_router(SettingsRouter.router)
 app.include_router(MaintenanceRouter.router)
 app.include_router(VersionRouter.router)
 app.include_router(KonomiTVBS4KSpeedTestRouter.router)
+# コーデック対応のサーバー診断は本線 API だけへ登録し、互換 API には露出させない。
+app.include_router(KonomiTVBS4KCodecSupportRouter.router)
 
 # FastAPI は認証 dependency より前に form 全体を解析するため、対象ルートだけ ASGI 層で本文を制限する。
 ## 画像は KonomiTV-BS4K が生成・保存できる Capture 1 枚 20 MiB を共通の入力上限とし、
@@ -496,6 +500,9 @@ async def _RunShutdownCleanup() -> None:
 
     # 録画モデル・fMP4キャッシュを参照する生成ジョブを、DB接続終了前に中断状態へ確定する。
     await RunCleanupStep('[KonomiTVBS4KOfflineJobManager]', KonomiTVBS4KOfflineJobManager.stop())
+
+    # サーバー診断ジョブはDBを使わないが、プロセス終了前に実行中ジョブをキャンセルして外部プロセスを回収する。
+    await RunCleanupStep('[KonomiTVBS4KCodecSupportJobManager]', KonomiTVBS4KCodecSupportJobManager.stop())
 
     # DB接続が閉じられる前に録画再生用インデックスワーカーを停止する。
     await RunCleanupStep('[RecordedPlaybackIndexer]', RecordedPlaybackIndexer.stop())

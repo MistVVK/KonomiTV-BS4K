@@ -398,6 +398,7 @@ class RecordedPlaybackBackend:
         device: str | None,
         *,
         quality: QUALITY_TYPES | None = None,
+        cuda_ordinal: int | None = None,
     ) -> list[str]:
         """能力検査用の短いfMP4生成コマンドを構築する。
 
@@ -408,6 +409,7 @@ class RecordedPlaybackBackend:
             output_path: 検査用fMP4の出力先。
             device: QSV/AMFで使うrender node。CPU/NVENCではNone。
             quality: 実再生相当の出力解像度・フレームレートを検査する画質。
+            cuda_ordinal: NVENCで使うCUDAデバイス番号。Noneなら0。
 
         Returns:
             create_subprocess_exec()へそのまま渡せる完全な引数列。
@@ -429,7 +431,12 @@ class RecordedPlaybackBackend:
                 raise ValueError('QSV render device is required.')
             command += ['-init_hw_device', f'qsv=recorded_qsv:{device}', '-filter_hw_device', 'recorded_qsv']
         elif encoder == 'NVENC':
-            command += ['-init_hw_device', 'cuda=recorded_cuda:0', '-filter_hw_device', 'recorded_cuda']
+            command += [
+                '-init_hw_device',
+                f'cuda=recorded_cuda:{cuda_ordinal if cuda_ordinal is not None else 0}',
+                '-filter_hw_device',
+                'recorded_cuda',
+            ]
         elif encoder == 'AMF':
             if device is None:
                 raise ValueError('AMD render device is required.')
@@ -1075,4 +1082,8 @@ class RecordedPlaybackCapabilityProbe:
             'error initializing filter',
         )):
             return 'FilterUnavailable'
+        # NVENC が encoder open 時に返す能力不足エラーは一時障害ではなく決定的な非対応なので、
+        # EncodeFailed (再試行で直る可能性のある失敗) とは区別する
+        if "provided device doesn't support required nvenc features" in normalized_stderr:
+            return 'UnsupportedByDevice'
         return 'EncodeFailed'

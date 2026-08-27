@@ -369,6 +369,7 @@ KonomiTVBS4KPlaybackCapabilityReason = Literal[
     'BitDepthMismatch',
     'ProfileMismatch',
     'UnsupportedCombination',
+    'UnsupportedByDevice',
 ]
 
 
