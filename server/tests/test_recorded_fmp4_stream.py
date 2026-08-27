@@ -1200,7 +1200,7 @@ def test_opus_master_uses_maximum_timeline_channels_codec_and_bandwidth(monkeypa
     expected_bandwidth = 3_150_000 + 256_000 * 5 // 4
 
     assert 'CHANNELS="6"' in master
-    assert 'CODECS="av01.0.10M.10,opus"' in master
+    assert 'CODECS="av01.0.10M.10,Opus"' in master
     assert f'BANDWIDTH={expected_bandwidth}' in master
     assert 'video_codec=av1' in master
     assert 'audio_codec=opus' in master

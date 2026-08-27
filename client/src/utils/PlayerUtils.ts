@@ -280,9 +280,9 @@ export class PlayerUtils {
     static getKonomiTVBS4KPlaybackAudioMIMEType(
         konomitv_bs4k_codec: KonomiTVBS4KPlaybackAudioCodec,
     ): string {
-        // Safari は ISO BMFF の Opus sample entry 名である大文字の Opus しか受け付けない
+        // ISO BMFF の Opus sample entry と RFC 6381 codec string は大文字小文字を区別する Opus。
         return konomitv_bs4k_codec === 'opus' ?
-            `audio/mp4; codecs="${Utils.isSafari() ? 'Opus' : 'opus'}"` :
+            'audio/mp4; codecs="Opus"' :
             'audio/mp4; codecs="mp4a.40.2"';
     }
 

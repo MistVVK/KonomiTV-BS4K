@@ -4,7 +4,6 @@ import { PlayerUtils } from '@/utils';
 import {
     KONOMITV_BS4K_BROWSER_AUDIO_CATALOG,
     KONOMITV_BS4K_BROWSER_VIDEO_CATALOG,
-    estimateKonomiTVBS4KBrowserVideoHardware,
     judgeKonomiTVBS4KBrowserAudioSupport,
     judgeKonomiTVBS4KBrowserVideoSupport,
     runKonomiTVBS4KBrowserCodecSupportDiagnostics,
@@ -173,114 +172,6 @@ describe('judgeKonomiTVBS4KBrowserAudioSupport', () => {
     });
 });
 
-describe('estimateKonomiTVBS4KBrowserVideoHardware', () => {
-    it('ブラウザ非対応なら NotApplicable を返す', () => {
-        const result = estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Chromium',
-            browser_support: 'Unsupported',
-            power_efficient: true,
-            web_codecs_prefer_hardware: 'Supported',
-            web_codecs_no_preference: 'Supported',
-        });
-        expect(result).toBe('NotApplicable');
-    });
-
-    it('ブラウザ対応が不明なら Unknown を返す', () => {
-        const result = estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Chromium',
-            browser_support: 'Unknown',
-            power_efficient: true,
-            web_codecs_prefer_hardware: 'Supported',
-            web_codecs_no_preference: 'Supported',
-        });
-        expect(result).toBe('Unknown');
-    });
-
-    it('Chromium では WebCodecs の prefer-hardware が主根拠になる', () => {
-        expect(estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Chromium',
-            browser_support: 'Supported',
-            power_efficient: false,
-            web_codecs_prefer_hardware: 'Supported',
-            web_codecs_no_preference: 'Supported',
-        })).toBe('HardwareLikely');
-        expect(estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Chromium',
-            browser_support: 'Supported',
-            power_efficient: true,
-            web_codecs_prefer_hardware: 'Unsupported',
-            web_codecs_no_preference: 'Supported',
-        })).toBe('SoftwareLikely');
-    });
-
-    it('Chromium で WebCodecs が無いなら powerEfficient にフォールバックする', () => {
-        expect(estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Chromium',
-            browser_support: 'Likely',
-            power_efficient: true,
-            web_codecs_prefer_hardware: 'Unavailable',
-            web_codecs_no_preference: 'Unavailable',
-        })).toBe('HardwareLikely');
-        expect(estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Chromium',
-            browser_support: 'Likely',
-            power_efficient: false,
-            web_codecs_prefer_hardware: 'Unavailable',
-            web_codecs_no_preference: 'Unavailable',
-        })).toBe('SoftwareLikely');
-    });
-
-    it('Gecko / WebKit では powerEfficient が主根拠になる', () => {
-        for (const engine of ['Gecko', 'WebKit'] as const) {
-            expect(estimateKonomiTVBS4KBrowserVideoHardware({
-                engine,
-                browser_support: 'Supported',
-                power_efficient: true,
-                web_codecs_prefer_hardware: 'Unavailable',
-                web_codecs_no_preference: 'Unavailable',
-            })).toBe('HardwareLikely');
-            expect(estimateKonomiTVBS4KBrowserVideoHardware({
-                engine,
-                browser_support: 'Supported',
-                power_efficient: false,
-                web_codecs_prefer_hardware: 'Unavailable',
-                web_codecs_no_preference: 'Unavailable',
-            })).toBe('SoftwareLikely');
-            expect(estimateKonomiTVBS4KBrowserVideoHardware({
-                engine,
-                browser_support: 'Supported',
-                power_efficient: null,
-                web_codecs_prefer_hardware: 'Unavailable',
-                web_codecs_no_preference: 'Unavailable',
-            })).toBe('Unknown');
-        }
-    });
-
-    it('Unknown エンジンでは両ソースが一致した時のみ推定する', () => {
-        expect(estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Unknown',
-            browser_support: 'Supported',
-            power_efficient: true,
-            web_codecs_prefer_hardware: 'Supported',
-            web_codecs_no_preference: 'Supported',
-        })).toBe('HardwareLikely');
-        expect(estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Unknown',
-            browser_support: 'Supported',
-            power_efficient: false,
-            web_codecs_prefer_hardware: 'Unsupported',
-            web_codecs_no_preference: 'Supported',
-        })).toBe('SoftwareLikely');
-        expect(estimateKonomiTVBS4KBrowserVideoHardware({
-            engine: 'Unknown',
-            browser_support: 'Supported',
-            power_efficient: true,
-            web_codecs_prefer_hardware: 'Unsupported',
-            web_codecs_no_preference: 'Supported',
-        })).toBe('Unknown');
-    });
-});
-
 describe('runKonomiTVBS4KBrowserCodecSupportDiagnostics', () => {
     const original_media_capabilities = navigator.mediaCapabilities;
     const original_media_source = window.MediaSource;
@@ -350,15 +241,13 @@ describe('runKonomiTVBS4KBrowserCodecSupportDiagnostics', () => {
             web_codecs_audio_encoder: true,
         });
 
-        // 映像 decode: 全行 Supported + WebCodecs 対応。
-        // happy-dom の UA は Chromium / Firefox / Safari どれもに該当しないため
-        // engine は Unknown となり、WebCodecs + powerEfficient の一致で HardwareLikely になる。
+        // 映像 decode: 全行 Supported + smooth + WebCodecs 対応。
         expect(result.video_decode.length).toBe(KONOMITV_BS4K_BROWSER_VIDEO_CATALOG.length);
         for (const row of result.video_decode) {
             expect(row.browser_support).toBe('Supported');
             expect(row.web_codecs_prefer_hardware).toBe('Supported');
             expect(row.web_codecs_no_preference).toBe('Supported');
-            expect(row.hardware_estimate).toBe('HardwareLikely');
+            expect(row.smooth).toBe(true);
             if (row.used_by_konomitv_bs4k === true) {
                 expect(row.konomitv_playback).toBe(true);
             } else {
@@ -418,7 +307,7 @@ describe('runKonomiTVBS4KBrowserCodecSupportDiagnostics', () => {
             expect(row.browser_support).toBe('Unsupported');
             expect(row.web_codecs_prefer_hardware).toBe('Unavailable');
             expect(row.web_codecs_no_preference).toBe('Unavailable');
-            expect(row.hardware_estimate).toBe('NotApplicable');
+            expect(row.smooth).toBeNull();
             if (row.used_by_konomitv_bs4k === true) {
                 expect(row.konomitv_playback).toBe(false);
             }
@@ -435,7 +324,7 @@ describe('runKonomiTVBS4KBrowserCodecSupportDiagnostics', () => {
         }
     });
 
-    it('WebCodecs の形状は supported:false で固定せず supported:true の形状を採用する', async () => {
+    it('WebCodecs decoder は正規の codedWidth / codedHeight が非対応なら非対応を返す', async () => {
         Object.defineProperty(navigator, 'mediaCapabilities', {
             value: {
                 decodingInfo: vi.fn().mockResolvedValue({
@@ -452,11 +341,8 @@ describe('runKonomiTVBS4KBrowserCodecSupportDiagnostics', () => {
                 return true;
             }
         };
-        // decoder: CodedSize は supported:false、WidthHeight は true を返す実装を再現。
-        // 旧実装では CodedSize の false で形状が固定され全行が誤った形状に張り付いた。
-        const decoder_mock = vi.fn()
-            .mockResolvedValueOnce({supported: false})
-            .mockResolvedValue({supported: true});
+        // width / height fallback は未知フィールドが無視されるため試さず、正規構成の結果を採用する。
+        const decoder_mock = vi.fn().mockResolvedValue({supported: false});
         globalThis.VideoDecoder = {
             isConfigSupported: decoder_mock,
         };
@@ -473,9 +359,18 @@ describe('runKonomiTVBS4KBrowserCodecSupportDiagnostics', () => {
 
         const result = await runKonomiTVBS4KBrowserCodecSupportDiagnostics();
 
-        // decoder の全行が Supported になる（false 形状に張り付いていない）ことを確認する
+        // decoder の全行が正規構成どおり Unsupported になることを確認する。
         for (const row of result.video_decode) {
-            expect(row.web_codecs_prefer_hardware).toBe('Supported');
+            expect(row.web_codecs_prefer_hardware).toBe('Unsupported');
+            expect(row.web_codecs_no_preference).toBe('Unsupported');
+        }
+        expect(decoder_mock).toHaveBeenCalledTimes(KONOMITV_BS4K_BROWSER_VIDEO_CATALOG.length * 2);
+        for (const [config] of decoder_mock.mock.calls) {
+            expect(config).toHaveProperty('codedWidth');
+            expect(config).toHaveProperty('codedHeight');
+            expect(config).not.toHaveProperty('width');
+            expect(config).not.toHaveProperty('height');
+            expect(config).not.toHaveProperty('video');
         }
     });
 });

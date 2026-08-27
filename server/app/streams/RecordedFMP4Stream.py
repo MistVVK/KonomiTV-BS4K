@@ -972,7 +972,7 @@ class RecordedFMP4Stream:
                     'message': 'The generated initialization segment has no supported codec configuration.',
                 },
             )
-        audio_codec_string = 'opus' if self._effective_audio_codec == 'opus' else 'mp4a.40.2'
+        audio_codec_string = 'Opus' if self._effective_audio_codec == 'opus' else 'mp4a.40.2'
         codec_attribute = f'{codec_string},{audio_codec_string}' if len(renditions) > 0 else codec_string
         stream_attributes = [
             f'BANDWIDTH={bandwidth + self.__getAudioBandwidth(renditions)}',
@@ -1246,7 +1246,7 @@ class RecordedFMP4Stream:
 
         # OpusSampleEntryは大文字のOpus、構成boxはdOpsで識別される。
         if b'Opus' in init_segment and b'dOps' in init_segment:
-            return 'opus'
+            return 'Opus'
         configuration = cls.extractAACInitializationConfiguration(init_segment)
         return f'mp4a.40.{configuration[0]}' if configuration is not None else None
 
@@ -4610,7 +4610,7 @@ class RecordedFMP4Stream:
         """
 
         info = cls.inspectAudioFragment(init_data, media_data)
-        expected_codec = 'mp4a.40.2' if audio_codec == 'aac' else 'opus'
+        expected_codec = 'mp4a.40.2' if audio_codec == 'aac' else 'Opus'
         frame_samples = cls.AAC_PACKET_SAMPLES if audio_codec == 'aac' else 960
         if info is None or not (
             cls.extractAudioCodecString(init_data) == expected_codec and

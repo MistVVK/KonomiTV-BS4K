@@ -8,9 +8,9 @@
  *   優先度の高いソースが「対応」と報告したのに低いソースが「非対応」と報告しているなど、
  *   複数ソースが矛盾する場合は断定せず Unknown を返す。
  * - 使えるのが canPlayType や MSE の isTypeSupported のみなら「推定対応」(Likely) と扱う。
- * - 映像のハードウェアアクセラレーションは推定値であり、エンジン別の主要根拠を使う。
- *   Blink は WebCodecs の prefer-hardware 結果、Gecko / WebKit は MediaCapabilities の
- *   powerEfficient を主要根拠とする (Safari の smooth は参考値に留める)。
+ * - MediaCapabilities の smooth / powerEfficient と WebCodecs の hardwareAcceleration は、
+ *   それぞれ仕様どおり独立した値として表示する。どれも HW 利用の証拠にはならないため、
+ *   HW / SW の種別へ読み替えない。
  * - KonomiTV-BS4K の実再生可否は PlayerUtils が実際に使う MSE / ManagedMediaSource 判定を
  *   そのまま参照する。診断側の独自判定と実再生経路の判定が分岐しないようにするため。
  */
@@ -43,13 +43,6 @@ export type KonomiTVBS4KBrowserEvidence =
     'MediaSource' |
     'CanPlayType' |
     'None';
-
-/** 映像のハードウェアアクセラレーション推定値。推定であることを読み手に示す命名を意図する。 */
-export type KonomiTVBS4KBrowserHardwareEstimate =
-    'HardwareLikely' |
-    'SoftwareLikely' |
-    'Unknown' |
-    'NotApplicable';
 
 /** 単一 Web API の個別プローブ結果。API 自体が存在しない場合は Unavailable。 */
 export type KonomiTVBS4KBrowserWebApiProbe = 'Supported' | 'Unsupported' | 'Unavailable';
@@ -148,7 +141,7 @@ export const KONOMITV_BS4K_BROWSER_VIDEO_CATALOG: readonly IKonomiTVBS4KBrowserV
         representative_bitrate: KONOMITV_BS4K_BROWSER_BITRATE_1080P30,
         used_by_konomitv_bs4k: false,
         // Baseline は再生本線に使わないため、診断用の固定 codec string を使う。
-        mime_type: 'video/mp4; codecs="avc1.42001E"',
+        mime_type: 'video/mp4; codecs="avc1.420028"',
     },
     {
         id: 'avc-high-8-1080p60',
@@ -562,8 +555,7 @@ export const KONOMITV_BS4K_BROWSER_AUDIO_CATALOG: readonly IKonomiTVBS4KBrowserA
         label: 'Opus',
         codec: 'Opus',
         used_by_konomitv_bs4k: true,
-        // MIME は実再生経路と同じく PlayerUtils の生成値を使う。Safari は ISO BMFF の
-        // sample entry 名である大文字 Opus しか受け付けず、ブラウザ対応判定と実再生判定が割れるため。
+        // MIME は実再生経路と同じく PlayerUtils が生成する ISO BMFF の Opus codec string を使う。
         probe_mime_type: PlayerUtils.getKonomiTVBS4KPlaybackAudioMIMEType('opus'),
         // WebCodecs の codec string 登録値は小文字の opus のため、MIME とは別に保持する。
         web_codecs_codec: 'opus',
@@ -648,7 +640,8 @@ export interface IKonomiTVBS4KBrowserVideoDecodeResult {
     used_by_konomitv_bs4k: boolean;
     browser_support: KonomiTVBS4KBrowserSupportStatus;
     browser_evidence: KonomiTVBS4KBrowserEvidence;
-    hardware_estimate: KonomiTVBS4KBrowserHardwareEstimate;
+    /** MediaCapabilities の smooth。API 未対応・失敗時は null。 */
+    smooth: boolean | null;
     /** MediaCapabilities の powerEfficient。API 未対応時は null。参考値として表示する。 */
     power_efficient: boolean | null;
     web_codecs_prefer_hardware: KonomiTVBS4KBrowserWebCodecsProbe;
@@ -690,40 +683,23 @@ export interface IKonomiTVBS4KBrowserCodecSupportResult {
     audio: IKonomiTVBS4KBrowserAudioResult[];
 }
 
-// WebCodecs の config 形状は仕様の改訂で入れ子 { video: {...} } / { audio: {...} } 形状から
-// フラット { codec, ... } 形状へ変わり、実装によってサポート形状が異なる。
-// 両形状をここで定義し、プローブ時に両方試す。
+// AudioDecoder / AudioEncoder は TS 5.5 の lib.dom に未定義のため、音声だけローカル型を定義する。
 interface IKonomiTVBS4KBrowserWebCodecsVideoConfig {
-    codec?: string;
+    codec: string;
     codedWidth?: number;
     codedHeight?: number;
     width?: number;
     height?: number;
     bitrate?: number;
     framerate?: number;
-    video?: {
-        codec: string;
-        codedWidth?: number;
-        codedHeight?: number;
-        width?: number;
-        height?: number;
-        bitrate?: number;
-        framerate?: number;
-    };
     hardwareAcceleration?: 'no-preference' | 'prefer-hardware' | 'prefer-software';
 }
 
 interface IKonomiTVBS4KBrowserWebCodecsAudioConfig {
-    codec?: string;
-    numberOfChannels?: number;
-    sampleRate?: number;
+    codec: string;
+    numberOfChannels: number;
+    sampleRate: number;
     bitrate?: number;
-    audio?: {
-        codec: string;
-        channels?: number;
-        bitrate?: number;
-        samplerate?: number;
-    };
 }
 
 interface IKonomiTVBS4KBrowserWebCodecsAudioStatic {
@@ -744,11 +720,6 @@ const KONOMITV_BS4K_BROWSER_MEDIA_CAPABILITIES_CONCURRENCY = 1;
 export type KonomiTVBS4KBrowserProbeOutcome<T> =
     {status: 'Resolved'; value: T} |
     {status: 'TimedOut' | 'Rejected' | 'Aborted'};
-
-// supported: true が返った WebCodecs config 形状を以降の行でも使い、2 形状の直列試行を避ける。
-// supported: false の形状は実装が未知の形状を「非対応」と解決している可能性があるため採用しない。
-let konomitv_bs4k_browser_video_decoder_shape: 'CodedSize' | 'WidthHeight' | 'Nested' | null = null;
-let konomitv_bs4k_browser_video_encoder_shape: 'WidthHeight' | 'Nested' | null = null;
 
 async function withKonomiTVBS4KBrowserProbeTimeout<T>(
     probe: Promise<T>,
@@ -812,8 +783,7 @@ async function mapKonomiTVBS4KBrowserProbes<Item, Result>(
 /**
  * 実行環境の概要を検出する。
  *
- * WebGL レンダラは GPU の「参考情報」であり、HW アクセラレーションの判定根拠には使わない。
- * 実際の HW 推定は WebCodecs / MediaCapabilities の API 結果から行うため。
+ * WebGL レンダラは GPU の「参考情報」であり、コーデック対応の判定根拠には使わない。
  */
 export function detectKonomiTVBS4KBrowserCodecSupportEnvironment():
 IKonomiTVBS4KBrowserCodecSupportEnvironment {
@@ -950,68 +920,6 @@ export function judgeKonomiTVBS4KBrowserAudioSupport(params: {
     return {support: 'Likely', evidence: 'CanPlayType'};
 }
 
-/**
- * 映像のハードウェアアクセラレーションを推定する。
- *
- * エンジン別の主要根拠:
- * - Chromium: WebCodecs の prefer-hardware 結果が主。未利用時は MediaCapabilities の powerEfficient。
- * - Gecko / WebKit: MediaCapabilities の powerEfficient が主。
- * - Unknown: WebCodecs と powerEfficient が揃って一致した時のみ断定する。
- */
-export function estimateKonomiTVBS4KBrowserVideoHardware(params: {
-    engine: KonomiTVBS4KBrowserEngine;
-    browser_support: KonomiTVBS4KBrowserSupportStatus;
-    power_efficient: boolean | null;
-    web_codecs_prefer_hardware: KonomiTVBS4KBrowserWebCodecsProbe;
-    web_codecs_no_preference: KonomiTVBS4KBrowserWebCodecsProbe;
-}): KonomiTVBS4KBrowserHardwareEstimate {
-    const {engine, browser_support, power_efficient, web_codecs_prefer_hardware, web_codecs_no_preference} = params;
-    if (browser_support === 'Unsupported') {
-        return 'NotApplicable';
-    }
-    if (browser_support === 'Unknown') {
-        return 'Unknown';
-    }
-    if (engine === 'Chromium') {
-        // WebCodecs の prefer-hardware が「対応」なら HW 推定、
-        // prefer-hardware 非対応で通常設定は対応なら SW 推定。
-        if (web_codecs_prefer_hardware === 'Supported') {
-            return 'HardwareLikely';
-        }
-        if (web_codecs_prefer_hardware === 'Unsupported') {
-            if (web_codecs_no_preference === 'Supported') {
-                return 'SoftwareLikely';
-            }
-            return 'Unknown';
-        }
-        // WebCodecs 未対応環境は powerEfficient にフォールバックする。
-        if (power_efficient === true) {
-            return 'HardwareLikely';
-        }
-        if (power_efficient === false) {
-            return 'SoftwareLikely';
-        }
-        return 'Unknown';
-    }
-    if (engine === 'Gecko' || engine === 'WebKit') {
-        if (power_efficient === true) {
-            return 'HardwareLikely';
-        }
-        if (power_efficient === false) {
-            return 'SoftwareLikely';
-        }
-        return 'Unknown';
-    }
-    // Unknown エンジン: 両ソースが揃って一致した時のみ推定する。
-    if (web_codecs_prefer_hardware === 'Supported' && power_efficient === true) {
-        return 'HardwareLikely';
-    }
-    if (web_codecs_no_preference === 'Supported' && power_efficient === false) {
-        return 'SoftwareLikely';
-    }
-    return 'Unknown';
-}
-
 function extractKonomiTVBS4KBrowserMIMECodec(mime_type: string): string {
     const match = mime_type.match(/\bcodecs\s*=\s*"([^"]+)"/i);
     if (match === null) {
@@ -1038,6 +946,7 @@ function probeKonomiTVBS4KBrowserCanPlayType(
 /** MediaCapabilities プローブの詳細結果。失敗時は理由を保持し、判定材料を失わないようにする。 */
 interface IKonomiTVBS4KBrowserMediaCapabilitiesResult {
     probe: KonomiTVBS4KBrowserWebApiProbe;
+    smooth: boolean | null;
     power_efficient: boolean | null;
     failure: 'TimedOut' | 'Rejected' | 'Aborted' | null;
 }
@@ -1052,7 +961,7 @@ async function probeKonomiTVBS4KBrowserMediaCapabilitiesVideo(params: {
     signal?: AbortSignal;
 }): Promise<IKonomiTVBS4KBrowserMediaCapabilitiesResult> {
     if (params.available === false) {
-        return {probe: 'Unavailable', power_efficient: null, failure: null};
+        return {probe: 'Unavailable', smooth: null, power_efficient: null, failure: null};
     }
     const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
         navigator.mediaCapabilities.decodingInfo({
@@ -1068,10 +977,11 @@ async function probeKonomiTVBS4KBrowserMediaCapabilitiesVideo(params: {
         params.signal,
     );
     if (outcome.status !== 'Resolved') {
-        return {probe: 'Unavailable', power_efficient: null, failure: outcome.status};
+        return {probe: 'Unavailable', smooth: null, power_efficient: null, failure: outcome.status};
     }
     return {
         probe: outcome.value.supported === true ? 'Supported' : 'Unsupported',
+        smooth: outcome.value.smooth,
         power_efficient: outcome.value.powerEfficient,
         failure: null,
     };
@@ -1090,7 +1000,7 @@ async function probeKonomiTVBS4KBrowserMediaCapabilitiesAudio(params: {
     signal?: AbortSignal;
 }): Promise<IKonomiTVBS4KBrowserMediaCapabilitiesResult> {
     if (params.available === false) {
-        return {probe: 'Unavailable', power_efficient: null, failure: null};
+        return {probe: 'Unavailable', smooth: null, power_efficient: null, failure: null};
     }
     const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
         navigator.mediaCapabilities.decodingInfo({
@@ -1105,10 +1015,11 @@ async function probeKonomiTVBS4KBrowserMediaCapabilitiesAudio(params: {
         params.signal,
     );
     if (outcome.status !== 'Resolved') {
-        return {probe: 'Unavailable', power_efficient: null, failure: outcome.status};
+        return {probe: 'Unavailable', smooth: null, power_efficient: null, failure: outcome.status};
     }
     return {
         probe: outcome.value.supported === true ? 'Supported' : 'Unsupported',
+        smooth: outcome.value.smooth,
         power_efficient: outcome.value.powerEfficient,
         failure: null,
     };
@@ -1134,11 +1045,6 @@ function probeKonomiTVBS4KBrowserMediaSource(mime_type: string): KonomiTVBS4KBro
     return media_source_ok && managed_media_source_ok ? 'Supported' : 'Unsupported';
 }
 
-/**
- * 新旧両方の config 形状で isConfigSupported を試し、
- * 拒否されない形状の結果を返す。
- * どちらの形状も reject した場合は Unavailable。
- */
 function withKonomiTVBS4KBrowserHardwareAcceleration(
     config: IKonomiTVBS4KBrowserWebCodecsVideoConfig,
     hardware_acceleration?: 'prefer-hardware' | 'prefer-software' | 'no-preference',
@@ -1150,77 +1056,30 @@ function withKonomiTVBS4KBrowserHardwareAcceleration(
 }
 
 async function probeKonomiTVBS4KBrowserVideoDecoderWebCodecs(params: {
-    mime_type: string;
     codec: string;
     width: number;
     height: number;
     hardware_acceleration?: 'prefer-hardware' | 'prefer-software' | 'no-preference';
     signal?: AbortSignal;
 }): Promise<KonomiTVBS4KBrowserWebCodecsProbe> {
-    // WebCodecs の VideoDecoderConfig に type フィールドは存在しない。未知フィールドを拒否する
-    // 実装で全行が N/A にならないよう、MediaCapabilities 用の container 情報は渡さない。
-    const candidates: Array<{
-        shape: 'CodedSize' | 'WidthHeight' | 'Nested';
-        config: IKonomiTVBS4KBrowserWebCodecsVideoConfig;
-    }> = [
-        {
-            // 現行 VideoDecoderConfig は codedWidth / codedHeight で解像度を見る。
-            shape: 'CodedSize',
-            config: withKonomiTVBS4KBrowserHardwareAcceleration({
-                codec: params.codec,
-                codedWidth: params.width,
-                codedHeight: params.height,
-            }, params.hardware_acceleration),
-        },
-        {
-            shape: 'WidthHeight',
-            config: withKonomiTVBS4KBrowserHardwareAcceleration({
-                codec: params.codec,
-                width: params.width,
-                height: params.height,
-            }, params.hardware_acceleration),
-        },
-        {
-            shape: 'Nested',
-            config: withKonomiTVBS4KBrowserHardwareAcceleration({
-                video: {
-                    codec: params.codec,
-                    codedWidth: params.width,
-                    codedHeight: params.height,
-                    width: params.width,
-                    height: params.height,
-                },
-            }, params.hardware_acceleration),
-        },
-    ];
-    const preferred = konomitv_bs4k_browser_video_decoder_shape;
-    const ordered = preferred === null ?
-        candidates :
-        [
-            ...candidates.filter(candidate => candidate.shape === preferred),
-            ...candidates.filter(candidate => candidate.shape !== preferred),
-        ];
-    // 形状の固定は supported: true が返った形状だけにする。supported: false で固定すると、
-    // その形状を「非対応」と解決する実装で残りの形状を試さず全行が誤った形状に張り付くため。
-    let resolved_unsupported = false;
-    for (const candidate of ordered) {
-        const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
-            VideoDecoder.isConfigSupported(candidate.config as unknown as VideoDecoderConfig),
-            params.signal,
-        );
-        if (outcome.status === 'Resolved') {
-            if (outcome.value.supported === true) {
-                konomitv_bs4k_browser_video_decoder_shape = candidate.shape;
-                return 'Supported';
-            }
-            resolved_unsupported = true;
-        }
+    // VideoDecoderConfig の解像度は codedWidth / codedHeight だけが正規フィールド。
+    // width / height は未知フィールドとして無視され codec 単体の false positive になるため試さない。
+    const config = withKonomiTVBS4KBrowserHardwareAcceleration({
+        codec: params.codec,
+        codedWidth: params.width,
+        codedHeight: params.height,
+    }, params.hardware_acceleration);
+    const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
+        VideoDecoder.isConfigSupported(config as VideoDecoderConfig),
+        params.signal,
+    );
+    if (outcome.status !== 'Resolved') {
+        return 'Unavailable';
     }
-    return resolved_unsupported === true ? 'Unsupported' : 'Unavailable';
+    return outcome.value.supported === true ? 'Supported' : 'Unsupported';
 }
 
 async function probeKonomiTVBS4KBrowserVideoEncoderWebCodecs(params: {
-    mime_type: string;
     codec: string;
     width: number;
     height: number;
@@ -1229,67 +1088,29 @@ async function probeKonomiTVBS4KBrowserVideoEncoderWebCodecs(params: {
     hardware_acceleration?: 'prefer-hardware' | 'prefer-software' | 'no-preference';
     signal?: AbortSignal;
 }): Promise<KonomiTVBS4KBrowserWebCodecsProbe> {
-    const candidates: Array<{
-        shape: 'WidthHeight' | 'Nested';
-        config: IKonomiTVBS4KBrowserWebCodecsVideoConfig;
-    }> = [
-        {
-            // VideoEncoderConfig は width / height / bitrate / framerate が正本。
-            shape: 'WidthHeight',
-            config: withKonomiTVBS4KBrowserHardwareAcceleration({
-                codec: params.codec,
-                width: params.width,
-                height: params.height,
-                bitrate: params.bitrate,
-                framerate: params.framerate,
-            }, params.hardware_acceleration),
-        },
-        {
-            shape: 'Nested',
-            config: withKonomiTVBS4KBrowserHardwareAcceleration({
-                video: {
-                    codec: params.codec,
-                    width: params.width,
-                    height: params.height,
-                    bitrate: params.bitrate,
-                    framerate: params.framerate,
-                },
-            }, params.hardware_acceleration),
-        },
-    ];
-    const preferred = konomitv_bs4k_browser_video_encoder_shape;
-    const ordered = preferred === null ?
-        candidates :
-        [
-            ...candidates.filter(candidate => candidate.shape === preferred),
-            ...candidates.filter(candidate => candidate.shape !== preferred),
-        ];
-    // decoder と同じく、形状の固定は supported: true が返った形状だけにする
-    let resolved_unsupported = false;
-    for (const candidate of ordered) {
-        const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
-            VideoEncoder.isConfigSupported(candidate.config as unknown as VideoEncoderConfig),
-            params.signal,
-        );
-        if (outcome.status === 'Resolved') {
-            if (outcome.value.supported === true) {
-                konomitv_bs4k_browser_video_encoder_shape = candidate.shape;
-                return 'Supported';
-            }
-            resolved_unsupported = true;
-        }
+    // VideoEncoderConfig は width / height / bitrate / framerate が正規フィールド。
+    const config = withKonomiTVBS4KBrowserHardwareAcceleration({
+        codec: params.codec,
+        width: params.width,
+        height: params.height,
+        bitrate: params.bitrate,
+        framerate: params.framerate,
+    }, params.hardware_acceleration);
+    const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
+        VideoEncoder.isConfigSupported(config as VideoEncoderConfig),
+        params.signal,
+    );
+    if (outcome.status !== 'Resolved') {
+        return 'Unavailable';
     }
-    return resolved_unsupported === true ? 'Unsupported' : 'Unavailable';
+    return outcome.value.supported === true ? 'Supported' : 'Unsupported';
 }
 
 async function probeKonomiTVBS4KBrowserVideoCodec(params: {
     available: boolean;
-    mime_type: string;
     codec: string;
     width: number;
     height: number;
-    bitrate: number;
-    framerate: number;
     hardware_acceleration?: 'prefer-hardware' | 'prefer-software' | 'no-preference';
     signal?: AbortSignal;
 }): Promise<KonomiTVBS4KBrowserWebCodecsProbe> {
@@ -1297,7 +1118,6 @@ async function probeKonomiTVBS4KBrowserVideoCodec(params: {
         return 'Unavailable';
     }
     return await probeKonomiTVBS4KBrowserVideoDecoderWebCodecs({
-        mime_type: params.mime_type,
         codec: params.codec,
         width: params.width,
         height: params.height,
@@ -1308,7 +1128,6 @@ async function probeKonomiTVBS4KBrowserVideoCodec(params: {
 
 async function probeKonomiTVBS4KBrowserVideoEncoder(params: {
     available: boolean;
-    mime_type: string;
     codec: string;
     width: number;
     height: number;
@@ -1325,7 +1144,6 @@ async function probeKonomiTVBS4KBrowserVideoEncoder(params: {
 
 async function probeKonomiTVBS4KBrowserAudioWebCodecs(params: {
     api: 'AudioDecoder' | 'AudioEncoder';
-    mime_type: string;
     codec: string;
     bitrate: number;
     samplerate: number;
@@ -1340,39 +1158,22 @@ async function probeKonomiTVBS4KBrowserAudioWebCodecs(params: {
     if (target_api === undefined) {
         return 'Unavailable';
     }
-    // AudioDecoderConfig は仕様どおり codec / numberOfChannels / sampleRate が必須。
-    // 入れ子形状は古い実験実装向けのフォールバック。type は MediaCapabilities 用の情報で
-    // WebCodecs の config には存在しないため渡さない。
-    const flat_config: IKonomiTVBS4KBrowserWebCodecsAudioConfig = {
+    // AudioDecoderConfig / AudioEncoderConfig は codec / numberOfChannels / sampleRate が必須。
+    // 未定義の入れ子形状は必須 codec を欠き、適合実装では必ず reject されるため試さない。
+    const config: IKonomiTVBS4KBrowserWebCodecsAudioConfig = {
         codec: params.codec,
         numberOfChannels: 2,
         sampleRate: params.samplerate,
         bitrate: params.bitrate,
     };
-    const nested_config: IKonomiTVBS4KBrowserWebCodecsAudioConfig = {
-        audio: {
-            codec: params.codec,
-            channels: 2,
-            bitrate: params.bitrate,
-            samplerate: params.samplerate,
-        },
-    };
-    // flat が supported: false で解決しても nested を試す。false で打ち切ると、
-    // 未知の形状を「非対応」と解決する実装で誤った非対応表示になるため。
-    let resolved_unsupported = false;
-    for (const config of [flat_config, nested_config]) {
-        const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
-            target_api.isConfigSupported(config),
-            params.signal,
-        );
-        if (outcome.status === 'Resolved') {
-            if (outcome.value.supported === true) {
-                return 'Supported';
-            }
-            resolved_unsupported = true;
-        }
+    const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
+        target_api.isConfigSupported(config),
+        params.signal,
+    );
+    if (outcome.status !== 'Resolved') {
+        return 'Unavailable';
     }
-    return resolved_unsupported === true ? 'Unsupported' : 'Unavailable';
+    return outcome.value.supported === true ? 'Supported' : 'Unsupported';
 }
 
 /**
@@ -1388,9 +1189,6 @@ export async function runKonomiTVBS4KBrowserCodecSupportDiagnostics(
     const diagnostics_signal = signal ?? new AbortController().signal;
     const environment = detectKonomiTVBS4KBrowserCodecSupportEnvironment();
     const video_element = document.createElement('video');
-    // 前回の診断で採用した WebCodecs config 形状のキャッシュを捨て、今回の環境で再判定する
-    konomitv_bs4k_browser_video_decoder_shape = null;
-    konomitv_bs4k_browser_video_encoder_shape = null;
 
     // MediaCapabilities を先に全行で確定させる。Gecko の decodingInfo() は実 decoder の
     // 初期化を内部で直列化し、6 並列の呼び出しでは全行が timeout して証拠を失うため、
@@ -1435,37 +1233,24 @@ export async function runKonomiTVBS4KBrowserCodecSupportDiagnostics(
             const web_codecs_prefer_hardware =
                 await probeKonomiTVBS4KBrowserVideoCodec({
                     available: environment.apis.web_codecs_video_decoder,
-                    mime_type: entry.mime_type,
                     codec: extractKonomiTVBS4KBrowserMIMECodec(entry.mime_type),
                     width: entry.width,
                     height: entry.height,
-                    bitrate: entry.representative_bitrate,
-                    framerate: entry.framerate,
                     hardware_acceleration: 'prefer-hardware',
                     signal: diagnostics_signal,
                 });
             const web_codecs_no_preference =
                 await probeKonomiTVBS4KBrowserVideoCodec({
                     available: environment.apis.web_codecs_video_decoder,
-                    mime_type: entry.mime_type,
                     codec: extractKonomiTVBS4KBrowserMIMECodec(entry.mime_type),
                     width: entry.width,
                     height: entry.height,
-                    bitrate: entry.representative_bitrate,
-                    framerate: entry.framerate,
                     signal: diagnostics_signal,
                 });
             const judgment = judgeKonomiTVBS4KBrowserVideoSupport({
                 media_capabilities: media_capabilities.probe,
                 media_source,
                 can_play_type,
-            });
-            const hardware_estimate = estimateKonomiTVBS4KBrowserVideoHardware({
-                engine: environment.engine,
-                browser_support: judgment.support,
-                power_efficient: media_capabilities.power_efficient,
-                web_codecs_prefer_hardware,
-                web_codecs_no_preference,
             });
             let konomitv_playback: boolean | null = null;
             if (
@@ -1490,7 +1275,7 @@ export async function runKonomiTVBS4KBrowserCodecSupportDiagnostics(
                 used_by_konomitv_bs4k: entry.used_by_konomitv_bs4k,
                 browser_support: judgment.support,
                 browser_evidence: judgment.evidence,
-                hardware_estimate,
+                smooth: media_capabilities.smooth,
                 power_efficient: media_capabilities.power_efficient,
                 web_codecs_prefer_hardware,
                 web_codecs_no_preference,
@@ -1513,7 +1298,6 @@ export async function runKonomiTVBS4KBrowserCodecSupportDiagnostics(
                 web_codecs_prefer_hardware:
                     await probeKonomiTVBS4KBrowserVideoEncoder({
                         available: environment.apis.web_codecs_video_encoder,
-                        mime_type: entry.mime_type,
                         codec: extractKonomiTVBS4KBrowserMIMECodec(entry.mime_type),
                         width: entry.width,
                         height: entry.height,
@@ -1525,7 +1309,6 @@ export async function runKonomiTVBS4KBrowserCodecSupportDiagnostics(
                 web_codecs_prefer_software:
                     await probeKonomiTVBS4KBrowserVideoEncoder({
                         available: environment.apis.web_codecs_video_encoder,
-                        mime_type: entry.mime_type,
                         codec: extractKonomiTVBS4KBrowserMIMECodec(entry.mime_type),
                         width: entry.width,
                         height: entry.height,
@@ -1537,7 +1320,6 @@ export async function runKonomiTVBS4KBrowserCodecSupportDiagnostics(
                 web_codecs_no_preference:
                     await probeKonomiTVBS4KBrowserVideoEncoder({
                         available: environment.apis.web_codecs_video_encoder,
-                        mime_type: entry.mime_type,
                         codec: extractKonomiTVBS4KBrowserMIMECodec(entry.mime_type),
                         width: entry.width,
                         height: entry.height,
@@ -1558,7 +1340,6 @@ export async function runKonomiTVBS4KBrowserCodecSupportDiagnostics(
             const web_codecs_decode =
                 await probeKonomiTVBS4KBrowserAudioWebCodecs({
                     api: 'AudioDecoder',
-                    mime_type: entry.probe_mime_type,
                     codec: entry.web_codecs_codec ?? extractKonomiTVBS4KBrowserMIMECodec(entry.probe_mime_type),
                     bitrate: entry.representative_bitrate,
                     samplerate: entry.representative_samplerate,
@@ -1567,7 +1348,6 @@ export async function runKonomiTVBS4KBrowserCodecSupportDiagnostics(
             const web_codecs_encode =
                 await probeKonomiTVBS4KBrowserAudioWebCodecs({
                     api: 'AudioEncoder',
-                    mime_type: entry.probe_mime_type,
                     codec: entry.web_codecs_codec ?? extractKonomiTVBS4KBrowserMIMECodec(entry.probe_mime_type),
                     bitrate: entry.representative_bitrate,
                     samplerate: entry.representative_samplerate,

@@ -136,7 +136,8 @@ def _StubEnvironment(
     async def FakeQueryNvidiaGpus(cls: object) -> list[_NvidiaGpu] | None:
         return nvidia_gpus
 
-    async def FakeListBinaryCodecNames(cls: object, kind: str) -> set[str] | None:
+    async def FakeListBinaryCodecNames(cls: object, kind: str, backend: str = 'FFmpeg') -> set[str] | None:
+        del backend
         return binary_encoders if kind == 'encoders' else binary_decoders
 
     monkeypatch.setattr(manager, 'getEnvironmentSignature', classmethod(FakeGetEnvironmentSignature))

@@ -273,7 +273,7 @@ class KonomiTVBS4KCodecSupportJobManager:
     """管理者専用のコーデック対応サーバー診断ジョブを実行してキャッシュする。"""
 
     # probe 実装を変更したら必ず増加させ、環境署名を無効化して再実行させる
-    _probe_version: ClassVar[int] = 4
+    _probe_version: ClassVar[int] = 5
     _probe_timeout_seconds: ClassVar[float] = 20.0
     _job_timeout_seconds: ClassVar[float] = 600.0
     _nvidia_smi_timeout_seconds: ClassVar[float] = 10.0
@@ -323,29 +323,56 @@ class KonomiTVBS4KCodecSupportJobManager:
             True の場合は呼び出し側が 202 を、キャッシュ再利用 (False) の場合は 200 を返す。
         """
 
-        signature = await cls.getEnvironmentSignature()
+        # 実行中ジョブへの合流には環境署名が不要。共有 limiter が埋まっていても直ちに応答する。
         async with cls._lock:
-            if cls._task is not None and cls._task.done() is False:
-                # 実行中ジョブへ合流した。診断は継続されるためキャッシュ再利用 (200) と区別して 202 扱いにする
+            active_task = cls._task if cls._task is not None and cls._task.done() is False else None
+            if active_task is not None and cls._state.status == 'Running':
                 return True, cls.__buildResponse(cls._state)
-            cached_state = cls._results_cache.get(signature)
-            # 現在状態が Failed のときは旧成功キャッシュへ戻さず再実行する。
-            # GET が Failed を隠さない契約と合わせ、再診断失敗後に成功結果が 200 で返るのを防ぐ
-            if cached_state is not None and force is False and cls._state.status != 'Failed':
-                return False, cls.__buildResponse(cached_state)
-            cls._state = _CodecSupportJobState(
-                status = 'Running',
-                progress = 0.0,
-                environment_signature = signature,
-                devices = [],
-                total_operations = 0,
-                completed_operations = 0,
-            )
-            cls._task = asyncio.create_task(
-                cls.__runJob(signature),
-                name = 'KonomiTVBS4KCodecSupport-diagnostic',
-            )
-            return True, cls.__buildResponse(cls._state)
+        if active_task is not None:
+            # status 更新後の子プロセス回収中は新旧ジョブを重ねず、回収完了後に改めて開始判定する。
+            try:
+                await asyncio.shield(active_task)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling() > 0:
+                    raise
+            return await cls.startProbe(force=force)
+        signature = await cls.getEnvironmentSignature()
+        settling_task: asyncio.Task[None] | None = None
+        async with cls._lock:
+            # 署名計算中に別リクエストが開始した場合も、その実行中ジョブへ合流する。
+            active_task = cls._task if cls._task is not None and cls._task.done() is False else None
+            if active_task is not None:
+                if cls._state.status == 'Running':
+                    return True, cls.__buildResponse(cls._state)
+                settling_task = active_task
+            else:
+                cached_state = cls._results_cache.get(signature)
+                # 現在状態が Failed のときは旧成功キャッシュへ戻さず再実行する。
+                # GET が Failed を隠さない契約と合わせ、再診断失敗後に成功結果が 200 で返るのを防ぐ
+                if cached_state is not None and force is False and cls._state.status != 'Failed':
+                    return False, cls.__buildResponse(cached_state)
+                cls._state = _CodecSupportJobState(
+                    status = 'Running',
+                    progress = 0.0,
+                    environment_signature = signature,
+                    devices = [],
+                    total_operations = 0,
+                    completed_operations = 0,
+                )
+                cls._task = asyncio.create_task(
+                    cls.__runJob(signature),
+                    name = 'KonomiTVBS4KCodecSupport-diagnostic',
+                )
+                return True, cls.__buildResponse(cls._state)
+        assert settling_task is not None
+        try:
+            await asyncio.shield(settling_task)
+        except asyncio.CancelledError:
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling() > 0:
+                raise
+        return await cls.startProbe(force=force)
 
     @classmethod
     async def cancelProbe(cls) -> Literal['Idle', 'Cancelled', 'ReclaimTimeout']:
@@ -374,11 +401,10 @@ class KonomiTVBS4KCodecSupportJobManager:
             )
             return 'ReclaimTimeout'
         except asyncio.CancelledError:
-            if task.done() is False:
-                logging.error(
-                    '[KonomiTVBS4KCodecSupport] Cancel waiter was cancelled before reclaim finished.',
-                )
-                return 'ReclaimTimeout'
+            current_task = asyncio.current_task()
+            if current_task is not None and current_task.cancelling() > 0:
+                # 呼び出し元自体のキャンセルは回収期限超過でも対象ジョブの完了でもない。
+                raise
             return 'Cancelled'
         if task.done() is False:
             return 'ReclaimTimeout'
@@ -427,7 +453,7 @@ class KonomiTVBS4KCodecSupportJobManager:
                     operation.applyResult(success, reason)
                     return
                 elif operation.kind == 'video_decode':
-                    clip = clips[operation.clip_key or '']
+                    clip = clips.get(operation.clip_key or '')
                     if clip is None or clip.is_file() is False:
                         # 入力クリップが生成できなかった decode は検証不能として扱う
                         operation.applyResult(False, 'ProbeInputUnavailable')
@@ -445,7 +471,7 @@ class KonomiTVBS4KCodecSupportJobManager:
                     operation.applyResult(success, reason)
                     return
                 else:  # audio_decode
-                    clip = clips[operation.clip_key or '']
+                    clip = clips.get(operation.clip_key or '')
                     if clip is None or clip.is_file() is False:
                         operation.applyResult(False, 'ProbeInputUnavailable')
                         return
@@ -514,17 +540,19 @@ class KonomiTVBS4KCodecSupportJobManager:
     async def listBinaryCodecNames(
         cls,
         kind: Literal['encoders', 'decoders'],
+        backend: Literal['FFmpeg', 'AMF'] = 'FFmpeg',
     ) -> set[str] | None:
-        """FFmpeg 8 バイナリが持つ encoder / decoder 名の一覧をパースして返す。
+        """指定バックエンドの FFmpeg 8 バイナリが持つ encoder / decoder 名を返す。
 
         Args:
             kind: 'encoders' または 'decoders'。
+            backend: 通常の FFmpeg 8 または AMD 専用 FFmpeg 8。
 
         Returns:
             codec 名の集合。バイナリ不在・実行失敗時は None。
         """
 
-        executable = Path(LIBRARY_PATH['FFmpeg8'])
+        executable = Path(LIBRARY_PATH['FFmpeg8AMD'] if backend == 'AMF' else LIBRARY_PATH['FFmpeg8'])
         if executable.is_file() is False:
             return None
         try:
@@ -628,6 +656,10 @@ class KonomiTVBS4KCodecSupportJobManager:
                 # 2. FFmpeg バイナリの encoder / decoder 一覧 (Binary 根拠)
                 binary_encoders = await cls.listBinaryCodecNames('encoders')
                 binary_decoders = await cls.listBinaryCodecNames('decoders')
+                amf_binary_decoders = (
+                    await cls.listBinaryCodecNames('decoders', 'AMF')
+                    if any(device.backend == 'AMF' for device in devices) else None
+                )
 
                 # 3. 実 probe 不要の cell を確定根拠で埋めつつ、probe 計画を作る
                 with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-codec-support-') as temporary_directory:
@@ -635,6 +667,7 @@ class KonomiTVBS4KCodecSupportJobManager:
                         devices,
                         binary_encoders,
                         binary_decoders,
+                        amf_binary_decoders,
                         Path(temporary_directory),
                     )
                     state.total_operations = plan.total
@@ -760,7 +793,7 @@ class KonomiTVBS4KCodecSupportJobManager:
                 # DRM の render node と nvidia-smi の結果を PCI BDF で統合し重複表示を避ける
                 ## nvidia-smi の name は 'NVIDIA' 接頭辞付きの製品名なのでそのまま表示する
                 matched = nvidia_by_bdf.get(normalized_bdf) if normalized_bdf is not None else None
-                if matched is None and nvidia_by_bdf:
+                if matched is None and normalized_bdf is None and nvidia_by_bdf:
                     # sysfs から BDF を読めない DRM node は /dev/dri だけが見えるコンテナで出現し、
                     # 下の nvidia-smi 側の列挙と同じ物理 GPU を二重表示する。smi 側が表示可能な
                     # GPU を持つなら出さない (smi の BDF が全て不正なら情報を失うため保持する)
@@ -898,6 +931,7 @@ class KonomiTVBS4KCodecSupportJobManager:
         devices: list[_CodecSupportDevice],
         binary_encoders: set[str] | None,
         binary_decoders: set[str] | None,
+        amf_binary_decoders: set[str] | None,
         temp_root: Path,
     ) -> _CodecSupportProbePlan:
         """実 probe 不要の cell を確定根拠で埋め、probe が必要な操作を計画する。"""
@@ -948,7 +982,7 @@ class KonomiTVBS4KCodecSupportJobManager:
                         device,
                         capability,
                         binary_encoders,
-                        binary_decoders,
+                        amf_binary_decoders if device.backend == 'AMF' else binary_decoders,
                         temp_root,
                         plan,
                     )
@@ -1012,7 +1046,21 @@ class KonomiTVBS4KCodecSupportJobManager:
                         'ProbeInputUnavailable',
                     )
         elif used is True:
-            if device.decode_accel == 'cuda' and device.cuda_ordinal is None:
+            # QSV / CUDA は実際に明示する専用 decoder、VAAPI は自動選択に必要な汎用 decoder が
+            # バイナリに含まれる場合だけ probe する。名目上の hwaccel 対応と実装有無を混同しない。
+            decoder_name = _HWACCEL_VIDEO_DECODER_NAMES.get(device.decode_accel, {}).get(codec)
+            if device.decode_accel == 'vaapi':
+                decoder_name = _VIDEO_SOFTWARE_DECODERS[codec]
+            encoder_name = _VIDEO_SOFTWARE_ENCODERS[codec]
+            if decoder_name is None or decoder_name not in binary_decoders:
+                cls.__fillUnavailable(capability.decode, device, 'Unsupported', 'DecoderUnavailable')
+            elif (
+                binary_encoders is None or
+                encoder_name is None or
+                encoder_name not in binary_encoders
+            ):
+                cls.__fillUnverified(capability.decode, device, 'Binary', 'ProbeInputUnavailable')
+            elif device.decode_accel == 'cuda' and device.cuda_ordinal is None:
                 # nvidia-smi と PCI BDF が結び付かない GPU を CUDA 0 へ落とすと別世代の結果になる
                 cls.__fillUnavailable(capability.decode, device, 'Unknown', 'DeviceUnavailable')
             else:
@@ -1033,7 +1081,10 @@ class KonomiTVBS4KCodecSupportJobManager:
         elif codec in _HWACCEL_VIDEO_DECODER_NAMES.get(device.decode_accel, {}):
             # 本線外でも専用 hwaccel decoder を持つ GPU codec (現状は CUDA の mpeg1/2/4) は、
             # ソフトウェア encoder で入力クリップを生成できる限り Driver 推定で終わらせず実 probe する
-            if device.decode_accel == 'cuda' and device.cuda_ordinal is None:
+            decoder_name = _HWACCEL_VIDEO_DECODER_NAMES[device.decode_accel][codec]
+            if decoder_name not in binary_decoders:
+                cls.__fillUnavailable(capability.decode, device, 'Unsupported', 'DecoderUnavailable')
+            elif device.decode_accel == 'cuda' and device.cuda_ordinal is None:
                 # nvidia-smi と PCI BDF が結び付かない GPU を CUDA 0 へ落とすと別世代の結果になる
                 cls.__fillUnavailable(capability.decode, device, 'Unknown', 'DeviceUnavailable')
             else:
@@ -1057,8 +1108,8 @@ class KonomiTVBS4KCodecSupportJobManager:
                         ),
                     ))
                 else:
-                    # decoder は存在するが正しい入力を生成できないため、名目対応の推定に留める
-                    cls.__fillLikely(capability.decode, device, 'Driver')
+                    # decoder は存在するが正しい入力を生成できないため、機能確認までは断定しない。
+                    cls.__fillUnverified(capability.decode, device, 'Binary', 'ProbeInputUnavailable')
         elif codec in _HWACCEL_VIDEO_DECODERS.get(device.decode_accel, frozenset()):
             # 専用 decoder マッピングを持たない本線外 GPU codec は実 probe できないため Driver 根拠に留める
             cls.__fillLikely(capability.decode, device, 'Driver')
@@ -1499,6 +1550,17 @@ class KonomiTVBS4KCodecSupportJobManager:
             int(stream.get('width', 0)) != quality.width or
             int(stream.get('height', 0)) != quality.height
         ):
+            return False, 'ProbeFailed'
+        try:
+            frame_rate_numerator, frame_rate_denominator = (
+                int(value)
+                for value in str(stream.get('r_frame_rate', '0/1')).split('/', maxsplit=1)
+            )
+            actual_frame_rate = frame_rate_numerator / frame_rate_denominator
+        except (ValueError, ZeroDivisionError):
+            return False, 'ProbeFailed'
+        expected_frame_rate = 60000 / 1001 if quality.is_60fps is True else 30000 / 1001
+        if abs(actual_frame_rate - expected_frame_rate) > 0.01:
             return False, 'ProbeFailed'
         actual_pixel_format = str(stream.get('pix_fmt', ''))
         is_10bit = actual_pixel_format in ('yuv420p10le', 'p010le', 'p010')

@@ -29,12 +29,16 @@
                         <div class="settings__item-label">
                             MediaCapabilities・MediaSource / ManagedMediaSource・WebCodecs・WebGL をこの端末内で照会し、
                             KonomiTV-BS4K の映像・音声コーデックの対応を確認します。<br>
-                            診断はブラウザにより数秒から数分かかります。応答しないブラウザ API は個別に打ち切り、残りの構成は最後まで診断します。結果はこの画面の表示だけに使います。
+                            診断はブラウザにより数秒から数分かかります。応答しないブラウザ API は個別に打ち切り、残りの構成は最後まで診断します。実行中はキャンセルできます。結果はこの画面の表示だけに使います。
                         </div>
                         <div class="codec-support-actions">
                             <v-btn color="primary" variant="flat" :loading="browser_in_progress"
                                 :disabled="browser_in_progress" @click="startBrowserDiagnostics">
                                 診断を実行
+                            </v-btn>
+                            <v-btn v-if="browser_in_progress" color="secondary" variant="tonal"
+                                @click="cancelBrowserDiagnostics">
+                                キャンセル
                             </v-btn>
                             <v-btn v-if="browser_result !== null" color="secondary" variant="tonal"
                                 @click="copyBrowserResult">
@@ -71,7 +75,7 @@
                             <div v-for="row in konomitv_summary" :key="row.codec" class="codec-support-summary__row">
                                 <span>{{ row.codec }}</span>
                                 <span :class="`codec-support-badge ${browserSupportClass(row.browser_support)}`">{{ browserSupportLabel(row.browser_support) }}</span>
-                                <span :class="`codec-support-badge ${hardwareEstimateClass(row.hardware_estimate)}`">{{ hardwareEstimateLabel(row.hardware_estimate) }}</span>
+                                <span :class="`codec-support-badge ${booleanMetricClass(row.smooth)}`">{{ smoothLabel(row.smooth) }}</span>
                             </div>
                         </div>
                     </div>
@@ -79,8 +83,9 @@
                     <div v-if="browser_result !== null" class="codec-support-card">
                         <div class="settings__item-heading">映像 decode</div>
                         <div class="settings__item-label">
-                            KonomiTV-BS4K 本線と比較対象の構成について、ブラウザでの再生可否と HW / SW の推定を表示します。<br>
-                            「KonomiTV 再生経路」は実際に再生時に使う MediaSource / ManagedMediaSource 判定をそのまま表示しています。
+                            KonomiTV-BS4K 本線と比較対象の構成について、コーデック対応と指定構成を滑らかに処理できるかを表示します。<br>
+                            Smooth / Power Efficient は MediaCapabilities の応答値であり、HW / SW の種別を示す値ではありません。<br>
+                            「MSE 構成」は実際に再生時に使う MediaSource / ManagedMediaSource の MIME 対応判定です。
                         </div>
                         <div class="codec-support-table-scroll">
                             <table class="codec-support-table">
@@ -89,10 +94,10 @@
                                         <th>コーデック / プロファイル</th>
                                         <th>検査構成</th>
                                         <th>ブラウザ対応</th>
-                                        <th>HW アクセラレーション</th>
+                                        <th>Smooth</th>
                                         <th>Power Efficient</th>
                                         <th>WebCodecs</th>
-                                        <th>KonomiTV 再生経路</th>
+                                        <th>MSE 構成</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -106,7 +111,7 @@
                                             <span :class="`codec-support-badge ${browserSupportClass(row.browser_support)}`" :title="evidenceLabel(row.browser_evidence)">{{ browserSupportLabel(row.browser_support) }}</span>
                                         </td>
                                         <td>
-                                            <span :class="`codec-support-badge ${hardwareEstimateClass(row.hardware_estimate)}`">{{ hardwareEstimateLabel(row.hardware_estimate) }}</span>
+                                            <span :class="`codec-support-badge ${booleanMetricClass(row.smooth)}`">{{ smoothLabel(row.smooth) }}</span>
                                         </td>
                                         <td>
                                             <template v-if="row.power_efficient === null">-</template>
@@ -118,7 +123,7 @@
                                         </td>
                                         <td>
                                             <template v-if="row.konomitv_playback === null">-</template>
-                                            <span v-else :class="`codec-support-badge ${row.konomitv_playback === true ? 'codec-support-badge--success' : 'codec-support-badge--error'}`">{{ row.konomitv_playback === true ? '可能' : '不可' }}</span>
+                                            <span v-else :class="`codec-support-badge ${row.konomitv_playback === true ? 'codec-support-badge--success' : 'codec-support-badge--error'}`">{{ row.konomitv_playback === true ? '対応' : '非対応' }}</span>
                                         </td>
                                     </tr>
                                 </tbody>
@@ -175,7 +180,7 @@
                                         <th>ブラウザ対応</th>
                                         <th>WebCodecs decode</th>
                                         <th>WebCodecs encode</th>
-                                        <th>KonomiTV 再生経路</th>
+                                        <th>MSE 構成</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -195,7 +200,7 @@
                                         </td>
                                         <td>
                                             <template v-if="row.konomitv_playback === null">-</template>
-                                            <span v-else :class="`codec-support-badge ${row.konomitv_playback === true ? 'codec-support-badge--success' : 'codec-support-badge--error'}`">{{ row.konomitv_playback === true ? '可能' : '不可' }}</span>
+                                            <span v-else :class="`codec-support-badge ${row.konomitv_playback === true ? 'codec-support-badge--success' : 'codec-support-badge--error'}`">{{ row.konomitv_playback === true ? '対応' : '非対応' }}</span>
                                         </td>
                                     </tr>
                                 </tbody>
@@ -329,7 +334,6 @@ import {
     runKonomiTVBS4KBrowserCodecSupportDiagnostics,
     type IKonomiTVBS4KBrowserCodecSupportResult,
     type KonomiTVBS4KBrowserEvidence,
-    type KonomiTVBS4KBrowserHardwareEstimate,
     type KonomiTVBS4KBrowserSupportStatus,
     type KonomiTVBS4KBrowserWebCodecsProbe,
 } from '@/utils/KonomiTVBS4KBrowserCodecSupport';
@@ -389,7 +393,7 @@ const konomitv_summary = computed(() => {
     const summary: Array<{
         codec: string;
         browser_support: KonomiTVBS4KBrowserSupportStatus;
-        hardware_estimate: KonomiTVBS4KBrowserHardwareEstimate;
+        smooth: boolean | null;
     }> = [];
     for (const codec of codecs) {
         const row = browser_result.value.video_decode.find(entry =>
@@ -403,7 +407,7 @@ const konomitv_summary = computed(() => {
             summary.push({
                 codec,
                 browser_support: row.konomitv_playback === false ? 'Unsupported' : row.browser_support,
-                hardware_estimate: row.konomitv_playback === false ? 'NotApplicable' : row.hardware_estimate,
+                smooth: row.smooth,
             });
         }
     }
@@ -432,6 +436,10 @@ async function startBrowserDiagnostics(): Promise<void> {
             browser_in_progress.value = false;
         }
     }
+}
+
+function cancelBrowserDiagnostics(): void {
+    browser_abort_controller?.abort();
 }
 
 async function copyBrowserResult(): Promise<void> {
@@ -640,30 +648,18 @@ function browserSupportClass(status: KonomiTVBS4KBrowserSupportStatus): string {
     }
 }
 
-function hardwareEstimateLabel(estimate: KonomiTVBS4KBrowserHardwareEstimate): string {
-    switch (estimate) {
-        case 'HardwareLikely':
-            return 'HW 推定';
-        case 'SoftwareLikely':
-            return 'SW 推定';
-        case 'Unknown':
-            return '不明';
-        case 'NotApplicable':
-            return '対象外';
+function smoothLabel(smooth: boolean | null): string {
+    if (smooth === null) {
+        return 'N/A';
     }
+    return smooth === true ? 'Smooth' : '非 Smooth';
 }
 
-function hardwareEstimateClass(estimate: KonomiTVBS4KBrowserHardwareEstimate): string {
-    switch (estimate) {
-        case 'HardwareLikely':
-            return 'codec-support-badge--success';
-        case 'SoftwareLikely':
-            return 'codec-support-badge--warning';
-        case 'Unknown':
-            return 'codec-support-badge--muted';
-        case 'NotApplicable':
-            return 'codec-support-badge--muted';
+function booleanMetricClass(value: boolean | null): string {
+    if (value === null) {
+        return 'codec-support-badge--muted';
     }
+    return value === true ? 'codec-support-badge--success' : 'codec-support-badge--warning';
 }
 
 function webCodecsLabel(probe: KonomiTVBS4KBrowserWebCodecsProbe): string {

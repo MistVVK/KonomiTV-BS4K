@@ -361,7 +361,8 @@ export default class Utils {
      */
     static isChromium(): boolean {
         const brands = navigator.userAgentData?.brands;
-        if (brands !== undefined) {
+        // Chromium 151 以降などで brands が空配列に制限される場合は、従来の UA 判定へ戻す。
+        if (brands !== undefined && brands.length > 0) {
             return brands.some(brand => /Chromium|Google Chrome|Microsoft Edge|Opera|Brave/i.test(brand.brand));
         }
         return /Chrom(e|ium)|Edg|OPR/i.test(navigator.userAgent);
