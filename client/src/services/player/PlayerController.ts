@@ -2053,8 +2053,9 @@ class PlayerController {
         if (is_current() === false) return;
 
         // この時点で映像が停止していて、かつ readyState が HAVE_FUTURE_DATA な場合、復旧を試みる
+        // リバッファ待機中は rebufferPlayback() 側がバッファの回復を管理しているため、二重に pause()/play() を行わないよう対象外とする
         // Safari ではタイミングによっては this.player.video が null になる場合があるらしいので ? を付ける
-        if (player_store.is_video_buffering === true && player.video.readyState < 3) {
+        if (this.is_rebuffering === false && player_store.is_video_buffering === true && player.video.readyState < 3) {
             console.warn('\u001b[31m[PlayerController] Video still buffering. (HTMLVideoElement.readyState < HAVE_FUTURE_DATA) Trying to recover.');
 
             // 一旦停止して、0.25 秒間を置く
@@ -2073,9 +2074,10 @@ class PlayerController {
             }
 
             // さらに 0.5 秒待った時点で映像が停止している場合、復旧を試みる
+            // リバッファ待機中は rebufferPlayback() 側がバッファの回復を管理しているため、こちらも対象外とする
             await Utils.sleep(0.5);
             if (is_current() === false) return;
-            if (player_store.is_video_buffering === true && player.video.readyState < 3) {
+            if (this.is_rebuffering === false && player_store.is_video_buffering === true && player.video.readyState < 3) {
                 console.warn('\u001b[31m[PlayerController] Video still buffering. (HTMLVideoElement.readyState < HAVE_FUTURE_DATA) Trying to recover.');
 
                 // 一旦停止して、0.25 秒間を置く
@@ -2092,6 +2094,142 @@ class PlayerController {
                     player.pause();
                 }
             }
+        }
+    }
+
+
+    /**
+     * 再生中にバッファアンダーランが発生した際、バッファが再開閾値まで回復するまで playbackRate = 0 で待機する
+     * 低速回線でアンダーラン直後に再生を再開すると waiting ↔ playing を短周期で繰り返し、
+     * バッファリングの Progress Circular の点滅と断続的な映像停止を引き起こすため、
+     * 起動時バッファ温め (on_canplay) と同様の手法で再開にヒステリシスを持たせる
+     * 待機中は Progress Circular が表示され続ける。処理の完了を待つ必要はないので、基本 await せず非同期で実行すべき
+     */
+    private async rebufferPlayback(): Promise<void> {
+        assert(this.player !== null);
+
+        const initialization_generation = this.initialization_generation;
+
+        // 同じ init() 世代ですでにリバッファ待機中であれば重複して開始しない。
+        // 旧世代の待機が終了処理中でも、新世代では独立して開始できるよう世代番号を照合する
+        if (this.rebuffering_generation === initialization_generation) return;
+
+        const player_store = usePlayerStore();
+        const player = this.player;
+        const video = player.video;
+
+        // 録画の分断されたバッファは hls.js の GapController に復旧を任せる。
+        // playbackRate = 0 にすると GapController も停止するため、将来のバッファ範囲がすでに存在する場合は介入しない
+        const has_future_buffer_range = (): boolean => {
+            for (let i = 0; i < video.buffered.length; i++) {
+                if (video.buffered.start(i) > video.currentTime) return true;
+                if (video.currentTime <= video.buffered.end(i) && i + 1 < video.buffered.length) return true;
+            }
+            return false;
+        };
+        if (has_future_buffer_range() === true) {
+            // ライブでは分断後の最後のバッファ範囲がライブ端なので、既存の sync() で即座に復帰する
+            if (this.playback_mode === 'Live') player.sync(true);
+            return;
+        }
+
+        // 録画末尾では playlist の duration と MSE の実バッファ末尾が完全には一致しないことがある。
+        // 独自の閾値待機を行わず hls.js の末尾補完へ任せ、自然完走を playbackRate = 0 で妨げない
+        if (
+            this.playback_mode === 'Video' &&
+            Number.isFinite(video.duration) &&
+            video.duration - video.currentTime <= PlayerController.RECORDED_REBUFFER_SECONDS
+        ) return;
+
+        const playback_target_key = this.getPlaybackTargetKey();
+        this.rebuffering_generation = initialization_generation;
+        const is_current = (): boolean => (
+            this.player === player &&
+            player.video === video &&
+            this.isInitializationCurrent(initialization_generation, playback_target_key)
+        );
+
+        // 現在の再生速度を保存し、playbackRate = 0 で再生位置を固定する
+        // video.pause() を使うと DPlayer の UI アイコンが停止してしまうため、起動時バッファ温めと同様に playbackRate を使う
+        // mpegts.js の live-latency-synchronizer は playbackRate === 0 の場合は変更しないが、
+        // latency > liveSyncMaxLatency (設定値 3 秒) の場合は playbackRate = 1.1 に上書きするため、
+        // リバッファ待機中は synchronizer を無効化して上書きを防止する
+        const original_playback_rate = video.playbackRate;
+        video.playbackRate = 0;
+        if (this.playback_mode === 'Live' && this.player?.plugins?.mpegts) {
+            const mpegts_player = this.player.plugins.mpegts as any;
+            if (typeof mpegts_player.configureLiveSync === 'function') {
+                mpegts_player.configureLiveSync({ liveSync: false });
+            }
+        }
+        console.warn('\u001b[31m[PlayerController] Buffer underrun detected. Waiting for the buffer to recover...');
+
+        // ライブ視聴では低遅延モードの有無に関わらず 4 秒、録画視聴では 5 秒のバッファが貯まるまで待機する
+        const rebuffer_target_seconds = this.playback_mode === 'Live' ?
+            PlayerController.LIVE_REBUFFER_SECONDS : PlayerController.RECORDED_REBUFFER_SECONDS;
+
+        // 0.1 秒おきに再生バッファをチェックし、再開閾値まで回復するか中断条件を満たすまで待機する
+        // 回線が極端に遅く閾値に達しない場合は待機が続くが、ユーザーは一時停止・画質変更・チャンネル切替でいつでも脱出できる
+        // (ライブ視聴ではバッファ肥大による mpegts.js の強制切断を防ぐため、60 秒おきの強制シークでライブ端へ復帰する)
+        let resumed = false;
+        while (is_current()) {
+
+            // ユーザー操作や Media Session からの制御で一時停止された場合は、再生再開をユーザーに委ねて待機を終了する
+            if (video.paused === true) break;
+
+            // 待機開始後に分断された範囲が追加された場合も playbackRate を戻し、既存の復旧経路へ引き渡す
+            if (has_future_buffer_range() === true) {
+                if (this.playback_mode === 'Live') player.sync(true);
+                break;
+            }
+
+            // 再生位置から連続して再生可能なバッファ残量を取得する
+            // シークでバッファ範囲が分断されうるため、範囲の末尾と再生位置の単純な差は使わず、再生位置を含む範囲からの残量だけを再開可否の指標にする
+            // 再生位置を含む範囲がない場合 (シーク直後やバッファホールの手前で停止している) は 0 とする
+            let current_buffer_seconds = 0;
+            for (let i = 0; i < video.buffered.length; i++) {
+                if (video.buffered.start(i) <= video.currentTime && video.currentTime <= video.buffered.end(i)) {
+                    current_buffer_seconds = video.buffered.end(i) - video.currentTime;
+                    break;
+                }
+            }
+
+            // 再開閾値までバッファが回復した場合は待機を終了し、再生を再開する
+            // シークされた場合もここで新しい再生位置のバッファが評価されるため、個別の中断処理は不要
+            if (current_buffer_seconds >= rebuffer_target_seconds) {
+                resumed = true;
+                break;
+            }
+
+            await Utils.sleep(0.1);
+        }
+
+        // 待機中にプレイヤーが破棄・再起動されたり画質切替で video 要素が交換されたりしていなければ、再生速度を元に戻す
+        // 一時停止による終了でも playbackRate だけは元に戻し、ユーザーが再生を再開した際に意図しない速度固定が残らないようにする
+        if (is_current()) {
+            // configureLiveSync({ liveSync: false }) は 0 / 1 以外の再生速度を 1 に戻すため、
+            // synchronizer を先に復元してから元の再生速度を書き戻す
+            if (this.playback_mode === 'Live' && this.player?.plugins?.mpegts) {
+                const mpegts_player = this.player.plugins.mpegts as any;
+                if (typeof mpegts_player.configureLiveSync === 'function') {
+                    mpegts_player.configureLiveSync({ liveSync: this.tv_low_latency_mode });
+                }
+            }
+            video.playbackRate = original_playback_rate;
+        }
+        // 終了した処理がまだこの世代の待機状態を所有している場合だけ解除する。
+        // 新世代がすでに開始済みなら、その待機状態は新世代自身の終了時まで維持する
+        if (this.rebuffering_generation === initialization_generation) {
+            this.rebuffering_generation = null;
+        }
+        if (resumed === true) {
+            // バッファは再開閾値まで回復しているため、バッファリング表示を解除する
+            // 実際のアンダーランからの復帰では playing イベントでも解除されるが、
+            // ブラウザが stalled 扱いにならなかった経路では playing が発火せず表示が残ってしまう場合がある
+            if (player_store.is_loading === false) {
+                player_store.is_video_buffering = false;
+            }
+            console.log('\u001b[31m[PlayerController] Buffer recovered. Resuming playback.');
         }
     }
 
@@ -2192,14 +2330,15 @@ class PlayerController {
         const playback_target_key = this.getPlaybackTargetKey();
         let playback_handler_generation = 0;
 
-        // ライブ視聴: 再生停止状態かつ現在の再生位置からバッファが 30 秒以上離れていないかを 60 秒おきに監視し、そうなっていたら強制的にシークする
+        // ライブ視聴: 再生停止状態またはリバッファ待機中に、現在の再生位置からバッファが 30 秒以上離れていないかを 60 秒おきに監視し、そうなっていたら強制的にシークする
         // mpegts.js の仕様上、MSE 側に未再生のバッファが貯まり過ぎると新規に SourceBuffer が追加できなくなるため、強制的に接続が切断されてしまう
-        // 再生停止状態でも定期的にシークすることで、バッファが貯まりすぎないように調節する
+        // リバッファ待機中も再生位置が固定されたままバッファが伸び続けるため、再生停止状態と同様に定期的にシークして調節する
         if (this.playback_mode === 'Live') {
             this.live_force_seek_interval_timer_cancel = Utils.setIntervalInWorker(() => {
                 if (this.player === null) return;
-                if ((this.player.video.paused && this.player.video.buffered.length >= 1) &&
-                    (this.player.video.buffered.end(0) - this.player.video.currentTime > 30)) {
+                const buffered = this.player.video.buffered;
+                if (((this.player.video.paused || this.is_rebuffering) && buffered.length >= 1) &&
+                    (buffered.end(buffered.length - 1) - this.player.video.currentTime > 30)) {
                     this.player.sync();
                 }
             }, 60 * 1000);
@@ -2260,10 +2399,19 @@ class PlayerController {
         this.player.on('waiting', () => {
             // Progress Circular を表示する
             player_store.is_video_buffering = true;
+
+            // 初回ロード完了後の再生中にバッファアンダーランが発生した場合、バッファが再開閾値まで回復するまで再生を待機する
+            // 低速回線でアンダーランのたびに即再開を繰り返すと、Progress Circular の点滅と断続的な映像停止が発生するため
+            // 起動時バッファ温め中 (is_loading === true) とユーザーによる一時停止中は対象外
+            if (player_store.is_loading === false && this.player !== null && this.player.video.paused === false) {
+                this.rebufferPlayback();
+            }
         });
         this.player.on('playing', () => {
             // ロード中 (映像が表示されていない) でなければ Progress Circular を非表示にする
-            if (player_store.is_loading === false) {
+            // リバッファ待機中は rebufferPlayback() 側が解除するまで表示を維持する
+            // (アンダーランからの部分的なデータ到着で playing が発火しても、バッファはまだ再開閾値に達していないため)
+            if (this.is_rebuffering === false && player_store.is_loading === false) {
                 player_store.is_video_buffering = false;
             }
             // 完走後に末尾より前へ戻して実際の再生を再開した場合は、再び通常の視聴中として扱う。
@@ -2359,10 +2507,14 @@ class PlayerController {
                         if (is_current() === false) return;
                     }
 
-                    // PlayerController の再起動を要求する
+                    // mpegts.js の ErrorTypes は NetworkError / MediaError / OtherError の 3 種別。
+                    // MediaError には MEDIA_MSE_ERROR や MEDIA_CODEC_UNSUPPORTED が含まれるため、
+                    // 接続喪失としてカウントするのは NetworkError のみに限る
+                    const is_network_error = error_type === 'NetworkError';
                     console.error('\u001b[31m[PlayerController] mpegts.js error event:', error_type, detail);
                     player_store.event_emitter.emit('PlayerRestartRequired', {
                         message: `再生中にエラーが発生しました。(${error_type}: ${detail}) プレイヤーを再起動しています…`,
+                        konomitv_bs4k_restart_reason: is_network_error ? 'StreamingConnectionLost' : undefined,
                     });
                 });
 
@@ -2386,7 +2538,8 @@ class PlayerController {
                         player_store.event_emitter.emit('PlayerRestartRequired', {
                             message: `再生中にエラーが発生しました。(Native: ${media_error.code}: ${media_error.message}) プレイヤーを再起動しています…`,
                             konomitv_bs4k_restart_reason: media_error.code === media_error.MEDIA_ERR_DECODE ?
-                                'RuntimeCodecPipelineError' : undefined,
+                                'RuntimeCodecPipelineError' :
+                                media_error.code === media_error.MEDIA_ERR_NETWORK ? 'StreamingConnectionLost' : undefined,
                         });
                     } else {
                         // MediaError オブジェクトは場合によっては存在しないことがあるらしい…
