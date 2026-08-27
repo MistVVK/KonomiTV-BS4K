@@ -94,6 +94,7 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
         label: '情報',
         items: [
             {type: 'Route', label: 'サーバー接続速度', icon: 'fluent:top-speed-20-filled', to: '/settings/info/speed-test'},
+            {type: 'Route', label: 'コーデック対応', icon: 'fluent:code-20-regular', to: '/settings/info/codec-support'},
             {
                 type: 'ExternalLink',
                 label: 'サードパーティーライセンス',
@@ -242,6 +243,11 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         path: '/settings/info/speed-test',
         name: 'Settings Info Speed Test',
         component: () => import('@/views/Settings/KonomiTVBS4KSpeedTest.vue'),
+    },
+    {
+        path: '/settings/info/codec-support',
+        name: 'Settings Info Codec Support',
+        component: () => import('@/views/Settings/KonomiTVBS4KCodecSupport.vue'),
     },
 ];
 

@@ -30,7 +30,8 @@ export type KonomiTVBS4KPlaybackCapabilityReason = (
     'CodecMismatch' |
     'BitDepthMismatch' |
     'ProfileMismatch' |
-    'UnsupportedCombination'
+    'UnsupportedCombination' |
+    'UnsupportedByDevice'
 );
 type KonomiTVBS4KPlaybackOptionUnavailableReason = (
     KonomiTVBS4KPlaybackCapabilityReason |
@@ -806,6 +807,7 @@ class Videos {
             BitDepthMismatch: '出力ビット深度を確認できません',
             ProfileMismatch: '出力プロファイルを確認できません',
             UnsupportedCombination: 'このコーデック構成は利用できません',
+            UnsupportedByDevice: 'このエンコーダーデバイスはこのコーデックに対応していません',
             BrowserMSEUnsupported: 'このブラウザの MSE が対応していません',
         };
         return konomitv_bs4k_labels[konomitv_bs4k_reason];
