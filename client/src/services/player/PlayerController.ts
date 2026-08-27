@@ -12,6 +12,7 @@ import OfflineVideos from '@/services/OfflineVideos';
 import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
 import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
+import KonomiTVBS4KStreamingReconnectGuard from '@/services/player/KonomiTVBS4KStreamingReconnectGuard';
 import CaptureManager from '@/services/player/managers/CaptureManager';
 import DocumentPiPManager from '@/services/player/managers/DocumentPiPManager';
 import KeyboardShortcutManager from '@/services/player/managers/KeyboardShortcutManager';
@@ -103,6 +104,11 @@ class PlayerController {
     // 4 秒程度の遅延を許容する
     private static readonly LIVE_PLAYBACK_BUFFER_SECONDS = 4.0;
 
+    // ライブ視聴: 再生中にバッファアンダーランが発生した際、再生を再開するまでに貯めるバッファ (秒単位)
+    // 低速回線でアンダーラン直後に即再開すると waiting ↔ playing を短周期で繰り返し (スピナーの点滅と断続的な映像停止)、
+    // かえって視聴体験を損なうため、低遅延モードでも通常モードの再生バッファと同じ 4 秒を貯めてから再開する
+    private static readonly LIVE_REBUFFER_SECONDS = 4.0;
+
     // 何秒視聴したら視聴履歴に追加するかの閾値 (秒)
     private static readonly WATCHED_HISTORY_THRESHOLD_SECONDS = 30;
 
@@ -117,6 +123,10 @@ class PlayerController {
     // maxBufferLength を拡張する。ローカル変換ではその要求がサーバーの連続エンコードを誘発し、
     // Chromium では大量の SourceBuffer append と描画を競合させるため、約5セグメントへ固定する。
     private static readonly RECORDED_PLAYBACK_BUFFER_SECONDS = 30;
+
+    // 録画視聴: 再生中にバッファアンダーランが発生した際、再生を再開するまでに貯めるバッファ (秒単位)
+    // ライブ視聴と同様に、低速回線で停止と再生が断続的に切り替わることを防ぐためのヒステリシス
+    private static readonly RECORDED_REBUFFER_SECONDS = 5.0;
 
     // CM 自動スキップ先は HLS のタイムライン補正で指定位置からわずかにずれるため、その許容誤差 (秒)
     private static readonly RECORDED_CM_SKIP_TARGET_TOLERANCE_SECONDS = 1.0;
@@ -241,6 +251,7 @@ class PlayerController {
     // 同一再生対象・同一 codec tuple の短時間再起動ループを、init() をまたいで検出する。
     // codec を自動変更せず、最初の同一 codec 再起動でも復旧できなかった場合はユーザーの明示変更へ委ねる。
     private readonly konomitv_bs4k_playback_restart_guard = new KonomiTVBS4KPlaybackRestartGuard();
+    private readonly konomitv_bs4k_streaming_reconnect_guard = new KonomiTVBS4KStreamingReconnectGuard();
 
     // ライブ再生開始時の一時ミュートを、保存済みミュートと区別するフラグ
     // 一時ミュートで発火した volumechange を、ユーザー操作として保存しないために使う
@@ -248,6 +259,10 @@ class PlayerController {
 
     // ライブ視聴: 直近の mpegts.js mediaInfo
     private live_media_info: {[key: string]: any} | null = null;
+
+    // playbackRate = 0 でバッファ回復を待機している init() 世代。
+    // 旧世代の非同期処理が遅れて終了しても、新世代の待機状態を解除しないために世代番号で所有権を管理する
+    private rebuffering_generation: number | null = null;
 
 
     /**
@@ -276,6 +291,12 @@ class PlayerController {
             }
         }
 
+    }
+
+
+    /** 現在の init() 世代がバッファ回復を待機しているかどうか。 */
+    private get is_rebuffering(): boolean {
+        return this.rebuffering_generation === this.initialization_generation;
     }
 
 
@@ -1794,6 +1815,34 @@ class PlayerController {
                 );
                 return;
             }
+
+            // 帯域不足などでライブストリーミングの接続が短時間に繰り返し切断された場合は、自動再起動を諦めてユーザー操作へ委ねる。
+            // 低速回線で高ビットレートの画質を選び続けている場合など、再起動しても同じ切断が再発するだけの状態を無限に繰り返さないため
+            if (
+                event.konomitv_bs4k_restart_reason === 'StreamingConnectionLost' &&
+                this.konomitv_bs4k_streaming_reconnect_guard.requestReconnect(
+                    this.getKonomiTVBS4KPlaybackRestartKey(),
+                ) === false
+            ) {
+                console.error('[PlayerController] Repeated streaming connection loss. Automatic restart stopped.');
+                this.player.video.pause();
+                player_store.is_loading = false;
+                player_store.is_video_buffering = false;
+                player_store.is_background_display = true;
+                this.player.notice(
+                    '回線速度が不足しているためか、ライブストリーミングの接続が繰り返し切断されました。画質を下げるか、回線状況が改善してからプレイヤーを再起動してください。',
+                    -1,
+                    undefined,
+                    'rgb(var(--v-theme-error-readable))',
+                );
+                return;
+            }
+
+            // ユーザー操作による再起動では、回線状況や画質を見直した上での再接続とみなし、
+            // 接続喪失の連続カウントをリセットする。理由タグのない自動再起動と混同しないよう明示フラグだけを参照する
+            if (event.is_user_initiated === true) {
+                this.konomitv_bs4k_streaming_reconnect_guard.reset();
+            }
             is_player_restarting = true;
 
             // 現在の再生画質・再生速度・再生位置を取得
@@ -1886,6 +1935,9 @@ class PlayerController {
                 this.player.options.video.quality?.[this.player.qualityIndex] ?? null : null;
             const current_playback_rate = this.player?.video.playbackRate ?? null;
             const current_time = this.player?.video.currentTime ?? null;
+
+            // ユーザーが回線状況や画質を見直した上での再接続とみなし、接続喪失の連続カウントをリセットする
+            this.konomitv_bs4k_streaming_reconnect_guard.reset();
 
             // PlayerController 自身を破棄
             // このイベントは手動で再起動した際に実行されるものなので、再初期化までは待たずに即座に再初期化する
@@ -2236,6 +2288,14 @@ class PlayerController {
         const on_init_or_quality_change = async (is_quality_change: boolean = false) => {
             const current_playback_handler_generation = ++playback_handler_generation;
             const current_player = this.player;
+
+            // 画質切り替えは PlayerRestartRequired イベントを介さずストリーミングへ再接続するため、
+            // ユーザーが回線状況に応じて画質を見直した上での再接続とみなし、接続喪失の連続カウントをリセットする
+            // (自動再起動に伴う DPlayer の再初期化ではリセットしない。リセットすると接続喪失ループの抑止自体が無効化されてしまう)
+            if (is_quality_change === true) {
+                this.konomitv_bs4k_streaming_reconnect_guard.reset();
+            }
+
             const is_current = (): boolean => (
                 current_playback_handler_generation === playback_handler_generation &&
                 current_player !== null &&
@@ -2506,6 +2566,7 @@ class PlayerController {
                 if (player_store.live_stream_status === 'ONAir' && player_store.is_video_buffering === true && on_canplay_called === false) {
                     player_store.event_emitter.emit('PlayerRestartRequired', {
                         message: '再生開始までに時間が掛かっています。プレイヤーを再起動しています…',
+                        konomitv_bs4k_restart_reason: 'StreamingConnectionLost',
                     });
                 }
 
@@ -3933,6 +3994,7 @@ class PlayerController {
                     message_delay_seconds: 2,
                     is_error_message: false,
                     should_resume_quality: true,
+                    is_user_initiated: true,
                 });
             });
         }
@@ -4233,6 +4295,7 @@ class PlayerController {
                     message_delay_seconds: this.tv_low_latency_mode || this.playback_mode === 'Video' ? 2 : 4.5,
                     is_error_message: false,
                     should_resume_quality: true,
+                    is_user_initiated: true,
                 });
             });
         });
@@ -4294,6 +4357,7 @@ class PlayerController {
                     message_delay_seconds: 2,
                     is_error_message: false,
                     should_resume_quality: true,
+                    is_user_initiated: true,
                 });
             });
         });
@@ -4336,6 +4400,7 @@ class PlayerController {
                     is_error_message: false,
                     // モバイル回線プロファイル切り替え時、切り替え後の画質プロファイルのデフォルト画質を優先する
                     should_resume_quality: false,
+                    is_user_initiated: true,
                 });
             // 画質プロファイルを Wi-Fi 回線向けに切り替えてから、プレイヤーを再起動
             } else {
@@ -4350,6 +4415,7 @@ class PlayerController {
                     is_error_message: false,
                     // Wi-Fi プロファイル切り替え時、切り替え後の画質プロファイルのデフォルト画質を優先する
                     should_resume_quality: false,
+                    is_user_initiated: true,
                 });
             }
         });

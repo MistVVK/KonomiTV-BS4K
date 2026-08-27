@@ -221,6 +221,7 @@ class LiveEventManager implements PlayerManager {
                     // ライブストリーミング API への接続が切断された可能性が高いので、PlayerController にプレイヤーの再起動を要求する
                     player_store.event_emitter.emit('PlayerRestartRequired', {
                         message: 'ストリーミング接続が切断されました。(Status: Idling) プレイヤーを再起動しています…',
+                        konomitv_bs4k_restart_reason: 'StreamingConnectionLost',
                     });
 
                     break;
@@ -249,16 +250,20 @@ class LiveEventManager implements PlayerManager {
                 // 基本的に Offline は放送休止中やエラーなどで復帰の見込みがない状態
                 case 'Offline': {
 
+                    // ステータス詳細をプレイヤーに表示
+                    // PlayerRestartRequired ハンドラーは mitt 経由で同期的に実行されるため、接続喪失の連続で自動再起動が
+                    // 拒否された場合は拒否側のエラーメッセージでこの通知が上書きされる (拒否側のメッセージを優先するため先に表示する)
+                    this.player.notice(event.detail, -1);
+
                     // 「ライブストリームは Offline です。」のステータス詳細を受信すること自体が不正な状態
                     // ストリーミング API への接続が切断された可能性が高いので、PlayerController にプレイヤーの再起動を要求する
                     if (event.detail === 'ライブストリームは Offline です。') {
                         player_store.event_emitter.emit('PlayerRestartRequired', {
                             message: 'ストリーミング接続が切断されました。(Status: Offline) プレイヤーを再起動しています…',
+                            konomitv_bs4k_restart_reason: 'StreamingConnectionLost',
                         });
                     }
 
-                    // ステータス詳細をプレイヤーに表示
-                    this.player.notice(event.detail, -1);
                     this.player.video.onerror = () => {
                         // 動画の読み込みエラーが送出された際に DPlayer に表示中の通知メッセージを上書きする
                         this.player.notice(event.detail, -1);

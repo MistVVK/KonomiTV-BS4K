@@ -252,6 +252,7 @@ class KeyboardShortcutManager implements PlayerManager {
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: 'プレイヤーを再起動しました。',
                     is_error_message: false,  // 明示的に上記メッセージがエラーメッセージではないことを示す (通知時の色がデフォルトになる)
+                    is_user_initiated: true,
                 });
             }},
 

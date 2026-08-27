@@ -32,10 +32,12 @@ export type PlayerEvents = {
         message_delay_seconds?: number;  // メッセージを表示するまでの待機時間 (秒)
         is_error_message?: boolean;  // メッセージをエラーメッセージとして表示するか (既定は true)
         should_resume_quality?: boolean;  // 再起動後に直前の画質を引き継ぐかどうか (既定は true)
+        is_user_initiated?: boolean;  // ユーザー操作による再起動かどうか (既定は false)
         // KonomiTV-BS4K の画質能力 guard が、切替開始前の対応画質を明示的に復元する場合だけ指定する
         konomitv_bs4k_resume_quality?: string;
-        // デコーダー・SourceBuffer の codec pipeline 失敗から自動復旧するときだけ指定する
-        konomitv_bs4k_restart_reason?: 'RuntimeCodecPipelineError';
+        // デコーダー・SourceBuffer の codec pipeline 失敗から自動復旧するとき (RuntimeCodecPipelineError)、または
+        // 帯域不足などによるライブストリーミング接続の喪失から自動復旧するとき (StreamingConnectionLost) だけ指定する
+        konomitv_bs4k_restart_reason?: 'RuntimeCodecPipelineError' | 'StreamingConnectionLost';
     };
     // PlayerController.setControlDisplayTimer() をそのまま呼び出す
     SetControlDisplayTimer: {
