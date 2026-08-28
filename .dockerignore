@@ -16,6 +16,9 @@ docker/development/state/
 client/node_modules/
 docker/opencode/node_modules/
 
+# ホストのエージェント用 OpenCode 設定（node_modules を含む）を build context へ含めない
+.opencode/
+
 # ホスト側の既存 build 成果物: Docker 内で再生成する
 client/dist/
 
