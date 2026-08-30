@@ -242,6 +242,7 @@ function buildAv1SequenceHeaderObu(primaries: number, transfer: number, matrix: 
     writer.writeBits(0, 1);  // enable_dual_filter
     writer.writeBits(0, 1);  // enable_order_hint
     writer.writeBits(1, 1);  // seq_choose_screen_content_tools (SELECT)
+    writer.writeBits(1, 1);  // seq_choose_integer_mv (SELECT)
     writer.writeBits(0, 1);  // enable_superres
     writer.writeBits(1, 1);  // enable_cdef
     writer.writeBits(0, 1);  // enable_restoration

@@ -678,7 +678,8 @@ function parseAv1SequenceHeaderColor(payload: Uint8Array): ParsedColorSignaling 
             } else {
                 seq_force_screen_content_tools = reader.readBits(1);
             }
-            if (seq_force_screen_content_tools === 1) {
+            // SELECT (2) の場合も seq_choose_integer_mv を読む (0 以外なら読むのが AV1 仕様)
+            if (seq_force_screen_content_tools > 0) {
                 if (reader.readBool()) {  // seq_choose_integer_mv
                     // seq_force_integer_mv = SELECT_INTEGER_MV (読み飛ばしだけでよい)
                 } else {
@@ -1286,8 +1287,13 @@ export function rewriteKonomiTVBS4KFMP4InitSegment(
                 output = scan.output;
                 rewritten = true;
             }
-            // colr ボックス (あれば) も同じ色信号へ揃える。書換え対象外の信号では既値と一致するため変わらない
-            if (scan.detected !== null) {
+            // colr ボックスは、コーデック設定の信号を実際に書き換えた場合だけ同じ値へ揃える。
+            // 書換え対象外 (非 HDR・素通し) やコーデック側が unspecified の場合に colr の実値を壊さないための条件
+            if (scan.detected !== null &&
+                colorTuplesEqual(
+                    scan.detected,
+                    resolveKonomiTVBS4KFMP4ColorRewrite(scan.detected, mode),
+                ) === false) {
                 const effective = resolveKonomiTVBS4KFMP4ColorRewrite(scan.detected, mode);
                 const base_data = output ?? data;
                 const colr_output = rewriteColrBox(base_data, output, entry, effective);
