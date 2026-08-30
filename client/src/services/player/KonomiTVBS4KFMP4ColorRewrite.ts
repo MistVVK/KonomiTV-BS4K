@@ -231,7 +231,17 @@ function ebspToRbsp(ebsp: Uint8Array): Uint8Array {
  */
 function isValidEbsp(ebsp: Uint8Array): boolean {
     for (let index = 2; index < ebsp.byteLength; index++) {
-        if (ebsp[index - 2] === 0x00 && ebsp[index - 1] === 0x00 && ebsp[index] <= 0x02) {
+        if (ebsp[index - 2] !== 0x00 || ebsp[index - 1] !== 0x00) {
+            continue;
+        }
+        const value = ebsp[index];
+        // 00 00 00 / 00 00 01 / 00 00 02 はスタートコード等の禁止パターン
+        if (value <= 0x02) {
+            return false;
+        }
+        // エミュレーション防止バイト (0x03) の後には 0x00-0x03 だけが来られる。
+        // それ以外の続き方や末尾で終わる 00 00 03 は、書換えが不正な境界を作らないための保守的な拒否
+        if (value === 0x03 && (index + 1 >= ebsp.byteLength || ebsp[index + 1] > 0x03)) {
             return false;
         }
     }
@@ -734,7 +744,6 @@ function rewriteAv1ObuSequenceColor(
     let rewritten = false;
     let offset = 0;
     while (offset < obus.byteLength) {
-        const obu_start = offset;
         const header = obus[offset];
         if ((header & 0x80) !== 0) {  // obu_forbidden_bit
             return null;
@@ -781,10 +790,12 @@ function rewriteAv1ObuSequenceColor(
                 if (output === null) {
                     output = obus.slice();
                 }
-                // AV1 のペイロードにはエミュレーション防止が無いので、ペイロード内のビット位置へ直接書く
+                // AV1 のペイロードにはエミュレーション防止が無いので、ペイロード内のビット位置へ直接書く。
+                // 書込み先は OBU 列全体のコピーなので、基準は OBU 先頭ではなく列先頭からの絶対位置とする
+                // (sequence header が先頭 OBU でない場合に先行 OBU を破壊しないため)
                 writeBitsToBytes(
                     output,
-                    (offset - obu_start) * 8 + (parsed.color_bit_offset ?? 0),
+                    offset * 8 + parsed.color_bit_offset,
                     24,
                     (effective.colour_primaries << 16) |
                         (effective.transfer_characteristics << 8) |
@@ -1341,135 +1352,147 @@ export function rewriteKonomiTVBS4KFMP4MediaSegment(
     if (top_boxes === null) {
         return failure;
     }
-    const moof = top_boxes.find((box) => box.type === 'moof');
-    const mdat = top_boxes.find((box) => box.type === 'mdat');
-    if (moof === undefined || mdat === undefined) {
+    // 1つの HLS セグメントに複数の moof/mdat fragment が並ぶのは RecordedFMP4Stream の正規契約。
+    // 先頭だけでなく全ての moof と、それに続く mdat を組として処理する
+    const moofs = top_boxes.filter((box) => box.type === 'moof');
+    if (moofs.length === 0) {
         // styp だけのセグメントなどは無害だが、moof/mdat を欠くメディアセグメントは扱えない
-        return failure;
-    }
-    const trafs = (() => {
-        const moof_children = parseMP4Boxes(data, moof.content_start, moof.end);
-        return moof_children?.filter((box) => box.type === 'traf') ?? null;
-    })();
-    if (trafs === null) {
         return failure;
     }
     let output: Uint8Array | null = null;
     let rewritten = false;
     let detected: KonomiTVBS4KFMP4ColorTuple | null = null;
-    for (const traf of trafs) {
-        // 1ファイル1映像トラックの録画 fMP4 では最初の traf が映像
-        const tfhd = findChildBox(data, traf, 'tfhd');
-        if (tfhd === null || tfhd.content_start + 4 > tfhd.end) {
+    for (const moof of moofs) {
+        // この moof のサンプルデータは、次の moof の手前にある直近の mdat に置かれる
+        const mdat = top_boxes.find((box) =>
+            box.type === 'mdat' && box.start >= moof.end &&
+            (moofs.find((next) => next.start > moof.start)?.start ?? data.byteLength) > box.start);
+        if (mdat === undefined) {
             return failure;
         }
-        const tfhd_flags = (data[tfhd.content_start + 1] << 16) |
-            (data[tfhd.content_start + 2] << 8) | data[tfhd.content_start + 3];
-        let tfhd_offset = tfhd.content_start + 4 + 4;  // version/flags + track_ID
-        if ((tfhd_flags & 0x000001) !== 0) {
-            tfhd_offset += 8;  // base_data_offset (本実装では default_base_moof 前提のため参照しない)
-        }
-        if ((tfhd_flags & 0x000002) !== 0) {
-            tfhd_offset += 4;  // sample_description_index
-        }
-        if ((tfhd_flags & 0x000008) !== 0) {
-            tfhd_offset += 4;  // default_sample_duration
-        }
-        let default_sample_size = 0;
-        if ((tfhd_flags & 0x000010) !== 0) {
-            if (tfhd_offset + 4 > tfhd.end) {
-                return failure;
-            }
-            default_sample_size = new DataView(data.buffer, data.byteOffset + tfhd_offset, 4).getUint32(0, false);
-            tfhd_offset += 4;
-        }
-        const truns = (() => {
-            const children = parseMP4Boxes(data, traf.content_start, traf.end);
-            return children?.filter((box) => box.type === 'trun') ?? null;
+        const trafs = (() => {
+            const moof_children = parseMP4Boxes(data, moof.content_start, moof.end);
+            return moof_children?.filter((box) => box.type === 'traf') ?? null;
         })();
-        if (truns === null) {
+        if (trafs === null) {
             return failure;
         }
-        let current_data_offset = 0;
-        let is_first_trun = true;
-        for (const trun of truns) {
-            if (trun.content_start + 8 > trun.end) {
+        for (const traf of trafs) {
+            // 1ファイル1映像トラックの録画 fMP4 では最初の traf が映像
+            const tfhd = findChildBox(data, traf, 'tfhd');
+            if (tfhd === null || tfhd.content_start + 4 > tfhd.end) {
                 return failure;
             }
-            const trun_flags = (data[trun.content_start + 1] << 16) |
-                (data[trun.content_start + 2] << 8) | data[trun.content_start + 3];
-            const sample_count = new DataView(data.buffer, data.byteOffset + trun.content_start + 4, 4)
-                .getUint32(0, false);
-            let trun_offset = trun.content_start + 8;
-            let data_offset: number | null = null;
-            if ((trun_flags & 0x000001) !== 0) {
-                if (trun_offset + 4 > trun.end) {
+            const tfhd_flags = (data[tfhd.content_start + 1] << 16) |
+                (data[tfhd.content_start + 2] << 8) | data[tfhd.content_start + 3];
+            let tfhd_offset = tfhd.content_start + 4 + 4;  // version/flags + track_ID
+            if ((tfhd_flags & 0x000001) !== 0) {
+                tfhd_offset += 8;  // base_data_offset (本実装では default_base_moof 前提のため参照しない)
+            }
+            if ((tfhd_flags & 0x000002) !== 0) {
+                tfhd_offset += 4;  // sample_description_index
+            }
+            if ((tfhd_flags & 0x000008) !== 0) {
+                tfhd_offset += 4;  // default_sample_duration
+            }
+            let default_sample_size = 0;
+            if ((tfhd_flags & 0x000010) !== 0) {
+                if (tfhd_offset + 4 > tfhd.end) {
                     return failure;
                 }
-                data_offset = new DataView(data.buffer, data.byteOffset + trun_offset, 4).getInt32(0, false);
-                trun_offset += 4;
+                default_sample_size = new DataView(data.buffer, data.byteOffset + tfhd_offset, 4).getUint32(0, false);
+                tfhd_offset += 4;
             }
-            if ((trun_flags & 0x000004) !== 0) {
-                trun_offset += 4;  // first_sample_flags
-            }
-            const has_sample_duration = (trun_flags & 0x000100) !== 0;
-            const has_sample_size = (trun_flags & 0x000200) !== 0;
-            const has_sample_flags = (trun_flags & 0x000400) !== 0;
-            const has_sample_cto = (trun_flags & 0x000800) !== 0;
-            if (has_sample_size === false && default_sample_size === 0) {
+            const truns = (() => {
+                const children = parseMP4Boxes(data, traf.content_start, traf.end);
+                return children?.filter((box) => box.type === 'trun') ?? null;
+            })();
+            if (truns === null) {
                 return failure;
             }
-            // data_offset は moof 先頭からの相対 (default_base_moof)。省略時は直前の trun の末尾に続く
-            if (data_offset !== null) {
-                current_data_offset = moof.start + data_offset;
-            } else if (is_first_trun === true) {
-                // data_offset を持たない最初の trun の位置を確定できないため安全側に倒す
-                return failure;
-            }
-            is_first_trun = false;
-            for (let sample_index = 0; sample_index < sample_count; sample_index++) {
-                if (has_sample_duration === true) {
-                    trun_offset += 4;
+            let current_data_offset = 0;
+            let is_first_trun = true;
+            for (const trun of truns) {
+                if (trun.content_start + 8 > trun.end) {
+                    return failure;
                 }
-                let sample_size = default_sample_size;
-                if (has_sample_size === true) {
+                const trun_flags = (data[trun.content_start + 1] << 16) |
+                    (data[trun.content_start + 2] << 8) | data[trun.content_start + 3];
+                const sample_count = new DataView(data.buffer, data.byteOffset + trun.content_start + 4, 4)
+                    .getUint32(0, false);
+                let trun_offset = trun.content_start + 8;
+                let data_offset: number | null = null;
+                if ((trun_flags & 0x000001) !== 0) {
                     if (trun_offset + 4 > trun.end) {
                         return failure;
                     }
-                    sample_size = new DataView(data.buffer, data.byteOffset + trun_offset, 4).getUint32(0, false);
+                    data_offset = new DataView(data.buffer, data.byteOffset + trun_offset, 4).getInt32(0, false);
                     trun_offset += 4;
                 }
-                if (has_sample_flags === true) {
-                    trun_offset += 4;
+                if ((trun_flags & 0x000004) !== 0) {
+                    trun_offset += 4;  // first_sample_flags
                 }
-                if (has_sample_cto === true) {
-                    trun_offset += 4;
-                }
-                if (sample_size === 0) {
-                    continue;
-                }
-                if (current_data_offset + sample_size > mdat.end) {
+                const has_sample_duration = (trun_flags & 0x000100) !== 0;
+                const has_sample_size = (trun_flags & 0x000200) !== 0;
+                const has_sample_flags = (trun_flags & 0x000400) !== 0;
+                const has_sample_cto = (trun_flags & 0x000800) !== 0;
+                if (has_sample_size === false && default_sample_size === 0) {
                     return failure;
                 }
-                const sample_start = current_data_offset;
-                current_data_offset += sample_size;
-                // サンプル内の in-band 色信号を書き換える
-                const outcome = rewriteSampleInBandColor(
-                    output ?? data,
-                    sample_start,
-                    sample_size,
-                    mode,
-                    video_state,
-                );
-                if (outcome.unsafe === true) {
+                // data_offset は moof 先頭からの相対 (default_base_moof)。省略時は直前の trun の末尾に続く
+                if (data_offset !== null) {
+                    current_data_offset = moof.start + data_offset;
+                } else if (is_first_trun === true) {
+                    // data_offset を持たない最初の trun の位置を確定できないため安全側に倒す
                     return failure;
                 }
-                if (detected === null && outcome.detected !== null) {
-                    detected = outcome.detected;
-                }
-                if (outcome.rewritten === true) {
-                    output = outcome.data;
-                    rewritten = true;
+                is_first_trun = false;
+                for (let sample_index = 0; sample_index < sample_count; sample_index++) {
+                    if (has_sample_duration === true) {
+                        trun_offset += 4;
+                    }
+                    let sample_size = default_sample_size;
+                    if (has_sample_size === true) {
+                        if (trun_offset + 4 > trun.end) {
+                            return failure;
+                        }
+                        sample_size = new DataView(data.buffer, data.byteOffset + trun_offset, 4).getUint32(0, false);
+                        trun_offset += 4;
+                    }
+                    if (has_sample_flags === true) {
+                        trun_offset += 4;
+                    }
+                    if (has_sample_cto === true) {
+                        trun_offset += 4;
+                    }
+                    if (sample_size === 0) {
+                        continue;
+                    }
+                    // 負の data_offset などで mdat 領域外を指す入力は、範囲外の解析・改変を避けるため unsafe へ倒す
+                    if (current_data_offset < mdat.content_start ||
+                        current_data_offset + sample_size > mdat.end) {
+                        return failure;
+                    }
+                    const sample_start = current_data_offset;
+                    current_data_offset += sample_size;
+                    // サンプル内の in-band 色信号を書き換える
+                    const outcome = rewriteSampleInBandColor(
+                        output ?? data,
+                        sample_start,
+                        sample_size,
+                        mode,
+                        video_state,
+                    );
+                    if (outcome.unsafe === true) {
+                        return failure;
+                    }
+                    if (detected === null && outcome.detected !== null) {
+                        detected = outcome.detected;
+                    }
+                    if (outcome.rewritten === true) {
+                        output = outcome.data;
+                        rewritten = true;
+                    }
                 }
             }
         }

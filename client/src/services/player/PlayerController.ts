@@ -739,6 +739,11 @@ class PlayerController {
         // 録画 HLS (オンライン / オフライン保存) の fMP4 色信号書換えセッションを作成する。
         // HDR 出力の選択は視聴中だけの override を優先し、SettingsStore の既定値は書き換えない。
         // 選択の変更はプレイヤー再起動で反映するため、セッションの mode は初期化時に固定する。
+        // 書換え不能の unsafe ラッチは新しい再生セッション (再起動・画質変更) ごとに解除し、
+        // 安全になった新セッションで canvas が復帰できるようにする
+        if (this.playback_mode === 'Video') {
+            player_store.konomitv_bs4k_recorded_color_rewrite_unsafe = false;
+        }
         const color_rewrite_session = this.playback_mode === 'Video' ?
             createKonomiTVBS4KColorRewriteSession(resolveKonomiTVBS4KHdrOutput(
                 settings_store.settings.konomitv_bs4k_hdr_output,

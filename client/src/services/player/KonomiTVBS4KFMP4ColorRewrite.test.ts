@@ -164,8 +164,8 @@ function buildAvcSps(primaries: number, transfer: number, matrix: number): Uint8
     return concat(new Uint8Array([0x67]), rbspToEbsp(writer.toBytes()));
 }
 
-/** HLG/PQ (BT.2020) を通知する H.265 Main10 SPS NAL (NAL ヘッダ 0x42 0x01 付き) */
-function buildHevcSps(primaries: number, transfer: number, matrix: number): Uint8Array {
+/** HLG/PQ (BT.2020) を通知する H.265 Main10 SPS NAL (NAL ヘッダ 0x42 0x01 付き)。tail_bytes は末尾への生バイト注入用 */
+function buildHevcSps(primaries: number, transfer: number, matrix: number, tail_bytes: number[] = []): Uint8Array {
     const writer = new BitWriter();
     writer.writeBits(0, 4);  // sps_video_parameter_set_id
     writer.writeBits(0, 3);  // sps_max_sub_layers_minus1
@@ -214,7 +214,7 @@ function buildHevcSps(primaries: number, transfer: number, matrix: number): Uint
     writer.writeBits(primaries, 8);
     writer.writeBits(transfer, 8);
     writer.writeBits(matrix, 8);
-    return concat(new Uint8Array([0x42, 0x01]), rbspToEbsp(writer.toBytes()));
+    return concat(new Uint8Array([0x42, 0x01]), rbspToEbsp(writer.toBytes()), Uint8Array.from(tail_bytes));
 }
 
 /** AV1 の sequence header OBU (obu_has_size_field=1) */
@@ -270,9 +270,9 @@ function buildAvcInitSegment(primaries: number, transfer: number, matrix: number
     return concat(ftypBox(), moovWithSampleEntry(entry));
 }
 
-/** HEVC の初期化セグメント (hvcC + colr 付き hvc1 エントリ) */
-function buildHevcInitSegment(primaries: number, transfer: number, matrix: number): Uint8Array {
-    const sps = buildHevcSps(primaries, transfer, matrix);
+/** HEVC の初期化セグメント (hvcC + colr 付き hvc1 エントリ)。sps_override で SPS NAL を差し替えられる */
+function buildHevcInitSegment(primaries: number, transfer: number, matrix: number, sps_override?: Uint8Array): Uint8Array {
+    const sps = sps_override ?? buildHevcSps(primaries, transfer, matrix);
     const record_header = new Uint8Array(23);
     record_header[0] = 1;  // configurationVersion
     record_header[1] = (0 << 6) | (0 << 5) | 2;  // profile_space/tier/profile_idc (Main10)
@@ -302,17 +302,17 @@ function buildVp9InitSegment(primaries: number, transfer: number, matrix: number
     return concat(ftypBox(), moovWithSampleEntry(entry));
 }
 
-/** AV1 の初期化セグメント (av1C configOBUs + colr 付き av01 エントリ) */
-function buildAv1InitSegment(primaries: number, transfer: number, matrix: number): Uint8Array {
+/** AV1 の初期化セグメント (av1C configOBUs + colr 付き av01 エントリ)。obu_prefix で configOBUs 先頭へ OBU を前置できる */
+function buildAv1InitSegment(primaries: number, transfer: number, matrix: number, obu_prefix?: Uint8Array): Uint8Array {
     const av1c_header = new Uint8Array([0x81, 0x00, 0x0C, 0x00]);  // marker=1 version=1 / profile0 level7 / 10bit 4:2:0
-    const av1c = box('av1C', av1c_header, buildAv1SequenceHeaderObu(primaries, transfer, matrix));
+    const av1c = box('av1C', av1c_header, ...(obu_prefix !== undefined ? [obu_prefix] : []),
+        buildAv1SequenceHeaderObu(primaries, transfer, matrix));
     const entry = box('av01', visualSampleEntryHeader(), av1c, colrBox(primaries, transfer, matrix));
     return concat(ftypBox(), moovWithSampleEntry(entry));
 }
 
 /** HEVC のメディアセグメント (in-band SPS + ダミーのスライス NAL を持つ1サンプル) */
-function buildHevcMediaSegment(primaries: number, transfer: number, matrix: number): Uint8Array {
-    const sps = buildHevcSps(primaries, transfer, matrix);
+function buildHevcMediaSegment(primaries: number, transfer: number, matrix: number): Uint8Array {    const sps = buildHevcSps(primaries, transfer, matrix);
     const slice_nal = new Uint8Array([0x02, 0x01, 0xAA, 0xBB, 0xCC]);  // 適当なスライス NAL
     const sample = new Uint8Array(4 + sps.byteLength + 4 + slice_nal.byteLength);
     new DataView(sample.buffer).setUint32(0, sps.byteLength, false);
@@ -339,6 +339,39 @@ function buildHevcMediaSegment(primaries: number, transfer: number, matrix: numb
     const moof = box('moof', mfhd, box('traf', tfhd, trun));
     const mdat = box('mdat', sample);
     return concat(styp, moof, mdat);
+}
+
+/** HEVC の1サンプル (任意で in-band SPS 付き) を組み立てる */
+function buildHevcSample(primaries: number, transfer: number, matrix: number, with_sps: boolean): Uint8Array {
+    const parts: Uint8Array[] = [];
+    if (with_sps === true) {
+        const sps = buildHevcSps(primaries, transfer, matrix);
+        const length = new Uint8Array(4);
+        new DataView(length.buffer).setUint32(0, sps.byteLength, false);
+        parts.push(length, sps);
+    }
+    const slice_nal = new Uint8Array([0x02, 0x01, 0xAA, 0xBB, 0xCC]);
+    const length = new Uint8Array(4);
+    new DataView(length.buffer).setUint32(0, slice_nal.byteLength, false);
+    parts.push(length, slice_nal);
+    return concat(...parts);
+}
+
+/** 1サンプルの moof + mdat fragment を組み立てる。data_offset は moof 先頭からの相対 (省略時は直後の mdat) */
+function buildFragment(sample: Uint8Array, data_offset_override?: number): {moof: Uint8Array; mdat: Uint8Array} {
+    const mfhd = box('mfhd', new Uint8Array(8));
+    const tfhd_content = new Uint8Array(8);
+    tfhd_content[1] = 0x02;  // flags = 0x020000 (default_base_is_moof)
+    tfhd_content[7] = 1;  // track_ID
+    const tfhd = box('tfhd', tfhd_content);
+    const moof_size = 8 + mfhd.byteLength + (8 + tfhd.byteLength + (8 + 16));
+    const trun_content = new Uint8Array(16);
+    trun_content[2] = 0x02;
+    trun_content[3] = 0x01;  // flags = data-offset-present + sample-size-present
+    new DataView(trun_content.buffer).setUint32(4, 1, false);  // sample_count
+    new DataView(trun_content.buffer).setInt32(8, data_offset_override ?? moof_size + 8, false);
+    new DataView(trun_content.buffer).setUint32(12, sample.byteLength, false);
+    return {moof: box('moof', mfhd, box('traf', tfhd, box('trun', trun_content))), mdat: box('mdat', sample)};
 }
 
 
@@ -410,6 +443,27 @@ describe('KonomiTVBS4KFMP4ColorRewrite (初期化セグメント)', () => {
         });
     });
 
+    it('AV1 の sequence header が先頭 OBU でなくても先行 OBU を破壊せず書き換える', () => {
+        // temporal delimiter OBU (type=2, 空ペイロード) を sequence header の前に置く
+        const temporal_delimiter_obu = new Uint8Array([0x12, 0x00]);  // type=2 + has_size_field, size=0
+        const init = buildAv1InitSegment(9, CICP_HLG_TRANSFER, 9, temporal_delimiter_obu);
+        const result = rewriteKonomiTVBS4KFMP4InitSegment(init, 'ToneMap');
+
+        expect(result.unsafe).toBe(false);
+        expect(result.rewritten).toBe(true);
+        expect(result.detected).toEqual({colour_primaries: 9, transfer_characteristics: CICP_HLG_TRANSFER, matrix_coeffs: 9});
+        // 先行 OBU のバイト列は無傷のまま残る
+        const prefix_index = Buffer.from(result.data).indexOf(temporal_delimiter_obu);
+        expect(prefix_index).toBeGreaterThan(-1);
+        // 書換え後は SDR 用の信号として読める
+        const verify = rewriteKonomiTVBS4KFMP4InitSegment(result.data, 'None');
+        expect(verify.detected).toEqual({
+            colour_primaries: CICP_BT709_PRIMARIES,
+            transfer_characteristics: CICP_SRGB_TRANSFER,
+            matrix_coeffs: 9,
+        });
+    });
+
     it('None モードでは4コーデックともバイト列を一切変更しない', () => {
         const inits = [
             buildAvcInitSegment(9, CICP_HLG_TRANSFER, 9),
@@ -448,6 +502,25 @@ describe('KonomiTVBS4KFMP4ColorRewrite (初期化セグメント)', () => {
         expect(result.unsafe).toBe(true);
         expect(result.rewritten).toBe(false);
         expect(Buffer.from(result.data).equals(Buffer.from(truncated))).toBe(true);
+    });
+
+    it('不正なエミュレーション防止 (00 00 03 04) を含む SPS は unsafe で原本不変にする', () => {
+        // 色情報の後ろに 00 00 03 04 を含む SPS。書換え後の EBSP 検証がこの境界を拒否する
+        const sps = buildHevcSps(9, CICP_PQ_TRANSFER, 9, [0x00, 0x00, 0x03, 0x04]);
+        const init = buildHevcInitSegment(9, CICP_PQ_TRANSFER, 9, sps);
+        const result = rewriteKonomiTVBS4KFMP4InitSegment(init, 'ToneMap');
+        expect(result.unsafe).toBe(true);
+        expect(result.rewritten).toBe(false);
+        expect(Buffer.from(result.data).equals(Buffer.from(init))).toBe(true);
+    });
+
+    it('末尾が 00 00 03 で終わる SPS は unsafe で原本不変にする', () => {
+        const sps = buildHevcSps(9, CICP_PQ_TRANSFER, 9, [0x00, 0x00, 0x03]);
+        const init = buildHevcInitSegment(9, CICP_PQ_TRANSFER, 9, sps);
+        const result = rewriteKonomiTVBS4KFMP4InitSegment(init, 'ToneMap');
+        expect(result.unsafe).toBe(true);
+        expect(result.rewritten).toBe(false);
+        expect(Buffer.from(result.data).equals(Buffer.from(init))).toBe(true);
     });
 });
 
@@ -495,6 +568,40 @@ describe('KonomiTVBS4KFMP4ColorRewrite (メディアセグメント in-band)', (
         const result = rewriteKonomiTVBS4KFMP4MediaSegment(truncated, 'ToneMap', video_state);
         expect(result.unsafe).toBe(true);
         expect(Buffer.from(result.data).equals(Buffer.from(truncated))).toBe(true);
+    });
+
+    it('複数の moof/mdat fragment を持つセグメントでは後続 fragment の in-band 色信号も書き換える', () => {
+        // RecordedFMP4Stream が 1 HLS セグメントに複数 moof/mdat を並べる正規契約に対応する
+        const styp = box('styp', new Uint8Array([0x6D, 0x73, 0x64, 0x68, 0, 0, 0, 0]));  // 'msdh'
+        const first = buildFragment(buildHevcSample(1, 1, 1, false));  // 先頭は SPS なし
+        const second_sample = buildHevcSample(9, CICP_PQ_TRANSFER, 9, true);  // 後続 fragment に HLG SPS
+        // 2つ目の moof の data_offset は moof 先頭からの相対なので、組み立て時の既定値で正しい
+        const second = buildFragment(second_sample);
+        const segment = concat(styp, first.moof, first.mdat, second.moof, second.mdat);
+
+        const result = rewriteKonomiTVBS4KFMP4MediaSegment(segment, 'ToneMap', video_state);
+        expect(result.unsafe).toBe(false);
+        expect(result.rewritten).toBe(true);
+        expect(result.detected).toEqual({colour_primaries: 9, transfer_characteristics: CICP_PQ_TRANSFER, matrix_coeffs: 9});
+        // 書換え後の再処理では SDR 用の信号として読める
+        const verify = rewriteKonomiTVBS4KFMP4MediaSegment(result.data, 'ToneMap', video_state);
+        expect(verify.unsafe).toBe(false);
+        expect(verify.rewritten).toBe(false);
+        expect(verify.detected).toEqual({
+            colour_primaries: CICP_BT709_PRIMARIES,
+            transfer_characteristics: CICP_SRGB_TRANSFER,
+            matrix_coeffs: 9,
+        });
+    });
+
+    it('負の data_offset で mdat 領域外を指す入力は原本不変の unsafe へ倒す', () => {
+        const styp = box('styp', new Uint8Array([0x6D, 0x73, 0x64, 0x68, 0, 0, 0, 0]));
+        const fragment = buildFragment(buildHevcSample(9, CICP_PQ_TRANSFER, 9, true), -24);
+        const segment = concat(styp, fragment.moof, fragment.mdat);
+        const result = rewriteKonomiTVBS4KFMP4MediaSegment(segment, 'ToneMap', video_state);
+        expect(result.unsafe).toBe(true);
+        expect(result.rewritten).toBe(false);
+        expect(Buffer.from(result.data).equals(Buffer.from(segment))).toBe(true);
     });
 });
 
