@@ -466,6 +466,7 @@ const handleSettingCoverClick = () => {
         .dplayer-setting-audio-item:hover,
         .dplayer-konomitv-bs4k-setting-video-codec-item:hover,
         .dplayer-konomitv-bs4k-setting-audio-codec-item:hover,
+        .dplayer-konomitv-bs4k-setting-hdr-output-item:hover,
         .dplayer-setting-header:hover {
             background: rgba(var(--v-theme-primary), 0.12) !important;
         }
@@ -474,7 +475,8 @@ const handleSettingCoverClick = () => {
         .dplayer-setting-speed-panel,
         .dplayer-setting-audio-panel,
         .dplayer-konomitv-bs4k-setting-video-codec-panel,
-        .dplayer-konomitv-bs4k-setting-audio-codec-panel {
+        .dplayer-konomitv-bs4k-setting-audio-codec-panel,
+        .dplayer-konomitv-bs4k-setting-hdr-output-panel {
             scrollbar-color: rgba(var(--v-theme-player-on-overlay), 0.24) transparent;
             &::-webkit-scrollbar-thumb {
                 background: rgba(var(--v-theme-player-on-overlay), 0.24) !important;
@@ -494,7 +496,8 @@ const handleSettingCoverClick = () => {
             clip-path: inset(calc(100% - var(--audio-panel-height, 114px)) 0 0 round 7px) !important;
         }
         &.dplayer-konomitv-bs4k-setting-box-video-codec,
-        &.dplayer-konomitv-bs4k-setting-box-audio-codec {
+        &.dplayer-konomitv-bs4k-setting-box-audio-codec,
+        &.dplayer-konomitv-bs4k-setting-box-hdr-output {
             // DPlayer が保持する元パネルの inline clip-path を壊さず、独自サブパネルの表示中だけ元パネルを退避する
             .dplayer-setting-origin-panel {
                 transform: translateX(-100%);
@@ -511,6 +514,13 @@ const handleSettingCoverClick = () => {
             clip-path: inset(calc(100% - var(--konomitv-bs4k-audio-codec-panel-height, 114px)) 0 0 round 7px) !important;
 
             .dplayer-konomitv-bs4k-setting-audio-codec-panel {
+                transform: translateX(0%) !important;
+            }
+        }
+        &.dplayer-konomitv-bs4k-setting-box-hdr-output {
+            clip-path: inset(calc(100% - var(--konomitv-bs4k-hdr-output-panel-height, 144px)) 0 0 round 7px) !important;
+
+            .dplayer-konomitv-bs4k-setting-hdr-output-panel {
                 transform: translateX(0%) !important;
             }
         }

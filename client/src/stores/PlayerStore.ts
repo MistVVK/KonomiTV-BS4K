@@ -227,7 +227,11 @@ const usePlayerStore = defineStore('player', {
         konomitv_bs4k_playback_hdr_output_override: null as 'Auto' | 'HDR' | 'SDR' | null,
 
         // mpegts.js が検出した元の transfer_characteristics。HLG=18 / PQ=16。
+        // 録画 HLS では KonomiTVBS4KColorRewriteLoader が fMP4 から検出した値を書き込む
         sps_transfer_characteristics: null as number | null,
+
+        // 録画 HLS: fMP4 の色信号を安全に書き換えられなかったか。true なら HDR canvas 変換を無効化する
+        konomitv_bs4k_recorded_color_rewrite_unsafe: false,
 
         // ライブ視聴: ニコニコ実況への接続に失敗した際のエラーメッセージ
         // null のとき、エラーは発生していないとみなす
@@ -348,6 +352,7 @@ const usePlayerStore = defineStore('player', {
             this.mh_eit_hdr_hint = null;
             this.konomitv_bs4k_playback_hdr_output_override = null;
             this.sps_transfer_characteristics = null;
+            this.konomitv_bs4k_recorded_color_rewrite_unsafe = false;
             this.live_comment_init_failed_message = null;
             this.clearTwitterCaptures();
         }

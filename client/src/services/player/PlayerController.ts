@@ -11,6 +11,10 @@ import APIClient from '@/services/APIClient';
 import OfflineVideos from '@/services/OfflineVideos';
 import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
+import KonomiTVBS4KColorRewriteLoader, {
+    createKonomiTVBS4KColorRewriteSession,
+} from '@/services/player/KonomiTVBS4KColorRewriteLoader';
+import { resolveKonomiTVBS4KHdrOutput } from '@/services/player/KonomiTVBS4KHdrPolicy';
 import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
 import KonomiTVBS4KStreamingReconnectGuard from '@/services/player/KonomiTVBS4KStreamingReconnectGuard';
 import CaptureManager from '@/services/player/managers/CaptureManager';
@@ -732,6 +736,15 @@ class PlayerController {
         (window as any).mpegts = mpegts;
         (window as any).Hls = Hls;
 
+        // 録画 HLS (オンライン / オフライン保存) の fMP4 色信号書換えセッションを作成する。
+        // HDR 出力の選択は視聴中だけの override を優先し、SettingsStore の既定値は書き換えない。
+        // 選択の変更はプレイヤー再起動で反映するため、セッションの mode は初期化時に固定する。
+        const color_rewrite_session = this.playback_mode === 'Video' ?
+            createKonomiTVBS4KColorRewriteSession(resolveKonomiTVBS4KHdrOutput(
+                settings_store.settings.konomitv_bs4k_hdr_output,
+                player_store.konomitv_bs4k_playback_hdr_output_override,
+            )) : null;
+
         // DPlayer を初期化
         this.player = new DPlayer({
             // DPlayer を配置する要素
@@ -1203,6 +1216,12 @@ class PlayerController {
                 // hls.js
                 hls: {
                     ...Hls.DefaultConfig,
+                    // 録画 fMP4 の HDR 色信号を fragment loader 境界で書き換えるための独自 Loader。
+                    // オンライン録画と CacheStorage 上のオフライン保存の両方がこの経路を通る。
+                    // ライブ (mpegts.js) では使われないため、セッションが無い場合は完全に素通しする。
+                    fLoader: KonomiTVBS4KColorRewriteLoader,
+                    // @ts-ignore セッション同梱キーは hls.js 標準の型に無い独自拡張 (Loader のコンストラクタが読む)
+                    konomitv_bs4k_color_rewrite_session: color_rewrite_session,
                     // Web Worker を有効にする
                     enableWorker: true,
                     // ManagedMediaSource が使える Safari では常に ManagedMediaSource を利用する
@@ -1994,6 +2013,10 @@ class PlayerController {
                     this.recorded_auto_skip_cm_target = target_time;
                     this.recorded_playback_end_blocked_by_seek = false;
                 }),
+                // BS4K 録画 (オンライン / オフライン保存) でも HLG / PQ の SDR 変換 canvas を再利用する。
+                // fMP4 の色信号書換え自体は KonomiTVBS4KColorRewriteLoader が fragment loader 境界で行う
+                ...(player_store.recorded_program.network_id === 0x000B ?
+                    [new KonomiTVBS4KHlgSdrManager(this.player)] : []),
                 new CaptureManager(this.player, this.playback_mode),
                 new DocumentPiPManager(this.player, this.playback_mode),
                 new KeyboardShortcutManager(this.player, this.playback_mode),
@@ -3910,15 +3933,16 @@ class PlayerController {
         // inline clip-path / height は変更しない。閉じる際に全 modifier を外すことで、
         // 戻る操作・外側クリック・別サブパネルへの移動のいずれでも元の寸法へ確実に戻す。
         const setting_box = this.player.template.settingBox;
-        const codec_panel_class_names = [
+        const sub_panel_class_names = [
             'dplayer-konomitv-bs4k-setting-box-video-codec',
             'dplayer-konomitv-bs4k-setting-box-audio-codec',
+            'dplayer-konomitv-bs4k-setting-box-hdr-output',
         ];
-        const close_codec_panel = () => {
-            setting_box.classList.remove(...codec_panel_class_names);
+        const close_sub_panel = () => {
+            setting_box.classList.remove(...sub_panel_class_names);
         };
-        const open_codec_panel = (panel_name: 'video-codec' | 'audio-codec') => {
-            close_codec_panel();
+        const open_sub_panel = (panel_name: 'video-codec' | 'audio-codec' | 'hdr-output') => {
+            close_sub_panel();
             // DPlayer 標準サブパネルの modifier が残っていると clip-path の優先順位が競合する。
             setting_box.classList.remove(
                 'dplayer-setting-box-quality',
@@ -3927,12 +3951,12 @@ class PlayerController {
             );
             setting_box.classList.add(`dplayer-konomitv-bs4k-setting-box-${panel_name}`);
         };
-        const consume_codec_panel_event = (event: Event) => {
+        const consume_sub_panel_event = (event: Event) => {
             // 設定パネル外の click/tap handler へ伝播させず、DPlayer の mask/hide と競合させない。
             event.preventDefault();
             event.stopPropagation();
         };
-        const register_codec_panel_activation_handler = (
+        const register_sub_panel_activation_handler = (
             element: HTMLElement,
             handler: (event: Event) => void,
         ) => {
@@ -3941,7 +3965,7 @@ class PlayerController {
                 // role=button の独自要素をネイティブ button と同じ Enter / Space で起動する。
                 // Space のページスクロールとキーリピートによる多重 preflight はここで抑止する。
                 if ((event.key !== 'Enter' && event.key !== ' ') || event.repeat === true) return;
-                consume_codec_panel_event(event);
+                consume_sub_panel_event(event);
                 element.click();
             });
         };
@@ -3953,12 +3977,12 @@ class PlayerController {
             if (this.player === null) return;
             original_hide.call(this.player.setting);
             // 独自サブパネルを開いたまま外側を押して閉じた場合も、次回は必ず元パネルから表示する。
-            close_codec_panel();
+            close_sub_panel();
             player_store.is_player_setting_panel_open = false;
         };
         this.player.setting.show = () => {
             if (this.player === null) return;
-            close_codec_panel();
+            close_sub_panel();
             original_show.call(this.player.setting);
             player_store.is_player_setting_panel_open = true;
         };
@@ -4075,6 +4099,7 @@ class PlayerController {
                 role="button" tabindex="0" style="touch-action:manipulation;">
                 <span class="dplayer-label">HDR 出力</span>
                 <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-hdr-output-value"></span>
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-hdr-output-arrow"></div>
             </div>
             ${auto_skip_cm_setting_item_html}
             <div class="dplayer-setting-item dplayer-setting-mobile-profile">
@@ -4183,20 +4208,24 @@ class PlayerController {
         };
         const update_hdr_output_display = (): void => {
             if (hdr_output_item === null || hdr_output_value === null) return;
-            // ライブでは SDR 番組でも項目を出し、次の HDR 番組に効く選択をその場で変えられるようにする。
-            // 録画再生には HDR 変換マネージャが無いので出さない。
-            hdr_output_item.style.display = this.playback_mode === 'Live' ? '' : 'none';
+            // BS4K ライブ・BS4K 録画・BS4K オフライン保存の再生でのみ表示する (非 BS4K では表示しない)。
+            // BS4K ライブでは SDR 番組でも項目を出し、次の HDR 番組に効く選択をその場で変えられるようにする。
+            const is_bs4k_playback = this.playback_mode === 'Live' ?
+                channels_store.channel.current.display_channel_id.startsWith('bs4k') :
+                player_store.recorded_program.network_id === 0x000B;
+            hdr_output_item.style.display = is_bs4k_playback === true ? '' : 'none';
             const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
                 settings_store.settings.konomitv_bs4k_hdr_output;
             hdr_output_value.textContent = hdr_output_labels[current];
+            // サブパネルの現在値へチェックを表示する
+            this.player?.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-item')
+                .forEach((item) => {
+                    const check = item.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-check');
+                    if (check !== null) {
+                        check.style.visibility = item.dataset.output === current ? 'visible' : 'hidden';
+                    }
+                });
         };
-        hdr_output_item?.addEventListener('click', () => {
-            const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
-                settings_store.settings.konomitv_bs4k_hdr_output;
-            const next = current === 'Auto' ? 'HDR' : current === 'HDR' ? 'SDR' : 'Auto';
-            player_store.konomitv_bs4k_playback_hdr_output_override = next;
-            update_hdr_output_display();
-        });
         this.rain_fallback_watchers = [
             watch(
                 [
@@ -4229,6 +4258,31 @@ class PlayerController {
                 ${audio_codec_item_html}
             </div>
         `;
+        // HDR 出力のサブパネル。選択肢は設定画面と同じ Auto / HDR 素通し / SDR 変換の3択で、
+        // 選択は視聴中だけの override として扱う (SettingsStore の既定値は書き換えない)
+        const selectable_hdr_outputs: ('Auto' | 'HDR' | 'SDR')[] = ['Auto', 'HDR', 'SDR'];
+        const hdr_output_item_html = selectable_hdr_outputs.map((output) => `
+            <div class="dplayer-konomitv-bs4k-setting-hdr-output-item" data-output="${output}"
+                role="button" tabindex="0"
+                style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-hdr-output-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                <span class="dplayer-label">${hdr_output_labels[output]}</span>
+            </div>
+        `).join('');
+        const hdr_output_panel_height = 54 + selectable_hdr_outputs.length * 30;
+        const hdr_output_panel_html = `
+            <div class="dplayer-konomitv-bs4k-setting-hdr-output-panel"
+                style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
+                <div class="dplayer-setting-header dplayer-konomitv-bs4k-setting-hdr-output-header"
+                    role="button" tabindex="0"
+                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                    <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-hdr-output-back"
+                        style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                    <span class="dplayer-label">HDR 出力</span>
+                </div>
+                ${hdr_output_item_html}
+            </div>
+        `;
         setting_box.insertAdjacentHTML('beforeend', `
             <div class="dplayer-konomitv-bs4k-setting-video-codec-panel"
                 style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
@@ -4242,6 +4296,7 @@ class PlayerController {
                 ${video_codec_item_html}
             </div>
             ${audio_codec_panel_html}
+            ${hdr_output_panel_html}
         `);
 
         // DPlayer が持つ音声トラック用の矢印・戻る・チェックアイコンを流用して見た目を揃える
@@ -4255,6 +4310,10 @@ class PlayerController {
         this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-arrow')!.innerHTML = audio_arrow_html;
         this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-back')!.innerHTML = audio_back_html;
         this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-check')
+            .forEach((element) => element.innerHTML = audio_check_html);
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-arrow')!.innerHTML = audio_arrow_html;
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-back')!.innerHTML = audio_back_html;
+        this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-check')
             .forEach((element) => element.innerHTML = audio_check_html);
 
         // 現在の通常 / BS4K と回線プロファイルに対応する共通設定を、override がない場合だけ参照する。
@@ -4420,27 +4479,27 @@ class PlayerController {
             });
         };
         update_video_codec_display();
-        register_codec_panel_activation_handler(video_codec_button, (event) => {
-            consume_codec_panel_event(event);
+        register_sub_panel_activation_handler(video_codec_button, (event) => {
+            consume_sub_panel_event(event);
             update_video_codec_display();
             // DPlayer が計測した元パネル用の inline clip-path は上書きせず、
             // サブパネル表示中だけ専用クラスで切り替える。
-            open_codec_panel('video-codec');
+            open_sub_panel('video-codec');
         });
         const video_codec_header = this.player.container.querySelector<HTMLElement>(
             '.dplayer-konomitv-bs4k-setting-video-codec-header',
         )!;
-        register_codec_panel_activation_handler(video_codec_header, (event) => {
-            consume_codec_panel_event(event);
-            close_codec_panel();
+        register_sub_panel_activation_handler(video_codec_header, (event) => {
+            consume_sub_panel_event(event);
+            close_sub_panel();
         });
         video_codec_items.forEach((item) => {
-            register_codec_panel_activation_handler(item, async (event) => {
-                consume_codec_panel_event(event);
+            register_sub_panel_activation_handler(item, async (event) => {
+                consume_sub_panel_event(event);
                 const codec = item.dataset.codec as KonomiTVBS4KPlaybackVideoCodec;
                 if (await prepare_codec_override(codec, get_requested_audio_codec()) === false) return;
                 update_video_codec_display();
-                close_codec_panel();
+                close_sub_panel();
                 // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
                 this.player?.setting.hide();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
@@ -4485,25 +4544,25 @@ class PlayerController {
             });
         };
         update_audio_codec_display();
-        register_codec_panel_activation_handler(audio_codec_button, (event) => {
-            consume_codec_panel_event(event);
+        register_sub_panel_activation_handler(audio_codec_button, (event) => {
+            consume_sub_panel_event(event);
             update_audio_codec_display();
-            open_codec_panel('audio-codec');
+            open_sub_panel('audio-codec');
         });
         const audio_codec_header = this.player.container.querySelector<HTMLElement>(
             '.dplayer-konomitv-bs4k-setting-audio-codec-header',
         )!;
-        register_codec_panel_activation_handler(audio_codec_header, (event) => {
-            consume_codec_panel_event(event);
-            close_codec_panel();
+        register_sub_panel_activation_handler(audio_codec_header, (event) => {
+            consume_sub_panel_event(event);
+            close_sub_panel();
         });
         audio_codec_items.forEach((item) => {
-            register_codec_panel_activation_handler(item, async (event) => {
-                consume_codec_panel_event(event);
+            register_sub_panel_activation_handler(item, async (event) => {
+                consume_sub_panel_event(event);
                 const codec = item.dataset.codec as KonomiTVBS4KPlaybackAudioCodec;
                 if (await prepare_codec_override(get_requested_video_codec(), codec) === false) return;
                 update_audio_codec_display();
-                close_codec_panel();
+                close_sub_panel();
                 this.player?.setting.hide();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: `音声コーデックを ${audio_codec_labels[codec]} に変更しました。`,
@@ -4514,6 +4573,49 @@ class PlayerController {
                 });
             });
         });
+
+        // HDR 出力のサブパネルを初期化する。選択は視聴中だけの override で、SettingsStore の既定値は書き換えない。
+        // ライブは HlgSdrManager が再起動なしで即時反映し、録画・オフライン保存は色信号を MSE 初期化から
+        // 適用し直すため、再生位置・画質・音声選択を維持したままプレイヤーを再起動する。
+        setting_box.style.setProperty('--konomitv-bs4k-hdr-output-panel-height', `${hdr_output_panel_height}px`);
+        register_sub_panel_activation_handler(hdr_output_item!, (event) => {
+            consume_sub_panel_event(event);
+            update_hdr_output_display();
+            open_sub_panel('hdr-output');
+        });
+        const hdr_output_header = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-hdr-output-header',
+        )!;
+        register_sub_panel_activation_handler(hdr_output_header, (event) => {
+            consume_sub_panel_event(event);
+            close_sub_panel();
+        });
+        this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-item')
+            .forEach((item) => {
+                register_sub_panel_activation_handler(item, (event) => {
+                    consume_sub_panel_event(event);
+                    const output = item.dataset.output as 'Auto' | 'HDR' | 'SDR';
+                    const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
+                        settings_store.settings.konomitv_bs4k_hdr_output;
+                    close_sub_panel();
+                    // 現在値の再選択では何もしない
+                    if (output === current) return;
+                    player_store.konomitv_bs4k_playback_hdr_output_override = output;
+                    update_hdr_output_display();
+                    if (this.playback_mode === 'Live') {
+                        return;
+                    }
+                    // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
+                    this.player?.setting.hide();
+                    player_store.event_emitter.emit('PlayerRestartRequired', {
+                        message: `HDR 出力を ${hdr_output_labels[output]} に変更しました。`,
+                        message_delay_seconds: 2,
+                        is_error_message: false,
+                        should_resume_quality: true,
+                        is_user_initiated: true,
+                    });
+                });
+            });
 
         // 録画再生時のみ、CM 自動スキップの有効状態を端末ローカル設定へ保存する
         // CM 区間が未解析・0件でも、今後再生する録画へ向けて常に切り替えられるようにする

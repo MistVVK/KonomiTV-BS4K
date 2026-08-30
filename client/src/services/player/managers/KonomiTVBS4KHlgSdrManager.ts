@@ -189,6 +189,9 @@ type MpegtsColorPlayer = {
 
 /**
  * ライブ視聴: HLG / PQ をデコード後の画素で SDR へ変換し、必要なら SPS / AV1 の色シグナリングを書き換える。
+ * BS4K 録画再生 (オンライン / オフライン) でも同じ canvas 変換を再利用する。
+ * 録画側の fMP4 色信号書換えは KonomiTVBS4KColorRewriteLoader が fragment loader 境界で行い、
+ * 検出した transfer_characteristics は PlayerStore 経由でこのマネージャへ届く。
  */
 class KonomiTVBS4KHlgSdrManager implements PlayerManager {
 
@@ -208,6 +211,8 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
     private source_kind: KonomiTVBS4KHdrSourceKind = 'None';
     private rewrite_mode: KonomiTVBS4KHdrRewriteMode = 'None';
     private transfer_characteristics: number | null = null;
+    // 録画 fMP4 の書換え不能を利用者へ通知済みかどうか (同一失敗につき1回に抑える)
+    private unsafe_notice_shown = false;
 
     constructor(player: DPlayer) {
         this.player = player;
@@ -232,6 +237,16 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
             ),
             watch(
                 () => usePlayerStore().mh_eit_hdr_hint,
+                () => this.applyPolicy(),
+            ),
+            // 録画 HLS では fragment loader が fMP4 から検出した transfer_characteristics を書き込む
+            watch(
+                () => usePlayerStore().sps_transfer_characteristics,
+                () => this.applyPolicy(),
+            ),
+            // fMP4 を安全に書き換えられなかった場合は canvas を無効化して HDR 素通しへ切り替える
+            watch(
+                () => usePlayerStore().konomitv_bs4k_recorded_color_rewrite_unsafe,
                 () => this.applyPolicy(),
             ),
         ];
@@ -327,6 +342,9 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
             settings_store.settings.konomitv_bs4k_hdr_output,
             player_store.konomitv_bs4k_playback_hdr_output_override,
         );
+        // transfer_characteristics はライブでは mpegts.js の mediaInfo から、
+        // 録画 HLS では fragment loader が fMP4 から検出した値を、それぞれ PlayerStore 経由で受け取る
+        this.transfer_characteristics = player_store.sps_transfer_characteristics;
         this.source_kind = classifyKonomiTVBS4KHdrSource(this.transfer_characteristics);
         this.rewrite_mode = resolveKonomiTVBS4KHdrRewriteMode(
             this.transfer_characteristics,
@@ -335,7 +353,18 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         );
         const mpegts_player = this.getMpegtsPlayer();
         mpegts_player?.setVideoColorRewrite?.(this.rewrite_mode);
-        const show_canvas = shouldDrawKonomiTVBS4KHdrCanvas(this.rewrite_mode);
+        // 録画 fMP4 を安全に書き換えられなかった場合は、ブラウザの HDR 表示との二重変換を避けるため
+        // canvas を無効化して HDR 素通しで再生を継続する (通知はセッション中1回だけ)
+        let show_canvas = shouldDrawKonomiTVBS4KHdrCanvas(this.rewrite_mode);
+        if (player_store.konomitv_bs4k_recorded_color_rewrite_unsafe === true) {
+            if (show_canvas === true && this.unsafe_notice_shown === false) {
+                this.unsafe_notice_shown = true;
+                this.player.notice(
+                    'この録画の HDR 信号は安全に書き換えられないため、SDR 変換を行わず HDR のまま再生します。',
+                );
+            }
+            show_canvas = false;
+        }
         if (this.canvas !== null) {
             this.canvas.style.display = show_canvas === true ? 'block' : 'none';
         }
