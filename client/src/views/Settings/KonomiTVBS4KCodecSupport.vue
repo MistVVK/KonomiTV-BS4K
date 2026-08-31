@@ -55,6 +55,20 @@
                             <div><span>WebGL</span><strong>{{ browser_result.environment.webgl_version ?? '利用不可' }}</strong></div>
                             <div><span>GPU (参考)</span><strong>{{ browser_result.environment.webgl_renderer ?? '取得できず' }}</strong></div>
                             <div><span>WebGPU</span><strong>{{ browser_result.environment.webgpu === true ? '利用可能' : '利用不可' }}</strong></div>
+                            <div><span>HDR 表示 (Auto)</span><strong>{{ browser_result.environment.hdr_display.supported === true ? '対応' : '非対応' }}</strong></div>
+                            <div class="codec-support-environment--wide">
+                                <span>証拠</span>
+                                <strong>
+                                    (video-dynamic-range: high) {{ hdrDisplayEvidenceLabel(browser_result.environment.hdr_display.video_dynamic_range_high) }}
+                                    / (dynamic-range: high) {{ hdrDisplayEvidenceLabel(browser_result.environment.hdr_display.dynamic_range_high) }}
+                                    / pixelDepth {{ hdrDisplayEvidenceLabel(browser_result.environment.hdr_display.pixel_depth) }}
+                                    / (color-gamut: p3) {{ hdrDisplayEvidenceLabel(browser_result.environment.hdr_display.color_gamut_p3) }}
+                                </strong>
+                            </div>
+                            <div class="codec-support-environment--wide">
+                                <span>説明</span>
+                                <strong>Auto と同じ表示能力判定。コーデック decode や GPU の断定ではない。</strong>
+                            </div>
                             <div class="codec-support-environment--wide">
                                 <span>API</span>
                                 <strong>
@@ -338,6 +352,7 @@ import {
     runKonomiTVBS4KBrowserCodecSupportDiagnostics,
     type IKonomiTVBS4KBrowserCodecSupportResult,
     type KonomiTVBS4KBrowserEvidence,
+    type KonomiTVBS4KBrowserHdrDisplayQueryEvidence,
     type KonomiTVBS4KBrowserSupportStatus,
     type KonomiTVBS4KBrowserWebCodecsProbe,
 } from '@/utils/KonomiTVBS4KBrowserCodecSupport';
@@ -625,6 +640,16 @@ onBeforeUnmount(() => {
         server_copy_timer = null;
     }
 });
+
+function hdrDisplayEvidenceLabel(value: KonomiTVBS4KBrowserHdrDisplayQueryEvidence | number): string {
+    if (value === 'Unavailable') {
+        return '利用不可';
+    }
+    if (typeof value === 'number') {
+        return String(value);
+    }
+    return value === true ? 'true' : 'false';
+}
 
 function browserSupportLabel(status: KonomiTVBS4KBrowserSupportStatus): string {
     switch (status) {

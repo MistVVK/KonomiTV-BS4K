@@ -21,6 +21,7 @@ import type {
     KonomiTVBS4KPlaybackVideoCodec,
 } from '@/stores/SettingsStore';
 
+import { detectKonomiTVBS4KHdrDisplayCapability } from '@/services/player/KonomiTVBS4KHdrPolicy';
 import { PlayerUtils } from '@/utils/PlayerUtils';
 import Utils from '@/utils/Utils';
 
@@ -617,6 +618,21 @@ export interface IKonomiTVBS4KBrowserCodecSupportApiPresence {
     web_codecs_audio_encoder: boolean;
 }
 
+/** HDR 表示判定の個別クエリ証拠。matchMedia 非存在は Unavailable。 */
+export type KonomiTVBS4KBrowserHdrDisplayQueryEvidence = boolean | 'Unavailable';
+
+/**
+ * Auto と同じ HDR 表示判定の結論と、判定に使ったクエリの証拠。
+ * コーデック decode や GPU の断定ではない。端末・サーバーへは保存しない。
+ */
+export interface IKonomiTVBS4KBrowserHdrDisplay {
+    supported: boolean;
+    video_dynamic_range_high: KonomiTVBS4KBrowserHdrDisplayQueryEvidence;
+    dynamic_range_high: KonomiTVBS4KBrowserHdrDisplayQueryEvidence;
+    pixel_depth: number | 'Unavailable';
+    color_gamut_p3: KonomiTVBS4KBrowserHdrDisplayQueryEvidence;
+}
+
 /** 実行環境の概要。結果 JSON の先頭と UI の概要カードに使う。 */
 export interface IKonomiTVBS4KBrowserCodecSupportEnvironment {
     user_agent: string;
@@ -624,6 +640,7 @@ export interface IKonomiTVBS4KBrowserCodecSupportEnvironment {
     webgl_version: 'WebGL2' | 'WebGL1' | null;
     webgl_renderer: string | null;
     webgpu: boolean;
+    hdr_display: IKonomiTVBS4KBrowserHdrDisplay;
     apis: IKonomiTVBS4KBrowserCodecSupportApiPresence;
 }
 
@@ -780,6 +797,36 @@ async function mapKonomiTVBS4KBrowserProbes<Item, Result>(
     return results;
 }
 
+function probeKonomiTVBS4KBrowserMatchMedia(
+    query: string,
+): KonomiTVBS4KBrowserHdrDisplayQueryEvidence {
+    // Auto 判定と同じ matchMedia クエリの証拠。API が無い・例外なら利用不可。
+    if (typeof window.matchMedia !== 'function') {
+        return 'Unavailable';
+    }
+    try {
+        return window.matchMedia(query).matches === true;
+    } catch {
+        return 'Unavailable';
+    }
+}
+
+function probeKonomiTVBS4KBrowserPixelDepth(): number | 'Unavailable' {
+    const pixel_depth = window.screen?.pixelDepth;
+    return typeof pixel_depth === 'number' ? pixel_depth : 'Unavailable';
+}
+
+function detectKonomiTVBS4KBrowserHdrDisplay(): IKonomiTVBS4KBrowserHdrDisplay {
+    // 結論は Auto と同じ検出関数をそのまま使う。新しい判定器は作らない。
+    return {
+        supported: detectKonomiTVBS4KHdrDisplayCapability(),
+        video_dynamic_range_high: probeKonomiTVBS4KBrowserMatchMedia('(video-dynamic-range: high)'),
+        dynamic_range_high: probeKonomiTVBS4KBrowserMatchMedia('(dynamic-range: high)'),
+        pixel_depth: probeKonomiTVBS4KBrowserPixelDepth(),
+        color_gamut_p3: probeKonomiTVBS4KBrowserMatchMedia('(color-gamut: p3)'),
+    };
+}
+
 /**
  * 実行環境の概要を検出する。
  *
@@ -829,6 +876,7 @@ IKonomiTVBS4KBrowserCodecSupportEnvironment {
         webgl_version,
         webgl_renderer,
         webgpu: webgpu_navigator.gpu !== undefined,
+        hdr_display: detectKonomiTVBS4KBrowserHdrDisplay(),
         apis: {
             media_source: window.MediaSource !== undefined,
             managed_media_source: (

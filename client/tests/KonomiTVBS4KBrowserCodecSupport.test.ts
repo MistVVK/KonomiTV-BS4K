@@ -240,6 +240,14 @@ describe('runKonomiTVBS4KBrowserCodecSupportDiagnostics', () => {
             web_codecs_audio_decoder: true,
             web_codecs_audio_encoder: true,
         });
+        // Auto と同じ HDR 表示判定。結論 boolean と各クエリ証拠が environment に載る。
+        expect(typeof result.environment.hdr_display.supported).toBe('boolean');
+        expect(result.environment.hdr_display).toEqual(expect.objectContaining({
+            video_dynamic_range_high: expect.anything(),
+            dynamic_range_high: expect.anything(),
+            pixel_depth: expect.anything(),
+            color_gamut_p3: expect.anything(),
+        }));
 
         // 映像 decode: 全行 Supported + smooth + WebCodecs 対応。
         expect(result.video_decode.length).toBe(KONOMITV_BS4K_BROWSER_VIDEO_CATALOG.length);
@@ -302,6 +310,7 @@ describe('runKonomiTVBS4KBrowserCodecSupportDiagnostics', () => {
             web_codecs_audio_decoder: false,
             web_codecs_audio_encoder: false,
         });
+        expect(typeof result.environment.hdr_display.supported).toBe('boolean');
         for (const row of result.video_decode) {
             // canPlayType '' → 'No' だが MSE / MC も無い場合は Unsupported になる。
             expect(row.browser_support).toBe('Unsupported');
