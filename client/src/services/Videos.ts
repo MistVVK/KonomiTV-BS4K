@@ -192,6 +192,7 @@ export interface IRecordedVideo {
     video_resolution_height: number | null;
     video_sample_aspect_ratio: string | null;
     video_display_aspect_ratio: string | null;
+    video_hdr: string | null;
     has_video_stream_changes: boolean;
     primary_audio_codec: string | null;
     primary_audio_channel: string | null;
@@ -274,6 +275,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     video_resolution_height: 1080,
     video_sample_aspect_ratio: '4:3',
     video_display_aspect_ratio: '16:9',
+    video_hdr: null,
     has_video_stream_changes: false,
     primary_audio_codec: 'AAC-LC',
     primary_audio_channel: 'Stereo',

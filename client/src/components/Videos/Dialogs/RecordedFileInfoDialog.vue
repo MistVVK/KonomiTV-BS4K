@@ -114,6 +114,10 @@
                     <div class="video-info__item-label">スキャン方式</div>
                     <div class="video-info__item-value">{{program.recorded_video.video_scan_type}}</div>
                 </div>
+                <div class="video-info__item">
+                    <div class="video-info__item-label">HDR</div>
+                    <div class="video-info__item-value">{{program.recorded_video.video_hdr ?? '不明'}}</div>
+                </div>
                 <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
                     <Icon icon="fluent:speaker-2-20-filled" width="24px" height="20px" />
                     <span class="ml-2">音声情報（主音声）</span>

@@ -305,6 +305,22 @@ class RecordedVideo(PydanticModel):
         representative_stream = self._representative_video_stream
         return representative_stream.get('display_aspect_ratio') if representative_stream is not None else None
 
+    @computed_field
+    @property
+    def video_hdr(self) -> str | None:
+        # 代表区間 (最長) の color_transfer。索引なし / transfer なしは None (UI は「不明」)。
+        representative_stream = self._representative_video_stream
+        if representative_stream is None:
+            return None
+        color_transfer = representative_stream.get('color_transfer')
+        if color_transfer is None or color_transfer == '':
+            return None
+        if color_transfer == 'arib-std-b67':
+            return 'HLG'
+        if color_transfer == 'smpte2084':
+            return 'PQ'
+        return color_transfer
+
 
 class RecordedPlaybackIndex(PydanticModel):
     status: Literal['Pending', 'Analyzing', 'Ready', 'Failed']
