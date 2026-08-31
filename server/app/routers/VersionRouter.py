@@ -537,5 +537,7 @@ async def VersionInformationAPI():
         'konomitv_bs4k_live_transport': general.konomitv_bs4k_live_transport,
         # 保存直後の設定値ではなく、このプロセスで実際に有効な実況機能の状態を返す
         'jikkyo_enabled': general.jikkyo_enabled,
+        # 視聴経路向けの非機密 runtime 情報。DPlayer HDR 出力のデバッグ項目表示に使う
+        'debug': general.debug,
     }
     return result

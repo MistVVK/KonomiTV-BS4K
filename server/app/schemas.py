@@ -1420,3 +1420,6 @@ class VersionInformation(BaseModel):
     bs4k_ignore_viewer_low_latency: bool
     konomitv_bs4k_live_transport: Literal['MpegTs', 'Tlv']
     jikkyo_enabled: bool
+    # 視聴経路向けの非機密 runtime 情報。DPlayer HDR 出力のデバッグ項目表示に使う。
+    # フルの /api/settings/server はホストパスを含むため、視聴経路ではこちらを使う。
+    debug: bool
