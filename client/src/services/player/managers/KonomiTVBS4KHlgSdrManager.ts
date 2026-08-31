@@ -184,14 +184,21 @@ void main() {
 `;
 
 
+type MpegtsColorRewriteMode = 'None' | 'ToneMap' | 'SdrInHlg';
+
 type MpegtsColorPlayer = {
     mediaInfo?: {
         transferCharacteristics?: number | null;
     };
-    setVideoColorRewrite?: (mode: KonomiTVBS4KHdrRewriteMode) => void;
+    setVideoColorRewrite?: (mode: MpegtsColorRewriteMode) => void;
     on?: (event: string, listener: (...args: unknown[]) => void) => void;
     off?: (event: string, listener: (...args: unknown[]) => void) => void;
 };
+
+function resolveMpegtsColorRewriteMode(mode: KonomiTVBS4KHdrRewriteMode): MpegtsColorRewriteMode {
+    // mpegts.js は ToneMap / None / SdrInHlg だけを理解する。Debug は SDR 変換と同じ ToneMap。
+    return mode === 'Debug' ? 'ToneMap' : mode === 'ToneMap' || mode === 'SdrInHlg' ? mode : 'None';
+}
 
 
 /**
@@ -219,6 +226,8 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
     private media_info_handler: ((...args: unknown[]) => void) | null = null;
     private source_kind: KonomiTVBS4KHdrSourceKind = 'None';
     private rewrite_mode: KonomiTVBS4KHdrRewriteMode = 'None';
+    // 直近で mpegts.js へ渡した色信号書換え。同じ値の再適用はライブ切断の原因になるため省略する。
+    private mpegts_rewrite_mode: MpegtsColorRewriteMode | null = null;
     private transfer_characteristics: number | null = null;
     // 録画 fMP4 の書換え不能を利用者へ通知済みかどうか (同一失敗につき1回に抑える)
     private unsafe_notice_shown = false;
@@ -274,10 +283,29 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         this.disposeGl();
         this.canvas?.remove();
         this.canvas = null;
+        // 画質切替では同じインスタンスを destroy → init するため、旧 mpegts への適用済みモードを捨てる。
+        this.mpegts_rewrite_mode = null;
     }
 
     private getMpegtsPlayer(): MpegtsColorPlayer | null {
         return (this.player.plugins.mpegts as MpegtsColorPlayer | undefined) ?? null;
+    }
+
+    private applyMpegtsColorRewrite(mode: KonomiTVBS4KHdrRewriteMode): void {
+        const mpegts_mode = resolveMpegtsColorRewriteMode(mode);
+        // 同じモードを再送すると、ワーカー経由の再適用がライブ MSE を落とすことがある。
+        // HDR 素通し / SDR 変換 / Debug の切替で値が変わるときだけ適用する。
+        if (this.mpegts_rewrite_mode === mpegts_mode) {
+            return;
+        }
+        // mpegts の初期値は None。未検出時の None を再送して起動直後のライブを落とさない。
+        if (this.mpegts_rewrite_mode === null && mpegts_mode === 'None') {
+            this.mpegts_rewrite_mode = 'None';
+            return;
+        }
+        const mpegts_player = this.getMpegtsPlayer();
+        mpegts_player?.setVideoColorRewrite?.(mpegts_mode);
+        this.mpegts_rewrite_mode = mpegts_mode;
     }
 
     private installCanvas(): void {
@@ -360,12 +388,7 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
             player_store.b60_video_transfer,
             desired_output,
         );
-        const mpegts_player = this.getMpegtsPlayer();
-        // mpegts.js の色信号書換えは ToneMap / None / SdrInHlg だけを理解する。
-        // Debug は SDR 変換と同じ ToneMap でブラウザ側 HDR 処理を止める。
-        mpegts_player?.setVideoColorRewrite?.(
-            this.rewrite_mode === 'Debug' ? 'ToneMap' : this.rewrite_mode,
-        );
+        this.applyMpegtsColorRewrite(this.rewrite_mode);
         // 録画 fMP4 を安全に書き換えられなかった場合は、ブラウザの HDR 表示との二重変換を避けるため
         // canvas を無効化して HDR 素通しで再生を継続する (通知はセッション中1回だけ)
         let show_canvas = shouldDrawKonomiTVBS4KHdrCanvas(this.rewrite_mode);
