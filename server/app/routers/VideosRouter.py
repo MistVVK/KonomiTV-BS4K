@@ -904,13 +904,19 @@ async def VideoDownloadAPI(
     指定された録画番組の MPEG-TS ファイルをダウンロードする。
     """
 
-    # ファイルパスとファイル名を取得
-    file_path = recorded_program.recorded_video.file_path
-    filename = pathlib.Path(file_path).name
+    file_path = anyio.Path(recorded_program.recorded_video.file_path)
+    filename = file_path.name
 
-    # MPEG-TS ファイルをダウンロードさせる
+    # 録画ファイルが消えていると FileResponse が 500 になるため、通常ファイルの存在を先に確認する
+    if await file_path.is_file() is False:
+        logging.error(f'[VideosRouter][VideoDownloadAPI] Recorded file was not found. path: {file_path}')
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='Specified video_id was not found',
+        )
+
     return FileResponse(
-        path = file_path,
+        path = str(file_path),
         filename = filename,
         media_type = 'video/mp2t',
     )
