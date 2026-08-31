@@ -161,8 +161,8 @@ vec3 mapToneMappedRgb(vec3 input_rgb, int source) {
 
 void main() {
     vec4 source = texture(u_image, v_uv);
-    // Debug 時だけ同一 canvas の右半面をシェーダ未通し (デコード画素そのまま) にする。
-    // 左半面 (v_uv.x < 0.5) は既存の SDR 変換。真の HDR 素通しではない。
+    // Debug は同一 canvas の右半面をシェーダ未通しにする（キャプチャの backing が左右比較を持つ）。
+    // ライブ Debug の画面上は clip で右半面の canvas を隠し、下の <video> 素通しを見せる。
     if (u_split == 1 && v_uv.x >= 0.5) {
         out_color = vec4(source.rgb, 1.0);
         return;
@@ -197,8 +197,9 @@ type MpegtsColorPlayer = {
 };
 
 function resolveMpegtsColorRewriteMode(mode: KonomiTVBS4KHdrRewriteMode): MpegtsColorRewriteMode {
-    // mpegts.js は ToneMap / None / SdrInHlg だけを理解する。Debug は SDR 変換と同じ ToneMap。
-    return mode === 'Debug' ? 'ToneMap' : mode === 'ToneMap' || mode === 'SdrInHlg' ? mode : 'None';
+    // mpegts.js は ToneMap / None / SdrInHlg だけを理解する。
+    // ライブ Debug は右半面を <video> 素通しにするため None。SDR 変換だけ ToneMap。
+    return mode === 'ToneMap' || mode === 'SdrInHlg' ? mode : 'None';
 }
 
 
@@ -330,6 +331,7 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         this.canvas.style.height = '100%';
         this.canvas.style.zIndex = '0';
         this.canvas.style.pointerEvents = 'none';
+        this.canvas.style.clipPath = 'none';
         this.canvas.style.display = 'none';
         this.resize_observer = new ResizeObserver(() => this.syncCanvasSize());
         this.resize_observer.observe(wrap);
@@ -410,6 +412,9 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         }
         if (this.canvas !== null) {
             this.canvas.style.display = show_canvas === true ? 'block' : 'none';
+            // ライブ Debug は左半分だけ canvas。右半分は下の <video>（mpegts None）を素通しする。
+            const clip_left_half = this.rewrite_mode === 'Debug' && this.player.options.live === true;
+            this.canvas.style.clipPath = clip_left_half === true ? 'inset(0 50% 0 0)' : 'none';
         }
         if (show_canvas === true) {
             this.ensureGl();
@@ -534,7 +539,7 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
         gl.useProgram(this.program);
         gl.uniform1i(this.source_location, this.source_kind === 'Pq' ? 1 : 0);
-        // Debug のときだけ右半面をシェーダ未通しにする。通常の SDR 変換では全面を tone map する。
+        // Debug は backing canvas を左右比較にする。ライブ画面は clip で右半面を隠すだけ。
         gl.uniform1i(this.split_location, this.rewrite_mode === 'Debug' ? 1 : 0);
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, this.texture);

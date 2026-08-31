@@ -70,7 +70,7 @@ export function resolveKonomiTVBS4KHdrRewriteMode(
     if (source === 'Hlg' && b60_video_transfer === B60_UHD_SDR) {
         return 'SdrInHlg';
     }
-    // Debug の色信号書換えは SDR 変換と同じ ToneMap。canvas 側だけ左右比較する。
+    // Debug は canvas 判定用。ライブ mpegts の実モードは None（素通し）へ落とす。
     if (desired_output === 'Debug') {
         return 'Debug';
     }
@@ -83,8 +83,8 @@ export function resolveKonomiTVBS4KHdrRewriteMode(
 export function resolveKonomiTVBS4KLiveMpegtsColorRewrite(
     desired: KonomiTVBS4KHdrDesiredOutput,
 ): 'None' | 'ToneMap' {
-    // ライブ mpegts は ToneMap / None / SdrInHlg だけ。Debug は SDR 変換と同じ ToneMap。
-    return desired === 'SDR' || desired === 'Debug' ? 'ToneMap' : 'None';
+    // ライブ mpegts は ToneMap / None。Debug は右半面を <video> 素通しにするため None。
+    return desired === 'SDR' ? 'ToneMap' : 'None';
 }
 
 export function shouldDrawKonomiTVBS4KHdrCanvas(mode: KonomiTVBS4KHdrRewriteMode): boolean {
