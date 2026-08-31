@@ -14,7 +14,7 @@ import CustomBufferController from '@/services/player/CustomBufferController';
 import KonomiTVBS4KColorRewriteLoader, {
     createKonomiTVBS4KColorRewriteSession,
 } from '@/services/player/KonomiTVBS4KColorRewriteLoader';
-import { resolveKonomiTVBS4KHdrOutput } from '@/services/player/KonomiTVBS4KHdrPolicy';
+import { classifyKonomiTVBS4KHdrSource, resolveKonomiTVBS4KHdrOutput } from '@/services/player/KonomiTVBS4KHdrPolicy';
 import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
 import KonomiTVBS4KStreamingReconnectGuard from '@/services/player/KonomiTVBS4KStreamingReconnectGuard';
 import CaptureManager from '@/services/player/managers/CaptureManager';
@@ -4226,11 +4226,14 @@ class PlayerController {
         const update_hdr_output_display = (): void => {
             if (hdr_output_item === null || hdr_output_value === null) return;
             // BS4K ライブ・BS4K 録画・BS4K オフライン保存の再生でのみ表示する (非 BS4K では表示しない)。
-            // BS4K ライブでは SDR 番組でも項目を出し、次の HDR 番組に効く選択をその場で変えられるようにする。
+            // SDR ソース (classify === None) では項目を隠す。HLG / PQ では素通し中も含めて出す。
             const is_bs4k_playback = this.playback_mode === 'Live' ?
                 channels_store.channel.current.display_channel_id.startsWith('bs4k') :
                 player_store.recorded_program.network_id === 0x000B;
-            hdr_output_item.style.display = is_bs4k_playback === true ? '' : 'none';
+            const is_hdr_source =
+                classifyKonomiTVBS4KHdrSource(player_store.sps_transfer_characteristics) !== 'None';
+            hdr_output_item.style.display =
+                is_bs4k_playback === true && is_hdr_source === true ? '' : 'none';
             const debug_enabled = version_store.is_server_debug_enabled;
             const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
                 settings_store.settings.konomitv_bs4k_hdr_output;
@@ -4261,6 +4264,7 @@ class PlayerController {
                     () => player_store.konomitv_bs4k_playback_hdr_output_override,
                     () => settings_store.settings.konomitv_bs4k_hdr_output,
                     () => version_store.is_server_debug_enabled,
+                    () => player_store.sps_transfer_characteristics,
                 ],
                 () => {
                     // 視聴中にサーバー debug がオフになったら Debug 項目を隠し、override を破棄する。
