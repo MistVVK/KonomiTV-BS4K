@@ -14,7 +14,11 @@ import CustomBufferController from '@/services/player/CustomBufferController';
 import KonomiTVBS4KColorRewriteLoader, {
     createKonomiTVBS4KColorRewriteSession,
 } from '@/services/player/KonomiTVBS4KColorRewriteLoader';
-import { classifyKonomiTVBS4KHdrSource, resolveKonomiTVBS4KHdrOutput } from '@/services/player/KonomiTVBS4KHdrPolicy';
+import {
+    classifyKonomiTVBS4KHdrSource,
+    resolveKonomiTVBS4KHdrOutput,
+    resolveKonomiTVBS4KLiveMpegtsColorRewrite,
+} from '@/services/player/KonomiTVBS4KHdrPolicy';
 import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
 import KonomiTVBS4KStreamingReconnectGuard from '@/services/player/KonomiTVBS4KStreamingReconnectGuard';
 import CaptureManager from '@/services/player/managers/CaptureManager';
@@ -741,14 +745,20 @@ class PlayerController {
         // 選択の変更はプレイヤー再起動で反映するため、セッションの mode は初期化時に固定する。
         // 書換え不能の unsafe ラッチは新しい再生セッション (再起動・画質変更) ごとに解除し、
         // 安全になった新セッションで canvas が復帰できるようにする
+        const playback_hdr_desired = resolveKonomiTVBS4KHdrOutput(
+            settings_store.settings.konomitv_bs4k_hdr_output,
+            player_store.konomitv_bs4k_playback_hdr_output_override,
+        );
         if (this.playback_mode === 'Video') {
             player_store.konomitv_bs4k_recorded_color_rewrite_unsafe = false;
         }
         const color_rewrite_session = this.playback_mode === 'Video' ?
-            createKonomiTVBS4KColorRewriteSession(resolveKonomiTVBS4KHdrOutput(
-                settings_store.settings.konomitv_bs4k_hdr_output,
-                player_store.konomitv_bs4k_playback_hdr_output_override,
-            )) : null;
+            createKonomiTVBS4KColorRewriteSession(playback_hdr_desired) : null;
+        // ライブ mpegts の色信号書換えは初回 InitSegment より前に、視聴開始時の HDR 出力へ合わせる。
+        // 切替後は HlgSdrManager が setVideoColorRewrite する。colour/transfer だけの差では
+        // mpegts.js が新しい InitSegment を出さない。
+        const live_mpegts_video_color_rewrite = this.playback_mode === 'Live' ?
+            resolveKonomiTVBS4KLiveMpegtsColorRewrite(playback_hdr_desired) : 'None';
 
         // DPlayer を初期化
         this.player = new DPlayer({
@@ -1199,8 +1209,9 @@ class PlayerController {
                         // duration 不明のライブ fMP4 とハードウェアデコーダーの組み合わせでは、十分な MSE バッファがあっても
                         // フレームドロップが発生する環境があるため、有限 duration の init segment を使う
                         forceMSEStreamLivenessRecorded: true,
-                        // HLG/PQ のブラウザ HDR パス制御。実モードは HlgSdrManager が実行中に切り替える。
-                        videoColorRewrite: 'None',
+                        // HLG/PQ のブラウザ HDR パス制御。初回 InitSegment より前に開始時モードへ合わせ、
+                        // 以降の切替は HlgSdrManager が setVideoColorRewrite する。
+                        videoColorRewrite: live_mpegts_video_color_rewrite,
                         // 再生開始まで 2048KB のバッファを貯める (?)
                         // あまり大きくしすぎてもどうも効果がないようだが、小さくしたり無効化すると特に Safari で不安定になる
                         enableStashBuffer: true,

@@ -7,6 +7,7 @@ import {
     classifyKonomiTVBS4KHdrSource,
     resolveKonomiTVBS4KHdrOutput,
     resolveKonomiTVBS4KHdrRewriteMode,
+    resolveKonomiTVBS4KLiveMpegtsColorRewrite,
     shouldDrawKonomiTVBS4KHdrCanvas,
     type KonomiTVBS4KHdrRewriteMode,
     type KonomiTVBS4KHdrSourceKind,
@@ -227,6 +228,7 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
     private source_kind: KonomiTVBS4KHdrSourceKind = 'None';
     private rewrite_mode: KonomiTVBS4KHdrRewriteMode = 'None';
     // 直近で mpegts.js へ渡した色信号書換え。同じ値の再適用はライブ切断の原因になるため省略する。
+    // 初期値は PlayerController の mpegts config と同じ希望出力から決め、初回の同値再送を避ける。
     private mpegts_rewrite_mode: MpegtsColorRewriteMode | null = null;
     private transfer_characteristics: number | null = null;
     // 録画 fMP4 の書換え不能を利用者へ通知済みかどうか (同一失敗につき1回に抑える)
@@ -268,6 +270,12 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
                 () => this.applyPolicy(),
             ),
         ];
+        this.mpegts_rewrite_mode = resolveKonomiTVBS4KLiveMpegtsColorRewrite(
+            resolveKonomiTVBS4KHdrOutput(
+                useSettingsStore().settings.konomitv_bs4k_hdr_output,
+                usePlayerStore().konomitv_bs4k_playback_hdr_output_override,
+            ),
+        );
         this.applyPolicy();
         this.startFrameLoop();
     }
@@ -293,16 +301,15 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
 
     private applyMpegtsColorRewrite(mode: KonomiTVBS4KHdrRewriteMode): void {
         const mpegts_mode = resolveMpegtsColorRewriteMode(mode);
-        // 同じモードを再送すると、ワーカー経由の再適用がライブ MSE を落とすことがある。
-        // HDR 素通し / SDR 変換 / Debug の切替で値が変わるときだけ適用する。
         if (this.mpegts_rewrite_mode === mpegts_mode) {
             return;
         }
-        // mpegts の初期値は None。未検出時の None を再送して起動直後のライブを落とさない。
-        if (this.mpegts_rewrite_mode === null && mpegts_mode === 'None') {
-            this.mpegts_rewrite_mode = 'None';
+        // ソース未検出の None は初期 config を維持する。未検出 None を送ると SDR 開始時の ToneMap を潰す。
+        if (mode === 'None' && this.source_kind === 'None') {
             return;
         }
+        // 同じモードの再送はライブ切断の原因になる。値が変わる切替だけ setVideoColorRewrite する。
+        // colour/transfer だけの差では mpegts.js は新しい InitSegment を出さない。
         const mpegts_player = this.getMpegtsPlayer();
         mpegts_player?.setVideoColorRewrite?.(mpegts_mode);
         this.mpegts_rewrite_mode = mpegts_mode;

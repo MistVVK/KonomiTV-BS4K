@@ -80,6 +80,13 @@ export function resolveKonomiTVBS4KHdrRewriteMode(
     return 'None';
 }
 
+export function resolveKonomiTVBS4KLiveMpegtsColorRewrite(
+    desired: KonomiTVBS4KHdrDesiredOutput,
+): 'None' | 'ToneMap' {
+    // ライブ mpegts は ToneMap / None / SdrInHlg だけ。Debug は SDR 変換と同じ ToneMap。
+    return desired === 'SDR' || desired === 'Debug' ? 'ToneMap' : 'None';
+}
+
 export function shouldDrawKonomiTVBS4KHdrCanvas(mode: KonomiTVBS4KHdrRewriteMode): boolean {
     return mode === 'ToneMap' || mode === 'Debug';
 }
