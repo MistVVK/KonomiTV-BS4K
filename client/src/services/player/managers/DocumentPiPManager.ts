@@ -149,9 +149,12 @@ class DocumentPiPManager implements PlayerManager {
             let stop_control_display_watcher: (() => void) | null = null;
             let keyboard_shortcut_manager: KeyboardShortcutManager | null = null;
             let playing_in_pip_container: HTMLDivElement | null = null;
+            const pip_lifecycle_generation = this.lifecycle_generation;
             const cleanup_pip_window = (): void => {
                 if (pip_cleanup_started === true) return;
                 pip_cleanup_started = true;
+                const video = this.player.video;
+                const should_resume_playback = video.paused === false;
                 player_store.is_document_pip = false;
                 stop_control_display_watcher?.();
                 stop_theme_watcher?.();
@@ -160,6 +163,23 @@ class DocumentPiPManager implements PlayerManager {
                 // setupのどの段階で閉じても、所有DOMを必ずメインウインドウへ戻す。
                 this.watch_content_element.append(this.watch_header_element);
                 this.watch_content_element.append(this.watch_player_element);
+                // Chrome では再生中の video 要素を PiP から戻した際に
+                // requestVideoFrameCallback() の通知だけが止まることがある。
+                // 再生状態を一度確定させてから再開し、破棄後の世代では再開しない。
+                if (should_resume_playback === true) {
+                    void (async () => {
+                        video.pause();
+                        await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
+                        if (this.lifecycle_generation !== pip_lifecycle_generation) {
+                            return;
+                        }
+                        try {
+                            await video.play();
+                        } catch (error) {
+                            console.warn('[DocumentPiPManager] Failed to resume playback after leaving Picture-in-Picture.', error);
+                        }
+                    })();
+                }
                 console.log('[DocumentPiPManager] Picture-in-Picture window exited.');
             };
             // TypeScript の同期制御フローによる false 固定を避け、pagehide から更新される状態を毎回読み直す。
