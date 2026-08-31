@@ -168,10 +168,11 @@ class KonomiTVBS4KColorRewriteLoader implements Loader<FragmentLoaderContext> {
 
 /** セッション状態を初期化する。HDR 出力の選択肢 (override 優先) から書換えモードを決める */
 export function createKonomiTVBS4KColorRewriteSession(
-    desired_output: 'HDR' | 'SDR',
+    desired_output: 'HDR' | 'SDR' | 'Debug',
 ): KonomiTVBS4KColorRewriteSession {
     return {
-        mode: desired_output === 'SDR' ? 'ToneMap' : 'None',
+        // Debug の色信号書換えは SDR 変換と同じ ToneMap。ブラウザ側 HDR 処理を止めて canvas で左右比較する。
+        mode: desired_output === 'HDR' ? 'None' : 'ToneMap',
         video_state: null,
         unsafe: false,
         unsafe_notified: false,

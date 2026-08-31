@@ -224,7 +224,8 @@ const usePlayerStore = defineStore('player', {
         mh_eit_hdr_hint: null as boolean | null,
 
         // 視聴画面の設定パネルで選んだ一時 HDR 出力。SettingsStore へは書かず、視聴終了で破棄する。
-        konomitv_bs4k_playback_hdr_output_override: null as 'Auto' | 'HDR' | 'SDR' | null,
+        // Debug はサーバー debug オン時だけ選べる視聴中 override で、設定へ同期しない。
+        konomitv_bs4k_playback_hdr_output_override: null as 'Auto' | 'HDR' | 'SDR' | 'Debug' | null,
 
         // mpegts.js が検出した元の transfer_characteristics。HLG=18 / PQ=16。
         // 録画 HLS では KonomiTVBS4KColorRewriteLoader が fMP4 から検出した値を書き込む

@@ -4206,10 +4206,22 @@ class PlayerController {
         const hdr_output_value = this.player.container.querySelector<HTMLElement>(
             '.dplayer-konomitv-bs4k-setting-hdr-output-value',
         );
-        const hdr_output_labels: Record<'Auto' | 'HDR' | 'SDR', string> = {
+        const hdr_output_labels: Record<'Auto' | 'HDR' | 'SDR' | 'Debug', string> = {
             Auto: 'Auto',
             HDR: 'HDR 素通し',
             SDR: 'SDR 変換',
+            Debug: 'デバッグモード',
+        };
+        const selectable_hdr_outputs: ('Auto' | 'HDR' | 'SDR' | 'Debug')[] = ['Auto', 'HDR', 'SDR', 'Debug'];
+        const HDR_OUTPUT_PANEL_BASE_HEIGHT = 54;
+        const HDR_OUTPUT_ITEM_HEIGHT = 30;
+        const update_hdr_output_panel_height = (): void => {
+            const visible_count = version_store.is_server_debug_enabled === true ?
+                selectable_hdr_outputs.length : selectable_hdr_outputs.length - 1;
+            setting_box.style.setProperty(
+                '--konomitv-bs4k-hdr-output-panel-height',
+                `${HDR_OUTPUT_PANEL_BASE_HEIGHT + visible_count * HDR_OUTPUT_ITEM_HEIGHT}px`,
+            );
         };
         const update_hdr_output_display = (): void => {
             if (hdr_output_item === null || hdr_output_value === null) return;
@@ -4219,17 +4231,22 @@ class PlayerController {
                 channels_store.channel.current.display_channel_id.startsWith('bs4k') :
                 player_store.recorded_program.network_id === 0x000B;
             hdr_output_item.style.display = is_bs4k_playback === true ? '' : 'none';
+            const debug_enabled = version_store.is_server_debug_enabled;
             const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
                 settings_store.settings.konomitv_bs4k_hdr_output;
             hdr_output_value.textContent = hdr_output_labels[current];
-            // サブパネルの現在値へチェックを表示する
+            // サブパネルの現在値へチェックを表示する。デバッグモードはサーバー debug オン時だけ出す。
             this.player?.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-item')
                 .forEach((item) => {
+                    if (item.dataset.output === 'Debug') {
+                        item.style.display = debug_enabled === true ? 'flex' : 'none';
+                    }
                     const check = item.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-check');
                     if (check !== null) {
                         check.style.visibility = item.dataset.output === current ? 'visible' : 'hidden';
                     }
                 });
+            update_hdr_output_panel_height();
         };
         this.rain_fallback_watchers = [
             watch(
@@ -4243,8 +4260,31 @@ class PlayerController {
                 [
                     () => player_store.konomitv_bs4k_playback_hdr_output_override,
                     () => settings_store.settings.konomitv_bs4k_hdr_output,
+                    () => version_store.is_server_debug_enabled,
                 ],
-                update_hdr_output_display,
+                () => {
+                    // 視聴中にサーバー debug がオフになったら Debug 項目を隠し、override を破棄する。
+                    // ライブは HlgSdrManager が即時反映し、録画は色信号書換えセッションを作り直すため再起動する。
+                    if (
+                        version_store.is_server_debug_enabled === false &&
+                        player_store.konomitv_bs4k_playback_hdr_output_override === 'Debug'
+                    ) {
+                        player_store.konomitv_bs4k_playback_hdr_output_override = null;
+                        update_hdr_output_display();
+                        if (this.playback_mode === 'Video') {
+                            this.player?.setting.hide();
+                            player_store.event_emitter.emit('PlayerRestartRequired', {
+                                message: 'HDR 出力をデバッグモードから戻しました。',
+                                message_delay_seconds: 2,
+                                is_error_message: false,
+                                should_resume_quality: true,
+                                is_user_initiated: true,
+                            });
+                        }
+                        return;
+                    }
+                    update_hdr_output_display();
+                },
                 {immediate: true},
             ),
         ];
@@ -4263,9 +4303,9 @@ class PlayerController {
                 ${audio_codec_item_html}
             </div>
         `;
-        // HDR 出力のサブパネル。選択肢は設定画面と同じ Auto / HDR 素通し / SDR 変換の3択で、
-        // 選択は視聴中だけの override として扱う (SettingsStore の既定値は書き換えない)
-        const selectable_hdr_outputs: ('Auto' | 'HDR' | 'SDR')[] = ['Auto', 'HDR', 'SDR'];
+        // HDR 出力のサブパネル。選択肢は設定画面と同じ Auto / HDR 素通し / SDR 変換に加え、
+        // サーバー debug オン時だけデバッグモードを出す。選択は視聴中だけの override として扱う
+        // (SettingsStore の既定値は書き換えない。Debug も同期しない)
         const hdr_output_item_html = selectable_hdr_outputs.map((output) => `
             <div class="dplayer-konomitv-bs4k-setting-hdr-output-item" data-output="${output}"
                 role="button" tabindex="0"
@@ -4274,7 +4314,6 @@ class PlayerController {
                 <span class="dplayer-label">${hdr_output_labels[output]}</span>
             </div>
         `).join('');
-        const hdr_output_panel_height = 54 + selectable_hdr_outputs.length * 30;
         const hdr_output_panel_html = `
             <div class="dplayer-konomitv-bs4k-setting-hdr-output-panel"
                 style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
@@ -4582,7 +4621,8 @@ class PlayerController {
         // HDR 出力のサブパネルを初期化する。選択は視聴中だけの override で、SettingsStore の既定値は書き換えない。
         // ライブは HlgSdrManager が再起動なしで即時反映し、録画・オフライン保存は色信号を MSE 初期化から
         // 適用し直すため、再生位置・画質・音声選択を維持したままプレイヤーを再起動する。
-        setting_box.style.setProperty('--konomitv-bs4k-hdr-output-panel-height', `${hdr_output_panel_height}px`);
+        update_hdr_output_panel_height();
+        update_hdr_output_display();
         register_sub_panel_activation_handler(hdr_output_item!, (event) => {
             consume_sub_panel_event(event);
             update_hdr_output_display();
@@ -4599,7 +4639,11 @@ class PlayerController {
             .forEach((item) => {
                 register_sub_panel_activation_handler(item, (event) => {
                     consume_sub_panel_event(event);
-                    const output = item.dataset.output as 'Auto' | 'HDR' | 'SDR';
+                    const output = item.dataset.output as 'Auto' | 'HDR' | 'SDR' | 'Debug';
+                    // サーバー debug がオフの間はデバッグモードを選べない
+                    if (output === 'Debug' && version_store.is_server_debug_enabled === false) {
+                        return;
+                    }
                     const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
                         settings_store.settings.konomitv_bs4k_hdr_output;
                     close_sub_panel();

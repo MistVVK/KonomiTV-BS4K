@@ -22,6 +22,7 @@ const HLG_SDR_FRAGMENT_SOURCE = `#version 300 es
 precision highp float;
 uniform sampler2D u_image;
 uniform int u_source;
+uniform int u_split;
 in vec2 v_uv;
 out vec4 out_color;
 
@@ -159,6 +160,12 @@ vec3 mapToneMappedRgb(vec3 input_rgb, int source) {
 
 void main() {
     vec4 source = texture(u_image, v_uv);
+    // Debug 時だけ同一 canvas の右半面をシェーダ未通し (デコード画素そのまま) にする。
+    // 左半面 (v_uv.x < 0.5) は既存の SDR 変換。真の HDR 素通しではない。
+    if (u_split == 1 && v_uv.x >= 0.5) {
+        out_color = vec4(source.rgb, 1.0);
+        return;
+    }
     out_color = vec4(mapToneMappedRgb(source.rgb, u_source), 1.0);
 }
 `;
@@ -204,6 +211,8 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
     private texture: WebGLTexture | null = null;
     private program: WebGLProgram | null = null;
     private source_location: WebGLUniformLocation | null = null;
+    // Debug 左右比較用。1 のとき右半面をシェーダ未通しにする u_split の location。
+    private split_location: WebGLUniformLocation | null = null;
     private frame_handle: number | null = null;
     private resize_observer: ResizeObserver | null = null;
     private watch_stops: WatchStopHandle[] = [];
@@ -352,7 +361,11 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
             desired_output,
         );
         const mpegts_player = this.getMpegtsPlayer();
-        mpegts_player?.setVideoColorRewrite?.(this.rewrite_mode);
+        // mpegts.js の色信号書換えは ToneMap / None / SdrInHlg だけを理解する。
+        // Debug は SDR 変換と同じ ToneMap でブラウザ側 HDR 処理を止める。
+        mpegts_player?.setVideoColorRewrite?.(
+            this.rewrite_mode === 'Debug' ? 'ToneMap' : this.rewrite_mode,
+        );
         // 録画 fMP4 を安全に書き換えられなかった場合は、ブラウザの HDR 表示との二重変換を避けるため
         // canvas を無効化して HDR 素通しで再生を継続する (通知はセッション中1回だけ)
         let show_canvas = shouldDrawKonomiTVBS4KHdrCanvas(this.rewrite_mode);
@@ -407,6 +420,7 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         }
         this.program = program;
         this.source_location = gl.getUniformLocation(program, 'u_source');
+        this.split_location = gl.getUniformLocation(program, 'u_split');
         this.texture = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, this.texture);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
@@ -490,6 +504,8 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         gl.viewport(0, 0, this.canvas.width, this.canvas.height);
         gl.useProgram(this.program);
         gl.uniform1i(this.source_location, this.source_kind === 'Pq' ? 1 : 0);
+        // Debug のときだけ右半面をシェーダ未通しにする。通常の SDR 変換では全面を tone map する。
+        gl.uniform1i(this.split_location, this.rewrite_mode === 'Debug' ? 1 : 0);
         gl.activeTexture(gl.TEXTURE0);
         gl.bindTexture(gl.TEXTURE_2D, this.texture);
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
@@ -510,6 +526,7 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         this.texture = null;
         this.program = null;
         this.source_location = null;
+        this.split_location = null;
     }
 }
 
