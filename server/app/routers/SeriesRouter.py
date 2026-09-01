@@ -5,6 +5,12 @@ from fastapi import APIRouter, HTTPException, Path, Query, status
 from tortoise.expressions import Q
 
 from app import logging, schemas
+from app.metadata.SeriesCatalog import (
+    CATALOG_PAGE_SIZE,
+    GetSeriesListPosition,
+    ListOnAirDays,
+    ListSeriesSummaries,
+)
 from app.models.Series import Series
 
 
@@ -39,6 +45,7 @@ async def SeriesListAPI(
     ).distinct()
     series_list = await visible_series_query \
         .prefetch_related(
+            'episodes',
             'broadcast_periods__channel',
             'broadcast_periods__recorded_programs__recorded_video',
             'broadcast_periods__recorded_programs__channel',
@@ -89,6 +96,7 @@ async def SeriesSearchAPI(
     ).distinct()
     series_list = await visible_series_query \
         .prefetch_related(
+            'episodes',
             'broadcast_periods__channel',
             'broadcast_periods__recorded_programs__recorded_video',
             'broadcast_periods__recorded_programs__channel',
@@ -109,6 +117,79 @@ async def SeriesSearchAPI(
 
 
 @router.get(
+    '/summary',
+    summary = 'シリーズカタログ要約 API',
+    response_description = 'カタログカード用のシリーズ要約リスト。',
+    response_model = schemas.SeriesSummaryList,
+)
+async def SeriesSummaryListAPI(
+    order: Annotated[Literal['desc', 'asc'], Query(description='ソート順序 (desc or asc) 。')] = 'desc',
+    page: Annotated[int, Query(description='ページ番号。')] = 1,
+    query: Annotated[str, Query(description='title または description の部分一致。')] = '',
+):
+    """
+    再生可能録画を持つシリーズを、カード一覧向けの要約だけ 50 件ずつ返す。
+    """
+
+    if page < 1:
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'page must be 1 or greater',
+        )
+    total, series_list = await ListSeriesSummaries(order=order, page=page, query=query)
+    return schemas.SeriesSummaryList(
+        total=total,
+        page_size=CATALOG_PAGE_SIZE,
+        series_list=[schemas.SeriesSummary.model_validate(summary) for summary in series_list],
+    )
+
+
+@router.get(
+    '/on-air',
+    summary = 'シリーズ放送中グリッド API',
+    response_description = '今クール相当の週間レギュラー。',
+    response_model = schemas.SeriesOnAirResponse,
+)
+async def SeriesOnAirAPI():
+    """
+    ローカル録画から推定した今クール相当の週間レギュラーを、月曜始まりで返す。<br>
+    EPG のいま放送中一覧ではない。曜日と時刻は自然時刻のまま。
+    """
+
+    days = await ListOnAirDays()
+    return schemas.SeriesOnAirResponse(
+        days=[schemas.SeriesOnAirDay.model_validate(day) for day in days],
+    )
+
+
+@router.get(
+    '/list-position',
+    summary = 'シリーズカタログ位置 API',
+    response_description = '指定シリーズが載るカタログページ番号。',
+    response_model = schemas.SeriesListPosition,
+)
+async def SeriesListPositionAPI(
+    series_id: Annotated[int, Query(description='展開したいシリーズ ID。')],
+    order: Annotated[Literal['desc', 'asc'], Query(description='ソート順序 (desc or asc) 。')] = 'desc',
+    query: Annotated[str, Query(description='title または description の部分一致。')] = '',
+):
+    """
+    `/series/:id` の深いリンクから、同じ検索・並びのカタログ何ページ目かを返す。
+    """
+
+    page = await GetSeriesListPosition(series_id=series_id, order=order, query=query)
+    if page is None:
+        logging.warning(
+            f'[SeriesRouter][SeriesListPositionAPI] Specified series_id was not found. [series_id: {series_id}]',
+        )
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified series_id was not found',
+        )
+    return schemas.SeriesListPosition(page=page)
+
+
+@router.get(
     '/{series_id}',
     summary = 'シリーズ番組 API',
     response_description = 'シリーズ番組。',
@@ -125,6 +206,7 @@ async def SeriesAPI(
         broadcast_periods__recorded_programs__recorded_video__status='Recorded',
     ).distinct() \
         .prefetch_related(
+            'episodes',
             'broadcast_periods__channel',
             'broadcast_periods__recorded_programs__recorded_video',
             'broadcast_periods__recorded_programs__channel',

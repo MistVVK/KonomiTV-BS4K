@@ -55,6 +55,30 @@ const router = createRouter({
             component: () => import('@/views/Videos/Watch.vue'),
         },
         {
+            path: '/videos/series/:id',
+            redirect: (to) => `/series/${to.params.id}`,
+        },
+        {
+            path: '/series/',
+            name: 'Series Home',
+            component: () => import('@/views/Series/Home.vue'),
+        },
+        {
+            path: '/series/on-air/:id',
+            name: 'Series On Air Detail',
+            component: () => import('@/views/Series/OnAir.vue'),
+        },
+        {
+            path: '/series/on-air',
+            name: 'Series On Air',
+            component: () => import('@/views/Series/OnAir.vue'),
+        },
+        {
+            path: '/series/:id',
+            name: 'Series Home Detail',
+            component: () => import('@/views/Series/Home.vue'),
+        },
+        {
             path: '/timetable/',
             name: 'TimeTable',
             component: () => import('@/views/TimeTable.vue'),

@@ -37,6 +37,7 @@ export interface ISeries {
     bangumi_subject_name_cn: string | null;
     bangumi_subject_summary: string | null;
     bangumi_subject_image_url: string | null;
+    episodes?: ISeriesEpisode[];
     broadcast_periods: ISeriesBroadcastPeriod[];
     created_at: string;
     updated_at: string;
@@ -46,6 +47,56 @@ export interface ISeries {
 export interface ISeriesList {
     total: number;
     series_list: ISeries[];
+}
+
+/** カタログカード用のシリーズ要約。 */
+export interface ISeriesSummary {
+    id: number;
+    title: string;
+    description: string;
+    genres: { major: string; middle: string; }[];
+    bangumi_subject_id: number | null;
+    bangumi_subject_name: string | null;
+    bangumi_subject_name_cn: string | null;
+    bangumi_subject_summary: string | null;
+    bangumi_subject_image_url: string | null;
+    recorded_count: number;
+    unrecorded_count: number;
+    partial_count: number;
+    latest_recorded_program_id: number | null;
+    updated_at: string;
+}
+
+/** カタログ一覧のページング応答。 */
+export interface ISeriesSummaryList {
+    total: number;
+    page_size: number;
+    series_list: ISeriesSummary[];
+}
+
+/** 放送中グリッドの 1 スロット。時刻は自然時刻。 */
+export interface ISeriesOnAirSlot {
+    weekday: number;
+    hour: number;
+    minute: number;
+    is_featured: boolean;
+    series: ISeriesSummary;
+}
+
+/** 放送中グリッドの 1 曜日。 */
+export interface ISeriesOnAirDay {
+    weekday: number;
+    slots: ISeriesOnAirSlot[];
+}
+
+/** 放送中グリッド応答。 */
+export interface ISeriesOnAirResponse {
+    days: ISeriesOnAirDay[];
+}
+
+/** `/series/:id` の深いリンク用ページ番号。 */
+export interface ISeriesListPosition {
+    page: number;
 }
 
 /** シリーズ放送期間を表すインターフェース */
@@ -130,6 +181,77 @@ class Series {
         }
 
         return response.data;
+    }
+
+
+    /**
+     * カタログカード用のシリーズ要約一覧を取得する
+     * @param order ソート順序 ('desc' or 'asc')
+     * @param page ページ番号
+     * @param query 検索キーワード
+     * @returns 要約一覧 or 失敗時は null
+     */
+    static async fetchSeriesSummaries(
+        order: 'desc' | 'asc' = 'desc',
+        page: number = 1,
+        query: string = '',
+    ): Promise<ISeriesSummaryList | null> {
+
+        const response = await APIClient.get<ISeriesSummaryList>('/series/summary', {
+            params: {
+                order,
+                page,
+                query,
+            },
+        });
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'シリーズ一覧を取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+
+    /**
+     * 今クール相当の週間レギュラーを取得する
+     * @returns 曜日ごとのスロット or 失敗時は null
+     */
+    static async fetchOnAirSeries(): Promise<ISeriesOnAirResponse | null> {
+
+        const response = await APIClient.get<ISeriesOnAirResponse>('/series/on-air');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, '放送中のシリーズを取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+
+    /**
+     * カタログ一覧で指定シリーズが載るページ番号を取得する
+     * @param series_id シリーズ ID
+     * @param order ソート順序
+     * @param query 検索キーワード
+     * @returns ページ番号 or 失敗時は null
+     */
+    static async fetchSeriesListPosition(
+        series_id: number,
+        order: 'desc' | 'asc' = 'desc',
+        query: string = '',
+    ): Promise<number | null> {
+
+        const response = await APIClient.get<ISeriesListPosition>('/series/list-position', {
+            params: {
+                series_id,
+                order,
+                query,
+            },
+        });
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'シリーズの一覧位置を取得できませんでした。');
+            return null;
+        }
+        return response.data.page;
     }
 }
 

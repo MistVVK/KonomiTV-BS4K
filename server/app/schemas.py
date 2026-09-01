@@ -836,6 +836,7 @@ class Series(PydanticModel):
     bangumi_subject_name_cn: str | None = None
     bangumi_subject_summary: str | None = None
     bangumi_subject_image_url: str | None = None
+    episodes: list[SeriesEpisode] = []
     broadcast_periods: list[SeriesBroadcastPeriod]
     created_at: datetime
     updated_at: datetime
@@ -843,6 +844,44 @@ class Series(PydanticModel):
 class SeriesList(BaseModel):
     total: int
     series_list: list[Series]
+
+class SeriesSummary(BaseModel):
+    id: Annotated[int, Field(description='シリーズ ID。')]
+    title: Annotated[str, Field(description='作品名。')]
+    description: Annotated[str, Field(description='シリーズの説明。')]
+    genres: Annotated[list[Genre], Field(description='ジャンル。')]
+    bangumi_subject_id: Annotated[int | None, Field(description='Bangumi 条目 ID。')]
+    bangumi_subject_name: Annotated[str | None, Field(description='Bangumi 原名。')]
+    bangumi_subject_name_cn: Annotated[str | None, Field(description='Bangumi 中文名。')]
+    bangumi_subject_summary: Annotated[str | None, Field(description='Bangumi 概要。')]
+    bangumi_subject_image_url: Annotated[str | None, Field(description='Bangumi 表紙 URL。')]
+    recorded_count: Annotated[int, Field(description='再生可能録画の件数。')]
+    unrecorded_count: Annotated[int, Field(description='番号付き話の欠番件数。')]
+    partial_count: Annotated[int, Field(description='完全版が無い部分録画の件数。')]
+    latest_recorded_program_id: Annotated[int | None, Field(description='最新録画の番組 ID。サムネイル用。')]
+    updated_at: Annotated[datetime, Field(description='Series の更新日時。')]
+
+class SeriesSummaryList(BaseModel):
+    total: Annotated[int, Field(description='検索条件に一致する総件数。')]
+    page_size: Annotated[int, Field(description='1 ページの件数。')]
+    series_list: Annotated[list[SeriesSummary], Field(description='カタログカード用の Series 要約。')]
+
+class SeriesOnAirSlot(BaseModel):
+    weekday: Annotated[int, Field(description='自然時刻の曜日。月曜=0。')]
+    hour: Annotated[int, Field(description='自然時刻の時。')]
+    minute: Annotated[int, Field(description='5 分丸めした分。')]
+    is_featured: Annotated[bool, Field(description='注目枠に入るとき True。')]
+    series: Annotated[SeriesSummary, Field(description='このスロットの作品。')]
+
+class SeriesOnAirDay(BaseModel):
+    weekday: Annotated[int, Field(description='自然時刻の曜日。月曜=0。')]
+    slots: Annotated[list[SeriesOnAirSlot], Field(description='その曜日のレギュラー。')]
+
+class SeriesOnAirResponse(BaseModel):
+    days: Annotated[list[SeriesOnAirDay], Field(description='月曜始まりの 7 列。')]
+
+class SeriesListPosition(BaseModel):
+    page: Annotated[int, Field(description='カタログ一覧上のページ番号。1 以上。')]
 
 class SeriesBroadcastPeriod(PydanticModel):
     channel: Channel
