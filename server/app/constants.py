@@ -306,6 +306,11 @@ QUALITY_TYPES = Literal[
     '240p-30fps-hevc',
 ]
 
+# ライブストリーミングで指定できる品質
+## original はブラウザ側の mpeg2toh264 で変換・再生する前提で、放送波の MPEG-2 TS を再エンコードせずに直接出力するストリームを表す特別な値
+## 保存プロファイルの QUALITY には含めず、ライブ GR/BS/CS フルセグの視聴中選択だけが使う
+LIVE_STREAMING_QUALITY_TYPES = Literal['original'] | QUALITY_TYPES
+
 # 映像と音声の品質
 QUALITY: dict[QUALITY_TYPES, Quality] = {
     '4320p': Quality(

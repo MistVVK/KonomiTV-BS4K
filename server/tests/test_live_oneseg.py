@@ -74,6 +74,7 @@ def _build_encoding_task(
     task = object.__new__(LiveEncodingTask)
     task._retry_count = 0
     task.live_stream = SimpleNamespace(
+        quality='1080p',
         stream_anchor_enabled=True,
         encoding_options=SimpleNamespace(
             is_24fps_mode_enabled=is_24fps_mode_enabled,

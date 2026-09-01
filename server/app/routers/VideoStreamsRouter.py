@@ -35,6 +35,7 @@ from app.streams.KonomiTVBS4KPlaybackEncoding import (
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.StreamEncodingOptions import (
+    RequireEncodedQuality,
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
 )
@@ -90,7 +91,7 @@ def GetRecordedStream(
         return RecordedFMP4Stream(
             session_id,
             recorded_program,
-            stream_quality.quality,
+            RequireEncodedQuality(stream_quality.quality),
             encoding_options=stream_quality.encoding_options,
             is_new_session_allowed=False,
             client_key=client_key,
@@ -110,7 +111,7 @@ def GetRecordedStream(
     return RecordedFMP4Stream(
         session_id,
         recorded_program,
-        stream_quality.quality,
+        RequireEncodedQuality(stream_quality.quality),
         stream_quality.encoding_options,
         is_new_session_allowed=is_new_session_allowed,
         client_key=client_key,
@@ -386,7 +387,7 @@ async def ValidateRecordedPlaybackCapabilities(
                 selected_encoder,
                 stream_quality.encoding_options.video_codec,
                 stream_quality.encoding_options.video_bit_depth,
-                quality = stream_quality.quality,
+                quality = RequireEncodedQuality(stream_quality.quality),
             )
         )
         if video_capability.recorded_available is False:
@@ -426,6 +427,14 @@ async def ValidateQuality(
     audio_track: Annotated[str | None, Query(description='映像と多重化する音声レンディション ID。')] = None,
 ) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
+
+    # 録画再生の original は VideoEncodingTask を戻さない方針のため拒否する
+    if quality == 'original':
+        logging.error(f'[VideoStreamsRouter][ValidateQuality] Original quality is not available for recorded playback. [quality: {quality}]')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Original quality is not available for recorded playback',
+        )
 
     # 指定された品質が存在するか確認
     ## 品質の指定に -10bit や -24fps が付いていれば分解する
@@ -509,7 +518,7 @@ def BuildOfflineStreamEstimate(
     video_bitrate_max = 0
     if recorded_program.recorded_video.has_video is True:
         bitrate = RecordedFMP4Stream.getOfflineVideoBitrate(
-            stream_quality.quality,
+            RequireEncodedQuality(stream_quality.quality),
             stream_quality.encoding_options.video_codec,
         )
         video_bitrate = int(bitrate.video_bitrate.removesuffix('K'))
@@ -1117,6 +1126,6 @@ async def VideoHLSSessionDeleteAPI(
     await RecordedFMP4Stream.destroySession(
         session_id,
         recorded_program,
-        stream_quality.quality,
+        RequireEncodedQuality(stream_quality.quality),
         stream_quality.encoding_options,
     )

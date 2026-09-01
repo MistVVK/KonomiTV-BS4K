@@ -271,6 +271,13 @@ async def ValidateCompatibilityLiveStreamQuality(
 ) -> StreamQualityWithOptions:
     """互換 API のライブ出力を旧 AVC / HEVC + AAC 契約へ固定する。"""
 
+    # mpeg2toh264 の original は Komorebi V1 互換契約に含まれない
+    if quality == 'original':
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Original quality is not available for compatibility API',
+        )
+
     # 互換ルートはStream Anchorを使わないため、mainルートのBridge必須能力は検査しない。
     # 品質名から旧 AVC / HEVC + AAC tupleを正規化し、不正品質だけを422で拒否する。
     selected_encoder = LiveStreamsRouter.GetEncoderForLiveChannel(display_channel_id)

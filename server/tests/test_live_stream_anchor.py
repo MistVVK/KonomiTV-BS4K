@@ -655,6 +655,7 @@ def test_compatibility_transport_does_not_add_anchor_options(monkeypatch: pytest
 def test_bridge_options_finalize_stream_anchor() -> None:
     task = object.__new__(LiveEncodingTask)
     task.live_stream = SimpleNamespace(
+        quality='240p',
         stream_anchor_enabled=True,
         encoding_options=StreamEncodingOptions(),
     )

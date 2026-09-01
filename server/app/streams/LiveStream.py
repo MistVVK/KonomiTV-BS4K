@@ -11,7 +11,7 @@ from hashids import Hashids
 
 from app import logging
 from app.config import Config
-from app.constants import QUALITY, QUALITY_TYPES
+from app.constants import LIVE_STREAMING_QUALITY_TYPES, QUALITY
 from app.schemas import LiveStreamStatus
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KAudioCodec,
@@ -26,7 +26,7 @@ from app.utils.edcb.EDCBTuner import EDCBTuner
 
 KonomiTVBS4KLiveStreamKey = tuple[
     str,
-    QUALITY_TYPES,
+    LIVE_STREAMING_QUALITY_TYPES,
     KonomiTVBS4KVideoCodec,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KAudioCodec,
@@ -35,7 +35,7 @@ KonomiTVBS4KLiveStreamKey = tuple[
 ]
 KonomiTVBS4KLiveStreamInstanceKey = tuple[
     str,
-    QUALITY_TYPES,
+    LIVE_STREAMING_QUALITY_TYPES,
     KonomiTVBS4KVideoCodec,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KAudioCodec,
@@ -138,7 +138,7 @@ class LiveStream:
     def __new__(
         cls,
         display_channel_id: str,
-        quality: QUALITY_TYPES,
+        quality: LIVE_STREAMING_QUALITY_TYPES,
         encoding_options: StreamEncodingOptions | None = None,
         stream_anchor_enabled: bool = True,
     ) -> LiveStream:
@@ -146,9 +146,13 @@ class LiveStream:
         # まだ同じライブストリーム ID のインスタンスがないときだけ、インスタンスを生成する
         # (チャンネル ID)-(映像の品質)-(追加エンコードオプション) で一意な ID になる
         if encoding_options is None:
-            encoding_options = StreamEncodingOptions(
-                video_codec = 'hevc' if QUALITY[quality].is_hevc else 'avc',
-            )
+            # original は QUALITY に無く、エンコーダーも通さないため既定の AVC/AAC オプションだけをキーに使う
+            if quality == 'original':
+                encoding_options = StreamEncodingOptions()
+            else:
+                encoding_options = StreamEncodingOptions(
+                    video_codec = 'hevc' if QUALITY[quality].is_hevc else 'avc',
+                )
         live_stream_key: KonomiTVBS4KLiveStreamKey = (
             display_channel_id,
             quality,
@@ -253,7 +257,7 @@ class LiveStream:
     def __init__(
         self,
         display_channel_id: str,
-        quality: QUALITY_TYPES,
+        quality: LIVE_STREAMING_QUALITY_TYPES,
         encoding_options: StreamEncodingOptions | None = None,
         stream_anchor_enabled: bool = True,
     ) -> None:
@@ -262,7 +266,7 @@ class LiveStream:
 
         Args:
             display_channel_id (str): チャンネルID
-            quality (QUALITY_TYPES): 映像の品質 (1080p-60fps ~ 240p)
+            quality (LIVE_STREAMING_QUALITY_TYPES): 映像の品質 (original, 1080p-60fps ~ 240p)
             encoding_options (StreamEncodingOptions | None): ベース画質に追加するエンコードオプション
             stream_anchor_enabled (bool): 最終 TS に Stream Anchor v1 を付与するか
         """
@@ -272,7 +276,7 @@ class LiveStream:
         self.live_stream_id: str
         self.live_stream_key: KonomiTVBS4KLiveStreamKey
         self.display_channel_id: str
-        self.quality: QUALITY_TYPES
+        self.quality: LIVE_STREAMING_QUALITY_TYPES
         self.encoding_options: StreamEncodingOptions
         self.stream_anchor_enabled: bool
         self._clients: list[LiveStreamClient]

@@ -8,6 +8,7 @@ import gc
 import os
 import re
 import secrets
+import sys
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
@@ -97,6 +98,10 @@ class LiveEncodingTask:
 
     # エンコーダーの出力を読み取る際のタイムアウト (ONAir 時) (秒)
     ENCODER_TS_READ_TIMEOUT_ONAIR: ClassVar[int] = 5
+    # オリジナル画質で ONAir に移行するために必要な、ライブストリームへ書き込んだ TS データの累積バイト数
+    ## 地上波・BS 放送の TS ビットレート (おおよそ 16〜19Mbps) を前提に、約 0.75 秒分のデータ量 (1.5MiB) とする
+    ## tsreadex から最初の TS パケットが出た直後だと再生に足りないため、実際に再生可能な量が溜まってから ONAir にする
+    ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES: ClassVar[int] = int(1.5 * 1024 * 1024)
     # AMD (公開名 AMF、実体は Mesa VAAPI) はドライバー初期化が重い場合があるため長めに維持する
     ENCODER_TS_READ_TIMEOUT_ONAIR_AMD: ClassVar[int] = 10
     # ISDB-S3 は入力解析と最初の映像出力に時間がかかるため、ONAir 遷移後の初回出力を長めに待つ
@@ -229,6 +234,7 @@ class LiveEncodingTask:
 
         return (
             self.IsStreamAnchorEnabled() is True and
+            self.live_stream.quality != 'original' and
             is_radiochannel is False and
             is_oneseg is False and
             is_mmt_tlv is False
@@ -247,9 +253,13 @@ class LiveEncodingTask:
         """
 
         self.live_stream.is_rain_fallback_broadcasting = broadcasting
+        # original は QUALITY に無く、降雨対応 SID の TLV 経路でもない
+        live_quality = self.live_stream.quality
+        if live_quality == 'original':
+            return False
         should_use_rain_fallback = (
             self.live_stream.encoding_options.use_rain_fallback is True and
-            QUALITY[self.live_stream.quality].height <= 1080 and
+            QUALITY[live_quality].height <= 1080 and
             broadcasting is True
         )
         if (
@@ -367,12 +377,14 @@ class LiveEncodingTask:
         ) is True:
             options.append('--stream-anchor-v1')
         if is_radiochannel is False and video_codec == 'av1':
+            live_quality = self.live_stream.quality
+            assert live_quality != 'original'
             muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
                 ResolveKonomiTVBS4KPlaybackVideoBitrate(
-                    self.live_stream.quality,
+                    live_quality,
                     video_codec,
                 ).video_bitrate_max,
-                quality = self.live_stream.quality,
+                quality = live_quality,
                 video_codec = video_codec,
             )
             options += [
@@ -1514,6 +1526,7 @@ class LiveEncodingTask:
             # aiohttp.StreamReader の __aiter__ は readline (\n 区切り) のため、生 TLV を渡すと
             # 64KB を超える改行の無い入力で LineTooLong になり壊れる。iter_chunked で生バイト列を渡す。
             rain_service_id = self.RAIN_FALLBACK_SERVICE_IDS.get((channel.network_id, channel.service_id))
+            assert self.live_stream.quality != 'original'
             need_rain_fallback = (
                 self.live_stream.encoding_options.use_rain_fallback is True and
                 QUALITY[self.live_stream.quality].height <= 1080 and
@@ -1696,6 +1709,10 @@ class LiveEncodingTask:
 
         CONFIG = Config()
 
+        # オリジナル画質 ("original") が指定された場合のみ、mpeg2toh264 での変換・再生を前提に、
+        # tsreadex からの出力をそのままストリーミングする
+        is_original_quality = self.live_stream.quality == 'original'
+
         # 現世代のmapと継続監視が確定するまで、前世代の降雨対応放送状態を表示しない。
         self.live_stream.is_rain_fallback = None
         self.live_stream.is_rain_fallback_broadcasting = None
@@ -1849,24 +1866,28 @@ class LiveEncodingTask:
             '-A', '1',
             # 字幕ストリームが常に存在する状態にする
             ## ストリームが存在しない場合、PMT の項目が補われて出力される
-            ## 実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する
-            '-c', '5',
+            ## エンコード済み画質は実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する
+            ## original はエンコーダーを通さないため、PMT 補完だけにする
+            '-c', '1' if is_original_quality is True else '5',
             # 文字スーパーストリームが常に存在する状態にする
             ## ストリームが存在しない場合、PMT の項目が補われて出力される
             '-u', '1',
+        ]
+
+        # オリジナル画質 (mpeg2toh264 で再生) ではエンコーダーを通さないため、
+        # 字幕の ID3 変換 (-d) と Stream Anchor 用 source marker (-g) を付けない
+        if is_original_quality is False:
             # 字幕と文字スーパーを aribb24.js が解釈できる ID3 timed-metadata に変換する
             ## +4: FFmpeg のバグを打ち消すため、変換後のストリームに規格外の5バイトのデータを追加する
             ## +8: FFmpeg のエラーを防ぐため、変換後のストリームの PTS が単調増加となるように調整する
             ## 以前は Linux 版 HWEncC が FFmpeg 4.4 系の共有ライブラリに依存していたため +4 を付与していたが、
             ## 現在の Linux 版 HWEncC は FFmpeg 8 系を静的リンクした最新版へ更新したため不要になった
             ## +4 を残すと FFmpeg 6.1 以降では字幕が表示されなくなるため、常に +8 のみを付与する
-            '-d', '9',
-        ]
-
-        # Encoder 前の source marker は実行ごとの generation ID で識別し、
-        # Encoder 後に TS Codec Bridge が実際の映像 AU 時刻へ確定する。
-        if stream_anchor_generation_id is not None:
-            tsreadex_options += ['-g', str(stream_anchor_generation_id)]
+            tsreadex_options += ['-d', '9']
+            # Encoder 前の source marker は実行ごとの generation ID で識別し、
+            # Encoder 後に TS Codec Bridge が実際の映像 AU 時刻へ確定する。
+            if stream_anchor_generation_id is not None:
+                tsreadex_options += ['-g', str(stream_anchor_generation_id)]
 
         if CONFIG.tv.debug_mode_ts_path is None:
             # 通常は標準入力を指定
@@ -2025,14 +2046,48 @@ class LiveEncodingTask:
             encoder_environment = RecordedPlaybackBackend.getEnvironment(ffmpeg8_encoder_type)
             encoder_stdin = asyncio.subprocess.PIPE if is_mmt_tlv is True else tsreadex_read_pipe
 
+            # オリジナル画質 ("original") 指定時のみ、Python で単に左から右にパイプで流すだけの無変換プロセスを「エンコーダー」として起動する
+            ## KonomiTV の既存ロジックはエンコーダーレスで配信することを想定した設計になっておらず、
+            ## エンコーダーに相当するプロセスがないと特別な条件分岐を大量追加する必要が出てくるため、当面この方向で対応する
+            if is_original_quality is True:
+                copy_script = (
+                    'import os\n'
+                    'while True:\n'
+                    '    data = os.read(0, 65536)\n'
+                    '    if not data:\n'
+                    '        break\n'
+                    '    offset = 0\n'
+                    '    while offset < len(data):\n'
+                    '        offset += os.write(1, data[offset:])\n'
+                )
+                logging.info(f'{self.live_stream.log_prefix} Original MPEG-TS stream passthrough is starting.')
+
+                # エンコーダープロセスを非同期で作成・実行
+                try:
+                    encoder = await asyncio.subprocess.create_subprocess_exec(
+                        sys.executable,
+                        '-u',
+                        '-c',
+                        copy_script,
+                        stdin = encoder_stdin,
+                        stdout = encoder_stdout,
+                        stderr = asyncio.subprocess.DEVNULL,
+                    )
+                finally:
+                    # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
+                    if tsreadex_read_pipe is not None:
+                        os.close(tsreadex_read_pipe)
+                        tsreadex_read_pipe = None
+
             # FFmpeg software backend
-            if ENCODER_TYPE == 'FFmpeg':
+            elif ENCODER_TYPE == 'FFmpeg':
 
                 # オプションを取得
                 # ラジオチャンネルかどうかでエンコードオプションを切り替え
                 if channel.is_radiochannel is True:
                     encoder_options = self.buildFFmpegOptionsForRadio()
                 else:
+                    assert self.live_stream.quality != 'original'
                     encoder_options = self.buildFFmpegOptions(
                         self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg, is_mmt_tlv,
                         tlv_main_video_packet_id,
@@ -2071,6 +2126,7 @@ class LiveEncodingTask:
             else:
 
                 # オプションを取得
+                assert self.live_stream.quality != 'original'
                 hw_encoder_type = ENCODER_TYPE
                 encoder_options = self.buildFFmpeg8HardwareOptions(
                     self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
@@ -2488,9 +2544,12 @@ class LiveEncodingTask:
             ## そうしないと稀にパケロスするらしく、ブラウザ側で突如再生できなくなることがある
             writer_lock = asyncio.Lock()
 
+            # オリジナル画質向け: ライブストリームへ書き込んだ TS データの累積バイト数
+            original_quality_bytes_written: int = 0
+
             async def Writer() -> None:
 
-                nonlocal chunk_buffer, chunk_written_at, writer_lock
+                nonlocal chunk_buffer, chunk_written_at, writer_lock, original_quality_bytes_written
 
                 while True:
                     try:
@@ -2510,8 +2569,23 @@ class LiveEncodingTask:
                             if len(chunk_buffer) >= 65536:
 
                                 # エンコーダーからの出力をライブストリームの Queue に書き込む
+                                chunk_size = len(chunk_buffer)
                                 self.live_stream.writeStreamData(bytes(chunk_buffer))
-                                # print(f'Writer:    Chunk size: {len(chunk_buffer):05} / Time: {time.time()}')
+                                # print(f'Writer:    Chunk size: {chunk_size:05} / Time: {time.time()}')
+
+                                # オリジナル画質 ("original") 指定時のみ、エンコーダーログがないため、
+                                # ライブストリームへ書き込んだ TS データ量からバッファリング完了を判定する
+                                if is_original_quality is True:
+                                    live_stream_status = self.live_stream.getStatus()
+                                    if live_stream_status.status == 'Standby':
+                                        original_quality_bytes_written += chunk_size
+                                        if original_quality_bytes_written < self.ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES:
+                                            if live_stream_status.detail != 'ストリーミングを開始しています…':
+                                                self.live_stream.setStatus('Standby', 'ストリーミングを開始しています…')
+                                        else:
+                                            self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
+                                            if self._retry_count > 0:
+                                                self._retry_count = 0
 
                                 # チャンクバッファを空にする（重要）
                                 chunk_buffer = bytearray()
@@ -2531,7 +2605,7 @@ class LiveEncodingTask:
             ## ラジオチャンネルは通常のチャンネルと比べてデータ量が圧倒的に少ないため、64KB に達することは稀で SubWriter でのチャンク書き込みがメインになる
             async def SubWriter() -> None:
 
-                nonlocal tuner_ts_read_at, tuner_ts_read_at_lock, chunk_buffer, chunk_written_at, writer_lock
+                nonlocal tuner_ts_read_at, tuner_ts_read_at_lock, chunk_buffer, chunk_written_at, writer_lock, original_quality_bytes_written
 
                 while True:
 
@@ -2546,8 +2620,23 @@ class LiveEncodingTask:
                         if (time.monotonic() - chunk_written_at) > 0.025 and (len(chunk_buffer) > 0):
 
                             # エンコーダーからの出力をライブストリームの Queue に書き込む
+                            chunk_size = len(chunk_buffer)
                             self.live_stream.writeStreamData(bytes(chunk_buffer))
-                            # print(f'SubWriter: Chunk size: {len(chunk_buffer):05} / Time: {time.time()}')
+                            # print(f'SubWriter: Chunk size: {chunk_size:05} / Time: {time.time()}')
+
+                            # オリジナル画質 ("original") 指定時のみ、エンコーダーログがないため、
+                            # ライブストリームへ書き込んだ TS データ量からバッファリング完了を判定する
+                            if is_original_quality is True:
+                                live_stream_status = self.live_stream.getStatus()
+                                if live_stream_status.status == 'Standby':
+                                    original_quality_bytes_written += chunk_size
+                                    if original_quality_bytes_written < self.ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES:
+                                        if live_stream_status.detail != 'ストリーミングを開始しています…':
+                                            self.live_stream.setStatus('Standby', 'ストリーミングを開始しています…')
+                                    else:
+                                        self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
+                                        if self._retry_count > 0:
+                                            self._retry_count = 0
 
                             # チャンクバッファを空にする（重要）
                             chunk_buffer = bytearray()
@@ -2701,8 +2790,10 @@ class LiveEncodingTask:
                 if CONFIG.general.debug_encoder is True and encoder_log is not None:
                     await encoder_log.close()
 
-            # タスクを非同期で実行
-            background_tasks.add(asyncio.create_task(EncoderObServer()))
+            # オリジナル画質はエンコーダーログがないため、ログ監視を起動しない
+            if is_original_quality is False:
+                # タスクを非同期で実行
+                background_tasks.add(asyncio.create_task(EncoderObServer()))
 
             # Bridge の stderr を読み続け、pipe 満杯による停止を防ぎつつ失敗理由を保持する。
             bridge_lines: list[str] = []
