@@ -1,10 +1,10 @@
 <template>
     <div class="series-episode-list">
-        <div v-if="is_loading" class="series-episode-list__state">
+        <div v-if="isLoading" class="series-episode-list__state">
             <v-progress-circular color="primary" indeterminate size="28" width="3" />
             <span>シリーズ詳細を取得しています…</span>
         </div>
-        <div v-else-if="load_failed" class="series-episode-list__state">
+        <div v-else-if="loadFailed" class="series-episode-list__state">
             <span>シリーズ詳細を取得できませんでした。</span>
         </div>
         <template v-else-if="series !== null">
@@ -13,18 +13,19 @@
                     class="series-episode-list__cover" :src="series.bangumi_subject_image_url" alt="">
                 <div class="series-episode-list__bangumi-main">
                     <div class="series-episode-list__bangumi-title">
-                        {{series.bangumi_subject_name_cn || series.bangumi_subject_name || series.title}}
+                        {{series.bangumi_subject_name || series.title}}
                     </div>
                     <a class="series-episode-list__bangumi-link"
                         :href="`https://bgm.tv/subject/${series.bangumi_subject_id}`" target="_blank" rel="noopener">
                         bgm.tv で開く
                     </a>
-                    <p v-if="show_original_summary && series.bangumi_subject_summary" class="series-episode-list__summary">
+                    <p v-if="showBangumiSummary && series.bangumi_subject_summary" class="series-episode-list__summary">
                         {{series.bangumi_subject_summary}}
                     </p>
                     <button v-if="series.bangumi_subject_summary" type="button"
-                        class="series-episode-list__summary-toggle" @click="show_original_summary = !show_original_summary">
-                        {{show_original_summary ? '簡介を畳む' : '簡介を表示'}}
+                        class="series-episode-list__summary-toggle" :aria-expanded="showBangumiSummary"
+                        @click="showBangumiSummary = !showBangumiSummary">
+                        {{showBangumiSummary ? '概要を閉じる' : '概要を表示'}}
                     </button>
                 </div>
             </div>
@@ -38,17 +39,18 @@
                         </tr>
                     </thead>
                     <tbody>
-                        <tr v-for="row in rows" :key="row.channel_id">
-                            <th>{{row.channel_name}}</th>
-                            <td v-for="column in columns" :key="`${row.channel_id}-${column.key}`">
-                                <router-link v-if="cellProgram(row.channel_id, column.key) !== null"
+                        <tr v-for="row in rows" :key="row.channelId">
+                            <th>{{row.channelName}}</th>
+                            <td v-for="column in columns" :key="`${row.channelId}-${column.key}`">
+                                <router-link v-if="cellProgram(row.channelId, column.key) !== null"
                                     class="series-episode-list__cell"
-                                    :to="`/videos/watch/${cellProgram(row.channel_id, column.key)!.id}`">
+                                    :to="`/videos/watch/${cellProgram(row.channelId, column.key)!.id}`"
+                                    :aria-label="`${cellProgram(row.channelId, column.key)!.title}を再生`">
                                     <img class="series-episode-list__thumb" loading="lazy"
-                                        :src="`${Utils.api_base_url}/videos/${cellProgram(row.channel_id, column.key)!.id}/thumbnail`"
+                                        :src="`${Utils.api_base_url}/videos/${cellProgram(row.channelId, column.key)!.id}/thumbnail`"
                                         alt="">
-                                    <span v-if="showPartialWarning(row.channel_id, column.key)"
-                                        class="series-episode-list__partial">一部のみ録画</span>
+                                    <span v-if="showPartialWarning(row.channelId, column.key)"
+                                        class="series-episode-list__partial">部分録画</span>
                                 </router-link>
                                 <span v-else class="series-episode-list__missing">未録画</span>
                             </td>
@@ -61,7 +63,7 @@
 </template>
 <script lang="ts" setup>
 
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 
 import Series, { type ISeries, type ISeriesRecordedProgram } from '@/services/Series';
 import Utils, { dayjs } from '@/utils';
@@ -72,9 +74,10 @@ const props = defineProps<{
 }>();
 
 const series = ref<ISeries | null>(null);
-const is_loading = ref(true);
-const load_failed = ref(false);
-const show_original_summary = ref(false);
+const isLoading = ref(true);
+const loadFailed = ref(false);
+const showBangumiSummary = ref(false);
+let fetchGeneration = 0;
 
 type MatrixColumn = {
     key: string;
@@ -82,8 +85,8 @@ type MatrixColumn = {
 };
 
 type MatrixRow = {
-    channel_id: string;
-    channel_name: string;
+    channelId: string;
+    channelName: string;
 };
 
 const recordedPrograms = computed(() => {
@@ -99,10 +102,10 @@ const columns = computed((): MatrixColumn[] => {
         return left.episode_number.localeCompare(right.episode_number, 'en', {numeric: true});
     });
     if (structured.length > 0) {
-        const season_count = new Set(structured.map((episode) => episode.season_number)).size;
+        const seasonCount = new Set(structured.map((episode) => episode.season_number)).size;
         return structured.map((episode) => ({
             key: `episode:${episode.id}`,
-            label: season_count > 1
+            label: seasonCount > 1
                 ? formatRecordedEpisodeLabel(episode.season_number, episode.episode_number)
                 : `第${formatRecordedEpisodeNumber(episode.episode_number)}話`,
         }));
@@ -125,7 +128,7 @@ const rows = computed((): MatrixRow[] => {
     for (const period of series.value.broadcast_periods) {
         channels.set(period.channel.id, period.channel.name);
     }
-    return [...channels.entries()].map(([channel_id, channel_name]) => ({channel_id, channel_name}));
+    return [...channels.entries()].map(([channelId, channelName]) => ({channelId, channelName}));
 });
 
 function broadcastSlotKey(program: ISeriesRecordedProgram): string {
@@ -139,31 +142,43 @@ function cellKey(program: ISeriesRecordedProgram): string | null {
     return broadcastSlotKey(program);
 }
 
-function cellProgram(channel_id: string, column_key: string): ISeriesRecordedProgram | null {
-    const candidates = recordedPrograms.value.filter((program) => {
-        return program.channel?.id === channel_id && cellKey(program) === column_key;
-    });
-    if (candidates.length === 0) return null;
-    const complete = candidates.find((program) => program.is_partially_recorded === false);
-    return complete ?? candidates[0];
+const programsByCell = computed((): Map<string, ISeriesRecordedProgram> => {
+    const programs = new Map<string, ISeriesRecordedProgram>();
+    for (const program of recordedPrograms.value) {
+        const columnKey = cellKey(program);
+        if (program.channel === null || columnKey === null) continue;
+        const key = `${program.channel.id}:${columnKey}`;
+        const current = programs.get(key);
+        if (current === undefined || (current.is_partially_recorded && program.is_partially_recorded === false)) {
+            programs.set(key, program);
+        }
+    }
+    return programs;
+});
+
+function cellProgram(channelId: string, columnKey: string): ISeriesRecordedProgram | null {
+    return programsByCell.value.get(`${channelId}:${columnKey}`) ?? null;
 }
 
-function showPartialWarning(channel_id: string, column_key: string): boolean {
-    const program = cellProgram(channel_id, column_key);
+function showPartialWarning(channelId: string, columnKey: string): boolean {
+    const program = cellProgram(channelId, columnKey);
     return program !== null && program.is_partially_recorded;
 }
 
 const fetchSeries = async () => {
-    is_loading.value = true;
-    load_failed.value = false;
+    // カードを素早く切り替えたとき、古い応答で新しい詳細を上書きしない。
+    const generation = ++fetchGeneration;
+    isLoading.value = true;
+    loadFailed.value = false;
+    showBangumiSummary.value = false;
     const result = await Series.fetchSeries(props.seriesId);
+    if (generation !== fetchGeneration) return;
     series.value = result;
-    load_failed.value = result === null;
-    is_loading.value = false;
+    loadFailed.value = result === null;
+    isLoading.value = false;
 };
 
-onMounted(fetchSeries);
-watch(() => props.seriesId, fetchSeries);
+watch(() => props.seriesId, fetchSeries, {immediate: true});
 
 </script>
 <style lang="scss" scoped>
@@ -187,6 +202,10 @@ watch(() => props.seriesId, fetchSeries);
     display: flex;
     gap: 14px;
     margin-bottom: 16px;
+}
+
+.series-episode-list__bangumi-main {
+    min-width: 0;
 }
 
 .series-episode-list__cover {
