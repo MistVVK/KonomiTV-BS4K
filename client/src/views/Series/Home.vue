@@ -1,10 +1,10 @@
 <template>
     <div class="route-container">
-        <HeaderBar :searchQuery="search_query" @update:searchQuery="search_query = $event" @search="applySearch" />
+        <HeaderBar v-model:searchQuery="searchQuery" @search="applySearch" />
         <main>
             <Navigation />
             <div class="series-home-wrapper">
-                <SPHeaderBar :searchQuery="search_query" @update:searchQuery="search_query = $event" @search="applySearch" />
+                <SPHeaderBar v-model:searchQuery="searchQuery" @search="applySearch" />
                 <div class="series-home">
                     <Breadcrumbs :crumbs="[
                         { name: 'ホーム', path: '/' },
@@ -12,19 +12,21 @@
                     ]" />
                     <div class="series-home__toolbar">
                         <h1 class="series-home__title">シリーズ</h1>
-                        <v-select v-model="sort_order" class="series-home__sort" :items="sort_items"
+                        <v-select v-model="sortOrder" class="series-home__sort" :items="sortItems"
                             item-title="title" item-value="value" density="compact" variant="outlined" hide-details
                             @update:modelValue="reloadFromFirstPage" />
                     </div>
-                    <div v-if="is_loading" class="series-home__state">
+                    <div v-if="isLoading" class="series-home__state">
                         <v-progress-circular color="primary" indeterminate size="30" width="3" />
                     </div>
-                    <div v-else-if="series_list.length === 0" class="series-home__state">
+                    <div v-else-if="seriesList.length === 0" class="series-home__state">
                         表示できるシリーズがありません。
                     </div>
-                    <div v-else class="series-home__grid" ref="grid_element">
-                        <template v-for="(card, index) in series_list" :key="card.id">
-                            <button type="button" class="series-card" :class="{'series-card--expanded': expanded_id === card.id}"
+                    <div v-else ref="gridElement" class="series-home__grid">
+                        <template v-for="(card, index) in seriesList" :key="card.id">
+                            <button type="button" class="series-card" :class="{'series-card--expanded': expandedId === card.id}"
+                                :style="{gridColumn: String(cardGridColumn(index)), gridRow: String(cardGridRow(index))}"
+                                :aria-expanded="expandedId === card.id"
                                 @click="toggleExpand(card.id)">
                                 <img class="series-card__image" loading="lazy" :src="cardImage(card)" alt="">
                                 <div class="series-card__body">
@@ -32,17 +34,18 @@
                                     <div class="series-card__meta">
                                         録画 {{card.recorded_count.toLocaleString()}} 件
                                         <span v-if="card.unrecorded_count > 0">・未録画 {{card.unrecorded_count}}</span>
-                                        <span v-if="card.partial_count > 0">・一部録画 {{card.partial_count}}</span>
+                                        <span v-if="card.partial_count > 0">・部分録画 {{card.partial_count}}</span>
                                     </div>
                                 </div>
                             </button>
-                            <div v-if="shouldShowDetailAfter(index)" class="series-home__detail">
-                                <SeriesEpisodeList :seriesId="expanded_id!" />
-                            </div>
                         </template>
+                        <div v-if="expandedId !== null" class="series-home__detail"
+                            :style="{gridRow: String(detailGridRow)}">
+                            <SeriesEpisodeList :seriesId="expandedId" />
+                        </div>
                     </div>
-                    <div v-if="total_pages > 1" class="series-home__pagination">
-                        <v-pagination v-model="current_page" :length="total_pages" density="comfortable"
+                    <div v-if="totalPages > 1" class="series-home__pagination">
+                        <v-pagination v-model="currentPage" :length="totalPages" density="comfortable"
                             @update:modelValue="changePage" />
                     </div>
                 </div>
@@ -66,23 +69,33 @@ import Utils from '@/utils';
 const route = useRoute();
 const router = useRouter();
 
-const sort_items = [
+const sortItems = [
     {title: '更新が新しい順', value: 'desc'},
     {title: '更新が古い順', value: 'asc'},
 ];
 
-const series_list = ref<ISeriesSummary[]>([]);
+const seriesList = ref<ISeriesSummary[]>([]);
 const total = ref(0);
-const page_size = ref(50);
-const current_page = ref(1);
-const sort_order = ref<'desc' | 'asc'>('desc');
-const search_query = ref('');
-const is_loading = ref(true);
-const expanded_id = ref<number | null>(null);
-const grid_element = ref<HTMLElement | null>(null);
-const column_count = ref(2);
+const pageSize = ref(50);
+const currentPage = ref(1);
+const sortOrder = ref<'desc' | 'asc'>('desc');
+const searchQuery = ref('');
+const isLoading = ref(true);
+const expandedId = ref<number | null>(null);
+const gridElement = ref<HTMLElement | null>(null);
+const columnCount = ref(1);
+let gridResizeObserver: ResizeObserver | null = null;
+let observedGridWidth = -1;
+let routeSyncGeneration = 0;
+let loadedListStateKey: string | null = null;
 
-const total_pages = computed(() => Math.max(1, Math.ceil(total.value / page_size.value)));
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)));
+const expandedIndex = computed(() => seriesList.value.findIndex((card) => card.id === expandedId.value));
+const expandedRow = computed(() => {
+    if (expandedIndex.value < 0) return null;
+    return Math.floor(expandedIndex.value / columnCount.value) + 1;
+});
+const detailGridRow = computed(() => (expandedRow.value ?? 0) + 1);
 
 const cardImage = (card: ISeriesSummary): string => {
     if (card.bangumi_subject_image_url) return card.bangumi_subject_image_url;
@@ -93,135 +106,216 @@ const cardImage = (card: ISeriesSummary): string => {
 };
 
 const updateColumnCount = () => {
-    const grid = grid_element.value;
+    const grid = gridElement.value;
     if (grid === null) return;
     const style = getComputedStyle(grid);
     const raw = style.gridTemplateColumns;
-    column_count.value = Math.max(1, raw.split(' ').filter((part) => part !== '').length);
+    columnCount.value = Math.max(1, raw.split(' ').filter((part) => part !== '').length);
 };
 
-const shouldShowDetailAfter = (index: number): boolean => {
-    if (expanded_id.value === null) return false;
-    const expanded_index = series_list.value.findIndex((card) => card.id === expanded_id.value);
-    if (expanded_index < 0) return false;
-    const row_end = Math.min(
-        series_list.value.length - 1,
-        Math.floor(expanded_index / column_count.value) * column_count.value + column_count.value - 1,
-    );
-    return index === row_end;
+const cardGridColumn = (index: number): number => {
+    return index % columnCount.value + 1;
 };
 
-const fetchPage = async () => {
-    is_loading.value = true;
-    const result = await Series.fetchSeriesSummaries(sort_order.value, current_page.value, search_query.value);
+const cardGridRow = (index: number): number => {
+    const row = Math.floor(index / columnCount.value) + 1;
+    return expandedRow.value !== null && row > expandedRow.value ? row + 1 : row;
+};
+
+const buildListStateKey = (query: string, order: 'desc' | 'asc', page: number): string => {
+    return `${query}\0${order}\0${page}`;
+};
+
+const fetchPage = async (
+    generation: number,
+    query: string,
+    order: 'desc' | 'asc',
+    page: number,
+): Promise<boolean> => {
+    if (generation !== routeSyncGeneration) return false;
+    isLoading.value = true;
+    const result = await Series.fetchSeriesSummaries(order, page, query);
+    if (generation !== routeSyncGeneration) return false;
     if (result !== null) {
-        series_list.value = result.series_list;
+        seriesList.value = result.series_list;
         total.value = result.total;
-        page_size.value = result.page_size;
+        pageSize.value = result.page_size;
+        loadedListStateKey = buildListStateKey(query, order, page);
+    } else {
+        seriesList.value = [];
+        total.value = 0;
+        loadedListStateKey = null;
     }
-    is_loading.value = false;
+    isLoading.value = false;
     await nextTick();
+    if (generation !== routeSyncGeneration) return false;
+    gridResizeObserver?.disconnect();
+    observedGridWidth = -1;
+    if (gridElement.value !== null) {
+        gridResizeObserver?.observe(gridElement.value);
+    }
     updateColumnCount();
+    return true;
 };
 
 const applySearch = async (query: string) => {
-    search_query.value = query;
-    current_page.value = 1;
-    expanded_id.value = null;
+    const previousFullPath = route.fullPath;
+    routeSyncGeneration++;
+    searchQuery.value = query;
+    currentPage.value = 1;
+    expandedId.value = null;
     await router.replace({
         path: '/series/',
         query: {
             ...(query !== '' ? {query} : {}),
-            order: sort_order.value,
+            order: sortOrder.value,
             page: '1',
         },
     });
-    await fetchPage();
+    if (route.fullPath === previousFullPath) await syncRouteState();
 };
 
 const reloadFromFirstPage = async () => {
-    current_page.value = 1;
-    expanded_id.value = null;
+    const previousFullPath = route.fullPath;
+    routeSyncGeneration++;
+    currentPage.value = 1;
+    expandedId.value = null;
     await router.replace({
         path: '/series/',
         query: {
-            ...(search_query.value !== '' ? {query: search_query.value} : {}),
-            order: sort_order.value,
+            ...(searchQuery.value !== '' ? {query: searchQuery.value} : {}),
+            order: sortOrder.value,
             page: '1',
         },
     });
-    await fetchPage();
+    if (route.fullPath === previousFullPath) await syncRouteState();
 };
 
 const changePage = async (page: number) => {
-    current_page.value = page;
-    expanded_id.value = null;
+    const previousFullPath = route.fullPath;
+    routeSyncGeneration++;
+    currentPage.value = page;
+    expandedId.value = null;
     await router.replace({
         path: '/series/',
         query: {
-            ...(search_query.value !== '' ? {query: search_query.value} : {}),
-            order: sort_order.value,
+            ...(searchQuery.value !== '' ? {query: searchQuery.value} : {}),
+            order: sortOrder.value,
             page: String(page),
         },
     });
-    await fetchPage();
+    if (route.fullPath === previousFullPath) await syncRouteState();
 };
 
-const toggleExpand = async (series_id: number) => {
-    const next_id = expanded_id.value === series_id ? null : series_id;
-    expanded_id.value = next_id;
-    const scroll_y = window.scrollY;
+const toggleExpand = async (seriesId: number) => {
+    const previousFullPath = route.fullPath;
+    routeSyncGeneration++;
+    const nextId = expandedId.value === seriesId ? null : seriesId;
+    expandedId.value = nextId;
+    const scrollY = window.scrollY;
     await router.replace({
-        path: next_id === null ? '/series/' : `/series/${next_id}`,
+        path: nextId === null ? '/series/' : `/series/${nextId}`,
         query: {
-            ...(search_query.value !== '' ? {query: search_query.value} : {}),
-            order: sort_order.value,
-            page: String(current_page.value),
+            ...(searchQuery.value !== '' ? {query: searchQuery.value} : {}),
+            order: sortOrder.value,
+            page: String(currentPage.value),
         },
     });
+    if (route.fullPath === previousFullPath) await syncRouteState();
     await nextTick();
-    window.scrollTo({top: scroll_y});
+    window.scrollTo({top: scrollY});
 };
 
-const openDeepLink = async () => {
-    const series_id_text = typeof route.params.id === 'string' ? route.params.id : '';
-    search_query.value = typeof route.query.query === 'string' ? route.query.query : '';
-    sort_order.value = route.query.order === 'asc' ? 'asc' : 'desc';
-    if (series_id_text !== '') {
-        const series_id = Number(series_id_text);
-        const page = await Series.fetchSeriesListPosition(series_id, sort_order.value, search_query.value);
+const syncRouteState = async () => {
+    const generation = ++routeSyncGeneration;
+    const seriesIdText = typeof route.params.id === 'string' ? route.params.id : '';
+    const query = typeof route.query.query === 'string' ? route.query.query : '';
+    const order = route.query.order === 'asc' ? 'asc' : 'desc';
+    const pageText = typeof route.query.page === 'string' ? Number(route.query.page) : 1;
+    const routePage = Number.isInteger(pageText) && pageText >= 1 ? pageText : 1;
+    const routeStateKey = buildListStateKey(query, order, routePage);
+
+    // URL を唯一の正本として、最新世代の同期だけが画面状態を更新する。
+    searchQuery.value = query;
+    sortOrder.value = order;
+    const seriesId = Number(seriesIdText);
+    if (seriesIdText !== '' && Number.isInteger(seriesId) && seriesId >= 1) {
+        // 現在の一覧にあるカードの開閉では、list-position と一覧を再取得しない。
+        if (loadedListStateKey === routeStateKey && seriesList.value.some((card) => card.id === seriesId)) {
+            currentPage.value = routePage;
+            expandedId.value = seriesId;
+            isLoading.value = false;
+            return;
+        }
+
+        const page = await Series.fetchSeriesListPosition(seriesId, order, query);
+        if (generation !== routeSyncGeneration) return;
         if (page !== null) {
-            current_page.value = page;
-            await fetchPage();
-            expanded_id.value = series_id;
+            currentPage.value = page;
+            const targetStateKey = buildListStateKey(query, order, page);
+            if (loadedListStateKey !== targetStateKey) {
+                const loaded = await fetchPage(generation, query, order, page);
+                if (loaded === false) return;
+            } else {
+                isLoading.value = false;
+            }
+            if (generation !== routeSyncGeneration) return;
+            expandedId.value = seriesList.value.some((card) => card.id === seriesId) ? seriesId : null;
             await nextTick();
+            if (generation !== routeSyncGeneration) return;
             updateColumnCount();
             return;
         }
     }
-    const page_text = typeof route.query.page === 'string' ? Number(route.query.page) : 1;
-    current_page.value = Number.isFinite(page_text) && page_text >= 1 ? page_text : 1;
-    await fetchPage();
+
+    currentPage.value = routePage;
+    expandedId.value = null;
+    if (loadedListStateKey !== routeStateKey) {
+        const loaded = await fetchPage(generation, query, order, routePage);
+        if (loaded === false) return;
+    } else {
+        isLoading.value = false;
+    }
+    if (generation !== routeSyncGeneration) return;
+    if (seriesIdText !== '') {
+        await router.replace({
+            path: '/series/',
+            query: {
+                ...(query !== '' ? {query} : {}),
+                order,
+                page: String(routePage),
+            },
+        });
+    }
 };
 
 onMounted(async () => {
-    window.addEventListener('resize', updateColumnCount);
-    await openDeepLink();
+    gridResizeObserver = new ResizeObserver((entries) => {
+        const width = entries[0]?.contentRect.width;
+        if (width === undefined || Math.abs(width - observedGridWidth) < 0.5) return;
+        observedGridWidth = width;
+        updateColumnCount();
+    });
+    await syncRouteState();
 });
 
 onUnmounted(() => {
-    window.removeEventListener('resize', updateColumnCount);
+    gridResizeObserver?.disconnect();
 });
 
-watch(() => route.params.id, async (next_id, previous_id) => {
-    if (next_id === previous_id) return;
-    await openDeepLink();
-});
+// params と query を 1 つの世代境界で同期し、古い応答を画面へ反映しない。
+watch(() => route.fullPath, async () => {
+    await syncRouteState();
+}, {flush: 'sync'});
 
 </script>
 <style lang="scss" scoped>
 
 .series-home-wrapper {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    min-width: 0;
     padding-top: 48px;
     @include smartphone-horizontal {
         padding-top: 0;
@@ -230,6 +324,8 @@ watch(() => route.params.id, async (next_id, previous_id) => {
 }
 
 .series-home {
+    width: 100%;
+    min-width: 0;
     max-width: 1100px;
     margin: 0 auto;
     padding: 16px 20px 80px;
@@ -307,11 +403,12 @@ watch(() => route.params.id, async (next_id, previous_id) => {
 
 .series-home__detail {
     grid-column: 1 / -1;
-    min-height: 280px;
+    height: clamp(320px, 50vh, 480px);
     padding: 4px 8px 12px;
     border: 1px solid rgb(var(--v-theme-background-lighten-2));
     border-radius: 10px;
     background: rgb(var(--v-theme-background));
+    overflow-y: auto;
 }
 
 .series-home__pagination {
