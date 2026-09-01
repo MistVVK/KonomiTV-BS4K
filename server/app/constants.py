@@ -860,6 +860,20 @@ NICONICO_TOKEN_FERNET_KEY = base64.urlsafe_b64encode(
 # ニコニコ OAuth トークンの暗号化に使う Fernet のインスタンス
 NICONICO_TOKEN_FERNET = Fernet(NICONICO_TOKEN_FERNET_KEY)
 
+# 暗号化された Bangumi 個人アクセストークンの接頭辞
+BANGUMI_ACCESS_TOKEN_ENCRYPTION_PREFIX = 'enc:'
+# Bangumi 個人アクセストークンの暗号化に使う Fernet の暗号化キー
+BANGUMI_ACCESS_TOKEN_FERNET_KEY = base64.urlsafe_b64encode(
+    hashlib.sha256(f'bangumi:{JWT_SECRET_KEY}'.encode()).digest(),
+)
+# Bangumi 個人アクセストークンの暗号化に使う Fernet のインスタンス
+BANGUMI_ACCESS_TOKEN_FERNET = Fernet(BANGUMI_ACCESS_TOKEN_FERNET_KEY)
+
+# Bangumi API だけが要求する User-Agent。他の外部 API の既定ヘッダーとは混ぜない。
+BANGUMI_REQUEST_HEADERS: dict[str, str] = {
+    'User-Agent': f'MistVVK/KonomiTV-BS4K/{BS4K_VERSION} (https://github.com/MistVVK/KonomiTV-BS4K)',
+}
+
 # パスワードハッシュ化のための設定
 PASSWORD_CONTEXT = CryptContext(
     schemes = ['bcrypt'],

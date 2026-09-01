@@ -26,7 +26,14 @@ class Series(TortoiseModel):
 
     id = fields.IntField(pk=True)
     canonical_key = cast(TortoiseField[str | None], fields.CharField(64, null=True, unique=True))
+    # SeriesIndexer の完全一致キー。既存 Series は NULL のまま Resolver が canonical_key を埋める。
+    normalized_title = cast(TortoiseField[str | None], fields.CharField(512, null=True, unique=True))
     wikipedia_page_id = cast(TortoiseField[int | None], fields.IntField(null=True, unique=True))
+    bangumi_subject_id = cast(TortoiseField[int | None], fields.IntField(null=True, unique=True))
+    bangumi_subject_name = cast(TortoiseField[str | None], fields.TextField(null=True))
+    bangumi_subject_name_cn = cast(TortoiseField[str | None], fields.TextField(null=True))
+    bangumi_subject_summary = cast(TortoiseField[str | None], fields.TextField(null=True))
+    bangumi_subject_image_url = cast(TortoiseField[str | None], fields.TextField(null=True))
     title = fields.TextField()
     description = fields.TextField()
     genres = cast(TortoiseField[list[Genre]], fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore

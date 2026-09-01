@@ -54,6 +54,8 @@ class RecordedProgram(TortoiseModel):
     series_title = cast(TortoiseField[str | None], fields.TextField(null=True))
     episode_number = cast(TortoiseField[str | None], fields.CharField(255, null=True))
     subtitle = cast(TortoiseField[str | None], fields.TextField(null=True))
+    bangumi_subject_id = cast(TortoiseField[int | None], fields.IntField(null=True))
+    bangumi_episode_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     description = fields.TextField()
     detail = cast(TortoiseField[dict[str, str]], fields.JSONField(default={}, encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
     start_time = fields.DatetimeField()

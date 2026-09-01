@@ -47,6 +47,7 @@ class SeriesEpisode(TortoiseModel):
     series_id: int
     season_number = fields.IntField()
     episode_number = fields.DecimalField(max_digits=10, decimal_places=3)
+    bangumi_episode_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     recorded_programs: fields.ReverseRelation[RecordedProgram]
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)

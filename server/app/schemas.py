@@ -321,6 +321,11 @@ class RecordedVideo(PydanticModel):
             return 'PQ'
         return color_transfer
 
+    @computed_field
+    @property
+    def playback_completion_threshold(self) -> float:
+        return GetPlaybackCompletionThreshold(self.duration, self.cm_sections)
+
 
 class RecordedPlaybackIndex(PydanticModel):
     status: Literal['Pending', 'Analyzing', 'Ready', 'Failed']
@@ -659,6 +664,39 @@ class CMSection(TypedDict):
     start_time: float
     end_time: float
 
+
+def GetPlaybackCompletionThreshold(duration: float, cm_sections: list[CMSection] | None) -> float:
+    """録画番組を視聴完了とみなす再生位置を算出する。
+
+    Args:
+        duration (float): 録画ファイル全体の再生時間 (秒)。
+        cm_sections (list[CMSection] | None): 検出済みの CM 区間。
+
+    Returns:
+        float: 録画先頭基準の視聴完了位置 (秒)。
+    """
+
+    normalized_sections: list[CMSection] = []
+    for section in cm_sections or []:
+        start_time = max(0.0, min(float(section['start_time']), duration))
+        end_time = max(0.0, min(float(section['end_time']), duration))
+        if start_time >= end_time:
+            continue
+        normalized_sections.append(CMSection(start_time=start_time, end_time=end_time))
+    normalized_sections.sort(key=lambda section: (section['start_time'], section['end_time']))
+
+    merged_sections: list[CMSection] = []
+    for section in normalized_sections:
+        previous_section = merged_sections[-1] if len(merged_sections) > 0 else None
+        if previous_section is not None and section['start_time'] - previous_section['end_time'] < 60.0:
+            previous_section['end_time'] = max(previous_section['end_time'], section['end_time'])
+            continue
+        merged_sections.append(section)
+
+    if len(merged_sections) > 0:
+        return max(merged_sections[-1]['start_time'] - 3 * 60, 0.0)
+    return max(duration, 0.0) * 0.9
+
 class ThumbnailInfo(TypedDict):
     version: int
     representative: ThumbnailImageInfo
@@ -766,6 +804,8 @@ class RecordedProgram(PydanticModel):
     series_title: str | None = None  # 番組タイトル解析に成功した場合のみセット
     episode_number: str | None = None  # 番組タイトル解析に成功した場合のみセット
     subtitle: str | None = None  # 番組タイトル解析に成功した場合のみセット
+    bangumi_subject_id: int | None = None  # Bangumi 条目との照合に成功した場合のみセット
+    bangumi_episode_id: int | None = None  # Bangumi エピソードとの照合に成功した場合のみセット
     description: str = '番組概要を取得できませんでした。'
     detail: dict[str, str] = {}
     start_time: datetime
@@ -791,6 +831,11 @@ class Series(PydanticModel):
     title: str
     description: str
     genres: list[Genre]
+    bangumi_subject_id: int | None = None
+    bangumi_subject_name: str | None = None
+    bangumi_subject_name_cn: str | None = None
+    bangumi_subject_summary: str | None = None
+    bangumi_subject_image_url: str | None = None
     broadcast_periods: list[SeriesBroadcastPeriod]
     created_at: datetime
     updated_at: datetime
@@ -850,6 +895,22 @@ class AccountLink(PydanticModel):
 
 class Users(RootModel[list[User]]):
     pass
+
+class BangumiAuthRequest(BaseModel):
+    access_token: Annotated[str, Field(min_length=1, max_length=512)]
+
+class BangumiPlaybackProgressRequest(BaseModel):
+    playback_position: Annotated[float, Field(ge=0)]
+    duration: Annotated[float, Field(gt=0)]
+
+class BangumiPlaybackProgressResponse(BaseModel):
+    status: Literal['Completed', 'AlreadyCompleted', 'Pending', 'NotEligible']
+
+class KonomiTVBS4KBangumiProfile(BaseModel):
+    bangumi_user_id: int | None
+    bangumi_user_name: str | None
+    bangumi_user_nickname: str | None
+    bangumi_user_avatar_url: str | None
 
 # ***** Twitter / Bluesky 連携 *****
 
