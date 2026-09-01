@@ -12,31 +12,47 @@
                     ]" />
                     <h1 class="series-onair__title">放送中</h1>
                     <p class="series-onair__lead">EPG のいま放送中ではなく、録画から推定した今クール相当の週間レギュラーです。</p>
-                    <div v-if="is_loading" class="series-onair__state">
+                    <div v-if="isLoading" class="series-onair__state">
                         <v-progress-circular color="primary" indeterminate size="30" width="3" />
                     </div>
                     <div v-else class="series-onair__grid">
-                        <section v-for="day in display_days" :key="day.weekday" class="series-onair__day"
-                            :style="{'--skeleton-count': String(Math.max(3, day.slots.length))}">
-                            <h2 class="series-onair__weekday">{{WEEKDAY_LABELS[day.weekday]}}</h2>
-                            <button v-for="slot in day.slots" :key="`${slot.series.id}-${slot.hour}-${slot.minute}`"
+                        <template v-for="day in displayDays" :key="day.weekday">
+                            <h2 class="series-onair__weekday"
+                                :style="{gridColumn: String(day.weekday + 1), gridRow: '1'}">
+                                {{WEEKDAY_LABELS[day.weekday]}}
+                            </h2>
+                            <div v-if="day.slots.length === 0" class="series-onair__empty"
+                                :style="{gridColumn: String(day.weekday + 1), gridRow: '2'}">
+                                該当なし
+                            </div>
+                            <button v-for="(slot, slotIndex) in day.slots"
+                                :key="`${slot.series.id}-${slot.hour}-${slot.minute}`"
                                 type="button" class="series-onair__card"
+                                :style="{
+                                    gridColumn: String(day.weekday + 1),
+                                    gridRow: String(cardGridRow(slotIndex)),
+                                }"
                                 :class="{
                                     'series-onair__card--featured': slot.is_featured,
-                                    'series-onair__card--expanded': expanded_id === slot.series.id,
+                                    'series-onair__card--expanded': isSlotExpanded(slot.series.id, day.weekday, slotIndex),
                                 }"
-                                @click="toggleExpand(slot.series.id)">
-                                <div class="series-onair__time">{{formatSlotLabel(slot.hour, slot.minute)}}</div>
+                                :aria-expanded="isSlotExpanded(slot.series.id, day.weekday, slotIndex)"
+                                @click="toggleExpand(slot.series.id, day.weekday, slotIndex)">
+                                <div class="series-onair__card-header">
+                                    <span class="series-onair__time">{{formatSlotLabel(slot.hour, slot.minute)}}</span>
+                                    <span v-if="slot.is_featured" class="series-onair__featured">注目</span>
+                                </div>
                                 <div class="series-onair__name">{{slot.series.title}}</div>
                                 <div class="series-onair__meta">
-                                    未録画 {{slot.series.unrecorded_count}}
-                                    ・一部 {{slot.series.partial_count}}
+                                    <span>未録画 {{slot.series.unrecorded_count}}</span>
+                                    <span>部分録画 {{slot.series.partial_count}}</span>
                                 </div>
                             </button>
-                            <div v-if="expandedDayId(day.weekday) !== null" class="series-onair__detail">
-                                <SeriesEpisodeList :seriesId="expandedDayId(day.weekday)!" />
+                            <div v-if="expandedSlot?.weekday === day.weekday" class="series-onair__detail"
+                                :style="{gridRow: String(expandedSlot.slotIndex + 3)}">
+                                <SeriesEpisodeList :seriesId="expandedSlot.seriesId" />
                             </div>
-                        </section>
+                        </template>
                     </div>
                 </div>
             </div>
@@ -60,78 +76,100 @@ const route = useRoute();
 const router = useRouter();
 
 const days = ref<ISeriesOnAirDay[]>([]);
-const is_loading = ref(true);
-const expanded_id = ref<number | null>(null);
+const isLoading = ref(true);
+const expandedSlot = ref<{seriesId: number; weekday: number; slotIndex: number} | null>(null);
 
 type DisplayDay = {
     weekday: number;
     slots: ISeriesOnAirSlot[];
 };
 
-const display_days = computed((): DisplayDay[] => {
+const displayDays = computed((): DisplayDay[] => {
     const grouped: DisplayDay[] = WEEKDAY_LABELS.map((_, weekday) => ({weekday, slots: []}));
     for (const day of days.value) {
         for (const slot of day.slots) {
-            const display_weekday = toDisplayWeekday(slot.weekday, slot.hour);
-            grouped[display_weekday].slots.push(slot);
+            const displayWeekday = toDisplayWeekday(slot.weekday, slot.hour);
+            grouped[displayWeekday].slots.push(slot);
         }
     }
     for (const day of grouped) {
         day.slots.sort((left, right) => {
-            const left_hour = toDisplayHour(left.hour);
-            const right_hour = toDisplayHour(right.hour);
-            if (left_hour !== right_hour) return left_hour - right_hour;
+            const leftHour = toDisplayHour(left.hour);
+            const rightHour = toDisplayHour(right.hour);
+            if (leftHour !== rightHour) return leftHour - rightHour;
             return left.minute - right.minute;
         });
     }
     return grouped;
 });
 
-const expandedDayId = (weekday: number): number | null => {
-    if (expanded_id.value === null) return null;
-    const day = display_days.value.find((item) => item.weekday === weekday);
-    if (day === undefined) return null;
-    return day.slots.some((slot) => slot.series.id === expanded_id.value) ? expanded_id.value : null;
+// 詳細行より下のスロットだけを 1 行送って、7 曜日すべての行位置を揃える。
+const cardGridRow = (slotIndex: number): number => {
+    const detailOffset = expandedSlot.value !== null && slotIndex > expandedSlot.value.slotIndex ? 1 : 0;
+    return slotIndex + 2 + detailOffset;
+};
+
+const isSlotExpanded = (seriesId: number, weekday: number, slotIndex: number): boolean => {
+    return expandedSlot.value?.seriesId === seriesId
+        && expandedSlot.value.weekday === weekday
+        && expandedSlot.value.slotIndex === slotIndex;
 };
 
 const fetchOnAir = async () => {
-    is_loading.value = true;
+    isLoading.value = true;
     const result = await Series.fetchOnAirSeries();
     days.value = result?.days ?? [];
-    is_loading.value = false;
+    isLoading.value = false;
 };
 
-const toggleExpand = async (series_id: number) => {
-    const next_id = expanded_id.value === series_id ? null : series_id;
-    expanded_id.value = next_id;
-    const scroll_y = window.scrollY;
+const syncExpandedFromRoute = async () => {
+    const seriesIdText = typeof route.params.id === 'string' ? route.params.id : '';
+    const seriesId = Number(seriesIdText);
+    if (Number.isInteger(seriesId) && seriesId >= 1) {
+        // 同じシリーズが複数曜日にある場合、カード操作で選んだ位置は URL 更新後も維持する。
+        if (expandedSlot.value?.seriesId === seriesId) return;
+        for (const day of displayDays.value) {
+            const slotIndex = day.slots.findIndex((slot) => slot.series.id === seriesId);
+            if (slotIndex >= 0) {
+                expandedSlot.value = {seriesId, weekday: day.weekday, slotIndex};
+                return;
+            }
+        }
+    }
+    expandedSlot.value = null;
+    if (seriesIdText !== '') {
+        await router.replace('/series/on-air');
+    }
+};
+
+const toggleExpand = async (seriesId: number, weekday: number, slotIndex: number) => {
+    const nextSlot = isSlotExpanded(seriesId, weekday, slotIndex) ? null : {seriesId, weekday, slotIndex};
+    expandedSlot.value = nextSlot;
+    const scrollY = window.scrollY;
     await router.replace({
-        path: next_id === null ? '/series/on-air' : `/series/on-air/${next_id}`,
+        path: nextSlot === null ? '/series/on-air' : `/series/on-air/${nextSlot.seriesId}`,
     });
     await nextTick();
-    window.scrollTo({top: scroll_y});
+    window.scrollTo({top: scrollY});
 };
 
 onMounted(async () => {
     await fetchOnAir();
-    const series_id_text = typeof route.params.id === 'string' ? route.params.id : '';
-    if (series_id_text !== '') {
-        expanded_id.value = Number(series_id_text);
-    }
+    await syncExpandedFromRoute();
 });
 
-watch(() => route.params.id, (next_id) => {
-    if (typeof next_id === 'string' && next_id !== '') {
-        expanded_id.value = Number(next_id);
-        return;
-    }
-    expanded_id.value = null;
+watch(() => route.params.id, async () => {
+    await syncExpandedFromRoute();
 });
 
 </script>
 <style lang="scss" scoped>
 
 .series-onair-wrapper {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    min-width: 0;
     padding-top: 48px;
     @include smartphone-horizontal {
         padding-top: 0;
@@ -140,6 +178,8 @@ watch(() => route.params.id, (next_id) => {
 }
 
 .series-onair {
+    width: 100%;
+    min-width: 0;
     max-width: 1280px;
     margin: 0 auto;
     padding: 16px 16px 80px;
@@ -166,6 +206,8 @@ watch(() => route.params.id, (next_id) => {
 .series-onair__grid {
     display: grid;
     grid-template-columns: repeat(7, minmax(0, 1fr));
+    grid-auto-flow: row;
+    align-items: start;
     gap: 10px;
     @include tablet-vertical {
         grid-template-columns: 1fr;
@@ -175,25 +217,44 @@ watch(() => route.params.id, (next_id) => {
     }
 }
 
-.series-onair__day {
-    min-height: calc(72px * var(--skeleton-count, 3));
+.series-onair__weekday {
+    margin: 0;
+    font-size: 15px;
     @include tablet-vertical {
-        min-height: 0;
+        grid-column: 1 !important;
+        grid-row: auto !important;
+        margin-top: 6px;
     }
     @include smartphone-vertical {
-        min-height: 0;
+        grid-column: 1 !important;
+        grid-row: auto !important;
+        margin-top: 6px;
     }
 }
 
-.series-onair__weekday {
-    margin: 0 0 8px;
-    font-size: 15px;
+.series-onair__empty {
+    min-height: 82px;
+    padding: 12px 8px;
+    border: 1px dashed rgb(var(--v-theme-background-lighten-2));
+    border-radius: 8px;
+    color: rgb(var(--v-theme-text-darken-1));
+    font-size: 11px;
+    @include tablet-vertical {
+        grid-column: 1 !important;
+        grid-row: auto !important;
+        min-height: 0;
+    }
+    @include smartphone-vertical {
+        grid-column: 1 !important;
+        grid-row: auto !important;
+        min-height: 0;
+    }
 }
 
 .series-onair__card {
     display: block;
     width: 100%;
-    margin-bottom: 8px;
+    min-height: 82px;
     padding: 8px;
     border: 1px solid rgb(var(--v-theme-background-lighten-2));
     border-radius: 8px;
@@ -208,11 +269,36 @@ watch(() => route.params.id, (next_id) => {
     &--expanded {
         background: rgb(var(--v-theme-background-lighten-2));
     }
+
+    @include tablet-vertical {
+        grid-column: 1 !important;
+        grid-row: auto !important;
+    }
+    @include smartphone-vertical {
+        grid-column: 1 !important;
+        grid-row: auto !important;
+    }
+}
+
+.series-onair__card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px;
 }
 
 .series-onair__time {
     color: rgb(var(--v-theme-primary));
     font-size: 12px;
+    font-weight: bold;
+}
+
+.series-onair__featured {
+    padding: 1px 5px;
+    border-radius: 999px;
+    background: rgb(var(--v-theme-primary));
+    color: rgb(var(--v-theme-on-primary));
+    font-size: 9.5px;
     font-weight: bold;
 }
 
@@ -224,19 +310,27 @@ watch(() => route.params.id, (next_id) => {
 }
 
 .series-onair__meta {
+    display: flex;
+    flex-direction: column;
     margin-top: 2px;
     color: rgb(var(--v-theme-text-darken-1));
     font-size: 11px;
 }
 
 .series-onair__detail {
-    min-height: 280px;
-    margin: 8px 0 12px;
-    padding: 4px;
+    grid-column: 1 / -1;
+    height: clamp(320px, 50vh, 480px);
+    padding: 4px 8px 12px;
     border: 1px solid rgb(var(--v-theme-background-lighten-2));
     border-radius: 8px;
+    overflow-y: auto;
     @include tablet-vertical {
-        grid-column: auto;
+        grid-column: 1 !important;
+        grid-row: auto !important;
+    }
+    @include smartphone-vertical {
+        grid-column: 1 !important;
+        grid-row: auto !important;
     }
 }
 
