@@ -204,6 +204,7 @@ export interface IRecordedVideo {
     audio_track_timeline: IAudioTrackTimelineEntry[];
     subtitle_tracks: ISubtitleTrack[];
     cm_sections: { start_time: number; end_time: number; }[] | null;
+    playback_completion_threshold: number;
     cm_analysis_status: 'Pending' | 'Analyzing' | 'Completed' | 'Failed' | 'Unsupported' | 'Excluded' | 'Interrupted' | null;
     cm_analysis_error_code: string | null;
     cm_analysis_finished_at: string | null;
@@ -287,6 +288,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     audio_track_timeline: [],
     subtitle_tracks: [],
     cm_sections: null,
+    playback_completion_threshold: 0,
     cm_analysis_status: null,
     cm_analysis_error_code: null,
     cm_analysis_finished_at: null,
@@ -317,6 +319,8 @@ export interface IRecordedProgram {
     series_title: string | null;
     episode_number: string | null;
     subtitle: string | null;
+    bangumi_subject_id: number | null;
+    bangumi_episode_id: number | null;
     description: string;
     detail: { [key: string]: string };
     start_time: string;
@@ -349,6 +353,8 @@ export const IRecordedProgramDefault: IRecordedProgram = {
     series_title: null,
     episode_number: null,
     subtitle: null,
+    bangumi_subject_id: null,
+    bangumi_episode_id: null,
     description: '取得中…',
     detail: {},
     start_time: '2000-01-01T00:00:00+09:00',

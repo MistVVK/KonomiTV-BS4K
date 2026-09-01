@@ -8,7 +8,8 @@
             <span class="ml-2">録画シリーズ</span>
         </h2>
         <div class="settings__description">
-            録画のタイトル・概要からシリーズを判定し、同じ作品の録画をまとめます。<br>
+            録画のタイトルから HonomiTV と同じ確定規則でシリーズを付けます。付かなければ所属しません。<br>
+            話数が単一の正整数で取れないときだけ、既存の話数 Web 検索を使います。<br>
             この設定と判定結果はすべてのユーザーと端末で共有されます。管理者だけが変更できます。<br>
         </div>
 
@@ -35,21 +36,21 @@
             <div class="settings__item settings__item--switch">
                 <label class="settings__item-heading" for="recorded_series_enabled">新しい録画を自動でシリーズ判定する</label>
                 <label class="settings__item-label" for="recorded_series_enabled">
-                    有効にすると、新しい録画の登録後にローカル情報からシリーズを自動判定します。<br>
-                    無効にしても保存済みのシリーズ情報は維持され、下のボタンから既存録画を手動判定できます。<br>
+                    有効にすると、新しい録画の登録後に Indexer がシリーズを自動判定します。<br>
+                    無効にしても保存済みのシリーズ情報は維持されます。<br>
                 </label>
                 <v-switch id="recorded_series_enabled" class="settings__item-switch" color="primary" hide-details
                     v-model="settings.enabled" />
             </div>
             <div class="settings__item settings__item--switch">
                 <label class="settings__item-heading" for="recorded_series_ai_enabled">
-                    AI でシリーズ名・話数・話名を生成する
+                    AI で話数 Web 検索と Bangumi 照合をする
                 </label>
                 <label class="settings__item-label" for="recorded_series_ai_enabled">
-                    有効時、Manual / Rule 以外は AI が作品名・シーズン話数・話名を一括生成します。<br>
-                    既存シリーズがある場合は、サーバーが ID・Wikipedia・正規化キー・類似度で合流します。<br>
-                    既存 Series の表示名は AI では書き換えません。Wikipedia と既存シリーズは参考情報として渡します。<br>
-                    無効時は Wikipedia と AI へ接続せず、従来のローカル情報・EPG 経路で判定します。<br>
+                    有効時、話数が単一の正整数で取れない録画だけ Web 検索します。<br>
+                    Bangumi の作品候補選択にも同じバックエンドを使います。<br>
+                    シリーズの所属は Indexer が決め、AI では書き換えません。<br>
+                    無効時は Web 検索と Bangumi 候補の AI 選択をしません。<br>
                     API キーと保存済みの判定結果は削除されません。<br>
                 </label>
                 <v-switch id="recorded_series_ai_enabled" class="settings__item-switch" color="primary" hide-details
@@ -61,7 +62,7 @@
                     AI が有効で Series が確定している話数不明録画は、接続確認済みのバックエンドで Web 検索します。<br>
                     Web 検索・出力形式・公開 URL の根拠を確認できた結果は、AI の信頼度表示にかかわらず自動採用します。<br>
                     根拠不足・検索失敗・不正な応答では現在の正本を変更しません。<br>
-                    既存録画は下の一括話数判定、または録画シリーズ管理から明示的に検索できます。<br>
+                    既存録画は下の一括話数判定から検索できます。<br>
                 </div>
             </div>
 
@@ -72,10 +73,10 @@
             <div class="settings__item">
                 <div class="settings__item-heading">バックエンド</div>
                 <div class="settings__item-label">
-                    AI によるシリーズ情報生成と話数検索に最初に使用するバックエンドを選択します。<br>
+                    話数 Web 検索と Bangumi 候補選択に最初に使うバックエンドを選びます。<br>
                     OpenCode は「設定 → AIバックエンド」で登録した service を使います。<br>
                     ACP / Codex・Grok はホスト上の CLI を起動します。<br>
-                    シリーズ情報生成と話数 Web 検索は、AIバックエンド画面から個別に接続確認できます。<br>
+                    シリーズの所属判定には使いません。接続確認は AIバックエンド画面から行えます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -125,8 +126,8 @@
             <div class="settings__item">
                 <div class="settings__item-heading">失敗時ポリシー</div>
                 <div class="settings__item-label">
-                    主系 AI が技術的に失敗したとき、または Unresolved / InsufficientEvidence のときにどうするかを決めます。<br>
-                    NotSeries / NoPublishedNumber / NotNumbered など正常な判定結果では切り替えません。<br>
+                    主系 AI が技術的に失敗したとき、または InsufficientEvidence のときにどうするかを決めます。<br>
+                    NoPublishedNumber / NotNumbered など正常な判定結果では切り替えません。<br>
                     失敗時ポリシーによる AI 試行は最大 2 回です。OpenCode 内部の出力形式補修は別に行われます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
@@ -195,20 +196,10 @@
                             <span>録画総数</span><strong>{{status.total.toLocaleString()}}</strong>
                         </div>
                         <div class="recorded-series-status-card">
-                            <span>シリーズ確定</span><strong>{{status.resolved.toLocaleString()}}</strong>
+                            <span>シリーズ所属</span><strong>{{status.assigned.toLocaleString()}}</strong>
                         </div>
                         <div class="recorded-series-status-card">
-                            <span>単発番組</span><strong>{{status.not_series.toLocaleString()}}</strong>
-                        </div>
-                        <div class="recorded-series-status-card">
-                            <span>未判定</span><strong>{{status.pending.toLocaleString()}}</strong>
-                        </div>
-                        <div class="recorded-series-status-card">
-                            <span>要確認</span><strong>{{status.needs_review.toLocaleString()}}</strong>
-                        </div>
-                        <div class="recorded-series-status-card"
-                            :class="{'recorded-series-status-card--error': status.failed > 0}">
-                            <span>失敗</span><strong>{{status.failed.toLocaleString()}}</strong>
+                            <span>未所属</span><strong>{{status.unassigned.toLocaleString()}}</strong>
                         </div>
                     </div>
                 </div>
@@ -239,7 +230,6 @@
                 <div class="settings__item">
                     <div class="settings__item-heading">最終実行</div>
                     <div class="settings__item-label">
-                        シリーズ判定: {{formatLastRunAt(status.last_run_at)}}<br>
                         話数判定: {{formatLastRunAt(status.episode_last_run_at)}}<br>
                         OpenCode の月次利用量は
                         <router-link to="/settings/server/ai-backends">AIバックエンド</router-link>
@@ -252,43 +242,24 @@
             </div>
 
             <div class="settings__item">
-                <div class="settings__item-heading">既存録画をシリーズ判定</div>
+                <div class="settings__item-heading">既存録画へ Indexer を再適用</div>
                 <div class="settings__item-label">
-                    未判定の録画を対象に、ローカル照合と保存済みの AI バックエンドを利用してシリーズを判定します。<br>
-                    Manual / Rule の確定結果は再利用し、それ以外の録画では AI による判定と利用量が発生します。<br>
-                    実行前に <router-link to="/settings/server/ai-backends">AIバックエンド</router-link>を設定してください。<br>
+                    保存済みの全録画へ、HonomiTV と同じ確定規則を再適用します。AI は使いません。<br>
+                    付かなければ所属を外します。自動判定が無効のときは実行できません。<br>
                 </div>
                 <div v-if="series_backfill_unavailable_message !== null"
                     class="settings__item-label mt-2 text-warning">
                     {{series_backfill_unavailable_message}}
                 </div>
             </div>
-            <div class="settings__item settings__item--switch">
-                <label class="settings__item-heading" for="recorded_series_force_backfill">確定済みも再判定する</label>
-                <label class="settings__item-label" for="recorded_series_force_backfill">
-                    有効にすると、シリーズ確定・単発番組を含むすべての録画を最新の設定で再判定します。<br>
-                    既存の判定結果が更新され、AI API の利用が再度発生する場合があります。<br>
-                    新しい確定結果を得られない場合は、最後に確定したシリーズ分けを保持します。<br>
-                </label>
-                <v-switch id="recorded_series_force_backfill" class="settings__item-switch" color="primary" hide-details
-                    :disabled="is_backfill_running || is_episode_backfill_running"
-                    v-model="force_backfill" />
-            </div>
             <div class="settings__item">
-                <v-progress-linear v-if="is_backfill_running" class="mt-4" color="primary" height="7" rounded
-                    :indeterminate="backfill_progress === null"
-                    :model-value="backfill_progress ?? undefined" />
-                <div v-if="backfill_task !== null" class="settings__item-label mt-2">
-                    {{stageLabel(backfill_task.stage)}}
-                    <template v-if="backfill_progress !== null">・{{backfill_progress.toFixed(0)}}%</template>
-                </div>
                 <v-btn class="settings__save-button mt-4" color="background-lighten-2" variant="flat"
                     :loading="is_starting_backfill"
                     :disabled="is_backfill_running || is_episode_backfill_running ||
                         is_series_backfill_available === false"
                     @click="startBackfill()">
                     <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="22px" />
-                    {{force_backfill ? 'すべての録画を再判定' : '既存録画の判定を開始'}}
+                    既存録画へ規則を再適用
                 </v-btn>
             </div>
 
@@ -298,21 +269,8 @@
                 <div class="settings__item-label">
                     Series 所属済みで、話数が未処理・ローカル判定で不明・移行データで要確認の既存録画を、<br>
                     保存済みの AI 設定で順番に Web 検索します。<br>
-                    手動で訂正した話数は変更せず、月次の AI 利用上限に達した時点で残りを保留します。<br>
+                    Indexer が単一の正整数を取れた録画は検索しません。<br>
                 </div>
-            </div>
-            <div class="settings__item settings__item--switch">
-                <label class="settings__item-heading" for="recorded_series_force_episode_backfill">
-                    判定済みの話数も再検索する
-                </label>
-                <label class="settings__item-label" for="recorded_series_force_episode_backfill">
-                    有効にすると、AI・ローカル情報・EPG・移行データで確定済みの話数も最新の設定で再検索します。<br>
-                    話数番号なし・要確認・失敗の結果も再検索しますが、手動で訂正した話数は対象外です。<br>
-                </label>
-                <v-switch id="recorded_series_force_episode_backfill" class="settings__item-switch"
-                    color="primary" hide-details
-                    :disabled="is_episode_backfill_running || is_backfill_running"
-                    v-model="force_episode_backfill" />
             </div>
             <div class="settings__item">
                 <v-progress-linear v-if="is_episode_backfill_running" class="mt-4" color="primary" height="7" rounded
@@ -329,7 +287,7 @@
                     :disabled="is_episode_backfill_running || is_backfill_running"
                     @click="startEpisodeBackfill()">
                     <Icon icon="fluent:globe-search-20-filled" class="mr-2" width="22px" />
-                    {{force_episode_backfill ? '判定済みを含めて話数を再検索' : '既存録画の話数判定を開始'}}
+                    既存録画の話数判定を開始
                 </v-btn>
             </div>
 
@@ -340,8 +298,7 @@
                 <div class="settings__item">
                     <div class="settings__item-heading">録画シリーズ管理</div>
                     <div class="settings__item-label">
-                        判定済みのシリーズを検索し、表示するタイトル・説明と、録画ごとのシーズン・話数を編集できます。<br>
-                        録画ごとの所属先は、各録画の再生画面にある「シリーズを訂正」から変更できます。<br>
+                    判定済みのシリーズを検索し、表示するタイトルと説明を確認できます。<br>
                     </div>
                     <v-btn class="settings__save-button mt-4" variant="flat"
                         to="/settings/server/recorded-series/series">
@@ -349,7 +306,54 @@
                     </v-btn>
                 </div>
             </div>
+
+            <div class="settings__content">
+                <v-divider class="mt-7"></v-divider>
+                <div class="settings__content-heading">
+                    <Icon icon="fluent:movies-and-tv-20-filled" width="22px" />
+                    <span class="ml-2">Bangumi 連携（共有・管理者1件）</span>
+                </div>
+                <div class="settings__item-label mb-4">
+                    管理者が登録した1件の個人アクセストークンを、全ユーザーの看過同期に使います。<br>
+                    トークンはサーバーへ暗号化して保存され、クライアントには返りません。<br>
+                </div>
+                <div class="bangumi-account bangumi-account--anonymous" v-if="bangumi_profile === null || bangumi_profile.bangumi_user_id === null">
+                    <div class="bangumi-account__info">
+                        <div class="bangumi-account__info-name">Bangumi アカウントと連携していません</div>
+                    </div>
+                    <v-btn color="secondary" variant="flat" height="42" @click="openBangumiLinkDialog()">連携する</v-btn>
+                </div>
+                <div class="bangumi-account" v-else>
+                    <div class="bangumi-account__info">
+                        <div class="bangumi-account__info-name">{{bangumi_profile.bangumi_user_nickname}} と連携しています</div>
+                        <span class="bangumi-account__info-description">@{{bangumi_profile.bangumi_user_name}}</span>
+                    </div>
+                    <div class="bangumi-account__actions">
+                        <v-btn color="secondary" variant="outlined" height="42" @click="openBangumiLinkDialog()">再連携</v-btn>
+                        <v-btn color="secondary" variant="flat" height="42" @click="logoutBangumiAccount()">連携解除</v-btn>
+                    </div>
+                </div>
+            </div>
         </template>
+
+        <v-dialog width="550" v-model="bangumi_link_dialog">
+            <v-card class="px-2 py-2">
+                <v-card-title class="d-flex justify-center pt-6 font-weight-bold">Bangumi アカウントと連携</v-card-title>
+                <v-card-text class="px-6 pt-4 pb-2">
+                    <v-text-field color="primary" variant="outlined" label="個人アクセストークン" autocomplete="off"
+                        :type="bangumi_token_showing ? 'text' : 'password'"
+                        :append-inner-icon="bangumi_token_showing ? 'fa-solid:eye-slash' : 'fa-solid:eye'"
+                        v-model="bangumi_access_token" @click:appendInner="bangumi_token_showing = !bangumi_token_showing">
+                    </v-text-field>
+                </v-card-text>
+                <v-card-actions class="px-6 pb-5">
+                    <v-spacer></v-spacer>
+                    <v-btn variant="text" @click="closeBangumiLinkDialog()">キャンセル</v-btn>
+                    <v-btn color="secondary" variant="flat" :loading="bangumi_linking"
+                        :disabled="bangumi_access_token.trim() === ''" @click="loginBangumiAccount()">連携する</v-btn>
+                </v-card-actions>
+            </v-card>
+        </v-dialog>
 
         <v-dialog :model-value="backfill_confirmation_dialog" :persistent="is_starting_selected_backfill"
             max-width="560" @update:model-value="updateBackfillConfirmationDialog">
@@ -378,6 +382,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue';
 import Message from '@/message';
 import AIBackend, { type AIAuthMode, type IACPBackendCredentialStatus } from '@/services/AIBackend';
 import AnalysisTasks, { type IAnalysisTaskExecution } from '@/services/AnalysisTasks';
+import Bangumi, { type IBangumiProfile } from '@/services/Bangumi';
 import RecordedSeries, {
     type AIBackendKind,
     type AIFailureRecoveryStrategy,
@@ -432,15 +437,17 @@ const is_loading = ref(true);
 const is_disabled = ref(true);
 const is_saving = ref(false);
 const is_starting_backfill = ref(false);
-const is_monitoring_backfill = ref(false);
 const is_starting_episode_backfill = ref(false);
 const is_monitoring_episode_backfill = ref(false);
 const is_refreshing_status = ref(false);
 const authorization_error = ref<'LoginRequired' | 'AdminRequired' | 'UserUnavailable' | null>(null);
-const backfill_task = ref<IAnalysisTaskExecution | null>(null);
+const bangumi_profile = ref<IBangumiProfile | null>(null);
+const bangumi_link_dialog = ref(false);
+const bangumi_access_token = ref('');
+const bangumi_token_showing = ref(false);
+const bangumi_linking = ref(false);
 const episode_backfill_task = ref<IAnalysisTaskExecution | null>(null);
-const force_backfill = ref(false);
-const force_episode_backfill = ref(false);
+
 type BackfillConfirmationAction = 'Series' | 'Episode';
 const backfill_confirmation_dialog = ref(false);
 const backfill_confirmation_action = ref<BackfillConfirmationAction | null>(null);
@@ -450,7 +457,6 @@ const backfill_confirmation_message = ref('');
 const is_form_dense = Utils.isSmartphoneHorizontal();
 const user_store = useUserStore();
 
-let backfill_abort_controller: AbortController | null = null;
 let episode_backfill_abort_controller: AbortController | null = null;
 let status_polling_timer: number | null = null;
 
@@ -540,7 +546,7 @@ const is_settings_action_running = computed(() =>
     is_saving.value,
 );
 const is_backfill_running = computed(() =>
-    is_starting_backfill.value || is_monitoring_backfill.value || status.value?.is_running === true,
+    is_starting_backfill.value || status.value?.is_running === true,
 );
 const is_episode_backfill_running = computed(() =>
     is_starting_episode_backfill.value ||
@@ -555,30 +561,15 @@ const is_starting_selected_backfill = computed(() => {
 const backfill_confirmation_title = computed(() =>
     backfill_confirmation_action.value === 'Episode' ?
         '既存録画の一括話数判定' :
-        '既存録画をシリーズ判定',
+        '既存録画へ Indexer を再適用',
 );
 const series_backfill_unavailable_message = computed(() => {
-    if (saved_settings.value?.ai_backend_auth_configured !== true) {
-        return 'AIバックエンドが未設定のため、シリーズ判定を開始できません。';
-    }
-    if (saved_settings.value.ai_enabled === false) {
-        return '「AI でシリーズ名・話数・話名を生成する」を有効にして設定を保存してください。';
+    if (saved_settings.value?.enabled === false) {
+        return '「新しい録画を自動でシリーズ判定する」が無効なため、既存録画への再適用を開始できません。';
     }
     return null;
 });
 const is_series_backfill_available = computed(() => series_backfill_unavailable_message.value === null);
-const saved_ai_backend_label = computed(() => {
-    const savedSettings = saved_settings.value;
-    if (savedSettings === null) return '保存済みの AI バックエンド';
-    if (savedSettings.ai_backend === 'OpenCode') {
-        return savedSettings.ai_backend_service_name ?? 'OpenCode';
-    }
-    return savedSettings.ai_backend === 'AcpCodex' ? 'ACP / Codex' : 'ACP / Grok Build';
-});
-const backfill_progress = computed(() => {
-    if (backfill_task.value?.progress === null || backfill_task.value?.progress === undefined) return null;
-    return Math.max(0, Math.min(100, backfill_task.value.progress * 100));
-});
 const episode_backfill_progress = computed(() => {
     if (episode_backfill_task.value?.progress === null || episode_backfill_task.value?.progress === undefined) {
         return null;
@@ -654,7 +645,6 @@ async function refreshStatus(show_error = false): Promise<void> {
     if (
         fetched_status.is_running === false &&
         fetched_status.is_episode_running === false &&
-        is_monitoring_backfill.value === false &&
         is_monitoring_episode_backfill.value === false
     ) {
         stopStatusPolling();
@@ -691,18 +681,17 @@ async function saveSettings(): Promise<void> {
 }
 
 
-/** 既存録画のシリーズ判定を開始する前に、利用量と更新範囲を確認する。 */
+/** 既存録画へ Indexer を再適用する前に、範囲を確認する。 */
 function startBackfill(): void {
     if (is_backfill_running.value || is_episode_backfill_running.value) return;
     if (is_series_backfill_available.value === false) {
-        Message.warning('AIバックエンドを設定してからシリーズ判定を実行してください。');
+        Message.warning('自動判定を有効にしてから既存録画へ規則を再適用してください。');
         return;
     }
     backfill_confirmation_action.value = 'Series';
-    backfill_confirmation_force.value = force_backfill.value;
-    backfill_confirmation_message.value = force_backfill.value ?
-        `「${saved_ai_backend_label.value}」AIバックエンドを利用し、シリーズ確定・単発番組を含むすべての録画を再判定します。既存の判定結果が更新され、録画件数に応じた AI 利用が発生します。続行しますか？` :
-        `「${saved_ai_backend_label.value}」AIバックエンドを利用し、未判定の既存録画をシリーズ判定します。Manual / Rule 以外では、録画件数に応じた AI 利用が発生します。続行しますか？`;
+    backfill_confirmation_force.value = false;
+    backfill_confirmation_message.value =
+        'HonomiTV と同じ確定規則を保存済みの全録画へ再適用します。AI は使いません。付かなければ所属を外します。続行しますか？';
     backfill_confirmation_dialog.value = true;
 }
 
@@ -729,49 +718,25 @@ async function confirmBackfill(): Promise<void> {
     }
 }
 
-/** 既存録画を対象に、バックグラウンドでシリーズ判定を実行する。 */
-async function runBackfill(force: boolean): Promise<void> {
+/** 既存録画へ Indexer の確定規則を再適用する。完了まで API 応答を待つ。 */
+async function runBackfill(_force: boolean): Promise<void> {
 
     is_starting_backfill.value = true;
-    const accepted = await RecordedSeries.startBackfill(force);
+    const accepted = await RecordedSeries.startBackfill(false);
     is_starting_backfill.value = false;
     if (accepted === null) return;
     updateBackfillConfirmationDialog(false);
-
-    status.value = status.value === null ? null : {...status.value, is_running: true};
-    is_monitoring_backfill.value = true;
-    startStatusPolling();
-    Message.info(accepted.reused ? '実行中のシリーズ判定を引き続き監視します。' : '既存録画のシリーズ判定を開始しました。');
-
-    // 同じ画面から再実行した場合に古い監視を残さない。
-    backfill_abort_controller?.abort();
-    backfill_abort_controller = new AbortController();
-    const execution = await AnalysisTasks.waitForCompletion(
-        accepted.execution_id,
-        backfill_abort_controller.signal,
-        task => backfill_task.value = task,
-    );
-    if (backfill_abort_controller.signal.aborted) return;
-
-    is_monitoring_backfill.value = false;
     await refreshStatus();
-    if (execution?.status === 'Succeeded') {
-        Message.success('既存録画のシリーズ判定が完了しました。');
-    } else if (execution?.status === 'Interrupted') {
-        Message.warning('既存録画のシリーズ判定が中断されました。');
-    } else if (execution !== null) {
-        Message.error(`既存録画のシリーズ判定に失敗しました。${execution.error_message ? `\n${execution.error_message}` : ''}`);
-    }
+    Message.success('既存録画へ Indexer の規則を再適用しました。');
 }
 
 /** 既存録画の一括話数判定を開始する前に、利用量と検索範囲を確認する。 */
 function startEpisodeBackfill(): void {
     if (is_episode_backfill_running.value || is_backfill_running.value) return;
     backfill_confirmation_action.value = 'Episode';
-    backfill_confirmation_force.value = force_episode_backfill.value;
-    backfill_confirmation_message.value = force_episode_backfill.value ?
-        '手動訂正を除く判定済みの話数も、最新の AI 設定で再検索します。録画件数に応じて AI API 利用が発生します。続行しますか？' :
-        '話数が未確定の既存録画を、保存済みの AI 設定で Web 検索します。録画件数に応じて AI API 利用が発生します。続行しますか？';
+    backfill_confirmation_force.value = false;
+    backfill_confirmation_message.value =
+        '話数が未確定の既存録画を、保存済みの AI 設定で Web 検索します。Indexer が単一の正整数を取れた録画は検索しません。続行しますか？';
     backfill_confirmation_dialog.value = true;
 }
 
@@ -779,7 +744,7 @@ function startEpisodeBackfill(): void {
 async function runEpisodeBackfill(force: boolean): Promise<void> {
 
     is_starting_episode_backfill.value = true;
-    const accepted = await RecordedSeries.startEpisodeBackfill(force);
+    const accepted = await RecordedSeries.startEpisodeBackfill(false);
     is_starting_episode_backfill.value = false;
     if (accepted === null) return;
     updateBackfillConfirmationDialog(false);
@@ -820,6 +785,37 @@ function formatLastRunAt(value: string | null): string {
     return value === null ? '未実行' : dayjs(value).format('YYYY/M/D HH:mm:ss');
 }
 
+function openBangumiLinkDialog(): void {
+    bangumi_link_dialog.value = true;
+}
+
+function closeBangumiLinkDialog(): void {
+    bangumi_link_dialog.value = false;
+    bangumi_access_token.value = '';
+    bangumi_token_showing.value = false;
+}
+
+async function loginBangumiAccount(): Promise<void> {
+    if (bangumi_linking.value === true || bangumi_access_token.value.trim() === '') return;
+    bangumi_linking.value = true;
+    try {
+        const result = await Bangumi.loginAccount({access_token: bangumi_access_token.value});
+        if (result === false) return;
+        bangumi_profile.value = await Bangumi.fetchProfile();
+        closeBangumiLinkDialog();
+        Message.success('Bangumi アカウントと連携しました。');
+    } finally {
+        bangumi_linking.value = false;
+    }
+}
+
+async function logoutBangumiAccount(): Promise<void> {
+    const result = await Bangumi.logoutAccount();
+    if (result === false) return;
+    bangumi_profile.value = await Bangumi.fetchProfile();
+    Message.success('Bangumi アカウントとの連携を解除しました。');
+}
+
 
 onMounted(async () => {
     // 管理者と確認できるまでは設定 API へアクセスしない。
@@ -836,11 +832,12 @@ onMounted(async () => {
         is_loading.value = false;
         return;
     }
-    const [fetched_settings, fetched_status, fetched_services, fetched_acp_credentials] = await Promise.all([
+    const [fetched_settings, fetched_status, fetched_services, fetched_acp_credentials, fetched_bangumi] = await Promise.all([
         RecordedSeries.fetchSettings(),
         RecordedSeries.fetchStatus(),
         AIBackend.fetchServices(),
         AIBackend.fetchACPCredentialStatus(),
+        Bangumi.fetchProfile(),
     ]);
     if (fetched_services !== null) {
         opencode_services.value = fetched_services.map(service => ({
@@ -864,11 +861,11 @@ onMounted(async () => {
         status.value = fetched_status;
         if (fetched_status.is_running || fetched_status.is_episode_running) startStatusPolling();
     }
+    bangumi_profile.value = fetched_bangumi;
     is_loading.value = false;
 });
 
 onUnmounted(() => {
-    backfill_abort_controller?.abort();
     episode_backfill_abort_controller?.abort();
     stopStatusPolling();
 });
@@ -919,6 +916,30 @@ onUnmounted(() => {
 @include smartphone-vertical {
     .recorded-series-status-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+.bangumi-account {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-height: 72px;
+    padding: 16px;
+    border-radius: 12px;
+    background: rgb(var(--v-theme-background-lighten-2));
+
+    &__info {
+        min-width: 0;
+        flex-grow: 1;
+    }
+
+    &__info-name {
+        font-weight: bold;
+    }
+
+    &__actions {
+        display: flex;
+        gap: 8px;
     }
 }
 

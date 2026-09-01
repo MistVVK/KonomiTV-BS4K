@@ -11,9 +11,6 @@
             <v-btn color="primary" size="small" variant="tonal" @click="fetchCurrentSeries()">
                 再試行
             </v-btn>
-            <v-btn v-if="is_admin" size="small" variant="text" @click="openAssignmentDialog()">
-                シリーズを訂正
-            </v-btn>
         </div>
 
         <div v-else-if="is_current_program_loading" class="series-state">
@@ -25,9 +22,6 @@
             <Icon icon="fluent:video-clip-off-20-regular" width="32px" />
             <span>この録画はシリーズに分類されていません。</span>
             <span class="series-state__description">単発番組として判定された録画もここに含まれます。</span>
-            <v-btn v-if="is_admin" color="primary" size="small" variant="tonal" @click="openAssignmentDialog()">
-                シリーズを訂正
-            </v-btn>
         </div>
 
         <template v-else>
@@ -35,16 +29,6 @@
                 <div class="series-header__main">
                     <h1 class="series-header__title">{{series_info.title}}</h1>
                     <div class="series-header__count">録画 {{recorded_programs.length.toLocaleString()}} 件</div>
-                </div>
-                <div v-if="is_admin" class="series-header__actions">
-                    <v-btn class="series-header__episode-edit" size="x-small" variant="tonal"
-                        @click="show_episode_assignment_dialog = true">
-                        話数を訂正
-                    </v-btn>
-                    <v-btn class="series-header__edit" icon size="small" variant="text"
-                        v-ftooltip.bottom="'シリーズを訂正'" @click="openAssignmentDialog()">
-                        <Icon icon="fluent:edit-20-filled" width="20px" />
-                    </v-btn>
                 </div>
                 <div class="series-header__sort">
                     <v-select v-model="settingsStore.settings.video_series_sort_key"
@@ -87,21 +71,6 @@
                 </router-link>
             </div>
         </template>
-
-        <RecordedSeriesAssignmentDialog
-            v-model="show_assignment_dialog"
-            :recorded-program-id="playerStore.recorded_program.id"
-            :current-series-id="playerStore.recorded_program.series_id"
-            :current-series-title="playerStore.recorded_program.series_title"
-            :current-label="current_assignment_label"
-            :program-title="playerStore.recorded_program.title"
-            @saved="seriesAssignmentSaved" />
-
-        <RecordedEpisodeAssignmentDialog v-if="series_info !== null"
-            v-model="show_episode_assignment_dialog"
-            :series-id="series_info.id"
-            :recorded-program-id="playerStore.recorded_program.id"
-            @saved="episodeAssignmentSaved()" />
     </div>
 </template>
 <script lang="ts">
@@ -109,15 +78,11 @@
 import { mapStores } from 'pinia';
 import { defineComponent } from 'vue';
 
-import RecordedSeriesAssignmentDialog from '@/components/Settings/RecordedSeriesAssignmentDialog.vue';
-import RecordedEpisodeAssignmentDialog from '@/components/Videos/Dialogs/RecordedEpisodeAssignmentDialog.vue';
-import Message from '@/message';
 import Series, { type ISeries, type ISeriesRecordedProgram } from '@/services/Series';
-import Videos, { type IRecordedProgram } from '@/services/Videos';
+import { type IRecordedProgram } from '@/services/Videos';
 import usePlayerStore from '@/stores/PlayerStore';
 import useRecordedSeriesStore, { getRecordedSeriesProgramDisplayTitle } from '@/stores/RecordedSeriesStore';
 import useSettingsStore, { type VideoSeriesSortDirection, type VideoSeriesSortKey } from '@/stores/SettingsStore';
-import useUserStore from '@/stores/UserStore';
 import Utils, { dayjs } from '@/utils';
 import {
     formatRecordedEpisodeLabel,
@@ -127,7 +92,6 @@ import {
 
 export default defineComponent({
     name: 'Panel-SeriesTab',
-    components: {RecordedEpisodeAssignmentDialog, RecordedSeriesAssignmentDialog},
     data() {
         return {
             // ユーティリティをテンプレートで使えるようにする。
@@ -143,15 +107,10 @@ export default defineComponent({
             is_loading: false,
             series_load_failed: false,
             series_fetch_sequence: 0,
-
-            // 管理者向け手動訂正ダイアログの状態。
-            show_assignment_dialog: false,
-            show_episode_assignment_dialog: false,
-            is_applying_assignment: false,
         };
     },
     computed: {
-        ...mapStores(usePlayerStore, useRecordedSeriesStore, useSettingsStore, useUserStore),
+        ...mapStores(usePlayerStore, useRecordedSeriesStore, useSettingsStore),
 
         /** 現在の録画が属する Series API の取得結果。 */
         series_info(): ISeries | null {
@@ -190,35 +149,16 @@ export default defineComponent({
             return this.settingsStore.settings.video_series_sort_direction === 'Asc' ? '昇順' : '降順';
         },
 
-        is_admin(): boolean {
-            return this.userStore.user?.is_admin === true;
-        },
-
         is_series_tab_active(): boolean {
             return this.playerStore.video_panel_active_tab === 'Series';
         },
 
-        current_assignment_label(): string {
-            if (this.series_info !== null) return this.series_info.title;
-            if (this.playerStore.recorded_program.series_id !== null) {
-                return this.playerStore.recorded_program.series_title ?? 'シリーズ情報を取得できませんでした';
-            }
-            return 'シリーズなし';
-        },
     },
     watch: {
         recorded_program_identity: {
             immediate: true,
             handler() {
-                // 録画の移動中に、前の録画を対象とした訂正ダイアログを操作させない。
-                if (this.show_assignment_dialog && this.is_applying_assignment === false) {
-                    this.show_assignment_dialog = false;
-                }
-                this.show_episode_assignment_dialog = false;
-                // 手動訂正の成功直後は seriesAssignmentSaved() 側で再取得するため、同じ API を二重に呼ばない。
-                if (this.is_applying_assignment === false) {
-                    void this.fetchCurrentSeries();
-                }
+                void this.fetchCurrentSeries();
             },
         },
         is_series_tab_active(is_active: boolean) {
@@ -230,10 +170,6 @@ export default defineComponent({
         'settingsStore.settings.video_series_sort_direction'() {
             if (this.is_series_tab_active) void this.scrollCurrentProgramIntoView();
         },
-    },
-    created() {
-        // 管理者向けボタンの表示判定に必要。取得済みなら UserStore 内で API 呼び出しは省略される。
-        void this.userStore.fetchUser();
     },
     beforeUnmount() {
         // 未完了レスポンスを、このコンポーネントへ反映させない。
@@ -311,45 +247,6 @@ export default defineComponent({
 
         formatDuration(duration_seconds: number): string {
             return `${Math.max(1, Math.round(duration_seconds / 60)).toLocaleString()}分`;
-        },
-
-        /** 共通ダイアログを、管理者のみ開ける。 */
-        openAssignmentDialog(): void {
-            if (this.is_admin === false) return;
-            this.show_assignment_dialog = true;
-        },
-
-        /** 所属変更後にプレイヤー本体と Series パネルを最新状態へそろえる。 */
-        async seriesAssignmentSaved(): Promise<void> {
-            const program_id = this.playerStore.recorded_program.id;
-            const refreshed_program = await Videos.fetchVideo(program_id);
-            if (refreshed_program === null) {
-                Message.warning('変更は保存されましたが、表示を更新できませんでした。ページを再読み込みしてください。');
-                return;
-            }
-            if (this.playerStore.recorded_program.id !== program_id) return;
-            this.is_applying_assignment = true;
-            try {
-                this.playerStore.recorded_program = refreshed_program;
-                await this.fetchCurrentSeries();
-            } finally {
-                this.is_applying_assignment = false;
-            }
-        },
-
-        /** 話数訂正後にプレイヤー本体と Series パネルの両方を最新状態へそろえる。 */
-        async episodeAssignmentSaved(): Promise<void> {
-            const program_id = this.playerStore.recorded_program.id;
-            const series_id = this.playerStore.recorded_program.series_id;
-            if (series_id === null) return;
-
-            const [refreshed_program, refreshed_series] = await Promise.all([
-                Videos.fetchVideo(program_id),
-                Series.fetchSeries(series_id),
-            ]);
-            if (this.playerStore.recorded_program.id !== program_id) return;
-            if (refreshed_program !== null) this.playerStore.recorded_program = refreshed_program;
-            if (refreshed_series !== null) this.recordedSeriesStore.setSeries(refreshed_series);
         },
     },
 });

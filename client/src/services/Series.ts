@@ -32,6 +32,11 @@ export interface ISeries {
     title: string;
     description: string;
     genres: { major: string; middle: string; }[];
+    bangumi_subject_id: number | null;
+    bangumi_subject_name: string | null;
+    bangumi_subject_name_cn: string | null;
+    bangumi_subject_summary: string | null;
+    bangumi_subject_image_url: string | null;
     broadcast_periods: ISeriesBroadcastPeriod[];
     created_at: string;
     updated_at: string;

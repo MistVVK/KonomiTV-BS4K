@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from decimal import Decimal
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal
 
 from fastapi import (
     APIRouter,
@@ -14,7 +13,7 @@ from fastapi import (
     Response,
     status,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError
 from tortoise.expressions import Q
 from typing_extensions import TypedDict
 
@@ -23,37 +22,19 @@ from app.metadata.ai.episode_lookup import EpisodeLookupOutcome, IsPublicHTTPURL
 from app.metadata.ai.KonomiTVBS4KACPCredentials import KonomiTVBS4KACPImportProvider
 from app.metadata.RecordedEpisodeAutomation import (
     RecordedEpisodeAutomation,
-    RecordedEpisodeRelookupConflictError,
     RecordedEpisodeRelookupDisabledError,
-    RecordedEpisodeRelookupNotFoundError,
-    RecordedEpisodeRelookupRateLimitedError,
 )
 from app.metadata.RecordedEpisodeMessages import GetRecordedEpisodeErrorMessage
-from app.metadata.RecordedEpisodeResolver import (
-    RecordedEpisodeAssignmentStaleError,
-    RecordedEpisodeCrossSeriesError,
-    RecordedEpisodeInvalidNumberError,
-    RecordedEpisodeProgramNotFoundError,
-    RecordedEpisodeResolver,
-    RecordedEpisodeSeriesNotAssignedError,
-    RecordedEpisodeTargetNotFoundError,
-)
-from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesResolver import (
-    RecordedSeriesChannelUnavailableError,
-    RecordedSeriesInvalidTitleError,
-    RecordedSeriesMetadataStaleError,
     RecordedSeriesProgramNotFoundError,
     RecordedSeriesResolver,
-    RecordedSeriesResolverBusyError,
-    RecordedSeriesTargetNotFoundError,
-    RecordedSeriesTitleConflictError,
 )
 from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettings,
     RecordedSeriesSettingsResponse,
     RecordedSeriesSettingsStore,
 )
+from app.metadata.SeriesIndexer import SeriesIndexer
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series
@@ -78,18 +59,14 @@ class RecordedSeriesStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     total: int
-    pending: int
-    resolved: int
-    not_series: int
-    needs_review: int
-    failed: int
+    assigned: int
+    unassigned: int
     episode_resolved: int
     episode_unknown: int
     episode_not_numbered: int
     episode_no_published_number: int
     episode_needs_review: int
     episode_failed: int
-    last_run_at: str | None
     episode_last_run_at: str | None
     is_running: bool
     is_episode_running: bool
@@ -114,27 +91,6 @@ class RecordedSeriesStandaloneProgram(BaseModel):
     start_time: datetime
     channel_id: str | None
     channel_name: str | None
-    resolution_status: (
-        Literal[
-            'Pending',
-            'Resolved',
-            'NotSeries',
-            'NeedsReview',
-            'Failed',
-        ]
-        | None
-    )
-    resolution_source: (
-        Literal[
-            'Rule',
-            'Local',
-            'EPG',
-            'MediaWiki',
-            'AI',
-            'Manual',
-        ]
-        | None
-    )
 
 
 class RecordedSeriesStandaloneProgramListResponse(BaseModel):
@@ -154,42 +110,6 @@ class RecordedSeriesBackfillRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     force: bool = False
-
-
-class RecordedSeriesAssignmentRequest(BaseModel):
-    """管理者が録画1件へ確定させるシリーズ所属。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    decision: Literal["Series", "NotSeries"]
-    series_id: Annotated[int | None, Field(gt=0)] = None
-    series_title: Annotated[str | None, Field(max_length=255)] = None
-
-    @model_validator(mode="after")
-    def validateTarget(self) -> Self:
-        """decisionに対して既存IDまたは新規タイトルの指定が一意であることを検証する。
-
-        Returns:
-            検証後のリクエスト自身。
-
-        Raises:
-            ValueError: Series指定の過不足、またはNotSeriesへの不要な対象指定がある場合。
-        """
-
-        if self.series_title is not None:
-            self.series_title = self.series_title.strip()
-            if self.series_title == "":
-                raise ValueError("series_title must not be blank.")
-        if self.decision == "Series":
-            if (self.series_id is None) == (self.series_title is None):
-                raise ValueError(
-                    "Series assignment requires exactly one of series_id or series_title."
-                )
-        elif self.series_id is not None or self.series_title is not None:
-            raise ValueError(
-                "NotSeries assignment cannot include series_id or series_title."
-            )
-        return self
 
 
 class RecordedSeriesManagementItem(BaseModel):
@@ -216,34 +136,6 @@ class RecordedSeriesManagementListResponse(BaseModel):
     page: int
     page_size: int
     items: list[RecordedSeriesManagementItem]
-
-
-class RecordedSeriesManagementUpdateRequest(BaseModel):
-    """管理者が変更できるSeries表示メタデータ。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    title: Annotated[str, Field(max_length=255)]
-    description: Annotated[str, Field(max_length=10000)]
-    expected_title: str
-    expected_description: str
-
-    @model_validator(mode="after")
-    def validateMetadata(self) -> Self:
-        """タイトルを正規化可能な非空文字列へ制限する。
-
-        Returns:
-            前後空白を除去したリクエスト自身。
-
-        Raises:
-            ValueError: タイトルが空白だけの場合。
-        """
-
-        self.title = self.title.strip()
-        self.description = self.description.strip()
-        if self.title == "":
-            raise ValueError("title must not be blank.")
-        return self
 
 
 class RecordedEpisodeAssignmentListResponse(BaseModel):
@@ -333,73 +225,6 @@ class RecordedEpisodeAssignmentResolution(BaseModel):
     ] | None
     error_code: str | None
     error_message: str | None
-
-
-class _RecordedEpisodeAssignmentRequestBase(BaseModel):
-    """全話数割当判断に共通する楽観ロック値。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    expected_series_id: Annotated[int, Field(gt=0)]
-    expected_series_episode_id: Annotated[int | None, Field(gt=0)]
-
-
-class RecordedEpisodeRelookupRequest(_RecordedEpisodeAssignmentRequestBase):
-    """録画1件のAI話数再検索を開始する楽観ロック付き要求。"""
-
-    override_manual: bool = False
-
-
-class RecordedEpisodeExistingAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """Series内の既存Episodeを選ぶ手動判断。"""
-
-    decision: Literal["ExistingEpisode"]
-    episode_id: Annotated[int, Field(gt=0)]
-
-
-class RecordedEpisodeStructuredAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """新しいシーズン・話数を入力する手動判断。"""
-
-    decision: Literal["StructuredEpisode"]
-    season_number: Annotated[int, Field(ge=0, le=2_147_483_647)]
-    episode_number: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=3)]
-
-
-class RecordedEpisodeUnknownAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """この録画の話数を不明として確定する手動判断。"""
-
-    decision: Literal["Unknown"]
-
-
-class RecordedEpisodeNoPublishedNumberAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """公開話数のない録画を、任意のシーズンへ所属させる手動判断。"""
-
-    decision: Literal['NoPublishedNumber']
-    season_number: Annotated[int | None, Field(ge=0, le=2_147_483_647)] = None
-
-
-class RecordedEpisodeNotNumberedAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """話数番号制度を持たない録画を、任意のシーズンへ所属させる手動判断。"""
-
-    decision: Literal['NotNumbered']
-    season_number: Annotated[int | None, Field(ge=0, le=2_147_483_647)] = None
-
-
-class RecordedEpisodeAdoptAIAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """保存済み AI レーンの提案を正本として採用する判断。"""
-
-    decision: Literal['AdoptAI']
-
-
-RecordedEpisodeAssignmentRequest = Annotated[
-    RecordedEpisodeExistingAssignmentRequest
-    | RecordedEpisodeStructuredAssignmentRequest
-    | RecordedEpisodeNoPublishedNumberAssignmentRequest
-    | RecordedEpisodeNotNumberedAssignmentRequest
-    | RecordedEpisodeUnknownAssignmentRequest
-    | RecordedEpisodeAdoptAIAssignmentRequest,
-    Field(discriminator='decision'),
-]
 
 
 class _RecordedSeriesProgramSummary(TypedDict):
@@ -628,7 +453,6 @@ async def RecordedSeriesSettingsUpdateAPI(
             headers=NO_STORE_HEADERS,
         ) from ex
     # 起動時に設定破損などでPending回収できなかった場合も、設定修復直後に再試行する。
-    await RecordedSeriesResolver.retryPendingRecovery()
     # 話数側は旧受理条件の保存済み提案を無課金昇格し、新規録画の保留だけを再評価する。
     await RecordedEpisodeAutomation.settingsUpdated()
 
@@ -830,7 +654,7 @@ async def RecordedSeriesStandaloneProgramListAPI(
     program_query = RecordedProgram.filter(
         series_id=None,
         recorded_video__status='Recorded',
-    ).prefetch_related('channel', 'series_resolution')
+    ).prefetch_related('channel')
     if normalized_query != '':
         program_query = program_query.filter(
             Q(title__icontains=normalized_query)
@@ -845,33 +669,6 @@ async def RecordedSeriesStandaloneProgramListAPI(
     )
     items: list[RecordedSeriesStandaloneProgram] = []
     for program in programs:
-        # series_resolution は型定義済みの reverse OneToOne。prefetch 済みで、
-        # 判定行が未作成の録画では None になる。
-        resolution = program.series_resolution
-        resolution_status: (
-            Literal['Pending', 'Resolved', 'NotSeries', 'NeedsReview', 'Failed'] | None
-        ) = None
-        resolution_source: (
-            Literal['Rule', 'Local', 'EPG', 'MediaWiki', 'AI', 'Manual'] | None
-        ) = None
-        if resolution is not None:
-            if resolution.status in {
-                'Pending',
-                'Resolved',
-                'NotSeries',
-                'NeedsReview',
-                'Failed',
-            }:
-                resolution_status = resolution.status
-            if resolution.source in {
-                'Rule',
-                'Local',
-                'EPG',
-                'MediaWiki',
-                'AI',
-                'Manual',
-            }:
-                resolution_source = resolution.source
         items.append(
             RecordedSeriesStandaloneProgram(
                 recorded_program_id=program.id,
@@ -882,8 +679,6 @@ async def RecordedSeriesStandaloneProgramListAPI(
                 channel_name=(
                     program.channel.name if program.channel is not None else None
                 ),
-                resolution_status=resolution_status,
-                resolution_source=resolution_source,
             ),
         )
     return RecordedSeriesStandaloneProgramListResponse(
@@ -964,7 +759,7 @@ async def RecordedSeriesManagementDetailAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> RecordedSeriesManagementItem:
-    """競合後の再編集にも使える、管理画面向けSeries最新情報を返す。"""
+    """管理画面向けSeries最新情報を返す。"""
 
     response.headers.update(NO_STORE_HEADERS)
     series = await Series.filter(id=series_id).first()
@@ -975,73 +770,6 @@ async def RecordedSeriesManagementDetailAPI(
             headers=NO_STORE_HEADERS,
         )
     return (await _buildRecordedSeriesManagementItems([series]))[0]
-
-
-@router.put(
-    "/series/{series_id}",
-    summary="録画シリーズ管理情報更新 API",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def RecordedSeriesManagementUpdateAPI(
-    series_id: Annotated[int, Path(gt=0, description="更新するSeries ID。")],
-    request: RecordedSeriesManagementUpdateRequest,
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
-    """Seriesの表示名と説明を、関連録画の表示名と原子的に更新する。
-
-    Args:
-        series_id: 更新対象のSeries ID。
-        request: 新しいタイトルと説明。
-        response: Cache-Controlヘッダーを設定するレスポンス。
-        _current_user: 管理者認証済みのユーザー。
-
-    Returns:
-        None
-
-    Raises:
-        HTTPException: Series不在、無効タイトル、競合、更新済み、またはResolver実行中の場合。
-    """
-
-    response.headers.update(NO_STORE_HEADERS)
-    try:
-        await RecordedSeriesResolver.updateSeriesMetadata(
-            series_id,
-            title=request.title,
-            description=request.description,
-            expected_title=request.expected_title,
-            expected_description=request.expected_description,
-        )
-    except RecordedSeriesTargetNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified series_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesTitleConflictError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Another series or recorded-series rule already uses the specified title.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesMetadataStaleError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Recorded series metadata was updated by another request.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesResolverBusyError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Recorded series resolution is currently busy.",
-            headers={**NO_STORE_HEADERS, "Retry-After": "5"},
-        ) from ex
-    except RecordedSeriesInvalidTitleError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Recorded series title is invalid.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
 
 
 @router.get(
@@ -1161,148 +889,6 @@ async def RecordedEpisodeAssignmentListAPI(
     )
 
 
-@router.put(
-    "/programs/{recorded_program_id}/episode-assignment",
-    summary="録画シリーズ話数手動割当更新 API",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def RecordedEpisodeAssignmentUpdateAPI(
-    recorded_program_id: Annotated[int, Path(gt=0, description="録画番組の ID。")],
-    request: RecordedEpisodeAssignmentRequest,
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
-    """管理者の話数判断をSeries・Episodeの楽観ロック付きで保存する。
-
-    Args:
-        recorded_program_id: 更新対象のRecordedProgram ID。
-        request: 既存Episode、新規構造化話数、またはUnknownの判断。
-        response: Cache-Controlヘッダーを設定するレスポンス。
-        _current_user: 管理者認証済みのユーザー。
-
-    Returns:
-        None
-
-    Raises:
-        HTTPException: 録画・Episode不在、競合、別Series指定、または不正値の場合。
-    """
-
-    response.headers.update(NO_STORE_HEADERS)
-    episode_id = request.episode_id if request.decision == "ExistingEpisode" else None
-    if request.decision == 'StructuredEpisode':
-        season_number = request.season_number
-    elif request.decision == 'NoPublishedNumber':
-        season_number = request.season_number
-    elif request.decision == 'NotNumbered':
-        season_number = request.season_number
-    else:
-        season_number = None
-    episode_number = (
-        request.episode_number if request.decision == "StructuredEpisode" else None
-    )
-    try:
-        async with RECORDED_SERIES_RESOLUTION_LOCK:
-            await RecordedEpisodeResolver.assignProgramEpisode(
-                recorded_program_id,
-                expected_series_id=request.expected_series_id,
-                expected_series_episode_id=request.expected_series_episode_id,
-                decision=request.decision,
-                episode_id=episode_id,
-                season_number=season_number,
-                episode_number=episode_number,
-            )
-    except RecordedEpisodeProgramNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified recorded_program_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeTargetNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified episode_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeSeriesNotAssignedError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The recorded program is not assigned to a series.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeAssignmentStaleError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The series or episode assignment was updated by another request.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeCrossSeriesError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The specified episode belongs to another series.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeInvalidNumberError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="The episode assignment is invalid.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-
-
-@router.post(
-    "/programs/{recorded_program_id}/episode-relookup",
-    summary="録画1件の話数AI再検索 API",
-    response_model=schemas.AnalysisTaskAccepted,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def RecordedEpisodeRelookupAPI(
-    recorded_program_id: Annotated[
-        int, Path(gt=0, description="再検索する録画番組の ID。")
-    ],
-    request: RecordedEpisodeRelookupRequest,
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-) -> schemas.AnalysisTaskAccepted:
-    """録画1件の話数Web検索を楽観ロック付きでバックグラウンド開始する。"""
-
-    response.headers.update(NO_STORE_HEADERS)
-    try:
-        accepted = await RecordedEpisodeAutomation.startRelookup(
-            recorded_program_id,
-            expected_series_id=request.expected_series_id,
-            expected_series_episode_id=request.expected_series_episode_id,
-            override_manual=request.override_manual,
-        )
-    except RecordedEpisodeRelookupNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="The recorded program is not available for episode lookup.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeRelookupConflictError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The recorded program state conflicts with the episode lookup request.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeRelookupDisabledError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="AI episode number search is not available with the current settings.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeRelookupRateLimitedError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="The daily AI request limit has been reached.",
-            headers={**NO_STORE_HEADERS, "Retry-After": "3600"},
-        ) from ex
-    return schemas.AnalysisTaskAccepted(
-        execution_id=accepted.execution_id,
-        reused=accepted.reused,
-    )
-
-
 @router.get(
     "/status",
     summary="録画シリーズ判定状況取得 API",
@@ -1312,14 +898,20 @@ async def RecordedSeriesStatusAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> RecordedSeriesStatusResponse:
-    """録画シリーズ判定の件数、当日AI利用数、一括処理状態を返す。"""
+    """Indexer の所属件数と話数判定の件数を返す。旧 Resolver の区分は使わない。"""
 
     response.headers.update(NO_STORE_HEADERS)
-    series_status = await RecordedSeriesResolver.getStatus()
+    # 所属の正本は RecordedProgram.series_id。Resolution 表は集計しない。
+    total = await RecordedProgram.all().count()
+    assigned = await RecordedProgram.filter(series_id__not_isnull=True).count()
     episode_status = await RecordedEpisodeAutomation.getStatus()
-    return RecordedSeriesStatusResponse.model_validate(
-        {**series_status, **episode_status}
-    )
+    return RecordedSeriesStatusResponse.model_validate({
+        'total': total,
+        'assigned': assigned,
+        'unassigned': total - assigned,
+        'is_running': False,
+        **episode_status,
+    })
 
 
 @router.post(
@@ -1333,25 +925,22 @@ async def RecordedSeriesBackfillAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> schemas.AnalysisTaskAccepted:
-    """未判定・入力変更済みの既存録画をバックグラウンドで二段階判定する。"""
+    """既存録画へ Indexer の確定規則を再適用する。旧 Resolver は起動しない。"""
 
     response.headers.update(NO_STORE_HEADERS)
     settings = RecordedSeriesSettingsStore.getSettings()
-    if (
-        settings.ai_enabled is False or
-        RecordedSeriesSettingsStore.isAIBackendConfigured(settings) is False
-    ):
+    if settings.enabled is False:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail='AI backend is not configured for recorded series resolution.',
+            detail='Recorded series indexing is disabled.',
             headers=NO_STORE_HEADERS,
         )
-    accepted = await RecordedSeriesResolver.startBackfill(
-        trigger="Manual", force=request.force
-    )
+    # force は Indexer 再適用では常に全件対象のため無視する。
+    _ = request.force
+    await SeriesIndexer.rebuild()
     return schemas.AnalysisTaskAccepted(
-        execution_id=accepted.execution_id,
-        reused=accepted.reused,
+        execution_id=0,
+        reused=False,
     )
 
 
@@ -1370,7 +959,9 @@ async def RecordedEpisodeBackfillAPI(
 
     response.headers.update(NO_STORE_HEADERS)
     try:
-        accepted = await RecordedEpisodeAutomation.startBackfill(force=request.force)
+        # force 再検索は公開しない。Indexer 整数は Web 検索しない。
+        _ = request.force
+        accepted = await RecordedEpisodeAutomation.startBackfill(force=False)
     except RecordedEpisodeRelookupDisabledError as ex:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1419,65 +1010,3 @@ async def RecordedSeriesNextProgramAPI(
             headers=NO_STORE_HEADERS,
         ) from ex
     return RecordedSeriesNextProgramResponse(recorded_program_id=next_program_id)
-
-
-@router.put(
-    "/programs/{recorded_program_id}/assignment",
-    summary="録画シリーズ手動割当更新 API",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def RecordedSeriesAssignmentUpdateAPI(
-    recorded_program_id: Annotated[int, Path(gt=0, description="録画番組の ID 。")],
-    request: RecordedSeriesAssignmentRequest,
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
-    """管理者の確定判断で録画1件を既存・新規Series、または単発番組へ変更する。
-
-    Args:
-        recorded_program_id: 変更対象のRecordedProgram ID。
-        request: Series指定またはNotSeries指定。
-        response: Cache-Controlヘッダーを設定するレスポンス。
-        _current_user: 管理者認証済みのユーザー。
-
-    Returns:
-        None
-
-    Raises:
-        HTTPException: 録画・Series不在、チャンネル不明、または無効なタイトルの場合。
-    """
-
-    response.headers.update(NO_STORE_HEADERS)
-    try:
-        await RecordedSeriesResolver.assignProgram(
-            recorded_program_id,
-            decision=request.decision,
-            series_id=request.series_id,
-            series_title=request.series_title,
-        )
-        if request.decision == "Series":
-            await RecordedEpisodeAutomation.enqueue(recorded_program_id)
-    except RecordedSeriesProgramNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified recorded_program_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesTargetNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified series_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesChannelUnavailableError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The recorded program has no channel and cannot be assigned to a series.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except (RecordedSeriesInvalidTitleError, ValueError) as ex:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Recorded series assignment is invalid.",
-            headers=NO_STORE_HEADERS,
-        ) from ex

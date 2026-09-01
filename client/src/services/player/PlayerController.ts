@@ -10,6 +10,7 @@ import mpegts from 'mpegts.js';
 import { watch } from 'vue';
 
 import APIClient from '@/services/APIClient';
+import Bangumi from '@/services/Bangumi';
 import OfflineVideos from '@/services/OfflineVideos';
 import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
@@ -51,6 +52,7 @@ import useSettingsStore, {
     VideoStreamingQuality,
     VIDEO_STREAMING_QUALITIES,
 } from '@/stores/SettingsStore';
+import useUserStore from '@/stores/UserStore';
 import useVersionStore from '@/stores/VersionStore';
 import Utils, { dayjs, PlayerUtils, ProgramUtils } from '@/utils';
 
@@ -228,6 +230,10 @@ class PlayerController {
     // 録画を末尾まで自然に再生し終えたかどうか
     // ended の多重通知防止と、完走後の視聴履歴を先頭付近へ戻す判断に共用する
     private recorded_playback_ended = false;
+
+    // Bangumi 看過 API の多重送信防止。完了・対象外が返ったら同じセッションでは再送しない
+    private bangumi_playback_progress_in_flight = false;
+    private bangumi_playback_progress_completed = false;
 
     // シーク操作で直接末尾へ移動したときに、自然な完走として扱わないためのフラグ
     // シーク後に末尾より前へ戻った時点、または CM 自動スキップと確認できた時点で解除する
@@ -419,6 +425,48 @@ class PlayerController {
     }
 
 
+    /**
+     * 録画再生位置を Bangumi 看過 API へ送る。オフライン再生と未連携では送らない。
+     * @param playback_position プレイヤーが解決した再生位置 (秒)
+     */
+    private async sendBangumiPlaybackProgress(playback_position: number): Promise<void> {
+        const player_store = usePlayerStore();
+        const user_store = useUserStore();
+        if (
+            this.playback_mode !== 'Video' ||
+            player_store.is_offline_playback === true ||
+            this.bangumi_playback_progress_completed === true ||
+            this.bangumi_playback_progress_in_flight === true ||
+            user_store.user === null
+        ) {
+            return;
+        }
+        const recorded_program = player_store.recorded_program;
+        if (recorded_program.id < 0) {
+            return;
+        }
+        this.bangumi_playback_progress_in_flight = true;
+        try {
+            const result = await Bangumi.updatePlaybackProgress(
+                recorded_program.id,
+                {
+                    playback_position,
+                    duration: recorded_program.recorded_video.duration,
+                },
+                false,
+            );
+            if (
+                result !== null &&
+                (result.status === 'Completed' || result.status === 'AlreadyCompleted' || result.status === 'NotEligible')
+            ) {
+                this.bangumi_playback_progress_completed = true;
+            }
+        } finally {
+            this.bangumi_playback_progress_in_flight = false;
+        }
+    }
+
+
     /** 現在の再生対象と回線プロファイルを、pinを分離する安定キーにする。 */
     private getPlaybackTargetKey(): string {
         const channels_store = useChannelsStore();
@@ -502,6 +550,8 @@ class PlayerController {
         this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
         this.is_live_startup_temporary_muted = false;
         this.recorded_playback_ended = false;
+        this.bangumi_playback_progress_in_flight = false;
+        this.bangumi_playback_progress_completed = false;
         this.recorded_playback_end_blocked_by_seek = false;
         this.recorded_auto_skip_cm_target = null;
         this.is_offline_fallback_in_progress = false;
@@ -3139,6 +3189,7 @@ class PlayerController {
                     settings_store.settings.watched_history[history_index].updated_at = Utils.time();
                     console.log(`\u001b[31m[PlayerController] Last playback position updated. (Video ID: ${video_id}, last_playback_position: ${current_time})`);
                 }
+                void this.sendBangumiPlaybackProgress(current_time);
             });
 
             // 視聴開始から WATCHED_HISTORY_THRESHOLD_SECONDS 秒間このページが開かれ続けていたら、視聴履歴に追加する
