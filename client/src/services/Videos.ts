@@ -1452,6 +1452,40 @@ class Videos {
 
 
     /**
+     * 指定した録画番組と同一シリーズまたは関連する録画番組を取得する
+     * @param video_id 検索基準となる録画番組 ID
+     * @param mode 検索モード
+     * @param include_other_channels 他チャンネルの録画番組を含めるか
+     * @param order ソート順序
+     * @param page ページ番号
+     * @returns 関連録画番組一覧 or 取得に失敗した場合は null
+     */
+    static async fetchRelatedVideos(
+        video_id: number,
+        mode: 'strict' | 'relaxed' = 'strict',
+        include_other_channels: boolean = false,
+        order: 'desc' | 'asc' = 'desc',
+        page: number = 1,
+    ): Promise<IRecordedPrograms | null> {
+
+        const response = await APIClient.get<IRecordedPrograms>('/videos/related', {
+            params: {
+                video_id,
+                mode,
+                include_other_channels,
+                order,
+                page,
+            },
+        });
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, '関連番組を取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+
+    /**
      * 録画番組情報を取得する
      * @param video_id 録画番組の ID
      * @returns 録画番組情報 or 録画番組情報の取得に失敗した場合は null
