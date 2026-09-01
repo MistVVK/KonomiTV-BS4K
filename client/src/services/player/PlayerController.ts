@@ -4,6 +4,8 @@ import assert from 'assert';
 import CanvasRenderer from 'aribb24.js/src/canvas-renderer';
 import DPlayer, { DPlayerType } from 'dplayer';
 import Hls, { ErrorDetails } from 'hls.js';
+import { Mpeg2TsPlayer } from 'mpeg2toh264/player';
+import { Deinterlacer, probeDecoder, supportsDeinterlace, type DecoderProbe } from 'mpeg2toh264/yadif';
 import mpegts from 'mpegts.js';
 import { watch } from 'vue';
 
@@ -44,6 +46,7 @@ import useSettingsStore, {
     KonomiTVBS4KPlaybackAudioCodec,
     KonomiTVBS4KPlaybackVideoCodec,
     LiveStreamingQuality,
+    LIVE_ORIGINAL_MPEG2_QUALITY_NAME,
     LIVE_STREAMING_QUALITIES,
     VideoStreamingQuality,
     VIDEO_STREAMING_QUALITIES,
@@ -63,6 +66,28 @@ export function generateRecordedPlaybackSessionID(
     const random_bytes = random_source.getRandomValues(new Uint8Array(4));
     return Array.from(random_bytes, byte => byte.toString(16).padStart(2, '0')).join('');
 }
+
+
+// デバイスのデコーダーが自動でのデインタレースに対応しているかを取得
+// この判定はデバイス単位で不変のため、初回ロード時に1回だけ実行して共有する
+const is_yadif_supported = supportsDeinterlace();
+let decoder_deinterlace_probe_result: DecoderProbe | null = null;
+const decoder_deinterlace_probe_promise: Promise<DecoderProbe | null> = (async () => {
+    // WebGL2 を利用できない端末では YADIF Deinterlacer を構築できないため、デコーダーの出力をそのまま表示する
+    if (is_yadif_supported === false) {
+        console.debug('[PlayerController] Decoder deinterlace probe:', {
+            deinterlaces: null,
+            survives: null,
+            tookMs: 0,
+            error: 'WebGL2 Deinterlacer is not supported.',
+        });
+        return null;
+    }
+
+    decoder_deinterlace_probe_result = await probeDecoder();
+    console.debug('[PlayerController] Decoder deinterlace probe:', decoder_deinterlace_probe_result);
+    return decoder_deinterlace_probe_result;
+})();
 
 
 /**
@@ -561,8 +586,12 @@ class PlayerController {
         // 実効 codec が AVC へフォールバックした場合も映像はパススルーされるため、この検査画質で問題ない。
         let preflight_streaming_quality = is_oneseg_live_playback === true ? '240p' : saved_streaming_quality;
         if (is_oneseg_live_playback === false && has_video === true) {
+            // original は再エンコードしないため、codec 能力検査は保存画質で行う
+            const preflight_quality_name = options.default_quality === LIVE_ORIGINAL_MPEG2_QUALITY_NAME ?
+                saved_streaming_quality :
+                (options.default_quality ?? saved_streaming_quality);
             const normalized_preflight_streaming_quality = PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
-                options.default_quality ?? saved_streaming_quality,
+                preflight_quality_name,
                 is_bs4k_stream,
                 available_streaming_qualities,
             );
@@ -639,6 +668,11 @@ class PlayerController {
         const is_hevc_video_supported_in_worker = this.playback_mode === 'Live' ?
             await mpegts.supportWorkerForMSEH265Playback() : true;
         this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
+
+        // WebGL2 がサポートされていて、かつデバイスが自動デインタレースに対応していない場合は、
+        // mpeg2toh264 で再生する際に YADIF Deinterlacer を有効にする
+        const is_yadif_enabled = is_yadif_supported === true &&
+            decoder_deinterlace_probe_result?.deinterlaces !== true;
 
         const is_bs4k_live_playback = (
             this.playback_mode === 'Live' &&
@@ -735,10 +769,11 @@ class PlayerController {
             console.log('\u001b[31m[PlayerController] Added CM section markers:', highlights);
         }
 
-        // mpegts.js と hls.js を window 直下に入れる
-        // こうしないと DPlayer が mpegts.js / hls.js を認識できない
+        // mpegts.js と hls.js / mpeg2toh264 を window 直下に入れる
+        // こうしないと DPlayer が各ライブラリを認識できない
         (window as any).mpegts = mpegts;
         (window as any).Hls = Hls;
+        Object.assign(window, {mpeg2toh264: {Mpeg2TsPlayer, Deinterlacer}});
 
         // 録画 HLS (オンライン / オフライン保存) の fMP4 色信号書換えセッションを作成する。
         // HDR 出力の選択は視聴中だけの override を優先し、SettingsStore の既定値は書き換えない。
@@ -888,6 +923,16 @@ class PlayerController {
                     // ラジオチャンネルの場合
                     // API が受け付ける画質の値は通常のチャンネルと同じだが (手抜き…)、実際の画質は 48KHz/192kbps で固定される
                     // ラジオチャンネルの場合は、1080p と渡しても 48kHz/192kbps 固定の音声だけの MPEG-TS が配信される
+                    const is_original_quality_available = (
+                        is_bs4k_live === false &&
+                        is_oneseg_live_playback === false &&
+                        channels_store.channel.current.is_radiochannel === false &&
+                        (
+                            channels_store.channel.current.type === 'GR' ||
+                            channels_store.channel.current.type === 'BS' ||
+                            channels_store.channel.current.type === 'CS'
+                        )
+                    );
                     if (channels_store.channel.current.is_radiochannel === true) {
                         qualities.push({
                             name: '48kHz/192kbps',
@@ -901,6 +946,20 @@ class PlayerController {
                         });
                     // 通常のチャンネルの場合
                     } else {
+                        // mpeg2toh264 によるオリジナル画質は GR/BS/CS フルセグだけ画質リストの先頭に追加する
+                        // 保存プロファイルには入れず、視聴中の選択とセッション内レジュームだけが使う
+                        if (is_original_quality_available === true) {
+                            qualities.push({
+                                name: LIVE_ORIGINAL_MPEG2_QUALITY_NAME,
+                                type: 'mpeg2toh264',
+                                url: PlayerUtils.buildKonomiTVBS4KLiveAPIEndpointURL(
+                                    channels_store.channel.current.display_channel_id,
+                                    'original',
+                                    'mpegts',
+                                    '',
+                                ),
+                            });
+                        }
                         // 画質リストを作成
                         for (const quality_name of live_streaming_qualities) {
                             qualities.push({
@@ -922,29 +981,42 @@ class PlayerController {
                     if (options.default_quality !== null) {
                         // PlayerController.init() のオプションでデフォルト画質が指定されている場合は
                         // 画質プロファイルに記載の画質ではなく、指定された（前回再生時の）画質を使ってレジュームする
-                        default_quality = options.default_quality;
+                        if (
+                            options.default_quality === LIVE_ORIGINAL_MPEG2_QUALITY_NAME &&
+                            is_original_quality_available === false
+                        ) {
+                            // original 非対応チャンネルへ切り替えたときは保存画質へ戻す
+                            default_quality = is_bs4k_live === true ?
+                                this.quality_profile.bs4k_playback_streaming_quality :
+                                this.quality_profile.playback_streaming_quality;
+                        } else {
+                            default_quality = options.default_quality;
+                        }
                     }
                     // 保存画質や再初期化前の画質は変更せず、ワンセグ HEVC と低解像度ライブだけ実効上限へ丸める。
-                    if (is_oneseg_live_playback === true && is_hevc_playback === true) {
-                        default_quality = '240p';
-                    } else if (
-                        is_bs4k_live === false &&
-                        source_limited_live_streaming_qualities.length < LIVE_STREAMING_QUALITIES.length
-                    ) {
-                        const normalized_default_api_quality = PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
-                            default_quality,
-                            false,
-                            LIVE_STREAMING_QUALITIES,
-                        );
-                        default_quality = (
-                            normalized_default_api_quality !== null &&
-                            source_limited_live_streaming_qualities.includes(
-                                normalized_default_api_quality as LiveStreamingQuality,
-                            ) === true
-                        ) ? get_quality_display_name(normalized_default_api_quality) :
-                            get_quality_display_name(source_limited_live_streaming_qualities[0]);
-                    } else {
-                        default_quality = normalize_default_quality(default_quality, live_streaming_qualities);
+                    // original は保存プロファイルに無い視聴中選択なので、解像度上限へ丸めない。
+                    if (default_quality !== LIVE_ORIGINAL_MPEG2_QUALITY_NAME) {
+                        if (is_oneseg_live_playback === true && is_hevc_playback === true) {
+                            default_quality = '240p';
+                        } else if (
+                            is_bs4k_live === false &&
+                            source_limited_live_streaming_qualities.length < LIVE_STREAMING_QUALITIES.length
+                        ) {
+                            const normalized_default_api_quality = PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
+                                default_quality,
+                                false,
+                                LIVE_STREAMING_QUALITIES,
+                            );
+                            default_quality = (
+                                normalized_default_api_quality !== null &&
+                                source_limited_live_streaming_qualities.includes(
+                                    normalized_default_api_quality as LiveStreamingQuality,
+                                ) === true
+                            ) ? get_quality_display_name(normalized_default_api_quality) :
+                                get_quality_display_name(source_limited_live_streaming_qualities[0]);
+                        } else {
+                            default_quality = normalize_default_quality(default_quality, live_streaming_qualities);
+                        }
                     }
                     // ラジオチャンネルのみ常に 48KHz/192kbps に固定する
                     if (channels_store.channel.current.is_radiochannel) {
@@ -1196,6 +1268,25 @@ class PlayerController {
 
             // 再生プラグインの設定
             pluginOptions: {
+                // mpeg2toh264
+                mpeg2toh264: {
+                    // 対応ブラウザでは変換処理と MediaSource を Web Worker 内へまとめ、メインスレッドの描画負荷から分離する
+                    mediaSource: 'auto',
+                    // MPEG-2 を直接デコードできるブラウザ環境でもデインタレース可否が不明なため、パススルーモードは使わない
+                    passthrough: false,
+                    // ライブ放送では選択中のサービスを明示する (tsreadex がすでに選択してくれているが念のため)
+                    serviceId: this.playback_mode === 'Live' ?
+                        channels_store.channel.current.service_id : undefined,
+                    // デコーダーが自動でデインタレースしてくれない端末だけ、YADIF Deinterlacer を通した Canvas を実際の表示映像として利用する
+                    deinterlace: is_yadif_enabled,
+                    deinterlacer: is_yadif_enabled === true ? (video: HTMLVideoElement) => new Deinterlacer(video, {
+                        // 常に MPEG-2 60i 映像を 60fps でぬるぬる再生する
+                        doubleRate: true,
+                        // 24fps モードがオンの場合のみ、実写区間では 60fps で描画しつつ、
+                        // 映画・アニメなど 24fps で制作された映像を自動検出し、余分なフレームを間引く
+                        autoFilm: this.quality_profile.playback_24fps_mode,
+                    }) : undefined,
+                },
                 // mpegts.js
                 mpegts: {
                     config: {
@@ -1227,7 +1318,7 @@ class PlayerController {
                         // ライブストリームの遅延の追跡に利用する再生速度 (x1.1)
                         // 遅延が 3 秒を超えたとき、遅延が playback_buffer_sec を下回るまで再生速度が x1.1 に設定される
                         liveSyncPlaybackRate: 1.1,
-                    }
+                    } as mpegts.Config,
                 },
                 // hls.js
                 hls: {
@@ -1669,6 +1760,16 @@ class PlayerController {
 
         // デバッグ用にプレイヤーインスタンスも window 直下に入れる
         (window as any).player = this.player;
+
+        // 万が一再生開始後にデバイスが自動デインタレースに対応していることが判明した場合は、再起動せず Deinterlacer の Canvas だけを停止する
+        void decoder_deinterlace_probe_promise.then((result) => {
+            if (result?.deinterlaces !== true || this.player === null) return;
+            this.player.options.pluginOptions!.mpeg2toh264!.deinterlace = false;
+            this.player.options.pluginOptions!.mpeg2toh264!.deinterlacer = undefined;
+            if (this.player.type === 'mpeg2toh264' && this.player.plugins.mpeg2toh264) {
+                this.player.plugins.mpeg2toh264.deinterlace = false;
+            }
+        });
 
         if (
             requested_video_codec !== effective_video_codec ||
@@ -2375,6 +2476,8 @@ class PlayerController {
         if (this.playback_mode === 'Live') {
             this.live_force_seek_interval_timer_cancel = Utils.setIntervalInWorker(() => {
                 if (this.player === null) return;
+                // mpeg2toh264 は変換済みバッファを自身で管理するため、強制同期は mpegts.js の再生時だけ実行する
+                if (this.player.type !== 'mpegts') return;
                 const buffered = this.player.video.buffered;
                 if (((this.player.video.paused || this.is_rebuffering) && buffered.length >= 1) &&
                     (buffered.end(buffered.length - 1) - this.player.video.currentTime > 30)) {
@@ -2518,6 +2621,67 @@ class PlayerController {
 
             // ライブ視聴時のみ
             if (this.playback_mode === 'Live') {
+
+                // mpeg2toh264 によるオリジナル画質再生時のみの専用処理
+                if (this.player.type === 'mpeg2toh264' && this.player.plugins.mpeg2toh264) {
+                    player_store.is_loading = true;
+                    player_store.is_background_display = true;
+
+                    let on_mpeg2_canplay_called = false;
+                    const mpeg2toh264_player = this.player.plugins.mpeg2toh264;
+                    const startup_timeout_id = window.setTimeout(() => {
+                        if (is_current() === false || on_mpeg2_canplay_called === true) return;
+                        // 15秒経っても再生できない恒常障害を、理由なしの無制限再試行にしない。
+                        // オフラインなら接続喪失、そうでなければ変換 / MSE pipeline の失敗として既存 guard へ渡す。
+                        player_store.event_emitter.emit('PlayerRestartRequired', {
+                            message: '再生開始までに時間が掛かっています。プレイヤーを再起動しています…',
+                            konomitv_bs4k_restart_reason: navigator.onLine === false ?
+                                'StreamingConnectionLost' :
+                                'RuntimeCodecPipelineError',
+                        });
+                    }, 15 * 1000);
+                    const on_mpeg2_canplay = () => {
+                        if (this.player === null || is_current() === false || on_mpeg2_canplay_called === true) return;
+                        on_mpeg2_canplay_called = true;
+                        window.clearTimeout(startup_timeout_id);
+                        this.player.video.oncanplay = null;
+                        this.player.video.oncanplaythrough = null;
+                        player_store.is_loading = false;
+                        player_store.is_video_buffering = false;
+                        player_store.is_background_display = false;
+                    };
+                    this.player.video.oncanplay = on_mpeg2_canplay;
+                    this.player.video.oncanplaythrough = on_mpeg2_canplay;
+                    mpeg2toh264_player.addEventListener('error', async () => {
+                        window.clearTimeout(startup_timeout_id);
+                        if (is_current() === false || this.player === null) return;
+                        this.player.pause();
+                        // mpeg2toh264 は通信・Worker・MSE 失敗を error に集約し、ライブラリ側に再試行が無い。
+                        // pause だけで止めず、通常ライブと同じ PlayerRestartRequired へ渡す。
+                        await Utils.sleep(1);
+                        if (is_current() === false || this.player === null) return;
+                        let was_offline = false;
+                        if (navigator.onLine === false) {
+                            was_offline = true;
+                            this.player.notice('現在ネットワーク接続がありません。オンラインになるまで待機しています…', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
+                            console.warn('\u001b[31m[PlayerController] mpeg2toh264 error event: Network error. Waiting for online...');
+                            await Utils.waitUntilOnline();
+                            if (is_current() === false) return;
+                        }
+                        console.error('\u001b[31m[PlayerController] mpeg2toh264 error event.');
+                        // mpeg2toh264 は通信と変換 / MSE を同じ error に集約する。
+                        // オフライン経路なら接続喪失、そうでなければ pipeline 失敗として既存の有限 guard へ渡す。
+                        player_store.event_emitter.emit('PlayerRestartRequired', {
+                            message: '再生中にエラーが発生しました。(mpeg2toh264) プレイヤーを再起動しています…',
+                            konomitv_bs4k_restart_reason: was_offline === true ?
+                                'StreamingConnectionLost' :
+                                'RuntimeCodecPipelineError',
+                        });
+                    }, {once: true});
+                    void this.player.play();
+                    // オリジナル画質では mpeg2toh264 自身がバッファを適切に管理してくれるため、mpegts.js 専用の同期処理はスキップする
+                    return;
+                }
 
                 // DPlayer と aribb24.js が購読するものと同じ timed-ID3 event を、KonomiTV の
                 // ARIB-TTML 共通デコーダーにも並列で接続する。

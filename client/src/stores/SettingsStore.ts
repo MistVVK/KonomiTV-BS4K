@@ -12,8 +12,10 @@ import Utils from '@/utils';
 
 
 // 選択可能な画質の種類
+// original は視聴中の選択のみ。Playback の保存プロファイルには入れない。
 export type LiveStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const LIVE_STREAMING_QUALITIES: LiveStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
+export const LIVE_ORIGINAL_MPEG2_QUALITY_NAME = 'Original (MPEG-2)';
 export type BS4KLiveStreamingQuality = '4320p' | '2160p' | '1440p' | '1080p-60fps' | '1080p-30fps' | '810p-60fps' | '810p-30fps' | '720p-60fps' | '720p-30fps' | '540p-30fps' | '480p-30fps' | '360p-30fps' | '240p-30fps';
 export const BS4K_LIVE_STREAMING_QUALITIES: BS4KLiveStreamingQuality[] = ['4320p', '2160p', '1440p', '1080p-60fps', '1080p-30fps', '810p-60fps', '810p-30fps', '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps'];
 export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
