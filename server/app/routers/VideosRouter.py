@@ -1,5 +1,6 @@
 
 import asyncio
+import difflib
 import json
 import pathlib
 from datetime import datetime
@@ -32,6 +33,7 @@ from app.metadata.RecordedPlaybackIndex import (
 )
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
+from app.metadata.SeriesIndexer import NormalizeSeriesTitle, ParseSeriesTitle
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.models.CMAnalysis import RecordedVideoCMAnalysis, RecordedVideoCMResult
@@ -55,6 +57,115 @@ router = APIRouter(
 
 # ページングで一度に取得する録画番組の数
 PAGE_SIZE = 30
+
+
+def CalculateRelatedProgramScore(current: RecordedProgram, target: RecordedProgram) -> int:
+    """
+    シリーズ未分類の録画同士について、HonomiTV の関連番組検索と同じ観点で近さを計算する。
+
+    Args:
+        current (RecordedProgram): 検索基準となる録画番組。
+        target (RecordedProgram): 関連候補となる録画番組。
+
+    Returns:
+        int: タイトル・放送時刻・チャンネル・メタデータを合計したスコア。
+    """
+
+    # SeriesIndexer と同じタイトル解析を使い、視聴パネル側で別の作品名抽出規則を増やさない。
+    current_parsed_title = ParseSeriesTitle(current.title, current.genres, current.description)
+    target_parsed_title = ParseSeriesTitle(target.title, target.genres, target.description)
+    current_title = (
+        current_parsed_title.normalized_title
+        if current_parsed_title is not None
+        else NormalizeSeriesTitle(current.series_title or current.title)
+    )
+    target_title = (
+        target_parsed_title.normalized_title
+        if target_parsed_title is not None
+        else NormalizeSeriesTitle(target.series_title or target.title)
+    )
+    if current_title == target_title and len(current_title) > 0:
+        title_score = 60
+    else:
+        similarity = difflib.SequenceMatcher(None, current_title, target_title, autojunk=False).ratio()
+        if similarity >= 0.9:
+            title_score = 55
+        elif similarity >= 0.8:
+            title_score = 50
+        elif similarity >= 0.7:
+            title_score = 40
+        elif len(current_title) >= 2 and current_title in target_title:
+            title_score = 35
+        else:
+            title_score = 0
+
+    # 毎日・毎週の同時刻帯を関連番組の補助根拠にする。
+    date_diff_days = abs((current.start_time.date() - target.start_time.date()).days)
+    day_diff = abs((current.start_time.weekday() - target.start_time.weekday() + 7) % 7)
+    minute_diff = abs(
+        (current.start_time.hour * 60 + current.start_time.minute) -
+        (target.start_time.hour * 60 + target.start_time.minute)
+    )
+    if 1 <= date_diff_days <= 7 and minute_diff <= 5:
+        time_score = 20
+    elif 1 <= date_diff_days <= 7 and minute_diff <= 15:
+        time_score = 18
+    elif 1 <= date_diff_days <= 7 and minute_diff <= 30:
+        time_score = 16
+    elif day_diff == 0 and minute_diff <= 5:
+        time_score = 20
+    elif day_diff == 0 and minute_diff <= 15:
+        time_score = 18
+    elif day_diff == 0 and minute_diff <= 30:
+        time_score = 15
+    elif day_diff == 0 and minute_diff <= 60:
+        time_score = 10
+    elif minute_diff <= 15:
+        time_score = 12
+    elif minute_diff <= 30:
+        time_score = 8
+    elif minute_diff <= 60:
+        time_score = 5
+    else:
+        time_score = 0
+
+    # 同じ放送サービスを最優先し、同一ネットワーク・同一放送種別も弱い根拠として扱う。
+    if current.channel_id is not None and current.channel_id == target.channel_id:
+        channel_score = 10
+    elif current.network_id is not None and current.network_id == target.network_id:
+        channel_score = 6
+    elif current.channel is not None and target.channel is not None and current.channel.type == target.channel.type:
+        channel_score = 3
+    else:
+        channel_score = 0
+
+    # ジャンルと番組尺は、タイトル・時刻だけでは判別しにくい候補の補助根拠に限定する。
+    metadata_score = 0
+    exact_genre_match = any(
+        current_genre['major'] == target_genre['major'] and
+        current_genre['middle'] == target_genre['middle']
+        for current_genre in current.genres
+        for target_genre in target.genres
+    )
+    if exact_genre_match:
+        series_genres = {'アニメ・特撮', 'ドラマ', '情報・ワイドショー'}
+        metadata_score += 5 if any(genre['major'] in series_genres for genre in current.genres) else 4
+    elif any(
+        current_genre['major'] == target_genre['major']
+        for current_genre in current.genres
+        for target_genre in target.genres
+    ):
+        metadata_score += 2
+
+    duration_diff = abs(current.duration - target.duration)
+    if duration_diff <= 300:
+        metadata_score += 3
+    elif duration_diff <= 600:
+        metadata_score += 2
+    elif duration_diff <= 900:
+        metadata_score += 1
+
+    return title_score + time_score + channel_score + min(metadata_score, 10)
 
 
 async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedProgram:
@@ -777,6 +888,83 @@ async def VideosSearchAPI(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to execute raw SQL query',
         )
+
+
+@router.get(
+    '/related',
+    summary = '関連録画番組 API',
+    response_description = '指定された録画番組と同一シリーズまたは関連する録画番組の情報のリスト。',
+    response_model = schemas.RecordedPrograms,
+)
+async def VideosRelatedAPI(
+    video_id: Annotated[int, Query(description='検索基準となる録画番組の ID 。')],
+    mode: Annotated[Literal['strict', 'relaxed'], Query(description='strict は同一シリーズ、relaxed は関連番組まで検索する。')] = 'strict',
+    include_other_channels: Annotated[bool, Query(description='他チャンネルの録画番組も検索対象に含めるかどうか。')] = False,
+    order: Annotated[Literal['desc', 'asc'], Query(description='ソート順序 (desc or asc) 。')] = 'desc',
+    page: Annotated[int, Query(description='ページ番号。', ge=1)] = 1,
+) -> schemas.RecordedPrograms:
+    """
+    HonomiTV の Series パネルと同じ条件で、関連する録画番組を 30 件ずつ取得する。
+
+    Args:
+        video_id (int): 検索基準となる録画番組 ID。
+        mode (Literal['strict', 'relaxed']): 同シリーズまたは関連番組の検索モード。
+        include_other_channels (bool): 他チャンネルの候補を含めるかどうか。
+        order (Literal['desc', 'asc']): 放送日時のソート順。
+        page (int): 1 始まりのページ番号。
+
+    Returns:
+        schemas.RecordedPrograms: 関連録画番組と検索条件に一致した総件数。
+    """
+
+    # Series パネルの検索基準を確定し、存在しない録画 ID は通常の詳細 API と同じ 422 にする。
+    current_program = await RecordedProgram.all() \
+        .select_related('channel') \
+        .get_or_none(id=video_id)
+    if current_program is None:
+        logging.warning(f'[VideosRouter][VideosRelatedAPI] Specified video_id was not found. [video_id: {video_id}]')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified video_id was not found',
+        )
+
+    # 他チャンネルを含めない場合、チャンネル不明の録画同士を同一局として推測しない。
+    if include_other_channels is False and current_program.channel_id is None:
+        return schemas.RecordedPrograms(total=0, recorded_programs=[])
+
+    candidates_query = RecordedProgram.all().select_related('channel')
+    if include_other_channels is False:
+        candidates_query = candidates_query.filter(channel_id=current_program.channel_id)
+
+    # SeriesIndexer が永続化した作品 ID を fuzzy 検索より優先する。
+    if current_program.series_id is not None:
+        candidates = await candidates_query.filter(series_id=current_program.series_id)
+        related_programs = list(candidates)
+    else:
+        candidates = await candidates_query
+        score_threshold = 70 if mode == 'strict' else 50
+        related_programs = [
+            candidate
+            for candidate in candidates
+            if CalculateRelatedProgramScore(current_program, candidate) >= score_threshold
+        ]
+
+    # HonomiTV と同じく放送日時で並べた後にページングし、既存 VideosAPI で公開スキーマを構築する。
+    related_programs.sort(
+        key=lambda program: (program.start_time, program.id),
+        reverse=order == 'desc',
+    )
+    total = len(related_programs)
+    offset = (page - 1) * PAGE_SIZE
+    page_ids = [program.id for program in related_programs[offset:offset + PAGE_SIZE]]
+    if len(page_ids) == 0:
+        return schemas.RecordedPrograms(total=total, recorded_programs=[])
+
+    page_result = await VideosAPI(order='ids', page=1, ids=page_ids)
+    return schemas.RecordedPrograms(
+        total=total,
+        recorded_programs=page_result.recorded_programs,
+    )
 
 
 @router.get(
