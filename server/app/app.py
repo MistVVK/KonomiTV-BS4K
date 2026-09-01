@@ -45,6 +45,7 @@ from app.routers import (
     ChannelsRouter,
     CMAnalysisRouter,
     DataBroadcastingRouter,
+    KonomiTVBS4KBangumiRouter,
     KonomiTVBS4KCodecSupportRouter,
     KonomiTVBS4KSpeedTestRouter,
     LiveStreamsRouter,
@@ -142,6 +143,8 @@ app.include_router(VersionRouter.router)
 app.include_router(KonomiTVBS4KSpeedTestRouter.router)
 # コーデック対応のサーバー診断は本線 API だけへ登録し、互換 API には露出させない。
 app.include_router(KonomiTVBS4KCodecSupportRouter.router)
+# Bangumi 連携は本線 API だけへ登録し、互換 API には露出させない。
+app.include_router(KonomiTVBS4KBangumiRouter.router)
 
 # FastAPI は認証 dependency より前に form 全体を解析するため、対象ルートだけ ASGI 層で本文を制限する。
 ## 画像は KonomiTV-BS4K が生成・保存できる Capture 1 枚 20 MiB を共通の入力上限とし、
@@ -371,8 +374,9 @@ async def Startup():
     except Exception as ex:
         logging.warning('[AIAPIUsageLedger] Startup reservation recovery failed:', exc_info=ex)
 
-    # 録画スキャンとは分離したシリーズ判定ワーカーを開始する。
-    await RecordedSeriesResolver.start()
+    # 所属は HonomiTV Indexer 本線。Resolver は起動しない。
+    from app.metadata.SeriesIndexer import SeriesIndexer
+    await SeriesIndexer.rebuild()
 
     # Series確定後の話数解析・Web検索も別ワーカーで開始し、録画スキャンを待たせない。
     await RecordedEpisodeAutomation.start()

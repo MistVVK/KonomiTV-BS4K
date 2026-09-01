@@ -482,3 +482,30 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
     assert {'video_codec', 'video_bit_depth', 'audio_codec', 'audio_track'}.isdisjoint(
         parameter['name'] for parameter in recorded_parameters
     )
+
+
+def test_bangumi_routes_are_not_on_compatibility_api() -> None:
+    """Bangumi API は本線だけへ公開し、互換 allowlist には載せない。"""
+
+    from app.routers.KonomiTVBS4KBangumiRouter import router as bangumi_router
+
+    bangumi_paths = {
+        route.path
+        for route in bangumi_router.routes
+        if getattr(route, 'path', None)
+    }
+    logout_methods = {
+        method
+        for route in bangumi_router.routes
+        if getattr(route, 'path', None) == '/api/bangumi/logout'
+        for method in (getattr(route, 'methods', None) or set())
+    }
+    assert '/api/bangumi/auth' in bangumi_paths
+    assert '/api/bangumi/me' in bangumi_paths
+    assert '/api/bangumi/logout' in bangumi_paths
+    assert 'POST' in logout_methods
+    assert '/api/bangumi/videos/{video_id}/progress' in bangumi_paths
+
+    compatibility_app = CreateCompatibilityAPI()
+    compatibility_paths = list(compatibility_app.openapi()['paths'].keys())
+    assert not any(path.startswith('/api/bangumi') for path in compatibility_paths)

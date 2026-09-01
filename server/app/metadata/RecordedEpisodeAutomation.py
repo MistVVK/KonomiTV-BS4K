@@ -38,6 +38,7 @@ from app.metadata.RecordedEpisodeMessages import GetRecordedEpisodeErrorMessage
 from app.metadata.RecordedEpisodeResolver import (
     FormatEpisodeNumber,
     ParseLegacyEpisodeNumber,
+    ParseSinglePositiveIntegerEpisode,
 )
 from app.metadata.RecordedEpisodeSearch import (
     GetEpisodeLookupEvidence,
@@ -313,17 +314,28 @@ class RecordedEpisodeAutomation:
         cls._recovery_completed = False
 
     @classmethod
-    async def enqueue(cls, recorded_program_id: int) -> None:
+    async def enqueue(
+        cls,
+        recorded_program_id: int,
+        *,
+        start_if_needed: bool = True,
+    ) -> None:
         """Series判定を待たせず、話数判定対象IDを重複排除して投入する。
 
         Args:
             recorded_program_id: Series確定後のRecordedProgram ID。
+            start_if_needed: ワーカー未起動なら start() するか。Indexer の
+                起動時 rebuild では False にし、永続状態だけ Pending へ戻す。
 
         Returns:
             None
         """
 
-        await cls.start()
+        if start_if_needed:
+            await cls.start()
+        elif cls._queue is None or cls._worker_task is None or cls._worker_task.done():
+            # 起動前 rebuild は start() の復旧が Pending を拾う。ここでは起動しない。
+            return
         assert cls._queue is not None
         async with cls._relookup_start_lock:
             relookup_task = cls._relookup_tasks.get(recorded_program_id)
@@ -831,6 +843,9 @@ class RecordedEpisodeAutomation:
                     selected_choice_id=selected_choice_id,
                     connection=connection,
                 )
+        # 整数話数が確定したあとでだけ Bangumi episode を結び、Indexer 整数時は Web 検索前に Local 経路へ乗る。
+        from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+        await KonomiTVBS4KBangumiClient.bindRecordedProgramById(snapshot.id)
         return True
 
     @classmethod
@@ -1376,21 +1391,22 @@ class RecordedEpisodeAutomation:
                 resolution.source == 'Manual' and apply_accepted_lookup is False
             ) or preserving_deterministic_value
             parsed_episode = ParseLegacyEpisodeNumber(snapshot.legacy_episode_number)
+            has_single_positive_integer = (
+                ParseSinglePositiveIntegerEpisode(snapshot.legacy_episode_number) is not None
+            )
 
-            # 既存の構造化 Episode は通常処理で再課金せず、壊れた Resolution だけを修復する。
+            # 既存の構造化 Episode は、現在の単一正整数話数と一致するときだけ再利用する。
             if force is False and snapshot.series_episode_id is not None:
                 episode = await SeriesEpisode.filter(
                     id=snapshot.series_episode_id,
                     series_id=snapshot.series_id,
                 ).first()
                 structured_value_matches = (
-                    resolution.source in {"WebSearch", "EPG", "AI"}
-                    or parsed_episode is None
-                    or (
-                        episode is not None
-                        and parsed_episode.season_number == episode.season_number
-                        and parsed_episode.episode_number == episode.episode_number
-                    )
+                    has_single_positive_integer
+                    and episode is not None
+                    and parsed_episode is not None
+                    and parsed_episode.season_number == episode.season_number
+                    and parsed_episode.episode_number == episode.episode_number
                 )
                 if episode is not None and structured_value_matches:
                     if (
@@ -1424,8 +1440,8 @@ class RecordedEpisodeAutomation:
                         False,
                     )
 
-            # Local / Migration の決定論的解析を AI より先に確定する。
-            if force is False and parsed_episode is not None:
+            # 単一正整数だけ Web 検索を抑止する。0・小数・範囲はフォールバックへ進む。
+            if has_single_positive_integer and parsed_episode is not None:
                 applied = await cls._applyResolvedEpisode(
                     snapshot=snapshot,
                     resolution_id=resolution.id,
@@ -2218,8 +2234,9 @@ class RecordedEpisodeAutomation:
                 settings,
                 api_key,
             )
+            # 公開一括判定は force 再検索しない。Indexer 整数は Web 検索しない。
+            force = False
             candidates = await cls._loadBackfillCandidateIDs(
-                force=force,
                 provider_fingerprint=provider_fingerprint,
             )
             handle = await AnalysisTaskTracker.start(
@@ -2245,10 +2262,9 @@ class RecordedEpisodeAutomation:
     async def _loadBackfillCandidateIDs(
         cls,
         *,
-        force: bool,
         provider_fingerprint: str | None = None,
     ) -> list[int]:
-        """手動実行対象を、前回結果とforce設定から固定する。"""
+        """手動実行対象を、未確定の話数だけに固定する。"""
 
         # Resolution を起点にすると、旧DBや処理競合で状態行がまだ作成されていない
         # Series 所属録画を取りこぼす。録画を母集合にして、Resolution がない録画も
@@ -2278,9 +2294,7 @@ class RecordedEpisodeAutomation:
                 continue
             if resolution.source == 'Manual':
                 continue
-            if force:
-                candidate_ids.append(recorded_program_id)
-                continue
+            # force でも確定済み整数話数は再検索しない。Resolved は候補に入れない。
             if resolution.status == "Resolved":
                 continue
             if resolution.status in {'Pending', 'Unknown'}:
