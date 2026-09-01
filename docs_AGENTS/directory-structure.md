@@ -25,7 +25,7 @@
     - `Watch/`: テレビ・録画番組視聴画面向けコンポーネント群 (`Watch.vue` / `Player.vue` / `Header.vue` / `Navigation.vue` / `Panel.vue` / `KeyboardShortcutList.vue` / `LShapedScreenCropSettings.vue`)
       - `Panel/`: 視聴画面右側のパネル内表示用コンポーネント群 (`Channel.vue` / `Program.vue` / `RecordedProgram.vue` / `Comment.vue` / `Remocon.vue` / `Series.vue`)
         - `Twitter/`: ツイート検索/タイムライン表示/キャプチャ管理/ツイート表示用コンポーネント群
-    - `Settings/`: 設定ページから呼び出されるダイアログ・セクションコンポーネント群 (`SettingsData.vue` / `AccountManageSettings.vue` / `PinnedChannelSettings.vue` / `CommentMuteSettings.vue` / `TimeTableSettings.vue` / `ACPBackendSection.vue` / `RecordedSeriesAssignmentDialog.vue` / `ServerLogDialog.vue` / `LogLine.vue` など)
+    - `Settings/`: 設定ページから呼び出されるダイアログ・セクションコンポーネント群 (`SettingsData.vue` / `AccountManageSettings.vue` / `PinnedChannelSettings.vue` / `CommentMuteSettings.vue` / `TimeTableSettings.vue` / `ACPBackendSection.vue` / `ServerLogDialog.vue` / `LogLine.vue` など)
     - `Programs/`: 番組表示関連コンポーネント群
     - `Reservations/`: 予約表示関連コンポーネント群
     - `Videos/`: 録画番組表示関連コンポーネント群

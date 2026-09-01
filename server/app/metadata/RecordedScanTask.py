@@ -39,17 +39,20 @@ from app.metadata.RecordedAnalysisPlan import (
     ContentState,
     RecordedAnalysisPlan,
 )
-from app.metadata.RecordedSeriesResolver import RecordedSeriesResolver
+from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
+from app.metadata.SeriesIndexer import SeriesIndexer
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.models.Channel import Channel
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
+from app.models.Series import Series
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.Git import GetGitCommit
+from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
 from app.utils.ProcessLimiter import ProcessLimiter
 from app.utils.TSInformation import TSInformation
 
@@ -781,6 +784,9 @@ class RecordedScanTask:
                 f'Re-run metadata analysis after checking source files.',
             )
         logging.info('Batch scan of recording folders has been completed.')
+        # 列挙と録画ごとの処理が終わった集合へ、現在の確定規則を一括適用する。
+        await SeriesIndexer.rebuild()
+        await KonomiTVBS4KBangumiClient.syncAllLinkedUsers()
 
 
     async def __cleanupNonExistentRecordedVideoRecords(
@@ -1159,10 +1165,21 @@ class RecordedScanTask:
                 # 録画スキャンを外部API待ちで止めないよう、DB保存済みIDだけを専用ワーカーへ渡す。
                 # 任意機能の設定ファイル破損やキュー障害で、後続の索引・CM解析まで中断しない。
                 try:
-                    await RecordedSeriesResolver.enqueue(saved_recorded_program_id, input_changed=True)
+                    indexed_program = await RecordedProgram.get_or_none(id=saved_recorded_program_id)
+                    if indexed_program is not None:
+                        # Indexer が所属を付けた新規・更新録画だけ話数 worker へ渡す。
+                        ## 整数話数なら Web 検索せず、非整数だけ既存の話数検索へ進む。
+                        linked = await SeriesIndexer.linkRecordedProgram(indexed_program)
+                        if linked:
+                            await RecordedEpisodeAutomation.enqueue(saved_recorded_program_id)
+                            # 未照合 Series の收藏同期はスキャンを止めず、重複実行は合流させる。
+                            if indexed_program.series_id is not None:
+                                series = await Series.get_or_none(id=indexed_program.series_id)
+                                if series is not None and series.bangumi_subject_id is None:
+                                    KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
                 except Exception as ex:
                     logging.error(
-                        f'{file_path}: Failed to enqueue recorded series resolution. '
+                        f'{file_path}: Failed to index recorded series. '
                         f'recorded_program_id: {saved_recorded_program_id}',
                         exc_info=ex,
                     )
