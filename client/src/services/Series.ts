@@ -248,7 +248,10 @@ class Series {
             },
         });
         if (response.type === 'error') {
-            APIClient.showGenericError(response, 'シリーズの一覧位置を取得できませんでした。');
+            // 一覧に存在しない深いリンクは通常の 422 契約なので、一覧へ戻す呼び出し元にだけ伝える。
+            if (response.status !== 422) {
+                APIClient.showGenericError(response, 'シリーズの一覧位置を取得できませんでした。');
+            }
             return null;
         }
         return response.data.page;
