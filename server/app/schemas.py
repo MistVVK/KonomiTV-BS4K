@@ -857,7 +857,7 @@ class SeriesSummary(BaseModel):
     bangumi_subject_image_url: Annotated[str | None, Field(description='Bangumi 表紙 URL。')]
     recorded_count: Annotated[int, Field(description='再生可能録画の件数。')]
     unrecorded_count: Annotated[int, Field(description='番号付き話の欠番件数。')]
-    partial_count: Annotated[int, Field(description='完全版が無い部分録画の件数。')]
+    partial_count: Annotated[int, Field(description='部分録画として表示する局別セルの件数。')]
     latest_recorded_program_id: Annotated[int | None, Field(description='最新録画の番組 ID。サムネイル用。')]
     updated_at: Annotated[datetime, Field(description='Series の更新日時。')]
 

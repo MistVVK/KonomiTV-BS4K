@@ -84,6 +84,24 @@ def BroadcastSlotKey(recorded_program: RecordedProgram) -> str:
     return local_time.strftime('%Y-%m-%d %H:%M')
 
 
+def CatalogCellKey(recorded_program: RecordedProgram) -> tuple[str, str] | None:
+    """
+    詳細行列と同じ局・話数または日付スロットのセル識別子を返す。
+
+    Args:
+        recorded_program (RecordedProgram): 対象録画。
+
+    Returns:
+        tuple[str, str] | None: (channel_id, column_key)。局が不明で表示セルを作れないとき None。
+    """
+
+    if recorded_program.channel_id is None:
+        return None
+    if recorded_program.series_episode_id is not None:
+        return (recorded_program.channel_id, f'episode:{recorded_program.series_episode_id}')
+    return (recorded_program.channel_id, f'date:{BroadcastSlotKey(recorded_program)}')
+
+
 def RoundStartMinutes(start_time: datetime) -> tuple[int, int, int]:
     """
     自然時刻の曜日と、5 分単位に丸めた時分を返す。
@@ -242,28 +260,26 @@ async def CountCatalogGaps(
             1 for episode in structured_episodes if episode.id not in recorded_episode_ids
         )
 
-    complete_episode_ids: set[int] = set()
-    complete_broadcast_slots: set[str] = set()
+    complete_cell_keys: set[tuple[str, str]] = set()
     for recorded_program in recorded_programs:
         if recorded_program.is_partially_recorded:
             continue
-        if recorded_program.series_episode_id is not None:
-            complete_episode_ids.add(recorded_program.series_episode_id)
-            continue
-        complete_broadcast_slots.add(BroadcastSlotKey(recorded_program))
-    partial_without_complete = 0
+        cell_key = CatalogCellKey(recorded_program)
+        if cell_key is not None:
+            complete_cell_keys.add(cell_key)
+
+    # 詳細行列と同じ局×話数・日付スロットを 1 セルとして、部分録画の警告数を数える。
+    partial_without_complete_keys: set[tuple[str, str]] = set()
     for recorded_program in recorded_programs:
         if recorded_program.is_partially_recorded is False:
             continue
-        if recorded_program.series_episode_id is not None:
-            if recorded_program.series_episode_id in complete_episode_ids:
-                continue
-        elif BroadcastSlotKey(recorded_program) in complete_broadcast_slots:
+        cell_key = CatalogCellKey(recorded_program)
+        if cell_key is None or cell_key in complete_cell_keys:
             continue
-        partial_without_complete += 1
+        partial_without_complete_keys.add(cell_key)
     return SeriesCatalogCounts(
         unrecorded_count=unrecorded_count,
-        partial_count=partial_without_complete,
+        partial_count=len(partial_without_complete_keys),
     )
 
 
