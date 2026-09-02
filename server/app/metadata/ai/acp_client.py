@@ -13,7 +13,7 @@ import signal
 import time
 import unicodedata
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal, cast
 from urllib.parse import urlsplit
@@ -2870,8 +2870,9 @@ async def run_acp_series_metadata(
     readable_files: tuple[str, ...] = (),
     backend_kind: str = 'AcpCodex',
     prompt_variant: Literal['Default', 'RecoveryRetry'] = 'Default',
+    require_web_search: bool = False,
 ) -> AISeriesMetadataResult:
-    """ACP v1 agent で tool-free のシリーズ情報生成を実行する。"""
+    """ACP v1 agent でシリーズ情報を生成し、必要時は検索 telemetry を付与する。"""
 
     start_time = time.monotonic()
     effective_cwd = cwd or env.get('HOME')
@@ -2886,6 +2887,7 @@ async def run_acp_series_metadata(
                 program,
                 hints,
                 prompt_variant=prompt_variant,
+                require_web_search=require_web_search,
             ),
             model=model,
             reasoning_effort=reasoning_effort,
@@ -2893,7 +2895,7 @@ async def run_acp_series_metadata(
             cwd=effective_cwd,
             profile_dir=profile_dir,
             readable_files=readable_files,
-            operation='SeriesMetadata',
+            operation='EpisodeLookup' if require_web_search else 'SeriesMetadata',
             backend_kind=backend_kind,
         )
     except _AcpHardTimeoutError as ex:
@@ -2934,7 +2936,7 @@ async def run_acp_series_metadata(
 
     latency_ms = int((time.monotonic() - start_time) * 1000)
     output_data = ParseStrictSeriesMetadataJSONObject(session_result.output_text)
-    return ValidateSeriesMetadataOutput(
+    result = ValidateSeriesMetadataOutput(
         output_data,
         hints=hints,
         model=model or 'default',
@@ -2943,6 +2945,13 @@ async def run_acp_series_metadata(
         http_status=0,
         latency_ms=latency_ms,
     )
+    if require_web_search:
+        return replace(
+            result,
+            citations=session_result.citations,
+            web_search_performed=session_result.web_search_performed,
+        )
+    return result
 
 
 def _validateCandidateSelectionOutput(

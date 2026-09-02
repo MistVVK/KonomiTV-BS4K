@@ -104,6 +104,7 @@ class RecordedSeriesAIBackend(Protocol):
         prompt_variant: AIPromptVariant = 'Default',
         execution_guard: Callable[[], None] | None = None,
         local_validation_attempts: int = 2,
+        require_web_search: bool = False,
     ) -> AISeriesMetadataResult:
         """シリーズ名・話数・話名を一括生成する。
 
@@ -113,6 +114,7 @@ class RecordedSeriesAIBackend(Protocol):
             prompt_variant: Default は通常プロンプト。RecoveryRetry は修正版。
             execution_guard: backend の認証・設定排他内で実行する世代検証。
             local_validation_attempts: backend 内の出力検証試行数。
+            require_web_search: 話数検索と同じ検索専用権限・根拠検証を要求するか。
         """
         ...
 

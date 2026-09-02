@@ -13,6 +13,7 @@ import json
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal, TypeVar, cast
 
@@ -72,6 +73,7 @@ from app.metadata.RecordedSeriesGeneration import (
     AISeriesMetadataOutput,
     AISeriesMetadataResult,
     BuildSeriesMetadataPrompt,
+    BuildSeriesMetadataWebLookupFinalPrompt,
     SeriesMetadataClusterHint,
     SeriesMetadataClusterProgramHint,
     SeriesMetadataExistingSeriesHint,
@@ -1154,6 +1156,81 @@ class OpenCodeBackend:
             ),
         )
 
+    async def _runSeriesMetadataWebSearchSession(
+        self,
+        prompt: str,
+    ) -> tuple[dict[str, Any] | None, OpenCodeNormalizedUsage, int, dict[str, Any]]:
+        """episode agent で検索とシリーズ JSON の2ターンを実行する。
+
+        Args:
+            prompt: 未所属の同一 EPG タイトル群をまとめた検索 prompt。
+
+        Returns:
+            構造化結果、合算 usage、経過時間、検索 telemetry。
+        """
+
+        started = time.monotonic()
+        session_id: str | None = None
+        try:
+            session_id = await self._client.createSession()
+            search_message = await self._client.promptJsonSchema(
+                session_id,
+                text=prompt,
+                provider_id=self._service.opencode_provider_id,
+                model_id=self._service.opencode_model_id,
+                variant=self._service.opencode_model_variant,
+                agent=OPENCODE_AGENT_EPISODE,
+                schema=_JsonSchemaForModel(AISeriesMetadataOutput),
+                retry_count=_OPENCODE_FORMAT_RETRY_COUNT,
+                timeout_sec=_OPENCODE_PROMPT_TIMEOUT_SEC,
+                tools=BuildOpenCodeEpisodeToolPermissions(),
+                include_format=False,
+            )
+            search_usage = ExtractOpenCodeUsage(search_message)
+            evidence = ExtractOpenCodeWebToolEvidence(search_message)
+            try:
+                all_messages = await self._client.listMessages(session_id)
+            except OpenCodeClientError as list_error:
+                logging.warning(
+                    f'[OpenCodeBackend] Failed to list series lookup messages: {list_error}',
+                )
+                all_messages = []
+            if all_messages:
+                evidence = _MergeOpenCodeWebToolEvidence(
+                    [ExtractOpenCodeWebToolEvidence(item) for item in all_messages],
+                )
+            structured, final_usage = await self._promptJSONInSession(
+                session_id,
+                prompt_text=BuildSeriesMetadataWebLookupFinalPrompt(),
+                schema_model=AISeriesMetadataOutput,
+                agent=OPENCODE_AGENT_EPISODE,
+                timeout_sec=_OPENCODE_PROMPT_TIMEOUT_SEC,
+                tools={'websearch': False, 'webfetch': False},
+            )
+            usage = _CombineOpenCodeUsage([search_usage, final_usage])
+            return (
+                structured,
+                usage,
+                int((time.monotonic() - started) * 1000),
+                evidence,
+            )
+        except OpenCodeClientError as error:
+            latency_ms = int((time.monotonic() - started) * 1000)
+            if session_id is not None:
+                try:
+                    await self._client.abortSession(session_id)
+                except OpenCodeClientError:
+                    pass
+            raise _MapClientError(error, latency_ms=latency_ms) from error
+        finally:
+            if session_id is not None:
+                try:
+                    await self._client.deleteSession(session_id)
+                except OpenCodeClientError as cleanup_error:
+                    logging.warning(
+                        f'[OpenCodeBackend] Failed to delete series lookup session: {cleanup_error}',
+                    )
+
     async def _resolveSeriesMetadataUnlocked(
         self,
         program: RecordedSeriesProgramPrompt,
@@ -1162,6 +1239,7 @@ class OpenCodeBackend:
         prompt_variant: Literal['Default', 'RecoveryRetry'] = 'Default',
         execution_guard: Callable[[], None] | None = None,
         local_validation_attempts: int = _OPENCODE_LOCAL_VALIDATION_ATTEMPTS,
+        require_web_search: bool = False,
     ) -> AISeriesMetadataResult:
         """シリーズ情報生成本体（セマフォは呼び出し側）。
 
@@ -1171,6 +1249,7 @@ class OpenCodeBackend:
             prompt_variant: RecoveryRetry のとき schema 再確認指示を付与する。
             execution_guard: provider lease 取得後に実行する設定世代検証。
             local_validation_attempts: Pydantic 検証失敗時を含む最大 session 数。
+            require_web_search: episode agent の検索 telemetry を必須にするか。
         """
 
         provider_lease = await self.ensureAuthInjected()
@@ -1180,6 +1259,7 @@ class OpenCodeBackend:
                 program,
                 hints,
                 prompt_variant=prompt_variant,
+                require_web_search=require_web_search,
             )
             last_error: RecordedSeriesAIError | None = None
             total_prompt = 0
@@ -1190,11 +1270,17 @@ class OpenCodeBackend:
             latency_ms = 0
             for attempt in range(local_validation_attempts):
                 try:
-                    structured, usage, latency_ms = await self._runStructured(
-                        prompt_text=prompt,
-                        schema_model=AISeriesMetadataOutput,
-                        agent=OPENCODE_AGENT_GENERATE,
-                    )
+                    evidence: dict[str, Any] | None = None
+                    if require_web_search:
+                        structured, usage, latency_ms, evidence = (
+                            await self._runSeriesMetadataWebSearchSession(prompt)
+                        )
+                    else:
+                        structured, usage, latency_ms = await self._runStructured(
+                            prompt_text=prompt,
+                            schema_model=AISeriesMetadataOutput,
+                            agent=OPENCODE_AGENT_GENERATE,
+                        )
                     total_prompt += usage['prompt_tokens']
                     total_completion += usage['completion_tokens']
                     total_reasoning += usage['reasoning_tokens']
@@ -1211,6 +1297,12 @@ class OpenCodeBackend:
                             http_status=200,
                             latency_ms=latency_ms,
                         )
+                        if evidence is not None:
+                            result = replace(
+                                result,
+                                citations=_CitationsFromEvidence(evidence),
+                                web_search_performed=bool(evidence.get('web_search_performed')),
+                            )
                         combined = OpenCodeNormalizedUsage(
                             prompt_tokens=total_prompt,
                             completion_tokens=total_completion,
@@ -1260,6 +1352,7 @@ class OpenCodeBackend:
         prompt_variant: Literal['Default', 'RecoveryRetry'] = 'Default',
         execution_guard: Callable[[], None] | None = None,
         local_validation_attempts: int = _OPENCODE_LOCAL_VALIDATION_ATTEMPTS,
+        require_web_search: bool = False,
     ) -> AISeriesMetadataResult:
         """シリーズ情報を OpenCode structured output で一括生成する。"""
 
@@ -1272,6 +1365,7 @@ class OpenCodeBackend:
                 prompt_variant=prompt_variant,
                 execution_guard=execution_guard,
                 local_validation_attempts=local_validation_attempts,
+                require_web_search=require_web_search,
             ),
         )
 

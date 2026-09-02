@@ -783,8 +783,9 @@ class _AcpAdapter:
         prompt_variant: AIPromptVariant = 'Default',
         execution_guard: Callable[[], None] | None = None,
         local_validation_attempts: int = 2,
+        require_web_search: bool = False,
     ) -> AISeriesMetadataResult:
-        """固定 preset の tool-free ACP turn でシリーズ情報を生成する。"""
+        """固定 preset でシリーズ情報を生成し、必要時は検索 telemetry も検証する。"""
 
         from app.metadata.ai.acp_client import run_acp_series_metadata
 
@@ -795,7 +796,9 @@ class _AcpAdapter:
 
         result = await run_acp_series_metadata(
             command=self._command,
-            args=self._operation_args('SeriesMetadata'),
+            args=self._operation_args(
+                'EpisodeLookup' if require_web_search else 'SeriesMetadata',
+            ),
             env=self._env,
             program=program,
             hints=hints,
@@ -811,6 +814,7 @@ class _AcpAdapter:
             readable_files=self._readable_files,
             backend_kind=self._backend_kind,
             prompt_variant=prompt_variant,
+            require_web_search=require_web_search,
         )
         return replace(result, model=self._audit_model())
 
@@ -1279,6 +1283,7 @@ async def resolve_series_metadata(
     *,
     settings: RecordedSeriesSettings | None = None,
     api_key: str | None = None,
+    require_web_search: bool = False,
 ) -> AISeriesMetadataResult:
     """バックエンド非依存でシリーズ名・話数・話名を一括生成する。
 
@@ -1290,6 +1295,7 @@ async def resolve_series_metadata(
         hints: サーバーが固定したローカル・既存 Series・Wikipedia の参考情報。
         settings: 判定開始時の設定 snapshot。未指定時はここで取得する。
         api_key: 同じ時点の API キー snapshot。settings 指定時に併用する。
+        require_web_search: 公開 URL telemetry 付きの Web 検索を必須にするか。
 
     Returns:
         最小 schema と hints 内 ID 制約を検証済みの生成結果。
@@ -1340,6 +1346,7 @@ async def resolve_series_metadata(
                     )
                     else 1
                 ),
+                require_web_search=require_web_search,
             )
 
         result = await _RunBackendOperation(
@@ -1360,7 +1367,16 @@ async def resolve_series_metadata(
 
     needs_recovery = False
     if first_result is not None:
-        needs_recovery = ShouldRecoverSeriesMetadataResult(first_result)
+        needs_recovery = (
+            ShouldRecoverSeriesMetadataResult(first_result)
+            or (
+                require_web_search
+                and (
+                    first_result.web_search_performed is False
+                    or len(first_result.citations) == 0
+                )
+            )
+        )
     elif first_error is not None:
         needs_recovery = ShouldRecoverSeriesMetadataError(first_error)
 
@@ -1411,8 +1427,8 @@ async def resolve_series_metadata(
     try:
         second_result = await RunGeneration(recovery_target)
     except RecordedSeriesAIError as second_error:
-        # 主系が正常な Unresolved を返していた場合、回復試行の技術障害で
-        # その判定を Failed へ劣化させず、主系結果を監査付きで採用する。
+        # 主系が正常な Unresolved または検索根拠不足を返していた場合、回復試行の
+        # 技術障害で Failed へ劣化させず、非採用の主系結果を監査付きで返す。
         preserve_first_result = (
             first_result is not None
             and ShouldRecoverSeriesMetadataError(second_error)
