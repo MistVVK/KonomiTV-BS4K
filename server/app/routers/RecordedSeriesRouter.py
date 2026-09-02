@@ -34,6 +34,7 @@ from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettingsResponse,
     RecordedSeriesSettingsStore,
 )
+from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
 from app.metadata.SeriesIndexer import SeriesIndexer
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
@@ -452,8 +453,9 @@ async def RecordedSeriesSettingsUpdateAPI(
             detail="Failed to save recorded series settings.",
             headers=NO_STORE_HEADERS,
         ) from ex
-    # 起動時に設定破損などでPending回収できなかった場合も、設定修復直後に再試行する。
+    # 起動時に重複送信を避けて中断扱いにした bundle も、明示的な設定保存後は再試行する。
     # 話数側は旧受理条件の保存済み提案を無課金昇格し、新規録画の保留だけを再評価する。
+    await SeriesAIFallbackTask.schedule(retry_cancelled=True)
     await RecordedEpisodeAutomation.settingsUpdated()
 
 
