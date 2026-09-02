@@ -8,7 +8,8 @@
             <span class="ml-2">録画シリーズ</span>
         </h2>
         <div class="settings__description">
-            録画のタイトルから HonomiTV と同じ確定規則でシリーズを付けます。付かなければ所属しません。<br>
+            録画のタイトルから HonomiTV と同じ確定規則でシリーズを付けます。<br>
+            付かなかった録画は、AI が有効なら同一 EPG タイトルごとに Web 検索で補完します。<br>
             話数が単一の正整数で取れないときだけ、既存の話数 Web 検索を使います。<br>
             この設定と判定結果はすべてのユーザーと端末で共有されます。管理者だけが変更できます。<br>
         </div>
@@ -44,12 +45,13 @@
             </div>
             <div class="settings__item settings__item--switch">
                 <label class="settings__item-heading" for="recorded_series_ai_enabled">
-                    AI で話数 Web 検索と Bangumi 照合をする
+                    AI でシリーズ補完・話数 Web 検索・Bangumi 照合をする
                 </label>
                 <label class="settings__item-label" for="recorded_series_ai_enabled">
-                    有効時、話数が単一の正整数で取れない録画だけ Web 検索します。<br>
+                    有効時、Indexer が所属を付けられなかった同一 EPG タイトル群を1回の Web 検索で補完します。<br>
+                    所属後、話数が単一の正整数で取れない録画だけ話数を Web 検索します。<br>
                     Bangumi の作品候補選択にも同じバックエンドを使います。<br>
-                    シリーズの所属は Indexer が決め、AI では書き換えません。<br>
+                    Indexer が付けた所属を AI で書き換えることはありません。<br>
                     無効時は Web 検索と Bangumi 候補の AI 選択をしません。<br>
                     API キーと保存済みの判定結果は削除されません。<br>
                 </label>
@@ -73,10 +75,10 @@
             <div class="settings__item">
                 <div class="settings__item-heading">バックエンド</div>
                 <div class="settings__item-label">
-                    話数 Web 検索と Bangumi 候補選択に最初に使うバックエンドを選びます。<br>
+                    シリーズ補完・話数 Web 検索・Bangumi 候補選択に最初に使うバックエンドを選びます。<br>
                     OpenCode は「設定 → AIバックエンド」で登録した service を使います。<br>
                     ACP / Codex・Grok はホスト上の CLI を起動します。<br>
-                    シリーズの所属判定には使いません。接続確認は AIバックエンド画面から行えます。<br>
+                    Web 検索の接続確認は AIバックエンド画面から行えます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -244,7 +246,8 @@
             <div class="settings__item">
                 <div class="settings__item-heading">既存録画へ Indexer を再適用</div>
                 <div class="settings__item-label">
-                    保存済みの全録画へ、HonomiTV と同じ確定規則を再適用します。AI は使いません。<br>
+                    保存済みの全録画へ、HonomiTV と同じ確定規則を再適用します。<br>
+                    AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで補完します。<br>
                     付かなければ所属を外します。自動判定が無効のときは実行できません。<br>
                 </div>
                 <div v-if="series_backfill_unavailable_message !== null"
@@ -691,7 +694,7 @@ function startBackfill(): void {
     backfill_confirmation_action.value = 'Series';
     backfill_confirmation_force.value = false;
     backfill_confirmation_message.value =
-        'HonomiTV と同じ確定規則を保存済みの全録画へ再適用します。AI は使いません。付かなければ所属を外します。続行しますか？';
+        'HonomiTV と同じ確定規則を保存済みの全録画へ再適用します。AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで Web 検索します。続行しますか？';
     backfill_confirmation_dialog.value = true;
 }
 
