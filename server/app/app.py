@@ -33,6 +33,7 @@ from app.metadata.RecordedEpisodeResolver import RecordedEpisodeResolver
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.metadata.RecordedSeriesResolver import RecordedSeriesResolver
+from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
 from app.models.Channel import Channel
 from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.Program import Program
@@ -378,6 +379,9 @@ async def Startup():
     from app.metadata.SeriesIndexer import SeriesIndexer
     await SeriesIndexer.rebuild()
 
+    # Indexer 未所属だけを EPG タイトル単位で束ね、Web 検索をスキャン外で直列実行する。
+    await SeriesAIFallbackTask.start()
+
     # Series確定後の話数解析・Web検索も別ワーカーで開始し、録画スキャンを待たせない。
     await RecordedEpisodeAutomation.start()
 
@@ -497,6 +501,7 @@ async def _RunShutdownCleanup() -> None:
     # DB接続が閉じられる前にproducerのシリーズ判定を先に止め、その後に話数判定を停止する。
     # 逆順では、停止済みの話数ワーカーへSeries側がenqueueして再起動する競合が起こり得る。
     await RunCleanupStep('[RecordedSeriesResolver]', RecordedSeriesResolver.stop())
+    await RunCleanupStep('[SeriesAIFallbackTask]', SeriesAIFallbackTask.stop())
     await RunCleanupStep('[RecordedEpisodeAutomation]', RecordedEpisodeAutomation.stop())
 
     # DB接続が閉じられる前に、HTTP接続から分離した手動CM再判定を中断・回収する。

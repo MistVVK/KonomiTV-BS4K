@@ -205,6 +205,25 @@ def NormalizeSeriesTitle(title: str) -> str:
     return re.sub(r'\s+', '', unicodedata.normalize('NFKC', title)).casefold()
 
 
+def BuildSeriesAIFallbackGroupingKey(title: str) -> str:
+    """AI Web 検索を束ねる、装飾除去済みの EPG タイトル完全一致キーを返す。
+
+    Args:
+        title: EPG 由来の番組タイトル。
+
+    Returns:
+        同じ EPG タイトル系だけを束ねる完全一致キー。
+    """
+
+    normalized_source = unicodedata.normalize('NFKC', title).strip()
+    normalized_source = PROGRAM_MARK_PATTERN.sub('', normalized_source)
+    normalized_source = re.sub(r'\((?:二|字|再)\)', '', normalized_source)
+    normalized_source = PROGRAM_SLOT_PREFIX_PATTERN.sub('', normalized_source)
+    normalized_source = PROGRAM_TYPE_PREFIX_PATTERN.sub('', normalized_source)
+    normalized_source = PROGRAM_SLOT_MARK_PATTERN.sub('', normalized_source)
+    return NormalizeSeriesTitle(normalized_source.strip())
+
+
 def ParseEpisodeLessSeriesTitle(
     title: str,
     genres: list[Genre],
@@ -462,12 +481,18 @@ class SeriesIndexer:
     """録画番組を確定的な作品タイトル単位で Series へ関連付ける。"""
 
     @classmethod
-    async def linkRecordedProgram(cls, recorded_program: RecordedProgram) -> bool:
+    async def linkRecordedProgram(
+        cls,
+        recorded_program: RecordedProgram,
+        *,
+        _fallback_title: ParsedSeriesTitle | None = None,
+    ) -> bool:
         """
         1 件の録画番組を Series と放送期間へ関連付ける。
 
         Args:
             recorded_program (RecordedProgram): DB 保存済みの録画番組。
+            _fallback_title (ParsedSeriesTitle | None): Web 根拠を検証済みの内部入力。
 
         Returns:
             bool: Series へ関連付けられた場合は True。
@@ -477,13 +502,13 @@ class SeriesIndexer:
         if RecordedSeriesSettingsStore.getSettings().enabled is False:
             return False
 
-        parsed_title = ParseSeriesTitle(
+        parsed_title = _fallback_title or ParseSeriesTitle(
             recorded_program.title,
             recorded_program.genres,
             recorded_program.description,
         )
         episode_less_similar_programs: list[RecordedProgram] = []
-        if parsed_title is None:
+        if parsed_title is None and _fallback_title is None:
             # 無話数のバラエティ・音楽番組は、同じ固定タイトルで始まる別の録画を根拠にする。
             ## 引用符より前の候補で DB 検索を限定し、全録画のタイトルをロードしない。
             quote_indexes = [
@@ -503,8 +528,18 @@ class SeriesIndexer:
                     [similar_program.title for similar_program in episode_less_similar_programs],
                 )
         if parsed_title is None:
-            # Indexer が付けられない録画は所属を外し、Resolver には回さない。
+            # AI で確定済みの完全一致 cache は rebuild でも再適用する。
+            # cache がなければ所属を外し、未所属集合の非同期 Web 検索だけ予約する。
+            from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
+            cached_assignment = await SeriesAIFallbackTask.getCachedAssignment(recorded_program)
+            if cached_assignment is not None:
+                return await cls.applyAIFallback(
+                    recorded_program,
+                    display_title=cached_assignment[0],
+                    normalized_title=cached_assignment[1],
+                )
             await cls._clearSeriesAssignment(recorded_program)
+            await SeriesAIFallbackTask.schedule()
             return False
 
         # 原則は normalized_title の完全一致だけで Series を再利用し、fuzzy 類似度による誤統合を防ぐ。
@@ -702,6 +737,53 @@ class SeriesIndexer:
 
 
     @classmethod
+    async def applyAIFallback(
+        cls,
+        recorded_program: RecordedProgram,
+        *,
+        display_title: str,
+        normalized_title: str,
+    ) -> bool:
+        """Indexer 未所属の録画だけへ、Web 根拠付き完全一致タイトルを適用する。
+
+        Args:
+            recorded_program: 現在も未所属の録画番組。
+            display_title: AI 検索で確定した作品表示名。
+            normalized_title: NormalizeSeriesTitle() 済みの完全一致キー。
+
+        Returns:
+            AI 確定 Series へ関連付けた場合は True。
+        """
+
+        # 検索待機中に Indexer が確定可能になった録画は AI で上書きしない。
+        if ParseSeriesTitle(
+            recorded_program.title,
+            recorded_program.genres,
+            recorded_program.description,
+        ) is not None:
+            return False
+        if (
+            recorded_program.series_id is not None
+            or normalized_title == ''
+            or normalized_title in GENERIC_SERIES_TITLES
+        ):
+            return False
+
+        # 既存の所属・放送期間・Episode 無効化境界を再利用するため、検証済みタイトルを
+        # 一時的な ParsedSeriesTitle として同じ本線へ渡す。
+        parsed_title = ParsedSeriesTitle(
+            display_title=display_title,
+            normalized_title=normalized_title,
+            episode_number=None,
+            subtitle=recorded_program.subtitle,
+        )
+        return await cls.linkRecordedProgram(
+            recorded_program,
+            _fallback_title=parsed_title,
+        )
+
+
+    @classmethod
     async def _invalidateEpisodeResolution(
         cls,
         resolution: RecordedEpisodeResolution,
@@ -806,6 +888,10 @@ class SeriesIndexer:
         if RecordedSeriesSettingsStore.getSettings().enabled is False:
             logging.info('Series index rebuild skipped because recorded series indexing is disabled.')
             return
+
+        # 永続化済みの AI exact title を1回だけ復元し、全録画ループではメモリ snapshot を参照する。
+        from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
+        await SeriesAIFallbackTask.restoreResolvedAssignments()
 
         logging.info('Series index rebuild has started.')
         linked_count = 0
