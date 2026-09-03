@@ -1,5 +1,8 @@
 import asyncio
 import hashlib
+from typing import Literal
+
+from typing_extensions import TypedDict
 
 from app import logging
 from app.metadata.ai.recorded_series_ai import (
@@ -24,11 +27,30 @@ from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettingsStore,
 )
 from app.models.RecordedProgram import RecordedProgram
-from app.models.SeriesAIFallback import SeriesAIFallback
+from app.models.SeriesAIFallback import SeriesAIFallback, SeriesAIFallbackStatus
 
 
 _MAX_GROUP_PROGRAMS = 8
 _MAX_TEXT_LENGTH = 600
+
+
+SeriesAIFallbackWorkerState = Literal['Running', 'Idle', 'Disabled', 'Stopped']
+
+
+class SeriesAIFallbackWorkerStatus(TypedDict):
+    """バックグラウンド処理 UI へ公開する現在の batch 状態。"""
+
+    state: SeriesAIFallbackWorkerState
+    stopped_reason: str | None
+    total_groups: int
+    processed_groups: int
+    resolved_count: int
+    not_series_count: int
+    insufficient_evidence_count: int
+    failed_count: int
+    pending_count: int
+    cancelled_count: int
+    current_title: str | None
 
 
 def _truncateText(value: str, maximum_length: int = _MAX_TEXT_LENGTH) -> str:
@@ -76,6 +98,18 @@ class SeriesAIFallbackTask:
     _start_lock = asyncio.Lock()
     _batch_lock = asyncio.Lock()
     _scan_requested = False
+    # UI には永続履歴ではなく、直列 worker が所有する現在の batch snapshot を公開する。
+    _worker_state: SeriesAIFallbackWorkerState = 'Stopped'
+    _worker_stopped_reason: str | None = 'WorkerNotStarted'
+    _total_groups = 0
+    _processed_groups = 0
+    _resolved_count = 0
+    _not_series_count = 0
+    _insufficient_evidence_count = 0
+    _failed_count = 0
+    _pending_count = 0
+    _cancelled_count = 0
+    _current_title: str | None = None
     # rebuild と新規録画の Indexer 経路が、録画ごとに永続表を再照会せず参照する確定 cache。
     _resolved_assignments: dict[str, tuple[str, str]] = {}
     _cache_loaded = False
@@ -122,6 +156,8 @@ class SeriesAIFallbackTask:
                 await cls.restoreResolvedAssignments()
             if cls._worker_task is None or cls._worker_task.done():
                 cls._wake_event = asyncio.Event()
+                cls._worker_state = 'Stopped'
+                cls._worker_stopped_reason = 'WorkerStarting'
                 cls._worker_task = asyncio.create_task(cls._runWorker())
             # 外部 POST 済みかもしれない Pending は起動だけでは自動再送せず、
             # 明示的な設定保存または入力・backend 世代変更まで終端へ閉じる。
@@ -146,6 +182,10 @@ class SeriesAIFallbackTask:
         cls._worker_task = None
         cls._wake_event = None
         cls._scan_requested = False
+        cls._worker_state = 'Stopped'
+        cls._worker_stopped_reason = 'WorkerStopped'
+        cls._pending_count = 0
+        cls._current_title = None
         cls._resolved_assignments = {}
         cls._cache_loaded = False
 
@@ -167,6 +207,34 @@ class SeriesAIFallbackTask:
         cls._scan_requested = True
         if cls._wake_event is not None:
             cls._wake_event.set()
+
+    @classmethod
+    def getStatus(cls) -> SeriesAIFallbackWorkerStatus:
+        """現在の worker 状態と batch 進捗を返す。
+
+        Returns:
+            バックグラウンド処理 UI 用の現在状態。
+        """
+
+        state = cls._worker_state
+        stopped_reason = cls._worker_stopped_reason
+        # task が予期せず終了した場合も、最後の Running / Idle 表示を残さず停止として公開する。
+        if cls._worker_task is None or cls._worker_task.done():
+            state = 'Stopped'
+            stopped_reason = stopped_reason or 'WorkerNotRunning'
+        return SeriesAIFallbackWorkerStatus(
+            state=state,
+            stopped_reason=stopped_reason if state == 'Stopped' else None,
+            total_groups=cls._total_groups,
+            processed_groups=cls._processed_groups,
+            resolved_count=cls._resolved_count,
+            not_series_count=cls._not_series_count,
+            insufficient_evidence_count=cls._insufficient_evidence_count,
+            failed_count=cls._failed_count,
+            pending_count=cls._pending_count,
+            cancelled_count=cls._cancelled_count,
+            current_title=cls._current_title,
+        )
 
     @classmethod
     async def getCachedAssignment(
@@ -205,6 +273,10 @@ class SeriesAIFallbackTask:
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
+                cls._worker_state = 'Stopped'
+                cls._worker_stopped_reason = type(ex).__name__
+                cls._pending_count = 0
+                cls._current_title = None
                 logging.error('[SeriesAIFallbackTask] Fallback batch failed.', exc_info=ex)
             if cls._scan_requested:
                 cls._wake_event.set()
@@ -322,29 +394,85 @@ class SeriesAIFallbackTask:
             # 接続試験の実行履歴ではなく現在の有効設定を開始条件にする。
             # 接続能力や認証の失敗は実リクエストの監査行へ記録し、補完を黙って省略しない。
             if settings.enabled is False or settings.ai_enabled is False:
+                cls._worker_state = 'Disabled'
+                cls._worker_stopped_reason = None
+                cls._total_groups = 0
+                cls._processed_groups = 0
+                cls._resolved_count = 0
+                cls._not_series_count = 0
+                cls._insufficient_evidence_count = 0
+                cls._failed_count = 0
+                cls._pending_count = 0
+                cls._cancelled_count = 0
+                cls._current_title = None
                 logging.warning('[SeriesAIFallbackTask] Fallback batch skipped because series AI is disabled.')
                 return
             provider_fingerprint = get_episode_lookup_provider_fingerprint(settings, api_key)
             groups = await cls._loadGroups()
+            cls._worker_state = 'Idle' if len(groups) == 0 else 'Running'
+            cls._worker_stopped_reason = None
+            cls._total_groups = len(groups)
+            cls._processed_groups = 0
+            cls._resolved_count = 0
+            cls._not_series_count = 0
+            cls._insufficient_evidence_count = 0
+            cls._failed_count = 0
+            cls._pending_count = 0
+            cls._cancelled_count = 0
+            cls._current_title = None
             for grouping_key, programs in groups.items():
                 # 設定 OFF や backend 世代変更後も、古い snapshot で新規リクエストを続けない。
                 latest_settings, latest_api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
                 if latest_settings.enabled is False or latest_settings.ai_enabled is False:
+                    cls._worker_state = 'Disabled'
+                    cls._worker_stopped_reason = None
+                    cls._pending_count = 0
+                    cls._current_title = None
                     logging.warning('[SeriesAIFallbackTask] Fallback batch stopped because series AI was disabled.')
                     return
                 if (
                     get_episode_lookup_provider_fingerprint(latest_settings, latest_api_key)
                     != provider_fingerprint
                 ):
+                    cls._pending_count = 0
+                    cls._current_title = None
                     await cls.schedule()
                     return
-                await cls._resolveGroup(
+                # Web 検索中は現在の代表 EPG タイトルと Pending 1 件を公開する。
+                cls._current_title = programs[0].title.strip() or None
+                cls._pending_count = 1
+                result_status = await cls._resolveGroup(
                     grouping_key,
                     programs,
                     settings=latest_settings,
                     api_key=latest_api_key,
                     provider_fingerprint=provider_fingerprint,
                 )
+                cls._pending_count = 0
+                cls._processed_groups += 1
+                if result_status == 'Resolved':
+                    cls._resolved_count += 1
+                elif result_status == 'NotSeries':
+                    cls._not_series_count += 1
+                elif result_status == 'InsufficientEvidence':
+                    cls._insufficient_evidence_count += 1
+                elif result_status == 'Failed':
+                    cls._failed_count += 1
+                elif result_status == 'Cancelled':
+                    cls._cancelled_count += 1
+            # 最終 group の外部待機中に設定が無効化された場合も、完了後に Idle へ上書きしない。
+            latest_settings = RecordedSeriesSettingsStore.getSettings()
+            if latest_settings.enabled is False or latest_settings.ai_enabled is False:
+                cls._worker_state = 'Disabled'
+                cls._worker_stopped_reason = None
+            elif cls._cancelled_count > 0:
+                # 起動時に中断監査へ閉じた group は、明示的な設定保存まで自動再送できないことを示す。
+                cls._worker_state = 'Stopped'
+                cls._worker_stopped_reason = 'InterruptedGroupsRequireRetry'
+            else:
+                cls._worker_state = 'Idle'
+                cls._worker_stopped_reason = None
+            cls._current_title = None
 
     @classmethod
     async def _resolveGroup(
@@ -355,7 +483,7 @@ class SeriesAIFallbackTask:
         settings: RecordedSeriesSettings,
         api_key: str | None,
         provider_fingerprint: str,
-    ) -> None:
+    ) -> SeriesAIFallbackStatus:
         """1タイトル群を cache または1回の Web 検索で確定する。
 
         Args:
@@ -366,7 +494,7 @@ class SeriesAIFallbackTask:
             provider_fingerprint: backend 設定・認証世代の fingerprint。
 
         Returns:
-            None
+            処理後または再利用した fallback status。
         """
 
         from app.metadata.SeriesIndexer import (
@@ -383,7 +511,7 @@ class SeriesAIFallbackTask:
             and len(fallback.citations) > 0
         ):
             await cls._applyResolvedFallback(fallback, programs)
-            return
+            return 'Resolved'
         if (
             fallback is not None
             and fallback.input_fingerprint == input_fingerprint
@@ -395,7 +523,7 @@ class SeriesAIFallbackTask:
                 'Cancelled',
             }
         ):
-            return
+            return fallback.status
 
         fallback, _created = await SeriesAIFallback.update_or_create(
             grouping_key=grouping_key,
@@ -441,7 +569,7 @@ class SeriesAIFallbackTask:
                 latency_ms=ex.latency_ms,
                 attempt_summaries=list(ex.recovery_attempt_summaries),
             )
-            return
+            return 'Failed'
         except Exception as ex:
             logging.error(
                 f'[SeriesAIFallbackTask] Series lookup failed unexpectedly. grouping_key: {grouping_key}',
@@ -451,7 +579,7 @@ class SeriesAIFallbackTask:
                 status='Failed',
                 error_code='SeriesAIFallbackFailed',
             )
-            return
+            return 'Failed'
 
         citation_records = [
             {'url': citation.url, 'title': citation.title}
@@ -488,7 +616,7 @@ class SeriesAIFallbackTask:
                 and latest_settings.ai_enabled
             ):
                 await cls.schedule(retry_cancelled=True)
-            return
+            return 'Cancelled'
 
         normalized_title = (
             NormalizeSeriesTitle(result.series_title)
@@ -510,7 +638,7 @@ class SeriesAIFallbackTask:
             and len(result.citations) > 0
         )
         if accepted is False:
-            terminal_status = (
+            terminal_status: SeriesAIFallbackStatus = (
                 'NotSeries'
                 if (
                     result.decision == 'NotSeries'
@@ -532,7 +660,7 @@ class SeriesAIFallbackTask:
                 attempt_summaries=list(result.recovery_attempt_summaries),
                 error_code=None,
             )
-            return
+            return terminal_status
 
         assert result.series_title is not None
         assert normalized_title is not None
@@ -559,6 +687,7 @@ class SeriesAIFallbackTask:
         )
         fallback = await SeriesAIFallback.get(grouping_key=grouping_key)
         await cls._applyResolvedFallback(fallback, programs)
+        return 'Resolved'
 
     @classmethod
     async def _applyResolvedFallback(

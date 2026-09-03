@@ -8,6 +8,7 @@ from fastapi.exceptions import HTTPException
 from tortoise.expressions import Q
 
 from app import schemas
+from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
 from app.models.AnalysisTask import AnalysisTaskExecution
 from app.models.CMAnalysis import CMLogoGenerationAttempt
 from app.models.User import User
@@ -88,9 +89,11 @@ async def AnalysisTaskOverviewAPI() -> schemas.AnalysisTaskOverview:
             .limit(500)
         )
     # 未ログイン公開のため、管理者専用のエラー本文は常に伏せる。
+    # シリーズ AI の代表タイトルは、既存の実行中タスク title と同じ現在処理中情報として返す。
     return schemas.AnalysisTaskOverview(
         active=[SerializeExecution(item, False) for item in active],
         active_children=[SerializeExecution(item, False) for item in active_children],
+        series_ai_fallback=schemas.SeriesAIFallbackStatus.model_validate(SeriesAIFallbackTask.getStatus()),
     )
 
 

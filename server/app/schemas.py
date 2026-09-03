@@ -600,9 +600,23 @@ class AnalysisTaskExecution(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+class SeriesAIFallbackStatus(BaseModel):
+    state: Literal['Running', 'Idle', 'Disabled', 'Stopped']
+    stopped_reason: str | None
+    total_groups: int
+    processed_groups: int
+    resolved_count: int
+    not_series_count: int
+    insufficient_evidence_count: int
+    failed_count: int
+    pending_count: int
+    cancelled_count: int
+    current_title: str | None
+
 class AnalysisTaskOverview(BaseModel):
     active: list[AnalysisTaskExecution]
     active_children: list[AnalysisTaskExecution]
+    series_ai_fallback: SeriesAIFallbackStatus
 
 class AnalysisTaskList(BaseModel):
     total: int
