@@ -647,7 +647,7 @@ const empty_acp_settings = computed<IACPBackendSettings>(() => ({
     model: null,
     reasoning_effort: null,
     codex_fast_mode_enabled: false,
-    timeout_sec: 120,
+    timeout_sec: 600,
 }));
 /** ACPBackendSection のドラフト更新を ACP 設定へ反映する。 */
 function updateACPDraft(provider: 'codex' | 'grok', settings: IACPBackendSettings): void {

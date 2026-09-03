@@ -308,7 +308,8 @@ export default class AIBackend {
         const response = await APIClient.post<IAIBackendConnectionTestResult>(
             '/ai-backends/openai-compatible/connection-test',
             {capability},
-            {timeout: 180 * 1000},
+            // server の read timeout 10分と監査保存の回収余裕1分を待つ。
+            {timeout: 11 * 60 * 1000},
         );
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'OpenAI 互換 API の接続試験を実行できませんでした。');
@@ -466,8 +467,8 @@ export default class AIBackend {
         const response = await APIClient.post<IAIBackendConnectionTestResult>(
             '/ai-backends/connection-test',
             {service_id, capability},
-            // 接続試験は時間がかかることがある
-            {timeout: 180 * 1000},
+            // Auto の2 prompt × 最大2 session（各10分）と session 回収余裕5分を待つ。
+            {timeout: 45 * 60 * 1000},
         );
         if (response.type === 'error') {
             if (response.status === 503) {

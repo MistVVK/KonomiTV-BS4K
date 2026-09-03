@@ -58,6 +58,11 @@ ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND: dict[str, AcpReasoningEffort] = {
 # KonomiTV-BS4K の ACP バックエンド種別。固定プリセットとして 2 種のみ。
 ACPBackendKind = Literal['AcpCodex', 'AcpGrok']
 
+# version 未記録の設定文書は、ACP 設定分離から schema version 導入前までに保存された形式。
+_ACP_SETTINGS_SCHEMA_VERSION = 1
+_ACP_LEGACY_DEFAULT_TIMEOUT_SEC = 120
+_ACP_DEFAULT_TIMEOUT_SEC = 600
+
 
 def IsKonomiTVBS4KCodexSolModel(konomitv_bs4k_model: str | None) -> bool:
     """Codex のモデル ID が Sol 系統かを判定する。
@@ -132,7 +137,8 @@ class ACPBackendSettings(BaseModel):
     codex_fast_mode_enabled: Annotated[bool, Field()] = False
     # 壁時計の総実行上限ではなく、ACP stdio の無通信打ち切り秒数。
     # thought / tool update などの NDJSON 行が届くたびにタイマーはリセットされる。
-    timeout_sec: Annotated[int, Field(ge=30, le=600)] = 120
+    # Web 検索を伴う推論は 120 秒では打ち切られるため、既定を 600 秒へ引き上げる。
+    timeout_sec: Annotated[int, Field(ge=30, le=_ACP_DEFAULT_TIMEOUT_SEC)] = _ACP_DEFAULT_TIMEOUT_SEC
 
     @field_validator('model')
     @classmethod
@@ -258,7 +264,43 @@ class ACPSettingsStore:
             settings_json = json.loads(cls.SETTINGS_PATH.read_text(encoding='utf-8'))
             if isinstance(settings_json, dict) is False:
                 raise ValueError('ACP settings document is invalid.')
-            return ACPSettings.model_validate(settings_json)
+            schema_version = settings_json.pop('schema_version', None)
+            if schema_version not in (None, _ACP_SETTINGS_SCHEMA_VERSION):
+                raise ValueError('ACP settings schema version is unsupported.')
+
+            # schema version 導入前の旧既定値だけを一度更新し、利用者が選んだ他の値は保持する。
+            needs_migration = schema_version is None
+            if needs_migration:
+                settings_json = cls._migrateUnversionedSettingsDocumentLocked(settings_json)
+            settings = ACPSettings.model_validate(settings_json)
+            if needs_migration:
+                cls.saveSettings(settings)
+            return settings
+
+    @classmethod
+    def _migrateUnversionedSettingsDocumentLocked(
+        cls,
+        settings_json: dict[str, object],
+    ) -> dict[str, object]:
+        """schema version 導入前の ACP 設定を現行形式へ移行する。
+
+        Args:
+            settings_json: JSON から読み込んだ version 未記録の設定文書。
+
+        Returns:
+            旧既定値の timeout だけを600秒へ更新した設定文書。
+        """
+
+        migrated = dict(settings_json)
+        # Codex / Grok は独立設定のため、旧既定値を保持する側だけを更新する。
+        for backend_name in ('codex', 'grok'):
+            backend = migrated.get(backend_name)
+            if isinstance(backend, dict) and backend.get('timeout_sec') == _ACP_LEGACY_DEFAULT_TIMEOUT_SEC:
+                migrated[backend_name] = {
+                    **backend,
+                    'timeout_sec': _ACP_DEFAULT_TIMEOUT_SEC,
+                }
+        return migrated
 
     @classmethod
     def _tryMigrateFromRecordedSeriesSettingsLocked(cls) -> ACPSettings | None:
@@ -308,13 +350,14 @@ class ACPSettingsStore:
         if 'acp_timeout_sec' in legacy_raw:
             payload['timeout_sec'] = legacy_raw.get('acp_timeout_sec')
         try:
-            migrated = ACPSettings.model_validate({
+            migrated_payload = cls._migrateUnversionedSettingsDocumentLocked({
                 target_kind: payload,
                 # 移行対象でない側は既定値のまま。
                 'grok' if target_kind == 'codex' else 'codex': {
                     'backend_kind': 'AcpGrok' if target_kind == 'codex' else 'AcpCodex',
                 },
             })
+            migrated = ACPSettings.model_validate(migrated_payload)
         except ValueError:
             return None
         # 移行結果を atomic 保存し、次回以降は acp-settings.json を正本にする。
@@ -338,7 +381,11 @@ class ACPSettingsStore:
 
         with cls._lock:
             validated = ACPSettings.model_validate(settings.model_dump())
-            payload = validated.model_dump(mode='json')
+            # store 固有の schema version は API model に露出させず、永続化時だけ先頭へ付与する。
+            payload = {
+                'schema_version': _ACP_SETTINGS_SCHEMA_VERSION,
+                **validated.model_dump(mode='json'),
+            }
             content = json.dumps(payload, ensure_ascii=False, indent=4) + '\n'
             cls._writeAtomic(cls.SETTINGS_PATH, content)
 

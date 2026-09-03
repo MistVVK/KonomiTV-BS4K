@@ -895,7 +895,7 @@ class OpenCodeClient:
         agent: str,
         schema: dict[str, Any],
         retry_count: int = 1,
-        timeout_sec: float = 120.0,
+        timeout_sec: float = 600.0,
         tools: dict[str, bool] | None = None,
         include_format: bool = True,
     ) -> dict[str, Any]:

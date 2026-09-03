@@ -86,8 +86,8 @@ from app.metadata.RecordedSeriesGeneration import (
 
 # service 単位の同時実行上限（製品 serve と API 従量の暴走防止）。
 _OPENCODE_SERVICE_MAX_CONCURRENCY = 2
-# prompt の HTTP タイムアウト秒。
-_OPENCODE_PROMPT_TIMEOUT_SEC = 120.0
+# prompt の HTTP タイムアウト秒。Web 検索を伴う推論は 120 秒では打ち切られるため 600 秒を許す。
+_OPENCODE_PROMPT_TIMEOUT_SEC = 600.0
 # OpenCode 側 format.retryCount（同一 session 内の出力形式補修）。
 _OPENCODE_FORMAT_RETRY_COUNT = 1
 # シリーズ生成の Pydantic 検証失敗時の session 再作成回数。

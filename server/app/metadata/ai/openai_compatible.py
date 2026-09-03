@@ -61,7 +61,8 @@ from app.metadata.RecordedSeriesGeneration import (
 )
 
 
-_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+# read は Web 検索を伴う長時間推論に耐えるよう 600 秒とする (接続・書込は短くてよい)。
+_HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0)
 _CANDIDATE_VALIDATION_ATTEMPTS = 2
 
 
