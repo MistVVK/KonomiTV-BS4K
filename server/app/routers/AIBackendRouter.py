@@ -66,6 +66,7 @@ from app.metadata.ai.opencode_serve import (
 )
 from app.metadata.ai.recorded_series_ai import (
     GetACPCredentialOperationLock,
+    GetAcpModelCatalog,
     IsACPOperationRunning,
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
@@ -438,6 +439,24 @@ class ACPBackendConnectionTestRequest(BaseModel):
         Literal['CandidateSelection', 'EpisodeLookup'],
         Field(),
     ] = 'CandidateSelection'
+
+
+class ACPGrokModelResponse(BaseModel):
+    """Grok ACP が広告したモデル1件。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    model_id: Annotated[str, Field(min_length=1, max_length=255)]
+    model_name: Annotated[str, Field(min_length=1, max_length=255)]
+
+
+class ACPGrokModelCatalogResponse(BaseModel):
+    """Grok ACP の session/new から取得したモデル一覧。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    current_model_id: Annotated[str, Field(min_length=1, max_length=255)]
+    models: list[ACPGrokModelResponse]
 
 
 def _httpErrorFromOpenCode(error: OpenCodeClientError) -> HTTPException:
@@ -1302,6 +1321,73 @@ async def ACPBackendSettingsAPI(
             detail='Failed to load ACP settings.',
             headers=NO_STORE_HEADERS,
         ) from error
+
+
+@router.get(
+    '/acp-models/grok',
+    summary='Grok ACP モデル一覧取得 API',
+    response_model=ACPGrokModelCatalogResponse,
+)
+async def ACPGrokModelListAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPGrokModelCatalogResponse:
+    """Grok ACP の session/new が広告したモデルだけを返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        Grok ACP が広告したモデル一覧と現在値。
+
+    Raises:
+        HTTPException: 認証未取り込み、ACP 実行中、または広告取得失敗の場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    # モデル広告も ACP process を起動するため、接続試験と同じ認証・直列実行条件を守る。
+    preflight_error = _ACPBackendConnectionTestPreflightError('AcpGrok')
+    if preflight_error is not None:
+        error_code, _ = preflight_error
+        if error_code == 'ACPAuthenticationUnavailable':
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail='Grok ACP authentication is unavailable.',
+                headers=NO_STORE_HEADERS,
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Another ACP operation is running.',
+            headers=NO_STORE_HEADERS,
+        )
+
+    try:
+        catalog = await GetAcpModelCatalog('AcpGrok')
+    except RecordedSeriesAIError as error:
+        logging.error(f'[ACPGrokModelListAPI] Failed to load model catalog ({error.code}).')
+        if error.code in {'Timeout', 'HardTimeout'}:
+            response_status = status.HTTP_504_GATEWAY_TIMEOUT
+        elif error.code == 'HostCLIStartFailed':
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            response_status = status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(
+            status_code=response_status,
+            detail='Failed to load the Grok ACP model catalog.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+    return ACPGrokModelCatalogResponse(
+        current_model_id=catalog.current_model_id,
+        models=[
+            ACPGrokModelResponse(
+                model_id=model.model_id,
+                model_name=model.model_name,
+            )
+            for model in catalog.models
+        ],
+    )
 
 
 @router.put(
