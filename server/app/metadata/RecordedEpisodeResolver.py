@@ -260,6 +260,8 @@ class RecordedEpisodeResolver:
 
         # API以外の統合フックから呼ばれても、不正値をDBへ到達させない。
         FormatEpisodeNumber(season_number, episode_number)
+        # 指数表記の Decimal (1E+1) は TEXT カラムへそのまま文字列化されるため、f 形式へ正規化する。
+        episode_number = Decimal(format(episode_number, 'f'))
         episode = await SeriesEpisode.filter(
             series_id=series_id,
             season_number=season_number,

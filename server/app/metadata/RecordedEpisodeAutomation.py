@@ -741,6 +741,8 @@ class RecordedEpisodeAutomation:
         """
 
         legacy_value = FormatEpisodeNumber(season_number, episode_number)
+        # 指数表記の Decimal (1E+1) は TEXT カラムへそのまま文字列化されるため、f 形式へ正規化する。
+        episode_number = Decimal(format(episode_number, 'f'))
         async with transactions.in_transaction() as connection:
             recorded_program = (
                 await RecordedProgram.filter(id=snapshot.id)

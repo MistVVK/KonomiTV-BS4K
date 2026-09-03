@@ -105,6 +105,8 @@ BROADCAST_EDITION_SUFFIX_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 QUOTED_SUBTITLE_PATTERN = re.compile(r'[「『](?P<subtitle>.*?)[」』]')
+# 日曜劇場「VIVANT」のように枠名の直後に来る引用符は、各話副題ではなく作品名の一部を表す。
+QUOTED_SLOT_WORK_PREFIX_PATTERN = re.compile(r'(?:劇場|ロードショー|シネマ|シアター)$')
 QUOTED_LEVEL_EPISODE_PATTERN = re.compile(
     r'^Lv\s*(?P<episode>[0-9]+(?:\.[0-9]+)?)\s+(?P<subtitle>.+)$',
     flags=re.IGNORECASE,
@@ -177,6 +179,8 @@ def NormalizeEpisodeNumber(episode_number: str) -> str:
     parts = re.split(r'\s*[・&／/\-～~]\s*#?\s*', episode_number)
     normalized_parts: list[str] = []
     for part in parts:
+        # EPG 更新で先頭の # が残ったまま話数だけ抽出される値があるため、比較前に外す。
+        part = part.lstrip('#')
         japanese_number = ParseJapaneseNumber(part)
         if part.isdigit():
             normalized_parts.append(str(int(part)))
@@ -348,8 +352,19 @@ def ParseSeriesTitle(
 
     # 「…」内は各話副題として先に保持し、作品名の比較キーからは除外する。
     subtitle_match = QUOTED_SUBTITLE_PATTERN.search(normalized_source)
+    # 枠名 (日曜劇場・金曜ロードショーなど) の直後にある引用符は作品名の一部なので副題にしない。
+    ## 例: 日曜劇場「VIVANT」第11話 → 引用符内を副題にすると枠名だけのシリーズへ誤統合する。
+    if (
+        subtitle_match is not None
+        and QUOTED_SLOT_WORK_PREFIX_PATTERN.search(normalized_source[:subtitle_match.start()].rstrip()) is not None
+    ):
+        subtitle_match = None
     subtitle = subtitle_match.group('subtitle').strip() if subtitle_match is not None else None
-    title_without_quoted_subtitle = QUOTED_SUBTITLE_PATTERN.sub('', normalized_source).strip()
+    title_without_quoted_subtitle = (
+        QUOTED_SUBTITLE_PATTERN.sub('', normalized_source).strip()
+        if subtitle_match is not None
+        else normalized_source
+    )
 
     # #6 / 第6話 / Chapter 6 など、話数だと断定できる位置より前を作品名として採用する。
     episode_source = title_without_quoted_subtitle
