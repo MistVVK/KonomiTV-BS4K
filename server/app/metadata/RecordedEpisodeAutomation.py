@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
@@ -48,12 +49,19 @@ from app.metadata.RecordedEpisodeSearch import (
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
 from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
+from app.metadata.SeriesCatalog import IsRebroadcastTitle
+from app.metadata.SeriesIndexer import ParseJapaneseNumber
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedSeries import RecordedSeriesAIRequest
 
 
 RECORDED_EPISODE_AUTOMATION_VERSION = "1"
+
+# 「第N部」は単発特番内の放送区分であり、作品の公開話数ではない。
+_BROADCAST_PART_PATTERN = re.compile(
+    r'第\s*(?P<number>[0-9０-９一二三四五六七八九十百千〇零壱弐参拾貳肆伍陸漆玖]+)\s*部',
+)
 
 
 class _EpisodeCitationRecord(TypedDict):
@@ -79,6 +87,32 @@ class _EpisodeProgramSnapshot:
     channel_id: str | None
     channel_name: str | None
     start_time: datetime
+
+
+def _getBroadcastPartNumbers(snapshot: _EpisodeProgramSnapshot) -> set[Decimal]:
+    """番組名と副題に明示された「第N部」の N を抽出する。
+
+    Args:
+        snapshot: 話数検索対象の録画メタデータ。
+
+    Returns:
+        話数として利用してはいけない放送上の部番号。
+    """
+
+    part_numbers: set[Decimal] = set()
+    for text in (snapshot.title, snapshot.subtitle):
+        if text is None:
+            continue
+        for match in _BROADCAST_PART_PATTERN.finditer(text):
+            raw_number = match.group('number')
+            parsed_number = (
+                int(raw_number)
+                if raw_number.isdigit()
+                else ParseJapaneseNumber(raw_number)
+            )
+            if parsed_number is not None:
+                part_numbers.add(Decimal(parsed_number))
+    return part_numbers
 
 
 @dataclass(frozen=True, slots=True)
@@ -1311,6 +1345,39 @@ class RecordedEpisodeAutomation:
                 connection=connection,
             )
 
+    @staticmethod
+    async def _hasUnmarkedCrossDateEpisodeDuplicate(
+        *,
+        snapshot: _EpisodeProgramSnapshot,
+        season_number: int,
+        episode_number: Decimal,
+    ) -> bool:
+        """別日録画に同じ話数があり、双方に再放送印がないかを確認する。
+
+        Args:
+            snapshot: 今回の話数検索対象。
+            season_number: AI が提案したシーズン番号。
+            episode_number: AI が提案した話数。
+
+        Returns:
+            捏造の可能性がある同番号重複が存在する場合は True。
+        """
+
+        if IsRebroadcastTitle(f'{snapshot.title} {snapshot.subtitle or ""}'):
+            return False
+        candidates = await RecordedProgram.filter(
+            series_id=snapshot.series_id,
+            series_episode__season_number=season_number,
+            series_episode__episode_number=episode_number,
+            recorded_video__status='Recorded',
+        ).exclude(id=snapshot.id).all()
+        broadcast_date = snapshot.start_time.astimezone(JST).date()
+        return any(
+            candidate.start_time.astimezone(JST).date() != broadcast_date
+            and IsRebroadcastTitle(f'{candidate.title} {candidate.subtitle or ""}') is False
+            for candidate in candidates
+        )
+
     @classmethod
     async def resolveProgram(
         cls,
@@ -1709,6 +1776,35 @@ class RecordedEpisodeAutomation:
                 )
                 raise _RecordedEpisodeSnapshotChanged
 
+            # 部制特番の「第N部」と同じ N は話数ではない。AI が Resolved を返しても
+            # 検索済み evidence を保ったまま NoPublishedNumber へ安全側に正規化する。
+            has_unmarked_cross_date_duplicate = False
+            if (
+                result.outcome == 'Resolved'
+                and result.episode_number is not None
+                and result.episode_number in _getBroadcastPartNumbers(snapshot)
+            ):
+                result = replace(
+                    result,
+                    outcome='NoPublishedNumber',
+                    episode_number=None,
+                    rationale_short='番組情報の「第N部」は話数ではなく放送上の部番号です。',
+                )
+            elif (
+                result.outcome == 'Resolved'
+                and result.season_number is not None
+                and result.episode_number is not None
+            ):
+                # 同一 Series の別日録画に同番号があり、双方に再放送印がない結果は
+                # 公開採番の誤推定とみなし、自動反映せず確認へ戻す。
+                has_unmarked_cross_date_duplicate = (
+                    await cls._hasUnmarkedCrossDateEpisodeDuplicate(
+                        snapshot=snapshot,
+                        season_number=result.season_number,
+                        episode_number=result.episode_number,
+                    )
+                )
+
             # 外部待機中に受理条件が更新されても、課金済み結果を旧 snapshot の
             # 条件で取りこぼさない。backend や認証 snapshot は呼出し時点を維持する。
             selected_choice_id: str | None
@@ -1734,7 +1830,10 @@ class RecordedEpisodeAutomation:
                 'NotNumbered',
                 'NoPublishedNumber',
             }:
-                accepted = IsEpisodeLookupResultAccepted(result)
+                accepted = (
+                    IsEpisodeLookupResultAccepted(result)
+                    and has_unmarked_cross_date_duplicate is False
+                )
                 if accepted:
                     terminal_status = "Succeeded"
                 else:
@@ -1744,6 +1843,11 @@ class RecordedEpisodeAutomation:
                         outcome='InsufficientEvidence',
                         season_number=None,
                         episode_number=None,
+                        rationale_short=(
+                            '同一シリーズの別日録画に、再放送印なしで同じ話数が割り当てられています。'
+                            if has_unmarked_cross_date_duplicate
+                            else result.rationale_short
+                        ),
                     )
                     terminal_status = "Rejected"
                     terminal_error = RecordedSeriesAIError("AcceptancePolicyRejected")
