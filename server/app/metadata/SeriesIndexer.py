@@ -209,6 +209,23 @@ def NormalizeSeriesTitle(title: str) -> str:
     return re.sub(r'\s+', '', unicodedata.normalize('NFKC', title)).casefold()
 
 
+def AreAIFallbackSeriesTitlesClose(left: str, right: str) -> bool:
+    """AI 補完名と既存 Series 名が完全一致または接尾辞拡張の関係か判定する。
+
+    Args:
+        left: NormalizeSeriesTitle() 済みの一方のタイトル。
+        right: NormalizeSeriesTitle() 済みのもう一方のタイトル。
+
+    Returns:
+        同一名か、十分な長さの短い側へ接尾辞を加えた関係なら True。
+    """
+
+    if left == right:
+        return True
+    shorter, longer = sorted((left, right), key=len)
+    return len(shorter) >= 4 and longer.startswith(shorter)
+
+
 def BuildSeriesAIFallbackGroupingKey(title: str) -> str:
     """AI Web 検索を束ねる、装飾除去済みの EPG タイトル完全一致キーを返す。
 
@@ -495,12 +512,48 @@ def _episodeNumbersMatch(left: str | None, right: str | None) -> bool:
 class SeriesIndexer:
     """録画番組を確定的な作品タイトル単位で Series へ関連付ける。"""
 
+    @staticmethod
+    async def resolveAIFallbackSeries(
+        *,
+        existing_series_id: int | None,
+        normalized_title: str,
+    ) -> tuple[Series, str] | None:
+        """AI が選んだ既存 Series ID の実在とタイトル関係を検証する。
+
+        Args:
+            existing_series_id: AI が同一作品として選んだ hints 内の既存 Series ID。
+            normalized_title: AI が返した NormalizeSeriesTitle() 済みタイトル。
+
+        Returns:
+            検証済み Series とその正規化名。再利用できない場合は None。
+        """
+
+        if existing_series_id is None:
+            return None
+        candidate = await Series.get_or_none(id=existing_series_id)
+        candidate_normalized_title = (
+            candidate.normalized_title or NormalizeSeriesTitle(candidate.title)
+            if candidate is not None
+            else None
+        )
+        if (
+            candidate is not None
+            and candidate_normalized_title is not None
+            and AreAIFallbackSeriesTitlesClose(normalized_title, candidate_normalized_title)
+        ):
+            return (candidate, candidate_normalized_title)
+        logging.warning(
+            '[SeriesIndexer] Ignored an AI fallback existing Series ID because its title did not match.',
+        )
+        return None
+
     @classmethod
     async def linkRecordedProgram(
         cls,
         recorded_program: RecordedProgram,
         *,
         _fallback_title: ParsedSeriesTitle | None = None,
+        _fallback_series: Series | None = None,
     ) -> bool:
         """
         1 件の録画番組を Series と放送期間へ関連付ける。
@@ -508,6 +561,7 @@ class SeriesIndexer:
         Args:
             recorded_program (RecordedProgram): DB 保存済みの録画番組。
             _fallback_title (ParsedSeriesTitle | None): Web 根拠を検証済みの内部入力。
+            _fallback_series (Series | None): ID とタイトルの整合性を検証済みの再利用対象。
 
         Returns:
             bool: Series へ関連付けられた場合は True。
@@ -552,6 +606,7 @@ class SeriesIndexer:
                     recorded_program,
                     display_title=cached_assignment[0],
                     normalized_title=cached_assignment[1],
+                    existing_series_id=cached_assignment[2],
                 )
             await cls._clearSeriesAssignment(recorded_program)
             await SeriesAIFallbackTask.schedule()
@@ -559,18 +614,24 @@ class SeriesIndexer:
 
         # 原則は normalized_title の完全一致だけで Series を再利用し、fuzzy 類似度による誤統合を防ぐ。
         ## Bangumi 条目で統合済みの放送局別表記は alias に残るため、主タイトルの次に完全一致で解決する。
-        series = await Series.get_or_none(normalized_title=parsed_title.normalized_title)
+        series = _fallback_series
         if series is None:
-            series_alias = await SeriesAlias.get_or_none(
-                normalized_title = parsed_title.normalized_title,
-            ).select_related('series')
-            if series_alias is not None:
-                series = series_alias.series
+            series = await Series.get_or_none(normalized_title=parsed_title.normalized_title)
+            if series is None:
+                series_alias = await SeriesAlias.get_or_none(
+                    normalized_title = parsed_title.normalized_title,
+                ).select_related('series')
+                if series_alias is not None:
+                    series = series_alias.series
         is_series_created = False
 
         # 一部放送局は副題を丸ごと省略するため、同じ話数が別局の正式作品名へ既に存在する場合に限り、
         ## 「短縮名 + 明示的な副題境界」の前方一致を作品名 alias として扱う。
-        if recorded_program.channel_id is not None and parsed_title.episode_number is not None:
+        if (
+            _fallback_series is None
+            and recorded_program.channel_id is not None
+            and parsed_title.episode_number is not None
+        ):
             longer_series_candidates = await Series.filter(
                 normalized_title__startswith = parsed_title.normalized_title,
             ).all()
@@ -758,6 +819,7 @@ class SeriesIndexer:
         *,
         display_title: str,
         normalized_title: str,
+        existing_series_id: int | None = None,
     ) -> bool:
         """Indexer 未所属の録画だけへ、Web 根拠付き完全一致タイトルを適用する。
 
@@ -765,6 +827,7 @@ class SeriesIndexer:
             recorded_program: 現在も未所属の録画番組。
             display_title: AI 検索で確定した作品表示名。
             normalized_title: NormalizeSeriesTitle() 済みの完全一致キー。
+            existing_series_id: AI が同一作品として選んだ hints 内の既存 Series ID。
 
         Returns:
             AI 確定 Series へ関連付けた場合は True。
@@ -784,6 +847,17 @@ class SeriesIndexer:
         ):
             return False
 
+        # hints 内 ID でも削除 race や AI の候補誤選択はあり得るため、実在とタイトル関係を再検証する。
+        # 検証を通った場合だけ既存側のタイトルを正本にし、返却された年号付き変名などを残さない。
+        fallback_series: Series | None = None
+        resolved_series = await cls.resolveAIFallbackSeries(
+            existing_series_id=existing_series_id,
+            normalized_title=normalized_title,
+        )
+        if resolved_series is not None:
+            fallback_series, normalized_title = resolved_series
+            display_title = fallback_series.title
+
         # 既存の所属・放送期間・Episode 無効化境界を再利用するため、検証済みタイトルを
         # 一時的な ParsedSeriesTitle として同じ本線へ渡す。
         parsed_title = ParsedSeriesTitle(
@@ -795,6 +869,7 @@ class SeriesIndexer:
         return await cls.linkRecordedProgram(
             recorded_program,
             _fallback_title=parsed_title,
+            _fallback_series=fallback_series,
         )
 
 
