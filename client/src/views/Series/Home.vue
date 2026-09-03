@@ -63,6 +63,7 @@ import HeaderBar from '@/components/HeaderBar.vue';
 import Navigation from '@/components/Navigation.vue';
 import SeriesEpisodeList from '@/components/Series/SeriesEpisodeList.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
+import { PRESERVE_SCROLL_POSITION_STATE_KEY } from '@/router';
 import Series, { type ISeriesSummary } from '@/services/Series';
 import Utils from '@/utils';
 
@@ -212,7 +213,6 @@ const toggleExpand = async (seriesId: number) => {
     routeSyncGeneration++;
     const nextId = expandedId.value === seriesId ? null : seriesId;
     expandedId.value = nextId;
-    const scrollY = window.scrollY;
     await router.replace({
         path: nextId === null ? '/series/' : `/series/${nextId}`,
         query: {
@@ -220,10 +220,9 @@ const toggleExpand = async (seriesId: number) => {
             order: sortOrder.value,
             page: String(currentPage.value),
         },
+        state: {[PRESERVE_SCROLL_POSITION_STATE_KEY]: true},
     });
     if (route.fullPath === previousFullPath) await syncRouteState();
-    await nextTick();
-    window.scrollTo({top: scrollY});
 };
 
 const syncRouteState = async () => {

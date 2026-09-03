@@ -61,7 +61,7 @@
 </template>
 <script lang="ts" setup>
 
-import { computed, nextTick, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import Breadcrumbs from '@/components/Breadcrumbs.vue';
@@ -69,6 +69,7 @@ import HeaderBar from '@/components/HeaderBar.vue';
 import Navigation from '@/components/Navigation.vue';
 import SeriesEpisodeList from '@/components/Series/SeriesEpisodeList.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
+import { PRESERVE_SCROLL_POSITION_STATE_KEY } from '@/router';
 import Series, { type ISeriesOnAirDay, type ISeriesOnAirSlot } from '@/services/Series';
 import { WEEKDAY_LABELS, formatSlotLabel, toDisplayHour, toDisplayWeekday } from '@/views/Series/OnAirUtils';
 
@@ -145,12 +146,12 @@ const syncExpandedFromRoute = async () => {
 const toggleExpand = async (seriesId: number, weekday: number, slotIndex: number) => {
     const nextSlot = isSlotExpanded(seriesId, weekday, slotIndex) ? null : {seriesId, weekday, slotIndex};
     expandedSlot.value = nextSlot;
-    const scrollY = window.scrollY;
+    // 同じシリーズの別曜日 slot は URL が変わらないため、不要な navigation と scroll を起こさない。
+    if (nextSlot !== null && route.params.id === String(nextSlot.seriesId)) return;
     await router.replace({
         path: nextSlot === null ? '/series/on-air' : `/series/on-air/${nextSlot.seriesId}`,
+        state: {[PRESERVE_SCROLL_POSITION_STATE_KEY]: true},
     });
-    await nextTick();
-    window.scrollTo({top: scrollY});
 };
 
 onMounted(async () => {
