@@ -306,6 +306,22 @@ class _ObservedAcpToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class AcpAdvertisedModel:
+    """ACP agent が session/new で広告したモデル1件。"""
+
+    model_id: str
+    model_name: str
+
+
+@dataclass(frozen=True, slots=True)
+class AcpModelCatalog:
+    """ACP agent が session/new で広告したモデル一覧と現在値。"""
+
+    current_model_id: str
+    models: tuple[AcpAdvertisedModel, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _AcpSessionResult:
     """ACP 1 turn の本文と、本文から独立した検証済み Web trace。"""
 
@@ -313,6 +329,7 @@ class _AcpSessionResult:
     web_search_performed: bool
     citations: tuple[EpisodeLookupCitation, ...]
     web_search_failed: bool
+    model_catalog: AcpModelCatalog | None = None
 
 
 @dataclass(slots=True)
@@ -2088,6 +2105,60 @@ def _find_model_config_id(session_result: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _parseAcpModelCatalog(session_result: Mapping[str, Any]) -> AcpModelCatalog:
+    """session/new の models 広告を検証してモデル一覧へ変換する。
+
+    Args:
+        session_result: ACP agent が返した session/new result。
+
+    Returns:
+        agent が広告したモデル ID・表示名と現在のモデル ID。
+
+    Raises:
+        _AcpProtocolError: 広告が欠落・空・不正・重複している場合。
+    """
+
+    models_payload = session_result.get('models')
+    if not isinstance(models_payload, dict):
+        raise _AcpProtocolError('ACP agent did not advertise models.')
+    current_model_id = models_payload.get('currentModelId')
+    available_models = models_payload.get('availableModels')
+    if (
+        not isinstance(current_model_id, str) or
+        not 1 <= len(current_model_id) <= 255 or
+        not isinstance(available_models, list) or
+        len(available_models) == 0
+    ):
+        raise _AcpProtocolError('ACP agent advertised an invalid model catalog.')
+
+    parsed_models: list[AcpAdvertisedModel] = []
+    model_ids: set[str] = set()
+    # 候補を補完・推測せず、agent が広告した有効な ID と表示名だけを受理する。
+    for advertised_model in available_models:
+        if not isinstance(advertised_model, dict):
+            raise _AcpProtocolError('ACP agent advertised an invalid model entry.')
+        model_id = advertised_model.get('modelId')
+        model_name = advertised_model.get('name')
+        if (
+            not isinstance(model_id, str) or
+            not 1 <= len(model_id) <= 255 or
+            not isinstance(model_name, str) or
+            not 1 <= len(model_name) <= 255 or
+            model_id in model_ids
+        ):
+            raise _AcpProtocolError('ACP agent advertised an invalid or duplicate model entry.')
+        parsed_models.append(AcpAdvertisedModel(model_id=model_id, model_name=model_name))
+        model_ids.add(model_id)
+
+    # currentModelId も同じ広告集合に含まれなければ、UI が安全な現在値を選べない。
+    if current_model_id not in model_ids:
+        raise _AcpProtocolError('ACP agent current model was not present in the advertised catalog.')
+    return AcpModelCatalog(
+        current_model_id=current_model_id,
+        models=tuple(parsed_models),
+    )
+
+
 def _find_reasoning_effort_config_id(session_result: Mapping[str, Any]) -> str | None:
     """session/new の configOptions から推論深さ selector の ID を取得する。
 
@@ -2261,7 +2332,7 @@ async def _run_acp_session(
     command: str,
     args: list[str],
     env: dict[str, str],
-    prompt_text: str,
+    prompt_text: str | None,
     *,
     model: str | None,
     reasoning_effort: str | None = None,
@@ -2279,7 +2350,7 @@ async def _run_acp_session(
         command: sandbox 経由で起動する ACP agent コマンド。
         args: agent へ渡す引数。
         env: agent へ渡す追加環境変数。
-        prompt_text: session/prompt に載せる本文。
+        prompt_text: session/prompt に載せる本文。None はモデル広告取得だけで終了する。
         model: 適用するモデル ID。未指定時は agent 既定。
         reasoning_effort: 適用する推論深さ。未指定時は変更しない。
         cwd: agent の作業ディレクトリ。
@@ -2422,6 +2493,16 @@ async def _run_acp_session(
             reasoning_effort=reasoning_effort,
         )
 
+        # モデル広告取得では prompt や tool を実行せず、session/new の検証済み候補だけを返す。
+        if prompt_text is None:
+            return _AcpSessionResult(
+                output_text='',
+                web_search_performed=False,
+                citations=(),
+                web_search_failed=False,
+                model_catalog=_parseAcpModelCatalog(session_result),
+            )
+
         trace.prompt_started = True
         try:
             prompt_result = await dispatcher.request('session/prompt', {
@@ -2548,7 +2629,7 @@ async def _run_acp_with_deadline(
     command: str,
     args: list[str],
     env: dict[str, str],
-    prompt_text: str,
+    prompt_text: str | None,
     *,
     model: str | None,
     reasoning_effort: str | None = None,
@@ -2566,7 +2647,7 @@ async def _run_acp_with_deadline(
         command: sandbox 経由で起動する ACP agent コマンド。
         args: agent へ渡す引数。
         env: agent へ渡す追加環境変数。
-        prompt_text: session/prompt に載せる本文。
+        prompt_text: session/prompt に載せる本文。None はモデル広告取得だけで終了する。
         model: 適用するモデル ID。未指定時は agent 既定。
         timeout_sec: stdio 無通信を打ち切る秒数。行が届くたびリセット。
         cwd: agent の作業ディレクトリ。
@@ -2609,6 +2690,85 @@ async def _run_acp_with_deadline(
     except TimeoutError as ex:
         # hard timeout (asyncio.timeout) およびそれ以外の TimeoutError を HardTimeout へ正規化する。
         raise _AcpHardTimeoutError from ex
+
+
+async def DiscoverAcpModels(
+    command: str,
+    args: list[str],
+    env: dict[str, str],
+    *,
+    timeout_sec: int,
+    cwd: str,
+    profile_dir: str,
+    readable_files: tuple[str, ...] = (),
+    backend_kind: str,
+) -> AcpModelCatalog:
+    """prompt を実行せず、ACP agent の session/new モデル広告を取得する。
+
+    Args:
+        command: sandbox 内で起動する ACP agent コマンド。
+        args: agent の固定起動引数。
+        env: provider profile の固定環境。
+        timeout_sec: stdio 無通信を打ち切る秒数。
+        cwd: agent の作業ディレクトリ。
+        profile_dir: Landlock 書込みを許可する profile ディレクトリ。
+        readable_files: 追加の read-only ファイル。
+        backend_kind: 固定 ACP preset の識別子。
+
+    Returns:
+        agent が広告したモデル一覧と現在値。
+
+    Raises:
+        RecordedSeriesAIError: 起動・認証・通信・広告検証に失敗した場合。
+    """
+
+    started_at = time.monotonic()
+    try:
+        session_result = await _run_acp_with_deadline(
+            command,
+            args,
+            env,
+            None,
+            model=None,
+            timeout_sec=timeout_sec,
+            cwd=cwd,
+            profile_dir=profile_dir,
+            readable_files=readable_files,
+            operation='SeriesMetadata',
+            backend_kind=backend_kind,
+        )
+    except _AcpHardTimeoutError as ex:
+        raise RecordedSeriesAIError(
+            'HardTimeout',
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+        ) from ex
+    except _AcpInactivityTimeoutError as ex:
+        raise RecordedSeriesAIError(
+            'Timeout',
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+        ) from ex
+    except _AcpAuthenticationError as ex:
+        raise RecordedSeriesAIError(
+            'ACPAuthenticationFailed',
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+        ) from ex
+    except _AcpProtocolError as ex:
+        raise RecordedSeriesAIError(
+            'ACPProtocolError',
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+        ) from ex
+    except OSError as ex:
+        raise RecordedSeriesAIError(
+            'HostCLIStartFailed',
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+        ) from ex
+
+    if session_result.model_catalog is None:
+        raise RecordedSeriesAIError(
+            'ACPProtocolError',
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+        )
+    return session_result.model_catalog
 
 
 def _build_candidate_selection_prompt(
@@ -2935,7 +3095,13 @@ async def run_acp_series_metadata(
         ) from ex
 
     latency_ms = int((time.monotonic() - start_time) * 1000)
-    output_data = ParseStrictSeriesMetadataJSONObject(session_result.output_text)
+    # 検証済み Web 検索では、一部 agent が tool 開始前の短い説明を最終 JSON の前へ残す。
+    # EpisodeLookup と同じ安全な prefix 検証を通し、tool-free 生成の strict 契約は維持する。
+    output_data = (
+        _parseEpisodeLookupJSONObject(session_result.output_text)
+        if require_web_search and session_result.web_search_performed
+        else ParseStrictSeriesMetadataJSONObject(session_result.output_text)
+    )
     result = ValidateSeriesMetadataOutput(
         output_data,
         hints=hints,

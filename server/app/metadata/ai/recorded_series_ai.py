@@ -17,7 +17,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, TypeVar, cast
 
 from typing_extensions import TypedDict
 
@@ -73,6 +73,10 @@ from app.metadata.RecordedSeriesSettings import (
 )
 
 
+if TYPE_CHECKING:
+    from app.metadata.ai.acp_client import AcpModelCatalog
+
+
 # fingerprint -> proven backend kind。再起動後も単票再検索を通すためディスクへ永続化する。
 # テストから差し替え可能なよう module 属性として公開する。
 EPISODE_LOOKUP_CAPABILITY_PROOFS_PATH: Path = (
@@ -95,6 +99,8 @@ ACP_CREDENTIAL_OPERATION_LOCKS: dict[KonomiTVBS4KACPImportProvider, asyncio.Lock
 # 公開 facade の実行待ち・credential lock 待機から backend 回収までに適用する絶対上限。
 # acp_client 内部にも同じ上限を残し、facade を経由しない呼出しも有限に保つ。
 _ACP_OPERATION_HARD_TIMEOUT_SEC = ACP_HARD_TIMEOUT_SEC
+# モデル広告は prompt を送らないため、設定済みの長時間推論 timeout とは別の短い上限にする。
+_ACP_MODEL_CATALOG_TIMEOUT_SEC = 60
 
 _AcpOperationResult = TypeVar('_AcpOperationResult')
 
@@ -737,7 +743,7 @@ def CreateBackendForTarget(
     # 固定プリセットの引数を provider ごとの実行条件へ展開する。
     all_args = list(preset_args)
 
-    # Grok Build はモデルが grok-4.5 固定のため、CLI の --reasoning-effort で深さを切り替える。
+    # Grok Build はモデルを ACP session へ適用する一方、推論深さは CLI 引数で切り替える。
     # `grok --reasoning-effort {low,medium,high} agent stdio` の形になるよう先頭へ挿入する。
     if backend_kind == 'AcpGrok' and acp_settings.reasoning_effort is not None:
         all_args = [
@@ -826,6 +832,27 @@ class _AcpAdapter:
             *self._args,
         ]
 
+    async def getAdvertisedModelCatalog(self) -> AcpModelCatalog:
+        """prompt を実行せず、ACP agent のモデル広告を取得する。
+
+        Returns:
+            session/new が広告したモデル一覧と現在値。
+        """
+
+        from app.metadata.ai.acp_client import DiscoverAcpModels
+
+        # モデル広告は output schema と無関係なため、provider 固定の起動引数だけを渡す。
+        return await DiscoverAcpModels(
+            command=self._command,
+            args=self._args,
+            env=self._env,
+            timeout_sec=min(self._timeout_sec, _ACP_MODEL_CATALOG_TIMEOUT_SEC),
+            cwd=self._cwd or self._env['HOME'],
+            profile_dir=self._profile_dir,
+            readable_files=self._readable_files,
+            backend_kind=self._backend_kind,
+        )
+
     async def selectCandidate(
         self,
         program: RecordedSeriesProgramPrompt,
@@ -887,9 +914,9 @@ class _AcpAdapter:
 
         result = await run_acp_series_metadata(
             command=self._command,
-            args=self._operation_args(
-                'EpisodeLookup' if require_web_search else 'SeriesMetadata',
-            ),
+            # Web 検索 trace の dispatcher operation は下位関数が EpisodeLookup へ切り替えるが、
+            # モデル出力は常にシリーズ生成 schema のため CLI の JSON schema は変えない。
+            args=self._operation_args('SeriesMetadata'),
             env=self._env,
             program=program,
             hints=hints,
@@ -1078,6 +1105,44 @@ def IsACPOperationRunning() -> bool:
     """
 
     return ACP_OPERATION_LOCK.locked()
+
+
+async def GetAcpModelCatalog(
+    backend_kind: Literal['AcpGrok'],
+) -> AcpModelCatalog:
+    """Grok ACP のモデル広告を公開 facade の排他境界内で取得する。
+
+    Args:
+        backend_kind: モデル広告を取得する Grok ACP backend。
+
+    Returns:
+        session/new が広告したモデル一覧と現在値。
+
+    Raises:
+        RecordedSeriesAIError: backend 構築またはモデル広告取得に失敗した場合。
+    """
+
+    async def GetCatalog() -> AcpModelCatalog:
+        backend = CreateBackendForTarget(AIBackendTarget(
+            backend_kind=backend_kind,
+            service_id=None,
+            role='Primary',
+            prompt_variant='Default',
+        ))
+        if not isinstance(backend, _AcpAdapter):
+            raise RecordedSeriesAIError('UnsupportedBackend')
+        return await backend.getAdvertisedModelCatalog()
+
+    # 広告取得は UI request 内で完結させるため、無通信期限とは別に lock 待機から
+    # process cleanup までを含む短い絶対期限を公開 facade へ適用する。
+    catalog_deadline = (
+        asyncio.get_running_loop().time() + _ACP_MODEL_CATALOG_TIMEOUT_SEC
+    )
+    return await _RunACPOperationWithDeadline(
+        GetCatalog,
+        _GetACPCredentialProvider(backend_kind),
+        hard_deadline=catalog_deadline,
+    )
 
 
 def _GetACPCredentialProvider(

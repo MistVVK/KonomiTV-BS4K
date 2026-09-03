@@ -45,7 +45,7 @@ _ACP_BASIC_REASONING_EFFORTS: frozenset[AcpReasoningEffort] = frozenset({
     'Medium',
     'High',
 })
-# backend ごとの未設定時デフォルト（CLI 既定ではなく明示プリセット）。
+# backend ごとの未設定時デフォルト。Grok は agent の currentModelId を実行時既定にする。
 ACP_DEFAULT_MODEL_BY_BACKEND: dict[str, str | None] = {
     'AcpCodex': 'gpt-5.6-luna',
     'AcpGrok': None,
@@ -129,7 +129,7 @@ class ACPBackendSettings(BaseModel):
 
     # プロバイダ種別。正規化に使用し、JSON には保存しない。
     backend_kind: Annotated[ACPBackendKind, Field(exclude=True)] = 'AcpCodex'
-    # Codex のみ使用。Grok は grok-4.5 固定のため常に None へ正規化する。
+    # Codex は KonomiTV の固定候補、Grok は ACP agent が広告した opaque ID を保存する。
     model: Annotated[str | None, Field(max_length=255)] = None
     # Codex: Low…Ultra / Grok: Low…High。未設定時は backend 既定へ補完する。
     reasoning_effort: Annotated[AcpReasoningEffort | None, Field()] = None
@@ -156,13 +156,12 @@ class ACPBackendSettings(BaseModel):
     def normalizeBackendCapabilities(self) -> ACPBackendSettings:
         """backend ごとの固定能力とプリセット既定を正規化する。
 
-        Grok はモデル固定・Fast 無効・推論深さ Low..High のみ。
+        Grok は Fast 無効・推論深さ Low..High のみ。
         Codex はモデル既定と Ultra の Sol 制約を適用する。
         """
 
         if self.backend_kind == 'AcpGrok':
-            # Grok Build の ACP は grok-4.5 固定。モデル ID は保存せず深さだけを持つ。
-            self.model = None
+            # Grok のモデル ID は ACP 広告値を opaque に保存し、実行時に session/set_model へ渡す。
             self.codex_fast_mode_enabled = False
             if self.reasoning_effort is None:
                 self.reasoning_effort = ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND['AcpGrok']
