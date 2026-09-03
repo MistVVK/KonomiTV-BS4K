@@ -44,9 +44,15 @@
                             <SeriesEpisodeList :seriesId="expandedId" />
                         </div>
                     </div>
-                    <div v-if="totalPages > 1" class="series-home__pagination">
-                        <v-pagination v-model="currentPage" :length="totalPages" density="comfortable"
-                            @update:modelValue="changePage" />
+                    <div v-if="total > 0" class="series-home__pagination">
+                        <v-pagination
+                            v-model="currentPage"
+                            active-color="primary"
+                            density="comfortable"
+                            :length="totalPages"
+                            :total-visible="Utils.isSmartphoneVertical() ? 5 : 7"
+                            @update:model-value="changePage">
+                        </v-pagination>
                     </div>
                 </div>
             </div>
