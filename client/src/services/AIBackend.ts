@@ -1,5 +1,5 @@
 /**
- * AI バックエンド (OpenCode service) 管理 API クライアント。
+ * AI バックエンド (OpenCode / OpenAI 互換 HTTP / ACP) 管理 API クライアント。
  */
 
 import APIClient from '@/services/APIClient';
@@ -183,6 +183,16 @@ export interface IAIBackendOAuthStartResult {
     authorize: Record<string, unknown>;
 }
 
+/** OpenCode を通さない OpenAI 互換 HTTP バックエンドの共有設定。 */
+export interface IOpenAICompatibleSettings {
+    api_base_url: string | null;
+    model: string | null;
+    api_key_configured: boolean;
+}
+
+/** OpenAI 互換 HTTP バックエンドの非秘密設定更新リクエスト。 */
+export type IOpenAICompatibleSettingsUpdate = Pick<IOpenAICompatibleSettings, 'api_base_url' | 'model'>;
+
 
 // ===== ACP 固定プリセット（Codex / Grok Build） =====
 
@@ -248,6 +258,64 @@ export interface IACPBackendConnectionTestResult {
 
 
 export default class AIBackend {
+
+    // ===== 独立 OpenAI 互換 HTTP バックエンド =====
+
+    /** API キー本体を含まない OpenAI 互換 HTTP 設定を取得する。 */
+    static async fetchOpenAICompatibleSettings(): Promise<IOpenAICompatibleSettings | null> {
+        const response = await APIClient.get<IOpenAICompatibleSettings>('/ai-backends/openai-compatible/settings');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API 設定を取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    /** OpenAI 互換 HTTP の API ベース URL とモデルを保存する。 */
+    static async updateOpenAICompatibleSettings(settings: IOpenAICompatibleSettingsUpdate): Promise<boolean> {
+        const response = await APIClient.put('/ai-backends/openai-compatible/settings', settings);
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API 設定を保存できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** OpenAI 互換 HTTP の専用 API キーを保存する。 */
+    static async setOpenAICompatibleAPIKey(api_key: string): Promise<boolean> {
+        const response = await APIClient.put('/ai-backends/openai-compatible/api-key', {api_key});
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API キーを設定できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** OpenAI 互換 HTTP の専用 API キーを削除する。 */
+    static async deleteOpenAICompatibleAPIKey(): Promise<boolean> {
+        const response = await APIClient.delete('/ai-backends/openai-compatible/api-key');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API キーを削除できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** 保存済み OpenAI 互換 HTTP 設定で接続試験を実行する。 */
+    static async testOpenAICompatibleConnection(
+        capability: AIBackendConnectionCapability,
+    ): Promise<IAIBackendConnectionTestResult | null> {
+        const response = await APIClient.post<IAIBackendConnectionTestResult>(
+            '/ai-backends/openai-compatible/connection-test',
+            {capability},
+            {timeout: 180 * 1000},
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API の接続試験を実行できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
 
     /** OpenCode serve の health を取得する。 */
     static async fetchHealth(): Promise<IOpenCodeAvailability | null> {

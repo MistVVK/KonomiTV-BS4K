@@ -8,7 +8,7 @@
             <span class="ml-2">AIバックエンド</span>
         </h2>
         <div class="settings__description">
-            録画シリーズ AI などで使う OpenCode 経由の外部モデル接続を管理します。<br>
+            録画シリーズ AI などで使う OpenCode・OpenAI 互換 API・ACP の接続を管理します。<br>
             API キーはサーバー上に暗号化せず安全な秘密ストアへ保存され、画面には表示されません。<br>
             この設定はすべてのユーザーと端末で共有され、管理者だけが変更できます。<br>
         </div>
@@ -26,12 +26,16 @@
         </div>
 
         <template v-else>
-            <!-- 親幅が狭いと3タブ分の intrinsic 幅が溢れるため、超過時は左右矢印でスクロールする -->
+            <!-- 親幅が狭いと4タブ分の intrinsic 幅が溢れるため、超過時は左右矢印でスクロールする -->
             <v-tabs v-model="tab" color="primary" bg-color="transparent" class="mt-4 ai-backend-tabs"
                 show-arrows :density="is_form_dense ? 'compact' : 'default'">
                 <v-tab value="opencode">
                     <Icon icon="fluent:cloud-20-filled" width="17px" />
                     <span class="ml-1">OpenCode</span>
+                </v-tab>
+                <v-tab value="openai-compatible">
+                    <Icon icon="fluent:globe-20-filled" width="17px" />
+                    <span class="ml-1">OpenAI 互換 API</span>
                 </v-tab>
                 <v-tab value="acp-codex">
                     <Icon icon="fluent:brain-circuit-20-filled" width="17px" />
@@ -270,6 +274,10 @@
                     </div>
                 </div>
             </div>
+            </v-window-item>
+
+            <v-window-item value="openai-compatible">
+                <OpenAICompatibleBackendSection />
             </v-window-item>
 
             <v-window-item value="acp-codex">
@@ -533,6 +541,7 @@
 import { computed, onMounted, ref } from 'vue';
 
 import ACPBackendSection from '@/components/Settings/ACPBackendSection.vue';
+import OpenAICompatibleBackendSection from '@/components/Settings/OpenAICompatibleBackendSection.vue';
 import Message from '@/message';
 import AIBackend, {
     type AIAuthMode,
@@ -625,8 +634,8 @@ const test_results = ref<Record<string, IAIBackendConnectionTestResult | null>>(
 /** `${service_id}:${capability}` 形式。同時に1試験のみ。 */
 const testing_service_id = ref<string | null>(null);
 
-/** ACP タブの切り替え状態。 */
-const tab = ref<'opencode' | 'acp-codex' | 'acp-grok'>('opencode');
+/** AI バックエンドタブの切り替え状態。 */
+const tab = ref<'opencode' | 'openai-compatible' | 'acp-codex' | 'acp-grok'>('opencode');
 /** ACP 固定プリセット設定（サーバー保存済み）。 */
 const acp_settings = ref<IACPSettings | null>(null);
 /** 認証内容を含まない ACP 資格情報状態。 */
