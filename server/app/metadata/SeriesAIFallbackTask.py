@@ -19,6 +19,7 @@ from app.metadata.RecordedSeriesGeneration import (
     BuildSeriesMetadataPrompt,
     SeriesMetadataClusterHint,
     SeriesMetadataClusterProgramHint,
+    SeriesMetadataExistingSeriesHint,
     SeriesMetadataHints,
     SeriesMetadataLocalParseHint,
 )
@@ -27,6 +28,7 @@ from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettingsStore,
 )
 from app.models.RecordedProgram import RecordedProgram
+from app.models.Series import Series
 from app.models.SeriesAIFallback import SeriesAIFallback, SeriesAIFallbackStatus
 
 
@@ -111,7 +113,7 @@ class SeriesAIFallbackTask:
     _cancelled_count = 0
     _current_title: str | None = None
     # rebuild と新規録画の Indexer 経路が、録画ごとに永続表を再照会せず参照する確定 cache。
-    _resolved_assignments: dict[str, tuple[str, str]] = {}
+    _resolved_assignments: dict[str, tuple[str, str, int | None]] = {}
     _cache_loaded = False
 
     @classmethod
@@ -126,7 +128,7 @@ class SeriesAIFallbackTask:
             status='Resolved',
             web_search_performed=True,
         ).all()
-        restored: dict[str, tuple[str, str]] = {}
+        restored: dict[str, tuple[str, str, int | None]] = {}
         for fallback in fallbacks:
             if (
                 fallback.series_title is None
@@ -137,6 +139,7 @@ class SeriesAIFallbackTask:
             restored[fallback.grouping_key] = (
                 fallback.series_title,
                 fallback.normalized_title,
+                fallback.series_id,
             )
         # 構築途中を Indexer へ見せず一度に公開する。照会中に worker が確定した値も
         # 消さないよう、永続表の snapshot と現在の確定 cache を merge する。
@@ -240,14 +243,14 @@ class SeriesAIFallbackTask:
     async def getCachedAssignment(
         cls,
         recorded_program: RecordedProgram,
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, int | None] | None:
         """rebuild が再利用できる AI 確定タイトルを返す。
 
         Args:
             recorded_program: Indexer が所属を確定できなかった録画。
 
         Returns:
-            表示タイトルと完全一致キー。確定 cache がなければ None。
+            表示タイトル、完全一致キー、既存 Series ID。確定 cache がなければ None。
         """
 
         from app.metadata.SeriesIndexer import BuildSeriesAIFallbackGroupingKey
@@ -316,7 +319,7 @@ class SeriesAIFallbackTask:
         return groups
 
     @classmethod
-    def _buildPrompt(
+    async def _buildPrompt(
         cls,
         grouping_key: str,
         programs: list[RecordedProgram],
@@ -330,6 +333,11 @@ class SeriesAIFallbackTask:
         Returns:
             代表番組、同一群 hints、入力 fingerprint。
         """
+
+        from app.metadata.SeriesIndexer import (
+            AreAIFallbackSeriesTitlesClose,
+            NormalizeSeriesTitle,
+        )
 
         representative = programs[0]
         channel = representative.channel
@@ -354,6 +362,18 @@ class SeriesAIFallbackTask:
             )
             for item in programs[:_MAX_GROUP_PROGRAMS]
         ]
+        # 完全一致または接尾辞拡張の候補だけを ID 付き hints として公開し、
+        # AI が同じ作品と判断した場合に既存 Series を明示的に選べるようにする。
+        existing_candidates: list[tuple[int, Series, str]] = []
+        for series in await Series.all().order_by('id'):
+            normalized_title = series.normalized_title or NormalizeSeriesTitle(series.title)
+            if AreAIFallbackSeriesTitlesClose(grouping_key, normalized_title):
+                existing_candidates.append((
+                    abs(len(grouping_key) - len(normalized_title)),
+                    series,
+                    normalized_title,
+                ))
+        existing_candidates.sort(key=lambda item: (item[0], item[1].id))
         hints = SeriesMetadataHints(
             local_parse=SeriesMetadataLocalParseHint(
                 series_title=_truncateText(representative.title, 300),
@@ -367,7 +387,25 @@ class SeriesAIFallbackTask:
                 member_count=len(programs),
                 representative_programs=samples,
             ),
-            existing_series=[],
+            existing_series=[
+                SeriesMetadataExistingSeriesHint(
+                    id=series.id,
+                    title=series.title,
+                    description=_truncateText(series.description),
+                    wikipedia_page_id=series.wikipedia_page_id,
+                    similarity=round(
+                        min(len(grouping_key), len(normalized_title)) /
+                        max(len(grouping_key), len(normalized_title)),
+                        4,
+                    ),
+                    match_reason=(
+                        'NormalizedExact'
+                        if grouping_key == normalized_title
+                        else 'TitleSuffixExtension'
+                    ),
+                )
+                for _length_difference, series, normalized_title in existing_candidates[:5]
+            ],
             wikipedia=[],
         )
         fingerprint_source = BuildSeriesMetadataPrompt(
@@ -500,9 +538,10 @@ class SeriesAIFallbackTask:
         from app.metadata.SeriesIndexer import (
             GENERIC_SERIES_TITLES,
             NormalizeSeriesTitle,
+            SeriesIndexer,
         )
 
-        program, hints, input_fingerprint = cls._buildPrompt(grouping_key, programs)
+        program, hints, input_fingerprint = await cls._buildPrompt(grouping_key, programs)
         fallback = await SeriesAIFallback.get_or_none(grouping_key=grouping_key)
         if (
             fallback is not None
@@ -664,12 +703,27 @@ class SeriesAIFallbackTask:
 
         assert result.series_title is not None
         assert normalized_title is not None
+        # AI が既存 Series を選んだ場合は、録画への適用成否とは独立に実在とタイトル関係を検証する。
+        # 検証済みの場合だけ既存側の ID・正本タイトルを、回復可能な最初の Resolved 行へ保存する。
+        resolved_series = await SeriesIndexer.resolveAIFallbackSeries(
+            existing_series_id=result.existing_series_id,
+            normalized_title=normalized_title,
+        )
+        resolved_series_id: int | None = None
+        resolved_series_title = result.series_title
+        resolved_normalized_title = normalized_title
+        if resolved_series is not None:
+            series, resolved_normalized_title = resolved_series
+            resolved_series_id = series.id
+            resolved_series_title = series.title
+
         # 確定 cache を必須状態として先に保存する。録画ごとの関連付けが途中失敗しても、
-        # rebuild が同じ完全一致タイトルから残りの録画へ収束させられる。
+        # rebuild が検証済みの同じ Series ID と正本タイトルから残りの録画へ収束させられる。
         await SeriesAIFallback.filter(grouping_key=grouping_key).update(
             status='Resolved',
-            series_title=result.series_title,
-            normalized_title=normalized_title,
+            series_id=resolved_series_id,
+            series_title=resolved_series_title,
+            normalized_title=resolved_normalized_title,
             web_search_performed=True,
             citations=citation_records,
             rationale_short=result.rationale_short,
@@ -682,11 +736,16 @@ class SeriesAIFallbackTask:
             error_code=None,
         )
         cls._resolved_assignments[grouping_key] = (
-            result.series_title,
-            normalized_title,
+            resolved_series_title,
+            resolved_normalized_title,
+            resolved_series_id,
         )
         fallback = await SeriesAIFallback.get(grouping_key=grouping_key)
-        await cls._applyResolvedFallback(fallback, programs)
+        await cls._applyResolvedFallback(
+            fallback,
+            programs,
+            existing_series_id=resolved_series_id,
+        )
         return 'Resolved'
 
     @classmethod
@@ -694,12 +753,15 @@ class SeriesAIFallbackTask:
         cls,
         fallback: SeriesAIFallback,
         programs: list[RecordedProgram],
+        *,
+        existing_series_id: int | None = None,
     ) -> None:
         """AI 確定 cache を、まだ未所属の束へ適用して話数キューへ渡す。
 
         Args:
             fallback: 公開 Web 根拠を保存済みの所属 cache。
             programs: 同じ grouping key に属する録画番組。
+            existing_series_id: 今回の AI 応答が選んだ hints 内の既存 Series ID。
 
         Returns:
             None
@@ -707,10 +769,13 @@ class SeriesAIFallbackTask:
 
         if fallback.series_title is None or fallback.normalized_title is None:
             return
-        from app.metadata.SeriesIndexer import SeriesIndexer
+        from app.metadata.SeriesIndexer import NormalizeSeriesTitle, SeriesIndexer
         from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
 
-        linked_series_id: int | None = fallback.series_id
+        target_series_id = existing_series_id if existing_series_id is not None else fallback.series_id
+        linked_series_id = fallback.series_id
+        linked_series_title = fallback.series_title
+        linked_normalized_title = fallback.normalized_title
         linked_any = False
         for program in programs:
             latest = await RecordedProgram.get_or_none(id=program.id, series_id=None)
@@ -720,16 +785,31 @@ class SeriesAIFallbackTask:
                 latest,
                 display_title=fallback.series_title,
                 normalized_title=fallback.normalized_title,
+                existing_series_id=target_series_id,
             )
             if linked is False:
                 continue
             linked_any = True
             linked_series_id = latest.series_id
+            if latest.series_title is not None:
+                linked_series_title = latest.series_title
+                linked_normalized_title = NormalizeSeriesTitle(latest.series_title)
             await RecordedEpisodeAutomation.enqueue(latest.id)
-        if linked_series_id is not None and fallback.series_id != linked_series_id:
-            await SeriesAIFallback.filter(grouping_key=fallback.grouping_key).update(
-                series_id=linked_series_id,
-            )
         if linked_any:
+            if (
+                linked_series_id != fallback.series_id
+                or linked_series_title != fallback.series_title
+                or linked_normalized_title != fallback.normalized_title
+            ):
+                await SeriesAIFallback.filter(grouping_key=fallback.grouping_key).update(
+                    series_id=linked_series_id,
+                    series_title=linked_series_title,
+                    normalized_title=linked_normalized_title,
+                )
+            cls._resolved_assignments[fallback.grouping_key] = (
+                linked_series_title,
+                linked_normalized_title,
+                linked_series_id,
+            )
             # Series 作成後の既存 Bangumi 照合は従来の合流可能なバックグラウンド経路へ渡す。
             KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
