@@ -6,10 +6,7 @@ import httpx
 
 from app import logging
 from app.constants import BANGUMI_REQUEST_HEADERS, HTTPX_CLIENT
-from app.metadata.ai.recorded_series_ai import (
-    has_episode_lookup_capability_proof,
-    select_candidate,
-)
+from app.metadata.ai.recorded_series_ai import select_candidate
 from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesAIError,
     RecordedSeriesProgramPrompt,
@@ -114,11 +111,10 @@ class KonomiTVBS4KBangumiSubjectSearch:
             return scored_subject
 
         settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-        # AI は接続試験済みのときだけ使い、未証明のバックエンドへ検索 hints を渡さない。
+        # 接続試験の履歴ではなく現在の有効設定を候補選択の開始条件にする。
         if (
             settings.enabled is False or
-            settings.ai_enabled is False or
-            has_episode_lookup_capability_proof(settings, api_key) is False
+            settings.ai_enabled is False
         ):
             return None
         if len(subjects) == 0:
