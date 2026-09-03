@@ -40,7 +40,14 @@
                     </thead>
                     <tbody>
                         <tr v-for="row in rows" :key="row.channelId">
-                            <th>{{row.channelName}}</th>
+                            <th class="series-episode-list__channel"
+                                :title="row.channelName" :aria-label="row.channelName">
+                                <span class="series-episode-list__channel-logo">
+                                    <img loading="lazy" :src="`${Utils.api_base_url}/channels/${row.channelId}/logo`"
+                                        alt="" @error="hideBrokenChannelLogo">
+                                </span>
+                                <span class="series-episode-list__channel-name">{{row.channelName}}</span>
+                            </th>
                             <td v-for="column in columns" :key="`${row.channelId}-${column.key}`">
                                 <router-link v-if="cellProgram(row.channelId, column.key) !== null"
                                     class="series-episode-list__cell"
@@ -165,6 +172,11 @@ function showPartialWarning(channelId: string, columnKey: string): boolean {
     return program !== null && program.is_partially_recorded;
 }
 
+function hideBrokenChannelLogo(event: Event): void {
+    // ロゴを取得できなくても局名テキストへ置き換えず、同じ寸法の空枠を維持する。
+    (event.currentTarget as HTMLImageElement).hidden = true;
+}
+
 const fetchSeries = async () => {
     // カードを素早く切り替えたとき、古い応答で新しい詳細を上書きしない。
     const generation = ++fetchGeneration;
@@ -268,8 +280,39 @@ watch(() => props.seriesId, fetchSeries, {immediate: true});
     }
 }
 
-.series-episode-list__corner {
+.series-episode-list__corner,
+.series-episode-list__channel {
+    width: 88px;
     min-width: 88px;
+    max-width: 88px;
+}
+
+.series-episode-list__channel-logo {
+    display: block;
+    width: 32px;
+    height: 18px;
+    margin: 0 auto 4px;
+    overflow: hidden;
+    border-radius: 2px;
+    background: rgb(var(--v-theme-background-lighten-2));
+
+    img {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+
+        &[hidden] {
+            display: none;
+        }
+    }
+}
+
+.series-episode-list__channel-name {
+    display: block;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
 }
 
 .series-episode-list__cell {
