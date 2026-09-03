@@ -114,10 +114,11 @@
                             <span v-if="!iconOnly" class="navigation__link-text navigation__link-text--utility">バックグラウンド処理</span>
                             <small v-if="!iconOnly && analysisTasksStore.activeTaskStatus !== null"
                                 class="navigation-analysis__status-label">
-                                {{analysisTasksStore.activeTaskStatus === 'Running' ? '実行中' : '待機中'}}
+                                {{backgroundTaskStatusLabel(analysisTasksStore.activeTaskStatus)}}
                             </small>
                         </router-link>
-                        <div v-if="!iconOnly && analysisTasksStore.activeTaskGroups.length > 0"
+                        <div v-if="!iconOnly && (analysisTasksStore.activeTaskGroups.length > 0 ||
+                            analysisTasksStore.seriesAIFallbackStatus !== null)"
                             class="navigation-analysis__tasks">
                             <button v-for="group in analysisTasksStore.activeTaskGroups" :key="group.task_type"
                                 v-ripple type="button" class="navigation-analysis__task"
@@ -131,6 +132,22 @@
                                 <v-progress-linear v-if="group.progress !== null" class="mt-1" color="primary" height="4"
                                     rounded :model-value="group.progress * 100" />
                                 <v-progress-linear v-else class="mt-1" color="primary" height="4" rounded indeterminate />
+                            </button>
+                            <button v-if="analysisTasksStore.seriesAIFallbackStatus !== null" v-ripple type="button"
+                                class="navigation-analysis__task" aria-label="シリーズ AI 補完の現在の処理を表示"
+                                @click="openActiveAnalysisTaskDialog('SeriesAIFallback')">
+                                <div class="navigation-analysis__task-line">
+                                    <strong>{{taskTypeLabel('SeriesAIFallback')}}</strong>
+                                    <small>{{backgroundTaskStatusLabel(analysisTasksStore.seriesAIFallbackStatus.state)}}</small>
+                                </div>
+                                <small class="navigation-analysis__stage">
+                                    {{analysisTasksStore.seriesAIFallbackStatus.processed_groups.toLocaleString()}} /
+                                    {{analysisTasksStore.seriesAIFallbackStatus.total_groups.toLocaleString()}} グループ
+                                </small>
+                                <v-progress-linear v-if="analysisTasksStore.seriesAIFallbackStatus.total_groups > 0"
+                                    class="mt-1" color="primary" height="4" rounded
+                                    :model-value="analysisTasksStore.seriesAIFallbackStatus.processed_groups /
+                                        analysisTasksStore.seriesAIFallbackStatus.total_groups * 100" />
                             </button>
                         </div>
                     </div>
@@ -176,8 +193,12 @@ import { defineComponent } from 'vue';
 import BottomNavigation from '@/components/BottomNavigation.vue';
 import KonomiTVBS4KActiveAnalysisTaskDialog from '@/components/KonomiTVBS4KActiveAnalysisTaskDialog.vue';
 import OfflineDownloadBadge from '@/components/OfflineDownloadBadge.vue';
-import { AnalysisTaskType } from '@/services/AnalysisTasks';
-import useAnalysisTasksStore, { stageLabel, taskTypeLabel } from '@/stores/AnalysisTasksStore';
+import useAnalysisTasksStore, {
+    BackgroundTaskType,
+    backgroundTaskStatusLabel,
+    stageLabel,
+    taskTypeLabel,
+} from '@/stores/AnalysisTasksStore';
 import useVersionStore from '@/stores/VersionStore';
 
 export default defineComponent({
@@ -198,7 +219,7 @@ export default defineComponent({
     data() {
         return {
             activeAnalysisTaskDialog: false,
-            selectedActiveTaskType: null as AnalysisTaskType | null,
+            selectedActiveTaskType: null as BackgroundTaskType | null,
             isAnalysisOverviewPollingStarted: false,
         };
     },
@@ -206,15 +227,17 @@ export default defineComponent({
         ...mapStores(useAnalysisTasksStore),
         ...mapStores(useVersionStore),
         analysisTaskTooltip(): string {
-            if (this.analysisTasksStore.activeTaskStatus === 'Running') return 'バックグラウンド処理 (実行中)';
-            if (this.analysisTasksStore.activeTaskStatus === 'Queued') return 'バックグラウンド処理 (待機中)';
+            if (this.analysisTasksStore.activeTaskStatus !== null) {
+                return `バックグラウンド処理 (${backgroundTaskStatusLabel(this.analysisTasksStore.activeTaskStatus)})`;
+            }
             return 'バックグラウンド処理';
         },
     },
     methods: {
+        backgroundTaskStatusLabel,
         stageLabel,
         taskTypeLabel,
-        openActiveAnalysisTaskDialog(taskType: AnalysisTaskType): void {
+        openActiveAnalysisTaskDialog(taskType: BackgroundTaskType): void {
             this.selectedActiveTaskType = taskType;
             this.activeAnalysisTaskDialog = true;
         },
@@ -521,6 +544,15 @@ export default defineComponent({
 
                     &--Queued {
                         background: rgb(var(--v-theme-secondary-lighten-1));
+                    }
+
+                    &--Idle {
+                        background: rgb(var(--v-theme-secondary-lighten-1));
+                    }
+
+                    &--Disabled,
+                    &--Stopped {
+                        background: rgb(var(--v-theme-gray));
                     }
                 }
 

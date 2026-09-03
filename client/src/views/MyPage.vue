@@ -27,9 +27,9 @@
                             </div>
                             <v-btn class="analysis-tasks__history-button" to="/analysis-history/" variant="text" size="small">履歴</v-btn>
                         </div>
-                        <template v-if="activeTaskGroups.length > 0">
+                        <template v-if="analysisTasksStore.activeTaskStatus !== null">
                             <div class="analysis-tasks__section-title">
-                                {{analysisTasksStore.activeTaskStatus === 'Running' ? '実行中' : '待機中'}}
+                                {{backgroundTaskStatusLabel(analysisTasksStore.activeTaskStatus)}}
                             </div>
                             <button v-for="group in activeTaskGroups" :key="group.task_type" v-ripple type="button"
                                 class="analysis-task analysis-task--active"
@@ -43,6 +43,25 @@
                                 <v-progress-linear v-if="group.progress !== null" class="mt-2" color="primary" height="5"
                                     rounded :model-value="group.progress * 100" />
                                 <v-progress-linear v-else class="mt-2" color="primary" height="5" rounded indeterminate />
+                            </button>
+                            <button v-if="analysisTasksStore.seriesAIFallbackStatus !== null" v-ripple type="button"
+                                class="analysis-task analysis-task--active"
+                                aria-label="シリーズ AI 補完の現在の処理を表示"
+                                @click="openActiveAnalysisTaskDialog('SeriesAIFallback')">
+                                <div class="analysis-task__line">
+                                    <strong class="analysis-task__type">{{taskTypeLabel('SeriesAIFallback')}}</strong>
+                                    <small class="analysis-task__stage">
+                                        {{backgroundTaskStatusLabel(analysisTasksStore.seriesAIFallbackStatus.state)}}
+                                    </small>
+                                    <small class="analysis-task__count">
+                                        {{analysisTasksStore.seriesAIFallbackStatus.processed_groups.toLocaleString()}} /
+                                        {{analysisTasksStore.seriesAIFallbackStatus.total_groups.toLocaleString()}} グループ
+                                    </small>
+                                </div>
+                                <v-progress-linear v-if="analysisTasksStore.seriesAIFallbackStatus.total_groups > 0"
+                                    class="mt-2" color="primary" height="5" rounded
+                                    :model-value="analysisTasksStore.seriesAIFallbackStatus.processed_groups /
+                                        analysisTasksStore.seriesAIFallbackStatus.total_groups * 100" />
                             </button>
                         </template>
                         <div v-else class="analysis-tasks__empty">実行中の処理はありません。</div>
@@ -92,8 +111,12 @@ import HeaderBar from '@/components/HeaderBar.vue';
 import KonomiTVBS4KActiveAnalysisTaskDialog from '@/components/KonomiTVBS4KActiveAnalysisTaskDialog.vue';
 import Navigation from '@/components/Navigation.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
-import { AnalysisTaskType } from '@/services/AnalysisTasks';
-import useAnalysisTasksStore, { stageLabel, taskTypeLabel } from '@/stores/AnalysisTasksStore';
+import useAnalysisTasksStore, {
+    BackgroundTaskType,
+    backgroundTaskStatusLabel,
+    stageLabel,
+    taskTypeLabel,
+} from '@/stores/AnalysisTasksStore';
 import useUserStore from '@/stores/UserStore';
 import useVersionStore from '@/stores/VersionStore';
 
@@ -102,9 +125,9 @@ const versionStore = useVersionStore();
 const analysisTasksStore = useAnalysisTasksStore();
 const { activeTaskGroups } = storeToRefs(analysisTasksStore);
 const activeAnalysisTaskDialog = ref(false);
-const selectedActiveTaskType = ref<AnalysisTaskType | null>(null);
+const selectedActiveTaskType = ref<BackgroundTaskType | null>(null);
 
-function openActiveAnalysisTaskDialog(taskType: AnalysisTaskType): void {
+function openActiveAnalysisTaskDialog(taskType: BackgroundTaskType): void {
     selectedActiveTaskType.value = taskType;
     activeAnalysisTaskDialog.value = true;
 }
