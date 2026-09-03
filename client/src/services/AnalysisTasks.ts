@@ -33,9 +33,25 @@ export interface IAnalysisTaskExecution {
     updated_at: string;
 }
 
+/** Indexer 未所属 group を処理するシリーズ AI 補完ワーカーの現在状態。 */
+export interface ISeriesAIFallbackStatus {
+    state: 'Running' | 'Idle' | 'Disabled' | 'Stopped';
+    stopped_reason: string | null;
+    total_groups: number;
+    processed_groups: number;
+    resolved_count: number;
+    not_series_count: number;
+    insufficient_evidence_count: number;
+    failed_count: number;
+    pending_count: number;
+    cancelled_count: number;
+    current_title: string | null;
+}
+
 export interface IAnalysisTaskOverview {
     active: IAnalysisTaskExecution[];
     active_children: IAnalysisTaskExecution[];
+    series_ai_fallback?: ISeriesAIFallbackStatus;
 }
 
 export interface IAnalysisTaskList {

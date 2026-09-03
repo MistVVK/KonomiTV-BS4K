@@ -1,6 +1,11 @@
 import { defineStore } from 'pinia';
 
-import AnalysisTasks, { AnalysisTaskType, IAnalysisTaskExecution, IAnalysisTaskOverview } from '@/services/AnalysisTasks';
+import AnalysisTasks, {
+    AnalysisTaskType,
+    IAnalysisTaskExecution,
+    IAnalysisTaskOverview,
+    ISeriesAIFallbackStatus,
+} from '@/services/AnalysisTasks';
 
 
 export interface IActiveAnalysisTaskGroup {
@@ -11,7 +16,8 @@ export interface IActiveAnalysisTaskGroup {
     progress: number | null;
 }
 
-export type ActiveAnalysisTaskStatus = 'Running' | 'Queued' | null;
+export type BackgroundTaskType = AnalysisTaskType | 'SeriesAIFallback';
+export type BackgroundTaskStatus = 'Running' | 'Queued' | 'Idle' | 'Disabled' | 'Stopped' | null;
 
 
 // Navigation と MyPage の両方が同時にマウントされても API ポーリングを重複させないため、
@@ -20,7 +26,7 @@ let overviewPollingTimer: number | null = null;
 let overviewPollingConsumers = 0;
 
 
-export function taskTypeLabel(type: AnalysisTaskType): string {
+export function taskTypeLabel(type: BackgroundTaskType): string {
     return {
         RecordedScan: '録画フォルダスキャン', MetadataAnalysis: 'メタデータ解析', PlaybackIndex: '再生索引作成',
         ThumbnailGeneration: 'サムネイル生成', CMAnalysis: 'CM区間解析', CMLogoGeneration: 'CMロゴ生成',
@@ -28,7 +34,16 @@ export function taskTypeLabel(type: AnalysisTaskType): string {
         BatchCMAnalysis: '全件CM再判定', BatchSeriesResolution: '既存録画シリーズ一括判定',
         BatchEpisodeResolution: '既存録画話数一括判定',
         BackgroundAnalysis: 'バックグラウンド一括解析',
+        SeriesAIFallback: 'シリーズ AI 補完',
     }[type];
+}
+
+
+export function backgroundTaskStatusLabel(status: BackgroundTaskStatus): string {
+    if (status === null) return '';
+    return {
+        Running: '実行中', Queued: '待機中', Idle: '待機中', Disabled: '無効', Stopped: '停止',
+    }[status];
 }
 
 
@@ -48,6 +63,7 @@ export function stageLabel(stage: string | null): string {
 const useAnalysisTasksStore = defineStore('analysisTasks', {
     state: () => ({
         analysisOverview: {active: [], active_children: []} as IAnalysisTaskOverview,
+        seriesAIFallbackStatus: null as ISeriesAIFallbackStatus | null,
     }),
     getters: {
         activeTaskGroups(state): IActiveAnalysisTaskGroup[] {
@@ -71,10 +87,11 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
                 };
             });
         },
-        activeTaskStatus(state): ActiveAnalysisTaskStatus {
+        activeTaskStatus(state): BackgroundTaskStatus {
             if (state.analysisOverview.active.some(task => task.status === 'Running')) return 'Running';
+            if (state.seriesAIFallbackStatus?.state === 'Running') return 'Running';
             if (state.analysisOverview.active.some(task => task.status === 'Queued')) return 'Queued';
-            return null;
+            return state.seriesAIFallbackStatus?.state ?? null;
         },
     },
     actions: {
@@ -87,6 +104,9 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
                     ...overview,
                     active_children: overview.active_children ?? [],
                 };
+                if (overview.series_ai_fallback !== undefined) {
+                    this.seriesAIFallbackStatus = overview.series_ai_fallback;
+                }
             }
         },
         startOverviewPolling(showError = false): void {
