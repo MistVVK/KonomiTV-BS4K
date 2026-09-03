@@ -5,7 +5,6 @@ from app import logging
 from app.metadata.ai.recorded_series_ai import (
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
-    has_episode_lookup_capability_proof,
     resolve_series_metadata,
 )
 from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
@@ -320,22 +319,18 @@ class SeriesAIFallbackTask:
 
         async with cls._batch_lock:
             settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-            if (
-                settings.enabled is False
-                or settings.ai_enabled is False
-                or has_episode_lookup_capability_proof(settings, api_key) is False
-            ):
+            # 接続試験の実行履歴ではなく現在の有効設定を開始条件にする。
+            # 接続能力や認証の失敗は実リクエストの監査行へ記録し、補完を黙って省略しない。
+            if settings.enabled is False or settings.ai_enabled is False:
+                logging.warning('[SeriesAIFallbackTask] Fallback batch skipped because series AI is disabled.')
                 return
             provider_fingerprint = get_episode_lookup_provider_fingerprint(settings, api_key)
             groups = await cls._loadGroups()
             for grouping_key, programs in groups.items():
                 # 設定 OFF や backend 世代変更後も、古い snapshot で新規リクエストを続けない。
                 latest_settings, latest_api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
-                if (
-                    latest_settings.enabled is False
-                    or latest_settings.ai_enabled is False
-                    or has_episode_lookup_capability_proof(latest_settings, latest_api_key) is False
-                ):
+                if latest_settings.enabled is False or latest_settings.ai_enabled is False:
+                    logging.warning('[SeriesAIFallbackTask] Fallback batch stopped because series AI was disabled.')
                     return
                 if (
                     get_episode_lookup_provider_fingerprint(latest_settings, latest_api_key)
@@ -368,7 +363,7 @@ class SeriesAIFallbackTask:
             programs: 同じ grouping key に属する Indexer 未所属録画。
             settings: 判定開始時の録画シリーズ設定 snapshot。
             api_key: 同じ時点の互換 API key snapshot。
-            provider_fingerprint: 接続試験済み backend 世代の fingerprint。
+            provider_fingerprint: backend 設定・認証世代の fingerprint。
 
         Returns:
             None
@@ -474,7 +469,6 @@ class SeriesAIFallbackTask:
             latest_settings.enabled is False
             or latest_settings.ai_enabled is False
             or latest_provider_fingerprint != provider_fingerprint
-            or has_episode_lookup_capability_proof(latest_settings, latest_api_key) is False
         ):
             await SeriesAIFallback.filter(grouping_key=grouping_key).update(
                 status='Cancelled',
@@ -492,7 +486,6 @@ class SeriesAIFallbackTask:
             if (
                 latest_settings.enabled
                 and latest_settings.ai_enabled
-                and has_episode_lookup_capability_proof(latest_settings, latest_api_key)
             ):
                 await cls.schedule(retry_cancelled=True)
             return
