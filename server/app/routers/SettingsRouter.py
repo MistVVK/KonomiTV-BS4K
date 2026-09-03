@@ -25,6 +25,8 @@ router = APIRouter(
 _HOST_PATH_SETTINGS_API_PATHS = {
     '/api/settings/server',
     '/api/cm-analysis/settings',
+    # API キー入力の検証失敗時にも FastAPI 標準応答の input へ秘密を転載しない。
+    '/api/ai-backends/openai-compatible/api-key',
 }
 
 
@@ -61,7 +63,7 @@ async def HostPathRequestValidationErrorHandler(
     exception: RequestValidationError,
 ) -> JSONResponse:
     """
-    パス設定APIの422レスポンスから入力値を除き、内部接頭辞の再露出を防ぐ。
+    パス設定・秘密入力 API の422レスポンスから入力値を除き、内部値の再露出を防ぐ。
 
     Args:
         request (Request): バリデーションに失敗したHTTPリクエスト。

@@ -1,4 +1,4 @@
-"""AI バックエンド（OpenCode service / ACP）管理 API。
+"""AI バックエンド（OpenCode service / OpenAI 互換 HTTP / ACP）管理 API。
 
 含む: service CRUD / APIキー set・delete / OAuth 開始・callback・切断 /
 OpenCode auth 注入と DELETE /auth/{id} 連動 / health・availability /
@@ -44,6 +44,12 @@ from app.metadata.ai.KonomiTVBS4KACPCredentials import (
     KonomiTVBS4KACPCredentials,
     KonomiTVBS4KACPImportProvider,
 )
+from app.metadata.ai.openai_compatible import OpenAICompatibleBackend
+from app.metadata.ai.OpenAICompatibleSettings import (
+    OpenAICompatibleSettings,
+    OpenAICompatibleSettingsResponse,
+    OpenAICompatibleSettingsStore,
+)
 from app.metadata.ai.opencode_backend import (
     BuildOpenCodeBackendFromDraft,
     BuildOpenCodeBackendFromServiceID,
@@ -70,6 +76,7 @@ from app.metadata.ai.recorded_series_ai import (
 )
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
 from app.metadata.RecordedSeriesSettings import (
+    AIBackendKind,
     RecordedSeriesSettings,
 )
 from app.models.RecordedSeries import RecordedSeriesAIRequest
@@ -106,12 +113,45 @@ NO_STORE_HEADERS = {'Cache-Control': 'no-store'}
 MAX_API_KEY_LENGTH = 8192
 
 
+def _BuildConnectionTestProofSettings(
+    backend_kind: AIBackendKind,
+    *,
+    service_id: str | None = None,
+) -> RecordedSeriesSettings:
+    """接続試験で実測する単一 backend target の proof 条件を返す。
+
+    Args:
+        backend_kind: 接続試験する backend 種別。
+        service_id: OpenCode 接続試験で使用する service UUID。
+
+    Returns:
+        回復設定を含まない target 単体の設定。
+    """
+
+    return RecordedSeriesSettings(
+        ai_enabled=True,
+        ai_backend=backend_kind,
+        ai_backend_service_id=service_id if backend_kind == 'OpenCode' else None,
+    )
+
+
 class AIBackendAPIKeyBody(BaseModel):
     """API キー設定ボディ。応答には絶対にエコーしない。"""
 
     model_config = ConfigDict(extra='forbid')
 
     api_key: Annotated[str, Field(min_length=1, max_length=MAX_API_KEY_LENGTH)]
+
+
+class OpenAICompatibleConnectionTestRequest(BaseModel):
+    """保存済み OpenAI 互換 HTTP 設定を使う接続試験リクエスト。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    capability: Annotated[
+        Literal['CandidateSelection', 'EpisodeLookup'],
+        Field(),
+    ] = 'CandidateSelection'
 
 
 class OpenCodeAvailabilityResponse(BaseModel):
@@ -857,6 +897,224 @@ async def AIBackendUsageListAPI(
         ) from error
 
 
+# === 独立 OpenAI 互換 HTTP バックエンド ===
+
+
+@router.get(
+    '/openai-compatible/settings',
+    summary='OpenAI 互換 HTTP 設定取得 API',
+    response_model=OpenAICompatibleSettingsResponse,
+)
+async def OpenAICompatibleSettingsAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> OpenAICompatibleSettingsResponse:
+    """API キー本体を含まない OpenAI 互換 HTTP 設定を返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        接続先・モデル・API キー設定済み状態。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        return OpenAICompatibleSettingsStore.getSettingsResponse()
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatibleSettingsAPI] Failed to load settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load OpenAI-compatible settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+
+@router.put(
+    '/openai-compatible/settings',
+    summary='OpenAI 互換 HTTP 設定更新 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatibleSettingsUpdateAPI(
+    body: OpenAICompatibleSettings,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """API ベース URL とモデルを全体置換で保存する。
+
+    Args:
+        body: 保存する非秘密設定。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 設定ファイルを保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatibleSettingsStore.saveSettings(body)
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatibleSettingsUpdateAPI] Failed to save settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to save OpenAI-compatible settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible')
+
+
+@router.put(
+    '/openai-compatible/api-key',
+    summary='OpenAI 互換 HTTP API キー設定 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatibleAPIKeySetAPI(
+    body: AIBackendAPIKeyBody,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """API キーを専用 secrets ファイルへ保存する。
+
+    Args:
+        body: API キーを含む設定リクエスト。応答へは含めない。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: キーが不正、または保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatibleSettingsStore.setAPIKey(body.api_key)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='API key is invalid.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    except OSError as error:
+        logging.error(
+            '[OpenAICompatibleAPIKeySetAPI] Failed to store API key.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to store OpenAI-compatible API key.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible')
+
+
+@router.delete(
+    '/openai-compatible/api-key',
+    summary='OpenAI 互換 HTTP API キー削除 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatibleAPIKeyDeleteAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """専用 secrets ファイルから API キーを削除する。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 秘密ファイルを削除できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatibleSettingsStore.deleteAPIKey()
+    except OSError as error:
+        logging.error(
+            '[OpenAICompatibleAPIKeyDeleteAPI] Failed to delete API key.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to delete OpenAI-compatible API key.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible')
+
+
+@router.post(
+    '/openai-compatible/connection-test',
+    summary='OpenAI 互換 HTTP 接続試験 API',
+    response_model=AIBackendConnectionTestResponse,
+)
+async def OpenAICompatibleConnectionTestAPI(
+    body: OpenAICompatibleConnectionTestRequest,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> AIBackendConnectionTestResponse:
+    """保存済み接続情報で Chat Completions または EpisodeLookup を試験する。
+
+    Args:
+        body: 試験する AI 機能。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        秘密を含まない接続試験結果。
+
+    Raises:
+        HTTPException: 保存済み設定を読み込めない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    proof_settings = _BuildConnectionTestProofSettings('OpenAICompatible')
+    try:
+        tested_provider_fingerprint = get_episode_lookup_provider_fingerprint(
+            proof_settings,
+            None,
+        )
+        direct_settings, api_key = OpenAICompatibleSettingsStore.getSettingsAndAPIKey()
+        backend = OpenAICompatibleBackend(direct_settings, api_key)
+        result = await backend.testConnection(body.capability)
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatibleConnectionTestAPI] Failed to load settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load OpenAI-compatible settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+    if body.capability == 'EpisodeLookup':
+        result = await _RecordEpisodeLookupConnectionTest(
+            proof_settings,
+            tested_provider_fingerprint,
+            result,
+        )
+    return _ConnectionTestResponse(result)
+
+
 # === ACP 固定プリセット（Codex / Grok Build） ===
 
 
@@ -1232,8 +1490,8 @@ async def ACPBackendConnectionTestAPI(
 
     response.headers.update(NO_STORE_HEADERS)
     capability = body.capability
-    # ACP バックエンド用の最小 settings（ACPSettings は実行時に正本参照される）。
-    settings = RecordedSeriesSettings(ai_backend=body.backend_kind, ai_enabled=True)
+    # 接続試験で実際に起動する ACP backend 単体へだけ proof を結び付ける。
+    settings = _BuildConnectionTestProofSettings(body.backend_kind)
     audit_model = get_audit_model(settings)
     # EpisodeLookup 時に実際に試験した provider fingerprint。preflight 失敗時は None のまま。
     tested_provider_fingerprint: str | None = None
@@ -2037,6 +2295,93 @@ def _ConnectionTestResponse(result: ConnectionTestResult) -> AIBackendConnection
     )
 
 
+async def _RecordEpisodeLookupConnectionTest(
+    proof_settings: RecordedSeriesSettings,
+    tested_provider_fingerprint: str,
+    result: ConnectionTestResult,
+) -> ConnectionTestResult:
+    """保存済み backend の EpisodeLookup 接続試験を監査し、能力証明を更新する。
+
+    Args:
+        proof_settings: 試験対象を指す録画シリーズ設定。
+        tested_provider_fingerprint: 試験開始時の設定・認証 fingerprint。
+        result: backend が返した接続試験結果。
+
+    Returns:
+        試験中の設定変更も反映した最終結果。
+    """
+
+    rejected_error_codes = {
+        'ChoiceOutsideCandidateSet',
+        'InvalidOutputSchema',
+        'InvalidJSON',
+        'InvalidJSONType',
+        'InvalidModelOutput',
+        'LowConfidence',
+        'MissingSearchSources',
+        'MissingWebSearchCall',
+        'SearchNotRun',
+        'OpenCodeWebSearchNotObserved',
+        'OpenCodeWebSearchFailed',
+        'OpenCodeEpisodeLookupLocalDisabled',
+    }
+    audit_error_code = None if result.success else result.error_code or 'ConnectionTestFailed'
+    connection_test_audit = await RecordedSeriesAIRequest.create(
+        resolution_id=None,
+        purpose='ConnectionTest',
+        status=(
+            'Succeeded'
+            if result.success
+            else 'Rejected'
+            if audit_error_code in rejected_error_codes
+            else 'Failed'
+        ),
+        model=result.model,
+        candidate_ids=['episode-lookup'],
+        selected_choice_id=result.selected_choice_id,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        http_status=result.http_status,
+        latency_ms=result.latency_ms,
+        error_code=audit_error_code,
+    )
+    invalidate_episode_lookup_capability_fingerprint(tested_provider_fingerprint)
+    proof_recorded = record_episode_lookup_capability_proof(
+        proof_settings,
+        None,
+        result,
+        tested_provider_fingerprint=tested_provider_fingerprint,
+    )
+    if result.success is False or proof_recorded:
+        return result
+
+    current_fingerprint = get_episode_lookup_provider_fingerprint(proof_settings, None)
+    state_changed = current_fingerprint != tested_provider_fingerprint
+    failed_result = ConnectionTestResult(
+        success=False,
+        latency_ms=result.latency_ms,
+        model=result.model,
+        message=(
+            '接続試験中に AI 設定または認証状態が変更されました。もう一度試してください。'
+            if state_changed
+            else '話数 Web 検索に必要な能力をすべて確認できませんでした。'
+        ),
+        checks=result.checks,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        http_status=result.http_status,
+        error_code=(
+            'ConnectionTestStateChanged'
+            if state_changed
+            else 'EpisodeLookupCapabilityNotVerified'
+        ),
+    )
+    connection_test_audit.status = 'Failed'
+    connection_test_audit.error_code = failed_result.error_code
+    await connection_test_audit.save(update_fields=['status', 'error_code'])
+    return failed_result
+
+
 @router.post(
     '/connection-test',
     summary='AI バックエンド OpenCode 接続試験 API',
@@ -2115,11 +2460,10 @@ async def AIBackendConnectionTestAPI(
                 )
                 remove_auth_on_cleanup = remaining == 0
                 provider_id_for_cleanup = backend.service.opencode_provider_id
-            if body.capability == 'EpisodeLookup':
-                proof_settings = RecordedSeriesSettings(
-                    ai_backend='OpenCode',
-                    ai_enabled=True,
-                    ai_backend_service_id=backend.service.service_id,
+            if body.capability == 'EpisodeLookup' and body.api_key is None:
+                proof_settings = _BuildConnectionTestProofSettings(
+                    'OpenCode',
+                    service_id=backend.service.service_id,
                 )
                 tested_provider_fingerprint = get_episode_lookup_provider_fingerprint(
                     proof_settings,
@@ -2213,77 +2557,11 @@ async def AIBackendConnectionTestAPI(
             and proof_settings is not None
             and tested_provider_fingerprint is not None
         ):
-            rejected_error_codes = {
-                'ChoiceOutsideCandidateSet',
-                'InvalidOutputSchema',
-                'InvalidJSON',
-                'InvalidJSONType',
-                'InvalidModelOutput',
-                'LowConfidence',
-                'MissingWebSearchCall',
-                'SearchNotRun',
-                'OpenCodeWebSearchNotObserved',
-                'OpenCodeWebSearchFailed',
-                'OpenCodeEpisodeLookupLocalDisabled',
-            }
-            audit_error_code = (
-                None if result.success else result.error_code or 'ConnectionTestFailed'
-            )
-            connection_test_audit = await RecordedSeriesAIRequest.create(
-                resolution_id=None,
-                purpose='ConnectionTest',
-                status=(
-                    'Succeeded'
-                    if result.success
-                    else 'Rejected'
-                    if audit_error_code in rejected_error_codes
-                    else 'Failed'
-                ),
-                model=result.model,
-                candidate_ids=['episode-lookup'],
-                selected_choice_id=result.selected_choice_id,
-                prompt_tokens=result.prompt_tokens,
-                completion_tokens=result.completion_tokens,
-                http_status=result.http_status,
-                latency_ms=result.latency_ms,
-                error_code=audit_error_code,
-            )
-            invalidate_episode_lookup_capability_fingerprint(
-                tested_provider_fingerprint,
-            )
-            proof_recorded = record_episode_lookup_capability_proof(
+            result = await _RecordEpisodeLookupConnectionTest(
                 proof_settings,
-                None,
+                tested_provider_fingerprint,
                 result,
-                tested_provider_fingerprint=tested_provider_fingerprint,
             )
-            if result.success and proof_recorded is False:
-                current_fp = get_episode_lookup_provider_fingerprint(proof_settings, None)
-                state_changed = current_fp != tested_provider_fingerprint
-                result = ConnectionTestResult(
-                    success=False,
-                    latency_ms=result.latency_ms,
-                    model=result.model,
-                    message=(
-                        '接続試験中に AI 設定または認証状態が変更されました。もう一度試してください。'
-                        if state_changed
-                        else '話数 Web 検索に必要な能力をすべて確認できませんでした。'
-                    ),
-                    checks=result.checks,
-                    prompt_tokens=result.prompt_tokens,
-                    completion_tokens=result.completion_tokens,
-                    http_status=result.http_status,
-                    error_code=(
-                        'ConnectionTestStateChanged'
-                        if state_changed
-                        else 'EpisodeLookupCapabilityNotVerified'
-                    ),
-                )
-                connection_test_audit.status = 'Failed'
-                connection_test_audit.error_code = result.error_code
-                await connection_test_audit.save(
-                    update_fields=['status', 'error_code'],
-                )
 
         return _ConnectionTestResponse(result)
     finally:
