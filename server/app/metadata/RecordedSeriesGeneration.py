@@ -100,10 +100,24 @@ class _SeriesMetadataWebLookupProgram(TypedDict):
     description: str
 
 
+class _SeriesMetadataWebLookupExistingSeriesHint(TypedDict):
+    """Web 所属補完へ渡す既存 Series の再利用候補。"""
+
+    id: int
+    title: str
+
+
+class _SeriesMetadataWebLookupHints(TypedDict):
+    """Web 所属補完で同一作品なら正確に再利用する既存 Series hints。"""
+
+    existing_series: list[_SeriesMetadataWebLookupExistingSeriesHint]
+
+
 class _SeriesMetadataWebLookupPromptData(TypedDict):
     """同一 EPG タイトル系を1回の検索へ束ねた入力。"""
 
     programs: list[_SeriesMetadataWebLookupProgram]
+    hints: _SeriesMetadataWebLookupHints
 
 
 class AISeriesMetadataOutput(BaseModel):
@@ -256,6 +270,8 @@ def BuildSeriesMetadataSystemPrompt(*, require_web_search: bool = False) -> str:
         'A null episode_number means insufficient episode evidence, not an unnumbered episode. '
         'Copy an existing_series_id or wikipedia_page_id only when the same work appears in hints; '
         'otherwise return null and never invent an ID. '
+        'When hints.existing_series contains the same work, copy that entry title exactly to '
+        'series_title and its id to existing_series_id instead of creating a title variant. '
         'Use NotSeries only for a one-off program and Unresolved when evidence is insufficient. '
         'Treat a continuing program with changing per-broadcast content as Series. '
         'Do not merge different works merely because they share a broadcast slot or short prefix. '
@@ -316,8 +332,8 @@ def BuildSeriesMetadataPrompt(
     """
 
     if require_web_search:
-        # 所属補完はユーザー確定の5項目だけを束ねる。内部 ID・候補・話数・詳細項目・
-        # 放送時間長を検索 provider へ渡さず、話数は所属確定後の既存経路で扱う。
+        # 所属補完はユーザー確定の5項目と、同一作品なら再利用できる既存 Series の
+        # ID・正確なタイトルだけを束ねる。話数・詳細項目・放送時間長は渡さない。
         representative_programs = hints['cluster']['representative_programs']
         prompt_data: _SeriesMetadataPromptData | _SeriesMetadataWebLookupPromptData = (
             _SeriesMetadataWebLookupPromptData(
@@ -339,6 +355,15 @@ def BuildSeriesMetadataPrompt(
                         description=program['description'],
                     ),
                 ],
+                hints=_SeriesMetadataWebLookupHints(
+                    existing_series=[
+                        _SeriesMetadataWebLookupExistingSeriesHint(
+                            id=existing_series['id'],
+                            title=existing_series['title'],
+                        )
+                        for existing_series in hints['existing_series']
+                    ],
+                ),
             )
         )
     else:
@@ -378,8 +403,10 @@ def BuildSeriesMetadataWebLookupFinalPrompt() -> str:
         'Do not call tools in this turn. Return exactly one JSON object and no Markdown. '
         'Use Series only when public Web evidence identifies a continuing work; otherwise use '
         'NotSeries or Unresolved. For Series, return a clean canonical series_title. '
-        'Always set season_number, episode_number, subtitle, existing_series_id, and '
-        'wikipedia_page_id to null. Do not include URLs. confidence is a number from 0 through 1.'
+        'When hints.existing_series contains the same work, copy that entry title exactly to '
+        'series_title and its id to existing_series_id; otherwise set existing_series_id to null. '
+        'Always set season_number, episode_number, subtitle, and wikipedia_page_id to null. '
+        'Do not include URLs. confidence is a number from 0 through 1.'
     )
 
 
