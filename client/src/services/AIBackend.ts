@@ -217,6 +217,18 @@ export interface IACPSettings {
     grok: IACPBackendSettings;
 }
 
+/** Grok ACP が session/new で広告したモデル1件。 */
+export interface IACPGrokModel {
+    model_id: string;
+    model_name: string;
+}
+
+/** Grok ACP が session/new で広告したモデル一覧。 */
+export interface IACPGrokModelCatalog {
+    current_model_id: string;
+    models: IACPGrokModel[];
+}
+
 /** 認証内容を含まない ACP 共有資格情報状態。 */
 export interface IACPBackendCredentialStatus {
     acp_operation_running: boolean;
@@ -515,6 +527,20 @@ export default class AIBackend {
             return false;
         }
         return true;
+    }
+
+    /** Grok ACP が session/new で広告したモデル一覧を取得する。 */
+    static async fetchACPGrokModels(): Promise<IACPGrokModelCatalog | null> {
+        const response = await APIClient.get<IACPGrokModelCatalog>(
+            '/ai-backends/acp-models/grok',
+            // agent の initialize と session/new、process 回収を待つ。
+            {timeout: 70 * 1000},
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'Grok ACP のモデル候補を取得できませんでした。');
+            return null;
+        }
+        return response.data;
     }
 
     /** ACP 認証状態を取得する。 */
