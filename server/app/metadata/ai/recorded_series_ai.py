@@ -1,7 +1,7 @@
 """録画シリーズ AI 統合 facade。
 
 プロバイダー非依存のインターフェースを提供し、
-設定に基づいて適切なバックエンド（OpenCode / ACP）へ routing する。
+設定に基づいて適切なバックエンド（OpenCode / OpenAI 互換 HTTP / ACP）へ routing する。
 """
 
 from __future__ import annotations
@@ -314,6 +314,24 @@ def _BuildTargetFingerprint(target: AIBackendTarget) -> _AIBackendTargetFingerpr
             ),
         )
 
+    if target.backend_kind == 'OpenAICompatible':
+        from app.metadata.ai.OpenAICompatibleSettings import (
+            OpenAICompatibleSettingsStore,
+        )
+
+        direct_settings, api_key = OpenAICompatibleSettingsStore.getSettingsAndAPIKey()
+        return _AIBackendTargetFingerprint(
+            backend_kind=target.backend_kind,
+            service_id=None,
+            prompt_variant=target.prompt_variant,
+            service=direct_settings.model_dump(mode='json'),
+            api_key_hash=(
+                hashlib.sha256(api_key.encode('utf-8')).hexdigest()
+                if api_key is not None
+                else None
+            ),
+        )
+
     from app.metadata.ai.ACPSettings import ACPSettingsStore
 
     credential_provider = _GetACPCredentialProvider(target.backend_kind)
@@ -400,13 +418,13 @@ def get_episode_lookup_provider_fingerprint(
     settings: RecordedSeriesSettings,
     api_key: str | None,
 ) -> str:
-    """接続試験と実行前検証で共有する、安全な能力証明キーを返す。
+    """実行前検証と自動判定 cache で共有する安全な provider fingerprint を返す。
 
     主系 backend に加え、失敗時ポリシーと予備 AI 設定も fingerprint に含め、
     設定変更後に古い判定結果や proof を再利用しない。
     """
 
-    # provider proof と自動判定 cache は同じ主系・予備系実行条件を共有する。
+    # 実行中に主系・予備のいずれが変わっても結果を適用しない全体識別子を作る。
     endpoint_identifier = GetAIExecutionFingerprint(settings)
     backend_kind_for_fingerprint = settings.ai_backend
     effective_api_key: str | None = None
@@ -416,6 +434,42 @@ def get_episode_lookup_provider_fingerprint(
         endpoint_identifier=endpoint_identifier,
         api_key=effective_api_key,
     )
+
+
+def get_episode_lookup_capability_proof_fingerprints(
+    settings: RecordedSeriesSettings,
+) -> tuple[str, ...]:
+    """主系と利用し得る予備を、個別に接続試験できる fingerprint へ変換する。
+
+    Args:
+        settings: 実行時または接続試験用の録画シリーズ設定。
+
+    Returns:
+        重複を除いた target 単位の能力証明 fingerprint。
+    """
+
+    targets = [BuildPrimaryTarget(settings)]
+    recovery_target = BuildRecoveryTarget(settings)
+    if recovery_target is not None:
+        targets.append(recovery_target)
+
+    fingerprints: list[str] = []
+    for target in targets:
+        # prompt variant や回復方針は検索能力を変えない。接続試験と同じ
+        # Default / Fail の単体設定へ正規化し、試した target だけを証明する。
+        target_settings = RecordedSeriesSettings(
+            ai_enabled=True,
+            ai_backend=target.backend_kind,
+            ai_backend_service_id=(
+                target.service_id
+                if target.backend_kind == 'OpenCode'
+                else None
+            ),
+        )
+        fingerprint = get_episode_lookup_provider_fingerprint(target_settings, None)
+        if fingerprint not in fingerprints:
+            fingerprints.append(fingerprint)
+    return tuple(fingerprints)
 
 
 def record_episode_lookup_capability_proof(
@@ -429,11 +483,14 @@ def record_episode_lookup_capability_proof(
 
     接続・Web 検索・検索元 URL・strict schema の4項目がすべて Passed の
     場合だけ、接続試験の診断結果を provider fingerprint に記録する。設定やキーが
-    変わると fingerprint も変わるため、古い診断結果は再利用されない。実検索は
-    同じ能力を実行時に検証するため、この記録の有無を開始条件にはしない。
+    変わると fingerprint も変わるため、古い診断結果は再利用されない。
+    複数 target の実行設定はこの関数へ渡さず、各接続試験の単体設定を個別に記録する。
     """
 
-    fingerprint = get_episode_lookup_provider_fingerprint(settings, api_key)
+    fingerprints = get_episode_lookup_capability_proof_fingerprints(settings)
+    if len(fingerprints) != 1:
+        raise ValueError('Capability proof must be recorded for exactly one backend target.')
+    fingerprint = fingerprints[0]
     with _EPISODE_LOOKUP_CAPABILITY_PROOFS_LOCK:
         _loadEpisodeLookupCapabilityProofsLocked()
         if (
@@ -481,12 +538,15 @@ def has_episode_lookup_capability_proof(
     settings: RecordedSeriesSettings,
     api_key: str | None,
 ) -> bool:
-    """現在の provider fingerprint に一致する能力証明があるかを返す。"""
+    """主系と利用し得る予備の全 target に能力証明があるかを返す。"""
 
-    fingerprint = get_episode_lookup_provider_fingerprint(settings, api_key)
+    fingerprints = get_episode_lookup_capability_proof_fingerprints(settings)
     with _EPISODE_LOOKUP_CAPABILITY_PROOFS_LOCK:
         _loadEpisodeLookupCapabilityProofsLocked()
-        return fingerprint in _EPISODE_LOOKUP_CAPABILITY_PROOFS
+        return all(
+            fingerprint in _EPISODE_LOOKUP_CAPABILITY_PROOFS
+            for fingerprint in fingerprints
+        )
 
 
 def invalidate_episode_lookup_capability_proof(
@@ -498,7 +558,7 @@ def invalidate_episode_lookup_capability_proof(
     """実行時の能力否定または認証世代変更に対応する proof を失効する。
 
     Args:
-        settings: 失効対象の完全な provider 設定。指定時は完全一致だけを失効する。
+        settings: 失効対象の実行設定。主系と利用し得る予備の target proof を失効する。
         api_key: OpenAI 互換設定に対応する API キー。
         backend_kind: 認証 import/delete 時に backend 全世代を失効する識別子。
     """
@@ -507,10 +567,10 @@ def invalidate_episode_lookup_capability_proof(
         _loadEpisodeLookupCapabilityProofsLocked()
         changed = False
         if settings is not None:
-            fingerprint = get_episode_lookup_provider_fingerprint(settings, api_key)
-            if fingerprint in _EPISODE_LOOKUP_CAPABILITY_PROOFS:
-                _EPISODE_LOOKUP_CAPABILITY_PROOFS.pop(fingerprint, None)
-                changed = True
+            for fingerprint in get_episode_lookup_capability_proof_fingerprints(settings):
+                if fingerprint in _EPISODE_LOOKUP_CAPABILITY_PROOFS:
+                    _EPISODE_LOOKUP_CAPABILITY_PROOFS.pop(fingerprint, None)
+                    changed = True
         elif backend_kind is not None:
             stale_fingerprints = [
                 fingerprint
@@ -550,6 +610,27 @@ class AcpBackendNotImplementedError(RecordedSeriesAIError):
         self.backend_kind = backend_kind
 
 
+class _BackendOperationAuditError(RecordedSeriesAIError):
+    """実行を開始した backend snapshot の監査 label を保持するエラー。"""
+
+    def __init__(self, source: RecordedSeriesAIError, audit_model: str) -> None:
+        """元エラーを安全な監査情報とともに包む。
+
+        Args:
+            source: backend operation が返した固定コードのエラー。
+            audit_model: backend 生成時の不変な監査 label。
+        """
+
+        super().__init__(
+            source.code,
+            http_status=source.http_status,
+            latency_ms=source.latency_ms,
+            recovery_attempt_summaries=source.recovery_attempt_summaries,
+        )
+        # エラー後に mutable store を再読せず、実 request の世代を attempt summary へ渡す。
+        self.audit_model = audit_model
+
+
 def _create_backend(
     settings: RecordedSeriesSettings,
     *,
@@ -559,14 +640,14 @@ def _create_backend(
 
     Args:
         settings: 判定開始時点の録画シリーズ判定設定（immutable snapshot）。
-        api_key: 同じ時点で解決した API キー。OpenCode では未使用（secrets 参照）。
+        api_key: 互換引数。各 HTTP backend は専用 secrets を参照する。
 
     Returns:
         RecordedSeriesAIBackend: 適切なバックエンドインスタンス。
 
     Raises:
         AcpBackendNotImplementedError: ACP バックエンドのコマンドが未設定の場合。
-        RecordedSeriesAIError: OpenCode service が未設定の場合。
+        RecordedSeriesAIError: backend の接続設定が未設定の場合。
     """
 
     return CreateBackendForTarget(
@@ -586,14 +667,14 @@ def CreateBackendForTarget(
 
     Args:
         target: 実行する backend 種別と service_id。
-        api_key: 互換引数。OpenCode では未使用。
+        api_key: 互換引数。各 HTTP backend は専用 secrets を参照する。
 
     Returns:
         RecordedSeriesAIBackend 実装。
 
     Raises:
         AcpBackendNotImplementedError: ACP バックエンドのコマンドが未設定の場合。
-        RecordedSeriesAIError: OpenCode service が未設定の場合。
+        RecordedSeriesAIError: backend の接続設定が未設定の場合。
     """
 
     _ = api_key
@@ -605,6 +686,15 @@ def CreateBackendForTarget(
         if service_id is None or service_id.strip() == '':
             raise RecordedSeriesAIError('OpenCodeServiceNotFound')
         return BuildOpenCodeBackendFromServiceID(service_id)
+
+    if backend_kind == 'OpenAICompatible':
+        from app.metadata.ai.openai_compatible import OpenAICompatibleBackend
+        from app.metadata.ai.OpenAICompatibleSettings import (
+            OpenAICompatibleSettingsStore,
+        )
+
+        direct_settings, direct_api_key = OpenAICompatibleSettingsStore.getSettingsAndAPIKey()
+        return OpenAICompatibleBackend(direct_settings, direct_api_key)
 
     # ACP バックエンド
     from app.metadata.ai.acp_presets import resolve_command
@@ -704,7 +794,8 @@ class _AcpAdapter:
     def backend_kind(self) -> str:
         return self._backend_kind
 
-    def _audit_model(self) -> str:
+    @property
+    def audit_model(self) -> str:
         """監査用のモデル文字列（backend prefix 付き）を返す。"""
         backend_prefix_map: dict[str, str] = {
             'AcpCodex': 'acp:codex',
@@ -768,7 +859,7 @@ class _AcpAdapter:
         return AIChoiceResult(
             choice_id=result.choice_id,
             confidence=result.confidence,
-            model=self._audit_model(),
+            model=self.audit_model,
             prompt_tokens=result.prompt_tokens,
             completion_tokens=result.completion_tokens,
             http_status=result.http_status,
@@ -816,7 +907,7 @@ class _AcpAdapter:
             prompt_variant=prompt_variant,
             require_web_search=require_web_search,
         )
-        return replace(result, model=self._audit_model())
+        return replace(result, model=self.audit_model)
 
     async def lookupEpisode(
         self,
@@ -851,7 +942,7 @@ class _AcpAdapter:
             readable_files=self._readable_files,
             prompt_variant=prompt_variant,
         )
-        return replace(result, model=self._audit_model())
+        return replace(result, model=self.audit_model)
 
     async def testConnection(
         self,
@@ -924,7 +1015,7 @@ class _AcpAdapter:
                     )
             return replace(
                 result,
-                model=self._audit_model(),
+                model=self.audit_model,
                 message=message,
                 checks=checks,
             )
@@ -947,7 +1038,7 @@ class _AcpAdapter:
             readable_files=self._readable_files,
             backend_kind=self._backend_kind,
         )
-        return replace(result, model=self._audit_model())
+        return replace(result, model=self.audit_model)
 
 
 def _backend_to_profile_name(
@@ -1042,29 +1133,22 @@ async def select_candidate(
 
     async def RunSelection() -> AIChoiceResult:
         backend = _create_backend(settings, api_key=api_key)
-        return await backend.selectCandidate(
+        result = await backend.selectCandidate(
             program,
             candidates,
             minimum_confidence=minimum_confidence,
         )
+        return replace(result, model=backend.audit_model)
 
-    if settings.ai_backend == 'OpenCode':
-        # Phase 2 で OpenCodeBackend を直接呼ぶ（ACP 直列 lock は使わない）。
+    if settings.ai_backend in {'OpenCode', 'OpenAICompatible'}:
+        # HTTP backend は ACP process の直列 lock を使わず直接実行する。
         result = await RunSelection()
     else:
         result = await _RunACPOperationWithDeadline(
             RunSelection,
             _GetACPCredentialProvider(settings.ai_backend),
         )
-    return AIChoiceResult(
-        choice_id=result.choice_id,
-        confidence=result.confidence,
-        model=get_audit_model(settings),
-        prompt_tokens=result.prompt_tokens,
-        completion_tokens=result.completion_tokens,
-        http_status=result.http_status,
-        latency_ms=result.latency_ms,
-    )
+    return result
 
 
 async def _RunBackendOperation(
@@ -1073,27 +1157,32 @@ async def _RunBackendOperation(
     *,
     api_key: str | None = None,
     acp_hard_deadline: float | None = None,
-) -> _AcpOperationResult:
+) -> tuple[_AcpOperationResult, str]:
     """指定ターゲットの backend を生成して操作を実行する。
 
-    OpenCode は直接実行し、ACP は直列 lock と credential lock を適用する。
+    HTTP backend は直接実行し、ACP は直列 lock と credential lock を適用する。
     backend は失敗時にだけ予備用ターゲットから生成し、成功時の負荷を増やさない。
 
     Args:
         target: 主系または予備系の実行ターゲット。
         operation: backend を受け取り結果を返す非同期処理。
-        api_key: 互換引数。OpenCode では未使用。
+        api_key: 互換引数。各 HTTP backend は専用 secrets を参照する。
         acp_hard_deadline: 同一判定の全 ACP 試行で共有する絶対期限。
 
     Returns:
-        operation の戻り値。
+        operation の戻り値と、backend 生成時の監査 label。
     """
 
-    async def Run() -> _AcpOperationResult:
+    async def Run() -> tuple[_AcpOperationResult, str]:
         backend = CreateBackendForTarget(target, api_key=api_key)
-        return await operation(backend)
+        try:
+            result = await operation(backend)
+        except RecordedSeriesAIError as ex:
+            # request 開始後の失敗も、生成時の backend snapshot へ帰属させる。
+            raise _BackendOperationAuditError(ex, backend.audit_model) from ex
+        return result, backend.audit_model
 
-    if target.backend_kind == 'OpenCode':
+    if target.backend_kind in {'OpenCode', 'OpenAICompatible'}:
         return await Run()
     return await _RunACPOperationWithDeadline(
         Run,
@@ -1134,7 +1223,11 @@ def _BuildSeriesAttemptSummary(
         role=target.role,
         backend_kind=target.backend_kind,
         service_id=target.service_id,
-        model=get_audit_model_for_target(target),
+        model=(
+            error.audit_model
+            if isinstance(error, _BackendOperationAuditError)
+            else get_audit_model_for_target(target)
+        ),
         result_code=error.code,
         succeeded=False,
         adopted=adopted,
@@ -1183,7 +1276,11 @@ def _BuildEpisodeAttemptSummary(
         role=target.role,
         backend_kind=target.backend_kind,
         service_id=target.service_id,
-        model=get_audit_model_for_target(target),
+        model=(
+            error.audit_model
+            if isinstance(error, _BackendOperationAuditError)
+            else get_audit_model_for_target(target)
+        ),
         result_code=error.code,
         succeeded=False,
         adopted=adopted,
@@ -1318,7 +1415,7 @@ async def resolve_series_metadata(
     ) -> AISeriesMetadataResult:
         nonlocal acp_hard_deadline
         # 同一判定で ACP を複数回使っても、最初の ACP 試行からの絶対期限を共有する。
-        if target.backend_kind != 'OpenCode' and acp_hard_deadline is None:
+        if _GetACPCredentialProvider(target.backend_kind) is not None and acp_hard_deadline is None:
             acp_hard_deadline = (
                 asyncio.get_running_loop().time() + _ACP_OPERATION_HARD_TIMEOUT_SEC
             )
@@ -1349,14 +1446,14 @@ async def resolve_series_metadata(
                 require_web_search=require_web_search,
             )
 
-        result = await _RunBackendOperation(
+        result, audit_model = await _RunBackendOperation(
             target,
             Operation,
             api_key=api_key,
             acp_hard_deadline=acp_hard_deadline,
         )
         # 監査 model は実際に使った target から付与する（予備切替時に主系ラベルへ戻さない）。
-        return replace(result, model=get_audit_model_for_target(target))
+        return replace(result, model=audit_model)
 
     first_result: AISeriesMetadataResult | None = None
     first_error: RecordedSeriesAIError | None = None
@@ -1511,7 +1608,7 @@ async def lookup_episode(
     async def RunLookup(target: AIBackendTarget) -> EpisodeLookupResult:
         nonlocal acp_hard_deadline
         # RetrySameBackend / ACP 予備のどちらも、最初の ACP 試行からの期限を共有する。
-        if target.backend_kind != 'OpenCode' and acp_hard_deadline is None:
+        if _GetACPCredentialProvider(target.backend_kind) is not None and acp_hard_deadline is None:
             acp_hard_deadline = (
                 asyncio.get_running_loop().time() + _ACP_OPERATION_HARD_TIMEOUT_SEC
             )
@@ -1526,13 +1623,13 @@ async def lookup_episode(
                 ),
             )
 
-        result = await _RunBackendOperation(
+        result, audit_model = await _RunBackendOperation(
             target,
             Operation,
             api_key=api_key,
             acp_hard_deadline=acp_hard_deadline,
         )
-        return replace(result, model=get_audit_model_for_target(target))
+        return replace(result, model=audit_model)
 
     first_result: EpisodeLookupResult | None = None
     first_error: RecordedSeriesAIError | None = None
@@ -1688,7 +1785,7 @@ async def test_connection(
             provider_fingerprint=provider_fingerprint,
         )
 
-    if settings.ai_backend == 'OpenCode':
+    if settings.ai_backend in {'OpenCode', 'OpenAICompatible'}:
         return await RunTest()
     try:
         return await _RunACPOperationWithDeadline(
@@ -1757,6 +1854,18 @@ def get_audit_model_for_target(target: AIBackendTarget) -> str:
             return f'opencode:service:{service_id}'
         return service.getAuditModelLabel()
 
+    if target.backend_kind == 'OpenAICompatible':
+        try:
+            from app.metadata.ai.OpenAICompatibleSettings import (
+                OpenAICompatibleSettingsStore,
+            )
+            direct_settings = OpenAICompatibleSettingsStore.getSettings()
+        except (OSError, ValueError):
+            direct_settings = None
+        if direct_settings is None or direct_settings.model is None:
+            return 'openai-compatible'
+        return f'openai-compatible:{direct_settings.model}'
+
     backend_prefix_map: dict[str, str] = {
         'AcpCodex': 'acp:codex',
         'AcpGrok': 'acp:grok',
@@ -1781,6 +1890,7 @@ def get_audit_model(settings: RecordedSeriesSettings | None = None) -> str:
 
     ACP: "acp:codex:claude-sonnet-4-5" または "acp:codex"
     OpenCode: "opencode:{provider}/{model}" または service 未設定時 "opencode"
+    OpenAICompatible: "openai-compatible:{model}"
 
     Args:
         settings: 監査ラベルへ変換する設定。未指定時は保存済み設定を使用する。

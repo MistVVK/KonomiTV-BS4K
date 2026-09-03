@@ -86,6 +86,11 @@ class RecordedSeriesAIBackend(Protocol):
         """バックエンド種別を返す（OpenCode / AcpCodex など）。"""
         ...
 
+    @property
+    def audit_model(self) -> str:
+        """生成時の不変 snapshot に対応する監査用モデル文字列を返す。"""
+        ...
+
     async def selectCandidate(
         self,
         program: RecordedSeriesProgramPrompt,

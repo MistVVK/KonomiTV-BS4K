@@ -32,7 +32,7 @@ class AIBackendTarget:
 
     # 実行する backend 種別。
     backend_kind: AIBackendKind
-    # OpenCode のときだけ非 None になる service UUID。
+    # OpenCode のときだけ非 None になる service UUID。OpenAICompatible は singleton 設定を使う。
     service_id: str | None
     # 監査・ログ用の試行役割。
     role: AIRecoveryRole
@@ -50,7 +50,7 @@ class AIRecoveryAttemptSummary:
     role: AIRecoveryRole
     # 実行した backend 種別。
     backend_kind: str
-    # OpenCode service_id。ACP では None。
+    # OpenCode service_id。OpenAICompatible / ACP では None。
     service_id: str | None
     # 監査 model ラベル。
     model: str

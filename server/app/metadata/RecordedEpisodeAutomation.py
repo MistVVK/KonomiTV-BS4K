@@ -23,6 +23,7 @@ from app.metadata.ai.episode_lookup import (
 )
 from app.metadata.ai.recorded_series_ai import (
     get_audit_model,
+    get_episode_lookup_capability_proof_fingerprints,
     get_episode_lookup_provider_fingerprint,
     invalidate_episode_lookup_capability_fingerprint,
 )
@@ -1512,6 +1513,11 @@ class RecordedEpisodeAutomation:
                 settings,
                 api_key,
             )
+            # lookup 終了後に mutable な設定 store を再読すると、旧世代 request の
+            # 失敗で新世代 proof を消し得る。開始時点の失効対象をここで固定する。
+            capability_proof_fingerprints = (
+                get_episode_lookup_capability_proof_fingerprints(settings)
+            )
 
             # 同一 context / provider の終端結果は明示再検索まで再利用する。
             if (
@@ -1668,17 +1674,22 @@ class RecordedEpisodeAutomation:
                 latency_ms=result.latency_ms,
             )
         if (
-            result.outcome in {"SearchFailed", "SearchNotRun", "InvalidModelOutput"}
-            or (
-                result.web_search_performed
-                and len(GetEpisodeLookupEvidence(result)) == 0
+            result.error_code != 'AISettingsChangedBeforeRequest'
+            and (
+                result.outcome in {'SearchFailed', 'SearchNotRun', 'InvalidModelOutput'}
+                or (
+                    result.web_search_performed
+                    and len(GetEpisodeLookupEvidence(result)) == 0
+                )
             )
         ):
             # 接続試験後でも実 lookup で tool/schema/source 能力が否定された場合は、
-            # 診断結果が実態と食い違ったまま残らないよう該当 proof を失効する。
-            invalidate_episode_lookup_capability_fingerprint(
-                provider_fingerprint,
-            )
+            # 診断結果が実態と食い違ったまま残らないよう、開始時点で固定した
+            # 利用し得る全 target proof だけを失効する。
+            for capability_proof_fingerprint in capability_proof_fingerprints:
+                invalidate_episode_lookup_capability_fingerprint(
+                    capability_proof_fingerprint,
+                )
 
         async with RECORDED_SERIES_RESOLUTION_LOCK:
             latest_context = await BuildRecordedEpisodeLookupContext(

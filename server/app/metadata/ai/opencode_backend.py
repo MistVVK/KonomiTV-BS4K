@@ -762,6 +762,12 @@ class OpenCodeBackend:
         return 'OpenCode'
 
     @property
+    def audit_model(self) -> str:
+        """生成時の service snapshot に対応する監査 label を返す。"""
+
+        return self._audit_model
+
+    @property
     def service(self) -> AIBackendService:
         """参照中の service 定義。"""
 
