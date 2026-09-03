@@ -77,6 +77,7 @@
                 <div class="settings__item-label">
                     シリーズ補完・話数 Web 検索・Bangumi 候補選択に最初に使うバックエンドを選びます。<br>
                     OpenCode は「設定 → AIバックエンド」で登録した service を使います。<br>
+                    OpenAI 互換 API は OpenCode を経由せず、保存済みの HTTP 接続を使います。<br>
                     ACP / Codex・Grok はホスト上の CLI を起動します。<br>
                     Web 検索の接続確認は AIバックエンド画面から行えます。<br>
                 </div>
@@ -104,6 +105,21 @@
                     no-data-text="登録済み service がありません"
                     v-model="settings.ai_backend_service_id" />
             </div>
+            </template>
+
+            <!-- 独立 OpenAI 互換 HTTP の接続情報は AI バックエンドページだけで管理する -->
+            <template v-if="settings.ai_backend === 'OpenAICompatible'">
+                <div class="settings__item">
+                    <div class="settings__item-heading">OpenAI 互換 API の接続</div>
+                    <div class="settings__item-label">
+                        API ベース URL・モデル・API キー・接続試験は「AIバックエンド」ページで設定します。<br>
+                        接続状態: {{openai_compatible_configured ? '設定済み' : '未設定'}}
+                    </div>
+                    <v-btn class="settings__save-button mt-3" variant="flat" to="/settings/server/ai-backends">
+                        <Icon icon="fluent:settings-20-regular" class="mr-2" width="21px" />
+                        AIバックエンド設定を開く
+                    </v-btn>
+                </div>
             </template>
 
             <!-- ACP 選択時は AI バックエンドページへ案内（モデル・認証・接続試験はそちらで設定） -->
@@ -166,6 +182,15 @@
                             v-model="settings.ai_fallback_backend_service_id" />
                         <div class="settings__item-label mt-2">
                             認証状態: {{ fallback_auth_configured ? '設定済み' : '未設定' }}
+                        </div>
+                    </div>
+                </template>
+                <template v-if="settings.ai_fallback_backend === 'OpenAICompatible'">
+                    <div class="settings__item">
+                        <div class="settings__item-heading">予備 OpenAI 互換 API の接続</div>
+                        <div class="settings__item-label">
+                            予備も「AIバックエンド」ページのシングルトン接続設定を共有します。<br>
+                            接続状態: {{fallback_auth_configured ? '設定済み' : '未設定'}}
                         </div>
                     </div>
                 </template>
@@ -383,7 +408,11 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue';
 
 import Message from '@/message';
-import AIBackend, { type AIAuthMode, type IACPBackendCredentialStatus } from '@/services/AIBackend';
+import AIBackend, {
+    type AIAuthMode,
+    type IACPBackendCredentialStatus,
+    type IOpenAICompatibleSettings,
+} from '@/services/AIBackend';
 import AnalysisTasks, { type IAnalysisTaskExecution } from '@/services/AnalysisTasks';
 import Bangumi, { type IBangumiProfile } from '@/services/Bangumi';
 import RecordedSeries, {
@@ -401,6 +430,7 @@ import SettingsBase from '@/views/Settings/Base.vue';
 
 const ai_backend_options: {title: string; value: AIBackendKind;}[] = [
     {title: 'OpenCode（AIバックエンド service）', value: 'OpenCode'},
+    {title: 'OpenAI 互換 API（直接 HTTP）', value: 'OpenAICompatible'},
     {title: 'ACP / Codex', value: 'AcpCodex'},
     {title: 'ACP / Grok Build', value: 'AcpGrok'},
 ];
@@ -433,6 +463,7 @@ const settings = ref<IRecordedSeriesSettings>({
 // 一括判定は未保存のフォーム値ではなく、サーバーに保存済みの AI 設定だけを利用する。
 const saved_settings = ref<IRecordedSeriesSettings | null>(null);
 const opencode_services = ref<{title: string; value: string; authConfigured: boolean;}[]>([]);
+const openai_compatible_settings = ref<IOpenAICompatibleSettings | null>(null);
 const acp_credential_status = ref<IACPBackendCredentialStatus | null>(null);
 const status = ref<IRecordedSeriesStatus | null>(null);
 
@@ -503,6 +534,13 @@ const fallback_opencode_service_error = computed(() => {
     }
     return '';
 });
+const openai_compatible_configured = computed(() => {
+    const current = openai_compatible_settings.value;
+    return current !== null
+        && current.api_base_url !== null
+        && current.model !== null
+        && current.api_key_configured;
+});
 const fallback_auth_configured = computed(() => {
     if (settings.value.ai_failure_recovery_strategy !== 'FallbackBackend') return false;
     const fallbackBackend = settings.value.ai_fallback_backend;
@@ -511,6 +549,7 @@ const fallback_auth_configured = computed(() => {
         const selectedService = opencode_services.value.find(service => service.value.toLowerCase() === selectedServiceID);
         return selectedService?.authConfigured === true;
     }
+    if (fallbackBackend === 'OpenAICompatible') return openai_compatible_configured.value;
     if (fallbackBackend === 'AcpCodex') return acp_credential_status.value?.codex_auth_imported === true;
     if (fallbackBackend === 'AcpGrok') return acp_credential_status.value?.grok_auth_imported === true;
     return false;
@@ -835,10 +874,18 @@ onMounted(async () => {
         is_loading.value = false;
         return;
     }
-    const [fetched_settings, fetched_status, fetched_services, fetched_acp_credentials, fetched_bangumi] = await Promise.all([
+    const [
+        fetched_settings,
+        fetched_status,
+        fetched_services,
+        fetched_openai_compatible_settings,
+        fetched_acp_credentials,
+        fetched_bangumi,
+    ] = await Promise.all([
         RecordedSeries.fetchSettings(),
         RecordedSeries.fetchStatus(),
         AIBackend.fetchServices(),
+        AIBackend.fetchOpenAICompatibleSettings(),
         AIBackend.fetchACPCredentialStatus(),
         Bangumi.fetchProfile(),
     ]);
@@ -855,6 +902,9 @@ onMounted(async () => {
     }
     if (fetched_acp_credentials !== null) {
         acp_credential_status.value = fetched_acp_credentials;
+    }
+    if (fetched_openai_compatible_settings !== null) {
+        openai_compatible_settings.value = fetched_openai_compatible_settings;
     }
     if (fetched_settings !== null) {
         applyFetchedSettings(fetched_settings);
