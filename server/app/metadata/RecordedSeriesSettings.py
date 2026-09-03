@@ -1,10 +1,11 @@
 """録画シリーズ判定の固有設定（AI バックエンド選択と EpisodeLookup 設定）。
 
-AI バックエンド接続・秘密・月次上限は AIBackendSettings 側が正本。
+AI バックエンド接続・秘密は各 AI バックエンド設定側が正本。
 OpenCode 時は ai_backend_service_id で AI バックエンド service を参照する。
+OpenAICompatible 時はシングルトンの HTTP 接続設定を参照する。
 AcpCodex / AcpGrok のモデル・推論深さ・Fast・タイムアウトは ACPSettings 側が正本。
 主系失敗時の予備 AI と失敗時ポリシーもここで管理する。
-旧 OpenAICompatible / AcpGemini / 日次制限はクリーンブレークで拒否する。
+旧 AcpGemini / 日次制限はクリーンブレークで拒否する。
 """
 
 from __future__ import annotations
@@ -22,9 +23,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.constants import DATA_DIR
 
 
-# AI バックエンド種別。OpenCode に加えて ACP の Codex / Grok を併存させる。
-# OpenAICompatible / AcpGemini はクリーンブレークで拒否する。
-AIBackendKind = Literal['OpenCode', 'AcpCodex', 'AcpGrok']
+# AI バックエンド種別。OpenCode、独立 OpenAI 互換 HTTP、ACP の Codex / Grok を併存させる。
+AIBackendKind = Literal['OpenCode', 'OpenAICompatible', 'AcpCodex', 'AcpGrok']
 # 主系 AI 失敗後の回復方針。既定は追加試行なしの Fail。
 AIFailureRecoveryStrategy = Literal['FallbackBackend', 'RetrySameBackend', 'Fail']
 
@@ -35,11 +35,10 @@ _UUID_RE = re.compile(
 
 # クリーンブレークで拒否する旧 backend 値（読取時に明示エラーにする）。
 _REJECTED_BACKEND_VALUES = frozenset({
-    'OpenAICompatible',
     'AcpGemini',
     'AcpCustom',
 })
-# OpenAICompatible 専用フィールドと日次制限。読取時に検出したら拒否する。
+# 旧 OpenAICompatible 接続フィールドと日次制限。読取時に破棄して各 backend の正本と混ぜない。
 _LEGACY_SETTINGS_KEYS = frozenset({
     'api_base_url',
     'model',
@@ -87,7 +86,7 @@ class RecordedSeriesSettings(BaseModel):
     ai_enabled: Annotated[bool, Field()] = False
     # 旧 JSON の読取互換だけを保つ。保存・API 応答・Resolver 分岐では使用しない。
     ai_candidate_selection_enabled: Annotated[bool, Field(exclude=True)] = True
-    # AI バックエンド種別（主系）。OpenCode / AcpCodex / AcpGrok の 3 種のみ。
+    # AI バックエンド種別（主系）。接続情報は各 backend の共有設定を参照する。
     ai_backend: Annotated[AIBackendKind, Field()] = 'AcpCodex'
     # 主系が OpenCode のとき参照する AIBackendSettings の service_id（UUID）。
     ai_backend_service_id: Annotated[str | None, Field(max_length=36)] = None
@@ -225,8 +224,7 @@ class RecordedSeriesSettingsStore:
             永続化済み設定。未作成時はデフォルト設定。
 
         Raises:
-            ValueError: 永続化済み設定が JSON またはスキーマとして不正な場合
-                （旧 OpenAICompatible / AcpGemini / 日次制限フィールド検出を含む）。
+            ValueError: 永続化済み設定が JSON またはスキーマとして不正な場合。
             OSError: 設定ファイルを読み込めない場合。
         """
 
@@ -236,7 +234,7 @@ class RecordedSeriesSettingsStore:
             settings_json = json.loads(cls.SETTINGS_PATH.read_text(encoding='utf-8'))
             if isinstance(settings_json, dict) is False:
                 raise ValueError('Recorded series settings document is invalid.')
-            # OpenAICompatible / AcpGemini / AcpCustom はクリーンブレークで拒否する。
+            # 廃止済み AcpGemini / AcpCustom はクリーンブレークで拒否する。
             backend_value = settings_json.get('ai_backend')
             if isinstance(backend_value, str) and backend_value in _REJECTED_BACKEND_VALUES:
                 raise ValueError(
@@ -258,14 +256,13 @@ class RecordedSeriesSettingsStore:
                     key not in _REMOVED_EPISODE_SEARCH_SETTINGS_KEYS
                 )
             }
-            # OpenAICompatible 専用フィールド / 日次制限は拒否する。
-            legacy_keys = sorted(key for key in settings_json if key in _LEGACY_SETTINGS_KEYS)
-            if legacy_keys:
-                raise ValueError(
-                    'Legacy recorded-series AI settings are not supported. '
-                    'Delete recorded-series-settings.json and reconfigure '
-                    f'(legacy keys: {", ".join(legacy_keys)}).',
-                )
+            # OpenAICompatible の接続情報は AI バックエンド画面だけを正本とする。
+            # 旧録画シリーズ JSON に残る非秘密値も移行せず破棄し、秘密ファイルは参照しない。
+            settings_json = {
+                key: value
+                for key, value in settings_json.items()
+                if key not in _LEGACY_SETTINGS_KEYS
+            }
             return RecordedSeriesSettings.model_validate(settings_json)
 
     @classmethod
@@ -301,7 +298,7 @@ class RecordedSeriesSettingsStore:
     def getSettingsAndAPIKey(cls) -> tuple[RecordedSeriesSettings, str | None]:
         """設定を取得する（旧 API キー同梱形式の互換 shim）。
 
-        OpenCode 移行後、録画シリーズ設定は API キーを持たない。
+        録画シリーズ設定は API キーを持たない。
         第 2 要素は常に None。秘密は AIBackendSettingsStore を参照すること。
 
         Returns:
@@ -359,7 +356,7 @@ class RecordedSeriesSettingsStore:
             settings: 検査する保存済み設定。省略時は設定ストアから取得する。
 
         Returns:
-            OpenCode service または ACP 専用プロファイルを利用できる場合は True。
+            選択中 backend の共有接続・認証を利用できる場合は True。
         """
 
         effective_settings = settings or cls.getSettings()
@@ -377,6 +374,12 @@ class RecordedSeriesSettingsStore:
                 )
             except (OSError, ValueError):
                 return False
+
+        if effective_settings.ai_backend == 'OpenAICompatible':
+            from app.metadata.ai.OpenAICompatibleSettings import (
+                OpenAICompatibleSettingsStore,
+            )
+            return OpenAICompatibleSettingsStore.isConfigured()
 
         # ACP はホスト側認証の存在だけでは実行せず、KonomiTV-BS4K 専用
         # プロファイルへ取り込み済みで有効な世代だけを設定済みとみなす。
@@ -422,6 +425,12 @@ class RecordedSeriesSettingsStore:
                 )
             except (OSError, ValueError):
                 return False
+
+        if fallback_backend == 'OpenAICompatible':
+            from app.metadata.ai.OpenAICompatibleSettings import (
+                OpenAICompatibleSettingsStore,
+            )
+            return OpenAICompatibleSettingsStore.isConfigured()
 
         from app.metadata.ai.KonomiTVBS4KACPCredentials import (
             KonomiTVBS4KACPCredentials,
