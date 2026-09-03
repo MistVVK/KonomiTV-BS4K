@@ -96,6 +96,11 @@ type MatrixRow = {
     channelName: string;
 };
 
+type BroadcastSlot = MatrixColumn & {
+    startTime: number;
+    hasSubtitleLabel: boolean;
+};
+
 const recordedPrograms = computed(() => {
     if (series.value === null) return [] as ISeriesRecordedProgram[];
     return series.value.broadcast_periods.flatMap((period) => period.recorded_programs);
@@ -108,26 +113,72 @@ const columns = computed((): MatrixColumn[] => {
         }
         return left.episode_number.localeCompare(right.episode_number, 'en', {numeric: true});
     });
-    if (structured.length > 0) {
-        const seasonCount = new Set(structured.map((episode) => episode.season_number)).size;
-        return structured.map((episode) => ({
-            key: `episode:${episode.id}`,
-            label: seasonCount > 1
-                ? formatRecordedEpisodeLabel(episode.season_number, episode.episode_number)
-                : `第${formatRecordedEpisodeNumber(episode.episode_number)}話`,
-        }));
-    }
-    const slots = new Map<string, string>();
-    for (const program of recordedPrograms.value) {
+    const seasonCount = new Set(structured.map((episode) => episode.season_number)).size;
+    const structuredColumns = structured.map((episode) => ({
+        key: `episode:${episode.id}`,
+        label: seasonCount > 1
+            ? formatRecordedEpisodeLabel(episode.season_number, episode.episode_number)
+            : `第${formatRecordedEpisodeNumber(episode.episode_number)}話`,
+    }));
+
+    // 構造化話数が一部だけ存在する Series でも、話数未確定録画を放送 slot 列として残す。
+    // 同じ slot が複数局にある場合は、いずれかの妥当なサブタイトルを時刻より優先する。
+    const slots = new Map<string, BroadcastSlot>();
+    const unstructuredPrograms = recordedPrograms.value
+        .filter((program) => program.series_episode == null)
+        .sort((left, right) => dayjs(left.start_time).valueOf() - dayjs(right.start_time).valueOf() || left.id - right.id);
+    for (const program of unstructuredPrograms) {
         const key = broadcastSlotKey(program);
-        if (slots.has(key) === false) {
-            slots.set(key, dayjs(program.start_time).format('M/D HH:mm'));
+        const subtitleLabel = validSubtitleLabel(program);
+        const current = slots.get(key);
+        if (current === undefined) {
+            slots.set(key, {
+                key,
+                label: subtitleLabel ?? dayjs(program.start_time).format('M/D HH:mm'),
+                startTime: dayjs(program.start_time).valueOf(),
+                hasSubtitleLabel: subtitleLabel !== null,
+            });
+        } else if (current.hasSubtitleLabel === false && subtitleLabel !== null) {
+            current.label = subtitleLabel;
+            current.hasSubtitleLabel = true;
         }
     }
-    return [...slots.entries()]
-        .sort((left, right) => left[0].localeCompare(right[0]))
-        .map(([key, label]) => ({key, label}));
+    const unstructuredColumns = [...slots.values()]
+        .sort((left, right) => left.startTime - right.startTime || left.key.localeCompare(right.key))
+        .map(({key, label}) => ({key, label}));
+
+    return [...structuredColumns, ...unstructuredColumns];
 });
+
+function normalizeComparableLabel(label: string): string {
+    // 幅・空白・大文字小文字だけの差を除き、題名中の意味のある記号は同一性比較でも保持する。
+    return label.normalize('NFKC').toLocaleLowerCase('ja-JP').replace(/\s/gu, '');
+}
+
+function hasMeaningfulLabelContent(label: string): boolean {
+    // variation selector や不可視の書式文字が残っても、文字・数字を含まない装飾だけの値は採用しない。
+    return /[\p{L}\p{N}]/u.test(label.normalize('NFKC'));
+}
+
+function validSubtitleLabel(program: ISeriesRecordedProgram): string | null {
+    const subtitle = program.subtitle?.trim();
+    if (subtitle === undefined) return null;
+    if (hasMeaningfulLabelContent(subtitle) === false) return null;
+    const normalizedSubtitle = normalizeComparableLabel(subtitle);
+
+    // Series 表示名と録画側の枠名・作品名を除外し、内容を表す副題だけを列ラベルへ使う。
+    const excludedLabels = [
+        series.value?.bangumi_subject_name,
+        series.value?.title,
+        program.series_title,
+        program.title,
+    ];
+    if (excludedLabels.some((label) => label !== null && label !== undefined
+        && normalizeComparableLabel(label) === normalizedSubtitle)) {
+        return null;
+    }
+    return subtitle;
+}
 
 const rows = computed((): MatrixRow[] => {
     const channels = new Map<string, string>();
