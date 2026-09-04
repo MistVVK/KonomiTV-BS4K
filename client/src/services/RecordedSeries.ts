@@ -4,7 +4,7 @@ import APIClient from '@/services/APIClient';
 
 
 /** 録画シリーズが選択できる AI バックエンド。OpenCode は AIBackend service_id を参照する。 */
-export type AIBackendKind = 'OpenCode' | 'OpenAICompatible' | 'AcpCodex' | 'AcpGrok';
+export type AIBackendKind = 'OpenCode' | 'OpenAICompatible' | 'OpenAICompatible2' | 'AcpCodex' | 'AcpGrok';
 /** 主系 AI 失敗後の回復方針。既定は追加試行なしの Fail。 */
 export type AIFailureRecoveryStrategy = 'FallbackBackend' | 'RetrySameBackend' | 'Fail';
 export type EpisodeLookupOutcome =

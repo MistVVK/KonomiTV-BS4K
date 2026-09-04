@@ -2,7 +2,7 @@
 
 AI バックエンド接続・秘密は各 AI バックエンド設定側が正本。
 OpenCode 時は ai_backend_service_id で AI バックエンド service を参照する。
-OpenAICompatible 時はシングルトンの HTTP 接続設定を参照する。
+OpenAICompatible / OpenAICompatible2 時は、それぞれ独立した HTTP 接続設定を参照する。
 AcpCodex / AcpGrok のモデル・推論深さ・Fast・タイムアウトは ACPSettings 側が正本。
 主系失敗時の予備 AI と失敗時ポリシーもここで管理する。
 旧 AcpGemini / 日次制限はクリーンブレークで拒否する。
@@ -23,8 +23,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.constants import DATA_DIR
 
 
-# AI バックエンド種別。OpenCode、独立 OpenAI 互換 HTTP、ACP の Codex / Grok を併存させる。
-AIBackendKind = Literal['OpenCode', 'OpenAICompatible', 'AcpCodex', 'AcpGrok']
+# AI バックエンド種別。OpenCode、独立した2枠の OpenAI 互換 HTTP、ACP の Codex / Grok を併存させる。
+AIBackendKind = Literal['OpenCode', 'OpenAICompatible', 'OpenAICompatible2', 'AcpCodex', 'AcpGrok']
 # 主系 AI 失敗後の回復方針。既定は追加試行なしの Fail。
 AIFailureRecoveryStrategy = Literal['FallbackBackend', 'RetrySameBackend', 'Fail']
 
@@ -375,11 +375,14 @@ class RecordedSeriesSettingsStore:
             except (OSError, ValueError):
                 return False
 
-        if effective_settings.ai_backend == 'OpenAICompatible':
+        if (
+            effective_settings.ai_backend == 'OpenAICompatible'
+            or effective_settings.ai_backend == 'OpenAICompatible2'
+        ):
             from app.metadata.ai.OpenAICompatibleSettings import (
-                OpenAICompatibleSettingsStore,
+                GetOpenAICompatibleSettingsStore,
             )
-            return OpenAICompatibleSettingsStore.isConfigured()
+            return GetOpenAICompatibleSettingsStore(effective_settings.ai_backend).isConfigured()
 
         # ACP はホスト側認証の存在だけでは実行せず、KonomiTV-BS4K 専用
         # プロファイルへ取り込み済みで有効な世代だけを設定済みとみなす。
@@ -426,11 +429,11 @@ class RecordedSeriesSettingsStore:
             except (OSError, ValueError):
                 return False
 
-        if fallback_backend == 'OpenAICompatible':
+        if fallback_backend == 'OpenAICompatible' or fallback_backend == 'OpenAICompatible2':
             from app.metadata.ai.OpenAICompatibleSettings import (
-                OpenAICompatibleSettingsStore,
+                GetOpenAICompatibleSettingsStore,
             )
-            return OpenAICompatibleSettingsStore.isConfigured()
+            return GetOpenAICompatibleSettingsStore(fallback_backend).isConfigured()
 
         from app.metadata.ai.KonomiTVBS4KACPCredentials import (
             KonomiTVBS4KACPCredentials,

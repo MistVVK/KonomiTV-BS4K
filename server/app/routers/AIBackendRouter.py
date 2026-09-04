@@ -46,6 +46,7 @@ from app.metadata.ai.KonomiTVBS4KACPCredentials import (
 )
 from app.metadata.ai.openai_compatible import OpenAICompatibleBackend
 from app.metadata.ai.OpenAICompatibleSettings import (
+    OpenAICompatible2SettingsStore,
     OpenAICompatibleSettings,
     OpenAICompatibleSettingsResponse,
     OpenAICompatibleSettingsStore,
@@ -1122,6 +1123,228 @@ async def OpenAICompatibleConnectionTestAPI(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='Failed to load OpenAI-compatible settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+    if body.capability == 'EpisodeLookup':
+        result = await _RecordEpisodeLookupConnectionTest(
+            proof_settings,
+            tested_provider_fingerprint,
+            result,
+        )
+    return _ConnectionTestResponse(result)
+
+
+# === 2つ目の独立 OpenAI 互換 HTTP バックエンド ===
+
+
+@router.get(
+    '/openai-compatible-2/settings',
+    summary='OpenAI 互換 HTTP 2 設定取得 API',
+    response_model=OpenAICompatibleSettingsResponse,
+)
+async def OpenAICompatible2SettingsAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> OpenAICompatibleSettingsResponse:
+    """API キー本体を含まない2枠目の OpenAI 互換 HTTP 設定を返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        2枠目の接続先・モデル・API キー設定済み状態。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        return OpenAICompatible2SettingsStore.getSettingsResponse()
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatible2SettingsAPI] Failed to load settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load OpenAI-compatible 2 settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+
+@router.put(
+    '/openai-compatible-2/settings',
+    summary='OpenAI 互換 HTTP 2 設定更新 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatible2SettingsUpdateAPI(
+    body: OpenAICompatibleSettings,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """2枠目の API ベース URL とモデルを全体置換で保存する。
+
+    Args:
+        body: 保存する非秘密設定。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 設定ファイルを保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatible2SettingsStore.saveSettings(body)
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatible2SettingsUpdateAPI] Failed to save settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to save OpenAI-compatible 2 settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible2')
+
+
+@router.put(
+    '/openai-compatible-2/api-key',
+    summary='OpenAI 互換 HTTP 2 API キー設定 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatible2APIKeySetAPI(
+    body: AIBackendAPIKeyBody,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """2枠目の API キーを専用 secrets ファイルへ保存する。
+
+    Args:
+        body: API キーを含む設定リクエスト。応答へは含めない。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: キーが不正、または保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatible2SettingsStore.setAPIKey(body.api_key)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='API key is invalid.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    except OSError as error:
+        logging.error(
+            '[OpenAICompatible2APIKeySetAPI] Failed to store API key.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to store OpenAI-compatible 2 API key.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible2')
+
+
+@router.delete(
+    '/openai-compatible-2/api-key',
+    summary='OpenAI 互換 HTTP 2 API キー削除 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatible2APIKeyDeleteAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """2枠目の専用 secrets ファイルから API キーを削除する。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 秘密ファイルを削除できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatible2SettingsStore.deleteAPIKey()
+    except OSError as error:
+        logging.error(
+            '[OpenAICompatible2APIKeyDeleteAPI] Failed to delete API key.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to delete OpenAI-compatible 2 API key.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible2')
+
+
+@router.post(
+    '/openai-compatible-2/connection-test',
+    summary='OpenAI 互換 HTTP 2 接続試験 API',
+    response_model=AIBackendConnectionTestResponse,
+)
+async def OpenAICompatible2ConnectionTestAPI(
+    body: OpenAICompatibleConnectionTestRequest,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> AIBackendConnectionTestResponse:
+    """2枠目の保存済み接続情報で生成または話数検索を試験する。
+
+    Args:
+        body: 試験する AI 機能。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        秘密を含まない接続試験結果。
+
+    Raises:
+        HTTPException: 保存済み設定を読み込めない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    proof_settings = _BuildConnectionTestProofSettings('OpenAICompatible2')
+    try:
+        tested_provider_fingerprint = get_episode_lookup_provider_fingerprint(
+            proof_settings,
+            None,
+        )
+        direct_settings, api_key = OpenAICompatible2SettingsStore.getSettingsAndAPIKey()
+        backend = OpenAICompatibleBackend(
+            direct_settings,
+            api_key,
+            backend_kind='OpenAICompatible2',
+        )
+        result = await backend.testConnection(body.capability)
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatible2ConnectionTestAPI] Failed to load settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load OpenAI-compatible 2 settings.',
             headers=NO_STORE_HEADERS,
         ) from error
 

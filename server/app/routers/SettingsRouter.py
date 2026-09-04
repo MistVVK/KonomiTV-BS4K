@@ -27,6 +27,7 @@ _HOST_PATH_SETTINGS_API_PATHS = {
     '/api/cm-analysis/settings',
     # API キー入力の検証失敗時にも FastAPI 標準応答の input へ秘密を転載しない。
     '/api/ai-backends/openai-compatible/api-key',
+    '/api/ai-backends/openai-compatible-2/api-key',
 }
 
 

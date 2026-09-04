@@ -3,7 +3,7 @@
         <div class="settings__content">
             <div class="settings__content-heading">
                 <Icon icon="fluent:globe-20-filled" width="22px" />
-                <span class="ml-2">OpenAI 互換 API</span>
+                <span class="ml-2">{{backend_title}}</span>
             </div>
             <div class="settings__item">
                 <div class="settings__item-label">
@@ -170,13 +170,21 @@ import AIBackend, {
     type IAIBackendConnectionTestResult,
     type IAIBackendEpisodeLookupConnectionChecks,
     type IOpenAICompatibleSettings,
+    type OpenAICompatibleSlot,
 } from '@/services/AIBackend';
 import Utils from '@/utils';
 
 
 type ConnectionTestResults = Record<AIBackendConnectionCapability, IAIBackendConnectionTestResult | null>;
 
+const props = withDefaults(defineProps<{
+    backendSlot?: OpenAICompatibleSlot;
+}>(), {
+    backendSlot: 1,
+});
+
 const OPENAI_COMPATIBLE_MODEL_MAX_LENGTH = 237;
+const backend_title = computed(() => props.backendSlot === 1 ? 'OpenAI 互換 API' : 'OpenAI 互換 API 2');
 const connection_test_capabilities: {title: string; value: AIBackendConnectionCapability;}[] = [
     {title: 'シリーズ情報生成', value: 'CandidateSelection'},
     {title: '話数 Web 検索', value: 'EpisodeLookup'},
@@ -254,7 +262,7 @@ const has_connection_test_result = computed(() =>
 
 async function loadSettings(): Promise<void> {
     is_loading.value = true;
-    const fetched = await AIBackend.fetchOpenAICompatibleSettings();
+    const fetched = await AIBackend.fetchOpenAICompatibleSettings(props.backendSlot);
     if (fetched !== null) {
         settings.value = fetched;
         draft.value = {
@@ -282,10 +290,10 @@ async function saveSettings(): Promise<void> {
         const saved = await AIBackend.updateOpenAICompatibleSettings({
             api_base_url: draft.value.api_base_url.trim() || null,
             model: draft.value.model.trim() || null,
-        });
+        }, props.backendSlot);
         if (saved) {
             clearConnectionTestResults();
-            Message.success('OpenAI 互換 API 設定を保存しました。');
+            Message.success(`${backend_title.value} 設定を保存しました。`);
             await loadSettings();
         }
     } finally {
@@ -297,12 +305,12 @@ async function saveAPIKey(): Promise<void> {
     if (api_key_input.value.trim() === '' || api_key_error.value !== '' || is_busy.value) return;
     is_saving_api_key.value = true;
     try {
-        const saved = await AIBackend.setOpenAICompatibleAPIKey(api_key_input.value.trim());
+        const saved = await AIBackend.setOpenAICompatibleAPIKey(api_key_input.value.trim(), props.backendSlot);
         if (saved) {
             clearConnectionTestResults();
             api_key_input.value = '';
             api_key_showing.value = false;
-            Message.success('OpenAI 互換 API キーを設定しました。');
+            Message.success(`${backend_title.value} キーを設定しました。`);
             await loadSettings();
         }
     } finally {
@@ -314,12 +322,12 @@ async function deleteAPIKey(): Promise<void> {
     if (settings.value.api_key_configured === false || is_busy.value) return;
     is_deleting_api_key.value = true;
     try {
-        const deleted = await AIBackend.deleteOpenAICompatibleAPIKey();
+        const deleted = await AIBackend.deleteOpenAICompatibleAPIKey(props.backendSlot);
         if (deleted) {
             clearConnectionTestResults();
             api_key_input.value = '';
             api_key_showing.value = false;
-            Message.success('OpenAI 互換 API キーを削除しました。');
+            Message.success(`${backend_title.value} キーを削除しました。`);
             await loadSettings();
         }
     } finally {
@@ -350,7 +358,7 @@ async function testConnection(capability: AIBackendConnectionCapability): Promis
     testing_connection_capability.value = capability;
     connection_test_results.value[capability] = null;
     try {
-        const result = await AIBackend.testOpenAICompatibleConnection(capability);
+        const result = await AIBackend.testOpenAICompatibleConnection(capability, props.backendSlot);
         connection_test_results.value[capability] = result;
         const capability_title = connection_test_capabilities.find(item => item.value === capability)?.title
             ?? capability;

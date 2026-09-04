@@ -27,7 +27,10 @@ from app.metadata.ai.episode_lookup import (
     EpisodeLookupResult,
     ModelEpisodeLookupOutcome,
 )
-from app.metadata.ai.OpenAICompatibleSettings import OpenAICompatibleSettings
+from app.metadata.ai.OpenAICompatibleSettings import (
+    OpenAICompatibleBackendKind,
+    OpenAICompatibleSettings,
+)
 from app.metadata.RecordedEpisodeContext import (
     RECORDED_EPISODE_CONTEXT_VERSION,
     RecordedEpisodeContextFile,
@@ -690,27 +693,37 @@ class OpenAICompatibleBackend:
         self,
         settings: OpenAICompatibleSettings,
         api_key: str | None,
+        backend_kind: OpenAICompatibleBackendKind = 'OpenAICompatible',
     ) -> None:
         """接続設定と秘密の immutable snapshot を保持する。
 
         Args:
             settings: 判定開始時に固定した非秘密設定。
             api_key: 同じ lock 世代で固定した API キー。
+            backend_kind: 設定・秘密の所属を示す1枠目または2枠目の識別子。
         """
 
+        # 同じ HTTP 実行器でも設定・fingerprint・監査を混同しない backend 識別子。
+        self._backend_kind: OpenAICompatibleBackendKind = backend_kind
         # 実行中に設定ストアを再読せず、facade の execution_guard だけで世代変更を検出する。
         self._settings = settings
         # API キーは Authorization header 以外へ出さず、ログ・例外・応答へ含めない。
         self._api_key = api_key
         # 監査には provider URL や秘密を含めず、backend とモデルだけを記録する。
         audit_model = settings.model or 'unconfigured'
-        self._audit_model = f'openai-compatible:{audit_model}'
+        audit_prefix = (
+            'openai-compatible'
+            if backend_kind == 'OpenAICompatible'
+            # 2枠目も237文字のモデル ID を維持し、監査ラベルの255文字上限内に収める。
+            else 'openai-compat-2'
+        )
+        self._audit_model = f'{audit_prefix}:{audit_model}'
 
     @property
-    def backend_kind(self) -> str:
+    def backend_kind(self) -> OpenAICompatibleBackendKind:
         """backend 種別を返す。"""
 
-        return 'OpenAICompatible'
+        return self._backend_kind
 
     @property
     def audit_model(self) -> str:

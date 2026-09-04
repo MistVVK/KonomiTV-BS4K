@@ -12,6 +12,7 @@ export type AIProviderSupportKind = 'Supported' | 'UnsupportedComplex';
 export type AIProviderAuthMethodType = 'api' | 'oauth' | 'vertex_adc';
 export type OpenCodeProviderType = 'Catalog' | 'OpenAICompatible' | 'AnthropicCompatible';
 export type StructuredOutputMode = 'Auto' | 'StructuredOutput' | 'JSONText';
+export type OpenAICompatibleSlot = 1 | 2;
 
 /** OpenCode serve の availability。 */
 export interface IOpenCodeAvailability {
@@ -193,6 +194,11 @@ export interface IOpenAICompatibleSettings {
 /** OpenAI 互換 HTTP バックエンドの非秘密設定更新リクエスト。 */
 export type IOpenAICompatibleSettingsUpdate = Pick<IOpenAICompatibleSettings, 'api_base_url' | 'model'>;
 
+/** OpenAI 互換 HTTP の独立スロットに対応する API prefix を返す。 */
+function openAICompatibleAPIPath(slot: OpenAICompatibleSlot): string {
+    return slot === 1 ? '/ai-backends/openai-compatible' : '/ai-backends/openai-compatible-2';
+}
+
 
 // ===== ACP 固定プリセット（Codex / Grok Build） =====
 
@@ -274,8 +280,12 @@ export default class AIBackend {
     // ===== 独立 OpenAI 互換 HTTP バックエンド =====
 
     /** API キー本体を含まない OpenAI 互換 HTTP 設定を取得する。 */
-    static async fetchOpenAICompatibleSettings(): Promise<IOpenAICompatibleSettings | null> {
-        const response = await APIClient.get<IOpenAICompatibleSettings>('/ai-backends/openai-compatible/settings');
+    static async fetchOpenAICompatibleSettings(
+        slot: OpenAICompatibleSlot = 1,
+    ): Promise<IOpenAICompatibleSettings | null> {
+        const response = await APIClient.get<IOpenAICompatibleSettings>(
+            `${openAICompatibleAPIPath(slot)}/settings`,
+        );
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'OpenAI 互換 API 設定を取得できませんでした。');
             return null;
@@ -284,8 +294,11 @@ export default class AIBackend {
     }
 
     /** OpenAI 互換 HTTP の API ベース URL とモデルを保存する。 */
-    static async updateOpenAICompatibleSettings(settings: IOpenAICompatibleSettingsUpdate): Promise<boolean> {
-        const response = await APIClient.put('/ai-backends/openai-compatible/settings', settings);
+    static async updateOpenAICompatibleSettings(
+        settings: IOpenAICompatibleSettingsUpdate,
+        slot: OpenAICompatibleSlot = 1,
+    ): Promise<boolean> {
+        const response = await APIClient.put(`${openAICompatibleAPIPath(slot)}/settings`, settings);
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'OpenAI 互換 API 設定を保存できませんでした。');
             return false;
@@ -294,8 +307,11 @@ export default class AIBackend {
     }
 
     /** OpenAI 互換 HTTP の専用 API キーを保存する。 */
-    static async setOpenAICompatibleAPIKey(api_key: string): Promise<boolean> {
-        const response = await APIClient.put('/ai-backends/openai-compatible/api-key', {api_key});
+    static async setOpenAICompatibleAPIKey(
+        api_key: string,
+        slot: OpenAICompatibleSlot = 1,
+    ): Promise<boolean> {
+        const response = await APIClient.put(`${openAICompatibleAPIPath(slot)}/api-key`, {api_key});
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'OpenAI 互換 API キーを設定できませんでした。');
             return false;
@@ -304,8 +320,8 @@ export default class AIBackend {
     }
 
     /** OpenAI 互換 HTTP の専用 API キーを削除する。 */
-    static async deleteOpenAICompatibleAPIKey(): Promise<boolean> {
-        const response = await APIClient.delete('/ai-backends/openai-compatible/api-key');
+    static async deleteOpenAICompatibleAPIKey(slot: OpenAICompatibleSlot = 1): Promise<boolean> {
+        const response = await APIClient.delete(`${openAICompatibleAPIPath(slot)}/api-key`);
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'OpenAI 互換 API キーを削除できませんでした。');
             return false;
@@ -316,9 +332,10 @@ export default class AIBackend {
     /** 保存済み OpenAI 互換 HTTP 設定で接続試験を実行する。 */
     static async testOpenAICompatibleConnection(
         capability: AIBackendConnectionCapability,
+        slot: OpenAICompatibleSlot = 1,
     ): Promise<IAIBackendConnectionTestResult | null> {
         const response = await APIClient.post<IAIBackendConnectionTestResult>(
-            '/ai-backends/openai-compatible/connection-test',
+            `${openAICompatibleAPIPath(slot)}/connection-test`,
             {capability},
             // server の read timeout 10分と監査保存の回収余裕1分を待つ。
             {timeout: 11 * 60 * 1000},

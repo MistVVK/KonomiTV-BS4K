@@ -1,8 +1,10 @@
-"""OpenAI 互換 HTTP バックエンドの共有設定と秘密を管理する。
+"""2枠の OpenAI 互換 HTTP バックエンド設定と秘密を管理する。
 
 保存先:
-- DATA_DIR/openai-compatible-settings.json: 接続先とモデル（非秘密）
-- DATA_DIR/secrets/openai-compatible-api.key: API キー（0600・atomic・非返却）
+- DATA_DIR/openai-compatible-settings.json: 1枠目の接続先とモデル（非秘密）
+- DATA_DIR/secrets/openai-compatible-api.key: 1枠目の API キー（0600・atomic・非返却）
+- DATA_DIR/openai-compatible-2-settings.json: 2枠目の接続先とモデル（非秘密）
+- DATA_DIR/secrets/openai-compatible-2-api.key: 2枠目の API キー（0600・atomic・非返却）
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import os
 import secrets
 import threading
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -22,6 +24,7 @@ from app.metadata.ai.AIBackendSettings import NormalizeAPIBaseURL
 
 # EpisodeLookupResult の監査ラベル上限255文字から `openai-compatible:` の18文字を除く。
 OPENAI_COMPATIBLE_MODEL_MAX_LENGTH = 237
+OpenAICompatibleBackendKind = Literal['OpenAICompatible', 'OpenAICompatible2']
 
 
 class OpenAICompatibleSettings(BaseModel):
@@ -75,7 +78,7 @@ class OpenAICompatibleSettingsResponse(OpenAICompatibleSettings):
 
 
 class OpenAICompatibleSettingsStore:
-    """OpenAI 互換 HTTP の設定と専用 API キーを原子的に永続化する。"""
+    """1枠目の OpenAI 互換 HTTP 設定と専用 API キーを原子的に永続化する。"""
 
     SETTINGS_PATH = DATA_DIR / 'openai-compatible-settings.json'
     API_KEY_PATH = DATA_DIR / 'secrets' / 'openai-compatible-api.key'
@@ -287,3 +290,30 @@ class OpenAICompatibleSettingsStore:
                 temporary_path.unlink()
             except FileNotFoundError:
                 pass
+
+
+class OpenAICompatible2SettingsStore(OpenAICompatibleSettingsStore):
+    """2枠目の OpenAI 互換 HTTP 設定と専用 API キーを独立して永続化する。"""
+
+    SETTINGS_PATH = DATA_DIR / 'openai-compatible-2-settings.json'
+    API_KEY_PATH = DATA_DIR / 'secrets' / 'openai-compatible-2-api.key'
+
+    # 1枠目の保存処理と同時に走っても、互いの snapshot 取得を待たせない。
+    _lock = threading.RLock()
+
+
+def GetOpenAICompatibleSettingsStore(
+    backend_kind: OpenAICompatibleBackendKind,
+) -> type[OpenAICompatibleSettingsStore]:
+    """backend 種別に対応する独立設定ストアを返す。
+
+    Args:
+        backend_kind: 1枠目または2枠目の OpenAI 互換 backend 種別。
+
+    Returns:
+        対応する設定・秘密ファイルを所有するストアクラス。
+    """
+
+    if backend_kind == 'OpenAICompatible':
+        return OpenAICompatibleSettingsStore
+    return OpenAICompatible2SettingsStore

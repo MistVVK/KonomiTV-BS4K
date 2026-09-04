@@ -26,7 +26,7 @@
         </div>
 
         <template v-else>
-            <!-- 親幅が狭いと4タブ分の intrinsic 幅が溢れるため、超過時は左右矢印でスクロールする -->
+            <!-- 親幅が狭いと5タブ分の intrinsic 幅が溢れるため、超過時は左右矢印でスクロールする -->
             <v-tabs v-model="tab" color="primary" bg-color="transparent" class="mt-4 ai-backend-tabs"
                 show-arrows :density="is_form_dense ? 'compact' : 'default'">
                 <v-tab value="opencode">
@@ -37,13 +37,17 @@
                     <Icon icon="fluent:globe-20-filled" width="17px" />
                     <span class="ml-1">OpenAI 互換 API</span>
                 </v-tab>
+                <v-tab value="openai-compatible-2">
+                    <Icon icon="fluent:globe-20-filled" width="17px" />
+                    <span class="ml-1">OpenAI 互換 API 2</span>
+                </v-tab>
                 <v-tab value="acp-codex">
                     <Icon icon="fluent:brain-circuit-20-filled" width="17px" />
                     <span class="ml-1">ACP / Codex</span>
                 </v-tab>
                 <v-tab value="acp-grok">
                     <Icon icon="fluent:sparkle-20-filled" width="17px" />
-                    <span class="ml-1">ACP / Grok Build</span>
+                    <span class="ml-1">ACP / Grok</span>
                 </v-tab>
             </v-tabs>
 
@@ -278,6 +282,10 @@
 
             <v-window-item value="openai-compatible">
                 <OpenAICompatibleBackendSection />
+            </v-window-item>
+
+            <v-window-item value="openai-compatible-2">
+                <OpenAICompatibleBackendSection :backend-slot="2" />
             </v-window-item>
 
             <v-window-item value="acp-codex">
@@ -635,7 +643,7 @@ const test_results = ref<Record<string, IAIBackendConnectionTestResult | null>>(
 const testing_service_id = ref<string | null>(null);
 
 /** AI バックエンドタブの切り替え状態。 */
-const tab = ref<'opencode' | 'openai-compatible' | 'acp-codex' | 'acp-grok'>('opencode');
+const tab = ref<'opencode' | 'openai-compatible' | 'openai-compatible-2' | 'acp-codex' | 'acp-grok'>('opencode');
 /** ACP 固定プリセット設定（サーバー保存済み）。 */
 const acp_settings = ref<IACPSettings | null>(null);
 /** 認証内容を含まない ACP 資格情報状態。 */

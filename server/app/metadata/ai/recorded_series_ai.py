@@ -320,12 +320,16 @@ def _BuildTargetFingerprint(target: AIBackendTarget) -> _AIBackendTargetFingerpr
             ),
         )
 
-    if target.backend_kind == 'OpenAICompatible':
+    if (
+        target.backend_kind == 'OpenAICompatible'
+        or target.backend_kind == 'OpenAICompatible2'
+    ):
         from app.metadata.ai.OpenAICompatibleSettings import (
-            OpenAICompatibleSettingsStore,
+            GetOpenAICompatibleSettingsStore,
         )
 
-        direct_settings, api_key = OpenAICompatibleSettingsStore.getSettingsAndAPIKey()
+        settings_store = GetOpenAICompatibleSettingsStore(target.backend_kind)
+        direct_settings, api_key = settings_store.getSettingsAndAPIKey()
         return _AIBackendTargetFingerprint(
             backend_kind=target.backend_kind,
             service_id=None,
@@ -693,14 +697,19 @@ def CreateBackendForTarget(
             raise RecordedSeriesAIError('OpenCodeServiceNotFound')
         return BuildOpenCodeBackendFromServiceID(service_id)
 
-    if backend_kind == 'OpenAICompatible':
+    if backend_kind == 'OpenAICompatible' or backend_kind == 'OpenAICompatible2':
         from app.metadata.ai.openai_compatible import OpenAICompatibleBackend
         from app.metadata.ai.OpenAICompatibleSettings import (
-            OpenAICompatibleSettingsStore,
+            GetOpenAICompatibleSettingsStore,
         )
 
-        direct_settings, direct_api_key = OpenAICompatibleSettingsStore.getSettingsAndAPIKey()
-        return OpenAICompatibleBackend(direct_settings, direct_api_key)
+        settings_store = GetOpenAICompatibleSettingsStore(backend_kind)
+        direct_settings, direct_api_key = settings_store.getSettingsAndAPIKey()
+        return OpenAICompatibleBackend(
+            direct_settings,
+            direct_api_key,
+            backend_kind=backend_kind,
+        )
 
     # ACP バックエンド
     from app.metadata.ai.acp_presets import resolve_command
@@ -1205,7 +1214,7 @@ async def select_candidate(
         )
         return replace(result, model=backend.audit_model)
 
-    if settings.ai_backend in {'OpenCode', 'OpenAICompatible'}:
+    if settings.ai_backend in {'OpenCode', 'OpenAICompatible', 'OpenAICompatible2'}:
         # HTTP backend は ACP process の直列 lock を使わず直接実行する。
         result = await RunSelection()
     else:
@@ -1247,7 +1256,7 @@ async def _RunBackendOperation(
             raise _BackendOperationAuditError(ex, backend.audit_model) from ex
         return result, backend.audit_model
 
-    if target.backend_kind in {'OpenCode', 'OpenAICompatible'}:
+    if target.backend_kind in {'OpenCode', 'OpenAICompatible', 'OpenAICompatible2'}:
         return await Run()
     return await _RunACPOperationWithDeadline(
         Run,
@@ -1850,7 +1859,7 @@ async def test_connection(
             provider_fingerprint=provider_fingerprint,
         )
 
-    if settings.ai_backend in {'OpenCode', 'OpenAICompatible'}:
+    if settings.ai_backend in {'OpenCode', 'OpenAICompatible', 'OpenAICompatible2'}:
         return await RunTest()
     try:
         return await _RunACPOperationWithDeadline(
@@ -1919,17 +1928,28 @@ def get_audit_model_for_target(target: AIBackendTarget) -> str:
             return f'opencode:service:{service_id}'
         return service.getAuditModelLabel()
 
-    if target.backend_kind == 'OpenAICompatible':
+    if (
+        target.backend_kind == 'OpenAICompatible'
+        or target.backend_kind == 'OpenAICompatible2'
+    ):
         try:
             from app.metadata.ai.OpenAICompatibleSettings import (
-                OpenAICompatibleSettingsStore,
+                GetOpenAICompatibleSettingsStore,
             )
-            direct_settings = OpenAICompatibleSettingsStore.getSettings()
+            direct_settings = GetOpenAICompatibleSettingsStore(
+                target.backend_kind,
+            ).getSettings()
         except (OSError, ValueError):
             direct_settings = None
+        prefix = (
+            'openai-compatible'
+            if target.backend_kind == 'OpenAICompatible'
+            # 2枠目も237文字のモデル ID を維持し、監査ラベルの255文字上限内に収める。
+            else 'openai-compat-2'
+        )
         if direct_settings is None or direct_settings.model is None:
-            return 'openai-compatible'
-        return f'openai-compatible:{direct_settings.model}'
+            return prefix
+        return f'{prefix}:{direct_settings.model}'
 
     backend_prefix_map: dict[str, str] = {
         'AcpCodex': 'acp:codex',
@@ -1956,6 +1976,7 @@ def get_audit_model(settings: RecordedSeriesSettings | None = None) -> str:
     ACP: "acp:codex:claude-sonnet-4-5" または "acp:codex"
     OpenCode: "opencode:{provider}/{model}" または service 未設定時 "opencode"
     OpenAICompatible: "openai-compatible:{model}"
+    OpenAICompatible2: "openai-compat-2:{model}"
 
     Args:
         settings: 監査ラベルへ変換する設定。未指定時は保存済み設定を使用する。
