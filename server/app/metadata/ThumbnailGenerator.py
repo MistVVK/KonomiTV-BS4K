@@ -66,7 +66,7 @@ class ThumbnailGenerator:
     MIGRATION_BACKUP_DIR_NAME: ClassVar[str] = 'old'
 
     # 顔検出用カスケード分類器のパス
-    HUMAN_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = pathlib.Path(cv2.__file__).parent / 'data' / 'haarcascade_frontalface_default.xml'
+    HUMAN_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = STATIC_DIR / 'haarcascade_frontalface_default.xml'
     ANIME_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = STATIC_DIR / 'lbpcascade_animeface.xml'
 
     # 顔検出の設定
