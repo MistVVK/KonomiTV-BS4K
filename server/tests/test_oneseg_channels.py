@@ -1,10 +1,12 @@
 import asyncio
 import importlib
+from collections.abc import Iterator
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from tortoise.context import TortoiseContext
 
 from app import schemas
 from app.constants import JST
@@ -20,6 +22,13 @@ MX_ONESEG_SERVICE_ID = 23992
 MX_ADDITIONAL_ONESEG_SERVICE_ID = 23993
 MX_DATA_SERVICE_ID = 23994
 MX_INCONSISTENT_SERVICE_ID = 23995
+
+
+@pytest.fixture
+def tortoise_context() -> Iterator[TortoiseContext]:
+    # Tortoise 1.x の module-level connection proxy に実行中 context を提供する
+    with TortoiseContext() as context:
+        yield context
 
 
 def test_oneseg_service_classifier_rejects_non_oneseg_data_services() -> None:
@@ -272,6 +281,7 @@ def _build_channels_api_program_row(
 )
 def test_channels_api_adds_oneseg_current_program_as_display_only_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    tortoise_context: TortoiseContext,
     parent_service_id: int,
     oneseg_service_id: int,
     is_subchannel: bool,
@@ -321,7 +331,7 @@ def test_channels_api_adds_oneseg_current_program_as_display_only_fallback(
     )
     connection = _FakeChannelsAPIConnection([parent_program_row])
 
-    monkeypatch.setattr(ChannelsRouter.connections, 'get', lambda _: connection)
+    monkeypatch.setattr(tortoise_context.connections, 'get', lambda _: connection)
     monkeypatch.setattr(
         Channel,
         'filter',
@@ -349,6 +359,7 @@ def test_channels_api_adds_oneseg_current_program_as_display_only_fallback(
 
 def test_channels_api_keeps_native_oneseg_present_and_following_programs(
     monkeypatch: pytest.MonkeyPatch,
+    tortoise_context: TortoiseContext,
 ) -> None:
     parent_channel = Channel(
         id=f'NID{MX_NETWORK_ID}-SID{MX_FULLSEG_SERVICE_ID:03d}',
@@ -417,7 +428,7 @@ def test_channels_api_keeps_native_oneseg_present_and_following_programs(
     ]
     connection = _FakeChannelsAPIConnection(program_rows)
 
-    monkeypatch.setattr(ChannelsRouter.connections, 'get', lambda _: connection)
+    monkeypatch.setattr(tortoise_context.connections, 'get', lambda _: connection)
     monkeypatch.setattr(
         Channel,
         'filter',
@@ -773,11 +784,12 @@ class _FakeTimeTableConnection:
 )
 def test_timetable_api_filters_gr_and_oneseg_independently(
     monkeypatch: pytest.MonkeyPatch,
+    tortoise_context: TortoiseContext,
     is_oneseg: bool,
     expected_display_channel_id: str,
 ) -> None:
     connection = _FakeTimeTableConnection()
-    monkeypatch.setattr(ProgramsRouter.connections, 'get', lambda _: connection)
+    monkeypatch.setattr(tortoise_context.connections, 'get', lambda _: connection)
     monkeypatch.setattr(
         ProgramsRouter,
         'Config',
@@ -798,6 +810,7 @@ def test_timetable_api_filters_gr_and_oneseg_independently(
 
 def test_timetable_api_never_copies_parent_program_to_oneseg(
     monkeypatch: pytest.MonkeyPatch,
+    tortoise_context: TortoiseContext,
 ) -> None:
     connection = _FakeTimeTableConnection()
     parent_channel = Channel(**connection.channel_rows[0])
@@ -816,7 +829,7 @@ def test_timetable_api_never_copies_parent_program_to_oneseg(
     parent_program_row.pop('program_order')
     connection.program_rows = [parent_program_row]
 
-    monkeypatch.setattr(ProgramsRouter.connections, 'get', lambda _: connection)
+    monkeypatch.setattr(tortoise_context.connections, 'get', lambda _: connection)
     monkeypatch.setattr(
         ProgramsRouter,
         'Config',
@@ -842,9 +855,12 @@ def test_timetable_api_never_copies_parent_program_to_oneseg(
     assert oneseg_result.channels[0].programs == []
 
 
-def test_timetable_api_pinned_channels_override_oneseg_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_timetable_api_pinned_channels_override_oneseg_filter(
+    monkeypatch: pytest.MonkeyPatch,
+    tortoise_context: TortoiseContext,
+) -> None:
     connection = _FakeTimeTableConnection()
-    monkeypatch.setattr(ProgramsRouter.connections, 'get', lambda _: connection)
+    monkeypatch.setattr(tortoise_context.connections, 'get', lambda _: connection)
     monkeypatch.setattr(
         ProgramsRouter,
         'Config',

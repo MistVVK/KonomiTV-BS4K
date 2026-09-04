@@ -169,7 +169,7 @@ class KonomiTVBS4KTransactionalSQLiteClient(SqliteClient):
 
     def _in_transaction(
         self,
-    ) -> TransactionContext[KonomiTVBS4KTransactionalSQLiteTransactionWrapper]:
+    ) -> TransactionContext:
         """transaction-safe wrapper を使う transaction context を生成する。
 
         Returns:
