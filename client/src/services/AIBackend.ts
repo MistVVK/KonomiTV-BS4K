@@ -14,15 +14,12 @@ export type OpenCodeProviderType = 'Catalog' | 'OpenAICompatible' | 'AnthropicCo
 export type StructuredOutputMode = 'Auto' | 'StructuredOutput' | 'JSONText';
 export type OpenAICompatibleSlot = 1 | 2;
 
-/** OpenCode serve の availability。 */
+/** listener-free OpenCode CLI の availability。 */
 export interface IOpenCodeAvailability {
     available: boolean;
-    base_url: string;
-    host: string;
-    port: number;
+    transport: 'CLI';
     version: string | null;
     pinned_version: string;
-    pid: number | null;
     workspace: string;
 }
 
@@ -347,7 +344,7 @@ export default class AIBackend {
         return response.data;
     }
 
-    /** OpenCode serve の health を取得する。 */
+    /** OpenCode CLI の availability を取得する。 */
     static async fetchHealth(): Promise<IOpenCodeAvailability | null> {
         const response = await APIClient.get<IOpenCodeAvailability>('/ai-backends/health');
         if (response.type === 'error') {
@@ -450,7 +447,12 @@ export default class AIBackend {
             {method},
         );
         if (response.type === 'error') {
-            APIClient.showGenericError(response, 'OAuth を開始できませんでした。');
+            APIClient.showGenericError(
+                response,
+                response.status === 501
+                    ? 'listener なしの OpenCode CLI では新規 OAuth を開始できません。製品用 auth.json に既存トークンを手動配置するか、API キー認証を使用してください。'
+                    : 'OAuth を開始できませんでした。',
+            );
             return null;
         }
         return response.data;
@@ -472,7 +474,12 @@ export default class AIBackend {
             {timeout: 120 * 1000},
         );
         if (response.type === 'error') {
-            APIClient.showGenericError(response, 'OAuth の完了処理に失敗しました。');
+            APIClient.showGenericError(
+                response,
+                response.status === 501
+                    ? 'listener なしの OpenCode CLI では OAuth callback を処理できません。製品用 auth.json に既存トークンを手動配置するか、API キー認証を使用してください。'
+                    : 'OAuth の完了処理に失敗しました。',
+            );
             return false;
         }
         return true;
@@ -501,7 +508,7 @@ export default class AIBackend {
         );
         if (response.type === 'error') {
             if (response.status === 503) {
-                APIClient.showGenericError(response, 'OpenCode serve が利用できません。');
+                APIClient.showGenericError(response, 'OpenCode CLI が利用できません。');
             } else {
                 APIClient.showGenericError(response, '接続試験を実行できませんでした。');
             }

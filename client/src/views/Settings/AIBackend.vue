@@ -56,7 +56,7 @@
             <div class="settings__content" :class="{'settings__content--disabled': is_busy}">
                 <div class="settings__content-heading">
                     <Icon icon="fluent:heart-pulse-20-filled" width="22px" />
-                    <span class="ml-2">OpenCode serve</span>
+                    <span class="ml-2">OpenCode CLI</span>
                 </div>
                 <div class="settings__item">
                     <div class="settings__item-heading">状態</div>
@@ -66,10 +66,10 @@
                         </span>
                         <template v-if="health.available">
                             / version {{ health.version || '不明' }}
-                            （pin {{ health.pinned_version }}） / {{ health.host }}:{{ health.port }}
+                            （pin {{ health.pinned_version }}） / listener なし
                         </template>
                         <template v-else>
-                            。サーバーログの opencode-serve を確認してください。
+                            。OpenCode CLI の配置とサーバーログを確認してください。
                         </template>
                     </div>
                     <div class="settings__item-label" v-else>状態を取得できませんでした。</div>
@@ -382,7 +382,7 @@
                     </template>
                     <template v-else>
                         <div class="settings__item-label mb-3">
-                            OpenCode serve に service 専用 provider として登録します。
+                            OpenCode CLI に service 専用 provider として登録します。
                             API キーはこの画面の秘密ストアから OpenCode auth へ注入されます。
                         </div>
                         <v-text-field v-model="form.api_base_url" label="API ベース URL" variant="outlined"
@@ -400,8 +400,8 @@
                         item-title="title" item-value="value" label="構造化出力方式" variant="outlined"
                         color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2" />
                     <div class="settings__item-label mb-3">
-                        生成と話数 Web 検索の両方へ適用します。Auto は StructuredOutput を先に試し、
-                        非対応または不正な応答だけ JSON テキストへフォールバックします。
+                        OpenCode CLI は設定値にかかわらず JSON テキストを使用し、
+                        不正な応答はサーバー側の厳格な検証と再実行で処理します。
                     </div>
                     <v-divider class="mb-3" />
                     <v-text-field v-model="form.service_name" label="表示名" variant="outlined"
@@ -625,9 +625,9 @@ const custom_auth_mode_items: Array<{title: string; value: AIAuthMode}> = [
 ];
 
 const structured_output_mode_items: Array<{title: string; value: StructuredOutputMode}> = [
-    {title: 'Auto（StructuredOutput → JSON テキスト）', value: 'Auto'},
-    {title: 'StructuredOutput（OpenCode json_schema）', value: 'StructuredOutput'},
-    {title: 'JSON テキスト', value: 'JSONText'},
+    {title: 'Auto（CLI では JSON テキスト）', value: 'Auto'},
+    {title: 'StructuredOutput（旧設定・CLI では JSON テキスト）', value: 'StructuredOutput'},
+    {title: 'JSON テキスト（CLI）', value: 'JSONText'},
 ];
 
 const is_form_dense = Utils.isSmartphoneHorizontal();
@@ -1271,10 +1271,11 @@ async function saveService(): Promise<void> {
         if (result !== null) {
             Message.success(editing_service_id.value ? 'service を更新しました。' : 'service を追加しました。');
             edit_dialog.value = false;
-            // OAuth 新規作成直後は続けて認証ダイアログを開く。
+            // 既存 token が auth.json にある場合はそのまま利用し、未設定時だけ Unsupported 案内を出す。
             const should_start_oauth = (
                 editing_service_id.value === null &&
-                result.auth_mode === 'OAuthSubscription'
+                result.auth_mode === 'OAuthSubscription' &&
+                !result.auth_configured
             );
             await reloadAll();
             if (should_start_oauth) {
@@ -1344,13 +1345,14 @@ async function runOAuthStart(service: IAIBackendService): Promise<void> {
             oauth_method_index.value = oauth_method.method_index;
         }
     }
-    oauth_dialog.value = true;
     is_oauth_starting.value = true;
     try {
         const result = await AIBackend.startOAuth(service.service_id, oauth_method_index.value);
         if (result === null) {
+            oauth_target.value = null;
             return;
         }
+        oauth_dialog.value = true;
         oauth_started.value = true;
         oauth_method_index.value = result.method;
         oauth_url.value = result.url;

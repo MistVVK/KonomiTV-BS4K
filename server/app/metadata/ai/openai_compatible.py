@@ -687,7 +687,7 @@ def _FailureEpisodeResult(
 
 
 class OpenAICompatibleBackend:
-    """OpenCode serve を通さず OpenAI 互換 HTTP API を実行する。"""
+    """OpenCode CLI を通さず OpenAI 互換 HTTP API を実行する。"""
 
     def __init__(
         self,

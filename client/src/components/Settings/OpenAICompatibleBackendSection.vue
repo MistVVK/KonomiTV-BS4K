@@ -7,7 +7,7 @@
             </div>
             <div class="settings__item">
                 <div class="settings__item-label">
-                    OpenCode serve を経由せず、指定した OpenAI 互換 HTTP API へ直接接続します。<br>
+                    OpenCode CLI を経由せず、指定した OpenAI 互換 HTTP API へ直接接続します。<br>
                     シリーズ生成には Chat Completions、話数 Web 検索には Responses API の
                     <code>web_search</code> を使用します。<br>
                     Chat Completions だけを実装した互換サーバーではシリーズ生成だけ利用でき、

@@ -7,6 +7,10 @@
       "description": "KonomiTV-BS4K recorded series candidate selection and metadata generation",
       "mode": "primary",
       "hidden": true,
+      "tools": {
+        "websearch": false,
+        "webfetch": false
+      },
       "permission": {
         "bash": "deny",
         "edit": "deny",
@@ -31,6 +35,10 @@
       "description": "KonomiTV-BS4K recorded series episode number lookup with web tools",
       "mode": "primary",
       "hidden": true,
+      "tools": {
+        "websearch": true,
+        "webfetch": false
+      },
       "permission": {
         "bash": "deny",
         "edit": "deny",

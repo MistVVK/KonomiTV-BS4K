@@ -1,8 +1,8 @@
 """AI バックエンド（OpenCode service / OpenAI 互換 HTTP / ACP）管理 API。
 
 含む: service CRUD / APIキー set・delete / OAuth 開始・callback・切断 /
-OpenCode auth 注入と DELETE /auth/{id} 連動 / health・availability /
-provider カタログ（OpenCode Web 相当の認証方式選択）/
+OpenCode auth.json の直接管理 / CLI availability /
+models.dev provider カタログ（保存済み認証方式を含む）/
 draft 接続試験（Phase 2）/ 月次利用量 GET（Phase 3）/
 ACP 固定プリセット（Codex / Grok）の設定・認証・接続試験。
 """
@@ -55,14 +55,14 @@ from app.metadata.ai.opencode_backend import (
     BuildOpenCodeBackendFromDraft,
     BuildOpenCodeBackendFromServiceID,
 )
-from app.metadata.ai.opencode_client import (
-    OpenCodeClient,
-    OpenCodeClientError,
+from app.metadata.ai.opencode_cli import (
+    OpenCodeCLI,
+    OpenCodeCLIError,
     OpenCodeUnavailableError,
 )
-from app.metadata.ai.opencode_serve import (
-    IsOpenCodeAvailable,
-    ProbeOpenCodeAvailability,
+from app.metadata.ai.opencode_runtime import (
+    IsOpenCodeCLIAvailable,
+    ProbeOpenCodeCLIAvailability,
     SyncKonomiTVBS4KOpenCodeRuntimeConfig,
 )
 from app.metadata.ai.recorded_series_ai import (
@@ -157,17 +157,14 @@ class OpenAICompatibleConnectionTestRequest(BaseModel):
 
 
 class OpenCodeAvailabilityResponse(BaseModel):
-    """製品用 opencode serve の availability。"""
+    """製品用 OpenCode CLI の availability。"""
 
     model_config = ConfigDict(extra='forbid')
 
     available: bool
-    base_url: str
-    host: str
-    port: int
+    transport: Literal['CLI']
     version: str | None
     pinned_version: str
-    pid: int | None
     workspace: str
 
 
@@ -280,7 +277,7 @@ class AIBackendProviderAuthMethodResponse(BaseModel):
 
     model_config = ConfigDict(extra='forbid')
 
-    # OpenCode /provider/auth の method index。Vertex など合成 method は null。
+    # 既存 auth.json entry の method index。直接管理・Vertex など合成 method は null。
     method_index: int | None = None
     # OpenCode method type または vertex_adc。
     type: Annotated[Literal['api', 'oauth', 'vertex_adc'], Field()]
@@ -460,13 +457,13 @@ class ACPGrokModelCatalogResponse(BaseModel):
     models: list[ACPGrokModelResponse]
 
 
-def _httpErrorFromOpenCode(error: OpenCodeClientError) -> HTTPException:
-    """OpenCodeClientError を HTTPException へ写像する。"""
+def _httpErrorFromOpenCode(error: OpenCodeCLIError) -> HTTPException:
+    """OpenCodeCLIError を HTTPException へ写像する。"""
 
     if isinstance(error, OpenCodeUnavailableError):
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='OpenCode serve is unavailable.',
+            detail='OpenCode CLI is unavailable.',
             headers=NO_STORE_HEADERS,
         )
     code = error.status_code or status.HTTP_502_BAD_GATEWAY
@@ -600,18 +597,18 @@ def _BuildAuthMethodsForProvider(
     env_names: list[str],
     raw_auth_methods: list[dict[str, Any]] | None,
 ) -> tuple[list[AIBackendProviderAuthMethodResponse], str, str | None]:
-    """provider に出す認証方式を OpenCode Web 相当に組み立てる。
+    """provider に出す listener-free 経路の認証方式を組み立てる。
 
     方針:
     - API キーのみ: ベストエフォートで出す
-    - OAuth: ベストエフォートで出す（prompts 付き method は除外）
+    - OAuth: auth.json に既存 token がある provider だけを出す
     - Vertex 系: VertexAdc のみ（ADC は Docker env 前提）
     - それ以外の面倒な認証: UnsupportedComplex
 
     Args:
         provider_id: OpenCode provider ID。
         env_names: provider.env。
-        raw_auth_methods: GET /provider/auth の当該 provider 配列。
+        raw_auth_methods: auth.json の値を除いた保存済み方式。
 
     Returns:
         (auth_methods, support_kind, support_note)。
@@ -705,11 +702,11 @@ def _BuildProviderCatalog(
     catalog_payload: dict[str, Any],
     auth_methods_by_provider: dict[str, list[dict[str, Any]]],
 ) -> list[AIBackendProviderResponse]:
-    """GET /provider + /provider/auth から UI 用カタログを組み立てる。
+    """models.dev cache と auth.json metadata から UI 用カタログを組み立てる。
 
     Args:
-        catalog_payload: OpenCode GET /provider の JSON。
-        auth_methods_by_provider: GET /provider/auth の整形結果。
+        catalog_payload: models.dev provider catalog と接続済み ID。
+        auth_methods_by_provider: auth.json の値を除いた認証方式。
 
     Returns:
         provider 応答のリスト（provider_name でソート）。
@@ -764,8 +761,7 @@ def _BuildProviderCatalog(
                 if isinstance(item, str) and item.strip() != ''
             ]
         models, default_model_id = _ExtractProviderModels(provider_id, raw.get('models'))
-        # 現行 OpenCode は provider ごとの既定を payload.default に返す。
-        # 旧 payload / テスト fixture の model.default は fallback として維持する。
+        # models.dev cache に provider 既定があれば採用し、model.default を fallback とする。
         default_model_id = default_model_ids.get(provider_id, default_model_id)
         auth_methods, support_kind, support_note = _BuildAuthMethodsForProvider(
             provider_id,
@@ -788,7 +784,7 @@ def _BuildProviderCatalog(
 
 
 async def _SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange() -> None:
-    """service CRUD 後に runtime config を再生成し、必要なら OpenCode へ反映する。
+    """service CRUD 後に次回 CLI 起動用 runtime config を再生成する。
 
     Returns:
         None
@@ -797,15 +793,8 @@ async def _SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange() -> None:
         OSError: runtime config の生成・保存に失敗した場合。
     """
 
-    changed = SyncKonomiTVBS4KOpenCodeRuntimeConfig()
-    if changed is False or IsOpenCodeAvailable() is False:
-        return
-    try:
-        await OpenCodeClient().reloadConfiguration()
-    except OpenCodeClientError as error:
-        # 設定ファイルは更新済みで、次回 serve 起動または auth 更新時には反映される。
-        # service 自体を巻き戻すより安全なため警告に留める。
-        logging.warning(f'[AIBackend] Failed to reload OpenCode runtime config: {error}')
+    # 常駐 process は無く、各 `opencode run` が起動時にこの設定を読み直す。
+    SyncKonomiTVBS4KOpenCodeRuntimeConfig()
 
 
 async def _removeOpenCodeAuthIfUnshared(provider_id: str, *, excluding_service_id: str | None) -> None:
@@ -821,16 +810,16 @@ async def _removeOpenCodeAuthIfUnshared(provider_id: str, *, excluding_service_i
             f'(still referenced by {remaining} service(s)).',
         )
         return
-    client = OpenCodeClient()
+    client = OpenCodeCLI()
     try:
         await client.deleteAuth(provider_id)
     except OpenCodeUnavailableError:
-        # serve 停止中は secrets 側は消済み。再試行可能な警告を残す。
+        # CLI runtime を準備できない場合も secrets 側は削除済みなので、再試行可能な警告を残す。
         logging.warning(
-            f'[AIBackend] OpenCode unavailable while deleting auth for provider={provider_id}.',
+            f'[AIBackend] OpenCode CLI unavailable while deleting auth for provider={provider_id}.',
         )
         raise
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         logging.warning(
             f'[AIBackend] Failed to delete OpenCode auth for provider={provider_id}: {error}',
         )
@@ -839,17 +828,17 @@ async def _removeOpenCodeAuthIfUnshared(provider_id: str, *, excluding_service_i
 
 @router.get(
     '/health',
-    summary='OpenCode serve availability API',
+    summary='OpenCode CLI availability API',
     response_model=OpenCodeAvailabilityResponse,
 )
 async def OpenCodeHealthAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> OpenCodeAvailabilityResponse:
-    """製品用 opencode serve の availability を返す。"""
+    """製品用 OpenCode CLI の availability を返す。"""
 
     response.headers.update(NO_STORE_HEADERS)
-    snapshot = ProbeOpenCodeAvailability()
+    snapshot = ProbeOpenCodeCLIAvailability()
     return OpenCodeAvailabilityResponse.model_validate(snapshot)
 
 
@@ -862,21 +851,21 @@ async def AIBackendProviderListAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> AIBackendProviderListResponse:
-    """service 追加 UI 用に、OpenCode Web 相当の provider カタログを返す。
+    """service 追加 UI 用に、listener-free CLI の provider カタログを返す。
 
-    GET /provider（全カタログ）と GET /provider/auth（認証方式）を合成する。
+    models.dev cache と製品用 auth.json の認証方式を合成する。
     - API キーのみ: ベストエフォートで選択可
-    - OAuth: ベストエフォートで選択可（prompts 付き method は除外）
+    - OAuth: auth.json に既存 token がある provider だけ選択可
     - Vertex AI: ADC のみ正式対応
     - それ以外の面倒な認証（Azure/Bedrock/GitHub Enterprise 等）: UnsupportedComplex
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    client = OpenCodeClient()
+    client = OpenCodeCLI()
     try:
         catalog_payload = await client.listAllProviders()
         auth_methods = await client.listProviderAuthMethods()
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         raise _httpErrorFromOpenCode(error) from error
 
     providers = _BuildProviderCatalog(catalog_payload, auth_methods)
@@ -2174,7 +2163,7 @@ async def AIBackendServiceUpdateAPI(
                     previous.opencode_provider_id,
                     excluding_service_id=service.service_id,
                 )
-            except OpenCodeClientError as error:
+            except OpenCodeCLIError as error:
                 # settings は更新済み。auth 掃除失敗は警告に留め再試行可能とする。
                 logging.warning(
                     f'[AIBackendServiceUpdateAPI] Provider auth cleanup failed: {error}',
@@ -2256,7 +2245,7 @@ async def AIBackendServiceDeleteAPI(
             removed.opencode_provider_id,
             excluding_service_id=removed.service_id,
         )
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         logging.warning(
             f'[AIBackendServiceDeleteAPI] OpenCode auth removal failed after local delete: {error}',
         )
@@ -2307,11 +2296,11 @@ async def AIBackendAPIKeySetAPI(
             headers=NO_STORE_HEADERS,
         ) from error
 
-    client = OpenCodeClient()
+    client = OpenCodeCLI()
     try:
         # キー本体はログに出さない
         await client.putApiKey(service.opencode_provider_id, body.api_key)
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         raise _httpErrorFromOpenCode(error) from error
 
     invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
@@ -2358,7 +2347,7 @@ async def AIBackendAPIKeyDeleteAPI(
             # 幽霊認証を残さない。
             excluding_service_id=service.service_id,
         )
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         logging.warning(
             f'[AIBackendAPIKeyDeleteAPI] OpenCode auth removal failed: {error}',
         )
@@ -2372,15 +2361,11 @@ async def AIBackendAPIKeyDeleteAPI(
 )
 async def AIBackendOAuthStartAPI(
     service_id: Annotated[str, Path(min_length=36, max_length=36)],
-    body: OAuthStartRequest,
+    _body: OAuthStartRequest,
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> OAuthStartResponse:
-    """OAuth 認可を開始し、browser 用 URL と手順を返す。
-
-    OpenCode Web と同様に method index を渡し、返却 URL をクライアントが開く。
-    接続済みフラグの更新は callback API 側で行う。
-    """
+    """listener が必要な新規 OAuth 認可を明示的に拒否する。"""
 
     response.headers.update(NO_STORE_HEADERS)
     service = AIBackendSettingsStore.getService(service_id)
@@ -2396,40 +2381,15 @@ async def AIBackendOAuthStartAPI(
             detail='OAuth start requires auth_mode=OAuthSubscription.',
             headers=NO_STORE_HEADERS,
         )
-    client = OpenCodeClient()
-    try:
-        authorize = await client.startOAuthAuthorize(
-            service.opencode_provider_id,
-            method=body.method,
-        )
-    except OpenCodeClientError as error:
-        raise _httpErrorFromOpenCode(error) from error
-    except ValueError as error:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(error),
-            headers=NO_STORE_HEADERS,
-        ) from error
-
-    url_raw = authorize.get('url')
-    url = url_raw.strip() if isinstance(url_raw, str) and url_raw.strip() != '' else None
-    method_raw = authorize.get('method')
-    authorization_method: Literal['auto', 'code'] | None = None
-    if method_raw in {'auto', 'code'}:
-        authorization_method = method_raw  # type: ignore[assignment]
-    instructions_raw = authorize.get('instructions')
-    instructions = (
-        instructions_raw.strip()
-        if isinstance(instructions_raw, str) and instructions_raw.strip() != ''
-        else None
-    )
-    return OAuthStartResponse(
-        provider_id=service.opencode_provider_id,
-        method=body.method,
-        url=url,
-        authorization_method=authorization_method,
-        instructions=instructions,
-        authorize=authorize,
+    # OpenCode 1.18.27 は OAuth authorize/callback を serve HTTP API または対話 TTY にしか公開しない。
+    # 無認証 listener を復活させず、既存 auth.json entry の利用・切断だけを維持する。
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            'OpenCodeOAuthUnsupported: New OAuth authorization is unavailable in listener-free CLI mode. '
+            'Provision an existing token in the product auth.json manually or use API key authentication.'
+        ),
+        headers=NO_STORE_HEADERS,
     )
 
 
@@ -2441,16 +2401,11 @@ async def AIBackendOAuthStartAPI(
 )
 async def AIBackendOAuthCallbackAPI(
     service_id: Annotated[str, Path(min_length=36, max_length=36)],
-    body: OAuthCallbackRequest,
+    _body: OAuthCallbackRequest,
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> None:
-    """OAuth callback を OpenCode に渡し、成功時に oauth_connected を立てる。
-
-    browser (auto) では code 無し、headless/device では code を渡す。
-    ベストエフォート: provider によっては redirect が Docker 内 localhost の
-    ため完了できない場合がある。その場合は headless method を選ぶ。
-    """
+    """listener-free CLI では開始できない OAuth callback を拒否する。"""
 
     response.headers.update(NO_STORE_HEADERS)
     service = AIBackendSettingsStore.getService(service_id)
@@ -2466,45 +2421,14 @@ async def AIBackendOAuthCallbackAPI(
             detail='OAuth callback requires auth_mode=OAuthSubscription.',
             headers=NO_STORE_HEADERS,
         )
-    client = OpenCodeClient()
-    try:
-        ok = await client.completeOAuthCallback(
-            service.opencode_provider_id,
-            method=body.method,
-            code=body.code,
-        )
-    except OpenCodeClientError as error:
-        raise _httpErrorFromOpenCode(error) from error
-    except ValueError as error:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(error),
-            headers=NO_STORE_HEADERS,
-        ) from error
-    if ok is not True:
-        # OpenCode が false を返した場合も接続未完了として 502。
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail='OpenCode OAuth callback did not complete.',
-            headers=NO_STORE_HEADERS,
-        )
-    try:
-        AIBackendSettingsStore.setOAuthConnected(service.service_id, True)
-    except KeyError as error:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail='AI backend service not found.',
-            headers=NO_STORE_HEADERS,
-        ) from error
-    except (OSError, ValueError) as error:
-        logging.error('[AIBackendOAuthCallbackAPI] Failed to set oauth_connected:', exc_info=error)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Failed to mark OAuth as connected.',
-            headers=NO_STORE_HEADERS,
-        ) from error
-
-    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            'OpenCodeOAuthUnsupported: OAuth callback is unavailable in listener-free CLI mode. '
+            'Provision an existing token in the product auth.json manually or use API key authentication.'
+        ),
+        headers=NO_STORE_HEADERS,
+    )
 
 
 @router.post(
@@ -2558,7 +2482,7 @@ async def AIBackendOAuthDisconnectAPI(
             # 切断した service 自身は oauth_connected=False なので参照カウントから除外する。
             excluding_service_id=service.service_id,
         )
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         logging.warning(
             f'[AIBackendOAuthDisconnectAPI] OpenCode auth removal failed: {error}',
         )
@@ -2713,10 +2637,10 @@ async def AIBackendConnectionTestAPI(
 
     response.headers.update(NO_STORE_HEADERS)
 
-    if IsOpenCodeAvailable() is False:
+    if IsOpenCodeCLIAvailable() is False:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='OpenCode serve is unavailable.',
+            detail='OpenCode CLI is unavailable.',
             headers=NO_STORE_HEADERS,
         )
 
@@ -2876,10 +2800,10 @@ async def AIBackendConnectionTestAPI(
     finally:
         # 一時キー試験後の OpenCode auth 掃除（共有 provider は壊さない）。
         if remove_auth_on_cleanup and provider_id_for_cleanup is not None:
-            client = OpenCodeClient()
+            client = OpenCodeCLI()
             try:
                 await client.deleteAuth(provider_id_for_cleanup)
-            except OpenCodeClientError as error:
+            except OpenCodeCLIError as error:
                 logging.warning(
                     f'[AIBackendConnectionTestAPI] Temporary auth cleanup failed: {error}',
                 )

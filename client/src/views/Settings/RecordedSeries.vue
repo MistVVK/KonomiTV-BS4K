@@ -146,7 +146,7 @@
                 <div class="settings__item-label">
                     主系 AI が技術的に失敗したとき、または InsufficientEvidence のときにどうするかを決めます。<br>
                     NoPublishedNumber / NotNumbered など正常な判定結果では切り替えません。<br>
-                    失敗時ポリシーによる AI 試行は最大 2 回です。OpenCode 内部の出力形式補修は別に行われます。<br>
+                    失敗時ポリシーによる AI 試行は最大 2 回です。OpenCode 側の形式補修は使わず、サーバー側で応答を検証します。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"

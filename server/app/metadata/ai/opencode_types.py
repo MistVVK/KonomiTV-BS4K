@@ -1,94 +1,34 @@
-"""OpenCode 1.18.18 OpenAPI 契約の型定義土台（Phase 2 クライアントが利用）。
+"""OpenCode 1.18.27 CLI telemetry と runtime config の型定義。
 
 usage の正本位置:
-- AssistantMessage.tokens.input / output / reasoning / cache
-- AssistantMessage.cost
-- StepFinishPart.tokens / cost（ステップ単位の中間値）
+- CLI NDJSON の StepFinishPart.tokens / cost
 
-auth:
-- PUT /auth/{providerID} body: ApiAuth | OAuth | WellKnownAuth
-- DELETE /auth/{providerID}
+auth.json は provider ID をキーに ApiAuth / OAuth などの entry を保持する。
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, NotRequired
+from typing import Annotated, Literal, NotRequired
 
 from typing_extensions import TypedDict
 
 
-class OpenCodeHealth(TypedDict):
-    """GET /global/health の応答。"""
-
-    healthy: Literal[True]
-    version: str
-
-
 class OpenCodeApiAuth(TypedDict):
-    """PUT /auth/{providerID} の API キー認証。"""
+    """auth.json に保存する API キー認証。"""
 
     type: Literal['api']
     key: str
     metadata: NotRequired[dict[str, str]]
 
 
-class OpenCodeOAuthAuth(TypedDict):
-    """PUT /auth/{providerID} の OAuth 認証（通常は serve 側が保持）。"""
-
-    type: Literal['oauth']
-    refresh: str
-    access: str
-    expires: int
-    accountId: NotRequired[str]
-    enterpriseUrl: NotRequired[str]
-
-
 class OpenCodeTokenUsage(TypedDict):
-    """AssistantMessage / StepFinishPart の tokens オブジェクト。"""
+    """CLI step-finish part の tokens オブジェクト。"""
 
     input: float
     output: float
     reasoning: float
     cache: dict[str, float]
     total: NotRequired[float]
-
-
-class OpenCodeModelRef(TypedDict):
-    """prompt リクエストの model 指定。"""
-
-    providerID: str
-    modelID: str
-
-
-class OpenCodeJsonSchemaFormat(TypedDict):
-    """format: json_schema 指定。"""
-
-    type: Literal['json_schema']
-    schema: dict[str, Any]
-    retryCount: NotRequired[int]
-
-
-class OpenCodeTextPartInput(TypedDict):
-    """prompt parts の text 要素。"""
-
-    type: Literal['text']
-    text: str
-
-
-class OpenCodePromptRequest(TypedDict):
-    """POST /session/{id}/message の主要フィールド。"""
-
-    parts: list[OpenCodeTextPartInput]
-    model: NotRequired[OpenCodeModelRef]
-    agent: NotRequired[str]
-    format: NotRequired[OpenCodeJsonSchemaFormat]
-    system: NotRequired[str]
-    noReply: NotRequired[bool]
-    # OpenCode が provider/model ごとに広告する推論深度などの variant 名。
-    variant: NotRequired[str]
-    # ツールの有効/無効（例: {'websearch': True}）。デフォルトのツールセットに
-    # websearch は含まれないため、web 検索を使う agent では明示指定が必要。
-    tools: NotRequired[dict[str, bool]]
 
 
 class KonomiTVBS4KOpenCodeProviderOptions(TypedDict):
@@ -126,11 +66,11 @@ def NormalizeOpenCodeUsage(
     tokens: OpenCodeTokenUsage | None,
     cost: float | None,
 ) -> OpenCodeNormalizedUsage:
-    """OpenCode 応答の tokens/cost を月次台帳向けに正規化する。
+    """OpenCode CLI part の tokens/cost を月次台帳向けに正規化する。
 
     Args:
-        tokens: AssistantMessage.tokens または StepFinishPart.tokens。
-        cost: AssistantMessage.cost または StepFinishPart.cost。取得不能時は None。
+        tokens: step-finish part の tokens。
+        cost: step-finish part の cost。取得不能時は None。
 
     Returns:
         整数化した token 数と推定 cost。cost が負や非数の場合は None。

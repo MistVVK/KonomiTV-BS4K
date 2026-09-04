@@ -608,7 +608,6 @@ class _ServerSettingsGeneral(BaseModel):
 class _ServerSettingsServer(BaseModel):
     https_mode: Literal['akebi', 'certificate', 'reverse_proxy'] = 'akebi'
     port: PositiveInt = 7000
-    opencode_serve_port: Annotated[int, Field(ge=1024, le=65535)] = 4097
     custom_https_certificate: FilePath | None = None
     custom_https_private_key: FilePath | None = None
     reverse_proxy_listen_address: IPvAnyAddress = ipaddress.IPv4Address('0.0.0.0')
@@ -680,31 +679,6 @@ class _ServerSettingsServer(BaseModel):
             raise ValueError(
                 f'ポート {port + 10} ({port} + 10) は他のプロセスで使われているため、KonomiTV-BS4K を起動できません。\n'
                 f'重複して KonomiTV-BS4K を起動していないか、他のソフトでポート {port + 10} を使っていないかを確認してください。'
-            )
-        return port
-
-    @field_validator('opencode_serve_port')
-    def validateOpenCodeServePort(cls, port: int, info: ValidationInfo) -> int:
-        """製品用 OpenCode serve のポートが他プロセスと衝突しないことを検証する。
-
-        Args:
-            port (int): 検証する OpenCode serve のポート番号。
-            info (ValidationInfo): bypass_validation などの検証コンテキスト。
-
-        Returns:
-            int: 利用可能な OpenCode serve のポート番号。
-        """
-
-        # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する。
-        if type(info.context) is dict and info.context.get('bypass_validation') is True:
-            return port
-
-        # 同じ KonomiTV-BS4K 内のリスナとの衝突は、全セクションが揃う ServerSettings 側で検証する。
-        if port in _GetUsedListenPorts():
-            raise ValueError(
-                f'OpenCode serve のポート {port} は他のプロセスで使われているため、'
-                'KonomiTV-BS4K を起動できません。\n'
-                f'他のソフトでポート {port} を使っていないかを確認してください。'
             )
         return port
 
@@ -837,7 +811,7 @@ class ServerSettings(BaseModel):
 
     @model_validator(mode='after')
     def validateListenPorts(self, info: ValidationInfo) -> 'ServerSettings':
-        """通常 API・互換 API・OpenCode serve のリスナが互いに衝突しないことを検証する。
+        """通常 API と互換 API のリスナが互いに衝突しないことを検証する。
 
         Args:
             info (ValidationInfo): bypass_validation などの検証コンテキスト。
@@ -851,12 +825,11 @@ class ServerSettings(BaseModel):
 
         listen_ports = {
             '通常 API': self.server.port,
-            'OpenCode serve': self.server.opencode_serve_port,
         }
         if self.server.https_mode == 'akebi':
             listen_ports['通常 API の内部 Uvicorn'] = self.server.port + 10
 
-        # 無効な互換 API はポートを予約せず、OpenCode serve に同じ値を設定できるようにする。
+        # 無効な互換 API はポートを予約しない。
         compatibility_https_mode: str | None = None
         if self.compatibility_api.enabled:
             compatibility_https_mode = (

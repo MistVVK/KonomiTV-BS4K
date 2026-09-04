@@ -755,7 +755,12 @@ class AIBackendSettingsStore:
         if service.auth_mode == 'ApiKey':
             return cls.hasAPIKey(service.service_id)
         if service.auth_mode == 'OAuthSubscription':
-            return service.oauth_connected
+            # listener-free CLI では、手動配置された既存 OAuth token も正規の認証源として扱う。
+            from app.metadata.ai.opencode_cli import HasStoredOpenCodeAuth
+            return (
+                service.oauth_connected
+                or HasStoredOpenCodeAuth(service.opencode_provider_id, auth_type='oauth')
+            )
         if service.auth_mode == 'VertexAdc':
             return service.google_cloud_project is not None
         if service.auth_mode == 'NoneLocal':

@@ -1,7 +1,7 @@
 """主系 AI 失敗時の回復方針（最大 2 試行）を定義する。
 
 シリーズ情報生成と話数 Web 検索で同じ判定・試行計画を共有する。
-OpenCode の format 補修（Auto JSON 補正 / format.retryCount）は backend 内に残し、
+OpenCode の JSON text 補修は backend の Python 側 validation retry に限定し、
 ここでの 2 試行目は独立した通常実行または修正版プロンプト再実行とする。
 """
 
