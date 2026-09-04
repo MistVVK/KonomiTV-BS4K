@@ -216,7 +216,7 @@ class LaunchedProcess:
     # 対応するエンコードパターン
     pattern: EncodePattern
     # tsreplace subprocess.Popen ハンドル
-    process: 'subprocess.Popen[bytes]'
+    process: subprocess.Popen[bytes]
     # 起動開始時刻 (perf_counter)
     start_time: float
     # 出力ファイルパス

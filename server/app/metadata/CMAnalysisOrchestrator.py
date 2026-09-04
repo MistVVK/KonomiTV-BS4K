@@ -130,7 +130,7 @@ class CMAnalysisOrchestrator:
 
     @classmethod
     @asynccontextmanager
-    async def _recordingLock(cls, recorded_video_id: int) -> AsyncGenerator[None, None]:
+    async def _recordingLock(cls, recorded_video_id: int) -> AsyncGenerator[None]:
         """同じ録画に対する scanner/API/watcher の競合を直列化する。"""
 
         async with cls._recording_locks_guard:

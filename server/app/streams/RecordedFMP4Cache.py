@@ -228,7 +228,7 @@ class RecordedFMP4CacheManager:
     async def __pathLock(
         cls,
         cache_path: Path,
-    ) -> AsyncGenerator[KonomiTVBS4KRecordedFMP4PathLock, None]:
+    ) -> AsyncGenerator[KonomiTVBS4KRecordedFMP4PathLock]:
         """Manager 内操作を cache path 固有 lock で直列化する。
 
         Args:

@@ -17,7 +17,7 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from typing_extensions import TypedDict
 
@@ -102,9 +102,6 @@ _ACP_OPERATION_HARD_TIMEOUT_SEC = ACP_HARD_TIMEOUT_SEC
 # モデル広告は prompt を送らないため、設定済みの長時間推論 timeout とは別の短い上限にする。
 _ACP_MODEL_CATALOG_TIMEOUT_SEC = 60
 
-_AcpOperationResult = TypeVar('_AcpOperationResult')
-
-
 class _AIBackendTargetFingerprint(TypedDict, total=False):
     """1 backend の実行条件を fingerprint 化するための安全な構造。"""
 
@@ -125,12 +122,12 @@ class _AIExecutionFingerprintPayload(TypedDict):
     failure_recovery_strategy: str
 
 
-async def _RunACPOperationWithDeadline(
-    operation: Callable[[], Awaitable[_AcpOperationResult]],
+async def _RunACPOperationWithDeadline[AcpOperationResult](
+    operation: Callable[[], Awaitable[AcpOperationResult]],
     credential_provider: KonomiTVBS4KACPImportProvider | None,
     *,
     hard_deadline: float | None = None,
-) -> _AcpOperationResult:
+) -> AcpOperationResult:
     """直列実行待ちと credential lock 待機を含む ACP 公開操作へ絶対期限を適用する。
 
     Args:
@@ -1225,13 +1222,13 @@ async def select_candidate(
     return result
 
 
-async def _RunBackendOperation(
+async def _RunBackendOperation[AcpOperationResult](
     target: AIBackendTarget,
-    operation: Callable[[RecordedSeriesAIBackend], Awaitable[_AcpOperationResult]],
+    operation: Callable[[RecordedSeriesAIBackend], Awaitable[AcpOperationResult]],
     *,
     api_key: str | None = None,
     acp_hard_deadline: float | None = None,
-) -> tuple[_AcpOperationResult, str]:
+) -> tuple[AcpOperationResult, str]:
     """指定ターゲットの backend を生成して操作を実行する。
 
     HTTP backend は直接実行し、ACP は直列 lock と credential lock を適用する。
@@ -1247,7 +1244,7 @@ async def _RunBackendOperation(
         operation の戻り値と、backend 生成時の監査 label。
     """
 
-    async def Run() -> tuple[_AcpOperationResult, str]:
+    async def Run() -> tuple[AcpOperationResult, str]:
         backend = CreateBackendForTarget(target, api_key=api_key)
         try:
             result = await operation(backend)

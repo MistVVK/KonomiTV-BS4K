@@ -298,7 +298,7 @@ def main() -> None:
             document.extend([f'##### {label}', '', '```text', license_text, '```', ''])
 
     python_license = extractTarLicense(
-        manifest['PYTHON_URL'], manifest['PYTHON_SHA256'], 'python/lib/python3.11/LICENSE.txt',
+        manifest['PYTHON_URL'], manifest['PYTHON_SHA256'], 'python/lib/python3.14/LICENSE.txt',
     )
     document.extend([
         f'#### Python Standalone {manifest["PYTHON_VERSION"]}', '',

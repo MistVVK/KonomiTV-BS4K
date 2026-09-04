@@ -200,7 +200,7 @@ class AnalysisTaskTracker:
         total_count: int = 0,
         parent_id: int | None = None,
         existing_handle: AnalysisTaskHandle | None = None,
-    ) -> AsyncGenerator[AnalysisTaskHandle, None]:
+    ) -> AsyncGenerator[AnalysisTaskHandle]:
         """実行履歴を作成し、例外・キャンセルを必ず終端状態へ変換する。"""
 
         handle = existing_handle

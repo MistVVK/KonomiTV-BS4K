@@ -101,4 +101,4 @@ download-verified "${PYTHON_URL}" "${PYTHON_SHA256}" "${DOWNLOAD_ROOT}/python.ta
 tar -xzf "${DOWNLOAD_ROOT}/python.tar.gz" -C "${SOURCE_ROOT}"
 mv "${SOURCE_ROOT}/python" "${OUTPUT_ROOT}/Python"
 "${OUTPUT_ROOT}/Python/bin/python" -m pip install --no-cache-dir "poetry==${POETRY_VERSION}"
-copy-license "${OUTPUT_ROOT}/Python/lib/python3.11/LICENSE.txt" "${OUTPUT_ROOT}/Python/License.txt"
+copy-license "${OUTPUT_ROOT}/Python/lib/python3.14/LICENSE.txt" "${OUTPUT_ROOT}/Python/License.txt"

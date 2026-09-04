@@ -121,7 +121,7 @@ def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
     class FakeRecordedProgramQuery:
         excluded_statuses: list[str] = []
 
-        def exclude(self, *, recorded_video__status__in: list[str]) -> 'FakeRecordedProgramQuery':
+        def exclude(self, *, recorded_video__status__in: list[str]) -> FakeRecordedProgramQuery:
             self.excluded_statuses = recorded_video__status__in
             return self
 
@@ -133,7 +133,7 @@ def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
             return 1
 
     @asynccontextmanager
-    async def InTransaction() -> AsyncGenerator[None, None]:
+    async def InTransaction() -> AsyncGenerator[None]:
         yield
 
     monkeypatch.setattr(anyio.Path, 'stat', Stat)
@@ -425,7 +425,7 @@ def test_thumbnail_history_uses_persisted_recorded_video_id(monkeypatch: pytest.
         cls: type[AnalysisTaskTracker],
         task_type: str,
         **kwargs: Any,
-    ) -> AsyncGenerator[FakeHistory, None]:
+    ) -> AsyncGenerator[FakeHistory]:
         del cls
         captured['task_type'] = task_type
         captured.update(kwargs)
@@ -644,7 +644,7 @@ def test_recorded_folder_watcher_routes_all_konomitv_bs4k_yaml_events(
     chapter_path = tmp_path / 'program.ts.konomitv-bs4k-chapters.yaml'
     handled_paths: list[pathlib.Path] = []
 
-    async def Watch(*args: Any, **kwargs: Any) -> AsyncGenerator[set[tuple[Change, str]], None]:
+    async def Watch(*args: Any, **kwargs: Any) -> AsyncGenerator[set[tuple[Change, str]]]:
         del args, kwargs
         yield {(change_type, str(chapter_path))}
         scan_task._is_running = False  # type: ignore[attr-defined]

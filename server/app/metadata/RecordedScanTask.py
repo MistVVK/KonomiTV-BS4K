@@ -240,7 +240,7 @@ class RecordedScanTask:
 
 
     @asynccontextmanager
-    async def fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None, None]:
+    async def fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None]:
         """path単位lockのholder・waiterを参照数へ含め、最後の解放後にentryを回収する。
 
         Args:
@@ -289,7 +289,7 @@ class RecordedScanTask:
         cls,
         folder: anyio.Path,
         successfully_scanned_directories: set[pathlib.Path] | None = None,
-    ) -> AsyncGenerator[anyio.Path, None]:
+    ) -> AsyncGenerator[anyio.Path]:
         """CM解析workspaceを枝刈りしながら録画フォルダを列挙する。
 
         Args:

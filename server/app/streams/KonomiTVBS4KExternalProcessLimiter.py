@@ -43,7 +43,7 @@ class KonomiTVBS4KExternalProcessLimiter:
 
     @classmethod
     @asynccontextmanager
-    async def acquireSlot(cls) -> AsyncGenerator[None, None]:
+    async def acquireSlot(cls) -> AsyncGenerator[None]:
         """外部プロセス同時実行枠を1つ取得して返す。
 
         Args:

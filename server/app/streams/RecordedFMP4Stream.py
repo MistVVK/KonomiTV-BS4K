@@ -466,7 +466,7 @@ class RecordedFMP4Stream:
     async def __segmentRequest(
         self,
         request_generation: int | None,
-    ) -> AsyncGenerator[bool, None]:
+    ) -> AsyncGenerator[bool]:
         """segment要求をシーク世代へ登録し、古い実行を停止する。
 
         Args:

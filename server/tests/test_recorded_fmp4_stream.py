@@ -2888,7 +2888,7 @@ def test_offline_continuous_video_falls_back_to_single_segment(monkeypatch, tmp_
 class _ImmediatePathLock:
     """テスト用に即座に出入りできる path lock。"""
 
-    async def __aenter__(self) -> '_ImmediatePathLock':
+    async def __aenter__(self) -> _ImmediatePathLock:
         return self
 
     async def __aexit__(self, *_args: object) -> None:

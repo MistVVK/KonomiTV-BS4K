@@ -315,7 +315,7 @@ class KonomiTVBS4KSpeedTestSessionManager:
         self,
         session_id: str,
         kind: KonomiTVBS4KSpeedTestTransferKind,
-    ) -> AsyncGenerator[KonomiTVBS4KSpeedTestSessionState, None]:
+    ) -> AsyncGenerator[KonomiTVBS4KSpeedTestSessionState]:
         """
         下り / 上り / ping の同時実行枠を確保し、終了時に返す。
 

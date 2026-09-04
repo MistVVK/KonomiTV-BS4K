@@ -4230,10 +4230,10 @@ Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
 ```
 
-#### Python Standalone 3.11.15
+#### Python Standalone 3.14.7
 
-- Source: <https://github.com/indygreg/python-build-standalone/releases/download/20260623/cpython-3.11.15+20260623-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz>
-- SHA-256: `0604cd029b142dc223e131f17f5941c0c8d2d5074997c8178b515b19eea2a6c2`
+- Source: <https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.14.7%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz>
+- SHA-256: `3959f92825141e04adf44982d3a83ee57af0877e893b0796e04c1468749d9b04`
 
 ##### LICENSE.txt
 
@@ -4323,10 +4323,8 @@ grants Licensee a nonexclusive, royalty-free, world-wide license to reproduce,
 analyze, test, perform and/or display publicly, prepare derivative works,
 distribute, and otherwise use Python alone or in any derivative version,
 provided, however, that PSF's License Agreement and PSF's notice of copyright,
-i.e., "Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
-2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023 Python Software Foundation;
-All Rights Reserved" are retained in Python alone or in any derivative version
-prepared by Licensee.
+i.e., "Copyright (c) 2001 Python Software Foundation; All Rights Reserved"
+are retained in Python alone or in any derivative version prepared by Licensee.
 
 3. In the event Licensee prepares a derivative work that is based on
 or incorporates Python or any part thereof, and wants to make

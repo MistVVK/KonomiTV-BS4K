@@ -27,7 +27,7 @@ class TagsClient:
         # キャッシュ検証で実際のリクエスト回数と URL を確認するために保持する
         self.requested_urls: list[str] = []
 
-    async def __aenter__(self) -> 'TagsClient':
+    async def __aenter__(self) -> TagsClient:
         """
         Returns:
             TagsClient: HTTPX_CLIENT の async context manager が返すクライアント

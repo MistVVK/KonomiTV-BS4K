@@ -32,7 +32,7 @@ class FakeHTTPXClient:
         self.request_url = ''
         self.request_headers: dict[str, str] = {}
 
-    async def __aenter__(self) -> 'FakeHTTPXClient':
+    async def __aenter__(self) -> FakeHTTPXClient:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:

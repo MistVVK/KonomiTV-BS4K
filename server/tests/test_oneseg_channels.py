@@ -203,7 +203,7 @@ class _FakeChannelQuery:
             return self.channels
         return Resolve().__await__()
 
-    def order_by(self, *_fields: str) -> '_FakeChannelQuery':
+    def order_by(self, *_fields: str) -> _FakeChannelQuery:
         return self
 
     async def first(self) -> Channel | None:

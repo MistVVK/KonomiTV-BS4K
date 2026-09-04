@@ -177,7 +177,7 @@ class _ExcludeChain:
     def __init__(self, users: list[Any]) -> None:
         self.users = users
 
-    def exclude(self, **_kwargs: object) -> '_ExcludeChain':
+    def exclude(self, **_kwargs: object) -> _ExcludeChain:
         return self
 
     def __await__(self) -> Any:

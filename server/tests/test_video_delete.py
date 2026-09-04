@@ -90,7 +90,7 @@ def test_video_delete_failure_preserves_record_for_retry(
             return file_path
 
         @asynccontextmanager
-        async def fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None, None]:
+        async def fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None]:
             del file_path
             yield
 

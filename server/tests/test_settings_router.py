@@ -27,7 +27,7 @@ class _FakeUserQuery:
 
         self._user = user
 
-    def select_for_update(self) -> '_FakeUserQuery':
+    def select_for_update(self) -> _FakeUserQuery:
         """
         行ロック付きクエリを装い、自身を返す。
 

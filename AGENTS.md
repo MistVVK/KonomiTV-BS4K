@@ -74,7 +74,7 @@ upstream KonomiTV は Windows と Linux の双方を対象としていますが�
     - Vuetify 3.x
     - Pinia
 - `server/`: KonomiTV のバックエンド API サーバー
-  - Python 3.11
+  - Python 3.14
   - Poetry
   - Uvicorn
   - FastAPI
@@ -130,7 +130,7 @@ upstream KonomiTV は Windows と Linux の双方を対象としていますが�
 ### Python コード
 - **コードの編集後には、必ず `poetry run task lint` コマンドで、Ruff によるコードリンターと Pyright による型チェッカーを実行すること**
 - 文字列にはシングルクォートを用いる (Docstring を除く)
-- Python 3.11 の機能を使う (3.10 以下での動作は考慮不要)
+- Python 3.14 の機能を使う (3.13 以下での動作は考慮不要)
 - ビルトイン型を使用した Type Hint で実装する (from typing import List, Dict などは避ける)
 - Pydantic モデル定義では必ず Annotated 記法を使う。`= Field()` 型の定義は行わずに全て Annotated 記法で定義すること
 - 変数・インスタンス変数は snake_case で命名する

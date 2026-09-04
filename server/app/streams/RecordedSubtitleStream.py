@@ -112,7 +112,7 @@ class RecordedSubtitleStream:
 
     @classmethod
     @asynccontextmanager
-    async def __cacheLock(cls, cache_path: Path) -> AsyncGenerator[None, None]:
+    async def __cacheLock(cls, cache_path: Path) -> AsyncGenerator[None]:
         """cache pathのholder・waiterを参照数へ含め、最後の解放後にentryを回収する。"""
 
         # asyncio taskはawait地点でのみ切り替わるため、entry作成と参照追加を連続して行えば、

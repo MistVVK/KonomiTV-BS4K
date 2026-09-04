@@ -397,7 +397,7 @@ class _ServerSettingsGeneral(BaseModel):
         return Url(str(mirakurun_url).rstrip('/') + '/')
 
     @model_validator(mode='after')
-    def validate_konomitv_bs4k_tlv_mirakurun(self, info: ValidationInfo) -> '_ServerSettingsGeneral':
+    def validate_konomitv_bs4k_tlv_mirakurun(self, info: ValidationInfo) -> _ServerSettingsGeneral:
         """
         TLV 選択時に専用 Mirakurun の API と BS4K サービスを検証する。
 
@@ -614,7 +614,7 @@ class _ServerSettingsServer(BaseModel):
     trusted_proxy_cidrs: list[IPvAnyNetwork] = []
 
     @model_validator(mode='after')
-    def validate_https_mode(self, info: ValidationInfo) -> '_ServerSettingsServer':
+    def validate_https_mode(self, info: ValidationInfo) -> _ServerSettingsServer:
         # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する
         if type(info.context) is dict and info.context.get('bypass_validation') is True:
             return self
@@ -693,7 +693,7 @@ class _ServerSettingsCompatibilityAPI(BaseModel):
     trusted_proxy_cidrs: list[IPvAnyNetwork] = []
 
     @model_validator(mode='after')
-    def validate_https_mode(self, info: ValidationInfo) -> '_ServerSettingsCompatibilityAPI':
+    def validate_https_mode(self, info: ValidationInfo) -> _ServerSettingsCompatibilityAPI:
         """互換 API 専用の HTTPS モードと関連設定が矛盾しないことを検証する。"""
 
         # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する
@@ -810,7 +810,7 @@ class ServerSettings(BaseModel):
     cm_analysis: _ServerSettingsCMAnalysis = _ServerSettingsCMAnalysis()
 
     @model_validator(mode='after')
-    def validateListenPorts(self, info: ValidationInfo) -> 'ServerSettings':
+    def validateListenPorts(self, info: ValidationInfo) -> ServerSettings:
         """通常 API と互換 API のリスナが互いに衝突しないことを検証する。
 
         Args:
@@ -1007,7 +1007,7 @@ class HostServerSettings(BaseModel):
     cm_analysis: _HostServerSettingsCMAnalysis = _HostServerSettingsCMAnalysis()
 
     @model_validator(mode='after')
-    def normalize_host_paths(self) -> 'HostServerSettings':
+    def normalize_host_paths(self) -> HostServerSettings:
         """
         外部モデルを構築した時点で対象パス項目をホスト表現へ正規化する。
 
@@ -1050,7 +1050,7 @@ class HostServerSettings(BaseModel):
         return self
 
     @classmethod
-    def fromServerSettings(cls, settings: ServerSettings) -> 'HostServerSettings':
+    def fromServerSettings(cls, settings: ServerSettings) -> HostServerSettings:
         """
         内部実行用設定から外部向けホストパス設定を生成する。
 

@@ -29,10 +29,10 @@ class _Query:
     def __init__(self, result: object) -> None:
         self.result = result
 
-    def select_for_update(self) -> '_Query':
+    def select_for_update(self) -> _Query:
         return self
 
-    def using_db(self, _db: object) -> '_Query':
+    def using_db(self, _db: object) -> _Query:
         return self
 
     async def first(self) -> object:
