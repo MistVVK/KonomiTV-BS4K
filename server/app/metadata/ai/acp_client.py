@@ -2105,11 +2105,16 @@ def _find_model_config_id(session_result: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _parseAcpModelCatalog(session_result: Mapping[str, Any]) -> AcpModelCatalog:
-    """session/new の models 広告を検証してモデル一覧へ変換する。
+def _parseAcpModelCatalog(
+    session_result: Mapping[str, Any],
+    *,
+    backend_kind: str,
+) -> AcpModelCatalog:
+    """session/new の provider 固有広告を検証してモデル一覧へ変換する。
 
     Args:
         session_result: ACP agent が返した session/new result。
+        backend_kind: 広告形式を固定する ACP バックエンド種別。
 
     Returns:
         agent が広告したモデル ID・表示名と現在のモデル ID。
@@ -2118,11 +2123,42 @@ def _parseAcpModelCatalog(session_result: Mapping[str, Any]) -> AcpModelCatalog:
         _AcpProtocolError: 広告が欠落・空・不正・重複している場合。
     """
 
-    models_payload = session_result.get('models')
-    if not isinstance(models_payload, dict):
-        raise _AcpProtocolError('ACP agent did not advertise models.')
-    current_model_id = models_payload.get('currentModelId')
-    available_models = models_payload.get('availableModels')
+    if backend_kind == 'AcpCodex':
+        # Codex の models は model[effort] の直積だが、設定は model と effort を別々に保持する。
+        # session/set_config_option と同じ model selector の値だけを候補として採用する。
+        config_options = session_result.get('configOptions')
+        if not isinstance(config_options, list):
+            raise _AcpProtocolError('ACP agent did not advertise model configuration options.')
+        model_config_options = [
+            option
+            for option in config_options
+            if (
+                isinstance(option, dict) and
+                isinstance(option.get('id'), str) and
+                (option.get('category') == 'model' or option['id'] in {'model', 'models'})
+            )
+        ]
+        if len(model_config_options) != 1:
+            raise _AcpProtocolError('ACP agent advertised an ambiguous model configuration option.')
+        models_payload = model_config_options[0]
+        if models_payload.get('type') != 'select':
+            raise _AcpProtocolError('ACP agent advertised an invalid model configuration option.')
+        current_model_id = models_payload.get('currentValue')
+        available_models = models_payload.get('options')
+        model_id_key = 'value'
+        model_name_key = 'name'
+    elif backend_kind == 'AcpGrok':
+        # Grok は session/new.models の opaque ID をそのまま session/set_model へ渡す。
+        models_payload = session_result.get('models')
+        if not isinstance(models_payload, dict):
+            raise _AcpProtocolError('ACP agent did not advertise models.')
+        current_model_id = models_payload.get('currentModelId')
+        available_models = models_payload.get('availableModels')
+        model_id_key = 'modelId'
+        model_name_key = 'name'
+    else:
+        raise _AcpProtocolError('ACP model catalog was requested for an unsupported backend.')
+
     if (
         not isinstance(current_model_id, str) or
         not 1 <= len(current_model_id) <= 255 or
@@ -2137,8 +2173,8 @@ def _parseAcpModelCatalog(session_result: Mapping[str, Any]) -> AcpModelCatalog:
     for advertised_model in available_models:
         if not isinstance(advertised_model, dict):
             raise _AcpProtocolError('ACP agent advertised an invalid model entry.')
-        model_id = advertised_model.get('modelId')
-        model_name = advertised_model.get('name')
+        model_id = advertised_model.get(model_id_key)
+        model_name = advertised_model.get(model_name_key)
         if (
             not isinstance(model_id, str) or
             not 1 <= len(model_id) <= 255 or
@@ -2500,7 +2536,10 @@ async def _run_acp_session(
                 web_search_performed=False,
                 citations=(),
                 web_search_failed=False,
-                model_catalog=_parseAcpModelCatalog(session_result),
+                model_catalog=_parseAcpModelCatalog(
+                    session_result,
+                    backend_kind=backend_kind,
+                ),
             )
 
         trace.prompt_started = True

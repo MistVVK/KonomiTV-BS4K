@@ -220,16 +220,16 @@ export interface IACPSettings {
     grok: IACPBackendSettings;
 }
 
-/** Grok ACP が session/new で広告したモデル1件。 */
-export interface IACPGrokModel {
+/** Codex / Grok ACP が session/new で広告したモデル1件。 */
+export interface IACPModel {
     model_id: string;
     model_name: string;
 }
 
-/** Grok ACP が session/new で広告したモデル一覧。 */
-export interface IACPGrokModelCatalog {
+/** Codex / Grok ACP が session/new で広告したモデル一覧。 */
+export interface IACPModelCatalog {
     current_model_id: string;
-    models: IACPGrokModel[];
+    models: IACPModel[];
 }
 
 /** 認証内容を含まない ACP 共有資格情報状態。 */
@@ -553,15 +553,16 @@ export default class AIBackend {
         return true;
     }
 
-    /** Grok ACP が session/new で広告したモデル一覧を取得する。 */
-    static async fetchACPGrokModels(): Promise<IACPGrokModelCatalog | null> {
-        const response = await APIClient.get<IACPGrokModelCatalog>(
-            '/ai-backends/acp-models/grok',
+    /** Codex / Grok ACP が session/new で広告したモデル一覧を取得する。 */
+    static async fetchACPModels(provider: 'codex' | 'grok'): Promise<IACPModelCatalog | null> {
+        const response = await APIClient.get<IACPModelCatalog>(
+            `/ai-backends/acp-models/${provider}`,
             // agent の initialize と session/new、process 回収を待つ。
             {timeout: 70 * 1000},
         );
         if (response.type === 'error') {
-            APIClient.showGenericError(response, 'Grok ACP のモデル候補を取得できませんでした。');
+            const provider_name = provider === 'codex' ? 'Codex' : 'Grok';
+            APIClient.showGenericError(response, `${provider_name} ACP のモデル候補を取得できませんでした。`);
             return null;
         }
         return response.data;

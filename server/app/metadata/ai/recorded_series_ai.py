@@ -1117,12 +1117,12 @@ def IsACPOperationRunning() -> bool:
 
 
 async def GetAcpModelCatalog(
-    backend_kind: Literal['AcpGrok'],
+    backend_kind: Literal['AcpCodex', 'AcpGrok'],
 ) -> AcpModelCatalog:
-    """Grok ACP のモデル広告を公開 facade の排他境界内で取得する。
+    """Codex / Grok ACP のモデル広告を公開 facade の排他境界内で取得する。
 
     Args:
-        backend_kind: モデル広告を取得する Grok ACP backend。
+        backend_kind: モデル広告を取得する ACP backend。
 
     Returns:
         session/new が広告したモデル一覧と現在値。

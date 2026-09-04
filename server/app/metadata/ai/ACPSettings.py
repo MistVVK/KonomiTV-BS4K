@@ -129,7 +129,7 @@ class ACPBackendSettings(BaseModel):
 
     # プロバイダ種別。正規化に使用し、JSON には保存しない。
     backend_kind: Annotated[ACPBackendKind, Field(exclude=True)] = 'AcpCodex'
-    # Codex は KonomiTV の固定候補、Grok は ACP agent が広告した opaque ID を保存する。
+    # Codex / Grok とも ACP agent が広告した ID を保存する。Codex は推論深さを ID から分離する。
     model: Annotated[str | None, Field(max_length=255)] = None
     # Codex: Low…Ultra / Grok: Low…High。未設定時は backend 既定へ補完する。
     reasoning_effort: Annotated[AcpReasoningEffort | None, Field()] = None

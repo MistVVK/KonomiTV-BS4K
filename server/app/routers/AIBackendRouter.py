@@ -439,8 +439,8 @@ class ACPBackendConnectionTestRequest(BaseModel):
     ] = 'CandidateSelection'
 
 
-class ACPGrokModelResponse(BaseModel):
-    """Grok ACP が広告したモデル1件。"""
+class ACPModelResponse(BaseModel):
+    """Codex / Grok ACP が広告したモデル1件。"""
 
     model_config = ConfigDict(extra='forbid')
 
@@ -448,13 +448,13 @@ class ACPGrokModelResponse(BaseModel):
     model_name: Annotated[str, Field(min_length=1, max_length=255)]
 
 
-class ACPGrokModelCatalogResponse(BaseModel):
-    """Grok ACP の session/new から取得したモデル一覧。"""
+class ACPModelCatalogResponse(BaseModel):
+    """Codex / Grok ACP の session/new から取得したモデル一覧。"""
 
     model_config = ConfigDict(extra='forbid')
 
     current_model_id: Annotated[str, Field(min_length=1, max_length=255)]
-    models: list[ACPGrokModelResponse]
+    models: list[ACPModelResponse]
 
 
 def _httpErrorFromOpenCode(error: OpenCodeCLIError) -> HTTPException:
@@ -1535,37 +1535,30 @@ async def ACPBackendSettingsAPI(
         ) from error
 
 
-@router.get(
-    '/acp-models/grok',
-    summary='Grok ACP モデル一覧取得 API',
-    response_model=ACPGrokModelCatalogResponse,
-)
-async def ACPGrokModelListAPI(
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-) -> ACPGrokModelCatalogResponse:
-    """Grok ACP の session/new が広告したモデルだけを返す。
+async def _GetACPModelCatalogResponse(
+    backend_kind: Literal['AcpCodex', 'AcpGrok'],
+) -> ACPModelCatalogResponse:
+    """指定 ACP の session/new が広告したモデルだけを返す。
 
     Args:
-        response: Cache-Control ヘッダーを設定するレスポンス。
-        _current_user: 管理者認証済みのユーザー。
+        backend_kind: モデル広告を取得する ACP バックエンド種別。
 
     Returns:
-        Grok ACP が広告したモデル一覧と現在値。
+        ACP agent が広告したモデル一覧と現在値。
 
     Raises:
         HTTPException: 認証未取り込み、ACP 実行中、または広告取得失敗の場合。
     """
 
-    response.headers.update(NO_STORE_HEADERS)
     # モデル広告も ACP process を起動するため、接続試験と同じ認証・直列実行条件を守る。
-    preflight_error = _ACPBackendConnectionTestPreflightError('AcpGrok')
+    preflight_error = _ACPBackendConnectionTestPreflightError(backend_kind)
     if preflight_error is not None:
         error_code, _ = preflight_error
         if error_code == 'ACPAuthenticationUnavailable':
+            provider_name = 'Codex' if backend_kind == 'AcpCodex' else 'Grok'
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail='Grok ACP authentication is unavailable.',
+                detail=f'{provider_name} ACP authentication is unavailable.',
                 headers=NO_STORE_HEADERS,
             )
         raise HTTPException(
@@ -1575,9 +1568,12 @@ async def ACPGrokModelListAPI(
         )
 
     try:
-        catalog = await GetAcpModelCatalog('AcpGrok')
+        catalog = await GetAcpModelCatalog(backend_kind)
     except RecordedSeriesAIError as error:
-        logging.error(f'[ACPGrokModelListAPI] Failed to load model catalog ({error.code}).')
+        logging.error(
+            f'[_GetACPModelCatalogResponse] Failed to load {backend_kind} model catalog '
+            f'({error.code}).'
+        )
         if error.code in {'Timeout', 'HardTimeout'}:
             response_status = status.HTTP_504_GATEWAY_TIMEOUT
         elif error.code == 'HostCLIStartFailed':
@@ -1586,20 +1582,66 @@ async def ACPGrokModelListAPI(
             response_status = status.HTTP_502_BAD_GATEWAY
         raise HTTPException(
             status_code=response_status,
-            detail='Failed to load the Grok ACP model catalog.',
+            detail='Failed to load the ACP model catalog.',
             headers=NO_STORE_HEADERS,
         ) from error
 
-    return ACPGrokModelCatalogResponse(
+    return ACPModelCatalogResponse(
         current_model_id=catalog.current_model_id,
         models=[
-            ACPGrokModelResponse(
+            ACPModelResponse(
                 model_id=model.model_id,
                 model_name=model.model_name,
             )
             for model in catalog.models
         ],
     )
+
+
+@router.get(
+    '/acp-models/codex',
+    summary='Codex ACP モデル一覧取得 API',
+    response_model=ACPModelCatalogResponse,
+)
+async def ACPCodexModelListAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPModelCatalogResponse:
+    """Codex ACP が広告したモデル系統だけを返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        推論深さを分離した Codex モデル一覧と現在値。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    return await _GetACPModelCatalogResponse('AcpCodex')
+
+
+@router.get(
+    '/acp-models/grok',
+    summary='Grok ACP モデル一覧取得 API',
+    response_model=ACPModelCatalogResponse,
+)
+async def ACPGrokModelListAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPModelCatalogResponse:
+    """Grok ACP が広告した opaque モデル ID だけを返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        Grok ACP が広告したモデル一覧と現在値。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    return await _GetACPModelCatalogResponse('AcpGrok')
 
 
 @router.put(
