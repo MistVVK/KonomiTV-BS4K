@@ -281,11 +281,11 @@
             </v-window-item>
 
             <v-window-item value="openai-compatible">
-                <OpenAICompatibleBackendSection />
+                <OpenAICompatibleBackendSection key="openai-compatible-1" />
             </v-window-item>
 
             <v-window-item value="openai-compatible-2">
-                <OpenAICompatibleBackendSection :backend-slot="2" />
+                <OpenAICompatibleBackendSection key="openai-compatible-2" :backend-slot="2" />
             </v-window-item>
 
             <v-window-item value="acp-codex">
