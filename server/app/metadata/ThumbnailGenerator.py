@@ -767,7 +767,7 @@ class ThumbnailGenerator:
                             if packet_index >= self.FRAME_EXTRACTION_MAX_DEMUX_PACKETS:
                                 break
                             for decoded_frame in packet.decode():
-                                frame = cast(av.VideoFrame, decoded_frame)
+                                frame = decoded_frame
                                 break
                             if frame is not None:
                                 break
