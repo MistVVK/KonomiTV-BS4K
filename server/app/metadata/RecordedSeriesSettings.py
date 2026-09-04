@@ -282,6 +282,22 @@ class RecordedSeriesSettingsStore:
 
         with cls._lock:
             validated = RecordedSeriesSettings.model_validate(settings.model_dump())
+            # OpenCode は登録済み service ごとに選択する。AI を一時的に無効化していても、
+            # 保存値へダミー UUID や削除済み service を残さない。
+            from app.metadata.ai.AIBackendSettings import AIBackendSettingsStore
+            if validated.ai_backend == 'OpenCode':
+                primary_service_id = validated.ai_backend_service_id
+                if primary_service_id is None:
+                    raise ValueError('主系 OpenCode service が選択されていません。')
+                if AIBackendSettingsStore.getService(primary_service_id) is None:
+                    raise ValueError('主系 OpenCode service が登録されていません。')
+            if validated.ai_fallback_backend == 'OpenCode':
+                fallback_service_id = validated.ai_fallback_backend_service_id
+                if fallback_service_id is None:
+                    raise ValueError('予備 OpenCode service が選択されていません。')
+                if AIBackendSettingsStore.getService(fallback_service_id) is None:
+                    raise ValueError('予備 OpenCode service が登録されていません。')
+
             # AI を有効にして予備へ切り替える設定は、障害発生時に初めて認証不足が
             # 判明しないよう保存時点で拒否する。AI 無効時は設定順序を妨げない。
             if (

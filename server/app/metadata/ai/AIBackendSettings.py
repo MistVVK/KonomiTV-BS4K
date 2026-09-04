@@ -440,8 +440,8 @@ class AIBackendSettingsStore:
     SETTINGS_PATH = DATA_DIR / 'ai-backend-settings.json'
     SECRETS_PATH = DATA_DIR / 'secrets' / 'ai-api-keys.json'
 
+    # 件数では制限せず、秘密ファイル全体の byte 上限で異常な入力サイズだけを拒否する。
     _SECRETS_MAX_BYTES = 256 * 1024
-    _SECRETS_MAX_ENTRIES = 64
     _API_KEY_MAX_LENGTH = 8192
     _lock = threading.RLock()
 
@@ -691,8 +691,6 @@ class AIBackendSettingsStore:
         # 旧 recorded-series-api.key 形式を拒否
         if set(data.keys()) == {'api_base_url', 'api_key'}:
             raise cls._invalidSecrets()
-        if len(data) > cls._SECRETS_MAX_ENTRIES:
-            raise cls._invalidSecrets()
         result: dict[str, str] = {}
         for raw_id, raw_key in data.items():
             if isinstance(raw_id, str) is False or isinstance(raw_key, str) is False:
@@ -717,8 +715,6 @@ class AIBackendSettingsStore:
                 cls.SECRETS_PATH.unlink()
                 cls._fsyncParentDirectory(cls.SECRETS_PATH)
             return
-        if len(secrets_map) > cls._SECRETS_MAX_ENTRIES:
-            raise cls._invalidSecrets()
         content = json.dumps(secrets_map, ensure_ascii=False, indent=4) + '\n'
         if len(content.encode('utf-8')) > cls._SECRETS_MAX_BYTES:
             raise cls._invalidSecrets()

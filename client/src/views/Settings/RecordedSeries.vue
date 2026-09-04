@@ -76,34 +76,29 @@
                 <div class="settings__item-heading">バックエンド</div>
                 <div class="settings__item-label">
                     シリーズ補完・話数 Web 検索・Bangumi 候補選択に最初に使うバックエンドを選びます。<br>
-                    OpenCode は「設定 → AIバックエンド」で登録した service を使います。<br>
+                    OpenCode は「設定 → AIバックエンド」で登録した service ごとに選べます。<br>
                     2つの OpenAI 互換 API は OpenCode を経由せず、それぞれ保存済みの HTTP 接続を使います。<br>
                     ACP / Codex・Grok はホスト上の CLI を起動します。<br>
                     Web 検索の接続確認は AIバックエンド画面から行えます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
-                    :items="ai_backend_options" item-title="title" item-value="value"
-                    v-model="settings.ai_backend" />
+                    :items="primary_ai_backend_options" item-title="title" item-value="value"
+                    :error-messages="primary_backend_error"
+                    v-model="primary_backend_target" />
             </div>
 
-            <!-- OpenCode service 選択 -->
+            <!-- OpenCode の接続情報は AI バックエンドページだけで管理する -->
             <template v-if="settings.ai_backend === 'OpenCode'">
             <div class="settings__item">
-                <div class="settings__item-heading">OpenCode service</div>
+                <div class="settings__item-heading">OpenCode service の接続</div>
                 <div class="settings__item-label">
-                    AI バックエンド画面で登録した service を選びます。API キーや月次上限はそちらで管理します。<br>
+                    API キー・モデル・月次上限は「AIバックエンド」ページで管理します。<br>
                 </div>
                 <v-btn class="settings__save-button mt-3" variant="flat" to="/settings/server/ai-backends">
                     <Icon icon="fluent:settings-20-regular" class="mr-2" width="21px" />
                     AIバックエンド設定を開く
                 </v-btn>
-                <v-select class="settings__item-form" color="primary" variant="outlined"
-                    :density="is_form_dense ? 'compact' : 'default'"
-                    :items="opencode_services" item-title="title" item-value="value"
-                    :error-messages="opencode_service_error"
-                    no-data-text="登録済み service がありません"
-                    v-model="settings.ai_backend_service_id" />
             </div>
             </template>
 
@@ -162,25 +157,16 @@
                     </div>
                     <v-select class="settings__item-form" color="primary" variant="outlined"
                         :density="is_form_dense ? 'compact' : 'default'"
-                        :items="ai_backend_options" item-title="title" item-value="value"
-                        :error-messages="fallback_backend_error || (
-                            settings.ai_fallback_backend !== 'OpenCode' ? fallback_auth_error : ''
-                        )"
-                        v-model="settings.ai_fallback_backend" />
+                        :items="fallback_ai_backend_options" item-title="title" item-value="value"
+                        :error-messages="fallback_backend_error || fallback_opencode_service_error ||
+                            fallback_auth_error"
+                        v-model="fallback_backend_target" />
                 </div>
                 <template v-if="settings.ai_fallback_backend === 'OpenCode'">
                     <div class="settings__item">
-                        <div class="settings__item-heading">予備 OpenCode service</div>
+                        <div class="settings__item-heading">予備 OpenCode service の接続</div>
                         <div class="settings__item-label">
-                            予備として使う OpenCode service を選びます。参照中の service は削除できません。<br>
-                        </div>
-                        <v-select class="settings__item-form" color="primary" variant="outlined"
-                            :density="is_form_dense ? 'compact' : 'default'"
-                            :items="opencode_services" item-title="title" item-value="value"
-                            :error-messages="fallback_opencode_service_error || fallback_auth_error"
-                            no-data-text="登録済み service がありません"
-                            v-model="settings.ai_fallback_backend_service_id" />
-                        <div class="settings__item-label mt-2">
+                            接続情報は「AIバックエンド」ページで管理します。参照中の service は削除できません。<br>
                             認証状態: {{ fallback_auth_configured ? '設定済み' : '未設定' }}
                         </div>
                     </div>
@@ -431,12 +417,34 @@ import Utils, { dayjs } from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
 
 
-const ai_backend_options: {title: string; value: AIBackendKind;}[] = [
-    {title: 'OpenCode（AIバックエンド service）', value: 'OpenCode'},
-    {title: 'OpenAI 互換 API（直接 HTTP）', value: 'OpenAICompatible'},
-    {title: 'OpenAI 互換 API 2（直接 HTTP）', value: 'OpenAICompatible2'},
-    {title: 'ACP / Codex', value: 'AcpCodex'},
-    {title: 'ACP / Grok Build', value: 'AcpGrok'},
+interface AIBackendOption {
+    title: string;
+    value: string;
+    backend: AIBackendKind;
+    serviceId: string | null;
+}
+const fixed_ai_backend_options: AIBackendOption[] = [
+    {
+        title: 'OpenAI 互換 API（直接 HTTP）',
+        value: 'OpenAICompatible',
+        backend: 'OpenAICompatible',
+        serviceId: null,
+    },
+    {
+        title: 'OpenAI 互換 API 2（直接 HTTP）',
+        value: 'OpenAICompatible2',
+        backend: 'OpenAICompatible2',
+        serviceId: null,
+    },
+    {title: 'ACP / Codex', value: 'AcpCodex', backend: 'AcpCodex', serviceId: null},
+    {title: 'ACP / Grok Build', value: 'AcpGrok', backend: 'AcpGrok', serviceId: null},
+];
+const supported_ai_backend_kinds: AIBackendKind[] = [
+    'OpenCode',
+    'OpenAICompatible',
+    'OpenAICompatible2',
+    'AcpCodex',
+    'AcpGrok',
 ];
 const ai_failure_recovery_options: {title: string; value: AIFailureRecoveryStrategy;}[] = [
     {title: 'Fail（追加試行なし）', value: 'Fail'},
@@ -467,6 +475,15 @@ const settings = ref<IRecordedSeriesSettings>({
 // 一括判定は未保存のフォーム値ではなく、サーバーに保存済みの AI 設定だけを利用する。
 const saved_settings = ref<IRecordedSeriesSettings | null>(null);
 const opencode_services = ref<{title: string; value: string; authConfigured: boolean;}[]>([]);
+const ai_backend_options = computed<AIBackendOption[]>(() => [
+    ...opencode_services.value.map(service => ({
+        title: `OpenCode / ${service.title}`,
+        value: `OpenCode:${service.value}`,
+        backend: 'OpenCode' as const,
+        serviceId: service.value,
+    })),
+    ...fixed_ai_backend_options,
+]);
 const openai_compatible_settings = ref<IOpenAICompatibleSettings | null>(null);
 const openai_compatible_2_settings = ref<IOpenAICompatibleSettings | null>(null);
 const acp_credential_status = ref<IACPBackendCredentialStatus | null>(null);
@@ -500,10 +517,72 @@ let episode_backfill_abort_controller: AbortController | null = null;
 let status_polling_timer: number | null = null;
 
 
-const opencode_service_error = computed(() => {
+/** API の2フィールドを、画面上の1つの選択値へ変換する。 */
+function backendTargetValue(backend: AIBackendKind | null, serviceId: string | null): string {
+    if (backend === null) return '';
+    if (backend === 'OpenCode') return serviceId === null ? '' : `OpenCode:${serviceId}`;
+    return backend;
+}
+
+/** 一覧から選んだ1ターゲットを既存の backend / service_id フィールドへ分離する。 */
+function resolveBackendTarget(target: string): AIBackendOption | null {
+    return ai_backend_options.value.find(option => option.value === target) ?? null;
+}
+
+const primary_backend_target = computed<string>({
+    get: () => backendTargetValue(settings.value.ai_backend, settings.value.ai_backend_service_id),
+    set: (target) => {
+        const option = resolveBackendTarget(target);
+        if (option === null) return;
+        settings.value.ai_backend = option.backend;
+        settings.value.ai_backend_service_id = option.serviceId;
+    },
+});
+const fallback_backend_target = computed<string>({
+    get: () => backendTargetValue(
+        settings.value.ai_fallback_backend,
+        settings.value.ai_fallback_backend_service_id,
+    ),
+    set: (target) => {
+        const option = resolveBackendTarget(target);
+        if (option === null) return;
+        settings.value.ai_fallback_backend = option.backend;
+        settings.value.ai_fallback_backend_service_id = option.serviceId;
+    },
+});
+const primary_ai_backend_options = computed(() => ai_backend_options.value.map(option => ({
+    ...option,
+    props: {
+        disabled: (
+            settings.value.ai_failure_recovery_strategy === 'FallbackBackend'
+            && areBackendTargetsIdentical(
+                option.backend,
+                option.serviceId,
+                settings.value.ai_fallback_backend,
+                settings.value.ai_fallback_backend_service_id,
+            )
+        ),
+    },
+})));
+const fallback_ai_backend_options = computed(() => ai_backend_options.value.map(option => ({
+    ...option,
+    props: {
+        disabled: areBackendTargetsIdentical(
+            settings.value.ai_backend,
+            settings.value.ai_backend_service_id,
+            option.backend,
+            option.serviceId,
+        ),
+    },
+})));
+
+const primary_backend_error = computed(() => {
     if (settings.value.ai_backend !== 'OpenCode') return '';
-    if (settings.value.ai_enabled && !settings.value.ai_backend_service_id) {
+    if (!settings.value.ai_backend_service_id) {
         return 'OpenCode service を選択してください。';
+    }
+    if (opencode_services.value.some(service => service.value === settings.value.ai_backend_service_id) === false) {
+        return '選択中の OpenCode service は登録されていません。';
     }
     return '';
 });
@@ -525,17 +604,15 @@ const fallback_backend_error = computed(() => {
 const fallback_opencode_service_error = computed(() => {
     if (settings.value.ai_failure_recovery_strategy !== 'FallbackBackend') return '';
     if (settings.value.ai_fallback_backend !== 'OpenCode') return '';
-    if (settings.value.ai_enabled && !settings.value.ai_fallback_backend_service_id) {
+    if (!settings.value.ai_fallback_backend_service_id) {
         return '予備 OpenCode service を選択してください。';
     }
     if (
-        settings.value.ai_backend === 'OpenCode'
-        && settings.value.ai_backend_service_id
-        && settings.value.ai_fallback_backend_service_id
-        && settings.value.ai_backend_service_id.toLowerCase()
-            === settings.value.ai_fallback_backend_service_id.toLowerCase()
+        opencode_services.value.some(
+            service => service.value === settings.value.ai_fallback_backend_service_id,
+        ) === false
     ) {
-        return '主系と同じ OpenCode service は予備に選べません。';
+        return '選択中の予備 OpenCode service は登録されていません。';
     }
     return '';
 });
@@ -578,7 +655,7 @@ const fallback_auth_error = computed(() => {
     return fallback_auth_configured.value ? '' : '予備 AI バックエンドの認証を設定してください。';
 });
 const has_settings_validation_error = computed(() =>
-    opencode_service_error.value !== ''
+    primary_backend_error.value !== ''
     || fallback_backend_error.value !== ''
     || fallback_opencode_service_error.value !== ''
     || fallback_auth_error.value !== '',
@@ -661,10 +738,10 @@ function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
 function applyFetchedSettings(fetched_settings: IRecordedSeriesSettings): void {
     // ローリング更新中の旧サーバーや古い mock が廃止済み backend を返しても、
     // 一覧外の値を表示したり任意コマンド設定へ戻ったりしないようクライアントでも fail-closed にする。
-    const is_supported_backend = ai_backend_options.some(option => option.value === fetched_settings.ai_backend);
+    const is_supported_backend = supported_ai_backend_kinds.includes(fetched_settings.ai_backend);
     const is_supported_fallback = (
         fetched_settings.ai_fallback_backend === null
-        || ai_backend_options.some(option => option.value === fetched_settings.ai_fallback_backend)
+        || supported_ai_backend_kinds.includes(fetched_settings.ai_fallback_backend)
     );
     const is_supported_strategy = ai_failure_recovery_options.some(
         option => option.value === fetched_settings.ai_failure_recovery_strategy,
