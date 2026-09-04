@@ -736,10 +736,8 @@ class OpenCodeBackend:
             # Vertex は ADC。OpenCode 側の env/config 前提（Phase 7b）。
             return await self._client.acquireProviderLease(self._service.opencode_provider_id)
         if self._service.auth_mode == 'OAuthSubscription':
-            if (
-                self._service.oauth_connected is False
-                and HasStoredOpenCodeAuth(self._service.opencode_provider_id, auth_type='oauth') is False
-            ):
+            # OAuth は provider-scoped auth entry を唯一の実効状態とし、古い service flag だけでは通さない。
+            if HasStoredOpenCodeAuth(self._service.opencode_provider_id, auth_type='oauth') is False:
                 raise RecordedSeriesAIError('OpenCodeOAuthNotConnected')
             return await self._client.acquireProviderLease(self._service.opencode_provider_id)
         # ApiKey

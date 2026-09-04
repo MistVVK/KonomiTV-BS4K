@@ -169,6 +169,14 @@ class _OpenCodeProcessResult:
     timed_out: bool = False
 
 
+@dataclass(frozen=True)
+class _OpenCodeErrorEvent:
+    """秘密を含まない OpenCode error event の分類。"""
+
+    name: str | None
+    status_code: int | None
+
+
 class _OpenCodeProcessCancelled(Exception):
     """キャンセル時に session ID 回収用 stdout だけを内部伝播する。"""
 
@@ -184,6 +192,27 @@ class _OpenCodeProcessCancelled(Exception):
 
         super().__init__('OpenCode CLI invocation was cancelled.')
         self.stdout = stdout
+
+
+class _OpenCodeProcessOutputLimitExceeded(OpenCodeCLIError):
+    """出力上限到達時に session ID 回収用 stdout だけを内部伝播する。"""
+
+    def __init__(self, stdout: bytes) -> None:
+        """上限内で回収できた標準出力を保持する。
+
+        Args:
+            stdout: 最大 `_OPENCODE_MAX_OUTPUT_BYTES` の NDJSON。
+
+        Returns:
+            None
+        """
+
+        super().__init__('OpenCode CLI output exceeded the safety limit.')
+        self.stdout = stdout
+
+
+class _OpenCodeOutputLimitReached(Exception):
+    """個々の pipe reader が出力上限へ達したことを示す内部 signal。"""
 
 
 # OpenCode は SQLite runtime を共有するため、複数 CLI process を同時起動すると
@@ -245,6 +274,58 @@ async def _StopOpenCodeProcess(process: asyncio.subprocess.Process) -> None:
         pass
 
 
+async def _ReadOpenCodeProcessStream(
+    stream: asyncio.StreamReader,
+    buffer: bytearray,
+) -> None:
+    """subprocess pipe を逐次読みし、累積出力を固定上限内に保つ。
+
+    Args:
+        stream: stdout または stderr の reader。
+        buffer: 呼び出し元が保持する bounded buffer。
+
+    Returns:
+        None
+
+    Raises:
+        _OpenCodeOutputLimitReached: stream が安全上限を超えた場合。
+    """
+
+    while True:
+        remaining = _OPENCODE_MAX_OUTPUT_BYTES - len(buffer)
+        # 上限到達後も1 byteだけ読んで、上限と上限超過を区別する。
+        chunk = await stream.read(min(64 * 1024, remaining + 1))
+        if chunk == b'':
+            return
+        if len(chunk) > remaining:
+            if remaining > 0:
+                buffer.extend(chunk[:remaining])
+            raise _OpenCodeOutputLimitReached()
+        buffer.extend(chunk)
+
+
+async def _FinishOpenCodeProcessTasks(tasks: set[asyncio.Task[Any]]) -> None:
+    """process 停止後の wait / pipe reader task を有限時間で回収する。
+
+    Args:
+        tasks: process wait と stdout / stderr reader の task。
+
+    Returns:
+        None
+    """
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=3.0,
+        )
+    except TimeoutError:
+        # 子孫 process が pipe を保持し続ける異常でも、cleanup を無期限に止めない。
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def _RunOpenCodeProcessUnlocked(
     arguments: list[str],
     *,
@@ -261,7 +342,8 @@ async def _RunOpenCodeProcessUnlocked(
 
     Raises:
         OpenCodeUnavailableError: binary または runtime を準備できない場合。
-        OpenCodeCLIError: 出力上限を超えた場合。
+        OpenCodeCLIError: pipe の読み取りに失敗した場合。
+        _OpenCodeProcessOutputLimitExceeded: 出力上限を超えた場合。
         _OpenCodeProcessCancelled: 呼び出し task がキャンセルされた場合。
     """
 
@@ -285,28 +367,43 @@ async def _RunOpenCodeProcessUnlocked(
 
     assert process.stdout is not None
     assert process.stderr is not None
-    stdout_task = asyncio.create_task(process.stdout.read())
-    stderr_task = asyncio.create_task(process.stderr.read())
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    stdout_task = asyncio.create_task(_ReadOpenCodeProcessStream(process.stdout, stdout_buffer))
+    stderr_task = asyncio.create_task(_ReadOpenCodeProcessStream(process.stderr, stderr_buffer))
+    process_task = asyncio.create_task(process.wait())
+    process_tasks = {process_task, stdout_task, stderr_task}
     timed_out = False
     try:
-        await asyncio.wait_for(process.wait(), timeout=timeout_sec)
-    except TimeoutError:
-        timed_out = True
-        await _StopOpenCodeProcess(process)
+        done, _pending = await asyncio.wait(
+            process_tasks,
+            timeout=timeout_sec,
+            return_when=asyncio.FIRST_EXCEPTION,
+        )
+        task_errors = [
+            task.exception()
+            for task in done
+            if task.cancelled() is False and task.exception() is not None
+        ]
+        if task_errors:
+            await _StopOpenCodeProcess(process)
+            await _FinishOpenCodeProcessTasks(process_tasks)
+            if any(isinstance(error, _OpenCodeOutputLimitReached) for error in task_errors):
+                raise _OpenCodeProcessOutputLimitExceeded(bytes(stdout_buffer))
+            raise OpenCodeCLIError('Failed to read OpenCode CLI output.') from task_errors[0]
+        if len(done) != len(process_tasks):
+            timed_out = True
+            await _StopOpenCodeProcess(process)
+            await _FinishOpenCodeProcessTasks(process_tasks)
     except asyncio.CancelledError:
         await _StopOpenCodeProcess(process)
-        stdout = await stdout_task
-        await stderr_task
-        raise _OpenCodeProcessCancelled(stdout) from None
+        await _FinishOpenCodeProcessTasks(process_tasks)
+        raise _OpenCodeProcessCancelled(bytes(stdout_buffer)) from None
 
-    stdout = await stdout_task
-    stderr = await stderr_task
-    if len(stdout) > _OPENCODE_MAX_OUTPUT_BYTES or len(stderr) > _OPENCODE_MAX_OUTPUT_BYTES:
-        raise OpenCodeCLIError('OpenCode CLI output exceeded the safety limit.')
     return _OpenCodeProcessResult(
         return_code=process.returncode if process.returncode is not None else -1,
-        stdout=stdout,
-        stderr=stderr,
+        stdout=bytes(stdout_buffer),
+        stderr=bytes(stderr_buffer),
         timed_out=timed_out,
     )
 
@@ -333,14 +430,16 @@ def _StatusCodeFromCLIError(stderr: bytes) -> int | None:
     return None
 
 
-def _ParseOpenCodeEvents(stdout: bytes) -> tuple[list[dict[str, Any]], str | None, bool]:
-    """CLI NDJSON から message parts、session ID、error event 有無を取り出す。
+def _ParseOpenCodeEvents(
+    stdout: bytes,
+) -> tuple[list[dict[str, Any]], str | None, _OpenCodeErrorEvent | None]:
+    """CLI NDJSON から parts、session ID、秘密を含まない error 分類を取り出す。
 
     Args:
         stdout: `opencode run --format json` の標準出力。
 
     Returns:
-        (parts, session_id, error_event_observed)。
+        (parts, session_id, error event 分類)。
 
     Raises:
         OpenCodeCLIError: NDJSON が壊れている場合。
@@ -348,7 +447,7 @@ def _ParseOpenCodeEvents(stdout: bytes) -> tuple[list[dict[str, Any]], str | Non
 
     parts: list[dict[str, Any]] = []
     session_id: str | None = None
-    error_observed = False
+    error_event: _OpenCodeErrorEvent | None = None
     for raw_line in stdout.splitlines():
         if raw_line.strip() == b'':
             continue
@@ -360,7 +459,31 @@ def _ParseOpenCodeEvents(stdout: bytes) -> tuple[list[dict[str, Any]], str | Non
             raise OpenCodeCLIError('OpenCode CLI emitted an invalid event.')
         event_type = event.get('type')
         if event_type == 'error':
-            error_observed = True
+            # provider response の本文・message・headers は保持せず、失敗分類に必要な
+            # allowlist 済みフィールドだけを内部値へ写す。
+            error_name: str | None = None
+            error_status_code: int | None = None
+            raw_error = event.get('error')
+            if isinstance(raw_error, dict):
+                raw_error_name = raw_error.get('name')
+                if isinstance(raw_error_name, str) and len(raw_error_name) <= 128:
+                    error_name = raw_error_name
+                raw_error_data = raw_error.get('data')
+                if isinstance(raw_error_data, dict):
+                    raw_status_code = raw_error_data.get('statusCode')
+                    if (
+                        isinstance(raw_status_code, int)
+                        and isinstance(raw_status_code, bool) is False
+                        and 400 <= raw_status_code <= 599
+                    ):
+                        error_status_code = raw_status_code
+            if error_event is None or (
+                error_event.status_code is None and error_status_code is not None
+            ):
+                error_event = _OpenCodeErrorEvent(
+                    name=error_name,
+                    status_code=error_status_code,
+                )
         raw_session_id = event.get('sessionID')
         if isinstance(raw_session_id, str) and raw_session_id.strip() != '':
             normalized_session_id = raw_session_id.strip()
@@ -370,7 +493,7 @@ def _ParseOpenCodeEvents(stdout: bytes) -> tuple[list[dict[str, Any]], str | Non
         part = event.get('part')
         if isinstance(part, dict):
             parts.append(part)
-    return parts, session_id, error_observed
+    return parts, session_id, error_event
 
 
 async def _DeleteOpenCodeSessionUnlocked(session_id: str | None) -> bool:
@@ -681,6 +804,13 @@ class OpenCodeCLI:
                     arguments,
                     timeout_sec=timeout_sec,
                 )
+            except _OpenCodeProcessOutputLimitExceeded as error:
+                session_id = _ExtractOpenCodeSessionIDBestEffort(error.stdout)
+                session_cleaned_up = await _TryDeleteOpenCodeSessionUnlocked(session_id)
+                raise OpenCodeCLIError(
+                    str(error),
+                    session_cleaned_up=session_cleaned_up,
+                ) from error
             except _OpenCodeProcessCancelled as error:
                 session_id = _ExtractOpenCodeSessionIDBestEffort(error.stdout)
                 await _TryDeleteOpenCodeSessionUnlocked(session_id)
@@ -707,7 +837,11 @@ class OpenCodeCLI:
             if process_result.return_code != 0 or error_observed:
                 raise OpenCodeCLIError(
                     'OpenCode CLI invocation failed.',
-                    status_code=_StatusCodeFromCLIError(process_result.stderr),
+                    status_code=(
+                        error_observed.status_code
+                        if error_observed is not None and error_observed.status_code is not None
+                        else _StatusCodeFromCLIError(process_result.stderr)
+                    ),
                     session_cleaned_up=session_cleaned_up,
                 )
             if len(parts) == 0:

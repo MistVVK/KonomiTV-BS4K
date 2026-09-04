@@ -2442,7 +2442,7 @@ async def AIBackendOAuthDisconnectAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> None:
-    """OAuth 接続を切断し、共有が無ければ OpenCode auth を除去する。"""
+    """provider-scoped OAuth 接続を切断する。"""
 
     response.headers.update(NO_STORE_HEADERS)
     service = AIBackendSettingsStore.getService(service_id)
@@ -2458,8 +2458,18 @@ async def AIBackendOAuthDisconnectAPI(
             detail='OAuth disconnect requires auth_mode=OAuthSubscription.',
             headers=NO_STORE_HEADERS,
         )
+    # auth.json は provider-scoped なので、同 provider の service を残したまま token だけ
+    # 共有し続ける service-scoped disconnect は成立しない。token 削除を成功応答の前提にする。
+    client = OpenCodeCLI()
     try:
-        AIBackendSettingsStore.setOAuthConnected(service.service_id, False)
+        await client.deleteAuth(service.opencode_provider_id)
+    except OpenCodeCLIError as error:
+        raise _httpErrorFromOpenCode(error) from error
+
+    # token が消えた時点で能力証明を失効し、古い persisted flag は同 provider 分を一括更新する。
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
+    try:
+        AIBackendSettingsStore.setOAuthProviderDisconnected(service.opencode_provider_id)
     except KeyError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -2473,19 +2483,6 @@ async def AIBackendOAuthDisconnectAPI(
             detail='Failed to disconnect OAuth.',
             headers=NO_STORE_HEADERS,
         ) from error
-
-    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
-
-    try:
-        await _removeOpenCodeAuthIfUnshared(
-            service.opencode_provider_id,
-            # 切断した service 自身は oauth_connected=False なので参照カウントから除外する。
-            excluding_service_id=service.service_id,
-        )
-    except OpenCodeCLIError as error:
-        logging.warning(
-            f'[AIBackendOAuthDisconnectAPI] OpenCode auth removal failed: {error}',
-        )
 
 
 def _OpenCodeConnectionChecksResponse(

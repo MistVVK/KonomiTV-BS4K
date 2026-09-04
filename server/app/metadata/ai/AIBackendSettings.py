@@ -623,22 +623,43 @@ class AIBackendSettingsStore:
             return removed
 
     @classmethod
-    def setOAuthConnected(cls, service_id: str, connected: bool) -> AIBackendService:
-        """OAuth 接続フラグだけを更新する。"""
+    def setOAuthProviderDisconnected(cls, provider_id: str) -> None:
+        """同一 provider を参照する全 OAuth service を1回の保存で切断済みにする。
+
+        Args:
+            provider_id: OpenCode auth entry と対応する provider ID。
+
+        Returns:
+            None
+
+        Raises:
+            KeyError: 対応する OAuth service が存在しない場合。
+        """
 
         with cls._lock:
             document = cls.getDocument()
-            normalized = service_id.strip().lower()
+            normalized = provider_id.strip().lower()
+            matched = False
+            changed = False
             for index, service in enumerate(document.services):
-                if service.service_id != normalized:
+                if (
+                    service.opencode_provider_id != normalized
+                    or service.auth_mode != 'OAuthSubscription'
+                ):
+                    continue
+                matched = True
+                if service.oauth_connected is False:
                     continue
                 data = service.model_dump()
-                data['oauth_connected'] = connected
+                data['oauth_connected'] = False
                 updated = AIBackendService.model_validate(data)
                 document.services[index] = updated
+                changed = True
+            if matched is False:
+                raise KeyError(normalized)
+            if changed:
+                document = AIBackendSettingsDocument.model_validate(document.model_dump())
                 cls.saveDocument(document)
-                return updated
-            raise KeyError(normalized)
 
     # ----- secrets -----
 
@@ -755,12 +776,9 @@ class AIBackendSettingsStore:
         if service.auth_mode == 'ApiKey':
             return cls.hasAPIKey(service.service_id)
         if service.auth_mode == 'OAuthSubscription':
-            # listener-free CLI では、手動配置された既存 OAuth token も正規の認証源として扱う。
+            # OpenCode auth は provider-scoped なので、永続 flag ではなく実在する entry を正本にする。
             from app.metadata.ai.opencode_cli import HasStoredOpenCodeAuth
-            return (
-                service.oauth_connected
-                or HasStoredOpenCodeAuth(service.opencode_provider_id, auth_type='oauth')
-            )
+            return HasStoredOpenCodeAuth(service.opencode_provider_id, auth_type='oauth')
         if service.auth_mode == 'VertexAdc':
             return service.google_cloud_project is not None
         if service.auth_mode == 'NoneLocal':
@@ -771,9 +789,14 @@ class AIBackendSettingsStore:
     def toResponse(cls, service: AIBackendService) -> AIBackendServiceResponse:
         """秘密を含まない応答モデルへ変換する。"""
 
+        auth_configured = cls.isAuthConfigured(service)
+        response_service = service
+        if service.auth_mode == 'OAuthSubscription':
+            # 手動配置 token も UI へ接続済みとして示し、切断操作を必ず公開する。
+            response_service = service.model_copy(update={'oauth_connected': auth_configured})
         return AIBackendServiceResponse(
-            **service.model_dump(),
-            auth_configured=cls.isAuthConfigured(service),
+            **response_service.model_dump(),
+            auth_configured=auth_configured,
             episode_lookup_ready=False,
         )
 
