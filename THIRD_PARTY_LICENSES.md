@@ -1579,7 +1579,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Poetry 1.8.5
+#### Poetry 2.4.2
 
 - Source: <https://github.com/python-poetry/poetry>
 - Fixed revision or artifact: `19a2f7bddb9bdf931a229ea0913a84021f3f9b93`
