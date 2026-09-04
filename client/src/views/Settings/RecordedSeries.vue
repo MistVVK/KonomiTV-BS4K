@@ -84,6 +84,7 @@
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
                     :items="primary_ai_backend_options" item-title="title" item-value="value"
+                    :item-props="backendOptionItemProps"
                     :error-messages="primary_backend_error"
                     v-model="primary_backend_target" />
             </div>
@@ -158,6 +159,7 @@
                     <v-select class="settings__item-form" color="primary" variant="outlined"
                         :density="is_form_dense ? 'compact' : 'default'"
                         :items="fallback_ai_backend_options" item-title="title" item-value="value"
+                        :item-props="backendOptionItemProps"
                         :error-messages="fallback_backend_error || fallback_opencode_service_error ||
                             fallback_auth_error"
                         v-model="fallback_backend_target" />
@@ -527,6 +529,13 @@ function backendTargetValue(backend: AIBackendKind | null, serviceId: string | n
 /** 一覧から選んだ1ターゲットを既存の backend / service_id フィールドへ分離する。 */
 function resolveBackendTarget(target: string): AIBackendOption | null {
     return ai_backend_options.value.find(option => option.value === target) ?? null;
+}
+
+/** Vuetify がラップした選択肢から、主系・予備の重複禁止 props を取り出す。 */
+function backendOptionItemProps(item: unknown): Record<string, unknown> {
+    if (item === null || typeof item !== 'object') return {};
+    const record = item as {raw?: {props?: Record<string, unknown>}; props?: Record<string, unknown>};
+    return record.raw?.props ?? record.props ?? {};
 }
 
 const primary_backend_target = computed<string>({
