@@ -14,30 +14,12 @@
                     </router-link>
                     <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/videos/"
                         :class="{
-                            'navigation__link--active': $route.path.startsWith('/videos'),
+                            'navigation__link--active': $route.path.startsWith('/videos') || $route.path.startsWith('/series'),
                             'navigation__link--icon-only': iconOnly,
                         }"
                         v-ftooltip.right="iconOnly ? 'ビデオをみる' : ''">
                         <Icon class="navigation__link-icon" icon="fluent:movies-and-tv-20-regular" width="26px" />
                         <span v-if="!iconOnly" class="navigation__link-text">ビデオをみる</span>
-                    </router-link>
-                    <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/series/on-air"
-                        :class="{
-                            'navigation__link--active': $route.path.startsWith('/series/on-air'),
-                            'navigation__link--icon-only': iconOnly,
-                        }"
-                        v-ftooltip.right="iconOnly ? '放送中' : ''">
-                        <Icon class="navigation__link-icon" icon="fluent:live-20-regular" width="26px" />
-                        <span v-if="!iconOnly" class="navigation__link-text">放送中</span>
-                    </router-link>
-                    <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/series/"
-                        :class="{
-                            'navigation__link--active': $route.path.startsWith('/series') && $route.path.startsWith('/series/on-air') === false,
-                            'navigation__link--icon-only': iconOnly,
-                        }"
-                        v-ftooltip.right="iconOnly ? 'シリーズ' : ''">
-                        <Icon class="navigation__link-icon" icon="fluent:collections-20-regular" width="26px" />
-                        <span v-if="!iconOnly" class="navigation__link-text">シリーズ</span>
                     </router-link>
                     <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/timetable/"
                         :class="{

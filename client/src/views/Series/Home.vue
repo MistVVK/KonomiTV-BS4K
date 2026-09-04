@@ -5,9 +5,11 @@
             <Navigation />
             <div class="series-home-wrapper">
                 <SPHeaderBar v-model:searchQuery="searchQuery" @search="applySearch" />
+                <KonomiTVBS4KVideoSectionTabs />
                 <div class="series-home">
                     <Breadcrumbs :crumbs="[
                         { name: 'ホーム', path: '/' },
+                        { name: 'ビデオをみる', path: '/videos/' },
                         { name: 'シリーズ', path: '/series/', disabled: true },
                     ]" />
                     <div class="series-home__toolbar">
@@ -66,6 +68,7 @@ import { useRoute, useRouter } from 'vue-router';
 
 import Breadcrumbs from '@/components/Breadcrumbs.vue';
 import HeaderBar from '@/components/HeaderBar.vue';
+import KonomiTVBS4KVideoSectionTabs from '@/components/KonomiTVBS4KVideoSectionTabs.vue';
 import Navigation from '@/components/Navigation.vue';
 import SeriesEpisodeList from '@/components/Series/SeriesEpisodeList.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
@@ -321,9 +324,7 @@ watch(() => route.fullPath, async () => {
     flex-direction: column;
     width: 100%;
     min-width: 0;
-    padding-top: 48px;
     @include smartphone-horizontal {
-        padding-top: 0;
         padding-left: env(safe-area-inset-left);
     }
 }

@@ -11,19 +11,9 @@
             <span class="mt-1">テレビをみる</span>
         </v-btn>
         <v-btn class="bottom-navigation-button" variant="text" stacked to="/videos/"
-            :class="{'v-btn--active': $route.path.startsWith('/videos')}">
+            :class="{'v-btn--active': $route.path.startsWith('/videos') || $route.path.startsWith('/series')}">
             <Icon icon="fluent:movies-and-tv-20-regular" width="30px" />
             <span class="mt-1">ビデオをみる</span>
-        </v-btn>
-        <v-btn class="bottom-navigation-button" variant="text" stacked to="/series/on-air"
-            :class="{'v-btn--active': $route.path.startsWith('/series/on-air')}">
-            <Icon icon="fluent:live-20-regular" width="30px" />
-            <span class="mt-1">放送中</span>
-        </v-btn>
-        <v-btn class="bottom-navigation-button" variant="text" stacked to="/series/"
-            :class="{'v-btn--active': $route.path.startsWith('/series') && $route.path.startsWith('/series/on-air') === false}">
-            <Icon icon="fluent:collections-20-regular" width="30px" />
-            <span class="mt-1">シリーズ</span>
         </v-btn>
         <v-btn class="bottom-navigation-button" variant="text" stacked to="/reservations/"
             :class="{'v-btn--active': $route.path.startsWith('/reservations')}">
