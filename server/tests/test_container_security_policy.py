@@ -325,7 +325,7 @@ def test_acp_clis_come_from_lockfile_and_do_not_install_google_cloud_cli() -> No
     # manifest.env のような二重管理や、テストへのバージョン・ハッシュ値のハードコードは行わない
     # (依存更新のたびにビルドが止まる保守負債になるため)。
     assert not (REPOSITORY_ROOT / 'docker/acp/manifest.env').exists()
-    acp_builder_section = dockerfile.split('FROM node:20.16.0 AS acp-builder', 1)[1].split('FROM ', 1)[0]
+    acp_builder_section = dockerfile.split('FROM node:24.20.0 AS acp-builder', 1)[1].split('FROM ', 1)[0]
     assert 'manifest.env' not in acp_builder_section
 
     dependencies = package_json['dependencies']
@@ -393,7 +393,7 @@ def test_opencode_runtime_comes_from_lockfile_and_binary_only_in_final_image() -
     # バージョンの正本は package.json / package-lock.json のみ（manifest.env の二重管理は行わない）。
     assert not (REPOSITORY_ROOT / 'docker/opencode/manifest.env').exists()
     opencode_section = dockerfile.split(
-        'FROM node:20.16.0 AS opencode-builder', 1,
+        'FROM node:24.20.0 AS opencode-builder', 1,
     )[1].split('FROM ', 1)[0]
     assert 'manifest.env' not in opencode_section
     assert 'npm ci --omit=dev --no-audit --no-fund' in opencode_section

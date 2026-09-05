@@ -252,7 +252,7 @@ RUN KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_ROOT=/opt/thirdparty/FFmpeg8 \
 # クライアントをビルドするステージ
 # --------------------------------------------------------------------------------------------------------------
 
-FROM node:20.16.0 AS client-builder
+FROM node:24.20.0 AS client-builder
 
 WORKDIR /code/client/
 COPY ./client/package.json ./client/yarn.lock /code/client/
@@ -265,7 +265,7 @@ RUN yarn build && \
 # 録画シリーズ ACP CLI を資格情報なしで固定導入するステージ
 # --------------------------------------------------------------------------------------------------------------
 
-FROM node:20.16.0 AS acp-builder
+FROM node:24.20.0 AS acp-builder
 
 # package.json / package-lock.json だけを先に COPY し、dependency layer のキャッシュ境界を明確にする。
 # npm の version / integrity の正本は lockfile のみ。npm ci が registry 取得内容を integrity 検証するため、
@@ -311,7 +311,7 @@ RUN set -eu && \
 # final には SEA 実行バイナリとライセンス断片のみを持ち込み、node_modules は残さない。
 # --------------------------------------------------------------------------------------------------------------
 
-FROM node:20.16.0 AS opencode-builder
+FROM node:24.20.0 AS opencode-builder
 
 # npm の version / integrity の正本は lockfile のみ（ACP builder と同じ方針）。
 WORKDIR /opt/konomitv-bs4k-opencode
