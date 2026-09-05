@@ -45,8 +45,10 @@
                                     </div>
                                 </button>
                                 <div v-if="isSlotExpanded(slot.series.id, day.weekday, slotIndex)"
-                                    class="series-onair__detail">
-                                    <SeriesEpisodeList :seriesId="slot.series.id" />
+                                    class="series-onair__detail-slot">
+                                    <div class="series-onair__detail">
+                                        <SeriesEpisodeList :seriesId="slot.series.id" />
+                                    </div>
                                 </div>
                             </template>
                         </div>
@@ -195,6 +197,7 @@ watch(() => route.params.id, async () => {
 }
 
 .series-onair__grid {
+    position: relative;
     display: grid;
     grid-template-columns: repeat(7, minmax(0, 1fr));
     align-items: start;
@@ -298,11 +301,22 @@ watch(() => route.params.id, async () => {
     font-size: 11px;
 }
 
-.series-onair__detail {
+// 詳細の高さは選択した曜日だけに確保し、同じ曜日の後続ボタンとの重なりを避ける。
+.series-onair__detail-slot {
     height: clamp(320px, 50vh, 480px);
+}
+
+.series-onair__detail {
+    // 横幅は grid を基準に広げ、top を指定しないことで縦位置はボタン直下の slot に従う。
+    position: absolute;
+    z-index: 1;
+    right: 0;
+    left: 0;
+    height: inherit;
     padding: 4px 8px 12px;
     border: 1px solid rgb(var(--v-theme-background-lighten-2));
     border-radius: 8px;
+    background: rgb(var(--v-theme-background));
     overflow-y: auto;
 }
 
