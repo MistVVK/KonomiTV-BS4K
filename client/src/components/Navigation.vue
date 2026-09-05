@@ -100,7 +100,8 @@
                             </small>
                         </router-link>
                         <div v-if="!iconOnly && (analysisTasksStore.activeTaskGroups.length > 0 ||
-                            analysisTasksStore.seriesAIFallbackStatus !== null)"
+                            analysisTasksStore.seriesAIFallbackStatus?.state === 'Running' ||
+                            analysisTasksStore.seriesAIFallbackStatus?.state === 'Stopped')"
                             class="navigation-analysis__tasks">
                             <button v-for="group in analysisTasksStore.activeTaskGroups" :key="group.task_type"
                                 v-ripple type="button" class="navigation-analysis__task"
@@ -115,7 +116,8 @@
                                     rounded :model-value="group.progress * 100" />
                                 <v-progress-linear v-else class="mt-1" color="primary" height="4" rounded indeterminate />
                             </button>
-                            <button v-if="analysisTasksStore.seriesAIFallbackStatus !== null" v-ripple type="button"
+                            <button v-if="analysisTasksStore.seriesAIFallbackStatus?.state === 'Running' ||
+                                analysisTasksStore.seriesAIFallbackStatus?.state === 'Stopped'" v-ripple type="button"
                                 class="navigation-analysis__task" aria-label="シリーズ AI 補完の現在の処理を表示"
                                 @click="openActiveAnalysisTaskDialog('SeriesAIFallback')">
                                 <div class="navigation-analysis__task-line">
