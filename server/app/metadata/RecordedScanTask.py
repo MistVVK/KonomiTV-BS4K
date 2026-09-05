@@ -15,6 +15,7 @@ from typing import ClassVar, Literal, cast
 import anyio
 from fastapi import HTTPException, status
 from tortoise import transactions
+from tortoise.context import TortoiseContext
 from tortoise.exceptions import IntegrityError
 from watchfiles import Change, awatch
 from watchfiles.filters import DefaultFilter
@@ -1242,11 +1243,14 @@ class RecordedScanTask:
         """同期MetadataAnalyzerを専用プロセスで実行し、キャンセル時も確実に回収する。"""
 
         loop = asyncio.get_running_loop()
-        analyzer = MetadataAnalyzer(pathlib.Path(str(file_path)))
         executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
         should_wait_executor = True
         try:
-            return await loop.run_in_executor(executor, analyzer.analyze)
+            return await loop.run_in_executor(
+                executor,
+                RecordedScanTask._analyzeMetadataForMultiProcess,
+                pathlib.Path(str(file_path)),
+            )
         except asyncio.CancelledError:
             should_wait_executor = False
             await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
@@ -1254,6 +1258,24 @@ class RecordedScanTask:
         finally:
             if should_wait_executor is True:
                 await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
+
+
+    @staticmethod
+    def _analyzeMetadataForMultiProcess(file_path: pathlib.Path) -> schemas.RecordedProgram | None:
+        """
+        子プロセス専用の ORM context で同期メタデータ解析を実行する。
+
+        Args:
+            file_path (pathlib.Path): 解析対象の録画ファイル。
+
+        Returns:
+            schemas.RecordedProgram | None: 解析結果。メタデータを取得できなければ None。
+        """
+
+        # forkserver の子プロセスは親の TortoiseContext を引き継がないため、
+        # connections proxy を使う地デジのチャンネル番号算出より先に worker 固有の context を有効化する。
+        with TortoiseContext():
+            return MetadataAnalyzer(file_path).analyze()
 
 
     @staticmethod
