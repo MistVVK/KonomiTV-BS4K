@@ -315,10 +315,17 @@ async def ListOnAirDays() -> list[dict[str, object]]:
         start_time__gte=now,
         start_time__lte=now + timedelta(days=ON_AIR_EPG_LOOKAHEAD_DAYS),
     ).all()
-    featured_start = now - timedelta(hours=3)
-    featured_end = (now + timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
-    if featured_end <= featured_start:
-        featured_end += timedelta(days=1)
+    # 深夜に翌日の夜枠まで注目扱いにしないよう、夜間は当該夜の 20:00〜翌 05:00 に固定する。
+    if now.hour >= 20 or now.hour < 5:
+        featured_start = now.replace(hour=20, minute=0, second=0, microsecond=0)
+        # 日付が変わった後も、前日 20:00 に始まった放送日の窓を使う。
+        if now.hour < 5:
+            featured_start -= timedelta(days=1)
+        featured_end = featured_start + timedelta(hours=9)
+    else:
+        # 日中は従来どおり、直近 3 時間から翌 05:00 までを注目扱いにする。
+        featured_start = now - timedelta(hours=3)
+        featured_end = (now + timedelta(days=1)).replace(hour=5, minute=0, second=0, microsecond=0)
 
     days: list[dict[str, object]] = [{'weekday': weekday, 'slots': []} for weekday in range(7)]
     seen_series_weekdays: set[tuple[int, int]] = set()
@@ -335,7 +342,8 @@ async def ListOnAirDays() -> list[dict[str, object]]:
             continue
         seen_series_weekdays.add((series_id, weekday))
         summary = await BuildSeriesSummary(series)
-        slot_datetime = NextSlotDatetime(now, weekday, hour, minute)
+        # 前日分を含む当該夜の枠を翌週へ送らないよう、注目窓の開始からスロット時刻を求める。
+        slot_datetime = NextSlotDatetime(featured_start, weekday, hour, minute)
         is_featured = featured_start <= slot_datetime < featured_end
         day_slots = days[weekday]['slots']
         assert isinstance(day_slots, list)
