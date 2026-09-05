@@ -28,6 +28,11 @@
                 </div>
             </div>
             <div class="mt-5">
+                <!-- EPG 由来の放送区分を、無料番組でも省略せず表示する -->
+                <div class="program-info__status">
+                    <Icon icon="fluent:tv-20-regular" height="17px" style="margin-left: -2px; margin-right: -1.7px; margin-bottom: -3px;" />
+                    <span class="ml-2">放送区分: {{displayProgram.is_free ? '無料' : '有料'}}</span>
+                </div>
                 <!-- 映像・音声情報 -->
                 <div class="program-info__status" v-if="displayProgram.video_codec && displayProgram.video_resolution">
                     <Icon icon="fluent:video-16-filled" height="17px" style="margin-left: -2px; margin-right: -1.7px; margin-bottom: -3px;" />
