@@ -18,43 +18,38 @@
                         <v-progress-circular color="primary" indeterminate size="30" width="3" />
                     </div>
                     <div v-else class="series-onair__grid">
-                        <template v-for="day in displayDays" :key="day.weekday">
-                            <h2 class="series-onair__weekday"
-                                :style="{gridColumn: String(day.weekday + 1), gridRow: '1'}">
+                        <div v-for="day in displayDays" :key="day.weekday" class="series-onair__day">
+                            <h2 class="series-onair__weekday">
                                 {{WEEKDAY_LABELS[day.weekday]}}
                             </h2>
-                            <div v-if="day.slots.length === 0" class="series-onair__empty"
-                                :style="{gridColumn: String(day.weekday + 1), gridRow: '2'}">
+                            <div v-if="day.slots.length === 0" class="series-onair__empty">
                                 該当なし
                             </div>
-                            <button v-for="(slot, slotIndex) in day.slots"
-                                :key="`${slot.series.id}-${slot.hour}-${slot.minute}`"
-                                type="button" class="series-onair__card"
-                                :style="{
-                                    gridColumn: String(day.weekday + 1),
-                                    gridRow: String(cardGridRow(slotIndex)),
-                                }"
-                                :class="{
-                                    'series-onair__card--featured': slot.is_featured,
-                                    'series-onair__card--expanded': isSlotExpanded(slot.series.id, day.weekday, slotIndex),
-                                }"
-                                :aria-expanded="isSlotExpanded(slot.series.id, day.weekday, slotIndex)"
-                                @click="toggleExpand(slot.series.id, day.weekday, slotIndex)">
-                                <div class="series-onair__card-header">
-                                    <span class="series-onair__time">{{formatSlotLabel(slot.hour, slot.minute)}}</span>
-                                    <span v-if="slot.is_featured" class="series-onair__featured">注目</span>
+                            <template v-for="(slot, slotIndex) in day.slots"
+                                :key="`${slot.series.id}-${slot.hour}-${slot.minute}`">
+                                <button type="button" class="series-onair__card"
+                                    :class="{
+                                        'series-onair__card--featured': slot.is_featured,
+                                        'series-onair__card--expanded': isSlotExpanded(slot.series.id, day.weekday, slotIndex),
+                                    }"
+                                    :aria-expanded="isSlotExpanded(slot.series.id, day.weekday, slotIndex)"
+                                    @click="toggleExpand(slot.series.id, day.weekday, slotIndex)">
+                                    <div class="series-onair__card-header">
+                                        <span class="series-onair__time">{{formatSlotLabel(slot.hour, slot.minute)}}</span>
+                                        <span v-if="slot.is_featured" class="series-onair__featured">注目</span>
+                                    </div>
+                                    <div class="series-onair__name">{{slot.series.title}}</div>
+                                    <div class="series-onair__meta">
+                                        <span>未録画 {{slot.series.unrecorded_count}}</span>
+                                        <span>部分録画 {{slot.series.partial_count}}</span>
+                                    </div>
+                                </button>
+                                <div v-if="isSlotExpanded(slot.series.id, day.weekday, slotIndex)"
+                                    class="series-onair__detail">
+                                    <SeriesEpisodeList :seriesId="slot.series.id" />
                                 </div>
-                                <div class="series-onair__name">{{slot.series.title}}</div>
-                                <div class="series-onair__meta">
-                                    <span>未録画 {{slot.series.unrecorded_count}}</span>
-                                    <span>部分録画 {{slot.series.partial_count}}</span>
-                                </div>
-                            </button>
-                            <div v-if="expandedSlot?.weekday === day.weekday" class="series-onair__detail"
-                                :style="{gridRow: String(expandedSlot.slotIndex + 3)}">
-                                <SeriesEpisodeList :seriesId="expandedSlot.seriesId" />
-                            </div>
-                        </template>
+                            </template>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -106,12 +101,6 @@ const displayDays = computed((): DisplayDay[] => {
     }
     return grouped;
 });
-
-// 詳細行より下のスロットだけを 1 行送って、7 曜日すべての行位置を揃える。
-const cardGridRow = (slotIndex: number): number => {
-    const detailOffset = expandedSlot.value !== null && slotIndex > expandedSlot.value.slotIndex ? 1 : 0;
-    return slotIndex + 2 + detailOffset;
-};
 
 const isSlotExpanded = (seriesId: number, weekday: number, slotIndex: number): boolean => {
     return expandedSlot.value?.seriesId === seriesId
@@ -208,7 +197,6 @@ watch(() => route.params.id, async () => {
 .series-onair__grid {
     display: grid;
     grid-template-columns: repeat(7, minmax(0, 1fr));
-    grid-auto-flow: row;
     align-items: start;
     gap: 10px;
     @include tablet-vertical {
@@ -219,17 +207,21 @@ watch(() => route.params.id, async () => {
     }
 }
 
+// 曜日ごとに独立した縦列にして、展開した詳細の高さをほかの曜日へ波及させない。
+.series-onair__day {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    gap: 10px;
+}
+
 .series-onair__weekday {
     margin: 0;
     font-size: 15px;
     @include tablet-vertical {
-        grid-column: 1 !important;
-        grid-row: auto !important;
         margin-top: 6px;
     }
     @include smartphone-vertical {
-        grid-column: 1 !important;
-        grid-row: auto !important;
         margin-top: 6px;
     }
 }
@@ -242,13 +234,9 @@ watch(() => route.params.id, async () => {
     color: rgb(var(--v-theme-text-darken-1));
     font-size: 11px;
     @include tablet-vertical {
-        grid-column: 1 !important;
-        grid-row: auto !important;
         min-height: 0;
     }
     @include smartphone-vertical {
-        grid-column: 1 !important;
-        grid-row: auto !important;
         min-height: 0;
     }
 }
@@ -270,15 +258,6 @@ watch(() => route.params.id, async () => {
 
     &--expanded {
         background: rgb(var(--v-theme-background-lighten-2));
-    }
-
-    @include tablet-vertical {
-        grid-column: 1 !important;
-        grid-row: auto !important;
-    }
-    @include smartphone-vertical {
-        grid-column: 1 !important;
-        grid-row: auto !important;
     }
 }
 
@@ -320,20 +299,11 @@ watch(() => route.params.id, async () => {
 }
 
 .series-onair__detail {
-    grid-column: 1 / -1;
     height: clamp(320px, 50vh, 480px);
     padding: 4px 8px 12px;
     border: 1px solid rgb(var(--v-theme-background-lighten-2));
     border-radius: 8px;
     overflow-y: auto;
-    @include tablet-vertical {
-        grid-column: 1 !important;
-        grid-row: auto !important;
-    }
-    @include smartphone-vertical {
-        grid-column: 1 !important;
-        grid-row: auto !important;
-    }
 }
 
 </style>
