@@ -2,3 +2,6 @@
 	path = thirdparty-src/tsreadex
 	url = https://github.com/MistVVK/tsreadex.git
 	branch = main
+[submodule "thirdparty-src/tscodecbridge"]
+	path = thirdparty-src/tscodecbridge
+	url = https://github.com/MistVVK/KonomiTV-BS4K-TSCodecBridge.git

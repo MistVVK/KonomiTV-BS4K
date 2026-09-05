@@ -17,7 +17,7 @@ expected_manifest_keys=(
     KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER
     KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME
     KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT
-    KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256
+    KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256
     KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION
     KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION
     KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_CODENAME
@@ -97,8 +97,8 @@ validate_manifest() {
 
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}" != PENDING_* ]] ||
         fail_pending 'replace SOURCE_COMMIT with the published 40-character commit SHA'
-    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}" != PENDING_* ]] ||
-        fail_pending 'replace SOURCE_ARCHIVE_SHA256 with the verified codeload archive SHA-256'
+    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}" != PENDING_* ]] ||
+        fail_pending 'replace SOURCE_TREE_SHA256 with the verified submodule source tree SHA-256'
 
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}" == 'MistVVK' ]] ||
         fail 'repository owner must remain MistVVK'
@@ -112,12 +112,12 @@ validate_manifest() {
         '0000000000000000000000000000000000000000' ]] ||
         fail 'SOURCE_COMMIT must not be the all-zero sentinel'
     require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}" \
+        KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256 \
+        "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}" \
         64
-    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}" != \
+    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}" != \
         '0000000000000000000000000000000000000000000000000000000000000000' ]] ||
-        fail 'SOURCE_ARCHIVE_SHA256 must not be the all-zero sentinel'
+        fail 'SOURCE_TREE_SHA256 must not be the all-zero sentinel'
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
         fail 'CLI_VERSION must be an exact semantic version'
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION}" =~ ^[0-9]+$ ]] ||
@@ -278,11 +278,38 @@ record_builder_packages() {
     done < "${changed_packages_path}"
 }
 
-install_toolchain_and_source() {
-    local bridge_archive="${download_root}/tscodecbridge.tar.gz"
+verify_source_tree() {
+    local source_directory="$1"
+    local actual_source_sha256
+
+    [[ -d "${source_directory}" && ! -L "${source_directory}" ]] ||
+        fail 'Bridge submodule source directory is missing or is a symlink'
+    test -f "${source_directory}/LICENSE" || fail 'Bridge submodule source does not contain LICENSE'
+    test -f "${source_directory}/konomitv-bs4k-tscodecbridge.asd" ||
+        fail 'Bridge submodule source does not contain its ASDF system'
+
+    # 従来の archive と同じく、入力は通常ファイルとディレクトリだけに限定する。
+    # submodule の .git はホスト固有の管理情報なので、Docker context と内容照合の両方から除く。
+    [[ -z "$(find "${source_directory}" -mindepth 1 \
+        -path "${source_directory}/.git" -prune -o ! -type f ! -type d -print -quit)" ]] ||
+        fail 'Bridge submodule source contains an unsupported non-regular entry'
+
+    # Git metadata を持たない Docker 内でも、固定 commit のクリーンな tracked tree と内容を照合する。
+    # 相対パスと各ファイルの SHA-256 を C locale 順で再ハッシュし、欠落・追加・変更を検出する。
+    actual_source_sha256="$(
+        cd -- "${source_directory}"
+        find . -path './.git' -prune -o -type f -print0 |
+            LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
+    )"
+    [[ "${actual_source_sha256}" == "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}" ]] ||
+        fail 'Bridge submodule source tree SHA-256 does not match manifest'
+    printf 'Bridge source commit: %s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
+    printf 'Bridge source tree SHA-256: %s\n' "${actual_source_sha256}"
+}
+
+install_toolchain() {
     local sblint_archive="${download_root}/sblint.tar.gz"
     local mallet_archive="${download_root}/mallet.tar.gz"
-    local bridge_url
     local sblint_url
     local mallet_url
     local installed_mallet_version
@@ -320,17 +347,11 @@ install_toolchain_and_source() {
 
     install -d -m 0755 \
         "${download_root}" \
-        "${source_root}" \
         "${toolchain_root}/sblint" \
         "${toolchain_root}/mallet"
-    bridge_url="https://codeload.github.com/${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}/${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME}/tar.gz/${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
     sblint_url="https://codeload.github.com/cxxxr/sblint/tar.gz/${KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_COMMIT}"
     mallet_url="https://github.com/fukamachi/mallet/releases/download/${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_VERSION}/mallet-${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_VERSION}-linux-x86_64.tar.gz"
 
-    download_verified_archive \
-        "${bridge_url}" \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}" \
-        "${bridge_archive}"
     download_verified_archive \
         "${sblint_url}" \
         "${KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_SOURCE_SHA256}" \
@@ -339,29 +360,20 @@ install_toolchain_and_source() {
         "${mallet_url}" \
         "${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_ARCHIVE_SHA256}" \
         "${mallet_archive}"
-    verify_single_root_archive "${bridge_archive}"
     verify_single_root_archive "${sblint_archive}"
     verify_single_root_archive "${mallet_archive}"
 
-    tar --extract --gzip --file "${bridge_archive}" \
-        --directory "${source_root}" --strip-components 1 --no-same-owner --no-same-permissions
     tar --extract --gzip --file "${sblint_archive}" \
         --directory "${toolchain_root}/sblint" --strip-components 1 --no-same-owner --no-same-permissions
     tar --extract --gzip --file "${mallet_archive}" \
         --directory "${toolchain_root}/mallet" --strip-components 1 --no-same-owner --no-same-permissions
-    test -f "${source_root}/LICENSE" || fail 'Bridge source archive does not contain LICENSE'
-    test -f "${source_root}/konomitv-bs4k-tscodecbridge.asd" ||
-        fail 'Bridge source archive does not contain its ASDF system'
     test -f "${toolchain_root}/sblint/sblint.asd" || fail 'SBLint archive is incomplete'
     test -x "${toolchain_root}/mallet/bin/mallet" || fail 'Mallet archive is incomplete'
     installed_mallet_version="$("${toolchain_root}/mallet/bin/mallet" --version)"
     [[ "${installed_mallet_version}" == "Mallet version ${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_VERSION}" ]] ||
         fail 'Mallet version does not match manifest'
 
-    printf 'Bridge source commit: %s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
-    printf 'Bridge source archive SHA-256: %s\n' \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}"
-    rm -f -- "${bridge_archive}" "${sblint_archive}" "${mallet_archive}"
+    rm -f -- "${sblint_archive}" "${mallet_archive}"
     apt-get clean
     rm -rf -- /var/lib/apt/lists/*
 }
@@ -460,7 +472,7 @@ build_and_package() {
     local observed_mapping_version
 
     validate_manifest
-    test -d "${source_root}" || fail 'Bridge source was not prepared'
+    verify_source_tree "${source_root}"
 
     printf 'Building Bridge source commit: %s\n' \
         "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
@@ -502,13 +514,10 @@ build_and_package() {
         printf 'SOURCE_REPOSITORY\thttps://github.com/%s/%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}" \
             "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME}"
-        printf 'SOURCE_ARCHIVE_URL\thttps://codeload.github.com/%s/%s/tar.gz/%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}" \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME}" \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
+        printf 'SOURCE_SUBMODULE_PATH\tthirdparty-src/tscodecbridge\n'
         printf 'SOURCE_COMMIT\t%s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
-        printf 'SOURCE_ARCHIVE_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}"
+        printf 'SOURCE_TREE_SHA256\t%s\n' \
+            "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}"
         printf 'CLI_VERSION\t%s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION}"
         printf 'TS_MAPPING_VERSION\t%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION}"
@@ -558,8 +567,13 @@ main() {
             [[ -n "${2:-}" ]] || fail 'usage: build.sh verify-archive ARCHIVE'
             verify_single_root_archive "$2"
             ;;
+        verify-source)
+            [[ -n "${2:-}" ]] || fail 'usage: build.sh verify-source DIRECTORY'
+            validate_manifest
+            verify_source_tree "$2"
+            ;;
         prepare)
-            install_toolchain_and_source
+            install_toolchain
             ;;
         build)
             build_and_package
@@ -568,7 +582,7 @@ main() {
             run_ffmpeg_integration
             ;;
         *)
-            fail 'usage: build.sh {validate-manifest|verify-archive|prepare|build|test-ffmpeg-integration}'
+            fail 'usage: build.sh {validate-manifest|verify-archive|verify-source|prepare|build|test-ffmpeg-integration}'
             ;;
     esac
 }

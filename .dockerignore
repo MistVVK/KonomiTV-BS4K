@@ -56,3 +56,7 @@ thirdparty-src/tsreadex/build/
 thirdparty-src/tsreadex/tsreadex
 thirdparty-src/tsreadex/tsreadex-anchor-test
 thirdparty-src/tsreadex/tsreadex.elf
+
+# TSCodecBridge: Git metadata とホスト生成物を除き、固定 submodule の source だけを builder へ渡す
+thirdparty-src/tscodecbridge/.git
+thirdparty-src/tscodecbridge/build/
