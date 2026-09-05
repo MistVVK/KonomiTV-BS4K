@@ -840,8 +840,8 @@ class PlayerController {
         const color_rewrite_session = this.playback_mode === 'Video' ?
             createKonomiTVBS4KColorRewriteSession(playback_hdr_desired) : null;
         // ライブ mpegts の色信号書換えは初回 InitSegment より前に、視聴開始時の HDR 出力へ合わせる。
-        // 切替後は HlgSdrManager が setVideoColorRewrite する。colour/transfer だけの差では
-        // mpegts.js が新しい InitSegment を出さない。
+        // colour/transfer だけの差では mpegts.js が新しい InitSegment を出さないため、
+        // 視聴パネルで HDR 出力を切り替えた際もプレイヤー再起動で初期化し直す。
         const live_mpegts_video_color_rewrite = this.playback_mode === 'Live' ?
             resolveKonomiTVBS4KLiveMpegtsColorRewrite(playback_hdr_desired) : 'None';
 
@@ -1351,7 +1351,7 @@ class PlayerController {
                         // フレームドロップが発生する環境があるため、有限 duration の init segment を使う
                         forceMSEStreamLivenessRecorded: true,
                         // HLG/PQ のブラウザ HDR パス制御。初回 InitSegment より前に開始時モードへ合わせ、
-                        // 以降の切替は HlgSdrManager が setVideoColorRewrite する。
+                        // 視聴パネルからの HDR 出力切替時も再起動を通して新しい MSE へ適用する。
                         videoColorRewrite: live_mpegts_video_color_rewrite,
                         // 再生開始まで 2048KB のバッファを貯める (?)
                         // あまり大きくしすぎてもどうも効果がないようだが、小さくしたり無効化すると特に Safari で不安定になる
@@ -4849,8 +4849,8 @@ class PlayerController {
         });
 
         // HDR 出力のサブパネルを初期化する。選択は視聴中だけの override で、SettingsStore の既定値は書き換えない。
-        // ライブは HlgSdrManager が再起動なしで即時反映し、録画・オフライン保存は色信号を MSE 初期化から
-        // 適用し直すため、再生位置・画質・音声選択を維持したままプレイヤーを再起動する。
+        // ライブも録画・オフライン保存と同じ再起動経路で、色信号を MSE 初期化から適用し直す。
+        // 画質・音声選択、および録画の再生位置は既存の再起動処理で維持する。
         update_hdr_output_panel_height();
         update_hdr_output_display();
         register_sub_panel_activation_handler(hdr_output_item!, (event) => {
@@ -4881,9 +4881,6 @@ class PlayerController {
                     if (output === current) return;
                     player_store.konomitv_bs4k_playback_hdr_output_override = output;
                     update_hdr_output_display();
-                    if (this.playback_mode === 'Live') {
-                        return;
-                    }
                     // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
                     this.player?.setting.hide();
                     player_store.event_emitter.emit('PlayerRestartRequired', {
