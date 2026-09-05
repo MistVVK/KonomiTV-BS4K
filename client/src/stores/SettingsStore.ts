@@ -146,6 +146,7 @@ export interface ITwitterPanelPostTarget {
 export interface ILocalClientSettings extends IClientSettings {
     last_synced_at: number;
     showed_panel_last_time: boolean;
+    konomitv_bs4k_playback_video_codec_default_initialized: boolean;
     selected_twitter_panel_account: {kind: 'Twitter' | 'Bluesky' | 'Linked'; id: number;} | null;
     twitter_panel_post_targets: Record<string, ITwitterPanelPostTarget>;
     twitter_reply_thread_states: Record<string, ITwitterReplyThreadState>;
@@ -300,6 +301,9 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
 
     // 前回視聴画面を開いた際にパネルが表示されていたかどうか (同期無効)
     showed_panel_last_time: true,
+    // このブラウザで工場 AV1 の HW デコード優先初期値を選定済みかどうか (同期無効)
+    // 証拠なし・手動設定による見送りも完了とし、起動や再生のたびに希望を上書きしない。
+    konomitv_bs4k_playback_video_codec_default_initialized: false,
     // 視聴画面 Twitter タブで最後に選択していたアカウント (Twitter / Bluesky / 紐付け の tagged union、同期無効)
     // ID は Twitter / Bluesky / 紐付け それぞれの DB 連番 ID で、別環境間で意味が異なるため同期対象外
     selected_twitter_panel_account: null,
@@ -629,6 +633,7 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
 export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'last_synced_at',
     // showed_panel_last_time: 同期無効
+    // konomitv_bs4k_playback_video_codec_default_initialized: 同期無効
     // selected_twitter_panel_account: 同期無効
     // twitter_panel_post_targets: 同期無効
     // twitter_reply_thread_states: 同期無効
@@ -1255,6 +1260,7 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
             ILocalClientSettingsDefault[konomitv_bs4k_key];
     }
     const konomitv_bs4k_common_boolean_keys = [
+        'konomitv_bs4k_playback_video_codec_default_initialized',
         'konomitv_bs4k_playback_24fps_mode',
         'konomitv_bs4k_playback_24fps_mode_cellular',
         'konomitv_bs4k_playback_24fps_mode_for_bs4k',
@@ -1385,6 +1391,54 @@ const useSettingsStore = defineStore('settings', {
         },
     },
     actions: {
+
+        /**
+         * 初回マウント前に、工場 AV1 の共通映像設定だけをブラウザの HW 優先信号へ一度寄せる。
+         * 同期 normalizer からは呼ばず、main.ts が完了を待ってから初回再生を開始する。
+         * @param selectPreferredCodec IIFE Worker と共有する Store にブラウザ診断を持ち込まないため、起動側から渡すプローブ。
+         */
+        async initializeKonomiTVBS4KPlaybackVideoCodecDefault(
+            selectPreferredCodec: () => Promise<KonomiTVBS4KPlaybackVideoCodec | null>,
+        ): Promise<void> {
+            if (this.settings.konomitv_bs4k_playback_video_codec_default_initialized === true) return;
+
+            const codec_keys = [
+                'konomitv_bs4k_playback_video_codec',
+                'konomitv_bs4k_playback_video_codec_cellular',
+                'konomitv_bs4k_playback_video_codec_for_bs4k',
+                'konomitv_bs4k_playback_video_codec_for_bs4k_cellular',
+            ] as const;
+            let preferred_codec: KonomiTVBS4KPlaybackVideoCodec | null = null;
+            // 1 キーでも手動希望があればプローブも行わず、4 キーをまとめて現状維持する。
+            if (codec_keys.every(key => this.settings[key] === 'av1')) {
+                preferred_codec = await selectPreferredCodec();
+            }
+
+            // 非同期プローブ中に現在の Store へ手動希望が入った場合も、書き換えるのは完了旗だけ。
+            if (codec_keys.some(key => this.settings[key] !== 'av1')) {
+                const settings = {
+                    ...this.settings,
+                    konomitv_bs4k_playback_video_codec_default_initialized: true,
+                };
+                setLocalStorageSettings(settings);
+                this.$patch({settings});
+                return;
+            }
+
+            // 別タブで完了した初期化や保存された希望を上書きしないよう、保存直前に正本を読み直す。
+            const settings = getNormalizedLocalClientSettings(getLocalStorageSettings());
+            if (settings.konomitv_bs4k_playback_video_codec_default_initialized === false) {
+                if (preferred_codec !== null && codec_keys.every(key => settings[key] === 'av1')) {
+                    for (const key of codec_keys) {
+                        settings[key] = preferred_codec;
+                    }
+                }
+                settings.konomitv_bs4k_playback_video_codec_default_initialized = true;
+                // 4 キーと完了旗を一括保存してから Store に公開し、中間の組み合わせを残さない。
+                setLocalStorageSettings(settings);
+            }
+            this.$patch({settings});
+        },
 
         /**
          * 共通再生profileの映像・音声codecを、1回のPinia mutationとして同時に更新する。

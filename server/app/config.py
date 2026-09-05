@@ -80,6 +80,7 @@ class ClientSettings(BaseModel):
     # 0 は未同期の初期値として正当なので、正の値に限定しない
     last_synced_at: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 0.0
     # showed_panel_last_time: 同期無効
+    # konomitv_bs4k_playback_video_codec_default_initialized: 同期無効
     # selected_twitter_panel_account: 同期無効
     # twitter_panel_post_targets: 同期無効
     saved_twitter_hashtags: list[str] = []

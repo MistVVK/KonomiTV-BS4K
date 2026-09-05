@@ -23,6 +23,7 @@ import useSettingsStore, {
 } from '@/stores/SettingsStore';
 import { KONOMITV_BS4K_THEME_OPTIONS } from '@/themes';
 import Utils from '@/utils';
+import { selectKonomiTVBS4KHardwareDecodePreferredCodec } from '@/utils/KonomiTVBS4KBrowserCodecSupport';
 
 
 // スムーズスクロール周りの API の polyfill を適用
@@ -56,137 +57,143 @@ app.use(router);
 // Vuetify を使う
 app.use(vuetify);
 
-// 初回描画より前に、このブラウザへ保存されているテーマを適用する
-// マウント後に切り替えると、起動時に Konomi Classic が一瞬表示されてしまう
-const settings_store = useSettingsStore();
-const applySelectedTheme = (): void => {
-    const selected_theme = KONOMITV_BS4K_THEME_OPTIONS.find(option => option.value === settings_store.settings.ui_theme) ??
-        KONOMITV_BS4K_THEME_OPTIONS[0];
-    vuetify.theme.global.name.value = selected_theme.value;
-    document.documentElement.style.colorScheme = selected_theme.dark ? 'dark' : 'light';
-    document.body.style.backgroundColor = selected_theme.preview.background;
-    document.body.style.color = selected_theme.preview.text;
-    document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute('content', selected_theme.preview.background);
-};
-applySelectedTheme();
-
-// vue-virtual-scroller を使う
-app.use(VueVirtualScroller);
-
-// FloatingVue を使う
-// タッチデバイスでは無効化する
-// ref: https://v-tooltip.netlify.app/guide/config#default-values
-FloatingVue.options.themes.tooltip.triggers = Utils.isTouchDevice() ? [] : ['hover', 'focus', 'touch'];
-FloatingVue.options.themes.tooltip.delay.show = 0;
-FloatingVue.options.offset = [0, 7];
-app.use(FloatingVue);
-
-// マウントを実行
-app.mount('#app');
-
-// Firefox Android 等で URL バー表示切替後に fixed 下端 UI がズレる問題を補正する
-// BottomNavigation / Snackbars / 番組表 FAB などが CSS 変数 --vv-bottom-offset を参照する
-Utils.startVisualViewportBottomOffsetSync();
-
-// ***** Service Worker のイベントを登録 *****
-
-const { updateServiceWorker } = useRegisterSW({
-    // Service Worker の登録に成功したとき
-    onRegisteredSW(registration) {
-        console.log('Service worker has been registered.');
-    },
-    // Service Worker の登録に失敗したとき
-    onRegisterError(error) {
-        console.error('Error during service worker registration:', error);
-    },
-    // PWA がオフラインで利用可能になったとき
-    onOfflineReady() {
-        console.log('Content has been cached for offline use.');
-    },
-    // PWA の更新が必要なとき
-    async onNeedRefresh() {
-        console.log('New content is available; please refresh.');
-        // 前景保存中はリロードで通信が切れるため、完了またはキャンセルまで更新を保留する
-        if (await OfflineVideos.hasActiveForegroundDownload() === true) {
-            Message.show('オフライン保存の完了後にクライアントを更新します。', 10);
-            while (await OfflineVideos.hasActiveForegroundDownload() === true) {
-                await Utils.sleep(1);
-            }
-        }
-        // リロードするまでトーストを表示し続ける
-        Message.show('クライアントが新しいバージョンに更新されました。5秒後にリロードします。', 10);  // 10秒間表示
-        await Utils.sleep(5);  // 5秒待つ
-        // PWA (Service Worker) を更新し、ページをリロードする
-        updateServiceWorker(true);
-    },
-});
-
-// ***** 設定データの同期 *****
-
-// 設定データの変更を監視する
-// Pinia の $subscribe() は app.mount() の後に呼び出す必要がある
-let is_updating_watched_history = false;
-settings_store.$subscribe(async () => {
-
-    // テーマ変更・設定インポート・設定同期のいずれでも即時に表示へ反映する
+// 非同期の初期値選定が終わるまでマウントを待ち、視聴 URL への直アクセスにも選定結果を使う。
+async function initializeKonomiTVBS4KApp(): Promise<void> {
+    // 初回描画より前に、このブラウザへ保存されているテーマを適用する
+    // マウント後に切り替えると、起動時に Konomi Classic が一瞬表示されてしまう
+    const settings_store = useSettingsStore();
+    await settings_store.initializeKonomiTVBS4KPlaybackVideoCodecDefault(selectKonomiTVBS4KHardwareDecodePreferredCodec);
+    const applySelectedTheme = (): void => {
+        const selected_theme = KONOMITV_BS4K_THEME_OPTIONS.find(option => option.value === settings_store.settings.ui_theme) ??
+            KONOMITV_BS4K_THEME_OPTIONS[0];
+        vuetify.theme.global.name.value = selected_theme.value;
+        document.documentElement.style.colorScheme = selected_theme.dark ? 'dark' : 'light';
+        document.body.style.backgroundColor = selected_theme.preview.background;
+        document.body.style.color = selected_theme.preview.text;
+        document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute('content', selected_theme.preview.background);
+    };
     applySelectedTheme();
 
-    // 視聴履歴の保持件数を変更した際に、既存の視聴履歴件数が上限を超えている場合は即時に古い履歴から削除する
-    // これにより、履歴追加時だけでなく設定値の縮小時にも常に上限件数を維持できる
-    const watched_history_max_count = Number.isFinite(settings_store.settings.video_watched_history_max_count) ?
-        Math.max(1, Math.floor(settings_store.settings.video_watched_history_max_count)) : 1;
-    const watched_history = settings_store.settings.watched_history;
-    if (is_updating_watched_history === false && watched_history.length > watched_history_max_count) {
+    // vue-virtual-scroller を使う
+    app.use(VueVirtualScroller);
 
-        // 配列を直接 sort() / splice() で破壊せず、コピー側で削除対象のみを算出する
-        const remove_count = watched_history.length - watched_history_max_count;
-        const remove_targets = new Set(
-            [...watched_history]
-                .sort((a, b) => a.updated_at - b.updated_at)
-                .slice(0, remove_count),
-        );
+    // FloatingVue を使う
+    // タッチデバイスでは無効化する
+    // ref: https://v-tooltip.netlify.app/guide/config#default-values
+    FloatingVue.options.themes.tooltip.triggers = Utils.isTouchDevice() ? [] : ['hover', 'focus', 'touch'];
+    FloatingVue.options.themes.tooltip.delay.show = 0;
+    FloatingVue.options.offset = [0, 7];
+    app.use(FloatingVue);
 
-        // 元の配列順序を維持したまま、削除対象だけを除外した新しい配列を作成する
-        const watched_history_trimmed = watched_history.filter(history => remove_targets.has(history) === false);
+    // マウントを実行
+    app.mount('#app');
 
-        // $subscribe の再入で同じロジックが連続実行されないようにガードしつつ代入する
-        is_updating_watched_history = true;
-        try {
-            settings_store.settings.watched_history = watched_history_trimmed;
-        } finally {
-            is_updating_watched_history = false;
+    // Firefox Android 等で URL バー表示切替後に fixed 下端 UI がズレる問題を補正する
+    // BottomNavigation / Snackbars / 番組表 FAB などが CSS 変数 --vv-bottom-offset を参照する
+    Utils.startVisualViewportBottomOffsetSync();
+
+    // ***** Service Worker のイベントを登録 *****
+
+    const { updateServiceWorker } = useRegisterSW({
+        // Service Worker の登録に成功したとき
+        onRegisteredSW(registration) {
+            console.log('Service worker has been registered.');
+        },
+        // Service Worker の登録に失敗したとき
+        onRegisterError(error) {
+            console.error('Error during service worker registration:', error);
+        },
+        // PWA がオフラインで利用可能になったとき
+        onOfflineReady() {
+            console.log('Content has been cached for offline use.');
+        },
+        // PWA の更新が必要なとき
+        async onNeedRefresh() {
+            console.log('New content is available; please refresh.');
+            // 前景保存中はリロードで通信が切れるため、完了またはキャンセルまで更新を保留する
+            if (await OfflineVideos.hasActiveForegroundDownload() === true) {
+                Message.show('オフライン保存の完了後にクライアントを更新します。', 10);
+                while (await OfflineVideos.hasActiveForegroundDownload() === true) {
+                    await Utils.sleep(1);
+                }
+            }
+            // リロードするまでトーストを表示し続ける
+            Message.show('クライアントが新しいバージョンに更新されました。5秒後にリロードします。', 10);  // 10秒間表示
+            await Utils.sleep(5);  // 5秒待つ
+            // PWA (Service Worker) を更新し、ページをリロードする
+            updateServiceWorker(true);
+        },
+    });
+
+    // ***** 設定データの同期 *****
+
+    // 設定データの変更を監視する
+    // Pinia の $subscribe() は app.mount() の後に呼び出す必要がある
+    let is_updating_watched_history = false;
+    settings_store.$subscribe(async () => {
+
+        // テーマ変更・設定インポート・設定同期のいずれでも即時に表示へ反映する
+        applySelectedTheme();
+
+        // 視聴履歴の保持件数を変更した際に、既存の視聴履歴件数が上限を超えている場合は即時に古い履歴から削除する
+        // これにより、履歴追加時だけでなく設定値の縮小時にも常に上限件数を維持できる
+        const watched_history_max_count = Number.isFinite(settings_store.settings.video_watched_history_max_count) ?
+            Math.max(1, Math.floor(settings_store.settings.video_watched_history_max_count)) : 1;
+        const watched_history = settings_store.settings.watched_history;
+        if (is_updating_watched_history === false && watched_history.length > watched_history_max_count) {
+
+            // 配列を直接 sort() / splice() で破壊せず、コピー側で削除対象のみを算出する
+            const remove_count = watched_history.length - watched_history_max_count;
+            const remove_targets = new Set(
+                [...watched_history]
+                    .sort((a, b) => a.updated_at - b.updated_at)
+                    .slice(0, remove_count),
+            );
+
+            // 元の配列順序を維持したまま、削除対象だけを除外した新しい配列を作成する
+            const watched_history_trimmed = watched_history.filter(history => remove_targets.has(history) === false);
+
+            // $subscribe の再入で同じロジックが連続実行されないようにガードしつつ代入する
+            is_updating_watched_history = true;
+            try {
+                settings_store.settings.watched_history = watched_history_trimmed;
+            } finally {
+                is_updating_watched_history = false;
+            }
         }
-    }
 
-    // 現在 LocalStorage に保存されている設定データを取得
-    const current_saved_settings = getNormalizedLocalClientSettings(getLocalStorageSettings());
+        // 現在 LocalStorage に保存されている設定データを取得
+        const current_saved_settings = getNormalizedLocalClientSettings(getLocalStorageSettings());
 
-    // 設定データが変更されている場合は、サーバーにアップロードする
-    if (hashClientSettings(current_saved_settings) !== hashClientSettings(settings_store.settings)) {
+        // 設定データが変更されている場合は、サーバーにアップロードする
+        if (hashClientSettings(current_saved_settings) !== hashClientSettings(settings_store.settings)) {
 
-        // 設定データを LocalStorage に保存
-        console.trace('Client Settings Changed:', diff(current_saved_settings, settings_store.settings));
-        setLocalStorageSettings(settings_store.settings);
+            // 設定データを LocalStorage に保存
+            console.trace('Client Settings Changed:', diff(current_saved_settings, settings_store.settings));
+            setLocalStorageSettings(settings_store.settings);
 
-        // このクライアントの設定をサーバーに同期する (ログイン時かつ同期が有効な場合のみ実行される)
-        await settings_store.syncClientSettingsToServer();
+            // このクライアントの設定をサーバーに同期する (ログイン時かつ同期が有効な場合のみ実行される)
+            await settings_store.syncClientSettingsToServer();
 
-    // 設定データが変更されているが更新されたキーが last_synced_at だけの場合は、LocalStorage への保存のみ行う
-    // hashClientSettings() は last_synced_at への変更を除外してハッシュ化を行う
-    } else if (current_saved_settings.last_synced_at < settings_store.settings.last_synced_at) {
+            // 設定データが変更されているが更新されたキーが last_synced_at だけの場合は、LocalStorage への保存のみ行う
+            // hashClientSettings() は last_synced_at への変更を除外してハッシュ化を行う
+        } else if (current_saved_settings.last_synced_at < settings_store.settings.last_synced_at) {
 
-        // 設定データを LocalStorage に保存
-        setLocalStorageSettings(settings_store.settings);
-    }
+            // 設定データを LocalStorage に保存
+            setLocalStorageSettings(settings_store.settings);
+        }
 
-}, {detached: true});
+    }, {detached: true});
 
-// ログイン時かつ設定の同期が有効な場合、ページ遷移に関わらず、常に3秒おきにサーバーから設定を取得する
-// 初回のページレンダリングに間に合わないのは想定内（同期の完了を待つこともできるが、それだと表示速度が遅くなるのでしょうがない）
-window.setInterval(async () => {
-    if (Utils.getAccessToken() !== null && settings_store.settings.sync_settings === true) {
+    // ログイン時かつ設定の同期が有効な場合、ページ遷移に関わらず、常に3秒おきにサーバーから設定を取得する
+    // 初回のページレンダリングに間に合わないのは想定内（同期の完了を待つこともできるが、それだと表示速度が遅くなるのでしょうがない）
+    window.setInterval(async () => {
+        if (Utils.getAccessToken() !== null && settings_store.settings.sync_settings === true) {
 
-        // サーバーに保存されている設定データをこのクライアントに同期する
-        await settings_store.syncClientSettingsFromServer();
-    }
-}, 3 * 1000);  // 3秒おき
+            // サーバーに保存されている設定データをこのクライアントに同期する
+            await settings_store.syncClientSettingsFromServer();
+        }
+    }, 3 * 1000);  // 3秒おき
+}
+
+void initializeKonomiTVBS4KApp();

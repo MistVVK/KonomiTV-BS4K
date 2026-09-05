@@ -1225,6 +1225,52 @@ async function probeKonomiTVBS4KBrowserAudioWebCodecs(params: {
 }
 
 /**
+ * 工場初期値の選定用に、HW デコード優先の信号がある最上位 codec を返す。
+ * 本線の代表構成 (1080p60 / 8bit) を使い、実再生での HW 利用や全解像度の対応を断定しない。
+ * @returns 優先信号がある codec。どちらの API にも信号がなければ null。
+ */
+export async function selectKonomiTVBS4KHardwareDecodePreferredCodec():
+Promise<KonomiTVBS4KPlaybackVideoCodec | null> {
+    const codec_order: readonly KonomiTVBS4KPlaybackVideoCodec[] = ['av1', 'vp9', 'hevc', 'avc'];
+    const candidates = codec_order.map(codec => {
+        const entry = KONOMITV_BS4K_BROWSER_VIDEO_CATALOG.find(entry =>
+            entry.konomitv_playback_video_codec === codec && entry.bit_depth === 8 &&
+            entry.konomitv_playback_profile?.streaming_quality === '1080p-60fps',
+        );
+        // 本線カタログの欠落はプローブの非対応と区別し、定義不整合として検出する。
+        if (entry === undefined) throw new Error(`Missing playback default codec catalog entry: ${codec}`);
+        return {codec, entry};
+    });
+
+    // codec の順位を優先し、上位の両 API を確認してから次へ進む。
+    // 下位の MediaCapabilities 信号だけで決めると、上位の WebCodecs 信号を見落とす。
+    for (const {codec, entry} of candidates) {
+        // API が同期的に例外を投げる実装差も、初期値選定では証拠なしとして扱う。
+        const media_capabilities = await probeKonomiTVBS4KBrowserMediaCapabilitiesVideo({
+            available: typeof navigator.mediaCapabilities?.decodingInfo === 'function',
+            mime_type: entry.mime_type,
+            width: entry.width,
+            height: entry.height,
+            bitrate: entry.representative_bitrate,
+            framerate: entry.framerate,
+        }).catch(() => null);
+        if (media_capabilities?.probe === 'Supported' && media_capabilities.power_efficient === true) return codec;
+
+        // この codec の MediaCapabilities に肯定信号がなければ、prefer-hardware を確認する。
+        // WebCodecs の同期例外も肯定信号にはしない。
+        const web_codecs = await probeKonomiTVBS4KBrowserVideoCodec({
+            available: typeof VideoDecoder !== 'undefined' && typeof VideoDecoder.isConfigSupported === 'function',
+            codec: extractKonomiTVBS4KBrowserMIMECodec(entry.mime_type),
+            width: entry.width,
+            height: entry.height,
+            hardware_acceleration: 'prefer-hardware',
+        }).catch(() => 'Unavailable');
+        if (web_codecs === 'Supported') return codec;
+    }
+    return null;
+}
+
+/**
  * 全カタログに対してブラウザ診断を実行する。
  *
  * 1 行の失敗が他の行へ波及しない。ハングした API で画面が止まらないよう、
