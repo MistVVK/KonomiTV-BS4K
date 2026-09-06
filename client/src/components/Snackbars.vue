@@ -1,7 +1,7 @@
 <template>
     <div class="snackbar-container">
         <!-- Vuetify の Snackbar を使うとかえってスタック上に積み上げるのが困難だったため独自に実装した -->
-        <div class="snackbar elevation-8"
+        <div class="snackbar elevation-3"
             :class="{
                 [`bg-${snackbar.level === 'default' ? 'background-lighten-2' : snackbar.level}`]: true,
                 'snackbar--showing' : snackbar.showing,

@@ -53,7 +53,7 @@ const activeTab = computed<KonomiTVBS4KVideoSectionTab>(() => {
         text-transform: none;
 
         &.v-tab--selected {
-            color: rgb(var(--v-theme-text));
+            color: rgb(var(--v-theme-primary));
             font-weight: bold;
         }
     }

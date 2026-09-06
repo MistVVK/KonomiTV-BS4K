@@ -6,9 +6,9 @@
             </v-card-title>
             <v-card-text class="pt-4 px-6 pb-0">
                 <div class="offline-download-dialog__title mb-4">
-                    <div class="text-h6 text-text mb-2"
+                    <div class="text-title-large text-text mb-2"
                         v-html="ProgramUtils.decorateProgramInfo(program, 'title')"></div>
-                    <div class="text-body-2 text-text-darken-1">
+                    <div class="text-body-medium text-text-darken-1">
                         {{ ProgramUtils.getProgramTime(program) }}
                     </div>
                 </div>

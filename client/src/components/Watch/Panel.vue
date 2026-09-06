@@ -26,7 +26,7 @@
                 :class="{'watch-panel__content--active': panel_active_tab === 'Comment'}" />
             <Twitter class="watch-panel__content" v-if="playerStore.is_offline_playback === false" :playback_mode="playback_mode"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Twitter'}" />
-            <button v-ripple class="watch-panel__content-remocon-button elevation-8" v-if="playback_mode === 'Live'"
+            <button v-ripple class="watch-panel__content-remocon-button elevation-3" v-if="playback_mode === 'Live'"
                 :class="{'watch-panel__content-remocon-button--active': panel_active_tab === 'Program' || panel_active_tab === 'Channel'}"
                 @click="playerStore.is_remocon_display = !playerStore.is_remocon_display">
                 <Icon class="panel-close-button__icon" icon="material-symbols:remote-gen" width="25px" />

@@ -4,7 +4,7 @@
         Firefox Android の URL バー表示切替補正 (translate / bottom 上書き) を受け付けない。
         見た目に必要な stacked ボタンだけ Vuetify の v-btn を使い、容器は自前の fixed nav にする。
     -->
-    <nav ref="navigationContainer" class="bottom-navigation-container elevation-12">
+    <nav ref="navigationContainer" class="bottom-navigation-container elevation-4">
         <v-btn class="bottom-navigation-button" variant="text" stacked to="/tv/"
             :class="{'v-btn--active': $route.path.startsWith('/tv')}">
             <Icon icon="fluent:tv-20-regular" width="30px" />

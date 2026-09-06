@@ -10,7 +10,7 @@
                 </div>
             </v-card-title>
             <div class="px-5 pb-6">
-                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-4">
+                <div class="text-body-large d-flex align-center font-weight-bold mt-4">
                     <Icon icon="fa-solid:sliders-h" width="24px" height="20px" />
                     <span class="ml-2">クイック設定</span>
                 </div>
@@ -96,7 +96,7 @@
                         v-model="settingsStore.settings.mute_comment_keywords_normalize_alphanumeric_width_case">
                     </v-switch>
                 </div>
-                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-4">
+                <div class="text-body-large d-flex align-center font-weight-bold mt-4">
                     <Icon icon="fluent:comment-dismiss-20-filled" width="24px" />
                     <span class="ml-2 mr-2">ミュート済みのキーワード</span>
                     <v-btn class="ml-auto" color="background-lighten-1" variant="flat"
@@ -128,7 +128,7 @@
                         </button>
                     </div>
                 </div>
-                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-4">
+                <div class="text-body-large d-flex align-center font-weight-bold mt-4">
                     <Icon icon="fluent:person-prohibited-20-filled" width="24px" />
                     <span class="ml-2 mr-2">ミュート済みのニコニコユーザー ID</span>
                     <v-btn class="ml-auto" color="background-lighten-1" variant="flat"

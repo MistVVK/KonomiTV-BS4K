@@ -1,6 +1,6 @@
 <template>
     <div>
-        <div class="navigation-container elevation-8" :class="{'navigation-container--icon-only': iconOnly}">
+        <div class="navigation-container elevation-3" :class="{'navigation-container--icon-only': iconOnly}">
             <nav class="navigation" :class="{'navigation--icon-only': iconOnly}">
                 <div class="navigation-scroll" :class="{'navigation-scroll--icon-only': iconOnly}">
                     <router-link v-ripple class="navigation__link" active-class="navigation__link--active" to="/tv/"

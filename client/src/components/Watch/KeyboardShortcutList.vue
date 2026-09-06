@@ -13,7 +13,7 @@
                 <v-row>
                     <v-col cols="6" v-for="(shortcut_key_column, shortcut_key_column_name) in shortcut_list" :key="shortcut_key_column_name">
                         <div class="mt-3" v-for="shortcut_keys in shortcut_key_column" :key="shortcut_keys.name">
-                            <div class="text-subtitle-1 d-flex align-center font-weight-bold">
+                            <div class="text-body-large d-flex align-center font-weight-bold">
                                 <Icon v-if="shortcut_keys.name !== 'データ放送'" :icon="shortcut_keys.icon" :height="shortcut_keys.icon_height" />
                                 <svg v-else width="24px" height="24px" viewBox="0 0 512 512">
                                     <path fill="currentColor" d="M248.039 381.326L355.039 67.8258C367.539 28.3257 395.039 34.3258 406.539 34.3258C431.039 34.3258 453.376 61.3258 441.039 96.8258C362.639 322.426 343.539 375.326 340.539 384.826C338.486 391.326 342.039 391.326 345.539 391.326C377.039 391.326 386.539 418.326 386.539 435.326C386.539 458.826 371.539 477.326 350.039 477.326H214.539C179.039 477.326 85.8269 431.3 88.0387 335.826C91.0387 206.326 192.039 183.326 243.539 183.326H296.539L265.539 272.326H243.539C185.539 272.326 174.113 314.826 176.039 334.326C180.039 374.826 215.039 389.814 237.039 390.326C244.539 390.5 246.039 386.826 248.039 381.326Z" />
@@ -21,7 +21,7 @@
                                 <span class="ml-2">{{shortcut_keys.name}}</span>
                             </div>
                             <div class="mt-3" v-for="shortcut in shortcut_keys.shortcuts" :key="shortcut.name">
-                                <div class="text-subtitle-2 mt-2 d-flex align-center font-weight-medium">
+                                <div class="text-title-small mt-2 d-flex align-center font-weight-medium">
                                     <span class="mr-2" v-html="shortcut.name"></span>
                                     <div class="ml-auto d-flex align-center flex-shrink-0">
                                         <div class="ml-auto d-flex align-center" v-for="(key, index) in shortcut.keys" :key="key.name">

@@ -16,6 +16,9 @@
         <meta name="darkreader-lock">
         <title>KonomiTV-BS4K</title>
         <style>
+            /* バンドル内のコンポーネント CSS が先に現れても、reset より優先される順序を固定する */
+            @layer vuetify-core, vuetify-components, vuetify-overrides, vuetify-utilities, vuetify-final;
+
             @font-face {
                 font-family: 'Open Sans';
                 font-weight: 500;

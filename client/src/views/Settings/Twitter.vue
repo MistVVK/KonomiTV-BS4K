@@ -16,8 +16,8 @@
                 <div class="twitter-accounts__guide" v-if="has_no_linked_accounts">
                     <Icon class="flex-shrink-0" icon="fa-brands:twitter" width="45px" />
                     <div class="ml-4">
-                        <div class="font-weight-bold text-h6">Twitter / Bluesky アカウントと連携していません</div>
-                        <div class="text-text-darken-1 text-subtitle-2 mt-1">
+                        <div class="font-weight-bold text-title-large">Twitter / Bluesky アカウントと連携していません</div>
+                        <div class="text-text-darken-1 text-title-small mt-1">
                             Twitter / Bluesky アカウントと連携すると、テレビを見ながらキャプ付きで実況ツイートしたり、ほかの実況ツイートをリアルタイムで表示できるようになります。
                         </div>
                     </div>
@@ -176,8 +176,8 @@
                 <div class="twitter-accounts__guide mt-4" v-if="userStore.user === null || userStore.user.account_links.length === 0">
                     <Icon class="flex-shrink-0" icon="fluent:link-20-filled" width="45px" />
                     <div class="ml-4">
-                        <div class="font-weight-bold text-h6">紐付け中の Twitter / Bluesky アカウントはありません</div>
-                        <div class="text-text-darken-1 text-subtitle-2 mt-1">
+                        <div class="font-weight-bold text-title-large">紐付け中の Twitter / Bluesky アカウントはありません</div>
+                        <div class="text-text-darken-1 text-title-small mt-1">
                             Twitter と Bluesky のアカウントを紐付けると、視聴画面で両方のタイムラインをまとめて表示し、両方に同時に実況ツイートを投稿できます。
                         </div>
                     </div>
@@ -822,7 +822,7 @@ export default defineComponent({
         display: flex;
         align-items: center;
 
-        .text-h6 {
+        .text-title-large {
             @include tablet-vertical {
                 font-size: 19px !important;
             }

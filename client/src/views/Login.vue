@@ -5,7 +5,7 @@
             <Navigation />
             <SPHeaderBar :hide-on-smartphone-vertical="true" />
             <div class="login-container-wrapper d-flex align-center w-100 mb-13">
-                <v-card class="login-container px-10 pt-8 pb-11 mx-auto" elevation="10"
+                <v-card class="login-container px-10 pt-8 pb-11 mx-auto" elevation="3"
                     width="100%" max-width="450">
                     <v-card-title class="login__logo py-4 d-flex flex-column justify-center align-center">
                         <img class="d-block" src="/assets/images/logo.svg" style="max-width: 250px;" />
