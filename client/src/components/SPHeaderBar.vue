@@ -153,7 +153,8 @@ onMounted(() => {
 
 watch(() => props.searchQuery, (searchQueryValue) => {
     // 検索ページでは結果見出しと同じキーワードをすぐ編集できるよう、入力欄を開いたままにする
-    if (searchQueryValue !== undefined) {
+    // 通常ページでは、空の親管理クエリだけで検索ボタンを入力欄に切り替えない
+    if (searchQueryValue !== undefined && (searchQueryValue !== '' || route.path.endsWith('/search'))) {
         isSearchActive.value = true;
     }
 }, { immediate: true });
