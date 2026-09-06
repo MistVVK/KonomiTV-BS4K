@@ -2181,6 +2181,10 @@ class RecordedFMP4Stream:
             (item for item in timeline if float(item['start_time']) <= start_time < float(item['end_time'])),
             None,
         )
+        color_space = entry.get('color_space') if entry else None
+        color_range = entry.get('color_range') if entry else None
+        color_primaries = entry.get('color_primaries') if entry else None
+        color_transfer = entry.get('color_transfer') if entry else None
         scan_type = entry.get('scan_type') if entry else self.recorded_program.recorded_video.video_scan_type
         is_interlaced = scan_type == 'Interlaced'
         if is_interlaced:
@@ -2298,10 +2302,6 @@ class RecordedFMP4Stream:
                 'out_chroma_location=left',
             ]
             if entry is not None:
-                color_space = entry.get('color_space')
-                color_range = entry.get('color_range')
-                color_primaries = entry.get('color_primaries')
-                color_transfer = entry.get('color_transfer')
                 if color_space is not None:
                     scale_vaapi_options.append(f'out_color_matrix={color_space}')
                 if color_range in ('tv', 'pc'):
@@ -2330,6 +2330,17 @@ class RecordedFMP4Stream:
         # 次のfragmentのtfdtとの間に穴を作らない。24/30p混在の逆テレシネはVFRを維持する。
         if self.encoding_options.is_24fps_mode_enabled is False:
             filters.append(f'fps={output_frame_rate}:start_time=0:eof_action=pass')
+        # prerollで前generationの色からfilterが初期化されても、encoderへは現在generationの
+        # フレーム色情報を渡す。色域・伝達特性・行列の未指定もunknownへ揃え、bt709を持ち越さない。
+        # encoderオプションだけではフレーム由来の値に置き換わり、configurationが位置で変わる。
+        # 色レンジ未確定時のunknown強制はQSV VPPが拒否するため、既存の自動判定を維持する。
+        filters.append(
+            'setparams='
+            f'range={color_range if color_range in ("tv", "pc") else "auto"}:'
+            f'color_primaries={color_primaries or "unknown"}:'
+            f'color_trc={color_transfer or "unknown"}:'
+            f'colorspace={color_space or "unknown"}'
+        )
         command += [
             '-vf', ','.join(filters),
             '-c:v', encoder_name,
