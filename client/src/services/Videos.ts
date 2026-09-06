@@ -106,7 +106,7 @@ export interface IKonomiTVBS4KPlaybackAudioCodecOption {
 
 export interface IKonomiTVBS4KPlaybackQualityOption<
     KonomiTVBS4KQuality extends KonomiTVBS4KPlaybackSelectableQuality =
-    KonomiTVBS4KPlaybackSelectableQuality,
+        KonomiTVBS4KPlaybackSelectableQuality,
 > {
     title: string;
     value: KonomiTVBS4KQuality;

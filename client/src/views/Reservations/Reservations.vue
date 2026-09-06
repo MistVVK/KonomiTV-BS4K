@@ -90,7 +90,7 @@ function updateDisplayData() {
     }
 
     // 並び順に応じてソート
-    let sortedReservations = [...allReservations.value];
+    const sortedReservations = [...allReservations.value];
     if (sortOrder.value === 'asc') {
         sortedReservations.sort((a, b) => dayjs(a.program.start_time).valueOf() - dayjs(b.program.start_time).valueOf());
     } else {

@@ -842,7 +842,7 @@ export default defineComponent({
                 .filter(hashtag => hashtag !== '');
 
             // ハッシュタグがついてない場合にハッシュタグを付与
-            for (let index in tweet_hashtag_array) {
+            for (const index in tweet_hashtag_array) {
                 if (!tweet_hashtag_array[index].startsWith('#')) {
                     tweet_hashtag_array[index] = `#${tweet_hashtag_array[index]}`;
                 }

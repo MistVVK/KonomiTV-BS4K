@@ -906,9 +906,9 @@ export function judgeKonomiTVBS4KBrowserVideoSupport(params: {
     media_source: KonomiTVBS4KBrowserWebApiProbe;
     can_play_type: 'Probably' | 'Maybe' | 'No';
 }): {
-        support: KonomiTVBS4KBrowserSupportStatus;
-        evidence: KonomiTVBS4KBrowserEvidence;
-    } {
+    support: KonomiTVBS4KBrowserSupportStatus;
+    evidence: KonomiTVBS4KBrowserEvidence;
+} {
     const {media_capabilities, media_source, can_play_type} = params;
     if (media_capabilities === 'Supported') {
         // MediaCapabilities が対応でも MSE が非対応なら実再生経路と矛盾するので断定しない。
@@ -949,9 +949,9 @@ export function judgeKonomiTVBS4KBrowserAudioSupport(params: {
     media_capabilities: KonomiTVBS4KBrowserWebApiProbe;
     can_play_type: 'Probably' | 'Maybe' | 'No';
 }): {
-        support: KonomiTVBS4KBrowserSupportStatus;
-        evidence: KonomiTVBS4KBrowserEvidence;
-    } {
+    support: KonomiTVBS4KBrowserSupportStatus;
+    evidence: KonomiTVBS4KBrowserEvidence;
+} {
     const {media_capabilities, can_play_type} = params;
     if (media_capabilities === 'Supported') {
         return {support: 'Supported', evidence: 'MediaCapabilities'};

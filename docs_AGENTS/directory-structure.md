@@ -67,7 +67,7 @@
 - `package.json`: Node.js プロジェクト設定と依存関係 (yarn)
 - `vite.config.mts`: Vite ビルド設定
 - `tsconfig.json`: TypeScript 設定
-- `.eslintrc.json`: ESLint コードスタイル設定
+- `eslint.config.js`: ESLint の flat config・コードスタイル設定
 
 ## サーバー (`server/`)
 

@@ -226,7 +226,7 @@ export class KonomiTVBS4KSpeedTestWorkerController {
 
     constructor(
         private readonly create_worker: KonomiTVBS4KSpeedTestWorkerFactory =
-        (url: string) => new Worker(url),
+            (url: string) => new Worker(url),
         private readonly api_base_url: string = Utils.api_base_url,
     ) {}
 
