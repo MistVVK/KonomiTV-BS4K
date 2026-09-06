@@ -86,13 +86,14 @@ cmake --install "${SOURCE_ROOT}/libaribtlv-build"
 # GnuTLS など無関係な共有 library まで静的検査へ巻き込まない。
 sed -i 's/^Libs: \(.*\)$/Libs: \1 -lz -lstdc++/' "${SDK_PREFIX}/lib/pkgconfig/libaribtlv.pc"
 
-# upstream の FFmpeg 8.1.2 対応 patch を順番どおり適用し、KonomiTV の timed ID3 出力を追加する。
+# upstream の FFmpeg 8.1.2 対応 patch を順番どおり適用し、KonomiTV のローカル補正を追加する。
 for patch_path in \
     "${ffmpeg_libaribtlv_patch_directory}/0001-Add-ARIB-MMT-TLV-demuxer-support-via-libaribtlv.patch" \
     "${ffmpeg_libaribtlv_patch_directory}/0002-avformat-libaribtlv-report-recording-duration.patch" \
     "${ffmpeg_libaribtlv_patch_directory}/0003-avformat-libaribtlv-support-timestamp-seeking.patch" \
     "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch" \
     "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch" \
+    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-aresample-reinit-first-pts.patch" \
     "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-vaapi-mesa-hevc-alignment.patch"; do
     git -C "${ffmpeg_source}" apply --check "${patch_path}"
     git -C "${ffmpeg_source}" apply "${patch_path}"

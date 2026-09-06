@@ -72,6 +72,7 @@ COPY ./docker/thirdparty/patches/amf-1.4.36-display-capture-c.patch \
      ./docker/thirdparty/patches/libaribtlv-0.2.0-konomitv-subtitle-mfu.patch \
      ./docker/thirdparty/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch \
      ./docker/thirdparty/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch \
+     ./docker/thirdparty/patches/ffmpeg-8.1.2-aresample-reinit-first-pts.patch \
      ./docker/thirdparty/patches/ffmpeg-8.1.2-vaapi-mesa-hevc-alignment.patch \
      ./docker/thirdparty/patches/intel-libva-standalone.patch \
      ./docker/thirdparty/patches/intel-media-driver-vpp-deinterlace-crash-fix.patch \
