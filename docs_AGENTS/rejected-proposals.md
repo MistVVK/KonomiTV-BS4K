@@ -26,4 +26,8 @@
 
 ## エントリ
 
-（まだエントリはない。却下判断が確定したらここに追記する）
+### ローカルのビルド成果物と submodule ソースに固定 SHA-256 ゲートを設ける
+
+- **却下した案**: FFmpeg / ffprobe のビルド成果物や TSCodecBridge / tsreadex の submodule ソースを固定 SHA-256 と照合し、ソース変更のたびに期待値を更新する。
+- **却下理由**: 正規の FFmpeg 音声再構成修正でも、生成バイナリの固定値不一致で `tscodecbridge-integration` が停止した。ソースは Git の commit / submodule で管理し、ローカル生成物に追加の固定値更新を要求しない。URL から取得するアーカイブの完全性検証はこの判断の対象外とし、SBLint / Mallet / Go / Python などの SHA-256 検証は維持する。対象は `docker/ts-codec-bridge/` と `docker/thirdparty/` のマニフェスト・ビルド処理。
+- **この判断が無効になる条件**: ローカルビルドではなく外部配布の成果物を受け入れるなど、ソース管理と既存のビルド検証では保証できない入力経路が追加された場合。

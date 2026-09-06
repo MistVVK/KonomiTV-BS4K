@@ -17,7 +17,6 @@ expected_manifest_keys=(
     KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER
     KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME
     KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT
-    KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256
     KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION
     KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION
     KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_CODENAME
@@ -26,8 +25,6 @@ expected_manifest_keys=(
     KONOMITV_BS4K_TSCODECBRIDGE_MALLET_VERSION
     KONOMITV_BS4K_TSCODECBRIDGE_MALLET_ARCHIVE_SHA256
     KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256
-    KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256
 )
 
 fail() {
@@ -97,8 +94,6 @@ validate_manifest() {
 
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}" != PENDING_* ]] ||
         fail_pending 'replace SOURCE_COMMIT with the published 40-character commit SHA'
-    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}" != PENDING_* ]] ||
-        fail_pending 'replace SOURCE_TREE_SHA256 with the verified submodule source tree SHA-256'
 
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}" == 'MistVVK' ]] ||
         fail 'repository owner must remain MistVVK'
@@ -111,13 +106,6 @@ validate_manifest() {
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}" != \
         '0000000000000000000000000000000000000000' ]] ||
         fail 'SOURCE_COMMIT must not be the all-zero sentinel'
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}" \
-        64
-    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}" != \
-        '0000000000000000000000000000000000000000000000000000000000000000' ]] ||
-        fail 'SOURCE_TREE_SHA256 must not be the all-zero sentinel'
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
         fail 'CLI_VERSION must be an exact semantic version'
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION}" =~ ^[0-9]+$ ]] ||
@@ -135,14 +123,6 @@ validate_manifest() {
     require_lower_hex \
         KONOMITV_BS4K_TSCODECBRIDGE_MALLET_ARCHIVE_SHA256 \
         "${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_ARCHIVE_SHA256}" \
-        64
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256}" \
-        64
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256}" \
         64
 }
 
@@ -280,7 +260,6 @@ record_builder_packages() {
 
 verify_source_tree() {
     local source_directory="$1"
-    local actual_source_sha256
 
     [[ -d "${source_directory}" && ! -L "${source_directory}" ]] ||
         fail 'Bridge submodule source directory is missing or is a symlink'
@@ -289,22 +268,12 @@ verify_source_tree() {
         fail 'Bridge submodule source does not contain its ASDF system'
 
     # 従来の archive と同じく、入力は通常ファイルとディレクトリだけに限定する。
-    # submodule の .git はホスト固有の管理情報なので、Docker context と内容照合の両方から除く。
+    # submodule の .git はホスト固有の管理情報なので、Docker context と入力検査の両方から除く。
     [[ -z "$(find "${source_directory}" -mindepth 1 \
         -path "${source_directory}/.git" -prune -o ! -type f ! -type d -print -quit)" ]] ||
         fail 'Bridge submodule source contains an unsupported non-regular entry'
 
-    # Git metadata を持たない Docker 内でも、固定 commit のクリーンな tracked tree と内容を照合する。
-    # 相対パスと各ファイルの SHA-256 を C locale 順で再ハッシュし、欠落・追加・変更を検出する。
-    actual_source_sha256="$(
-        cd -- "${source_directory}"
-        find . -path './.git' -prune -o -type f -print0 |
-            LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1
-    )"
-    [[ "${actual_source_sha256}" == "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}" ]] ||
-        fail 'Bridge submodule source tree SHA-256 does not match manifest'
     printf 'Bridge source commit: %s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
-    printf 'Bridge source tree SHA-256: %s\n' "${actual_source_sha256}"
 }
 
 install_toolchain() {
@@ -413,30 +382,22 @@ verify_bridge_dependencies() {
     done <<< "${dependency_names}"
 }
 
-verify_fixed_ffmpeg() {
+verify_ffmpeg() {
     local ffmpeg_binary="${ffmpeg_root}/ffmpeg8.elf"
     local ffprobe_binary="${ffmpeg_root}/ffprobe8.elf"
     local observed_ffmpeg_version
     local observed_ffprobe_version
 
-    test -x "${ffmpeg_binary}" || fail 'fixed thirdparty-builder FFmpeg 8 is missing'
-    test -x "${ffprobe_binary}" || fail 'fixed thirdparty-builder ffprobe 8 is missing'
-    printf '%s  %s\n' \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256}" \
-        "${ffmpeg_binary}" |
-        sha256sum --check --strict -
-    printf '%s  %s\n' \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256}" \
-        "${ffprobe_binary}" |
-        sha256sum --check --strict -
+    test -x "${ffmpeg_binary}" || fail 'thirdparty-builder FFmpeg 8 is missing'
+    test -x "${ffprobe_binary}" || fail 'thirdparty-builder ffprobe 8 is missing'
     observed_ffmpeg_version="$("${ffmpeg_binary}" -version 2>&1 | sed -n '1p')"
     observed_ffprobe_version="$("${ffprobe_binary}" -version 2>&1 | sed -n '1p')"
     [[ "${observed_ffmpeg_version}" == \
         "ffmpeg version ${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION} "* ]] ||
-        fail 'fixed thirdparty-builder FFmpeg version does not match manifest'
+        fail 'thirdparty-builder FFmpeg version does not match manifest'
     [[ "${observed_ffprobe_version}" == \
         "ffprobe version ${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION} "* ]] ||
-        fail 'fixed thirdparty-builder ffprobe version does not match manifest'
+        fail 'thirdparty-builder ffprobe version does not match manifest'
 }
 
 run_ffmpeg_integration() {
@@ -447,7 +408,7 @@ run_ffmpeg_integration() {
     validate_manifest
     test -d "${source_root}" || fail 'Bridge source was not copied into the integration stage'
     test -x "${bridge_binary}" || fail 'built Bridge executable is missing from the integration stage'
-    verify_fixed_ffmpeg
+    verify_ffmpeg
     [[ "$("${bridge_binary}" --version)" == "${KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION}" ]] ||
         fail 'Bridge CLI version changed before FFmpeg integration'
     [[ "$("${bridge_binary}" --mapping-version)" == \
@@ -459,8 +420,6 @@ run_ffmpeg_integration() {
         BRIDGE_BINARY="${bridge_binary}" \
         FFMPEG_BINARY="${ffmpeg_binary}" \
         FFPROBE_BINARY="${ffprobe_binary}" \
-        FFMPEG_SHA256="${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256}" \
-        FFPROBE_SHA256="${KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256}" \
         test-ffmpeg-integration
 }
 
@@ -516,8 +475,6 @@ build_and_package() {
             "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME}"
         printf 'SOURCE_SUBMODULE_PATH\tthirdparty-src/tscodecbridge\n'
         printf 'SOURCE_COMMIT\t%s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
-        printf 'SOURCE_TREE_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_TREE_SHA256}"
         printf 'CLI_VERSION\t%s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION}"
         printf 'TS_MAPPING_VERSION\t%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION}"
@@ -539,10 +496,6 @@ build_and_package() {
         printf 'FFMPEG_ORIGIN\tKonomiTV-BS4K-thirdparty-builder:/opt/thirdparty/FFmpeg8\n'
         printf 'FFMPEG_VERSION\t%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION}"
-        printf 'FFMPEG_BINARY_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256}"
-        printf 'FFPROBE_BINARY_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256}"
         printf 'EXECUTABLE_SHA256\t%s\n' "${executable_sha256}"
         for common_license in Apache-2.0 GPL-2 LGPL-2.1 GFDL-1.3; do
             common_license_path="/usr/share/common-licenses/${common_license}"

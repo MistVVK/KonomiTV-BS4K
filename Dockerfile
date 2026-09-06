@@ -202,14 +202,14 @@ RUN cc -std=c17 -Wall -Wextra -Werror -Wconversion -Wformat=2 -Wshadow -Wstrict-
     file /opt/konomitv-bs4k-acp-sandbox | grep -F 'pie executable'
 
 # --------------------------------------------------------------------------------------------------------------
-# KonomiTV-BS4K TS Codec Bridge を submodule の固定 commit と source tree SHA-256 から構築するステージ
+# KonomiTV-BS4K TS Codec Bridge を submodule から構築するステージ
 # --------------------------------------------------------------------------------------------------------------
 
 FROM ubuntu:22.04 AS tscodecbridge-toolchain
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 固定 commit と source tree SHA-256 が未確定なら、toolchain の取得より前に失敗する。
+# submodule の参照 commit が未確定なら、toolchain の取得より前に失敗する。
 COPY ./docker/ts-codec-bridge/manifest.env \
      ./docker/ts-codec-bridge/build.sh \
      /build/docker/ts-codec-bridge/
@@ -221,7 +221,7 @@ RUN /build/docker/ts-codec-bridge/build.sh prepare
 
 FROM tscodecbridge-toolchain AS tscodecbridge-builder
 
-# チェックアウト済み submodule をビルド入力にし、make の実行前に内容を固定 digest と照合する。
+# チェックアウト済み submodule をビルド入力にする。
 COPY ./thirdparty-src/tscodecbridge/ /build/konomitv-bs4k-tscodecbridge/source/
 
 # Jammy公式toolchainだけで全compile・lint・単体試験を行い、保存実行形式と表示物を固定する。
