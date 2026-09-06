@@ -2163,6 +2163,7 @@ class RecordedFMP4Stream:
         quality = QUALITY[self.quality]
         video_bitrate = self.__getEffectiveVideoBitrate()
         video_bitrate_max_kbps = int(video_bitrate.video_bitrate_max.removesuffix('K'))
+        output_frame_rate = '60000/1001' if quality.is_60fps is True else '30000/1001'
         backend = self.__getBackend()
         codec = self.encoding_options.video_codec
         bit_depth = self.encoding_options.video_bit_depth
@@ -2324,6 +2325,11 @@ class RecordedFMP4Stream:
                 f'trim=start={trim_start:.6f}:duration={duration:.6f}',
                 'setpts=PTS-STARTPTS',
             ]
+        # encoder側の-rだけでは、trim後の最後の入力frameでCFR同期が終わり、
+        # 約6秒の区間が短くなる。filterのEOF時刻まで最後のframeを保持し、
+        # 次のfragmentのtfdtとの間に穴を作らない。24/30p混在の逆テレシネはVFRを維持する。
+        if self.encoding_options.is_24fps_mode_enabled is False:
+            filters.append(f'fps={output_frame_rate}:start_time=0:eof_action=pass')
         command += [
             '-vf', ','.join(filters),
             '-c:v', encoder_name,
@@ -2356,7 +2362,7 @@ class RecordedFMP4Stream:
             command += ['-fps_mode', 'vfr']
         else:
             command += [
-                '-r', '60000/1001' if quality.is_60fps is True else '30000/1001',
+                '-r', output_frame_rate,
                 '-fps_mode', 'cfr',
             ]
         command += [
