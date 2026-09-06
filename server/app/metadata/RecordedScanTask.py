@@ -25,6 +25,7 @@ from app.config import Config
 from app.constants import JST, THUMBNAILS_DIR
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
+from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
 from app.metadata.CMChapterFile import (
     GetRecordedPathFromCMChapterPath,
@@ -415,7 +416,7 @@ class RecordedScanTask:
             # runBatchScan() が完了しなくても新しく録画されたファイルの監視を開始するため、同時に実行する
             await asyncio.gather(
                 # サーバー起動時の一括スキャン・同期を実行
-                self.runBatchScan(),
+                self.__runStartupScan(),
                 # 録画フォルダの監視を開始し、一時障害で停止した場合は再起動する
                 self.__runRecordedFolderWatchSupervisor(),
                 # NFS/CIFS 向けの低頻度 reconciliation
@@ -427,6 +428,18 @@ class RecordedScanTask:
             logging.error('Error in RecordedScanTask:', exc_info=ex)
         finally:
             self._is_running = False
+
+
+    async def __runStartupScan(self) -> None:
+        """起動時スキャンの完了後だけ、未完了のCM解析を直列に補完する。
+
+        Returns:
+            None
+        """
+
+        # 手動スキャンや定期reconciliationでは再投入せず、起動時の一巡だけを対象にする。
+        await self.runBatchScan()
+        await CMAnalysisTaskManager.runStartupBackfill()
 
 
     async def __runRecordedFolderWatchSupervisor(self) -> None:
