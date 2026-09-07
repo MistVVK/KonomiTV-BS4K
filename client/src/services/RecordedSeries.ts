@@ -81,6 +81,20 @@ export interface IRecordedSeriesStatus {
     is_episode_running: boolean;
 }
 
+/** シリーズ DB 削除で消した表ごとの行数。録画本体は含まない。 */
+export interface IRecordedSeriesDatabaseDeleteResult {
+    series: number;
+    series_episodes: number;
+    series_aliases: number;
+    series_broadcast_periods: number;
+    series_ai_fallbacks: number;
+    recorded_series_rules: number;
+    recorded_series_resolutions: number;
+    recorded_series_ai_requests: number;
+    recorded_episode_resolutions: number;
+    bangumi_episode_completions: number;
+}
+
 /** 管理画面の一覧に表示する、録画シリーズの軽量な集計情報。 */
 export interface IRecordedSeriesManagementItem {
     id: number;
@@ -303,6 +317,16 @@ export default class RecordedSeries {
         const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/episodes/backfill', {force});
         if (response.type === 'error') {
             APIClient.showGenericError(response, '既存録画の話数判定を開始できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    /** シリーズ関連データだけを削除する。録画本体・サムネイル・CM・履歴は残る。 */
+    static async deleteSeriesDatabase(): Promise<IRecordedSeriesDatabaseDeleteResult | null> {
+        const response = await APIClient.delete<IRecordedSeriesDatabaseDeleteResult>('/recorded-series/database');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'シリーズデータベースを削除できませんでした。');
             return null;
         }
         return response.data;

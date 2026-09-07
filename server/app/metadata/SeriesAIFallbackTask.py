@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from typing_extensions import TypedDict
@@ -90,6 +92,10 @@ def _genreLabels(recorded_program: RecordedProgram) -> list[str]:
         if len(parts) > 0:
             labels.append(' / '.join(parts)[:160])
     return labels
+
+
+class SeriesAIFallbackBatchBusyError(Exception):
+    """補完バッチの実行中に排他取得を試みたため待たずに失敗した。"""
 
 
 class SeriesAIFallbackTask:
@@ -191,6 +197,46 @@ class SeriesAIFallbackTask:
         cls._current_title = None
         cls._resolved_assignments = {}
         cls._cache_loaded = False
+
+    @classmethod
+    def clearResolvedAssignments(cls) -> None:
+        """確定 cache を破棄し、次回 restore 時に永続表から作り直させる。
+
+        シリーズ DB 削除の直後に呼び、削除済みの AI 確定割当が Indexer rebuild
+        時に再適用されないようにする。worker の停止は行わない。
+
+        Returns:
+            None
+        """
+
+        cls._resolved_assignments = {}
+        cls._cache_loaded = False
+
+    @classmethod
+    @asynccontextmanager
+    async def holdBatchExclusion(cls) -> AsyncGenerator[None]:
+        """補完バッチの実行と排他的に処理を行う領域を提供する。
+
+        `_runBatch()` は遷移・外部待機・確定 cache の再充填まで `_batch_lock` を
+        保持するため、この領域の保持中はバッチの実行も新規開始も起きない。
+        実行中は待たずに例外で失敗し、呼び出し側で 409 へ変換する。
+
+        Yields:
+            排他保持中の制御。
+
+        Raises:
+            SeriesAIFallbackBatchBusyError: 補完バッチの実行中。
+        """
+
+        # locked() 確認と acquire() の間に await が無く、同一ループでは割り込まれない。
+        ## 実行中バッチの完了待ちは行わず、即座に失敗する。
+        if cls._batch_lock.locked():
+            raise SeriesAIFallbackBatchBusyError
+        await cls._batch_lock.acquire()
+        try:
+            yield
+        finally:
+            cls._batch_lock.release()
 
     @classmethod
     async def schedule(cls, *, retry_cancelled: bool = False) -> None:

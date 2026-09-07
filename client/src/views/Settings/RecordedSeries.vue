@@ -276,54 +276,18 @@
                 判定状況を取得できませんでした。
             </div>
 
-            <div class="settings__item">
-                <div class="settings__item-heading">既存録画へ Indexer を再適用</div>
-                <div class="settings__item-label">
-                    保存済みの全録画へ、HonomiTV と同じ確定規則を再適用します。<br>
-                    AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで補完します。<br>
-                    付かなければ所属を外します。自動判定が無効のときは実行できません。<br>
-                </div>
-                <div v-if="series_backfill_unavailable_message !== null"
-                    class="settings__item-label mt-2 text-warning">
-                    {{series_backfill_unavailable_message}}
-                </div>
-            </div>
-            <div class="settings__item">
-                <v-btn class="settings__save-button mt-4" color="background-lighten-2" variant="flat"
-                    :loading="is_starting_backfill"
-                    :disabled="is_backfill_running || is_episode_backfill_running ||
-                        is_series_backfill_available === false"
-                    @click="startBackfill()">
-                    <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="22px" />
-                    既存録画へ規則を再適用
-                </v-btn>
-            </div>
-
             <v-divider class="mt-7" />
             <div class="settings__item">
-                <div class="settings__item-heading">既存録画の一括話数判定</div>
+                <div class="settings__item-heading">シリーズデータベースの削除と一括操作</div>
                 <div class="settings__item-label">
-                    Series 所属済みで、話数が未処理・ローカル判定で不明・移行データで要確認の既存録画を、<br>
-                    保存済みの AI 設定で順番に Web 検索します。<br>
-                    Indexer が単一の正整数を取れた録画は検索しません。<br>
+                    シリーズデータベースの削除・既存録画へ Indexer を再適用・既存録画の一括話数判定は、<br>
+                    メンテナンス画面のシリーズ欄へ移動しました。<br>
                 </div>
             </div>
             <div class="settings__item">
-                <v-progress-linear v-if="is_episode_backfill_running" class="mt-4" color="primary" height="7" rounded
-                    :indeterminate="episode_backfill_progress === null"
-                    :model-value="episode_backfill_progress ?? undefined" />
-                <div v-if="episode_backfill_task !== null" class="settings__item-label mt-2">
-                    {{stageLabel(episode_backfill_task.stage)}}
-                    <template v-if="episode_backfill_progress !== null">
-                        ・{{episode_backfill_progress.toFixed(0)}}%
-                    </template>
-                </div>
-                <v-btn class="settings__save-button mt-4" color="background-lighten-2" variant="flat"
-                    :loading="is_starting_episode_backfill"
-                    :disabled="is_episode_backfill_running || is_backfill_running"
-                    @click="startEpisodeBackfill()">
-                    <Icon icon="fluent:globe-search-20-filled" class="mr-2" width="22px" />
-                    既存録画の話数判定を開始
+                <v-btn class="settings__save-button mt-4" variant="flat"
+                    to="/settings/maintenance">
+                    <Icon icon="fluent:wrench-settings-20-filled" class="mr-2" width="22px" />メンテナンスを開く
                 </v-btn>
             </div>
 
@@ -459,29 +423,12 @@
             </v-card>
         </v-dialog>
 
-        <v-dialog :model-value="backfill_confirmation_dialog" :persistent="is_starting_selected_backfill"
-            max-width="560" @update:model-value="updateBackfillConfirmationDialog">
-            <v-card>
-                <v-card-title>{{backfill_confirmation_title}}</v-card-title>
-                <v-card-text>{{backfill_confirmation_message}}</v-card-text>
-                <v-card-actions>
-                    <v-spacer />
-                    <v-btn variant="text" :disabled="is_starting_selected_backfill"
-                        @click="updateBackfillConfirmationDialog(false)">キャンセル</v-btn>
-                    <v-btn color="primary" variant="flat" :loading="is_starting_selected_backfill"
-                        :disabled="backfill_confirmation_action === null" @click="confirmBackfill()">
-                        判定を開始
-                    </v-btn>
-                </v-card-actions>
-            </v-card>
-        </v-dialog>
-
     </SettingsBase>
 </template>
 
 <script setup lang="ts">
 
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 
 import Message from '@/message';
 import AIBackend, {
@@ -489,7 +436,6 @@ import AIBackend, {
     type IACPBackendCredentialStatus,
     type IOpenAICompatibleSettings,
 } from '@/services/AIBackend';
-import AnalysisTasks, { type IAnalysisTaskExecution } from '@/services/AnalysisTasks';
 import Bangumi, { type IBangumiProfile } from '@/services/Bangumi';
 import RecordedSeries, {
     type AIBackendKind,
@@ -499,7 +445,6 @@ import RecordedSeries, {
     type IRecordedSeriesSettingsUpdate,
     type IRecordedSeriesStatus,
 } from '@/services/RecordedSeries';
-import { stageLabel } from '@/stores/AnalysisTasksStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { dayjs } from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
@@ -569,8 +514,6 @@ const settings = ref<IRecordedSeriesSettings>({
     tmdb_api_key_configured: false,
     tmdb_api_key_masked: null,
 });
-// 一括判定は未保存のフォーム値ではなく、サーバーに保存済みの AI 設定だけを利用する。
-const saved_settings = ref<IRecordedSeriesSettings | null>(null);
 const opencode_services = ref<{title: string; value: string; authConfigured: boolean;}[]>([]);
 const ai_backend_options = computed<AIBackendOption[]>(() => [
     ...opencode_services.value.map(service => ({
@@ -589,9 +532,6 @@ const status = ref<IRecordedSeriesStatus | null>(null);
 const is_loading = ref(true);
 const is_disabled = ref(true);
 const is_saving = ref(false);
-const is_starting_backfill = ref(false);
-const is_starting_episode_backfill = ref(false);
-const is_monitoring_episode_backfill = ref(false);
 const is_refreshing_status = ref(false);
 const authorization_error = ref<'LoginRequired' | 'AdminRequired' | 'UserUnavailable' | null>(null);
 const bangumi_profile = ref<IBangumiProfile | null>(null);
@@ -607,19 +547,9 @@ const is_saving_tmdb_key = ref(false);
 const is_deleting_tmdb_key = ref(false);
 const is_testing_tmdb_connection = ref(false);
 const tmdb_connection_test_message = ref('');
-const episode_backfill_task = ref<IAnalysisTaskExecution | null>(null);
-
-type BackfillConfirmationAction = 'Series' | 'Episode';
-const backfill_confirmation_dialog = ref(false);
-const backfill_confirmation_action = ref<BackfillConfirmationAction | null>(null);
-const backfill_confirmation_force = ref(false);
-const backfill_confirmation_message = ref('');
 
 const is_form_dense = Utils.isSmartphoneHorizontal();
 const user_store = useUserStore();
-
-let episode_backfill_abort_controller: AbortController | null = null;
-let status_polling_timer: number | null = null;
 
 
 /** API の2フィールドを、画面上の1つの選択値へ変換する。 */
@@ -794,37 +724,6 @@ function areBackendTargetsIdentical(
 const is_settings_action_running = computed(() =>
     is_saving.value,
 );
-const is_backfill_running = computed(() =>
-    is_starting_backfill.value || status.value?.is_running === true,
-);
-const is_episode_backfill_running = computed(() =>
-    is_starting_episode_backfill.value ||
-    is_monitoring_episode_backfill.value ||
-    status.value?.is_episode_running === true,
-);
-const is_starting_selected_backfill = computed(() => {
-    if (backfill_confirmation_action.value === 'Series') return is_starting_backfill.value;
-    if (backfill_confirmation_action.value === 'Episode') return is_starting_episode_backfill.value;
-    return false;
-});
-const backfill_confirmation_title = computed(() =>
-    backfill_confirmation_action.value === 'Episode' ?
-        '既存録画の一括話数判定' :
-        '既存録画へ Indexer を再適用',
-);
-const series_backfill_unavailable_message = computed(() => {
-    if (saved_settings.value?.enabled === false) {
-        return '「新しい録画を自動でシリーズ判定する」が無効なため、既存録画への再適用を開始できません。';
-    }
-    return null;
-});
-const is_series_backfill_available = computed(() => series_backfill_unavailable_message.value === null);
-const episode_backfill_progress = computed(() => {
-    if (episode_backfill_task.value?.progress === null || episode_backfill_task.value?.progress === undefined) {
-        return null;
-    }
-    return Math.max(0, Math.min(100, episode_backfill_task.value.progress * 100));
-});
 
 /** 画面上の全ドラフトを保存 payload へ変換する。 */
 function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
@@ -880,10 +779,9 @@ function applyFetchedSettings(fetched_settings: IRecordedSeriesSettings): void {
         ai_fallback_backend_auth_configured: fetched_settings.ai_fallback_backend_auth_configured,
     };
     settings.value = {...normalized_settings};
-    saved_settings.value = {...normalized_settings};
 }
 
-/** 判定状況を更新し、バックフィル終了後は定期取得を止める。 */
+/** 判定状況を更新する。一括操作はメンテナンス画面へ移設したため追跡しない。 */
 async function refreshStatus(show_error = false): Promise<void> {
     if (is_refreshing_status.value) return;
     is_refreshing_status.value = true;
@@ -892,25 +790,6 @@ async function refreshStatus(show_error = false): Promise<void> {
     if (fetched_status === null) return;
 
     status.value = fetched_status;
-    if (
-        fetched_status.is_running === false &&
-        fetched_status.is_episode_running === false &&
-        is_monitoring_episode_backfill.value === false
-    ) {
-        stopStatusPolling();
-    }
-}
-
-/** 実行中の一括判定を、画面再読み込み後も状況 API から追跡する。 */
-function startStatusPolling(): void {
-    if (status_polling_timer !== null) return;
-    status_polling_timer = window.setInterval(() => void refreshStatus(), 3000);
-}
-
-function stopStatusPolling(): void {
-    if (status_polling_timer === null) return;
-    window.clearInterval(status_polling_timer);
-    status_polling_timer = null;
 }
 
 /** サーバー共有設定を保存する。API キー入力は保存成功後だけ破棄する。 */
@@ -930,106 +809,6 @@ async function saveSettings(): Promise<void> {
     is_saving.value = false;
 }
 
-
-/** 既存録画へ Indexer を再適用する前に、範囲を確認する。 */
-function startBackfill(): void {
-    if (is_backfill_running.value || is_episode_backfill_running.value) return;
-    if (is_series_backfill_available.value === false) {
-        Message.warning('自動判定を有効にしてから既存録画へ規則を再適用してください。');
-        return;
-    }
-    backfill_confirmation_action.value = 'Series';
-    backfill_confirmation_force.value = false;
-    backfill_confirmation_message.value =
-        'HonomiTV と同じ確定規則を保存済みの全録画へ再適用します。AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで Web 検索します。続行しますか？';
-    backfill_confirmation_dialog.value = true;
-}
-
-/** 確認ダイアログを閉じ、次に開いた操作へ古い対象を持ち越さない。 */
-function updateBackfillConfirmationDialog(value: boolean): void {
-    if (value === false && is_starting_selected_backfill.value) return;
-    backfill_confirmation_dialog.value = value;
-    if (value === false) {
-        backfill_confirmation_action.value = null;
-        backfill_confirmation_message.value = '';
-    }
-}
-
-/** 確認時に固定した操作種別と force 値で、対応する一括判定を開始する。 */
-async function confirmBackfill(): Promise<void> {
-    const action = backfill_confirmation_action.value;
-    const force = backfill_confirmation_force.value;
-    if (action === null || is_starting_selected_backfill.value) return;
-
-    if (action === 'Series') {
-        await runBackfill(force);
-    } else {
-        await runEpisodeBackfill(force);
-    }
-}
-
-/** 既存録画へ Indexer の確定規則を再適用する。完了まで API 応答を待つ。 */
-async function runBackfill(_force: boolean): Promise<void> {
-
-    is_starting_backfill.value = true;
-    const accepted = await RecordedSeries.startBackfill(false);
-    is_starting_backfill.value = false;
-    if (accepted === null) return;
-    updateBackfillConfirmationDialog(false);
-    await refreshStatus();
-    Message.success('既存録画へ Indexer の規則を再適用しました。');
-}
-
-/** 既存録画の一括話数判定を開始する前に、利用量と検索範囲を確認する。 */
-function startEpisodeBackfill(): void {
-    if (is_episode_backfill_running.value || is_backfill_running.value) return;
-    backfill_confirmation_action.value = 'Episode';
-    backfill_confirmation_force.value = false;
-    backfill_confirmation_message.value =
-        '話数が未確定の既存録画を、保存済みの AI 設定で Web 検索します。Indexer が単一の正整数を取れた録画は検索しません。続行しますか？';
-    backfill_confirmation_dialog.value = true;
-}
-
-/** Series所属済みの既存録画を対象に、バックグラウンドで話数Web検索を実行する。 */
-async function runEpisodeBackfill(force: boolean): Promise<void> {
-
-    is_starting_episode_backfill.value = true;
-    const accepted = await RecordedSeries.startEpisodeBackfill(false);
-    is_starting_episode_backfill.value = false;
-    if (accepted === null) return;
-    updateBackfillConfirmationDialog(false);
-
-    status.value = status.value === null ? null : {...status.value, is_episode_running: true};
-    is_monitoring_episode_backfill.value = true;
-    startStatusPolling();
-    Message.info(
-        accepted.reused ?
-            '実行中の一括話数判定を引き続き監視します。' :
-            '既存録画の一括話数判定を開始しました。',
-    );
-
-    // シリーズ一括判定とは別の履歴IDを追跡し、進捗と完了通知を混同しない。
-    episode_backfill_abort_controller?.abort();
-    episode_backfill_abort_controller = new AbortController();
-    const execution = await AnalysisTasks.waitForCompletion(
-        accepted.execution_id,
-        episode_backfill_abort_controller.signal,
-        task => episode_backfill_task.value = task,
-    );
-    if (episode_backfill_abort_controller.signal.aborted) return;
-
-    is_monitoring_episode_backfill.value = false;
-    await refreshStatus();
-    if (execution?.status === 'Succeeded') {
-        Message.success('既存録画の一括話数判定が完了しました。');
-    } else if (execution?.status === 'Interrupted') {
-        Message.warning('既存録画の一括話数判定が中断されました。');
-    } else if (execution !== null) {
-        Message.error(
-            `既存録画の一括話数判定に失敗しました。${execution.error_message ? `\n${execution.error_message}` : ''}`,
-        );
-    }
-}
 
 function formatLastRunAt(value: string | null): string {
     return value === null ? '未実行' : dayjs(value).format('YYYY/M/D HH:mm:ss');
@@ -1196,15 +975,9 @@ onMounted(async () => {
     }
     if (fetched_status !== null) {
         status.value = fetched_status;
-        if (fetched_status.is_running || fetched_status.is_episode_running) startStatusPolling();
     }
     bangumi_profile.value = fetched_bangumi;
     is_loading.value = false;
-});
-
-onUnmounted(() => {
-    episode_backfill_abort_controller?.abort();
-    stopStatusPolling();
 });
 
 </script>

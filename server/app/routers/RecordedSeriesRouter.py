@@ -14,6 +14,7 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from tortoise import transactions
 from tortoise.expressions import Q
 from typing_extensions import TypedDict
 
@@ -25,6 +26,7 @@ from app.metadata.RecordedEpisodeAutomation import (
     RecordedEpisodeRelookupDisabledError,
 )
 from app.metadata.RecordedEpisodeMessages import GetRecordedEpisodeErrorMessage
+from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesResolver import (
     RecordedSeriesProgramNotFoundError,
     RecordedSeriesResolver,
@@ -35,11 +37,25 @@ from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettingsResponse,
     RecordedSeriesSettingsStore,
 )
-from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
+from app.metadata.SeriesAIFallbackTask import (
+    SeriesAIFallbackBatchBusyError,
+    SeriesAIFallbackTask,
+)
 from app.metadata.SeriesIndexer import SeriesIndexer
+from app.models.KonomiTVBS4KBangumiEpisodeCompletion import (
+    KonomiTVBS4KBangumiEpisodeCompletion,
+)
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
+from app.models.RecordedSeries import (
+    RecordedSeriesAIRequest,
+    RecordedSeriesResolution,
+    RecordedSeriesRule,
+)
 from app.models.Series import Series
+from app.models.SeriesAIFallback import SeriesAIFallback
+from app.models.SeriesAlias import SeriesAlias
+from app.models.SeriesBroadcastPeriod import SeriesBroadcastPeriod
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
 from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
@@ -137,6 +153,23 @@ class RecordedSeriesBackfillRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     force: bool = False
+
+
+class RecordedSeriesDatabaseDeleteResponse(BaseModel):
+    """シリーズ DB 削除で消した表ごとの行数。録画本体は含まない。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    series: int
+    series_episodes: int
+    series_aliases: int
+    series_broadcast_periods: int
+    series_ai_fallbacks: int
+    recorded_series_rules: int
+    recorded_series_resolutions: int
+    recorded_series_ai_requests: int
+    recorded_episode_resolutions: int
+    bangumi_episode_completions: int
 
 
 class RecordedSeriesManagementItem(BaseModel):
@@ -1130,6 +1163,154 @@ async def RecordedEpisodeBackfillAPI(
         execution_id=accepted.execution_id,
         reused=accepted.reused,
     )
+
+
+@router.delete(
+    "/database",
+    summary="シリーズデータベース削除 API",
+    response_model=RecordedSeriesDatabaseDeleteResponse,
+)
+async def RecordedSeriesDatabaseDeleteAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> RecordedSeriesDatabaseDeleteResponse:
+    """シリーズ関連データだけを単一トランザクションで削除する。
+
+    録画本体・サムネイル・CM 解析・視聴履歴・ユーザー/チャンネルは残し、
+    番組のシリーズ関連列だけ NULL 化する。Indexer 再適用は自動起動しない。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        counts = await _DeleteSeriesDatabase()
+    except _SeriesDatabaseBusyError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                'Series AI fallback batch is running.'
+                if ex.reason == 'AIFallbackRunning'
+                else 'Episode backfill is running.'
+            ),
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    return RecordedSeriesDatabaseDeleteResponse.model_validate({
+        'series': counts['series'],
+        'series_episodes': counts['series_episodes'],
+        'series_aliases': counts['series_aliases'],
+        'series_broadcast_periods': counts['series_broadcast_periods'],
+        'series_ai_fallbacks': counts['series_ai_fallbacks'],
+        'recorded_series_rules': counts['recorded_series_rules'],
+        'recorded_series_resolutions': counts['recorded_series_resolutions'],
+        'recorded_series_ai_requests': counts['recorded_series_ai_requests'],
+        'recorded_episode_resolutions': counts['recorded_episode_resolutions'],
+        'bangumi_episode_completions': counts['bangumi_episode_completions'],
+    })
+
+
+class _SeriesDatabaseBusyError(Exception):
+    """削除中に走らせてはいけないバッチが実行中のため削除できない。"""
+
+    def __init__(self, reason: Literal['AIFallbackRunning', 'EpisodeBackfillRunning']) -> None:
+        """実行中バッチの種別を保持する。
+
+        Args:
+            reason: 409 の原因となった実行中バッチ。
+        """
+
+        super().__init__(reason)
+        # 呼び出し元の HTTP 変換が参照する実行中バッチ種別。
+        self.reason = reason
+
+
+class _SeriesDatabaseDeleteCounts(TypedDict):
+    """シリーズ DB 削除で消した行数の概要。録画本体の行数は含まない。"""
+
+    series: int
+    series_episodes: int
+    series_aliases: int
+    series_broadcast_periods: int
+    series_ai_fallbacks: int
+    recorded_series_rules: int
+    recorded_series_resolutions: int
+    recorded_series_ai_requests: int
+    recorded_episode_resolutions: int
+    bangumi_episode_completions: int
+
+
+async def _DeleteSeriesDatabase() -> _SeriesDatabaseDeleteCounts:
+    """シリーズ関連データを排他境界の中で削除し、件数概要を返す。
+
+    補完バッチの batch lock を非待機で取得し、話数解決 lock を保持したまま
+    判定・commit・cache clear を行う。実行中バッチがある場合は待たずに失敗
+    し、新規バッチ開始は lock で直列化する。開始済み backfill の最初の解決は
+    lock に止まり、削除確定後の状態で安全に skip する。話数の実行中判定は
+    lock 待ちの前後で行い、完了後の status だけでの可否判断にしない。
+
+    Returns:
+        表ごとの削除行数。
+
+    Raises:
+        _SeriesDatabaseBusyError: AI 補完バッチまたは話数一括判定の実行中。
+    """
+
+    # 話数一括判定・単票再検索の実行中は resolution lock 待ちへ入る前に拒否する。
+    ## 完了後の status だけでは実行中を見逃すため、lock 保持中に再判定する。
+    pre_delete_status = await RecordedEpisodeAutomation.getStatus()
+    if bool(pre_delete_status['is_episode_running']):
+        raise _SeriesDatabaseBusyError('EpisodeBackfillRunning')
+    try:
+        # holdBatchExclusion() は非待機で取得する。実行中は待たずに例外で失敗する。
+        async with SeriesAIFallbackTask.holdBatchExclusion():
+            async with RECORDED_SERIES_RESOLUTION_LOCK:
+                # lock 待ちの間に開始・終了した話数バッチを最終判定する。
+                episode_status = await RecordedEpisodeAutomation.getStatus()
+                if bool(episode_status['is_episode_running']):
+                    raise _SeriesDatabaseBusyError('EpisodeBackfillRunning')
+                async with transactions.in_transaction() as connection:
+                    # CASCADE で録画本体が消えないよう、先に番組側の関連列だけ NULL 化する。
+                    ## episode_number は Indexer が EPG から再導出するため、再適用で復元する。
+                    await RecordedProgram.all().using_db(connection).update(
+                        series_id=None,
+                        series_broadcast_period_id=None,
+                        series_title=None,
+                        episode_number=None,
+                        series_episode_id=None,
+                        bangumi_episode_id=None,
+                    )
+                    counts = _SeriesDatabaseDeleteCounts(
+                        series=await Series.all().using_db(connection).count(),
+                        series_episodes=await SeriesEpisode.all().using_db(connection).count(),
+                        series_aliases=await SeriesAlias.all().using_db(connection).count(),
+                        series_broadcast_periods=await SeriesBroadcastPeriod.all().using_db(connection).count(),
+                        series_ai_fallbacks=await SeriesAIFallback.all().using_db(connection).count(),
+                        recorded_series_rules=await RecordedSeriesRule.all().using_db(connection).count(),
+                        recorded_series_resolutions=await RecordedSeriesResolution.all().using_db(connection).count(),
+                        recorded_series_ai_requests=await RecordedSeriesAIRequest.all().using_db(connection).count(),
+                        recorded_episode_resolutions=await RecordedEpisodeResolution.all().using_db(connection).count(),
+                        bangumi_episode_completions=await KonomiTVBS4KBangumiEpisodeCompletion.all().using_db(connection).count(),
+                    )
+                    # 子表から親表の順に消し、外部キー制約の有無に依らず成立させる。
+                    await RecordedEpisodeResolution.all().using_db(connection).delete()
+                    await RecordedSeriesAIRequest.all().using_db(connection).delete()
+                    await RecordedSeriesResolution.all().using_db(connection).delete()
+                    await RecordedSeriesRule.all().using_db(connection).delete()
+                    await SeriesAIFallback.all().using_db(connection).delete()
+                    await KonomiTVBS4KBangumiEpisodeCompletion.all().using_db(connection).delete()
+                    await SeriesAlias.all().using_db(connection).delete()
+                    await SeriesBroadcastPeriod.all().using_db(connection).delete()
+                    await SeriesEpisode.all().using_db(connection).delete()
+                    await Series.all().using_db(connection).delete()
+
+                # commit 成功後に確定 cache を破棄する。rollback 時は古い cache を残す。
+                ## batch lock 保持中のため、破棄後の再充填は起きない。
+                SeriesAIFallbackTask.clearResolvedAssignments()
+                logging.info(
+                    '[RecordedSeriesDatabase] Deleted series database. '
+                    f'[series: {counts["series"]}]',
+                )
+                return counts
+    except SeriesAIFallbackBatchBusyError:
+        raise _SeriesDatabaseBusyError('AIFallbackRunning') from None
 
 
 @router.get(
