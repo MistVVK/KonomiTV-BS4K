@@ -365,7 +365,9 @@ watch(() => route.fullPath, async () => {
 
 .series-home__grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    // ポスターウォールとして列を細くする。2:3 の縦画像でカードが高くなっても、
+    // 1画面あたりの件数が旧横長カード (min 220px・画像高さ 124px) と同程度に収まる幅。
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
     gap: 14px;
 }
 
@@ -387,7 +389,9 @@ watch(() => route.fullPath, async () => {
 
 .series-card__image {
     width: 100%;
-    height: 124px;
+    // Bangumi / TMDb の縦長ポスターを切らない 2:3 枠。録画サムネ (16:9) やロゴ fallback も
+    // 同じ枠へ object-fit: cover でトリミングし、ポスター有無でカードの縦横を混ぜない。
+    aspect-ratio: 2 / 3;
     object-fit: cover;
     background: rgb(var(--v-theme-background-lighten-2));
 }
