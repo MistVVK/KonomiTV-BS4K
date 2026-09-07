@@ -32,6 +32,10 @@ from app.metadata.ai.recorded_series_ai import (
     lookup_episode as ai_lookup_episode,
 )
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
+from app.metadata.RecordedEpisodeCatalogBind import (
+    ShouldProtectCatalogValue,
+    TryBindCatalogEpisode,
+)
 from app.metadata.RecordedEpisodeContext import (
     BuildEpisodeInputFingerprint,
     BuildRecordedEpisodeLookupContext,
@@ -87,6 +91,8 @@ class _EpisodeProgramSnapshot:
     channel_id: str | None
     channel_name: str | None
     start_time: datetime
+    # カタログ照合の尺キーに使う録画尺（秒）。不明なときは None。
+    duration: float | None = None
 
 
 def _getBroadcastPartNumbers(snapshot: _EpisodeProgramSnapshot) -> set[Decimal]:
@@ -185,6 +191,7 @@ def _buildInputFingerprint(snapshot: _EpisodeProgramSnapshot) -> str:
             "detail": snapshot.detail,
             "channel_id": snapshot.channel_id,
             "start_time": snapshot.start_time.isoformat(),
+            "duration": snapshot.duration,
         }
     )
 
@@ -211,6 +218,7 @@ def _snapshotFromProgram(
         channel_id=recorded_program.channel_id,
         channel_name=channel_name,
         start_time=recorded_program.start_time,
+        duration=recorded_program.duration,
     )
 
 
@@ -760,6 +768,8 @@ class RecordedEpisodeAutomation:
         write_legacy_value: bool,
         rationale_short: str | None = None,
         input_fingerprint: str | None = None,
+        bangumi_subject_id: int | None = None,
+        bangumi_episode_id: int | None = None,
         ai_request: RecordedSeriesAIRequest | None = None,
         ai_request_status: Literal["Succeeded", "Failed", "Rejected"] | None = None,
         ai_request_result: EpisodeLookupResult | None = None,
@@ -772,6 +782,9 @@ class RecordedEpisodeAutomation:
         Args:
             allow_manual_overwrite: 単票再検索の受理結果で Manual を WebSearch へ
                 置き換えることを許可するか。通常の自動判定では False。
+            bangumi_subject_id: カタログで採用した Bangumi 条目 ID。指定時は
+                episode ID と対で直接保存し、旧整数での選び直しを行わない。
+            bangumi_episode_id: カタログで採用した Bangumi episode ID。
         """
 
         legacy_value = FormatEpisodeNumber(season_number, episode_number)
@@ -837,6 +850,14 @@ class RecordedEpisodeAutomation:
             if write_legacy_value:
                 recorded_program.episode_number = legacy_value
                 update_fields.append("episode_number")
+            # カタログで採用した Bangumi ID は同一トランザクションで直接保存する。
+            ## 旧整数での選び直しは独一照合を覆すため行わない。
+            if bangumi_subject_id is not None:
+                recorded_program.bangumi_subject_id = bangumi_subject_id
+                update_fields.append("bangumi_subject_id")
+            if bangumi_episode_id is not None:
+                recorded_program.bangumi_episode_id = bangumi_episode_id
+                update_fields.append("bangumi_episode_id")
             await recorded_program.save(
                 update_fields=update_fields, using_db=connection
             )
@@ -881,8 +902,10 @@ class RecordedEpisodeAutomation:
                     connection=connection,
                 )
         # 整数話数が確定したあとでだけ Bangumi episode を結び、Indexer 整数時は Web 検索前に Local 経路へ乗る。
-        from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
-        await KonomiTVBS4KBangumiClient.bindRecordedProgramById(snapshot.id)
+        ## カタログで採用した ID を直接保存した場合は選び直さない。
+        if bangumi_episode_id is None:
+            from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+            await KonomiTVBS4KBangumiClient.bindRecordedProgramById(snapshot.id)
         return True
 
     @classmethod
@@ -1379,6 +1402,71 @@ class RecordedEpisodeAutomation:
         )
 
     @classmethod
+    async def _tryApplyCatalogBind(
+        cls,
+        snapshot: _EpisodeProgramSnapshot,
+        resolution_id: int,
+    ) -> Literal['Applied', 'Undecided', 'Passed']:
+        """カタログ照合の3状態に従い、確定または後続分岐の指示を返す。
+
+        Matched のときだけ AI 検索なしでシーズン込み確定する。Undecided
+        （カタログ取得済み・非独一）のときは整数 fast path を抑止して
+        EpisodeLookup へ進める。Unknown（不在・取得失敗）は既存動作のままと
+        する。手動確定は _applyResolvedEpisode 側の保護で上書きしない。
+
+        Args:
+            snapshot: 話数検索対象の録画メタデータ。
+            resolution_id: 適用先 RecordedEpisodeResolution ID。
+
+        Returns:
+            Applied（確定済み）、Undecided（整数抑止して既存検索へ）、
+                Passed（既存動作のまま）のいずれか。
+        """
+
+        try:
+            result = await TryBindCatalogEpisode(
+                series_id=snapshot.series_id,
+                title=snapshot.title,
+                subtitle=snapshot.subtitle,
+                start_time=snapshot.start_time,
+                duration_seconds=snapshot.duration,
+            )
+        except Exception as ex:
+            # 基盤異常でも既存検索へ落とす。課金済み結果の保全と異なり、
+            ## 未確定の best-effort には失敗の記録を残さない。
+            logging.warning(
+                '[RecordedEpisodeAutomation] Catalog episode binding skipped. '
+                f'recorded_program_id: {snapshot.id}, error: {type(ex).__name__}',
+            )
+            return 'Passed'
+        if result.status == 'Undecided':
+            return 'Undecided'
+        bound = result.bound
+        if bound is None:
+            return 'Passed'
+        # 旧 episode_number 文字列は互換性と移行監査のため書き換えない。
+        ## 整数 fast path と同じく、カタログ確定も決定論的 Local として保存する。
+        applied = await cls._applyResolvedEpisode(
+            snapshot=snapshot,
+            resolution_id=resolution_id,
+            season_number=bound.season_number,
+            episode_number=bound.episode_number,
+            source='Local',
+            provider_fingerprint=None,
+            confidence=None,
+            citations=[],
+            ai_model=None,
+            write_legacy_value=False,
+            bangumi_subject_id=(
+                bound.catalog_subject_id if bound.catalog == 'Bangumi' else None
+            ),
+            bangumi_episode_id=(
+                bound.catalog_episode_id if bound.catalog == 'Bangumi' else None
+            ),
+        )
+        return 'Applied' if applied else 'Passed'
+
+    @classmethod
     async def resolveProgram(
         cls,
         recorded_program_id: int,
@@ -1410,6 +1498,87 @@ class RecordedEpisodeAutomation:
         Returns:
             確定状態、出典、AI呼び出し有無。
         """
+
+        # 公式カタログの照合は EpisodeLookup より先に行う。決定論的で課金を
+        ## 伴わないため、既存の整数 fast path と同じ扱いにする。カタログ Series の
+        ## 通常評価でも毎回再検証し、旧整数の Season 1 既定へ戻さない。取得済みで
+        ## 非独一のときは整数 fast path を抑止して EpisodeLookup へ進める。
+        ## ネットワーク待機中は解決 lock を保持せず、適用時の競合は
+        ## _applyResolvedEpisode 側で検出する。
+        catalog_undecided = False
+        catalog_protect_differing = False
+        catalog_snapshot = await cls._loadSnapshot(recorded_program_id)
+        if catalog_snapshot is not None:
+            catalog_resolution = await cls._getOrCreateResolution(catalog_snapshot)
+            catalog_eligible = (
+                (expected_series_id is None or (
+                    catalog_snapshot.series_id == expected_series_id
+                    and catalog_snapshot.series_episode_id == expected_series_episode_id
+                ))
+                and (
+                    catalog_resolution.source != 'Manual'
+                    or override_manual
+                )
+            )
+            if catalog_eligible:
+                catalog_outcome = await cls._tryApplyCatalogBind(
+                    catalog_snapshot,
+                    catalog_resolution.id,
+                )
+                if catalog_outcome == 'Applied':
+                    return RecordedEpisodeAutomationResult(
+                        recorded_program_id,
+                        'Resolved',
+                        'Catalog',
+                        False,
+                    )
+                if catalog_outcome == 'Undecided':
+                    catalog_undecided = True
+                elif await ShouldProtectCatalogValue(
+                    series_id=catalog_snapshot.series_id,
+                    resolution_source=catalog_resolution.source,
+                    series_episode_id=catalog_snapshot.series_episode_id,
+                    legacy_episode_number=catalog_snapshot.legacy_episode_number,
+                ):
+                    # Unknown でもカタログ確定済み構造を旧整数へ戻さない。自動評価では
+                    ## 保持して早期復帰し、明示の単票再検索だけ整数抑止のまま AI へ進める。
+                    if apply_accepted_lookup is False:
+                        stored_status = catalog_resolution.status
+                        keep_status: Literal[
+                            'Resolved',
+                            'NotNumbered',
+                            'NoPublishedNumber',
+                            'NeedsReview',
+                            'Failed',
+                            'Skipped',
+                        ] = (
+                            cast(
+                                Literal[
+                                    'Resolved',
+                                    'NotNumbered',
+                                    'NoPublishedNumber',
+                                    'NeedsReview',
+                                    'Failed',
+                                ],
+                                stored_status,
+                            )
+                            if stored_status
+                            in {
+                                'Resolved',
+                                'NotNumbered',
+                                'NoPublishedNumber',
+                                'NeedsReview',
+                                'Failed',
+                            }
+                            else 'Skipped'
+                        )
+                        return RecordedEpisodeAutomationResult(
+                            recorded_program_id,
+                            keep_status,
+                            catalog_resolution.source or 'Local',
+                            False,
+                        )
+                    catalog_protect_differing = True
 
         async with RECORDED_SERIES_RESOLUTION_LOCK:
             snapshot = await cls._loadSnapshot(recorded_program_id)
@@ -1466,7 +1635,12 @@ class RecordedEpisodeAutomation:
             )
 
             # 既存の構造化 Episode は、現在の単一正整数話数と一致するときだけ再利用する。
-            if force is False and snapshot.series_episode_id is not None:
+            ## カタログ取得済み・非独一のときは整数だけで再確定せず EpisodeLookup へ進める。
+            if (
+                force is False
+                and catalog_undecided is False
+                and snapshot.series_episode_id is not None
+            ):
                 episode = await SeriesEpisode.filter(
                     id=snapshot.series_episode_id,
                     series_id=snapshot.series_id,
@@ -1511,7 +1685,14 @@ class RecordedEpisodeAutomation:
                     )
 
             # 単一正整数だけ Web 検索を抑止する。0・小数・範囲はフォールバックへ進む。
-            if has_single_positive_integer and parsed_episode is not None:
+            ## カタログ取得済み・非独一、または Unknown でも確定済み構造の保護対象のときは
+            ## 整数だけで確定せず EpisodeLookup へ進める。
+            if (
+                has_single_positive_integer
+                and parsed_episode is not None
+                and catalog_undecided is False
+                and catalog_protect_differing is False
+            ):
                 applied = await cls._applyResolvedEpisode(
                     snapshot=snapshot,
                     resolution_id=resolution.id,

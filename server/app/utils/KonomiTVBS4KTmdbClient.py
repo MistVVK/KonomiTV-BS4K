@@ -64,6 +64,18 @@ class TmdbSeriesDetails(TypedDict):
     season_numbers: list[int]
 
 
+class TmdbSeasonEpisode(TypedDict):
+    """話数照合に使う TMDb シーズンエピソード1件。"""
+
+    episode_number: int
+    tmdb_episode_id: int
+    name: str
+    # YYYY-MM-DD。不明なときは空文字。
+    air_date: str
+    # 本編尺（分）。不明なときは None。
+    runtime: int | None
+
+
 @dataclass(frozen=True, slots=True)
 class TmdbConnectionTestResult:
     """TMDb 接続試験の結果。API キー本体を含めない。"""
@@ -347,6 +359,62 @@ class KonomiTVBS4KTmdbClient:
             ):
                 raise ValueError('TMDb episode is invalid.')
             result.append((episode['episode_number'], episode['id']))
+        return result
+
+
+    @classmethod
+    async def getSeasonEpisodeDetails(
+        cls,
+        tmdb_id: int,
+        season_number: int,
+        api_key: str,
+    ) -> list[TmdbSeasonEpisode]:
+        """
+        TV シーズンの通常エピソードを、話数照合に必要な欄付きで取得する。
+
+        Args:
+            tmdb_id (int): TMDb の TV 作品 ID。
+            season_number (int): シーズン番号。
+            api_key (str): TMDb API キー。
+
+        Returns:
+            list[TmdbSeasonEpisode]: 照合用の名前・放送日・尺を含むエピソード。
+
+        Raises:
+            httpx.HTTPError: 接続失敗、タイムアウト、404 以外の HTTP エラー。
+            ValueError: 応答が無い、または想定外の形状の場合。
+        """
+
+        # getSeasonEpisodes() と同じ言語・パスの応答を使い、照合に要る欄だけ足す。
+        ## 番号と ID の検証も同じ基準にし、構造組み立てと照合で別物を見ない。
+        payload = await cls._getJSON(
+            f'/tv/{tmdb_id}/season/{season_number}',
+            api_key,
+            {'language': cls.PRIMARY_LANGUAGE},
+        )
+        if payload is None:
+            raise ValueError('TMDb season was not found.')
+        episodes = payload.get('episodes')
+        if not isinstance(episodes, list):
+            raise ValueError('TMDb episodes response is invalid.')
+        result: list[TmdbSeasonEpisode] = []
+        for episode in episodes:
+            if (
+                not isinstance(episode, dict)
+                or type(episode.get('episode_number')) is not int
+                or type(episode.get('id')) is not int
+                or episode['episode_number'] < 1
+                or episode['id'] < 1
+            ):
+                raise ValueError('TMDb episode is invalid.')
+            runtime = episode.get('runtime')
+            result.append(TmdbSeasonEpisode(
+                episode_number=episode['episode_number'],
+                tmdb_episode_id=episode['id'],
+                name=' '.join(str(episode.get('name') or '').split()),
+                air_date=str(episode.get('air_date') or ''),
+                runtime=runtime if type(runtime) is int and runtime > 0 else None,
+            ))
         return result
 
 
