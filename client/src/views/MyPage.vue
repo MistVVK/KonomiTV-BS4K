@@ -27,7 +27,7 @@
                             </div>
                             <v-btn class="analysis-tasks__history-button" to="/analysis-history/" variant="text" size="small">履歴</v-btn>
                         </div>
-                        <template v-if="analysisTasksStore.activeTaskStatus !== null">
+                        <template v-if="isBackgroundTasksSectionVisible">
                             <div class="analysis-tasks__section-title">
                                 {{backgroundTaskStatusLabel(analysisTasksStore.activeTaskStatus)}}
                             </div>
@@ -44,7 +44,8 @@
                                     rounded :model-value="group.progress * 100" />
                                 <v-progress-linear v-else class="mt-2" color="primary" height="5" rounded indeterminate />
                             </button>
-                            <button v-if="analysisTasksStore.seriesAIFallbackStatus !== null" v-ripple type="button"
+                            <button v-if="analysisTasksStore.seriesAIFallbackStatus?.state === 'Running' ||
+                                analysisTasksStore.seriesAIFallbackStatus?.state === 'Stopped'" v-ripple type="button"
                                 class="analysis-task analysis-task--active"
                                 aria-label="シリーズ AI 補完の現在の処理を表示"
                                 @click="openActiveAnalysisTaskDialog('SeriesAIFallback')">
@@ -105,7 +106,7 @@
 <script lang="ts" setup>
 
 import { storeToRefs } from 'pinia';
-import { onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 
 import HeaderBar from '@/components/HeaderBar.vue';
 import KonomiTVBS4KActiveAnalysisTaskDialog from '@/components/KonomiTVBS4KActiveAnalysisTaskDialog.vue';
@@ -124,6 +125,13 @@ const userStore = useUserStore();
 const versionStore = useVersionStore();
 const analysisTasksStore = useAnalysisTasksStore();
 const { activeTaskGroups } = storeToRefs(analysisTasksStore);
+// 表示すべきエントリがあるときだけセクションを出す。シリーズ AI 補完はナビと同じ Running/Stopped ゲート。
+// activeTaskStatus !== null に直接依存すると、AI 補完が Idle のときに 'Idle' が返って
+// 他に実行中タスクが無くてもセクションタイトル「待機中」だけが残ってしまう。
+const isBackgroundTasksSectionVisible = computed(() =>
+    activeTaskGroups.value.length > 0 ||
+    analysisTasksStore.seriesAIFallbackStatus?.state === 'Running' ||
+    analysisTasksStore.seriesAIFallbackStatus?.state === 'Stopped');
 const activeAnalysisTaskDialog = ref(false);
 const selectedActiveTaskType = ref<BackgroundTaskType | null>(null);
 
