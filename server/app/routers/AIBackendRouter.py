@@ -68,6 +68,7 @@ from app.metadata.ai.opencode_runtime import (
 from app.metadata.ai.recorded_series_ai import (
     GetACPCredentialOperationLock,
     GetAcpModelCatalog,
+    IsACPBackendKindRunning,
     IsACPOperationRunning,
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
@@ -1439,7 +1440,8 @@ def _ACPBackendConnectionTestPreflightError(
             'ACPAuthenticationUnavailable',
             'Grok Build 認証が未取り込みのため接続テストを実行できません。',
         )
-    if IsACPOperationRunning():
+    # 対象 provider の実行枠だけを見る。別 provider の実行中バッチがあっても拒否しない。
+    if IsACPBackendKindRunning(backend_kind):
         return (
             'ACPOperationBusy',
             '別の ACP AI 処理を実行中のため、完了後に接続テストを実行してください。',

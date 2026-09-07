@@ -69,7 +69,13 @@ from app.metadata.RecordedSeriesGeneration import (
 
 
 _ACP_PROTOCOL_VERSION = 1
-_ACP_SEMAPHORE = asyncio.Semaphore(1)
+# ACP agent の同時実行上限は provider ごとに1件とする。Codex と Grok の実行資源
+# （CLI process・profile・workspace）は provider 専用のため、異なる provider 間の
+# 並列実行を許す。各呼び出しは backend_kind 確定後に単一の semaphore だけを取る。
+_ACP_SEMAPHORES: dict[str, asyncio.Semaphore] = {
+    'AcpCodex': asyncio.Semaphore(1),
+    'AcpGrok': asyncio.Semaphore(1),
+}
 # agent が進捗を出し続けても、Semaphore 待機から process 回収までを必ず有限にする。
 # 利用者が調整する無通信タイムアウトとは独立した、サーバー側の最終安全上限。
 # 文言導出元は RecordedEpisodeMessages.ACP_HARD_TIMEOUT_SEC。テストは本名を monkeypatch する。
@@ -2702,11 +2708,16 @@ async def _run_acp_with_deadline(
     """
 
     execution_trace = trace or _AcpExecutionTrace()
+    semaphore = _ACP_SEMAPHORES.get(backend_kind)
+    if semaphore is None:
+        # 未知の backend_kind を共有枠へ黙って落とさない。5 呼び出し元はすべて
+        # _AcpProtocolError を捕捉して ACPProtocolError へ写像する。
+        raise _AcpProtocolError('ACP execution was requested for an unsupported backend.')
     try:
         # 待ち行列を含む実行全体には固定の最終上限を設ける。通常の長時間推論は
         # 行ごとの無通信タイマーを更新しながら続行できるが、永久占有は許可しない。
         async with asyncio.timeout(_ACP_HARD_TIMEOUT_SEC):
-            async with _ACP_SEMAPHORE:
+            async with semaphore:
                 return await _run_acp_session(
                     command,
                     args,

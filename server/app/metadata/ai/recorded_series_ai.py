@@ -87,9 +87,15 @@ _EPISODE_LOOKUP_CAPABILITY_PROOFS_LOCK = threading.RLock()
 # fingerprint 挿入順を保ち、上限超過時は最古を捨てる。
 _EPISODE_LOOKUP_CAPABILITY_PROOFS: OrderedDict[str, str] = OrderedDict()
 _EPISODE_LOOKUP_CAPABILITY_PROOFS_LOADED = False
-# ACP agent は全 provider 合計で1件だけ実行する。acp_client 側の Semaphore も
-# 最終防衛として維持するが、公開 facade でも backend 構築前から直列化する。
-ACP_OPERATION_LOCK = asyncio.Lock()
+# ACP agent は provider ごとに1件だけ実行する。Codex と Grok の credential profile は
+# 独立しているため、異なる provider 間の並列実行を許す。
+# acp_client 側の Semaphore も最終防衛として維持するが、公開 facade でも backend 構築前から
+# provider 単位の枠で直列化する。各呼び出しは provider 確定後に単一の枠だけを取り、
+# 枠を跨いだ入れ子取得は行わない（主系→回復系は逐次 await で枠を取り直す）。
+ACP_OPERATION_LOCKS: dict[KonomiTVBS4KACPImportProvider, asyncio.Lock] = {
+    'codex': asyncio.Lock(),
+    'grok': asyncio.Lock(),
+}
 # Codex / Grok の可変 credential profile は provider ごとに独立している。
 # 実行中 provider の import/delete だけを止め、別 provider の認証操作を巻き添えにしない。
 ACP_CREDENTIAL_OPERATION_LOCKS: dict[KonomiTVBS4KACPImportProvider, asyncio.Lock] = {
@@ -132,8 +138,8 @@ async def _RunACPOperationWithDeadline[AcpOperationResult](
 
     Args:
         operation: lock 取得後に backend を生成して実行する非同期処理。
-        credential_provider: 実行中の世代変更を止める Codex / Grok provider。
-            Gemini は管理 API から ADC を変更しないため None。
+        credential_provider: 実行枠と実行中の世代変更を排他する Codex / Grok provider。
+            呼び出し前に確定していること（None は受理しない）。
         hard_deadline: 同一判定の ACP 回復試行で共有する event loop 絶対期限。
             未指定時はこの操作の開始時点から既定上限を適用する。
 
@@ -144,6 +150,8 @@ async def _RunACPOperationWithDeadline[AcpOperationResult](
         RecordedSeriesAIError: lock 待機から cleanup 完了までが安全上限を超えた場合。
     """
 
+    # すべての呼び出し元は provider 確定後に単一枠で呼ぶ。未知 provider を黙って扱わない。
+    assert credential_provider is not None
     started_at = time.monotonic()
     effective_deadline = hard_deadline
     if effective_deadline is None:
@@ -151,12 +159,11 @@ async def _RunACPOperationWithDeadline[AcpOperationResult](
             asyncio.get_running_loop().time() + _ACP_OPERATION_HARD_TIMEOUT_SEC
         )
     try:
-        # 全 ACP の直列実行待ちと、対象 provider の認証排他待ちを総実行時間に含める。
+        # 対象 provider 枠の直列実行待ちと認証排他待ちを総実行時間に含める。
         # backend は両 lock 取得後に生成し、期限切れ要求が新しい ACP process を起動しないようにする。
+        # 取得順序は実行枠→認証の固定順かつ単一 provider のみ。枠跨ぎの入れ子取得も逆順取得も存在しない。
         async with asyncio.timeout_at(effective_deadline):
-            async with ACP_OPERATION_LOCK:
-                if credential_provider is None:
-                    return await operation()
+            async with ACP_OPERATION_LOCKS[credential_provider]:
                 async with ACP_CREDENTIAL_OPERATION_LOCKS[credential_provider]:
                     return await operation()
     except TimeoutError as ex:
@@ -1104,13 +1111,16 @@ def GetACPCredentialOperationLock(
 
 
 def IsACPOperationRunning() -> bool:
-    """公開 facade で ACP agent が1件実行中かを返す。
+    """公開 facade で ACP agent が1件以上実行中かを返す。
+
+    認証状態 API の実行表示用。接続試験の preflight には使わない
+    （対象 provider の枠だけを見る IsACPBackendKindRunning を使う）。
 
     Returns:
-        ACP の直列実行 lock が保持されている場合は True。
+        いずれかの provider 実行枠が保持されている場合は True。
     """
 
-    return ACP_OPERATION_LOCK.locked()
+    return any(lock.locked() for lock in ACP_OPERATION_LOCKS.values())
 
 
 async def GetAcpModelCatalog(
@@ -1168,6 +1178,25 @@ def _GetACPCredentialProvider(
         'AcpGrok': 'grok',
     }
     return mapping.get(backend_kind)
+
+
+def IsACPBackendKindRunning(
+    backend_kind: Literal['AcpCodex', 'AcpGrok'],
+) -> bool:
+    """指定 backend の provider 実行枠が使用中かを返す。
+
+    接続試験・モデル広告の preflight 用。対象 provider 以外の実行は見ない。
+
+    Args:
+        backend_kind: 'AcpCodex' または 'AcpGrok'。
+
+    Returns:
+        対象 provider の実行枠が保持されている場合は True。
+    """
+
+    provider = _GetACPCredentialProvider(backend_kind)
+    assert provider is not None
+    return ACP_OPERATION_LOCKS[provider].locked()
 
 
 # === 公開 facade 関数 ===
