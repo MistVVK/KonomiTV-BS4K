@@ -17,6 +17,8 @@ FROM ubuntu:22.04 AS thirdparty-builder-base
 ARG CUDA_VERSION=12.4
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Ubuntu の一部ミラーだけが失敗しても続行するが、毎回一覧を消して今回取得した jammy InRelease を必須にする。
+# 既存の署名検証設定と後続 install の失敗判定は維持し、外部リポジトリ向けの代替経路は追加しない。
 RUN case "${CUDA_VERSION}" in \
         '12.4') CUDA_PACKAGE_SUFFIX='12-4' ;; \
         '12.8') CUDA_PACKAGE_SUFFIX='12-8' ;; \
@@ -37,14 +39,28 @@ RUN case "${CUDA_VERSION}" in \
         'deb https://ftp.tsukuba.wide.ad.jp/Linux/ubuntu/ jammy-backports main restricted universe multiverse' \
         'deb https://ftp.tsukuba.wide.ad.jp/Linux/ubuntu/ jammy-security main restricted universe multiverse' \
         > /etc/apt/sources.list && \
-    nala update && nala install -y --no-install-recommends curl gpg && \
+    rm -rf /var/lib/apt/lists/* && \
+    { nala update || true; } && \
+    set -- /var/lib/apt/lists/*_dists_jammy_InRelease && \
+    if [ ! -e "$1" ]; then \
+        echo 'nala update fetched no jammy InRelease' >&2; \
+        exit 1; \
+    fi && \
+    nala install -y --no-install-recommends curl gpg && \
     curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
         --output /tmp/cuda-keyring.deb && \
     dpkg --install /tmp/cuda-keyring.deb && \
     rm /tmp/cuda-keyring.deb && \
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics-keyring.gpg && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics-keyring.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2523 unified' > /etc/apt/sources.list.d/intel-gpu-jammy.list && \
-    nala update && nala upgrade -y && nala install -y --no-install-recommends \
+    rm -rf /var/lib/apt/lists/* && \
+    { nala update || true; } && \
+    set -- /var/lib/apt/lists/*_dists_jammy_InRelease && \
+    if [ ! -e "$1" ]; then \
+        echo 'nala update fetched no jammy InRelease' >&2; \
+        exit 1; \
+    fi && \
+    nala upgrade -y && nala install -y --no-install-recommends \
         autoconf automake build-essential ca-certificates ccache clang cmake cuda-cudart-dev-${CUDA_PACKAGE_SUFFIX} cuda-nvvm-${CUDA_PACKAGE_SUFFIX} curl file git libdrm-dev libffi-dev libglib2.0-dev \
         libaom-dev libass-dev libbluray-dev libbz2-dev libfontconfig1-dev libfreetype6-dev libfribidi-dev \
         libgnutls28-dev libgsm1-dev liblzma-dev libmp3lame-dev libmysofa-dev \
@@ -395,7 +411,14 @@ RUN case "${CUDA_VERSION}" in \
         'deb https://ftp.tsukuba.wide.ad.jp/Linux/ubuntu/ jammy-backports main restricted universe multiverse' \
         'deb https://ftp.tsukuba.wide.ad.jp/Linux/ubuntu/ jammy-security main restricted universe multiverse' \
         > /etc/apt/sources.list && \
-    nala update && nala upgrade -y && nala install -y --no-install-recommends curl git gpg tzdata libc6 zlib1g && \
+    rm -rf /var/lib/apt/lists/* && \
+    { nala update || true; } && \
+    set -- /var/lib/apt/lists/*_dists_jammy_InRelease && \
+    if [ ! -e "$1" ]; then \
+        echo 'nala update fetched no jammy InRelease' >&2; \
+        exit 1; \
+    fi && \
+    nala upgrade -y && nala install -y --no-install-recommends curl git gpg tzdata libc6 zlib1g && \
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics-keyring.gpg && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics-keyring.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2523 unified' > /etc/apt/sources.list.d/intel-gpu-jammy.list && \
     if [ "${AMD_NONFREE}" = 'true' ]; then \
@@ -404,7 +427,14 @@ RUN case "${CUDA_VERSION}" in \
         echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/amdgpu/6.4.4/ubuntu jammy proprietary' > /etc/apt/sources.list.d/amdgpu-proprietary.list; \
         echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/rocm-keyring.gpg] https://repo.radeon.com/rocm/apt/6.4.4 jammy main' > /etc/apt/sources.list.d/rocm.list; \
     fi && \
-    nala update && nala install -y --no-install-recommends \
+    rm -rf /var/lib/apt/lists/* && \
+    { nala update || true; } && \
+    set -- /var/lib/apt/lists/*_dists_jammy_InRelease && \
+    if [ ! -e "$1" ]; then \
+        echo 'nala update fetched no jammy InRelease' >&2; \
+        exit 1; \
+    fi && \
+    nala install -y --no-install-recommends \
         fonts-vlgothic intel-opencl-icd \
         libdrm2 libfontconfig1 libfreetype6 libfribidi0 \
         libaom3 libass9 libbluray2 libgnutls30 libgsm1 libmp3lame0 \
@@ -472,7 +502,14 @@ RUN curl -fsSL https://fastly.linuxmint.io/pool/main/l/linuxmint-keyring/linuxmi
         'Pin: release o=linuxmint,n=virginia,c=upstream' \
         'Pin-Priority: 1001' \
         > /etc/apt/preferences.d/linuxmint-chromium && \
-    nala update && nala install -y --no-install-recommends chromium libasound2 && \
+    rm -rf /var/lib/apt/lists/* && \
+    { nala update || true; } && \
+    set -- /var/lib/apt/lists/*_dists_jammy_InRelease && \
+    if [ ! -e "$1" ]; then \
+        echo 'nala update fetched no jammy InRelease' >&2; \
+        exit 1; \
+    fi && \
+    nala install -y --no-install-recommends chromium libasound2 && \
     chromium_candidate="$(apt-cache policy chromium | awk '/Candidate:/ { print $2; exit }')" && \
     chromium_installed="$(dpkg-query --showformat='${Version}' --show chromium)" && \
     test "${chromium_candidate}" = "${chromium_installed}" && \
@@ -781,7 +818,13 @@ FROM runtime AS server-verify
 
 # runtime は非 root のまま維持し、build 中だけ C fixture の構築と開発依存導入に root を使う。
 USER root
-RUN nala update && \
+RUN rm -rf /var/lib/apt/lists/* && \
+    { nala update || true; } && \
+    set -- /var/lib/apt/lists/*_dists_jammy_InRelease && \
+    if [ ! -e "$1" ]; then \
+        echo 'nala update fetched no jammy InRelease' >&2; \
+        exit 1; \
+    fi && \
     apt-get install -y --fix-broken && \
     apt-get install -y --no-install-recommends build-essential && \
     command -v cc >/dev/null && \
