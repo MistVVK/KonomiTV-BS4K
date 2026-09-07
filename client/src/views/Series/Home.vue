@@ -109,6 +109,7 @@ const detailGridRow = computed(() => (expandedRow.value ?? 0) + 1);
 
 const cardImage = (card: ISeriesSummary): string => {
     if (card.bangumi_subject_image_url) return card.bangumi_subject_image_url;
+    if (card.tmdb_poster_url) return card.tmdb_poster_url;
     if (card.latest_recorded_program_id !== null) {
         return `${Utils.api_base_url}/videos/${card.latest_recorded_program_id}/thumbnail`;
     }

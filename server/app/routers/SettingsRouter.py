@@ -28,6 +28,7 @@ _HOST_PATH_SETTINGS_API_PATHS = {
     # API キー入力の検証失敗時にも FastAPI 標準応答の input へ秘密を転載しない。
     '/api/ai-backends/openai-compatible/api-key',
     '/api/ai-backends/openai-compatible-2/api-key',
+    '/api/recorded-series/settings/tmdb-api-key',
 }
 
 

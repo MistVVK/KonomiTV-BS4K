@@ -56,7 +56,8 @@ class SeriesMerger:
             # 今回の照合対象と、すでに同じ条目 ID を保持する Series を同じトランザクションで取得する。
             ## プロセス内の同期は BangumiClient 側で直列化し、DB の一意索引をプロセス間競合の最終防線とする。
             _, candidate_rows = await connection.execute_query(
-                'SELECT id, normalized_title, title '
+                'SELECT id, normalized_title, title, tmdb_id, tmdb_media_type, '
+                'tmdb_name, tmdb_overview, tmdb_poster_url, tmdb_backdrop_url '
                 'FROM series '
                 'WHERE id = ? OR bangumi_subject_id = ? '
                 'ORDER BY id ASC',
@@ -68,6 +69,7 @@ class SeriesMerger:
             canonical_row = candidate_rows[0]
             canonical_series_id = int(canonical_row['id'])
             canonical_series_title = str(canonical_row['title'])
+            canonical_tmdb_id = canonical_row['tmdb_id']
 
             # 移行済み DB だけでなく、テスト用スキーマや新規作成直後の Series でも主タイトルの所有者を必ず登録する。
             await connection.execute_query(
@@ -159,6 +161,20 @@ class SeriesMerger:
                 )
                 await connection.execute_query('DELETE FROM series WHERE id = ?', [source_series_id])
 
+                # 後から Bangumi が統合しても、先に取得済みの TMDb 補完を失わない。
+                # 複合 unique の所有者である元 Series を削除した後に、主側の欠損だけを引き継ぐ。
+                if canonical_tmdb_id is None and source_row['tmdb_id'] is not None:
+                    await connection.execute_query(
+                        'UPDATE series SET tmdb_id = ?, tmdb_media_type = ?, tmdb_name = ?, '
+                        'tmdb_overview = ?, tmdb_poster_url = ?, tmdb_backdrop_url = ? WHERE id = ?',
+                        [
+                            source_row['tmdb_id'], source_row['tmdb_media_type'], source_row['tmdb_name'],
+                            source_row['tmdb_overview'], source_row['tmdb_poster_url'],
+                            source_row['tmdb_backdrop_url'], canonical_series_id,
+                        ],
+                    )
+                    canonical_tmdb_id = source_row['tmdb_id']
+
             # 重複行を削除した後にだけ一意制約対象の subject ID を更新する。
             ## この順番により、同期中も同じ subject ID を持つ Series は常に 1 件に保たれる。
             await connection.execute_query(
@@ -200,14 +216,14 @@ class SeriesMerger:
         """
 
         _, source_episode_rows = await connection.execute_query(
-            'SELECT id, season_number, episode_number, bangumi_episode_id '
+            'SELECT id, season_number, episode_number, bangumi_episode_id, tmdb_episode_id '
             'FROM series_episodes WHERE series_id = ?',
             [source_series_id],
         )
         for source_episode_row in source_episode_rows:
             source_episode_id = int(source_episode_row['id'])
             _, canonical_episode_rows = await connection.execute_query(
-                'SELECT id, bangumi_episode_id FROM series_episodes '
+                'SELECT id, bangumi_episode_id, tmdb_episode_id FROM series_episodes '
                 'WHERE series_id = ? AND season_number = ? AND episode_number = ?',
                 [
                     canonical_series_id,
@@ -232,6 +248,15 @@ class SeriesMerger:
                 await connection.execute_query(
                     'UPDATE series_episodes SET bangumi_episode_id = ? WHERE id = ?',
                     [int(source_episode_row['bangumi_episode_id']), canonical_episode_id],
+                )
+            # 話数の参照を寄せる際、TMDb の確定済み ID も主側が未設定のときだけ保持する。
+            if (
+                canonical_episode_rows[0]['tmdb_episode_id'] is None and
+                source_episode_row['tmdb_episode_id'] is not None
+            ):
+                await connection.execute_query(
+                    'UPDATE series_episodes SET tmdb_episode_id = ? WHERE id = ?',
+                    [int(source_episode_row['tmdb_episode_id']), canonical_episode_id],
                 )
             await connection.execute_query(
                 'UPDATE recorded_programs SET series_episode_id = ? WHERE series_episode_id = ?',

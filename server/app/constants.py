@@ -867,6 +867,15 @@ BANGUMI_ACCESS_TOKEN_FERNET_KEY = base64.urlsafe_b64encode(
 # Bangumi 個人アクセストークンの暗号化に使う Fernet のインスタンス
 BANGUMI_ACCESS_TOKEN_FERNET = Fernet(BANGUMI_ACCESS_TOKEN_FERNET_KEY)
 
+# 暗号化された TMDb API キーの接頭辞
+TMDB_API_KEY_ENCRYPTION_PREFIX = 'enc:'
+# TMDb API キーの暗号化に使う Fernet の暗号化キー
+TMDB_API_KEY_FERNET_KEY = base64.urlsafe_b64encode(
+    hashlib.sha256(f'tmdb:{JWT_SECRET_KEY}'.encode()).digest(),
+)
+# TMDb API キーの暗号化に使う Fernet のインスタンス
+TMDB_API_KEY_FERNET = Fernet(TMDB_API_KEY_FERNET_KEY)
+
 # Bangumi API だけが要求する User-Agent。他の外部 API の既定ヘッダーとは混ぜない。
 BANGUMI_REQUEST_HEADERS: dict[str, str] = {
     'User-Agent': f'MistVVK/KonomiTV-BS4K/{BS4K_VERSION} (https://github.com/MistVVK/KonomiTV-BS4K)',
@@ -893,4 +902,16 @@ HTTPX_CLIENT = lambda: httpx.AsyncClient(
     follow_redirects = True,
     # 3 秒応答がない場合はタイムアウトする
     timeout = 3.0,
+)
+
+# TMDb API で利用する httpx.AsyncClient の設定
+## TMDb は検索・詳細・シーズンと1作品あたり複数回呼び出し、海外 API のため 3 秒では
+## 正常応答をタイムアウト扱いしやすい。Wikipedia 検索と同じ 10 秒を上限にする。
+TMDB_HTTPX_CLIENT = lambda: httpx.AsyncClient(
+    # KonomiTV-BS4K の User-Agent を指定
+    headers = API_REQUEST_HEADERS,
+    # query に API キーを含むため、別ホストへのリダイレクトで転送しない。
+    follow_redirects = False,
+    # 10 秒応答がない場合はタイムアウトする
+    timeout = 10.0,
 )

@@ -13,7 +13,7 @@ from fastapi import (
     Response,
     status,
 )
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from tortoise.expressions import Q
 from typing_extensions import TypedDict
 
@@ -30,6 +30,7 @@ from app.metadata.RecordedSeriesResolver import (
     RecordedSeriesResolver,
 )
 from app.metadata.RecordedSeriesSettings import (
+    IsBangumiExternalMetadataEnabled,
     RecordedSeriesSettings,
     RecordedSeriesSettingsResponse,
     RecordedSeriesSettingsStore,
@@ -41,6 +42,8 @@ from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
+from app.utils.KonomiTVBS4KTmdbStore import KonomiTVBS4KTmdbStore
 
 
 router = APIRouter(
@@ -71,6 +74,29 @@ class RecordedSeriesStatusResponse(BaseModel):
     episode_last_run_at: str | None
     is_running: bool
     is_episode_running: bool
+
+
+class RecordedSeriesTmdbAPIKeyBody(BaseModel):
+    """TMDb API キー設定ボディ。応答には絶対にエコーしない。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    api_key: Annotated[
+        str,
+        Field(min_length=1, max_length=KonomiTVBS4KTmdbStore.API_KEY_MAX_LENGTH),
+    ]
+
+
+class RecordedSeriesTmdbConnectionTestResponse(BaseModel):
+    """TMDb 接続試験結果（API キー非返却）。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    success: Annotated[bool, Field()]
+    latency_ms: Annotated[int, Field()]
+    message: Annotated[str, Field()]
+    http_status: Annotated[int | None, Field()]
+    error_code: Annotated[str | None, Field()]
 
 
 class RecordedSeriesNextProgramResponse(BaseModel):
@@ -328,6 +354,13 @@ async def ParseRecordedSeriesSettingsUpdate(
         )
 
     settings_body = dict(request_body)
+    # TMDb API キーは秘密のため設定本体では受理せず、専用エンドポイントへ誘導する。
+    if 'tmdb_api_key' in settings_body:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='Use PUT /api/recorded-series/settings/tmdb-api-key instead.',
+            headers=NO_STORE_HEADERS,
+        )
     # 旧クライアントの秘密・OpenAI 互換接続 field・日次制限は受理せず拒否する（クリーンブレーク）。
     rejected_keys = [
         key
@@ -356,6 +389,9 @@ async def ParseRecordedSeriesSettingsUpdate(
     settings_body.pop("ai_backend_auth_configured", None)
     settings_body.pop("ai_fallback_backend_service_name", None)
     settings_body.pop("ai_fallback_backend_auth_configured", None)
+    # 応答専用の TMDb キー表示は保存値へ持ち込まない。
+    settings_body.pop('tmdb_api_key_configured', None)
+    settings_body.pop('tmdb_api_key_masked', None)
 
     try:
         settings = RecordedSeriesSettings.model_validate(settings_body)
@@ -436,6 +472,7 @@ async def RecordedSeriesSettingsUpdateAPI(
     response.headers.update(NO_STORE_HEADERS)
     settings = await ParseRecordedSeriesSettingsUpdate(request)
     try:
+        bangumi_was_enabled = IsBangumiExternalMetadataEnabled()
         RecordedSeriesSettingsStore.saveSettings(settings)
     except ValueError as ex:
         raise HTTPException(
@@ -457,6 +494,125 @@ async def RecordedSeriesSettingsUpdateAPI(
     # 話数側は旧受理条件の保存済み提案を無課金昇格し、新規録画の保留だけを再評価する。
     await SeriesAIFallbackTask.schedule(retry_cancelled=True)
     await RecordedEpisodeAutomation.settingsUpdated()
+    # 外部メタデータソースを TMDb 有効へ切り替えたときは、次のスキャンを待たずに照合を予約する。
+    ## TmdbOnly / BangumiOnly / None の判定と API キー未設定の skip は scheduleSeriesSync() 内で行う。
+    KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+    # Bangumi を再び有効にした場合も次の起動時スキャンまで待たず、既存の同期経路を再開する。
+    if not bangumi_was_enabled and IsBangumiExternalMetadataEnabled(settings):
+        from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+        KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
+
+
+@router.put(
+    '/settings/tmdb-api-key',
+    summary='TMDb API キー設定 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def RecordedSeriesTmdbAPIKeySetAPI(
+    body: RecordedSeriesTmdbAPIKeyBody,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """UI から受け取った TMDb API キーを Fernet ストアへ暗号化して保存する。
+
+    Args:
+        body: TMDb API キーを含むリクエスト。応答へは含めない。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        KonomiTVBS4KTmdbStore.save(api_key=body.api_key)
+    except ValueError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='TMDb API key is invalid.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    except OSError as ex:
+        logging.error(
+            '[RecordedSeriesTmdbAPIKeySetAPI] Failed to store TMDb API key:',
+            exc_info=ex,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to store TMDb API key.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    # キーを保存したあとは、Bangumi 連携と同じく照合をバックグラウンドで開始する。
+    KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+
+
+@router.delete(
+    '/settings/tmdb-api-key',
+    summary='TMDb API キー削除 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def RecordedSeriesTmdbAPIKeyDeleteAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """Fernet ストアから TMDb API キーを削除する。
+
+    削除後も既存の `tmdb_*` メタデータは残る。以降の TMDb 経路だけが skip される。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        KonomiTVBS4KTmdbStore.clear()
+    except OSError as ex:
+        logging.error(
+            '[RecordedSeriesTmdbAPIKeyDeleteAPI] Failed to delete TMDb API key:',
+            exc_info=ex,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to delete TMDb API key.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+
+
+@router.post(
+    '/settings/tmdb-connection-test',
+    summary='TMDb 接続試験 API',
+    response_model=RecordedSeriesTmdbConnectionTestResponse,
+)
+async def RecordedSeriesTmdbConnectionTestAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> RecordedSeriesTmdbConnectionTestResponse:
+    """保存済み TMDb API キーで TMDb へ実通信し、成否を返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        秘密を含まない接続試験結果。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    result = await KonomiTVBS4KTmdbClient.testConnection()
+    return RecordedSeriesTmdbConnectionTestResponse(
+        success=result.success,
+        latency_ms=result.latency_ms,
+        message=result.message,
+        http_status=result.http_status,
+        error_code=result.error_code,
+    )
 
 
 @router.delete(

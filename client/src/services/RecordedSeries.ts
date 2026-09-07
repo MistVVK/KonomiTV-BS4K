@@ -7,9 +7,21 @@ import APIClient from '@/services/APIClient';
 export type AIBackendKind = 'OpenCode' | 'OpenAICompatible' | 'OpenAICompatible2' | 'AcpCodex' | 'AcpGrok';
 /** 主系 AI 失敗後の回復方針。既定は追加試行なしの Fail。 */
 export type AIFailureRecoveryStrategy = 'FallbackBackend' | 'RetrySameBackend' | 'Fail';
+/** シリーズメタデータの外部ソース。TMDb と Bangumi (bgm.tv) の併用可否を選ぶ。 */
+export type ExternalMetadataSource = 'TmdbAndBangumi' | 'TmdbOnly' | 'BangumiOnly' | 'None';
 export type EpisodeLookupOutcome =
     'Pending' | 'Resolved' | 'NotNumbered' | 'NoPublishedNumber' | 'InsufficientEvidence' | 'SearchFailed' |
     'SearchNotRun' | 'InvalidModelOutput' | 'Disabled' | 'RateLimited' | 'Cancelled';
+
+
+/** TMDb 接続試験の結果。API キー本体は含まれない。 */
+export interface ITmdbConnectionTestResult {
+    success: boolean;
+    latency_ms: number;
+    message: string;
+    http_status: number | null;
+    error_code: string | null;
+}
 
 
 /** 録画シリーズ判定のサーバー共有設定。AI 接続・認証・モデルは AI バックエンド側が正本。 */
@@ -33,6 +45,12 @@ export interface IRecordedSeriesSettings {
     ai_fallback_backend_service_name: string | null;
     // 予備 OpenCode / ACP バックエンドに利用可能な認証があるか。
     ai_fallback_backend_auth_configured: boolean;
+    // シリーズメタデータの外部ソース。既定は TMDb と Bangumi の併用。
+    external_metadata_source: ExternalMetadataSource;
+    // TMDb API キーがサーバーの Fernet ストアに保存済みか。キー本体は返らない。
+    tmdb_api_key_configured: boolean;
+    // TMDb API キーのマスク表示。未設定時は null。
+    tmdb_api_key_masked: string | null;
 }
 
 /** 録画シリーズ判定設定の更新リクエスト。 */
@@ -44,6 +62,7 @@ export interface IRecordedSeriesSettingsUpdate {
     ai_failure_recovery_strategy: AIFailureRecoveryStrategy;
     ai_fallback_backend: AIBackendKind | null;
     ai_fallback_backend_service_id: string | null;
+    external_metadata_source: ExternalMetadataSource;
 }
 
 /** 録画シリーズ判定の全体状況。 */
@@ -180,6 +199,41 @@ export default class RecordedSeries {
             return false;
         }
         return true;
+    }
+
+    /** TMDb API キーをサーバーの Fernet ストアへ保存する。 */
+    static async setTmdbAPIKey(api_key: string): Promise<boolean> {
+        const response = await APIClient.put('/recorded-series/settings/tmdb-api-key', {api_key});
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'TMDb API キーを設定できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** 保存済みの TMDb API キーを削除する。既存の TMDb メタデータは残る。 */
+    static async deleteTmdbAPIKey(): Promise<boolean> {
+        const response = await APIClient.delete('/recorded-series/settings/tmdb-api-key');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'TMDb API キーを削除できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** 保存済み TMDb API キーで TMDb へ実通信し、成否を取得する。 */
+    static async testTmdbConnection(): Promise<ITmdbConnectionTestResult | null> {
+        const response = await APIClient.post<ITmdbConnectionTestResult>(
+            '/recorded-series/settings/tmdb-connection-test',
+            undefined,
+            // サーバー側の TMDb タイムアウト 10 秒に余裕を持たせる。
+            {timeout: 30 * 1000},
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'TMDb の接続試験を実行できませんでした。');
+            return null;
+        }
+        return response.data;
     }
 
     /** 録画シリーズ判定の件数・実行状況を取得する。 */

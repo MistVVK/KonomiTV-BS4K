@@ -10,6 +10,7 @@ from tortoise.exceptions import IntegrityError
 from app import logging, schemas
 from app.constants import BANGUMI_REQUEST_HEADERS, HTTPX_CLIENT
 from app.metadata.RecordedEpisodeResolver import ParseSinglePositiveIntegerEpisode
+from app.metadata.RecordedSeriesSettings import IsBangumiExternalMetadataEnabled
 from app.metadata.SeriesIndexer import IsStrictSeriesTitlePrefix, NormalizeSeriesTitle
 from app.metadata.SeriesMerger import SeriesMerger
 from app.models.RecordedProgram import RecordedProgram
@@ -289,6 +290,9 @@ class KonomiTVBS4KBangumiClient:
             httpx.HTTPError: Bangumi API への接続または HTTP エラーが発生した場合。
         """
 
+        # 公開の同期経路を直接呼んだ場合も、無効モードでは新規の照合を開始しない。
+        if IsBangumiExternalMetadataEnabled() is False:
+            return 0
         anime_series = [
             series for series in await Series.all()
             if any(genre['major'] == 'アニメ・特撮' for genre in series.genres)
@@ -303,6 +307,8 @@ class KonomiTVBS4KBangumiClient:
         matched_series_ids: set[int] = set()
 
         for loaded_series in anime_series:
+            if IsBangumiExternalMetadataEnabled() is False:
+                break
             series_lock = cls._series_merge_locks.setdefault(loaded_series.id, asyncio.Lock())
             async with series_lock:
                 # ロック後に DB を読み直し、開始時スナップショットの未確定判定で上書きしない。
@@ -339,6 +345,9 @@ class KonomiTVBS4KBangumiClient:
                         continue
                     subject_id = int(subject['id'])
 
+                # 検索・AI の待機中に無効化された結果は新規 binding として保存しない。
+                if IsBangumiExternalMetadataEnabled() is False:
+                    break
                 # 收藏一覧が返す SlimSubject を永続化すると同時に、同じ条目 ID に照合済みの Series を統合する。
                 ## ロック中に外部 API は呼ばず、異なるユーザーの定期同期が重なっても subject ごとに直列化する。
                 images = subject.get('images')
@@ -391,6 +400,8 @@ class KonomiTVBS4KBangumiClient:
             None
         """
 
+        if IsBangumiExternalMetadataEnabled() is False:
+            return
         recorded_programs = await RecordedProgram.filter(series_id=series_id).all()
         needs_episode_mapping = any(
             cls.parseEpisodeNumber(recorded_program.episode_number) is not None and (
@@ -406,6 +417,9 @@ class KonomiTVBS4KBangumiClient:
         # Series 全体が同じ条目と確定したため、特別編や複数話録画にも subject ID までは保存する。
         ## 自然話数が一意な録画だけ、一覧取得時に確定した条目内の episode ID へ追加で結び付ける。
         for recorded_program in recorded_programs:
+            # エピソード一覧の取得中や一括保存の途中でも、新規 bind の停止を反映する。
+            if IsBangumiExternalMetadataEnabled() is False:
+                break
             update_fields: list[str] = []
             subject_changed = recorded_program.bangumi_subject_id != subject_id
             if subject_changed:
@@ -433,6 +447,13 @@ class KonomiTVBS4KBangumiClient:
             None
         """
 
+        # None / TmdbOnly では新規の收藏同期を行わない。既存の bangumi_* は削除しない。
+        if IsBangumiExternalMetadataEnabled() is False:
+            logging.info(
+                '[KonomiTVBS4KBangumiClient][syncAllLinkedUsers] Bangumi metadata source is disabled. '
+                'Skipping collection sync.',
+            )
+            return
         owner = cls._sharedCollectionOwner()
         if owner is None:
             return
@@ -462,6 +483,10 @@ class KonomiTVBS4KBangumiClient:
         """
 
         del user
+
+        # None / TmdbOnly では新しい收藏同期タスクを起動しない。
+        if IsBangumiExternalMetadataEnabled() is False:
+            return
 
         # 実行中の同期へ合流し、スキャンから外部 API を待たせない。
         if any(task.done() is False for task in cls._sync_tasks):
@@ -541,6 +566,9 @@ class KonomiTVBS4KBangumiClient:
             None
         """
 
+        # None / TmdbOnly では新規の episode bind を行わない。既存の bind はそのまま残す。
+        if IsBangumiExternalMetadataEnabled() is False:
+            return
         recorded_program = await RecordedProgram.get_or_none(id=recorded_program_id)
         if recorded_program is None or recorded_program.series_id is None:
             return
@@ -549,6 +577,8 @@ class KonomiTVBS4KBangumiClient:
             return
         # 録画の subject が現在 Series と違うときは旧 episode を捨てて再照合する。
         if recorded_program.bangumi_subject_id != series.bangumi_subject_id:
+            if IsBangumiExternalMetadataEnabled() is False:
+                return
             recorded_program.bangumi_subject_id = series.bangumi_subject_id
             recorded_program.bangumi_episode_id = None
             await recorded_program.save(update_fields=['bangumi_subject_id', 'bangumi_episode_id'])
@@ -577,6 +607,8 @@ class KonomiTVBS4KBangumiClient:
         resolved_episode_id = int(episode['id'])
         # 既存 episode は現在話数と一致するときだけ再利用する。
         if recorded_program.bangumi_episode_id == resolved_episode_id:
+            return
+        if IsBangumiExternalMetadataEnabled() is False:
             return
         recorded_program.bangumi_episode_id = resolved_episode_id
         await recorded_program.save(update_fields=['bangumi_episode_id'])

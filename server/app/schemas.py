@@ -850,6 +850,13 @@ class Series(PydanticModel):
     bangumi_subject_name_cn: str | None = None
     bangumi_subject_summary: str | None = None
     bangumi_subject_image_url: str | None = None
+    # TMDb 由来の補完メタデータ。media type は models.Series.TmdbMediaType と同じ 2 値。
+    tmdb_id: Annotated[int | None, Field()] = None
+    tmdb_media_type: Annotated[Literal['tv', 'movie'] | None, Field()] = None
+    tmdb_name: Annotated[str | None, Field()] = None
+    tmdb_overview: Annotated[str | None, Field()] = None
+    tmdb_poster_url: Annotated[str | None, Field()] = None
+    tmdb_backdrop_url: Annotated[str | None, Field()] = None
     episodes: list[SeriesEpisode] = []
     broadcast_periods: list[SeriesBroadcastPeriod]
     created_at: datetime
@@ -869,6 +876,15 @@ class SeriesSummary(BaseModel):
     bangumi_subject_name_cn: Annotated[str | None, Field(description='Bangumi 中文名。')]
     bangumi_subject_summary: Annotated[str | None, Field(description='Bangumi 概要。')]
     bangumi_subject_image_url: Annotated[str | None, Field(description='Bangumi 表紙 URL。')]
+    tmdb_id: Annotated[int | None, Field(description='TMDb 作品 ID。')]
+    tmdb_media_type: Annotated[
+        Literal['tv', 'movie'] | None,
+        Field(description='TMDb の作品種別。models.Series.TmdbMediaType と同じ 2 値。'),
+    ]
+    tmdb_name: Annotated[str | None, Field(description='TMDb の作品名。')]
+    tmdb_overview: Annotated[str | None, Field(description='TMDb の概要。')]
+    tmdb_poster_url: Annotated[str | None, Field(description='TMDb のポスター URL。')]
+    tmdb_backdrop_url: Annotated[str | None, Field(description='TMDb のバックドロップ URL。')]
     recorded_count: Annotated[int, Field(description='再生可能録画の件数。')]
     unrecorded_count: Annotated[int, Field(description='番号付き話の欠番件数。')]
     partial_count: Annotated[int, Field(description='部分録画として表示する局別セルの件数。')]

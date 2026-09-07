@@ -771,6 +771,7 @@ class SeriesAIFallbackTask:
             return
         from app.metadata.SeriesIndexer import NormalizeSeriesTitle, SeriesIndexer
         from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+        from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
 
         target_series_id = existing_series_id if existing_series_id is not None else fallback.series_id
         linked_series_id = fallback.series_id
@@ -813,3 +814,5 @@ class SeriesAIFallbackTask:
             )
             # Series 作成後の既存 Bangumi 照合は従来の合流可能なバックグラウンド経路へ渡す。
             KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
+            # 同じく Series 作成後の TMDb 照合も、合流可能なバックグラウンド経路へ渡す。
+            KonomiTVBS4KTmdbClient.scheduleSeriesSync()

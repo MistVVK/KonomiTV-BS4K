@@ -8,24 +8,31 @@
             <span>シリーズ詳細を取得できませんでした。</span>
         </div>
         <template v-else-if="series !== null">
-            <div v-if="series.bangumi_subject_id !== null" class="series-episode-list__bangumi">
-                <img v-if="series.bangumi_subject_image_url"
-                    class="series-episode-list__cover" :src="series.bangumi_subject_image_url" alt="">
+            <div v-if="series.bangumi_subject_id !== null || series.tmdb_id !== null" class="series-episode-list__bangumi">
+                <img v-if="series.bangumi_subject_image_url || series.tmdb_poster_url"
+                    class="series-episode-list__cover" :src="series.bangumi_subject_image_url || series.tmdb_poster_url!" alt="">
                 <div class="series-episode-list__bangumi-main">
                     <div class="series-episode-list__bangumi-title">
-                        {{series.bangumi_subject_name || series.title}}
+                        {{series.bangumi_subject_name || series.tmdb_name || series.title}}
                     </div>
-                    <a class="series-episode-list__bangumi-link"
+                    <a v-if="series.bangumi_subject_id !== null" class="series-episode-list__bangumi-link"
                         :href="`https://bgm.tv/subject/${series.bangumi_subject_id}`" target="_blank" rel="noopener">
                         bgm.tv で開く
                     </a>
-                    <p v-if="showBangumiSummary && series.bangumi_subject_summary" class="series-episode-list__summary">
-                        {{series.bangumi_subject_summary}}
+                    <a v-if="series.tmdb_id !== null && series.tmdb_media_type !== null"
+                        class="series-episode-list__bangumi-link"
+                        :href="`https://www.themoviedb.org/${series.tmdb_media_type}/${series.tmdb_id}`"
+                        target="_blank" rel="noopener">
+                        TMDb で開く
+                    </a>
+                    <p v-if="showExternalSummary && (series.bangumi_subject_summary || series.tmdb_overview)"
+                        class="series-episode-list__summary">
+                        {{series.bangumi_subject_summary || series.tmdb_overview}}
                     </p>
-                    <button v-if="series.bangumi_subject_summary" type="button"
-                        class="series-episode-list__summary-toggle" :aria-expanded="showBangumiSummary"
-                        @click="showBangumiSummary = !showBangumiSummary">
-                        {{showBangumiSummary ? '概要を閉じる' : '概要を表示'}}
+                    <button v-if="series.bangumi_subject_summary || series.tmdb_overview" type="button"
+                        class="series-episode-list__summary-toggle" :aria-expanded="showExternalSummary"
+                        @click="showExternalSummary = !showExternalSummary">
+                        {{showExternalSummary ? '概要を閉じる' : '概要を表示'}}
                     </button>
                 </div>
             </div>
@@ -83,7 +90,7 @@ const props = defineProps<{
 const series = ref<ISeries | null>(null);
 const isLoading = ref(true);
 const loadFailed = ref(false);
-const showBangumiSummary = ref(false);
+const showExternalSummary = ref(false);
 let fetchGeneration = 0;
 
 type MatrixColumn = {
@@ -233,7 +240,7 @@ const fetchSeries = async () => {
     const generation = ++fetchGeneration;
     isLoading.value = true;
     loadFailed.value = false;
-    showBangumiSummary.value = false;
+    showExternalSummary.value = false;
     const result = await Series.fetchSeries(props.seriesId);
     if (generation !== fetchGeneration) return;
     series.value = result;

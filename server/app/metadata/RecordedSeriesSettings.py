@@ -6,6 +6,9 @@ OpenAICompatible / OpenAICompatible2 時は、それぞれ独立した HTTP 接�
 AcpCodex / AcpGrok のモデル・推論深さ・Fast・タイムアウトは ACPSettings 側が正本。
 主系失敗時の予備 AI と失敗時ポリシーもここで管理する。
 旧 AcpGemini / 日次制限はクリーンブレークで拒否する。
+
+シリーズメタデータの外部ソース (external_metadata_source) もここで選ぶ。
+TMDb API キーの秘密本体は KonomiTVBS4KTmdbStore が正本で、この設定ファイルへは書かない。
 """
 
 from __future__ import annotations
@@ -21,12 +24,16 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.constants import DATA_DIR
+from app.utils.KonomiTVBS4KTmdbStore import KonomiTVBS4KTmdbStore
 
 
 # AI バックエンド種別。OpenCode、独立した2枠の OpenAI 互換 HTTP、ACP の Codex / Grok を併存させる。
 AIBackendKind = Literal['OpenCode', 'OpenAICompatible', 'OpenAICompatible2', 'AcpCodex', 'AcpGrok']
 # 主系 AI 失敗後の回復方針。既定は追加試行なしの Fail。
 AIFailureRecoveryStrategy = Literal['FallbackBackend', 'RetrySameBackend', 'Fail']
+# シリーズメタデータの外部ソース。TMDb と Bangumi (bgm.tv) の併用可否を選ぶ。
+# None は新規の TMDb 照合と Bangumi sync / bind を止め、既存の照合データは保持する。
+ExternalMetadataSource = Literal['TmdbAndBangumi', 'TmdbOnly', 'BangumiOnly', 'None']
 
 _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
@@ -96,6 +103,9 @@ class RecordedSeriesSettings(BaseModel):
     ai_fallback_backend: Annotated[AIBackendKind | None, Field()] = None
     # 予備が OpenCode のとき参照する service_id（UUID）。
     ai_fallback_backend_service_id: Annotated[str | None, Field(max_length=36)] = None
+    # シリーズメタデータの外部ソース。既定は TMDb と Bangumi (bgm.tv) の併用。
+    # 既存の設定ファイルにこのキーが無くても、Pydantic の既定値として同じ値を採用する。
+    external_metadata_source: Annotated[ExternalMetadataSource, Field()] = 'TmdbAndBangumi'
 
     @field_validator('ai_backend_service_id', 'ai_fallback_backend_service_id')
     @classmethod
@@ -191,6 +201,43 @@ def AreAIBackendTargetsIdentical(
     return True
 
 
+def IsBangumiExternalMetadataEnabled(
+    settings: RecordedSeriesSettings | None = None,
+) -> bool:
+    """現在のモードで Bangumi の新規 sync / bind を実行してよいかを返す。
+
+    既存の bangumi_subject_* / bangumi_episode_id はどのモードでも削除しない。
+    止まるのは新しい照合同期と録画単位の episode bind だけ。
+
+    Args:
+        settings: 検査する設定。省略時は設定ストアから取得する。
+
+    Returns:
+        TmdbAndBangumi / BangumiOnly のとき True。
+    """
+
+    effective_settings = settings or RecordedSeriesSettingsStore.getSettings()
+    return effective_settings.external_metadata_source in {'TmdbAndBangumi', 'BangumiOnly'}
+
+
+def IsTmdbExternalMetadataEnabled(
+    settings: RecordedSeriesSettings | None = None,
+) -> bool:
+    """現在のモードで TMDb の照合・enrich を実行してよいかを返す。
+
+    API キーの有無はここで判定しない。未設定時の skip は TMDb 経路側が記録する。
+
+    Args:
+        settings: 検査する設定。省略時は設定ストアから取得する。
+
+    Returns:
+        TmdbAndBangumi / TmdbOnly のとき True。
+    """
+
+    effective_settings = settings or RecordedSeriesSettingsStore.getSettings()
+    return effective_settings.external_metadata_source in {'TmdbAndBangumi', 'TmdbOnly'}
+
+
 class RecordedSeriesSettingsResponse(RecordedSeriesSettings):
     """録画シリーズ判定設定 API レスポンス。
 
@@ -205,6 +252,10 @@ class RecordedSeriesSettingsResponse(RecordedSeriesSettings):
     ai_fallback_backend_service_name: Annotated[str | None, Field()] = None
     # 予備 backend の認証が設定済みか（未使用時は False）
     ai_fallback_backend_auth_configured: Annotated[bool, Field()] = False
+    # TMDb API キーが Fernet ストアに保存済みか。キー本体は応答に含めない。
+    tmdb_api_key_configured: Annotated[bool, Field()] = False
+    # TMDb API キーのマスク表示（未設定時は None）
+    tmdb_api_key_masked: Annotated[str | None, Field()] = None
 
 
 class RecordedSeriesSettingsStore:
@@ -328,6 +379,8 @@ class RecordedSeriesSettingsStore:
         """API 応答用に service 表示情報を付与した設定を返す。"""
 
         settings = cls.getSettings()
+        # TMDb API キーは本体を返さず、設定済みかどうかが分かるマスク表示だけを応答する。
+        tmdb_api_key_masked = KonomiTVBS4KTmdbStore.getMaskedAPIKey()
         service_name: str | None = None
         fallback_service_name: str | None = None
         if settings.ai_backend == 'OpenCode' and settings.ai_backend_service_id is not None:
@@ -359,6 +412,8 @@ class RecordedSeriesSettingsStore:
             ai_fallback_backend_auth_configured=cls.isFallbackAIBackendConfigured(
                 settings,
             ),
+            tmdb_api_key_configured=tmdb_api_key_masked is not None,
+            tmdb_api_key_masked=tmdb_api_key_masked,
         )
 
     @classmethod

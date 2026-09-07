@@ -195,6 +195,23 @@
                     </div>
                 </template>
             </template>
+            <div class="settings__content-heading mt-7">
+                <Icon icon="fluent:cloud-20-filled" width="22px" />
+                <span class="ml-2">外部メタデータソース</span>
+            </div>
+            <div class="settings__item">
+                <div class="settings__item-heading">シリーズメタデータの外部ソース</div>
+                <div class="settings__item-label">
+                    シリーズの補完メタデータ（作品名・概要・画像・話数構造）を TMDb と Bangumi (bgm.tv) のどちらから取るかを選びます。<br>
+                    併用時は両方を照合し、Bangumi 由来の話数構造があるシリーズでは Bangumi を優先します。<br>
+                    シリーズのタイトル・説明・ジャンルはこれまでどおり Wikipedia 由来の AI 生成が正本で、外部ソースは上書きしません。<br>
+                    「なし」にすると新しい照合・同期だけを止め、保存済みの照合データは残します。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined"
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :items="external_metadata_source_options" item-title="title" item-value="value"
+                    v-model="settings.external_metadata_source" />
+            </div>
             <v-btn class="settings__save-button bg-secondary mt-6" variant="flat"
                 :loading="is_saving"
                 :disabled="has_settings_validation_error"
@@ -329,6 +346,44 @@
             <div class="settings__content">
                 <v-divider class="mt-7"></v-divider>
                 <div class="settings__content-heading">
+                    <Icon icon="fluent:cloud-20-filled" width="22px" />
+                    <span class="ml-2">TMDb 連携（API キー）</span>
+                </div>
+                <div class="settings__item-label mb-4">
+                    TMDb の作品検索・詳細・話数構造の取得に使う v3 API キーです。<br>
+                    キーはサーバー内で暗号化して保存され、画面にはマスク以外返りません。<br>
+                    TMDb を使うかどうかは上の「外部メタデータソース」で選びます。<br>
+                </div>
+                <div class="settings__item">
+                    <div class="settings__item-heading">保存済み API キー</div>
+                    <div class="settings__item-label">
+                        状態:
+                        <template v-if="settings.tmdb_api_key_configured">
+                            設定済み（{{settings.tmdb_api_key_masked}}）
+                        </template>
+                        <template v-else>
+                            未設定
+                        </template>
+                        <br>
+                        未設定でも TMDb 以外の照合は続行します。キーを保存すると、未照合のシリーズをバックグラウンドで照合します。<br>
+                        <template v-if="tmdb_connection_test_message !== ''">
+                            接続試験: {{tmdb_connection_test_message}}<br>
+                        </template>
+                    </div>
+                    <v-btn class="settings__save-button mt-3 mr-2" color="secondary" variant="flat"
+                        :disabled="is_disabled" @click="openTmdbKeyDialog()">
+                        <Icon icon="fluent:key-20-filled" class="mr-2" width="21px" />API キーを設定
+                    </v-btn>
+                    <v-btn class="settings__save-button mt-3" color="secondary" variant="outlined"
+                        :loading="is_testing_tmdb_connection" :disabled="is_disabled" @click="testTmdbConnection()">
+                        接続試験
+                    </v-btn>
+                </div>
+            </div>
+
+            <div class="settings__content">
+                <v-divider class="mt-7"></v-divider>
+                <div class="settings__content-heading">
                     <Icon icon="fluent:movies-and-tv-20-filled" width="22px" />
                     <span class="ml-2">Bangumi 連携（共有・管理者1件）</span>
                 </div>
@@ -374,6 +429,36 @@
             </v-card>
         </v-dialog>
 
+        <v-dialog width="550" :model-value="tmdb_key_dialog"
+            :persistent="is_saving_tmdb_key || is_deleting_tmdb_key"
+            @update:model-value="value => { if (!value) closeTmdbKeyDialog(); }">
+            <v-card class="px-2 py-2">
+                <v-card-title class="d-flex justify-center pt-6 font-weight-bold">TMDb API キーを設定</v-card-title>
+                <v-card-text class="px-6 pt-4 pb-2">
+                    <div class="settings__item-label mb-3">
+                        キー本体は保存後に再表示できません。変更時は新しいキーを入力してください。
+                    </div>
+                    <v-text-field color="primary" variant="outlined" label="v3 API キー" autocomplete="off"
+                        :disabled="is_saving_tmdb_key || is_deleting_tmdb_key"
+                        spellcheck="false" :type="tmdb_key_showing ? 'text' : 'password'"
+                        :append-inner-icon="tmdb_key_showing ? 'fa-solid:eye-slash' : 'fa-solid:eye'"
+                        v-model="tmdb_api_key" @click:appendInner="tmdb_key_showing = !tmdb_key_showing">
+                    </v-text-field>
+                </v-card-text>
+                <v-card-actions class="px-6 pb-5">
+                    <v-btn v-if="settings.tmdb_api_key_configured" color="error" variant="text"
+                        :loading="is_deleting_tmdb_key" :disabled="is_saving_tmdb_key"
+                        @click="deleteTmdbKey()">キー削除</v-btn>
+                    <v-spacer></v-spacer>
+                    <v-btn variant="text" :disabled="is_saving_tmdb_key || is_deleting_tmdb_key"
+                        @click="closeTmdbKeyDialog()">キャンセル</v-btn>
+                    <v-btn color="secondary" variant="flat" :loading="is_saving_tmdb_key"
+                        :disabled="is_deleting_tmdb_key || tmdb_api_key.trim() === ''"
+                        @click="saveTmdbKey()">保存する</v-btn>
+                </v-card-actions>
+            </v-card>
+        </v-dialog>
+
         <v-dialog :model-value="backfill_confirmation_dialog" :persistent="is_starting_selected_backfill"
             max-width="560" @update:model-value="updateBackfillConfirmationDialog">
             <v-card>
@@ -409,6 +494,7 @@ import Bangumi, { type IBangumiProfile } from '@/services/Bangumi';
 import RecordedSeries, {
     type AIBackendKind,
     type AIFailureRecoveryStrategy,
+    type ExternalMetadataSource,
     type IRecordedSeriesSettings,
     type IRecordedSeriesSettingsUpdate,
     type IRecordedSeriesStatus,
@@ -459,6 +545,12 @@ const ai_auth_mode_labels: Record<AIAuthMode, string> = {
     VertexAdc: 'Vertex ADC',
     NoneLocal: '認証なし',
 };
+const external_metadata_source_options: {title: string; value: ExternalMetadataSource;}[] = [
+    {title: 'TMDb + Bangumi（既定）', value: 'TmdbAndBangumi'},
+    {title: 'TMDb のみ', value: 'TmdbOnly'},
+    {title: 'Bangumi (bgm.tv) のみ', value: 'BangumiOnly'},
+    {title: 'なし（新規の照合・同期を停止）', value: 'None'},
+];
 
 // API 取得前は入力欄を操作できないため、安全側の無効値を初期値にする。
 const settings = ref<IRecordedSeriesSettings>({
@@ -473,6 +565,9 @@ const settings = ref<IRecordedSeriesSettings>({
     ai_fallback_backend_service_id: null,
     ai_fallback_backend_service_name: null,
     ai_fallback_backend_auth_configured: false,
+    external_metadata_source: 'TmdbAndBangumi',
+    tmdb_api_key_configured: false,
+    tmdb_api_key_masked: null,
 });
 // 一括判定は未保存のフォーム値ではなく、サーバーに保存済みの AI 設定だけを利用する。
 const saved_settings = ref<IRecordedSeriesSettings | null>(null);
@@ -504,6 +599,14 @@ const bangumi_link_dialog = ref(false);
 const bangumi_access_token = ref('');
 const bangumi_token_showing = ref(false);
 const bangumi_linking = ref(false);
+// TMDb API キーは本体を取得できないため、入力ダイアログの値とマスク表示だけを画面で持つ。
+const tmdb_key_dialog = ref(false);
+const tmdb_api_key = ref('');
+const tmdb_key_showing = ref(false);
+const is_saving_tmdb_key = ref(false);
+const is_deleting_tmdb_key = ref(false);
+const is_testing_tmdb_connection = ref(false);
+const tmdb_connection_test_message = ref('');
 const episode_backfill_task = ref<IAnalysisTaskExecution | null>(null);
 
 type BackfillConfirmationAction = 'Series' | 'Episode';
@@ -740,6 +843,7 @@ function buildSettingsRequest(): IRecordedSeriesSettingsUpdate {
         ai_fallback_backend_service_id: (
             use_fallback && fallback_backend === 'OpenCode'
         ) ? settings.value.ai_fallback_backend_service_id : null,
+        external_metadata_source: settings.value.external_metadata_source,
     };
 }
 
@@ -960,6 +1064,77 @@ async function logoutBangumiAccount(): Promise<void> {
     if (result === false) return;
     bangumi_profile.value = await Bangumi.fetchProfile();
     Message.success('Bangumi アカウントとの連携を解除しました。');
+}
+
+function openTmdbKeyDialog(): void {
+    tmdb_key_dialog.value = true;
+}
+
+function closeTmdbKeyDialog(): void {
+    tmdb_key_dialog.value = false;
+    tmdb_api_key.value = '';
+    tmdb_key_showing.value = false;
+}
+
+/** キー保存・削除後のマスク表示だけを設定 GET から取り直す。 */
+async function refreshTmdbKeyState(): Promise<void> {
+    const fetched_settings = await RecordedSeries.fetchSettings();
+    if (fetched_settings === null) return;
+    // 未保存のドラフト（AI バックエンドや外部メタデータソース）を巻き戻さないよう、キー表示だけ更新する。
+    settings.value.tmdb_api_key_configured = fetched_settings.tmdb_api_key_configured;
+    settings.value.tmdb_api_key_masked = fetched_settings.tmdb_api_key_masked;
+}
+
+/** TMDb API キーを Fernet ストアへ保存する。 */
+async function saveTmdbKey(): Promise<void> {
+    if (is_saving_tmdb_key.value || is_deleting_tmdb_key.value || tmdb_api_key.value.trim() === '') return;
+    is_saving_tmdb_key.value = true;
+    try {
+        const result = await RecordedSeries.setTmdbAPIKey(tmdb_api_key.value);
+        if (result === false) return;
+        await refreshTmdbKeyState();
+        closeTmdbKeyDialog();
+        tmdb_connection_test_message.value = '';
+        Message.success('TMDb API キーを保存しました。');
+    } finally {
+        is_saving_tmdb_key.value = false;
+    }
+}
+
+/** 保存済みの TMDb API キーを削除する。既存の TMDb メタデータは残る。 */
+async function deleteTmdbKey(): Promise<void> {
+    if (is_deleting_tmdb_key.value || is_saving_tmdb_key.value) return;
+    is_deleting_tmdb_key.value = true;
+    try {
+        const result = await RecordedSeries.deleteTmdbAPIKey();
+        if (result === false) return;
+        await refreshTmdbKeyState();
+        closeTmdbKeyDialog();
+        tmdb_connection_test_message.value = '';
+        Message.success('TMDb API キーを削除しました。');
+    } finally {
+        is_deleting_tmdb_key.value = false;
+    }
+}
+
+/** 保存済みキーで TMDb へ実通信し、成否を画面とトーストへ出す。 */
+async function testTmdbConnection(): Promise<void> {
+    if (is_testing_tmdb_connection.value === true) return;
+    is_testing_tmdb_connection.value = true;
+    try {
+        const result = await RecordedSeries.testTmdbConnection();
+        if (result === null) return;
+        tmdb_connection_test_message.value = result.success
+            ? `成功（${result.latency_ms}ms）`
+            : `${result.message}（${result.latency_ms}ms）`;
+        if (result.success) {
+            Message.success('TMDb の接続試験に成功しました。');
+        } else {
+            Message.warning(result.message);
+        }
+    } finally {
+        is_testing_tmdb_connection.value = false;
+    }
 }
 
 

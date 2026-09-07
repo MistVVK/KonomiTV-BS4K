@@ -1683,6 +1683,11 @@ class RecordedSeriesResolver:
                     using_db=connection,
                 )
 
+            # 手動作成もトランザクション確定後に外部補完へ渡し、未コミット行を同期タスクから参照しない。
+            if target_series is not None and target_series.tmdb_id is None:
+                from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
+                KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+
     @classmethod
     async def _applySeries(
         cls,
@@ -1870,7 +1875,11 @@ class RecordedSeriesResolver:
                 ai_model=ai_model,
                 connection=connection,
             )
-            return series
+        # Wikipedia 生成・既存ルール適用のどちらでも、新規の照合は保存確定後に予約する。
+        if series.tmdb_id is None:
+            from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
+            KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+        return series
 
     @classmethod
     async def _applyNotSeries(

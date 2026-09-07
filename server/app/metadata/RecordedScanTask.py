@@ -55,6 +55,7 @@ from app.utils import ShutdownProcessPoolExecutor
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.Git import GetGitCommit
 from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
 from app.utils.ProcessLimiter import ProcessLimiter
 from app.utils.TSInformation import TSInformation
 
@@ -801,6 +802,8 @@ class RecordedScanTask:
         # 列挙と録画ごとの処理が終わった集合へ、現在の確定規則を一括適用する。
         await SeriesIndexer.rebuild()
         await KonomiTVBS4KBangumiClient.syncAllLinkedUsers()
+        # TMDb の検索・AI 待ちでスキャン完了や後続の CM 解析を止めず、既存の同期タスクへ合流する。
+        KonomiTVBS4KTmdbClient.scheduleSeriesSync()
 
 
     async def __cleanupNonExistentRecordedVideoRecords(
@@ -1191,6 +1194,9 @@ class RecordedScanTask:
                                 series = await Series.get_or_none(id=indexed_program.series_id)
                                 if series is not None and series.bangumi_subject_id is None:
                                     KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
+                                # TMDb 未照合の Series も同じく、スキャンを止めずに照合を予約する。
+                                if series is not None and series.tmdb_id is None:
+                                    KonomiTVBS4KTmdbClient.scheduleSeriesSync()
                 except Exception as ex:
                     logging.error(
                         f'{file_path}: Failed to index recorded series. '
