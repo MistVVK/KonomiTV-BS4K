@@ -31,8 +31,15 @@ from typing_extensions import TypedDict
 
 from app import logging
 from app.constants import JST, TMDB_HTTPX_CLIENT
+from app.metadata.RecordedSeriesCandidates import (
+    BuildSeriesEPGContext,
+    IsCandidateBroadcastConsistent,
+)
 from app.metadata.RecordedSeriesSettings import IsTmdbExternalMetadataEnabled
-from app.metadata.SeriesTitleParser import ExtractMovieWorkTitle
+from app.metadata.SeriesTitleParser import (
+    ExtractEPGSearchQueries,
+    ExtractMovieWorkTitle,
+)
 from app.models.RecordedEpisode import SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series, TmdbMediaType
@@ -188,13 +195,20 @@ class KonomiTVBS4KTmdbClient:
 
 
     @classmethod
-    async def searchCandidates(cls, series_title: str, api_key: str) -> list[TmdbSearchCandidate]:
+    async def searchCandidates(
+        cls,
+        series_title: str,
+        api_key: str,
+        auxiliary_queries: list[str] | None = None,
+    ) -> list[TmdbSearchCandidate]:
         """
         TV と映画を検索し、AI 選択へ渡す hints を組み立てる。
 
         Args:
             series_title (str): ローカル Series の表示タイトル。
             api_key (str): TMDb API キー。
+            auxiliary_queries (list[str] | None): 所属録画の EPG から抽出した補助クエリ。
+                タイトル検索が空のときだけ、空でなくなるまで順に試す。
 
         Returns:
             list[TmdbSearchCandidate]: TV と映画を交互に並べた上位候補。失敗時は空リスト。
@@ -214,6 +228,20 @@ class KonomiTVBS4KTmdbClient:
                 results_by_type[media_type] = await cls._search(f'/search/{media_type}', series_title, api_key)
                 if not results_by_type[media_type] and quoted_title and quoted_title != series_title:
                     results_by_type[media_type] = await cls._search(f'/search/{media_type}', quoted_title, api_key)
+                # Series タイトルと引用内作品名の両方が空のとき、EPG 由来の補助クエリを
+                ## 順に試す。EPG 全文をクエリへ足すことはせず、作品名だけを検索語にする。
+                ## 補助クエリの1件が失敗しても、取得済みの結果は捨てない。
+                for auxiliary_query in auxiliary_queries or []:
+                    if results_by_type[media_type]:
+                        break
+                    try:
+                        results_by_type[media_type] = await cls._search(f'/search/{media_type}', auxiliary_query, api_key)
+                    except (httpx.HTTPError, ValueError) as ex:
+                        logging.warning(
+                            f'[KonomiTVBS4KTmdbClient] TMDb auxiliary search skipped. '
+                            f'[media_type: {media_type}, error: {type(ex).__name__}]',
+                        )
+                        break
             except (httpx.HTTPError, ValueError) as ex:
                 logging.warning(
                     f'[KonomiTVBS4KTmdbClient] TMDb search skipped. '
@@ -543,14 +571,20 @@ class KonomiTVBS4KTmdbClient:
             TmdbSearchCandidate | None: 採用できる候補。曖昧または失敗時は None。
         """
 
-        candidates = await cls.searchCandidates(series.title, api_key)
-        if len(candidates) == 0:
-            return None
+        # 所属録画の EPG を証拠として組み立てる。番組名はタイトル検索が空のときの
+        ## 補助クエリ、放送日は候補の初放送・公開日との突合、概要と詳細とチャンネルは
+        ## AI 選択の入力に使う。
+        member_programs = await RecordedProgram.filter(series_id=series.id).values(
+            'title', 'genres', 'description', 'detail', 'start_time', 'channel__name',
+        )
+        epg_context = BuildSeriesEPGContext(member_programs)
+        auxiliary_queries = ExtractEPGSearchQueries(member_programs, existing_title=series.title)
+        candidates = await cls.searchCandidates(series.title, api_key, auxiliary_queries=auxiliary_queries)
         # Indexer と同じ映画識別で作品種別を決め、映画 Series に TV 作品を、
         ## TV Series に映画作品を結び付けない。所属録画の EPG 題名・ジャンルを
         ## 同じ抽出で判定するため、アニメジャンルの劇場版も movie になる。
         ## 所属録画が無い Series は絞らず、AI 選択へ委ねる。
-        member_programs = await RecordedProgram.filter(series_id=series.id).values('title', 'genres')
+        is_movie_series: bool | None = None
         if len(member_programs) > 0:
             is_movie_series = any(
                 ExtractMovieWorkTitle(
@@ -569,13 +603,55 @@ class KonomiTVBS4KTmdbClient:
                 candidate for candidate in candidates
                 if candidate['media_type'] == ('movie' if is_movie_series else 'tv')
             ]
+        min_broadcast_date = epg_context['min_broadcast_date'] if epg_context is not None else ''
+        # すべての録画より後に初放送・公開される候補は、その録画の取得元になり得ないため落とす。
+        candidates = cls._filterBroadcastConsistentCandidates(candidates, min_broadcast_date)
+        # 日付突合などで採用候補が空になったとき、EPG 由来の補助クエリを対象検索へ
+        ## 使ってもう一度同じ採用条件を通す。それでも一意でなければ unresolved を維持する。
+        for auxiliary_query in auxiliary_queries:
+            if len(candidates) > 0:
+                break
+            retry_candidates = await cls.searchCandidates(auxiliary_query, api_key)
+            if is_movie_series is not None:
+                retry_candidates = [
+                    candidate for candidate in retry_candidates
+                    if candidate['media_type'] == ('movie' if is_movie_series else 'tv')
+                ]
+            retry_candidates = cls._filterBroadcastConsistentCandidates(retry_candidates, min_broadcast_date)
+            if len(retry_candidates) > 0:
+                candidates = retry_candidates
         if len(candidates) == 0:
             return None
         # 同名のリメイクや別媒体を採点だけで結び付けず、全候補を AI 選択へ回す。
         from app.metadata.KonomiTVBS4KTmdbSeriesSearch import (
             KonomiTVBS4KTmdbSeriesSearch,
         )
-        return await KonomiTVBS4KTmdbSeriesSearch.findCandidateForSeries(series, candidates)
+        return await KonomiTVBS4KTmdbSeriesSearch.findCandidateForSeries(
+            series, candidates, epg_context=epg_context,
+        )
+
+
+    @staticmethod
+    def _filterBroadcastConsistentCandidates(
+        candidates: list[TmdbSearchCandidate],
+        min_broadcast_date: str,
+    ) -> list[TmdbSearchCandidate]:
+        """
+        所属録画の最古放送日より後に初放送・公開される候補を落とす。
+
+        Args:
+            candidates (list[TmdbSearchCandidate]): 媒体種別の絞り込み済み TMDb 候補。
+            min_broadcast_date (str): 所属録画の最古の放送開始日 (YYYY-MM-DD)。不明は空文字。
+
+        Returns:
+            list[TmdbSearchCandidate]: 放送日・公開日が矛盾しない候補。
+        """
+
+        # 検索結果が空文字の日付は不明として保持するため、候補の排除はここに一元する。
+        return [
+            candidate for candidate in candidates
+            if IsCandidateBroadcastConsistent(candidate['first_air_date'], min_broadcast_date)
+        ]
 
 
     @classmethod

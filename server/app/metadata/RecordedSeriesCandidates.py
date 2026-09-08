@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Annotated, Literal, cast
+from datetime import date, datetime
+from typing import Annotated, Any, Literal, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -170,3 +171,122 @@ async def SearchWikipediaCandidates(query: str, limit: int = 5) -> list[Wikipedi
             extract=' '.join(extract.split())[:600],
         ))
     return candidates
+
+
+class SeriesEPGContext(TypedDict):
+    """外部メタデータ照合へ渡す、所属録画の EPG 証拠。
+
+    Series レコード自体は放送日・チャンネルを持たないため、所属録画
+    (RecordedProgram) の EPG 列から代表値と最古放送日を組み立てる。
+    """
+
+    # 重複を除いた所属録画の EPG 番組名。放送枠名を含むため API クエリには直送しない。
+    epg_titles: list[str]
+    # 番組概要が最も長い代表録画の EPG 概要。Series.description とは別の一次情報。
+    description: str
+    # 代表録画の EPG 詳細 (見出し→本文)。照合 AI の入力へ渡すための上限付き項目。
+    detail_items: list[RecordedSeriesProgramDetailItem]
+    # 代表録画の放送開始時刻 (ISO 8601)。代表録画が時刻を持たない場合は空文字。
+    broadcast_datetime: str
+    # 所属録画全体で最も古い放送開始日 (YYYY-MM-DD)。候補の初放送・公開日との突合に使う。
+    min_broadcast_date: str
+    # 代表録画のチャンネル名。チャンネル未設定の録画のみの場合は None。
+    channel_name: str | None
+
+
+def BuildSeriesEPGContext(member_programs: list[dict[str, Any]]) -> SeriesEPGContext | None:
+    """所属録画の行から、外部メタデータ照合へ渡す EPG 証拠を組み立てる。
+
+    Args:
+        member_programs (list[dict[str, Any]]): RecordedProgram.values() の行。
+            title / description / start_time / channel__name を含むこと。
+
+    Returns:
+        SeriesEPGContext | None: 所属録画が無い、または題名が全て空の場合は None。
+    """
+
+    rows = [program for program in member_programs if str(program.get('title') or '').strip() != '']
+    if len(rows) == 0:
+        return None
+    # 番組概要が最も長い録画を代表にする。番組内容を語れる録画のほうが、
+    ## 外部候補との突合と AI 判定の両方で有用な証拠になる。
+    representative = max(rows, key=lambda program: len(str(program.get('description') or '').strip()))
+    epg_titles: list[str] = []
+    for program in rows:
+        title = str(program.get('title') or '').strip()
+        if title != '' and title not in epg_titles:
+            epg_titles.append(title)
+    start_time = representative.get('start_time')
+    start_times = [program['start_time'] for program in rows if isinstance(program.get('start_time'), datetime)]
+    # EPG 詳細は RecordedSeriesResolver の番組詳細と同じ上限 (8 項目 / name 120 / value 800)
+    ## で切り詰め、照合 AI の入力証拠として残す。API クエリには使わない。
+    representative_detail = representative.get('detail')
+    detail_items: list[RecordedSeriesProgramDetailItem] = []
+    if isinstance(representative_detail, dict):
+        detail_items = [
+            RecordedSeriesProgramDetailItem(
+                name=str(name)[:120],
+                value=str(value)[:800],
+            )
+            for name, value in sorted(representative_detail.items())[:8]
+            if str(value).strip() != ''
+        ]
+    return SeriesEPGContext(
+        epg_titles=epg_titles[:8],
+        description=str(representative.get('description') or '').strip()[:600],
+        detail_items=detail_items,
+        broadcast_datetime=start_time.isoformat() if isinstance(start_time, datetime) else '',
+        min_broadcast_date=min(start_times).date().isoformat() if len(start_times) > 0 else '',
+        channel_name=str(representative.get('channel__name') or '').strip() or None,
+    )
+
+
+def BuildEPGEvidenceText(epg_context: SeriesEPGContext | None) -> str:
+    """EPG 証拠を AI へ渡す入力文の末尾に追加するブロックへ変換する。
+
+    Args:
+        epg_context (SeriesEPGContext | None): 所属録画の EPG 証拠。無い場合は None。
+
+    Returns:
+        str: 追加するブロック。証拠が空の場合は空文字。
+    """
+
+    if epg_context is None:
+        return ''
+    lines: list[str] = []
+    if len(epg_context['epg_titles']) > 0:
+        lines.append('Program names: ' + ' / '.join(epg_context['epg_titles'][:4]))
+    if epg_context['description'] != '':
+        lines.append(f"Program description: {epg_context['description']}")
+    for detail_item in epg_context['detail_items']:
+        lines.append(f"Detail {detail_item['name']}: {detail_item['value']}")
+    if epg_context['broadcast_datetime'] != '':
+        lines.append(f"Recorded broadcast datetime: {epg_context['broadcast_datetime']}")
+    if epg_context['channel_name'] is not None:
+        lines.append(f"Recorded channel: {epg_context['channel_name']}")
+    if len(lines) == 0:
+        return ''
+    return '\n\nRecorded program EPG evidence:\n' + '\n'.join(lines)
+
+
+def IsCandidateBroadcastConsistent(candidate_date: str, min_broadcast_date: str) -> bool:
+    """外部候補の初放送・公開日が、所属録画の最古放送日と矛盾しないか検査する。
+
+    録画は作品の初放送・公開以後に作られるため、すべての録画より後に初出する
+    候補はその録画の取得元になり得ない。日付不明の候補は絞り込まず残す。
+
+    Args:
+        candidate_date (str): 外部候補の初放送日・公開日 (YYYY-MM-DD)。不明は空文字。
+        min_broadcast_date (str): 所属録画の最古の放送開始日 (YYYY-MM-DD)。不明は空文字。
+
+    Returns:
+        bool: 候補を残してよい場合は True。
+    """
+
+    if candidate_date == '' or min_broadcast_date == '':
+        return True
+    try:
+        return date.fromisoformat(candidate_date) <= date.fromisoformat(min_broadcast_date)
+    except ValueError:
+        # 外部 API や EPG の日付表記の揺れは、候補の排除ではなく保持を優先する。
+        return True

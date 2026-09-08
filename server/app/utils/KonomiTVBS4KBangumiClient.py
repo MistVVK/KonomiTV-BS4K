@@ -10,9 +10,14 @@ from tortoise.exceptions import IntegrityError
 from app import logging, schemas
 from app.constants import BANGUMI_REQUEST_HEADERS, HTTPX_CLIENT
 from app.metadata.RecordedEpisodeResolver import ParseSinglePositiveIntegerEpisode
+from app.metadata.RecordedSeriesCandidates import (
+    BuildSeriesEPGContext,
+    IsCandidateBroadcastConsistent,
+)
 from app.metadata.RecordedSeriesSettings import IsBangumiExternalMetadataEnabled
 from app.metadata.SeriesIndexer import IsStrictSeriesTitlePrefix, NormalizeSeriesTitle
 from app.metadata.SeriesMerger import SeriesMerger
+from app.metadata.SeriesTitleParser import ExtractEPGSearchQueries
 from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series
 from app.utils.KonomiTVBS4KBangumiSharedStore import (
@@ -150,21 +155,31 @@ class KonomiTVBS4KBangumiClient:
 
 
     @classmethod
-    def findSubject(cls, series_title: str, subjects: list[dict[str, Any]]) -> dict[str, Any] | None:
+    def findSubject(
+        cls,
+        series_title: str,
+        subjects: list[dict[str, Any]],
+        auxiliary_titles: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         """
         用户の在看・看過收藏からローカル Series に対応する条目を一意に選ぶ。
 
         Args:
             series_title (str): ローカル Series の表示タイトル。
             subjects (list[dict[str, Any]]): 在看・看過のアニメ条目一覧。
+            auxiliary_titles (list[str] | None): 所属録画の EPG から抽出した補助タイトル。
+                Series タイトルとの最高得点を候補ごとに採用し、枠名を含む
+                Series タイトルだけでは届かない条目も採点できるようにする。
 
         Returns:
             dict[str, Any] | None: 十分に一意な最高得点候補。
         """
 
+        # Series タイトルと EPG 由来の補助タイトルのうち最も高い採点を候補の得点にする。
+        local_titles = [series_title, *(auxiliary_titles or [])]
         candidates = sorted(
             (
-                (cls._scoreSubjectTitle(series_title, subject), subject)
+                (max(cls._scoreSubjectTitle(title, subject) for title in local_titles), subject)
                 for subject in subjects
             ),
             key = lambda candidate: candidate[0],
@@ -334,13 +349,31 @@ class KonomiTVBS4KBangumiClient:
                         )
                         continue
                 else:
-                    subject = cls.findSubject(series.title, subjects)
+                    # 収藏照合の前に所属録画の EPG 証拠を組み立てる。番組名は採点と
+                    ## 検索の補助タイトル、放送日・概要・チャンネルは検索 AI の入力に使う。
+                    member_programs = await RecordedProgram.filter(series_id=series.id).values(
+                        'title', 'description', 'detail', 'genres', 'start_time', 'channel__name',
+                    )
+                    auxiliary_titles = ExtractEPGSearchQueries(member_programs, existing_title=series.title)
+                    epg_context = BuildSeriesEPGContext(member_programs)
+                    # 收藏候補にも検索と同じ EPG 日付整合を適用する。すべての録画より
+                    ## 後に放送開始した条目は採点対象から除く。採用候補が空のときは
+                    ## そのまま検索・AI へ渡し、他の Series の收藏一覧は変えない。
+                    scoreable_subjects = subjects
+                    if epg_context is not None:
+                        scoreable_subjects = [
+                            subject for subject in subjects
+                            if IsCandidateBroadcastConsistent(str(subject.get('date') or ''), epg_context['min_broadcast_date'])
+                        ]
+                    subject = cls.findSubject(series.title, scoreable_subjects, auxiliary_titles=auxiliary_titles)
                     # 收藏照合で一意に決まらない作品だけ、bgm.tv 検索結果を hints にした AI 照合へ回す。
                     if subject is None:
                         from app.metadata.KonomiTVBS4KBangumiSubjectSearch import (
                             KonomiTVBS4KBangumiSubjectSearch,
                         )
-                        subject = await KonomiTVBS4KBangumiSubjectSearch.findSubjectForSeries(series, user)
+                        subject = await KonomiTVBS4KBangumiSubjectSearch.findSubjectForSeries(
+                            series, user, epg_context=epg_context, auxiliary_titles=auxiliary_titles,
+                        )
                     if subject is None:
                         continue
                     subject_id = int(subject['id'])

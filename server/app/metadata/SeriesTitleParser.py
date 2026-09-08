@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, cast
 
 from app.schemas import Genre
 
@@ -501,3 +502,53 @@ def ParseSeriesTitle(
         is_hard_standalone=is_hard_standalone or is_primary_movie,
         is_soft_standalone=is_soft_standalone and not is_primary_movie,
     )
+
+
+def ExtractEPGSearchQueries(
+    programs: list[dict[str, Any]],
+    existing_title: str | None = None,
+) -> list[str]:
+    """所属録画の EPG 題名から、外部メタデータ検索の補助クエリを抽出する。
+
+    EPG の番組名は放送枠名・話数・装飾を含むため、API クエリへ EPG 全文を
+    そのまま足しては汚さない。ローカル解析で作品名だけを取り出し、Series の
+    表示タイトルと同一のクエリを除外して返す。
+
+    Args:
+        programs (list[dict[str, Any]]): 所属録画の title / description / detail /
+            genres を含む行 (RecordedProgram.values() の結果)。
+        existing_title (str | None): Series 表示タイトル。同一作品名のクエリは除外する。
+
+    Returns:
+        list[str]: 出現数の多い順の補助クエリ。最大 3 件。抽出できなければ空リスト。
+    """
+
+    exclude_key = BuildSeriesGroupingKey(existing_title) if existing_title else ''
+    query_counts: Counter[str] = Counter()
+    for program in programs:
+        title = str(program.get('title') or '')
+        if title.strip() == '':
+            continue
+        genres = program.get('genres')
+        parsed_genres: list[Genre] = []
+        if isinstance(genres, list):
+            for genre in genres:
+                if isinstance(genre, dict):
+                    # values() の行は生 dict で届くため、Genre として読み替えて渡す。
+                    parsed_genres.append(cast(Genre, genre))
+        # ParseSeriesTitle は映画枠・劇場版を ExtractMovieWorkTitle() 経由で
+        # 作品単位の表示名へ解決するため、TV と映画の両方を同じ呼び出しで扱える。
+        parse = ParseSeriesTitle(
+            title,
+            str(program.get('description') or ''),
+            program['detail'] if isinstance(program.get('detail'), dict) else {},
+            parsed_genres,
+        )
+        candidate = parse.series_title
+        if candidate == '':
+            continue
+        if exclude_key != '' and BuildSeriesGroupingKey(candidate) == exclude_key:
+            continue
+        query_counts[candidate] += 1
+    # 頻度順にすることで、単発の特番名より継続して現れる作品名を優先する。
+    return [query for query, _count in query_counts.most_common(3)]
