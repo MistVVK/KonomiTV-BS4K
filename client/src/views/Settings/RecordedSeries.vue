@@ -8,7 +8,7 @@
             <span class="ml-2">録画シリーズ</span>
         </h2>
         <div class="settings__description">
-            録画のタイトルから HonomiTV と同じ確定規則でシリーズを付けます。<br>
+            録画のタイトルからシリーズ確定規則でシリーズを付けます。<br>
             付かなかった録画は、AI が有効なら同一 EPG タイトルごとに Web 検索で補完します。<br>
             話数が単一の正整数で取れないときだけ、既存の話数 Web 検索を使います。<br>
             この設定と判定結果はすべてのユーザーと端末で共有されます。管理者だけが変更できます。<br>
@@ -23,7 +23,7 @@
                 <router-link class="link" to="/login/">ログイン</router-link>
             </span>
             <span v-else-if="authorization_error === 'AdminRequired'">この設定を表示するには管理者権限が必要です。</span>
-            <span v-else>サーバーに接続できないため、ユーザー情報を取得できませんでした。</span>
+            <span v-else>ユーザー情報を取得できませんでした。</span>
         </div>
 
         <template v-else>
@@ -48,7 +48,7 @@
                     AI でシリーズ補完・話数 Web 検索・Bangumi 照合をする
                 </label>
                 <label class="settings__item-label" for="recorded_series_ai_enabled">
-                    有効時、Indexer が所属を付けられなかった同一 EPG タイトル群を1回の Web 検索で補完します。<br>
+                    有効時、Indexer が所属を付けられなかった同一 EPG タイトル群をまとめて Web 検索で補完します。<br>
                     所属後、話数が単一の正整数で取れない録画だけ話数を Web 検索します。<br>
                     Bangumi の作品候補選択にも同じバックエンドを使います。<br>
                     Indexer が付けた所属を AI で書き換えることはありません。<br>
@@ -61,10 +61,10 @@
             <div class="settings__item">
                 <div class="settings__item-heading">話数不明時の Web 検索</div>
                 <div class="settings__item-label">
-                    AI が有効で Series が確定している話数不明録画は、接続確認済みのバックエンドで Web 検索します。<br>
+                    AI が有効で Series が確定している話数不明録画は、設定されたバックエンドで Web 検索します。<br>
                     Web 検索・出力形式・公開 URL の根拠を確認できた結果は、AI の信頼度表示にかかわらず自動採用します。<br>
                     根拠不足・検索失敗・不正な応答では現在の正本を変更しません。<br>
-                    既存録画は下の一括話数判定から検索できます。<br>
+                    既存録画はメンテナンス画面の一括話数判定から検索できます。<br>
                 </div>
             </div>
 
@@ -78,7 +78,7 @@
                     シリーズ補完・話数 Web 検索・Bangumi 候補選択に最初に使うバックエンドを選びます。<br>
                     OpenCode は「設定 → AIバックエンド」で登録した service ごとに選べます。<br>
                     2つの OpenAI 互換 API は OpenCode を経由せず、それぞれ保存済みの HTTP 接続を使います。<br>
-                    ACP / Codex・Grok はホスト上の CLI を起動します。<br>
+                    ACP / Codex・Grok はコンテナ内の CLI を起動します。<br>
                     Web 検索の接続確認は AIバックエンド画面から行えます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
@@ -109,7 +109,7 @@
                     <div class="settings__item-heading">{{openAICompatibleBackendTitle(settings.ai_backend)}} の接続</div>
                     <div class="settings__item-label">
                         API ベース URL・モデル・API キー・接続試験は「AIバックエンド」ページで設定します。<br>
-                        接続状態: {{isOpenAICompatibleConfigured(settings.ai_backend) ? '設定済み' : '未設定'}}
+                        設定状態: {{isOpenAICompatibleConfigured(settings.ai_backend) ? '設定済み' : '未設定'}}
                     </div>
                     <v-btn class="settings__save-button mt-3" variant="flat" to="/settings/server/ai-backends">
                         <Icon icon="fluent:settings-20-regular" class="mr-2" width="21px" />
@@ -140,7 +140,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">失敗時ポリシー</div>
                 <div class="settings__item-label">
-                    主系 AI が技術的に失敗したとき、または InsufficientEvidence のときにどうするかを決めます。<br>
+                    主系 AI が技術的に失敗したとき、またはシリーズ未確定・話数の根拠不足のときにどうするかを決めます。<br>
                     NoPublishedNumber / NotNumbered など正常な判定結果では切り替えません。<br>
                     失敗時ポリシーによる AI 試行は最大 2 回です。OpenCode 側の形式補修は使わず、サーバー側で応答を検証します。<br>
                 </div>
@@ -181,7 +181,7 @@
                         </div>
                         <div class="settings__item-label">
                             「AIバックエンド」ページの対応する独立接続設定を使います。<br>
-                            接続状態: {{fallback_auth_configured ? '設定済み' : '未設定'}}
+                            設定状態: {{fallback_auth_configured ? '設定済み' : '未設定'}}
                         </div>
                     </div>
                 </template>
@@ -204,7 +204,7 @@
                 <div class="settings__item-label">
                     シリーズの補完メタデータ（作品名・概要・画像・話数構造）を TMDb と Bangumi (bgm.tv) のどちらから取るかを選びます。<br>
                     併用時は両方を照合し、Bangumi 由来の話数構造があるシリーズでは Bangumi を優先します。<br>
-                    シリーズのタイトル・説明・ジャンルはこれまでどおり Wikipedia 由来の AI 生成が正本で、外部ソースは上書きしません。<br>
+                    外部ソースはシリーズ本体のタイトル・説明・ジャンルを上書きせず、取得した情報は別の補完データとして保持されます。<br>
                     「なし」にすると新しい照合・同期だけを止め、保存済みの照合データは残します。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
@@ -263,7 +263,7 @@
                     </div>
                 </div>
                 <div class="settings__item">
-                    <div class="settings__item-heading">最終実行</div>
+                    <div class="settings__item-heading">最終更新</div>
                     <div class="settings__item-label">
                         話数判定: {{formatLastRunAt(status.episode_last_run_at)}}<br>
                         OpenCode の月次利用量は
@@ -281,7 +281,7 @@
                 <div class="settings__item-heading">シリーズデータベースの削除と一括操作</div>
                 <div class="settings__item-label">
                     シリーズデータベースの削除・既存録画へ Indexer を再適用・既存録画の一括話数判定は、<br>
-                    メンテナンス画面のシリーズ欄へ移動しました。<br>
+                    メンテナンス画面のシリーズ欄で行います。<br>
                 </div>
             </div>
             <div class="settings__item">
@@ -298,7 +298,7 @@
                 <div class="settings__item">
                     <div class="settings__item-heading">録画シリーズ管理</div>
                     <div class="settings__item-label">
-                    判定済みのシリーズを検索し、表示するタイトルと説明を確認できます。<br>
+                    シリーズやその話数詳細、シリーズ未所属の録画を確認できます。<br>
                     </div>
                     <v-btn class="settings__save-button mt-4" variant="flat"
                         to="/settings/server/recorded-series/series">
@@ -329,7 +329,7 @@
                             未設定
                         </template>
                         <br>
-                        未設定でも TMDb 以外の照合は続行します。キーを保存すると、未照合のシリーズをバックグラウンドで照合します。<br>
+                        未設定でも TMDb 以外の照合は続行します。キーを保存すると、シリーズの照合をバックグラウンドで開始します。<br>
                         <template v-if="tmdb_connection_test_message !== ''">
                             接続試験: {{tmdb_connection_test_message}}<br>
                         </template>
@@ -352,7 +352,7 @@
                     <span class="ml-2">Bangumi 連携（共有・管理者1件）</span>
                 </div>
                 <div class="settings__item-label mb-4">
-                    管理者が登録した1件の個人アクセストークンを、全ユーザーの看過同期に使います。<br>
+                    管理者が登録した1件の個人アクセストークンを使い、各ユーザーの録画視聴完了を共有 Bangumi アカウントへ視聴済みとして反映します。<br>
                     トークンはサーバーへ暗号化して保存され、クライアントには返りません。<br>
                 </div>
                 <div class="bangumi-account bangumi-account--anonymous" v-if="bangumi_profile === null || bangumi_profile.bangumi_user_id === null">
@@ -400,7 +400,7 @@
                 <v-card-title class="d-flex justify-center pt-6 font-weight-bold">TMDb API キーを設定</v-card-title>
                 <v-card-text class="px-6 pt-4 pb-2">
                     <div class="settings__item-label mb-3">
-                        キー本体は保存後に再表示できません。変更時は新しいキーを入力してください。
+                        キー本体は保存後に再表示できません。変更時は新しいキーを入力してください。キーを削除しても取得済みのメタデータは保持されます。
                     </div>
                     <v-text-field color="primary" variant="outlined" label="v3 API キー" autocomplete="off"
                         :disabled="is_saving_tmdb_key || is_deleting_tmdb_key"
@@ -804,14 +804,14 @@ async function saveSettings(): Promise<void> {
         if (fetched_settings !== null) {
             applyFetchedSettings(fetched_settings);
         }
-        Message.success('録画シリーズ判定設定を更新しました。');
+        Message.success('録画シリーズ設定を更新しました。');
     }
     is_saving.value = false;
 }
 
 
 function formatLastRunAt(value: string | null): string {
-    return value === null ? '未実行' : dayjs(value).format('YYYY/M/D HH:mm:ss');
+    return value === null ? '記録なし' : dayjs(value).format('YYYY/M/D HH:mm:ss');
 }
 
 function openBangumiLinkDialog(): void {

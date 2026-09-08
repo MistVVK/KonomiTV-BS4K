@@ -8,7 +8,7 @@
             <span class="ml-3">録画シリーズ管理</span>
         </h2>
         <div class="settings__description">
-            判定済みの録画シリーズとシリーズ未所属の録画を確認します。<br>
+            録画シリーズとシリーズ未所属の録画を確認します。<br>
             所属や話数の訂正はこの画面では行いません。
         </div>
 
@@ -21,7 +21,7 @@
                 <router-link class="link" to="/login/">ログイン</router-link>
             </span>
             <span v-else-if="authorization_error === 'AdminRequired'">この画面を表示するには管理者権限が必要です。</span>
-            <span v-else>サーバーに接続できないため、ユーザー情報を取得できませんでした。</span>
+            <span v-else>ユーザー情報を取得できませんでした。</span>
         </div>
 
         <template v-else>
