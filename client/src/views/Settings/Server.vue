@@ -67,11 +67,11 @@
                 </v-text-field>
             </div>
             <div class="settings__item" v-if="isSectionVisible('backend')">
-                <div class="settings__item-heading">BS4K の視聴方法</div>
+                <div class="settings__item-heading">BS4K の受信方式</div>
                 <div class="settings__item-label">
-                    MPEG-TS は従来の受信経路を利用します。TLV は BS4K のライブ視聴だけを専用 Mirakurun / mirakc から受信します。<br>
+                    MPEG-TS は通常の受信経路を利用します。TLV は BS4K のライブ視聴のみ専用 Mirakurun / mirakc から受信します。<br>
                     TLV を選択しても、番組情報・録画予約などの通常バックエンドは変更されません。<br>
-                    EDCB バックエンドでは、BS4K 以外のライブ視聴も従来どおり EDCB から受信できます。<br>
+                    BS4K 以外のライブ視聴は、通常のバックエンド設定に従って受信されます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -111,8 +111,8 @@
             <div class="settings__item" v-if="isSectionVisible('streaming') && server_settings.general.encoder !== 'FFmpeg'">
                 <div class="settings__item-heading">SARモード</div>
                 <div class="settings__item-label">
-                    CPUを選択すると、放送中のアスペクト比を自動判断して最適な出力をします。<br>
-                    GPUは<strong>決め打ちで</strong>最終的に16:9になるように出力します。<br>
+                    CPU を選択すると、放送中のアスペクト比を自動判定し、比率を維持して出力します。<br>
+                    GPU は24fpsモード時を除き、アスペクト比を自動判定せず<strong>固定で</strong>16:9 に引き伸ばして出力します。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -379,7 +379,7 @@
                     通常・BS4K の両方のハードウェアエンコード (QSV・AMF) で利用する DRM render node を指定します。デフォルトは自動選択です。<br>
                     自動選択では、エンコーダーのベンダーに一致する render node が自動で選択されます。<br>
                     複数 GPU 環境で特定の GPU だけを使いたい場合は、/dev/dri/renderD128 のようなパスを指定してください。<br>
-                    指定した render node が見えない環境では、警告を出した上で自動選択に戻ります。<br>
+                    指定した render node が存在しない場合やベンダーが一致しない場合は、警告を出力した上で自動選択で動作します。<br>
                 </div>
                 <v-combobox class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
