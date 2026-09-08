@@ -9,7 +9,7 @@
         </h2>
         <div class="settings__description">
             サーバーの診断設定、ログ確認、データベース更新、録画スキャン、各種再解析をまとめて管理します。<br>
-            操作ごとの権限確認と実行方法は従来どおり維持されます。<br>
+            設定の変更や各種操作を行うには、管理者アカウントでログインしてください。<br>
         </div>
         <ServerSettings section="diagnostics" embedded />
         <MaintenanceSettings section="maintenance" embedded />

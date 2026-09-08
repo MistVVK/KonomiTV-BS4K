@@ -90,7 +90,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">すべての録画ファイルの CM 区間を再判定</div>
                 <div class="settings__item-label">
-                    KonomiTV-BS4K に登録されているすべての録画ファイルについて、既存結果を上書きして CM 区間を再判定します。<br>
+                    CM 解析が有効な場合に、手動編集した専用 YAML を保護し、除外ディレクトリを除く登録録画の自動解析結果を上書きして CM 区間を再判定します。<br>
                     CM 判定方法が変更された後に、既存の録画ファイルにも新しい判定結果を反映したい場合に利用してください。<br>
                 </div>
                 <div class="settings__item-label mt-1">
@@ -155,7 +155,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">既存録画へ Indexer を再適用</div>
                 <div class="settings__item-label">
-                    保存済みの全録画へ、HonomiTV と同じ確定規則を再適用します。<br>
+                    保存済みの全録画へ、シリーズ確定規則を再適用します。<br>
                     AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで補完します。<br>
                     付かなければ所属を外します。自動判定が無効のときは実行できません。<br>
                 </div>
@@ -177,7 +177,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">既存録画の一括話数判定</div>
                 <div class="settings__item-label">
-                    Series 所属済みで、話数が未処理・ローカル判定で不明・移行データで要確認の既存録画を、<br>
+                    Series 所属済みで、話数が未処理・ローカル判定で不明・移行データで要確認、および AI 設定変更後の再試行対象となる既存録画を、<br>
                     保存済みの AI 設定で順番に Web 検索します。<br>
                     Indexer が単一の正整数を取れた録画は検索しません。<br>
                 </div>
@@ -401,7 +401,7 @@ async function reanalyzeAllRecordedVideos() {
     );
     const result = await Maintenance.reanalyzeAllRecordedVideos();
     if (result === true) {
-        Message.success('すべての録画ファイルのメタデータ再解析が完了しました。');
+        Message.success('録画ファイルのメタデータ再解析処理が完了しました。');
     }
 }
 
@@ -413,7 +413,7 @@ async function detectCMSectionsForAllRecordedVideos() {
     );
     const result = await Maintenance.detectCMSectionsForAllRecordedVideos();
     if (result === true) {
-        Message.success('すべての録画ファイルの CM 区間判定が完了しました。');
+        Message.success('録画ファイルの CM 区間再判定処理が完了しました。');
     }
 }
 
@@ -504,7 +504,7 @@ function startBackfill(): void {
     }
     series_confirmation_action.value = 'Series';
     series_confirmation_message.value =
-        'HonomiTV と同じ確定規則を保存済みの全録画へ再適用します。AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで Web 検索します。続行しますか？';
+        'シリーズ確定規則を保存済みの全録画へ再適用します。AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで Web 検索します。続行しますか？';
     series_confirmation_dialog.value = true;
 }
 
