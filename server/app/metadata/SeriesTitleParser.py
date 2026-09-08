@@ -166,7 +166,7 @@ def _findQuotedSegment(value: str) -> tuple[int, int, str] | None:
 
 
 def _isInsideQuotedSegment(value: str, position: int) -> bool:
-    """指定位置が対応済み引用区間内にあるかを返す。
+    """指定位置が対応済み引用区間内にあるかを検査する。
 
     Args:
         value: 引用符を検査する正規化済み文字列。
@@ -187,6 +187,69 @@ def _isInsideQuotedSegment(value: str, position: int) -> bool:
         offset = absolute_end
         remaining = value[offset:]
     return False
+
+
+# 映画枠・劇場版を作品単位で束ねるとき、放送装飾と同一作品の版表記だけを除く。
+## 枠名そのものは引用符の前にあるため、作品名の抽出では使わない。
+_MOVIE_DECORATION_PATTERN = re.compile(r'★[^★]*★|<[^<>]*>|\[[^\]]*\]|【[^【】]*】')
+# ディレクターズカット版は本編と同じ Series にするため、作品名から除く。
+_MOVIE_EDITION_MARKERS = ('ディレクターズカット', 'ディレクターズ・カット')
+# 版マーカー・本編表記を含む括弧は、対応する括弧ごと単位として除去する。
+## 文字列だけを削ると括弧や「版」が残り別キーになる。無関係な作品名の括弧は削らない。
+_MOVIE_EDITION_BRACKET_PATTERN = re.compile(
+    r'[\(（\[][^\(（\)）\[\]]*(?:ディレクターズカット|ディレクターズ・カット|本編)[^\(（\)）\[\]]*[\)）\]]',
+)
+# 「○○ 本編」と「○○ ディレクターズカット」を同一作品にするための末尾表記。
+_MOVIE_HONPEN_SUFFIX_PATTERN = re.compile(r'[\s　\[［\(\（]*本編[\s　\]］\)\）]*\s*$')
+# 映画枠の判定に使う劇場版表記。単独抱き合わせ特番の枠名ではなく作品側の表記である。
+_MOVIE_THEATER_MARKER = '劇場版'
+
+
+def ExtractMovieWorkTitle(
+    value: str,
+    primary_major_genre: str | None,
+) -> tuple[str, bool] | None:
+    """映画枠・劇場版のタイトルから作品単位の表示名を抜き出す。
+
+    枠名で束ねると別作品が混ざるため、引用された作品名と後続の installment を
+    作品識別名にする。引用が無い場合は全体を作品名とする。監督カット版・本編
+    表記は同一作品としてキーから除く。
+
+    Args:
+        value: 正規化済みの番組タイトル。
+        primary_major_genre: 先頭ジャンルの major。映画枠の判定に使う。
+
+    Returns:
+        (作品表示名, 引用の有無)。映画枠でなければ None。
+    """
+
+    if primary_major_genre != '映画' and _MOVIE_THEATER_MARKER not in value:
+        return None
+    segment = _findQuotedSegment(value)
+    if segment is not None:
+        # 引用以降（installment・属性）を作品名に含め、枠名は捨てる。
+        ## 例: 金曜ロードショー「耳をすませば」★...★ → 耳をすませば
+        ## 例: 劇場版「鬼滅の刃」無限列車編 → 鬼滅の刃 無限列車編
+        trailing = _MOVIE_DECORATION_PATTERN.sub('', value[segment[1]:])
+        work_title = _cleanSeriesTitle(f'{segment[2]} {trailing}')
+        has_quoted_movie = True
+    else:
+        work_title = _cleanSeriesTitle(_MOVIE_DECORATION_PATTERN.sub('', value))
+        has_quoted_movie = False
+    # 括弧付きの版表記は括弧ごと単位で除去し、対応する括弧や「版」を残さない。
+    work_title = _cleanSeriesTitle(_MOVIE_EDITION_BRACKET_PATTERN.sub('', work_title))
+    edition_found = False
+    for marker in _MOVIE_EDITION_MARKERS:
+        if marker in work_title:
+            edition_found = True
+            work_title = _cleanSeriesTitle(work_title.replace(marker, ''))
+    if edition_found:
+        # 「ディレクターズカット版」の版は作品名ではないため、除去後に残っても削る。
+        work_title = _cleanSeriesTitle(re.sub(r'版\s*$', '', work_title))
+    work_title = _cleanSeriesTitle(_MOVIE_HONPEN_SUFFIX_PATTERN.sub('', work_title))
+    if work_title == '':
+        return None
+    return work_title, has_quoted_movie
 
 
 def _stripLeadingStructuralDescriptor(value: str) -> str:
@@ -406,6 +469,24 @@ def ParseSeriesTitle(
         ):
             subtitle = _cleanSubtitle(description_subtitle_segment[2])
 
+    # 映画枠・劇場版は作品単位で Series を作る。枠名で束ねると別作品が混ざるため、
+    ## 引用された作品名と後続 installment をシリーズ名にする。抽出できた映画は
+    ## 単発除外せず、1作品1 Series として扱う。
+    movie_work = ExtractMovieWorkTitle(normalized_title, primary_major_genre)
+    if movie_work is not None:
+        movie_title, has_quoted_movie = movie_work
+        return SeriesTitleParseResult(
+            series_title=movie_title,
+            normalized_key=BuildSeriesGroupingKey(movie_title),
+            episode_number=None,
+            subtitle=movie_title if has_quoted_movie else subtitle,
+            season_number=None,
+            episode_source=None,
+            has_explicit_episode=False,
+            is_hard_standalone=False,
+            is_soft_standalone=False,
+        )
+
     return SeriesTitleParseResult(
         series_title=series_title,
         normalized_key=BuildSeriesGroupingKey(series_title),
@@ -416,7 +497,7 @@ def ParseSeriesTitle(
         has_explicit_episode=False,
         # 「映画『作品名』」のような汎用枠タイトルは引用符前が同じ root になるため、
         # 内容の異なる映画が2本揃っただけでシリーズへ昇格しないよう絶対除外にする。
-        # 明示話数がある場合は上の分岐ですでに返しており、この除外より優先される。
+        # 明示話数がある場合と抽出できた映画は上の分岐ですでに返しており、この除外より優先される。
         is_hard_standalone=is_hard_standalone or is_primary_movie,
         is_soft_standalone=is_soft_standalone and not is_primary_movie,
     )

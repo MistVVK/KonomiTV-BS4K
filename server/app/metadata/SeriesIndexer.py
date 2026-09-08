@@ -16,8 +16,10 @@ from app.metadata.RecordedEpisodeResolver import (
     ParseSinglePositiveIntegerEpisode,
 )
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
+from app.metadata.SeriesTitleParser import ExtractMovieWorkTitle
 from app.models.RecordedEpisode import RecordedEpisodeResolution
 from app.models.RecordedProgram import RecordedProgram
+from app.models.RecordedSeries import RecordedSeriesResolution
 from app.models.Series import Series
 from app.models.SeriesAlias import SeriesAlias
 from app.models.SeriesBroadcastPeriod import SeriesBroadcastPeriod
@@ -36,6 +38,8 @@ class ParsedSeriesTitle:
     episode_number: str | None
     # 話数表記の後ろにある副題。取得できない場合は None。
     subtitle: str | None
+    # 映画作品として識別できた場合だけ True。グルーピング identity の種別に使う。
+    is_movie: bool = False
 
 
 # 放送状態や短い汎用枠は、同名でも一つの作品を表さないため Series を自動生成しない。
@@ -353,6 +357,27 @@ def ParseSeriesTitle(
     normalized_source = PROGRAM_SLOT_MARK_PATTERN.sub('', normalized_source)
     normalized_source = normalized_source.strip()
 
+    # 映画枠・劇場版は作品単位で Series を作る。枠名で束ねると別作品が混ざり、
+    ## 話数が無いため AI 側へ落ちると枠シリーズへ誤統合される。引用作品名と
+    ## 後続 installment を作品名にし、監督カット版は本編と同一キーにする。
+    movie_work = ExtractMovieWorkTitle(
+        normalized_source,
+        genres[0]['major'] if len(genres) > 0 else None,
+    )
+    if movie_work is not None:
+        movie_title, has_quoted_movie = movie_work
+        normalized_movie_title = NormalizeSeriesTitle(movie_title)
+        if len(normalized_movie_title) >= 2 and normalized_movie_title not in GENERIC_SERIES_TITLES:
+            return ParsedSeriesTitle(
+                display_title = movie_title,
+                normalized_title = normalized_movie_title,
+                episode_number = None,
+                subtitle = movie_title if has_quoted_movie else None,
+                is_movie = True,
+            )
+        # 抽出できた映画名が汎用枠相当のときは、通常解析へ委ねず除外する。
+        return None
+
     # 「日5『作品名』 #2」の引用符は副題ではないため、作品名と話数を通常の配置に戻す。
     quoted_program_slot_match = QUOTED_PROGRAM_SLOT_PATTERN.fullmatch(normalized_source)
     if quoted_program_slot_match is not None:
@@ -612,14 +637,34 @@ class SeriesIndexer:
             await SeriesAIFallbackTask.schedule()
             return False
 
+        # 映画は作品種別をグルーピング identity に含め、同名 TV と混ざらないようにする。
+        ## 識別キー・alias・canonical key を同じ区別で通し、表示名は作品名のままにする。
+        ## AI fallback が検証した別 Series は、映画キーと不一致なら再利用しない。
+        identity_title = (
+            f'映画:{parsed_title.normalized_title}'
+            if parsed_title.is_movie
+            else parsed_title.normalized_title
+        )
+        if parsed_title.is_movie:
+            if _fallback_series is not None and _fallback_series.normalized_title != identity_title:
+                _fallback_series = None
+            # 管理者の手動判断は映画の自動所属より優先し、所属も解除もせず維持する。
+            manual_resolution = await RecordedSeriesResolution.filter(
+                recorded_program_id=recorded_program.id,
+                source='Manual',
+                status__in=['Resolved', 'NotSeries'],
+            ).first()
+            if manual_resolution is not None:
+                return False
+
         # 原則は normalized_title の完全一致だけで Series を再利用し、fuzzy 類似度による誤統合を防ぐ。
         ## Bangumi 条目で統合済みの放送局別表記は alias に残るため、主タイトルの次に完全一致で解決する。
         series = _fallback_series
         if series is None:
-            series = await Series.get_or_none(normalized_title=parsed_title.normalized_title)
+            series = await Series.get_or_none(normalized_title=identity_title)
             if series is None:
                 series_alias = await SeriesAlias.get_or_none(
-                    normalized_title = parsed_title.normalized_title,
+                    normalized_title = identity_title,
                 ).select_related('series')
                 if series_alias is not None:
                     series = series_alias.series
@@ -649,17 +694,17 @@ class SeriesIndexer:
                     break
 
         if series is None:
-            canonical_key = hashlib.sha256(parsed_title.normalized_title.encode('utf-8')).hexdigest()
+            canonical_key = hashlib.sha256(identity_title.encode('utf-8')).hexdigest()
             canonical_key_owner = await Series.get_or_none(canonical_key=canonical_key)
             if canonical_key_owner is not None:
                 series = canonical_key_owner
                 is_series_created = False
                 if series.normalized_title is None:
-                    series.normalized_title = parsed_title.normalized_title
+                    series.normalized_title = identity_title
                     await series.save(update_fields=['normalized_title', 'updated_at'])
             else:
                 series, is_series_created = await Series.get_or_create(
-                    normalized_title = parsed_title.normalized_title,
+                    normalized_title = identity_title,
                     defaults = {
                         'title': parsed_title.display_title,
                         'description': '',
@@ -673,7 +718,7 @@ class SeriesIndexer:
 
         # 主タイトルも alias テーブルへ常に登録し、統合時にタイトル所有者を原子的に移せるようにする。
         await SeriesAlias.update_or_create(
-            normalized_title = parsed_title.normalized_title,
+            normalized_title = identity_title,
             defaults = {'series_id': series.id},
         )
 

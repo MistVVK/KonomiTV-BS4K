@@ -32,7 +32,9 @@ from typing_extensions import TypedDict
 from app import logging
 from app.constants import JST, TMDB_HTTPX_CLIENT
 from app.metadata.RecordedSeriesSettings import IsTmdbExternalMetadataEnabled
+from app.metadata.SeriesTitleParser import ExtractMovieWorkTitle
 from app.models.RecordedEpisode import SeriesEpisode
+from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series, TmdbMediaType
 from app.utils.KonomiTVBS4KTmdbStore import KonomiTVBS4KTmdbStore
 
@@ -542,6 +544,31 @@ class KonomiTVBS4KTmdbClient:
         """
 
         candidates = await cls.searchCandidates(series.title, api_key)
+        if len(candidates) == 0:
+            return None
+        # Indexer と同じ映画識別で作品種別を決め、映画 Series に TV 作品を、
+        ## TV Series に映画作品を結び付けない。所属録画の EPG 題名・ジャンルを
+        ## 同じ抽出で判定するため、アニメジャンルの劇場版も movie になる。
+        ## 所属録画が無い Series は絞らず、AI 選択へ委ねる。
+        member_programs = await RecordedProgram.filter(series_id=series.id).values('title', 'genres')
+        if len(member_programs) > 0:
+            is_movie_series = any(
+                ExtractMovieWorkTitle(
+                    str(member_program.get('title') or ''),
+                    (
+                        member_program['genres'][0]['major']
+                        if isinstance(member_program.get('genres'), list)
+                        and len(member_program['genres']) > 0
+                        and isinstance(member_program['genres'][0], dict)
+                        else None
+                    ),
+                ) is not None
+                for member_program in member_programs
+            )
+            candidates = [
+                candidate for candidate in candidates
+                if candidate['media_type'] == ('movie' if is_movie_series else 'tv')
+            ]
         if len(candidates) == 0:
             return None
         # 同名のリメイクや別媒体を採点だけで結び付けず、全候補を AI 選択へ回す。
