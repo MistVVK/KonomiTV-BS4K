@@ -23,8 +23,8 @@
             <div class="settings__item">
                 <div class="settings__item-heading">BS4K</div>
                 <div class="settings__item-label">
-                    BS4K のライブ再生と、BS4K（ONID=11）の録画再生で利用します。<br>
-                    通常のライブ再生と録画再生には、通常側のタブで選んだエンコーダーを利用します。<br>
+                    BS4K チャンネルのライブ再生と、BS4K 放送の録画再生で利用します。<br>
+                    通常チャンネルのライブ再生と BS4K 以外の録画再生には、通常タブで選んだエンコーダーを利用します。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -33,9 +33,9 @@
                 </v-select>
             </div>
             <div class="settings__item settings__item--switch">
-                <label class="settings__item-heading" for="encoder_bs4k_input_analysis_enabled">BS4K ライブ入力解析を強化する</label>
+                <label class="settings__item-heading" for="encoder_bs4k_input_analysis_enabled">BS4K ライブ用の入力解析設定を有効にする</label>
                 <label class="settings__item-label" for="encoder_bs4k_input_analysis_enabled">
-                    有効にすると、BS4K のライブ視聴時だけ下の入力解析サイズ・時間を使います。<br>
+                    有効にすると、BS4K のライブ視聴時のみ、下の入力解析サイズと時間を基準値として入力ストリームを解析します。<br>
                     無効にすると、通常チャンネルと同じ入力解析設定を使います。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="encoder_bs4k_input_analysis_enabled" hide-details
@@ -45,7 +45,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">BS4K 入力解析サイズ (KB)</div>
                 <div class="settings__item-label">
-                    BS4K ライブ入力解析を強化する場合に、エンコーダーが映像ヘッダーを探すために読むデータ量を設定します。デフォルトは 3000 です。<br>
+                    BS4K ライブ用の入力解析設定が有効な場合に、エンコーダーがストリーム情報を解析するために読み込むデータ量の基準値を設定します。デフォルトは 3000 です。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -55,7 +55,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">BS4K 入力解析時間 (秒)</div>
                 <div class="settings__item-label">
-                    BS4K ライブ入力解析を強化する場合に、エンコーダーが入力ストリームを解析する時間を設定します。デフォルトは 1.5 です。<br>
+                    BS4K ライブ用の入力解析設定が有効な場合に、エンコーダーが入力ストリームを解析する時間の基準値を設定します。デフォルトは 1.5 です。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number" step="0.1" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -63,9 +63,9 @@
                 </v-text-field>
             </div>
             <div class="settings__item">
-                <div class="settings__item-heading">BS4K mux 待ち幅 (KB)</div>
+                <div class="settings__item-heading">BS4K mux 待ち幅 (ミリ秒)</div>
                 <div class="settings__item-label">
-                    BS4K のライブ視聴と ONID=11 の録画再生時だけ、映像と音声の多重化で許容する待ち幅を設定します。デフォルトは 800 です。<br>
+                    BS4K のライブ視聴時のみ、映像や音声の多重化（mux）で許容する待ち時間の基準値を設定します。デフォルトは 800 です。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -78,7 +78,7 @@
                     <span class="bs4k-warning-badge">注意</span>
                 </label>
                 <label class="settings__item-label" for="encoder_bs4k_low_latency">
-                    有効にすると、BS4K のライブ視聴と ONID=11 の録画再生時だけエンコーダーに即時出力系のオプションを付けます。<br>
+                    有効にすると、BS4K のライブ視聴時のみ、エンコーダーのバッファを抑えて即時出力するオプションを適用します。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="encoder_bs4k_low_latency" hide-details
                     :model-value="server_settings.general.encoder_bs4k_low_latency"
@@ -86,9 +86,9 @@
                 </v-switch>
             </div>
             <div class="settings__item settings__item--switch">
-                <label class="settings__item-heading" for="bs4k_live_startup_discard_enabled">BS4K ライブ開始時に先頭 TS を捨てる</label>
+                <label class="settings__item-heading" for="bs4k_live_startup_discard_enabled">BS4K ライブ開始時に先頭 TS を破棄する</label>
                 <label class="settings__item-label" for="bs4k_live_startup_discard_enabled">
-                    有効にすると、BS4K のライブ視聴開始時だけチューナー切替直後の TS をエンコーダーに渡さず破棄します。<br>
+                    有効にすると、MPEG-TS での BS4K ライブ視聴開始時のみ、チューナー切り替え直後の TS を下の設定秒数だけエンコーダーへ渡さず破棄します（MMT/TLV は対象外）。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="bs4k_live_startup_discard_enabled" hide-details
                     v-model="server_settings.general.bs4k_live_startup_discard_enabled">
@@ -97,7 +97,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">BS4K ライブ先頭 TS 破棄秒数</div>
                 <div class="settings__item-label">
-                    BS4K ライブ開始時に捨てる TS の秒数を設定します。デフォルトは 2.0 です。<br>
+                    BS4K ライブ開始時の先頭 TS 破棄が有効な場合に、エンコーダーへ渡さず破棄する秒数を設定します。0 に設定すると破棄しません。デフォルトは 2.0 です。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" type="number" step="0.1" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -242,7 +242,7 @@
                 </label>
                 <label class="settings__item-label" for="bs4k_ignore_viewer_low_latency">
                     有効にすると、BS4K のライブ視聴時だけユーザーの低遅延視聴設定を使わず、通常の再生バッファを使います。<br>
-                    変更を反映するには BS4K設定を更新し、KonomiTV-BS4K サーバーを再起動してください。<br>
+                    変更を反映するには配信・エンコーダー設定を更新し、KonomiTV-BS4K サーバーを再起動してください。<br>
                 </label>
                 <v-switch class="settings__item-switch" color="primary" id="bs4k_ignore_viewer_low_latency" hide-details
                     :model-value="server_settings.general.bs4k_ignore_viewer_low_latency" :disabled="is_disabled"
@@ -272,7 +272,7 @@
                 <v-card-title>BS4K エンコーダーの即時出力優先を有効化</v-card-title>
                 <v-card-text>
                     <v-alert class="mb-4" color="warning" variant="tonal">
-                        BS4K 再生時に、プチフリーズのような再読み込みが多発するおそれがあります。
+                        BS4K のライブ視聴時に、プチフリーズのような再読み込みが多発するおそれがあります。
                     </v-alert>
                     再生の安定性よりもエンコーダーからの即時出力を優先する設定です。<br>
                     内容を理解した上で、それでも利用する場合だけ有効にしてください。
@@ -288,10 +288,10 @@
         </v-dialog>
         <v-dialog v-model="bs4k_ignore_viewer_low_latency_warning_dialog" max-width="560">
             <v-card>
-                <v-card-title>BS4K プレイヤーの通常バッファを無効化</v-card-title>
+                <v-card-title>BS4K 通常バッファの強制を解除</v-card-title>
                 <v-card-text>
                     <v-alert class="mb-4" color="warning" variant="tonal">
-                        ユーザー側で低遅延視聴が有効な場合、BS4K 再生時にプチフリーズのような再読み込みが多発するおそれがあります。
+                        ユーザー側で低遅延視聴が有効な場合、BS4K のライブ視聴時にプチフリーズのような再読み込みが多発するおそれがあります。
                     </v-alert>
                     通常バッファの強制を解除し、ユーザーごとの低遅延視聴設定を優先します。<br>
                     内容を理解した上で、それでも利用する場合だけオフにしてください。
