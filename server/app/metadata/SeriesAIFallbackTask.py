@@ -11,6 +11,7 @@ from app.metadata.ai.recorded_series_ai import (
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
     resolve_series_metadata,
+    resolve_title_readings,
 )
 from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
 from app.metadata.RecordedSeriesCandidates import (
@@ -29,6 +30,10 @@ from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettings,
     RecordedSeriesSettingsStore,
 )
+from app.metadata.SeriesTitleParser import (
+    DeriveTitleReadingFromTitle,
+    NormalizeProgramText,
+)
 from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series
 from app.models.SeriesAIFallback import SeriesAIFallback, SeriesAIFallbackStatus
@@ -36,6 +41,12 @@ from app.models.SeriesAIFallback import SeriesAIFallback, SeriesAIFallbackStatus
 
 _MAX_GROUP_PROGRAMS = 8
 _MAX_TEXT_LENGTH = 600
+# 読み一括補完の1回あたりタイトル上限。ACP 応答は推論の長さも含めて
+## 出力上限 (約 256KB) を超えるため、実機で 19 件前後が上限だった実績から
+## 余裕を持って 10 件ずつに分割する。
+_TITLE_READING_BATCH_SIZE = 10
+# 読み一括補完の1実行あたり処理上限。実行時間を外部 AI 呼び出しに依存させないための枠。
+_TITLE_READING_MAX_SERIES_PER_RUN = 96
 
 
 SeriesAIFallbackWorkerState = Literal['Running', 'Idle', 'Disabled', 'Stopped']
@@ -544,6 +555,9 @@ class SeriesAIFallbackTask:
                     cls._failed_count += 1
                 elif result_status == 'Cancelled':
                     cls._cancelled_count += 1
+            # 読み欠落の解決済みシリーズを、同じ AI 補完実行の軽量パスで補完する。
+            await cls._backfillTitleReadings()
+
             # 最終 group の外部待機中に設定が無効化された場合も、完了後に Idle へ上書きしない。
             latest_settings = RecordedSeriesSettingsStore.getSettings()
             if latest_settings.enabled is False or latest_settings.ai_enabled is False:
@@ -791,6 +805,7 @@ class SeriesAIFallbackTask:
             fallback,
             programs,
             existing_series_id=resolved_series_id,
+            title_reading=result.title_reading,
         )
         return 'Resolved'
 
@@ -801,6 +816,7 @@ class SeriesAIFallbackTask:
         programs: list[RecordedProgram],
         *,
         existing_series_id: int | None = None,
+        title_reading: str | None = None,
     ) -> None:
         """AI 確定 cache を、まだ未所属の束へ適用して話数キューへ渡す。
 
@@ -808,6 +824,7 @@ class SeriesAIFallbackTask:
             fallback: 公開 Web 根拠を保存済みの所属 cache。
             programs: 同じ grouping key に属する録画番組。
             existing_series_id: 今回の AI 応答が選んだ hints 内の既存 Series ID。
+            title_reading: 今回の AI 応答から取得した読み。cache 再利用時は None。
 
         Returns:
             None
@@ -815,7 +832,11 @@ class SeriesAIFallbackTask:
 
         if fallback.series_title is None or fallback.normalized_title is None:
             return
-        from app.metadata.SeriesIndexer import NormalizeSeriesTitle, SeriesIndexer
+        from app.metadata.SeriesIndexer import (
+            NormalizeSeriesTitle,
+            SaveTitleReading,
+            SeriesIndexer,
+        )
         from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
         from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
 
@@ -842,7 +863,9 @@ class SeriesAIFallbackTask:
                 linked_series_title = latest.series_title
                 linked_normalized_title = NormalizeSeriesTitle(latest.series_title)
             await RecordedEpisodeAutomation.enqueue(latest.id)
-        if linked_any:
+        if linked_any and linked_series_id is not None:
+            # AI 応答の読みを、未設定の Series へだけ保存する (既存値の上書きはしない)。
+            await SaveTitleReading(linked_series_id, linked_series_title, title_reading)
             if (
                 linked_series_id != fallback.series_id
                 or linked_series_title != fallback.series_title
@@ -862,3 +885,64 @@ class SeriesAIFallbackTask:
             KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
             # 同じく Series 作成後の TMDb 照合も、合流可能なバックグラウンド経路へ渡す。
             KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+
+    @classmethod
+    async def _backfillTitleReadings(cls) -> None:
+        """読み欠落の解決済みシリーズを、カナ機械生成と軽量 AI 一括呼び出しで補完する。
+
+        Returns:
+            None
+        """
+
+        from app.metadata.SeriesIndexer import SaveTitleReading
+
+        # 再生可能録画を持つ Series のうち、読みが未設定のものだけを対象にする。
+        missing_series = list(
+            await Series.filter(
+                title_reading__isnull=True,
+                broadcast_periods__recorded_programs__recorded_video__status='Recorded',
+            ).distinct().order_by('id').limit(_TITLE_READING_MAX_SERIES_PER_RUN)
+        )
+        if len(missing_series) == 0:
+            return
+        # カナのみのタイトルは AI を呼ばずに埋める。
+        pending = [series for series in missing_series if DeriveTitleReadingFromTitle(series.title) is None]
+        for series in missing_series:
+            if series not in pending:
+                await SaveTitleReading(series.id, series.title, None)
+        for offset in range(0, len(pending), _TITLE_READING_BATCH_SIZE):
+            # 外部待機中に無効化された場合は、残りを次回の実行へ委ねる。
+            latest_settings, latest_api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+            if latest_settings.enabled is False or latest_settings.ai_enabled is False:
+                logging.warning(
+                    '[SeriesAIFallbackTask] Title reading backfill stopped because series AI was disabled.',
+                )
+                return
+            batch = pending[offset:offset + _TITLE_READING_BATCH_SIZE]
+            try:
+                readings = await resolve_title_readings(
+                    [series.title for series in batch],
+                    settings=latest_settings,
+                    api_key=latest_api_key,
+                )
+            except RecordedSeriesAIError as ex:
+                logging.warning(
+                    f'[SeriesAIFallbackTask] Title reading backfill skipped. [error: {ex.code}]',
+                )
+                return
+            # 応答の title はバリデータで NormalizeProgramText() 済みのため、
+            ## 所属 Series 側のタイトルも同じ正規化を通して照合する (生 title は
+            ## 全角英数字など正規化後と一致しないことがある)。
+            reading_by_title = {
+                NormalizeProgramText(title): reading
+                for title, reading in readings
+            }
+            for series in batch:
+                # 同一タイトルの Series が複数あっても、同じ読みを未設定行へだけ保存する。
+                normalized_title = NormalizeProgramText(series.title)
+                if normalized_title in reading_by_title:
+                    await SaveTitleReading(series.id, series.title, reading_by_title[normalized_title])
+        logging.info(
+            f'[SeriesAIFallbackTask] Title reading backfill completed. '
+            f'[missing: {len(missing_series)}, ai_requested: {len(pending)}]',
+        )

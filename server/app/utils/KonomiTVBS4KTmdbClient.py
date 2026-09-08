@@ -20,12 +20,14 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, cast
 
 import httpx
 from tortoise.exceptions import IntegrityError
+from tortoise.expressions import F
+from tortoise.functions import Coalesce
 from tortoise.transactions import in_transaction
 from typing_extensions import TypedDict
 
@@ -71,6 +73,11 @@ class TmdbSeriesDetails(TypedDict):
     backdrop_url: str | None
     # TV のレギュラーシーズンと特別編の season_number。映画では空リスト。
     season_numbers: list[int]
+    # TV は初回放送日、映画は公開日 (YYYY-MM-DD)。不明なときは空文字。
+    first_air_date: str
+    # 人気度と評価。不明なときは None。
+    popularity: float | None
+    vote_average: float | None
 
 
 class TmdbSeasonEpisode(TypedDict):
@@ -287,6 +294,24 @@ class KonomiTVBS4KTmdbClient:
         return candidates
 
 
+    @staticmethod
+    def _parseTmdbDate(value: str) -> date | None:
+        """TMDb の日付文字列 (YYYY-MM-DD) を date へ変換する。
+
+        Args:
+            value (str): 変換する日付文字列。
+
+        Returns:
+            date | None: 解析できない日付は無効値として None を返す。
+        """
+
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            # 外部 API の日付表記の揺れは、保存の妨げにならないよう破棄する。
+            return None
+
+
     @classmethod
     async def getDetails(
         cls,
@@ -338,6 +363,11 @@ class KonomiTVBS4KTmdbClient:
                 if not isinstance(season, dict) or type(season.get('season_number')) is not int:
                     raise ValueError('TMDb season number is invalid.')
                 season_numbers.append(season['season_number'])
+        # 初放送日・人気度・評価はソート用の補完メタデータ。日本語化対象ではないため
+        ## 英語フォールバック応答は参照せず、主応答の値だけを使う。
+        first_air_date = str(payload.get('first_air_date') or payload.get('release_date') or '')
+        popularity = payload.get('popularity')
+        vote_average = payload.get('vote_average')
         return TmdbSeriesDetails(
             media_type=media_type,
             tmdb_id=tmdb_id,
@@ -346,6 +376,17 @@ class KonomiTVBS4KTmdbClient:
             poster_url=cls._buildImageURL(payload.get('poster_path'), cls.POSTER_SIZE),
             backdrop_url=cls._buildImageURL(payload.get('backdrop_path'), cls.BACKDROP_SIZE),
             season_numbers=season_numbers,
+            first_air_date=first_air_date,
+            popularity=(
+                float(popularity)
+                if isinstance(popularity, (int, float)) and not isinstance(popularity, bool)
+                else None
+            ),
+            vote_average=(
+                float(vote_average)
+                if isinstance(vote_average, (int, float)) and not isinstance(vote_average, bool)
+                else None
+            ),
         )
 
 
@@ -728,12 +769,27 @@ class KonomiTVBS4KTmdbClient:
         # 外部待ちの間の無効化と、別処理で統合・削除された Series を保存直前に再確認する。
         if not IsTmdbExternalMetadataEnabled() or not KonomiTVBS4KTmdbStore.isConfigured():
             return False
+        # 初放送日は TMDb → Bangumi → ローカル放送開始日の優先順のため、TMDb 側は
+        ## 値が取れたときだけ上書きする (空は既存の Bangumi・ローカル値を保持する)。
+        ## 由来は Bangumi 側が判定するため、日付の取得有無を first_air_date_source へ記録する。
+        enrichment_fields: dict[str, Any] = {}
+        parsed_first_air_date = (
+            cls._parseTmdbDate(details['first_air_date']) if details['first_air_date'] != '' else None
+        )
+        if parsed_first_air_date is not None:
+            enrichment_fields['first_air_date'] = parsed_first_air_date
+            enrichment_fields['first_air_date_source'] = 'Tmdb'
+        # 人気度・評価は「一度だけの保存」のため、未設定の Series だけを COALESCE で埋める。
+        ## 既存値がある Series は再取得しても上書きしない。
+        enrichment_fields['tmdb_popularity'] = Coalesce(F('tmdb_popularity'), details['popularity'])
+        enrichment_fields['tmdb_vote_average'] = Coalesce(F('tmdb_vote_average'), details['vote_average'])
         updated = await Series.filter(id=series.id, tmdb_id=tmdb_id, tmdb_media_type=media_type).update(
             tmdb_name=details['name'],
             tmdb_overview=details['overview'],
             tmdb_poster_url=details['poster_url'],
             tmdb_backdrop_url=details['backdrop_url'],
             updated_at=datetime.now(tz=JST),
+            **enrichment_fields,
         )
         if updated == 0:
             return False

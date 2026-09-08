@@ -123,6 +123,7 @@ async def SeriesSearchAPI(
     response_model = schemas.SeriesSummaryList,
 )
 async def SeriesSummaryListAPI(
+    sort: Annotated[schemas.SeriesSummarySort, Query(description='ソートキー。既定は updated_at。')] = 'updated_at',
     order: Annotated[Literal['desc', 'asc'], Query(description='ソート順序 (desc or asc) 。')] = 'desc',
     page: Annotated[int, Query(description='ページ番号。')] = 1,
     query: Annotated[str, Query(description='title または description の部分一致。')] = '',
@@ -136,7 +137,7 @@ async def SeriesSummaryListAPI(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'page must be 1 or greater',
         )
-    total, series_list = await ListSeriesSummaries(order=order, page=page, query=query)
+    total, series_list = await ListSeriesSummaries(sort=sort, order=order, page=page, query=query)
     return schemas.SeriesSummaryList(
         total=total,
         page_size=CATALOG_PAGE_SIZE,
@@ -170,6 +171,7 @@ async def SeriesOnAirAPI():
 )
 async def SeriesListPositionAPI(
     series_id: Annotated[int, Query(description='展開したいシリーズ ID。')],
+    sort: Annotated[schemas.SeriesSummarySort, Query(description='ソートキー。既定は updated_at。')] = 'updated_at',
     order: Annotated[Literal['desc', 'asc'], Query(description='ソート順序 (desc or asc) 。')] = 'desc',
     query: Annotated[str, Query(description='title または description の部分一致。')] = '',
 ):
@@ -177,7 +179,7 @@ async def SeriesListPositionAPI(
     `/series/:id` の深いリンクから、同じ検索・並びのカタログ何ページ目かを返す。
     """
 
-    page = await GetSeriesListPosition(series_id=series_id, order=order, query=query)
+    page = await GetSeriesListPosition(series_id=series_id, sort=sort, order=order, query=query)
     if page is None:
         logging.warning(
             f'[SeriesRouter][SeriesListPositionAPI] Specified series_id was not found. [series_id: {series_id}]',

@@ -16,7 +16,11 @@ from app.metadata.RecordedSeriesCandidates import (
     SeriesEPGContext,
 )
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
-from app.metadata.SeriesIndexer import GENERIC_SERIES_TITLES, NormalizeSeriesTitle
+from app.metadata.SeriesIndexer import (
+    GENERIC_SERIES_TITLES,
+    NormalizeSeriesTitle,
+    SaveTitleReading,
+)
 from app.models.Series import Series
 from app.utils.KonomiTVBS4KBangumiClient import (
     BangumiCollectionOwner,
@@ -198,6 +202,8 @@ class KonomiTVBS4KBangumiSubjectSearch:
         proposed_subject_id_text = result.choice_id.removeprefix('bangumi:')
         if proposed_subject_id_text.isdecimal() is False:
             return None
+        # 候補の採否とは独立に、AI 応答に読みが載っていれば未設定の Series へ保存する。
+        await SaveTitleReading(series.id, series.title, result.title_reading)
         return ChooseSubjectFromHints(series.title, subjects, int(proposed_subject_id_text))
 
 

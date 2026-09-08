@@ -1,5 +1,5 @@
 
-import type { VideoSeriesSortDirection, VideoSeriesSortKey } from '@/stores/SettingsStore';
+import type { SeriesHomeSortKey, VideoSeriesSortDirection, VideoSeriesSortKey } from '@/stores/SettingsStore';
 import type { KonomiTVBS4KTheme } from '@/themes';
 
 import APIClient from '@/services/APIClient';
@@ -67,6 +67,8 @@ export interface IClientSettings {
     video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment' | 'Twitter';
     video_series_sort_key: VideoSeriesSortKey;
     video_series_sort_direction: VideoSeriesSortDirection;
+    series_home_sort_key: SeriesHomeSortKey;
+    series_home_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
     // konomitv_bs4k_offline_video_streaming_quality: 同期無効
     // konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効

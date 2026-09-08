@@ -12,7 +12,7 @@ from app.models.Program import Program
 from app.models.RecordedEpisode import SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series
-from app.schemas import Genre
+from app.schemas import Genre, SeriesSummarySort
 
 
 # カタログ一覧は HonomiTV と同じ 50 件ページングにする。
@@ -142,6 +142,7 @@ def VisibleSeriesQuery(query: str = ''):
 
 async def ListSeriesSummaries(
     *,
+    sort: SeriesSummarySort,
     order: str,
     page: int,
     query: str = '',
@@ -150,7 +151,8 @@ async def ListSeriesSummaries(
     カタログカード用の Series 要約をページングして返す。
 
     Args:
-        order (str): desc なら更新が新しい順、asc なら古い順。
+        sort (SeriesSummarySort): ソートキー。
+        order (str): desc なら降順、asc なら昇順。
         page (int): 1 以上のページ番号。
         query (str): 検索キーワード。
 
@@ -158,17 +160,72 @@ async def ListSeriesSummaries(
         tuple[int, list[dict[str, object]]]: 総件数と要約辞書のリスト。
     """
 
-    series_query = VisibleSeriesQuery(query)
-    ordered_query = series_query.order_by('-updated_at' if order == 'desc' else 'updated_at')
-    total = len(await series_query.values_list('id', flat=True))
-    series_rows = await ordered_query.offset((page - 1) * CATALOG_PAGE_SIZE).limit(CATALOG_PAGE_SIZE)
-    summaries = [await BuildSeriesSummary(series) for series in series_rows]
+    # ソートは全 ID 行を Python 側で行う。NULL の扱いと id の第 2 キーを
+    ## DB の方言に寄せず同一条件で保証するため、values() の小さな行集合で完結させる。
+    rows = await VisibleSeriesQuery(query).values(
+        'id',
+        'updated_at',
+        'title_reading',
+        'first_air_date',
+        'tmdb_popularity',
+        'tmdb_vote_average',
+        'bangumi_rating',
+    )
+    ordered_rows = SortSeriesRows(rows, sort=sort, order=order)
+    total = len(ordered_rows)
+    page_ids = [row['id'] for row in ordered_rows[(page - 1) * CATALOG_PAGE_SIZE:page * CATALOG_PAGE_SIZE]]
+    # ページが空でも返却値の形状は同じでよい (total からページ数は算出できる)。
+    series_by_id = {
+        series.id: series
+        for series in await Series.filter(id__in=page_ids)
+    }
+    summaries = [
+        await BuildSeriesSummary(series_by_id[cast(int, series_id)])
+        for series_id in page_ids
+        if series_id in series_by_id
+    ]
     return total, summaries
+
+
+def SortSeriesRows(
+    rows: list[dict[str, object]],
+    *,
+    sort: SeriesSummarySort,
+    order: str,
+) -> list[dict[str, object]]:
+    """
+    ソートキー・順序に従って Series の行を並べ替える。
+
+    ソート共通仕様: 第 2 キーは常に id (昇順) でページング越しの順序を安定化し、
+    NULL は方向に関係なく常に末尾に置く。
+
+    Args:
+        rows (list[dict[str, object]]): id と各ソートカラムを含む Series の行。
+        sort (SeriesSummarySort): ソートキー。
+        order (str): desc なら降順、asc なら昇順。
+
+    Returns:
+        list[dict[str, object]]: ソート済みの行。
+    """
+
+    def _id(row: dict[str, object]) -> int:
+        return cast(int, row['id'])
+
+    null_rows = [row for row in rows if row[sort] is None]
+    non_null_rows = [row for row in rows if row[sort] is not None]
+    # 同一キーの行は常に id 昇順に固定し、安定ソートでページング越しの順序を保つ。
+    null_rows.sort(key=_id)
+    non_null_rows.sort(key=lambda row: (row[sort], row['id']))
+    if order == 'desc':
+        # reverse は primary の降順だけに使う。NULL 行は方向に関係なく末尾へ置く。
+        non_null_rows.sort(key=lambda row: (row[sort], row['id']), reverse=True)
+    return non_null_rows + null_rows
 
 
 async def GetSeriesListPosition(
     *,
     series_id: int,
+    sort: SeriesSummarySort,
     order: str,
     query: str = '',
 ) -> int | None:
@@ -177,19 +234,24 @@ async def GetSeriesListPosition(
 
     Args:
         series_id (int): 展開したい Series ID。
-        order (str): 一覧と同じソート。
+        sort (SeriesSummarySort): 一覧と同じソートキー。
+        order (str): 一覧と同じソート順序。
         query (str): 一覧と同じ検索キーワード。
 
     Returns:
         int | None: 1 以上のページ番号。一覧に無いとき None。
     """
 
-    series_ids = cast(
-        list[int],
-        await VisibleSeriesQuery(query).order_by(
-            '-updated_at' if order == 'desc' else 'updated_at',
-        ).values_list('id', flat=True),
+    rows = await VisibleSeriesQuery(query).values(
+        'id',
+        'updated_at',
+        'title_reading',
+        'first_air_date',
+        'tmdb_popularity',
+        'tmdb_vote_average',
+        'bangumi_rating',
     )
+    series_ids = [row['id'] for row in SortSeriesRows(rows, sort=sort, order=order)]
     try:
         index = series_ids.index(series_id)
     except ValueError:

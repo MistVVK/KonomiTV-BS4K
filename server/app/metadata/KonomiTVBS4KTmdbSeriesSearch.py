@@ -20,7 +20,11 @@ from app.metadata.RecordedSeriesSettings import (
     IsTmdbExternalMetadataEnabled,
     RecordedSeriesSettingsStore,
 )
-from app.metadata.SeriesIndexer import GENERIC_SERIES_TITLES, NormalizeSeriesTitle
+from app.metadata.SeriesIndexer import (
+    GENERIC_SERIES_TITLES,
+    NormalizeSeriesTitle,
+    SaveTitleReading,
+)
 from app.models.Series import Series
 from app.utils.KonomiTVBS4KTmdbClient import (
     TmdbSearchCandidate,
@@ -206,6 +210,8 @@ class KonomiTVBS4KTmdbSeriesSearch:
             )
             return None
         selected = ChooseCandidateFromHints(series.title, candidates, result.choice_id)
+        # 候補の採否とは独立に、AI 応答に読みが載っていれば未設定の Series へ保存する。
+        await SaveTitleReading(series.id, series.title, result.title_reading)
         # 作品 ID と候補数だけを残し、実行時に hints + AI 選択を経由したことを確認できるようにする。
         logging.info(
             f'[KonomiTVBS4KTmdbSeriesSearch] AI selection completed. '

@@ -552,3 +552,45 @@ def ExtractEPGSearchQueries(
         query_counts[candidate] += 1
     # 頻度順にすることで、単発の特番名より継続して現れる作品名を優先する。
     return [query for query, _count in query_counts.most_common(3)]
+
+
+def NormalizeTitleReading(value: str | None) -> str | None:
+    """AI などが返したタイトル読みを、ソート用の正規化済みひらがなへ整える。
+
+    カタカナはひらがなへ読み替え、空白は連続をまとめて除去する。かな以外の
+    文字はそのまま残す (番号やアルファベットは読みの一部として保持する)。
+
+    Args:
+        value (str | None): 正規化前の読み。
+
+    Returns:
+        str | None: 正規化済みの読み。空になった場合は None。
+    """
+
+    if value is None:
+        return None
+    normalized = NormalizeProgramText(value).replace(' ', '')
+    # カタカナ (U+30A1〜U+30F6) を対応するひらがなへ読み替える。長音記号はそのまま。
+    normalized = ''.join(
+        chr(ord(character) - 0x60) if 0x30A1 <= ord(character) <= 0x30F6 else character
+        for character in normalized
+    )
+    return normalized or None
+
+
+def DeriveTitleReadingFromTitle(title: str) -> str | None:
+    """カナのみのタイトルから、AI を使わずに読みを機械的に生成する。
+
+    Args:
+        title (str): Series 表示タイトル。
+
+    Returns:
+        str | None: かな文字だけで構成されるタイトルの読み。それ以外は None。
+    """
+
+    normalized = NormalizeProgramText(title).replace(' ', '')
+    if normalized == '' or any(
+        not (0x3041 <= ord(character) <= 0x30FF) for character in normalized
+    ):
+        return None
+    return NormalizeTitleReading(normalized)

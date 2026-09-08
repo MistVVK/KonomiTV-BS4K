@@ -866,6 +866,16 @@ class SeriesList(BaseModel):
     total: int
     series_list: list[Series]
 
+# シリーズ一覧のソートキー。既存の order=desc|asc (updated_at の方向) と組み合わせる。
+SeriesSummarySort = Literal[
+    'updated_at',
+    'title_reading',
+    'first_air_date',
+    'tmdb_popularity',
+    'tmdb_vote_average',
+    'bangumi_rating',
+]
+
 class SeriesSummary(BaseModel):
     id: Annotated[int, Field(description='シリーズ ID。')]
     title: Annotated[str, Field(description='作品名。')]

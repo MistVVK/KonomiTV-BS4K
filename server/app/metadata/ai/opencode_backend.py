@@ -67,6 +67,7 @@ from app.metadata.RecordedSeriesCandidates import (
 from app.metadata.RecordedSeriesGeneration import (
     AISeriesMetadataResult,
     BuildSeriesMetadataPrompt,
+    BuildTitleReadingsPrompt,
     SeriesMetadataClusterHint,
     SeriesMetadataClusterProgramHint,
     SeriesMetadataExistingSeriesHint,
@@ -74,6 +75,7 @@ from app.metadata.RecordedSeriesGeneration import (
     SeriesMetadataLocalParseHint,
     SeriesMetadataWikipediaHint,
     ValidateSeriesMetadataOutput,
+    ValidateTitleReadingsOutput,
 )
 
 
@@ -145,9 +147,12 @@ def _BuildCandidateSelectionPrompt(
         'You are a TV recording series classifier. Select the single best candidate.\n\n'
         'Rules:\n'
         '- Select exactly one choice_id from the candidates below.\n'
+        '- Also return title_reading: the kana reading of the Program title in hiragana '
+        '(convert katakana to hiragana, keep latin letters and digits, remove broadcast decorations), '
+        'or null when no kana reading can be derived.\n'
         '- Never invent a choice_id.\n'
         '- Do not use tools, files, terminals, or external resources.\n'
-        '- Return only one JSON object with choice_id and confidence.\n'
+        '- Return only one JSON object with choice_id, confidence, and title_reading.\n'
         '- confidence must be a number between 0.0 and 1.0.\n\n'
         f"Program:\n"
         f"Title: {program['title']}\n"
@@ -157,7 +162,7 @@ def _BuildCandidateSelectionPrompt(
         f"Broadcast Date: {program['broadcast_datetime']}\n\n"
         f'Candidates:\n{candidates_json}\n\n'
         'Output schema:\n'
-        '{"choice_id":"...","confidence":0.0}'
+        '{"choice_id":"...","confidence":0.0,"title_reading":null}'
     )
 
 
@@ -993,6 +998,7 @@ class OpenCodeBackend:
                         completion_tokens=total_completion or None,
                         http_status=200,
                         latency_ms=latency_ms,
+                        title_reading=validated.title_reading,
                     ), combined
                 except RecordedSeriesAIError as error:
                     last_error = error
@@ -1028,6 +1034,65 @@ class OpenCodeBackend:
                 minimum_confidence=minimum_confidence,
             ),
         )
+
+    async def resolveTitleReadings(
+        self,
+        titles: list[str],
+    ) -> list[tuple[str, str]]:
+        """OpenCode structured output で複数タイトルの読みを一括生成する。
+
+        Args:
+            titles (list[str]): 読みを取得する Series タイトル一覧。
+
+        Returns:
+            list[tuple[str, str]]: 読みが取れた (title, reading) の列。
+
+        Raises:
+            RecordedSeriesAIError: 検証済みの応答が最終試行までに得られなかった。
+        """
+
+        return await self._withServiceLimit(
+            lambda: self._resolveTitleReadingsUnlocked(titles),
+        )
+
+    async def _resolveTitleReadingsUnlocked(
+        self,
+        titles: list[str],
+    ) -> list[tuple[str, str]]:
+        """読み一括生成本体 (セマフォは呼び出し側)。"""
+
+        provider_lease = await self.ensureAuthInjected()
+
+        async def Run() -> tuple[list[tuple[str, str]], OpenCodeNormalizedUsage | None]:
+            prompt = BuildTitleReadingsPrompt(titles)
+            last_error: RecordedSeriesAIError | None = None
+            for attempt in range(_OPENCODE_CANDIDATE_VALIDATION_ATTEMPTS):
+                try:
+                    structured, usage, _latency_ms = await self._runStructured(
+                        prompt_text=prompt,
+                        agent=OPENCODE_AGENT_GENERATE,
+                    )
+                    try:
+                        return ValidateTitleReadingsOutput(structured), usage
+                    except ValidationError as error:
+                        last_error = RecordedSeriesAIError('InvalidOutputSchema')
+                        if attempt + 1 < _OPENCODE_CANDIDATE_VALIDATION_ATTEMPTS:
+                            continue
+                        raise last_error from error
+                except RecordedSeriesAIError as error:
+                    last_error = error
+                    if error.code in {
+                        'InvalidOutputSchema',
+                        'OpenCodeStructuredOutputMissing',
+                    } and attempt + 1 < _OPENCODE_CANDIDATE_VALIDATION_ATTEMPTS:
+                        continue
+                    raise
+            assert last_error is not None
+            raise last_error
+
+        # 同一 provider の認証主体が処理中に切り替わらないよう CLI 呼び出し全体を lease する。
+        async with provider_lease:
+            return await self._withMonthlyReservation(Run)
 
     async def _runSeriesMetadataWebSearchInvocation(
         self,

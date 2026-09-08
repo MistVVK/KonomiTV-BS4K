@@ -145,6 +145,8 @@ class ClientSettings(BaseModel):
     video_panel_active_tab: Literal['RecordedProgram', 'Series', 'Comment', 'Twitter'] = 'RecordedProgram'
     video_series_sort_key: Literal['SeasonEpisode', 'BroadcastDate', 'Title'] = 'SeasonEpisode'
     video_series_sort_direction: Literal['Asc', 'Desc'] = 'Asc'
+    series_home_sort_key: Literal['UpdatedAt', 'TitleReading', 'FirstAirDate', 'TmdbPopularity', 'TmdbVoteAverage', 'BangumiRating'] = 'UpdatedAt'
+    series_home_sort_direction: Literal['Asc', 'Desc'] = 'Desc'
     video_watched_history_max_count: PositiveInt = 50
     # konomitv_bs4k_offline_video_streaming_quality: 同期無効
     # konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効

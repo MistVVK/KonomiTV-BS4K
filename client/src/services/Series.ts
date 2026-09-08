@@ -208,6 +208,7 @@ class Series {
      * @returns 要約一覧 or 失敗時は null
      */
     static async fetchSeriesSummaries(
+        sort: 'updated_at' | 'title_reading' | 'first_air_date' | 'tmdb_popularity' | 'tmdb_vote_average' | 'bangumi_rating' = 'updated_at',
         order: 'desc' | 'asc' = 'desc',
         page: number = 1,
         query: string = '',
@@ -215,6 +216,7 @@ class Series {
 
         const response = await APIClient.get<ISeriesSummaryList>('/series/summary', {
             params: {
+                sort,
                 order,
                 page,
                 query,
@@ -252,6 +254,7 @@ class Series {
      */
     static async fetchSeriesListPosition(
         series_id: number,
+        sort: 'updated_at' | 'title_reading' | 'first_air_date' | 'tmdb_popularity' | 'tmdb_vote_average' | 'bangumi_rating' = 'updated_at',
         order: 'desc' | 'asc' = 'desc',
         query: string = '',
     ): Promise<number | null> {
@@ -259,6 +262,7 @@ class Series {
         const response = await APIClient.get<ISeriesListPosition>('/series/list-position', {
             params: {
                 series_id,
+                sort,
                 order,
                 query,
             },

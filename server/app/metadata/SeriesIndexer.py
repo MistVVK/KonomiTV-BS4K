@@ -8,6 +8,7 @@ from datetime import datetime
 
 from tortoise import connections, transactions
 from tortoise.backends.base.client import BaseDBAsyncClient
+from tortoise.expressions import Q
 
 from app import logging
 from app.constants import JST
@@ -16,7 +17,11 @@ from app.metadata.RecordedEpisodeResolver import (
     ParseSinglePositiveIntegerEpisode,
 )
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
-from app.metadata.SeriesTitleParser import ExtractMovieWorkTitle
+from app.metadata.SeriesTitleParser import (
+    DeriveTitleReadingFromTitle,
+    ExtractMovieWorkTitle,
+    NormalizeTitleReading,
+)
 from app.models.RecordedEpisode import RecordedEpisodeResolution
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedSeries import RecordedSeriesResolution
@@ -228,6 +233,31 @@ def AreAIFallbackSeriesTitlesClose(left: str, right: str) -> bool:
         return True
     shorter, longer = sorted((left, right), key=len)
     return len(shorter) >= 4 and longer.startswith(shorter)
+
+
+async def SaveTitleReading(series_id: int, series_title: str, title_reading: str | None) -> None:
+    """AI 応答などの読みを、未設定の Series へだけ保存する。
+
+    既存値の上書きはしない (AI 読みの誤りを許容する仕様)。読みが得られない
+    場合でも、カナのみのタイトルなら AI なしの読みを生成して保存する。
+
+    Args:
+        series_id (int): 保存先の Series ID。
+        series_title (str): 保存先 Series の表示タイトル (カナのみ読みの生成元)。
+        title_reading (str | None): AI 応答から取得した読み。無ければ None。
+    """
+
+    normalized_reading = NormalizeTitleReading(title_reading)
+    if normalized_reading is None:
+        # カナのみのタイトルは AI なしで読みを作れる。
+        normalized_reading = DeriveTitleReadingFromTitle(series_title)
+    if normalized_reading is None:
+        return
+    # 未設定の行だけを原子的に更新する。同時実行の AI 結果で上書き競合しない。
+    await Series.filter(id=series_id, title_reading__isnull=True).update(
+        title_reading=normalized_reading,
+        updated_at=datetime.now(tz=JST),
+    )
 
 
 def BuildSeriesAIFallbackGroupingKey(title: str) -> str:
@@ -707,6 +737,8 @@ class SeriesIndexer:
                     normalized_title = identity_title,
                     defaults = {
                         'title': parsed_title.display_title,
+                        # カナのみのタイトルは作成時に AI なしで読みを作る。
+                        'title_reading': DeriveTitleReadingFromTitle(parsed_title.display_title),
                         'description': '',
                         'genres': recorded_program.genres,
                         'canonical_key': canonical_key,
@@ -746,6 +778,22 @@ class SeriesIndexer:
             if update_fields:
                 await series_broadcast_period.save(update_fields=update_fields)
             is_period_changed = is_period_created or len(update_fields) > 0
+
+            # 初放送日は TMDb → Bangumi → ローカル放送開始日の優先順。
+            ## first_air_date_source へ記録した実際の由来で判定し、ローカル由来 (または未確定) の
+            ## 日付は放送期間の追加・拡大に合わせて Series 全体の最古開始日へ更新する。
+            ## 外部由来 ('Tmdb' / 'Bangumi') の日付は維持する。
+            if series.first_air_date_source in (None, 'Local'):
+                earliest_period = await SeriesBroadcastPeriod.filter(series_id=series.id).order_by('start_date').first()
+                if earliest_period is not None and earliest_period.start_date != series.first_air_date:
+                    # 保存条件も由来で絞り、待機中に enrich 等へ上書きされた外部由来の日付を壊さない。
+                    await Series.filter(
+                        Q(first_air_date_source__isnull=True) | Q(first_air_date_source='Local'),
+                    ).filter(id=series.id).update(
+                        first_air_date=earliest_period.start_date,
+                        first_air_date_source='Local',
+                        updated_at=datetime.now(tz=JST),
+                    )
 
         # Program の identity と Resolution は片方だけを公開できないため、同じ transaction で更新する。
         resolution_invalidated = False

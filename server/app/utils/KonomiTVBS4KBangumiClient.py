@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date, datetime
 from difflib import SequenceMatcher
 from typing import Any, Protocol, cast
 
 import httpx
 from tortoise.exceptions import IntegrityError
+from tortoise.expressions import Q
 
 from app import logging, schemas
-from app.constants import BANGUMI_REQUEST_HEADERS, HTTPX_CLIENT
+from app.constants import BANGUMI_REQUEST_HEADERS, HTTPX_CLIENT, JST
 from app.metadata.RecordedEpisodeResolver import ParseSinglePositiveIntegerEpisode
 from app.metadata.RecordedSeriesCandidates import (
     BuildSeriesEPGContext,
@@ -192,6 +194,145 @@ class KonomiTVBS4KBangumiClient:
         return candidates[0][1]
 
 
+    @staticmethod
+    def _extractSubjectRating(subject: dict[str, Any] | None) -> float | None:
+        """条目ペイロードからレーティング (rating.score) を取り出す。
+
+        Args:
+            subject (dict[str, Any] | None): Bangumi 条目のペイロード。
+
+        Returns:
+            float | None: rating.score の数値。無い・不明なときは None。
+        """
+
+        rating = subject.get('rating') if isinstance(subject, dict) else None
+        if isinstance(rating, dict) is False:
+            return None
+        score = cast(dict[str, Any], rating).get('score')
+        # bool は int の派生型のため、レーティングの数値からは除外する。
+        if isinstance(score, bool) or isinstance(score, (int, float)) is False:
+            return None
+        return float(cast(int | float, score))
+
+
+    @staticmethod
+    def _parseSubjectDate(value: str) -> date | None:
+        """条目の放送開始日文字列 (YYYY-MM-DD) を date へ変換する。
+
+        Args:
+            value (str): 変換する日付文字列。
+
+        Returns:
+            date | None: 解析できない日付は無効値として None を返す。
+        """
+
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            # 外部 API の日付表記の揺れは、保存の妨げにならないよう破棄する。
+            return None
+
+
+    @classmethod
+    async def _getSubjectDetail(
+        cls,
+        subject_id: int,
+        access_token: str,
+        subject_details_by_id: dict[int, dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """条目詳細 (rating など) を取得し、同一実行内でキャッシュする。
+
+        Args:
+            subject_id (int): Bangumi 条目 ID。
+            access_token (str): Bangumi 個人アクセストークン。
+            subject_details_by_id (dict[int, dict[str, Any]]): 条目詳細のキャッシュ。
+
+        Returns:
+            dict[str, Any] | None: 条目詳細。取得失敗時は None (失敗もキャッシュする)。
+        """
+
+        if subject_id in subject_details_by_id:
+            return subject_details_by_id[subject_id]
+        try:
+            async with HTTPX_CLIENT() as httpx_client:
+                response = await httpx_client.get(
+                    url=f'{cls.API_BASE_URL}/subjects/{subject_id}',
+                    headers={**BANGUMI_REQUEST_HEADERS, 'Authorization': f'Bearer {access_token}'},
+                )
+                response.raise_for_status()
+                payload = cast(dict[str, Any], response.json())
+        except httpx.HTTPError as ex:
+            logging.error(
+                '[KonomiTVBS4KBangumiClient] Failed to fetch Bangumi subject detail.',
+                exc_info = ex,
+            )
+            payload = cast(dict[str, Any], {})
+        subject_details_by_id[subject_id] = payload
+        return payload if len(payload) > 0 else None
+
+
+    @classmethod
+    async def _fillSubjectSortMetadata(
+        cls,
+        series: Series,
+        subject: dict[str, Any],
+        subject_id: int,
+        access_token: str,
+        subject_details_by_id: dict[int, dict[str, Any]],
+    ) -> None:
+        """既存 binding の Series へ、未設定の初放送日・評価を一度だけ補完する。
+
+        Args:
+            series (Series): すでに条目が確定している Series。
+            subject (dict[str, Any]): 收藏一覧の条目概要。
+            subject_id (int): Bangumi 条目 ID。
+            access_token (str): Bangumi 個人アクセストークン。
+            subject_details_by_id (dict[int, dict[str, Any]]): 条目詳細のキャッシュ。
+
+        Returns:
+            None
+        """
+
+        # 初放送日は TMDb → Bangumi → ローカルの優先順。binding の有無ではなく
+        ## first_air_date_source へ記録した実際の由来で判定する。TMDb 由来は維持し、
+        ## Bangumi・ローカル・未確定 (NULL) の日は Bangumi で上書きする。
+        ## 初放送日も評価も確定済みなら再補完は不要。
+        if series.first_air_date_source == 'Tmdb' and series.bangumi_rating is not None:
+            return
+        # 收藏一覧の概要に無い情報 (rating・date) は条目詳細で補う。
+        ## 保存済み評価を持つ Series は、評価のためだけに詳細を再取得しない。
+        subject_rating = cls._extractSubjectRating(subject)
+        subject_date_text = str(subject.get('date') or '')
+        needs_rating_detail = series.bangumi_rating is None and subject_rating is None
+        if needs_rating_detail or subject_date_text == '':
+            subject_detail = await cls._getSubjectDetail(subject_id, access_token, subject_details_by_id)
+            if subject_detail is not None:
+                if needs_rating_detail:
+                    subject_rating = cls._extractSubjectRating(subject_detail)
+                if subject_date_text == '':
+                    subject_date_text = str(subject_detail.get('date') or '')
+        if subject_date_text != '' and series.first_air_date_source != 'Tmdb':
+            first_air_date = cls._parseSubjectDate(subject_date_text)
+            if first_air_date is not None and (
+                first_air_date != series.first_air_date
+                or series.first_air_date_source != 'Bangumi'
+            ):
+                # TMDb 日付の無い Series は、ローカル backfill 値を含めて条項 date で更新する。
+                ## 条目詳細の待機中に enrich が 'Tmdb' 由来を保存する競合があるため、
+                ## 最新の由来が TMDb 以外 (NULL・Bangumi・Local) であることを UPDATE 条件で確認する。
+                await Series.filter(
+                    Q(first_air_date_source__isnull=True) | Q(first_air_date_source__not='Tmdb'),
+                ).filter(id=series.id).update(
+                    first_air_date=first_air_date,
+                    first_air_date_source='Bangumi',
+                    updated_at=datetime.now(tz=JST),
+                )
+        if series.bangumi_rating is None and subject_rating is not None:
+            await Series.filter(id=series.id, bangumi_rating__isnull=True).update(
+                bangumi_rating=subject_rating, updated_at=datetime.now(tz=JST),
+            )
+
+
     @classmethod
     async def _getCollectionSubjects(cls, user: BangumiCollectionOwner) -> list[dict[str, Any]]:
         """
@@ -320,6 +461,8 @@ class KonomiTVBS4KBangumiClient:
         access_token = user.decryptBangumiAccessToken()
         episodes_by_subject_id: dict[int, list[dict[str, Any]]] = {}
         matched_series_ids: set[int] = set()
+        # 条目詳細 (rating など) の同一実行内キャッシュ。
+        subject_details_by_id: dict[int, dict[str, Any]] = {}
 
         for loaded_series in anime_series:
             if IsBangumiExternalMetadataEnabled() is False:
@@ -347,7 +490,23 @@ class KonomiTVBS4KBangumiClient:
                             access_token = access_token,
                             episodes_by_subject_id = episodes_by_subject_id,
                         )
+                        # 收藏一覧に無い既存 binding も、初放送日・評価は条目詳細から補完する。
+                        await cls._fillSubjectSortMetadata(
+                            series,
+                            {},
+                            subject_id,
+                            access_token,
+                            subject_details_by_id,
+                        )
                         continue
+                    # 既存 binding の初放送日・評価は、未設定の行にだけ一度だけ補完する (定期再取得はしない)。
+                    await cls._fillSubjectSortMetadata(
+                        series,
+                        subject,
+                        subject_id,
+                        access_token,
+                        subject_details_by_id,
+                    )
                 else:
                     # 収藏照合の前に所属録画の EPG 証拠を組み立てる。番組名は採点と
                     ## 検索の補助タイトル、放送日・概要・チャンネルは検索 AI の入力に使う。
@@ -385,6 +544,14 @@ class KonomiTVBS4KBangumiClient:
                 ## ロック中に外部 API は呼ばず、異なるユーザーの定期同期が重なっても subject ごとに直列化する。
                 images = subject.get('images')
                 image_url = str(images.get('large') or images.get('common') or '') if isinstance(images, dict) else ''
+                # 初放送日・レーティングはソート用の補完メタデータ。保存済み評価を持つ Series は、
+                ## 評価のためだけに詳細を再取得せず、merge へも新しい評価を渡さない。
+                subject_rating = cls._extractSubjectRating(subject)
+                if subject_rating is None and series.bangumi_rating is None:
+                    subject_detail = await cls._getSubjectDetail(subject_id, access_token, subject_details_by_id)
+                    subject_rating = cls._extractSubjectRating(subject_detail) if subject_detail is not None else None
+                if series.bangumi_rating is not None:
+                    subject_rating = None
                 subject_merge_lock = cls._subject_merge_locks.setdefault(subject_id, asyncio.Lock())
                 async with subject_merge_lock:
                     try:
@@ -395,6 +562,8 @@ class KonomiTVBS4KBangumiClient:
                             subject_name_cn = str(subject.get('name_cn', '')) or None,
                             subject_summary = str(subject.get('short_summary', '')) or None,
                             subject_image_url = image_url or None,
+                            subject_date = cls._parseSubjectDate(str(subject.get('date') or '')),
+                            subject_rating = subject_rating,
                         )
                     except (IntegrityError, ValueError):
                         # 別プロセスが同じ subject を先に統合した場合は、一意索引の衝突または削除済み ID として観測される。

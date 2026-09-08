@@ -14,9 +14,9 @@
                     ]" />
                     <div class="series-home__toolbar">
                         <h1 class="series-home__title">シリーズ</h1>
-                        <v-select v-model="sortOrder" class="series-home__sort" :items="sortItems"
+                        <v-select :model-value="selectedSortValue" class="series-home__sort" :items="sortItems"
                             item-title="title" item-value="value" density="compact" variant="outlined" hide-details
-                            @update:modelValue="reloadFromFirstPage" />
+                            @update:modelValue="changeSort" />
                     </div>
                     <div v-if="isLoading" class="series-home__state">
                         <v-progress-circular color="primary" indeterminate size="30" width="3" />
@@ -66,6 +66,8 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
+import type { SeriesHomeSortKey, VideoSeriesSortDirection } from '@/stores/SettingsStore';
+
 import Breadcrumbs from '@/components/Breadcrumbs.vue';
 import HeaderBar from '@/components/HeaderBar.vue';
 import KonomiTVBS4KVideoSectionTabs from '@/components/KonomiTVBS4KVideoSectionTabs.vue';
@@ -74,21 +76,51 @@ import SeriesEpisodeList from '@/components/Series/SeriesEpisodeList.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
 import { PRESERVE_SCROLL_POSITION_STATE_KEY } from '@/router';
 import Series, { type ISeriesSummary } from '@/services/Series';
+import useSettingsStore from '@/stores/SettingsStore';
 import Utils from '@/utils';
+
+const settingsStore = useSettingsStore();
+
+// SettingsStore のソートキーと API の sort パラメータ (snake_case) の対応。
+const SERIES_HOME_SORT_API_VALUES = {
+    UpdatedAt: 'updated_at',
+    TitleReading: 'title_reading',
+    FirstAirDate: 'first_air_date',
+    TmdbPopularity: 'tmdb_popularity',
+    TmdbVoteAverage: 'tmdb_vote_average',
+    BangumiRating: 'bangumi_rating',
+} as const;
+const SERIES_HOME_SORT_KEYS_BY_API_VALUE = Object.fromEntries(
+    Object.entries(SERIES_HOME_SORT_API_VALUES).map(([key, api_value]) => [api_value, key]),
+) as Record<string, SeriesHomeSortKey>;
+const isSeriesHomeSortKey = (value: string): value is SeriesHomeSortKey => {
+    return value in SERIES_HOME_SORT_API_VALUES;
+};
 
 const route = useRoute();
 const router = useRouter();
 
+// ソート選択の値は "設定キー:順序" の組合せ。表示順は既定の更新日時を先頭にする。
 const sortItems = [
-    {title: '更新が新しい順', value: 'desc'},
-    {title: '更新が古い順', value: 'asc'},
+    {title: '更新が新しい順', value: 'UpdatedAt:Desc'},
+    {title: '更新が古い順', value: 'UpdatedAt:Asc'},
+    {title: 'タイトル (あ→ん)', value: 'TitleReading:Asc'},
+    {title: 'タイトル (ん→あ)', value: 'TitleReading:Desc'},
+    {title: '初放送日が新しい順', value: 'FirstAirDate:Desc'},
+    {title: '初放送日が古い順', value: 'FirstAirDate:Asc'},
+    {title: 'TMDb 人気度が高い順', value: 'TmdbPopularity:Desc'},
+    {title: 'TMDb 評価が高い順', value: 'TmdbVoteAverage:Desc'},
+    {title: 'Bangumi レーティングが高い順', value: 'BangumiRating:Desc'},
 ];
 
 const seriesList = ref<ISeriesSummary[]>([]);
 const total = ref(0);
 const pageSize = ref(50);
 const currentPage = ref(1);
-const sortOrder = ref<'desc' | 'asc'>('desc');
+// ソートは URL query が正本。query に無いときは SettingsStore の前回選択を使う。
+const sortKey = ref<SeriesHomeSortKey>(settingsStore.settings.series_home_sort_key);
+const sortOrder = ref<VideoSeriesSortDirection>(settingsStore.settings.series_home_sort_direction);
+const selectedSortValue = computed(() => `${sortKey.value}:${sortOrder.value}`);
 const searchQuery = ref('');
 const isLoading = ref(true);
 const expandedId = ref<number | null>(null);
@@ -133,25 +165,26 @@ const cardGridRow = (index: number): number => {
     return expandedRow.value !== null && row > expandedRow.value ? row + 1 : row;
 };
 
-const buildListStateKey = (query: string, order: 'desc' | 'asc', page: number): string => {
-    return `${query}\0${order}\0${page}`;
+const buildListStateKey = (query: string, sort: SeriesHomeSortKey, order: 'desc' | 'asc', page: number): string => {
+    return `${query}\0${sort}\0${order}\0${page}`;
 };
 
 const fetchPage = async (
     generation: number,
     query: string,
+    sort: SeriesHomeSortKey,
     order: 'desc' | 'asc',
     page: number,
 ): Promise<boolean> => {
     if (generation !== routeSyncGeneration) return false;
     isLoading.value = true;
-    const result = await Series.fetchSeriesSummaries(order, page, query);
+    const result = await Series.fetchSeriesSummaries(SERIES_HOME_SORT_API_VALUES[sort], order, page, query);
     if (generation !== routeSyncGeneration) return false;
     if (result !== null) {
         seriesList.value = result.series_list;
         total.value = result.total;
         pageSize.value = result.page_size;
-        loadedListStateKey = buildListStateKey(query, order, page);
+        loadedListStateKey = buildListStateKey(query, sort, order, page);
     } else {
         seriesList.value = [];
         total.value = 0;
@@ -179,11 +212,24 @@ const applySearch = async (query: string) => {
         path: '/series/',
         query: {
             ...(query !== '' ? {query} : {}),
-            order: sortOrder.value,
+            sort: SERIES_HOME_SORT_API_VALUES[sortKey.value],
+            order: sortOrder.value.toLowerCase(),
             page: '1',
         },
     });
     if (route.fullPath === previousFullPath) await syncRouteState();
+};
+
+const changeSort = async (value: unknown) => {
+    // 選択値は "設定キー:順序" の組合せ。両方を URL query と SettingsStore へ永続化する。
+    const [key_text, direction_text] = String(value).split(':');
+    if (isSeriesHomeSortKey(key_text) === false) return;
+    if (direction_text !== 'Asc' && direction_text !== 'Desc') return;
+    settingsStore.settings.series_home_sort_key = key_text;
+    settingsStore.settings.series_home_sort_direction = direction_text;
+    sortKey.value = key_text;
+    sortOrder.value = direction_text;
+    await reloadFromFirstPage();
 };
 
 const reloadFromFirstPage = async () => {
@@ -195,7 +241,8 @@ const reloadFromFirstPage = async () => {
         path: '/series/',
         query: {
             ...(searchQuery.value !== '' ? {query: searchQuery.value} : {}),
-            order: sortOrder.value,
+            sort: SERIES_HOME_SORT_API_VALUES[sortKey.value],
+            order: sortOrder.value.toLowerCase(),
             page: '1',
         },
     });
@@ -211,7 +258,8 @@ const changePage = async (page: number) => {
         path: '/series/',
         query: {
             ...(searchQuery.value !== '' ? {query: searchQuery.value} : {}),
-            order: sortOrder.value,
+            sort: SERIES_HOME_SORT_API_VALUES[sortKey.value],
+            order: sortOrder.value.toLowerCase(),
             page: String(page),
         },
     });
@@ -227,7 +275,8 @@ const toggleExpand = async (seriesId: number) => {
         path: nextId === null ? '/series/' : `/series/${nextId}`,
         query: {
             ...(searchQuery.value !== '' ? {query: searchQuery.value} : {}),
-            order: sortOrder.value,
+            sort: SERIES_HOME_SORT_API_VALUES[sortKey.value],
+            order: sortOrder.value.toLowerCase(),
             page: String(currentPage.value),
         },
         state: {[PRESERVE_SCROLL_POSITION_STATE_KEY]: true},
@@ -239,14 +288,27 @@ const syncRouteState = async () => {
     const generation = ++routeSyncGeneration;
     const seriesIdText = typeof route.params.id === 'string' ? route.params.id : '';
     const query = typeof route.query.query === 'string' ? route.query.query : '';
-    const order = route.query.order === 'asc' ? 'asc' : 'desc';
+    // URL query の order が有効なときだけ正本。無い・不正なときは SettingsStore の保存方向へ寄せる。
+    const queryOrderText = typeof route.query.order === 'string' ? route.query.order : '';
+    const settingsOrder: 'desc' | 'asc' =
+        settingsStore.settings.series_home_sort_direction === 'Asc' ? 'asc' : 'desc';
+    const order: 'desc' | 'asc' = queryOrderText === 'asc' || queryOrderText === 'desc'
+        ? queryOrderText
+        : settingsOrder;
     const pageText = typeof route.query.page === 'string' ? Number(route.query.page) : 1;
     const routePage = Number.isInteger(pageText) && pageText >= 1 ? pageText : 1;
-    const routeStateKey = buildListStateKey(query, order, routePage);
+    // URL query の sort が正本。無い・不正なときは SettingsStore の前回選択へ寄せる。
+    const querySortText = typeof route.query.sort === 'string' ? route.query.sort : '';
+    const querySortKey = querySortText !== '' ? SERIES_HOME_SORT_KEYS_BY_API_VALUE[querySortText] : undefined;
+    const routeSortKey = querySortKey !== undefined && isSeriesHomeSortKey(querySortKey)
+        ? querySortKey
+        : settingsStore.settings.series_home_sort_key;
+    const routeStateKey = buildListStateKey(query, routeSortKey, order, routePage);
 
     // URL を唯一の正本として、最新世代の同期だけが画面状態を更新する。
     searchQuery.value = query;
-    sortOrder.value = order;
+    sortKey.value = routeSortKey;
+    sortOrder.value = order === 'asc' ? 'Asc' : 'Desc';
     const seriesId = Number(seriesIdText);
     if (seriesIdText !== '' && Number.isInteger(seriesId) && seriesId >= 1) {
         // 現在の一覧にあるカードの開閉では、list-position と一覧を再取得しない。
@@ -257,13 +319,13 @@ const syncRouteState = async () => {
             return;
         }
 
-        const page = await Series.fetchSeriesListPosition(seriesId, order, query);
+        const page = await Series.fetchSeriesListPosition(seriesId, SERIES_HOME_SORT_API_VALUES[routeSortKey], order, query);
         if (generation !== routeSyncGeneration) return;
         if (page !== null) {
             currentPage.value = page;
-            const targetStateKey = buildListStateKey(query, order, page);
+            const targetStateKey = buildListStateKey(query, routeSortKey, order, page);
             if (loadedListStateKey !== targetStateKey) {
-                const loaded = await fetchPage(generation, query, order, page);
+                const loaded = await fetchPage(generation, query, routeSortKey, order, page);
                 if (loaded === false) return;
             } else {
                 isLoading.value = false;
@@ -280,7 +342,7 @@ const syncRouteState = async () => {
     currentPage.value = routePage;
     expandedId.value = null;
     if (loadedListStateKey !== routeStateKey) {
-        const loaded = await fetchPage(generation, query, order, routePage);
+        const loaded = await fetchPage(generation, query, routeSortKey, order, routePage);
         if (loaded === false) return;
     } else {
         isLoading.value = false;
@@ -291,6 +353,7 @@ const syncRouteState = async () => {
             path: '/series/',
             query: {
                 ...(query !== '' ? {query} : {}),
+                sort: SERIES_HOME_SORT_API_VALUES[routeSortKey],
                 order,
                 page: String(routePage),
             },

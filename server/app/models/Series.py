@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from typing import TYPE_CHECKING, Literal, cast
 
 from tortoise import fields
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
 
 # TMDb の作品種別。TV と映画で ID の採番空間が分かれているため、tmdb_id と対で保持する。
 TmdbMediaType = Literal['tv', 'movie']
+# 初放送日 (first_air_date) の由来。TMDb → Bangumi → ローカル放送開始日の優先順を判定するために使う。
+FirstAirDateSource = Literal['Tmdb', 'Bangumi', 'Local']
 
 
 class Series(TortoiseModel):
@@ -40,6 +43,8 @@ class Series(TortoiseModel):
     bangumi_subject_name_cn = cast(TortoiseField[str | None], fields.TextField(null=True))
     bangumi_subject_summary = cast(TortoiseField[str | None], fields.TextField(null=True))
     bangumi_subject_image_url = cast(TortoiseField[str | None], fields.TextField(null=True))
+    # Bangumi 条目のレーティング (rating.score)。照合確定時に一度だけ保存する。
+    bangumi_rating = cast(TortoiseField[float | None], fields.FloatField(null=True))
     # TMDb 由来の補完メタデータ。description / genres は Wikipedia AI 生成が正本のため、
     # TMDb の値は必ず tmdb_ 接頭辞の専用カラムへだけ保存する。
     tmdb_id = cast(TortoiseField[int | None], fields.IntField(null=True))
@@ -48,6 +53,15 @@ class Series(TortoiseModel):
     tmdb_overview = cast(TortoiseField[str | None], fields.TextField(null=True))
     tmdb_poster_url = cast(TortoiseField[str | None], fields.TextField(null=True))
     tmdb_backdrop_url = cast(TortoiseField[str | None], fields.TextField(null=True))
+    # TMDb の人気度と評価。enrich 時に一度だけ保存し、定期再取得はしない。
+    tmdb_popularity = cast(TortoiseField[float | None], fields.FloatField(null=True))
+    tmdb_vote_average = cast(TortoiseField[float | None], fields.FloatField(null=True))
+    # 初放送日 (日付のみ)。TMDb → Bangumi → ローカル最古放送日の優先順で保存する。
+    first_air_date = cast(TortoiseField[date | None], fields.DateField(null=True))
+    # 初放送日の由来。binding や非 NULL の推測ではなく実際の書き込み元を記録する (NULL は未確定)。
+    first_air_date_source = cast(TortoiseField[FirstAirDateSource | None], fields.CharField(8, null=True))
+    # タイトルのかな読み (ソートキー)。AI 生成をひらがなへ正規化して保存し、既存値は上書きしない。
+    title_reading = cast(TortoiseField[str | None], fields.TextField(null=True))
     title = fields.TextField()
     description = fields.TextField()
     genres = cast(TortoiseField[list[Genre]], fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore

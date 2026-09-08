@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from tortoise import transactions
 from tortoise.backends.base.client import BaseDBAsyncClient
@@ -21,6 +21,8 @@ class SeriesMerger:
         subject_name_cn: str | None,
         subject_summary: str | None,
         subject_image_url: str | None,
+        subject_date: date | None,
+        subject_rating: float | None,
     ) -> Series:
         """
         指定した Series を同じ Bangumi 条目に紐付く最古の Series へ原子的に統合する。
@@ -32,6 +34,8 @@ class SeriesMerger:
             subject_name_cn (str | None): Bangumi 条目の中文題。
             subject_summary (str | None): Bangumi 条目の概要。
             subject_image_url (str | None): Bangumi 条目の画像 URL。
+            subject_date (date | None): 条目の放送開始日。
+            subject_rating (float | None): 条目のレーティング (rating.score)。
 
         Returns:
             Series: 統合後に残った最も ID が小さい Series。
@@ -177,10 +181,16 @@ class SeriesMerger:
 
             # 重複行を削除した後にだけ一意制約対象の subject ID を更新する。
             ## この順番により、同期中も同じ subject ID を持つ Series は常に 1 件に保たれる。
+            ## 初放送日は TMDb → Bangumi → ローカルの優先順。条目 date が不明なときは
+            ## 既存値を書き換えず、first_air_date_source が TMDb 由来でない行だけを更新する。
+            ## レーティングは未設定の行だけ COALESCE で埋める (保存済み評価の再取得・上書きはしない)。
             await connection.execute_query(
                 'UPDATE series SET '
                 'bangumi_subject_id = ?, bangumi_subject_name = ?, bangumi_subject_name_cn = ?, '
-                'bangumi_subject_summary = ?, bangumi_subject_image_url = ?, updated_at = ? '
+                'bangumi_subject_summary = ?, bangumi_subject_image_url = ?, '
+                'first_air_date = CASE WHEN (? IS NOT NULL AND (first_air_date_source IS NULL OR first_air_date_source != ?)) THEN ? ELSE first_air_date END, '
+                "first_air_date_source = CASE WHEN (? IS NOT NULL AND (first_air_date_source IS NULL OR first_air_date_source != ?)) THEN 'Bangumi' ELSE first_air_date_source END, "
+                'bangumi_rating = COALESCE(bangumi_rating, ?), updated_at = ? '
                 'WHERE id = ? AND (bangumi_subject_id IS NULL OR bangumi_subject_id = ?)',
                 [
                     subject_id,
@@ -188,6 +198,12 @@ class SeriesMerger:
                     subject_name_cn,
                     subject_summary,
                     subject_image_url,
+                    subject_date,
+                    'Tmdb',
+                    subject_date,
+                    subject_date,
+                    'Tmdb',
+                    subject_rating,
                     datetime.now(tz=JST),
                     canonical_series_id,
                     subject_id,

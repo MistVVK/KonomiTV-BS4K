@@ -101,6 +101,20 @@ class RecordedSeriesAIBackend(Protocol):
         """候補選択を実行する。"""
         ...
 
+    async def resolveTitleReadings(
+        self,
+        titles: list[str],
+    ) -> list[tuple[str, str]]:
+        """複数タイトルのかな読みを一括生成する。
+
+        Args:
+            titles: 読みを取得する Series タイトル一覧。
+
+        Returns:
+            読みが取れた (title, reading) の列。
+        """
+        ...
+
     async def resolveSeriesMetadata(
         self,
         program: RecordedSeriesProgramPrompt,

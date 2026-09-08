@@ -5,10 +5,11 @@ from datetime import date, datetime
 from typing import Annotated, Any, Literal, cast
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing_extensions import TypedDict
 
 from app.constants import API_REQUEST_HEADERS
+from app.metadata.SeriesTitleParser import NormalizeTitleReading
 
 
 MEDIAWIKI_API_URL = 'https://ja.wikipedia.org/w/api.php'
@@ -58,6 +59,15 @@ class AIChoiceOutput(BaseModel):
 
     choice_id: Annotated[str, Field(min_length=1, max_length=96)]
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
+    # 候補選択と同時に取得するシリーズタイトルの読み。旧応答の互換のため省略可。
+    title_reading: Annotated[str | None, Field(max_length=255)] = None
+
+    @field_validator('title_reading')
+    @classmethod
+    def validateTitleReading(cls, value: str | None) -> str | None:
+        """読みはソート用の正規化済みひらがなへ整え、空は null と同じにする。"""
+
+        return NormalizeTitleReading(value)
 
 
 # 旧 private 名の互換 alias（OpenCode / ACP 実装が参照）。
@@ -75,6 +85,8 @@ class AIChoiceResult:
     completion_tokens: int | None
     http_status: int
     latency_ms: int
+    # 候補選択の返答と同時に取得したシリーズタイトルの読み。旧応答では None。
+    title_reading: str | None = None
 
 
 class RecordedSeriesAIError(Exception):

@@ -832,7 +832,7 @@ class _AcpAdapter:
 
     def _operation_args(
         self,
-        operation: Literal['CandidateSelection', 'SeriesMetadata', 'EpisodeLookup'],
+        operation: Literal['CandidateSelection', 'SeriesMetadata', 'EpisodeLookup', 'TitleReadings'],
     ) -> list[str]:
         """共通 output schema を provider 固有 CLI の薄い受け口へ写像する。"""
 
@@ -904,7 +904,34 @@ class _AcpAdapter:
             completion_tokens=result.completion_tokens,
             http_status=result.http_status,
             latency_ms=result.latency_ms,
+            title_reading=result.title_reading,
         )
+
+    async def resolveTitleReadings(
+        self,
+        titles: list[str],
+    ) -> list[tuple[str, str]]:
+        """ACP v1 agent で複数タイトルの読みを一括生成する。"""
+
+        from app.metadata.ai.acp_client import run_acp_title_readings
+        result = await run_acp_title_readings(
+            command=self._command,
+            args=self._operation_args('TitleReadings'),
+            env=self._env,
+            titles=titles,
+            model=self._model,
+            reasoning_effort=(
+                self._reasoning_effort
+                if self._backend_kind == 'AcpCodex'
+                else None
+            ),
+            timeout_sec=self._timeout_sec,
+            cwd=self._cwd or self._env.get('HOME'),
+            profile_dir=self._profile_dir,
+            readable_files=self._readable_files,
+            backend_kind=self._backend_kind,
+        )
+        return result
 
     async def resolveSeriesMetadata(
         self,
@@ -1249,6 +1276,48 @@ async def select_candidate(
             _GetACPCredentialProvider(settings.ai_backend),
         )
     return result
+
+
+async def resolve_title_readings(
+    titles: list[str],
+    *,
+    settings: RecordedSeriesSettings | None = None,
+    api_key: str | None = None,
+) -> list[tuple[str, str]]:
+    """バックエンド非依存で複数タイトルのかな読みを一括生成する。
+
+    候補選択と同じバックエンド選択・snapshot 固定・ACP 直列 lock を共有する
+    軽量パス。Web 検索は行わない。
+
+    Args:
+        titles: 読みを取得する Series タイトル一覧。空でないこと。
+        settings: 判定開始時の設定 snapshot。未指定時はここで取得する。
+        api_key: 同じ時点の API キー snapshot。settings 指定時に併用する。
+
+    Returns:
+        読みが取れた (title, reading) の列。
+
+    Raises:
+        RecordedSeriesAIError: AI 呼び出しの失敗。
+    """
+
+    if len(titles) == 0:
+        raise RecordedSeriesAIError('EmptyTitleSet')
+    # 判定1回分の settings/key を固定し、backend 内で再取得して世代がずれないようにする。
+    if settings is None:
+        settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+
+    async def RunResolutions() -> list[tuple[str, str]]:
+        backend = _create_backend(settings, api_key=api_key)
+        return await backend.resolveTitleReadings(titles)
+
+    if settings.ai_backend in {'OpenCode', 'OpenAICompatible', 'OpenAICompatible2'}:
+        # HTTP backend は ACP process の直列 lock を使わず直接実行する。
+        return await RunResolutions()
+    return await _RunACPOperationWithDeadline(
+        RunResolutions,
+        _GetACPCredentialProvider(settings.ai_backend),
+    )
 
 
 async def _RunBackendOperation[AcpOperationResult](

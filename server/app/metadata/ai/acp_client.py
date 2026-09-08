@@ -56,7 +56,9 @@ from app.metadata.RecordedSeriesCandidates import (
 from app.metadata.RecordedSeriesGeneration import (
     AISeriesMetadataOutput,
     AISeriesMetadataResult,
+    AITitleReadingsOutput,
     BuildSeriesMetadataPrompt,
+    BuildTitleReadingsPrompt,
     ParseStrictSeriesMetadataJSONObject,
     SeriesMetadataClusterHint,
     SeriesMetadataClusterProgramHint,
@@ -65,6 +67,7 @@ from app.metadata.RecordedSeriesGeneration import (
     SeriesMetadataLocalParseHint,
     SeriesMetadataWikipediaHint,
     ValidateSeriesMetadataOutput,
+    ValidateTitleReadingsOutput,
 )
 
 
@@ -177,7 +180,7 @@ _UNSAFE_TOOL_PAYLOAD_KEYS = frozenset({
 })
 _WEB_TOOL_KINDS = frozenset({'search', 'fetch'})
 
-AcpOperation = Literal['CandidateSelection', 'SeriesMetadata', 'EpisodeLookup']
+AcpOperation = Literal['CandidateSelection', 'SeriesMetadata', 'EpisodeLookup', 'TitleReadings']
 _AcpCancelCategory = Literal[
     'UnsafeOperation',
     'PermissionPolicy',
@@ -2844,9 +2847,10 @@ def _build_candidate_selection_prompt(
 
 Rules:
 - Select exactly one choice_id from the candidates below.
+- Also return title_reading: the kana reading of the Program title in hiragana (convert katakana to hiragana, keep latin letters and digits, remove broadcast decorations), or null when no kana reading can be derived.
 - Never invent a choice_id.
 - Do not use tools, files, terminals, or external resources.
-- Return only one JSON object with choice_id and confidence.
+- Return only one JSON object with choice_id, confidence, and title_reading.
 - confidence must be a number between 0.0 and 1.0.
 
 Program:
@@ -2860,7 +2864,7 @@ Candidates:
 {candidates_json}
 
 Output schema:
-{{"choice_id":"...","confidence":0.0}}"""
+{{"choice_id":"...","confidence":0.0,"title_reading":null}}"""
 
 
 def _parse_strict_json_object(output_text: str) -> dict[str, Any]:
@@ -2963,6 +2967,8 @@ def BuildAcpOutputJSONSchemaArgument(operation: AcpOperation) -> str:
         output_model = _AIChoiceOutput
     elif operation == 'SeriesMetadata':
         output_model = AISeriesMetadataOutput
+    elif operation == 'TitleReadings':
+        output_model = AITitleReadingsOutput
     else:
         output_model = _AcpEpisodeLookupOutput
     return json.dumps(
@@ -3062,7 +3068,88 @@ async def run_acp_candidate_selection(
         completion_tokens=None,
         http_status=0,
         latency_ms=latency_ms,
+        title_reading=validated.title_reading,
     )
+
+
+async def run_acp_title_readings(
+    command: str,
+    args: list[str],
+    env: dict[str, str],
+    titles: list[str],
+    *,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    timeout_sec: int = 120,
+    cwd: str | None = None,
+    profile_dir: str,
+    readable_files: tuple[str, ...] = (),
+    backend_kind: str = 'AcpCodex',
+) -> list[tuple[str, str]]:
+    """ACP v1 agent で複数タイトルの読みを一括生成し、厳格 schema で検証する。"""
+
+    start_time = time.monotonic()
+    effective_cwd = cwd or env.get('HOME')
+    if effective_cwd is None:
+        raise RecordedSeriesAIError('HostCLIStartFailed', latency_ms=0)
+    try:
+        session_result = await _run_acp_with_deadline(
+            command,
+            args,
+            env,
+            BuildTitleReadingsPrompt(titles),
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout_sec=timeout_sec,
+            cwd=effective_cwd,
+            profile_dir=profile_dir,
+            readable_files=readable_files,
+            operation='TitleReadings',
+            backend_kind=backend_kind,
+        )
+    except _AcpHardTimeoutError as ex:
+        raise RecordedSeriesAIError(
+            'HardTimeout',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except _AcpInactivityTimeoutError as ex:
+        raise RecordedSeriesAIError(
+            'Timeout',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except FileNotFoundError as ex:
+        raise RecordedSeriesAIError(
+            'HostCLINotFound',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except PermissionError as ex:
+        raise RecordedSeriesAIError(
+            'HostCLIPermissionDenied',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except _AcpAuthenticationError as ex:
+        raise RecordedSeriesAIError(
+            'ACPAuthenticationFailed',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except _AcpProtocolError as ex:
+        raise RecordedSeriesAIError(
+            'ACPProtocolError',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+    except OSError as ex:
+        # cwd 不在は command 未発見と区別し、起動失敗として報告する。
+        raise RecordedSeriesAIError(
+            'HostCLIStartFailed',
+            latency_ms=int((time.monotonic() - start_time) * 1000),
+        ) from ex
+
+    latency_ms = int((time.monotonic() - start_time) * 1000)
+    try:
+        output_data = _parse_strict_json_object(session_result.output_text)
+        return ValidateTitleReadingsOutput(output_data)
+    except RecordedSeriesAIError:
+        raise RecordedSeriesAIError('InvalidOutputSchema', latency_ms=latency_ms) from None
 
 
 async def run_acp_series_metadata(

@@ -54,6 +54,8 @@ export type RecordedStreamingVideoCodec = KonomiTVBS4KPlaybackVideoCodec;
 export type RecordedStreamingAudioCodec = KonomiTVBS4KPlaybackAudioCodec;
 export type VideoSeriesSortKey = 'SeasonEpisode' | 'BroadcastDate' | 'Title';
 export type VideoSeriesSortDirection = 'Asc' | 'Desc';
+// シリーズ一覧 (ビデオ → シリーズ) のカード並び替えキー。
+export type SeriesHomeSortKey = 'UpdatedAt' | 'TitleReading' | 'FirstAirDate' | 'TmdbPopularity' | 'TmdbVoteAverage' | 'BangumiRating';
 
 /** 通常 / BS4K と回線種別に対応する共通映像コーデック設定キーを返す。 */
 export function getKonomiTVBS4KPlaybackVideoCodecSettingKey(
@@ -195,6 +197,8 @@ export interface ILocalClientSettings extends IClientSettings {
     video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment' | 'Twitter';
     video_series_sort_key: VideoSeriesSortKey;
     video_series_sort_direction: VideoSeriesSortDirection;
+    series_home_sort_key: SeriesHomeSortKey;
+    series_home_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
     konomitv_bs4k_offline_video_streaming_quality: VideoStreamingQuality;
     konomitv_bs4k_offline_video_streaming_quality_for_bs4k: BS4KLiveStreamingQuality;
@@ -413,6 +417,10 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     video_series_sort_key: 'SeasonEpisode',
     // ビデオ視聴画面のシリーズを並べる方向 (Default: 昇順)
     video_series_sort_direction: 'Asc',
+    // シリーズ一覧のカードを並べる基準 (Default: 更新日時)
+    series_home_sort_key: 'UpdatedAt',
+    // シリーズ一覧のカードを並べる方向 (Default: 降順)
+    series_home_sort_direction: 'Desc',
     // 視聴履歴の保持件数 (Default: 50件)
     // この値を超えると、最も古い視聴履歴から自動的に削除される
     video_watched_history_max_count: 50,
@@ -673,6 +681,8 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'video_panel_active_tab',
     'video_series_sort_key',
     'video_series_sort_direction',
+    'series_home_sort_key',
+    'series_home_sort_direction',
     'video_watched_history_max_count',
     // konomitv_bs4k_offline_video_streaming_quality: 同期無効
     // konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
@@ -1176,6 +1186,24 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         normalized_settings.video_series_sort_direction !== 'Desc'
     ) {
         normalized_settings.video_series_sort_direction = ILocalClientSettingsDefault.video_series_sort_direction;
+    }
+
+    // 不正なインポート値や開発途中版の値では、シリーズ一覧の並び替えを既定値へ戻す。
+    if (
+        normalized_settings.series_home_sort_key !== 'UpdatedAt' &&
+        normalized_settings.series_home_sort_key !== 'TitleReading' &&
+        normalized_settings.series_home_sort_key !== 'FirstAirDate' &&
+        normalized_settings.series_home_sort_key !== 'TmdbPopularity' &&
+        normalized_settings.series_home_sort_key !== 'TmdbVoteAverage' &&
+        normalized_settings.series_home_sort_key !== 'BangumiRating'
+    ) {
+        normalized_settings.series_home_sort_key = ILocalClientSettingsDefault.series_home_sort_key;
+    }
+    if (
+        normalized_settings.series_home_sort_direction !== 'Asc' &&
+        normalized_settings.series_home_sort_direction !== 'Desc'
+    ) {
+        normalized_settings.series_home_sort_direction = ILocalClientSettingsDefault.series_home_sort_direction;
     }
 
     // 録画音声コーデックは AAC / Opus の2択だけを許可する。
