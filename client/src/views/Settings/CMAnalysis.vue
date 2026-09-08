@@ -14,7 +14,7 @@
         </div>
         <div class="settings__content" :class="{'settings__content--loading': is_loading, 'settings__content--disabled': is_edit_disabled}">
             <div v-if="is_edit_disabled" class="settings__item-label mb-4">
-                CM 解析設定の変更は管理者のみ実行できます。閲覧は可能です。
+                CM 解析設定の確認や変更には、管理者権限が必要です。
             </div>
             <div class="settings__item settings__item--switch">
                 <label class="settings__item-heading" for="cm_analysis_enabled">KonomiTV-BS4K で CM 解析する</label>

@@ -29,7 +29,7 @@
                 <button v-for="service_id in service_ids" :key="String(service_id)" type="button"
                     :class="{'logo-services__item--active': selected_service_id === service_id}"
                     @click="selectService(service_id)">
-                    <span>{{service_id === 'unassigned' ? 'SID 未割り当て' : `SID ${service_id}`}}</span>
+                    <span>{{service_id === 'unassigned' ? 'SID なし' : `SID ${service_id}`}}</span>
                     <strong>{{stationNamesForService(service_id)}}</strong>
                     <small>{{logosForService(service_id).length}} ロゴ</small>
                 </button>
@@ -46,8 +46,8 @@
                     <div class="logo-card__body">
                         <strong>{{logo.logo_name || logo.filename}}</strong>
                         <span>{{logo.filename}}</span>
-                        <small>{{logo.service_id === null ? 'SID 未割り当て' : `SID ${logo.service_id}`}} · {{formatSize(logo.file_size)}}</small>
-                        <small v-if="logo.missing" class="text-error-readable">missing / 外部削除済み</small>
+                        <small>{{logo.service_id === null ? 'SID なし' : `SID ${logo.service_id}`}} · {{formatSize(logo.file_size)}}</small>
+                        <small v-if="logo.missing" class="text-error-readable">missing / 共有ファイルなし</small>
                         <small v-else-if="!logo.enabled">無効</small>
                     </div>
                 </button>
@@ -57,14 +57,14 @@
                 <template v-if="selected_logo !== null">
                     <h3>選択ロゴ詳細</h3>
                     <dl>
-                        <dt>局名</dt><dd>{{selected_logo.logo_name}}</dd>
-                        <dt>SID</dt><dd>{{selected_logo.service_id ?? '未割り当て（明示割り当てが必要）'}}</dd>
+                        <dt>ロゴ名</dt><dd>{{selected_logo.logo_name}}</dd>
+                        <dt>SID</dt><dd>{{selected_logo.service_id ?? 'なし（明示割り当てで利用）'}}</dd>
                         <dt>形式</dt><dd>{{formatLogoFileFormat(selected_logo.file_format)}}</dd>
                         <dt>ファイル</dt><dd>{{selected_logo.filename}}</dd>
                         <dt>パス</dt><dd>{{selected_logo.path}}</dd>
                         <dt>SHA-256</dt><dd class="logo-detail__hash">{{selected_logo.file_hash}}</dd>
-                        <dt>最終利用</dt><dd>{{selected_logo.last_used_at ?? '未使用'}}</dd>
-                        <dt>生成元録画</dt><dd>{{selected_logo.generated_from_recorded_video_id ?? '外部/手動追加'}}</dd>
+                        <dt>最終利用</dt><dd>{{selected_logo.last_used_at ?? '利用記録なし'}}</dd>
+                        <dt>生成元録画</dt><dd>{{selected_logo.generated_from_recorded_video_id ?? 'なし'}}</dd>
                     </dl>
                     <v-switch color="primary" hide-details label="KonomiTV-BS4K で有効"
                         :model-value="selected_logo.enabled" :disabled="is_edit_disabled || selected_logo.missing"
