@@ -8,8 +8,8 @@
             <span class="ml-2">AIバックエンド</span>
         </h2>
         <div class="settings__description">
-            録画シリーズ AI などで使う OpenCode・OpenAI 互換 API・ACP の接続を管理します。<br>
-            API キーはサーバー上に暗号化せず安全な秘密ストアへ保存され、画面には表示されません。<br>
+            録画シリーズ判定で使う OpenCode・OpenAI 互換 API・ACP の接続を管理します。<br>
+            API キーはサーバー上に暗号化せず権限 0600 の専用ファイルへ保存され、画面や API 応答には返りません。<br>
             この設定はすべてのユーザーと端末で共有され、管理者だけが変更できます。<br>
         </div>
 
@@ -22,7 +22,7 @@
                 <router-link class="link" to="/login/">ログイン</router-link>
             </span>
             <span v-else-if="authorization_error === 'AdminRequired'">この設定を表示するには管理者権限が必要です。</span>
-            <span v-else>サーバーに接続できないため、ユーザー情報を取得できませんでした。</span>
+            <span v-else>ユーザー情報を取得できませんでした。</span>
         </div>
 
         <template v-else>
@@ -66,7 +66,7 @@
                         </span>
                         <template v-if="health.available">
                             / version {{ health.version || '不明' }}
-                            （pin {{ health.pinned_version }}） / listener なし
+                            （固定 {{ health.pinned_version }}） / 常駐リスナーなし
                         </template>
                         <template v-else>
                             。OpenCode CLI の配置とサーバーログを確認してください。
@@ -75,7 +75,7 @@
                     <div class="settings__item-label" v-else>状態を取得できませんでした。</div>
                     <v-btn class="mt-3" variant="tonal" color="primary" size="small"
                         :disabled="is_busy" @click="reloadAll()">
-                        再読込
+                        再読み込み
                     </v-btn>
                 </div>
             </div>
@@ -92,12 +92,12 @@
                     </v-btn>
                 </div>
                 <div class="settings__item-label mt-2">
-                    各 service カードに当月の利用状況を表示します。料金は OpenCode が返す
+                    各 service カードに当月の利用状況を表示します。料金は
                     <strong>推定料金</strong>で、プロバイダの請求額そのものではありません。
                 </div>
 
                 <div v-if="services.length === 0" class="settings__item-label mt-3">
-                    まだ service がありません。「追加」から OpenCode provider を登録してください。
+                    まだ service がありません。「追加」から service を登録してください。
                 </div>
 
                 <div v-for="service in services" :key="service.service_id" class="ai-backend-card">
@@ -113,7 +113,7 @@
                                     [{{ service.opencode_model_variant }}]
                                 </template>
                                 <template v-if="isOpenAIFastService(service)"> · Fast</template><br>
-                                接続: {{ formatProviderType(service.opencode_provider_type) }} ·
+                                接続方式: {{ formatProviderType(service.opencode_provider_type) }} ·
                                 出力: {{ formatStructuredOutputMode(service.structured_output_mode) }}<br>
                                 auth: {{ service.auth_mode }} · billing: {{ service.billing_mode }} ·
                                 認証: {{ service.auth_configured ? '設定済み' : '未設定' }}
@@ -180,7 +180,7 @@
                             </div>
                         </template>
                         <div v-else class="ai-backend-card__usage-body">
-                            当月の利用はまだありません。
+                            利用状況を取得できませんでした。
                         </div>
                     </div>
 
@@ -234,7 +234,7 @@
                     <span class="ml-2">削除済み service の利用履歴</span>
                 </div>
                 <div class="settings__item-label mt-2">
-                    設定から削除した service の当月履歴です。上限 enforce の対象外で、表示のみ残ります。
+                    設定から削除した service の当月履歴です。上限適用の対象外で、当月分の記録のみ表示されます。
                 </div>
                 <div v-for="usage in deleted_usage_list" :key="`${usage.service_id}-${usage.year_month}`"
                     class="ai-backend-usage-card">
@@ -321,10 +321,10 @@
                         @update:model-value="onProviderTypeSelected" />
                     <template v-if="form.opencode_provider_type === 'Catalog'">
                         <div class="settings__item-label mb-3">
-                            OpenCode Web と同じく、<strong>プロバイダ</strong>を選んだあと
-                            <strong>認証方式</strong>（API キー / OAuth など）を選びます。<br>
-                            API キーと OAuth はベストエフォート対応です。Vertex AI 以外の面倒な認証
-                            （Azure / Bedrock / GitHub Enterprise 等）は非対応です。
+                            <strong>プロバイダ</strong>を選んだあと<strong>認証方式</strong>を選びます。<br>
+                            API キーはベストエフォート対応です。新規 OAuth は開始できません。
+                            複数資格情報を要する認証（Azure / Bedrock / GitHub Enterprise 等）は、
+                            Vertex AI を除き非対応です。
                         </div>
                         <!-- 1. プロバイダ選択（全カタログ・検索可） -->
                         <v-autocomplete v-model="selected_provider_id" :items="provider_items" item-title="title"
@@ -338,7 +338,8 @@
                         </div>
                         <div v-if="selected_provider?.support_kind === 'UnsupportedComplex'"
                             class="ai-backend-warn mb-3">
-                            このプロバイダは面倒な認証が必要なため選択できません（Vertex AI のみ例外対応）。
+                            このプロバイダは複数資格情報やクラウド固有の認証が必要なため選択できません
+                            （Vertex AI のみ例外対応）。
                         </div>
                         <!-- 2. 認証方式（OpenCode Web と同じラベル一覧） -->
                         <v-select v-model="selected_auth_method_key" :items="auth_method_items" item-title="title"
@@ -363,8 +364,8 @@
                             color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
                             :disabled="selected_model === null || selected_model.variants.length === 0" />
                         <div class="settings__item-label mb-3">
-                            モデルが OpenCode へ公開している推論 variant だけを選択できます。
-                            「モデル既定」は OpenCode 側の標準値を使います。
+                            モデルが対応している思考の深さ（推論 variant）を選択できます。
+                            「モデル既定」は variant を指定せず、モデル側の標準値を使います。
                         </div>
                         <div v-if="selected_provider_id === 'openai' &&
                             (openai_fast_mode_available || form.openai_fast_mode_enabled)"
@@ -383,7 +384,7 @@
                     <template v-else>
                         <div class="settings__item-label mb-3">
                             OpenCode CLI に service 専用 provider として登録します。
-                            API キーはこの画面の秘密ストアから OpenCode auth へ注入されます。
+                            保存された API キーは OpenCode の認証設定へ自動で反映されます。
                         </div>
                         <v-text-field v-model="form.api_base_url" label="API ベース URL" variant="outlined"
                             color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
@@ -424,8 +425,8 @@
                             class="mb-2" />
                     </template>
                     <div v-if="form.auth_mode === 'OAuthSubscription'" class="settings__item-label mb-2">
-                        保存後に「OAuth開始」からブラウザ認証画面を開いてください。
-                        Docker 内 localhost リダイレクトが使えない場合は headless / device code 方式を選んでください。
+                        常駐リスナーなしの OpenCode CLI では新規 OAuth を開始できません。
+                        利用するには製品用 auth.json に既存トークンを手動配置するか、API キー認証を使用してください。
                     </div>
                     <v-expansion-panels variant="accordion" class="mt-2">
                         <v-expansion-panel title="詳細設定（課金・上限・ローカル）">
@@ -532,7 +533,7 @@
             <v-card>
                 <v-card-title>service を削除</v-card-title>
                 <v-card-text>
-                    「{{ delete_target?.service_name }}」を削除しますか？録画シリーズから参照中の場合は拒否されます。
+                    「{{ delete_target?.service_name }}」を削除しますか？録画シリーズから参照中の場合は削除できません。
                 </v-card-text>
                 <v-card-actions>
                     <v-spacer />
@@ -608,7 +609,7 @@ const emptyForm = (): ServiceForm => ({
 });
 
 const billing_mode_items = [
-    {title: 'Metered（従量・月次上限対象）', value: 'Metered'},
+    {title: 'Metered（従量・月次上限は任意）', value: 'Metered'},
     {title: 'Subscription（上限対象外）', value: 'Subscription'},
     {title: 'Local（token 上限のみ任意）', value: 'Local'},
 ];
@@ -1081,7 +1082,7 @@ function formatUsageLimits(usage: IAIBackendUsage): string {
 
 function formatLimitFlags(usage: IAIBackendUsage): string {
     if (usage.service_deleted) {
-        return '履歴のみ（上限 enforce 対象外）';
+        return '履歴のみ（上限適用対象外）';
     }
     if (usage.billing_mode === 'Subscription') {
         return 'サブスク課金のため月次上限は適用しません';
@@ -1094,7 +1095,7 @@ function formatLimitFlags(usage: IAIBackendUsage): string {
         flags.push('料金上限到達');
     }
     if (flags.length === 0) {
-        return usage.cost_limit_effective ? '上限監視中' : '上限なし';
+        return usage.cost_limit_effective ? '上限監視中' : '料金上限なし';
     }
     return flags.join(' · ');
 }
@@ -1237,7 +1238,7 @@ async function saveService(): Promise<void> {
             if (result !== null && body.auth_mode === 'ApiKey' && create_api_key_input.value.trim() !== '') {
                 const key_ok = await AIBackend.setAPIKey(result.service_id, create_api_key_input.value.trim());
                 if (key_ok === false) {
-                    Message.warning('service は追加しましたが、API キーの設定に失敗しました。');
+                    Message.warning('service は追加しましたが、API キーの設定を完了できませんでした。');
                 }
             }
             // OAuth method index を記憶（カードの OAuth開始で使う）。
