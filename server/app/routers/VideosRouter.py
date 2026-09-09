@@ -1075,13 +1075,34 @@ async def VideoPlaybackIndexCreateAPI(
     return index
 
 
+def GetRecordedFileDownloadMediaType(filename: str) -> str:
+    """
+    録画ダウンロードの Content-Type をファイル拡張子から決める。
+
+    Args:
+        filename (str): 録画ファイル名。
+
+    Returns:
+        str: 拡張子に対応する Content-Type。
+    """
+
+    suffix = pathlib.Path(filename).suffix.lower()
+    if suffix in ('.ts', '.m2ts'):
+        return 'video/mp2t'
+    if suffix == '.mp4':
+        return 'video/mp4'
+    if suffix == '.mkv':
+        return 'video/x-matroska'
+    return 'application/octet-stream'
+
+
 @router.get(
     '/{video_id}/download',
     summary = '録画番組ダウンロード API',
-    response_description = '録画番組の MPEG-TS ファイル。',
+    response_description = '録画番組のファイル。',
     response_class = FileResponse,
     responses = {
-        200: {'content': {'video/mp2t': {}}},
+        200: {'content': {'video/mp2t': {}, 'video/mp4': {}, 'video/x-matroska': {}, 'application/octet-stream': {}}},
         422: {'description': 'Specified video_id was not found'},
     },
 )
@@ -1089,7 +1110,7 @@ async def VideoDownloadAPI(
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
 ):
     """
-    指定された録画番組の MPEG-TS ファイルをダウンロードする。
+    指定された録画番組のファイルをダウンロードする。
     """
 
     file_path = anyio.Path(recorded_program.recorded_video.file_path)
@@ -1106,7 +1127,7 @@ async def VideoDownloadAPI(
     return FileResponse(
         path = str(file_path),
         filename = filename,
-        media_type = 'video/mp2t',
+        media_type = GetRecordedFileDownloadMediaType(filename),
     )
 
 
