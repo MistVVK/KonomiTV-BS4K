@@ -103,6 +103,10 @@ class TmdbConnectionTestResult:
     error_code: str | None
 
 
+class TmdbMetadataSyncError(RuntimeError):
+    """pipelineへ秘密を含めずTMDb同期失敗を通知する。"""
+
+
 class KonomiTVBS4KTmdbClient:
     """KonomiTV の録画シリーズを TMDb の作品とシーズンへ照合する。"""
 
@@ -122,7 +126,9 @@ class KonomiTVBS4KTmdbClient:
     # 接続試験に使う、認証だけを確認できる最も軽いエンドポイント。
     CONNECTION_TEST_PATH = '/configuration'
     # scheduleSeriesSync() が起動した未完了タスク。完了時に discard する。
-    _sync_tasks: set[asyncio.Task[None]] = set()
+    _sync_tasks: set[asyncio.Task[Any]] = set()
+    # pipeline が await する task は同じ所有集合へ加え、通常 scheduler からは再予約しない。
+    _pipeline_sync_tasks: set[asyncio.Task[Any]] = set()
     # 実行中に再予約されたら、完了後にもう一度だけ照合する。
     _sync_rerun: bool = False
     # 起動時の直接呼び出しと設定更新後の予約を直列化し、同じ候補へ AI を重複実行しない。
@@ -207,6 +213,8 @@ class KonomiTVBS4KTmdbClient:
         series_title: str,
         api_key: str,
         auxiliary_queries: list[str] | None = None,
+        *,
+        raise_on_error: bool = False,
     ) -> list[TmdbSearchCandidate]:
         """
         TV と映画を検索し、AI 選択へ渡す hints を組み立てる。
@@ -216,6 +224,7 @@ class KonomiTVBS4KTmdbClient:
             api_key (str): TMDb API キー。
             auxiliary_queries (list[str] | None): 所属録画の EPG から抽出した補助クエリ。
                 タイトル検索が空のときだけ、空でなくなるまで順に試す。
+            raise_on_error: 主検索の通信・応答失敗を呼び出し元へ伝播するか。
 
         Returns:
             list[TmdbSearchCandidate]: TV と映画を交互に並べた上位候補。失敗時は空リスト。
@@ -248,12 +257,16 @@ class KonomiTVBS4KTmdbClient:
                             f'[KonomiTVBS4KTmdbClient] TMDb auxiliary search skipped. '
                             f'[media_type: {media_type}, error: {type(ex).__name__}]',
                         )
+                        if raise_on_error:
+                            raise
                         break
             except (httpx.HTTPError, ValueError) as ex:
                 logging.warning(
                     f'[KonomiTVBS4KTmdbClient] TMDb search skipped. '
                     f'[media_type: {media_type}, error: {type(ex).__name__}]',
                 )
+                if raise_on_error:
+                    raise
                 results_by_type[media_type] = []
         tv_results = results_by_type['tv']
         movie_results = results_by_type['movie']
@@ -490,9 +503,18 @@ class KonomiTVBS4KTmdbClient:
 
 
     @classmethod
-    async def syncAllSeries(cls) -> int:
+    async def syncAllSeries(
+        cls,
+        *,
+        maximum_series: int | None = None,
+        raise_on_error: bool = False,
+    ) -> int:
         """
         未照合の Series を TMDb 作品へ照合し、`tmdb_*` と話数構造を補完する。
+
+        Args:
+            maximum_series: 今回処理する未照合 Series の上限。None は全件を再同期する。
+            raise_on_error: 外部API失敗を秘密を含まない例外として呼び出し元へ伝播するか。
 
         Returns:
             int: 今回 TMDb 作品を確定できた Series 数。
@@ -510,15 +532,21 @@ class KonomiTVBS4KTmdbClient:
                     'Skipping the TMDb metadata pass.',
                 )
                 return 0
-            # 完了済みの詳細も再取得し、前回の話数取得失敗や後日追加されたシーズンを補完する。
-            target_series = await Series.all().order_by('id')
+            # 全件同期では完了済みの詳細も再取得する。有限バッチでは未照合だけを
+            ## ID順に取り、同じ対象へ長時間滞留しない。
+            if maximum_series is None:
+                target_series = await Series.all().order_by('id')
+            else:
+                target_series = await Series.filter(
+                    tmdb_id__isnull=True,
+                ).order_by('id').limit(maximum_series)
             matched_series_count = 0
             for loaded_series in target_series:
                 # 長い同期の途中でモードを無効化した場合は、次の作品から外部通信を止める。
                 if not IsTmdbExternalMetadataEnabled() or not KonomiTVBS4KTmdbStore.isConfigured():
                     break
                 try:
-                    if await cls._syncSeries(loaded_series, api_key):
+                    if await cls._syncSeries(loaded_series, api_key, raise_on_error=raise_on_error):
                         matched_series_count += 1
                 except (httpx.HTTPError, ValueError) as ex:
                     # rate limit・通信エラー・不正応答は該当 Series だけ skip し、pass 全体は続行する。
@@ -527,11 +555,42 @@ class KonomiTVBS4KTmdbClient:
                         f'[KonomiTVBS4KTmdbClient][syncAllSeries] Failed to fetch TMDb metadata. '
                         f'[series_id: {loaded_series.id}, error: {type(ex).__name__}]',
                     )
+                    if raise_on_error:
+                        # HTTP例外のURLにはAPIキーが含まれるため、元例外を連鎖させない。
+                        raise TmdbMetadataSyncError(type(ex).__name__) from None
         logging.info(
             f'[KonomiTVBS4KTmdbClient][syncAllSeries] Synchronized TMDb metadata. '
             f'[matched_series: {matched_series_count}]',
         )
         return matched_series_count
+
+
+    @classmethod
+    def startPipelineSync(cls, *, maximum_series: int | None = None) -> asyncio.Task[int]:
+        """pipeline用TMDb同期を通常schedulerと同じ所有集合へ登録する。
+
+        Args:
+            maximum_series: 今回処理する未照合 Series の上限。None は全件を再同期する。
+
+        Returns:
+            pipelineが完了を待つTMDb同期task。
+
+        Raises:
+            RuntimeError: 別のTMDb同期がすでに実行中の場合。
+        """
+
+        # 確認から登録までawaitせず、通常schedulerとの開始競合を同一イベントループ上で防ぐ。
+        if cls.hasRunningSync():
+            raise RuntimeError('TmdbSyncBusy')
+        task = asyncio.create_task(cls.syncAllSeries(
+            maximum_series=maximum_series,
+            raise_on_error=True,
+        ))
+        cls._sync_tasks.add(task)
+        cls._pipeline_sync_tasks.add(task)
+        task.add_done_callback(cls._sync_tasks.discard)
+        task.add_done_callback(cls._pipeline_sync_tasks.discard)
+        return task
 
 
     @classmethod
@@ -548,7 +607,9 @@ class KonomiTVBS4KTmdbClient:
         if KonomiTVBS4KTmdbStore.isConfigured() is False:
             logging.info('[KonomiTVBS4KTmdbClient] TMDb API key is not configured. Skipping metadata sync.')
             return
-        # 実行中の照合へ合流し、スキャンや API 応答を外部通信で待たせない。
+        # pipeline中は別taskを積み増さない。通常scheduler同士だけは1回の再実行へ合流する。
+        if any(task.done() is False for task in cls._pipeline_sync_tasks):
+            return
         if any(task.done() is False for task in cls._sync_tasks):
             cls._sync_rerun = True
             return
@@ -557,7 +618,7 @@ class KonomiTVBS4KTmdbClient:
             while True:
                 cls._sync_rerun = False
                 try:
-                    await cls.syncAllSeries()
+                    await cls.syncAllSeries(maximum_series=1)
                 except (httpx.HTTPError, ValueError) as ex:
                     logging.error(
                         '[KonomiTVBS4KTmdbClient][scheduleSeriesSync] Failed to synchronize TMDb metadata. '
@@ -573,20 +634,40 @@ class KonomiTVBS4KTmdbClient:
 
 
     @classmethod
-    async def _syncSeries(cls, series: Series, api_key: str) -> bool:
+    def hasRunningSync(cls) -> bool:
+        """TMDb 同期が実行中または起動済みかを返す。
+
+        Returns:
+            新しい同期を開始できない場合は True。
+        """
+
+        return cls._sync_lock.locked() or any(
+            task.done() is False for task in cls._sync_tasks
+        )
+
+
+    @classmethod
+    async def _syncSeries(
+        cls,
+        series: Series,
+        api_key: str,
+        *,
+        raise_on_error: bool,
+    ) -> bool:
         """
         1件の Series を TMDb 作品へ照合し、確定したら enrich する。
 
         Args:
             series (Series): 対象 Series。
             api_key (str): TMDb API キー。
+            raise_on_error: 候補主検索の通信・応答失敗を伝播するか。
 
         Returns:
             bool: TMDb 作品を確定して enrich まで完了した場合は True。
         """
 
         if series.tmdb_id is None or series.tmdb_media_type is None:
-            candidate = await cls._matchSeries(series, api_key)
+            candidate = await cls._matchSeries(series, api_key, raise_on_error=raise_on_error)
             if candidate is None:
                 return False
             # 照合結果を先に永続化し、enrich が失敗しても次回 pass で検索をやり直さない。
@@ -600,6 +681,8 @@ class KonomiTVBS4KTmdbClient:
         cls,
         series: Series,
         api_key: str,
+        *,
+        raise_on_error: bool,
     ) -> TmdbSearchCandidate | None:
         """
         検索 hints と AI 選択で Series に対応する TMDb 作品を決める。
@@ -607,6 +690,7 @@ class KonomiTVBS4KTmdbClient:
         Args:
             series (Series): 未照合の Series。
             api_key (str): TMDb API キー。
+            raise_on_error: 候補主検索の通信・応答失敗を伝播するか。
 
         Returns:
             TmdbSearchCandidate | None: 採用できる候補。曖昧または失敗時は None。
@@ -620,7 +704,12 @@ class KonomiTVBS4KTmdbClient:
         )
         epg_context = BuildSeriesEPGContext(member_programs)
         auxiliary_queries = ExtractEPGSearchQueries(member_programs, existing_title=series.title)
-        candidates = await cls.searchCandidates(series.title, api_key, auxiliary_queries=auxiliary_queries)
+        candidates = await cls.searchCandidates(
+            series.title,
+            api_key,
+            auxiliary_queries=auxiliary_queries,
+            raise_on_error=raise_on_error,
+        )
         # Indexer と同じ映画識別で作品種別を決め、映画 Series に TV 作品を、
         ## TV Series に映画作品を結び付けない。所属録画の EPG 題名・ジャンルを
         ## 同じ抽出で判定するため、アニメジャンルの劇場版も movie になる。
@@ -652,7 +741,11 @@ class KonomiTVBS4KTmdbClient:
         for auxiliary_query in auxiliary_queries:
             if len(candidates) > 0:
                 break
-            retry_candidates = await cls.searchCandidates(auxiliary_query, api_key)
+            retry_candidates = await cls.searchCandidates(
+                auxiliary_query,
+                api_key,
+                raise_on_error=raise_on_error,
+            )
             if is_movie_series is not None:
                 retry_candidates = [
                     candidate for candidate in retry_candidates

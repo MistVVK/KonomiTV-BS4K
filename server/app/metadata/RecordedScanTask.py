@@ -801,7 +801,8 @@ class RecordedScanTask:
         logging.info('Batch scan of recording folders has been completed.')
         # 列挙と録画ごとの処理が終わった集合へ、現在の確定規則を一括適用する。
         await SeriesIndexer.rebuild()
-        await KonomiTVBS4KBangumiClient.syncAllLinkedUsers()
+        # pipelineと同じ所有境界でBangumi同期を待ち、既存の全收藏同期へ積み増さない。
+        await KonomiTVBS4KBangumiClient.syncAfterRecordedScan()
         # TMDb の検索・AI 待ちでスキャン完了や後続の CM 解析を止めず、既存の同期タスクへ合流する。
         KonomiTVBS4KTmdbClient.scheduleSeriesSync()
 

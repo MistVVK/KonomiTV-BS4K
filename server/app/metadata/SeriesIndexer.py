@@ -5,6 +5,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from tortoise import connections, transactions
 from tortoise.backends.base.client import BaseDBAsyncClient
@@ -609,6 +610,7 @@ class SeriesIndexer:
         *,
         _fallback_title: ParsedSeriesTitle | None = None,
         _fallback_series: Series | None = None,
+        schedule_background_tasks: bool = True,
     ) -> bool:
         """
         1 件の録画番組を Series と放送期間へ関連付ける。
@@ -617,6 +619,7 @@ class SeriesIndexer:
             recorded_program (RecordedProgram): DB 保存済みの録画番組。
             _fallback_title (ParsedSeriesTitle | None): Web 根拠を検証済みの内部入力。
             _fallback_series (Series | None): ID とタイトルの整合性を検証済みの再利用対象。
+            schedule_background_tasks: AI 補完・話数判定を非同期予約するか。
 
         Returns:
             bool: Series へ関連付けられた場合は True。
@@ -664,7 +667,8 @@ class SeriesIndexer:
                     existing_series_id=cached_assignment[2],
                 )
             await cls._clearSeriesAssignment(recorded_program)
-            await SeriesAIFallbackTask.schedule()
+            if schedule_background_tasks:
+                await SeriesAIFallbackTask.schedule()
             return False
 
         # 映画は作品種別をグルーピング identity に含め、同名 TV と混ざらないようにする。
@@ -884,7 +888,7 @@ class SeriesIndexer:
                 resolution_invalidated = True
 
         # DB commit 後にだけワーカーへ投入する。起動前 rebuild は start() の Pending 復旧へ委ねる。
-        if resolution_invalidated:
+        if resolution_invalidated and schedule_background_tasks:
             from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
             await RecordedEpisodeAutomation.enqueue(
                 recorded_program.id,
@@ -896,7 +900,10 @@ class SeriesIndexer:
         if parsed_title.episode_number is None:
             for episode_less_program in episode_less_similar_programs:
                 if episode_less_program.series_id is None:
-                    await cls.linkRecordedProgram(episode_less_program)
+                    await cls.linkRecordedProgram(
+                        episode_less_program,
+                        schedule_background_tasks=schedule_background_tasks,
+                    )
 
         # 新しい録画や放送期間が加わったときだけ更新日時を進め、一覧の「更新が新しい順」へ反映する。
         if is_series_created or is_period_changed or is_recorded_program_changed:
@@ -1059,18 +1066,27 @@ class SeriesIndexer:
         ])
 
     @classmethod
-    async def rebuild(cls) -> None:
+    async def rebuild(
+        cls,
+        *,
+        scope: Literal['Unresolved', 'All'] = 'All',
+        schedule_background_tasks: bool = True,
+    ) -> int:
         """
-        既存の全録画番組へ現在の確定的な Series 解析規則を適用する。
+        指定範囲の録画番組へ現在の確定的な Series 解析規則を適用する。
+
+        Args:
+            scope: 未所属・話数未確定だけ、または全録画を処理する範囲。
+            schedule_background_tasks: AI 補完・話数判定を非同期予約するか。
 
         Returns:
-            None
+            Series へ関連付けられた録画数。
         """
 
         # スイッチオフでは全件再適用せず、保存済みの所属を残す。
         if RecordedSeriesSettingsStore.getSettings().enabled is False:
             logging.info('Series index rebuild skipped because recorded series indexing is disabled.')
-            return
+            return 0
 
         # 永続化済みの AI exact title を1回だけ復元し、全録画ループではメモリ snapshot を参照する。
         from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
@@ -1082,28 +1098,40 @@ class SeriesIndexer:
 
         # 大量の録画を一括ロードせず、ID 順に小さなバッチで処理する。
         while True:
-            recorded_programs = await RecordedProgram.filter(id__gt=last_seen_id).order_by('id').limit(100)
+            recorded_programs_query = RecordedProgram.filter(id__gt=last_seen_id)
+            if scope == 'Unresolved':
+                recorded_programs_query = recorded_programs_query.filter(
+                    Q(series_id__isnull=True) | Q(series_episode_id__isnull=True),
+                )
+            recorded_programs = await recorded_programs_query.order_by('id').limit(100)
             if len(recorded_programs) == 0:
                 break
             for recorded_program in recorded_programs:
-                if await cls.linkRecordedProgram(recorded_program):
+                if await cls.linkRecordedProgram(
+                    recorded_program,
+                    schedule_background_tasks=schedule_background_tasks,
+                ):
                     linked_count += 1
                 last_seen_id = recorded_program.id
 
         # 短縮タイトルが正式タイトルより先に登録された場合でも同じ結果へ収束させる。
         ## 全録画を再走査せず、厳密な前方一致となる長い Series が実在する短い Series の録画だけを再評価する。
-        all_series = await Series.all()
-        for short_series in all_series:
-            has_longer_candidate = any(
-                candidate.id != short_series.id and
-                IsStrictSeriesTitlePrefix(short_series.normalized_title, candidate.normalized_title)
-                for candidate in all_series
-            )
-            if not has_longer_candidate:
-                continue
-            short_series_programs = await RecordedProgram.filter(series_id=short_series.id).all()
-            for recorded_program in short_series_programs:
-                await cls.linkRecordedProgram(recorded_program)
+        if scope == 'All':
+            all_series = await Series.all()
+            for short_series in all_series:
+                has_longer_candidate = any(
+                    candidate.id != short_series.id and
+                    IsStrictSeriesTitlePrefix(short_series.normalized_title, candidate.normalized_title)
+                    for candidate in all_series
+                )
+                if not has_longer_candidate:
+                    continue
+                short_series_programs = await RecordedProgram.filter(series_id=short_series.id).all()
+                for recorded_program in short_series_programs:
+                    await cls.linkRecordedProgram(
+                        recorded_program,
+                        schedule_background_tasks=schedule_background_tasks,
+                    )
 
         # ルール改善で別 Series へ移った録画の古い放送期間とカードだけを後始末する。
         ## RecordedProgram がまだ参照する Series は消さないため、CASCADE で録画自体が失われることはない。
@@ -1123,3 +1151,4 @@ class SeriesIndexer:
         )
 
         logging.info(f'Series index rebuild has completed. linked_recorded_programs: {linked_count}')
+        return linked_count

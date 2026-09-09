@@ -13,6 +13,7 @@ from app.metadata.ai.recorded_series_ai import (
     resolve_series_metadata,
     resolve_title_readings,
 )
+from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle
 from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
 from app.metadata.RecordedSeriesCandidates import (
     RecordedSeriesAIError,
@@ -46,7 +47,9 @@ _MAX_TEXT_LENGTH = 600
 ## 余裕を持って 10 件ずつに分割する。
 _TITLE_READING_BATCH_SIZE = 10
 # 読み一括補完の1実行あたり処理上限。実行時間を外部 AI 呼び出しに依存させないための枠。
-_TITLE_READING_MAX_SERIES_PER_RUN = 96
+_TITLE_READING_MAX_SERIES_PER_RUN = _TITLE_READING_BATCH_SIZE
+# 自動起動1回で外部AIへ送るタイトル群を限定し、残件を自動連鎖させない。
+_MAX_GROUPS_PER_RUN = 1
 
 
 SeriesAIFallbackWorkerState = Literal['Running', 'Idle', 'Disabled', 'Stopped']
@@ -117,6 +120,9 @@ class SeriesAIFallbackTask:
     _start_lock = asyncio.Lock()
     _batch_lock = asyncio.Lock()
     _scan_requested = False
+    _bounded_wait_active = False
+    _schedule_external_sync = True
+    _schedule_episode_automation = True
     # UI には永続履歴ではなく、直列 worker が所有する現在の batch snapshot を公開する。
     _worker_state: SeriesAIFallbackWorkerState = 'Stopped'
     _worker_stopped_reason: str | None = 'WorkerNotStarted'
@@ -176,8 +182,8 @@ class SeriesAIFallbackTask:
                 await cls.restoreResolvedAssignments()
             if cls._worker_task is None or cls._worker_task.done():
                 cls._wake_event = asyncio.Event()
-                cls._worker_state = 'Stopped'
-                cls._worker_stopped_reason = 'WorkerStarting'
+                cls._worker_state = 'Idle'
+                cls._worker_stopped_reason = None
                 cls._worker_task = asyncio.create_task(cls._runWorker())
             # 外部 POST 済みかもしれない Pending は起動だけでは自動再送せず、
             # 明示的な設定保存または入力・backend 世代変更まで終端へ閉じる。
@@ -185,7 +191,6 @@ class SeriesAIFallbackTask:
                 status='Cancelled',
                 error_code='AIRequestInterrupted',
             )
-            await cls.schedule()
 
     @classmethod
     async def stop(cls) -> None:
@@ -202,6 +207,9 @@ class SeriesAIFallbackTask:
         cls._worker_task = None
         cls._wake_event = None
         cls._scan_requested = False
+        cls._bounded_wait_active = False
+        cls._schedule_external_sync = True
+        cls._schedule_episode_automation = True
         cls._worker_state = 'Stopped'
         cls._worker_stopped_reason = 'WorkerStopped'
         cls._pending_count = 0
@@ -269,6 +277,81 @@ class SeriesAIFallbackTask:
             cls._wake_event.set()
 
     @classmethod
+    def isBatchBusy(cls) -> bool:
+        """AI 補完が実行中または開始予約済みかを返す。
+
+        Returns:
+            新しい補完処理を開始できない場合は True。
+        """
+
+        return cls._batch_lock.locked() or cls._scan_requested or cls._bounded_wait_active
+
+    @classmethod
+    async def runBoundedBatch(
+        cls,
+        handle: AnalysisTaskHandle,
+        *,
+        retry_cancelled: bool,
+        timeout_seconds: float,
+        progress_start: float,
+        progress_end: float,
+        schedule_external_sync: bool,
+        schedule_episode_automation: bool,
+    ) -> SeriesAIFallbackWorkerStatus:
+        """1グループだけ予約し、有限時間で完了を待って進捗を反映する。
+
+        Args:
+            handle: 親パイプラインの解析履歴。
+            retry_cancelled: 中断済みグループを今回の明示操作で再試行するか。
+            timeout_seconds: 待機を打ち切る秒数。
+            progress_start: この段階の開始進捗。
+            progress_end: この段階の完了進捗。
+            schedule_external_sync: 確定後の外部同期を別タスクとして予約するか。
+            schedule_episode_automation: 確定録画の話数判定を別タスクとして予約するか。
+
+        Returns:
+            完了時のAI補完状態。
+
+        Raises:
+            SeriesAIFallbackBatchBusyError: 別の補完処理が開始済みの場合。
+            TimeoutError: 有限時間内に処理を終了できなかった場合。
+        """
+
+        await cls.start()
+        if cls.isBatchBusy():
+            raise SeriesAIFallbackBatchBusyError
+        cls._bounded_wait_active = True
+        cls._schedule_external_sync = schedule_external_sync
+        cls._schedule_episode_automation = schedule_episode_automation
+        try:
+            await cls.schedule(retry_cancelled=retry_cancelled)
+            try:
+                async with asyncio.timeout(timeout_seconds):
+                    while cls._batch_lock.locked() or cls._scan_requested:
+                        current_status = cls.getStatus()
+                        total_groups = current_status['total_groups']
+                        stage_fraction = (
+                            current_status['processed_groups'] / total_groups
+                            if total_groups > 0
+                            else 0.0
+                        )
+                        await handle.setProgress(
+                            progress_start + (progress_end - progress_start) * stage_fraction,
+                        )
+                        await asyncio.sleep(0.25)
+            except TimeoutError:
+                # 有限時間を超えた処理を裏で継続させず、所有 worker ごと停止して回収する。
+                await cls.stop()
+                await cls.start()
+                raise
+            await handle.setProgress(progress_end)
+            return cls.getStatus()
+        finally:
+            cls._schedule_episode_automation = True
+            cls._schedule_external_sync = True
+            cls._bounded_wait_active = False
+
+    @classmethod
     def getStatus(cls) -> SeriesAIFallbackWorkerStatus:
         """現在の worker 状態と batch 進捗を返す。
 
@@ -329,7 +412,7 @@ class SeriesAIFallbackTask:
             cls._wake_event.clear()
             cls._scan_requested = False
             try:
-                await cls._runBatch()
+                await cls._runBatch(maximum_groups=_MAX_GROUPS_PER_RUN)
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
@@ -338,8 +421,9 @@ class SeriesAIFallbackTask:
                 cls._pending_count = 0
                 cls._current_title = None
                 logging.error('[SeriesAIFallbackTask] Fallback batch failed.', exc_info=ex)
-            if cls._scan_requested:
-                cls._wake_event.set()
+            # 実行中に届いた再予約は次の自動連鎖へせず、DB上の未確定状態を
+            ## 次回の明示操作または新しい入力変更まで残す。
+            cls._scan_requested = False
 
     @classmethod
     async def _loadGroups(cls) -> dict[str, list[RecordedProgram]]:
@@ -477,8 +561,11 @@ class SeriesAIFallbackTask:
         )
 
     @classmethod
-    async def _runBatch(cls) -> None:
-        """同一 EPG タイトル系につき最大1回だけ Web 検索する。
+    async def _runBatch(cls, *, maximum_groups: int) -> None:
+        """同一 EPG タイトル系につき最大1回だけ新しい Web 検索をする。
+
+        Args:
+            maximum_groups: 今回の起動で新たに Web 検索する最大タイトル群数。
 
         Returns:
             None
@@ -515,6 +602,7 @@ class SeriesAIFallbackTask:
             cls._pending_count = 0
             cls._cancelled_count = 0
             cls._current_title = None
+            requested_groups = 0
             for grouping_key, programs in groups.items():
                 # 設定 OFF や backend 世代変更後も、古い snapshot で新規リクエストを続けない。
                 latest_settings, latest_api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
@@ -533,17 +621,24 @@ class SeriesAIFallbackTask:
                     cls._current_title = None
                     await cls.schedule()
                     return
-                # Web 検索中は現在の代表 EPG タイトルと Pending 1 件を公開する。
+                # cache 再利用も進捗へ含めるが、新しい Web 検索だけを有限枠として数える。
                 cls._current_title = programs[0].title.strip() or None
-                cls._pending_count = 1
-                result_status = await cls._resolveGroup(
+                result_status, requested = await cls._resolveGroup(
                     grouping_key,
                     programs,
                     settings=latest_settings,
                     api_key=latest_api_key,
                     provider_fingerprint=provider_fingerprint,
+                    allow_request=requested_groups < maximum_groups,
                 )
-                cls._pending_count = 0
+                # 再利用できる cache がなく有限枠も尽きたら、残件を次の明示操作へ委ねる。
+                if result_status is None:
+                    cls._worker_state = 'Stopped'
+                    cls._worker_stopped_reason = 'BatchLimitReached'
+                    cls._current_title = None
+                    return
+                if requested:
+                    requested_groups += 1
                 cls._processed_groups += 1
                 if result_status == 'Resolved':
                     cls._resolved_count += 1
@@ -581,7 +676,8 @@ class SeriesAIFallbackTask:
         settings: RecordedSeriesSettings,
         api_key: str | None,
         provider_fingerprint: str,
-    ) -> SeriesAIFallbackStatus:
+        allow_request: bool,
+    ) -> tuple[SeriesAIFallbackStatus | None, bool]:
         """1タイトル群を cache または1回の Web 検索で確定する。
 
         Args:
@@ -590,9 +686,10 @@ class SeriesAIFallbackTask:
             settings: 判定開始時の録画シリーズ設定 snapshot。
             api_key: 同じ時点の互換 API key snapshot。
             provider_fingerprint: backend 設定・認証世代の fingerprint。
+            allow_request: cache がなければ新しい Web 検索を開始してよいか。
 
         Returns:
-            処理後または再利用した fallback status。
+            fallback status と新しい Web 検索を実行したか。有限枠超過時の status は None。
         """
 
         from app.metadata.SeriesIndexer import (
@@ -610,7 +707,7 @@ class SeriesAIFallbackTask:
             and len(fallback.citations) > 0
         ):
             await cls._applyResolvedFallback(fallback, programs)
-            return 'Resolved'
+            return 'Resolved', False
         if (
             fallback is not None
             and fallback.input_fingerprint == input_fingerprint
@@ -622,7 +719,11 @@ class SeriesAIFallbackTask:
                 'Cancelled',
             }
         ):
-            return fallback.status
+            return fallback.status, False
+
+        # 同じ入力・provider の再利用可能 cache がなく、今回の新規検索枠も尽きている。
+        if allow_request is False:
+            return None, False
 
         fallback, _created = await SeriesAIFallback.update_or_create(
             grouping_key=grouping_key,
@@ -646,6 +747,8 @@ class SeriesAIFallbackTask:
             },
         )
         cls._resolved_assignments.pop(grouping_key, None)
+        # Web 検索中だけ現在の代表 EPG タイトルを Pending 1 件として公開する。
+        cls._pending_count = 1
         try:
             result = await resolve_series_metadata(
                 program,
@@ -668,7 +771,7 @@ class SeriesAIFallbackTask:
                 latency_ms=ex.latency_ms,
                 attempt_summaries=list(ex.recovery_attempt_summaries),
             )
-            return 'Failed'
+            return 'Failed', True
         except Exception as ex:
             logging.error(
                 f'[SeriesAIFallbackTask] Series lookup failed unexpectedly. grouping_key: {grouping_key}',
@@ -678,7 +781,9 @@ class SeriesAIFallbackTask:
                 status='Failed',
                 error_code='SeriesAIFallbackFailed',
             )
-            return 'Failed'
+            return 'Failed', True
+        finally:
+            cls._pending_count = 0
 
         citation_records = [
             {'url': citation.url, 'title': citation.title}
@@ -715,7 +820,7 @@ class SeriesAIFallbackTask:
                 and latest_settings.ai_enabled
             ):
                 await cls.schedule(retry_cancelled=True)
-            return 'Cancelled'
+            return 'Cancelled', True
 
         normalized_title = (
             NormalizeSeriesTitle(result.series_title)
@@ -759,7 +864,7 @@ class SeriesAIFallbackTask:
                 attempt_summaries=list(result.recovery_attempt_summaries),
                 error_code=None,
             )
-            return terminal_status
+            return terminal_status, True
 
         assert result.series_title is not None
         assert normalized_title is not None
@@ -807,7 +912,7 @@ class SeriesAIFallbackTask:
             existing_series_id=resolved_series_id,
             title_reading=result.title_reading,
         )
-        return 'Resolved'
+        return 'Resolved', True
 
     @classmethod
     async def _applyResolvedFallback(
@@ -862,7 +967,8 @@ class SeriesAIFallbackTask:
             if latest.series_title is not None:
                 linked_series_title = latest.series_title
                 linked_normalized_title = NormalizeSeriesTitle(latest.series_title)
-            await RecordedEpisodeAutomation.enqueue(latest.id)
+            if cls._schedule_episode_automation:
+                await RecordedEpisodeAutomation.enqueue(latest.id)
         if linked_any and linked_series_id is not None:
             # AI 応答の読みを、未設定の Series へだけ保存する (既存値の上書きはしない)。
             await SaveTitleReading(linked_series_id, linked_series_title, title_reading)
@@ -881,10 +987,10 @@ class SeriesAIFallbackTask:
                 linked_normalized_title,
                 linked_series_id,
             )
-            # Series 作成後の既存 Bangumi 照合は従来の合流可能なバックグラウンド経路へ渡す。
-            KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
-            # 同じく Series 作成後の TMDb 照合も、合流可能なバックグラウンド経路へ渡す。
-            KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+            if cls._schedule_external_sync:
+                # 通常の新規 Series は合流可能な短いバックグラウンド同期へ渡す。
+                KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
+                KonomiTVBS4KTmdbClient.scheduleSeriesSync()
 
     @classmethod
     async def _backfillTitleReadings(cls) -> None:

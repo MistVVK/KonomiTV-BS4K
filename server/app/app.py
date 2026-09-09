@@ -498,8 +498,12 @@ async def _RunShutdownCleanup() -> None:
         if scan_stop_succeeded:
             recorded_scan_task = None
 
-    # DB接続が閉じられる前にproducerのシリーズ判定を先に止め、その後に話数判定を停止する。
+    # DB接続が閉じられる前に保守パイプラインを止め、producerのシリーズ判定、話数判定の順に停止する。
     # 逆順では、停止済みの話数ワーカーへSeries側がenqueueして再起動する競合が起こり得る。
+    await RunCleanupStep(
+        '[RecordedSeriesPipeline]',
+        RecordedSeriesRouter.StopRecordedSeriesPipeline(),
+    )
     await RunCleanupStep('[RecordedSeriesResolver]', RecordedSeriesResolver.stop())
     await RunCleanupStep('[SeriesAIFallbackTask]', SeriesAIFallbackTask.stop())
     await RunCleanupStep('[RecordedEpisodeAutomation]', RecordedEpisodeAutomation.stop())

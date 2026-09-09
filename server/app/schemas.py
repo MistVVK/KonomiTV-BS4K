@@ -578,7 +578,7 @@ class AnalysisTaskExecution(BaseModel):
     task_type: Literal[
         'RecordedScan', 'MetadataAnalysis', 'PlaybackIndex', 'ThumbnailGeneration', 'CMAnalysis',
         'CMLogoGeneration', 'BatchScan', 'BatchMetadataReanalysis', 'BatchCMAnalysis',
-        'BatchSeriesResolution', 'BatchEpisodeResolution', 'BackgroundAnalysis',
+        'BatchSeriesResolution', 'BatchEpisodeResolution', 'BatchSeriesPipeline', 'BackgroundAnalysis',
     ]
     status: Literal['Queued', 'Running', 'Succeeded', 'Failed', 'Interrupted', 'Skipped']
     trigger: Literal['Automatic', 'Manual', 'Maintenance', 'StartupBackfill']

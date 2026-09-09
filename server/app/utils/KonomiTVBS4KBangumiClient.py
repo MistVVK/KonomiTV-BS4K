@@ -49,6 +49,10 @@ class _SharedCollectionOwner:
         return self._access_token
 
 
+class BangumiMetadataSyncError(RuntimeError):
+    """pipelineへ認証情報を含めずBangumi同期失敗を通知する。"""
+
+
 class KonomiTVBS4KBangumiClient:
     """KonomiTV の録画番組を Bangumi の条目とエピソードへ照合する。"""
 
@@ -56,7 +60,9 @@ class KonomiTVBS4KBangumiClient:
     COLLECTION_PAGE_SIZE = 100
     EPISODE_PAGE_SIZE = 200
     # scheduleUserCollectionSync() が起動した未完了タスク。完了時に discard する。
-    _sync_tasks: set[asyncio.Task[None]] = set()
+    _sync_tasks: set[asyncio.Task[Any]] = set()
+    # pipeline・scan が await する task は同じ所有集合へ加え、通常 scheduler からは再予約しない。
+    _exclusive_sync_tasks: set[asyncio.Task[Any]] = set()
     # 実行中に再予約されたら、完了後にもう一度だけ收藏同期する。
     _sync_rerun: bool = False
     _subject_merge_locks: dict[int, asyncio.Lock] = {}
@@ -641,9 +647,12 @@ class KonomiTVBS4KBangumiClient:
 
 
     @classmethod
-    async def syncAllLinkedUsers(cls) -> None:
+    async def syncAllLinkedUsers(cls, *, raise_on_error: bool = False) -> None:
         """
         管理者1件の共有 Bangumi 連携があれば收藏一覧をローカル Series へ反映する。
+
+        Args:
+            raise_on_error: 外部API失敗を認証情報を含まない例外として呼び出し元へ伝播するか。
 
         Returns:
             None
@@ -656,10 +665,10 @@ class KonomiTVBS4KBangumiClient:
                 'Skipping collection sync.',
             )
             return
-        owner = cls._sharedCollectionOwner()
-        if owner is None:
-            return
         try:
+            owner = cls._sharedCollectionOwner()
+            if owner is None:
+                return
             matched_series_count = await cls.syncUserCollections(owner)
             logging.info(
                 f'[KonomiTVBS4KBangumiClient][syncAllLinkedUsers] Synchronized shared Bangumi collections. '
@@ -670,6 +679,62 @@ class KonomiTVBS4KBangumiClient:
                 '[KonomiTVBS4KBangumiClient][syncAllLinkedUsers] Failed to synchronize shared Bangumi collections.',
                 exc_info = ex,
             )
+            if raise_on_error:
+                raise BangumiMetadataSyncError(type(ex).__name__) from None
+
+
+    @classmethod
+    def _startExclusiveSync(cls, *, raise_on_error: bool) -> asyncio.Task[None] | None:
+        """awaitされるBangumi同期を通常schedulerと同じ所有集合へ登録する。
+
+        Args:
+            raise_on_error: 外部API失敗を認証情報を含まない例外として呼び出し元へ伝播するか。
+
+        Returns:
+            呼び出し元が完了を待つBangumi同期task。別の同期が実行中ならNone。
+        """
+
+        # 確認から登録までawaitせず、pipeline・scan・通常schedulerの開始競合を防ぐ。
+        if cls.hasRunningSync():
+            return None
+        task = asyncio.create_task(cls.syncAllLinkedUsers(raise_on_error=raise_on_error))
+        cls._sync_tasks.add(task)
+        cls._exclusive_sync_tasks.add(task)
+        task.add_done_callback(cls._sync_tasks.discard)
+        task.add_done_callback(cls._exclusive_sync_tasks.discard)
+        return task
+
+
+    @classmethod
+    def startPipelineSync(cls) -> asyncio.Task[None]:
+        """pipeline用Bangumi同期を通常schedulerと同じ所有集合へ登録する。
+
+        Returns:
+            pipelineが完了を待つBangumi同期task。
+
+        Raises:
+            RuntimeError: 別のBangumi同期がすでに実行中の場合。
+        """
+
+        task = cls._startExclusiveSync(raise_on_error=True)
+        if task is None:
+            raise RuntimeError('BangumiSyncBusy')
+        return task
+
+
+    @classmethod
+    async def syncAfterRecordedScan(cls) -> None:
+        """録画scan後のBangumi同期を共有所有境界内で完了まで待つ。
+
+        Returns:
+            None
+        """
+
+        # pipelineまたは別scanが先に所有していれば、同じ全收藏同期を積み増さない。
+        task = cls._startExclusiveSync(raise_on_error=False)
+        if task is None:
+            return
+        await task
 
 
     @classmethod
@@ -690,7 +755,9 @@ class KonomiTVBS4KBangumiClient:
         if IsBangumiExternalMetadataEnabled() is False:
             return
 
-        # 実行中の同期へ合流し、スキャンから外部 API を待たせない。
+        # pipeline・scan中は積み増さない。通常scheduler同士だけは1回の再実行へ合流する。
+        if any(task.done() is False for task in cls._exclusive_sync_tasks):
+            return
         if any(task.done() is False for task in cls._sync_tasks):
             cls._sync_rerun = True
             return
@@ -712,6 +779,17 @@ class KonomiTVBS4KBangumiClient:
         task = asyncio.create_task(Sync())
         cls._sync_tasks.add(task)
         task.add_done_callback(cls._sync_tasks.discard)
+
+
+    @classmethod
+    def hasRunningSync(cls) -> bool:
+        """Bangumi 收藏同期が起動済みかを返す。
+
+        Returns:
+            新しい同期を開始できない場合は True。
+        """
+
+        return any(task.done() is False for task in cls._sync_tasks)
 
 
     @staticmethod
