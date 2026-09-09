@@ -42,7 +42,13 @@
                     <thead>
                         <tr>
                             <th class="series-episode-list__corner">放送局</th>
-                            <th v-for="column in columns" :key="column.key">{{column.label}}</th>
+                            <template v-for="column in columns" :key="column.key">
+                                <th class="series-episode-list__number-header">{{column.label}}</th>
+                                <th v-if="column.span === 2"
+                                    class="series-episode-list__title-header" :title="column.title ?? undefined">
+                                    {{column.title}}
+                                </th>
+                            </template>
                         </tr>
                     </thead>
                     <tbody>
@@ -55,7 +61,8 @@
                                 </span>
                                 <span class="series-episode-list__channel-name">{{row.channelName}}</span>
                             </th>
-                            <td v-for="column in columns" :key="`${row.channelId}-${column.key}`">
+                            <td v-for="column in columns" :key="`${row.channelId}-${column.key}`"
+                                :colspan="column.span">
                                 <router-link v-if="cellProgram(row.channelId, column.key) !== null"
                                     class="series-episode-list__cell"
                                     :to="`/videos/watch/${cellProgram(row.channelId, column.key)!.id}`"
@@ -81,7 +88,7 @@ import { computed, ref, watch } from 'vue';
 
 import Series, { type ISeries, type ISeriesRecordedProgram } from '@/services/Series';
 import Utils, { dayjs } from '@/utils';
-import { formatRecordedEpisodeLabel, formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
+import { extractValidEpisodeSubtitle, formatRecordedEpisodeLabel, formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
 
 const props = defineProps<{
     seriesId: number;
@@ -96,6 +103,10 @@ let fetchGeneration = 0;
 type MatrixColumn = {
     key: string;
     label: string;
+    /** 構造化話数に紐づく題名。無いときは null とし、話数ラベルへ混ぜない。 */
+    title: string | null;
+    /** 見出しセル数。構造化話数列は 2（話数・題名）で固定し、題名がないときは題名セルを空にする。 */
+    span: 1 | 2;
 };
 
 type MatrixRow = {
@@ -121,11 +132,14 @@ const columns = computed((): MatrixColumn[] => {
         return left.episode_number.localeCompare(right.episode_number, 'en', {numeric: true});
     });
     const seasonCount = new Set(structured.map((episode) => episode.season_number)).size;
-    const structuredColumns = structured.map((episode) => ({
+    const structuredColumns: MatrixColumn[] = structured.map((episode) => ({
         key: `episode:${episode.id}`,
         label: seasonCount > 1
             ? formatRecordedEpisodeLabel(episode.season_number, episode.episode_number)
             : `第${formatRecordedEpisodeNumber(episode.episode_number)}話`,
+        title: episodeTitle(episode.id),
+        // 構造化話数は題名の有無にかかわらず2セルとし、無いときは題名セルを空にする。
+        span: 2 as const,
     }));
 
     // 構造化話数が一部だけ存在する Series でも、話数未確定録画を放送 slot 列として残す。
@@ -142,6 +156,9 @@ const columns = computed((): MatrixColumn[] => {
             slots.set(key, {
                 key,
                 label: subtitleLabel ?? dayjs(program.start_time).format('M/D HH:mm'),
+                // 話数未確定の列は既存どおり副題優先の単独ラベルとし、話数を捏造しない。
+                title: null,
+                span: 1 as const,
                 startTime: dayjs(program.start_time).valueOf(),
                 hasSubtitleLabel: subtitleLabel !== null,
             });
@@ -150,41 +167,32 @@ const columns = computed((): MatrixColumn[] => {
             current.hasSubtitleLabel = true;
         }
     }
-    const unstructuredColumns = [...slots.values()]
+    const unstructuredColumns: MatrixColumn[] = [...slots.values()]
         .sort((left, right) => left.startTime - right.startTime || left.key.localeCompare(right.key))
-        .map(({key, label}) => ({key, label}));
+        .map(({key, label}) => ({key, label, title: null, span: 1 as const}));
 
     return [...structuredColumns, ...unstructuredColumns];
 });
 
-function normalizeComparableLabel(label: string): string {
-    // 幅・空白・大文字小文字だけの差を除き、題名中の意味のある記号は同一性比較でも保持する。
-    return label.normalize('NFKC').toLocaleLowerCase('ja-JP').replace(/\s/gu, '');
-}
-
-function hasMeaningfulLabelContent(label: string): boolean {
-    // variation selector や不可視の書式文字が残っても、文字・数字を含まない装飾だけの値は採用しない。
-    return /[\p{L}\p{N}]/u.test(label.normalize('NFKC'));
+function episodeTitle(episodeId: number): string | null {
+    // 構造化話数に紐づく録画の副題を列の題名にする。複数局にある場合はいずれかの妥当な副題を使う。
+    // 紐づく録画がない列は題名なしとし、話数ラベルへ混ぜない。
+    for (const program of recordedPrograms.value) {
+        if (program.series_episode?.id !== episodeId) continue;
+        const subtitleLabel = validSubtitleLabel(program);
+        if (subtitleLabel !== null) return subtitleLabel;
+    }
+    return null;
 }
 
 function validSubtitleLabel(program: ISeriesRecordedProgram): string | null {
-    const subtitle = program.subtitle?.trim();
-    if (subtitle === undefined) return null;
-    if (hasMeaningfulLabelContent(subtitle) === false) return null;
-    const normalizedSubtitle = normalizeComparableLabel(subtitle);
-
     // Series 表示名と録画側の枠名・作品名を除外し、内容を表す副題だけを列ラベルへ使う。
-    const excludedLabels = [
+    return extractValidEpisodeSubtitle(program.subtitle, [
         series.value?.bangumi_subject_name,
         series.value?.title,
         program.series_title,
         program.title,
-    ];
-    if (excludedLabels.some((label) => label !== null && label !== undefined
-        && normalizeComparableLabel(label) === normalizedSubtitle)) {
-        return null;
-    }
-    return subtitle;
+    ]);
 }
 
 const rows = computed((): MatrixRow[] => {
@@ -343,6 +351,16 @@ watch(() => props.seriesId, fetchSeries, {immediate: true});
     width: 88px;
     min-width: 88px;
     max-width: 88px;
+}
+
+.series-episode-list__title-header {
+    max-width: 140px;
+    overflow: hidden;
+    color: rgb(var(--v-theme-text-darken-1));
+    font-size: 11px;
+    font-weight: normal;
+    white-space: nowrap;
+    text-overflow: ellipsis;
 }
 
 .series-episode-list__channel-logo {

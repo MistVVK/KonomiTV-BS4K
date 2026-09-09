@@ -57,8 +57,10 @@
                     </div>
                     <div class="series-item__info">
                         <div class="series-item__heading">
-                            <div class="series-item__title"
-                                v-html="ProgramUtils.decorateProgramInfo(program, 'title')"></div>
+                            <span v-if="episodeNumberLabel(program) !== ''" class="series-item__episode">
+                                {{episodeNumberLabel(program)}}
+                            </span>
+                            <div class="series-item__title">{{episodeTitle(program)}}</div>
                             <span v-if="isCurrentProgram(program)" class="series-item__current-label">再生中</span>
                         </div>
                         <div class="series-item__meta">
@@ -99,6 +101,7 @@ import Videos, { type IRecordedProgram } from '@/services/Videos';
 import usePlayerStore from '@/stores/PlayerStore';
 import Utils, { dayjs } from '@/utils';
 import { ProgramUtils } from '@/utils/ProgramUtils';
+import { extractValidEpisodeSubtitle, formatRecordedEpisodeLabel, formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
 
 
 export default defineComponent({
@@ -282,6 +285,21 @@ export default defineComponent({
 
         isCurrentProgram(program: IRecordedProgram): boolean {
             return program.id === this.playerStore.recorded_program.id;
+        },
+
+        episodeNumberLabel(program: IRecordedProgram): string {
+            // 正本の構造化話数だけを使い、旧互換 episode_number は参照しない。未確定は何も返さない。
+            const episode = program.series_episode;
+            if (episode === null || episode === undefined) return '';
+            if (episode.season_number === 1) {
+                return `第${formatRecordedEpisodeNumber(episode.episode_number)}話`;
+            }
+            return formatRecordedEpisodeLabel(episode.season_number, episode.episode_number);
+        },
+
+        episodeTitle(program: IRecordedProgram): string {
+            // 題名は話数に紐づく副題だけを使い、元の番組 title へ fallback しない。無いときは空。
+            return extractValidEpisodeSubtitle(program.subtitle, [program.series_title, program.title]) ?? '';
         },
 
         formatDate(start_time: string): string {
@@ -473,6 +491,19 @@ export default defineComponent({
         align-items: flex-start;
         min-width: 0;
         gap: 7px;
+    }
+
+    &__episode {
+        flex-shrink: 0;
+        margin-top: 2px;
+        padding: 2px 5px;
+        border-radius: 3px;
+        color: rgb(var(--v-theme-primary));
+        background: rgba(var(--v-theme-primary), 0.13);
+        font-size: 10.5px;
+        font-weight: bold;
+        line-height: 1.5;
+        white-space: nowrap;
     }
 
     &__title {

@@ -13,8 +13,6 @@ export interface ISeriesEpisode {
 
 /** Series API に限って、構造化話数を含む録画番組情報。 */
 export interface ISeriesRecordedProgram extends IRecordedProgram {
-    /** ローリング更新中の旧サーバー応答ではフィールド自体がない場合がある。 */
-    series_episode?: ISeriesEpisode | null;
     /** 番号付き Episode がない録画の正本シーズン・状態。旧サーバーでは未定義。 */
     episode_resolution?: ISeriesEpisodeResolution | null;
 }

@@ -1,5 +1,6 @@
 
 import type { IAnalysisTaskAccepted } from '@/services/AnalysisTasks';
+import type { ISeriesEpisode } from '@/services/Series';
 import type {
     IKonomiTVBS4KPlaybackVideoProfile,
     KonomiTVBS4KPlaybackAudioCodec,
@@ -319,6 +320,8 @@ export interface IRecordedProgram {
     series_title: string | null;
     episode_number: string | null;
     subtitle: string | null;
+    /** 構造化話数の割当。関連番組など割当付きの応答でのみ入る。旧互換 episode_number の代わりに使う。 */
+    series_episode: ISeriesEpisode | null;
     bangumi_subject_id: number | null;
     bangumi_episode_id: number | null;
     description: string;
@@ -353,6 +356,7 @@ export const IRecordedProgramDefault: IRecordedProgram = {
     series_title: null,
     episode_number: null,
     subtitle: null,
+    series_episode: null,
     bangumi_subject_id: null,
     bangumi_episode_id: null,
     description: '取得中…',
