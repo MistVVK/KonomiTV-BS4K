@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Literal, NotRequired, cast
+from typing import Annotated, Any, Literal, NotRequired, cast
 from uuid import UUID
 
 from pydantic import (
@@ -820,6 +820,18 @@ class RecordedProgram(PydanticModel):
     subtitle: str | None = None  # 番組タイトル解析に成功した場合のみセット
     bangumi_subject_id: int | None = None  # Bangumi 条目との照合に成功した場合のみセット
     bangumi_episode_id: int | None = None  # Bangumi エピソードとの照合に成功した場合のみセット
+    series_episode: SeriesEpisode | None = None  # 構造化話数の割当がある場合のみ設定側で付与する
+
+    @field_validator('series_episode', mode='before')
+    @classmethod
+    def ConvertUnfetchedSeriesEpisode(cls, value: Any) -> Any:
+        # 未 prefetch のリレーションは QuerySet として渡されるため、検証せず null へ倒す。
+        # prefetch 済み ORM・dict・schema はそのまま検証し、欠落だけを null とする。
+        if value is None or isinstance(value, dict):
+            return value
+        if hasattr(value, 'season_number') and hasattr(value, 'episode_number'):
+            return value
+        return None
     description: str = '番組概要を取得できませんでした。'
     detail: dict[str, str] = {}
     start_time: datetime

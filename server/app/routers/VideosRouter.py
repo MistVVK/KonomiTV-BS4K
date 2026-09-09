@@ -961,6 +961,23 @@ async def VideosRelatedAPI(
         return schemas.RecordedPrograms(total=total, recorded_programs=[])
 
     page_result = await VideosAPI(order='ids', page=1, ids=page_ids)
+
+    # 視聴パネルの話数表示用に、構造化 Episode を正本値で付与する (旧互換 episode_number は使わない)。
+    # 共有の VideosAPI 本体には触らず、関連番組の応答だけに必要な 1 回の追加クエリで賄う。
+    programs_with_episodes = await RecordedProgram.filter(id__in=page_ids).select_related('series_episode')
+    series_episodes_by_program_id = {
+        program.id: program.series_episode
+        for program in programs_with_episodes
+        if program.series_episode is not None
+    }
+    for recorded_program in page_result.recorded_programs:
+        series_episode = series_episodes_by_program_id.get(recorded_program.id)
+        if series_episode is not None:
+            recorded_program.series_episode = schemas.SeriesEpisode.model_validate(
+                series_episode,
+                from_attributes=True,
+            )
+
     return schemas.RecordedPrograms(
         total=total,
         recorded_programs=page_result.recorded_programs,
