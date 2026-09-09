@@ -77,7 +77,7 @@
                         <p v-if="item.task.file_path !== null" class="active-analysis-dialog__path">
                             {{item.task.file_path}}
                         </p>
-                        <p v-else class="active-analysis-dialog__no-path">
+                        <p v-else-if="shouldShowMissingPath(item.task)" class="active-analysis-dialog__no-path">
                             対象ファイルはまだ確定していません。
                         </p>
                         <dl>
@@ -109,7 +109,7 @@
 
 import { computed } from 'vue';
 
-import { IAnalysisTaskExecution } from '@/services/AnalysisTasks';
+import { AnalysisTaskType, IAnalysisTaskExecution } from '@/services/AnalysisTasks';
 import useAnalysisTasksStore, {
     BackgroundTaskType,
     backgroundTaskStatusLabel,
@@ -132,6 +132,16 @@ defineEmits<{
 }>();
 
 const analysisTasksStore = useAnalysisTasksStore();
+
+const FILELESS_TASK_TYPES = new Set<AnalysisTaskType>([
+    'BatchScan',
+    'BatchMetadataReanalysis',
+    'BatchCMAnalysis',
+    'BatchSeriesResolution',
+    'BatchEpisodeResolution',
+    'BatchSeriesPipeline',
+    'BackgroundAnalysis',
+]);
 
 const dialogTitle = computed(() => props.taskType === null
     ? '実行中の処理'
@@ -174,6 +184,11 @@ function fileName(filePath: string | null): string | null {
     // Linux と Windows の両方で動作するため、両方のパス区切り文字を扱う。
     const segments = filePath.split(/[\\/]/).filter(segment => segment.length > 0);
     return segments[segments.length - 1] ?? filePath;
+}
+
+function shouldShowMissingPath(task: IAnalysisTaskExecution): boolean {
+    // 単票再検索は BatchEpisodeResolution を共有するため、録画IDがある場合は従来表示を保つ。
+    return task.recorded_video_id !== null || FILELESS_TASK_TYPES.has(task.task_type) === false;
 }
 
 </script>
