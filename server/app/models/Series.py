@@ -16,6 +16,7 @@ from app.schemas import Genre
 
 if TYPE_CHECKING:
     from app.models.RecordedEpisode import SeriesEpisode
+    from app.models.RecordedProgram import RecordedProgram
     from app.models.SeriesBroadcastPeriod import SeriesBroadcastPeriod
 
 
@@ -65,6 +66,7 @@ class Series(TortoiseModel):
     title = fields.TextField()
     description = fields.TextField()
     genres = cast(TortoiseField[list[Genre]], fields.JSONField(default=[], encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
+    recorded_programs: fields.ReverseRelation[RecordedProgram]
     episodes: fields.ReverseRelation[SeriesEpisode]
     broadcast_periods: fields.ReverseRelation[SeriesBroadcastPeriod]
     created_at = fields.DatetimeField(auto_now_add=True)

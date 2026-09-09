@@ -3,6 +3,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, HTTPException, Path, Query, status
 from tortoise.expressions import Q
+from tortoise.functions import Max
 
 from app import logging, schemas
 from app.metadata.SeriesCatalog import (
@@ -44,6 +45,10 @@ async def SeriesListAPI(
         broadcast_periods__recorded_programs__recorded_video__status='Recorded',
     ).distinct()
     series_list = await visible_series_query \
+        .annotate(latest_recorded_start_time=Max(
+            'recorded_programs__start_time',
+            _filter=Q(recorded_programs__recorded_video__status='Recorded'),
+        )) \
         .prefetch_related(
             'episodes',
             'broadcast_periods__channel',
@@ -52,7 +57,10 @@ async def SeriesListAPI(
             'broadcast_periods__recorded_programs__series_episode',
             'broadcast_periods__recorded_programs__episode_resolution',
         ) \
-        .order_by('-updated_at' if order == 'desc' else 'updated_at') \
+        .order_by(
+            '-latest_recorded_start_time' if order == 'desc' else 'latest_recorded_start_time',
+            'id',
+        ) \
         .offset((page - 1) * PAGE_SIZE) \
         .limit(PAGE_SIZE) \
 
@@ -95,6 +103,10 @@ async def SeriesSearchAPI(
         Q(description__icontains=query)
     ).distinct()
     series_list = await visible_series_query \
+        .annotate(latest_recorded_start_time=Max(
+            'recorded_programs__start_time',
+            _filter=Q(recorded_programs__recorded_video__status='Recorded'),
+        )) \
         .prefetch_related(
             'episodes',
             'broadcast_periods__channel',
@@ -103,7 +115,10 @@ async def SeriesSearchAPI(
             'broadcast_periods__recorded_programs__series_episode',
             'broadcast_periods__recorded_programs__episode_resolution',
         ) \
-        .order_by('-updated_at' if order == 'desc' else 'updated_at') \
+        .order_by(
+            '-latest_recorded_start_time' if order == 'desc' else 'latest_recorded_start_time',
+            'id',
+        ) \
         .offset((page - 1) * PAGE_SIZE) \
         .limit(PAGE_SIZE)
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import cast
 
 from tortoise.expressions import Q
+from tortoise.functions import Max
 
 from app.constants import JST
 from app.models.Program import Program
@@ -162,9 +163,15 @@ async def ListSeriesSummaries(
 
     # ソートは全 ID 行を Python 側で行う。NULL の扱いと id の第 2 キーを
     ## DB の方言に寄せず同一条件で保証するため、values() の小さな行集合で完結させる。
-    rows = await VisibleSeriesQuery(query).values(
+    rows = await VisibleSeriesQuery(query).annotate(
+        latest_recorded_start_time=Max(
+            'recorded_programs__start_time',
+            _filter=Q(recorded_programs__recorded_video__status='Recorded'),
+        ),
+    ).values(
         'id',
         'updated_at',
+        'latest_recorded_start_time',
         'title_reading',
         'first_air_date',
         'tmdb_popularity',
@@ -211,14 +218,17 @@ def SortSeriesRows(
     def _id(row: dict[str, object]) -> int:
         return cast(int, row['id'])
 
-    null_rows = [row for row in rows if row[sort] is None]
-    non_null_rows = [row for row in rows if row[sort] is not None]
+    sort_field = 'latest_recorded_start_time' if sort == 'updated_at' else sort
+    null_rows = [row for row in rows if row[sort_field] is None]
+    non_null_rows = [row for row in rows if row[sort_field] is not None]
     # 同一キーの行は常に id 昇順に固定し、安定ソートでページング越しの順序を保つ。
     null_rows.sort(key=_id)
-    non_null_rows.sort(key=lambda row: (row[sort], row['id']))
-    if order == 'desc':
-        # reverse は primary の降順だけに使う。NULL 行は方向に関係なく末尾へ置く。
-        non_null_rows.sort(key=lambda row: (row[sort], row['id']), reverse=True)
+    non_null_rows.sort(key=_id)
+    # Python の安定ソートで primary だけを反転し、第2キーの id は常に昇順を保つ。
+    non_null_rows.sort(
+        key=lambda row: cast(date | datetime | float | str, row[sort_field]),
+        reverse=order == 'desc',
+    )
     return non_null_rows + null_rows
 
 
@@ -242,9 +252,15 @@ async def GetSeriesListPosition(
         int | None: 1 以上のページ番号。一覧に無いとき None。
     """
 
-    rows = await VisibleSeriesQuery(query).values(
+    rows = await VisibleSeriesQuery(query).annotate(
+        latest_recorded_start_time=Max(
+            'recorded_programs__start_time',
+            _filter=Q(recorded_programs__recorded_video__status='Recorded'),
+        ),
+    ).values(
         'id',
         'updated_at',
+        'latest_recorded_start_time',
         'title_reading',
         'first_air_date',
         'tmdb_popularity',

@@ -42,7 +42,7 @@ class RecordedProgram(TortoiseModel):
     service_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     event_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     series: fields.ForeignKeyNullableRelation[Series] = \
-        fields.ForeignKeyField('models.Series', related_name=None, null=True, on_delete=fields.CASCADE)
+        fields.ForeignKeyField('models.Series', related_name='recorded_programs', null=True, on_delete=fields.CASCADE)
     series_id: int | None
     series_broadcast_period: fields.ForeignKeyNullableRelation[SeriesBroadcastPeriod] = \
         fields.ForeignKeyField('models.SeriesBroadcastPeriod', related_name='recorded_programs', null=True, on_delete=fields.CASCADE)
