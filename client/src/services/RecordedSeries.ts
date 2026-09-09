@@ -302,21 +302,11 @@ export default class RecordedSeries {
         return response.data;
     }
 
-    /** 既存録画へ Indexer の確定規則を再適用する。force は無視される。 */
-    static async startBackfill(force = false): Promise<IAnalysisTaskAccepted | null> {
-        const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/backfill', {force});
+    /** 指定範囲の Indexer・AI 補完・外部同期・話数判定を単一履歴で開始する。 */
+    static async startPipeline(scope: 'Unresolved' | 'All'): Promise<IAnalysisTaskAccepted | null> {
+        const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/pipeline', {scope});
         if (response.type === 'error') {
-            APIClient.showGenericError(response, '既存録画のシリーズ判定を開始できませんでした。');
-            return null;
-        }
-        return response.data;
-    }
-
-    /** 既存録画の未確定話数だけを Web 検索する。Indexer 整数は対象外。 */
-    static async startEpisodeBackfill(force = false): Promise<IAnalysisTaskAccepted | null> {
-        const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/episodes/backfill', {force});
-        if (response.type === 'error') {
-            APIClient.showGenericError(response, '既存録画の話数判定を開始できませんでした。');
+            APIClient.showGenericError(response, '録画のシリーズ・話数一括判定を開始できませんでした。');
             return null;
         }
         return response.data;

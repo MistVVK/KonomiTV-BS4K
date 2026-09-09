@@ -141,7 +141,7 @@
                 <div class="settings__item-label">
                     シリーズ・話数・AI 補完の判定データだけをすべて削除します。<br>
                     録画本体・サムネイル・CM 解析・視聴履歴は残り、番組のシリーズ関連付けだけ外れます。<br>
-                    削除後に下の「既存録画へ Indexer を再適用」を実行してシリーズを再構築してください。<br>
+                    削除後に下の「未確定の録画を一括判定」を実行してシリーズを再構築してください。<br>
                     シリーズ AI 補完バッチ・話数一括判定の実行中は削除できません。<br>
                 </div>
             </div>
@@ -153,11 +153,12 @@
                 <span class="ml-2">シリーズデータベースを削除</span>
             </v-btn>
             <div class="settings__item">
-                <div class="settings__item-heading">既存録画へ Indexer を再適用</div>
+                <div class="settings__item-heading">既存録画のシリーズ・話数を一括判定</div>
                 <div class="settings__item-label">
-                    保存済みの全録画へ、シリーズ確定規則を再適用します。<br>
-                    AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで補完します。<br>
-                    付かなければ所属を外します。自動判定が無効のときは実行できません。<br>
+                    確定規則の適用から AI 補完・外部メタデータ同期・話数判定までを順に実行します。<br>
+                    「未確定の録画を一括判定」は未所属・話数未確定の録画だけを処理し、確定済み録画は再評価しません。<br>
+                    「すべての録画を一括再判定」は全録画へ最新規則を再適用し、旧規則で誤って束ねられたシリーズを修正します。<br>
+                    ※AI で確定した所属をやり直す場合は、上の「シリーズデータベースを削除」を実行してから判定してください。<br>
                 </div>
                 <div v-if="series_backfill_unavailable_message !== null"
                     class="settings__item-label mt-2 text-warning">
@@ -165,39 +166,29 @@
                 </div>
             </div>
             <div class="settings__item">
-                <v-btn class="settings__save-button mt-4" color="background-lighten-2" variant="flat"
-                    :loading="is_starting_backfill"
-                    :disabled="is_series_action_running ||
-                        is_series_backfill_available === false"
-                    @click="startBackfill()">
-                    <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="22px" />
-                    既存録画へ規則を再適用
-                </v-btn>
-            </div>
-            <div class="settings__item">
-                <div class="settings__item-heading">既存録画の一括話数判定</div>
-                <div class="settings__item-label">
-                    Series 所属済みで、話数が未処理・ローカル判定で不明・移行データで要確認、および AI 設定変更後の再試行対象となる既存録画を、<br>
-                    保存済みの AI 設定で順番に Web 検索します。<br>
-                    Indexer が単一の正整数を取れた録画は検索しません。<br>
-                </div>
-            </div>
-            <div class="settings__item">
-                <v-progress-linear v-if="is_episode_backfill_running" class="mt-4" color="primary" height="7" rounded
-                    :indeterminate="episode_backfill_progress === null"
-                    :model-value="episode_backfill_progress ?? undefined" />
-                <div v-if="episode_backfill_task !== null" class="settings__item-label mt-2">
-                    {{stageLabel(episode_backfill_task.stage)}}
-                    <template v-if="episode_backfill_progress !== null">
-                        ・{{episode_backfill_progress.toFixed(0)}}%
+                <v-progress-linear v-if="is_pipeline_running" class="mt-4" color="primary" height="7" rounded
+                    :indeterminate="pipeline_progress === null"
+                    :model-value="pipeline_progress ?? undefined" />
+                <div v-if="pipeline_task !== null" class="settings__item-label mt-2">
+                    {{stageLabel(pipeline_task.stage)}}
+                    <template v-if="pipeline_progress !== null">
+                        ・{{pipeline_progress.toFixed(0)}}%
                     </template>
                 </div>
                 <v-btn class="settings__save-button mt-4" color="background-lighten-2" variant="flat"
-                    :loading="is_starting_episode_backfill"
-                    :disabled="is_series_action_running"
-                    @click="startEpisodeBackfill()">
-                    <Icon icon="fluent:globe-search-20-filled" class="mr-2" width="22px" />
-                    既存録画の話数判定を開始
+                    :loading="is_starting_pipeline && series_confirmation_action === 'Unresolved'"
+                    :disabled="is_series_action_running ||
+                        is_series_backfill_available === false"
+                    @click="startPipeline('Unresolved')">
+                    <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="22px" />
+                    未確定の録画を一括判定
+                </v-btn>
+                <v-btn class="settings__save-button mt-4" color="background-lighten-2" variant="flat"
+                    :loading="is_starting_pipeline && series_confirmation_action === 'All'"
+                    :disabled="is_series_action_running || is_series_backfill_available === false"
+                    @click="startPipeline('All')">
+                    <Icon icon="fluent:arrow-sync-20-filled" class="mr-2" width="22px" />
+                    すべての録画を一括再判定
                 </v-btn>
             </div>
         </div>
@@ -316,46 +307,44 @@ const server_log_dialog = ref(false);
 // シリーズ欄の状態。RecordedSeries 画面から移設した一括操作と DB 削除を束ねる。
 const series_indexing_enabled = ref<boolean | null>(null);
 const is_deleting_series_database = ref(false);
-const is_starting_backfill = ref(false);
-const is_starting_episode_backfill = ref(false);
-const is_monitoring_episode_backfill = ref(false);
+const is_starting_pipeline = ref(false);
+const is_monitoring_pipeline = ref(false);
 const is_refreshing_series_status = ref(false);
 const series_status = ref<IRecordedSeriesStatus | null>(null);
-const episode_backfill_task = ref<IAnalysisTaskExecution | null>(null);
+const pipeline_task = ref<IAnalysisTaskExecution | null>(null);
 
-type SeriesConfirmationAction = 'Series' | 'Episode' | 'DeleteDatabase';
+type SeriesPipelineScope = 'Unresolved' | 'All';
+type SeriesConfirmationAction = SeriesPipelineScope | 'DeleteDatabase';
 const series_confirmation_dialog = ref(false);
 const series_confirmation_action = ref<SeriesConfirmationAction | null>(null);
 const series_confirmation_message = ref('');
 
-let episode_backfill_abort_controller: AbortController | null = null;
+let pipeline_abort_controller: AbortController | null = null;
 let series_status_polling_timer: number | null = null;
 
-const is_backfill_running = computed(() =>
-    is_starting_backfill.value || series_status.value?.is_running === true,
-);
-const is_episode_backfill_running = computed(() =>
-    is_starting_episode_backfill.value ||
-    is_monitoring_episode_backfill.value ||
-    series_status.value?.is_episode_running === true,
+const is_pipeline_running = computed(() =>
+    is_starting_pipeline.value ||
+    is_monitoring_pipeline.value ||
+    series_status.value?.is_running === true,
 );
 const is_series_action_running = computed(() =>
     is_deleting_series_database.value ||
-    is_backfill_running.value ||
-    is_episode_backfill_running.value,
+    is_pipeline_running.value ||
+    series_status.value?.is_episode_running === true,
 );
 const is_starting_selected_series_action = computed(() => {
-    if (series_confirmation_action.value === 'Series') return is_starting_backfill.value;
-    if (series_confirmation_action.value === 'Episode') return is_starting_episode_backfill.value;
+    if (series_confirmation_action.value === 'Unresolved' || series_confirmation_action.value === 'All') {
+        return is_starting_pipeline.value;
+    }
     if (series_confirmation_action.value === 'DeleteDatabase') return is_deleting_series_database.value;
     return false;
 });
 const series_confirmation_title = computed(() =>
-    series_confirmation_action.value === 'Episode' ?
-        '既存録画の一括話数判定' :
-        series_confirmation_action.value === 'DeleteDatabase' ?
-            'シリーズデータベースを削除' :
-            '既存録画へ Indexer を再適用',
+    series_confirmation_action.value === 'Unresolved' ?
+        '未確定の録画を一括判定' :
+        series_confirmation_action.value === 'All' ?
+            'すべての録画を一括再判定' :
+            'シリーズデータベースを削除',
 );
 const series_backfill_unavailable_message = computed(() => {
     if (series_indexing_enabled.value === false) {
@@ -364,11 +353,11 @@ const series_backfill_unavailable_message = computed(() => {
     return null;
 });
 const is_series_backfill_available = computed(() => series_backfill_unavailable_message.value === null);
-const episode_backfill_progress = computed(() => {
-    if (episode_backfill_task.value?.progress === null || episode_backfill_task.value?.progress === undefined) {
+const pipeline_progress = computed(() => {
+    if (pipeline_task.value?.progress === null || pipeline_task.value?.progress === undefined) {
         return null;
     }
-    return Math.max(0, Math.min(100, episode_backfill_task.value.progress * 100));
+    return Math.max(0, Math.min(100, pipeline_task.value.progress * 100));
 });
 
 // データベースを更新する関数
@@ -455,7 +444,7 @@ async function refreshSeriesStatus(show_error = false): Promise<void> {
         fetched_status.is_episode_running === false
     ) {
         // 完了・中断を polling で検知したら、監視表示を通常状態へ戻す。
-        is_monitoring_episode_backfill.value = false;
+        is_monitoring_pipeline.value = false;
         stopSeriesStatusPolling();
     }
 }
@@ -477,7 +466,7 @@ function startSeriesDatabaseDelete(): void {
     if (is_series_action_running.value) return;
     series_confirmation_action.value = 'DeleteDatabase';
     series_confirmation_message.value =
-        'シリーズ・話数・AI 補完の判定データをすべて削除します。録画本体・サムネイル・CM 解析・視聴履歴は残ります。削除後に「既存録画へ Indexer を再適用」を実行してください。続行しますか？';
+        'シリーズ・話数・AI 補完の判定データをすべて削除します。録画本体・サムネイル・CM 解析・視聴履歴は残ります。削除後に「未確定の録画を一括判定」を実行してください。続行しますか？';
     series_confirmation_dialog.value = true;
 }
 
@@ -491,20 +480,21 @@ async function runSeriesDatabaseDelete(): Promise<void> {
     await refreshSeriesStatus();
     Message.success(
         `シリーズデータベースを削除しました。（シリーズ ${result.series.toLocaleString()} 件）\n` +
-        '「既存録画へ Indexer を再適用」を実行してシリーズを再構築してください。',
+        '「未確定の録画を一括判定」を実行してシリーズを再構築してください。',
     );
 }
 
-/** 既存録画へ Indexer を再適用する前に、範囲を確認する。 */
-function startBackfill(): void {
+/** シリーズ・話数の一括判定を開始する前に、対象範囲を確認する。 */
+function startPipeline(scope: SeriesPipelineScope): void {
     if (is_series_action_running.value) return;
     if (is_series_backfill_available.value === false) {
         Message.warning('自動判定を有効にしてから既存録画へ規則を再適用してください。');
         return;
     }
-    series_confirmation_action.value = 'Series';
-    series_confirmation_message.value =
-        'シリーズ確定規則を保存済みの全録画へ再適用します。AI が有効なら、付かなかった同一 EPG タイトル群をバックグラウンドで Web 検索します。続行しますか？';
+    series_confirmation_action.value = scope;
+    series_confirmation_message.value = scope === 'Unresolved'
+        ? '未所属または話数未確定の録画を対象に、確定規則の適用・AI 補完・外部同期・話数判定を順に実行します。確定済みの録画は再評価しません。続行しますか？'
+        : '保存済みの全録画へ最新の確定規則を再適用し、AI 補完・外部同期・話数判定を順に実行します。誤って束ねられたシリーズを現在の規則へ寄せて再構築します。続行しますか？';
     series_confirmation_dialog.value = true;
 }
 
@@ -523,72 +513,47 @@ async function confirmSeriesAction(): Promise<void> {
     const action = series_confirmation_action.value;
     if (action === null || is_starting_selected_series_action.value) return;
 
-    if (action === 'Series') {
-        await runBackfill();
-    } else if (action === 'Episode') {
-        await runEpisodeBackfill();
-    } else {
+    if (action === 'DeleteDatabase') {
         await runSeriesDatabaseDelete();
+    } else {
+        await runPipeline(action);
     }
 }
 
-/** 既存録画へ Indexer の確定規則を再適用する。完了まで API 応答を待つ。 */
-async function runBackfill(): Promise<void> {
-
-    is_starting_backfill.value = true;
-    const accepted = await RecordedSeries.startBackfill(false);
-    is_starting_backfill.value = false;
+/** 選択した有限パイプラインを開始し、単一の解析履歴を完了まで監視する。 */
+async function runPipeline(scope: SeriesPipelineScope): Promise<void> {
+    is_starting_pipeline.value = true;
+    const accepted = await RecordedSeries.startPipeline(scope);
+    is_starting_pipeline.value = false;
     if (accepted === null) return;
     updateSeriesConfirmationDialog(false);
-    await refreshSeriesStatus();
-    Message.success('既存録画へ Indexer の規則を再適用しました。');
-}
-
-/** 既存録画の一括話数判定を開始する前に、利用量と検索範囲を確認する。 */
-function startEpisodeBackfill(): void {
-    if (is_series_action_running.value) return;
-    series_confirmation_action.value = 'Episode';
-    series_confirmation_message.value =
-        '話数が未確定の既存録画を、保存済みの AI 設定で Web 検索します。Indexer が単一の正整数を取れた録画は検索しません。続行しますか？';
-    series_confirmation_dialog.value = true;
-}
-
-/** Series所属済みの既存録画を対象に、バックグラウンドで話数Web検索を実行する。 */
-async function runEpisodeBackfill(): Promise<void> {
-
-    is_starting_episode_backfill.value = true;
-    const accepted = await RecordedSeries.startEpisodeBackfill(false);
-    is_starting_episode_backfill.value = false;
-    if (accepted === null) return;
-    updateSeriesConfirmationDialog(false);
-    series_status.value = series_status.value === null ? null : {...series_status.value, is_episode_running: true};
-    is_monitoring_episode_backfill.value = true;
+    series_status.value = series_status.value === null ? null : {...series_status.value, is_running: true};
+    is_monitoring_pipeline.value = true;
     startSeriesStatusPolling();
-    Message.info(
-        accepted.reused ?
-            '実行中の一括話数判定を引き続き監視します。' :
-            '既存録画の一括話数判定を開始しました。',
-    );
+    Message.info(scope === 'Unresolved'
+        ? '未確定の録画の一括判定を開始しました。'
+        : 'すべての録画の一括再判定を開始しました。');
 
-    // シリーズ一括判定とは別の履歴IDを追跡し、進捗と完了通知を混同しない。
-    episode_backfill_abort_controller?.abort();
-    episode_backfill_abort_controller = new AbortController();
+    pipeline_abort_controller?.abort();
+    pipeline_abort_controller = new AbortController();
     const execution = await AnalysisTasks.waitForCompletion(
         accepted.execution_id,
-        episode_backfill_abort_controller.signal,
-        task => episode_backfill_task.value = task,
+        pipeline_abort_controller.signal,
+        task => pipeline_task.value = task,
     );
-    if (episode_backfill_abort_controller.signal.aborted) return;
+    if (pipeline_abort_controller.signal.aborted) return;
 
-    is_monitoring_episode_backfill.value = false;
+    is_monitoring_pipeline.value = false;
     await refreshSeriesStatus();
     if (execution?.status === 'Succeeded') {
-        Message.success('既存録画の一括話数判定が完了しました。');
+        Message.success(scope === 'Unresolved'
+            ? '未確定の録画の一括判定が完了しました。'
+            : 'すべての録画の一括再判定が完了しました。');
     } else if (execution?.status === 'Interrupted') {
-        Message.warning('既存録画の一括話数判定が中断されました。');
+        Message.warning('録画の一括判定が中断されました。');
     } else if (execution !== null) {
         Message.error(
-            `既存録画の一括話数判定に失敗しました。${execution.error_message ? `\n${execution.error_message}` : ''}`,
+            `録画の一括判定に失敗しました。${execution.error_message ? `\n${execution.error_message}` : ''}`,
         );
     }
 }
@@ -601,13 +566,13 @@ onMounted(async () => {
     await refreshSeriesStatus();
     // 開き直し時点で一括判定が実行中なら、既存の polling で追跡を再開する。
     if (series_status.value?.is_running === true || series_status.value?.is_episode_running === true) {
-        is_monitoring_episode_backfill.value = series_status.value.is_episode_running;
+        is_monitoring_pipeline.value = series_status.value.is_running;
         startSeriesStatusPolling();
     }
 });
 
 onUnmounted(() => {
-    episode_backfill_abort_controller?.abort();
+    pipeline_abort_controller?.abort();
     stopSeriesStatusPolling();
 });
 

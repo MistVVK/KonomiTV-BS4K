@@ -32,7 +32,7 @@ export function taskTypeLabel(type: BackgroundTaskType): string {
         ThumbnailGeneration: 'サムネイル生成', CMAnalysis: 'CM区間解析', CMLogoGeneration: 'CMロゴ生成',
         BatchScan: '録画フォルダ一括スキャン', BatchMetadataReanalysis: '全件メタデータ再解析',
         BatchCMAnalysis: '全件CM再判定', BatchSeriesResolution: '既存録画シリーズ一括判定',
-        BatchEpisodeResolution: '既存録画話数一括判定',
+        BatchEpisodeResolution: '既存録画話数一括判定', BatchSeriesPipeline: 'シリーズ・話数一括判定',
         BackgroundAnalysis: 'バックグラウンド一括解析',
         SeriesAIFallback: 'シリーズ AI 補完',
     }[type];
@@ -56,6 +56,8 @@ export function stageLabel(stage: string | null): string {
         IndexingMedia: '共有索引作成中', ChapterAnalyzing: '無音・シーン解析中', LogoAnalyzing: 'ロゴ解析中',
         HardwareFallback: 'CPU解析へ切替中', CombiningCM: 'CM区間統合中',
         Committing: '結果確定中', Processing: '処理中', Saving: '保存中',
+        indexer_rebuild: '確定規則を適用中', ai_fallback: 'シリーズ AI 補完中',
+        external_sync: '外部メタデータ同期中', episode_backfill: '話数判定中',
     } as Record<string, string>)[stage] ?? stage;
 }
 
