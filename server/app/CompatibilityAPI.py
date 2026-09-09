@@ -1,9 +1,11 @@
 import json
+import pathlib
 import re
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import Annotated, Any, Literal, cast
 
+import anyio
 from fastapi import (
     APIRouter,
     Body,
@@ -16,14 +18,16 @@ from fastapi import (
     Response,
     status,
 )
+from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app import schemas
+from app import logging, schemas
 from app.config import Config
 from app.constants import QUALITY_TYPES, VERSION
 from app.models.RecordedProgram import RecordedProgram
+from app.models.RecordedVideo import RecordedVideo
 from app.routers import (
     ChannelsRouter,
     LiveStreamsRouter,
@@ -269,14 +273,39 @@ async def ValidateCompatibilityLiveStreamQuality(
     quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
     display_channel_id: Annotated[str, Depends(LiveStreamsRouter.ValidateChannelID)],
 ) -> StreamQualityWithOptions:
-    """互換 API のライブ出力を旧 AVC / HEVC + AAC 契約へ固定する。"""
+    """互換 API のライブ出力を旧 AVC / HEVC + AAC 契約へ固定し、original だけ passthrough で開く。"""
 
-    # mpeg2toh264 の original は Komorebi V1 互換契約に含まれない
+    # original は GR/BS/CS フルセグ + BS4K + ワンセグに限り、本線と同じ MPEG-TS passthrough で開く。
+    # ラジオと SKY/CATV などは 422 のままにする。
+    # 解決済み quality を直接渡す現行構造のため、本線 ValidateQuality の BS4K/ワンセグ 422 ゲートは通らない。
     if quality == 'original':
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Original quality is not available for compatibility API',
+        original_channel = await LiveStreamsRouter.Channel.filter(
+            display_channel_id = display_channel_id,
+        ).get_or_none()
+        if (
+            original_channel is None or
+            original_channel.is_radiochannel is True or
+            original_channel.type not in ('GR', 'BS', 'CS', 'BS4K')
+        ):
+            logging.error(
+                f'[CompatibilityAPI][ValidateCompatibilityLiveStreamQuality] Original quality is not available for this channel. '
+                f'[display_channel_id: {display_channel_id}]'
+            )
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Original quality is not available for this channel',
+            )
+        original_quality = LiveStreamsRouter.SplitQualityAndEncodingOptions(
+            quality,
+            LiveStreamsRouter.GetEncoderForLiveChannel(display_channel_id),
         )
+        if original_quality is None:
+            # SplitQualityAndEncodingOptions() は original を常に解決するため、通常ここには到達しない
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Specified quality was not found',
+            )
+        return original_quality
 
     # 互換ルートはStream Anchorを使わないため、mainルートのBridge必須能力は検査しない。
     # 品質名から旧 AVC / HEVC + AAC tupleを正規化し、不正品質だけを422で拒否する。
@@ -590,6 +619,160 @@ async def CompatibilityVideoHLSKeepAliveAPI(
         recorded_program,
         stream_quality,
         session_id,
+    )
+
+
+compatibility_videos_router = APIRouter(
+    tags = ['Compatibility - Videos'],
+    prefix = '/api/videos',
+)
+
+
+def CollectCompatibilityDownloadVideoCodecs(recorded_video: RecordedVideo) -> list[str]:
+    """
+    互換 download の判定用に、代表 codec と DB 列挙済みの映像 timeline 全区間の codec を集める。
+
+    代表 codec の欠落・空文字も「不一致」として空文字で返すことで、呼び出し側の許可リスト検査を
+    安全側 (422) に倒す。timeline が存在しない録画では代表 codec だけを返す。
+
+    Args:
+        recorded_video (RecordedVideo): 判定対象の録画ファイル DB レコード。
+
+    Returns:
+        list[str]: 代表 codec と列挙済み全映像区間の codec 値 (欠落は空文字)。
+    """
+
+    codecs: list[str] = []
+
+    # 代表 codec (最長区間の codec)。欠落・空文字は不一致として空文字で返す。
+    if recorded_video.video_codec is not None and str(recorded_video.video_codec).strip() != '':
+        codecs.append(str(recorded_video.video_codec))
+    else:
+        codecs.append('')
+
+    # DB 列挙済みの映像 timeline 全区間。codec の欠落・空文字は不一致として空文字で返す。
+    for entry in recorded_video.video_stream_timeline or []:
+        codec = entry.get('codec')
+        codecs.append(str(codec) if codec is not None and str(codec).strip() != '' else '')
+
+    return codecs
+
+
+def CollectCompatibilityDownloadAudioCodecs(recorded_video: RecordedVideo) -> list[str]:
+    """
+    互換 download の判定用に、DB に列挙済みの副音声・全音声 track / timeline の codec を集める。
+
+    主音声は呼び出し側で必須 AAC 検査済みのため、ここには含めない。
+    値が欠落・空文字・想定外の形状の要素は「不一致」として空文字で返すことで、
+    呼び出し側の AAC 系検査を安全側 (422) に倒す。
+
+    Args:
+        recorded_video (RecordedVideo): 判定対象の録画ファイル DB レコード。
+
+    Returns:
+        list[str]: 副音声と列挙済み全音声の codec 値 (欠落・不正は空文字)。
+    """
+
+    codecs: list[str] = []
+
+    # 副音声 (存在する場合だけ)。None・空文字は「副音声なし」とみなして何も足さない。
+    if recorded_video.secondary_audio_codec is not None and str(recorded_video.secondary_audio_codec).strip() != '':
+        codecs.append(str(recorded_video.secondary_audio_codec))
+
+    # DB 列挙済みの全音声 track。codec の欠落・空文字は不一致として空文字で返す。
+    for track in recorded_video.audio_tracks or []:
+        codec = track.get('codec')
+        codecs.append(str(codec) if codec is not None and str(codec).strip() != '' else '')
+
+    # DB 列挙済みの全音声 timeline 内の track。空の tracks (無音区間) は検査対象にしない。
+    for entry in recorded_video.audio_track_timeline or []:
+        for track in entry.get('tracks') or []:
+            codec = track.get('codec')
+            codecs.append(str(codec) if codec is not None and str(codec).strip() != '' else '')
+
+    return codecs
+
+
+@compatibility_videos_router.get(
+    '/{video_id}/download',
+    summary = '互換録画番組ダウンロード API',
+    response_description = 'TS コンテナ + 放送波コーデックの録画番組ファイル。',
+    response_class = FileResponse,
+    responses = {
+        200: {'content': {'video/mp2t': {}}},
+        422: {'description': 'Specified video_id was not found or the recorded file is not a broadcast TS'},
+    },
+)
+async def CompatibilityVideoDownloadAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+):
+    """
+    TS + 放送波コーデックの録画だけを生ファイルで配信する。
+
+    配信可否は既存の DB メタデータだけで判定し、リクエスト時の ffprobe やファイル走査は行わない。
+    メタデータの欠落・不一致がある録画は安全側で 422 にする。
+    通過時は本線 VideoDownloadAPI と同じ生ファイル配信 (FileResponse、Range 対応) を行う。
+    """
+
+    recorded_video = recorded_program.recorded_video
+    file_path = anyio.Path(recorded_video.file_path)
+    filename = file_path.name
+
+    # 録画ファイルが消えていると FileResponse が 500 になるため、通常ファイルの存在を先に確認する
+    if await file_path.is_file() is False:
+        logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded file was not found. path: {recorded_video.file_path}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified video_id was not found',
+        )
+
+    # TS 系拡張子以外の録画は配信しない
+    if pathlib.Path(filename).suffix.lower() not in ('.ts', '.m2ts'):
+        logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded file is not a transport stream. path: {recorded_video.file_path}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Recorded file is not a transport stream',
+        )
+
+    # 放送波の映像コーデック (MPEG-2 / AVC / HEVC) 以外の録画は配信しない
+    ## 代表 codec だけでなく、DB 列挙済みの映像 timeline 全区間も確認する。
+    ## 生ファイル配信では無視された条件外区間までレスポンスに含まれるため、
+    ## 列挙済み codec が1つでも許可対象外・欠落なら安全側で 422 にする。
+    ## DB には解析世代により 'H.265' 形式と 'hevc' 形式が混在するため、小文字正規化して両方を受け付ける。
+    for video_codec in CollectCompatibilityDownloadVideoCodecs(recorded_video):
+        if video_codec.strip().lower() not in (
+            'mpeg-2', 'mpeg2video', 'mpeg2',
+            'h.264', 'h264', 'avc',
+            'h.265', 'h265', 'hevc',
+        ):
+            logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded video codec is not supported for direct download. codec: {video_codec}')
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Recorded video codec is not supported for direct download',
+            )
+
+    # AAC 系以外の音声を持つ録画は配信しない
+    ## 主音声だけでなく、副音声と DB 列挙済みの全音声 track / timeline も確認する。
+    ## 生ファイル配信では無視された非 AAC stream までレスポンスに含まれるため、
+    ## 列挙済み codec が1つでも AAC 系でなければ安全側で 422 にする。
+    if (recorded_video.primary_audio_codec or '').strip().upper().startswith('AAC') is False:
+        logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded audio codec is not supported for direct download. codec: {recorded_video.primary_audio_codec}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Recorded audio codec is not supported for direct download',
+        )
+    for audio_codec in CollectCompatibilityDownloadAudioCodecs(recorded_video):
+        if audio_codec.strip().upper().startswith('AAC') is False:
+            logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded audio codec is not supported for direct download. codec: {audio_codec}')
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Recorded audio codec is not supported for direct download',
+            )
+
+    return FileResponse(
+        path = str(file_path),
+        filename = filename,
+        media_type = VideosRouter.GetRecordedFileDownloadMediaType(filename),
     )
 
 
@@ -1001,6 +1184,7 @@ def CreateCompatibilityAPI(
     )
     compatibility_app.include_router(compatibility_live_streams_router)
     compatibility_app.include_router(compatibility_video_streams_router)
+    compatibility_app.include_router(compatibility_videos_router)
     compatibility_app.include_router(compatibility_reservations_router)
     compatibility_app.include_router(version_router)
     compatibility_app.include_router(users_router)
