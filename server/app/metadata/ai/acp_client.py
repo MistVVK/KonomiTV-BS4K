@@ -2688,6 +2688,7 @@ async def _run_acp_with_deadline(
     operation: AcpOperation = 'CandidateSelection',
     backend_kind: str = 'AcpCodex',
     trace: _AcpExecutionTrace | None = None,
+    use_provider_execution_slot: bool = True,
 ) -> _AcpSessionResult:
     """Semaphore 待機を含む絶対上限内で、無通信監視付き ACP turn を実行する。
 
@@ -2705,6 +2706,7 @@ async def _run_acp_with_deadline(
         operation: CandidateSelection / SeriesMetadata / EpisodeLookup。
         backend_kind: 固定 ACP preset の識別子。
         trace: 接続試験や失敗診断用の実行トレース。
+        use_provider_execution_slot: provider 単位の同時実行枠を取得するか。
 
     Returns:
         agent の最終出力と Web tool 相関結果。
@@ -2720,7 +2722,7 @@ async def _run_acp_with_deadline(
         # 待ち行列を含む実行全体には固定の最終上限を設ける。通常の長時間推論は
         # 行ごとの無通信タイマーを更新しながら続行できるが、永久占有は許可しない。
         async with asyncio.timeout(_ACP_HARD_TIMEOUT_SEC):
-            async with semaphore:
+            async def RunSession() -> _AcpSessionResult:
                 return await _run_acp_session(
                     command,
                     args,
@@ -2736,6 +2738,10 @@ async def _run_acp_with_deadline(
                     inactivity_timeout_sec=timeout_sec,
                     trace=execution_trace,
                 )
+            if use_provider_execution_slot:
+                async with semaphore:
+                    return await RunSession()
+            return await RunSession()
     except _AcpInactivityTimeoutError:
         # 内側の stdio 無通信は asyncio.timeout() の絶対上限と混同しない。
         # TimeoutError の subclass なので、必ず generic TimeoutError より先に捕捉する。
@@ -2789,6 +2795,7 @@ async def DiscoverAcpModels(
             readable_files=readable_files,
             operation='SeriesMetadata',
             backend_kind=backend_kind,
+            use_provider_execution_slot=False,
         )
     except _AcpHardTimeoutError as ex:
         raise RecordedSeriesAIError(

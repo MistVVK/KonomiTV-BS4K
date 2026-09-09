@@ -14,7 +14,8 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -96,11 +97,78 @@ ACP_OPERATION_LOCKS: dict[KonomiTVBS4KACPImportProvider, asyncio.Lock] = {
     'codex': asyncio.Lock(),
     'grok': asyncio.Lock(),
 }
+class _ACPCredentialOperationLock:
+    """同一 provider の認証読取りを共有し、認証変更だけを排他する。"""
+
+    def __init__(self) -> None:
+        """認証利用数と認証変更状態を空で初期化する。"""
+
+        # Condition は reader 数と writer 状態の確認・更新を同じ境界で直列化する。
+        self._condition = asyncio.Condition()
+        # 推論・モデル広告取得が保持する共有 reader 数。状態 API と変更可否が参照する。
+        self._reader_count = 0
+        # import/delete が保持する writer 状態。新しい reader の開始を止める。
+        self._writer_active = False
+
+    def locked(self) -> bool:
+        """認証を利用中または変更中かを返す。
+
+        Returns:
+            認証変更を開始できない場合は True。
+        """
+
+        return self._writer_active or self._reader_count > 0
+
+    @asynccontextmanager
+    async def read(self) -> AsyncGenerator[None]:
+        """認証変更と排他しながら共有読取り権を保持する。
+
+        Yields:
+            認証を安全に読み取れる区間。
+        """
+
+        async with self._condition:
+            await self._condition.wait_for(lambda: self._writer_active is False)
+            self._reader_count += 1
+        try:
+            yield
+        finally:
+            async with self._condition:
+                self._reader_count -= 1
+                self._condition.notify_all()
+
+    async def tryAcquireWrite(self) -> bool:
+        """待機せず認証変更権を取得する。
+
+        Returns:
+            取得できた場合は True。認証利用中なら False。
+        """
+
+        async with self._condition:
+            if self._writer_active or self._reader_count > 0:
+                return False
+            self._writer_active = True
+            return True
+
+    async def releaseWrite(self) -> None:
+        """保持中の認証変更権を解放する。
+
+        Returns:
+            None
+        """
+
+        async with self._condition:
+            if self._writer_active is False:
+                raise RuntimeError('ACP credential write lock is not held.')
+            self._writer_active = False
+            self._condition.notify_all()
+
+
 # Codex / Grok の可変 credential profile は provider ごとに独立している。
-# 実行中 provider の import/delete だけを止め、別 provider の認証操作を巻き添えにしない。
-ACP_CREDENTIAL_OPERATION_LOCKS: dict[KonomiTVBS4KACPImportProvider, asyncio.Lock] = {
-    'codex': asyncio.Lock(),
-    'grok': asyncio.Lock(),
+# 認証読取りは共有し、実行中 provider の import/delete だけを止める。
+ACP_CREDENTIAL_OPERATION_LOCKS: dict[KonomiTVBS4KACPImportProvider, _ACPCredentialOperationLock] = {
+    'codex': _ACPCredentialOperationLock(),
+    'grok': _ACPCredentialOperationLock(),
 }
 # 公開 facade の実行待ち・credential lock 待機から backend 回収までに適用する絶対上限。
 # acp_client 内部にも同じ上限を残し、facade を経由しない呼出しも有限に保つ。
@@ -164,7 +232,7 @@ async def _RunACPOperationWithDeadline[AcpOperationResult](
         # 取得順序は実行枠→認証の固定順かつ単一 provider のみ。枠跨ぎの入れ子取得も逆順取得も存在しない。
         async with asyncio.timeout_at(effective_deadline):
             async with ACP_OPERATION_LOCKS[credential_provider]:
-                async with ACP_CREDENTIAL_OPERATION_LOCKS[credential_provider]:
+                async with ACP_CREDENTIAL_OPERATION_LOCKS[credential_provider].read():
                     return await operation()
     except TimeoutError as ex:
         raise RecordedSeriesAIError(
@@ -1124,7 +1192,7 @@ def _backend_to_profile_name(
 
 def GetACPCredentialOperationLock(
     provider: KonomiTVBS4KACPImportProvider,
-) -> asyncio.Lock:
+) -> _ACPCredentialOperationLock:
     """指定 provider の実行と認証変更を排他する lock を返す。
 
     Args:
@@ -1153,7 +1221,7 @@ def IsACPOperationRunning() -> bool:
 async def GetAcpModelCatalog(
     backend_kind: Literal['AcpCodex', 'AcpGrok'],
 ) -> AcpModelCatalog:
-    """Codex / Grok ACP のモデル広告を公開 facade の排他境界内で取得する。
+    """Codex / Grok ACP のモデル広告を認証変更と排他的に取得する。
 
     Args:
         backend_kind: モデル広告を取得する ACP backend。
@@ -1176,16 +1244,24 @@ async def GetAcpModelCatalog(
             raise RecordedSeriesAIError('UnsupportedBackend')
         return await backend.getAdvertisedModelCatalog()
 
-    # 広告取得は UI request 内で完結させるため、無通信期限とは別に lock 待機から
-    # process cleanup までを含む短い絶対期限を公開 facade へ適用する。
+    # 広告取得は推論枠を消費しないため provider 実行枠を取らない。
+    ## 認証 import/delete との排他と短い絶対期限は維持し、中途半端な認証読取りと
+    ## 無限待機だけを防ぐ。
     catalog_deadline = (
         asyncio.get_running_loop().time() + _ACP_MODEL_CATALOG_TIMEOUT_SEC
     )
-    return await _RunACPOperationWithDeadline(
-        GetCatalog,
-        _GetACPCredentialProvider(backend_kind),
-        hard_deadline=catalog_deadline,
-    )
+    credential_provider = _GetACPCredentialProvider(backend_kind)
+    assert credential_provider is not None
+    started_at = time.monotonic()
+    try:
+        async with asyncio.timeout_at(catalog_deadline):
+            async with ACP_CREDENTIAL_OPERATION_LOCKS[credential_provider].read():
+                return await GetCatalog()
+    except TimeoutError as ex:
+        raise RecordedSeriesAIError(
+            'HardTimeout',
+            latency_ms=int((time.monotonic() - started_at) * 1000),
+        ) from ex
 
 
 def _GetACPCredentialProvider(

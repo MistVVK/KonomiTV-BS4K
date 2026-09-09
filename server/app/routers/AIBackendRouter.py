@@ -1449,6 +1449,32 @@ def _ACPBackendConnectionTestPreflightError(
     return None
 
 
+def _ACPBackendAuthenticationPreflightError(
+    backend_kind: Literal['AcpCodex', 'AcpGrok'],
+) -> tuple[str, str] | None:
+    """モデル広告取得前に、対象 ACP の認証有無だけを確認する。
+
+    Args:
+        backend_kind: モデル広告取得対象の ACP バックエンド種別。
+
+    Returns:
+        認証がなければ固定エラーコードと理由。取得可能なら None。
+    """
+
+    credential_status = KonomiTVBS4KACPCredentials.getStatus()
+    if backend_kind == 'AcpCodex' and credential_status.codex_auth_imported is False:
+        return (
+            'ACPAuthenticationUnavailable',
+            'Codex 認証が未取り込みのためモデル候補を取得できません。',
+        )
+    if backend_kind == 'AcpGrok' and credential_status.grok_auth_imported is False:
+        return (
+            'ACPAuthenticationUnavailable',
+            'Grok Build 認証が未取り込みのためモデル候補を取得できません。',
+        )
+    return None
+
+
 def _ACPBackendNotRunEpisodeLookupConnectionChecks(
     message: str,
 ) -> ACPBackendEpisodeLookupConnectionChecksResponse:
@@ -1549,23 +1575,16 @@ async def _GetACPModelCatalogResponse(
         ACP agent が広告したモデル一覧と現在値。
 
     Raises:
-        HTTPException: 認証未取り込み、ACP 実行中、または広告取得失敗の場合。
+        HTTPException: 認証未取り込み、または広告取得失敗の場合。
     """
 
-    # モデル広告も ACP process を起動するため、接続試験と同じ認証・直列実行条件を守る。
-    preflight_error = _ACPBackendConnectionTestPreflightError(backend_kind)
+    # モデル広告は推論を行わないため、認証だけ確認して provider 実行中でも許可する。
+    preflight_error = _ACPBackendAuthenticationPreflightError(backend_kind)
     if preflight_error is not None:
-        error_code, _ = preflight_error
-        if error_code == 'ACPAuthenticationUnavailable':
-            provider_name = 'Codex' if backend_kind == 'AcpCodex' else 'Grok'
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f'{provider_name} ACP authentication is unavailable.',
-                headers=NO_STORE_HEADERS,
-            )
+        provider_name = 'Codex' if backend_kind == 'AcpCodex' else 'Grok'
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail='Another ACP operation is running.',
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f'{provider_name} ACP authentication is unavailable.',
             headers=NO_STORE_HEADERS,
         )
 
@@ -1737,10 +1756,9 @@ async def ACPBackendCredentialImportAPI(
 
     response.headers.update(NO_STORE_HEADERS)
     credential_lock = GetACPCredentialOperationLock(provider)
-    # 同じ provider の AI が認証を読んでいる場合、最大60分の終了待ちを API に持ち込まない。
-    if credential_lock.locked():
+    # 同じ provider の AI が認証を読んでいる場合、終了待ちを API に持ち込まない。
+    if await credential_lock.tryAcquireWrite() is False:
         raise _ACPBackendCredentialInUseHTTPException()
-    await credential_lock.acquire()
     try:
         try:
             KonomiTVBS4KACPCredentials.importProviderAuth(provider)
@@ -1754,7 +1772,7 @@ async def ACPBackendCredentialImportAPI(
             backend_kind='AcpCodex' if provider == 'codex' else 'AcpGrok',
         )
     finally:
-        credential_lock.release()
+        await credential_lock.releaseWrite()
     return _ACPBackendCredentialStatusResponse()
 
 
@@ -1787,9 +1805,8 @@ async def ACPBackendCredentialDeleteAPI(
     response.headers.update(NO_STORE_HEADERS)
     credential_lock = GetACPCredentialOperationLock(provider)
     # 削除も import と同じく、実行中世代を壊さず即時に競合を通知する。
-    if credential_lock.locked():
+    if await credential_lock.tryAcquireWrite() is False:
         raise _ACPBackendCredentialInUseHTTPException()
-    await credential_lock.acquire()
     try:
         try:
             KonomiTVBS4KACPCredentials.deleteProviderAuth(provider)
@@ -1802,7 +1819,7 @@ async def ACPBackendCredentialDeleteAPI(
             backend_kind='AcpCodex' if provider == 'codex' else 'AcpGrok',
         )
     finally:
-        credential_lock.release()
+        await credential_lock.releaseWrite()
     return _ACPBackendCredentialStatusResponse()
 
 
