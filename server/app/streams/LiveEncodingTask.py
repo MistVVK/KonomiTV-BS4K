@@ -1526,12 +1526,15 @@ class LiveEncodingTask:
             # aiohttp.StreamReader の __aiter__ は readline (\n 区切り) のため、生 TLV を渡すと
             # 64KB を超える改行の無い入力で LineTooLong になり壊れる。iter_chunked で生バイト列を渡す。
             rain_service_id = self.RAIN_FALLBACK_SERVICE_IDS.get((channel.network_id, channel.service_id))
-            assert self.live_stream.quality != 'original'
-            need_rain_fallback = (
-                self.live_stream.encoding_options.use_rain_fallback is True and
-                QUALITY[self.live_stream.quality].height <= 1080 and
-                rain_service_id is not None
-            )
+            if self.live_stream.quality == 'original':
+                # original は主階層だけを素通しし、降雨対応の低階層切替は行わない
+                need_rain_fallback = False
+            else:
+                need_rain_fallback = (
+                    self.live_stream.encoding_options.use_rain_fallback is True and
+                    QUALITY[self.live_stream.quality].height <= 1080 and
+                    rain_service_id is not None
+                )
             resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
                 response.content.iter_chunked(64 * 1024),
                 channel.service_id,
@@ -2046,10 +2049,72 @@ class LiveEncodingTask:
             encoder_environment = RecordedPlaybackBackend.getEnvironment(ffmpeg8_encoder_type)
             encoder_stdin = asyncio.subprocess.PIPE if is_mmt_tlv is True else tsreadex_read_pipe
 
+            # BS4K のオリジナル画質 ("original") は MMT/TLV 入力のため、そのままでは MPEG-TS として素通しできない。
+            # FFmpeg 8 の libaribtlv で TS へ多重化し直すだけの無変換プロセスを「エンコーダー」として起動する
+            # (再エンコード・tsreadex・TS Codec Bridge なし)。
+            if is_original_quality is True and is_mmt_tlv is True:
+                if tlv_main_video_packet_id is None or tlv_main_audio_packet_id is None:
+                    raise RuntimeError('MMT/TLV main video/audio packet IDs are not resolved.')
+                # -map 0:i:<packet_id> は context を跨いでマッチするため、通常モードの除外 context だけを
+                # 後ろの負の metadata map で除外する (original は降雨対応の低階層を使わない)。
+                tlv_original_copy_options = [
+                    '-fflags', 'nobuffer',
+                    '-f', 'libaribtlv',
+                    '-max_audio_channels', str(self.ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS),
+                    *(
+                        [
+                            '-probesize',
+                            f'{round(CONFIG.general.encoder_bs4k_input_probesize + (self._retry_count * 500))}K',
+                        ]
+                        if CONFIG.general.encoder_bs4k_input_analysis_enabled is True else []
+                    ),
+                    '-analyzeduration', str(round(
+                        (CONFIG.general.encoder_bs4k_input_analyze * 1_000_000) +
+                        (self._retry_count * 200_000),
+                    )),
+                    '-i', 'pipe:0',
+                    '-ignore_unknown',
+                    '-map', f'0:i:{tlv_main_video_packet_id}',
+                    '-map', f'0:i:{tlv_main_audio_packet_id}',
+                    '-map', '0:d?',
+                    *(
+                        option
+                        for excluded_context_id in tlv_normal_excluded_context_ids
+                        for option in ('-map', f'-0:m:context_id:{excluded_context_id}')
+                    ),
+                    '-c', 'copy',
+                    '-max_delay', '250000',
+                    '-max_interleave_delta', f'{round(CONFIG.general.encoder_bs4k_max_interleave_delta + (self._retry_count * 100))}K',
+                    '-flush_packets', '1',
+                    '-y',
+                    '-f', 'mpegts',
+                    'pipe:1',
+                ]
+                logging.info(
+                    f'{self.live_stream.log_prefix} FFmpeg 8 Commands (Original MMT/TLV transmux):\n'
+                    f'{encoder_executable} {" ".join(tlv_original_copy_options)}'
+                )
+
+                # エンコーダープロセスを非同期で作成・実行
+                try:
+                    encoder = await asyncio.subprocess.create_subprocess_exec(
+                        encoder_executable,
+                        *tlv_original_copy_options,
+                        stdin = encoder_stdin,  # 同期済み TLV からの入力
+                        stdout = encoder_stdout,  # ストリーム出力へ接続
+                        stderr = asyncio.subprocess.DEVNULL,  # original は EncoderObServer を起動しないため読まない
+                        env = encoder_environment,
+                    )
+                finally:
+                    # tsreadex は TLV 経路では起動しないため閉じるパイプはない
+                    if tsreadex_read_pipe is not None:
+                        os.close(tsreadex_read_pipe)
+                        tsreadex_read_pipe = None
+
             # オリジナル画質 ("original") 指定時のみ、Python で単に左から右にパイプで流すだけの無変換プロセスを「エンコーダー」として起動する
             ## KonomiTV の既存ロジックはエンコーダーレスで配信することを想定した設計になっておらず、
             ## エンコーダーに相当するプロセスがないと特別な条件分岐を大量追加する必要が出てくるため、当面この方向で対応する
-            if is_original_quality is True:
+            elif is_original_quality is True:
                 copy_script = (
                     'import os\n'
                     'while True:\n'
