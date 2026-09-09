@@ -43,11 +43,13 @@
                         <tr>
                             <th class="series-episode-list__corner">放送局</th>
                             <template v-for="column in columns" :key="column.key">
-                                <th class="series-episode-list__number-header">{{column.label}}</th>
-                                <th v-if="column.span === 2"
-                                    class="series-episode-list__title-header" :title="column.title ?? undefined">
-                                    {{column.title}}
+                                <th v-if="isStructuredColumn(column)">
+                                    <span class="series-episode-list__column-number">{{column.label}}</span>
+                                    <span class="series-episode-list__column-title" :title="column.title ?? undefined">
+                                        {{column.title}}
+                                    </span>
                                 </th>
+                                <th v-else>{{column.label}}</th>
                             </template>
                         </tr>
                     </thead>
@@ -61,8 +63,7 @@
                                 </span>
                                 <span class="series-episode-list__channel-name">{{row.channelName}}</span>
                             </th>
-                            <td v-for="column in columns" :key="`${row.channelId}-${column.key}`"
-                                :colspan="column.span">
+                            <td v-for="column in columns" :key="`${row.channelId}-${column.key}`">
                                 <router-link v-if="cellProgram(row.channelId, column.key) !== null"
                                     class="series-episode-list__cell"
                                     :to="`/videos/watch/${cellProgram(row.channelId, column.key)!.id}`"
@@ -103,10 +104,8 @@ let fetchGeneration = 0;
 type MatrixColumn = {
     key: string;
     label: string;
-    /** 構造化話数に紐づく題名。無いときは null とし、話数ラベルへ混ぜない。 */
+    /** 構造化話数に紐づく題名。無いときは null とし、題名段を空にする（話数段へ混ぜない）。 */
     title: string | null;
-    /** 見出しセル数。構造化話数列は 2（話数・題名）で固定し、題名がないときは題名セルを空にする。 */
-    span: 1 | 2;
 };
 
 type MatrixRow = {
@@ -138,8 +137,6 @@ const columns = computed((): MatrixColumn[] => {
             ? formatRecordedEpisodeLabel(episode.season_number, episode.episode_number)
             : `第${formatRecordedEpisodeNumber(episode.episode_number)}話`,
         title: episodeTitle(episode.id),
-        // 構造化話数は題名の有無にかかわらず2セルとし、無いときは題名セルを空にする。
-        span: 2 as const,
     }));
 
     // 構造化話数が一部だけ存在する Series でも、話数未確定録画を放送 slot 列として残す。
@@ -158,7 +155,6 @@ const columns = computed((): MatrixColumn[] => {
                 label: subtitleLabel ?? dayjs(program.start_time).format('M/D HH:mm'),
                 // 話数未確定の列は既存どおり副題優先の単独ラベルとし、話数を捏造しない。
                 title: null,
-                span: 1 as const,
                 startTime: dayjs(program.start_time).valueOf(),
                 hasSubtitleLabel: subtitleLabel !== null,
             });
@@ -169,10 +165,15 @@ const columns = computed((): MatrixColumn[] => {
     }
     const unstructuredColumns: MatrixColumn[] = [...slots.values()]
         .sort((left, right) => left.startTime - right.startTime || left.key.localeCompare(right.key))
-        .map(({key, label}) => ({key, label, title: null, span: 1 as const}));
+        .map(({key, label}) => ({key, label, title: null}));
 
     return [...structuredColumns, ...unstructuredColumns];
 });
+
+function isStructuredColumn(column: MatrixColumn): boolean {
+    // 構造化話数列だけを見出し2段（話数・題名）にし、未確定 slot 列は既存の単独ラベルのままにする。
+    return column.key.startsWith('episode:');
+}
 
 function episodeTitle(episodeId: number): string | null {
     // 構造化話数に紐づく録画の副題を列の題名にする。複数局にある場合はいずれかの妥当な副題を使う。
@@ -353,8 +354,14 @@ watch(() => props.seriesId, fetchSeries, {immediate: true});
     max-width: 88px;
 }
 
-.series-episode-list__title-header {
+.series-episode-list__column-number {
+    display: block;
+}
+
+.series-episode-list__column-title {
+    display: block;
     max-width: 140px;
+    margin: 2px auto 0;
     overflow: hidden;
     color: rgb(var(--v-theme-text-darken-1));
     font-size: 11px;
