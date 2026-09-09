@@ -45,6 +45,13 @@
                     class="series-item" :class="{'series-item--current': isCurrentProgram(program)}"
                     :to="`/videos/watch/${program.id}`" :aria-current="isCurrentProgram(program) ? 'page' : undefined"
                     role="listitem">
+                    <div v-if="episodeNumberLabel(program) !== ''" class="series-item__episode">
+                        {{episodeNumberLabel(program)}}
+                    </div>
+                    <div class="series-item__heading">
+                        <div class="series-item__title">{{episodeTitle(program)}}</div>
+                        <span v-if="isCurrentProgram(program)" class="series-item__current-label">再生中</span>
+                    </div>
                     <div class="series-item__thumbnail">
                         <img class="series-item__thumbnail-image" decoding="async" loading="lazy"
                             :src="`${Utils.api_base_url}/videos/${program.id}/thumbnail`" alt="">
@@ -55,23 +62,14 @@
                             録画中
                         </div>
                     </div>
-                    <div class="series-item__info">
-                        <div class="series-item__heading">
-                            <span v-if="episodeNumberLabel(program) !== ''" class="series-item__episode">
-                                {{episodeNumberLabel(program)}}
-                            </span>
-                            <div class="series-item__title">{{episodeTitle(program)}}</div>
-                            <span v-if="isCurrentProgram(program)" class="series-item__current-label">再生中</span>
-                        </div>
-                        <div class="series-item__meta">
-                            <div v-if="program.channel !== null" class="series-item__channel">
-                                <div class="series-item__channel-logo">
-                                    <img loading="lazy" :src="`${Utils.api_base_url}/channels/${program.channel.id}/logo`" alt="">
-                                </div>
-                                <span>{{program.channel.name}}</span>
+                    <div class="series-item__meta">
+                        <div v-if="program.channel !== null" class="series-item__channel">
+                            <div class="series-item__channel-logo">
+                                <img loading="lazy" :src="`${Utils.api_base_url}/channels/${program.channel.id}/logo`" alt="">
                             </div>
-                            <span class="series-item__date">{{formatDate(program.start_time)}}</span>
+                            <span>{{program.channel.name}}</span>
                         </div>
+                        <span class="series-item__date">{{formatDate(program.start_time)}}</span>
                     </div>
                 </router-link>
             </div>
@@ -395,9 +393,9 @@ export default defineComponent({
 
 .series-item {
     display: flex;
-    min-height: 104px;
+    flex-direction: column;
     padding: 10px;
-    gap: 12px;
+    gap: 8px;
     border-radius: 6px;
     color: rgb(var(--v-theme-text));
     background: rgb(var(--v-theme-background-lighten-1));
@@ -405,9 +403,8 @@ export default defineComponent({
     transition: background-color 0.15s, transform 0.15s;
     user-select: none;
     @include smartphone-vertical {
-        min-height: 80px;
         padding: 8px;
-        gap: 9px;
+        gap: 7px;
     }
 
     &:hover {
@@ -423,16 +420,12 @@ export default defineComponent({
 
     &__thumbnail {
         position: relative;
-        flex-shrink: 0;
-        width: 120px;
+        width: 100%;
         height: auto;
         aspect-ratio: 16 / 9;
         border-radius: 4px;
         background: rgb(var(--v-theme-background));
         overflow: hidden;
-        @include smartphone-vertical {
-            width: 100px;
-        }
     }
 
     &__thumbnail-image {
@@ -477,15 +470,6 @@ export default defineComponent({
         background: #fff;
     }
 
-    &__info {
-        display: flex;
-        justify-content: space-between;
-        flex-direction: column;
-        min-width: 0;
-        flex-grow: 1;
-        gap: 6px;
-    }
-
     &__heading {
         display: flex;
         align-items: flex-start;
@@ -494,8 +478,7 @@ export default defineComponent({
     }
 
     &__episode {
-        flex-shrink: 0;
-        margin-top: 2px;
+        align-self: flex-start;
         padding: 2px 5px;
         border-radius: 3px;
         color: rgb(var(--v-theme-primary));
