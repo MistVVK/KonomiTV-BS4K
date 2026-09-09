@@ -124,13 +124,25 @@ const recordedPrograms = computed(() => {
 });
 
 const columns = computed((): MatrixColumn[] => {
-    const structured = [...(series.value?.episodes ?? [])].sort((left, right) => {
-        if (left.season_number !== right.season_number) {
-            return left.season_number - right.season_number;
+    // 紐づく録画があるシーズンだけを列にする。録画が1本もないシーズンは枠ごと出さない。
+    // 録画があるシーズン内の未録画話は既存の未録画セルのまま残す。
+    const recordedSeasonNumbers = new Set<number>();
+    for (const program of recordedPrograms.value) {
+        const seasonNumber = program.series_episode?.season_number;
+        if (seasonNumber !== null && seasonNumber !== undefined) {
+            recordedSeasonNumbers.add(seasonNumber);
         }
-        return left.episode_number.localeCompare(right.episode_number, 'en', {numeric: true});
-    });
-    const seasonCount = new Set(structured.map((episode) => episode.season_number)).size;
+    }
+    // シーズン数は除外前の全話数で数え、残った1シーズンだけでも既存の S 接頭辞を維持する。
+    const seasonCount = new Set((series.value?.episodes ?? []).map((episode) => episode.season_number)).size;
+    const structured = [...(series.value?.episodes ?? [])]
+        .filter((episode) => recordedSeasonNumbers.has(episode.season_number))
+        .sort((left, right) => {
+            if (left.season_number !== right.season_number) {
+                return left.season_number - right.season_number;
+            }
+            return left.episode_number.localeCompare(right.episode_number, 'en', {numeric: true});
+        });
     const structuredColumns: MatrixColumn[] = structured.map((episode) => ({
         key: `episode:${episode.id}`,
         label: seasonCount > 1
