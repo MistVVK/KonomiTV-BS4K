@@ -234,6 +234,8 @@ class PlayerController {
     // Bangumi 看過 API の多重送信防止。完了・対象外が返ったら同じセッションでは再送しない
     private bangumi_playback_progress_in_flight = false;
     private bangumi_playback_progress_completed = false;
+    // グローバル設定同期に依存せず、再生中のユーザーについてサーバーの送信設定を1回取得したことを保持する
+    private bangumi_watch_history_sync_user_id: number | null = null;
 
     // シーク操作で直接末尾へ移動したときに、自然な完走として扱わないためのフラグ
     // シーク後に末尾より前へ戻った時点、または CM 自動スキップと確認できた時点で解除する
@@ -426,11 +428,12 @@ class PlayerController {
 
 
     /**
-     * 録画再生位置を Bangumi 看過 API へ送る。オフライン再生と未連携では送らない。
+     * 録画再生位置を Bangumi 看過 API へ送る。設定無効・オフライン再生・未連携では送らない。
      * @param playback_position プレイヤーが解決した再生位置 (秒)
      */
     private async sendBangumiPlaybackProgress(playback_position: number): Promise<void> {
         const player_store = usePlayerStore();
+        const settings_store = useSettingsStore();
         const user_store = useUserStore();
         if (
             this.playback_mode !== 'Video' ||
@@ -441,12 +444,23 @@ class PlayerController {
         ) {
             return;
         }
+        const current_user_id = user_store.user.id;
         const recorded_program = player_store.recorded_program;
         if (recorded_program.id < 0) {
             return;
         }
         this.bangumi_playback_progress_in_flight = true;
         try {
+            // グローバルな設定同期が無効でも、再生セッションごとの初回判定ではサーバーの保存値を正とする。
+            if (this.bangumi_watch_history_sync_user_id !== current_user_id) {
+                const enabled = await Bangumi.fetchWatchHistorySyncSetting(false);
+                if (enabled === null || user_store.user?.id !== current_user_id) {
+                    return;
+                }
+                settings_store.settings.bangumi_watch_history_sync = enabled;
+                this.bangumi_watch_history_sync_user_id = current_user_id;
+            }
+            if (settings_store.settings.bangumi_watch_history_sync !== true) return;
             const result = await Bangumi.updatePlaybackProgress(
                 recorded_program.id,
                 {

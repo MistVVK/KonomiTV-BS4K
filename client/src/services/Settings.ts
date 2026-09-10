@@ -70,6 +70,7 @@ export interface IClientSettings {
     series_home_sort_key: SeriesHomeSortKey;
     series_home_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
+    bangumi_watch_history_sync: boolean;
     // konomitv_bs4k_offline_video_streaming_quality: 同期無効
     // konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
     // konomitv_bs4k_offline_video_codec: 同期無効

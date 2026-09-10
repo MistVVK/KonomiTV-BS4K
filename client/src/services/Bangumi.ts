@@ -86,6 +86,38 @@ class Bangumi {
 
 
     /**
+     * サーバーに保存された Bangumi 視聴履歴送信設定を取得する
+     * @param show_error 通信失敗時にトーストを出すか
+     * @returns 送信設定。通信失敗時は null
+     */
+    static async fetchWatchHistorySyncSetting(show_error: boolean = true): Promise<boolean | null> {
+        const response = await APIClient.get<boolean>('/bangumi/watch-history-sync');
+        if (response.type === 'error') {
+            if (show_error) {
+                APIClient.showGenericError(response, 'Bangumi の視聴履歴送信設定を取得できませんでした。');
+            }
+            return null;
+        }
+        return response.data;
+    }
+
+
+    /**
+     * Bangumi 視聴履歴送信設定をサーバーへ保存する
+     * @param enabled 録画の視聴完了を Bangumi へ送信するか
+     * @returns 保存に成功した場合は true
+     */
+    static async updateWatchHistorySyncSetting(enabled: boolean): Promise<boolean> {
+        const response = await APIClient.put('/bangumi/watch-history-sync', {enabled});
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'Bangumi の視聴履歴送信設定を更新できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+
+    /**
      * 録画番組の再生進捗を送信し、バックエンドで Bangumi の視聴完了を判定する
      * @param video_id 録画番組 ID
      * @param progress_request プレイヤーが解決した再生位置と録画時間

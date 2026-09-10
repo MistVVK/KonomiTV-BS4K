@@ -200,6 +200,7 @@ export interface ILocalClientSettings extends IClientSettings {
     series_home_sort_key: SeriesHomeSortKey;
     series_home_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
+    bangumi_watch_history_sync: boolean;
     konomitv_bs4k_offline_video_streaming_quality: VideoStreamingQuality;
     konomitv_bs4k_offline_video_streaming_quality_for_bs4k: BS4KLiveStreamingQuality;
     konomitv_bs4k_offline_video_codec: KonomiTVBS4KPlaybackVideoCodec;
@@ -424,6 +425,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     // 視聴履歴の保持件数 (Default: 50件)
     // この値を超えると、最も古い視聴履歴から自動的に削除される
     video_watched_history_max_count: 50,
+    // 録画の視聴完了を Bangumi (bgm.tv) へ送信する (Default: オフ)
+    bangumi_watch_history_sync: false,
 
     // ***** 設定 → 画質 *****
 
@@ -684,6 +687,7 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'series_home_sort_key',
     'series_home_sort_direction',
     'video_watched_history_max_count',
+    'bangumi_watch_history_sync',
     // konomitv_bs4k_offline_video_streaming_quality: 同期無効
     // konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
     // konomitv_bs4k_offline_video_codec: 同期無効

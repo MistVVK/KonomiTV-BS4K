@@ -355,6 +355,21 @@
                     管理者が登録した1件の個人アクセストークンを使い、各ユーザーの録画視聴完了を共有 Bangumi アカウントへ視聴済みとして反映します。<br>
                     トークンはサーバーへ暗号化して保存され、クライアントには返りません。<br>
                 </div>
+                <div class="settings__item settings__item--switch">
+                    <label class="settings__item-heading" for="bangumi_watch_history_sync">
+                        録画の視聴完了を Bangumi (bgm.tv) へ送信する
+                    </label>
+                    <label class="settings__item-label" for="bangumi_watch_history_sync">
+                        有効にすると、録画の視聴完了時に、連携済みの共有 Bangumi (bgm.tv) アカウントへエピソードを「視聴済み」として送信します。<br>
+                        無効（既定）にしても視聴履歴が送信されないだけで、アカウント連携やシリーズ・話数のメタデータ照合には影響しません。<br>
+                        この設定は KonomiTV アカウント設定として保存され、設定同期により端末間で共有されます。<br>
+                    </label>
+                    <v-switch id="bangumi_watch_history_sync" class="settings__item-switch" color="primary" hide-details
+                        :model-value="settingsStore.settings.bangumi_watch_history_sync"
+                        :loading="is_saving_bangumi_watch_history_sync"
+                        :disabled="is_bangumi_watch_history_sync_loaded === false || is_saving_bangumi_watch_history_sync"
+                        @update:model-value="updateBangumiWatchHistorySync" />
+                </div>
                 <div class="bangumi-account bangumi-account--anonymous" v-if="bangumi_profile === null || bangumi_profile.bangumi_user_id === null">
                     <div class="bangumi-account__info">
                         <div class="bangumi-account__info-name">Bangumi アカウントと連携していません</div>
@@ -445,6 +460,7 @@ import RecordedSeries, {
     type IRecordedSeriesSettingsUpdate,
     type IRecordedSeriesStatus,
 } from '@/services/RecordedSeries';
+import useSettingsStore from '@/stores/SettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils, { dayjs } from '@/utils';
 import SettingsBase from '@/views/Settings/Base.vue';
@@ -539,6 +555,8 @@ const bangumi_link_dialog = ref(false);
 const bangumi_access_token = ref('');
 const bangumi_token_showing = ref(false);
 const bangumi_linking = ref(false);
+const is_bangumi_watch_history_sync_loaded = ref(false);
+const is_saving_bangumi_watch_history_sync = ref(false);
 // TMDb API キーは本体を取得できないため、入力ダイアログの値とマスク表示だけを画面で持つ。
 const tmdb_key_dialog = ref(false);
 const tmdb_api_key = ref('');
@@ -549,6 +567,7 @@ const is_testing_tmdb_connection = ref(false);
 const tmdb_connection_test_message = ref('');
 
 const is_form_dense = Utils.isSmartphoneHorizontal();
+const settingsStore = useSettingsStore();
 const user_store = useUserStore();
 
 
@@ -845,6 +864,34 @@ async function logoutBangumiAccount(): Promise<void> {
     Message.success('Bangumi アカウントとの連携を解除しました。');
 }
 
+/** サーバーへの保存成功後だけ、現在のブラウザで使う Bangumi 視聴履歴送信設定を切り替える。 */
+async function updateBangumiWatchHistorySync(enabled: boolean | null): Promise<void> {
+    if (
+        enabled === null ||
+        enabled === settingsStore.settings.bangumi_watch_history_sync ||
+        is_bangumi_watch_history_sync_loaded.value === false ||
+        is_saving_bangumi_watch_history_sync.value === true ||
+        user_store.user === null
+    ) {
+        return;
+    }
+    is_saving_bangumi_watch_history_sync.value = true;
+    try {
+        const user_id = user_store.user.id;
+        const authentication_generation = Utils.getAuthenticationGeneration();
+        const success = await Bangumi.updateWatchHistorySyncSetting(enabled);
+        if (
+            success === true
+            && Utils.getAuthenticationGeneration() === authentication_generation
+            && user_store.user?.id === user_id
+        ) {
+            settingsStore.settings.bangumi_watch_history_sync = enabled;
+        }
+    } finally {
+        is_saving_bangumi_watch_history_sync.value = false;
+    }
+}
+
 function openTmdbKeyDialog(): void {
     tmdb_key_dialog.value = true;
 }
@@ -940,6 +987,7 @@ onMounted(async () => {
         fetched_openai_compatible_2_settings,
         fetched_acp_credentials,
         fetched_bangumi,
+        fetched_bangumi_watch_history_sync,
     ] = await Promise.all([
         RecordedSeries.fetchSettings(),
         RecordedSeries.fetchStatus(),
@@ -948,6 +996,7 @@ onMounted(async () => {
         AIBackend.fetchOpenAICompatibleSettings(2),
         AIBackend.fetchACPCredentialStatus(),
         Bangumi.fetchProfile(),
+        Bangumi.fetchWatchHistorySyncSetting(),
     ]);
     if (fetched_services !== null) {
         opencode_services.value = fetched_services.map(service => ({
@@ -977,6 +1026,10 @@ onMounted(async () => {
         status.value = fetched_status;
     }
     bangumi_profile.value = fetched_bangumi;
+    if (fetched_bangumi_watch_history_sync !== null && user_store.user?.id === user.id) {
+        settingsStore.settings.bangumi_watch_history_sync = fetched_bangumi_watch_history_sync;
+        is_bangumi_watch_history_sync_loaded.value = true;
+    }
     is_loading.value = false;
 });
 
