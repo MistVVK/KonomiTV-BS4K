@@ -93,7 +93,7 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
             if (state.analysisOverview.active.some(task => task.status === 'Running')) return 'Running';
             if (state.seriesAIFallbackStatus?.state === 'Running') return 'Running';
             if (state.analysisOverview.active.some(task => task.status === 'Queued')) return 'Queued';
-            return state.seriesAIFallbackStatus?.state ?? null;
+            return null;
         },
     },
     actions: {

@@ -100,8 +100,7 @@
                             </small>
                         </router-link>
                         <div v-if="!iconOnly && (analysisTasksStore.activeTaskGroups.length > 0 ||
-                            analysisTasksStore.seriesAIFallbackStatus?.state === 'Running' ||
-                            analysisTasksStore.seriesAIFallbackStatus?.state === 'Stopped')"
+                            analysisTasksStore.seriesAIFallbackStatus?.state === 'Running')"
                             class="navigation-analysis__tasks">
                             <button v-for="group in analysisTasksStore.activeTaskGroups" :key="group.task_type"
                                 v-ripple type="button" class="navigation-analysis__task"
@@ -116,8 +115,7 @@
                                     rounded :model-value="group.progress * 100" />
                                 <v-progress-linear v-else class="mt-1" color="primary" height="4" rounded indeterminate />
                             </button>
-                            <button v-if="analysisTasksStore.seriesAIFallbackStatus?.state === 'Running' ||
-                                analysisTasksStore.seriesAIFallbackStatus?.state === 'Stopped'" v-ripple type="button"
+                            <button v-if="analysisTasksStore.seriesAIFallbackStatus?.state === 'Running'" v-ripple type="button"
                                 class="navigation-analysis__task" aria-label="シリーズ AI 補完の現在の処理を表示"
                                 @click="openActiveAnalysisTaskDialog('SeriesAIFallback')">
                                 <div class="navigation-analysis__task-line">
@@ -178,6 +176,7 @@ import BottomNavigation from '@/components/BottomNavigation.vue';
 import KonomiTVBS4KActiveAnalysisTaskDialog from '@/components/KonomiTVBS4KActiveAnalysisTaskDialog.vue';
 import OfflineDownloadBadge from '@/components/OfflineDownloadBadge.vue';
 import useAnalysisTasksStore, {
+    BackgroundTaskStatus,
     BackgroundTaskType,
     backgroundTaskStatusLabel,
     stageLabel,
@@ -210,11 +209,23 @@ export default defineComponent({
     computed: {
         ...mapStores(useAnalysisTasksStore),
         ...mapStores(useVersionStore),
+        seriesAIFallbackState(): BackgroundTaskStatus {
+            return this.analysisTasksStore.seriesAIFallbackStatus?.state ?? null;
+        },
         analysisTaskTooltip(): string {
             if (this.analysisTasksStore.activeTaskStatus !== null) {
                 return `バックグラウンド処理 (${backgroundTaskStatusLabel(this.analysisTasksStore.activeTaskStatus)})`;
             }
             return 'バックグラウンド処理';
+        },
+    },
+    watch: {
+        seriesAIFallbackState(state: BackgroundTaskStatus): void {
+            // Running ではなくなったシリーズ AI のダイアログを画面上に残さない。
+            if (state !== 'Running' && this.selectedActiveTaskType === 'SeriesAIFallback') {
+                this.activeAnalysisTaskDialog = false;
+                this.selectedActiveTaskType = null;
+            }
         },
     },
     methods: {
