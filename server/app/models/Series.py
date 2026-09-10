@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Literal, cast
 
 from tortoise import fields
@@ -40,6 +40,8 @@ class Series(TortoiseModel):
     normalized_title = cast(TortoiseField[str | None], fields.CharField(512, null=True, unique=True))
     wikipedia_page_id = cast(TortoiseField[int | None], fields.IntField(null=True, unique=True))
     bangumi_subject_id = cast(TortoiseField[int | None], fields.IntField(null=True, unique=True))
+    # 未照合 Series の有限バッチを未試行・最久試行順へ回すため、直近の試行開始時刻を保持する。
+    bangumi_last_attempt_at = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     bangumi_subject_name = cast(TortoiseField[str | None], fields.TextField(null=True))
     bangumi_subject_name_cn = cast(TortoiseField[str | None], fields.TextField(null=True))
     bangumi_subject_summary = cast(TortoiseField[str | None], fields.TextField(null=True))
@@ -49,7 +51,11 @@ class Series(TortoiseModel):
     # TMDb 由来の補完メタデータ。description / genres は Wikipedia AI 生成が正本のため、
     # TMDb の値は必ず tmdb_ 接頭辞の専用カラムへだけ保存する。
     tmdb_id = cast(TortoiseField[int | None], fields.IntField(null=True))
+    # 照合不能な先頭 Series に滞留せず、次の有限バッチで対象を交代するために使う。
+    tmdb_last_attempt_at = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     tmdb_media_type = cast(TortoiseField[TmdbMediaType | None], fields.CharField(8, null=True))
+    # binding 後に中断した enrich を、未照合キューと分けて通常同期が再試行するために保持する。
+    tmdb_enrichment_pending = fields.BooleanField(default=False)
     tmdb_name = cast(TortoiseField[str | None], fields.TextField(null=True))
     tmdb_overview = cast(TortoiseField[str | None], fields.TextField(null=True))
     tmdb_poster_url = cast(TortoiseField[str | None], fields.TextField(null=True))
