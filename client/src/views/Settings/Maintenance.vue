@@ -360,6 +360,17 @@ const pipeline_progress = computed(() => {
     return Math.max(0, Math.min(100, pipeline_task.value.progress * 100));
 });
 
+/** 一括判定の絶対上限により、次回へ引き継ぐ未処理対象があるかを判定する。 */
+function hasPipelineRemainingItems(summary: Record<string, unknown> | null): boolean {
+    if (summary === null) return false;
+    return [
+        'ai_remaining_groups',
+        'tmdb_remaining_series',
+        'bangumi_remaining_series',
+        'episode_remaining_programs',
+    ].some((key) => typeof summary[key] === 'number' && summary[key] > 0);
+}
+
 // データベースを更新する関数
 async function updateDatabase() {
     Message.show('データベースを更新しています...');
@@ -546,9 +557,16 @@ async function runPipeline(scope: SeriesPipelineScope): Promise<void> {
     is_monitoring_pipeline.value = false;
     await refreshSeriesStatus();
     if (execution?.status === 'Succeeded') {
-        Message.success(scope === 'Unresolved'
-            ? '未確定の録画の一括判定が完了しました。'
-            : 'すべての録画の一括再判定が完了しました。');
+        if (hasPipelineRemainingItems(execution.summary)) {
+            Message.warning(
+                '実行上限に達したため、一部の処理が残っています。\n' +
+                '残りを続けて処理するには、もう一度一括判定を実行してください。',
+            );
+        } else {
+            Message.success(scope === 'Unresolved'
+                ? '未確定の録画の一括判定が完了しました。'
+                : 'すべての録画の一括再判定が完了しました。');
+        }
     } else if (execution?.status === 'Interrupted') {
         Message.warning('録画の一括判定が中断されました。');
     } else if (execution !== null) {
