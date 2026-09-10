@@ -50,6 +50,7 @@ class FakeUser:
     def __init__(self) -> None:
         self.id = 1
         self.saved = False
+        self.client_settings: dict[str, Any] = {}
 
     async def save(self) -> None:
         self.saved = True
@@ -156,6 +157,7 @@ class BangumiRouterTest(unittest.IsolatedAsyncioTestCase):
         """未照合の録画は Bangumi API を呼ばず Pending を返す。"""
 
         current_user = FakeUser()
+        current_user.client_settings['bangumi_watch_history_sync'] = True
         recorded_video = MagicMock()
         recorded_video.duration = 1800.0
         recorded_video.cm_sections = None
@@ -206,6 +208,7 @@ class BangumiRouterTest(unittest.IsolatedAsyncioTestCase):
 
         current_user = FakeUser()
         current_user.id = 1
+        current_user.client_settings['bangumi_watch_history_sync'] = True
         recorded_video = MagicMock()
         recorded_video.duration = 1800.0
         recorded_video.cm_sections = None

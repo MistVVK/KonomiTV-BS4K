@@ -148,6 +148,7 @@ class ClientSettings(BaseModel):
     series_home_sort_key: Literal['UpdatedAt', 'TitleReading', 'FirstAirDate', 'TmdbPopularity', 'TmdbVoteAverage', 'BangumiRating'] = 'UpdatedAt'
     series_home_sort_direction: Literal['Asc', 'Desc'] = 'Desc'
     video_watched_history_max_count: PositiveInt = 50
+    bangumi_watch_history_sync: bool = False
     # konomitv_bs4k_offline_video_streaming_quality: 同期無効
     # konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
     # konomitv_bs4k_offline_video_codec: 同期無効

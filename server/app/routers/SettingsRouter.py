@@ -151,7 +151,14 @@ async def ClientSettingsUpdateAPI(
         # dict に変換してから入れる
         ## Pydantic モデルのままだと JSON にシリアライズできないので怒られる
         ## mode='json' で非有限値が残らない形に正規化する
-        user.client_settings = client_settings.model_dump(mode='json')
+        updated_client_settings = client_settings.model_dump(mode='json')
+
+        # 専用 API が書き込んだ Bangumi 視聴履歴送信設定は、古い全量 snapshot で巻き戻さない。
+        # 一般設定の同期ではこの値を配布だけに留め、サーバー上の値の更新は専用 API だけが所有する。
+        updated_client_settings['bangumi_watch_history_sync'] = (
+            user.client_settings.get('bangumi_watch_history_sync') is True
+        )
+        user.client_settings = updated_client_settings
         await user.save(update_fields=['client_settings', 'updated_at'])
 
 

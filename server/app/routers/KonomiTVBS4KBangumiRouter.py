@@ -2,6 +2,7 @@ from typing import Annotated, Any, cast
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, status
+from tortoise.transactions import in_transaction
 
 from app import logging, schemas
 from app.constants import BANGUMI_REQUEST_HEADERS, HTTPX_CLIENT
@@ -49,6 +50,59 @@ async def BangumiProfileAPI(
         bangumi_user_nickname = profile['bangumi_user_nickname'],
         bangumi_user_avatar_url = profile['bangumi_user_avatar_url'],
     )
+
+
+@router.get(
+    '/watch-history-sync',
+    summary = 'Bangumi 視聴履歴送信設定取得 API',
+    response_model = bool,
+)
+async def BangumiWatchHistorySyncSettingAPI(
+    current_user: Annotated[User, Depends(GetCurrentUser)],
+) -> bool:
+    """
+    現在ログイン中のユーザーについて、録画の視聴完了を Bangumi へ送信するかを返す。<br>
+    グローバルなクライアント設定同期の有効・無効にかかわらず、サーバーに保存された値を正とする。
+
+    Args:
+        current_user (User): ログイン中の KonomiTV ユーザー。
+
+    Returns:
+        bool: 視聴履歴送信が明示的に有効な場合は True。
+    """
+
+    return current_user.client_settings.get('bangumi_watch_history_sync') is True
+
+
+@router.put(
+    '/watch-history-sync',
+    summary = 'Bangumi 視聴履歴送信設定更新 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def BangumiWatchHistorySyncSettingUpdateAPI(
+    enabled: Annotated[bool, Body(embed=True, description='録画の視聴完了を Bangumi へ送信するか。')],
+    current_user: Annotated[User, Depends(GetCurrentUser)],
+) -> None:
+    """
+    現在ログイン中のユーザーについて、録画の視聴完了を Bangumi へ送信するかを保存する。<br>
+    グローバルなクライアント設定同期の有効・無効には依存しない。
+
+    Args:
+        enabled (bool): 録画の視聴完了を Bangumi へ送信するか。
+        current_user (User): ログイン中の KonomiTV ユーザー。
+
+    Returns:
+        None: 設定の保存が完了した場合。
+    """
+
+    # 全クライアント設定を送らず、行ロック後の最新値にこの1項目だけを反映する。
+    # 通常の設定同期と競合しても、同じ User 行への書き込みを直列化して無関係な設定を巻き戻さない。
+    async with in_transaction():
+        user = await User.filter(id=current_user.id).select_for_update().get()
+        client_settings = user.client_settings.copy()
+        client_settings['bangumi_watch_history_sync'] = enabled
+        user.client_settings = client_settings
+        await user.save(update_fields=['client_settings', 'updated_at'])
 
 
 async def UpdateBangumiEpisodeCollection(access_token: str, subject_id: int, episode_id: int) -> None:
@@ -244,6 +298,10 @@ async def BangumiPlaybackProgressAPI(
     Raises:
         HTTPException: 録画番組が存在しない、連携がない、または Bangumi API 更新に失敗した場合。
     """
+
+    # 新設定のない既存アカウントも既定オフとして扱い、旧タブや直接 API からの送信もサーバー側で止める。
+    if current_user.client_settings.get('bangumi_watch_history_sync') is not True:
+        return schemas.BangumiPlaybackProgressResponse(status='NotEligible')
 
     # await を挟む前に token と Bangumi user ID を同じ共有ストアスナップショットへ固定する。
     # 連携切替と競合しても、外部 PUT と完了記録は必ず同じ Bangumi アカウントへ結び付ける。
