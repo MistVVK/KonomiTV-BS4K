@@ -61,7 +61,7 @@ class SeriesMerger:
             ## プロセス内の同期は BangumiClient 側で直列化し、DB の一意索引をプロセス間競合の最終防線とする。
             _, candidate_rows = await connection.execute_query(
                 'SELECT id, normalized_title, title, tmdb_id, tmdb_media_type, '
-                'tmdb_name, tmdb_overview, tmdb_poster_url, tmdb_backdrop_url '
+                'tmdb_enrichment_pending, tmdb_name, tmdb_overview, tmdb_poster_url, tmdb_backdrop_url '
                 'FROM series '
                 'WHERE id = ? OR bangumi_subject_id = ? '
                 'ORDER BY id ASC',
@@ -169,10 +169,11 @@ class SeriesMerger:
                 # 複合 unique の所有者である元 Series を削除した後に、主側の欠損だけを引き継ぐ。
                 if canonical_tmdb_id is None and source_row['tmdb_id'] is not None:
                     await connection.execute_query(
-                        'UPDATE series SET tmdb_id = ?, tmdb_media_type = ?, tmdb_name = ?, '
+                        'UPDATE series SET tmdb_id = ?, tmdb_media_type = ?, tmdb_enrichment_pending = ?, tmdb_name = ?, '
                         'tmdb_overview = ?, tmdb_poster_url = ?, tmdb_backdrop_url = ? WHERE id = ?',
                         [
-                            source_row['tmdb_id'], source_row['tmdb_media_type'], source_row['tmdb_name'],
+                            source_row['tmdb_id'], source_row['tmdb_media_type'],
+                            source_row['tmdb_enrichment_pending'], source_row['tmdb_name'],
                             source_row['tmdb_overview'], source_row['tmdb_poster_url'],
                             source_row['tmdb_backdrop_url'], canonical_series_id,
                         ],

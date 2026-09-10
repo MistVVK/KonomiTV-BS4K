@@ -65,8 +65,8 @@ RECORDED_EPISODE_AUTOMATION_VERSION = "1"
 
 # 自動処理は新着録画を1件ずつ処理し、起動時スキャンなどで長い待機列を作らない。
 _AUTOMATIC_QUEUE_LIMIT = 1
-# 一括処理でも外部 AI は1回で打ち切り、残件は次の明示操作へ委ねる。
-_BACKFILL_MAX_AI_REQUESTS_PER_RUN = 1
+# 単独の手動一括処理では外部 AI を1回で打ち切る。親パイプラインは別の絶対上限まで全件処理する。
+_MANUAL_BACKFILL_MAX_AI_REQUESTS_PER_RUN = 1
 
 # 「第N部」は単発特番内の放送区分であり、作品の公開話数ではない。
 _BROADCAST_PART_PATTERN = re.compile(
@@ -164,9 +164,11 @@ class RecordedEpisodeBackfillSummary(TypedDict):
     preserved: int
     failed: int
     skipped: int
+    remaining: int
     ai_requests: int
     stopped_by_usage_limit: bool
     stopped_by_batch_limit: bool
+    stopped_by_time_limit: bool
 
 
 class _RecordedEpisodeSnapshotChanged(Exception):
@@ -2707,6 +2709,8 @@ class RecordedEpisodeAutomation:
                     expected_provider_fingerprint=expected_provider_fingerprint,
                     progress_start=0.0,
                     progress_end=1.0,
+                    maximum_ai_requests=_MANUAL_BACKFILL_MAX_AI_REQUESTS_PER_RUN,
+                    timeout_seconds=None,
                 )
                 await history.finish(
                     "Failed" if summary['failed'] > 0 else "Succeeded",
@@ -2732,13 +2736,15 @@ class RecordedEpisodeAutomation:
         *,
         progress_start: float,
         progress_end: float,
+        timeout_seconds: float,
     ) -> RecordedEpisodeBackfillSummary:
-        """親パイプライン内で、決定論的候補と最大1回のAI検索を処理する。
+        """親パイプライン内で、開始時の全候補を絶対上限まで順次処理する。
 
         Args:
             handle: 親パイプラインの解析履歴。
             progress_start: この段階の開始進捗。
             progress_end: この段階の完了進捗。
+            timeout_seconds: この段階を打ち切る絶対上限秒数。
 
         Returns:
             今回処理した話数候補の集計。
@@ -2773,6 +2779,8 @@ class RecordedEpisodeAutomation:
                 expected_provider_fingerprint=provider_fingerprint,
                 progress_start=progress_start,
                 progress_end=progress_end,
+                maximum_ai_requests=None,
+                timeout_seconds=timeout_seconds,
             )
         finally:
             if cls._backfill_task is current_task:
@@ -2789,8 +2797,10 @@ class RecordedEpisodeAutomation:
         expected_provider_fingerprint: str,
         progress_start: float,
         progress_end: float,
+        maximum_ai_requests: int | None,
+        timeout_seconds: float | None,
     ) -> RecordedEpisodeBackfillSummary:
-        """固定候補を順に処理し、外部AIを1回使った時点で残件を保留する。
+        """固定候補を順に処理し、指定されたAI回数と時間の上限で残件を保留する。
 
         Args:
             history: 件数と進捗を保存する解析履歴。
@@ -2799,6 +2809,8 @@ class RecordedEpisodeAutomation:
             expected_provider_fingerprint: 開始時に固定したAI設定世代。
             progress_start: この段階の開始進捗。
             progress_end: この段階の完了進捗。
+            maximum_ai_requests: 新しいAI検索の上限。None は回数制限なし。
+            timeout_seconds: 処理全体の絶対上限秒数。None は時間制限なし。
 
         Returns:
             今回処理した話数候補の集計。
@@ -2815,9 +2827,18 @@ class RecordedEpisodeAutomation:
         ai_request_count = 0
         stopped_by_usage_limit = False
         stopped_by_batch_limit = False
+        stopped_by_time_limit = False
+        processed_count = 0
 
         async def SaveProgress(current: int) -> None:
-            """現在件数とパイプライン全体に占める進捗を同時に保存する。"""
+            """現在件数とパイプライン全体に占める進捗を同時に保存する。
+
+            Args:
+                current: 完了またはskipとして記録する現在件数。
+
+            Returns:
+                None
+            """
 
             await history.setCounts(
                 current=current,
@@ -2831,67 +2852,80 @@ class RecordedEpisodeAutomation:
                 progress_start + (progress_end - progress_start) * fraction,
             )
 
-        for index, recorded_program_id in enumerate(candidate_ids, start=1):
-            # 決定論的候補を先頭へ並べてあるため、1回AIを使った後の残件は
-            ## 次回の明示操作へ残し、長時間のバックグラウンド処理にしない。
-            if ai_request_count >= _BACKFILL_MAX_AI_REQUESTS_PER_RUN:
-                stopped_by_batch_limit = True
-                skipped_count += len(candidate_ids) - index + 1
-                await SaveProgress(len(candidate_ids))
-                break
-            try:
-                result = await cls.resolveProgram(
-                    recorded_program_id,
-                    force=force,
-                    allow_disabled=True,
-                    allow_legacy_ai=True,
-                    expected_provider_fingerprint=expected_provider_fingerprint,
-                )
-            except asyncio.CancelledError:
-                raise
-            except _RecordedEpisodeSnapshotChanged:
-                skipped_count += 1
-                await SaveProgress(index)
-                continue
-            except Exception as ex:
-                failed_count += 1
-                logging.error(
-                    f"[RecordedEpisodeAutomation] Episode backfill item failed. "
-                    f"recorded_program_id: {recorded_program_id}",
-                    exc_info=ex,
-                )
-                await SaveProgress(index)
-                continue
+        stage_timeout = asyncio.timeout(timeout_seconds)
+        try:
+            # 親パイプラインでは長いAI待機も絶対上限でキャンセルする。通常の手動一括処理は
+            ## None を渡し、従来どおりAI回数の有限枠だけで閉じる。
+            async with stage_timeout:
+                for index, recorded_program_id in enumerate(candidate_ids, start=1):
+                    # 単独の手動一括処理だけは従来のAI回数上限で残件を次回操作へ委ねる。
+                    ## 親パイプラインは None のため、開始時スナップショットを時間上限まで処理する。
+                    if maximum_ai_requests is not None and ai_request_count >= maximum_ai_requests:
+                        stopped_by_batch_limit = True
+                        skipped_count += len(candidate_ids) - index + 1
+                        await SaveProgress(len(candidate_ids))
+                        break
+                    try:
+                        result = await cls.resolveProgram(
+                            recorded_program_id,
+                            force=force,
+                            allow_disabled=True,
+                            allow_legacy_ai=True,
+                            expected_provider_fingerprint=expected_provider_fingerprint,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except _RecordedEpisodeSnapshotChanged:
+                        skipped_count += 1
+                        processed_count = index
+                        await SaveProgress(index)
+                        continue
+                    except Exception as ex:
+                        failed_count += 1
+                        processed_count = index
+                        logging.error(
+                            f"[RecordedEpisodeAutomation] Episode backfill item failed. "
+                            f"recorded_program_id: {recorded_program_id}",
+                            exc_info=ex,
+                        )
+                        await SaveProgress(index)
+                        continue
 
-            ai_request_count += int(result.ai_requested)
-            preserved_count += int(result.source == "WebSearchRefreshPreserved")
-            if result.status == "Resolved":
-                succeeded_count += 1
-                resolved_count += 1
-            elif result.status == "NotNumbered":
-                succeeded_count += 1
-                not_numbered_count += 1
-            elif result.status == 'NoPublishedNumber':
-                succeeded_count += 1
-                no_published_number_count += 1
-            elif result.status == "NeedsReview":
-                succeeded_count += 1
-                needs_review_count += 1
-            elif result.status == "Failed":
-                failed_count += 1
-            else:
-                skipped_count += 1
-            await SaveProgress(index)
-            if result.error_code in {
-                "DailyAIRequestLimitReached",
-                "MonthlyTokenLimitReached",
-                "MonthlyCostLimitReached",
-            }:
-                # 上限到達時は自動再開せず、残りは次回の明示操作まで保留する。
-                stopped_by_usage_limit = True
-                skipped_count += len(candidate_ids) - index
-                await SaveProgress(len(candidate_ids))
-                break
+                    ai_request_count += int(result.ai_requested)
+                    preserved_count += int(result.source == "WebSearchRefreshPreserved")
+                    if result.status == "Resolved":
+                        succeeded_count += 1
+                        resolved_count += 1
+                    elif result.status == "NotNumbered":
+                        succeeded_count += 1
+                        not_numbered_count += 1
+                    elif result.status == 'NoPublishedNumber':
+                        succeeded_count += 1
+                        no_published_number_count += 1
+                    elif result.status == "NeedsReview":
+                        succeeded_count += 1
+                        needs_review_count += 1
+                    elif result.status == "Failed":
+                        failed_count += 1
+                    else:
+                        skipped_count += 1
+                    processed_count = index
+                    await SaveProgress(index)
+                    if result.error_code in {
+                        "DailyAIRequestLimitReached",
+                        "MonthlyTokenLimitReached",
+                        "MonthlyCostLimitReached",
+                    }:
+                        # 利用上限到達時も自動再開せず、未着手分は summary から次回操作へ引き継ぐ。
+                        stopped_by_usage_limit = True
+                        skipped_count += len(candidate_ids) - index
+                        await SaveProgress(len(candidate_ids))
+                        break
+        except TimeoutError:
+            if stage_timeout.expired() is False:
+                raise
+            # 現在処理中の録画を中断し、完了済み件数から未着手分を算出する。
+            stopped_by_time_limit = True
 
         if len(candidate_ids) == 0:
             await SaveProgress(0)
@@ -2904,9 +2938,11 @@ class RecordedEpisodeAutomation:
             preserved=preserved_count,
             failed=failed_count,
             skipped=skipped_count,
+            remaining=max(0, len(candidate_ids) - processed_count),
             ai_requests=ai_request_count,
             stopped_by_usage_limit=stopped_by_usage_limit,
             stopped_by_batch_limit=stopped_by_batch_limit,
+            stopped_by_time_limit=stopped_by_time_limit,
         )
 
     @classmethod

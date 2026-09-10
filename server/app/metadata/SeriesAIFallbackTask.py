@@ -1,6 +1,6 @@
 import asyncio
 import hashlib
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -298,7 +298,7 @@ class SeriesAIFallbackTask:
         schedule_external_sync: bool,
         schedule_episode_automation: bool,
     ) -> SeriesAIFallbackWorkerStatus:
-        """1グループだけ予約し、有限時間で完了を待って進捗を反映する。
+        """親パイプライン内で開始時の全グループを有限時間まで順次処理する。
 
         Args:
             handle: 親パイプラインの解析履歴。
@@ -314,7 +314,6 @@ class SeriesAIFallbackTask:
 
         Raises:
             SeriesAIFallbackBatchBusyError: 別の補完処理が開始済みの場合。
-            TimeoutError: 有限時間内に処理を終了できなかった場合。
         """
 
         await cls.start()
@@ -324,27 +323,44 @@ class SeriesAIFallbackTask:
         cls._schedule_external_sync = schedule_external_sync
         cls._schedule_episode_automation = schedule_episode_automation
         try:
-            await cls.schedule(retry_cancelled=retry_cancelled)
+            # 親パイプラインからの明示操作だけが、中断監査へ閉じた group の再試行を許可する。
+            if retry_cancelled:
+                await SeriesAIFallback.filter(status='Cancelled').update(status='Pending')
+
+            async def UpdateProgress(processed_groups: int, total_groups: int) -> None:
+                """1グループ完了ごとに親パイプラインの進捗を保存する。
+
+                Args:
+                    processed_groups: 完了済みグループ数。
+                    total_groups: 開始時の対象グループ総数。
+
+                Returns:
+                    None
+                """
+
+                stage_fraction = processed_groups / total_groups if total_groups > 0 else 1.0
+                await handle.setProgress(
+                    progress_start + (progress_end - progress_start) * stage_fraction,
+                )
+
+            stage_timeout = asyncio.timeout(timeout_seconds)
             try:
-                async with asyncio.timeout(timeout_seconds):
-                    while cls._batch_lock.locked() or cls._scan_requested:
-                        current_status = cls.getStatus()
-                        total_groups = current_status['total_groups']
-                        stage_fraction = (
-                            current_status['processed_groups'] / total_groups
-                            if total_groups > 0
-                            else 0.0
-                        )
-                        await handle.setProgress(
-                            progress_start + (progress_end - progress_start) * stage_fraction,
-                        )
-                        await asyncio.sleep(0.25)
+                async with stage_timeout:
+                    await cls._runBatch(
+                        maximum_groups=None,
+                        progress_callback=UpdateProgress,
+                    )
             except TimeoutError:
-                # 有限時間を超えた処理を裏で継続させず、所有 worker ごと停止して回収する。
-                await cls.stop()
-                await cls.start()
-                raise
-            await handle.setProgress(progress_end)
+                if stage_timeout.expired() is False:
+                    raise
+                # 絶対上限で現在 group をキャンセルし、未着手分は summary から再実行へ引き継ぐ。
+                ## 待機中の通常 worker は停止せず、pipeline が直接所有する処理だけを閉じる。
+                cls._worker_state = 'Stopped'
+                cls._worker_stopped_reason = 'StageTimeoutReached'
+                cls._pending_count = 0
+                cls._current_title = None
+            if cls._processed_groups >= cls._total_groups:
+                await handle.setProgress(progress_end)
             return cls.getStatus()
         finally:
             cls._schedule_episode_automation = True
@@ -561,11 +577,17 @@ class SeriesAIFallbackTask:
         )
 
     @classmethod
-    async def _runBatch(cls, *, maximum_groups: int) -> None:
+    async def _runBatch(
+        cls,
+        *,
+        maximum_groups: int | None,
+        progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+    ) -> None:
         """同一 EPG タイトル系につき最大1回だけ新しい Web 検索をする。
 
         Args:
-            maximum_groups: 今回の起動で新たに Web 検索する最大タイトル群数。
+            maximum_groups: 今回の起動で新たに Web 検索する最大タイトル群数。None は全件。
+            progress_callback: 処理済み件数と総件数を1グループごとに通知する関数。
 
         Returns:
             None
@@ -602,6 +624,8 @@ class SeriesAIFallbackTask:
             cls._pending_count = 0
             cls._cancelled_count = 0
             cls._current_title = None
+            if progress_callback is not None:
+                await progress_callback(0, len(groups))
             requested_groups = 0
             for grouping_key, programs in groups.items():
                 # 設定 OFF や backend 世代変更後も、古い snapshot で新規リクエストを続けない。
@@ -619,7 +643,13 @@ class SeriesAIFallbackTask:
                 ):
                     cls._pending_count = 0
                     cls._current_title = None
-                    await cls.schedule()
+                    # 通常workerは新しい設定世代を次の有限バッチへ予約する。親パイプラインは
+                    ## 後続stageと並行させず、設定変更を失敗として呼び出し元へ返す。
+                    if progress_callback is None:
+                        await cls.schedule()
+                    else:
+                        cls._worker_state = 'Stopped'
+                        cls._worker_stopped_reason = 'ProviderConfigurationChanged'
                     return
                 # cache 再利用も進捗へ含めるが、新しい Web 検索だけを有限枠として数える。
                 cls._current_title = programs[0].title.strip() or None
@@ -629,7 +659,7 @@ class SeriesAIFallbackTask:
                     settings=latest_settings,
                     api_key=latest_api_key,
                     provider_fingerprint=provider_fingerprint,
-                    allow_request=requested_groups < maximum_groups,
+                    allow_request=maximum_groups is None or requested_groups < maximum_groups,
                 )
                 # 再利用できる cache がなく有限枠も尽きたら、残件を次の明示操作へ委ねる。
                 if result_status is None:
@@ -650,6 +680,8 @@ class SeriesAIFallbackTask:
                     cls._failed_count += 1
                 elif result_status == 'Cancelled':
                     cls._cancelled_count += 1
+                if progress_callback is not None:
+                    await progress_callback(cls._processed_groups, cls._total_groups)
             # 読み欠落の解決済みシリーズを、同じ AI 補完実行の軽量パスで補完する。
             await cls._backfillTitleReadings()
 

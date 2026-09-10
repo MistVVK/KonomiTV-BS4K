@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
@@ -26,7 +27,7 @@ from typing import Any, cast
 
 import httpx
 from tortoise.exceptions import IntegrityError
-from tortoise.expressions import F
+from tortoise.expressions import F, Q
 from tortoise.functions import Coalesce
 from tortoise.transactions import in_transaction
 from typing_extensions import TypedDict
@@ -508,13 +509,21 @@ class KonomiTVBS4KTmdbClient:
         *,
         maximum_series: int | None = None,
         raise_on_error: bool = False,
+        unmatched_only: bool = False,
+        continue_on_item_error: bool = False,
+        item_failure_callback: Callable[[], None] | None = None,
+        progress_callback: Callable[[int, int, int], Awaitable[None]] | None = None,
     ) -> int:
         """
         未照合の Series を TMDb 作品へ照合し、`tmdb_*` と話数構造を補完する。
 
         Args:
-            maximum_series: 今回処理する未照合 Series の上限。None は全件を再同期する。
+            maximum_series: 今回処理する未照合・enrich 未完了 Series の上限。None は全件を再同期する。
             raise_on_error: 外部API失敗を秘密を含まない例外として呼び出し元へ伝播するか。
+            unmatched_only: 上限なしでも未照合 Series だけを処理するか。
+            continue_on_item_error: 認証失敗以外の作品単位エラー後も開始時スナップショットを走査するか。
+            item_failure_callback: 継続可能な作品単位エラーを呼び出し元へ通知する関数。
+            progress_callback: 処理済み件数・総件数・照合件数を作品ごとに通知する関数。
 
         Returns:
             int: 今回 TMDb 作品を確定できた Series 数。
@@ -523,6 +532,8 @@ class KonomiTVBS4KTmdbClient:
         async with cls._sync_lock:
             # None / BangumiOnly では TMDb 経路を一切動かさない。既存の tmdb_* は残す。
             if IsTmdbExternalMetadataEnabled() is False:
+                if progress_callback is not None:
+                    await progress_callback(0, 0, 0)
                 return 0
             api_key = KonomiTVBS4KTmdbStore.getAPIKey()
             # API キー未設定は TMDb 経路だけを skip し、Wikipedia / Bangumi 側は止めない。
@@ -531,23 +542,40 @@ class KonomiTVBS4KTmdbClient:
                     '[KonomiTVBS4KTmdbClient][syncAllSeries] TMDb API key is not configured. '
                     'Skipping the TMDb metadata pass.',
                 )
+                if progress_callback is not None:
+                    await progress_callback(0, 0, 0)
                 return 0
-            # 全件同期では完了済みの詳細も再取得する。有限バッチでは未照合だけを
-            ## ID順に取り、同じ対象へ長時間滞留しない。
-            if maximum_series is None:
-                target_series = await Series.all().order_by('id')
+            # pipeline は開始時点の未照合 Series だけを固定する。通常の有限バッチは未照合に加え、
+            ## binding 後に中断した enrich も同じ最久試行順へ戻し、別の retry 所有経路にする。
+            if unmatched_only:
+                target_query = Series.filter(tmdb_id__isnull=True).order_by('tmdb_last_attempt_at', 'id')
+            elif maximum_series is not None:
+                target_query = Series.filter(
+                    Q(tmdb_id__isnull=True) | Q(tmdb_enrichment_pending=True),
+                ).order_by('tmdb_last_attempt_at', 'id')
             else:
-                target_series = await Series.filter(
-                    tmdb_id__isnull=True,
-                ).order_by('id').limit(maximum_series)
+                target_query = Series.all().order_by('tmdb_last_attempt_at', 'id')
+            if maximum_series is not None:
+                target_query = target_query.limit(maximum_series)
+            target_series = await target_query
             matched_series_count = 0
-            for loaded_series in target_series:
+            if progress_callback is not None:
+                await progress_callback(0, len(target_series), matched_series_count)
+            for processed_series_count, loaded_series in enumerate(target_series, start=1):
                 # 長い同期の途中でモードを無効化した場合は、次の作品から外部通信を止める。
                 if not IsTmdbExternalMetadataEnabled() or not KonomiTVBS4KTmdbStore.isConfigured():
                     break
+                series_completed = False
+                series_matched = False
+                item_failed = False
+                was_unmatched = loaded_series.tmdb_id is None
                 try:
-                    if await cls._syncSeries(loaded_series, api_key, raise_on_error=raise_on_error):
-                        matched_series_count += 1
+                    series_matched = await cls._syncSeries(
+                        loaded_series,
+                        api_key,
+                        raise_on_error=raise_on_error,
+                    )
+                    series_completed = True
                 except (httpx.HTTPError, ValueError) as ex:
                     # rate limit・通信エラー・不正応答は該当 Series だけ skip し、pass 全体は続行する。
                     ## URL には API キーが含まれるため、例外メッセージとトレースバックは記録しない。
@@ -555,9 +583,37 @@ class KonomiTVBS4KTmdbClient:
                         f'[KonomiTVBS4KTmdbClient][syncAllSeries] Failed to fetch TMDb metadata. '
                         f'[series_id: {loaded_series.id}, error: {type(ex).__name__}]',
                     )
-                    if raise_on_error:
+                    authentication_failed = (
+                        isinstance(ex, httpx.HTTPStatusError)
+                        and ex.response.status_code in {401, 403}
+                    )
+                    if raise_on_error and (continue_on_item_error is False or authentication_failed):
                         # HTTP例外のURLにはAPIキーが含まれるため、元例外を連鎖させない。
                         raise TmdbMetadataSyncError(type(ex).__name__) from None
+                    item_failed = True
+                    if item_failure_callback is not None:
+                        item_failure_callback()
+                finally:
+                    # 未照合キューは binding の永続化を完了境界とする。binding 後の enrich 待機中に
+                    ## cancel されても再実行対象と remaining が食い違わないよう、DB の確定値を読み直す。
+                    if was_unmatched and series_matched is False:
+                        series_matched = await Series.filter(
+                            id=loaded_series.id,
+                            tmdb_id__not_isnull=True,
+                        ).exists()
+                    if series_matched:
+                        matched_series_count += 1
+                        series_completed = True
+                    elif item_failed:
+                        series_completed = True
+                    # 成否やキャンセルにかかわらず、外部照合を開始した Series は次の有限バッチで後方へ回す。
+                    await Series.filter(id=loaded_series.id).update(tmdb_last_attempt_at=datetime.now(tz=JST))
+                    if progress_callback is not None and series_completed:
+                        await progress_callback(
+                            processed_series_count,
+                            len(target_series),
+                            matched_series_count,
+                        )
         logging.info(
             f'[KonomiTVBS4KTmdbClient][syncAllSeries] Synchronized TMDb metadata. '
             f'[matched_series: {matched_series_count}]',
@@ -566,14 +622,18 @@ class KonomiTVBS4KTmdbClient:
 
 
     @classmethod
-    def startPipelineSync(cls, *, maximum_series: int | None = None) -> asyncio.Task[int]:
+    def startPipelineSync(
+        cls,
+        *,
+        progress_callback: Callable[[int, int, int], Awaitable[None]] | None = None,
+    ) -> asyncio.Task[int]:
         """pipeline用TMDb同期を通常schedulerと同じ所有集合へ登録する。
 
         Args:
-            maximum_series: 今回処理する未照合 Series の上限。None は全件を再同期する。
+            progress_callback: 処理済み件数・総件数・照合件数を作品ごとに通知する関数。
 
         Returns:
-            pipelineが完了を待つTMDb同期task。
+            pipelineが完了を待ち、作品単位の失敗数を返すTMDb同期task。
 
         Raises:
             RuntimeError: 別のTMDb同期がすでに実行中の場合。
@@ -582,10 +642,30 @@ class KonomiTVBS4KTmdbClient:
         # 確認から登録までawaitせず、通常schedulerとの開始競合を同一イベントループ上で防ぐ。
         if cls.hasRunningSync():
             raise RuntimeError('TmdbSyncBusy')
-        task = asyncio.create_task(cls.syncAllSeries(
-            maximum_series=maximum_series,
-            raise_on_error=True,
-        ))
+
+        async def SyncPipeline() -> int:
+            """開始時スナップショットを走査する。
+
+            Returns:
+                int: 作品単位の失敗数。
+            """
+
+            failed_series_count = 0
+
+            def CountItemFailure() -> None:
+                nonlocal failed_series_count
+                failed_series_count += 1
+
+            await cls.syncAllSeries(
+                raise_on_error=True,
+                unmatched_only=True,
+                continue_on_item_error=True,
+                item_failure_callback=CountItemFailure,
+                progress_callback=progress_callback,
+            )
+            return failed_series_count
+
+        task = asyncio.create_task(SyncPipeline())
         cls._sync_tasks.add(task)
         cls._pipeline_sync_tasks.add(task)
         task.add_done_callback(cls._sync_tasks.discard)
@@ -818,6 +898,7 @@ class KonomiTVBS4KTmdbClient:
             # 検索中に別処理が確定した ID や、Bangumi 統合で削除された Series を復活させない。
             updated = await Series.filter(id=series.id, tmdb_id__isnull=True).update(
                 tmdb_id=candidate['tmdb_id'], tmdb_media_type=candidate['media_type'],
+                tmdb_enrichment_pending=True,
                 updated_at=datetime.now(tz=JST),
             )
         except IntegrityError:
@@ -887,13 +968,27 @@ class KonomiTVBS4KTmdbClient:
         if updated == 0:
             return False
         if media_type == 'tv':
-            created_count = await cls._buildEpisodeStructure(series.id, tmdb_id, details, api_key)
+            created_count, episode_structure_completed = await cls._buildEpisodeStructure(
+                series.id,
+                tmdb_id,
+                details,
+                api_key,
+            )
             if created_count > 0:
                 logging.info(
                     f'[KonomiTVBS4KTmdbClient][enrichSeries] Built TMDb episode structure. '
                     f'[series_id: {series.id}, tmdb_id: {tmdb_id}, created_episodes: {created_count}]',
                 )
-        return True
+            # 設定変更やSeries消失でseason処理を中断した場合は、通常同期へretry所有権を残す。
+            if episode_structure_completed is False:
+                return False
+        # 詳細保存と話数構造の両方が完了してから retry 所有権を解放する。
+        ## この更新前に失敗・cancel された Series は通常の有限バッチが再試行する。
+        return await Series.filter(
+            id=series.id,
+            tmdb_id=tmdb_id,
+            tmdb_media_type=media_type,
+        ).update(tmdb_enrichment_pending=False) == 1
 
 
     @classmethod
@@ -903,7 +998,7 @@ class KonomiTVBS4KTmdbClient:
         tmdb_id: int,
         details: TmdbSeriesDetails,
         api_key: str,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """
         Bangumi 由来の話数構造が無い Series だけ、TMDb シーズンから話を追加する。
 
@@ -914,26 +1009,30 @@ class KonomiTVBS4KTmdbClient:
             api_key (str): TMDb API キー。
 
         Returns:
-            int: 今回追加した SeriesEpisode の件数。
+            tuple[int, bool]: 今回追加した SeriesEpisode の件数と、必須のseason処理を完了したか。
         """
 
         # Bangumi の episode ID が付いた話数構造がある Series では、ユーザーコレクションを正とし、
         # TMDb のシーズン構成で上書きも追加もしない。
         if await SeriesEpisode.filter(series_id=series_id, bangumi_episode_id__not_isnull=True).exists():
-            return 0
+            return (0, True)
         created_count = 0
+        episode_structure_completed = True
         for season_number in details['season_numbers']:
             # 特別編 (season 0) は放送話数ではないため、話数構造の列へは載せない。
             if season_number < 1:
                 continue
             if not IsTmdbExternalMetadataEnabled() or not KonomiTVBS4KTmdbStore.isConfigured():
+                episode_structure_completed = False
                 break
             episodes = await cls.getSeasonEpisodes(tmdb_id, season_number, api_key)
             # ネットワーク待ちをトランザクションの外に出し、話数の作成と優先ソースの検査だけを直列化する。
             async with in_transaction():
                 if not IsTmdbExternalMetadataEnabled() or not KonomiTVBS4KTmdbStore.isConfigured():
+                    episode_structure_completed = False
                     break
                 if not await Series.filter(id=series_id, tmdb_id=tmdb_id, tmdb_media_type='tv').exists():
+                    episode_structure_completed = False
                     break
                 if await SeriesEpisode.filter(series_id=series_id, bangumi_episode_id__not_isnull=True).exists():
                     break
@@ -950,7 +1049,7 @@ class KonomiTVBS4KTmdbClient:
                     elif episode.tmdb_episode_id is None:
                         episode.tmdb_episode_id = tmdb_episode_id
                         await episode.save(update_fields=['tmdb_episode_id', 'updated_at'])
-        return created_count
+        return (created_count, episode_structure_completed)
 
 
     @classmethod

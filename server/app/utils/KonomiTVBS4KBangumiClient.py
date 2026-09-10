@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime
 from difflib import SequenceMatcher
 from typing import Any, Protocol, cast
@@ -438,12 +439,24 @@ class KonomiTVBS4KBangumiClient:
 
 
     @classmethod
-    async def syncUserCollections(cls, user: BangumiCollectionOwner) -> int:
+    async def syncUserCollections(
+        cls,
+        user: BangumiCollectionOwner,
+        *,
+        unmatched_only: bool = False,
+        continue_on_item_error: bool = False,
+        item_failure_callback: Callable[[], None] | None = None,
+        progress_callback: Callable[[int, int, int], Awaitable[None]] | None = None,
+    ) -> int:
         """
         連携ユーザーの收藏一覧を候補プールとしてローカル Series と全録画を照合する。
 
         Args:
             user (User): Bangumi アカウント連携済みの KonomiTV ユーザー。
+            unmatched_only: Bangumi 条目が未照合の Series だけを処理するか。
+            continue_on_item_error: 認証失敗以外の作品単位エラー後も開始時スナップショットを走査するか。
+            item_failure_callback: 継続可能な作品単位エラーを呼び出し元へ通知する関数。
+            progress_callback: 処理済み件数・総件数・照合件数を作品ごとに通知する関数。
 
         Returns:
             int: 今回 Bangumi 条目へ照合できた Series 数。
@@ -454,15 +467,30 @@ class KonomiTVBS4KBangumiClient:
 
         # 公開の同期経路を直接呼んだ場合も、無効モードでは新規の照合を開始しない。
         if IsBangumiExternalMetadataEnabled() is False:
+            if progress_callback is not None:
+                await progress_callback(0, 0, 0)
             return 0
         anime_series = [
             series for series in await Series.all()
-            if any(genre['major'] == 'アニメ・特撮' for genre in series.genres)
+            if any(genre['major'] == 'アニメ・特撮' for genre in series.genres) and (
+                unmatched_only is False or series.bangumi_subject_id is None
+            )
         ]
+        # pipeline の再実行では未試行を先にし、その後は最も古く試行した Series から回す。
+        ## 全件同期でも同じ安定順序を使い、絶対上限後の再実行で未着手分を優先する。
+        anime_series.sort(key=lambda series: (
+            series.bangumi_last_attempt_at is not None,
+            series.bangumi_last_attempt_at or datetime.min.replace(tzinfo=JST),
+            series.id,
+        ))
         # ローカルにアニメ・特撮の Series が一件もなければ、Bangumi API 自体へアクセスしない。
         if len(anime_series) == 0:
+            if progress_callback is not None:
+                await progress_callback(0, 0, 0)
             return 0
 
+        if progress_callback is not None:
+            await progress_callback(0, len(anime_series), 0)
         subjects = await cls._getCollectionSubjects(user)
         access_token = user.decryptBangumiAccessToken()
         episodes_by_subject_id: dict[int, list[dict[str, Any]]] = {}
@@ -470,121 +498,211 @@ class KonomiTVBS4KBangumiClient:
         # 条目詳細 (rating など) の同一実行内キャッシュ。
         subject_details_by_id: dict[int, dict[str, Any]] = {}
 
-        for loaded_series in anime_series:
+        for processed_series_count, loaded_series in enumerate(anime_series, start=1):
             if IsBangumiExternalMetadataEnabled() is False:
                 break
-            series_lock = cls._series_merge_locks.setdefault(loaded_series.id, asyncio.Lock())
-            async with series_lock:
-                # ロック後に DB を読み直し、開始時スナップショットの未確定判定で上書きしない。
-                series = await Series.get_or_none(id=loaded_series.id)
-                if series is None:
-                    continue
+            series_completed = False
 
-                # すでに条目が確定している Series は、他ユーザーの收藏・検索・AI で上書きしない。
-                if series.bangumi_subject_id is not None:
-                    subject = next(
-                        (subject for subject in subjects if int(subject['id']) == series.bangumi_subject_id),
-                        None,
+            async def CompleteSeries(matched_series_id: int | None) -> None:
+                """binding境界で現在のSeriesを完了として通知する。
+
+                Args:
+                    matched_series_id: 照合済みのSeries ID。未照合ならNone。
+
+                Returns:
+                    None
+                """
+
+                nonlocal series_completed
+                if series_completed:
+                    return
+                if matched_series_id is not None:
+                    matched_series_ids.add(matched_series_id)
+                # binding と同じ完了境界を先に確定し、progress保存中のcancelでもremainingへ戻さない。
+                series_completed = True
+                if progress_callback is not None:
+                    await progress_callback(
+                        processed_series_count,
+                        len(anime_series),
+                        len(matched_series_ids),
                     )
-                    subject_id = series.bangumi_subject_id
-                    if subject is None:
-                        # 收藏に無くても既存 ID を正本とし、新規録画の episode 対応だけ進める。
-                        matched_series_ids.add(series.id)
-                        await cls._mapRecordedProgramEpisodes(
-                            series_id = series.id,
-                            subject_id = subject_id,
-                            access_token = access_token,
-                            episodes_by_subject_id = episodes_by_subject_id,
-                        )
-                        # 收藏一覧に無い既存 binding も、初放送日・評価は条目詳細から補完する。
-                        await cls._fillSubjectSortMetadata(
-                            series,
-                            {},
-                            subject_id,
-                            access_token,
-                            subject_details_by_id,
-                        )
-                        continue
-                    # 既存 binding の初放送日・評価は、未設定の行にだけ一度だけ補完する (定期再取得はしない)。
+
+            try:
+                matched_series_id = await cls._syncUserCollectionSeries(
+                    loaded_series,
+                    user,
+                    subjects,
+                    access_token,
+                    episodes_by_subject_id,
+                    subject_details_by_id,
+                    completion_callback=CompleteSeries if unmatched_only else None,
+                )
+                await CompleteSeries(matched_series_id)
+            except (httpx.HTTPError, ValueError) as ex:
+                # 回復可能な作品単位エラーは開始時スナップショットの後続へ進む。
+                ## 外部リクエスト情報を残さないよう、ローカルIDと例外型だけを記録する。
+                logging.warning(
+                    f'[KonomiTVBS4KBangumiClient][syncUserCollections] Failed to fetch Bangumi metadata. '
+                    f'[series_id: {loaded_series.id}, error: {type(ex).__name__}]',
+                )
+                authentication_failed = (
+                    isinstance(ex, httpx.HTTPStatusError)
+                    and ex.response.status_code in {401, 403}
+                )
+                if continue_on_item_error is False or authentication_failed:
+                    raise
+                if item_failure_callback is not None:
+                    item_failure_callback()
+                await CompleteSeries(None)
+            finally:
+                # 成否やキャンセルにかかわらず、照合を開始した Series は次の有限バッチで後方へ回す。
+                await Series.filter(id=loaded_series.id).update(bangumi_last_attempt_at=datetime.now(tz=JST))
+        return len(matched_series_ids)
+
+
+    @classmethod
+    async def _syncUserCollectionSeries(
+        cls,
+        loaded_series: Series,
+        user: BangumiCollectionOwner,
+        subjects: list[dict[str, Any]],
+        access_token: str,
+        episodes_by_subject_id: dict[int, list[dict[str, Any]]],
+        subject_details_by_id: dict[int, dict[str, Any]],
+        completion_callback: Callable[[int], Awaitable[None]] | None = None,
+    ) -> int | None:
+        """收藏一覧と検索候補から1件のSeriesを照合する。
+
+        Args:
+            loaded_series: 開始時スナップショットから選んだSeries。
+            user: Bangumiアカウント連携済みのKonomiTVユーザー。
+            subjects: 連携ユーザーの收藏条目一覧。
+            access_token: Bangumi APIのアクセストークン。
+            episodes_by_subject_id: 条目ごとのepisode一覧キャッシュ。
+            subject_details_by_id: 条目ごとの詳細キャッシュ。
+            completion_callback: binding永続化時に照合済みSeries IDを通知する関数。
+
+        Returns:
+            照合済みのSeries ID。未照合または処理対象が消えた場合はNone。
+        """
+
+        series_lock = cls._series_merge_locks.setdefault(loaded_series.id, asyncio.Lock())
+        async with series_lock:
+            # ロック後に DB を読み直し、開始時スナップショットの未確定判定で上書きしない。
+            series = await Series.get_or_none(id=loaded_series.id)
+            if series is None:
+                return None
+
+            # すでに条目が確定している Series は、他ユーザーの收藏・検索・AI で上書きしない。
+            if series.bangumi_subject_id is not None:
+                subject = next(
+                    (subject for subject in subjects if int(subject['id']) == series.bangumi_subject_id),
+                    None,
+                )
+                subject_id = series.bangumi_subject_id
+                if completion_callback is not None:
+                    await completion_callback(series.id)
+                if subject is None:
+                    # 收藏に無くても既存 ID を正本とし、新規録画の episode 対応だけ進める。
+                    await cls._mapRecordedProgramEpisodes(
+                        series_id = series.id,
+                        subject_id = subject_id,
+                        access_token = access_token,
+                        episodes_by_subject_id = episodes_by_subject_id,
+                    )
+                    # 收藏一覧に無い既存 binding も、初放送日・評価は条目詳細から補完する。
                     await cls._fillSubjectSortMetadata(
                         series,
-                        subject,
+                        {},
                         subject_id,
                         access_token,
                         subject_details_by_id,
                     )
-                else:
-                    # 収藏照合の前に所属録画の EPG 証拠を組み立てる。番組名は採点と
-                    ## 検索の補助タイトル、放送日・概要・チャンネルは検索 AI の入力に使う。
-                    member_programs = await RecordedProgram.filter(series_id=series.id).values(
-                        'title', 'description', 'detail', 'genres', 'start_time', 'channel__name',
-                    )
-                    auxiliary_titles = ExtractEPGSearchQueries(member_programs, existing_title=series.title)
-                    epg_context = BuildSeriesEPGContext(member_programs)
-                    # 收藏候補にも検索と同じ EPG 日付整合を適用する。すべての録画より
-                    ## 後に放送開始した条目は採点対象から除く。採用候補が空のときは
-                    ## そのまま検索・AI へ渡し、他の Series の收藏一覧は変えない。
-                    scoreable_subjects = subjects
-                    if epg_context is not None:
-                        scoreable_subjects = [
-                            subject for subject in subjects
-                            if IsCandidateBroadcastConsistent(str(subject.get('date') or ''), epg_context['min_broadcast_date'])
-                        ]
-                    subject = cls.findSubject(series.title, scoreable_subjects, auxiliary_titles=auxiliary_titles)
-                    # 收藏照合で一意に決まらない作品だけ、bgm.tv 検索結果を hints にした AI 照合へ回す。
-                    if subject is None:
-                        from app.metadata.KonomiTVBS4KBangumiSubjectSearch import (
-                            KonomiTVBS4KBangumiSubjectSearch,
-                        )
-                        subject = await KonomiTVBS4KBangumiSubjectSearch.findSubjectForSeries(
-                            series, user, epg_context=epg_context, auxiliary_titles=auxiliary_titles,
-                        )
-                    if subject is None:
-                        continue
-                    subject_id = int(subject['id'])
-
-                # 検索・AI の待機中に無効化された結果は新規 binding として保存しない。
-                if IsBangumiExternalMetadataEnabled() is False:
-                    break
-                # 收藏一覧が返す SlimSubject を永続化すると同時に、同じ条目 ID に照合済みの Series を統合する。
-                ## ロック中に外部 API は呼ばず、異なるユーザーの定期同期が重なっても subject ごとに直列化する。
-                images = subject.get('images')
-                image_url = str(images.get('large') or images.get('common') or '') if isinstance(images, dict) else ''
-                # 初放送日・レーティングはソート用の補完メタデータ。保存済み評価を持つ Series は、
-                ## 評価のためだけに詳細を再取得せず、merge へも新しい評価を渡さない。
-                subject_rating = cls._extractSubjectRating(subject)
-                if subject_rating is None and series.bangumi_rating is None:
-                    subject_detail = await cls._getSubjectDetail(subject_id, access_token, subject_details_by_id)
-                    subject_rating = cls._extractSubjectRating(subject_detail) if subject_detail is not None else None
-                if series.bangumi_rating is not None:
-                    subject_rating = None
-                subject_merge_lock = cls._subject_merge_locks.setdefault(subject_id, asyncio.Lock())
-                async with subject_merge_lock:
-                    try:
-                        canonical_series = await SeriesMerger.mergeByBangumiSubject(
-                            series_id = series.id,
-                            subject_id = subject_id,
-                            subject_name = str(subject.get('name', '')) or None,
-                            subject_name_cn = str(subject.get('name_cn', '')) or None,
-                            subject_summary = str(subject.get('short_summary', '')) or None,
-                            subject_image_url = image_url or None,
-                            subject_date = cls._parseSubjectDate(str(subject.get('date') or '')),
-                            subject_rating = subject_rating,
-                        )
-                    except (IntegrityError, ValueError):
-                        # 別プロセスが同じ subject を先に統合した場合は、一意索引の衝突または削除済み ID として観測される。
-                        ## トランザクションのロールバック後に確定済みの主 Series を読み直し、外部 API を再試行しない。
-                        canonical_series = await Series.get_or_none(bangumi_subject_id=subject_id)
-                        if canonical_series is None:
-                            raise
-                matched_series_ids.add(canonical_series.id)
-                await cls._mapRecordedProgramEpisodes(
-                    series_id = canonical_series.id,
-                    subject_id = subject_id,
-                    access_token = access_token,
-                    episodes_by_subject_id = episodes_by_subject_id,
+                    return series.id
+                # 既存 binding の初放送日・評価は、未設定の行にだけ一度だけ補完する (定期再取得はしない)。
+                await cls._fillSubjectSortMetadata(
+                    series,
+                    subject,
+                    subject_id,
+                    access_token,
+                    subject_details_by_id,
                 )
-        return len(matched_series_ids)
+            else:
+                # 收藏照合の前に所属録画の EPG 証拠を組み立てる。番組名は採点と
+                ## 検索の補助タイトル、放送日・概要・チャンネルは検索 AI の入力に使う。
+                member_programs = await RecordedProgram.filter(series_id=series.id).values(
+                    'title', 'description', 'detail', 'genres', 'start_time', 'channel__name',
+                )
+                auxiliary_titles = ExtractEPGSearchQueries(member_programs, existing_title=series.title)
+                epg_context = BuildSeriesEPGContext(member_programs)
+                # 收藏候補にも検索と同じ EPG 日付整合を適用する。すべての録画より
+                ## 後に放送開始した条目は採点対象から除く。採用候補が空のときは
+                ## そのまま検索・AI へ渡し、他の Series の收藏一覧は変えない。
+                scoreable_subjects = subjects
+                if epg_context is not None:
+                    scoreable_subjects = [
+                        subject for subject in subjects
+                        if IsCandidateBroadcastConsistent(
+                            str(subject.get('date') or ''),
+                            epg_context['min_broadcast_date'],
+                        )
+                    ]
+                subject = cls.findSubject(series.title, scoreable_subjects, auxiliary_titles=auxiliary_titles)
+                # 收藏照合で一意に決まらない作品だけ、bgm.tv 検索結果を hints にした AI 照合へ回す。
+                if subject is None:
+                    from app.metadata.KonomiTVBS4KBangumiSubjectSearch import (
+                        KonomiTVBS4KBangumiSubjectSearch,
+                    )
+                    subject = await KonomiTVBS4KBangumiSubjectSearch.findSubjectForSeries(
+                        series, user, epg_context=epg_context, auxiliary_titles=auxiliary_titles,
+                    )
+                if subject is None:
+                    return None
+                subject_id = int(subject['id'])
+
+            # 検索・AI の待機中に無効化された結果は新規 binding として保存しない。
+            if IsBangumiExternalMetadataEnabled() is False:
+                return None
+            # 收藏一覧が返す SlimSubject を永続化すると同時に、同じ条目 ID に照合済みの Series を統合する。
+            ## ロック中に外部 API は呼ばず、異なるユーザーの定期同期が重なっても subject ごとに直列化する。
+            images = subject.get('images')
+            image_url = str(images.get('large') or images.get('common') or '') if isinstance(images, dict) else ''
+            # 初放送日・レーティングはソート用の補完メタデータ。保存済み評価を持つ Series は、
+            ## 評価のためだけに詳細を再取得せず、merge へも新しい評価を渡さない。
+            subject_rating = cls._extractSubjectRating(subject)
+            if subject_rating is None and series.bangumi_rating is None:
+                subject_detail = await cls._getSubjectDetail(subject_id, access_token, subject_details_by_id)
+                subject_rating = cls._extractSubjectRating(subject_detail) if subject_detail is not None else None
+            if series.bangumi_rating is not None:
+                subject_rating = None
+            subject_merge_lock = cls._subject_merge_locks.setdefault(subject_id, asyncio.Lock())
+            async with subject_merge_lock:
+                try:
+                    canonical_series = await SeriesMerger.mergeByBangumiSubject(
+                        series_id = series.id,
+                        subject_id = subject_id,
+                        subject_name = str(subject.get('name', '')) or None,
+                        subject_name_cn = str(subject.get('name_cn', '')) or None,
+                        subject_summary = str(subject.get('short_summary', '')) or None,
+                        subject_image_url = image_url or None,
+                        subject_date = cls._parseSubjectDate(str(subject.get('date') or '')),
+                        subject_rating = subject_rating,
+                    )
+                except (IntegrityError, ValueError):
+                    # 別プロセスが同じ subject を先に統合した場合は、一意索引の衝突または削除済み ID として観測される。
+                    ## トランザクションのロールバック後に確定済みの主 Series を読み直し、外部 API を再試行しない。
+                    canonical_series = await Series.get_or_none(bangumi_subject_id=subject_id)
+                    if canonical_series is None:
+                        raise
+            if completion_callback is not None:
+                await completion_callback(canonical_series.id)
+            await cls._mapRecordedProgramEpisodes(
+                series_id = canonical_series.id,
+                subject_id = subject_id,
+                access_token = access_token,
+                episodes_by_subject_id = episodes_by_subject_id,
+            )
+            return canonical_series.id
 
 
     @classmethod
@@ -647,16 +765,38 @@ class KonomiTVBS4KBangumiClient:
 
 
     @classmethod
-    async def syncAllLinkedUsers(cls, *, raise_on_error: bool = False) -> None:
+    async def syncAllLinkedUsers(
+        cls,
+        *,
+        raise_on_error: bool = False,
+        unmatched_only: bool = False,
+        continue_on_item_error: bool = False,
+        progress_callback: Callable[[int, int, int], Awaitable[None]] | None = None,
+    ) -> int:
         """
         管理者1件の共有 Bangumi 連携があれば收藏一覧をローカル Series へ反映する。
 
         Args:
             raise_on_error: 外部API失敗を認証情報を含まない例外として呼び出し元へ伝播するか。
+            unmatched_only: Bangumi 条目が未照合の Series だけを処理するか。
+            continue_on_item_error: 認証失敗以外の作品単位エラー後も開始時スナップショットを走査するか。
+            progress_callback: 処理済み件数・総件数・照合件数を作品ごとに通知する関数。
 
         Returns:
-            None
+            int: 継続可能な作品単位エラーの件数。
         """
+
+        failed_series_count = 0
+
+        def CountItemFailure() -> None:
+            """作品単位の失敗件数を増やす。
+
+            Returns:
+                None
+            """
+
+            nonlocal failed_series_count
+            failed_series_count += 1
 
         # None / TmdbOnly では新規の收藏同期を行わない。既存の bangumi_* は削除しない。
         if IsBangumiExternalMetadataEnabled() is False:
@@ -664,12 +804,22 @@ class KonomiTVBS4KBangumiClient:
                 '[KonomiTVBS4KBangumiClient][syncAllLinkedUsers] Bangumi metadata source is disabled. '
                 'Skipping collection sync.',
             )
-            return
+            if progress_callback is not None:
+                await progress_callback(0, 0, 0)
+            return failed_series_count
         try:
             owner = cls._sharedCollectionOwner()
             if owner is None:
-                return
-            matched_series_count = await cls.syncUserCollections(owner)
+                if progress_callback is not None:
+                    await progress_callback(0, 0, 0)
+                return failed_series_count
+            matched_series_count = await cls.syncUserCollections(
+                owner,
+                unmatched_only=unmatched_only,
+                continue_on_item_error=continue_on_item_error,
+                item_failure_callback=CountItemFailure,
+                progress_callback=progress_callback,
+            )
             logging.info(
                 f'[KonomiTVBS4KBangumiClient][syncAllLinkedUsers] Synchronized shared Bangumi collections. '
                 f'[matched_series: {matched_series_count}]',
@@ -681,14 +831,25 @@ class KonomiTVBS4KBangumiClient:
             )
             if raise_on_error:
                 raise BangumiMetadataSyncError(type(ex).__name__) from None
+        return failed_series_count
 
 
     @classmethod
-    def _startExclusiveSync(cls, *, raise_on_error: bool) -> asyncio.Task[None] | None:
+    def _startExclusiveSync(
+        cls,
+        *,
+        raise_on_error: bool,
+        unmatched_only: bool = False,
+        continue_on_item_error: bool = False,
+        progress_callback: Callable[[int, int, int], Awaitable[None]] | None = None,
+    ) -> asyncio.Task[int] | None:
         """awaitされるBangumi同期を通常schedulerと同じ所有集合へ登録する。
 
         Args:
             raise_on_error: 外部API失敗を認証情報を含まない例外として呼び出し元へ伝播するか。
+            unmatched_only: Bangumi 条目が未照合の Series だけを処理するか。
+            continue_on_item_error: 認証失敗以外の作品単位エラー後も開始時スナップショットを走査するか。
+            progress_callback: 処理済み件数・総件数・照合件数を作品ごとに通知する関数。
 
         Returns:
             呼び出し元が完了を待つBangumi同期task。別の同期が実行中ならNone。
@@ -697,7 +858,12 @@ class KonomiTVBS4KBangumiClient:
         # 確認から登録までawaitせず、pipeline・scan・通常schedulerの開始競合を防ぐ。
         if cls.hasRunningSync():
             return None
-        task = asyncio.create_task(cls.syncAllLinkedUsers(raise_on_error=raise_on_error))
+        task = asyncio.create_task(cls.syncAllLinkedUsers(
+            raise_on_error=raise_on_error,
+            unmatched_only=unmatched_only,
+            continue_on_item_error=continue_on_item_error,
+            progress_callback=progress_callback,
+        ))
         cls._sync_tasks.add(task)
         cls._exclusive_sync_tasks.add(task)
         task.add_done_callback(cls._sync_tasks.discard)
@@ -706,17 +872,29 @@ class KonomiTVBS4KBangumiClient:
 
 
     @classmethod
-    def startPipelineSync(cls) -> asyncio.Task[None]:
+    def startPipelineSync(
+        cls,
+        *,
+        progress_callback: Callable[[int, int, int], Awaitable[None]] | None = None,
+    ) -> asyncio.Task[int]:
         """pipeline用Bangumi同期を通常schedulerと同じ所有集合へ登録する。
 
+        Args:
+            progress_callback: 処理済み件数・総件数・照合件数を作品ごとに通知する関数。
+
         Returns:
-            pipelineが完了を待つBangumi同期task。
+            pipelineが完了を待ち、作品単位の失敗数を返すBangumi同期task。
 
         Raises:
             RuntimeError: 別のBangumi同期がすでに実行中の場合。
         """
 
-        task = cls._startExclusiveSync(raise_on_error=True)
+        task = cls._startExclusiveSync(
+            raise_on_error=True,
+            unmatched_only=True,
+            continue_on_item_error=True,
+            progress_callback=progress_callback,
+        )
         if task is None:
             raise RuntimeError('BangumiSyncBusy')
         return task

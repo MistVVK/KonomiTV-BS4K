@@ -74,8 +74,12 @@ NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 MAX_API_KEY_LENGTH = 8192
 RECORDED_SERIES_MANAGEMENT_DEFAULT_PAGE_SIZE = 30
 RECORDED_SERIES_MANAGEMENT_MAX_PAGE_SIZE = 100
-# 外部サービスを含む各段階は短い有限時間で閉じ、裏で処理を継続させない。
-RECORDED_SERIES_PIPELINE_STAGE_TIMEOUT_SECONDS = 90.0
+# Indexer は外部待機を含まないため従来の有限上限を維持する。
+RECORDED_SERIES_PIPELINE_INDEXER_TIMEOUT_SECONDS = 90.0
+# AI と外部同期は開始時バックログの全件処理を基本とし、実測に基づく絶対上限だけを設ける。
+RECORDED_SERIES_PIPELINE_AI_FALLBACK_TIMEOUT_SECONDS = 10_800.0
+RECORDED_SERIES_PIPELINE_EXTERNAL_SYNC_TIMEOUT_SECONDS = 3_600.0
+RECORDED_SERIES_PIPELINE_EPISODE_BACKFILL_TIMEOUT_SECONDS = 10_800.0
 
 
 _recorded_series_pipeline_start_lock = asyncio.Lock()
@@ -98,9 +102,13 @@ class _RecordedSeriesPipelineSummary(TypedDict):
     ai_processed_groups: int
     ai_remaining_groups: int
     tmdb_matched_series: int
+    tmdb_remaining_series: int
+    bangumi_matched_series: int
+    bangumi_remaining_series: int
     episode_resolved: int
     episode_ai_requests: int
     episode_skipped: int
+    episode_remaining_programs: int
 
 
 class RecordedSeriesStatusResponse(BaseModel):
@@ -1225,7 +1233,7 @@ async def _RunRecordedSeriesPipeline(
             existing_handle=handle,
         ) as history:
             await history.setStage('indexer_rebuild', 0.0)
-            async with asyncio.timeout(RECORDED_SERIES_PIPELINE_STAGE_TIMEOUT_SECONDS):
+            async with asyncio.timeout(RECORDED_SERIES_PIPELINE_INDEXER_TIMEOUT_SECONDS):
                 linked_count = await SeriesIndexer.rebuild(
                     scope=scope,
                     schedule_background_tasks=False,
@@ -1236,7 +1244,7 @@ async def _RunRecordedSeriesPipeline(
             ai_status = await SeriesAIFallbackTask.runBoundedBatch(
                 history,
                 retry_cancelled=True,
-                timeout_seconds=RECORDED_SERIES_PIPELINE_STAGE_TIMEOUT_SECONDS,
+                timeout_seconds=RECORDED_SERIES_PIPELINE_AI_FALLBACK_TIMEOUT_SECONDS,
                 progress_start=0.25,
                 progress_end=0.5,
                 schedule_external_sync=False,
@@ -1246,7 +1254,7 @@ async def _RunRecordedSeriesPipeline(
                 ai_status['failed_count'] > 0
                 or (
                     ai_status['state'] == 'Stopped'
-                    and ai_status['stopped_reason'] != 'BatchLimitReached'
+                    and ai_status['stopped_reason'] != 'StageTimeoutReached'
                 )
             ):
                 raise RuntimeError('SeriesAIFallbackPartialFailure')
@@ -1257,14 +1265,81 @@ async def _RunRecordedSeriesPipeline(
                 or KonomiTVBS4KBangumiClient.hasRunningSync()
             ):
                 raise RuntimeError('ExternalSyncBusy')
-            tmdb_sync_task = KonomiTVBS4KTmdbClient.startPipelineSync(maximum_series=1)
-            bangumi_sync_task = KonomiTVBS4KBangumiClient.startPipelineSync()
+
+            # 2サービスの開始時総数と完了数を共有し、作品1件の完了ごとに親progressを更新する。
+            external_progress_lock = asyncio.Lock()
+            tmdb_progress_ready = False
+            tmdb_processed_series = 0
+            tmdb_total_series = 0
+            tmdb_matched_series = 0
+            bangumi_progress_ready = False
+            bangumi_processed_series = 0
+            bangumi_total_series = 0
+            bangumi_matched_series = 0
+
+            async def UpdateExternalProgress(
+                source: Literal['Tmdb', 'Bangumi'],
+                processed: int,
+                total: int,
+                matched: int,
+            ) -> None:
+                """外部同期2経路の進捗を単一stageの範囲へ合成する。
+
+                Args:
+                    source: 進捗を通知した外部サービス。
+                    processed: 完了済みSeries数。
+                    total: 開始時の対象Series総数。
+                    matched: 今回照合できたSeries数。
+
+                Returns:
+                    None
+                """
+
+                nonlocal tmdb_progress_ready, tmdb_processed_series, tmdb_total_series, tmdb_matched_series
+                nonlocal bangumi_progress_ready, bangumi_processed_series, bangumi_total_series, bangumi_matched_series
+                async with external_progress_lock:
+                    if source == 'Tmdb':
+                        tmdb_progress_ready = True
+                        tmdb_processed_series = processed
+                        tmdb_total_series = total
+                        tmdb_matched_series = matched
+                    else:
+                        bangumi_progress_ready = True
+                        bangumi_processed_series = processed
+                        bangumi_total_series = total
+                        bangumi_matched_series = matched
+                    # 両方の開始時総数が確定する前は、後着側によるprogressの巻き戻りを避ける。
+                    if tmdb_progress_ready and bangumi_progress_ready:
+                        processed_total = tmdb_processed_series + bangumi_processed_series
+                        target_total = tmdb_total_series + bangumi_total_series
+                        stage_fraction = processed_total / target_total if target_total > 0 else 1.0
+                        await history.setProgress(0.5 + 0.25 * stage_fraction)
+
+            tmdb_sync_task = KonomiTVBS4KTmdbClient.startPipelineSync(
+                progress_callback=lambda processed, total, matched: UpdateExternalProgress(
+                    'Tmdb', processed, total, matched,
+                ),
+            )
+            bangumi_sync_task = KonomiTVBS4KBangumiClient.startPipelineSync(
+                progress_callback=lambda processed, total, matched: UpdateExternalProgress(
+                    'Bangumi', processed, total, matched,
+                ),
+            )
+            external_item_failure_count = 0
+            external_sync_timeout = asyncio.timeout(RECORDED_SERIES_PIPELINE_EXTERNAL_SYNC_TIMEOUT_SECONDS)
             try:
-                async with asyncio.timeout(RECORDED_SERIES_PIPELINE_STAGE_TIMEOUT_SECONDS):
-                    tmdb_matched_series, _ = await asyncio.gather(
-                        tmdb_sync_task,
-                        bangumi_sync_task,
-                    )
+                try:
+                    async with external_sync_timeout:
+                        tmdb_failed_series, bangumi_failed_series = await asyncio.gather(
+                            tmdb_sync_task,
+                            bangumi_sync_task,
+                        )
+                        external_item_failure_count = tmdb_failed_series + bangumi_failed_series
+                except TimeoutError:
+                    if external_sync_timeout.expired() is False:
+                        raise
+                    # 絶対上限では現在の外部待機を止め、未完了数をsummaryへ残して後続へ進む。
+                    pass
             finally:
                 # timeout・片側失敗でも同期taskを裏で継続させず、両方を回収してから失敗させる。
                 for sync_task in (tmdb_sync_task, bangumi_sync_task):
@@ -1272,15 +1347,19 @@ async def _RunRecordedSeriesPipeline(
                         sync_task.cancel()
                 await asyncio.gather(tmdb_sync_task, bangumi_sync_task, return_exceptions=True)
             await history.setProgress(0.75)
+            # 回復可能な作品単位エラーでは開始時スナップショットを全走査し、
+            ## 後続stageへ進める前に既存の部分失敗契約へ載せる。
+            if external_item_failure_count > 0:
+                raise RuntimeError('ExternalSyncPartialFailure')
 
             await history.setStage('episode_backfill', 0.75)
             try:
-                async with asyncio.timeout(RECORDED_SERIES_PIPELINE_STAGE_TIMEOUT_SECONDS):
-                    episode_summary = await RecordedEpisodeAutomation.runBoundedBackfill(
-                        history,
-                        progress_start=0.75,
-                        progress_end=1.0,
-                    )
+                episode_summary = await RecordedEpisodeAutomation.runBoundedBackfill(
+                    history,
+                    progress_start=0.75,
+                    progress_end=1.0,
+                    timeout_seconds=RECORDED_SERIES_PIPELINE_EPISODE_BACKFILL_TIMEOUT_SECONDS,
+                )
             except RecordedEpisodeBackfillBusyError as ex:
                 raise RuntimeError('EpisodeBackfillBusy') from ex
             if episode_summary['failed'] > 0:
@@ -1296,9 +1375,13 @@ async def _RunRecordedSeriesPipeline(
                 ai_processed_groups=ai_status['processed_groups'],
                 ai_remaining_groups=ai_remaining_groups,
                 tmdb_matched_series=tmdb_matched_series,
+                tmdb_remaining_series=max(0, tmdb_total_series - tmdb_processed_series),
+                bangumi_matched_series=bangumi_matched_series,
+                bangumi_remaining_series=max(0, bangumi_total_series - bangumi_processed_series),
                 episode_resolved=episode_summary['resolved'],
                 episode_ai_requests=episode_summary['ai_requests'],
                 episode_skipped=episode_summary['skipped'],
+                episode_remaining_programs=episode_summary['remaining'],
             )
             await history.finish(summary=cast(dict[str, object], summary))
     except asyncio.CancelledError:
