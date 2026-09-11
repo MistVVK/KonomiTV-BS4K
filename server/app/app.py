@@ -28,6 +28,7 @@ from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
+from app.metadata.KonomiTVBS4KSeriesImage import KonomiTVBS4KSeriesImage
 from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
 from app.metadata.RecordedEpisodeResolver import RecordedEpisodeResolver
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
@@ -378,6 +379,9 @@ async def Startup():
     # 所属は HonomiTV Indexer 本線。Resolver は起動しない。
     from app.metadata.SeriesIndexer import SeriesIndexer
     await SeriesIndexer.rebuild()
+
+    # Indexer が削除した空 Series も反映した DB を正本に、到達不能な外部 ID の表紙だけを回収する。
+    await KonomiTVBS4KSeriesImage.cleanupOrphanedImages()
 
     # Indexer 未所属だけを EPG タイトル単位で束ね、Web 検索をスキャン外で直列実行する。
     await SeriesAIFallbackTask.start()

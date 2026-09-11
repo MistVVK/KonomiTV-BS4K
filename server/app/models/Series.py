@@ -45,6 +45,7 @@ class Series(TortoiseModel):
     bangumi_subject_name = cast(TortoiseField[str | None], fields.TextField(null=True))
     bangumi_subject_name_cn = cast(TortoiseField[str | None], fields.TextField(null=True))
     bangumi_subject_summary = cast(TortoiseField[str | None], fields.TextField(null=True))
+    # 旧カラム名を維持しつつ、クライアントへ返す URL ではなく Bangumi CDN の画像パスを保持する。
     bangumi_subject_image_url = cast(TortoiseField[str | None], fields.TextField(null=True))
     # Bangumi 条目のレーティング (rating.score)。照合確定時に一度だけ保存する。
     bangumi_rating = cast(TortoiseField[float | None], fields.FloatField(null=True))
@@ -58,6 +59,7 @@ class Series(TortoiseModel):
     tmdb_enrichment_pending = fields.BooleanField(default=False)
     tmdb_name = cast(TortoiseField[str | None], fields.TextField(null=True))
     tmdb_overview = cast(TortoiseField[str | None], fields.TextField(null=True))
+    # 旧カラム名を維持しつつ、クライアントへ返す URL ではなく TMDb の poster_path を保持する。
     tmdb_poster_url = cast(TortoiseField[str | None], fields.TextField(null=True))
     tmdb_backdrop_url = cast(TortoiseField[str | None], fields.TextField(null=True))
     # TMDb の人気度と評価。enrich 時に一度だけ保存し、定期再取得はしない。

@@ -20,7 +20,7 @@ class SeriesMerger:
         subject_name: str | None,
         subject_name_cn: str | None,
         subject_summary: str | None,
-        subject_image_url: str | None,
+        subject_image_identifier: str | None,
         subject_date: date | None,
         subject_rating: float | None,
     ) -> Series:
@@ -33,7 +33,7 @@ class SeriesMerger:
             subject_name (str | None): Bangumi 条目の原題。
             subject_name_cn (str | None): Bangumi 条目の中文題。
             subject_summary (str | None): Bangumi 条目の概要。
-            subject_image_url (str | None): Bangumi 条目の画像 URL。
+            subject_image_identifier (str | None): Bangumi 条目の画像パス。
             subject_date (date | None): 条目の放送開始日。
             subject_rating (float | None): 条目のレーティング (rating.score)。
 
@@ -198,7 +198,7 @@ class SeriesMerger:
                     subject_name,
                     subject_name_cn,
                     subject_summary,
-                    subject_image_url,
+                    subject_image_identifier,
                     subject_date,
                     'Tmdb',
                     subject_date,

@@ -1,11 +1,13 @@
 
+import hashlib
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, HTTPException, Path, Query, status
+from fastapi import APIRouter, HTTPException, Path, Query, Request, Response, status
 from tortoise.expressions import Q
 from tortoise.functions import Max
 
 from app import logging, schemas
+from app.metadata.KonomiTVBS4KSeriesImage import KonomiTVBS4KSeriesImage
 from app.metadata.SeriesCatalog import (
     CATALOG_PAGE_SIZE,
     GetSeriesListPosition,
@@ -204,6 +206,77 @@ async def SeriesListPositionAPI(
             detail = 'Specified series_id was not found',
         )
     return schemas.SeriesListPosition(page=page)
+
+
+@router.get(
+    '/{series_id}/poster',
+    summary = 'シリーズ表紙 API',
+    response_description = 'ローカル保存済みの WebP 表紙。',
+    response_model = None,
+)
+async def SeriesPosterAPI(
+    series_id: Annotated[int, Path(description='シリーズ番組の ID 。')],
+    request: Request,
+) -> Response:
+    """
+    Bangumi、TMDb の順で WebP 表紙を返し、同じ URL の差し替えを ETag で再検証する。
+
+    Args:
+        series_id (int): シリーズ番組の ID。
+        request (Request): If-None-Match を含む HTTP リクエスト。
+
+    Returns:
+        Response: WebP、または ETag が一致する場合の 304。
+
+    Raises:
+        HTTPException: Series または取得可能な表紙が存在しない場合の 404。
+    """
+
+    series = await Series.get_or_none(id=series_id)
+    if series is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Series poster was not found')
+    # パスではなくバイト列を受け取るため、invalidation の unlink と配信が競合しない。
+    poster_bytes = await KonomiTVBS4KSeriesImage.ensurePoster(series)
+    if poster_bytes is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Series poster was not found')
+
+    # WebP は同じ API URL で差し替えるため immutable にせず、内容ハッシュの ETag を毎回再検証させる。
+    etag = f'"{hashlib.sha256(poster_bytes).hexdigest()}"'
+    response_headers = {
+        'Cache-Control': 'public, max-age=0, must-revalidate',
+        'ETag': etag,
+    }
+    if _IsETagMatched(request.headers.get('If-None-Match'), etag):
+        return Response(status_code=status.HTTP_304_NOT_MODIFIED, headers=response_headers)
+    return Response(
+        content=poster_bytes,
+        media_type='image/webp',
+        headers=response_headers,
+    )
+
+
+def _IsETagMatched(if_none_match: str | None, current_etag: str) -> bool:
+    """
+    GET の If-None-Match を現在の表紙と比較し、一致するか返す。
+
+    Args:
+        if_none_match (str | None): ブラウザが送った If-None-Match。
+        current_etag (str): 現在の表紙に付与する ETag。
+
+    Returns:
+        bool: `*` またはいずれかのタグが現在値と一致する場合は True。
+    """
+
+    if if_none_match is None:
+        return False
+    normalized_current = current_etag.removeprefix('W/').strip()
+    for raw_etag in if_none_match.split(','):
+        candidate = raw_etag.strip()
+        if candidate == '*':
+            return True
+        if candidate.removeprefix('W/').strip() == normalized_current:
+            return True
+    return False
 
 
 @router.get(

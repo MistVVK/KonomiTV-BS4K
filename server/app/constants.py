@@ -47,6 +47,8 @@ DATA_DIR = BASE_DIR / 'data'
 ACCOUNT_ICON_DIR = DATA_DIR / 'account-icons'
 ## サムネイル画像があるディレクトリ
 THUMBNAILS_DIR = DATA_DIR / 'thumbnails'
+## TMDb / Bangumi から取得して WebP へ変換したシリーズ表紙の保存先
+KONOMITV_BS4K_SERIES_IMAGES_DIR = DATA_DIR / 'series-images'
 ## 変換済み録画字幕 (WebVTT) のキャッシュディレクトリ
 RECORDED_SUBTITLES_DIR = DATA_DIR / 'recorded-subtitles'
 ## オフライン保存の完成済みパッケージと永続ジョブ状態を保持するディレクトリ
@@ -913,5 +915,14 @@ TMDB_HTTPX_CLIENT = lambda: httpx.AsyncClient(
     # query に API キーを含むため、別ホストへのリダイレクトで転送しない。
     follow_redirects = False,
     # 10 秒応答がない場合はタイムアウトする
+    timeout = 10.0,
+)
+
+# シリーズ表紙の取得で利用する httpx.AsyncClient の設定
+## 画像 URL は認証情報を含まないが、保存済み識別子から許可済み CDN へだけ接続し、
+## 別ホストへの redirect は追跡しない。
+KONOMITV_BS4K_SERIES_IMAGE_HTTPX_CLIENT = lambda: httpx.AsyncClient(
+    headers = API_REQUEST_HEADERS,
+    follow_redirects = False,
     timeout = 10.0,
 )

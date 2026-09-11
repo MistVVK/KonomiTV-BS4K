@@ -12,6 +12,7 @@ from tortoise.expressions import Q
 
 from app import logging, schemas
 from app.constants import BANGUMI_REQUEST_HEADERS, HTTPX_CLIENT, JST
+from app.metadata.KonomiTVBS4KSeriesImage import KonomiTVBS4KSeriesImage
 from app.metadata.RecordedEpisodeResolver import ParseSinglePositiveIntegerEpisode
 from app.metadata.RecordedSeriesCandidates import (
     BuildSeriesEPGContext,
@@ -667,6 +668,7 @@ class KonomiTVBS4KBangumiClient:
             ## ロック中に外部 API は呼ばず、異なるユーザーの定期同期が重なっても subject ごとに直列化する。
             images = subject.get('images')
             image_url = str(images.get('large') or images.get('common') or '') if isinstance(images, dict) else ''
+            image_identifier = KonomiTVBS4KSeriesImage.normalizeBangumiImageIdentifier(image_url)
             # 初放送日・レーティングはソート用の補完メタデータ。保存済み評価を持つ Series は、
             ## 評価のためだけに詳細を再取得せず、merge へも新しい評価を渡さない。
             subject_rating = cls._extractSubjectRating(subject)
@@ -677,6 +679,15 @@ class KonomiTVBS4KBangumiClient:
                 subject_rating = None
             subject_merge_lock = cls._subject_merge_locks.setdefault(subject_id, asyncio.Lock())
             async with subject_merge_lock:
+                # 未照合 Series が既存条目へ統合される場合も、残る行の以前の画像識別子と比較する。
+                previous_series = (
+                    series
+                    if series.bangumi_subject_id == subject_id
+                    else await Series.get_or_none(bangumi_subject_id=subject_id)
+                )
+                previous_image_identifier = (
+                    previous_series.bangumi_subject_image_url if previous_series is not None else None
+                )
                 try:
                     canonical_series = await SeriesMerger.mergeByBangumiSubject(
                         series_id = series.id,
@@ -684,7 +695,7 @@ class KonomiTVBS4KBangumiClient:
                         subject_name = str(subject.get('name', '')) or None,
                         subject_name_cn = str(subject.get('name_cn', '')) or None,
                         subject_summary = str(subject.get('short_summary', '')) or None,
-                        subject_image_url = image_url or None,
+                        subject_image_identifier = image_identifier,
                         subject_date = cls._parseSubjectDate(str(subject.get('date') or '')),
                         subject_rating = subject_rating,
                     )
@@ -694,6 +705,9 @@ class KonomiTVBS4KBangumiClient:
                     canonical_series = await Series.get_or_none(bangumi_subject_id=subject_id)
                     if canonical_series is None:
                         raise
+                # 条目 ID は同じでも画像キーは差し替わるため、次の GET で新しい表紙を取り直す。
+                if previous_image_identifier != image_identifier:
+                    await KonomiTVBS4KSeriesImage.invalidateBangumiPoster(subject_id)
             if completion_callback is not None:
                 await completion_callback(canonical_series.id)
             await cls._mapRecordedProgramEpisodes(

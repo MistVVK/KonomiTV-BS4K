@@ -34,6 +34,7 @@ from typing_extensions import TypedDict
 
 from app import logging
 from app.constants import JST, TMDB_HTTPX_CLIENT
+from app.metadata.KonomiTVBS4KSeriesImage import KonomiTVBS4KSeriesImage
 from app.metadata.RecordedSeriesCandidates import (
     BuildSeriesEPGContext,
     IsCandidateBroadcastConsistent,
@@ -70,7 +71,7 @@ class TmdbSeriesDetails(TypedDict):
     tmdb_id: int
     name: str
     overview: str
-    poster_url: str | None
+    poster_path: str | None
     backdrop_url: str | None
     # TV のレギュラーシーズンと特別編の season_number。映画では空リスト。
     season_numbers: list[int]
@@ -387,7 +388,7 @@ class KonomiTVBS4KTmdbClient:
             tmdb_id=tmdb_id,
             name=name,
             overview=overview,
-            poster_url=cls._buildImageURL(payload.get('poster_path'), cls.POSTER_SIZE),
+            poster_path=cls._extractImagePath(payload.get('poster_path')),
             backdrop_url=cls._buildImageURL(payload.get('backdrop_path'), cls.BACKDROP_SIZE),
             season_numbers=season_numbers,
             first_air_date=first_air_date,
@@ -957,16 +958,20 @@ class KonomiTVBS4KTmdbClient:
         ## 既存値がある Series は再取得しても上書きしない。
         enrichment_fields['tmdb_popularity'] = Coalesce(F('tmdb_popularity'), details['popularity'])
         enrichment_fields['tmdb_vote_average'] = Coalesce(F('tmdb_vote_average'), details['vote_average'])
+        poster_identifier_changed = series.tmdb_poster_url != details['poster_path']
         updated = await Series.filter(id=series.id, tmdb_id=tmdb_id, tmdb_media_type=media_type).update(
             tmdb_name=details['name'],
             tmdb_overview=details['overview'],
-            tmdb_poster_url=details['poster_url'],
+            tmdb_poster_url=details['poster_path'],
             tmdb_backdrop_url=details['backdrop_url'],
             updated_at=datetime.now(tz=JST),
             **enrichment_fields,
         )
         if updated == 0:
             return False
+        # 作品 ID は同じでも poster_path は差し替わるため、次の GET で新しい表紙を取り直す。
+        if poster_identifier_changed:
+            await KonomiTVBS4KSeriesImage.invalidateTmdbPoster(media_type, tmdb_id)
         if media_type == 'tv':
             created_count, episode_structure_completed = await cls._buildEpisodeStructure(
                 series.id,
@@ -1383,6 +1388,23 @@ class KonomiTVBS4KTmdbClient:
         if isinstance(raw_path, str) is False or raw_path == '':
             return None
         return f'{KonomiTVBS4KTmdbClient.IMAGE_BASE_URL}/{size}{raw_path}'
+
+
+    @staticmethod
+    def _extractImagePath(raw_path: Any) -> str | None:
+        """
+        TMDb 応答の画像パスをローカル取得用のソース識別子として取り出す。
+
+        Args:
+            raw_path (Any): 応答の poster_path。
+
+        Returns:
+            str | None: `/` 始まりの画像パス。画像が無い・形式が異なる場合は None。
+        """
+
+        if isinstance(raw_path, str) is False or raw_path.startswith('/') is False or raw_path.startswith('//'):
+            return None
+        return raw_path
 
 
     @staticmethod
