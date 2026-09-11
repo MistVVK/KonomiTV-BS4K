@@ -37,9 +37,13 @@ from app.constants import JST, TMDB_HTTPX_CLIENT
 from app.metadata.KonomiTVBS4KSeriesImage import KonomiTVBS4KSeriesImage
 from app.metadata.RecordedSeriesCandidates import (
     BuildSeriesEPGContext,
-    IsCandidateBroadcastConsistent,
 )
 from app.metadata.RecordedSeriesSettings import IsTmdbExternalMetadataEnabled
+from app.metadata.SeriesIndexer import (
+    PROGRAM_MARK_PATTERN,
+    PROGRAM_SLOT_MARK_PATTERN,
+    NormalizeSeriesTitle,
+)
 from app.metadata.SeriesTitleParser import (
     ExtractEPGSearchQueries,
     ExtractMovieWorkTitle,
@@ -48,6 +52,17 @@ from app.models.RecordedEpisode import SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series, TmdbMediaType
 from app.utils.KonomiTVBS4KTmdbStore import KonomiTVBS4KTmdbStore
+
+
+# 放映バリアントの接尾辞。コメンタリー版・完全版・ディレクターズカットは本編と同じ作品の
+## 再編集版で、TMDb には本編だけが登録されるため、検索クエリからだけ外す
+## (DB 保存タイトルと AI へ渡す原文は変えない)。
+_BROADCAST_VARIANT_SUFFIX_PATTERN = re.compile(
+    r'\s*(?:コメンタリー版|完全版|ディレクターズカット(?:版)?)$',
+)
+# 末尾の話数表記 (#07) と括弧年号 ((2024) / （2024）)。本編作品の検索を妨げる装飾だけを外す。
+_TRAILING_EPISODE_MARK_PATTERN = re.compile(r'\s*#\d+(?:\.\d+)?$')
+_TRAILING_YEAR_PATTERN = re.compile(r'\s*[\(（]\d{4}[\)）]$')
 
 
 class TmdbSearchCandidate(TypedDict):
@@ -123,6 +138,9 @@ class KonomiTVBS4KTmdbClient:
     # 検索は TV・映画それぞれ上位5件まで。hints へ載せるのは TV と映画を交互に6件。
     SEARCH_LIMIT = 5
     HINT_LIMIT = 6
+    # 主クエリが 0 件のときに試す正規化フォールバッククエリの上限。
+    ## TMDb への再検索は 0-hit 時だけに限定し、無限リトライを防ぐ。
+    NORMALIZED_FALLBACK_QUERY_LIMIT = 4
     # 1作品あたりの別名タイトル上限。プロンプトを肥大させないため検索結果の一部だけ使う。
     ALTERNATIVE_TITLE_LIMIT = 8
     # 接続試験に使う、認証だけを確認できる最も軽いエンドポイント。
@@ -239,19 +257,48 @@ class KonomiTVBS4KTmdbClient:
             (quoted_title_match.group(1) or quoted_title_match.group(2)).strip()
             if quoted_title_match is not None else ''
         )
+        # 主クエリが 0 件のときの再検索語。bgm 準拠の正規化と放映バリアント除去を
+        ## Series タイトルと EPG 由来の補助クエリから組み立て、重複を除いて有限件数に切る。
+        fallback_queries = cls._buildNormalizedFallbackQueries(series_title, auxiliary_queries or [])
         # 一方の検索が失敗しても、取得できた種別の hints は照合へ渡す。
         results_by_type: dict[TmdbMediaType, list[dict[str, Any]]] = {}
         for media_type in ('tv', 'movie'):
+            # 主・引用部・フォールバック・EPG 補助の全段階を横断して同じ検索語を一度だけ送る。
+            ## fallback や引用部が別の EPG 補助クエリと一致しても再送しない (task の重複排除)。
+            tried_queries = {series_title}
             try:
                 results_by_type[media_type] = await cls._search(f'/search/{media_type}', series_title, api_key)
                 if not results_by_type[media_type] and quoted_title and quoted_title != series_title:
+                    tried_queries.add(quoted_title)
                     results_by_type[media_type] = await cls._search(f'/search/{media_type}', quoted_title, api_key)
+                # 主クエリと引用部が 0 件のとき、正規化済みのフォールバッククエリを順に試す。
+                ## 装飾付きタイトルでは本編作品に届かないため、検索語だけを変えて再検索する。
+                ## フォールバックの1件が失敗しても、取得済みの結果は捨てない。
+                for fallback_query in fallback_queries:
+                    if results_by_type[media_type]:
+                        break
+                    if fallback_query in tried_queries:
+                        continue
+                    tried_queries.add(fallback_query)
+                    try:
+                        results_by_type[media_type] = await cls._search(f'/search/{media_type}', fallback_query, api_key)
+                    except (httpx.HTTPError, ValueError) as ex:
+                        logging.warning(
+                            f'[KonomiTVBS4KTmdbClient] TMDb fallback search skipped. '
+                            f'[media_type: {media_type}, error: {type(ex).__name__}]',
+                        )
+                        if raise_on_error:
+                            raise
+                        break
                 # Series タイトルと引用内作品名の両方が空のとき、EPG 由来の補助クエリを
                 ## 順に試す。EPG 全文をクエリへ足すことはせず、作品名だけを検索語にする。
                 ## 補助クエリの1件が失敗しても、取得済みの結果は捨てない。
                 for auxiliary_query in auxiliary_queries or []:
                     if results_by_type[media_type]:
                         break
+                    if auxiliary_query in tried_queries:
+                        continue
+                    tried_queries.add(auxiliary_query)
                     try:
                         results_by_type[media_type] = await cls._search(f'/search/{media_type}', auxiliary_query, api_key)
                     except (httpx.HTTPError, ValueError) as ex:
@@ -307,6 +354,78 @@ class KonomiTVBS4KTmdbClient:
                 alternative_titles=await cls._getAlternativeTitles(media_type, tmdb_id, api_key),
             ))
         return candidates
+
+
+    @classmethod
+    def _buildNormalizedFallbackQueries(cls, series_title: str, auxiliary_queries: list[str]) -> list[str]:
+        """
+        主クエリが 0 件のときに試す再検索クエリを、bgm 準拠の正規化で組み立てる。
+
+        Args:
+            series_title (str): ローカル Series の表示タイトル。
+            auxiliary_queries (list[str]): 所属録画の EPG から抽出した補助クエリ。
+
+        Returns:
+            list[str]: 重複を除いた再検索クエリ。NORMALIZED_FALLBACK_QUERY_LIMIT 件まで。
+        """
+
+        queries: list[str] = []
+
+        def Append(query: str) -> None:
+            """主クエリや既出クエリと同じ検索語は再試行しない。
+
+            Args:
+                query (str): 追加候補の検索語。
+            """
+
+            if query != '' and query != series_title and query not in queries:
+                queries.append(query)
+
+        # (a) Bangumi と同じ正規化。NormalizeSeriesTitle (NFKC・空白除去・casefold) のあと
+        ## 末尾句読点を外す変換で、KonomiTVBS4KBangumiClient._normalizeSubjectTitle と同じ形。
+        Append(NormalizeSeriesTitle(series_title).rstrip('。.!！?？'))
+        # (b) 放映バリアント接尾辞の除去。コメンタリー版などの再編集版は TMDb では本編に
+        ## 登録されるため、Series タイトルと所属 EPG 由来の補助クエリの両方から本編名を引く。
+        ## task の (a)→(b) の順に合成し、「作品名 完全版！」のように句読点が接尾辞より後ろへ
+        ## 来るタイトルでも本編クエリへ届くよう、正規化・句読点除去済みの結果へ適用する。
+        for source in [series_title, *auxiliary_queries]:
+            normalized_source = NormalizeSeriesTitle(source).rstrip('。.!！?？')
+            stripped = cls._stripBroadcastVariantMarkers(normalized_source)
+            # 変換しても元と同じ補助クエリは既存の補助検索ループがそのまま試すため、
+            ## fallback へは追加しない (同じ検索語の重複送信を防ぐ)。
+            if source != series_title and stripped == source:
+                continue
+            Append(stripped)
+        return queries[:cls.NORMALIZED_FALLBACK_QUERY_LIMIT]
+
+
+    @staticmethod
+    def _stripBroadcastVariantMarkers(title: str) -> str:
+        """
+        検索クエリ用に、タイトル末尾の放映バリアント装飾を外す。
+
+        Args:
+            title (str): Series タイトルまたは EPG 由来の補助クエリ。
+
+        Returns:
+            str: 番組記号・放送枠マーク・末尾の話数 #NN・括弧年号・再編集版接尾辞を
+                外したタイトル。外すものが無ければ入力と同じ文字列。
+        """
+
+        stripped = title.strip()
+        # 「コメンタリー版 #07[多]」のように末尾装飾が重なるため、外すと次の装飾が
+        ## 末尾へ出る。変化がなくなるまで最大3回剥がし、無限ループは防ぐ。
+        for _ in range(3):
+            previous = stripped
+            # KonomiTV が番組記号・放送枠として既知の [多][字]・<+Ultra> 系を外す。
+            stripped = PROGRAM_MARK_PATTERN.sub('', stripped)
+            stripped = PROGRAM_SLOT_MARK_PATTERN.sub('', stripped)
+            stripped = _TRAILING_EPISODE_MARK_PATTERN.sub('', stripped)
+            stripped = _TRAILING_YEAR_PATTERN.sub('', stripped)
+            stripped = _BROADCAST_VARIANT_SUFFIX_PATTERN.sub('', stripped).strip()
+            if stripped == previous:
+                break
+        return stripped
 
 
     @staticmethod
@@ -778,8 +897,9 @@ class KonomiTVBS4KTmdbClient:
         """
 
         # 所属録画の EPG を証拠として組み立てる。番組名はタイトル検索が空のときの
-        ## 補助クエリ、放送日は候補の初放送・公開日との突合、概要と詳細とチャンネルは
-        ## AI 選択の入力に使う。
+        ## 補助クエリ、放送日・概要・詳細・チャンネルは AI 選択の入力に使う。
+        ## 放送日は候補の排除 (ハードゲート) には使わず、矛盾判断は証拠を受け取った
+        ## AI へ委ねる (コミュニティ入力の初放送日は誤登録・特別版先行で硬ゲートが成立しない)。
         member_programs = await RecordedProgram.filter(series_id=series.id).values(
             'title', 'genres', 'description', 'detail', 'start_time', 'channel__name',
         )
@@ -814,10 +934,7 @@ class KonomiTVBS4KTmdbClient:
                 candidate for candidate in candidates
                 if candidate['media_type'] == ('movie' if is_movie_series else 'tv')
             ]
-        min_broadcast_date = epg_context['min_broadcast_date'] if epg_context is not None else ''
-        # すべての録画より後に初放送・公開される候補は、その録画の取得元になり得ないため落とす。
-        candidates = cls._filterBroadcastConsistentCandidates(candidates, min_broadcast_date)
-        # 日付突合などで採用候補が空になったとき、EPG 由来の補助クエリを対象検索へ
+        # 媒体種別の絞り込みで採用候補が空になったとき、EPG 由来の補助クエリを対象検索へ
         ## 使ってもう一度同じ採用条件を通す。それでも一意でなければ unresolved を維持する。
         for auxiliary_query in auxiliary_queries:
             if len(candidates) > 0:
@@ -832,7 +949,6 @@ class KonomiTVBS4KTmdbClient:
                     candidate for candidate in retry_candidates
                     if candidate['media_type'] == ('movie' if is_movie_series else 'tv')
                 ]
-            retry_candidates = cls._filterBroadcastConsistentCandidates(retry_candidates, min_broadcast_date)
             if len(retry_candidates) > 0:
                 candidates = retry_candidates
         if len(candidates) == 0:
@@ -844,29 +960,6 @@ class KonomiTVBS4KTmdbClient:
         return await KonomiTVBS4KTmdbSeriesSearch.findCandidateForSeries(
             series, candidates, epg_context=epg_context,
         )
-
-
-    @staticmethod
-    def _filterBroadcastConsistentCandidates(
-        candidates: list[TmdbSearchCandidate],
-        min_broadcast_date: str,
-    ) -> list[TmdbSearchCandidate]:
-        """
-        所属録画の最古放送日より後に初放送・公開される候補を落とす。
-
-        Args:
-            candidates (list[TmdbSearchCandidate]): 媒体種別の絞り込み済み TMDb 候補。
-            min_broadcast_date (str): 所属録画の最古の放送開始日 (YYYY-MM-DD)。不明は空文字。
-
-        Returns:
-            list[TmdbSearchCandidate]: 放送日・公開日が矛盾しない候補。
-        """
-
-        # 検索結果が空文字の日付は不明として保持するため、候補の排除はここに一元する。
-        return [
-            candidate for candidate in candidates
-            if IsCandidateBroadcastConsistent(candidate['first_air_date'], min_broadcast_date)
-        ]
 
 
     @classmethod

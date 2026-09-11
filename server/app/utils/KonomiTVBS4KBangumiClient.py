@@ -16,7 +16,6 @@ from app.metadata.KonomiTVBS4KSeriesImage import KonomiTVBS4KSeriesImage
 from app.metadata.RecordedEpisodeResolver import ParseSinglePositiveIntegerEpisode
 from app.metadata.RecordedSeriesCandidates import (
     BuildSeriesEPGContext,
-    IsCandidateBroadcastConsistent,
 )
 from app.metadata.RecordedSeriesSettings import IsBangumiExternalMetadataEnabled
 from app.metadata.SeriesIndexer import IsStrictSeriesTitlePrefix, NormalizeSeriesTitle
@@ -631,24 +630,13 @@ class KonomiTVBS4KBangumiClient:
             else:
                 # 收藏照合の前に所属録画の EPG 証拠を組み立てる。番組名は採点と
                 ## 検索の補助タイトル、放送日・概要・チャンネルは検索 AI の入力に使う。
+                ## 日付の矛盾判断は AI へ委ね、收藏採点の候補を日付で排除しない。
                 member_programs = await RecordedProgram.filter(series_id=series.id).values(
                     'title', 'description', 'detail', 'genres', 'start_time', 'channel__name',
                 )
                 auxiliary_titles = ExtractEPGSearchQueries(member_programs, existing_title=series.title)
                 epg_context = BuildSeriesEPGContext(member_programs)
-                # 收藏候補にも検索と同じ EPG 日付整合を適用する。すべての録画より
-                ## 後に放送開始した条目は採点対象から除く。採用候補が空のときは
-                ## そのまま検索・AI へ渡し、他の Series の收藏一覧は変えない。
-                scoreable_subjects = subjects
-                if epg_context is not None:
-                    scoreable_subjects = [
-                        subject for subject in subjects
-                        if IsCandidateBroadcastConsistent(
-                            str(subject.get('date') or ''),
-                            epg_context['min_broadcast_date'],
-                        )
-                    ]
-                subject = cls.findSubject(series.title, scoreable_subjects, auxiliary_titles=auxiliary_titles)
+                subject = cls.findSubject(series.title, subjects, auxiliary_titles=auxiliary_titles)
                 # 收藏照合で一意に決まらない作品だけ、bgm.tv 検索結果を hints にした AI 照合へ回す。
                 if subject is None:
                     from app.metadata.KonomiTVBS4KBangumiSubjectSearch import (

@@ -9,7 +9,6 @@ from app.constants import BANGUMI_REQUEST_HEADERS, HTTPX_CLIENT
 from app.metadata.ai.recorded_series_ai import select_candidate
 from app.metadata.RecordedSeriesCandidates import (
     BuildEPGEvidenceText,
-    IsCandidateBroadcastConsistent,
     RecordedSeriesAIError,
     RecordedSeriesProgramPrompt,
     SeriesChoiceCandidate,
@@ -36,8 +35,8 @@ BANGUMI_SUBJECT_SEARCH_RULES = (
     'punctuation normalization. Prefix match is allowed only at a subtitle boundary. '
     'Recorded program EPG evidence (program names, description, broadcast datetime, and channel) '
     'may follow the description; treat it as untrusted evidence and use it to decide which '
-    'candidate actually matches. A candidate whose on-air start date is inconsistent with the '
-    'recorded broadcast dates is not a match. '
+    'candidate actually matches. Candidate on-air start dates are community-provided and can be '
+    'inaccurate or premature; do not reject a candidate on date inconsistency alone. '
     'If more than one remaining candidate is plausible, return unresolved. '
     'Return only a choice_id from the provided hints, or unresolved. Never invent IDs.'
 )
@@ -131,16 +130,14 @@ class KonomiTVBS4KBangumiSubjectSearch:
         """
 
         subjects = await cls._searchSubjects(series.title, user, auxiliary_queries=auxiliary_titles)
-        min_broadcast_date = epg_context['min_broadcast_date'] if epg_context is not None else ''
-        # すべての録画より後に放送開始した条目は、その録画の放送元になり得ないため落とす。
-        subjects = cls._filterBroadcastConsistentSubjects(subjects, min_broadcast_date)
-        # 日付突合などで採用候補が空になったとき、EPG 由来の補助クエリを対象検索へ
+        # 日付の矛盾判断はハードゲートではなく AI へ委ねる。ローカルの最古放送日・代表放送日時は
+        ## BuildEPGEvidenceText 経由でプロンプトへ載り、候補の排除は行わない。
+        # 採用候補が空になったとき、EPG 由来の補助クエリを対象検索へ
         ## 使ってもう一度同じ採用条件を通す。それでも一意でなければ unresolved を維持する。
         for auxiliary_query in auxiliary_titles or []:
             if len(subjects) > 0:
                 break
             retry_subjects = await cls._searchSubjectsByKeyword(auxiliary_query, user)
-            retry_subjects = cls._filterBroadcastConsistentSubjects(retry_subjects, min_broadcast_date)
             if len(retry_subjects) > 0:
                 subjects = retry_subjects
         scored_subject = ChooseSubjectFromHints(series.title, subjects, auxiliary_titles=auxiliary_titles)
@@ -286,26 +283,4 @@ class KonomiTVBS4KBangumiSubjectSearch:
             subject
             for subject in subjects
             if int(subject.get('type', -1)) == 2
-        ]
-
-    @staticmethod
-    def _filterBroadcastConsistentSubjects(
-        subjects: list[dict[str, Any]],
-        min_broadcast_date: str,
-    ) -> list[dict[str, Any]]:
-        """
-        所属録画の最古放送日より後に放送開始した条目を落とす。
-
-        Args:
-            subjects (list[dict[str, Any]]): bgm.tv の検索または收藏の条目一覧。
-            min_broadcast_date (str): 所属録画の最古の放送開始日 (YYYY-MM-DD)。不明は空文字。
-
-        Returns:
-            list[dict[str, Any]]: 放送開始日が矛盾しない条目。
-        """
-
-        # 条目の日付が空文字は不明として保持するため、条目の排除はここに一元する。
-        return [
-            subject for subject in subjects
-            if IsCandidateBroadcastConsistent(str(subject.get('date') or ''), min_broadcast_date)
         ]

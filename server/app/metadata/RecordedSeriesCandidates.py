@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from typing import Annotated, Any, Literal, cast
 
 import httpx
@@ -200,7 +200,8 @@ class SeriesEPGContext(TypedDict):
     detail_items: list[RecordedSeriesProgramDetailItem]
     # 代表録画の放送開始時刻 (ISO 8601)。代表録画が時刻を持たない場合は空文字。
     broadcast_datetime: str
-    # 所属録画全体で最も古い放送開始日 (YYYY-MM-DD)。候補の初放送・公開日との突合に使う。
+    # 所属録画全体で最も古い放送開始日 (YYYY-MM-DD)。日付の矛盾判断はハードゲートではなく
+    ## AI へ渡す証拠とするため、BuildEPGEvidenceText 経由でプロンプトへ載せる。
     min_broadcast_date: str
     # 代表録画のチャンネル名。チャンネル未設定の録画のみの場合は None。
     channel_name: str | None
@@ -274,31 +275,10 @@ def BuildEPGEvidenceText(epg_context: SeriesEPGContext | None) -> str:
         lines.append(f"Detail {detail_item['name']}: {detail_item['value']}")
     if epg_context['broadcast_datetime'] != '':
         lines.append(f"Recorded broadcast datetime: {epg_context['broadcast_datetime']}")
+    if epg_context['min_broadcast_date'] != '':
+        lines.append(f"Oldest recorded broadcast date: {epg_context['min_broadcast_date']}")
     if epg_context['channel_name'] is not None:
         lines.append(f"Recorded channel: {epg_context['channel_name']}")
     if len(lines) == 0:
         return ''
     return '\n\nRecorded program EPG evidence:\n' + '\n'.join(lines)
-
-
-def IsCandidateBroadcastConsistent(candidate_date: str, min_broadcast_date: str) -> bool:
-    """外部候補の初放送・公開日が、所属録画の最古放送日と矛盾しないか検査する。
-
-    録画は作品の初放送・公開以後に作られるため、すべての録画より後に初出する
-    候補はその録画の取得元になり得ない。日付不明の候補は絞り込まず残す。
-
-    Args:
-        candidate_date (str): 外部候補の初放送日・公開日 (YYYY-MM-DD)。不明は空文字。
-        min_broadcast_date (str): 所属録画の最古の放送開始日 (YYYY-MM-DD)。不明は空文字。
-
-    Returns:
-        bool: 候補を残してよい場合は True。
-    """
-
-    if candidate_date == '' or min_broadcast_date == '':
-        return True
-    try:
-        return date.fromisoformat(candidate_date) <= date.fromisoformat(min_broadcast_date)
-    except ValueError:
-        # 外部 API や EPG の日付表記の揺れは、候補の排除ではなく保持を優先する。
-        return True
