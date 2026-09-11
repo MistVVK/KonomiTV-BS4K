@@ -99,7 +99,9 @@ const props = defineProps<{
 const series = ref<ISeries | null>(null);
 const isLoading = ref(true);
 const loadFailed = ref(false);
-const showExternalSummary = ref(false);
+// 概要の開閉はローカル状態だが、枠の高さを親側で変えるため v-model で双方向に同期する。
+// 親 (シリーズ一覧・放送中) はこの値で詳細枠を固定高さから自動高さへ切り替える。
+const showExternalSummary = defineModel<boolean>('summaryExpanded', {default: false});
 let fetchGeneration = 0;
 
 type MatrixColumn = {

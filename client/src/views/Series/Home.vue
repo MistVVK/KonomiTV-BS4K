@@ -43,8 +43,9 @@
                             </button>
                         </template>
                         <div v-if="expandedId !== null" class="series-home__detail"
+                            :class="{'series-home__detail--summary': summaryExpanded}"
                             :style="{gridRow: String(detailGridRow)}">
-                            <SeriesEpisodeList :seriesId="expandedId" />
+                            <SeriesEpisodeList :seriesId="expandedId" v-model:summary-expanded="summaryExpanded" />
                         </div>
                     </div>
                     <div v-if="total > 0" class="series-home__pagination">
@@ -125,6 +126,13 @@ const selectedSortValue = computed(() => `${sortKey.value}:${sortOrder.value}`);
 const searchQuery = ref('');
 const isLoading = ref(true);
 const expandedId = ref<number | null>(null);
+// SeriesEpisodeList の概要開閉を受け取り、概要全文が見えるよう詳細枠の固定高さを外す。
+const summaryExpanded = ref(false);
+
+// 別のカードへ展開先が移ったり閉じたりしたら、前のカードで開いた概要の状態を引き継がない。
+watch(expandedId, () => {
+    summaryExpanded.value = false;
+});
 const gridElement = ref<HTMLElement | null>(null);
 const columnCount = ref(1);
 let gridResizeObserver: ResizeObserver | null = null;
@@ -493,6 +501,13 @@ watch(() => route.fullPath, async () => {
     border-radius: 10px;
     background: rgb(var(--v-theme-background));
     overflow-y: auto;
+}
+
+// 概要を開いたときは枠を本文ぶんまで伸ばし、概要を枠内スクロールさせない。
+// 閉じると上の固定高さへ戻る。話数表の横スクロールは table-wrap 側が持つため影響しない。
+.series-home__detail--summary {
+    height: auto;
+    overflow-y: visible;
 }
 
 .series-home__pagination {
