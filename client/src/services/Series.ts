@@ -38,13 +38,10 @@ export interface ISeries {
     bangumi_subject_name: string | null;
     bangumi_subject_name_cn: string | null;
     bangumi_subject_summary: string | null;
-    bangumi_subject_image_url: string | null;
     tmdb_id: number | null;
     tmdb_media_type: TmdbMediaType | null;
     tmdb_name: string | null;
     tmdb_overview: string | null;
-    tmdb_poster_url: string | null;
-    tmdb_backdrop_url: string | null;
     episodes?: ISeriesEpisode[];
     broadcast_periods: ISeriesBroadcastPeriod[];
     created_at: string;
@@ -67,13 +64,10 @@ export interface ISeriesSummary {
     bangumi_subject_name: string | null;
     bangumi_subject_name_cn: string | null;
     bangumi_subject_summary: string | null;
-    bangumi_subject_image_url: string | null;
     tmdb_id: number | null;
     tmdb_media_type: TmdbMediaType | null;
     tmdb_name: string | null;
     tmdb_overview: string | null;
-    tmdb_poster_url: string | null;
-    tmdb_backdrop_url: string | null;
     recorded_count: number;
     unrecorded_count: number;
     partial_count: number;

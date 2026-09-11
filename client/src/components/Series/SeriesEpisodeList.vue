@@ -9,8 +9,9 @@
         </div>
         <template v-else-if="series !== null">
             <div v-if="series.bangumi_subject_id !== null || series.tmdb_id !== null" class="series-episode-list__bangumi">
-                <img v-if="series.bangumi_subject_image_url || series.tmdb_poster_url"
-                    class="series-episode-list__cover" :src="series.bangumi_subject_image_url || series.tmdb_poster_url!" alt="">
+                <img v-if="series.bangumi_subject_id !== null || series.tmdb_id !== null" :key="series.id"
+                    class="series-episode-list__cover" :src="`${Utils.api_base_url}/series/${series.id}/poster`" alt=""
+                    @error="hideBrokenSeriesCover">
                 <div class="series-episode-list__bangumi-main">
                     <div class="series-episode-list__bangumi-title">
                         {{series.bangumi_subject_name || series.tmdb_name || series.title}}
@@ -253,6 +254,11 @@ function showPartialWarning(channelId: string, columnKey: string): boolean {
 
 function hideBrokenChannelLogo(event: Event): void {
     // ロゴを取得できなくても局名テキストへ置き換えず、同じ寸法の空枠を維持する。
+    (event.currentTarget as HTMLImageElement).hidden = true;
+}
+
+function hideBrokenSeriesCover(event: Event): void {
+    // 外部 CDN へフォールバックせず、取得不能なローカル表紙だけを非表示にする。
     (event.currentTarget as HTMLImageElement).hidden = true;
 }
 

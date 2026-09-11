@@ -30,7 +30,8 @@
                                 :style="{gridColumn: String(cardGridColumn(index)), gridRow: String(cardGridRow(index))}"
                                 :aria-expanded="expandedId === card.id"
                                 @click="toggleExpand(card.id)">
-                                <img class="series-card__image" loading="lazy" :src="cardImage(card)" alt="">
+                                <img class="series-card__image" loading="lazy" :src="cardImage(card)" alt=""
+                                    @error="useCardImageFallback(card, $event)">
                                 <div class="series-card__body">
                                     <div class="series-card__name">{{card.title}}</div>
                                     <div class="series-card__meta">
@@ -140,12 +141,21 @@ const expandedRow = computed(() => {
 const detailGridRow = computed(() => (expandedRow.value ?? 0) + 1);
 
 const cardImage = (card: ISeriesSummary): string => {
-    if (card.bangumi_subject_image_url) return card.bangumi_subject_image_url;
-    if (card.tmdb_poster_url) return card.tmdb_poster_url;
-    if (card.latest_recorded_program_id !== null) {
-        return `${Utils.api_base_url}/videos/${card.latest_recorded_program_id}/thumbnail`;
+    return `${Utils.api_base_url}/series/${card.id}/poster`;
+};
+
+const useCardImageFallback = (card: ISeriesSummary, event: Event): void => {
+    const image = event.currentTarget as HTMLImageElement;
+    // ローカル表紙が 404 のときだけ、従来の録画サムネイルからロゴの順へフォールバックする。
+    if (image.dataset.fallback === undefined && card.latest_recorded_program_id !== null) {
+        image.dataset.fallback = 'thumbnail';
+        image.src = `${Utils.api_base_url}/videos/${card.latest_recorded_program_id}/thumbnail`;
+        return;
     }
-    return '/assets/images/logo.svg';
+    if (image.dataset.fallback !== 'logo') {
+        image.dataset.fallback = 'logo';
+        image.src = '/assets/images/logo.svg';
+    }
 };
 
 const updateColumnCount = () => {
