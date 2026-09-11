@@ -19,6 +19,7 @@ from app.metadata.RecordedEpisodeResolver import (
 )
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
 from app.metadata.SeriesTitleParser import (
+    ContainsKanjiCharacters,
     DeriveTitleReadingFromTitle,
     ExtractMovieWorkTitle,
     NormalizeTitleReading,
@@ -62,6 +63,16 @@ GENERIC_SERIES_TITLES = {
 # バラエティ・音楽番組は話数を付けず、固定の番組名と毎回の企画名で EPG を構成することがある。
 ## ジャンルだけで単発番組を統合しないよう、実際に類似する別の録画がある場合に限り Series にする。
 EPISODELESS_SERIES_GENRES = {'バラエティ', '音楽'}
+
+# task で実資料が確認できた ★ 区切り運用のシリーズだけを列挙する。★ 直後の全文を話名にする形式は
+## 宝塚カフェブレイクの受け入れ条件 2/3 に名指しされているため、正規化キー完全一致で対象を閉じ、
+## VIVA! TOKYO MINA など他シリーズの話名契約へ一般化しない。値は NormalizeSeriesTitle() 済みキー。
+STAR_EPISODELESS_SERIES_KEYS = {'宝塚カフェブレイク'}
+
+# 話数マーカーより後ろの引用を公演行として残す対象。`NOW ON STAGE#NNN 公演行…` の形式に限る。
+## これを一般化すると `作品(NN)第N週「副題」` 形式で副題が週表記ごと拡大する回帰が実在するため、
+## 作品名 (話数より前) の正規化キー完全一致で発火を制限する。値は NormalizeSeriesTitle() 済みキー。
+STAR_TRAILER_QUOTE_SERIES_KEYS = {'nowonstage'}
 
 # EPG タイトルの先頭に付与される放送枠名。作品名そのものではないため除外する。
 PROGRAM_SLOT_PREFIX_PATTERN = re.compile(
@@ -239,8 +250,10 @@ def AreAIFallbackSeriesTitlesClose(left: str, right: str) -> bool:
 async def SaveTitleReading(series_id: int, series_title: str, title_reading: str | None) -> None:
     """AI 応答などの読みを、未設定の Series へだけ保存する。
 
-    既存値の上書きはしない (AI 読みの誤りを許容する仕様)。読みが得られない
-    場合でも、カナのみのタイトルなら AI なしの読みを生成して保存する。
+    既存値の上書きはしない (ひらがな化し切れない語の誤りは許容する仕様)。漢字を
+    含む値はあ→んソートで整列しない無効な読みなので保存せず、未設定のまま再取得
+    対象に残す。読みが得られない場合でも、カナのみのタイトルなら AI なしの読みを
+    生成して保存する。
 
     Args:
         series_id (int): 保存先の Series ID。
@@ -252,7 +265,9 @@ async def SaveTitleReading(series_id: int, series_title: str, title_reading: str
     if normalized_reading is None:
         # カナのみのタイトルは AI なしで読みを作れる。
         normalized_reading = DeriveTitleReadingFromTitle(series_title)
-    if normalized_reading is None:
+    if normalized_reading is None or ContainsKanjiCharacters(normalized_reading):
+        # 漢字が残った読みはあ→んソートで正しい列へ並ばないため、有効な読みとして保存しない。
+        ## 列は未設定のまま残るので、次の補完実行で再取得される。
         return
     # 未設定の行だけを原子的に更新する。同時実行の AI 結果で上書き競合しない。
     await Series.filter(id=series_id, title_reading__isnull=True).update(
@@ -297,11 +312,44 @@ def ParseEpisodeLessSeriesTitle(
         ParsedSeriesTitle | None: 別の録画で定期番組と確認できた場合の解析結果。
     """
 
+    normalized_source = unicodedata.normalize('NFKC', title).strip()
+
+    # task で運用を確認した `シリーズ名 ★話名` 形式のシリーズだけ、★ の後ろの全文を話名とする。
+    ## 引用符を消費せず、複数録画が ★ 直前まで完全一致するときだけ定期番組として束ねるため、
+    ## 単発特番は拾わない。ジャンルの gate は情報番組にも現れる形式なので要求しないが、
+    ## 他シリーズへ一般化しないよう正規化キーの対象外ではこの分岐に入らない。
+    star_source = PROGRAM_MARK_PATTERN.sub('', normalized_source)
+    star_index = star_source.find('★')
+    if star_index > 0:
+        display_title = star_source[:star_index].strip()
+        trailing_subtitle = star_source[star_index + 1:].strip()
+        normalized_title = NormalizeSeriesTitle(display_title)
+        if normalized_title in STAR_EPISODELESS_SERIES_KEYS and trailing_subtitle != '':
+            # 別録画判定は現行側と同じく装飾マークを除去してから比べ、[再] だけの再放送対を
+            ## 互いの根拠にしない (前字列の一致検査も同じ除去済み表記で行っている)。
+            has_same_star_prefixed_title = False
+            for similar_title in similar_titles:
+                if '★' not in similar_title:
+                    continue
+                star_similar = PROGRAM_MARK_PATTERN.sub('', unicodedata.normalize('NFKC', similar_title))
+                if (
+                    NormalizeSeriesTitle(star_similar) != NormalizeSeriesTitle(star_source) and
+                    star_similar.split('★', 1)[0].strip() == display_title
+                ):
+                    has_same_star_prefixed_title = True
+                    break
+            if has_same_star_prefixed_title:
+                return ParsedSeriesTitle(
+                    display_title = display_title,
+                    normalized_title = normalized_title,
+                    episode_number = None,
+                    subtitle = trailing_subtitle,
+                )
+
     # 話数を付けず毎回の企画名を入れる運用が確認できたジャンルだけを対象にする。
     if {genre['major'] for genre in genres}.isdisjoint(EPISODELESS_SERIES_GENRES):
         return None
 
-    normalized_source = unicodedata.normalize('NFKC', title).strip()
     quote_index_candidates = [
         normalized_source.find(quote)
         for quote in ('「', '『')
@@ -432,6 +480,24 @@ def ParseSeriesTitle(
         and QUOTED_SLOT_WORK_PREFIX_PATTERN.search(normalized_source[:subtitle_match.start()].rstrip()) is not None
     ):
         subtitle_match = None
+    # 対象シリーズでは話数マーカーより後ろの引用符を公演行の一部として残す。
+    ## 例: NOW ON STAGE#733 花組 宝塚バウホール公演『赤と黒』 → 最初の引用だけ副題にすると
+    ## 公演行全体を失い、続けて並ぶ引用も消える。引用を残して話数検索へ渡せば、末尾が
+    ## 引用単体なら従来どおり中身だけ副題になり、それ以外は話数より後ろの全文が副題になる。
+    ## 他シリーズ (作品(NN)第N週「副題」など) へ一般化すると既存の週形式が壊れるためキー限定。
+    if subtitle_match is not None:
+        explicit_episode_probe = EPISODE_PATTERN.search(normalized_source)
+        probe_work_key = (
+            NormalizeSeriesTitle(normalized_source[:explicit_episode_probe.start()])
+            if explicit_episode_probe is not None
+            else ''
+        )
+        if (
+            explicit_episode_probe is not None
+            and subtitle_match.start() >= explicit_episode_probe.end()
+            and probe_work_key in STAR_TRAILER_QUOTE_SERIES_KEYS
+        ):
+            subtitle_match = None
     subtitle = subtitle_match.group('subtitle').strip() if subtitle_match is not None else None
     title_without_quoted_subtitle = (
         QUOTED_SUBTITLE_PATTERN.sub('', normalized_source).strip()
@@ -636,16 +702,26 @@ class SeriesIndexer:
         )
         episode_less_similar_programs: list[RecordedProgram] = []
         if parsed_title is None and _fallback_title is None:
-            # 無話数のバラエティ・音楽番組は、同じ固定タイトルで始まる別の録画を根拠にする。
-            ## 引用符より前の候補で DB 検索を限定し、全録画のタイトルをロードしない。
+            # 無話数の定期番組は、同じ固定タイトルで始まる別の録画を根拠にする。
+            ## 引用符の境界まで一致させ、似た文字列を持つ別番組の誤統合を防ぐ。
+            ### ★ 区切りはシリーズ名と宣伝文の境界なので、装飾マーク除去後に空でない前字列のときだけ検索に使う。
             quote_indexes = [
                 recorded_program.title.find(quote)
                 for quote in ('「', '『')
                 if recorded_program.title.find(quote) >= 0
             ]
+            search_prefixes: list[str] = []
             if quote_indexes:
+                search_prefixes.append(recorded_program.title[:min(quote_indexes)].strip())
+            star_index = recorded_program.title.find('★')
+            if star_index >= 0:
+                star_prefix = PROGRAM_MARK_PATTERN.sub('', recorded_program.title[:star_index]).strip()
+                if star_prefix != '':
+                    search_prefixes.append(star_prefix)
+            if search_prefixes:
+                # 短い前字列は同じ録画由来の長い前字列を含むので、最短 1 本で両経路の候補を拾える。
+                episode_less_title_prefix = min(search_prefixes, key=len)
                 # DB の全角記号と一致させるため、検索には NFKC 前の EPG 原文を使う。
-                episode_less_title_prefix = recorded_program.title[:min(quote_indexes)].strip()
                 episode_less_similar_programs = await RecordedProgram.filter(
                     title__startswith = episode_less_title_prefix,
                 ).exclude(id=recorded_program.id).all()
