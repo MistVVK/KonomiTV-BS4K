@@ -45,9 +45,11 @@
                                     </div>
                                 </button>
                                 <div v-if="isSlotExpanded(slot.series.id, day.weekday, slotIndex)"
-                                    class="series-onair__detail-slot">
-                                    <div class="series-onair__detail">
-                                        <SeriesEpisodeList :seriesId="slot.series.id" />
+                                    class="series-onair__detail-slot"
+                                    :class="{'series-onair__detail-slot--summary': summaryExpanded}"
+                                    :ref="bindDetailSlotRef">
+                                    <div class="series-onair__detail" :ref="bindDetailFrameRef">
+                                        <SeriesEpisodeList :seriesId="slot.series.id" v-model:summary-expanded="summaryExpanded" />
                                     </div>
                                 </div>
                             </template>
@@ -60,7 +62,7 @@
 </template>
 <script lang="ts" setup>
 
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 import Breadcrumbs from '@/components/Breadcrumbs.vue';
@@ -79,6 +81,62 @@ const router = useRouter();
 const days = ref<ISeriesOnAirDay[]>([]);
 const isLoading = ref(true);
 const expandedSlot = ref<{seriesId: number; weekday: number; slotIndex: number} | null>(null);
+// SeriesEpisodeList の概要開閉を受け取り、概要全文が見えるよう詳細枠の固定高さを外す。
+const summaryExpanded = ref(false);
+
+// 概要展開中の詳細枠は absolute のため slot の高さを作らない。枠の実測高さを slot の
+// min-height へ同期し、slot が曜日列 flow で概要ぶん場所を確保して後続ボタンと重ならないようにする。
+const detailSlotEl = shallowRef<HTMLElement | null>(null);
+const detailFrameEl = shallowRef<HTMLElement | null>(null);
+let detailHeightObserver: ResizeObserver | null = null;
+
+const bindDetailSlotRef = (el: unknown) => {
+    detailSlotEl.value = el as HTMLElement | null;
+};
+
+const bindDetailFrameRef = (el: unknown) => {
+    detailFrameEl.value = el as HTMLElement | null;
+};
+
+const syncDetailHeightToSlot = () => {
+    if (detailSlotEl.value === null || detailFrameEl.value === null) return;
+    detailSlotEl.value.style.minHeight = `${detailFrameEl.value.offsetHeight}px`;
+};
+
+const stopDetailHeightSync = () => {
+    if (detailHeightObserver !== null) {
+        detailHeightObserver.disconnect();
+        detailHeightObserver = null;
+    }
+};
+
+const clearDetailHeightSync = () => {
+    stopDetailHeightSync();
+    if (detailSlotEl.value !== null) {
+        detailSlotEl.value.style.minHeight = '';
+    }
+};
+
+watch(summaryExpanded, async (expanded) => {
+    if (expanded === false) {
+        clearDetailHeightSync();
+        return;
+    }
+    await nextTick();
+    syncDetailHeightToSlot();
+    // ビューポート変化による概要の再行折返しで高さが動いても slot と枠の同期を保つ。
+    detailHeightObserver = new ResizeObserver(syncDetailHeightToSlot);
+    if (detailFrameEl.value !== null) {
+        detailHeightObserver.observe(detailFrameEl.value);
+    }
+});
+
+// 別のカードへ展開先が移ったら、前のカードで開いた概要の状態を引き継がない。
+watch(expandedSlot, () => {
+    summaryExpanded.value = false;
+});
+
+onUnmounted(stopDetailHeightSync);
 
 type DisplayDay = {
     weekday: number;
@@ -318,6 +376,18 @@ watch(() => route.params.id, async () => {
     border-radius: 8px;
     background: rgb(var(--v-theme-background));
     overflow-y: auto;
+}
+
+// 概要を開いたときは枠を本文ぶんまで伸ばし、概要を枠内スクロールで読ませない。
+// 閉じると上の固定高さへ戻る。slot の min-height は JS で枠の高さへ同期され、
+// full-width の absolute のまま後続ボタンとも重ならない。
+.series-onair__detail-slot--summary {
+    height: auto;
+
+    .series-onair__detail {
+        height: auto;
+        overflow-y: visible;
+    }
 }
 
 </style>
