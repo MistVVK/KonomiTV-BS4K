@@ -32,6 +32,7 @@ from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettingsStore,
 )
 from app.metadata.SeriesTitleParser import (
+    ContainsKanjiCharacters,
     DeriveTitleReadingFromTitle,
     NormalizeProgramText,
 )
@@ -1026,13 +1027,31 @@ class SeriesAIFallbackTask:
 
     @classmethod
     async def _backfillTitleReadings(cls) -> None:
-        """読み欠落の解決済みシリーズを、カナ機械生成と軽量 AI 一括呼び出しで補完する。
+        """読み欠落・漢字残りの解決済みシリーズを、カナ機械生成と軽量 AI 一括呼び出しで補完する。
 
         Returns:
             None
         """
 
         from app.metadata.SeriesIndexer import SaveTitleReading
+
+        # 漢字が残った旧 AI 読みは未設定とみなし、この後の欠落検索で再取得させる。
+        ## 保存済み値そのものとの比較つき更新で、待機中に別経路が埋めた正しい読みを消さない。
+        stored_readings = await Series.filter(title_reading__isnull=False).values('id', 'title_reading')
+        invalidated_count = 0
+        for row in stored_readings:
+            stored_reading = row['title_reading']
+            if stored_reading is None or ContainsKanjiCharacters(stored_reading) is False:
+                continue
+            cleared = await Series.filter(id=row['id'], title_reading=stored_reading).update(
+                title_reading=None,
+            )
+            invalidated_count += cleared
+        if invalidated_count > 0:
+            logging.info(
+                f'[SeriesAIFallbackTask] Cleared title readings with unresolved kanji for refetch. '
+                f'[cleared: {invalidated_count}]',
+            )
 
         # 再生可能録画を持つ Series のうち、読みが未設定のものだけを対象にする。
         missing_series = list(

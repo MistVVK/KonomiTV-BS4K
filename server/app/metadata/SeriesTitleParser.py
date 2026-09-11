@@ -578,6 +578,30 @@ def NormalizeTitleReading(value: str | None) -> str | None:
     return normalized or None
 
 
+# あ→んソートで読み列を使うため、漢字コード表に属す文字は機械的な変換先を持たない。
+_KANJI_CODE_POINT_RANGES: tuple[tuple[int, int], ...] = (
+    (0x3400, 0x4DBF),  # CJK 拡張 A
+    (0x4E00, 0x9FFF),  # CJK 統合漢字
+)
+
+
+def ContainsKanjiCharacters(value: str) -> bool:
+    """タイトル読み候補に漢字が残っているかを判定する。
+
+    Args:
+        value: 判定する読み文字列。
+
+    Returns:
+        CJK 漢字コード表に属す文字を 1 つ以上含む場合は True。
+    """
+
+    return any(
+        start <= ord(character) <= end
+        for character in value
+        for start, end in _KANJI_CODE_POINT_RANGES
+    )
+
+
 def DeriveTitleReadingFromTitle(title: str) -> str | None:
     """カナのみのタイトルから、AI を使わずに読みを機械的に生成する。
 
