@@ -33,8 +33,8 @@
                                 <img class="series-card__image" loading="lazy" :src="cardImage(card)" alt=""
                                     @error="useCardImageFallback(card, $event)">
                                 <div class="series-card__body">
-                                    <!-- 表示名は詳細ヘッダと同じ外部名優先の共有ヘルパーで出す。並び順・検索の照合はローカル題名のまま。 -->
-                                    <div class="series-card__name">{{formatSeriesDisplayName(card)}}</div>
+                                    <!-- 表示名は TMDb 作品グループなら tmdb_name 素のまま、それ以外は外部名優先の共有ヘルパーで出す。並び順・検索の照合はローカル題名のまま。 -->
+                                    <div class="series-card__name">{{cardName(card)}}</div>
                                     <div class="series-card__meta">
                                         録画 {{card.recorded_count.toLocaleString()}} 件
                                         <span v-if="card.unrecorded_count > 0">・未録画 {{card.unrecorded_count}}</span>
@@ -46,7 +46,21 @@
                         <div v-if="expandedId !== null" class="series-home__detail"
                             :class="{'series-home__detail--summary': summaryExpanded}"
                             :style="{gridRow: String(detailGridRow)}">
-                            <SeriesEpisodeList :seriesId="expandedId" v-model:summary-expanded="summaryExpanded" />
+                            <!-- TMDb バインド作品のカードは、成员 (Season) ごとの話数表をセクションとして並べる。単独成员でもグループ表示とする。 -->
+                            <template v-if="expandedCard !== null && isTmdbWorkCard(expandedCard)">
+                                <!-- tmdb_name は enrich 待ち・失敗で NULL になり得るため、ヘッダはカード名と同じ fallback を使う。 -->
+                                <div class="series-home__group-header">{{cardName(expandedCard)}}</div>
+                                <section v-for="member in expandedCard.season_members" :key="member.series_id"
+                                    class="series-home__group-section">
+                                    <!-- 概要の開閉状態は成员ごとに分離し、片方の操作が他 Season へ伝播しないようにする。 -->
+                                    <SeriesEpisodeList :seriesId="member.series_id"
+                                        :summary-expanded="summaryExpandedBySeriesId[member.series_id] ?? false"
+                                        @update:summary-expanded="updateSummaryExpanded(member.series_id, $event)" />
+                                </section>
+                            </template>
+                            <SeriesEpisodeList v-else :seriesId="expandedId"
+                                :summary-expanded="summaryExpandedBySeriesId[expandedId] ?? false"
+                                @update:summary-expanded="updateSummaryExpanded(expandedId, $event)" />
                         </div>
                     </div>
                     <div v-if="total > 0" class="series-home__pagination">
@@ -128,12 +142,18 @@ const selectedSortValue = computed(() => `${sortKey.value}:${sortOrder.value}`);
 const searchQuery = ref('');
 const isLoading = ref(true);
 const expandedId = ref<number | null>(null);
-// SeriesEpisodeList の概要開閉を受け取り、概要全文が見えるよう詳細枠の固定高さを外す。
-const summaryExpanded = ref(false);
+// SeriesEpisodeList の概要開閉を成员 (series_id) ごとに保持する。
+// 詳細枠の固定高さを外す判定 (summaryExpanded) には「いずれかの成员が展開中」の集約だけを使う。
+const summaryExpandedBySeriesId = ref<Record<number, boolean>>({});
+const summaryExpanded = computed(() =>
+    Object.values(summaryExpandedBySeriesId.value).some((expanded) => expanded));
+const updateSummaryExpanded = (seriesId: number, expanded: boolean): void => {
+    summaryExpandedBySeriesId.value = {...summaryExpandedBySeriesId.value, [seriesId]: expanded};
+};
 
 // 別のカードへ展開先が移ったり閉じたりしたら、前のカードで開いた概要の状態を引き継がない。
 watch(expandedId, () => {
-    summaryExpanded.value = false;
+    summaryExpandedBySeriesId.value = {};
 });
 const gridElement = ref<HTMLElement | null>(null);
 const columnCount = ref(1);
@@ -143,7 +163,9 @@ let routeSyncGeneration = 0;
 let loadedListStateKey: string | null = null;
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)));
+// expandedId は常にカードの代表 id を所有する (成员 id の URL は syncRouteState で代表 id へ正規化)。
 const expandedIndex = computed(() => seriesList.value.findIndex((card) => card.id === expandedId.value));
+const expandedCard = computed(() => expandedIndex.value >= 0 ? seriesList.value[expandedIndex.value] : null);
 const expandedRow = computed(() => {
     if (expandedIndex.value < 0) return null;
     return Math.floor(expandedIndex.value / columnCount.value) + 1;
@@ -152,6 +174,22 @@ const detailGridRow = computed(() => (expandedRow.value ?? 0) + 1);
 
 const cardImage = (card: ISeriesSummary): string => {
     return `${Utils.api_base_url}/series/${card.id}/poster`;
+};
+
+// カード名は TMDb バインド作品なら tmdb_name (S サフィックスなし)、それ以外は card-5 の表示名ヘルパー。
+// 作品カードの identity は tmdb_id のみで判定する。tmdb_name は enrich 完了まで NULL になり得る
+// (bind は tmdb_id を先に永続化する) ため、nullable な表示名はカード名・グループヘッダの fallback に限定する。
+const isTmdbWorkCard = (card: ISeriesSummary): boolean => card.tmdb_id !== null;
+const cardName = (card: ISeriesSummary): string => {
+    if (isTmdbWorkCard(card) && card.tmdb_name !== null) {
+        return card.tmdb_name;
+    }
+    return formatSeriesDisplayName(card);
+};
+
+// グループカードは代表行の id を持つ。URL が成员 id を指しても展開先を見失わないよう成员も見る。
+const isCardSeries = (card: ISeriesSummary, seriesId: number | null): boolean => {
+    return card.id === seriesId || card.season_members.some((member) => member.series_id === seriesId);
 };
 
 const useCardImageFallback = (card: ISeriesSummary, event: Event): void => {
@@ -332,9 +370,11 @@ const syncRouteState = async () => {
     const seriesId = Number(seriesIdText);
     if (seriesIdText !== '' && Number.isInteger(seriesId) && seriesId >= 1) {
         // 現在の一覧にあるカードの開閉では、list-position と一覧を再取得しない。
-        if (loadedListStateKey === routeStateKey && seriesList.value.some((card) => card.id === seriesId)) {
+        const loadedCard = seriesList.value.find((card) => isCardSeries(card, seriesId));
+        if (loadedListStateKey === routeStateKey && loadedCard !== undefined) {
             currentPage.value = routePage;
-            expandedId.value = seriesId;
+            // 展開状態の所有 ID を代表 id に正規化し、選択表示と toggle の閉判定を一致させる。
+            expandedId.value = loadedCard.id;
             isLoading.value = false;
             return;
         }
@@ -351,7 +391,9 @@ const syncRouteState = async () => {
                 isLoading.value = false;
             }
             if (generation !== routeSyncGeneration) return;
-            expandedId.value = seriesList.value.some((card) => card.id === seriesId) ? seriesId : null;
+            // 成员 id の URL でも代表 id へ正規化する (上の fast path と同じ所有 ID)。
+            const targetCard = seriesList.value.find((card) => isCardSeries(card, seriesId));
+            expandedId.value = targetCard !== undefined ? targetCard.id : null;
             await nextTick();
             if (generation !== routeSyncGeneration) return;
             updateColumnCount();
@@ -503,6 +545,19 @@ watch(() => route.fullPath, async () => {
     border-radius: 10px;
     background: rgb(var(--v-theme-background));
     overflow-y: auto;
+}
+
+// TMDb 作品グループの展開ヘッダ (tmdb_name) と成员 Season セクションの積み上げ。
+.series-home__group-header {
+    padding: 8px 4px 0;
+    font-weight: bold;
+    font-size: 14px;
+    line-height: 1.4;
+}
+
+.series-home__group-section + .series-home__group-section {
+    margin-top: 8px;
+    border-top: 1px solid rgb(var(--v-theme-background-lighten-2));
 }
 
 // 概要を開いたときは枠を本文ぶんまで伸ばし、概要を枠内スクロールさせない。

@@ -75,6 +75,13 @@ export interface ISeriesSummary {
     partial_count: number;
     latest_recorded_program_id: number | null;
     updated_at: string;
+    season_members: ISeriesSummaryMember[];
+}
+
+/** カタログカードのグループ成员。Season 未バインドは season_number が null。 */
+export interface ISeriesSummaryMember {
+    series_id: number;
+    season_number: number | null;
 }
 
 /** カタログ一覧のページング応答。 */
