@@ -2855,9 +2855,10 @@ def _build_candidate_selection_prompt(
 Rules:
 - Select exactly one choice_id from the candidates below.
 - Also return title_reading: the kana reading of the Program title in hiragana (convert katakana to hiragana, keep latin letters and digits, remove broadcast decorations), or null when no kana reading can be derived.
+- Also return season: the season number decided by the rules in the description, "whole", or "unresolved"; use null when the selection does not involve seasons.
 - Never invent a choice_id.
 - Do not use tools, files, terminals, or external resources.
-- Return only one JSON object with choice_id, confidence, and title_reading.
+- Return only one JSON object with choice_id, confidence, title_reading, and season.
 - confidence must be a number between 0.0 and 1.0.
 
 Program:
@@ -2871,7 +2872,7 @@ Candidates:
 {candidates_json}
 
 Output schema:
-{{"choice_id":"...","confidence":0.0,"title_reading":null}}"""
+{{"choice_id":"...","confidence":0.0,"title_reading":null,"season":null}}"""
 
 
 def _parse_strict_json_object(output_text: str) -> dict[str, Any]:
@@ -3076,6 +3077,7 @@ async def run_acp_candidate_selection(
         http_status=0,
         latency_ms=latency_ms,
         title_reading=validated.title_reading,
+        season=validated.season,
     )
 
 

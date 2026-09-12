@@ -878,6 +878,7 @@ class OpenAICompatibleBackend:
                     http_status=http_status,
                     latency_ms=total_latency_ms,
                     title_reading=output.title_reading,
+                    season=output.season,
                 )
             if attempt + 1 >= _CANDIDATE_VALIDATION_ATTEMPTS:
                 raise RecordedSeriesAIError(

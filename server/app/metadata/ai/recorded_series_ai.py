@@ -973,6 +973,7 @@ class _AcpAdapter:
             http_status=result.http_status,
             latency_ms=result.latency_ms,
             title_reading=result.title_reading,
+            season=result.season,
         )
 
     async def resolveTitleReadings(

@@ -150,9 +150,14 @@ def _BuildCandidateSelectionPrompt(
         '- Also return title_reading: the kana reading of the Program title in hiragana '
         '(convert katakana to hiragana, keep latin letters and digits, remove broadcast decorations), '
         'or null when no kana reading can be derived.\n'
+        # TMDb 照合では作品に加えて Season 判定も返させる。季番号・'whole'・'unresolved' の
+        ## 意味づけは呼び出し側の規則文 (TMDB_SEARCH_RULES) が Description へ載せる。
+        ## Season を伴わない照合 (Bangumi 等) では null のまま返り、サーバー側は従来動作へ倒す。
+        '- Also return season: the season number decided by the rules in the description, '
+        '"whole", or "unresolved"; use null when the selection does not involve seasons.\n'
         '- Never invent a choice_id.\n'
         '- Do not use tools, files, terminals, or external resources.\n'
-        '- Return only one JSON object with choice_id, confidence, and title_reading.\n'
+        '- Return only one JSON object with choice_id, confidence, title_reading, and season.\n'
         '- confidence must be a number between 0.0 and 1.0.\n\n'
         f"Program:\n"
         f"Title: {program['title']}\n"
@@ -162,7 +167,7 @@ def _BuildCandidateSelectionPrompt(
         f"Broadcast Date: {program['broadcast_datetime']}\n\n"
         f'Candidates:\n{candidates_json}\n\n'
         'Output schema:\n'
-        '{"choice_id":"...","confidence":0.0,"title_reading":null}'
+        '{"choice_id":"...","confidence":0.0,"title_reading":null,"season":null}'
     )
 
 
@@ -999,6 +1004,7 @@ class OpenCodeBackend:
                         http_status=200,
                         latency_ms=latency_ms,
                         title_reading=validated.title_reading,
+                        season=validated.season,
                     ), combined
                 except RecordedSeriesAIError as error:
                     last_error = error

@@ -61,6 +61,10 @@ class AIChoiceOutput(BaseModel):
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
     # 候補選択と同時に取得するシリーズタイトルの読み。旧応答の互換のため省略可。
     title_reading: Annotated[str | None, Field(max_length=255)] = None
+    # TMDb 照合時の Season 判定。季番号・'whole' (作品全体)・'unresolved' (判定不能) のいずれか。
+    ## Season 選択を求めない照合 (Bangumi 等) では null のまま返り、サーバー側は null を
+    ## 判定不能 (unresolved) と同じ従来動作へ倒す。旧応答の互換のため省略可。
+    season: Annotated[int | Literal['whole', 'unresolved'] | None, Field()] = None
 
     @field_validator('title_reading')
     @classmethod
@@ -87,6 +91,8 @@ class AIChoiceResult:
     latency_ms: int
     # 候補選択の返答と同時に取得したシリーズタイトルの読み。旧応答では None。
     title_reading: str | None = None
+    # TMDb 照合時の Season 判定 (季番号 / 'whole' / 'unresolved')。それ以外の照合では None。
+    season: int | str | None = None
 
 
 class RecordedSeriesAIError(Exception):
