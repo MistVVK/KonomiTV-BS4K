@@ -38,7 +38,8 @@
                                         <span class="series-onair__time">{{formatSlotLabel(slot.hour, slot.minute)}}</span>
                                         <span v-if="slot.is_featured" class="series-onair__featured">注目</span>
                                     </div>
-                                    <div class="series-onair__name">{{slot.series.title}}</div>
+                                    <!-- 表示名は詳細ヘッダと同じ外部名優先の共有ヘルパーで出す。 -->
+                                    <div class="series-onair__name">{{formatSeriesDisplayName(slot.series)}}</div>
                                     <div class="series-onair__meta">
                                         <span>未録画 {{slot.series.unrecorded_count}}</span>
                                         <span>部分録画 {{slot.series.partial_count}}</span>
@@ -73,6 +74,7 @@ import SeriesEpisodeList from '@/components/Series/SeriesEpisodeList.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
 import { PRESERVE_SCROLL_POSITION_STATE_KEY } from '@/router';
 import Series, { type ISeriesOnAirDay, type ISeriesOnAirSlot } from '@/services/Series';
+import { formatSeriesDisplayName } from '@/utils/SeriesUtils';
 import { WEEKDAY_LABELS, formatSlotLabel, toDisplayHour, toDisplayWeekday } from '@/views/Series/OnAirUtils';
 
 const route = useRoute();

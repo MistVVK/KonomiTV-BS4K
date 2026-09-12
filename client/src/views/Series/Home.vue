@@ -33,7 +33,8 @@
                                 <img class="series-card__image" loading="lazy" :src="cardImage(card)" alt=""
                                     @error="useCardImageFallback(card, $event)">
                                 <div class="series-card__body">
-                                    <div class="series-card__name">{{card.title}}</div>
+                                    <!-- 表示名は詳細ヘッダと同じ外部名優先の共有ヘルパーで出す。並び順・検索の照合はローカル題名のまま。 -->
+                                    <div class="series-card__name">{{formatSeriesDisplayName(card)}}</div>
                                     <div class="series-card__meta">
                                         録画 {{card.recorded_count.toLocaleString()}} 件
                                         <span v-if="card.unrecorded_count > 0">・未録画 {{card.unrecorded_count}}</span>
@@ -80,6 +81,7 @@ import { PRESERVE_SCROLL_POSITION_STATE_KEY } from '@/router';
 import Series, { type ISeriesSummary } from '@/services/Series';
 import useSettingsStore from '@/stores/SettingsStore';
 import Utils from '@/utils';
+import { formatSeriesDisplayName } from '@/utils/SeriesUtils';
 
 const settingsStore = useSettingsStore();
 

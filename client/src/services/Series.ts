@@ -67,6 +67,7 @@ export interface ISeriesSummary {
     bangumi_subject_summary: string | null;
     tmdb_id: number | null;
     tmdb_media_type: TmdbMediaType | null;
+    tmdb_season_number: number | null;
     tmdb_name: string | null;
     tmdb_overview: string | null;
     recorded_count: number;
