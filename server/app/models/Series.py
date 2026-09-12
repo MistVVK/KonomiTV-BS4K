@@ -31,8 +31,13 @@ class Series(TortoiseModel):
     # データベース上のテーブル名
     class Meta(TortoiseModel.Meta):
         table: str = 'series'
-        # TV と映画の同番号は別作品なので、作品種別と数値 ID の組で一意にする。
-        unique_together = (('tmdb_media_type', 'tmdb_id'),)
+        # TMDb 作品の参照単位は (作品, Season) の多対一。作品種別と数値 ID と Season 番号の組で
+        ## 一意にし、同じ Season 枠を2つの Series へは結び付けない。Season 未確定の作品全体
+        ## バインド (tmdb_season_number IS NULL) は作品につき高々1件とする。
+        ## SQLite は複合 unique で NULL を区別しないため、制約は ORM の unique_together ではなく
+        ## migration が作る次の 2 つの部分 unique Index で表現する (ORM へは重複登録しない)。
+        ## - (tmdb_media_type, tmdb_id, tmdb_season_number) WHERE tmdb_season_number IS NOT NULL
+        ## - (tmdb_media_type, tmdb_id) WHERE tmdb_season_number IS NULL
 
     id = fields.IntField(pk=True)
     canonical_key = cast(TortoiseField[str | None], fields.CharField(64, null=True, unique=True))
@@ -52,6 +57,9 @@ class Series(TortoiseModel):
     # TMDb 由来の補完メタデータ。description / genres は Wikipedia AI 生成が正本のため、
     # TMDb の値は必ず tmdb_ 接頭辞の専用カラムへだけ保存する。
     tmdb_id = cast(TortoiseField[int | None], fields.IntField(null=True))
+    # 参照する TMDb 作品内の Season 番号。NULL は作品全体バインド (Season 未確定・movie を含む
+    ## 従来の 1:1 動作)。値は _bindSeries の所有判定と enrich の話数構築スコープにだけ使う。
+    tmdb_season_number = cast(TortoiseField[int | None], fields.IntField(null=True))
     # 照合不能な先頭 Series に滞留せず、次の有限バッチで対象を交代するために使う。
     tmdb_last_attempt_at = cast(TortoiseField[datetime | None], fields.DatetimeField(null=True))
     tmdb_media_type = cast(TortoiseField[TmdbMediaType | None], fields.CharField(8, null=True))
