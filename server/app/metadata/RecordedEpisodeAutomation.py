@@ -348,6 +348,9 @@ class RecordedEpisodeAutomation:
     # 撤去ガード residual の drain 投入済み番組 ID。同一プロセスでの無限再投入だけを防ぐ。
     # start() での作り直し時に空に戻し、残滓があれば再試行する。
     _residual_drain_attempted: set[int] = set()
+    # resolution 行のない録画の補充投入済み番組 ID。外部検索が resolution 行を
+    # 残さず失敗した場合の無限再投入だけを防ぐ。start() での作り直し時に空に戻す。
+    _unresolved_drain_attempted: set[int] = set()
     _backfill_task: asyncio.Task[RecordedEpisodeBackfillSummary | None] | None = None
     _backfill_handle: AnalysisTaskHandle | None = None
     _relookup_tasks: dict[int, asyncio.Task[None]] = {}
@@ -372,12 +375,17 @@ class RecordedEpisodeAutomation:
                 cls._running_ids = set()
                 cls._rerun_ids = set()
                 cls._residual_drain_attempted = set()
+                cls._unresolved_drain_attempted = set()
                 cls._recovery_completed = False
                 cls._worker_task = asyncio.create_task(cls._runWorker())
                 # 撤去ガード residual の初回 seed は worker 新規作成時だけ行う。
                 # 稼働確認の start() で毎回 seed すると、既存 retry や新着の枠を奪う。
                 # 以降の補充は worker 完了時の top-up（既存 retry の後）に任せる。
-                await cls._enqueueRemovedGuardResiduals()
+                residual_enqueued = await cls._enqueueRemovedGuardResiduals()
+                # residual が無ければ起動直後から未解決録画の補充も始める。ここで
+                # 始めないと、変更のない既存録画は次の enqueue まで連鎖が動かない。
+                if residual_enqueued == 0:
+                    await cls._enqueueUnresolvedPrograms()
             if cls._recovery_completed is False:
                 await cls._recoverInterruptedRequests()
                 cls._recovery_completed = True
@@ -409,6 +417,7 @@ class RecordedEpisodeAutomation:
         cls._running_ids = set()
         cls._rerun_ids = set()
         cls._residual_drain_attempted = set()
+        cls._unresolved_drain_attempted = set()
         cls._backfill_task = None
         cls._backfill_handle = None
         cls._relookup_tasks = {}
@@ -488,7 +497,10 @@ class RecordedEpisodeAutomation:
             if retry_after_current:
                 await cls.enqueue(recorded_program_id)
             # 撤去ガードの residual が残っていれば上限内で次を補充する。通常項目の再投入はしない。
-            await cls._enqueueRemovedGuardResiduals()
+            residual_enqueued = await cls._enqueueRemovedGuardResiduals()
+            # residual が空なら、resolution 行のない Series 所属録画を同じ上限で1件補充する。
+            if residual_enqueued == 0:
+                await cls._enqueueUnresolvedPrograms()
 
     @classmethod
     async def _recoverInterruptedRequests(cls) -> None:
@@ -587,6 +599,59 @@ class RecordedEpisodeAutomation:
                 or recorded_program_id in cls._running_ids
             ):
                 cls._residual_drain_attempted.add(recorded_program_id)
+                enqueued_count += 1
+        return enqueued_count
+
+    @classmethod
+    async def _enqueueUnresolvedPrograms(cls) -> int:
+        """resolution 行のない Series 所属録画を queue 上限内で補充する。
+
+        residual drain の後に呼び、残滓が空のときだけ未解決の録画を1件ずつ進める。
+        投入した ID は同一プロセス内で再投入しない。外部検索が resolution 行を
+        作れば以降の対象から外れるため、通常は各録画1回で連鎖が終わる。
+        終端状態の行を持つ録画の再投入や queue 上限の他用途は変えない。
+
+        Returns:
+            今回 queue へ投入した録画件数。
+        """
+
+        if cls._queue is None:
+            return 0
+        enqueued_count = 0
+        # values_list(flat=True) の戻りは tuple 扱いの型付けになるため、既存の
+        # program_ids 取得と同じく list[int] へ cast する。
+        program_ids = cast(
+            list[int],
+            await RecordedProgram.filter(
+                series_id__not_isnull=True,
+                recorded_video__status='Recorded',
+            ).order_by('id').values_list('id', flat=True),
+        )
+        if len(program_ids) == 0:
+            return 0
+        # resolution 行を既に持つ録画は対象外。終端状態の再投入は行わない。
+        resolved_program_ids = set(
+            cast(
+                list[int],
+                await RecordedEpisodeResolution.filter(
+                    recorded_program_id__in=program_ids,
+                ).values_list('recorded_program_id', flat=True),
+            ),
+        )
+        for recorded_program_id in program_ids:
+            if recorded_program_id in resolved_program_ids:
+                continue
+            if recorded_program_id in cls._unresolved_drain_attempted:
+                continue
+            # start() 呼ばずに投入する。start() 経由は seed が再入し _start_lock で deadlock する。
+            await cls.enqueue(recorded_program_id, start_if_needed=False)
+            # 投入成否は対象自身の所属で判定する（同期的で競合しない）。
+            # 既存経路で処理中・待機中なら投入済み扱い、拒否されたら試行済みにしない。
+            if (
+                recorded_program_id in cls._queued_ids
+                or recorded_program_id in cls._running_ids
+            ):
+                cls._unresolved_drain_attempted.add(recorded_program_id)
                 enqueued_count += 1
         return enqueued_count
 
