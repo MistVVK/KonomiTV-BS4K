@@ -53,7 +53,6 @@ from app.metadata.RecordedEpisodeSearch import (
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
 from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
-from app.metadata.SeriesCatalog import IsRebroadcastTitle
 from app.metadata.SeriesIndexer import ParseJapaneseNumber
 from app.metadata.SeriesTitleParser import ParseSeriesTitle
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
@@ -99,6 +98,30 @@ class _EpisodeProgramSnapshot:
     start_time: datetime
     # カタログ照合の尺キーに使う録画尺（秒）。不明なときは None。
     duration: float | None = None
+
+
+# 撤去した別日重複ガードが出した NeedsReview の識別子。enqueue と Cache の両方で、
+# この residual だけ同 fingerprint でも再評価する。一般の終端結果は触らない。
+_REMOVED_CROSS_DATE_GUARD_RATIONALE = '同一シリーズの別日録画に、再放送印なしで同じ話数が割り当てられています。'
+
+
+def _isRemovedGuardResidual(resolution: RecordedEpisodeResolution) -> bool:
+    """撤去ガード由来の NeedsReview 残滓かを返す。
+
+    ガード由来行の error_code は resolution へ保存されない（AI 監査側にだけ付く）ため、
+    guard が唯一書き込んだ rationale_short と NeedsReview で識別する。
+
+    Args:
+        resolution: 判定対象の話数 Resolution。
+
+    Returns:
+        NeedsReview かつ rationale_short が撤去ガードの出力と一致するとき True。
+    """
+
+    return (
+        resolution.status == 'NeedsReview'
+        and resolution.rationale_short == _REMOVED_CROSS_DATE_GUARD_RATIONALE
+    )
 
 
 def _getBroadcastPartNumbers(snapshot: _EpisodeProgramSnapshot) -> set[Decimal]:
@@ -322,6 +345,9 @@ class RecordedEpisodeAutomation:
     _queued_ids: set[int] = set()
     _running_ids: set[int] = set()
     _rerun_ids: set[int] = set()
+    # 撤去ガード residual の drain 投入済み番組 ID。同一プロセスでの無限再投入だけを防ぐ。
+    # start() での作り直し時に空に戻し、残滓があれば再試行する。
+    _residual_drain_attempted: set[int] = set()
     _backfill_task: asyncio.Task[RecordedEpisodeBackfillSummary | None] | None = None
     _backfill_handle: AnalysisTaskHandle | None = None
     _relookup_tasks: dict[int, asyncio.Task[None]] = {}
@@ -345,8 +371,13 @@ class RecordedEpisodeAutomation:
                 cls._queued_ids = set()
                 cls._running_ids = set()
                 cls._rerun_ids = set()
+                cls._residual_drain_attempted = set()
                 cls._recovery_completed = False
                 cls._worker_task = asyncio.create_task(cls._runWorker())
+                # 撤去ガード residual の初回 seed は worker 新規作成時だけ行う。
+                # 稼働確認の start() で毎回 seed すると、既存 retry や新着の枠を奪う。
+                # 以降の補充は worker 完了時の top-up（既存 retry の後）に任せる。
+                await cls._enqueueRemovedGuardResiduals()
             if cls._recovery_completed is False:
                 await cls._recoverInterruptedRequests()
                 cls._recovery_completed = True
@@ -377,6 +408,7 @@ class RecordedEpisodeAutomation:
         cls._queued_ids = set()
         cls._running_ids = set()
         cls._rerun_ids = set()
+        cls._residual_drain_attempted = set()
         cls._backfill_task = None
         cls._backfill_handle = None
         cls._relookup_tasks = {}
@@ -455,6 +487,8 @@ class RecordedEpisodeAutomation:
                 retry_after_current = True
             if retry_after_current:
                 await cls.enqueue(recorded_program_id)
+            # 撤去ガードの residual が残っていれば上限内で次を補充する。通常項目の再投入はしない。
+            await cls._enqueueRemovedGuardResiduals()
 
     @classmethod
     async def _recoverInterruptedRequests(cls) -> None:
@@ -518,6 +552,45 @@ class RecordedEpisodeAutomation:
                 )
 
     @classmethod
+    async def _enqueueRemovedGuardResiduals(cls) -> int:
+        """撤去ガードの residual を queue 上限内で再投入する。
+
+        起動時と worker 完了時に呼び、残件がなくなるまで 1 件ずつ drain する。
+        queue/running にある ID だけを試行済みにし、上限で受け付けられなかった
+        ID は次回に残す。通常録画の enqueue 条件・上限の他用途は変えない。
+
+        Returns:
+            今回 queue へ投入した residual 件数。
+        """
+
+        if cls._queue is None:
+            return 0
+        enqueued_count = 0
+        # values_list(flat=True) の戻りは tuple 扱いの型付けになるため、既存の
+        # program_ids 取得と同じく list[int] へ cast する。
+        residual_program_ids = cast(
+            list[int],
+            await RecordedEpisodeResolution.filter(
+                status='NeedsReview',
+                rationale_short=_REMOVED_CROSS_DATE_GUARD_RATIONALE,
+            ).order_by('id').values_list('recorded_program_id', flat=True),
+        )
+        for recorded_program_id in residual_program_ids:
+            if recorded_program_id in cls._residual_drain_attempted:
+                continue
+            # start() 呼ばずに投入する。start() 経由は seed が再入し _start_lock で deadlock する。
+            await cls.enqueue(recorded_program_id, start_if_needed=False)
+            # 投入成否は総数差ではなく対象自身の所属で判定する（同期的で競合しない）。
+            # 既存経路で処理中・待機中なら投入済み扱い、拒否されたら試行済みにしない。
+            if (
+                recorded_program_id in cls._queued_ids
+                or recorded_program_id in cls._running_ids
+            ):
+                cls._residual_drain_attempted.add(recorded_program_id)
+                enqueued_count += 1
+        return enqueued_count
+
+    @classmethod
     async def _enqueueRecoverablePrograms(
         cls,
         *,
@@ -559,9 +632,12 @@ class RecordedEpisodeAutomation:
                     and resolution.status in {"NeedsReview", "Failed"}
                     and resolution.provider_fingerprint != provider_fingerprint
                 )
+                # 撤去した別日重複ガードの residual は provider 変更なしでも再評価する。
+                retry_for_removed_guard = _isRemovedGuardResidual(resolution)
                 if (
                     resolution.status not in {"Pending", "Unknown"}
                     and retry_for_provider_change is False
+                    and retry_for_removed_guard is False
                 ):
                     continue
             async with cls._relookup_start_lock:
@@ -1408,39 +1484,6 @@ class RecordedEpisodeAutomation:
                 connection=connection,
             )
 
-    @staticmethod
-    async def _hasUnmarkedCrossDateEpisodeDuplicate(
-        *,
-        snapshot: _EpisodeProgramSnapshot,
-        season_number: int,
-        episode_number: Decimal,
-    ) -> bool:
-        """別日録画に同じ話数があり、双方に再放送印がないかを確認する。
-
-        Args:
-            snapshot: 今回の話数検索対象。
-            season_number: AI が提案したシーズン番号。
-            episode_number: AI が提案した話数。
-
-        Returns:
-            捏造の可能性がある同番号重複が存在する場合は True。
-        """
-
-        if IsRebroadcastTitle(f'{snapshot.title} {snapshot.subtitle or ""}'):
-            return False
-        candidates = await RecordedProgram.filter(
-            series_id=snapshot.series_id,
-            series_episode__season_number=season_number,
-            series_episode__episode_number=episode_number,
-            recorded_video__status='Recorded',
-        ).exclude(id=snapshot.id).all()
-        broadcast_date = snapshot.start_time.astimezone(JST).date()
-        return any(
-            candidate.start_time.astimezone(JST).date() != broadcast_date
-            and IsRebroadcastTitle(f'{candidate.title} {candidate.subtitle or ""}') is False
-            for candidate in candidates
-        )
-
     @classmethod
     async def _tryApplyCatalogBind(
         cls,
@@ -1835,6 +1878,7 @@ class RecordedEpisodeAutomation:
             )
 
             # 同一 context / provider の終端結果は明示再検索まで再利用する。
+            # ただし撤去した別日重複ガードの residual だけは同 fingerprint でも再評価する。
             if (
                 force is False
                 and resolution.input_fingerprint == input_fingerprint
@@ -1845,6 +1889,7 @@ class RecordedEpisodeAutomation:
                     'NeedsReview',
                     'Failed',
                 }
+                and _isRemovedGuardResidual(resolution) is False
             ):
                 return RecordedEpisodeAutomationResult(
                     recorded_program_id,
@@ -2024,7 +2069,6 @@ class RecordedEpisodeAutomation:
 
             # 部制特番の「第N部」と同じ N は話数ではない。AI が Resolved を返しても
             # 検索済み evidence を保ったまま NoPublishedNumber へ安全側に正規化する。
-            has_unmarked_cross_date_duplicate = False
             if (
                 result.outcome == 'Resolved'
                 and result.episode_number is not None
@@ -2035,20 +2079,6 @@ class RecordedEpisodeAutomation:
                     outcome='NoPublishedNumber',
                     episode_number=None,
                     rationale_short='番組情報の「第N部」は話数ではなく放送上の部番号です。',
-                )
-            elif (
-                result.outcome == 'Resolved'
-                and result.season_number is not None
-                and result.episode_number is not None
-            ):
-                # 同一 Series の別日録画に同番号があり、双方に再放送印がない結果は
-                # 公開採番の誤推定とみなし、自動反映せず確認へ戻す。
-                has_unmarked_cross_date_duplicate = (
-                    await cls._hasUnmarkedCrossDateEpisodeDuplicate(
-                        snapshot=snapshot,
-                        season_number=result.season_number,
-                        episode_number=result.episode_number,
-                    )
                 )
 
             # 外部待機中に受理条件が更新されても、課金済み結果を旧 snapshot の
@@ -2076,10 +2106,7 @@ class RecordedEpisodeAutomation:
                 'NotNumbered',
                 'NoPublishedNumber',
             }:
-                accepted = (
-                    IsEpisodeLookupResultAccepted(result)
-                    and has_unmarked_cross_date_duplicate is False
-                )
+                accepted = IsEpisodeLookupResultAccepted(result)
                 if accepted:
                     terminal_status = "Succeeded"
                 else:
@@ -2089,11 +2116,6 @@ class RecordedEpisodeAutomation:
                         outcome='InsufficientEvidence',
                         season_number=None,
                         episode_number=None,
-                        rationale_short=(
-                            '同一シリーズの別日録画に、再放送印なしで同じ話数が割り当てられています。'
-                            if has_unmarked_cross_date_duplicate
-                            else result.rationale_short
-                        ),
                     )
                     terminal_status = "Rejected"
                     terminal_error = RecordedSeriesAIError("AcceptancePolicyRejected")
