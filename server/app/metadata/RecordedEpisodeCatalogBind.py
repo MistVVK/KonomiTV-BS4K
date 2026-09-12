@@ -342,7 +342,8 @@ async def TryBindCatalogEpisode(
         and series.tmdb_id is not None
     ):
         tmdb_id = series.tmdb_id
-        tmdb_candidates = await _FetchTmdbCandidates(tmdb_id)
+        # season 付きバインドでは担当 Season の候補だけを作り、他 Season の話へ誤バインドしない。
+        tmdb_candidates = await _FetchTmdbCandidates(tmdb_id, season_number=series.tmdb_season_number)
         if tmdb_candidates is None or len(tmdb_candidates) == 0:
             return CatalogBindResult('Unknown')
         matched = NarrowCatalogCandidates(
@@ -495,11 +496,17 @@ async def _FetchBangumiCandidates(subject_id: int) -> list[_CatalogCandidate] | 
     return candidates
 
 
-async def _FetchTmdbCandidates(tmdb_id: int) -> list[_CatalogCandidate] | None:
-    """TMDb TV 作品の全レギュラーシーズンを照合用候補へ変換する。
+async def _FetchTmdbCandidates(
+    tmdb_id: int,
+    *,
+    season_number: int | None = None,
+) -> list[_CatalogCandidate] | None:
+    """TMDb TV 作品のレギュラーシーズンを照合用候補へ変換する。
 
     Args:
         tmdb_id: 確定済み TMDb TV 作品 ID。
+        season_number: 担当 Season 番号。指定時はその Season の話だけを候補にする。
+            None は作品全体バインドで、従来どおり全レギュラーシーズンを候補にする。
 
     Returns:
         照合用候補。取得失敗時は None。
@@ -521,8 +528,8 @@ async def _FetchTmdbCandidates(tmdb_id: int) -> list[_CatalogCandidate] | None:
     if details is None:
         return None
     season_numbers = [
-        season_number for season_number in details['season_numbers']
-        if season_number >= 1
+        entry for entry in details['season_numbers']
+        if entry >= 1 and (season_number is None or entry == season_number)
     ]
     if len(season_numbers) == 0:
         return None

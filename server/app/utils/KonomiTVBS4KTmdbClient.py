@@ -48,7 +48,7 @@ from app.metadata.SeriesTitleParser import (
     ExtractEPGSearchQueries,
     ExtractMovieWorkTitle,
 )
-from app.models.RecordedEpisode import SeriesEpisode
+from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 from app.models.Series import Series, TmdbMediaType
 from app.utils.KonomiTVBS4KTmdbStore import KonomiTVBS4KTmdbStore
@@ -79,6 +79,15 @@ class TmdbSearchCandidate(TypedDict):
     alternative_titles: list[str]
 
 
+class TmdbSeasonInfo(TypedDict):
+    """TMDb 作品詳細に含まれるシーズン1件。Season 判定と enrich のスコープに使う。"""
+
+    season_number: int
+    # シーズン初回放送日 (YYYY-MM-DD)。不明なときは空文字。
+    air_date: str
+    episode_count: int
+
+
 class TmdbSeriesDetails(TypedDict):
     """Series への enrich に使う TMDb 作品詳細。"""
 
@@ -90,11 +99,21 @@ class TmdbSeriesDetails(TypedDict):
     backdrop_url: str | None
     # TV のレギュラーシーズンと特別編の season_number。映画では空リスト。
     season_numbers: list[int]
+    # TV のシーズン構成 (air_date・話数付き)。映画では空リスト。
+    seasons: list[TmdbSeasonInfo]
     # TV は初回放送日、映画は公開日 (YYYY-MM-DD)。不明なときは空文字。
     first_air_date: str
     # 人気度と評価。不明なときは None。
     popularity: float | None
     vote_average: float | None
+
+
+class TmdbMatchDecision(TypedDict):
+    """AI 照合で確定した TMDb 作品と、その Series が参照する Season。"""
+
+    candidate: TmdbSearchCandidate
+    # 確定した Season 番号。None は作品全体バインド (Season 判定不能・whole・movie)。
+    season_number: int | None
 
 
 class TmdbSeasonEpisode(TypedDict):
@@ -489,14 +508,21 @@ class KonomiTVBS4KTmdbClient:
                 if overview == '':
                     overview = ' '.join(str(fallback_payload.get('overview') or '').split())
         season_numbers: list[int] = []
+        seasons: list[TmdbSeasonInfo] = []
         if media_type == 'tv':
-            seasons = payload.get('seasons')
-            if not isinstance(seasons, list):
+            raw_seasons = payload.get('seasons')
+            if not isinstance(raw_seasons, list):
                 raise ValueError('TMDb seasons response is invalid.')
-            for season in seasons:
+            for season in raw_seasons:
                 if not isinstance(season, dict) or type(season.get('season_number')) is not int:
                     raise ValueError('TMDb season number is invalid.')
                 season_numbers.append(season['season_number'])
+                raw_episode_count = season.get('episode_count')
+                seasons.append(TmdbSeasonInfo(
+                    season_number=season['season_number'],
+                    air_date=str(season.get('air_date') or ''),
+                    episode_count=raw_episode_count if type(raw_episode_count) is int else 0,
+                ))
         # 初放送日・人気度・評価はソート用の補完メタデータ。日本語化対象ではないため
         ## 英語フォールバック応答は参照せず、主応答の値だけを使う。
         first_air_date = str(payload.get('first_air_date') or payload.get('release_date') or '')
@@ -510,6 +536,7 @@ class KonomiTVBS4KTmdbClient:
             poster_path=cls._extractImagePath(payload.get('poster_path')),
             backdrop_url=cls._buildImageURL(payload.get('backdrop_path'), cls.BACKDROP_SIZE),
             season_numbers=season_numbers,
+            seasons=seasons,
             first_air_date=first_air_date,
             popularity=(
                 float(popularity)
@@ -867,11 +894,11 @@ class KonomiTVBS4KTmdbClient:
         """
 
         if series.tmdb_id is None or series.tmdb_media_type is None:
-            candidate = await cls._matchSeries(series, api_key, raise_on_error=raise_on_error)
-            if candidate is None:
+            decision = await cls._matchSeries(series, api_key, raise_on_error=raise_on_error)
+            if decision is None:
                 return False
             # 照合結果を先に永続化し、enrich が失敗しても次回 pass で検索をやり直さない。
-            if await cls._bindSeries(series, candidate) is False:
+            if await cls._bindSeries(series, decision['candidate'], decision['season_number']) is False:
                 return False
         return await cls.enrichSeries(series, api_key)
 
@@ -883,9 +910,9 @@ class KonomiTVBS4KTmdbClient:
         api_key: str,
         *,
         raise_on_error: bool,
-    ) -> TmdbSearchCandidate | None:
+    ) -> TmdbMatchDecision | None:
         """
-        検索 hints と AI 選択で Series に対応する TMDb 作品を決める。
+        検索 hints と AI 選択で Series に対応する TMDb 作品と Season を決める。
 
         Args:
             series (Series): 未照合の Series。
@@ -893,7 +920,7 @@ class KonomiTVBS4KTmdbClient:
             raise_on_error: 候補主検索の通信・応答失敗を伝播するか。
 
         Returns:
-            TmdbSearchCandidate | None: 採用できる候補。曖昧または失敗時は None。
+            TmdbMatchDecision | None: 採用できる候補と Season 判定。曖昧または失敗時は None。
         """
 
         # 所属録画の EPG を証拠として組み立てる。番組名はタイトル検索が空のときの
@@ -953,59 +980,114 @@ class KonomiTVBS4KTmdbClient:
                 candidates = retry_candidates
         if len(candidates) == 0:
             return None
+        # TV 候補のシーズン構成 (季番号・air_date・話数) を hints と Season 検証に使う。
+        ## 候補ごとの取得失敗はその候補のシーズン情報を空にするだけで、作品候補そのものは捨てない。
+        season_hints_by_id: dict[int, list[TmdbSeasonInfo]] = {}
+        for candidate in candidates:
+            if candidate['media_type'] != 'tv':
+                continue
+            try:
+                candidate_details = await cls.getDetails('tv', candidate['tmdb_id'], api_key)
+            except (httpx.HTTPError, ValueError) as ex:
+                logging.warning(
+                    f'[KonomiTVBS4KTmdbClient] TMDb candidate details skipped. '
+                    f'[series_id: {series.id}, error: {type(ex).__name__}]',
+                )
+                candidate_details = None
+            if candidate_details is not None:
+                season_hints_by_id[candidate['tmdb_id']] = candidate_details['seasons']
+        # 判定信号 R (解決済み話数のシーズン) を AI の Season 判定へ渡す。
+        ## 録画が未解決の Series では空になり、タイトルと放送日の信号だけで判定する。
+        resolved_seasons = sorted(cast(
+            list[int],
+            await RecordedEpisodeResolution.filter(
+                recorded_program__series_id=series.id,
+                season_number__not_isnull=True,
+            ).distinct().values_list('season_number', flat=True),
+        ))
         # 同名のリメイクや別媒体を採点だけで結び付けず、全候補を AI 選択へ回す。
         from app.metadata.KonomiTVBS4KTmdbSeriesSearch import (
             KonomiTVBS4KTmdbSeriesSearch,
         )
         return await KonomiTVBS4KTmdbSeriesSearch.findCandidateForSeries(
-            series, candidates, epg_context=epg_context,
+            series,
+            candidates,
+            epg_context=epg_context,
+            season_hints_by_id=season_hints_by_id,
+            resolved_seasons=resolved_seasons,
         )
 
 
     @classmethod
-    async def _bindSeries(cls, series: Series, candidate: TmdbSearchCandidate) -> bool:
+    async def _bindSeries(
+        cls,
+        series: Series,
+        candidate: TmdbSearchCandidate,
+        season_number: int | None,
+    ) -> bool:
         """
-        照合できた TMDb 作品 ID を Series へ保存する。
+        照合できた TMDb 作品と Season を Series へ保存する。
 
         Args:
             series (Series): 対象 Series。
             candidate (TmdbSearchCandidate): 採用する TMDb 候補。
+            season_number (int | None): 確定した Season 番号。None は作品全体バインド
+                (Season 判定不能・movie を含む従来動作)。
 
         Returns:
-            bool: 保存できた場合は True。他の Series が同じ作品を持つ場合は False。
+            bool: 保存できた場合は True。参照枠を他の Series が持つ場合は False。
         """
 
-        # TV と映画を区別した複合一意索引により、同じ作品を2つの Series へは結び付けない。
-        ## Bangumi のような統合は行わず、先に照合した Series を正本として今回は skip する。
+        # 参照単位は (作品, Season)。season 付きバインドは同じ (作品, Season) 枠だけを見て、
+        ## 他 Season や作品全体バインドの有無とは無関係に許可する (task の所有規則)。
+        ## season NULL の作品全体バインドは、その作品に season 付き・全体を問わず
+        ## 既存バインドが1件も無いときだけ許可する (movie は常にこの経路で実質 1:1)。
         if not IsTmdbExternalMetadataEnabled() or not KonomiTVBS4KTmdbStore.isConfigured():
             return False
-        owner = await Series.get_or_none(
-            tmdb_media_type=candidate['media_type'], tmdb_id=candidate['tmdb_id'],
-        )
-        if owner is not None and owner.id != series.id:
+        if season_number is not None:
+            # 同一 (作品, Season) 枠の所有者だけを見る。部分 unique Index で高々1件のため
+            ## 複数行にはならないが、自分自身の再バインドは exclude で所有者扱いしない。
+            owned = await Series.filter(
+                tmdb_media_type=candidate['media_type'],
+                tmdb_id=candidate['tmdb_id'],
+                tmdb_season_number=season_number,
+            ).exclude(id=series.id).exists()
+        else:
+            # 同一作品への既存バインドは season 付き・全体を問わず1件でもあれば競合。
+            ## 多対一参照の正常状態 (同一作品に複数 Series) では複数行がヒットするため、
+            ## 単一行取得 (get_or_none) は MultipleObjectsReturned で落ちる。exists() で
+            ## 「1件でもある」だけを判定する。
+            owned = await Series.filter(
+                tmdb_media_type=candidate['media_type'], tmdb_id=candidate['tmdb_id'],
+            ).exclude(id=series.id).exists()
+        if owned:
             logging.info(
                 f'[KonomiTVBS4KTmdbClient][_bindSeries] TMDb title is already bound to another series. '
-                f'[series_id: {series.id}, tmdb_id: {candidate["tmdb_id"]}, owner_series_id: {owner.id}]',
+                f'[series_id: {series.id}, tmdb_id: {candidate["tmdb_id"]}, '
+                f'season_number: {season_number}]',
             )
             return False
         try:
             # 検索中に別処理が確定した ID や、Bangumi 統合で削除された Series を復活させない。
             updated = await Series.filter(id=series.id, tmdb_id__isnull=True).update(
                 tmdb_id=candidate['tmdb_id'], tmdb_media_type=candidate['media_type'],
+                tmdb_season_number=season_number,
                 tmdb_enrichment_pending=True,
                 updated_at=datetime.now(tz=JST),
             )
         except IntegrityError:
-            # 別プロセスが同じ作品を先に確定させた。一意索引を最終防線にして再試行しない。
+            # 別プロセスが同じ参照枠を先に確定させた。部分 unique Index を最終防線にして再試行しない。
             logging.info(
                 f'[KonomiTVBS4KTmdbClient][_bindSeries] TMDb title was bound by another process. '
-                f'[series_id: {series.id}, tmdb_id: {candidate["tmdb_id"]}]',
+                f'[series_id: {series.id}, tmdb_id: {candidate["tmdb_id"]}, '
+                f'season_number: {season_number}]',
             )
             return False
         if updated == 0:
             return False
         series.tmdb_id = candidate['tmdb_id']
         series.tmdb_media_type = candidate['media_type']
+        series.tmdb_season_number = season_number
         return True
 
 
@@ -1040,9 +1122,24 @@ class KonomiTVBS4KTmdbClient:
         # 初放送日は TMDb → Bangumi → ローカル放送開始日の優先順のため、TMDb 側は
         ## 値が取れたときだけ上書きする (空は既存の Bangumi・ローカル値を保持する)。
         ## 由来は Bangumi 側が判定するため、日付の取得有無を first_air_date_source へ記録する。
+        ## season 付きバインドでは担当 Season の air_date だけを使う。作品初回は必ず
+        ## 第1季の日付になり、第2季以降の Series へは誤った初放送日が入るため、
+        ## 担当 Season の air_date が空・不正なら作品初回日へは倒さず、first_air_date と
+        ## source を更新せず既存の Bangumi / ローカル値を保持する。
+        ## 作品初回日へのフォールバックは season NULL (作品全体バインド) のみで使う。
         enrichment_fields: dict[str, Any] = {}
+        if series.tmdb_season_number is not None:
+            effective_first_air_date = next(
+                (
+                    season['air_date'] for season in details['seasons']
+                    if season['season_number'] == series.tmdb_season_number
+                ),
+                '',
+            )
+        else:
+            effective_first_air_date = details['first_air_date']
         parsed_first_air_date = (
-            cls._parseTmdbDate(details['first_air_date']) if details['first_air_date'] != '' else None
+            cls._parseTmdbDate(effective_first_air_date) if effective_first_air_date != '' else None
         )
         if parsed_first_air_date is not None:
             enrichment_fields['first_air_date'] = parsed_first_air_date
@@ -1114,11 +1211,21 @@ class KonomiTVBS4KTmdbClient:
         # TMDb のシーズン構成で上書きも追加もしない。
         if await SeriesEpisode.filter(series_id=series_id, bangumi_episode_id__not_isnull=True).exists():
             return (0, True)
+        # season 付きバインドでは担当 Season の話数構造だけを作る。season NULL (作品全体) は
+        ## 従来どおり全レギュラーシーズンを構築する (movie はここへ来ない)。
+        owned_season_numbers = cast(
+            list[int | None],
+            await Series.filter(id=series_id).values_list('tmdb_season_number', flat=True),
+        )
+        owned_season_number = owned_season_numbers[0] if len(owned_season_numbers) > 0 else None
         created_count = 0
         episode_structure_completed = True
         for season_number in details['season_numbers']:
             # 特別編 (season 0) は放送話数ではないため、話数構造の列へは載せない。
             if season_number < 1:
+                continue
+            # season 付きバインドの Series へ他 Season の話数構造は作らない。
+            if owned_season_number is not None and season_number != owned_season_number:
                 continue
             if not IsTmdbExternalMetadataEnabled() or not KonomiTVBS4KTmdbStore.isConfigured():
                 episode_structure_completed = False
@@ -1147,6 +1254,48 @@ class KonomiTVBS4KTmdbClient:
                     elif episode.tmdb_episode_id is None:
                         episode.tmdb_episode_id = tmdb_episode_id
                         await episode.save(update_fields=['tmdb_episode_id', 'updated_at'])
+        # 担当 Season が変わった Series に残る旧 Season の構造を後始末する。削除するのは
+        ## TMDb 由来 (tmdb_episode_id 付き) で、録画・現在の判定・手動レーンのいずれからも
+        ## 参照されていない行だけ。手動レーン (manual_episode_id) は AI 採用後も
+        ## 「再び手動へ戻せる」永続契約のため、そこから参照される行も残す。
+        ## 参照済みの行は再生・一覧の正本のため、担当外 Season であっても残す。
+        if owned_season_number is not None:
+            # 手動レーン (manual_episode_id) が参照する話数 ID を独立 SELECT で取得する。
+            ## recorded_episode_resolutions (episode_id) と manual_recorded_episode_resolutions
+            ## (manual_episode_id) は同じテーブルへの reverse FK で、Tortoise 1.1.8 は
+            ## 1つの queryset 内で JOIN をテーブル単位に共用するため、両者を同一 filter に
+            ## 重ねると manual_episode_id の JOIN/WHERE が生成されず手動参照-only の行が
+            ## 誤って stale 候補に入る。手動レーンの保護は別クエリで行う。
+            manual_referenced_ids = cast(
+                list[int],
+                await RecordedEpisodeResolution.filter(
+                    manual_episode_id__not_isnull=True,
+                    manual_episode__series_id=series_id,
+                ).values_list('manual_episode_id', flat=True),
+            )
+            # Tortoise の queryset.delete() は reverse-FK 参照を含めた JOIN 付き DELETE を
+            ## 生成し SQLite で構文エラーになるため、ID 集合を SELECT で先に確定してから
+            ## 主キーだけで削除する。現在判定レーン (recorded_episode_resolutions__isnull)
+            ## の JOIN は episode_id 用で正しく生成されるため queryset に残す。
+            stale_episode_ids = cast(
+                list[int],
+                await SeriesEpisode.filter(
+                    series_id=series_id,
+                    tmdb_episode_id__not_isnull=True,
+                    recorded_programs__isnull=True,
+                    recorded_episode_resolutions__isnull=True,
+                ).exclude(
+                    season_number=owned_season_number,
+                ).exclude(
+                    id__in=manual_referenced_ids,
+                ).values_list('id', flat=True),
+            )
+            if len(stale_episode_ids) > 0:
+                await SeriesEpisode.filter(id__in=stale_episode_ids).delete()
+                logging.info(
+                    f'[KonomiTVBS4KTmdbClient][_buildEpisodeStructure] Removed stale TMDb episode structure. '
+                    f'[series_id: {series_id}, tmdb_id: {tmdb_id}, removed_episodes: {len(stale_episode_ids)}]',
+                )
         return (created_count, episode_structure_completed)
 
 
