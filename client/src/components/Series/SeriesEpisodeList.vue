@@ -13,8 +13,9 @@
                     class="series-episode-list__cover" :src="`${Utils.api_base_url}/series/${series.id}/poster`" alt=""
                     @error="hideBrokenSeriesCover">
                 <div class="series-episode-list__bangumi-main">
+                    <!-- TMDb 名に解決され、かつシーズン 2 以上にバインド済みのときだけ末尾へ半角 S{N} を付ける。Bangumi 優先時と title 代替時は素のまま。 -->
                     <div class="series-episode-list__bangumi-title">
-                        {{series.bangumi_subject_name || series.tmdb_name || series.title}}
+                        {{series.bangumi_subject_name || (series.tmdb_name && series.tmdb_season_number != null && series.tmdb_season_number > 1 ? `${series.tmdb_name} S${series.tmdb_season_number}` : series.tmdb_name) || series.title}}
                     </div>
                     <a v-if="series.bangumi_subject_id !== null" class="series-episode-list__bangumi-link"
                         :href="`https://bgm.tv/subject/${series.bangumi_subject_id}`" target="_blank" rel="noopener">
