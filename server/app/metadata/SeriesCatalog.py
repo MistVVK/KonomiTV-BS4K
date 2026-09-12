@@ -141,6 +141,74 @@ def VisibleSeriesQuery(query: str = ''):
     return series_query.distinct()
 
 
+async def FetchCatalogRows(query: str) -> list[dict[str, object]]:
+    """
+    カタログカード構築用の Series 行を返す。
+
+    検索キーワードによる title / description の行単位照合は従来どおり維持するが、
+    その結果はどのカードを採用するかの判定にだけ使う。TMDb バインド行は 1 成员でも
+    一致すればその作品 (tmdb_media_type, tmdb_id) のカードを採用し、成员・集約値は
+    query なしの全 visible 行から構築する (検索に一致しない Season をカードから
+    脱落させないため)。tmdb_id NULL の行は従来どおり行単位の採用。
+
+    Args:
+        query (str): 検索キーワード。空なら全 visible 行をそのまま返す。
+
+    Returns:
+        list[dict[str, object]]: カード単位への集約 (GroupCatalogRows) に渡す行。
+    """
+
+    catalog_values = (
+        'id',
+        'updated_at',
+        'latest_recorded_start_time',
+        'title_reading',
+        'first_air_date',
+        'tmdb_popularity',
+        'tmdb_vote_average',
+        'bangumi_rating',
+        'tmdb_id',
+        'tmdb_media_type',
+        'tmdb_season_number',
+    )
+
+    async def _fetch_rows(search_query: str) -> list[dict[str, object]]:
+        # 最新録画日時は updated_at とは別物 (録画追加で updated_at は更新されない) で、
+        # サムネイル成员の選択に使う。ソートには使わない。
+        return await VisibleSeriesQuery(search_query).annotate(
+            latest_recorded_start_time=Max(
+                'recorded_programs__start_time',
+                _filter=Q(recorded_programs__recorded_video__status='Recorded'),
+            ),
+        ).values(*catalog_values)
+
+    matched_rows = await _fetch_rows(query)
+    if query.strip() == '':
+        return matched_rows
+    # 採用キー: バインド行は作品 key、非バインド行は行 id。
+    adopted_works = {
+        (row['tmdb_media_type'], row['tmdb_id'])
+        for row in matched_rows
+        if row['tmdb_id'] is not None
+    }
+    adopted_ids = {
+        cast(int, row['id'])
+        for row in matched_rows
+        if row['tmdb_id'] is None
+    }
+    all_rows = await _fetch_rows('')
+    return [
+        row
+        for row in all_rows
+        if (
+            row['tmdb_id'] is not None
+            and (row['tmdb_media_type'], row['tmdb_id']) in adopted_works
+        ) or (
+            row['tmdb_id'] is None and cast(int, row['id']) in adopted_ids
+        )
+    ]
+
+
 async def ListSeriesSummaries(
     *,
     sort: SeriesSummarySort,
@@ -163,35 +231,113 @@ async def ListSeriesSummaries(
 
     # ソートは全 ID 行を Python 側で行う。NULL の扱いと id の第 2 キーを
     ## DB の方言に寄せず同一条件で保証するため、values() の小さな行集合で完結させる。
-    rows = await VisibleSeriesQuery(query).annotate(
-        latest_recorded_start_time=Max(
-            'recorded_programs__start_time',
-            _filter=Q(recorded_programs__recorded_video__status='Recorded'),
-        ),
-    ).values(
-        'id',
-        'updated_at',
-        'latest_recorded_start_time',
-        'title_reading',
-        'first_air_date',
-        'tmdb_popularity',
-        'tmdb_vote_average',
-        'bangumi_rating',
-    )
-    ordered_rows = SortSeriesRows(rows, sort=sort, order=order)
+    ## 検索キーワードはカード採用判定にだけ使い、成员・集約は全 visible 行から構築する。
+    rows = await FetchCatalogRows(query)
+    ordered_rows = SortSeriesRows(GroupCatalogRows(rows), sort=sort, order=order)
     total = len(ordered_rows)
-    page_ids = [row['id'] for row in ordered_rows[(page - 1) * CATALOG_PAGE_SIZE:page * CATALOG_PAGE_SIZE]]
+    page_rows = ordered_rows[(page - 1) * CATALOG_PAGE_SIZE:page * CATALOG_PAGE_SIZE]
     # ページが空でも返却値の形状は同じでよい (total からページ数は算出できる)。
+    member_ids = [
+        member_id
+        for group_row in page_rows
+        for member_id in cast(list[int], group_row['member_ids'])
+    ]
     series_by_id = {
         series.id: series
-        for series in await Series.filter(id__in=page_ids)
+        for series in await Series.filter(id__in=member_ids)
     }
     summaries = [
-        await BuildSeriesSummary(series_by_id[cast(int, series_id)])
-        for series_id in page_ids
-        if series_id in series_by_id
+        await BuildSeriesGroupSummary(group_row, series_by_id)
+        for group_row in page_rows
+        if any(
+            member_id in series_by_id
+            for member_id in cast(list[int], group_row['member_ids'])
+        )
     ]
     return total, summaries
+
+
+def GroupCatalogRows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """
+    カタログ行を TMDb 作品単位のカード行へ集約する。
+
+    tmdb_id が非 NULL の行は (tmdb_media_type, tmdb_id) で 1 カードにまとめ、
+    それ以外 (bgm のみ / 外部なし) は 1 行 = 1 カードのまま返す。
+    集約値は updated_at = max、first_air_date = min、tmdb_popularity / tmdb_vote_average =
+    代表行の値 (グループ共通)、bangumi_rating = max、title_reading = 代表行の値とする。
+    代表行は最小 season_number (NULL は末尾) → id 昇順で選び、行の id として残す。
+    各行には成员の 'member_ids' (season 昇順)・'member_seasons'・'member_latest' を添える。
+
+    Args:
+        rows (list[dict[str, object]]): values() で取得した Series 行。
+
+    Returns:
+        list[dict[str, object]]: カード単位に集約した行。SortSeriesRows へそのまま渡せる形。
+    """
+
+    grouped_members: dict[tuple[object, object], list[dict[str, object]]] = defaultdict(list)
+    single_rows: list[dict[str, object]] = []
+    for row in rows:
+        if row['tmdb_id'] is not None:
+            grouped_members[(row['tmdb_media_type'], row['tmdb_id'])].append(row)
+        else:
+            single_rows.append(row)
+
+    def _decorate_single(row: dict[str, object]) -> dict[str, object]:
+        # 非グループ行も同じ形にそろえ、下流が成员の有無を意識しないで済むようにする。
+        series_id = cast(int, row['id'])
+        decorated = dict(row)
+        decorated['member_ids'] = [series_id]
+        decorated['member_seasons'] = {series_id: cast(int | None, row['tmdb_season_number'])}
+        decorated['member_latest'] = {series_id: row['latest_recorded_start_time']}
+        return decorated
+
+    result = [_decorate_single(row) for row in single_rows]
+    for members in grouped_members.values():
+        # 代表行は最小の Season (未バインドは末尾) を持つ成员とし、カードの id と
+        # title_reading / popularity / vote の出所をこの行に固定する。
+        ordered_members = sorted(
+            members,
+            key=lambda member: (
+                member['tmdb_season_number'] is None,
+                cast(int | None, member['tmdb_season_number']) or 0,
+                cast(int, member['id']),
+            ),
+        )
+        representative = ordered_members[0]
+        aggregated = dict(representative)
+        aggregated['updated_at'] = max(
+            cast(datetime, member['updated_at']) for member in members
+        )
+        latest_values = [
+            cast(datetime, member['latest_recorded_start_time'])
+            for member in members
+            if member['latest_recorded_start_time'] is not None
+        ]
+        aggregated['latest_recorded_start_time'] = max(latest_values) if len(latest_values) > 0 else None
+        first_air_values = [
+            cast(date, member['first_air_date'])
+            for member in members
+            if member['first_air_date'] is not None
+        ]
+        aggregated['first_air_date'] = min(first_air_values) if len(first_air_values) > 0 else None
+        rating_values = [
+            cast(float, member['bangumi_rating'])
+            for member in members
+            if member['bangumi_rating'] is not None
+        ]
+        aggregated['bangumi_rating'] = max(rating_values) if len(rating_values) > 0 else None
+        aggregated['member_ids'] = [cast(int, member['id']) for member in ordered_members]
+        aggregated['member_seasons'] = {
+            cast(int, member['id']): cast(int | None, member['tmdb_season_number'])
+            for member in members
+        }
+        aggregated['member_latest'] = {
+            cast(int, member['id']): member['latest_recorded_start_time']
+            for member in members
+        }
+        result.append(aggregated)
+    return result
 
 
 def SortSeriesRows(
@@ -218,7 +364,9 @@ def SortSeriesRows(
     def _id(row: dict[str, object]) -> int:
         return cast(int, row['id'])
 
-    sort_field = 'latest_recorded_start_time' if sort == 'updated_at' else sort
+    # sort=updated_at は集約済み updated_at (グループでは成员の max) をそのまま使う。
+    ## 応答値とソートキーを一致させるため、従来の latest_recorded_start_time への置換はしない。
+    sort_field = sort
     null_rows = [row for row in rows if row[sort_field] is None]
     non_null_rows = [row for row in rows if row[sort_field] is not None]
     # 同一キーの行は常に id 昇順に固定し、安定ソートでページング越しの順序を保つ。
@@ -252,27 +400,13 @@ async def GetSeriesListPosition(
         int | None: 1 以上のページ番号。一覧に無いとき None。
     """
 
-    rows = await VisibleSeriesQuery(query).annotate(
-        latest_recorded_start_time=Max(
-            'recorded_programs__start_time',
-            _filter=Q(recorded_programs__recorded_video__status='Recorded'),
-        ),
-    ).values(
-        'id',
-        'updated_at',
-        'latest_recorded_start_time',
-        'title_reading',
-        'first_air_date',
-        'tmdb_popularity',
-        'tmdb_vote_average',
-        'bangumi_rating',
-    )
-    series_ids = [row['id'] for row in SortSeriesRows(rows, sort=sort, order=order)]
-    try:
-        index = series_ids.index(series_id)
-    except ValueError:
-        return None
-    return index // CATALOG_PAGE_SIZE + 1
+    rows = await FetchCatalogRows(query)
+    group_rows = SortSeriesRows(GroupCatalogRows(rows), sort=sort, order=order)
+    # 成员 id が属するグループのページを返す (グループ化で代表行以外の id でも辿れる)。
+    for index, group_row in enumerate(group_rows):
+        if series_id in cast(list[int], group_row['member_ids']):
+            return index // CATALOG_PAGE_SIZE + 1
+    return None
 
 
 async def BuildSeriesSummary(series: Series) -> dict[str, object]:
@@ -311,7 +445,72 @@ async def BuildSeriesSummary(series: Series) -> dict[str, object]:
         'partial_count': counts.partial_count,
         'latest_recorded_program_id': latest_program.id if latest_program is not None else None,
         'updated_at': series.updated_at,
+        # 非グループ経路 (放送中など) でも応答形状をそろえるため、自分自身1件の成员を入れる。
+        # 一覧のグループ化では BuildSeriesGroupSummary がこの値を実メンバーで上書きする。
+        'season_members': [{'series_id': series.id, 'season_number': series.tmdb_season_number}],
     }
+
+
+async def BuildSeriesGroupSummary(
+    group_row: dict[str, object],
+    series_by_id: dict[int, Series],
+) -> dict[str, object]:
+    """
+    カタログの 1 カード分 (TMDb 作品グループまたは単独 Series) の要約を作る。
+
+    成员ごとの件数を合算し、updated_at は最大、サムネイルは最新録画を持つ成员の
+    latest_recorded_program_id とする。表示名などの作品フィールドは代表行
+    (group_row['id']) の成员由来のまま残す。
+
+    Args:
+        group_row (dict[str, object]): GroupCatalogRows が返す集約行。
+        series_by_id (dict[int, Series]): 成员 Series の実体。
+
+    Returns:
+        dict[str, object]: カード表示に必要なフィールド。
+    """
+
+    member_ids = [
+        member_id
+        for member_id in cast(list[int], group_row['member_ids'])
+        if member_id in series_by_id
+    ]
+    member_summaries = [
+        await BuildSeriesSummary(series_by_id[member_id])
+        for member_id in member_ids
+    ]
+    # 代表行の成员要約を土台にし、件数・更新日時・サムネイルだけをグループ集約で上書きする。
+    summary = dict(member_summaries[0])
+    summary['recorded_count'] = sum(
+        cast(int, member['recorded_count']) for member in member_summaries
+    )
+    summary['unrecorded_count'] = sum(
+        cast(int, member['unrecorded_count']) for member in member_summaries
+    )
+    summary['partial_count'] = sum(
+        cast(int, member['partial_count']) for member in member_summaries
+    )
+    summary['updated_at'] = max(
+        cast(datetime, member['updated_at']) for member in member_summaries
+    )
+    # サムネイルはグループ内で最新の録画を持つ成员から取る。全成员に録画が無いときは
+    # 代表行の値 (None) のままになる。
+    member_latest = cast(dict[int, object], group_row['member_latest'])
+    thumbnail_member_id = max(
+        member_ids,
+        key=lambda member_id: (
+            member_latest[member_id] is not None,
+            cast(datetime, member_latest[member_id])
+            if member_latest[member_id] is not None else datetime.min.replace(tzinfo=JST),
+        ),
+    )
+    thumbnail_summary = member_summaries[member_ids.index(thumbnail_member_id)]
+    summary['latest_recorded_program_id'] = thumbnail_summary['latest_recorded_program_id']
+    summary['season_members'] = [
+        {'series_id': member_id, 'season_number': cast(dict[int, int | None], group_row['member_seasons'])[member_id]}
+        for member_id in member_ids
+    ]
+    return summary
 
 
 async def CountCatalogGaps(

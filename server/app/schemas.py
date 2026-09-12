@@ -909,6 +909,11 @@ class SeriesSummary(BaseModel):
     partial_count: Annotated[int, Field(description='部分録画として表示する局別セルの件数。')]
     latest_recorded_program_id: Annotated[int | None, Field(description='最新録画の番組 ID。サムネイル用。')]
     updated_at: Annotated[datetime, Field(description='Series の更新日時。')]
+    season_members: Annotated[list[SeriesSummaryMember], Field(description='TMDb 作品単位でグループ化した成员。非グループ行は自分自身1件。')]
+
+class SeriesSummaryMember(BaseModel):
+    series_id: Annotated[int, Field(description='成员 Series の ID。')]
+    season_number: Annotated[int | None, Field(description='成员の TMDb Season 番号。未バインドは NULL。')]
 
 class SeriesSummaryList(BaseModel):
     total: Annotated[int, Field(description='検索条件に一致する総件数。')]
