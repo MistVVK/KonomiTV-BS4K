@@ -91,7 +91,7 @@ import { computed, ref, watch } from 'vue';
 
 import Series, { type ISeries, type ISeriesRecordedProgram } from '@/services/Series';
 import Utils, { dayjs } from '@/utils';
-import { extractValidEpisodeSubtitle, formatRecordedEpisodeLabel, formatRecordedEpisodeNumber } from '@/utils/RecordedEpisode';
+import { extractValidEpisodeSubtitle, formatRecordedEpisodeLabel } from '@/utils/RecordedEpisode';
 
 const props = defineProps<{
     seriesId: number;
@@ -137,8 +137,6 @@ const columns = computed((): MatrixColumn[] => {
             recordedSeasonNumbers.add(seasonNumber);
         }
     }
-    // シーズン数は除外前の全話数で数え、残った1シーズンだけでも既存の S 接頭辞を維持する。
-    const seasonCount = new Set((series.value?.episodes ?? []).map((episode) => episode.season_number)).size;
     const structured = [...(series.value?.episodes ?? [])]
         .filter((episode) => recordedSeasonNumbers.has(episode.season_number))
         .sort((left, right) => {
@@ -149,9 +147,9 @@ const columns = computed((): MatrixColumn[] => {
         });
     const structuredColumns: MatrixColumn[] = structured.map((episode) => ({
         key: `episode:${episode.id}`,
-        label: seasonCount > 1
-            ? formatRecordedEpisodeLabel(episode.season_number, episode.episode_number)
-            : `第${formatRecordedEpisodeNumber(episode.episode_number)}話`,
+        // 1段目はシーズン数に関わらず常に S{season}・第{N}話。シーズン分離済みページでも
+        // ヘッダだけでなく表ラベル側にシーズン帰属を残す。
+        label: formatRecordedEpisodeLabel(episode.season_number, episode.episode_number),
         title: episodeTitle(episode.id),
     }));
 
