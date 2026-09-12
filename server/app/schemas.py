@@ -864,6 +864,8 @@ class Series(PydanticModel):
     # TMDb 由来の補完メタデータ。media type は models.Series.TmdbMediaType と同じ 2 値。
     tmdb_id: Annotated[int | None, Field()] = None
     tmdb_media_type: Annotated[Literal['tv', 'movie'] | None, Field()] = None
+    # 参照する TMDb 作品内の Season 番号。NULL は作品全体バインド (Season 未確定・movie を含む従来動作)。
+    tmdb_season_number: Annotated[int | None, Field()] = None
     tmdb_name: Annotated[str | None, Field()] = None
     tmdb_overview: Annotated[str | None, Field()] = None
     episodes: list[SeriesEpisode] = []
