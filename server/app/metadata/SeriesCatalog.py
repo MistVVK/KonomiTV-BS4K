@@ -303,6 +303,7 @@ async def BuildSeriesSummary(series: Series) -> dict[str, object]:
         'bangumi_subject_summary': series.bangumi_subject_summary,
         'tmdb_id': series.tmdb_id,
         'tmdb_media_type': series.tmdb_media_type,
+        'tmdb_season_number': series.tmdb_season_number,
         'tmdb_name': series.tmdb_name,
         'tmdb_overview': series.tmdb_overview,
         'recorded_count': len(recorded_programs),

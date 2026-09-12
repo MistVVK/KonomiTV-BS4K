@@ -901,6 +901,7 @@ class SeriesSummary(BaseModel):
         Literal['tv', 'movie'] | None,
         Field(description='TMDb の作品種別。models.Series.TmdbMediaType と同じ 2 値。'),
     ]
+    tmdb_season_number: Annotated[int | None, Field(description='参照する TMDb 作品内の Season 番号。NULL は作品全体バインド。')]
     tmdb_name: Annotated[str | None, Field(description='TMDb の作品名。')]
     tmdb_overview: Annotated[str | None, Field(description='TMDb の概要。')]
     recorded_count: Annotated[int, Field(description='再生可能録画の件数。')]
