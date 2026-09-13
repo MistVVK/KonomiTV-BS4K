@@ -3,6 +3,7 @@ import asyncio
 import json
 import math
 import uuid
+from dataclasses import replace
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
@@ -96,6 +97,7 @@ def GetRecordedStream(
             is_new_session_allowed=False,
             client_key=client_key,
             is_offline_continuous=is_offline_continuous,
+            cm_skip_aware=stream_quality.cm_skip_aware,
         )
     if IsRecordedPlaybackIndexReady(
         recorded_program.recorded_video.playback_index_status,
@@ -116,6 +118,7 @@ def GetRecordedStream(
         is_new_session_allowed=is_new_session_allowed,
         client_key=client_key,
         is_offline_continuous=is_offline_continuous,
+        cm_skip_aware=stream_quality.cm_skip_aware,
     )
 
 
@@ -425,6 +428,7 @@ async def ValidateQuality(
     video_bit_depth: Annotated[VideoBitDepthQuery | None, Query(description='出力映像bit depth。')] = None,
     audio_codec: Annotated[KonomiTVBS4KAudioCodec, Query(description='出力音声コーデック。')] = 'aac',
     audio_track: Annotated[str | None, Query(description='映像と多重化する音声レンディション ID。')] = None,
+    cm_skip_aware: Annotated[bool, Query(description='CM スキップ有効の視聴セッションかどうか。')] = False,
 ) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
 
@@ -457,6 +461,10 @@ async def ValidateQuality(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Specified quality was not found',
         )
+
+    # CM スキップの有無は画質とは別のセッション条件として、全 HLS 子 API で同じ query を必須にする
+    if cm_skip_aware is True:
+        stream_quality = replace(stream_quality, cm_skip_aware=True)
 
     # Ready済み録画は依存解決時に早期拒否する。Pending/Staleはmaster handlerが
     # index生成後の最新メタデータで同じhelperを必ず再実行する。
@@ -1128,4 +1136,5 @@ async def VideoHLSSessionDeleteAPI(
         recorded_program,
         RequireEncodedQuality(stream_quality.quality),
         stream_quality.encoding_options,
+        cm_skip_aware=stream_quality.cm_skip_aware,
     )

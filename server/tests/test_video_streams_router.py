@@ -89,11 +89,11 @@ def test_existing_session_rejects_changed_audio_codec() -> None:
     stream.encoding_options = aac_options
     RecordedFMP4Stream._instances[session_id] = stream
     try:
-        same_quality = SimpleNamespace(quality='1080p', encoding_options=aac_options)
+        same_quality = SimpleNamespace(quality='1080p', encoding_options=aac_options, cm_skip_aware=False)
         assert GetRecordedStream(session_id, recorded_program, same_quality) is stream
 
         opus_options = SimpleNamespace(**{**vars(aac_options), 'audio_codec': 'opus'})
-        changed_quality = SimpleNamespace(quality='1080p', encoding_options=opus_options)
+        changed_quality = SimpleNamespace(quality='1080p', encoding_options=opus_options, cm_skip_aware=False)
         with pytest.raises(HTTPException) as ex_info:
             GetRecordedStream(session_id, recorded_program, changed_quality)
         assert ex_info.value.status_code == 422

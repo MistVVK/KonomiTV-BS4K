@@ -200,6 +200,10 @@ class StreamQualityWithOptions:
     # query で従来値以外の音声 codec が明示されたかどうか
     is_audio_encoding_explicitly_requested: bool = False
 
+    # CM スキップ有効の録画視聴セッションかどうか
+    ## 録画 HLS の先行生成条件としてセッション条件へ含める。ライブ・オフライン保存では常に False
+    cm_skip_aware: bool = False
+
 
 def RequireEncodedQuality(quality: LIVE_STREAMING_QUALITY_TYPES) -> QUALITY_TYPES:
     """QUALITY に存在する再エンコード画質だけを返す。

@@ -1121,6 +1121,9 @@ class PlayerController {
                     const first_audio_track = player_store.recorded_program.recorded_video.audio_tracks[0];
                     const initial_audio_rendition = first_audio_track === undefined ? null :
                         `${first_audio_track.index}${first_audio_track.is_dual_mono === true ? '-main' : ''}`;
+                    // CM スキップ有効時はサーバー側へスキップ先の先行生成を許可する。
+                    // セッション条件の一部なので、URL を組み立てた時点の設定値でセッション中は固定する
+                    const cm_skip_aware = settings_store.settings.video_auto_skip_cm === true;
                     for (const quality_name of video_streaming_qualities) {
                         // 画質ごとに異なる8桁のセッション ID を生成する。
                         const session_id = generateRecordedPlaybackSessionID();
@@ -1130,7 +1133,7 @@ class PlayerController {
                             type: 'hls',
                             url: `${streaming_api_base_url}/${build_api_quality(quality_name)}/playlist?session_id=${session_id}` +
                                 `&video_codec=${effective_video_codec}&video_bit_depth=${effective_video_bit_depth}` +
-                                `&audio_codec=${effective_audio_codec}` +
+                                `&audio_codec=${effective_audio_codec}&cm_skip_aware=${cm_skip_aware ? '1' : '0'}` +
                                 (initial_audio_rendition !== null ? `&audio_track=${initial_audio_rendition}` : ''),
                         });
                     }
