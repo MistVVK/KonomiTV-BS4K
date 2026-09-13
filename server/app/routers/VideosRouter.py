@@ -39,6 +39,7 @@ from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.models.CMAnalysis import RecordedVideoCMAnalysis, RecordedVideoCMResult
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
+from app.models.Series import Series
 from app.models.User import User
 from app.routers.JikkyoDependency import EnsureJikkyoEnabled
 from app.routers.UsersRouter import GetCurrentAdminUser
@@ -938,7 +939,23 @@ async def VideosRelatedAPI(
 
     # SeriesIndexer が永続化した作品 ID を fuzzy 検索より優先する。
     if current_program.series_id is not None:
-        candidates = await candidates_query.filter(series_id=current_program.series_id)
+        series_ids = [current_program.series_id]
+        if mode == 'relaxed':
+            # relaxed は TMDb バインド作品の全 Season を対象にする (再生中の Season も含む)。
+            ## Series 行の tmdb_id / tmdb_media_type を参照し、同じ作品に属する Season の series_id をすべて引く。
+            ## TMDb 未バインドの作品は兄弟を引けないため、strict と同じ同一シリーズの範囲に留める
+            current_series = await Series.get_or_none(id=current_program.series_id)
+            if (
+                current_series is not None and
+                current_series.tmdb_id is not None and
+                current_series.tmdb_media_type is not None
+            ):
+                sibling_series_list = await Series.filter(
+                    tmdb_media_type=current_series.tmdb_media_type,
+                    tmdb_id=current_series.tmdb_id,
+                )
+                series_ids = [series.id for series in sibling_series_list]
+        candidates = await candidates_query.filter(series_id__in=series_ids)
         related_programs = list(candidates)
     else:
         candidates = await candidates_query
