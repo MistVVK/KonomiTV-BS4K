@@ -105,6 +105,7 @@ class RecordedSeriesAIError(Exception):
         http_status: int | None = None,
         latency_ms: int | None = None,
         recovery_attempt_summaries: tuple[str, ...] = (),
+        provider_error_excerpt: str | None = None,
     ) -> None:
         """監査ログへ保存可能な安全な情報だけで例外を初期化する。
 
@@ -113,6 +114,8 @@ class RecordedSeriesAIError(Exception):
             http_status: APIが応答した場合のHTTPステータス。
             latency_ms: エラー確定までの経過時間。
             recovery_attempt_summaries: 失敗時ポリシーによる試行サマリ（秘密なし）。
+            provider_error_excerpt: 非2xx時に provider が返した本文の sanitizer 済み抜粋
+                （秘密なし・長さ上限済み）。raise 元の backend だけが設定する。
         """
 
         super().__init__(code)
@@ -121,6 +124,8 @@ class RecordedSeriesAIError(Exception):
         self.latency_ms = latency_ms
         # 主系・予備系の試行列。単一試行失敗時は空または1件。
         self.recovery_attempt_summaries = recovery_attempt_summaries
+        # 生レスポンスではなく sanitizer 済みの抜粋だけを保持する。
+        self.provider_error_excerpt = provider_error_excerpt
 
 
 async def SearchWikipediaCandidates(query: str, limit: int = 5) -> list[WikipediaCandidate]:

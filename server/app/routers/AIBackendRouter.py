@@ -18,6 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app import logging
 from app.metadata.ai.ACPSettings import ACPSettings, ACPSettingsStore
+from app.metadata.ai.ai_failure_recovery import (
+    AIRecoveryAttemptSummary,
+    FormatRecoveryAttemptSummary,
+)
 from app.metadata.ai.AIAPIUsageLedger import (
     AIAPIUsageLedger,
     CurrentYearMonth,
@@ -1118,10 +1122,13 @@ async def OpenAICompatibleConnectionTestAPI(
 
     if body.capability == 'EpisodeLookup':
         result = await _RecordEpisodeLookupConnectionTest(
+            'OpenAICompatible',
             proof_settings,
             tested_provider_fingerprint,
             result,
         )
+    elif body.capability == 'CandidateSelection':
+        await _RecordCandidateSelectionConnectionTestFailure('OpenAICompatible', result)
     return _ConnectionTestResponse(result)
 
 
@@ -1340,10 +1347,13 @@ async def OpenAICompatible2ConnectionTestAPI(
 
     if body.capability == 'EpisodeLookup':
         result = await _RecordEpisodeLookupConnectionTest(
+            'OpenAICompatible2',
             proof_settings,
             tested_provider_fingerprint,
             result,
         )
+    elif body.capability == 'CandidateSelection':
+        await _RecordCandidateSelectionConnectionTestFailure('OpenAICompatible2', result)
     return _ConnectionTestResponse(result)
 
 
@@ -2586,7 +2596,86 @@ def _ConnectionTestResponse(result: ConnectionTestResult) -> AIBackendConnection
     )
 
 
+def _ConnectionTestAttemptSummaries(
+    backend_kind: AIBackendKind,
+    result: ConnectionTestResult,
+) -> list[str]:
+    """接続試験結果から監査用の試行サマリ行を構築する。
+
+    sanitizer 済みの provider 本文抜粋がある (= OpenAI 互換 backend が非2xxを
+    受けた) ときだけ1行を返す。message からの再解析はせず、backend が結果へ
+    保持した内部値をそのまま使う。抜粋がなければ従来どおり空リストを返す。
+
+    Args:
+        backend_kind: 試験した backend 種別。
+        result: backend が返した接続試験結果。
+
+    Returns:
+        attempt_summaries へ保存する行のリスト (0 または 1 件)。
+    """
+
+    if result.provider_error_excerpt is None:
+        return []
+    error_code = result.error_code or 'ConnectionTestFailed'
+    return [
+        FormatRecoveryAttemptSummary(
+            AIRecoveryAttemptSummary(
+                attempt_number=1,
+                role='Primary',
+                backend_kind=backend_kind,
+                service_id=None,
+                model=result.model,
+                result_code=error_code,
+                succeeded=False,
+                adopted=False,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                latency_ms=result.latency_ms,
+                http_status=result.http_status,
+                error_code=error_code,
+                provider_error_excerpt=result.provider_error_excerpt,
+            ),
+        ),
+    ]
+
+
+async def _RecordCandidateSelectionConnectionTestFailure(
+    backend_kind: AIBackendKind,
+    result: ConnectionTestResult,
+) -> None:
+    """OpenAI 互換 backend の CandidateSelection 接続試験失敗を監査行へ残す。
+
+    EpisodeLookup 接続試験は能力証明のため成否に関わらず監査行を書くが、
+    CandidateSelection にはその経路がなく、非2xxの provider 本文が監査から
+    読めなかった。sanitizer 済み抜粋を持つ失敗のときだけ行を作成する
+    (成功時・抜粋なし失敗時の行は増やさない)。
+
+    Args:
+        backend_kind: 試験した backend 種別。
+        result: backend が返した接続試験結果。
+    """
+
+    attempt_summaries = _ConnectionTestAttemptSummaries(backend_kind, result)
+    if result.success is True or len(attempt_summaries) == 0:
+        return
+    await RecordedSeriesAIRequest.create(
+        resolution_id=None,
+        purpose='ConnectionTest',
+        status='Failed',
+        model=result.model,
+        candidate_ids=['candidate-selection'],
+        selected_choice_id=None,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        http_status=result.http_status,
+        latency_ms=result.latency_ms,
+        error_code=result.error_code or 'ConnectionTestFailed',
+        attempt_summaries=attempt_summaries,
+    )
+
+
 async def _RecordEpisodeLookupConnectionTest(
+    backend_kind: AIBackendKind,
     proof_settings: RecordedSeriesSettings,
     tested_provider_fingerprint: str,
     result: ConnectionTestResult,
@@ -2594,6 +2683,7 @@ async def _RecordEpisodeLookupConnectionTest(
     """保存済み backend の EpisodeLookup 接続試験を監査し、能力証明を更新する。
 
     Args:
+        backend_kind: 試験した backend 種別。
         proof_settings: 試験対象を指す録画シリーズ設定。
         tested_provider_fingerprint: 試験開始時の設定・認証 fingerprint。
         result: backend が返した接続試験結果。
@@ -2635,6 +2725,7 @@ async def _RecordEpisodeLookupConnectionTest(
         http_status=result.http_status,
         latency_ms=result.latency_ms,
         error_code=audit_error_code,
+        attempt_summaries=_ConnectionTestAttemptSummaries(backend_kind, result),
     )
     invalidate_episode_lookup_capability_fingerprint(tested_provider_fingerprint)
     proof_recorded = record_episode_lookup_capability_proof(
@@ -2849,6 +2940,7 @@ async def AIBackendConnectionTestAPI(
             and tested_provider_fingerprint is not None
         ):
             result = await _RecordEpisodeLookupConnectionTest(
+                'OpenCode',
                 proof_settings,
                 tested_provider_fingerprint,
                 result,

@@ -72,6 +72,7 @@ from app.metadata.RecordedSeriesSettings import (
     RecordedSeriesSettings,
     RecordedSeriesSettingsStore,
 )
+from app.models.RecordedSeries import RecordedSeriesAIRequest
 
 
 if TYPE_CHECKING:
@@ -708,6 +709,7 @@ class _BackendOperationAuditError(RecordedSeriesAIError):
             http_status=source.http_status,
             latency_ms=source.latency_ms,
             recovery_attempt_summaries=source.recovery_attempt_summaries,
+            provider_error_excerpt=source.provider_error_excerpt,
         )
         # エラー後に mutable store を再読せず、実 request の世代を attempt summary へ渡す。
         self.audit_model = audit_model
@@ -1306,6 +1308,60 @@ def IsACPBackendKindRunning(
 # === 公開 facade 関数 ===
 
 
+async def _RecordProviderErrorAudit(
+    purpose: Literal['CandidateSelection', 'TitleReading'],
+    settings: RecordedSeriesSettings,
+    error: RecordedSeriesAIError,
+    *,
+    candidate_ids: list[str],
+) -> None:
+    """provider の非2xx抜粋を持つ失敗を recorded_series_ai_requests へ残す。
+
+    候補選択・タイトル読みの軽量経路は従来監査行を書かず、OpenAI 互換 backend が
+    受けた非2xxの本文が英語ログにしか残らなかった。sanitizer 済み抜粋を持つ
+    失敗 (= OpenAI 互換 backend の非2xx) のときだけ、1行の attempt summary と
+    ともに監査行を作成する。抜粋のない失敗や成功時の行は増やさない。
+    監査行の作成は判定本体の付帯情報であり、DB 書き込みの失敗で元の例外を
+    隠さないよう、作成失敗はログに残して握り潰す。
+
+    Args:
+        purpose: 監査行の用途 (CandidateSelection / TitleReading)。
+        settings: 判定開始時点の設定 snapshot。
+        error: backend 呼び出しの失敗。
+        candidate_ids: 監査行へ残す候補 ID 一覧 (タイトル読みは固定 sentinel)。
+    """
+
+    if error.provider_error_excerpt is None:
+        return
+    summary = _BuildSeriesAttemptSummary(
+        attempt_number=1,
+        target=BuildPrimaryTarget(settings),
+        result=None,
+        error=error,
+        adopted=False,
+    )
+    try:
+        await RecordedSeriesAIRequest.create(
+            resolution_id=None,
+            purpose=purpose,
+            status='Failed',
+            model=summary.model,
+            candidate_ids=candidate_ids,
+            selected_choice_id=None,
+            prompt_tokens=None,
+            completion_tokens=None,
+            http_status=error.http_status,
+            latency_ms=error.latency_ms,
+            error_code=error.code,
+            attempt_summaries=[FormatRecoveryAttemptSummary(summary)],
+        )
+    except Exception as ex:
+        logging.error(
+            f'[recorded_series_ai] Failed to record provider error audit. [purpose: {purpose}]',
+            exc_info=ex,
+        )
+
+
 async def select_candidate(
     program: RecordedSeriesProgramPrompt,
     candidates: list[SeriesChoiceCandidate],
@@ -1346,7 +1402,17 @@ async def select_candidate(
 
     if settings.ai_backend in {'OpenCode', 'OpenAICompatible', 'OpenAICompatible2'}:
         # HTTP backend は ACP process の直列 lock を使わず直接実行する。
-        result = await RunSelection()
+        try:
+            result = await RunSelection()
+        except RecordedSeriesAIError as ex:
+            # provider 非2xxの sanitizer 済み抜粋を監査行へ残す (抜粋なしなら何もしない)。
+            await _RecordProviderErrorAudit(
+                'CandidateSelection',
+                settings,
+                ex,
+                candidate_ids=[candidate['choice_id'] for candidate in candidates],
+            )
+            raise
     else:
         result = await _RunACPOperationWithDeadline(
             RunSelection,
@@ -1390,7 +1456,17 @@ async def resolve_title_readings(
 
     if settings.ai_backend in {'OpenCode', 'OpenAICompatible', 'OpenAICompatible2'}:
         # HTTP backend は ACP process の直列 lock を使わず直接実行する。
-        return await RunResolutions()
+        try:
+            return await RunResolutions()
+        except RecordedSeriesAIError as ex:
+            # provider 非2xxの sanitizer 済み抜粋を監査行へ残す (抜粋なしなら何もしない)。
+            await _RecordProviderErrorAudit(
+                'TitleReading',
+                settings,
+                ex,
+                candidate_ids=['title-reading'],
+            )
+            raise
     return await _RunACPOperationWithDeadline(
         RunResolutions,
         _GetACPCredentialProvider(settings.ai_backend),
@@ -1482,6 +1558,7 @@ def _BuildSeriesAttemptSummary(
         latency_ms=error.latency_ms,
         http_status=error.http_status,
         error_code=error.code,
+        provider_error_excerpt=error.provider_error_excerpt,
     )
 
 
@@ -1515,6 +1592,7 @@ def _BuildEpisodeAttemptSummary(
             latency_ms=result.latency_ms,
             http_status=result.http_status,
             error_code=result.error_code,
+            provider_error_excerpt=result.provider_error_excerpt,
         )
     assert error is not None
     return AIRecoveryAttemptSummary(
@@ -1535,6 +1613,7 @@ def _BuildEpisodeAttemptSummary(
         latency_ms=error.latency_ms,
         http_status=error.http_status,
         error_code=error.code,
+        provider_error_excerpt=error.provider_error_excerpt,
     )
 
 

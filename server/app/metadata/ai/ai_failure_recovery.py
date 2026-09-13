@@ -65,6 +65,8 @@ class AIRecoveryAttemptSummary:
     latency_ms: int | None
     http_status: int | None
     error_code: str | None
+    # 非2xx時に provider が返した本文の sanitizer 済み抜粋。backend 非対応なら None。
+    provider_error_excerpt: str | None = None
 
 
 def BuildPrimaryTarget(settings: RecordedSeriesSettings) -> AIBackendTarget:
@@ -226,13 +228,17 @@ def FormatRecoveryAttemptSummary(summary: AIRecoveryAttemptSummary) -> str:
     latency_ms = summary.latency_ms if summary.latency_ms is not None else '-'
     http_status = summary.http_status if summary.http_status is not None else '-'
     error_code = summary.error_code or '-'
-    return (
+    line = (
         f'{summary.attempt_number}:{summary.role}:{summary.backend_kind}:'
         f'service={service}:model={summary.model}:result={summary.result_code}:'
         f'{adopted}:prompt_tokens={prompt_tokens}:'
         f'completion_tokens={completion_tokens}:latency_ms={latency_ms}:'
         f'http_status={http_status}:error={error_code}'
     )
+    # sanitizer 済み抜粋があるときだけ末尾へ足す。既存の固定形式は変えない。
+    if summary.provider_error_excerpt is not None:
+        line += f':provider_error={summary.provider_error_excerpt}'
+    return line
 
 
 def SeriesResultCode(result: AISeriesMetadataResult) -> str:
