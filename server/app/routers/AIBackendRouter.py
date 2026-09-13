@@ -1081,7 +1081,7 @@ async def OpenAICompatibleConnectionTestAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> AIBackendConnectionTestResponse:
-    """保存済み接続情報で Chat Completions または EpisodeLookup を試験する。
+    """保存済み接続情報で Responses のシリーズ生成または EpisodeLookup を試験する。
 
     Args:
         body: 試験する AI 機能。
