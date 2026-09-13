@@ -7,7 +7,7 @@
                     <Icon class="mr-1" icon="fluent:collections-20-regular" width="16px" />
                     同シリーズ
                 </v-btn>
-                <v-btn size="small" value="relaxed">
+                <v-btn v-if="show_relaxed_toggle" size="small" value="relaxed">
                     <Icon class="mr-1" icon="fluent:apps-20-regular" width="16px" />
                     関連番組
                 </v-btn>
@@ -125,6 +125,9 @@ export default defineComponent({
             load_failed: false,
             request_sequence: 0,
             active_request_key: null as string | null,
+
+            // TMDb バインド作品に兄弟 Season の録画があるか。true のときだけ関連番組トグルを出す。
+            has_relaxed_results: false,
         };
     },
     computed: {
@@ -155,6 +158,15 @@ export default defineComponent({
             return this.playerStore.video_panel_active_tab === 'Series';
         },
 
+        /**
+         * 関連番組トグルの表示可否。
+         * シリーズ未確定 (series_id null) のあいまい検索は従来どおり relaxed を選べる。
+         * シリーズ確定済みでは TMDb 兄弟 Season の録画がある作品にだけ relaxed を出す。
+         */
+        show_relaxed_toggle(): boolean {
+            return this.playerStore.recorded_program.series_id === null || this.has_relaxed_results;
+        },
+
         has_more(): boolean {
             return this.related_programs.length < this.total;
         },
@@ -169,6 +181,15 @@ export default defineComponent({
                 this.related_programs = [];
                 this.total = 0;
                 this.fetched_pages = 0;
+                // 兄弟 Season の有無は作品ごとに異なるため、録画切替で前作の判定を引き継がない
+                this.has_relaxed_results = false;
+                // シリーズ未確定の録画で選択した relaxed がシリーズ確定済みの録画へ残ると、
+                // 非表示のトグルの条件で全 Season の一覧が出続けてしまう。
+                // has_relaxed_results の値変化に依存せず、ここで明示的に strict へ戻す
+                // (戻すと filter_mode の監視が strict で再検索し、その結果から兄弟の有無を probe する)
+                if (this.playerStore.recorded_program.series_id !== null && this.filter_mode === 'relaxed') {
+                    this.filter_mode = 'strict';
+                }
                 if (this.is_series_tab_active) void this.searchRelatedPrograms();
             },
         },
@@ -180,6 +201,17 @@ export default defineComponent({
         },
         show_other_channels() {
             if (this.is_series_tab_active) void this.searchRelatedPrograms();
+        },
+        has_relaxed_results(has_results: boolean) {
+            // 兄弟が無い作品へ切り替わったのに relaxed が残っていると、非表示のトグルの条件で
+            // 一覧が出続けるため strict へ戻す (戻すと filter_mode の監視が再検索する)
+            if (
+                has_results === false &&
+                this.filter_mode === 'relaxed' &&
+                this.playerStore.recorded_program.series_id !== null
+            ) {
+                this.filter_mode = 'strict';
+            }
         },
     },
     beforeUnmount() {
@@ -228,6 +260,27 @@ export default defineComponent({
             this.total = result.total;
             this.fetched_pages = 1;
             await this.scrollCurrentProgramIntoView();
+
+            // シリーズ確定済みの strict 結果が出たら、relaxed の総数を調べてトグル表示を更新する
+            // TMDb 兄弟の録画が無ければ relaxed は strict と同じ集合になり、トグルを出す意味がない
+            if (this.filter_mode === 'strict' && this.playerStore.recorded_program.series_id !== null) {
+                void this.probeRelaxedAvailability(program_id, this.total);
+            }
+        },
+
+        /**
+         * relaxed 検索の先頭ページだけを取得し、strict より候補が増えるかを判定する。
+         * 判定だけの補助取得で、表示中のリストは書き換えない。
+         */
+        async probeRelaxedAvailability(program_id: number, strict_total: number): Promise<void> {
+            const request_sequence = this.request_sequence;
+            const result = await Videos.fetchRelatedVideos(program_id, 'relaxed', this.show_other_channels, 'desc', 1);
+            if (request_sequence !== this.request_sequence || this.playerStore.recorded_program.id !== program_id) {
+                return;
+            }
+            // 取得失敗時は前回の判定を維持する (トグルが途中で消えないようにする)
+            if (result === null) return;
+            this.has_relaxed_results = result.total > strict_total;
         },
 
         /** 現在の検索条件を維持したまま、関連番組の次ページを追加する。 */

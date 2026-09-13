@@ -27,6 +27,7 @@
                     <div v-else ref="gridElement" class="series-home__grid">
                         <template v-for="(card, index) in seriesList" :key="card.id">
                             <button type="button" class="series-card" :class="{'series-card--expanded': expandedId === card.id}"
+                                :data-series-card="card.id"
                                 :style="{gridColumn: String(cardGridColumn(index)), gridRow: String(cardGridRow(index))}"
                                 :aria-expanded="expandedId === card.id"
                                 @click="toggleExpand(card.id)">
@@ -51,6 +52,7 @@
                                 <!-- tmdb_name は enrich 待ち・失敗で NULL になり得るため、ヘッダはカード名と同じ fallback を使う。 -->
                                 <div class="series-home__group-header">{{cardName(expandedCard)}}</div>
                                 <section v-for="member in expandedCard.season_members" :key="member.series_id"
+                                    :data-series-section="member.series_id"
                                     class="series-home__group-section">
                                     <!-- 概要の開閉状態は成员ごとに分離し、片方の操作が他 Season へ伝播しないようにする。 -->
                                     <SeriesEpisodeList :seriesId="member.series_id"
@@ -161,6 +163,9 @@ let gridResizeObserver: ResizeObserver | null = null;
 let observedGridWidth = -1;
 let routeSyncGeneration = 0;
 let loadedListStateKey: string | null = null;
+// カードのクリック開閉では深いリンク用のスクロールを行わない。
+// toggleExpand が立て、syncRouteState が1回だけ消費する。
+let suppressDeepLinkScroll = false;
 
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)));
 // expandedId は常にカードの代表 id を所有する (成员 id の URL は syncRouteState で代表 id へ正規化)。
@@ -329,6 +334,8 @@ const toggleExpand = async (seriesId: number) => {
     routeSyncGeneration++;
     const nextId = expandedId.value === seriesId ? null : seriesId;
     expandedId.value = nextId;
+    // 一覧内の開閉は深いリンクではないため、カード・セクションへのスクロールを抑制する
+    suppressDeepLinkScroll = true;
     await router.replace({
         path: nextId === null ? '/series/' : `/series/${nextId}`,
         query: {
@@ -342,8 +349,24 @@ const toggleExpand = async (seriesId: number) => {
     if (route.fullPath === previousFullPath) await syncRouteState();
 };
 
+/**
+ * 深いリンク (/series/{id}) で開いたカードと当該 Season セクションへスクロールする。
+ * ページ側は対象カードへ、詳細枠 (overflow-y: auto) 側は成员セクションの先頭へ移動する。
+ */
+const scrollToDeepLinkedCard = async (seriesId: number): Promise<void> => {
+    await nextTick();
+    const grid = gridElement.value;
+    const card = expandedCard.value;
+    if (grid === null || card === null) return;
+    grid.querySelector<HTMLElement>(`[data-series-card="${card.id}"]`)?.scrollIntoView({block: 'center'});
+    grid.querySelector<HTMLElement>(`[data-series-section="${seriesId}"]`)?.scrollIntoView({block: 'start'});
+};
+
 const syncRouteState = async () => {
     const generation = ++routeSyncGeneration;
+    // この URL 更新がカード開閉由来かを先に確定し、以降のどの分岐でも1回だけ消費する
+    const shouldScrollToCard = suppressDeepLinkScroll === false;
+    suppressDeepLinkScroll = false;
     const seriesIdText = typeof route.params.id === 'string' ? route.params.id : '';
     const query = typeof route.query.query === 'string' ? route.query.query : '';
     // URL query の order が有効なときだけ正本。無い・不正なときは SettingsStore の保存方向へ寄せる。
@@ -376,6 +399,8 @@ const syncRouteState = async () => {
             // 展開状態の所有 ID を代表 id に正規化し、選択表示と toggle の閉判定を一致させる。
             expandedId.value = loadedCard.id;
             isLoading.value = false;
+            // 深いリンクでは対象カードと当該 Season セクションまでスクロールする (開閉操作では抑制)
+            if (shouldScrollToCard === true) await scrollToDeepLinkedCard(seriesId);
             return;
         }
 
@@ -397,6 +422,10 @@ const syncRouteState = async () => {
             await nextTick();
             if (generation !== routeSyncGeneration) return;
             updateColumnCount();
+            // 深いリンクでは対象カードと当該 Season セクションまでスクロールする (開閉操作では抑制)
+            if (targetCard !== undefined && shouldScrollToCard === true) {
+                await scrollToDeepLinkedCard(seriesId);
+            }
             return;
         }
     }
