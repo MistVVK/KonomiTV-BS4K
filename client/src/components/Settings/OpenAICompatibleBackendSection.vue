@@ -8,9 +8,9 @@
             <div class="settings__item">
                 <div class="settings__item-label">
                     OpenCode CLI を経由せず、指定した OpenAI 互換 HTTP API へ直接接続します。<br>
-                    シリーズ生成には Chat Completions、話数 Web 検索には Responses API の
-                    <code>web_search</code> を使用します。<br>
-                    Chat Completions だけを実装した互換サーバーではシリーズ生成だけ利用でき、
+                    シリーズ生成と話数 Web 検索の両方に Responses API を使用し、
+                    話数 Web 検索には Responses API の <code>web_search</code> を使用します。<br>
+                    Responses API の web_search を実装しない互換サーバーではシリーズ生成だけ利用でき、
                     話数 Web 検索の接続試験は失敗します。<br>
                 </div>
             </div>
@@ -34,7 +34,7 @@
                 <div class="settings__item">
                     <div class="settings__item-heading">モデル ID</div>
                     <div class="settings__item-label">
-                        Chat Completions と Responses API の両方へ同じモデル ID を送信します。<br>
+                        すべてのリクエストへ同じモデル ID を送信します。<br>
                     </div>
                     <v-text-field v-model="draft.model" class="settings__item-form" color="primary"
                         variant="outlined" :density="is_form_dense ? 'compact' : 'default'"
