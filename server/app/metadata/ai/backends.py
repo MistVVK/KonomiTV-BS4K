@@ -72,6 +72,10 @@ class ConnectionTestResult:
     selected_choice_id: str | None = None
     # API へは返さず、接続試験が実際に使用した認証世代と proof を結ぶ内部値。
     provider_fingerprint: str | None = None
+    # API 応答には含めない内部監査用の値。OpenAI 互換 backend が非2xxを受けたときの
+    # sanitizer 済み provider 本文抜粋で、router が監査行 (recorded_series_ai_requests)
+    # へそのまま渡す。message から再解析しないために結果オブジェクトへ保持する。
+    provider_error_excerpt: str | None = None
 
 
 @runtime_checkable

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import unicodedata
 from collections.abc import Callable
@@ -15,6 +16,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from typing_extensions import TypedDict
 
+from app import logging
 from app.constants import API_REQUEST_HEADERS
 from app.metadata.ai.ai_failure_recovery import AIPromptVariant
 from app.metadata.ai.backends import (
@@ -70,6 +72,8 @@ from app.metadata.RecordedSeriesGeneration import (
 # read は Web 検索を伴う長時間推論に耐えるよう 600 秒とする (接続・書込は短くてよい)。
 _HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=10.0, pool=10.0)
 _CANDIDATE_VALIDATION_ATTEMPTS = 2
+# 非2xx時に保持する provider 本文抜粋の上限 (task.md で固定された 1024 文字)。
+_PROVIDER_ERROR_EXCERPT_MAX_LENGTH = 1024
 
 
 class _JSONSchemaDescriptor(TypedDict):
@@ -330,6 +334,102 @@ def _ReadJSONArray(value: object) -> list[object] | None:
     if not isinstance(value, list):
         return None
     return cast(list[object], value)
+
+
+def _ExtractProviderErrorText(body: str) -> str | None:
+    """非2xx応答本文からエラー相当の文字列だけを抜き出す。
+
+    JSON なら error.message / error (文字列) / message の順に探し、
+    非 JSON なら本文の先頭をそのまま使う。生本文全体は返さない。
+
+    Args:
+        body: provider が返した非2xxの応答本文。
+
+    Returns:
+        抜き出した文字列。空・解析不能なら None。
+    """
+
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        error_object = parsed.get('error')
+        if isinstance(error_object, dict):
+            message = error_object.get('message')
+            if isinstance(message, str) and message.strip() != '':
+                return message.strip()
+        if isinstance(error_object, str) and error_object.strip() != '':
+            return error_object.strip()
+        message = parsed.get('message')
+        if isinstance(message, str) and message.strip() != '':
+            return message.strip()
+        return None
+    stripped = body.strip()
+    if stripped == '':
+        return None
+    return stripped
+
+
+def _SanitizeProviderErrorExcerpt(text: str, *, api_key: str | None) -> str:
+    """秘密値を [REDACTED] へ置換し、1行へ正規化した上で上限長へ切り詰めた保持用抜粋を返す。
+
+    provider 本文へ設定済み API キーや Authorization 値が混入した場合に備え、
+    保持・表示・ログへ出す前に必ず通す。抜粋は 1024 文字で打ち切る。
+    接続試験 message・英語ログ・監査行の3面はすべてこの戻り値だけを使い、
+    生本文を個別に加工して渡してはならない。
+
+    処理順序はセキュリティ上の意味を持つ。不可視文字の正規化を秘密置換より先に
+    行わないと、Cf (零幅文字) で分断された秘密値が置換をすり抜け、後段の Cf 除去で
+    平文へ再構成されて3面へ漏れる。逆に正規化より後で文字の除去・結合を行わない
+    (末尾の切り詰めは文字の除去のみで、切り口が秘密値を再構成することはない)。
+
+    Args:
+        text: _ExtractProviderErrorText が抜き出した文字列。
+        api_key: 現在の接続設定の API キー (値そのものを消す対象)。
+
+    Returns:
+        sanitizer 済み・1行正規化済み・長さ上限済みの抜粋。
+    """
+
+    # warning ログと監査の1行サマリへそのまま載るため、provider 本文による
+    # 表示・ログの複数行化を防ぐ目的で、保持前に必ず1行の printable text へ正規化する。
+    # まず splitlines() が行区切りとして認識する全種 (ASCII の改行系に加えて
+    # U+0085 NEL・U+2028・U+2029 も含む) を空白1つへ畳む。
+    sanitized = re.sub(r'[\n\r\x0b\x0c\x1c-\x1e\x85  ]+', ' ', text)
+    # 残った非表示文字のうち、零幅・書式文字 (category Cf) は幅を持たないため
+    # 空白を挟まず除去する。それ以外の category C 全体 (Cc 制御文字、Cs 孤立
+    # サロゲート、Co 私用領域、Cn 未割当) と非 ASCII の空白 (Zs) は、語の分断を
+    # 避けるため ASCII 空白へ置換する。escaped surrogate 由来の lone surrogate が
+    # 残ると接続試験の JSON 応答が UnicodeEncodeError で 500 になるため、
+    # ここで最終戻り値が必ず1行の printable text になることを保証する。
+    def NormalizeInvisibleChar(char: str) -> str:
+        category = unicodedata.category(char)
+        if category == 'Cf':
+            return ''
+        if category.startswith('C') or category == 'Zs':
+            return ' '
+        return char
+
+    sanitized = ''.join(NormalizeInvisibleChar(char) for char in sanitized).strip()
+    # ここから秘密置換。正規化済みの文字列へ行うため、Cf 等で分断された値は
+    # 再構成済みの形で確実に一致する。
+    # 設定済みキー値そのものを消す (空文字列の置換は全文壊れるので除外)。
+    if api_key is not None and api_key.strip() != '':
+        sanitized = sanitized.replace(api_key, '[REDACTED]')
+    # Bearer token の混入も畳む (Bearer の値は空白を含まない単一 token)。
+    sanitized = re.sub(r'(?i)(bearer)\s+\S+', r'\1 [REDACTED]', sanitized)
+    # Authorization 値は "Basic <token>" のように複数語になり得るため、
+    # 値全体を引用符・改行・終端まで畳む。区切りに : または = を必須にして、
+    # 本文中の "Authorization failed" のような散文を誤って畳まないようにする。
+    # なお先に1行化しているため改行は残っておらず、値の畳み込みは同一行の末尾まで
+    # 及び得る。秘密の残存より過剰な畳み込みを選ぶ。
+    sanitized = re.sub(
+        r'(?i)(authorization["\'\s]*[:=]["\'\s]*)[^"\'\r\n]+',
+        r'\1[REDACTED]',
+        sanitized,
+    )
+    return sanitized[:_PROVIDER_ERROR_EXCERPT_MAX_LENGTH]
 
 
 def _ParseStrictJSONObject(content: str) -> dict[str, object]:
@@ -684,6 +784,7 @@ def _FailureEpisodeResult(
         error_code=error.code,
         error_message=GetRecordedEpisodeErrorMessage(error.code) or _ConnectionTestMessage(error.code),
         sources=sources if web_search_performed else (),
+        provider_error_excerpt=error.provider_error_excerpt,
     )
 
 
@@ -787,17 +888,26 @@ class OpenAICompatibleBackend:
             raise RecordedSeriesAIError('NetworkError', latency_ms=latency_ms) from error
 
         latency_ms = int((time.monotonic() - started) * 1000)
-        if response.is_redirect:
-            raise RecordedSeriesAIError(
-                'RedirectRejected',
-                http_status=response.status_code,
-                latency_ms=latency_ms,
+        # redirect 拒否 (3xx) とそれ以外の非2xxのいずれでも、provider のエラー本文を
+        # sanitizer 済み抜粋として保持し、接続試験・英語ログ・監査行の 3 面から
+        # 切り分けに届くようにする。redirect 拒否の挙動と error_code
+        # (RedirectRejected / HTTP<status>)、日本語訳文は従来どおり維持する。
+        if response.is_redirect or response.is_success is False:
+            excerpt_text = _ExtractProviderErrorText(response.text)
+            excerpt = (
+                _SanitizeProviderErrorExcerpt(excerpt_text, api_key=api_key)
+                if excerpt_text is not None
+                else None
             )
-        if response.is_success is False:
+            logging.warning(
+                f'[OpenAICompatibleBackend] Provider returned HTTP {response.status_code} '
+                f'({self._audit_model}): {excerpt or "<empty body>"}',
+            )
             raise RecordedSeriesAIError(
-                f'HTTP{response.status_code}',
+                'RedirectRejected' if response.is_redirect else f'HTTP{response.status_code}',
                 http_status=response.status_code,
                 latency_ms=latency_ms,
+                provider_error_excerpt=excerpt,
             )
         try:
             response_payload = response.json()
@@ -1277,13 +1387,21 @@ class OpenAICompatibleBackend:
                     local_validation_attempts=1,
                 )
             except RecordedSeriesAIError as error:
+                # 日本語訳文と error_code は従来どおり。非2xxなら sanitizer 済みの
+                # provider 本文抜粋を追加情報として末尾へ付ける。
+                failure_message = _ConnectionTestMessage(error.code)
+                if error.provider_error_excerpt is not None:
+                    failure_message = (
+                        f'{failure_message} (provider response: {error.provider_error_excerpt})'
+                    )
                 return ConnectionTestResult(
                     success=False,
                     latency_ms=error.latency_ms or 0,
                     model=self._audit_model,
-                    message=_ConnectionTestMessage(error.code),
+                    message=failure_message,
                     http_status=error.http_status,
                     error_code=error.code,
+                    provider_error_excerpt=error.provider_error_excerpt,
                 )
             return ConnectionTestResult(
                 success=True,
@@ -1306,12 +1424,19 @@ class OpenAICompatibleBackend:
 
         result = await self.lookupEpisode(_BuildEpisodeLookupConnectionTestContext())
         backend_connected = result.http_status == 200
+        # 接続失敗時は日本語訳文へ sanitizer 済みの provider 本文抜粋を追加する。
+        # 全体 message は失敗 check の message をそのまま使うため、ここへ付ければ両方へ届く。
+        backend_failure_message = result.error_message or 'Responses API へ接続できませんでした。'
+        if result.provider_error_excerpt is not None:
+            backend_failure_message = (
+                f'{backend_failure_message} (provider response: {result.provider_error_excerpt})'
+            )
         backend_connection = ConnectionTestCheck(
             status='Passed' if backend_connected else 'Failed',
             message=(
                 'Responses API との認証済み接続と応答を確認しました。'
                 if backend_connected
-                else result.error_message or 'Responses API へ接続できませんでした。'
+                else backend_failure_message
             ),
         )
         web_search = ConnectionTestCheck(
@@ -1393,4 +1518,5 @@ class OpenAICompatibleBackend:
             http_status=result.http_status,
             error_code=result.error_code,
             selected_choice_id=result.outcome,
+            provider_error_excerpt=result.provider_error_excerpt,
         )
