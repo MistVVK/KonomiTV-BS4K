@@ -6,6 +6,7 @@ import concurrent.futures
 import math
 import pathlib
 import random
+import re
 import subprocess
 import time
 import uuid
@@ -26,6 +27,158 @@ from app.constants import DATABASE_CONFIG, JST, LIBRARY_PATH, STATIC_DIR, THUMBN
 from app.models.RecordedVideo import RecordedVideo
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_CONTAINER_FORMAT
+
+
+# HDR (HLG/PQ) 録画の検出とトーンマップの単一定義 (task: bs4k-thumbnail-hdr-tonemap)
+## 検出は映像ストリームメタデータ駆動とし、チャンネル属性では判定しない
+_AV_COLOR_PRIMARIES_BT2020 = 9  # AVColorPrimaries の bt2020
+# PyAV が返す color_transfer の数値 (AVColorTransferCharacteristic) と VUI 名の対応 (検出条件に使う2種のみ)
+_AV_COLOR_TRANSFER_NAMES: dict[int, str] = {
+    14: 'bt2020-10',
+    16: 'smpte2084',
+}
+# VUI 上の transfer 名と、HDR の実体として FFmpeg8 へ渡す transfer 名の対応
+## BS4K の HLG は VUI 上 bt2020-10 を名乗るが実体は HLG (ARIB STD-B67) なので、変換時は arib-std-b67 として扱う
+_HDR_INPUT_TRANSFER_MAP: dict[str, str] = {
+    'bt2020-10': 'arib-std-b67',
+    'smpte2084': 'smpte2084',
+}
+# トーンマップアルゴリズム。基準の bt2390 は同梱 FFmpeg8 (n8.1.2, libplacebo 無し) に搭載されていないため、
+## director 裁定により実行可能な mobius を使う
+_HDR_TONEMAP_ALGORITHM = 'mobius'
+
+
+class HDRTonemapConversionError(RuntimeError):
+    """HDR 判定後のトーンマップ変換失敗。フレーム単位の復旧扱いにせず抽出・生成失敗へ伝播させる"""
+
+
+def _DetectHDRInputTransfer(color_primaries: int, color_transfer: int) -> str | None:
+    """
+    映像ストリームメタデータが HDR (HLG/PQ) を示す場合に、FFmpeg8 投入用の transfer 名を返す。
+
+    Args:
+        color_primaries (int): 映像ストリームの color_primaries (AVColorPrimaries)。
+        color_transfer (int): 映像ストリームの color_transfer (AVColorTransferCharacteristic)。
+
+    Returns:
+        str | None: 'arib-std-b67' または 'smpte2084'。SDR・不明の場合は None。
+    """
+
+    # color_primaries == bt2020 かつ color_transfer が bt2020-10 / smpte2084 の場合だけ HDR とみなす
+    if color_primaries != _AV_COLOR_PRIMARIES_BT2020:
+        return None
+    transfer_name = _AV_COLOR_TRANSFER_NAMES.get(color_transfer)
+    if transfer_name is None:
+        return None
+    return _HDR_INPUT_TRANSFER_MAP[transfer_name]
+
+
+def _BuildHDRTonemapFilter(input_transfer: str | None = None) -> str:
+    """
+    HDR→SDR トーンマップのフィルタチェーンを返す (3 抽出経路で共有する単一の定義)。
+
+    rawvideo パイプ投入の経路 (PyAV 直 / tsreadex) は demuxer の入力オプションで色タグを付けるため
+    tin= は不要。MMT/TLV 経路は FFmpeg8 自身がデコードし、decoder が VUI を読んでフレームへ
+    bt2020-10 を設定するため (入力オプション -color_trc は decoder が VUI で上書きして効かない)、
+    先頭 zscale の tin= で実体の transfer を指定する必要がある。
+
+    Args:
+        input_transfer (str | None): MMT/TLV 経路で先頭 zscale の tin= へ設定する transfer 名。
+
+    Returns:
+        str: zscale+tonemap のフィルタチェーン (format=bgr24 で終わる)。
+    """
+
+    first_stage = 'zscale=transfer=linear'
+    if input_transfer is not None:
+        first_stage = f'zscale=tin={input_transfer}:transfer=linear'
+    return (
+        f'{first_stage},'
+        f'tonemap={_HDR_TONEMAP_ALGORITHM},'
+        'zscale=primaries=bt709:transfer=bt709:matrix=bt709,'
+        'format=bgr24'
+    )
+
+
+class _HDRSDRTonemapConverter:
+    """
+    PyAV がデコードした HDR (HLG/PQ) フレームを、同梱 FFmpeg8 の zscale+tonemap で SDR の BGR 配列へ変換する
+    rawvideo パイプへ渡すとフレームの色メタデータが失われるため、rawvideo demuxer の入力オプションで色タグを明示する
+    (zscale が入力の transfer/primaries/matrix を正しく解釈するために必須。これが無いと no path between colorspaces で失敗する)
+    同梱 FFmpeg8 はパイプ入力を EOF まで処理しない (stdin を開いたままでは出力が返らない) ため、
+    持続プロセスは使わずフレームごとに subprocess を起動する
+    変換に失敗した場合は例外を送出し、HDR 録画で未変換フレームが公開されないよう生成全体を失敗させる
+    (従来の rgb24 変換へのフォールバックは行わない。旧変換は SDR 録画だけに限定する)
+    """
+
+    def __init__(self, file_label: str, input_transfer: str) -> None:
+        """
+        Args:
+            file_label (str): ログ識別用のファイルパス文字列。
+            input_transfer (str): 入力フレームの実体の transfer 名 ('arib-std-b67' または 'smpte2084')。
+        """
+
+        # 変換失敗時のログへ付ける識別子。
+        self._file_label = file_label
+        # FFmpeg8 の入力タグへ渡す transfer。検出済みの HLG (arib-std-b67) / PQ (smpte2084) のみが来る前提。
+        self._input_transfer = input_transfer
+
+    def convert(self, frame: av.VideoFrame, timeout: int) -> NDArray[np.uint8]:
+        """
+        デコード済みフレームを SDR の BGR 配列 (フル解像度) へ変換する。
+
+        Args:
+            frame (av.VideoFrame): PyAV がデコードしたフレーム。
+            timeout (int): FFmpeg8 サブプロセスのタイムアウト時間 (秒)。
+
+        Returns:
+            NDArray[np.uint8]: BGR 配列 (height, width, 3)。
+
+        Raises:
+            HDRTonemapConversionError: FFmpeg8 の非0終了・出力サイズ不一致・タイムアウト・raw 変換失敗時。
+                HDR 録画では未変換フレームを公開しないため、呼び出し側へ伝播して生成を失敗させる。
+        """
+
+        width, height = frame.width, frame.height
+        pix_fmt = frame.format.name
+        command = [
+            LIBRARY_PATH['FFmpeg8'],
+            '-hide_banner', '-loglevel', 'error',
+            '-f', 'rawvideo',
+            '-pix_fmt', pix_fmt,
+            '-s', f'{width}x{height}',
+            # rawvideo パイプではフレームの色メタデータが失われるため、検出時の実体に合わせて入力タグを明示する
+            ## BS4K の HLG/PQ は primaries=bt2020・matrix=bt2020nc・range=tv 固定でよい
+            '-color_range', 'tv',
+            '-colorspace', 'bt2020nc',
+            '-color_primaries', 'bt2020',
+            '-color_trc', self._input_transfer,
+            '-i', 'pipe:0',
+            '-vf', _BuildHDRTonemapFilter(),
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            'pipe:1',
+        ]
+        try:
+            # 入力は pix_fmt そのままの rawvideo (yuv420p10le なら uint16 平面の連結)。
+            ## stdin を閉じて EOF を伝える必要があるため、communicate 相当の input= で渡す
+            raw = frame.to_ndarray(format=pix_fmt).tobytes()
+            process = subprocess.run(command, input=raw, capture_output=True, timeout=timeout, check=False)
+            expected_size = width * height * 3
+            if process.returncode != 0 or len(process.stdout) != expected_size:
+                raise RuntimeError(
+                    f'FFmpeg8 failed (rc={process.returncode}, out={len(process.stdout)}/{expected_size} bytes): '
+                    f'{process.stderr.decode(errors="replace")[:200]}'
+                )
+            return np.frombuffer(process.stdout, dtype=np.uint8).reshape((height, width, 3)).copy()
+        except Exception as ex:
+            # 変換失敗は従来変換へフォールバックせず、HDR 録画で未変換フレームが
+            ## 代表・タイルとして公開されないよう例外を伝播して生成全体を失敗させる
+            logging.error(
+                f'{self._file_label}: HDR to SDR tonemap conversion failed.',
+                exc_info=ex,
+            )
+            raise HDRTonemapConversionError(f'HDR to SDR tonemap conversion failed: {ex}') from ex
 
 
 class ThumbnailGenerator:
@@ -51,6 +204,7 @@ class ThumbnailGenerator:
     FFMPEG_TIMEOUT: ClassVar[int] = 300  # FFmpeg サブプロセスのタイムアウト時間 (秒)
     TSREADEX_FRAME_EXTRACTION_TIMEOUT: ClassVar[int] = 600  # tsreadex 経由のフレーム抽出タイムアウト時間 (秒)
     MMT_TLV_FRAME_EXTRACTION_TIMEOUT: ClassVar[int] = 60  # TLV の候補1枚を FFmpeg 8 で抽出する上限 (秒)
+    HDR_TONEMAP_CONVERSION_TIMEOUT: ClassVar[int] = 60  # HDR フレーム1枚の FFmpeg 8 トーンマップ変換の上限 (秒)
     FRAME_EXTRACTION_MAX_DEMUX_PACKETS: ClassVar[int] = 20000  # 1候補位置でフレーム探索する最大パケット数
     FRAME_EXTRACTION_MAX_CONSECUTIVE_FAILURES: ClassVar[int] = 10  # 連続失敗時に残り候補を黒画像で埋める閾値
 
@@ -695,6 +849,46 @@ class ThumbnailGenerator:
         return True
 
 
+    def __convertFrameToScoringBGR(
+        self,
+        frame: av.VideoFrame,
+        hdr_converter: _HDRSDRTonemapConverter | None,
+    ) -> NDArray[np.uint8]:
+        """
+        デコード済みフレームをスコアリング解像度の BGR 配列へ変換する単一の投入点
+        HDR 録画では同梱 FFmpeg8 の zscale+tonemap で SDR 化してから縮小し、
+        SDR 録画では従来どおり rgb24 直変換を使う
+        HDR 変換が失敗した場合は例外が伝播し、生成全体が失敗する (未変換フレームは公開しない)
+        代表サムネイル・タイル・スコアリング・顔検出・レターボックス判定のすべてが
+        この戻り値を使うため、変換の有無はここで確定すればよい
+
+        Args:
+            frame (av.VideoFrame): PyAV がデコードしたフレーム
+            hdr_converter (_HDRSDRTonemapConverter | None): HDR 録画の場合の変換プロセス
+
+        Returns:
+            NDArray[np.uint8]: スコアリング解像度 (SCORING_SCALE) の BGR 配列
+        """
+
+        scoring_width, scoring_height = self.SCORING_SCALE
+        if hdr_converter is not None:
+            # HDR 録画は必ずトーンマップする。失敗時は convert() の例外がそのまま伝播する
+            tonemapped_bgr = hdr_converter.convert(frame, self.HDR_TONEMAP_CONVERSION_TIMEOUT)
+            # SDR 化済みのフレームをスコアリング解像度へ縮小する (既に BGR のため色変換は不要)
+            return cast(
+                NDArray[np.uint8],
+                cv2.resize(tonemapped_bgr, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA),
+            )
+
+        # SDR 録画の従来経路。生成結果を変えないよう既存の変換手順を維持する
+        img_rgb = frame.to_ndarray(format='rgb24')
+        # リサイズを実行
+        ## 1440x1080 から一気に 480x270 まで縮小するため INTER_AREA を使う
+        img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
+        # RGB から OpenCV 向けの BGR に変換する
+        return cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
+
+
     def __extractAndScoreFrames(
         self,
         candidate_offsets: list[float],
@@ -719,6 +913,10 @@ class ThumbnailGenerator:
             scoring_width, scoring_height = self.SCORING_SCALE
             bgr_frames: list[NDArray[np.uint8]] = []
             consecutive_failed_frames = 0
+            # HDR (HLG/PQ) 判定は最初にデコードできたフレームのメタデータで行う
+            ## codec_context はコンテナ次第で色情報が未設定のことがあるため、フレーム側の値で確定させる
+            hdr_converter: _HDRSDRTonemapConverter | None = None
+            hdr_detection_done = False
 
             # MPEG-TS の場合は format を明示的に指定
             format_name = 'mpegts' if self.container_format == 'MPEG-TS' else None
@@ -794,21 +992,32 @@ class ThumbnailGenerator:
                                 break
                             continue
 
-                        # フレームを numpy 配列に変換
-                        img_rgb = frame.to_ndarray(format='rgb24')
+                        # HDR 判定は最初のフレームで1回だけ行い、HDR 録画のみ変換プロセスを起動する
+                        if hdr_detection_done is False:
+                            hdr_detection_done = True
+                            hdr_input_transfer = _DetectHDRInputTransfer(frame.color_primaries, frame.color_trc)
+                            if hdr_input_transfer is not None:
+                                logging.info(
+                                    f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
+                                    'Applying HDR to SDR tonemap for thumbnail frames.'
+                                )
+                                hdr_converter = _HDRSDRTonemapConverter(str(self.file_path), hdr_input_transfer)
 
-                        # リサイズを実行
-                        ## 1440x1080 から一気に 480x270 まで縮小するため INTER_AREA を使う
-                        img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
-
-                        # RGB から OpenCV 向けの BGR に変換して bgr_frames に追加する
-                        img_bgr = cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
+                        # フレームをスコアリング解像度の BGR 配列に変換して bgr_frames に追加する
+                        ## HDR 録画では FFmpeg8 の zscale+tonemap で SDR 化されてから返る
+                        img_bgr = self.__convertFrameToScoringBGR(frame, hdr_converter)
                         bgr_frames.append(img_bgr)
                         consecutive_failed_frames = 0
 
                         # 進捗ログ（50フレームごと）
                         if (i + 1) % 50 == 0:
                             logging.debug(f'{self.file_path}: Extracted {i + 1}/{len(candidate_offsets)} frames')
+
+                    except HDRTonemapConversionError:
+                        # HDR 判定後のトーンマップ失敗はフレーム単位の復旧 (黒画像代替) をせず、
+                        ## 関数末尾の共通エラーハンドリングへ伝播させて抽出失敗とする
+                        ## (未変換・代替フレームを代表・タイルとして公開しないため)
+                        raise
 
                     except Exception as ex:
                         # 個別のフレーム抽出エラーは警告にとどめ、黒画像で代替
@@ -948,6 +1157,13 @@ class ThumbnailGenerator:
             previous_frame_relative_time: float | None = None
             bgr_frames: list[NDArray[np.uint8]] = []
             next_candidate_index = 0
+            # HDR (HLG/PQ) 判定は最初にデコードできたフレームのメタデータで行う
+            hdr_converter: _HDRSDRTonemapConverter | None = None
+            hdr_detection_done = False
+            # HDR 録画では変換がフレームごとの FFmpeg8 プロセス起動になり高コストなため、
+            ## 採用が確定するまでデコード済みフレームを保持し、採用するフレームだけを変換する
+            ## (SDR 録画は従来どおり全フレームを即時変換する)
+            previous_decoded_frame: av.VideoFrame | None = None
             for decoded_frame in container_for_read.decode(video_stream):
                 if time.time() - start_time_frame_extraction > self.TSREADEX_FRAME_EXTRACTION_TIMEOUT:
                     logging.error(
@@ -961,21 +1177,44 @@ class ThumbnailGenerator:
                     first_frame_time = float(decoded_frame.time)
                 relative_time = float(decoded_frame.time) - first_frame_time
 
+                # HDR 判定は最初のフレームで1回だけ行い、HDR 録画のみ変換プロセスを起動する
+                if hdr_detection_done is False:
+                    hdr_detection_done = True
+                    hdr_input_transfer = _DetectHDRInputTransfer(decoded_frame.color_primaries, decoded_frame.color_trc)
+                    if hdr_input_transfer is not None:
+                        logging.info(
+                            f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
+                            'Applying HDR to SDR tonemap for thumbnail frames.'
+                        )
+                        hdr_converter = _HDRSDRTonemapConverter(str(self.file_path), hdr_input_transfer)
+
                 # 既存のスコアリング入力と同じ解像度に縮小し、次の候補時刻をまたいだ時に直前フレームとして使う
-                img_rgb = decoded_frame.to_ndarray(format='rgb24')
-                img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
-                bgr_frame = cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
+                ## SDR 録画は従来どおりここで全フレームを変換する。HDR 録画は採用時にだけ変換するため、
+                ## この時点ではデコード済みフレームの保持にとどめる
+                bgr_frame = (
+                    self.__convertFrameToScoringBGR(decoded_frame, None)
+                    if hdr_converter is None
+                    else None
+                )
 
                 # 候補時刻を超えた場合、通常経路の backward seek と同じく直前の I フレームを採用する
                 ## 先頭だけは直前フレームが存在しないため、最初に取得できた I フレームを使う
                 while next_candidate_index < expected_frame_count and relative_time + 0.001 >= candidate_offsets[next_candidate_index]:
-                    if previous_frame_bgr is not None:
+                    if hdr_converter is not None:
+                        # HDR は採用が確定したフレームだけを FFmpeg8 でトーンマップする
+                        chosen_frame = previous_decoded_frame if previous_decoded_frame is not None else decoded_frame
+                        bgr_frames.append(self.__convertFrameToScoringBGR(chosen_frame, hdr_converter))
+                    elif previous_frame_bgr is not None:
                         bgr_frames.append(previous_frame_bgr.copy())
                     else:
+                        assert bgr_frame is not None
                         bgr_frames.append(bgr_frame.copy())
                     next_candidate_index += 1
 
-                previous_frame_bgr = bgr_frame
+                if hdr_converter is not None:
+                    previous_decoded_frame = decoded_frame
+                else:
+                    previous_frame_bgr = bgr_frame
                 previous_frame_relative_time = relative_time
 
                 # 必要な候補枚数を取得したら、tsreadex 側の入力パイプを閉じて処理を終える
@@ -986,10 +1225,15 @@ class ThumbnailGenerator:
             ## デコード済みフレームが1枚もない場合は、後続の不足補完で黒画像にする
             while (
                 next_candidate_index < expected_frame_count and
-                previous_frame_bgr is not None and
+                (previous_decoded_frame is not None or previous_frame_bgr is not None) and
                 previous_frame_relative_time is not None
             ):
-                bgr_frames.append(previous_frame_bgr.copy())
+                if hdr_converter is not None:
+                    assert previous_decoded_frame is not None
+                    bgr_frames.append(self.__convertFrameToScoringBGR(previous_decoded_frame, hdr_converter))
+                else:
+                    assert previous_frame_bgr is not None
+                    bgr_frames.append(previous_frame_bgr.copy())
                 next_candidate_index += 1
 
             # 末尾までに候補数へ届かない場合でもタイル枚数を維持し、保存処理の前提を崩さない
@@ -1055,9 +1299,28 @@ class ThumbnailGenerator:
         consecutive_failed_frames = 0
         start_time_frame_extraction = time.time()
 
+        # HDR (HLG/PQ) かどうかを映像メタデータから判定し、HDR 録画のみトーンマップフィルタを挿入する
+        hdr_input_transfer = self.__probeHDRInputTransferWithFFmpeg()
+        if hdr_input_transfer is not None:
+            logging.info(
+                f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
+                'Applying HDR to SDR tonemap for thumbnail frames.'
+            )
+
         # PyAV は同梱 FFmpeg 8 の libaribtlv demuxer を持たないため、この形式だけ固定バイナリへ委譲する。
         # 1 process で大量 seek すると demuxer 状態が候補間で残るので、候補ごとに独立して fail closed にする。
         for index, offset_sec in enumerate(candidate_offsets):
+            # HDR 録画のみ、スケーリング前に zscale+tonemap で SDR 化する
+            ## MMT/TLV は FFmpeg8 自身がデコードするため、先頭 zscale の tin= で
+            ## VUI (bt2020-10 表記) を実体の transfer で上書きする
+            video_filter = (
+                f'{_BuildHDRTonemapFilter(hdr_input_transfer)},'
+                if hdr_input_transfer is not None
+                else ''
+            ) + (
+                f'scale={scoring_width}:{scoring_height}:force_original_aspect_ratio=decrease,'
+                f'pad={scoring_width}:{scoring_height}:(ow-iw)/2:(oh-ih)/2'
+            )
             command = [
                 LIBRARY_PATH['FFmpeg8'],
                 '-hide_banner', '-loglevel', 'error',
@@ -1067,10 +1330,7 @@ class ThumbnailGenerator:
                 '-map', '0:v:0',
                 '-an', '-sn', '-dn',
                 '-frames:v', '1',
-                '-vf', (
-                    f'scale={scoring_width}:{scoring_height}:force_original_aspect_ratio=decrease,'
-                    f'pad={scoring_width}:{scoring_height}:(ow-iw)/2:(oh-ih)/2'
-                ),
+                '-vf', video_filter,
                 '-pix_fmt', 'bgr24',
                 '-f', 'rawvideo',
                 'pipe:1',
@@ -1090,6 +1350,13 @@ class ThumbnailGenerator:
                 process = None
 
             if process is None or process.returncode != 0 or len(process.stdout) != expected_size:
+                # HDR と判定した録画では、トーンマップを含む候補抽出の失敗を黒画像補完しない
+                ## 未変換・代替フレームを代表・タイルとして公開しないよう、生成失敗へ伝播する
+                if hdr_input_transfer is not None:
+                    logging.error(
+                        f'{self.file_path}: HDR MMT/TLV frame extraction and tonemap failed at {offset_sec:.2f}s.'
+                    )
+                    return None
                 bgr_frames.append(np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8))
                 consecutive_failed_frames += 1
             else:
@@ -1117,6 +1384,49 @@ class ThumbnailGenerator:
             f'[frames: {len(bgr_frames)}, elapsed: {time.time() - start_time_frame_extraction:.2f}s]'
         )
         return (bgr_frames, self.__scoreFrames(bgr_frames))
+
+
+    def __probeHDRInputTransferWithFFmpeg(self) -> str | None:
+        """
+        MMT/TLV 録画の映像メタデータを同梱 FFmpeg8 の出力から読み、HDR (HLG/PQ) なら投入用 transfer 名を返す
+
+        Returns:
+            str | None: 'arib-std-b67' または 'smpte2084'。SDR・判定不能の場合は None
+        """
+
+        # stream 情報は stderr へ出るため、0 フレーム処理の起動だけで色メタデータを取得する
+        command = [
+            LIBRARY_PATH['FFmpeg8'],
+            '-f', 'libaribtlv',
+            '-i', str(self.file_path),
+            '-frames:v', '0',
+            '-f', 'null', '-',
+        ]
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=self.MMT_TLV_FRAME_EXTRACTION_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            logging.warning(f'{self.file_path}: Failed to probe MMT/TLV color metadata.', exc_info=ex)
+            return None
+
+        # 出力例: "Stream #0:0[0x100]: Video: hevc (Main 10) (...), yuv420p10le(tv, bt2020nc/bt2020/bt2020-10), ..."
+        ## pix_fmt 直後の括弧は (range, matrix/primaries/transfer, ...) の並び
+        match = re.search(
+            r'Video:.*?\w+\((?:[^()/]*,\s*)?([a-z0-9]+)/([a-z0-9-]+)/([a-z0-9-]+)',
+            process.stderr.decode(errors='replace'),
+        )
+        if match is None:
+            logging.warning(f'{self.file_path}: No color metadata found in MMT/TLV probe output.')
+            return None
+        _matrix, primaries, transfer = match.groups()
+        # color_primaries == bt2020 かつ transfer が bt2020-10 / smpte2084 の場合だけ HDR とみなす
+        if primaries != 'bt2020' or transfer not in _HDR_INPUT_TRANSFER_MAP:
+            return None
+        return _HDR_INPUT_TRANSFER_MAP[transfer]
 
 
     def __scoreFrames(self, bgr_frames: list[NDArray[np.uint8]]) -> int | None:
