@@ -19,7 +19,7 @@ from app import logging
 from app.config import Config
 from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
 from app.models.RecordedProgram import RecordedProgram
-from app.schemas import AudioTrack
+from app.schemas import AudioTrack, CMSection
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KONOMITV_BS4K_VIDEO_BITRATE_MINIMUM_GAP_KBPS,
     KONOMITV_BS4K_VIDEO_BITRATE_RATIOS_FROM_HEVC,
@@ -69,6 +69,32 @@ class RecordedPlaybackPrefetchRun:
     segments: tuple[RecordedFMP4Segment, ...]
     # セッション破棄・シーク時にキャンセルし、対象要求から完了を待つ共有 task。
     task: asyncio.Task[bool]
+    # CM スキップの終端を anchor にした先行生成では、その先頭セグメントの sequence を保持する。
+    # None は現在位置からの通常先読みで、範囲外要求で即キャンセルする従来どおりの実行を表す。
+    cm_anchor_sequence: int | None = None
+    # CM 先行生成を起動した要求の sequence。これより手前への後方シークでは、
+    # スキップせずCMを視聴する可能性が高いため、通常の範囲外要求と同様にキャンセルする。
+    cm_trigger_sequence: int | None = None
+    # CM 先行生成を起動した要求の request generation。方向判定はこれより新しい generation の
+    # 要求が届いたときだけ行い、同世代の自然な到着順・再試行では維持する。
+    cm_trigger_generation: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedCMSkipAudioPrefetch:
+    """CM スキップの終端 anchor に紐づく音声 delivery generation の先行生成を表す。"""
+
+    # 先行生成本体の共有 task。後方シークや generation 範囲を外れたシークでキャンセルする。
+    task: asyncio.Task[None]
+    # 先行生成を起動した映像要求の sequence。これより手前への後方シークで回収対象になる。
+    trigger_sequence: int
+    # 先行生成を起動した要求の request generation。音声要求は映像 trigger より自然に遅れるため、
+    # 同世代の要求では方向判定を行わず維持する。None は generation を持たない起動要求を表す。
+    request_generation: int | None
+    # 生成対象の音声 delivery generation の先頭・末尾 sequence。この範囲内の音声要求は
+    # スキップ後の自然な需要なので、生成を維持する。
+    first_sequence: int
+    last_sequence: int
 
 
 RecordedVideoBitrate = KonomiTVBS4KPlaybackVideoBitrate
@@ -159,6 +185,9 @@ class RecordedFMP4Stream:
     # 2セグメントなら約12秒で、6秒の再生中に完了しやすくしつつ、単発2回分のprerollを1回へ減らせる。
     PLAYBACK_PREFETCH_MAX_SEGMENTS: ClassVar[int] = 2
     PLAYBACK_PREFETCH_MAX_DURATION_SECONDS: ClassVar[float] = 18.0
+    # CM スキップ有効時、要求位置が CM 開始のこの秒数手前へ達したら CM 終端 anchor の先行生成を始める。
+    # 先読み枠が通常 run で埋まっていても、スキップ発動までに次の要求で再試行できる余裕を持たせる。
+    CM_SKIP_PREFETCH_LEAD_SECONDS: ClassVar[float] = 18.0
     AAC_ENCODER_DELAY_SAMPLES: ClassVar[int] = 1024
     AAC_PACKET_SAMPLES: ClassVar[int] = 1024
     AUDIO_SAMPLE_RATE: ClassVar[int] = 48_000
@@ -211,6 +240,17 @@ class RecordedFMP4Stream:
     _playback_prefetch_run: RecordedPlaybackPrefetchRun | None
     # 先読みの起動・シーク時キャンセル・完了時の参照解除を直列化する。
     _playback_prefetch_lock: asyncio.Lock
+    # CM スキップ有効の視聴セッションかどうか。playlist 要求で固定され、同一セッション条件として照合する。
+    ## 既存テストが object.__new__ で作る最小ダブルはこの属性を設定しないため、class 既定値を False とする。
+    _cm_skip_aware: bool = False
+    # CM 終端 anchor の先行生成を開始済みの anchor segment sequence。1 区間につき映像・音声各 1 回まで。
+    _cm_skip_video_prefetch_started: set[int]
+    _cm_skip_audio_prefetch_started: set[int]
+    # CM 終端の音声 generation を先行生成するときの対象レンディション。直近の音声要求から追跡する。
+    _last_requested_audio_rendition_id: str | None
+    # 音声先行生成 task の強参照。anchor sequence をキーに起動元・generation 範囲を保持し、
+    # 後方・範囲外シーク時の回収に使う。完了まで GC されないよう保持し、破棄は active operation に委ねる。
+    _cm_skip_audio_prefetch_tasks: dict[int, RecordedCMSkipAudioPrefetch]
     # クライアントのシーク世代。遅着した旧要求が新しい生成処理へ干渉しないよう比較する。
     _latest_request_generation: int
     # 世代付きsegment要求の実行Task。新しいシーク世代の到着時に旧世代だけを停止する。
@@ -239,6 +279,7 @@ class RecordedFMP4Stream:
         is_new_session_allowed: bool = False,
         client_key: str = 'unknown',
         is_offline_continuous: bool = False,
+        cm_skip_aware: bool = False,
     ) -> RecordedFMP4Stream:
         """session ID単位で単一の新録画視聴セッションを返す。"""
 
@@ -288,6 +329,11 @@ class RecordedFMP4Stream:
                 cls.SESSION_TIMEOUT,
                 lambda: asyncio.create_task(instance.__destroyIfIdle(instance._destroy_handle)),
             )
+            instance._cm_skip_aware = cm_skip_aware
+            instance._cm_skip_video_prefetch_started = set()
+            instance._cm_skip_audio_prefetch_started = set()
+            instance._last_requested_audio_rendition_id = None
+            instance._cm_skip_audio_prefetch_tasks = {}
             cls._instances[session_id] = instance
             cls._session_client_keys[session_id] = client_key
         instance = cls._instances[session_id]
@@ -302,6 +348,9 @@ class RecordedFMP4Stream:
             instance.encoding_options.video_bit_depth != encoding_options.video_bit_depth or
             instance.encoding_options.audio_codec != encoding_options.audio_codec
         ):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session conditions mismatch')
+        # CM スキップの有無も同じセッション条件として照合する
+        if instance._cm_skip_aware != cm_skip_aware:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session conditions mismatch')
         return instance
 
@@ -529,6 +578,7 @@ class RecordedFMP4Stream:
         recorded_program: RecordedProgram,
         quality: QUALITY_TYPES,
         encoding_options: StreamEncodingOptions,
+        cm_skip_aware: bool = False,
     ) -> None:
         """指定した録画視聴セッションを終了し、遅着要求による再作成を防ぐ。
 
@@ -537,6 +587,7 @@ class RecordedFMP4Stream:
             recorded_program: セッションが再生している録画番組。
             quality: セッションに固定された画質。
             encoding_options: セッションに固定されたエンコード条件。
+            cm_skip_aware: セッションに固定された CM スキップ有効フラグ。
 
         Returns:
             None
@@ -546,11 +597,13 @@ class RecordedFMP4Stream:
         instance = cls._instances.get(session_id)
         if instance is not None:
             # 別録画・別生成条件の session_id を第三者が終了できないよう、既存の条件照合を通す。
+            # CM スキップの有無もセッション条件のため、照合用インスタンスへ同じ値を渡す。
             instance = cls(
                 session_id,
                 recorded_program,
                 quality,
                 encoding_options=encoding_options,
+                cm_skip_aware=cm_skip_aware,
             )
             await instance.destroy()
             return
@@ -1703,9 +1756,9 @@ class RecordedFMP4Stream:
             async with self.__segmentRequest(request_generation) as is_current:
                 if is_current is False:
                     return b''
-                return await self.__getAudioSegment(rendition_id, sequence)
+                return await self.__getAudioSegment(rendition_id, sequence, request_generation)
 
-    async def __getAudioSegment(self, rendition_id: str, sequence: int) -> bytes | None:
+    async def __getAudioSegment(self, rendition_id: str, sequence: int, request_generation: int | None = None) -> bytes | None:
         """音声fragment生成の本体処理を行う。"""
 
         self.keepAlive()
@@ -1713,6 +1766,13 @@ class RecordedFMP4Stream:
         rendition = self.__getAudioRendition(rendition_id)
         if segment is None or rendition is None:
             return None
+        # CM スキップの音声先行生成は、プレイヤーが実際に聴いているレンディションだけを対象にする
+        self._last_requested_audio_rendition_id = rendition.id
+        # 音声要求が先行生成の対象範囲を外れたシーク由来なら、旧 anchor の先行生成を回収する。
+        # 方向判定は起動時より新しい generation の要求だけで行い、同世代の自然な
+        # A/V 遅延や generation を持たない init 要求では維持する。
+        if self._cm_skip_aware is True:
+            await self.__collectCMSkipAudioPrefetchIfSeekedAway(sequence, request_generation)
         segment_data = await self.__getTranscodedAudioSegment(segment, rendition, self._effective_audio_codec)
         if segment_data is not None and getattr(self.recorded_program.recorded_video, 'has_video', True) is False:
             self._completed_sequences.add(sequence)
@@ -1752,18 +1812,20 @@ class RecordedFMP4Stream:
             async with self.__segmentRequest(request_generation) as is_current:
                 if is_current is False:
                     return b''
-                return await self.__getVideoSegment(sequence, should_start_playback_prefetch=True)
+                return await self.__getVideoSegment(sequence, should_start_playback_prefetch=True, request_generation=request_generation)
 
     async def __getVideoSegment(
         self,
         sequence: int,
         should_start_playback_prefetch: bool = False,
+        request_generation: int | None = None,
     ) -> bytes | None:
         """映像fragment生成の本体処理を行う。
 
         Args:
             sequence: 取得するHLSメディアシーケンス。
             should_start_playback_prefetch: 通常のmedia要求として後続先読みを許可するか。
+            request_generation: 現在要求のシーク世代。CM先行生成の方向判定に使う。
 
         Returns:
             生成済み映像fragment。生成できない場合はNone。
@@ -1788,7 +1850,7 @@ class RecordedFMP4Stream:
         # 先読み対象なら共有taskの完了を待ち、範囲外要求なら古い方向の先読みを先に回収する。
         # path lockを保持したまま待つと、先読み側のatomic公開と相互待ちになるため必ず先に行う。
         if is_offline_continuous is False and should_start_playback_prefetch is True:
-            playback_prefetch_task = await self.__preparePlaybackPrefetchRequest(sequence)
+            playback_prefetch_task = await self.__preparePlaybackPrefetchRequest(sequence, request_generation)
             if playback_prefetch_task is not None:
                 try:
                     await asyncio.shield(playback_prefetch_task)
@@ -1798,6 +1860,10 @@ class RecordedFMP4Stream:
                     current_task = asyncio.current_task()
                     if current_task is not None and current_task.cancelling() > 0:
                         raise
+            # CM スキップの音声先行生成は映像runとは別taskのため、後方・範囲外シークでは
+            # 映像runの回収とあわせてここで回収する (同世代・anchor 内の順方向要求では何もしない)。
+            if self._cm_skip_aware is True:
+                await self.__collectCMSkipAudioPrefetchIfSeekedAway(sequence, request_generation)
 
         segment_path = self.__buildCachePath(segment, is_init=False)
         init_path = self.__buildCachePath(segment, is_init=True)
@@ -1836,6 +1902,11 @@ class RecordedFMP4Stream:
                     did_encode_current_segment = True
 
         if is_offline_continuous is False:
+            # CM スキップ有効のセッションでは、CM 開始手前の通常要求を合図にスキップ先
+            # (CM 終端) の先行生成を始める。スキップ発動直後の再生待ちを減らすため、
+            # 通常の後続先読みより先に CM anchor 側へ実行枠を割り当てる。
+            if segment_data is not None and should_start_playback_prefetch is True:
+                await self.__startCMSkipPrefetchIfNeeded(segment, request_generation)
             # キャッシュヒットや先読みtaskの成果からは次を起動しない。直接単発生成した要求だけを
             # 起点にすることで、短い先読みがファイル末尾まで自動連鎖することを防ぐ。
             if (
@@ -2554,26 +2625,28 @@ class RecordedFMP4Stream:
         await RecordedFMP4CacheManager.writeAtomic(segment_path, media_data)
         return True
 
-    def __getPlaybackPrefetchSegments(
+    def __collectPlaybackPrefetchWindow(
         self,
-        current_segment: RecordedFMP4Segment,
+        start_sequence: int,
+        generation: int,
     ) -> list[RecordedFMP4Segment]:
-        """直接生成した現在fragmentの直後から、短い未キャッシュ連続区間を返す。
+        """指定位置から同じ映像generationの未キャッシュ連続区間を、先読み窓の上限内で返す。
 
         Args:
-            current_segment: browserへ返すため単発生成した現在のセグメント。
+            start_sequence: 先読みを開始するセグメントのシーケンス。
+            generation: 混在させない映像generation。
 
         Returns:
-            同じ映像generation内で本数・媒体時間上限に収まる後続セグメント。
+            本数・媒体時間上限に収まる連続セグメント。
         """
 
         segments: list[RecordedFMP4Segment] = []
         total_duration = 0.0
-        sequence = current_segment.sequence + 1
+        sequence = start_sequence
         while sequence < len(self._segments):
             segment = self._segments[sequence]
             # codec configurationが変わる境界を単一の連続encodeへ混在させない。
-            if segment.generation != current_segment.generation:
+            if segment.generation != generation:
                 break
             # cache済み区間を飛び越して遠方のholeを生成すると、cache hitだけで先読みが
             # ファイル末尾まで連鎖するため、直後からの連続holeだけを対象にする。
@@ -2588,11 +2661,30 @@ class RecordedFMP4Stream:
             sequence += 1
         return segments
 
-    async def __preparePlaybackPrefetchRequest(self, sequence: int) -> asyncio.Task[bool] | None:
+    def __getPlaybackPrefetchSegments(
+        self,
+        current_segment: RecordedFMP4Segment,
+    ) -> list[RecordedFMP4Segment]:
+        """直接生成した現在fragmentの直後から、短い未キャッシュ連続区間を返す。
+
+        Args:
+            current_segment: browserへ返すため単発生成した現在のセグメント。
+
+        Returns:
+            同じ映像generation内で本数・媒体時間上限に収まる後続セグメント。
+        """
+
+        return self.__collectPlaybackPrefetchWindow(
+            current_segment.sequence + 1,
+            current_segment.generation,
+        )
+
+    async def __preparePlaybackPrefetchRequest(self, sequence: int, request_generation: int | None = None) -> asyncio.Task[bool] | None:
         """現在要求を実行中の先読みに接続し、範囲外なら古い先読みを回収する。
 
         Args:
             sequence: browserが現在必要としているシーケンス。
+            request_generation: 現在要求のシーク世代。CM先行生成の方向判定に使う。
 
         Returns:
             このsequenceを生成中なら共有task。それ以外はNone。
@@ -2605,6 +2697,21 @@ class RecordedFMP4Stream:
                 return None
             if any(segment.sequence == sequence for segment in run.segments):
                 return run.task
+            # CM 終端 anchor の先行生成では、起動要求から anchor 窓までの自然な順方向の
+            # 手前要求だけは実行を維持する (スキップ発動時に必要な生成を直前で殺さないため)。
+            # 方向判定は起動時より新しい request generation の要求だけで行う。
+            # 同じ generation の要求はシークを伴わない通常再生 (CM 内の先読み通過や
+            # 再試行を含む) なので維持し、generation を持たない要求でも判定しない。
+            if run.cm_anchor_sequence is not None and run.cm_trigger_sequence is not None:
+                is_newer_generation = (
+                    request_generation is not None and
+                    run.cm_trigger_generation is not None and
+                    request_generation > run.cm_trigger_generation
+                )
+                if is_newer_generation is False:
+                    return None
+                if run.cm_trigger_sequence <= sequence <= run.segments[-1].sequence:
+                    return None
             # シーク先を含まない実行は参照から先に外す。taskのfinallyも同じlockを取るため、
             # cancel完了はlock外で待たなければデッドロックする。
             self._playback_prefetch_run = None
@@ -2694,6 +2801,227 @@ class RecordedFMP4Stream:
                     f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
                     f'start_sequence: {segments[0].sequence}, end_sequence: {segments[-1].sequence}]'
                 )
+
+    def __getCMSkipAnchorSegment(self, current_segment: RecordedFMP4Segment) -> RecordedFMP4Segment | None:
+        """要求位置が手前リード内へ入った次のCM区間について、終端を含むセグメントを返す。
+
+        Args:
+            current_segment: browserが現在要求した映像セグメント。
+
+        Returns:
+            スキップ先となるCM終端を含むセグメント。対象のCM区間がなければNone。
+        """
+
+        cm_sections: list[CMSection] = self.recorded_program.recorded_video.cm_sections or []
+        for section in sorted(cm_sections, key=lambda item: (item['start_time'], item['end_time'])):
+            start_time = max(0.0, float(section['start_time']))
+            end_time = max(0.0, float(section['end_time']))
+            if start_time >= end_time:
+                continue
+            # 終端を通過済みの区間と、まだ手前リードへ達していない区間は対象外。
+            # バッファ先読みでCM内部のセグメントが要求された場合もここで起動対象になる。
+            if current_segment.start_time >= end_time:
+                continue
+            if current_segment.start_time < start_time - self.CM_SKIP_PREFETCH_LEAD_SECONDS:
+                continue
+            # CM 終端ちょうどがセグメント境界に一致するときは、その境界から始まるセグメントを選ぶ
+            return next(
+                (
+                    segment for segment in self._segments
+                    if segment.start_time <= end_time < segment.start_time + segment.duration
+                ),
+                None,
+            )
+        return None
+
+    async def __startCMSkipPrefetchIfNeeded(self, current_segment: RecordedFMP4Segment, request_generation: int | None = None) -> None:
+        """CM スキップ有効セッションで、CM 終端 anchor の映像・音声の先行生成を始める。
+
+        Args:
+            current_segment: browserへ返した現在の映像セグメント。
+            request_generation: 起動元要求のシーク世代。後方・範囲外シークの方向判定に使う。
+
+        Returns:
+            None
+        """
+
+        if self._cm_skip_aware is False:
+            return
+        anchor_segment = self.__getCMSkipAnchorSegment(current_segment)
+        if anchor_segment is None:
+            return
+
+        # 映像は既存の先読みrunと同じ実行枠で、CM 終端から通常窓 (2 segment / 18 秒) を生成する。
+        # 実行枠が埋まっている要求では起動せず、次の要求で再試行する (起動は 1 要求 1 回まで)。
+        if anchor_segment.sequence not in self._cm_skip_video_prefetch_started:
+            started = await self.__startCMSkipVideoPrefetch(anchor_segment, current_segment.sequence, request_generation)
+            if started is True:
+                self._cm_skip_video_prefetch_started.add(anchor_segment.sequence)
+
+        # 音声は CM 終端を含む delivery generation を、既存の境界計算・生成経路のまま先行生成する。
+        if anchor_segment.sequence not in self._cm_skip_audio_prefetch_started:
+            rendition = self.__getCMSkipAudioPrefetchRendition()
+            if rendition is not None:
+                self._cm_skip_audio_prefetch_started.add(anchor_segment.sequence)
+                task = asyncio.create_task(self.__runCMSkipAudioPrefetch(anchor_segment, rendition))
+                # 後方・範囲外シークで回収できるよう、起動元と generation 範囲を task に紐付ける
+                generation_segments = self.__getAudioGenerationSegments(
+                    self.__getTranscodedAudioGeneration(anchor_segment),
+                )
+                if len(generation_segments) > 0:
+                    self._cm_skip_audio_prefetch_tasks[anchor_segment.sequence] = RecordedCMSkipAudioPrefetch(
+                        task=task,
+                        trigger_sequence=current_segment.sequence,
+                        request_generation=request_generation,
+                        first_sequence=generation_segments[0].sequence,
+                        last_sequence=generation_segments[-1].sequence,
+                    )
+                    task.add_done_callback(
+                        lambda done_task, anchor_sequence=anchor_segment.sequence: (
+                            self._cm_skip_audio_prefetch_tasks.pop(anchor_sequence, None)
+                        ),
+                    )
+                logging.info(
+                    '[RecordedFMP4Stream] Started CM skip audio prefetch. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'anchor_sequence: {anchor_segment.sequence}, rendition: {rendition.id}]'
+                )
+
+    async def __startCMSkipVideoPrefetch(self, anchor_segment: RecordedFMP4Segment, trigger_sequence: int, request_generation: int | None = None) -> bool:
+        """CM 終端から通常窓分の映像を、既存の先読みrun機構で先行生成する。
+
+        Args:
+            anchor_segment: CM 終端を含むセグメント。スキップ後に最初に要求される位置。
+            trigger_sequence: 先行生成を起動した要求の sequence。後方シーク判定に使う。
+            request_generation: 先行生成を起動した要求のシーク世代。方向判定に使う。
+
+        Returns:
+            生成を開始したか、すでに cache 済みで不要だった場合はTrue。実行枠が占有中ならFalse。
+        """
+
+        async with self._playback_prefetch_lock:
+            # 既存の通常先読みと直列化し、1 セッション 1 本の実行制約を維持する。
+            if self._playback_prefetch_run is not None:
+                return False
+            segments = self.__collectPlaybackPrefetchWindow(anchor_segment.sequence, anchor_segment.generation)
+            if len(segments) == 0:
+                # スキップ先がすでに cache 済みなら生成不要。再試行しても同じため開始済みとして扱う。
+                return True
+            immutable_segments = tuple(segments)
+            task = asyncio.create_task(self.__encodePlaybackPrefetchRun(immutable_segments))
+            self._playback_prefetch_run = RecordedPlaybackPrefetchRun(
+                segments=immutable_segments,
+                task=task,
+                cm_anchor_sequence=anchor_segment.sequence,
+                cm_trigger_sequence=trigger_sequence,
+                cm_trigger_generation=request_generation,
+            )
+            logging.info(
+                '[RecordedFMP4Stream] Started CM skip video prefetch. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                f'start_sequence: {segments[0].sequence}, end_sequence: {segments[-1].sequence}, '
+                f'count: {len(segments)}]'
+            )
+            return True
+
+    def __getCMSkipAudioPrefetchRendition(self) -> RecordedAudioRendition | None:
+        """CM 終端の音声 generation を先行生成する対象レンディションを返す。
+
+        Returns:
+            直近の音声要求と同じレンディション。要求がまだ無ければ master の既定レンディション。
+        """
+
+        renditions = self.getAudioRenditions()
+        if self._last_requested_audio_rendition_id is not None:
+            matched = next(
+                (rendition for rendition in renditions if rendition.id == self._last_requested_audio_rendition_id),
+                None,
+            )
+            if matched is not None:
+                return matched
+        return renditions[0] if len(renditions) > 0 else None
+
+    async def __collectCMSkipAudioPrefetchIfSeekedAway(self, sequence: int, request_generation: int | None = None) -> None:
+        """後方・範囲外シークで不要になった CM スキップ音声先行生成を回収する。
+
+        Args:
+            sequence: browserが現在要求したメディアセグメントのシーケンス。
+            request_generation: 現在要求のシーク世代。None (init 要求など) では方向判定しない。
+
+        Returns:
+            None
+        """
+
+        # generation を持たない要求 (init 取得など) では方向判定しない
+        if request_generation is None:
+            return
+        # 起動元と同じ generation の要求はシークを伴わない通常再生であり、音声は映像
+        # trigger より自然に遅れて到着するため維持する。起動時より新しい generation の
+        # 要求だけが方向判定の対象で、起動元より手前への後方シーク、または対象
+        # generation を通過したシークでは先行生成を止める。
+        # 起動元から generation 末尾までの順方向の要求 (スキップ発動後の要求を含む) は維持する。
+        # なお古い generation の要求は __segmentRequest() が先行排除するためここには届かない。
+        stale_records = [
+            (anchor_sequence, record)
+            for anchor_sequence, record in self._cm_skip_audio_prefetch_tasks.items()
+            if (
+                record.request_generation is None or
+                request_generation > record.request_generation
+            ) and (
+                sequence < record.trigger_sequence or sequence > record.last_sequence
+            )
+        ]
+        if len(stale_records) == 0:
+            return
+        tasks_to_cancel: list[asyncio.Task[None]] = []
+        for anchor_sequence, record in stale_records:
+            # 辞書から先に外し、done_callback の pop と二重に扱わないようにする
+            self._cm_skip_audio_prefetch_tasks.pop(anchor_sequence, None)
+            if record.task.done() is False:
+                record.task.cancel()
+            tasks_to_cancel.append(record.task)
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        logging.info(
+            '[RecordedFMP4Stream] Cancelled CM skip audio prefetch for a seek away from the anchor. '
+            f'[recorded_video_id: {self.recorded_program.recorded_video.id}, sequence: {sequence}, '
+            f'anchors: {[anchor_sequence for anchor_sequence, _ in stale_records]}]'
+        )
+
+    async def __runCMSkipAudioPrefetch(
+        self,
+        anchor_segment: RecordedFMP4Segment,
+        rendition: RecordedAudioRendition,
+    ) -> None:
+        """CM 終端を含む音声 delivery generation を通常要求と同一経路で生成する。
+
+        Args:
+            anchor_segment: CM 終端を含むセグメント。
+            rendition: 先行生成する音声レンディション。
+
+        Returns:
+            None
+        """
+
+        try:
+            # background task自体をactive operationとして数え、Keep-Alive間隔の直前に
+            # セッションとcache参照が破棄されることを防ぐ。
+            async with self.__activeOperation():
+                # generation 全体の encode と cache 公開が目的で、戻り値の fragment は使わない。
+                # 48kHz grid・packet境界・decoder warm-up は通常要求と同一コードパスに委ねる。
+                await self.__getTranscodedAudioSegment(
+                    anchor_segment,
+                    rendition,
+                    self._effective_audio_codec,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.error(
+                '[RecordedFMP4Stream] CM skip audio prefetch failed unexpectedly. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                f'anchor_sequence: {anchor_segment.sequence}, rendition: {rendition.id}]',
+                exc_info=True,
+            )
 
     def __getUncachedVideoRun(self, segment: RecordedFMP4Segment) -> list[RecordedFMP4Segment]:
         """同じ映像generation内で、指定segmentを含む未キャッシュ連続区間を返す。
@@ -3966,10 +4294,13 @@ class RecordedFMP4Stream:
     def getCodecQuery(self) -> str:
         """子APIへ引き継ぐ録画エンコード条件を返す。"""
 
+        # CM スキップの有無もセッション条件のため、有効なセッションでは子APIのURLへ引き継ぐ
+        cm_skip_query = '&cm_skip_aware=1' if self._cm_skip_aware else ''
         return (
             f'video_codec={self.encoding_options.video_codec}'
             f'&video_bit_depth={self.encoding_options.video_bit_depth}'
             f'&audio_codec={self.encoding_options.audio_codec}'
+            f'{cm_skip_query}'
         )
 
     @staticmethod
