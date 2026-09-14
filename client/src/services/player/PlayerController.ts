@@ -1643,7 +1643,9 @@ class PlayerController {
             player_store.recorded_program.recorded_video.playback_index_status === 'Ready'
         ) {
             const arib_track = player_store.recorded_program.recorded_video.subtitle_tracks.find((track) =>
-                track.codec.toLowerCase().includes('arib') && track.codec.toLowerCase() !== 'arib_ttml',
+                (track.codec.toLowerCase().includes('arib') && track.codec.toLowerCase() !== 'arib_ttml') ||
+                // sidecar もサーバーで PES payload に戻し、同じ pushRawData と seek 復元を使用する。
+                (track.source === 'Sidecar' && track.codec === 'webvtt'),
             );
             if (arib_track !== undefined) {
                 const requested_ranges = new Set<number>();

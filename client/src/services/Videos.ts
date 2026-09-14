@@ -160,6 +160,7 @@ export interface ISubtitleTrack {
     pid?: number;
     component_tag?: number;
     program_number?: number;
+    source?: 'Sidecar';
 }
 
 /** 録画ファイル情報を表すインターフェース */
