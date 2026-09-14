@@ -827,11 +827,11 @@ def CreateBackendForTarget(
     all_args = list(preset_args)
 
     # Grok Build はモデルを ACP session へ適用する一方、推論深さは CLI 引数で切り替える。
-    # `grok --reasoning-effort {low,medium,high} agent stdio` の形になるよう先頭へ挿入する。
+    # ACP agent が広告した opaque ID を大小文字も含めてそのまま先頭へ挿入する。
     if backend_kind == 'AcpGrok' and acp_settings.reasoning_effort is not None:
         all_args = [
             '--reasoning-effort',
-            acp_settings.reasoning_effort.lower(),
+            acp_settings.reasoning_effort,
             *all_args,
         ]
 

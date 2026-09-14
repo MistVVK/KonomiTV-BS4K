@@ -315,11 +315,21 @@ class _ObservedAcpToolCall:
 
 
 @dataclass(frozen=True, slots=True)
+class AcpAdvertisedReasoningEffort:
+    """ACP agent が広告した推論深さ1件。"""
+
+    reasoning_effort_id: str
+    reasoning_effort_name: str
+
+
+@dataclass(frozen=True, slots=True)
 class AcpAdvertisedModel:
-    """ACP agent が session/new で広告したモデル1件。"""
+    """ACP agent が session/new で広告したモデルと推論深さ。"""
 
     model_id: str
     model_name: str
+    current_reasoning_effort_id: str
+    reasoning_efforts: tuple[AcpAdvertisedReasoningEffort, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2114,19 +2124,19 @@ def _find_model_config_id(session_result: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _parseAcpModelCatalog(
+def _parseAcpModelAdvertisements(
     session_result: Mapping[str, Any],
     *,
     backend_kind: str,
-) -> AcpModelCatalog:
-    """session/new の provider 固有広告を検証してモデル一覧へ変換する。
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """session/new の provider 固有広告からモデル ID・表示名を取得する。
 
     Args:
         session_result: ACP agent が返した session/new result。
         backend_kind: 広告形式を固定する ACP バックエンド種別。
 
     Returns:
-        agent が広告したモデル ID・表示名と現在のモデル ID。
+        現在のモデル ID と、広告されたモデル ID・表示名の組。
 
     Raises:
         _AcpProtocolError: 広告が欠落・空・不正・重複している場合。
@@ -2176,7 +2186,7 @@ def _parseAcpModelCatalog(
     ):
         raise _AcpProtocolError('ACP agent advertised an invalid model catalog.')
 
-    parsed_models: list[AcpAdvertisedModel] = []
+    parsed_models: list[tuple[str, str]] = []
     model_ids: set[str] = set()
     # 候補を補完・推測せず、agent が広告した有効な ID と表示名だけを受理する。
     for advertised_model in available_models:
@@ -2192,38 +2202,241 @@ def _parseAcpModelCatalog(
             model_id in model_ids
         ):
             raise _AcpProtocolError('ACP agent advertised an invalid or duplicate model entry.')
-        parsed_models.append(AcpAdvertisedModel(model_id=model_id, model_name=model_name))
+        parsed_models.append((model_id, model_name))
         model_ids.add(model_id)
 
     # currentModelId も同じ広告集合に含まれなければ、UI が安全な現在値を選べない。
     if current_model_id not in model_ids:
         raise _AcpProtocolError('ACP agent current model was not present in the advertised catalog.')
-    return AcpModelCatalog(
-        current_model_id=current_model_id,
-        models=tuple(parsed_models),
-    )
+    return current_model_id, tuple(parsed_models)
 
 
-def _find_reasoning_effort_config_id(session_result: Mapping[str, Any]) -> str | None:
-    """session/new の configOptions から推論深さ selector の ID を取得する。
+def _parseAcpReasoningEffortAdvertisements(
+    session_result: Mapping[str, Any],
+) -> tuple[str, str, tuple[AcpAdvertisedReasoningEffort, ...]]:
+    """session/new の configOptions から推論深さ広告を取得する。
 
     Codex は id=reasoning_effort / category=thought_level を広告する。
+
+    Args:
+        session_result: session/new または session/set_config_option の result。
+
+    Returns:
+        config ID、現在の推論深さ ID、広告された推論深さ一覧。
+
+    Raises:
+        _AcpProtocolError: 広告が欠落・空・不正・重複している場合。
     """
 
     config_options = session_result.get('configOptions')
     if not isinstance(config_options, list):
-        return None
-    for option in config_options:
-        if not isinstance(option, dict) or not isinstance(option.get('id'), str):
-            continue
-        option_id = option['id']
-        category = option.get('category')
+        raise _AcpProtocolError('ACP agent did not advertise reasoning effort configuration options.')
+    matching_options = [
+        option
+        for option in config_options
         if (
-            option_id in {'reasoning_effort', 'reasoningEffort', 'thought_level'}
-            or category in {'thought_level', 'reasoning_effort', 'reasoningEffort'}
+            isinstance(option, dict) and
+            isinstance(option.get('id'), str) and
+            (
+                option['id'] in {'reasoning_effort', 'reasoningEffort', 'thought_level'}
+                or option.get('category') in {'thought_level', 'reasoning_effort', 'reasoningEffort'}
+            )
+        )
+    ]
+    if len(matching_options) != 1:
+        raise _AcpProtocolError('ACP agent advertised an ambiguous reasoning effort configuration option.')
+
+    reasoning_payload = matching_options[0]
+    config_id = reasoning_payload['id']
+    current_reasoning_effort_id = reasoning_payload.get('currentValue')
+    available_reasoning_efforts = reasoning_payload.get('options')
+    if (
+        reasoning_payload.get('type') != 'select' or
+        not 1 <= len(config_id) <= 255 or
+        not isinstance(current_reasoning_effort_id, str) or
+        not 1 <= len(current_reasoning_effort_id) <= 255 or
+        not isinstance(available_reasoning_efforts, list) or
+        len(available_reasoning_efforts) == 0
+    ):
+        raise _AcpProtocolError('ACP agent advertised an invalid reasoning effort catalog.')
+
+    parsed_reasoning_efforts: list[AcpAdvertisedReasoningEffort] = []
+    reasoning_effort_ids: set[str] = set()
+    # 候補を正規化・補完せず、agent が広告した ID と表示名をそのまま返す。
+    for advertised_reasoning_effort in available_reasoning_efforts:
+        if not isinstance(advertised_reasoning_effort, dict):
+            raise _AcpProtocolError('ACP agent advertised an invalid reasoning effort entry.')
+        reasoning_effort_id = advertised_reasoning_effort.get('value')
+        reasoning_effort_name = advertised_reasoning_effort.get('name')
+        if (
+            not isinstance(reasoning_effort_id, str) or
+            not 1 <= len(reasoning_effort_id) <= 255 or
+            not isinstance(reasoning_effort_name, str) or
+            not 1 <= len(reasoning_effort_name) <= 255 or
+            reasoning_effort_id in reasoning_effort_ids
         ):
-            return option_id
-    return None
+            raise _AcpProtocolError('ACP agent advertised an invalid or duplicate reasoning effort entry.')
+        parsed_reasoning_efforts.append(AcpAdvertisedReasoningEffort(
+            reasoning_effort_id=reasoning_effort_id,
+            reasoning_effort_name=reasoning_effort_name,
+        ))
+        reasoning_effort_ids.add(reasoning_effort_id)
+
+    if current_reasoning_effort_id not in reasoning_effort_ids:
+        raise _AcpProtocolError(
+            'ACP agent current reasoning effort was not present in the advertised catalog.'
+        )
+    return config_id, current_reasoning_effort_id, tuple(parsed_reasoning_efforts)
+
+
+def _parseAcpGrokReasoningEffortAdvertisements(
+    advertised_model: Mapping[str, Any],
+) -> tuple[str, tuple[AcpAdvertisedReasoningEffort, ...]]:
+    """Grok のモデル metadata から推論深さ広告を取得する。
+
+    Args:
+        advertised_model: session/new の models.availableModels に含まれるモデル1件。
+
+    Returns:
+        現在の推論深さ ID と、広告された推論深さ一覧。
+
+    Raises:
+        _AcpProtocolError: 広告が欠落・空・不正・重複している場合。
+    """
+
+    metadata = advertised_model.get('_meta')
+    if not isinstance(metadata, dict) or metadata.get('supportsReasoningEffort') is not True:
+        raise _AcpProtocolError('Grok ACP model did not advertise reasoning effort support.')
+
+    current_reasoning_effort_id = metadata.get('reasoningEffort')
+    available_reasoning_efforts = metadata.get('reasoningEfforts')
+    if (
+        not isinstance(current_reasoning_effort_id, str) or
+        not 1 <= len(current_reasoning_effort_id) <= 255 or
+        not isinstance(available_reasoning_efforts, list) or
+        len(available_reasoning_efforts) == 0
+    ):
+        raise _AcpProtocolError('Grok ACP model advertised an invalid reasoning effort catalog.')
+
+    parsed_reasoning_efforts: list[AcpAdvertisedReasoningEffort] = []
+    reasoning_effort_ids: set[str] = set()
+    # CLI 引数へ渡す value と画面へ出す label をそのまま採用し、既知値で補完しない。
+    for advertised_reasoning_effort in available_reasoning_efforts:
+        if not isinstance(advertised_reasoning_effort, dict):
+            raise _AcpProtocolError('Grok ACP model advertised an invalid reasoning effort entry.')
+        reasoning_effort_id = advertised_reasoning_effort.get('value')
+        reasoning_effort_name = advertised_reasoning_effort.get('label')
+        if (
+            not isinstance(reasoning_effort_id, str) or
+            not 1 <= len(reasoning_effort_id) <= 255 or
+            not isinstance(reasoning_effort_name, str) or
+            not 1 <= len(reasoning_effort_name) <= 255 or
+            reasoning_effort_id in reasoning_effort_ids
+        ):
+            raise _AcpProtocolError(
+                'Grok ACP model advertised an invalid or duplicate reasoning effort entry.'
+            )
+        parsed_reasoning_efforts.append(AcpAdvertisedReasoningEffort(
+            reasoning_effort_id=reasoning_effort_id,
+            reasoning_effort_name=reasoning_effort_name,
+        ))
+        reasoning_effort_ids.add(reasoning_effort_id)
+
+    if current_reasoning_effort_id not in reasoning_effort_ids:
+        raise _AcpProtocolError(
+            'Grok ACP model current reasoning effort was not present in the advertised catalog.'
+        )
+    return current_reasoning_effort_id, tuple(parsed_reasoning_efforts)
+
+
+async def _discoverAcpModelCatalog(
+    dispatcher: _AcpDispatcher,
+    session_result: Mapping[str, Any],
+    *,
+    session_id: str,
+    backend_kind: str,
+) -> AcpModelCatalog:
+    """モデルごとの推論深さ広告を同じ ACP session から収集する。
+
+    Args:
+        dispatcher: ACP JSON-RPC dispatcher。
+        session_result: session/new の result。
+        session_id: 広告を取得する session。
+        backend_kind: 固定 ACP preset の識別子。
+
+    Returns:
+        モデルごとの推論深さを含む広告カタログ。
+
+    Raises:
+        _AcpProtocolError: モデル切替後の広告が欠落または不整合な場合。
+    """
+
+    current_model_id, advertised_models = _parseAcpModelAdvertisements(
+        session_result,
+        backend_kind=backend_kind,
+    )
+    parsed_models: list[AcpAdvertisedModel] = []
+
+    if backend_kind == 'AcpGrok':
+        models_payload = session_result['models']
+        assert isinstance(models_payload, dict)
+        available_models = models_payload['availableModels']
+        assert isinstance(available_models, list)
+        # Grok は各モデルの _meta に、そのモデルで CLI 引数へ渡せる推論深さを広告する。
+        # モデル広告を先に検証した順序のまま対応付け、モデル間で候補を共有しない。
+        for (model_id, model_name), advertised_model in zip(
+            advertised_models,
+            available_models,
+            strict=True,
+        ):
+            assert isinstance(advertised_model, dict)
+            current_reasoning_effort_id, reasoning_efforts = (
+                _parseAcpGrokReasoningEffortAdvertisements(advertised_model)
+            )
+            parsed_models.append(AcpAdvertisedModel(
+                model_id=model_id,
+                model_name=model_name,
+                current_reasoning_effort_id=current_reasoning_effort_id,
+                reasoning_efforts=reasoning_efforts,
+            ))
+        return AcpModelCatalog(
+            current_model_id=current_model_id,
+            models=tuple(parsed_models),
+        )
+
+    model_config_id = _find_model_config_id(session_result)
+    if model_config_id is None:
+        raise _AcpProtocolError('ACP agent did not advertise a model configuration option.')
+    for model_id, model_name in advertised_models:
+        model_session_result = session_result
+        # Codex の reasoning_effort 候補はモデルごとに変わる。各モデルへ切り替えた直後に
+        # agent が返す configOptions だけをそのモデルの候補として採用する。
+        if model_id != current_model_id:
+            model_session_result = await dispatcher.request('session/set_config_option', {
+                'sessionId': session_id,
+                'configId': model_config_id,
+                'value': model_id,
+            })
+            selected_model_id, _ = _parseAcpModelAdvertisements(
+                model_session_result,
+                backend_kind=backend_kind,
+            )
+            if selected_model_id != model_id:
+                raise _AcpProtocolError('ACP agent returned a model catalog for an unexpected model.')
+        _, current_reasoning_effort_id, reasoning_efforts = _parseAcpReasoningEffortAdvertisements(
+            model_session_result,
+        )
+        parsed_models.append(AcpAdvertisedModel(
+            model_id=model_id,
+            model_name=model_name,
+            current_reasoning_effort_id=current_reasoning_effort_id,
+            reasoning_efforts=reasoning_efforts,
+        ))
+
+    return AcpModelCatalog(
+        current_model_id=current_model_id,
+        models=tuple(parsed_models),
+    )
 
 
 def _auth_method_ids(initialize_result: Mapping[str, Any]) -> list[str]:
@@ -2340,26 +2553,29 @@ async def _apply_session_model_and_effort(
     if model is None and reasoning_effort is None:
         return
 
-    effort_value = reasoning_effort.lower() if reasoning_effort is not None else None
     model_config_id = _find_model_config_id(session_result)
-    effort_config_id = _find_reasoning_effort_config_id(session_result)
-
-    # 推論深さを適用できない agent へモデルだけ先に変更すると、失敗時点の session が
-    # 部分適用状態になる。送信前に全項目の受け口を確認し、atomic な設定単位として扱う。
-    if effort_value is not None and effort_config_id is None:
-        raise _AcpProtocolError('ACP agent did not advertise a reasoning effort configuration option.')
+    effective_session_result = session_result
 
     if model is not None and model_config_id is not None:
-        await dispatcher.request('session/set_config_option', {
+        effective_session_result = await dispatcher.request('session/set_config_option', {
             'sessionId': session_id,
             'configId': model_config_id,
             'value': model,
         })
-    if effort_value is not None and effort_config_id is not None:
+    if reasoning_effort is not None:
+        # Codex はモデル切替後に候補集合を更新するため、切替応答の configOptions を正本にする。
+        effort_config_id, _, advertised_reasoning_efforts = _parseAcpReasoningEffortAdvertisements(
+            effective_session_result,
+        )
+        if reasoning_effort not in {
+            effort.reasoning_effort_id
+            for effort in advertised_reasoning_efforts
+        }:
+            raise _AcpProtocolError('Requested reasoning effort was not advertised by the ACP agent.')
         await dispatcher.request('session/set_config_option', {
             'sessionId': session_id,
             'configId': effort_config_id,
-            'value': effort_value,
+            'value': reasoning_effort,
         })
 
     # configOptions で model を設定できなかった場合だけ、旧 models 広告経路へ落とす。
@@ -2545,8 +2761,10 @@ async def _run_acp_session(
                 web_search_performed=False,
                 citations=(),
                 web_search_failed=False,
-                model_catalog=_parseAcpModelCatalog(
+                model_catalog=await _discoverAcpModelCatalog(
+                    dispatcher,
                     session_result,
+                    session_id=session_id,
                     backend_kind=backend_kind,
                 ),
             )
@@ -2673,6 +2891,41 @@ async def _await_cleanup_task(cleanup_task: asyncio.Task[None]) -> None:
         raise cancellation_error
 
 
+def _withoutGrokReasoningEffortArgument(args: list[str]) -> tuple[list[str], str | None]:
+    """Grok 起動引数から推論深さを分離する。
+
+    Args:
+        args: Grok CLI の起動引数。
+
+    Returns:
+        ``--reasoning-effort`` と値を除いた引数、および指定されていた値。
+
+    Raises:
+        _AcpProtocolError: 引数が重複、欠落、または空の場合。
+    """
+
+    argument_indexes = [
+        index
+        for index, argument in enumerate(args)
+        if argument == '--reasoning-effort'
+    ]
+    if len(argument_indexes) == 0:
+        return list(args), None
+    if len(argument_indexes) != 1:
+        raise _AcpProtocolError('Grok reasoning effort argument was ambiguous.')
+    argument_index = argument_indexes[0]
+    if argument_index + 1 >= len(args) or args[argument_index + 1] == '':
+        raise _AcpProtocolError('Grok reasoning effort argument was invalid.')
+    return (
+        [
+            argument
+            for index, argument in enumerate(args)
+            if index not in {argument_index, argument_index + 1}
+        ],
+        args[argument_index + 1],
+    )
+
+
 async def _run_acp_with_deadline(
     command: str,
     args: list[str],
@@ -2723,6 +2976,47 @@ async def _run_acp_with_deadline(
         # 行ごとの無通信タイマーを更新しながら続行できるが、永久占有は許可しない。
         async with asyncio.timeout(_ACP_HARD_TIMEOUT_SEC):
             async def RunSession() -> _AcpSessionResult:
+                # Grok の推論深さは process 起動前に CLI 引数へ渡す必要がある。まず引数なしの
+                # 独立 session で現在の広告を取得し、選択モデルの候補に含まれる値だけを起動へ渡す。
+                if backend_kind == 'AcpGrok':
+                    discovery_args, cli_reasoning_effort = _withoutGrokReasoningEffortArgument(args)
+                    if cli_reasoning_effort is not None:
+                        discovery_result = await _run_acp_session(
+                            command,
+                            discovery_args,
+                            env,
+                            None,
+                            model=None,
+                            reasoning_effort=None,
+                            cwd=cwd,
+                            profile_dir=profile_dir,
+                            readable_files=readable_files,
+                            operation=operation,
+                            backend_kind=backend_kind,
+                            inactivity_timeout_sec=timeout_sec,
+                            trace=_AcpExecutionTrace(),
+                        )
+                        if discovery_result.model_catalog is None:
+                            raise _AcpProtocolError('Grok did not return a reasoning effort catalog.')
+                        effective_model_id = model or discovery_result.model_catalog.current_model_id
+                        effective_model = next(
+                            (
+                                advertised_model
+                                for advertised_model in discovery_result.model_catalog.models
+                                if advertised_model.model_id == effective_model_id
+                            ),
+                            None,
+                        )
+                        if (
+                            effective_model is None or
+                            cli_reasoning_effort not in {
+                                effort.reasoning_effort_id
+                                for effort in effective_model.reasoning_efforts
+                            }
+                        ):
+                            raise _AcpProtocolError(
+                                'Requested Grok reasoning effort was not advertised by the ACP agent.'
+                            )
                 return await _run_acp_session(
                     command,
                     args,
@@ -2783,9 +3077,14 @@ async def DiscoverAcpModels(
 
     started_at = time.monotonic()
     try:
+        discovery_args = args
+        if backend_kind == 'AcpGrok':
+            # 保存済み値が古くても広告を再取得して選び直せるよう、カタログ取得自体には
+            # ``--reasoning-effort`` を渡さず agent の現在値を使用する。
+            discovery_args, _ = _withoutGrokReasoningEffortArgument(args)
         session_result = await _run_acp_with_deadline(
             command,
-            args,
+            discovery_args,
             env,
             None,
             model=None,

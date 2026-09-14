@@ -461,17 +461,28 @@ class ACPBackendConnectionTestRequest(BaseModel):
     ] = 'CandidateSelection'
 
 
+class ACPReasoningEffortResponse(BaseModel):
+    """Codex / Grok ACP が広告した推論深さ1件。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    reasoning_effort_id: Annotated[str, Field(min_length=1, max_length=255)]
+    reasoning_effort_name: Annotated[str, Field(min_length=1, max_length=255)]
+
+
 class ACPModelResponse(BaseModel):
-    """Codex / Grok ACP が広告したモデル1件。"""
+    """Codex / Grok ACP が広告したモデルと推論深さ。"""
 
     model_config = ConfigDict(extra='forbid')
 
     model_id: Annotated[str, Field(min_length=1, max_length=255)]
     model_name: Annotated[str, Field(min_length=1, max_length=255)]
+    current_reasoning_effort_id: Annotated[str, Field(min_length=1, max_length=255)]
+    reasoning_efforts: list[ACPReasoningEffortResponse]
 
 
 class ACPModelCatalogResponse(BaseModel):
-    """Codex / Grok ACP の session/new から取得したモデル一覧。"""
+    """Codex / Grok ACP の session/new から取得したモデル別カタログ。"""
 
     model_config = ConfigDict(extra='forbid')
 
@@ -1673,6 +1684,14 @@ async def _GetACPModelCatalogResponse(
             ACPModelResponse(
                 model_id=model.model_id,
                 model_name=model.model_name,
+                current_reasoning_effort_id=model.current_reasoning_effort_id,
+                reasoning_efforts=[
+                    ACPReasoningEffortResponse(
+                        reasoning_effort_id=reasoning_effort.reasoning_effort_id,
+                        reasoning_effort_name=reasoning_effort.reasoning_effort_name,
+                    )
+                    for reasoning_effort in model.reasoning_efforts
+                ],
             )
             for model in catalog.models
         ],
@@ -1751,6 +1770,41 @@ async def ACPBackendSettingsUpdateAPI(
     """
 
     response.headers.update(NO_STORE_HEADERS)
+    # 設定保存時点の両 agent 広告を取得し、選択したモデルと推論深さの組を同じ
+    # session/new 由来の候補集合で検証する。片方でも取得できなければ保存しない。
+    codex_catalog = await _GetACPModelCatalogResponse('AcpCodex')
+    grok_catalog = await _GetACPModelCatalogResponse('AcpGrok')
+    for backend_settings, catalog in (
+        (body.codex, codex_catalog),
+        (body.grok, grok_catalog),
+    ):
+        effective_model_id = backend_settings.model or catalog.current_model_id
+        advertised_model = next(
+            (
+                model
+                for model in catalog.models
+                if model.model_id == effective_model_id
+            ),
+            None,
+        )
+        if advertised_model is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail='The selected ACP model is not currently advertised.',
+                headers=NO_STORE_HEADERS,
+            )
+        if (
+            backend_settings.reasoning_effort is not None and
+            backend_settings.reasoning_effort not in {
+                effort.reasoning_effort_id
+                for effort in advertised_model.reasoning_efforts
+            }
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail='The selected ACP reasoning effort is not currently advertised.',
+                headers=NO_STORE_HEADERS,
+            )
     try:
         ACPSettingsStore.saveSettings(body)
     except (OSError, ValueError) as error:

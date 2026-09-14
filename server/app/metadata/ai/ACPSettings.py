@@ -23,36 +23,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.constants import DATA_DIR
 
 
-# ACP 共通の推論深さ。CLI / agent には lowercase で渡す。
-# Codex は XHigh/Max/Ultra まで。ただし Ultra は Sol 系統だけで使用する。
-# Grok は Low/Medium/High のみ。
-AcpReasoningEffort = Literal['Low', 'Medium', 'High', 'XHigh', 'Max', 'Ultra']
-_ACP_REASONING_EFFORT_FROM_LOWER: dict[str, AcpReasoningEffort] = {
-    'low': 'Low',
-    'medium': 'Medium',
-    'high': 'High',
-    'xhigh': 'XHigh',
-    'max': 'Max',
-    'ultra': 'Ultra',
-}
+# ACP 共通の推論深さ。provider が広告した opaque ID をそのまま保存・適用する。
+type AcpReasoningEffort = str
 # 旧 UI の連結 ID（gpt-5.6-luna[medium]）を model + effort に分解する。
 _ACP_COMPOSITE_MODEL_RE = re.compile(
     r'^(?P<model>[^\[\]]+?)(?:\[(?P<effort>low|medium|high|xhigh|max|ultra)\])?$',
     re.IGNORECASE,
 )
-_ACP_BASIC_REASONING_EFFORTS: frozenset[AcpReasoningEffort] = frozenset({
-    'Low',
-    'Medium',
-    'High',
-})
-# backend ごとの未設定時デフォルト。Grok は agent の currentModelId を実行時既定にする。
+# backend ごとの未設定時モデル。Grok は agent の currentModelId を実行時既定にする。
 ACP_DEFAULT_MODEL_BY_BACKEND: dict[str, str | None] = {
     'AcpCodex': 'gpt-5.6-luna',
     'AcpGrok': None,
-}
-ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND: dict[str, AcpReasoningEffort] = {
-    'AcpCodex': 'Medium',
-    'AcpGrok': 'High',
 }
 
 # KonomiTV-BS4K の ACP バックエンド種別。固定プリセットとして 2 種のみ。
@@ -62,25 +43,6 @@ ACPBackendKind = Literal['AcpCodex', 'AcpGrok']
 _ACP_SETTINGS_SCHEMA_VERSION = 1
 _ACP_LEGACY_DEFAULT_TIMEOUT_SEC = 120
 _ACP_DEFAULT_TIMEOUT_SEC = 600
-
-
-def IsKonomiTVBS4KCodexSolModel(konomitv_bs4k_model: str | None) -> bool:
-    """Codex のモデル ID が Sol 系統かを判定する。
-
-    Args:
-        konomitv_bs4k_model: 判定する Codex モデル ID。
-
-    Returns:
-        Sol 系統（'sol' または '-sol' 末尾）なら True。
-    """
-
-    if konomitv_bs4k_model is None:
-        return False
-    konomitv_bs4k_normalized_model = konomitv_bs4k_model.strip().lower()
-    return (
-        konomitv_bs4k_normalized_model == 'sol' or
-        konomitv_bs4k_normalized_model.endswith('-sol')
-    )
 
 
 def ParseAcpCompositeModel(
@@ -116,10 +78,7 @@ def ParseAcpCompositeModel(
     effort_raw = matched.group('effort')
     if effort_raw is None:
         return model, None
-    effort = _ACP_REASONING_EFFORT_FROM_LOWER.get(effort_raw.lower())
-    if effort is None:
-        raise ValueError('ACP 推論深さの値が不正です。')
-    return model, effort
+    return model, effort_raw.lower()
 
 
 class ACPBackendSettings(BaseModel):
@@ -131,8 +90,8 @@ class ACPBackendSettings(BaseModel):
     backend_kind: Annotated[ACPBackendKind, Field(exclude=True)] = 'AcpCodex'
     # Codex / Grok とも ACP agent が広告した ID を保存する。Codex は推論深さを ID から分離する。
     model: Annotated[str | None, Field(max_length=255)] = None
-    # Codex: Low…Ultra / Grok: Low…High。未設定時は backend 既定へ補完する。
-    reasoning_effort: Annotated[AcpReasoningEffort | None, Field()] = None
+    # Codex / Grok ACP が広告した opaque ID。未設定時は agent の現在値を使用する。
+    reasoning_effort: Annotated[AcpReasoningEffort | None, Field(max_length=255)] = None
     # KonomiTV-BS4K 固有。Codex の専用 profile へ Fast service tier を設定する。
     codex_fast_mode_enabled: Annotated[bool, Field()] = False
     # 壁時計の総実行上限ではなく、ACP stdio の無通信打ち切り秒数。
@@ -152,21 +111,29 @@ class ACPBackendSettings(BaseModel):
             return None
         return model.strip() or None
 
+    @field_validator('reasoning_effort')
+    @classmethod
+    def validateReasoningEffort(cls, reasoning_effort: str | None) -> str | None:
+        """推論深さ ID の空文字を未指定へ正規化する。
+
+        Args:
+            reasoning_effort: ACP agent が広告した推論深さ ID。
+
+        Returns:
+            前後空白を除いた ID。空文字または None は None。
+        """
+
+        if reasoning_effort is None:
+            return None
+        return reasoning_effort.strip() or None
+
     @model_validator(mode='after')
     def normalizeBackendCapabilities(self) -> ACPBackendSettings:
-        """backend ごとの固定能力とプリセット既定を正規化する。
-
-        Grok は Fast 無効・推論深さ Low..High のみ。
-        Codex はモデル既定と Ultra の Sol 制約を適用する。
-        """
+        """backend ごとの固定能力と旧 Codex モデル形式を正規化する。"""
 
         if self.backend_kind == 'AcpGrok':
             # Grok のモデル ID は ACP 広告値を opaque に保存し、実行時に session/set_model へ渡す。
             self.codex_fast_mode_enabled = False
-            if self.reasoning_effort is None:
-                self.reasoning_effort = ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND['AcpGrok']
-            if self.reasoning_effort not in _ACP_BASIC_REASONING_EFFORTS:
-                raise ValueError('Grok の推論深さは Low / Medium / High のみです。')
             return self
 
         # 旧 UI の連結 ID を model + effort に分解する。
@@ -179,14 +146,6 @@ class ACPBackendSettings(BaseModel):
 
         if self.model is None:
             self.model = ACP_DEFAULT_MODEL_BY_BACKEND['AcpCodex']
-        if self.reasoning_effort is None:
-            self.reasoning_effort = ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND['AcpCodex']
-        if (
-            self.reasoning_effort == 'Ultra' and
-            IsKonomiTVBS4KCodexSolModel(self.model) is False
-        ):
-            # 旧保存値や直接 API 入力も、非 Sol では Max へ安全に補正する。
-            self.reasoning_effort = 'Max'
         return self
 
 
