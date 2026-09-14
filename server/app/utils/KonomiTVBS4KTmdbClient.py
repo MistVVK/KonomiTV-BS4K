@@ -60,6 +60,9 @@ from app.utils.KonomiTVBS4KTmdbStore import KonomiTVBS4KTmdbStore
 _BROADCAST_VARIANT_SUFFIX_PATTERN = re.compile(
     r'\s*(?:コメンタリー版|完全版|ディレクターズカット(?:版)?)$',
 )
+# 作品名の前に並ぶ `【放送枠】【属性】` 形式の装飾。TMDb の主検索が 0 件だった場合だけ
+# fallback 検索語から外し、文中・末尾の括弧は作品名の一部として維持する。
+_LEADING_BROADCAST_DESCRIPTOR_PATTERN = re.compile(r'^(?:【[^】]+】)+')
 # 末尾の話数表記 (#07) と括弧年号 ((2024) / （2024）)。本編作品の検索を妨げる装飾だけを外す。
 _TRAILING_EPISODE_MARK_PATTERN = re.compile(r'\s*#\d+(?:\.\d+)?$')
 _TRAILING_YEAR_PATTERN = re.compile(r'\s*[\(（]\d{4}[\)）]$')
@@ -412,6 +415,17 @@ class KonomiTVBS4KTmdbClient:
             stripped = cls._stripBroadcastVariantMarkers(normalized_source)
             # 変換しても元と同じ補助クエリは既存の補助検索ループがそのまま試すため、
             ## fallback へは追加しない (同じ検索語の重複送信を防ぐ)。
+            if source != series_title and stripped == source:
+                continue
+            Append(stripped)
+        # (c) 先頭の `【…】` 群を除去。既存 fallback を優先するため (a)・(b) の全候補より
+        ## 後ろに置き、主検索が 0 件のときだけ検索語を変える。放送枠が重なっていても
+        ## 先頭から連続する群だけを外し、文中・末尾の引用や話数には触れない。
+        for source in [series_title, *auxiliary_queries]:
+            normalized_source = NormalizeSeriesTitle(source).rstrip('。.!！?？')
+            variant_stripped = cls._stripBroadcastVariantMarkers(normalized_source)
+            stripped = _LEADING_BROADCAST_DESCRIPTOR_PATTERN.sub('', variant_stripped).strip()
+            # 先頭括弧がない未変換の補助クエリは既存の補助検索ループへ任せる。
             if source != series_title and stripped == source:
                 continue
             Append(stripped)
