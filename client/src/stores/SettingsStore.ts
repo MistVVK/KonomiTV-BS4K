@@ -514,8 +514,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     // BS4K/BSP4K・BS8K で降雨対応放送（1080p 低階層）を自動利用する (Default: 利用する) (同期無効)
     tv_use_rain_fallback_for_bs4k: true,
     tv_use_rain_fallback_for_bs8k: true,
-    // HDR 映像の出力 (Default: Auto) 表示能力を見て素通し / SDR 変換を選ぶ
-    konomitv_bs4k_hdr_output: 'Auto',
+    // HDR 映像の出力 (Default: SDR) HDR 表示対応端末でも既定では canvas で SDR 変換して再生する
+    konomitv_bs4k_hdr_output: 'SDR',
     // テレビを 24fps モードで視聴する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
     tv_24fps_mode: false,
     // テレビを 24fps モードで視聴する (モバイル回線時)  (Default: オフ) (同期無効)
