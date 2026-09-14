@@ -181,6 +181,16 @@ export interface IAIBackendOAuthStartResult {
     authorize: Record<string, unknown>;
 }
 
+/** 進行中の OAuth device authorization の状態（poll 用）。 */
+export interface IAIBackendOAuthStatus {
+    provider_id: string;
+    method: number | null;
+    status: 'None' | 'InProgress' | 'Succeeded' | 'Failed' | 'Timeout';
+    url: string | null;
+    instructions: string | null;
+    error: string | null;
+}
+
 /** OpenCode を通さない OpenAI 互換 HTTP バックエンドの共有設定。 */
 export interface IOpenAICompatibleSettings {
     api_base_url: string | null;
@@ -450,9 +460,23 @@ export default class AIBackend {
             APIClient.showGenericError(
                 response,
                 response.status === 501
-                    ? 'listener なしの OpenCode CLI では新規 OAuth を開始できません。製品用 auth.json に既存トークンを手動配置するか、API キー認証を使用してください。'
+                    ? 'このプロバイダでは新規 OAuth を開始できません。製品用 auth.json に既存トークンを手動配置するか、API キー認証を使用してください。'
                     : 'OAuth を開始できませんでした。',
             );
+            return null;
+        }
+        return response.data;
+    }
+
+    /**
+     * 進行中の OAuth device authorization の状態を取得する（poll 用）。
+     * 失敗時は null を返す（一時的な通信失敗で poll を止めないため汎用エラーは出さない）。
+     */
+    static async getOAuthStatus(service_id: string): Promise<IAIBackendOAuthStatus | null> {
+        const response = await APIClient.get<IAIBackendOAuthStatus>(
+            `/ai-backends/${service_id}/oauth/status`,
+        );
+        if (response.type === 'error') {
             return null;
         }
         return response.data;
