@@ -774,6 +774,165 @@ async function withKonomiTVBS4KBrowserProbeTimeout<T>(
     }
 }
 
+/** WebCodecs プローブのキューエントリ。取消済みは API を呼ばず、実行済みなら slot を先に解き放つ。 */
+interface IKonomiTVBS4KBrowserWebCodecsQueueEntry {
+    // 実際の isConfigSupported 呼び出し。キューで slot が回ってきたときだけ実行する。
+    call: () => Promise<unknown>;
+    // 呼び出し元が待つ Promise の解決関数。実 API 開始後の終了状態を返す。
+    resolve: (outcome: KonomiTVBS4KBrowserProbeOutcome<unknown>) => void;
+    // 待機中にも受理する診断全体の中断状態と、そのキュー用 listener。
+    signal?: AbortSignal;
+    on_abort?: () => void;
+    // 呼び出し元へ終了状態を返したかどうか。遅延完了の二重反映を防ぐ。
+    settled: boolean;
+    // 実 API 呼び出しを開始したかどうか。
+    started: boolean;
+}
+
+/**
+ * WebCodecs の `isConfigSupported` 照会を 1 本に直列化する共有キュー。
+ *
+ * Chromium 系ブラウザでは映像・音声エンコーダ / デコーダ設定の照会が GPU・codec
+ * adapter の実初期化を伴うことがあり、診断の行並列 (6 並列) と重なると初期化の競合で
+ * タブごとクラッシュする実例がある (Vivaldi で観測)。判定結果は逐次実行でも同じで、
+ * 診断の行並列性は他の API 待機としてそのまま活かせるため、WebCodecs の呼び出しだけを
+ * このキューへ通す。MediaCapabilities は map 側で既に 1 件ずつ実行しているため対象外。
+ */
+class KonomiTVBS4KBrowserWebCodecsProbeQueue {
+    // 実行待ち・実行中のプローブ。先頭の未取消順に 1 件だけ走らせる。
+    private entries: IKonomiTVBS4KBrowserWebCodecsQueueEntry[] = [];
+    // 実行中のエントリ。slot の排他制御に使う。
+    private running: IKonomiTVBS4KBrowserWebCodecsQueueEntry | null = null;
+
+    /**
+     * WebCodecs 呼び出しをキューへ登録する。
+     *
+     * Args:
+     *     call: 実行 slot が回ってきたときだけ呼ばれる実 API 呼び出し。
+     *     signal: 診断全体の中断状態。
+     *
+     * Returns:
+     *     API の終了状態。実行 timeout はキュー待機を含めず、実 API の開始時から計測する。
+     */
+    public enqueue<T>(
+        call: () => Promise<T>,
+        signal?: AbortSignal,
+    ): Promise<KonomiTVBS4KBrowserProbeOutcome<T>> {
+        if (signal?.aborted === true) {
+            return Promise.resolve({status: 'Aborted'});
+        }
+        return new Promise<KonomiTVBS4KBrowserProbeOutcome<T>>((resolve) => {
+            const entry: IKonomiTVBS4KBrowserWebCodecsQueueEntry = {
+                call: call as () => Promise<unknown>,
+                resolve: resolve as (outcome: KonomiTVBS4KBrowserProbeOutcome<unknown>) => void,
+                signal,
+                settled: false,
+                started: false,
+            };
+            entry.on_abort = (): void => this.abort(entry);
+            signal?.addEventListener('abort', entry.on_abort, {once: true});
+            this.entries.push(entry);
+            this.pump();
+        });
+    }
+
+    /**
+     * slot が空いているあいだ、キュー先頭から 1 件を実行する。
+     */
+    private pump(): void {
+        if (this.running !== null) {
+            return;
+        }
+        while (this.entries.length > 0) {
+            const entry = this.entries.shift();
+            if (entry === undefined) {
+                continue;
+            }
+            if (entry.settled === true) {
+                continue;
+            }
+            // abort event の Promise 継続順に依存せず、取消済みの未開始 API を除外する。
+            if (entry.signal?.aborted === true) {
+                this.settle(entry, {status: 'Aborted'});
+                continue;
+            }
+            entry.started = true;
+            this.running = entry;
+            // キュー待機で予算を消費しないよう、実 API の開始後にだけ15秒 timeout を開始する。
+            try {
+                withKonomiTVBS4KBrowserProbeTimeout(entry.call(), entry.signal).then(
+                    outcome => this.complete(entry, outcome),
+                );
+            } catch {
+                // WebCodecs 実装が同期的に例外を投げても slot を保持したままにしない。
+                this.complete(entry, {status: 'Rejected'});
+            }
+            return;
+        }
+    }
+
+    /**
+     * 呼び出し元が待機を取りやめたことを受理する。
+     *
+     * 未開始なら API を呼ばずキューから外し、実行中なら slot を先に解き放つ
+     * (応答しない API で後続の全行が 15 秒 timeout の連鎖に詰まるのを防ぐ)。
+     */
+    private abort(entry: IKonomiTVBS4KBrowserWebCodecsQueueEntry): void {
+        if (entry.settled === true) {
+            return;
+        }
+        this.settle(entry, {status: 'Aborted'});
+        if (entry.started === false) {
+            const index = this.entries.indexOf(entry);
+            if (index !== -1) {
+                this.entries.splice(index, 1);
+            }
+            if (this.running === null) {
+                this.pump();
+            }
+            return;
+        }
+        if (this.running === entry) {
+            this.running = null;
+            this.pump();
+        }
+    }
+
+    /**
+     * API 呼び出しの完了結果を呼び出し元へ返し、slot を解いて後続を進める。
+     */
+    private complete(
+        entry: IKonomiTVBS4KBrowserWebCodecsQueueEntry,
+        outcome: KonomiTVBS4KBrowserProbeOutcome<unknown>,
+    ): void {
+        // timeout / abort 後の遅延完了は返却せず、別 entry の実行 slot にも干渉させない。
+        if (entry.settled === true) {
+            return;
+        }
+        this.settle(entry, outcome);
+        if (this.running === entry) {
+            this.running = null;
+            this.pump();
+        }
+    }
+
+    /**
+     * 呼び出し元へ終了状態を一度だけ返し、キュー用 abort listener を片付ける。
+     */
+    private settle(
+        entry: IKonomiTVBS4KBrowserWebCodecsQueueEntry,
+        outcome: KonomiTVBS4KBrowserProbeOutcome<unknown>,
+    ): void {
+        entry.settled = true;
+        if (entry.on_abort !== undefined) {
+            entry.signal?.removeEventListener('abort', entry.on_abort);
+        }
+        entry.resolve(outcome);
+    }
+}
+
+const KONOMITV_BS4K_BROWSER_WEBCODECS_PROBE_QUEUE = new KonomiTVBS4KBrowserWebCodecsProbeQueue();
+
 async function mapKonomiTVBS4KBrowserProbes<Item, Result>(
     items: readonly Item[],
     mapper: (item: Item, index: number) => Promise<Result>,
@@ -1110,6 +1269,10 @@ async function probeKonomiTVBS4KBrowserVideoDecoderWebCodecs(params: {
     hardware_acceleration?: 'prefer-hardware' | 'prefer-software' | 'no-preference';
     signal?: AbortSignal;
 }): Promise<KonomiTVBS4KBrowserWebCodecsProbe> {
+    // 呼び出し前から診断が中断済みなら、キューへ積まず API も開始しない。
+    if (params.signal?.aborted === true) {
+        return 'Unavailable';
+    }
     // VideoDecoderConfig の解像度は codedWidth / codedHeight だけが正規フィールド。
     // width / height は未知フィールドとして無視され codec 単体の false positive になるため試さない。
     const config = withKonomiTVBS4KBrowserHardwareAcceleration({
@@ -1117,8 +1280,9 @@ async function probeKonomiTVBS4KBrowserVideoDecoderWebCodecs(params: {
         codedWidth: params.width,
         codedHeight: params.height,
     }, params.hardware_acceleration);
-    const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
-        VideoDecoder.isConfigSupported(config as VideoDecoderConfig),
+    // 直列キューで HW codec adapter の並列初期化競合 (Vivaldi でタブクラッシュ実例) を避ける。
+    const outcome = await KONOMITV_BS4K_BROWSER_WEBCODECS_PROBE_QUEUE.enqueue(
+        () => VideoDecoder.isConfigSupported(config as VideoDecoderConfig),
         params.signal,
     );
     if (outcome.status !== 'Resolved') {
@@ -1136,6 +1300,10 @@ async function probeKonomiTVBS4KBrowserVideoEncoderWebCodecs(params: {
     hardware_acceleration?: 'prefer-hardware' | 'prefer-software' | 'no-preference';
     signal?: AbortSignal;
 }): Promise<KonomiTVBS4KBrowserWebCodecsProbe> {
+    // 呼び出し前から診断が中断済みなら、キューへ積まず API も開始しない。
+    if (params.signal?.aborted === true) {
+        return 'Unavailable';
+    }
     // VideoEncoderConfig は width / height / bitrate / framerate が正規フィールド。
     const config = withKonomiTVBS4KBrowserHardwareAcceleration({
         codec: params.codec,
@@ -1144,8 +1312,9 @@ async function probeKonomiTVBS4KBrowserVideoEncoderWebCodecs(params: {
         bitrate: params.bitrate,
         framerate: params.framerate,
     }, params.hardware_acceleration);
-    const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
-        VideoEncoder.isConfigSupported(config as VideoEncoderConfig),
+    // 直列キューで HW codec adapter の並列初期化競合 (Vivaldi でタブクラッシュ実例) を避ける。
+    const outcome = await KONOMITV_BS4K_BROWSER_WEBCODECS_PROBE_QUEUE.enqueue(
+        () => VideoEncoder.isConfigSupported(config as VideoEncoderConfig),
         params.signal,
     );
     if (outcome.status !== 'Resolved') {
@@ -1206,6 +1375,10 @@ async function probeKonomiTVBS4KBrowserAudioWebCodecs(params: {
     if (target_api === undefined) {
         return 'Unavailable';
     }
+    // 呼び出し前から診断が中断済みなら、キューへ積まず API も開始しない。
+    if (params.signal?.aborted === true) {
+        return 'Unavailable';
+    }
     // AudioDecoderConfig / AudioEncoderConfig は codec / numberOfChannels / sampleRate が必須。
     // 未定義の入れ子形状は必須 codec を欠き、適合実装では必ず reject されるため試さない。
     const config: IKonomiTVBS4KBrowserWebCodecsAudioConfig = {
@@ -1214,8 +1387,9 @@ async function probeKonomiTVBS4KBrowserAudioWebCodecs(params: {
         sampleRate: params.samplerate,
         bitrate: params.bitrate,
     };
-    const outcome = await withKonomiTVBS4KBrowserProbeTimeout(
-        target_api.isConfigSupported(config),
+    // 直列キューで HW codec adapter の並列初期化競合 (Vivaldi でタブクラッシュ実例) を避ける。
+    const outcome = await KONOMITV_BS4K_BROWSER_WEBCODECS_PROBE_QUEUE.enqueue(
+        () => target_api.isConfigSupported(config),
         params.signal,
     );
     if (outcome.status !== 'Resolved') {
