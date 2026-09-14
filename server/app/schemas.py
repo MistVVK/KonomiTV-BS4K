@@ -228,6 +228,7 @@ class SubtitleTrack(TypedDict):
     pid: NotRequired[int]
     component_tag: NotRequired[int]
     program_number: NotRequired[int]
+    source: NotRequired[Literal['Sidecar']]
 
 class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け

@@ -27,6 +27,7 @@ from app.utils.KonomiTVBS4KMMTTLV import (
     MMT_TLV_CONTAINER_FORMAT,
     BuildKonomiTVBS4KMMTTLVInputArguments,
 )
+from app.utils.RecordedWebVTT import ReadRecordedARIBSidecar, ReadRecordedWebVTTSidecar
 from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker
 
 
@@ -249,6 +250,11 @@ class RecordedSubtitleStream:
                 ):
                     raise ValueError('Recorded subtitle track cache fields are invalid.')
                 normalized_codec = codec.lower()
+                # sidecar は生成cacheを持たない。破損JSONを見逃してreachableを過小評価しない。
+                if 'source' in track:
+                    if track['source'] != 'Sidecar' or normalized_codec != 'webvtt' or stream_index is not None:
+                        raise ValueError('Recorded sidecar subtitle track is invalid.')
+                    continue
                 if normalized_codec == 'arib_ttml':
                     has_arib_ttml_track = True
                     program_number = track.get('program_number')
@@ -305,6 +311,8 @@ class RecordedSubtitleStream:
         track = self.getTrack(subtitle_index)
         if track is None:
             return None
+        if track.get('source') == 'Sidecar' and track['codec'].lower() == 'webvtt':
+            return 'ARIB'
         codec = track['codec'].lower()
         if 'arib' in codec:
             return 'ARIB'
@@ -316,7 +324,14 @@ class RecordedSubtitleStream:
         """テキスト字幕を永続WebVTTキャッシュとして返す。"""
 
         track = self.getTrack(subtitle_index)
-        if track is None or self.getTrackKind(subtitle_index) != 'Text':
+        if track is None:
+            return None
+        # b24tovtt の時刻は録画先頭基準。変換cacheを介さず、現在のsidecarを検査して返す。
+        if track.get('source') == 'Sidecar':
+            if track['codec'].lower() != 'webvtt' or track.get('stream_index') is not None:
+                return None
+            return await asyncio.to_thread(ReadRecordedWebVTTSidecar, Path(self.recorded_video.file_path))
+        if self.getTrackKind(subtitle_index) != 'Text':
             return None
         stream_index = track.get('stream_index')
         if stream_index is None:
@@ -775,6 +790,12 @@ class RecordedSubtitleStream:
     async def __loadARIBPackets(self, subtitle_index: int, track: SubtitleTrack) -> list[ARIBSubtitlePacket]:
         """FFprobe 8の全packet索引をサーバーデータ領域へ永続化する。"""
 
+        # sidecar は録画本体と別に更新されるため、本体hash由来のcacheを一切再利用しない。
+        if track.get('source') == 'Sidecar':
+            sidecar_packets = await asyncio.to_thread(ReadRecordedARIBSidecar, Path(self.recorded_video.file_path))
+            return [ARIBSubtitlePacket(
+                pts=pts, duration=duration, data=base64.b64encode(data).decode(), is_restore_point=False,
+            ) for pts, duration, data in sidecar_packets]
         stream_index = track.get('stream_index')
         if stream_index is None:
             return []

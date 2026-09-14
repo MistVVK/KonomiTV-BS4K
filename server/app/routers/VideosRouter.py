@@ -1462,7 +1462,7 @@ async def VideoDeleteAPI(
     """
     指定された録画番組のファイルとメタデータを削除する。不可逆な処理であるため、慎重に実行すること。
     - 録画ファイルに紐づくサムネイルファイルを削除
-    - 録画ファイルに関連する補助ファイル (.ts.program.txt, .ts.err) を削除
+    - 録画ファイルに関連する補助ファイル (.ts.program.txt, .ts.err, .vtt) を削除
     - 録画ファイル本体を削除
     - 全ファイルの削除完了後にデータベースから録画番組情報・録画ファイル情報を削除
 
@@ -1535,7 +1535,7 @@ async def VideoDeleteAPI(
             elif has_duplicates:
                 logging.info(f'[VideoDeleteAPI] Skip deleting thumbnail files because other records with the same file_hash exist: {file_hash}')
 
-            # 4. 関連する補助ファイルを削除する (.ts.program.txt, .ts.err)
+            # 4. 関連する補助ファイルを削除する (.ts.program.txt, .ts.err, .vtt)
             deletion_stage = 'program information file'
             ts_program_txt_path = anyio.Path(f'{file_dir}/{file_name}.program.txt')
             if await ts_program_txt_path.is_file():
@@ -1545,6 +1545,12 @@ async def VideoDeleteAPI(
             ts_err_path = anyio.Path(f'{file_dir}/{file_name}.err')
             if await ts_err_path.is_file():
                 await ts_err_path.unlink()
+
+            # コンテナの拡張子を置換する規約は、解析・配信時の sidecar 導出と揃える。
+            deletion_stage = 'WebVTT sidecar file'
+            webvtt_path = file_path.with_suffix('.vtt')
+            if await webvtt_path.is_file():
+                await webvtt_path.unlink()
 
             # 5. 録画ファイル本体を削除する
             deletion_stage = 'recorded video file'

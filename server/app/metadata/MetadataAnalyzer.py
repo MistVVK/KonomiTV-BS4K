@@ -22,6 +22,7 @@ from app.utils.KonomiTVBS4KMMTTLV import (
     MMT_TLV_FILE_EXTENSIONS,
     BuildKonomiTVBS4KMMTTLVInputArguments,
 )
+from app.utils.RecordedWebVTT import ReadRecordedWebVTTSidecar
 from app.utils.TSInformation import TSInformation
 from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker
 
@@ -704,6 +705,18 @@ class MetadataAnalyzer:
                     subtitle_track['stream_index'] = data_stream.index
                 subtitle_tracks.append(subtitle_track)
                 known_arib_ttml_streams.add(stream_key)
+
+        # FFprobe の字幕が別 program に属する場合も含め、埋め込み字幕があれば常に優先する。
+        # PMT / timed ID3 から補完した放送字幕も、同名 WebVTT と重複登録しない。
+        if len(full_probe.getSubtitleStreams()) == 0 and len(subtitle_tracks) == 0:
+            if ReadRecordedWebVTTSidecar(self.recorded_file_path) is not None:
+                subtitle_tracks.append(schemas.SubtitleTrack(
+                    index=1,
+                    codec='webvtt',
+                    language=None,
+                    title=None,
+                    source='Sidecar',
+                ))
 
         has_video = video_codec is not None
         has_audio = primary_audio_codec is not None
