@@ -32,16 +32,18 @@ from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_CONTAINER_FORMAT
 # HDR (HLG/PQ) 録画の検出とトーンマップの単一定義 (task: bs4k-thumbnail-hdr-tonemap)
 ## 検出は映像ストリームメタデータ駆動とし、チャンネル属性では判定しない
 _AV_COLOR_PRIMARIES_BT2020 = 9  # AVColorPrimaries の bt2020
-# PyAV が返す color_transfer の数値 (AVColorTransferCharacteristic) と VUI 名の対応 (検出条件に使う2種のみ)
+# PyAV が返す color_transfer の数値 (AVColorTransferCharacteristic) と VUI 名の対応 (検出条件に使う3種のみ)
 _AV_COLOR_TRANSFER_NAMES: dict[int, str] = {
     14: 'bt2020-10',
     16: 'smpte2084',
+    18: 'arib-std-b67',
 }
 # VUI 上の transfer 名と、HDR の実体として FFmpeg8 へ渡す transfer 名の対応
-## BS4K の HLG は VUI 上 bt2020-10 を名乗るが実体は HLG (ARIB STD-B67) なので、変換時は arib-std-b67 として扱う
+## BS4K の HLG は bt2020-10 または arib-std-b67 を名乗るため、どちらも実体の arib-std-b67 として扱う
 _HDR_INPUT_TRANSFER_MAP: dict[str, str] = {
     'bt2020-10': 'arib-std-b67',
     'smpte2084': 'smpte2084',
+    'arib-std-b67': 'arib-std-b67',
 }
 # トーンマップアルゴリズム。基準の bt2390 は同梱 FFmpeg8 (n8.1.2, libplacebo 無し) に搭載されていないため、
 ## director 裁定により実行可能な mobius を使う
@@ -64,7 +66,7 @@ def _DetectHDRInputTransfer(color_primaries: int, color_transfer: int) -> str | 
         str | None: 'arib-std-b67' または 'smpte2084'。SDR・不明の場合は None。
     """
 
-    # color_primaries == bt2020 かつ color_transfer が bt2020-10 / smpte2084 の場合だけ HDR とみなす
+    # color_primaries == bt2020 かつ color_transfer が bt2020-10 / smpte2084 / arib-std-b67 の場合だけ HDR とみなす
     if color_primaries != _AV_COLOR_PRIMARIES_BT2020:
         return None
     transfer_name = _AV_COLOR_TRANSFER_NAMES.get(color_transfer)
@@ -79,7 +81,7 @@ def _BuildHDRTonemapFilter(input_transfer: str | None = None) -> str:
 
     rawvideo パイプ投入の経路 (PyAV 直 / tsreadex) は demuxer の入力オプションで色タグを付けるため
     tin= は不要。MMT/TLV 経路は FFmpeg8 自身がデコードし、decoder が VUI を読んでフレームへ
-    bt2020-10 を設定するため (入力オプション -color_trc は decoder が VUI で上書きして効かない)、
+    VUI の transfer を設定するため (入力オプション -color_trc は decoder が VUI で上書きして効かない)、
     先頭 zscale の tin= で実体の transfer を指定する必要がある。
 
     Args:
@@ -992,7 +994,7 @@ class ThumbnailGenerator:
                                 break
                             continue
 
-                        # HDR 判定は最初のフレームで1回だけ行い、HDR 録画のみ変換プロセスを起動する
+                        # HDR 判定は最初のフレームで1回だけ行い、HLG の両宣言 (bt2020-10 / arib-std-b67) と PQ を変換する
                         if hdr_detection_done is False:
                             hdr_detection_done = True
                             hdr_input_transfer = _DetectHDRInputTransfer(frame.color_primaries, frame.color_trc)
@@ -1177,7 +1179,7 @@ class ThumbnailGenerator:
                     first_frame_time = float(decoded_frame.time)
                 relative_time = float(decoded_frame.time) - first_frame_time
 
-                # HDR 判定は最初のフレームで1回だけ行い、HDR 録画のみ変換プロセスを起動する
+                # HDR 判定は最初のフレームで1回だけ行い、HLG の両宣言 (bt2020-10 / arib-std-b67) と PQ を変換する
                 if hdr_detection_done is False:
                     hdr_detection_done = True
                     hdr_input_transfer = _DetectHDRInputTransfer(decoded_frame.color_primaries, decoded_frame.color_trc)
@@ -1312,7 +1314,7 @@ class ThumbnailGenerator:
         for index, offset_sec in enumerate(candidate_offsets):
             # HDR 録画のみ、スケーリング前に zscale+tonemap で SDR 化する
             ## MMT/TLV は FFmpeg8 自身がデコードするため、先頭 zscale の tin= で
-            ## VUI (bt2020-10 表記) を実体の transfer で上書きする
+            ## VUI の transfer を検出した実体の transfer で上書きする
             video_filter = (
                 f'{_BuildHDRTonemapFilter(hdr_input_transfer)},'
                 if hdr_input_transfer is not None
@@ -1423,7 +1425,7 @@ class ThumbnailGenerator:
             logging.warning(f'{self.file_path}: No color metadata found in MMT/TLV probe output.')
             return None
         _matrix, primaries, transfer = match.groups()
-        # color_primaries == bt2020 かつ transfer が bt2020-10 / smpte2084 の場合だけ HDR とみなす
+        # color_primaries == bt2020 かつ transfer が bt2020-10 / smpte2084 / arib-std-b67 の場合だけ HDR とみなす
         if primaries != 'bt2020' or transfer not in _HDR_INPUT_TRANSFER_MAP:
             return None
         return _HDR_INPUT_TRANSFER_MAP[transfer]
