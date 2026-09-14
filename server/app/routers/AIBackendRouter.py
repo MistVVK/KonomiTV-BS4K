@@ -60,6 +60,7 @@ from app.metadata.ai.opencode_backend import (
     BuildOpenCodeBackendFromServiceID,
 )
 from app.metadata.ai.opencode_cli import (
+    OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED,
     OpenCodeCLI,
     OpenCodeCLIError,
     OpenCodeUnavailableError,
@@ -259,6 +260,22 @@ class OAuthCallbackRequest(BaseModel):
     method: Annotated[int, Field(ge=0, le=32)] = 0
     # headless / device code 時にユーザーが貼り付ける認可コード。
     code: Annotated[str | None, Field(max_length=4096)] = None
+
+
+class OAuthStatusResponse(BaseModel):
+    """進行中の OAuth device authorization の状態応答 (token は含めない)。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    provider_id: str
+    # authorize 時に解決した method index。
+    method: int | None = None
+    # None = セッション未開始。client は Succeeded/Failed/Timeout で poll を終える。
+    status: Literal['None', 'InProgress', 'Succeeded', 'Failed', 'Timeout'] = 'None'
+    url: str | None = None
+    instructions: str | None = None
+    # Failed / Timeout 時の秘密を含まない理由。
+    error: str | None = None
 
 
 class AIBackendProviderModelResponse(BaseModel):
@@ -606,7 +623,8 @@ def _BuildAuthMethodsForProvider(
 
     方針:
     - API キーのみ: ベストエフォートで出す
-    - OAuth: auth.json に既存 token がある provider だけを出す
+    - OAuth: auth.json に既存 token がある provider に加え、device flow を確認済みの
+      allowlist provider には新規 OAuth 開始の選択肢も出す
     - Vertex 系: VertexAdc のみ（ADC は Docker env 前提）
     - それ以外の面倒な認証: UnsupportedComplex
 
@@ -635,7 +653,13 @@ def _BuildAuthMethodsForProvider(
             None,
         )
 
-    if provider_id in _COMPLEX_UNSUPPORTED_PROVIDER_IDS:
+    # github-copilot は Enterprise URL 等の prompts 付き method を持つため本来は複雑認証だが、
+    # 既定の GitHub.com への device flow は method index だけで開始できる (prompts 回答不要)
+    # ことが実測で確認済みのため、device flow allowlist 上の provider だけは例外として通す。
+    if (
+        provider_id in _COMPLEX_UNSUPPORTED_PROVIDER_IDS and
+        provider_id not in OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED
+    ):
         return (
             [],
             'UnsupportedComplex',
@@ -670,6 +694,32 @@ def _BuildAuthMethodsForProvider(
                     auth_mode='OAuthSubscription',
                     billing_mode_default='Subscription',
                 ))
+
+    # allowlist 上の provider は auth.json に entry がなくても新規 OAuth 開始の選択肢を出す。
+    # method_index は開始時に ephemeral serve の /provider/auth からラベル解決するため None。
+    # API キー入力の併記は pin が API method を広告する provider (openai・xai) に限る。
+    # github-copilot は pin の認証定義が OAuth のみのため API fallback を追加しない
+    # (広告しない接続不能な方式を UI に出さない)。
+    if provider_id in OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED:
+        if (
+            provider_id not in _COMPLEX_UNSUPPORTED_PROVIDER_IDS and
+            any(method.type == 'api' for method in methods) is False
+        ):
+            methods.append(AIBackendProviderAuthMethodResponse(
+                method_index=None,
+                type='api',
+                label='Manually enter API Key',
+                auth_mode='ApiKey',
+                billing_mode_default='Metered',
+            ))
+        if any(method.type == 'oauth' for method in methods) is False:
+            methods.append(AIBackendProviderAuthMethodResponse(
+                method_index=None,
+                type='oauth',
+                label=OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED[provider_id],
+                auth_mode='OAuthSubscription',
+                billing_mode_default='Subscription',
+            ))
 
     if methods:
         note = None
@@ -2436,7 +2486,7 @@ async def AIBackendOAuthStartAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> OAuthStartResponse:
-    """listener が必要な新規 OAuth 認可を明示的に拒否する。"""
+    """allowlist 上の provider の新規 OAuth device flow を開始する。"""
 
     response.headers.update(NO_STORE_HEADERS)
     service = AIBackendSettingsStore.getService(service_id)
@@ -2452,15 +2502,84 @@ async def AIBackendOAuthStartAPI(
             detail='OAuth start requires auth_mode=OAuthSubscription.',
             headers=NO_STORE_HEADERS,
         )
-    # OpenCode 1.18.27 は OAuth authorize/callback を serve HTTP API または対話 TTY にしか公開しない。
-    # 無認証 listener を復活させず、既存 auth.json entry の利用・切断だけを維持する。
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail=(
-            'OpenCodeOAuthUnsupported: New OAuth authorization is unavailable in listener-free CLI mode. '
-            'Provision an existing token in the product auth.json manually or use API key authentication.'
-        ),
-        headers=NO_STORE_HEADERS,
+    # 新規 OAuth は device flow を確認済みの provider のみ許可する。
+    # allowlist 外は従来どおり開始できない (501 維持)。
+    if service.opencode_provider_id not in OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                'OpenCodeOAuthUnsupported: New OAuth authorization is unavailable for this provider in listener-free CLI mode. '
+                'Provision an existing token in the product auth.json manually or use API key authentication.'
+            ),
+            headers=NO_STORE_HEADERS,
+        )
+    client = OpenCodeCLI()
+    try:
+        # 成功時は disconnect と同様に capability proof を失効させ、再接続試験に備える。
+        # oauth_connected の永続 flag は不要 (toResponse が auth.json の実 entry を正本として導出する)。
+        info = await client.startOAuthDeviceAuthorization(
+            service.opencode_provider_id,
+            on_success=lambda: invalidate_episode_lookup_capability_proof(backend_kind='OpenCode'),
+        )
+    except OpenCodeCLIError as error:
+        raise _httpErrorFromOpenCode(error) from error
+    return OAuthStartResponse(
+        provider_id=info.provider_id,
+        method=info.method_index,
+        url=info.url,
+        authorization_method='auto',
+        instructions=info.instructions,
+        authorize={},
+    )
+
+
+@router.get(
+    '/{service_id}/oauth/status',
+    summary='AI バックエンド OAuth 状態 API',
+    response_model=OAuthStatusResponse,
+)
+async def AIBackendOAuthStatusAPI(
+    service_id: Annotated[str, Path(min_length=36, max_length=36)],
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> OAuthStatusResponse:
+    """進行中の OAuth device authorization の状態を返す。
+
+    method='auto' の完了は serve が auth.json へ entry を書くことで確定するため、
+    client は本 API を poll して完了・失敗・タイムアウトを検知する。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    service = AIBackendSettingsStore.getService(service_id)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='AI backend service not found.',
+            headers=NO_STORE_HEADERS,
+        )
+    if service.auth_mode != 'OAuthSubscription':
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='OAuth status requires auth_mode=OAuthSubscription.',
+            headers=NO_STORE_HEADERS,
+        )
+    info = OpenCodeCLI().getOAuthAuthorizationStatus(service.opencode_provider_id)
+    if info is None:
+        return OAuthStatusResponse(
+            provider_id=service.opencode_provider_id,
+            method=None,
+            status='None',
+            url=None,
+            instructions=None,
+            error=None,
+        )
+    return OAuthStatusResponse(
+        provider_id=info.provider_id,
+        method=info.method_index,
+        status=info.status,
+        url=info.url,
+        instructions=info.instructions,
+        error=info.error,
     )
 
 
