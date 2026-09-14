@@ -209,8 +209,8 @@ function openAICompatibleAPIPath(slot: OpenAICompatibleSlot): string {
 
 // ===== ACP 固定プリセット（Codex / Grok Build） =====
 
-/** ACP の推論深さ。Codex は XHigh/Max/Ultra まで、Grok は Low〜High。 */
-export type AcpReasoningEffort = 'Low' | 'Medium' | 'High' | 'XHigh' | 'Max' | 'Ultra';
+/** ACP agent が広告する opaque な推論深さ ID。 */
+export type AcpReasoningEffort = string;
 /** ACP 固定プリセットのバックエンド種別。 */
 export type ACPBackendKind = 'AcpCodex' | 'AcpGrok';
 
@@ -230,10 +230,18 @@ export interface IACPSettings {
     grok: IACPBackendSettings;
 }
 
-/** Codex / Grok ACP が session/new で広告したモデル1件。 */
+/** Codex / Grok ACP が configOptions で広告した推論深さ1件。 */
+export interface IACPReasoningEffort {
+    reasoning_effort_id: string;
+    reasoning_effort_name: string;
+}
+
+/** Codex / Grok ACP が session/new で広告したモデルと推論深さ。 */
 export interface IACPModel {
     model_id: string;
     model_name: string;
+    current_reasoning_effort_id: string;
+    reasoning_efforts: IACPReasoningEffort[];
 }
 
 /** Codex / Grok ACP が session/new で広告したモデル一覧。 */
@@ -569,7 +577,12 @@ export default class AIBackend {
 
     /** ACP 固定プリセット設定を保存する（全体置き換え）。 */
     static async updateACPSettings(settings: IACPSettings): Promise<boolean> {
-        const response = await APIClient.put('/ai-backends/acp-settings', settings);
+        const response = await APIClient.put(
+            '/ai-backends/acp-settings',
+            settings,
+            // 保存直前に Codex / Grok の最新広告を取得して検証する時間を確保する。
+            {timeout: 130 * 1000},
+        );
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'ACP 設定を保存できませんでした。');
             return false;

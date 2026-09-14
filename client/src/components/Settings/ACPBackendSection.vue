@@ -9,11 +9,11 @@
                 <div class="settings__item-label">
                     <template v-if="provider === 'grok'">
                         ホスト上の Grok Build CLI を起動して AI 処理を行います。<br>
-                        モデルは Grok ACP が現在広告している候補から選びます。推論の深さの初期値は <strong>High</strong> です。<br>
+                        モデルと推論の深さは Grok ACP が現在広告している候補から選びます。<br>
                     </template>
                     <template v-else>
                         ホスト上の Codex CLI を起動して AI 処理を行います。<br>
-                        モデルは Codex ACP が現在広告している候補から選びます。推論の深さの初期値は <strong>Medium</strong> です。<br>
+                        モデルと推論の深さは Codex ACP が現在広告している候補から選びます。<br>
                     </template>
                 </div>
             </div>
@@ -52,20 +52,16 @@
             <div class="settings__item">
                 <div class="settings__item-heading">推論の深さ</div>
                 <div class="settings__item-label">
-                    モデル名とは別に、思考の深さを選びます。<br>
-                    <template v-if="provider === 'codex'">
-                        Codex は Low〜Ultra。ただし <strong>Ultra</strong> は GPT-5.6 Sol 系統だけ選べます。<br>
-                        Sol 以外で保存済みの Ultra は、サーバー側で <strong>Max</strong> に自動補正します。<br>
-                    </template>
-                    <template v-else>
-                        Grok は Low / Medium / High。<br>
-                    </template>
+                    選択したモデルについて、ACP agent が現在広告している思考の深さだけを選べます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
                     :items="acp_reasoning_effort_options"
                     item-title="title"
                     item-value="value"
+                    :loading="is_loading_models"
+                    :disabled="is_loading_models || advertised_selected_model === null"
+                    :error-messages="acp_reasoning_effort_error"
                     :model-value="acp_reasoning_effort_selection"
                     @update:model-value="setAcpReasoningEffortSelection" />
                 <div class="settings__item-label mt-2" v-if="acp_wire_preview">
@@ -316,27 +312,6 @@ const emit = defineEmits<{
 
 /** サーバー側 ACP hard timeout の表示用分。ACP_HARD_TIMEOUT_SEC から導出する。 */
 const acp_hard_timeout_minutes = Math.floor(ACP_HARD_TIMEOUT_SEC / 60);
-/** プロバイダ別の推論深さ候補。 */
-const acp_reasoning_effort_presets_by_backend: Record<'codex' | 'grok', {title: string; value: AcpReasoningEffort;}[]> = {
-    codex: [
-        {title: 'Low（速い）', value: 'Low'},
-        {title: 'Medium', value: 'Medium'},
-        {title: 'High（深い）', value: 'High'},
-        {title: 'XHigh', value: 'XHigh'},
-        {title: 'Max', value: 'Max'},
-        {title: 'Ultra', value: 'Ultra'},
-    ],
-    grok: [
-        {title: 'Low（速い）', value: 'Low'},
-        {title: 'Medium', value: 'Medium'},
-        {title: 'High（深い）', value: 'High'},
-    ],
-};
-/** プロバイダ別の未設定時推論深さ。モデル未設定時は ACP 広告の現在値を使う。 */
-const acp_default_reasoning_effort_by_backend: Record<'codex' | 'grok', AcpReasoningEffort> = {
-    codex: 'Medium',
-    grok: 'High',
-};
 const connection_test_capabilities: {title: string; value: 'CandidateSelection' | 'EpisodeLookup';}[] = [
     {title: 'シリーズ情報生成', value: 'CandidateSelection'},
     {title: '話数 Web 検索', value: 'EpisodeLookup'},
@@ -392,11 +367,6 @@ function updateDraft(patch: Partial<IACPBackendSettings>): void {
     emit('update:settings', draft_settings.value);
 }
 
-function isKonomiTVBS4KCodexSolModel(model: string | null): boolean {
-    const normalized = model?.trim().toLowerCase() ?? '';
-    return normalized === 'sol' || normalized.endsWith('-sol');
-}
-
 /** 現在のプロバイダ向けモデル候補。 */
 const acp_model_preset_items = computed(() => {
     return model_catalog.value?.models.map(model => ({
@@ -422,33 +392,36 @@ const acp_effective_model = computed(() => {
     const current = draft_settings.value.model?.trim() ?? '';
     return current || model_catalog.value?.current_model_id || '';
 });
-const is_codex_sol_model = computed(() =>
-    props.provider === 'codex' && isKonomiTVBS4KCodexSolModel(acp_effective_model.value),
+
+/** 選択中モデルについて agent が広告したモデル・推論深さ。 */
+const advertised_selected_model = computed(() =>
+    model_catalog.value?.models.find(model => model.model_id === acp_effective_model.value) ?? null,
 );
 
 /** 現在のプロバイダ向け推論深さ候補。 */
 const acp_reasoning_effort_options = computed(() => {
-    const options = acp_reasoning_effort_presets_by_backend[props.provider] ?? [];
-    if (props.provider !== 'codex' || is_codex_sol_model.value) {
-        return options;
-    }
-    return options.filter(option => option.value !== 'Ultra');
+    return advertised_selected_model.value?.reasoning_efforts.map(reasoning_effort => ({
+        title: reasoning_effort.reasoning_effort_name,
+        value: reasoning_effort.reasoning_effort_id,
+    })) ?? [];
 });
 
-function normalizeCodexReasoningEffort(
-    effort: AcpReasoningEffort | null,
-    model: string | null,
-    backend: 'codex' | 'grok',
-): AcpReasoningEffort | null {
-    if (
-        backend === 'codex' &&
-        effort === 'Ultra' &&
-        isKonomiTVBS4KCodexSolModel(model) === false
-    ) {
-        return 'Max';
+const acp_reasoning_effort_error = computed(() => {
+    if (acp_model_error.value !== '') return '';
+    if (advertised_selected_model.value === null) {
+        return `${provider_acp_display_name} の推論深さ候補を取得できませんでした。`;
     }
-    return effort;
-}
+    const selected_reasoning_effort = draft_settings.value.reasoning_effort?.trim() ?? '';
+    if (selected_reasoning_effort === '') return '';
+    if (
+        advertised_selected_model.value.reasoning_efforts.some(
+            effort => effort.reasoning_effort_id === selected_reasoning_effort,
+        ) === false
+    ) {
+        return `保存済みの推論深さ「${selected_reasoning_effort}」は現在の ${provider_acp_display_name} 広告にありません。候補から選び直してください。`;
+    }
+    return '';
+});
 
 /** モデル選択。未設定時は agent が広告した現在値を表示する。 */
 const acp_model_selection = computed<string | null>(() => {
@@ -464,62 +437,49 @@ const acp_model_selection = computed<string | null>(() => {
 
 function setAcpModelSelection(value: string | null): void {
     if (value === null || value === undefined) {
-        updateDraft({
-            model: null,
-            reasoning_effort: normalizeCodexReasoningEffort(
-                draft_settings.value.reasoning_effort,
-                draft_settings.value.model,
-                props.provider,
-            ),
-        });
+        updateDraft({model: null});
         return;
     }
     const trimmed = value.trim();
+    const selected_model = model_catalog.value?.models.find(model => model.model_id === trimmed) ?? null;
+    const current_reasoning_effort = draft_settings.value.reasoning_effort;
+    const reasoning_effort_is_available = selected_model?.reasoning_efforts.some(
+        effort => effort.reasoning_effort_id === current_reasoning_effort,
+    ) ?? false;
     updateDraft({
         model: trimmed === '' ? null : trimmed,
-        reasoning_effort: normalizeCodexReasoningEffort(
-            draft_settings.value.reasoning_effort,
-            trimmed === '' ? null : trimmed,
-            props.provider,
-        ),
+        // ユーザーがモデルを切り替えた場合だけ、新しいモデルの広告現在値へ安全に追従する。
+        reasoning_effort: reasoning_effort_is_available ?
+            current_reasoning_effort :
+            selected_model?.current_reasoning_effort_id ?? null,
     });
 }
 
-/** 推論深さ。未設定時はプロバイダ既定を表示し、set でドラフトへ書き戻す。 */
+/** 推論深さ。未設定時は選択モデルについて agent が広告した現在値を表示する。 */
 const acp_reasoning_effort_selection = computed<AcpReasoningEffort | null>(() => {
     if (draft_settings.value.reasoning_effort !== null) {
-        return normalizeCodexReasoningEffort(
-            draft_settings.value.reasoning_effort,
-            acp_effective_model.value,
-            props.provider,
-        );
+        return draft_settings.value.reasoning_effort;
     }
-    return acp_default_reasoning_effort_by_backend[props.provider];
+    return advertised_selected_model.value?.current_reasoning_effort_id ?? null;
 });
 
 function setAcpReasoningEffortSelection(value: AcpReasoningEffort | null): void {
-    updateDraft({
-        reasoning_effort: normalizeCodexReasoningEffort(
-            value,
-            acp_effective_model.value,
-            props.provider,
-        ),
-    });
+    updateDraft({reasoning_effort: value});
 }
 
 /** 実際に ACP agent へ適用するモデルと推論深さ、または Grok CLI 引数を表示する。 */
 const acp_wire_preview = computed(() => {
     const effort = acp_reasoning_effort_selection.value;
     if (props.provider === 'grok') {
-        const effort_cli = (effort ?? 'High').toLowerCase();
+        if (effort === null) return '';
         const model = acp_effective_model.value || 'agent default';
-        return `${model} / grok --reasoning-effort ${effort_cli} agent stdio`;
+        return `${model} / grok --reasoning-effort ${effort} agent stdio`;
     }
     const model = acp_effective_model.value;
     if (model === '') return '';
     if (effort) {
         const fast_mode_suffix = draft_settings.value.codex_fast_mode_enabled ? ' / fast' : '';
-        return `${model} / reasoning_effort=${effort.toLowerCase()}${fast_mode_suffix}`;
+        return `${model} / reasoning_effort=${effort}${fast_mode_suffix}`;
     }
     return model;
 });
@@ -534,6 +494,7 @@ const acp_timeout_error = computed(() => {
 const validation_error = computed(() => {
     const errors: string[] = [];
     if (acp_model_error.value !== '') errors.push(acp_model_error.value);
+    if (acp_reasoning_effort_error.value !== '') errors.push(acp_reasoning_effort_error.value);
     if (acp_timeout_error.value !== '') errors.push(acp_timeout_error.value);
     return errors.join('\n');
 });
@@ -606,9 +567,18 @@ async function loadModels(after_auth_import: boolean = false): Promise<void> {
         return;
     }
     model_catalog.value = catalog;
-    // 未設定時だけ agent の現在値を選び、保存済みの一覧外 ID は置き換えない。
+    // 未設定項目だけ agent の現在値を選び、保存済みの一覧外 ID は置き換えない。
+    const effective_model_id = draft_settings.value.model?.trim() || catalog.current_model_id;
+    const advertised_model = catalog.models.find(model => model.model_id === effective_model_id) ?? null;
+    const patch: Partial<IACPBackendSettings> = {};
     if ((draft_settings.value.model?.trim() ?? '') === '') {
-        updateDraft({model: catalog.current_model_id});
+        patch.model = catalog.current_model_id;
+    }
+    if (draft_settings.value.reasoning_effort === null && advertised_model !== null) {
+        patch.reasoning_effort = advertised_model.current_reasoning_effort_id;
+    }
+    if (Object.keys(patch).length > 0) {
+        updateDraft(patch);
     }
 }
 
