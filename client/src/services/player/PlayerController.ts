@@ -34,7 +34,7 @@ import LiveEventManager from '@/services/player/managers/LiveEventManager';
 import MediaSessionManager from '@/services/player/managers/MediaSessionManager';
 import RecordedCMSkipManager from '@/services/player/managers/RecordedCMSkipManager';
 import PlayerManager from '@/services/player/PlayerManager';
-import Videos, { type IJikkyoComments } from '@/services/Videos';
+import Videos, { type ISubtitleTrack, type IJikkyoComments } from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore, {
@@ -226,6 +226,16 @@ class PlayerController {
     // fMP4 録画のARIB-TTML timed-ID3先読みハンドラーと再接続関数
     private recorded_arib_ttml_cancel: (() => void) | null = null;
     private recorded_arib_ttml_restart: (() => void) | null = null;
+
+    // 録画生字幕 (ARIB STD-B24 / sidecar WebVTT) のユーザー選択トラック (subtitle_tracks の index)。
+    // null は自動 (= component_tag / PID / index 順の最初のトラック) を意味する
+    private recorded_raw_subtitle_track_index: number | null = null;
+
+    // 設定パネルの字幕サブメニューに出す録画生字幕・sidecar の候補一覧 (初期化時のメタデータから生成)
+    private recorded_raw_subtitle_tracks: ISubtitleTrack[] = [];
+
+    // ARIB-TTML component は先読み窓の受信で増えていくため、字幕サブパネルの候補を1秒間隔で追従させる
+    private subtitle_panel_timer_cancel: (() => void) | null = null;
 
     // 録画を末尾まで自然に再生し終えたかどうか
     // ended の多重通知防止と、完走後の視聴履歴を先頭付近へ戻す判断に共用する
@@ -569,6 +579,10 @@ class PlayerController {
         this.recorded_playback_end_blocked_by_seek = false;
         this.recorded_auto_skip_cm_target = null;
         this.is_offline_fallback_in_progress = false;
+        // 番組の再初期化では選択を引き継がない。video要素だけの画質切替ではここは通らない。
+        this.recorded_raw_subtitle_track_index = null;
+        this.recorded_raw_subtitle_tracks = [];
+        this.arib_ttml_renderer?.setCaptionComponentTag(null);
 
         // AudioContext は PlayerController の初期化単位で所有する。
         // 同じ Controller を destroy() 後に再初期化する場合も、close 済みの Context を再利用しない。
@@ -1633,7 +1647,11 @@ class PlayerController {
         // ARIB-TTML はライブと録画のどちらも同じレンダラーへ timed-ID3 を投入する。
         // 字幕ボタンは字幕層だけを切り替え、緊急情報にも使われる文字スーパー層は既存設定に従って独立表示する。
         this.attachARIBTTMLRenderer();
-        this.player.on('subtitle_show', () => this.arib_ttml_renderer?.showCaption());
+        this.player.on('subtitle_show', () => {
+            // 生字幕を明示選択中はTTMLを重ねない。ボタン自体は従来の表示/非表示を維持する。
+            if (this.recorded_raw_subtitle_track_index !== null) this.arib_ttml_renderer?.hideCaption();
+            else this.arib_ttml_renderer?.showCaption();
+        });
         this.player.on('subtitle_hide', () => this.arib_ttml_renderer?.hideCaption());
 
         // fMP4 経路ではARIB生字幕を映像から分離し、シーク復元点と後続12秒を先読みする。
@@ -1642,12 +1660,25 @@ class PlayerController {
             player_store.is_offline_playback === false &&
             player_store.recorded_program.recorded_video.playback_index_status === 'Ready'
         ) {
-            const arib_track = player_store.recorded_program.recorded_video.subtitle_tracks.find((track) =>
+            // 生字幕・sidecar WebVTT トラックをすべて候補として保持し、設定パネルの字幕サブメニューへ出す。
+            // 従来は先頭トラックへ固定していたが、二か国語字幕などで PID が分かれている場合は
+            // 選択したトラックの PES だけを同じ先読み・復元経路で投入する。
+            this.recorded_raw_subtitle_tracks = player_store.recorded_program.recorded_video.subtitle_tracks.filter((track) =>
                 (track.codec.toLowerCase().includes('arib') && track.codec.toLowerCase() !== 'arib_ttml') ||
                 // sidecar もサーバーで PES payload に戻し、同じ pushRawData と seek 復元を使用する。
                 (track.source === 'Sidecar' && track.codec === 'webvtt'),
-            );
-            if (arib_track !== undefined) {
+            ).sort((left, right) =>
+                (left.component_tag ?? left.pid ?? left.index) - (right.component_tag ?? right.pid ?? right.index));
+            // ユーザー選択トラックを優先し、別番組化などで候補に無ければ自動 (先頭) へフォールバックする。
+            const resolve_arib_track = (): ISubtitleTrack | undefined => {
+                if ((this.arib_ttml_renderer?.getSelectedCaptionComponentTag() ?? null) !== null) return undefined;
+                return this.recorded_raw_subtitle_tracks.find((track) =>
+                    track.index === this.recorded_raw_subtitle_track_index) ?? this.recorded_raw_subtitle_tracks[0];
+            };
+            const initial_arib_track = resolve_arib_track();
+            if (initial_arib_track !== undefined) {
+                // TTML明示選択中は生字幕の取得を止める。
+                let arib_track: ISubtitleTrack | undefined = initial_arib_track;
                 const requested_ranges = new Set<number>();
                 let is_fetching = false;
                 let restore_after_fetch = false;
@@ -1657,6 +1688,8 @@ class PlayerController {
                         this.player === null ||
                         this.isInitializationCurrent(initialization_generation, playback_target_key) === false
                     ) return;
+                    const requested_track = arib_track;
+                    if (requested_track === undefined) return;
                     if (is_fetching === true) {
                         // 画質切り替えやシーク中なら、進行中の取得完了後に新しい再生位置から状態を復元する。
                         restore_after_fetch ||= restore;
@@ -1671,7 +1704,7 @@ class PlayerController {
                         const response = await APIClient.get<{
                             restore_packets: {pts: number; data: string}[];
                             packets: {pts: number; data: string}[];
-                        }>(`/streams/video/${player_store.recorded_program.id}/subtitle/${arib_track.index}/arib`, {
+                        }>(`/streams/video/${player_store.recorded_program.id}/subtitle/${requested_track.index}/arib`, {
                             params: {start_time: range_start, end_time: range_start + 12},
                         });
                         if (
@@ -1711,6 +1744,8 @@ class PlayerController {
                 };
                 const restart_arib_subtitle = () => {
                     if (this.player === null) return;
+                    // 字幕トラック切替・画質切り替えによる再アタッチでは、その時点のユーザー選択を再解決する。
+                    arib_track = resolve_arib_track();
                     this.recorded_arib_subtitle_cancel?.();
                     const video = this.player.video;
                     const timeupdate_handler = () => void fetch_arib_subtitle(false);
@@ -2489,6 +2524,22 @@ class PlayerController {
 
 
     /**
+     * 録画生字幕の表示トラックを切り替える。
+     *
+     * Args:
+     *     subtitle_track_index: 選択する subtitle_tracks の index。null で自動 (先頭トラック) に戻す。
+     */
+    private switchRecordedRawSubtitleTrack(subtitle_track_index: number | null): void {
+        if (this.player === null) return;
+        this.recorded_raw_subtitle_track_index = subtitle_track_index;
+        // 前トラックの字幕ウィンドウが画面に残らないよう CanvasRenderer を作り直し、
+        // 現在位置から新トラックの管理データ・DRCS 復元 packet を引き直して再表示する。
+        this.replaceARIBB24Renderers();
+        this.recorded_arib_subtitle_restart?.();
+    }
+
+
+    /**
      * ARIB-TTML レンダラーを現在の video 要素へ接続する。
      * 画質切り替えでは video 要素自体が作り直されるため、同じデコーダーを新しい要素へ付け直す。
      */
@@ -2508,7 +2559,7 @@ class PlayerController {
         (this.player.plugins as unknown as {aribTTML?: ARIBTTMLRenderer}).aribTTML = this.arib_ttml_renderer;
         this.arib_ttml_renderer.attachMedia(this.player.video);
         const is_caption_hidden = this.player.subtitle?.container.classList.contains('dplayer-subtitle-hide') ?? false;
-        if (is_caption_hidden) this.arib_ttml_renderer.hideCaption();
+        if (is_caption_hidden || this.recorded_raw_subtitle_track_index !== null) this.arib_ttml_renderer.hideCaption();
         else this.arib_ttml_renderer.showCaption();
         this.arib_ttml_renderer.setSuperimposeVisibility(aribb24_options.disableSuperimposeRenderer !== true);
     }
@@ -4187,11 +4238,12 @@ class PlayerController {
             'dplayer-konomitv-bs4k-setting-box-video-codec',
             'dplayer-konomitv-bs4k-setting-box-audio-codec',
             'dplayer-konomitv-bs4k-setting-box-hdr-output',
+            'dplayer-konomitv-bs4k-setting-box-subtitle',
         ];
         const close_sub_panel = () => {
             setting_box.classList.remove(...sub_panel_class_names);
         };
-        const open_sub_panel = (panel_name: 'video-codec' | 'audio-codec' | 'hdr-output') => {
+        const open_sub_panel = (panel_name: 'video-codec' | 'audio-codec' | 'hdr-output' | 'subtitle') => {
             close_sub_panel();
             // DPlayer 標準サブパネルの modifier が残っていると clip-path の優先順位が競合する。
             setting_box.classList.remove(
@@ -4275,6 +4327,16 @@ class PlayerController {
                 <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-audio-codec-arrow"></div>
             </div>
         `;
+        // 字幕トラック切替の項目。候補は録画生字幕・TTML component から動的に組み立てるため、
+        // パネル内の項目は render 関数で生成し、パネル枠だけを HTML 直書きで注入する。
+        const subtitle_setting_item_html = `
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-subtitle"
+                role="button" tabindex="0" style="touch-action:manipulation;">
+                <span class="dplayer-label">字幕</span>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-subtitle-value"></span>
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-subtitle-arrow"></div>
+            </div>
+        `;
         const auto_skip_cm_setting_item_html = this.playback_mode === 'Video' ? `
             <div class="dplayer-setting-item dplayer-setting-auto-skip-cm">
                 <span class="dplayer-label">CM自動スキップ</span>
@@ -4345,6 +4407,7 @@ class PlayerController {
                 <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-video-codec-arrow"></div>
             </div>
             ${audio_codec_setting_item_html}
+            ${subtitle_setting_item_html}
             <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-hdr-output"
                 role="button" tabindex="0" style="touch-action:manipulation;">
                 <span class="dplayer-label">HDR 出力</span>
@@ -4375,6 +4438,10 @@ class PlayerController {
             )!.style.display = 'none';
             this.player.container.querySelector<HTMLElement>(
                 '.dplayer-setting-mobile-profile',
+            )!.style.display = 'none';
+            // 保存版パッケージの字幕は生成条件に焼き込まれているため、トラック切替を提供しない
+            this.player.container.querySelector<HTMLElement>(
+                '.dplayer-konomitv-bs4k-setting-subtitle',
             )!.style.display = 'none';
         }
 
@@ -4590,6 +4657,17 @@ class PlayerController {
             </div>
             ${audio_codec_panel_html}
             ${hdr_output_panel_html}
+            <div class="dplayer-konomitv-bs4k-setting-subtitle-panel"
+                style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
+                <div class="dplayer-setting-header dplayer-konomitv-bs4k-setting-subtitle-header"
+                    role="button" tabindex="0"
+                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                    <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-subtitle-back"
+                        style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                    <span class="dplayer-label">字幕</span>
+                </div>
+                <div class="dplayer-konomitv-bs4k-setting-subtitle-items"></div>
+            </div>
         `);
 
         // DPlayer が持つ音声トラック用の矢印・戻る・チェックアイコンを流用して見た目を揃える
@@ -5015,6 +5093,175 @@ class PlayerController {
             });
         }
 
+        // ==== 字幕トラック切替サブメニューの初期化 ====
+        // 候補は動的に組み立てる:
+        //  - 録画生字幕 / sidecar WebVTT: subtitle_tracks のメタデータ (初期化時に確定)
+        //  - ARIB-TTML (録画・ライブ): レンダラーの受信済み component。先読み窓の受信に応じて後から増える
+        //  - ライブ生 ARIB STD-B24: component 選択が DPlayer / aribb24.js 側の話のため対象外、「自動」のみ
+        // 「切」は置かない。非表示は字幕ボタンの専任であり、二重の正源を作らない。
+        const subtitle_panel = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle-panel',
+        )!;
+        const subtitle_setting_item = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle',
+        )!;
+        const subtitle_value_element = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle-value',
+        )!;
+        const subtitle_item_container = subtitle_panel.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle-items',
+        )!;
+        interface SubtitlePanelEntry {
+            key: string;
+            label: string;
+        }
+        const map_subtitle_language = (language: string | null): string | null => {
+            language = language?.trim().toLowerCase() ?? null;
+            // ARIB 3 文字言語コードのうち二か国語字幕で使う日英だけ和名へ訳し、その他はコードのまま出す
+            if (language === 'jpn') return '日本語';
+            if (language === 'eng') return '英語';
+            return language?.trim() || null;
+        };
+        const build_subtitle_entries = (): SubtitlePanelEntry[] => {
+            const entries: SubtitlePanelEntry[] = [{ key: 'auto', label: '自動' }];
+            if (this.playback_mode === 'Video') {
+                this.recorded_raw_subtitle_tracks.forEach((track) => {
+                    entries.push({
+                        key: `raw:${track.index}`,
+                        label: map_subtitle_language(track.language ?? null) ?? `トラック${track.component_tag ?? track.pid ?? track.index}`,
+                    });
+                });
+                player_store.recorded_program.recorded_video.subtitle_tracks.forEach((track) => {
+                    if (track.codec.toLowerCase() !== 'arib_ttml' || track.component_tag === undefined ||
+                        track.component_tag < 0x30 || track.component_tag > 0x37) return;
+                    if (entries.some(entry => entry.key === `ttml:${track.component_tag}`)) return;
+                    entries.push({key: `ttml:${track.component_tag}`,
+                        label: map_subtitle_language(track.language) ?? `トラック${track.component_tag}`});
+                });
+            }
+            this.arib_ttml_renderer?.getCaptionComponents().forEach((component) => {
+                const existing = entries.find(entry => entry.key === `ttml:${component.component_tag}`);
+                if (existing !== undefined) {
+                    existing.label = map_subtitle_language(component.language) ?? existing.label;
+                    return;
+                }
+                entries.push({
+                    key: `ttml:${component.component_tag}`,
+                    label: map_subtitle_language(component.language) ?? `トラック${component.component_tag}`,
+                });
+            });
+            return entries;
+        };
+        const get_subtitle_selection_key = (): string => {
+            if (this.recorded_raw_subtitle_track_index !== null) {
+                return `raw:${this.recorded_raw_subtitle_track_index}`;
+            }
+            const ttml_component_tag = this.arib_ttml_renderer?.getSelectedCaptionComponentTag() ?? null;
+            return ttml_component_tag !== null ? `ttml:${ttml_component_tag}` : 'auto';
+        };
+        const select_subtitle_entry = (key: string): void => {
+            if (this.player === null || !build_subtitle_entries().some(entry => entry.key === key)) return;
+            const selection_changed = key !== get_subtitle_selection_key();
+            if (selection_changed && key === 'auto') {
+                this.arib_ttml_renderer?.setCaptionComponentTag(null);
+                this.switchRecordedRawSubtitleTrack(null);
+                this.arib_ttml_renderer?.showCaption();
+            } else if (selection_changed && key.startsWith('raw:')) {
+                this.arib_ttml_renderer?.setCaptionComponentTag(null);
+                this.switchRecordedRawSubtitleTrack(Number(key.slice('raw:'.length)));
+                this.arib_ttml_renderer?.hideCaption();
+            } else if (selection_changed && key.startsWith('ttml:')) {
+                this.arib_ttml_renderer?.setCaptionComponentTag(Number(key.slice('ttml:'.length)));
+                this.switchRecordedRawSubtitleTrack(null);
+                this.arib_ttml_renderer?.showCaption();
+            } else if (selection_changed) {
+                return;
+            }
+            // 選択は「新しい字幕を見たい」という操作そのものなので、非表示なら自動表示する。
+            // subtitle.show() 経由にすればボタン状態・user 設定・subtitle_show イベント (TTML層) も同期される。
+            const is_caption_hidden = this.player.subtitle?.container.classList.contains('dplayer-subtitle-hide') ?? false;
+            if (is_caption_hidden === true) {
+                this.player.subtitle?.show();
+            }
+        };
+        let subtitle_panel_signature = '';
+        const render_subtitle_panel = (force = false): void => {
+            if (this.player === null) return;
+            const entries = build_subtitle_entries();
+            const current_key = get_subtitle_selection_key();
+            const signature = JSON.stringify([current_key, entries]);
+            if (force === false && signature === subtitle_panel_signature) return;
+            subtitle_panel_signature = signature;
+            // 録画メタデータと放送由来の言語名はHTMLとして解釈しない。
+            subtitle_item_container.replaceChildren(...entries.map((entry) => {
+                const item = document.createElement('div');
+                item.className = 'dplayer-konomitv-bs4k-setting-subtitle-item';
+                item.dataset.subtitle = entry.key;
+                item.setAttribute('role', 'button');
+                item.tabIndex = 0;
+                item.style.cssText = 'display:flex; align-items:center; min-height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer; touch-action:manipulation;';
+                const check = document.createElement('div');
+                check.className = 'dplayer-toggle dplayer-konomitv-bs4k-setting-subtitle-check';
+                check.style.cssText = 'display:inline-block; position:static; width:22px; margin-right:6px; flex-shrink:0;';
+                const label = document.createElement('span');
+                label.className = 'dplayer-label';
+                label.textContent = entry.label;
+                label.title = entry.label;
+                label.style.cssText = 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+                item.append(check, label);
+                return item;
+            }));
+            subtitle_item_container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-subtitle-item')
+                .forEach((item) => {
+                    // DPlayer の音声パネルのチェックアイコンを流用し、現在選択にだけ表示する
+                    const check = item.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-subtitle-check');
+                    if (check !== null) {
+                        check.innerHTML = audio_check_html;
+                        check.style.visibility = item.dataset.subtitle === current_key ? 'visible' : 'hidden';
+                    }
+                    register_sub_panel_activation_handler(item, (event) => {
+                        consume_sub_panel_event(event);
+                        select_subtitle_entry(item.dataset.subtitle ?? 'auto');
+                        render_subtitle_panel(true);
+                    });
+                });
+            subtitle_value_element.textContent = entries.find((entry) => entry.key === current_key)?.label ?? '自動';
+            // パネル高さは他サブパネルと同じ CSS 変数制御 (ヘッダー 54px + 項目 30px 分)
+            setting_box.style.setProperty(
+                '--konomitv-bs4k-subtitle-panel-height',
+                `${54 + entries.length * 30}px`,
+            );
+            // 切り替え候補が無い録画 (字幕トラックなし) は項目自体を隠す。ライブは後から component が
+            // 到着する可能性があるため、「自動」だけでも開ける状態として常時表示する。
+            subtitle_setting_item.style.display =
+                player_store.is_offline_playback === false &&
+                (entries.length > 1 || this.playback_mode === 'Live') ? '' : 'none';
+        };
+        render_subtitle_panel(true);
+        register_sub_panel_activation_handler(subtitle_setting_item, (event) => {
+            consume_sub_panel_event(event);
+            // 開く直前に再構築し、先読みで増えた component や選択状態を最新化する
+            render_subtitle_panel(true);
+            open_sub_panel('subtitle');
+        });
+        const subtitle_header = subtitle_panel.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle-header',
+        )!;
+        register_sub_panel_activation_handler(subtitle_header, (event) => {
+            consume_sub_panel_event(event);
+            close_sub_panel();
+        });
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-subtitle-arrow')!
+            .innerHTML = audio_arrow_html;
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-subtitle-back')!
+            .innerHTML = audio_back_html;
+        // TTML component は先読み窓の受信で増えていくため、1秒間隔で候補・現在値・高さを追従させる。
+        // 設定パネルはプレイヤー再生成ごとに作り直されるので、旧プレイヤーへ向くタイマーは必ず破棄して張り直す。
+        this.subtitle_panel_timer_cancel?.();
+        this.subtitle_panel_timer_cancel = Utils.setIntervalInWorker(() => {
+            render_subtitle_panel();
+        }, 1000);
+
         this.applyAudioTrackLabels();
     }
 
@@ -5438,6 +5685,10 @@ class PlayerController {
         if (this.live_audio_track_interval_timer_cancel !== null) {
             this.live_audio_track_interval_timer_cancel();
             this.live_audio_track_interval_timer_cancel = null;
+        }
+        if (this.subtitle_panel_timer_cancel !== null) {
+            this.subtitle_panel_timer_cancel();
+            this.subtitle_panel_timer_cancel = null;
         }
         if (this.video_keep_alive_interval_timer_cancel !== null) {
             this.video_keep_alive_interval_timer_cancel();
