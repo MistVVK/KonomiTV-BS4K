@@ -50,6 +50,7 @@ from app.utils.AuthSecurity import (
     GetUsernameRateLimitKey,
     HashRefreshToken,
 )
+from app.utils.KonomiTVBS4KCloudStorage import KonomiTVBS4KCloudStorage
 
 
 # ルーター
@@ -866,6 +867,44 @@ async def UserUpdateIconAPI(
         ) from ex
 
 
+async def DeleteUserWithKonomiTVBS4KCloudCredentials(user: User) -> None:
+    """アカウント削除のcommit後に、所有するローカルクラウド認証を破棄する。
+
+    Args:
+        user: 削除対象のユーザー。
+    Returns:
+        None
+    """
+    try:
+        # 接続操作と同じlockをDB削除前に取得する。使用中ならアカウントも認証も残す。
+        with KonomiTVBS4KCloudStorage.ownerLock(user.id) as root:
+            # 削除と管理者数確認を同じトランザクションに置き、管理者0人への競合を防ぐ。
+            async with in_transaction() as connection:
+                await user.delete(using_db=connection)
+                # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
+                ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
+                if await User.filter(is_admin=True).using_db(connection).count() == 0:
+                    id_young_user = await User.all().order_by('id').using_db(connection).first()
+                    if id_young_user is not None:
+                        id_young_user.is_admin = True
+                        await id_young_user.save(using_db=connection, update_fields=['is_admin', 'updated_at'])
+            # rollbackやcommit失敗ではここへ到達しない。クラウド側の削除/revokeは呼ばない。
+            # commit直後の中断・I/O失敗で残ったディレクトリは起動時の所有者確認で回収する。
+            KonomiTVBS4KCloudStorage.removeOwner(root)
+    except BlockingIOError:
+        raise HTTPException(
+            status_code=409,
+            detail='Cloud storage operations for this user are currently in progress. '
+                   'The account was not deleted; please retry after the operation completes.',
+        ) from None
+    except OSError:
+        logging.error('[UsersRouter] Local cloud credential cleanup could not complete.')
+        raise HTTPException(
+            status_code=503,
+            detail='Failed to complete local cloud credential cleanup due to an I/O error.',
+        ) from None
+
+
 @router.delete(
     '/me',
     summary = 'アカウント削除 API (ログイン中のユーザー)',
@@ -879,27 +918,15 @@ async def UserDeleteAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。
     """
 
-    # アイコン画像が保存されていれば削除する
-    icon_save_path = anyio.Path(str(ACCOUNT_ICON_DIR)) / f'{current_user.id:02}.png'
-    if await icon_save_path.exists():
-        await icon_save_path.unlink()
-
     # 現在ログイン中のユーザーアカウント（自分自身）を削除
     # アカウントを削除すると、それ以降は（当然ながら）ログインを要求する API へアクセスできなくなる
     ## 削除と管理者数の確認を同一トランザクション内で直列化し、同時削除で管理者 0 人にならないようにする
-    async with in_transaction() as connection:
-        await current_user.delete(using_db = connection)
+    await DeleteUserWithKonomiTVBS4KCloudCredentials(current_user)
 
-        # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
-        ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
-        if await User.filter(is_admin=True).using_db(connection).count() == 0:
-            id_young_user = await User.all().order_by('id').using_db(connection).first()
-            if id_young_user is not None:
-                id_young_user.is_admin = True
-                await id_young_user.save(
-                    using_db = connection,
-                    update_fields = ['is_admin', 'updated_at'],
-                )
+    # 削除拒否・DB失敗では画像を保持する。アイコン画像が保存されていれば削除する
+    icon_save_path = anyio.Path(str(ACCOUNT_ICON_DIR)) / f'{current_user.id:02}.png'
+    if await icon_save_path.exists():
+        await icon_save_path.unlink()
 
 
 # ***** 指定ユーザーアカウント情報 API (管理者用) *****
@@ -1018,23 +1045,11 @@ async def SpecifiedUserDeleteAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
-    # アイコン画像が保存されていれば削除する
+    # 指定されたユーザーを削除
+    ## 削除と管理者数の確認を同一トランザクション内で直列化し、同時削除で管理者 0 人にならないようにする
+    await DeleteUserWithKonomiTVBS4KCloudCredentials(user)
+
+    # 削除拒否・DB失敗では画像を保持する。アイコン画像が保存されていれば削除する
     icon_save_path = anyio.Path(str(ACCOUNT_ICON_DIR)) / f'{user.id:02}.png'
     if await icon_save_path.exists():
         await icon_save_path.unlink()
-
-    # 指定されたユーザーを削除
-    ## 削除と管理者数の確認を同一トランザクション内で直列化し、同時削除で管理者 0 人にならないようにする
-    async with in_transaction() as connection:
-        await user.delete(using_db = connection)
-
-        # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
-        ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
-        if await User.filter(is_admin=True).using_db(connection).count() == 0:
-            id_young_user = await User.all().order_by('id').using_db(connection).first()
-            if id_young_user is not None:
-                id_young_user.is_admin = True
-                await id_young_user.save(
-                    using_db = connection,
-                    update_fields = ['is_admin', 'updated_at'],
-                )
