@@ -453,6 +453,12 @@ async def CleanupExpiredNiconicoOAuthStates():
 async def CleanupExpiredOfflineJobs():
     await KonomiTVBS4KOfflineJobManager.cleanupExpired()
 
+# 起動時回収と重複させず、1時間ごとに同じ参照・書き込み保護条件でfMP4残骸を回収する。
+@app.on_event('startup')
+@repeat_every(seconds=3600, wait_first=3600, logger=logging.logger)
+async def CleanupStaleRecordedFMP4Caches():
+    await RecordedFMP4CacheManager.cleanupStale()
+
 # サーバーの終了処理は FastAPI と atexit のどちらから呼ばれても同じ Task を共有する
 _shutdown_completed = False
 _shutdown_task: asyncio.Task[None] | None = None
