@@ -1554,9 +1554,11 @@ export default class ARIBTTMLRenderer {
     private svg: SVGSVGElement | null = null;
     private caption_state: ComponentState | null = null;
     private superimpose_state: ComponentState | null = null;
-    private preferred_caption_component_tag = 0x30;
     private preferred_superimpose_component_tag = 0x38;
     private preferred_caption_language: 'auto' | 'jpn' | 'eng';
+    // 設定パネルの字幕サブメニューによる明示選択 (0x30..0x37)。null は自動選択に戻す。
+    // 自動表示フラグ (DMF) より優先するが、未送出のうちは自動選択へフォールバックする。
+    private user_selected_caption_component_tag: number | null = null;
     // TR-B39 7.2.3 の同時再生可否を字幕・文字スーパーの両レイヤーで共通判定する。
     // callback待ちの内蔵音も予約時点から数え、最大2音を越えないようにする。
     private readonly active_auxiliary_audio = new Set<AuxiliaryAudioRegistration>();
@@ -1741,18 +1743,6 @@ export default class ARIBTTMLRenderer {
         this.renderCurrentTime();
     }
 
-    /** 二言語字幕では選択assetだけを描画する。未送出なら運用中の最小componentへフォールバックする。 */
-    public setCaptionComponentTag(component_tag: number): void {
-        if (component_tag < 0x30 || component_tag > 0x37) return;
-        this.preferred_caption_component_tag = component_tag;
-        if (this.caption_state !== null) {
-            this.stopAudio(this.caption_state, true);
-            this.caption_state.current_cue = null;
-            this.caption_state.host.replaceChildren();
-        }
-        this.renderCurrentTime();
-    }
-
     public setCaptionLanguage(language: 'auto' | 'jpn' | 'eng'): void {
         this.preferred_caption_language = language;
         if (this.caption_state !== null) {
@@ -1761,6 +1751,37 @@ export default class ARIBTTMLRenderer {
             this.caption_state.host.replaceChildren();
         }
         this.renderCurrentTime();
+    }
+
+    /** 字幕 asset を明示選択する (null で自動選択へ復帰)。二か国語字幕のトラック切替メニューから呼ぶ。 */
+    public setCaptionComponentTag(component_tag: number | null): void {
+        if (component_tag !== null && (!Number.isInteger(component_tag) || component_tag < 0x30 || component_tag > 0x37)) return;
+        this.user_selected_caption_component_tag = component_tag;
+        if (this.caption_state !== null) {
+            this.stopAudio(this.caption_state, true);
+            this.caption_state.current_cue = null;
+            this.caption_state.host.replaceChildren();
+        }
+        this.renderCurrentTime();
+    }
+
+    public getSelectedCaptionComponentTag(): number | null {
+        return this.user_selected_caption_component_tag;
+    }
+
+    /**
+     * 受信済み字幕 component とその言語の一覧を返す。字幕トラック切替メニューの候補生成に使う。
+     *
+     * Returns:
+     *     { component_tag: number; language: string | null }[]: 先読み範囲で観測した字幕 asset。
+     *         言語は各 component の最初の presentation unit から取るため、未着の component は現れない。
+     */
+    public getCaptionComponents(): { component_tag: number; language: string | null }[] {
+        if (this.caption_state === null) return [];
+        return [...this.caption_state.cues_by_component.keys()].sort((left, right) => left - right).map((component_tag) => ({
+            component_tag,
+            language: this.caption_state?.cues_by_component.get(component_tag)?.[0]?.unit.additional_info.language ?? null,
+        }));
     }
 
     public isCaptionPresent(): boolean {
@@ -1832,8 +1853,7 @@ export default class ARIBTTMLRenderer {
         if (this.media === null) return;
         for (const state of [this.caption_state, this.superimpose_state]) {
             if (state === null) continue;
-            const preferred_component_tag = state === this.caption_state ?
-                this.preferred_caption_component_tag : this.preferred_superimpose_component_tag;
+            const preferred_component_tag = this.preferred_superimpose_component_tag;
             const available_component_tags = [...state.cues_by_component.keys()].sort((left, right) => left - right);
             const display_modes = available_component_tags.map((component_tag) => {
                 const cue = this.findCue(
@@ -1853,9 +1873,16 @@ export default class ARIBTTMLRenderer {
                     state.cues_by_component.get(component_tag)?.[0]?.unit.additional_info.language ===
                         this.preferred_caption_language
                 ) : undefined;
-            const selected_component_tag = automatic_component_tag ??
-                language_component_tag ?? (state.cues_by_component.has(preferred_component_tag) ?
-                preferred_component_tag : available_component_tags[0]);
+            // 字幕トラックの明示選択が最優先。選択 asset がまだ未送出なら従来の自動判定へフォールバックする。
+            const user_component_tag = state === this.caption_state &&
+                this.user_selected_caption_component_tag !== null &&
+                state.cues_by_component.has(this.user_selected_caption_component_tag) ?
+                this.user_selected_caption_component_tag : undefined;
+            // 字幕は明示選択、言語一致、自動表示資産、最小componentの順。文字スーパーの規約は変えない。
+            const selected_component_tag = state === this.caption_state ?
+                user_component_tag ?? language_component_tag ?? automatic_component_tag ?? available_component_tags[0] :
+                automatic_component_tag ?? (state.cues_by_component.has(preferred_component_tag) ?
+                    preferred_component_tag : available_component_tags[0]);
             const selected_cues = Number.isFinite(selected_component_tag) ?
                 state.cues_by_component.get(selected_component_tag) ?? [] : [];
             const cue = this.findCue(selected_cues, this.media.currentTime);
