@@ -48,6 +48,7 @@ from app.routers import (
     CMAnalysisRouter,
     DataBroadcastingRouter,
     KonomiTVBS4KBangumiRouter,
+    KonomiTVBS4KCloudStorageRouter,
     KonomiTVBS4KCodecSupportRouter,
     KonomiTVBS4KSpeedTestRouter,
     LiveStreamsRouter,
@@ -73,6 +74,7 @@ from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
 from app.utils.HTTPS import BuildServerStartupSettings, ReverseProxyMiddleware
+from app.utils.KonomiTVBS4KCloudStorage import KonomiTVBS4KCloudStorage
 from app.utils.KonomiTVBS4KCodecSupport import KonomiTVBS4KCodecSupportJobManager
 from app.utils.KonomiTVBS4KRequestBodyLimit import (
     MULTIPART_FORM_DATA_OVERHEAD_BYTES,
@@ -143,6 +145,7 @@ app.include_router(SettingsRouter.router)
 app.include_router(MaintenanceRouter.router)
 app.include_router(VersionRouter.router)
 app.include_router(KonomiTVBS4KSpeedTestRouter.router)
+app.include_router(KonomiTVBS4KCloudStorageRouter.router)
 # コーデック対応のサーバー診断は本線 API だけへ登録し、互換 API には露出させない。
 app.include_router(KonomiTVBS4KCodecSupportRouter.router)
 # Bangumi 連携は本線 API だけへ登録し、互換 API には露出させない。
@@ -411,6 +414,9 @@ async def Startup():
 
     # 異常終了した前プロセスが残したfMP4予約キャッシュだけを削除する。
     await RecordedFMP4CacheManager.cleanupStale()
+
+    # アカウント削除のcommit後に中断したローカル認証回収を再試行する。
+    await KonomiTVBS4KCloudStorage.cleanupOrphanedOwners()
 
     # HTTP 接続から独立したオフライン保存ジョブを復旧し、完成済みパッケージだけを再公開する。
     await KonomiTVBS4KOfflineJobManager.initialize()

@@ -418,7 +418,7 @@ RUN case "${CUDA_VERSION}" in \
         echo 'nala update fetched no jammy InRelease' >&2; \
         exit 1; \
     fi && \
-    nala upgrade -y && nala install -y --no-install-recommends curl git gpg tzdata libc6 zlib1g && \
+    nala upgrade -y && nala install -y --no-install-recommends curl git gpg tzdata libc6 zlib1g rclone && \
     curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics-keyring.gpg && \
     echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics-keyring.gpg] https://repositories.intel.com/gpu/ubuntu jammy/lts/2523 unified' > /etc/apt/sources.list.d/intel-gpu-jammy.list && \
     if [ "${AMD_NONFREE}" = 'true' ]; then \
