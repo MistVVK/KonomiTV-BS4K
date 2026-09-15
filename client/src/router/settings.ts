@@ -66,6 +66,7 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
             {type: 'Route', label: '配信・エンコーダー', icon: 'fluent:video-settings-20-filled', to: '/settings/server/streaming'},
             {type: 'Route', label: 'AIバックエンド', icon: 'fluent:bot-20-filled', to: '/settings/server/ai-backends'},
             {type: 'Route', label: '録画・ストレージ', icon: 'fluent:hard-drive-20-filled', to: '/settings/server/storage'},
+            {type: 'Route', label: 'クラウドストレージ', icon: 'fluent:cloud-24-regular', to: '/settings/server/konomitv-bs4k-cloud-storage'},
             {
                 type: 'Route',
                 label: '録画シリーズ',
@@ -206,6 +207,11 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         path: '/settings/server/recorded-series',
         name: 'Settings Server Recorded Series',
         component: () => import('@/views/Settings/RecordedSeries.vue'),
+    },
+    {
+        path: '/settings/server/konomitv-bs4k-cloud-storage',
+        name: 'KonomiTVBS4K Cloud Storage',
+        component: () => import('@/views/Settings/KonomiTVBS4KCloudStorage.vue'),
     },
     {
         path: '/settings/server/recorded-series/series',
