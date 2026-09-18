@@ -55,6 +55,21 @@ services:
         target: '/code/server/logs/'
         bind:
           selinux: z
+      # RCの制御はUnix socketだけで行う。FUSEとmount権限は専用sidecarへ分離する。
+      - type: bind
+        source: './docker/development/state/cloud-control/'
+        target: '/run/konomitv-bs4k-cloud/'
+        bind:
+          selinux: z
+          create_host_path: false
+      - type: bind
+        source: './docker/development/state/cloud-mounts/'
+        target: '/cloud-mounts/'
+        read_only: true
+        bind:
+          selinux: z
+          create_host_path: false
+          propagation: rslave
       # config.yaml のホスト絶対パスをコンテナ内の /host-rootfs 配下へ対応付ける。
       - type: bind
         source: '/'
@@ -64,3 +79,59 @@ services:
         source: '${HOME}'
         target: '/host-home/'
         read_only: true
+
+  cloud-storage:
+    image: konomitv-bs4k-development-cloud-storage
+    extends:
+      file: '${KONOMITV_BS4K_RECORDING_BINDS_FILE:-./docker/cloud-storage/recording-binds.empty.yaml}'
+      service: konomitv-bs4k-recording-inputs
+    init: true
+    build:
+      context: .
+      dockerfile: docker/cloud-storage/Dockerfile
+      args:
+        KONOMITV_UID: '${KONOMITV_UID:-1000}'
+        KONOMITV_GID: '${KONOMITV_GID:-1000}'
+    user: '${KONOMITV_UID:-1000}:${KONOMITV_GID:-1000}'
+    restart: unless-stopped
+    read_only: true
+    # 常駐プロセスは非rootで動かし、mountにはsetuid fusermount3を使用する。
+    # ホストTCPやDocker socketは公開しない。
+    cap_drop: [ALL]
+    # setuid fusermount3がmode0700の共有先を探索できるよう、読取り探索だけを許可する。
+    cap_add: [SYS_ADMIN, DAC_READ_SEARCH]
+    devices:
+      - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor=unconfined
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: './docker/development/state/cloud-control/'
+        target: '/run/konomitv-bs4k-cloud/'
+        bind:
+          selinux: z
+          create_host_path: false
+      - type: bind
+        source: './docker/development/state/cloud-mounts/'
+        target: '/cloud-mounts/'
+        bind:
+          selinux: z
+          create_host_path: false
+          propagation: rshared
+      # 生成物だけをサイズ既知の入力として共有し、DB・JWT・鍵を含むdata全体は渡さない。
+      - type: bind
+        source: './docker/development/state/data/konomitv-bs4k-cloud-generated-source/'
+        target: '/cloud-generated-source/'
+        read_only: true
+        bind:
+          selinux: z
+          create_host_path: false
+      # 認証は通常のrclone入力として使い、更新tokenの書戻しもrcloneへ任せる。
+      - type: bind
+        source: './docker/development/state/data/konomitv-bs4k-cloud-storage/'
+        target: '/cloud-credentials/'
+        bind:
+          selinux: z
+          create_host_path: false

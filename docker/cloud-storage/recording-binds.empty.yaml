@@ -1,0 +1,4 @@
+# 録画共有を指定しない場合も、追跡中のComposeだけで解決できる既定値。
+services:
+  konomitv-bs4k-recording-inputs:
+    volumes: []

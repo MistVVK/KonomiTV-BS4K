@@ -31,3 +31,9 @@
 - **却下した案**: FFmpeg / ffprobe のビルド成果物や TSCodecBridge / tsreadex の submodule ソースを固定 SHA-256 と照合し、ソース変更のたびに期待値を更新する。
 - **却下理由**: 正規の FFmpeg 音声再構成修正でも、生成バイナリの固定値不一致で `tscodecbridge-integration` が停止した。ソースは Git の commit / submodule で管理し、ローカル生成物に追加の固定値更新を要求しない。URL から取得するアーカイブの完全性検証はこの判断の対象外とし、SBLint / Mallet / Go / Python などの SHA-256 検証は維持する。対象は `docker/ts-codec-bridge/` と `docker/thirdparty/` のマニフェスト・ビルド処理。
 - **この判断が無効になる条件**: ローカルビルドではなく外部配布の成果物を受け入れるなど、ソース管理と既存のビルド検証では保証できない入力経路が追加された場合。
+
+### sidecar への録画原本受け渡しに独自 WebDAV 転送元 (KonomiTVBS4KCloudSource) を設ける
+
+- **却下した案**: ローカルの録画原本を sidecar へ渡すため、Unix domain socket 上で動作する独自の WebDAV サーバー (`KonomiTVBS4KCloudSource`) を本体に設け、サイズ情報を付与して rclone へ中継する。
+- **却下理由**: 通常ファイルはローカルでサイズを事前に `stat` 可能であり、rclone crypt も平文サイズが既知であれば暗号化後のサイズを計算できる。pCloud などの `PutStream=false` はサイズ不明入力時の制約であり、通常ファイルのアップロード自体を制限するものではない。`RC uploadfile` の Rcat 経路では大きなサイズ不明入力時にスプールが必要になるが、録画領域を sidecar へ read-only bind して通常ファイルを `RC operations/copyfile` の送信元に指定すれば、独自 WebDAV を介さずに直接転送できる。また、WebDAV 転送元を設けてもクラウドからの再生読み取りやシークの課題は解決されないため、独自の中継サーバーを設ける必要性がない。
+- **この判断が無効になる条件**: 録画領域を sidecar へ read-only bind できないコンテナ分離要件や、本体と sidecar が別ホストへ分離されるなど、ローカルファイルシステム経由での直接参照が根本的に不可能なアーキテクチャへ変更された場合。

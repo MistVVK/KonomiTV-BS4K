@@ -52,6 +52,21 @@ services:
         target: '/code/server/logs/'
         bind:
           selinux: z
+      # RC制御とmount伝播の起点は環境ごとのdata内へ分離する。
+      - type: bind
+        source: './server/data/konomitv-bs4k-cloud-control/'
+        target: '/run/konomitv-bs4k-cloud/'
+        bind:
+          selinux: z
+          create_host_path: false
+      - type: bind
+        source: './server/data/konomitv-bs4k-cloud-mounts/'
+        target: '/cloud-mounts/'
+        read_only: true
+        bind:
+          selinux: z
+          create_host_path: false
+          propagation: rslave
       # config.yaml のホスト絶対パスをコンテナ内の /host-rootfs 配下へ対応付ける。
       - type: bind
         source: '/'
@@ -61,3 +76,57 @@ services:
         source: '${HOME}'
         target: '/host-home/'
         read_only: true
+
+  cloud-storage:
+    image: konomitv-bs4k-cloud-storage
+    extends:
+      file: '${KONOMITV_BS4K_RECORDING_BINDS_FILE:-./docker/cloud-storage/recording-binds.empty.yaml}'
+      service: konomitv-bs4k-recording-inputs
+    init: true
+    build:
+      context: .
+      dockerfile: docker/cloud-storage/Dockerfile
+      args:
+        KONOMITV_UID: '${KONOMITV_UID:-1000}'
+        KONOMITV_GID: '${KONOMITV_GID:-1000}'
+    user: '${KONOMITV_UID:-1000}:${KONOMITV_GID:-1000}'
+    restart: always
+    read_only: true
+    # FUSEとmount権限はこのサービスだけに付与する。
+    cap_drop: [ALL]
+    # mode0700の共有先をsetuid fusermount3が探索するために必要。DAC_OVERRIDEは付けない。
+    cap_add: [SYS_ADMIN, DAC_READ_SEARCH]
+    devices:
+      - /dev/fuse:/dev/fuse
+    security_opt:
+      - apparmor=unconfined
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - type: bind
+        source: './server/data/konomitv-bs4k-cloud-control/'
+        target: '/run/konomitv-bs4k-cloud/'
+        bind:
+          selinux: z
+          create_host_path: false
+      - type: bind
+        source: './server/data/konomitv-bs4k-cloud-mounts/'
+        target: '/cloud-mounts/'
+        bind:
+          selinux: z
+          create_host_path: false
+          propagation: rshared
+      - type: bind
+        source: './server/data/konomitv-bs4k-cloud-storage/'
+        target: '/cloud-credentials/'
+        bind:
+          selinux: z
+          create_host_path: false
+      # 生成物専用spoolだけを共有する。認証・鍵・DBの入力範囲は拡張しない。
+      - type: bind
+        source: './server/data/konomitv-bs4k-cloud-generated-source/'
+        target: '/cloud-generated-source/'
+        read_only: true
+        bind:
+          selinux: z
+          create_host_path: false
