@@ -181,21 +181,28 @@ def main(
         command = Command(tortoise_config=DATABASE_CONFIG, app='models', location='./app/migrations/')
         await command.init()
 
-        # KonomiTV-BS4K 1.1.x で配布済みの migration は、既存の番号 12 と重複していた。
-        ## Aerich は先頭番号だけで file を並べるため、新しい一意な番号へ変更するとともに、
-        ## 適用済み DB の履歴も先に読み替えて同じ ALTER TABLE が再実行されないようにする。
-        old_version = '12_20260801220000_update.py'
-        new_version = '35_20260801220000_update.py'
-        old_migration = await Aerich.filter(app='models', version=old_version).first()
-        if old_migration is not None:
-            new_migration_exists = await Aerich.exists(app='models', version=new_version)
-            if new_migration_exists is True:
-                # 両方の履歴がある異常状態では、新しい正本だけを残す。
-                await old_migration.delete()
-            else:
-                old_migration.version = new_version
-                await old_migration.save(update_fields=['version'])
-            logging.info(f'Normalized database migration history from {old_version} to {new_version}.')
+        # 空 DB では最初の migration が aerich テーブルを作るため、履歴正規化を先に実行してはならない。
+        ## 既存 DB だけを正規化し、履歴未初期化時は Aerich 標準の全 migration 適用へ進める。
+        aerich_table_exists = bool(await Tortoise.get_connection('default').execute_query_dict(
+            'SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1;',
+            ['table', 'aerich'],
+        ))
+        if aerich_table_exists is True:
+            # KonomiTV-BS4K 1.1.x で配布済みの migration は、既存の番号 12 と重複していた。
+            ## Aerich は先頭番号だけで file を並べるため、新しい一意な番号へ変更するとともに、
+            ## 適用済み DB の履歴も先に読み替えて同じ ALTER TABLE が再実行されないようにする。
+            old_version = '12_20260801220000_update.py'
+            new_version = '35_20260801220000_update.py'
+            old_migration = await Aerich.filter(app='models', version=old_version).first()
+            if old_migration is not None:
+                new_migration_exists = await Aerich.exists(app='models', version=new_version)
+                if new_migration_exists is True:
+                    # 両方の履歴がある異常状態では、新しい正本だけを残す。
+                    await old_migration.delete()
+                else:
+                    old_migration.version = new_version
+                    await old_migration.save(update_fields=['version'])
+                logging.info(f'Normalized database migration history from {old_version} to {new_version}.')
 
         migrated = await command.upgrade(run_in_transaction=True)
         await Tortoise.close_connections()
