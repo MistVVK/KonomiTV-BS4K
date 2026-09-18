@@ -23,7 +23,10 @@ import useSettingsStore, {
 } from '@/stores/SettingsStore';
 import { KONOMITV_BS4K_THEME_OPTIONS } from '@/themes';
 import Utils from '@/utils';
-import { selectKonomiTVBS4KHardwareDecodePreferredCodec } from '@/utils/KonomiTVBS4KBrowserCodecSupport';
+import {
+    selectKonomiTVBS4KPlaybackDefaultAudioCodec,
+    selectKonomiTVBS4KPlaybackDefaultVideoCodec,
+} from '@/utils/KonomiTVBS4KBrowserCodecSupport';
 
 
 // スムーズスクロール周りの API の polyfill を適用
@@ -62,7 +65,8 @@ async function initializeKonomiTVBS4KApp(): Promise<void> {
     // 初回描画より前に、このブラウザへ保存されているテーマを適用する
     // マウント後に切り替えると、起動時に Konomi Classic が一瞬表示されてしまう
     const settings_store = useSettingsStore();
-    await settings_store.initializeKonomiTVBS4KPlaybackVideoCodecDefault(selectKonomiTVBS4KHardwareDecodePreferredCodec);
+    await settings_store.initializeKonomiTVBS4KPlaybackVideoCodecDefault(selectKonomiTVBS4KPlaybackDefaultVideoCodec);
+    settings_store.initializeKonomiTVBS4KPlaybackAudioCodecDefault(selectKonomiTVBS4KPlaybackDefaultAudioCodec);
     const applySelectedTheme = (): void => {
         const selected_theme = KONOMITV_BS4K_THEME_OPTIONS.find(option => option.value === settings_store.settings.ui_theme) ??
             KONOMITV_BS4K_THEME_OPTIONS[0];

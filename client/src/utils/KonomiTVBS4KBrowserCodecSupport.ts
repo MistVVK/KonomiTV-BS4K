@@ -1399,11 +1399,14 @@ async function probeKonomiTVBS4KBrowserAudioWebCodecs(params: {
 }
 
 /**
- * 工場初期値の選定用に、HW デコード優先の信号がある最上位 codec を返す。
+ * 工場初期値の選定用に、このブラウザが肯定信号を返す最上位 codec を返す。
+ * まず HW デコード優先の信号 (MediaCapabilities の power_efficient / WebCodecs prefer-hardware) を
+ * av1 → vp9 → hevc → avc の順で探し、いずれにも信号がなければ再生前 preflight と同じ MSE 判定で
+ * MSE が対応を肯定する最上位 codec を同じ降格梯子で選ぶ。
  * 本線の代表構成 (1080p60 / 8bit) を使い、実再生での HW 利用や全解像度の対応を断定しない。
- * @returns 優先信号がある codec。どちらの API にも信号がなければ null。
+ * @returns 選定した codec。HW 優先信号も MSE の肯定証拠もない場合は null (工場値維持)。
  */
-export async function selectKonomiTVBS4KHardwareDecodePreferredCodec():
+export async function selectKonomiTVBS4KPlaybackDefaultVideoCodec():
 Promise<KonomiTVBS4KPlaybackVideoCodec | null> {
     const codec_order: readonly KonomiTVBS4KPlaybackVideoCodec[] = ['av1', 'vp9', 'hevc', 'avc'];
     const candidates = codec_order.map(codec => {
@@ -1440,6 +1443,35 @@ Promise<KonomiTVBS4KPlaybackVideoCodec | null> {
             hardware_acceleration: 'prefer-hardware',
         }).catch(() => 'Unavailable');
         if (web_codecs === 'Supported') return codec;
+    }
+
+    // HW 優先信号がどの codec にもない場合でも、MSE の肯定証拠がある codec まで既定を降格する。
+    // 再生前 preflight と同じ MSE 判定・同じ av1 → vp9 → hevc → avc の降格梯子で、
+    // MSE の肯定証拠がある最上位codecだけを返す (MediaSource 自体がない環境は null = 工場値維持)。
+    const fallback_profile: IKonomiTVBS4KPlaybackVideoProfile = {
+        is_bs4k: true,
+        streaming_quality: '1080p-60fps',
+    };
+    for (const {codec} of candidates) {
+        if (PlayerUtils.isKonomiTVBS4KPlaybackVideoCodecSupported(codec, 8, fallback_profile) === true) {
+            return codec;
+        }
+    }
+    return null;
+}
+
+/**
+ * 工場初期値の選定用に、ブラウザの MSE が肯定証拠を出す最上位の音声 codec を返す。
+ * 候補順は再生前 preflight と同じ Opus → AAC。
+ * ライブ (MediaSource) と録画 (ManagedMediaSource 併用) の両方で作れる MIME だけを肯定とみなすため、
+ * 判定は PlayerUtils の共通チェックそのものを使う。
+ * @returns 肯定証拠がある 'opus' / 'aac'。いずれも否定・判定 API 不在なら null (工場値維持)。
+ */
+export function selectKonomiTVBS4KPlaybackDefaultAudioCodec(): KonomiTVBS4KPlaybackAudioCodec | null {
+    for (const codec of ['opus', 'aac'] as const) {
+        if (PlayerUtils.isKonomiTVBS4KPlaybackAudioCodecSupported(codec) === true) {
+            return codec;
+        }
     }
     return null;
 }
