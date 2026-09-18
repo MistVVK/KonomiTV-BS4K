@@ -166,7 +166,10 @@ import { defineComponent } from 'vue';
 import type { IProgramDisplay } from '@/services/Programs';
 
 import Message from '@/message';
-import { classifyKonomiTVBS4KHdrSource } from '@/services/player/KonomiTVBS4KHdrPolicy';
+import {
+    classifyKonomiTVBS4KHdrSource,
+    resolveKonomiTVBS4KEffectiveTransferCharacteristics,
+} from '@/services/player/KonomiTVBS4KHdrPolicy';
 import Reservations, { IReservation } from '@/services/Reservations';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
@@ -204,14 +207,21 @@ export default defineComponent({
     computed: {
         ...mapStores(useChannelsStore, useSettingsStore, useVersionStore, usePlayerStore),
 
-        // SI の video_type は改変せず、transfer が取れたときだけ HLG / PQ / SDR を接尾辞にする。
+        // SI の video_type は改変せず、判定できたときだけ HLG / PQ / SDR を接尾辞にする。
         videoTypeDetailLabel(): string {
             const video_type = this.channelsStore.channel.current.program_present?.video_type;
             if (video_type === null || video_type === undefined || video_type === '') {
                 return '';
             }
-            const transfer = this.playerStore.sps_transfer_characteristics;
+
+            // VUI → B60 → MH-EIT の優先順で、コーデックに依存しない実効 transfer を求める。
+            const transfer = resolveKonomiTVBS4KEffectiveTransferCharacteristics(
+                this.playerStore.sps_transfer_characteristics,
+                this.playerStore.b60_video_transfer,
+                this.playerStore.mh_eit_hdr_hint,
+            );
             if (transfer === null) {
+                // すべて未観測の間は、誤った方式を表示せず従来どおり video_type だけを表示する。
                 return video_type;
             }
             const source = classifyKonomiTVBS4KHdrSource(transfer);

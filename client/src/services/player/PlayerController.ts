@@ -19,6 +19,7 @@ import KonomiTVBS4KColorRewriteLoader, {
 } from '@/services/player/KonomiTVBS4KColorRewriteLoader';
 import {
     classifyKonomiTVBS4KHdrSource,
+    resolveKonomiTVBS4KEffectiveTransferCharacteristics,
     resolveKonomiTVBS4KHdrOutput,
     resolveKonomiTVBS4KLiveMpegtsColorRewrite,
 } from '@/services/player/KonomiTVBS4KHdrPolicy';
@@ -4542,8 +4543,15 @@ class PlayerController {
             const is_bs4k_playback = this.playback_mode === 'Live' ?
                 channels_store.channel.current.display_channel_id.startsWith('bs4k') :
                 player_store.recorded_program.network_id === 0x000B;
+            // ライブは VUI を取得できないコーデックでも、B60 / MH-EIT から HDR ソースを判定する。
+            // 録画では B60 / MH-EIT が null のため、従来どおり fMP4 colr 由来の VUI だけが使われる。
+            const transfer_characteristics = resolveKonomiTVBS4KEffectiveTransferCharacteristics(
+                player_store.sps_transfer_characteristics,
+                player_store.b60_video_transfer,
+                player_store.mh_eit_hdr_hint,
+            );
             const is_hdr_source =
-                classifyKonomiTVBS4KHdrSource(player_store.sps_transfer_characteristics) !== 'None';
+                classifyKonomiTVBS4KHdrSource(transfer_characteristics) !== 'None';
             hdr_output_item.style.display =
                 is_bs4k_playback === true && is_hdr_source === true ? '' : 'none';
             const debug_enabled = version_store.is_server_debug_enabled;
@@ -4577,6 +4585,8 @@ class PlayerController {
                     () => settings_store.settings.konomitv_bs4k_hdr_output,
                     () => version_store.is_server_debug_enabled,
                     () => player_store.sps_transfer_characteristics,
+                    () => player_store.b60_video_transfer,
+                    () => player_store.mh_eit_hdr_hint,
                 ],
                 () => {
                     // 視聴中にサーバー debug がオフになったら Debug 項目を隠し、override を破棄する。

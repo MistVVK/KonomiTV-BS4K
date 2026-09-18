@@ -58,6 +58,30 @@ export function classifyKonomiTVBS4KHdrSource(
     return 'None';
 }
 
+export function resolveKonomiTVBS4KEffectiveTransferCharacteristics(
+    vui_transfer_characteristics: number | null,
+    b60_video_transfer: number | null,
+    mh_eit_hdr_hint: boolean | null,
+): number | null {
+    // 映像ストリームから直接得た VUI を最優先する。18=HLG / 16=PQ、それ以外の既知値は SDR。
+    if (vui_transfer_characteristics !== null) {
+        return vui_transfer_characteristics;
+    }
+    // VP9 / AV1 / AVC など MPEG-TS の VUI を読めない場合は ARIB STD-B60 を使う。
+    // video_transfer_characteristics は 5=HLG / 3=UHD SDR。SDR は代表値の BT.2020 を返す。
+    if (b60_video_transfer === B60_HLG) {
+        return CICP_HLG_TRANSFER;
+    }
+    if (b60_video_transfer === B60_UHD_SDR) {
+        return CICP_BT2020_12_TRANSFER;
+    }
+    // B60 も未判定なら現在番組の MH-EIT HDR アイコンを最後のヒントとして使う。
+    if (mh_eit_hdr_hint !== null) {
+        return mh_eit_hdr_hint === true ? CICP_HLG_TRANSFER : CICP_BT2020_12_TRANSFER;
+    }
+    return null;
+}
+
 export function resolveKonomiTVBS4KHdrRewriteMode(
     transfer_characteristics: number | null,
     b60_video_transfer: number | null,

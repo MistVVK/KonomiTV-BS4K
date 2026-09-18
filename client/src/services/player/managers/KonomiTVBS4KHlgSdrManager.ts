@@ -5,6 +5,7 @@ import { watch, type WatchStopHandle } from 'vue';
 
 import {
     classifyKonomiTVBS4KHdrSource,
+    resolveKonomiTVBS4KEffectiveTransferCharacteristics,
     resolveKonomiTVBS4KHdrOutput,
     resolveKonomiTVBS4KHdrRewriteMode,
     resolveKonomiTVBS4KLiveMpegtsColorRewrite,
@@ -391,9 +392,16 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         // transfer_characteristics はライブでは mpegts.js の mediaInfo から、
         // 録画 HLS では fragment loader が fMP4 から検出した値を、それぞれ PlayerStore 経由で受け取る
         this.transfer_characteristics = player_store.sps_transfer_characteristics;
-        this.source_kind = classifyKonomiTVBS4KHdrSource(this.transfer_characteristics);
-        this.rewrite_mode = resolveKonomiTVBS4KHdrRewriteMode(
+        // ライブの VP9 / AV1 / AVC で VUI を取得できない場合も、B60 → MH-EIT の順に補完する。
+        // Store の生 VUI は上書きせず、各情報が更新されるたびに正しい優先順位で再評価する。
+        const effective_transfer_characteristics = resolveKonomiTVBS4KEffectiveTransferCharacteristics(
             this.transfer_characteristics,
+            player_store.b60_video_transfer,
+            player_store.mh_eit_hdr_hint,
+        );
+        this.source_kind = classifyKonomiTVBS4KHdrSource(effective_transfer_characteristics);
+        this.rewrite_mode = resolveKonomiTVBS4KHdrRewriteMode(
+            effective_transfer_characteristics,
             player_store.b60_video_transfer,
             desired_output,
         );
