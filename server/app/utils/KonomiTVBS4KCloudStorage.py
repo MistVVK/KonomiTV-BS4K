@@ -18,6 +18,7 @@ from typing_extensions import TypedDict
 from app import logging
 from app.constants import DATA_DIR
 from app.models.User import User
+from app.utils.KonomiTVBS4KCloudRC import KonomiTVBS4KCloudRC
 
 
 class KonomiTVBS4KCloudConnection(BaseModel):
@@ -119,6 +120,20 @@ class KonomiTVBS4KCloudStorage:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             yield base / str(owner_id)
 
+    @classmethod
+    def connectionExists(cls, owner_id: int, connection_id: UUID) -> bool:
+        """所有者lock内で接続の認証ファイルが現在も存在するか確認する。
+
+        Args:
+            owner_id: 接続を所有する管理者ID。
+            connection_id: 確認する接続UUID。
+        Returns:
+            通常ファイルとして公開済みの接続が存在する場合はTrue。
+        """
+        with cls.ownerLock(owner_id) as root:
+            path = root / f'{connection_id}.conf'
+            return path.is_file() and not path.is_symlink()
+
     @staticmethod
     def removeOwner(root: Path) -> None:
         """ownerLock保持中に所有者のローカル認証だけを破棄する。
@@ -130,6 +145,7 @@ class KonomiTVBS4KCloudStorage:
         """
         # shutilはディレクトリsymlinkを拒否し、配下のsymlinkも辿らず除去する。
         if root.exists() or root.is_symlink():
+            KonomiTVBS4KCloudRC.stop(int(root.name))
             shutil.rmtree(root)
             directory_fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -180,6 +196,7 @@ class KonomiTVBS4KCloudStorage:
         imported: KonomiTVBS4KCloudImport | None = None,
         *,
         owner_is_active: Callable[[], bool],
+        record_check: Callable[[UUID, bool], None],
     ) -> list[KonomiTVBS4KCloudConnection] | KonomiTVBS4KCloudConnection | list[str] | None:
         """
         同じ認証ファイルへの取り込み・rclone更新・解除を排他して実行する。
@@ -190,6 +207,7 @@ class KonomiTVBS4KCloudStorage:
             connection_id: 既存接続ID。新規取り込みでは省略する。
             imported: 新しい表示名・プロバイダー・秘密のトークンJSON。
             owner_is_active: lock内で所有者の現存・管理権限を再確認するDB照会。
+            record_check: 認証とは独立した接続確認状態の永続化。
         Returns:
             秘密を含まない接続情報またはフォルダ名。解除時はNone。
         """
@@ -216,6 +234,7 @@ class KonomiTVBS4KCloudStorage:
                 raise FileNotFoundError('Cloud connection not found.')
             if operation == 'Disconnect':
                 # クラウドAPIへ削除・revoke要求を送らず、所有者のローカル認証だけを解除する。
+                KonomiTVBS4KCloudRC.stop(owner_id, UUID(path.stem))
                 path.unlink()
                 directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
                 try:
@@ -277,25 +296,20 @@ class KonomiTVBS4KCloudStorage:
                     config = cls.readConfig(staging)
                     config['connection']['konomitv_bs4k_status'] = 'Connected'
                     config['connection']['konomitv_bs4k_checked_at'] = datetime.now(UTC).isoformat()
+                    # 検証が成功してから旧rcloneを止め、旧tokenの遅延書戻しを防ぐ。
+                    KonomiTVBS4KCloudRC.stop(owner_id, UUID(path.stem))
                     cls.writeConfig(path, config)
                     return cls.describe(path, config)
                 finally:
                     staging.unlink(missing_ok=True)
 
-            config = cls.readConfig(path)
             try:
-                folders = cls.listFolders(path)
-            except (OSError, subprocess.SubprocessError, ValueError):
-                # rclone が更新したtokenを古いsnapshotで上書きしない。
-                config = cls.readConfig(path)
-                config['connection']['konomitv_bs4k_status'] = 'Error'
-                config['connection']['konomitv_bs4k_checked_at'] = datetime.now(UTC).isoformat()
-                cls.writeConfig(path, config)
+                folders = KonomiTVBS4KCloudRC.listFolders(owner_id, UUID(path.stem))
+            except (OSError, ValueError):
+                record_check(UUID(path.stem), False)
                 raise
-            config = cls.readConfig(path)
-            config['connection']['konomitv_bs4k_status'] = 'Connected'
-            config['connection']['konomitv_bs4k_checked_at'] = datetime.now(UTC).isoformat()
-            cls.writeConfig(path, config)
+            # 常駐rcloneのtoken更新と競合しないよう、確認結果だけをSQLiteへ記録する。
+            record_check(UUID(path.stem), True)
             return folders
 
     @staticmethod
