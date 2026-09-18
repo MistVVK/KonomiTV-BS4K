@@ -55,6 +55,7 @@ from app.utils import ShutdownProcessPoolExecutor
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.Git import GetGitCommit
 from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+from app.utils.KonomiTVBS4KCloudTransferManager import KonomiTVBS4KCloudTransferManager
 from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
 from app.utils.ProcessLimiter import ProcessLimiter
 from app.utils.TSInformation import TSInformation
@@ -547,6 +548,9 @@ class RecordedScanTask:
         videos_by_path: dict[str, list[RecordedVideoSummary]] = {}
         videos_to_keep: list[RecordedVideoSummary] = []  # 保持するレコードのリスト
         for index, row in enumerate(all_video_rows, start=1):
+            # クラウド録画は目録が正本。元のローカルパスや不完全なmount一覧で重複・消失と判断しない。
+            if KonomiTVBS4KCloudTransferManager.protects(row['id']):
+                continue
             recorded_video_summary = RecordedVideoSummary(
                 id = row['id'],
                 file_path = row['file_path'],
@@ -583,6 +587,9 @@ class RecordedScanTask:
                     videos_to_keep.append(latest_video)  # 最新のものを保持リストに追加
                     # 最新以外のレコードを削除
                     for video_to_delete in videos[1:]:
+                        # batchのsnapshot取得後に受け付けた移動も、その場で保持する。
+                        if KonomiTVBS4KCloudTransferManager.protects(video_to_delete.id):
+                            continue
                         try:
                             # RecordedProgram を削除 (CASCADE により RecordedVideo も削除される)
                             await RecordedProgram.filter(id=video_to_delete.recorded_program_id).delete()
@@ -856,6 +863,8 @@ class RecordedScanTask:
 
                 # ファイルが消失した録画だけをDBレコード回収の対象にする
                 if is_file_missing is True:
+                    if KonomiTVBS4KCloudTransferManager.protects(existing_recorded_video_summary.id):
+                        continue
                     # 削除APIが録画本体を削除した後に失敗したレコードは、同じAPIからの再試行対象として保持する
                     # ここでDBを消すと未削除の補助ファイルを辿れなくなるため、自動回収の対象から除外する
                     if existing_recorded_video_summary.status in ('Deleting', 'DeleteFailed'):
@@ -868,6 +877,7 @@ class RecordedScanTask:
                         # RecordedProgram を削除すると、CASCADE 制約により RecordedVideo も同時に削除される
                         deleted_count = await RecordedProgram.filter(
                             id=existing_recorded_video_summary.recorded_program_id,
+                            recorded_video__file_path=existing_recorded_video_summary.file_path,
                         ).exclude(
                             recorded_video__status__in=['Deleting', 'DeleteFailed'],
                         ).delete()
@@ -985,6 +995,9 @@ class RecordedScanTask:
                         existing_recorded_video_summary.file_path = file_path_str
 
                 # 削除処理中または削除失敗後のレコードは、APIからの再試行まで状態とファイルをそのまま保持する
+                # 移動中の対象集合を、再解析で書き換えない。公開後は新しい所在に従って処理する。
+                if existing_recorded_video_summary is not None and KonomiTVBS4KCloudTransferManager.isActive(existing_recorded_video_summary.id):
+                    return
                 # 自動スキャンで Analyzing / Recorded へ戻すと削除状態を失い、再試行不能になるため処理対象外とする
                 if (
                     existing_recorded_video_summary is not None and
@@ -1114,6 +1127,10 @@ class RecordedScanTask:
                     ).select_related('recorded_program', 'recorded_program__channel')
 
                 # 部分ハッシュまで比較して最終的なContentStateを確定する。
+                if file_path_str.startswith('/cloud-mounts/') and existing_db_recorded_video_after_analyze is not None:
+                    # providerのmtime精度で、目録が保持する元の日時を丸めない。
+                    recorded_program.recorded_video.file_created_at = existing_db_recorded_video_after_analyze.file_created_at
+                    recorded_program.recorded_video.file_modified_at = existing_db_recorded_video_after_analyze.file_modified_at
                 # 更新日時だけが変わった同一内容の録画は、Automaticならメタデータを保存せず索引状態だけを処理する。
                 if existing_db_recorded_video_after_analyze is None:
                     content_state: ContentState = 'New'
@@ -2363,6 +2380,8 @@ class RecordedScanTask:
                 if db_recorded_video is None and original_file_path is not None:
                     db_recorded_video = await RecordedVideo.get_or_none(file_path=str(original_file_path))
                 if db_recorded_video is not None:
+                    if KonomiTVBS4KCloudTransferManager.protects(db_recorded_video.id):
+                        return
                     # 削除APIが録画本体を削除した後に失敗したレコードは、同じAPIからの再試行対象として保持する
                     # watcherは削除APIのpath lock解放後に到達するため、lockだけでなく永続statusも必ず確認する
                     if db_recorded_video.status in ('Deleting', 'DeleteFailed'):

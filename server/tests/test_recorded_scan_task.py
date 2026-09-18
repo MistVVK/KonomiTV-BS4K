@@ -77,7 +77,7 @@ def test_file_deletion_handler_preserves_deletion_retry_states(
         recorded_program_deleted = True
 
     recorded_program = SimpleNamespace(delete=DeleteRecordedProgram)
-    recorded_video = SimpleNamespace(status=recorded_video_status, recorded_program=recorded_program)
+    recorded_video = SimpleNamespace(id=1, status=recorded_video_status, recorded_program=recorded_program)
 
     async def GetRecordedVideoOrNone(**conditions: str) -> SimpleNamespace:
         assert conditions == {'file_path': str(file_path)}
@@ -140,7 +140,7 @@ def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
     monkeypatch.setattr(
         'app.metadata.RecordedScanTask.RecordedProgram.filter',
         lambda **conditions: FakeRecordedProgramQuery()
-        if conditions == {'id': summary.recorded_program_id}
+        if conditions == {'id': summary.recorded_program_id, 'recorded_video__file_path': summary.file_path}
         else pytest.fail(),
     )
     monkeypatch.setattr('app.metadata.RecordedScanTask.transactions.in_transaction', InTransaction)

@@ -10,19 +10,20 @@ from ariblib.aribgaiji import GAIJI_MAP
 from app import logging
 
 
-def ReadRecordedWebVTTSidecar(recorded_file_path: Path) -> bytes | None:
+def ReadRecordedWebVTTSidecar(recorded_file_path: Path, *, sidecar_path: Path | None = None) -> bytes | None:
     """
     録画先頭基準の同名 WebVTT を検査して読み、欠損・破損時は字幕なしとして返す。
 
     Args:
         recorded_file_path (Path): 録画本体のパス
+        sidecar_path: クラウド目録の検証済み参照先。通常は本体から導出する。
 
     Returns:
         bytes | None: 元の WebVTT バイト列。利用できない場合は None
     """
 
-    # パスは録画本体からだけ導出し、字幕 JSON に任意の読み取り先を保持しない。
-    sidecar_path = recorded_file_path.with_suffix('.vtt')
+    # 通常は本体から導出する。クラウドだけ検証済み目録を使い、字幕JSONの任意パスは受け付けない。
+    sidecar_path = sidecar_path if sidecar_path is not None else recorded_file_path.with_suffix('.vtt')
     try:
         data = sidecar_path.read_bytes()
         text = data.decode('utf-8-sig')
@@ -38,18 +39,19 @@ def ReadRecordedWebVTTSidecar(recorded_file_path: Path) -> bytes | None:
     return data
 
 
-def ReadRecordedARIBSidecar(recorded_file_path: Path) -> list[tuple[float, float, bytes]]:
+def ReadRecordedARIBSidecar(recorded_file_path: Path, *, sidecar_path: Path | None = None) -> list[tuple[float, float, bytes]]:
     """
     b24tovtt の字幕を録画先頭基準の ARIB8 PES payload に復元する。
 
     Args:
         recorded_file_path (Path): 同名 WebVTT を持つ録画本体
+        sidecar_path: クラウド目録の検証済み参照先。
 
     Returns:
         list[tuple[float, float, bytes]]: 開始秒・継続秒・字幕 PES payload
     """
 
-    data = ReadRecordedWebVTTSidecar(recorded_file_path)
+    data = ReadRecordedWebVTTSidecar(recorded_file_path, sidecar_path=sidecar_path)
     if data is None:
         return []
     try:

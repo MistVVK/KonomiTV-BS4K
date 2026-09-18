@@ -330,7 +330,11 @@ class RecordedSubtitleStream:
         if track.get('source') == 'Sidecar':
             if track['codec'].lower() != 'webvtt' or track.get('stream_index') is not None:
                 return None
-            return await asyncio.to_thread(ReadRecordedWebVTTSidecar, Path(self.recorded_video.file_path))
+            from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
+            sidecar = await KonomiTVBS4KCloudCatalog.artifactPath(self.recorded_video.id, self.recorded_video.file_path, '.vtt')
+            if sidecar is None:
+                return None
+            return await asyncio.to_thread(ReadRecordedWebVTTSidecar, Path(self.recorded_video.file_path), sidecar_path=sidecar)
         if self.getTrackKind(subtitle_index) != 'Text':
             return None
         stream_index = track.get('stream_index')
@@ -342,6 +346,11 @@ class RecordedSubtitleStream:
         async with self.__cacheLock(cache_path):
             if cache_path.is_file():
                 return await asyncio.to_thread(cache_path.read_bytes)
+            from app.utils.KonomiTVBS4KCloudTransferManager import (
+                KonomiTVBS4KCloudTransferManager,
+            )
+            self.recorded_video.file_path = str(await KonomiTVBS4KCloudTransferManager.resolvePath(
+                self.recorded_video.id, self.recorded_video.file_path))
             process = await asyncio.create_subprocess_exec(
                 LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error',
                 *BuildKonomiTVBS4KMMTTLVInputArguments(self.recorded_video.container_format),
@@ -515,6 +524,11 @@ class RecordedSubtitleStream:
                     pass
 
             # fMP4映像タイムラインと同じ録画先頭0秒へPTSを揃えるため、コンテナの開始時刻だけを得る。
+            from app.utils.KonomiTVBS4KCloudTransferManager import (
+                KonomiTVBS4KCloudTransferManager,
+            )
+            self.recorded_video.file_path = str(await KonomiTVBS4KCloudTransferManager.resolvePath(
+                self.recorded_video.id, self.recorded_video.file_path))
             process = await asyncio.create_subprocess_exec(
                 LIBRARY_PATH['FFprobe8'], '-v', 'error',
                 '-show_entries', 'format=start_time', '-of', 'json',
@@ -792,7 +806,11 @@ class RecordedSubtitleStream:
 
         # sidecar は録画本体と別に更新されるため、本体hash由来のcacheを一切再利用しない。
         if track.get('source') == 'Sidecar':
-            sidecar_packets = await asyncio.to_thread(ReadRecordedARIBSidecar, Path(self.recorded_video.file_path))
+            from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
+            sidecar = await KonomiTVBS4KCloudCatalog.artifactPath(self.recorded_video.id, self.recorded_video.file_path, '.vtt')
+            if sidecar is None:
+                return []
+            sidecar_packets = await asyncio.to_thread(ReadRecordedARIBSidecar, Path(self.recorded_video.file_path), sidecar_path=sidecar)
             return [ARIBSubtitlePacket(
                 pts=pts, duration=duration, data=base64.b64encode(data).decode(), is_restore_point=False,
             ) for pts, duration, data in sidecar_packets]
@@ -806,6 +824,11 @@ class RecordedSubtitleStream:
                     return cast(list[ARIBSubtitlePacket], json.loads(await asyncio.to_thread(cache_path.read_text)))
                 except (OSError, json.JSONDecodeError):
                     pass
+            from app.utils.KonomiTVBS4KCloudTransferManager import (
+                KonomiTVBS4KCloudTransferManager,
+            )
+            self.recorded_video.file_path = str(await KonomiTVBS4KCloudTransferManager.resolvePath(
+                self.recorded_video.id, self.recorded_video.file_path))
             process = await asyncio.create_subprocess_exec(
                 LIBRARY_PATH['FFprobe8'], '-v', 'error', '-select_streams', str(stream_index),
                 '-show_packets', '-show_data', '-show_format',

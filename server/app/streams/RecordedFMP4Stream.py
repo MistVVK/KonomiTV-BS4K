@@ -41,6 +41,7 @@ from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.StreamEncodingOptions import StreamEncodingOptions
 from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
 from app.utils.HLSText import sanitizeHLSQuotedString
+from app.utils.KonomiTVBS4KCloudTransferManager import KonomiTVBS4KCloudTransferManager
 from app.utils.KonomiTVBS4KMMTTLV import BuildKonomiTVBS4KMMTTLVInputArguments
 
 
@@ -2482,6 +2483,9 @@ class RecordedFMP4Stream:
         if plan is None:
             return
         command, backend, device, encoder_pixel_format = plan
+        # キャッシュ参照や無音生成にはクラウド接続を要求せず、実入力を開く段階だけ所在を解決する。
+        video = self.recorded_program.recorded_video
+        command[command.index('-i') + 1] = str(await KonomiTVBS4KCloudTransferManager.resolvePath(video.id, video.file_path))
         stdout, stderr, returncode = await self.__runVideoEncodeProcess(
             command,
             backend,
@@ -3198,6 +3202,8 @@ class RecordedFMP4Stream:
             if plan is None:
                 return False
             command, backend, device, encoder_pixel_format = plan
+            video = self.recorded_program.recorded_video
+            command[command.index('-i') + 1] = str(await KonomiTVBS4KCloudTransferManager.resolvePath(video.id, video.file_path))
             return await self.__runContinuousVideoEncodeProcess(
                 command,
                 backend,
@@ -3633,6 +3639,8 @@ class RecordedFMP4Stream:
             normalization_command: list[str] | None = None
             trim_start_samples = 0
             if use_recorded_audio:
+                video = self.recorded_program.recorded_video
+                source_path = str(await KonomiTVBS4KCloudTransferManager.resolvePath(video.id, video.file_path))
                 source_track = self.__getAudioSourceTrack(rendition, configuration_time)
                 source_pid = rendition.pid
                 source_stream_index = rendition.stream_index
@@ -3676,7 +3684,7 @@ class RecordedFMP4Stream:
                         '-analyzeduration', str(self.AUDIO_MPEGTS_ANALYZE_DURATION_MICROSECONDS),
                     ]
                 source_input_arguments += [
-                    '-i', self.recorded_program.recorded_video.file_path,
+                    '-i', source_path,
                     '-t', f'{input_duration:.6f}',
                     '-map', stream_specifier,
                 ]

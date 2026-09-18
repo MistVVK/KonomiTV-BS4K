@@ -15,6 +15,7 @@ from typing import ClassVar, Literal, TypeVar, cast
 
 from app import logging
 from app.config import Config
+from app.constants import DATA_DIR
 from app.models.RecordedVideo import RecordedVideo
 
 
@@ -194,7 +195,11 @@ class RecordedFMP4CacheManager:
         """設定値または元動画の親フォルダから実際の保存先を解決する。"""
 
         configured_folder = Config().video.recorded_fmp4_cache_folder
-        return configured_folder if configured_folder is not None else Path(recorded_video.file_path).parent
+        if configured_folder is not None:
+            return configured_folder
+        # クラウドの読取りmountをキャッシュ書込み先へ流用しない。
+        source = Path(recorded_video.file_path)
+        return DATA_DIR if source.is_relative_to('/cloud-mounts') else source.parent
 
     @classmethod
     def buildPath(
@@ -453,7 +458,8 @@ class RecordedFMP4CacheManager:
             cache_folder = cls.getCacheFolder(recorded_video)
         except AssertionError:
             # サーバー起動前の保守呼び出しでは Config が未初期化でも、既定配置の回収は実行できる。
-            cache_folder = Path(recorded_video.file_path).parent
+            source = Path(recorded_video.file_path)
+            cache_folder = DATA_DIR if source.is_relative_to('/cloud-mounts') else source.parent
         if cache_folder.is_dir() is False:
             return
         current_prefix = f'{cls.FILE_PREFIX}{recorded_video.id}-{recorded_video.file_hash}-'
@@ -487,7 +493,7 @@ class RecordedFMP4CacheManager:
         if configured_folder is not None:
             folders.add(configured_folder)
         file_paths = cast(list[str], await RecordedVideo.all().values_list('file_path', flat=True))
-        folders.update(Path(file_path).parent for file_path in file_paths)
+        folders.update(DATA_DIR if Path(file_path).is_relative_to('/cloud-mounts') else Path(file_path).parent for file_path in file_paths)
         for folder in folders:
             if folder.is_dir() is False:
                 continue

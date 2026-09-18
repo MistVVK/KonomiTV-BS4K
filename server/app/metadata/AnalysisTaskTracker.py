@@ -7,6 +7,8 @@ from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta
 
+from tortoise.transactions import in_transaction
+
 from app import logging
 from app.constants import JST
 from app.models.AnalysisTask import (
@@ -173,9 +175,23 @@ class AnalysisTaskHandle:
             if error_message
             else None
         )
-        await self.execution.save(update_fields=[
+        update_fields = [
             'status', 'completed_at', 'progress', 'stage_history', 'summary', 'error_code', 'error_message', 'updated_at',
-        ])
+        ]
+        # 完成結果の公開要求を履歴の成功と同じcommitへ含め、終了直後の再起動でも失わない。
+        from app.utils.KonomiTVBS4KCloudTransferManager import (
+            KonomiTVBS4KCloudTransferManager,
+        )
+        if (status == 'Succeeded' and self.execution.recorded_video_id is not None and
+            self.execution.task_type in ('MetadataAnalysis', 'PlaybackIndex', 'ThumbnailGeneration', 'CMAnalysis', 'BackgroundAnalysis') and
+            (KonomiTVBS4KCloudTransferManager.protects(self.execution.recorded_video_id) or
+             (self.execution.file_path or '').startswith('/cloud-mounts/'))):
+            from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
+            async with in_transaction() as db:
+                await self.execution.save(using_db=db, update_fields=update_fields)
+                await KonomiTVBS4KCloudCatalog.requestPublication(self.execution)
+        else:
+            await self.execution.save(update_fields=update_fields)
         self.terminal = True
 
 
