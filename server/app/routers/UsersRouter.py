@@ -50,6 +50,7 @@ from app.utils.AuthSecurity import (
     GetUsernameRateLimitKey,
     HashRefreshToken,
 )
+from app.utils.KonomiTVBS4KCloudRC import KonomiTVBS4KCloudRC
 from app.utils.KonomiTVBS4KCloudStorage import KonomiTVBS4KCloudStorage
 
 
@@ -878,6 +879,8 @@ async def DeleteUserWithKonomiTVBS4KCloudCredentials(user: User) -> None:
     try:
         # 接続操作と同じlockをDB削除前に取得する。使用中ならアカウントも認証も残す。
         with KonomiTVBS4KCloudStorage.ownerLock(user.id) as root:
+            # tokenを書き戻す旧プロセスを止められない場合は、ユーザー削除前に失敗させる。
+            await asyncio.to_thread(KonomiTVBS4KCloudRC.stop, user.id)
             # 削除と管理者数確認を同じトランザクションに置き、管理者0人への競合を防ぐ。
             async with in_transaction() as connection:
                 await user.delete(using_db=connection)

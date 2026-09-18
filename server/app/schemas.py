@@ -236,6 +236,7 @@ class RecordedVideo(PydanticModel):
     status: Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed', 'Deleting', 'DeleteFailed']
     # 内部では再生・解析・削除に必要な runtime path を保ち、JSON 境界でだけホスト表現へ戻す。
     file_path: Annotated[str, PlainSerializer(SerializeHostPath, return_type=str, when_used='json')]
+    storage_location: Literal['Local', 'Cloud'] = 'Local'
     file_hash: str
     file_size: int
     file_created_at: datetime

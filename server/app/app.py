@@ -48,7 +48,9 @@ from app.routers import (
     CMAnalysisRouter,
     DataBroadcastingRouter,
     KonomiTVBS4KBangumiRouter,
+    KonomiTVBS4KCloudCryptKeysRouter,
     KonomiTVBS4KCloudStorageRouter,
+    KonomiTVBS4KCloudTransfersRouter,
     KonomiTVBS4KCodecSupportRouter,
     KonomiTVBS4KSpeedTestRouter,
     LiveStreamsRouter,
@@ -74,7 +76,9 @@ from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
 from app.utils.HTTPS import BuildServerStartupSettings, ReverseProxyMiddleware
+from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
 from app.utils.KonomiTVBS4KCloudStorage import KonomiTVBS4KCloudStorage
+from app.utils.KonomiTVBS4KCloudTransferManager import KonomiTVBS4KCloudTransferManager
 from app.utils.KonomiTVBS4KCodecSupport import KonomiTVBS4KCodecSupportJobManager
 from app.utils.KonomiTVBS4KRequestBodyLimit import (
     MULTIPART_FORM_DATA_OVERHEAD_BYTES,
@@ -146,6 +150,8 @@ app.include_router(MaintenanceRouter.router)
 app.include_router(VersionRouter.router)
 app.include_router(KonomiTVBS4KSpeedTestRouter.router)
 app.include_router(KonomiTVBS4KCloudStorageRouter.router)
+app.include_router(KonomiTVBS4KCloudTransfersRouter.router)
+app.include_router(KonomiTVBS4KCloudCryptKeysRouter.router)
 # コーデック対応のサーバー診断は本線 API だけへ登録し、互換 API には露出させない。
 app.include_router(KonomiTVBS4KCodecSupportRouter.router)
 # Bangumi 連携は本線 API だけへ登録し、互換 API には露出させない。
@@ -404,6 +410,9 @@ async def Startup():
     await RecordedSubtitleStream.cleanupOrphanedCaches()
 
     # 録画フォルダ監視・メタデータ更新/同期タスクを開始
+    # クラウド所在と未完了移動の保持ガードは、スキャナーの不在回収より先に復旧する。
+    await KonomiTVBS4KCloudTransferManager.start()
+    await KonomiTVBS4KCloudCatalog.start()
     ## 録画ファイルの量次第では録画ファイルの更新確認に時間がかかるため、非同期で実行する
     # ref: https://docs.astral.sh/ruff/rules/asyncio-dangling-task/
     recorded_scan_task = RecordedScanTask()
@@ -505,6 +514,9 @@ async def _RunShutdownCleanup() -> None:
         await RunCleanupStep('[EDCBTuner]', EDCBTuner.closeAll())
 
     # 録画フォルダ監視タスクを停止
+    # 移動workerが保持するpath lockと同期I/Oを先に回収し、スキャナー停止との待ち合いを防ぐ。
+    await RunCleanupStep('[KonomiTVBS4KCloudCatalog]', KonomiTVBS4KCloudCatalog.stop())
+    await RunCleanupStep('[KonomiTVBS4KCloudTransferManager]', KonomiTVBS4KCloudTransferManager.stop())
     global recorded_scan_task
     if recorded_scan_task is not None:
         scan_stop_succeeded, _scan_stop_result = await RunCleanupStep(

@@ -22,10 +22,12 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from starlette.datastructures import Headers
 from tortoise import connections
+from tortoise.transactions import in_transaction
 
 from app import logging, schemas
 from app.constants import STATIC_DIR, THUMBNAILS_DIR
 from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
+from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.RecordedPlaybackIndex import (
     RECORDED_PLAYBACK_INDEX_VERSION,
@@ -37,6 +39,7 @@ from app.metadata.SeriesIndexer import NormalizeSeriesTitle, ParseSeriesTitle
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.models.CMAnalysis import RecordedVideoCMAnalysis, RecordedVideoCMResult
+from app.models.KonomiTVBS4KCloudTransfer import KonomiTVBS4KCloudRecording
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
 from app.models.Series import Series
@@ -48,6 +51,8 @@ from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.JikkyoClient import JikkyoClient
+from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
+from app.utils.KonomiTVBS4KCloudTransferManager import KonomiTVBS4KCloudTransferManager
 
 
 # ルーター
@@ -215,6 +220,7 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         'id': row['rv_id'],
         'status': row['status'],
         'file_path': row['file_path'],
+        'storage_location': 'Cloud' if row['file_path'].startswith('/cloud-mounts/') else 'Local',
         'file_hash': row['file_hash'],
         'file_size': row['file_size'],
         'file_created_at': row['file_created_at'],
@@ -1147,7 +1153,9 @@ async def VideoDownloadAPI(
     指定された録画番組のファイルをダウンロードする。
     """
 
-    file_path = anyio.Path(recorded_program.recorded_video.file_path)
+    file_path = anyio.Path(await KonomiTVBS4KCloudTransferManager.resolvePath(
+        recorded_program.recorded_video.id, recorded_program.recorded_video.file_path,
+    ))
     filename = file_path.name
 
     # 録画ファイルが消えていると FileResponse が 500 になるため、通常ファイルの存在を先に確認する
@@ -1257,10 +1265,9 @@ async def VideoJikkyoCommentsAPI(
             # PSI/SI の書庫があればそこから動画のカット編集情報を抽出して過去ログコメントのタイミングを調節する
             # TODO: コメントリストの時刻などは調節前のほうが望ましいので schemas.JikkyoComment に項目を追加すべき
             ## 書庫の解析に失敗しても過去ログコメント API 自体はエラーにせず、補正なしのコメントをそのまま返す
-            tot_time_list = await asyncio.to_thread(
-                ExtractTOTTimeListFromPSCArchive,
-                pathlib.Path(recorded_program.recorded_video.file_path).with_suffix('.psc'),
-            )
+            psc_path = await KonomiTVBS4KCloudCatalog.artifactPath(
+                recorded_program.recorded_video.id, recorded_program.recorded_video.file_path, '.psc')
+            tot_time_list = [] if psc_path is None else await asyncio.to_thread(ExtractTOTTimeListFromPSCArchive, psc_path)
 
             if len(tot_time_list) >= 2:
                 # TOT 時刻を開始時刻からの相対秒数に変換する
@@ -1471,6 +1478,8 @@ async def VideoDeleteAPI(
 
     # 録画ファイルの情報を取得する
     # 実際の削除対象は DB に保存されたパスのままとし、スキャナーとの排他だけcanonical pathへ統一する
+    if KonomiTVBS4KCloudTransferManager.isActive(recorded_program.recorded_video.id):
+        raise HTTPException(409, 'Recording is owned by an unfinished cloud transfer.')
     file_path = anyio.Path(recorded_program.recorded_video.file_path)
     recorded_scan_task = RecordedScanTask()
     lock_file_path = await recorded_scan_task.resolveRecordedPath(file_path)
@@ -1479,7 +1488,14 @@ async def VideoDeleteAPI(
     file_dir = file_path.parent
 
     # スキャナーの解析・DB更新と削除を同じpath lockで直列化し、削除中のレコードが再生成される競合を防ぐ
-    async with recorded_scan_task.fileLock(lock_file_path):
+    async with recorded_scan_task.fileLock(lock_file_path), CMAnalysisOrchestrator.recordingLock(recorded_program.recorded_video.id):
+        if KonomiTVBS4KCloudTransferManager.isActive(recorded_program.recorded_video.id):
+            raise HTTPException(409, 'Recording is owned by an unfinished cloud transfer.')
+        is_cloud = str(file_path).startswith('/cloud-mounts/')
+        if is_cloud or KonomiTVBS4KCloudTransferManager.protects(recorded_program.recorded_video.id):
+            current = await RecordedVideo.get_or_none(id=recorded_program.recorded_video.id)
+            if current is None or current.file_path != str(file_path):
+                raise HTTPException(409, 'Recording location changed before deletion.')
         # 同じ file_hash の録画が存在する場合、共有サムネイルは削除しない
         duplicate_records = await RecordedProgram.filter(
             recorded_video__file_hash=file_hash,
@@ -1512,6 +1528,11 @@ async def VideoDeleteAPI(
             deletion_stage = 'fMP4 cache files'
             await RecordedFMP4CacheManager.deleteForRecordedVideo(recorded_program.recorded_video)
 
+            if is_cloud:
+                # mount経由のunlinkは行わず、固定した領域の削除マーカーを先に永続化してRCで回収する。
+                deletion_stage = 'cloud recording files'
+                await KonomiTVBS4KCloudCatalog.deleteFiles(recorded_video_id)
+
             # 3. サムネイルファイルを削除する
             # 同じ file_hash を持つ他のレコードが存在する場合は共有中なのでスキップする
             deletion_stage = 'thumbnail files'
@@ -1534,6 +1555,15 @@ async def VideoDeleteAPI(
                         logging.warning(f'[VideoDeleteAPI] Tile thumbnail file does not exist: {tile_thumbnail_path}')
             elif has_duplicates:
                 logging.info(f'[VideoDeleteAPI] Skip deleting thumbnail files because other records with the same file_hash exist: {file_hash}')
+
+            if is_cloud:
+                # 未転送のローカル補助ファイルには触れない。所在と登録の除去は同じtransactionで行う。
+                deletion_stage = 'cloud database record'
+                async with in_transaction() as db:
+                    await KonomiTVBS4KCloudRecording.filter(recorded_video_id=recorded_video_id).using_db(db).delete()
+                    await recorded_program.delete(using_db=db)
+                await KonomiTVBS4KCloudTransferManager.refresh()
+                return
 
             # 4. 関連する補助ファイルを削除する (.ts.program.txt, .ts.err, .vtt)
             deletion_stage = 'program information file'
