@@ -131,12 +131,15 @@ public:
     }
 
     void onMhSdtSnapshot(const aribtlv::MhSdtSnapshot& snapshot) override {
-        // SDT はスナップショットなので、同一 context の古いサービスを一度除去する。
-        for (auto iterator = services_.begin(); iterator != services_.end();) {
-            if (std::get<0>(iterator->first) == snapshot.context_id) {
-                iterator = services_.erase(iterator);
-            } else {
-                ++iterator;
+        // streaming consumer には現在の完全 SDT snapshot だけを返す。
+        // 録画解析では先頭・末尾の別 window で異なるサービスの SDT が現れるため、観測済みサービスを保持する。
+        if (streaming_) {
+            for (auto iterator = services_.begin(); iterator != services_.end();) {
+                if (std::get<0>(iterator->first) == snapshot.context_id) {
+                    iterator = services_.erase(iterator);
+                } else {
+                    ++iterator;
+                }
             }
         }
         for (const auto& service : snapshot.services) {
@@ -183,8 +186,14 @@ public:
     }
 
     void onEventInfo(const aribtlv::EventInfo& event) override {
-        // EIT の再送では input offset が後の情報を優先し、同じイベントを重複出力しない。
-        const auto key = std::tuple{event.context_id, event.service_id, event.event_id};
+        // p/f と schedule は同じ event_id でも記述子の充足度が異なるため、table ごとに保持する。
+        // 同じ table の再送だけ input offset が後の情報を優先し、同一内容を重複出力しない。
+        const auto key = std::tuple{
+            event.context_id,
+            event.service_id,
+            event.event_id,
+            event.table_id,
+        };
         const auto found = events_.find(key);
         if (found == events_.end() || found->second.input_offset <= event.input_offset) {
             events_[key] = event;
@@ -436,7 +445,10 @@ private:
     };
 
     std::map<std::tuple<std::uint32_t, std::uint16_t>, ServiceRecord> services_;
-    std::map<std::tuple<std::uint32_t, std::uint16_t, std::uint16_t>, aribtlv::EventInfo> events_;
+    std::map<
+        std::tuple<std::uint32_t, std::uint16_t, std::uint16_t, std::uint8_t>,
+        aribtlv::EventInfo
+    > events_;
     struct TotRange {
         aribtlv::MhTotInfo first;
         aribtlv::MhTotInfo last;
