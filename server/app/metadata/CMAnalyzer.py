@@ -21,7 +21,6 @@ import av
 from typing_extensions import TypedDict
 
 from app import logging
-from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_FILE_EXTENSIONS
 
 
 CMAnalyzerStatus = Literal[
@@ -34,6 +33,7 @@ CMDecodeMode = Literal['Hardware', 'CPU']
 KonomiTVBS4KLogicalAudioRebuildPreference = Literal['PyAV', 'FFmpegAfterPreviousFailure']
 KonomiTVBS4KLogicalAudioRebuildStrategy = Literal[
     'PyAV',
+    'FFmpegPrimaryMMTTLV',
     'FFmpegPrimaryAfterPreviousFailure',
     'FFmpegFallbackAfterSignal',
     'FFmpegFallbackAfterReportedFailure',
@@ -555,13 +555,6 @@ class GenericCMAnalyzer:
     async def resolveInputDescriptor(self, request: CMAnalyzerRequest) -> CMInputDescriptor:
         """FFprobe の実データから対象 stream を決定する。"""
 
-        # 現行の LGPL CM runtime は libaribtlv をリンクしないため、同じ入力での再試行を行わない。
-        if request.recorded_file_path.suffix.lower() in MMT_TLV_FILE_EXTENSIONS:
-            raise CMInputUnsupportedError(
-                'ContainerUnsupportedMMTTLV',
-                'MMT/TLV recordings are not supported by the CM analysis pipeline.',
-            )
-
         process = await self._runProcess((
             str(self.ffprobe_path),
             '-v', 'error',
@@ -1063,7 +1056,40 @@ class GenericCMAnalyzer:
         published_paths: list[Path] = []
         logical_audio_strategy: KonomiTVBS4KLogicalAudioRebuildStrategy = 'PyAV'
         try:
-            if request.konomitv_bs4k_logical_audio_rebuild_preference == 'FFmpegAfterPreviousFailure':
+            if descriptor.format_name == 'libaribtlv':
+                # PyPI版PyAVはlibaribtlvを持たないため、MMT/TLVだけは最初から
+                # 再生用FFmpeg 8で論理音声0を固定PCM WAVへ正規化する。
+                logical_audio_strategy = 'FFmpegPrimaryMMTTLV'
+                logging.info(
+                    '[CMAnalyzer] AudioRebuildPrimary=FFmpeg; '
+                    'Reason=MMTTLVContainer; '
+                    f'StreamMap=0:{descriptor.audio_stream_index}'
+                )
+                audio_process = await self._rebuildLogicalAudioWithFFmpeg(
+                    request,
+                    descriptor,
+                    raw_audio_partial_path,
+                    environment,
+                )
+                audio_validation_error = self._validatePreparedWAV(raw_audio_partial_path)
+                if audio_process.return_code != 0 or audio_validation_error is not None:
+                    audio_diagnostic = (
+                        audio_process.diagnostic
+                        if audio_process.return_code != 0
+                        else f'InvalidWAV: {audio_validation_error}'
+                    )
+                    self._removeFiles(temporary_paths)
+                    return _ProcessResult(
+                        audio_process.return_code or -1,
+                        '',
+                        (
+                            'AudioRebuildPrimary=FFmpeg failed for MMT/TLV: '
+                            f'{audio_diagnostic or "FFmpeg did not produce logical audio."}'
+                        ),
+                        logical_audio_strategy,
+                    )
+                logging.info('[CMAnalyzer] AudioRebuildPrimary=FFmpeg completed for MMT/TLV.')
+            elif request.konomitv_bs4k_logical_audio_rebuild_preference == 'FFmpegAfterPreviousFailure':
                 # 同一入力で過去にMediaPreparationFailedまたはsignal fallbackを確認済みなら、
                 # 捕捉不能なPyAV native crashを再現させず、既に成功実績のある同一stream固定
                 # FFmpeg経路を主経路として使う。初回入力では従来どおりStreamReform準拠
