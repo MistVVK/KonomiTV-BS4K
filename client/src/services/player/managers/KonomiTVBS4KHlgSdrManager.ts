@@ -53,31 +53,37 @@ float inversePqEotf(float signal) {
     return 10000.0 * pow(numerator / denominator, 1.0 / m1);
 }
 
-float prototypeToneMap(float hdr_luminance) {
-    const float k1 = 0.83802;
-    const float k2 = 15.09968;
-    const float k3 = 0.74204;
-    const float k4 = 78.99439;
+float methodCToneMap(float hdr_luminance) {
+    // ITU-R BT.2446-1 Method C §6.1.4 式(5)の線形・対数トーンマップを適用する。
+    const float k1 = 0.83802;  // 式(5)の線形gain、式(10)の96% SDR例示値。
+    const float k2 = 15.09968;  // 式(7)の連続条件、式(10)の96% SDR例示値。
+    const float k3 = 0.74204;  // 式(9)の白レベル条件、式(10)の96% SDR例示値。
+    const float k4 = 78.99439;  // 式(8)の連続条件、式(10)の96% SDR例示値。
+    // 式(6): SDR knee 58.5 cd/m²からHDR側の変曲点を求める。
     float inflection = 58.5 / k1;
-    float mapped = hdr_luminance < inflection
+    return hdr_luminance < inflection
         ? k1 * hdr_luminance
         : k2 * log(hdr_luminance / inflection - k3) + k4;
-    const float reference_white = 90.7;
-    const float method_peak = 118.4;
-    if (mapped <= reference_white) {
-        return clamp01(mapped / 100.0);
-    }
-    float ratio = clamp01((mapped - reference_white) / (method_peak - reference_white));
-    return reference_white / 100.0 + (1.0 - reference_white / 100.0) * (2.0 * ratio - ratio * ratio);
 }
 
-float prototypeSdrLumaFit(float luminance) {
-    float input_value = clamp01(luminance);
-    const float contrast = 1.7;
-    return input_value / (input_value + contrast * (1.0 - input_value));
+float adaptMethodCHeadroomForSrgbCanvas(float method_c_luminance) {
+    // Method CはTable 1で0〜109% SDR（約120 cd/m²）を許容し、100%超は表示側でclipする前提。
+    // 一方、sRGB canvasは100%超を保持できないため、規格のheadroomをそのまま渡すと急峻に白飛びする。
+    // 式(10)のHDR Reference White（96% SDR = 線形90.7 cd/m²）以下は動かさず、
+    // 1000 cd/m² HLGのMethod C出力118.4 cd/m²までだけを90.7〜100 cd/m²へ滑らかに圧縮する。
+    const float reference_white = 90.7;
+    const float method_peak = 118.4;
+    if (method_c_luminance <= reference_white) {
+        return clamp(method_c_luminance, 0.0, reference_white);
+    }
+    float ratio = clamp01((method_c_luminance - reference_white) / (method_peak - reference_white));
+    return reference_white + (100.0 - reference_white) * (2.0 * ratio - ratio * ratio);
 }
 
 vec3 softMapBt709Gamut(vec3 color) {
+    // ITU-R BT.2407 §3とAnnexesは複数方式を示し、Conclusionは単一の最良方式を定めない。
+    // §2.4のhard clipによる色相変化とディテール損失を避けるため、BT.709輝度を保ったまま、
+    // 低彩度色は変更せず、境界の50%を超えた彩度だけを同じ色相方向でsoft compressionする。
     const vec3 weights = vec3(0.2126, 0.7152, 0.0722);
     float luma = clamp01(dot(color, weights));
     if (luma <= 0.0) return vec3(0.0);
@@ -101,6 +107,8 @@ vec3 softMapBt709Gamut(vec3 color) {
 }
 
 float srgbOetf(float linear) {
+    // BT.2446-1 §6.1.7のBT.1886逆EOTFはSDR映像信号の生成用。
+    // ここは信号を生成せず既定sRGB framebufferへ表示するため、線形Method C出力をsRGBで符号化する。
     float value = clamp01(linear);
     return value <= 0.0031308 ? 12.92 * value : 1.055 * pow(value, 1.0 / 2.4) - 0.055;
 }
@@ -125,6 +133,7 @@ vec3 mapToneMappedRgb(vec3 input_rgb, int source) {
     }
 
     vec3 display = scene * 1000.0;
+    // ITU-R BT.2446-1 Method C §6.1.2 式(2): αは0≤α≤0.33、本実装は0.075を維持する。
     const float crosstalk = 0.075;
     float sum = display.r + display.g + display.b;
     display = (1.0 - 3.0 * crosstalk) * display + crosstalk * sum;
@@ -139,24 +148,26 @@ vec3 mapToneMappedRgb(vec3 input_rgb, int source) {
         -0.3557, 1.6165, -0.0428,
         -0.2534, 0.0158, 0.9421
     );
+    // §6.1.8のHDR Reference White超え彩度補正は任意のため適用せず、元の色相を維持する。
     vec3 xyz = bt2020_to_xyz * display;
     if (xyz.g <= 0.0) return vec3(0.0);
-    xyz *= 100.0 * prototypeToneMap(xyz.g) / xyz.g;
+    float method_c_luminance = methodCToneMap(xyz.g);
+    // §6.1.5 式(11)(12): XYZを同じ比率でscaleし、式(4)で得るxyを維持したままYだけを置換する。
+    xyz *= adaptMethodCHeadroomForSrgbCanvas(method_c_luminance) / xyz.g;
     vec3 sdr2020 = xyz_to_bt2020 * xyz;
     float inverse = 1.0 / (1.0 - 3.0 * crosstalk);
     float sdr_sum = sdr2020.r + sdr2020.g + sdr2020.b;
     sdr2020 = inverse * ((1.0 - crosstalk) * sdr2020 - crosstalk * (sdr_sum - sdr2020));
     sdr2020 /= 100.0;
 
+    // ITU-R BT.2407 §2 式(1)。同節NOTEの4桁丸め前に相当する既存の高精度係数を維持する。
     const mat3 bt2020_to_bt709 = mat3(
         1.660491, -0.124550, -0.018151,
         -0.587641, 1.132900, -0.100579,
         -0.072850, -0.008350, 1.118730
     );
     vec3 sdr709 = bt2020_to_bt709 * sdr2020;
-    float sdr_luma = dot(sdr709, vec3(0.2126, 0.7152, 0.0722));
-    if (sdr_luma <= 0.0) return vec3(0.0);
-    sdr709 = softMapBt709Gamut(sdr709 * (prototypeSdrLumaFit(sdr_luma) / sdr_luma));
+    sdr709 = softMapBt709Gamut(sdr709);
     return vec3(srgbOetf(sdr709.r), srgbOetf(sdr709.g), srgbOetf(sdr709.b));
 }
 
