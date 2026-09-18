@@ -27,27 +27,54 @@ from app.constants import DATABASE_CONFIG, JST, LIBRARY_PATH, STATIC_DIR, THUMBN
 from app.models.RecordedVideo import RecordedVideo
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_CONTAINER_FORMAT
+from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
 
 
-# HDR (HLG/PQ) 録画の検出とトーンマップの単一定義 (task: bs4k-thumbnail-hdr-tonemap)
+# HDR (HLG/PQ) 録画の検出と BT.2446-1 Method C 変換の単一定義
 ## 検出は映像ストリームメタデータ駆動とし、チャンネル属性では判定しない
 _AV_COLOR_PRIMARIES_BT2020 = 9  # AVColorPrimaries の bt2020
-# PyAV が返す color_transfer の数値 (AVColorTransferCharacteristic) と VUI 名の対応 (検出条件に使う3種のみ)
-_AV_COLOR_TRANSFER_NAMES: dict[int, str] = {
-    14: 'bt2020-10',
+# PyAV が返す color_transfer のうち、規格上 HDR を示す VUI 値だけを変換対象にする。
+## 14 (BT.2020 10-bit) は WCG SDR であり、HLG として扱わない
+_AV_HDR_COLOR_TRANSFERS: dict[int, str] = {
     16: 'smpte2084',
     18: 'arib-std-b67',
 }
-# VUI 上の transfer 名と、HDR の実体として FFmpeg8 へ渡す transfer 名の対応
-## BS4K の HLG は bt2020-10 または arib-std-b67 を名乗るため、どちらも実体の arib-std-b67 として扱う
-_HDR_INPUT_TRANSFER_MAP: dict[str, str] = {
-    'bt2020-10': 'arib-std-b67',
-    'smpte2084': 'smpte2084',
-    'arib-std-b67': 'arib-std-b67',
+# ARIB STD-B60 Table 7-51 の video_transfer_characteristics と HDR transfer の対応。
+## 1=BT.709、2=IEC 61966-2-4、3=BT.2020 はいずれも SDR
+_B60_HDR_VIDEO_TRANSFERS: dict[int, str] = {
+    4: 'smpte2084',
+    5: 'arib-std-b67',
 }
-# トーンマップアルゴリズム。基準の bt2390 は同梱 FFmpeg8 (n8.1.2, libplacebo 無し) に搭載されていないため、
-## director 裁定により実行可能な mobius を使う
-_HDR_TONEMAP_ALGORITHM = 'mobius'
+_B60_SDR_VIDEO_TRANSFERS = frozenset({1, 2, 3})
+
+# card-32 の再生 canvas と同じ BT.2446-1 Method C 式(5)～(10)・表示適応の係数。
+_METHOD_C_K1 = np.float32(0.83802)
+_METHOD_C_K2 = np.float32(15.09968)
+_METHOD_C_K3 = np.float32(0.74204)
+_METHOD_C_K4 = np.float32(78.99439)
+_METHOD_C_INFLECTION = np.float32(58.5) / _METHOD_C_K1
+_METHOD_C_REFERENCE_WHITE = np.float32(90.7)
+_METHOD_C_PEAK = np.float32(118.4)
+_METHOD_C_CROSSTALK = np.float32(0.075)
+_METHOD_C_CHUNK_HEIGHT = 270
+
+_METHOD_C_BT2020_TO_XYZ = np.array([
+    [0.6370, 0.1446, 0.1689],
+    [0.2627, 0.6780, 0.0593],
+    [0.0000, 0.0281, 1.0610],
+], dtype=np.float32)
+_METHOD_C_XYZ_TO_BT2020 = np.array([
+    [1.7167, -0.3557, -0.2534],
+    [-0.6667, 1.6165, 0.0158],
+    [0.0176, -0.0428, 0.9421],
+], dtype=np.float32)
+_METHOD_C_BT2020_TO_BT709 = np.array([
+    [1.660491, -0.587641, -0.072850],
+    [-0.124550, 1.132900, -0.008350],
+    [-0.018151, -0.100579, 1.118730],
+], dtype=np.float32)
+_BT709_LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+_METHOD_C_LUTS: dict[str, NDArray[np.uint8]] = {}
 
 
 class HDRTonemapConversionError(RuntimeError):
@@ -56,7 +83,7 @@ class HDRTonemapConversionError(RuntimeError):
 
 def _DetectHDRInputTransfer(color_primaries: int, color_transfer: int) -> str | None:
     """
-    映像ストリームメタデータが HDR (HLG/PQ) を示す場合に、FFmpeg8 投入用の transfer 名を返す。
+    VUI が HDR (HLG/PQ) を示す場合に Method C 入力用の transfer 名を返す。
 
     Args:
         color_primaries (int): 映像ストリームの color_primaries (AVColorPrimaries)。
@@ -66,115 +93,299 @@ def _DetectHDRInputTransfer(color_primaries: int, color_transfer: int) -> str | 
         str | None: 'arib-std-b67' または 'smpte2084'。SDR・不明の場合は None。
     """
 
-    # color_primaries == bt2020 かつ color_transfer が bt2020-10 / smpte2084 / arib-std-b67 の場合だけ HDR とみなす
+    # BT.2020 primaries と、HDR を直接表す PQ / HLG transfer の組み合わせだけを HDR とみなす。
+    ## transfer=14 は ARIB STD-B32 でも BT.2020 SDR と規定されているため対象外
     if color_primaries != _AV_COLOR_PRIMARIES_BT2020:
         return None
-    transfer_name = _AV_COLOR_TRANSFER_NAMES.get(color_transfer)
-    if transfer_name is None:
-        return None
-    return _HDR_INPUT_TRANSFER_MAP[transfer_name]
+    return _AV_HDR_COLOR_TRANSFERS.get(color_transfer)
 
 
-def _BuildHDRTonemapFilter(input_transfer: str | None = None) -> str:
+def _DetectHDRInputTransferFromB60(
+    video_transfer_characteristics: int | None,
+    hdr_wcg_idc: int | None,
+) -> tuple[bool, str | None]:
     """
-    HDR→SDR トーンマップのフィルタチェーンを返す (3 抽出経路で共有する単一の定義)。
-
-    rawvideo パイプ投入の経路 (PyAV 直 / tsreadex) は demuxer の入力オプションで色タグを付けるため
-    tin= は不要。MMT/TLV 経路は FFmpeg8 自身がデコードし、decoder が VUI を読んでフレームへ
-    VUI の transfer を設定するため (入力オプション -color_trc は decoder が VUI で上書きして効かない)、
-    先頭 zscale の tin= で実体の transfer を指定する必要がある。
+    B60 descriptor だけで HDR transfer または SDR を確定できるかを返す。
 
     Args:
-        input_transfer (str | None): MMT/TLV 経路で先頭 zscale の tin= へ設定する transfer 名。
+        video_transfer_characteristics (int | None): B60 Table 7-51 の transfer 値。
+        hdr_wcg_idc (int | None): B60 Table 7-39-1 の HDR/WCG 分類。
 
     Returns:
-        str: zscale+tonemap のフィルタチェーン (format=bgr24 で終わる)。
+        tuple[bool, str | None]: (descriptor だけで確定したか, HDR transfer)。
+            SDR と確定した場合は (True, None)、取得不能または曲線を特定できない場合は (False, None)。
     """
 
-    first_stage = 'zscale=transfer=linear'
-    if input_transfer is not None:
-        first_stage = f'zscale=tin={input_transfer}:transfer=linear'
-    return (
-        f'{first_stage},'
-        f'tonemap={_HDR_TONEMAP_ALGORITHM},'
-        'zscale=primaries=bt709:transfer=bt709:matrix=bt709,'
-        'format=bgr24'
+    # transfer descriptor は変換曲線を直接表すため、HDR_WCG_idc より具体的な第一根拠として扱う。
+    if video_transfer_characteristics in _B60_HDR_VIDEO_TRANSFERS:
+        return (True, _B60_HDR_VIDEO_TRANSFERS[video_transfer_characteristics])
+    if video_transfer_characteristics in _B60_SDR_VIDEO_TRANSFERS:
+        return (True, None)
+
+    # HDR_WCG_idc=0/1 は SDR、2 は HDR だが HLG/PQ の曲線までは識別できない。
+    ## 2 の場合だけ VUI による曲線識別へフォールバックする
+    if hdr_wcg_idc in (0, 1):
+        return (True, None)
+    return (False, None)
+
+
+def _ApplyHDRSDRMethodCDirect(
+    bgr_image: NDArray[np.uint8],
+    input_transfer: str,
+) -> NDArray[np.uint8]:
+    """
+    HLG/PQ の信号値を BT.2446-1 Method C で sRGB の SDR BGR へ変換する。
+
+    Args:
+        bgr_image (NDArray[np.uint8]): HLG/PQ 信号値を保持した BGR 8-bit 配列。
+        input_transfer (str): 'arib-std-b67' または 'smpte2084'。
+
+    Returns:
+        NDArray[np.uint8]: card-32 の再生 canvas と同じ変換を適用した BGR 8-bit 配列。
+
+    Raises:
+        ValueError: 入力配列または transfer が対象外の場合。
+    """
+
+    if bgr_image.dtype != np.uint8 or bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+        raise ValueError('Method C input must be an uint8 BGR image.')
+    if input_transfer not in ('arib-std-b67', 'smpte2084'):
+        raise ValueError(f'Unsupported HDR transfer: {input_transfer}')
+
+    # 4K 全体を一度に float32 化すると中間配列だけで GiB 級になり、並列スキャンでメモリ帯域を圧迫する。
+    ## 画素ごとに独立した変換なので、スコアリング画像と同じ270行ずつ処理して出力だけを全解像度で保持する
+    if bgr_image.shape[0] > _METHOD_C_CHUNK_HEIGHT:
+        converted_image = np.empty_like(bgr_image)
+        for y in range(0, bgr_image.shape[0], _METHOD_C_CHUNK_HEIGHT):
+            converted_image[y:y + _METHOD_C_CHUNK_HEIGHT] = _ApplyHDRSDRMethodCDirect(
+                bgr_image[y:y + _METHOD_C_CHUNK_HEIGHT],
+                input_transfer,
+            )
+        return converted_image
+
+    # PyAV / FFmpeg が YUV から作った信号値の BGR を、canvas shader と同じ RGB 順・0～1へ揃える。
+    rgb = bgr_image[..., ::-1].astype(np.float32) / np.float32(255.0)
+    if input_transfer == 'smpte2084':
+        # BT.2100 PQ inverse EOTF。戻り値は絶対輝度 cd/m²。
+        m1 = np.float32(2610.0 / 16384.0)
+        m2 = np.float32(2523.0 / 32.0)
+        c1 = np.float32(3424.0 / 4096.0)
+        c2 = np.float32(2413.0 / 128.0)
+        c3 = np.float32(2392.0 / 128.0)
+        raised = np.power(rgb, np.float32(1.0) / m2)
+        numerator = np.maximum(raised - c1, np.float32(0.0))
+        denominator = np.maximum(c2 - c3 * raised, np.float32(1e-6))
+        display = np.float32(10000.0) * np.power(numerator / denominator, np.float32(1.0) / m1)
+    else:
+        # BT.2100 HLG inverse OETF と 1000 cd/m² display OOTF (system gamma 1.2)。
+        a = np.float32(0.17883277)
+        b = np.float32(0.28466892)
+        c = np.float32(0.55991073)
+        scene = np.where(
+            rgb <= np.float32(0.5),
+            rgb * rgb / np.float32(3.0),
+            (np.exp((rgb - c) / a) + b) / np.float32(12.0),
+        )
+        scene_luma = np.sum(scene * np.array([0.2627, 0.6780, 0.0593], dtype=np.float32), axis=2)
+        display = scene * (
+            np.float32(1000.0) * np.power(np.maximum(scene_luma, np.float32(0.0)), np.float32(0.2))
+        )[..., np.newaxis]
+
+    # BT.2446-1 §6.1.2 式(2)。card-32 と同じ crosstalk α=0.075 を適用する。
+    display_sum = np.sum(display, axis=2, keepdims=True)
+    display = (
+        (np.float32(1.0) - np.float32(3.0) * _METHOD_C_CROSSTALK) * display +
+        _METHOD_C_CROSSTALK * display_sum
     )
+
+    # §6.1.3～§6.1.5。BT.2020 RGB→XYZ 後、式(5)～(10)で Y だけを置換して xy を維持する。
+    xyz = display @ _METHOD_C_BT2020_TO_XYZ.T
+    hdr_luminance = xyz[..., 1]
+    positive_luminance = hdr_luminance > np.float32(0.0)
+    method_c_luminance = np.zeros_like(hdr_luminance)
+    linear_region = positive_luminance & (hdr_luminance < _METHOD_C_INFLECTION)
+    method_c_luminance[linear_region] = _METHOD_C_K1 * hdr_luminance[linear_region]
+    logarithmic_region = positive_luminance & ~linear_region
+    method_c_luminance[logarithmic_region] = (
+        _METHOD_C_K2 * np.log(
+            hdr_luminance[logarithmic_region] / _METHOD_C_INFLECTION - _METHOD_C_K3
+        ) +
+        _METHOD_C_K4
+    )
+
+    # Method C の 96% SDR reference white 以下は維持し、109% headroom を sRGB canvas の100%へ滑らかに収める。
+    adapted_luminance = np.clip(
+        method_c_luminance,
+        np.float32(0.0),
+        _METHOD_C_REFERENCE_WHITE,
+    )
+    headroom = method_c_luminance > _METHOD_C_REFERENCE_WHITE
+    headroom_ratio = np.clip(
+        (method_c_luminance[headroom] - _METHOD_C_REFERENCE_WHITE) /
+        (_METHOD_C_PEAK - _METHOD_C_REFERENCE_WHITE),
+        np.float32(0.0),
+        np.float32(1.0),
+    )
+    adapted_luminance[headroom] = (
+        _METHOD_C_REFERENCE_WHITE +
+        (np.float32(100.0) - _METHOD_C_REFERENCE_WHITE) *
+        (np.float32(2.0) * headroom_ratio - headroom_ratio * headroom_ratio)
+    )
+    xyz_scale = np.zeros_like(hdr_luminance)
+    np.divide(adapted_luminance, hdr_luminance, out=xyz_scale, where=positive_luminance)
+    xyz *= xyz_scale[..., np.newaxis]
+
+    # §6.1.6 で crosstalk を戻し、BT.2407 §2 式(1)で BT.2020 から BT.709 へ変換する。
+    sdr_bt2020 = xyz @ _METHOD_C_XYZ_TO_BT2020.T
+    sdr_sum = np.sum(sdr_bt2020, axis=2, keepdims=True)
+    sdr_bt2020 = (
+        (
+            (np.float32(1.0) - _METHOD_C_CROSSTALK) * sdr_bt2020 -
+            _METHOD_C_CROSSTALK * (sdr_sum - sdr_bt2020)
+        ) /
+        (np.float32(1.0) - np.float32(3.0) * _METHOD_C_CROSSTALK)
+    ) / np.float32(100.0)
+    sdr_bt709 = sdr_bt2020 @ _METHOD_C_BT2020_TO_BT709.T
+
+    # BT.2407 は単一の最良方式を定めないため、canvas と同じ輝度保持の soft gamut mapping を使う。
+    luma = np.clip(np.sum(sdr_bt709 * _BT709_LUMA_WEIGHTS, axis=2), np.float32(0.0), np.float32(1.0))
+    delta = sdr_bt709 - luma[..., np.newaxis]
+    boundary_scale = np.full_like(sdr_bt709, np.float32(np.inf))
+    positive_delta = delta > np.float32(0.0)
+    negative_delta = delta < np.float32(0.0)
+    np.divide(
+        np.float32(1.0) - luma[..., np.newaxis],
+        delta,
+        out=boundary_scale,
+        where=positive_delta,
+    )
+    np.divide(
+        -luma[..., np.newaxis],
+        delta,
+        out=boundary_scale,
+        where=negative_delta,
+    )
+    normalized_chroma = np.zeros_like(luma)
+    minimum_boundary_scale = np.min(boundary_scale, axis=2)
+    # 完全な白では境界が 0 になるが、後段で白へ固定するため逆数を計算する必要はない。
+    valid_boundary = np.isfinite(minimum_boundary_scale) & (minimum_boundary_scale > np.float32(0.0))
+    np.divide(
+        np.float32(1.0),
+        minimum_boundary_scale,
+        out=normalized_chroma,
+        where=valid_boundary,
+    )
+    chroma_scale = np.ones_like(luma)
+    gamut_compression = normalized_chroma > np.float32(0.5)
+    gamut_distance = (
+        (normalized_chroma[gamut_compression] - np.float32(0.5)) / np.float32(0.5)
+    )
+    mapped_chroma = np.float32(0.5) + np.float32(0.5) * (
+        np.float32(1.0) - np.exp(-gamut_distance)
+    )
+    chroma_scale[gamut_compression] = mapped_chroma / normalized_chroma[gamut_compression]
+    sdr_bt709 = np.clip(
+        luma[..., np.newaxis] + delta * chroma_scale[..., np.newaxis],
+        np.float32(0.0),
+        np.float32(1.0),
+    )
+    sdr_bt709[luma <= np.float32(0.0)] = np.float32(0.0)
+    sdr_bt709[luma >= np.float32(1.0)] = np.float32(1.0)
+
+    # 既定 sRGB framebuffer と同じ OETF で符号化し、OpenCV が使う BGR 順へ戻す。
+    encoded = np.where(
+        sdr_bt709 <= np.float32(0.0031308),
+        np.float32(12.92) * sdr_bt709,
+        np.float32(1.055) * np.power(sdr_bt709, np.float32(1.0 / 2.4)) - np.float32(0.055),
+    )
+    return np.rint(np.clip(encoded, 0.0, 1.0) * np.float32(255.0)).astype(np.uint8)[..., ::-1].copy()
+
+
+def _ApplyHDRSDRMethodC(
+    bgr_image: NDArray[np.uint8],
+    input_transfer: str,
+) -> NDArray[np.uint8]:
+    """
+    8-bit BGR の全入力組合せを持つ LUT で BT.2446-1 Method C を適用する。
+
+    Args:
+        bgr_image (NDArray[np.uint8]): HLG/PQ 信号値を保持した BGR 8-bit 配列。
+        input_transfer (str): 'arib-std-b67' または 'smpte2084'。
+
+    Returns:
+        NDArray[np.uint8]: card-32 の再生 canvas と同じ変換を適用した BGR 8-bit 配列。
+
+    Raises:
+        ValueError: 入力配列または transfer が対象外の場合。
+    """
+
+    if bgr_image.dtype != np.uint8 or bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+        raise ValueError('Method C input must be an uint8 BGR image.')
+    if input_transfer not in ('arib-std-b67', 'smpte2084'):
+        raise ValueError(f'Unsupported HDR transfer: {input_transfer}')
+
+    # TLV の FFmpeg 経路は巨大な full-resolution rawvideo 転送を避けるため、縮小済みの1枚だけを直接変換する。
+    ## PyAV 経路の4Kフレーム群は、初回生成コストを回収できる完全 LUT を共有する
+    if bgr_image.shape[0] <= _METHOD_C_CHUNK_HEIGHT:
+        return _ApplyHDRSDRMethodCDirect(bgr_image, input_transfer)
+
+    lut = _METHOD_C_LUTS.get(input_transfer)
+    if lut is None:
+        # BGR24 は 256³ 通りに閉じているため、近似せず全組合せの変換結果を録画プロセス内で共有する。
+        ## 約48 MiB の LUT 構築は初回だけで、以後の数百候補は配列参照だけになる
+        lut = np.empty((256, 256, 256, 3), dtype=np.uint8)
+        green_codes, red_codes = np.indices((256, 256), dtype=np.uint8)
+        input_slice = np.empty((256, 256, 3), dtype=np.uint8)
+        input_slice[..., 1] = green_codes
+        input_slice[..., 2] = red_codes
+        for blue_code in range(256):
+            input_slice[..., 0] = blue_code
+            lut[blue_code] = _ApplyHDRSDRMethodCDirect(input_slice, input_transfer)
+        _METHOD_C_LUTS[input_transfer] = lut
+
+    return lut[bgr_image[..., 0], bgr_image[..., 1], bgr_image[..., 2]]
 
 
 class _HDRSDRTonemapConverter:
     """
-    PyAV がデコードした HDR (HLG/PQ) フレームを、同梱 FFmpeg8 の zscale+tonemap で SDR の BGR 配列へ変換する
-    rawvideo パイプへ渡すとフレームの色メタデータが失われるため、rawvideo demuxer の入力オプションで色タグを明示する
-    (zscale が入力の transfer/primaries/matrix を正しく解釈するために必須。これが無いと no path between colorspaces で失敗する)
-    同梱 FFmpeg8 はパイプ入力を EOF まで処理しない (stdin を開いたままでは出力が返らない) ため、
-    持続プロセスは使わずフレームごとに subprocess を起動する
+    デコード済み HDR (HLG/PQ) BGR 配列を BT.2446-1 Method C で SDR へ変換する。
+
+    3つの抽出経路が同じ NumPy 実装を通り、card-32 の再生 canvas と係数・表示適応を共有する。
     変換に失敗した場合は例外を送出し、HDR 録画で未変換フレームが公開されないよう生成全体を失敗させる
-    (従来の rgb24 変換へのフォールバックは行わない。旧変換は SDR 録画だけに限定する)
+    (SDR 画像へのフォールバックは行わない。従来の無変換経路は SDR 録画だけに限定する)。
     """
 
     def __init__(self, file_label: str, input_transfer: str) -> None:
         """
         Args:
             file_label (str): ログ識別用のファイルパス文字列。
-            input_transfer (str): 入力フレームの実体の transfer 名 ('arib-std-b67' または 'smpte2084')。
+            input_transfer (str): 入力 BGR 信号値の transfer 名 ('arib-std-b67' または 'smpte2084')。
         """
 
         # 変換失敗時のログへ付ける識別子。
         self._file_label = file_label
-        # FFmpeg8 の入力タグへ渡す transfer。検出済みの HLG (arib-std-b67) / PQ (smpte2084) のみが来る前提。
+        # 検出済みの HLG (arib-std-b67) / PQ (smpte2084) だけが来る前提。
         self._input_transfer = input_transfer
 
-    def convert(self, frame: av.VideoFrame, timeout: int) -> NDArray[np.uint8]:
+    def convert(self, bgr_image: NDArray[np.uint8]) -> NDArray[np.uint8]:
         """
-        デコード済みフレームを SDR の BGR 配列 (フル解像度) へ変換する。
+        デコード済み BGR 配列を SDR の BGR 配列へ変換する。
 
         Args:
-            frame (av.VideoFrame): PyAV がデコードしたフレーム。
-            timeout (int): FFmpeg8 サブプロセスのタイムアウト時間 (秒)。
+            bgr_image (NDArray[np.uint8]): HLG/PQ 信号値を保持した BGR 配列。
 
         Returns:
-            NDArray[np.uint8]: BGR 配列 (height, width, 3)。
+            NDArray[np.uint8]: SDR BGR 配列 (height, width, 3)。
 
         Raises:
-            HDRTonemapConversionError: FFmpeg8 の非0終了・出力サイズ不一致・タイムアウト・raw 変換失敗時。
+            HDRTonemapConversionError: Method C 変換に失敗した場合。
                 HDR 録画では未変換フレームを公開しないため、呼び出し側へ伝播して生成を失敗させる。
         """
 
-        width, height = frame.width, frame.height
-        pix_fmt = frame.format.name
-        command = [
-            LIBRARY_PATH['FFmpeg8'],
-            '-hide_banner', '-loglevel', 'error',
-            '-f', 'rawvideo',
-            '-pix_fmt', pix_fmt,
-            '-s', f'{width}x{height}',
-            # rawvideo パイプではフレームの色メタデータが失われるため、検出時の実体に合わせて入力タグを明示する
-            ## BS4K の HLG/PQ は primaries=bt2020・matrix=bt2020nc・range=tv 固定でよい
-            '-color_range', 'tv',
-            '-colorspace', 'bt2020nc',
-            '-color_primaries', 'bt2020',
-            '-color_trc', self._input_transfer,
-            '-i', 'pipe:0',
-            '-vf', _BuildHDRTonemapFilter(),
-            '-f', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            'pipe:1',
-        ]
         try:
-            # 入力は pix_fmt そのままの rawvideo (yuv420p10le なら uint16 平面の連結)。
-            ## stdin を閉じて EOF を伝える必要があるため、communicate 相当の input= で渡す
-            raw = frame.to_ndarray(format=pix_fmt).tobytes()
-            process = subprocess.run(command, input=raw, capture_output=True, timeout=timeout, check=False)
-            expected_size = width * height * 3
-            if process.returncode != 0 or len(process.stdout) != expected_size:
-                raise RuntimeError(
-                    f'FFmpeg8 failed (rc={process.returncode}, out={len(process.stdout)}/{expected_size} bytes): '
-                    f'{process.stderr.decode(errors="replace")[:200]}'
-                )
-            return np.frombuffer(process.stdout, dtype=np.uint8).reshape((height, width, 3)).copy()
+            return _ApplyHDRSDRMethodC(bgr_image, self._input_transfer)
         except Exception as ex:
-            # 変換失敗は従来変換へフォールバックせず、HDR 録画で未変換フレームが
+            # 変換失敗は SDR 経路へフォールバックせず、HDR 録画で未変換フレームが
             ## 代表・タイルとして公開されないよう例外を伝播して生成全体を失敗させる
             logging.error(
                 f'{self._file_label}: HDR to SDR tonemap conversion failed.',
@@ -206,7 +417,6 @@ class ThumbnailGenerator:
     FFMPEG_TIMEOUT: ClassVar[int] = 300  # FFmpeg サブプロセスのタイムアウト時間 (秒)
     TSREADEX_FRAME_EXTRACTION_TIMEOUT: ClassVar[int] = 600  # tsreadex 経由のフレーム抽出タイムアウト時間 (秒)
     MMT_TLV_FRAME_EXTRACTION_TIMEOUT: ClassVar[int] = 60  # TLV の候補1枚を FFmpeg 8 で抽出する上限 (秒)
-    HDR_TONEMAP_CONVERSION_TIMEOUT: ClassVar[int] = 60  # HDR フレーム1枚の FFmpeg 8 トーンマップ変換の上限 (秒)
     FRAME_EXTRACTION_MAX_DEMUX_PACKETS: ClassVar[int] = 20000  # 1候補位置でフレーム探索する最大パケット数
     FRAME_EXTRACTION_MAX_CONSECUTIVE_FAILURES: ClassVar[int] = 10  # 連続失敗時に残り候補を黒画像で埋める閾値
 
@@ -858,7 +1068,7 @@ class ThumbnailGenerator:
     ) -> NDArray[np.uint8]:
         """
         デコード済みフレームをスコアリング解像度の BGR 配列へ変換する単一の投入点
-        HDR 録画では同梱 FFmpeg8 の zscale+tonemap で SDR 化してから縮小し、
+        HDR 録画では BT.2446-1 Method C で SDR 化してから縮小し、
         SDR 録画では従来どおり rgb24 直変換を使う
         HDR 変換が失敗した場合は例外が伝播し、生成全体が失敗する (未変換フレームは公開しない)
         代表サムネイル・タイル・スコアリング・顔検出・レターボックス判定のすべてが
@@ -874,20 +1084,25 @@ class ThumbnailGenerator:
 
         scoring_width, scoring_height = self.SCORING_SCALE
         if hdr_converter is not None:
-            # HDR 録画は必ずトーンマップする。失敗時は convert() の例外がそのまま伝播する
-            tonemapped_bgr = hdr_converter.convert(frame, self.HDR_TONEMAP_CONVERSION_TIMEOUT)
-            # SDR 化済みのフレームをスコアリング解像度へ縮小する (既に BGR のため色変換は不要)
-            return cast(
-                NDArray[np.uint8],
-                cv2.resize(tonemapped_bgr, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA),
-            )
+            # 再生 canvas と同じく全解像度で Method C を適用してから表示解像度へ縮小する。
+            ## 変換失敗時は例外を伝播し、未変換画像を公開しない
+            try:
+                img_rgb = frame.to_ndarray(format='rgb24')
+                full_bgr = cast(NDArray[np.uint8], cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+                converted_bgr = hdr_converter.convert(full_bgr)
+                return cast(
+                    NDArray[np.uint8],
+                    cv2.resize(converted_bgr, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA),
+                )
+            except HDRTonemapConversionError:
+                raise
+            except Exception as ex:
+                logging.error(f'{self.file_path}: HDR frame conversion failed.', exc_info=ex)
+                raise HDRTonemapConversionError(f'HDR frame conversion failed: {ex}') from ex
 
-        # SDR 録画の従来経路。生成結果を変えないよう既存の変換手順を維持する
+        # SDR 録画の生成結果を変えないよう、従来どおり RGB のまま縮小してから BGR へ変換する
         img_rgb = frame.to_ndarray(format='rgb24')
-        # リサイズを実行
-        ## 1440x1080 から一気に 480x270 まで縮小するため INTER_AREA を使う
         img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
-        # RGB から OpenCV 向けの BGR に変換する
         return cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
 
 
@@ -994,19 +1209,20 @@ class ThumbnailGenerator:
                                 break
                             continue
 
-                        # HDR 判定は最初のフレームで1回だけ行い、HLG の両宣言 (bt2020-10 / arib-std-b67) と PQ を変換する
+                        # HDR 判定は最初のフレームで1回だけ行い、VUI 16 (PQ) / 18 (HLG) を変換する。
+                        ## VUI 14 は規格どおり BT.2020 SDR として従来の無変換経路を通す
                         if hdr_detection_done is False:
                             hdr_detection_done = True
                             hdr_input_transfer = _DetectHDRInputTransfer(frame.color_primaries, frame.color_trc)
                             if hdr_input_transfer is not None:
                                 logging.info(
                                     f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
-                                    'Applying HDR to SDR tonemap for thumbnail frames.'
+                                    'Applying BT.2446-1 Method C for thumbnail frames.'
                                 )
                                 hdr_converter = _HDRSDRTonemapConverter(str(self.file_path), hdr_input_transfer)
 
                         # フレームをスコアリング解像度の BGR 配列に変換して bgr_frames に追加する
-                        ## HDR 録画では FFmpeg8 の zscale+tonemap で SDR 化されてから返る
+                        ## HDR 録画では共通の BT.2446-1 Method C で SDR 化されてから返る
                         img_bgr = self.__convertFrameToScoringBGR(frame, hdr_converter)
                         bgr_frames.append(img_bgr)
                         consecutive_failed_frames = 0
@@ -1016,7 +1232,7 @@ class ThumbnailGenerator:
                             logging.debug(f'{self.file_path}: Extracted {i + 1}/{len(candidate_offsets)} frames')
 
                     except HDRTonemapConversionError:
-                        # HDR 判定後のトーンマップ失敗はフレーム単位の復旧 (黒画像代替) をせず、
+                        # HDR 判定後の Method C 変換失敗はフレーム単位の復旧 (黒画像代替) をせず、
                         ## 関数末尾の共通エラーハンドリングへ伝播させて抽出失敗とする
                         ## (未変換・代替フレームを代表・タイルとして公開しないため)
                         raise
@@ -1159,10 +1375,10 @@ class ThumbnailGenerator:
             previous_frame_relative_time: float | None = None
             bgr_frames: list[NDArray[np.uint8]] = []
             next_candidate_index = 0
-            # HDR (HLG/PQ) 判定は最初にデコードできたフレームのメタデータで行う
+            # HDR (HLG/PQ) 判定は最初にデコードできたフレームの VUI で行う
             hdr_converter: _HDRSDRTonemapConverter | None = None
             hdr_detection_done = False
-            # HDR 録画では変換がフレームごとの FFmpeg8 プロセス起動になり高コストなため、
+            # HDR 録画では採用しない I フレームの Method C 変換を避けるため、
             ## 採用が確定するまでデコード済みフレームを保持し、採用するフレームだけを変換する
             ## (SDR 録画は従来どおり全フレームを即時変換する)
             previous_decoded_frame: av.VideoFrame | None = None
@@ -1179,14 +1395,15 @@ class ThumbnailGenerator:
                     first_frame_time = float(decoded_frame.time)
                 relative_time = float(decoded_frame.time) - first_frame_time
 
-                # HDR 判定は最初のフレームで1回だけ行い、HLG の両宣言 (bt2020-10 / arib-std-b67) と PQ を変換する
+                # HDR 判定は最初のフレームで1回だけ行い、VUI 16 (PQ) / 18 (HLG) を変換する。
+                ## VUI 14 は規格どおり BT.2020 SDR として従来の無変換経路を通す
                 if hdr_detection_done is False:
                     hdr_detection_done = True
                     hdr_input_transfer = _DetectHDRInputTransfer(decoded_frame.color_primaries, decoded_frame.color_trc)
                     if hdr_input_transfer is not None:
                         logging.info(
                             f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
-                            'Applying HDR to SDR tonemap for thumbnail frames.'
+                            'Applying BT.2446-1 Method C for thumbnail frames.'
                         )
                         hdr_converter = _HDRSDRTonemapConverter(str(self.file_path), hdr_input_transfer)
 
@@ -1203,7 +1420,7 @@ class ThumbnailGenerator:
                 ## 先頭だけは直前フレームが存在しないため、最初に取得できた I フレームを使う
                 while next_candidate_index < expected_frame_count and relative_time + 0.001 >= candidate_offsets[next_candidate_index]:
                     if hdr_converter is not None:
-                        # HDR は採用が確定したフレームだけを FFmpeg8 でトーンマップする
+                        # HDR は採用が確定したフレームだけを Method C で変換する
                         chosen_frame = previous_decoded_frame if previous_decoded_frame is not None else decoded_frame
                         bgr_frames.append(self.__convertFrameToScoringBGR(chosen_frame, hdr_converter))
                     elif previous_frame_bgr is not None:
@@ -1296,30 +1513,30 @@ class ThumbnailGenerator:
         """
 
         scoring_width, scoring_height = self.SCORING_SCALE
-        expected_size = scoring_width * scoring_height * 3
         bgr_frames: list[NDArray[np.uint8]] = []
         consecutive_failed_frames = 0
         start_time_frame_extraction = time.time()
 
-        # HDR (HLG/PQ) かどうかを映像メタデータから判定し、HDR 録画のみトーンマップフィルタを挿入する
-        hdr_input_transfer = self.__probeHDRInputTransferWithFFmpeg()
+        # 生 TLV は B60 descriptor を第一根拠とし、取得不能な場合だけ VUI へフォールバックする。
+        ## HDR と確定した録画だけ、全候補へ同じ Method C converter を適用する
+        hdr_input_transfer = self.__probeHDRInputTransfer()
+        hdr_converter = (
+            _HDRSDRTonemapConverter(str(self.file_path), hdr_input_transfer)
+            if hdr_input_transfer is not None
+            else None
+        )
         if hdr_input_transfer is not None:
             logging.info(
                 f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
-                'Applying HDR to SDR tonemap for thumbnail frames.'
+                'Applying BT.2446-1 Method C for thumbnail frames.'
             )
 
         # PyAV は同梱 FFmpeg 8 の libaribtlv demuxer を持たないため、この形式だけ固定バイナリへ委譲する。
         # 1 process で大量 seek すると demuxer 状態が候補間で残るので、候補ごとに独立して fail closed にする。
         for index, offset_sec in enumerate(candidate_offsets):
-            # HDR 録画のみ、スケーリング前に zscale+tonemap で SDR 化する
-            ## MMT/TLV は FFmpeg8 自身がデコードするため、先頭 zscale の tin= で
-            ## VUI の transfer を検出した実体の transfer で上書きする
+            # libaribtlv 経路は full-resolution BGR のパイプ転送が支配的になるため、信号値のまま先に縮小する。
+            ## SDR と同じ既存の縮小・余白処理後に Method C を適用し、候補ごとの巨大な rawvideo 転送を避ける
             video_filter = (
-                f'{_BuildHDRTonemapFilter(hdr_input_transfer)},'
-                if hdr_input_transfer is not None
-                else ''
-            ) + (
                 f'scale={scoring_width}:{scoring_height}:force_original_aspect_ratio=decrease,'
                 f'pad={scoring_width}:{scoring_height}:(ow-iw)/2:(oh-ih)/2'
             )
@@ -1351,8 +1568,9 @@ class ThumbnailGenerator:
                 )
                 process = None
 
+            expected_size = scoring_width * scoring_height * 3
             if process is None or process.returncode != 0 or len(process.stdout) != expected_size:
-                # HDR と判定した録画では、トーンマップを含む候補抽出の失敗を黒画像補完しない
+                # HDR と判定した録画では、Method C を含む候補抽出の失敗を黒画像補完しない
                 ## 未変換・代替フレームを代表・タイルとして公開しないよう、生成失敗へ伝播する
                 if hdr_input_transfer is not None:
                     logging.error(
@@ -1365,7 +1583,15 @@ class ThumbnailGenerator:
                 frame = np.frombuffer(process.stdout, dtype=np.uint8).reshape(
                     (scoring_height, scoring_width, 3),
                 ).copy()
-                bgr_frames.append(cast(NDArray[np.uint8], frame))
+                try:
+                    bgr_frames.append(
+                        hdr_converter.convert(cast(NDArray[np.uint8], frame))
+                        if hdr_converter is not None
+                        else cast(NDArray[np.uint8], frame)
+                    )
+                except HDRTonemapConversionError:
+                    # 未変換・代替フレームを代表・タイルとして公開しないよう、生成失敗へ伝播する
+                    return None
                 consecutive_failed_frames = 0
 
             # 連続失敗後は残りを黒画像で埋め、破損録画に対する process 再生成を打ち切る。
@@ -1388,13 +1614,40 @@ class ThumbnailGenerator:
         return (bgr_frames, self.__scoreFrames(bgr_frames))
 
 
-    def __probeHDRInputTransferWithFFmpeg(self) -> str | None:
+    def __probeHDRInputTransfer(self) -> str | None:
         """
-        MMT/TLV 録画の映像メタデータを同梱 FFmpeg8 の出力から読み、HDR (HLG/PQ) なら投入用 transfer 名を返す
+        MMT/TLV 録画の B60 descriptor を第一根拠にし、必要な場合だけ VUI で HDR transfer を補完する。
 
         Returns:
             str | None: 'arib-std-b67' または 'smpte2084'。SDR・判定不能の場合は None
         """
+
+        # B60 の video_transfer_characteristics は HLG/PQ の曲線まで直接表すため、VUI より先に判定する。
+        ## helper が descriptor を取得できない場合と HDR_WCG_idc=2 だけの場合は VUI へフォールバックする
+        b60_descriptor = self.__probeB60VideoDescriptor()
+        if b60_descriptor is not None:
+            video_transfer_characteristics, hdr_wcg_idc = b60_descriptor
+            descriptor_resolved, descriptor_transfer = _DetectHDRInputTransferFromB60(
+                video_transfer_characteristics,
+                hdr_wcg_idc,
+            )
+            if hdr_wcg_idc is not None and (
+                (
+                    video_transfer_characteristics in _B60_SDR_VIDEO_TRANSFERS and
+                    hdr_wcg_idc == 2
+                ) or (
+                    video_transfer_characteristics in _B60_HDR_VIDEO_TRANSFERS and
+                    hdr_wcg_idc != 2
+                )
+            ):
+                # B60 内で transfer と HDR_WCG_idc が矛盾する入力は、どちらかを推測して公開しない。
+                ## 実放送で観測した場合に規格・送出状態を確認できるよう、生成失敗として呼び出し側へ伝播する
+                raise HDRTonemapConversionError(
+                    'Conflicting B60 HDR descriptors. '
+                    f'[video_transfer_characteristics: {video_transfer_characteristics}, hdr_wcg_idc: {hdr_wcg_idc}]'
+                )
+            if descriptor_resolved is True:
+                return descriptor_transfer
 
         # stream 情報は stderr へ出るため、0 フレーム処理の起動だけで色メタデータを取得する
         command = [
@@ -1413,6 +1666,11 @@ class ThumbnailGenerator:
             )
         except (OSError, subprocess.TimeoutExpired) as ex:
             logging.warning(f'{self.file_path}: Failed to probe MMT/TLV color metadata.', exc_info=ex)
+            if b60_descriptor is not None and b60_descriptor[1] == 2:
+                # B60 で HDR と確定済みなら、VUI probe 障害を SDR 判定へ読み替えて未変換映像を公開しない。
+                raise HDRTonemapConversionError(
+                    'B60 declares HDR but the transfer curve probe failed.'
+                ) from ex
             return None
 
         # 出力例: "Stream #0:0[0x100]: Video: hevc (Main 10) (...), yuv420p10le(tv, bt2020nc/bt2020/bt2020-10), ..."
@@ -1422,13 +1680,96 @@ class ThumbnailGenerator:
             process.stderr.decode(errors='replace'),
         )
         if match is None:
+            if b60_descriptor is not None and b60_descriptor[1] == 2:
+                raise HDRTonemapConversionError(
+                    'B60 declares HDR but the transfer curve is unavailable from both B60 and VUI.'
+                )
             logging.warning(f'{self.file_path}: No color metadata found in MMT/TLV probe output.')
             return None
         _matrix, primaries, transfer = match.groups()
-        # color_primaries == bt2020 かつ transfer が bt2020-10 / smpte2084 / arib-std-b67 の場合だけ HDR とみなす
-        if primaries != 'bt2020' or transfer not in _HDR_INPUT_TRANSFER_MAP:
+        # B60 を取得できない場合も、VUI 16 (PQ) / 18 (HLG) だけを HDR とみなす。
+        ## VUI 14 (bt2020-10) は規格上 WCG SDR なので変換しない
+        if primaries != 'bt2020' or transfer not in _AV_HDR_COLOR_TRANSFERS.values():
+            if b60_descriptor is not None and b60_descriptor[1] == 2:
+                raise HDRTonemapConversionError(
+                    'B60 declares HDR but VUI does not identify an HLG/PQ transfer. '
+                    f'[primaries: {primaries}, transfer: {transfer}]'
+                )
             return None
-        return _HDR_INPUT_TRANSFER_MAP[transfer]
+        return transfer
+
+
+    def __probeB60VideoDescriptor(self) -> tuple[int | None, int | None] | None:
+        """
+        既存 metadata ELF から録画対象の主映像トラックに付いた B60 descriptor を読む。
+
+        Returns:
+            tuple[int | None, int | None] | None:
+                (video_transfer_characteristics, hdr_wcg_idc)。helper 失敗・主映像未選出なら None。
+        """
+
+        command = [
+            LIBRARY_PATH['KonomiTVBS4KTLVMetadata'],
+            str(self.file_path),
+            str(KonomiTVBS4KTLVServiceResolver.MAX_PROBE_BYTES),
+        ]
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=self.MMT_TLV_FRAME_EXTRACTION_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            logging.warning(f'{self.file_path}: Failed to probe B60 video descriptor.', exc_info=ex)
+            return None
+        if process.returncode != 0:
+            logging.warning(
+                f'{self.file_path}: B60 video descriptor probe failed. [returncode: {process.returncode}]'
+            )
+            return None
+
+        snapshot = KonomiTVBS4KTLVServiceResolver.parseMetadataLine(
+            process.stdout.decode(errors='replace'),
+        )
+        if snapshot is None:
+            logging.warning(f'{self.file_path}: B60 video descriptor probe returned no metadata snapshot.')
+            return None
+
+        # service_id が得られる通常経路では resolver と同じ context / component_tag 順で主映像を選ぶ。
+        ## 古い呼び出し元など service_id が無い場合も、snapshot context または先頭 Video へ限定して判定する
+        main_context_id = (
+            snapshot.service_contexts.get(self.service_id)
+            if self.service_id is not None
+            else None
+        )
+        if main_context_id is None:
+            main_context_id = snapshot.snapshot_context_id
+        if main_context_id is None:
+            first_video_track = next((track for track in snapshot.tracks if track.kind == 'Video'), None)
+            main_context_id = first_video_track.context_id if first_video_track is not None else None
+        main_video_packet_id, _main_audio_packet_id, _rain_video_packet_id = (
+            KonomiTVBS4KTLVServiceResolver.selectTrackPacketIds(
+                snapshot.tracks,
+                main_context_id,
+                None,
+            )
+        )
+        main_video_track = next((
+            track for track in snapshot.tracks
+            if (
+                track.kind == 'Video' and
+                track.context_id == main_context_id and
+                track.packet_id == main_video_packet_id
+            )
+        ), None)
+        if main_video_track is None:
+            logging.warning(f'{self.file_path}: No main video track found in B60 metadata snapshot.')
+            return None
+        return (
+            main_video_track.video_transfer_characteristics,
+            main_video_track.hdr_wcg_idc,
+        )
 
 
     def __scoreFrames(self, bgr_frames: list[NDArray[np.uint8]]) -> int | None:
