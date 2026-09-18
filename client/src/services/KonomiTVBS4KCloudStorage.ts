@@ -21,9 +21,29 @@ export interface IKonomiTVBS4KCloudImport {
     client_secret: string;
 }
 
+export interface IKonomiTVBS4KCloudDestination {
+    folder: string;
+    is_upload_destination: boolean;
+    connection_id: string;
+}
+
 /** 秘密の取り込み入力を通知・ログ・永続設定に渡さないクラウド連携API。 */
 export default class KonomiTVBS4KCloudStorage {
     static readonly base = '/konomitv-bs4k/cloud-storage';
+
+    static async destinations(): Promise<IKonomiTVBS4KCloudDestination[] | null> {
+        const result = await APIClient.get<IKonomiTVBS4KCloudDestination[]>(`${this.base}/destinations`);
+        if (result.type === 'error') { Message.error('クラウド利用不可'); return null; }
+        return result.data;
+    }
+
+    static async saveDestination(id: string, folder: string, selected: boolean): Promise<boolean> {
+        const result = await APIClient.put<IKonomiTVBS4KCloudDestination>(`${this.base}/${id}/destination`, {
+            folder, is_upload_destination: selected,
+        });
+        if (result.type === 'error') { Message.error('クラウド利用不可'); return false; }
+        return true;
+    }
 
     static async list(): Promise<IKonomiTVBS4KCloudConnection[] | null> {
         const result = await APIClient.get<IKonomiTVBS4KCloudConnection[]>(this.base);

@@ -9,7 +9,7 @@
         </h2>
         <div class="settings__description">
             Google Drive / pCloud の接続を、この管理者アカウントに紐付けて保管します。<br>
-            この画面ではログイン連携とフォルダの読み取り確認だけを行います。録画の転送・削除は行いません。
+            鍵は製品が自動生成し、OAuth 認証情報とは独立して保管されます。
         </div>
         <v-alert v-if="!isAdmin" type="info" variant="tonal" class="mt-4">
             管理者アカウントでログインすると接続を管理できます。
@@ -62,8 +62,28 @@
                         <v-btn variant="text" :disabled="busy" @click="openImport(connection)">キーを再取り込み</v-btn>
                         <v-btn variant="text" color="error" :disabled="busy" @click="disconnectTarget = connection">接続解除</v-btn>
                     </div>
+                    <div v-if="destinationDrafts[connection.id]" class="mt-4">
+                        <v-text-field v-model="destinationDrafts[connection.id].folder" label="暗号化保存先フォルダ"
+                            variant="outlined" :disabled="busy" maxlength="1024" />
+                        <p class="settings__item-label">
+                            クラウドストレージ側で暗号化録画を保管するフォルダパスを指定します（サーバーのローカルパスではありません）。
+                            指定したフォルダ内に、登録済みの暗号化鍵を用いて暗号化保管されます。
+                        </p>
+                        <v-checkbox v-model="destinationDrafts[connection.id].selected" :disabled="busy" hide-details
+                            label="新規録画のアップロード先として使用" />
+                        <p class="settings__item-label">
+                            今後クラウドへ移動する録画は、選択されたこの接続にのみアップロードされます
+                            （利用不可時も含め、他の接続への自動切替は行われません）。
+                            未選択の接続も読み取り専用にはならず、既存録画の再生・ローカル移動・削除・解析結果の保存に引き続き利用できます。
+                            なお、保存先を指定しただけでは録画の自動移動は行われず、開始済みの移動ジョブの保存先も変更されません。
+                        </p>
+                        <v-btn class="mt-3" variant="tonal" :disabled="busy || !destinationDrafts[connection.id].folder"
+                            @click="saveDestination(connection.id)">フォルダ設定を保存</v-btn>
+                    </div>
                 </article>
             </div>
+            <KonomiTVBS4KCloudCryptKeysPanel />
+            <KonomiTVBS4KCloudTransfersPanel />
         </div>
 
         <v-dialog v-model="importOpen" max-width="620" :persistent="busy" @after-leave="clearKey">
@@ -126,6 +146,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 
+import KonomiTVBS4KCloudCryptKeysPanel from '@/components/Settings/KonomiTVBS4KCloudCryptKeys.vue';
+import KonomiTVBS4KCloudTransfersPanel from '@/components/Settings/KonomiTVBS4KCloudTransfers.vue';
 import Message from '@/message';
 import KonomiTVBS4KCloudStorage, { IKonomiTVBS4KCloudConnection } from '@/services/KonomiTVBS4KCloudStorage';
 import useUserStore from '@/stores/UserStore';
@@ -135,6 +157,8 @@ import SettingsBase from '@/views/Settings/Base.vue';
 const userStore = useUserStore();
 const isAdmin = computed(() => userStore.user?.is_admin === true);
 const connections = ref<IKonomiTVBS4KCloudConnection[]>([]);
+// 接続IDに依存するサーバー管理データ。ブラウザ設定として永続化・他サーバーへ同期しない。
+const destinationDrafts = ref<Record<string, {folder: string; selected: boolean}>>({});
 const loading = ref(false);
 const busy = ref(false);
 const importOpen = ref(false);
@@ -166,8 +190,30 @@ function openImport(connection: IKonomiTVBS4KCloudConnection | null): void {
 
 async function reload(): Promise<void> {
     loading.value = true;
-    try { connections.value = await KonomiTVBS4KCloudStorage.list() ?? []; }
+    try {
+        destinationDrafts.value = {};
+        connections.value = await KonomiTVBS4KCloudStorage.list() ?? [];
+        const destinations = await KonomiTVBS4KCloudStorage.destinations();
+        if (destinations !== null) {
+            for (const connection of connections.value) {
+                const destination = destinations.find(item => item.connection_id === connection.id);
+                destinationDrafts.value[connection.id] = {
+                    folder: destination?.folder ?? '', selected: destination?.is_upload_destination ?? false,
+                };
+            }
+        }
+    }
     finally { loading.value = false; }
+}
+
+async function saveDestination(id: string): Promise<void> {
+    if (busy.value) return;
+    const draft = destinationDrafts.value[id];
+    if (!draft) return;
+    busy.value = true;
+    try {
+        if (await KonomiTVBS4KCloudStorage.saveDestination(id, draft.folder, draft.selected)) await reload();
+    } finally { busy.value = false; }
 }
 
 async function importKey(): Promise<void> {

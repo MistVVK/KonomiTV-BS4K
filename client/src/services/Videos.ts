@@ -168,6 +168,7 @@ export interface IRecordedVideo {
     id: number;
     status: 'Recording' | 'Analyzing' | 'Recorded' | 'AnalysisFailed' | 'Deleting' | 'DeleteFailed';
     file_path: string;
+    storage_location: 'Local' | 'Cloud';
     file_hash: string;
     file_size: number;
     file_created_at: string;
@@ -252,6 +253,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     id: -1,
     status: 'Recorded',
     file_path: '',
+    storage_location: 'Local',
     file_hash: '',
     file_size: 0,
     file_created_at: '2000-01-01T00:00:00+09:00',
