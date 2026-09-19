@@ -37,3 +37,9 @@
 - **却下した案**: ローカルの録画原本を sidecar へ渡すため、Unix domain socket 上で動作する独自の WebDAV サーバー (`KonomiTVBS4KCloudSource`) を本体に設け、サイズ情報を付与して rclone へ中継する。
 - **却下理由**: 通常ファイルはローカルでサイズを事前に `stat` 可能であり、rclone crypt も平文サイズが既知であれば暗号化後のサイズを計算できる。pCloud などの `PutStream=false` はサイズ不明入力時の制約であり、通常ファイルのアップロード自体を制限するものではない。`RC uploadfile` の Rcat 経路では大きなサイズ不明入力時にスプールが必要になるが、録画領域を sidecar へ read-only bind して通常ファイルを `RC operations/copyfile` の送信元に指定すれば、独自 WebDAV を介さずに直接転送できる。また、WebDAV 転送元を設けてもクラウドからの再生読み取りやシークの課題は解決されないため、独自の中継サーバーを設ける必要性がない。
 - **この判断が無効になる条件**: 録画領域を sidecar へ read-only bind できないコンテナ分離要件や、本体と sidecar が別ホストへ分離されるなど、ローカルファイルシステム経由での直接参照が根本的に不可能なアーキテクチャへ変更された場合。
+
+### MMT→TS 合成ブリッジ経由で web-bml を再利用する BS4K データ放送
+
+- **却下した案**: ライブの生 TLV を tee し、dantto4k 由来の MMT→合成 TS ブリッジ（PAT/PMT/AIT/DSM-CC カルーセルを TS へ再構成）を挟んで、既存の web-bml データ放送スタック（`LivePSIDataArchiver` / `LiveDataBroadcastingManager` / NVRAM エミュレーション）をそのまま再利用する。
+- **却下理由**: ユーザーが HonomiTV 方式（libaribhtml5 = HTML5 レシーバーエンジン）を選定した。合成 TS ブリッジ案は dantto4k のフォーク導入と `onApplicationData` 実装という追加ネイティブ資産、`datacast.ts` という新しい API 経路、常時 tee と TS 再構成のサーバー負荷を伴う一方、B62 HTML5 が本来持つ描画モデル（レイアウト設定・イベント情報・viewer participation 等）から乖離する。既存ビルドの `libaribtlv` に datacast コールバックが揃っており、既存降雨監視 ELF へ相乗りすれば TLV の再受信・全体パース・追加プロセス無しでデータのみを SSE 配信できるため、追加コストの小さい後者を採用する。対象カードは card-24〜26（2026-09-16 に取消）。
+- **この判断が無効になる条件**: libaribhtml5 が BS4K データ放送の描画要件（B62 レイアウト・イベント・双方向）を満たせないことが実測で判明した場合、または既存 `libaribtlv` の datacast コールバックから必要な application/resource 情報が実測で取得できない場合。
