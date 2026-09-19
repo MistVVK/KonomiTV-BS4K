@@ -127,6 +127,7 @@ mkdir -p "${metadata_output}"
 ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
     -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
     "${SCRIPT_DIR}/KonomiTVBS4KTLVMetadata.cpp" \
+    "${SCRIPT_DIR}/KonomiTVBS4KDatacast.cpp" \
     $(PKG_CONFIG_PATH="${si_sdk_prefix}/lib/pkgconfig" pkg-config --cflags --libs --static libaribtlv) \
     -Wl,-z,relro,-z,now -pie \
     -o "${metadata_output}/KonomiTVBS4KTLVMetadata.elf"
@@ -134,6 +135,7 @@ ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
 ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
     -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
     "${SCRIPT_DIR}/KonomiTVBS4KTLVMetadataTest.cpp" \
+    "${SCRIPT_DIR}/KonomiTVBS4KDatacast.cpp" \
     $(PKG_CONFIG_PATH="${si_sdk_prefix}/lib/pkgconfig" pkg-config --cflags --libs --static libaribtlv) \
     -Wl,-z,relro,-z,now -pie \
     -o /tmp/KonomiTVBS4KTLVMetadataTest.elf
