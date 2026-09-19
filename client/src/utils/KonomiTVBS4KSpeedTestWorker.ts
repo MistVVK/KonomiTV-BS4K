@@ -133,12 +133,12 @@ function IsFiniteMetric(value: unknown): value is number {
     return typeof value === 'number' && Number.isFinite(value);
 }
 
-function ParseMetricString(value: unknown): number | null {
+function ParseMetricString(value: unknown, allow_zero: boolean = false): number | null {
     if (typeof value !== 'string' || value === '' || value === 'Fail') {
         return null;
     }
     const parsed = Number(value);
-    if (Number.isFinite(parsed) === false || parsed <= 0) {
+    if (Number.isFinite(parsed) === false || (allow_zero ? parsed < 0 : parsed <= 0)) {
         return null;
     }
     return parsed;
@@ -193,7 +193,7 @@ export function ResolveKonomiTVBS4KSpeedTestResult(
     const download_mbps = ParseMetricString(status.dlStatus);
     const upload_mbps = ParseMetricString(status.ulStatus);
     const rtt_ms = ParseMetricString(status.pingStatus);
-    const jitter_ms = ParseMetricString(status.jitterStatus);
+    const jitter_ms = ParseMetricString(status.jitterStatus, true);
     if (download_mbps === null || upload_mbps === null || rtt_ms === null || jitter_ms === null) {
         return null;
     }
