@@ -4123,11 +4123,6 @@ levn@^0.4.1:
     prelude-ls "^1.2.1"
     type-check "~0.4.0"
 
-libaribhtml5@^0.1.7:
-  version "0.1.7"
-  resolved "https://registry.yarnpkg.com/libaribhtml5/-/libaribhtml5-0.1.7.tgz#a0604428b3a6ad831fc96d4bd0f4ed2055e7ed5e"
-  integrity sha512-KGBJnM2agV0kv78L3MfFHlbjFcjXnI4g+ms/BwHpSwqZw+DhzUuxvYWWhVbwlEQ6fLn1cpEJ6olG1GWM2GmjUw==
-
 lightningcss-android-arm64@1.33.0:
   version "1.33.0"
   resolved "https://registry.yarnpkg.com/lightningcss-android-arm64/-/lightningcss-android-arm64-1.33.0.tgz#9a6841f88ae50fc83502903892b41af41bc2b907"

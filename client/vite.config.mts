@@ -1,41 +1,11 @@
 
-import { readFileSync } from 'node:fs';
 import { fileURLToPath, URL } from 'node:url';
 
 import vue from '@vitejs/plugin-vue';
-import { defineConfig, type Plugin } from 'vite';
+import { defineConfig } from 'vite';
 import { comlink } from 'vite-plugin-comlink';
 import { VitePWA } from 'vite-plugin-pwa';
 import vuetify, { transformAssetUrls } from 'vite-plugin-vuetify';
-
-import { patchKonomiTVBS4KARIBVFSWorkerSource } from './vite.arib-vfs-worker.mts';
-
-
-const konomitv_bs4k_arib_vfs_worker_path = fileURLToPath(
-    new URL('./node_modules/libaribhtml5/dist/sdk/arib-vfs-sw.js', import.meta.url),
-);
-const loadKonomiTVBS4KARIBVFSWorkerSource = (): string => patchKonomiTVBS4KARIBVFSWorkerSource(
-    readFileSync(konomitv_bs4k_arib_vfs_worker_path, 'utf-8'),
-);
-
-// VFS Worker 自身を /data-broadcast/ scope 内へ置き、追加レスポンスヘッダーなしで登録可能にする。
-const konomitv_bs4k_arib_vfs_worker_plugin: Plugin = {
-    name: 'konomitv-bs4k-arib-vfs-worker',
-    configureServer(server) {
-        server.middlewares.use('/data-broadcast/arib-vfs-sw.js', (_request, response) => {
-            response.statusCode = 200;
-            response.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-            response.end(loadKonomiTVBS4KARIBVFSWorkerSource());
-        });
-    },
-    generateBundle() {
-        this.emitFile({
-            type: 'asset',
-            fileName: 'data-broadcast/arib-vfs-sw.js',
-            source: loadKonomiTVBS4KARIBVFSWorkerSource(),
-        });
-    },
-};
 
 
 // Vite の設定
@@ -92,7 +62,6 @@ export default defineConfig({
     },
     // プラグインの設定
     plugins: [
-        konomitv_bs4k_arib_vfs_worker_plugin,
         comlink(),
         vue({
             template: {
