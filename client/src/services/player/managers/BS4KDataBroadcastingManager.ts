@@ -18,6 +18,7 @@ import type {
 import router from '@/router';
 import PlayerManager from '@/services/player/PlayerManager';
 import useChannelsStore from '@/stores/ChannelsStore';
+import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import { dayjs, PlayerUtils } from '@/utils';
 
@@ -349,6 +350,7 @@ class BS4KDataBroadcastingManager implements PlayerManager {
     private autostart_scheduled = false;
     private media_plane_adapter: KonomiTVBS4KMediaPlaneAdapter | null = null;
     private visible = false;
+    private previous_remocon_display: boolean | null = null;
 
     constructor(player: DPlayer) {
         this.player = player;
@@ -422,6 +424,7 @@ class BS4KDataBroadcastingManager implements PlayerManager {
         this.event_processing_tail = Promise.resolve();
 
         this.exitApplication();
+        this.unlockPanelForApplication();
         this.host?.setLctBackgroundColor(null);
         this.host?.destroy();
         this.host = null;
@@ -555,6 +558,7 @@ class BS4KDataBroadcastingManager implements PlayerManager {
                     this.active_application_key = null;
                     this.pending_application_key = null;
                     this.visible = false;
+                    this.unlockPanelForApplication();
                     this.media_plane_adapter?.setApplicationVisible(false);
                     if (this.viewport !== null) this.viewport.style.opacity = '0';
                     if (this.iframe !== null) {
@@ -1217,7 +1221,7 @@ class BS4KDataBroadcastingManager implements PlayerManager {
         }
     }
 
-    /** active applicationのvisibilityをiframeと映像面へ同時反映する。 */
+    /** active applicationのvisibilityをiframe、映像面、リモコンpanelへ同時反映する。 */
     private applyApplicationVisibility(): void {
         const application = this.active_application_key === null
             ? null
@@ -1226,6 +1230,8 @@ class BS4KDataBroadcastingManager implements PlayerManager {
         this.visible = visible;
         this.host?.setApplicationInputActive(visible);
         this.media_plane_adapter?.setApplicationVisible(visible);
+        if (visible) this.lockPanelForApplication();
+        else this.unlockPanelForApplication();
         if (this.viewport !== null) this.viewport.style.opacity = visible ? '1' : '0';
         if (this.iframe !== null) {
             // 非表示AUTOSTARTも実行は継続し、ユーザー向け合成面だけを隠す。
@@ -1244,12 +1250,26 @@ class BS4KDataBroadcastingManager implements PlayerManager {
         this.visible = false;
         this.host?.setApplicationInputActive(false);
         this.media_plane_adapter?.setApplicationVisible(false);
+        this.unlockPanelForApplication();
         if (this.viewport !== null) this.viewport.style.opacity = '0';
         if (this.iframe !== null) {
             this.iframe.style.opacity = '0';
             this.iframe.style.display = 'none';
             this.iframe.setAttribute('aria-hidden', 'true');
         }
+    }
+
+    /** application表示中はリモコンpanelを開き、終了後にユーザーの元の表示状態へ戻す。 */
+    private lockPanelForApplication(): void {
+        const player_store = usePlayerStore();
+        if (this.previous_remocon_display === null) this.previous_remocon_display = player_store.is_remocon_display;
+        player_store.is_remocon_display = true;
+    }
+
+    private unlockPanelForApplication(): void {
+        const player_store = usePlayerStore();
+        if (this.previous_remocon_display !== null) player_store.is_remocon_display = this.previous_remocon_display;
+        this.previous_remocon_display = null;
     }
 
     private resolveNumberKey(remocon_id: number): number | undefined {

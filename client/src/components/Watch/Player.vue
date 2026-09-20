@@ -226,7 +226,6 @@ const handleSettingCoverClick = () => {
     .dplayer-controller-mask {
         height: 82px !important;
         background: linear-gradient(to bottom, transparent, rgba(var(--v-theme-player-overlay), 0.92)) !important;
-        z-index: 3;
         opacity: 0 !important;
         visibility: hidden;
         transition: opacity 0.3s ease, visibility 0.3s ease !important;
@@ -251,7 +250,6 @@ const handleSettingCoverClick = () => {
         padding-left: calc(68px + 18px) !important;
         padding-right: calc(0px + 18px) !important;
         padding-bottom: 6px !important;
-        z-index: 3;
         transition: opacity 0.3s ease, visibility 0.3s ease;
         opacity: 0 !important;
         visibility: hidden;
