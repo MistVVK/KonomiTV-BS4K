@@ -100,3 +100,4 @@ Update: [Upstream] upstream/master の更新を取り込む
    - upstream からの取り込みコミットは Git コミット規約に従い `Update: [Upstream] upstream/master の更新を取り込む` とする。
    - pushは絶対にしない
    - PRもしない
+   - upstream の Twitter / Bluesky 関連の変更は取り込まない。KonomiTV-BS4K では対応を除去する方針のため、取り込み時に該当箇所（サーバーの Twitter/Bluesky ルーター・API・モデル・schemas、クライアントのパネル・services・stores・設定キー等）の upstream 側変更は採用せず、除去状態を維持する。コンフリクト時は除去側を正として解決する。
