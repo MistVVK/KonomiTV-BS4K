@@ -53,6 +53,14 @@ class KonomiTVBS4KTLVProgramHint:
     hdr_programme_icon: bool
 
 
+@dataclass(frozen=True)
+class KonomiTVBS4KTLVAudioTrackSelection:
+    """主サービスの音声トラックと FFmpeg map 可否。"""
+
+    packet_id: int
+    is_mappable: bool
+
+
 KonomiTVBS4KTLVDatacastEventType = Literal[
     'snapshot_begin',
     'snapshot_end',
@@ -107,6 +115,9 @@ class KonomiTVBS4KTLVServiceResolution:
     normal_excluded_context_ids: tuple[int, ...]
     rain_excluded_context_ids: tuple[int, ...]
     head_buffer: bytes
+    # 主 context の全音声を component_tag 順で保持する。main_audio_packet_id は従来どおり
+    # 先頭の map 可能な音声を指し、8ch 超の音声は is_mappable=False として FFmpeg map から除外する
+    main_audio_tracks: tuple[KonomiTVBS4KTLVAudioTrackSelection, ...] = ()
 
 
 class KonomiTVBS4KTLVServiceResolver:
@@ -364,7 +375,50 @@ class KonomiTVBS4KTLVServiceResolver:
         )
 
     @staticmethod
+    def selectAudioTracks(
+        tracks: tuple[KonomiTVBS4KTLVTrackSnapshot, ...],
+        main_context_id: int | None,
+    ) -> tuple[KonomiTVBS4KTLVAudioTrackSelection, ...]:
+        """
+        主 context の全音声を component_tag 順に並べ、FFmpeg map 可否を付ける。
+
+        Args:
+            tracks (tuple[KonomiTVBS4KTLVTrackSnapshot, ...]): 最新 snapshot の全トラック。
+            main_context_id (int | None): 主サービスの context_id。
+
+        Returns:
+            tuple[KonomiTVBS4KTLVAudioTrackSelection, ...]:
+                component_tag、track_id 順の音声トラックと map 可否。
+        """
+
+        if main_context_id is None:
+            return ()
+
+        audio_tracks = sorted(
+            (
+                track for track in tracks
+                if track.context_id == main_context_id and track.kind == 'Audio'
+            ),
+            key=lambda track: (
+                track.component_tag if track.component_tag is not None else 0xFFFF,
+                track.track_id,
+            ),
+        )
+        return tuple(
+            KonomiTVBS4KTLVAudioTrackSelection(
+                packet_id=track.packet_id,
+                # helper がチャンネル数を報告しない旧入力は、従来どおり map 対象として扱う。
+                is_mappable=(
+                    track.audio_channels is None or
+                    track.audio_channels <= KonomiTVBS4KTLVServiceResolver.MAX_TRANSCODABLE_AUDIO_CHANNELS
+                ),
+            )
+            for track in audio_tracks
+        )
+
+    @classmethod
     def selectTrackPacketIds(
+        cls,
         tracks: tuple[KonomiTVBS4KTLVTrackSnapshot, ...],
         main_context_id: int | None,
         rain_context_id: int | None,
@@ -402,22 +456,12 @@ class KonomiTVBS4KTLVServiceResolver:
             track for track in tracks
             if track.context_id == main_context_id and track.kind == 'Video'
         ]
-        # FFmpeg は -max_audio_channels を超える音声トラックの AVStream を生成しないため、
-        # 22.2ch (24ch) などの超過トラックを選ぶと必須 map が matches no streams になり
-        # ライブ開始が失敗する。チャンネル数が上限を超える音声は選択候補から除外する
-        main_audio_tracks = [
-            track for track in tracks
-            if (
-                track.context_id == main_context_id and
-                track.kind == 'Audio' and
-                (
-                    track.audio_channels is None or
-                    track.audio_channels <= KonomiTVBS4KTLVServiceResolver.MAX_TRANSCODABLE_AUDIO_CHANNELS
-                )
-            )
-        ]
         main_video_track = min(main_video_tracks, key=trackSortKey, default=None)
-        main_audio_track = min(main_audio_tracks, key=trackSortKey, default=None)
+        # main_audio_packet_id の既存契約は維持し、全件選択結果の先頭にある map 可能な音声を主音声とする。
+        main_audio_track = next(
+            (track for track in cls.selectAudioTracks(tracks, main_context_id) if track.is_mappable is True),
+            None,
+        )
 
         rain_video_track: KonomiTVBS4KTLVTrackSnapshot | None = None
         if rain_context_id is not None:
@@ -455,6 +499,7 @@ class KonomiTVBS4KTLVServiceResolver:
         main_video_packet_id: int | None,
         main_audio_packet_id: int | None,
         rain_video_packet_id: int | None,
+        main_audio_packet_ids: tuple[int, ...] = (),
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """
         FFmpeg の packet_id map へ混入する他 context のストリームを負の map で除外する context_id 一覧を返す。
@@ -471,6 +516,7 @@ class KonomiTVBS4KTLVServiceResolver:
             main_video_packet_id (int | None): 主映像トラックの packet_id。
             main_audio_packet_id (int | None): 主音声トラックの packet_id。
             rain_video_packet_id (int | None): 降雨対応映像トラックの packet_id (未選出なら None)。
+            main_audio_packet_ids (tuple[int, ...]): 主 context にある map 可能な全音声の packet_id。
 
         Returns:
             tuple[tuple[int, ...], tuple[int, ...]]:
@@ -508,7 +554,8 @@ class KonomiTVBS4KTLVServiceResolver:
 
         # 通常モードでは主映像・主音声を map し、必要な context は主 context のみ。
         # このモードでは低階層 context を除外しても再生に影響しない
-        normal_mapped = {main_video_packet_id, main_audio_packet_id}
+        mapped_audio_packet_ids = main_audio_packet_ids or (main_audio_packet_id,)
+        normal_mapped = {main_video_packet_id, *mapped_audio_packet_ids}
         validateNoUnresolvableCollision(normal_mapped, {main_context_id})
         normal_excluded = collidingContexts(normal_mapped, {main_context_id})
 
@@ -516,7 +563,7 @@ class KonomiTVBS4KTLVServiceResolver:
         # このモードで衝突する context は除外できないため、除外不能な衝突として失敗させる
         rain_excluded: tuple[int, ...] = ()
         if rain_video_packet_id is not None and rain_context_id is not None:
-            rain_mapped = {rain_video_packet_id, main_audio_packet_id}
+            rain_mapped = {rain_video_packet_id, *mapped_audio_packet_ids}
             rain_needed = {main_context_id, rain_context_id}
             validateNoUnresolvableCollision(rain_mapped, rain_needed)
             rain_excluded = collidingContexts(rain_mapped, rain_needed)
@@ -574,6 +621,7 @@ class KonomiTVBS4KTLVServiceResolver:
         main_video_packet_id: int | None = None
         main_audio_packet_id: int | None = None
         rain_video_packet_id: int | None = None
+        main_audio_tracks: tuple[KonomiTVBS4KTLVAudioTrackSelection, ...] = ()
         is_rain_fallback_broadcasting: bool | None = None
 
         # stdout 読取は独立タスクにし、stdin 書込と並行させる。
@@ -581,7 +629,7 @@ class KonomiTVBS4KTLVServiceResolver:
         async def readMetadata() -> None:
             nonlocal latest_tracks
             nonlocal main_context_id, rain_context_id
-            nonlocal main_video_packet_id, main_audio_packet_id, rain_video_packet_id
+            nonlocal main_video_packet_id, main_audio_packet_id, rain_video_packet_id, main_audio_tracks
             nonlocal is_rain_fallback_broadcasting
             while True:
                 line = await stdout.readline()
@@ -618,6 +666,7 @@ class KonomiTVBS4KTLVServiceResolver:
                     main_audio_packet_id,
                     rain_video_packet_id,
                 ) = cls.selectTrackPacketIds(latest_tracks, main_context_id, rain_context_id)
+                main_audio_tracks = cls.selectAudioTracks(latest_tracks, main_context_id)
                 if rain_service_id is not None:
                     # MPT は対象 context の完全なトラック一覧なので、観測済みなら Video の有無を確定できる。
                     # SDT だけを見て低階層を採用すると FFmpeg の必須 map を満たせないため、未観測は None のままにする。
@@ -698,6 +747,9 @@ class KonomiTVBS4KTLVServiceResolver:
             main_video_packet_id,
             main_audio_packet_id,
             rain_video_packet_id,
+            main_audio_packet_ids=tuple(
+                track.packet_id for track in main_audio_tracks if track.is_mappable is True
+            ),
         )
         # 実放送で context 間の packet_id 衝突が起きたか後から調べられるよう、衝突時は観測した
         # 全トラックの context_id / packet_id / 種別を併せて記録する。
@@ -725,6 +777,7 @@ class KonomiTVBS4KTLVServiceResolver:
             normal_excluded_context_ids=normal_excluded_context_ids,
             rain_excluded_context_ids=rain_excluded_context_ids,
             head_buffer=bytes(head_buffer),
+            main_audio_tracks=main_audio_tracks,
         )
 
     @staticmethod
