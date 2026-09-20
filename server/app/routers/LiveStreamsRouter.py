@@ -1,7 +1,6 @@
 
 import asyncio
 import copy
-import json
 from dataclasses import replace
 from typing import Annotated, cast
 
@@ -382,82 +381,6 @@ async def LiveStreamEventAPI(
     return EventSourceResponse(generator())
 
 
-# ***** ライブ BS4K データ放送イベント API *****
-
-
-@router.get(
-    '/{display_channel_id}/{quality}/data-broadcast',
-    summary = 'ライブストリーム データ放送イベント API',
-    response_class = Response,
-    responses = {
-        status.HTTP_200_OK: {
-            'description': 'BS4K の MMT/TLV ライブから抽出したデータ放送の snapshot と差分イベントが随時配信されるイベントストリーム。',
-            'content': {'text/event-stream': {}},
-        },
-        status.HTTP_429_TOO_MANY_REQUESTS: {
-            'description': '同一 LiveStream のデータ放送購読者数が上限（8）に達している。',
-        },
-    },
-)
-async def LiveDataBroadcastStreamAPI(
-    request: Request,
-    display_channel_id: Annotated[str, Depends(ValidateChannelID)],
-    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
-):
-    """
-    BS4K の MMT/TLV ライブから抽出したデータ放送イベントを Server-Sent Events で配信する。<br>
-    接続直後に現在の完全な snapshot を送信し、以降は差分イベントを随時配信する。
-
-    BS4K 以外のチャンネル、またはライブ入力方式が Tlv 以外の場合は、空の text/event-stream を HTTP 200 で返す。<br>
-    同一 LiveStream に対する購読者上限は8であり、上限到達時は HTTP 429 を返す。
-    """
-
-    # 配信系APIへ認証体系が将来導入される場合は、本APIも同じ認証境界へ追随する。
-    # MPEG-TSやBS4K以外にはHTML5データ放送イベントがないため、待機せず空の正常応答を返す。
-    if (
-        display_channel_id.startswith('bs4k') is False or
-        Config().general.konomitv_bs4k_live_transport != 'Tlv'
-    ):
-        return Response(content=b'', media_type='text/event-stream')
-
-    # /eventsと完全に同じ解決済み画質・codec query・Stream Anchor設定から同一LiveStreamを取得する。
-    live_stream = LiveStream(
-        display_channel_id,
-        stream_quality.quality,
-        stream_quality.encoding_options,
-        getattr(request.state, 'stream_anchor_enabled', True),
-    )
-    client = live_stream.connectDataBroadcast()
-    if client is None:
-        raise HTTPException(
-            status_code = status.HTTP_429_TOO_MANY_REQUESTS,
-            detail = 'Too many data broadcast subscribers for this LiveStream',
-        )
-
-    async def generator():
-        """接続時snapshotの後に有限Queueから差分イベントを配信する。"""
-
-        try:
-            for event in client.takeInitialSnapshot():
-                yield {
-                    'event': event.event_type,
-                    'data': json.dumps(event.payload, ensure_ascii=False, separators=(',', ':')),
-                }
-            while True:
-                events = await client.readEvents()
-                if events is None:
-                    return
-                for event in events:
-                    yield {
-                        'event': event.event_type,
-                        'data': json.dumps(event.payload, ensure_ascii=False, separators=(',', ':')),
-                    }
-        finally:
-            live_stream.disconnectDataBroadcast(client)
-
-    return EventSourceResponse(generator())
-
-
 # ***** ライブ PSI/SI アーカイブデータストリーミング API *****
 
 
@@ -483,8 +406,8 @@ async def LivePSIArchivedDataAPI(
     何らかの理由でライブストリームが終了しない限り、継続的にレスポンスが出力される（ストリーミング）。
     """
 
-    # MMT/TLV は MPEG-TS PSI/SI アーカイバーへ入力できず、BS4K HTML5データ放送は上の専用SSEで配信する。
-    # クライアントは再生開始時に本APIへ常に接続するため、10秒待って500にせず空の正常応答で即座に終了させる。
+    # MMT/TLV は MPEG-TS PSI/SI アーカイバーへ入力できない。クライアントは再生開始時にこの API を
+    # 常に接続するため、10 秒待って 500 にせず、空の正常応答でデコーダーを即座に終了させる。
     if (
         display_channel_id.startswith('bs4k') and
         Config().general.konomitv_bs4k_live_transport == 'Tlv'

@@ -27,10 +27,7 @@ from app.constants import DATABASE_CONFIG, JST, LIBRARY_PATH, STATIC_DIR, THUMBN
 from app.models.RecordedVideo import RecordedVideo
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_CONTAINER_FORMAT
-from app.utils.KonomiTVBS4KTLVServiceResolver import (
-    KonomiTVBS4KTLVMetadataSnapshot,
-    KonomiTVBS4KTLVServiceResolver,
-)
+from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
 
 
 # HDR (HLG/PQ) 録画の検出と BT.2446-1 Method C 変換の単一定義
@@ -1735,8 +1732,7 @@ class ThumbnailGenerator:
         snapshot = KonomiTVBS4KTLVServiceResolver.parseMetadataLine(
             process.stdout.decode(errors='replace'),
         )
-        # 録画ファイル向けhelperも将来データ放送行を出力し得るため、B60判定ではmetadata snapshotだけを扱う。
-        if not isinstance(snapshot, KonomiTVBS4KTLVMetadataSnapshot):
+        if snapshot is None:
             logging.warning(f'{self.file_path}: B60 video descriptor probe returned no metadata snapshot.')
             return None
 
