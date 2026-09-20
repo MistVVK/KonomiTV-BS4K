@@ -238,6 +238,14 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
     private resize_observer: ResizeObserver | null = null;
     private watch_stops: WatchStopHandle[] = [];
     private media_info_handler: ((...args: unknown[]) => void) | null = null;
+    // <video> の状態変化を購読し、フレーム未着の過渡期に canvas を隠すためのハンドラー
+    private media_state_handler: (() => void) | null = null;
+    // 現時点で <video> から描画できるフレームがあるか。再起動・再バッファ中は false になり、
+    // canvas が最後の変換済みフレームを残し続けると「左=古い静止画、右=真っ黒」の不整合表示になる
+    private frame_ready = false;
+    // 設定ポリシー上 canvas を見せるべきか (applyPolicy の計算結果)。
+    // 実際の canvas の表示は frame_ready との両方が true のときだけになる
+    private policy_canvas_visible = false;
     private source_kind: KonomiTVBS4KHdrSourceKind = 'None';
     private rewrite_mode: KonomiTVBS4KHdrRewriteMode = 'None';
     // 直近で mpegts.js へ渡した色信号書換え。同じ値の再適用はライブ切断の原因になるため省略する。
@@ -253,8 +261,12 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
 
     public async init(): Promise<void> {
         this.destroyed = false;
+        // 新しい再生セッションではまだ描画済みフレームがない。frame_ready を戻さないと
+        // destroy 前に映っていた古い canvas が init 直後も一瞬表示され続ける
+        this.frame_ready = false;
         this.installCanvas();
         this.bindMediaInfo();
+        this.bindMediaState();
         this.watch_stops = [
             watch(
                 () => useSettingsStore().settings.konomitv_bs4k_hdr_output,
@@ -300,6 +312,7 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         }
         this.watch_stops = [];
         this.unbindMediaInfo();
+        this.unbindMediaState();
         this.stopFrameLoop();
         this.disposeGl();
         this.canvas?.remove();
@@ -390,6 +403,56 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         this.media_info_handler = null;
     }
 
+    // <video> の再生状態を購読し、フレーム未着の過渡期に canvas を隠すハンドラーを登録する
+    private bindMediaState(): void {
+        const video = this.player.video;
+        this.media_state_handler = () => {
+            if (this.destroyed === true) {
+                return;
+            }
+            // emptied / loadstart / waiting / stalled / error 時点で描画可能フレームが落ちた場合は、
+            // 次のフレームが描画されるまで canvas を隠して左右の表示状態をそろえる。
+            // 復側 (フレーム到着) は drawFrame の描画成功時に frame_ready へ反映するのでここで購読しない
+            if (this.hasDrawableFrame() === false && this.frame_ready === true) {
+                this.frame_ready = false;
+                this.updateCanvasVisibility();
+            }
+        };
+        for (const event_name of ['emptied', 'loadstart', 'waiting', 'stalled', 'error']) {
+            video.addEventListener(event_name, this.media_state_handler);
+        }
+    }
+
+    // bindMediaState() で登録した <video> のイベントハンドラーを解除する
+    private unbindMediaState(): void {
+        const video = this.player.video;
+        if (this.media_state_handler !== null) {
+            for (const event_name of ['emptied', 'loadstart', 'waiting', 'stalled', 'error']) {
+                video.removeEventListener(event_name, this.media_state_handler);
+            }
+        }
+        this.media_state_handler = null;
+    }
+
+    // 現在 <video> から canvas へ描画できるフレームを持っているかどうか
+    private hasDrawableFrame(): boolean {
+        const video = this.player.video;
+        return video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0;
+    }
+
+    // applyPolicy() の計算結果 (policy_canvas_visible) と描画可能フレームの有無 (frame_ready) を
+    // 突き合わせて、canvas の実際の表示 / 非表示を決め適用する
+    private updateCanvasVisibility(): void {
+        if (this.canvas === null) {
+            return;
+        }
+        // フレーム未着の過渡期に canvas を見せると、最後の変換済みフレーム (preserveDrawingBuffer 保持) や
+        // 未描画の黒い backing が左半面だけを覆い、右半面の素通し <video> と状態が食い違う。
+        // policy 上必要でも、実際に描画できるフレームが来るまで非表示を維持するのがこの修正の要点
+        this.canvas.style.display =
+            this.policy_canvas_visible === true && this.frame_ready === true ? 'block' : 'none';
+    }
+
     private applyPolicy(): void {
         if (this.destroyed === true) {
             return;
@@ -430,7 +493,10 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
             show_canvas = false;
         }
         if (this.canvas !== null) {
-            this.canvas.style.display = show_canvas === true ? 'block' : 'none';
+            // canvas の実際の表示は updateCanvasVisibility() で frame_ready とあわせて決めるため、
+            // ここではポリシー上の要求だけを保持する
+            this.policy_canvas_visible = show_canvas;
+            this.updateCanvasVisibility();
             // ライブ Debug は左半分だけ canvas。右半分は下の <video>（mpegts None）を素通しする。
             const clip_left_half = this.rewrite_mode === 'Debug' && this.player.options.live === true;
             this.canvas.style.clipPath = clip_left_half === true ? 'inset(0 50% 0 0)' : 'none';
@@ -551,6 +617,12 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         }
         const video = this.player.video;
         if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth === 0) {
+            // 描画対象のフレームが無い過渡期 (再起動直後・再バッファ中など)。
+            // イベントを逃した場合の取りこぼし対策としても、この確認で frame_ready を落とす
+            if (this.frame_ready === true) {
+                this.frame_ready = false;
+                this.updateCanvasVisibility();
+            }
             return;
         }
         this.syncCanvasSize();
@@ -565,6 +637,12 @@ class KonomiTVBS4KHlgSdrManager implements PlayerManager {
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
         gl.drawArrays(gl.TRIANGLES, 0, 6);
+        // 新しい変換フレームの描画が完了してから canvas を見せる。
+        // 表示復帰は必ず「今の映像と同じ内容を描き終えた後」に行い、古い静止画を見せる隙間を作らない
+        if (this.frame_ready === false) {
+            this.frame_ready = true;
+            this.updateCanvasVisibility();
+        }
     }
 
     private disposeGl(): void {
