@@ -2214,13 +2214,26 @@ class PlayerController {
         // ライブ視聴とビデオ視聴で必要な PlayerManager が異なる
         // この初期化順序は意図的 (入れ替えても動作するものもあるが、CaptureManager は KeyboardShortcutManager より先に初期化する必要がある)
         if (this.playback_mode === 'Live') {
+            // libaribhtml5はBS4KのTLVライブでのみ必要なため、既存のライブ・録画視聴へbundleを持ち込まない。
+            let data_broadcasting_manager: PlayerManager;
+            if (channels_store.channel.current.display_channel_id.startsWith('bs4k') === true &&
+                version_store.server_version_info?.konomitv_bs4k_live_transport === 'Tlv' &&
+                settings_store.settings.tv_show_data_broadcasting === true) {
+                const {default: BS4KDataBroadcastingManager} =
+                    await import('@/services/player/managers/BS4KDataBroadcastingManager');
+                this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
+                data_broadcasting_manager = new BS4KDataBroadcastingManager(this.player);
+            } else {
+                data_broadcasting_manager = new LiveDataBroadcastingManager(this.player);
+            }
             // ライブ視聴時に設定する PlayerManager
             this.player_managers = [
                 new LiveEventManager(this.player),
                 new KonomiTVBS4KHlgSdrManager(this.player),
                 // 実況機能が無効な場合は接続情報 API へのアクセスも WebSocket 接続も開始しない
                 ...(settings_store.is_jikkyo_enabled === true ? [new LiveCommentManager(this.player)] : []),
-                new LiveDataBroadcastingManager(this.player),
+                // BS4KのTLVライブだけARIB HTML5版を使い、それ以外は既存BML経路を維持する。
+                data_broadcasting_manager,
                 new CaptureManager(this.player, this.playback_mode),
                 new DocumentPiPManager(this.player, this.playback_mode),
                 new KeyboardShortcutManager(this.player, this.playback_mode),

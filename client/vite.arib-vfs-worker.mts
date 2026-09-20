@@ -19,6 +19,7 @@ const KONOMITV_BS4K_EXTERNAL_PROXY_RUNTIME = String.raw`
   // location.href への直接代入は Fetch / XHR の差し替えでは捕捉できないため、
   // 書き換え対象ホスト上の文書も VFS Worker の scope 内に写像して receiver runtime を維持する。
   const EXTERNAL_PROXY_PREFIX = VFS_PREFIX + ".external/";
+  const EXTERNAL_PROXY_PERMISSION_PATH = ".konomitv-bs4k-external-network-enabled";
   const EXTERNAL_PROXY_ALLOWED_HOSTS = new Set(${JSON.stringify(KONOMITV_BS4K_ARIB_HTML5_EXTERNAL_PROXY_ALLOWED_HOSTS)});
   function externalProxyRoot(scheme, hostname) {
     return EXTERNAL_PROXY_PREFIX + scheme + "/" + hostname + "/";
@@ -51,6 +52,10 @@ const KONOMITV_BS4K_EXTERNAL_PROXY_RUNTIME = String.raw`
     return { upstreamUrl, rootPath: externalProxyRoot(scheme, hostname) };
   }
   async function serveExternalProxy(request, url) {
+    await restorePersistentResources();
+    if (!enabled || !resources.has(EXTERNAL_PROXY_PERMISSION_PATH)) {
+      return new Response("External broadcast network access is disabled", { status: 403 });
+    }
     const resolved = resolveExternalProxyUrl(url);
     if (!resolved) return new Response("Bad external broadcast path", { status: 400 });
     const proxyUrl = new URL(

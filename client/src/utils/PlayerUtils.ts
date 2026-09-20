@@ -358,7 +358,7 @@ export class PlayerUtils {
 
     /**
      * 再生中の MPEG-TS URL から codec query だけを正規順序で取り出す。
-     * events / psi-archived-data を必ず同一 LiveStream 共有キーへ接続するために使う。
+     * events / psi-archived-data / data-broadcast を必ず同一 LiveStream 共有キーへ接続するために使う。
      */
     static extractKonomiTVBS4KLivePlaybackCodecQueryFromDPlayer(
         konomitv_bs4k_player: DPlayer,
@@ -385,7 +385,7 @@ export class PlayerUtils {
     static buildKonomiTVBS4KLiveAPIEndpointURL(
         konomitv_bs4k_display_channel_id: string,
         konomitv_bs4k_api_quality: string,
-        konomitv_bs4k_endpoint: 'mpegts' | 'events' | 'psi-archived-data',
+        konomitv_bs4k_endpoint: 'mpegts' | 'events' | 'psi-archived-data' | 'data-broadcast',
         konomitv_bs4k_codec_query: string,
     ): string {
         const konomitv_bs4k_url =
@@ -401,7 +401,7 @@ export class PlayerUtils {
     static buildKonomiTVBS4KLiveAPIEndpointURLFromDPlayer(
         konomitv_bs4k_player: DPlayer,
         konomitv_bs4k_display_channel_id: string,
-        konomitv_bs4k_endpoint: 'mpegts' | 'events' | 'psi-archived-data',
+        konomitv_bs4k_endpoint: 'mpegts' | 'events' | 'psi-archived-data' | 'data-broadcast',
     ): string {
         const konomitv_bs4k_api_quality =
             this.extractLiveAPIQualityFromDPlayer(konomitv_bs4k_player);
