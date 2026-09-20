@@ -39,7 +39,8 @@ private:
     using ApplicationKey =
         std::tuple<std::uint32_t, std::uint16_t, std::uint16_t, std::uint32_t>;
     using ResourceKey = std::pair<std::uint32_t, std::string>;
-    using EventKey = std::tuple<std::uint32_t, std::uint8_t, std::uint8_t>;
+    using EventKey =
+        std::tuple<std::uint32_t, std::uint16_t, std::uint16_t, std::uint8_t>;
 
     struct StoredResource {
         aribtlv::ApplicationResource resource;

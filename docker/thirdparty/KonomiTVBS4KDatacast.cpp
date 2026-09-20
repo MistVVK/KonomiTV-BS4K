@@ -183,7 +183,7 @@ void KonomiTVBS4KDatacast::onLayoutConfiguration(
 
 void KonomiTVBS4KDatacast::onEventInfo(const aribtlv::EventInfo& event) {
     if (!enabled_ || suspended_until_source_reset_) return;
-    events_[EventKey{event.context_id, event.table_id, event.section_number}] = event;
+    events_[EventKey{event.context_id, event.service_id, event.event_id, event.table_id}] = event;
     if (snapshot_emitted_) emitEventInfo(event);
 }
 

@@ -147,6 +147,17 @@ bool TestDatacastSnapshotAndDiffFraming() {
     // entryが揃う前は出力せず、resourceとready stateが揃った時点を完全snapshotの境界にする。
     datacast.onApplicationState(BuildDatacastApplicationState(false));
     datacast.onApplicationResource(BuildDatacastResource(20 * 1024, 'a'));
+    // 1つのMH-EIT sectionから複数eventが通知されても、完全snapshotでは別々に保持する。
+    aribtlv::EventInfo first_event;
+    first_event.context_id = 7;
+    first_event.service_id = 101;
+    first_event.table_id = 0x8c;
+    first_event.section_number = 120;
+    first_event.event_id = 16317;
+    datacast.onEventInfo(first_event);
+    auto second_event = first_event;
+    second_event.event_id = 17969;
+    datacast.onEventInfo(second_event);
     if (!output.str().empty()) {
         std::cerr << "datacast emitted a partial initial state\n";
         return false;
@@ -168,6 +179,8 @@ bool TestDatacastSnapshotAndDiffFraming() {
         !ExpectContains(snapshot, "\"type\":\"application_state\"", "datacast application state") ||
         !ExpectContains(snapshot, "\"seq\":0,\"total\":2", "datacast first resource chunk") ||
         !ExpectContains(snapshot, "\"seq\":1,\"total\":2", "datacast final resource chunk") ||
+        !ExpectContains(snapshot, "\"eventId\":16317", "datacast first same-section event") ||
+        !ExpectContains(snapshot, "\"eventId\":17969", "datacast second same-section event") ||
         !ExpectContains(snapshot, "{\"type\":\"snapshot_end\"}\n", "datacast snapshot end")) {
         return false;
     }
