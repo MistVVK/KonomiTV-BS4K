@@ -957,8 +957,8 @@ class BS4KDataBroadcastingManager implements PlayerManager {
 
     /** visibility descriptorに従いユーザーへ表示するapplicationか判定する。 */
     private applicationIsUserVisible(application: ManagedApplication): boolean {
-        // 古いdemuxerがdescriptorを出さない場合は、従来どおり可視として扱う。
-        return !application.state.applicationDescriptorPresent || application.state.visibility === 0x03;
+        // descriptor不在時は可視性を推定せず、実行を継続したままユーザー向け合成面だけを隠す。
+        return application.state.applicationDescriptorPresent && application.state.visibility === 0x03;
     }
 
     /** AUTOSTART候補を同一microtask内でpriority順に一度だけ起動する。 */
