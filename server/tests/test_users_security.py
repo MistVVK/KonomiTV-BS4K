@@ -40,9 +40,6 @@ async def _InitializeDatabase() -> None:
             'models': [
                 'app.models.User',
                 'app.models.RefreshToken',
-                'app.models.TwitterAccount',
-                'app.models.BlueskyAccount',
-                'app.models.AccountLink',
             ],
         },
         timezone = 'Asia/Tokyo',

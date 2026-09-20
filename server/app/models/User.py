@@ -27,10 +27,7 @@ from app.utils import Interlaced
 
 
 if TYPE_CHECKING:
-    from app.models.AccountLink import AccountLink
-    from app.models.BlueskyAccount import BlueskyAccount
     from app.models.RefreshToken import RefreshToken
-    from app.models.TwitterAccount import TwitterAccount
 
 
 def encodeClientSettingsJSON(value: object) -> str:
@@ -75,10 +72,7 @@ class User(TortoiseModel):
         TortoiseField[str | None],
         fields.TextField(null=True, source_field='niconico_refresh_token'),
     )
-    twitter_accounts: fields.ReverseRelation[TwitterAccount]
-    bluesky_accounts: fields.ReverseRelation[BlueskyAccount]
     refresh_tokens: fields.ReverseRelation[RefreshToken]
-    account_links: fields.ReverseRelation[AccountLink]
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)
 

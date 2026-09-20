@@ -1101,35 +1101,6 @@ class UserUpdateRequest(BaseModel):
 class UserUpdateRequestForAdmin(BaseModel):
     is_admin: bool | None = None
 
-# ***** Twitter / Bluesky 連携のブラウザ情報 =====
-## TwitterScrapeBrowser 経由のヘッドレスブラウザ検出情報。
-## API 経路の除去後も models.TwitterAccount / BlueskyAccount の保存列 (JSON) が型として参照するため残す。
-## アカウントモデルと併せて card-13 (DB drop) で削除する予定。
-
-class BrowserEnvironmentInfo(TypedDict):
-    http_headers: BrowserEnvironmentHTTPHeaders
-    user_agent_data: BrowserEnvironmentUserAgentData
-    navigator_platform: str
-    locale: str
-    timezone: str
-
-class BrowserEnvironmentHTTPHeaders(TypedDict):
-    user_agent: str | None
-    accept_language: str | None
-    accept_languages: list[str]
-    sec_ch_ua: str | None
-    sec_ch_ua_mobile: str | None
-    sec_ch_ua_platform: str | None
-
-class BrowserEnvironmentUserAgentData(TypedDict):
-    platform: str
-    platform_version: str
-    architecture: str
-    bitness: str
-    mobile: bool
-    model: str
-    wow64: bool
-
 # モデルに関連しない API レスポンスの構造を表す Pydantic モデル
 ## レスポンスボディの JSON 構造と一致する
 

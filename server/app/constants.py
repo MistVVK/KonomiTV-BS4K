@@ -828,24 +828,6 @@ def _LoadOrCreateJWTSecretKey(path: Path) -> str:
 ## jwt_secret.dat からシークレットキーをロードする
 JWT_SECRET_KEY = _LoadOrCreateJWTSecretKey(JWT_SECRET_KEY_PATH)
 
-# 暗号化された Cookie の接頭辞
-TWITTER_ACCOUNT_COOKIE_ENCRYPTION_PREFIX = 'enc:'
-# Cookie の暗号化に使う Fernet の暗号化キー
-TWITTER_ACCOUNT_COOKIE_FERNET_KEY = base64.urlsafe_b64encode(
-    hashlib.sha256(JWT_SECRET_KEY.encode('utf-8')).digest(),
-)
-# Cookie の暗号化に使う Fernet のインスタンス
-TWITTER_ACCOUNT_COOKIE_FERNET = Fernet(TWITTER_ACCOUNT_COOKIE_FERNET_KEY)
-
-# 暗号化された Bluesky セッション文字列の接頭辞
-BLUESKY_ACCOUNT_SESSION_ENCRYPTION_PREFIX = 'enc:'
-# Bluesky セッション文字列の暗号化に使う Fernet の暗号化キー
-BLUESKY_ACCOUNT_SESSION_FERNET_KEY = base64.urlsafe_b64encode(
-    hashlib.sha256(f'bluesky:{JWT_SECRET_KEY}'.encode()).digest(),
-)
-# Bluesky セッション文字列の暗号化に使う Fernet のインスタンス
-BLUESKY_ACCOUNT_SESSION_FERNET = Fernet(BLUESKY_ACCOUNT_SESSION_FERNET_KEY)
-
 # 暗号化されたニコニコ OAuth トークンの接頭辞
 NICONICO_TOKEN_ENCRYPTION_PREFIX = 'enc:'
 # ニコニコ OAuth トークンの暗号化に使う Fernet の暗号化キー
