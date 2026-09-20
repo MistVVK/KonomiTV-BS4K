@@ -1,7 +1,5 @@
 #include <aribtlv/demuxer.hpp>
 
-#include "KonomiTVBS4KDatacast.hpp"
-
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -83,8 +81,7 @@ class MetadataSink final : public aribtlv::Sink {
 public:
     // streaming 時はサービス・トラックの現在スナップショットを stdout へ出力し、
     // 呼び出し側 (ライブ視聴のプローブ) が目的の service_id と映像を得たら早期終了できるようにする。
-    explicit MetadataSink(const bool streaming = false)
-        : streaming_(streaming), datacast_(streaming, std::cout, std::cerr) {}
+    explicit MetadataSink(const bool streaming = false) : streaming_(streaming) {}
 
     void onServiceStateReset(const aribtlv::ServiceStateReset& reset) override {
         // 現行 CLI は Demuxer::reset() / selectService() を呼ばないが、将来 Sink を別経路から再利用しても
@@ -126,42 +123,7 @@ public:
 
     void onAccessUnit(aribtlv::AccessUnit&&) override {}
 
-    void onApplicationState(const aribtlv::ApplicationState& state) override {
-        datacast_.onApplicationState(state);
-    }
-
-    void onApplicationResource(aribtlv::ApplicationResource&& resource) override {
-        datacast_.onApplicationResource(std::move(resource));
-    }
-
-    void onApplicationResourceRemoved(
-        const aribtlv::ApplicationResourceRemoval& removal) override {
-        datacast_.onApplicationResourceRemoved(removal);
-    }
-
-    void onApplicationResourcesReset() override {
-        datacast_.onApplicationResourcesReset();
-    }
-
-    void onBroadcastClock(const aribtlv::BroadcastClock& clock) override {
-        datacast_.onBroadcastClock(clock);
-    }
-
-    void onLayoutConfiguration(const aribtlv::LayoutConfiguration& layout) override {
-        datacast_.onLayoutConfiguration(layout);
-    }
-
-    void onStreamEvent(const aribtlv::StreamEvent& event) override {
-        datacast_.onStreamEvent(event);
-    }
-
-    void onViewerParticipationNotification(
-        const aribtlv::ViewerParticipationNotification& notification) override {
-        datacast_.onViewerParticipationNotification(notification);
-    }
-
     void onError(const aribtlv::Error& error) override {
-        datacast_.onError(error);
         // 復旧不能な入力エラーだけを終了理由として保持し、JSON stdout は汚さない。
         if (!error.recoverable) {
             fatal_error_ = error.message;
@@ -224,7 +186,6 @@ public:
     }
 
     void onEventInfo(const aribtlv::EventInfo& event) override {
-        datacast_.onEventInfo(event);
         // p/f と schedule は同じ event_id でも記述子の充足度が異なるため、table ごとに保持する。
         // 同じ table の再送だけ input offset が後の情報を優先し、同一内容を重複出力しない。
         const auto key = std::tuple{
@@ -270,10 +231,6 @@ public:
 
     [[nodiscard]] bool hasEmittedStreamingSnapshot() const noexcept {
         return has_emitted_streaming_snapshot_;
-    }
-
-    void emitCurrentDatacastSnapshot() {
-        datacast_.emitCurrentSnapshot();
     }
 
     void writeStreamingJSONLine(std::ostream& output) const {
@@ -506,8 +463,6 @@ private:
     bool streaming_ = false;
     // streaming snapshot を 1 回以上出力済みか (stdin で情報未取得のまま終了した場合の判定用)
     bool has_emitted_streaming_snapshot_ = false;
-    // stdinライブ入力でだけ有効化し、データ放送の完全snapshotと差分を同じstdoutへ出力する。
-    KonomiTVBS4KDatacast datacast_;
 };
 
 std::uint64_t ParseProbeSize(const char* text) {
@@ -538,9 +493,7 @@ int main(const int argc, char* argv[]) {
 
         MetadataSink sink(use_stdin);
         aribtlv::Limits limits;
-        // データ放送のカルーセル組立てはライブstdin入力だけで有効化し、録画メタデータ解析の
-        // IO・メモリ特性は従来どおり維持する。
-        limits.collect_application_resources = use_stdin;
+        limits.collect_application_resources = false;
         aribtlv::Demuxer demuxer(sink, limits);
         std::array<std::uint8_t, FILE_READ_BUFFER_SIZE> buffer{};
 
@@ -580,8 +533,6 @@ int main(const int argc, char* argv[]) {
                 std::cerr << "MMT/TLV metadata demuxing failed: " << sink.fatalError() << '\n';
                 return 1;
             }
-            // 有限fixtureプローブではEOF時点の完全カルーセルも出し、snapshot内の全resourceを検証可能にする。
-            if (!follow_stdin) sink.emitCurrentDatacastSnapshot();
             // 情報を一度も取得できなかった場合だけ、空の snapshot を返して呼び出し側へ通知する。
             if (!sink.hasEmittedStreamingSnapshot()) {
                 sink.writeStreamingJSONLine(std::cout);

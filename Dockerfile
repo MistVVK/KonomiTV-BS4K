@@ -79,8 +79,6 @@ COPY ./docker/thirdparty/manifest.env \
      ./docker/thirdparty/build.sh \
      ./docker/thirdparty/build-ffmpeg8.sh \
      ./docker/thirdparty/ffmpeg8-amd.sh \
-     ./docker/thirdparty/KonomiTVBS4KDatacast.cpp \
-     ./docker/thirdparty/KonomiTVBS4KDatacast.hpp \
      ./docker/thirdparty/KonomiTVBS4KTLVMetadata.cpp \
      ./docker/thirdparty/KonomiTVBS4KTLVMetadataTest.cpp \
      ./docker/thirdparty/build-intel-media-stack.sh \
