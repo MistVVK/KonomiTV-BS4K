@@ -200,11 +200,26 @@ class LiveDataBroadcastClient:
             self._missed_events = True
         self._queue.put_nowait(events)
 
-    def close(self) -> None:
-        """待機中の購読処理へ接続終了を通知する。"""
+    def close(
+        self,
+        final_events: tuple[KonomiTVBS4KTLVDatacastEvent, ...] = (),
+    ) -> None:
+        """
+        待機中の購読処理へ最終イベントと接続終了を通知する。
 
+        Args:
+            final_events (tuple[KonomiTVBS4KTLVDatacastEvent, ...]): 終了前に必ず配信するイベントbatch。
+
+        Returns:
+            None
+        """
+
+        # 終了時は旧差分を適用させず、明示的resetと終了通知だけを順番に読み出せるようにする。
         while self._queue.empty() is False:
             self._queue.get_nowait()
+        self._missed_events = False
+        if final_events:
+            self._queue.put_nowait(final_events)
         self._queue.put_nowait(None)
 
 
@@ -1065,12 +1080,23 @@ class LiveStream:
         for client in self._data_broadcast_clients:
             client.writeEvents(events)
 
-    def _disconnectAllDataBroadcastClients(self) -> None:
-        """ストリーム終了時に全データ放送購読者を閉じる。"""
+    def _disconnectAllDataBroadcastClients(
+        self,
+        final_events: tuple[KonomiTVBS4KTLVDatacastEvent, ...] = (),
+    ) -> None:
+        """
+        ストリーム終了時に全データ放送購読者を閉じる。
+
+        Args:
+            final_events (tuple[KonomiTVBS4KTLVDatacastEvent, ...]): 終了前に必ず配信するイベントbatch。
+
+        Returns:
+            None
+        """
 
         clients = self._data_broadcast_clients.copy()
         for client in clients:
-            client.close()
+            client.close(final_events)
             logging.info(f'{self.log_prefix} Data Broadcast Client Disconnected. Client ID: {client.client_id}')
         self._data_broadcast_clients.clear()
 
@@ -1142,7 +1168,12 @@ class LiveStream:
             self._data_broadcast_snapshot_in_progress = False
             self._data_broadcast_waiting_for_snapshot = False
             self._rebuildDataBroadcastSnapshot()
-            self._disconnectAllDataBroadcastClients()
+            self._disconnectAllDataBroadcastClients((
+                KonomiTVBS4KTLVDatacastEvent(
+                    event_type='application_resources_reset',
+                    payload={'reason': 'stream_offline'},
+                ),
+            ))
 
         # ストリーム開始 (Offline or Restart → Standby) 時、started_at と stream_data_written_at を更新する
         # ここで更新しておかないと、いつまで経っても初期化時の古いタイムスタンプが使われてしまう
