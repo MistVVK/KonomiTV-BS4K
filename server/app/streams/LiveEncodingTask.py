@@ -1563,7 +1563,7 @@ class LiveEncodingTask:
                 rain_service_id,
                 self.live_stream.log_prefix,
                 resolution.is_rain_fallback_broadcasting,
-                datacast_event_callback = self.live_stream.publishDataBroadcastEvent,
+                datacast_event_callback = lambda event: self.live_stream.publishDataBroadcastEvent(event),
             )
             rain_fallback_monitor.start()
 
