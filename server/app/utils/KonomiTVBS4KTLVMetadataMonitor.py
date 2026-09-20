@@ -433,6 +433,15 @@ class KonomiTVBS4KTLVMetadataMonitor:
             None
         """
 
+        # helper側の保持上限がサーバー側より先に発火するとstderrは破棄されるため、異常resetの理由をここで残す。
+        if event.event_type == 'application_resources_reset':
+            reason = event.payload.get('reason')
+            if reason in ('resource_limit_exceeded', 'parser_resource_limit_exceeded'):
+                logging.warning(
+                    f'{self._log_prefix} Datacast metadata helper exceeded its resource limit; '
+                    f'resetting application resources. [reason: {reason}]'
+                )
+
         # snapshot/resetは以前の未完結チャンクを引き継げない明示的な状態境界として扱う。
         if event.event_type in ('snapshot_begin', 'application_resources_reset'):
             self._clearDatacastResourceAssemblies()
