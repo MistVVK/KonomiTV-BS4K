@@ -167,6 +167,7 @@ class KonomiTVBS4KMediaPlaneAdapter implements AribMediaPlaneAdapter {
     private managed_video: HTMLVideoElement | null = null;
     private managed_hdr_canvas: HTMLCanvasElement | null = null;
     private hdr_canvas_original_styles = new Map<string, string>();
+    private video_wrap_aspect_original_width: string | null = null;
     private application_visible = true;
     private last_plane: AribMediaPlane | null = null;
 
@@ -215,6 +216,12 @@ class KonomiTVBS4KMediaPlaneAdapter implements AribMediaPlaneAdapter {
             this.restoreNormalLayout();
         }
         this.managed_video = video;
+
+        // videoをabsolute配置しても、通常フロー上の子を失った16:9コンテナがflex内で収縮しないようにする。
+        if (this.video_wrap_aspect_original_width === null) {
+            this.video_wrap_aspect_original_width = this.player.template.videoWrapAspect.style.width;
+        }
+        this.player.template.videoWrapAspect.style.width = '100%';
 
         const percent = (value: number, extent: number): string => `${value / extent * 100}%`;
         const z_index = plane.layer.externalPlacement === 'above-application' ? '2' : '1';
@@ -271,6 +278,15 @@ class KonomiTVBS4KMediaPlaneAdapter implements AribMediaPlaneAdapter {
             }
         }
         this.managed_video = null;
+
+        if (this.video_wrap_aspect_original_width !== null) {
+            if (this.video_wrap_aspect_original_width === '') {
+                this.player.template.videoWrapAspect.style.removeProperty('width');
+            } else {
+                this.player.template.videoWrapAspect.style.width = this.video_wrap_aspect_original_width;
+            }
+            this.video_wrap_aspect_original_width = null;
+        }
 
         if (this.managed_hdr_canvas !== null) {
             for (const [property, value] of this.hdr_canvas_original_styles) {
