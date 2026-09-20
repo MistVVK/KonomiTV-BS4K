@@ -53,11 +53,6 @@ KONOMITV_BS4K_SERIES_IMAGES_DIR = DATA_DIR / 'series-images'
 RECORDED_SUBTITLES_DIR = DATA_DIR / 'recorded-subtitles'
 ## オフライン保存の完成済みパッケージと永続ジョブ状態を保持するディレクトリ
 KONOMITV_BS4K_OFFLINE_JOBS_DIR = DATA_DIR / 'offline-jobs'
-## Twitter 関連のデバッグ用スクリーンショットの保存先ディレクトリ
-TWITTER_DEBUG_SCREENSHOTS_DIR = DATA_DIR / 'twitter-debug-screenshots'
-## デバッグ用スクリーンショットの保持期限 (日数)
-## 7 日を超えたスクリーンショットを自動削除する
-TWITTER_DEBUG_SCREENSHOTS_RETENTION_DAYS = 7
 ## サーバー終了時に再起動が必要なことを伝えるロックファイルのパス
 RESTART_REQUIRED_LOCK_PATH = DATA_DIR / 'restart_required.lock'
 

@@ -81,9 +81,6 @@ class ClientSettings(BaseModel):
     last_synced_at: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 0.0
     # showed_panel_last_time: 同期無効
     # konomitv_bs4k_playback_video_codec_default_initialized: 同期無効
-    # selected_twitter_panel_account: 同期無効
-    # twitter_panel_post_targets: 同期無効
-    saved_twitter_hashtags: list[str] = []
     mylist: list[dict[str, Any]] = []
     watched_history: list[dict[str, Any]] = []
     # lshaped_screen_crop_enabled: 同期無効
@@ -208,14 +205,6 @@ class ClientSettings(BaseModel):
     mute_comment_keywords_normalize_alphanumeric_width_case: bool = True
     muted_comment_keywords: list[dict[str, str]] = []
     muted_niconico_user_ids: list[str] = []
-    fold_panel_after_sending_tweet: bool = False
-    reset_hashtag_when_program_switches: bool = True
-    auto_add_watching_channel_hashtag: bool = True
-    twitter_reply_thread_mode: Literal['PerHashtag', 'PerDay', 'Disabled'] = 'PerHashtag'
-    bluesky_reply_thread_mode: Literal['PerHashtag', 'PerDay', 'Disabled'] = 'Disabled'
-    twitter_active_tab: Literal['Search', 'Timeline', 'Capture'] = 'Capture'
-    tweet_hashtag_position: Literal['Prepend', 'Append', 'PrependWithLineBreak', 'AppendWithLineBreak'] = 'Append'
-    tweet_capture_watermark_position: Literal['None', 'TopLeft', 'TopRight', 'BottomLeft', 'BottomRight'] = 'None'
 
     @staticmethod
     def _rejectNonFiniteNumbers(value: Any, path: str = 'root') -> None:

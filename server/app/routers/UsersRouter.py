@@ -35,10 +35,7 @@ from app.constants import (
     JWT_SECRET_KEY,
     PASSWORD_CONTEXT,
 )
-from app.models.AccountLink import AccountLink
-from app.models.BlueskyAccount import BlueskyAccount
 from app.models.RefreshToken import RefreshToken
-from app.models.TwitterAccount import TwitterAccount
 from app.models.User import User
 from app.utils.AuthSecurity import (
     DUMMY_PASSWORD_HASH,
@@ -255,12 +252,7 @@ async def GetSpecifiedUser(
     """ 指定されたユーザー名のユーザーを取得する """
 
     # 指定されたユーザー名のユーザーを取得
-    user = await User.filter(name=username).prefetch_related(
-        'twitter_accounts',
-        'bluesky_accounts',
-        'account_links__twitter_account',
-        'account_links__bluesky_account',
-    ).get_or_none()
+    user = await User.filter(name=username).get_or_none()
 
     # 指定されたユーザー名のユーザーが存在しない
     if not user:
@@ -373,13 +365,7 @@ async def UserCreateAPI(
             detail = 'Specified username is duplicated',
         ) from ex
 
-    # 外部テーブルのデータを取得してから返す
-    await current_user.fetch_related(
-        'twitter_accounts',
-        'bluesky_accounts',
-        'account_links__twitter_account',
-        'account_links__bluesky_account',
-    )
+    # 作成済みユーザーをそのまま返す
     return current_user
 
 
@@ -576,13 +562,8 @@ async def UsersAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
-    # 常に関連するアカウント系テーブルの対応するレコードを全取得して返す
-    return await User.all().prefetch_related(
-        'twitter_accounts',
-        'bluesky_accounts',
-        'account_links__twitter_account',
-        'account_links__bluesky_account',
-    )
+    # ユーザー一覧をそのまま返す
+    return await User.all()
 
 
 # ***** ログイン中ユーザーアカウント情報 API *****
@@ -602,113 +583,7 @@ async def UserAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。
     """
 
-    # 一番よく使う API なので、リクエスト時に twitter_accounts テーブルに仮のアカウントデータが残っていたらすべて消しておく
-    ## Twitter 連携では途中で連携をキャンセルした場合に仮のアカウントデータが残置されてしまうので、それを取り除く
-    if await TwitterAccount.filter(icon_url='Temporary').count() > 0:
-        await TwitterAccount.filter(icon_url='Temporary').delete()
-
-    # 常に関連するアカウント系テーブルの対応するレコードを全取得して返す
-    return await User.filter(id=current_user.id).prefetch_related(
-        'twitter_accounts',
-        'bluesky_accounts',
-        'account_links__twitter_account',
-        'account_links__bluesky_account',
-    ).get()
-
-
-@router.post(
-    '/me/account-links',
-    summary = 'Twitter / Bluesky アカウント紐付け作成 API',
-    response_description = '作成したアカウント紐付け。',
-    response_model = schemas.AccountLink,
-    status_code = status.HTTP_201_CREATED,
-)
-async def AccountLinkCreateAPI(
-    account_link_create_request: Annotated[schemas.AccountLinkCreateRequest, Body(description='紐付ける Twitter / Bluesky アカウント ID 。')],
-    current_user: Annotated[User, Depends(GetCurrentUser)],
-):
-    """
-    ログイン中ユーザーの Twitter アカウントと Bluesky アカウントを紐付ける。<br>
-    紐付けは視聴画面の Twitter タブで両方のタイムラインをまとめて表示し、ツイートを同時投稿する際に利用される。
-    """
-
-    # リクエストされた Twitter アカウントがログイン中ユーザーの所有物であることを確認する
-    twitter_account = await TwitterAccount.filter(
-        id = account_link_create_request.twitter_account_id,
-        user_id = current_user.id,
-    ).get_or_none()
-    if twitter_account is None:
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Specified Twitter account does not exist',
-        )
-
-    # Bluesky 側も同じユーザーに属するレコードだけを許可し、他ユーザーのアカウントとの紐付けを防ぐ
-    bluesky_account = await BlueskyAccount.filter(
-        id = account_link_create_request.bluesky_account_id,
-        user_id = current_user.id,
-    ).get_or_none()
-    if bluesky_account is None:
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Specified Bluesky account does not exist',
-        )
-
-    # 返却直後にクライアントが表示名やアイコンを表示できるように、両方の子レコードを取得しておく
-    try:
-        account_link = await AccountLink.create(
-            user = current_user,
-            twitter_account = twitter_account,
-            bluesky_account = bluesky_account,
-        )
-    except IntegrityError as ex:
-        # 紐付けは DB の一意制約で一対一を最終保証する
-        ## 事前確認だけでは複数タブの同時作成を防げないため、競合後に実際の重複側を調べて既存のエラー文へ戻す
-        if await AccountLink.filter(twitter_account_id=twitter_account.id).exists() is True:
-            raise HTTPException(
-                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail = 'Specified Twitter account is already linked',
-            ) from ex
-        if await AccountLink.filter(bluesky_account_id=bluesky_account.id).exists() is True:
-            raise HTTPException(
-                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail = 'Specified Bluesky account is already linked',
-            ) from ex
-        logging.error(
-            f'[UsersRouter][AccountLinkCreateAPI] Failed to create account link due to an unexpected integrity error. [user_id: {current_user.id}]',
-            exc_info=ex,
-        )
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Failed to create account link',
-        ) from ex
-    await account_link.fetch_related('twitter_account', 'bluesky_account')
-    return account_link
-
-
-@router.delete(
-    '/me/account-links/{link_id}',
-    summary = 'Twitter / Bluesky アカウント紐付け解除 API',
-    status_code = status.HTTP_204_NO_CONTENT,
-)
-async def AccountLinkDeleteAPI(
-    link_id: Annotated[int, Path(description='解除するアカウント紐付け ID 。')],
-    current_user: Annotated[User, Depends(GetCurrentUser)],
-):
-    """
-    ログイン中ユーザーの Twitter / Bluesky アカウント紐付けを解除する。<br>
-    連携済みアカウント自体は削除しない。
-    """
-
-    # 紐付け解除はログイン中ユーザーのリンクレコードだけに限定する
-    ## 個別の Twitter / Bluesky 連携は残されるので、紐付け解除後は別々のアカウントとして選択候補に表示される形となる
-    account_link = await AccountLink.filter(id=link_id, user_id=current_user.id).get_or_none()
-    if account_link is None:
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Specified account link does not exist',
-        )
-    await account_link.delete()
+    return await User.filter(id=current_user.id).get()
 
 
 @router.put(

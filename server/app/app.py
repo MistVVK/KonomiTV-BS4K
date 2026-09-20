@@ -42,7 +42,6 @@ from app.models.RefreshToken import RefreshToken
 from app.routers import (
     AIBackendRouter,
     AnalysisTasksRouter,
-    BlueskyRouter,
     CapturesRouter,
     ChannelsRouter,
     CMAnalysisRouter,
@@ -63,7 +62,6 @@ from app.routers import (
     ReservationsRouter,
     SeriesRouter,
     SettingsRouter,
-    TwitterRouter,
     UsersRouter,
     VersionRouter,
     VideosRouter,
@@ -142,8 +140,6 @@ app.include_router(CapturesRouter.router)
 app.include_router(CMAnalysisRouter.router)
 app.include_router(DataBroadcastingRouter.router)
 app.include_router(NiconicoRouter.router)
-app.include_router(TwitterRouter.router)
-app.include_router(BlueskyRouter.router)
 app.include_router(UsersRouter.router)
 app.include_router(SettingsRouter.router)
 app.include_router(MaintenanceRouter.router)
@@ -159,7 +155,7 @@ app.include_router(KonomiTVBS4KBangumiRouter.router)
 
 # FastAPI は認証 dependency より前に form 全体を解析するため、対象ルートだけ ASGI 層で本文を制限する。
 ## 画像は KonomiTV-BS4K が生成・保存できる Capture 1 枚 20 MiB を共通の入力上限とし、
-## Twitter / Bluesky は最大 4 枚、CM ロゴは endpoint の既存 64 MiB 上限に framing の余裕を加える。
+## CM ロゴは endpoint の既存 64 MiB 上限に framing の余裕を加える。
 ## OAuth2 ログインは username 64 bytes・password 72 bytes と任意の標準フィールドに対して十分な 64 KiB とする。
 REQUEST_BODY_LIMITS = (
     CapturesRouter.CAPTURE_UPLOAD_BODY_LIMIT,
@@ -168,18 +164,6 @@ REQUEST_BODY_LIMITS = (
         path_pattern=re.compile(r'/api/users/me/icon/?'),
         max_body_bytes=CapturesRouter.MAX_CAPTURE_UPLOAD_BYTES + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
         detail='User icon upload exceeds the 20 MiB limit',
-    ),
-    KonomiTVBS4KRequestBodyLimit(
-        method='POST',
-        path_pattern=re.compile(r'/api/twitter/accounts/[^/]+/tweets/?'),
-        max_body_bytes=(CapturesRouter.MAX_CAPTURE_UPLOAD_BYTES * 4) + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
-        detail='Twitter image upload exceeds the 80 MiB request limit',
-    ),
-    KonomiTVBS4KRequestBodyLimit(
-        method='POST',
-        path_pattern=re.compile(r'/api/bluesky/accounts/[^/]+/posts/?'),
-        max_body_bytes=(CapturesRouter.MAX_CAPTURE_UPLOAD_BYTES * 4) + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
-        detail='Bluesky image upload exceeds the 80 MiB request limit',
     ),
     KonomiTVBS4KRequestBodyLimit(
         method='POST',

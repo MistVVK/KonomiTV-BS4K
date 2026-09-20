@@ -975,16 +975,6 @@ class User(PydanticModel):
     niconico_user_id: int | None
     niconico_user_name: str | None
     niconico_user_premium: bool | None
-    twitter_accounts: list[TwitterAccount]  # 追加カラム
-    bluesky_accounts: list[BlueskyAccount]  # 追加カラム
-    account_links: list[AccountLink]  # 追加カラム
-    created_at: datetime
-    updated_at: datetime
-
-class AccountLink(PydanticModel):
-    id: int
-    twitter_account: TwitterAccount
-    bluesky_account: BlueskyAccount
     created_at: datetime
     updated_at: datetime
 
@@ -1006,25 +996,6 @@ class KonomiTVBS4KBangumiProfile(BaseModel):
     bangumi_user_name: str | None
     bangumi_user_nickname: str | None
     bangumi_user_avatar_url: str | None
-
-# ***** Twitter / Bluesky 連携 *****
-
-class TwitterAccount(PydanticModel):
-    id: int
-    name: str
-    screen_name: str
-    icon_url: str
-    created_at: datetime
-    updated_at: datetime
-
-class BlueskyAccount(PydanticModel):
-    id: int
-    did: str
-    handle: str
-    name: str
-    icon_url: str
-    created_at: datetime
-    updated_at: datetime
 
 # モデルに関連しない API リクエストの構造を表す Pydantic モデル
 ## リクエストボティの JSON 構造と一致する
@@ -1130,24 +1101,13 @@ class UserUpdateRequest(BaseModel):
 class UserUpdateRequestForAdmin(BaseModel):
     is_admin: bool | None = None
 
-class AccountLinkCreateRequest(BaseModel):
-    twitter_account_id: int
-    bluesky_account_id: int
-
-# ***** Twitter 連携 *****
-
-class TwitterCookieAuthRequest(BaseModel):
-    cookies_txt: str
-    browser_info: BrowserEnvironmentInfoRequest | None = None
-
-class BrowserEnvironmentInfoRequest(BaseModel):
-    user_agent_data: BrowserEnvironmentUserAgentData
-    navigator_platform: str
-    locale: str
-    timezone: str
+# ***** Twitter / Bluesky 連携のブラウザ情報 =====
+## TwitterScrapeBrowser 経由のヘッドレスブラウザ検出情報。
+## API 経路の除去後も models.TwitterAccount / BlueskyAccount の保存列 (JSON) が型として参照するため残す。
+## アカウントモデルと併せて card-13 (DB drop) で削除する予定。
 
 class BrowserEnvironmentInfo(TypedDict):
-    http_headers: BrowserEnvironmentHTTPHeaders  # /api/twitter/auth の HTTP リクエストヘッダーから抽出した情報
+    http_headers: BrowserEnvironmentHTTPHeaders
     user_agent_data: BrowserEnvironmentUserAgentData
     navigator_platform: str
     locale: str
@@ -1169,10 +1129,6 @@ class BrowserEnvironmentUserAgentData(TypedDict):
     mobile: bool
     model: str
     wow64: bool
-
-class BlueskyAuthRequest(BaseModel):
-    handle: str
-    app_password: str
 
 # モデルに関連しない API レスポンスの構造を表す Pydantic モデル
 ## レスポンスボディの JSON 構造と一致する
@@ -1509,66 +1465,6 @@ class JikkyoComments(BaseModel):
 
 class ThirdpartyAuthURL(BaseModel):
     authorization_url: str
-
-# ***** Twitter 連携 *****
-
-class Tweet(BaseModel):
-    source: Literal['Twitter', 'Bluesky']
-    id: str
-    created_at: datetime
-    user: TweetUser
-    text: str
-    lang: str
-    via: str
-    image_urls: list[str] | None
-    movie_url: str | None
-    retweet_count: int
-    retweeted: bool
-    favorite_count: int
-    favorited: bool
-    retweeted_tweet: Tweet | None
-    quoted_tweet: Tweet | None
-
-class TweetUser(BaseModel):
-    source: Literal['Twitter', 'Bluesky']
-    id: str
-    name: str
-    screen_name: str
-    icon_url: str
-
-class TwitterAPIResult(BaseModel):
-    is_success: bool
-    detail: str
-
-class PostTweetResult(TwitterAPIResult):
-    tweet_url: str
-    tweet_id: str | None = None
-    post_uri: str | None = None
-    post_cid: str | None = None
-
-class TimelineLoadMoreCursor(BaseModel):
-    cursor_type: Literal['Older', 'Gap', 'ShowMore']
-    cursor_id: str
-    entry_id: str | None
-    upper_created_at: datetime | None
-    lower_created_at: datetime | None
-
-class TimelineTweetsResult(TwitterAPIResult):
-    tweets: list[Tweet]
-    newer_cursor_id: str | None
-    load_more_cursors: list[TimelineLoadMoreCursor]
-    is_cursor_consumed: bool
-
-class TwitterGraphQLAPIEndpointInfo(BaseModel):
-    method: Literal['GET', 'POST']
-    query_id: str
-    endpoint: str
-    features: dict[str, bool] | None
-
-    @computed_field
-    @property
-    def path(self) -> str:
-        return f'/i/api/graphql/{self.query_id}/{self.endpoint}'
 
 # ***** ユーザー *****
 
