@@ -22,6 +22,7 @@ from app.streams.LiveEncodingTask import LiveEncodingTask
 from app.streams.LivePSIDataArchiver import LivePSIDataArchiver
 from app.streams.StreamEncodingOptions import StreamEncodingOptions
 from app.utils.edcb.EDCBTuner import EDCBTuner
+from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVDatacastEvent
 
 
 KonomiTVBS4KLiveStreamKey = tuple[
@@ -126,12 +127,97 @@ class LiveStreamClient:
         self._queue.put_nowait(stream_data)
 
 
+class LiveDataBroadcastClient:
+    """BS4Kデータ放送SSEの購読者と有限イベントQueueを管理する。"""
+
+    # 大きなsnapshotは1つの共有tupleとして数え、差分が滞留してもメモリを無制限に増やさない。
+    QUEUE_MAX_BATCHES: ClassVar[int] = 128
+
+    def __init__(
+        self,
+        initial_snapshot: tuple[KonomiTVBS4KTLVDatacastEvent, ...],
+    ) -> None:
+        """
+        データ放送購読者を初期化する。
+
+        Args:
+            initial_snapshot (tuple[KonomiTVBS4KTLVDatacastEvent, ...]): 接続時点の完全snapshot。
+
+        Returns:
+            None
+        """
+
+        # ログ上でMPEG-TS視聴クライアントと区別できる購読者ID。
+        self.client_id = 'DATABROADCAST-' + Hashids(min_length=10).encode(int(time.time() * 1000))
+        # 接続時snapshotはQueueへ複製せず、LiveStreamが保持する同じ不変tupleを参照する。
+        self._initial_snapshot = initial_snapshot
+        # 差分はbatch単位の有限Queueへ保持し、producerであるELF読取を待たせない。
+        self._queue: asyncio.Queue[tuple[KonomiTVBS4KTLVDatacastEvent, ...] | None] = asyncio.Queue(
+            maxsize=self.QUEUE_MAX_BATCHES,
+        )
+        # 古いbatchを破棄した購読者は差分適用を継続せず、接続終了後のsnapshot再同期へ回す。
+        self._missed_events = False
+
+    def takeInitialSnapshot(self) -> tuple[KonomiTVBS4KTLVDatacastEvent, ...]:
+        """
+        接続時snapshotを一度だけ返す。
+
+        Returns:
+            tuple[KonomiTVBS4KTLVDatacastEvent, ...]: 接続時点の完全snapshot。
+        """
+
+        snapshot = self._initial_snapshot
+        self._initial_snapshot = ()
+        return snapshot
+
+    async def readEvents(self) -> tuple[KonomiTVBS4KTLVDatacastEvent, ...] | None:
+        """
+        次の差分batchを読み、欠落済みまたは切断済みならNoneを返す。
+
+        Returns:
+            tuple[KonomiTVBS4KTLVDatacastEvent, ...] | None: 次のイベントbatch、または再接続を促すNone。
+        """
+
+        if self._missed_events is True:
+            return None
+        return await self._queue.get()
+
+    def writeEvents(self, events: tuple[KonomiTVBS4KTLVDatacastEvent, ...]) -> None:
+        """
+        producerをブロックせず差分batchをQueueへ追加する。
+
+        Args:
+            events (tuple[KonomiTVBS4KTLVDatacastEvent, ...]): 配信するイベントbatch。
+
+        Returns:
+            None
+        """
+
+        if self._missed_events is True:
+            return
+        if self._queue.full() is True:
+            self._queue.get_nowait()
+            self._missed_events = True
+        self._queue.put_nowait(events)
+
+    def close(self) -> None:
+        """待機中の購読処理へ接続終了を通知する。"""
+
+        while self._queue.empty() is False:
+            self._queue.get_nowait()
+        self._queue.put_nowait(None)
+
+
 class LiveStream:
     """ ライブストリームを管理するクラス """
 
     # ライブストリームのインスタンスが入る、ライブストリーム ID をキーとした辞書
     # この辞書にライブストリームに関する全てのデータが格納されている
     __instances: ClassVar[dict[KonomiTVBS4KLiveStreamInstanceKey, LiveStream]] = {}
+    # snapshot生成とBase64保持の上限を、ELF側のカルーセル上限と同じ値に固定する。
+    DATA_BROADCAST_MAX_SUBSCRIBERS: ClassVar[int] = 8
+    DATA_BROADCAST_MAX_CONTEXT_RESOURCE_BYTES: ClassVar[int] = 8 * 1024 * 1024
+    DATA_BROADCAST_MAX_TOTAL_RESOURCE_BYTES: ClassVar[int] = 16 * 1024 * 1024
 
 
     # 必ずライブストリーム ID ごとに1つのインスタンスになるように (Singleton)
@@ -247,6 +333,26 @@ class LiveStream:
             # 主サービスの MH-EIT 現在番組 HDR アイコン。未観測は None。
             instance.mh_eit_hdr_hint = None
 
+            # データ放送SSEの購読者。映像視聴者数とは別に上限と有限Queueを管理する。
+            instance._data_broadcast_clients = []
+            # 最新snapshotを再構築するため、状態種別ごとに直近イベントを保持する。
+            instance._data_broadcast_applications = {}
+            instance._data_broadcast_resources = {}
+            instance._data_broadcast_resource_sizes = {}
+            instance._data_broadcast_resource_context_bytes = {}
+            instance._data_broadcast_resource_total_bytes = 0
+            instance._data_broadcast_clock = None
+            instance._data_broadcast_layout = None
+            instance._data_broadcast_events = {}
+            # helperのsnapshot境界内では途中状態を公開せず、snapshot_endで一括確定する。
+            instance._data_broadcast_snapshot_in_progress = False
+            # 保持上限超過後は、次の完全snapshotが始まるまで同じhelper世代の後続差分を適用しない。
+            instance._data_broadcast_waiting_for_snapshot = False
+            instance._data_broadcast_snapshot = (
+                KonomiTVBS4KTLVDatacastEvent('snapshot_begin', {}),
+                KonomiTVBS4KTLVDatacastEvent('snapshot_end', {}),
+            )
+
             # 生成したインスタンスを登録する
             cls.__instances[instance_key] = instance
 
@@ -297,6 +403,18 @@ class LiveStream:
         self.b60_video_transfer: int | None
         # 主サービスの MH-EIT 現在番組 HDR アイコン。LiveEncodingTask が helper から転記する。
         self.mh_eit_hdr_hint: bool | None
+        self._data_broadcast_clients: list[LiveDataBroadcastClient]
+        self._data_broadcast_applications: dict[tuple[int, int, int, int], KonomiTVBS4KTLVDatacastEvent]
+        self._data_broadcast_resources: dict[tuple[int, str], KonomiTVBS4KTLVDatacastEvent]
+        self._data_broadcast_resource_sizes: dict[tuple[int, str], int]
+        self._data_broadcast_resource_context_bytes: dict[int, int]
+        self._data_broadcast_resource_total_bytes: int
+        self._data_broadcast_clock: KonomiTVBS4KTLVDatacastEvent | None
+        self._data_broadcast_layout: KonomiTVBS4KTLVDatacastEvent | None
+        self._data_broadcast_events: dict[tuple[int, int, int, int], KonomiTVBS4KTLVDatacastEvent]
+        self._data_broadcast_snapshot_in_progress: bool
+        self._data_broadcast_waiting_for_snapshot: bool
+        self._data_broadcast_snapshot: tuple[KonomiTVBS4KTLVDatacastEvent, ...]
 
 
     @property
@@ -698,6 +816,265 @@ class LiveStream:
         self._clients.clear()
 
 
+    def connectDataBroadcast(self) -> LiveDataBroadcastClient | None:
+        """
+        データ放送SSE購読者を登録し、上限超過時はNoneを返す。
+
+        Returns:
+            LiveDataBroadcastClient | None: 登録済み購読者。上限到達時はNone。
+        """
+
+        if len(self._data_broadcast_clients) >= self.DATA_BROADCAST_MAX_SUBSCRIBERS:
+            return None
+        client = LiveDataBroadcastClient(self._data_broadcast_snapshot)
+        self._data_broadcast_clients.append(client)
+        logging.info(f'{self.log_prefix} Data Broadcast Client Connected. Client ID: {client.client_id}')
+        return client
+
+    def disconnectDataBroadcast(self, client: LiveDataBroadcastClient) -> None:
+        """
+        指定したデータ放送SSE購読者を解除する。
+
+        Args:
+            client (LiveDataBroadcastClient): 解除する購読者。
+
+        Returns:
+            None
+        """
+
+        try:
+            self._data_broadcast_clients.remove(client)
+            logging.info(f'{self.log_prefix} Data Broadcast Client Disconnected. Client ID: {client.client_id}')
+        except ValueError:
+            pass
+
+    def publishDataBroadcastEvent(self, event: KonomiTVBS4KTLVDatacastEvent) -> None:
+        """
+        metadata monitorの完結イベントを状態へ反映し、購読者へ非ブロッキング配信する。
+
+        Args:
+            event (KonomiTVBS4KTLVDatacastEvent): 完結済みデータ放送イベント。
+
+        Returns:
+            None
+        """
+
+        # helperの完全snapshotは途中状態を公開せず、終端でキャッシュと購読者を一括更新する。
+        if event.event_type == 'snapshot_begin':
+            self._clearDataBroadcastStateValues()
+            self._data_broadcast_snapshot_in_progress = True
+            self._data_broadcast_waiting_for_snapshot = False
+            return
+
+        # 保持上限を超えた世代の残りは部分状態になるため、次の完全snapshot境界まで破棄する。
+        if self._data_broadcast_waiting_for_snapshot is True:
+            return
+        if event.event_type == 'snapshot_end':
+            if self._data_broadcast_snapshot_in_progress is False:
+                return
+            self._data_broadcast_snapshot_in_progress = False
+            self._rebuildDataBroadcastSnapshot()
+            self._fanOutDataBroadcastEvents(self._data_broadcast_snapshot)
+            return
+
+        # source/helper/serverのresetはいずれもサービス状態全体を破棄し、古いsnapshotを再利用しない。
+        if event.event_type == 'application_resources_reset':
+            reason = event.payload.get('reason')
+            self._resetDataBroadcastState(
+                reason if isinstance(reason, str) else 'unknown',
+                reset_event=event,
+            )
+            return
+
+        if self._applyDataBroadcastEvent(event) is False:
+            return
+        if self._data_broadcast_snapshot_in_progress is True:
+            return
+
+        # stream_event/viewer_participationは瞬時イベントなのでsnapshotへ保持せず、そのまま差分配信する。
+        if event.event_type not in ('stream_event', 'viewer_participation'):
+            self._rebuildDataBroadcastSnapshot()
+        self._fanOutDataBroadcastEvents((event,))
+
+    def _applyDataBroadcastEvent(self, event: KonomiTVBS4KTLVDatacastEvent) -> bool:
+        """
+        1イベントを最新snapshotの状態マップへ反映する。
+
+        Args:
+            event (KonomiTVBS4KTLVDatacastEvent): 反映する完結済みイベント。
+
+        Returns:
+            bool: shapeが有効で反映または瞬時配信できる場合はTrue。
+        """
+
+        def readInteger(field: str) -> int | None:
+            value = event.payload.get(field)
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            return value
+
+        if event.event_type == 'application_state':
+            context_id = readInteger('contextId')
+            application_type = readInteger('applicationType')
+            organization_id = readInteger('organizationId')
+            application_id = readInteger('applicationId')
+            if None in (context_id, application_type, organization_id, application_id):
+                return False
+            assert context_id is not None
+            assert application_type is not None
+            assert organization_id is not None
+            assert application_id is not None
+            self._data_broadcast_applications[
+                (context_id, application_type, organization_id, application_id)
+            ] = event
+            return True
+
+        if event.event_type == 'application_resource':
+            context_id = readInteger('contextId')
+            path = event.payload.get('path')
+            data = event.payload.get('data')
+            if context_id is None or not isinstance(path, str) or not isinstance(data, str):
+                return False
+            key = (context_id, path)
+            previous_size = self._data_broadcast_resource_sizes.get(key, 0)
+            context_size = self._data_broadcast_resource_context_bytes.get(context_id, 0) - previous_size
+            total_size = self._data_broadcast_resource_total_bytes - previous_size
+            if (
+                event.resource_data_size < 0 or
+                context_size + event.resource_data_size > self.DATA_BROADCAST_MAX_CONTEXT_RESOURCE_BYTES or
+                total_size + event.resource_data_size > self.DATA_BROADCAST_MAX_TOTAL_RESOURCE_BYTES
+            ):
+                logging.warning(
+                    f'{self.log_prefix} Datacast carousel exceeded server holding limits; resetting state.'
+                )
+                self._resetDataBroadcastState('server_resource_limit_exceeded')
+                self._data_broadcast_waiting_for_snapshot = True
+                return False
+            self._data_broadcast_resources[key] = event
+            self._data_broadcast_resource_sizes[key] = event.resource_data_size
+            self._data_broadcast_resource_context_bytes[context_id] = context_size + event.resource_data_size
+            self._data_broadcast_resource_total_bytes = total_size + event.resource_data_size
+            return True
+
+        if event.event_type == 'application_resource_removed':
+            context_id = readInteger('contextId')
+            path = event.payload.get('path')
+            if context_id is None or not isinstance(path, str):
+                return False
+            key = (context_id, path)
+            removed_size = self._data_broadcast_resource_sizes.pop(key, 0)
+            self._data_broadcast_resources.pop(key, None)
+            context_size = max(0, self._data_broadcast_resource_context_bytes.get(context_id, 0) - removed_size)
+            if context_size == 0:
+                self._data_broadcast_resource_context_bytes.pop(context_id, None)
+            else:
+                self._data_broadcast_resource_context_bytes[context_id] = context_size
+            self._data_broadcast_resource_total_bytes = max(
+                0,
+                self._data_broadcast_resource_total_bytes - removed_size,
+            )
+            return True
+
+        if event.event_type == 'broadcast_clock':
+            self._data_broadcast_clock = event
+            return True
+        if event.event_type == 'layout_configuration':
+            self._data_broadcast_layout = event
+            return True
+        if event.event_type == 'event_info':
+            context_id = readInteger('contextId')
+            service_id = readInteger('serviceId')
+            event_id = readInteger('eventId')
+            table_id = readInteger('tableId')
+            if None in (context_id, service_id, event_id, table_id):
+                return False
+            assert context_id is not None
+            assert service_id is not None
+            assert event_id is not None
+            assert table_id is not None
+            self._data_broadcast_events[(context_id, service_id, event_id, table_id)] = event
+            return True
+        return event.event_type in ('stream_event', 'viewer_participation')
+
+    def _clearDataBroadcastStateValues(self) -> None:
+        """データ放送snapshotを構成する全状態マップを空にする。"""
+
+        self._data_broadcast_applications.clear()
+        self._data_broadcast_resources.clear()
+        self._data_broadcast_resource_sizes.clear()
+        self._data_broadcast_resource_context_bytes.clear()
+        self._data_broadcast_resource_total_bytes = 0
+        self._data_broadcast_clock = None
+        self._data_broadcast_layout = None
+        self._data_broadcast_events.clear()
+
+    def _resetDataBroadcastState(
+        self,
+        reason: str,
+        *,
+        reset_event: KonomiTVBS4KTLVDatacastEvent | None = None,
+    ) -> None:
+        """
+        データ放送状態を全消去し、購読者へresetを通知する。
+
+        Args:
+            reason (str): reset理由。
+            reset_event (KonomiTVBS4KTLVDatacastEvent | None): helper由来のresetイベント。
+
+        Returns:
+            None
+        """
+
+        self._clearDataBroadcastStateValues()
+        self._data_broadcast_snapshot_in_progress = False
+        self._rebuildDataBroadcastSnapshot()
+        if reset_event is None:
+            reset_event = KonomiTVBS4KTLVDatacastEvent(
+                event_type='application_resources_reset',
+                payload={'reason': reason},
+            )
+        self._fanOutDataBroadcastEvents((reset_event,))
+
+    def _rebuildDataBroadcastSnapshot(self) -> None:
+        """現在の状態マップから新規購読者向けの共有snapshot tupleを再構築する。"""
+
+        events: list[KonomiTVBS4KTLVDatacastEvent] = [
+            KonomiTVBS4KTLVDatacastEvent('snapshot_begin', {}),
+        ]
+        events.extend(self._data_broadcast_applications.values())
+        events.extend(self._data_broadcast_resources.values())
+        if self._data_broadcast_clock is not None:
+            events.append(self._data_broadcast_clock)
+        if self._data_broadcast_layout is not None:
+            events.append(self._data_broadcast_layout)
+        events.extend(self._data_broadcast_events.values())
+        events.append(KonomiTVBS4KTLVDatacastEvent('snapshot_end', {}))
+        self._data_broadcast_snapshot = tuple(events)
+
+    def _fanOutDataBroadcastEvents(self, events: tuple[KonomiTVBS4KTLVDatacastEvent, ...]) -> None:
+        """
+        全購読者の有限Queueへ同じ不変batch参照を非ブロッキングで追加する。
+
+        Args:
+            events (tuple[KonomiTVBS4KTLVDatacastEvent, ...]): 配信するイベントbatch。
+
+        Returns:
+            None
+        """
+
+        for client in self._data_broadcast_clients:
+            client.writeEvents(events)
+
+    def _disconnectAllDataBroadcastClients(self) -> None:
+        """ストリーム終了時に全データ放送購読者を閉じる。"""
+
+        clients = self._data_broadcast_clients.copy()
+        for client in clients:
+            client.close()
+            logging.info(f'{self.log_prefix} Data Broadcast Client Disconnected. Client ID: {client.client_id}')
+        self._data_broadcast_clients.clear()
+
+
     def getStatus(self) -> LiveStreamStatus:
         """
         ライブストリームのステータスを取得する
@@ -760,6 +1137,12 @@ class LiveStream:
             self.is_rain_fallback_broadcasting = None
             self.b60_video_transfer = None
             self.mh_eit_hdr_hint = None
+            # 実行中helperが存在しない状態へ古いカルーセルを残さず、SSE購読も終了して再接続時に再同期させる。
+            self._clearDataBroadcastStateValues()
+            self._data_broadcast_snapshot_in_progress = False
+            self._data_broadcast_waiting_for_snapshot = False
+            self._rebuildDataBroadcastSnapshot()
+            self._disconnectAllDataBroadcastClients()
 
         # ストリーム開始 (Offline or Restart → Standby) 時、started_at と stream_data_written_at を更新する
         # ここで更新しておかないと、いつまで経っても初期化時の古いタイムスタンプが使われてしまう

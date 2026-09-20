@@ -1,14 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import ClassVar
 
 from app import logging
 from app.constants import LIBRARY_PATH
 from app.utils.KonomiTVBS4KTLVServiceResolver import (
+    KonomiTVBS4KTLVDatacastEvent,
+    KonomiTVBS4KTLVDatacastResourceChunk,
     KonomiTVBS4KTLVMetadataSnapshot,
     KonomiTVBS4KTLVServiceResolver,
 )
+
+
+@dataclass
+class _KonomiTVBS4KTLVDatacastResourceAssembly:
+    """同一 resourceId の連続した物理チャンクを保持する。"""
+
+    context_id: int
+    path: str
+    content_type: str
+    total: int
+    chunks: list[bytes]
+    data_size: int = 0
 
 
 class KonomiTVBS4KTLVMetadataMonitor:
@@ -20,6 +37,8 @@ class KonomiTVBS4KTLVMetadataMonitor:
     END_STABILITY_SECONDS: ClassVar[float] = 5.0
     RESTART_DELAY_SECONDS: ClassVar[float] = 0.25
     WRITE_CHUNK_SIZE: ClassVar[int] = 64 * 1024
+    MAX_CONTEXT_RESOURCE_BYTES: ClassVar[int] = 8 * 1024 * 1024
+    MAX_TOTAL_RESOURCE_BYTES: ClassVar[int] = 16 * 1024 * 1024
 
     def __init__(
         self,
@@ -27,6 +46,7 @@ class KonomiTVBS4KTLVMetadataMonitor:
         rain_service_id: int | None,
         log_prefix: str,
         initial_broadcasting_state: bool | None = None,
+        datacast_event_callback: Callable[[KonomiTVBS4KTLVDatacastEvent], None] | None = None,
     ) -> None:
         """
         降雨対応放送の継続監視を初期化する。
@@ -36,6 +56,8 @@ class KonomiTVBS4KTLVMetadataMonitor:
             rain_service_id (int | None): 降雨対応サービスのSID。対象がない場合はNone。
             log_prefix (str): ログへ付与するプレフィックス。
             initial_broadcasting_state (bool | None): 起動時Resolverが確定済みなら引き継ぐ送出状態。
+            datacast_event_callback (Callable[[KonomiTVBS4KTLVDatacastEvent], None] | None):
+                完結したデータ放送イベントの同期通知先。
 
         Returns:
             None
@@ -72,6 +94,13 @@ class KonomiTVBS4KTLVMetadataMonitor:
         self._b60_video_transfer: int | None = None
         # 主サービスの MH-EIT 現在番組 HDR アイコン。未観測なら None、不在は False。
         self._mh_eit_hdr_hint: bool | None = None
+        # resource_chunk は完結するまでSSEへ公開せず、resourceIdごとの再組立て状態として保持する。
+        self._datacast_resource_assemblies: dict[int, _KonomiTVBS4KTLVDatacastResourceAssembly] = {}
+        # 未完結チャンクにもcontext/全体上限を適用するため、Base64復号後の保持量を追跡する。
+        self._datacast_resource_context_bytes: dict[int, int] = {}
+        self._datacast_resource_total_bytes = 0
+        # LiveStream側の状態更新とfan-outを、stdout読取と同じevent loop上で同期的に実行する。
+        self._datacast_event_callback = datacast_event_callback
 
     @property
     def is_rain_fallback_broadcasting(self) -> bool | None:
@@ -243,6 +272,9 @@ class KonomiTVBS4KTLVMetadataMonitor:
             while self._cancelled is False and self._input_finished is False:
                 self._restart_event.clear()
                 self._resetObservations(clear_published_state=first_process is False)
+                if first_process is False:
+                    # helper世代を跨いで未完結チャンクや旧snapshotを混ぜず、次の完全snapshotを待つ。
+                    self._resetDatacastState('monitor_restart', publish=True)
                 first_process = False
                 try:
                     process = await asyncio.subprocess.create_subprocess_exec(
@@ -291,6 +323,7 @@ class KonomiTVBS4KTLVMetadataMonitor:
                 await asyncio.sleep(self.RESTART_DELAY_SECONDS)
         finally:
             self._setCandidateState(None)
+            self._resetDatacastState('monitor_stopped', publish=True)
             if self._process is not None:
                 await self._terminateProcess(self._process, ())
 
@@ -346,15 +379,23 @@ class KonomiTVBS4KTLVMetadataMonitor:
             None
         """
 
-        while True:
+        # 同じreader内で再起動要求を発行した場合も、buffer済みの旧世代行を続けて適用しない。
+        while self._restart_event.is_set() is False:
             line = await stdout.readline()
             if line == b'':
                 return
-            metadata = KonomiTVBS4KTLVServiceResolver.parseMetadataLine(
+            parsed_line = KonomiTVBS4KTLVServiceResolver.parseMetadataLine(
                 line.decode('utf-8', errors='replace'),
             )
-            if metadata is None:
+            if isinstance(parsed_line, KonomiTVBS4KTLVDatacastResourceChunk):
+                self._handleDatacastResourceChunk(parsed_line)
                 continue
+            if isinstance(parsed_line, KonomiTVBS4KTLVDatacastEvent):
+                self._handleDatacastEvent(parsed_line)
+                continue
+            if not isinstance(parsed_line, KonomiTVBS4KTLVMetadataSnapshot):
+                continue
+            metadata = parsed_line
 
             # 実入力ではSIDごとにSDTが順次通知されるため、helper世代内で観測した対応を蓄積する。
             self._service_contexts.update(metadata.service_contexts)
@@ -380,6 +421,187 @@ class KonomiTVBS4KTLVMetadataMonitor:
 
             self._evaluateCandidateState()
             self._evaluateColorHint(metadata)
+
+    def _handleDatacastEvent(self, event: KonomiTVBS4KTLVDatacastEvent) -> None:
+        """
+        チャンク以外のデータ放送イベントを状態境界に従って通知する。
+
+        Args:
+            event (KonomiTVBS4KTLVDatacastEvent): metadata helperが出力した論理イベント。
+
+        Returns:
+            None
+        """
+
+        # snapshot/resetは以前の未完結チャンクを引き継げない明示的な状態境界として扱う。
+        if event.event_type in ('snapshot_begin', 'application_resources_reset'):
+            self._clearDatacastResourceAssemblies()
+        elif event.event_type == 'application_resource_removed':
+            context_id = event.payload.get('contextId')
+            path = event.payload.get('path')
+            if isinstance(context_id, int) and not isinstance(context_id, bool) and isinstance(path, str):
+                for resource_id, assembly in tuple(self._datacast_resource_assemblies.items()):
+                    if assembly.context_id == context_id and assembly.path == path:
+                        self._removeDatacastResourceAssembly(resource_id)
+        elif event.event_type == 'snapshot_end' and self._datacast_resource_assemblies:
+            # snapshot内の欠落を部分状態として公開せず、helper再起動後の完全snapshotから再同期する。
+            logging.warning(
+                f'{self._log_prefix} Incomplete datacast resource chunks remained at snapshot end; '
+                'restarting the metadata monitor.'
+            )
+            self._resetDatacastState('incomplete_resource_snapshot', publish=True)
+            self._restart_event.set()
+            return
+
+        self._publishDatacastEvent(event)
+
+    def _handleDatacastResourceChunk(self, chunk: KonomiTVBS4KTLVDatacastResourceChunk) -> None:
+        """
+        物理チャンクを順番に再組立てし、完結したapplication_resourceだけを通知する。
+
+        Args:
+            chunk (KonomiTVBS4KTLVDatacastResourceChunk): 検証・Base64復号済みの物理チャンク。
+
+        Returns:
+            None
+        """
+
+        # seq=0は同じIDの古い未完結状態を置き換え、新しいリソースの先頭として扱う。
+        if chunk.sequence == 0:
+            self._removeDatacastResourceAssembly(chunk.resource_id)
+            self._datacast_resource_assemblies[chunk.resource_id] = _KonomiTVBS4KTLVDatacastResourceAssembly(
+                context_id=chunk.context_id,
+                path=chunk.path,
+                content_type=chunk.content_type,
+                total=chunk.total,
+                chunks=[],
+            )
+
+        assembly = self._datacast_resource_assemblies.get(chunk.resource_id)
+        if assembly is None:
+            # 先頭チャンク欠落後の残りを無視すると、不完全なsnapshotを正常扱いしてしまう。
+            logging.warning(
+                f'{self._log_prefix} Datacast resource chunk sequence started without its first chunk; '
+                'restarting the metadata monitor.'
+            )
+            self._resetDatacastState('invalid_resource_sequence', publish=True)
+            self._restart_event.set()
+            return
+        if (
+            assembly.context_id != chunk.context_id or
+            assembly.path != chunk.path or
+            assembly.content_type != chunk.content_type or
+            assembly.total != chunk.total or
+            chunk.sequence != len(assembly.chunks)
+        ):
+            # resourceId再利用や欠落を含むframing不整合では、同じhelper世代のsnapshot全体を信用しない。
+            logging.warning(
+                f'{self._log_prefix} Datacast resource chunk framing was inconsistent; '
+                'restarting the metadata monitor.'
+            )
+            self._resetDatacastState('invalid_resource_framing', publish=True)
+            self._restart_event.set()
+            return
+
+        context_bytes = self._datacast_resource_context_bytes.get(chunk.context_id, 0)
+        if (
+            context_bytes + len(chunk.data) > self.MAX_CONTEXT_RESOURCE_BYTES or
+            self._datacast_resource_total_bytes + len(chunk.data) > self.MAX_TOTAL_RESOURCE_BYTES
+        ):
+            logging.warning(
+                f'{self._log_prefix} Datacast resource chunks exceeded server holding limits; resetting state.'
+            )
+            self._resetDatacastState('server_resource_limit_exceeded', publish=True)
+            self._restart_event.set()
+            return
+
+        assembly.chunks.append(chunk.data)
+        assembly.data_size += len(chunk.data)
+        self._datacast_resource_context_bytes[chunk.context_id] = context_bytes + len(chunk.data)
+        self._datacast_resource_total_bytes += len(chunk.data)
+
+        # 最終チャンクまで揃った時点で初めて、SSE論理契約のapplication_resourceへ変換する。
+        if chunk.sequence + 1 == chunk.total:
+            data = b''.join(assembly.chunks)
+            event = KonomiTVBS4KTLVDatacastEvent(
+                event_type='application_resource',
+                payload={
+                    'contextId': assembly.context_id,
+                    'path': assembly.path,
+                    'contentType': assembly.content_type,
+                    'data': base64.b64encode(data).decode('ascii'),
+                },
+                resource_data_size=len(data),
+            )
+            self._removeDatacastResourceAssembly(chunk.resource_id)
+            self._publishDatacastEvent(event)
+
+    def _removeDatacastResourceAssembly(self, resource_id: int) -> None:
+        """
+        未完結リソースを破棄し、保持量カウンターを減算する。
+
+        Args:
+            resource_id (int): 破棄するresourceId。
+
+        Returns:
+            None
+        """
+
+        assembly = self._datacast_resource_assemblies.pop(resource_id, None)
+        if assembly is None:
+            return
+        context_bytes = self._datacast_resource_context_bytes.get(assembly.context_id, 0)
+        remaining_context_bytes = max(0, context_bytes - assembly.data_size)
+        if remaining_context_bytes == 0:
+            self._datacast_resource_context_bytes.pop(assembly.context_id, None)
+        else:
+            self._datacast_resource_context_bytes[assembly.context_id] = remaining_context_bytes
+        self._datacast_resource_total_bytes = max(0, self._datacast_resource_total_bytes - assembly.data_size)
+
+    def _clearDatacastResourceAssemblies(self) -> None:
+        """未完結のデータ放送リソースをすべて破棄する。"""
+
+        self._datacast_resource_assemblies.clear()
+        self._datacast_resource_context_bytes.clear()
+        self._datacast_resource_total_bytes = 0
+
+    def _resetDatacastState(self, reason: str, *, publish: bool) -> None:
+        """
+        未完結チャンクを破棄し、必要なら購読側にも全状態resetを通知する。
+
+        Args:
+            reason (str): reset理由。
+            publish (bool): application_resources_resetを通知するか。
+
+        Returns:
+            None
+        """
+
+        self._clearDatacastResourceAssemblies()
+        if publish is True:
+            self._publishDatacastEvent(KonomiTVBS4KTLVDatacastEvent(
+                event_type='application_resources_reset',
+                payload={'reason': reason},
+            ))
+
+    def _publishDatacastEvent(self, event: KonomiTVBS4KTLVDatacastEvent) -> None:
+        """
+        stdout読取を待たせない同期callbackで完結イベントを公開する。
+
+        Args:
+            event (KonomiTVBS4KTLVDatacastEvent): 公開するイベント。
+
+        Returns:
+            None
+        """
+
+        if self._datacast_event_callback is None:
+            return
+        try:
+            self._datacast_event_callback(event)
+        except Exception as ex:
+            # metadata監視は映像再生に対してfail-openとし、SSE状態更新だけを破棄する。
+            logging.warning(f'{self._log_prefix} Failed to publish a datacast event:', exc_info=ex)
 
     def _evaluateColorHint(self, metadata: KonomiTVBS4KTLVMetadataSnapshot) -> None:
         """

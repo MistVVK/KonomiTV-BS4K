@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 from collections.abc import AsyncIterable
 from dataclasses import dataclass
@@ -51,6 +53,44 @@ class KonomiTVBS4KTLVProgramHint:
     hdr_programme_icon: bool
 
 
+KonomiTVBS4KTLVDatacastEventType = Literal[
+    'snapshot_begin',
+    'snapshot_end',
+    'application_state',
+    'application_resource',
+    'application_resource_removed',
+    'application_resources_reset',
+    'broadcast_clock',
+    'layout_configuration',
+    'event_info',
+    'stream_event',
+    'viewer_participation',
+]
+
+
+@dataclass(frozen=True)
+class KonomiTVBS4KTLVDatacastEvent:
+    """SSE へ転送できる完結済みのデータ放送イベント。"""
+
+    event_type: KonomiTVBS4KTLVDatacastEventType
+    payload: dict[str, Any]
+    # application_resource だけ、Base64 化前の保持量を上限判定へ渡す。
+    resource_data_size: int = 0
+
+
+@dataclass(frozen=True)
+class KonomiTVBS4KTLVDatacastResourceChunk:
+    """metadata helper の物理行から検証・復号したリソースチャンク。"""
+
+    context_id: int
+    path: str
+    content_type: str
+    resource_id: int
+    sequence: int
+    total: int
+    data: bytes
+
+
 @dataclass(frozen=True)
 class KonomiTVBS4KTLVServiceResolution:
     """起動時プローブで解決したTLVサービス情報と先頭バッファ。"""
@@ -98,7 +138,9 @@ class KonomiTVBS4KTLVServiceResolver:
     RAIN_FALLBACK_WAIT_SECONDS: float = 2.0
 
     @staticmethod
-    def parseMetadataLine(line: str) -> KonomiTVBS4KTLVMetadataSnapshot | None:
+    def parseMetadataLine(
+        line: str,
+    ) -> KonomiTVBS4KTLVMetadataSnapshot | KonomiTVBS4KTLVDatacastEvent | KonomiTVBS4KTLVDatacastResourceChunk | None:
         """
         メタデータツールが出力した 1 行からサービスとトラックの識別情報を抽出する。
 
@@ -106,8 +148,10 @@ class KonomiTVBS4KTLVServiceResolver:
             line (str): ストリーミング出力された JSON 行。
 
         Returns:
-            KonomiTVBS4KTLVMetadataSnapshot | None:
-                サービス・トラックと完全 snapshot の識別情報。解析不能なら None。
+            KonomiTVBS4KTLVMetadataSnapshot | KonomiTVBS4KTLVDatacastEvent |
+            KonomiTVBS4KTLVDatacastResourceChunk | None:
+                サービス・トラックの snapshot、完結済みデータ放送イベント、または
+                データ放送リソースの物理チャンク。解析不能なら None。
         """
 
         try:
@@ -116,6 +160,77 @@ class KonomiTVBS4KTLVServiceResolver:
             return None
         if not isinstance(payload, dict):
             return None
+
+        # データ放送行は metadata snapshot と shape が異なるため、type を先に判定する。
+        event_type_raw = payload.get('type')
+        if event_type_raw == 'resource_chunk':
+            context_id_raw = payload.get('contextId')
+            resource_id_raw = payload.get('resourceId')
+            sequence_raw = payload.get('seq')
+            total_raw = payload.get('total')
+            path_raw = payload.get('path')
+            content_type_raw = payload.get('contentType')
+            data_raw = payload.get('data')
+            if (
+                isinstance(context_id_raw, bool) or
+                isinstance(resource_id_raw, bool) or
+                isinstance(sequence_raw, bool) or
+                isinstance(total_raw, bool) or
+                not isinstance(path_raw, str) or
+                not isinstance(content_type_raw, str) or
+                not isinstance(data_raw, str)
+            ):
+                return None
+            try:
+                context_id = int(cast(Any, context_id_raw))
+                resource_id = int(cast(Any, resource_id_raw))
+                sequence = int(cast(Any, sequence_raw))
+                total = int(cast(Any, total_raw))
+                data = base64.b64decode(data_raw, validate=True)
+            except (TypeError, ValueError, binascii.Error):
+                return None
+
+            # ELF の物理契約 (16KiB/chunk、context 上限 8MiB) から外れる framing は受け付けない。
+            if (
+                context_id < 0 or
+                resource_id < 0 or
+                sequence < 0 or
+                total <= 0 or
+                sequence >= total or
+                total > 512 or
+                len(data) > 16 * 1024
+            ):
+                return None
+            return KonomiTVBS4KTLVDatacastResourceChunk(
+                context_id=context_id,
+                path=path_raw,
+                content_type=content_type_raw,
+                resource_id=resource_id,
+                sequence=sequence,
+                total=total,
+                data=data,
+            )
+
+        datacast_event_types: tuple[KonomiTVBS4KTLVDatacastEventType, ...] = (
+            'snapshot_begin',
+            'snapshot_end',
+            'application_state',
+            'application_resource_removed',
+            'application_resources_reset',
+            'broadcast_clock',
+            'layout_configuration',
+            'event_info',
+            'stream_event',
+            'viewer_participation',
+        )
+        if event_type_raw in datacast_event_types:
+            event_payload = cast(dict[str, Any], payload.copy())
+            del event_payload['type']
+            return KonomiTVBS4KTLVDatacastEvent(
+                event_type=cast(KonomiTVBS4KTLVDatacastEventType, event_type_raw),
+                payload=event_payload,
+            )
+
         services = payload.get('services')
         tracks = payload.get('tracks')
         if not isinstance(services, list) or not isinstance(tracks, list):
@@ -472,9 +587,10 @@ class KonomiTVBS4KTLVServiceResolver:
                 line = await stdout.readline()
                 if line == b'':
                     return
-                metadata = cls.parseMetadataLine(line.decode('utf-8', errors='replace'))
-                if metadata is None:
+                parsed_line = cls.parseMetadataLine(line.decode('utf-8', errors='replace'))
+                if not isinstance(parsed_line, KonomiTVBS4KTLVMetadataSnapshot):
                     continue
+                metadata = parsed_line
 
                 # 実入力では同じ context_id の SDT が SID ごとに順次通知されるため、各行だけを見ると
                 # 直前に解決した主 SID が消える。プローブ期間内に観測したサービス対応は SID ごとに蓄積する。
