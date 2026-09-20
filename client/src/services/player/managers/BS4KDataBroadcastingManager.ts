@@ -363,6 +363,12 @@ class BS4KDataBroadcastingManager implements PlayerManager {
             onError: error => {
                 if (is_current() === false) return;
                 console.error('[BS4KDataBroadcastingManager] VFS operation failed.', error);
+                this.player.notice(
+                    'データ放送リソースの保存に失敗しました。',
+                    3000,
+                    undefined,
+                    'rgb(var(--v-theme-error-readable))',
+                );
             },
         });
 
@@ -501,7 +507,12 @@ class BS4KDataBroadcastingManager implements PlayerManager {
             onCaptionSubscription: () => undefined,
             // libaribhtml5既定のalert()はKonomiTV-BS4KのUI規約に反するため表示しない。
             onProgramGuideUnavailable: () => undefined,
-            onViewerParticipation: () => undefined,
+            onViewerParticipation: () => {
+                this.player.notice(
+                    '視聴者参加型データ放送が始まりました。リモコンの d ボタンから操作できます。',
+                    5000,
+                );
+            },
             onReplaceApplication: async request => {
                 const application = [...this.applications.values()].find(candidate =>
                     candidate.state.organizationId === request.organizationId &&
@@ -509,7 +520,7 @@ class BS4KDataBroadcastingManager implements PlayerManager {
                 if (application === undefined) {
                     throw new Error(`MH-AIT application not found: ${request.organizationId}:${request.applicationId}`);
                 }
-                await this.loadManagedApplication(application);
+                await this.loadManagedApplication(application, 'アプリケーション切替中');
             },
             onLifecycle: event => {
                 if (event.type === 'installed') {
@@ -541,6 +552,12 @@ class BS4KDataBroadcastingManager implements PlayerManager {
                     }
                 } else if (event.type === 'error') {
                     console.error('[BS4KDataBroadcastingManager] Receiver runtime failed.', event.message);
+                    this.player.notice(
+                        'データ放送を起動できませんでした。',
+                        3000,
+                        undefined,
+                        'rgb(var(--v-theme-error-readable))',
+                    );
                 }
             },
         });
@@ -951,7 +968,7 @@ class BS4KDataBroadcastingManager implements PlayerManager {
                 if (active?.state.controlCode !== 0x02 || active.state.presentApplicationPriority) return;
                 this.exitApplication();
             }
-            void this.loadManagedApplication(candidate);
+            void this.loadManagedApplication(candidate, 'アプリケーション読込中');
         });
     }
 
@@ -1139,11 +1156,11 @@ class BS4KDataBroadcastingManager implements PlayerManager {
         }
         this.dispatch_data_key_after_install = application.state.controlCode === 0x01;
         this.show_requested = false;
-        await this.loadManagedApplication(application);
+        await this.loadManagedApplication(application, 'アプリケーション読込中');
     }
 
     /** entryのVFS書込み完了を待ち、scope内URLとしてreceiverへロードする。 */
-    private async loadManagedApplication(application: ManagedApplication): Promise<void> {
+    private async loadManagedApplication(application: ManagedApplication, status: string): Promise<void> {
         if (this.vfs === null || this.iframe === null || this.pending_application_key !== null) return;
         const lifecycle_generation = this.lifecycle_generation;
         const vfs_generation = this.vfs_generation;
@@ -1173,12 +1190,18 @@ class BS4KDataBroadcastingManager implements PlayerManager {
                     ? 'AUTOSTART'
                     : application.state.controlCode === 0x02 ? 'PRESENT' : '',
             });
-            this.host?.loadApplication(application_url.href);
+            this.host?.loadApplication(application_url.href, status);
         } catch (error) {
             if (lifecycle_generation !== this.lifecycle_generation || vfs_generation !== this.vfs_generation) return;
             if (this.pending_application_key === application.key) this.pending_application_key = null;
             this.exitApplication();
             console.error('[BS4KDataBroadcastingManager] Failed to enter application.', error);
+            this.player.notice(
+                'データ放送を起動できませんでした。',
+                3000,
+                undefined,
+                'rgb(var(--v-theme-error-readable))',
+            );
         }
     }
 
