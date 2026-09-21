@@ -262,7 +262,6 @@ export default defineComponent({
                 {title: '番組情報タブ', value: 'Program'},
                 {title: 'チャンネルタブ', value: 'Channel'},
                 {title: 'コメントタブ', value: 'Comment'},
-                {title: 'Twitter タブ', value: 'Twitter'},
             ],
 
             // ビデオをみるときにデフォルトで表示されるパネルのタブの選択肢
@@ -270,7 +269,6 @@ export default defineComponent({
                 {title: '番組情報タブ', value: 'RecordedProgram'},
                 {title: 'シリーズタブ', value: 'Series'},
                 {title: 'コメントタブ', value: 'Comment'},
-                {title: 'Twitter タブ', value: 'Twitter'},
             ],
         };
     },

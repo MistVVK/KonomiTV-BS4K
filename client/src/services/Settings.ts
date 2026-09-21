@@ -23,9 +23,6 @@ export interface IClientSettings {
     // showed_panel_last_time: 同期無効
     // konomitv_bs4k_playback_video_codec_default_initialized: 同期無効
     // konomitv_bs4k_playback_audio_codec_default_initialized: 同期無効
-    // selected_twitter_panel_account: 同期無効
-    // twitter_panel_post_targets: 同期無効
-    saved_twitter_hashtags: string[];
     mylist: {
         type: 'Series' | 'RecordedProgram';
         id: number;
@@ -64,8 +61,8 @@ export interface IClientSettings {
     use_28hour_clock: boolean;
     show_original_broadcast_time_during_playback: boolean;
     panel_display_state: 'RestorePreviousState' | 'AlwaysDisplay' | 'AlwaysFold';
-    tv_panel_active_tab: 'Program' | 'Channel' | 'Comment' | 'Twitter';
-    video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment' | 'Twitter';
+    tv_panel_active_tab: 'Program' | 'Channel' | 'Comment';
+    video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment';
     video_series_sort_key: VideoSeriesSortKey;
     video_series_sort_direction: VideoSeriesSortDirection;
     series_home_sort_key: SeriesHomeSortKey;
@@ -133,14 +130,6 @@ export interface IClientSettings {
     mute_comment_keywords_normalize_alphanumeric_width_case: boolean;
     muted_comment_keywords: IMutedCommentKeywords[];
     muted_niconico_user_ids: string[];
-    fold_panel_after_sending_tweet: boolean;
-    reset_hashtag_when_program_switches: boolean;
-    auto_add_watching_channel_hashtag: boolean;
-    twitter_reply_thread_mode: 'PerHashtag' | 'PerDay' | 'Disabled';
-    bluesky_reply_thread_mode: 'PerHashtag' | 'PerDay' | 'Disabled';
-    twitter_active_tab: 'Search' | 'Timeline' | 'Capture';
-    tweet_hashtag_position: 'Prepend' | 'Append' | 'PrependWithLineBreak' | 'AppendWithLineBreak';
-    tweet_capture_watermark_position: 'None' | 'TopLeft' | 'TopRight' | 'BottomLeft' | 'BottomRight';
 }
 
 /**

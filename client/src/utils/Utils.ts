@@ -10,10 +10,6 @@ import { dayjs } from '@/utils';
  */
 export default class Utils {
 
-    // <video> が Authorization ヘッダを送れないために使う、動画プロキシ専用 Cookie。
-    // Server 側と同じ名前を維持し、Path を動画 endpoint だけへ限定する。
-    private static readonly twitter_video_access_token_cookie_name = 'KonomiTV-TwitterVideoAccessToken';
-
     // ログイン・ログアウトをまたいで古い非同期認証処理の結果を適用しないための、タブ内の認証世代
     private static authentication_generation = 0;
 
@@ -81,7 +77,6 @@ export default class Utils {
 
         // そのまま LocalStorage に保存
         localStorage.setItem('KonomiTV-AccessToken', access_token);
-        Utils.syncTwitterVideoAccessTokenCookie(access_token);
     }
 
 
@@ -93,24 +88,6 @@ export default class Utils {
 
         // KonomiTV-AccessToken キーを削除
         localStorage.removeItem('KonomiTV-AccessToken');
-        Utils.syncTwitterVideoAccessTokenCookie(null);
-    }
-
-
-    /**
-     * Twitter 動画プロキシ専用の認証 Cookie を現在のアクセストークンへ同期する
-     * @param access_token JWT アクセストークン（削除する場合は null）
-     */
-    static syncTwitterVideoAccessTokenCookie(access_token: string | null): void {
-
-        const cookie_value = access_token === null ? '' : encodeURIComponent(access_token);
-        const max_age = access_token === null ? '; Max-Age=0' : '';
-        document.cookie = [
-            `${Utils.twitter_video_access_token_cookie_name}=${cookie_value}`,
-            'Path=/api/twitter/video-proxy',
-            'SameSite=Strict',
-            'Secure',
-        ].join('; ') + max_age;
     }
 
 

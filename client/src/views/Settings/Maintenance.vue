@@ -40,7 +40,7 @@
             <div class="settings__item">
                 <div class="settings__item-heading">KonomiTV-BS4K のデータベースを更新</div>
                 <div class="settings__item-label">
-                    KonomiTV-BS4K のデータベースに保存されている、チャンネル情報・番組情報・Twitter アカウント情報などの外部 API に依存するデータをすべて更新します。<br>
+                    KonomiTV-BS4K のデータベースに保存されている、チャンネル情報・番組情報などの外部 API に依存するデータをすべて更新します。<br>
                     即座に外部 API からのデータ更新を反映させたいときに利用してください。<br>
                 </div>
             </div>

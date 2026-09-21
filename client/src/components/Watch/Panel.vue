@@ -24,8 +24,6 @@
                 :class="{'watch-panel__content--active': panel_active_tab === 'Series'}" />
             <Comment class="watch-panel__content" v-if="settingsStore.is_jikkyo_enabled" :playback_mode="playback_mode"
                 :class="{'watch-panel__content--active': panel_active_tab === 'Comment'}" />
-            <Twitter class="watch-panel__content" v-if="playerStore.is_offline_playback === false" :playback_mode="playback_mode"
-                :class="{'watch-panel__content--active': panel_active_tab === 'Twitter'}" />
             <button v-ripple class="watch-panel__content-remocon-button elevation-3" v-if="playback_mode === 'Live'"
                 :class="{'watch-panel__content-remocon-button--active': panel_active_tab === 'Program' || panel_active_tab === 'Channel'}"
                 @click="playerStore.is_remocon_display = !playerStore.is_remocon_display">
@@ -67,12 +65,6 @@
                 <Icon class="panel-navigation-button__icon" icon="bi:chat-left-text-fill" width="29px" />
                 <span class="panel-navigation-button__text">コメント</span>
             </div>
-            <div v-ripple class="panel-navigation-button" v-if="playerStore.is_offline_playback === false"
-                 :class="{'panel-navigation-button--active': panel_active_tab === 'Twitter'}"
-                 @click="playback_mode === 'Live' ? playerStore.tv_panel_active_tab = 'Twitter' : playerStore.video_panel_active_tab = 'Twitter'">
-                <Icon class="panel-navigation-button__icon" icon="fa-brands:twitter" width="34px" />
-                <span class="panel-navigation-button__text">Twitter</span>
-            </div>
         </div>
     </div>
 </template>
@@ -87,7 +79,6 @@ import Program from '@/components/Watch/Panel/Program.vue';
 import RecordedProgram from '@/components/Watch/Panel/RecordedProgram.vue';
 import Remocon from '@/components/Watch/Panel/Remocon.vue';
 import Series from '@/components/Watch/Panel/Series.vue';
-import Twitter from '@/components/Watch/Panel/Twitter.vue';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
@@ -102,7 +93,6 @@ export default defineComponent({
         RecordedProgram,
         Remocon,
         Series,
-        Twitter,
     },
     props: {
         playback_mode: {
@@ -128,10 +118,10 @@ export default defineComponent({
                 }
                 return this.playerStore.tv_panel_active_tab;
             } else {
-                // 保存版では通信が必要な Series / Twitter タブを表示せず、ローカルだけで描画できるタブへ退避する
+                // 保存版では通信が必要な Series タブを表示せず、ローカルだけで描画できるタブへ退避する
                 if (
                     this.playerStore.is_offline_playback === true &&
-                    ['Series', 'Twitter'].includes(this.playerStore.video_panel_active_tab)
+                    this.playerStore.video_panel_active_tab === 'Series'
                 ) {
                     return 'RecordedProgram';
                 }

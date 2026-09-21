@@ -3,8 +3,6 @@ import { isEqual, hash } from 'ohash';
 import { defineStore } from 'pinia';
 import { toRaw } from 'vue';
 
-import type { IBlueskyReplyThreadState, ITwitterReplyThreadState } from '@/utils/TweetUtils';
-
 import Settings, { IClientSettings, IMutedCommentKeywords } from '@/services/Settings';
 import useVersionStore from '@/stores/VersionStore';
 import { isKonomiTVBS4KTheme, type KonomiTVBS4KTheme } from '@/themes';
@@ -136,11 +134,6 @@ export interface ITimeTableGenreColors {
     'その他': TimeTableGenreHighlightColor;
 }
 
-export interface ITwitterPanelPostTarget {
-    is_post_to_twitter: boolean;
-    is_post_to_bluesky: boolean;
-}
-
 /**
  * LocalStorage に保存される KonomiTV の設定データ
  * IClientSettings とは異なり、同期対象外の設定キーも含まれる
@@ -150,11 +143,6 @@ export interface ILocalClientSettings extends IClientSettings {
     showed_panel_last_time: boolean;
     konomitv_bs4k_playback_video_codec_default_initialized: boolean;
     konomitv_bs4k_playback_audio_codec_default_initialized: boolean;
-    selected_twitter_panel_account: {kind: 'Twitter' | 'Bluesky' | 'Linked'; id: number;} | null;
-    twitter_panel_post_targets: Record<string, ITwitterPanelPostTarget>;
-    twitter_reply_thread_states: Record<string, ITwitterReplyThreadState>;
-    bluesky_reply_thread_states: Record<string, IBlueskyReplyThreadState>;
-    saved_twitter_hashtags: string[];
     mylist: {
         type: 'Series' | 'RecordedProgram';
         id: number;
@@ -194,8 +182,8 @@ export interface ILocalClientSettings extends IClientSettings {
     use_28hour_clock: boolean;
     show_original_broadcast_time_during_playback: boolean;
     panel_display_state: 'RestorePreviousState' | 'AlwaysDisplay' | 'AlwaysFold';
-    tv_panel_active_tab: 'Program' | 'Channel' | 'Comment' | 'Twitter';
-    video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment' | 'Twitter';
+    tv_panel_active_tab: 'Program' | 'Channel' | 'Comment';
+    video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment';
     video_series_sort_key: VideoSeriesSortKey;
     video_series_sort_direction: VideoSeriesSortDirection;
     series_home_sort_key: SeriesHomeSortKey;
@@ -284,12 +272,6 @@ export interface ILocalClientSettings extends IClientSettings {
     mute_comment_keywords_normalize_alphanumeric_width_case: boolean;
     muted_comment_keywords: IMutedCommentKeywords[];
     muted_niconico_user_ids: string[];
-    fold_panel_after_sending_tweet: boolean;
-    reset_hashtag_when_program_switches: boolean;
-    auto_add_watching_channel_hashtag: boolean;
-    twitter_active_tab: 'Search' | 'Timeline' | 'Capture';
-    tweet_hashtag_position: 'Prepend' | 'Append' | 'PrependWithLineBreak' | 'AppendWithLineBreak';
-    tweet_capture_watermark_position: 'None' | 'TopLeft' | 'TopRight' | 'BottomLeft' | 'BottomRight';
 }
 
 /**
@@ -313,20 +295,6 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     // このブラウザで工場 Opus の音声初期値を選定済みかどうか (同期無効)
     // 映像と同じく選定は 1 回だけ。手動設定があれば上書きせず完了旗だけを立てる。
     konomitv_bs4k_playback_audio_codec_default_initialized: false,
-    // 視聴画面 Twitter タブで最後に選択していたアカウント (Twitter / Bluesky / 紐付け の tagged union、同期無効)
-    // ID は Twitter / Bluesky / 紐付け それぞれの DB 連番 ID で、別環境間で意味が異なるため同期対象外
-    selected_twitter_panel_account: null,
-    // 紐付けアカウントごとの送信先設定 (同期無効)
-    // 視聴中に頻繁に変える UI 状態なので、サーバー側の AccountLink レコードには保存しない
-    twitter_panel_post_targets: {},
-    // Twitter アカウントごとのリプライツリー状態 (同期無効)
-    // 実況中の一時的な投稿状態なので、サーバー設定同期で別端末へ引き継がない
-    twitter_reply_thread_states: {},
-    // Bluesky アカウントごとのリプライツリー状態 (同期無効)
-    // 実況中の一時的な投稿状態なので、サーバー設定同期で別端末へ引き継がない
-    bluesky_reply_thread_states: {},
-    // 保存している Twitter のハッシュタグが入るリスト
-    saved_twitter_hashtags: [],
 
     // マイリストに追加したシリーズ・録画番組
     mylist: [],
@@ -622,25 +590,6 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     muted_comment_keywords: [],
     // ミュート済みのニコニコユーザー ID が入るリスト
     muted_niconico_user_ids: [],
-
-    // ***** 設定 → Twitter *****
-
-    // ツイート送信後にパネルを折りたたむ (Default: オフ)
-    fold_panel_after_sending_tweet: false,
-    // 番組が切り替わったときにハッシュタグフォームをリセットする (Default: オン)
-    reset_hashtag_when_program_switches: true,
-    // 視聴中のチャンネルに対応する局タグを自動で追加する (Default: オン)
-    auto_add_watching_channel_hashtag: true,
-    // リプライツリー実況モード (Twitter) (Default: ハッシュタグごとにリプライツリーを切り替える)
-    twitter_reply_thread_mode: 'PerHashtag',
-    // リプライツリー実況モード (Bluesky) (Default: リプライツリー実況を行わない)
-    bluesky_reply_thread_mode: 'Disabled',
-    // デフォルトで表示される Twitter タブ内のタブ (Default: キャプチャタブ)
-    twitter_active_tab: 'Capture',
-    // ツイートにつけるハッシュタグの位置 (Default: ツイート本文の後に追加する)
-    tweet_hashtag_position: 'Append',
-    // ツイートするキャプチャに番組名の透かしを描画する (Default: 透かしを描画しない)
-    tweet_capture_watermark_position: 'None',
 };
 
 // 同期対象の設定データのキーのみを列挙した配列
@@ -650,11 +599,6 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     // showed_panel_last_time: 同期無効
     // konomitv_bs4k_playback_video_codec_default_initialized: 同期無効
     // konomitv_bs4k_playback_audio_codec_default_initialized: 同期無効
-    // selected_twitter_panel_account: 同期無効
-    // twitter_panel_post_targets: 同期無効
-    // twitter_reply_thread_states: 同期無効
-    // bluesky_reply_thread_states: 同期無効
-    'saved_twitter_hashtags',
     'mylist',
     'watched_history',
     // video_auto_skip_cm: 同期無効
@@ -775,24 +719,14 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'mute_comment_keywords_normalize_alphanumeric_width_case',
     'muted_comment_keywords',
     'muted_niconico_user_ids',
-    'fold_panel_after_sending_tweet',
-    'reset_hashtag_when_program_switches',
-    'auto_add_watching_channel_hashtag',
-    'twitter_reply_thread_mode',
-    'bluesky_reply_thread_mode',
-    'twitter_active_tab',
-    'tweet_hashtag_position',
-    'tweet_capture_watermark_position',
 ];
 
 // 設定インポート時に「現在のデバイスの値を維持する」選択ができる、KonomiTV サーバーの DB レコード ID に依存した環境固有の設定キー
-// これらは Series / RecordedProgram / RecordedVideo / 連携アカウントの DB 連番 ID を参照しており、別の KonomiTV サーバーへ
-// インポートすると、同じ ID が全く別のコンテンツ (録画番組やアカウント) を指してしまうため、まとめて上書き対象から外せるようにしている
-// selected_twitter_panel_account は同期無効の一時的な UI 状態だが、同じく DB 連番 ID 依存なので環境固有値として一緒に扱う
+// これらは Series / RecordedProgram / RecordedVideo の DB 連番 ID を参照しており、別の KonomiTV サーバーへ
+// インポートすると、同じ ID が全く別のコンテンツ (録画番組) を指してしまうため、まとめて上書き対象から外せるようにしている
 export const ENVIRONMENT_SPECIFIC_SETTINGS_KEYS: (keyof ILocalClientSettings)[] = [
     'mylist',
     'watched_history',
-    'selected_twitter_panel_account',
 ];
 
 
@@ -1182,6 +1116,17 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         normalized_settings.ui_theme = ILocalClientSettingsDefault.ui_theme;
     }
 
+    // 廃止した Twitter タブの旧値だけ、現行の既定タブへ移行する
+    // タブ選択キー自体は存続キーなので不要キー掃除では消えず、LocalStorage の旧値が
+    // そのまま同期に回るとサーバー側の ClientSettings 検証で 422 になる。
+    // 比較対象は生データ由来の値なので、union から外れた 'Twitter' を見るために string へ広げて照合する
+    if ((normalized_settings.tv_panel_active_tab as string) === 'Twitter') {
+        normalized_settings.tv_panel_active_tab = ILocalClientSettingsDefault.tv_panel_active_tab;
+    }
+    if ((normalized_settings.video_panel_active_tab as string) === 'Twitter') {
+        normalized_settings.video_panel_active_tab = ILocalClientSettingsDefault.video_panel_active_tab;
+    }
+
     // 不正なインポート値や開発途中版の値では、シリーズ一覧と連続再生の順序を既定値へ戻す。
     if (
         normalized_settings.video_series_sort_key !== 'SeasonEpisode' &&
@@ -1317,19 +1262,6 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
             normalized_settings[konomitv_bs4k_key] =
                 ILocalClientSettingsDefault[konomitv_bs4k_key];
         }
-    }
-
-    // 旧 selected_twitter_account_id (Twitter アカウント単独参照) を
-    // 新 selected_twitter_panel_account (Twitter / Bluesky / 紐付け の tagged union) に移行する
-    // 既存ユーザーの「最後に選択していた Twitter アカウント」が初回ロードで失われないよう、
-    // 旧キーが残っていて新キーが未設定の場合のみ Twitter アカウントとして引き継ぐ
-    // 旧キー自体はループで既に排除済みのため、ここで明示的な削除処理は不要
-    if (normalized_settings.selected_twitter_panel_account === null &&
-        typeof settings.selected_twitter_account_id === 'number') {
-        normalized_settings.selected_twitter_panel_account = {
-            kind: 'Twitter',
-            id: settings.selected_twitter_account_id,
-        };
     }
 
     return normalized_settings as ILocalClientSettings;

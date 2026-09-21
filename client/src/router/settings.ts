@@ -56,7 +56,6 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
         items: [
             {type: 'Route', label: 'アカウント・データ', icon: 'fluent:person-20-filled', to: '/settings/account'},
             {type: 'Route', label: 'ニコニコ実況', icon: 'bi:chat-left-text-fill', iconStyle: 'padding: 0 2px;', to: '/settings/account/niconico'},
-            {type: 'Route', label: 'Twitter / Bluesky 連携', icon: 'fa-brands:twitter', iconStyle: 'padding: 0 1px;', to: '/settings/account/social'},
         ],
     },
     {
@@ -177,11 +176,6 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         beforeEnter: redirectDisabledJikkyoSettings,
     },
     {
-        path: '/settings/account/social',
-        name: 'Settings Account Social',
-        component: () => import('@/views/Settings/Twitter.vue'),
-    },
-    {
         path: '/settings/server/basic',
         name: 'Settings Server Basic',
         component: () => import('@/views/Settings/Server.vue'),
@@ -273,7 +267,6 @@ const LEGACY_SETTINGS_ROUTES: RouteRecordRaw[] = [
         path: '/settings/jikkyo',
         redirect: to => ({path: '/settings/account/niconico', query: to.query, hash: to.hash}),
     },
-    {path: '/settings/twitter', redirect: '/settings/account/social'},
     {
         path: '/settings/bs4k',
         redirect: to => ({path: '/settings/server/streaming', query: to.query, hash: '#bs4k'}),

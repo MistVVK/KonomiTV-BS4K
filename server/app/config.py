@@ -138,8 +138,8 @@ class ClientSettings(BaseModel):
     use_28hour_clock: bool = False
     show_original_broadcast_time_during_playback: bool = False
     panel_display_state: Literal['RestorePreviousState', 'AlwaysDisplay', 'AlwaysFold'] = 'RestorePreviousState'
-    tv_panel_active_tab: Literal['Program', 'Channel', 'Comment', 'Twitter'] = 'Program'
-    video_panel_active_tab: Literal['RecordedProgram', 'Series', 'Comment', 'Twitter'] = 'RecordedProgram'
+    tv_panel_active_tab: Literal['Program', 'Channel', 'Comment'] = 'Program'
+    video_panel_active_tab: Literal['RecordedProgram', 'Series', 'Comment'] = 'RecordedProgram'
     video_series_sort_key: Literal['SeasonEpisode', 'BroadcastDate', 'Title'] = 'SeasonEpisode'
     video_series_sort_direction: Literal['Asc', 'Desc'] = 'Asc'
     series_home_sort_key: Literal['UpdatedAt', 'TitleReading', 'FirstAirDate', 'TmdbPopularity', 'TmdbVoteAverage', 'BangumiRating'] = 'UpdatedAt'

@@ -4,7 +4,6 @@ import { defineStore } from 'pinia';
 
 import type { IOfflineVideo } from '@/services/OfflineVideos';
 
-import { ITweetCapture } from '@/components/Watch/Panel/Twitter.vue';
 import { ICommentData } from '@/services/player/managers/LiveCommentManager';
 import { IRecordedProgram, IRecordedProgramDefault } from '@/services/Videos';
 import useSettingsStore, {
@@ -138,9 +137,6 @@ const usePlayerStore = defineStore('player', {
         // ビデオ視聴: 表示されるパネルのタブ
         video_panel_active_tab: useSettingsStore().settings.video_panel_active_tab,
 
-        // パネルの Twitter タブ内で表示されるタブ
-        twitter_active_tab: useSettingsStore().settings.twitter_active_tab,
-
         // リモコンを表示するか
         is_remocon_display: false,
 
@@ -241,50 +237,8 @@ const usePlayerStore = defineStore('player', {
         // ビデオ視聴: 過去ログコメントへの取得に失敗した際のエラーメッセージ
         // null のとき、エラーは発生していないとみなす
         video_comment_init_failed_message: null as string | null,
-
-        // Twitter パネルコンポーネントで利用する、ツイート添付候補のキャプチャのリスト
-        // UI 上と KeyboardShortcutManager の両方から操作する必要があるため PlayerStore に持たせている
-        twitter_captures: [] as ITweetCapture[],
-
-        // Twitter パネルコンポーネントで利用する、ツイートに添付するキャプチャの Blob データのリスト
-        // Twitter パネル本体とキャプチャタブの間で共有するため PlayerStore に持たせている
-        twitter_selected_capture_blobs: [] as Blob[],
-
-        // Twitter パネルコンポーネントで利用する、キャプチャを拡大表示するモーダルの表示状態
-        // UI 上と KeyboardShortcutManager の両方から操作する必要があるため PlayerStore に持たせている
-        twitter_zoom_capture_modal: false,
-
-        // Twitter パネルコンポーネントで利用する、現在モーダルで拡大表示中のキャプチャ
-        // UI 上と KeyboardShortcutManager の両方から操作する必要があるため PlayerStore に持たせている
-        twitter_zoom_capture: null as ITweetCapture | null,
     }),
     actions: {
-
-        /**
-         * Twitter パネルで選択中のキャプチャと、それに付随する UI 状態を解除する
-         * キャプチャ候補と Blob URL 自体は引き続き利用できる状態で保持する
-         */
-        clearTwitterCaptureSelection(): void {
-            for (const capture of this.twitter_captures) {
-                capture.selected = false;
-                capture.focused = false;
-            }
-            this.twitter_selected_capture_blobs = [];
-            this.twitter_zoom_capture_modal = false;
-            this.twitter_zoom_capture = null;
-        },
-
-        /**
-         * Twitter パネルのキャプチャをすべて破棄する
-         * Blob 自体は URL を持たないため、一覧側で生成した Object URL を一覧の消去前に revoke する
-         */
-        clearTwitterCaptures(): void {
-            for (const capture of this.twitter_captures) {
-                URL.revokeObjectURL(capture.image_url);
-            }
-            this.twitter_captures = [];
-            this.clearTwitterCaptureSelection();
-        },
 
         /**
          * 視聴画面を開き、再生処理を開始する際に必ず呼び出さなければならない
@@ -331,7 +285,6 @@ const usePlayerStore = defineStore('player', {
             })();
             this.tv_panel_active_tab = useSettingsStore().settings.tv_panel_active_tab;
             this.video_panel_active_tab = useSettingsStore().settings.video_panel_active_tab;
-            this.twitter_active_tab = useSettingsStore().settings.twitter_active_tab;
             this.is_remocon_display = false;
             this.is_zapping = false;
             this.is_player_setting_panel_open = false;
@@ -355,7 +308,6 @@ const usePlayerStore = defineStore('player', {
             this.sps_transfer_characteristics = null;
             this.konomitv_bs4k_recorded_color_rewrite_unsafe = false;
             this.live_comment_init_failed_message = null;
-            this.clearTwitterCaptures();
         }
     }
 });

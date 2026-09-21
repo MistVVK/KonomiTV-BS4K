@@ -87,6 +87,22 @@ async def HostPathRequestValidationErrorHandler(
     )
 
 
+# 廃止した Twitter タブの旧値だけを現行の既定タブへ移行する
+## パネルタブ選択キー (tv / video_panel_active_tab) は存続キーのため、Twitter 機能除去後も
+## 同期 DB には旧クライアントが保存した 'Twitter' 値が残り得る。このまま ClientSettings を
+## 検証すると設定破損と判定され、全既定値の上書き保存で無関係なユーザー設定まで失われるため、
+## 検証の直前この2値だけを移行する (他の不正値の従来どおり破損修復には関与しない)
+def _MigrateLegacyTwitterPanelTabs(client_settings: object) -> object:
+    if not isinstance(client_settings, dict):
+        return client_settings
+    migrated: dict[str, object] = client_settings
+    if migrated.get('tv_panel_active_tab') == 'Twitter':
+        migrated = {**migrated, 'tv_panel_active_tab': 'Program'}
+    if migrated.get('video_panel_active_tab') == 'Twitter':
+        migrated = {**migrated, 'video_panel_active_tab': 'RecordedProgram'}
+    return migrated
+
+
 @router.get(
     '/client',
     summary = 'クライアント設定取得 API',
@@ -99,10 +115,11 @@ async def ClientSettingsAPI(
     """
     現在ログイン中のユーザーアカウントのクライアント設定を取得する。<br>
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。<br>
+    既存 DB に廃止した Twitter タブの旧値が残っている場合は既定タブへ移行して返す。<br>
     既存 DB に NaN/Inf など非有限値が残っている場合は default へ自己修復する。
     """
     try:
-        return ClientSettings.model_validate(current_user.client_settings)
+        return ClientSettings.model_validate(_MigrateLegacyTwitterPanelTabs(current_user.client_settings))
     except ValidationError as ex:
         logging.warning(
             f'[ClientSettingsAPI] Corrupted client settings detected for user {current_user.id}. '
@@ -134,7 +151,12 @@ async def ClientSettingsUpdateAPI(
     async with in_transaction():
         user = await User.filter(id=current_user.id).select_for_update().get()
         try:
-            current_client_settings = ClientSettings.model_validate(user.client_settings)
+            # 保存済みの旧 Twitter タブ値も GET と同じ移行を通してから検証する
+            ## 移行しないと ValidationError 扱いで全既定値が比較元になり、
+            ## last_synced_at=0 化して本来 409 の古い snapshot を受け付けてしまう
+            current_client_settings = ClientSettings.model_validate(
+                _MigrateLegacyTwitterPanelTabs(user.client_settings),
+            )
         except ValidationError:
             # 汚染済み既存値は default 相当として CAS 比較し、今回の更新で上書き修復する
             current_client_settings = ClientSettings()
