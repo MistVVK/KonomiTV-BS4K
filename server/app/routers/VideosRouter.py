@@ -29,6 +29,8 @@ from app.constants import STATIC_DIR, THUMBNAILS_DIR
 from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
+from app.metadata.CMChapterFile import GetCMChapterPath
+from app.metadata.KonomiTVBS4KChapterFile import GetKonomiTVBS4KChapterPath
 from app.metadata.RecordedPlaybackIndex import (
     RECORDED_PLAYBACK_INDEX_VERSION,
     GetRecordedPlaybackIndexState,
@@ -1471,8 +1473,9 @@ async def VideoDeleteAPI(
     """
     指定された録画番組のファイルとメタデータを削除する。不可逆な処理であるため、慎重に実行すること。
     - 録画ファイルに紐づくサムネイルファイルを削除
-    - 録画ファイルに関連する補助ファイル (.ts.program.txt, .ts.err, .vtt) を削除
+    - 録画ファイル専用の番組情報・エラーログを削除
     - 録画ファイル本体を削除
+    - 録画専用のチャプター YAML を削除し、同じ基本名の録画が残っていなければ .vtt・.psc・.chapter.txt も削除
     - 全ファイルの削除完了後にデータベースから録画番組情報・録画ファイル情報を削除
 
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
@@ -1567,7 +1570,7 @@ async def VideoDeleteAPI(
                 await KonomiTVBS4KCloudTransferManager.refresh()
                 return
 
-            # 4. 関連する補助ファイルを削除する (.ts.program.txt, .ts.err, .vtt)
+            # 4. 録画の拡張子まで含む名前で対応付けられた、専用の補助ファイルを削除する
             deletion_stage = 'program information file'
             ts_program_txt_path = anyio.Path(f'{file_dir}/{file_name}.program.txt')
             if await ts_program_txt_path.is_file():
@@ -1578,12 +1581,6 @@ async def VideoDeleteAPI(
             if await ts_err_path.is_file():
                 await ts_err_path.unlink()
 
-            # コンテナの拡張子を置換する規約は、解析・配信時の sidecar 導出と揃える。
-            deletion_stage = 'WebVTT sidecar file'
-            webvtt_path = file_path.with_suffix('.vtt')
-            if await webvtt_path.is_file():
-                await webvtt_path.unlink()
-
             # 5. 録画ファイル本体を削除する
             deletion_stage = 'recorded video file'
             if await file_path.is_file():
@@ -1593,7 +1590,32 @@ async def VideoDeleteAPI(
                 # 再試行時は前回処理で録画本体だけ削除済みの場合があるため、存在しなくても処理を継続する
                 logging.warning(f'[VideoDeleteAPI] Recorded video file does not exist: {file_path}')
 
-            # 6. 全ファイルの削除完了後に DB レコードを削除する
+            # 6. 自動解析 YAML は録画の完全名に対応し、別コンテナの同名録画とは共有しない。
+            deletion_stage = 'recording chapter file'
+            chapter_path = anyio.Path(GetKonomiTVBS4KChapterPath(pathlib.Path(str(file_path))))
+            await chapter_path.unlink(missing_ok=True)
+
+            # 7. 本体の削除後に確認することで、同名録画の並行削除でも最後の処理が共有物を回収する。
+            # DB 未登録の録画も保護し、基本名の比較は外部チャプターの対応判定に合わせる。
+            deletion_stage = 'shared sidecar ownership check'
+            has_shared_recording = False
+            async for candidate in file_dir.iterdir():
+                if (candidate.stem.casefold() == file_path.stem.casefold() and
+                    candidate.suffix.lower() in RecordedScanTask.SCAN_TARGET_EXTENSIONS and
+                    await candidate.is_file()):
+                    has_shared_recording = True
+                    break
+            # 読み込み側と同じ名前だけを対象にし、並行した削除による不在は成功として扱う。
+            if not has_shared_recording:
+                for sidecar_path in (
+                    file_path.with_suffix('.vtt'),
+                    file_path.with_suffix('.psc'),
+                    anyio.Path(GetCMChapterPath(pathlib.Path(str(file_path)))),
+                ):
+                    deletion_stage = 'shared sidecar files'
+                    await sidecar_path.unlink(missing_ok=True)
+
+            # 8. 全ファイルの削除完了後に DB レコードを削除する
             # RecordedVideo も CASCADE 制約で削除される
             deletion_stage = 'database record'
             await recorded_program.delete()
