@@ -1,0 +1,295 @@
+from __future__ import annotations
+
+from datetime import date, datetime
+
+from tortoise import transactions
+from tortoise.backends.base.client import BaseDBAsyncClient
+
+from app.constants import JST
+from app.models.Series import Series
+
+
+class SeriesMerger:
+    """Bangumi で同一作品と確定した Series とその放送期間を統合する。"""
+
+    @classmethod
+    async def mergeByBangumiSubject(
+        cls,
+        series_id: int,
+        subject_id: int,
+        subject_name: str | None,
+        subject_name_cn: str | None,
+        subject_summary: str | None,
+        subject_image_identifier: str | None,
+        subject_date: date | None,
+        subject_rating: float | None,
+    ) -> Series:
+        """
+        指定した Series を同じ Bangumi 条目に紐付く最古の Series へ原子的に統合する。
+
+        Args:
+            series_id (int): 今回 Bangumi 条目と照合できた Series ID。
+            subject_id (int): Bangumi 条目 ID。
+            subject_name (str | None): Bangumi 条目の原題。
+            subject_name_cn (str | None): Bangumi 条目の中文題。
+            subject_summary (str | None): Bangumi 条目の概要。
+            subject_image_identifier (str | None): Bangumi 条目の画像パス。
+            subject_date (date | None): 条目の放送開始日。
+            subject_rating (float | None): 条目のレーティング (rating.score)。
+
+        Returns:
+            Series: 統合後に残った最も ID が小さい Series。
+
+        Raises:
+            ValueError: 指定された Series が存在しない場合。
+        """
+
+        async with transactions.in_transaction() as connection:
+            # 並行同期が先に別 subject を確定していないか、書き込み前に再取得する。
+            _, current_rows = await connection.execute_query(
+                'SELECT id, bangumi_subject_id FROM series WHERE id = ?',
+                [series_id],
+            )
+            if len(current_rows) == 0:
+                raise ValueError(f'Series {series_id} was not found.')
+            current_subject_id = current_rows[0]['bangumi_subject_id']
+            if current_subject_id is not None and int(current_subject_id) != subject_id:
+                # 先に確定した条目を、別ユーザーの後続 merge で上書きしない。
+                return await Series.get(id=series_id)
+
+            # 今回の照合対象と、すでに同じ条目 ID を保持する Series を同じトランザクションで取得する。
+            ## プロセス内の同期は BangumiClient 側で直列化し、DB の一意索引をプロセス間競合の最終防線とする。
+            _, candidate_rows = await connection.execute_query(
+                'SELECT id, normalized_title, title, tmdb_id, tmdb_media_type, tmdb_season_number, '
+                'tmdb_enrichment_pending, tmdb_name, tmdb_overview, tmdb_poster_url, tmdb_backdrop_url '
+                'FROM series '
+                'WHERE id = ? OR bangumi_subject_id = ? '
+                'ORDER BY id ASC',
+                [series_id, subject_id],
+            )
+            if not any(int(row['id']) == series_id for row in candidate_rows):
+                raise ValueError(f'Series {series_id} was not found.')
+
+            canonical_row = candidate_rows[0]
+            canonical_series_id = int(canonical_row['id'])
+            canonical_series_title = str(canonical_row['title'])
+            canonical_tmdb_id = canonical_row['tmdb_id']
+
+            # 移行済み DB だけでなく、テスト用スキーマや新規作成直後の Series でも主タイトルの所有者を必ず登録する。
+            await connection.execute_query(
+                'INSERT INTO series_aliases (normalized_title, series_id) VALUES (?, ?) '
+                'ON CONFLICT(normalized_title) DO UPDATE SET series_id = excluded.series_id',
+                [str(canonical_row['normalized_title']), canonical_series_id],
+            )
+
+            # ID が小さい最古の Series を残し、それ以外の表記・放送期間・録画を順番に移す。
+            for source_row in candidate_rows[1:]:
+                source_series_id = int(source_row['id'])
+
+                # 削除する Series の主タイトルと既存 alias を残し、将来の録画スキャンが再分割しないようにする。
+                await connection.execute_query(
+                    'UPDATE series_aliases SET series_id = ? WHERE series_id = ?',
+                    [canonical_series_id, source_series_id],
+                )
+                await connection.execute_query(
+                    'INSERT INTO series_aliases (normalized_title, series_id) VALUES (?, ?) '
+                    'ON CONFLICT(normalized_title) DO UPDATE SET series_id = excluded.series_id',
+                    [str(source_row['normalized_title']), canonical_series_id],
+                )
+
+                # 同一チャンネルの放送期間が両 Series にある場合は、日付範囲を外側へ広げて一方へ寄せる。
+                _, source_period_rows = await connection.execute_query(
+                    'SELECT id, channel_id, start_date, end_date '
+                    'FROM series_broadcast_periods WHERE series_id = ?',
+                    [source_series_id],
+                )
+                for source_period_row in source_period_rows:
+                    source_period_id = int(source_period_row['id'])
+                    _, canonical_period_rows = await connection.execute_query(
+                        'SELECT id, start_date, end_date '
+                        'FROM series_broadcast_periods '
+                        'WHERE series_id = ? AND channel_id = ?',
+                        [canonical_series_id, str(source_period_row['channel_id'])],
+                    )
+                    if len(canonical_period_rows) == 0:
+                        await connection.execute_query(
+                            'UPDATE series_broadcast_periods SET series_id = ? WHERE id = ?',
+                            [canonical_series_id, source_period_id],
+                        )
+                        continue
+
+                    canonical_period_row = canonical_period_rows[0]
+                    canonical_period_id = int(canonical_period_row['id'])
+                    start_date = min(
+                        str(canonical_period_row['start_date']),
+                        str(source_period_row['start_date']),
+                    )
+                    end_date = max(
+                        str(canonical_period_row['end_date']),
+                        str(source_period_row['end_date']),
+                    )
+                    await connection.execute_query(
+                        'UPDATE series_broadcast_periods SET start_date = ?, end_date = ? WHERE id = ?',
+                        [start_date, end_date, canonical_period_id],
+                    )
+                    await connection.execute_query(
+                        'UPDATE recorded_programs SET series_broadcast_period_id = ? '
+                        'WHERE series_broadcast_period_id = ?',
+                        [canonical_period_id, source_period_id],
+                    )
+                    await connection.execute_query(
+                        'DELETE FROM series_broadcast_periods WHERE id = ?',
+                        [source_period_id],
+                    )
+
+                # 手動 Rule と録画ごとの所属判定を主 Series へ移し、削除時の SET NULL で失わない。
+                await connection.execute_query(
+                    'UPDATE recorded_series_rules SET series_id = ? WHERE series_id = ?',
+                    [canonical_series_id, source_series_id],
+                )
+                await connection.execute_query(
+                    'UPDATE recorded_series_resolutions SET series_id = ? WHERE series_id = ?',
+                    [canonical_series_id, source_series_id],
+                )
+                await cls._reassignSeriesEpisodes(
+                    connection = connection,
+                    canonical_series_id = canonical_series_id,
+                    source_series_id = source_series_id,
+                )
+
+                # 放送期間を先に完全移行してから Series FK と表示タイトルを更新する。
+                ## 録画単位の Bangumi subject / episode ID は同じ作品の永続 ID なのでそのまま保持する。
+                await connection.execute_query(
+                    'UPDATE recorded_programs SET series_id = ?, series_title = ? WHERE series_id = ?',
+                    [canonical_series_id, canonical_series_title, source_series_id],
+                )
+                await connection.execute_query('DELETE FROM series WHERE id = ?', [source_series_id])
+
+                # 後から Bangumi が統合しても、先に取得済みの TMDb 補完を失わない。
+                # 複合 unique の所有者である元 Series を削除した後に、主側の欠損だけを引き継ぐ。
+                if canonical_tmdb_id is None and source_row['tmdb_id'] is not None:
+                    await connection.execute_query(
+                        'UPDATE series SET tmdb_id = ?, tmdb_media_type = ?, tmdb_season_number = ?, '
+                        'tmdb_enrichment_pending = ?, tmdb_name = ?, '
+                        'tmdb_overview = ?, tmdb_poster_url = ?, tmdb_backdrop_url = ? WHERE id = ?',
+                        [
+                            source_row['tmdb_id'], source_row['tmdb_media_type'],
+                            source_row['tmdb_season_number'],
+                            source_row['tmdb_enrichment_pending'], source_row['tmdb_name'],
+                            source_row['tmdb_overview'], source_row['tmdb_poster_url'],
+                            source_row['tmdb_backdrop_url'], canonical_series_id,
+                        ],
+                    )
+                    canonical_tmdb_id = source_row['tmdb_id']
+
+            # 重複行を削除した後にだけ一意制約対象の subject ID を更新する。
+            ## この順番により、同期中も同じ subject ID を持つ Series は常に 1 件に保たれる。
+            ## 初放送日は TMDb → Bangumi → ローカルの優先順。条目 date が不明なときは
+            ## 既存値を書き換えず、first_air_date_source が TMDb 由来でない行だけを更新する。
+            ## レーティングは未設定の行だけ COALESCE で埋める (保存済み評価の再取得・上書きはしない)。
+            await connection.execute_query(
+                'UPDATE series SET '
+                'bangumi_subject_id = ?, bangumi_subject_name = ?, bangumi_subject_name_cn = ?, '
+                'bangumi_subject_summary = ?, bangumi_subject_image_url = ?, '
+                'first_air_date = CASE WHEN (? IS NOT NULL AND (first_air_date_source IS NULL OR first_air_date_source != ?)) THEN ? ELSE first_air_date END, '
+                "first_air_date_source = CASE WHEN (? IS NOT NULL AND (first_air_date_source IS NULL OR first_air_date_source != ?)) THEN 'Bangumi' ELSE first_air_date_source END, "
+                'bangumi_rating = COALESCE(bangumi_rating, ?), updated_at = ? '
+                'WHERE id = ? AND (bangumi_subject_id IS NULL OR bangumi_subject_id = ?)',
+                [
+                    subject_id,
+                    subject_name,
+                    subject_name_cn,
+                    subject_summary,
+                    subject_image_identifier,
+                    subject_date,
+                    'Tmdb',
+                    subject_date,
+                    subject_date,
+                    'Tmdb',
+                    subject_rating,
+                    datetime.now(tz=JST),
+                    canonical_series_id,
+                    subject_id,
+                ],
+            )
+
+        return await Series.get(id=canonical_series_id)
+
+
+    @staticmethod
+    async def _reassignSeriesEpisodes(
+        connection: BaseDBAsyncClient,
+        canonical_series_id: int,
+        source_series_id: int,
+    ) -> None:
+        """
+        統合元の構造化話数を主 Series へ移し、同じ話数は参照を寄せてから重複行を消す。
+
+        Args:
+            connection (BaseDBAsyncClient): 統合トランザクションの DB 接続。
+            canonical_series_id (int): 残す主 Series ID。
+            source_series_id (int): 削除する統合元 Series ID。
+
+        Returns:
+            None
+        """
+
+        _, source_episode_rows = await connection.execute_query(
+            'SELECT id, season_number, episode_number, bangumi_episode_id, tmdb_episode_id '
+            'FROM series_episodes WHERE series_id = ?',
+            [source_series_id],
+        )
+        for source_episode_row in source_episode_rows:
+            source_episode_id = int(source_episode_row['id'])
+            _, canonical_episode_rows = await connection.execute_query(
+                'SELECT id, bangumi_episode_id, tmdb_episode_id FROM series_episodes '
+                'WHERE series_id = ? AND season_number = ? AND episode_number = ?',
+                [
+                    canonical_series_id,
+                    source_episode_row['season_number'],
+                    source_episode_row['episode_number'],
+                ],
+            )
+            if len(canonical_episode_rows) == 0:
+                # 主 Series に無い話数はその行を所有者ごと移す。
+                await connection.execute_query(
+                    'UPDATE series_episodes SET series_id = ? WHERE id = ?',
+                    [canonical_series_id, source_episode_id],
+                )
+                continue
+
+            canonical_episode_id = int(canonical_episode_rows[0]['id'])
+            # 主側に Bangumi episode が無く統合元にある場合だけ、確定済み ID を引き継ぐ。
+            if (
+                canonical_episode_rows[0]['bangumi_episode_id'] is None and
+                source_episode_row['bangumi_episode_id'] is not None
+            ):
+                await connection.execute_query(
+                    'UPDATE series_episodes SET bangumi_episode_id = ? WHERE id = ?',
+                    [int(source_episode_row['bangumi_episode_id']), canonical_episode_id],
+                )
+            # 話数の参照を寄せる際、TMDb の確定済み ID も主側が未設定のときだけ保持する。
+            if (
+                canonical_episode_rows[0]['tmdb_episode_id'] is None and
+                source_episode_row['tmdb_episode_id'] is not None
+            ):
+                await connection.execute_query(
+                    'UPDATE series_episodes SET tmdb_episode_id = ? WHERE id = ?',
+                    [int(source_episode_row['tmdb_episode_id']), canonical_episode_id],
+                )
+            await connection.execute_query(
+                'UPDATE recorded_programs SET series_episode_id = ? WHERE series_episode_id = ?',
+                [canonical_episode_id, source_episode_id],
+            )
+            await connection.execute_query(
+                'UPDATE recorded_episode_resolutions SET episode_id = ? WHERE episode_id = ?',
+                [canonical_episode_id, source_episode_id],
+            )
+            await connection.execute_query(
+                'UPDATE recorded_episode_resolutions SET manual_episode_id = ? WHERE manual_episode_id = ?',
+                [canonical_episode_id, source_episode_id],
+            )
+            await connection.execute_query(
+                'DELETE FROM series_episodes WHERE id = ?',
+                [source_episode_id],
+            )

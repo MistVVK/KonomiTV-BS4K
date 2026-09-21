@@ -47,15 +47,12 @@ DATA_DIR = BASE_DIR / 'data'
 ACCOUNT_ICON_DIR = DATA_DIR / 'account-icons'
 ## サムネイル画像があるディレクトリ
 THUMBNAILS_DIR = DATA_DIR / 'thumbnails'
+## TMDb / Bangumi から取得して WebP へ変換したシリーズ表紙の保存先
+KONOMITV_BS4K_SERIES_IMAGES_DIR = DATA_DIR / 'series-images'
 ## 変換済み録画字幕 (WebVTT) のキャッシュディレクトリ
 RECORDED_SUBTITLES_DIR = DATA_DIR / 'recorded-subtitles'
 ## オフライン保存の完成済みパッケージと永続ジョブ状態を保持するディレクトリ
 KONOMITV_BS4K_OFFLINE_JOBS_DIR = DATA_DIR / 'offline-jobs'
-## Twitter 関連のデバッグ用スクリーンショットの保存先ディレクトリ
-TWITTER_DEBUG_SCREENSHOTS_DIR = DATA_DIR / 'twitter-debug-screenshots'
-## デバッグ用スクリーンショットの保持期限 (日数)
-## 7 日を超えたスクリーンショットを自動削除する
-TWITTER_DEBUG_SCREENSHOTS_RETENTION_DAYS = 7
 ## サーバー終了時に再起動が必要なことを伝えるロックファイルのパス
 RESTART_REQUIRED_LOCK_PATH = DATA_DIR / 'restart_required.lock'
 
@@ -85,9 +82,6 @@ KONOMITV_SERVER_LOG_PATH = LOGS_DIR / 'KonomiTV-BS4K-Server.log'
 KONOMITV_ACCESS_LOG_PATH = LOGS_DIR / 'KonomiTV-BS4K-Access.log'
 ## Akebi (HTTPS リバースプロキシ) のログファイルのパス
 AKEBI_LOG_PATH = LOGS_DIR / 'Akebi-HTTPS-Server.log'
-## 製品用 opencode serve のログファイルのパス
-OPENCODE_SERVE_LOG_PATH = LOGS_DIR / 'opencode-serve.log'
-
 # サードパーティーライブラリのあるディレクトリ
 LIBRARY_DIR = BASE_DIR / 'thirdparty'
 
@@ -105,33 +99,34 @@ LIBRARY_PATH = {
     ),
     'tsreadex': str(LIBRARY_DIR / 'tsreadex/tsreadex.elf'),
     'psisiarc': str(LIBRARY_DIR / 'psisiarc/psisiarc.elf'),
-    # 製品用 opencode serve バイナリ（Docker 同梱 SEA）。ホスト開発時は PATH 上の同名でも可。
+    # 製品用 OpenCode CLI バイナリ（Docker 同梱 SEA）。ホスト開発時は PATH 上の同名でも可。
     'OpenCode': '/usr/local/bin/opencode',
 }
 
-# ----- 製品用 opencode serve（録画シリーズ AI）-----
-# 監査用 OpenCode と listen port / home / workspace / auth を完全分離する。
-OPENCODE_SERVE_HOST = '127.0.0.1'
-## config / data / PID を置く製品専用 home ルート
+# ----- 製品用 OpenCode CLI（録画シリーズ AI）-----
+# 監査用 OpenCode と XDG home / workspace / auth を完全分離する。
+## config / data / cache / state を置く製品専用 home ルート
 OPENCODE_HOME_ROOT = DATA_DIR / 'opencode-home'
 ## XDG_CONFIG_HOME（opencode.json / auth.json 等がぶら下がる）
 OPENCODE_XDG_CONFIG_HOME = OPENCODE_HOME_ROOT / 'config'
 ## XDG_DATA_HOME
 OPENCODE_XDG_DATA_HOME = OPENCODE_HOME_ROOT / 'data'
-## serve の cwd。ソースツリーを置かない空の最小化 workspace
+## XDG_CACHE_HOME（models.dev cache を製品用に隔離する）
+OPENCODE_XDG_CACHE_HOME = OPENCODE_HOME_ROOT / 'cache'
+## XDG_STATE_HOME（CLI process lock などを製品用に隔離する）
+OPENCODE_XDG_STATE_HOME = OPENCODE_HOME_ROOT / 'state'
+## 製品用 auth.json。値は秘密なのでアプリケーションログへ出さない
+OPENCODE_AUTH_PATH = OPENCODE_XDG_DATA_HOME / 'opencode' / 'auth.json'
+## models.dev provider catalog cache
+OPENCODE_MODELS_CACHE_PATH = OPENCODE_XDG_CACHE_HOME / 'opencode' / 'models.json'
+## CLI の cwd。ソースツリーを置かない空の最小化 workspace
 OPENCODE_WORKSPACE_DIR = DATA_DIR / 'opencode-workspace'
-## orphan 回収用 PID ファイル
-OPENCODE_SERVE_PID_PATH = OPENCODE_HOME_ROOT / 'opencode-serve.pid'
 ## イメージ同梱の製品用 config 雛形（初回 seed 元）
 OPENCODE_BUNDLED_CONFIG_PATH = Path('/usr/local/share/konomitv-bs4k-opencode/opencode.json')
 ## リポジトリ内の雛形（開発・テスト用フォールバック）
 OPENCODE_REPO_CONFIG_PATH = BASE_DIR.parent / 'docker' / 'opencode' / 'opencode.json'
-## health リトライ（起動直後の bind 待ち）
-OPENCODE_HEALTH_RETRY_ATTEMPTS = 30
-OPENCODE_HEALTH_RETRY_INTERVAL_SEC = 0.2
-OPENCODE_HEALTH_TIMEOUT_SEC = 2.0
 ## 固定 version（Dockerfile / package.json と一致させる）
-OPENCODE_PINNED_VERSION = '1.18.18'
+OPENCODE_PINNED_VERSION = '1.18.27'
 ## 生成 agent / EpisodeLookup agent 名（opencode.json と一致）
 OPENCODE_AGENT_GENERATE = 'recorded-series-generate'
 OPENCODE_AGENT_EPISODE = 'recorded-series-episode'
@@ -141,7 +136,12 @@ __model_list = [name for _, name, _ in pkgutil.iter_modules(path=['app/models'])
 DATABASE_CONFIG = {
     'timezone': 'Asia/Tokyo',
     'connections': {
-        'default': f'sqlite://{DATA_DIR / "database.sqlite"!s}',
+        'default': {
+            'engine': 'app.utils.KonomiTVBS4KTransactionalSQLite',
+            'credentials': {
+                'file_path': str(DATA_DIR / 'database.sqlite'),
+            },
+        },
     },
     'apps': {
         'models': {
@@ -300,6 +300,11 @@ QUALITY_TYPES = Literal[
     '240p-30fps',
     '240p-30fps-hevc',
 ]
+
+# ライブストリーミングで指定できる品質
+## original はブラウザ側の mpeg2toh264 で変換・再生する前提で、放送波の MPEG-2 TS を再エンコードせずに直接出力するストリームを表す特別な値
+## 保存プロファイルの QUALITY には含めず、ライブ GR/BS/CS フルセグの視聴中選択だけが使う
+LIVE_STREAMING_QUALITY_TYPES = Literal['original'] | QUALITY_TYPES
 
 # 映像と音声の品質
 QUALITY: dict[QUALITY_TYPES, Quality] = {
@@ -823,23 +828,37 @@ def _LoadOrCreateJWTSecretKey(path: Path) -> str:
 ## jwt_secret.dat からシークレットキーをロードする
 JWT_SECRET_KEY = _LoadOrCreateJWTSecretKey(JWT_SECRET_KEY_PATH)
 
-# 暗号化された Cookie の接頭辞
-TWITTER_ACCOUNT_COOKIE_ENCRYPTION_PREFIX = 'enc:'
-# Cookie の暗号化に使う Fernet の暗号化キー
-TWITTER_ACCOUNT_COOKIE_FERNET_KEY = base64.urlsafe_b64encode(
-    hashlib.sha256(JWT_SECRET_KEY.encode('utf-8')).digest(),
+# 暗号化されたニコニコ OAuth トークンの接頭辞
+NICONICO_TOKEN_ENCRYPTION_PREFIX = 'enc:'
+# ニコニコ OAuth トークンの暗号化に使う Fernet の暗号化キー
+NICONICO_TOKEN_FERNET_KEY = base64.urlsafe_b64encode(
+    hashlib.sha256(f'niconico:{JWT_SECRET_KEY}'.encode()).digest(),
 )
-# Cookie の暗号化に使う Fernet のインスタンス
-TWITTER_ACCOUNT_COOKIE_FERNET = Fernet(TWITTER_ACCOUNT_COOKIE_FERNET_KEY)
+# ニコニコ OAuth トークンの暗号化に使う Fernet のインスタンス
+NICONICO_TOKEN_FERNET = Fernet(NICONICO_TOKEN_FERNET_KEY)
 
-# 暗号化された Bluesky セッション文字列の接頭辞
-BLUESKY_ACCOUNT_SESSION_ENCRYPTION_PREFIX = 'enc:'
-# Bluesky セッション文字列の暗号化に使う Fernet の暗号化キー
-BLUESKY_ACCOUNT_SESSION_FERNET_KEY = base64.urlsafe_b64encode(
-    hashlib.sha256(f'bluesky:{JWT_SECRET_KEY}'.encode()).digest(),
+# 暗号化された Bangumi 個人アクセストークンの接頭辞
+BANGUMI_ACCESS_TOKEN_ENCRYPTION_PREFIX = 'enc:'
+# Bangumi 個人アクセストークンの暗号化に使う Fernet の暗号化キー
+BANGUMI_ACCESS_TOKEN_FERNET_KEY = base64.urlsafe_b64encode(
+    hashlib.sha256(f'bangumi:{JWT_SECRET_KEY}'.encode()).digest(),
 )
-# Bluesky セッション文字列の暗号化に使う Fernet のインスタンス
-BLUESKY_ACCOUNT_SESSION_FERNET = Fernet(BLUESKY_ACCOUNT_SESSION_FERNET_KEY)
+# Bangumi 個人アクセストークンの暗号化に使う Fernet のインスタンス
+BANGUMI_ACCESS_TOKEN_FERNET = Fernet(BANGUMI_ACCESS_TOKEN_FERNET_KEY)
+
+# 暗号化された TMDb API キーの接頭辞
+TMDB_API_KEY_ENCRYPTION_PREFIX = 'enc:'
+# TMDb API キーの暗号化に使う Fernet の暗号化キー
+TMDB_API_KEY_FERNET_KEY = base64.urlsafe_b64encode(
+    hashlib.sha256(f'tmdb:{JWT_SECRET_KEY}'.encode()).digest(),
+)
+# TMDb API キーの暗号化に使う Fernet のインスタンス
+TMDB_API_KEY_FERNET = Fernet(TMDB_API_KEY_FERNET_KEY)
+
+# Bangumi API だけが要求する User-Agent。他の外部 API の既定ヘッダーとは混ぜない。
+BANGUMI_REQUEST_HEADERS: dict[str, str] = {
+    'User-Agent': f'MistVVK/KonomiTV-BS4K/{BS4K_VERSION} (https://github.com/MistVVK/KonomiTV-BS4K)',
+}
 
 # パスワードハッシュ化のための設定
 PASSWORD_CONTEXT = CryptContext(
@@ -862,4 +881,25 @@ HTTPX_CLIENT = lambda: httpx.AsyncClient(
     follow_redirects = True,
     # 3 秒応答がない場合はタイムアウトする
     timeout = 3.0,
+)
+
+# TMDb API で利用する httpx.AsyncClient の設定
+## TMDb は検索・詳細・シーズンと1作品あたり複数回呼び出し、海外 API のため 3 秒では
+## 正常応答をタイムアウト扱いしやすい。Wikipedia 検索と同じ 10 秒を上限にする。
+TMDB_HTTPX_CLIENT = lambda: httpx.AsyncClient(
+    # KonomiTV-BS4K の User-Agent を指定
+    headers = API_REQUEST_HEADERS,
+    # query に API キーを含むため、別ホストへのリダイレクトで転送しない。
+    follow_redirects = False,
+    # 10 秒応答がない場合はタイムアウトする
+    timeout = 10.0,
+)
+
+# シリーズ表紙の取得で利用する httpx.AsyncClient の設定
+## 画像 URL は認証情報を含まないが、保存済み識別子から許可済み CDN へだけ接続し、
+## 別ホストへの redirect は追跡しない。
+KONOMITV_BS4K_SERIES_IMAGE_HTTPX_CLIENT = lambda: httpx.AsyncClient(
+    headers = API_REQUEST_HEADERS,
+    follow_redirects = False,
+    timeout = 10.0,
 )

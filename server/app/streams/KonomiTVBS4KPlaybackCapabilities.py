@@ -13,7 +13,10 @@ from biim.mpeg2ts.pat import PATSection
 from biim.mpeg2ts.pmt import PMTSection
 
 from app import logging
-from app.constants import LIBRARY_PATH
+from app.constants import LIBRARY_PATH, QUALITY_TYPES
+from app.streams.KonomiTVBS4KExternalProcessLimiter import (
+    KonomiTVBS4KExternalProcessLimiter,
+)
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KONOMITV_BS4K_AUDIO_CODECS,
     IsKonomiTVBS4KVideoCodecBitDepthSupported,
@@ -42,7 +45,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
     """録画の実probeとライブTS経路の依存を分離して共通能力契約を作る。"""
 
     BRIDGE_LIBRARY_PATH_KEY = 'KonomiTVBS4KTSCodecBridge'
-    _live_probe_version: ClassVar[int] = 7
+    _live_probe_version: ClassVar[int] = 8
     _live_probe_signature: ClassVar[str | None] = None
     _live_probe_results: ClassVar[
         dict[
@@ -83,7 +86,6 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
     _radio_opus_probe_tasks: ClassVar[dict[str, asyncio.Task[bool]]] = {}
     _live_probe_event_loop: ClassVar[asyncio.AbstractEventLoop | None] = None
     _live_probe_lock: ClassVar[asyncio.Lock] = asyncio.Lock()
-    _live_probe_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
     _negative_probe_ttl_seconds: ClassVar[float] = 5.0
 
     @classmethod
@@ -196,6 +198,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         video_bit_depths: tuple[KonomiTVBS4KVideoBitDepth, ...],
         audio_codec: KonomiTVBS4KAudioCodec,
         has_video: bool,
+        quality: QUALITY_TYPES | None = None,
     ) -> KonomiTVBS4KPlaybackCapabilities:
         """
         再生開始に必要なexact行とAVC/AAC互換fallback行だけを検査する。
@@ -207,6 +210,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             video_bit_depths: 現在の画質とブラウザで候補になるbit depthの優先順。
             audio_codec: 保存設定から選ばれた音声コーデック。
             has_video: 映像SourceBufferを使う再生対象ならTrue。
+            quality: 録画再生で実際に生成する画質。ライブでは使用しない。
 
         Returns:
             現在の再生候補と互換fallbackだけを含む部分能力行列。
@@ -221,6 +225,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                 video_bit_depths,
                 audio_codec,
                 has_video,
+                quality,
             )
 
         # ラジオと音声のみ録画では映像backendを一切起動せず、要求音声とAAC fallbackだけを検査する。
@@ -450,6 +455,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         video_bit_depths: tuple[KonomiTVBS4KVideoBitDepth, ...],
         audio_codec: KonomiTVBS4KAudioCodec,
         has_video: bool,
+        quality: QUALITY_TYPES | None,
     ) -> KonomiTVBS4KPlaybackCapabilities:
         """
         録画再生に必要なエンコーダー能力だけを検査する。
@@ -460,6 +466,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             video_bit_depths: ブラウザで再生できる bit depth の優先順。
             audio_codec: 保存設定から選ばれた音声コーデック。
             has_video: 録画に映像ストリームが含まれるなら True。
+            quality: 実際に生成する録画画質。省略時は基礎能力だけを検査する。
 
         Returns:
             録画能力だけを保持し、ライブ組み合わせを含まない部分能力行列。
@@ -497,11 +504,19 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         for video_bit_depth in video_bit_depths:
             if IsKonomiTVBS4KVideoCodecBitDepthSupported(video_codec, video_bit_depth) is False:
                 continue
-            recorded = await RecordedPlaybackCapabilityProbe.getCapability(
-                encoder,
-                video_codec,
-                video_bit_depth,
-            )
+            if quality is None:
+                recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                    encoder,
+                    video_codec,
+                    video_bit_depth,
+                )
+            else:
+                recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                    encoder,
+                    video_codec,
+                    video_bit_depth,
+                    quality = quality,
+                )
             recorded_capabilities.append(recorded)
             if recorded.available is True:
                 break
@@ -511,13 +526,20 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             (recorded.encoder, recorded.codec, recorded.bit_depth) == fallback_target
             for recorded in recorded_capabilities
         ):
-            recorded_capabilities.append(
-                await RecordedPlaybackCapabilityProbe.getCapability(
+            if quality is None:
+                fallback_recorded = await RecordedPlaybackCapabilityProbe.getCapability(
                     encoder,
                     'avc',
                     8,
                 )
-            )
+            else:
+                fallback_recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                    encoder,
+                    'avc',
+                    8,
+                    quality = quality,
+                )
+            recorded_capabilities.append(fallback_recorded)
 
         return KonomiTVBS4KPlaybackCapabilities(
             video = tuple(
@@ -573,7 +595,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         同一バイナリの組み合わせはプロセス内でキャッシュし、API 呼び出しごとの再エンコードを避ける。
         """
 
-        lock, semaphore = cls.__getLiveProbeSynchronization()
+        lock = cls.__getLiveProbeLock()
         key = (encoder, video_codec, bit_depth, audio_codec)
         while True:
             async with lock:
@@ -600,7 +622,6 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                             signature,
                             key,
                             lock,
-                            semaphore,
                         ),
                         name = (
                             'KonomiTVBS4KPlaybackCapabilityProbe-live-'
@@ -629,7 +650,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             bool: 映像なし・二音声の Opus TS が実 pipe で成立した場合は True。
         """
 
-        lock, semaphore = cls.__getLiveProbeSynchronization()
+        lock = cls.__getLiveProbeLock()
         while True:
             async with lock:
                 signature = cls.__resetLiveProbeCacheForCurrentSignature()
@@ -651,7 +672,6 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                         cls.__runRadioOpusTransportProbeAndCache(
                             signature,
                             lock,
-                            semaphore,
                         ),
                         name = 'KonomiTVBS4KPlaybackCapabilityProbe-radio-opus',
                     )
@@ -664,19 +684,16 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
                     return result
 
     @classmethod
-    def __getLiveProbeSynchronization(
-        cls,
-    ) -> tuple[asyncio.Lock, asyncio.Semaphore]:
-        """実行中 event loop ごとに probe の共有 lock と同時実行上限を返す。"""
+    def __getLiveProbeLock(cls) -> asyncio.Lock:
+        """実行中 event loop ごとに probe の共有 lock を返す。"""
 
         event_loop = asyncio.get_running_loop()
         if cls._live_probe_event_loop is not event_loop:
             cls._live_probe_event_loop = event_loop
             cls._live_probe_lock = asyncio.Lock()
-            cls._live_probe_semaphore = asyncio.Semaphore(2)
             cls._live_probe_tasks.clear()
             cls._radio_opus_probe_tasks.clear()
-        return cls._live_probe_lock, cls._live_probe_semaphore
+        return cls._live_probe_lock
 
     @classmethod
     def __resetLiveProbeCacheForCurrentSignature(cls) -> str:
@@ -703,14 +720,14 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             KonomiTVBS4KAudioCodec,
         ],
         lock: asyncio.Lock,
-        semaphore: asyncio.Semaphore,
     ) -> bool:
         """同一exact probeを共有し、安定した署名世代の結果だけをcacheする。"""
 
         task_key = (signature, *key)
         current_task = asyncio.current_task()
         try:
-            async with semaphore:
+            # 外部プロセス総数の上限は全probe系で共有する。
+            async with KonomiTVBS4KExternalProcessLimiter.acquireSlot():
                 result = await cls.__runLiveTransportProbe(*key)
             async with lock:
                 if cls.__getLiveProbeSignature() == signature:
@@ -730,13 +747,13 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         cls,
         signature: str,
         lock: asyncio.Lock,
-        semaphore: asyncio.Semaphore,
     ) -> bool:
         """radio Opus probeを共有し、失敗だけ短時間cacheする。"""
 
         current_task = asyncio.current_task()
         try:
-            async with semaphore:
+            # 外部プロセス総数の上限は全probe系で共有する。
+            async with KonomiTVBS4KExternalProcessLimiter.acquireSlot():
                 result = await cls.__runRadioOpusTransportProbe()
             async with lock:
                 if cls.__getLiveProbeSignature() == signature:
@@ -1263,7 +1280,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             ffmpeg_command += [
                 '-vf',
                 f'format={codec_spec.encoder_pixel_format},hwupload,'
-                f'scale_vaapi=w=640:h=360,hwdownload,format={codec_spec.encoder_pixel_format}',
+                f'scale_vaapi=w=640:h=360:format={codec_spec.encoder_pixel_format}',
             ]
 
         ffmpeg_command += [
@@ -1277,7 +1294,7 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         elif encoder == 'NVENC':
             ffmpeg_command += ['-pix_fmt', 'cuda']
         elif encoder == 'AMF':
-            ffmpeg_command += ['-pix_fmt', codec_spec.encoder_pixel_format]
+            ffmpeg_command += ['-pix_fmt', 'vaapi']
 
         if video_codec == 'vp9':
             ffmpeg_command += [
@@ -1295,6 +1312,10 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             ffmpeg_command += ['-profile:v', 'main10' if bit_depth == 10 else 'main']
         else:
             ffmpeg_command += ['-profile:v', 'high']
+
+        if encoder == 'AMF' and video_codec == 'hevc':
+            # 実ライブと同じく、Mesa VCN へ HEVC 符号化面の padding を事前通知する。
+            ffmpeg_command += ['-mesa_hevc_alignment', '1']
 
         ffmpeg_command += RecordedPlaybackBackend.getTuningArguments(
             encoder, video_codec
@@ -1326,16 +1347,13 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
             if video_codec in ('vp9', 'av1'):
                 ffmpeg_command += ['-zerolatency', '1', '-bf', '0']
         else:
-            ffmpeg_command += [
-                '-quality',
-                'balanced',
-                '-rc',
-                'vbr_latency',
-                '-async_depth',
-                '1',
-            ]
-            if video_codec in ('vp9', 'av1'):
-                ffmpeg_command += ['-usage', 'lowlatency', '-latency', '1', '-bf', '0']
+            # VAAPI encode は AMF 固有オプションを使わない。
+            ffmpeg_command += ['-bf', '0', '-rc_mode', 'VBR']
+            # VAAPI の VBR はビットレート未指定だと "Bitrate must be set for VBR RC mode." で
+            # 必ず失敗する。実ライブ起動は常時 -b:v を渡すため、probe 側も AVC/HEVC で同じ条件を渡す。
+            # AV1 は後段の needs_fixed_muxrate ブロックで既にビットレートが付くため二重指定しない。
+            if video_codec not in ('vp9', 'av1'):
+                ffmpeg_command += ['-b:v', '600K', '-maxrate', '800K', '-bufsize', '800K']
 
         # Bridge が SELECTED_PCR_GAP で fail closed するため、VP9/AV1 だけでなく
         # Opus 付きの passthrough 映像 (AVC/HEVC) でも固定 muxrate と PCR 周期を使う。
@@ -1556,6 +1574,54 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         )
 
     @classmethod
+    async def getLegacyLiveCombinationCapability(
+        cls,
+        encoder: KonomiTVBS4KPlaybackEncoder,
+        video_codec: KonomiTVBS4KVideoCodec,
+        video_bit_depth: KonomiTVBS4KVideoBitDepth,
+        audio_codec: KonomiTVBS4KAudioCodec,
+    ) -> KonomiTVBS4KPlaybackLiveCombinationCapability:
+        """
+        Bridgeを通らない旧AVC/HEVC + AACライブのbackend能力を返す。
+
+        Args:
+            encoder: 実際に使う映像エンコーダー。
+            video_codec: 出力映像コーデック。
+            video_bit_depth: 出力映像bit depth。
+            audio_codec: 出力音声コーデック。
+
+        Returns:
+            Bridge非依存の旧ライブ組み合わせ能力。
+        """
+
+        # 旧ライブ経路はBridgeによるcodec変換を行わないため、直接TS出力できる組み合わせだけを許可する。
+        if video_codec not in ('avc', 'hevc') or audio_codec != 'aac':
+            return KonomiTVBS4KPlaybackLiveCombinationCapability(
+                encoder = encoder,
+                video_codec = video_codec,
+                video_bit_depth = video_bit_depth,
+                audio_codec = audio_codec,
+                available = False,
+                reason_code = 'UnsupportedCombination',
+            )
+
+        # 基礎probeと実ライブは同じFFmpeg 8 backend・render node・codec設定を共有する。
+        # 録画配信全体の可否ではなく、共通backendのexact encode結果を能力根拠にする。
+        backend = await RecordedPlaybackCapabilityProbe.getCapability(
+            encoder,
+            video_codec,
+            video_bit_depth,
+        )
+        return KonomiTVBS4KPlaybackLiveCombinationCapability(
+            encoder = backend.encoder,
+            video_codec = backend.codec,
+            video_bit_depth = backend.bit_depth,
+            audio_codec = audio_codec,
+            available = backend.available,
+            reason_code = backend.reason_code,
+        )
+
+    @classmethod
     async def getAudioCapability(
         cls,
         codec: KonomiTVBS4KAudioCodec,
@@ -1600,14 +1666,24 @@ class KonomiTVBS4KPlaybackCapabilityProbe:
         encoder: KonomiTVBS4KPlaybackEncoder,
         codec: KonomiTVBS4KVideoCodec,
         bit_depth: KonomiTVBS4KVideoBitDepth,
+        *,
+        quality: QUALITY_TYPES | None = None,
     ) -> KonomiTVBS4KPlaybackVideoCapability:
         """録画映像の実encode可否だけを返し、live TS probeを起動しない。"""
 
-        recorded = await RecordedPlaybackCapabilityProbe.getCapability(
-            encoder,
-            codec,
-            bit_depth,
-        )
+        if quality is None:
+            recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                encoder,
+                codec,
+                bit_depth,
+            )
+        else:
+            recorded = await RecordedPlaybackCapabilityProbe.getCapability(
+                encoder,
+                codec,
+                bit_depth,
+                quality = quality,
+            )
         return KonomiTVBS4KPlaybackVideoCapability(
             encoder = recorded.encoder,
             codec = recorded.codec,

@@ -79,7 +79,7 @@ declare module 'vue-virtual-scroller' {
         scrollToItem(index: number): void;
         scrollToPosition(position: number);
     }
-    /* eslint-disable @typescript-eslint/indent */
+    /* eslint-disable @stylistic/indent */
     export const RecycleScroller: DefineComponent<
         ComponentPropsOptions<RecycleScrollerProps>,
         object,

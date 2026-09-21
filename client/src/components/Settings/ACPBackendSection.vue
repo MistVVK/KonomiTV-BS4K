@@ -9,11 +9,11 @@
                 <div class="settings__item-label">
                     <template v-if="provider === 'grok'">
                         ホスト上の Grok Build CLI を起動して AI 処理を行います。<br>
-                        モデルは <code>grok-4.5</code> 固定で、推論の深さだけを指定できます。初期値は <strong>High</strong> です。<br>
+                        モデルと推論の深さは Grok ACP が現在広告している候補から選びます。<br>
                     </template>
                     <template v-else>
                         ホスト上の Codex CLI を起動して AI 処理を行います。<br>
-                        モデルと推論の深さは分離して指定できます。初期値は <strong>GPT-5.6 Luna</strong> / <strong>Medium</strong> です。<br>
+                        モデルと推論の深さは Codex ACP が現在広告している候補から選びます。<br>
                     </template>
                 </div>
             </div>
@@ -21,10 +21,11 @@
                 <div class="settings__item-heading">モデル</div>
                 <div class="settings__item-label">
                     <template v-if="provider === 'grok'">
-                        Grok Build の ACP モデルは <code>grok-4.5</code> 固定です。<br>
+                        認証済み Grok ACP の <code>session/new</code> が広告したモデルだけを選べます。<br>
                     </template>
                     <template v-else>
-                        Codex のモデル系統を選びます。深さは下の「推論の深さ」で別指定します。<br>
+                        認証済み Codex ACP の <code>session/new</code> が広告したモデル系統だけを選べます。<br>
+                        深さは下の「推論の深さ」で別指定します。<br>
                     </template>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
@@ -32,28 +33,35 @@
                     :items="acp_model_preset_items"
                     item-title="title"
                     item-value="value"
-                    :disabled="provider === 'grok'"
+                    :loading="is_loading_models"
+                    :disabled="is_loading_models || model_catalog === null"
                     :error-messages="acp_model_error"
                     :model-value="acp_model_selection"
                     @update:model-value="setAcpModelSelection" />
+                <v-alert v-if="model_catalog_error !== ''"
+                    class="mt-3" color="warning" variant="tonal">
+                    {{model_catalog_error}}
+                    <div class="mt-2">
+                        <v-btn size="small" variant="tonal" color="primary"
+                            :loading="is_loading_models" @click="loadModels()">
+                            モデル候補を再取得
+                        </v-btn>
+                    </div>
+                </v-alert>
             </div>
             <div class="settings__item">
                 <div class="settings__item-heading">推論の深さ</div>
                 <div class="settings__item-label">
-                    モデル名とは別に、思考の深さを選びます。<br>
-                    <template v-if="provider === 'codex'">
-                        Codex は Low〜Ultra。ただし <strong>Ultra</strong> は GPT-5.6 Sol 系統だけ選べます。<br>
-                        Sol 以外で保存済みの Ultra は、サーバー側で <strong>Max</strong> に自動補正します。<br>
-                    </template>
-                    <template v-else>
-                        Grok は Low / Medium / High。<br>
-                    </template>
+                    選択したモデルについて、ACP agent が現在広告している思考の深さだけを選べます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined"
                     :density="is_form_dense ? 'compact' : 'default'"
                     :items="acp_reasoning_effort_options"
                     item-title="title"
                     item-value="value"
+                    :loading="is_loading_models"
+                    :disabled="is_loading_models || advertised_selected_model === null"
+                    :error-messages="acp_reasoning_effort_error"
                     :model-value="acp_reasoning_effort_selection"
                     @update:model-value="setAcpReasoningEffortSelection" />
                 <div class="settings__item-label mt-2" v-if="acp_wire_preview">
@@ -280,6 +288,7 @@ import AIBackend, {
     type IACPBackendCredentialStatus,
     type IACPBackendSettings,
     type IACPBackendEpisodeLookupConnectionChecks,
+    type IACPModelCatalog,
 } from '@/services/AIBackend';
 import Utils, { dayjs } from '@/utils';
 import { ACP_HARD_TIMEOUT_SEC } from '@/utils/RecordedEpisodeResolution';
@@ -303,42 +312,6 @@ const emit = defineEmits<{
 
 /** サーバー側 ACP hard timeout の表示用分。ACP_HARD_TIMEOUT_SEC から導出する。 */
 const acp_hard_timeout_minutes = Math.floor(ACP_HARD_TIMEOUT_SEC / 60);
-/** プロバイダ別のモデル候補（角括弧なし）。Grok は 4.5 固定表示。 */
-const acp_model_presets_by_backend: Record<'codex' | 'grok', {title: string; value: string;}[]> = {
-    codex: [
-        {title: 'GPT-5.6 Luna', value: 'gpt-5.6-luna'},
-        {title: 'GPT-5.6 Terra', value: 'gpt-5.6-terra'},
-        {title: 'GPT-5.6 Sol', value: 'gpt-5.6-sol'},
-        {title: 'GPT-5.5', value: 'gpt-5.5'},
-        {title: 'GPT-5.4', value: 'gpt-5.4'},
-        {title: 'GPT-5.4 Mini', value: 'gpt-5.4-mini'},
-        {title: 'GPT-5.3 Codex Spark', value: 'gpt-5.3-codex-spark'},
-    ],
-    grok: [
-        {title: 'Grok 4.5（固定）', value: 'grok-4.5'},
-    ],
-};
-/** プロバイダ別の推論深さ候補。 */
-const acp_reasoning_effort_presets_by_backend: Record<'codex' | 'grok', {title: string; value: AcpReasoningEffort;}[]> = {
-    codex: [
-        {title: 'Low（速い）', value: 'Low'},
-        {title: 'Medium', value: 'Medium'},
-        {title: 'High（深い）', value: 'High'},
-        {title: 'XHigh', value: 'XHigh'},
-        {title: 'Max', value: 'Max'},
-        {title: 'Ultra', value: 'Ultra'},
-    ],
-    grok: [
-        {title: 'Low（速い）', value: 'Low'},
-        {title: 'Medium', value: 'Medium'},
-        {title: 'High（深い）', value: 'High'},
-    ],
-};
-/** プロバイダ別の未設定時デフォルト。 */
-const acp_defaults_by_backend: Record<'codex' | 'grok', {model: string | null; effort: AcpReasoningEffort | null;}> = {
-    codex: {model: 'gpt-5.6-luna', effort: 'Medium'},
-    grok: {model: null, effort: 'High'},
-};
 const connection_test_capabilities: {title: string; value: 'CandidateSelection' | 'EpisodeLookup';}[] = [
     {title: 'シリーズ情報生成', value: 'CandidateSelection'},
     {title: '話数 Web 検索', value: 'EpisodeLookup'},
@@ -369,6 +342,9 @@ const connection_test_results = ref<ConnectionTestResults>({
     CandidateSelection: null,
     EpisodeLookup: null,
 });
+const model_catalog = ref<IACPModelCatalog | null>(null);
+const model_catalog_error = ref('');
+const is_loading_models = ref(false);
 const is_updating_acp_authentication = ref(false);
 const acp_authentication_dialog = ref(false);
 const pending_acp_authentication_action = ref<'Import' | 'Delete' | null>(null);
@@ -377,6 +353,7 @@ const is_form_dense = Utils.isSmartphoneHorizontal();
 
 const backend_kind: ACPBackendKind = props.provider === 'codex' ? 'AcpCodex' : 'AcpGrok';
 const provider_display_name = props.provider === 'codex' ? 'Codex' : 'Grok Build';
+const provider_acp_display_name = props.provider === 'codex' ? 'Codex ACP' : 'Grok ACP';
 const section_icon = props.provider === 'codex' ? 'fluent:brain-circuit-20-filled' : 'fluent:sparkle-20-filled';
 
 /** props.settings の差し替え（保存後の再取得など）をドラフトへ反映する。 */
@@ -390,130 +367,119 @@ function updateDraft(patch: Partial<IACPBackendSettings>): void {
     emit('update:settings', draft_settings.value);
 }
 
-function isKonomiTVBS4KCodexSolModel(model: string | null): boolean {
-    const normalized = model?.trim().toLowerCase() ?? '';
-    return normalized === 'sol' || normalized.endsWith('-sol');
-}
-
 /** 現在のプロバイダ向けモデル候補。 */
 const acp_model_preset_items = computed(() => {
-    return acp_model_presets_by_backend[props.provider] ?? [];
+    return model_catalog.value?.models.map(model => ({
+        title: model.model_name,
+        value: model.model_id,
+    })) ?? [];
 });
 
-const acp_model_error = computed(() =>
-    (draft_settings.value.model?.trim().length ?? 0) > 255 ? 'ACP モデル ID は 255 文字以内で入力してください。' : '',
-);
+const acp_model_error = computed(() => {
+    const selected_model = draft_settings.value.model?.trim() ?? '';
+    if (selected_model.length > 255) return 'ACP モデル ID は 255 文字以内で入力してください。';
+    if (is_loading_models.value) return `${provider_acp_display_name} のモデル候補を取得しています。`;
+    if (model_catalog_error.value !== '') return model_catalog_error.value;
+    if (model_catalog.value === null) return `${provider_acp_display_name} のモデル候補を取得できませんでした。`;
+    if (selected_model === '') return `${provider_acp_display_name} のモデルを選択してください。`;
+    if (model_catalog.value.models.some(model => model.model_id === selected_model) === false) {
+        return `保存済みモデル「${selected_model}」は現在の ${provider_acp_display_name} 広告にありません。候補から選び直してください。`;
+    }
+    return '';
+});
 
 const acp_effective_model = computed(() => {
     const current = draft_settings.value.model?.trim() ?? '';
-    return current || acp_defaults_by_backend[props.provider]?.model || '';
+    return current || model_catalog.value?.current_model_id || '';
 });
-const is_codex_sol_model = computed(() =>
-    props.provider === 'codex' && isKonomiTVBS4KCodexSolModel(acp_effective_model.value),
+
+/** 選択中モデルについて agent が広告したモデル・推論深さ。 */
+const advertised_selected_model = computed(() =>
+    model_catalog.value?.models.find(model => model.model_id === acp_effective_model.value) ?? null,
 );
 
 /** 現在のプロバイダ向け推論深さ候補。 */
 const acp_reasoning_effort_options = computed(() => {
-    const options = acp_reasoning_effort_presets_by_backend[props.provider] ?? [];
-    if (props.provider !== 'codex' || is_codex_sol_model.value) {
-        return options;
-    }
-    return options.filter(option => option.value !== 'Ultra');
+    return advertised_selected_model.value?.reasoning_efforts.map(reasoning_effort => ({
+        title: reasoning_effort.reasoning_effort_name,
+        value: reasoning_effort.reasoning_effort_id,
+    })) ?? [];
 });
 
-function normalizeCodexReasoningEffort(
-    effort: AcpReasoningEffort | null,
-    model: string | null,
-    backend: 'codex' | 'grok',
-): AcpReasoningEffort | null {
+const acp_reasoning_effort_error = computed(() => {
+    if (acp_model_error.value !== '') return '';
+    if (advertised_selected_model.value === null) {
+        return `${provider_acp_display_name} の推論深さ候補を取得できませんでした。`;
+    }
+    const selected_reasoning_effort = draft_settings.value.reasoning_effort?.trim() ?? '';
+    if (selected_reasoning_effort === '') return '';
     if (
-        backend === 'codex' &&
-        effort === 'Ultra' &&
-        isKonomiTVBS4KCodexSolModel(model) === false
+        advertised_selected_model.value.reasoning_efforts.some(
+            effort => effort.reasoning_effort_id === selected_reasoning_effort,
+        ) === false
     ) {
-        return 'Max';
+        return `保存済みの推論深さ「${selected_reasoning_effort}」は現在の ${provider_acp_display_name} 広告にありません。候補から選び直してください。`;
     }
-    return effort;
-}
+    return '';
+});
 
-/** モデル選択。Grok は保存値が null でも表示上 grok-4.5 を出す。 */
+/** モデル選択。未設定時は agent が広告した現在値を表示する。 */
 const acp_model_selection = computed<string | null>(() => {
-    if (props.provider === 'grok') {
-        return 'grok-4.5';
-    }
     const current = draft_settings.value.model?.trim() ?? '';
+    if (current === '') {
+        return model_catalog.value?.current_model_id ?? null;
+    }
     const matched = acp_model_preset_items.value.find(item => item.value === current);
     if (matched) return matched.value;
-    if (current === '') {
-        // 未設定時はプロバイダ既定の先頭候補を表示する。
-        return acp_model_preset_items.value[0]?.value ?? null;
-    }
     // 旧バージョンなどで保存された一覧外 ID は、そのまま文字列で返す。
     return current;
 });
 
 function setAcpModelSelection(value: string | null): void {
-    if (props.provider === 'grok') {
-        // Grok は常にモデル固定。保存は null。
+    if (value === null || value === undefined) {
         updateDraft({model: null});
         return;
     }
-    if (value === null || value === undefined) {
-        updateDraft({
-            model: null,
-            reasoning_effort: normalizeCodexReasoningEffort(
-                draft_settings.value.reasoning_effort,
-                draft_settings.value.model,
-                props.provider,
-            ),
-        });
-        return;
-    }
     const trimmed = value.trim();
+    const selected_model = model_catalog.value?.models.find(model => model.model_id === trimmed) ?? null;
+    const current_reasoning_effort = draft_settings.value.reasoning_effort;
+    const reasoning_effort_is_available = selected_model?.reasoning_efforts.some(
+        effort => effort.reasoning_effort_id === current_reasoning_effort,
+    ) ?? false;
     updateDraft({
         model: trimmed === '' ? null : trimmed,
-        reasoning_effort: normalizeCodexReasoningEffort(
-            draft_settings.value.reasoning_effort,
-            trimmed === '' ? null : trimmed,
-            props.provider,
-        ),
+        // ユーザーがモデルを切り替えた場合だけ、新しいモデルの広告現在値へ安全に追従する。
+        reasoning_effort: reasoning_effort_is_available ?
+            current_reasoning_effort :
+            selected_model?.current_reasoning_effort_id ?? null,
     });
 }
 
-/** 推論深さ。未設定時はプロバイダ既定を表示し、set でドラフトへ書き戻す。 */
+/** 推論深さ。未設定時は選択モデルについて agent が広告した現在値を表示する。 */
 const acp_reasoning_effort_selection = computed<AcpReasoningEffort | null>(() => {
     if (draft_settings.value.reasoning_effort !== null) {
-        return normalizeCodexReasoningEffort(
-            draft_settings.value.reasoning_effort,
-            acp_effective_model.value,
-            props.provider,
-        );
+        return draft_settings.value.reasoning_effort;
     }
-    return acp_defaults_by_backend[props.provider]?.effort ?? null;
+    return advertised_selected_model.value?.current_reasoning_effort_id ?? null;
 });
 
 function setAcpReasoningEffortSelection(value: AcpReasoningEffort | null): void {
-    updateDraft({
-        reasoning_effort: normalizeCodexReasoningEffort(
-            value,
-            acp_effective_model.value,
-            props.provider,
-        ),
-    });
+    updateDraft({reasoning_effort: value});
 }
 
 /** 実際に ACP agent へ適用するモデルと推論深さ、または Grok CLI 引数を表示する。 */
 const acp_wire_preview = computed(() => {
     const effort = acp_reasoning_effort_selection.value;
     if (props.provider === 'grok') {
-        const effort_cli = (effort ?? 'High').toLowerCase();
-        return `grok --reasoning-effort ${effort_cli} agent stdio`;
+        if (effort === null) return '';
+        const model = acp_effective_model.value || 'agent default';
+        return `${model} / grok --reasoning-effort ${effort} agent stdio`;
     }
     const model = acp_effective_model.value;
     if (model === '') return '';
     if (effort) {
         const fast_mode_suffix = draft_settings.value.codex_fast_mode_enabled ? ' / fast' : '';
-        return `${model} / reasoning_effort=${effort.toLowerCase()}${fast_mode_suffix}`;
+        return `${model} / reasoning_effort=${effort}${fast_mode_suffix}`;
     }
     return model;
 });
@@ -528,6 +494,7 @@ const acp_timeout_error = computed(() => {
 const validation_error = computed(() => {
     const errors: string[] = [];
     if (acp_model_error.value !== '') errors.push(acp_model_error.value);
+    if (acp_reasoning_effort_error.value !== '') errors.push(acp_reasoning_effort_error.value);
     if (acp_timeout_error.value !== '') errors.push(acp_timeout_error.value);
     return errors.join('\n');
 });
@@ -579,6 +546,40 @@ const has_connection_test_result = computed(() =>
 async function saveSettings(): Promise<void> {
     if (validation_error.value || props.saving) return;
     emit('save');
+}
+
+/** ACP agent を prompt なしで起動し、session/new のモデル広告をドラフトへ反映する。 */
+async function loadModels(after_auth_import: boolean = false): Promise<void> {
+    if (is_loading_models.value) return;
+    if (after_auth_import === false && auth_imported.value === false) {
+        model_catalog.value = null;
+        model_catalog_error.value = `${provider_display_name} 認証を取り込むとモデル候補を取得できます。`;
+        return;
+    }
+
+    is_loading_models.value = true;
+    model_catalog.value = null;
+    model_catalog_error.value = '';
+    const catalog = await AIBackend.fetchACPModels(props.provider);
+    is_loading_models.value = false;
+    if (catalog === null || catalog.models.length === 0) {
+        model_catalog_error.value = `${provider_acp_display_name} が広告したモデル候補を取得できませんでした。`;
+        return;
+    }
+    model_catalog.value = catalog;
+    // 未設定項目だけ agent の現在値を選び、保存済みの一覧外 ID は置き換えない。
+    const effective_model_id = draft_settings.value.model?.trim() || catalog.current_model_id;
+    const advertised_model = catalog.models.find(model => model.model_id === effective_model_id) ?? null;
+    const patch: Partial<IACPBackendSettings> = {};
+    if ((draft_settings.value.model?.trim() ?? '') === '') {
+        patch.model = catalog.current_model_id;
+    }
+    if (draft_settings.value.reasoning_effort === null && advertised_model !== null) {
+        patch.reasoning_effort = advertised_model.current_reasoning_effort_id;
+    }
+    if (Object.keys(patch).length > 0) {
+        updateDraft(patch);
+    }
 }
 
 /** 固定6項目のうち指定した接続試験結果を安全に取得する。 */
@@ -650,8 +651,11 @@ async function confirmACPAuthenticationAction(): Promise<void> {
     pending_acp_authentication_action.value = null;
     if (pending_action === 'Import') {
         Message.success(`${provider_display_name} 認証を KonomiTV-BS4K 専用プロファイルへ取り込みました。`);
+        await loadModels(true);
     } else {
         Message.success(`KonomiTV-BS4K の ${provider_display_name} 認証コピーを削除しました。`);
+        model_catalog.value = null;
+        model_catalog_error.value = `${provider_display_name} 認証を取り込むとモデル候補を取得できます。`;
     }
 }
 
@@ -660,9 +664,10 @@ function formatAuthImportedAt(imported_at: string): string {
     return dayjs(imported_at).format('YYYY/M/D HH:mm:ss');
 }
 
-onMounted(() => {
+onMounted(async () => {
     // 親から取得済みの settings をドラフトへ初期反映する（初回 watch が走らないため）。
     draft_settings.value = {...props.settings};
+    await loadModels();
 });
 
 </script>

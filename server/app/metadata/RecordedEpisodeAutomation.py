@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
@@ -23,6 +24,7 @@ from app.metadata.ai.episode_lookup import (
 )
 from app.metadata.ai.recorded_series_ai import (
     get_audit_model,
+    get_episode_lookup_capability_proof_fingerprints,
     get_episode_lookup_provider_fingerprint,
     invalidate_episode_lookup_capability_fingerprint,
 )
@@ -30,6 +32,10 @@ from app.metadata.ai.recorded_series_ai import (
     lookup_episode as ai_lookup_episode,
 )
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
+from app.metadata.RecordedEpisodeCatalogBind import (
+    ShouldProtectCatalogValue,
+    TryBindCatalogEpisode,
+)
 from app.metadata.RecordedEpisodeContext import (
     BuildEpisodeInputFingerprint,
     BuildRecordedEpisodeLookupContext,
@@ -38,6 +44,7 @@ from app.metadata.RecordedEpisodeMessages import GetRecordedEpisodeErrorMessage
 from app.metadata.RecordedEpisodeResolver import (
     FormatEpisodeNumber,
     ParseLegacyEpisodeNumber,
+    ParseSinglePositiveIntegerEpisode,
 )
 from app.metadata.RecordedEpisodeSearch import (
     GetEpisodeLookupEvidence,
@@ -46,12 +53,24 @@ from app.metadata.RecordedEpisodeSearch import (
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
 from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesSettings import RecordedSeriesSettingsStore
+from app.metadata.SeriesIndexer import ParseJapaneseNumber
+from app.metadata.SeriesTitleParser import ParseSeriesTitle
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedSeries import RecordedSeriesAIRequest
 
 
 RECORDED_EPISODE_AUTOMATION_VERSION = "1"
+
+# 自動処理は新着録画を1件ずつ処理し、起動時スキャンなどで長い待機列を作らない。
+_AUTOMATIC_QUEUE_LIMIT = 1
+# 単独の手動一括処理では外部 AI を1回で打ち切る。親パイプラインは別の絶対上限まで全件処理する。
+_MANUAL_BACKFILL_MAX_AI_REQUESTS_PER_RUN = 1
+
+# 「第N部」は単発特番内の放送区分であり、作品の公開話数ではない。
+_BROADCAST_PART_PATTERN = re.compile(
+    r'第\s*(?P<number>[0-9０-９一二三四五六七八九十百千〇零壱弐参拾貳肆伍陸漆玖]+)\s*部',
+)
 
 
 class _EpisodeCitationRecord(TypedDict):
@@ -77,6 +96,58 @@ class _EpisodeProgramSnapshot:
     channel_id: str | None
     channel_name: str | None
     start_time: datetime
+    # カタログ照合の尺キーに使う録画尺（秒）。不明なときは None。
+    duration: float | None = None
+
+
+# 撤去した別日重複ガードが出した NeedsReview の識別子。enqueue と Cache の両方で、
+# この residual だけ同 fingerprint でも再評価する。一般の終端結果は触らない。
+_REMOVED_CROSS_DATE_GUARD_RATIONALE = '同一シリーズの別日録画に、再放送印なしで同じ話数が割り当てられています。'
+
+
+def _isRemovedGuardResidual(resolution: RecordedEpisodeResolution) -> bool:
+    """撤去ガード由来の NeedsReview 残滓かを返す。
+
+    ガード由来行の error_code は resolution へ保存されない（AI 監査側にだけ付く）ため、
+    guard が唯一書き込んだ rationale_short と NeedsReview で識別する。
+
+    Args:
+        resolution: 判定対象の話数 Resolution。
+
+    Returns:
+        NeedsReview かつ rationale_short が撤去ガードの出力と一致するとき True。
+    """
+
+    return (
+        resolution.status == 'NeedsReview'
+        and resolution.rationale_short == _REMOVED_CROSS_DATE_GUARD_RATIONALE
+    )
+
+
+def _getBroadcastPartNumbers(snapshot: _EpisodeProgramSnapshot) -> set[Decimal]:
+    """番組名と副題に明示された「第N部」の N を抽出する。
+
+    Args:
+        snapshot: 話数検索対象の録画メタデータ。
+
+    Returns:
+        話数として利用してはいけない放送上の部番号。
+    """
+
+    part_numbers: set[Decimal] = set()
+    for text in (snapshot.title, snapshot.subtitle):
+        if text is None:
+            continue
+        for match in _BROADCAST_PART_PATTERN.finditer(text):
+            raw_number = match.group('number')
+            parsed_number = (
+                int(raw_number)
+                if raw_number.isdigit()
+                else ParseJapaneseNumber(raw_number)
+            )
+            if parsed_number is not None:
+                part_numbers.add(Decimal(parsed_number))
+    return part_numbers
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +176,24 @@ class RecordedEpisodeBackfillAccepted:
     reused: bool
 
 
+class RecordedEpisodeBackfillSummary(TypedDict):
+    """有限の話数一括判定で確定した件数と停止理由。"""
+
+    resolved_or_reviewed: int
+    resolved: int
+    not_numbered: int
+    no_published_number: int
+    needs_review: int
+    preserved: int
+    failed: int
+    skipped: int
+    remaining: int
+    ai_requests: int
+    stopped_by_usage_limit: bool
+    stopped_by_batch_limit: bool
+    stopped_by_time_limit: bool
+
+
 class _RecordedEpisodeSnapshotChanged(Exception):
     """外部API待機中に話数判定入力またはSeries所属が変化した。"""
 
@@ -123,6 +212,10 @@ class RecordedEpisodeRelookupDisabledError(Exception):
 
 class RecordedEpisodeRelookupRateLimitedError(Exception):
     """アプリの日次上限により単票再検索を開始できない。"""
+
+
+class RecordedEpisodeBackfillBusyError(Exception):
+    """別の話数処理が実行中のため、一括判定を開始できない。"""
 
 
 def _sha256JSON(payload: object) -> str:
@@ -149,6 +242,7 @@ def _buildInputFingerprint(snapshot: _EpisodeProgramSnapshot) -> str:
             "detail": snapshot.detail,
             "channel_id": snapshot.channel_id,
             "start_time": snapshot.start_time.isoformat(),
+            "duration": snapshot.duration,
         }
     )
 
@@ -175,6 +269,7 @@ def _snapshotFromProgram(
         channel_id=recorded_program.channel_id,
         channel_name=channel_name,
         start_time=recorded_program.start_time,
+        duration=recorded_program.duration,
     )
 
 
@@ -250,7 +345,13 @@ class RecordedEpisodeAutomation:
     _queued_ids: set[int] = set()
     _running_ids: set[int] = set()
     _rerun_ids: set[int] = set()
-    _backfill_task: asyncio.Task[None] | None = None
+    # 撤去ガード residual の drain 投入済み番組 ID。同一プロセスでの無限再投入だけを防ぐ。
+    # start() での作り直し時に空に戻し、残滓があれば再試行する。
+    _residual_drain_attempted: set[int] = set()
+    # resolution 行のない録画の補充投入済み番組 ID。外部検索が resolution 行を
+    # 残さず失敗した場合の無限再投入だけを防ぐ。start() での作り直し時に空に戻す。
+    _unresolved_drain_attempted: set[int] = set()
+    _backfill_task: asyncio.Task[RecordedEpisodeBackfillSummary | None] | None = None
     _backfill_handle: AnalysisTaskHandle | None = None
     _relookup_tasks: dict[int, asyncio.Task[None]] = {}
     _relookup_handles: dict[int, AnalysisTaskHandle] = {}
@@ -261,7 +362,7 @@ class RecordedEpisodeAutomation:
 
     @classmethod
     async def start(cls) -> None:
-        """中断監査を回収し、話数判定ワーカーと未処理録画を復元する。
+        """中断監査を回収し、話数判定ワーカーを開始する。
 
         Returns:
             None
@@ -273,11 +374,20 @@ class RecordedEpisodeAutomation:
                 cls._queued_ids = set()
                 cls._running_ids = set()
                 cls._rerun_ids = set()
+                cls._residual_drain_attempted = set()
+                cls._unresolved_drain_attempted = set()
                 cls._recovery_completed = False
                 cls._worker_task = asyncio.create_task(cls._runWorker())
+                # 撤去ガード residual の初回 seed は worker 新規作成時だけ行う。
+                # 稼働確認の start() で毎回 seed すると、既存 retry や新着の枠を奪う。
+                # 以降の補充は worker 完了時の top-up（既存 retry の後）に任せる。
+                residual_enqueued = await cls._enqueueRemovedGuardResiduals()
+                # residual が無ければ起動直後から未解決録画の補充も始める。ここで
+                # 始めないと、変更のない既存録画は次の enqueue まで連鎖が動かない。
+                if residual_enqueued == 0:
+                    await cls._enqueueUnresolvedPrograms()
             if cls._recovery_completed is False:
                 await cls._recoverInterruptedRequests()
-                await cls._enqueueRecoverablePrograms()
                 cls._recovery_completed = True
 
     @classmethod
@@ -306,6 +416,8 @@ class RecordedEpisodeAutomation:
         cls._queued_ids = set()
         cls._running_ids = set()
         cls._rerun_ids = set()
+        cls._residual_drain_attempted = set()
+        cls._unresolved_drain_attempted = set()
         cls._backfill_task = None
         cls._backfill_handle = None
         cls._relookup_tasks = {}
@@ -313,17 +425,28 @@ class RecordedEpisodeAutomation:
         cls._recovery_completed = False
 
     @classmethod
-    async def enqueue(cls, recorded_program_id: int) -> None:
+    async def enqueue(
+        cls,
+        recorded_program_id: int,
+        *,
+        start_if_needed: bool = True,
+    ) -> None:
         """Series判定を待たせず、話数判定対象IDを重複排除して投入する。
 
         Args:
             recorded_program_id: Series確定後のRecordedProgram ID。
+            start_if_needed: ワーカー未起動なら start() するか。Indexer の
+                起動時 rebuild では False にし、永続状態だけ Pending へ戻す。
 
         Returns:
             None
         """
 
-        await cls.start()
+        if start_if_needed:
+            await cls.start()
+        elif cls._queue is None or cls._worker_task is None or cls._worker_task.done():
+            # 起動前 rebuild は start() の復旧が Pending を拾う。ここでは起動しない。
+            return
         assert cls._queue is not None
         async with cls._relookup_start_lock:
             relookup_task = cls._relookup_tasks.get(recorded_program_id)
@@ -335,6 +458,10 @@ class RecordedEpisodeAutomation:
                 cls._rerun_ids.add(recorded_program_id)
                 return
             if recorded_program_id in cls._queued_ids:
+                return
+            # 別録画の処理中・待機中は追加投入しない。未処理状態はDBに残るため、
+            ## 次の明示操作または入力変更時に再評価できる。
+            if len(cls._queued_ids) + len(cls._running_ids) >= _AUTOMATIC_QUEUE_LIMIT:
                 return
             cls._queued_ids.add(recorded_program_id)
             await cls._queue.put(recorded_program_id)
@@ -369,6 +496,11 @@ class RecordedEpisodeAutomation:
                 retry_after_current = True
             if retry_after_current:
                 await cls.enqueue(recorded_program_id)
+            # 撤去ガードの residual が残っていれば上限内で次を補充する。通常項目の再投入はしない。
+            residual_enqueued = await cls._enqueueRemovedGuardResiduals()
+            # residual が空なら、resolution 行のない Series 所属録画を同じ上限で1件補充する。
+            if residual_enqueued == 0:
+                await cls._enqueueUnresolvedPrograms()
 
     @classmethod
     async def _recoverInterruptedRequests(cls) -> None:
@@ -432,12 +564,105 @@ class RecordedEpisodeAutomation:
                 )
 
     @classmethod
+    async def _enqueueRemovedGuardResiduals(cls) -> int:
+        """撤去ガードの residual を queue 上限内で再投入する。
+
+        起動時と worker 完了時に呼び、残件がなくなるまで 1 件ずつ drain する。
+        queue/running にある ID だけを試行済みにし、上限で受け付けられなかった
+        ID は次回に残す。通常録画の enqueue 条件・上限の他用途は変えない。
+
+        Returns:
+            今回 queue へ投入した residual 件数。
+        """
+
+        if cls._queue is None:
+            return 0
+        enqueued_count = 0
+        # values_list(flat=True) の戻りは tuple 扱いの型付けになるため、既存の
+        # program_ids 取得と同じく list[int] へ cast する。
+        residual_program_ids = cast(
+            list[int],
+            await RecordedEpisodeResolution.filter(
+                status='NeedsReview',
+                rationale_short=_REMOVED_CROSS_DATE_GUARD_RATIONALE,
+            ).order_by('id').values_list('recorded_program_id', flat=True),
+        )
+        for recorded_program_id in residual_program_ids:
+            if recorded_program_id in cls._residual_drain_attempted:
+                continue
+            # start() 呼ばずに投入する。start() 経由は seed が再入し _start_lock で deadlock する。
+            await cls.enqueue(recorded_program_id, start_if_needed=False)
+            # 投入成否は総数差ではなく対象自身の所属で判定する（同期的で競合しない）。
+            # 既存経路で処理中・待機中なら投入済み扱い、拒否されたら試行済みにしない。
+            if (
+                recorded_program_id in cls._queued_ids
+                or recorded_program_id in cls._running_ids
+            ):
+                cls._residual_drain_attempted.add(recorded_program_id)
+                enqueued_count += 1
+        return enqueued_count
+
+    @classmethod
+    async def _enqueueUnresolvedPrograms(cls) -> int:
+        """resolution 行のない Series 所属録画を queue 上限内で補充する。
+
+        residual drain の後に呼び、残滓が空のときだけ未解決の録画を1件ずつ進める。
+        投入した ID は同一プロセス内で再投入しない。外部検索が resolution 行を
+        作れば以降の対象から外れるため、通常は各録画1回で連鎖が終わる。
+        終端状態の行を持つ録画の再投入や queue 上限の他用途は変えない。
+
+        Returns:
+            今回 queue へ投入した録画件数。
+        """
+
+        if cls._queue is None:
+            return 0
+        enqueued_count = 0
+        # values_list(flat=True) の戻りは tuple 扱いの型付けになるため、既存の
+        # program_ids 取得と同じく list[int] へ cast する。
+        program_ids = cast(
+            list[int],
+            await RecordedProgram.filter(
+                series_id__not_isnull=True,
+                recorded_video__status='Recorded',
+            ).order_by('id').values_list('id', flat=True),
+        )
+        if len(program_ids) == 0:
+            return 0
+        # resolution 行を既に持つ録画は対象外。終端状態の再投入は行わない。
+        resolved_program_ids = set(
+            cast(
+                list[int],
+                await RecordedEpisodeResolution.filter(
+                    recorded_program_id__in=program_ids,
+                ).values_list('recorded_program_id', flat=True),
+            ),
+        )
+        for recorded_program_id in program_ids:
+            if recorded_program_id in resolved_program_ids:
+                continue
+            if recorded_program_id in cls._unresolved_drain_attempted:
+                continue
+            # start() 呼ばずに投入する。start() 経由は seed が再入し _start_lock で deadlock する。
+            await cls.enqueue(recorded_program_id, start_if_needed=False)
+            # 投入成否は対象自身の所属で判定する（同期的で競合しない）。
+            # 既存経路で処理中・待機中なら投入済み扱い、拒否されたら試行済みにしない。
+            if (
+                recorded_program_id in cls._queued_ids
+                or recorded_program_id in cls._running_ids
+            ):
+                cls._unresolved_drain_attempted.add(recorded_program_id)
+                enqueued_count += 1
+        return enqueued_count
+
+    @classmethod
     async def _enqueueRecoverablePrograms(
         cls,
         *,
         provider_fingerprint: str | None = None,
+        maximum_programs: int = _AUTOMATIC_QUEUE_LIMIT,
     ) -> None:
-        """未処理録画と、設定変更で再試行可能になった新規録画をキューへ戻す。"""
+        """未処理録画と設定変更対象を、短い自動キューの範囲で再投入する。"""
 
         assert cls._queue is not None
         program_ids = cast(
@@ -455,6 +680,7 @@ class RecordedEpisodeAutomation:
         resolutions_by_program_id = {
             resolution.recorded_program_id: resolution for resolution in resolutions
         }
+        enqueued_count = 0
         for recorded_program_id in program_ids:
             resolution = resolutions_by_program_id.get(recorded_program_id)
             if resolution is not None:
@@ -471,9 +697,12 @@ class RecordedEpisodeAutomation:
                     and resolution.status in {"NeedsReview", "Failed"}
                     and resolution.provider_fingerprint != provider_fingerprint
                 )
+                # 撤去した別日重複ガードの residual は provider 変更なしでも再評価する。
+                retry_for_removed_guard = _isRemovedGuardResidual(resolution)
                 if (
                     resolution.status not in {"Pending", "Unknown"}
                     and retry_for_provider_change is False
+                    and retry_for_removed_guard is False
                 ):
                     continue
             async with cls._relookup_start_lock:
@@ -488,8 +717,15 @@ class RecordedEpisodeAutomation:
                     continue
                 if recorded_program_id in cls._queued_ids:
                     continue
+                # 自動再評価は既存の実行・待機へ積み増さず、今回の上限でも打ち切る。
+                if (
+                    len(cls._queued_ids) + len(cls._running_ids) >= _AUTOMATIC_QUEUE_LIMIT
+                    or enqueued_count >= maximum_programs
+                ):
+                    return
                 cls._queued_ids.add(recorded_program_id)
                 await cls._queue.put(recorded_program_id)
+                enqueued_count += 1
 
     @classmethod
     async def _loadSnapshot(
@@ -713,6 +949,8 @@ class RecordedEpisodeAutomation:
         write_legacy_value: bool,
         rationale_short: str | None = None,
         input_fingerprint: str | None = None,
+        bangumi_subject_id: int | None = None,
+        bangumi_episode_id: int | None = None,
         ai_request: RecordedSeriesAIRequest | None = None,
         ai_request_status: Literal["Succeeded", "Failed", "Rejected"] | None = None,
         ai_request_result: EpisodeLookupResult | None = None,
@@ -725,9 +963,14 @@ class RecordedEpisodeAutomation:
         Args:
             allow_manual_overwrite: 単票再検索の受理結果で Manual を WebSearch へ
                 置き換えることを許可するか。通常の自動判定では False。
+            bangumi_subject_id: カタログで採用した Bangumi 条目 ID。指定時は
+                episode ID と対で直接保存し、旧整数での選び直しを行わない。
+            bangumi_episode_id: カタログで採用した Bangumi episode ID。
         """
 
         legacy_value = FormatEpisodeNumber(season_number, episode_number)
+        # 指数表記の Decimal (1E+1) は TEXT カラムへそのまま文字列化されるため、f 形式へ正規化する。
+        episode_number = Decimal(format(episode_number, 'f'))
         async with transactions.in_transaction() as connection:
             recorded_program = (
                 await RecordedProgram.filter(id=snapshot.id)
@@ -788,6 +1031,14 @@ class RecordedEpisodeAutomation:
             if write_legacy_value:
                 recorded_program.episode_number = legacy_value
                 update_fields.append("episode_number")
+            # カタログで採用した Bangumi ID は同一トランザクションで直接保存する。
+            ## 旧整数での選び直しは独一照合を覆すため行わない。
+            if bangumi_subject_id is not None:
+                recorded_program.bangumi_subject_id = bangumi_subject_id
+                update_fields.append("bangumi_subject_id")
+            if bangumi_episode_id is not None:
+                recorded_program.bangumi_episode_id = bangumi_episode_id
+                update_fields.append("bangumi_episode_id")
             await recorded_program.save(
                 update_fields=update_fields, using_db=connection
             )
@@ -831,6 +1082,11 @@ class RecordedEpisodeAutomation:
                     selected_choice_id=selected_choice_id,
                     connection=connection,
                 )
+        # 整数話数が確定したあとでだけ Bangumi episode を結び、Indexer 整数時は Web 検索前に Local 経路へ乗る。
+        ## カタログで採用した ID を直接保存した場合は選び直さない。
+        if bangumi_episode_id is None:
+            from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+            await KonomiTVBS4KBangumiClient.bindRecordedProgramById(snapshot.id)
         return True
 
     @classmethod
@@ -1294,6 +1550,71 @@ class RecordedEpisodeAutomation:
             )
 
     @classmethod
+    async def _tryApplyCatalogBind(
+        cls,
+        snapshot: _EpisodeProgramSnapshot,
+        resolution_id: int,
+    ) -> Literal['Applied', 'Undecided', 'Passed']:
+        """カタログ照合の3状態に従い、確定または後続分岐の指示を返す。
+
+        Matched のときだけ AI 検索なしでシーズン込み確定する。Undecided
+        （カタログ取得済み・非独一）のときは整数 fast path を抑止して
+        EpisodeLookup へ進める。Unknown（不在・取得失敗）は既存動作のままと
+        する。手動確定は _applyResolvedEpisode 側の保護で上書きしない。
+
+        Args:
+            snapshot: 話数検索対象の録画メタデータ。
+            resolution_id: 適用先 RecordedEpisodeResolution ID。
+
+        Returns:
+            Applied（確定済み）、Undecided（整数抑止して既存検索へ）、
+                Passed（既存動作のまま）のいずれか。
+        """
+
+        try:
+            result = await TryBindCatalogEpisode(
+                series_id=snapshot.series_id,
+                title=snapshot.title,
+                subtitle=snapshot.subtitle,
+                start_time=snapshot.start_time,
+                duration_seconds=snapshot.duration,
+            )
+        except Exception as ex:
+            # 基盤異常でも既存検索へ落とす。課金済み結果の保全と異なり、
+            ## 未確定の best-effort には失敗の記録を残さない。
+            logging.warning(
+                '[RecordedEpisodeAutomation] Catalog episode binding skipped. '
+                f'recorded_program_id: {snapshot.id}, error: {type(ex).__name__}',
+            )
+            return 'Passed'
+        if result.status == 'Undecided':
+            return 'Undecided'
+        bound = result.bound
+        if bound is None:
+            return 'Passed'
+        # 旧 episode_number 文字列は互換性と移行監査のため書き換えない。
+        ## 整数 fast path と同じく、カタログ確定も決定論的 Local として保存する。
+        applied = await cls._applyResolvedEpisode(
+            snapshot=snapshot,
+            resolution_id=resolution_id,
+            season_number=bound.season_number,
+            episode_number=bound.episode_number,
+            source='Local',
+            provider_fingerprint=None,
+            confidence=None,
+            citations=[],
+            ai_model=None,
+            write_legacy_value=False,
+            bangumi_subject_id=(
+                bound.catalog_subject_id if bound.catalog == 'Bangumi' else None
+            ),
+            bangumi_episode_id=(
+                bound.catalog_episode_id if bound.catalog == 'Bangumi' else None
+            ),
+        )
+        return 'Applied' if applied else 'Passed'
+
+    @classmethod
     async def resolveProgram(
         cls,
         recorded_program_id: int,
@@ -1325,6 +1646,90 @@ class RecordedEpisodeAutomation:
         Returns:
             確定状態、出典、AI呼び出し有無。
         """
+
+        # EPG から単一正整数を取れない録画だけ、EpisodeLookup より先に公式カタログを照合する。
+        ## EPG に明示された通算話数をカタログ側のシーズン内番号で上書きしないため、
+        ## 単一正整数は下のローカル fast path を正本とする。カタログ取得済みで非独一の
+        ## 録画だけは整数 fast path を抑止して EpisodeLookup へ進める。
+        ## ネットワーク待機中は解決 lock を保持せず、適用時の競合は
+        ## _applyResolvedEpisode 側で検出する。
+        catalog_undecided = False
+        catalog_protect_differing = False
+        catalog_snapshot = await cls._loadSnapshot(recorded_program_id)
+        if (
+            catalog_snapshot is not None
+            and ParseSinglePositiveIntegerEpisode(catalog_snapshot.legacy_episode_number) is None
+        ):
+            catalog_resolution = await cls._getOrCreateResolution(catalog_snapshot)
+            catalog_eligible = (
+                (expected_series_id is None or (
+                    catalog_snapshot.series_id == expected_series_id
+                    and catalog_snapshot.series_episode_id == expected_series_episode_id
+                ))
+                and (
+                    catalog_resolution.source != 'Manual'
+                    or override_manual
+                )
+            )
+            if catalog_eligible:
+                catalog_outcome = await cls._tryApplyCatalogBind(
+                    catalog_snapshot,
+                    catalog_resolution.id,
+                )
+                if catalog_outcome == 'Applied':
+                    return RecordedEpisodeAutomationResult(
+                        recorded_program_id,
+                        'Resolved',
+                        'Catalog',
+                        False,
+                    )
+                if catalog_outcome == 'Undecided':
+                    catalog_undecided = True
+                elif await ShouldProtectCatalogValue(
+                    series_id=catalog_snapshot.series_id,
+                    resolution_source=catalog_resolution.source,
+                    series_episode_id=catalog_snapshot.series_episode_id,
+                    legacy_episode_number=catalog_snapshot.legacy_episode_number,
+                ):
+                    # Unknown でもカタログ確定済み構造を旧整数へ戻さない。自動評価では
+                    ## 保持して早期復帰し、明示の単票再検索だけ整数抑止のまま AI へ進める。
+                    if apply_accepted_lookup is False:
+                        stored_status = catalog_resolution.status
+                        keep_status: Literal[
+                            'Resolved',
+                            'NotNumbered',
+                            'NoPublishedNumber',
+                            'NeedsReview',
+                            'Failed',
+                            'Skipped',
+                        ] = (
+                            cast(
+                                Literal[
+                                    'Resolved',
+                                    'NotNumbered',
+                                    'NoPublishedNumber',
+                                    'NeedsReview',
+                                    'Failed',
+                                ],
+                                stored_status,
+                            )
+                            if stored_status
+                            in {
+                                'Resolved',
+                                'NotNumbered',
+                                'NoPublishedNumber',
+                                'NeedsReview',
+                                'Failed',
+                            }
+                            else 'Skipped'
+                        )
+                        return RecordedEpisodeAutomationResult(
+                            recorded_program_id,
+                            keep_status,
+                            catalog_resolution.source or 'Local',
+                            False,
+                        )
+                    catalog_protect_differing = True
 
         async with RECORDED_SERIES_RESOLUTION_LOCK:
             snapshot = await cls._loadSnapshot(recorded_program_id)
@@ -1376,21 +1781,49 @@ class RecordedEpisodeAutomation:
                 resolution.source == 'Manual' and apply_accepted_lookup is False
             ) or preserving_deterministic_value
             parsed_episode = ParseLegacyEpisodeNumber(snapshot.legacy_episode_number)
+            # 保存済みの旧話数が #N だけでも、EPG タイトルに Season N / 第N期が
+            ## 明示されていれば既存のタイトル解析結果をシーズンの正本として使う。
+            if parsed_episode is not None:
+                parsed_title = ParseSeriesTitle(
+                    snapshot.title,
+                    snapshot.description,
+                    snapshot.detail,
+                    [],
+                )
+                parsed_season_number = (
+                    int(parsed_title.season_number)
+                    if parsed_title.season_number is not None
+                    and parsed_title.season_number.isdecimal()
+                    else ParseJapaneseNumber(parsed_title.season_number)
+                    if parsed_title.season_number is not None
+                    else None
+                )
+                if parsed_season_number is not None and parsed_season_number >= 1:
+                    parsed_episode = replace(
+                        parsed_episode,
+                        season_number=parsed_season_number,
+                    )
+            has_single_positive_integer = (
+                ParseSinglePositiveIntegerEpisode(snapshot.legacy_episode_number) is not None
+            )
 
-            # 既存の構造化 Episode は通常処理で再課金せず、壊れた Resolution だけを修復する。
-            if force is False and snapshot.series_episode_id is not None:
+            # 既存の構造化 Episode は、現在の単一正整数話数と一致するときだけ再利用する。
+            ## カタログ取得済み・非独一のときは整数だけで再確定せず EpisodeLookup へ進める。
+            if (
+                force is False
+                and catalog_undecided is False
+                and snapshot.series_episode_id is not None
+            ):
                 episode = await SeriesEpisode.filter(
                     id=snapshot.series_episode_id,
                     series_id=snapshot.series_id,
                 ).first()
                 structured_value_matches = (
-                    resolution.source in {"WebSearch", "EPG", "AI"}
-                    or parsed_episode is None
-                    or (
-                        episode is not None
-                        and parsed_episode.season_number == episode.season_number
-                        and parsed_episode.episode_number == episode.episode_number
-                    )
+                    has_single_positive_integer
+                    and episode is not None
+                    and parsed_episode is not None
+                    and parsed_episode.season_number == episode.season_number
+                    and parsed_episode.episode_number == episode.episode_number
                 )
                 if episode is not None and structured_value_matches:
                     if (
@@ -1424,8 +1857,15 @@ class RecordedEpisodeAutomation:
                         False,
                     )
 
-            # Local / Migration の決定論的解析を AI より先に確定する。
-            if force is False and parsed_episode is not None:
+            # 単一正整数だけ Web 検索を抑止する。0・小数・範囲はフォールバックへ進む。
+            ## カタログ取得済み・非独一、または Unknown でも確定済み構造の保護対象のときは
+            ## 整数だけで確定せず EpisodeLookup へ進める。
+            if (
+                has_single_positive_integer
+                and parsed_episode is not None
+                and catalog_undecided is False
+                and catalog_protect_differing is False
+            ):
                 applied = await cls._applyResolvedEpisode(
                     snapshot=snapshot,
                     resolution_id=resolution.id,
@@ -1496,8 +1936,14 @@ class RecordedEpisodeAutomation:
                 settings,
                 api_key,
             )
+            # lookup 終了後に mutable な設定 store を再読すると、旧世代 request の
+            # 失敗で新世代 proof を消し得る。開始時点の失効対象をここで固定する。
+            capability_proof_fingerprints = (
+                get_episode_lookup_capability_proof_fingerprints(settings)
+            )
 
             # 同一 context / provider の終端結果は明示再検索まで再利用する。
+            # ただし撤去した別日重複ガードの residual だけは同 fingerprint でも再評価する。
             if (
                 force is False
                 and resolution.input_fingerprint == input_fingerprint
@@ -1508,6 +1954,7 @@ class RecordedEpisodeAutomation:
                     'NeedsReview',
                     'Failed',
                 }
+                and _isRemovedGuardResidual(resolution) is False
             ):
                 return RecordedEpisodeAutomationResult(
                     recorded_program_id,
@@ -1652,17 +2099,22 @@ class RecordedEpisodeAutomation:
                 latency_ms=result.latency_ms,
             )
         if (
-            result.outcome in {"SearchFailed", "SearchNotRun", "InvalidModelOutput"}
-            or (
-                result.web_search_performed
-                and len(GetEpisodeLookupEvidence(result)) == 0
+            result.error_code != 'AISettingsChangedBeforeRequest'
+            and (
+                result.outcome in {'SearchFailed', 'SearchNotRun', 'InvalidModelOutput'}
+                or (
+                    result.web_search_performed
+                    and len(GetEpisodeLookupEvidence(result)) == 0
+                )
             )
         ):
             # 接続試験後でも実 lookup で tool/schema/source 能力が否定された場合は、
-            # 診断結果が実態と食い違ったまま残らないよう該当 proof を失効する。
-            invalidate_episode_lookup_capability_fingerprint(
-                provider_fingerprint,
-            )
+            # 診断結果が実態と食い違ったまま残らないよう、開始時点で固定した
+            # 利用し得る全 target proof だけを失効する。
+            for capability_proof_fingerprint in capability_proof_fingerprints:
+                invalidate_episode_lookup_capability_fingerprint(
+                    capability_proof_fingerprint,
+                )
 
         async with RECORDED_SERIES_RESOLUTION_LOCK:
             latest_context = await BuildRecordedEpisodeLookupContext(
@@ -1679,6 +2131,20 @@ class RecordedEpisodeAutomation:
                     result=result,
                 )
                 raise _RecordedEpisodeSnapshotChanged
+
+            # 部制特番の「第N部」と同じ N は話数ではない。AI が Resolved を返しても
+            # 検索済み evidence を保ったまま NoPublishedNumber へ安全側に正規化する。
+            if (
+                result.outcome == 'Resolved'
+                and result.episode_number is not None
+                and result.episode_number in _getBroadcastPartNumbers(snapshot)
+            ):
+                result = replace(
+                    result,
+                    outcome='NoPublishedNumber',
+                    episode_number=None,
+                    rationale_short='番組情報の「第N部」は話数ではなく放送上の部番号です。',
+                )
 
             # 外部待機中に受理条件が更新されても、課金済み結果を旧 snapshot の
             # 条件で取りこぼさない。backend や認証 snapshot は呼出し時点を維持する。
@@ -2218,8 +2684,9 @@ class RecordedEpisodeAutomation:
                 settings,
                 api_key,
             )
+            # 公開一括判定は force 再検索しない。Indexer 整数は Web 検索しない。
+            force = False
             candidates = await cls._loadBackfillCandidateIDs(
-                force=force,
                 provider_fingerprint=provider_fingerprint,
             )
             handle = await AnalysisTaskTracker.start(
@@ -2245,23 +2712,26 @@ class RecordedEpisodeAutomation:
     async def _loadBackfillCandidateIDs(
         cls,
         *,
-        force: bool,
         provider_fingerprint: str | None = None,
     ) -> list[int]:
-        """手動実行対象を、前回結果とforce設定から固定する。"""
+        """手動実行対象を、未確定の話数だけに固定する。"""
 
         # Resolution を起点にすると、旧DBや処理競合で状態行がまだ作成されていない
         # Series 所属録画を取りこぼす。録画を母集合にして、Resolution がない録画も
         # resolveProgram() 内の get_or_create を通る対象として含める。
-        program_ids = cast(
-            list[int],
-            await RecordedProgram.filter(
+        program_rows = await (
+            RecordedProgram.filter(
                 series_id__not_isnull=True,
                 recorded_video__status='Recorded',
             )
             .order_by('id')
-            .values_list('id', flat=True),
+            .values('id', 'episode_number')
         )
+        program_ids = [cast(int, program_row['id']) for program_row in program_rows]
+        episode_numbers_by_program_id = {
+            cast(int, program_row['id']): cast(str | None, program_row['episode_number'])
+            for program_row in program_rows
+        }
         if len(program_ids) == 0:
             return []
         resolutions = await RecordedEpisodeResolution.filter(
@@ -2278,9 +2748,7 @@ class RecordedEpisodeAutomation:
                 continue
             if resolution.source == 'Manual':
                 continue
-            if force:
-                candidate_ids.append(recorded_program_id)
-                continue
+            # force でも確定済み整数話数は再検索しない。Resolved は候補に入れない。
             if resolution.status == "Resolved":
                 continue
             if resolution.status in {'Pending', 'Unknown'}:
@@ -2296,6 +2764,11 @@ class RecordedEpisodeAutomation:
                 and resolution.provider_fingerprint != provider_fingerprint
             ):
                 candidate_ids.append(recorded_program_id)
+        # 外部通信不要の明示話数を先に確定し、AI上限到達時にも取りこぼさない。
+        candidate_ids.sort(key=lambda program_id: (
+            ParseSinglePositiveIntegerEpisode(episode_numbers_by_program_id[program_id]) is None,
+            program_id,
+        ))
         return candidate_ids
 
     @classmethod
@@ -2306,7 +2779,7 @@ class RecordedEpisodeAutomation:
         *,
         force: bool,
         expected_provider_fingerprint: str,
-    ) -> None:
+    ) -> RecordedEpisodeBackfillSummary | None:
         """1回の管理者操作につき、同じAI設定で当日の残り上限まで順次検索する。"""
 
         try:
@@ -2316,17 +2789,169 @@ class RecordedEpisodeAutomation:
                 existing_handle=handle,
             ) as history:
                 await history.setStage("Searching", 0.0)
-                succeeded_count = 0
-                failed_count = 0
-                skipped_count = 0
-                resolved_count = 0
-                not_numbered_count = 0
-                no_published_number_count = 0
-                needs_review_count = 0
-                preserved_count = 0
-                ai_request_count = 0
-                stopped_by_usage_limit = False
+                summary = await cls._processBackfill(
+                    history,
+                    candidate_ids,
+                    force=force,
+                    expected_provider_fingerprint=expected_provider_fingerprint,
+                    progress_start=0.0,
+                    progress_end=1.0,
+                    maximum_ai_requests=_MANUAL_BACKFILL_MAX_AI_REQUESTS_PER_RUN,
+                    timeout_seconds=None,
+                )
+                await history.finish(
+                    "Failed" if summary['failed'] > 0 else "Succeeded",
+                    summary=cast(dict[str, object], summary),
+                    error_code="PartialFailure" if summary['failed'] > 0 else None,
+                )
+                return summary
+        except asyncio.CancelledError:
+            raise
+        except Exception as ex:
+            logging.error(
+                "[RecordedEpisodeAutomation] Episode backfill failed:", exc_info=ex
+            )
+            return None
+        finally:
+            cls._backfill_task = None
+            cls._backfill_handle = None
+
+    @classmethod
+    async def runBoundedBackfill(
+        cls,
+        handle: AnalysisTaskHandle,
+        *,
+        progress_start: float,
+        progress_end: float,
+        timeout_seconds: float,
+    ) -> RecordedEpisodeBackfillSummary:
+        """親パイプライン内で、開始時の全候補を絶対上限まで順次処理する。
+
+        Args:
+            handle: 親パイプラインの解析履歴。
+            progress_start: この段階の開始進捗。
+            progress_end: この段階の完了進捗。
+            timeout_seconds: この段階を打ち切る絶対上限秒数。
+
+        Returns:
+            今回処理した話数候補の集計。
+
+        Raises:
+            RecordedEpisodeBackfillBusyError: 別の話数処理が実行中の場合。
+        """
+
+        async with cls._backfill_start_lock:
+            if (
+                (cls._backfill_task is not None and cls._backfill_task.done() is False)
+                or any(task.done() is False for task in cls._relookup_tasks.values())
+                or len(cls._queued_ids) > 0
+                or len(cls._running_ids) > 0
+            ):
+                raise RecordedEpisodeBackfillBusyError
+            await cls.start()
+            settings, api_key = RecordedSeriesSettingsStore.getSettingsAndAPIKey()
+            provider_fingerprint = get_episode_lookup_provider_fingerprint(settings, api_key)
+            candidates = await cls._loadBackfillCandidateIDs(
+                provider_fingerprint=provider_fingerprint,
+            )
+            current_task = asyncio.current_task()
+            assert current_task is not None
+            cls._backfill_task = current_task
+            cls._backfill_handle = handle
+        try:
+            return await cls._processBackfill(
+                handle,
+                candidates,
+                force=False,
+                expected_provider_fingerprint=provider_fingerprint,
+                progress_start=progress_start,
+                progress_end=progress_end,
+                maximum_ai_requests=None,
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            if cls._backfill_task is current_task:
+                cls._backfill_task = None
+                cls._backfill_handle = None
+
+    @classmethod
+    async def _processBackfill(
+        cls,
+        history: AnalysisTaskHandle,
+        candidate_ids: list[int],
+        *,
+        force: bool,
+        expected_provider_fingerprint: str,
+        progress_start: float,
+        progress_end: float,
+        maximum_ai_requests: int | None,
+        timeout_seconds: float | None,
+    ) -> RecordedEpisodeBackfillSummary:
+        """固定候補を順に処理し、指定されたAI回数と時間の上限で残件を保留する。
+
+        Args:
+            history: 件数と進捗を保存する解析履歴。
+            candidate_ids: 開始時に固定した対象録画ID。
+            force: 保存済み終端結果を再利用せず検索するか。
+            expected_provider_fingerprint: 開始時に固定したAI設定世代。
+            progress_start: この段階の開始進捗。
+            progress_end: この段階の完了進捗。
+            maximum_ai_requests: 新しいAI検索の上限。None は回数制限なし。
+            timeout_seconds: 処理全体の絶対上限秒数。None は時間制限なし。
+
+        Returns:
+            今回処理した話数候補の集計。
+        """
+
+        succeeded_count = 0
+        failed_count = 0
+        skipped_count = 0
+        resolved_count = 0
+        not_numbered_count = 0
+        no_published_number_count = 0
+        needs_review_count = 0
+        preserved_count = 0
+        ai_request_count = 0
+        stopped_by_usage_limit = False
+        stopped_by_batch_limit = False
+        stopped_by_time_limit = False
+        processed_count = 0
+
+        async def SaveProgress(current: int) -> None:
+            """現在件数とパイプライン全体に占める進捗を同時に保存する。
+
+            Args:
+                current: 完了またはskipとして記録する現在件数。
+
+            Returns:
+                None
+            """
+
+            await history.setCounts(
+                current=current,
+                total=len(candidate_ids),
+                succeeded=succeeded_count,
+                failed=failed_count,
+                skipped=skipped_count,
+            )
+            fraction = current / len(candidate_ids) if len(candidate_ids) > 0 else 1.0
+            await history.setProgress(
+                progress_start + (progress_end - progress_start) * fraction,
+            )
+
+        stage_timeout = asyncio.timeout(timeout_seconds)
+        try:
+            # 親パイプラインでは長いAI待機も絶対上限でキャンセルする。通常の手動一括処理は
+            ## None を渡し、従来どおりAI回数の有限枠だけで閉じる。
+            async with stage_timeout:
                 for index, recorded_program_id in enumerate(candidate_ids, start=1):
+                    # 単独の手動一括処理だけは従来のAI回数上限で残件を次回操作へ委ねる。
+                    ## 親パイプラインは None のため、開始時スナップショットを時間上限まで処理する。
+                    if maximum_ai_requests is not None and ai_request_count >= maximum_ai_requests:
+                        stopped_by_batch_limit = True
+                        skipped_count += len(candidate_ids) - index + 1
+                        await SaveProgress(len(candidate_ids))
+                        break
                     try:
                         result = await cls.resolveProgram(
                             recorded_program_id,
@@ -2339,28 +2964,18 @@ class RecordedEpisodeAutomation:
                         raise
                     except _RecordedEpisodeSnapshotChanged:
                         skipped_count += 1
-                        await history.setCounts(
-                            current=index,
-                            total=len(candidate_ids),
-                            succeeded=succeeded_count,
-                            failed=failed_count,
-                            skipped=skipped_count,
-                        )
+                        processed_count = index
+                        await SaveProgress(index)
                         continue
                     except Exception as ex:
                         failed_count += 1
+                        processed_count = index
                         logging.error(
                             f"[RecordedEpisodeAutomation] Episode backfill item failed. "
                             f"recorded_program_id: {recorded_program_id}",
                             exc_info=ex,
                         )
-                        await history.setCounts(
-                            current=index,
-                            total=len(candidate_ids),
-                            succeeded=succeeded_count,
-                            failed=failed_count,
-                            skipped=skipped_count,
-                        )
+                        await SaveProgress(index)
                         continue
 
                     ai_request_count += int(result.ai_requested)
@@ -2381,58 +2996,41 @@ class RecordedEpisodeAutomation:
                         failed_count += 1
                     else:
                         skipped_count += 1
-                    await history.setCounts(
-                        current=index,
-                        total=len(candidate_ids),
-                        succeeded=succeeded_count,
-                        failed=failed_count,
-                        skipped=skipped_count,
-                    )
+                    processed_count = index
+                    await SaveProgress(index)
                     if result.error_code in {
                         "DailyAIRequestLimitReached",
                         "MonthlyTokenLimitReached",
                         "MonthlyCostLimitReached",
                     }:
-                        # 上限到達時は自動再開せず、残りは次回の明示操作まで保留する。
+                        # 利用上限到達時も自動再開せず、未着手分は summary から次回操作へ引き継ぐ。
                         stopped_by_usage_limit = True
                         skipped_count += len(candidate_ids) - index
-                        await history.setCounts(
-                            current=len(candidate_ids),
-                            total=len(candidate_ids),
-                            succeeded=succeeded_count,
-                            failed=failed_count,
-                            skipped=skipped_count,
-                        )
+                        await SaveProgress(len(candidate_ids))
                         break
+        except TimeoutError:
+            if stage_timeout.expired() is False:
+                raise
+            # 現在処理中の録画を中断し、完了済み件数から未着手分を算出する。
+            stopped_by_time_limit = True
 
-                await history.finish(
-                    "Failed" if failed_count > 0 else "Succeeded",
-                    summary=cast(
-                        dict[str, object],
-                        {
-                            "resolved_or_reviewed": succeeded_count,
-                            "resolved": resolved_count,
-                            "not_numbered": not_numbered_count,
-                            'no_published_number': no_published_number_count,
-                            "needs_review": needs_review_count,
-                            "preserved": preserved_count,
-                            "failed": failed_count,
-                            "skipped": skipped_count,
-                            "ai_requests": ai_request_count,
-                            "stopped_by_usage_limit": stopped_by_usage_limit,
-                        },
-                    ),
-                    error_code="PartialFailure" if failed_count > 0 else None,
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as ex:
-            logging.error(
-                "[RecordedEpisodeAutomation] Episode backfill failed:", exc_info=ex
-            )
-        finally:
-            cls._backfill_task = None
-            cls._backfill_handle = None
+        if len(candidate_ids) == 0:
+            await SaveProgress(0)
+        return RecordedEpisodeBackfillSummary(
+            resolved_or_reviewed=succeeded_count,
+            resolved=resolved_count,
+            not_numbered=not_numbered_count,
+            no_published_number=no_published_number_count,
+            needs_review=needs_review_count,
+            preserved=preserved_count,
+            failed=failed_count,
+            skipped=skipped_count,
+            remaining=max(0, len(candidate_ids) - processed_count),
+            ai_requests=ai_request_count,
+            stopped_by_usage_limit=stopped_by_usage_limit,
+            stopped_by_batch_limit=stopped_by_batch_limit,
+            stopped_by_time_limit=stopped_by_time_limit,
+        )
 
     @classmethod
     async def getStatus(cls) -> dict[str, int | str | bool | None]:
@@ -2487,5 +3085,7 @@ class RecordedEpisodeAutomation:
             "is_episode_running": (
                 cls._backfill_task is not None and cls._backfill_task.done() is False
             )
-            or any(task.done() is False for task in cls._relookup_tasks.values()),
+            or any(task.done() is False for task in cls._relookup_tasks.values())
+            or len(cls._queued_ids) > 0
+            or len(cls._running_ids) > 0,
         }

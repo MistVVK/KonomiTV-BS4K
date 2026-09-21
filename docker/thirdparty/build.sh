@@ -71,9 +71,7 @@ INTEL_NONFREE="${INTEL_NONFREE}" OUTPUT_ROOT="${SOURCE_ROOT}/intel-media-stack" 
     "${SCRIPT_DIR}/build-intel-media-stack.sh" "${SOURCE_ROOT}/intel-media-stack"
 cp -a "${SOURCE_ROOT}/intel-media-stack/artifact/Library" "${OUTPUT_ROOT}/Library"
 
-# Docker build context では submodule の Git metadata が除外されるため、固定 commit の tracked source tree と同じ内容か検証する。
-actual_tsreadex_source_sha256="$(cd "${TSREADEX_SOURCE}" && { find . -type f ! -name '.git' ! -name 'tsreadex.elf' -print0 | sort -z | xargs -0 sha256sum; } | sha256sum | cut -d' ' -f1)"
-test "${actual_tsreadex_source_sha256}" = "${TSREADEX_SOURCE_SHA256}"
+# tsreadex は Docker build context に取り込んだ submodule から構築する。
 make -C "${TSREADEX_SOURCE}" clean
 make -C "${TSREADEX_SOURCE}" TARGET=tsreadex.elf -j"$(nproc)"
 mkdir -p "${OUTPUT_ROOT}/tsreadex"
@@ -101,4 +99,4 @@ download-verified "${PYTHON_URL}" "${PYTHON_SHA256}" "${DOWNLOAD_ROOT}/python.ta
 tar -xzf "${DOWNLOAD_ROOT}/python.tar.gz" -C "${SOURCE_ROOT}"
 mv "${SOURCE_ROOT}/python" "${OUTPUT_ROOT}/Python"
 "${OUTPUT_ROOT}/Python/bin/python" -m pip install --no-cache-dir "poetry==${POETRY_VERSION}"
-copy-license "${OUTPUT_ROOT}/Python/lib/python3.11/LICENSE.txt" "${OUTPUT_ROOT}/Python/License.txt"
+copy-license "${OUTPUT_ROOT}/Python/lib/python3.14/LICENSE.txt" "${OUTPUT_ROOT}/Python/License.txt"

@@ -40,6 +40,9 @@ def BuildEncodingTask(
     settings.general.encoder_bs4k_input_analysis_enabled = bs4k_input_analysis_enabled
     settings.general.konomitv_bs4k_live_sar_mode = sar_mode  # type: ignore[assignment]
     monkeypatch.setattr('app.streams.LiveEncodingTask.Config', lambda: settings)
+    # render node 固定指定は遅延 import される app.config.Config を直接参照するため、
+    # タスク側だけでなく参照元モジュールの Config も同じ最小設定へ差し替える
+    monkeypatch.setattr('app.config.Config', lambda: settings)
     task = object.__new__(LiveEncodingTask)
     task._retry_count = 0
     task.live_stream = SimpleNamespace(
@@ -298,9 +301,9 @@ def test_ffmpeg8_bs4k_ignores_sar_mode_and_uses_gpu_scale(
         ('NVENC', 'avc', 'h264_nvenc', 'high'),
         ('NVENC', 'hevc', 'hevc_nvenc', 'main'),
         ('NVENC', 'av1', 'av1_nvenc', None),
-        ('AMF', 'avc', 'h264_amf', 'high'),
-        ('AMF', 'hevc', 'hevc_amf', 'main'),
-        ('AMF', 'av1', 'av1_amf', 'main'),
+        ('AMF', 'avc', 'h264_vaapi', 'high'),
+        ('AMF', 'hevc', 'hevc_vaapi', 'main'),
+        ('AMF', 'av1', 'av1_vaapi', 'main'),
     ],
 )
 @pytest.mark.parametrize(('audio_codec', 'expected_audio_encoder'), [('aac', 'copy'), ('opus', 'libopus')])
@@ -419,20 +422,26 @@ def test_mmt_tlv_uses_libaribtlv_and_disables_source_anchor(
     )
     monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
 
-    software_options = task.buildFFmpegOptions('240p', 'BS4K', False, is_mmt_tlv=True)
+    software_options = task.buildFFmpegOptions(
+        '240p', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+    )
     hardware_options = task.buildFFmpeg8HardwareOptions(
         '240p',
         'QSV',
         'BS4K',
         False,
         is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200,
+        tlv_main_audio_packet_id=0xF210,
     )
     bridge_options = task.BuildTSCodecBridgeOptions(is_mmt_tlv=True)
 
     for options in (software_options, hardware_options):
         assert options[options.index('-f') + 1] == 'libaribtlv'
         assert options[options.index('-max_audio_channels') + 1] == '8'
-        assert options.count('0:a?') == 1
+        assert '0:i:61952' in options
+        assert '0:i:61968' in options
         assert options.count('0:d?') == 1
         assert '-ac' not in options
     assert software_options[software_options.index('-acodec') + 1] == 'aac'
@@ -454,10 +463,10 @@ def test_mmt_tlv_uses_libaribtlv_and_disables_source_anchor(
     assert '-max_audio_channels' not in hardware_options
 
 
-def test_mmt_tlv_context_id_map_fixes_video_and_audio(
+def test_mmt_tlv_packet_id_map_fixes_video_and_audio(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """TLV は context_id で映像・音声を固定し、降雨対応時は映像だけ低階層を選ぶ。"""
+    """TLV は packet_id で映像・音声を一意に固定し、降雨対応時は映像だけ低階層を選ぶ。"""
 
     task = BuildEncodingTask(
         monkeypatch,
@@ -467,48 +476,106 @@ def test_mmt_tlv_context_id_map_fixes_video_and_audio(
     )
     monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
 
-    # 高階層のみ (降雨対応なし): 映像・音声とも主 context へ固定し、0:v:0 の先着順に依存しない。
+    # 高階層のみ (降雨対応なし): 映像・音声とも主トラックの packet_id へ固定し、0:v:0 の先着順に依存しない。
     software_options = task.buildFFmpegOptions(
-        '240p', 'BS4K', False, is_mmt_tlv=True, tlv_main_context_id=0x0001,
+        '240p', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
     )
     hardware_options = task.buildFFmpeg8HardwareOptions(
-        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True, tlv_main_context_id=0x0001,
+        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
     )
 
     for options in (software_options, hardware_options):
-        assert '0:v:m:context_id:1' in options
-        assert '0:a:m:context_id:1' in options
+        assert '0:i:61952' in options
+        assert '0:i:61968' in options
         assert '0:d?' in options
         assert '0:v:0' not in options
         assert '0:a?' not in options
 
-    # 降雨対応あり: 映像は低階層 (context 2)、音声は高階層 (context 1)。
+    # 降雨対応あり: 映像は低階層 (0xF201)、音声は高階層 (0xF210)。
     software_options = task.buildFFmpegOptions(
         '240p', 'BS4K', False, is_mmt_tlv=True,
-        tlv_main_context_id=0x0001, tlv_rain_context_id=0x0002,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_rain_video_packet_id=0xF201,
     )
     hardware_options = task.buildFFmpeg8HardwareOptions(
         '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True,
-        tlv_main_context_id=0x0001, tlv_rain_context_id=0x0002,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_rain_video_packet_id=0xF201,
     )
 
     for options in (software_options, hardware_options):
-        assert '0:v:m:context_id:2' in options
-        assert '0:a:m:context_id:1' in options
+        assert '0:i:61953' in options
+        assert '0:i:61968' in options
         assert '0:d?' in options
 
-    # context_id 未解決 (プローブ失敗) は従来 map へフォールバックする。
+    # 主映像・主音声の packet_id が未解決 (プローブ失敗) の場合は、複数トラックへ拡大し得る
+    # context_id map や先着順の 0:v:0 へ黙って落とさず失敗させる。
+    for missing in (
+        {'tlv_main_video_packet_id': None, 'tlv_main_audio_packet_id': 0xF210},
+        {'tlv_main_video_packet_id': 0xF200, 'tlv_main_audio_packet_id': None},
+    ):
+        with pytest.raises(RuntimeError):
+            task.buildFFmpegOptions('240p', 'BS4K', False, is_mmt_tlv=True, **missing)
+        with pytest.raises(RuntimeError):
+            task.buildFFmpeg8HardwareOptions('240p', 'QSV', 'BS4K', False, is_mmt_tlv=True, **missing)
+
+
+def test_mmt_tlv_packet_id_map_excludes_colliding_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """packet_id が他 context と衝突する場合、正の map の後ろに負の metadata map で衝突元を除外する。"""
+
+    task = BuildEncodingTask(
+        monkeypatch,
+        stream_anchor_enabled=False,
+        video_codec='avc',
+        audio_codec='aac',
+    )
+    monkeypatch.setattr(RecordedPlaybackBackend, 'discoverRenderDevices', lambda _encoder: ['/dev/dri/renderD128'])
+
+    # 通常モード: 主映像・主音声の packet_id と衝突する context 9 を除外する。
+    # FFmpeg は正の map を先に評価するため、除外 map は必ず正の map の後ろに並ぶ必要がある。
     software_options = task.buildFFmpegOptions(
-        '240p', 'BS4K', False, is_mmt_tlv=True, tlv_main_context_id=None,
+        '240p', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_normal_excluded_context_ids=(9,),
+        tlv_rain_excluded_context_ids=(8,),
     )
     hardware_options = task.buildFFmpeg8HardwareOptions(
-        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True, tlv_main_context_id=None,
+        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_normal_excluded_context_ids=(9,),
+        tlv_rain_excluded_context_ids=(8,),
     )
 
     for options in (software_options, hardware_options):
-        assert '0:v:0' in options
-        assert '0:a?' in options
-        assert '0:d?' in options
+        assert '-0:m:context_id:9' in options
+        assert '-0:m:context_id:8' not in options
+        # 除外 map は全ての正の map より後ろに配置される。
+        assert options.index('-0:m:context_id:9') > options.index('0:d?')
+
+    # 降雨対応モード: 降雨モード用の除外一覧 (context 8) を使う。
+    software_options = task.buildFFmpegOptions(
+        '240p', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_rain_video_packet_id=0xF201,
+        tlv_normal_excluded_context_ids=(9,),
+        tlv_rain_excluded_context_ids=(8,),
+    )
+    hardware_options = task.buildFFmpeg8HardwareOptions(
+        '240p', 'QSV', 'BS4K', False, is_mmt_tlv=True,
+        tlv_main_video_packet_id=0xF200, tlv_main_audio_packet_id=0xF210,
+        tlv_rain_video_packet_id=0xF201,
+        tlv_normal_excluded_context_ids=(9,),
+        tlv_rain_excluded_context_ids=(8,),
+    )
+
+    for options in (software_options, hardware_options):
+        assert '-0:m:context_id:8' in options
+        assert '-0:m:context_id:9' not in options
+        assert options.index('-0:m:context_id:8') > options.index('0:d?')
 
 
 def test_ffmpeg8_software_advanced_codec_uses_single_map_and_vbv(
@@ -588,6 +655,7 @@ def test_compatibility_transport_does_not_add_anchor_options(monkeypatch: pytest
 def test_bridge_options_finalize_stream_anchor() -> None:
     task = object.__new__(LiveEncodingTask)
     task.live_stream = SimpleNamespace(
+        quality='240p',
         stream_anchor_enabled=True,
         encoding_options=StreamEncodingOptions(),
     )

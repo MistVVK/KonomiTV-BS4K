@@ -5,7 +5,10 @@ from typing import ClassVar
 
 from app import logging
 from app.constants import LIBRARY_PATH
-from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
+from app.utils.KonomiTVBS4KTLVServiceResolver import (
+    KonomiTVBS4KTLVMetadataSnapshot,
+    KonomiTVBS4KTLVServiceResolver,
+)
 
 
 class KonomiTVBS4KTLVMetadataMonitor:
@@ -42,9 +45,10 @@ class KonomiTVBS4KTLVMetadataMonitor:
         self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=self.MAX_BUFFERED_CHUNKS)
         # SIDからcontext_idを解決するため、完全SDTが分割通知されても観測済み対応を保持する。
         self._service_contexts: dict[int, int] = {}
-        # contextごとに完全MPTを受信済みかと、そのsnapshotにVideoが存在したかを保持する。
-        # Falseのentryは「MPT受信済み・tracks=[]」であり、未受信とは明確に区別する。
-        self._mpt_video_availability: dict[int, bool] = {}
+        # contextごとに完全MPTを受信済みかと、そのsnapshotに含まれる Video packet_id を保持する。
+        # 主・低階層が同じ context_id に多重化される局では、packet_id が主と異なる映像があるかで
+        # 降雨対応放送の送出を判定する。
+        self._mpt_video_packet_ids: dict[int, tuple[int, ...]] = {}
         # Resolverが先に消費した連続TLVを最初のhelperへ直送し、有限live Queueのoverflowから保護する。
         self._initial_data: bytes | None = None
         self._initial_data_consumed = False
@@ -64,6 +68,10 @@ class KonomiTVBS4KTLVMetadataMonitor:
         self._main_service_id = main_service_id
         self._rain_service_id = rain_service_id
         self._log_prefix = log_prefix
+        # 主サービスの B60 0x8010 値 (1-5)。未観測なら None。
+        self._b60_video_transfer: int | None = None
+        # 主サービスの MH-EIT 現在番組 HDR アイコン。未観測なら None、不在は False。
+        self._mh_eit_hdr_hint: bool | None = None
 
     @property
     def is_rain_fallback_broadcasting(self) -> bool | None:
@@ -78,6 +86,34 @@ class KonomiTVBS4KTLVMetadataMonitor:
         """
 
         return self._broadcasting_state
+
+    @property
+    def b60_video_transfer(self) -> int | None:
+        """
+        主サービス映像の B60 video_transfer_characteristics を返す。
+
+        Args:
+            なし。
+
+        Returns:
+            int | None: B60 値 1-5。未観測なら None。
+        """
+
+        return self._b60_video_transfer
+
+    @property
+    def mh_eit_hdr_hint(self) -> bool | None:
+        """
+        主サービスの MH-EIT 現在番組 HDR アイコンを返す。
+
+        Args:
+            なし。
+
+        Returns:
+            bool | None: アイコンあり True、現在番組はあるがアイコンなし False、未観測 None。
+        """
+
+        return self._mh_eit_hdr_hint
 
     def start(self) -> None:
         """
@@ -327,18 +363,58 @@ class KonomiTVBS4KTLVMetadataMonitor:
                 # helper側も全状態を消しているため、サービス対応・MPT受信実績を同時に破棄する。
                 if metadata.snapshot_context_id is None:
                     self._service_contexts.clear()
-                    self._mpt_video_availability.clear()
+                    self._mpt_video_packet_ids.clear()
                 else:
                     # MPTのtracksは全contextを含む完全snapshotなので、過去のtrackを累積せず丸ごと置き換える。
                     # 一方、snapshot_context_idはそのcontextのMPTを実際に受信した証拠として世代内で保持する。
-                    received_context_ids = set(self._mpt_video_availability)
+                    video_packet_ids: dict[int, list[int]] = {}
+                    for track in metadata.tracks:
+                        if track.kind == 'Video':
+                            video_packet_ids.setdefault(track.context_id, []).append(track.packet_id)
+                    received_context_ids = set(self._mpt_video_packet_ids)
                     received_context_ids.add(metadata.snapshot_context_id)
-                    self._mpt_video_availability = {
-                        context_id: context_id in metadata.video_context_ids
+                    self._mpt_video_packet_ids = {
+                        context_id: tuple(video_packet_ids.get(context_id, ()))
                         for context_id in received_context_ids
                     }
 
             self._evaluateCandidateState()
+            self._evaluateColorHint(metadata)
+
+    def _evaluateColorHint(self, metadata: KonomiTVBS4KTLVMetadataSnapshot) -> None:
+        """
+        主サービスの B60 transfer と MH-EIT HDR アイコンを公開する。
+
+        Args:
+            metadata (KonomiTVBS4KTLVMetadataSnapshot): parseMetadataLine が返した最新 snapshot。
+
+        Returns:
+            None
+        """
+
+        if self._main_service_id is None:
+            return
+        main_context_id = self._service_contexts.get(self._main_service_id)
+        if metadata.tracks:
+            video_tracks = [
+                track for track in metadata.tracks
+                if track.kind == 'Video' and (
+                    main_context_id is None or track.context_id == main_context_id
+                )
+            ]
+            video_tracks.sort(key=lambda track: (
+                track.component_tag if track.component_tag is not None else 1 << 30,
+                track.track_id,
+            ))
+            if video_tracks:
+                self._b60_video_transfer = video_tracks[0].video_transfer_characteristics
+        present_hints = [
+            hint for hint in metadata.program_hints
+            if hint.service_id == self._main_service_id and hint.section_number == 0
+        ]
+        if present_hints:
+            # 同じ現在番組が複数テーブルで来ても、HDR アイコンの有無だけを公開する。
+            self._mh_eit_hdr_hint = any(hint.hdr_programme_icon for hint in present_hints)
 
     def _evaluateCandidateState(self) -> None:
         """
@@ -359,17 +435,28 @@ class KonomiTVBS4KTLVMetadataMonitor:
             return
 
         # 主映像を確認できない状態では、低階層の不在を放送終了として扱わない。
-        if self._mpt_video_availability.get(main_context_id) is not True:
-            if main_context_id in self._mpt_video_availability:
-                self._setCandidateState(None)
+        main_video_packet_ids = self._mpt_video_packet_ids.get(main_context_id)
+        if main_video_packet_ids is None:
+            return
+        if len(main_video_packet_ids) == 0:
+            self._setCandidateState(None)
             return
 
         # 主映像が正常な一方で降雨対応SIDまたはそのMPTが現れない状態は、終了側の5秒安定待ちを経て
         # 「未実施」と確定する。SDTがSIDごとに順次届く途中なら、後続MPTで候補が上書きされる。
-        if rain_context_id is None or rain_context_id not in self._mpt_video_availability:
+        rain_video_packet_ids = (
+            self._mpt_video_packet_ids.get(rain_context_id)
+            if rain_context_id is not None else None
+        )
+        if rain_video_packet_ids is None:
             self._setCandidateState(False)
             return
-        self._setCandidateState(self._mpt_video_availability[rain_context_id])
+        if rain_context_id == main_context_id:
+            # NHK BSP4K / BS8K は主・低階層が同じ context_id に並ぶ。主映像とは異なる
+            # Video packet_id が存在するときだけ低階層送出中として扱う。
+            self._setCandidateState(len(set(rain_video_packet_ids)) > 1)
+            return
+        self._setCandidateState(len(rain_video_packet_ids) > 0)
 
     def _setCandidateState(self, state: bool | None) -> None:
         """
@@ -430,8 +517,10 @@ class KonomiTVBS4KTLVMetadataMonitor:
         """
 
         self._service_contexts.clear()
-        self._mpt_video_availability.clear()
+        self._mpt_video_packet_ids.clear()
         if clear_published_state is True:
+            self._b60_video_transfer = None
+            self._mh_eit_hdr_hint = None
             self._setCandidateState(None)
         else:
             self._candidate_state = self._broadcasting_state

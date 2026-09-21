@@ -74,6 +74,9 @@ const useUserStore = defineStore('user', {
          */
         async login(username: string, password: string, silent: boolean = false): Promise<boolean> {
 
+            // 進行中の古いアクセストークン更新が、ログイン結果を後から上書きしないようにする
+            Utils.invalidateAuthentication();
+
             // アクセストークンを発行
             const access_token = await Users.createUserAccessToken(username, password);
             if (access_token === null) {
@@ -103,6 +106,9 @@ const useUserStore = defineStore('user', {
          */
         logout(silent: boolean = false): void {
 
+            // 進行中のアクセストークン更新が、削除後に認証状態を復活させないようにする
+            Utils.invalidateAuthentication();
+
             // 設定の同期を無効化
             const settings_store = useSettingsStore();
             settings_store.settings.sync_settings = false;
@@ -116,6 +122,9 @@ const useUserStore = defineStore('user', {
             // 未ログイン状態に設定
             this.is_logged_in = false;
             this.user = null;
+            if (this.user_icon_url) {
+                URL.revokeObjectURL(this.user_icon_url);
+            }
             this.user_icon_url = '';
 
             if (silent === false) {
@@ -158,6 +167,9 @@ const useUserStore = defineStore('user', {
             const user_icon_url = await Users.fetchUserIcon();
             if (user_icon_url === null) {
                 return null;
+            }
+            if (this.user_icon_url) {
+                URL.revokeObjectURL(this.user_icon_url);
             }
             this.user_icon_url = user_icon_url;
 

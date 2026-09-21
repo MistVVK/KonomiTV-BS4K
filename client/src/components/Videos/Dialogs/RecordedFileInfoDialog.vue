@@ -10,7 +10,7 @@
                 </div>
             </v-card-title>
             <div class="px-5 pb-6">
-                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-2">
+                <div class="text-body-large d-flex align-center font-weight-bold mt-2">
                     <Icon icon="fluent:video-clip-20-filled" width="24px" height="20px" />
                     <span class="ml-2">ファイル情報</span>
                 </div>
@@ -86,7 +86,7 @@
                         {{Utils.apply28HourClock(dayjs(program.recorded_video.cm_result_published_at).format('YYYY/MM/DD (dd) HH:mm:ss'))}}
                     </div>
                 </div>
-                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
+                <div class="text-body-large d-flex align-center font-weight-bold mt-3">
                     <Icon icon="fluent:video-20-filled" width="24px" height="20px" />
                     <span class="ml-2">映像情報</span>
                 </div>
@@ -114,7 +114,11 @@
                     <div class="video-info__item-label">スキャン方式</div>
                     <div class="video-info__item-value">{{program.recorded_video.video_scan_type}}</div>
                 </div>
-                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
+                <div class="video-info__item">
+                    <div class="video-info__item-label">HDR</div>
+                    <div class="video-info__item-value">{{program.recorded_video.video_hdr ?? '不明'}}</div>
+                </div>
+                <div class="text-body-large d-flex align-center font-weight-bold mt-3">
                     <Icon icon="fluent:speaker-2-20-filled" width="24px" height="20px" />
                     <span class="ml-2">音声情報（主音声）</span>
                 </div>
@@ -131,7 +135,7 @@
                     <div class="video-info__item-value">{{program.recorded_video.primary_audio_sampling_rate ? `${program.recorded_video.primary_audio_sampling_rate / 1000}kHz` : '不明'}}</div>
                 </div>
 
-                <div v-if="program.recorded_video.secondary_audio_codec" class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
+                <div v-if="program.recorded_video.secondary_audio_codec" class="text-body-large d-flex align-center font-weight-bold mt-3">
                     <Icon icon="fluent:speaker-2-20-filled" width="24px" height="20px" />
                     <span class="ml-2">音声情報（副音声）</span>
                 </div>
@@ -149,7 +153,7 @@
                         <div class="video-info__item-value">{{program.recorded_video.secondary_audio_sampling_rate ? `${program.recorded_video.secondary_audio_sampling_rate / 1000}kHz` : '不明'}}</div>
                     </div>
                 </template>
-                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
+                <div class="text-body-large d-flex align-center font-weight-bold mt-3">
                     <Icon icon="fluent:timeline-20-filled" width="24px" height="20px" />
                     <span class="ml-2">音声構成タイムライン</span>
                 </div>
@@ -163,7 +167,7 @@
                     <div class="video-info__item-label">{{formatTimelineRange(interval.start_time, interval.end_time)}}</div>
                     <div class="video-info__item-value">{{formatTimelineTracks(interval.tracks)}}</div>
                 </div>
-                <div class="text-subtitle-1 d-flex align-center font-weight-bold mt-3">
+                <div class="text-body-large d-flex align-center font-weight-bold mt-3">
                     <Icon icon="fluent:timeline-20-filled" width="24px" height="20px" />
                     <span class="ml-2">CMタイムライン</span>
                 </div>

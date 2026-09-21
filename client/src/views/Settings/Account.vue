@@ -51,13 +51,6 @@
                         </div>
                     </div>
                     <div class="account-feature">
-                        <Icon class="account-feature__icon" icon="fa-brands:twitter" />
-                        <div class="account-feature__info">
-                            <span class="account-feature__info-heading">Twitter 連携機能</span>
-                            <span class="account-feature__info-text">テレビを見ながら Twitter にツイートしたり、検索したツイートをリアルタイムで表示できます。別途、Twitter アカウントとの連携が必要です。</span>
-                        </div>
-                    </div>
-                    <div class="account-feature">
                         <Icon class="account-feature__icon" icon="fluent:arrow-sync-20-filled" />
                         <div class="account-feature__info">
                             <span class="account-feature__info-heading">
@@ -303,6 +296,8 @@ export default defineComponent({
                 // 一度オブジェクトに戻したものをハッシュ化する
                 const server_sync_settings = await Settings.fetchClientSettings();
                 if (server_sync_settings === null) {
+                    // 実際の同期設定はまだ無効なので、スイッチもオフへ戻して表示との不整合を残さない
+                    this.sync_settings = false;
                     Message.error('サーバーから設定データを取得できませんでした。');
                     return;
                 }
@@ -358,14 +353,14 @@ export default defineComponent({
         async overrideClientSettingsFromServer() {
 
             // 強制的にサーバーに保存されている設定データをこのクライアントに同期する
-            // 設定の同期を有効化する前に実行しておくのが重要
-            await this.settingsStore.syncClientSettingsFromServer(true);
+            // 成功時の同期有効化も pull ロック内で行い、反映したサーバー設定が watcher から再 push されないようにする
+            const success = await this.settingsStore.syncClientSettingsFromServer(true);
+            if (success === false) {
+                Message.error('サーバーから設定データを取得できませんでした。');
+                return;
+            }
 
-            // 設定の同期を有効化
-            // 値を変更した時点で設定データがサーバーにアップロードされてしまうので、
-            // それよりも前に syncClientSettingsFromServer(true) でサーバー上の設定データを同期させておく必要がある
-            // さもなければ、サーバー上の設定データがこのクライアントの設定で上書きされてしまい、overrideServerSettingsFromClient() と同じ挙動になってしまう
-            this.settingsStore.settings.sync_settings = true;
+            // Store 側では同期有効化済みなので、スイッチの表示だけ合わせる
             this.sync_settings = true;
 
             // ダイヤログを閉じる

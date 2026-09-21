@@ -27,7 +27,7 @@ class TagsClient:
         # キャッシュ検証で実際のリクエスト回数と URL を確認するために保持する
         self.requested_urls: list[str] = []
 
-    async def __aenter__(self) -> 'TagsClient':
+    async def __aenter__(self) -> TagsClient:
         """
         Returns:
             TagsClient: HTTPX_CLIENT の async context manager が返すクライアント
@@ -108,8 +108,10 @@ def test_version_information_separates_bs4k_and_upstream_versions_and_caches_tag
     assert first_response['encoder_bs4k'] == 'NVENC'
     assert first_response['bs4k_ignore_viewer_low_latency'] is False
     assert first_response['konomitv_bs4k_live_transport'] == 'Tlv'
+    assert first_response['debug'] is False
     # FastAPI の response_model と同じ検証を通し、公開フィールドが欠落・除去されない契約を固定する。
     assert VersionInformation.model_validate(first_response).konomitv_bs4k_live_transport == 'Tlv'
+    assert VersionInformation.model_validate(first_response).debug is False
     assert second_response['latest_version'] == expected_latest_version
     assert tags_client.requested_urls == ['https://api.github.com/repos/MistVVK/KonomiTV-BS4K/tags']
     http_client_factory.assert_called_once_with()

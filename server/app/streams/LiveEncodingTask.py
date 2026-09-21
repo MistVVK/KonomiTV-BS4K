@@ -8,6 +8,7 @@ import gc
 import os
 import re
 import secrets
+import sys
 import time
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, ClassVar, Literal, cast
@@ -18,6 +19,7 @@ import aiohttp
 import anyio
 import httpx
 from aiofiles.threadpool.text import AsyncTextIOWrapper
+from aiohttp import ServerDisconnectedError
 from biim.mpeg2ts import ts
 
 from app import logging
@@ -95,13 +97,20 @@ class LiveEncodingTask:
     ENCODER_TS_READ_TIMEOUT_STANDBY: ClassVar[int] = 20
 
     # エンコーダーの出力を読み取る際のタイムアウト (ONAir 時) (秒)
-    # VCEEncC 利用時のみ起動時に OpenCL シェーダーがコンパイルされる関係で起動が遅いため、10 秒に設定
     ENCODER_TS_READ_TIMEOUT_ONAIR: ClassVar[int] = 5
-    ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC: ClassVar[int] = 10
+    # オリジナル画質で ONAir に移行するために必要な、ライブストリームへ書き込んだ TS データの累積バイト数
+    ## 地上波・BS 放送の TS ビットレート (おおよそ 16〜19Mbps) を前提に、約 0.75 秒分のデータ量 (1.5MiB) とする
+    ## tsreadex から最初の TS パケットが出た直後だと再生に足りないため、実際に再生可能な量が溜まってから ONAir にする
+    ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES: ClassVar[int] = int(1.5 * 1024 * 1024)
+    # AMD (公開名 AMF、実体は Mesa VAAPI) はドライバー初期化が重い場合があるため長めに維持する
+    ENCODER_TS_READ_TIMEOUT_ONAIR_AMD: ClassVar[int] = 10
     # ISDB-S3 は入力解析と最初の映像出力に時間がかかるため、ONAir 遷移後の初回出力を長めに待つ
     ENCODER_TS_READ_TIMEOUT_ONAIR_BS4K: ClassVar[int] = 15
-    # Opus と一般的なブラウザ再生経路が扱える最大チャンネル数。ISDB-S3 demuxer の入力段階で適用する
-    ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS: ClassVar[int] = 8
+    # Opus と一般的なブラウザ再生経路が扱える最大チャンネル数。ISDB-S3 demuxer の入力段階で適用する。
+    # Resolver が音声トラックを選択する際の除外条件と同じ値を共有する
+    ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS: ClassVar[int] = (
+        KonomiTVBS4KTLVServiceResolver.MAX_TRANSCODABLE_AUDIO_CHANNELS
+    )
 
     # 降雨対応放送 (低階層) が割り当てられている主サービスだけを明示する。
     # Channel Stream API は同じトランスポンダの全サービスを含むため、全局へ SID + 2 を適用すると
@@ -126,6 +135,27 @@ class LiveEncodingTask:
 
         # エンコードタスクのリトライ回数のカウント
         self._retry_count = 0
+
+
+    @staticmethod
+    def isOffTheAir(channel: Channel, program_present: Program | None) -> bool:
+        """
+        現在番組の状態から放送休止中と判断できるかを返す。
+
+        Args:
+            channel (Channel): 視聴対象のチャンネル。
+            program_present (Program | None): 現在の番組情報。
+
+        Returns:
+            bool: 放送休止中と判断できる場合は True。
+        """
+
+        # ワンセグでは放送中でも EPG が欠落するため、番組情報がないこと自体を停波の根拠にしない。
+        if channel.is_oneseg is True and (
+            program_present is None or program_present.title == '番組情報がありません'
+        ):
+            return False
+        return program_present is None or program_present.isOffTheAirProgram()
 
 
     @staticmethod
@@ -204,6 +234,7 @@ class LiveEncodingTask:
 
         return (
             self.IsStreamAnchorEnabled() is True and
+            self.live_stream.quality != 'original' and
             is_radiochannel is False and
             is_oneseg is False and
             is_mmt_tlv is False
@@ -222,9 +253,13 @@ class LiveEncodingTask:
         """
 
         self.live_stream.is_rain_fallback_broadcasting = broadcasting
+        # original は QUALITY に無く、降雨対応 SID の TLV 経路でもない
+        live_quality = self.live_stream.quality
+        if live_quality == 'original':
+            return False
         should_use_rain_fallback = (
             self.live_stream.encoding_options.use_rain_fallback is True and
-            QUALITY[self.live_stream.quality].height <= 1080 and
+            QUALITY[live_quality].height <= 1080 and
             broadcasting is True
         )
         if (
@@ -342,12 +377,14 @@ class LiveEncodingTask:
         ) is True:
             options.append('--stream-anchor-v1')
         if is_radiochannel is False and video_codec == 'av1':
+            live_quality = self.live_stream.quality
+            assert live_quality != 'original'
             muxrate = ResolveKonomiTVBS4KAdvancedLiveMuxrate(
                 ResolveKonomiTVBS4KPlaybackVideoBitrate(
-                    self.live_stream.quality,
+                    live_quality,
                     video_codec,
                 ).video_bitrate_max,
-                quality = self.live_stream.quality,
+                quality = live_quality,
                 video_codec = video_codec,
             )
             options += [
@@ -365,8 +402,12 @@ class LiveEncodingTask:
         is_fullhd_channel: bool,
         is_oneseg: bool = False,
         is_mmt_tlv: bool = False,
-        tlv_main_context_id: int | None = None,
-        tlv_rain_context_id: int | None = None,
+        tlv_main_video_packet_id: int | None = None,
+        tlv_main_audio_packet_id: int | None = None,
+        tlv_rain_video_packet_id: int | None = None,
+        tlv_normal_excluded_context_ids: tuple[int, ...] = (),
+        tlv_rain_excluded_context_ids: tuple[int, ...] = (),
+        tlv_main_audio_packet_ids: tuple[int, ...] = (),
     ) -> list[str]:
         """現 main の単一 pipeline 向け FFmpeg 8 HW エンコードオプションを返す。"""
 
@@ -399,7 +440,8 @@ class LiveEncodingTask:
             )
             if selected_device is None:
                 # legacy URLはtargeted probeを通らないため、その場合だけ同vendorの先頭候補へ退避する。
-                render_devices = RecordedPlaybackBackend.discoverRenderDevices(encoder_type)
+                # 固定指定がある場合は resolveRenderDevices がその render node だけを返す (vendor 不一致時は自動選択へ退避)。
+                render_devices = RecordedPlaybackBackend.resolveRenderDevices(encoder_type)
                 if len(render_devices) == 0:
                     raise RuntimeError(f'No compatible render device was found for {encoder_type}.')
                 selected_device = render_devices[0]
@@ -429,10 +471,13 @@ class LiveEncodingTask:
                 '-filter_hw_device', 'live_vaapi',
             ]
             if use_software_decode is False:
+                # VAAPI hwaccel の decoder 名は hevc (native) のままだが、出力面は vaapi。
+                # extra_hw_frames を足して 4K60 の参照フレーム不足で SW へ落ちないようにする。
                 options += [
                     '-hwaccel', 'vaapi',
                     '-hwaccel_device', 'live_vaapi',
                     '-hwaccel_output_format', 'vaapi',
+                    '-extra_hw_frames', '16',
                 ]
 
         input_probesize: str | None = None
@@ -465,16 +510,31 @@ class LiveEncodingTask:
             '-analyzeduration', str(analyzeduration), '-i', 'pipe:0',
             '-ignore_unknown',
         ]
-        # TLV かつ context_id が解決済みなら、映像・音声を context_id で固定する。
-        # 字幕・データ放送 (data) は低階層には存在しないため、0:d? のまま高階層から得られる。
-        if is_mmt_tlv is True and tlv_main_context_id is not None:
+        # TLV では context_id が主・低階層で共通になり得るため、Resolver が MPT から選んだ
+        # packet_id で映像・音声を一意に固定する。字幕・データ放送 (data) は低階層には存在しないため、
+        # 0:d? のまま高階層から得られる。
+        if is_mmt_tlv is True:
+            if tlv_main_video_packet_id is None or tlv_main_audio_packet_id is None:
+                raise RuntimeError('MMT/TLV main video/audio packet IDs are not resolved.')
             # 降雨対応時は映像だけ低階層、音声は高階層。それ以外は映像・音声とも高階層。
-            video_context_id = tlv_rain_context_id if tlv_rain_context_id is not None else tlv_main_context_id
-            options += [
-                '-map', f'0:v:m:context_id:{video_context_id}',
-                '-map', f'0:a:m:context_id:{tlv_main_context_id}',
-                '-map', '0:d?',
-            ]
+            video_packet_id = (
+                tlv_rain_video_packet_id
+                if tlv_rain_video_packet_id is not None else tlv_main_video_packet_id
+            )
+            audio_packet_ids = tlv_main_audio_packet_ids or (tlv_main_audio_packet_id,)
+            options += ['-map', f'0:i:{video_packet_id}']
+            for audio_packet_id in audio_packet_ids:
+                options += ['-map', f'0:i:{audio_packet_id}']
+            options += ['-map', '0:d?']
+            # -map 0:i:<packet_id> は context を跨いでマッチするため、別 context が同じ packet_id を
+            # 使うと複数ストリームが map される。FFmpeg は正の map を先に評価するため、後ろに付けた
+            # 負の metadata map で衝突元 context の誤マッチ分 (他サービスの data を含む) だけを除外する
+            excluded_context_ids = (
+                tlv_rain_excluded_context_ids
+                if tlv_rain_video_packet_id is not None else tlv_normal_excluded_context_ids
+            )
+            for excluded_context_id in excluded_context_ids:
+                options += ['-map', f'-0:m:context_id:{excluded_context_id}']
         else:
             options += [
                 '-map', '0:v:0',
@@ -490,12 +550,14 @@ class LiveEncodingTask:
         )
 
         # SW 処理後に HW エンコーダーへ渡すための upload filter。
-        # AMF は system memory の NV12 / P010 をそのまま受け取るため upload は不要。
+        # AMF 公開名でも実エンコードは VAAPI なので、SW 経路では hwupload が必要。
         upload_filters: list[str] = []
         if encoder_type == 'QSV':
             upload_filters = ['hwupload=extra_hw_frames=64']
         elif encoder_type == 'NVENC':
             upload_filters = ['hwupload_cuda']
+        elif encoder_type == 'AMF':
+            upload_filters = ['hwupload']
 
         filters: list[str] = []
         if use_software_decode is True:
@@ -549,7 +611,7 @@ class LiveEncodingTask:
         if encoder_type == 'NVENC':
             options += ['-pix_fmt', 'cuda']
         elif encoder_type == 'AMF':
-            options += ['-pix_fmt', codec_spec.encoder_pixel_format]
+            options += ['-pix_fmt', 'vaapi']
         if encoder_type == 'QSV':
             options += ['-preset', 'medium', '-async_depth', '1', '-bf', '0']
             # look_ahead は h264_qsv 固有。HEVC / VP9 / AV1 へ渡すと未使用警告になり、
@@ -562,7 +624,8 @@ class LiveEncodingTask:
                 '-spatial-aq', '1', '-temporal-aq', '1', '-zerolatency', '1', '-bf', '0',
             ]
         else:
-            options += ['-quality', 'balanced', '-rc', 'vbr_latency', '-usage', 'lowlatency', '-bf', '0']
+            # h264_vaapi / hevc_vaapi は AMF 固有の -quality / -rc vbr_latency を受け付けない。
+            options += ['-bf', '0', '-rc_mode', 'VBR']
 
         if codec == 'hevc':
             options += [
@@ -577,6 +640,11 @@ class LiveEncodingTask:
         elif codec == 'av1' and encoder_type != 'NVENC':
             # av1_nvenc は profile オプション自体を公開しない。QSV / AMF は main を受け付ける。
             options += ['-profile:v', 'main']
+
+        if encoder_type == 'AMF' and codec == 'hevc':
+            # Mesa VCN は HEVC の符号化面を 64x16 境界へ拡張するため、packed SPS で padding を事前通知する。
+            # driver に通知せず後段で SPS だけを補正すると、padding が未初期化のまま Firefox に露出する。
+            options += ['-mesa_hevc_alignment', '1']
 
         if is_oneseg is True:
             # ワンセグ入力は約 10～15fps の VFR だが、固定 muxrate / PCR と再生安定のため 15fps CFR へ正規化する。
@@ -691,8 +759,12 @@ class LiveEncodingTask:
         is_fullhd_channel: bool,
         is_oneseg: bool = False,
         is_mmt_tlv: bool = False,
-        tlv_main_context_id: int | None = None,
-        tlv_rain_context_id: int | None = None,
+        tlv_main_video_packet_id: int | None = None,
+        tlv_main_audio_packet_id: int | None = None,
+        tlv_rain_video_packet_id: int | None = None,
+        tlv_normal_excluded_context_ids: tuple[int, ...] = (),
+        tlv_rain_excluded_context_ids: tuple[int, ...] = (),
+        tlv_main_audio_packet_ids: tuple[int, ...] = (),
     ) -> list[str]:
         """
         FFmpeg に渡すオプションを組み立てる
@@ -703,8 +775,12 @@ class LiveEncodingTask:
             is_fullhd_channel (bool): フル HD 放送が実施されているチャンネルかどうか
             is_oneseg (bool): ワンセグサービスかどうか
             is_mmt_tlv (bool): MMT/TLV 入力かどうか
-            tlv_main_context_id (int | None): 主サービス (高階層) の context_id
-            tlv_rain_context_id (int | None): 降雨対応サービス (低階層) の context_id
+            tlv_main_video_packet_id (int | None): 主映像トラックの packet_id
+            tlv_main_audio_packet_id (int | None): 主音声トラックの packet_id
+            tlv_rain_video_packet_id (int | None): 選択中の降雨対応映像トラックの packet_id
+            tlv_normal_excluded_context_ids (tuple[int, ...]): 通常モードで負の map により除外する context_id 一覧
+            tlv_rain_excluded_context_ids (tuple[int, ...]): 降雨対応モードで負の map により除外する context_id 一覧
+            tlv_main_audio_packet_ids (tuple[int, ...]): 主 context にある map 可能な全音声の packet_id
 
         Returns:
             list[str]: FFmpeg に渡すオプションが連なる配列
@@ -867,14 +943,33 @@ class LiveEncodingTask:
                     options.append(f'-r 30000/1001 -g {int(gop_length_second * 30)}')
 
         # 音声
-        # TLV かつ context_id が解決済みなら、映像・音声を context_id で固定する。
-        # 字幕・データ放送 (data) は低階層には存在しないため、0:d? のまま高階層から得られる。
-        if is_mmt_tlv is True and tlv_main_context_id is not None:
+        # TLV では context_id が主・低階層で共通になり得るため、Resolver が MPT から選んだ
+        # packet_id で映像・音声を一意に固定する。字幕・データ放送 (data) は低階層には存在しないため、
+        # 0:d? のまま高階層から得られる。
+        if is_mmt_tlv is True:
+            if tlv_main_video_packet_id is None or tlv_main_audio_packet_id is None:
+                raise RuntimeError('MMT/TLV main video/audio packet IDs are not resolved.')
             # 降雨対応時は映像だけ低階層、音声は高階層。それ以外は映像・音声とも高階層。
-            video_context_id = tlv_rain_context_id if tlv_rain_context_id is not None else tlv_main_context_id
+            video_packet_id = (
+                tlv_rain_video_packet_id
+                if tlv_rain_video_packet_id is not None else tlv_main_video_packet_id
+            )
+            audio_packet_ids = tlv_main_audio_packet_ids or (tlv_main_audio_packet_id,)
+            # -map 0:i:<packet_id> は context を跨いでマッチするため、別 context が同じ packet_id を
+            # 使うと複数ストリームが map される。FFmpeg は正の map を先に評価するため、後ろに付けた
+            # 負の metadata map で衝突元 context の誤マッチ分 (他サービスの data を含む) だけを除外する
+            excluded_context_ids = (
+                tlv_rain_excluded_context_ids
+                if tlv_rain_video_packet_id is not None else tlv_normal_excluded_context_ids
+            )
+            exclusion_maps = ''.join(
+                f' -map -0:m:context_id:{excluded_context_id}'
+                for excluded_context_id in excluded_context_ids
+            )
             options.append(
-                f'-map 0:v:m:context_id:{video_context_id} '
-                f'-map 0:a:m:context_id:{tlv_main_context_id} -map 0:d?'
+                f'-map 0:i:{video_packet_id} '
+                + ' '.join(f'-map 0:i:{audio_packet_id}' for audio_packet_id in audio_packet_ids)
+                + f' -map 0:d?{exclusion_maps}'
             )
         else:
             options.append('-map 0:v:0 -map 0:a? -map 0:d?')
@@ -1323,13 +1418,17 @@ class LiveEncodingTask:
         KonomiTVBS4KTLVStreamPump,
         KonomiTVBS4KTLVRainFallbackMonitor | None,
         int,
+        int,
         int | None,
+        tuple[int, ...],
+        tuple[int, ...],
+        tuple[int, ...],
     ] | None:
         """
         TLV のチューナー確保・ストリーム接続・先頭バッファのプローブを行う。
 
-        FFmpeg は -map に context_id が必要なため、エンコーダー生成前に同じ Channel Stream を開いて
-        先頭バッファを読み、主/降雨対応 SID の context_id を解決する。プローブ後は入力 pump を直ちに起動し、
+        FFmpeg は -map に一意な packet_id が必要なため、エンコーダー生成前に同じ Channel Stream を開いて
+        先頭バッファを読み、主/降雨対応トラックの packet_id を解決する。プローブ後は入力 pump を直ちに起動し、
         読み取った生バイトと後続入力をエンコーダー起動まで有限バッファへ保持する。
 
         Args:
@@ -1340,8 +1439,11 @@ class LiveEncodingTask:
 
         Returns:
             tuple[aiohttp.ClientSession, aiohttp.ClientResponse, KonomiTVBS4KTLVStreamPump,
-                KonomiTVBS4KTLVRainFallbackMonitor | None, int, int | None] | None:
-                (session, response, 入力 pump, 降雨対応monitor, 主 context_id, 選択する降雨対応 context_id)。
+                KonomiTVBS4KTLVRainFallbackMonitor | None, int, int, int | None,
+                tuple[int, ...], tuple[int, ...], tuple[int, ...]] | None:
+                (session, response, 入力 pump, 降雨対応monitor, 主映像 packet_id, 主音声 packet_id,
+                選択する降雨対応映像 packet_id, 通常モードの除外 context_id 一覧,
+                降雨対応モードの除外 context_id 一覧, map 可能な全音声 packet_id)。
                 接続に失敗した場合は None (Offline 遷移と disconnectAll はこの中で済ませる)。
         """
 
@@ -1390,9 +1492,9 @@ class LiveEncodingTask:
                         sock_read=mirakurun_stream_timeout,
                     ),
                 )
-            except (TimeoutError, aiohttp.ClientConnectorError):
+            except (TimeoutError, aiohttp.ClientConnectorError, ServerDisconnectedError):
                 # 番組名に「放送休止」などが入っていれば停波によるものとみなし、そうでないなら接続失敗とする
-                if program_present is None or program_present.isOffTheAirProgram():
+                if self.isOffTheAir(channel, program_present):
                     self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-01M)')
                 else:
                     self.live_stream.setStatus('Offline', 'チューナーへの接続に失敗しました。チューナー側に何らかの問題があるかもしれません。(E-01M)')
@@ -1425,16 +1527,20 @@ class LiveEncodingTask:
                 await closeConnection()
                 return None
 
-            # 先頭バッファを読んで主/降雨対応 SID の context_id を解決する。
+            # 先頭バッファを読んで主/降雨対応トラックの packet_id を解決する。
             # 画質 1080p 以下かつ降雨対応放送の自動利用が有効なときだけ降雨対応 SID が現れるまで待つ。
             # aiohttp.StreamReader の __aiter__ は readline (\n 区切り) のため、生 TLV を渡すと
             # 64KB を超える改行の無い入力で LineTooLong になり壊れる。iter_chunked で生バイト列を渡す。
             rain_service_id = self.RAIN_FALLBACK_SERVICE_IDS.get((channel.network_id, channel.service_id))
-            need_rain_fallback = (
-                self.live_stream.encoding_options.use_rain_fallback is True and
-                QUALITY[self.live_stream.quality].height <= 1080 and
-                rain_service_id is not None
-            )
+            if self.live_stream.quality == 'original':
+                # original は主階層だけを素通しし、降雨対応の低階層切替は行わない
+                need_rain_fallback = False
+            else:
+                need_rain_fallback = (
+                    self.live_stream.encoding_options.use_rain_fallback is True and
+                    QUALITY[self.live_stream.quality].height <= 1080 and
+                    rain_service_id is not None
+                )
             resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
                 response.content.iter_chunked(64 * 1024),
                 channel.service_id,
@@ -1443,11 +1549,11 @@ class LiveEncodingTask:
                 log_prefix = self.live_stream.log_prefix,
             )
 
-            if resolution.main_context_id is None:
-                # 主 SID の context_id が解決できない場合は、先着順に依存する 0:v:0 へ黙って落とさず失敗させる。
-                # 0:v:0 は降雨時に低階層映像を掴み得るため、本機能が直したい不具合そのもの。
+            if resolution.main_video_packet_id is None or resolution.main_audio_packet_id is None:
+                # 主映像・主音声の packet_id が解決できない場合は、複数トラックへ拡大し得る
+                # context_id map や先着順の 0:v:0 へ黙って落とさず失敗させる。
                 logging.warning(
-                    f'{self.live_stream.log_prefix} Failed to resolve the main service context_id from MMT/TLV. '
+                    f'{self.live_stream.log_prefix} Failed to resolve the main service packet IDs from MMT/TLV. '
                     f'(SID: {channel.service_id})'
                 )
                 await closeConnection()
@@ -1455,16 +1561,22 @@ class LiveEncodingTask:
                 self.live_stream.setStatus('Offline', 'TLV 入力から主サービスの情報を解決できませんでした。設定を確認してください。(E-19T)')
                 return None
 
-            # 自動利用の可否とは独立して対象SIDの送出状態を継続監視する。
+            # Resolver の互換フィールドは先頭の map 可能音声を保持する。全件情報がない呼び出しでも
+            # 従来どおり主音声1件へ退避し、実入力では component_tag 順の全音声を FFmpeg へ渡す。
+            main_audio_packet_ids = tuple(
+                track.packet_id for track in resolution.main_audio_tracks if track.is_mappable is True
+            ) or (resolution.main_audio_packet_id,)
+
+            # 自動利用の可否とは独立して対象SIDの送出状態と番組色ヒントを継続監視する。
             # 起動時Resolverで確定済みの状態は引き継ぎ、同じ先頭バッファを再解析して後続MPTへ連続させる。
-            if rain_service_id is not None:
-                rain_fallback_monitor = KonomiTVBS4KTLVRainFallbackMonitor(
-                    channel.service_id,
-                    rain_service_id,
-                    self.live_stream.log_prefix,
-                    resolution.is_rain_fallback_broadcasting,
-                )
-                rain_fallback_monitor.start()
+            # 降雨対象外の局でも B60 / MH-EIT を見るため、helper は TLV ライブで常に起動する。
+            rain_fallback_monitor = KonomiTVBS4KTLVRainFallbackMonitor(
+                channel.service_id,
+                rain_service_id,
+                self.live_stream.log_prefix,
+                resolution.is_rain_fallback_broadcasting,
+            )
+            rain_fallback_monitor.start()
 
             # Resolver が止まった直後から HTTP 応答を読み続け、FFmpeg 起動中の Mirakurun 側滞留を防ぐ。
             # 以後 response.content を直接読むのはこの pump だけに限定する。
@@ -1476,27 +1588,31 @@ class LiveEncodingTask:
             )
             stream_pump.start()
 
-            # 自動利用の実効条件を満たし、完全MPTにVideoがある場合だけ低階層を選択する。
+            # 自動利用の実効条件を満たし、完全MPTに主映像とは別の低階層Videoがある場合だけ選択する。
             # FFmpegの-mapは固定なので、以後の状態変化はControllerが計画再起動して反映する。
-            selected_rain_context_id = (
-                resolution.rain_context_id
+            selected_rain_video_packet_id = (
+                resolution.rain_video_packet_id
                 if need_rain_fallback is True and resolution.is_rain_fallback_broadcasting is True
                 else None
             )
-            self.live_stream.is_rain_fallback = selected_rain_context_id is not None
+            self.live_stream.is_rain_fallback = selected_rain_video_packet_id is not None
             self.live_stream.is_rain_fallback_broadcasting = resolution.is_rain_fallback_broadcasting
             self.live_stream.setStatus(
                 'Standby',
                 (
                     '降雨対応放送を使用してエンコードを開始しています…'
-                    if selected_rain_context_id is not None
+                    if selected_rain_video_packet_id is not None
                     else 'エンコードを開始しています…'
                 ),
             )
-            if selected_rain_context_id is not None:
+            # TLV プローブはチューナーロック待ちを含めて Standby 監視の許容時間 (20 秒) を超え得る。
+            # このままだとエンコーダー起動直後の Controller 初回判定がプローブ時間を無出力と誤認し、
+            # 正常なエンコーダーを再起動して接続中のクライアントを切断するため、監視基準時刻をリセットする。
+            self.live_stream.refreshStreamDataWrittenAt()
+            if selected_rain_video_packet_id is not None:
                 logging.info(
                     f'{self.live_stream.log_prefix} Rain fallback broadcast detected. '
-                    f'(SID: {rain_service_id})'
+                    f'(SID: {rain_service_id}, Packet ID: {selected_rain_video_packet_id})'
                 )
 
             return (
@@ -1504,14 +1620,29 @@ class LiveEncodingTask:
                 response,
                 stream_pump,
                 rain_fallback_monitor,
-                resolution.main_context_id,
-                selected_rain_context_id,
+                resolution.main_video_packet_id,
+                resolution.main_audio_packet_id,
+                selected_rain_video_packet_id,
+                resolution.normal_excluded_context_ids,
+                resolution.rain_excluded_context_ids,
+                main_audio_packet_ids,
             )
 
         except asyncio.CancelledError:
             # 選局キャンセル: 接続だけ閉じて再送出する (状態遷移は LiveStream.connect 側に任せる)。
             await closeConnection()
             raise
+        except ServerDisconnectedError as ex:
+            # Mirakurun が HTTP 200 応答後にストリームを切断した場合は、チューナー側の受信障害として案内する。
+            logging.error(f'{self.live_stream.log_prefix} The MMT/TLV stream was disconnected by Mirakurun.', exc_info=ex)
+            await closeConnection()
+            self.live_stream.disconnectAll()
+            self.live_stream.setStatus(
+                'Offline',
+                'チューナーから受信データが送られなかったか、受信中に接続が切断されました。'
+                'チューナー側の状態を確認してください。(E-20T)',
+            )
+            return None
         except Exception as ex:
             # 予期せぬ失敗: 接続を閉じ、Offline へ遷移して次回 connect() で再試行できるようにする。
             # ここで Standby のまま例外終了すると、次回 connect() がタスクを起こせなくなる。
@@ -1594,9 +1725,15 @@ class LiveEncodingTask:
 
         CONFIG = Config()
 
+        # オリジナル画質 ("original") が指定された場合のみ、mpeg2toh264 での変換・再生を前提に、
+        # tsreadex からの出力をそのままストリーミングする
+        is_original_quality = self.live_stream.quality == 'original'
+
         # 現世代のmapと継続監視が確定するまで、前世代の降雨対応放送状態を表示しない。
         self.live_stream.is_rain_fallback = None
         self.live_stream.is_rain_fallback_broadcasting = None
+        self.live_stream.b60_video_transfer = None
+        self.live_stream.mh_eit_hdr_hint = None
 
         # まだ Standby になっていなければ、ステータスを Standby に設定
         # 基本はエンコードタスクの呼び出し元である self.live_stream.connect() の方で Standby に設定されるが、再起動の場合はそこを経由しないため必要
@@ -1661,18 +1798,23 @@ class LiveEncodingTask:
                 return
 
         # TLV 経路はエンコーダー生成前にチューナー接続と先頭バッファのプローブを行うため、
-        # 放送波の受信元と context_id をここで事前初期化する。MPEG-TS 経路も同じ変数を使うが、
+        # 放送波の受信元と FFmpeg map 用 packet_id をここで事前初期化する。MPEG-TS 経路も同じ変数を使うが、
         # そちらではチューナー接続後に設定する。
         ## 放送波の MPEG2-TS / 生 TLV を受信する StreamReader
         stream_reader: asyncio.StreamReader | PipeStreamReader | aiohttp.StreamReader | None = None
         ## Mirakurun の aiohttp セッションとレスポンス (EDCB バックエンド利用時は常に None)
         response: aiohttp.ClientResponse | None = None
         session: aiohttp.ClientSession | None = None
-        ## TLV のプローブ後から HTTP 入力を読み続けるpump、降雨対応monitor、解決済みのcontext_id
+        ## TLV のプローブ後から HTTP 入力を読み続けるpump、降雨対応monitor、FFmpeg map用の packet_id
+        ## と、packet_id が他 context と衝突した場合に負の map で除外する context_id 一覧 (通常/降雨対応)
         tlv_stream_pump: KonomiTVBS4KTLVStreamPump | None = None
         tlv_rain_fallback_monitor: KonomiTVBS4KTLVRainFallbackMonitor | None = None
-        tlv_main_context_id: int | None = None
-        tlv_rain_context_id: int | None = None
+        tlv_main_video_packet_id: int | None = None
+        tlv_main_audio_packet_id: int | None = None
+        tlv_main_audio_packet_ids: tuple[int, ...] = ()
+        tlv_rain_video_packet_id: int | None = None
+        tlv_normal_excluded_context_ids: tuple[int, ...] = ()
+        tlv_rain_excluded_context_ids: tuple[int, ...] = ()
 
         # 3つのバックエンド構成のどれで動作しているかと、実際に選局するサービスを明示する
         ## 接続 URL は認証情報やローカル環境情報を含む可能性があるためログへ出力しない。
@@ -1741,24 +1883,28 @@ class LiveEncodingTask:
             '-A', '1',
             # 字幕ストリームが常に存在する状態にする
             ## ストリームが存在しない場合、PMT の項目が補われて出力される
-            ## 実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する
-            '-c', '5',
+            ## エンコード済み画質は実際の字幕データが現れない場合に5秒ごとに非表示の適当なデータを挿入する
+            ## original はエンコーダーを通さないため、PMT 補完だけにする
+            '-c', '1' if is_original_quality is True else '5',
             # 文字スーパーストリームが常に存在する状態にする
             ## ストリームが存在しない場合、PMT の項目が補われて出力される
             '-u', '1',
+        ]
+
+        # オリジナル画質 (mpeg2toh264 で再生) ではエンコーダーを通さないため、
+        # 字幕の ID3 変換 (-d) と Stream Anchor 用 source marker (-g) を付けない
+        if is_original_quality is False:
             # 字幕と文字スーパーを aribb24.js が解釈できる ID3 timed-metadata に変換する
             ## +4: FFmpeg のバグを打ち消すため、変換後のストリームに規格外の5バイトのデータを追加する
             ## +8: FFmpeg のエラーを防ぐため、変換後のストリームの PTS が単調増加となるように調整する
             ## 以前は Linux 版 HWEncC が FFmpeg 4.4 系の共有ライブラリに依存していたため +4 を付与していたが、
             ## 現在の Linux 版 HWEncC は FFmpeg 8 系を静的リンクした最新版へ更新したため不要になった
             ## +4 を残すと FFmpeg 6.1 以降では字幕が表示されなくなるため、常に +8 のみを付与する
-            '-d', '9',
-        ]
-
-        # Encoder 前の source marker は実行ごとの generation ID で識別し、
-        # Encoder 後に TS Codec Bridge が実際の映像 AU 時刻へ確定する。
-        if stream_anchor_generation_id is not None:
-            tsreadex_options += ['-g', str(stream_anchor_generation_id)]
+            tsreadex_options += ['-d', '9']
+            # Encoder 前の source marker は実行ごとの generation ID で識別し、
+            # Encoder 後に TS Codec Bridge が実際の映像 AU 時刻へ確定する。
+            if stream_anchor_generation_id is not None:
+                tsreadex_options += ['-g', str(stream_anchor_generation_id)]
 
         if CONFIG.tv.debug_mode_ts_path is None:
             # 通常は標準入力を指定
@@ -1850,15 +1996,19 @@ class LiveEncodingTask:
                 response,
                 tlv_stream_pump,
                 tlv_rain_fallback_monitor,
-                tlv_main_context_id,
-                tlv_rain_context_id,
+                tlv_main_video_packet_id,
+                tlv_main_audio_packet_id,
+                tlv_rain_video_packet_id,
+                tlv_normal_excluded_context_ids,
+                tlv_rain_excluded_context_ids,
+                tlv_main_audio_packet_ids,
             ) = tlv_stream_result
 
         try:
             # ***** エンコーダープロセスの作成と実行 *****
 
             # MPEG-TS 経路ではエンコーダーを先に起動してからチューナーへ接続する。
-            # TLV 経路は context_id の事前解決が必要なため既に接続済みだが、入力 pump が起動中も読み続けている。
+            # TLV 経路は packet_id の事前解決が必要なため既に接続済みだが、入力 pump が起動中も読み続けている。
 
             # フル HD 放送が行われているチャンネルかを取得
             is_fullhd_channel = (
@@ -1914,18 +2064,134 @@ class LiveEncodingTask:
             encoder_environment = RecordedPlaybackBackend.getEnvironment(ffmpeg8_encoder_type)
             encoder_stdin = asyncio.subprocess.PIPE if is_mmt_tlv is True else tsreadex_read_pipe
 
+            # BS4K のオリジナル画質 ("original") は MMT/TLV 入力のため、そのままでは MPEG-TS として素通しできない。
+            # FFmpeg 8 の libaribtlv で TS へ多重化し直すだけの無変換プロセスを「エンコーダー」として起動する
+            # (再エンコード・tsreadex・TS Codec Bridge なし)。
+            if is_original_quality is True and is_mmt_tlv is True:
+                if tlv_main_video_packet_id is None or tlv_main_audio_packet_id is None:
+                    raise RuntimeError('MMT/TLV main video/audio packet IDs are not resolved.')
+                # -map 0:i:<packet_id> は context を跨いでマッチするため、通常モードの除外 context だけを
+                # 後ろの負の metadata map で除外する (original は降雨対応の低階層を使わない)。
+                tlv_original_copy_options = [
+                    '-fflags', 'nobuffer',
+                    '-f', 'libaribtlv',
+                    '-max_audio_channels', str(self.ISDB_S3_MAX_TRANSCODABLE_AUDIO_CHANNELS),
+                    *(
+                        [
+                            '-probesize',
+                            f'{round(CONFIG.general.encoder_bs4k_input_probesize + (self._retry_count * 500))}K',
+                        ]
+                        if CONFIG.general.encoder_bs4k_input_analysis_enabled is True else []
+                    ),
+                    '-analyzeduration', str(round(
+                        (CONFIG.general.encoder_bs4k_input_analyze * 1_000_000) +
+                        (self._retry_count * 200_000),
+                    )),
+                    '-i', 'pipe:0',
+                    '-ignore_unknown',
+                    '-map', f'0:i:{tlv_main_video_packet_id}',
+                    *(
+                        option
+                        for audio_packet_id in (tlv_main_audio_packet_ids or (tlv_main_audio_packet_id,))
+                        for option in ('-map', f'0:i:{audio_packet_id}')
+                    ),
+                    '-map', '0:d?',
+                    *(
+                        option
+                        for excluded_context_id in tlv_normal_excluded_context_ids
+                        for option in ('-map', f'-0:m:context_id:{excluded_context_id}')
+                    ),
+                    '-c', 'copy',
+                    '-max_delay', '250000',
+                    '-max_interleave_delta', f'{round(CONFIG.general.encoder_bs4k_max_interleave_delta + (self._retry_count * 100))}K',
+                    '-flush_packets', '1',
+                    '-y',
+                    '-f', 'mpegts',
+                    'pipe:1',
+                ]
+                logging.info(
+                    f'{self.live_stream.log_prefix} FFmpeg 8 Commands (Original MMT/TLV transmux):\n'
+                    f'{encoder_executable} {" ".join(tlv_original_copy_options)}'
+                )
+
+                # エンコーダープロセスを非同期で作成・実行
+                try:
+                    encoder = await asyncio.subprocess.create_subprocess_exec(
+                        encoder_executable,
+                        *tlv_original_copy_options,
+                        stdin = encoder_stdin,  # 同期済み TLV からの入力
+                        stdout = encoder_stdout,  # ストリーム出力へ接続
+                        stderr = asyncio.subprocess.DEVNULL,  # original は EncoderObServer を起動しないため読まない
+                        env = encoder_environment,
+                    )
+                finally:
+                    # tsreadex は TLV 経路では起動しないため閉じるパイプはない
+                    if tsreadex_read_pipe is not None:
+                        os.close(tsreadex_read_pipe)
+                        tsreadex_read_pipe = None
+
+            # オリジナル画質 ("original") 指定時のみ、Python で単に左から右にパイプで流すだけの無変換プロセスを「エンコーダー」として起動する
+            ## KonomiTV の既存ロジックはエンコーダーレスで配信することを想定した設計になっておらず、
+            ## エンコーダーに相当するプロセスがないと特別な条件分岐を大量追加する必要が出てくるため、当面この方向で対応する
+            elif is_original_quality is True:
+                copy_script = (
+                    'import os\n'
+                    'while True:\n'
+                    '    data = os.read(0, 65536)\n'
+                    '    if not data:\n'
+                    '        break\n'
+                    '    offset = 0\n'
+                    '    while offset < len(data):\n'
+                    '        offset += os.write(1, data[offset:])\n'
+                )
+                logging.info(f'{self.live_stream.log_prefix} Original MPEG-TS stream passthrough is starting.')
+
+                # エンコーダープロセスを非同期で作成・実行
+                try:
+                    encoder = await asyncio.subprocess.create_subprocess_exec(
+                        sys.executable,
+                        '-u',
+                        '-c',
+                        copy_script,
+                        stdin = encoder_stdin,
+                        stdout = encoder_stdout,
+                        stderr = asyncio.subprocess.DEVNULL,
+                    )
+                finally:
+                    # tsreadex の読み込み用パイプは子プロセスに渡したので、親プロセス側ではクローズする
+                    if tsreadex_read_pipe is not None:
+                        os.close(tsreadex_read_pipe)
+                        tsreadex_read_pipe = None
+
             # FFmpeg software backend
-            if ENCODER_TYPE == 'FFmpeg':
+            elif ENCODER_TYPE == 'FFmpeg':
 
                 # オプションを取得
                 # ラジオチャンネルかどうかでエンコードオプションを切り替え
                 if channel.is_radiochannel is True:
                     encoder_options = self.buildFFmpegOptionsForRadio()
                 else:
-                    encoder_options = self.buildFFmpegOptions(
-                        self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg, is_mmt_tlv,
-                        tlv_main_context_id, tlv_rain_context_id,
-                    )
+                    assert self.live_stream.quality != 'original'
+                    if is_mmt_tlv is True:
+                        encoder_options = self.buildFFmpegOptions(
+                            self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg, is_mmt_tlv,
+                            tlv_main_video_packet_id,
+                            tlv_main_audio_packet_id,
+                            tlv_rain_video_packet_id,
+                            tlv_normal_excluded_context_ids,
+                            tlv_rain_excluded_context_ids,
+                            tlv_main_audio_packet_ids=tlv_main_audio_packet_ids,
+                        )
+                    else:
+                        # MPEG-TS 経路は既存の呼び出し契約を維持し、TLV 専用引数を渡さない。
+                        encoder_options = self.buildFFmpegOptions(
+                            self.live_stream.quality, channel.type, is_fullhd_channel, channel.is_oneseg, is_mmt_tlv,
+                            tlv_main_video_packet_id,
+                            tlv_main_audio_packet_id,
+                            tlv_rain_video_packet_id,
+                            tlv_normal_excluded_context_ids,
+                            tlv_rain_excluded_context_ids,
+                        )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 Commands:\n'
                     f'{encoder_executable} {" ".join(encoder_options)}'
@@ -1956,11 +2222,30 @@ class LiveEncodingTask:
             else:
 
                 # オプションを取得
+                assert self.live_stream.quality != 'original'
                 hw_encoder_type = ENCODER_TYPE
-                encoder_options = self.buildFFmpeg8HardwareOptions(
-                    self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
-                    channel.is_oneseg, is_mmt_tlv, tlv_main_context_id, tlv_rain_context_id,
-                )
+                if is_mmt_tlv is True:
+                    encoder_options = self.buildFFmpeg8HardwareOptions(
+                        self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
+                        channel.is_oneseg, is_mmt_tlv,
+                        tlv_main_video_packet_id,
+                        tlv_main_audio_packet_id,
+                        tlv_rain_video_packet_id,
+                        tlv_normal_excluded_context_ids,
+                        tlv_rain_excluded_context_ids,
+                        tlv_main_audio_packet_ids=tlv_main_audio_packet_ids,
+                    )
+                else:
+                    # MPEG-TS 経路は既存の呼び出し契約を維持し、TLV 専用引数を渡さない。
+                    encoder_options = self.buildFFmpeg8HardwareOptions(
+                        self.live_stream.quality, hw_encoder_type, channel.type, is_fullhd_channel,
+                        channel.is_oneseg, is_mmt_tlv,
+                        tlv_main_video_packet_id,
+                        tlv_main_audio_packet_id,
+                        tlv_rain_video_packet_id,
+                        tlv_normal_excluded_context_ids,
+                        tlv_rain_excluded_context_ids,
+                    )
                 logging.info(
                     f'{self.live_stream.log_prefix} FFmpeg 8 ({ENCODER_TYPE}) Commands:\n'
                     f'{encoder_executable} {" ".join(encoder_options)}'
@@ -2108,7 +2393,7 @@ class LiveEncodingTask:
                 except (TimeoutError, aiohttp.ClientConnectorError):
 
                     # 番組名に「放送休止」などが入っていれば停波によるものとみなし、そうでないならチューナーへの接続に失敗したものとする
-                    if program_present is None or program_present.isOffTheAirProgram():
+                    if self.isOffTheAir(channel, program_present):
                         self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-01M)')
                     else:
                         self.live_stream.setStatus('Offline', 'チューナーへの接続に失敗しました。チューナー側に何らかの問題があるかもしれません。(E-01M)')
@@ -2296,7 +2581,10 @@ class LiveEncodingTask:
                             ## 放送波の tsreadex への書き込みを最優先で行うため、非同期タスクとして実行する
                             ## ここで tsreadex への書き込みがブロックされると放送波の受信ループが止まり、ライブストリームの異常終了に繋がりかねない
                             if is_mmt_tlv is False and self.live_stream.psi_data_archiver is not None:
-                                background_tasks.add(asyncio.create_task(self.live_stream.psi_data_archiver.pushTSPacketData(chunk)))
+                                psi_push_task = asyncio.create_task(self.live_stream.psi_data_archiver.pushTSPacketData(chunk))
+                                background_tasks.add(psi_push_task)
+                                # 完了した短命タスクを取り除き、視聴時間に比例して強参照が蓄積しないようにする
+                                psi_push_task.add_done_callback(background_tasks.discard)
 
                             # BS4K ライブ開始直後の不安定な TS はエンコーダーへ渡さず破棄する
                             if startup_discard_until > 0 and time.monotonic() < startup_discard_until:
@@ -2365,9 +2653,12 @@ class LiveEncodingTask:
             ## そうしないと稀にパケロスするらしく、ブラウザ側で突如再生できなくなることがある
             writer_lock = asyncio.Lock()
 
+            # オリジナル画質向け: ライブストリームへ書き込んだ TS データの累積バイト数
+            original_quality_bytes_written: int = 0
+
             async def Writer() -> None:
 
-                nonlocal chunk_buffer, chunk_written_at, writer_lock
+                nonlocal chunk_buffer, chunk_written_at, writer_lock, original_quality_bytes_written
 
                 while True:
                     try:
@@ -2387,8 +2678,23 @@ class LiveEncodingTask:
                             if len(chunk_buffer) >= 65536:
 
                                 # エンコーダーからの出力をライブストリームの Queue に書き込む
+                                chunk_size = len(chunk_buffer)
                                 self.live_stream.writeStreamData(bytes(chunk_buffer))
-                                # print(f'Writer:    Chunk size: {len(chunk_buffer):05} / Time: {time.time()}')
+                                # print(f'Writer:    Chunk size: {chunk_size:05} / Time: {time.time()}')
+
+                                # オリジナル画質 ("original") 指定時のみ、エンコーダーログがないため、
+                                # ライブストリームへ書き込んだ TS データ量からバッファリング完了を判定する
+                                if is_original_quality is True:
+                                    live_stream_status = self.live_stream.getStatus()
+                                    if live_stream_status.status == 'Standby':
+                                        original_quality_bytes_written += chunk_size
+                                        if original_quality_bytes_written < self.ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES:
+                                            if live_stream_status.detail != 'ストリーミングを開始しています…':
+                                                self.live_stream.setStatus('Standby', 'ストリーミングを開始しています…')
+                                        else:
+                                            self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
+                                            if self._retry_count > 0:
+                                                self._retry_count = 0
 
                                 # チャンクバッファを空にする（重要）
                                 chunk_buffer = bytearray()
@@ -2408,7 +2714,7 @@ class LiveEncodingTask:
             ## ラジオチャンネルは通常のチャンネルと比べてデータ量が圧倒的に少ないため、64KB に達することは稀で SubWriter でのチャンク書き込みがメインになる
             async def SubWriter() -> None:
 
-                nonlocal tuner_ts_read_at, tuner_ts_read_at_lock, chunk_buffer, chunk_written_at, writer_lock
+                nonlocal tuner_ts_read_at, tuner_ts_read_at_lock, chunk_buffer, chunk_written_at, writer_lock, original_quality_bytes_written
 
                 while True:
 
@@ -2423,8 +2729,23 @@ class LiveEncodingTask:
                         if (time.monotonic() - chunk_written_at) > 0.025 and (len(chunk_buffer) > 0):
 
                             # エンコーダーからの出力をライブストリームの Queue に書き込む
+                            chunk_size = len(chunk_buffer)
                             self.live_stream.writeStreamData(bytes(chunk_buffer))
-                            # print(f'SubWriter: Chunk size: {len(chunk_buffer):05} / Time: {time.time()}')
+                            # print(f'SubWriter: Chunk size: {chunk_size:05} / Time: {time.time()}')
+
+                            # オリジナル画質 ("original") 指定時のみ、エンコーダーログがないため、
+                            # ライブストリームへ書き込んだ TS データ量からバッファリング完了を判定する
+                            if is_original_quality is True:
+                                live_stream_status = self.live_stream.getStatus()
+                                if live_stream_status.status == 'Standby':
+                                    original_quality_bytes_written += chunk_size
+                                    if original_quality_bytes_written < self.ORIGINAL_QUALITY_ONAIR_BUFFER_BYTES:
+                                        if live_stream_status.detail != 'ストリーミングを開始しています…':
+                                            self.live_stream.setStatus('Standby', 'ストリーミングを開始しています…')
+                                    else:
+                                        self.live_stream.setStatus('ONAir', 'ライブストリームは ONAir です。')
+                                        if self._retry_count > 0:
+                                            self._retry_count = 0
 
                             # チャンクバッファを空にする（重要）
                             chunk_buffer = bytearray()
@@ -2544,7 +2865,7 @@ class LiveEncodingTask:
 
                     # 全 backend の FFmpeg 8 ログを同じ経路で診断する。
                     if 'Stream map \'0:v:0\' matches no streams.' in line:
-                        if program_present is None or program_present.isOffTheAirProgram():
+                        if self.isOffTheAir(channel, program_present):
                             self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-04F)')
                         else:
                             self.live_stream.setStatus('Offline', 'チューナーからの放送波の受信に失敗したため、エンコードを開始できません。(E-04F)')
@@ -2556,7 +2877,13 @@ class LiveEncodingTask:
                         'Error initializing an MFX session' in line or 'No device available' in line
                     ):
                         self.live_stream.setStatus('Offline', 'お使いの PC 環境は QSV エンコーダーに対応していません。(E-07HQ)')
-                    elif ENCODER_TYPE == 'AMF' and 'AMF failed to initialise' in line:
+                    # 公開名 AMF の実体は Mesa VAAPI のため、proprietary AMF ではなく
+                    # libva / render node の初期化失敗メッセージを検出する
+                    elif ENCODER_TYPE == 'AMF' and (
+                        'No VA display found' in line
+                        or 'Failed to initialise VAAPI connection' in line
+                        or 'Device creation failed' in line
+                    ):
                         self.live_stream.setStatus('Offline', 'お使いの PC 環境は AMF エンコーダーに対応していません。(E-10HV)')
                     elif 'Conversion failed!' in line:
                         result = self.live_stream.setStatus('Restart', 'エンコード中に予期しないエラーが発生しました。エンコードタスクを再起動しています… (ER-01F)')
@@ -2572,8 +2899,10 @@ class LiveEncodingTask:
                 if CONFIG.general.debug_encoder is True and encoder_log is not None:
                     await encoder_log.close()
 
-            # タスクを非同期で実行
-            background_tasks.add(asyncio.create_task(EncoderObServer()))
+            # オリジナル画質はエンコーダーログがないため、ログ監視を起動しない
+            if is_original_quality is False:
+                # タスクを非同期で実行
+                background_tasks.add(asyncio.create_task(EncoderObServer()))
 
             # Bridge の stderr を読み続け、pipe 満杯による停止を防ぎつつ失敗理由を保持する。
             bridge_lines: list[str] = []
@@ -2613,6 +2942,8 @@ class LiveEncodingTask:
                     # 正常系の計画再起動で切り替える。Unknownでは古い状態を推測せず、再起動しない。
                     if tlv_rain_fallback_monitor is not None:
                         broadcasting = tlv_rain_fallback_monitor.is_rain_fallback_broadcasting
+                        self.live_stream.b60_video_transfer = tlv_rain_fallback_monitor.b60_video_transfer
+                        self.live_stream.mh_eit_hdr_hint = tlv_rain_fallback_monitor.mh_eit_hdr_hint
                         if self.updateRainFallbackBroadcastingState(broadcasting) is True:
                             is_planned_rain_fallback_restart = True
                             break
@@ -2650,7 +2981,7 @@ class LiveEncodingTask:
                         if (time.monotonic() - tuner_ts_read_at) > tuner_read_timeout:
 
                             # 番組名に「放送休止」などが入っていれば停波の可能性が高い
-                            if program_present is None or program_present.isOffTheAirProgram():
+                            if self.isOffTheAir(channel, program_present):
                                 self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-11)')
 
                             # それ以外は受信エラーとする
@@ -2684,7 +3015,7 @@ class LiveEncodingTask:
                     if channel.type == 'BS4K':
                         encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR_BS4K
                     elif ENCODER_TYPE == 'AMF':
-                        encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR_VCEENCC
+                        encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR_AMD
                     else:
                         encoder_ts_read_timeout_onair = self.ENCODER_TS_READ_TIMEOUT_ONAIR
                     stream_data_last_write_time = time.time() - self.live_stream.getStreamDataWrittenAt()
@@ -2694,7 +3025,7 @@ class LiveEncodingTask:
                         # 番組名に「放送休止」などが入っている場合、チューナーから出力された放送波 TS に映像/音声ストリームが
                         # 含まれていない可能性が高いので、ここでエンコードタスクを停止する
                         ## 映像/音声ストリームが含まれていない場合は当然ながらエンコーダーはフリーズする
-                        if program_present is None or program_present.isOffTheAirProgram():
+                        if self.isOffTheAir(channel, program_present):
                             self.live_stream.setStatus('Offline', 'この時間は放送を休止しています。(E-13)')
 
                         # それ以外なら、エンコーダーの再起動で復帰できる可能性があるのでエンコードタスクを再起動する
@@ -2747,8 +3078,14 @@ class LiveEncodingTask:
                                     if not available_for_encode:
                                         self.live_stream.setStatus('Offline', 'お使いの NVIDIA GPU は H.265/HEVC でのエンコードに対応していません。(E-15HN)')
                                         break
-                                # AMF: H.265/HEVC でのエンコードに非対応の環境
-                                elif ENCODER_TYPE == 'AMF' and 'HW Acceleration of H.265/HEVC is not supported on this platform.' in line:
+                                # AMF (実体は Mesa VAAPI): H.265/HEVC でのエンコードに非対応の環境
+                                # VAAPI はドライバーが対応 profile を持たない場合 "No usable encoding profile found." を
+                                # 出力するが、このメッセージはコーデック非依存のため、誤検出を避けるよう HEVC 要求時に限定する
+                                elif (
+                                    ENCODER_TYPE == 'AMF'
+                                    and self.GetRequestedVideoCodec() == 'hevc'
+                                    and 'No usable encoding profile found.' in line
+                                ):
                                     self.live_stream.setStatus('Offline', 'お使いの AMD GPU は H.265/HEVC でのエンコードに対応していません。(E-16HV)')
                                     break
 

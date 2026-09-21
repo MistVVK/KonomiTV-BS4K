@@ -55,6 +55,7 @@ from app.metadata.RecordedSeriesSettings import (
 from app.metadata.SeriesTitleParser import (
     SERIES_TITLE_PARSER_VERSION,
     BuildSeriesGroupingKey,
+    DeriveTitleReadingFromTitle,
     NormalizeProgramText,
     ParseSeriesTitle,
     SeriesTitleParseResult,
@@ -1683,6 +1684,11 @@ class RecordedSeriesResolver:
                     using_db=connection,
                 )
 
+            # 手動作成もトランザクション確定後に外部補完へ渡し、未コミット行を同期タスクから参照しない。
+            if target_series is not None and target_series.tmdb_id is None:
+                from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
+                KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+
     @classmethod
     async def _applySeries(
         cls,
@@ -1727,12 +1733,19 @@ class RecordedSeriesResolver:
                     connection=connection,
                 )
             if series is None:
+                # AI 応答の読みを、カナのみタイトルの機械生成と併せて新規 Series へ保存する。
+                created_title_reading = (
+                    generated_metadata.title_reading
+                    if generated_metadata is not None
+                    else None
+                ) or DeriveTitleReadingFromTitle(title)
                 series = await Series.create(
                     title=title,
                     description=description,
                     genres=snapshot.genres,
                     canonical_key=canonical_key,
                     wikipedia_page_id=wikipedia_page_id,
+                    title_reading=created_title_reading,
                     using_db=connection,
                 )
             else:
@@ -1753,6 +1766,14 @@ class RecordedSeriesResolver:
                     if wikipedia_page_owner is None:
                         series.wikipedia_page_id = wikipedia_page_id
                         changed_fields.append('wikipedia_page_id')
+                # 読みは未設定時のみ保存し、既存値は AI 読みで上書きしない。
+                if (
+                    series.title_reading is None
+                    and generated_metadata is not None
+                    and generated_metadata.title_reading is not None
+                ):
+                    series.title_reading = generated_metadata.title_reading
+                    changed_fields.append('title_reading')
                 if len(changed_fields) > 0:
                     changed_fields.append('updated_at')
                     await series.save(update_fields=changed_fields, using_db=connection)
@@ -1870,7 +1891,11 @@ class RecordedSeriesResolver:
                 ai_model=ai_model,
                 connection=connection,
             )
-            return series
+        # Wikipedia 生成・既存ルール適用のどちらでも、新規の照合は保存確定後に予約する。
+        if series.tmdb_id is None:
+            from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
+            KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+        return series
 
     @classmethod
     async def _applyNotSeries(

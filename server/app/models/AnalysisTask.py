@@ -26,6 +26,7 @@ AnalysisTaskType = Literal[
     'BatchCMAnalysis',
     'BatchSeriesResolution',
     'BatchEpisodeResolution',
+    'BatchSeriesPipeline',
     'BackgroundAnalysis',
 ]
 AnalysisTaskStatus = Literal['Queued', 'Running', 'Succeeded', 'Failed', 'Interrupted', 'Skipped']

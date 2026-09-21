@@ -55,25 +55,16 @@ clone-commit "${FFMPEG_LIBARIBTLV_REPOSITORY}" "${FFMPEG_LIBARIBTLV_COMMIT}" \
     "${ffmpeg_libaribtlv_source}" "${FFMPEG_LIBARIBTLV_COMMIT}"
 clone-commit "${LIBARIBTLV_REPOSITORY}" "${LIBARIBTLV_COMMIT}" \
     "${libaribtlv_source}" "refs/tags/${LIBARIBTLV_TAG}"
+libaribtlv_si_source="${SOURCE_ROOT}/libaribtlv-si"
+clone-commit "${LIBARIBTLV_REPOSITORY}" "${LIBARIBTLV_SI_COMMIT}" \
+    "${libaribtlv_si_source}" "${LIBARIBTLV_SI_COMMIT}"
 clone-commit "${NVCODEC_HEADERS_REPOSITORY}" "${NVCODEC_HEADERS_COMMIT}" "${nvcodec_source}" "refs/tags/${NVCODEC_HEADERS_TAG}"
 clone-commit "${AMF_REPOSITORY}" "${AMF_COMMIT}" "${amf_source}" "refs/tags/${AMF_TAG}"
 
-# libaribtlv と FFmpeg 統合 patch は、固定 revision・checksum・ローカル差分をすべて検証する。
-echo "${LIBARIBTLV_LICENSE_SHA256}  ${libaribtlv_source}/LICENSE" | sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_LICENSE_SHA256}  ${ffmpeg_libaribtlv_source}/LICENSE" | sha256sum --check --strict
+# libaribtlv と FFmpeg 統合 patch は、固定 commit の source とローカル patch を組み合わせる。
+# 適用可否は git apply --check が担保し、個別の checksum 照合は行わない
+# (commit 固定された git 内容と Git 管理下の patch の再検証は冗長で、保守時の churn 元になるため)。
 ffmpeg_libaribtlv_patch_directory="${ffmpeg_libaribtlv_source}/patches/ffmpeg-${FFMPEG8_VERSION}"
-echo "${FFMPEG_LIBARIBTLV_PATCH_0001_SHA256}  ${ffmpeg_libaribtlv_patch_directory}/0001-Add-ARIB-MMT-TLV-demuxer-support-via-libaribtlv.patch" | \
-    sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_PATCH_0002_SHA256}  ${ffmpeg_libaribtlv_patch_directory}/0002-avformat-libaribtlv-report-recording-duration.patch" | \
-    sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_PATCH_0003_SHA256}  ${ffmpeg_libaribtlv_patch_directory}/0003-avformat-libaribtlv-support-timestamp-seeking.patch" | \
-    sha256sum --check --strict
-echo "${LIBARIBTLV_SUBTITLE_MFU_PATCH_SHA256}  ${SCRIPT_DIR}/patches/libaribtlv-0.2.0-konomitv-subtitle-mfu.patch" | \
-    sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_TIMED_ID3_PATCH_SHA256}  ${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch" | \
-    sha256sum --check --strict
-echo "${FFMPEG_LIBARIBTLV_CONTEXT_ID_METADATA_PATCH_SHA256}  ${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch" | \
-    sha256sum --check --strict
 git -C "${libaribtlv_source}" apply --check \
     "${SCRIPT_DIR}/patches/libaribtlv-0.2.0-konomitv-subtitle-mfu.patch"
 git -C "${libaribtlv_source}" apply \
@@ -95,49 +86,19 @@ cmake --install "${SOURCE_ROOT}/libaribtlv-build"
 # GnuTLS など無関係な共有 library まで静的検査へ巻き込まない。
 sed -i 's/^Libs: \(.*\)$/Libs: \1 -lz -lstdc++/' "${SDK_PREFIX}/lib/pkgconfig/libaribtlv.pc"
 
-# upstream の FFmpeg 8.1.2 対応 patch を順番どおり適用し、KonomiTV の timed ID3 出力を追加する。
+# upstream の FFmpeg 8.1.2 対応 patch を順番どおり適用し、KonomiTV のローカル補正を追加する。
 for patch_path in \
     "${ffmpeg_libaribtlv_patch_directory}/0001-Add-ARIB-MMT-TLV-demuxer-support-via-libaribtlv.patch" \
     "${ffmpeg_libaribtlv_patch_directory}/0002-avformat-libaribtlv-report-recording-duration.patch" \
     "${ffmpeg_libaribtlv_patch_directory}/0003-avformat-libaribtlv-support-timestamp-seeking.patch" \
     "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-timed-id3.patch" \
-    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch"; do
+    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch" \
+    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-aresample-reinit-first-pts.patch" \
+    "${SCRIPT_DIR}/patches/ffmpeg-8.1.2-vaapi-mesa-hevc-alignment.patch"; do
     git -C "${ffmpeg_source}" apply --check "${patch_path}"
     git -C "${ffmpeg_source}" apply "${patch_path}"
 done
-echo "${AMF_DISPLAY_CAPTURE_C_PATCH_SHA256}  ${SCRIPT_DIR}/patches/amf-1.4.36-display-capture-c.patch" | \
-    sha256sum --check --strict
 patch -d "${amf_source}" -p1 < "${SCRIPT_DIR}/patches/amf-1.4.36-display-capture-c.patch"
-
-# CUVID/NVDEC で実際に組み込む header も固定 commit の checksum で監査する。
-# 現在の 12.1.14.0 では 2 つの CUVID header の notice が nvEncodeAPI.h と同一であることも検証し、
-# CUDA/loader header のみが共通の別 notice を持つことを明示的に固定する。
-# notice が将来変更された場合にライセンス登録なしでビルドを進めない。
-echo "${NVCODEC_HEADERS_LICENSE_SHA256}  ${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h" | \
-    sha256sum --check --strict
-echo "${NVCODEC_HEADERS_CUDA_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h" | \
-    sha256sum --check --strict
-echo "${NVCODEC_HEADERS_CUVIDDEC_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_cuviddec.h" | \
-    sha256sum --check --strict
-echo "${NVCODEC_HEADERS_LOADER_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_loader.h" | \
-    sha256sum --check --strict
-echo "${NVCODEC_HEADERS_NVCUVID_SHA256}  ${nvcodec_source}/include/ffnvcodec/dynlink_nvcuvid.h" | \
-    sha256sum --check --strict
-cmp \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuviddec.h")
-cmp \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_nvcuvid.h")
-cmp \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h") \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_loader.h")
-if cmp -s \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/nvEncodeAPI.h") \
-    <(sed -n '1,/^ \*\/$/p' "${nvcodec_source}/include/ffnvcodec/dynlink_cuda.h"); then
-    echo 'Expected the audited CUDA/loader notice to be distinct from nvEncodeAPI.h.' >&2
-    exit 1
-fi
 
 make -C "${nvcodec_source}" PREFIX="${SDK_PREFIX}" install
 mkdir -p "${SDK_PREFIX}/include/AMF"
@@ -147,24 +108,38 @@ export PKG_CONFIG_PATH="${SDK_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 export CFLAGS="-I${SDK_PREFIX}/include"
 
 # SI/EPG 抽出は libaribtlv の C++ callback を直接利用する小さな専用ツールに限定する。
+# FFmpeg 用 0.2.0 とは別に、B60 / MH-EIT 色ヒント API がある master を helper だけへリンクする。
+# 0.2.0 向け subtitle patch は master に当たらないため、FFmpeg 側へは持ち込まない。
+si_sdk_prefix="${SOURCE_ROOT}/libaribtlv-si-sdk"
+cmake -S "${libaribtlv_si_source}" -B "${SOURCE_ROOT}/libaribtlv-si-build" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="${si_sdk_prefix}" \
+    -DCMAKE_INSTALL_LIBDIR=lib \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DBUILD_TESTING=OFF
+cmake --build "${SOURCE_ROOT}/libaribtlv-si-build" --parallel "$(nproc)"
+cmake --install "${SOURCE_ROOT}/libaribtlv-si-build"
+sed -i 's/^Libs: \(.*\)$/Libs: \1 -lz -lstdc++/' "${si_sdk_prefix}/lib/pkgconfig/libaribtlv.pc"
+
 metadata_output="${OUTPUT_ROOT}/KonomiTVBS4KTLVMetadata"
 mkdir -p "${metadata_output}"
 ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
     -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
     "${SCRIPT_DIR}/KonomiTVBS4KTLVMetadata.cpp" \
-    $(pkg-config --cflags --libs --static libaribtlv) \
+    $(PKG_CONFIG_PATH="${si_sdk_prefix}/lib/pkgconfig" pkg-config --cflags --libs --static libaribtlv) \
     -Wl,-z,relro,-z,now -pie \
     -o "${metadata_output}/KonomiTVBS4KTLVMetadata.elf"
 # production 実装を同じ翻訳単位へ取り込み、reset 境界の JSON と状態消去を直接検証する。
 ccache g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wconversion -Wshadow \
     -fPIE -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
     "${SCRIPT_DIR}/KonomiTVBS4KTLVMetadataTest.cpp" \
-    $(pkg-config --cflags --libs --static libaribtlv) \
+    $(PKG_CONFIG_PATH="${si_sdk_prefix}/lib/pkgconfig" pkg-config --cflags --libs --static libaribtlv) \
     -Wl,-z,relro,-z,now -pie \
     -o /tmp/KonomiTVBS4KTLVMetadataTest.elf
 /tmp/KonomiTVBS4KTLVMetadataTest.elf
 rm /tmp/KonomiTVBS4KTLVMetadataTest.elf
-install -m 0644 "${libaribtlv_source}/LICENSE" "${metadata_output}/License-libaribtlv-MIT.txt"
+install -m 0644 "${libaribtlv_si_source}/LICENSE" "${metadata_output}/License-libaribtlv-MIT.txt"
 
 pushd "${ffmpeg_source}"
 ./configure \

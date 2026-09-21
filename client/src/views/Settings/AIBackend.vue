@@ -8,8 +8,8 @@
             <span class="ml-2">AIバックエンド</span>
         </h2>
         <div class="settings__description">
-            録画シリーズ AI などで使う OpenCode 経由の外部モデル接続を管理します。<br>
-            API キーはサーバー上に暗号化せず安全な秘密ストアへ保存され、画面には表示されません。<br>
+            録画シリーズ判定で使う OpenCode・OpenAI 互換 API・ACP の接続を管理します。<br>
+            API キーはサーバー上に暗号化せず権限 0600 の専用ファイルへ保存され、画面や API 応答には返りません。<br>
             この設定はすべてのユーザーと端末で共有され、管理者だけが変更できます。<br>
         </div>
 
@@ -22,16 +22,24 @@
                 <router-link class="link" to="/login/">ログイン</router-link>
             </span>
             <span v-else-if="authorization_error === 'AdminRequired'">この設定を表示するには管理者権限が必要です。</span>
-            <span v-else>サーバーに接続できないため、ユーザー情報を取得できませんでした。</span>
+            <span v-else>ユーザー情報を取得できませんでした。</span>
         </div>
 
         <template v-else>
-            <!-- 親幅が狭いと3タブ分の intrinsic 幅が溢れるため、超過時は左右矢印でスクロールする -->
+            <!-- 親幅が狭いと5タブ分の intrinsic 幅が溢れるため、超過時は左右矢印でスクロールする -->
             <v-tabs v-model="tab" color="primary" bg-color="transparent" class="mt-4 ai-backend-tabs"
                 show-arrows :density="is_form_dense ? 'compact' : 'default'">
                 <v-tab value="opencode">
                     <Icon icon="fluent:cloud-20-filled" width="17px" />
                     <span class="ml-1">OpenCode</span>
+                </v-tab>
+                <v-tab value="openai-compatible">
+                    <Icon icon="fluent:globe-20-filled" width="17px" />
+                    <span class="ml-1">OpenAI 互換 API</span>
+                </v-tab>
+                <v-tab value="openai-compatible-2">
+                    <Icon icon="fluent:globe-20-filled" width="17px" />
+                    <span class="ml-1">OpenAI 互換 API 2</span>
                 </v-tab>
                 <v-tab value="acp-codex">
                     <Icon icon="fluent:brain-circuit-20-filled" width="17px" />
@@ -39,7 +47,7 @@
                 </v-tab>
                 <v-tab value="acp-grok">
                     <Icon icon="fluent:sparkle-20-filled" width="17px" />
-                    <span class="ml-1">ACP / Grok Build</span>
+                    <span class="ml-1">ACP / Grok</span>
                 </v-tab>
             </v-tabs>
 
@@ -48,7 +56,7 @@
             <div class="settings__content" :class="{'settings__content--disabled': is_busy}">
                 <div class="settings__content-heading">
                     <Icon icon="fluent:heart-pulse-20-filled" width="22px" />
-                    <span class="ml-2">OpenCode serve</span>
+                    <span class="ml-2">OpenCode CLI</span>
                 </div>
                 <div class="settings__item">
                     <div class="settings__item-heading">状態</div>
@@ -58,16 +66,16 @@
                         </span>
                         <template v-if="health.available">
                             / version {{ health.version || '不明' }}
-                            （pin {{ health.pinned_version }}） / {{ health.host }}:{{ health.port }}
+                            （固定 {{ health.pinned_version }}） / 常駐リスナーなし
                         </template>
                         <template v-else>
-                            。サーバーログの opencode-serve を確認してください。
+                            。OpenCode CLI の配置とサーバーログを確認してください。
                         </template>
                     </div>
                     <div class="settings__item-label" v-else>状態を取得できませんでした。</div>
                     <v-btn class="mt-3" variant="tonal" color="primary" size="small"
                         :disabled="is_busy" @click="reloadAll()">
-                        再読込
+                        再読み込み
                     </v-btn>
                 </div>
             </div>
@@ -84,12 +92,12 @@
                     </v-btn>
                 </div>
                 <div class="settings__item-label mt-2">
-                    各 service カードに当月の利用状況を表示します。料金は OpenCode が返す
+                    各 service カードに当月の利用状況を表示します。料金は
                     <strong>推定料金</strong>で、プロバイダの請求額そのものではありません。
                 </div>
 
                 <div v-if="services.length === 0" class="settings__item-label mt-3">
-                    まだ service がありません。「追加」から OpenCode provider を登録してください。
+                    まだ service がありません。「追加」から service を登録してください。
                 </div>
 
                 <div v-for="service in services" :key="service.service_id" class="ai-backend-card">
@@ -105,7 +113,7 @@
                                     [{{ service.opencode_model_variant }}]
                                 </template>
                                 <template v-if="isOpenAIFastService(service)"> · Fast</template><br>
-                                接続: {{ formatProviderType(service.opencode_provider_type) }} ·
+                                接続方式: {{ formatProviderType(service.opencode_provider_type) }} ·
                                 出力: {{ formatStructuredOutputMode(service.structured_output_mode) }}<br>
                                 auth: {{ service.auth_mode }} · billing: {{ service.billing_mode }} ·
                                 認証: {{ service.auth_configured ? '設定済み' : '未設定' }}
@@ -172,7 +180,7 @@
                             </div>
                         </template>
                         <div v-else class="ai-backend-card__usage-body">
-                            当月の利用はまだありません。
+                            利用状況を取得できませんでした。
                         </div>
                     </div>
 
@@ -226,7 +234,7 @@
                     <span class="ml-2">削除済み service の利用履歴</span>
                 </div>
                 <div class="settings__item-label mt-2">
-                    設定から削除した service の当月履歴です。上限 enforce の対象外で、表示のみ残ります。
+                    設定から削除した service の当月履歴です。上限適用の対象外で、当月分の記録のみ表示されます。
                 </div>
                 <div v-for="usage in deleted_usage_list" :key="`${usage.service_id}-${usage.year_month}`"
                     class="ai-backend-usage-card">
@@ -272,6 +280,14 @@
             </div>
             </v-window-item>
 
+            <v-window-item value="openai-compatible">
+                <OpenAICompatibleBackendSection key="openai-compatible-1" />
+            </v-window-item>
+
+            <v-window-item value="openai-compatible-2">
+                <OpenAICompatibleBackendSection key="openai-compatible-2" :backend-slot="2" />
+            </v-window-item>
+
             <v-window-item value="acp-codex">
                 <ACPBackendSection provider="codex"
                     :settings="acp_settings?.codex ?? empty_acp_settings"
@@ -305,10 +321,12 @@
                         @update:model-value="onProviderTypeSelected" />
                     <template v-if="form.opencode_provider_type === 'Catalog'">
                         <div class="settings__item-label mb-3">
-                            OpenCode Web と同じく、<strong>プロバイダ</strong>を選んだあと
-                            <strong>認証方式</strong>（API キー / OAuth など）を選びます。<br>
-                            API キーと OAuth はベストエフォート対応です。Vertex AI 以外の面倒な認証
-                            （Azure / Bedrock / GitHub Enterprise 等）は非対応です。
+                            <strong>プロバイダ</strong>を選んだあと<strong>認証方式</strong>を選びます。<br>
+                            API キーはベストエフォート対応です。
+                            OpenAI (headless)・xAI・GitHub Copilot は新規 OAuth に対応しています。<br>
+                            それ以外のプロバイダの新規 OAuth は開始できません。
+                            複数資格情報を要する認証（Azure / Bedrock / GitHub Enterprise 等）は、
+                            Vertex AI を除き非対応です。
                         </div>
                         <!-- 1. プロバイダ選択（全カタログ・検索可） -->
                         <v-autocomplete v-model="selected_provider_id" :items="provider_items" item-title="title"
@@ -322,7 +340,8 @@
                         </div>
                         <div v-if="selected_provider?.support_kind === 'UnsupportedComplex'"
                             class="ai-backend-warn mb-3">
-                            このプロバイダは面倒な認証が必要なため選択できません（Vertex AI のみ例外対応）。
+                            このプロバイダは複数資格情報やクラウド固有の認証が必要なため選択できません
+                            （Vertex AI のみ例外対応）。
                         </div>
                         <!-- 2. 認証方式（OpenCode Web と同じラベル一覧） -->
                         <v-select v-model="selected_auth_method_key" :items="auth_method_items" item-title="title"
@@ -347,8 +366,8 @@
                             color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
                             :disabled="selected_model === null || selected_model.variants.length === 0" />
                         <div class="settings__item-label mb-3">
-                            モデルが OpenCode へ公開している推論 variant だけを選択できます。
-                            「モデル既定」は OpenCode 側の標準値を使います。
+                            モデルが対応している思考の深さ（推論 variant）を選択できます。
+                            「モデル既定」は variant を指定せず、モデル側の標準値を使います。
                         </div>
                         <div v-if="selected_provider_id === 'openai' &&
                             (openai_fast_mode_available || form.openai_fast_mode_enabled)"
@@ -366,8 +385,8 @@
                     </template>
                     <template v-else>
                         <div class="settings__item-label mb-3">
-                            OpenCode serve に service 専用 provider として登録します。
-                            API キーはこの画面の秘密ストアから OpenCode auth へ注入されます。
+                            OpenCode CLI に service 専用 provider として登録します。
+                            保存された API キーは OpenCode の認証設定へ自動で反映されます。
                         </div>
                         <v-text-field v-model="form.api_base_url" label="API ベース URL" variant="outlined"
                             color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
@@ -384,8 +403,8 @@
                         item-title="title" item-value="value" label="構造化出力方式" variant="outlined"
                         color="primary" :density="is_form_dense ? 'compact' : 'default'" class="mb-2" />
                     <div class="settings__item-label mb-3">
-                        生成と話数 Web 検索の両方へ適用します。Auto は StructuredOutput を先に試し、
-                        非対応または不正な応答だけ JSON テキストへフォールバックします。
+                        OpenCode CLI は設定値にかかわらず JSON テキストを使用し、
+                        不正な応答はサーバー側の厳格な検証と再実行で処理します。
                     </div>
                     <v-divider class="mb-3" />
                     <v-text-field v-model="form.service_name" label="表示名" variant="outlined"
@@ -408,8 +427,9 @@
                             class="mb-2" />
                     </template>
                     <div v-if="form.auth_mode === 'OAuthSubscription'" class="settings__item-label mb-2">
-                        保存後に「OAuth開始」からブラウザ認証画面を開いてください。
-                        Docker 内 localhost リダイレクトが使えない場合は headless / device code 方式を選んでください。
+                        OpenAI (headless)・xAI・GitHub Copilot は新規 OAuth を開始できます。
+                        それ以外のプロバイダを利用するには製品用 auth.json に既存トークンを手動配置するか、
+                        API キー認証を使用してください。
                     </div>
                     <v-expansion-panels variant="accordion" class="mt-2">
                         <v-expansion-panel title="詳細設定（課金・上限・ローカル）">
@@ -465,11 +485,27 @@
                     <div v-else-if="oauth_started" class="settings__item-label mb-3">
                         認可 URL が返りませんでした。headless method を試すか、OpenCode ログを確認してください。
                     </div>
+                    <div v-if="oauth_is_auto && oauth_user_code !== null" class="mb-3">
+                        <div class="settings__item-label mb-1">認証画面で入力するコード</div>
+                        <div class="d-flex align-center">
+                            <code class="ai-backend-oauth-user-code">{{ oauth_user_code }}</code>
+                            <v-btn variant="tonal" color="primary" size="small" class="ml-2" :disabled="is_busy"
+                                @click="copyOAuthUserCode()">
+                                コピー
+                            </v-btn>
+                        </div>
+                    </div>
                     <v-text-field v-if="oauth_needs_code" v-model="oauth_code_input"
                         label="認可コード / device code" variant="outlined" color="primary"
                         :density="is_form_dense ? 'compact' : 'default'" class="mb-2"
                         spellcheck="false" autocomplete="off" />
-                    <div class="settings__item-label">
+                    <div v-if="oauth_is_auto && oauth_poll_failed_reason !== null" class="ai-backend-warn mb-2">
+                        認可を完了できませんでした（{{ oauth_poll_failed_reason }}）。閉じてからやり直してください。
+                    </div>
+                    <div v-else-if="oauth_is_auto" class="settings__item-label">
+                        ブラウザでコードを入力して認可してください。完了すると自動的にこのダイアログが閉じます。
+                    </div>
+                    <div v-else class="settings__item-label">
                         ブラウザで認証が終わったら「完了する」を押してください。
                         device code 方式の場合はコードを入力してから完了します。
                     </div>
@@ -477,7 +513,7 @@
                 <v-card-actions>
                     <v-spacer />
                     <v-btn variant="text" :disabled="is_busy" @click="closeOAuthDialog()">閉じる</v-btn>
-                    <v-btn color="primary" variant="flat" :loading="is_oauth_completing"
+                    <v-btn v-if="!oauth_is_auto" color="primary" variant="flat" :loading="is_oauth_completing"
                         :disabled="is_busy || !oauth_started || (oauth_needs_code && !oauth_code_input.trim())"
                         @click="completeOAuthFlow()">
                         完了する
@@ -516,7 +552,7 @@
             <v-card>
                 <v-card-title>service を削除</v-card-title>
                 <v-card-text>
-                    「{{ delete_target?.service_name }}」を削除しますか？録画シリーズから参照中の場合は拒否されます。
+                    「{{ delete_target?.service_name }}」を削除しますか？録画シリーズから参照中の場合は削除できません。
                 </v-card-text>
                 <v-card-actions>
                     <v-spacer />
@@ -533,6 +569,7 @@
 import { computed, onMounted, ref } from 'vue';
 
 import ACPBackendSection from '@/components/Settings/ACPBackendSection.vue';
+import OpenAICompatibleBackendSection from '@/components/Settings/OpenAICompatibleBackendSection.vue';
 import Message from '@/message';
 import AIBackend, {
     type AIAuthMode,
@@ -591,7 +628,7 @@ const emptyForm = (): ServiceForm => ({
 });
 
 const billing_mode_items = [
-    {title: 'Metered（従量・月次上限対象）', value: 'Metered'},
+    {title: 'Metered（従量・月次上限は任意）', value: 'Metered'},
     {title: 'Subscription（上限対象外）', value: 'Subscription'},
     {title: 'Local（token 上限のみ任意）', value: 'Local'},
 ];
@@ -608,9 +645,9 @@ const custom_auth_mode_items: Array<{title: string; value: AIAuthMode}> = [
 ];
 
 const structured_output_mode_items: Array<{title: string; value: StructuredOutputMode}> = [
-    {title: 'Auto（StructuredOutput → JSON テキスト）', value: 'Auto'},
-    {title: 'StructuredOutput（OpenCode json_schema）', value: 'StructuredOutput'},
-    {title: 'JSON テキスト', value: 'JSONText'},
+    {title: 'Auto（CLI では JSON テキスト）', value: 'Auto'},
+    {title: 'StructuredOutput（旧設定・CLI では JSON テキスト）', value: 'StructuredOutput'},
+    {title: 'JSON テキスト（CLI）', value: 'JSONText'},
 ];
 
 const is_form_dense = Utils.isSmartphoneHorizontal();
@@ -625,8 +662,8 @@ const test_results = ref<Record<string, IAIBackendConnectionTestResult | null>>(
 /** `${service_id}:${capability}` 形式。同時に1試験のみ。 */
 const testing_service_id = ref<string | null>(null);
 
-/** ACP タブの切り替え状態。 */
-const tab = ref<'opencode' | 'acp-codex' | 'acp-grok'>('opencode');
+/** AI バックエンドタブの切り替え状態。 */
+const tab = ref<'opencode' | 'openai-compatible' | 'openai-compatible-2' | 'acp-codex' | 'acp-grok'>('opencode');
 /** ACP 固定プリセット設定（サーバー保存済み）。 */
 const acp_settings = ref<IACPSettings | null>(null);
 /** 認証内容を含まない ACP 資格情報状態。 */
@@ -638,7 +675,7 @@ const empty_acp_settings = computed<IACPBackendSettings>(() => ({
     model: null,
     reasoning_effort: null,
     codex_fast_mode_enabled: false,
-    timeout_sec: 120,
+    timeout_sec: 600,
 }));
 /** ACPBackendSection のドラフト更新を ACP 設定へ反映する。 */
 function updateACPDraft(provider: 'codex' | 'grok', settings: IACPBackendSettings): void {
@@ -973,6 +1010,26 @@ const oauth_code_input = ref('');
 const oauth_started = ref(false);
 const is_oauth_starting = ref(false);
 const is_oauth_completing = ref(false);
+// device flow (auto) 方式: サーバーが auth.json を監視するため、client は状態を poll する
+const oauth_is_auto = ref(false);
+const oauth_poll_failed_reason = ref<string | null>(null);
+let oauth_poll_timer: number | null = null;
+
+// instructions / URL からユーザーが認証画面へ入力する code を抽出する（表示専用）。
+const oauth_user_code = computed<string | null>(() => {
+    const instructions_match = oauth_instructions.value?.match(/enter code:?\s*([A-Z0-9-]{4,})/i);
+    if (instructions_match) {
+        return instructions_match[1];
+    }
+    if (oauth_url.value !== null) {
+        try {
+            return new URL(oauth_url.value).searchParams.get('user_code');
+        } catch {
+            return null;
+        }
+    }
+    return null;
+});
 
 const delete_dialog = ref(false);
 const delete_target = ref<IAIBackendService | null>(null);
@@ -1064,7 +1121,7 @@ function formatUsageLimits(usage: IAIBackendUsage): string {
 
 function formatLimitFlags(usage: IAIBackendUsage): string {
     if (usage.service_deleted) {
-        return '履歴のみ（上限 enforce 対象外）';
+        return '履歴のみ（上限適用対象外）';
     }
     if (usage.billing_mode === 'Subscription') {
         return 'サブスク課金のため月次上限は適用しません';
@@ -1077,7 +1134,7 @@ function formatLimitFlags(usage: IAIBackendUsage): string {
         flags.push('料金上限到達');
     }
     if (flags.length === 0) {
-        return usage.cost_limit_effective ? '上限監視中' : '上限なし';
+        return usage.cost_limit_effective ? '上限監視中' : '料金上限なし';
     }
     return flags.join(' · ');
 }
@@ -1220,7 +1277,7 @@ async function saveService(): Promise<void> {
             if (result !== null && body.auth_mode === 'ApiKey' && create_api_key_input.value.trim() !== '') {
                 const key_ok = await AIBackend.setAPIKey(result.service_id, create_api_key_input.value.trim());
                 if (key_ok === false) {
-                    Message.warning('service は追加しましたが、API キーの設定に失敗しました。');
+                    Message.warning('service は追加しましたが、API キーの設定を完了できませんでした。');
                 }
             }
             // OAuth method index を記憶（カードの OAuth開始で使う）。
@@ -1254,10 +1311,11 @@ async function saveService(): Promise<void> {
         if (result !== null) {
             Message.success(editing_service_id.value ? 'service を更新しました。' : 'service を追加しました。');
             edit_dialog.value = false;
-            // OAuth 新規作成直後は続けて認証ダイアログを開く。
+            // 既存 token が auth.json にある場合はそのまま利用し、未設定時だけ Unsupported 案内を出す。
             const should_start_oauth = (
                 editing_service_id.value === null &&
-                result.auth_mode === 'OAuthSubscription'
+                result.auth_mode === 'OAuthSubscription' &&
+                !result.auth_configured
             );
             await reloadAll();
             if (should_start_oauth) {
@@ -1312,12 +1370,15 @@ async function deleteKey(): Promise<void> {
  * method index は service 作成時に選んだ方式、無ければ 0。
  */
 async function runOAuthStart(service: IAIBackendService): Promise<void> {
+    stopOAuthStatusPolling();
     oauth_target.value = service;
     oauth_url.value = null;
     oauth_instructions.value = null;
     oauth_code_input.value = '';
     oauth_needs_code.value = false;
     oauth_started.value = false;
+    oauth_is_auto.value = false;
+    oauth_poll_failed_reason.value = null;
     oauth_method_index.value = oauth_method_by_service.value[service.service_id] ?? 0;
     // カタログから OAuth method が1件ならそれを優先（記憶が無い場合）。
     if (oauth_method_by_service.value[service.service_id] === undefined) {
@@ -1327,22 +1388,26 @@ async function runOAuthStart(service: IAIBackendService): Promise<void> {
             oauth_method_index.value = oauth_method.method_index;
         }
     }
-    oauth_dialog.value = true;
     is_oauth_starting.value = true;
     try {
         const result = await AIBackend.startOAuth(service.service_id, oauth_method_index.value);
         if (result === null) {
+            oauth_target.value = null;
             return;
         }
+        oauth_dialog.value = true;
         oauth_started.value = true;
         oauth_method_index.value = result.method;
         oauth_url.value = result.url;
         oauth_instructions.value = result.instructions;
-        // code 方式、または instructions に code 入力を促す文言がある場合は入力欄を出す。
-        oauth_needs_code.value = (
-            result.authorization_method === 'code' ||
-            (result.instructions !== null && /enter code|code:/i.test(result.instructions))
-        );
+        // device flow (auto) はサーバーが完了を検知するため、client は状態を poll する。
+        // code 入力欄は legacy の 'code' 方式だけに出す（auto の instructions に含まれる
+        // "Enter code" は認証画面への入力求めであり、サーバーへの返送ではない）。
+        oauth_is_auto.value = result.authorization_method === 'auto';
+        oauth_needs_code.value = result.authorization_method === 'code';
+        if (oauth_is_auto.value) {
+            startOAuthStatusPolling(service.service_id);
+        }
         // browser 方式なら即座に認証画面を開く（ユーザーが OAuth 画面を目視確認できる）。
         if (result.url) {
             openOAuthUrl();
@@ -1350,6 +1415,43 @@ async function runOAuthStart(service: IAIBackendService): Promise<void> {
     } finally {
         is_oauth_starting.value = false;
     }
+}
+
+/** device flow の完了をサーバーへ poll する。成功時はダイアログを閉じて一覧を更新する。 */
+function startOAuthStatusPolling(service_id: string): void {
+    stopOAuthStatusPolling();
+    oauth_poll_timer = window.setInterval(async () => {
+        const status = await AIBackend.getOAuthStatus(service_id);
+        // 一時的な通信失敗では poll を止めない
+        if (status === null) {
+            return;
+        }
+        if (status.status === 'Succeeded') {
+            stopOAuthStatusPolling();
+            Message.success('OAuth 接続が完了しました。');
+            closeOAuthDialog();
+            await reloadAll();
+        } else if (status.status === 'Failed' || status.status === 'Timeout') {
+            stopOAuthStatusPolling();
+            oauth_poll_failed_reason.value = status.error;
+        }
+    }, 3000);
+}
+
+function stopOAuthStatusPolling(): void {
+    if (oauth_poll_timer !== null) {
+        window.clearInterval(oauth_poll_timer);
+        oauth_poll_timer = null;
+    }
+}
+
+/** ユーザーが認証画面へ入力する code をコピーする。 */
+async function copyOAuthUserCode(): Promise<void> {
+    if (oauth_user_code.value === null) {
+        return;
+    }
+    await navigator.clipboard.writeText(oauth_user_code.value);
+    Message.success('コードをコピーしました。');
 }
 
 function openOAuthUrl(): void {
@@ -1361,12 +1463,15 @@ function openOAuthUrl(): void {
 }
 
 function closeOAuthDialog(): void {
+    stopOAuthStatusPolling();
     oauth_dialog.value = false;
     oauth_target.value = null;
     oauth_url.value = null;
     oauth_instructions.value = null;
     oauth_code_input.value = '';
     oauth_started.value = false;
+    oauth_is_auto.value = false;
+    oauth_poll_failed_reason.value = null;
 }
 
 async function completeOAuthFlow(): Promise<void> {
@@ -1509,6 +1614,14 @@ onMounted(async () => {
     word-break: break-all;
     color: rgb(var(--v-theme-text-darken-1));
     line-height: 1.4;
+}
+.ai-backend-oauth-user-code {
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    padding: 4px 10px;
+    border-radius: 6px;
+    background: rgb(var(--v-theme-surface-variant));
 }
 .ai-backend-card {
     margin-top: 14px;

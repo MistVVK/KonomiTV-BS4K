@@ -31,6 +31,9 @@ router = APIRouter(
 )
 
 
+# スピードテストはログイン不要で提供し、測定枠の発行は Fetch Metadata / Origin と
+# プロセス内のセッション数制限で保護する。LibreSpeed Worker は Bearer token を付けないため、
+# 以降の転送は、この API が発行する短命な HttpOnly Cookie で認証する。
 @router.post(
     '/session',
     summary = 'サーバー接続速度測定セッション作成 API',
@@ -53,6 +56,7 @@ async def KonomiTVBS4KSpeedTestSessionCreateAPI(
     """
 
     RequireSpeedTestFetchMetadata(request)
+    RequireSpeedTestOrigin(request)
     session = await SPEED_TEST_SESSION_MANAGER.createSession()
     token = GenerateKonomiTVBS4KSpeedTestSessionToken(session.session_id)
     SetKonomiTVBS4KSpeedTestSessionCookie(response, token)

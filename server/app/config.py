@@ -80,9 +80,7 @@ class ClientSettings(BaseModel):
     # 0 は未同期の初期値として正当なので、正の値に限定しない
     last_synced_at: Annotated[float, Field(ge=0.0, allow_inf_nan=False)] = 0.0
     # showed_panel_last_time: 同期無効
-    # selected_twitter_panel_account: 同期無効
-    # twitter_panel_post_targets: 同期無効
-    saved_twitter_hashtags: list[str] = []
+    # konomitv_bs4k_playback_video_codec_default_initialized: 同期無効
     mylist: list[dict[str, Any]] = []
     watched_history: list[dict[str, Any]] = []
     # lshaped_screen_crop_enabled: 同期無効
@@ -140,11 +138,14 @@ class ClientSettings(BaseModel):
     use_28hour_clock: bool = False
     show_original_broadcast_time_during_playback: bool = False
     panel_display_state: Literal['RestorePreviousState', 'AlwaysDisplay', 'AlwaysFold'] = 'RestorePreviousState'
-    tv_panel_active_tab: Literal['Program', 'Channel', 'Comment', 'Twitter'] = 'Program'
-    video_panel_active_tab: Literal['RecordedProgram', 'Series', 'Comment', 'Twitter'] = 'RecordedProgram'
+    tv_panel_active_tab: Literal['Program', 'Channel', 'Comment'] = 'Program'
+    video_panel_active_tab: Literal['RecordedProgram', 'Series', 'Comment'] = 'RecordedProgram'
     video_series_sort_key: Literal['SeasonEpisode', 'BroadcastDate', 'Title'] = 'SeasonEpisode'
     video_series_sort_direction: Literal['Asc', 'Desc'] = 'Asc'
+    series_home_sort_key: Literal['UpdatedAt', 'TitleReading', 'FirstAirDate', 'TmdbPopularity', 'TmdbVoteAverage', 'BangumiRating'] = 'UpdatedAt'
+    series_home_sort_direction: Literal['Asc', 'Desc'] = 'Desc'
     video_watched_history_max_count: PositiveInt = 50
+    bangumi_watch_history_sync: bool = False
     # konomitv_bs4k_offline_video_streaming_quality: 同期無効
     # konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
     # konomitv_bs4k_offline_video_codec: 同期無効
@@ -166,6 +167,7 @@ class ClientSettings(BaseModel):
     # tv_low_latency_mode_for_bs4k_cellular: 同期無効
     # tv_use_rain_fallback_for_bs4k: 同期無効
     # tv_use_rain_fallback_for_bs8k: 同期無効
+    konomitv_bs4k_hdr_output: Literal['Auto', 'HDR', 'SDR'] = 'SDR'
     # tv_24fps_mode: 同期無効
     # tv_24fps_mode_cellular: 同期無効
     # video_streaming_quality: 同期無効
@@ -179,7 +181,7 @@ class ClientSettings(BaseModel):
     caption_font: str = 'Rounded M+ 1m for ARIB'
     always_border_caption_text: bool = True
     specify_caption_opacity: bool = False
-    caption_opacity: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)] = 1.0
+    caption_opacity: Annotated[float, Field(ge=0.0, le=1.0, allow_inf_nan=False)] = 0.5
     tv_show_superimpose: bool = True
     video_show_superimpose: bool = False
     # tv_show_data_broadcasting: 同期無効
@@ -203,14 +205,6 @@ class ClientSettings(BaseModel):
     mute_comment_keywords_normalize_alphanumeric_width_case: bool = True
     muted_comment_keywords: list[dict[str, str]] = []
     muted_niconico_user_ids: list[str] = []
-    fold_panel_after_sending_tweet: bool = False
-    reset_hashtag_when_program_switches: bool = True
-    auto_add_watching_channel_hashtag: bool = True
-    twitter_reply_thread_mode: Literal['PerHashtag', 'PerDay', 'Disabled'] = 'PerHashtag'
-    bluesky_reply_thread_mode: Literal['PerHashtag', 'PerDay', 'Disabled'] = 'Disabled'
-    twitter_active_tab: Literal['Search', 'Timeline', 'Capture'] = 'Capture'
-    tweet_hashtag_position: Literal['Prepend', 'Append', 'PrependWithLineBreak', 'AppendWithLineBreak'] = 'Append'
-    tweet_capture_watermark_position: Literal['None', 'TopLeft', 'TopRight', 'BottomLeft', 'BottomRight'] = 'None'
 
     @staticmethod
     def _rejectNonFiniteNumbers(value: Any, path: str = 'root') -> None:
@@ -253,6 +247,10 @@ class _ServerSettingsGeneral(BaseModel):
     mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] = Url('http://127.0.0.1:40772/')
     konomitv_bs4k_live_transport: Literal['MpegTs', 'Tlv'] = 'MpegTs'
     konomitv_bs4k_tlv_mirakurun_url: Annotated[Url, UrlConstraints(allowed_schemes=['http', 'https'])] | None = None
+    # QSV / AMF の HW エンコードに使う DRM render node の固定指定
+    # null (既定) なら vendor ID が一致する render node を自動選択する。
+    # このフィールドを encoder より前に定義し、encoder の起動時 probe でも同じ固定指定を参照できるようにする。
+    konomitv_bs4k_encoder_render_device: str | None = None
     encoder: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
     konomitv_bs4k_live_sar_mode: Literal['CPU', 'GPU'] = 'CPU'
     encoder_bs4k: Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'] = 'FFmpeg'
@@ -392,7 +390,7 @@ class _ServerSettingsGeneral(BaseModel):
         return Url(str(mirakurun_url).rstrip('/') + '/')
 
     @model_validator(mode='after')
-    def validate_konomitv_bs4k_tlv_mirakurun(self, info: ValidationInfo) -> '_ServerSettingsGeneral':
+    def validate_konomitv_bs4k_tlv_mirakurun(self, info: ValidationInfo) -> _ServerSettingsGeneral:
         """
         TLV 選択時に専用 Mirakurun の API と BS4K サービスを検証する。
 
@@ -479,8 +477,22 @@ class _ServerSettingsGeneral(BaseModel):
         logging.info('KonomiTV-BS4K MMT/TLV Mirakurun API validation succeeded.')
         return self
 
+    @field_validator('konomitv_bs4k_encoder_render_device', mode='before')
+    def validate_encoder_render_device(cls, value: Any) -> str | None:
+        # 空文字・空白は未指定（自動選択）として扱う
+        if value is None:
+            return None
+        if isinstance(value, str) is False:
+            raise ValueError('render node は文字列で指定してください。')
+        normalized = value.strip()
+        if normalized == '':
+            return None
+        if re.fullmatch(r'/dev/dri/renderD[0-9]+', normalized) is None:
+            raise ValueError('/dev/dri/renderD128 のような DRM render node のパスを指定してください。')
+        return normalized
+
     @classmethod
-    def _validate_encoder_value(cls, encoder: str) -> str:
+    def _validate_encoder_value(cls, encoder: str, pinned_render_device: str | None = None) -> str:
         from app import logging
         from app.streams.RecordedPlaybackCapabilities import (
             RecordedPlaybackBackend,
@@ -496,9 +508,19 @@ class _ServerSettingsGeneral(BaseModel):
         if encoder != 'FFmpeg':
             device: str | None = None
             if encoder_type in ('QSV', 'AMF'):
-                devices = RecordedPlaybackBackend.discoverRenderDevices(encoder_type)
-                if len(devices) > 0:
-                    device = devices[0]
+                # 固定指定が存在し encoder の GPU vendor と一致する場合はその render node だけを検査対象にする。
+                # render node の番号は再起動で入れ替わり得るため、見えていない固定指定や vendor が
+                # 合わない固定指定は起動不能にせず自動選択へ退避する（実行経路側の resolveRenderDevices と同じ契約）
+                if (
+                    pinned_render_device is not None and
+                    Path(pinned_render_device).exists() and
+                    RecordedPlaybackBackend.matchesEncoderVendor(pinned_render_device, encoder_type) is True
+                ):
+                    device = pinned_render_device
+                else:
+                    devices = RecordedPlaybackBackend.discoverRenderDevices(encoder_type)
+                    if len(devices) > 0:
+                        device = devices[0]
             probe_results: dict[Literal['avc', 'hevc'], bool] = {}
             with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-live-encoder-probe-') as temporary_directory:
                 for codec in cast(tuple[Literal['avc', 'hevc'], ...], ('avc', 'hevc')):
@@ -570,19 +592,22 @@ class _ServerSettingsGeneral(BaseModel):
         # バリデーションをスキップする場合はここで終了
         if type(info.context) is dict and info.context.get('bypass_validation') is True:
             return encoder
-        return cls._validate_encoder_value(encoder)
+        # konomitv_bs4k_encoder_render_device は encoder より前に定義されているため、
+        # 先行フィールドの検証済み値を info.data から取得できる。起動時検査も実行経路と
+        # 同じ固定 render node で行い、別 GPU の probe 成功で設定を誤って受理しないようにする
+        pinned_render_device = info.data.get('konomitv_bs4k_encoder_render_device')
+        return cls._validate_encoder_value(encoder, pinned_render_device)
 
 class _ServerSettingsServer(BaseModel):
     https_mode: Literal['akebi', 'certificate', 'reverse_proxy'] = 'akebi'
     port: PositiveInt = 7000
-    opencode_serve_port: Annotated[int, Field(ge=1024, le=65535)] = 4097
     custom_https_certificate: FilePath | None = None
     custom_https_private_key: FilePath | None = None
     reverse_proxy_listen_address: IPvAnyAddress = ipaddress.IPv4Address('0.0.0.0')
     trusted_proxy_cidrs: list[IPvAnyNetwork] = []
 
     @model_validator(mode='after')
-    def validate_https_mode(self, info: ValidationInfo) -> '_ServerSettingsServer':
+    def validate_https_mode(self, info: ValidationInfo) -> _ServerSettingsServer:
         # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する
         if type(info.context) is dict and info.context.get('bypass_validation') is True:
             return self
@@ -650,31 +675,6 @@ class _ServerSettingsServer(BaseModel):
             )
         return port
 
-    @field_validator('opencode_serve_port')
-    def validateOpenCodeServePort(cls, port: int, info: ValidationInfo) -> int:
-        """製品用 OpenCode serve のポートが他プロセスと衝突しないことを検証する。
-
-        Args:
-            port (int): 検証する OpenCode serve のポート番号。
-            info (ValidationInfo): bypass_validation などの検証コンテキスト。
-
-        Returns:
-            int: 利用可能な OpenCode serve のポート番号。
-        """
-
-        # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する。
-        if type(info.context) is dict and info.context.get('bypass_validation') is True:
-            return port
-
-        # 同じ KonomiTV-BS4K 内のリスナとの衝突は、全セクションが揃う ServerSettings 側で検証する。
-        if port in _GetUsedListenPorts():
-            raise ValueError(
-                f'OpenCode serve のポート {port} は他のプロセスで使われているため、'
-                'KonomiTV-BS4K を起動できません。\n'
-                f'他のソフトでポート {port} を使っていないかを確認してください。'
-            )
-        return port
-
 class _ServerSettingsCompatibilityAPI(BaseModel):
     enabled: bool = False
     https_mode: Literal['inherit', 'akebi', 'certificate', 'reverse_proxy'] = 'inherit'
@@ -686,7 +686,7 @@ class _ServerSettingsCompatibilityAPI(BaseModel):
     trusted_proxy_cidrs: list[IPvAnyNetwork] = []
 
     @model_validator(mode='after')
-    def validate_https_mode(self, info: ValidationInfo) -> '_ServerSettingsCompatibilityAPI':
+    def validate_https_mode(self, info: ValidationInfo) -> _ServerSettingsCompatibilityAPI:
         """互換 API 専用の HTTPS モードと関連設定が矛盾しないことを検証する。"""
 
         # 自動リロード先プロセスでは、起動元プロセスで検証済みの設定をそのまま復元する
@@ -803,8 +803,8 @@ class ServerSettings(BaseModel):
     cm_analysis: _ServerSettingsCMAnalysis = _ServerSettingsCMAnalysis()
 
     @model_validator(mode='after')
-    def validateListenPorts(self, info: ValidationInfo) -> 'ServerSettings':
-        """通常 API・互換 API・OpenCode serve のリスナが互いに衝突しないことを検証する。
+    def validateListenPorts(self, info: ValidationInfo) -> ServerSettings:
+        """通常 API と互換 API のリスナが互いに衝突しないことを検証する。
 
         Args:
             info (ValidationInfo): bypass_validation などの検証コンテキスト。
@@ -818,12 +818,11 @@ class ServerSettings(BaseModel):
 
         listen_ports = {
             '通常 API': self.server.port,
-            'OpenCode serve': self.server.opencode_serve_port,
         }
         if self.server.https_mode == 'akebi':
             listen_ports['通常 API の内部 Uvicorn'] = self.server.port + 10
 
-        # 無効な互換 API はポートを予約せず、OpenCode serve に同じ値を設定できるようにする。
+        # 無効な互換 API はポートを予約しない。
         compatibility_https_mode: str | None = None
         if self.compatibility_api.enabled:
             compatibility_https_mode = (
@@ -1001,7 +1000,7 @@ class HostServerSettings(BaseModel):
     cm_analysis: _HostServerSettingsCMAnalysis = _HostServerSettingsCMAnalysis()
 
     @model_validator(mode='after')
-    def normalize_host_paths(self) -> 'HostServerSettings':
+    def normalize_host_paths(self) -> HostServerSettings:
         """
         外部モデルを構築した時点で対象パス項目をホスト表現へ正規化する。
 
@@ -1044,7 +1043,7 @@ class HostServerSettings(BaseModel):
         return self
 
     @classmethod
-    def fromServerSettings(cls, settings: ServerSettings) -> 'HostServerSettings':
+    def fromServerSettings(cls, settings: ServerSettings) -> HostServerSettings:
         """
         内部実行用設定から外部向けホストパス設定を生成する。
 

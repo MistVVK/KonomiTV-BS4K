@@ -63,7 +63,7 @@ async def ValidateChannelID(display_channel_id: Annotated[str, Path(description=
 
 
 async def ValidateQuality(
-    quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
+    quality: Annotated[str, Path(description='映像の品質。ex: original, 1080p')],
     display_channel_id: Annotated[str, Depends(ValidateChannelID)],
     video_codec: Annotated[
         KonomiTVBS4KVideoCodec | None,
@@ -83,6 +83,25 @@ async def ValidateQuality(
     ] = True,
 ) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
+
+    # オリジナル画質は mpeg2toh264 で MPEG-2 映像を再生する前提のため、
+    # GR/BS/CS フルセグ以外 (ワンセグ / BS4K / SKY / CATV / ラジオ) は受け付けない
+    if quality == 'original':
+        original_channel = await Channel.filter(display_channel_id=display_channel_id).get_or_none()
+        if (
+            original_channel is None or
+            original_channel.is_oneseg is True or
+            original_channel.is_radiochannel is True or
+            original_channel.type not in ('GR', 'BS', 'CS')
+        ):
+            logging.error(
+                f'[LiveStreamsRouter][ValidateQuality] Original quality is not available for this channel. '
+                f'[display_channel_id: {display_channel_id}]'
+            )
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Original quality is not available for this channel',
+            )
 
     # 指定された品質が存在するか確認
     ## 品質の指定に -10bit や -24fps が付いていれば分解する
@@ -104,6 +123,10 @@ async def ValidateQuality(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Specified quality was not found',
         )
+
+    # original は再エンコードしないため、codec 能力検査と降雨対応のストリーム分岐を通さない
+    if stream_quality.quality == 'original':
+        return stream_quality
 
     # ラジオは映像 backend を使わない。映像・深度・24fpsを中立値へ正規化し、音声だけを共有キーに残す。
     capability_encoder = selected_encoder
@@ -333,7 +356,9 @@ async def LiveStreamEventAPI(
                 elif (
                     previous_status.detail != status.detail or
                     previous_status.is_rain_fallback != status.is_rain_fallback or
-                    previous_status.is_rain_fallback_broadcasting != status.is_rain_fallback_broadcasting
+                    previous_status.is_rain_fallback_broadcasting != status.is_rain_fallback_broadcasting or
+                    previous_status.b60_video_transfer != status.b60_video_transfer or
+                    previous_status.mh_eit_hdr_hint != status.mh_eit_hdr_hint
                 ):
                     yield {
                         'event': 'detail_update',  # detail_update イベントを設定

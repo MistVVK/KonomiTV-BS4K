@@ -30,13 +30,14 @@
 - KonomiTV-BS4K の実行ターゲットは Docker Linux のみです。通常の開発・動作確認も Docker の Development 環境で行います
 - Main 環境と Development 環境は、コンテナ・イメージ・設定・データ・ログを分離します。片方の操作で他方の状態を変更しないでください
 - 実際のホストパス、ドメイン、IP アドレス、リバースプロキシ構成はマシン固有の指示を参照し、Git 管理下の文書やコードへ記載しないでください
-- Compose のファイル構成、起動手順、状態保護、検証方法は `AGENTS-BS4K.md` の指示に従ってください
+- Compose のファイル構成、起動手順、状態保護、検証方法は `docs_AGENTS/docker-development.md` の指示に従ってください
 
 ### Main 環境 (port 7000、常にユーザー管理)
 
 - Main 環境は、動作確認済みの `main` ブランチを提供する常用環境です
 - エージェントは、ユーザーの明示的な許可なく Main コンテナを起動・停止・再起動・再構築・再設定してはいけません
 - 通常のコード変更を Main 環境で直接検証してはいけません。Development 環境で検証してから Main へ反映します
+- 番組タイトルや番組概要を表示するときは必ず `ProgramUtils.decorateProgramInfo(program, 'field_name')` を使用してください
 
 ### Development 環境 (port 7100)
 
@@ -44,7 +45,7 @@
 - Development 固有の設定・データ・ログ・録画ミラー・キャプチャは `docker/development/state/` 以下へ隔離します
 - コンテナ内の実行コードはイメージに格納されています。ホストのソースツリーは参照用の read-only bind であり、コード変更は hot reload されません
 - コード変更を Development で確認するときは、ユーザーに再ビルドや再作成を依頼せず、エージェントが検証付き Development イメージをビルドしてから Development コンテナだけを再作成する
-- Development のビルド・再作成・再起動はエージェントの通常作業である。事前確認と状態保護に関する `AGENTS-BS4K.md` の手順は省略してはいけない
+- Development のビルド・再作成・再起動はエージェントの通常作業である。事前確認と状態保護に関する `docs_AGENTS/docker-development.md` の手順は省略してはいけない
 
 ### ブラウザ検証
 
@@ -74,7 +75,7 @@ upstream KonomiTV は Windows と Linux の双方を対象としていますが�
     - Vuetify 3.x
     - Pinia
 - `server/`: KonomiTV のバックエンド API サーバー
-  - Python 3.11
+  - Python 3.14
   - Poetry
   - Uvicorn
   - FastAPI
@@ -85,112 +86,7 @@ upstream KonomiTV は Windows と Linux の双方を対象としていますが�
 
 ## ディレクトリ構成
 
-### クライアント (`client/`)
-
-- `public/`: 直接提供される静的ファイル
-- `src/`: ソースコード
-  - `views/`: Vue ルートコンポーネント/ページ
-    - `TV/`: テレビ視聴関連ページ
-    - `Videos/`: 動画関連ページ
-    - `Reservations/`: 予約関連ページ
-    - `Settings/`: アプリケーション設定ページ
-    - `Login.vue`: ログインページ
-    - `Register.vue`: アカウント登録ページ
-    - `MyList.vue`: マイリストページ
-    - `WatchedHistory.vue`: 視聴履歴ページ
-    - `MyPage.vue`: マイページ
-    - `NotFound.vue`: 404 エラーページ
-  - `components/`: Vue コンポーネント
-    - `Watch/`: テレビ・録画番組視聴画面向けコンポーネント群
-      - `Panel/`: 視聴画面右側のパネル内表示用コンポーネント群
-        - `Twitter/`: ツイート検索/タイムライン表示/キャプチャ管理/ツイート表示用コンポーネント群
-    - `Settings/`: 設定ページから呼び出されるダイアログコンポーネント群
-    - `HeaderBar.vue`: ヘッダーバー
-    - `SPHeaderBar.vue`: スマートフォン用ヘッダーバー
-    - `Navigation.vue`: ナビゲーション
-    - `BottomNavigation.vue`: スマートフォン用下部ナビゲーション
-    - `Snackbars.vue`: 通知メッセージ表示コンポーネント
-    - `Breadcrumbs.vue`: パンくずリスト表示コンポーネント
-  - `stores/`: 状態管理 (Pinia ストア)
-  - `services/`: サーバー API へのサービスクライアント
-    - `player/`: KonomiTV の視聴画面で用いられるライブ/ビデオプレイヤーのロジック (重要)
-      - `managers/`: PlayerController に紐づく様々な機能のロジックを提供し、各機能に責任を持つ PlayerManager 群
-      - `PlayerController.ts`: 動画プレイヤーである DPlayer に関連するロジックを丸ごとラップするクラスで、KonomiTV の再生系ロジックの中核を担う
-  - `utils/`: ユーティリティ関数とヘルパー
-  - `workers/`: 重い処理をバックグラウンドで実行するための Web Workers コード (with Comlink)
-  - `styles/`: グローバル CSS の定義 (グローバル CSS は `App.vue` の方がメイン)
-  - `router/`: Vue Router 設定
-  - `plugins/`: Vue プラグインの初期化定義
-  - `App.vue`: アプリケーションのルートコンポーネント (グローバル CSS 定義もここに含まれる)
-  - `main.ts`: アプリケーションのエントリーポイント・初期化処理
-- `package.json`: Node.js プロジェクト設定と依存関係 (yarn)
-- `vite.config.mts`: Vite ビルド設定
-- `tsconfig.json`: TypeScript 設定
-- `.eslintrc.json`: ESLint コードスタイル設定
-
-### サーバー (`server/`)
-
-- `app/`: FastAPI アプリケーションコード
-  - `routers/`: API ルートハンドラー
-    - `ChannelsRouter.py`: チャンネル関連メタデータ取得 API
-    - `ProgramsRouter.py`: 番組関連メタデータ取得 API
-    - `VideosRouter.py`: 録画番組メタデータ取得 API
-    - `SeriesRouter.py`: 番組シリーズ関連 API
-    - `LiveStreamsRouter.py`: 放送中テレビ放送のライブストリーミング配信関連 API
-    - `VideoStreamsRouter.py`: 録画番組のストリーミング配信関連 API
-    - `ReservationsRouter.py`: EDCB と連携したテレビ番組の録画予約関連 API
-    - `ReservationConditionsRouter.py`: EDCB と連携したテレビ番組の自動録画予約条件 (EPG 自動予約) 関連 API
-    - `DataBroadcastingRouter.py`: データ放送のインターネット接続機能向け API
-    - `CapturesRouter.py`: キャプチャ画像管理 API
-    - `TwitterRouter.py`: Twitter 連携 API
-    - `NiconicoRouter.py`: ニコニコ実況連携 API
-    - `UsersRouter.py`: ユーザーアカウント管理 API
-    - `SettingsRouter.py`: クライアント・サーバー設定管理 API
-    - `MaintenanceRouter.py`: サーバーメンテナンス用 API
-    - `VersionRouter.py`: バージョン情報 API
-  - `models/`: データベースモデルとスキーマ
-    - `Channel.py`: チャンネル情報を管理するモデル（放送局情報、チャンネル番号、ロゴ、ストリーム設定など）
-    - `Program.py`: 放送番組情報を管理するモデル（番組メタデータ、EPG 番組情報、タイトル、番組詳細、ジャンルなど）
-    - `RecordedProgram.py`: 録画済み番組のメタデータを管理するモデル（EPG 録画番組情報、録画開始/終了時刻など）
-    - `RecordedVideo.py`: 録画済み番組の動画ファイル情報を管理するモデル（ファイルパス、映像/音声コーデック、ファイルサイズなど）
-    - `Series.py`: 番組シリーズ情報を管理するモデル（シリーズ名、シリーズ ID など）
-    - `SeriesBroadcastPeriod.py`: 番組シリーズの放送期間情報を管理するモデル
-    - `TwitterAccount.py`: Twitter アカウント連携情報を管理するモデル（トークン、認証情報など）
-    - `User.py`: ユーザーアカウント情報を管理するモデル（認証情報、権限など）
-  - `migrations/`: Tortoise ORM のマイグレーションツール: Aerich 向けの DB マイグレーション定義 (Aerich で自動生成されたコードを修正したもの)
-  - `streams/`: テレビ放送のライブストリーミング・録画番組のオンデマンドストリーミング関連の実装
-    - `LiveEncodingTask.py`: ライブストリーミング用のエンコード・ストリーミングタスクを管理
-    - `VideoEncodingTask.py`: 録画番組用のエンコード・ストリーミングタスクを管理
-    - `LiveStream.py`: 放送波のライブストリーミングの状態管理
-    - `VideoStream.py`: 録画番組のオンデマンドストリーミングの状態管理
-    - `LivePSIDataArchiver.py`: 放送波から PSI/SI データを抽出・アーカイブする機能の実装
-  - `metadata/`: 録画番組データから番組情報などのメタデータを抽出・保存するための実装
-    - `RecordedScanTask.py`: 録画フォルダの監視とメタデータの DB への同期を行うタスク
-    - `MetadataAnalyzer.py`: 録画ファイルのメタデータを解析するクラス
-    - `TSInfoAnalyzer.py`: 録画 TS ファイルや録画データ関連ファイルに含まれる番組情報を解析するクラス
-    - `ThumbnailGenerator.py`: プレイヤーのシークバー用タイル画像と、候補区間内で最も良い1枚の代表サムネイルを生成するクラス
-    - `CMSectionsDetector.py`: 録画 TS ファイルに含まれる CM 区間を検出するクラス
-  - `utils/`: ユーティリティ関数とヘルパー
-    - `edcb/`: EDCB 連携用の API クライアント実装
-    - `JikkyoClient.py`: ニコニコ実況・NX-Jikkyo 連携用の API クライアント実装
-    - `TwitterGraphQLAPI.py`: Twitter API 連携用にリバースエンジニアリングして開発した API クライアント実装
-    - `TSInformation.py`: 日本のテレビ放送で用いられている MPEG2-TS から情報を取得する際に役立つユーティリティ群
-    - `DriveIOLimiter.py`: ドライブごとの同時実行数を制限するためのユーティリティクラス
-    - `ProcessLimiter.py`: プロセスごとの同時実行数を制限するためのユーティリティクラス
-  - `app.py`: FastAPI アプリケーションやルーターの初期化・バックグラウンドタスクの定義
-  - `config.py`: サーバー設定 (`config.yaml`) のロードとバリデーション
-  - `constants.py`: サーバー全体で用いられるグローバル定数
-  - `logging.py`: ロギング設定
-  - `schemas.py`: API リクエスト/レスポンス型に用いる Pydantic スキーマ
-- `data/`: アプリケーションデータ用ディレクトリ
-  - `database.sqlite`: SQLite データベースファイル
-- `logs/`: アプリケーションログ用ディレクトリ
-- `misc/`: メンテナンス・デバッグ用 Pythonスクリプト群
-- `static/`: サーバー API によって提供される静的ファイル (Git 管理下にあり、放送局ロゴなどが含まれる)
-- `thirdparty/`: FFmpeg や QSVEncC などのエンコーダーをはじめとした、ビルド済みのサードパーティー実行ファイル (Git 管理外で、`poetry run task update-thirdparty` で更新する)
-- `pyproject.toml`: Python プロジェクト設定と依存関係 (Poetry)
-- `KonomiTV.py`: KonomiTV サーバーのエントリーポイント
-- `KonomiTV-Service.py`: Windows サービス管理スクリプト & Windows サービスのエントリーポイント
+ディレクトリ構成は `docs_AGENTS/directory-structure.md` を参照してください (KonomiTV-BS4K の実際のツリーに合わせて管理されています)。
 
 ## アーキテクチャ上の設計判断と既知の制約
 
@@ -217,7 +113,6 @@ upstream KonomiTV は Windows と Linux の双方を対象としていますが�
 ## コーディング規約
 
 ### 全般
-- サービス名はコード・型・コメント・UI・文書のすべてで一貫して `Twitter` と表記する。`X` は `X Premium` などの正式な商品名、`x.com` などのホスト名、HTTP ヘッダー名のように原表記が技術的に必要な場合だけ使用する
 - コードをざっくり斜め読みした際の可読性を高めるため、日本語のコメントを多めに記述する
 - コードを変更する際、既存のコメントは、変更によりコメント内容がコードの記述と合わなくなった場合を除き、コメント量に関わらずそのまま保持する
 - ログメッセージに関しては文字化けを避けるため、必ず英語で記述する
@@ -235,7 +130,7 @@ upstream KonomiTV は Windows と Linux の双方を対象としていますが�
 ### Python コード
 - **コードの編集後には、必ず `poetry run task lint` コマンドで、Ruff によるコードリンターと Pyright による型チェッカーを実行すること**
 - 文字列にはシングルクォートを用いる (Docstring を除く)
-- Python 3.11 の機能を使う (3.10 以下での動作は考慮不要)
+- Python 3.14 の機能を使う (3.13 以下での動作は考慮不要)
 - ビルトイン型を使用した Type Hint で実装する (from typing import List, Dict などは避ける)
 - Pydantic モデル定義では必ず Annotated 記法を使う。`= Field()` 型の定義は行わずに全て Annotated 記法で定義すること
 - 変数・インスタンス変数は snake_case で命名する

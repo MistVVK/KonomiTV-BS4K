@@ -27,6 +27,7 @@ from app.utils.KonomiTVBS4KMMTTLV import (
     MMT_TLV_CONTAINER_FORMAT,
     BuildKonomiTVBS4KMMTTLVInputArguments,
 )
+from app.utils.RecordedWebVTT import ReadRecordedARIBSidecar, ReadRecordedWebVTTSidecar
 from app.utils.TSKeyFrameSeeker import TSKeyFrameSeeker
 
 
@@ -100,13 +101,19 @@ class RecordedSubtitleStream:
     _arib_ttml_memory_cache: ClassVar[OrderedDict[Path, ARIBTTMLPacketIndex]] = OrderedDict()
     _arib_ttml_memory_cache_bytes: ClassVar[dict[Path, int]] = {}
     _arib_ttml_memory_cache_bytes_total = 0
+    # クライアントの12秒先読みをAPI契約とし、seek復元履歴・異常密度の索引・
+    # base64 dataの重複をそれぞれ制限して、録画時間に比例する応答を作らない。
+    _arib_range_seconds_limit = 12.0
+    _arib_restore_packets_limit = 256
+    _arib_range_packets_limit = 1024
+    _arib_response_data_size_limit = 4 * 1024 * 1024
 
     def __init__(self, recorded_video: RecordedVideo) -> None:
         self.recorded_video = recorded_video
 
     @classmethod
     @asynccontextmanager
-    async def __cacheLock(cls, cache_path: Path) -> AsyncGenerator[None, None]:
+    async def __cacheLock(cls, cache_path: Path) -> AsyncGenerator[None]:
         """cache pathのholder・waiterを参照数へ含め、最後の解放後にentryを回収する。"""
 
         # asyncio taskはawait地点でのみ切り替わるため、entry作成と参照追加を連続して行えば、
@@ -243,6 +250,11 @@ class RecordedSubtitleStream:
                 ):
                     raise ValueError('Recorded subtitle track cache fields are invalid.')
                 normalized_codec = codec.lower()
+                # sidecar は生成cacheを持たない。破損JSONを見逃してreachableを過小評価しない。
+                if 'source' in track:
+                    if track['source'] != 'Sidecar' or normalized_codec != 'webvtt' or stream_index is not None:
+                        raise ValueError('Recorded sidecar subtitle track is invalid.')
+                    continue
                 if normalized_codec == 'arib_ttml':
                     has_arib_ttml_track = True
                     program_number = track.get('program_number')
@@ -299,6 +311,8 @@ class RecordedSubtitleStream:
         track = self.getTrack(subtitle_index)
         if track is None:
             return None
+        if track.get('source') == 'Sidecar' and track['codec'].lower() == 'webvtt':
+            return 'ARIB'
         codec = track['codec'].lower()
         if 'arib' in codec:
             return 'ARIB'
@@ -310,7 +324,18 @@ class RecordedSubtitleStream:
         """テキスト字幕を永続WebVTTキャッシュとして返す。"""
 
         track = self.getTrack(subtitle_index)
-        if track is None or self.getTrackKind(subtitle_index) != 'Text':
+        if track is None:
+            return None
+        # b24tovtt の時刻は録画先頭基準。変換cacheを介さず、現在のsidecarを検査して返す。
+        if track.get('source') == 'Sidecar':
+            if track['codec'].lower() != 'webvtt' or track.get('stream_index') is not None:
+                return None
+            from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
+            sidecar = await KonomiTVBS4KCloudCatalog.artifactPath(self.recorded_video.id, self.recorded_video.file_path, '.vtt')
+            if sidecar is None:
+                return None
+            return await asyncio.to_thread(ReadRecordedWebVTTSidecar, Path(self.recorded_video.file_path), sidecar_path=sidecar)
+        if self.getTrackKind(subtitle_index) != 'Text':
             return None
         stream_index = track.get('stream_index')
         if stream_index is None:
@@ -321,6 +346,11 @@ class RecordedSubtitleStream:
         async with self.__cacheLock(cache_path):
             if cache_path.is_file():
                 return await asyncio.to_thread(cache_path.read_bytes)
+            from app.utils.KonomiTVBS4KCloudTransferManager import (
+                KonomiTVBS4KCloudTransferManager,
+            )
+            self.recorded_video.file_path = str(await KonomiTVBS4KCloudTransferManager.resolvePath(
+                self.recorded_video.id, self.recorded_video.file_path))
             process = await asyncio.create_subprocess_exec(
                 LIBRARY_PATH['FFmpeg8'], '-hide_banner', '-loglevel', 'error',
                 *BuildKonomiTVBS4KMMTTLVInputArguments(self.recorded_video.container_format),
@@ -346,13 +376,33 @@ class RecordedSubtitleStream:
         track = self.getTrack(subtitle_index)
         if (
             track is None or track['codec'].lower() == 'arib_ttml' or
-            self.getTrackKind(subtitle_index) != 'ARIB' or end_time <= start_time
+            self.getTrackKind(subtitle_index) != 'ARIB' or end_time <= start_time or
+            end_time - start_time > self._arib_range_seconds_limit
         ):
             return None
         packets = await self.__loadARIBPackets(subtitle_index, track)
+        range_start = bisect_left(packets, start_time, key=lambda packet: packet['pts'])
+        range_end = bisect_left(packets, end_time, range_start, key=lambda packet: packet['pts'])
+
+        # 指定範囲そのものを欠落させた成功応答は返さない。通常の12秒窓では到達しない件数・
+        # data量を上限として、異常な索引から巨大JSONを構築しない。
+        source_range_packets = packets[range_start:range_end]
+        if (
+            len(source_range_packets) > self._arib_range_packets_limit or
+            sum(len(packet['data']) * 3 for packet in source_range_packets) > self._arib_response_data_size_limit
+        ):
+            return None
+
         # CanvasRendererは管理データ・DRCS・表示状態を内部に保持する。任意位置へのseekでは
-        # 直前の1packetだけでは状態を復元できないため、録画先頭から対象直前までを時系列で返す。
-        # クライアントはseek/初回だけこれを投入し、通常の先読みではrange packetsだけを使う。
+        # 直前の1packetだけでは状態を復元できないため、有限な直前履歴を時系列で返す。
+        # 1packetのdataは管理データ・DRCSにも最大2回重複するため、最悪時の応答量で選別する。
+        restore_start = max(0, range_start - self._arib_restore_packets_limit)
+        source_restore_packets = packets[restore_start:range_start]
+        range_data_size = sum(len(packet['data']) * 3 for packet in source_range_packets)
+        restore_data_size = sum(len(packet['data']) * 3 for packet in source_restore_packets)
+        while range_data_size + restore_data_size > self._arib_response_data_size_limit:
+            restore_data_size -= len(source_restore_packets.pop(0)['data']) * 3
+
         restore_packets: list[ARIBSubtitlePacket] = [
             {
                 'pts': packet['pts'],
@@ -360,18 +410,17 @@ class RecordedSubtitleStream:
                 'data': packet['data'],
                 'is_restore_point': True,
             }
-            for packet in packets
-            if packet['pts'] < start_time
+            for packet in source_restore_packets
         ]
-        range_packets: list[ARIBSubtitlePacket] = []
-        for packet in packets:
-            if start_time <= packet['pts'] < end_time:
-                range_packets.append({
-                    'pts': packet['pts'],
-                    'duration': packet['duration'],
-                    'data': packet['data'],
-                    'is_restore_point': False,
-                })
+        range_packets: list[ARIBSubtitlePacket] = [
+            {
+                'pts': packet['pts'],
+                'duration': packet['duration'],
+                'data': packet['data'],
+                'is_restore_point': False,
+            }
+            for packet in source_range_packets
+        ]
         management_data: list[str] = []
         drcs: list[str] = []
         for packet in [*restore_packets, *range_packets]:
@@ -397,6 +446,7 @@ class RecordedSubtitleStream:
 
         if (
             end_time <= start_time or
+            end_time - start_time > self._arib_range_seconds_limit or
             not any(track['codec'].lower() == 'arib_ttml' for track in self.recorded_video.subtitle_tracks)
         ):
             return None
@@ -439,6 +489,13 @@ class RecordedSubtitleStream:
             }
             for packet in packet_index.packets[range_start:range_end]
         ]
+        if (
+            len(restore_packets) + len(range_packets) >
+                self._arib_restore_packets_limit + self._arib_range_packets_limit or
+            sum(len(packet['data']) for packet in [*restore_packets, *range_packets]) >
+                self._arib_response_data_size_limit
+        ):
+            return None
         return {
             'start_time': start_time,
             'end_time': end_time,
@@ -467,6 +524,11 @@ class RecordedSubtitleStream:
                     pass
 
             # fMP4映像タイムラインと同じ録画先頭0秒へPTSを揃えるため、コンテナの開始時刻だけを得る。
+            from app.utils.KonomiTVBS4KCloudTransferManager import (
+                KonomiTVBS4KCloudTransferManager,
+            )
+            self.recorded_video.file_path = str(await KonomiTVBS4KCloudTransferManager.resolvePath(
+                self.recorded_video.id, self.recorded_video.file_path))
             process = await asyncio.create_subprocess_exec(
                 LIBRARY_PATH['FFprobe8'], '-v', 'error',
                 '-show_entries', 'format=start_time', '-of', 'json',
@@ -742,6 +804,16 @@ class RecordedSubtitleStream:
     async def __loadARIBPackets(self, subtitle_index: int, track: SubtitleTrack) -> list[ARIBSubtitlePacket]:
         """FFprobe 8の全packet索引をサーバーデータ領域へ永続化する。"""
 
+        # sidecar は録画本体と別に更新されるため、本体hash由来のcacheを一切再利用しない。
+        if track.get('source') == 'Sidecar':
+            from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
+            sidecar = await KonomiTVBS4KCloudCatalog.artifactPath(self.recorded_video.id, self.recorded_video.file_path, '.vtt')
+            if sidecar is None:
+                return []
+            sidecar_packets = await asyncio.to_thread(ReadRecordedARIBSidecar, Path(self.recorded_video.file_path), sidecar_path=sidecar)
+            return [ARIBSubtitlePacket(
+                pts=pts, duration=duration, data=base64.b64encode(data).decode(), is_restore_point=False,
+            ) for pts, duration, data in sidecar_packets]
         stream_index = track.get('stream_index')
         if stream_index is None:
             return []
@@ -752,6 +824,11 @@ class RecordedSubtitleStream:
                     return cast(list[ARIBSubtitlePacket], json.loads(await asyncio.to_thread(cache_path.read_text)))
                 except (OSError, json.JSONDecodeError):
                     pass
+            from app.utils.KonomiTVBS4KCloudTransferManager import (
+                KonomiTVBS4KCloudTransferManager,
+            )
+            self.recorded_video.file_path = str(await KonomiTVBS4KCloudTransferManager.resolvePath(
+                self.recorded_video.id, self.recorded_video.file_path))
             process = await asyncio.create_subprocess_exec(
                 LIBRARY_PATH['FFprobe8'], '-v', 'error', '-select_streams', str(stream_index),
                 '-show_packets', '-show_data', '-show_format',

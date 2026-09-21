@@ -73,7 +73,11 @@ const useVersionStore = defineStore('version', {
         is_jikkyo_enabled_on_server(): boolean {
             // 未取得時・取得失敗時・旧サーバーからフィールドが返らない場合は、外部サービスへ接続しないよう必ず無効として扱う
             return this.is_server_version_fetch_failed === false && this.server_version_info?.jikkyo_enabled === true;
-        }
+        },
+        is_server_debug_enabled(): boolean {
+            // 未取得時・取得失敗時・旧サーバーからフィールドが返らない場合はデバッグ項目を出さない
+            return this.is_server_version_fetch_failed === false && this.server_version_info?.debug === true;
+        },
     },
     actions: {
 

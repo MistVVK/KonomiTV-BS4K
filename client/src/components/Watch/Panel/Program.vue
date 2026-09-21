@@ -31,7 +31,7 @@
                 </div>
                 <div class="program-info__media-item" v-if="channelsStore.channel.current.program_present.video_type">
                     <Icon icon="fluent:video-16-filled" height="17px" />
-                    <span class="ml-2">映像詳細: {{channelsStore.channel.current.program_present.video_type}}</span>
+                    <span class="ml-2">映像詳細: {{videoTypeDetailLabel}}</span>
                 </div>
                 <div class="program-info__media-item">
                     <Icon icon="fluent:headphones-sound-wave-20-filled" height="17px" />
@@ -121,9 +121,9 @@
                 <v-card-text class="pt-2 pb-0">
                     <!-- 予約の基本情報 -->
                     <div v-if="reservation" class="mb-4">
-                        <div class="text-h6 text-text mb-2"
+                        <div class="text-title-large text-text mb-2"
                             v-html="ProgramUtils.decorateProgramInfo(reservation.program, 'title')"></div>
-                        <div class="text-body-2 text-text-darken-1">
+                        <div class="text-body-medium text-text-darken-1">
                             {{ProgramUtils.getProgramTime(reservation.program)}}
                         </div>
                     </div>
@@ -166,8 +166,13 @@ import { defineComponent } from 'vue';
 import type { IProgramDisplay } from '@/services/Programs';
 
 import Message from '@/message';
+import {
+    classifyKonomiTVBS4KHdrSource,
+    resolveKonomiTVBS4KEffectiveTransferCharacteristics,
+} from '@/services/player/KonomiTVBS4KHdrPolicy';
 import Reservations, { IReservation } from '@/services/Reservations';
 import useChannelsStore from '@/stores/ChannelsStore';
+import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore from '@/stores/SettingsStore';
 import useVersionStore from '@/stores/VersionStore';
 import Utils, { ChannelUtils, ProgramUtils } from '@/utils';
@@ -200,7 +205,29 @@ export default defineComponent({
         };
     },
     computed: {
-        ...mapStores(useChannelsStore, useSettingsStore, useVersionStore),
+        ...mapStores(useChannelsStore, useSettingsStore, useVersionStore, usePlayerStore),
+
+        // SI の video_type は改変せず、判定できたときだけ HLG / PQ / SDR を接尾辞にする。
+        videoTypeDetailLabel(): string {
+            const video_type = this.channelsStore.channel.current.program_present?.video_type;
+            if (video_type === null || video_type === undefined || video_type === '') {
+                return '';
+            }
+
+            // VUI → B60 → MH-EIT の優先順で、コーデックに依存しない実効 transfer を求める。
+            const transfer = resolveKonomiTVBS4KEffectiveTransferCharacteristics(
+                this.playerStore.sps_transfer_characteristics,
+                this.playerStore.b60_video_transfer,
+                this.playerStore.mh_eit_hdr_hint,
+            );
+            if (transfer === null) {
+                // すべて未観測の間は、誤った方式を表示せず従来どおり video_type だけを表示する。
+                return video_type;
+            }
+            const source = classifyKonomiTVBS4KHdrSource(transfer);
+            const suffix = source === 'Hlg' ? 'HLG' : source === 'Pq' ? 'PQ' : 'SDR';
+            return `${video_type} / ${suffix}`;
+        },
 
         // 実際のワンセグ現在番組がなければ、親フルセグ局由来の最小表示情報を利用する
         programPresentForDisplay(): IProgramDisplay | null {

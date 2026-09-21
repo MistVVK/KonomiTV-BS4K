@@ -20,6 +20,8 @@ export interface IVersionInformation {
     bs4k_ignore_viewer_low_latency: boolean;
     konomitv_bs4k_live_transport: 'MpegTs' | 'Tlv';
     jikkyo_enabled: boolean;
+    // 視聴経路向けの非機密 runtime 情報。DPlayer HDR 出力のデバッグ項目表示に使う
+    debug: boolean;
 }
 
 

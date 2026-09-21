@@ -15,6 +15,7 @@ from typing import ClassVar, Literal, TypeVar, cast
 
 from app import logging
 from app.config import Config
+from app.constants import DATA_DIR
 from app.models.RecordedVideo import RecordedVideo
 
 
@@ -28,7 +29,7 @@ class RecordedFMP4Variant:
 
     # 生成パイプラインの変更時にこの値を上げ、互換性のない旧キャッシュとの衝突を防ぐ。
     # キャッシュの配置形式は変わらないため、LAYOUT_VERSION とは独立した内部改訂値とする。
-    PIPELINE_REVISION: ClassVar[int] = 8
+    PIPELINE_REVISION: ClassVar[int] = 14
 
     quality: str
     codec: str
@@ -194,7 +195,11 @@ class RecordedFMP4CacheManager:
         """設定値または元動画の親フォルダから実際の保存先を解決する。"""
 
         configured_folder = Config().video.recorded_fmp4_cache_folder
-        return configured_folder if configured_folder is not None else Path(recorded_video.file_path).parent
+        if configured_folder is not None:
+            return configured_folder
+        # クラウドの読取りmountをキャッシュ書込み先へ流用しない。
+        source = Path(recorded_video.file_path)
+        return DATA_DIR if source.is_relative_to('/cloud-mounts') else source.parent
 
     @classmethod
     def buildPath(
@@ -228,7 +233,7 @@ class RecordedFMP4CacheManager:
     async def __pathLock(
         cls,
         cache_path: Path,
-    ) -> AsyncGenerator[KonomiTVBS4KRecordedFMP4PathLock, None]:
+    ) -> AsyncGenerator[KonomiTVBS4KRecordedFMP4PathLock]:
         """Manager 内操作を cache path 固有 lock で直列化する。
 
         Args:
@@ -439,6 +444,47 @@ class RecordedFMP4CacheManager:
         await cls.__waitReleaseTask(previous_task)
 
     @classmethod
+    async def deleteForRecordedVideo(cls, recorded_video: RecordedVideo) -> None:
+        """録画削除時に対象録画だけの予約キャッシュを即時回収する。
+
+        Args:
+            recorded_video: 削除対象と保存先・cache prefixを特定する録画情報。
+
+        Returns:
+            None
+        """
+
+        try:
+            cache_folder = cls.getCacheFolder(recorded_video)
+        except AssertionError:
+            # サーバー起動前の保守呼び出しでは Config が未初期化でも、既定配置の回収は実行できる。
+            source = Path(recorded_video.file_path)
+            cache_folder = DATA_DIR if source.is_relative_to('/cloud-mounts') else source.parent
+        if cache_folder.is_dir() is False:
+            return
+        current_prefix = f'{cls.FILE_PREFIX}{recorded_video.id}-{recorded_video.file_hash}-'
+        legacy_prefix = f'.konomitv-fmp4-v1-{recorded_video.id}-{recorded_video.file_hash}-'
+        try:
+            cache_paths = await asyncio.to_thread(lambda: list(cache_folder.iterdir()))
+        except OSError as ex:
+            raise OSError(f'Failed to enumerate caches for deleted recording: {ex}') from ex
+
+        # セッション停止後なので参照は空だが、delayed delete と同じ path lock で競合なく即時削除する。
+        for cache_path in cache_paths:
+            if (
+                cache_path.name.startswith((current_prefix, legacy_prefix)) and
+                cls.isCacheFileName(cache_path.name)
+            ):
+                await cls.cleanupDiscovered(cache_path)
+                try:
+                    await asyncio.to_thread(cache_path.stat)
+                except FileNotFoundError:
+                    continue
+                except OSError as ex:
+                    raise OSError(f'Failed to verify deleted fMP4 cache: {cache_path}') from ex
+                raise OSError(f'Failed to delete fMP4 cache: {cache_path}')
+
+    @classmethod
     async def cleanupStale(cls) -> None:
         """前プロセスが残した予約キャッシュだけを起動時に削除する。"""
 
@@ -447,7 +493,7 @@ class RecordedFMP4CacheManager:
         if configured_folder is not None:
             folders.add(configured_folder)
         file_paths = cast(list[str], await RecordedVideo.all().values_list('file_path', flat=True))
-        folders.update(Path(file_path).parent for file_path in file_paths)
+        folders.update(DATA_DIR if Path(file_path).is_relative_to('/cloud-mounts') else Path(file_path).parent for file_path in file_paths)
         for folder in folders:
             if folder.is_dir() is False:
                 continue

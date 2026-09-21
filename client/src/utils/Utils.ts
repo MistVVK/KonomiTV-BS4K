@@ -2,6 +2,7 @@
 import { AxiosResponseHeaders, RawAxiosResponseHeaders } from 'axios';
 
 import useSettingsStore from '@/stores/SettingsStore';
+import { dayjs } from '@/utils';
 
 
 /**
@@ -9,9 +10,8 @@ import useSettingsStore from '@/stores/SettingsStore';
  */
 export default class Utils {
 
-    // <video> が Authorization ヘッダを送れないために使う、動画プロキシ専用 Cookie。
-    // Server 側と同じ名前を維持し、Path を動画 endpoint だけへ限定する。
-    private static readonly twitter_video_access_token_cookie_name = 'KonomiTV-TwitterVideoAccessToken';
+    // ログイン・ログアウトをまたいで古い非同期認証処理の結果を適用しないための、タブ内の認証世代
+    private static authentication_generation = 0;
 
     // バージョン情報
     // ビルド時の環境変数 (vue.config.js に記載) から取得
@@ -22,8 +22,8 @@ export default class Utils {
     // Worker からも参照できるように self.location を使う
     static readonly api_base_url = (() => {
         if (import.meta.env.DEV === true) {
-            // デバッグ時はポートを 7000 に強制する
-            return `${self.location.protocol}//${self.location.hostname}:7000/api`;
+            // デバッグ時は Development サーバーのポートを使う
+            return `${self.location.protocol}//${self.location.hostname}:7100/api`;
         } else {
             // ビルド後は同じポートを使う
             return `${self.location.protocol}//${self.location.host}/api`;
@@ -51,6 +51,25 @@ export default class Utils {
 
 
     /**
+     * 現在のタブ内の認証世代を取得する
+     * @returns ログイン・ログアウトの開始ごとに増える認証世代
+     */
+    static getAuthenticationGeneration(): number {
+
+        return Utils.authentication_generation;
+    }
+
+
+    /**
+     * 進行中の古い認証処理を無効化するため、タブ内の認証世代を更新する
+     */
+    static invalidateAuthentication(): void {
+
+        Utils.authentication_generation += 1;
+    }
+
+
+    /**
      * アクセストークンを LocalStorage に保存する
      * @param access_token 発行された JWT アクセストークン
      */
@@ -58,7 +77,6 @@ export default class Utils {
 
         // そのまま LocalStorage に保存
         localStorage.setItem('KonomiTV-AccessToken', access_token);
-        Utils.syncTwitterVideoAccessTokenCookie(access_token);
     }
 
 
@@ -70,24 +88,6 @@ export default class Utils {
 
         // KonomiTV-AccessToken キーを削除
         localStorage.removeItem('KonomiTV-AccessToken');
-        Utils.syncTwitterVideoAccessTokenCookie(null);
-    }
-
-
-    /**
-     * Twitter 動画プロキシ専用の認証 Cookie を現在のアクセストークンへ同期する
-     * @param access_token JWT アクセストークン（削除する場合は null）
-     */
-    static syncTwitterVideoAccessTokenCookie(access_token: string | null): void {
-
-        const cookie_value = access_token === null ? '' : encodeURIComponent(access_token);
-        const max_age = access_token === null ? '; Max-Age=0' : '';
-        document.cookie = [
-            `${Utils.twitter_video_access_token_cookie_name}=${cookie_value}`,
-            'Path=/api/twitter/video-proxy',
-            'SameSite=Strict',
-            'Secure',
-        ].join('; ') + max_age;
     }
 
 
@@ -131,17 +131,8 @@ export default class Utils {
 
         // ユーティリティ: 日付文字列 YYYY/MM/DD を 1 日戻す
         const prevDateStr = (y: number, m: number, d: number, withWeek: boolean): string => {
-            const date = new Date(y, m - 1, d);
-            date.setDate(date.getDate() - 1);
-            const yy = date.getFullYear();
-            const mm = String(date.getMonth() + 1).padStart(2, '0');
-            const dd = String(date.getDate()).padStart(2, '0');
-            if (withWeek) {
-                const weeks = '日月火水木金土';
-                const w = weeks[date.getDay()];
-                return `${yy}/${mm}/${dd} (${w})`;
-            }
-            return `${yy}/${mm}/${dd}`;
+            const date = dayjs(`${y}-${m}-${d}`).subtract(1, 'day');
+            return date.format(withWeek ? 'YYYY/MM/DD (dd)' : 'YYYY/MM/DD');
         };
 
         // 1) YYYY/MM/DD (w) HH:mm[:ss]
@@ -171,18 +162,16 @@ export default class Utils {
         );
 
         // 3) MM/DD HH:mm[:ss]
-        const baseYear = new Date().getFullYear();
+        const baseYear = dayjs().year();
         text = text.replace(Utils.month_day_time_pattern,
             (_m, m, d, hh, mm, ss) => {
                 const hour = parseInt(hh, 10);
                 if (hour >= 0 && hour <= 3) {
                     // 年は表示されないため、現在年を基準に日付計算のみ行う
-                    const date = new Date(baseYear, parseInt(m, 10) - 1, parseInt(d, 10));
-                    date.setDate(date.getDate() - 1);
-                    const mm2 = String(date.getMonth() + 1).padStart(2, '0');
-                    const dd2 = String(date.getDate()).padStart(2, '0');
+                    const date = dayjs(`${baseYear}-${m}-${d}`).subtract(1, 'day');
+                    const previous_date = date.format('MM/DD');
                     const newH = String(hour + 24).padStart(2, '0');
-                    return `${mm2}/${dd2} ${newH}:${mm}${ss ? `:${ss}` : ''}`;
+                    return `${previous_date} ${newH}:${mm}${ss ? `:${ss}` : ''}`;
                 }
                 return `${m}/${d} ${hh}:${mm}${ss ? `:${ss}` : ''}`;
             }
@@ -349,7 +338,8 @@ export default class Utils {
      */
     static isChromium(): boolean {
         const brands = navigator.userAgentData?.brands;
-        if (brands !== undefined) {
+        // Chromium 151 以降などで brands が空配列に制限される場合は、従来の UA 判定へ戻す。
+        if (brands !== undefined && brands.length > 0) {
             return brands.some(brand => /Chromium|Google Chrome|Microsoft Edge|Opera|Brave/i.test(brand.brand));
         }
         return /Chrom(e|ium)|Edg|OPR/i.test(navigator.userAgent);

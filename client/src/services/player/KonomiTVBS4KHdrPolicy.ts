@@ -1,0 +1,116 @@
+import type { KonomiTVBS4KHdrOutput } from '@/stores/SettingsStore';
+
+
+export type KonomiTVBS4KHdrRewriteMode = 'None' | 'ToneMap' | 'SdrInHlg' | 'Debug';
+export type KonomiTVBS4KHdrSourceKind = 'None' | 'Hlg' | 'Pq';
+export type KonomiTVBS4KHdrDesiredOutput = 'HDR' | 'SDR' | 'Debug';
+
+export const CICP_BT709_TRANSFER = 1;
+export const CICP_BT2020_12_TRANSFER = 14;
+export const CICP_PQ_TRANSFER = 16;
+export const CICP_HLG_TRANSFER = 18;
+export const B60_UHD_SDR = 3;
+export const B60_HLG = 5;
+
+export function detectKonomiTVBS4KHdrDisplayCapability(): boolean {
+    if (typeof window.matchMedia === 'function') {
+        if (window.matchMedia('(video-dynamic-range: high)').matches === true) {
+            return true;
+        }
+        if (window.matchMedia('(dynamic-range: high)').matches === true) {
+            return true;
+        }
+        if (
+            window.screen.pixelDepth > 24 &&
+            window.matchMedia('(color-gamut: p3)').matches === true
+        ) {
+            return true;
+        }
+    }
+    // 判定不能は SDR 変換側。HDR 番組の白飛びより被害が小さい。
+    return false;
+}
+
+export function resolveKonomiTVBS4KHdrOutput(
+    setting: KonomiTVBS4KHdrOutput,
+    override: KonomiTVBS4KHdrOutput | 'Debug' | null,
+): KonomiTVBS4KHdrDesiredOutput {
+    const requested = override ?? setting;
+    // Debug は Auto の HDR/SDR 判定に落とさない。視聴中 override 専用の左右比較モード。
+    if (requested === 'Debug') {
+        return 'Debug';
+    }
+    if (requested === 'HDR' || requested === 'SDR') {
+        return requested;
+    }
+    return detectKonomiTVBS4KHdrDisplayCapability() === true ? 'HDR' : 'SDR';
+}
+
+export function classifyKonomiTVBS4KHdrSource(
+    transfer_characteristics: number | null,
+): KonomiTVBS4KHdrSourceKind {
+    if (transfer_characteristics === CICP_HLG_TRANSFER) {
+        return 'Hlg';
+    }
+    if (transfer_characteristics === CICP_PQ_TRANSFER) {
+        return 'Pq';
+    }
+    return 'None';
+}
+
+export function resolveKonomiTVBS4KEffectiveTransferCharacteristics(
+    vui_transfer_characteristics: number | null,
+    b60_video_transfer: number | null,
+    mh_eit_hdr_hint: boolean | null,
+): number | null {
+    // 映像ストリームから直接得た VUI を最優先する。18=HLG / 16=PQ、それ以外の既知値は SDR。
+    if (vui_transfer_characteristics !== null) {
+        return vui_transfer_characteristics;
+    }
+    // VP9 / AV1 / AVC など MPEG-TS の VUI を読めない場合は ARIB STD-B60 を使う。
+    // video_transfer_characteristics は 5=HLG / 3=UHD SDR。SDR は代表値の BT.2020 を返す。
+    if (b60_video_transfer === B60_HLG) {
+        return CICP_HLG_TRANSFER;
+    }
+    if (b60_video_transfer === B60_UHD_SDR) {
+        return CICP_BT2020_12_TRANSFER;
+    }
+    // B60 も未判定なら現在番組の MH-EIT HDR アイコンを最後のヒントとして使う。
+    if (mh_eit_hdr_hint !== null) {
+        return mh_eit_hdr_hint === true ? CICP_HLG_TRANSFER : CICP_BT2020_12_TRANSFER;
+    }
+    return null;
+}
+
+export function resolveKonomiTVBS4KHdrRewriteMode(
+    transfer_characteristics: number | null,
+    b60_video_transfer: number | null,
+    desired_output: KonomiTVBS4KHdrDesiredOutput,
+): KonomiTVBS4KHdrRewriteMode {
+    const source = classifyKonomiTVBS4KHdrSource(transfer_characteristics);
+    if (source === 'None') {
+        return 'None';
+    }
+    if (source === 'Hlg' && b60_video_transfer === B60_UHD_SDR) {
+        return 'SdrInHlg';
+    }
+    // Debug は canvas 判定用。ライブ mpegts の実モードは None（素通し）へ落とす。
+    if (desired_output === 'Debug') {
+        return 'Debug';
+    }
+    if (desired_output === 'SDR') {
+        return 'ToneMap';
+    }
+    return 'None';
+}
+
+export function resolveKonomiTVBS4KLiveMpegtsColorRewrite(
+    desired: KonomiTVBS4KHdrDesiredOutput,
+): 'None' | 'ToneMap' {
+    // ライブ mpegts は ToneMap / None。Debug は右半面を <video> 素通しにするため None。
+    return desired === 'SDR' ? 'ToneMap' : 'None';
+}
+
+export function shouldDrawKonomiTVBS4KHdrCanvas(mode: KonomiTVBS4KHdrRewriteMode): boolean {
+    return mode === 'ToneMap' || mode === 'Debug';
+}

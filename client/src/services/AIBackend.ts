@@ -1,5 +1,5 @@
 /**
- * AI バックエンド (OpenCode service) 管理 API クライアント。
+ * AI バックエンド (OpenCode / OpenAI 互換 HTTP / ACP) 管理 API クライアント。
  */
 
 import APIClient from '@/services/APIClient';
@@ -12,16 +12,14 @@ export type AIProviderSupportKind = 'Supported' | 'UnsupportedComplex';
 export type AIProviderAuthMethodType = 'api' | 'oauth' | 'vertex_adc';
 export type OpenCodeProviderType = 'Catalog' | 'OpenAICompatible' | 'AnthropicCompatible';
 export type StructuredOutputMode = 'Auto' | 'StructuredOutput' | 'JSONText';
+export type OpenAICompatibleSlot = 1 | 2;
 
-/** OpenCode serve の availability。 */
+/** listener-free OpenCode CLI の availability。 */
 export interface IOpenCodeAvailability {
     available: boolean;
-    base_url: string;
-    host: string;
-    port: number;
+    transport: 'CLI';
     version: string | null;
     pinned_version: string;
-    pid: number | null;
     workspace: string;
 }
 
@@ -183,11 +181,36 @@ export interface IAIBackendOAuthStartResult {
     authorize: Record<string, unknown>;
 }
 
+/** 進行中の OAuth device authorization の状態（poll 用）。 */
+export interface IAIBackendOAuthStatus {
+    provider_id: string;
+    method: number | null;
+    status: 'None' | 'InProgress' | 'Succeeded' | 'Failed' | 'Timeout';
+    url: string | null;
+    instructions: string | null;
+    error: string | null;
+}
+
+/** OpenCode を通さない OpenAI 互換 HTTP バックエンドの共有設定。 */
+export interface IOpenAICompatibleSettings {
+    api_base_url: string | null;
+    model: string | null;
+    api_key_configured: boolean;
+}
+
+/** OpenAI 互換 HTTP バックエンドの非秘密設定更新リクエスト。 */
+export type IOpenAICompatibleSettingsUpdate = Pick<IOpenAICompatibleSettings, 'api_base_url' | 'model'>;
+
+/** OpenAI 互換 HTTP の独立スロットに対応する API prefix を返す。 */
+function openAICompatibleAPIPath(slot: OpenAICompatibleSlot): string {
+    return slot === 1 ? '/ai-backends/openai-compatible' : '/ai-backends/openai-compatible-2';
+}
+
 
 // ===== ACP 固定プリセット（Codex / Grok Build） =====
 
-/** ACP の推論深さ。Codex は XHigh/Max/Ultra まで、Grok は Low〜High。 */
-export type AcpReasoningEffort = 'Low' | 'Medium' | 'High' | 'XHigh' | 'Max' | 'Ultra';
+/** ACP agent が広告する opaque な推論深さ ID。 */
+export type AcpReasoningEffort = string;
 /** ACP 固定プリセットのバックエンド種別。 */
 export type ACPBackendKind = 'AcpCodex' | 'AcpGrok';
 
@@ -205,6 +228,26 @@ export interface IACPBackendSettings {
 export interface IACPSettings {
     codex: IACPBackendSettings;
     grok: IACPBackendSettings;
+}
+
+/** Codex / Grok ACP が configOptions で広告した推論深さ1件。 */
+export interface IACPReasoningEffort {
+    reasoning_effort_id: string;
+    reasoning_effort_name: string;
+}
+
+/** Codex / Grok ACP が session/new で広告したモデルと推論深さ。 */
+export interface IACPModel {
+    model_id: string;
+    model_name: string;
+    current_reasoning_effort_id: string;
+    reasoning_efforts: IACPReasoningEffort[];
+}
+
+/** Codex / Grok ACP が session/new で広告したモデル一覧。 */
+export interface IACPModelCatalog {
+    current_model_id: string;
+    models: IACPModel[];
 }
 
 /** 認証内容を含まない ACP 共有資格情報状態。 */
@@ -249,7 +292,77 @@ export interface IACPBackendConnectionTestResult {
 
 export default class AIBackend {
 
-    /** OpenCode serve の health を取得する。 */
+    // ===== 独立 OpenAI 互換 HTTP バックエンド =====
+
+    /** API キー本体を含まない OpenAI 互換 HTTP 設定を取得する。 */
+    static async fetchOpenAICompatibleSettings(
+        slot: OpenAICompatibleSlot = 1,
+    ): Promise<IOpenAICompatibleSettings | null> {
+        const response = await APIClient.get<IOpenAICompatibleSettings>(
+            `${openAICompatibleAPIPath(slot)}/settings`,
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API 設定を取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    /** OpenAI 互換 HTTP の API ベース URL とモデルを保存する。 */
+    static async updateOpenAICompatibleSettings(
+        settings: IOpenAICompatibleSettingsUpdate,
+        slot: OpenAICompatibleSlot = 1,
+    ): Promise<boolean> {
+        const response = await APIClient.put(`${openAICompatibleAPIPath(slot)}/settings`, settings);
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API 設定を保存できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** OpenAI 互換 HTTP の専用 API キーを保存する。 */
+    static async setOpenAICompatibleAPIKey(
+        api_key: string,
+        slot: OpenAICompatibleSlot = 1,
+    ): Promise<boolean> {
+        const response = await APIClient.put(`${openAICompatibleAPIPath(slot)}/api-key`, {api_key});
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API キーを設定できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** OpenAI 互換 HTTP の専用 API キーを削除する。 */
+    static async deleteOpenAICompatibleAPIKey(slot: OpenAICompatibleSlot = 1): Promise<boolean> {
+        const response = await APIClient.delete(`${openAICompatibleAPIPath(slot)}/api-key`);
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API キーを削除できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** 保存済み OpenAI 互換 HTTP 設定で接続試験を実行する。 */
+    static async testOpenAICompatibleConnection(
+        capability: AIBackendConnectionCapability,
+        slot: OpenAICompatibleSlot = 1,
+    ): Promise<IAIBackendConnectionTestResult | null> {
+        const response = await APIClient.post<IAIBackendConnectionTestResult>(
+            `${openAICompatibleAPIPath(slot)}/connection-test`,
+            {capability},
+            // server の read timeout 10分と監査保存の回収余裕1分を待つ。
+            {timeout: 11 * 60 * 1000},
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'OpenAI 互換 API の接続試験を実行できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+    /** OpenCode CLI の availability を取得する。 */
     static async fetchHealth(): Promise<IOpenCodeAvailability | null> {
         const response = await APIClient.get<IOpenCodeAvailability>('/ai-backends/health');
         if (response.type === 'error') {
@@ -352,7 +465,26 @@ export default class AIBackend {
             {method},
         );
         if (response.type === 'error') {
-            APIClient.showGenericError(response, 'OAuth を開始できませんでした。');
+            APIClient.showGenericError(
+                response,
+                response.status === 501
+                    ? 'このプロバイダでは新規 OAuth を開始できません。製品用 auth.json に既存トークンを手動配置するか、API キー認証を使用してください。'
+                    : 'OAuth を開始できませんでした。',
+            );
+            return null;
+        }
+        return response.data;
+    }
+
+    /**
+     * 進行中の OAuth device authorization の状態を取得する（poll 用）。
+     * 失敗時は null を返す（一時的な通信失敗で poll を止めないため汎用エラーは出さない）。
+     */
+    static async getOAuthStatus(service_id: string): Promise<IAIBackendOAuthStatus | null> {
+        const response = await APIClient.get<IAIBackendOAuthStatus>(
+            `/ai-backends/${service_id}/oauth/status`,
+        );
+        if (response.type === 'error') {
             return null;
         }
         return response.data;
@@ -374,7 +506,12 @@ export default class AIBackend {
             {timeout: 120 * 1000},
         );
         if (response.type === 'error') {
-            APIClient.showGenericError(response, 'OAuth の完了処理に失敗しました。');
+            APIClient.showGenericError(
+                response,
+                response.status === 501
+                    ? 'listener なしの OpenCode CLI では OAuth callback を処理できません。製品用 auth.json に既存トークンを手動配置するか、API キー認証を使用してください。'
+                    : 'OAuth の完了処理に失敗しました。',
+            );
             return false;
         }
         return true;
@@ -398,12 +535,12 @@ export default class AIBackend {
         const response = await APIClient.post<IAIBackendConnectionTestResult>(
             '/ai-backends/connection-test',
             {service_id, capability},
-            // 接続試験は時間がかかることがある
-            {timeout: 180 * 1000},
+            // Auto の2 prompt × 最大2 session（各10分）と session 回収余裕5分を待つ。
+            {timeout: 45 * 60 * 1000},
         );
         if (response.type === 'error') {
             if (response.status === 503) {
-                APIClient.showGenericError(response, 'OpenCode serve が利用できません。');
+                APIClient.showGenericError(response, 'OpenCode CLI が利用できません。');
             } else {
                 APIClient.showGenericError(response, '接続試験を実行できませんでした。');
             }
@@ -440,12 +577,32 @@ export default class AIBackend {
 
     /** ACP 固定プリセット設定を保存する（全体置き換え）。 */
     static async updateACPSettings(settings: IACPSettings): Promise<boolean> {
-        const response = await APIClient.put('/ai-backends/acp-settings', settings);
+        const response = await APIClient.put(
+            '/ai-backends/acp-settings',
+            settings,
+            // 保存直前に Codex / Grok の最新広告を取得して検証する時間を確保する。
+            {timeout: 130 * 1000},
+        );
         if (response.type === 'error') {
             APIClient.showGenericError(response, 'ACP 設定を保存できませんでした。');
             return false;
         }
         return true;
+    }
+
+    /** Codex / Grok ACP が session/new で広告したモデル一覧を取得する。 */
+    static async fetchACPModels(provider: 'codex' | 'grok'): Promise<IACPModelCatalog | null> {
+        const response = await APIClient.get<IACPModelCatalog>(
+            `/ai-backends/acp-models/${provider}`,
+            // agent の initialize と session/new、process 回収を待つ。
+            {timeout: 70 * 1000},
+        );
+        if (response.type === 'error') {
+            const provider_name = provider === 'codex' ? 'Codex' : 'Grok';
+            APIClient.showGenericError(response, `${provider_name} ACP のモデル候補を取得できませんでした。`);
+            return null;
+        }
+        return response.data;
     }
 
     /** ACP 認証状態を取得する。 */

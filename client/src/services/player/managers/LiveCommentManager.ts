@@ -63,6 +63,10 @@ class LiveCommentManager implements PlayerManager {
     // 破棄済みかどうか
     private destroyed = false;
 
+    // init() ごとの owner 世代番号
+    // 破棄前に開始した API 待機・再接続・コメント遅延が、新しい視聴セッションを復活させないために利用する
+    private lifecycle_generation = 0;
+
     /**
      * コンストラクタ
      * @param player DPlayer のインスタンス
@@ -78,6 +82,16 @@ class LiveCommentManager implements PlayerManager {
     }
 
 
+    /** 指定した owner 世代と WebSocket セッションが現在も有効かを返す。 */
+    private isLifecycleCurrent(lifecycle_generation: number, session_signal?: AbortSignal): boolean {
+        return (
+            this.destroyed === false &&
+            this.lifecycle_generation === lifecycle_generation &&
+            session_signal?.aborted !== true
+        );
+    }
+
+
     /**
      * ニコニコ実況または NX-Jikkyo に接続し、セッションを初期化する
      */
@@ -85,6 +99,9 @@ class LiveCommentManager implements PlayerManager {
         const player_store = usePlayerStore();
         const settings_store = useSettingsStore();
         const user_store = useUserStore();
+
+        // 旧 init() の API 待機・イベント処理を無効化する
+        const lifecycle_generation = ++this.lifecycle_generation;
 
         // PlayerController 側の生成条件をすり抜けても、無効時はユーザー情報取得や接続情報 API へ一切アクセスしない
         if (settings_store.is_jikkyo_enabled === false) {
@@ -94,12 +111,15 @@ class LiveCommentManager implements PlayerManager {
 
         // 破棄済みかどうかのフラグを下ろす
         this.destroyed = false;
+        const session_signal = this.abort_controller.signal;
 
         // ユーザー情報を事前にキャッシュさせておく
         await user_store.fetchUser();
+        if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
 
         // 視聴セッションを初期化
-        const watch_session_info = await this.initWatchSession();
+        const watch_session_info = await this.initWatchSession(lifecycle_generation, session_signal);
+        if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
         if (watch_session_info.is_success === false) {
 
             // 初期化に失敗した際のエラーメッセージを設定する
@@ -118,7 +138,7 @@ class LiveCommentManager implements PlayerManager {
 
         // 視聴セッションを初期化できた場合のみ、
         // 取得したコメントサーバーへの接続情報を使い、非同期でコメントセッションを初期化
-        this.initCommentSession(watch_session_info);
+        this.initCommentSession(watch_session_info, lifecycle_generation, session_signal);
 
         console.log('[LiveCommentManager] Initialized.');
     }
@@ -128,13 +148,19 @@ class LiveCommentManager implements PlayerManager {
      * 視聴セッションを初期化する
      * @returns コメントサーバーへの接続情報 or エラー情報
      */
-    private async initWatchSession(): Promise<IWatchSessionInfo> {
+    private async initWatchSession(
+        lifecycle_generation: number,
+        session_signal: AbortSignal,
+    ): Promise<IWatchSessionInfo> {
         const channels_store = useChannelsStore();
         const settings_store = useSettingsStore();
         const user_store = useUserStore();
 
         // 防御的に再判定し、無効時は WebSocket 接続情報 API へアクセスしない
-        if (settings_store.is_jikkyo_enabled === false) {
+        if (
+            settings_store.is_jikkyo_enabled === false ||
+            this.isLifecycleCurrent(lifecycle_generation, session_signal) === false
+        ) {
             return {
                 is_success: false,
                 detail: '実況機能は無効です。',
@@ -147,6 +173,9 @@ class LiveCommentManager implements PlayerManager {
         // 視聴セッション WebSocket の URL を取得
         // 実際は旧ニコニコ生放送の WebSocket API と互換性がある NX-Jikkyo の WebSocket API の URL が返る
         const websocket_info = await Channels.fetchWebSocketInfo(channels_store.channel.current.id);
+        if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) {
+            return {is_success: false, detail: ''};
+        }
         if (websocket_info === null) {
             return {
                 is_success: false,
@@ -205,6 +234,8 @@ class LiveCommentManager implements PlayerManager {
         // 視聴セッションの接続が開かれたとき
         this.watch_session.addEventListener('open', () => {
 
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
+
             // 視聴セッションをリクエスト
             // 公式ドキュメントいわく、stream フィールドは Optional らしい
             // サーバー負荷軽減のため、映像が不要な場合は必ず省略してくださいとのこと
@@ -215,10 +246,12 @@ class LiveCommentManager implements PlayerManager {
                 },
             }));
 
-        }, { signal: this.abort_controller.signal });
+        }, { signal: session_signal });
 
         // 視聴セッションの接続が閉じられたとき（ネットワークが切断された場合など）
         const on_close = async (event: CloseEvent | Event) => {
+
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
 
             // すでに disconnect メッセージが送られてきている場合は何もしない
             if (is_disconnect_message_received === true) {
@@ -235,16 +268,18 @@ class LiveCommentManager implements PlayerManager {
             // 3 秒ほど待ってから再接続する
             // ニコ生側から切断された場合と異なりネットワークが切断された可能性が高いので、間を多めに取る
             await Utils.sleep(3);
-            await this.reconnect();
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
+            await this.reconnect(lifecycle_generation, session_signal);
 
         };
-        this.watch_session.addEventListener('close', on_close, { signal: this.abort_controller.signal });
-        this.watch_session.addEventListener('error', on_close, { signal: this.abort_controller.signal });
+        this.watch_session.addEventListener('close', on_close, { signal: session_signal });
+        this.watch_session.addEventListener('error', on_close, { signal: session_signal });
 
         // 視聴セッション WebSocket からメッセージを受信したとき
         // 視聴セッションはコメント送信時のために維持し続ける必要がある
         // 以下はいずれも視聴セッションを維持し続けたり、エラーが発生した際に再接続するための処理
         this.watch_session.addEventListener('message', async (event) => {
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
             if (this.watch_session === null) return;
 
             // 各メッセージタイプに対応する処理を実行
@@ -259,6 +294,7 @@ class LiveCommentManager implements PlayerManager {
                     }
                     // keepIntervalSec の秒数ごとに keepSeat を送信して座席を維持する
                     this.keep_seat_interval_id = window.setInterval(() => {
+                        if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
                         if (this.watch_session && this.watch_session.readyState === WebSocket.OPEN) {
                             // セッションがまだ開いていれば、座席を維持する
                             this.watch_session.send(JSON.stringify({type: 'keepSeat'}));
@@ -321,7 +357,8 @@ class LiveCommentManager implements PlayerManager {
 
                     // 3 秒ほど待ってから再接続する
                     await Utils.sleep(3);
-                    await this.reconnect();
+                    if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
+                    await this.reconnect(lifecycle_generation, session_signal);
                     break;
                 }
 
@@ -330,7 +367,7 @@ class LiveCommentManager implements PlayerManager {
                     // waitTimeSec に記載の秒数だけ待ってから再接続する
                     // 公式ドキュメントには reconnect で送られてくる audienceToken で再接続しろと書いてあるんだけど、
                     // 確実性的な面で実装が面倒なので当面このままにしておく
-                    await this.reconnect();
+                    await this.reconnect(lifecycle_generation, session_signal);
                     break;
                 }
 
@@ -380,17 +417,23 @@ class LiveCommentManager implements PlayerManager {
 
                     // 3 秒ほど待ってから再接続する
                     await Utils.sleep(3);
-                    await this.reconnect();
+                    if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
+                    await this.reconnect(lifecycle_generation, session_signal);
                     break;
                 }
             }
 
-        }, { signal: this.abort_controller.signal });
+        }, { signal: session_signal });
 
         // コメントサーバーへの接続情報を返す
         // イベント内で値を返すため、Promise で包む
         return new Promise((resolve) => {
-            this.watch_session!.addEventListener('message', async (event) => {
+            // destroy() で listener が解除された場合も初期化 Promise を待機中のまま残さない
+            session_signal.addEventListener('abort', () => {
+                resolve({is_success: false, detail: ''});
+            }, { once: true });
+            this.watch_session!.addEventListener('message', (event) => {
+                if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
                 const message = JSON.parse(event.data);
 
                 // 2024/08/05 以降のニコニコ生放送では room メッセージは廃止されており、現在は NX-Jikkyo のみが送信している
@@ -444,7 +487,7 @@ class LiveCommentManager implements PlayerManager {
                         your_post_key: `nicolive:${hashed_user_id}`,
                     });
                 }
-            }, { signal: this.abort_controller.signal });
+            }, { signal: session_signal });
         });
     }
 
@@ -453,13 +496,20 @@ class LiveCommentManager implements PlayerManager {
      * コメントセッションを初期化する
      * @param comment_session_info コメントサーバーへの接続情報
      */
-    private initCommentSession(comment_session_info: IWatchSessionInfo): void {
+    private initCommentSession(
+        comment_session_info: IWatchSessionInfo,
+        lifecycle_generation: number,
+        session_signal: AbortSignal,
+    ): void {
         const player_store = usePlayerStore();
         const settings_store = useSettingsStore();
         const user_store = useUserStore();
 
         // 視聴セッション取得後に無効化されていた場合も、コメント WebSocket は開かない
-        if (settings_store.is_jikkyo_enabled === false) {
+        if (
+            settings_store.is_jikkyo_enabled === false ||
+            this.isLifecycleCurrent(lifecycle_generation, session_signal) === false
+        ) {
             return;
         }
 
@@ -477,6 +527,7 @@ class LiveCommentManager implements PlayerManager {
 
         // コメントセッション WebSocket を開いたとき
         this.comment_session.addEventListener('open', () => {
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
             if (this.comment_session === null) return;
 
             // コメント送信をリクエスト
@@ -497,10 +548,12 @@ class LiveCommentManager implements PlayerManager {
                 {ping: {content: 'rf:0'}},
             ]));
 
-        }, { signal: this.abort_controller.signal });
+        }, { signal: session_signal });
 
         // コメントセッションの接続が閉じられたとき（ネットワークが切断された場合など）
         const on_close = async (event: CloseEvent | Event) => {
+
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
 
             // 接続切断の理由を表示
             const code = (event instanceof CloseEvent) ? event.code : 'Error';
@@ -513,10 +566,11 @@ class LiveCommentManager implements PlayerManager {
             // ニコ生側から切断された場合と異なりネットワークが切断された可能性が高いので、間を多めに取る
             // 視聴セッション側が同時に切断され再接続中の場合、this.reconnect() は何も行わない
             await Utils.sleep(3);
-            await this.reconnect();
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
+            await this.reconnect(lifecycle_generation, session_signal);
         };
-        this.comment_session.addEventListener('close', on_close, { signal: this.abort_controller.signal });
-        this.comment_session.addEventListener('error', on_close, { signal: this.abort_controller.signal });
+        this.comment_session.addEventListener('close', on_close, { signal: session_signal });
+        this.comment_session.addEventListener('error', on_close, { signal: session_signal });
 
         // 受信したコメントをイベントリスナーに送信する関数
         // スロットルを設定し、333ms 未満の間隔でイベントが発火しないようにする
@@ -524,7 +578,8 @@ class LiveCommentManager implements PlayerManager {
             if (Utils.isSafari() === false) {
                 console.debug('[LiveCommentManager][CommentSession] Comments buffer length:', comments_buffer.length);
             }
-            if (this.destroyed === false) {  // まだ破棄されていない場合のみイベントを発火
+            // throttle 待機中に破棄・再接続された旧セッションのコメントは発火しない
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal)) {
                 player_store.event_emitter.emit('CommentReceived', {
                     is_initial_comments: false,
                     comments: comments_buffer,
@@ -536,6 +591,7 @@ class LiveCommentManager implements PlayerManager {
 
         // コメントセッション WebSocket からメッセージを受信したとき
         this.comment_session.addEventListener('message', async (event) => {
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
 
             // メッセージを取得
             const message = JSON.parse(event.data);
@@ -553,7 +609,7 @@ class LiveCommentManager implements PlayerManager {
             // この時点で初期コメントを一気にイベントリスナーに送信する
             if (message.ping !== undefined && message.ping.content === 'rf:0') {
                 initial_comments_received = true;
-                if (this.destroyed === false) {  // まだ破棄されていない場合のみイベントを発火
+                if (this.isLifecycleCurrent(lifecycle_generation, session_signal)) {
                     player_store.event_emitter.emit('CommentReceived', {
                         is_initial_comments: true,
                         comments: initial_comments_buffer,
@@ -612,6 +668,7 @@ class LiveCommentManager implements PlayerManager {
                 console.debug(`[LiveCommentManager][CommentSession] Delay: ${comment_delay_time} sec.`);
             }
             await Utils.sleep(comment_delay_time);
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
 
             // コメントを一時バッファに格納し、スロットルを設定してイベントリスナーに送信する
             // コメントの受信間隔が 333ms 以上あれば、今回のコールバックで取得したコメントがダイレクトにイベントリスナーに送信される
@@ -628,7 +685,7 @@ class LiveCommentManager implements PlayerManager {
                 });
             }
 
-        }, { signal: this.abort_controller.signal });
+        }, { signal: session_signal });
     }
 
 
@@ -643,7 +700,7 @@ class LiveCommentManager implements PlayerManager {
         const user_store = useUserStore();
 
         // 非表示のフォームなどから直接呼び出されても、無効時はコメントを送信しない
-        if (settings_store.is_jikkyo_enabled === false) {
+        if (settings_store.is_jikkyo_enabled === false || this.destroyed === true) {
             options.error('実況機能は無効です。');
             return;
         }
@@ -730,7 +787,12 @@ class LiveCommentManager implements PlayerManager {
 
         // コメント送信のレスポンスを取得
         const abort_controller = new AbortController();
+        const lifecycle_generation = this.lifecycle_generation;
+        const session_signal = this.abort_controller.signal;
+        const abort_response_listener = () => abort_controller.abort();
+        session_signal.addEventListener('abort', abort_response_listener, { once: true });
         this.watch_session.addEventListener('message', (event) => {
+            if (this.isLifecycleCurrent(lifecycle_generation, session_signal) === false) return;
             const message = JSON.parse(event.data);
             switch (message.type) {
 
@@ -753,6 +815,7 @@ class LiveCommentManager implements PlayerManager {
                     });
 
                     // イベントリスナーを削除
+                    session_signal.removeEventListener('abort', abort_response_listener);
                     abort_controller.abort();
                     break;
                 }
@@ -773,6 +836,7 @@ class LiveCommentManager implements PlayerManager {
                     options.error(error);
 
                     // イベントリスナーを解除
+                    session_signal.removeEventListener('abort', abort_response_listener);
                     abort_controller.abort();
                     break;
                 }
@@ -785,14 +849,16 @@ class LiveCommentManager implements PlayerManager {
     /**
      * 同じ設定でニコニコ実況または NX-Jikkyo に再接続する
      */
-    private async reconnect(): Promise<void> {
+    private async reconnect(lifecycle_generation: number, source_session_signal: AbortSignal): Promise<void> {
         const player_store = usePlayerStore();
         const settings_store = useSettingsStore();
+
+        // sleep() 中に破棄または別セッションへの再接続が始まっていた場合は何もしない
+        if (this.isLifecycleCurrent(lifecycle_generation, source_session_signal) === false) return;
 
         // 無効化後に遅延した close/error イベントが発火しても、再接続は行わない
         if (settings_store.is_jikkyo_enabled === false) {
             await this.destroy();
-            this.reconnecting = false;
             return;
         }
 
@@ -817,10 +883,13 @@ class LiveCommentManager implements PlayerManager {
         }
 
         // 前の視聴セッション・コメントセッションを破棄
-        await this.destroy();
+        this.resetSessions();
+        const reconnect_session_signal = this.abort_controller.signal;
+        if (this.isLifecycleCurrent(lifecycle_generation, reconnect_session_signal) === false) return;
 
         // 視聴セッションを再初期化
-        const watch_session_info = await this.initWatchSession();
+        const watch_session_info = await this.initWatchSession(lifecycle_generation, reconnect_session_signal);
+        if (this.isLifecycleCurrent(lifecycle_generation, reconnect_session_signal) === false) return;
         if (watch_session_info.is_success === false) {
 
             // 初期化に失敗した際のエラーメッセージを設定する
@@ -842,7 +911,7 @@ class LiveCommentManager implements PlayerManager {
 
         // 視聴セッションを初期化できた場合のみ、
         // 取得したコメントサーバーへの接続情報を使い、非同期でコメントセッションを初期化
-        this.initCommentSession(watch_session_info);
+        this.initCommentSession(watch_session_info, lifecycle_generation, reconnect_session_signal);
 
         // ここまできたら再初期化が完了しているので破棄済みかどうかのフラグを false にする
         // ここでフラグを false にしないと再接続後にコメントリストにコメントが送信されない
@@ -858,6 +927,20 @@ class LiveCommentManager implements PlayerManager {
      * 視聴セッションとコメントセッションをそれぞれ閉じる
      */
     public async destroy(): Promise<void> {
+
+        // API 待機や sleep() の完了より先に owner 世代を無効化する
+        this.lifecycle_generation += 1;
+        this.destroyed = true;
+        this.reconnecting = false;
+
+        this.resetSessions();
+
+        console.log('[LiveCommentManager] Destroyed.');
+    }
+
+
+    /** 現在の WebSocket セッションと listener・タイマーだけを破棄する。 */
+    private resetSessions(): void {
         const player_store = usePlayerStore();
 
         // セッションに紐いているすべての EventListener を解除
@@ -886,11 +969,6 @@ class LiveCommentManager implements PlayerManager {
 
         // 初期化に失敗した際のエラーメッセージを削除
         player_store.live_comment_init_failed_message = null;
-
-        // 破棄済みかどうかのフラグを立てる
-        this.destroyed = true;
-
-        console.log('[LiveCommentManager] Destroyed.');
     }
 }
 

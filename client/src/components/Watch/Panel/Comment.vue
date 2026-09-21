@@ -120,7 +120,7 @@
                 </div>
             </div>
         </section>
-        <div v-ripple class="comment-scroll-button elevation-5" @click="handleAutoScrollButtonClick"
+        <div v-ripple class="comment-scroll-button elevation-2" @click="handleAutoScrollButtonClick"
              :class="{'comment-scroll-button--display': is_manual_scroll}">
             <Icon icon="fluent:arrow-down-12-filled" height="29px" />
         </div>

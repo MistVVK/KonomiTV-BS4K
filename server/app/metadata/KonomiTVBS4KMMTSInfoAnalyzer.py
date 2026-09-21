@@ -82,28 +82,16 @@ class KonomiTVBS4KMMTSInfoAnalyzer:
             key=lambda context_id: media_track_counts.get(context_id, 0),
             default=None,
         )
-        service = next(
-            (
-                item for item in bs4k_services
-                if self.__parseInteger(item.get('context_id')) == selected_context_id
-            ),
-            None,
-        )
-        if service is None:
+        if selected_context_id is None:
             logging.warning('[KonomiTVBS4KMMTSInfoAnalyzer] BS4K service was not found in MMT-SI metadata.')
             return None
 
-        context_id = self.__parseInteger(service.get('context_id'))
-        service_id = self.__parseInteger(service.get('service_id'))
-        network_id = self.__parseInteger(service.get('original_network_id'))
-        transport_stream_id = self.__parseInteger(service.get('tlv_stream_id'))
-        if context_id is None or service_id is None or network_id != 0x000B:
-            return None
-
+        context_id = selected_context_id
+        # 同一 context の SDT には別サービスが現れ得るため、録画時間に合うイベントから先に SID を決める。
         event_candidates = [
             event for event in events
             if self.__parseInteger(event.get('context_id')) == context_id
-            and self.__parseInteger(event.get('service_id')) == service_id
+            and self.__parseInteger(event.get('service_id')) is not None
             and self.__parseInteger(event.get('start_time_unix_milliseconds')) is not None
             and self.__parseInteger(event.get('duration_seconds')) is not None
         ]
@@ -186,6 +174,52 @@ class KonomiTVBS4KMMTSInfoAnalyzer:
                     ).total_seconds()
                 ),
             )
+
+        # 同一イベントの p/f と schedule では記述子の充足度が異なる。
+        # 時刻選択したイベントの識別子を変えず、title を持つ表から不足している文言だけを補う。
+        event_service_id = self.__parseInteger(event.get('service_id'))
+        event_id = self.__parseInteger(event.get('event_id'))
+        if event_service_id is not None and event_id is not None:
+            text_sources = [
+                item for item in event_candidates
+                if self.__parseInteger(item.get('service_id')) == event_service_id
+                and self.__parseInteger(item.get('event_id')) == event_id
+                and str(item.get('title') or '').strip() != ''
+            ]
+            if text_sources:
+                text_source = max(
+                    text_sources,
+                    key=lambda item: (
+                        int(str(item.get('description') or '').strip() != ''),
+                        int(self.__parseInteger(item.get('table_id')) == 0x8B),
+                        self.__parseInteger(item.get('input_offset')) or 0,
+                    ),
+                )
+                event = event.copy()
+                for field in ('title', 'description', 'extended_description'):
+                    if str(event.get(field) or '').strip() == '':
+                        event[field] = text_source.get(field)
+
+        # イベント SID と一致する SDT service を使い、別サービスの最終 snapshot を誤採用しない。
+        service_id = self.__parseInteger(event.get('service_id'))
+        service = next(
+            (
+                item for item in bs4k_services
+                if self.__parseInteger(item.get('context_id')) == context_id
+                and self.__parseInteger(item.get('service_id')) == service_id
+            ),
+            None,
+        )
+        if service is None or service_id is None:
+            logging.warning(
+                '[KonomiTVBS4KMMTSInfoAnalyzer] Service information matching the selected event was not found.'
+            )
+            return None
+        network_id = self.__parseInteger(service.get('original_network_id'))
+        transport_stream_id = self.__parseInteger(service.get('tlv_stream_id'))
+        if network_id != 0x000B:
+            return None
+
         event_start_time = self.__eventStartTime(event)
         event_duration = float(self.__parseInteger(event.get('duration_seconds')) or 0)
         if event_duration <= 0:

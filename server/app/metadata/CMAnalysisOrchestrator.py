@@ -130,7 +130,7 @@ class CMAnalysisOrchestrator:
 
     @classmethod
     @asynccontextmanager
-    async def _recordingLock(cls, recorded_video_id: int) -> AsyncGenerator[None, None]:
+    async def recordingLock(cls, recorded_video_id: int) -> AsyncGenerator[None]:
         """同じ録画に対する scanner/API/watcher の競合を直列化する。"""
 
         async with cls._recording_locks_guard:
@@ -166,7 +166,7 @@ class CMAnalysisOrchestrator:
             最新のCM解析状態。対象録画が消えている場合はNone。
         """
 
-        async with self._recordingLock(recorded_video_id):
+        async with self.recordingLock(recorded_video_id):
             recorded_video = await RecordedVideo.get_or_none(id=recorded_video_id).prefetch_related(
                 'recorded_program__channel',
             )
@@ -386,6 +386,9 @@ class CMAnalysisOrchestrator:
         if recorded_video is None:
             return None
         state = await RecordedVideoCMAnalysis.get_or_none(recorded_video_id=recorded_video_id)
+        if recorded_video.file_path.startswith('/cloud-mounts/'):
+            # クラウドの変更は目録同期が取り込む。再生開始のたびに全量の解析用コピーを作らない。
+            return state
         if state is None:
             return await self.run(recorded_video_id, 'DetectCM')
         selection = await self._selectChapterPath(Path(recorded_video.file_path))
@@ -453,6 +456,16 @@ class CMAnalysisOrchestrator:
             result_published = False
             try:
                 source_path = Path(recorded_video.file_path)
+                if source_path.is_relative_to('/cloud-mounts'):
+                    # 書込みを伴うCM解析は、全量検証と精密mtime復元を済ませたローカル作業用入力で行う。
+                    from app.utils.KonomiTVBS4KCloudCatalog import (
+                        KonomiTVBS4KCloudCatalog,
+                    )
+                    source_path = await KonomiTVBS4KCloudCatalog.materializeAnalysis(recorded_video.id)
+                    recorded_video.file_path = str(source_path)
+                    input_fingerprint = await self.buildInputFingerprint(source_path)
+                    state.input_fingerprint = input_fingerprint
+                    await state.save(update_fields=['input_fingerprint', 'updated_at'])
                 await history.setStage('LogoCatalogScanning', 0.02)
                 await CMLogoScanner.scan()
                 logo_selection = CMLogoSelection(status='Missing')
@@ -1095,7 +1108,8 @@ class CMAnalysisOrchestrator:
         selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(encoder)
         if selected_device is not None:
             return f'vaapi:{selected_device}'
-        devices = RecordedPlaybackBackend.discoverRenderDevices(encoder)
+        # 固定指定がある場合は resolveRenderDevices がその render node だけを返す (vendor 不一致時は自動選択へ退避)
+        devices = RecordedPlaybackBackend.resolveRenderDevices(encoder)
         return f'vaapi:{devices[0]}' if devices else None
 
     async def _selectChapterPath(self, recorded_path: Path) -> CMChapterPathSelection:

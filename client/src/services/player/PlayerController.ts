@@ -4,24 +4,38 @@ import assert from 'assert';
 import CanvasRenderer from 'aribb24.js/src/canvas-renderer';
 import DPlayer, { DPlayerType } from 'dplayer';
 import Hls, { ErrorDetails } from 'hls.js';
+import { Mpeg2TsPlayer } from 'mpeg2toh264/player';
+import { Deinterlacer, probeDecoder, supportsDeinterlace, type DecoderProbe } from 'mpeg2toh264/yadif';
 import mpegts from 'mpegts.js';
 import { watch } from 'vue';
 
 import APIClient from '@/services/APIClient';
+import Bangumi from '@/services/Bangumi';
 import OfflineVideos from '@/services/OfflineVideos';
 import ARIBTTMLRenderer from '@/services/player/ARIBTTMLRenderer';
 import CustomBufferController from '@/services/player/CustomBufferController';
+import KonomiTVBS4KColorRewriteLoader, {
+    createKonomiTVBS4KColorRewriteSession,
+} from '@/services/player/KonomiTVBS4KColorRewriteLoader';
+import {
+    classifyKonomiTVBS4KHdrSource,
+    resolveKonomiTVBS4KEffectiveTransferCharacteristics,
+    resolveKonomiTVBS4KHdrOutput,
+    resolveKonomiTVBS4KLiveMpegtsColorRewrite,
+} from '@/services/player/KonomiTVBS4KHdrPolicy';
 import KonomiTVBS4KPlaybackRestartGuard from '@/services/player/KonomiTVBS4KPlaybackRestartGuard';
+import KonomiTVBS4KStreamingReconnectGuard from '@/services/player/KonomiTVBS4KStreamingReconnectGuard';
 import CaptureManager from '@/services/player/managers/CaptureManager';
 import DocumentPiPManager from '@/services/player/managers/DocumentPiPManager';
 import KeyboardShortcutManager from '@/services/player/managers/KeyboardShortcutManager';
+import KonomiTVBS4KHlgSdrManager from '@/services/player/managers/KonomiTVBS4KHlgSdrManager';
 import LiveCommentManager from '@/services/player/managers/LiveCommentManager';
 import LiveDataBroadcastingManager from '@/services/player/managers/LiveDataBroadcastingManager';
 import LiveEventManager from '@/services/player/managers/LiveEventManager';
 import MediaSessionManager from '@/services/player/managers/MediaSessionManager';
 import RecordedCMSkipManager from '@/services/player/managers/RecordedCMSkipManager';
 import PlayerManager from '@/services/player/PlayerManager';
-import Videos, { type IJikkyoComments } from '@/services/Videos';
+import Videos, { type ISubtitleTrack, type IJikkyoComments } from '@/services/Videos';
 import useChannelsStore from '@/stores/ChannelsStore';
 import usePlayerStore from '@/stores/PlayerStore';
 import useSettingsStore, {
@@ -34,10 +48,12 @@ import useSettingsStore, {
     KonomiTVBS4KPlaybackAudioCodec,
     KonomiTVBS4KPlaybackVideoCodec,
     LiveStreamingQuality,
+    LIVE_ORIGINAL_MPEG2_QUALITY_NAME,
     LIVE_STREAMING_QUALITIES,
     VideoStreamingQuality,
     VIDEO_STREAMING_QUALITIES,
 } from '@/stores/SettingsStore';
+import useUserStore from '@/stores/UserStore';
 import useVersionStore from '@/stores/VersionStore';
 import Utils, { dayjs, PlayerUtils, ProgramUtils } from '@/utils';
 
@@ -53,6 +69,28 @@ export function generateRecordedPlaybackSessionID(
     const random_bytes = random_source.getRandomValues(new Uint8Array(4));
     return Array.from(random_bytes, byte => byte.toString(16).padStart(2, '0')).join('');
 }
+
+
+// デバイスのデコーダーが自動でのデインタレースに対応しているかを取得
+// この判定はデバイス単位で不変のため、初回ロード時に1回だけ実行して共有する
+const is_yadif_supported = supportsDeinterlace();
+let decoder_deinterlace_probe_result: DecoderProbe | null = null;
+const decoder_deinterlace_probe_promise: Promise<DecoderProbe | null> = (async () => {
+    // WebGL2 を利用できない端末では YADIF Deinterlacer を構築できないため、デコーダーの出力をそのまま表示する
+    if (is_yadif_supported === false) {
+        console.debug('[PlayerController] Decoder deinterlace probe:', {
+            deinterlaces: null,
+            survives: null,
+            tookMs: 0,
+            error: 'WebGL2 Deinterlacer is not supported.',
+        });
+        return null;
+    }
+
+    decoder_deinterlace_probe_result = await probeDecoder();
+    console.debug('[PlayerController] Decoder deinterlace probe:', decoder_deinterlace_probe_result);
+    return decoder_deinterlace_probe_result;
+})();
 
 
 /**
@@ -102,6 +140,11 @@ class PlayerController {
     // 4 秒程度の遅延を許容する
     private static readonly LIVE_PLAYBACK_BUFFER_SECONDS = 4.0;
 
+    // ライブ視聴: 再生中にバッファアンダーランが発生した際、再生を再開するまでに貯めるバッファ (秒単位)
+    // 低速回線でアンダーラン直後に即再開すると waiting ↔ playing を短周期で繰り返し (スピナーの点滅と断続的な映像停止)、
+    // かえって視聴体験を損なうため、低遅延モードでも通常モードの再生バッファと同じ 4 秒を貯めてから再開する
+    private static readonly LIVE_REBUFFER_SECONDS = 4.0;
+
     // 何秒視聴したら視聴履歴に追加するかの閾値 (秒)
     private static readonly WATCHED_HISTORY_THRESHOLD_SECONDS = 30;
 
@@ -116,6 +159,10 @@ class PlayerController {
     // maxBufferLength を拡張する。ローカル変換ではその要求がサーバーの連続エンコードを誘発し、
     // Chromium では大量の SourceBuffer append と描画を競合させるため、約5セグメントへ固定する。
     private static readonly RECORDED_PLAYBACK_BUFFER_SECONDS = 30;
+
+    // 録画視聴: 再生中にバッファアンダーランが発生した際、再生を再開するまでに貯めるバッファ (秒単位)
+    // ライブ視聴と同様に、低速回線で停止と再生が断続的に切り替わることを防ぐためのヒステリシス
+    private static readonly RECORDED_REBUFFER_SECONDS = 5.0;
 
     // CM 自動スキップ先は HLS のタイムライン補正で指定位置からわずかにずれるため、その許容誤差 (秒)
     private static readonly RECORDED_CM_SKIP_TARGET_TOLERANCE_SECONDS = 1.0;
@@ -181,9 +228,25 @@ class PlayerController {
     private recorded_arib_ttml_cancel: (() => void) | null = null;
     private recorded_arib_ttml_restart: (() => void) | null = null;
 
+    // 録画生字幕 (ARIB STD-B24 / sidecar WebVTT) のユーザー選択トラック (subtitle_tracks の index)。
+    // null は自動 (= component_tag / PID / index 順の最初のトラック) を意味する
+    private recorded_raw_subtitle_track_index: number | null = null;
+
+    // 設定パネルの字幕サブメニューに出す録画生字幕・sidecar の候補一覧 (初期化時のメタデータから生成)
+    private recorded_raw_subtitle_tracks: ISubtitleTrack[] = [];
+
+    // ARIB-TTML component は先読み窓の受信で増えていくため、字幕サブパネルの候補を1秒間隔で追従させる
+    private subtitle_panel_timer_cancel: (() => void) | null = null;
+
     // 録画を末尾まで自然に再生し終えたかどうか
     // ended の多重通知防止と、完走後の視聴履歴を先頭付近へ戻す判断に共用する
     private recorded_playback_ended = false;
+
+    // Bangumi 看過 API の多重送信防止。完了・対象外が返ったら同じセッションでは再送しない
+    private bangumi_playback_progress_in_flight = false;
+    private bangumi_playback_progress_completed = false;
+    // グローバル設定同期に依存せず、再生中のユーザーについてサーバーの送信設定を1回取得したことを保持する
+    private bangumi_watch_history_sync_user_id: number | null = null;
 
     // シーク操作で直接末尾へ移動したときに、自然な完走として扱わないためのフラグ
     // シーク後に末尾より前へ戻った時点、または CM 自動スキップと確認できた時点で解除する
@@ -210,9 +273,10 @@ class PlayerController {
     private screen_wake_lock: WakeLockSentinel | null = null;
 
     // RomSound の AudioContext と AudioBuffer のリスト
-    private readonly romsounds_context: AudioContext = new AudioContext();
+    // init() ごとに生成し、destroy() で close() してブラウザの音声リソースを確実に解放する
+    private romsounds_context: AudioContext | null = null;
     private readonly romsounds_buffers = new Map<number, AudioBuffer>();
-    private readonly romsounds_ready: Promise<void>;
+    private romsounds_ready: Promise<void> = Promise.resolve();
 
     // L字画面のクロップ設定で使うウォッチャーを保持する配列
     private lshaped_screen_crop_watchers: (() => void)[] = [];
@@ -221,11 +285,14 @@ class PlayerController {
     private rain_fallback_watchers: (() => void)[] = [];
 
     // 破棄中かどうか
-    // 破棄中は destroy() が呼ばれても何もしない
     private destroying = false;
 
     // 破棄済みかどうか
     private destroyed = false;
+
+    // 進行中の破棄処理
+    // route 更新と unmount が重なっても、すべての呼び出し元が同じ cleanup の完了を待つために保持する
+    private destroy_promise: Promise<void> | null = null;
 
     // 視聴画面の寿命。route離脱後の能力API応答が共有StoreやDOMを書き戻さないように使う。
     private readonly owner_signal: AbortSignal | null;
@@ -236,6 +303,7 @@ class PlayerController {
     // 同一再生対象・同一 codec tuple の短時間再起動ループを、init() をまたいで検出する。
     // codec を自動変更せず、最初の同一 codec 再起動でも復旧できなかった場合はユーザーの明示変更へ委ねる。
     private readonly konomitv_bs4k_playback_restart_guard = new KonomiTVBS4KPlaybackRestartGuard();
+    private readonly konomitv_bs4k_streaming_reconnect_guard = new KonomiTVBS4KStreamingReconnectGuard();
 
     // ライブ再生開始時の一時ミュートを、保存済みミュートと区別するフラグ
     // 一時ミュートで発火した volumechange を、ユーザー操作として保存しないために使う
@@ -243,6 +311,10 @@ class PlayerController {
 
     // ライブ視聴: 直近の mpegts.js mediaInfo
     private live_media_info: {[key: string]: any} | null = null;
+
+    // playbackRate = 0 でバッファ回復を待機している init() 世代。
+    // 旧世代の非同期処理が遅れて終了しても、新世代の待機状態を解除しないために世代番号で所有権を管理する
+    private rebuffering_generation: number | null = null;
 
 
     /**
@@ -271,26 +343,12 @@ class PlayerController {
             }
         }
 
-        // 01 ~ 14 を番号を崩さず並列取得し、初回再生は準備完了を待つ。
-        this.romsounds_ready = Promise.all(Array.from({length: 14}, (_, index) => index + 1).map(async (index) => {
-            try {
-                // ArrayBuffer をデコードして AudioBuffer にし、すぐ呼び出せるように貯めておく
-                // ref: https://ics.media/entry/200427/
-                const romsound_url = `/assets/romsounds/${index.toString().padStart(2, '0')}.wav`;
-                const romsound_response = await APIClient.get<ArrayBuffer>(romsound_url, {
-                    baseURL: '',  // BaseURL を明示的にクライアントのルートに設定
-                    responseType: 'arraybuffer',
-                });
-                if (romsound_response.type === 'success') {
-                    this.romsounds_buffers.set(
-                        index,
-                        await this.romsounds_context.decodeAudioData(romsound_response.data),
-                    );
-                }
-            } catch (error) {
-                console.warn(`[PlayerController] Failed to preload RomSound ${index}.`, error);
-            }
-        })).then(() => undefined);
+    }
+
+
+    /** 現在の init() 世代がバッファ回復を待機しているかどうか。 */
+    private get is_rebuffering(): boolean {
+        return this.rebuffering_generation === this.initialization_generation;
     }
 
 
@@ -380,6 +438,60 @@ class PlayerController {
     }
 
 
+    /**
+     * 録画再生位置を Bangumi 看過 API へ送る。設定無効・オフライン再生・未連携では送らない。
+     * @param playback_position プレイヤーが解決した再生位置 (秒)
+     */
+    private async sendBangumiPlaybackProgress(playback_position: number): Promise<void> {
+        const player_store = usePlayerStore();
+        const settings_store = useSettingsStore();
+        const user_store = useUserStore();
+        if (
+            this.playback_mode !== 'Video' ||
+            player_store.is_offline_playback === true ||
+            this.bangumi_playback_progress_completed === true ||
+            this.bangumi_playback_progress_in_flight === true ||
+            user_store.user === null
+        ) {
+            return;
+        }
+        const current_user_id = user_store.user.id;
+        const recorded_program = player_store.recorded_program;
+        if (recorded_program.id < 0) {
+            return;
+        }
+        this.bangumi_playback_progress_in_flight = true;
+        try {
+            // グローバルな設定同期が無効でも、再生セッションごとの初回判定ではサーバーの保存値を正とする。
+            if (this.bangumi_watch_history_sync_user_id !== current_user_id) {
+                const enabled = await Bangumi.fetchWatchHistorySyncSetting(false);
+                if (enabled === null || user_store.user?.id !== current_user_id) {
+                    return;
+                }
+                settings_store.settings.bangumi_watch_history_sync = enabled;
+                this.bangumi_watch_history_sync_user_id = current_user_id;
+            }
+            if (settings_store.settings.bangumi_watch_history_sync !== true) return;
+            const result = await Bangumi.updatePlaybackProgress(
+                recorded_program.id,
+                {
+                    playback_position,
+                    duration: recorded_program.recorded_video.duration,
+                },
+                false,
+            );
+            if (
+                result !== null &&
+                (result.status === 'Completed' || result.status === 'AlreadyCompleted' || result.status === 'NotEligible')
+            ) {
+                this.bangumi_playback_progress_completed = true;
+            }
+        } finally {
+            this.bangumi_playback_progress_in_flight = false;
+        }
+    }
+
+
     /** 現在の再生対象と回線プロファイルを、pinを分離する安定キーにする。 */
     private getPlaybackTargetKey(): string {
         const channels_store = useChannelsStore();
@@ -410,15 +522,30 @@ class PlayerController {
     }
 
 
-    /** 非同期初期化が現在のroute/再生対象に属することを確実にする。 */
-    private assertInitializationIsCurrent(generation: number, playback_target_key: string): void {
-        if (
+    /** 非同期初期化が現在の route / 再生対象に属するかを返す。 */
+    private isInitializationCurrent(generation: number, playback_target_key: string): boolean {
+        return !(
             this.owner_signal?.aborted === true ||
             generation !== this.initialization_generation ||
             this.destroying === true ||
             this.destroyed === true ||
             this.getPlaybackTargetKey() !== playback_target_key
-        ) {
+        );
+    }
+
+
+    /** 画質切り替えやプレイヤー破棄で不要になった録画 HLS セッションを終了する。 */
+    private async destroyRecordedPlaybackSession(source_url: string | null): Promise<void> {
+        if (source_url === null) return;
+        const session_url = new URL(source_url);
+        if (session_url.pathname.endsWith('/playlist') === false) return;
+        session_url.pathname = `${session_url.pathname.slice(0, -'/playlist'.length)}/session`;
+        await APIClient.delete(session_url.toString());
+    }
+
+    /** 非同期初期化が現在の route / 再生対象に属することを確実にする。 */
+    private assertInitializationIsCurrent(generation: number, playback_target_key: string): void {
+        if (this.isInitializationCurrent(generation, playback_target_key) === false) {
             throw new DOMException('Player initialization was superseded.', 'AbortError');
         }
     }
@@ -448,9 +575,43 @@ class PlayerController {
         this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
         this.is_live_startup_temporary_muted = false;
         this.recorded_playback_ended = false;
+        this.bangumi_playback_progress_in_flight = false;
+        this.bangumi_playback_progress_completed = false;
         this.recorded_playback_end_blocked_by_seek = false;
         this.recorded_auto_skip_cm_target = null;
         this.is_offline_fallback_in_progress = false;
+        // 番組の再初期化では選択を引き継がない。video要素だけの画質切替ではここは通らない。
+        this.recorded_raw_subtitle_track_index = null;
+        this.recorded_raw_subtitle_tracks = [];
+        this.arib_ttml_renderer?.setCaptionComponentTag(null);
+
+        // AudioContext は PlayerController の初期化単位で所有する。
+        // 同じ Controller を destroy() 後に再初期化する場合も、close 済みの Context を再利用しない。
+        const romsounds_context = new AudioContext();
+        this.romsounds_context = romsounds_context;
+        this.romsounds_buffers.clear();
+
+        // 01 ~ 14 を番号を崩さず並列取得し、初回再生は準備完了を待つ。
+        this.romsounds_ready = Promise.all(Array.from({length: 14}, (_, index) => index + 1).map(async (index) => {
+            try {
+                // ArrayBuffer をデコードして AudioBuffer にし、すぐ呼び出せるように貯めておく
+                // ref: https://ics.media/entry/200427/
+                const romsound_url = `/assets/romsounds/${index.toString().padStart(2, '0')}.wav`;
+                const romsound_response = await APIClient.get<ArrayBuffer>(romsound_url, {
+                    baseURL: '',  // BaseURL を明示的にクライアントのルートに設定
+                    responseType: 'arraybuffer',
+                });
+                if (romsound_response.type === 'success') {
+                    const romsound_buffer = await romsounds_context.decodeAudioData(romsound_response.data);
+                    // destroy() 後に遅れて decode が完了しても、解放済み世代の AudioBuffer を保持し直さない。
+                    if (this.romsounds_context === romsounds_context) {
+                        this.romsounds_buffers.set(index, romsound_buffer);
+                    }
+                }
+            } catch (error) {
+                console.warn(`[PlayerController] Failed to preload RomSound ${index}.`, error);
+            }
+        })).then(() => undefined);
 
         // PlayerStore にプレイヤーを初期化したことを通知する
         // 実際にはこの時点ではプレイヤーの初期化は完了していないが、PlayerController.init() を実行したことが通知されることが重要
@@ -504,8 +665,12 @@ class PlayerController {
         // 実効 codec が AVC へフォールバックした場合も映像はパススルーされるため、この検査画質で問題ない。
         let preflight_streaming_quality = is_oneseg_live_playback === true ? '240p' : saved_streaming_quality;
         if (is_oneseg_live_playback === false && has_video === true) {
+            // original は再エンコードしないため、codec 能力検査は保存画質で行う
+            const preflight_quality_name = options.default_quality === LIVE_ORIGINAL_MPEG2_QUALITY_NAME ?
+                saved_streaming_quality :
+                (options.default_quality ?? saved_streaming_quality);
             const normalized_preflight_streaming_quality = PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
-                options.default_quality ?? saved_streaming_quality,
+                preflight_quality_name,
                 is_bs4k_stream,
                 available_streaming_qualities,
             );
@@ -582,6 +747,11 @@ class PlayerController {
         const is_hevc_video_supported_in_worker = this.playback_mode === 'Live' ?
             await mpegts.supportWorkerForMSEH265Playback() : true;
         this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
+
+        // WebGL2 がサポートされていて、かつデバイスが自動デインタレースに対応していない場合は、
+        // mpeg2toh264 で再生する際に YADIF Deinterlacer を有効にする
+        const is_yadif_enabled = is_yadif_supported === true &&
+            decoder_deinterlace_probe_result?.deinterlaces !== true;
 
         const is_bs4k_live_playback = (
             this.playback_mode === 'Live' &&
@@ -678,10 +848,31 @@ class PlayerController {
             console.log('\u001b[31m[PlayerController] Added CM section markers:', highlights);
         }
 
-        // mpegts.js と hls.js を window 直下に入れる
-        // こうしないと DPlayer が mpegts.js / hls.js を認識できない
+        // mpegts.js と hls.js / mpeg2toh264 を window 直下に入れる
+        // こうしないと DPlayer が各ライブラリを認識できない
         (window as any).mpegts = mpegts;
         (window as any).Hls = Hls;
+        Object.assign(window, {mpeg2toh264: {Mpeg2TsPlayer, Deinterlacer}});
+
+        // 録画 HLS (オンライン / オフライン保存) の fMP4 色信号書換えセッションを作成する。
+        // HDR 出力の選択は視聴中だけの override を優先し、SettingsStore の既定値は書き換えない。
+        // 選択の変更はプレイヤー再起動で反映するため、セッションの mode は初期化時に固定する。
+        // 書換え不能の unsafe ラッチは新しい再生セッション (再起動・画質変更) ごとに解除し、
+        // 安全になった新セッションで canvas が復帰できるようにする
+        const playback_hdr_desired = resolveKonomiTVBS4KHdrOutput(
+            settings_store.settings.konomitv_bs4k_hdr_output,
+            player_store.konomitv_bs4k_playback_hdr_output_override,
+        );
+        if (this.playback_mode === 'Video') {
+            player_store.konomitv_bs4k_recorded_color_rewrite_unsafe = false;
+        }
+        const color_rewrite_session = this.playback_mode === 'Video' ?
+            createKonomiTVBS4KColorRewriteSession(playback_hdr_desired) : null;
+        // ライブ mpegts の色信号書換えは初回 InitSegment より前に、視聴開始時の HDR 出力へ合わせる。
+        // colour/transfer だけの差では mpegts.js が新しい InitSegment を出さないため、
+        // 視聴パネルで HDR 出力を切り替えた際もプレイヤー再起動で初期化し直す。
+        const live_mpegts_video_color_rewrite = this.playback_mode === 'Live' ?
+            resolveKonomiTVBS4KLiveMpegtsColorRewrite(playback_hdr_desired) : 'None';
 
         // DPlayer を初期化
         this.player = new DPlayer({
@@ -811,6 +1002,16 @@ class PlayerController {
                     // ラジオチャンネルの場合
                     // API が受け付ける画質の値は通常のチャンネルと同じだが (手抜き…)、実際の画質は 48KHz/192kbps で固定される
                     // ラジオチャンネルの場合は、1080p と渡しても 48kHz/192kbps 固定の音声だけの MPEG-TS が配信される
+                    const is_original_quality_available = (
+                        is_bs4k_live === false &&
+                        is_oneseg_live_playback === false &&
+                        channels_store.channel.current.is_radiochannel === false &&
+                        (
+                            channels_store.channel.current.type === 'GR' ||
+                            channels_store.channel.current.type === 'BS' ||
+                            channels_store.channel.current.type === 'CS'
+                        )
+                    );
                     if (channels_store.channel.current.is_radiochannel === true) {
                         qualities.push({
                             name: '48kHz/192kbps',
@@ -824,6 +1025,20 @@ class PlayerController {
                         });
                     // 通常のチャンネルの場合
                     } else {
+                        // mpeg2toh264 によるオリジナル画質は GR/BS/CS フルセグだけ画質リストの先頭に追加する
+                        // 保存プロファイルには入れず、視聴中の選択とセッション内レジュームだけが使う
+                        if (is_original_quality_available === true) {
+                            qualities.push({
+                                name: LIVE_ORIGINAL_MPEG2_QUALITY_NAME,
+                                type: 'mpeg2toh264',
+                                url: PlayerUtils.buildKonomiTVBS4KLiveAPIEndpointURL(
+                                    channels_store.channel.current.display_channel_id,
+                                    'original',
+                                    'mpegts',
+                                    '',
+                                ),
+                            });
+                        }
                         // 画質リストを作成
                         for (const quality_name of live_streaming_qualities) {
                             qualities.push({
@@ -845,29 +1060,42 @@ class PlayerController {
                     if (options.default_quality !== null) {
                         // PlayerController.init() のオプションでデフォルト画質が指定されている場合は
                         // 画質プロファイルに記載の画質ではなく、指定された（前回再生時の）画質を使ってレジュームする
-                        default_quality = options.default_quality;
+                        if (
+                            options.default_quality === LIVE_ORIGINAL_MPEG2_QUALITY_NAME &&
+                            is_original_quality_available === false
+                        ) {
+                            // original 非対応チャンネルへ切り替えたときは保存画質へ戻す
+                            default_quality = is_bs4k_live === true ?
+                                this.quality_profile.bs4k_playback_streaming_quality :
+                                this.quality_profile.playback_streaming_quality;
+                        } else {
+                            default_quality = options.default_quality;
+                        }
                     }
                     // 保存画質や再初期化前の画質は変更せず、ワンセグ HEVC と低解像度ライブだけ実効上限へ丸める。
-                    if (is_oneseg_live_playback === true && is_hevc_playback === true) {
-                        default_quality = '240p';
-                    } else if (
-                        is_bs4k_live === false &&
-                        source_limited_live_streaming_qualities.length < LIVE_STREAMING_QUALITIES.length
-                    ) {
-                        const normalized_default_api_quality = PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
-                            default_quality,
-                            false,
-                            LIVE_STREAMING_QUALITIES,
-                        );
-                        default_quality = (
-                            normalized_default_api_quality !== null &&
-                            source_limited_live_streaming_qualities.includes(
-                                normalized_default_api_quality as LiveStreamingQuality,
-                            ) === true
-                        ) ? get_quality_display_name(normalized_default_api_quality) :
-                            get_quality_display_name(source_limited_live_streaming_qualities[0]);
-                    } else {
-                        default_quality = normalize_default_quality(default_quality, live_streaming_qualities);
+                    // original は保存プロファイルに無い視聴中選択なので、解像度上限へ丸めない。
+                    if (default_quality !== LIVE_ORIGINAL_MPEG2_QUALITY_NAME) {
+                        if (is_oneseg_live_playback === true && is_hevc_playback === true) {
+                            default_quality = '240p';
+                        } else if (
+                            is_bs4k_live === false &&
+                            source_limited_live_streaming_qualities.length < LIVE_STREAMING_QUALITIES.length
+                        ) {
+                            const normalized_default_api_quality = PlayerUtils.normalizeKonomiTVBS4KPlaybackAPIQuality(
+                                default_quality,
+                                false,
+                                LIVE_STREAMING_QUALITIES,
+                            );
+                            default_quality = (
+                                normalized_default_api_quality !== null &&
+                                source_limited_live_streaming_qualities.includes(
+                                    normalized_default_api_quality as LiveStreamingQuality,
+                                ) === true
+                            ) ? get_quality_display_name(normalized_default_api_quality) :
+                                get_quality_display_name(source_limited_live_streaming_qualities[0]);
+                        } else {
+                            default_quality = normalize_default_quality(default_quality, live_streaming_qualities);
+                        }
                     }
                     // ラジオチャンネルのみ常に 48KHz/192kbps に固定する
                     if (channels_store.channel.current.is_radiochannel) {
@@ -908,6 +1136,9 @@ class PlayerController {
                     const first_audio_track = player_store.recorded_program.recorded_video.audio_tracks[0];
                     const initial_audio_rendition = first_audio_track === undefined ? null :
                         `${first_audio_track.index}${first_audio_track.is_dual_mono === true ? '-main' : ''}`;
+                    // CM スキップ有効時はサーバー側へスキップ先の先行生成を許可する。
+                    // セッション条件の一部なので、URL を組み立てた時点の設定値でセッション中は固定する
+                    const cm_skip_aware = settings_store.settings.video_auto_skip_cm === true;
                     for (const quality_name of video_streaming_qualities) {
                         // 画質ごとに異なる8桁のセッション ID を生成する。
                         const session_id = generateRecordedPlaybackSessionID();
@@ -917,7 +1148,7 @@ class PlayerController {
                             type: 'hls',
                             url: `${streaming_api_base_url}/${build_api_quality(quality_name)}/playlist?session_id=${session_id}` +
                                 `&video_codec=${effective_video_codec}&video_bit_depth=${effective_video_bit_depth}` +
-                                `&audio_codec=${effective_audio_codec}` +
+                                `&audio_codec=${effective_audio_codec}&cm_skip_aware=${cm_skip_aware ? '1' : '0'}` +
                                 (initial_audio_rendition !== null ? `&audio_track=${initial_audio_rendition}` : ''),
                         });
                     }
@@ -1033,6 +1264,11 @@ class PlayerController {
                         } else {
                             jikkyo_comments = await Videos.fetchVideoJikkyoComments(player_store.recorded_program.id);
                         }
+                        // 取得中に route 離脱・再初期化された場合、旧録画のコメントを共有 Store へ反映しない
+                        if (
+                            this.player === null ||
+                            this.isInitializationCurrent(initialization_generation, playback_target_key) === false
+                        ) return;
                         if (jikkyo_comments.is_success === false) {
                             // 取得に失敗した場合はコメントリストにエラーメッセージを表示する
                             // ただし「この録画番組の過去ログコメントは存在しないか、現在取得中です。」の場合はエラー扱いしない
@@ -1072,6 +1308,10 @@ class PlayerController {
                             comment_seek_seconds = seek_seconds;
                         }
                         await Utils.sleep(0.1);  // 仮想スクローラーの準備ができるまで少し待つ
+                        if (
+                            this.player === null ||
+                            this.isInitializationCurrent(initialization_generation, playback_target_key) === false
+                        ) return;
                         player_store.event_emitter.emit('PlaybackPositionChanged', {
                             playback_position: comment_seek_seconds,
                         });
@@ -1110,6 +1350,25 @@ class PlayerController {
 
             // 再生プラグインの設定
             pluginOptions: {
+                // mpeg2toh264
+                mpeg2toh264: {
+                    // 対応ブラウザでは変換処理と MediaSource を Web Worker 内へまとめ、メインスレッドの描画負荷から分離する
+                    mediaSource: 'auto',
+                    // MPEG-2 を直接デコードできるブラウザ環境でもデインタレース可否が不明なため、パススルーモードは使わない
+                    passthrough: false,
+                    // ライブ放送では選択中のサービスを明示する (tsreadex がすでに選択してくれているが念のため)
+                    serviceId: this.playback_mode === 'Live' ?
+                        channels_store.channel.current.service_id : undefined,
+                    // デコーダーが自動でデインタレースしてくれない端末だけ、YADIF Deinterlacer を通した Canvas を実際の表示映像として利用する
+                    deinterlace: is_yadif_enabled,
+                    deinterlacer: is_yadif_enabled === true ? (video: HTMLVideoElement) => new Deinterlacer(video, {
+                        // 常に MPEG-2 60i 映像を 60fps でぬるぬる再生する
+                        doubleRate: true,
+                        // 24fps モードがオンの場合のみ、実写区間では 60fps で描画しつつ、
+                        // 映画・アニメなど 24fps で制作された映像を自動検出し、余分なフレームを間引く
+                        autoFilm: this.quality_profile.playback_24fps_mode,
+                    }) : undefined,
+                },
                 // mpegts.js
                 mpegts: {
                     config: {
@@ -1123,6 +1382,9 @@ class PlayerController {
                         // duration 不明のライブ fMP4 とハードウェアデコーダーの組み合わせでは、十分な MSE バッファがあっても
                         // フレームドロップが発生する環境があるため、有限 duration の init segment を使う
                         forceMSEStreamLivenessRecorded: true,
+                        // HLG/PQ のブラウザ HDR パス制御。初回 InitSegment より前に開始時モードへ合わせ、
+                        // 視聴パネルからの HDR 出力切替時も再起動を通して新しい MSE へ適用する。
+                        videoColorRewrite: live_mpegts_video_color_rewrite,
                         // 再生開始まで 2048KB のバッファを貯める (?)
                         // あまり大きくしすぎてもどうも効果がないようだが、小さくしたり無効化すると特に Safari で不安定になる
                         enableStashBuffer: true,
@@ -1138,11 +1400,17 @@ class PlayerController {
                         // ライブストリームの遅延の追跡に利用する再生速度 (x1.1)
                         // 遅延が 3 秒を超えたとき、遅延が playback_buffer_sec を下回るまで再生速度が x1.1 に設定される
                         liveSyncPlaybackRate: 1.1,
-                    }
+                    } as mpegts.Config,
                 },
                 // hls.js
                 hls: {
                     ...Hls.DefaultConfig,
+                    // 録画 fMP4 の HDR 色信号を fragment loader 境界で書き換えるための独自 Loader。
+                    // オンライン録画と CacheStorage 上のオフライン保存の両方がこの経路を通る。
+                    // ライブ (mpegts.js) では使われないため、セッションが無い場合は完全に素通しする。
+                    fLoader: KonomiTVBS4KColorRewriteLoader,
+                    // @ts-ignore セッション同梱キーは hls.js 標準の型に無い独自拡張 (Loader のコンストラクタが読む)
+                    konomitv_bs4k_color_rewrite_session: color_rewrite_session,
                     // Web Worker を有効にする
                     enableWorker: true,
                     // ManagedMediaSource が使える Safari では常に ManagedMediaSource を利用する
@@ -1288,6 +1556,8 @@ class PlayerController {
                     })(),
                     // 文字スーパーの PRA (内蔵音再生コマンド) のコールバックを指定
                     PRACallback: async (index: number, loop: boolean = false, offset: number = 0) => {
+                        const romsounds_context = this.romsounds_context;
+                        if (romsounds_context === null) return;
                         // index に応じた内蔵音を鳴らす
                         // ref: https://ics.media/entry/200427/
                         // ref: https://www.ipentec.com/document/javascript-web-audio-api-change-volume
@@ -1295,20 +1565,22 @@ class PlayerController {
                         // resume() するまでに何らかのユーザーのジェスチャーが行われているはず…
                         // なくても動くこともあるみたいだけど、念のため
                         await this.romsounds_ready;
-                        if (this.romsounds_context.state === 'suspended') {
-                            await this.romsounds_context.resume();
+                        if (this.isInitializationCurrent(initialization_generation, playback_target_key) === false) return;
+                        if (romsounds_context.state === 'suspended') {
+                            await romsounds_context.resume();
+                            if (this.isInitializationCurrent(initialization_generation, playback_target_key) === false) return;
                         }
                         // index で指定された音声データを読み込み
                         const buffer = this.romsounds_buffers.get(index);
-                        if (buffer === undefined || this.romsounds_context.state === 'closed') return;
-                        const buffer_source_node = this.romsounds_context.createBufferSource();
+                        if (buffer === undefined || romsounds_context.state === 'closed') return;
+                        const buffer_source_node = romsounds_context.createBufferSource();
                         buffer_source_node.buffer = buffer;
                         buffer_source_node.loop = loop;
                         // GainNode につなげる
-                        const gain_node = this.romsounds_context.createGain();
+                        const gain_node = romsounds_context.createGain();
                         buffer_source_node.connect(gain_node);
                         // 出力につなげる
-                        gain_node.connect(this.romsounds_context.destination);
+                        gain_node.connect(romsounds_context.destination);
                         // 音量を元の wav の3倍にする (1倍だと結構小さめ)
                         gain_node.gain.value = 3 * (
                             this.player?.video.muted === true ? 0 : this.player?.video.volume ?? 1
@@ -1376,7 +1648,11 @@ class PlayerController {
         // ARIB-TTML はライブと録画のどちらも同じレンダラーへ timed-ID3 を投入する。
         // 字幕ボタンは字幕層だけを切り替え、緊急情報にも使われる文字スーパー層は既存設定に従って独立表示する。
         this.attachARIBTTMLRenderer();
-        this.player.on('subtitle_show', () => this.arib_ttml_renderer?.showCaption());
+        this.player.on('subtitle_show', () => {
+            // 生字幕を明示選択中はTTMLを重ねない。ボタン自体は従来の表示/非表示を維持する。
+            if (this.recorded_raw_subtitle_track_index !== null) this.arib_ttml_renderer?.hideCaption();
+            else this.arib_ttml_renderer?.showCaption();
+        });
         this.player.on('subtitle_hide', () => this.arib_ttml_renderer?.hideCaption());
 
         // fMP4 経路ではARIB生字幕を映像から分離し、シーク復元点と後続12秒を先読みする。
@@ -1385,16 +1661,36 @@ class PlayerController {
             player_store.is_offline_playback === false &&
             player_store.recorded_program.recorded_video.playback_index_status === 'Ready'
         ) {
-            const arib_track = player_store.recorded_program.recorded_video.subtitle_tracks.find((track) =>
-                track.codec.toLowerCase().includes('arib') && track.codec.toLowerCase() !== 'arib_ttml',
-            );
-            if (arib_track !== undefined) {
+            // 生字幕・sidecar WebVTT トラックをすべて候補として保持し、設定パネルの字幕サブメニューへ出す。
+            // 従来は先頭トラックへ固定していたが、二か国語字幕などで PID が分かれている場合は
+            // 選択したトラックの PES だけを同じ先読み・復元経路で投入する。
+            this.recorded_raw_subtitle_tracks = player_store.recorded_program.recorded_video.subtitle_tracks.filter((track) =>
+                (track.codec.toLowerCase().includes('arib') && track.codec.toLowerCase() !== 'arib_ttml') ||
+                // sidecar もサーバーで PES payload に戻し、同じ pushRawData と seek 復元を使用する。
+                (track.source === 'Sidecar' && track.codec === 'webvtt'),
+            ).sort((left, right) =>
+                (left.component_tag ?? left.pid ?? left.index) - (right.component_tag ?? right.pid ?? right.index));
+            // ユーザー選択トラックを優先し、別番組化などで候補に無ければ自動 (先頭) へフォールバックする。
+            const resolve_arib_track = (): ISubtitleTrack | undefined => {
+                if ((this.arib_ttml_renderer?.getSelectedCaptionComponentTag() ?? null) !== null) return undefined;
+                return this.recorded_raw_subtitle_tracks.find((track) =>
+                    track.index === this.recorded_raw_subtitle_track_index) ?? this.recorded_raw_subtitle_tracks[0];
+            };
+            const initial_arib_track = resolve_arib_track();
+            if (initial_arib_track !== undefined) {
+                // TTML明示選択中は生字幕の取得を止める。
+                let arib_track: ISubtitleTrack | undefined = initial_arib_track;
                 const requested_ranges = new Set<number>();
                 let is_fetching = false;
                 let restore_after_fetch = false;
                 let subtitle_generation = 0;
                 const fetch_arib_subtitle = async (restore: boolean = false): Promise<void> => {
-                    if (this.player === null) return;
+                    if (
+                        this.player === null ||
+                        this.isInitializationCurrent(initialization_generation, playback_target_key) === false
+                    ) return;
+                    const requested_track = arib_track;
+                    if (requested_track === undefined) return;
                     if (is_fetching === true) {
                         // 画質切り替えやシーク中なら、進行中の取得完了後に新しい再生位置から状態を復元する。
                         restore_after_fetch ||= restore;
@@ -1409,12 +1705,13 @@ class PlayerController {
                         const response = await APIClient.get<{
                             restore_packets: {pts: number; data: string}[];
                             packets: {pts: number; data: string}[];
-                        }>(`/streams/video/${player_store.recorded_program.id}/subtitle/${arib_track.index}/arib`, {
+                        }>(`/streams/video/${player_store.recorded_program.id}/subtitle/${requested_track.index}/arib`, {
                             params: {start_time: range_start, end_time: range_start + 12},
                         });
                         if (
                             response.type === 'success' &&
                             this.player !== null &&
+                            this.isInitializationCurrent(initialization_generation, playback_target_key) &&
                             fetch_generation === subtitle_generation
                         ) {
                             const decode = (data: string): Uint8Array => Uint8Array.from(atob(data), (character) =>
@@ -1432,7 +1729,10 @@ class PlayerController {
                         }
                     } finally {
                         is_fetching = false;
-                        if (restore_after_fetch === true) {
+                        if (
+                            restore_after_fetch === true &&
+                            this.isInitializationCurrent(initialization_generation, playback_target_key)
+                        ) {
                             restore_after_fetch = false;
                             void fetch_arib_subtitle(true);
                         }
@@ -1445,6 +1745,8 @@ class PlayerController {
                 };
                 const restart_arib_subtitle = () => {
                     if (this.player === null) return;
+                    // 字幕トラック切替・画質切り替えによる再アタッチでは、その時点のユーザー選択を再解決する。
+                    arib_track = resolve_arib_track();
                     this.recorded_arib_subtitle_cancel?.();
                     const video = this.player.video;
                     const timeupdate_handler = () => void fetch_arib_subtitle(false);
@@ -1470,7 +1772,11 @@ class PlayerController {
                 let restore_after_fetch = false;
                 let subtitle_generation = 0;
                 const fetch_arib_ttml = async (restore: boolean = false): Promise<void> => {
-                    if (this.player === null || this.arib_ttml_renderer === null) return;
+                    if (
+                        this.player === null ||
+                        this.arib_ttml_renderer === null ||
+                        this.isInitializationCurrent(initialization_generation, playback_target_key) === false
+                    ) return;
                     if (is_fetching === true) {
                         restore_after_fetch ||= restore;
                         return;
@@ -1503,6 +1809,7 @@ class PlayerController {
                             response.type === 'success' &&
                             this.player !== null &&
                             this.arib_ttml_renderer !== null &&
+                            this.isInitializationCurrent(initialization_generation, playback_target_key) &&
                             fetch_generation === subtitle_generation
                         ) {
                             const decode = (data: string): Uint8Array => Uint8Array.from(atob(data), (character) =>
@@ -1524,7 +1831,10 @@ class PlayerController {
                         }
                     } finally {
                         is_fetching = false;
-                        if (restore_after_fetch === true) {
+                        if (
+                            restore_after_fetch === true &&
+                            this.isInitializationCurrent(initialization_generation, playback_target_key)
+                        ) {
                             restore_after_fetch = false;
                             void fetch_arib_ttml(true);
                         }
@@ -1555,6 +1865,16 @@ class PlayerController {
 
         // デバッグ用にプレイヤーインスタンスも window 直下に入れる
         (window as any).player = this.player;
+
+        // 万が一再生開始後にデバイスが自動デインタレースに対応していることが判明した場合は、再起動せず Deinterlacer の Canvas だけを停止する
+        void decoder_deinterlace_probe_promise.then((result) => {
+            if (result?.deinterlaces !== true || this.player === null) return;
+            this.player.options.pluginOptions!.mpeg2toh264!.deinterlace = false;
+            this.player.options.pluginOptions!.mpeg2toh264!.deinterlacer = undefined;
+            if (this.player.type === 'mpeg2toh264' && this.player.plugins.mpeg2toh264) {
+                this.player.plugins.mpeg2toh264.deinterlace = false;
+            }
+        });
 
         if (
             requested_video_codec !== effective_video_codec ||
@@ -1622,12 +1942,46 @@ class PlayerController {
             // DPlayer の画質切り替え時にも現在の再生位置から HLS セグメントをロードさせるためのモンキーパッチを適用
             const dplayer_instance = this.player;
             const originalSwitchQuality = dplayer_instance.switchQuality.bind(dplayer_instance);
+            let is_recorded_quality_switch_pending = false;
             dplayer_instance.switchQuality = (index: number): void => {
-                if (dplayer_instance.options?.pluginOptions?.hls && dplayer_instance.video && dplayer_instance.options.live !== true) {
-                    // 画質切り替え前の再生位置を hls.js の startPosition に指定して、無駄な HLS セグメントの取得を抑止する
-                    dplayer_instance.options.pluginOptions.hls.startPosition = dplayer_instance.video.currentTime;
-                }
-                originalSwitchQuality(index);
+                if (
+                    dplayer_instance.options.video.quality === undefined ||
+                    dplayer_instance.qualityIndex === index ||
+                    dplayer_instance.switchingQuality === true ||
+                    is_recorded_quality_switch_pending === true
+                ) return;
+
+                // 旧 HLS の通信を止め、Server の admission 枠が解放されてから次画質を開始する。
+                // 終了 API が先着しても Server 側のバリアが遅着 playlist によるセッション復活を防ぐ。
+                is_recorded_quality_switch_pending = true;
+                const previous_source_url = dplayer_instance.quality?.url ?? null;
+                dplayer_instance.plugins.hls?.stopLoad();
+                void this.destroyRecordedPlaybackSession(previous_source_url).finally(() => {
+                    is_recorded_quality_switch_pending = false;
+                    if (
+                        this.player !== dplayer_instance ||
+                        this.destroying === true ||
+                        this.destroyed === true
+                    ) return;
+                    const target_quality = dplayer_instance.options.video.quality?.[index];
+                    if (dplayer_instance.options?.pluginOptions?.hls && dplayer_instance.video) {
+                        // 切り替え直前の再生位置からロードし、終了 API の待機中に進んだ位置も引き継ぐ。
+                        dplayer_instance.options.pluginOptions.hls.startPosition = dplayer_instance.video.currentTime;
+                    }
+                    originalSwitchQuality(index);
+
+                    // MSE は AAC のサンプル境界に合わせてシーク位置をわずかに補正する場合がある
+                    // DPlayer の画質切り替え完了判定が同じ位置へ戻し続けないよう、50ms 以内の補正値を現在位置として確定する
+                    if ((target_quality?.type === 'mpeg2toh264' || target_quality?.type === 'hls') && dplayer_instance.prevVideo !== null) {
+                        const video = dplayer_instance.video;
+                        const requested_time = dplayer_instance.prevVideoCurrentTime;
+                        video.addEventListener('seeked', () => {
+                            if (Math.abs(video.currentTime - requested_time) <= 0.05) {
+                                dplayer_instance.prevVideoCurrentTime = video.currentTime;
+                            }
+                        }, {once: true});
+                    }
+                });
             };
 
             this.setupRecordedHLSAudioTrackSelector();
@@ -1715,6 +2069,34 @@ class PlayerController {
                 );
                 return;
             }
+
+            // 帯域不足などでライブストリーミングの接続が短時間に繰り返し切断された場合は、自動再起動を諦めてユーザー操作へ委ねる。
+            // 低速回線で高ビットレートの画質を選び続けている場合など、再起動しても同じ切断が再発するだけの状態を無限に繰り返さないため
+            if (
+                event.konomitv_bs4k_restart_reason === 'StreamingConnectionLost' &&
+                this.konomitv_bs4k_streaming_reconnect_guard.requestReconnect(
+                    this.getKonomiTVBS4KPlaybackRestartKey(),
+                ) === false
+            ) {
+                console.error('[PlayerController] Repeated streaming connection loss. Automatic restart stopped.');
+                this.player.video.pause();
+                player_store.is_loading = false;
+                player_store.is_video_buffering = false;
+                player_store.is_background_display = true;
+                this.player.notice(
+                    '回線速度が不足しているためか、ライブストリーミングの接続が繰り返し切断されました。画質を下げるか、回線状況が改善してからプレイヤーを再起動してください。',
+                    -1,
+                    undefined,
+                    'rgb(var(--v-theme-error-readable))',
+                );
+                return;
+            }
+
+            // ユーザー操作による再起動では、回線状況や画質を見直した上での再接続とみなし、
+            // 接続喪失の連続カウントをリセットする。理由タグのない自動再起動と混同しないよう明示フラグだけを参照する
+            if (event.is_user_initiated === true) {
+                this.konomitv_bs4k_streaming_reconnect_guard.reset();
+            }
             is_player_restarting = true;
 
             // 現在の再生画質・再生速度・再生位置を取得
@@ -1758,8 +2140,11 @@ class PlayerController {
             // 通知を表示してから PlayerController を破棄すると DPlayer の DOM 要素ごと消えてしまうので、DPlayer を作り直した後に通知を表示する
             assert(this.player !== null);
             if (event.message) {
+                const restarted_generation = this.initialization_generation;
+                const restarted_playback_target_key = this.getPlaybackTargetKey();
                 // 遅延時間が指定されていれば待つ
                 await Utils.sleep(event.message_delay_seconds ?? 0);
+                if (this.isInitializationCurrent(restarted_generation, restarted_playback_target_key) === false) return;
                 // 明示的にエラーメッセージではないことが指定されていればデフォルトの色で通知を表示する
                 // デフォルトではメッセージは赤色で表示される
                 const color = event.is_error_message === false ? undefined : 'rgb(var(--v-theme-error-readable))';
@@ -1805,6 +2190,9 @@ class PlayerController {
             const current_playback_rate = this.player?.video.playbackRate ?? null;
             const current_time = this.player?.video.currentTime ?? null;
 
+            // ユーザーが回線状況や画質を見直した上での再接続とみなし、接続喪失の連続カウントをリセットする
+            this.konomitv_bs4k_streaming_reconnect_guard.reset();
+
             // PlayerController 自身を破棄
             // このイベントは手動で再起動した際に実行されるものなので、再初期化までは待たずに即座に再初期化する
             await this.destroy();
@@ -1825,6 +2213,11 @@ class PlayerController {
         // 待つ必要はないので非同期で実行
         if ('wakeLock' in navigator) {
             navigator.wakeLock.request('screen').then((wake_lock) => {
+                // request() 待機中に破棄・再初期化された場合、旧世代の Wake Lock を保持せず即座に解放する
+                if (this.isInitializationCurrent(initialization_generation, playback_target_key) === false) {
+                    void wake_lock.release();
+                    return;
+                }
                 this.screen_wake_lock = wake_lock;  // 後で解除するために WakeLockSentinel を保持
                 console.log('\u001b[31m[PlayerController] Screen Wake Lock API: Screen Wake Lock acquired.');
             });
@@ -1837,6 +2230,7 @@ class PlayerController {
             // ライブ視聴時に設定する PlayerManager
             this.player_managers = [
                 new LiveEventManager(this.player),
+                new KonomiTVBS4KHlgSdrManager(this.player),
                 // 実況機能が無効な場合は接続情報 API へのアクセスも WebSocket 接続も開始しない
                 ...(settings_store.is_jikkyo_enabled === true ? [new LiveCommentManager(this.player)] : []),
                 new LiveDataBroadcastingManager(this.player),
@@ -1854,6 +2248,10 @@ class PlayerController {
                     this.recorded_auto_skip_cm_target = target_time;
                     this.recorded_playback_end_blocked_by_seek = false;
                 }),
+                // BS4K 録画 (オンライン / オフライン保存) でも HLG / PQ の SDR 変換 canvas を再利用する。
+                // fMP4 の色信号書換え自体は KonomiTVBS4KColorRewriteLoader が fragment loader 境界で行う
+                ...(player_store.recorded_program.network_id === 0x000B ?
+                    [new KonomiTVBS4KHlgSdrManager(this.player)] : []),
                 new CaptureManager(this.player, this.playback_mode),
                 new DocumentPiPManager(this.player, this.playback_mode),
                 new KeyboardShortcutManager(this.player, this.playback_mode),
@@ -1865,6 +2263,7 @@ class PlayerController {
         // これにより各 PlayerManager での実際の処理が開始される
         // 同期処理すると時間が掛かるので、並行して実行する
         await Promise.all(this.player_managers.map((player_manager) => player_manager.init()));
+        this.assertInitializationIsCurrent(initialization_generation, playback_target_key);
 
         console.log('\u001b[31m[PlayerController] Initialized.');
     }
@@ -1899,47 +2298,196 @@ class PlayerController {
     private async recoverPlayback(): Promise<void> {
         assert(this.player !== null);
         const player_store = usePlayerStore();
+        const player = this.player;
+        const initialization_generation = this.initialization_generation;
+        const playback_target_key = this.getPlaybackTargetKey();
+        const is_current = (): boolean => (
+            this.player === player &&
+            this.isInitializationCurrent(initialization_generation, playback_target_key)
+        );
 
         // 1 秒待つ
         await Utils.sleep(1);
+        if (is_current() === false) return;
 
         // この時点で映像が停止していて、かつ readyState が HAVE_FUTURE_DATA な場合、復旧を試みる
+        // リバッファ待機中は rebufferPlayback() 側がバッファの回復を管理しているため、二重に pause()/play() を行わないよう対象外とする
         // Safari ではタイミングによっては this.player.video が null になる場合があるらしいので ? を付ける
-        if (player_store.is_video_buffering === true && this.player?.video?.readyState < 3) {
+        if (this.is_rebuffering === false && player_store.is_video_buffering === true && player.video.readyState < 3) {
             console.warn('\u001b[31m[PlayerController] Video still buffering. (HTMLVideoElement.readyState < HAVE_FUTURE_DATA) Trying to recover.');
 
             // 一旦停止して、0.25 秒間を置く
-            this.player.video.pause();
+            player.video.pause();
             await Utils.sleep(0.25);
+            if (is_current() === false) return;
 
             // 再度再生を試みる
             try {
-                await this.player.video.play();
+                await player.video.play();
             } catch (error) {
-                assert(this.player !== null);
+                if (is_current() === false) return;
                 console.warn('\u001b[31m[PlayerController] HTMLVideoElement.play() rejected. paused.');
-                this.player.pause();
+                player.pause();
                 return;  // 再生開始がリジェクトされた場合はここで終了
             }
 
             // さらに 0.5 秒待った時点で映像が停止している場合、復旧を試みる
+            // リバッファ待機中は rebufferPlayback() 側がバッファの回復を管理しているため、こちらも対象外とする
             await Utils.sleep(0.5);
-            if (player_store.is_video_buffering === true && this.player?.video?.readyState < 3) {
+            if (is_current() === false) return;
+            if (this.is_rebuffering === false && player_store.is_video_buffering === true && player.video.readyState < 3) {
                 console.warn('\u001b[31m[PlayerController] Video still buffering. (HTMLVideoElement.readyState < HAVE_FUTURE_DATA) Trying to recover.');
 
                 // 一旦停止して、0.25 秒間を置く
-                this.player.video.pause();
+                player.video.pause();
                 await Utils.sleep(0.25);
+                if (is_current() === false) return;
 
                 // 再度再生を試みる
                 try {
-                    await this.player.video.play();
+                    await player.video.play();
                 } catch (error) {
-                    assert(this.player !== null);
+                    if (is_current() === false) return;
                     console.warn('\u001b[31m[PlayerController] (retry) HTMLVideoElement.play() rejected. paused.');
-                    this.player.pause();
+                    player.pause();
                 }
             }
+        }
+    }
+
+
+    /**
+     * 再生中にバッファアンダーランが発生した際、バッファが再開閾値まで回復するまで playbackRate = 0 で待機する
+     * 低速回線でアンダーラン直後に再生を再開すると waiting ↔ playing を短周期で繰り返し、
+     * バッファリングの Progress Circular の点滅と断続的な映像停止を引き起こすため、
+     * 起動時バッファ温め (on_canplay) と同様の手法で再開にヒステリシスを持たせる
+     * 待機中は Progress Circular が表示され続ける。処理の完了を待つ必要はないので、基本 await せず非同期で実行すべき
+     */
+    private async rebufferPlayback(): Promise<void> {
+        assert(this.player !== null);
+
+        const initialization_generation = this.initialization_generation;
+
+        // 同じ init() 世代ですでにリバッファ待機中であれば重複して開始しない。
+        // 旧世代の待機が終了処理中でも、新世代では独立して開始できるよう世代番号を照合する
+        if (this.rebuffering_generation === initialization_generation) return;
+
+        const player_store = usePlayerStore();
+        const player = this.player;
+        const video = player.video;
+
+        // 録画の分断されたバッファは hls.js の GapController に復旧を任せる。
+        // playbackRate = 0 にすると GapController も停止するため、将来のバッファ範囲がすでに存在する場合は介入しない
+        const has_future_buffer_range = (): boolean => {
+            for (let i = 0; i < video.buffered.length; i++) {
+                if (video.buffered.start(i) > video.currentTime) return true;
+                if (video.currentTime <= video.buffered.end(i) && i + 1 < video.buffered.length) return true;
+            }
+            return false;
+        };
+        if (has_future_buffer_range() === true) {
+            // ライブでは分断後の最後のバッファ範囲がライブ端なので、既存の sync() で即座に復帰する
+            if (this.playback_mode === 'Live') player.sync(true);
+            return;
+        }
+
+        // 録画末尾では playlist の duration と MSE の実バッファ末尾が完全には一致しないことがある。
+        // 独自の閾値待機を行わず hls.js の末尾補完へ任せ、自然完走を playbackRate = 0 で妨げない
+        if (
+            this.playback_mode === 'Video' &&
+            Number.isFinite(video.duration) &&
+            video.duration - video.currentTime <= PlayerController.RECORDED_REBUFFER_SECONDS
+        ) return;
+
+        const playback_target_key = this.getPlaybackTargetKey();
+        this.rebuffering_generation = initialization_generation;
+        const is_current = (): boolean => (
+            this.player === player &&
+            player.video === video &&
+            this.isInitializationCurrent(initialization_generation, playback_target_key)
+        );
+
+        // 現在の再生速度を保存し、playbackRate = 0 で再生位置を固定する
+        // video.pause() を使うと DPlayer の UI アイコンが停止してしまうため、起動時バッファ温めと同様に playbackRate を使う
+        // mpegts.js の live-latency-synchronizer は playbackRate === 0 の場合は変更しないが、
+        // latency > liveSyncMaxLatency (設定値 3 秒) の場合は playbackRate = 1.1 に上書きするため、
+        // リバッファ待機中は synchronizer を無効化して上書きを防止する
+        const original_playback_rate = video.playbackRate;
+        video.playbackRate = 0;
+        if (this.playback_mode === 'Live' && this.player?.plugins?.mpegts) {
+            const mpegts_player = this.player.plugins.mpegts as any;
+            if (typeof mpegts_player.configureLiveSync === 'function') {
+                mpegts_player.configureLiveSync({ liveSync: false });
+            }
+        }
+        console.warn('\u001b[31m[PlayerController] Buffer underrun detected. Waiting for the buffer to recover...');
+
+        // ライブ視聴では低遅延モードの有無に関わらず 4 秒、録画視聴では 5 秒のバッファが貯まるまで待機する
+        const rebuffer_target_seconds = this.playback_mode === 'Live' ?
+            PlayerController.LIVE_REBUFFER_SECONDS : PlayerController.RECORDED_REBUFFER_SECONDS;
+
+        // 0.1 秒おきに再生バッファをチェックし、再開閾値まで回復するか中断条件を満たすまで待機する
+        // 回線が極端に遅く閾値に達しない場合は待機が続くが、ユーザーは一時停止・画質変更・チャンネル切替でいつでも脱出できる
+        // (ライブ視聴ではバッファ肥大による mpegts.js の強制切断を防ぐため、60 秒おきの強制シークでライブ端へ復帰する)
+        let resumed = false;
+        while (is_current()) {
+
+            // ユーザー操作や Media Session からの制御で一時停止された場合は、再生再開をユーザーに委ねて待機を終了する
+            if (video.paused === true) break;
+
+            // 待機開始後に分断された範囲が追加された場合も playbackRate を戻し、既存の復旧経路へ引き渡す
+            if (has_future_buffer_range() === true) {
+                if (this.playback_mode === 'Live') player.sync(true);
+                break;
+            }
+
+            // 再生位置から連続して再生可能なバッファ残量を取得する
+            // シークでバッファ範囲が分断されうるため、範囲の末尾と再生位置の単純な差は使わず、再生位置を含む範囲からの残量だけを再開可否の指標にする
+            // 再生位置を含む範囲がない場合 (シーク直後やバッファホールの手前で停止している) は 0 とする
+            let current_buffer_seconds = 0;
+            for (let i = 0; i < video.buffered.length; i++) {
+                if (video.buffered.start(i) <= video.currentTime && video.currentTime <= video.buffered.end(i)) {
+                    current_buffer_seconds = video.buffered.end(i) - video.currentTime;
+                    break;
+                }
+            }
+
+            // 再開閾値までバッファが回復した場合は待機を終了し、再生を再開する
+            // シークされた場合もここで新しい再生位置のバッファが評価されるため、個別の中断処理は不要
+            if (current_buffer_seconds >= rebuffer_target_seconds) {
+                resumed = true;
+                break;
+            }
+
+            await Utils.sleep(0.1);
+        }
+
+        // 待機中にプレイヤーが破棄・再起動されたり画質切替で video 要素が交換されたりしていなければ、再生速度を元に戻す
+        // 一時停止による終了でも playbackRate だけは元に戻し、ユーザーが再生を再開した際に意図しない速度固定が残らないようにする
+        if (is_current()) {
+            // configureLiveSync({ liveSync: false }) は 0 / 1 以外の再生速度を 1 に戻すため、
+            // synchronizer を先に復元してから元の再生速度を書き戻す
+            if (this.playback_mode === 'Live' && this.player?.plugins?.mpegts) {
+                const mpegts_player = this.player.plugins.mpegts as any;
+                if (typeof mpegts_player.configureLiveSync === 'function') {
+                    mpegts_player.configureLiveSync({ liveSync: this.tv_low_latency_mode });
+                }
+            }
+            video.playbackRate = original_playback_rate;
+        }
+        // 終了した処理がまだこの世代の待機状態を所有している場合だけ解除する。
+        // 新世代がすでに開始済みなら、その待機状態は新世代自身の終了時まで維持する
+        if (this.rebuffering_generation === initialization_generation) {
+            this.rebuffering_generation = null;
+        }
+        if (resumed === true) {
+            // バッファは再開閾値まで回復しているため、バッファリング表示を解除する
+            // 実際のアンダーランからの復帰では playing イベントでも解除されるが、
+            // ブラウザが stalled 扱いにならなかった経路では playing が発火せず表示が残ってしまう場合がある
+            if (player_store.is_loading === false) {
+                player_store.is_video_buffering = false;
+            }
+            console.log('\u001b[31m[PlayerController] Buffer recovered. Resuming playback.');
         }
     }
 
@@ -1990,6 +2538,22 @@ class PlayerController {
 
 
     /**
+     * 録画生字幕の表示トラックを切り替える。
+     *
+     * Args:
+     *     subtitle_track_index: 選択する subtitle_tracks の index。null で自動 (先頭トラック) に戻す。
+     */
+    private switchRecordedRawSubtitleTrack(subtitle_track_index: number | null): void {
+        if (this.player === null) return;
+        this.recorded_raw_subtitle_track_index = subtitle_track_index;
+        // 前トラックの字幕ウィンドウが画面に残らないよう CanvasRenderer を作り直し、
+        // 現在位置から新トラックの管理データ・DRCS 復元 packet を引き直して再表示する。
+        this.replaceARIBB24Renderers();
+        this.recorded_arib_subtitle_restart?.();
+    }
+
+
+    /**
      * ARIB-TTML レンダラーを現在の video 要素へ接続する。
      * 画質切り替えでは video 要素自体が作り直されるため、同じデコーダーを新しい要素へ付け直す。
      */
@@ -2009,7 +2573,7 @@ class PlayerController {
         (this.player.plugins as unknown as {aribTTML?: ARIBTTMLRenderer}).aribTTML = this.arib_ttml_renderer;
         this.arib_ttml_renderer.attachMedia(this.player.video);
         const is_caption_hidden = this.player.subtitle?.container.classList.contains('dplayer-subtitle-hide') ?? false;
-        if (is_caption_hidden) this.arib_ttml_renderer.hideCaption();
+        if (is_caption_hidden || this.recorded_raw_subtitle_track_index !== null) this.arib_ttml_renderer.hideCaption();
         else this.arib_ttml_renderer.showCaption();
         this.arib_ttml_renderer.setSuperimposeVisibility(aribb24_options.disableSuperimposeRenderer !== true);
     }
@@ -2036,15 +2600,21 @@ class PlayerController {
         const channels_store = useChannelsStore();
         const player_store = usePlayerStore();
         const settings_store = useSettingsStore();
+        const initialization_generation = this.initialization_generation;
+        const playback_target_key = this.getPlaybackTargetKey();
+        let playback_handler_generation = 0;
 
-        // ライブ視聴: 再生停止状態かつ現在の再生位置からバッファが 30 秒以上離れていないかを 60 秒おきに監視し、そうなっていたら強制的にシークする
+        // ライブ視聴: 再生停止状態またはリバッファ待機中に、現在の再生位置からバッファが 30 秒以上離れていないかを 60 秒おきに監視し、そうなっていたら強制的にシークする
         // mpegts.js の仕様上、MSE 側に未再生のバッファが貯まり過ぎると新規に SourceBuffer が追加できなくなるため、強制的に接続が切断されてしまう
-        // 再生停止状態でも定期的にシークすることで、バッファが貯まりすぎないように調節する
+        // リバッファ待機中も再生位置が固定されたままバッファが伸び続けるため、再生停止状態と同様に定期的にシークして調節する
         if (this.playback_mode === 'Live') {
             this.live_force_seek_interval_timer_cancel = Utils.setIntervalInWorker(() => {
                 if (this.player === null) return;
-                if ((this.player.video.paused && this.player.video.buffered.length >= 1) &&
-                    (this.player.video.buffered.end(0) - this.player.video.currentTime > 30)) {
+                // mpeg2toh264 は変換済みバッファを自身で管理するため、強制同期は mpegts.js の再生時だけ実行する
+                if (this.player.type !== 'mpegts') return;
+                const buffered = this.player.video.buffered;
+                if (((this.player.video.paused || this.is_rebuffering) && buffered.length >= 1) &&
+                    (buffered.end(buffered.length - 1) - this.player.video.currentTime > 30)) {
                     this.player.sync();
                 }
             }, 60 * 1000);
@@ -2061,9 +2631,25 @@ class PlayerController {
                 const player = this.player;
                 if (player.quality === null) return;
                 const api_quality = PlayerUtils.extractVideoAPIQualityFromDPlayer(player);
-                const source_url = new URL(player.quality.url);
-                const query = source_url.searchParams.toString();
-                await APIClient.put(`${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/keep-alive?${query}`);
+                const source_url = player.quality.url;
+                const query = new URL(source_url).searchParams.toString();
+                const response = await APIClient.put(`${Utils.api_base_url}/streams/video/${player_store.recorded_program.id}/${api_quality}/keep-alive?${query}`);
+
+                // タブ休止などで Server 側のセッションが期限切れになった場合は、新しい session ID で再作成する。
+                // 遅着した旧画質の応答から現在のプレイヤーを再起動しないよう、要求時の source も照合する。
+                if (
+                    response.type === 'error' &&
+                    response.status === 422 &&
+                    response.data.detail === 'Session does not exist' &&
+                    this.player === player &&
+                    player.quality?.url === source_url &&
+                    this.isInitializationCurrent(initialization_generation, playback_target_key)
+                ) {
+                    player_store.event_emitter.emit('PlayerRestartRequired', {
+                        message: '録画再生セッションの有効期限が切れたため、プレイヤーを再起動しました。',
+                        is_error_message: false,
+                    });
+                }
             }, 5 * 1000);
         }
 
@@ -2089,10 +2675,19 @@ class PlayerController {
         this.player.on('waiting', () => {
             // Progress Circular を表示する
             player_store.is_video_buffering = true;
+
+            // 初回ロード完了後の再生中にバッファアンダーランが発生した場合、バッファが再開閾値まで回復するまで再生を待機する
+            // 低速回線でアンダーランのたびに即再開を繰り返すと、Progress Circular の点滅と断続的な映像停止が発生するため
+            // 起動時バッファ温め中 (is_loading === true) とユーザーによる一時停止中は対象外
+            if (player_store.is_loading === false && this.player !== null && this.player.video.paused === false) {
+                this.rebufferPlayback();
+            }
         });
         this.player.on('playing', () => {
             // ロード中 (映像が表示されていない) でなければ Progress Circular を非表示にする
-            if (player_store.is_loading === false) {
+            // リバッファ待機中は rebufferPlayback() 側が解除するまで表示を維持する
+            // (アンダーランからの部分的なデータ到着で playing が発火しても、バッファはまだ再開閾値に達していないため)
+            if (this.is_rebuffering === false && player_store.is_loading === false) {
                 player_store.is_video_buffering = false;
             }
             // 完走後に末尾より前へ戻して実際の再生を再開した場合は、再び通常の視聴中として扱う。
@@ -2115,6 +2710,24 @@ class PlayerController {
         // 今回 (DPlayer 初期化直後) と画質切り替え開始時の両方のタイミングで実行する必要がある処理
         // mpegts.js などの DPlayer のプラグインは画質切り替え時に一旦破棄されるため、再度イベントハンドラーを登録する必要がある
         const on_init_or_quality_change = async (is_quality_change: boolean = false) => {
+            const current_playback_handler_generation = ++playback_handler_generation;
+            const current_player = this.player;
+
+            // 画質切り替えは PlayerRestartRequired イベントを介さずストリーミングへ再接続するため、
+            // ユーザーが回線状況に応じて画質を見直した上での再接続とみなし、接続喪失の連続カウントをリセットする
+            // (自動再起動に伴う DPlayer の再初期化ではリセットしない。リセットすると接続喪失ループの抑止自体が無効化されてしまう)
+            if (is_quality_change === true) {
+                this.konomitv_bs4k_streaming_reconnect_guard.reset();
+            }
+
+            const is_current = (): boolean => (
+                current_playback_handler_generation === playback_handler_generation &&
+                current_player !== null &&
+                this.player === current_player &&
+                this.isInitializationCurrent(initialization_generation, playback_target_key)
+            );
+            if (is_current() === false) return;
+            assert(current_player !== null);
             assert(this.player !== null);
 
             // 画質切り替え時は DPlayer が内蔵字幕レンダラーを再生成するため、再度パッチ済み版へ差し替える。
@@ -2132,12 +2745,77 @@ class PlayerController {
             // 初回実行時はそもそもまだ PlayerManager が一つも初期化されていないので、何も起こらない
             for (const player_manager of this.player_managers) {
                 if (player_manager.restart_required_when_quality_switched === true) {
-                    player_manager.destroy().then(() => player_manager.init());  // 非同期で実行
+                    void player_manager.destroy().then(async () => {
+                        // controller 破棄や次の画質切替が始まっていれば、旧 callback から manager を復活させない
+                        if (is_current() === false || this.player_managers.includes(player_manager) === false) return;
+                        await player_manager.init();
+                    });
                 }
             }
 
             // ライブ視聴時のみ
             if (this.playback_mode === 'Live') {
+
+                // mpeg2toh264 によるオリジナル画質再生時のみの専用処理
+                if (this.player.type === 'mpeg2toh264' && this.player.plugins.mpeg2toh264) {
+                    player_store.is_loading = true;
+                    player_store.is_background_display = true;
+
+                    let on_mpeg2_canplay_called = false;
+                    const mpeg2toh264_player = this.player.plugins.mpeg2toh264;
+                    const startup_timeout_id = window.setTimeout(() => {
+                        if (is_current() === false || on_mpeg2_canplay_called === true) return;
+                        // 15秒経っても再生できない恒常障害を、理由なしの無制限再試行にしない。
+                        // オフラインなら接続喪失、そうでなければ変換 / MSE pipeline の失敗として既存 guard へ渡す。
+                        player_store.event_emitter.emit('PlayerRestartRequired', {
+                            message: '再生開始までに時間が掛かっています。プレイヤーを再起動しています…',
+                            konomitv_bs4k_restart_reason: navigator.onLine === false ?
+                                'StreamingConnectionLost' :
+                                'RuntimeCodecPipelineError',
+                        });
+                    }, 15 * 1000);
+                    const on_mpeg2_canplay = () => {
+                        if (this.player === null || is_current() === false || on_mpeg2_canplay_called === true) return;
+                        on_mpeg2_canplay_called = true;
+                        window.clearTimeout(startup_timeout_id);
+                        this.player.video.oncanplay = null;
+                        this.player.video.oncanplaythrough = null;
+                        player_store.is_loading = false;
+                        player_store.is_video_buffering = false;
+                        player_store.is_background_display = false;
+                    };
+                    this.player.video.oncanplay = on_mpeg2_canplay;
+                    this.player.video.oncanplaythrough = on_mpeg2_canplay;
+                    mpeg2toh264_player.addEventListener('error', async () => {
+                        window.clearTimeout(startup_timeout_id);
+                        if (is_current() === false || this.player === null) return;
+                        this.player.pause();
+                        // mpeg2toh264 は通信・Worker・MSE 失敗を error に集約し、ライブラリ側に再試行が無い。
+                        // pause だけで止めず、通常ライブと同じ PlayerRestartRequired へ渡す。
+                        await Utils.sleep(1);
+                        if (is_current() === false || this.player === null) return;
+                        let was_offline = false;
+                        if (navigator.onLine === false) {
+                            was_offline = true;
+                            this.player.notice('現在ネットワーク接続がありません。オンラインになるまで待機しています…', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
+                            console.warn('\u001b[31m[PlayerController] mpeg2toh264 error event: Network error. Waiting for online...');
+                            await Utils.waitUntilOnline();
+                            if (is_current() === false) return;
+                        }
+                        console.error('\u001b[31m[PlayerController] mpeg2toh264 error event.');
+                        // mpeg2toh264 は通信と変換 / MSE を同じ error に集約する。
+                        // オフライン経路なら接続喪失、そうでなければ pipeline 失敗として既存の有限 guard へ渡す。
+                        player_store.event_emitter.emit('PlayerRestartRequired', {
+                            message: '再生中にエラーが発生しました。(mpeg2toh264) プレイヤーを再起動しています…',
+                            konomitv_bs4k_restart_reason: was_offline === true ?
+                                'StreamingConnectionLost' :
+                                'RuntimeCodecPipelineError',
+                        });
+                    }, {once: true});
+                    void this.player.play();
+                    // オリジナル画質では mpeg2toh264 自身がバッファを適切に管理してくれるため、mpegts.js 専用の同期処理はスキップする
+                    return;
+                }
 
                 // DPlayer と aribb24.js が購読するものと同じ timed-ID3 event を、KonomiTV の
                 // ARIB-TTML 共通デコーダーにも並列で接続する。
@@ -2156,18 +2834,24 @@ class PlayerController {
 
                     // すぐ再起動すると問題があるケースがあるので、少し待機する
                     await Utils.sleep(1);
+                    if (is_current() === false) return;
 
                     // もしこの時点でオフラインの場合、ネットワーク接続の変更による接続切断の可能性が高いので、オンラインになるまで待機する
                     if (navigator.onLine === false) {
                         this.player.notice('現在ネットワーク接続がありません。オンラインになるまで待機しています…', undefined, undefined, 'rgb(var(--v-theme-error-readable))');
                         console.warn('\u001b[31m[PlayerController] mpegts.js error event: Network error. Waiting for online...');
                         await Utils.waitUntilOnline();
+                        if (is_current() === false) return;
                     }
 
-                    // PlayerController の再起動を要求する
+                    // mpegts.js の ErrorTypes は NetworkError / MediaError / OtherError の 3 種別。
+                    // MediaError には MEDIA_MSE_ERROR や MEDIA_CODEC_UNSUPPORTED が含まれるため、
+                    // 接続喪失としてカウントするのは NetworkError のみに限る
+                    const is_network_error = error_type === 'NetworkError';
                     console.error('\u001b[31m[PlayerController] mpegts.js error event:', error_type, detail);
                     player_store.event_emitter.emit('PlayerRestartRequired', {
                         message: `再生中にエラーが発生しました。(${error_type}: ${detail}) プレイヤーを再起動しています…`,
+                        konomitv_bs4k_restart_reason: is_network_error ? 'StreamingConnectionLost' : undefined,
                     });
                 });
 
@@ -2183,6 +2867,7 @@ class PlayerController {
 
                     // すぐ再起動すると問題があるケースがあるので、少し待機する
                     await Utils.sleep(1);
+                    if (is_current() === false) return;
 
                     const media_error = this.player.video.error;
                     if (media_error) {
@@ -2190,7 +2875,8 @@ class PlayerController {
                         player_store.event_emitter.emit('PlayerRestartRequired', {
                             message: `再生中にエラーが発生しました。(Native: ${media_error.code}: ${media_error.message}) プレイヤーを再起動しています…`,
                             konomitv_bs4k_restart_reason: media_error.code === media_error.MEDIA_ERR_DECODE ?
-                                'RuntimeCodecPipelineError' : undefined,
+                                'RuntimeCodecPipelineError' :
+                                media_error.code === media_error.MEDIA_ERR_NETWORK ? 'StreamingConnectionLost' : undefined,
                         });
                     } else {
                         // MediaError オブジェクトは場合によっては存在しないことがあるらしい…
@@ -2220,6 +2906,7 @@ class PlayerController {
                     const maxAttempts = 5;  // 試行回数
                     const attemptInterval = 0.05;  // 試行間隔 (秒)
                     const attemptPlay = async (): Promise<void> => {
+                        if (is_current() === false) return;
                         if (attempts >= maxAttempts) {
                             console.warn(`\u001b[31m[PlayerController] Failed to start playback after ${maxAttempts} attempts.`);
                             return;
@@ -2231,10 +2918,12 @@ class PlayerController {
                             console.warn(`\u001b[31m[PlayerController] Attempt ${attempts + 1} to start playback failed:`, error);
                             attempts++;
                             await Utils.sleep(attemptInterval);
+                            if (is_current() === false) return;
                             await attemptPlay();
                         }
                     };
                     await attemptPlay();
+                    if (is_current() === false) return;
                 }
 
                 // 再生準備ができた段階で再生バッファを調整し、再生準備ができた段階でローディング中の背景写真を非表示にするイベントハンドラーを登録
@@ -2242,7 +2931,8 @@ class PlayerController {
                 const on_canplay = async () => {
 
                     // 重複実行を回避する
-                    if (this.player === null) return;
+                    if (is_current() === false) return;
+                    assert(this.player !== null);
                     if (on_canplay_called === true) return;
                     this.player.video.oncanplay = null;
                     this.player.video.oncanplaythrough = null;
@@ -2259,10 +2949,11 @@ class PlayerController {
                     // live_playback_buffer_seconds の値は mpegts.js の liveSyncTargetLatency 設定に渡す値と共通
                     const live_playback_buffer_seconds = this.live_playback_buffer_seconds;  // 毎回取得すると負荷が掛かるのでキャッシュする
                     let current_playback_buffer_sec = this.getPlaybackBufferSeconds();
-                    while (current_playback_buffer_sec < live_playback_buffer_seconds) {
+                    while (is_current() && current_playback_buffer_sec < live_playback_buffer_seconds) {
                         await Utils.sleep(0.1);
                         current_playback_buffer_sec = this.getPlaybackBufferSeconds();
                     }
+                    if (is_current() === false) return;
 
                     // 再生バッファ調整のため一旦停止していた再生を再び開始
                     this.player.video.playbackRate = 1;
@@ -2299,6 +2990,7 @@ class PlayerController {
                         const volume_step = current_volume / 10;
                         for (let i = 0; i < 10; i++) {  // 10 回に分けて音量を上げる
                             await Utils.sleep(0.5 / 10);
+                            if (is_current() === false) return;
                             // 音量が current_volume を超えないようにする
                             // 浮動小数点絡みの問題 (丸め誤差) が出るため小数第3位で切り捨てる
                             this.player.video.volume = Math.min(Utils.mathFloor(this.player.video.volume + volume_step, 3), current_volume);
@@ -2316,12 +3008,14 @@ class PlayerController {
                 // 特に Safari 18 以降では MSE の canplay(through) が場合によっては発火しなかったり、発火が異常に遅かったりする…
                 // Safari 18 以降、MSE において canplay(through) の発火タイミングと readyState の値は信頼できない
                 this.player.plugins.mpegts?.on(mpegts.Events.MEDIA_INFO, async (info: {[key: string]: any}) => {
+                    if (is_current() === false) return;
                     console.log('\u001b[31m[PlayerController] mpegts.js media info:', info);
                     this.live_media_info = info;
                     this.applyAudioTrackLabels(info);
                     // 一応ブラウザネイティブの canplay(through) を優先したいので、0.25 秒待ってから再生開始を試みる
                     // 既に再生開始処理を実行済みの場合は実行しない
                     await Utils.sleep(0.25);
+                    if (is_current() === false) return;
                     if (on_canplay_called === false) {
                         console.warn('\u001b[31m[PlayerController] mpegts.js media info fired, but canplay(through) event not fired. Trying to manually start playback.');
                         on_canplay();
@@ -2335,10 +3029,10 @@ class PlayerController {
                 // ほとんどのケースでは 先に上記 mpegts.js の MEDIA_INFO イベントが発火するため、この処理は実行されない
                 (async () => {
                     let have_future_data_count = 0;
-                    while (this.player !== null && this.player.video.readyState < 4) {
+                    while (is_current() && current_player.video.readyState < 4) {
                         // プレイヤーが充分と判断する基準はまちまちでブラウザによっては HAVE_FUTURE_DATA のままタイムアウトするので
                         // HAVE_FUTURE_DATA がおおむね 5 秒つづけば HAVE_ENOUGH_DATA 扱いする
-                        if (this.player.video.readyState < 3) {
+                        if (current_player.video.readyState < 3) {
                             have_future_data_count = 0;
                         } else if (++have_future_data_count > 100) {
                             break;
@@ -2348,6 +3042,7 @@ class PlayerController {
                     // ループを終えた時点で readyState === HAVE_ENOUGH_DATA になっているので、再生開始を試みる
                     // 既に再生開始処理を実行済みの場合は実行しない
                     await Utils.sleep(0.1);
+                    if (is_current() === false) return;
                     if (on_canplay_called === false) {
                         console.warn('\u001b[31m[PlayerController] canplay(through) event not fired. Trying to manually start playback.');
                         on_canplay();
@@ -2357,10 +3052,11 @@ class PlayerController {
                 // もしライブストリームのステータスが ONAir にも関わらず 15 秒以上バッファリング中で canplaythrough が発火しない場合、
                 // ロードに失敗したとみなし PlayerController の再起動を要求する
                 await Utils.sleep(15);
-                if (this.destroyed === true || this.player === null) return;
+                if (is_current() === false) return;
                 if (player_store.live_stream_status === 'ONAir' && player_store.is_video_buffering === true && on_canplay_called === false) {
                     player_store.event_emitter.emit('PlayerRestartRequired', {
                         message: '再生開始までに時間が掛かっています。プレイヤーを再起動しています…',
+                        konomitv_bs4k_restart_reason: 'StreamingConnectionLost',
                     });
                 }
 
@@ -2407,7 +3103,8 @@ class PlayerController {
                 const on_canplay = async () => {
 
                     // 重複実行を回避する
-                    if (this.player === null) return;
+                    if (is_current() === false) return;
+                    assert(this.player !== null);
                     if (on_canplay_called === true) return;
                     this.player.video.oncanplaythrough = null;
                     on_canplay_called = true;
@@ -2465,14 +3162,14 @@ class PlayerController {
         // 番組情報タブ内の NEXT >> を 500ms 以内に3回連続でタップすると統計情報の表示/非表示が切り替わる
         // イベントを重複定義しないように、あえて ontouchstart を使う
         let tap_count = 0;
-        let last_tap = 0;
+        let last_tap: number | null = null;
         const element = document.querySelector<HTMLDivElement>('.program-info__next');
         if (element !== null) {
             element.ontouchstart = () => {
                 if (this.player === null) return;
-                const current_time = new Date().getTime();
-                const time_difference = current_time - last_tap;
-                if (time_difference < 500 && time_difference > 0) {
+                const current_time = performance.now();
+                const time_difference = last_tap === null ? null : current_time - last_tap;
+                if (time_difference !== null && time_difference < 500 && time_difference > 0) {
                     tap_count++;
                     if (tap_count === 3) {
                         this.player.infoPanel.toggle();
@@ -2551,14 +3248,17 @@ class PlayerController {
             // 視聴履歴の更新処理
             // timeupdate イベントを間引いて処理
             // ここで登録したイベントは、destroy() を実行した際にプレイヤーごと破棄される
-            let last_timeupdate_fired_at = 0;
+            let last_timeupdate_fired_at: number | null = null;
             this.player.on('timeupdate', () => {
                 if (!this.player || !this.player.video) {
                     return;
                 }
                 // 前回 timeupdate イベントが発火した時刻から WATCHED_HISTORY_UPDATE_INTERVAL 秒間は処理を実行しない（間引く）
-                const now = new Date().getTime();
-                if (now - last_timeupdate_fired_at < PlayerController.WATCHED_HISTORY_UPDATE_INTERVAL * 1000) {
+                const now = performance.now();
+                if (
+                    last_timeupdate_fired_at !== null &&
+                    now - last_timeupdate_fired_at < PlayerController.WATCHED_HISTORY_UPDATE_INTERVAL * 1000
+                ) {
                     return;
                 }
                 last_timeupdate_fired_at = now;
@@ -2573,6 +3273,7 @@ class PlayerController {
                     settings_store.settings.watched_history[history_index].updated_at = Utils.time();
                     console.log(`\u001b[31m[PlayerController] Last playback position updated. (Video ID: ${video_id}, last_playback_position: ${current_time})`);
                 }
+                void this.sendBangumiPlaybackProgress(current_time);
             });
 
             // 視聴開始から WATCHED_HISTORY_THRESHOLD_SECONDS 秒間このページが開かれ続けていたら、視聴履歴に追加する
@@ -2997,9 +3698,16 @@ class PlayerController {
                 this.is_offline_fallback_in_progress === true
             ) return;
             this.is_offline_fallback_in_progress = true;
+            const fallback_generation = this.initialization_generation;
+            const fallback_playback_target_key = this.getPlaybackTargetKey();
+            const fallback_player = this.player;
             try {
                 const offline_video = await OfflineVideos.getVideo(player_store.recorded_program.id);
-                if (this.destroyed === true || this.player === null || offline_video === null) return;
+                if (
+                    offline_video === null ||
+                    this.player !== fallback_player ||
+                    this.isInitializationCurrent(fallback_generation, fallback_playback_target_key) === false
+                ) return;
                 player_store.recorded_program = offline_video.program;
                 player_store.is_offline_playback = true;
                 player_store.offline_video = offline_video;
@@ -3540,15 +4248,17 @@ class PlayerController {
         // inline clip-path / height は変更しない。閉じる際に全 modifier を外すことで、
         // 戻る操作・外側クリック・別サブパネルへの移動のいずれでも元の寸法へ確実に戻す。
         const setting_box = this.player.template.settingBox;
-        const codec_panel_class_names = [
+        const sub_panel_class_names = [
             'dplayer-konomitv-bs4k-setting-box-video-codec',
             'dplayer-konomitv-bs4k-setting-box-audio-codec',
+            'dplayer-konomitv-bs4k-setting-box-hdr-output',
+            'dplayer-konomitv-bs4k-setting-box-subtitle',
         ];
-        const close_codec_panel = () => {
-            setting_box.classList.remove(...codec_panel_class_names);
+        const close_sub_panel = () => {
+            setting_box.classList.remove(...sub_panel_class_names);
         };
-        const open_codec_panel = (panel_name: 'video-codec' | 'audio-codec') => {
-            close_codec_panel();
+        const open_sub_panel = (panel_name: 'video-codec' | 'audio-codec' | 'hdr-output' | 'subtitle') => {
+            close_sub_panel();
             // DPlayer 標準サブパネルの modifier が残っていると clip-path の優先順位が競合する。
             setting_box.classList.remove(
                 'dplayer-setting-box-quality',
@@ -3557,12 +4267,12 @@ class PlayerController {
             );
             setting_box.classList.add(`dplayer-konomitv-bs4k-setting-box-${panel_name}`);
         };
-        const consume_codec_panel_event = (event: Event) => {
+        const consume_sub_panel_event = (event: Event) => {
             // 設定パネル外の click/tap handler へ伝播させず、DPlayer の mask/hide と競合させない。
             event.preventDefault();
             event.stopPropagation();
         };
-        const register_codec_panel_activation_handler = (
+        const register_sub_panel_activation_handler = (
             element: HTMLElement,
             handler: (event: Event) => void,
         ) => {
@@ -3571,7 +4281,7 @@ class PlayerController {
                 // role=button の独自要素をネイティブ button と同じ Enter / Space で起動する。
                 // Space のページスクロールとキーリピートによる多重 preflight はここで抑止する。
                 if ((event.key !== 'Enter' && event.key !== ' ') || event.repeat === true) return;
-                consume_codec_panel_event(event);
+                consume_sub_panel_event(event);
                 element.click();
             });
         };
@@ -3583,12 +4293,12 @@ class PlayerController {
             if (this.player === null) return;
             original_hide.call(this.player.setting);
             // 独自サブパネルを開いたまま外側を押して閉じた場合も、次回は必ず元パネルから表示する。
-            close_codec_panel();
+            close_sub_panel();
             player_store.is_player_setting_panel_open = false;
         };
         this.player.setting.show = () => {
             if (this.player === null) return;
-            close_codec_panel();
+            close_sub_panel();
             original_show.call(this.player.setting);
             player_store.is_player_setting_panel_open = true;
         };
@@ -3629,6 +4339,16 @@ class PlayerController {
                 <span class="dplayer-label">音声コーデック</span>
                 <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-audio-codec-value"></span>
                 <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-audio-codec-arrow"></div>
+            </div>
+        `;
+        // 字幕トラック切替の項目。候補は録画生字幕・TTML component から動的に組み立てるため、
+        // パネル内の項目は render 関数で生成し、パネル枠だけを HTML 直書きで注入する。
+        const subtitle_setting_item_html = `
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-subtitle"
+                role="button" tabindex="0" style="touch-action:manipulation;">
+                <span class="dplayer-label">字幕</span>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-subtitle-value"></span>
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-subtitle-arrow"></div>
             </div>
         `;
         const auto_skip_cm_setting_item_html = this.playback_mode === 'Video' ? `
@@ -3701,6 +4421,13 @@ class PlayerController {
                 <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-video-codec-arrow"></div>
             </div>
             ${audio_codec_setting_item_html}
+            ${subtitle_setting_item_html}
+            <div class="dplayer-setting-item dplayer-konomitv-bs4k-setting-hdr-output"
+                role="button" tabindex="0" style="touch-action:manipulation;">
+                <span class="dplayer-label">HDR 出力</span>
+                <span class="dplayer-label-value dplayer-konomitv-bs4k-setting-hdr-output-value"></span>
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-hdr-output-arrow"></div>
+            </div>
             ${auto_skip_cm_setting_item_html}
             <div class="dplayer-setting-item dplayer-setting-mobile-profile">
                 <span class="dplayer-label">モバイル回線向け画質</span>
@@ -3725,6 +4452,10 @@ class PlayerController {
             )!.style.display = 'none';
             this.player.container.querySelector<HTMLElement>(
                 '.dplayer-setting-mobile-profile',
+            )!.style.display = 'none';
+            // 保存版パッケージの字幕は生成条件に焼き込まれているため、トラック切替を提供しない
+            this.player.container.querySelector<HTMLElement>(
+                '.dplayer-konomitv-bs4k-setting-subtitle',
             )!.style.display = 'none';
         }
 
@@ -3772,6 +4503,7 @@ class PlayerController {
                     message_delay_seconds: 2,
                     is_error_message: false,
                     should_resume_quality: true,
+                    is_user_initiated: true,
                 });
             });
         }
@@ -3794,6 +4526,64 @@ class PlayerController {
                 );
             }
         };
+        const hdr_output_item = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-hdr-output',
+        );
+        const hdr_output_value = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-hdr-output-value',
+        );
+        const hdr_output_labels: Record<'Auto' | 'HDR' | 'SDR' | 'Debug', string> = {
+            Auto: 'Auto',
+            HDR: 'HDR 素通し',
+            SDR: 'SDR 変換',
+            Debug: 'デバッグモード',
+        };
+        const selectable_hdr_outputs: ('Auto' | 'HDR' | 'SDR' | 'Debug')[] = ['Auto', 'HDR', 'SDR', 'Debug'];
+        const HDR_OUTPUT_PANEL_BASE_HEIGHT = 54;
+        const HDR_OUTPUT_ITEM_HEIGHT = 30;
+        const update_hdr_output_panel_height = (): void => {
+            const visible_count = version_store.is_server_debug_enabled === true ?
+                selectable_hdr_outputs.length : selectable_hdr_outputs.length - 1;
+            setting_box.style.setProperty(
+                '--konomitv-bs4k-hdr-output-panel-height',
+                `${HDR_OUTPUT_PANEL_BASE_HEIGHT + visible_count * HDR_OUTPUT_ITEM_HEIGHT}px`,
+            );
+        };
+        const update_hdr_output_display = (): void => {
+            if (hdr_output_item === null || hdr_output_value === null) return;
+            // BS4K ライブ・BS4K 録画・BS4K オフライン保存の再生でのみ表示する (非 BS4K では表示しない)。
+            // SDR ソース (classify === None) では項目を隠す。HLG / PQ では素通し中も含めて出す。
+            const is_bs4k_playback = this.playback_mode === 'Live' ?
+                channels_store.channel.current.display_channel_id.startsWith('bs4k') :
+                player_store.recorded_program.network_id === 0x000B;
+            // ライブは VUI を取得できないコーデックでも、B60 / MH-EIT から HDR ソースを判定する。
+            // 録画では B60 / MH-EIT が null のため、従来どおり fMP4 colr 由来の VUI だけが使われる。
+            const transfer_characteristics = resolveKonomiTVBS4KEffectiveTransferCharacteristics(
+                player_store.sps_transfer_characteristics,
+                player_store.b60_video_transfer,
+                player_store.mh_eit_hdr_hint,
+            );
+            const is_hdr_source =
+                classifyKonomiTVBS4KHdrSource(transfer_characteristics) !== 'None';
+            hdr_output_item.style.display =
+                is_bs4k_playback === true && is_hdr_source === true ? '' : 'none';
+            const debug_enabled = version_store.is_server_debug_enabled;
+            const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
+                settings_store.settings.konomitv_bs4k_hdr_output;
+            hdr_output_value.textContent = hdr_output_labels[current];
+            // サブパネルの現在値へチェックを表示する。デバッグモードはサーバー debug オン時だけ出す。
+            this.player?.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-item')
+                .forEach((item) => {
+                    if (item.dataset.output === 'Debug') {
+                        item.style.display = debug_enabled === true ? 'flex' : 'none';
+                    }
+                    const check = item.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-check');
+                    if (check !== null) {
+                        check.style.visibility = item.dataset.output === current ? 'visible' : 'hidden';
+                    }
+                });
+            update_hdr_output_panel_height();
+        };
         this.rain_fallback_watchers = [
             watch(
                 [
@@ -3801,6 +4591,40 @@ class PlayerController {
                     () => player_store.is_rain_fallback_broadcasting,
                 ],
                 update_rain_fallback_status_display,
+            ),
+            watch(
+                [
+                    () => player_store.konomitv_bs4k_playback_hdr_output_override,
+                    () => settings_store.settings.konomitv_bs4k_hdr_output,
+                    () => version_store.is_server_debug_enabled,
+                    () => player_store.sps_transfer_characteristics,
+                    () => player_store.b60_video_transfer,
+                    () => player_store.mh_eit_hdr_hint,
+                ],
+                () => {
+                    // 視聴中にサーバー debug がオフになったら Debug 項目を隠し、override を破棄する。
+                    // ライブは HlgSdrManager が即時反映し、録画は色信号書換えセッションを作り直すため再起動する。
+                    if (
+                        version_store.is_server_debug_enabled === false &&
+                        player_store.konomitv_bs4k_playback_hdr_output_override === 'Debug'
+                    ) {
+                        player_store.konomitv_bs4k_playback_hdr_output_override = null;
+                        update_hdr_output_display();
+                        if (this.playback_mode === 'Video') {
+                            this.player?.setting.hide();
+                            player_store.event_emitter.emit('PlayerRestartRequired', {
+                                message: 'HDR 出力をデバッグモードから戻しました。',
+                                message_delay_seconds: 2,
+                                is_error_message: false,
+                                should_resume_quality: true,
+                                is_user_initiated: true,
+                            });
+                        }
+                        return;
+                    }
+                    update_hdr_output_display();
+                },
+                {immediate: true},
             ),
         ];
 
@@ -3818,6 +4642,30 @@ class PlayerController {
                 ${audio_codec_item_html}
             </div>
         `;
+        // HDR 出力のサブパネル。選択肢は設定画面と同じ Auto / HDR 素通し / SDR 変換に加え、
+        // サーバー debug オン時だけデバッグモードを出す。選択は視聴中だけの override として扱う
+        // (SettingsStore の既定値は書き換えない。Debug も同期しない)
+        const hdr_output_item_html = selectable_hdr_outputs.map((output) => `
+            <div class="dplayer-konomitv-bs4k-setting-hdr-output-item" data-output="${output}"
+                role="button" tabindex="0"
+                style="display:flex; align-items:center; height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-hdr-output-check" style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                <span class="dplayer-label">${hdr_output_labels[output]}</span>
+            </div>
+        `).join('');
+        const hdr_output_panel_html = `
+            <div class="dplayer-konomitv-bs4k-setting-hdr-output-panel"
+                style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
+                <div class="dplayer-setting-header dplayer-konomitv-bs4k-setting-hdr-output-header"
+                    role="button" tabindex="0"
+                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                    <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-hdr-output-back"
+                        style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                    <span class="dplayer-label">HDR 出力</span>
+                </div>
+                ${hdr_output_item_html}
+            </div>
+        `;
         setting_box.insertAdjacentHTML('beforeend', `
             <div class="dplayer-konomitv-bs4k-setting-video-codec-panel"
                 style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
@@ -3831,6 +4679,18 @@ class PlayerController {
                 ${video_codec_item_html}
             </div>
             ${audio_codec_panel_html}
+            ${hdr_output_panel_html}
+            <div class="dplayer-konomitv-bs4k-setting-subtitle-panel"
+                style="display:block; position:absolute; bottom:0; width:100%; padding:7px 0; box-sizing:border-box; transform:translateX(100%); transition:transform .25s ease;">
+                <div class="dplayer-setting-header dplayer-konomitv-bs4k-setting-subtitle-header"
+                    role="button" tabindex="0"
+                    style="display:flex; align-items:center; height:33px; padding:0 5px 5px; margin-bottom:7px; border-bottom:2px solid rgba(255,255,255,.15); box-sizing:border-box; cursor:pointer; touch-action:manipulation;">
+                    <div class="dplayer-toggle dplayer-konomitv-bs4k-setting-subtitle-back"
+                        style="display:inline-block; position:static; width:22px; margin-right:6px;"></div>
+                    <span class="dplayer-label">字幕</span>
+                </div>
+                <div class="dplayer-konomitv-bs4k-setting-subtitle-items"></div>
+            </div>
         `);
 
         // DPlayer が持つ音声トラック用の矢印・戻る・チェックアイコンを流用して見た目を揃える
@@ -3844,6 +4704,10 @@ class PlayerController {
         this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-arrow')!.innerHTML = audio_arrow_html;
         this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-back')!.innerHTML = audio_back_html;
         this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-audio-codec-check')
+            .forEach((element) => element.innerHTML = audio_check_html);
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-arrow')!.innerHTML = audio_arrow_html;
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-back')!.innerHTML = audio_back_html;
+        this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-check')
             .forEach((element) => element.innerHTML = audio_check_html);
 
         // 現在の通常 / BS4K と回線プロファイルに対応する共通設定を、override がない場合だけ参照する。
@@ -4009,27 +4873,27 @@ class PlayerController {
             });
         };
         update_video_codec_display();
-        register_codec_panel_activation_handler(video_codec_button, (event) => {
-            consume_codec_panel_event(event);
+        register_sub_panel_activation_handler(video_codec_button, (event) => {
+            consume_sub_panel_event(event);
             update_video_codec_display();
             // DPlayer が計測した元パネル用の inline clip-path は上書きせず、
             // サブパネル表示中だけ専用クラスで切り替える。
-            open_codec_panel('video-codec');
+            open_sub_panel('video-codec');
         });
         const video_codec_header = this.player.container.querySelector<HTMLElement>(
             '.dplayer-konomitv-bs4k-setting-video-codec-header',
         )!;
-        register_codec_panel_activation_handler(video_codec_header, (event) => {
-            consume_codec_panel_event(event);
-            close_codec_panel();
+        register_sub_panel_activation_handler(video_codec_header, (event) => {
+            consume_sub_panel_event(event);
+            close_sub_panel();
         });
         video_codec_items.forEach((item) => {
-            register_codec_panel_activation_handler(item, async (event) => {
-                consume_codec_panel_event(event);
+            register_sub_panel_activation_handler(item, async (event) => {
+                consume_sub_panel_event(event);
                 const codec = item.dataset.codec as KonomiTVBS4KPlaybackVideoCodec;
                 if (await prepare_codec_override(codec, get_requested_audio_codec()) === false) return;
                 update_video_codec_display();
-                close_codec_panel();
+                close_sub_panel();
                 // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
                 this.player?.setting.hide();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
@@ -4037,6 +4901,7 @@ class PlayerController {
                     message_delay_seconds: this.tv_low_latency_mode || this.playback_mode === 'Video' ? 2 : 4.5,
                     is_error_message: false,
                     should_resume_quality: true,
+                    is_user_initiated: true,
                 });
             });
         });
@@ -4073,34 +4938,80 @@ class PlayerController {
             });
         };
         update_audio_codec_display();
-        register_codec_panel_activation_handler(audio_codec_button, (event) => {
-            consume_codec_panel_event(event);
+        register_sub_panel_activation_handler(audio_codec_button, (event) => {
+            consume_sub_panel_event(event);
             update_audio_codec_display();
-            open_codec_panel('audio-codec');
+            open_sub_panel('audio-codec');
         });
         const audio_codec_header = this.player.container.querySelector<HTMLElement>(
             '.dplayer-konomitv-bs4k-setting-audio-codec-header',
         )!;
-        register_codec_panel_activation_handler(audio_codec_header, (event) => {
-            consume_codec_panel_event(event);
-            close_codec_panel();
+        register_sub_panel_activation_handler(audio_codec_header, (event) => {
+            consume_sub_panel_event(event);
+            close_sub_panel();
         });
         audio_codec_items.forEach((item) => {
-            register_codec_panel_activation_handler(item, async (event) => {
-                consume_codec_panel_event(event);
+            register_sub_panel_activation_handler(item, async (event) => {
+                consume_sub_panel_event(event);
                 const codec = item.dataset.codec as KonomiTVBS4KPlaybackAudioCodec;
                 if (await prepare_codec_override(get_requested_video_codec(), codec) === false) return;
                 update_audio_codec_display();
-                close_codec_panel();
+                close_sub_panel();
                 this.player?.setting.hide();
                 player_store.event_emitter.emit('PlayerRestartRequired', {
                     message: `音声コーデックを ${audio_codec_labels[codec]} に変更しました。`,
                     message_delay_seconds: 2,
                     is_error_message: false,
                     should_resume_quality: true,
+                    is_user_initiated: true,
                 });
             });
         });
+
+        // HDR 出力のサブパネルを初期化する。選択は視聴中だけの override で、SettingsStore の既定値は書き換えない。
+        // ライブも録画・オフライン保存と同じ再起動経路で、色信号を MSE 初期化から適用し直す。
+        // 画質・音声選択、および録画の再生位置は既存の再起動処理で維持する。
+        update_hdr_output_panel_height();
+        update_hdr_output_display();
+        register_sub_panel_activation_handler(hdr_output_item!, (event) => {
+            consume_sub_panel_event(event);
+            update_hdr_output_display();
+            open_sub_panel('hdr-output');
+        });
+        const hdr_output_header = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-hdr-output-header',
+        )!;
+        register_sub_panel_activation_handler(hdr_output_header, (event) => {
+            consume_sub_panel_event(event);
+            close_sub_panel();
+        });
+        this.player.container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-hdr-output-item')
+            .forEach((item) => {
+                register_sub_panel_activation_handler(item, (event) => {
+                    consume_sub_panel_event(event);
+                    const output = item.dataset.output as 'Auto' | 'HDR' | 'SDR' | 'Debug';
+                    // サーバー debug がオフの間はデバッグモードを選べない
+                    if (output === 'Debug' && version_store.is_server_debug_enabled === false) {
+                        return;
+                    }
+                    const current = player_store.konomitv_bs4k_playback_hdr_output_override ??
+                        settings_store.settings.konomitv_bs4k_hdr_output;
+                    close_sub_panel();
+                    // 現在値の再選択では何もしない
+                    if (output === current) return;
+                    player_store.konomitv_bs4k_playback_hdr_output_override = output;
+                    update_hdr_output_display();
+                    // プレイヤー再起動が始まる前に設定パネル全体を閉じ、黒画面上へ一瞬残ることを防ぐ
+                    this.player?.setting.hide();
+                    player_store.event_emitter.emit('PlayerRestartRequired', {
+                        message: `HDR 出力を ${hdr_output_labels[output]} に変更しました。`,
+                        message_delay_seconds: 2,
+                        is_error_message: false,
+                        should_resume_quality: true,
+                        is_user_initiated: true,
+                    });
+                });
+            });
 
         // 録画再生時のみ、CM 自動スキップの有効状態を端末ローカル設定へ保存する
         // CM 区間が未解析・0件でも、今後再生する録画へ向けて常に切り替えられるようにする
@@ -4140,6 +5051,7 @@ class PlayerController {
                     is_error_message: false,
                     // モバイル回線プロファイル切り替え時、切り替え後の画質プロファイルのデフォルト画質を優先する
                     should_resume_quality: false,
+                    is_user_initiated: true,
                 });
             // 画質プロファイルを Wi-Fi 回線向けに切り替えてから、プレイヤーを再起動
             } else {
@@ -4154,6 +5066,7 @@ class PlayerController {
                     is_error_message: false,
                     // Wi-Fi プロファイル切り替え時、切り替え後の画質プロファイルのデフォルト画質を優先する
                     should_resume_quality: false,
+                    is_user_initiated: true,
                 });
             }
         });
@@ -4202,6 +5115,175 @@ class PlayerController {
                 player_store.shortcut_key_modal = true;
             });
         }
+
+        // ==== 字幕トラック切替サブメニューの初期化 ====
+        // 候補は動的に組み立てる:
+        //  - 録画生字幕 / sidecar WebVTT: subtitle_tracks のメタデータ (初期化時に確定)
+        //  - ARIB-TTML (録画・ライブ): レンダラーの受信済み component。先読み窓の受信に応じて後から増える
+        //  - ライブ生 ARIB STD-B24: component 選択が DPlayer / aribb24.js 側の話のため対象外、「自動」のみ
+        // 「切」は置かない。非表示は字幕ボタンの専任であり、二重の正源を作らない。
+        const subtitle_panel = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle-panel',
+        )!;
+        const subtitle_setting_item = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle',
+        )!;
+        const subtitle_value_element = this.player.container.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle-value',
+        )!;
+        const subtitle_item_container = subtitle_panel.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle-items',
+        )!;
+        interface SubtitlePanelEntry {
+            key: string;
+            label: string;
+        }
+        const map_subtitle_language = (language: string | null): string | null => {
+            language = language?.trim().toLowerCase() ?? null;
+            // ARIB 3 文字言語コードのうち二か国語字幕で使う日英だけ和名へ訳し、その他はコードのまま出す
+            if (language === 'jpn') return '日本語';
+            if (language === 'eng') return '英語';
+            return language?.trim() || null;
+        };
+        const build_subtitle_entries = (): SubtitlePanelEntry[] => {
+            const entries: SubtitlePanelEntry[] = [{ key: 'auto', label: '自動' }];
+            if (this.playback_mode === 'Video') {
+                this.recorded_raw_subtitle_tracks.forEach((track) => {
+                    entries.push({
+                        key: `raw:${track.index}`,
+                        label: map_subtitle_language(track.language ?? null) ?? `トラック${track.component_tag ?? track.pid ?? track.index}`,
+                    });
+                });
+                player_store.recorded_program.recorded_video.subtitle_tracks.forEach((track) => {
+                    if (track.codec.toLowerCase() !== 'arib_ttml' || track.component_tag === undefined ||
+                        track.component_tag < 0x30 || track.component_tag > 0x37) return;
+                    if (entries.some(entry => entry.key === `ttml:${track.component_tag}`)) return;
+                    entries.push({key: `ttml:${track.component_tag}`,
+                        label: map_subtitle_language(track.language) ?? `トラック${track.component_tag}`});
+                });
+            }
+            this.arib_ttml_renderer?.getCaptionComponents().forEach((component) => {
+                const existing = entries.find(entry => entry.key === `ttml:${component.component_tag}`);
+                if (existing !== undefined) {
+                    existing.label = map_subtitle_language(component.language) ?? existing.label;
+                    return;
+                }
+                entries.push({
+                    key: `ttml:${component.component_tag}`,
+                    label: map_subtitle_language(component.language) ?? `トラック${component.component_tag}`,
+                });
+            });
+            return entries;
+        };
+        const get_subtitle_selection_key = (): string => {
+            if (this.recorded_raw_subtitle_track_index !== null) {
+                return `raw:${this.recorded_raw_subtitle_track_index}`;
+            }
+            const ttml_component_tag = this.arib_ttml_renderer?.getSelectedCaptionComponentTag() ?? null;
+            return ttml_component_tag !== null ? `ttml:${ttml_component_tag}` : 'auto';
+        };
+        const select_subtitle_entry = (key: string): void => {
+            if (this.player === null || !build_subtitle_entries().some(entry => entry.key === key)) return;
+            const selection_changed = key !== get_subtitle_selection_key();
+            if (selection_changed && key === 'auto') {
+                this.arib_ttml_renderer?.setCaptionComponentTag(null);
+                this.switchRecordedRawSubtitleTrack(null);
+                this.arib_ttml_renderer?.showCaption();
+            } else if (selection_changed && key.startsWith('raw:')) {
+                this.arib_ttml_renderer?.setCaptionComponentTag(null);
+                this.switchRecordedRawSubtitleTrack(Number(key.slice('raw:'.length)));
+                this.arib_ttml_renderer?.hideCaption();
+            } else if (selection_changed && key.startsWith('ttml:')) {
+                this.arib_ttml_renderer?.setCaptionComponentTag(Number(key.slice('ttml:'.length)));
+                this.switchRecordedRawSubtitleTrack(null);
+                this.arib_ttml_renderer?.showCaption();
+            } else if (selection_changed) {
+                return;
+            }
+            // 選択は「新しい字幕を見たい」という操作そのものなので、非表示なら自動表示する。
+            // subtitle.show() 経由にすればボタン状態・user 設定・subtitle_show イベント (TTML層) も同期される。
+            const is_caption_hidden = this.player.subtitle?.container.classList.contains('dplayer-subtitle-hide') ?? false;
+            if (is_caption_hidden === true) {
+                this.player.subtitle?.show();
+            }
+        };
+        let subtitle_panel_signature = '';
+        const render_subtitle_panel = (force = false): void => {
+            if (this.player === null) return;
+            const entries = build_subtitle_entries();
+            const current_key = get_subtitle_selection_key();
+            const signature = JSON.stringify([current_key, entries]);
+            if (force === false && signature === subtitle_panel_signature) return;
+            subtitle_panel_signature = signature;
+            // 録画メタデータと放送由来の言語名はHTMLとして解釈しない。
+            subtitle_item_container.replaceChildren(...entries.map((entry) => {
+                const item = document.createElement('div');
+                item.className = 'dplayer-konomitv-bs4k-setting-subtitle-item';
+                item.dataset.subtitle = entry.key;
+                item.setAttribute('role', 'button');
+                item.tabIndex = 0;
+                item.style.cssText = 'display:flex; align-items:center; min-height:30px; padding:5px 10px; box-sizing:border-box; cursor:pointer; touch-action:manipulation;';
+                const check = document.createElement('div');
+                check.className = 'dplayer-toggle dplayer-konomitv-bs4k-setting-subtitle-check';
+                check.style.cssText = 'display:inline-block; position:static; width:22px; margin-right:6px; flex-shrink:0;';
+                const label = document.createElement('span');
+                label.className = 'dplayer-label';
+                label.textContent = entry.label;
+                label.title = entry.label;
+                label.style.cssText = 'overflow:hidden; text-overflow:ellipsis; white-space:nowrap;';
+                item.append(check, label);
+                return item;
+            }));
+            subtitle_item_container.querySelectorAll<HTMLElement>('.dplayer-konomitv-bs4k-setting-subtitle-item')
+                .forEach((item) => {
+                    // DPlayer の音声パネルのチェックアイコンを流用し、現在選択にだけ表示する
+                    const check = item.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-subtitle-check');
+                    if (check !== null) {
+                        check.innerHTML = audio_check_html;
+                        check.style.visibility = item.dataset.subtitle === current_key ? 'visible' : 'hidden';
+                    }
+                    register_sub_panel_activation_handler(item, (event) => {
+                        consume_sub_panel_event(event);
+                        select_subtitle_entry(item.dataset.subtitle ?? 'auto');
+                        render_subtitle_panel(true);
+                    });
+                });
+            subtitle_value_element.textContent = entries.find((entry) => entry.key === current_key)?.label ?? '自動';
+            // パネル高さは他サブパネルと同じ CSS 変数制御 (ヘッダー 54px + 項目 30px 分)
+            setting_box.style.setProperty(
+                '--konomitv-bs4k-subtitle-panel-height',
+                `${54 + entries.length * 30}px`,
+            );
+            // 切り替え候補が無い録画 (字幕トラックなし) は項目自体を隠す。ライブは後から component が
+            // 到着する可能性があるため、「自動」だけでも開ける状態として常時表示する。
+            subtitle_setting_item.style.display =
+                player_store.is_offline_playback === false &&
+                (entries.length > 1 || this.playback_mode === 'Live') ? '' : 'none';
+        };
+        render_subtitle_panel(true);
+        register_sub_panel_activation_handler(subtitle_setting_item, (event) => {
+            consume_sub_panel_event(event);
+            // 開く直前に再構築し、先読みで増えた component や選択状態を最新化する
+            render_subtitle_panel(true);
+            open_sub_panel('subtitle');
+        });
+        const subtitle_header = subtitle_panel.querySelector<HTMLElement>(
+            '.dplayer-konomitv-bs4k-setting-subtitle-header',
+        )!;
+        register_sub_panel_activation_handler(subtitle_header, (event) => {
+            consume_sub_panel_event(event);
+            close_sub_panel();
+        });
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-subtitle-arrow')!
+            .innerHTML = audio_arrow_html;
+        this.player.container.querySelector<HTMLElement>('.dplayer-konomitv-bs4k-setting-subtitle-back')!
+            .innerHTML = audio_back_html;
+        // TTML component は先読み窓の受信で増えていくため、1秒間隔で候補・現在値・高さを追従させる。
+        // 設定パネルはプレイヤー再生成ごとに作り直されるので、旧プレイヤーへ向くタイマーは必ず破棄して張り直す。
+        this.subtitle_panel_timer_cancel?.();
+        this.subtitle_panel_timer_cancel = Utils.setIntervalInWorker(() => {
+            render_subtitle_panel();
+        }, 1000);
 
         this.applyAudioTrackLabels();
     }
@@ -4504,21 +5586,39 @@ class PlayerController {
      * PlayerController の再起動を行う場合、基本外部から直接 await destroy() と await init() は呼び出さず、代わりに
      * player_store.event_emitter.emit('PlayerRestartRequired', 'プレイヤーを再起動しています…') のようにイベントを発火させるべき
      */
-    public async destroy(): Promise<void> {
-        const settings_store = useSettingsStore();
-        const player_store = usePlayerStore();
+    public destroy(): Promise<void> {
 
         // すでに破棄されているのに再度実行してはならない
         if (this.destroyed === true) {
-            return;
+            return Promise.resolve();
         }
-        // すでに破棄中なら何もしない
-        if (this.destroying === true) {
-            return;
+
+        // route 更新や unmount から破棄が重複した場合、先行する cleanup の完了へ合流する
+        if (this.destroy_promise !== null) {
+            return this.destroy_promise;
         }
+
+        // cleanup の同期処理から destroy() が再入しても同じ Promise へ合流できるよう、実処理より先に破棄状態を確定する
         this.destroying = true;
-        // この後の非同期cleanup中に古いpreflightが完了しても、Store/DOMを書き戻せない。
+        // この後の非同期 cleanup 中に古い preflight が完了しても、Store / DOM を書き戻せない
         this.initialization_generation += 1;
+        this.destroy_promise = Promise.resolve().then(() => this.destroyPlayer()).finally(() => {
+            // cleanup が失敗した場合は destroyed を立てず、失敗したリソースだけを次回 destroy() で再試行できるようにする
+            this.destroying = false;
+            this.destroy_promise = null;
+        });
+        return this.destroy_promise;
+    }
+
+
+    /** 実際の破棄処理を一度だけ実行する。 */
+    private async destroyPlayer(): Promise<void> {
+        const settings_store = useSettingsStore();
+        const player_store = usePlayerStore();
+        const recorded_playback_source_url = (
+            this.playback_mode === 'Video' &&
+            player_store.is_offline_playback === false
+        ) ? this.player?.quality?.url ?? null : null;
 
         // 視聴履歴の最終位置を更新
         // 現在の再生位置を取得するため、プレイヤーの破棄前に実行する必要がある
@@ -4548,8 +5648,17 @@ class PlayerController {
         // 登録されている PlayerManager をすべて破棄
         // CSS アニメーションの関係上、ローディング状態にする前に破棄する必要がある (特に LiveDataBroadcastingManager)
         // 同期処理すると時間が掛かるので、並行して実行する
-        await Promise.all(this.player_managers.map(async (player_manager) => player_manager.destroy()));
-        this.player_managers = [];
+        // 1つが失敗しても他の破棄完了を待ち、再試行時に成功済み Manager を二重破棄しない
+        const player_managers = this.player_managers;
+        const player_manager_destroy_results = await Promise.allSettled(
+            player_managers.map((player_manager) => player_manager.destroy()),
+        );
+        this.player_managers = player_managers.filter(
+            (_, index) => player_manager_destroy_results[index].status === 'rejected',
+        );
+        const player_manager_destroy_errors = player_manager_destroy_results.flatMap((result) =>
+            result.status === 'rejected' ? [result.reason] : [],
+        );
 
         // Screen Wake Lock API で確保した起動ロックを解放
         // 起動ロックが確保できていない場合は何もしない
@@ -4586,7 +5695,9 @@ class PlayerController {
             }
             // 最後に音量を 0 に設定
             // 上記ロジックでは丸め誤差の関係で完全に 0 とは一致しないことがあるため
-            this.player.video.volume = 0;
+            if (this.player?.video) {
+                this.player.video.volume = 0;
+            }
         }
 
         // タイマーを破棄
@@ -4597,6 +5708,10 @@ class PlayerController {
         if (this.live_audio_track_interval_timer_cancel !== null) {
             this.live_audio_track_interval_timer_cancel();
             this.live_audio_track_interval_timer_cancel = null;
+        }
+        if (this.subtitle_panel_timer_cancel !== null) {
+            this.subtitle_panel_timer_cancel();
+            this.subtitle_panel_timer_cancel = null;
         }
         if (this.video_keep_alive_interval_timer_cancel !== null) {
             this.video_keep_alive_interval_timer_cancel();
@@ -4682,12 +5797,32 @@ class PlayerController {
             this.player = null;
         }
 
-        // 破棄済みかどうかのフラグを立てる
-        this.destroying = false;
-        this.destroyed = true;
+        // hls.js の要求を止めた後に終了を通知し、同じ Controller の再起動が旧セッション枠と競合しないようにする。
+        await this.destroyRecordedPlaybackSession(recorded_playback_source_url);
+
+        // PRA の AudioBufferSourceNode は各レンダラーの dispose() と DPlayer の destroy() で停止・切断済み。
+        // close() の完了まで待って AudioContext の音声デバイス資源を解放し、遅延 decode の保持も無効化する。
+        const romsounds_context = this.romsounds_context;
+        if (romsounds_context !== null) {
+            if (romsounds_context.state !== 'closed') {
+                await romsounds_context.close();
+            }
+            if (this.romsounds_context === romsounds_context) {
+                this.romsounds_context = null;
+                this.romsounds_buffers.clear();
+            }
+        }
 
         // PlayerStore にプレイヤーを破棄したことを通知
         player_store.is_player_initialized = false;
+
+        // Manager の破棄失敗を呼び出し元へ伝え、失敗した Manager だけを次回 destroy() で再試行する
+        if (player_manager_destroy_errors.length > 0) {
+            throw new AggregateError(player_manager_destroy_errors, 'Failed to destroy PlayerManager resources.');
+        }
+
+        // すべての cleanup が完了した場合だけ破棄済みとする
+        this.destroyed = true;
 
         console.log('\u001b[31m[PlayerController] Destroyed.');
     }

@@ -42,7 +42,7 @@ class RecordedProgram(TortoiseModel):
     service_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     event_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     series: fields.ForeignKeyNullableRelation[Series] = \
-        fields.ForeignKeyField('models.Series', related_name=None, null=True, on_delete=fields.CASCADE)
+        fields.ForeignKeyField('models.Series', related_name='recorded_programs', null=True, on_delete=fields.CASCADE)
     series_id: int | None
     series_broadcast_period: fields.ForeignKeyNullableRelation[SeriesBroadcastPeriod] = \
         fields.ForeignKeyField('models.SeriesBroadcastPeriod', related_name='recorded_programs', null=True, on_delete=fields.CASCADE)
@@ -54,6 +54,8 @@ class RecordedProgram(TortoiseModel):
     series_title = cast(TortoiseField[str | None], fields.TextField(null=True))
     episode_number = cast(TortoiseField[str | None], fields.CharField(255, null=True))
     subtitle = cast(TortoiseField[str | None], fields.TextField(null=True))
+    bangumi_subject_id = cast(TortoiseField[int | None], fields.IntField(null=True))
+    bangumi_episode_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     description = fields.TextField()
     detail = cast(TortoiseField[dict[str, str]], fields.JSONField(default={}, encoder=lambda x: json.dumps(x, ensure_ascii=False)))  # type: ignore
     start_time = fields.DatetimeField()

@@ -1,5 +1,5 @@
 
-import type { VideoSeriesSortDirection, VideoSeriesSortKey } from '@/stores/SettingsStore';
+import type { SeriesHomeSortKey, VideoSeriesSortDirection, VideoSeriesSortKey } from '@/stores/SettingsStore';
 import type { KonomiTVBS4KTheme } from '@/themes';
 
 import APIClient from '@/services/APIClient';
@@ -21,9 +21,8 @@ export interface IMutedCommentKeywords {
 export interface IClientSettings {
     last_synced_at: number;
     // showed_panel_last_time: 同期無効
-    // selected_twitter_panel_account: 同期無効
-    // twitter_panel_post_targets: 同期無効
-    saved_twitter_hashtags: string[];
+    // konomitv_bs4k_playback_video_codec_default_initialized: 同期無効
+    // konomitv_bs4k_playback_audio_codec_default_initialized: 同期無効
     mylist: {
         type: 'Series' | 'RecordedProgram';
         id: number;
@@ -62,11 +61,14 @@ export interface IClientSettings {
     use_28hour_clock: boolean;
     show_original_broadcast_time_during_playback: boolean;
     panel_display_state: 'RestorePreviousState' | 'AlwaysDisplay' | 'AlwaysFold';
-    tv_panel_active_tab: 'Program' | 'Channel' | 'Comment' | 'Twitter';
-    video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment' | 'Twitter';
+    tv_panel_active_tab: 'Program' | 'Channel' | 'Comment';
+    video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment';
     video_series_sort_key: VideoSeriesSortKey;
     video_series_sort_direction: VideoSeriesSortDirection;
+    series_home_sort_key: SeriesHomeSortKey;
+    series_home_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
+    bangumi_watch_history_sync: boolean;
     // konomitv_bs4k_offline_video_streaming_quality: 同期無効
     // konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
     // konomitv_bs4k_offline_video_codec: 同期無効
@@ -90,6 +92,7 @@ export interface IClientSettings {
     // tv_low_latency_mode_for_bs4k_cellular: 同期無効
     // tv_use_rain_fallback_for_bs4k: 同期無効
     // tv_use_rain_fallback_for_bs8k: 同期無効
+    konomitv_bs4k_hdr_output: 'Auto' | 'HDR' | 'SDR';
     // tv_24fps_mode: 同期無効
     // tv_24fps_mode_cellular: 同期無効
     // video_streaming_quality: 同期無効
@@ -127,14 +130,6 @@ export interface IClientSettings {
     mute_comment_keywords_normalize_alphanumeric_width_case: boolean;
     muted_comment_keywords: IMutedCommentKeywords[];
     muted_niconico_user_ids: string[];
-    fold_panel_after_sending_tweet: boolean;
-    reset_hashtag_when_program_switches: boolean;
-    auto_add_watching_channel_hashtag: boolean;
-    twitter_reply_thread_mode: 'PerHashtag' | 'PerDay' | 'Disabled';
-    bluesky_reply_thread_mode: 'PerHashtag' | 'PerDay' | 'Disabled';
-    twitter_active_tab: 'Search' | 'Timeline' | 'Capture';
-    tweet_hashtag_position: 'Prepend' | 'Append' | 'PrependWithLineBreak' | 'AppendWithLineBreak';
-    tweet_capture_watermark_position: 'None' | 'TopLeft' | 'TopRight' | 'BottomLeft' | 'BottomRight';
 }
 
 /**
@@ -145,8 +140,16 @@ export type HostAbsolutePath = string;
 export type ServerEncoder = 'FFmpeg' | 'QSV' | 'NVENC' | 'AMF';
 
 /**
+ * QSV / AMF の HW エンコード固定指定の候補となる DRM render node のインターフェイス
+ */
+export interface IKonomiTVBS4KRenderDevice {
+    path: string;
+    vendor_id: string;
+    vendor_name: string;
+}
+
+/**
  * サーバー設定を表すインターフェース
- * サーバー側の app.config.HostServerSettings で定義されているものと同じ
  */
 export interface IServerSettings {
     general: {
@@ -157,6 +160,7 @@ export interface IServerSettings {
         mirakurun_url: string;
         konomitv_bs4k_live_transport: 'MpegTs' | 'Tlv';
         konomitv_bs4k_tlv_mirakurun_url: string | null;
+        konomitv_bs4k_encoder_render_device: string | null;
         encoder: ServerEncoder;
         konomitv_bs4k_live_sar_mode: 'CPU' | 'GPU';
         encoder_bs4k: ServerEncoder;
@@ -175,7 +179,6 @@ export interface IServerSettings {
     server: {
         https_mode: 'akebi' | 'certificate' | 'reverse_proxy';
         port: number;
-        opencode_serve_port: number;
         custom_https_certificate: HostAbsolutePath | null;
         custom_https_private_key: HostAbsolutePath | null;
         reverse_proxy_listen_address: string;
@@ -249,6 +252,7 @@ export const IServerSettingsDefault: IServerSettings = {
         mirakurun_url: 'http://127.0.0.1:40772/',
         konomitv_bs4k_live_transport: 'MpegTs',
         konomitv_bs4k_tlv_mirakurun_url: null,
+        konomitv_bs4k_encoder_render_device: null,
         encoder: 'FFmpeg',
         konomitv_bs4k_live_sar_mode: 'CPU',
         encoder_bs4k: 'FFmpeg',
@@ -267,7 +271,6 @@ export const IServerSettingsDefault: IServerSettings = {
     server: {
         https_mode: 'akebi',
         port: 7000,
-        opencode_serve_port: 4097,
         custom_https_certificate: null,
         custom_https_private_key: null,
         reverse_proxy_listen_address: '0.0.0.0',
@@ -350,6 +353,25 @@ class Settings {
         return true;
     }
 
+
+    /**
+     * QSV / AMF の HW エンコードに利用できる DRM render node の一覧を取得する
+     * 設定画面での固定指定の候補表示に利用する
+     * @return render node の一覧 (取得に失敗した場合は空配列)
+     */
+    static async fetchKonomiTVBS4KRenderDevices(): Promise<IKonomiTVBS4KRenderDevice[]> {
+
+        // API リクエストを実行
+        const response = await APIClient.get<IKonomiTVBS4KRenderDevice[]>('/settings/konomitv-bs4k-render-devices');
+
+        // エラー処理
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'DRM render node の一覧を取得できませんでした。');
+            return [];
+        }
+
+        return response.data;
+    }
 
     /**
      * サーバー設定を取得する

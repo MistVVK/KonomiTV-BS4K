@@ -6,12 +6,18 @@ config.yaml
 .env
 compose.override.yaml
 
+# Development の設定・DB・ログ・録画などのローカル状態
+docker/development/state/
+
 # Git metadata: バージョン判定は実行時の read-only source tree bind mount を利用する
 .git/
 
 # node_modules: ファイル数が多すぎてコピーに時間がかかる
 client/node_modules/
 docker/opencode/node_modules/
+
+# ホストのエージェント用 OpenCode 設定（node_modules を含む）を build context へ含めない
+.opencode/
 
 # ホスト側の既存 build 成果物: Docker 内で再生成する
 client/dist/
@@ -50,3 +56,7 @@ thirdparty-src/tsreadex/build/
 thirdparty-src/tsreadex/tsreadex
 thirdparty-src/tsreadex/tsreadex-anchor-test
 thirdparty-src/tsreadex/tsreadex.elf
+
+# TSCodecBridge: Git metadata とホスト生成物を除き、固定 submodule の source だけを builder へ渡す
+thirdparty-src/tscodecbridge/.git
+thirdparty-src/tscodecbridge/build/

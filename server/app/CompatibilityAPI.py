@@ -1,9 +1,11 @@
 import json
+import pathlib
 import re
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import Annotated, Any, Literal, cast
 
+import anyio
 from fastapi import (
     APIRouter,
     Body,
@@ -16,13 +18,16 @@ from fastapi import (
     Response,
     status,
 )
+from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from app import schemas
+from app import logging, schemas
+from app.config import Config
 from app.constants import QUALITY_TYPES, VERSION
 from app.models.RecordedProgram import RecordedProgram
+from app.models.RecordedVideo import RecordedVideo
 from app.routers import (
     ChannelsRouter,
     LiveStreamsRouter,
@@ -36,9 +41,11 @@ from app.streams.StreamEncodingOptions import (
     StreamEncodingOptions,
     StreamQualityWithOptions,
 )
+from app.utils import GetPlatformEnvironment
 from app.utils.edcb import ReserveDataRequired
 from app.utils.edcb.CtrlCmdUtil import CtrlCmdUtil
 from app.utils.HTTPS import ReverseProxyMiddleware
+from app.utils.KonomiTVBS4KFastAPIRouteUtils import IterateKonomiTVBS4KAPIRouteContexts
 
 
 _VIDEO_DETAIL_PATH_PATTERN = re.compile(r'^/api/videos/[0-9]+/?$')
@@ -51,6 +58,16 @@ _VIDEO_COLLECTION_PATHS = {
 _RESERVATION_COLLECTION_PATHS = {
     '/api/recording/reservations',
     '/api/recording/reservations/',
+}
+_RESERVATION_DETAIL_PATH_PATTERN = re.compile(r'^/api/recording/reservations/[0-9]+/?$')
+_KOMOREBI_V1_ENCODER_MAP: dict[
+    Literal['FFmpeg', 'QSV', 'NVENC', 'AMF'],
+    Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC'],
+] = {
+    'FFmpeg': 'FFmpeg',
+    'QSV': 'QSVEncC',
+    'NVENC': 'NVEncC',
+    'AMF': 'VCEEncC',
 }
 
 # Komorebi V1 が利用・宣言する API と、録画 HLS プレイリストから間接参照される API だけを公開する。
@@ -91,6 +108,42 @@ class CompatibilityUser(BaseModel):
     id: int
     name: str
     pinned_channel_ids: list[str]
+
+
+class CompatibilityVersionInformation(BaseModel):
+    """upstream KonomiTV と同じ形で公開する互換バージョン情報。"""
+
+    version: str
+    latest_version: str | None
+    environment: Literal['Linux', 'Linux-Docker']
+    backend: Literal['EDCB', 'Mirakurun']
+    encoder: Literal['FFmpeg', 'QSVEncC', 'NVEncC', 'VCEEncC']
+
+
+version_router = APIRouter(tags = ['Compatibility - Version'])
+
+
+@version_router.get(
+    '/api/version',
+    summary = '互換バージョン情報 API',
+    response_model = CompatibilityVersionInformation,
+)
+async def CompatibilityVersionInformationAPI() -> CompatibilityVersionInformation:
+    """本線の BS4K 拡張情報を混ぜず、upstream KonomiTV のバージョン情報を返す。
+
+    Returns:
+        upstream KonomiTV と同じ形の互換バージョン情報。
+    """
+
+    general = Config().general
+    return CompatibilityVersionInformation(
+        version = VERSION,
+        # BS4K 本体の更新先は upstream KonomiTV ではないため、BS4K の最新バージョンを混ぜない。
+        latest_version = None,
+        environment = GetPlatformEnvironment(),
+        backend = general.backend,
+        encoder = _KOMOREBI_V1_ENCODER_MAP[general.encoder],
+    )
 
 
 users_router = APIRouter(tags = ['Compatibility - Users'])
@@ -153,20 +206,57 @@ def IncludeKomorebiV1UpstreamRoutes(
     filtered_router = APIRouter()
     included_routes: set[tuple[str, str]] = set()
     for source_router in source_routers:
-        for route in source_router.routes:
-            if not isinstance(route, APIRoute) or route.methods is None:
-                continue
+        for route_context in IterateKonomiTVBS4KAPIRouteContexts(source_router.routes):
+            original_route = cast(APIRoute, route_context.original_route)
+            path = route_context.path
+            methods = route_context.methods
+            endpoint = route_context.endpoint
 
-            route_keys = {(method, route.path) for method in route.methods}
+            # APIRoute では常に揃う情報だが、不完全な route context を黙って除外すると
+            # allowlist の不足を見逃すため、互換 API の構築を明示的に失敗させる。
+            if path is None or methods is None or endpoint is None:
+                raise RuntimeError('Komorebi V1 互換 API のルート情報が不完全です')
+
+            route_keys = {(method, path) for method in methods}
             allowed_route_keys = route_keys & _KOMOREBI_V1_UPSTREAM_ROUTE_ALLOWLIST
             if not allowed_route_keys:
                 continue
             if allowed_route_keys != route_keys:
                 raise RuntimeError(
-                    f'Komorebi V1 互換 API の複数メソッドルートを部分的に公開できません: {route.path}',
+                    f'Komorebi V1 互換 API の複数メソッドルートを部分的に公開できません: {path}',
                 )
 
-            filtered_router.routes.append(route)
+            # nested include_router() の prefix・dependencies・レスポンス設定を含む有効な文脈を複製し、
+            # allowlist に一致したルートだけを従来どおり互換 API へ公開する。
+            filtered_router.add_api_route(
+                path = path,
+                endpoint = endpoint,
+                response_model = route_context.response_model,
+                status_code = route_context.status_code,
+                tags = route_context.tags,
+                dependencies = route_context.dependencies,
+                summary = route_context.summary,
+                description = route_context.description,
+                response_description = route_context.response_description,
+                responses = route_context.responses,
+                deprecated = route_context.deprecated,
+                methods = methods,
+                operation_id = route_context.operation_id,
+                response_model_include = route_context.response_model_include,
+                response_model_exclude = route_context.response_model_exclude,
+                response_model_by_alias = route_context.response_model_by_alias,
+                response_model_exclude_unset = route_context.response_model_exclude_unset,
+                response_model_exclude_defaults = route_context.response_model_exclude_defaults,
+                response_model_exclude_none = route_context.response_model_exclude_none,
+                include_in_schema = route_context.include_in_schema,
+                response_class = route_context.response_class,
+                name = route_context.name,
+                route_class_override = type(original_route),
+                callbacks = route_context.callbacks,
+                openapi_extra = route_context.openapi_extra,
+                generate_unique_id_function = route_context.generate_unique_id_function,
+                strict_content_type = route_context.strict_content_type,
+            )
             included_routes.update(route_keys)
 
     missing_routes = _KOMOREBI_V1_UPSTREAM_ROUTE_ALLOWLIST - included_routes
@@ -183,7 +273,39 @@ async def ValidateCompatibilityLiveStreamQuality(
     quality: Annotated[str, Path(description='映像の品質。ex: 1080p')],
     display_channel_id: Annotated[str, Depends(LiveStreamsRouter.ValidateChannelID)],
 ) -> StreamQualityWithOptions:
-    """互換 API のライブ出力を旧 AVC / HEVC + AAC 契約へ固定する。"""
+    """互換 API のライブ出力を旧 AVC / HEVC + AAC 契約へ固定し、original だけ passthrough で開く。"""
+
+    # original は GR/BS/CS フルセグ + BS4K + ワンセグに限り、本線と同じ MPEG-TS passthrough で開く。
+    # ラジオと SKY/CATV などは 422 のままにする。
+    # 解決済み quality を直接渡す現行構造のため、本線 ValidateQuality の BS4K/ワンセグ 422 ゲートは通らない。
+    if quality == 'original':
+        original_channel = await LiveStreamsRouter.Channel.filter(
+            display_channel_id = display_channel_id,
+        ).get_or_none()
+        if (
+            original_channel is None or
+            original_channel.is_radiochannel is True or
+            original_channel.type not in ('GR', 'BS', 'CS', 'BS4K')
+        ):
+            logging.error(
+                f'[CompatibilityAPI][ValidateCompatibilityLiveStreamQuality] Original quality is not available for this channel. '
+                f'[display_channel_id: {display_channel_id}]'
+            )
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Original quality is not available for this channel',
+            )
+        original_quality = LiveStreamsRouter.SplitQualityAndEncodingOptions(
+            quality,
+            LiveStreamsRouter.GetEncoderForLiveChannel(display_channel_id),
+        )
+        if original_quality is None:
+            # SplitQualityAndEncodingOptions() は original を常に解決するため、通常ここには到達しない
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Specified quality was not found',
+            )
+        return original_quality
 
     # 互換ルートはStream Anchorを使わないため、mainルートのBridge必須能力は検査しない。
     # 品質名から旧 AVC / HEVC + AAC tupleを正規化し、不正品質だけを422で拒否する。
@@ -212,12 +334,13 @@ async def ValidateCompatibilityLiveStreamQuality(
     ):
         # Komorebi V1 の旧 -10bit は可能なら10bitを使う希望指定であり、exact指定ではない。
         # main API の exact 契約は変えず、互換 API だけ選択エンコーダーの能力不足時に8bitへ戻す。
-        capability = await LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe.getRecordedVideoCapability(
+        capability = await LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe.getLegacyLiveCombinationCapability(
             selected_encoder,
             'hevc',
             10,
+            'aac',
         )
-        if capability.recorded_available is False:
+        if capability.available is False:
             stream_quality = replace(
                 stream_quality,
                 encoding_options = replace(
@@ -317,7 +440,7 @@ async def CompatibilityVideoHLSPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     """従来 codec に固定した録画 HLS master playlist を返す。"""
 
@@ -335,7 +458,7 @@ async def CompatibilityVideoHLSVideoPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSVideoPlaylistAPI(
         recorded_program,
@@ -352,7 +475,7 @@ async def CompatibilityVideoHLSVideoInitSegmentAPI(
     session_id: Annotated[str, Query()],
     generation: Annotated[int, Query()],
     sequence: Annotated[int, Query()] = 0,
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSVideoInitSegmentAPI(
         recorded_program,
@@ -370,7 +493,7 @@ async def CompatibilityVideoHLSVideoSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSVideoSegmentAPI(
         recorded_program,
@@ -390,7 +513,7 @@ async def CompatibilityVideoHLSAudioPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSAudioPlaylistAPI(
         rendition_id,
@@ -411,7 +534,7 @@ async def CompatibilityVideoHLSAudioInitSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()] = 0,
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSAudioInitSegmentAPI(
         rendition_id,
@@ -433,7 +556,7 @@ async def CompatibilityVideoHLSAudioSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSAudioSegmentAPI(
         rendition_id,
@@ -454,7 +577,7 @@ async def CompatibilityVideoHLSSubtitlePlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateCompatibilityRecordedStreamQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: VideoStreamsRouter.CacheKeyQuery = None,
 ):
     return await VideoStreamsRouter.VideoHLSSubtitlePlaylistAPI(
         subtitle_index,
@@ -496,6 +619,160 @@ async def CompatibilityVideoHLSKeepAliveAPI(
         recorded_program,
         stream_quality,
         session_id,
+    )
+
+
+compatibility_videos_router = APIRouter(
+    tags = ['Compatibility - Videos'],
+    prefix = '/api/videos',
+)
+
+
+def CollectCompatibilityDownloadVideoCodecs(recorded_video: RecordedVideo) -> list[str]:
+    """
+    互換 download の判定用に、代表 codec と DB 列挙済みの映像 timeline 全区間の codec を集める。
+
+    代表 codec の欠落・空文字も「不一致」として空文字で返すことで、呼び出し側の許可リスト検査を
+    安全側 (422) に倒す。timeline が存在しない録画では代表 codec だけを返す。
+
+    Args:
+        recorded_video (RecordedVideo): 判定対象の録画ファイル DB レコード。
+
+    Returns:
+        list[str]: 代表 codec と列挙済み全映像区間の codec 値 (欠落は空文字)。
+    """
+
+    codecs: list[str] = []
+
+    # 代表 codec (最長区間の codec)。欠落・空文字は不一致として空文字で返す。
+    if recorded_video.video_codec is not None and str(recorded_video.video_codec).strip() != '':
+        codecs.append(str(recorded_video.video_codec))
+    else:
+        codecs.append('')
+
+    # DB 列挙済みの映像 timeline 全区間。codec の欠落・空文字は不一致として空文字で返す。
+    for entry in recorded_video.video_stream_timeline or []:
+        codec = entry.get('codec')
+        codecs.append(str(codec) if codec is not None and str(codec).strip() != '' else '')
+
+    return codecs
+
+
+def CollectCompatibilityDownloadAudioCodecs(recorded_video: RecordedVideo) -> list[str]:
+    """
+    互換 download の判定用に、DB に列挙済みの副音声・全音声 track / timeline の codec を集める。
+
+    主音声は呼び出し側で必須 AAC 検査済みのため、ここには含めない。
+    値が欠落・空文字・想定外の形状の要素は「不一致」として空文字で返すことで、
+    呼び出し側の AAC 系検査を安全側 (422) に倒す。
+
+    Args:
+        recorded_video (RecordedVideo): 判定対象の録画ファイル DB レコード。
+
+    Returns:
+        list[str]: 副音声と列挙済み全音声の codec 値 (欠落・不正は空文字)。
+    """
+
+    codecs: list[str] = []
+
+    # 副音声 (存在する場合だけ)。None・空文字は「副音声なし」とみなして何も足さない。
+    if recorded_video.secondary_audio_codec is not None and str(recorded_video.secondary_audio_codec).strip() != '':
+        codecs.append(str(recorded_video.secondary_audio_codec))
+
+    # DB 列挙済みの全音声 track。codec の欠落・空文字は不一致として空文字で返す。
+    for track in recorded_video.audio_tracks or []:
+        codec = track.get('codec')
+        codecs.append(str(codec) if codec is not None and str(codec).strip() != '' else '')
+
+    # DB 列挙済みの全音声 timeline 内の track。空の tracks (無音区間) は検査対象にしない。
+    for entry in recorded_video.audio_track_timeline or []:
+        for track in entry.get('tracks') or []:
+            codec = track.get('codec')
+            codecs.append(str(codec) if codec is not None and str(codec).strip() != '' else '')
+
+    return codecs
+
+
+@compatibility_videos_router.get(
+    '/{video_id}/download',
+    summary = '互換録画番組ダウンロード API',
+    response_description = 'TS コンテナ + 放送波コーデックの録画番組ファイル。',
+    response_class = FileResponse,
+    responses = {
+        200: {'content': {'video/mp2t': {}}},
+        422: {'description': 'Specified video_id was not found or the recorded file is not a broadcast TS'},
+    },
+)
+async def CompatibilityVideoDownloadAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(VideoStreamsRouter.ValidateVideoID)],
+):
+    """
+    TS + 放送波コーデックの録画だけを生ファイルで配信する。
+
+    配信可否は既存の DB メタデータだけで判定し、リクエスト時の ffprobe やファイル走査は行わない。
+    メタデータの欠落・不一致がある録画は安全側で 422 にする。
+    通過時は本線 VideoDownloadAPI と同じ生ファイル配信 (FileResponse、Range 対応) を行う。
+    """
+
+    recorded_video = recorded_program.recorded_video
+    file_path = anyio.Path(recorded_video.file_path)
+    filename = file_path.name
+
+    # 録画ファイルが消えていると FileResponse が 500 になるため、通常ファイルの存在を先に確認する
+    if await file_path.is_file() is False:
+        logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded file was not found. path: {recorded_video.file_path}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified video_id was not found',
+        )
+
+    # TS 系拡張子以外の録画は配信しない
+    if pathlib.Path(filename).suffix.lower() not in ('.ts', '.m2ts'):
+        logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded file is not a transport stream. path: {recorded_video.file_path}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Recorded file is not a transport stream',
+        )
+
+    # 放送波の映像コーデック (MPEG-2 / AVC / HEVC) 以外の録画は配信しない
+    ## 代表 codec だけでなく、DB 列挙済みの映像 timeline 全区間も確認する。
+    ## 生ファイル配信では無視された条件外区間までレスポンスに含まれるため、
+    ## 列挙済み codec が1つでも許可対象外・欠落なら安全側で 422 にする。
+    ## DB には解析世代により 'H.265' 形式と 'hevc' 形式が混在するため、小文字正規化して両方を受け付ける。
+    for video_codec in CollectCompatibilityDownloadVideoCodecs(recorded_video):
+        if video_codec.strip().lower() not in (
+            'mpeg-2', 'mpeg2video', 'mpeg2',
+            'h.264', 'h264', 'avc',
+            'h.265', 'h265', 'hevc',
+        ):
+            logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded video codec is not supported for direct download. codec: {video_codec}')
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Recorded video codec is not supported for direct download',
+            )
+
+    # AAC 系以外の音声を持つ録画は配信しない
+    ## 主音声だけでなく、副音声と DB 列挙済みの全音声 track / timeline も確認する。
+    ## 生ファイル配信では無視された非 AAC stream までレスポンスに含まれるため、
+    ## 列挙済み codec が1つでも AAC 系でなければ安全側で 422 にする。
+    if (recorded_video.primary_audio_codec or '').strip().upper().startswith('AAC') is False:
+        logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded audio codec is not supported for direct download. codec: {recorded_video.primary_audio_codec}')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Recorded audio codec is not supported for direct download',
+        )
+    for audio_codec in CollectCompatibilityDownloadAudioCodecs(recorded_video):
+        if audio_codec.strip().upper().startswith('AAC') is False:
+            logging.error(f'[CompatibilityAPI][CompatibilityVideoDownloadAPI] Recorded audio codec is not supported for direct download. codec: {audio_codec}')
+            raise HTTPException(
+                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail = 'Recorded audio codec is not supported for direct download',
+            )
+
+    return FileResponse(
+        path = str(file_path),
+        filename = filename,
+        media_type = VideosRouter.GetRecordedFileDownloadMediaType(filename),
     )
 
 
@@ -568,6 +845,12 @@ def IsRecordedProgramResponsePath(path: str) -> bool:
     return path in _VIDEO_COLLECTION_PATHS or _VIDEO_DETAIL_PATH_PATTERN.fullmatch(path) is not None
 
 
+def IsReservationResponsePath(path: str) -> bool:
+    """Komorebi 向け単発録画予約変換を適用する API パスかどうかを返す。"""
+
+    return path in _RESERVATION_COLLECTION_PATHS or _RESERVATION_DETAIL_PATH_PATTERN.fullmatch(path) is not None
+
+
 def TransformRecordedProgramForKomorebi(recorded_program: dict[str, Any]) -> None:
     """録画番組レスポンスを Komorebi が安全に読み取れる形式へインプレース変換する。"""
 
@@ -635,10 +918,14 @@ def TransformReservationResponseForKomorebi(response_data: Any) -> Any:
     if not isinstance(response_data, dict):
         return response_data
     reservations = response_data.get('reservations')
-    if not isinstance(reservations, list):
+    if isinstance(reservations, list):
+        reservation_items = reservations
+    elif isinstance(response_data.get('record_settings'), dict):
+        reservation_items = [response_data]
+    else:
         return response_data
 
-    for reservation in reservations:
+    for reservation in reservation_items:
         if not isinstance(reservation, dict):
             continue
         record_settings = reservation.get('record_settings')
@@ -669,7 +956,7 @@ def TransformCompatibilityResponseForKomorebi(path: str, response_data: Any) -> 
 
     if IsRecordedProgramResponsePath(path):
         return TransformRecordedProgramResponseForKomorebi(response_data)
-    if path in _RESERVATION_COLLECTION_PATHS:
+    if IsReservationResponsePath(path):
         return TransformReservationResponseForKomorebi(response_data)
     return response_data
 
@@ -683,10 +970,10 @@ class KomorebiResponseMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
             scope['type'] != 'http' or
-            scope.get('method') != 'GET' or
+            scope.get('method') not in ('GET', 'PUT') or
             (
                 IsRecordedProgramResponsePath(scope.get('path', '')) is False and
-                scope.get('path', '') not in _RESERVATION_COLLECTION_PATHS
+                IsReservationResponsePath(scope.get('path', '')) is False
             )
         ):
             await self.app(scope, receive, send)
@@ -897,7 +1184,9 @@ def CreateCompatibilityAPI(
     )
     compatibility_app.include_router(compatibility_live_streams_router)
     compatibility_app.include_router(compatibility_video_streams_router)
+    compatibility_app.include_router(compatibility_videos_router)
     compatibility_app.include_router(compatibility_reservations_router)
+    compatibility_app.include_router(version_router)
     compatibility_app.include_router(users_router)
     compatibility_app.include_router(histories_router)
 

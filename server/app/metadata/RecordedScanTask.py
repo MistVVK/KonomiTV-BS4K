@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import os
 import pathlib
+import stat
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from typing import ClassVar, Literal, cast
 import anyio
 from fastapi import HTTPException, status
 from tortoise import transactions
+from tortoise.context import TortoiseContext
 from tortoise.exceptions import IntegrityError
 from watchfiles import Change, awatch
 from watchfiles.filters import DefaultFilter
@@ -23,6 +25,7 @@ from app.config import Config
 from app.constants import JST, THUMBNAILS_DIR
 from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
+from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
 from app.metadata.CMChapterFile import (
     GetRecordedPathFromCMChapterPath,
@@ -38,17 +41,22 @@ from app.metadata.RecordedAnalysisPlan import (
     ContentState,
     RecordedAnalysisPlan,
 )
-from app.metadata.RecordedSeriesResolver import RecordedSeriesResolver
+from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
+from app.metadata.SeriesIndexer import SeriesIndexer
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.models.Channel import Channel
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
+from app.models.Series import Series
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.Git import GetGitCommit
+from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+from app.utils.KonomiTVBS4KCloudTransferManager import KonomiTVBS4KCloudTransferManager
+from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
 from app.utils.ProcessLimiter import ProcessLimiter
 from app.utils.TSInformation import TSInformation
 
@@ -73,6 +81,22 @@ class RecordedFileLockEntry:
 
     lock: asyncio.Lock
     reference_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ThumbnailGenerationRequest:
+    """バックグラウンドサムネイル生成へ渡す録画世代を保持する。"""
+
+    recorded_program: schemas.RecordedProgram
+    recorded_video_id: int
+
+
+@dataclass(slots=True)
+class ThumbnailGenerationTaskState:
+    """path 単位のサムネイルワーカーと、実行中に到着した最新世代を管理する。"""
+
+    task: asyncio.Task[None] | None = None
+    pending_request: ThumbnailGenerationRequest | None = None
 
 
 @dataclass(slots=True)
@@ -116,6 +140,9 @@ class RecordedScanTask:
 
     # watcher event が欠落しても別 host 書き込みを発見するための強制再スキャン間隔
     RECONCILIATION_INTERVAL_SECONDS: ClassVar[int] = 900
+    # watcher が一時的に停止した際の再起動間隔。連続失敗時は上限まで指数的に延ばす。
+    WATCH_RESTART_INITIAL_BACKOFF_SECONDS: ClassVar[float] = 1.0
+    WATCH_RESTART_MAX_BACKOFF_SECONDS: ClassVar[float] = 60.0
     # Docker 上で host / を参照する bind 先
     DOCKER_HOST_ROOTFS: ClassVar[pathlib.Path] = pathlib.Path('/host-rootfs')
 
@@ -154,6 +181,8 @@ class RecordedScanTask:
     # 一括スキャンは録画単位のパイプラインを複数流し、別録画の各解析段階を重ねる。
     # 各MetadataAnalyzerが子プロセスを1つ使うため、CPUコア数の50%を上限とする。
     BATCH_PIPELINE_CONCURRENCY: ClassVar[int] = max(1, (os.cpu_count() or 2) // 2)
+    # watcherはイベント受信を索引・CM解析の完了待ちから分離しつつ、batchと同じ上限で処理する。
+    WATCH_PIPELINE_CONCURRENCY: ClassVar[int] = BATCH_PIPELINE_CONCURRENCY
 
 
     def __new__(cls) -> RecordedScanTask:
@@ -196,8 +225,8 @@ class RecordedScanTask:
         # runBatchScan() の例外・キャンセル時に未完了 task を cancel / join するために保持する
         self._batch_scan_pipeline_tasks: set[asyncio.Task[None]] = set()
 
-        # バックグラウンドタスクの状態管理
-        self._background_tasks: dict[anyio.Path, asyncio.Task[None]] = {}
+        # path ごとに単一のサムネイルワーカーを保持し、実行中の内容変更は state の最新世代へ集約する。
+        self._background_tasks: dict[anyio.Path, ThumbnailGenerationTaskState] = {}
 
         # シンボリックリンクの元パスと実体パスのマッピング
         self._symlink_path_map: dict[str, str] = {}
@@ -215,7 +244,7 @@ class RecordedScanTask:
 
 
     @asynccontextmanager
-    async def fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None, None]:
+    async def fileLock(self, file_path: anyio.Path) -> AsyncGenerator[None]:
         """path単位lockのholder・waiterを参照数へ含め、最後の解放後にentryを回収する。
 
         Args:
@@ -260,17 +289,24 @@ class RecordedScanTask:
 
 
     @classmethod
-    async def iterRecordedFolderPaths(cls, folder: anyio.Path) -> AsyncGenerator[anyio.Path, None]:
+    async def iterRecordedFolderPaths(
+        cls,
+        folder: anyio.Path,
+        successfully_scanned_directories: set[pathlib.Path] | None = None,
+    ) -> AsyncGenerator[anyio.Path]:
         """CM解析workspaceを枝刈りしながら録画フォルダを列挙する。
 
         Args:
             folder: 列挙を開始する設定済み録画フォルダ。
+            successfully_scanned_directories: scandirが最後まで成功したディレクトリの記録先。
 
         Yields:
             workspace予約rootとその配下を除くファイル・ディレクトリ。
         """
 
-        directories = [pathlib.Path(str(folder))]
+        folder_path = pathlib.Path(str(folder))
+        canonical_folder = pathlib.Path(str(await cls.resolveRecordedPath(folder)))
+        directories = [folder_path]
         while directories:
             directory = directories.pop()
             try:
@@ -278,6 +314,14 @@ class RecordedScanTask:
             except OSError as ex:
                 logging.warning(f'{directory}: Failed to scan directory:', exc_info=ex)
                 continue
+            # scandirが途中で失敗した場合は_scanDirectory()自体が例外を送出するため、
+            # ここへ到達したディレクトリだけが直下エントリを完全に確認できたと判断できる。
+            if successfully_scanned_directories is not None:
+                successfully_scanned_directories.add(directory)
+                # 設定root自体がsymlinkの場合、DBには録画のcanonical pathが保存される。
+                # 列挙に使ったpathとcanonical pathの両方を記録し、同じ走査成功を対応付ける。
+                relative_directory = directory.relative_to(folder_path)
+                successfully_scanned_directories.add(canonical_folder / relative_directory)
             for entry_path, is_directory in entries:
                 if CMAnalysisWorkspace.isWorkspacePath(entry_path):
                     if is_directory and CMAnalysisWorkspace.isWorkspaceRootName(entry_path.name):
@@ -374,9 +418,9 @@ class RecordedScanTask:
             # runBatchScan() が完了しなくても新しく録画されたファイルの監視を開始するため、同時に実行する
             await asyncio.gather(
                 # サーバー起動時の一括スキャン・同期を実行
-                self.runBatchScan(),
-                # 録画フォルダの監視を開始
-                self.watchRecordedFolders(),
+                self.__runStartupScan(),
+                # 録画フォルダの監視を開始し、一時障害で停止した場合は再起動する
+                self.__runRecordedFolderWatchSupervisor(),
                 # NFS/CIFS 向けの低頻度 reconciliation
                 self.__runPeriodicReconciliation(),
             )
@@ -386,6 +430,63 @@ class RecordedScanTask:
             logging.error('Error in RecordedScanTask:', exc_info=ex)
         finally:
             self._is_running = False
+
+
+    async def __runStartupScan(self) -> None:
+        """起動時スキャンの完了後だけ、未完了のCM解析を直列に補完する。
+
+        Returns:
+            None
+        """
+
+        # 手動スキャンや定期reconciliationでは再投入せず、起動時の一巡だけを対象にする。
+        await self.runBatchScan()
+        await CMAnalysisTaskManager.runStartupBackfill()
+
+
+    async def __runRecordedFolderWatchSupervisor(self) -> None:
+        """録画フォルダ監視を一時障害から再起動し、キャンセルだけは即座に伝播する。
+
+        Returns:
+            None
+        """
+
+        restart_backoff = self.WATCH_RESTART_INITIAL_BACKOFF_SECONDS
+        while self._is_running:
+            watch_started_at = asyncio.get_running_loop().time()
+            try:
+                await self.watchRecordedFolders()
+                # stop() と同時に watcher が正常終了した場合は再起動しない。
+                if self._is_running is False:
+                    return
+                # 上限時間以上は安定稼働できた場合、過去の一時障害を連続失敗として持ち越さない。
+                if asyncio.get_running_loop().time() - watch_started_at >= self.WATCH_RESTART_MAX_BACKOFF_SECONDS:
+                    restart_backoff = self.WATCH_RESTART_INITIAL_BACKOFF_SECONDS
+                logging.warning(
+                    'File system watch of recording folders stopped unexpectedly. '
+                    f'Restarting in {restart_backoff:g}s.'
+                )
+            except asyncio.CancelledError:
+                # shutdown を再起動待ちへ変換せず、run() と stop() へ即座に伝播する。
+                raise
+            except Exception as ex:
+                # watchfiles は root 不在や権限・I/O 異常を例外として送出する。
+                # root が復旧するまで再生成を続けるが、連続失敗時のログ洪水と busy loop は抑止する。
+                if self._is_running is False:
+                    return
+                if asyncio.get_running_loop().time() - watch_started_at >= self.WATCH_RESTART_MAX_BACKOFF_SECONDS:
+                    restart_backoff = self.WATCH_RESTART_INITIAL_BACKOFF_SECONDS
+                logging.error(
+                    'File system watch of recording folders failed. '
+                    f'Restarting in {restart_backoff:g}s.',
+                    exc_info=ex,
+                )
+
+            await asyncio.sleep(restart_backoff)
+            restart_backoff = min(
+                restart_backoff * 2,
+                self.WATCH_RESTART_MAX_BACKOFF_SECONDS,
+            )
 
 
     async def runBatchScan(self) -> None:
@@ -447,6 +548,9 @@ class RecordedScanTask:
         videos_by_path: dict[str, list[RecordedVideoSummary]] = {}
         videos_to_keep: list[RecordedVideoSummary] = []  # 保持するレコードのリスト
         for index, row in enumerate(all_video_rows, start=1):
+            # クラウド録画は目録が正本。元のローカルパスや不完全なmount一覧で重複・消失と判断しない。
+            if KonomiTVBS4KCloudTransferManager.protects(row['id']):
+                continue
             recorded_video_summary = RecordedVideoSummary(
                 id = row['id'],
                 file_path = row['file_path'],
@@ -483,6 +587,9 @@ class RecordedScanTask:
                     videos_to_keep.append(latest_video)  # 最新のものを保持リストに追加
                     # 最新以外のレコードを削除
                     for video_to_delete in videos[1:]:
+                        # batchのsnapshot取得後に受け付けた移動も、その場で保持する。
+                        if KonomiTVBS4KCloudTransferManager.protects(video_to_delete.id):
+                            continue
                         try:
                             # RecordedProgram を削除 (CASCADE により RecordedVideo も削除される)
                             await RecordedProgram.filter(id=video_to_delete.recorded_program_id).delete()
@@ -533,8 +640,9 @@ class RecordedScanTask:
         logging.info('Scanning recorded folders...')
         processed_canonical_paths: set[str] = set()
         cleaned_symlink_target_parents: set[pathlib.Path] = set()
+        successfully_scanned_directories: set[pathlib.Path] = set()
         for folder in self.recorded_folders:
-            async for file_path in self.iterRecordedFolderPaths(folder):
+            async for file_path in self.iterRecordedFolderPaths(folder, successfully_scanned_directories):
                 try:
                     # CM解析のcanonical MKVなどは録画と同じFSへ置くため、名前空間ごと最優先で除外する。
                     if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(file_path))):
@@ -606,7 +714,10 @@ class RecordedScanTask:
             self._batch_scan_pipeline_tasks.clear()
 
         # 存在しない録画ファイルに対応するレコードを一括削除
-        await self.__cleanupNonExistentRecordedVideoRecords(existing_db_recorded_videos)
+        await self.__cleanupNonExistentRecordedVideoRecords(
+            existing_db_recorded_videos,
+            successfully_scanned_directories,
+        )
 
         # DB に存在する全ての RecordedVideo レコードのハッシュを取得
         logging.info('Gathering all recorded video hashes...')
@@ -625,6 +736,10 @@ class RecordedScanTask:
                         continue
                     # ディレクトリは無視
                     if await thumbnail_path.is_dir():
+                        continue
+                    # 実行中の生成処理が所有する一時ファイルは削除せず、失敗・キャンセル時の finally に任せる。
+                    # 前回プロセスから残った一時ファイルは active 集合にないため、通常の孤児判定で削除される。
+                    if ThumbnailGenerator.isTemporaryOutputActive(pathlib.Path(str(thumbnail_path))):
                         continue
 
                     # ファイル名からハッシュを抽出
@@ -691,16 +806,24 @@ class RecordedScanTask:
                 f'Re-run metadata analysis after checking source files.',
             )
         logging.info('Batch scan of recording folders has been completed.')
+        # 列挙と録画ごとの処理が終わった集合へ、現在の確定規則を一括適用する。
+        await SeriesIndexer.rebuild()
+        # pipelineと同じ所有境界でBangumi同期を待ち、既存の全收藏同期へ積み増さない。
+        await KonomiTVBS4KBangumiClient.syncAfterRecordedScan()
+        # TMDb の検索・AI 待ちでスキャン完了や後続の CM 解析を止めず、既存の同期タスクへ合流する。
+        KonomiTVBS4KTmdbClient.scheduleSeriesSync()
 
 
     async def __cleanupNonExistentRecordedVideoRecords(
         self,
         existing_db_recorded_videos: dict[anyio.Path, RecordedVideoSummary],
+        successfully_scanned_directories: set[pathlib.Path],
     ) -> None:
         """存在しない録画ファイルのDBレコードを、削除再試行状態を保護しながら回収する。
 
         Args:
             existing_db_recorded_videos: batch scan後もファイルとの対応を確認できなかった録画の一覧。
+            successfully_scanned_directories: scandirが最後まで成功したディレクトリの一覧。
 
         Returns:
             None
@@ -708,13 +831,40 @@ class RecordedScanTask:
 
         # トランザクション配下でまとめて削除することで、大量の消失レコードがある場合のDB処理を高速化する
         logging.info('Deleting records for non-existent files...')
+        unverified_record_count = 0
         async with transactions.in_transaction():
             for index, (file_path, existing_recorded_video_summary) in enumerate(
                 existing_db_recorded_videos.items(),
                 start=1,
             ):
+                # 直親のscandirに成功していない場合、未検出はファイル消失ではなくNAS切断・権限異常などの
+                # 一時的な走査失敗である可能性がある。失敗したsubtreeだけをfail-closedで保持する。
+                file_parent = pathlib.Path(str(file_path)).parent
+                if file_parent not in successfully_scanned_directories:
+                    unverified_record_count += 1
+                    if index % 50 == 0:
+                        # 大量の保持対象がある場合もイベントループへ定期的に制御を返す。
+                        await asyncio.sleep(0)
+                    continue
+
+                # is_file()は権限・I/OエラーもFalseへ畳むため、破壊的cleanupではstat()を直接使う。
+                # 明確な不在または通常ファイル以外への置換だけを消失とし、アクセス不能時はfail-closedで保持する。
+                try:
+                    file_stat = await file_path.stat()
+                    is_file_missing = stat.S_ISREG(file_stat.st_mode) is False
+                except FileNotFoundError:
+                    is_file_missing = True
+                except OSError as ex:
+                    logging.warning(f'{file_path}: Preserved record because file existence could not be verified:', exc_info=ex)
+                    if index % 50 == 0:
+                        # アクセス不能な録画が大量にある場合もイベントループへ定期的に制御を返す。
+                        await asyncio.sleep(0)
+                    continue
+
                 # ファイルが消失した録画だけをDBレコード回収の対象にする
-                if not await self.isFileExists(file_path):
+                if is_file_missing is True:
+                    if KonomiTVBS4KCloudTransferManager.protects(existing_recorded_video_summary.id):
+                        continue
                     # 削除APIが録画本体を削除した後に失敗したレコードは、同じAPIからの再試行対象として保持する
                     # ここでDBを消すと未削除の補助ファイルを辿れなくなるため、自動回収の対象から除外する
                     if existing_recorded_video_summary.status in ('Deleting', 'DeleteFailed'):
@@ -727,6 +877,7 @@ class RecordedScanTask:
                         # RecordedProgram を削除すると、CASCADE 制約により RecordedVideo も同時に削除される
                         deleted_count = await RecordedProgram.filter(
                             id=existing_recorded_video_summary.recorded_program_id,
+                            recorded_video__file_path=existing_recorded_video_summary.file_path,
                         ).exclude(
                             recorded_video__status__in=['Deleting', 'DeleteFailed'],
                         ).delete()
@@ -738,6 +889,13 @@ class RecordedScanTask:
                 if index % 50 == 0:
                     # 既存レコードの走査がイベントループを占有し続けないよう適宜制御を返す
                     await asyncio.sleep(0)
+
+        # NAS切断時などに録画件数分のwarningを出さず、保持した総数だけを利用者へ通知する。
+        if unverified_record_count > 0:
+            logging.warning(
+                f'Preserved {unverified_record_count} recorded video record(s) because '
+                'their parent directories were not scanned successfully.'
+            )
 
 
     async def processRecordedFile(
@@ -837,6 +995,9 @@ class RecordedScanTask:
                         existing_recorded_video_summary.file_path = file_path_str
 
                 # 削除処理中または削除失敗後のレコードは、APIからの再試行まで状態とファイルをそのまま保持する
+                # 移動中の対象集合を、再解析で書き換えない。公開後は新しい所在に従って処理する。
+                if existing_recorded_video_summary is not None and KonomiTVBS4KCloudTransferManager.isActive(existing_recorded_video_summary.id):
+                    return
                 # 自動スキャンで Analyzing / Recorded へ戻すと削除状態を失い、再試行不能になるため処理対象外とする
                 if (
                     existing_recorded_video_summary is not None and
@@ -966,6 +1127,10 @@ class RecordedScanTask:
                     ).select_related('recorded_program', 'recorded_program__channel')
 
                 # 部分ハッシュまで比較して最終的なContentStateを確定する。
+                if file_path_str.startswith('/cloud-mounts/') and existing_db_recorded_video_after_analyze is not None:
+                    # providerのmtime精度で、目録が保持する元の日時を丸めない。
+                    recorded_program.recorded_video.file_created_at = existing_db_recorded_video_after_analyze.file_created_at
+                    recorded_program.recorded_video.file_modified_at = existing_db_recorded_video_after_analyze.file_modified_at
                 # 更新日時だけが変わった同一内容の録画は、Automaticならメタデータを保存せず索引状態だけを処理する。
                 if existing_db_recorded_video_after_analyze is None:
                     content_state: ContentState = 'New'
@@ -1035,10 +1200,24 @@ class RecordedScanTask:
                 # 録画スキャンを外部API待ちで止めないよう、DB保存済みIDだけを専用ワーカーへ渡す。
                 # 任意機能の設定ファイル破損やキュー障害で、後続の索引・CM解析まで中断しない。
                 try:
-                    await RecordedSeriesResolver.enqueue(saved_recorded_program_id, input_changed=True)
+                    indexed_program = await RecordedProgram.get_or_none(id=saved_recorded_program_id)
+                    if indexed_program is not None:
+                        # Indexer が所属を付けた新規・更新録画だけ話数 worker へ渡す。
+                        ## 整数話数なら Web 検索せず、非整数だけ既存の話数検索へ進む。
+                        linked = await SeriesIndexer.linkRecordedProgram(indexed_program)
+                        if linked:
+                            await RecordedEpisodeAutomation.enqueue(saved_recorded_program_id)
+                            # 未照合 Series の收藏同期はスキャンを止めず、重複実行は合流させる。
+                            if indexed_program.series_id is not None:
+                                series = await Series.get_or_none(id=indexed_program.series_id)
+                                if series is not None and series.bangumi_subject_id is None:
+                                    KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
+                                # TMDb 未照合の Series も同じく、スキャンを止めずに照合を予約する。
+                                if series is not None and series.tmdb_id is None:
+                                    KonomiTVBS4KTmdbClient.scheduleSeriesSync()
                 except Exception as ex:
                     logging.error(
-                        f'{file_path}: Failed to enqueue recorded series resolution. '
+                        f'{file_path}: Failed to index recorded series. '
                         f'recorded_program_id: {saved_recorded_program_id}',
                         exc_info=ex,
                     )
@@ -1046,12 +1225,22 @@ class RecordedScanTask:
                 # サムネイルだけは直列処理に含めず、従来どおりバックグラウンドで生成する。
                 # CMは索引完了後に直列実行するため、このタスクへ混在させない。
                 if 'GenerateThumbnail' in analysis_plan.actions:
-                    if file_path not in self._background_tasks:
-                        task = asyncio.create_task(self.__runThumbnailGeneration(
-                            recorded_program,
-                            saved_recorded_video_id,
+                    thumbnail_request = ThumbnailGenerationRequest(
+                        recorded_program = recorded_program,
+                        recorded_video_id = saved_recorded_video_id,
+                    )
+                    generation_state = self._background_tasks.get(file_path)
+                    if generation_state is None:
+                        generation_state = ThumbnailGenerationTaskState()
+                        generation_state.task = asyncio.create_task(self.__runThumbnailGeneration(
+                            thumbnail_request.recorded_program,
+                            thumbnail_request.recorded_video_id,
+                            generation_state,
                         ))
-                        self._background_tasks[file_path] = task
+                        self._background_tasks[file_path] = generation_state
+                    else:
+                        # 生成中に同じ path が追記・置換された場合、途中世代を捨てて最新要求だけを次に実行する。
+                        generation_state.pending_request = thumbnail_request
 
                 # 新規・内容変更・手動再解析は、DBへ暫定保存した後で全編索引を直列実行する。
                 # MetadataAnalyzerが得たEIT候補はDBの旧確定索引を上書きせず、今回の索引入力としてだけ渡す。
@@ -1091,11 +1280,14 @@ class RecordedScanTask:
         """同期MetadataAnalyzerを専用プロセスで実行し、キャンセル時も確実に回収する。"""
 
         loop = asyncio.get_running_loop()
-        analyzer = MetadataAnalyzer(pathlib.Path(str(file_path)))
         executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
         should_wait_executor = True
         try:
-            return await loop.run_in_executor(executor, analyzer.analyze)
+            return await loop.run_in_executor(
+                executor,
+                RecordedScanTask._analyzeMetadataForMultiProcess,
+                pathlib.Path(str(file_path)),
+            )
         except asyncio.CancelledError:
             should_wait_executor = False
             await ShutdownProcessPoolExecutor(executor, is_cancelled=True)
@@ -1103,6 +1295,24 @@ class RecordedScanTask:
         finally:
             if should_wait_executor is True:
                 await ShutdownProcessPoolExecutor(executor, is_cancelled=False)
+
+
+    @staticmethod
+    def _analyzeMetadataForMultiProcess(file_path: pathlib.Path) -> schemas.RecordedProgram | None:
+        """
+        子プロセス専用の ORM context で同期メタデータ解析を実行する。
+
+        Args:
+            file_path (pathlib.Path): 解析対象の録画ファイル。
+
+        Returns:
+            schemas.RecordedProgram | None: 解析結果。メタデータを取得できなければ None。
+        """
+
+        # forkserver の子プロセスは親の TortoiseContext を引き継がないため、
+        # connections proxy を使う地デジのチャンネル番号算出より先に worker 固有の context を有効化する。
+        with TortoiseContext():
+            return MetadataAnalyzer(file_path).analyze()
 
 
     @staticmethod
@@ -1609,6 +1819,7 @@ class RecordedScanTask:
         self,
         recorded_program: schemas.RecordedProgram,
         recorded_video_id: int,
+        generation_state: ThumbnailGenerationTaskState | None = None,
     ) -> None:
         """
         録画完了後のサムネイルをバックグラウンド生成する。
@@ -1616,36 +1827,62 @@ class RecordedScanTask:
         Args:
             recorded_program (schemas.RecordedProgram): 解析対象の録画番組情報
             recorded_video_id (int): DB 保存後に確定した RecordedVideo の ID
+            generation_state: path 単位ワーカーの実行状態。直接実行時はこのメソッド内で作成する。
         """
 
         # 録画ファイルのパスを anyio.Path に変換
         file_path = anyio.Path(recorded_program.recorded_video.file_path)
+        if generation_state is None:
+            generation_state = ThumbnailGenerationTaskState()
 
         try:
-            async with AnalysisTaskTracker.track(
-                'ThumbnailGeneration',
-                recorded_video_id=recorded_video_id,
-                title=recorded_program.title,
-            ) as history:
-                logging.info(f'{file_path}: Starting background analysis task...')
-                await history.setStage('Generating')
-                # ProcessLimiter で稼働中のバックグラウンドタスクの同時実行数を CPU コア数の 50% に制限
-                async with ProcessLimiter.getSemaphore('RecordedScanTask'):
-                    # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
-                    async with DriveIOLimiter.getSemaphore(file_path):
-                        if recorded_program.recorded_video.has_video is False:
-                            logging.info(f'{file_path}: Skipping thumbnail generation for audio-only recording.')
-                            await history.finish('Skipped', error_code='AudioOnly')
-                            return
-                        # シークバー用サムネイルとリスト表示用の代表サムネイルの両方を生成する。
-                        await ThumbnailGenerator.fromRecordedProgram(recorded_program).generateAndSave()
-                logging.info(f'{file_path}: Background analysis task completed.')
+            while True:
+                thumbnail_result: Literal['Succeeded', 'Failed', 'Stale'] | None = None
+                try:
+                    async with AnalysisTaskTracker.track(
+                        'ThumbnailGeneration',
+                        recorded_video_id=recorded_video_id,
+                        title=recorded_program.title,
+                    ) as history:
+                        logging.info(f'{file_path}: Starting background analysis task...')
+                        await history.setStage('Generating')
+                        # ProcessLimiter で稼働中のバックグラウンドタスクの同時実行数を CPU コア数の 50% に制限
+                        async with ProcessLimiter.getSemaphore('RecordedScanTask'):
+                            # DriveIOLimiter で同一 HDD に対してのバックグラウンドタスクの同時実行数を原則1セッションに制限
+                            async with DriveIOLimiter.getSemaphore(file_path):
+                                if recorded_program.recorded_video.has_video is False:
+                                    logging.info(f'{file_path}: Skipping thumbnail generation for audio-only recording.')
+                                    await history.finish('Skipped', error_code='AudioOnly')
+                                else:
+                                    # MetadataAnalyzer の schema は未保存 ID のため、DB 保存後に確定した世代 ID で上書きする。
+                                    generator = ThumbnailGenerator.fromRecordedProgram(recorded_program)
+                                    generator.recorded_video_id = recorded_video_id
+                                    thumbnail_result = await generator.generateAndSave()
+                                    if thumbnail_result == 'Stale':
+                                        await history.finish('Skipped', error_code='GenerationChanged')
+                                    elif thumbnail_result == 'Failed':
+                                        await history.finish('Failed', error_code='ThumbnailGenerationFailed')
+                        if thumbnail_result in ('Succeeded', None):
+                            logging.info(f'{file_path}: Background analysis task completed.')
+                except Exception as ex:
+                    logging.error(f'{file_path}: Error in background analysis task:', exc_info=ex)
 
-        except Exception as ex:
-            logging.error(f'{file_path}: Error in background analysis task:', exc_info=ex)
+                # watcher より先に物理ファイルの変更を検出した場合は、同じワーカー内で再スキャンを要求する。
+                # 既に processRecordedFile() が最新世代を pending に積んでいれば重複解析しない。
+                if thumbnail_result == 'Stale' and generation_state.pending_request is None:
+                    await self.processRecordedFile(file_path)
+
+                # 実行中に複数世代が到着しても最新要求だけを取り出し、中間世代の無駄な生成を避ける。
+                pending_request = generation_state.pending_request
+                generation_state.pending_request = None
+                if pending_request is None:
+                    break
+                recorded_program = pending_request.recorded_program
+                recorded_video_id = pending_request.recorded_video_id
         finally:
-            # 完了したタスクを管理対象から削除
-            self._background_tasks.pop(file_path, None)
+            # 古いワーカーの finally が、同じ path に作られた新しい state を削除しないよう identity を確認する。
+            if self._background_tasks.get(file_path) is generation_state:
+                self._background_tasks.pop(file_path, None)
 
 
     async def __migrateKeyFramesToSegmentMap(self) -> None:
@@ -1784,6 +2021,7 @@ class RecordedScanTask:
 
         # 監視対象のディレクトリを設定
         watch_paths = [str(path) for path in self.recorded_folders]
+        watch_path_set = {pathlib.Path(path) for path in watch_paths}
 
         # スキャン対象から除外するフォルダ
         # 空文字列は全パスにマッチしてしまうため除外する
@@ -1795,6 +2033,63 @@ class RecordedScanTask:
 
         # 録画完了チェック用のタスク
         completion_check_task = asyncio.create_task(self.__checkRecordingCompletion())
+
+        # watchfilesのデバウンス後も同じpathへ連続イベントが届くため、待機中・処理中を問わず
+        # 最新イベント1件へ集約する。固定数workerだけがprocess pipelineへ入り、task数を増やさない。
+        change_queue: asyncio.Queue[str] = asyncio.Queue()
+        pending_changes: dict[str, Change] = {}
+        scheduled_paths: set[str] = set()
+
+        def EnqueueChange(change_type: Change, file_path_str: str) -> None:
+            """同一pathの最新イベントを保持し、未処理pathだけをworker queueへ追加する。
+
+            Args:
+                change_type: watchfilesが通知した変更種別。
+                file_path_str: watchfilesが通知した変更path。
+
+            Returns:
+                None
+            """
+
+            pending_changes[file_path_str] = change_type
+            if file_path_str in scheduled_paths:
+                return
+            scheduled_paths.add(file_path_str)
+            change_queue.put_nowait(file_path_str)
+
+        async def ProcessChanges() -> None:
+            """path単位に集約された変更を順次処理する。
+
+            Returns:
+                None
+            """
+
+            while True:
+                file_path_str = await change_queue.get()
+                change_type = pending_changes.pop(file_path_str)
+                try:
+                    await self.__processRecordedFolderChange(
+                        change_type,
+                        file_path_str,
+                        exclude_scan_paths,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as ex:
+                    logging.error(f'{file_path_str}: Error processing queued file system change:', exc_info=ex)
+                finally:
+                    # 処理中に同じpathの新世代が届いた場合は末尾へ戻し、他pathにも処理機会を渡す。
+                    # 新世代がなければscheduled状態を外し、次のイベントで再度queueへ追加できるようにする。
+                    if file_path_str in pending_changes:
+                        change_queue.put_nowait(file_path_str)
+                    else:
+                        scheduled_paths.discard(file_path_str)
+                    change_queue.task_done()
+
+        pipeline_tasks = [
+            asyncio.create_task(ProcessChanges())
+            for _ in range(self.WATCH_PIPELINE_CONCURRENCY)
+        ]
 
         try:
             # watchfiles によるファイル監視
@@ -1811,64 +2106,88 @@ class RecordedScanTask:
                     if not self._is_running:
                         break
 
-                    file_path = anyio.Path(file_path_str)
-                    # chapter判定や録画拡張子判定より先に、CM解析workspaceの全イベントを除外する。
-                    if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(file_path_str)):
-                        continue
-                    # Mac の metadata ファイルをスキップ
-                    if file_path.name.startswith('._'):
-                        continue
-                    # 再生中にも生成・削除イベントが発生するため、キャッシュ管理側だけに処理を任せる。
-                    if RecordedFMP4CacheManager.isCacheFileName(file_path.name):
-                        await RecordedFMP4CacheManager.cleanupDiscovered(pathlib.Path(str(file_path)))
-                        continue
-                    # 除外パターンのチェック（シンボリックリンク解決前）
-                    original_path_str = str(file_path)
-                    if self.isPathExcludedByPatterns(original_path_str, exclude_scan_paths) is True:
-                        continue
-                    # シンボリックリンクを含むパスは実体に解決して処理する
-                    canonical_path = await self.resolveRecordedPath(file_path)
-                    if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(canonical_path))):
-                        continue
-                    # 除外パターンのチェック（シンボリックリンク解決後）
-                    canonical_path_str = str(canonical_path)
-                    if self.isPathExcludedByPatterns(canonical_path_str, exclude_scan_paths) is True:
-                        continue
-                    if await canonical_path.is_dir():
-                        continue
-                    # chapterイベントは通常の録画拡張子フィルターより先に元録画へ関連付ける。
-                    # 削除イベントでは実体が存在しないため、イベント種別を問わずファイル名から逆引きする。
-                    if canonical_path.name.lower().endswith(('.chapter.txt', '.konomitv-bs4k-chapters.yaml')):
-                        try:
-                            await self.__handleChapterFileChange(canonical_path)
-                        except Exception as ex:
-                            logging.error(f'{file_path}: Error handling chapter file change:', exc_info=ex)
-                        continue
-                    # 対象拡張子のファイル以外は無視
-                    if canonical_path.suffix.lower() not in self.SCAN_TARGET_EXTENSIONS:
-                        continue
+                    # Linux の inotify は監視 root 自体の削除後も generator を終了せず、同じ path が
+                    # 再作成されても新 inode を監視しない。監督ループで watcher を作り直して追従する。
+                    if change_type == Change.deleted and pathlib.Path(file_path_str) in watch_path_set:
+                        raise FileNotFoundError(f'Recorded folder watch root disappeared: {file_path_str}')
+                    EnqueueChange(change_type, file_path_str)
 
-                    try:
-                        # 追加 or 変更イベント
-                        if change_type == Change.added or change_type == Change.modified:
-                            await self.__handleFileChange(canonical_path, original_file_path=file_path)
-                        # 削除イベント
-                        elif change_type == Change.deleted:
-                            await self.__handleFileDeletion(canonical_path, original_file_path=file_path)
-                    except Exception as ex:
-                        logging.error(f'{file_path}: Error handling file change:', exc_info=ex)
+            # watcherが正常終了した場合は、受理済みイベントを失わず処理してからworkerを回収する。
+            await change_queue.join()
 
         except asyncio.CancelledError:
             raise
-        except Exception as ex:
-            logging.error('Error in file system watch of recording folders:', exc_info=ex)
         finally:
             completion_check_task.cancel()
-            try:
-                await completion_check_task
-            except asyncio.CancelledError:
-                pass
+            for pipeline_task in pipeline_tasks:
+                pipeline_task.cancel()
+            await asyncio.gather(completion_check_task, *pipeline_tasks, return_exceptions=True)
             logging.info('File system watch of recording folders has been stopped.')
+
+
+    async def __processRecordedFolderChange(
+        self,
+        change_type: Change,
+        file_path_str: str,
+        exclude_scan_paths: list[str],
+    ) -> None:
+        """watcherから受理した単一pathの最新変更を録画処理へ振り分ける。
+
+        Args:
+            change_type: watchfilesが通知した変更種別。
+            file_path_str: watchfilesが通知した変更path。
+            exclude_scan_paths: component境界を正規化済みの除外path一覧。
+
+        Returns:
+            None
+        """
+
+        file_path = anyio.Path(file_path_str)
+        # chapter判定や録画拡張子判定より先に、CM解析workspaceの全イベントを除外する。
+        if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(file_path_str)):
+            return
+        # Mac の metadata ファイルをスキップ
+        if file_path.name.startswith('._'):
+            return
+        # 再生中にも生成・削除イベントが発生するため、キャッシュ管理側だけに処理を任せる。
+        if RecordedFMP4CacheManager.isCacheFileName(file_path.name):
+            await RecordedFMP4CacheManager.cleanupDiscovered(pathlib.Path(str(file_path)))
+            return
+        # 除外パターンのチェック（シンボリックリンク解決前）
+        original_path_str = str(file_path)
+        if self.isPathExcludedByPatterns(original_path_str, exclude_scan_paths) is True:
+            return
+        # シンボリックリンクを含むパスは実体に解決して処理する
+        canonical_path = await self.resolveRecordedPath(file_path)
+        if CMAnalysisWorkspace.isWorkspacePath(pathlib.Path(str(canonical_path))):
+            return
+        # 除外パターンのチェック（シンボリックリンク解決後）
+        canonical_path_str = str(canonical_path)
+        if self.isPathExcludedByPatterns(canonical_path_str, exclude_scan_paths) is True:
+            return
+        if await canonical_path.is_dir():
+            return
+        # chapterイベントは通常の録画拡張子フィルターより先に元録画へ関連付ける。
+        # 削除イベントでは実体が存在しないため、イベント種別を問わずファイル名から逆引きする。
+        if canonical_path.name.lower().endswith(('.chapter.txt', '.konomitv-bs4k-chapters.yaml')):
+            try:
+                await self.__handleChapterFileChange(canonical_path)
+            except Exception as ex:
+                logging.error(f'{file_path}: Error handling chapter file change:', exc_info=ex)
+            return
+        # 対象拡張子のファイル以外は無視
+        if canonical_path.suffix.lower() not in self.SCAN_TARGET_EXTENSIONS:
+            return
+
+        try:
+            # 追加 or 変更イベント
+            if change_type == Change.added or change_type == Change.modified:
+                await self.__handleFileChange(canonical_path, original_file_path=file_path)
+            # 削除イベント
+            elif change_type == Change.deleted:
+                await self.__handleFileDeletion(canonical_path, original_file_path=file_path)
+        except Exception as ex:
+            logging.error(f'{file_path}: Error handling file change:', exc_info=ex)
 
 
     async def __handleChapterFileChange(self, chapter_file_path: anyio.Path) -> None:
@@ -2061,6 +2380,8 @@ class RecordedScanTask:
                 if db_recorded_video is None and original_file_path is not None:
                     db_recorded_video = await RecordedVideo.get_or_none(file_path=str(original_file_path))
                 if db_recorded_video is not None:
+                    if KonomiTVBS4KCloudTransferManager.protects(db_recorded_video.id):
+                        return
                     # 削除APIが録画本体を削除した後に失敗したレコードは、同じAPIからの再試行対象として保持する
                     # watcherは削除APIのpath lock解放後に到達するため、lockだけでなく永続statusも必ず確認する
                     if db_recorded_video.status in ('Deleting', 'DeleteFailed'):

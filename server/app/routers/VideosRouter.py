@@ -1,5 +1,6 @@
 
 import asyncio
+import difflib
 import json
 import pathlib
 from datetime import datetime
@@ -21,27 +22,40 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from starlette.datastructures import Headers
 from tortoise import connections
+from tortoise.transactions import in_transaction
 
 from app import logging, schemas
 from app.constants import STATIC_DIR, THUMBNAILS_DIR
 from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
+from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
+from app.metadata.CMChapterFile import GetCMChapterPath
+from app.metadata.KonomiTVBS4KChapterFile import GetKonomiTVBS4KChapterPath
 from app.metadata.RecordedPlaybackIndex import (
     RECORDED_PLAYBACK_INDEX_VERSION,
     GetRecordedPlaybackIndexState,
 )
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
+from app.metadata.SeriesIndexer import NormalizeSeriesTitle, ParseSeriesTitle
 from app.metadata.ThumbnailGenerator import ThumbnailGenerator
 from app.metadata.TSInfoAnalyzer import TSInfoAnalyzer
 from app.models.CMAnalysis import RecordedVideoCMAnalysis, RecordedVideoCMResult
+from app.models.KonomiTVBS4KCloudTransfer import KonomiTVBS4KCloudRecording
 from app.models.RecordedProgram import RecordedProgram
 from app.models.RecordedVideo import RecordedVideo
+from app.models.Series import Series
 from app.models.User import User
 from app.routers.JikkyoDependency import EnsureJikkyoEnabled
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.streams.KonomiTVBS4KOfflineJobManager import KonomiTVBS4KOfflineJobManager
+from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
+from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
+from app.utils.DisconnectAwareFileResponse import DisconnectAwareFileResponse
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.JikkyoClient import JikkyoClient
+from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
+from app.utils.KonomiTVBS4KCloudTransferManager import KonomiTVBS4KCloudTransferManager
 
 
 # ルーター
@@ -52,6 +66,115 @@ router = APIRouter(
 
 # ページングで一度に取得する録画番組の数
 PAGE_SIZE = 30
+
+
+def CalculateRelatedProgramScore(current: RecordedProgram, target: RecordedProgram) -> int:
+    """
+    シリーズ未分類の録画同士について、HonomiTV の関連番組検索と同じ観点で近さを計算する。
+
+    Args:
+        current (RecordedProgram): 検索基準となる録画番組。
+        target (RecordedProgram): 関連候補となる録画番組。
+
+    Returns:
+        int: タイトル・放送時刻・チャンネル・メタデータを合計したスコア。
+    """
+
+    # SeriesIndexer と同じタイトル解析を使い、視聴パネル側で別の作品名抽出規則を増やさない。
+    current_parsed_title = ParseSeriesTitle(current.title, current.genres, current.description)
+    target_parsed_title = ParseSeriesTitle(target.title, target.genres, target.description)
+    current_title = (
+        current_parsed_title.normalized_title
+        if current_parsed_title is not None
+        else NormalizeSeriesTitle(current.series_title or current.title)
+    )
+    target_title = (
+        target_parsed_title.normalized_title
+        if target_parsed_title is not None
+        else NormalizeSeriesTitle(target.series_title or target.title)
+    )
+    if current_title == target_title and len(current_title) > 0:
+        title_score = 60
+    else:
+        similarity = difflib.SequenceMatcher(None, current_title, target_title, autojunk=False).ratio()
+        if similarity >= 0.9:
+            title_score = 55
+        elif similarity >= 0.8:
+            title_score = 50
+        elif similarity >= 0.7:
+            title_score = 40
+        elif len(current_title) >= 2 and current_title in target_title:
+            title_score = 35
+        else:
+            title_score = 0
+
+    # 毎日・毎週の同時刻帯を関連番組の補助根拠にする。
+    date_diff_days = abs((current.start_time.date() - target.start_time.date()).days)
+    day_diff = abs((current.start_time.weekday() - target.start_time.weekday() + 7) % 7)
+    minute_diff = abs(
+        (current.start_time.hour * 60 + current.start_time.minute) -
+        (target.start_time.hour * 60 + target.start_time.minute)
+    )
+    if 1 <= date_diff_days <= 7 and minute_diff <= 5:
+        time_score = 20
+    elif 1 <= date_diff_days <= 7 and minute_diff <= 15:
+        time_score = 18
+    elif 1 <= date_diff_days <= 7 and minute_diff <= 30:
+        time_score = 16
+    elif day_diff == 0 and minute_diff <= 5:
+        time_score = 20
+    elif day_diff == 0 and minute_diff <= 15:
+        time_score = 18
+    elif day_diff == 0 and minute_diff <= 30:
+        time_score = 15
+    elif day_diff == 0 and minute_diff <= 60:
+        time_score = 10
+    elif minute_diff <= 15:
+        time_score = 12
+    elif minute_diff <= 30:
+        time_score = 8
+    elif minute_diff <= 60:
+        time_score = 5
+    else:
+        time_score = 0
+
+    # 同じ放送サービスを最優先し、同一ネットワーク・同一放送種別も弱い根拠として扱う。
+    if current.channel_id is not None and current.channel_id == target.channel_id:
+        channel_score = 10
+    elif current.network_id is not None and current.network_id == target.network_id:
+        channel_score = 6
+    elif current.channel is not None and target.channel is not None and current.channel.type == target.channel.type:
+        channel_score = 3
+    else:
+        channel_score = 0
+
+    # ジャンルと番組尺は、タイトル・時刻だけでは判別しにくい候補の補助根拠に限定する。
+    metadata_score = 0
+    exact_genre_match = any(
+        current_genre['major'] == target_genre['major'] and
+        current_genre['middle'] == target_genre['middle']
+        for current_genre in current.genres
+        for target_genre in target.genres
+    )
+    if exact_genre_match:
+        series_genres = {'アニメ・特撮', 'ドラマ', '情報・ワイドショー'}
+        metadata_score += 5 if any(genre['major'] in series_genres for genre in current.genres) else 4
+    elif any(
+        current_genre['major'] == target_genre['major']
+        for current_genre in current.genres
+        for target_genre in target.genres
+    ):
+        metadata_score += 2
+
+    duration_diff = abs(current.duration - target.duration)
+    if duration_diff <= 300:
+        metadata_score += 3
+    elif duration_diff <= 600:
+        metadata_score += 2
+    elif duration_diff <= 900:
+        metadata_score += 1
+
+    return title_score + time_score + channel_score + min(metadata_score, 10)
 
 
 async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedProgram:
@@ -100,6 +223,7 @@ async def ConvertRowToRecordedProgram(row: dict[str, Any]) -> schemas.RecordedPr
         'id': row['rv_id'],
         'status': row['status'],
         'file_path': row['file_path'],
+        'storage_location': 'Cloud' if row['file_path'].startswith('/cloud-mounts/') else 'Local',
         'file_hash': row['file_hash'],
         'file_size': row['file_size'],
         'file_created_at': row['file_created_at'],
@@ -777,6 +901,116 @@ async def VideosSearchAPI(
 
 
 @router.get(
+    '/related',
+    summary = '関連録画番組 API',
+    response_description = '指定された録画番組と同一シリーズまたは関連する録画番組の情報のリスト。',
+    response_model = schemas.RecordedPrograms,
+)
+async def VideosRelatedAPI(
+    video_id: Annotated[int, Query(description='検索基準となる録画番組の ID 。')],
+    mode: Annotated[Literal['strict', 'relaxed'], Query(description='strict は同一シリーズ、relaxed は関連番組まで検索する。')] = 'strict',
+    include_other_channels: Annotated[bool, Query(description='他チャンネルの録画番組も検索対象に含めるかどうか。')] = False,
+    order: Annotated[Literal['desc', 'asc'], Query(description='ソート順序 (desc or asc) 。')] = 'desc',
+    page: Annotated[int, Query(description='ページ番号。', ge=1)] = 1,
+) -> schemas.RecordedPrograms:
+    """
+    HonomiTV の Series パネルと同じ条件で、関連する録画番組を 30 件ずつ取得する。
+
+    Args:
+        video_id (int): 検索基準となる録画番組 ID。
+        mode (Literal['strict', 'relaxed']): 同シリーズまたは関連番組の検索モード。
+        include_other_channels (bool): 他チャンネルの候補を含めるかどうか。
+        order (Literal['desc', 'asc']): 放送日時のソート順。
+        page (int): 1 始まりのページ番号。
+
+    Returns:
+        schemas.RecordedPrograms: 関連録画番組と検索条件に一致した総件数。
+    """
+
+    # Series パネルの検索基準を確定し、存在しない録画 ID は通常の詳細 API と同じ 422 にする。
+    current_program = await RecordedProgram.all() \
+        .select_related('channel') \
+        .get_or_none(id=video_id)
+    if current_program is None:
+        logging.warning(f'[VideosRouter][VideosRelatedAPI] Specified video_id was not found. [video_id: {video_id}]')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Specified video_id was not found',
+        )
+
+    # 他チャンネルを含めない場合、チャンネル不明の録画同士を同一局として推測しない。
+    if include_other_channels is False and current_program.channel_id is None:
+        return schemas.RecordedPrograms(total=0, recorded_programs=[])
+
+    candidates_query = RecordedProgram.all().select_related('channel')
+    if include_other_channels is False:
+        candidates_query = candidates_query.filter(channel_id=current_program.channel_id)
+
+    # SeriesIndexer が永続化した作品 ID を fuzzy 検索より優先する。
+    if current_program.series_id is not None:
+        series_ids = [current_program.series_id]
+        if mode == 'relaxed':
+            # relaxed は TMDb バインド作品の全 Season を対象にする (再生中の Season も含む)。
+            ## Series 行の tmdb_id / tmdb_media_type を参照し、同じ作品に属する Season の series_id をすべて引く。
+            ## TMDb 未バインドの作品は兄弟を引けないため、strict と同じ同一シリーズの範囲に留める
+            current_series = await Series.get_or_none(id=current_program.series_id)
+            if (
+                current_series is not None and
+                current_series.tmdb_id is not None and
+                current_series.tmdb_media_type is not None
+            ):
+                sibling_series_list = await Series.filter(
+                    tmdb_media_type=current_series.tmdb_media_type,
+                    tmdb_id=current_series.tmdb_id,
+                )
+                series_ids = [series.id for series in sibling_series_list]
+        candidates = await candidates_query.filter(series_id__in=series_ids)
+        related_programs = list(candidates)
+    else:
+        candidates = await candidates_query
+        score_threshold = 70 if mode == 'strict' else 50
+        related_programs = [
+            candidate
+            for candidate in candidates
+            if CalculateRelatedProgramScore(current_program, candidate) >= score_threshold
+        ]
+
+    # HonomiTV と同じく放送日時で並べた後にページングし、既存 VideosAPI で公開スキーマを構築する。
+    related_programs.sort(
+        key=lambda program: (program.start_time, program.id),
+        reverse=order == 'desc',
+    )
+    total = len(related_programs)
+    offset = (page - 1) * PAGE_SIZE
+    page_ids = [program.id for program in related_programs[offset:offset + PAGE_SIZE]]
+    if len(page_ids) == 0:
+        return schemas.RecordedPrograms(total=total, recorded_programs=[])
+
+    page_result = await VideosAPI(order='ids', page=1, ids=page_ids)
+
+    # 視聴パネルの話数表示用に、構造化 Episode を正本値で付与する (旧互換 episode_number は使わない)。
+    # 共有の VideosAPI 本体には触らず、関連番組の応答だけに必要な 1 回の追加クエリで賄う。
+    programs_with_episodes = await RecordedProgram.filter(id__in=page_ids).select_related('series_episode')
+    series_episodes_by_program_id = {
+        program.id: program.series_episode
+        for program in programs_with_episodes
+        if program.series_episode is not None
+    }
+    for recorded_program in page_result.recorded_programs:
+        series_episode = series_episodes_by_program_id.get(recorded_program.id)
+        if series_episode is not None:
+            recorded_program.series_episode = schemas.SeriesEpisode.model_validate(
+                series_episode,
+                from_attributes=True,
+            )
+
+    return schemas.RecordedPrograms(
+        total=total,
+        recorded_programs=page_result.recorded_programs,
+    )
+
+
+@router.get(
     '/{video_id}',
     summary = '録画番組 API',
     response_description = '録画番組の情報。',
@@ -884,13 +1118,34 @@ async def VideoPlaybackIndexCreateAPI(
     return index
 
 
+def GetRecordedFileDownloadMediaType(filename: str) -> str:
+    """
+    録画ダウンロードの Content-Type をファイル拡張子から決める。
+
+    Args:
+        filename (str): 録画ファイル名。
+
+    Returns:
+        str: 拡張子に対応する Content-Type。
+    """
+
+    suffix = pathlib.Path(filename).suffix.lower()
+    if suffix in ('.ts', '.m2ts'):
+        return 'video/mp2t'
+    if suffix == '.mp4':
+        return 'video/mp4'
+    if suffix == '.mkv':
+        return 'video/x-matroska'
+    return 'application/octet-stream'
+
+
 @router.get(
     '/{video_id}/download',
     summary = '録画番組ダウンロード API',
-    response_description = '録画番組の MPEG-TS ファイル。',
-    response_class = FileResponse,
+    response_description = '録画番組のファイル。',
+    response_class = DisconnectAwareFileResponse,
     responses = {
-        200: {'content': {'video/mp2t': {}}},
+        200: {'content': {'video/mp2t': {}, 'video/mp4': {}, 'video/x-matroska': {}, 'application/octet-stream': {}}},
         422: {'description': 'Specified video_id was not found'},
     },
 )
@@ -898,18 +1153,27 @@ async def VideoDownloadAPI(
     recorded_program: Annotated[RecordedProgram, Depends(GetRecordedProgram)],
 ):
     """
-    指定された録画番組の MPEG-TS ファイルをダウンロードする。
+    指定された録画番組のファイルをダウンロードする。
     """
 
-    # ファイルパスとファイル名を取得
-    file_path = recorded_program.recorded_video.file_path
-    filename = pathlib.Path(file_path).name
+    file_path = anyio.Path(await KonomiTVBS4KCloudTransferManager.resolvePath(
+        recorded_program.recorded_video.id, recorded_program.recorded_video.file_path,
+    ))
+    filename = file_path.name
 
-    # MPEG-TS ファイルをダウンロードさせる
-    return FileResponse(
-        path = file_path,
+    # 録画ファイルが消えていると FileResponse が 500 になるため、通常ファイルの存在を先に確認する
+    if await file_path.is_file() is False:
+        logging.error(f'[VideosRouter][VideoDownloadAPI] Recorded file was not found. path: {file_path}')
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='Specified video_id was not found',
+        )
+
+    # 録画ファイルをダウンロードさせる (切断検知で読み出しループを打ち切る)
+    return DisconnectAwareFileResponse(
+        path = str(file_path),
         filename = filename,
-        media_type = 'video/mp2t',
+        media_type = GetRecordedFileDownloadMediaType(filename),
     )
 
 
@@ -1005,10 +1269,9 @@ async def VideoJikkyoCommentsAPI(
             # PSI/SI の書庫があればそこから動画のカット編集情報を抽出して過去ログコメントのタイミングを調節する
             # TODO: コメントリストの時刻などは調節前のほうが望ましいので schemas.JikkyoComment に項目を追加すべき
             ## 書庫の解析に失敗しても過去ログコメント API 自体はエラーにせず、補正なしのコメントをそのまま返す
-            tot_time_list = await asyncio.to_thread(
-                ExtractTOTTimeListFromPSCArchive,
-                pathlib.Path(recorded_program.recorded_video.file_path).with_suffix('.psc'),
-            )
+            psc_path = await KonomiTVBS4KCloudCatalog.artifactPath(
+                recorded_program.recorded_video.id, recorded_program.recorded_video.file_path, '.psc')
+            tot_time_list = [] if psc_path is None else await asyncio.to_thread(ExtractTOTTimeListFromPSCArchive, psc_path)
 
             if len(tot_time_list) >= 2:
                 # TOT 時刻を開始時刻からの相対秒数に変換する
@@ -1210,8 +1473,9 @@ async def VideoDeleteAPI(
     """
     指定された録画番組のファイルとメタデータを削除する。不可逆な処理であるため、慎重に実行すること。
     - 録画ファイルに紐づくサムネイルファイルを削除
-    - 録画ファイルに関連する補助ファイル (.ts.program.txt, .ts.err) を削除
+    - 録画ファイル専用の番組情報・エラーログを削除
     - 録画ファイル本体を削除
+    - 録画専用のチャプター YAML を削除し、同じ基本名の録画が残っていなければ .vtt・.psc・.chapter.txt も削除
     - 全ファイルの削除完了後にデータベースから録画番組情報・録画ファイル情報を削除
 
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
@@ -1219,6 +1483,8 @@ async def VideoDeleteAPI(
 
     # 録画ファイルの情報を取得する
     # 実際の削除対象は DB に保存されたパスのままとし、スキャナーとの排他だけcanonical pathへ統一する
+    if KonomiTVBS4KCloudTransferManager.isActive(recorded_program.recorded_video.id):
+        raise HTTPException(409, 'Recording is owned by an unfinished cloud transfer.')
     file_path = anyio.Path(recorded_program.recorded_video.file_path)
     recorded_scan_task = RecordedScanTask()
     lock_file_path = await recorded_scan_task.resolveRecordedPath(file_path)
@@ -1227,7 +1493,14 @@ async def VideoDeleteAPI(
     file_dir = file_path.parent
 
     # スキャナーの解析・DB更新と削除を同じpath lockで直列化し、削除中のレコードが再生成される競合を防ぐ
-    async with recorded_scan_task.fileLock(lock_file_path):
+    async with recorded_scan_task.fileLock(lock_file_path), CMAnalysisOrchestrator.recordingLock(recorded_program.recorded_video.id):
+        if KonomiTVBS4KCloudTransferManager.isActive(recorded_program.recorded_video.id):
+            raise HTTPException(409, 'Recording is owned by an unfinished cloud transfer.')
+        is_cloud = str(file_path).startswith('/cloud-mounts/')
+        if is_cloud or KonomiTVBS4KCloudTransferManager.protects(recorded_program.recorded_video.id):
+            current = await RecordedVideo.get_or_none(id=recorded_program.recorded_video.id)
+            if current is None or current.file_path != str(file_path):
+                raise HTTPException(409, 'Recording location changed before deletion.')
         # 同じ file_hash の録画が存在する場合、共有サムネイルは削除しない
         duplicate_records = await RecordedProgram.filter(
             recorded_video__file_hash=file_hash,
@@ -1245,10 +1518,29 @@ async def VideoDeleteAPI(
             )
         recorded_program.recorded_video.status = 'Deleting'
 
-        deletion_stage = 'thumbnail files'
+        deletion_stage = 'playback index task'
         try:
-            # 1. サムネイルファイルを削除する
+            # 1. 元ファイルを開く索引・オフライン保存・通常再生を順に停止し、完了まで待つ。
+            # 各 Manager に削除バリアも立てるため、依存解決済みの競合要求から再生成されない。
+            recorded_video_id = recorded_program.recorded_video.id
+            await RecordedPlaybackIndexer.cancelByRecordedVideoID(recorded_video_id)
+            deletion_stage = 'offline jobs'
+            await KonomiTVBS4KOfflineJobManager.deleteByVideoID(recorded_program.id)
+            deletion_stage = 'playback sessions'
+            await RecordedFMP4Stream.destroyByRecordedProgramID(recorded_program.id)
+
+            # 2. 全生成 Task の回収後、60秒の通常猶予を待たず対象録画の fMP4 キャッシュを削除する。
+            deletion_stage = 'fMP4 cache files'
+            await RecordedFMP4CacheManager.deleteForRecordedVideo(recorded_program.recorded_video)
+
+            if is_cloud:
+                # mount経由のunlinkは行わず、固定した領域の削除マーカーを先に永続化してRCで回収する。
+                deletion_stage = 'cloud recording files'
+                await KonomiTVBS4KCloudCatalog.deleteFiles(recorded_video_id)
+
+            # 3. サムネイルファイルを削除する
             # 同じ file_hash を持つ他のレコードが存在する場合は共有中なのでスキップする
+            deletion_stage = 'thumbnail files'
             thumbnails_dir = anyio.Path(str(THUMBNAILS_DIR))
             if await thumbnails_dir.is_dir() and not has_duplicates:
                 # 通常サムネイル (.webp、旧仕様の .jpg)
@@ -1269,7 +1561,16 @@ async def VideoDeleteAPI(
             elif has_duplicates:
                 logging.info(f'[VideoDeleteAPI] Skip deleting thumbnail files because other records with the same file_hash exist: {file_hash}')
 
-            # 2. 関連する補助ファイルを削除する (.ts.program.txt, .ts.err)
+            if is_cloud:
+                # 未転送のローカル補助ファイルには触れない。所在と登録の除去は同じtransactionで行う。
+                deletion_stage = 'cloud database record'
+                async with in_transaction() as db:
+                    await KonomiTVBS4KCloudRecording.filter(recorded_video_id=recorded_video_id).using_db(db).delete()
+                    await recorded_program.delete(using_db=db)
+                await KonomiTVBS4KCloudTransferManager.refresh()
+                return
+
+            # 4. 録画の拡張子まで含む名前で対応付けられた、専用の補助ファイルを削除する
             deletion_stage = 'program information file'
             ts_program_txt_path = anyio.Path(f'{file_dir}/{file_name}.program.txt')
             if await ts_program_txt_path.is_file():
@@ -1280,7 +1581,7 @@ async def VideoDeleteAPI(
             if await ts_err_path.is_file():
                 await ts_err_path.unlink()
 
-            # 3. 録画ファイル本体を削除する
+            # 5. 録画ファイル本体を削除する
             deletion_stage = 'recorded video file'
             if await file_path.is_file():
                 await file_path.unlink()
@@ -1289,7 +1590,32 @@ async def VideoDeleteAPI(
                 # 再試行時は前回処理で録画本体だけ削除済みの場合があるため、存在しなくても処理を継続する
                 logging.warning(f'[VideoDeleteAPI] Recorded video file does not exist: {file_path}')
 
-            # 4. 全ファイルの削除完了後に DB レコードを削除する
+            # 6. 自動解析 YAML は録画の完全名に対応し、別コンテナの同名録画とは共有しない。
+            deletion_stage = 'recording chapter file'
+            chapter_path = anyio.Path(GetKonomiTVBS4KChapterPath(pathlib.Path(str(file_path))))
+            await chapter_path.unlink(missing_ok=True)
+
+            # 7. 本体の削除後に確認することで、同名録画の並行削除でも最後の処理が共有物を回収する。
+            # DB 未登録の録画も保護し、基本名の比較は外部チャプターの対応判定に合わせる。
+            deletion_stage = 'shared sidecar ownership check'
+            has_shared_recording = False
+            async for candidate in file_dir.iterdir():
+                if (candidate.stem.casefold() == file_path.stem.casefold() and
+                    candidate.suffix.lower() in RecordedScanTask.SCAN_TARGET_EXTENSIONS and
+                    await candidate.is_file()):
+                    has_shared_recording = True
+                    break
+            # 読み込み側と同じ名前だけを対象にし、並行した削除による不在は成功として扱う。
+            if not has_shared_recording:
+                for sidecar_path in (
+                    file_path.with_suffix('.vtt'),
+                    file_path.with_suffix('.psc'),
+                    anyio.Path(GetCMChapterPath(pathlib.Path(str(file_path)))),
+                ):
+                    deletion_stage = 'shared sidecar files'
+                    await sidecar_path.unlink(missing_ok=True)
+
+            # 8. 全ファイルの削除完了後に DB レコードを削除する
             # RecordedVideo も CASCADE 制約で削除される
             deletion_stage = 'database record'
             await recorded_program.delete()

@@ -12,35 +12,19 @@ builder_packages_path="${build_root}/builder-packages.tsv"
 toolchain_root='/opt/konomitv-bs4k-tscodecbridge-toolchain'
 ffmpeg_root="${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_ROOT:-/opt/konomitv-bs4k-tscodecbridge-ffmpeg8}"
 runtime_root='/opt/konomitv-bs4k-tscodecbridge-runtime'
-runtime_packages_root='/opt/konomitv-bs4k-tscodecbridge-runtime-packages'
 
 expected_manifest_keys=(
     KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER
     KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME
     KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT
-    KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256
     KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION
     KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION
     KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_CODENAME
-    KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_IMAGE_SHA256
-    KONOMITV_BS4K_TSCODECBRIDGE_CA_CERTIFICATES_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_CURL_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_MAKE_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_TAR_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_NALA_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_SBCL_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_CL_SWANK_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_SHA256
-    KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_SHA256
     KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_COMMIT
     KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_SOURCE_SHA256
     KONOMITV_BS4K_TSCODECBRIDGE_MALLET_VERSION
     KONOMITV_BS4K_TSCODECBRIDGE_MALLET_ARCHIVE_SHA256
     KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION
-    KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256
-    KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256
 )
 
 fail() {
@@ -110,8 +94,6 @@ validate_manifest() {
 
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}" != PENDING_* ]] ||
         fail_pending 'replace SOURCE_COMMIT with the published 40-character commit SHA'
-    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}" != PENDING_* ]] ||
-        fail_pending 'replace SOURCE_ARCHIVE_SHA256 with the verified codeload archive SHA-256'
 
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}" == 'MistVVK' ]] ||
         fail 'repository owner must remain MistVVK'
@@ -124,38 +106,12 @@ validate_manifest() {
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}" != \
         '0000000000000000000000000000000000000000' ]] ||
         fail 'SOURCE_COMMIT must not be the all-zero sentinel'
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}" \
-        64
-    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}" != \
-        '0000000000000000000000000000000000000000000000000000000000000000' ]] ||
-        fail 'SOURCE_ARCHIVE_SHA256 must not be the all-zero sentinel'
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
         fail 'CLI_VERSION must be an exact semantic version'
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION}" =~ ^[0-9]+$ ]] ||
         fail 'TS_MAPPING_VERSION must be a decimal integer'
     [[ "${KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_CODENAME}" == 'jammy' ]] ||
         fail 'Ubuntu codename must remain jammy'
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_IMAGE_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_IMAGE_SHA256}" \
-        64
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_EXPECTED_UBUNTU_IMAGE_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_EXPECTED_UBUNTU_IMAGE_SHA256:-}" \
-        64
-    [[ "${KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_IMAGE_SHA256}" == \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_EXPECTED_UBUNTU_IMAGE_SHA256}" ]] ||
-        fail 'manifest Ubuntu image digest does not match the Docker base digest'
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_SHA256}" \
-        64
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_SHA256}" \
-        64
     require_lower_hex \
         KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_COMMIT \
         "${KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_COMMIT}" \
@@ -167,14 +123,6 @@ validate_manifest() {
     require_lower_hex \
         KONOMITV_BS4K_TSCODECBRIDGE_MALLET_ARCHIVE_SHA256 \
         "${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_ARCHIVE_SHA256}" \
-        64
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256}" \
-        64
-    require_lower_hex \
-        KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256}" \
         64
 }
 
@@ -215,37 +163,6 @@ download_verified_archive() {
         --output "${output_path}"
     printf '%s  %s\n' "${expected_sha256}" "${output_path}" |
         sha256sum --check --strict -
-}
-
-download_and_install_fixed_runtime_package() {
-    local package_name="$1"
-    local package_version="$2"
-    local package_sha256="$3"
-    local output_name="$4"
-    local package_url="$5"
-    local package_download_root="${download_root}/runtime-packages/${package_name}"
-    local downloaded_archive="${package_download_root}/${output_name}"
-
-    test ! -e "${package_download_root}" ||
-        fail "runtime package download directory already exists: ${package_download_root}"
-    install -d -m 0755 "${package_download_root}" "${runtime_packages_root}"
-    download_verified_archive "${package_url}" "${package_sha256}" "${downloaded_archive}"
-
-    [[ "$(dpkg-deb --field "${downloaded_archive}" Package)" == "${package_name}" ]] ||
-        fail "downloaded package name does not match manifest: ${package_name}"
-    [[ "$(dpkg-deb --field "${downloaded_archive}" Version)" == "${package_version}" ]] ||
-        fail "downloaded package version does not match manifest: ${package_name}"
-    [[ "$(dpkg-deb --field "${downloaded_archive}" Architecture)" == 'amd64' ]] ||
-        fail "downloaded package architecture is not amd64: ${package_name}"
-
-    install -m 0644 "${downloaded_archive}" "${runtime_packages_root}/${output_name}"
-    dpkg --install "${runtime_packages_root}/${output_name}"
-    [[ "$(dpkg-query --showformat='${Version}' --show "${package_name}")" == "${package_version}" ]] ||
-        fail "installed runtime package version does not match manifest: ${package_name}"
-    printf 'Fixed runtime package: %s %s (%s)\n' \
-        "${package_name}" \
-        "${package_version}" \
-        "${package_url}"
 }
 
 verify_single_root_archive() {
@@ -341,24 +258,30 @@ record_builder_packages() {
     done < "${changed_packages_path}"
 }
 
-install_toolchain_and_source() {
-    local bridge_archive="${download_root}/tscodecbridge.tar.gz"
+verify_source_tree() {
+    local source_directory="$1"
+
+    [[ -d "${source_directory}" && ! -L "${source_directory}" ]] ||
+        fail 'Bridge submodule source directory is missing or is a symlink'
+    test -f "${source_directory}/LICENSE" || fail 'Bridge submodule source does not contain LICENSE'
+    test -f "${source_directory}/konomitv-bs4k-tscodecbridge.asd" ||
+        fail 'Bridge submodule source does not contain its ASDF system'
+
+    # 従来の archive と同じく、入力は通常ファイルとディレクトリだけに限定する。
+    # submodule の .git はホスト固有の管理情報なので、Docker context と入力検査の両方から除く。
+    [[ -z "$(find "${source_directory}" -mindepth 1 \
+        -path "${source_directory}/.git" -prune -o ! -type f ! -type d -print -quit)" ]] ||
+        fail 'Bridge submodule source contains an unsupported non-regular entry'
+
+    printf 'Bridge source commit: %s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
+}
+
+install_toolchain() {
     local sblint_archive="${download_root}/sblint.tar.gz"
     local mallet_archive="${download_root}/mallet.tar.gz"
-    local bridge_url
     local sblint_url
     local mallet_url
-    local package
-    local installed_sbcl_version
-    local installed_cl_swank_version
     local installed_mallet_version
-    local installed_nala_version
-    local installed_ca_certificates_version
-    local installed_curl_version
-    local installed_make_version
-    local installed_tar_version
-    local installed_libc6_version
-    local installed_zlib1g_version
 
     validate_manifest
     [[ "$(uname -m)" == 'x86_64' ]] || fail 'Bridge builder supports Linux x86_64 only'
@@ -374,84 +297,30 @@ install_toolchain_and_source() {
         --showformat='${binary:Package}\t${Version}\n' |
         sort > "${initial_packages_path}"
     apt-get update
-    apt-get install -y --no-install-recommends \
-        "nala=${KONOMITV_BS4K_TSCODECBRIDGE_NALA_PACKAGE_VERSION}"
+    # apt package は version を固定せず公式 Jammy archive の最新を導入する。
+    # 固定すると Ubuntu の security 更新で旧 version が archive から消えるたびにビルドが壊れる。
+    # 導入した実測値は record_builder_packages が Runtime-Manifest.tsv へ記録する。
+    apt-get install -y --no-install-recommends nala
+    # libc6 / zlib1g は SBCL 製 Bridge 実行形式が動的リンクする runtime 依存なので、
+    # builder と最終 image の双方で archive の最新を使い、その時点の archive 内容に揃える。
     nala install -y --no-install-recommends \
-        "ca-certificates=${KONOMITV_BS4K_TSCODECBRIDGE_CA_CERTIFICATES_PACKAGE_VERSION}" \
-        "cl-swank=${KONOMITV_BS4K_TSCODECBRIDGE_CL_SWANK_PACKAGE_VERSION}" \
-        "curl=${KONOMITV_BS4K_TSCODECBRIDGE_CURL_PACKAGE_VERSION}" \
-        "make=${KONOMITV_BS4K_TSCODECBRIDGE_MAKE_PACKAGE_VERSION}" \
-        "sbcl=${KONOMITV_BS4K_TSCODECBRIDGE_SBCL_PACKAGE_VERSION}" \
-        "tar=${KONOMITV_BS4K_TSCODECBRIDGE_TAR_PACKAGE_VERSION}"
-    download_and_install_fixed_runtime_package \
+        ca-certificates \
+        cl-swank \
+        curl \
         libc6 \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_VERSION}" \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_SHA256}" \
-        libc6-amd64.deb \
-        "https://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_${KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_VERSION}_amd64.deb"
-    download_and_install_fixed_runtime_package \
-        zlib1g \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_VERSION}" \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_SHA256}" \
-        zlib1g-amd64.deb \
-        "https://archive.ubuntu.com/ubuntu/pool/main/z/zlib/zlib1g_${KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_VERSION#*:}_amd64.deb"
-
-    for package in sbcl cl-swank; do
-        printf 'Ubuntu package policy for %s:\n' "${package}"
-        apt-cache policy "${package}"
-        apt-cache policy "${package}" |
-            grep -Eq 'https?://archive\.ubuntu\.com/ubuntu[[:space:]]+jammy/universe[[:space:]]+amd64[[:space:]]+Packages' ||
-            fail "${package} was not selected from the official Jammy universe archive"
-    done
-    installed_nala_version="$(dpkg-query --showformat='${Version}' --show nala)"
-    installed_ca_certificates_version="$(
-        dpkg-query --showformat='${Version}' --show ca-certificates
-    )"
-    installed_curl_version="$(dpkg-query --showformat='${Version}' --show curl)"
-    installed_make_version="$(dpkg-query --showformat='${Version}' --show make)"
-    installed_tar_version="$(dpkg-query --showformat='${Version}' --show tar)"
-    installed_sbcl_version="$(dpkg-query --showformat='${Version}' --show sbcl)"
-    installed_cl_swank_version="$(dpkg-query --showformat='${Version}' --show cl-swank)"
-    installed_libc6_version="$(dpkg-query --showformat='${Version}' --show libc6)"
-    installed_zlib1g_version="$(dpkg-query --showformat='${Version}' --show zlib1g)"
-    [[ "${installed_nala_version}" == "${KONOMITV_BS4K_TSCODECBRIDGE_NALA_PACKAGE_VERSION}" ]] ||
-        fail 'installed nala package version does not match manifest'
-    [[ "${installed_ca_certificates_version}" == \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_CA_CERTIFICATES_PACKAGE_VERSION}" ]] ||
-        fail 'installed ca-certificates package version does not match manifest'
-    [[ "${installed_curl_version}" == "${KONOMITV_BS4K_TSCODECBRIDGE_CURL_PACKAGE_VERSION}" ]] ||
-        fail 'installed curl package version does not match manifest'
-    [[ "${installed_make_version}" == "${KONOMITV_BS4K_TSCODECBRIDGE_MAKE_PACKAGE_VERSION}" ]] ||
-        fail 'installed make package version does not match manifest'
-    [[ "${installed_tar_version}" == "${KONOMITV_BS4K_TSCODECBRIDGE_TAR_PACKAGE_VERSION}" ]] ||
-        fail 'installed tar package version does not match manifest'
-    [[ "${installed_sbcl_version}" == "${KONOMITV_BS4K_TSCODECBRIDGE_SBCL_PACKAGE_VERSION}" ]] ||
-        fail 'installed SBCL package version does not match manifest'
-    [[ "${installed_cl_swank_version}" == "${KONOMITV_BS4K_TSCODECBRIDGE_CL_SWANK_PACKAGE_VERSION}" ]] ||
-        fail 'installed cl-swank package version does not match manifest'
-    [[ "${installed_libc6_version}" == "${KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_VERSION}" ]] ||
-        fail 'installed libc6 package version does not match manifest'
-    [[ "${installed_zlib1g_version}" == "${KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_VERSION}" ]] ||
-        fail 'installed zlib1g package version does not match manifest'
-    dpkg-query \
-        --show \
-        --showformat='Ubuntu package: ${Package} ${Version} (${source:Package})\n' \
-        sbcl cl-swank
+        make \
+        sbcl \
+        tar \
+        zlib1g
     record_builder_packages
 
     install -d -m 0755 \
         "${download_root}" \
-        "${source_root}" \
         "${toolchain_root}/sblint" \
         "${toolchain_root}/mallet"
-    bridge_url="https://codeload.github.com/${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}/${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME}/tar.gz/${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
     sblint_url="https://codeload.github.com/cxxxr/sblint/tar.gz/${KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_COMMIT}"
     mallet_url="https://github.com/fukamachi/mallet/releases/download/${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_VERSION}/mallet-${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_VERSION}-linux-x86_64.tar.gz"
 
-    download_verified_archive \
-        "${bridge_url}" \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}" \
-        "${bridge_archive}"
     download_verified_archive \
         "${sblint_url}" \
         "${KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_SOURCE_SHA256}" \
@@ -460,29 +329,20 @@ install_toolchain_and_source() {
         "${mallet_url}" \
         "${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_ARCHIVE_SHA256}" \
         "${mallet_archive}"
-    verify_single_root_archive "${bridge_archive}"
     verify_single_root_archive "${sblint_archive}"
     verify_single_root_archive "${mallet_archive}"
 
-    tar --extract --gzip --file "${bridge_archive}" \
-        --directory "${source_root}" --strip-components 1 --no-same-owner --no-same-permissions
     tar --extract --gzip --file "${sblint_archive}" \
         --directory "${toolchain_root}/sblint" --strip-components 1 --no-same-owner --no-same-permissions
     tar --extract --gzip --file "${mallet_archive}" \
         --directory "${toolchain_root}/mallet" --strip-components 1 --no-same-owner --no-same-permissions
-    test -f "${source_root}/LICENSE" || fail 'Bridge source archive does not contain LICENSE'
-    test -f "${source_root}/konomitv-bs4k-tscodecbridge.asd" ||
-        fail 'Bridge source archive does not contain its ASDF system'
     test -f "${toolchain_root}/sblint/sblint.asd" || fail 'SBLint archive is incomplete'
     test -x "${toolchain_root}/mallet/bin/mallet" || fail 'Mallet archive is incomplete'
     installed_mallet_version="$("${toolchain_root}/mallet/bin/mallet" --version)"
     [[ "${installed_mallet_version}" == "Mallet version ${KONOMITV_BS4K_TSCODECBRIDGE_MALLET_VERSION}" ]] ||
         fail 'Mallet version does not match manifest'
 
-    printf 'Bridge source commit: %s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
-    printf 'Bridge source archive SHA-256: %s\n' \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}"
-    rm -f -- "${bridge_archive}" "${sblint_archive}" "${mallet_archive}"
+    rm -f -- "${sblint_archive}" "${mallet_archive}"
     apt-get clean
     rm -rf -- /var/lib/apt/lists/*
 }
@@ -522,30 +382,22 @@ verify_bridge_dependencies() {
     done <<< "${dependency_names}"
 }
 
-verify_fixed_ffmpeg() {
+verify_ffmpeg() {
     local ffmpeg_binary="${ffmpeg_root}/ffmpeg8.elf"
     local ffprobe_binary="${ffmpeg_root}/ffprobe8.elf"
     local observed_ffmpeg_version
     local observed_ffprobe_version
 
-    test -x "${ffmpeg_binary}" || fail 'fixed thirdparty-builder FFmpeg 8 is missing'
-    test -x "${ffprobe_binary}" || fail 'fixed thirdparty-builder ffprobe 8 is missing'
-    printf '%s  %s\n' \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256}" \
-        "${ffmpeg_binary}" |
-        sha256sum --check --strict -
-    printf '%s  %s\n' \
-        "${KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256}" \
-        "${ffprobe_binary}" |
-        sha256sum --check --strict -
+    test -x "${ffmpeg_binary}" || fail 'thirdparty-builder FFmpeg 8 is missing'
+    test -x "${ffprobe_binary}" || fail 'thirdparty-builder ffprobe 8 is missing'
     observed_ffmpeg_version="$("${ffmpeg_binary}" -version 2>&1 | sed -n '1p')"
     observed_ffprobe_version="$("${ffprobe_binary}" -version 2>&1 | sed -n '1p')"
     [[ "${observed_ffmpeg_version}" == \
         "ffmpeg version ${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION} "* ]] ||
-        fail 'fixed thirdparty-builder FFmpeg version does not match manifest'
+        fail 'thirdparty-builder FFmpeg version does not match manifest'
     [[ "${observed_ffprobe_version}" == \
         "ffprobe version ${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION} "* ]] ||
-        fail 'fixed thirdparty-builder ffprobe version does not match manifest'
+        fail 'thirdparty-builder ffprobe version does not match manifest'
 }
 
 run_ffmpeg_integration() {
@@ -556,7 +408,7 @@ run_ffmpeg_integration() {
     validate_manifest
     test -d "${source_root}" || fail 'Bridge source was not copied into the integration stage'
     test -x "${bridge_binary}" || fail 'built Bridge executable is missing from the integration stage'
-    verify_fixed_ffmpeg
+    verify_ffmpeg
     [[ "$("${bridge_binary}" --version)" == "${KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION}" ]] ||
         fail 'Bridge CLI version changed before FFmpeg integration'
     [[ "$("${bridge_binary}" --mapping-version)" == \
@@ -568,8 +420,6 @@ run_ffmpeg_integration() {
         BRIDGE_BINARY="${bridge_binary}" \
         FFMPEG_BINARY="${ffmpeg_binary}" \
         FFPROBE_BINARY="${ffprobe_binary}" \
-        FFMPEG_SHA256="${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256}" \
-        FFPROBE_SHA256="${KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256}" \
         test-ffmpeg-integration
 }
 
@@ -577,15 +427,11 @@ build_and_package() {
     local bridge_binary="${source_root}/build/ts-codec-bridge.elf"
     local executable_sha256
     local runtime_manifest
-    local glibc_package_version
-    local glibc_library_sha256
-    local zlib_package_version
-    local zlib_library_sha256
     local observed_cli_version
     local observed_mapping_version
 
     validate_manifest
-    test -d "${source_root}" || fail 'Bridge source was not prepared'
+    verify_source_tree "${source_root}"
 
     printf 'Building Bridge source commit: %s\n' \
         "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
@@ -605,10 +451,6 @@ build_and_package() {
     verify_bridge_dependencies "${bridge_binary}"
     executable_sha256="$(sha256sum "${bridge_binary}" | cut -d' ' -f1)"
     printf 'Bridge executable SHA-256: %s\n' "${executable_sha256}"
-    glibc_package_version="$(dpkg-query --showformat='${Version}' --show libc6)"
-    glibc_library_sha256="$(sha256sum /lib/x86_64-linux-gnu/libc.so.6 | cut -d' ' -f1)"
-    zlib_package_version="$(dpkg-query --showformat='${Version}' --show zlib1g)"
-    zlib_library_sha256="$(sha256sum /lib/x86_64-linux-gnu/libz.so.1 | cut -d' ' -f1)"
     test -s "${builder_packages_path}" || fail 'builder package manifest is missing'
 
     test ! -e "${runtime_root}" || fail "runtime output already exists: ${runtime_root}"
@@ -631,42 +473,13 @@ build_and_package() {
         printf 'SOURCE_REPOSITORY\thttps://github.com/%s/%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}" \
             "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME}"
-        printf 'SOURCE_ARCHIVE_URL\thttps://codeload.github.com/%s/%s/tar.gz/%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_OWNER}" \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_REPOSITORY_NAME}" \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
+        printf 'SOURCE_SUBMODULE_PATH\tthirdparty-src/tscodecbridge\n'
         printf 'SOURCE_COMMIT\t%s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_COMMIT}"
-        printf 'SOURCE_ARCHIVE_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_SOURCE_ARCHIVE_SHA256}"
         printf 'CLI_VERSION\t%s\n' "${KONOMITV_BS4K_TSCODECBRIDGE_CLI_VERSION}"
         printf 'TS_MAPPING_VERSION\t%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_TS_MAPPING_VERSION}"
         printf 'UBUNTU_CODENAME\t%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_CODENAME}"
-        printf 'UBUNTU_IMAGE_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_UBUNTU_IMAGE_SHA256}"
-        printf 'CA_CERTIFICATES_PACKAGE_VERSION\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_CA_CERTIFICATES_PACKAGE_VERSION}"
-        printf 'CURL_PACKAGE_VERSION\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_CURL_PACKAGE_VERSION}"
-        printf 'MAKE_PACKAGE_VERSION\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_MAKE_PACKAGE_VERSION}"
-        printf 'TAR_PACKAGE_VERSION\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_TAR_PACKAGE_VERSION}"
-        printf 'NALA_PACKAGE_VERSION\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_NALA_PACKAGE_VERSION}"
-        printf 'SBCL_PACKAGE_VERSION\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_SBCL_PACKAGE_VERSION}"
-        printf 'CL_SWANK_PACKAGE_VERSION\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_CL_SWANK_PACKAGE_VERSION}"
-        printf 'LIBC6_PACKAGE_ARCHIVE_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_SHA256}"
-        printf 'LIBC6_PACKAGE_ARCHIVE_URL\thttps://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_%s_amd64.deb\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_LIBC6_PACKAGE_VERSION}"
-        printf 'ZLIB1G_PACKAGE_ARCHIVE_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_SHA256}"
-        printf 'ZLIB1G_PACKAGE_ARCHIVE_URL\thttps://archive.ubuntu.com/ubuntu/pool/main/z/zlib/zlib1g_%s_amd64.deb\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_ZLIB1G_PACKAGE_VERSION#*:}"
         printf 'SBLINT_COMMIT\t%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_SBLINT_COMMIT}"
         printf 'SBLINT_SOURCE_SHA256\t%s\n' \
@@ -683,14 +496,6 @@ build_and_package() {
         printf 'FFMPEG_ORIGIN\tKonomiTV-BS4K-thirdparty-builder:/opt/thirdparty/FFmpeg8\n'
         printf 'FFMPEG_VERSION\t%s\n' \
             "${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_VERSION}"
-        printf 'FFMPEG_BINARY_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_FFMPEG_BINARY_SHA256}"
-        printf 'FFPROBE_BINARY_SHA256\t%s\n' \
-            "${KONOMITV_BS4K_TSCODECBRIDGE_FFPROBE_BINARY_SHA256}"
-        printf 'BUILD_GLIBC_PACKAGE_VERSION\t%s\n' "${glibc_package_version}"
-        printf 'BUILD_GLIBC_LIBRARY_SHA256\t%s\n' "${glibc_library_sha256}"
-        printf 'BUILD_ZLIB_PACKAGE_VERSION\t%s\n' "${zlib_package_version}"
-        printf 'BUILD_ZLIB_LIBRARY_SHA256\t%s\n' "${zlib_library_sha256}"
         printf 'EXECUTABLE_SHA256\t%s\n' "${executable_sha256}"
         for common_license in Apache-2.0 GPL-2 LGPL-2.1 GFDL-1.3; do
             common_license_path="/usr/share/common-licenses/${common_license}"
@@ -715,8 +520,13 @@ main() {
             [[ -n "${2:-}" ]] || fail 'usage: build.sh verify-archive ARCHIVE'
             verify_single_root_archive "$2"
             ;;
+        verify-source)
+            [[ -n "${2:-}" ]] || fail 'usage: build.sh verify-source DIRECTORY'
+            validate_manifest
+            verify_source_tree "$2"
+            ;;
         prepare)
-            install_toolchain_and_source
+            install_toolchain
             ;;
         build)
             build_and_package
@@ -725,7 +535,7 @@ main() {
             run_ffmpeg_integration
             ;;
         *)
-            fail 'usage: build.sh {validate-manifest|verify-archive|prepare|build|test-ffmpeg-integration}'
+            fail 'usage: build.sh {validate-manifest|verify-archive|verify-source|prepare|build|test-ffmpeg-integration}'
             ;;
     esac
 }

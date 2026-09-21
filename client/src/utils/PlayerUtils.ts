@@ -63,6 +63,7 @@ type APIBaseVideoQuality = (
  * ライブストリーミング API で設定できる動画の画質
  */
 type LiveAPIVideoQuality = (
+    'original' |
     APIBaseVideoQuality |
     `${APIBaseVideoQuality}-10bit` |
     `${APIBaseVideoQuality}-24fps` |
@@ -276,13 +277,22 @@ export class PlayerUtils {
     }
 
 
+    /** 現在のブラウザで指定音声codecのMSE SourceBuffer作成に使うMIMEを返す。 */
+    static getKonomiTVBS4KPlaybackAudioMIMEType(
+        konomitv_bs4k_codec: KonomiTVBS4KPlaybackAudioCodec,
+    ): string {
+        // ISO BMFF の Opus sample entry と RFC 6381 codec string は大文字小文字を区別する Opus。
+        return konomitv_bs4k_codec === 'opus' ?
+            'audio/mp4; codecs="Opus"' :
+            'audio/mp4; codecs="mp4a.40.2"';
+    }
+
+
     /** 現在のブラウザが指定音声codecのMSE SourceBufferを作成できるか返す。 */
     static isKonomiTVBS4KPlaybackAudioCodecSupported(
         konomitv_bs4k_codec: KonomiTVBS4KPlaybackAudioCodec,
     ): boolean {
-        const konomitv_bs4k_mime_type = konomitv_bs4k_codec === 'opus' ?
-            `audio/mp4; codecs="${Utils.isSafari() ? 'Opus' : 'opus'}"` :
-            'audio/mp4; codecs="mp4a.40.2"';
+        const konomitv_bs4k_mime_type = this.getKonomiTVBS4KPlaybackAudioMIMEType(konomitv_bs4k_codec);
         return this.isKonomiTVBS4KPlaybackMIMETypeSupported(konomitv_bs4k_mime_type);
     }
 
@@ -415,7 +425,7 @@ export class PlayerUtils {
         if (player.quality === null) {
             return '1080p';
         }
-        const regex = /streams\/video\/[0-9]*\/(.*)\/playlist/;
+        const regex = /streams\/video\/[0-9]*\/([^/]+)\/playlist/;
         const match = player.quality.url.match(regex);
         return match ? (match[1] as VideoAPIVideoQuality) : '1080p';
     }

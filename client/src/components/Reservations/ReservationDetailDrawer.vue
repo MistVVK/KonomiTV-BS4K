@@ -113,9 +113,9 @@
             </v-card-title>
             <v-card-text class="pt-2 pb-0">
                 <div v-if="reservation" class="mb-4">
-                    <div class="text-h6 text-text mb-2"
+                    <div class="text-title-large text-text mb-2"
                         v-html="ProgramUtils.decorateProgramInfo(reservation.program, 'title')"></div>
-                    <div class="text-body-2 text-text-darken-1">
+                    <div class="text-body-medium text-text-darken-1">
                         {{ ProgramUtils.getProgramTime(reservation.program) }}
                     </div>
                 </div>

@@ -4,14 +4,14 @@
         Firefox Android の URL バー表示切替補正 (translate / bottom 上書き) を受け付けない。
         見た目に必要な stacked ボタンだけ Vuetify の v-btn を使い、容器は自前の fixed nav にする。
     -->
-    <nav class="bottom-navigation-container elevation-12">
+    <nav ref="navigationContainer" class="bottom-navigation-container elevation-4">
         <v-btn class="bottom-navigation-button" variant="text" stacked to="/tv/"
             :class="{'v-btn--active': $route.path.startsWith('/tv')}">
             <Icon icon="fluent:tv-20-regular" width="30px" />
             <span class="mt-1">テレビをみる</span>
         </v-btn>
         <v-btn class="bottom-navigation-button" variant="text" stacked to="/videos/"
-            :class="{'v-btn--active': $route.path.startsWith('/videos')}">
+            :class="{'v-btn--active': $route.path.startsWith('/videos') || $route.path.startsWith('/series')}">
             <Icon icon="fluent:movies-and-tv-20-regular" width="30px" />
             <span class="mt-1">ビデオをみる</span>
         </v-btn>
@@ -32,6 +32,33 @@
         </v-btn>
     </nav>
 </template>
+<script lang="ts" setup>
+
+import { nextTick, onMounted, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
+
+const route = useRoute();
+const navigationContainer = ref<HTMLElement | null>(null);
+
+// 横スクロール時も現在のページを示すボタンが必ず見える位置へ寄せる。
+const scrollActiveButtonIntoView = async (behavior: ScrollBehavior) => {
+    await nextTick();
+    const container = navigationContainer.value;
+    const activeButton = container?.querySelector<HTMLElement>('.v-btn--active');
+    if (container === null || activeButton === null || activeButton === undefined) return;
+    const left = activeButton.offsetLeft - (container.clientWidth - activeButton.offsetWidth) / 2;
+    container.scrollTo({left: Math.max(0, left), behavior});
+};
+
+onMounted(async () => {
+    await scrollActiveButtonIntoView('auto');
+});
+
+watch(() => route.path, async () => {
+    await scrollActiveButtonIntoView('smooth');
+});
+
+</script>
 <style lang="scss">
 
 .bottom-navigation-container .v-btn--active > .v-btn__overlay {
@@ -63,11 +90,18 @@
         width: calc(100% - 8px * 2);
         padding-bottom: env(safe-area-inset-bottom);
         box-sizing: content-box;
+        overflow-x: auto;
+        overscroll-behavior-x: contain;
+        scrollbar-width: none;
+
+        &::-webkit-scrollbar {
+            display: none;
+        }
     }
 
     .v-btn.bottom-navigation-button {
-        flex: 1 1 0;  // 均等に割り振る
-        min-width: 0 !important;
+        flex: 0 0 76px;
+        min-width: 76px !important;
         height: 100% !important;
         padding: 0 !important;
         border-radius: 0 !important;
@@ -75,6 +109,7 @@
         font-weight: bold;
         font-size: 10.5px;
         text-transform: none;
+        white-space: nowrap;
 
         &.v-btn--active {
             color: rgb(var(--v-theme-primary)) !important;

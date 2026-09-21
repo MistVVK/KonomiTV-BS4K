@@ -51,8 +51,8 @@ class KonomiTVBS4KTLVStreamPump:
         self._error: BaseException | None = None
         # 入力終了の debug ログに利用するストリーム固有プレフィックス。
         self._log_prefix = log_prefix
-        # 降雨対象局では LiveEncodingTask から渡された monitor へ生TLVを複製する。
-        # 対象外の局では helper を起動せず、エンコーダー入力だけを扱う。
+        # TLV ライブでは LiveEncodingTask から渡された monitor へ生TLVを複製する。
+        # 降雨対象外でも B60 / MH-EIT の番組色ヒントを継続監視する。
         self._rain_fallback_monitor = rain_fallback_monitor
 
         # Resolver が読み取ったデータも64KiB以下へ分割し、後続データと同じ上限・順序で管理する。

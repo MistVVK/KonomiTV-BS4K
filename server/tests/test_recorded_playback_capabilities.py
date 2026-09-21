@@ -9,6 +9,7 @@ from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 
 from app import schemas
+from app.config import ServerSettings
 from app.metadata.RecordedPlaybackIndexer import (
     RecordedPlaybackIndexAnalysisError,
     RecordedPlaybackIndexer,
@@ -31,13 +32,13 @@ def _reset_recorded_playback_probe_state(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_result', None)
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_individual_results', {})
+    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_individual_failure_timestamps', {})
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_signature', None)
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_signature_generation', 0)
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_inflight_tasks', {})
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_matrix_inflight_tasks', {})
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_selected_devices', {})
     monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_lock', asyncio.Lock())
-    monkeypatch.setattr(RecordedPlaybackCapabilityProbe, '_probe_semaphore', asyncio.Semaphore(2))
 
 
 def test_recorded_playback_capability_matrix() -> None:
@@ -120,8 +121,8 @@ def test_recorded_playback_amd_uses_mesa_without_proprietary_runtime(
     assert environment['LD_LIBRARY_PATH'].split(':')[0].endswith('/Library')
 
 
-def test_recorded_playback_amd_probe_uses_vaapi_download() -> None:
-    """AMF能力検査が実再生と同じVAAPIからsystem memoryへの境界を通ることを確認する。"""
+def test_recorded_playback_amd_probe_keeps_vaapi_frames() -> None:
+    """AMF能力検査がVAAPI面をencoderへ直接渡すことを確認する。"""
 
     command = RecordedPlaybackBackend.buildProbeCommand(
         'AMF',
@@ -134,9 +135,9 @@ def test_recorded_playback_amd_probe_uses_vaapi_download() -> None:
     assert command[0].endswith('/FFmpeg8/ffmpeg8-amd.sh')
     assert 'vaapi=recorded_vaapi:/dev/dri/renderD130' in command_text
     assert 'scale_vaapi' in command_text
-    assert 'hwdownload' in command_text
-    assert 'format=p010le' in command_text
-    assert 'hevc_amf' in command_text
+    assert 'hwdownload' not in command_text
+    assert command[command.index('-pix_fmt') + 1] == 'vaapi'
+    assert 'hevc_vaapi' in command_text
 
 
 def test_recorded_playback_qsv_probe_keeps_hardware_pixel_format() -> None:
@@ -278,6 +279,10 @@ def test_recorded_playback_capability_selects_device_per_codec_and_bit_depth(
         'app.streams.RecordedPlaybackCapabilities.asyncio.create_subprocess_exec',
         CreateProcess,
     )
+    # render node 固定指定は遅延 import される app.config.Config を参照するため、
+    # 未固定 (pin=None) の最小設定を返すよう差し替える
+    settings = ServerSettings.model_validate({}, context={'bypass_validation': True})
+    monkeypatch.setattr('app.config.Config', lambda: settings)
     RecordedPlaybackCapabilityProbe._selected_devices.clear()  # pyright: ignore[reportPrivateUsage]
 
     async def Verify() -> None:

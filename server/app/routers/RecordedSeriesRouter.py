@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
-from decimal import Decimal
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, cast
 
 from fastapi import (
     APIRouter,
@@ -14,51 +14,55 @@ from fastapi import (
     Response,
     status,
 )
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from tortoise import transactions
 from tortoise.expressions import Q
 from typing_extensions import TypedDict
 
 from app import logging, schemas
 from app.metadata.ai.episode_lookup import EpisodeLookupOutcome, IsPublicHTTPURL
 from app.metadata.ai.KonomiTVBS4KACPCredentials import KonomiTVBS4KACPImportProvider
+from app.metadata.AnalysisTaskTracker import AnalysisTaskHandle, AnalysisTaskTracker
 from app.metadata.RecordedEpisodeAutomation import (
     RecordedEpisodeAutomation,
-    RecordedEpisodeRelookupConflictError,
-    RecordedEpisodeRelookupDisabledError,
-    RecordedEpisodeRelookupNotFoundError,
-    RecordedEpisodeRelookupRateLimitedError,
+    RecordedEpisodeBackfillBusyError,
 )
 from app.metadata.RecordedEpisodeMessages import GetRecordedEpisodeErrorMessage
-from app.metadata.RecordedEpisodeResolver import (
-    RecordedEpisodeAssignmentStaleError,
-    RecordedEpisodeCrossSeriesError,
-    RecordedEpisodeInvalidNumberError,
-    RecordedEpisodeProgramNotFoundError,
-    RecordedEpisodeResolver,
-    RecordedEpisodeSeriesNotAssignedError,
-    RecordedEpisodeTargetNotFoundError,
-)
 from app.metadata.RecordedSeriesLocks import RECORDED_SERIES_RESOLUTION_LOCK
 from app.metadata.RecordedSeriesResolver import (
-    RecordedSeriesChannelUnavailableError,
-    RecordedSeriesInvalidTitleError,
-    RecordedSeriesMetadataStaleError,
     RecordedSeriesProgramNotFoundError,
     RecordedSeriesResolver,
-    RecordedSeriesResolverBusyError,
-    RecordedSeriesTargetNotFoundError,
-    RecordedSeriesTitleConflictError,
 )
 from app.metadata.RecordedSeriesSettings import (
+    IsBangumiExternalMetadataEnabled,
     RecordedSeriesSettings,
     RecordedSeriesSettingsResponse,
     RecordedSeriesSettingsStore,
 )
+from app.metadata.SeriesAIFallbackTask import (
+    SeriesAIFallbackBatchBusyError,
+    SeriesAIFallbackTask,
+)
+from app.metadata.SeriesIndexer import SeriesIndexer
+from app.models.KonomiTVBS4KBangumiEpisodeCompletion import (
+    KonomiTVBS4KBangumiEpisodeCompletion,
+)
 from app.models.RecordedEpisode import RecordedEpisodeResolution, SeriesEpisode
 from app.models.RecordedProgram import RecordedProgram
+from app.models.RecordedSeries import (
+    RecordedSeriesAIRequest,
+    RecordedSeriesResolution,
+    RecordedSeriesRule,
+)
 from app.models.Series import Series
+from app.models.SeriesAIFallback import SeriesAIFallback
+from app.models.SeriesAlias import SeriesAlias
+from app.models.SeriesBroadcastPeriod import SeriesBroadcastPeriod
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser
+from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+from app.utils.KonomiTVBS4KTmdbClient import KonomiTVBS4KTmdbClient
+from app.utils.KonomiTVBS4KTmdbStore import KonomiTVBS4KTmdbStore
 
 
 router = APIRouter(
@@ -70,6 +74,41 @@ NO_STORE_HEADERS = {"Cache-Control": "no-store"}
 MAX_API_KEY_LENGTH = 8192
 RECORDED_SERIES_MANAGEMENT_DEFAULT_PAGE_SIZE = 30
 RECORDED_SERIES_MANAGEMENT_MAX_PAGE_SIZE = 100
+# Indexer は外部待機を含まないため従来の有限上限を維持する。
+RECORDED_SERIES_PIPELINE_INDEXER_TIMEOUT_SECONDS = 90.0
+# AI と外部同期は開始時バックログの全件処理を基本とし、実測に基づく絶対上限だけを設ける。
+RECORDED_SERIES_PIPELINE_AI_FALLBACK_TIMEOUT_SECONDS = 10_800.0
+RECORDED_SERIES_PIPELINE_EXTERNAL_SYNC_TIMEOUT_SECONDS = 3_600.0
+RECORDED_SERIES_PIPELINE_EPISODE_BACKFILL_TIMEOUT_SECONDS = 10_800.0
+
+
+_recorded_series_pipeline_start_lock = asyncio.Lock()
+_recorded_series_pipeline_task: asyncio.Task[None] | None = None
+
+
+class RecordedSeriesPipelineRequest(BaseModel):
+    """シリーズ保守パイプラインで再評価する録画範囲。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    scope: Annotated[Literal['Unresolved', 'All'], Field()]
+
+
+class _RecordedSeriesPipelineSummary(TypedDict):
+    """単一executionへ保存する各段階の有限処理結果。"""
+
+    scope: Literal['Unresolved', 'All']
+    indexer_linked: int
+    ai_processed_groups: int
+    ai_remaining_groups: int
+    tmdb_matched_series: int
+    tmdb_remaining_series: int
+    bangumi_matched_series: int
+    bangumi_remaining_series: int
+    episode_resolved: int
+    episode_ai_requests: int
+    episode_skipped: int
+    episode_remaining_programs: int
 
 
 class RecordedSeriesStatusResponse(BaseModel):
@@ -78,21 +117,40 @@ class RecordedSeriesStatusResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     total: int
-    pending: int
-    resolved: int
-    not_series: int
-    needs_review: int
-    failed: int
+    assigned: int
+    unassigned: int
     episode_resolved: int
     episode_unknown: int
     episode_not_numbered: int
     episode_no_published_number: int
     episode_needs_review: int
     episode_failed: int
-    last_run_at: str | None
     episode_last_run_at: str | None
     is_running: bool
     is_episode_running: bool
+
+
+class RecordedSeriesTmdbAPIKeyBody(BaseModel):
+    """TMDb API キー設定ボディ。応答には絶対にエコーしない。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    api_key: Annotated[
+        str,
+        Field(min_length=1, max_length=KonomiTVBS4KTmdbStore.API_KEY_MAX_LENGTH),
+    ]
+
+
+class RecordedSeriesTmdbConnectionTestResponse(BaseModel):
+    """TMDb 接続試験結果（API キー非返却）。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    success: Annotated[bool, Field()]
+    latency_ms: Annotated[int, Field()]
+    message: Annotated[str, Field()]
+    http_status: Annotated[int | None, Field()]
+    error_code: Annotated[str | None, Field()]
 
 
 class RecordedSeriesNextProgramResponse(BaseModel):
@@ -114,27 +172,6 @@ class RecordedSeriesStandaloneProgram(BaseModel):
     start_time: datetime
     channel_id: str | None
     channel_name: str | None
-    resolution_status: (
-        Literal[
-            'Pending',
-            'Resolved',
-            'NotSeries',
-            'NeedsReview',
-            'Failed',
-        ]
-        | None
-    )
-    resolution_source: (
-        Literal[
-            'Rule',
-            'Local',
-            'EPG',
-            'MediaWiki',
-            'AI',
-            'Manual',
-        ]
-        | None
-    )
 
 
 class RecordedSeriesStandaloneProgramListResponse(BaseModel):
@@ -148,48 +185,21 @@ class RecordedSeriesStandaloneProgramListResponse(BaseModel):
     items: list[RecordedSeriesStandaloneProgram]
 
 
-class RecordedSeriesBackfillRequest(BaseModel):
-    """既存録画の一括判定方法。"""
+class RecordedSeriesDatabaseDeleteResponse(BaseModel):
+    """シリーズ DB 削除で消した表ごとの行数。録画本体は含まない。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    force: bool = False
-
-
-class RecordedSeriesAssignmentRequest(BaseModel):
-    """管理者が録画1件へ確定させるシリーズ所属。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    decision: Literal["Series", "NotSeries"]
-    series_id: Annotated[int | None, Field(gt=0)] = None
-    series_title: Annotated[str | None, Field(max_length=255)] = None
-
-    @model_validator(mode="after")
-    def validateTarget(self) -> Self:
-        """decisionに対して既存IDまたは新規タイトルの指定が一意であることを検証する。
-
-        Returns:
-            検証後のリクエスト自身。
-
-        Raises:
-            ValueError: Series指定の過不足、またはNotSeriesへの不要な対象指定がある場合。
-        """
-
-        if self.series_title is not None:
-            self.series_title = self.series_title.strip()
-            if self.series_title == "":
-                raise ValueError("series_title must not be blank.")
-        if self.decision == "Series":
-            if (self.series_id is None) == (self.series_title is None):
-                raise ValueError(
-                    "Series assignment requires exactly one of series_id or series_title."
-                )
-        elif self.series_id is not None or self.series_title is not None:
-            raise ValueError(
-                "NotSeries assignment cannot include series_id or series_title."
-            )
-        return self
+    series: int
+    series_episodes: int
+    series_aliases: int
+    series_broadcast_periods: int
+    series_ai_fallbacks: int
+    recorded_series_rules: int
+    recorded_series_resolutions: int
+    recorded_series_ai_requests: int
+    recorded_episode_resolutions: int
+    bangumi_episode_completions: int
 
 
 class RecordedSeriesManagementItem(BaseModel):
@@ -216,34 +226,6 @@ class RecordedSeriesManagementListResponse(BaseModel):
     page: int
     page_size: int
     items: list[RecordedSeriesManagementItem]
-
-
-class RecordedSeriesManagementUpdateRequest(BaseModel):
-    """管理者が変更できるSeries表示メタデータ。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    title: Annotated[str, Field(max_length=255)]
-    description: Annotated[str, Field(max_length=10000)]
-    expected_title: str
-    expected_description: str
-
-    @model_validator(mode="after")
-    def validateMetadata(self) -> Self:
-        """タイトルを正規化可能な非空文字列へ制限する。
-
-        Returns:
-            前後空白を除去したリクエスト自身。
-
-        Raises:
-            ValueError: タイトルが空白だけの場合。
-        """
-
-        self.title = self.title.strip()
-        self.description = self.description.strip()
-        if self.title == "":
-            raise ValueError("title must not be blank.")
-        return self
 
 
 class RecordedEpisodeAssignmentListResponse(BaseModel):
@@ -333,73 +315,6 @@ class RecordedEpisodeAssignmentResolution(BaseModel):
     ] | None
     error_code: str | None
     error_message: str | None
-
-
-class _RecordedEpisodeAssignmentRequestBase(BaseModel):
-    """全話数割当判断に共通する楽観ロック値。"""
-
-    model_config = ConfigDict(extra="forbid")
-
-    expected_series_id: Annotated[int, Field(gt=0)]
-    expected_series_episode_id: Annotated[int | None, Field(gt=0)]
-
-
-class RecordedEpisodeRelookupRequest(_RecordedEpisodeAssignmentRequestBase):
-    """録画1件のAI話数再検索を開始する楽観ロック付き要求。"""
-
-    override_manual: bool = False
-
-
-class RecordedEpisodeExistingAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """Series内の既存Episodeを選ぶ手動判断。"""
-
-    decision: Literal["ExistingEpisode"]
-    episode_id: Annotated[int, Field(gt=0)]
-
-
-class RecordedEpisodeStructuredAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """新しいシーズン・話数を入力する手動判断。"""
-
-    decision: Literal["StructuredEpisode"]
-    season_number: Annotated[int, Field(ge=0, le=2_147_483_647)]
-    episode_number: Annotated[Decimal, Field(ge=0, max_digits=10, decimal_places=3)]
-
-
-class RecordedEpisodeUnknownAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """この録画の話数を不明として確定する手動判断。"""
-
-    decision: Literal["Unknown"]
-
-
-class RecordedEpisodeNoPublishedNumberAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """公開話数のない録画を、任意のシーズンへ所属させる手動判断。"""
-
-    decision: Literal['NoPublishedNumber']
-    season_number: Annotated[int | None, Field(ge=0, le=2_147_483_647)] = None
-
-
-class RecordedEpisodeNotNumberedAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """話数番号制度を持たない録画を、任意のシーズンへ所属させる手動判断。"""
-
-    decision: Literal['NotNumbered']
-    season_number: Annotated[int | None, Field(ge=0, le=2_147_483_647)] = None
-
-
-class RecordedEpisodeAdoptAIAssignmentRequest(_RecordedEpisodeAssignmentRequestBase):
-    """保存済み AI レーンの提案を正本として採用する判断。"""
-
-    decision: Literal['AdoptAI']
-
-
-RecordedEpisodeAssignmentRequest = Annotated[
-    RecordedEpisodeExistingAssignmentRequest
-    | RecordedEpisodeStructuredAssignmentRequest
-    | RecordedEpisodeNoPublishedNumberAssignmentRequest
-    | RecordedEpisodeNotNumberedAssignmentRequest
-    | RecordedEpisodeUnknownAssignmentRequest
-    | RecordedEpisodeAdoptAIAssignmentRequest,
-    Field(discriminator='decision'),
-]
 
 
 class _RecordedSeriesProgramSummary(TypedDict):
@@ -502,6 +417,13 @@ async def ParseRecordedSeriesSettingsUpdate(
         )
 
     settings_body = dict(request_body)
+    # TMDb API キーは秘密のため設定本体では受理せず、専用エンドポイントへ誘導する。
+    if 'tmdb_api_key' in settings_body:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='Use PUT /api/recorded-series/settings/tmdb-api-key instead.',
+            headers=NO_STORE_HEADERS,
+        )
     # 旧クライアントの秘密・OpenAI 互換接続 field・日次制限は受理せず拒否する（クリーンブレーク）。
     rejected_keys = [
         key
@@ -530,6 +452,9 @@ async def ParseRecordedSeriesSettingsUpdate(
     settings_body.pop("ai_backend_auth_configured", None)
     settings_body.pop("ai_fallback_backend_service_name", None)
     settings_body.pop("ai_fallback_backend_auth_configured", None)
+    # 応答専用の TMDb キー表示は保存値へ持ち込まない。
+    settings_body.pop('tmdb_api_key_configured', None)
+    settings_body.pop('tmdb_api_key_masked', None)
 
     try:
         settings = RecordedSeriesSettings.model_validate(settings_body)
@@ -610,6 +535,7 @@ async def RecordedSeriesSettingsUpdateAPI(
     response.headers.update(NO_STORE_HEADERS)
     settings = await ParseRecordedSeriesSettingsUpdate(request)
     try:
+        bangumi_was_enabled = IsBangumiExternalMetadataEnabled()
         RecordedSeriesSettingsStore.saveSettings(settings)
     except ValueError as ex:
         raise HTTPException(
@@ -627,10 +553,129 @@ async def RecordedSeriesSettingsUpdateAPI(
             detail="Failed to save recorded series settings.",
             headers=NO_STORE_HEADERS,
         ) from ex
-    # 起動時に設定破損などでPending回収できなかった場合も、設定修復直後に再試行する。
-    await RecordedSeriesResolver.retryPendingRecovery()
+    # 起動時に重複送信を避けて中断扱いにした bundle も、明示的な設定保存後は再試行する。
     # 話数側は旧受理条件の保存済み提案を無課金昇格し、新規録画の保留だけを再評価する。
+    await SeriesAIFallbackTask.schedule(retry_cancelled=True)
     await RecordedEpisodeAutomation.settingsUpdated()
+    # 外部メタデータソースを TMDb 有効へ切り替えたときは、次のスキャンを待たずに照合を予約する。
+    ## TmdbOnly / BangumiOnly / None の判定と API キー未設定の skip は scheduleSeriesSync() 内で行う。
+    KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+    # Bangumi を再び有効にした場合も次の起動時スキャンまで待たず、既存の同期経路を再開する。
+    if not bangumi_was_enabled and IsBangumiExternalMetadataEnabled(settings):
+        from app.utils.KonomiTVBS4KBangumiClient import KonomiTVBS4KBangumiClient
+        KonomiTVBS4KBangumiClient.scheduleUserCollectionSync()
+
+
+@router.put(
+    '/settings/tmdb-api-key',
+    summary='TMDb API キー設定 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def RecordedSeriesTmdbAPIKeySetAPI(
+    body: RecordedSeriesTmdbAPIKeyBody,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """UI から受け取った TMDb API キーを Fernet ストアへ暗号化して保存する。
+
+    Args:
+        body: TMDb API キーを含むリクエスト。応答へは含めない。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        KonomiTVBS4KTmdbStore.save(api_key=body.api_key)
+    except ValueError as ex:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='TMDb API key is invalid.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    except OSError as ex:
+        logging.error(
+            '[RecordedSeriesTmdbAPIKeySetAPI] Failed to store TMDb API key:',
+            exc_info=ex,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to store TMDb API key.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+    # キーを保存したあとは、Bangumi 連携と同じく照合をバックグラウンドで開始する。
+    KonomiTVBS4KTmdbClient.scheduleSeriesSync()
+
+
+@router.delete(
+    '/settings/tmdb-api-key',
+    summary='TMDb API キー削除 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def RecordedSeriesTmdbAPIKeyDeleteAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """Fernet ストアから TMDb API キーを削除する。
+
+    削除後も既存の `tmdb_*` メタデータは残る。以降の TMDb 経路だけが skip される。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        KonomiTVBS4KTmdbStore.clear()
+    except OSError as ex:
+        logging.error(
+            '[RecordedSeriesTmdbAPIKeyDeleteAPI] Failed to delete TMDb API key:',
+            exc_info=ex,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to delete TMDb API key.',
+            headers=NO_STORE_HEADERS,
+        ) from ex
+
+
+@router.post(
+    '/settings/tmdb-connection-test',
+    summary='TMDb 接続試験 API',
+    response_model=RecordedSeriesTmdbConnectionTestResponse,
+)
+async def RecordedSeriesTmdbConnectionTestAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> RecordedSeriesTmdbConnectionTestResponse:
+    """保存済み TMDb API キーで TMDb へ実通信し、成否を返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        秘密を含まない接続試験結果。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    result = await KonomiTVBS4KTmdbClient.testConnection()
+    return RecordedSeriesTmdbConnectionTestResponse(
+        success=result.success,
+        latency_ms=result.latency_ms,
+        message=result.message,
+        http_status=result.http_status,
+        error_code=result.error_code,
+    )
 
 
 @router.delete(
@@ -830,7 +875,7 @@ async def RecordedSeriesStandaloneProgramListAPI(
     program_query = RecordedProgram.filter(
         series_id=None,
         recorded_video__status='Recorded',
-    ).prefetch_related('channel', 'series_resolution')
+    ).prefetch_related('channel')
     if normalized_query != '':
         program_query = program_query.filter(
             Q(title__icontains=normalized_query)
@@ -845,33 +890,6 @@ async def RecordedSeriesStandaloneProgramListAPI(
     )
     items: list[RecordedSeriesStandaloneProgram] = []
     for program in programs:
-        # series_resolution は型定義済みの reverse OneToOne。prefetch 済みで、
-        # 判定行が未作成の録画では None になる。
-        resolution = program.series_resolution
-        resolution_status: (
-            Literal['Pending', 'Resolved', 'NotSeries', 'NeedsReview', 'Failed'] | None
-        ) = None
-        resolution_source: (
-            Literal['Rule', 'Local', 'EPG', 'MediaWiki', 'AI', 'Manual'] | None
-        ) = None
-        if resolution is not None:
-            if resolution.status in {
-                'Pending',
-                'Resolved',
-                'NotSeries',
-                'NeedsReview',
-                'Failed',
-            }:
-                resolution_status = resolution.status
-            if resolution.source in {
-                'Rule',
-                'Local',
-                'EPG',
-                'MediaWiki',
-                'AI',
-                'Manual',
-            }:
-                resolution_source = resolution.source
         items.append(
             RecordedSeriesStandaloneProgram(
                 recorded_program_id=program.id,
@@ -882,8 +900,6 @@ async def RecordedSeriesStandaloneProgramListAPI(
                 channel_name=(
                     program.channel.name if program.channel is not None else None
                 ),
-                resolution_status=resolution_status,
-                resolution_source=resolution_source,
             ),
         )
     return RecordedSeriesStandaloneProgramListResponse(
@@ -964,7 +980,7 @@ async def RecordedSeriesManagementDetailAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> RecordedSeriesManagementItem:
-    """競合後の再編集にも使える、管理画面向けSeries最新情報を返す。"""
+    """管理画面向けSeries最新情報を返す。"""
 
     response.headers.update(NO_STORE_HEADERS)
     series = await Series.filter(id=series_id).first()
@@ -975,73 +991,6 @@ async def RecordedSeriesManagementDetailAPI(
             headers=NO_STORE_HEADERS,
         )
     return (await _buildRecordedSeriesManagementItems([series]))[0]
-
-
-@router.put(
-    "/series/{series_id}",
-    summary="録画シリーズ管理情報更新 API",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def RecordedSeriesManagementUpdateAPI(
-    series_id: Annotated[int, Path(gt=0, description="更新するSeries ID。")],
-    request: RecordedSeriesManagementUpdateRequest,
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
-    """Seriesの表示名と説明を、関連録画の表示名と原子的に更新する。
-
-    Args:
-        series_id: 更新対象のSeries ID。
-        request: 新しいタイトルと説明。
-        response: Cache-Controlヘッダーを設定するレスポンス。
-        _current_user: 管理者認証済みのユーザー。
-
-    Returns:
-        None
-
-    Raises:
-        HTTPException: Series不在、無効タイトル、競合、更新済み、またはResolver実行中の場合。
-    """
-
-    response.headers.update(NO_STORE_HEADERS)
-    try:
-        await RecordedSeriesResolver.updateSeriesMetadata(
-            series_id,
-            title=request.title,
-            description=request.description,
-            expected_title=request.expected_title,
-            expected_description=request.expected_description,
-        )
-    except RecordedSeriesTargetNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified series_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesTitleConflictError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Another series or recorded-series rule already uses the specified title.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesMetadataStaleError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Recorded series metadata was updated by another request.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesResolverBusyError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Recorded series resolution is currently busy.",
-            headers={**NO_STORE_HEADERS, "Retry-After": "5"},
-        ) from ex
-    except RecordedSeriesInvalidTitleError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Recorded series title is invalid.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
 
 
 @router.get(
@@ -1161,148 +1110,6 @@ async def RecordedEpisodeAssignmentListAPI(
     )
 
 
-@router.put(
-    "/programs/{recorded_program_id}/episode-assignment",
-    summary="録画シリーズ話数手動割当更新 API",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def RecordedEpisodeAssignmentUpdateAPI(
-    recorded_program_id: Annotated[int, Path(gt=0, description="録画番組の ID。")],
-    request: RecordedEpisodeAssignmentRequest,
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
-    """管理者の話数判断をSeries・Episodeの楽観ロック付きで保存する。
-
-    Args:
-        recorded_program_id: 更新対象のRecordedProgram ID。
-        request: 既存Episode、新規構造化話数、またはUnknownの判断。
-        response: Cache-Controlヘッダーを設定するレスポンス。
-        _current_user: 管理者認証済みのユーザー。
-
-    Returns:
-        None
-
-    Raises:
-        HTTPException: 録画・Episode不在、競合、別Series指定、または不正値の場合。
-    """
-
-    response.headers.update(NO_STORE_HEADERS)
-    episode_id = request.episode_id if request.decision == "ExistingEpisode" else None
-    if request.decision == 'StructuredEpisode':
-        season_number = request.season_number
-    elif request.decision == 'NoPublishedNumber':
-        season_number = request.season_number
-    elif request.decision == 'NotNumbered':
-        season_number = request.season_number
-    else:
-        season_number = None
-    episode_number = (
-        request.episode_number if request.decision == "StructuredEpisode" else None
-    )
-    try:
-        async with RECORDED_SERIES_RESOLUTION_LOCK:
-            await RecordedEpisodeResolver.assignProgramEpisode(
-                recorded_program_id,
-                expected_series_id=request.expected_series_id,
-                expected_series_episode_id=request.expected_series_episode_id,
-                decision=request.decision,
-                episode_id=episode_id,
-                season_number=season_number,
-                episode_number=episode_number,
-            )
-    except RecordedEpisodeProgramNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified recorded_program_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeTargetNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified episode_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeSeriesNotAssignedError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The recorded program is not assigned to a series.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeAssignmentStaleError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The series or episode assignment was updated by another request.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeCrossSeriesError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The specified episode belongs to another series.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeInvalidNumberError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="The episode assignment is invalid.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-
-
-@router.post(
-    "/programs/{recorded_program_id}/episode-relookup",
-    summary="録画1件の話数AI再検索 API",
-    response_model=schemas.AnalysisTaskAccepted,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def RecordedEpisodeRelookupAPI(
-    recorded_program_id: Annotated[
-        int, Path(gt=0, description="再検索する録画番組の ID。")
-    ],
-    request: RecordedEpisodeRelookupRequest,
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-) -> schemas.AnalysisTaskAccepted:
-    """録画1件の話数Web検索を楽観ロック付きでバックグラウンド開始する。"""
-
-    response.headers.update(NO_STORE_HEADERS)
-    try:
-        accepted = await RecordedEpisodeAutomation.startRelookup(
-            recorded_program_id,
-            expected_series_id=request.expected_series_id,
-            expected_series_episode_id=request.expected_series_episode_id,
-            override_manual=request.override_manual,
-        )
-    except RecordedEpisodeRelookupNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="The recorded program is not available for episode lookup.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeRelookupConflictError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The recorded program state conflicts with the episode lookup request.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeRelookupDisabledError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="AI episode number search is not available with the current settings.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedEpisodeRelookupRateLimitedError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="The daily AI request limit has been reached.",
-            headers={**NO_STORE_HEADERS, "Retry-After": "3600"},
-        ) from ex
-    return schemas.AnalysisTaskAccepted(
-        execution_id=accepted.execution_id,
-        reused=accepted.reused,
-    )
-
-
 @router.get(
     "/status",
     summary="録画シリーズ判定状況取得 API",
@@ -1312,75 +1119,452 @@ async def RecordedSeriesStatusAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> RecordedSeriesStatusResponse:
-    """録画シリーズ判定の件数、当日AI利用数、一括処理状態を返す。"""
+    """Indexer の所属件数と話数判定の件数を返す。旧 Resolver の区分は使わない。"""
 
     response.headers.update(NO_STORE_HEADERS)
-    series_status = await RecordedSeriesResolver.getStatus()
+    # 所属の正本は RecordedProgram.series_id。Resolution 表は集計しない。
+    total = await RecordedProgram.all().count()
+    assigned = await RecordedProgram.filter(series_id__not_isnull=True).count()
     episode_status = await RecordedEpisodeAutomation.getStatus()
-    return RecordedSeriesStatusResponse.model_validate(
-        {**series_status, **episode_status}
-    )
+    return RecordedSeriesStatusResponse.model_validate({
+        'total': total,
+        'assigned': assigned,
+        'unassigned': total - assigned,
+        'is_running': (
+            _recorded_series_pipeline_task is not None
+            and _recorded_series_pipeline_task.done() is False
+        ),
+        **episode_status,
+    })
 
 
 @router.post(
-    "/backfill",
-    summary="既存録画シリーズ一括判定 API",
+    '/pipeline',
+    summary='録画シリーズ保守パイプライン API',
     response_model=schemas.AnalysisTaskAccepted,
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def RecordedSeriesBackfillAPI(
-    request: RecordedSeriesBackfillRequest,
+async def RecordedSeriesPipelineAPI(
+    request: RecordedSeriesPipelineRequest,
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> schemas.AnalysisTaskAccepted:
-    """未判定・入力変更済みの既存録画をバックグラウンドで二段階判定する。"""
+    """指定範囲を4段階で再評価し、単一の解析履歴として開始する。
+
+    Args:
+        request: 未確定だけ、または全録画を処理する範囲。
+        response: no-storeを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        開始した解析履歴ID。
+
+    Raises:
+        HTTPException: 設定無効または関連処理の実行中。
+    """
+
+    global _recorded_series_pipeline_task
 
     response.headers.update(NO_STORE_HEADERS)
-    settings = RecordedSeriesSettingsStore.getSettings()
-    if (
-        settings.ai_enabled is False or
-        RecordedSeriesSettingsStore.isAIBackendConfigured(settings) is False
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail='AI backend is not configured for recorded series resolution.',
-            headers=NO_STORE_HEADERS,
+    async with _recorded_series_pipeline_start_lock:
+        if RecordedSeriesSettingsStore.getSettings().enabled is False:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='Recorded series indexing is disabled.',
+                headers=NO_STORE_HEADERS,
+            )
+        episode_status = await RecordedEpisodeAutomation.getStatus()
+        is_pipeline_running = (
+            _recorded_series_pipeline_task is not None
+            and _recorded_series_pipeline_task.done() is False
         )
-    accepted = await RecordedSeriesResolver.startBackfill(
-        trigger="Manual", force=request.force
-    )
-    return schemas.AnalysisTaskAccepted(
-        execution_id=accepted.execution_id,
-        reused=accepted.reused,
-    )
+        if (
+            is_pipeline_running
+            or SeriesAIFallbackTask.isBatchBusy()
+            or bool(episode_status['is_episode_running'])
+            or KonomiTVBS4KTmdbClient.hasRunningSync()
+            or KonomiTVBS4KBangumiClient.hasRunningSync()
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='Another recorded series maintenance operation is running.',
+                headers=NO_STORE_HEADERS,
+            )
+        handle = await AnalysisTaskTracker.start(
+            'BatchSeriesPipeline',
+            title=(
+                '未確定の録画を一括判定'
+                if request.scope == 'Unresolved'
+                else 'すべての録画を一括再判定'
+            ),
+            trigger='Maintenance',
+            initial_status='Queued',
+            inherit_parent=False,
+        )
+        _recorded_series_pipeline_task = asyncio.create_task(
+            _RunRecordedSeriesPipeline(handle, request.scope),
+        )
+        return schemas.AnalysisTaskAccepted(
+            execution_id=handle.execution.id,
+            reused=False,
+        )
 
 
-@router.post(
-    "/episodes/backfill",
-    summary="既存録画話数一括判定 API",
-    response_model=schemas.AnalysisTaskAccepted,
-    status_code=status.HTTP_202_ACCEPTED,
+async def _RunRecordedSeriesPipeline(
+    handle: AnalysisTaskHandle,
+    scope: Literal['Unresolved', 'All'],
+) -> None:
+    """有限な4段階を順次実行し、失敗時は後続を開始しない。
+
+    Args:
+        handle: 単一の親解析履歴。
+        scope: Indexerを再適用する録画範囲。
+
+    Returns:
+        None
+    """
+
+    global _recorded_series_pipeline_task
+
+    try:
+        async with AnalysisTaskTracker.track(
+            'BatchSeriesPipeline',
+            trigger='Maintenance',
+            existing_handle=handle,
+        ) as history:
+            await history.setStage('indexer_rebuild', 0.0)
+            async with asyncio.timeout(RECORDED_SERIES_PIPELINE_INDEXER_TIMEOUT_SECONDS):
+                linked_count = await SeriesIndexer.rebuild(
+                    scope=scope,
+                    schedule_background_tasks=False,
+                )
+            await history.setProgress(0.25)
+
+            await history.setStage('ai_fallback', 0.25)
+            ai_status = await SeriesAIFallbackTask.runBoundedBatch(
+                history,
+                retry_cancelled=True,
+                timeout_seconds=RECORDED_SERIES_PIPELINE_AI_FALLBACK_TIMEOUT_SECONDS,
+                progress_start=0.25,
+                progress_end=0.5,
+                schedule_external_sync=False,
+                schedule_episode_automation=False,
+            )
+            if (
+                ai_status['failed_count'] > 0
+                or (
+                    ai_status['state'] == 'Stopped'
+                    and ai_status['stopped_reason'] != 'StageTimeoutReached'
+                )
+            ):
+                raise RuntimeError('SeriesAIFallbackPartialFailure')
+
+            await history.setStage('external_sync', 0.5)
+            if (
+                KonomiTVBS4KTmdbClient.hasRunningSync()
+                or KonomiTVBS4KBangumiClient.hasRunningSync()
+            ):
+                raise RuntimeError('ExternalSyncBusy')
+
+            # 2サービスの開始時総数と完了数を共有し、作品1件の完了ごとに親progressを更新する。
+            external_progress_lock = asyncio.Lock()
+            tmdb_progress_ready = False
+            tmdb_processed_series = 0
+            tmdb_total_series = 0
+            tmdb_matched_series = 0
+            bangumi_progress_ready = False
+            bangumi_processed_series = 0
+            bangumi_total_series = 0
+            bangumi_matched_series = 0
+
+            async def UpdateExternalProgress(
+                source: Literal['Tmdb', 'Bangumi'],
+                processed: int,
+                total: int,
+                matched: int,
+            ) -> None:
+                """外部同期2経路の進捗を単一stageの範囲へ合成する。
+
+                Args:
+                    source: 進捗を通知した外部サービス。
+                    processed: 完了済みSeries数。
+                    total: 開始時の対象Series総数。
+                    matched: 今回照合できたSeries数。
+
+                Returns:
+                    None
+                """
+
+                nonlocal tmdb_progress_ready, tmdb_processed_series, tmdb_total_series, tmdb_matched_series
+                nonlocal bangumi_progress_ready, bangumi_processed_series, bangumi_total_series, bangumi_matched_series
+                async with external_progress_lock:
+                    if source == 'Tmdb':
+                        tmdb_progress_ready = True
+                        tmdb_processed_series = processed
+                        tmdb_total_series = total
+                        tmdb_matched_series = matched
+                    else:
+                        bangumi_progress_ready = True
+                        bangumi_processed_series = processed
+                        bangumi_total_series = total
+                        bangumi_matched_series = matched
+                    # 両方の開始時総数が確定する前は、後着側によるprogressの巻き戻りを避ける。
+                    if tmdb_progress_ready and bangumi_progress_ready:
+                        processed_total = tmdb_processed_series + bangumi_processed_series
+                        target_total = tmdb_total_series + bangumi_total_series
+                        stage_fraction = processed_total / target_total if target_total > 0 else 1.0
+                        await history.setProgress(0.5 + 0.25 * stage_fraction)
+
+            tmdb_sync_task = KonomiTVBS4KTmdbClient.startPipelineSync(
+                progress_callback=lambda processed, total, matched: UpdateExternalProgress(
+                    'Tmdb', processed, total, matched,
+                ),
+            )
+            bangumi_sync_task = KonomiTVBS4KBangumiClient.startPipelineSync(
+                progress_callback=lambda processed, total, matched: UpdateExternalProgress(
+                    'Bangumi', processed, total, matched,
+                ),
+            )
+            external_item_failure_count = 0
+            external_sync_timeout = asyncio.timeout(RECORDED_SERIES_PIPELINE_EXTERNAL_SYNC_TIMEOUT_SECONDS)
+            try:
+                try:
+                    async with external_sync_timeout:
+                        tmdb_failed_series, bangumi_failed_series = await asyncio.gather(
+                            tmdb_sync_task,
+                            bangumi_sync_task,
+                        )
+                        external_item_failure_count = tmdb_failed_series + bangumi_failed_series
+                except TimeoutError:
+                    if external_sync_timeout.expired() is False:
+                        raise
+                    # 絶対上限では現在の外部待機を止め、未完了数をsummaryへ残して後続へ進む。
+                    pass
+            finally:
+                # timeout・片側失敗でも同期taskを裏で継続させず、両方を回収してから失敗させる。
+                for sync_task in (tmdb_sync_task, bangumi_sync_task):
+                    if sync_task.done() is False:
+                        sync_task.cancel()
+                await asyncio.gather(tmdb_sync_task, bangumi_sync_task, return_exceptions=True)
+            await history.setProgress(0.75)
+            # 回復可能な作品単位エラーでは開始時スナップショットを全走査し、
+            ## 後続stageへ進める前に既存の部分失敗契約へ載せる。
+            if external_item_failure_count > 0:
+                raise RuntimeError('ExternalSyncPartialFailure')
+
+            await history.setStage('episode_backfill', 0.75)
+            try:
+                episode_summary = await RecordedEpisodeAutomation.runBoundedBackfill(
+                    history,
+                    progress_start=0.75,
+                    progress_end=1.0,
+                    timeout_seconds=RECORDED_SERIES_PIPELINE_EPISODE_BACKFILL_TIMEOUT_SECONDS,
+                )
+            except RecordedEpisodeBackfillBusyError as ex:
+                raise RuntimeError('EpisodeBackfillBusy') from ex
+            if episode_summary['failed'] > 0:
+                raise RuntimeError('EpisodeBackfillPartialFailure')
+
+            ai_remaining_groups = max(
+                0,
+                ai_status['total_groups'] - ai_status['processed_groups'],
+            )
+            summary = _RecordedSeriesPipelineSummary(
+                scope=scope,
+                indexer_linked=linked_count,
+                ai_processed_groups=ai_status['processed_groups'],
+                ai_remaining_groups=ai_remaining_groups,
+                tmdb_matched_series=tmdb_matched_series,
+                tmdb_remaining_series=max(0, tmdb_total_series - tmdb_processed_series),
+                bangumi_matched_series=bangumi_matched_series,
+                bangumi_remaining_series=max(0, bangumi_total_series - bangumi_processed_series),
+                episode_resolved=episode_summary['resolved'],
+                episode_ai_requests=episode_summary['ai_requests'],
+                episode_skipped=episode_summary['skipped'],
+                episode_remaining_programs=episode_summary['remaining'],
+            )
+            await history.finish(summary=cast(dict[str, object], summary))
+    except asyncio.CancelledError:
+        raise
+    except Exception as ex:
+        logging.error('[RecordedSeriesPipeline] Pipeline failed.', exc_info=ex)
+    finally:
+        _recorded_series_pipeline_task = None
+
+
+async def StopRecordedSeriesPipeline() -> None:
+    """サーバー終了前に実行中パイプラインを中断状態へ閉じる。
+
+    Returns:
+        None
+    """
+
+    global _recorded_series_pipeline_task
+
+    task = _recorded_series_pipeline_task
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    _recorded_series_pipeline_task = None
+
+
+@router.delete(
+    "/database",
+    summary="シリーズデータベース削除 API",
+    response_model=RecordedSeriesDatabaseDeleteResponse,
 )
-async def RecordedEpisodeBackfillAPI(
-    request: RecordedSeriesBackfillRequest,
+async def RecordedSeriesDatabaseDeleteAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-) -> schemas.AnalysisTaskAccepted:
-    """Series所属済みの既存録画を対象に、話数Web検索をバックグラウンド開始する。"""
+) -> RecordedSeriesDatabaseDeleteResponse:
+    """シリーズ関連データだけを単一トランザクションで削除する。
+
+    録画本体・サムネイル・CM 解析・視聴履歴・ユーザー/チャンネルは残し、
+    番組のシリーズ関連列だけ NULL 化する。Indexer 再適用は自動起動しない。
+    """
 
     response.headers.update(NO_STORE_HEADERS)
     try:
-        accepted = await RecordedEpisodeAutomation.startBackfill(force=request.force)
-    except RecordedEpisodeRelookupDisabledError as ex:
+        async with _recorded_series_pipeline_start_lock:
+            counts = await _DeleteSeriesDatabase()
+    except _SeriesDatabaseBusyError as ex:
+        busy_detail = {
+            'AIFallbackRunning': 'Series AI fallback batch is running.',
+            'EpisodeBackfillRunning': 'Episode backfill is running.',
+            'PipelineRunning': 'Recorded series maintenance pipeline is running.',
+        }[ex.reason]
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail='AI episode number search is not available with the current settings.',
+            detail=busy_detail,
             headers=NO_STORE_HEADERS,
         ) from ex
-    return schemas.AnalysisTaskAccepted(
-        execution_id=accepted.execution_id,
-        reused=accepted.reused,
-    )
+    return RecordedSeriesDatabaseDeleteResponse.model_validate({
+        'series': counts['series'],
+        'series_episodes': counts['series_episodes'],
+        'series_aliases': counts['series_aliases'],
+        'series_broadcast_periods': counts['series_broadcast_periods'],
+        'series_ai_fallbacks': counts['series_ai_fallbacks'],
+        'recorded_series_rules': counts['recorded_series_rules'],
+        'recorded_series_resolutions': counts['recorded_series_resolutions'],
+        'recorded_series_ai_requests': counts['recorded_series_ai_requests'],
+        'recorded_episode_resolutions': counts['recorded_episode_resolutions'],
+        'bangumi_episode_completions': counts['bangumi_episode_completions'],
+    })
+
+
+class _SeriesDatabaseBusyError(Exception):
+    """削除中に走らせてはいけないバッチが実行中のため削除できない。"""
+
+    def __init__(
+        self,
+        reason: Literal['AIFallbackRunning', 'EpisodeBackfillRunning', 'PipelineRunning'],
+    ) -> None:
+        """実行中バッチの種別を保持する。
+
+        Args:
+            reason: 409 の原因となった実行中バッチ。
+        """
+
+        super().__init__(reason)
+        # 呼び出し元の HTTP 変換が参照する実行中バッチ種別。
+        self.reason = reason
+
+
+class _SeriesDatabaseDeleteCounts(TypedDict):
+    """シリーズ DB 削除で消した行数の概要。録画本体の行数は含まない。"""
+
+    series: int
+    series_episodes: int
+    series_aliases: int
+    series_broadcast_periods: int
+    series_ai_fallbacks: int
+    recorded_series_rules: int
+    recorded_series_resolutions: int
+    recorded_series_ai_requests: int
+    recorded_episode_resolutions: int
+    bangumi_episode_completions: int
+
+
+async def _DeleteSeriesDatabase() -> _SeriesDatabaseDeleteCounts:
+    """シリーズ関連データを排他境界の中で削除し、件数概要を返す。
+
+    補完バッチの batch lock を非待機で取得し、話数解決 lock を保持したまま
+    判定・commit・cache clear を行う。実行中バッチがある場合は待たずに失敗
+    し、新規バッチ開始は lock で直列化する。開始済み backfill の最初の解決は
+    lock に止まり、削除確定後の状態で安全に skip する。話数の実行中判定は
+    lock 待ちの前後で行い、完了後の status だけでの可否判断にしない。
+
+    Returns:
+        表ごとの削除行数。
+
+    Raises:
+        _SeriesDatabaseBusyError: AI 補完バッチまたは話数一括判定の実行中。
+    """
+
+    # 話数一括判定・単票再検索の実行中は resolution lock 待ちへ入る前に拒否する。
+    ## 完了後の status だけでは実行中を見逃すため、lock 保持中に再判定する。
+    if (
+        _recorded_series_pipeline_task is not None
+        and _recorded_series_pipeline_task.done() is False
+    ):
+        raise _SeriesDatabaseBusyError('PipelineRunning')
+    pre_delete_status = await RecordedEpisodeAutomation.getStatus()
+    if bool(pre_delete_status['is_episode_running']):
+        raise _SeriesDatabaseBusyError('EpisodeBackfillRunning')
+    try:
+        # holdBatchExclusion() は非待機で取得する。実行中は待たずに例外で失敗する。
+        async with SeriesAIFallbackTask.holdBatchExclusion():
+            async with RECORDED_SERIES_RESOLUTION_LOCK:
+                # lock 待ちの間に開始・終了した話数バッチを最終判定する。
+                episode_status = await RecordedEpisodeAutomation.getStatus()
+                if bool(episode_status['is_episode_running']):
+                    raise _SeriesDatabaseBusyError('EpisodeBackfillRunning')
+                async with transactions.in_transaction() as connection:
+                    # CASCADE で録画本体が消えないよう、先に番組側の関連列だけ NULL 化する。
+                    ## episode_number は Indexer が EPG から再導出するため、再適用で復元する。
+                    await RecordedProgram.all().using_db(connection).update(
+                        series_id=None,
+                        series_broadcast_period_id=None,
+                        series_title=None,
+                        episode_number=None,
+                        series_episode_id=None,
+                        bangumi_episode_id=None,
+                    )
+                    counts = _SeriesDatabaseDeleteCounts(
+                        series=await Series.all().using_db(connection).count(),
+                        series_episodes=await SeriesEpisode.all().using_db(connection).count(),
+                        series_aliases=await SeriesAlias.all().using_db(connection).count(),
+                        series_broadcast_periods=await SeriesBroadcastPeriod.all().using_db(connection).count(),
+                        series_ai_fallbacks=await SeriesAIFallback.all().using_db(connection).count(),
+                        recorded_series_rules=await RecordedSeriesRule.all().using_db(connection).count(),
+                        recorded_series_resolutions=await RecordedSeriesResolution.all().using_db(connection).count(),
+                        recorded_series_ai_requests=await RecordedSeriesAIRequest.all().using_db(connection).count(),
+                        recorded_episode_resolutions=await RecordedEpisodeResolution.all().using_db(connection).count(),
+                        bangumi_episode_completions=await KonomiTVBS4KBangumiEpisodeCompletion.all().using_db(connection).count(),
+                    )
+                    # 子表から親表の順に消し、外部キー制約の有無に依らず成立させる。
+                    await RecordedEpisodeResolution.all().using_db(connection).delete()
+                    await RecordedSeriesAIRequest.all().using_db(connection).delete()
+                    await RecordedSeriesResolution.all().using_db(connection).delete()
+                    await RecordedSeriesRule.all().using_db(connection).delete()
+                    await SeriesAIFallback.all().using_db(connection).delete()
+                    await KonomiTVBS4KBangumiEpisodeCompletion.all().using_db(connection).delete()
+                    await SeriesAlias.all().using_db(connection).delete()
+                    await SeriesBroadcastPeriod.all().using_db(connection).delete()
+                    await SeriesEpisode.all().using_db(connection).delete()
+                    await Series.all().using_db(connection).delete()
+
+                # commit 成功後に確定 cache を破棄する。rollback 時は古い cache を残す。
+                ## batch lock 保持中のため、破棄後の再充填は起きない。
+                SeriesAIFallbackTask.clearResolvedAssignments()
+                logging.info(
+                    '[RecordedSeriesDatabase] Deleted series database. '
+                    f'[series: {counts["series"]}]',
+                )
+                return counts
+    except SeriesAIFallbackBatchBusyError:
+        raise _SeriesDatabaseBusyError('AIFallbackRunning') from None
 
 
 @router.get(
@@ -1419,65 +1603,3 @@ async def RecordedSeriesNextProgramAPI(
             headers=NO_STORE_HEADERS,
         ) from ex
     return RecordedSeriesNextProgramResponse(recorded_program_id=next_program_id)
-
-
-@router.put(
-    "/programs/{recorded_program_id}/assignment",
-    summary="録画シリーズ手動割当更新 API",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def RecordedSeriesAssignmentUpdateAPI(
-    recorded_program_id: Annotated[int, Path(gt=0, description="録画番組の ID 。")],
-    request: RecordedSeriesAssignmentRequest,
-    response: Response,
-    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
-):
-    """管理者の確定判断で録画1件を既存・新規Series、または単発番組へ変更する。
-
-    Args:
-        recorded_program_id: 変更対象のRecordedProgram ID。
-        request: Series指定またはNotSeries指定。
-        response: Cache-Controlヘッダーを設定するレスポンス。
-        _current_user: 管理者認証済みのユーザー。
-
-    Returns:
-        None
-
-    Raises:
-        HTTPException: 録画・Series不在、チャンネル不明、または無効なタイトルの場合。
-    """
-
-    response.headers.update(NO_STORE_HEADERS)
-    try:
-        await RecordedSeriesResolver.assignProgram(
-            recorded_program_id,
-            decision=request.decision,
-            series_id=request.series_id,
-            series_title=request.series_title,
-        )
-        if request.decision == "Series":
-            await RecordedEpisodeAutomation.enqueue(recorded_program_id)
-    except RecordedSeriesProgramNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified recorded_program_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesTargetNotFoundError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Specified series_id was not found.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except RecordedSeriesChannelUnavailableError as ex:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="The recorded program has no channel and cannot be assigned to a series.",
-            headers=NO_STORE_HEADERS,
-        ) from ex
-    except (RecordedSeriesInvalidTitleError, ValueError) as ex:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Recorded series assignment is invalid.",
-            headers=NO_STORE_HEADERS,
-        ) from ex

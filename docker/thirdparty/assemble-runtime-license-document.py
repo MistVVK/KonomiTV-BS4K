@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 
@@ -13,7 +14,7 @@ INTEL_NONFREE_WARNING_START = '<!-- INTEL_NONFREE_WARNING_START -->'
 INTEL_NONFREE_WARNING_END = '<!-- INTEL_NONFREE_WARNING_END -->'
 AMD_NONFREE_WARNING_START = '<!-- AMD_NONFREE_WARNING_START -->'
 AMD_NONFREE_WARNING_END = '<!-- AMD_NONFREE_WARNING_END -->'
-NONFREE_PROFILES = ('nonfree', 'free', 'intel-nonfree', 'amd-nonfree')
+NONFREE_PROFILES = ('nonfree', 'free')
 DOCUMENT_TITLE = '# Third-Party Software Licenses'
 CONTROL_CHARACTERS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
 ATX_HEADING = re.compile(r'^(#{1,6})[ \t]+(.+?)\s*$')
@@ -22,8 +23,13 @@ FENCE_OPEN = re.compile(r'^ {0,3}(`{3,}|~{3,})')
 
 def readDocument(path: Path) -> str:
     document = path.read_text(encoding='utf-8')
+    # 上流由来の文字化けが残っていても文書の結合は続行する
+    # (ライセンス文書の体裁の問題でビルドを止めない)。
     if '\ufffd' in document:
-        raise ValueError(f'Document contains a Unicode replacement character: {path}')
+        print(
+            f'WARNING: Document contains a Unicode replacement character: {path}',
+            file=sys.stderr,
+        )
 
     # GNU ライセンス原文などでは U+000C が印刷時の改ページとして使われる。
     # HTML/Markdown に安全に埋め込めるよう改行へ正規化し、意味のある本文は変更しない。
@@ -116,16 +122,18 @@ def ValidateDocumentHierarchy(path: Path, document: str, *, contains_title: bool
         previous_level = level
 
 
-def AssembleNonfreeWarning(base_document: str, profile: str) -> tuple[str, int]:
+def AssembleNonfreeWarning(base_document: str, *, intel_nonfree: bool, amd_nonfree: bool) -> tuple[str, int]:
     """
-    基礎文書の警告ブロックをプロファイルに合わせて組み立て直す。
+    基礎文書の警告ブロックを実際に含まれるベンダー非自由コンポーネントに合わせて組み立て直す。
 
     警告ブロックは見出しを共通にして、Intel Full Feature 節と AMD proprietary 節だけを
-    プロファイルに応じて出し分ける。マーカーは完成文書へ残さずすべて除去する。
+    vendor flag に応じて出し分ける。どちらも含まない構成ではブロックごと除去する。
+    マーカーは完成文書へ残さずすべて除去する。
 
     Args:
         base_document (str): 警告ブロックを含む基礎文書
-        profile (str): NONFREE_PROFILES のいずれかのプロファイル名
+        intel_nonfree (bool): Intel 非自由カーネルを含むか
+        amd_nonfree (bool): AMD proprietary runtime を含むか
 
     Returns:
         tuple[str, int]: 警告ブロックを置換した文書と、警告ブロック末尾の文字位置
@@ -134,8 +142,8 @@ def AssembleNonfreeWarning(base_document: str, profile: str) -> tuple[str, int]:
     outer_start = base_document.index(NONFREE_WARNING_START)
     outer_end_marker_start = base_document.index(NONFREE_WARNING_END)
     outer_end = outer_end_marker_start + len(NONFREE_WARNING_END)
-    if profile == 'free':
-        # free プロファイルはブロックごと除去し、プロファイルカードを文書タイトルの直後へ置く
+    if not intel_nonfree and not amd_nonfree:
+        # 非自由コンポーネントを含まない構成（redeploy可能）はブロックごと除去し、プロファイルカードを文書タイトルの直後へ置く
         base_document = base_document[:outer_start] + base_document[outer_end:]
         if not base_document.startswith(DOCUMENT_TITLE + '\n'):
             raise ValueError(f'Base document must start with {DOCUMENT_TITLE!r}.')
@@ -156,8 +164,9 @@ def AssembleNonfreeWarning(base_document: str, profile: str) -> tuple[str, int]:
     amd_part = base_document[amd_start + len(AMD_NONFREE_WARNING_START):amd_end_marker_start]
     tail_part = base_document[amd_end:outer_end_marker_start]
 
-    include_intel = profile in ('nonfree', 'intel-nonfree')
-    include_amd = profile in ('nonfree', 'amd-nonfree')
+    # 再配布警告は実際に含まれるベンダーでのみ組み立てる。profile 文字列の分岐は持たない。
+    include_intel = intel_nonfree
+    include_amd = amd_nonfree
     sections = [heading_part.strip('\n')]
     if include_intel:
         sections.append(intel_part.strip('\n'))
@@ -180,6 +189,8 @@ def main() -> None:
     parser.add_argument('--manifest', type=Path, action='append', default=[])
     parser.add_argument('--cuda-version', required=True)
     parser.add_argument('--nonfree-profile', required=True, choices=NONFREE_PROFILES)
+    parser.add_argument('--intel-nonfree', required=True, choices=('true', 'false'))
+    parser.add_argument('--amd-nonfree', required=True, choices=('true', 'false'))
     args = parser.parse_args()
 
     base_document = readDocument(args.base)
@@ -193,11 +204,16 @@ def main() -> None:
         manifest_documents.append((manifest, manifest_document))
     cuda_version = args.cuda_version.replace('-', '.')
     profile = args.nonfree_profile
-    if profile in ('nonfree', 'intel-nonfree'):
+    # 文書の記述は profile 文字列ではなく vendor flag から決める。
+    # profile=nonfree かつ flag 両 false（未指定警告のみで通る構成）でも、
+    # 警告も専用節も出さず、Profile 表示だけ nonfree のまま実構成と一致させる。
+    intel_nonfree = args.intel_nonfree == 'true'
+    amd_nonfree = args.amd_nonfree == 'true'
+    if intel_nonfree:
         intel_media_driver = 'Full Feature iHD (`ENABLE_NONFREE_KERNELS=ON`)'
     else:
         intel_media_driver = 'Free Kernel iHD (`ENABLE_NONFREE_KERNELS=OFF`)'
-    if profile in ('nonfree', 'amd-nonfree'):
+    if amd_nonfree:
         amd_media_runtime = 'AMD proprietary runtime'
     else:
         amd_media_runtime = 'Mesa'
@@ -213,7 +229,9 @@ def main() -> None:
 
     # 非自由コンポーネントを含む場合は、再配布警告を読んだ直後にビルド条件を確認できるよう警告全体の直後へ配置する
     # 警告ブロックはプロファイルに合わせて節を出し分けてから、プロファイルカードの挿入位置をその直後に決める
-    base_document, target_insertion_point = AssembleNonfreeWarning(base_document, profile)
+    base_document, target_insertion_point = AssembleNonfreeWarning(
+        base_document, intel_nonfree=intel_nonfree, amd_nonfree=amd_nonfree,
+    )
     base_document = (
         base_document[:target_insertion_point].rstrip() + '\n\n' + target_document + '\n\n' +
         base_document[target_insertion_point:].lstrip()

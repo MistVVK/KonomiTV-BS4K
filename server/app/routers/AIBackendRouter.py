@@ -1,8 +1,8 @@
-"""AI バックエンド（OpenCode service / ACP）管理 API。
+"""AI バックエンド（OpenCode service / OpenAI 互換 HTTP / ACP）管理 API。
 
 含む: service CRUD / APIキー set・delete / OAuth 開始・callback・切断 /
-OpenCode auth 注入と DELETE /auth/{id} 連動 / health・availability /
-provider カタログ（OpenCode Web 相当の認証方式選択）/
+OpenCode auth.json の直接管理 / CLI availability /
+models.dev provider カタログ（保存済み認証方式を含む）/
 draft 接続試験（Phase 2）/ 月次利用量 GET（Phase 3）/
 ACP 固定プリセット（Codex / Grok）の設定・認証・接続試験。
 """
@@ -18,6 +18,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app import logging
 from app.metadata.ai.ACPSettings import ACPSettings, ACPSettingsStore
+from app.metadata.ai.ai_failure_recovery import (
+    AIRecoveryAttemptSummary,
+    FormatRecoveryAttemptSummary,
+)
 from app.metadata.ai.AIAPIUsageLedger import (
     AIAPIUsageLedger,
     CurrentYearMonth,
@@ -44,22 +48,32 @@ from app.metadata.ai.KonomiTVBS4KACPCredentials import (
     KonomiTVBS4KACPCredentials,
     KonomiTVBS4KACPImportProvider,
 )
+from app.metadata.ai.openai_compatible import OpenAICompatibleBackend
+from app.metadata.ai.OpenAICompatibleSettings import (
+    OpenAICompatible2SettingsStore,
+    OpenAICompatibleSettings,
+    OpenAICompatibleSettingsResponse,
+    OpenAICompatibleSettingsStore,
+)
 from app.metadata.ai.opencode_backend import (
     BuildOpenCodeBackendFromDraft,
     BuildOpenCodeBackendFromServiceID,
 )
-from app.metadata.ai.opencode_client import (
-    OpenCodeClient,
-    OpenCodeClientError,
+from app.metadata.ai.opencode_cli import (
+    OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED,
+    OpenCodeCLI,
+    OpenCodeCLIError,
     OpenCodeUnavailableError,
 )
-from app.metadata.ai.opencode_serve import (
-    IsOpenCodeAvailable,
-    ProbeOpenCodeAvailability,
+from app.metadata.ai.opencode_runtime import (
+    IsOpenCodeCLIAvailable,
+    ProbeOpenCodeCLIAvailability,
     SyncKonomiTVBS4KOpenCodeRuntimeConfig,
 )
 from app.metadata.ai.recorded_series_ai import (
     GetACPCredentialOperationLock,
+    GetAcpModelCatalog,
+    IsACPBackendKindRunning,
     IsACPOperationRunning,
     get_audit_model,
     get_episode_lookup_provider_fingerprint,
@@ -70,6 +84,7 @@ from app.metadata.ai.recorded_series_ai import (
 )
 from app.metadata.RecordedSeriesCandidates import RecordedSeriesAIError
 from app.metadata.RecordedSeriesSettings import (
+    AIBackendKind,
     RecordedSeriesSettings,
 )
 from app.models.RecordedSeries import RecordedSeriesAIRequest
@@ -106,6 +121,28 @@ NO_STORE_HEADERS = {'Cache-Control': 'no-store'}
 MAX_API_KEY_LENGTH = 8192
 
 
+def _BuildConnectionTestProofSettings(
+    backend_kind: AIBackendKind,
+    *,
+    service_id: str | None = None,
+) -> RecordedSeriesSettings:
+    """接続試験で実測する単一 backend target の proof 条件を返す。
+
+    Args:
+        backend_kind: 接続試験する backend 種別。
+        service_id: OpenCode 接続試験で使用する service UUID。
+
+    Returns:
+        回復設定を含まない target 単体の設定。
+    """
+
+    return RecordedSeriesSettings(
+        ai_enabled=True,
+        ai_backend=backend_kind,
+        ai_backend_service_id=service_id if backend_kind == 'OpenCode' else None,
+    )
+
+
 class AIBackendAPIKeyBody(BaseModel):
     """API キー設定ボディ。応答には絶対にエコーしない。"""
 
@@ -114,18 +151,26 @@ class AIBackendAPIKeyBody(BaseModel):
     api_key: Annotated[str, Field(min_length=1, max_length=MAX_API_KEY_LENGTH)]
 
 
+class OpenAICompatibleConnectionTestRequest(BaseModel):
+    """保存済み OpenAI 互換 HTTP 設定を使う接続試験リクエスト。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    capability: Annotated[
+        Literal['CandidateSelection', 'EpisodeLookup'],
+        Field(),
+    ] = 'CandidateSelection'
+
+
 class OpenCodeAvailabilityResponse(BaseModel):
-    """製品用 opencode serve の availability。"""
+    """製品用 OpenCode CLI の availability。"""
 
     model_config = ConfigDict(extra='forbid')
 
     available: bool
-    base_url: str
-    host: str
-    port: int
+    transport: Literal['CLI']
     version: str | None
     pinned_version: str
-    pid: int | None
     workspace: str
 
 
@@ -217,6 +262,22 @@ class OAuthCallbackRequest(BaseModel):
     code: Annotated[str | None, Field(max_length=4096)] = None
 
 
+class OAuthStatusResponse(BaseModel):
+    """進行中の OAuth device authorization の状態応答 (token は含めない)。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    provider_id: str
+    # authorize 時に解決した method index。
+    method: int | None = None
+    # None = セッション未開始。client は Succeeded/Failed/Timeout で poll を終える。
+    status: Literal['None', 'InProgress', 'Succeeded', 'Failed', 'Timeout'] = 'None'
+    url: str | None = None
+    instructions: str | None = None
+    # Failed / Timeout 時の秘密を含まない理由。
+    error: str | None = None
+
+
 class AIBackendProviderModelResponse(BaseModel):
     """service 追加 UI 用の provider モデル 1 件。"""
 
@@ -238,7 +299,7 @@ class AIBackendProviderAuthMethodResponse(BaseModel):
 
     model_config = ConfigDict(extra='forbid')
 
-    # OpenCode /provider/auth の method index。Vertex など合成 method は null。
+    # 既存 auth.json entry の method index。直接管理・Vertex など合成 method は null。
     method_index: int | None = None
     # OpenCode method type または vertex_adc。
     type: Annotated[Literal['api', 'oauth', 'vertex_adc'], Field()]
@@ -400,13 +461,42 @@ class ACPBackendConnectionTestRequest(BaseModel):
     ] = 'CandidateSelection'
 
 
-def _httpErrorFromOpenCode(error: OpenCodeClientError) -> HTTPException:
-    """OpenCodeClientError を HTTPException へ写像する。"""
+class ACPReasoningEffortResponse(BaseModel):
+    """Codex / Grok ACP が広告した推論深さ1件。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    reasoning_effort_id: Annotated[str, Field(min_length=1, max_length=255)]
+    reasoning_effort_name: Annotated[str, Field(min_length=1, max_length=255)]
+
+
+class ACPModelResponse(BaseModel):
+    """Codex / Grok ACP が広告したモデルと推論深さ。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    model_id: Annotated[str, Field(min_length=1, max_length=255)]
+    model_name: Annotated[str, Field(min_length=1, max_length=255)]
+    current_reasoning_effort_id: Annotated[str, Field(min_length=1, max_length=255)]
+    reasoning_efforts: list[ACPReasoningEffortResponse]
+
+
+class ACPModelCatalogResponse(BaseModel):
+    """Codex / Grok ACP の session/new から取得したモデル別カタログ。"""
+
+    model_config = ConfigDict(extra='forbid')
+
+    current_model_id: Annotated[str, Field(min_length=1, max_length=255)]
+    models: list[ACPModelResponse]
+
+
+def _httpErrorFromOpenCode(error: OpenCodeCLIError) -> HTTPException:
+    """OpenCodeCLIError を HTTPException へ写像する。"""
 
     if isinstance(error, OpenCodeUnavailableError):
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='OpenCode serve is unavailable.',
+            detail='OpenCode CLI is unavailable.',
             headers=NO_STORE_HEADERS,
         )
     code = error.status_code or status.HTTP_502_BAD_GATEWAY
@@ -540,18 +630,19 @@ def _BuildAuthMethodsForProvider(
     env_names: list[str],
     raw_auth_methods: list[dict[str, Any]] | None,
 ) -> tuple[list[AIBackendProviderAuthMethodResponse], str, str | None]:
-    """provider に出す認証方式を OpenCode Web 相当に組み立てる。
+    """provider に出す listener-free 経路の認証方式を組み立てる。
 
     方針:
     - API キーのみ: ベストエフォートで出す
-    - OAuth: ベストエフォートで出す（prompts 付き method は除外）
+    - OAuth: auth.json に既存 token がある provider に加え、device flow を確認済みの
+      allowlist provider には新規 OAuth 開始の選択肢も出す
     - Vertex 系: VertexAdc のみ（ADC は Docker env 前提）
     - それ以外の面倒な認証: UnsupportedComplex
 
     Args:
         provider_id: OpenCode provider ID。
         env_names: provider.env。
-        raw_auth_methods: GET /provider/auth の当該 provider 配列。
+        raw_auth_methods: auth.json の値を除いた保存済み方式。
 
     Returns:
         (auth_methods, support_kind, support_note)。
@@ -573,7 +664,13 @@ def _BuildAuthMethodsForProvider(
             None,
         )
 
-    if provider_id in _COMPLEX_UNSUPPORTED_PROVIDER_IDS:
+    # github-copilot は Enterprise URL 等の prompts 付き method を持つため本来は複雑認証だが、
+    # 既定の GitHub.com への device flow は method index だけで開始できる (prompts 回答不要)
+    # ことが実測で確認済みのため、device flow allowlist 上の provider だけは例外として通す。
+    if (
+        provider_id in _COMPLEX_UNSUPPORTED_PROVIDER_IDS and
+        provider_id not in OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED
+    ):
         return (
             [],
             'UnsupportedComplex',
@@ -608,6 +705,32 @@ def _BuildAuthMethodsForProvider(
                     auth_mode='OAuthSubscription',
                     billing_mode_default='Subscription',
                 ))
+
+    # allowlist 上の provider は auth.json に entry がなくても新規 OAuth 開始の選択肢を出す。
+    # method_index は開始時に ephemeral serve の /provider/auth からラベル解決するため None。
+    # API キー入力の併記は pin が API method を広告する provider (openai・xai) に限る。
+    # github-copilot は pin の認証定義が OAuth のみのため API fallback を追加しない
+    # (広告しない接続不能な方式を UI に出さない)。
+    if provider_id in OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED:
+        if (
+            provider_id not in _COMPLEX_UNSUPPORTED_PROVIDER_IDS and
+            any(method.type == 'api' for method in methods) is False
+        ):
+            methods.append(AIBackendProviderAuthMethodResponse(
+                method_index=None,
+                type='api',
+                label='Manually enter API Key',
+                auth_mode='ApiKey',
+                billing_mode_default='Metered',
+            ))
+        if any(method.type == 'oauth' for method in methods) is False:
+            methods.append(AIBackendProviderAuthMethodResponse(
+                method_index=None,
+                type='oauth',
+                label=OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED[provider_id],
+                auth_mode='OAuthSubscription',
+                billing_mode_default='Subscription',
+            ))
 
     if methods:
         note = None
@@ -645,11 +768,11 @@ def _BuildProviderCatalog(
     catalog_payload: dict[str, Any],
     auth_methods_by_provider: dict[str, list[dict[str, Any]]],
 ) -> list[AIBackendProviderResponse]:
-    """GET /provider + /provider/auth から UI 用カタログを組み立てる。
+    """models.dev cache と auth.json metadata から UI 用カタログを組み立てる。
 
     Args:
-        catalog_payload: OpenCode GET /provider の JSON。
-        auth_methods_by_provider: GET /provider/auth の整形結果。
+        catalog_payload: models.dev provider catalog と接続済み ID。
+        auth_methods_by_provider: auth.json の値を除いた認証方式。
 
     Returns:
         provider 応答のリスト（provider_name でソート）。
@@ -704,8 +827,7 @@ def _BuildProviderCatalog(
                 if isinstance(item, str) and item.strip() != ''
             ]
         models, default_model_id = _ExtractProviderModels(provider_id, raw.get('models'))
-        # 現行 OpenCode は provider ごとの既定を payload.default に返す。
-        # 旧 payload / テスト fixture の model.default は fallback として維持する。
+        # models.dev cache に provider 既定があれば採用し、model.default を fallback とする。
         default_model_id = default_model_ids.get(provider_id, default_model_id)
         auth_methods, support_kind, support_note = _BuildAuthMethodsForProvider(
             provider_id,
@@ -728,7 +850,7 @@ def _BuildProviderCatalog(
 
 
 async def _SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange() -> None:
-    """service CRUD 後に runtime config を再生成し、必要なら OpenCode へ反映する。
+    """service CRUD 後に次回 CLI 起動用 runtime config を再生成する。
 
     Returns:
         None
@@ -737,15 +859,8 @@ async def _SyncKonomiTVBS4KOpenCodeConfigAfterServiceChange() -> None:
         OSError: runtime config の生成・保存に失敗した場合。
     """
 
-    changed = SyncKonomiTVBS4KOpenCodeRuntimeConfig()
-    if changed is False or IsOpenCodeAvailable() is False:
-        return
-    try:
-        await OpenCodeClient().reloadConfiguration()
-    except OpenCodeClientError as error:
-        # 設定ファイルは更新済みで、次回 serve 起動または auth 更新時には反映される。
-        # service 自体を巻き戻すより安全なため警告に留める。
-        logging.warning(f'[AIBackend] Failed to reload OpenCode runtime config: {error}')
+    # 常駐 process は無く、各 `opencode run` が起動時にこの設定を読み直す。
+    SyncKonomiTVBS4KOpenCodeRuntimeConfig()
 
 
 async def _removeOpenCodeAuthIfUnshared(provider_id: str, *, excluding_service_id: str | None) -> None:
@@ -761,16 +876,16 @@ async def _removeOpenCodeAuthIfUnshared(provider_id: str, *, excluding_service_i
             f'(still referenced by {remaining} service(s)).',
         )
         return
-    client = OpenCodeClient()
+    client = OpenCodeCLI()
     try:
         await client.deleteAuth(provider_id)
     except OpenCodeUnavailableError:
-        # serve 停止中は secrets 側は消済み。再試行可能な警告を残す。
+        # CLI runtime を準備できない場合も secrets 側は削除済みなので、再試行可能な警告を残す。
         logging.warning(
-            f'[AIBackend] OpenCode unavailable while deleting auth for provider={provider_id}.',
+            f'[AIBackend] OpenCode CLI unavailable while deleting auth for provider={provider_id}.',
         )
         raise
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         logging.warning(
             f'[AIBackend] Failed to delete OpenCode auth for provider={provider_id}: {error}',
         )
@@ -779,17 +894,17 @@ async def _removeOpenCodeAuthIfUnshared(provider_id: str, *, excluding_service_i
 
 @router.get(
     '/health',
-    summary='OpenCode serve availability API',
+    summary='OpenCode CLI availability API',
     response_model=OpenCodeAvailabilityResponse,
 )
 async def OpenCodeHealthAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> OpenCodeAvailabilityResponse:
-    """製品用 opencode serve の availability を返す。"""
+    """製品用 OpenCode CLI の availability を返す。"""
 
     response.headers.update(NO_STORE_HEADERS)
-    snapshot = ProbeOpenCodeAvailability()
+    snapshot = ProbeOpenCodeCLIAvailability()
     return OpenCodeAvailabilityResponse.model_validate(snapshot)
 
 
@@ -802,21 +917,21 @@ async def AIBackendProviderListAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> AIBackendProviderListResponse:
-    """service 追加 UI 用に、OpenCode Web 相当の provider カタログを返す。
+    """service 追加 UI 用に、listener-free CLI の provider カタログを返す。
 
-    GET /provider（全カタログ）と GET /provider/auth（認証方式）を合成する。
+    models.dev cache と製品用 auth.json の認証方式を合成する。
     - API キーのみ: ベストエフォートで選択可
-    - OAuth: ベストエフォートで選択可（prompts 付き method は除外）
+    - OAuth: auth.json に既存 token がある provider だけ選択可
     - Vertex AI: ADC のみ正式対応
     - それ以外の面倒な認証（Azure/Bedrock/GitHub Enterprise 等）: UnsupportedComplex
     """
 
     response.headers.update(NO_STORE_HEADERS)
-    client = OpenCodeClient()
+    client = OpenCodeCLI()
     try:
         catalog_payload = await client.listAllProviders()
         auth_methods = await client.listProviderAuthMethods()
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         raise _httpErrorFromOpenCode(error) from error
 
     providers = _BuildProviderCatalog(catalog_payload, auth_methods)
@@ -855,6 +970,452 @@ async def AIBackendUsageListAPI(
             detail='Failed to load AI backend usage.',
             headers=NO_STORE_HEADERS,
         ) from error
+
+
+# === 独立 OpenAI 互換 HTTP バックエンド ===
+
+
+@router.get(
+    '/openai-compatible/settings',
+    summary='OpenAI 互換 HTTP 設定取得 API',
+    response_model=OpenAICompatibleSettingsResponse,
+)
+async def OpenAICompatibleSettingsAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> OpenAICompatibleSettingsResponse:
+    """API キー本体を含まない OpenAI 互換 HTTP 設定を返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        接続先・モデル・API キー設定済み状態。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        return OpenAICompatibleSettingsStore.getSettingsResponse()
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatibleSettingsAPI] Failed to load settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load OpenAI-compatible settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+
+@router.put(
+    '/openai-compatible/settings',
+    summary='OpenAI 互換 HTTP 設定更新 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatibleSettingsUpdateAPI(
+    body: OpenAICompatibleSettings,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """API ベース URL とモデルを全体置換で保存する。
+
+    Args:
+        body: 保存する非秘密設定。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 設定ファイルを保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatibleSettingsStore.saveSettings(body)
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatibleSettingsUpdateAPI] Failed to save settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to save OpenAI-compatible settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible')
+
+
+@router.put(
+    '/openai-compatible/api-key',
+    summary='OpenAI 互換 HTTP API キー設定 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatibleAPIKeySetAPI(
+    body: AIBackendAPIKeyBody,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """API キーを専用 secrets ファイルへ保存する。
+
+    Args:
+        body: API キーを含む設定リクエスト。応答へは含めない。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: キーが不正、または保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatibleSettingsStore.setAPIKey(body.api_key)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='API key is invalid.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    except OSError as error:
+        logging.error(
+            '[OpenAICompatibleAPIKeySetAPI] Failed to store API key.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to store OpenAI-compatible API key.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible')
+
+
+@router.delete(
+    '/openai-compatible/api-key',
+    summary='OpenAI 互換 HTTP API キー削除 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatibleAPIKeyDeleteAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """専用 secrets ファイルから API キーを削除する。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 秘密ファイルを削除できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatibleSettingsStore.deleteAPIKey()
+    except OSError as error:
+        logging.error(
+            '[OpenAICompatibleAPIKeyDeleteAPI] Failed to delete API key.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to delete OpenAI-compatible API key.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible')
+
+
+@router.post(
+    '/openai-compatible/connection-test',
+    summary='OpenAI 互換 HTTP 接続試験 API',
+    response_model=AIBackendConnectionTestResponse,
+)
+async def OpenAICompatibleConnectionTestAPI(
+    body: OpenAICompatibleConnectionTestRequest,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> AIBackendConnectionTestResponse:
+    """保存済み接続情報で Responses のシリーズ生成または EpisodeLookup を試験する。
+
+    Args:
+        body: 試験する AI 機能。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        秘密を含まない接続試験結果。
+
+    Raises:
+        HTTPException: 保存済み設定を読み込めない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    proof_settings = _BuildConnectionTestProofSettings('OpenAICompatible')
+    try:
+        tested_provider_fingerprint = get_episode_lookup_provider_fingerprint(
+            proof_settings,
+            None,
+        )
+        direct_settings, api_key = OpenAICompatibleSettingsStore.getSettingsAndAPIKey()
+        backend = OpenAICompatibleBackend(direct_settings, api_key)
+        result = await backend.testConnection(body.capability)
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatibleConnectionTestAPI] Failed to load settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load OpenAI-compatible settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+    if body.capability == 'EpisodeLookup':
+        result = await _RecordEpisodeLookupConnectionTest(
+            'OpenAICompatible',
+            proof_settings,
+            tested_provider_fingerprint,
+            result,
+        )
+    elif body.capability == 'CandidateSelection':
+        await _RecordCandidateSelectionConnectionTestFailure('OpenAICompatible', result)
+    return _ConnectionTestResponse(result)
+
+
+# === 2つ目の独立 OpenAI 互換 HTTP バックエンド ===
+
+
+@router.get(
+    '/openai-compatible-2/settings',
+    summary='OpenAI 互換 HTTP 2 設定取得 API',
+    response_model=OpenAICompatibleSettingsResponse,
+)
+async def OpenAICompatible2SettingsAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> OpenAICompatibleSettingsResponse:
+    """API キー本体を含まない2枠目の OpenAI 互換 HTTP 設定を返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        2枠目の接続先・モデル・API キー設定済み状態。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        return OpenAICompatible2SettingsStore.getSettingsResponse()
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatible2SettingsAPI] Failed to load settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load OpenAI-compatible 2 settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+
+@router.put(
+    '/openai-compatible-2/settings',
+    summary='OpenAI 互換 HTTP 2 設定更新 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatible2SettingsUpdateAPI(
+    body: OpenAICompatibleSettings,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """2枠目の API ベース URL とモデルを全体置換で保存する。
+
+    Args:
+        body: 保存する非秘密設定。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 設定ファイルを保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatible2SettingsStore.saveSettings(body)
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatible2SettingsUpdateAPI] Failed to save settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to save OpenAI-compatible 2 settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible2')
+
+
+@router.put(
+    '/openai-compatible-2/api-key',
+    summary='OpenAI 互換 HTTP 2 API キー設定 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatible2APIKeySetAPI(
+    body: AIBackendAPIKeyBody,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """2枠目の API キーを専用 secrets ファイルへ保存する。
+
+    Args:
+        body: API キーを含む設定リクエスト。応答へは含めない。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: キーが不正、または保存できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatible2SettingsStore.setAPIKey(body.api_key)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail='API key is invalid.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    except OSError as error:
+        logging.error(
+            '[OpenAICompatible2APIKeySetAPI] Failed to store API key.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to store OpenAI-compatible 2 API key.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible2')
+
+
+@router.delete(
+    '/openai-compatible-2/api-key',
+    summary='OpenAI 互換 HTTP 2 API キー削除 API',
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+)
+async def OpenAICompatible2APIKeyDeleteAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> None:
+    """2枠目の専用 secrets ファイルから API キーを削除する。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        None
+
+    Raises:
+        HTTPException: 秘密ファイルを削除できない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    try:
+        OpenAICompatible2SettingsStore.deleteAPIKey()
+    except OSError as error:
+        logging.error(
+            '[OpenAICompatible2APIKeyDeleteAPI] Failed to delete API key.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to delete OpenAI-compatible 2 API key.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenAICompatible2')
+
+
+@router.post(
+    '/openai-compatible-2/connection-test',
+    summary='OpenAI 互換 HTTP 2 接続試験 API',
+    response_model=AIBackendConnectionTestResponse,
+)
+async def OpenAICompatible2ConnectionTestAPI(
+    body: OpenAICompatibleConnectionTestRequest,
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> AIBackendConnectionTestResponse:
+    """2枠目の保存済み接続情報で生成または話数検索を試験する。
+
+    Args:
+        body: 試験する AI 機能。
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        秘密を含まない接続試験結果。
+
+    Raises:
+        HTTPException: 保存済み設定を読み込めない場合。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    proof_settings = _BuildConnectionTestProofSettings('OpenAICompatible2')
+    try:
+        tested_provider_fingerprint = get_episode_lookup_provider_fingerprint(
+            proof_settings,
+            None,
+        )
+        direct_settings, api_key = OpenAICompatible2SettingsStore.getSettingsAndAPIKey()
+        backend = OpenAICompatibleBackend(
+            direct_settings,
+            api_key,
+            backend_kind='OpenAICompatible2',
+        )
+        result = await backend.testConnection(body.capability)
+    except (OSError, ValueError) as error:
+        logging.error(
+            '[OpenAICompatible2ConnectionTestAPI] Failed to load settings.',
+            exc_info=error,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Failed to load OpenAI-compatible 2 settings.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+    if body.capability == 'EpisodeLookup':
+        result = await _RecordEpisodeLookupConnectionTest(
+            'OpenAICompatible2',
+            proof_settings,
+            tested_provider_fingerprint,
+            result,
+        )
+    elif body.capability == 'CandidateSelection':
+        await _RecordCandidateSelectionConnectionTestFailure('OpenAICompatible2', result)
+    return _ConnectionTestResponse(result)
 
 
 # === ACP 固定プリセット（Codex / Grok Build） ===
@@ -950,10 +1511,37 @@ def _ACPBackendConnectionTestPreflightError(
             'ACPAuthenticationUnavailable',
             'Grok Build 認証が未取り込みのため接続テストを実行できません。',
         )
-    if IsACPOperationRunning():
+    # 対象 provider の実行枠だけを見る。別 provider の実行中バッチがあっても拒否しない。
+    if IsACPBackendKindRunning(backend_kind):
         return (
             'ACPOperationBusy',
             '別の ACP AI 処理を実行中のため、完了後に接続テストを実行してください。',
+        )
+    return None
+
+
+def _ACPBackendAuthenticationPreflightError(
+    backend_kind: Literal['AcpCodex', 'AcpGrok'],
+) -> tuple[str, str] | None:
+    """モデル広告取得前に、対象 ACP の認証有無だけを確認する。
+
+    Args:
+        backend_kind: モデル広告取得対象の ACP バックエンド種別。
+
+    Returns:
+        認証がなければ固定エラーコードと理由。取得可能なら None。
+    """
+
+    credential_status = KonomiTVBS4KACPCredentials.getStatus()
+    if backend_kind == 'AcpCodex' and credential_status.codex_auth_imported is False:
+        return (
+            'ACPAuthenticationUnavailable',
+            'Codex 認証が未取り込みのためモデル候補を取得できません。',
+        )
+    if backend_kind == 'AcpGrok' and credential_status.grok_auth_imported is False:
+        return (
+            'ACPAuthenticationUnavailable',
+            'Grok Build 認証が未取り込みのためモデル候補を取得できません。',
         )
     return None
 
@@ -1046,6 +1634,116 @@ async def ACPBackendSettingsAPI(
         ) from error
 
 
+async def _GetACPModelCatalogResponse(
+    backend_kind: Literal['AcpCodex', 'AcpGrok'],
+) -> ACPModelCatalogResponse:
+    """指定 ACP の session/new が広告したモデルだけを返す。
+
+    Args:
+        backend_kind: モデル広告を取得する ACP バックエンド種別。
+
+    Returns:
+        ACP agent が広告したモデル一覧と現在値。
+
+    Raises:
+        HTTPException: 認証未取り込み、または広告取得失敗の場合。
+    """
+
+    # モデル広告は推論を行わないため、認証だけ確認して provider 実行中でも許可する。
+    preflight_error = _ACPBackendAuthenticationPreflightError(backend_kind)
+    if preflight_error is not None:
+        provider_name = 'Codex' if backend_kind == 'AcpCodex' else 'Grok'
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f'{provider_name} ACP authentication is unavailable.',
+            headers=NO_STORE_HEADERS,
+        )
+
+    try:
+        catalog = await GetAcpModelCatalog(backend_kind)
+    except RecordedSeriesAIError as error:
+        logging.error(
+            f'[_GetACPModelCatalogResponse] Failed to load {backend_kind} model catalog '
+            f'({error.code}).'
+        )
+        if error.code in {'Timeout', 'HardTimeout'}:
+            response_status = status.HTTP_504_GATEWAY_TIMEOUT
+        elif error.code == 'HostCLIStartFailed':
+            response_status = status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            response_status = status.HTTP_502_BAD_GATEWAY
+        raise HTTPException(
+            status_code=response_status,
+            detail='Failed to load the ACP model catalog.',
+            headers=NO_STORE_HEADERS,
+        ) from error
+
+    return ACPModelCatalogResponse(
+        current_model_id=catalog.current_model_id,
+        models=[
+            ACPModelResponse(
+                model_id=model.model_id,
+                model_name=model.model_name,
+                current_reasoning_effort_id=model.current_reasoning_effort_id,
+                reasoning_efforts=[
+                    ACPReasoningEffortResponse(
+                        reasoning_effort_id=reasoning_effort.reasoning_effort_id,
+                        reasoning_effort_name=reasoning_effort.reasoning_effort_name,
+                    )
+                    for reasoning_effort in model.reasoning_efforts
+                ],
+            )
+            for model in catalog.models
+        ],
+    )
+
+
+@router.get(
+    '/acp-models/codex',
+    summary='Codex ACP モデル一覧取得 API',
+    response_model=ACPModelCatalogResponse,
+)
+async def ACPCodexModelListAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPModelCatalogResponse:
+    """Codex ACP が広告したモデル系統だけを返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        推論深さを分離した Codex モデル一覧と現在値。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    return await _GetACPModelCatalogResponse('AcpCodex')
+
+
+@router.get(
+    '/acp-models/grok',
+    summary='Grok ACP モデル一覧取得 API',
+    response_model=ACPModelCatalogResponse,
+)
+async def ACPGrokModelListAPI(
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> ACPModelCatalogResponse:
+    """Grok ACP が広告した opaque モデル ID だけを返す。
+
+    Args:
+        response: Cache-Control ヘッダーを設定するレスポンス。
+        _current_user: 管理者認証済みのユーザー。
+
+    Returns:
+        Grok ACP が広告したモデル一覧と現在値。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    return await _GetACPModelCatalogResponse('AcpGrok')
+
+
 @router.put(
     '/acp-settings',
     summary='ACP 固定プリセット設定更新 API',
@@ -1072,6 +1770,41 @@ async def ACPBackendSettingsUpdateAPI(
     """
 
     response.headers.update(NO_STORE_HEADERS)
+    # 設定保存時点の両 agent 広告を取得し、選択したモデルと推論深さの組を同じ
+    # session/new 由来の候補集合で検証する。片方でも取得できなければ保存しない。
+    codex_catalog = await _GetACPModelCatalogResponse('AcpCodex')
+    grok_catalog = await _GetACPModelCatalogResponse('AcpGrok')
+    for backend_settings, catalog in (
+        (body.codex, codex_catalog),
+        (body.grok, grok_catalog),
+    ):
+        effective_model_id = backend_settings.model or catalog.current_model_id
+        advertised_model = next(
+            (
+                model
+                for model in catalog.models
+                if model.model_id == effective_model_id
+            ),
+            None,
+        )
+        if advertised_model is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail='The selected ACP model is not currently advertised.',
+                headers=NO_STORE_HEADERS,
+            )
+        if (
+            backend_settings.reasoning_effort is not None and
+            backend_settings.reasoning_effort not in {
+                effort.reasoning_effort_id
+                for effort in advertised_model.reasoning_efforts
+            }
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail='The selected ACP reasoning effort is not currently advertised.',
+                headers=NO_STORE_HEADERS,
+            )
     try:
         ACPSettingsStore.saveSettings(body)
     except (OSError, ValueError) as error:
@@ -1137,10 +1870,9 @@ async def ACPBackendCredentialImportAPI(
 
     response.headers.update(NO_STORE_HEADERS)
     credential_lock = GetACPCredentialOperationLock(provider)
-    # 同じ provider の AI が認証を読んでいる場合、最大60分の終了待ちを API に持ち込まない。
-    if credential_lock.locked():
+    # 同じ provider の AI が認証を読んでいる場合、終了待ちを API に持ち込まない。
+    if await credential_lock.tryAcquireWrite() is False:
         raise _ACPBackendCredentialInUseHTTPException()
-    await credential_lock.acquire()
     try:
         try:
             KonomiTVBS4KACPCredentials.importProviderAuth(provider)
@@ -1154,7 +1886,7 @@ async def ACPBackendCredentialImportAPI(
             backend_kind='AcpCodex' if provider == 'codex' else 'AcpGrok',
         )
     finally:
-        credential_lock.release()
+        await credential_lock.releaseWrite()
     return _ACPBackendCredentialStatusResponse()
 
 
@@ -1187,9 +1919,8 @@ async def ACPBackendCredentialDeleteAPI(
     response.headers.update(NO_STORE_HEADERS)
     credential_lock = GetACPCredentialOperationLock(provider)
     # 削除も import と同じく、実行中世代を壊さず即時に競合を通知する。
-    if credential_lock.locked():
+    if await credential_lock.tryAcquireWrite() is False:
         raise _ACPBackendCredentialInUseHTTPException()
-    await credential_lock.acquire()
     try:
         try:
             KonomiTVBS4KACPCredentials.deleteProviderAuth(provider)
@@ -1202,7 +1933,7 @@ async def ACPBackendCredentialDeleteAPI(
             backend_kind='AcpCodex' if provider == 'codex' else 'AcpGrok',
         )
     finally:
-        credential_lock.release()
+        await credential_lock.releaseWrite()
     return _ACPBackendCredentialStatusResponse()
 
 
@@ -1232,8 +1963,8 @@ async def ACPBackendConnectionTestAPI(
 
     response.headers.update(NO_STORE_HEADERS)
     capability = body.capability
-    # ACP バックエンド用の最小 settings（ACPSettings は実行時に正本参照される）。
-    settings = RecordedSeriesSettings(ai_backend=body.backend_kind, ai_enabled=True)
+    # 接続試験で実際に起動する ACP backend 単体へだけ proof を結び付ける。
+    settings = _BuildConnectionTestProofSettings(body.backend_kind)
     audit_model = get_audit_model(settings)
     # EpisodeLookup 時に実際に試験した provider fingerprint。preflight 失敗時は None のまま。
     tested_provider_fingerprint: str | None = None
@@ -1607,7 +2338,7 @@ async def AIBackendServiceUpdateAPI(
                     previous.opencode_provider_id,
                     excluding_service_id=service.service_id,
                 )
-            except OpenCodeClientError as error:
+            except OpenCodeCLIError as error:
                 # settings は更新済み。auth 掃除失敗は警告に留め再試行可能とする。
                 logging.warning(
                     f'[AIBackendServiceUpdateAPI] Provider auth cleanup failed: {error}',
@@ -1689,7 +2420,7 @@ async def AIBackendServiceDeleteAPI(
             removed.opencode_provider_id,
             excluding_service_id=removed.service_id,
         )
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         logging.warning(
             f'[AIBackendServiceDeleteAPI] OpenCode auth removal failed after local delete: {error}',
         )
@@ -1740,11 +2471,11 @@ async def AIBackendAPIKeySetAPI(
             headers=NO_STORE_HEADERS,
         ) from error
 
-    client = OpenCodeClient()
+    client = OpenCodeCLI()
     try:
         # キー本体はログに出さない
         await client.putApiKey(service.opencode_provider_id, body.api_key)
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         raise _httpErrorFromOpenCode(error) from error
 
     invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
@@ -1791,7 +2522,7 @@ async def AIBackendAPIKeyDeleteAPI(
             # 幽霊認証を残さない。
             excluding_service_id=service.service_id,
         )
-    except OpenCodeClientError as error:
+    except OpenCodeCLIError as error:
         logging.warning(
             f'[AIBackendAPIKeyDeleteAPI] OpenCode auth removal failed: {error}',
         )
@@ -1805,15 +2536,11 @@ async def AIBackendAPIKeyDeleteAPI(
 )
 async def AIBackendOAuthStartAPI(
     service_id: Annotated[str, Path(min_length=36, max_length=36)],
-    body: OAuthStartRequest,
+    _body: OAuthStartRequest,
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> OAuthStartResponse:
-    """OAuth 認可を開始し、browser 用 URL と手順を返す。
-
-    OpenCode Web と同様に method index を渡し、返却 URL をクライアントが開く。
-    接続済みフラグの更新は callback API 側で行う。
-    """
+    """allowlist 上の provider の新規 OAuth device flow を開始する。"""
 
     response.headers.update(NO_STORE_HEADERS)
     service = AIBackendSettingsStore.getService(service_id)
@@ -1829,40 +2556,84 @@ async def AIBackendOAuthStartAPI(
             detail='OAuth start requires auth_mode=OAuthSubscription.',
             headers=NO_STORE_HEADERS,
         )
-    client = OpenCodeClient()
-    try:
-        authorize = await client.startOAuthAuthorize(
-            service.opencode_provider_id,
-            method=body.method,
+    # 新規 OAuth は device flow を確認済みの provider のみ許可する。
+    # allowlist 外は従来どおり開始できない (501 維持)。
+    if service.opencode_provider_id not in OPENCODE_OAUTH_DEVICE_FLOW_ALLOWED:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=(
+                'OpenCodeOAuthUnsupported: New OAuth authorization is unavailable for this provider in listener-free CLI mode. '
+                'Provision an existing token in the product auth.json manually or use API key authentication.'
+            ),
+            headers=NO_STORE_HEADERS,
         )
-    except OpenCodeClientError as error:
+    client = OpenCodeCLI()
+    try:
+        # 成功時は disconnect と同様に capability proof を失効させ、再接続試験に備える。
+        # oauth_connected の永続 flag は不要 (toResponse が auth.json の実 entry を正本として導出する)。
+        info = await client.startOAuthDeviceAuthorization(
+            service.opencode_provider_id,
+            on_success=lambda: invalidate_episode_lookup_capability_proof(backend_kind='OpenCode'),
+        )
+    except OpenCodeCLIError as error:
         raise _httpErrorFromOpenCode(error) from error
-    except ValueError as error:
+    return OAuthStartResponse(
+        provider_id=info.provider_id,
+        method=info.method_index,
+        url=info.url,
+        authorization_method='auto',
+        instructions=info.instructions,
+        authorize={},
+    )
+
+
+@router.get(
+    '/{service_id}/oauth/status',
+    summary='AI バックエンド OAuth 状態 API',
+    response_model=OAuthStatusResponse,
+)
+async def AIBackendOAuthStatusAPI(
+    service_id: Annotated[str, Path(min_length=36, max_length=36)],
+    response: Response,
+    _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
+) -> OAuthStatusResponse:
+    """進行中の OAuth device authorization の状態を返す。
+
+    method='auto' の完了は serve が auth.json へ entry を書くことで確定するため、
+    client は本 API を poll して完了・失敗・タイムアウトを検知する。
+    """
+
+    response.headers.update(NO_STORE_HEADERS)
+    service = AIBackendSettingsStore.getService(service_id)
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail='AI backend service not found.',
+            headers=NO_STORE_HEADERS,
+        )
+    if service.auth_mode != 'OAuthSubscription':
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(error),
+            detail='OAuth status requires auth_mode=OAuthSubscription.',
             headers=NO_STORE_HEADERS,
-        ) from error
-
-    url_raw = authorize.get('url')
-    url = url_raw.strip() if isinstance(url_raw, str) and url_raw.strip() != '' else None
-    method_raw = authorize.get('method')
-    authorization_method: Literal['auto', 'code'] | None = None
-    if method_raw in {'auto', 'code'}:
-        authorization_method = method_raw  # type: ignore[assignment]
-    instructions_raw = authorize.get('instructions')
-    instructions = (
-        instructions_raw.strip()
-        if isinstance(instructions_raw, str) and instructions_raw.strip() != ''
-        else None
-    )
-    return OAuthStartResponse(
-        provider_id=service.opencode_provider_id,
-        method=body.method,
-        url=url,
-        authorization_method=authorization_method,
-        instructions=instructions,
-        authorize=authorize,
+        )
+    info = OpenCodeCLI().getOAuthAuthorizationStatus(service.opencode_provider_id)
+    if info is None:
+        return OAuthStatusResponse(
+            provider_id=service.opencode_provider_id,
+            method=None,
+            status='None',
+            url=None,
+            instructions=None,
+            error=None,
+        )
+    return OAuthStatusResponse(
+        provider_id=info.provider_id,
+        method=info.method_index,
+        status=info.status,
+        url=info.url,
+        instructions=info.instructions,
+        error=info.error,
     )
 
 
@@ -1874,16 +2645,11 @@ async def AIBackendOAuthStartAPI(
 )
 async def AIBackendOAuthCallbackAPI(
     service_id: Annotated[str, Path(min_length=36, max_length=36)],
-    body: OAuthCallbackRequest,
+    _body: OAuthCallbackRequest,
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> None:
-    """OAuth callback を OpenCode に渡し、成功時に oauth_connected を立てる。
-
-    browser (auto) では code 無し、headless/device では code を渡す。
-    ベストエフォート: provider によっては redirect が Docker 内 localhost の
-    ため完了できない場合がある。その場合は headless method を選ぶ。
-    """
+    """listener-free CLI では開始できない OAuth callback を拒否する。"""
 
     response.headers.update(NO_STORE_HEADERS)
     service = AIBackendSettingsStore.getService(service_id)
@@ -1899,45 +2665,14 @@ async def AIBackendOAuthCallbackAPI(
             detail='OAuth callback requires auth_mode=OAuthSubscription.',
             headers=NO_STORE_HEADERS,
         )
-    client = OpenCodeClient()
-    try:
-        ok = await client.completeOAuthCallback(
-            service.opencode_provider_id,
-            method=body.method,
-            code=body.code,
-        )
-    except OpenCodeClientError as error:
-        raise _httpErrorFromOpenCode(error) from error
-    except ValueError as error:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(error),
-            headers=NO_STORE_HEADERS,
-        ) from error
-    if ok is not True:
-        # OpenCode が false を返した場合も接続未完了として 502。
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail='OpenCode OAuth callback did not complete.',
-            headers=NO_STORE_HEADERS,
-        )
-    try:
-        AIBackendSettingsStore.setOAuthConnected(service.service_id, True)
-    except KeyError as error:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail='AI backend service not found.',
-            headers=NO_STORE_HEADERS,
-        ) from error
-    except (OSError, ValueError) as error:
-        logging.error('[AIBackendOAuthCallbackAPI] Failed to set oauth_connected:', exc_info=error)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Failed to mark OAuth as connected.',
-            headers=NO_STORE_HEADERS,
-        ) from error
-
-    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=(
+            'OpenCodeOAuthUnsupported: OAuth callback is unavailable in listener-free CLI mode. '
+            'Provision an existing token in the product auth.json manually or use API key authentication.'
+        ),
+        headers=NO_STORE_HEADERS,
+    )
 
 
 @router.post(
@@ -1951,7 +2686,7 @@ async def AIBackendOAuthDisconnectAPI(
     response: Response,
     _current_user: Annotated[User, Depends(GetCurrentAdminUser)],
 ) -> None:
-    """OAuth 接続を切断し、共有が無ければ OpenCode auth を除去する。"""
+    """provider-scoped OAuth 接続を切断する。"""
 
     response.headers.update(NO_STORE_HEADERS)
     service = AIBackendSettingsStore.getService(service_id)
@@ -1967,8 +2702,18 @@ async def AIBackendOAuthDisconnectAPI(
             detail='OAuth disconnect requires auth_mode=OAuthSubscription.',
             headers=NO_STORE_HEADERS,
         )
+    # auth.json は provider-scoped なので、同 provider の service を残したまま token だけ
+    # 共有し続ける service-scoped disconnect は成立しない。token 削除を成功応答の前提にする。
+    client = OpenCodeCLI()
     try:
-        AIBackendSettingsStore.setOAuthConnected(service.service_id, False)
+        await client.deleteAuth(service.opencode_provider_id)
+    except OpenCodeCLIError as error:
+        raise _httpErrorFromOpenCode(error) from error
+
+    # token が消えた時点で能力証明を失効し、古い persisted flag は同 provider 分を一括更新する。
+    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
+    try:
+        AIBackendSettingsStore.setOAuthProviderDisconnected(service.opencode_provider_id)
     except KeyError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1982,19 +2727,6 @@ async def AIBackendOAuthDisconnectAPI(
             detail='Failed to disconnect OAuth.',
             headers=NO_STORE_HEADERS,
         ) from error
-
-    invalidate_episode_lookup_capability_proof(backend_kind='OpenCode')
-
-    try:
-        await _removeOpenCodeAuthIfUnshared(
-            service.opencode_provider_id,
-            # 切断した service 自身は oauth_connected=False なので参照カウントから除外する。
-            excluding_service_id=service.service_id,
-        )
-    except OpenCodeClientError as error:
-        logging.warning(
-            f'[AIBackendOAuthDisconnectAPI] OpenCode auth removal failed: {error}',
-        )
 
 
 def _OpenCodeConnectionChecksResponse(
@@ -2037,6 +2769,174 @@ def _ConnectionTestResponse(result: ConnectionTestResult) -> AIBackendConnection
     )
 
 
+def _ConnectionTestAttemptSummaries(
+    backend_kind: AIBackendKind,
+    result: ConnectionTestResult,
+) -> list[str]:
+    """接続試験結果から監査用の試行サマリ行を構築する。
+
+    sanitizer 済みの provider 本文抜粋がある (= OpenAI 互換 backend が非2xxを
+    受けた) ときだけ1行を返す。message からの再解析はせず、backend が結果へ
+    保持した内部値をそのまま使う。抜粋がなければ従来どおり空リストを返す。
+
+    Args:
+        backend_kind: 試験した backend 種別。
+        result: backend が返した接続試験結果。
+
+    Returns:
+        attempt_summaries へ保存する行のリスト (0 または 1 件)。
+    """
+
+    if result.provider_error_excerpt is None:
+        return []
+    error_code = result.error_code or 'ConnectionTestFailed'
+    return [
+        FormatRecoveryAttemptSummary(
+            AIRecoveryAttemptSummary(
+                attempt_number=1,
+                role='Primary',
+                backend_kind=backend_kind,
+                service_id=None,
+                model=result.model,
+                result_code=error_code,
+                succeeded=False,
+                adopted=False,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                latency_ms=result.latency_ms,
+                http_status=result.http_status,
+                error_code=error_code,
+                provider_error_excerpt=result.provider_error_excerpt,
+            ),
+        ),
+    ]
+
+
+async def _RecordCandidateSelectionConnectionTestFailure(
+    backend_kind: AIBackendKind,
+    result: ConnectionTestResult,
+) -> None:
+    """OpenAI 互換 backend の CandidateSelection 接続試験失敗を監査行へ残す。
+
+    EpisodeLookup 接続試験は能力証明のため成否に関わらず監査行を書くが、
+    CandidateSelection にはその経路がなく、非2xxの provider 本文が監査から
+    読めなかった。sanitizer 済み抜粋を持つ失敗のときだけ行を作成する
+    (成功時・抜粋なし失敗時の行は増やさない)。
+
+    Args:
+        backend_kind: 試験した backend 種別。
+        result: backend が返した接続試験結果。
+    """
+
+    attempt_summaries = _ConnectionTestAttemptSummaries(backend_kind, result)
+    if result.success is True or len(attempt_summaries) == 0:
+        return
+    await RecordedSeriesAIRequest.create(
+        resolution_id=None,
+        purpose='ConnectionTest',
+        status='Failed',
+        model=result.model,
+        candidate_ids=['candidate-selection'],
+        selected_choice_id=None,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        http_status=result.http_status,
+        latency_ms=result.latency_ms,
+        error_code=result.error_code or 'ConnectionTestFailed',
+        attempt_summaries=attempt_summaries,
+    )
+
+
+async def _RecordEpisodeLookupConnectionTest(
+    backend_kind: AIBackendKind,
+    proof_settings: RecordedSeriesSettings,
+    tested_provider_fingerprint: str,
+    result: ConnectionTestResult,
+) -> ConnectionTestResult:
+    """保存済み backend の EpisodeLookup 接続試験を監査し、能力証明を更新する。
+
+    Args:
+        backend_kind: 試験した backend 種別。
+        proof_settings: 試験対象を指す録画シリーズ設定。
+        tested_provider_fingerprint: 試験開始時の設定・認証 fingerprint。
+        result: backend が返した接続試験結果。
+
+    Returns:
+        試験中の設定変更も反映した最終結果。
+    """
+
+    rejected_error_codes = {
+        'ChoiceOutsideCandidateSet',
+        'InvalidOutputSchema',
+        'InvalidJSON',
+        'InvalidJSONType',
+        'InvalidModelOutput',
+        'LowConfidence',
+        'MissingSearchSources',
+        'MissingWebSearchCall',
+        'SearchNotRun',
+        'OpenCodeWebSearchNotObserved',
+        'OpenCodeWebSearchFailed',
+        'OpenCodeEpisodeLookupLocalDisabled',
+    }
+    audit_error_code = None if result.success else result.error_code or 'ConnectionTestFailed'
+    connection_test_audit = await RecordedSeriesAIRequest.create(
+        resolution_id=None,
+        purpose='ConnectionTest',
+        status=(
+            'Succeeded'
+            if result.success
+            else 'Rejected'
+            if audit_error_code in rejected_error_codes
+            else 'Failed'
+        ),
+        model=result.model,
+        candidate_ids=['episode-lookup'],
+        selected_choice_id=result.selected_choice_id,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        http_status=result.http_status,
+        latency_ms=result.latency_ms,
+        error_code=audit_error_code,
+        attempt_summaries=_ConnectionTestAttemptSummaries(backend_kind, result),
+    )
+    invalidate_episode_lookup_capability_fingerprint(tested_provider_fingerprint)
+    proof_recorded = record_episode_lookup_capability_proof(
+        proof_settings,
+        None,
+        result,
+        tested_provider_fingerprint=tested_provider_fingerprint,
+    )
+    if result.success is False or proof_recorded:
+        return result
+
+    current_fingerprint = get_episode_lookup_provider_fingerprint(proof_settings, None)
+    state_changed = current_fingerprint != tested_provider_fingerprint
+    failed_result = ConnectionTestResult(
+        success=False,
+        latency_ms=result.latency_ms,
+        model=result.model,
+        message=(
+            '接続試験中に AI 設定または認証状態が変更されました。もう一度試してください。'
+            if state_changed
+            else '話数 Web 検索に必要な能力をすべて確認できませんでした。'
+        ),
+        checks=result.checks,
+        prompt_tokens=result.prompt_tokens,
+        completion_tokens=result.completion_tokens,
+        http_status=result.http_status,
+        error_code=(
+            'ConnectionTestStateChanged'
+            if state_changed
+            else 'EpisodeLookupCapabilityNotVerified'
+        ),
+    )
+    connection_test_audit.status = 'Failed'
+    connection_test_audit.error_code = failed_result.error_code
+    await connection_test_audit.save(update_fields=['status', 'error_code'])
+    return failed_result
+
+
 @router.post(
     '/connection-test',
     summary='AI バックエンド OpenCode 接続試験 API',
@@ -2059,10 +2959,10 @@ async def AIBackendConnectionTestAPI(
 
     response.headers.update(NO_STORE_HEADERS)
 
-    if IsOpenCodeAvailable() is False:
+    if IsOpenCodeCLIAvailable() is False:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail='OpenCode serve is unavailable.',
+            detail='OpenCode CLI is unavailable.',
             headers=NO_STORE_HEADERS,
         )
 
@@ -2115,11 +3015,10 @@ async def AIBackendConnectionTestAPI(
                 )
                 remove_auth_on_cleanup = remaining == 0
                 provider_id_for_cleanup = backend.service.opencode_provider_id
-            if body.capability == 'EpisodeLookup':
-                proof_settings = RecordedSeriesSettings(
-                    ai_backend='OpenCode',
-                    ai_enabled=True,
-                    ai_backend_service_id=backend.service.service_id,
+            if body.capability == 'EpisodeLookup' and body.api_key is None:
+                proof_settings = _BuildConnectionTestProofSettings(
+                    'OpenCode',
+                    service_id=backend.service.service_id,
                 )
                 tested_provider_fingerprint = get_episode_lookup_provider_fingerprint(
                     proof_settings,
@@ -2213,86 +3112,21 @@ async def AIBackendConnectionTestAPI(
             and proof_settings is not None
             and tested_provider_fingerprint is not None
         ):
-            rejected_error_codes = {
-                'ChoiceOutsideCandidateSet',
-                'InvalidOutputSchema',
-                'InvalidJSON',
-                'InvalidJSONType',
-                'InvalidModelOutput',
-                'LowConfidence',
-                'MissingWebSearchCall',
-                'SearchNotRun',
-                'OpenCodeWebSearchNotObserved',
-                'OpenCodeWebSearchFailed',
-                'OpenCodeEpisodeLookupLocalDisabled',
-            }
-            audit_error_code = (
-                None if result.success else result.error_code or 'ConnectionTestFailed'
-            )
-            connection_test_audit = await RecordedSeriesAIRequest.create(
-                resolution_id=None,
-                purpose='ConnectionTest',
-                status=(
-                    'Succeeded'
-                    if result.success
-                    else 'Rejected'
-                    if audit_error_code in rejected_error_codes
-                    else 'Failed'
-                ),
-                model=result.model,
-                candidate_ids=['episode-lookup'],
-                selected_choice_id=result.selected_choice_id,
-                prompt_tokens=result.prompt_tokens,
-                completion_tokens=result.completion_tokens,
-                http_status=result.http_status,
-                latency_ms=result.latency_ms,
-                error_code=audit_error_code,
-            )
-            invalidate_episode_lookup_capability_fingerprint(
-                tested_provider_fingerprint,
-            )
-            proof_recorded = record_episode_lookup_capability_proof(
+            result = await _RecordEpisodeLookupConnectionTest(
+                'OpenCode',
                 proof_settings,
-                None,
+                tested_provider_fingerprint,
                 result,
-                tested_provider_fingerprint=tested_provider_fingerprint,
             )
-            if result.success and proof_recorded is False:
-                current_fp = get_episode_lookup_provider_fingerprint(proof_settings, None)
-                state_changed = current_fp != tested_provider_fingerprint
-                result = ConnectionTestResult(
-                    success=False,
-                    latency_ms=result.latency_ms,
-                    model=result.model,
-                    message=(
-                        '接続試験中に AI 設定または認証状態が変更されました。もう一度試してください。'
-                        if state_changed
-                        else '話数 Web 検索に必要な能力をすべて確認できませんでした。'
-                    ),
-                    checks=result.checks,
-                    prompt_tokens=result.prompt_tokens,
-                    completion_tokens=result.completion_tokens,
-                    http_status=result.http_status,
-                    error_code=(
-                        'ConnectionTestStateChanged'
-                        if state_changed
-                        else 'EpisodeLookupCapabilityNotVerified'
-                    ),
-                )
-                connection_test_audit.status = 'Failed'
-                connection_test_audit.error_code = result.error_code
-                await connection_test_audit.save(
-                    update_fields=['status', 'error_code'],
-                )
 
         return _ConnectionTestResponse(result)
     finally:
         # 一時キー試験後の OpenCode auth 掃除（共有 provider は壊さない）。
         if remove_auth_on_cleanup and provider_id_for_cleanup is not None:
-            client = OpenCodeClient()
+            client = OpenCodeCLI()
             try:
                 await client.deleteAuth(provider_id_for_cleanup)
-            except OpenCodeClientError as error:
+            except OpenCodeCLIError as error:
                 logging.warning(
                     f'[AIBackendConnectionTestAPI] Temporary auth cleanup failed: {error}',
                 )

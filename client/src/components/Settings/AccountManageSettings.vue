@@ -65,7 +65,7 @@
 </template>
 <script lang='ts' setup>
 
-import { PropType, ref, watch } from 'vue';
+import { onUnmounted, PropType, ref, watch } from 'vue';
 
 import Message from '@/message';
 import Users, { IUser } from '@/services/Users';
@@ -97,6 +97,21 @@ const user_accounts = ref<IUser[]>([]);
 // ユーザーごとのアイコンの Blob URL を ID: Blob URL の形で保持
 const user_accounts_blob_urls = ref<{ [key: number]: string }>({});
 
+// 再取得やコンポーネントの破棄時に、保持しているユーザーアイコンの Blob URL をまとめて解放する
+function revokeUserAccountIconBlobURLs() {
+    for (const blob_url of Object.values(user_accounts_blob_urls.value)) {
+        URL.revokeObjectURL(blob_url);
+    }
+    user_accounts_blob_urls.value = {};
+}
+
+// 古い取得処理がコンポーネント破棄後や次の再取得後に Blob URL を保持しないよう、取得世代を管理する
+let fetch_all_users_generation = 0;
+onUnmounted(() => {
+    fetch_all_users_generation += 1;
+    revokeUserAccountIconBlobURLs();
+});
+
 // ユーザーごとのロールを ID: ロール の形で保持
 // 変更されたら API に反映
 const user_roles = ref<{ [key: number]: string }>({});
@@ -124,14 +139,25 @@ watch(user_roles, (new_value) => {
 
 // ユーザー情報を取得 (管理者ユーザー時のみ)
 function fetchAllUsers() {
+    const fetch_generation = ++fetch_all_users_generation;
     Users.fetchAllUsers().then(async (response) => {
+
+        // より新しい再取得が始まっている場合、この応答は反映しない
+        if (fetch_generation !== fetch_all_users_generation) return;
+
         // ユーザー情報が取得できた場合
         if (response !== null) {
+            revokeUserAccountIconBlobURLs();
             user_accounts.value = response;
             for (const user_account of user_accounts.value) {
                 // ユーザーごとのアイコンの Blob URL を取得
-                Users.fetchSpecifiedUserIcon(user_account.name).then((response) => {
-                    user_accounts_blob_urls.value[user_account.id] = response ?? '';
+                Users.fetchSpecifiedUserIcon(user_account.name).then((blob_url) => {
+                    // 再取得やアンマウント後に完了したリクエストの Blob URL は、保持せず即座に解放する
+                    if (fetch_generation !== fetch_all_users_generation) {
+                        URL.revokeObjectURL(blob_url);
+                        return;
+                    }
+                    user_accounts_blob_urls.value[user_account.id] = blob_url;
                 });
                 // ユーザーごとのロールを取得
                 // is_admin が true なら管理者、false なら一般

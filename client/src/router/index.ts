@@ -4,6 +4,8 @@ import { createRouter, createWebHistory } from 'vue-router';
 
 import { SETTINGS_ROUTES } from '@/router/settings';
 
+export const PRESERVE_SCROLL_POSITION_STATE_KEY = 'preserveScrollPosition';
+
 
 // Vue Router v4
 // ref: https://router.vuejs.org/guide/
@@ -53,6 +55,30 @@ const router = createRouter({
             path: '/videos/watch/:video_id',
             name: 'Videos Watch',
             component: () => import('@/views/Videos/Watch.vue'),
+        },
+        {
+            path: '/videos/series/:id',
+            redirect: (to) => `/series/${to.params.id}`,
+        },
+        {
+            path: '/series/',
+            name: 'Series Home',
+            component: () => import('@/views/Series/Home.vue'),
+        },
+        {
+            path: '/series/on-air/:id',
+            name: 'Series On Air Detail',
+            component: () => import('@/views/Series/OnAir.vue'),
+        },
+        {
+            path: '/series/on-air',
+            name: 'Series On Air',
+            component: () => import('@/views/Series/OnAir.vue'),
+        },
+        {
+            path: '/series/:id',
+            name: 'Series Home Detail',
+            component: () => import('@/views/Series/Home.vue'),
         },
         {
             path: '/timetable/',
@@ -117,6 +143,13 @@ const router = createRouter({
         if (savedPosition) {
             // 戻る/進むボタンが押されたときは保存されたスクロール位置を使う
             return savedPosition;
+        } else if (window.history.state?.[PRESERVE_SCROLL_POSITION_STATE_KEY] === true) {
+            // 同じ一覧内の選択 URL 更新ではスクロールせず、次の navigation へ印を持ち越さない。
+            window.history.replaceState({
+                ...window.history.state,
+                [PRESERVE_SCROLL_POSITION_STATE_KEY]: false,
+            }, '');
+            return false;
         } else {
             // それ以外は常に先頭にスクロールする
             return {top: 0, left: 0};

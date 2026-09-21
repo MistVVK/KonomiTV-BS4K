@@ -12,6 +12,7 @@ from app import logging
 from app.config import ClientSettings, Config, HostServerSettings, SaveConfig
 from app.models.User import User
 from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
+from app.schemas import KonomiTVBS4KRenderDevice
 from app.utils.HostPath import HostPathError, ToUserHostPathText
 
 
@@ -24,6 +25,10 @@ router = APIRouter(
 _HOST_PATH_SETTINGS_API_PATHS = {
     '/api/settings/server',
     '/api/cm-analysis/settings',
+    # API キー入力の検証失敗時にも FastAPI 標準応答の input へ秘密を転載しない。
+    '/api/ai-backends/openai-compatible/api-key',
+    '/api/ai-backends/openai-compatible-2/api-key',
+    '/api/recorded-series/settings/tmdb-api-key',
 }
 
 
@@ -60,7 +65,7 @@ async def HostPathRequestValidationErrorHandler(
     exception: RequestValidationError,
 ) -> JSONResponse:
     """
-    パス設定APIの422レスポンスから入力値を除き、内部接頭辞の再露出を防ぐ。
+    パス設定・秘密入力 API の422レスポンスから入力値を除き、内部値の再露出を防ぐ。
 
     Args:
         request (Request): バリデーションに失敗したHTTPリクエスト。
@@ -82,6 +87,22 @@ async def HostPathRequestValidationErrorHandler(
     )
 
 
+# 廃止した Twitter タブの旧値だけを現行の既定タブへ移行する
+## パネルタブ選択キー (tv / video_panel_active_tab) は存続キーのため、Twitter 機能除去後も
+## 同期 DB には旧クライアントが保存した 'Twitter' 値が残り得る。このまま ClientSettings を
+## 検証すると設定破損と判定され、全既定値の上書き保存で無関係なユーザー設定まで失われるため、
+## 検証の直前この2値だけを移行する (他の不正値の従来どおり破損修復には関与しない)
+def _MigrateLegacyTwitterPanelTabs(client_settings: object) -> object:
+    if not isinstance(client_settings, dict):
+        return client_settings
+    migrated: dict[str, object] = client_settings
+    if migrated.get('tv_panel_active_tab') == 'Twitter':
+        migrated = {**migrated, 'tv_panel_active_tab': 'Program'}
+    if migrated.get('video_panel_active_tab') == 'Twitter':
+        migrated = {**migrated, 'video_panel_active_tab': 'RecordedProgram'}
+    return migrated
+
+
 @router.get(
     '/client',
     summary = 'クライアント設定取得 API',
@@ -94,10 +115,11 @@ async def ClientSettingsAPI(
     """
     現在ログイン中のユーザーアカウントのクライアント設定を取得する。<br>
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。<br>
+    既存 DB に廃止した Twitter タブの旧値が残っている場合は既定タブへ移行して返す。<br>
     既存 DB に NaN/Inf など非有限値が残っている場合は default へ自己修復する。
     """
     try:
-        return ClientSettings.model_validate(current_user.client_settings)
+        return ClientSettings.model_validate(_MigrateLegacyTwitterPanelTabs(current_user.client_settings))
     except ValidationError as ex:
         logging.warning(
             f'[ClientSettingsAPI] Corrupted client settings detected for user {current_user.id}. '
@@ -129,7 +151,12 @@ async def ClientSettingsUpdateAPI(
     async with in_transaction():
         user = await User.filter(id=current_user.id).select_for_update().get()
         try:
-            current_client_settings = ClientSettings.model_validate(user.client_settings)
+            # 保存済みの旧 Twitter タブ値も GET と同じ移行を通してから検証する
+            ## 移行しないと ValidationError 扱いで全既定値が比較元になり、
+            ## last_synced_at=0 化して本来 409 の古い snapshot を受け付けてしまう
+            current_client_settings = ClientSettings.model_validate(
+                _MigrateLegacyTwitterPanelTabs(user.client_settings),
+            )
         except ValidationError:
             # 汚染済み既存値は default 相当として CAS 比較し、今回の更新で上書き修復する
             current_client_settings = ClientSettings()
@@ -146,8 +173,15 @@ async def ClientSettingsUpdateAPI(
         # dict に変換してから入れる
         ## Pydantic モデルのままだと JSON にシリアライズできないので怒られる
         ## mode='json' で非有限値が残らない形に正規化する
-        user.client_settings = client_settings.model_dump(mode='json')
-        await user.save()
+        updated_client_settings = client_settings.model_dump(mode='json')
+
+        # 専用 API が書き込んだ Bangumi 視聴履歴送信設定は、古い全量 snapshot で巻き戻さない。
+        # 一般設定の同期ではこの値を配布だけに留め、サーバー上の値の更新は専用 API だけが所有する。
+        updated_client_settings['bangumi_watch_history_sync'] = (
+            user.client_settings.get('bangumi_watch_history_sync') is True
+        )
+        user.client_settings = updated_client_settings
+        await user.save(update_fields=['client_settings', 'updated_at'])
 
 
 @router.get(
@@ -164,6 +198,31 @@ async def ServerSettingsAPI() -> HostServerSettings:
     """
 
     return HostServerSettings.fromServerSettings(Config())
+
+
+@router.get(
+    '/konomitv-bs4k-render-devices',
+    summary = 'KonomiTV-BS4K render node 一覧取得 API',
+    response_description = 'コンテナから見える DRM render node の一覧。',
+    response_model = list[KonomiTVBS4KRenderDevice],
+)
+async def KonomiTVBS4KRenderDevicesAPI() -> list[KonomiTVBS4KRenderDevice]:
+    """
+    QSV / AMF の HW エンコードに利用できる DRM render node の一覧を取得する。<br>
+    エンコーダー設定で render node を固定指定する際の候補表示に利用する。<br>
+    取得できるのはコンテナへ渡されたデバイスだけであり、ホスト上の全 GPU とは限らない。
+    """
+
+    # サーバー設定の取得 API と同様に、ローカル動作前提の非機密情報なので認証は不要
+    from app.streams.RecordedPlaybackCapabilities import RecordedPlaybackBackend
+    return [
+        KonomiTVBS4KRenderDevice(
+            path = device.path,
+            vendor_id = device.vendor_id,
+            vendor_name = device.vendor_name,
+        )
+        for device in RecordedPlaybackBackend.listRenderDevices()
+    ]
 
 
 @router.put(

@@ -134,8 +134,15 @@ def test_niconico_auth_and_callback_are_blocked_but_logout_remains_local(monkeyp
         niconico_access_token = 'access-token'
         niconico_refresh_token = 'refresh-token'
 
-        async def save(self) -> None:
-            return None
+        async def save(self, *, update_fields: list[str] | None = None) -> None:
+            assert update_fields == [
+                'niconico_user_id',
+                'niconico_user_name',
+                'niconico_user_premium',
+                'niconico_access_token',
+                'niconico_refresh_token',
+                'updated_at',
+            ]
 
     local_user = LocalUser()
 

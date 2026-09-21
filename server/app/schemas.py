@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Literal, NotRequired, cast
+from typing import Annotated, Any, Literal, NotRequired, cast
 from uuid import UUID
 
 from pydantic import (
@@ -20,7 +20,22 @@ from tortoise.contrib.pydantic import PydanticModel
 from typing_extensions import TypedDict
 
 from app.metadata.RecordedPlaybackIndex import RECORDED_PLAYBACK_INDEX_VERSION
+from app.utils.HostPath import ToHostPath
 from app.utils.TSInformation import TerrestrialRegion
+
+
+def SerializeHostPath(path: str) -> str:
+    """
+    内部処理用の runtime path を API へ公開するホスト絶対パスへ変換する。
+
+    Args:
+        path (str): KonomiTV-BS4K 内部で利用している実アクセス用パス。
+
+    Returns:
+        str: 外部へ公開できるホスト絶対パス。
+    """
+
+    return str(ToHostPath(path))
 
 
 def SerializeRecordedEpisodeNumber(episode_number: Decimal) -> str:
@@ -213,12 +228,15 @@ class SubtitleTrack(TypedDict):
     pid: NotRequired[int]
     component_tag: NotRequired[int]
     program_number: NotRequired[int]
+    source: NotRequired[Literal['Sidecar']]
 
 class RecordedVideo(PydanticModel):
     # デフォルト値は録画番組からメタデータを取得する処理向け
     id: int = -1  # メタデータ取得時は ID が定まらないため -1 を設定
     status: Literal['Recording', 'Analyzing', 'Recorded', 'AnalysisFailed', 'Deleting', 'DeleteFailed']
-    file_path: str
+    # 内部では再生・解析・削除に必要な runtime path を保ち、JSON 境界でだけホスト表現へ戻す。
+    file_path: Annotated[str, PlainSerializer(SerializeHostPath, return_type=str, when_used='json')]
+    storage_location: Literal['Local', 'Cloud'] = 'Local'
     file_hash: str
     file_size: int
     file_created_at: datetime
@@ -289,6 +307,27 @@ class RecordedVideo(PydanticModel):
         representative_stream = self._representative_video_stream
         return representative_stream.get('display_aspect_ratio') if representative_stream is not None else None
 
+    @computed_field
+    @property
+    def video_hdr(self) -> str | None:
+        # 代表区間 (最長) の color_transfer。索引なし / transfer なしは None (UI は「不明」)。
+        representative_stream = self._representative_video_stream
+        if representative_stream is None:
+            return None
+        color_transfer = representative_stream.get('color_transfer')
+        if color_transfer is None or color_transfer == '':
+            return None
+        if color_transfer == 'arib-std-b67':
+            return 'HLG'
+        if color_transfer == 'smpte2084':
+            return 'PQ'
+        return color_transfer
+
+    @computed_field
+    @property
+    def playback_completion_threshold(self) -> float:
+        return GetPlaybackCompletionThreshold(self.duration, self.cm_sections)
+
 
 class RecordedPlaybackIndex(PydanticModel):
     status: Literal['Pending', 'Analyzing', 'Ready', 'Failed']
@@ -333,6 +372,7 @@ KonomiTVBS4KPlaybackCapabilityReason = Literal[
     'BitDepthMismatch',
     'ProfileMismatch',
     'UnsupportedCombination',
+    'UnsupportedByDevice',
 ]
 
 
@@ -456,6 +496,81 @@ class KonomiTVBS4KSpeedTestQualityThreshold(BaseModel):
     required_mbps: Annotated[float, Field(gt=0)]
     basis: Literal['VariableBitrate', 'FixedMuxrate']
 
+# ***** コーデック対応 (KonomiTV-BS4K サーバー診断) *****
+
+KonomiTVBS4KCodecSupportStatus = Literal['Idle', 'Running', 'Completed', 'Failed']
+KonomiTVBS4KCodecSupportMediaType = Literal['Video', 'Audio']
+KonomiTVBS4KCodecSupportDeviceKind = Literal['CPU', 'GPU']
+KonomiTVBS4KCodecSupportDeviceVendor = Literal['Intel', 'NVIDIA', 'AMD', 'None']
+KonomiTVBS4KCodecSupportOperationStatus = Literal['Supported', 'Likely', 'Unsupported', 'Unknown']
+KonomiTVBS4KCodecSupportEvidence = Literal[
+    'VerifiedProbe',
+    'Driver',
+    'Binary',
+    'ProbeFailed',
+    'Unavailable',
+]
+KonomiTVBS4KCodecSupportBackend = Literal['FFmpeg', 'QSV', 'NVENC', 'AMF']
+KonomiTVBS4KCodecSupportReasonCode = Literal[
+    'BinaryUnavailable',
+    'EncoderUnavailable',
+    'DecoderUnavailable',
+    'DeviceUnavailable',
+    'DeviceInitializationFailed',
+    'FilterUnavailable',
+    'EncodeFailed',
+    'DecodeFailed',
+    'CodecMismatch',
+    'BitDepthMismatch',
+    'ProfileMismatch',
+    'ProbeTimeout',
+    'ProbeFailed',
+    'ProbeInputUnavailable',
+    'UnsupportedCombination',
+    'UnsupportedByDevice',
+]
+
+
+class KonomiTVBS4KCodecSupportJob(BaseModel):
+    """管理者専用のサーバー診断共有ジョブの状態。実行中は部分結果を含む。"""
+
+    status: KonomiTVBS4KCodecSupportStatus
+    progress: Annotated[float, Field(ge=0.0, le=1.0)]
+    environment_signature: str | None
+    devices: list[KonomiTVBS4KCodecSupportDevice]
+
+
+class KonomiTVBS4KCodecSupportDevice(BaseModel):
+    """診断対象の CPU / GPU。render node パス・PCI BDF・UUID・stderr 全文は含めない。"""
+
+    id: str
+    label: str
+    kind: KonomiTVBS4KCodecSupportDeviceKind
+    vendor: KonomiTVBS4KCodecSupportDeviceVendor
+    capabilities: list[KonomiTVBS4KCodecSupportCapability]
+
+
+class KonomiTVBS4KCodecSupportCapability(BaseModel):
+    """1つの映像・音声コーデックの decode / encode 能力。"""
+
+    media_type: KonomiTVBS4KCodecSupportMediaType
+    codec: str
+    profile: str | None
+    bit_depth: Literal[8, 10] | None
+    decode: KonomiTVBS4KCodecSupportOperationSupport
+    encode: KonomiTVBS4KCodecSupportOperationSupport
+    used_by_konomitv_bs4k: bool
+
+
+class KonomiTVBS4KCodecSupportOperationSupport(BaseModel):
+    """1つの decode / encode operation の状態と根拠。"""
+
+    status: KonomiTVBS4KCodecSupportOperationStatus
+    evidence: KonomiTVBS4KCodecSupportEvidence
+    backend: KonomiTVBS4KCodecSupportBackend | None
+    reason_code: KonomiTVBS4KCodecSupportReasonCode | None
+    tested_configuration: str | None
+
 # ***** バックグラウンド解析履歴 *****
 
 class AnalysisTaskExecution(BaseModel):
@@ -465,7 +580,7 @@ class AnalysisTaskExecution(BaseModel):
     task_type: Literal[
         'RecordedScan', 'MetadataAnalysis', 'PlaybackIndex', 'ThumbnailGeneration', 'CMAnalysis',
         'CMLogoGeneration', 'BatchScan', 'BatchMetadataReanalysis', 'BatchCMAnalysis',
-        'BatchSeriesResolution', 'BatchEpisodeResolution', 'BackgroundAnalysis',
+        'BatchSeriesResolution', 'BatchEpisodeResolution', 'BatchSeriesPipeline', 'BackgroundAnalysis',
     ]
     status: Literal['Queued', 'Running', 'Succeeded', 'Failed', 'Interrupted', 'Skipped']
     trigger: Literal['Automatic', 'Manual', 'Maintenance', 'StartupBackfill']
@@ -487,10 +602,23 @@ class AnalysisTaskExecution(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+class SeriesAIFallbackStatus(BaseModel):
+    state: Literal['Running', 'Idle', 'Disabled', 'Stopped']
+    stopped_reason: str | None
+    total_groups: int
+    processed_groups: int
+    resolved_count: int
+    not_series_count: int
+    insufficient_evidence_count: int
+    failed_count: int
+    pending_count: int
+    cancelled_count: int
+    current_title: str | None
+
 class AnalysisTaskOverview(BaseModel):
     active: list[AnalysisTaskExecution]
     active_children: list[AnalysisTaskExecution]
-    recent: list[AnalysisTaskExecution]
+    series_ai_fallback: SeriesAIFallbackStatus
 
 class AnalysisTaskList(BaseModel):
     total: int
@@ -551,6 +679,39 @@ class SegmentMapEntry(TypedDict):
 class CMSection(TypedDict):
     start_time: float
     end_time: float
+
+
+def GetPlaybackCompletionThreshold(duration: float, cm_sections: list[CMSection] | None) -> float:
+    """録画番組を視聴完了とみなす再生位置を算出する。
+
+    Args:
+        duration (float): 録画ファイル全体の再生時間 (秒)。
+        cm_sections (list[CMSection] | None): 検出済みの CM 区間。
+
+    Returns:
+        float: 録画先頭基準の視聴完了位置 (秒)。
+    """
+
+    normalized_sections: list[CMSection] = []
+    for section in cm_sections or []:
+        start_time = max(0.0, min(float(section['start_time']), duration))
+        end_time = max(0.0, min(float(section['end_time']), duration))
+        if start_time >= end_time:
+            continue
+        normalized_sections.append(CMSection(start_time=start_time, end_time=end_time))
+    normalized_sections.sort(key=lambda section: (section['start_time'], section['end_time']))
+
+    merged_sections: list[CMSection] = []
+    for section in normalized_sections:
+        previous_section = merged_sections[-1] if len(merged_sections) > 0 else None
+        if previous_section is not None and section['start_time'] - previous_section['end_time'] < 60.0:
+            previous_section['end_time'] = max(previous_section['end_time'], section['end_time'])
+            continue
+        merged_sections.append(section)
+
+    if len(merged_sections) > 0:
+        return max(merged_sections[-1]['start_time'] - 3 * 60, 0.0)
+    return max(duration, 0.0) * 0.9
 
 class ThumbnailInfo(TypedDict):
     version: int
@@ -631,6 +792,15 @@ class CMLogoServiceAssignmentCreate(BaseModel):
     valid_from: Annotated[datetime | None, Field()]
     valid_until: Annotated[datetime | None, Field()]
 
+# ***** サーバー設定 *****
+
+class KonomiTVBS4KRenderDevice(BaseModel):
+    """QSV / AMF の HW エンコード固定指定の候補となる DRM render node。"""
+
+    path: str
+    vendor_id: str
+    vendor_name: str
+
 # ***** 録画番組 *****
 
 class RecordedProgram(PydanticModel):
@@ -650,6 +820,20 @@ class RecordedProgram(PydanticModel):
     series_title: str | None = None  # 番組タイトル解析に成功した場合のみセット
     episode_number: str | None = None  # 番組タイトル解析に成功した場合のみセット
     subtitle: str | None = None  # 番組タイトル解析に成功した場合のみセット
+    bangumi_subject_id: int | None = None  # Bangumi 条目との照合に成功した場合のみセット
+    bangumi_episode_id: int | None = None  # Bangumi エピソードとの照合に成功した場合のみセット
+    series_episode: SeriesEpisode | None = None  # 構造化話数の割当がある場合のみ設定側で付与する
+
+    @field_validator('series_episode', mode='before')
+    @classmethod
+    def ConvertUnfetchedSeriesEpisode(cls, value: Any) -> Any:
+        # 未 prefetch のリレーションは QuerySet として渡されるため、検証せず null へ倒す。
+        # prefetch 済み ORM・dict・schema はそのまま検証し、欠落だけを null とする。
+        if value is None or isinstance(value, dict):
+            return value
+        if hasattr(value, 'season_number') and hasattr(value, 'episode_number'):
+            return value
+        return None
     description: str = '番組概要を取得できませんでした。'
     detail: dict[str, str] = {}
     start_time: datetime
@@ -675,6 +859,18 @@ class Series(PydanticModel):
     title: str
     description: str
     genres: list[Genre]
+    bangumi_subject_id: int | None = None
+    bangumi_subject_name: str | None = None
+    bangumi_subject_name_cn: str | None = None
+    bangumi_subject_summary: str | None = None
+    # TMDb 由来の補完メタデータ。media type は models.Series.TmdbMediaType と同じ 2 値。
+    tmdb_id: Annotated[int | None, Field()] = None
+    tmdb_media_type: Annotated[Literal['tv', 'movie'] | None, Field()] = None
+    # 参照する TMDb 作品内の Season 番号。NULL は作品全体バインド (Season 未確定・movie を含む従来動作)。
+    tmdb_season_number: Annotated[int | None, Field()] = None
+    tmdb_name: Annotated[str | None, Field()] = None
+    tmdb_overview: Annotated[str | None, Field()] = None
+    episodes: list[SeriesEpisode] = []
     broadcast_periods: list[SeriesBroadcastPeriod]
     created_at: datetime
     updated_at: datetime
@@ -682,6 +878,66 @@ class Series(PydanticModel):
 class SeriesList(BaseModel):
     total: int
     series_list: list[Series]
+
+# シリーズ一覧のソートキー。既存の order=desc|asc (updated_at の方向) と組み合わせる。
+SeriesSummarySort = Literal[
+    'updated_at',
+    'title_reading',
+    'first_air_date',
+    'tmdb_popularity',
+    'tmdb_vote_average',
+    'bangumi_rating',
+]
+
+class SeriesSummary(BaseModel):
+    id: Annotated[int, Field(description='シリーズ ID。')]
+    title: Annotated[str, Field(description='作品名。')]
+    description: Annotated[str, Field(description='シリーズの説明。')]
+    genres: Annotated[list[Genre], Field(description='ジャンル。')]
+    bangumi_subject_id: Annotated[int | None, Field(description='Bangumi 条目 ID。')]
+    bangumi_subject_name: Annotated[str | None, Field(description='Bangumi 原名。')]
+    bangumi_subject_name_cn: Annotated[str | None, Field(description='Bangumi 中文名。')]
+    bangumi_subject_summary: Annotated[str | None, Field(description='Bangumi 概要。')]
+    tmdb_id: Annotated[int | None, Field(description='TMDb 作品 ID。')]
+    tmdb_media_type: Annotated[
+        Literal['tv', 'movie'] | None,
+        Field(description='TMDb の作品種別。models.Series.TmdbMediaType と同じ 2 値。'),
+    ]
+    tmdb_season_number: Annotated[int | None, Field(description='参照する TMDb 作品内の Season 番号。NULL は作品全体バインド。')]
+    tmdb_name: Annotated[str | None, Field(description='TMDb の作品名。')]
+    tmdb_overview: Annotated[str | None, Field(description='TMDb の概要。')]
+    recorded_count: Annotated[int, Field(description='再生可能録画の件数。')]
+    unrecorded_count: Annotated[int, Field(description='番号付き話の欠番件数。')]
+    partial_count: Annotated[int, Field(description='部分録画として表示する局別セルの件数。')]
+    latest_recorded_program_id: Annotated[int | None, Field(description='最新録画の番組 ID。サムネイル用。')]
+    updated_at: Annotated[datetime, Field(description='Series の更新日時。')]
+    season_members: Annotated[list[SeriesSummaryMember], Field(description='TMDb 作品単位でグループ化した成员。非グループ行は自分自身1件。')]
+
+class SeriesSummaryMember(BaseModel):
+    series_id: Annotated[int, Field(description='成员 Series の ID。')]
+    season_number: Annotated[int | None, Field(description='成员の TMDb Season 番号。未バインドは NULL。')]
+
+class SeriesSummaryList(BaseModel):
+    total: Annotated[int, Field(description='検索条件に一致する総件数。')]
+    page_size: Annotated[int, Field(description='1 ページの件数。')]
+    series_list: Annotated[list[SeriesSummary], Field(description='カタログカード用の Series 要約。')]
+
+class SeriesOnAirSlot(BaseModel):
+    weekday: Annotated[int, Field(description='自然時刻の曜日。月曜=0。')]
+    hour: Annotated[int, Field(description='自然時刻の時。')]
+    minute: Annotated[int, Field(description='5 分丸めした分。')]
+    is_featured: Annotated[bool, Field(description='注目枠に入るとき True。')]
+    series: Annotated[SeriesSummary, Field(description='このスロットの作品。')]
+
+class SeriesOnAirDay(BaseModel):
+    weekday: Annotated[int, Field(description='自然時刻の曜日。月曜=0。')]
+    slots: Annotated[list[SeriesOnAirSlot], Field(description='その曜日のレギュラー。')]
+
+class SeriesOnAirResponse(BaseModel):
+    days: Annotated[list[SeriesOnAirDay], Field(description='月曜始まりの 7 列。')]
+
+class SeriesListPosition(BaseModel):
+    page: Annotated[int, Field(description='カタログ一覧上のページ番号。1 以上。')]
 
 class SeriesBroadcastPeriod(PydanticModel):
     channel: Channel
@@ -719,40 +975,27 @@ class User(PydanticModel):
     niconico_user_id: int | None
     niconico_user_name: str | None
     niconico_user_premium: bool | None
-    twitter_accounts: list[TwitterAccount]  # 追加カラム
-    bluesky_accounts: list[BlueskyAccount]  # 追加カラム
-    account_links: list[AccountLink]  # 追加カラム
-    created_at: datetime
-    updated_at: datetime
-
-class AccountLink(PydanticModel):
-    id: int
-    twitter_account: TwitterAccount
-    bluesky_account: BlueskyAccount
     created_at: datetime
     updated_at: datetime
 
 class Users(RootModel[list[User]]):
     pass
 
-# ***** Twitter / Bluesky 連携 *****
+class BangumiAuthRequest(BaseModel):
+    access_token: Annotated[str, Field(min_length=1, max_length=512)]
 
-class TwitterAccount(PydanticModel):
-    id: int
-    name: str
-    screen_name: str
-    icon_url: str
-    created_at: datetime
-    updated_at: datetime
+class BangumiPlaybackProgressRequest(BaseModel):
+    playback_position: Annotated[float, Field(ge=0)]
+    duration: Annotated[float, Field(gt=0)]
 
-class BlueskyAccount(PydanticModel):
-    id: int
-    did: str
-    handle: str
-    name: str
-    icon_url: str
-    created_at: datetime
-    updated_at: datetime
+class BangumiPlaybackProgressResponse(BaseModel):
+    status: Literal['Completed', 'AlreadyCompleted', 'Pending', 'NotEligible']
+
+class KonomiTVBS4KBangumiProfile(BaseModel):
+    bangumi_user_id: int | None
+    bangumi_user_name: str | None
+    bangumi_user_nickname: str | None
+    bangumi_user_avatar_url: str | None
 
 # モデルに関連しない API リクエストの構造を表す Pydantic モデル
 ## リクエストボティの JSON 構造と一致する
@@ -858,50 +1101,6 @@ class UserUpdateRequest(BaseModel):
 class UserUpdateRequestForAdmin(BaseModel):
     is_admin: bool | None = None
 
-class AccountLinkCreateRequest(BaseModel):
-    twitter_account_id: int
-    bluesky_account_id: int
-
-# ***** Twitter 連携 *****
-
-class TwitterCookieAuthRequest(BaseModel):
-    cookies_txt: str
-    browser_info: BrowserEnvironmentInfoRequest | None = None
-
-class BrowserEnvironmentInfoRequest(BaseModel):
-    user_agent_data: BrowserEnvironmentUserAgentData
-    navigator_platform: str
-    locale: str
-    timezone: str
-
-class BrowserEnvironmentInfo(TypedDict):
-    http_headers: BrowserEnvironmentHTTPHeaders  # /api/twitter/auth の HTTP リクエストヘッダーから抽出した情報
-    user_agent_data: BrowserEnvironmentUserAgentData
-    navigator_platform: str
-    locale: str
-    timezone: str
-
-class BrowserEnvironmentHTTPHeaders(TypedDict):
-    user_agent: str | None
-    accept_language: str | None
-    accept_languages: list[str]
-    sec_ch_ua: str | None
-    sec_ch_ua_mobile: str | None
-    sec_ch_ua_platform: str | None
-
-class BrowserEnvironmentUserAgentData(TypedDict):
-    platform: str
-    platform_version: str
-    architecture: str
-    bitness: str
-    mobile: bool
-    model: str
-    wow64: bool
-
-class BlueskyAuthRequest(BaseModel):
-    handle: str
-    app_password: str
-
 # モデルに関連しない API レスポンスの構造を表す Pydantic モデル
 ## レスポンスボディの JSON 構造と一致する
 
@@ -923,6 +1122,10 @@ class LiveStreamStatus(BaseModel):
     is_rain_fallback: bool | None = None
     # 降雨対応サービスの完全MPTにVideoが存在するか。未判定・監視不能ならNone
     is_rain_fallback_broadcasting: bool | None = None
+    # B60 0x8010 video_transfer_characteristics (1-5)。未観測なら None
+    b60_video_transfer: int | None = None
+    # MH-EIT 現在番組の HDR アイコン。未観測なら None、番組はあるがアイコンなしなら False
+    mh_eit_hdr_hint: bool | None = None
 
 
 class LivePrepareLeaseRequest(BaseModel):
@@ -1234,66 +1437,6 @@ class JikkyoComments(BaseModel):
 class ThirdpartyAuthURL(BaseModel):
     authorization_url: str
 
-# ***** Twitter 連携 *****
-
-class Tweet(BaseModel):
-    source: Literal['Twitter', 'Bluesky']
-    id: str
-    created_at: datetime
-    user: TweetUser
-    text: str
-    lang: str
-    via: str
-    image_urls: list[str] | None
-    movie_url: str | None
-    retweet_count: int
-    retweeted: bool
-    favorite_count: int
-    favorited: bool
-    retweeted_tweet: Tweet | None
-    quoted_tweet: Tweet | None
-
-class TweetUser(BaseModel):
-    source: Literal['Twitter', 'Bluesky']
-    id: str
-    name: str
-    screen_name: str
-    icon_url: str
-
-class TwitterAPIResult(BaseModel):
-    is_success: bool
-    detail: str
-
-class PostTweetResult(TwitterAPIResult):
-    tweet_url: str
-    tweet_id: str | None = None
-    post_uri: str | None = None
-    post_cid: str | None = None
-
-class TimelineLoadMoreCursor(BaseModel):
-    cursor_type: Literal['Older', 'Gap', 'ShowMore']
-    cursor_id: str
-    entry_id: str | None
-    upper_created_at: datetime | None
-    lower_created_at: datetime | None
-
-class TimelineTweetsResult(TwitterAPIResult):
-    tweets: list[Tweet]
-    newer_cursor_id: str | None
-    load_more_cursors: list[TimelineLoadMoreCursor]
-    is_cursor_consumed: bool
-
-class TwitterGraphQLAPIEndpointInfo(BaseModel):
-    method: Literal['GET', 'POST']
-    query_id: str
-    endpoint: str
-    features: dict[str, bool] | None
-
-    @computed_field
-    @property
-    def path(self) -> str:
-        return f'/i/api/graphql/{self.query_id}/{self.endpoint}'
-
 # ***** ユーザー *****
 
 class UserAccessToken(BaseModel):
@@ -1316,3 +1459,6 @@ class VersionInformation(BaseModel):
     bs4k_ignore_viewer_low_latency: bool
     konomitv_bs4k_live_transport: Literal['MpegTs', 'Tlv']
     jikkyo_enabled: bool
+    # 視聴経路向けの非機密 runtime 情報。DPlayer HDR 出力のデバッグ項目表示に使う。
+    # フルの /api/settings/server はホストパスを含むため、視聴経路ではこちらを使う。
+    debug: bool

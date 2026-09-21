@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 import puremagic
 import pytest
 from fastapi import HTTPException, status
-from fastapi.routing import APIRoute
+from fastapi.routing import RouteContext
 from httpx import ASGITransport
 from httpx import AsyncClient as HTTPXAsyncClient
 from starlette.datastructures import Headers, UploadFile
@@ -27,6 +27,10 @@ from app.routers import (
     VideosRouter,
 )
 from app.routers.UsersRouter import GetCurrentAdminUser, GetCurrentUser
+from app.utils.KonomiTVBS4KFastAPIRouteUtils import IterateKonomiTVBS4KAPIRouteContexts
+from app.utils.KonomiTVBS4KRequestBodyLimit import (
+    KonomiTVBS4KRequestBodyLimitMiddleware,
+)
 
 
 if config_module._CONFIG is None:
@@ -61,7 +65,7 @@ def _ClearMainAppOverrides() -> None:
     main_app.dependency_overrides.pop(GetCurrentAdminUser, None)
 
 
-def _RouteDependsOn(route: APIRoute, dependency: Any) -> bool:
+def _RouteDependsOn(route: RouteContext, dependency: Any) -> bool:
     # include_router の dependencies と endpoint 引数の Depends の両方を見る
     for item in route.dependencies:
         if item.dependency is dependency:
@@ -72,10 +76,8 @@ def _RouteDependsOn(route: APIRoute, dependency: Any) -> bool:
     return False
 
 
-def _FindRoute(path: str, method: str) -> APIRoute:
-    for route in main_app.routes:
-        if not isinstance(route, APIRoute):
-            continue
+def _FindRoute(path: str, method: str) -> RouteContext:
+    for route in IterateKonomiTVBS4KAPIRouteContexts(main_app.routes):
         if route.path != path:
             continue
         if method.upper() not in (route.methods or set()):
@@ -349,7 +351,10 @@ def test_capture_body_limit_middleware_rejects_content_length_before_body_read()
     async def downstream_app(_scope: Scope, _receive: Receive, _send: Send) -> None:
         raise AssertionError('downstream app must not run when Content-Length exceeds the limit')
 
-    middleware = CapturesRouter.CaptureUploadBodyLimitMiddleware(downstream_app)
+    middleware = KonomiTVBS4KRequestBodyLimitMiddleware(
+        downstream_app,
+        (CapturesRouter.CAPTURE_UPLOAD_BODY_LIMIT,),
+    )
     asyncio.run(middleware(scope, tracking_receive, tracking_send))
 
     assert receive_call_count == 0
@@ -426,7 +431,10 @@ def test_capture_body_limit_middleware_stops_streamed_body_before_full_spool() -
             'more_body': False,
         })
 
-    middleware = CapturesRouter.CaptureUploadBodyLimitMiddleware(body_consuming_app)
+    middleware = KonomiTVBS4KRequestBodyLimitMiddleware(
+        body_consuming_app,
+        (CapturesRouter.CAPTURE_UPLOAD_BODY_LIMIT,),
+    )
     asyncio.run(middleware(scope, streaming_receive, tracking_send))
 
     # 超過検知後は source の残りも後段への本文も読まず、直ちに 413 へ切り替える

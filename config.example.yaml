@@ -35,6 +35,12 @@ general:
     # MpegTs 選択時は null のままで構いません。
     konomitv_bs4k_tlv_mirakurun_url: null
 
+    # QSV / AMF の HW エンコードで利用する DRM render node の固定指定
+    # null (デフォルト) なら、エンコーダーの vendor ID に一致する render node を自動選択します。
+    # 複数 GPU 環境で特定の GPU だけを使いたい場合は、/dev/dri/renderD128 のようなコンテナ内パスを指定してください。
+    # 指定した render node が見えない環境では、警告を出した上で自動選択に戻ります。
+    konomitv_bs4k_encoder_render_device: null
+
     # 利用するエンコーダー
     # BS4K のライブ視聴や録画視聴以外で使用されます。
     # FFmpeg・QSV・NVENC・AMF から選択してください。
@@ -111,10 +117,6 @@ server:
     # KonomiTV-BS4K サーバーのリッスンポート
     # デフォルトのリッスンポートは 7000 です。
     port: 7000
-
-    # 録画シリーズ AI で使用する製品用 OpenCode serve のリッスンポート
-    # 通常はデフォルトの 4097 から変更する必要はありません。
-    opencode_serve_port: 4097
 
     # HTTPS / リバースプロキシの動作モード
     # akebi (既定): Akebi Keyless Server が port で HTTPS を提供します。証明書設定と trusted_proxy_cidrs は指定できません。

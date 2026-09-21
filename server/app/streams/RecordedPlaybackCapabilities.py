@@ -5,18 +5,23 @@ import hashlib
 import json
 import os
 import tempfile
+import time
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
 from app import logging
-from app.constants import LIBRARY_PATH
+from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
+from app.streams.KonomiTVBS4KExternalProcessLimiter import (
+    KonomiTVBS4KExternalProcessLimiter,
+)
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KonomiTVBS4KPlaybackCapabilityReason,
     KonomiTVBS4KPlaybackEncoder,
     KonomiTVBS4KVideoBitDepth,
     KonomiTVBS4KVideoCodec,
+    ResolveKonomiTVBS4KPlaybackVideoBitrate,
 )
 
 
@@ -51,11 +56,26 @@ class RecordedPlaybackCapability:
     reason_code: RecordedPlaybackCapabilityReason | None
 
 
-RecordedPlaybackCapabilityKey = tuple[
+RecordedPlaybackCapabilityBaseKey = tuple[
     RecordedPlaybackEncoder,
     RecordedPlaybackVideoCodec,
     RecordedPlaybackBitDepth,
 ]
+RecordedPlaybackCapabilityKey = RecordedPlaybackCapabilityBaseKey | tuple[
+    RecordedPlaybackEncoder,
+    RecordedPlaybackVideoCodec,
+    RecordedPlaybackBitDepth,
+    QUALITY_TYPES,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedRenderDevice:
+    """設定画面での固定指定候補となる DRM render node を表す。"""
+
+    path: str
+    vendor_id: str
+    vendor_name: str
 
 
 @dataclass(slots=True)
@@ -72,13 +92,26 @@ class RecordedPlaybackBackend:
         'FFmpeg': {'avc': 'libx264', 'hevc': 'libx265', 'vp9': 'libvpx-vp9', 'av1': 'libaom-av1'},
         'QSV': {'avc': 'h264_qsv', 'hevc': 'hevc_qsv', 'vp9': 'vp9_qsv', 'av1': 'av1_qsv'},
         'NVENC': {'avc': 'h264_nvenc', 'hevc': 'hevc_nvenc', 'vp9': None, 'av1': 'av1_nvenc'},
-        'AMF': {'avc': 'h264_amf', 'hevc': 'hevc_amf', 'vp9': None, 'av1': 'av1_amf'},
+        # 公開名 AMF は設定互換のため残し、実エンコードは Mesa VAAPI を使う。
+        # proprietary AMF はホスト kernel と amdgpu-pro の ABI がずれると初期化できない。
+        'AMF': {'avc': 'h264_vaapi', 'hevc': 'hevc_vaapi', 'vp9': None, 'av1': 'av1_vaapi'},
     }
 
     _VENDOR_IDS: ClassVar[dict[RecordedPlaybackEncoder, str]] = {
         'QSV': '0x8086',
         'AMF': '0x1002',
     }
+    # sysfs の vendor ID から設定画面へ表示する vendor 名への対応
+    # NVIDIA は QSV / AMF の利用対象外だが、render node が列挙された際の識別表示のために含める
+    _VENDOR_NAMES: ClassVar[dict[str, str]] = {
+        '0x8086': 'Intel',
+        '0x1002': 'AMD',
+        '0x10de': 'NVIDIA',
+    }
+    # 見えていない固定指定の警告は能力 probe の行列で繰り返し呼ばれても 1 プロセス 1 回に留める
+    _STALE_RENDER_DEVICE_WARNED: ClassVar[bool] = False
+    # vendor 不一致の固定指定の警告も同様に 1 プロセス 1 回に留める
+    _VENDOR_MISMATCH_RENDER_DEVICE_WARNED: ClassVar[bool] = False
     _AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/opt/amdgpu/lib/x86_64-linux-gnu/dri')
     _AMD_MESA_VAAPI_DRIVER_DIRECTORY: ClassVar[Path] = Path('/usr/lib/x86_64-linux-gnu/dri')
 
@@ -231,6 +264,39 @@ class RecordedPlaybackBackend:
             return cls._AMD_PROPRIETARY_VAAPI_DRIVER_DIRECTORY
         return cls._AMD_MESA_VAAPI_DRIVER_DIRECTORY
 
+    @staticmethod
+    def getRenderDeviceVendorId(device_path: str) -> str | None:
+        """render node の sysfs vendor ID を返す。
+
+        Args:
+            device_path: /dev/dri/renderD* のパス。
+
+        Returns:
+            小文字の vendor ID (例: 0x8086)。sysfs から読めない場合は None。
+        """
+
+        try:
+            return Path(f'/sys/class/drm/{Path(device_path).name}/device/vendor').read_text().strip().lower()
+        except OSError:
+            return None
+
+    @classmethod
+    def matchesEncoderVendor(cls, device_path: str, encoder: RecordedPlaybackEncoder) -> bool:
+        """render node の vendor が encoder の対象 GPU vendor と一致するかを返す。
+
+        Args:
+            device_path: /dev/dri/renderD* のパス。
+            encoder: 公開設定上のエンコーダー名。
+
+        Returns:
+            vendor が一致する場合 True。QSV / AMF 以外の encoder や vendor が読めない場合は False。
+        """
+
+        expected_vendor_id = cls._VENDOR_IDS.get(encoder)
+        if expected_vendor_id is None:
+            return False
+        return cls.getRenderDeviceVendorId(device_path) == expected_vendor_id
+
     @classmethod
     def discoverRenderDevices(cls, encoder: RecordedPlaybackEncoder) -> list[str]:
         """vendor IDが一致するDRM render nodeを列挙する。
@@ -247,12 +313,80 @@ class RecordedPlaybackBackend:
             return []
         devices: list[str] = []
         for device_path in sorted(Path('/sys/class/drm').glob('renderD*/device')):
+            # コンテナの sysfs にはホストの全 render node が見えるため、vendor 一致だけで選ぶと
+            # Compose で割り当てていない node を選び得る。/dev/dri に実在する node だけを候補にする
+            render_node = Path(f'/dev/dri/{device_path.parent.name}')
+            if render_node.exists() is False:
+                continue
             try:
                 if device_path.joinpath('vendor').read_text().strip().lower() == vendor_id:
-                    devices.append(f'/dev/dri/{device_path.parent.name}')
+                    devices.append(str(render_node))
             except OSError:
                 continue
         return devices
+
+    @classmethod
+    def listRenderDevices(cls) -> list[RecordedRenderDevice]:
+        """コンテナから見える全 DRM render node を vendor 情報付きで列挙する。
+
+        Returns:
+            設定画面での固定指定の候補となる render node 一覧。
+        """
+
+        devices: list[RecordedRenderDevice] = []
+        for device_path in sorted(Path('/sys/class/drm').glob('renderD*/device')):
+            # コンテナの sysfs にはホストの全 render node が見えるため、/dev/dri に実在しない
+            # (Compose で割り当てていない) node を設定画面の候補へ表示しない
+            render_node = Path(f'/dev/dri/{device_path.parent.name}')
+            if render_node.exists() is False:
+                continue
+            try:
+                vendor_id = device_path.joinpath('vendor').read_text().strip().lower()
+            except OSError:
+                continue
+            devices.append(RecordedRenderDevice(
+                path = str(render_node),
+                vendor_id = vendor_id,
+                vendor_name = cls._VENDOR_NAMES.get(vendor_id, 'Unknown'),
+            ))
+        return devices
+
+    @classmethod
+    def resolveRenderDevices(cls, encoder: RecordedPlaybackEncoder) -> list[str]:
+        """設定で固定指定された render node、または vendor ID が一致する自動列挙を返す。
+
+        Args:
+            encoder: QSVまたはAMFを表す公開エンコーダー名。
+
+        Returns:
+            デバイス初期化を試す順番のrender node一覧。
+        """
+
+        # config.py が validator から本モジュールを遅延 import するため、こちらからの参照も遅延させて循環を避ける
+        from app.config import Config
+        pinned_device = Config().general.konomitv_bs4k_encoder_render_device
+        if pinned_device is not None:
+            # render node の番号は再起動やハードウェア構成で入れ替わるため、見えていない固定指定は
+            # 起動不能にせず警告へ留め、自動選択へ退避する
+            if Path(pinned_device).exists():
+                # 固定指定は encoder / encoder_bs4k で共通の1つしかないため、vendor が合わない
+                # encoder へ無条件に適用すると Intel / AMD 併用環境で必ず片方の初期化が失敗する。
+                # vendor が一致する encoder にだけ固定を適用し、合わない側は自動選択へ退避する
+                if cls.matchesEncoderVendor(pinned_device, encoder) is True:
+                    return [pinned_device]
+                if cls._VENDOR_MISMATCH_RENDER_DEVICE_WARNED is False:
+                    cls._VENDOR_MISMATCH_RENDER_DEVICE_WARNED = True
+                    logging.warning(
+                        f'Configured render device does not match the {encoder} GPU vendor, '
+                        f'falling back to auto selection. [device: {pinned_device}]'
+                    )
+            elif cls._STALE_RENDER_DEVICE_WARNED is False:
+                cls._STALE_RENDER_DEVICE_WARNED = True
+                logging.warning(
+                    'Configured render device is not available, falling back to auto selection. '
+                    f'[device: {pinned_device}]'
+                )
+        return cls.discoverRenderDevices(encoder)
 
     @classmethod
     def buildProbeCommand(
@@ -262,6 +396,9 @@ class RecordedPlaybackBackend:
         bit_depth: RecordedPlaybackBitDepth,
         output_path: Path,
         device: str | None,
+        *,
+        quality: QUALITY_TYPES | None = None,
+        cuda_ordinal: int | None = None,
     ) -> list[str]:
         """能力検査用の短いfMP4生成コマンドを構築する。
 
@@ -271,6 +408,8 @@ class RecordedPlaybackBackend:
             bit_depth: 出力bit depth。
             output_path: 検査用fMP4の出力先。
             device: QSV/AMFで使うrender node。CPU/NVENCではNone。
+            quality: 実再生相当の出力解像度・フレームレートを検査する画質。
+            cuda_ordinal: NVENCで使うCUDAデバイス番号。Noneなら0。
 
         Returns:
             create_subprocess_exec()へそのまま渡せる完全な引数列。
@@ -292,28 +431,59 @@ class RecordedPlaybackBackend:
                 raise ValueError('QSV render device is required.')
             command += ['-init_hw_device', f'qsv=recorded_qsv:{device}', '-filter_hw_device', 'recorded_qsv']
         elif encoder == 'NVENC':
-            command += ['-init_hw_device', 'cuda=recorded_cuda:0', '-filter_hw_device', 'recorded_cuda']
+            command += [
+                '-init_hw_device',
+                f'cuda=recorded_cuda:{cuda_ordinal if cuda_ordinal is not None else 0}',
+                '-filter_hw_device',
+                'recorded_cuda',
+            ]
         elif encoder == 'AMF':
             if device is None:
                 raise ValueError('AMD render device is required.')
             command += ['-init_hw_device', f'vaapi=recorded_vaapi:{device}', '-filter_hw_device', 'recorded_vaapi']
 
-        # 一部のQSV HEVC/AV1 encoderは極端に小さい解像度を拒否するため、
-        # 能力判定がfalse negativeにならない最小限の16:9 fixtureを使う。
-        command += ['-f', 'lavfi', '-i', 'testsrc2=size=320x192:rate=10:duration=0.6']
+        # 入力生成自体のCPU・メモリ負荷は小さく保ち、scale後のsurfaceとencoder設定だけを
+        # 実画質へ揃える。これで8K非対応GPUを検出しつつ、8K fixture生成の余計な負荷を避ける。
+        frame_rate = (
+            '60000/1001'
+            if quality is not None and QUALITY[quality].is_60fps is True
+            else ('30000/1001' if quality is not None else '10')
+        )
+        command += ['-f', 'lavfi', '-i', f'testsrc2=size=320x192:rate={frame_rate}:duration=0.6']
         if encoder == 'FFmpeg':
-            command += ['-vf', f'format={spec.pixel_format}']
+            filters = []
+            if quality is not None:
+                filters += [
+                    f'scale=w={QUALITY[quality].width}:h={QUALITY[quality].height}:'
+                    'force_original_aspect_ratio=decrease',
+                    f'pad={QUALITY[quality].width}:{QUALITY[quality].height}:(ow-iw)/2:(oh-ih)/2',
+                ]
+            filters.append(f'format={spec.pixel_format}')
+            command += ['-vf', ','.join(filters)]
         elif encoder == 'QSV':
-            command += ['-vf', f'format={spec.encoder_pixel_format},hwupload=extra_hw_frames=32']
+            filters = [f'format={spec.encoder_pixel_format}', 'hwupload=extra_hw_frames=32']
+            if quality is not None:
+                filters.append(
+                    f'vpp_qsv=w={QUALITY[quality].width}:h={QUALITY[quality].height}:'
+                    f'format={spec.encoder_pixel_format}'
+                )
+            command += ['-vf', ','.join(filters)]
         elif encoder == 'NVENC':
-            command += ['-vf', f'format={spec.encoder_pixel_format},hwupload_cuda']
+            filters = [f'format={spec.encoder_pixel_format}', 'hwupload_cuda']
+            if quality is not None:
+                filters.append(
+                    f'scale_cuda=w={QUALITY[quality].width}:h={QUALITY[quality].height}:'
+                    f'format={spec.encoder_pixel_format}'
+                )
+            command += ['-vf', ','.join(filters)]
         else:
-            # AMF自体はsystem-memoryのNV12/P010を受けるため、能力検査でも実再生と同じ
-            # VAAPI upload/download境界を通し、ドライバーとAMFの両方を検査する。
+            # QSV/NVENC と同様に、upload 後の VAAPI 面を encoder へ直接渡す。
+            output_width = QUALITY[quality].width if quality is not None else 320
+            output_height = QUALITY[quality].height if quality is not None else 192
             command += [
                 '-vf',
-                f'format={spec.encoder_pixel_format},hwupload,scale_vaapi=w=320:h=192,'
-                f'hwdownload,format={spec.encoder_pixel_format}',
+                f'format={spec.encoder_pixel_format},hwupload,'
+                f'scale_vaapi=w={output_width}:h={output_height}:format={spec.encoder_pixel_format}',
             ]
 
         command += ['-an', '-c:v', ffmpeg_encoder]
@@ -326,7 +496,7 @@ class RecordedPlaybackBackend:
             # auto_scaleがhwupload_cuda後へ挿入されるのを防ぐ。
             command += ['-pix_fmt', 'cuda']
         elif encoder == 'AMF':
-            command += ['-pix_fmt', spec.encoder_pixel_format]
+            command += ['-pix_fmt', 'vaapi']
         if codec == 'avc':
             command += ['-profile:v', 'high']
         elif codec == 'hevc':
@@ -344,7 +514,30 @@ class RecordedPlaybackBackend:
                 command += ['-profile:v', '0']
             elif encoder != 'NVENC':
                 command += ['-profile:v', 'main']
+        if encoder == 'AMF' and codec == 'hevc':
+            # 実再生と同じく、Mesa VCN へ HEVC 符号化面の padding を事前通知する。
+            command += ['-mesa_hevc_alignment', '1']
         command += cls.getTuningArguments(encoder, codec)
+        if codec == 'hevc':
+            # 実再生と同じ sample entry を検査し、AMF では driver の in-band parameter sets も確認する。
+            command += ['-tag:v', 'hev1' if encoder == 'AMF' else 'hvc1']
+        if quality is not None:
+            bitrate = ResolveKonomiTVBS4KPlaybackVideoBitrate(quality, codec)
+            bitrate_max_kbps = int(bitrate.video_bitrate_max.removesuffix('K'))
+            command += [
+                '-r',
+                frame_rate,
+                '-fps_mode',
+                'cfr',
+                '-b:v',
+                bitrate.video_bitrate,
+                '-maxrate',
+                bitrate.video_bitrate_max,
+                '-bufsize',
+                f'{bitrate_max_kbps * 2}K',
+                '-aspect',
+                '16:9',
+            ]
         command += [
             '-frames:v',
             '6',
@@ -363,6 +556,7 @@ class RecordedPlaybackCapabilityProbe:
 
     _result: ClassVar[list[RecordedPlaybackCapability] | None] = None
     _individual_results: ClassVar[dict[RecordedPlaybackCapabilityKey, RecordedPlaybackCapability]] = {}
+    _individual_failure_timestamps: ClassVar[dict[RecordedPlaybackCapabilityKey, float]] = {}
     _signature: ClassVar[str | None] = None
     _signature_generation: ClassVar[int] = 0
     _lock: ClassVar[asyncio.Lock] = asyncio.Lock()
@@ -380,9 +574,15 @@ class RecordedPlaybackCapabilityProbe:
         'recorded_playback_probe_context',
         default = None,
     )
-    _probe_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
-    _probe_version: ClassVar[int] = 4
+    _probe_version: ClassVar[int] = 6
     _probe_timeout_seconds: ClassVar[float] = 20.0
+    _negative_probe_ttl_seconds: ClassVar[float] = 5.0
+    _transient_failure_reasons: ClassVar[frozenset[RecordedPlaybackCapabilityReason]] = frozenset({
+        'DeviceUnavailable',
+        'DeviceInitializationFailed',
+        'EncodeFailed',
+        'ProbeFailed',
+    })
 
     @classmethod
     async def getCapabilities(cls) -> list[RecordedPlaybackCapability]:
@@ -396,6 +596,7 @@ class RecordedPlaybackCapabilityProbe:
             signature = await cls.__getSignature()
             async with cls._lock:
                 generation = cls.__resetCacheForSignature(signature)
+                cls.__discardExpiredNegativeResults()
                 if cls._result is not None:
                     return cls._result
                 task = cls._matrix_inflight_tasks.get(generation)
@@ -425,14 +626,22 @@ class RecordedPlaybackCapabilityProbe:
         encoder: RecordedPlaybackEncoder,
         codec: RecordedPlaybackVideoCodec,
         bit_depth: RecordedPlaybackBitDepth,
+        *,
+        quality: QUALITY_TYPES | None = None,
     ) -> RecordedPlaybackCapability:
-        """指定した1組だけを実probeし、全32行の初回検査を強制せず返す。"""
+        """指定した1組・画質だけを実probeし、全32行の初回検査を強制せず返す。"""
 
-        key = (encoder, codec, bit_depth)
+        # 全行列の基礎能力と実画質能力を別キーにし、低解像度の成功を8Kへ流用しない。
+        key: RecordedPlaybackCapabilityKey = (
+            (encoder, codec, bit_depth)
+            if quality is None
+            else (encoder, codec, bit_depth, quality)
+        )
         while True:
             signature = await cls.__getSignature()
             async with cls._lock:
                 generation = cls.__resetCacheForSignature(signature)
+                cls.__discardExpiredNegativeResults()
                 cached = cls._individual_results.get(key)
                 if cached is not None:
                     return cached
@@ -447,7 +656,7 @@ class RecordedPlaybackCapabilityProbe:
                         ),
                         name = (
                             f'RecordedPlaybackCapabilityProbe-{generation}-'
-                            f'{encoder}-{codec}-{bit_depth}'
+                            f'{encoder}-{codec}-{bit_depth}-{quality or "baseline"}'
                         ),
                     )
                     cls._inflight_tasks[task_key] = task
@@ -476,9 +685,28 @@ class RecordedPlaybackCapabilityProbe:
         cls._signature_generation += 1
         cls._result = None
         cls._individual_results.clear()
+        cls._individual_failure_timestamps.clear()
         cls._selected_devices.clear()
         cls._signature = signature
         return cls._signature_generation
+
+    @classmethod
+    def __discardExpiredNegativeResults(cls) -> None:
+        """一時的な負結果だけをTTL経過後に破棄し、次回要求で再probe可能にする。"""
+
+        now = time.monotonic()
+        expired_keys = [
+            key
+            for key, failure_timestamp in cls._individual_failure_timestamps.items()
+            if now - failure_timestamp >= cls._negative_probe_ttl_seconds
+        ]
+        for key in expired_keys:
+            cls._individual_results.pop(key, None)
+            cls._individual_failure_timestamps.pop(key, None)
+            cls._selected_devices.pop(key, None)
+            # 基礎能力の負結果を含む全行列も同時に失効させ、再構築時に成功cacheだけを再利用する。
+            if len(key) == 3:
+                cls._result = None
 
     @classmethod
     def getSelectedDevice(
@@ -486,17 +714,23 @@ class RecordedPlaybackCapabilityProbe:
         encoder: RecordedPlaybackEncoder,
         codec: RecordedPlaybackVideoCodec | None = None,
         bit_depth: RecordedPlaybackBitDepth | None = None,
+        quality: QUALITY_TYPES | None = None,
     ) -> str | None:
-        """能力組み合わせで実際に成功したrender nodeを返す。"""
+        """能力組み合わせ・画質で実際に成功したrender nodeを返す。"""
 
         if codec is not None and bit_depth is not None:
-            return cls._selected_devices.get((encoder, codec, bit_depth))
+            key: RecordedPlaybackCapabilityKey = (
+                (encoder, codec, bit_depth)
+                if quality is None
+                else (encoder, codec, bit_depth, quality)
+            )
+            return cls._selected_devices.get(key)
         # CM解析のdecode専用候補ではcodecを固定できないため、同encoderで成功済みの任意deviceを返す。
         return next(
             (
                 device
-                for (selected_encoder, _, _), device in cls._selected_devices.items()
-                if selected_encoder == encoder
+                for key, device in cls._selected_devices.items()
+                if key[0] == encoder
             ),
             None,
         )
@@ -531,7 +765,20 @@ class RecordedPlaybackCapabilityProbe:
             async with cls._lock:
                 latest_generation = cls.__resetCacheForSignature(latest_signature)
                 if latest_generation == generation and latest_signature == signature:
-                    cls._result = result
+                    cls.__discardExpiredNegativeResults()
+                    # 行列構築中に初期の負結果がTTL切れした場合、その古い一覧を再び全行列cacheへ戻さない。
+                    is_current_result = all(
+                        cls._individual_results.get((
+                            capability.encoder,
+                            capability.codec,
+                            capability.bit_depth,
+                        )) is capability
+                        for capability in result
+                    )
+                    if is_current_result is True:
+                        cls._result = result
+                    else:
+                        result = None
             return result
         finally:
             async with cls._lock:
@@ -549,14 +796,14 @@ class RecordedPlaybackCapabilityProbe:
         encoders: tuple[RecordedPlaybackEncoder, ...] = ('FFmpeg', 'QSV', 'NVENC', 'AMF')
         codecs: tuple[RecordedPlaybackVideoCodec, ...] = ('avc', 'hevc', 'vp9', 'av1')
         bit_depths: tuple[RecordedPlaybackBitDepth, ...] = (8, 10)
-        keys: list[RecordedPlaybackCapabilityKey] = [
+        keys: list[RecordedPlaybackCapabilityBaseKey] = [
             (encoder, codec, bit_depth)
             for encoder in encoders
             for codec in codecs
             for bit_depth in bit_depths
         ]
         key_indexes = {key: index for index, key in enumerate(keys)}
-        probe_order: list[tuple[int, RecordedPlaybackCapabilityKey]] = [
+        probe_order: list[tuple[int, RecordedPlaybackCapabilityBaseKey]] = [
             (key_indexes[(encoder, codec, bit_depth)], (encoder, codec, bit_depth))
             for codec in codecs
             for bit_depth in bit_depths
@@ -586,17 +833,26 @@ class RecordedPlaybackCapabilityProbe:
         """署名世代と能力キーに対応する唯一の実probeを実行する。"""
 
         task_key = (generation, key)
-        encoder, codec, bit_depth = key
+        encoder, codec, bit_depth = key[:3]
+        quality = key[3] if len(key) == 4 else None
         try:
-            # exact要求を全行列の後ろへ滞留させず、実probe総数は全backend合計2件に制限する。
-            async with cls._probe_semaphore:
+            # exact要求を全行列の後ろへ滞留させず、実probe総数は全probe系合計2件に制限する。
+            async with KonomiTVBS4KExternalProcessLimiter.acquireSlot():
                 async with cls._lock:
                     if cls._signature_generation != generation or cls._signature != signature:
                         return None
                 context = _RecordedPlaybackProbeContext()
                 token = cls._probe_context.set(context)
                 try:
-                    capability = await cls.__probeOne(encoder, codec, bit_depth)
+                    if quality is None:
+                        capability = await cls.__probeOne(encoder, codec, bit_depth)
+                    else:
+                        capability = await cls.__probeOne(
+                            encoder,
+                            codec,
+                            bit_depth,
+                            quality = quality,
+                        )
                 finally:
                     cls._probe_context.reset(token)
 
@@ -605,7 +861,11 @@ class RecordedPlaybackCapabilityProbe:
             async with cls._lock:
                 latest_generation = cls.__resetCacheForSignature(latest_signature)
                 if latest_generation == generation and latest_signature == signature:
-                    cls._individual_results.setdefault(key, capability)
+                    cached = cls._individual_results.setdefault(key, capability)
+                    if cached.available is False and cached.reason_code in cls._transient_failure_reasons:
+                        cls._individual_failure_timestamps.setdefault(key, time.monotonic())
+                    else:
+                        cls._individual_failure_timestamps.pop(key, None)
                     if context.selected_device is not None:
                         cls._selected_devices.setdefault(key, context.selected_device)
             return outcome
@@ -655,8 +915,10 @@ class RecordedPlaybackCapabilityProbe:
         encoder: RecordedPlaybackEncoder,
         codec: RecordedPlaybackVideoCodec,
         bit_depth: RecordedPlaybackBitDepth,
+        *,
+        quality: QUALITY_TYPES | None = None,
     ) -> RecordedPlaybackCapability:
-        """1つの能力キーを実エンコードとFFprobe 8で検査する。"""
+        """1つの能力キー・画質を実エンコードとFFprobe 8で検査する。"""
 
         spec = RecordedPlaybackBackend.getCodecSpec(codec, bit_depth)
         if RecordedPlaybackBackend.isCombinationSupported(encoder, codec, bit_depth) is False:
@@ -669,7 +931,8 @@ class RecordedPlaybackCapabilityProbe:
         devices: list[str | None] = [None]
         if encoder in ('QSV', 'AMF'):
             # 同vendorでも世代ごとにcodec能力が異なるため、各能力キーで全deviceを試す。
-            devices = [*RecordedPlaybackBackend.discoverRenderDevices(encoder)]
+            # 固定指定がある場合は resolveRenderDevices がその render node だけを返す (vendor 不一致時は自動選択へ退避)。
+            devices = [*RecordedPlaybackBackend.resolveRenderDevices(encoder)]
             if len(devices) == 0:
                 return RecordedPlaybackCapability(encoder, codec, bit_depth, False, spec.profile, 'DeviceUnavailable')
 
@@ -677,7 +940,23 @@ class RecordedPlaybackCapabilityProbe:
         for device in devices:
             with tempfile.TemporaryDirectory(prefix='konomitv-bs4k-recorded-capability-') as temporary_directory:
                 output_path = Path(temporary_directory) / 'probe.mp4'
-                command = RecordedPlaybackBackend.buildProbeCommand(encoder, codec, bit_depth, output_path, device)
+                if quality is None:
+                    command = RecordedPlaybackBackend.buildProbeCommand(
+                        encoder,
+                        codec,
+                        bit_depth,
+                        output_path,
+                        device,
+                    )
+                else:
+                    command = RecordedPlaybackBackend.buildProbeCommand(
+                        encoder,
+                        codec,
+                        bit_depth,
+                        output_path,
+                        device,
+                        quality = quality,
+                    )
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *command,
@@ -697,7 +976,7 @@ class RecordedPlaybackCapabilityProbe:
                     logging.warning(
                         '[RecordedPlaybackCapabilityProbe] Probe encode failed. '
                         f'[encoder: {encoder}, codec: {codec}, bit_depth: {bit_depth}, '
-                        f'device: {device}, stderr: {decoded_stderr}]'
+                        f'quality: {quality}, device: {device}, stderr: {decoded_stderr}]'
                     )
                     last_reason = cls.classifyFailure(decoded_stderr)
                     continue
@@ -733,6 +1012,26 @@ class RecordedPlaybackCapabilityProbe:
                 if int(stream.get('nb_read_frames', 0)) < 2:
                     last_reason = 'ProbeFailed'
                     continue
+                if quality is not None and (
+                    int(stream.get('width', 0)) != QUALITY[quality].width
+                    or int(stream.get('height', 0)) != QUALITY[quality].height
+                ):
+                    last_reason = 'ProbeFailed'
+                    continue
+                if quality is not None:
+                    try:
+                        frame_rate_numerator, frame_rate_denominator = (
+                            int(value)
+                            for value in str(stream.get('r_frame_rate', '0/1')).split('/', maxsplit=1)
+                        )
+                        actual_frame_rate = frame_rate_numerator / frame_rate_denominator
+                    except (ValueError, ZeroDivisionError):
+                        last_reason = 'ProbeFailed'
+                        continue
+                    expected_frame_rate = 60000 / 1001 if QUALITY[quality].is_60fps is True else 30000 / 1001
+                    if abs(actual_frame_rate - expected_frame_rate) > 0.01:
+                        last_reason = 'ProbeFailed'
+                        continue
                 actual_pixel_format = str(stream.get('pix_fmt', ''))
                 is_10bit = actual_pixel_format in ('yuv420p10le', 'p010le', 'p010')
                 if is_10bit != (bit_depth == 10):
@@ -745,7 +1044,12 @@ class RecordedPlaybackCapabilityProbe:
                     context = cls._probe_context.get()
                     if context is None:
                         # private probeを単体利用する既存経路では従来どおり即時公開する。
-                        cls._selected_devices[(encoder, codec, bit_depth)] = device
+                        key: RecordedPlaybackCapabilityKey = (
+                            (encoder, codec, bit_depth)
+                            if quality is None
+                            else (encoder, codec, bit_depth, quality)
+                        )
+                        cls._selected_devices[key] = device
                     else:
                         # 通常経路では署名再確認後にだけ現在世代へ反映する。
                         context.selected_device = device
@@ -778,4 +1082,8 @@ class RecordedPlaybackCapabilityProbe:
             'error initializing filter',
         )):
             return 'FilterUnavailable'
+        # NVENC が encoder open 時に返す能力不足エラーは一時障害ではなく決定的な非対応なので、
+        # EncodeFailed (再試行で直る可能性のある失敗) とは区別する
+        if "provided device doesn't support required nvenc features" in normalized_stderr:
+            return 'UnsupportedByDevice'
         return 'EncodeFailed'

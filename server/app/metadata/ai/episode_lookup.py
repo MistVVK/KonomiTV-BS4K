@@ -180,6 +180,8 @@ class EpisodeLookupResult:
     sources: tuple[EpisodeLookupCitation, ...] = ()
     # 失敗時ポリシーによる試行サマリ（秘密なし）。単一試行時は空でもよい。
     recovery_attempt_summaries: tuple[str, ...] = ()
+    # 非2xx時に provider が返した本文の sanitizer 済み抜粋。backend 非対応なら None。
+    provider_error_excerpt: str | None = None
 
     def __post_init__(self) -> None:
         """結果内の値の組み合わせを厳格に検証する。

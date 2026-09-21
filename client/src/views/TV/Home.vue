@@ -135,7 +135,7 @@ import Message from '@/message';
 import { ILiveChannel } from '@/services/Channels';
 import useChannelsStore from '@/stores/ChannelsStore';
 import useSettingsStore from '@/stores/SettingsStore';
-import Utils, { ChannelUtils, ProgramUtils } from '@/utils';
+import Utils, { ChannelUtils, dayjs, ProgramUtils } from '@/utils';
 
 export default defineComponent({
     name: 'TV-Home',
@@ -240,7 +240,7 @@ export default defineComponent({
 
         // 00秒までの残り秒数を取得
         // 現在 16:01:34 なら 26 (秒) になる
-        const residue_second = 60 - new Date().getSeconds();
+        const residue_second = 60 - dayjs().second();
 
         // 00秒になるまで待ってから実行するタイマー
         // 番組は基本1分単位で組まれているため、20秒や45秒など中途半端な秒数で更新してしまうと番組情報の反映が遅れてしまう

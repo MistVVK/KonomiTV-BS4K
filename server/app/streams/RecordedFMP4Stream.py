@@ -6,11 +6,12 @@ import math
 import re
 import tempfile
 import uuid
+import weakref
 from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import Any, ClassVar, Literal
 
 from fastapi import HTTPException, status
 
@@ -18,7 +19,7 @@ from app import logging
 from app.config import Config
 from app.constants import LIBRARY_PATH, QUALITY, QUALITY_TYPES
 from app.models.RecordedProgram import RecordedProgram
-from app.schemas import AudioTrack
+from app.schemas import AudioTrack, CMSection
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     KONOMITV_BS4K_VIDEO_BITRATE_MINIMUM_GAP_KBPS,
     KONOMITV_BS4K_VIDEO_BITRATE_RATIOS_FROM_HEVC,
@@ -40,6 +41,7 @@ from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.StreamEncodingOptions import StreamEncodingOptions
 from app.streams.VideoSegmentPlanner import VideoSegmentPlanner
 from app.utils.HLSText import sanitizeHLSQuotedString
+from app.utils.KonomiTVBS4KCloudTransferManager import KonomiTVBS4KCloudTransferManager
 from app.utils.KonomiTVBS4KMMTTLV import BuildKonomiTVBS4KMMTTLVInputArguments
 
 
@@ -68,6 +70,32 @@ class RecordedPlaybackPrefetchRun:
     segments: tuple[RecordedFMP4Segment, ...]
     # セッション破棄・シーク時にキャンセルし、対象要求から完了を待つ共有 task。
     task: asyncio.Task[bool]
+    # CM スキップの終端を anchor にした先行生成では、その先頭セグメントの sequence を保持する。
+    # None は現在位置からの通常先読みで、範囲外要求で即キャンセルする従来どおりの実行を表す。
+    cm_anchor_sequence: int | None = None
+    # CM 先行生成を起動した要求の sequence。これより手前への後方シークでは、
+    # スキップせずCMを視聴する可能性が高いため、通常の範囲外要求と同様にキャンセルする。
+    cm_trigger_sequence: int | None = None
+    # CM 先行生成を起動した要求の request generation。方向判定はこれより新しい generation の
+    # 要求が届いたときだけ行い、同世代の自然な到着順・再試行では維持する。
+    cm_trigger_generation: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedCMSkipAudioPrefetch:
+    """CM スキップの終端 anchor に紐づく音声 delivery generation の先行生成を表す。"""
+
+    # 先行生成本体の共有 task。後方シークや generation 範囲を外れたシークでキャンセルする。
+    task: asyncio.Task[None]
+    # 先行生成を起動した映像要求の sequence。これより手前への後方シークで回収対象になる。
+    trigger_sequence: int
+    # 先行生成を起動した要求の request generation。音声要求は映像 trigger より自然に遅れるため、
+    # 同世代の要求では方向判定を行わず維持する。None は generation を持たない起動要求を表す。
+    request_generation: int | None
+    # 生成対象の音声 delivery generation の先頭・末尾 sequence。この範囲内の音声要求は
+    # スキップ後の自然な需要なので、生成を維持する。
+    first_sequence: int
+    last_sequence: int
 
 
 RecordedVideoBitrate = KonomiTVBS4KPlaybackVideoBitrate
@@ -129,6 +157,16 @@ class RecordedFMP4Stream:
     _cpu_semaphore: ClassVar[asyncio.Semaphore] = asyncio.Semaphore(2)
     _gpu_semaphores: ClassVar[dict[str, asyncio.Semaphore]] = {}
     _instances: ClassVar[dict[str, RecordedFMP4Stream]] = {}
+    # 録画削除開始後は、依存解決済みの古い HTTP 要求からも新しいセッションを作らせない。
+    _deleting_recorded_program_ids: ClassVar[set[int]] = set()
+    # session ごとの直接 HTTP 生成 Task。destroy() が cancel / wait してから cache を解放する。
+    _active_operation_tasks: ClassVar[dict[str, set[asyncio.Task[Any]]]] = {}
+    # destroy() 開始後に同じセッションへ新しい処理が入ることを防ぐバリア。
+    _destroying_session_ids: ClassVar[set[str]] = set()
+    # registry から外れた古い instance を保持済みの要求も、再び処理へ入れない。
+    _destroyed_instances: ClassVar[weakref.WeakSet[RecordedFMP4Stream]] = weakref.WeakSet()
+    # idle timeout と録画削除が同時に destroy() を呼んでも回収処理を1回に直列化する。
+    _destroy_locks: ClassVar[dict[str, asyncio.Lock]] = {}
     # session_id -> 接続元識別子（IP 等）。per-client 上限判定に使う。
     _session_client_keys: ClassVar[dict[str, str]] = {}
     # encoder semaphore 待ち行列の長さ。concurrency 上限とは別の admission 用カウンタ。
@@ -140,10 +178,17 @@ class RecordedFMP4Stream:
     MAX_ENCODER_WAITERS: ClassVar[int] = 32
     SESSION_TIMEOUT: ClassVar[float] = 30.0
     SEEK_PREROLL_SECONDS: ClassVar[float] = 10.0
+    # CPUの低速codecとオフライン全編生成を許容しつつ、停止したencoderが処理枠を永久占有しない上限。
+    ENCODER_PROCESS_MIN_TIMEOUT_SECONDS: ClassVar[float] = 5 * 60.0
+    ENCODER_PROCESS_MAX_TIMEOUT_SECONDS: ClassVar[float] = 24 * 60 * 60.0
+    ENCODER_PROCESS_DURATION_MULTIPLIER: ClassVar[float] = 8.0
     # 現在要求は既存の単発経路で確実に返し、その直後だけを短い連続encodeへまとめる。
     # 2セグメントなら約12秒で、6秒の再生中に完了しやすくしつつ、単発2回分のprerollを1回へ減らせる。
     PLAYBACK_PREFETCH_MAX_SEGMENTS: ClassVar[int] = 2
     PLAYBACK_PREFETCH_MAX_DURATION_SECONDS: ClassVar[float] = 18.0
+    # CM スキップ有効時、要求位置が CM 開始のこの秒数手前へ達したら CM 終端 anchor の先行生成を始める。
+    # 先読み枠が通常 run で埋まっていても、スキップ発動までに次の要求で再試行できる余裕を持たせる。
+    CM_SKIP_PREFETCH_LEAD_SECONDS: ClassVar[float] = 18.0
     AAC_ENCODER_DELAY_SAMPLES: ClassVar[int] = 1024
     AAC_PACKET_SAMPLES: ClassVar[int] = 1024
     AUDIO_SAMPLE_RATE: ClassVar[int] = 48_000
@@ -196,6 +241,21 @@ class RecordedFMP4Stream:
     _playback_prefetch_run: RecordedPlaybackPrefetchRun | None
     # 先読みの起動・シーク時キャンセル・完了時の参照解除を直列化する。
     _playback_prefetch_lock: asyncio.Lock
+    # CM スキップ有効の視聴セッションかどうか。playlist 要求で固定され、同一セッション条件として照合する。
+    ## 既存テストが object.__new__ で作る最小ダブルはこの属性を設定しないため、class 既定値を False とする。
+    _cm_skip_aware: bool = False
+    # CM 終端 anchor の先行生成を開始済みの anchor segment sequence。1 区間につき映像・音声各 1 回まで。
+    _cm_skip_video_prefetch_started: set[int]
+    _cm_skip_audio_prefetch_started: set[int]
+    # CM 終端の音声 generation を先行生成するときの対象レンディション。直近の音声要求から追跡する。
+    _last_requested_audio_rendition_id: str | None
+    # 音声先行生成 task の強参照。anchor sequence をキーに起動元・generation 範囲を保持し、
+    # 後方・範囲外シーク時の回収に使う。完了まで GC されないよう保持し、破棄は active operation に委ねる。
+    _cm_skip_audio_prefetch_tasks: dict[int, RecordedCMSkipAudioPrefetch]
+    # クライアントのシーク世代。遅着した旧要求が新しい生成処理へ干渉しないよう比較する。
+    _latest_request_generation: int
+    # 世代付きsegment要求の実行Task。新しいシーク世代の到着時に旧世代だけを停止する。
+    _segment_request_tasks: dict[asyncio.Task[Any], int]
     # オフライン保存セッションだけ、未キャッシュ映像区間を連続encodeする。
     _is_offline_continuous: bool
     # 連続encode中の sequence から実行中 Task への対応。同一区間の重複起動を防ぐ。
@@ -220,11 +280,20 @@ class RecordedFMP4Stream:
         is_new_session_allowed: bool = False,
         client_key: str = 'unknown',
         is_offline_continuous: bool = False,
+        cm_skip_aware: bool = False,
     ) -> RecordedFMP4Stream:
         """session ID単位で単一の新録画視聴セッションを返す。"""
 
         # 既存・新規を問わず session_id 形式を先に検査する
         cls.validateSessionId(session_id)
+
+        # 画質切り替えで終了したセッションの遅着要求は、新規セッションとして復活させない。
+        if session_id in cls._destroying_session_ids:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Recorded stream is being destroyed')
+
+        # 録画削除と競合して依存解決済みの古い要求が到着しても、元ファイルを再び開かせない。
+        if recorded_program.id in cls._deleting_recorded_program_ids:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Recorded video is being deleted')
 
         if session_id not in cls._instances:
             if is_new_session_allowed is False or encoding_options is None:
@@ -249,6 +318,8 @@ class RecordedFMP4Stream:
             instance._active_operations = 0
             instance._playback_prefetch_run = None
             instance._playback_prefetch_lock = asyncio.Lock()
+            instance._latest_request_generation = 0
+            instance._segment_request_tasks = {}
             instance._offline_video_sequence_tasks = {}
             instance._offline_video_segment_events = {}
             instance._offline_video_encode_lock = asyncio.Lock()
@@ -257,8 +328,13 @@ class RecordedFMP4Stream:
             instance._offline_work_progress = {}
             instance._destroy_handle = asyncio.get_running_loop().call_later(
                 cls.SESSION_TIMEOUT,
-                lambda: asyncio.create_task(instance.__destroyIfIdle()),
+                lambda: asyncio.create_task(instance.__destroyIfIdle(instance._destroy_handle)),
             )
+            instance._cm_skip_aware = cm_skip_aware
+            instance._cm_skip_video_prefetch_started = set()
+            instance._cm_skip_audio_prefetch_started = set()
+            instance._last_requested_audio_rendition_id = None
+            instance._cm_skip_audio_prefetch_tasks = {}
             cls._instances[session_id] = instance
             cls._session_client_keys[session_id] = client_key
         instance = cls._instances[session_id]
@@ -273,6 +349,9 @@ class RecordedFMP4Stream:
             instance.encoding_options.video_bit_depth != encoding_options.video_bit_depth or
             instance.encoding_options.audio_codec != encoding_options.audio_codec
         ):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session conditions mismatch')
+        # CM スキップの有無も同じセッション条件として照合する
+        if instance._cm_skip_aware != cm_skip_aware:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail='Session conditions mismatch')
         return instance
 
@@ -385,12 +464,23 @@ class RecordedFMP4Stream:
         self._destroy_handle.cancel()
         self._destroy_handle = asyncio.get_running_loop().call_later(
             self.SESSION_TIMEOUT,
-            lambda: asyncio.create_task(self.__destroyIfIdle()),
+            lambda: asyncio.create_task(self.__destroyIfIdle(self._destroy_handle)),
         )
 
-    async def __destroyIfIdle(self) -> None:
-        """生成中の要求があればセッション破棄を延期する。"""
+    async def __destroyIfIdle(self, destroy_handle: asyncio.TimerHandle | None = None) -> None:
+        """生成中の要求や更新済みタイマーがあればセッション破棄を延期する。
 
+        Args:
+            destroy_handle: この破棄 Task を起動した TimerHandle。テストからの直接呼び出しでは None。
+
+        Returns:
+            None
+        """
+
+        # call_later() 発火後、生成した Task の開始前に Keep-Alive が届くことがある。
+        # その場合は旧 TimerHandle が作った Task から更新後のセッションを破棄しない。
+        if destroy_handle is not None and destroy_handle is not self._destroy_handle:
+            return
         if self._active_operations > 0:
             self.keepAlive()
             return
@@ -400,14 +490,68 @@ class RecordedFMP4Stream:
     async def __activeOperation(self) -> AsyncGenerator[None]:
         """長時間のエンコードやfsync中にセッションタイムアウトを防ぐ。"""
 
+        if (
+            self.session_id in self._destroying_session_ids or
+            self in self._destroyed_instances
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail='Recorded stream is being destroyed')
+        active_operation_tasks = self._active_operation_tasks.setdefault(self.session_id, set())
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            active_operation_tasks.add(current_task)
         self._active_operations += 1
         self.keepAlive()
         try:
             yield
         finally:
+            if current_task is not None:
+                active_operation_tasks.discard(current_task)
+            if len(active_operation_tasks) == 0:
+                self._active_operation_tasks.pop(self.session_id, None)
             self._active_operations = max(0, self._active_operations - 1)
             if self._instances.get(self.session_id) is self:
                 self.keepAlive()
+
+    @asynccontextmanager
+    async def __segmentRequest(
+        self,
+        request_generation: int | None,
+    ) -> AsyncGenerator[bool]:
+        """segment要求をシーク世代へ登録し、古い実行を停止する。
+
+        Args:
+            request_generation: クライアントがシークごとに進める要求世代。旧クライアントではNone。
+
+        Yields:
+            現在の世代に属する要求ならTrue、遅着した旧要求ならFalse。
+        """
+
+        # queryを持たない旧クライアントは従来どおり処理し、世代付き要求との互換性を維持する。
+        if request_generation is None:
+            yield True
+            return
+
+        current_task = asyncio.current_task()
+        if current_task is None:
+            raise RuntimeError('Recorded segment request requires an asyncio task.')
+        if request_generation < self._latest_request_generation:
+            yield False
+            return
+
+        # event loop上で比較と更新の間にawaitを挟まないことで、最初の新世代要求だけが
+        # 旧映像・音声要求を停止する。writeAtomic中のcancelはatomic公開完了後に再送出されるため、
+        # 同じ生成条件・sequenceの正常なcacheだけが残り、破損した途中ファイルは公開されない。
+        if request_generation > self._latest_request_generation:
+            self._latest_request_generation = request_generation
+            for task, generation in tuple(self._segment_request_tasks.items()):
+                if generation < request_generation and task is not current_task:
+                    task.cancel()
+        self._segment_request_tasks[current_task] = request_generation
+        try:
+            yield True
+        finally:
+            if self._segment_request_tasks.get(current_task) == request_generation:
+                self._segment_request_tasks.pop(current_task, None)
 
     @classmethod
     def hasActiveSessions(cls) -> bool:
@@ -427,6 +571,84 @@ class RecordedFMP4Stream:
         """
 
         return session_id in cls._instances
+
+    @classmethod
+    async def destroySession(
+        cls,
+        session_id: str,
+        recorded_program: RecordedProgram,
+        quality: QUALITY_TYPES,
+        encoding_options: StreamEncodingOptions,
+        cm_skip_aware: bool = False,
+    ) -> None:
+        """指定した録画視聴セッションを終了し、遅着要求による再作成を防ぐ。
+
+        Args:
+            session_id: クライアントが発行した視聴セッションID。
+            recorded_program: セッションが再生している録画番組。
+            quality: セッションに固定された画質。
+            encoding_options: セッションに固定されたエンコード条件。
+            cm_skip_aware: セッションに固定された CM スキップ有効フラグ。
+
+        Returns:
+            None
+        """
+
+        cls.validateSessionId(session_id)
+        instance = cls._instances.get(session_id)
+        if instance is not None:
+            # 別録画・別生成条件の session_id を第三者が終了できないよう、既存の条件照合を通す。
+            # CM スキップの有無もセッション条件のため、照合用インスタンスへ同じ値を渡す。
+            instance = cls(
+                session_id,
+                recorded_program,
+                quality,
+                encoding_options=encoding_options,
+                cm_skip_aware=cm_skip_aware,
+            )
+            await instance.destroy()
+            return
+
+        # playlist の依存解決中に終了要求が先着した場合も、遅れて来る新規作成を拒否する。
+        cls._destroying_session_ids.add(session_id)
+        cls.__scheduleDestroyBarrierRemoval(session_id)
+
+    @classmethod
+    def __scheduleDestroyBarrierRemoval(cls, session_id: str) -> None:
+        """遅着 HTTP 要求が消えるまでセッション終了バリアを保持する。
+
+        Args:
+            session_id: 終了した視聴セッションID。
+
+        Returns:
+            None
+        """
+
+        asyncio.get_running_loop().call_later(
+            cls.SESSION_TIMEOUT,
+            cls._destroying_session_ids.discard,
+            session_id,
+        )
+
+    @classmethod
+    async def destroyByRecordedProgramID(cls, recorded_program_id: int) -> None:
+        """録画削除を開始し、対象録画の全セッションと進行中処理を回収する。
+
+        Args:
+            recorded_program_id: 削除する RecordedProgram の ID。
+
+        Returns:
+            None
+        """
+
+        # await より先にバリアを立て、依存解決済みの競合要求も __new__() で拒否する。
+        cls._deleting_recorded_program_ids.add(recorded_program_id)
+        streams = [
+            stream
+            for stream in cls._instances.values()
+            if stream.recorded_program.id == recorded_program_id
+        ]
+        await asyncio.gather(*(stream.destroy() for stream in streams))
 
     @property
     def log_prefix(self) -> str:
@@ -585,11 +807,19 @@ class RecordedFMP4Stream:
     @staticmethod
     async def __communicateSubprocess(
         process: asyncio.subprocess.Process,
+        duration: float | None = None,
     ) -> tuple[bytes, bytes]:
-        """子プロセスをdrainし、キャンセルや例外時も必ず終了・回収する。"""
+        """子プロセスを有限時間でdrainし、キャンセルや例外時も必ず終了・回収する。"""
 
         try:
-            stdout, stderr = await process.communicate()
+            communicate = process.communicate()
+            if duration is None:
+                stdout, stderr = await communicate
+            else:
+                stdout, stderr = await asyncio.wait_for(
+                    communicate,
+                    timeout=RecordedFMP4Stream.__getEncoderProcessTimeout(duration),
+                )
             return stdout or b'', stderr or b''
         except BaseException:
             if process.returncode is None:
@@ -603,35 +833,76 @@ class RecordedFMP4Stream:
                     pass
             raise
 
+    @classmethod
+    def __getEncoderProcessTimeout(cls, duration: float) -> float:
+        """処理対象の媒体尺に比例する実エンコーダーの絶対タイムアウトを返す。
+
+        Args:
+            duration: エンコードまたは分割する媒体時間。
+
+        Returns:
+            低速なCPUエンコードも許容する5分から24時間までのタイムアウト秒数。
+        """
+
+        scaled_timeout = duration * cls.ENCODER_PROCESS_DURATION_MULTIPLIER \
+            if math.isfinite(duration) and duration > 0 else cls.ENCODER_PROCESS_MIN_TIMEOUT_SECONDS
+        return min(
+            cls.ENCODER_PROCESS_MAX_TIMEOUT_SECONDS,
+            max(cls.ENCODER_PROCESS_MIN_TIMEOUT_SECONDS, scaled_timeout),
+        )
+
     async def destroy(self) -> None:
         """セッション参照を解放し、キャッシュの60秒削除猶予を開始する。"""
 
-        if self._instances.get(self.session_id) is not self:
-            return
-        self._destroy_handle.cancel()
-        # 通常再生の先読みはオフライン保存taskと独立しているため、先に参照から外して回収する。
-        # taskのfinallyも同じlockを取得するので、lock外へ出てから完了を待つ。
-        playback_prefetch_task: asyncio.Task[bool] | None = None
-        async with self._playback_prefetch_lock:
-            if self._playback_prefetch_run is not None:
-                playback_prefetch_task = self._playback_prefetch_run.task
-                self._playback_prefetch_run = None
-                playback_prefetch_task.cancel()
-        if playback_prefetch_task is not None:
-            await asyncio.gather(playback_prefetch_task, return_exceptions=True)
-        offline_video_tasks = set(self._offline_video_sequence_tasks.values())
-        for task in offline_video_tasks:
-            task.cancel()
-        if len(offline_video_tasks) > 0:
-            await asyncio.gather(*offline_video_tasks, return_exceptions=True)
-        for event in self._offline_video_segment_events.values():
-            event.set()
-        self._offline_video_sequence_tasks.clear()
-        self._instances.pop(self.session_id, None)
-        self._session_client_keys.pop(self.session_id, None)
-        for cache_path in self._referenced_paths:
-            await RecordedFMP4CacheManager.release(cache_path, self.session_id)
-        self._referenced_paths.clear()
+        destroy_lock = self._destroy_locks.setdefault(self.session_id, asyncio.Lock())
+        try:
+            async with destroy_lock:
+                if self._instances.get(self.session_id) is not self:
+                    return
+                self._destroying_session_ids.add(self.session_id)
+                self._destroyed_instances.add(self)
+                self._destroy_handle.cancel()
+
+                # HTTP 要求 Task は内部先読み Task とは別なので、キャッシュ解放より先に明示的に停止して待つ。
+                current_task = asyncio.current_task()
+                active_operation_tasks = {
+                    task for task in self._active_operation_tasks.get(self.session_id, set())
+                    if task is not current_task
+                }
+                for task in active_operation_tasks:
+                    task.cancel()
+                if len(active_operation_tasks) > 0:
+                    await asyncio.gather(*active_operation_tasks, return_exceptions=True)
+
+                # 通常再生の先読みはオフライン保存taskと独立しているため、先に参照から外して回収する。
+                # taskのfinallyも同じlockを取得するので、lock外へ出てから完了を待つ。
+                playback_prefetch_task: asyncio.Task[bool] | None = None
+                async with self._playback_prefetch_lock:
+                    if self._playback_prefetch_run is not None:
+                        playback_prefetch_task = self._playback_prefetch_run.task
+                        self._playback_prefetch_run = None
+                        playback_prefetch_task.cancel()
+                if playback_prefetch_task is not None:
+                    await asyncio.gather(playback_prefetch_task, return_exceptions=True)
+                offline_video_tasks = set(self._offline_video_sequence_tasks.values())
+                for task in offline_video_tasks:
+                    task.cancel()
+                if len(offline_video_tasks) > 0:
+                    await asyncio.gather(*offline_video_tasks, return_exceptions=True)
+                for event in self._offline_video_segment_events.values():
+                    event.set()
+                self._offline_video_sequence_tasks.clear()
+                self._instances.pop(self.session_id, None)
+                self._session_client_keys.pop(self.session_id, None)
+                for cache_path in self._referenced_paths:
+                    await RecordedFMP4CacheManager.release(cache_path, self.session_id)
+                self._referenced_paths.clear()
+                self._active_operation_tasks.pop(self.session_id, None)
+                # 破棄と競合した playlist 要求が同じ ID を再作成しないよう、idle timeout 1回分はバリアを残す。
+                self.__scheduleDestroyBarrierRemoval(self.session_id)
+        finally:
+            if destroy_lock.locked() is False and self._destroy_locks.get(self.session_id) is destroy_lock:
+                self._destroy_locks.pop(self.session_id, None)
 
     async def getMasterPlaylist(self, cache_key: str | None = None) -> str:
         """映像fMP4メディアプレイリストを参照するHLSマスターを返す。"""
@@ -755,7 +1026,7 @@ class RecordedFMP4Stream:
                     'message': 'The generated initialization segment has no supported codec configuration.',
                 },
             )
-        audio_codec_string = 'opus' if self._effective_audio_codec == 'opus' else 'mp4a.40.2'
+        audio_codec_string = 'Opus' if self._effective_audio_codec == 'opus' else 'mp4a.40.2'
         codec_attribute = f'{codec_string},{audio_codec_string}' if len(renditions) > 0 else codec_string
         stream_attributes = [
             f'BANDWIDTH={bandwidth + self.__getAudioBandwidth(renditions)}',
@@ -780,7 +1051,7 @@ class RecordedFMP4Stream:
             if codec_string.startswith('avc1.') and len(codec_string) >= 11:
                 return int(codec_string[-2:], 16)
             parts = codec_string.split('.')
-            if codec_string.startswith('hvc1.'):
+            if codec_string.startswith(('hvc1.', 'hev1.')):
                 level = next((part[1:] for part in parts if part.startswith('L')), '0')
                 return int(level)
             if codec_string.startswith('vp09.') and len(parts) >= 3:
@@ -792,7 +1063,34 @@ class RecordedFMP4Stream:
         return max(codec_strings, key=GetLevel)
 
     @staticmethod
-    def extractCodecString(init_segment: bytes) -> str | None:
+    def __extractVideoCodecConfiguration(init_segment: bytes) -> tuple[bytes, bytes] | None:
+        """init内の映像codec configuration boxを取得する。
+
+        Args:
+            init_segment: FFmpegが生成したfMP4初期化セグメント。
+
+        Returns:
+            box typeとpayload。対応boxがない場合はNone。
+        """
+
+        # configuration boxはVisualSampleEntry内にネストされるため、親固有の固定長領域に
+        # 依存せず、size/typeヘッダーがinit範囲内に収まる候補だけを採用する。
+        for box_type in (b'avcC', b'hvcC', b'vpcC', b'av1C'):
+            search_offset = 0
+            while True:
+                type_offset = init_segment.find(box_type, search_offset)
+                if type_offset < 0:
+                    break
+                if type_offset >= 4:
+                    size = int.from_bytes(init_segment[type_offset - 4:type_offset], 'big')
+                    box_start = type_offset - 4
+                    if size >= 8 and box_start + size <= len(init_segment):
+                        return box_type, init_segment[type_offset + 4:box_start + size]
+                search_offset = type_offset + 1
+        return None
+
+    @classmethod
+    def extractCodecString(cls, init_segment: bytes) -> str | None:
         """init内のcodec configuration boxからRFC 6381 codec stringを取得する。
 
         Args:
@@ -802,56 +1100,45 @@ class RecordedFMP4Stream:
             AVC / HEVC / VP9 / AV1のcodec string。対応boxがない場合はNone。
         """
 
-        # configuration boxはVisualSampleEntry内にネストされるため、親固有の固定長領域に
-        # 依存せず、size/typeヘッダーがinit範囲内に収まる候補だけを採用する。
-        def FindBox(box_type: bytes) -> bytes | None:
-            """検証済みboxのpayloadを返す。"""
-
-            search_offset = 0
-            while True:
-                type_offset = init_segment.find(box_type, search_offset)
-                if type_offset < 0:
-                    return None
-                if type_offset >= 4:
-                    size = int.from_bytes(init_segment[type_offset - 4:type_offset], 'big')
-                    box_start = type_offset - 4
-                    if size >= 8 and box_start + size <= len(init_segment):
-                        return init_segment[type_offset + 4:box_start + size]
-                search_offset = type_offset + 1
+        configuration = cls.__extractVideoCodecConfiguration(init_segment)
+        if configuration is None:
+            return None
+        box_type, payload = configuration
 
         # AVCDecoderConfigurationRecordのprofile/compatibility/levelは先頭4 byteにある。
-        avcc = FindBox(b'avcC')
-        if avcc is not None and len(avcc) >= 4 and avcc[0] == 1:
-            return f'avc1.{avcc[1]:02X}{avcc[2]:02X}{avcc[3]:02X}'
+        if box_type == b'avcC' and len(payload) >= 4 and payload[0] == 1:
+            return f'avc1.{payload[1]:02X}{payload[2]:02X}{payload[3]:02X}'
 
         # HEVCのcompatibility flagsはcodec stringでbit順が逆になる。constraint bytesは
         # 末尾のゼロだけを省略し、実際のprofile/tier/levelとともに表現する。
-        hvcc = FindBox(b'hvcC')
-        if hvcc is not None and len(hvcc) >= 13 and hvcc[0] == 1:
-            profile_space = ('', 'A', 'B', 'C')[hvcc[1] >> 6]
-            profile_idc = hvcc[1] & 0x1F
-            compatibility = int.from_bytes(hvcc[2:6], 'big')
+        if box_type == b'hvcC' and len(payload) >= 13 and payload[0] == 1:
+            if cls.__findMP4Box(init_segment, b'hev1') is not None:
+                sample_entry = 'hev1'
+            else:
+                # hvcC box単体を渡す既存利用では、従来どおりhvc1として解釈する。
+                sample_entry = 'hvc1'
+            profile_space = ('', 'A', 'B', 'C')[payload[1] >> 6]
+            profile_idc = payload[1] & 0x1F
+            compatibility = int.from_bytes(payload[2:6], 'big')
             compatibility = int(f'{compatibility:032b}'[::-1], 2)
-            tier = 'H' if hvcc[1] & 0x20 else 'L'
-            constraints = hvcc[6:12].rstrip(b'\x00')
+            tier = 'H' if payload[1] & 0x20 else 'L'
+            constraints = payload[6:12].rstrip(b'\x00')
             constraint_suffix = ''.join(f'.{value:X}' for value in constraints)
             return (
-                f'hvc1.{profile_space}{profile_idc}.{compatibility:X}.'
-                f'{tier}{hvcc[12]}{constraint_suffix}'
+                f'{sample_entry}.{profile_space}{profile_idc}.{compatibility:X}.'
+                f'{tier}{payload[12]}{constraint_suffix}'
             )
 
         # VPCodecConfigurationBoxのFullBoxヘッダー直後にある実profile/level/bit depthを使う。
-        vpcc = FindBox(b'vpcC')
-        if vpcc is not None and len(vpcc) >= 7:
-            return f'vp09.{vpcc[4]:02}.{vpcc[5]:02}.{vpcc[6] >> 4:02}'
+        if box_type == b'vpcC' and len(payload) >= 7:
+            return f'vp09.{payload[4]:02}.{payload[5]:02}.{payload[6] >> 4:02}'
 
         # AV1CodecConfigurationRecordから実profile/level/tier/bit depthを使う。
-        av1c = FindBox(b'av1C')
-        if av1c is not None and len(av1c) >= 3 and av1c[0] & 0x80:
-            profile = av1c[1] >> 5
-            level = av1c[1] & 0x1F
-            tier = 'H' if av1c[2] & 0x80 else 'M'
-            bit_depth = 10 if av1c[2] & 0x40 else 8
+        if box_type == b'av1C' and len(payload) >= 3 and payload[0] & 0x80:
+            profile = payload[1] >> 5
+            level = payload[1] & 0x1F
+            tier = 'H' if payload[2] & 0x80 else 'M'
+            bit_depth = 10 if payload[2] & 0x40 else 8
             return f'av01.{profile}.{level:02}{tier}.{bit_depth:02}'
 
         return None
@@ -1013,7 +1300,7 @@ class RecordedFMP4Stream:
 
         # OpusSampleEntryは大文字のOpus、構成boxはdOpsで識別される。
         if b'Opus' in init_segment and b'dOps' in init_segment:
-            return 'opus'
+            return 'Opus'
         configuration = cls.extractAACInitializationConfiguration(init_segment)
         return f'mp4a.40.{configuration[0]}' if configuration is not None else None
 
@@ -1458,13 +1745,21 @@ class RecordedFMP4Stream:
         init_path = self.__buildAudioCachePath(segment, rendition, is_init=True)
         return await asyncio.to_thread(init_path.read_bytes) if init_path.is_file() else None
 
-    async def getAudioSegment(self, rendition_id: str, sequence: int) -> bytes | None:
+    async def getAudioSegment(
+        self,
+        rendition_id: str,
+        sequence: int,
+        request_generation: int | None = None,
+    ) -> bytes | None:
         """映像とは独立して指定方式の音声fragmentを生成または再利用する。"""
 
         async with self.__activeOperation():
-            return await self.__getAudioSegment(rendition_id, sequence)
+            async with self.__segmentRequest(request_generation) as is_current:
+                if is_current is False:
+                    return b''
+                return await self.__getAudioSegment(rendition_id, sequence, request_generation)
 
-    async def __getAudioSegment(self, rendition_id: str, sequence: int) -> bytes | None:
+    async def __getAudioSegment(self, rendition_id: str, sequence: int, request_generation: int | None = None) -> bytes | None:
         """音声fragment生成の本体処理を行う。"""
 
         self.keepAlive()
@@ -1472,6 +1767,13 @@ class RecordedFMP4Stream:
         rendition = self.__getAudioRendition(rendition_id)
         if segment is None or rendition is None:
             return None
+        # CM スキップの音声先行生成は、プレイヤーが実際に聴いているレンディションだけを対象にする
+        self._last_requested_audio_rendition_id = rendition.id
+        # 音声要求が先行生成の対象範囲を外れたシーク由来なら、旧 anchor の先行生成を回収する。
+        # 方向判定は起動時より新しい generation の要求だけで行い、同世代の自然な
+        # A/V 遅延や generation を持たない init 要求では維持する。
+        if self._cm_skip_aware is True:
+            await self.__collectCMSkipAudioPrefetchIfSeekedAway(sequence, request_generation)
         segment_data = await self.__getTranscodedAudioSegment(segment, rendition, self._effective_audio_codec)
         if segment_data is not None and getattr(self.recorded_program.recorded_video, 'has_video', True) is False:
             self._completed_sequences.add(sequence)
@@ -1490,9 +1792,8 @@ class RecordedFMP4Stream:
         # master生成や同じ映像世代の先行segmentですでにinitを確定済みなら、音声だけの
         # DISCONTINUITY境界に対応するsegment encodeを待たず即座に返す。
         if init_path.is_file():
-            # initは数KB以下の小さな固定データなので、executorへ渡すより同期読込の方が
-            # 境界MAPへの応答を確実に即時化できる。
-            return init_path.read_bytes()
+            # init自体が小さくても、NAS上ではopen/read待ちがevent loop全体を止め得る。
+            return await asyncio.to_thread(init_path.read_bytes)
         # MAP取得は通常のmedia要求ではない。ここから先読みを開始すると、プレイリストにある
         # 別generationのMAP取得同士が先読みをキャンセルし合うため、現在segmentだけを生成する。
         async with self.__activeOperation():
@@ -1501,22 +1802,31 @@ class RecordedFMP4Stream:
             return None
         return await asyncio.to_thread(init_path.read_bytes)
 
-    async def getVideoSegment(self, sequence: int) -> bytes | None:
+    async def getVideoSegment(
+        self,
+        sequence: int,
+        request_generation: int | None = None,
+    ) -> bytes | None:
         """要求シーケンスの映像fragmentを生成またはキャッシュから返す。"""
 
         async with self.__activeOperation():
-            return await self.__getVideoSegment(sequence, should_start_playback_prefetch=True)
+            async with self.__segmentRequest(request_generation) as is_current:
+                if is_current is False:
+                    return b''
+                return await self.__getVideoSegment(sequence, should_start_playback_prefetch=True, request_generation=request_generation)
 
     async def __getVideoSegment(
         self,
         sequence: int,
         should_start_playback_prefetch: bool = False,
+        request_generation: int | None = None,
     ) -> bytes | None:
         """映像fragment生成の本体処理を行う。
 
         Args:
             sequence: 取得するHLSメディアシーケンス。
             should_start_playback_prefetch: 通常のmedia要求として後続先読みを許可するか。
+            request_generation: 現在要求のシーク世代。CM先行生成の方向判定に使う。
 
         Returns:
             生成済み映像fragment。生成できない場合はNone。
@@ -1541,7 +1851,7 @@ class RecordedFMP4Stream:
         # 先読み対象なら共有taskの完了を待ち、範囲外要求なら古い方向の先読みを先に回収する。
         # path lockを保持したまま待つと、先読み側のatomic公開と相互待ちになるため必ず先に行う。
         if is_offline_continuous is False and should_start_playback_prefetch is True:
-            playback_prefetch_task = await self.__preparePlaybackPrefetchRequest(sequence)
+            playback_prefetch_task = await self.__preparePlaybackPrefetchRequest(sequence, request_generation)
             if playback_prefetch_task is not None:
                 try:
                     await asyncio.shield(playback_prefetch_task)
@@ -1551,43 +1861,53 @@ class RecordedFMP4Stream:
                     current_task = asyncio.current_task()
                     if current_task is not None and current_task.cancelling() > 0:
                         raise
+            # CM スキップの音声先行生成は映像runとは別taskのため、後方・範囲外シークでは
+            # 映像runの回収とあわせてここで回収する (同世代・anchor 内の順方向要求では何もしない)。
+            if self._cm_skip_aware is True:
+                await self.__collectCMSkipAudioPrefetchIfSeekedAway(sequence, request_generation)
 
         segment_path = self.__buildCachePath(segment, is_init=False)
         init_path = self.__buildCachePath(segment, is_init=True)
+        generation_lock = await self.__acquire(init_path)
         segment_lock = await self.__acquire(segment_path)
-        await self.__acquire(init_path)
         segment_data: bytes | None = None
         did_encode_current_segment = False
-        async with segment_lock:
-            # fragmentだけが残り、対になるinitが遅延削除済みなら再生成する。
-            # 片方だけをキャッシュヒットとして返すと、呼び出し元は再生不能なfragmentを受け取ってしまう。
-            if segment_path.is_file() and init_path.is_file():
-                self._completed_sequences.add(sequence)
-                generation_segments = [
-                    item for item in self._segments if item.generation == segment.generation
-                ]
-                if all(self.__buildCachePath(item, is_init=False).is_file() for item in generation_segments):
-                    self.__updateOfflineWorkProgress(
-                        self.__getOfflineVideoWorkKey(segment.generation),
-                        1.0,
-                    )
-                segment_data = await asyncio.to_thread(segment_path.read_bytes)
-            elif is_offline_continuous is False:
-                # 現在必要なfragmentは実績のある単発経路で確定し、後続先読みの成否へ依存させない。
-                await self.__encodeSegment(segment, init_path, segment_path)
-                # fragment 単体を成功扱いすると、直後の MAP 取得だけが失敗するため、
-                # 通常再生でも対応する init と fragment の両方が揃った場合だけ返す。
-                if segment_path.is_file() is False or init_path.is_file() is False:
-                    return None
-                self._completed_sequences.add(sequence)
-                self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
-                segment_data = await asyncio.to_thread(segment_path.read_bytes)
-                did_encode_current_segment = True
-            else:
-                # 連続encodeの書き込みは別taskがpath lockを取るため、待ちに入る前に解放する。
-                await self.__startOfflineVideoEncodeIfNeeded(segment)
+
+        # init pathをgeneration owner lockとして先に取得し、同じgenerationの別segmentが
+        # 独立FFmpegで生成したinitを後勝ちで置換しないようencodeと公開を直列化する。
+        async with generation_lock:
+            async with segment_lock:
+                # fragmentだけが残り、対になるinitが遅延削除済みなら再生成する。
+                # 片方だけをキャッシュヒットとして返すと、呼び出し元は再生不能なfragmentを受け取ってしまう。
+                if segment_path.is_file() and init_path.is_file():
+                    self._completed_sequences.add(sequence)
+                    generation_segments = [
+                        item for item in self._segments if item.generation == segment.generation
+                    ]
+                    if all(self.__buildCachePath(item, is_init=False).is_file() for item in generation_segments):
+                        self.__updateOfflineWorkProgress(
+                            self.__getOfflineVideoWorkKey(segment.generation),
+                            1.0,
+                        )
+                    segment_data = await asyncio.to_thread(segment_path.read_bytes)
+                elif is_offline_continuous is False:
+                    # 現在必要なfragmentは実績のある単発経路で確定し、後続先読みの成否へ依存させない。
+                    await self.__encodeSegment(segment, init_path, segment_path)
+                    # fragment 単体を成功扱いすると、直後の MAP 取得だけが失敗するため、
+                    # 通常再生でも対応する init と fragment の両方が揃った場合だけ返す。
+                    if segment_path.is_file() is False or init_path.is_file() is False:
+                        return None
+                    self._completed_sequences.add(sequence)
+                    self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
+                    segment_data = await asyncio.to_thread(segment_path.read_bytes)
+                    did_encode_current_segment = True
 
         if is_offline_continuous is False:
+            # CM スキップ有効のセッションでは、CM 開始手前の通常要求を合図にスキップ先
+            # (CM 終端) の先行生成を始める。スキップ発動直後の再生待ちを減らすため、
+            # 通常の後続先読みより先に CM anchor 側へ実行枠を割り当てる。
+            if segment_data is not None and should_start_playback_prefetch is True:
+                await self.__startCMSkipPrefetchIfNeeded(segment, request_generation)
             # キャッシュヒットや先読みtaskの成果からは次を起動しない。直接単発生成した要求だけを
             # 起点にすることで、短い先読みがファイル末尾まで自動連鎖することを防ぐ。
             if (
@@ -1599,21 +1919,25 @@ class RecordedFMP4Stream:
             return segment_data
 
         if is_offline_continuous is True:
+            # generation ownerを解放してから共有連続encodeを開始し、そのtask自身に所有させる。
+            # 待機側がlockを保持すると、連続encodeのatomic公開と相互待ちになる。
+            await self.__startOfflineVideoEncodeIfNeeded(segment)
             await self.__waitOfflineVideoSegment(segment)
-            async with segment_lock:
-                # 連続生成 task の完了通知後にも、必ず init / fragment の組を再検査する。
-                # fragment だけが残った状態を返すと getVideoInitSegment() が直後に None となり、
-                # 長時間生成の全成果を破棄してしまうため、不完全な組は個別生成で復旧する。
-                if segment_path.is_file() and init_path.is_file():
+            async with generation_lock:
+                async with segment_lock:
+                    # 連続生成 task の完了通知後にも、必ず init / fragment の組を再検査する。
+                    # fragment だけが残った状態を返すと getVideoInitSegment() が直後に None となり、
+                    # 長時間生成の全成果を破棄してしまうため、不完全な組は個別生成で復旧する。
+                    if segment_path.is_file() and init_path.is_file():
+                        self._completed_sequences.add(sequence)
+                        return await asyncio.to_thread(segment_path.read_bytes)
+                    # 連続encodeがこのsequenceを確定できなければ、現行の1本encodeへ落とす。
+                    await self.__encodeSegment(segment, init_path, segment_path)
+                    if segment_path.is_file() is False or init_path.is_file() is False:
+                        return None
                     self._completed_sequences.add(sequence)
+                    self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
                     return await asyncio.to_thread(segment_path.read_bytes)
-                # 連続encodeがこのsequenceを確定できなければ、現行の1本encodeへ落とす。
-                await self.__encodeSegment(segment, init_path, segment_path)
-                if segment_path.is_file() is False or init_path.is_file() is False:
-                    return None
-                self._completed_sequences.add(sequence)
-                self.__updateOfflineVideoGenerationProgressFromCompletedSegments(segment.generation)
-                return await asyncio.to_thread(segment_path.read_bytes)
         return None
 
     @staticmethod
@@ -1911,6 +2235,7 @@ class RecordedFMP4Stream:
         quality = QUALITY[self.quality]
         video_bitrate = self.__getEffectiveVideoBitrate()
         video_bitrate_max_kbps = int(video_bitrate.video_bitrate_max.removesuffix('K'))
+        output_frame_rate = '60000/1001' if quality.is_60fps is True else '30000/1001'
         backend = self.__getBackend()
         codec = self.encoding_options.video_codec
         bit_depth = self.encoding_options.video_bit_depth
@@ -1928,6 +2253,10 @@ class RecordedFMP4Stream:
             (item for item in timeline if float(item['start_time']) <= start_time < float(item['end_time'])),
             None,
         )
+        color_space = entry.get('color_space') if entry else None
+        color_range = entry.get('color_range') if entry else None
+        color_primaries = entry.get('color_primaries') if entry else None
+        color_transfer = entry.get('color_transfer') if entry else None
         scan_type = entry.get('scan_type') if entry else self.recorded_program.recorded_video.video_scan_type
         is_interlaced = scan_type == 'Interlaced'
         if is_interlaced:
@@ -1957,9 +2286,16 @@ class RecordedFMP4Stream:
         ]
         device: str | None = None
         if backend in ('QSV', 'AMF'):
-            selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(backend, codec, bit_depth)
+            # 能力検査で同じ画質を完走したrender nodeを使い、低解像度だけ成功する旧GPUへ戻さない。
+            # 固定指定がある場合は resolveRenderDevices がその render node だけを返す (vendor 不一致時は自動選択へ退避)。
+            selected_device = RecordedPlaybackCapabilityProbe.getSelectedDevice(
+                backend,
+                codec,
+                bit_depth,
+                self.quality,
+            )
             devices = [selected_device] if selected_device is not None else \
-                RecordedPlaybackBackend.discoverRenderDevices(backend)
+                RecordedPlaybackBackend.resolveRenderDevices(backend)
             if len(devices) == 0:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -2029,20 +2365,54 @@ class RecordedFMP4Stream:
                 filters.append(
                     f'deinterlace_vaapi=rate={"field" if quality.is_60fps else "frame"}:auto=1'
                 )
+            # decoderの並べ替えで構成境界後にも旧色メタデータのframeが残ることがあるため、
+            # 同じgenerationの全segmentが同じSPSを生成するよう索引上の構成へ正規化する。
+            scale_vaapi_options = [
+                f'w={quality.width}',
+                f'h={quality.height}',
+                f'format={spec.encoder_pixel_format}',
+                'out_chroma_location=left',
+            ]
+            if entry is not None:
+                if color_space is not None:
+                    scale_vaapi_options.append(f'out_color_matrix={color_space}')
+                if color_range in ('tv', 'pc'):
+                    scale_vaapi_options.append(f'out_range={color_range}')
+                if color_primaries is not None:
+                    scale_vaapi_options.append(f'out_color_primaries={color_primaries}')
+                if color_transfer is not None:
+                    scale_vaapi_options.append(f'out_color_transfer={color_transfer}')
+            scale_vaapi_filter = 'scale_vaapi=' + ':'.join(scale_vaapi_options)
+            # VAAPI encoder へ VAAPI 面を直接渡す。
             filters += [
-                f'scale_vaapi=w={quality.width}:h={quality.height}:format={spec.encoder_pixel_format}',
-                f'hwdownload,format={spec.encoder_pixel_format}',
+                scale_vaapi_filter,
             ]
             if is_interlaced and self.encoding_options.is_24fps_mode_enabled:
                 filters += [
-                    'pullup', 'dejudder', f'format={spec.encoder_pixel_format}', 'hwupload',
-                    f'scale_vaapi=w={quality.width}:h={quality.height}:format={spec.encoder_pixel_format}',
-                    f'hwdownload,format={spec.encoder_pixel_format}',
+                    f'hwdownload,format={spec.encoder_pixel_format}', 'pullup', 'dejudder',
+                    f'format={spec.encoder_pixel_format}', 'hwupload',
+                    scale_vaapi_filter,
                 ]
             filters += [
                 f'trim=start={trim_start:.6f}:duration={duration:.6f}',
                 'setpts=PTS-STARTPTS',
             ]
+        # encoder側の-rだけでは、trim後の最後の入力frameでCFR同期が終わり、
+        # 約6秒の区間が短くなる。filterのEOF時刻まで最後のframeを保持し、
+        # 次のfragmentのtfdtとの間に穴を作らない。24/30p混在の逆テレシネはVFRを維持する。
+        if self.encoding_options.is_24fps_mode_enabled is False:
+            filters.append(f'fps={output_frame_rate}:start_time=0:eof_action=pass')
+        # prerollで前generationの色からfilterが初期化されても、encoderへは現在generationの
+        # フレーム色情報を渡す。色域・伝達特性・行列の未指定もunknownへ揃え、bt709を持ち越さない。
+        # encoderオプションだけではフレーム由来の値に置き換わり、configurationが位置で変わる。
+        # 色レンジ未確定時のunknown強制はQSV VPPが拒否するため、既存の自動判定を維持する。
+        filters.append(
+            'setparams='
+            f'range={color_range if color_range in ("tv", "pc") else "auto"}:'
+            f'color_primaries={color_primaries or "unknown"}:'
+            f'color_trc={color_transfer or "unknown"}:'
+            f'colorspace={color_space or "unknown"}'
+        )
         command += [
             '-vf', ','.join(filters),
             '-c:v', encoder_name,
@@ -2055,11 +2425,17 @@ class RecordedFMP4Stream:
         elif backend == 'NVENC':
             command += ['-pix_fmt', 'cuda']
         elif backend == 'AMF':
-            command += ['-pix_fmt', spec.encoder_pixel_format]
+            command += ['-pix_fmt', 'vaapi']
         command += self.__getProfileArguments(backend, codec, bit_depth)
+        if backend == 'AMF' and codec == 'hevc':
+            # ライブと同じく、Mesa VCN へ HEVC 符号化面の padding を事前通知する。
+            # fMP4 の global SPS と driver が生成する slice で同じ coded dimensions を共有させる。
+            command += ['-mesa_hevc_alignment', '1']
         command += RecordedPlaybackBackend.getTuningArguments(backend, codec)
         if codec == 'hevc':
-            command += ['-tag:v', 'hvc1']
+            # Mesa VCN は driver 側で VPS/SPS/PPS を再生成するため、AMF では in-band parameter sets を
+            # 保持できる hev1 を使う。hvc1 の global PPS だけでは VBR slice の CU QP 構造と一致しない。
+            command += ['-tag:v', 'hev1' if backend == 'AMF' else 'hvc1']
         # 録画 MPEG-TS の PTS には局側の欠落や seek 直後の不連続が含まれることがあり、
         # FFmpeg の自動同期へ任せると同じ約6秒の fragmentでも出力枚数が大きく変動する。
         # 通常画質は画質名の契約どおり 29.97 / 59.94fps CFR へ正規化し、Chrome の
@@ -2069,7 +2445,7 @@ class RecordedFMP4Stream:
             command += ['-fps_mode', 'vfr']
         else:
             command += [
-                '-r', '60000/1001' if quality.is_60fps is True else '30000/1001',
+                '-r', output_frame_rate,
                 '-fps_mode', 'cfr',
             ]
         command += [
@@ -2107,7 +2483,16 @@ class RecordedFMP4Stream:
         if plan is None:
             return
         command, backend, device, encoder_pixel_format = plan
-        stdout, stderr, returncode = await self.__runVideoEncodeProcess(command, backend, device, encoder_pixel_format)
+        # キャッシュ参照や無音生成にはクラウド接続を要求せず、実入力を開く段階だけ所在を解決する。
+        video = self.recorded_program.recorded_video
+        command[command.index('-i') + 1] = str(await KonomiTVBS4KCloudTransferManager.resolvePath(video.id, video.file_path))
+        stdout, stderr, returncode = await self.__runVideoEncodeProcess(
+            command,
+            backend,
+            device,
+            encoder_pixel_format,
+            segment.duration,
+        )
         if returncode != 0:
             logging.error(
                 '[RecordedFMP4Stream] FFmpeg 8 video segment failed. '
@@ -2124,6 +2509,7 @@ class RecordedFMP4Stream:
         backend: RecordedPlaybackEncoder,
         device: str | None,
         encoder_pixel_format: str,
+        duration: float,
     ) -> tuple[bytes, bytes, int]:
         """映像encoderを1回実行し、HW decode失敗時だけ同じGPUへ再試行する。
 
@@ -2132,6 +2518,7 @@ class RecordedFMP4Stream:
             backend: 実行する録画再生バックエンド。
             device: GPU render node。CPU encodeではNone。
             encoder_pixel_format: software decode再試行時のupload先pixel format。
+            duration: 生成する媒体時間。実行タイムアウトの算出に使う。
 
         Returns:
             stdout、stderr、終了コード。
@@ -2149,23 +2536,37 @@ class RecordedFMP4Stream:
                 stderr = asyncio.subprocess.PIPE,
                 env = RecordedPlaybackBackend.getEnvironment(backend),
             )
-            stdout, stderr = await self.__communicateSubprocess(process)
+            stdout, stderr = await self.__communicateSubprocess(process, duration)
             returncode = process.returncode if process.returncode is not None else 1
+            is_mpeg_ts_filter_reinitialization_failure = (
+                self.recorded_program.recorded_video.container_format == 'MPEG-TS' and
+                self.shouldRetryMPEGTSFilterReinitializationWithSoftwareDecode(stderr)
+            )
             if (
                 returncode != 0 and backend != 'FFmpeg' and
-                self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
-                self.shouldRetryWithSoftwareDecode(stderr)
+                (
+                    (
+                        self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
+                        self.shouldRetryWithSoftwareDecode(stderr)
+                    ) or
+                    is_mpeg_ts_filter_reinitialization_failure
+                )
             ):
-                # MP4/MKV/WebM でHW decodeだけが失敗した場合は、同じGPU encoderへ
-                # system-memoryフレームをuploadし直す。エンコーダーのCPU降格は行わない。
-                fallback_command = self.buildSoftwareDecodeFallback(command, backend, encoder_pixel_format)
+                # HW decodeだけが失敗した場合は、同じGPU encoderへsystem-memoryフレームをuploadし直す。
+                # MPEG-TS内の映像パラメータ切替ではfilter graphを固定し、preroll中の再初期化を避ける。
+                fallback_command = self.buildSoftwareDecodeFallback(
+                    command,
+                    backend,
+                    encoder_pixel_format,
+                    disable_filter_reinitialization=is_mpeg_ts_filter_reinitialization_failure,
+                )
                 process = await asyncio.create_subprocess_exec(
                     *fallback_command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=RecordedPlaybackBackend.getEnvironment(backend),
                 )
-                stdout, stderr = await self.__communicateSubprocess(process)
+                stdout, stderr = await self.__communicateSubprocess(process, duration)
                 returncode = process.returncode if process.returncode is not None else 1
         return stdout, stderr, returncode
 
@@ -2197,31 +2598,59 @@ class RecordedFMP4Stream:
             segment.start_time,
             segment.sequence,
         )
-        if init_path.is_file() is False:
+        # 呼び出し元はinit pathのgeneration owner lockをencode開始前から保持する。
+        # その所有中にinitの決定とmedia公開を完結し、存在確認とatomic replaceのTOCTOUを防ぐ。
+        if init_path.is_file():
+            cached_init_data = await asyncio.to_thread(init_path.read_bytes)
+            # hev1 は各 fragment の先頭 sample に VPS/SPS/PPS を保持するため、Mesa が動的に生成した
+            # hvcC が generation 内で変化しても、その fragment 自身の parameter sets で復号できる。
+            allows_in_band_parameter_sets = (
+                self.__getBackend() == 'AMF' and
+                self.encoding_options.video_codec == 'hevc' and
+                self.__findMP4Box(cached_init_data, b'hev1') is not None and
+                self.__findMP4Box(init_data, b'hev1') is not None
+            )
+            if (
+                allows_in_band_parameter_sets is False and
+                self.__extractVideoCodecConfiguration(cached_init_data) !=
+                self.__extractVideoCodecConfiguration(init_data)
+            ):
+                # 既存initと復号条件が違うmediaを公開すると、先行segmentか現在segmentの
+                # どちらかが必ず壊れる。既存generationを保持し、不整合fragmentだけを失敗させる。
+                logging.error(
+                    '[RecordedFMP4Stream] Refusing to publish a video fragment with a mismatched '
+                    'codec configuration. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'generation: {segment.generation}, sequence: {segment.sequence}]'
+                )
+                return False
+        else:
             await RecordedFMP4CacheManager.writeAtomic(init_path, init_data)
         await RecordedFMP4CacheManager.writeAtomic(segment_path, media_data)
         return True
 
-    def __getPlaybackPrefetchSegments(
+    def __collectPlaybackPrefetchWindow(
         self,
-        current_segment: RecordedFMP4Segment,
+        start_sequence: int,
+        generation: int,
     ) -> list[RecordedFMP4Segment]:
-        """直接生成した現在fragmentの直後から、短い未キャッシュ連続区間を返す。
+        """指定位置から同じ映像generationの未キャッシュ連続区間を、先読み窓の上限内で返す。
 
         Args:
-            current_segment: browserへ返すため単発生成した現在のセグメント。
+            start_sequence: 先読みを開始するセグメントのシーケンス。
+            generation: 混在させない映像generation。
 
         Returns:
-            同じ映像generation内で本数・媒体時間上限に収まる後続セグメント。
+            本数・媒体時間上限に収まる連続セグメント。
         """
 
         segments: list[RecordedFMP4Segment] = []
         total_duration = 0.0
-        sequence = current_segment.sequence + 1
+        sequence = start_sequence
         while sequence < len(self._segments):
             segment = self._segments[sequence]
             # codec configurationが変わる境界を単一の連続encodeへ混在させない。
-            if segment.generation != current_segment.generation:
+            if segment.generation != generation:
                 break
             # cache済み区間を飛び越して遠方のholeを生成すると、cache hitだけで先読みが
             # ファイル末尾まで連鎖するため、直後からの連続holeだけを対象にする。
@@ -2236,11 +2665,30 @@ class RecordedFMP4Stream:
             sequence += 1
         return segments
 
-    async def __preparePlaybackPrefetchRequest(self, sequence: int) -> asyncio.Task[bool] | None:
+    def __getPlaybackPrefetchSegments(
+        self,
+        current_segment: RecordedFMP4Segment,
+    ) -> list[RecordedFMP4Segment]:
+        """直接生成した現在fragmentの直後から、短い未キャッシュ連続区間を返す。
+
+        Args:
+            current_segment: browserへ返すため単発生成した現在のセグメント。
+
+        Returns:
+            同じ映像generation内で本数・媒体時間上限に収まる後続セグメント。
+        """
+
+        return self.__collectPlaybackPrefetchWindow(
+            current_segment.sequence + 1,
+            current_segment.generation,
+        )
+
+    async def __preparePlaybackPrefetchRequest(self, sequence: int, request_generation: int | None = None) -> asyncio.Task[bool] | None:
         """現在要求を実行中の先読みに接続し、範囲外なら古い先読みを回収する。
 
         Args:
             sequence: browserが現在必要としているシーケンス。
+            request_generation: 現在要求のシーク世代。CM先行生成の方向判定に使う。
 
         Returns:
             このsequenceを生成中なら共有task。それ以外はNone。
@@ -2253,6 +2701,21 @@ class RecordedFMP4Stream:
                 return None
             if any(segment.sequence == sequence for segment in run.segments):
                 return run.task
+            # CM 終端 anchor の先行生成では、起動要求から anchor 窓までの自然な順方向の
+            # 手前要求だけは実行を維持する (スキップ発動時に必要な生成を直前で殺さないため)。
+            # 方向判定は起動時より新しい request generation の要求だけで行う。
+            # 同じ generation の要求はシークを伴わない通常再生 (CM 内の先読み通過や
+            # 再試行を含む) なので維持し、generation を持たない要求でも判定しない。
+            if run.cm_anchor_sequence is not None and run.cm_trigger_sequence is not None:
+                is_newer_generation = (
+                    request_generation is not None and
+                    run.cm_trigger_generation is not None and
+                    request_generation > run.cm_trigger_generation
+                )
+                if is_newer_generation is False:
+                    return None
+                if run.cm_trigger_sequence <= sequence <= run.segments[-1].sequence:
+                    return None
             # シーク先を含まない実行は参照から先に外す。taskのfinallyも同じlockを取るため、
             # cancel完了はlock外で待たなければデッドロックする。
             self._playback_prefetch_run = None
@@ -2342,6 +2805,227 @@ class RecordedFMP4Stream:
                     f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
                     f'start_sequence: {segments[0].sequence}, end_sequence: {segments[-1].sequence}]'
                 )
+
+    def __getCMSkipAnchorSegment(self, current_segment: RecordedFMP4Segment) -> RecordedFMP4Segment | None:
+        """要求位置が手前リード内へ入った次のCM区間について、終端を含むセグメントを返す。
+
+        Args:
+            current_segment: browserが現在要求した映像セグメント。
+
+        Returns:
+            スキップ先となるCM終端を含むセグメント。対象のCM区間がなければNone。
+        """
+
+        cm_sections: list[CMSection] = self.recorded_program.recorded_video.cm_sections or []
+        for section in sorted(cm_sections, key=lambda item: (item['start_time'], item['end_time'])):
+            start_time = max(0.0, float(section['start_time']))
+            end_time = max(0.0, float(section['end_time']))
+            if start_time >= end_time:
+                continue
+            # 終端を通過済みの区間と、まだ手前リードへ達していない区間は対象外。
+            # バッファ先読みでCM内部のセグメントが要求された場合もここで起動対象になる。
+            if current_segment.start_time >= end_time:
+                continue
+            if current_segment.start_time < start_time - self.CM_SKIP_PREFETCH_LEAD_SECONDS:
+                continue
+            # CM 終端ちょうどがセグメント境界に一致するときは、その境界から始まるセグメントを選ぶ
+            return next(
+                (
+                    segment for segment in self._segments
+                    if segment.start_time <= end_time < segment.start_time + segment.duration
+                ),
+                None,
+            )
+        return None
+
+    async def __startCMSkipPrefetchIfNeeded(self, current_segment: RecordedFMP4Segment, request_generation: int | None = None) -> None:
+        """CM スキップ有効セッションで、CM 終端 anchor の映像・音声の先行生成を始める。
+
+        Args:
+            current_segment: browserへ返した現在の映像セグメント。
+            request_generation: 起動元要求のシーク世代。後方・範囲外シークの方向判定に使う。
+
+        Returns:
+            None
+        """
+
+        if self._cm_skip_aware is False:
+            return
+        anchor_segment = self.__getCMSkipAnchorSegment(current_segment)
+        if anchor_segment is None:
+            return
+
+        # 映像は既存の先読みrunと同じ実行枠で、CM 終端から通常窓 (2 segment / 18 秒) を生成する。
+        # 実行枠が埋まっている要求では起動せず、次の要求で再試行する (起動は 1 要求 1 回まで)。
+        if anchor_segment.sequence not in self._cm_skip_video_prefetch_started:
+            started = await self.__startCMSkipVideoPrefetch(anchor_segment, current_segment.sequence, request_generation)
+            if started is True:
+                self._cm_skip_video_prefetch_started.add(anchor_segment.sequence)
+
+        # 音声は CM 終端を含む delivery generation を、既存の境界計算・生成経路のまま先行生成する。
+        if anchor_segment.sequence not in self._cm_skip_audio_prefetch_started:
+            rendition = self.__getCMSkipAudioPrefetchRendition()
+            if rendition is not None:
+                self._cm_skip_audio_prefetch_started.add(anchor_segment.sequence)
+                task = asyncio.create_task(self.__runCMSkipAudioPrefetch(anchor_segment, rendition))
+                # 後方・範囲外シークで回収できるよう、起動元と generation 範囲を task に紐付ける
+                generation_segments = self.__getAudioGenerationSegments(
+                    self.__getTranscodedAudioGeneration(anchor_segment),
+                )
+                if len(generation_segments) > 0:
+                    self._cm_skip_audio_prefetch_tasks[anchor_segment.sequence] = RecordedCMSkipAudioPrefetch(
+                        task=task,
+                        trigger_sequence=current_segment.sequence,
+                        request_generation=request_generation,
+                        first_sequence=generation_segments[0].sequence,
+                        last_sequence=generation_segments[-1].sequence,
+                    )
+                    task.add_done_callback(
+                        lambda done_task, anchor_sequence=anchor_segment.sequence: (
+                            self._cm_skip_audio_prefetch_tasks.pop(anchor_sequence, None)
+                        ),
+                    )
+                logging.info(
+                    '[RecordedFMP4Stream] Started CM skip audio prefetch. '
+                    f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                    f'anchor_sequence: {anchor_segment.sequence}, rendition: {rendition.id}]'
+                )
+
+    async def __startCMSkipVideoPrefetch(self, anchor_segment: RecordedFMP4Segment, trigger_sequence: int, request_generation: int | None = None) -> bool:
+        """CM 終端から通常窓分の映像を、既存の先読みrun機構で先行生成する。
+
+        Args:
+            anchor_segment: CM 終端を含むセグメント。スキップ後に最初に要求される位置。
+            trigger_sequence: 先行生成を起動した要求の sequence。後方シーク判定に使う。
+            request_generation: 先行生成を起動した要求のシーク世代。方向判定に使う。
+
+        Returns:
+            生成を開始したか、すでに cache 済みで不要だった場合はTrue。実行枠が占有中ならFalse。
+        """
+
+        async with self._playback_prefetch_lock:
+            # 既存の通常先読みと直列化し、1 セッション 1 本の実行制約を維持する。
+            if self._playback_prefetch_run is not None:
+                return False
+            segments = self.__collectPlaybackPrefetchWindow(anchor_segment.sequence, anchor_segment.generation)
+            if len(segments) == 0:
+                # スキップ先がすでに cache 済みなら生成不要。再試行しても同じため開始済みとして扱う。
+                return True
+            immutable_segments = tuple(segments)
+            task = asyncio.create_task(self.__encodePlaybackPrefetchRun(immutable_segments))
+            self._playback_prefetch_run = RecordedPlaybackPrefetchRun(
+                segments=immutable_segments,
+                task=task,
+                cm_anchor_sequence=anchor_segment.sequence,
+                cm_trigger_sequence=trigger_sequence,
+                cm_trigger_generation=request_generation,
+            )
+            logging.info(
+                '[RecordedFMP4Stream] Started CM skip video prefetch. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                f'start_sequence: {segments[0].sequence}, end_sequence: {segments[-1].sequence}, '
+                f'count: {len(segments)}]'
+            )
+            return True
+
+    def __getCMSkipAudioPrefetchRendition(self) -> RecordedAudioRendition | None:
+        """CM 終端の音声 generation を先行生成する対象レンディションを返す。
+
+        Returns:
+            直近の音声要求と同じレンディション。要求がまだ無ければ master の既定レンディション。
+        """
+
+        renditions = self.getAudioRenditions()
+        if self._last_requested_audio_rendition_id is not None:
+            matched = next(
+                (rendition for rendition in renditions if rendition.id == self._last_requested_audio_rendition_id),
+                None,
+            )
+            if matched is not None:
+                return matched
+        return renditions[0] if len(renditions) > 0 else None
+
+    async def __collectCMSkipAudioPrefetchIfSeekedAway(self, sequence: int, request_generation: int | None = None) -> None:
+        """後方・範囲外シークで不要になった CM スキップ音声先行生成を回収する。
+
+        Args:
+            sequence: browserが現在要求したメディアセグメントのシーケンス。
+            request_generation: 現在要求のシーク世代。None (init 要求など) では方向判定しない。
+
+        Returns:
+            None
+        """
+
+        # generation を持たない要求 (init 取得など) では方向判定しない
+        if request_generation is None:
+            return
+        # 起動元と同じ generation の要求はシークを伴わない通常再生であり、音声は映像
+        # trigger より自然に遅れて到着するため維持する。起動時より新しい generation の
+        # 要求だけが方向判定の対象で、起動元より手前への後方シーク、または対象
+        # generation を通過したシークでは先行生成を止める。
+        # 起動元から generation 末尾までの順方向の要求 (スキップ発動後の要求を含む) は維持する。
+        # なお古い generation の要求は __segmentRequest() が先行排除するためここには届かない。
+        stale_records = [
+            (anchor_sequence, record)
+            for anchor_sequence, record in self._cm_skip_audio_prefetch_tasks.items()
+            if (
+                record.request_generation is None or
+                request_generation > record.request_generation
+            ) and (
+                sequence < record.trigger_sequence or sequence > record.last_sequence
+            )
+        ]
+        if len(stale_records) == 0:
+            return
+        tasks_to_cancel: list[asyncio.Task[None]] = []
+        for anchor_sequence, record in stale_records:
+            # 辞書から先に外し、done_callback の pop と二重に扱わないようにする
+            self._cm_skip_audio_prefetch_tasks.pop(anchor_sequence, None)
+            if record.task.done() is False:
+                record.task.cancel()
+            tasks_to_cancel.append(record.task)
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        logging.info(
+            '[RecordedFMP4Stream] Cancelled CM skip audio prefetch for a seek away from the anchor. '
+            f'[recorded_video_id: {self.recorded_program.recorded_video.id}, sequence: {sequence}, '
+            f'anchors: {[anchor_sequence for anchor_sequence, _ in stale_records]}]'
+        )
+
+    async def __runCMSkipAudioPrefetch(
+        self,
+        anchor_segment: RecordedFMP4Segment,
+        rendition: RecordedAudioRendition,
+    ) -> None:
+        """CM 終端を含む音声 delivery generation を通常要求と同一経路で生成する。
+
+        Args:
+            anchor_segment: CM 終端を含むセグメント。
+            rendition: 先行生成する音声レンディション。
+
+        Returns:
+            None
+        """
+
+        try:
+            # background task自体をactive operationとして数え、Keep-Alive間隔の直前に
+            # セッションとcache参照が破棄されることを防ぐ。
+            async with self.__activeOperation():
+                # generation 全体の encode と cache 公開が目的で、戻り値の fragment は使わない。
+                # 48kHz grid・packet境界・decoder warm-up は通常要求と同一コードパスに委ねる。
+                await self.__getTranscodedAudioSegment(
+                    anchor_segment,
+                    rendition,
+                    self._effective_audio_codec,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.error(
+                '[RecordedFMP4Stream] CM skip audio prefetch failed unexpectedly. '
+                f'[recorded_video_id: {self.recorded_program.recorded_video.id}, '
+                f'anchor_sequence: {anchor_segment.sequence}, rendition: {rendition.id}]',
+                exc_info=True,
+            )
 
     def __getUncachedVideoRun(self, segment: RecordedFMP4Segment) -> list[RecordedFMP4Segment]:
         """同じ映像generation内で、指定segmentを含む未キャッシュ連続区間を返す。
@@ -2474,6 +3158,27 @@ class RecordedFMP4Stream:
             全fragmentを書けた場合はTrue。
         """
 
+        # 単発encodeと同じinit pathをgeneration owner lockにし、先読み・オフライン生成も
+        # 同一generationの別要求と並列にinitを決定しない。全fragment公開まで所有を維持する。
+        generation_lock = await self.__acquire(self.__buildCachePath(segments[0], is_init=True))
+        async with generation_lock:
+            return await self.__encodeContinuousVideoRunAsOwner(segments, purpose)
+
+    async def __encodeContinuousVideoRunAsOwner(
+        self,
+        segments: list[RecordedFMP4Segment],
+        purpose: Literal['Offline', 'PlaybackPrefetch'],
+    ) -> bool:
+        """generation ownerとして連続映像encodeと全fragment公開を行う。
+
+        Args:
+            segments: 同じ映像generationの連続セグメント。
+            purpose: オフライン保存または通常再生の短い先読み。
+
+        Returns:
+            全fragmentを書けた場合はTrue。
+        """
+
         first_segment = segments[0]
         total_duration = sum(item.duration for item in segments)
         split_times = self.__getVideoRunSplitTimes(segments)
@@ -2497,6 +3202,8 @@ class RecordedFMP4Stream:
             if plan is None:
                 return False
             command, backend, device, encoder_pixel_format = plan
+            video = self.recorded_program.recorded_video
+            command[command.index('-i') + 1] = str(await KonomiTVBS4KCloudTransferManager.resolvePath(video.id, video.file_path))
             return await self.__runContinuousVideoEncodeProcess(
                 command,
                 backend,
@@ -2560,12 +3267,27 @@ class RecordedFMP4Stream:
             if (
                 returncode != 0 and
                 backend != 'FFmpeg' and
-                self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
-                self.shouldRetryWithSoftwareDecode(stderr)
+                (
+                    (
+                        self.recorded_program.recorded_video.container_format != 'MPEG-TS' and
+                        self.shouldRetryWithSoftwareDecode(stderr)
+                    ) or
+                    (
+                        self.recorded_program.recorded_video.container_format == 'MPEG-TS' and
+                        self.shouldRetryMPEGTSFilterReinitializationWithSoftwareDecode(stderr)
+                    )
+                )
             ):
                 # 同じencoder slot内で再試行し、semaphoreを二重取得しない。
                 encoded_path.unlink(missing_ok=True)
-                fallback_command = self.buildSoftwareDecodeFallback(command, backend, encoder_pixel_format)
+                fallback_command = self.buildSoftwareDecodeFallback(
+                    command,
+                    backend,
+                    encoder_pixel_format,
+                    disable_filter_reinitialization=(
+                        self.recorded_program.recorded_video.container_format == 'MPEG-TS'
+                    ),
+                )
                 process = await asyncio.create_subprocess_exec(
                     *fallback_command,
                     stdout=asyncio.subprocess.PIPE,
@@ -2670,25 +3392,26 @@ class RecordedFMP4Stream:
         stderr = b''
         latest_progress = 0.0
         try:
-            if process.stdout is not None:
-                while True:
-                    line = await process.stdout.readline()
-                    if line == b'':
-                        break
-                    key, separator, value = line.decode(errors='ignore').strip().partition('=')
-                    if separator == '' or key not in ('out_time_us', 'out_time_ms'):
-                        continue
-                    try:
-                        out_time = int(value) / 1_000_000
-                    except ValueError:
-                        continue
-                    if duration > 0:
-                        latest_progress = max(latest_progress, min(1.0, out_time / duration))
-                        callback(latest_progress)
-            returncode = await process.wait()
-            if returncode == 0:
-                callback(1.0)
-        except asyncio.CancelledError:
+            async with asyncio.timeout(self.__getEncoderProcessTimeout(duration)):
+                if process.stdout is not None:
+                    while True:
+                        line = await process.stdout.readline()
+                        if line == b'':
+                            break
+                        key, separator, value = line.decode(errors='ignore').strip().partition('=')
+                        if separator == '' or key not in ('out_time_us', 'out_time_ms'):
+                            continue
+                        try:
+                            out_time = int(value) / 1_000_000
+                        except ValueError:
+                            continue
+                        if duration > 0:
+                            latest_progress = max(latest_progress, min(1.0, out_time / duration))
+                            callback(latest_progress)
+                returncode = await process.wait()
+                if returncode == 0:
+                    callback(1.0)
+        except (asyncio.CancelledError, TimeoutError):
             if process.returncode is None:
                 try:
                     process.kill()
@@ -2744,10 +3467,32 @@ class RecordedFMP4Stream:
         return any(marker in normalized_stderr for marker in hardware_decode_failure_markers)
 
     @staticmethod
+    def shouldRetryMPEGTSFilterReinitializationWithSoftwareDecode(stderr: bytes) -> bool:
+        """MPEG-TSの映像パラメータ切替によるfilter再初期化失敗かを返す。
+
+        Args:
+            stderr: FFmpegが標準エラー出力へ書いた診断。
+
+        Returns:
+            HW decodeからsoftware decodeへ限定再試行すべき失敗の場合はTrue。
+        """
+
+        # 放送波では同じ映像PIDでも色メタデータなどが切り替わり、VAAPI decoderがhardware frame
+        # contextを再生成する。GPU filter/encoderはそのcontext変更を引き継げないため、両方の
+        # 診断が揃った場合だけsoftware decodeと固定filter graphで再試行する。
+        normalized_stderr = stderr.decode(errors='ignore').lower()
+        return (
+            'error reinitializing filters!' in normalized_stderr and
+            'impossible to convert between the formats supported by the filter' in normalized_stderr
+        )
+
+    @staticmethod
     def buildSoftwareDecodeFallback(
         command: list[str],
         backend: RecordedPlaybackEncoder,
         pixel_format: str,
+        *,
+        disable_filter_reinitialization: bool = False,
     ) -> list[str]:
         """HW decode引数だけを除き、同じGPU filter/encoderへuploadする。"""
 
@@ -2760,6 +3505,11 @@ class RecordedFMP4Stream:
                 continue
             fallback_command.append(command[index])
             index += 1
+        if disable_filter_reinitialization is True:
+            # software frameのpixel formatは直前のformat filterで固定するため、色メタデータなどの
+            # 変更だけで後段のhardware frame contextを作り直さない。
+            input_index = fallback_command.index('-i')
+            fallback_command[input_index:input_index] = ['-reinit_filter:v', '0']
         filter_index = fallback_command.index('-vf') + 1
         upload_filter = {
             'QSV': f'format={pixel_format},hwupload=extra_hw_frames=32',
@@ -2889,6 +3639,8 @@ class RecordedFMP4Stream:
             normalization_command: list[str] | None = None
             trim_start_samples = 0
             if use_recorded_audio:
+                video = self.recorded_program.recorded_video
+                source_path = str(await KonomiTVBS4KCloudTransferManager.resolvePath(video.id, video.file_path))
                 source_track = self.__getAudioSourceTrack(rendition, configuration_time)
                 source_pid = rendition.pid
                 source_stream_index = rendition.stream_index
@@ -2932,7 +3684,7 @@ class RecordedFMP4Stream:
                         '-analyzeduration', str(self.AUDIO_MPEGTS_ANALYZE_DURATION_MICROSECONDS),
                     ]
                 source_input_arguments += [
-                    '-i', self.recorded_program.recorded_video.file_path,
+                    '-i', source_path,
                     '-t', f'{input_duration:.6f}',
                     '-map', stream_specifier,
                 ]
@@ -3550,10 +4302,13 @@ class RecordedFMP4Stream:
     def getCodecQuery(self) -> str:
         """子APIへ引き継ぐ録画エンコード条件を返す。"""
 
+        # CM スキップの有無もセッション条件のため、有効なセッションでは子APIのURLへ引き継ぐ
+        cm_skip_query = '&cm_skip_aware=1' if self._cm_skip_aware else ''
         return (
             f'video_codec={self.encoding_options.video_codec}'
             f'&video_bit_depth={self.encoding_options.video_bit_depth}'
             f'&audio_codec={self.encoding_options.audio_codec}'
+            f'{cm_skip_query}'
         )
 
     @staticmethod
@@ -4211,7 +4966,7 @@ class RecordedFMP4Stream:
         """
 
         info = cls.inspectAudioFragment(init_data, media_data)
-        expected_codec = 'mp4a.40.2' if audio_codec == 'aac' else 'opus'
+        expected_codec = 'mp4a.40.2' if audio_codec == 'aac' else 'Opus'
         frame_samples = cls.AAC_PACKET_SAMPLES if audio_codec == 'aac' else 960
         if info is None or not (
             cls.extractAudioCodecString(init_data) == expected_codec and

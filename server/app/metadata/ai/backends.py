@@ -72,6 +72,10 @@ class ConnectionTestResult:
     selected_choice_id: str | None = None
     # API へは返さず、接続試験が実際に使用した認証世代と proof を結ぶ内部値。
     provider_fingerprint: str | None = None
+    # API 応答には含めない内部監査用の値。OpenAI 互換 backend が非2xxを受けたときの
+    # sanitizer 済み provider 本文抜粋で、router が監査行 (recorded_series_ai_requests)
+    # へそのまま渡す。message から再解析しないために結果オブジェクトへ保持する。
+    provider_error_excerpt: str | None = None
 
 
 @runtime_checkable
@@ -86,6 +90,11 @@ class RecordedSeriesAIBackend(Protocol):
         """バックエンド種別を返す（OpenCode / AcpCodex など）。"""
         ...
 
+    @property
+    def audit_model(self) -> str:
+        """生成時の不変 snapshot に対応する監査用モデル文字列を返す。"""
+        ...
+
     async def selectCandidate(
         self,
         program: RecordedSeriesProgramPrompt,
@@ -96,6 +105,20 @@ class RecordedSeriesAIBackend(Protocol):
         """候補選択を実行する。"""
         ...
 
+    async def resolveTitleReadings(
+        self,
+        titles: list[str],
+    ) -> list[tuple[str, str]]:
+        """複数タイトルのかな読みを一括生成する。
+
+        Args:
+            titles: 読みを取得する Series タイトル一覧。
+
+        Returns:
+            読みが取れた (title, reading) の列。
+        """
+        ...
+
     async def resolveSeriesMetadata(
         self,
         program: RecordedSeriesProgramPrompt,
@@ -104,6 +127,7 @@ class RecordedSeriesAIBackend(Protocol):
         prompt_variant: AIPromptVariant = 'Default',
         execution_guard: Callable[[], None] | None = None,
         local_validation_attempts: int = 2,
+        require_web_search: bool = False,
     ) -> AISeriesMetadataResult:
         """シリーズ名・話数・話名を一括生成する。
 
@@ -113,6 +137,7 @@ class RecordedSeriesAIBackend(Protocol):
             prompt_variant: Default は通常プロンプト。RecoveryRetry は修正版。
             execution_guard: backend の認証・設定排他内で実行する世代検証。
             local_validation_attempts: backend 内の出力検証試行数。
+            require_web_search: 話数検索と同じ検索専用権限・根拠検証を要求するか。
         """
         ...
 

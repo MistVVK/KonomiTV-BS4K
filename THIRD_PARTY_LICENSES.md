@@ -22,23 +22,11 @@ KonomiTV-BS4K の Docker image に直接組み込む third-party ソフトウェ
 
 このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。
 Ubuntu・CUDA・GPU runtime・Python／JavaScript パッケージの推移的依存関係を含め、各配布物の著作権表示とライセンス全文を掲載します。
-Chromium の大容量なライセンス全文は、同じイメージ内の専用文書へ分離してこの文書からリンクします。
 -->
 
 ## Directly Managed Third-Party Components
 
 ### Bundled Components
-
-#### Chromium
-
-- Source package and binaries: <https://packages.linuxmint.com/>
-- Upstream source: <https://chromium.googlesource.com/chromium/src/>
-- Package: `chromium` from the signed Linux Mint Virginia `upstream` repository
-- Licenses include: BSD 3-Clause and the licenses listed by the installed Chromium binary
-
-The exact Chromium license and every third-party notice reported by the installed binary are generated during the Docker build.
-
-[Open the complete Chromium license document](/api/version/chromium-third-party-licenses)
 
 #### KonomiTV upstream
 
@@ -1579,7 +1567,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-#### Poetry 1.8.5
+#### Poetry 2.4.2
 
 - Source: <https://github.com/python-poetry/poetry>
 - Fixed revision or artifact: `19a2f7bddb9bdf931a229ea0913a84021f3f9b93`
@@ -3358,7 +3346,7 @@ SOFTWARE.
 - Source: <https://github.com/FFmpeg/nv-codec-headers.git>
 - Fixed revision or artifact: `1889e62e2d35ff7aa9baca2bceb14f053785e6f1`
 
-##### nvEncodeAPI.h license notice
+##### nvEncodeAPI.h / dynlink_cuviddec.h / dynlink_nvcuvid.h license notice
 
 ```text
 This copyright notice applies to this header file only:
@@ -4230,10 +4218,10 @@ Broadcom Corporation:
 https://datatracker.ietf.org/ipr/1526/
 ```
 
-#### Python Standalone 3.11.15
+#### Python Standalone 3.14.7
 
-- Source: <https://github.com/indygreg/python-build-standalone/releases/download/20260623/cpython-3.11.15+20260623-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz>
-- SHA-256: `0604cd029b142dc223e131f17f5941c0c8d2d5074997c8178b515b19eea2a6c2`
+- Source: <https://github.com/astral-sh/python-build-standalone/releases/download/20260901/cpython-3.14.7%2B20260901-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz>
+- SHA-256: `3959f92825141e04adf44982d3a83ee57af0877e893b0796e04c1468749d9b04`
 
 ##### LICENSE.txt
 
@@ -4323,10 +4311,8 @@ grants Licensee a nonexclusive, royalty-free, world-wide license to reproduce,
 analyze, test, perform and/or display publicly, prepare derivative works,
 distribute, and otherwise use Python alone or in any derivative version,
 provided, however, that PSF's License Agreement and PSF's notice of copyright,
-i.e., "Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
-2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023 Python Software Foundation;
-All Rights Reserved" are retained in Python alone or in any derivative version
-prepared by Licensee.
+i.e., "Copyright (c) 2001 Python Software Foundation; All Rights Reserved"
+are retained in Python alone or in any derivative version prepared by Licensee.
 
 3. In the event Licensee prepares a derivative work that is based on
 or incorporates Python or any part thereof, and wants to make
@@ -4591,6 +4577,7 @@ The fixed upstream revisions, complete local patches, dependency revisions, and 
   - `libaribtlv-0.2.0-konomitv-subtitle-mfu.patch` (`ea2b9a95f2bf4368f3d61428d1f121f2406e6d5e27390a7b5fc016af757c256e`)
   - `ffmpeg-8.1.2-libaribtlv-timed-id3.patch` (`016307760c5a71f1206b253c49904c33cf34ccdba007f8c0702fe3f676ee3a1e`)
   - `ffmpeg-8.1.2-libaribtlv-context-id-metadata.patch` (`5cbbae0849893d7cda9b5d7830be437298a4ed1887d0012af6f9259459e11107`)
+  - `ffmpeg-8.1.2-vaapi-mesa-hevc-alignment.patch` (`92e0363bf85b557fdd4af021e80f4a3610684e6539d78008ace987b12fad0137`)
   - `amf-1.4.36-display-capture-c.patch` (`3527641c277d534d223dcfb669fdff465be9ceca1fe60713c6dcc2880d939f25`)
 
 #### Intel media stack

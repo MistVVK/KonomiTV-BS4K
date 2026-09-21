@@ -13,8 +13,6 @@ export interface ISeriesEpisode {
 
 /** Series API に限って、構造化話数を含む録画番組情報。 */
 export interface ISeriesRecordedProgram extends IRecordedProgram {
-    /** ローリング更新中の旧サーバー応答ではフィールド自体がない場合がある。 */
-    series_episode?: ISeriesEpisode | null;
     /** 番号付き Episode がない録画の正本シーズン・状態。旧サーバーでは未定義。 */
     episode_resolution?: ISeriesEpisodeResolution | null;
 }
@@ -26,12 +24,26 @@ export interface ISeriesEpisodeResolution {
 }
 
 
+/** TMDb の作品種別。サーバー側 models.Series.TmdbMediaType と同じ 2 値。 */
+export type TmdbMediaType = 'tv' | 'movie';
+
+
 /** シリーズ情報を表すインターフェース */
 export interface ISeries {
     id: number;
     title: string;
     description: string;
     genres: { major: string; middle: string; }[];
+    bangumi_subject_id: number | null;
+    bangumi_subject_name: string | null;
+    bangumi_subject_name_cn: string | null;
+    bangumi_subject_summary: string | null;
+    tmdb_id: number | null;
+    tmdb_media_type: TmdbMediaType | null;
+    tmdb_season_number: number | null;
+    tmdb_name: string | null;
+    tmdb_overview: string | null;
+    episodes?: ISeriesEpisode[];
     broadcast_periods: ISeriesBroadcastPeriod[];
     created_at: string;
     updated_at: string;
@@ -41,6 +53,67 @@ export interface ISeries {
 export interface ISeriesList {
     total: number;
     series_list: ISeries[];
+}
+
+/** カタログカード用のシリーズ要約。 */
+export interface ISeriesSummary {
+    id: number;
+    title: string;
+    description: string;
+    genres: { major: string; middle: string; }[];
+    bangumi_subject_id: number | null;
+    bangumi_subject_name: string | null;
+    bangumi_subject_name_cn: string | null;
+    bangumi_subject_summary: string | null;
+    tmdb_id: number | null;
+    tmdb_media_type: TmdbMediaType | null;
+    tmdb_season_number: number | null;
+    tmdb_name: string | null;
+    tmdb_overview: string | null;
+    recorded_count: number;
+    unrecorded_count: number;
+    partial_count: number;
+    latest_recorded_program_id: number | null;
+    updated_at: string;
+    season_members: ISeriesSummaryMember[];
+}
+
+/** カタログカードのグループ成员。Season 未バインドは season_number が null。 */
+export interface ISeriesSummaryMember {
+    series_id: number;
+    season_number: number | null;
+}
+
+/** カタログ一覧のページング応答。 */
+export interface ISeriesSummaryList {
+    total: number;
+    page_size: number;
+    series_list: ISeriesSummary[];
+}
+
+/** 放送中グリッドの 1 スロット。時刻は自然時刻。 */
+export interface ISeriesOnAirSlot {
+    weekday: number;
+    hour: number;
+    minute: number;
+    is_featured: boolean;
+    series: ISeriesSummary;
+}
+
+/** 放送中グリッドの 1 曜日。 */
+export interface ISeriesOnAirDay {
+    weekday: number;
+    slots: ISeriesOnAirSlot[];
+}
+
+/** 放送中グリッド応答。 */
+export interface ISeriesOnAirResponse {
+    days: ISeriesOnAirDay[];
+}
+
+/** `/series/:id` の深いリンク用ページ番号。 */
+export interface ISeriesListPosition {
+    page: number;
 }
 
 /** シリーズ放送期間を表すインターフェース */
@@ -125,6 +198,84 @@ class Series {
         }
 
         return response.data;
+    }
+
+
+    /**
+     * カタログカード用のシリーズ要約一覧を取得する
+     * @param order ソート順序 ('desc' or 'asc')
+     * @param page ページ番号
+     * @param query 検索キーワード
+     * @returns 要約一覧 or 失敗時は null
+     */
+    static async fetchSeriesSummaries(
+        sort: 'updated_at' | 'title_reading' | 'first_air_date' | 'tmdb_popularity' | 'tmdb_vote_average' | 'bangumi_rating' = 'updated_at',
+        order: 'desc' | 'asc' = 'desc',
+        page: number = 1,
+        query: string = '',
+    ): Promise<ISeriesSummaryList | null> {
+
+        const response = await APIClient.get<ISeriesSummaryList>('/series/summary', {
+            params: {
+                sort,
+                order,
+                page,
+                query,
+            },
+        });
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'シリーズ一覧を取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+
+    /**
+     * 今クール相当の週間レギュラーを取得する
+     * @returns 曜日ごとのスロット or 失敗時は null
+     */
+    static async fetchOnAirSeries(): Promise<ISeriesOnAirResponse | null> {
+
+        const response = await APIClient.get<ISeriesOnAirResponse>('/series/on-air');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, '放送中のシリーズを取得できませんでした。');
+            return null;
+        }
+        return response.data;
+    }
+
+
+    /**
+     * カタログ一覧で指定シリーズが載るページ番号を取得する
+     * @param series_id シリーズ ID
+     * @param order ソート順序
+     * @param query 検索キーワード
+     * @returns ページ番号 or 失敗時は null
+     */
+    static async fetchSeriesListPosition(
+        series_id: number,
+        sort: 'updated_at' | 'title_reading' | 'first_air_date' | 'tmdb_popularity' | 'tmdb_vote_average' | 'bangumi_rating' = 'updated_at',
+        order: 'desc' | 'asc' = 'desc',
+        query: string = '',
+    ): Promise<number | null> {
+
+        const response = await APIClient.get<ISeriesListPosition>('/series/list-position', {
+            params: {
+                series_id,
+                sort,
+                order,
+                query,
+            },
+        });
+        if (response.type === 'error') {
+            // 一覧に存在しない深いリンクは通常の 422 契約なので、一覧へ戻す呼び出し元にだけ伝える。
+            if (response.status !== 422) {
+                APIClient.showGenericError(response, 'シリーズの一覧位置を取得できませんでした。');
+            }
+            return null;
+        }
+        return response.data.page;
     }
 }
 

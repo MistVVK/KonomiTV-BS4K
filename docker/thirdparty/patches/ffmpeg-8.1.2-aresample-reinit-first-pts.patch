@@ -1,0 +1,50 @@
+diff --git a/fftools/ffmpeg_filter.c b/fftools/ffmpeg_filter.c
+--- a/fftools/ffmpeg_filter.c
++++ b/fftools/ffmpeg_filter.c
+@@ -2135,3 +2135,46 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
++    /* A lone async resampler has the same timeline as the graph output.
++     * Recreating it must not accept the next input PTS as a new origin:
++     * a gap at a broadcast channel-layout change still needs actual silence
++     * (or overlapping samples need trimming), not a jump in encoded PTS.
++     * Let swresample perform that compensation from the previous output end.
++     * Do not infer this relationship for graphs that can transform timestamps.
++     */
++    if (simple && fg->outputs[0]->type == AVMEDIA_TYPE_AUDIO &&
++        fgt->graph->nb_filters == 1 &&
++        !strcmp(fgt->graph->filters[0]->filter->name, "aresample")) {
++        OutputFilterPriv *ofp = ofp_from_ofilter(fg->outputs[0]);
++        InputFilterPriv *ifp = ifp_from_ifilter(fg->inputs[0]);
++        AVFilterContext *resampler = fgt->graph->filters[0];
++        double async;
++
++        ret = av_opt_get_double(resampler, "async", AV_OPT_SEARCH_CHILDREN, &async);
++        if (ret < 0) {
++            avfilter_inout_free(&inputs);
++            avfilter_inout_free(&outputs);
++            goto fail;
++        }
++        if (ofp->tb_out_locked && async > 0) {
++            void *swr = NULL;
++            AVRational input_tb = { 1, ifp->sample_rate };
++            int64_t first_pts = av_rescale_q(ofp->next_pts, ofp->tb_out, input_tb) +
++                                av_rescale_q(ofp->ts_offset, AV_TIME_BASE_Q, input_tb);
++
++            /* The filter is initialized, but config_output() has not called
++             * swr_init() yet. Configure the resampler child, not a live filter.
++             */
++            if (!av_opt_find2(resampler, "first_pts", NULL, 0,
++                              AV_OPT_SEARCH_CHILDREN, &swr))
++                ret = AVERROR_OPTION_NOT_FOUND;
++            else
++                ret = av_opt_set_int(swr, "first_pts", first_pts, 0);
++            if (ret < 0) {
++                avfilter_inout_free(&inputs);
++                avfilter_inout_free(&outputs);
++                goto fail;
++            }
++        }
++    }
++
+     for (cur = inputs, i = 0; cur; cur = cur->next, i++)
+         if ((ret = configure_input_filter(fg, fgt->graph, fg->inputs[i], cur)) < 0) {
+             avfilter_inout_free(&inputs);

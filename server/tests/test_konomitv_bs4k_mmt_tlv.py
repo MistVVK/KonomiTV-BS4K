@@ -19,7 +19,10 @@ from app.utils.KonomiTVBS4KTLVMetadataMonitor import (
 from app.utils.KonomiTVBS4KTLVRainFallbackMonitor import (
     KonomiTVBS4KTLVRainFallbackMonitor,
 )
-from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
+from app.utils.KonomiTVBS4KTLVServiceResolver import (
+    KonomiTVBS4KTLVServiceResolver,
+    KonomiTVBS4KTLVTrackSnapshot,
+)
 from app.utils.KonomiTVBS4KTLVStreamPump import KonomiTVBS4KTLVStreamPump
 
 
@@ -146,27 +149,35 @@ def test_tlv_live_psi_archived_data_returns_empty_success(monkeypatch: pytest.Mo
 
 
 def test_service_resolver_parses_metadata_line() -> None:
-    """ストリーミング JSON 行からサービスと映像トラックの context_id を抽出する。"""
+    """ストリーミング JSON 行からサービスとトラックの識別情報を抽出する。"""
 
     parse = KonomiTVBS4KTLVServiceResolver.parseMetadataLine
 
     metadata = parse(
         '{"snapshot_type":"MPT","snapshot_context_id":2,'
         '"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
-        '"tracks":[{"context_id":1,"kind":"Audio"},{"context_id":2,"kind":"Video"}]}'
+        '"tracks":[{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio","audio_channels":2},'
+        '{"track_id":0,"context_id":2,"packet_id":62208,"component_tag":0,"kind":"Video","audio_channels":null}]}'
     )
     assert metadata is not None
     assert metadata.snapshot_type == 'MPT'
     assert metadata.snapshot_context_id == 2
     assert metadata.service_contexts == {101: 1, 103: 2}
-    assert metadata.video_context_ids == {2}
+    assert metadata.tracks == (
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=1, context_id=1, packet_id=62224, component_tag=16, audio_channels=2, kind='Audio',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=0, context_id=2, packet_id=62208, component_tag=0, audio_channels=None, kind='Video',
+        ),
+    )
     # 主/降雨対応以外のサービスや追加フィールドは無視しない (service_id さえあれば拾う)。
     metadata = parse(
         '{"services":[{"context_id":1,"service_id":101,"service_name":"NHK BS4K"}],"tracks":[]}'
     )
     assert metadata is not None
     assert metadata.service_contexts == {101: 1}
-    assert metadata.video_context_ids == set()
+    assert metadata.tracks == ()
 
 
 def test_service_resolver_ignores_malformed_metadata_line() -> None:
@@ -177,16 +188,133 @@ def test_service_resolver_ignores_malformed_metadata_line() -> None:
     assert parse('not-a-json') is None
     assert parse('{"events":[]}') is None
     assert parse('{"services":"not-a-list","tracks":[]}') is None
-    # bool は int のサブクラスなので、service_id/context_id の bool は数値として扱わない。
+    # bool は int のサブクラスなので、service_id/context_id/packet_id の bool は数値として扱わない。
     for line in (
         '{"services":[{"service_id":true,"context_id":1}],"tracks":[]}',
         '{"services":[{"service_id":101,"context_id":true}],"tracks":[]}',
-        '{"services":[],"tracks":[{"context_id":true,"kind":"Video"}]}',
+        '{"services":[],"tracks":[{"track_id":0,"context_id":true,"packet_id":62208,"kind":"Video"}]}',
+        '{"services":[],"tracks":[{"track_id":0,"context_id":1,"packet_id":true,"kind":"Video"}]}',
+        '{"services":[],"tracks":[{"track_id":true,"context_id":1,"packet_id":62208,"kind":"Video"}]}',
     ):
         metadata = parse(line)
         assert metadata is not None
         assert metadata.service_contexts == {}
-        assert metadata.video_context_ids == set()
+        assert metadata.tracks == ()
+
+
+def test_select_track_packet_ids_prefers_component_tag_and_picks_distinct_rain_video() -> None:
+    """同一 context に主・低階層が並ぶ局では、component_tag の小さい映像を主とし、別 packet_id を低階層に選ぶ。"""
+
+    select = KonomiTVBS4KTLVServiceResolver.selectTrackPacketIds
+    # NHK BSP4K / BS8K 相当: 主・低階層の映像・音声がすべて context_id=1 に多重化される。
+    tracks = (
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=0, context_id=1, packet_id=62208, component_tag=0, audio_channels=None, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=1, context_id=1, packet_id=62224, component_tag=16, audio_channels=2, kind='Audio',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=2, context_id=1, packet_id=62209, component_tag=1, audio_channels=None, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=3, context_id=1, packet_id=62228, component_tag=20, audio_channels=2, kind='Audio',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=4, context_id=1, packet_id=62256, component_tag=48, audio_channels=None, kind='Subtitle',
+        ),
+    )
+
+    assert select(tracks, 1, 1) == (62208, 62224, 62209)
+    # 低階層なしの通常放送では降雨映像を選ばない。
+    assert select(tracks[:2], 1, 1) == (62208, 62224, None)
+    # 降雨 SID の context が主と別なら、その context の映像をそのまま選ぶ。
+    assert select(tracks, 1, 2) == (62208, 62224, None)
+    # 主 context が未解決なら何も選ばない。
+    assert select(tracks, None, 1) == (None, None, None)
+
+
+def test_select_track_packet_ids_skips_audio_above_max_channels() -> None:
+    """-max_audio_channels で破棄される 8ch 超の音声は選択せず、上限内の音声を選ぶ。"""
+
+    select = KonomiTVBS4KTLVServiceResolver.selectTrackPacketIds
+    # BS4K 相当: 主音声が 22.2ch (24ch)、副音声が 2ch。
+    tracks = (
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=0, context_id=1, packet_id=62208, component_tag=0, audio_channels=None, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=1, context_id=1, packet_id=62224, component_tag=16, audio_channels=24, kind='Audio',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=2, context_id=1, packet_id=62228, component_tag=17, audio_channels=2, kind='Audio',
+        ),
+    )
+
+    # FFmpeg が AVStream を生成しない 22.2ch 音声を必須 map に指定すると失敗するため、2ch 音声を選ぶ。
+    assert select(tracks, 1, None) == (62208, 62228, None)
+    # 上限内の音声が1つもない場合は音声未解決として呼び出し元を失敗させる。
+    assert select(tracks[:2], 1, None) == (62208, None, None)
+
+
+def test_compute_excluded_context_ids_excludes_colliding_contexts() -> None:
+    """他 context が map 対象と同じ packet_id を使う場合、その context だけをモードごとの除外一覧へ入れる。"""
+
+    compute = KonomiTVBS4KTLVServiceResolver.computeExcludedContextIds
+    # context 9 の別サービスが主と同じ packet_id を使い回している想定。
+    tracks = (
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=0, context_id=1, packet_id=62208, component_tag=0, audio_channels=None, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=1, context_id=1, packet_id=62224, component_tag=16, audio_channels=2, kind='Audio',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=2, context_id=2, packet_id=62240, component_tag=0, audio_channels=None, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=3, context_id=9, packet_id=62208, component_tag=0, audio_channels=None, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=4, context_id=9, packet_id=62224, component_tag=16, audio_channels=2, kind='Audio',
+        ),
+    )
+
+    # 通常モードでは主 context 以外が不要なため、衝突元の context 9 を除外できる。
+    assert compute(tracks, 1, 2, 62208, 62224, 62240) == ((9,), (9,))
+    # 低階層を選ばない場合は降雨モードの除外一覧を返さない。
+    assert compute(tracks, 1, 2, 62208, 62224, None) == ((9,), ())
+    # 衝突がなければ両モードとも除外しない。
+    assert compute(tracks[:3], 1, 2, 62208, 62224, 62240) == ((), ())
+    # 主 context 未解決では除外一覧を計算しない。
+    assert compute(tracks, None, 2, None, None, None) == ((), ())
+
+
+def test_compute_excluded_context_ids_rejects_unresolvable_collision() -> None:
+    """必要な context 内での packet_id 重複は負の map で除外できないため失敗させる。"""
+
+    compute = KonomiTVBS4KTLVServiceResolver.computeExcludedContextIds
+    # 主音声と同じ packet_id のトラックが低階層 context にあると、降雨モードでは
+    # 主・低階層の両 context が必要になり除外できない。
+    tracks = (
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=0, context_id=1, packet_id=62208, component_tag=0, audio_channels=None, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=1, context_id=1, packet_id=62224, component_tag=16, audio_channels=2, kind='Audio',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=2, context_id=2, packet_id=62240, component_tag=0, audio_channels=None, kind='Video',
+        ),
+        KonomiTVBS4KTLVTrackSnapshot(
+            track_id=3, context_id=2, packet_id=62224, component_tag=16, audio_channels=2, kind='Audio',
+        ),
+    )
+
+    with pytest.raises(RuntimeError):
+        compute(tracks, 1, 2, 62208, 62224, 62240)
+    # 低階層を選ばなければ低階層 context は不要なため、同じ入力でも除外で処理できる。
+    assert compute(tracks, 1, 2, 62208, 62224, None) == ((2,), ())
 
 
 class _FakeTLVMetadataStreamWriter:
@@ -251,15 +379,23 @@ class _FakeFollowingTLVMetadataProcess:
 def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """resolve はストリームを読み、主/降雨対応 SID の context_id と生バイトを返し、子プロセスを必ず殺す。"""
+    """resolve はストリームを読み、主/降雨対応 SID の context_id と packet_id、生バイトを返し、子プロセスを必ず殺す。"""
 
     async def scenario() -> None:
         stdout_reader = asyncio.StreamReader()
+        # 全 context の MPT が揃うまで早期終了しないため、主 context の MPT を先に通知する。
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"}]}\n'
+        )
         stdout_reader.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,'
             b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
-            b'"tracks":[{"context_id":1,"track_id":10,"kind":"Video"},'
-            b'{"context_id":2,"track_id":20,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"},'
+            b'{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n'
         )
         stdout_reader.feed_eof()
         process = _FakeTLVMetadataProcess(stdout_reader)
@@ -286,12 +422,71 @@ def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
 
         assert resolution.main_context_id == 1
         assert resolution.rain_context_id == 2
+        assert resolution.main_video_packet_id == 62208
+        assert resolution.main_audio_packet_id == 62224
+        assert resolution.rain_video_packet_id == 62240
         assert resolution.is_rain_fallback_broadcasting is True
+        # 全 context で packet_id が一意なため、除外する context はない。
+        assert resolution.normal_excluded_context_ids == ()
+        assert resolution.rain_excluded_context_ids == ()
         # 早期終了により 2 番目の chunk は読まれない。先頭バッファは 1 番目だけ。
         assert resolution.head_buffer == b'head-chunk'
         assert process.stdin.closed is True
         assert process.killed is True
         assert process.wait_count == 1
+
+    asyncio.run(scenario())
+
+
+def test_service_resolver_waits_for_mpt_of_all_observed_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDT で観測した全 context の MPT が揃うまでは早期終了せず、次の chunk を読み進める。"""
+
+    async def scenario() -> None:
+        stdout_reader = asyncio.StreamReader()
+        # 主 context の MPT だけでは packet_id 衝突の除外計算が確定できない。
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"}]}\n'
+        )
+        process = _FakeTLVMetadataProcess(stdout_reader)
+
+        async def fake_exec(*_args: object, **_kwargs: object) -> _FakeTLVMetadataProcess:
+            return process
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVServiceResolver.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+
+        async def stream():
+            yield b'head-chunk'
+            # 主 context の MPT だけでは終了しないため読み進められ、到着後に降雨 context の MPT を通知する。
+            stdout_reader.feed_data(
+                b'{"snapshot_type":"MPT","snapshot_context_id":2,'
+                b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+                b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+                b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"},'
+                b'{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n'
+            )
+            yield b'tail-chunk'
+
+        resolution = await KonomiTVBS4KTLVServiceResolver.resolve(
+            stream(),
+            main_service_id=101,
+            rain_service_id=103,
+            need_rain_fallback=True,
+            log_prefix='test',
+        )
+
+        assert resolution.main_context_id == 1
+        assert resolution.rain_context_id == 2
+        assert resolution.is_rain_fallback_broadcasting is True
+        # 全 context の MPT を待つ間に読んだ 2 つの chunk が先頭バッファに残る。
+        assert resolution.head_buffer == b'head-chunktail-chunk'
 
     asyncio.run(scenario())
 
@@ -304,14 +499,21 @@ def test_service_resolver_resolves_context_ids_and_returns_head_buffer(
             b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],"tracks":[]}\n',
             b'{"snapshot_type":"MPT","snapshot_context_id":2,'
             b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
-            b'"tracks":[{"context_id":2,"kind":"Video"}]}\n',
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"},'
+            b'{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n',
         ],
         [
             b'{"snapshot_type":"MPT","snapshot_context_id":2,'
-            b'"services":[],"tracks":[{"context_id":2,"kind":"Video"}]}\n',
+            b'"services":[],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"},'
+            b'{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n',
             b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
             b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
-            b'"tracks":[{"context_id":2,"kind":"Video"}]}\n',
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"},'
+            b'{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n',
         ],
     ],
 )
@@ -349,6 +551,9 @@ def test_service_resolver_accepts_service_and_track_in_either_order(
 
         assert resolution.main_context_id == 1
         assert resolution.rain_context_id == 2
+        assert resolution.main_video_packet_id == 62208
+        assert resolution.main_audio_packet_id == 62224
+        assert resolution.rain_video_packet_id == 62240
         assert resolution.is_rain_fallback_broadcasting is True
 
     asyncio.run(scenario())
@@ -368,11 +573,16 @@ def test_service_resolver_treats_empty_mpt_as_received_complete_snapshot(
         )
         stdout_reader.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
-            b'"tracks":[{"context_id":2,"track_id":20,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"},'
+            b'{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n'
         )
+        # MPT の tracks は全 context を含む完全 snapshot なので、降雨映像だけを消した再通知で
+        # 主トラックの packet_id は維持される。
         stdout_reader.feed_data(
-            b'{"snapshot_type":"MPT","snapshot_context_id":2,'
-            b'"services":[],"tracks":[]}\n'
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"}]}\n'
         )
         stdout_reader.feed_eof()
         process = _FakeTLVMetadataProcess(stdout_reader)
@@ -396,6 +606,8 @@ def test_service_resolver_treats_empty_mpt_as_received_complete_snapshot(
             log_prefix='test',
         )
 
+        assert resolution.main_video_packet_id == 62208
+        assert resolution.main_audio_packet_id == 62224
         assert resolution.is_rain_fallback_broadcasting is False
 
     asyncio.run(scenario())
@@ -412,7 +624,7 @@ def test_service_resolver_clears_all_track_state_on_null_context_mpt(
         stdout_reader.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,'
             b'"services":[{"service_id":999,"context_id":2}],'
-            b'"tracks":[{"context_id":2,"track_id":20,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n'
         )
         # 未選択resetはhelperの全状態を消した完全空snapshotとして通知される。
         stdout_reader.feed_data(
@@ -423,7 +635,9 @@ def test_service_resolver_clears_all_track_state_on_null_context_mpt(
         stdout_reader.feed_data(
             b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
             b'"services":[{"service_id":101,"context_id":1},'
-            b'{"service_id":103,"context_id":2}],"tracks":[]}\n'
+            b'{"service_id":103,"context_id":2}],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"}]}\n'
         )
         stdout_reader.feed_eof()
         process = _FakeTLVMetadataProcess(stdout_reader)
@@ -504,13 +718,22 @@ def test_service_resolver_cancellation_still_kills_process(
 def test_service_resolver_without_rain_fallback_stops_at_main(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """need_rain_fallback=False では主 SID 解決後に即終了し、降雨対応 SID を待たない。"""
+    """need_rain_fallback=False では主 SID と全 context の MPT 受信で即終了し、降雨送出の追加待機はしない。"""
 
     async def scenario() -> None:
         stdout_reader = asyncio.StreamReader()
+        # SDT で観測した全 context の MPT が揃うまで終了しないため、主・降雨対応の両 context を通知する。
         stdout_reader.feed_data(
-            b'{"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
-            b'"tracks":[{"context_id":2,"kind":"Video"}]}\n'
+            b'{"snapshot_type":"MPT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"}]}\n'
+        )
+        stdout_reader.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":2,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"}]}\n'
         )
         stdout_reader.feed_eof()
         process = _FakeTLVMetadataProcess(stdout_reader)
@@ -537,8 +760,11 @@ def test_service_resolver_without_rain_fallback_stops_at_main(
 
         assert resolution.main_context_id == 1
         assert resolution.rain_context_id == 2
-        assert resolution.is_rain_fallback_broadcasting is None
-        # 主 SID 解決で早期終了するため、2 番目の chunk は読まれない。
+        assert resolution.main_video_packet_id == 62208
+        assert resolution.main_audio_packet_id == 62224
+        # 降雨 context の MPT 受信で Video なしと確定する (追加の降雨送出待機は発生しない)。
+        assert resolution.is_rain_fallback_broadcasting is False
+        # 主 SID と全 context の MPT 受信で早期終了するため、2 番目の chunk は読まれない。
         assert resolution.head_buffer == b'head-chunk'
 
     asyncio.run(scenario())
@@ -555,12 +781,14 @@ def test_service_resolver_rain_timeout_returns_main_only(
         # 降雨対応 SID は SDT にあるが映像トラックがない。EOF も与えず、reader は次の行を待ち続ける。
         stdout_reader.feed_data(
             b'{"services":[{"service_id":101,"context_id":1},{"service_id":103,"context_id":2}],'
-            b'"tracks":[{"context_id":2,"kind":"Audio"}]}\n'
+            b'"tracks":[{"track_id":3,"context_id":2,"packet_id":62256,"component_tag":16,"kind":"Audio"}]}\n'
         )
         # 実入力では同じ context の別 SID が後続 SDT snapshot として届く。主 SID の解決結果は失わない。
         stdout_reader.feed_data(
             b'{"services":[{"service_id":181,"context_id":1}],'
-            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"},'
+            b'{"track_id":3,"context_id":2,"packet_id":62256,"component_tag":16,"kind":"Audio"}]}\n'
         )
         process = _FakeTLVMetadataProcess(stdout_reader)
 
@@ -587,6 +815,8 @@ def test_service_resolver_rain_timeout_returns_main_only(
 
         assert resolution.main_context_id == 1
         assert resolution.rain_context_id == 2
+        assert resolution.main_video_packet_id == 62208
+        assert resolution.main_audio_packet_id == 62224
         assert resolution.is_rain_fallback_broadcasting is None
         assert resolution.head_buffer == b'head-chunk'
 
@@ -604,7 +834,8 @@ def test_service_resolver_starts_probe_timeout_after_first_byte(
         stdout_reader = asyncio.StreamReader()
         stdout_reader.feed_data(
             b'{"services":[{"service_id":101,"context_id":1}],'
-            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"}]}\n'
         )
         stdout_reader.feed_eof()
         process = _FakeTLVMetadataProcess(stdout_reader)
@@ -646,7 +877,7 @@ def test_tlv_metadata_monitor_clears_all_track_state_on_null_context_mpt() -> No
         stdout_reader.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,'
             b'"services":[{"service_id":103,"context_id":2}],'
-            b'"tracks":[{"context_id":2,"track_id":20,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n'
         )
         stdout_reader.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":null,'
@@ -657,7 +888,7 @@ def test_tlv_metadata_monitor_clears_all_track_state_on_null_context_mpt() -> No
         await monitor._readMetadata(stdout_reader)  # type: ignore[reportPrivateUsage]
 
         assert monitor._service_contexts == {}  # type: ignore[reportPrivateUsage]
-        assert monitor._mpt_video_availability == {}  # type: ignore[reportPrivateUsage]
+        assert monitor._mpt_video_packet_ids == {}  # type: ignore[reportPrivateUsage]
 
     asyncio.run(scenario())
 
@@ -689,6 +920,59 @@ def test_tlv_metadata_monitor_replays_resolver_head_before_live_queue(
 
         assert b''.join(process.stdin.chunks) == initial_data + b'live'
         assert [len(chunk) for chunk in process.stdin.chunks] == [monitor.WRITE_CHUNK_SIZE, 1, 4]
+        monitor.cancel()
+        await monitor.wait()
+
+    asyncio.run(scenario())
+
+
+def test_rain_fallback_monitor_detects_same_context_rain_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """主・低階層が同じ context_id に並ぶ局では、主と異なる Video packet_id の有無で送出を判定する。"""
+
+    async def scenario() -> None:
+        monkeypatch.setattr(KonomiTVBS4KTLVMetadataMonitor, 'START_STABILITY_SECONDS', 0.01)
+        monkeypatch.setattr(KonomiTVBS4KTLVMetadataMonitor, 'END_STABILITY_SECONDS', 0.01)
+        process = _FakeFollowingTLVMetadataProcess()
+
+        async def fake_exec(*_args: object, **_kwargs: object) -> _FakeFollowingTLVMetadataProcess:
+            return process
+
+        monkeypatch.setattr(
+            'app.utils.KonomiTVBS4KTLVMetadataMonitor.asyncio.subprocess.create_subprocess_exec',
+            fake_exec,
+        )
+        # NHK BSP4K / BS8K 相当: 主 (101) と降雨対応 (102) が同じ context_id=1 を共有する。
+        monitor = KonomiTVBS4KTLVMetadataMonitor(101, 102, 'test')
+        monitor.start()
+        await asyncio.sleep(0)
+
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MHSDT","snapshot_context_id":1,'
+            b'"services":[{"service_id":101,"context_id":1},{"service_id":102,"context_id":1}],'
+            b'"tracks":[]}\n'
+        )
+        # 主映像・主音声だけの通常放送では送出中にしない。
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":1,"services":[],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"}]}\n'
+        )
+        await asyncio.sleep(0.015)
+        assert monitor.is_rain_fallback_broadcasting is False
+
+        # 低階層映像・音声が現れた完全MPTで送出中へ遷移する。
+        process.stdout.feed_data(
+            b'{"snapshot_type":"MPT","snapshot_context_id":1,"services":[],'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},'
+            b'{"track_id":1,"context_id":1,"packet_id":62224,"component_tag":16,"kind":"Audio"},'
+            b'{"track_id":2,"context_id":1,"packet_id":62209,"component_tag":1,"kind":"Video"},'
+            b'{"track_id":3,"context_id":1,"packet_id":62228,"component_tag":20,"kind":"Audio"}]}\n'
+        )
+        await asyncio.sleep(0.015)
+        assert monitor.is_rain_fallback_broadcasting is True
+
         monitor.cancel()
         await monitor.wait()
 
@@ -732,18 +1016,18 @@ def test_rain_fallback_monitor_tracks_stable_mpt_start_and_end(
         )
         process.stdout.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":1,"services":[],'
-            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"}]}\n'
         )
         process.stdout.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
-            b'"tracks":[{"context_id":1,"kind":"Video"},{"context_id":2,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n'
         )
         await asyncio.sleep(0.015)
         assert monitor.is_rain_fallback_broadcasting is True
 
         process.stdout.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
-            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"}]}\n'
         )
         await asyncio.sleep(0.01)
         assert monitor.is_rain_fallback_broadcasting is True
@@ -786,16 +1070,16 @@ def test_rain_fallback_monitor_cancels_unstable_transition(
         )
         process.stdout.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":1,"services":[],'
-            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"}]}\n'
         )
         process.stdout.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
-            b'"tracks":[{"context_id":1,"kind":"Video"},{"context_id":2,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"},{"track_id":2,"context_id":2,"packet_id":62240,"component_tag":0,"kind":"Video"}]}\n'
         )
         await asyncio.sleep(0.01)
         process.stdout.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":2,"services":[],'
-            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"}]}\n'
         )
         await asyncio.sleep(0.04)
         assert monitor.is_rain_fallback_broadcasting is False
@@ -831,7 +1115,7 @@ def test_rain_fallback_monitor_treats_missing_rain_service_as_not_broadcasting(
         )
         process.stdout.feed_data(
             b'{"snapshot_type":"MPT","snapshot_context_id":1,"services":[],'
-            b'"tracks":[{"context_id":1,"kind":"Video"}]}\n'
+            b'"tracks":[{"track_id":0,"context_id":1,"packet_id":62208,"component_tag":0,"kind":"Video"}]}\n'
         )
         await asyncio.sleep(0.015)
 

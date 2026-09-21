@@ -19,6 +19,7 @@ from app.CompatibilityAPI import (
 )
 from app.constants import VERSION
 from app.routers import LiveStreamsRouter
+from app.utils.KonomiTVBS4KFastAPIRouteUtils import IterateKonomiTVBS4KAPIRouteContexts
 
 
 def BuildRecordedProgramResponse() -> dict[str, Any]:
@@ -217,19 +218,30 @@ def test_reservation_response_folders_and_nullable_numbers_are_transformed() -> 
             }],
         }
 
+    @app.put('/api/recording/reservations/{reservation_id}')
+    async def UpdateReservationAPI(reservation_id: int):
+        assert reservation_id == 1
+        return (await ReservationsAPI())['reservations'][0]
+
     app.add_middleware(KomorebiResponseMiddleware)
 
-    async def GetResponse():
+    async def GetResponses():
         async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
-            return await client.get('/api/recording/reservations')
+            return (
+                await client.get('/api/recording/reservations'),
+                await client.put('/api/recording/reservations/1'),
+            )
 
-    response = asyncio.run(GetResponse())
-    assert response.status_code == 200
-    record_settings = response.json()['reservations'][0]['record_settings']
-    assert record_settings['recording_folders'] == ['/recordings/primary']
-    assert record_settings['recording_start_margin'] == 0
-    assert record_settings['recording_end_margin'] == 0
-    assert record_settings['forced_tuner_id'] == 0
+    list_response, update_response = asyncio.run(GetResponses())
+    for response, record_settings in (
+        (list_response, list_response.json()['reservations'][0]['record_settings']),
+        (update_response, update_response.json()['record_settings']),
+    ):
+        assert response.status_code == 200
+        assert record_settings['recording_folders'] == ['/recordings/primary']
+        assert record_settings['recording_start_margin'] == 0
+        assert record_settings['recording_end_margin'] == 0
+        assert record_settings['forced_tuner_id'] == 0
 
 
 def test_reservation_request_body_is_replayed_after_transformation() -> None:
@@ -319,16 +331,35 @@ def test_port_dispatch_uses_destination_port_and_main_lifespan() -> None:
     ]
 
 
-def test_compatibility_app_does_not_publish_web_ui_or_server_settings() -> None:
+def test_compatibility_app_does_not_publish_web_ui_or_server_settings(monkeypatch) -> None:
+    monkeypatch.setattr(
+        'app.CompatibilityAPI.Config',
+        lambda: SimpleNamespace(general=SimpleNamespace(backend='EDCB', encoder='QSV')),
+    )
     app = CreateCompatibilityAPI()
-    paths = {route.path for route in app.routes}
+    routes = list(IterateKonomiTVBS4KAPIRouteContexts(app.routes))
+    paths = {route.path for route in routes}
     method_paths = {
         (method, route.path)
-        for route in app.routes
+        for route in routes
         for method in getattr(route, 'methods', set()) or set()
     }
 
+    async def GetVersionResponse():
+        async with HTTPXAsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
+            return await client.get('/api/version')
+
+    version_response = asyncio.run(GetVersionResponse())
+    version_information = version_response.json()
+
     assert app.version == VERSION
+    assert version_response.status_code == 200
+    assert set(version_information) == {'version', 'latest_version', 'environment', 'backend', 'encoder'}
+    assert version_information['version'] == VERSION
+    assert version_information['latest_version'] is None
+    assert version_information['environment'] in ('Linux', 'Linux-Docker')
+    assert version_information['backend'] == 'EDCB'
+    assert version_information['encoder'] == 'QSVEncC'
     assert '/api/channels' in paths
     assert '/api/videos' in paths
     assert '/api/histories' in paths
@@ -350,7 +381,7 @@ def test_compatibility_app_does_not_publish_web_ui_or_server_settings() -> None:
     assert ('DELETE', '/api/videos/{video_id}') not in method_paths
     assert not any(path.startswith('/api/settings') for path in paths)
     assert not any(path.startswith('/api/maintenance') for path in paths)
-    assert '/api/version' not in paths
+    assert ('GET', '/api/version') in method_paths
     assert '/{file:path}' not in paths
 
 
@@ -404,7 +435,7 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
         raise AssertionError('compatibility route must not require Stream Anchor capability')
 
     async def GetAvailableHEVC10BitCapability(*_args, **_kwargs):
-        return SimpleNamespace(recorded_available=True)
+        return SimpleNamespace(available=True)
 
     monkeypatch.setattr(
         LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
@@ -413,7 +444,7 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
     )
     monkeypatch.setattr(
         LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
-        'getRecordedVideoCapability',
+        'getLegacyLiveCombinationCapability',
         classmethod(GetAvailableHEVC10BitCapability),
     )
     hevc_10bit_stream_quality = asyncio.run(
@@ -423,11 +454,11 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
     assert hevc_10bit_stream_quality.encoding_options.video_bit_depth == 10
 
     async def GetUnavailableHEVC10BitCapability(*_args, **_kwargs):
-        return SimpleNamespace(recorded_available=False)
+        return SimpleNamespace(available=False)
 
     monkeypatch.setattr(
         LiveStreamsRouter.KonomiTVBS4KPlaybackCapabilityProbe,
-        'getRecordedVideoCapability',
+        'getLegacyLiveCombinationCapability',
         classmethod(GetUnavailableHEVC10BitCapability),
     )
     downgraded_hevc_stream_quality = asyncio.run(
@@ -451,3 +482,30 @@ def test_compatibility_stream_dependencies_force_legacy_codecs(monkeypatch) -> N
     assert {'video_codec', 'video_bit_depth', 'audio_codec', 'audio_track'}.isdisjoint(
         parameter['name'] for parameter in recorded_parameters
     )
+
+
+def test_bangumi_routes_are_not_on_compatibility_api() -> None:
+    """Bangumi API は本線だけへ公開し、互換 allowlist には載せない。"""
+
+    from app.routers.KonomiTVBS4KBangumiRouter import router as bangumi_router
+
+    bangumi_paths = {
+        route.path
+        for route in bangumi_router.routes
+        if getattr(route, 'path', None)
+    }
+    logout_methods = {
+        method
+        for route in bangumi_router.routes
+        if getattr(route, 'path', None) == '/api/bangumi/logout'
+        for method in (getattr(route, 'methods', None) or set())
+    }
+    assert '/api/bangumi/auth' in bangumi_paths
+    assert '/api/bangumi/me' in bangumi_paths
+    assert '/api/bangumi/logout' in bangumi_paths
+    assert 'POST' in logout_methods
+    assert '/api/bangumi/videos/{video_id}/progress' in bangumi_paths
+
+    compatibility_app = CreateCompatibilityAPI()
+    compatibility_paths = list(compatibility_app.openapi()['paths'].keys())
+    assert not any(path.startswith('/api/bangumi') for path in compatibility_paths)

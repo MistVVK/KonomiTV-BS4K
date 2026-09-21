@@ -43,8 +43,8 @@ export interface IKonomiTVBS4KSpeedTestResult {
 export interface IKonomiTVBS4KSpeedTestWorkerOptions {
     test_order: 'P_D_U';
     time_auto: true;
-    time_dl_max: 10;
-    time_ul_max: 10;
+    time_dl_max: 15;
+    time_ul_max: 15;
     time_dlGraceTime: 1.5;
     time_ulGraceTime: 3;
     count_ping: 20;
@@ -55,10 +55,10 @@ export interface IKonomiTVBS4KSpeedTestWorkerOptions {
     xhr_ul_blob_megabytes: 20;
     garbagePhp_chunkSize: 100;
     xhr_dlUseBlob: false;
-    xhr_ignoreErrors: 0;
+    xhr_ignoreErrors: 1;
     enable_quirks: true;
     useMebibits: false;
-    overheadCompensationFactor: 1.0;
+    overheadCompensationFactor: 1.06;
     telemetry_level: 0;
     getIp_ispInfo: false;
     url_dl: string;
@@ -72,14 +72,14 @@ export type KonomiTVBS4KSpeedTestWorkerFactory = (url: string) => Worker;
 export function BuildKonomiTVBS4KSpeedTestWorkerOptions(
     api_base_url: string = Utils.api_base_url,
 ): IKonomiTVBS4KSpeedTestWorkerOptions {
-    // Desktop / Mobile で負荷条件を分けず、8K 視聴を同じ基準で測る。
+    // Desktop / Mobile で負荷条件を分けず、同じ条件でサーバーとの接続速度を測る。
     // 下り 100MiB は高ビットレート映像の連続受信、上り 20MiB は約 6 秒の 4K 相当セグメント。
     // 小さい blob だと Gbps 級で HTTP オーバーヘッドが支配し、実測が低すぎる。
     return {
         test_order: 'P_D_U',
         time_auto: true,
-        time_dl_max: 10,
-        time_ul_max: 10,
+        time_dl_max: 15,
+        time_ul_max: 15,
         time_dlGraceTime: 1.5,
         time_ulGraceTime: 3,
         count_ping: 20,
@@ -90,10 +90,10 @@ export function BuildKonomiTVBS4KSpeedTestWorkerOptions(
         xhr_ul_blob_megabytes: 20,
         garbagePhp_chunkSize: 100,
         xhr_dlUseBlob: false,
-        xhr_ignoreErrors: 0,
+        xhr_ignoreErrors: 1,
         enable_quirks: true,
         useMebibits: false,
-        overheadCompensationFactor: 1.0,
+        overheadCompensationFactor: 1.06,
         telemetry_level: 0,
         getIp_ispInfo: false,
         url_dl: `${api_base_url}/konomitv-bs4k/speed-test/garbage`,
@@ -133,12 +133,12 @@ function IsFiniteMetric(value: unknown): value is number {
     return typeof value === 'number' && Number.isFinite(value);
 }
 
-function ParseMetricString(value: unknown): number | null {
+function ParseMetricString(value: unknown, allow_zero: boolean = false): number | null {
     if (typeof value !== 'string' || value === '' || value === 'Fail') {
         return null;
     }
     const parsed = Number(value);
-    if (Number.isFinite(parsed) === false || parsed <= 0) {
+    if (Number.isFinite(parsed) === false || (allow_zero ? parsed < 0 : parsed <= 0)) {
         return null;
     }
     return parsed;
@@ -193,7 +193,7 @@ export function ResolveKonomiTVBS4KSpeedTestResult(
     const download_mbps = ParseMetricString(status.dlStatus);
     const upload_mbps = ParseMetricString(status.ulStatus);
     const rtt_ms = ParseMetricString(status.pingStatus);
-    const jitter_ms = ParseMetricString(status.jitterStatus);
+    const jitter_ms = ParseMetricString(status.jitterStatus, true);
     if (download_mbps === null || upload_mbps === null || rtt_ms === null || jitter_ms === null) {
         return null;
     }
@@ -226,7 +226,7 @@ export class KonomiTVBS4KSpeedTestWorkerController {
 
     constructor(
         private readonly create_worker: KonomiTVBS4KSpeedTestWorkerFactory =
-        (url: string) => new Worker(url),
+            (url: string) => new Worker(url),
         private readonly api_base_url: string = Utils.api_base_url,
     ) {}
 

@@ -135,6 +135,26 @@ def _parseEpisodeDecimal(value: str) -> Decimal | None:
     return episode_number
 
 
+def ParseSinglePositiveIntegerEpisode(value: str | None) -> int | None:
+    """Indexer の確定値保持と Automation の検索抑止が共有する、単一正整数話数。
+
+    Args:
+        value: Indexer または Automation が見た話数文字列。
+
+    Returns:
+        単一の正整数ならその値。0・小数・範囲・複数話・Season 付きは None。
+    """
+
+    if value is None:
+        return None
+    # Season 1 の #N 表記も、素の数字と同じ正整数として扱う。
+    normalized_episode_number = value[1:] if value.startswith('#') else value
+    if normalized_episode_number.isdecimal() is False:
+        return None
+    parsed_number = int(normalized_episode_number)
+    return parsed_number if parsed_number > 0 else None
+
+
 def ParseLegacyEpisodeNumber(value: str | None) -> ParsedEpisodeNumber | None:
     """既存episode_numberを完全一致で構造化し、複合・範囲表記を拒否する。
 
@@ -240,6 +260,8 @@ class RecordedEpisodeResolver:
 
         # API以外の統合フックから呼ばれても、不正値をDBへ到達させない。
         FormatEpisodeNumber(season_number, episode_number)
+        # 指数表記の Decimal (1E+1) は TEXT カラムへそのまま文字列化されるため、f 形式へ正規化する。
+        episode_number = Decimal(format(episode_number, 'f'))
         episode = await SeriesEpisode.filter(
             series_id=series_id,
             season_number=season_number,

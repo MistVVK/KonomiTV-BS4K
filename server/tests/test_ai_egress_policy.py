@@ -165,19 +165,16 @@ def test_blocked_ai_egress_hostname(hostname: str, blocked: bool) -> None:
     assert IsBlockedAIEgressHostname(hostname) is blocked
 
 
-def test_opencode_episode_session_passes_search_only_tools(
+def test_opencode_episode_invocation_passes_search_only_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OpenCode episode session は tools に websearch のみ True を渡す。"""
+    """OpenCode episode CLI は tools に websearch のみ True を渡す。"""
 
     backend = OpenCodeBackend(_service(), api_key='sk-test')
     captured_tools: list[dict[str, bool] | None] = []
 
     class FakeClient:
-        async def createSession(self) -> str:
-            return 'sess-1'
-
-        async def promptJsonSchema(self, *_args: Any, **kwargs: Any) -> dict[str, Any]:
+        async def runPrompt(self, **kwargs: Any) -> dict[str, Any]:
             captured_tools.append(kwargs.get('tools'))
             return {
                 'parts': [
@@ -205,16 +202,8 @@ def test_opencode_episode_session_passes_search_only_tools(
                         ),
                     },
                 ],
+                'session_cleaned_up': True,
             }
-
-        async def listMessages(self, _session_id: str) -> list[dict[str, Any]]:
-            return []
-
-        async def deleteSession(self, _session_id: str) -> None:
-            return None
-
-        async def abortSession(self, _session_id: str) -> None:
-            return None
 
     class NoopProviderLease:
         async def __aenter__(self) -> NoopProviderLease:

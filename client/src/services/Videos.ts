@@ -1,5 +1,6 @@
 
 import type { IAnalysisTaskAccepted } from '@/services/AnalysisTasks';
+import type { ISeriesEpisode } from '@/services/Series';
 import type {
     IKonomiTVBS4KPlaybackVideoProfile,
     KonomiTVBS4KPlaybackAudioCodec,
@@ -30,7 +31,8 @@ export type KonomiTVBS4KPlaybackCapabilityReason = (
     'CodecMismatch' |
     'BitDepthMismatch' |
     'ProfileMismatch' |
-    'UnsupportedCombination'
+    'UnsupportedCombination' |
+    'UnsupportedByDevice'
 );
 type KonomiTVBS4KPlaybackOptionUnavailableReason = (
     KonomiTVBS4KPlaybackCapabilityReason |
@@ -105,7 +107,7 @@ export interface IKonomiTVBS4KPlaybackAudioCodecOption {
 
 export interface IKonomiTVBS4KPlaybackQualityOption<
     KonomiTVBS4KQuality extends KonomiTVBS4KPlaybackSelectableQuality =
-    KonomiTVBS4KPlaybackSelectableQuality,
+        KonomiTVBS4KPlaybackSelectableQuality,
 > {
     title: string;
     value: KonomiTVBS4KQuality;
@@ -158,6 +160,7 @@ export interface ISubtitleTrack {
     pid?: number;
     component_tag?: number;
     program_number?: number;
+    source?: 'Sidecar';
 }
 
 /** 録画ファイル情報を表すインターフェース */
@@ -165,6 +168,7 @@ export interface IRecordedVideo {
     id: number;
     status: 'Recording' | 'Analyzing' | 'Recorded' | 'AnalysisFailed' | 'Deleting' | 'DeleteFailed';
     file_path: string;
+    storage_location: 'Local' | 'Cloud';
     file_hash: string;
     file_size: number;
     file_created_at: string;
@@ -191,6 +195,7 @@ export interface IRecordedVideo {
     video_resolution_height: number | null;
     video_sample_aspect_ratio: string | null;
     video_display_aspect_ratio: string | null;
+    video_hdr: string | null;
     has_video_stream_changes: boolean;
     primary_audio_codec: string | null;
     primary_audio_channel: string | null;
@@ -202,6 +207,7 @@ export interface IRecordedVideo {
     audio_track_timeline: IAudioTrackTimelineEntry[];
     subtitle_tracks: ISubtitleTrack[];
     cm_sections: { start_time: number; end_time: number; }[] | null;
+    playback_completion_threshold: number;
     cm_analysis_status: 'Pending' | 'Analyzing' | 'Completed' | 'Failed' | 'Unsupported' | 'Excluded' | 'Interrupted' | null;
     cm_analysis_error_code: string | null;
     cm_analysis_finished_at: string | null;
@@ -247,6 +253,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     id: -1,
     status: 'Recorded',
     file_path: '',
+    storage_location: 'Local',
     file_hash: '',
     file_size: 0,
     file_created_at: '2000-01-01T00:00:00+09:00',
@@ -273,6 +280,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     video_resolution_height: 1080,
     video_sample_aspect_ratio: '4:3',
     video_display_aspect_ratio: '16:9',
+    video_hdr: null,
     has_video_stream_changes: false,
     primary_audio_codec: 'AAC-LC',
     primary_audio_channel: 'Stereo',
@@ -284,6 +292,7 @@ export const IRecordedVideoDefault: IRecordedVideo = {
     audio_track_timeline: [],
     subtitle_tracks: [],
     cm_sections: null,
+    playback_completion_threshold: 0,
     cm_analysis_status: null,
     cm_analysis_error_code: null,
     cm_analysis_finished_at: null,
@@ -314,6 +323,10 @@ export interface IRecordedProgram {
     series_title: string | null;
     episode_number: string | null;
     subtitle: string | null;
+    /** 構造化話数の割当。関連番組など割当付きの応答でのみ入る。旧互換 episode_number の代わりに使う。 */
+    series_episode: ISeriesEpisode | null;
+    bangumi_subject_id: number | null;
+    bangumi_episode_id: number | null;
     description: string;
     detail: { [key: string]: string };
     start_time: string;
@@ -346,6 +359,9 @@ export const IRecordedProgramDefault: IRecordedProgram = {
     series_title: null,
     episode_number: null,
     subtitle: null,
+    series_episode: null,
+    bangumi_subject_id: null,
+    bangumi_episode_id: null,
     description: '取得中…',
     detail: {},
     start_time: '2000-01-01T00:00:00+09:00',
@@ -557,6 +573,7 @@ class Videos {
                     video_bit_depths: konomitv_bs4k_video_bit_depths.join(','),
                     audio_codec: konomitv_bs4k_requested_audio_codec,
                     has_video: konomitv_bs4k_has_video,
+                    quality: konomitv_bs4k_video_profile.streaming_quality,
                 },
             },
         );
@@ -805,6 +822,7 @@ class Videos {
             BitDepthMismatch: '出力ビット深度を確認できません',
             ProfileMismatch: '出力プロファイルを確認できません',
             UnsupportedCombination: 'このコーデック構成は利用できません',
+            UnsupportedByDevice: 'このエンコーダーデバイスはこのコーデックに対応していません',
             BrowserMSEUnsupported: 'このブラウザの MSE が対応していません',
         };
         return konomitv_bs4k_labels[konomitv_bs4k_reason];
@@ -1436,6 +1454,40 @@ class Videos {
             return null;
         }
 
+        return response.data;
+    }
+
+
+    /**
+     * 指定した録画番組と同一シリーズまたは関連する録画番組を取得する
+     * @param video_id 検索基準となる録画番組 ID
+     * @param mode 検索モード
+     * @param include_other_channels 他チャンネルの録画番組を含めるか
+     * @param order ソート順序
+     * @param page ページ番号
+     * @returns 関連録画番組一覧 or 取得に失敗した場合は null
+     */
+    static async fetchRelatedVideos(
+        video_id: number,
+        mode: 'strict' | 'relaxed' = 'strict',
+        include_other_channels: boolean = false,
+        order: 'desc' | 'asc' = 'desc',
+        page: number = 1,
+    ): Promise<IRecordedPrograms | null> {
+
+        const response = await APIClient.get<IRecordedPrograms>('/videos/related', {
+            params: {
+                video_id,
+                mode,
+                include_other_channels,
+                order,
+                page,
+            },
+        });
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, '関連番組を取得できませんでした。');
+            return null;
+        }
         return response.data;
     }
 

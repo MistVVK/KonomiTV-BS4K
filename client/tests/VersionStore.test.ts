@@ -18,6 +18,7 @@ function createVersionInfo(overrides: Partial<IVersionInformation> = {}): IVersi
         bs4k_ignore_viewer_low_latency: true,
         konomitv_bs4k_live_transport: 'Tlv',
         jikkyo_enabled: false,
+        debug: false,
         ...overrides,
     };
 }

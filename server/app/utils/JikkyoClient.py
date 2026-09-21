@@ -15,7 +15,7 @@ from typing_extensions import TypedDict
 from app import logging, schemas
 from app.config import Config
 from app.constants import API_REQUEST_HEADERS, HTTPX_CLIENT, JIKKYO_CHANNELS_PATH, JST
-from app.models.User import User
+from app.models.User import NiconicoTokenDecryptionError, User
 from app.utils import ParseDatetimeStringToJST
 
 
@@ -318,13 +318,26 @@ class JikkyoClient:
         # NX-Jikkyo の旧ニコニコ生放送「コメント受信用 WebSocket API」互換の WebSocket API の URL を生成
         comment_session_url = f'wss://nx-jikkyo.tsukumijima.net/api/v1/channels/{self.jikkyo_id}/ws/comment'
 
+        # 暗号鍵の欠損・変更時は暗号文をニコニコへ送らず、他の実況機能を維持したまま再連携を促す
+        try:
+            niconico_access_token = current_user.niconico_access_token if current_user is not None else None
+            niconico_refresh_token = current_user.niconico_refresh_token if current_user is not None else None
+        except NiconicoTokenDecryptionError as ex:
+            return schemas.JikkyoWebSocketInfo(
+                watch_session_url = watch_session_url,
+                nicolive_watch_session_url = None,
+                nicolive_watch_session_error = str(ex),
+                comment_session_url = comment_session_url,
+                is_nxjikkyo_exclusive = is_nxjikkyo_exclusive,
+            )
+
         # 現在は NX-Jikkyo のみ存在するニコニコ実況チャンネル or 未ログイン or ニコニコアカウントと連携していない場合は、
         # ニコ生側の「視聴セッション維持用 WebSocket API」の URL は取得せず、そのまま NX-Jikkyo の WebSocket API の URL のみを返す
         if is_nxjikkyo_exclusive is True or current_user is None or not all([
             current_user.niconico_user_id,
             current_user.niconico_user_name,
-            current_user.niconico_access_token,
-            current_user.niconico_refresh_token,
+            niconico_access_token,
+            niconico_refresh_token,
         ]):
             return schemas.JikkyoWebSocketInfo(
                 watch_session_url = watch_session_url,
@@ -376,7 +389,7 @@ class JikkyoClient:
                 async with HTTPX_CLIENT() as client:
                     return await client.get(
                         url = wsendpoint_api_url,
-                        headers = {**API_REQUEST_HEADERS, 'Authorization': f'Bearer {current_user.niconico_access_token}'},
+                        headers = {**API_REQUEST_HEADERS, 'Authorization': f'Bearer {niconico_access_token}'},
                     )
             wsendpoint_api_response = await get_session()
 
@@ -385,6 +398,7 @@ class JikkyoClient:
             if wsendpoint_api_response.status_code == 401:
                 try:
                     await current_user.refreshNiconicoAccessToken()
+                    niconico_access_token = current_user.niconico_access_token
                 except Exception as ex:
                     # アクセストークンのリフレッシュに失敗した
                     logging.warning(f'[fetchWebSocketInfo][{self.nicochannel_id}] Failed to refresh niconico access token. ({ex.args[0]})')

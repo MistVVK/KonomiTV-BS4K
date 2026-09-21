@@ -2,6 +2,7 @@
 import asyncio
 import atexit
 import mimetypes
+import re
 from collections.abc import Awaitable
 from pathlib import Path
 
@@ -27,11 +28,13 @@ from app.metadata.AnalysisTaskTracker import AnalysisTaskTracker
 from app.metadata.CMAnalysisOrchestrator import CMAnalysisOrchestrator
 from app.metadata.CMAnalysisTaskManager import CMAnalysisTaskManager
 from app.metadata.CMAnalysisWorkspace import CMAnalysisWorkspace
+from app.metadata.KonomiTVBS4KSeriesImage import KonomiTVBS4KSeriesImage
 from app.metadata.RecordedEpisodeAutomation import RecordedEpisodeAutomation
 from app.metadata.RecordedEpisodeResolver import RecordedEpisodeResolver
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.metadata.RecordedScanTask import RecordedScanTask
 from app.metadata.RecordedSeriesResolver import RecordedSeriesResolver
+from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
 from app.models.Channel import Channel
 from app.models.NiconicoOAuthState import NiconicoOAuthState
 from app.models.Program import Program
@@ -39,11 +42,15 @@ from app.models.RefreshToken import RefreshToken
 from app.routers import (
     AIBackendRouter,
     AnalysisTasksRouter,
-    BlueskyRouter,
     CapturesRouter,
     ChannelsRouter,
     CMAnalysisRouter,
     DataBroadcastingRouter,
+    KonomiTVBS4KBangumiRouter,
+    KonomiTVBS4KCloudCryptKeysRouter,
+    KonomiTVBS4KCloudStorageRouter,
+    KonomiTVBS4KCloudTransfersRouter,
+    KonomiTVBS4KCodecSupportRouter,
     KonomiTVBS4KSpeedTestRouter,
     LiveStreamsRouter,
     MaintenanceRouter,
@@ -55,7 +62,6 @@ from app.routers import (
     ReservationsRouter,
     SeriesRouter,
     SettingsRouter,
-    TwitterRouter,
     UsersRouter,
     VersionRouter,
     VideosRouter,
@@ -68,6 +74,15 @@ from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.utils.edcb.EDCBTuner import EDCBTuner
 from app.utils.FastAPITaskUtil import repeat_every
 from app.utils.HTTPS import BuildServerStartupSettings, ReverseProxyMiddleware
+from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
+from app.utils.KonomiTVBS4KCloudStorage import KonomiTVBS4KCloudStorage
+from app.utils.KonomiTVBS4KCloudTransferManager import KonomiTVBS4KCloudTransferManager
+from app.utils.KonomiTVBS4KCodecSupport import KonomiTVBS4KCodecSupportJobManager
+from app.utils.KonomiTVBS4KRequestBodyLimit import (
+    MULTIPART_FORM_DATA_OVERHEAD_BYTES,
+    KonomiTVBS4KRequestBodyLimit,
+    KonomiTVBS4KRequestBodyLimitMiddleware,
+)
 
 
 # もし Config() の実行時に AssertionError が発生した場合は、LoadConfig() を実行してサーバー設定データをロードする
@@ -125,17 +140,47 @@ app.include_router(CapturesRouter.router)
 app.include_router(CMAnalysisRouter.router)
 app.include_router(DataBroadcastingRouter.router)
 app.include_router(NiconicoRouter.router)
-app.include_router(TwitterRouter.router)
-app.include_router(BlueskyRouter.router)
 app.include_router(UsersRouter.router)
 app.include_router(SettingsRouter.router)
 app.include_router(MaintenanceRouter.router)
 app.include_router(VersionRouter.router)
 app.include_router(KonomiTVBS4KSpeedTestRouter.router)
+app.include_router(KonomiTVBS4KCloudStorageRouter.router)
+app.include_router(KonomiTVBS4KCloudTransfersRouter.router)
+app.include_router(KonomiTVBS4KCloudCryptKeysRouter.router)
+# コーデック対応のサーバー診断は本線 API だけへ登録し、互換 API には露出させない。
+app.include_router(KonomiTVBS4KCodecSupportRouter.router)
+# Bangumi 連携は本線 API だけへ登録し、互換 API には露出させない。
+app.include_router(KonomiTVBS4KBangumiRouter.router)
 
-# Capture upload は multipart 解析前に HTTP 本文サイズを制限する。
-# add_middleware は後から登録した方が外側になるため、先に BodyLimit を入れ、その後 CORS を被せる。
-app.add_middleware(CapturesRouter.CaptureUploadBodyLimitMiddleware)
+# FastAPI は認証 dependency より前に form 全体を解析するため、対象ルートだけ ASGI 層で本文を制限する。
+## 画像は KonomiTV-BS4K が生成・保存できる Capture 1 枚 20 MiB を共通の入力上限とし、
+## CM ロゴは endpoint の既存 64 MiB 上限に framing の余裕を加える。
+## OAuth2 ログインは username 64 bytes・password 72 bytes と任意の標準フィールドに対して十分な 64 KiB とする。
+REQUEST_BODY_LIMITS = (
+    CapturesRouter.CAPTURE_UPLOAD_BODY_LIMIT,
+    KonomiTVBS4KRequestBodyLimit(
+        method='PUT',
+        path_pattern=re.compile(r'/api/users/me/icon/?'),
+        max_body_bytes=CapturesRouter.MAX_CAPTURE_UPLOAD_BYTES + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
+        detail='User icon upload exceeds the 20 MiB limit',
+    ),
+    KonomiTVBS4KRequestBodyLimit(
+        method='POST',
+        path_pattern=re.compile(r'/api/cm-analysis/logos/?'),
+        max_body_bytes=CMAnalysisRouter.MAX_LOGO_UPLOAD_BYTES + MULTIPART_FORM_DATA_OVERHEAD_BYTES,
+        detail='The CM logo file exceeds the 64 MiB limit',
+    ),
+    KonomiTVBS4KRequestBodyLimit(
+        method='POST',
+        path_pattern=re.compile(r'/api/users/token/?'),
+        max_body_bytes=64 * 1024,
+        detail='Login form exceeds the 64 KiB limit',
+    ),
+)
+app.add_middleware(KonomiTVBS4KRequestBodyLimitMiddleware, limits=REQUEST_BODY_LIMITS)
+
+# add_middleware は後から登録した方が外側になるため、BodyLimit の後に CORS を被せる。
 
 # CORS の設定
 ## 開発環境では全てのオリジンからのリクエストを許可
@@ -324,8 +369,15 @@ async def Startup():
     except Exception as ex:
         logging.warning('[AIAPIUsageLedger] Startup reservation recovery failed:', exc_info=ex)
 
-    # 録画スキャンとは分離したシリーズ判定ワーカーを開始する。
-    await RecordedSeriesResolver.start()
+    # 所属は HonomiTV Indexer 本線。Resolver は起動しない。
+    from app.metadata.SeriesIndexer import SeriesIndexer
+    await SeriesIndexer.rebuild()
+
+    # Indexer が削除した空 Series も反映した DB を正本に、到達不能な外部 ID の表紙だけを回収する。
+    await KonomiTVBS4KSeriesImage.cleanupOrphanedImages()
+
+    # Indexer 未所属だけを EPG タイトル単位で束ね、Web 検索をスキャン外で直列実行する。
+    await SeriesAIFallbackTask.start()
 
     # Series確定後の話数解析・Web検索も別ワーカーで開始し、録画スキャンを待たせない。
     await RecordedEpisodeAutomation.start()
@@ -342,6 +394,9 @@ async def Startup():
     await RecordedSubtitleStream.cleanupOrphanedCaches()
 
     # 録画フォルダ監視・メタデータ更新/同期タスクを開始
+    # クラウド所在と未完了移動の保持ガードは、スキャナーの不在回収より先に復旧する。
+    await KonomiTVBS4KCloudTransferManager.start()
+    await KonomiTVBS4KCloudCatalog.start()
     ## 録画ファイルの量次第では録画ファイルの更新確認に時間がかかるため、非同期で実行する
     # ref: https://docs.astral.sh/ruff/rules/asyncio-dangling-task/
     recorded_scan_task = RecordedScanTask()
@@ -352,6 +407,9 @@ async def Startup():
 
     # 異常終了した前プロセスが残したfMP4予約キャッシュだけを削除する。
     await RecordedFMP4CacheManager.cleanupStale()
+
+    # アカウント削除のcommit後に中断したローカル認証回収を再試行する。
+    await KonomiTVBS4KCloudStorage.cleanupOrphanedOwners()
 
     # HTTP 接続から独立したオフライン保存ジョブを復旧し、完成済みパッケージだけを再公開する。
     await KonomiTVBS4KOfflineJobManager.initialize()
@@ -394,6 +452,12 @@ async def CleanupExpiredNiconicoOAuthStates():
 async def CleanupExpiredOfflineJobs():
     await KonomiTVBS4KOfflineJobManager.cleanupExpired()
 
+# 起動時回収と重複させず、1時間ごとに同じ参照・書き込み保護条件でfMP4残骸を回収する。
+@app.on_event('startup')
+@repeat_every(seconds=3600, wait_first=3600, logger=logging.logger)
+async def CleanupStaleRecordedFMP4Caches():
+    await RecordedFMP4CacheManager.cleanupStale()
+
 # サーバーの終了処理は FastAPI と atexit のどちらから呼ばれても同じ Task を共有する
 _shutdown_completed = False
 _shutdown_task: asyncio.Task[None] | None = None
@@ -434,6 +498,9 @@ async def _RunShutdownCleanup() -> None:
         await RunCleanupStep('[EDCBTuner]', EDCBTuner.closeAll())
 
     # 録画フォルダ監視タスクを停止
+    # 移動workerが保持するpath lockと同期I/Oを先に回収し、スキャナー停止との待ち合いを防ぐ。
+    await RunCleanupStep('[KonomiTVBS4KCloudCatalog]', KonomiTVBS4KCloudCatalog.stop())
+    await RunCleanupStep('[KonomiTVBS4KCloudTransferManager]', KonomiTVBS4KCloudTransferManager.stop())
     global recorded_scan_task
     if recorded_scan_task is not None:
         scan_stop_succeeded, _scan_stop_result = await RunCleanupStep(
@@ -443,9 +510,14 @@ async def _RunShutdownCleanup() -> None:
         if scan_stop_succeeded:
             recorded_scan_task = None
 
-    # DB接続が閉じられる前にproducerのシリーズ判定を先に止め、その後に話数判定を停止する。
+    # DB接続が閉じられる前に保守パイプラインを止め、producerのシリーズ判定、話数判定の順に停止する。
     # 逆順では、停止済みの話数ワーカーへSeries側がenqueueして再起動する競合が起こり得る。
+    await RunCleanupStep(
+        '[RecordedSeriesPipeline]',
+        RecordedSeriesRouter.StopRecordedSeriesPipeline(),
+    )
     await RunCleanupStep('[RecordedSeriesResolver]', RecordedSeriesResolver.stop())
+    await RunCleanupStep('[SeriesAIFallbackTask]', SeriesAIFallbackTask.stop())
     await RunCleanupStep('[RecordedEpisodeAutomation]', RecordedEpisodeAutomation.stop())
 
     # DB接続が閉じられる前に、HTTP接続から分離した手動CM再判定を中断・回収する。
@@ -453,6 +525,9 @@ async def _RunShutdownCleanup() -> None:
 
     # 録画モデル・fMP4キャッシュを参照する生成ジョブを、DB接続終了前に中断状態へ確定する。
     await RunCleanupStep('[KonomiTVBS4KOfflineJobManager]', KonomiTVBS4KOfflineJobManager.stop())
+
+    # サーバー診断ジョブはDBを使わないが、プロセス終了前に実行中ジョブをキャンセルして外部プロセスを回収する。
+    await RunCleanupStep('[KonomiTVBS4KCodecSupportJobManager]', KonomiTVBS4KCodecSupportJobManager.stop())
 
     # DB接続が閉じられる前に録画再生用インデックスワーカーを停止する。
     await RunCleanupStep('[RecordedPlaybackIndexer]', RecordedPlaybackIndexer.stop())

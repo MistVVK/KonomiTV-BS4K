@@ -60,7 +60,7 @@ export default class KonomiTVBS4KOfflineDownloadRuntime {
         const generationBaseURL = OfflineVideoStorage.getGenerationBaseURL(job.video_id, job.generation_id);
 
         /** 指定バイト数をネットワークチャンク列から読み取る。 */
-        const readBytes = async (length: number): Promise<Uint8Array> => {
+        const readBytes = async (length: number): Promise<Uint8Array<ArrayBuffer>> => {
             while (pendingLength < length && isStreamFinished === false) {
                 const result = await reader.read();
                 if (result.done === true) {

@@ -471,9 +471,12 @@ export default defineComponent({
             .settings__save-button {
                 max-width: 100%;
                 height: 45px;
-                background: rgb(var(--v-theme-background-lighten-2));
                 font-size: 15.5px;
                 letter-spacing: 0;
+                &:not([class*='bg-']),
+                &:disabled {
+                    background: rgb(var(--v-theme-background-lighten-2));
+                }
                 @include smartphone-horizontal {
                     height: 40px;
                     padding: 0 12px;

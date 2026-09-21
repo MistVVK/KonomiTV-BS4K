@@ -45,8 +45,9 @@
             <div class="settings__item settings__item--sync-disabled">
                 <div class="settings__item-heading">映像コーデック</div>
                 <div class="settings__item-label">
-                    AV1 を既定とし、再生前にブラウザ MSE とライブ・録画それぞれの能力から実効値を確定します。<br>
-                    理由が付いた項目も将来の能力追加に備えた希望値として選択できます。
+                    工場既定は AV1 です。このブラウザでの初回起動時のみ、ハードウェア優先や MSE の対応信号から AV1 → VP9 → HEVC → AVC の順で初期値を選定します。<br>
+                    初期選定後はお使いの環境で未対応の項目も含めて希望値を自由に保存でき、設定値が勝手に書き換わることはありません。<br>
+                    再生開始時にブラウザとサーバーの能力を確認し、希望値が利用できない場合はその再生のみ自動降格します（実効値は「HEVC (AV1→自動)」のように表示されます）。
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :items="video_codec_options" :model-value="selected_video_codec"
@@ -57,7 +58,9 @@
             <div class="settings__item settings__item--sync-disabled">
                 <div class="settings__item-heading">音声コーデック</div>
                 <div class="settings__item-label">
-                    Opus を既定とし、利用できない場合だけ再生開始前に AAC を選びます。再生開始後の自動変更は行いません。
+                    工場既定は Opus です。このブラウザでの初回起動時のみ、MSE の対応信号から Opus → AAC の順で初期値を選定します。<br>
+                    初期選定後はお使いの環境で未対応の項目も含めて希望値を自由に保存でき、設定値が勝手に書き換わることはありません。<br>
+                    再生開始直前に Opus → AAC の順で実効値を決定します。再生が開始された後にコーデックが変更されることはありません。
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :items="audio_codec_options" :model-value="selected_audio_codec"
@@ -104,6 +107,17 @@
                 <v-switch class="settings__item-switch" color="primary" hide-details id="playback-rain-fallback-bs8k"
                     :model-value="selected_rain_fallback_bs8k" @update:model-value="updateRainFallbackBS8K">
                 </v-switch>
+            </div>
+            <div v-if="is_bs4k === true" class="settings__item">
+                <div class="settings__item-heading">HDR 映像の出力</div>
+                <div class="settings__item-label">
+                    デコードできるが HDR 表示できない端末向けに、HLG / PQ を canvas で SDR へ変換します。<br>
+                    Auto は表示能力を見て選び、判定できないときは SDR 変換します。視聴中の一時変更は保存しません。<br>
+                </div>
+                <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :items="hdr_output_options" :model-value="selected_hdr_output"
+                    @update:model-value="updateHdrOutput">
+                </v-select>
             </div>
             <div v-if="is_bs4k === true" class="settings__item settings__item--sync-disabled">
                 <div class="settings__item-heading">24fpsモード</div>
@@ -172,6 +186,7 @@ import useSettingsStore, {
     getKonomiTVBS4KPlaybackAudioCodecSettingKey,
     getKonomiTVBS4KPlaybackStreamingQualitySettingKey,
     getKonomiTVBS4KPlaybackVideoCodecSettingKey,
+    type KonomiTVBS4KHdrOutput,
     type KonomiTVBS4KPlaybackAudioCodec,
     type KonomiTVBS4KPlaybackVideoCodec,
     LIVE_STREAMING_QUALITIES,
@@ -343,6 +358,15 @@ const updateRainFallbackBS4K = (value: boolean | null): void => {
 };
 const updateRainFallbackBS8K = (value: boolean | null): void => {
     patchSetting('tv_use_rain_fallback_for_bs8k', value === true);
+};
+const hdr_output_options = [
+    {title: 'Auto（表示能力に合わせる）', value: 'Auto'},
+    {title: 'HDR（素通し）', value: 'HDR'},
+    {title: 'SDR（変換する）', value: 'SDR'},
+];
+const selected_hdr_output = computed(() => settingsStore.settings.konomitv_bs4k_hdr_output);
+const updateHdrOutput = (value: KonomiTVBS4KHdrOutput): void => {
+    patchSetting('konomitv_bs4k_hdr_output', value);
 };
 
 onMounted(async () => {

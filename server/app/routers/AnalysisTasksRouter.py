@@ -8,6 +8,7 @@ from fastapi.exceptions import HTTPException
 from tortoise.expressions import Q
 
 from app import schemas
+from app.metadata.SeriesAIFallbackTask import SeriesAIFallbackTask
 from app.models.AnalysisTask import AnalysisTaskExecution
 from app.models.CMAnalysis import CMLogoGenerationAttempt
 from app.models.User import User
@@ -57,10 +58,13 @@ def SerializeExecution(execution: AnalysisTaskExecution, is_admin: bool) -> sche
 
 
 @router.get('/overview', response_model=schemas.AnalysisTaskOverview)
-async def AnalysisTaskOverviewAPI(
-    current_user: Annotated[User, Depends(GetCurrentUser)],
-) -> schemas.AnalysisTaskOverview:
-    """ナビゲーションとマイページ用に実行中処理と直近5件を返す。"""
+async def AnalysisTaskOverviewAPI() -> schemas.AnalysisTaskOverview:
+    """ナビゲーションとマイページ用に実行中処理を返す。
+
+    実行中表示はサーバー全体の状態であり、一括解析の開始 API と同様に未ログインでも閲覧できる。
+    完了済みの履歴はタイトルやファイルパスを含むため未認証へは返さず、認証済みの履歴 API に任せる。
+    エラー本文は管理者向け履歴 API に任せ、ここからは出さない。
+    """
 
     active = (
         await AnalysisTaskExecution.filter(
@@ -84,19 +88,12 @@ async def AnalysisTaskOverviewAPI(
             .order_by('created_at')
             .limit(500)
         )
-    recent = (
-        await AnalysisTaskExecution.filter(
-            parent_id=None,
-            status__in=['Succeeded', 'Failed', 'Interrupted', 'Skipped'],
-        )
-        .prefetch_related('recorded_video')
-        .order_by('-completed_at')
-        .limit(5)
-    )
+    # 未ログイン公開のため、管理者専用のエラー本文は常に伏せる。
+    # シリーズ AI の代表タイトルは、既存の実行中タスク title と同じ現在処理中情報として返す。
     return schemas.AnalysisTaskOverview(
-        active=[SerializeExecution(item, current_user.is_admin) for item in active],
-        active_children=[SerializeExecution(item, current_user.is_admin) for item in active_children],
-        recent=[SerializeExecution(item, current_user.is_admin) for item in recent],
+        active=[SerializeExecution(item, False) for item in active],
+        active_children=[SerializeExecution(item, False) for item in active_children],
+        series_ai_fallback=schemas.SeriesAIFallbackStatus.model_validate(SeriesAIFallbackTask.getStatus()),
     )
 
 

@@ -14,9 +14,54 @@
             </v-card-title>
             <v-card-text>
                 <p class="active-analysis-dialog__description">
-                    現在処理しているファイルと処理段階を表示しています。内容は自動更新されます。
+                    {{taskType === 'SeriesAIFallback'
+                        ? 'Indexer で所属を確定できなかった EPG タイトル群の補完状況です。内容は自動更新されます。'
+                        : '現在処理しているファイルと処理段階を表示しています。内容は自動更新されます。'}}
                 </p>
-                <div v-if="detailItems.length > 0" class="active-analysis-dialog__items">
+                <div v-if="seriesAIFallbackStatus !== null" class="active-analysis-dialog__items">
+                    <article class="active-analysis-dialog__item">
+                        <div class="active-analysis-dialog__item-heading">
+                            <span class="active-analysis-dialog__status"
+                                :class="`active-analysis-dialog__status--${seriesAIFallbackStatus.state}`">
+                                {{backgroundTaskStatusLabel(seriesAIFallbackStatus.state)}}
+                            </span>
+                            <small>
+                                全体 {{seriesAIFallbackStatus.processed_groups.toLocaleString()}} /
+                                {{seriesAIFallbackStatus.total_groups.toLocaleString()}} グループ
+                            </small>
+                        </div>
+                        <h3>{{seriesAIFallbackStatus.current_title ?? seriesAIFallbackStateDescription}}</h3>
+                        <dl>
+                            <dt>現在の状態</dt>
+                            <dd>{{backgroundTaskStatusLabel(seriesAIFallbackStatus.state)}}</dd>
+                            <dt>進捗</dt>
+                            <dd>
+                                {{seriesAIFallbackStatus.processed_groups.toLocaleString()}} /
+                                {{seriesAIFallbackStatus.total_groups.toLocaleString()}} グループ
+                            </dd>
+                            <dt>状態内訳</dt>
+                            <dd class="active-analysis-dialog__breakdown">
+                                <span>Resolved {{seriesAIFallbackStatus.resolved_count.toLocaleString()}}</span>
+                                <span>NotSeries {{seriesAIFallbackStatus.not_series_count.toLocaleString()}}</span>
+                                <span>InsufficientEvidence {{seriesAIFallbackStatus.insufficient_evidence_count.toLocaleString()}}</span>
+                                <span>Failed {{seriesAIFallbackStatus.failed_count.toLocaleString()}}</span>
+                                <span>Pending {{seriesAIFallbackStatus.pending_count.toLocaleString()}}</span>
+                                <span>Cancelled {{seriesAIFallbackStatus.cancelled_count.toLocaleString()}}</span>
+                            </dd>
+                            <template v-if="seriesAIFallbackStatus.current_title !== null">
+                                <dt>処理中タイトル</dt>
+                                <dd>{{seriesAIFallbackStatus.current_title}}</dd>
+                            </template>
+                            <template v-if="seriesAIFallbackStatus.stopped_reason !== null">
+                                <dt>停止理由</dt>
+                                <dd>{{seriesAIFallbackStatus.stopped_reason}}</dd>
+                            </template>
+                        </dl>
+                        <v-progress-linear v-if="seriesAIFallbackStatus.total_groups > 0" class="mt-3" color="primary"
+                            height="5" rounded :model-value="seriesAIFallbackProgress" />
+                    </article>
+                </div>
+                <div v-else-if="detailItems.length > 0" class="active-analysis-dialog__items">
                     <article v-for="item in detailItems" :key="item.task.id" class="active-analysis-dialog__item">
                         <div class="active-analysis-dialog__item-heading">
                             <span class="active-analysis-dialog__status"
@@ -32,7 +77,7 @@
                         <p v-if="item.task.file_path !== null" class="active-analysis-dialog__path">
                             {{item.task.file_path}}
                         </p>
-                        <p v-else class="active-analysis-dialog__no-path">
+                        <p v-else-if="shouldShowMissingPath(item.task)" class="active-analysis-dialog__no-path">
                             対象ファイルはまだ確定していません。
                         </p>
                         <dl>
@@ -49,7 +94,7 @@
                 </div>
                 <div v-else class="active-analysis-dialog__completed">
                     <Icon icon="fluent:checkmark-circle-20-regular" width="28px" />
-                    <span>この処理は完了しました。</span>
+                    <span>{{taskType === 'SeriesAIFallback' ? '補完状況を取得できませんでした。' : 'この処理は完了しました。'}}</span>
                 </div>
             </v-card-text>
             <v-card-actions>
@@ -65,7 +110,12 @@
 import { computed } from 'vue';
 
 import { AnalysisTaskType, IAnalysisTaskExecution } from '@/services/AnalysisTasks';
-import useAnalysisTasksStore, { stageLabel, taskTypeLabel } from '@/stores/AnalysisTasksStore';
+import useAnalysisTasksStore, {
+    BackgroundTaskType,
+    backgroundTaskStatusLabel,
+    stageLabel,
+    taskTypeLabel,
+} from '@/stores/AnalysisTasksStore';
 
 interface IActiveAnalysisTaskDetailItem {
     root: IAnalysisTaskExecution;
@@ -74,7 +124,7 @@ interface IActiveAnalysisTaskDetailItem {
 
 const props = defineProps<{
     modelValue: boolean;
-    taskType: AnalysisTaskType | null;
+    taskType: BackgroundTaskType | null;
 }>();
 
 defineEmits<{
@@ -83,12 +133,40 @@ defineEmits<{
 
 const analysisTasksStore = useAnalysisTasksStore();
 
+const FILELESS_TASK_TYPES = new Set<AnalysisTaskType>([
+    'BatchScan',
+    'BatchMetadataReanalysis',
+    'BatchCMAnalysis',
+    'BatchSeriesResolution',
+    'BatchEpisodeResolution',
+    'BatchSeriesPipeline',
+    'BackgroundAnalysis',
+]);
+
 const dialogTitle = computed(() => props.taskType === null
     ? '実行中の処理'
     : taskTypeLabel(props.taskType));
 
+const seriesAIFallbackStatus = computed(() => props.taskType === 'SeriesAIFallback'
+    ? analysisTasksStore.seriesAIFallbackStatus
+    : null);
+
+const seriesAIFallbackProgress = computed(() => {
+    const status = seriesAIFallbackStatus.value;
+    if (status === null || status.total_groups === 0) return 0;
+    return status.processed_groups / status.total_groups * 100;
+});
+
+const seriesAIFallbackStateDescription = computed(() => {
+    const state = seriesAIFallbackStatus.value?.state;
+    if (state === 'Idle') return '処理を待機しています。';
+    if (state === 'Disabled') return 'シリーズ AI 補完は無効です。';
+    if (state === 'Stopped') return 'シリーズ AI 補完は停止しています。';
+    return '補完対象を処理しています。';
+});
+
 const detailItems = computed<IActiveAnalysisTaskDetailItem[]>(() => {
-    if (props.taskType === null) return [];
+    if (props.taskType === null || props.taskType === 'SeriesAIFallback') return [];
 
     // 一括処理ではルートにファイルパスがないため、現在実行中または待機中の子処理を優先して表示する。
     return analysisTasksStore.analysisOverview.active
@@ -106,6 +184,11 @@ function fileName(filePath: string | null): string | null {
     // Linux と Windows の両方で動作するため、両方のパス区切り文字を扱う。
     const segments = filePath.split(/[\\/]/).filter(segment => segment.length > 0);
     return segments[segments.length - 1] ?? filePath;
+}
+
+function shouldShowMissingPath(task: IAnalysisTaskExecution): boolean {
+    // 単票再検索は BatchEpisodeResolution を共有するため、録画IDがある場合は従来表示を保つ。
+    return task.recorded_video_id !== null || FILELESS_TASK_TYPES.has(task.task_type) === false;
 }
 
 </script>
@@ -202,6 +285,23 @@ function fileName(filePath: string | null): string | null {
             color: rgb(var(--v-theme-warning-readable));
             background: rgb(var(--v-theme-warning) / 16%);
         }
+
+        &--Idle {
+            color: rgb(var(--v-theme-secondary-readable));
+            background: rgb(var(--v-theme-secondary) / 16%);
+        }
+
+        &--Disabled,
+        &--Stopped {
+            color: rgb(var(--v-theme-text-darken-1));
+            background: rgb(var(--v-theme-background-lighten-3));
+        }
+    }
+
+    &__breakdown {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 3px 10px;
     }
 
     &__path {

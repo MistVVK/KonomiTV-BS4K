@@ -411,8 +411,15 @@ async def NiconicoAuthCallbackAPI(
             NiconicoOAuthResult.UserAPITimeout,
         )
 
-    # 変更をデータベースに保存
-    await current_user.save()
+    # 外部 API の応答待ち中に更新されたパスワードや設定を古いモデルで上書きしないよう、変更列だけを保存
+    await current_user.save(update_fields=[
+        'niconico_user_id',
+        'niconico_user_name',
+        'niconico_user_premium',
+        'niconico_access_token',
+        'niconico_refresh_token',
+        'updated_at',
+    ])
 
     # OAuth 連携が正常に完了したことを伝える
     return _CreateOAuthCallbackRedirectResponse(
@@ -440,4 +447,11 @@ async def NiconicoAccountLogoutAPI(
     current_user.niconico_user_premium = None
     current_user.niconico_access_token = None
     current_user.niconico_refresh_token = None
-    await current_user.save()
+    await current_user.save(update_fields=[
+        'niconico_user_id',
+        'niconico_user_name',
+        'niconico_user_premium',
+        'niconico_access_token',
+        'niconico_refresh_token',
+        'updated_at',
+    ])

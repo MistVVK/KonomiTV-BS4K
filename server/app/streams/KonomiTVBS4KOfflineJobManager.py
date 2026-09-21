@@ -44,6 +44,8 @@ class KonomiTVBS4KOfflineJobManager:
     _mutation_lock: ClassVar[asyncio.Lock | None] = None
     _is_initialized: ClassVar[bool] = False
     _is_stopping: ClassVar[bool] = False
+    # 録画削除開始後に、依存解決済みの古い POST からジョブが再作成されることを防ぐ。
+    _deleting_video_ids: ClassVar[set[int]] = set()
 
     @classmethod
     def _getStatusPath(cls, job_id: str) -> Path:
@@ -215,6 +217,7 @@ class KonomiTVBS4KOfflineJobManager:
         cls._semaphore = asyncio.Semaphore(cls.MAX_CONCURRENT_JOBS)
         cls._mutation_lock = asyncio.Lock()
         cls._is_stopping = False
+        cls._deleting_video_ids = set()
         cls._is_initialized = True
 
     @classmethod
@@ -249,6 +252,8 @@ class KonomiTVBS4KOfflineJobManager:
             raise RuntimeError('Offline job manager is stopping')
 
         async with cls._mutation_lock:
+            if video_id in cls._deleting_video_ids:
+                raise KonomiTVBS4KOfflineJobConflictError('Recorded video is being deleted')
             # 同じ録画の生成を重ねるとエンコーダーと共有キャッシュを無駄に競合させるため、生成中だけ拒否する。
             if any(job.video_id == video_id and job.state in ('Queued', 'Generating') for job in cls._jobs.values()):
                 raise KonomiTVBS4KOfflineJobConflictError('Offline job is already active')
@@ -566,6 +571,33 @@ class KonomiTVBS4KOfflineJobManager:
             cls._jobs.pop(job_id, None)
             await asyncio.to_thread(cls._getPackagePath(job_id).unlink, missing_ok=True)
             await asyncio.to_thread(cls._getStatusPath(job_id).unlink, missing_ok=True)
+
+    @classmethod
+    async def deleteByVideoID(cls, video_id: int) -> None:
+        """録画削除を開始し、対象録画の生成 Task と永続ジョブをすべて回収する。
+
+        Args:
+            video_id: 削除する録画番組 ID。
+
+        Returns:
+            None
+        """
+
+        await cls._ensureInitialized()
+        if cls._mutation_lock is None:
+            raise RuntimeError('Offline job manager is not initialized')
+        async with cls._mutation_lock:
+            # await より先にバリアを立て、列挙後の createJob() 割り込みを拒否する。
+            cls._deleting_video_ids.add(video_id)
+            job_ids = [job.job_id for job in cls._jobs.values() if job.video_id == video_id]
+
+        # deleteJob() の既存 cancel / wait / atomic 状態削除手順をジョブごとに再利用する。
+        for job_id in job_ids:
+            try:
+                await cls.deleteJob(video_id, job_id)
+            except KonomiTVBS4KOfflineJobNotFoundError:
+                # cleanupExpired() が列挙後に完了していれば、対象はすでに回収済み。
+                continue
 
     @classmethod
     async def cleanupExpired(cls) -> None:

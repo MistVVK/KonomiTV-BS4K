@@ -14,6 +14,7 @@ from typing import Any, cast
 import ariblib.constants
 import httpx
 from tortoise import Tortoise, connections, exceptions, fields, transactions
+from tortoise.context import TortoiseContext
 from tortoise.fields import Field as TortoiseField
 from tortoise.models import Model as TortoiseModel
 
@@ -806,8 +807,11 @@ class Program(TortoiseModel):
             # バリデーションは既にサーバー起動時に行われているためスキップする
             LoadConfig(bypass_validation=True)
 
-        # asyncio.run() で非同期メソッドの実行が終わるまで待つ
-        asyncio.run(cls.updateFromMirakurun(is_running_multiprocess=True))
+        # Python 3.14 の forkserver で起動した子プロセスは親プロセスの TortoiseContext を引き継がないため、
+        # connections proxy を使う非同期処理より先に worker 固有の context を有効化する
+        with TortoiseContext():
+            # asyncio.run() で非同期メソッドの実行が終わるまで待つ
+            asyncio.run(cls.updateFromMirakurun(is_running_multiprocess=True))
 
 
     @classmethod
@@ -825,8 +829,11 @@ class Program(TortoiseModel):
             # バリデーションは既にサーバー起動時に行われているためスキップする
             LoadConfig(bypass_validation=True)
 
-        # asyncio.run() で非同期メソッドの実行が終わるまで待つ
-        asyncio.run(cls.updateFromEDCB(is_running_multiprocess=True))
+        # Python 3.14 の forkserver で起動した子プロセスは親プロセスの TortoiseContext を引き継がないため、
+        # connections proxy を使う非同期処理より先に worker 固有の context を有効化する
+        with TortoiseContext():
+            # asyncio.run() で非同期メソッドの実行が終わるまで待つ
+            asyncio.run(cls.updateFromEDCB(is_running_multiprocess=True))
 
 
     def isOffTheAirProgram(self) -> bool:

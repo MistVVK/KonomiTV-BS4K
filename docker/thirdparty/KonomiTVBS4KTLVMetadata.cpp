@@ -131,12 +131,15 @@ public:
     }
 
     void onMhSdtSnapshot(const aribtlv::MhSdtSnapshot& snapshot) override {
-        // SDT はスナップショットなので、同一 context の古いサービスを一度除去する。
-        for (auto iterator = services_.begin(); iterator != services_.end();) {
-            if (std::get<0>(iterator->first) == snapshot.context_id) {
-                iterator = services_.erase(iterator);
-            } else {
-                ++iterator;
+        // streaming consumer には現在の完全 SDT snapshot だけを返す。
+        // 録画解析では先頭・末尾の別 window で異なるサービスの SDT が現れるため、観測済みサービスを保持する。
+        if (streaming_) {
+            for (auto iterator = services_.begin(); iterator != services_.end();) {
+                if (std::get<0>(iterator->first) == snapshot.context_id) {
+                    iterator = services_.erase(iterator);
+                } else {
+                    ++iterator;
+                }
             }
         }
         for (const auto& service : snapshot.services) {
@@ -183,11 +186,27 @@ public:
     }
 
     void onEventInfo(const aribtlv::EventInfo& event) override {
-        // EIT の再送では input offset が後の情報を優先し、同じイベントを重複出力しない。
-        const auto key = std::tuple{event.context_id, event.service_id, event.event_id};
+        // p/f と schedule は同じ event_id でも記述子の充足度が異なるため、table ごとに保持する。
+        // 同じ table の再送だけ input offset が後の情報を優先し、同一内容を重複出力しない。
+        const auto key = std::tuple{
+            event.context_id,
+            event.service_id,
+            event.event_id,
+            event.table_id,
+        };
         const auto found = events_.find(key);
         if (found == events_.end() || found->second.input_offset <= event.input_offset) {
             events_[key] = event;
+        }
+        // 番組境界の B60 / HDR アイコン変化を、SDT/MPT を待たずに streaming consumer へ出す。
+        if (streaming_) {
+            streaming_snapshot_metadata_ = StreamingSnapshotMetadata{
+                "MHEIT",
+                event.context_id,
+                event.version,
+                event.input_offset,
+            };
+            emitStreamingSnapshot();
         }
     }
 
@@ -235,6 +254,8 @@ public:
         writeServices(output);
         output.put(',');
         writeTracks(output);
+        output.put(',');
+        writeProgramHints(output);
         output << "}\n";
         output.flush();
     }
@@ -261,7 +282,8 @@ public:
             output << ",\"free_ca_mode\":" << (event.free_ca_mode ? "true" : "false")
                    << ",\"title\":";
             WriteJSONString(output, event.title);
-            output << ",\"description\":";
+            output << ",\"hdr_programme_icon\":" << (event.hdr_programme_icon ? "true" : "false")
+                   << ",\"description\":";
             WriteJSONString(output, event.description);
             output << ",\"extended_description\":";
             WriteJSONString(output, event.extended_description);
@@ -340,7 +362,42 @@ private:
             } else {
                 output << ",\"audio_sample_rate\":null,\"audio_channels\":null,\"audio_main_component\":false";
             }
+            output << ",\"video_transfer_characteristics\":";
+            if (track.video.has_value() && track.video->video_transfer_characteristics.has_value()) {
+                output << static_cast<unsigned int>(*track.video->video_transfer_characteristics);
+            } else {
+                output << "null";
+            }
+            output << ",\"hdr_wcg_idc\":";
+            if (track.video.has_value() && track.video->hdr_wcg_idc.has_value()) {
+                output << static_cast<unsigned int>(*track.video->hdr_wcg_idc);
+            } else {
+                output << "null";
+            }
             output.put('}');
+        }
+        output.put(']');
+    }
+
+    // MH-EIT p/f だけを番組ヒントとして出す。schedule テーブルは件数が多いので載せない。
+    void writeProgramHints(std::ostream& output) const {
+        output << "\"program_hints\":[";
+        bool first = true;
+        for (const auto& [key, event] : events_) {
+            static_cast<void>(key);
+            const auto table_id = static_cast<unsigned int>(event.table_id);
+            if (table_id != 0x8BU && table_id != 0x8CU) {
+                continue;
+            }
+            if (!first) output.put(',');
+            first = false;
+            output << "{\"context_id\":" << event.context_id
+                   << ",\"service_id\":" << event.service_id
+                   << ",\"event_id\":" << event.event_id
+                   << ",\"table_id\":" << table_id
+                   << ",\"section_number\":" << static_cast<unsigned int>(event.section_number)
+                   << ",\"hdr_programme_icon\":" << (event.hdr_programme_icon ? "true" : "false")
+                   << '}';
         }
         output.put(']');
     }
@@ -388,7 +445,10 @@ private:
     };
 
     std::map<std::tuple<std::uint32_t, std::uint16_t>, ServiceRecord> services_;
-    std::map<std::tuple<std::uint32_t, std::uint16_t, std::uint16_t>, aribtlv::EventInfo> events_;
+    std::map<
+        std::tuple<std::uint32_t, std::uint16_t, std::uint16_t, std::uint8_t>,
+        aribtlv::EventInfo
+    > events_;
     struct TotRange {
         aribtlv::MhTotInfo first;
         aribtlv::MhTotInfo last;

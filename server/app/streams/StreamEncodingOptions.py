@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.config import Config
-from app.constants import QUALITY, QUALITY_TYPES
+from app.constants import LIVE_STREAMING_QUALITY_TYPES, QUALITY, QUALITY_TYPES
 from app.streams.KonomiTVBS4KPlaybackEncoding import (
     IsKonomiTVBS4KVideoCodecBitDepthSupported,
     KonomiTVBS4KAudioCodec,
@@ -181,13 +181,14 @@ class StreamQualityWithOptions:
     API パスの品質指定を、ベース画質と追加エンコードオプションへ分解した結果を表す
 
     Args:
-        quality (QUALITY_TYPES): ベース画質
+        quality (LIVE_STREAMING_QUALITY_TYPES): ベース画質
         encoding_options (StreamEncodingOptions): ベース画質に追加するエンコードオプション
     """
 
     # QUALITY に定義されているベース画質
     ## API パスには 720p-hevc-10bit-24fps のようにオプション付きの品質が渡されるが、エンコード処理にはこの値だけを渡す
-    quality: QUALITY_TYPES
+    ## ライブ時のみ "original" を受け付ける。録画再生では VideoStreamsRouter が original を 422 で拒否する
+    quality: LIVE_STREAMING_QUALITY_TYPES
 
     # ベース画質に追加するエンコードオプション
     ## HEVC 10bit や 24fps モードは、ベース画質から分けてストリーム ID やエンコード引数へ渡す
@@ -198,6 +199,31 @@ class StreamQualityWithOptions:
 
     # query で従来値以外の音声 codec が明示されたかどうか
     is_audio_encoding_explicitly_requested: bool = False
+
+    # CM スキップ有効の録画視聴セッションかどうか
+    ## 録画 HLS の先行生成条件としてセッション条件へ含める。ライブ・オフライン保存では常に False
+    cm_skip_aware: bool = False
+
+
+def RequireEncodedQuality(quality: LIVE_STREAMING_QUALITY_TYPES) -> QUALITY_TYPES:
+    """QUALITY に存在する再エンコード画質だけを返す。
+
+    original は QUALITY に無く、録画再生では VideoStreamsRouter が 422 する。
+    この関数は original 以外の経路だけが呼ぶ。
+
+    Args:
+        quality (LIVE_STREAMING_QUALITY_TYPES): 分解済みの画質。
+
+    Returns:
+        QUALITY_TYPES: QUALITY に定義されたベース画質。
+
+    Raises:
+        ValueError: original が渡されたとき。
+    """
+
+    if quality == 'original':
+        raise ValueError('original quality is not an encoded QUALITY')
+    return quality
 
 
 def SplitQualityAndEncodingOptions(
@@ -226,6 +252,14 @@ def SplitQualityAndEncodingOptions(
     Returns:
         StreamQualityWithOptions | None: 分解結果 (不正な品質指定の場合は None)
     """
+
+    # オリジナル画質はエンコーダーを通さないため、エンコードオプションは空の既定値にする
+    ## ルーター側で GR/BS/CS フルセグ以外と録画再生を 422 にする
+    if quality == 'original':
+        return StreamQualityWithOptions(
+            quality = 'original',
+            encoding_options = StreamEncodingOptions(),
+        )
 
     # -10bit / -24fps は buildSuffix() と同じ順序でのみ受け付ける
     ## 末尾から剥がすことで、1080p-60fps-hevc のようにベース画質自体が -hevc を含むケースを安全に扱う

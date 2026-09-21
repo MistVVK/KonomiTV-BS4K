@@ -42,7 +42,8 @@
                     :items="['EDCB', 'Mirakurun']" v-model="server_settings.general.backend">
                 </v-select>
             </div>
-            <div class="settings__item" v-if="isSectionVisible('backend')">
+            <div class="settings__item"
+                v-if="isSectionVisible('backend') && server_settings.general.backend === 'EDCB'">
                 <div class="settings__item-heading">EDCB (EpgTimerNW) の TCP API の URL</div>
                 <div class="settings__item-label">
                     バックエンドに EDCB が選択されているときに利用されます。<br>
@@ -53,10 +54,12 @@
                     v-model="server_settings.general.edcb_url">
                 </v-text-field>
             </div>
-            <div class="settings__item" v-if="isSectionVisible('backend')">
+            <div class="settings__item"
+                v-if="isSectionVisible('backend') && (server_settings.general.backend === 'Mirakurun' || server_settings.general.always_receive_tv_from_mirakurun)">
                 <div class="settings__item-heading">Mirakurun / mirakc の HTTP API の URL</div>
                 <div class="settings__item-label">
                     バックエンドに Mirakurun が選択されているときに利用されます。<br>
+                    バックエンドが EDCB でも、[常に Mirakurun / mirakc から放送波を受信する] が有効なときは利用されます。<br>
                 </div>
                 <v-text-field class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -64,11 +67,11 @@
                 </v-text-field>
             </div>
             <div class="settings__item" v-if="isSectionVisible('backend')">
-                <div class="settings__item-heading">BS4K の視聴方法</div>
+                <div class="settings__item-heading">BS4K の受信方式</div>
                 <div class="settings__item-label">
-                    MPEG-TS は従来の受信経路を利用します。TLV は BS4K のライブ視聴だけを専用 Mirakurun / mirakc から受信します。<br>
+                    MPEG-TS は通常の受信経路を利用します。TLV は BS4K のライブ視聴のみ専用 Mirakurun / mirakc から受信します。<br>
                     TLV を選択しても、番組情報・録画予約などの通常バックエンドは変更されません。<br>
-                    EDCB バックエンドでは、BS4K 以外のライブ視聴も従来どおり EDCB から受信できます。<br>
+                    BS4K 以外のライブ視聴は、通常のバックエンド設定に従って受信されます。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -108,8 +111,8 @@
             <div class="settings__item" v-if="isSectionVisible('streaming') && server_settings.general.encoder !== 'FFmpeg'">
                 <div class="settings__item-heading">SARモード</div>
                 <div class="settings__item-label">
-                    CPUを選択すると、放送中のアスペクト比を自動判断して最適な出力をします。<br>
-                    GPUは<strong>決め打ちで</strong>最終的に16:9になるように出力します。<br>
+                    CPU を選択すると、放送中のアスペクト比を自動判定し、比率を維持して出力します。<br>
+                    GPU は24fpsモード時を除き、アスペクト比を自動判定せず<strong>固定で</strong>16:9 に引き伸ばして出力します。<br>
                 </div>
                 <v-select class="settings__item-form" color="primary" variant="outlined" hide-details
                     :density="is_form_dense ? 'compact' : 'default'"
@@ -345,8 +348,7 @@
                 <label class="settings__item-label" for="always_receive_tv_from_mirakurun">
                     利用するバックエンドが EDCB のとき、常に Mirakurun / mirakc から放送波を受信するかを設定します。
                     バックエンドに Mirakurun が選択されているときは効果がありません。<br>
-                </label>
-                <label class="settings__item-label mt-1" for="always_receive_tv_from_mirakurun">
+                    <div class="mt-1"></div>
                     KonomiTV-BS4K から EDCB と Mirakurun / mirakc 両方にアクセスできる必要があります。<br>
                     EDCB はチューナー起動やチャンネル切り替えに時間がかかるため、Mirakurun / mirakc が利用できる環境であれば、この設定を有効にするとより快適に使えます。<br>
                 </label>
@@ -370,6 +372,20 @@
                     :items="preferred_terrestrial_region_options"
                     v-model="server_settings.tv.preferred_terrestrial_region">
                 </v-select>
+            </div>
+            <div class="settings__item" v-if="isSectionVisible('streaming-common') && is_render_device_setting_visible">
+                <div class="settings__item-heading">ハードウェアエンコードで利用する GPU の固定指定</div>
+                <div class="settings__item-label">
+                    通常・BS4K の両方のハードウェアエンコード (QSV・AMF) で利用する DRM render node を指定します。デフォルトは自動選択です。<br>
+                    自動選択では、エンコーダーのベンダーに一致する render node が自動で選択されます。<br>
+                    複数 GPU 環境で特定の GPU だけを使いたい場合は、/dev/dri/renderD128 のようなパスを指定してください。<br>
+                    指定した render node が存在しない場合やベンダーが一致しない場合は、警告を出力した上で自動選択で動作します。<br>
+                </div>
+                <v-combobox class="settings__item-form" color="primary" variant="outlined" hide-details
+                    :density="is_form_dense ? 'compact' : 'default'"
+                    :items="render_device_options"
+                    v-model="encoder_render_device_selection">
+                </v-combobox>
             </div>
             <div class="settings__item" v-if="isSectionVisible('streaming-common')">
                 <div class="settings__item-heading">誰も見ていないチャンネルのエンコードタスクを維持する秒数</div>
@@ -548,6 +564,7 @@ import type { IServerSettings } from '@/services/Settings';
 
 import AccountManageSettings from '@/components/Settings/AccountManageSettings.vue';
 import Message from '@/message';
+import Settings, { type IKonomiTVBS4KRenderDevice } from '@/services/Settings';
 import useServerSettingsStore from '@/stores/ServerSettingsStore';
 import useUserStore from '@/stores/UserStore';
 import Utils from '@/utils';
@@ -723,6 +740,35 @@ const server_settings = computed<IServerSettings>({
         }
     },
 });
+
+// ハードウェアエンコード (QSV・AMF) で利用する DRM render node の固定指定
+// QSV・AMF がどちらのエンコーダーにも選ばれていないときは render node を使わないため非表示にする
+const render_devices = ref<IKonomiTVBS4KRenderDevice[]>([]);
+const is_render_device_setting_visible = computed(() => {
+    const encoders = [server_settings.value.general.encoder, server_settings.value.general.encoder_bs4k];
+    return encoders.includes('QSV') || encoders.includes('AMF');
+});
+// 自動選択は空文字で表現し、保存時は null へ正規化する
+const render_device_options = computed(() => [
+    { title: '自動選択（エンコーダーのベンダーに一致する render node を利用）', value: '' },
+    ...render_devices.value.map(device => ({
+        title: `${device.path} (${device.vendor_name})`,
+        value: device.path,
+    })),
+]);
+const encoder_render_device_selection = computed<string>({
+    get: () => server_settings.value.general.konomitv_bs4k_encoder_render_device ?? '',
+    set: (value) => {
+        const normalized = (value ?? '').trim();
+        server_settings.value.general.konomitv_bs4k_encoder_render_device = normalized === '' ? null : normalized;
+    },
+});
+// 候補はコンテナへ渡された render node から取得する。表示が必要になったタイミングで一度だけ取得する
+watch(is_render_device_setting_visible, async (visible) => {
+    if (visible === true && render_devices.value.length === 0) {
+        render_devices.value = await Settings.fetchKonomiTVBS4KRenderDevices();
+    }
+}, { immediate: true });
 
 // inherit の場合は通常 API の動作モードを利用して、実際に使用する物理リッスンポートを判定する
 const compatibility_api_effective_https_mode = computed<IServerSettings['server']['https_mode']>(() => {

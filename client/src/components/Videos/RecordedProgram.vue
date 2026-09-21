@@ -56,6 +56,8 @@
                     </v-chip>
                 </div>
                 <div class="recorded-program__content-meta">
+                    <v-chip v-if="!forOffline && program.recorded_video.storage_location === 'Cloud'"
+                        size="x-small" color="primary" variant="tonal">クラウド</v-chip>
                     <div class="recorded-program__content-meta-broadcaster" v-if="program.channel">
                         <img class="recorded-program__content-meta-broadcaster-icon" loading="lazy" decoding="async"
                             :src="offlineVideo !== null ? OfflineVideos.getAssetURL(offlineVideo, 'channel-logo') :
@@ -126,6 +128,13 @@
                         </div>
                     </template>
                     <v-list density="compact" bg-color="background-lighten-1" class="recorded-program__menu-list">
+                        <v-list-item v-if="userStore.user?.is_admin" @click="showCloudMove = true"
+                            :disabled="program.recorded_video.status !== 'Recorded'">
+                            <template v-slot:prepend>
+                                <Icon icon="fluent:cloud-arrow-up-20-regular" width="20px" height="20px" />
+                            </template>
+                            <v-list-item-title class="ml-3">{{ program.recorded_video.storage_location === 'Cloud' ? 'ローカルへ移動' : 'クラウドへ移動' }}</v-list-item-title>
+                        </v-list-item>
                         <v-list-item @click="showOfflineDownload = true" :disabled="program.recorded_video.status === 'Recording'">
                             <template v-slot:prepend>
                                 <Icon icon="fluent:cloud-arrow-down-20-regular" width="20px" height="20px" />
@@ -185,6 +194,7 @@
     </component>
     <RecordedFileInfoDialog :program="program" v-model:show="show_video_info" />
     <OfflineVideoDownloadDialog :program="program" v-model:show="showOfflineDownload" />
+    <KonomiTVBS4KCloudMoveDialog v-if="showCloudMove" :program="program" v-model:show="showCloudMove" />
 
     <v-dialog v-model="showOfflineDeleteConfirmation" max-width="620">
         <v-card>
@@ -210,7 +220,10 @@
             <v-card-title class="d-flex justify-center pt-6 font-weight-bold">本当に録画ファイルを削除しますか？</v-card-title>
             <v-card-text class="pt-2 pb-0">
                 <div class="delete-confirmation__file-path mb-4">{{ program.recorded_video.file_path }}</div>
-                <div class="text-error-readable font-weight-bold">
+                <div v-if="program.recorded_video.storage_location === 'Cloud'" class="text-error-readable font-weight-bold">
+                    クラウドストレージ上の録画原本と、この録画に属するクラウド上の関連ファイル・解析結果・変更記録が削除されます。削除マーカーが記録されるため、同じ暗号化領域を共有する別サーバーの一覧からもこの録画が削除されます（ローカルに残っている未転送の補助ファイルは削除されません）。一度削除を実行すると元に戻すことはできず、一部のファイル削除に失敗した場合でも削除マーカーの記録は維持されます。本当にこのクラウド録画を削除しますか？
+                </div>
+                <div v-else class="text-error-readable font-weight-bold">
                     この録画ファイルに関連するすべてのデータ (サムネイル / .ts.program.txt / .ts.err を含む) が削除されます。<br>
                     元に戻すことはできません。本当に録画ファイルを削除しますか？
                 </div>
@@ -233,6 +246,7 @@
 
 import { ref, computed, onBeforeUnmount, watch } from 'vue';
 
+import KonomiTVBS4KCloudMoveDialog from '@/components/Videos/Dialogs/KonomiTVBS4KCloudMoveDialog.vue';
 import OfflineVideoDownloadDialog from '@/components/Videos/Dialogs/OfflineVideoDownloadDialog.vue';
 import RecordedFileInfoDialog from '@/components/Videos/Dialogs/RecordedFileInfoDialog.vue';
 import Message from '@/message';
@@ -271,6 +285,8 @@ const show_video_info = ref(false);
 // 削除確認ダイアログの表示状態
 const show_delete_confirmation = ref(false);
 const showOfflineDownload = ref(false);
+const showCloudMove = ref(false);
+const userStore = useUserStore();
 const showOfflineDeleteConfirmation = ref(false);
 const isDeletingOfflineVideo = ref(false);
 const useFallbackThumbnail = ref(false);

@@ -77,7 +77,7 @@ def test_file_deletion_handler_preserves_deletion_retry_states(
         recorded_program_deleted = True
 
     recorded_program = SimpleNamespace(delete=DeleteRecordedProgram)
-    recorded_video = SimpleNamespace(status=recorded_video_status, recorded_program=recorded_program)
+    recorded_video = SimpleNamespace(id=1, status=recorded_video_status, recorded_program=recorded_program)
 
     async def GetRecordedVideoOrNone(**conditions: str) -> SimpleNamespace:
         assert conditions == {'file_path': str(file_path)}
@@ -115,13 +115,13 @@ def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
     summary.status = summary_status
     recorded_program_deleted = False
 
-    async def IsFileExists(_file_path: anyio.Path) -> bool:
-        return False
+    async def Stat(_file_path: anyio.Path) -> None:
+        raise FileNotFoundError
 
     class FakeRecordedProgramQuery:
         excluded_statuses: list[str] = []
 
-        def exclude(self, *, recorded_video__status__in: list[str]) -> 'FakeRecordedProgramQuery':
+        def exclude(self, *, recorded_video__status__in: list[str]) -> FakeRecordedProgramQuery:
             self.excluded_statuses = recorded_video__status__in
             return self
 
@@ -133,21 +133,22 @@ def test_batch_non_existent_cleanup_preserves_deletion_retry_states(
             return 1
 
     @asynccontextmanager
-    async def InTransaction() -> AsyncGenerator[None, None]:
+    async def InTransaction() -> AsyncGenerator[None]:
         yield
 
-    monkeypatch.setattr(scan_task, 'isFileExists', IsFileExists)
+    monkeypatch.setattr(anyio.Path, 'stat', Stat)
     monkeypatch.setattr(
         'app.metadata.RecordedScanTask.RecordedProgram.filter',
         lambda **conditions: FakeRecordedProgramQuery()
-        if conditions == {'id': summary.recorded_program_id}
+        if conditions == {'id': summary.recorded_program_id, 'recorded_video__file_path': summary.file_path}
         else pytest.fail(),
     )
     monkeypatch.setattr('app.metadata.RecordedScanTask.transactions.in_transaction', InTransaction)
 
     asyncio.run(
         scan_task._RecordedScanTask__cleanupNonExistentRecordedVideoRecords(  # pyright: ignore[reportPrivateUsage]
-            {file_path: summary}
+            {file_path: summary},
+            {pathlib.Path('/recorded')},
         )
     )
 
@@ -424,7 +425,7 @@ def test_thumbnail_history_uses_persisted_recorded_video_id(monkeypatch: pytest.
         cls: type[AnalysisTaskTracker],
         task_type: str,
         **kwargs: Any,
-    ) -> AsyncGenerator[FakeHistory, None]:
+    ) -> AsyncGenerator[FakeHistory]:
         del cls
         captured['task_type'] = task_type
         captured.update(kwargs)
@@ -643,7 +644,7 @@ def test_recorded_folder_watcher_routes_all_konomitv_bs4k_yaml_events(
     chapter_path = tmp_path / 'program.ts.konomitv-bs4k-chapters.yaml'
     handled_paths: list[pathlib.Path] = []
 
-    async def Watch(*args: Any, **kwargs: Any) -> AsyncGenerator[set[tuple[Change, str]], None]:
+    async def Watch(*args: Any, **kwargs: Any) -> AsyncGenerator[set[tuple[Change, str]]]:
         del args, kwargs
         yield {(change_type, str(chapter_path))}
         scan_task._is_running = False  # type: ignore[attr-defined]

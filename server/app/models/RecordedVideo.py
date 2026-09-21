@@ -99,6 +99,17 @@ class RecordedVideo(TortoiseModel):
     updated_at = fields.DatetimeField(auto_now=True)
 
     @property
+    def storage_location(self) -> Literal['Local', 'Cloud']:
+        """所在レコードと同じtransactionで切り替えた読取りパスから、公開用の所在を返す。
+
+        Args:
+            None
+        Returns:
+            通常の所在。処理中の状態は移動ジョブが別途保持する。
+        """
+        return 'Cloud' if self.file_path.startswith('/cloud-mounts/') else 'Local'
+
+    @property
     def playback_index_state(self) -> RecordedPlaybackIndexState:
         """現行Versionとの差異を含むクライアント向け索引状態を返す。"""
 

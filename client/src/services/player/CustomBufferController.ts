@@ -49,6 +49,16 @@ class CustomBufferController extends BufferController {
         this.pendingSeekPosition = null;
         this.seekDebounceTimerId = null;
         this.seekRestartTimeoutId = null;
+
+        // 副音声プレイリストの初回読み込みでは、hls.js が音声の取得開始位置を映像の再生開始時点へ戻す
+        // プレイリストの解析後、セグメント取得が始まる前に現在位置へ合わせ、保持中の TS から副音声を取得する
+        hls.on(Hls.Events.AUDIO_TRACK_UPDATED, () => {
+            const media = hls.media;
+            // 再生開始前は設定済みの startPosition を使い、再生中の切り替えでは現在位置を使う
+            if (media !== null && media.readyState > 0) {
+                hls.startLoad(media.currentTime);
+            }
+        });
     }
 
     /**

@@ -6,8 +6,11 @@ import concurrent.futures
 import math
 import pathlib
 import random
+import re
 import subprocess
 import time
+import uuid
+from datetime import datetime
 from typing import Any, ClassVar, Literal, cast
 
 import anyio
@@ -20,10 +23,375 @@ from tortoise import Tortoise
 
 from app import logging, schemas
 from app.config import Config, LoadConfig
-from app.constants import DATABASE_CONFIG, LIBRARY_PATH, STATIC_DIR, THUMBNAILS_DIR
+from app.constants import DATABASE_CONFIG, JST, LIBRARY_PATH, STATIC_DIR, THUMBNAILS_DIR
 from app.models.RecordedVideo import RecordedVideo
 from app.utils import ShutdownProcessPoolExecutor
 from app.utils.KonomiTVBS4KMMTTLV import MMT_TLV_CONTAINER_FORMAT
+from app.utils.KonomiTVBS4KTLVServiceResolver import KonomiTVBS4KTLVServiceResolver
+
+
+# HDR (HLG/PQ) 録画の検出と BT.2446-1 Method C 変換の単一定義
+## 検出は映像ストリームメタデータ駆動とし、チャンネル属性では判定しない
+_AV_COLOR_PRIMARIES_BT2020 = 9  # AVColorPrimaries の bt2020
+# PyAV が返す color_transfer のうち、規格上 HDR を示す VUI 値だけを変換対象にする。
+## 14 (BT.2020 10-bit) は WCG SDR であり、HLG として扱わない
+_AV_HDR_COLOR_TRANSFERS: dict[int, str] = {
+    16: 'smpte2084',
+    18: 'arib-std-b67',
+}
+# ARIB STD-B60 Table 7-51 の video_transfer_characteristics と HDR transfer の対応。
+## 1=BT.709、2=IEC 61966-2-4、3=BT.2020 はいずれも SDR
+_B60_HDR_VIDEO_TRANSFERS: dict[int, str] = {
+    4: 'smpte2084',
+    5: 'arib-std-b67',
+}
+_B60_SDR_VIDEO_TRANSFERS = frozenset({1, 2, 3})
+
+# card-32 の再生 canvas と同じ BT.2446-1 Method C 式(5)～(10)・表示適応の係数。
+_METHOD_C_K1 = np.float32(0.83802)
+_METHOD_C_K2 = np.float32(15.09968)
+_METHOD_C_K3 = np.float32(0.74204)
+_METHOD_C_K4 = np.float32(78.99439)
+_METHOD_C_INFLECTION = np.float32(58.5) / _METHOD_C_K1
+_METHOD_C_REFERENCE_WHITE = np.float32(90.7)
+_METHOD_C_PEAK = np.float32(118.4)
+_METHOD_C_CROSSTALK = np.float32(0.075)
+_METHOD_C_CHUNK_HEIGHT = 270
+
+_METHOD_C_BT2020_TO_XYZ = np.array([
+    [0.6370, 0.1446, 0.1689],
+    [0.2627, 0.6780, 0.0593],
+    [0.0000, 0.0281, 1.0610],
+], dtype=np.float32)
+_METHOD_C_XYZ_TO_BT2020 = np.array([
+    [1.7167, -0.3557, -0.2534],
+    [-0.6667, 1.6165, 0.0158],
+    [0.0176, -0.0428, 0.9421],
+], dtype=np.float32)
+_METHOD_C_BT2020_TO_BT709 = np.array([
+    [1.660491, -0.587641, -0.072850],
+    [-0.124550, 1.132900, -0.008350],
+    [-0.018151, -0.100579, 1.118730],
+], dtype=np.float32)
+_BT709_LUMA_WEIGHTS = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+_METHOD_C_LUTS: dict[str, NDArray[np.uint8]] = {}
+
+
+class HDRTonemapConversionError(RuntimeError):
+    """HDR 判定後のトーンマップ変換失敗。フレーム単位の復旧扱いにせず抽出・生成失敗へ伝播させる"""
+
+
+def _DetectHDRInputTransfer(color_primaries: int, color_transfer: int) -> str | None:
+    """
+    VUI が HDR (HLG/PQ) を示す場合に Method C 入力用の transfer 名を返す。
+
+    Args:
+        color_primaries (int): 映像ストリームの color_primaries (AVColorPrimaries)。
+        color_transfer (int): 映像ストリームの color_transfer (AVColorTransferCharacteristic)。
+
+    Returns:
+        str | None: 'arib-std-b67' または 'smpte2084'。SDR・不明の場合は None。
+    """
+
+    # BT.2020 primaries と、HDR を直接表す PQ / HLG transfer の組み合わせだけを HDR とみなす。
+    ## transfer=14 は ARIB STD-B32 でも BT.2020 SDR と規定されているため対象外
+    if color_primaries != _AV_COLOR_PRIMARIES_BT2020:
+        return None
+    return _AV_HDR_COLOR_TRANSFERS.get(color_transfer)
+
+
+def _DetectHDRInputTransferFromB60(
+    video_transfer_characteristics: int | None,
+    hdr_wcg_idc: int | None,
+) -> tuple[bool, str | None]:
+    """
+    B60 descriptor だけで HDR transfer または SDR を確定できるかを返す。
+
+    Args:
+        video_transfer_characteristics (int | None): B60 Table 7-51 の transfer 値。
+        hdr_wcg_idc (int | None): B60 Table 7-39-1 の HDR/WCG 分類。
+
+    Returns:
+        tuple[bool, str | None]: (descriptor だけで確定したか, HDR transfer)。
+            SDR と確定した場合は (True, None)、取得不能または曲線を特定できない場合は (False, None)。
+    """
+
+    # transfer descriptor は変換曲線を直接表すため、HDR_WCG_idc より具体的な第一根拠として扱う。
+    if video_transfer_characteristics in _B60_HDR_VIDEO_TRANSFERS:
+        return (True, _B60_HDR_VIDEO_TRANSFERS[video_transfer_characteristics])
+    if video_transfer_characteristics in _B60_SDR_VIDEO_TRANSFERS:
+        return (True, None)
+
+    # HDR_WCG_idc=0/1 は SDR、2 は HDR だが HLG/PQ の曲線までは識別できない。
+    ## 2 の場合だけ VUI による曲線識別へフォールバックする
+    if hdr_wcg_idc in (0, 1):
+        return (True, None)
+    return (False, None)
+
+
+def _ApplyHDRSDRMethodCDirect(
+    bgr_image: NDArray[np.uint8],
+    input_transfer: str,
+) -> NDArray[np.uint8]:
+    """
+    HLG/PQ の信号値を BT.2446-1 Method C で sRGB の SDR BGR へ変換する。
+
+    Args:
+        bgr_image (NDArray[np.uint8]): HLG/PQ 信号値を保持した BGR 8-bit 配列。
+        input_transfer (str): 'arib-std-b67' または 'smpte2084'。
+
+    Returns:
+        NDArray[np.uint8]: card-32 の再生 canvas と同じ変換を適用した BGR 8-bit 配列。
+
+    Raises:
+        ValueError: 入力配列または transfer が対象外の場合。
+    """
+
+    if bgr_image.dtype != np.uint8 or bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+        raise ValueError('Method C input must be an uint8 BGR image.')
+    if input_transfer not in ('arib-std-b67', 'smpte2084'):
+        raise ValueError(f'Unsupported HDR transfer: {input_transfer}')
+
+    # 4K 全体を一度に float32 化すると中間配列だけで GiB 級になり、並列スキャンでメモリ帯域を圧迫する。
+    ## 画素ごとに独立した変換なので、スコアリング画像と同じ270行ずつ処理して出力だけを全解像度で保持する
+    if bgr_image.shape[0] > _METHOD_C_CHUNK_HEIGHT:
+        converted_image = np.empty_like(bgr_image)
+        for y in range(0, bgr_image.shape[0], _METHOD_C_CHUNK_HEIGHT):
+            converted_image[y:y + _METHOD_C_CHUNK_HEIGHT] = _ApplyHDRSDRMethodCDirect(
+                bgr_image[y:y + _METHOD_C_CHUNK_HEIGHT],
+                input_transfer,
+            )
+        return converted_image
+
+    # PyAV / FFmpeg が YUV から作った信号値の BGR を、canvas shader と同じ RGB 順・0～1へ揃える。
+    rgb = bgr_image[..., ::-1].astype(np.float32) / np.float32(255.0)
+    if input_transfer == 'smpte2084':
+        # BT.2100 PQ inverse EOTF。戻り値は絶対輝度 cd/m²。
+        m1 = np.float32(2610.0 / 16384.0)
+        m2 = np.float32(2523.0 / 32.0)
+        c1 = np.float32(3424.0 / 4096.0)
+        c2 = np.float32(2413.0 / 128.0)
+        c3 = np.float32(2392.0 / 128.0)
+        raised = np.power(rgb, np.float32(1.0) / m2)
+        numerator = np.maximum(raised - c1, np.float32(0.0))
+        denominator = np.maximum(c2 - c3 * raised, np.float32(1e-6))
+        display = np.float32(10000.0) * np.power(numerator / denominator, np.float32(1.0) / m1)
+    else:
+        # BT.2100 HLG inverse OETF と 1000 cd/m² display OOTF (system gamma 1.2)。
+        a = np.float32(0.17883277)
+        b = np.float32(0.28466892)
+        c = np.float32(0.55991073)
+        scene = np.where(
+            rgb <= np.float32(0.5),
+            rgb * rgb / np.float32(3.0),
+            (np.exp((rgb - c) / a) + b) / np.float32(12.0),
+        )
+        scene_luma = np.sum(scene * np.array([0.2627, 0.6780, 0.0593], dtype=np.float32), axis=2)
+        display = scene * (
+            np.float32(1000.0) * np.power(np.maximum(scene_luma, np.float32(0.0)), np.float32(0.2))
+        )[..., np.newaxis]
+
+    # BT.2446-1 §6.1.2 式(2)。card-32 と同じ crosstalk α=0.075 を適用する。
+    display_sum = np.sum(display, axis=2, keepdims=True)
+    display = (
+        (np.float32(1.0) - np.float32(3.0) * _METHOD_C_CROSSTALK) * display +
+        _METHOD_C_CROSSTALK * display_sum
+    )
+
+    # §6.1.3～§6.1.5。BT.2020 RGB→XYZ 後、式(5)～(10)で Y だけを置換して xy を維持する。
+    xyz = display @ _METHOD_C_BT2020_TO_XYZ.T
+    hdr_luminance = xyz[..., 1]
+    positive_luminance = hdr_luminance > np.float32(0.0)
+    method_c_luminance = np.zeros_like(hdr_luminance)
+    linear_region = positive_luminance & (hdr_luminance < _METHOD_C_INFLECTION)
+    method_c_luminance[linear_region] = _METHOD_C_K1 * hdr_luminance[linear_region]
+    logarithmic_region = positive_luminance & ~linear_region
+    method_c_luminance[logarithmic_region] = (
+        _METHOD_C_K2 * np.log(
+            hdr_luminance[logarithmic_region] / _METHOD_C_INFLECTION - _METHOD_C_K3
+        ) +
+        _METHOD_C_K4
+    )
+
+    # Method C の 96% SDR reference white 以下は維持し、109% headroom を sRGB canvas の100%へ滑らかに収める。
+    adapted_luminance = np.clip(
+        method_c_luminance,
+        np.float32(0.0),
+        _METHOD_C_REFERENCE_WHITE,
+    )
+    headroom = method_c_luminance > _METHOD_C_REFERENCE_WHITE
+    headroom_ratio = np.clip(
+        (method_c_luminance[headroom] - _METHOD_C_REFERENCE_WHITE) /
+        (_METHOD_C_PEAK - _METHOD_C_REFERENCE_WHITE),
+        np.float32(0.0),
+        np.float32(1.0),
+    )
+    adapted_luminance[headroom] = (
+        _METHOD_C_REFERENCE_WHITE +
+        (np.float32(100.0) - _METHOD_C_REFERENCE_WHITE) *
+        (np.float32(2.0) * headroom_ratio - headroom_ratio * headroom_ratio)
+    )
+    xyz_scale = np.zeros_like(hdr_luminance)
+    np.divide(adapted_luminance, hdr_luminance, out=xyz_scale, where=positive_luminance)
+    xyz *= xyz_scale[..., np.newaxis]
+
+    # §6.1.6 で crosstalk を戻し、BT.2407 §2 式(1)で BT.2020 から BT.709 へ変換する。
+    sdr_bt2020 = xyz @ _METHOD_C_XYZ_TO_BT2020.T
+    sdr_sum = np.sum(sdr_bt2020, axis=2, keepdims=True)
+    sdr_bt2020 = (
+        (
+            (np.float32(1.0) - _METHOD_C_CROSSTALK) * sdr_bt2020 -
+            _METHOD_C_CROSSTALK * (sdr_sum - sdr_bt2020)
+        ) /
+        (np.float32(1.0) - np.float32(3.0) * _METHOD_C_CROSSTALK)
+    ) / np.float32(100.0)
+    sdr_bt709 = sdr_bt2020 @ _METHOD_C_BT2020_TO_BT709.T
+
+    # BT.2407 は単一の最良方式を定めないため、canvas と同じ輝度保持の soft gamut mapping を使う。
+    luma = np.clip(np.sum(sdr_bt709 * _BT709_LUMA_WEIGHTS, axis=2), np.float32(0.0), np.float32(1.0))
+    delta = sdr_bt709 - luma[..., np.newaxis]
+    boundary_scale = np.full_like(sdr_bt709, np.float32(np.inf))
+    positive_delta = delta > np.float32(0.0)
+    negative_delta = delta < np.float32(0.0)
+    np.divide(
+        np.float32(1.0) - luma[..., np.newaxis],
+        delta,
+        out=boundary_scale,
+        where=positive_delta,
+    )
+    np.divide(
+        -luma[..., np.newaxis],
+        delta,
+        out=boundary_scale,
+        where=negative_delta,
+    )
+    normalized_chroma = np.zeros_like(luma)
+    minimum_boundary_scale = np.min(boundary_scale, axis=2)
+    # 完全な白では境界が 0 になるが、後段で白へ固定するため逆数を計算する必要はない。
+    valid_boundary = np.isfinite(minimum_boundary_scale) & (minimum_boundary_scale > np.float32(0.0))
+    np.divide(
+        np.float32(1.0),
+        minimum_boundary_scale,
+        out=normalized_chroma,
+        where=valid_boundary,
+    )
+    chroma_scale = np.ones_like(luma)
+    gamut_compression = normalized_chroma > np.float32(0.5)
+    gamut_distance = (
+        (normalized_chroma[gamut_compression] - np.float32(0.5)) / np.float32(0.5)
+    )
+    mapped_chroma = np.float32(0.5) + np.float32(0.5) * (
+        np.float32(1.0) - np.exp(-gamut_distance)
+    )
+    chroma_scale[gamut_compression] = mapped_chroma / normalized_chroma[gamut_compression]
+    sdr_bt709 = np.clip(
+        luma[..., np.newaxis] + delta * chroma_scale[..., np.newaxis],
+        np.float32(0.0),
+        np.float32(1.0),
+    )
+    sdr_bt709[luma <= np.float32(0.0)] = np.float32(0.0)
+    sdr_bt709[luma >= np.float32(1.0)] = np.float32(1.0)
+
+    # 既定 sRGB framebuffer と同じ OETF で符号化し、OpenCV が使う BGR 順へ戻す。
+    encoded = np.where(
+        sdr_bt709 <= np.float32(0.0031308),
+        np.float32(12.92) * sdr_bt709,
+        np.float32(1.055) * np.power(sdr_bt709, np.float32(1.0 / 2.4)) - np.float32(0.055),
+    )
+    return np.rint(np.clip(encoded, 0.0, 1.0) * np.float32(255.0)).astype(np.uint8)[..., ::-1].copy()
+
+
+def _ApplyHDRSDRMethodC(
+    bgr_image: NDArray[np.uint8],
+    input_transfer: str,
+) -> NDArray[np.uint8]:
+    """
+    8-bit BGR の全入力組合せを持つ LUT で BT.2446-1 Method C を適用する。
+
+    Args:
+        bgr_image (NDArray[np.uint8]): HLG/PQ 信号値を保持した BGR 8-bit 配列。
+        input_transfer (str): 'arib-std-b67' または 'smpte2084'。
+
+    Returns:
+        NDArray[np.uint8]: card-32 の再生 canvas と同じ変換を適用した BGR 8-bit 配列。
+
+    Raises:
+        ValueError: 入力配列または transfer が対象外の場合。
+    """
+
+    if bgr_image.dtype != np.uint8 or bgr_image.ndim != 3 or bgr_image.shape[2] != 3:
+        raise ValueError('Method C input must be an uint8 BGR image.')
+    if input_transfer not in ('arib-std-b67', 'smpte2084'):
+        raise ValueError(f'Unsupported HDR transfer: {input_transfer}')
+
+    # TLV の FFmpeg 経路は巨大な full-resolution rawvideo 転送を避けるため、縮小済みの1枚だけを直接変換する。
+    ## PyAV 経路の4Kフレーム群は、初回生成コストを回収できる完全 LUT を共有する
+    if bgr_image.shape[0] <= _METHOD_C_CHUNK_HEIGHT:
+        return _ApplyHDRSDRMethodCDirect(bgr_image, input_transfer)
+
+    lut = _METHOD_C_LUTS.get(input_transfer)
+    if lut is None:
+        # BGR24 は 256³ 通りに閉じているため、近似せず全組合せの変換結果を録画プロセス内で共有する。
+        ## 約48 MiB の LUT 構築は初回だけで、以後の数百候補は配列参照だけになる
+        lut = np.empty((256, 256, 256, 3), dtype=np.uint8)
+        green_codes, red_codes = np.indices((256, 256), dtype=np.uint8)
+        input_slice = np.empty((256, 256, 3), dtype=np.uint8)
+        input_slice[..., 1] = green_codes
+        input_slice[..., 2] = red_codes
+        for blue_code in range(256):
+            input_slice[..., 0] = blue_code
+            lut[blue_code] = _ApplyHDRSDRMethodCDirect(input_slice, input_transfer)
+        _METHOD_C_LUTS[input_transfer] = lut
+
+    return lut[bgr_image[..., 0], bgr_image[..., 1], bgr_image[..., 2]]
+
+
+class _HDRSDRTonemapConverter:
+    """
+    デコード済み HDR (HLG/PQ) BGR 配列を BT.2446-1 Method C で SDR へ変換する。
+
+    3つの抽出経路が同じ NumPy 実装を通り、card-32 の再生 canvas と係数・表示適応を共有する。
+    変換に失敗した場合は例外を送出し、HDR 録画で未変換フレームが公開されないよう生成全体を失敗させる
+    (SDR 画像へのフォールバックは行わない。従来の無変換経路は SDR 録画だけに限定する)。
+    """
+
+    def __init__(self, file_label: str, input_transfer: str) -> None:
+        """
+        Args:
+            file_label (str): ログ識別用のファイルパス文字列。
+            input_transfer (str): 入力 BGR 信号値の transfer 名 ('arib-std-b67' または 'smpte2084')。
+        """
+
+        # 変換失敗時のログへ付ける識別子。
+        self._file_label = file_label
+        # 検出済みの HLG (arib-std-b67) / PQ (smpte2084) だけが来る前提。
+        self._input_transfer = input_transfer
+
+    def convert(self, bgr_image: NDArray[np.uint8]) -> NDArray[np.uint8]:
+        """
+        デコード済み BGR 配列を SDR の BGR 配列へ変換する。
+
+        Args:
+            bgr_image (NDArray[np.uint8]): HLG/PQ 信号値を保持した BGR 配列。
+
+        Returns:
+            NDArray[np.uint8]: SDR BGR 配列 (height, width, 3)。
+
+        Raises:
+            HDRTonemapConversionError: Method C 変換に失敗した場合。
+                HDR 録画では未変換フレームを公開しないため、呼び出し側へ伝播して生成を失敗させる。
+        """
+
+        try:
+            return _ApplyHDRSDRMethodC(bgr_image, self._input_transfer)
+        except Exception as ex:
+            # 変換失敗は SDR 経路へフォールバックせず、HDR 録画で未変換フレームが
+            ## 代表・タイルとして公開されないよう例外を伝播して生成全体を失敗させる
+            logging.error(
+                f'{self._file_label}: HDR to SDR tonemap conversion failed.',
+                exc_info=ex,
+            )
+            raise HDRTonemapConversionError(f'HDR to SDR tonemap conversion failed: {ex}') from ex
 
 
 class ThumbnailGenerator:
@@ -55,12 +423,16 @@ class ThumbnailGenerator:
     # サムネイル情報のバージョン
     THUMBNAIL_INFO_VERSION: ClassVar[int] = 1
 
+    # 生成途中のファイルを起動時の孤児サムネイル削除から保護する。
+    # 正常終了・失敗・キャンセル時は generateAndSave() が必ず集合と実ファイルを回収する。
+    _active_temporary_output_paths: ClassVar[set[pathlib.Path]] = set()
+
     # サムネイルタイル移行時のバックアップ設定 (デバッグ用)
     MIGRATION_BACKUP_ENABLED: ClassVar[bool] = False
     MIGRATION_BACKUP_DIR_NAME: ClassVar[str] = 'old'
 
     # 顔検出用カスケード分類器のパス
-    HUMAN_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = pathlib.Path(cv2.__file__).parent / 'data' / 'haarcascade_frontalface_default.xml'
+    HUMAN_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = STATIC_DIR / 'haarcascade_frontalface_default.xml'
     ANIME_FACE_CASCADE_PATH: ClassVar[pathlib.Path] = STATIC_DIR / 'lbpcascade_animeface.xml'
 
     # 顔検出の設定
@@ -155,6 +527,9 @@ class ThumbnailGenerator:
         face_detection_mode: Literal['Human', 'Anime'] | None = None,
         has_video_stream_changes: bool = False,
         service_id: int | None = None,
+        recorded_video_id: int | None = None,
+        file_size: int | None = None,
+        file_modified_at: datetime | None = None,
     ) -> None:
         """
         プレイヤーのシークバー用タイル画像と、候補区間内で最も良い1枚の代表サムネイルを生成するクラスを初期化する
@@ -168,15 +543,25 @@ class ThumbnailGenerator:
             face_detection_mode (Literal['Human', 'Anime'] | None): 顔検出モード (デフォルト: None)
             has_video_stream_changes (bool): TS 内で映像 PID や映像ストリーム構成が変化しているかどうか
             service_id (int | None): 録画対象サービス ID (tsreadex のサービス選択に使用)
+            recorded_video_id (int | None): 生成開始世代の RecordedVideo ID
+            file_size (int | None): 生成開始世代のファイルサイズ
+            file_modified_at (datetime | None): 生成開始世代の最終更新日時
         """
 
+        # デコード元と出力名を決めるファイル情報。generateAndSave() の生成・公開処理から参照する。
         self.file_path = file_path
+        self.file_hash = file_hash
         self.container_format = container_format
         self.duration_sec = duration_sec
         self.candidate_intervals = candidate_time_ranges
         self.face_detection_mode = face_detection_mode
         self.has_video_stream_changes = has_video_stream_changes
         self.service_id = service_id
+
+        # DB 保存済み世代の識別情報。生成完了後に同じ録画内容へだけ結果を公開するために参照する。
+        self.recorded_video_id = recorded_video_id
+        self.file_size = file_size
+        self.file_modified_at = file_modified_at
 
         # 動画の長さに応じて適切なタイル化間隔を計算
         self.base_tile_interval_sec = self.__calculateBaseTileInterval(duration_sec)
@@ -305,6 +690,9 @@ class ThumbnailGenerator:
             face_detection_mode = face_detection_mode,
             has_video_stream_changes = recorded_program.recorded_video.has_video_stream_changes,
             service_id = recorded_program.channel.service_id if recorded_program.channel is not None else None,
+            recorded_video_id = recorded_program.recorded_video.id if recorded_program.recorded_video.id > 0 else None,
+            file_size = recorded_program.recorded_video.file_size,
+            file_modified_at = recorded_program.recorded_video.file_modified_at,
         )
 
 
@@ -336,19 +724,53 @@ class ThumbnailGenerator:
         )
 
 
-    async def generateAndSave(self) -> None:
+    @classmethod
+    def isTemporaryOutputActive(cls, output_path: pathlib.Path) -> bool:
+        """指定されたサムネイル一時出力が現在の生成処理に所有されているかを返す。
+
+        Args:
+            output_path: 孤児サムネイル削除が確認するファイルパス。
+
+        Returns:
+            現在実行中の generateAndSave() が所有している場合は True。
+        """
+
+        return output_path in cls._active_temporary_output_paths
+
+
+    async def generateAndSave(self) -> Literal['Succeeded', 'Failed', 'Stale']:
         """
         プレイヤーのシークバー用サムネイルタイル画像を生成し、
         さらに候補区間内のフレームから最も良い1枚を選び、代表サムネイルとして出力する
 
         処理フロー:
         1. サブプロセス内で PyAV でフレーム抽出 + スコアリング
-        2. サブプロセス内で代表サムネイルを保存
-        3. サブプロセス内でタイル画像を生成・保存
+        2. サブプロセス内で代表サムネイルとタイル画像を一時ファイルへ保存
+        3. 生成開始世代が現行 DB・実ファイルと一致する場合だけ生成物と DB 情報を公開
+
+        Returns:
+            Literal['Succeeded', 'Failed', 'Stale']: 生成・公開結果
         """
 
         start_time = time.time()
         logging.info(f'{self.file_path}: Generating thumbnail... / Face detection mode: {self.face_detection_mode}')
+
+        # 最終出力と同じディレクトリへ生成し、検証後の os.replace を同一ファイルシステム内で完結させる。
+        generation_token = uuid.uuid4().hex
+        temporary_representative_path = anyio.Path(str(
+            THUMBNAILS_DIR / f'.tmp-thumbnail-{self.file_hash}-{generation_token}.webp'
+        ))
+        temporary_tile_path = anyio.Path(str(
+            THUMBNAILS_DIR / f'.tmp-thumbnail-{self.file_hash}-{generation_token}_tile.webp'
+        ))
+        temporary_output_paths = (
+            pathlib.Path(str(temporary_representative_path)),
+            pathlib.Path(str(temporary_tile_path)),
+        )
+        published_output_paths: list[anyio.Path] = []
+        should_keep_published_outputs = False
+        require_generation_match = self.__getGenerationFilter() is not None
+        self._active_temporary_output_paths.update(temporary_output_paths)
 
         try:
             # 万が一出力先ディレクトリが無い場合は作成 (通常存在するはず)
@@ -372,6 +794,8 @@ class ThumbnailGenerator:
                     self._generateAndSaveThumbnails,
                     candidate_offsets,
                     self.tile_rows,
+                    temporary_output_paths[0],
+                    temporary_output_paths[1],
                 )
             except asyncio.CancelledError:
                 should_wait_executor = False
@@ -383,19 +807,58 @@ class ThumbnailGenerator:
 
             if not success:
                 logging.error(f'{self.file_path}: Failed to generate thumbnails in subprocess.')
-                return
+                return 'Failed'
 
-            # 3. サムネイル情報を DB に保存
-            await self.__saveThumbnailInfoToDB()
+            # 長時間の生成中に同じ path の録画が追記・置換された場合、旧世代の生成物を公開しない。
+            if require_generation_match is True and await self.__isGenerationCurrent() is False:
+                logging.info(f'{self.file_path}: Discarding stale thumbnail generation result before publishing.')
+                return 'Stale'
+
+            # 各出力は同じディレクトリの一時ファイルから atomic replace し、途中書き込みを配信しない。
+            await temporary_representative_path.replace(self.representative_thumbnail_path)
+            published_output_paths.append(self.representative_thumbnail_path)
+            await temporary_tile_path.replace(self.seekbar_thumbnails_tile_path)
+            published_output_paths.append(self.seekbar_thumbnails_tile_path)
+
+            # replace 中のファイル変更と DB 世代変更も再確認し、条件付き UPDATE で後勝ちの解析結果を保護する。
+            if require_generation_match is True and await self.__isGenerationCurrent() is False:
+                logging.info(f'{self.file_path}: Discarding stale thumbnail generation result after publishing.')
+                return 'Stale'
+            if (
+                require_generation_match is True and
+                await self.__saveThumbnailInfoToDB(require_generation_match=True) is False
+            ):
+                logging.info(f'{self.file_path}: Thumbnail metadata update skipped because the generation became stale.')
+                return 'Stale'
+            should_keep_published_outputs = True
+
+            # DB 未登録ファイルを扱うデバッグ CLI は従来どおり生成物を残し、DB 行があれば情報も更新する。
+            if require_generation_match is False:
+                await self.__saveThumbnailInfoToDB()
 
             logging.info(f'{self.file_path}: Thumbnail generation completed. (Total: {time.time() - start_time:.2f} sec)')
             logging.debug(f'Thumbnail tile -> {self.seekbar_thumbnails_tile_path.name}')
             logging.debug(f'Representative -> {self.representative_thumbnail_path.name}')
+            return 'Succeeded'
 
         except Exception as ex:
             # 予期せぬエラーのみここでキャッチ
             logging.error(f'{self.file_path}: Unexpected error in thumbnail generation:', exc_info=ex)
-            return
+            return 'Failed'
+        finally:
+            # 失敗・世代不一致・キャンセルでは、公開途中の生成物も含めて旧世代の出力を残さない。
+            if should_keep_published_outputs is False:
+                for published_output_path in published_output_paths:
+                    try:
+                        await published_output_path.unlink()
+                    except FileNotFoundError:
+                        pass
+            for temporary_output_path in (temporary_representative_path, temporary_tile_path):
+                try:
+                    await temporary_output_path.unlink()
+                except FileNotFoundError:
+                    pass
+            self._active_temporary_output_paths.difference_update(temporary_output_paths)
 
 
     def __calculateBaseTileInterval(self, duration_sec: float) -> float:
@@ -529,6 +992,8 @@ class ThumbnailGenerator:
         self,
         candidate_offsets: list[float],
         tile_rows: int,
+        representative_output_path: pathlib.Path,
+        tile_output_path: pathlib.Path,
     ) -> bool:
         """
         サブプロセス内でフレーム抽出・スコアリング・タイル生成・代表サムネイル保存まで行う
@@ -539,6 +1004,8 @@ class ThumbnailGenerator:
         Args:
             candidate_offsets (list[float]): 抽出するフレームのタイムスタンプ (秒) のリスト
             tile_rows (int): タイルの行数
+            representative_output_path (pathlib.Path): 代表サムネイルの一時出力先
+            tile_output_path (pathlib.Path): タイル画像の一時出力先
 
         Returns:
             bool: 成功時は True、失敗時は False
@@ -578,7 +1045,7 @@ class ThumbnailGenerator:
             logging.warning(f'{self.file_path}: No frames found in candidate intervals. Selecting a random frame.')
             best_frame = random.choice(all_frames)
 
-        if not self.__saveRepresentativeThumbnail(best_frame):
+        if not self.__saveRepresentativeThumbnail(best_frame, representative_output_path):
             logging.error(f'{self.file_path}: Failed to save representative thumbnail.')
             return False
 
@@ -586,12 +1053,57 @@ class ThumbnailGenerator:
 
         # 3. タイル画像を生成・保存
         start_time_tile = time.time()
-        if not self.__generateAndSaveTileImage(all_frames, tile_rows):
+        if not self.__generateAndSaveTileImage(all_frames, tile_rows, tile_output_path):
             logging.error(f'{self.file_path}: Failed to generate and save tile image.')
             return False
 
         logging.info(f'{self.file_path}: Tile image generation completed. ({time.time() - start_time_tile:.2f} sec)')
         return True
+
+
+    def __convertFrameToScoringBGR(
+        self,
+        frame: av.VideoFrame,
+        hdr_converter: _HDRSDRTonemapConverter | None,
+    ) -> NDArray[np.uint8]:
+        """
+        デコード済みフレームをスコアリング解像度の BGR 配列へ変換する単一の投入点
+        HDR 録画では BT.2446-1 Method C で SDR 化してから縮小し、
+        SDR 録画では従来どおり rgb24 直変換を使う
+        HDR 変換が失敗した場合は例外が伝播し、生成全体が失敗する (未変換フレームは公開しない)
+        代表サムネイル・タイル・スコアリング・顔検出・レターボックス判定のすべてが
+        この戻り値を使うため、変換の有無はここで確定すればよい
+
+        Args:
+            frame (av.VideoFrame): PyAV がデコードしたフレーム
+            hdr_converter (_HDRSDRTonemapConverter | None): HDR 録画の場合の変換プロセス
+
+        Returns:
+            NDArray[np.uint8]: スコアリング解像度 (SCORING_SCALE) の BGR 配列
+        """
+
+        scoring_width, scoring_height = self.SCORING_SCALE
+        if hdr_converter is not None:
+            # 再生 canvas と同じく全解像度で Method C を適用してから表示解像度へ縮小する。
+            ## 変換失敗時は例外を伝播し、未変換画像を公開しない
+            try:
+                img_rgb = frame.to_ndarray(format='rgb24')
+                full_bgr = cast(NDArray[np.uint8], cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+                converted_bgr = hdr_converter.convert(full_bgr)
+                return cast(
+                    NDArray[np.uint8],
+                    cv2.resize(converted_bgr, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA),
+                )
+            except HDRTonemapConversionError:
+                raise
+            except Exception as ex:
+                logging.error(f'{self.file_path}: HDR frame conversion failed.', exc_info=ex)
+                raise HDRTonemapConversionError(f'HDR frame conversion failed: {ex}') from ex
+
+        # SDR 録画の生成結果を変えないよう、従来どおり RGB のまま縮小してから BGR へ変換する
+        img_rgb = frame.to_ndarray(format='rgb24')
+        img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
+        return cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
 
 
     def __extractAndScoreFrames(
@@ -618,6 +1130,10 @@ class ThumbnailGenerator:
             scoring_width, scoring_height = self.SCORING_SCALE
             bgr_frames: list[NDArray[np.uint8]] = []
             consecutive_failed_frames = 0
+            # HDR (HLG/PQ) 判定は最初にデコードできたフレームのメタデータで行う
+            ## codec_context はコンテナ次第で色情報が未設定のことがあるため、フレーム側の値で確定させる
+            hdr_converter: _HDRSDRTonemapConverter | None = None
+            hdr_detection_done = False
 
             # MPEG-TS の場合は format を明示的に指定
             format_name = 'mpegts' if self.container_format == 'MPEG-TS' else None
@@ -666,7 +1182,7 @@ class ThumbnailGenerator:
                             if packet_index >= self.FRAME_EXTRACTION_MAX_DEMUX_PACKETS:
                                 break
                             for decoded_frame in packet.decode():
-                                frame = cast(av.VideoFrame, decoded_frame)
+                                frame = decoded_frame
                                 break
                             if frame is not None:
                                 break
@@ -693,21 +1209,33 @@ class ThumbnailGenerator:
                                 break
                             continue
 
-                        # フレームを numpy 配列に変換
-                        img_rgb = frame.to_ndarray(format='rgb24')
+                        # HDR 判定は最初のフレームで1回だけ行い、VUI 16 (PQ) / 18 (HLG) を変換する。
+                        ## VUI 14 は規格どおり BT.2020 SDR として従来の無変換経路を通す
+                        if hdr_detection_done is False:
+                            hdr_detection_done = True
+                            hdr_input_transfer = _DetectHDRInputTransfer(frame.color_primaries, frame.color_trc)
+                            if hdr_input_transfer is not None:
+                                logging.info(
+                                    f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
+                                    'Applying BT.2446-1 Method C for thumbnail frames.'
+                                )
+                                hdr_converter = _HDRSDRTonemapConverter(str(self.file_path), hdr_input_transfer)
 
-                        # リサイズを実行
-                        ## 1440x1080 から一気に 480x270 まで縮小するため INTER_AREA を使う
-                        img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
-
-                        # RGB から OpenCV 向けの BGR に変換して bgr_frames に追加する
-                        img_bgr = cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
+                        # フレームをスコアリング解像度の BGR 配列に変換して bgr_frames に追加する
+                        ## HDR 録画では共通の BT.2446-1 Method C で SDR 化されてから返る
+                        img_bgr = self.__convertFrameToScoringBGR(frame, hdr_converter)
                         bgr_frames.append(img_bgr)
                         consecutive_failed_frames = 0
 
                         # 進捗ログ（50フレームごと）
                         if (i + 1) % 50 == 0:
                             logging.debug(f'{self.file_path}: Extracted {i + 1}/{len(candidate_offsets)} frames')
+
+                    except HDRTonemapConversionError:
+                        # HDR 判定後の Method C 変換失敗はフレーム単位の復旧 (黒画像代替) をせず、
+                        ## 関数末尾の共通エラーハンドリングへ伝播させて抽出失敗とする
+                        ## (未変換・代替フレームを代表・タイルとして公開しないため)
+                        raise
 
                     except Exception as ex:
                         # 個別のフレーム抽出エラーは警告にとどめ、黒画像で代替
@@ -847,6 +1375,13 @@ class ThumbnailGenerator:
             previous_frame_relative_time: float | None = None
             bgr_frames: list[NDArray[np.uint8]] = []
             next_candidate_index = 0
+            # HDR (HLG/PQ) 判定は最初にデコードできたフレームの VUI で行う
+            hdr_converter: _HDRSDRTonemapConverter | None = None
+            hdr_detection_done = False
+            # HDR 録画では採用しない I フレームの Method C 変換を避けるため、
+            ## 採用が確定するまでデコード済みフレームを保持し、採用するフレームだけを変換する
+            ## (SDR 録画は従来どおり全フレームを即時変換する)
+            previous_decoded_frame: av.VideoFrame | None = None
             for decoded_frame in container_for_read.decode(video_stream):
                 if time.time() - start_time_frame_extraction > self.TSREADEX_FRAME_EXTRACTION_TIMEOUT:
                     logging.error(
@@ -860,21 +1395,45 @@ class ThumbnailGenerator:
                     first_frame_time = float(decoded_frame.time)
                 relative_time = float(decoded_frame.time) - first_frame_time
 
+                # HDR 判定は最初のフレームで1回だけ行い、VUI 16 (PQ) / 18 (HLG) を変換する。
+                ## VUI 14 は規格どおり BT.2020 SDR として従来の無変換経路を通す
+                if hdr_detection_done is False:
+                    hdr_detection_done = True
+                    hdr_input_transfer = _DetectHDRInputTransfer(decoded_frame.color_primaries, decoded_frame.color_trc)
+                    if hdr_input_transfer is not None:
+                        logging.info(
+                            f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
+                            'Applying BT.2446-1 Method C for thumbnail frames.'
+                        )
+                        hdr_converter = _HDRSDRTonemapConverter(str(self.file_path), hdr_input_transfer)
+
                 # 既存のスコアリング入力と同じ解像度に縮小し、次の候補時刻をまたいだ時に直前フレームとして使う
-                img_rgb = decoded_frame.to_ndarray(format='rgb24')
-                img_resized = cv2.resize(img_rgb, (scoring_width, scoring_height), interpolation=cv2.INTER_AREA)
-                bgr_frame = cast(NDArray[np.uint8], cv2.cvtColor(img_resized, cv2.COLOR_RGB2BGR))
+                ## SDR 録画は従来どおりここで全フレームを変換する。HDR 録画は採用時にだけ変換するため、
+                ## この時点ではデコード済みフレームの保持にとどめる
+                bgr_frame = (
+                    self.__convertFrameToScoringBGR(decoded_frame, None)
+                    if hdr_converter is None
+                    else None
+                )
 
                 # 候補時刻を超えた場合、通常経路の backward seek と同じく直前の I フレームを採用する
                 ## 先頭だけは直前フレームが存在しないため、最初に取得できた I フレームを使う
                 while next_candidate_index < expected_frame_count and relative_time + 0.001 >= candidate_offsets[next_candidate_index]:
-                    if previous_frame_bgr is not None:
+                    if hdr_converter is not None:
+                        # HDR は採用が確定したフレームだけを Method C で変換する
+                        chosen_frame = previous_decoded_frame if previous_decoded_frame is not None else decoded_frame
+                        bgr_frames.append(self.__convertFrameToScoringBGR(chosen_frame, hdr_converter))
+                    elif previous_frame_bgr is not None:
                         bgr_frames.append(previous_frame_bgr.copy())
                     else:
+                        assert bgr_frame is not None
                         bgr_frames.append(bgr_frame.copy())
                     next_candidate_index += 1
 
-                previous_frame_bgr = bgr_frame
+                if hdr_converter is not None:
+                    previous_decoded_frame = decoded_frame
+                else:
+                    previous_frame_bgr = bgr_frame
                 previous_frame_relative_time = relative_time
 
                 # 必要な候補枚数を取得したら、tsreadex 側の入力パイプを閉じて処理を終える
@@ -885,10 +1444,15 @@ class ThumbnailGenerator:
             ## デコード済みフレームが1枚もない場合は、後続の不足補完で黒画像にする
             while (
                 next_candidate_index < expected_frame_count and
-                previous_frame_bgr is not None and
+                (previous_decoded_frame is not None or previous_frame_bgr is not None) and
                 previous_frame_relative_time is not None
             ):
-                bgr_frames.append(previous_frame_bgr.copy())
+                if hdr_converter is not None:
+                    assert previous_decoded_frame is not None
+                    bgr_frames.append(self.__convertFrameToScoringBGR(previous_decoded_frame, hdr_converter))
+                else:
+                    assert previous_frame_bgr is not None
+                    bgr_frames.append(previous_frame_bgr.copy())
                 next_candidate_index += 1
 
             # 末尾までに候補数へ届かない場合でもタイル枚数を維持し、保存処理の前提を崩さない
@@ -949,14 +1513,33 @@ class ThumbnailGenerator:
         """
 
         scoring_width, scoring_height = self.SCORING_SCALE
-        expected_size = scoring_width * scoring_height * 3
         bgr_frames: list[NDArray[np.uint8]] = []
         consecutive_failed_frames = 0
         start_time_frame_extraction = time.time()
 
+        # 生 TLV は B60 descriptor を第一根拠とし、取得不能な場合だけ VUI へフォールバックする。
+        ## HDR と確定した録画だけ、全候補へ同じ Method C converter を適用する
+        hdr_input_transfer = self.__probeHDRInputTransfer()
+        hdr_converter = (
+            _HDRSDRTonemapConverter(str(self.file_path), hdr_input_transfer)
+            if hdr_input_transfer is not None
+            else None
+        )
+        if hdr_input_transfer is not None:
+            logging.info(
+                f'{self.file_path}: HDR transfer detected ({hdr_input_transfer}). '
+                'Applying BT.2446-1 Method C for thumbnail frames.'
+            )
+
         # PyAV は同梱 FFmpeg 8 の libaribtlv demuxer を持たないため、この形式だけ固定バイナリへ委譲する。
         # 1 process で大量 seek すると demuxer 状態が候補間で残るので、候補ごとに独立して fail closed にする。
         for index, offset_sec in enumerate(candidate_offsets):
+            # libaribtlv 経路は full-resolution BGR のパイプ転送が支配的になるため、信号値のまま先に縮小する。
+            ## SDR と同じ既存の縮小・余白処理後に Method C を適用し、候補ごとの巨大な rawvideo 転送を避ける
+            video_filter = (
+                f'scale={scoring_width}:{scoring_height}:force_original_aspect_ratio=decrease,'
+                f'pad={scoring_width}:{scoring_height}:(ow-iw)/2:(oh-ih)/2'
+            )
             command = [
                 LIBRARY_PATH['FFmpeg8'],
                 '-hide_banner', '-loglevel', 'error',
@@ -966,10 +1549,7 @@ class ThumbnailGenerator:
                 '-map', '0:v:0',
                 '-an', '-sn', '-dn',
                 '-frames:v', '1',
-                '-vf', (
-                    f'scale={scoring_width}:{scoring_height}:force_original_aspect_ratio=decrease,'
-                    f'pad={scoring_width}:{scoring_height}:(ow-iw)/2:(oh-ih)/2'
-                ),
+                '-vf', video_filter,
                 '-pix_fmt', 'bgr24',
                 '-f', 'rawvideo',
                 'pipe:1',
@@ -988,14 +1568,30 @@ class ThumbnailGenerator:
                 )
                 process = None
 
+            expected_size = scoring_width * scoring_height * 3
             if process is None or process.returncode != 0 or len(process.stdout) != expected_size:
+                # HDR と判定した録画では、Method C を含む候補抽出の失敗を黒画像補完しない
+                ## 未変換・代替フレームを代表・タイルとして公開しないよう、生成失敗へ伝播する
+                if hdr_input_transfer is not None:
+                    logging.error(
+                        f'{self.file_path}: HDR MMT/TLV frame extraction and tonemap failed at {offset_sec:.2f}s.'
+                    )
+                    return None
                 bgr_frames.append(np.zeros((scoring_height, scoring_width, 3), dtype=np.uint8))
                 consecutive_failed_frames += 1
             else:
                 frame = np.frombuffer(process.stdout, dtype=np.uint8).reshape(
                     (scoring_height, scoring_width, 3),
                 ).copy()
-                bgr_frames.append(cast(NDArray[np.uint8], frame))
+                try:
+                    bgr_frames.append(
+                        hdr_converter.convert(cast(NDArray[np.uint8], frame))
+                        if hdr_converter is not None
+                        else cast(NDArray[np.uint8], frame)
+                    )
+                except HDRTonemapConversionError:
+                    # 未変換・代替フレームを代表・タイルとして公開しないよう、生成失敗へ伝播する
+                    return None
                 consecutive_failed_frames = 0
 
             # 連続失敗後は残りを黒画像で埋め、破損録画に対する process 再生成を打ち切る。
@@ -1016,6 +1612,164 @@ class ThumbnailGenerator:
             f'[frames: {len(bgr_frames)}, elapsed: {time.time() - start_time_frame_extraction:.2f}s]'
         )
         return (bgr_frames, self.__scoreFrames(bgr_frames))
+
+
+    def __probeHDRInputTransfer(self) -> str | None:
+        """
+        MMT/TLV 録画の B60 descriptor を第一根拠にし、必要な場合だけ VUI で HDR transfer を補完する。
+
+        Returns:
+            str | None: 'arib-std-b67' または 'smpte2084'。SDR・判定不能の場合は None
+        """
+
+        # B60 の video_transfer_characteristics は HLG/PQ の曲線まで直接表すため、VUI より先に判定する。
+        ## helper が descriptor を取得できない場合と HDR_WCG_idc=2 だけの場合は VUI へフォールバックする
+        b60_descriptor = self.__probeB60VideoDescriptor()
+        if b60_descriptor is not None:
+            video_transfer_characteristics, hdr_wcg_idc = b60_descriptor
+            descriptor_resolved, descriptor_transfer = _DetectHDRInputTransferFromB60(
+                video_transfer_characteristics,
+                hdr_wcg_idc,
+            )
+            if hdr_wcg_idc is not None and (
+                (
+                    video_transfer_characteristics in _B60_SDR_VIDEO_TRANSFERS and
+                    hdr_wcg_idc == 2
+                ) or (
+                    video_transfer_characteristics in _B60_HDR_VIDEO_TRANSFERS and
+                    hdr_wcg_idc != 2
+                )
+            ):
+                # B60 内で transfer と HDR_WCG_idc が矛盾する入力は、どちらかを推測して公開しない。
+                ## 実放送で観測した場合に規格・送出状態を確認できるよう、生成失敗として呼び出し側へ伝播する
+                raise HDRTonemapConversionError(
+                    'Conflicting B60 HDR descriptors. '
+                    f'[video_transfer_characteristics: {video_transfer_characteristics}, hdr_wcg_idc: {hdr_wcg_idc}]'
+                )
+            if descriptor_resolved is True:
+                return descriptor_transfer
+
+        # stream 情報は stderr へ出るため、0 フレーム処理の起動だけで色メタデータを取得する
+        command = [
+            LIBRARY_PATH['FFmpeg8'],
+            '-f', 'libaribtlv',
+            '-i', str(self.file_path),
+            '-frames:v', '0',
+            '-f', 'null', '-',
+        ]
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=self.MMT_TLV_FRAME_EXTRACTION_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            logging.warning(f'{self.file_path}: Failed to probe MMT/TLV color metadata.', exc_info=ex)
+            if b60_descriptor is not None and b60_descriptor[1] == 2:
+                # B60 で HDR と確定済みなら、VUI probe 障害を SDR 判定へ読み替えて未変換映像を公開しない。
+                raise HDRTonemapConversionError(
+                    'B60 declares HDR but the transfer curve probe failed.'
+                ) from ex
+            return None
+
+        # 出力例: "Stream #0:0[0x100]: Video: hevc (Main 10) (...), yuv420p10le(tv, bt2020nc/bt2020/bt2020-10), ..."
+        ## pix_fmt 直後の括弧は (range, matrix/primaries/transfer, ...) の並び
+        match = re.search(
+            r'Video:.*?\w+\((?:[^()/]*,\s*)?([a-z0-9]+)/([a-z0-9-]+)/([a-z0-9-]+)',
+            process.stderr.decode(errors='replace'),
+        )
+        if match is None:
+            if b60_descriptor is not None and b60_descriptor[1] == 2:
+                raise HDRTonemapConversionError(
+                    'B60 declares HDR but the transfer curve is unavailable from both B60 and VUI.'
+                )
+            logging.warning(f'{self.file_path}: No color metadata found in MMT/TLV probe output.')
+            return None
+        _matrix, primaries, transfer = match.groups()
+        # B60 を取得できない場合も、VUI 16 (PQ) / 18 (HLG) だけを HDR とみなす。
+        ## VUI 14 (bt2020-10) は規格上 WCG SDR なので変換しない
+        if primaries != 'bt2020' or transfer not in _AV_HDR_COLOR_TRANSFERS.values():
+            if b60_descriptor is not None and b60_descriptor[1] == 2:
+                raise HDRTonemapConversionError(
+                    'B60 declares HDR but VUI does not identify an HLG/PQ transfer. '
+                    f'[primaries: {primaries}, transfer: {transfer}]'
+                )
+            return None
+        return transfer
+
+
+    def __probeB60VideoDescriptor(self) -> tuple[int | None, int | None] | None:
+        """
+        既存 metadata ELF から録画対象の主映像トラックに付いた B60 descriptor を読む。
+
+        Returns:
+            tuple[int | None, int | None] | None:
+                (video_transfer_characteristics, hdr_wcg_idc)。helper 失敗・主映像未選出なら None。
+        """
+
+        command = [
+            LIBRARY_PATH['KonomiTVBS4KTLVMetadata'],
+            str(self.file_path),
+            str(KonomiTVBS4KTLVServiceResolver.MAX_PROBE_BYTES),
+        ]
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=self.MMT_TLV_FRAME_EXTRACTION_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as ex:
+            logging.warning(f'{self.file_path}: Failed to probe B60 video descriptor.', exc_info=ex)
+            return None
+        if process.returncode != 0:
+            logging.warning(
+                f'{self.file_path}: B60 video descriptor probe failed. [returncode: {process.returncode}]'
+            )
+            return None
+
+        snapshot = KonomiTVBS4KTLVServiceResolver.parseMetadataLine(
+            process.stdout.decode(errors='replace'),
+        )
+        if snapshot is None:
+            logging.warning(f'{self.file_path}: B60 video descriptor probe returned no metadata snapshot.')
+            return None
+
+        # service_id が得られる通常経路では resolver と同じ context / component_tag 順で主映像を選ぶ。
+        ## 古い呼び出し元など service_id が無い場合も、snapshot context または先頭 Video へ限定して判定する
+        main_context_id = (
+            snapshot.service_contexts.get(self.service_id)
+            if self.service_id is not None
+            else None
+        )
+        if main_context_id is None:
+            main_context_id = snapshot.snapshot_context_id
+        if main_context_id is None:
+            first_video_track = next((track for track in snapshot.tracks if track.kind == 'Video'), None)
+            main_context_id = first_video_track.context_id if first_video_track is not None else None
+        main_video_packet_id, _main_audio_packet_id, _rain_video_packet_id = (
+            KonomiTVBS4KTLVServiceResolver.selectTrackPacketIds(
+                snapshot.tracks,
+                main_context_id,
+                None,
+            )
+        )
+        main_video_track = next((
+            track for track in snapshot.tracks
+            if (
+                track.kind == 'Video' and
+                track.context_id == main_context_id and
+                track.packet_id == main_video_packet_id
+            )
+        ), None)
+        if main_video_track is None:
+            logging.warning(f'{self.file_path}: No main video track found in B60 metadata snapshot.')
+            return None
+        return (
+            main_video_track.video_transfer_characteristics,
+            main_video_track.hdr_wcg_idc,
+        )
 
 
     def __scoreFrames(self, bgr_frames: list[NDArray[np.uint8]]) -> int | None:
@@ -1090,12 +1844,17 @@ class ThumbnailGenerator:
         return best_frame_index
 
 
-    def __saveRepresentativeThumbnail(self, img_bgr: NDArray[np.uint8]) -> bool:
+    def __saveRepresentativeThumbnail(
+        self,
+        img_bgr: NDArray[np.uint8],
+        output_path: pathlib.Path,
+    ) -> bool:
         """
         代表サムネイルを WebP ファイルに同期的に保存する
 
         Args:
             img_bgr (NDArray[np.uint8]): 保存する画像データ (BGR)
+            output_path (pathlib.Path): 代表サムネイルの出力先
 
         Returns:
             bool: 成功時は True、失敗時は False
@@ -1108,7 +1867,7 @@ class ThumbnailGenerator:
                 thumbnails_dir.mkdir(parents=True, exist_ok=True)
 
             # WebP ファイルを書き込む
-            if not cv2.imwrite(str(self.representative_thumbnail_path), img_bgr, [
+            if not cv2.imwrite(str(output_path), img_bgr, [
                 cv2.IMWRITE_WEBP_QUALITY, self.WEBP_QUALITY_REPRESENTATIVE,
             ]):
                 logging.error(f'{self.file_path}: Failed to write representative thumbnail.')
@@ -1125,6 +1884,7 @@ class ThumbnailGenerator:
         self,
         bgr_frames: list[NDArray[np.uint8]],
         tile_rows: int,
+        output_path: pathlib.Path,
     ) -> bool:
         """
         BGR フレームからタイル画像を生成し、WebP として保存する
@@ -1134,6 +1894,7 @@ class ThumbnailGenerator:
         Args:
             bgr_frames (list[NDArray[np.uint8]]): BGR フレームのリスト (SCORING_SCALE)
             tile_rows (int): タイルの行数
+            output_path (pathlib.Path): タイル画像の出力先
 
         Returns:
             bool: 成功時は True、失敗時は False
@@ -1168,7 +1929,7 @@ class ThumbnailGenerator:
             tile_image = cast(NDArray[np.uint8], cv2.vconcat(rows))
 
             # タイル画像を WebP としてエンコードし、ファイルに保存する
-            if not self.__encodeTileImageToWebP(tile_image, pathlib.Path(str(self.seekbar_thumbnails_tile_path)), str(self.file_path)):
+            if not self.__encodeTileImageToWebP(tile_image, output_path, str(self.file_path)):
                 return False
 
             return True
@@ -1359,23 +2120,68 @@ class ThumbnailGenerator:
         return True
 
 
-    async def __saveThumbnailInfoToDB(self) -> None:
+    def __getGenerationFilter(self) -> dict[str, Any] | None:
+        """生成開始世代だけに一致する RecordedVideo の検索条件を構築する。
+
+        Returns:
+            ID・path・hash・size・mtime が揃っている場合は検索条件、不足時は None。
+        """
+
+        if (
+            self.recorded_video_id is None or
+            self.file_size is None or
+            self.file_modified_at is None
+        ):
+            return None
+        return {
+            'id': self.recorded_video_id,
+            'file_path': str(self.file_path),
+            'file_hash': self.file_hash,
+            'file_size': self.file_size,
+            'file_modified_at': self.file_modified_at,
+        }
+
+
+    async def __isGenerationCurrent(self) -> bool:
+        """生成開始世代が現在の DB 行と実ファイルの双方に一致するかを確認する。
+
+        Returns:
+            生成物を公開してよい世代の場合は True。
+        """
+
+        generation_filter = self.__getGenerationFilter()
+        if generation_filter is None:
+            logging.warning(f'{self.file_path}: Thumbnail generation identity is incomplete.')
+            return False
+        if await RecordedVideo.filter(**generation_filter).exists() is False:
+            return False
+
+        # DB 更新より先に物理ファイルだけが追記・置換された状態も検出する。
+        try:
+            file_stat = await self.file_path.stat()
+        except FileNotFoundError:
+            return False
+        current_modified_at = datetime.fromtimestamp(file_stat.st_mtime, tz=JST)
+        return file_stat.st_size == self.file_size and current_modified_at == self.file_modified_at
+
+
+    async def __saveThumbnailInfoToDB(self, require_generation_match: bool = False) -> bool:
         """
         生成済みサムネイル情報を DB に保存する
         再生成の場合、既存のサムネイル情報は上書きされる（この時点でサムネイル自体が上書き保存されているので正常な挙動）
-        """
 
-        # DB から RecordedVideo を取得
-        db_recorded_video = await RecordedVideo.get_or_none(file_path=str(self.file_path))
-        if db_recorded_video is None:
-            logging.warning(f'{self.file_path}: RecordedVideo not found for thumbnail metadata update.')
-            return
+        Args:
+            require_generation_match: 生成開始世代に一致する DB 行だけを条件付き更新するか。
+
+        Returns:
+            サムネイル情報を保存できた場合は True。
+        """
 
         tile_width, tile_height = self.TILE_SCALE
         scoring_width, scoring_height = self.SCORING_SCALE
 
-        # サムネイル情報を DB に保存
-        db_recorded_video.thumbnail_info = schemas.ThumbnailInfo(
+        # 生成時と移行時で同じレイアウト情報を保存する。
+        thumbnail_info = schemas.ThumbnailInfo(
             version = self.THUMBNAIL_INFO_VERSION,
             representative = schemas.ThumbnailImageInfo(
                 format = 'WebP',
@@ -1394,7 +2200,23 @@ class ThumbnailGenerator:
                 interval_sec = self.tile_interval_sec,
             ),
         )
+
+        # 通常生成は生成開始世代を SQL の UPDATE 条件にも含め、検証直後の後勝ち更新を防ぐ。
+        if require_generation_match is True:
+            generation_filter = self.__getGenerationFilter()
+            if generation_filter is None:
+                return False
+            updated_count = await RecordedVideo.filter(**generation_filter).update(thumbnail_info=thumbnail_info)
+            return updated_count == 1
+
+        # 旧サムネイル移行は従来どおり path で対象を取得する。
+        db_recorded_video = await RecordedVideo.get_or_none(file_path=str(self.file_path))
+        if db_recorded_video is None:
+            logging.warning(f'{self.file_path}: RecordedVideo not found for thumbnail metadata update.')
+            return False
+        db_recorded_video.thumbnail_info = thumbnail_info
         await db_recorded_video.save()
+        return True
 
 
     async def migrateFromLegacyTile(self) -> bool:

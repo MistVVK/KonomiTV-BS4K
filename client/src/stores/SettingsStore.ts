@@ -3,8 +3,6 @@ import { isEqual, hash } from 'ohash';
 import { defineStore } from 'pinia';
 import { toRaw } from 'vue';
 
-import type { IBlueskyReplyThreadState, ITwitterReplyThreadState } from '@/utils/TweetUtils';
-
 import Settings, { IClientSettings, IMutedCommentKeywords } from '@/services/Settings';
 import useVersionStore from '@/stores/VersionStore';
 import { isKonomiTVBS4KTheme, type KonomiTVBS4KTheme } from '@/themes';
@@ -12,8 +10,10 @@ import Utils from '@/utils';
 
 
 // 選択可能な画質の種類
+// original は視聴中の選択のみ。Playback の保存プロファイルには入れない。
 export type LiveStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
 export const LIVE_STREAMING_QUALITIES: LiveStreamingQuality[] = ['1080p-60fps', '1080p', '810p', '720p', '540p', '480p', '360p', '240p'];
+export const LIVE_ORIGINAL_MPEG2_QUALITY_NAME = 'Original (MPEG-2)';
 export type BS4KLiveStreamingQuality = '4320p' | '2160p' | '1440p' | '1080p-60fps' | '1080p-30fps' | '810p-60fps' | '810p-30fps' | '720p-60fps' | '720p-30fps' | '540p-30fps' | '480p-30fps' | '360p-30fps' | '240p-30fps';
 export const BS4K_LIVE_STREAMING_QUALITIES: BS4KLiveStreamingQuality[] = ['4320p', '2160p', '1440p', '1080p-60fps', '1080p-30fps', '810p-60fps', '810p-30fps', '720p-60fps', '720p-30fps', '540p-30fps', '480p-30fps', '360p-30fps', '240p-30fps'];
 export type VideoStreamingQuality = '1080p-60fps' | '1080p' | '810p' | '720p' | '540p' | '480p' | '360p' | '240p';
@@ -21,6 +21,7 @@ export const VIDEO_STREAMING_QUALITIES: VideoStreamingQuality[] = ['1080p-60fps'
 export type KonomiTVBS4KPlaybackStreamingQuality = LiveStreamingQuality;
 export type KonomiTVBS4KPlaybackVideoCodec = 'avc' | 'hevc' | 'vp9' | 'av1';
 export type KonomiTVBS4KPlaybackAudioCodec = 'aac' | 'opus';
+export type KonomiTVBS4KHdrOutput = 'Auto' | 'HDR' | 'SDR';
 export interface IKonomiTVBS4KPlaybackVideoProfile {
     is_bs4k: boolean;
     streaming_quality: KonomiTVBS4KPlaybackStreamingQuality | BS4KLiveStreamingQuality;
@@ -51,6 +52,8 @@ export type RecordedStreamingVideoCodec = KonomiTVBS4KPlaybackVideoCodec;
 export type RecordedStreamingAudioCodec = KonomiTVBS4KPlaybackAudioCodec;
 export type VideoSeriesSortKey = 'SeasonEpisode' | 'BroadcastDate' | 'Title';
 export type VideoSeriesSortDirection = 'Asc' | 'Desc';
+// シリーズ一覧 (ビデオ → シリーズ) のカード並び替えキー。
+export type SeriesHomeSortKey = 'UpdatedAt' | 'TitleReading' | 'FirstAirDate' | 'TmdbPopularity' | 'TmdbVoteAverage' | 'BangumiRating';
 
 /** 通常 / BS4K と回線種別に対応する共通映像コーデック設定キーを返す。 */
 export function getKonomiTVBS4KPlaybackVideoCodecSettingKey(
@@ -131,11 +134,6 @@ export interface ITimeTableGenreColors {
     'その他': TimeTableGenreHighlightColor;
 }
 
-export interface ITwitterPanelPostTarget {
-    is_post_to_twitter: boolean;
-    is_post_to_bluesky: boolean;
-}
-
 /**
  * LocalStorage に保存される KonomiTV の設定データ
  * IClientSettings とは異なり、同期対象外の設定キーも含まれる
@@ -143,11 +141,8 @@ export interface ITwitterPanelPostTarget {
 export interface ILocalClientSettings extends IClientSettings {
     last_synced_at: number;
     showed_panel_last_time: boolean;
-    selected_twitter_panel_account: {kind: 'Twitter' | 'Bluesky' | 'Linked'; id: number;} | null;
-    twitter_panel_post_targets: Record<string, ITwitterPanelPostTarget>;
-    twitter_reply_thread_states: Record<string, ITwitterReplyThreadState>;
-    bluesky_reply_thread_states: Record<string, IBlueskyReplyThreadState>;
-    saved_twitter_hashtags: string[];
+    konomitv_bs4k_playback_video_codec_default_initialized: boolean;
+    konomitv_bs4k_playback_audio_codec_default_initialized: boolean;
     mylist: {
         type: 'Series' | 'RecordedProgram';
         id: number;
@@ -187,11 +182,14 @@ export interface ILocalClientSettings extends IClientSettings {
     use_28hour_clock: boolean;
     show_original_broadcast_time_during_playback: boolean;
     panel_display_state: 'RestorePreviousState' | 'AlwaysDisplay' | 'AlwaysFold';
-    tv_panel_active_tab: 'Program' | 'Channel' | 'Comment' | 'Twitter';
-    video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment' | 'Twitter';
+    tv_panel_active_tab: 'Program' | 'Channel' | 'Comment';
+    video_panel_active_tab: 'RecordedProgram' | 'Series' | 'Comment';
     video_series_sort_key: VideoSeriesSortKey;
     video_series_sort_direction: VideoSeriesSortDirection;
+    series_home_sort_key: SeriesHomeSortKey;
+    series_home_sort_direction: VideoSeriesSortDirection;
     video_watched_history_max_count: number;
+    bangumi_watch_history_sync: boolean;
     konomitv_bs4k_offline_video_streaming_quality: VideoStreamingQuality;
     konomitv_bs4k_offline_video_streaming_quality_for_bs4k: BS4KLiveStreamingQuality;
     konomitv_bs4k_offline_video_codec: KonomiTVBS4KPlaybackVideoCodec;
@@ -274,12 +272,6 @@ export interface ILocalClientSettings extends IClientSettings {
     mute_comment_keywords_normalize_alphanumeric_width_case: boolean;
     muted_comment_keywords: IMutedCommentKeywords[];
     muted_niconico_user_ids: string[];
-    fold_panel_after_sending_tweet: boolean;
-    reset_hashtag_when_program_switches: boolean;
-    auto_add_watching_channel_hashtag: boolean;
-    twitter_active_tab: 'Search' | 'Timeline' | 'Capture';
-    tweet_hashtag_position: 'Prepend' | 'Append' | 'PrependWithLineBreak' | 'AppendWithLineBreak';
-    tweet_capture_watermark_position: 'None' | 'TopLeft' | 'TopRight' | 'BottomLeft' | 'BottomRight';
 }
 
 /**
@@ -297,20 +289,12 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
 
     // 前回視聴画面を開いた際にパネルが表示されていたかどうか (同期無効)
     showed_panel_last_time: true,
-    // 視聴画面 Twitter タブで最後に選択していたアカウント (Twitter / Bluesky / 紐付け の tagged union、同期無効)
-    // ID は Twitter / Bluesky / 紐付け それぞれの DB 連番 ID で、別環境間で意味が異なるため同期対象外
-    selected_twitter_panel_account: null,
-    // 紐付けアカウントごとの送信先設定 (同期無効)
-    // 視聴中に頻繁に変える UI 状態なので、サーバー側の AccountLink レコードには保存しない
-    twitter_panel_post_targets: {},
-    // Twitter アカウントごとのリプライツリー状態 (同期無効)
-    // 実況中の一時的な投稿状態なので、サーバー設定同期で別端末へ引き継がない
-    twitter_reply_thread_states: {},
-    // Bluesky アカウントごとのリプライツリー状態 (同期無効)
-    // 実況中の一時的な投稿状態なので、サーバー設定同期で別端末へ引き継がない
-    bluesky_reply_thread_states: {},
-    // 保存している Twitter のハッシュタグが入るリスト
-    saved_twitter_hashtags: [],
+    // このブラウザで工場 AV1 の再生能力に応じた初期値を選定済みかどうか (同期無効)
+    // 証拠なし・手動設定による見送りも完了とし、起動や再生のたびに希望を上書きしない。
+    konomitv_bs4k_playback_video_codec_default_initialized: false,
+    // このブラウザで工場 Opus の音声初期値を選定済みかどうか (同期無効)
+    // 映像と同じく選定は 1 回だけ。手動設定があれば上書きせず完了旗だけを立てる。
+    konomitv_bs4k_playback_audio_codec_default_initialized: false,
 
     // マイリストに追加したシリーズ・録画番組
     mylist: [],
@@ -406,9 +390,15 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     video_series_sort_key: 'SeasonEpisode',
     // ビデオ視聴画面のシリーズを並べる方向 (Default: 昇順)
     video_series_sort_direction: 'Asc',
+    // シリーズ一覧のカードを並べる基準 (Default: 更新日時)
+    series_home_sort_key: 'UpdatedAt',
+    // シリーズ一覧のカードを並べる方向 (Default: 降順)
+    series_home_sort_direction: 'Desc',
     // 視聴履歴の保持件数 (Default: 50件)
     // この値を超えると、最も古い視聴履歴から自動的に削除される
     video_watched_history_max_count: 50,
+    // 録画の視聴完了を Bangumi (bgm.tv) へ送信する (Default: オフ)
+    bangumi_watch_history_sync: false,
 
     // ***** 設定 → 画質 *****
 
@@ -496,6 +486,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     // BS4K/BSP4K・BS8K で降雨対応放送（1080p 低階層）を自動利用する (Default: 利用する) (同期無効)
     tv_use_rain_fallback_for_bs4k: true,
     tv_use_rain_fallback_for_bs8k: true,
+    // HDR 映像の出力 (Default: SDR) HDR 表示対応端末でも既定では canvas で SDR 変換して再生する
+    konomitv_bs4k_hdr_output: 'SDR',
     // テレビを 24fps モードで視聴する (Wi-Fi 回線時)  (Default: オフ) (同期無効)
     tv_24fps_mode: false,
     // テレビを 24fps モードで視聴する (モバイル回線時)  (Default: オフ) (同期無効)
@@ -598,25 +590,6 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
     muted_comment_keywords: [],
     // ミュート済みのニコニコユーザー ID が入るリスト
     muted_niconico_user_ids: [],
-
-    // ***** 設定 → Twitter *****
-
-    // ツイート送信後にパネルを折りたたむ (Default: オフ)
-    fold_panel_after_sending_tweet: false,
-    // 番組が切り替わったときにハッシュタグフォームをリセットする (Default: オン)
-    reset_hashtag_when_program_switches: true,
-    // 視聴中のチャンネルに対応する局タグを自動で追加する (Default: オン)
-    auto_add_watching_channel_hashtag: true,
-    // リプライツリー実況モード (Twitter) (Default: ハッシュタグごとにリプライツリーを切り替える)
-    twitter_reply_thread_mode: 'PerHashtag',
-    // リプライツリー実況モード (Bluesky) (Default: リプライツリー実況を行わない)
-    bluesky_reply_thread_mode: 'Disabled',
-    // デフォルトで表示される Twitter タブ内のタブ (Default: キャプチャタブ)
-    twitter_active_tab: 'Capture',
-    // ツイートにつけるハッシュタグの位置 (Default: ツイート本文の後に追加する)
-    tweet_hashtag_position: 'Append',
-    // ツイートするキャプチャに番組名の透かしを描画する (Default: 透かしを描画しない)
-    tweet_capture_watermark_position: 'None',
 };
 
 // 同期対象の設定データのキーのみを列挙した配列
@@ -624,11 +597,8 @@ export const ILocalClientSettingsDefault: ILocalClientSettings = {
 export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'last_synced_at',
     // showed_panel_last_time: 同期無効
-    // selected_twitter_panel_account: 同期無効
-    // twitter_panel_post_targets: 同期無効
-    // twitter_reply_thread_states: 同期無効
-    // bluesky_reply_thread_states: 同期無効
-    'saved_twitter_hashtags',
+    // konomitv_bs4k_playback_video_codec_default_initialized: 同期無効
+    // konomitv_bs4k_playback_audio_codec_default_initialized: 同期無効
     'mylist',
     'watched_history',
     // video_auto_skip_cm: 同期無効
@@ -663,7 +633,10 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'video_panel_active_tab',
     'video_series_sort_key',
     'video_series_sort_direction',
+    'series_home_sort_key',
+    'series_home_sort_direction',
     'video_watched_history_max_count',
+    'bangumi_watch_history_sync',
     // konomitv_bs4k_offline_video_streaming_quality: 同期無効
     // konomitv_bs4k_offline_video_streaming_quality_for_bs4k: 同期無効
     // konomitv_bs4k_offline_video_codec: 同期無効
@@ -704,6 +677,7 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     // tv_low_latency_mode_for_bs4k_cellular: 同期無効
     // tv_use_rain_fallback_for_bs4k: 同期無効
     // tv_use_rain_fallback_for_bs8k: 同期無効
+    'konomitv_bs4k_hdr_output',
     // tv_24fps_mode: 同期無効
     // tv_24fps_mode_cellular: 同期無効
     // video_streaming_quality: 同期無効
@@ -745,24 +719,14 @@ export const SYNCABLE_SETTINGS_KEYS: (keyof IClientSettings)[] = [
     'mute_comment_keywords_normalize_alphanumeric_width_case',
     'muted_comment_keywords',
     'muted_niconico_user_ids',
-    'fold_panel_after_sending_tweet',
-    'reset_hashtag_when_program_switches',
-    'auto_add_watching_channel_hashtag',
-    'twitter_reply_thread_mode',
-    'bluesky_reply_thread_mode',
-    'twitter_active_tab',
-    'tweet_hashtag_position',
-    'tweet_capture_watermark_position',
 ];
 
 // 設定インポート時に「現在のデバイスの値を維持する」選択ができる、KonomiTV サーバーの DB レコード ID に依存した環境固有の設定キー
-// これらは Series / RecordedProgram / RecordedVideo / 連携アカウントの DB 連番 ID を参照しており、別の KonomiTV サーバーへ
-// インポートすると、同じ ID が全く別のコンテンツ (録画番組やアカウント) を指してしまうため、まとめて上書き対象から外せるようにしている
-// selected_twitter_panel_account は同期無効の一時的な UI 状態だが、同じく DB 連番 ID 依存なので環境固有値として一緒に扱う
+// これらは Series / RecordedProgram / RecordedVideo の DB 連番 ID を参照しており、別の KonomiTV サーバーへ
+// インポートすると、同じ ID が全く別のコンテンツ (録画番組) を指してしまうため、まとめて上書き対象から外せるようにしている
 export const ENVIRONMENT_SPECIFIC_SETTINGS_KEYS: (keyof ILocalClientSettings)[] = [
     'mylist',
     'watched_history',
-    'selected_twitter_panel_account',
 ];
 
 
@@ -774,13 +738,21 @@ export const ENVIRONMENT_SPECIFIC_SETTINGS_KEYS: (keyof ILocalClientSettings)[] 
 export function getLocalStorageSettings(): {[key: string]: any} {
     const settings = localStorage.getItem('KonomiTV-Settings');
     if (settings !== null) {
-        return JSON.parse(settings);
-    } else {
-        // もし LocalStorage に KonomiTV-Settings キーがまだない場合、あらかじめデフォルトの設定値を保存しておく
-        const default_settings = structuredClone(ILocalClientSettingsDefault);
-        setLocalStorageSettings(default_settings);
-        return default_settings;
+        try {
+            const parsed_settings: unknown = JSON.parse(settings);
+            if (typeof parsed_settings === 'object' && parsed_settings !== null && Array.isArray(parsed_settings) === false) {
+                return parsed_settings as {[key: string]: any};
+            }
+            console.warn('Client settings in LocalStorage are not a JSON object. Resetting to defaults.');
+        } catch {
+            console.warn('Failed to parse client settings from LocalStorage. Resetting to defaults.');
+        }
     }
+
+    // LocalStorage に設定がない場合や保存内容が破損している場合は、起動可能なデフォルト設定へ復旧する
+    const default_settings = structuredClone(ILocalClientSettingsDefault);
+    setLocalStorageSettings(default_settings);
+    return default_settings;
 }
 
 /**
@@ -1144,6 +1116,17 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         normalized_settings.ui_theme = ILocalClientSettingsDefault.ui_theme;
     }
 
+    // 廃止した Twitter タブの旧値だけ、現行の既定タブへ移行する
+    // タブ選択キー自体は存続キーなので不要キー掃除では消えず、LocalStorage の旧値が
+    // そのまま同期に回るとサーバー側の ClientSettings 検証で 422 になる。
+    // 比較対象は生データ由来の値なので、union から外れた 'Twitter' を見るために string へ広げて照合する
+    if ((normalized_settings.tv_panel_active_tab as string) === 'Twitter') {
+        normalized_settings.tv_panel_active_tab = ILocalClientSettingsDefault.tv_panel_active_tab;
+    }
+    if ((normalized_settings.video_panel_active_tab as string) === 'Twitter') {
+        normalized_settings.video_panel_active_tab = ILocalClientSettingsDefault.video_panel_active_tab;
+    }
+
     // 不正なインポート値や開発途中版の値では、シリーズ一覧と連続再生の順序を既定値へ戻す。
     if (
         normalized_settings.video_series_sort_key !== 'SeasonEpisode' &&
@@ -1157,6 +1140,24 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
         normalized_settings.video_series_sort_direction !== 'Desc'
     ) {
         normalized_settings.video_series_sort_direction = ILocalClientSettingsDefault.video_series_sort_direction;
+    }
+
+    // 不正なインポート値や開発途中版の値では、シリーズ一覧の並び替えを既定値へ戻す。
+    if (
+        normalized_settings.series_home_sort_key !== 'UpdatedAt' &&
+        normalized_settings.series_home_sort_key !== 'TitleReading' &&
+        normalized_settings.series_home_sort_key !== 'FirstAirDate' &&
+        normalized_settings.series_home_sort_key !== 'TmdbPopularity' &&
+        normalized_settings.series_home_sort_key !== 'TmdbVoteAverage' &&
+        normalized_settings.series_home_sort_key !== 'BangumiRating'
+    ) {
+        normalized_settings.series_home_sort_key = ILocalClientSettingsDefault.series_home_sort_key;
+    }
+    if (
+        normalized_settings.series_home_sort_direction !== 'Asc' &&
+        normalized_settings.series_home_sort_direction !== 'Desc'
+    ) {
+        normalized_settings.series_home_sort_direction = ILocalClientSettingsDefault.series_home_sort_direction;
     }
 
     // 録画音声コーデックは AAC / Opus の2択だけを許可する。
@@ -1241,6 +1242,8 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
             ILocalClientSettingsDefault[konomitv_bs4k_key];
     }
     const konomitv_bs4k_common_boolean_keys = [
+        'konomitv_bs4k_playback_video_codec_default_initialized',
+        'konomitv_bs4k_playback_audio_codec_default_initialized',
         'konomitv_bs4k_playback_24fps_mode',
         'konomitv_bs4k_playback_24fps_mode_cellular',
         'konomitv_bs4k_playback_24fps_mode_for_bs4k',
@@ -1259,19 +1262,6 @@ export function getNormalizedLocalClientSettings(settings: {[key: string]: any})
             normalized_settings[konomitv_bs4k_key] =
                 ILocalClientSettingsDefault[konomitv_bs4k_key];
         }
-    }
-
-    // 旧 selected_twitter_account_id (Twitter アカウント単独参照) を
-    // 新 selected_twitter_panel_account (Twitter / Bluesky / 紐付け の tagged union) に移行する
-    // 既存ユーザーの「最後に選択していた Twitter アカウント」が初回ロードで失われないよう、
-    // 旧キーが残っていて新キーが未設定の場合のみ Twitter アカウントとして引き継ぐ
-    // 旧キー自体はループで既に排除済みのため、ここで明示的な削除処理は不要
-    if (normalized_settings.selected_twitter_panel_account === null &&
-        typeof settings.selected_twitter_account_id === 'number') {
-        normalized_settings.selected_twitter_panel_account = {
-            kind: 'Twitter',
-            id: settings.selected_twitter_account_id,
-        };
     }
 
     return normalized_settings as ILocalClientSettings;
@@ -1371,6 +1361,103 @@ const useSettingsStore = defineStore('settings', {
         },
     },
     actions: {
+
+        /**
+         * 初回マウント前に、工場 AV1 の共通映像設定だけをブラウザの再生可能信号へ一度寄せる。
+         * 同期 normalizer からは呼ばず、main.ts が完了を待ってから初回再生を開始する。
+         * @param selectPreferredCodec IIFE Worker と共有する Store にブラウザ診断を持ち込まないため、起動側から渡すプローブ。
+         */
+        async initializeKonomiTVBS4KPlaybackVideoCodecDefault(
+            selectPreferredCodec: () => Promise<KonomiTVBS4KPlaybackVideoCodec | null>,
+        ): Promise<void> {
+            if (this.settings.konomitv_bs4k_playback_video_codec_default_initialized === true) return;
+
+            const codec_keys = [
+                'konomitv_bs4k_playback_video_codec',
+                'konomitv_bs4k_playback_video_codec_cellular',
+                'konomitv_bs4k_playback_video_codec_for_bs4k',
+                'konomitv_bs4k_playback_video_codec_for_bs4k_cellular',
+            ] as const;
+            let preferred_codec: KonomiTVBS4KPlaybackVideoCodec | null = null;
+            // 1 キーでも手動希望があればプローブも行わず、4 キーをまとめて現状維持する。
+            if (codec_keys.every(key => this.settings[key] === 'av1')) {
+                preferred_codec = await selectPreferredCodec();
+            }
+
+            // 非同期プローブ中に現在の Store へ手動希望が入った場合も、書き換えるのは完了旗だけ。
+            if (codec_keys.some(key => this.settings[key] !== 'av1')) {
+                const settings = {
+                    ...this.settings,
+                    konomitv_bs4k_playback_video_codec_default_initialized: true,
+                };
+                setLocalStorageSettings(settings);
+                this.$patch({settings});
+                return;
+            }
+
+            // 別タブで完了した初期化や保存された希望を上書きしないよう、保存直前に正本を読み直す。
+            const settings = getNormalizedLocalClientSettings(getLocalStorageSettings());
+            if (settings.konomitv_bs4k_playback_video_codec_default_initialized === false) {
+                if (preferred_codec !== null && codec_keys.every(key => settings[key] === 'av1')) {
+                    for (const key of codec_keys) {
+                        settings[key] = preferred_codec;
+                    }
+                }
+                settings.konomitv_bs4k_playback_video_codec_default_initialized = true;
+                // 4 キーと完了旗を一括保存してから Store に公開し、中間の組み合わせを残さない。
+                setLocalStorageSettings(settings);
+            }
+            this.$patch({settings});
+        },
+
+        /**
+         * 初回マウント前に、工場 Opus の共通音声設定だけをブラウザ MSE の肯定信号へ一度寄せる。
+         * 映像版と同じく同期 normalizer からは呼ばず、main.ts が初回再生開始前に完了を待つ。
+         * MSE 判定は同期 API のため、この action も同期で中間状態を残さない。
+         * @param selectPreferredCodec Store にブラウザ診断を持ち込まないため、起動側から渡す同期プローブ。
+         */
+        initializeKonomiTVBS4KPlaybackAudioCodecDefault(
+            selectPreferredCodec: () => KonomiTVBS4KPlaybackAudioCodec | null,
+        ): void {
+            if (this.settings.konomitv_bs4k_playback_audio_codec_default_initialized === true) return;
+
+            const codec_keys = [
+                'konomitv_bs4k_playback_audio_codec',
+                'konomitv_bs4k_playback_audio_codec_cellular',
+                'konomitv_bs4k_playback_audio_codec_for_bs4k',
+                'konomitv_bs4k_playback_audio_codec_for_bs4k_cellular',
+            ] as const;
+            let preferred_codec: KonomiTVBS4KPlaybackAudioCodec | null = null;
+            // 1 キーでも手動希望があればプローブの適用対象外とし、4 キーをまとめて現状維持する。
+            if (codec_keys.every(key => this.settings[key] === 'opus')) {
+                preferred_codec = selectPreferredCodec();
+            }
+
+            // 手動希望がある場合は完了旗だけを立て、保存済みの希望値へ一切触れない。
+            if (codec_keys.some(key => this.settings[key] !== 'opus')) {
+                const settings = {
+                    ...this.settings,
+                    konomitv_bs4k_playback_audio_codec_default_initialized: true,
+                };
+                setLocalStorageSettings(settings);
+                this.$patch({settings});
+                return;
+            }
+
+            // 別タブで完成した初期化や保存済みの希望を上書きしないよう、保存直前に正本を読み直す。
+            const settings = getNormalizedLocalClientSettings(getLocalStorageSettings());
+            if (settings.konomitv_bs4k_playback_audio_codec_default_initialized === false) {
+                if (preferred_codec !== null && codec_keys.every(key => settings[key] === 'opus')) {
+                    for (const key of codec_keys) {
+                        settings[key] = preferred_codec;
+                    }
+                }
+                settings.konomitv_bs4k_playback_audio_codec_default_initialized = true;
+                // 4 キーと完了旗を一括保存してから Store に公開し、中間の組み合わせを残さない。
+                setLocalStorageSettings(settings);
+            }
+            this.$patch({settings});
+        },
 
         /**
          * 共通再生profileの映像・音声codecを、1回のPinia mutationとして同時に更新する。
@@ -1484,13 +1571,14 @@ const useSettingsStore = defineStore('settings', {
 
         /**
          * ログイン時かつ同期が有効な場合、サーバーに保存されている設定データをこのクライアントに同期する
-         * @param force ログイン中なら同期が有効かに関わらず実行する (デフォルト: false)
+         * @param force ログイン中なら同期状態と最終同期時刻に関わらずサーバー設定を適用し、成功時に同期を有効化する (デフォルト: false)
+         * @returns サーバー設定を取得して適用できた場合は true
          */
-        async syncClientSettingsFromServer(force: boolean = false): Promise<void> {
+        async syncClientSettingsFromServer(force: boolean = false): Promise<boolean> {
 
             // ログインしていない時、同期が無効なときは実行しない
             if (Utils.getAccessToken() === null || (this.settings.sync_settings === false && force === false)) {
-                return;
+                return false;
             }
 
             // ここから先、設定データの pull 中に syncClientSettingsToServer() が実行されないようロックする
@@ -1501,15 +1589,16 @@ const useSettingsStore = defineStore('settings', {
                 const settings_server = await Settings.fetchClientSettings();
                 if (settings_server === null) {
                     console.warn('Failed to fetch client settings from server. Skip syncing.');
-                    return;  // 取得できなくても後続の処理には影響しないので、サイレントに失敗する
+                    return false;
                 }
 
                 // サーバーから取得した設定データに含まれる最終同期時刻が、このクライアントが保持している最終同期時刻よりも古い場合、
                 // このまま同期を続行するとサーバーに保存されている古い設定データに巻き戻されてしまうため、同期を中断する
-                if (settings_server.last_synced_at < this.settings.last_synced_at) {
+                // ただし競合ダイアログでサーバー設定を明示的に選択した場合は、時計ずれを含めてユーザーの選択を優先する
+                if (force === false && settings_server.last_synced_at < this.settings.last_synced_at) {
                     console.warn('Server has older settings than this client. Skipping sync.');
-                    return;
-                } else if (settings_server.last_synced_at > this.settings.last_synced_at) {
+                    return false;
+                } else if (settings_server.last_synced_at !== this.settings.last_synced_at) {
                     console.log('Last Synced At Changed (From Server):', settings_server.last_synced_at);
                 }
 
@@ -1521,6 +1610,14 @@ const useSettingsStore = defineStore('settings', {
                         this.settings[settings_server_key] = settings_server_value;
                     }
                 }
+
+                // 競合ダイアログからの強制 pull では、同期有効化も pull ロック内で行う
+                // pull 完了直後の watcher がサーバー設定を再 push して、別デバイスの更新を巻き戻すことを防ぐ
+                if (force === true) {
+                    this.settings.sync_settings = true;
+                }
+
+                return true;
 
             // 成功・失敗に関わらずロックを解除する
             } finally {

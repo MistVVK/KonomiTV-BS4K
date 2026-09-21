@@ -5,4 +5,14 @@
 
     // フォントの定義
     $body-font-family: ('Open Sans', 'YakuHanJPs', 'Twemoji', 'Hiragino Sans', 'Noto Sans JP', sans-serif),
+
+    // Vuetify の responsive utility と独自 mixin、display.thresholds の境界を揃える
+    $grid-breakpoints: (
+        'xs': 0,
+        'sm': 600px,
+        'md': 960px,
+        'lg': 1280px,
+        'xl': 1920px,
+        'xxl': 2560px,
+    ),
 );

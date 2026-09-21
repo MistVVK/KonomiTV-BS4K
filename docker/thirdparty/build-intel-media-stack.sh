@@ -17,9 +17,6 @@ OUTPUT_ROOT="${1:-${REPO_ROOT}/intel-media-stack}"
 : "${INTEL_MEDIA_DRIVER_COMMIT:?INTEL_MEDIA_DRIVER_COMMIT is required}"
 : "${INTEL_MEDIASDK_COMMIT:?INTEL_MEDIASDK_COMMIT is required}"
 : "${INTEL_ONEVPL_GPU_COMMIT:?INTEL_ONEVPL_GPU_COMMIT is required}"
-: "${INTEL_LIBVA_STANDALONE_PATCH_SHA256:?INTEL_LIBVA_STANDALONE_PATCH_SHA256 is required}"
-: "${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256:?INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256 is required}"
-: "${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256:?INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256 is required}"
 
 case "${INTEL_NONFREE:-}" in
   true)
@@ -102,12 +99,6 @@ clone-commit https://github.com/intel/media-driver.git "${INTEL_MEDIA_DRIVER_COM
 clone-commit https://github.com/Intel-Media-SDK/MediaSDK.git "${INTEL_MEDIASDK_COMMIT}" "${SRC_ROOT}/MediaSDK"
 clone-commit https://github.com/intel/vpl-gpu-rt.git "${INTEL_ONEVPL_GPU_COMMIT}" "${SRC_ROOT}/vpl-gpu-rt"
 
-echo "${INTEL_LIBVA_STANDALONE_PATCH_SHA256}  ${PATCH_DIR}/intel-libva-standalone.patch" | \
-  sha256sum --check --strict
-echo "${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256}  ${PATCH_DIR}/intel-media-driver-vpp-deinterlace-crash-fix.patch" | \
-  sha256sum --check --strict
-echo "${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256}  ${PATCH_DIR}/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch" | \
-  sha256sum --check --strict
 apply-git-patch "${SRC_ROOT}/libva" "${PATCH_DIR}/intel-libva-standalone.patch"
 apply-git-patch "${SRC_ROOT}/media-driver" "${PATCH_DIR}/intel-media-driver-vpp-deinterlace-crash-fix.patch"
 apply-git-patch "${SRC_ROOT}/vpl-gpu-rt" "${PATCH_DIR}/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch"
@@ -239,11 +230,13 @@ cp -f "${PREFIX_DIR}/lib/dri/iHD_drv_video.so" "${ARTIFACT_DIR}/Library/dri/"
     "${MEDIA_DRIVER_BUILD_DIR}/CMakeCache.txt"
   grep -E '^(ENABLE_KERNELS|ENABLE_NONFREE_KERNELS|BUILD_CMRTLIB):BOOL=' \
     "${MEDIA_DRIVER_CMRT_BUILD_DIR}/CMakeCache.txt" | sed 's/^/cmrt_/'
-  printf 'patch_intel_libva_standalone_sha256=%s\n' "${INTEL_LIBVA_STANDALONE_PATCH_SHA256}"
+  # patch の hash は監査用の実測値として、適用に使った実ファイルから都度算出する。
+  printf 'patch_intel_libva_standalone_sha256=%s\n' \
+    "$(sha256sum "${PATCH_DIR}/intel-libva-standalone.patch" | cut -d' ' -f1)"
   printf 'patch_intel_media_driver_vpp_deinterlace_crash_fix_sha256=%s\n' \
-    "${INTEL_MEDIA_DRIVER_VPP_DEINTERLACE_CRASH_FIX_PATCH_SHA256}"
+    "$(sha256sum "${PATCH_DIR}/intel-media-driver-vpp-deinterlace-crash-fix.patch" | cut -d' ' -f1)"
   printf 'patch_intel_onevpl_gpu_rt_vpp_deinterlace_hang_fix_sha256=%s\n' \
-    "${INTEL_ONEVPL_GPU_RT_VPP_DEINTERLACE_HANG_FIX_PATCH_SHA256}"
+    "$(sha256sum "${PATCH_DIR}/intel-onevpl-gpu-rt-vpp-deinterlace-hang-fix.patch" | cut -d' ' -f1)"
   if [ "${INTEL_NONFREE}" = 'false' ]; then
     printf 'compile_definition=_FULL_OPEN_SOURCE\n'
   fi

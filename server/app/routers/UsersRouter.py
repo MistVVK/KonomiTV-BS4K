@@ -22,7 +22,7 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from tortoise import timezone
 from tortoise.exceptions import IntegrityError
 from tortoise.transactions import in_transaction
@@ -35,10 +35,7 @@ from app.constants import (
     JWT_SECRET_KEY,
     PASSWORD_CONTEXT,
 )
-from app.models.AccountLink import AccountLink
-from app.models.BlueskyAccount import BlueskyAccount
 from app.models.RefreshToken import RefreshToken
-from app.models.TwitterAccount import TwitterAccount
 from app.models.User import User
 from app.utils.AuthSecurity import (
     DUMMY_PASSWORD_HASH,
@@ -50,6 +47,8 @@ from app.utils.AuthSecurity import (
     GetUsernameRateLimitKey,
     HashRefreshToken,
 )
+from app.utils.KonomiTVBS4KCloudRC import KonomiTVBS4KCloudRC
+from app.utils.KonomiTVBS4KCloudStorage import KonomiTVBS4KCloudStorage
 
 
 # ルーター
@@ -67,6 +66,8 @@ REFRESH_TOKEN_COOKIE_NAME = 'KonomiTV-Refresh-Token'
 REFRESH_TOKEN_COOKIE_PATH = '/api/users'
 REFRESH_TOKEN_COOKIE_MAX_AGE = int(REFRESH_TOKEN_LIFETIME.total_seconds())
 
+# 公開経路はすべて HTTPS のため、Akebi が内部 HTTP へ転送した request.url.scheme から Secure 属性を落とさない
+
 
 def SetRefreshTokenCookie(request: Request, response: Response, refresh_token: str) -> None:
     """更新トークンをHttpOnly Cookieへ設定する。"""
@@ -76,7 +77,7 @@ def SetRefreshTokenCookie(request: Request, response: Response, refresh_token: s
         value = refresh_token,
         max_age = REFRESH_TOKEN_COOKIE_MAX_AGE,
         httponly = True,
-        secure = request.url.scheme == 'https',
+        secure = True,
         samesite = 'lax',
         path = REFRESH_TOKEN_COOKIE_PATH,
     )
@@ -88,7 +89,7 @@ def DeleteRefreshTokenCookie(request: Request, response: Response) -> None:
     response.delete_cookie(
         key = REFRESH_TOKEN_COOKIE_NAME,
         httponly = True,
-        secure = request.url.scheme == 'https',
+        secure = True,
         samesite = 'lax',
         path = REFRESH_TOKEN_COOKIE_PATH,
     )
@@ -251,12 +252,7 @@ async def GetSpecifiedUser(
     """ 指定されたユーザー名のユーザーを取得する """
 
     # 指定されたユーザー名のユーザーを取得
-    user = await User.filter(name=username).prefetch_related(
-        'twitter_accounts',
-        'bluesky_accounts',
-        'account_links__twitter_account',
-        'account_links__bluesky_account',
-    ).get_or_none()
+    user = await User.filter(name=username).get_or_none()
 
     # 指定されたユーザー名のユーザーが存在しない
     if not user:
@@ -285,19 +281,26 @@ def ResizeAndSaveIcon(file: BinaryIO, save_path: pathlib.Path) -> None:
     # リサイズする画像の幅と高さ
     RESIZE_WIDTH_AND_HEIGHT = 512
 
-    # 画像を開く
-    pillow_image = Image.open(file)
+    # Content-Type はクライアントが偽装できるため、Pillow が実データから JPEG / PNG と判定した画像だけを開く
+    # 入力の解析・デコードに起因するエラーだけを入力不正として正規化し、保存先の I/O エラーとは区別する
+    try:
+        with Image.open(file, formats=['JPEG', 'PNG']) as pillow_image:
 
-    # 縦横どちらか長さが短い方に合わせて正方形にクロップ
-    pillow_image_crop = pillow_image.crop((
-        (pillow_image.size[0] - min(pillow_image.size)) // 2,
-        (pillow_image.size[1] - min(pillow_image.size)) // 2,
-        (pillow_image.size[0] + min(pillow_image.size)) // 2,
-        (pillow_image.size[1] + min(pillow_image.size)) // 2,
-    ))
+            # 縦横どちらか長さが短い方に合わせて正方形にクロップ
+            # crop() で遅延デコードも完了させ、不正な画像を保存処理へ進めない
+            pillow_image_crop = pillow_image.crop((
+                (pillow_image.size[0] - min(pillow_image.size)) // 2,
+                (pillow_image.size[1] - min(pillow_image.size)) // 2,
+                (pillow_image.size[0] + min(pillow_image.size)) // 2,
+                (pillow_image.size[1] + min(pillow_image.size)) // 2,
+            ))
 
-    # リサイズして保存
-    pillow_image_resize = pillow_image_crop.resize((RESIZE_WIDTH_AND_HEIGHT, RESIZE_WIDTH_AND_HEIGHT))
+            # デコード済み画像を保存用サイズへ変換する
+            pillow_image_resize = pillow_image_crop.resize((RESIZE_WIDTH_AND_HEIGHT, RESIZE_WIDTH_AND_HEIGHT))
+    except (OSError, Image.DecompressionBombError) as ex:
+        raise UnidentifiedImageError('Uploaded file is not a valid JPEG or PNG image.') from ex
+
+    # 保存先の権限・容量・I/O エラーは入力不正ではないため、422 に変換せず呼び出し元へ伝播させる
     pillow_image_resize.save(save_path, 'PNG')
 
 
@@ -362,13 +365,7 @@ async def UserCreateAPI(
             detail = 'Specified username is duplicated',
         ) from ex
 
-    # 外部テーブルのデータを取得してから返す
-    await current_user.fetch_related(
-        'twitter_accounts',
-        'bluesky_accounts',
-        'account_links__twitter_account',
-        'account_links__bluesky_account',
-    )
+    # 作成済みユーザーをそのまま返す
     return current_user
 
 
@@ -531,13 +528,22 @@ async def UserLogoutAPI(
     response: Response,
     refresh_token_cookie: Annotated[str | None, Cookie(alias=REFRESH_TOKEN_COOKIE_NAME)] = None,
 ):
-    """現在の更新トークンを失効させ、Cookieを削除する。"""
+    """現在の更新トークンファミリーを失効させ、Cookieを削除する。"""
 
     if refresh_token_cookie is not None:
-        await RefreshToken.filter(
-            token_hash = HashRefreshToken(refresh_token_cookie),
-            revoked_at__isnull = True,
-        ).update(revoked_at = timezone.now())
+        now = timezone.now()
+
+        # refresh と logout が同じトークンで競合しても、refresh が作成した後継を含めて失効させる。
+        ## すでにローテーション済みの古いトークンも検索対象に残し、同じ行をロックして refresh と直列化する。
+        async with in_transaction() as connection:
+            refresh_token = await RefreshToken.filter(
+                token_hash = HashRefreshToken(refresh_token_cookie),
+            ).select_for_update().using_db(connection).get_or_none()
+
+            if refresh_token is not None:
+                await RefreshToken.filter(
+                    family_id = refresh_token.family_id,
+                ).using_db(connection).update(revoked_at = now)
 
     DeleteRefreshTokenCookie(request, response)
 
@@ -556,13 +562,8 @@ async def UsersAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
-    # 常に関連するアカウント系テーブルの対応するレコードを全取得して返す
-    return await User.all().prefetch_related(
-        'twitter_accounts',
-        'bluesky_accounts',
-        'account_links__twitter_account',
-        'account_links__bluesky_account',
-    )
+    # ユーザー一覧をそのまま返す
+    return await User.all()
 
 
 # ***** ログイン中ユーザーアカウント情報 API *****
@@ -582,113 +583,7 @@ async def UserAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。
     """
 
-    # 一番よく使う API なので、リクエスト時に twitter_accounts テーブルに仮のアカウントデータが残っていたらすべて消しておく
-    ## Twitter 連携では途中で連携をキャンセルした場合に仮のアカウントデータが残置されてしまうので、それを取り除く
-    if await TwitterAccount.filter(icon_url='Temporary').count() > 0:
-        await TwitterAccount.filter(icon_url='Temporary').delete()
-
-    # 常に関連するアカウント系テーブルの対応するレコードを全取得して返す
-    return await User.filter(id=current_user.id).prefetch_related(
-        'twitter_accounts',
-        'bluesky_accounts',
-        'account_links__twitter_account',
-        'account_links__bluesky_account',
-    ).get()
-
-
-@router.post(
-    '/me/account-links',
-    summary = 'Twitter / Bluesky アカウント紐付け作成 API',
-    response_description = '作成したアカウント紐付け。',
-    response_model = schemas.AccountLink,
-    status_code = status.HTTP_201_CREATED,
-)
-async def AccountLinkCreateAPI(
-    account_link_create_request: Annotated[schemas.AccountLinkCreateRequest, Body(description='紐付ける Twitter / Bluesky アカウント ID 。')],
-    current_user: Annotated[User, Depends(GetCurrentUser)],
-):
-    """
-    ログイン中ユーザーの Twitter アカウントと Bluesky アカウントを紐付ける。<br>
-    紐付けは視聴画面の Twitter タブで両方のタイムラインをまとめて表示し、ツイートを同時投稿する際に利用される。
-    """
-
-    # リクエストされた Twitter アカウントがログイン中ユーザーの所有物であることを確認する
-    twitter_account = await TwitterAccount.filter(
-        id = account_link_create_request.twitter_account_id,
-        user_id = current_user.id,
-    ).get_or_none()
-    if twitter_account is None:
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Specified Twitter account does not exist',
-        )
-
-    # Bluesky 側も同じユーザーに属するレコードだけを許可し、他ユーザーのアカウントとの紐付けを防ぐ
-    bluesky_account = await BlueskyAccount.filter(
-        id = account_link_create_request.bluesky_account_id,
-        user_id = current_user.id,
-    ).get_or_none()
-    if bluesky_account is None:
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Specified Bluesky account does not exist',
-        )
-
-    # 返却直後にクライアントが表示名やアイコンを表示できるように、両方の子レコードを取得しておく
-    try:
-        account_link = await AccountLink.create(
-            user = current_user,
-            twitter_account = twitter_account,
-            bluesky_account = bluesky_account,
-        )
-    except IntegrityError as ex:
-        # 紐付けは DB の一意制約で一対一を最終保証する
-        ## 事前確認だけでは複数タブの同時作成を防げないため、競合後に実際の重複側を調べて既存のエラー文へ戻す
-        if await AccountLink.filter(twitter_account_id=twitter_account.id).exists() is True:
-            raise HTTPException(
-                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail = 'Specified Twitter account is already linked',
-            ) from ex
-        if await AccountLink.filter(bluesky_account_id=bluesky_account.id).exists() is True:
-            raise HTTPException(
-                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail = 'Specified Bluesky account is already linked',
-            ) from ex
-        logging.error(
-            f'[UsersRouter][AccountLinkCreateAPI] Failed to create account link due to an unexpected integrity error. [user_id: {current_user.id}]',
-            exc_info=ex,
-        )
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Failed to create account link',
-        ) from ex
-    await account_link.fetch_related('twitter_account', 'bluesky_account')
-    return account_link
-
-
-@router.delete(
-    '/me/account-links/{link_id}',
-    summary = 'Twitter / Bluesky アカウント紐付け解除 API',
-    status_code = status.HTTP_204_NO_CONTENT,
-)
-async def AccountLinkDeleteAPI(
-    link_id: Annotated[int, Path(description='解除するアカウント紐付け ID 。')],
-    current_user: Annotated[User, Depends(GetCurrentUser)],
-):
-    """
-    ログイン中ユーザーの Twitter / Bluesky アカウント紐付けを解除する。<br>
-    連携済みアカウント自体は削除しない。
-    """
-
-    # 紐付け解除はログイン中ユーザーのリンクレコードだけに限定する
-    ## 個別の Twitter / Bluesky 連携は残されるので、紐付け解除後は別々のアカウントとして選択候補に表示される形となる
-    account_link = await AccountLink.filter(id=link_id, user_id=current_user.id).get_or_none()
-    if account_link is None:
-        raise HTTPException(
-            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail = 'Specified account link does not exist',
-        )
-    await account_link.delete()
+    return await User.filter(id=current_user.id).get()
 
 
 @router.put(
@@ -763,16 +658,18 @@ async def UserUpdateAPI(
                 detail = 'Specified username is duplicated',
             ) from ex
     else:
-        # パスワードを変更しない場合は従来どおりユーザー名などだけを保存する
+        # パスワードを変更しない場合は、指定されたユーザー名だけを保存する
         ## UNIQUE 制約があるため、同時更新でユーザー名が重複した場合は IntegrityError が発生する
-        try:
-            await current_user.save()
-        except IntegrityError as ex:
-            logging.warning(f'[UsersRouter][UserUpdateAPI] Specified username is duplicated. [username: {user_update_request.username}]')
-            raise HTTPException(
-                status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail = 'Specified username is duplicated',
-            ) from ex
+        ## dependency 解決後に並行更新されたパスワード・token_version・権限・設定を古いモデルで上書きしない
+        if user_update_request.username is not None:
+            try:
+                await current_user.save(update_fields=['name', 'updated_at'])
+            except IntegrityError as ex:
+                logging.warning(f'[UsersRouter][UserUpdateAPI] Specified username is duplicated. [username: {user_update_request.username}]')
+                raise HTTPException(
+                    status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail = 'Specified username is duplicated',
+                ) from ex
 
 
 @router.get(
@@ -831,9 +728,59 @@ async def UserUpdateIconAPI(
             detail = 'Please upload JPEG or PNG image',
         )
 
-    # 正方形の PNG にリサイズして保存
+    # 実データも JPEG / PNG のときだけ、正方形の PNG にリサイズして保存
     # 保存先ファイルパス: (ユーザー ID を0埋めしたもの).png
-    await asyncio.to_thread(ResizeAndSaveIcon, image.file, ACCOUNT_ICON_DIR / f'{current_user.id:02}.png')
+    try:
+        await asyncio.to_thread(ResizeAndSaveIcon, image.file, ACCOUNT_ICON_DIR / f'{current_user.id:02}.png')
+    except UnidentifiedImageError as ex:
+        logging.warning(
+            f'[UsersRouter][UserUpdateIconAPI] Invalid JPEG or PNG image was uploaded. '
+            f'[error_type: {type(ex).__name__}]',
+        )
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Please upload valid JPEG or PNG image',
+        ) from ex
+
+
+async def DeleteUserWithKonomiTVBS4KCloudCredentials(user: User) -> None:
+    """アカウント削除のcommit後に、所有するローカルクラウド認証を破棄する。
+
+    Args:
+        user: 削除対象のユーザー。
+    Returns:
+        None
+    """
+    try:
+        # 接続操作と同じlockをDB削除前に取得する。使用中ならアカウントも認証も残す。
+        with KonomiTVBS4KCloudStorage.ownerLock(user.id) as root:
+            # tokenを書き戻す旧プロセスを止められない場合は、ユーザー削除前に失敗させる。
+            await asyncio.to_thread(KonomiTVBS4KCloudRC.stop, user.id)
+            # 削除と管理者数確認を同じトランザクションに置き、管理者0人への競合を防ぐ。
+            async with in_transaction() as connection:
+                await user.delete(using_db=connection)
+                # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
+                ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
+                if await User.filter(is_admin=True).using_db(connection).count() == 0:
+                    id_young_user = await User.all().order_by('id').using_db(connection).first()
+                    if id_young_user is not None:
+                        id_young_user.is_admin = True
+                        await id_young_user.save(using_db=connection, update_fields=['is_admin', 'updated_at'])
+            # rollbackやcommit失敗ではここへ到達しない。クラウド側の削除/revokeは呼ばない。
+            # commit直後の中断・I/O失敗で残ったディレクトリは起動時の所有者確認で回収する。
+            KonomiTVBS4KCloudStorage.removeOwner(root)
+    except BlockingIOError:
+        raise HTTPException(
+            status_code=409,
+            detail='Cloud storage operations for this user are currently in progress. '
+                   'The account was not deleted; please retry after the operation completes.',
+        ) from None
+    except OSError:
+        logging.error('[UsersRouter] Local cloud credential cleanup could not complete.')
+        raise HTTPException(
+            status_code=503,
+            detail='Failed to complete local cloud credential cleanup due to an I/O error.',
+        ) from None
 
 
 @router.delete(
@@ -849,24 +796,15 @@ async def UserDeleteAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていないとアクセスできない。
     """
 
-    # アイコン画像が保存されていれば削除する
-    icon_save_path = anyio.Path(str(ACCOUNT_ICON_DIR)) / f'{current_user.id:02}.png'
-    if await icon_save_path.exists():
-        await icon_save_path.unlink()
-
     # 現在ログイン中のユーザーアカウント（自分自身）を削除
     # アカウントを削除すると、それ以降は（当然ながら）ログインを要求する API へアクセスできなくなる
     ## 削除と管理者数の確認を同一トランザクション内で直列化し、同時削除で管理者 0 人にならないようにする
-    async with in_transaction() as connection:
-        await current_user.delete(using_db = connection)
+    await DeleteUserWithKonomiTVBS4KCloudCredentials(current_user)
 
-        # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
-        ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
-        if await User.filter(is_admin=True).using_db(connection).count() == 0:
-            id_young_user = await User.all().order_by('id').using_db(connection).first()
-            if id_young_user is not None:
-                id_young_user.is_admin = True
-                await id_young_user.save(using_db = connection)
+    # 削除拒否・DB失敗では画像を保持する。アイコン画像が保存されていれば削除する
+    icon_save_path = anyio.Path(str(ACCOUNT_ICON_DIR)) / f'{current_user.id:02}.png'
+    if await icon_save_path.exists():
+        await icon_save_path.unlink()
 
 
 # ***** 指定ユーザーアカウント情報 API (管理者用) *****
@@ -985,20 +923,11 @@ async def SpecifiedUserDeleteAPI(
     JWT エンコードされたアクセストークンがリクエストの Authorization: Bearer に設定されていて、かつ管理者アカウントでないとアクセスできない。
     """
 
-    # アイコン画像が保存されていれば削除する
+    # 指定されたユーザーを削除
+    ## 削除と管理者数の確認を同一トランザクション内で直列化し、同時削除で管理者 0 人にならないようにする
+    await DeleteUserWithKonomiTVBS4KCloudCredentials(user)
+
+    # 削除拒否・DB失敗では画像を保持する。アイコン画像が保存されていれば削除する
     icon_save_path = anyio.Path(str(ACCOUNT_ICON_DIR)) / f'{user.id:02}.png'
     if await icon_save_path.exists():
         await icon_save_path.unlink()
-
-    # 指定されたユーザーを削除
-    ## 削除と管理者数の確認を同一トランザクション内で直列化し、同時削除で管理者 0 人にならないようにする
-    async with in_transaction() as connection:
-        await user.delete(using_db = connection)
-
-        # ユーザーを削除した結果、管理者アカウントがいなくなってしまった場合
-        ## ID が一番若いアカウントに管理者権限を付与する（そうしないと誰も管理者権限を行使できないし付与できない）
-        if await User.filter(is_admin=True).using_db(connection).count() == 0:
-            id_young_user = await User.all().order_by('id').using_db(connection).first()
-            if id_young_user is not None:
-                id_young_user.is_admin = True
-                await id_young_user.save(using_db = connection)

@@ -1,7 +1,11 @@
 import { defineStore } from 'pinia';
 
-import AnalysisTasks, { AnalysisTaskType, IAnalysisTaskExecution, IAnalysisTaskOverview } from '@/services/AnalysisTasks';
-import Utils from '@/utils';
+import AnalysisTasks, {
+    AnalysisTaskType,
+    IAnalysisTaskExecution,
+    IAnalysisTaskOverview,
+    ISeriesAIFallbackStatus,
+} from '@/services/AnalysisTasks';
 
 
 export interface IActiveAnalysisTaskGroup {
@@ -12,7 +16,8 @@ export interface IActiveAnalysisTaskGroup {
     progress: number | null;
 }
 
-export type ActiveAnalysisTaskStatus = 'Running' | 'Queued' | null;
+export type BackgroundTaskType = AnalysisTaskType | 'SeriesAIFallback';
+export type BackgroundTaskStatus = 'Running' | 'Queued' | 'Idle' | 'Disabled' | 'Stopped' | null;
 
 
 // Navigation と MyPage の両方が同時にマウントされても API ポーリングを重複させないため、
@@ -21,15 +26,24 @@ let overviewPollingTimer: number | null = null;
 let overviewPollingConsumers = 0;
 
 
-export function taskTypeLabel(type: AnalysisTaskType): string {
+export function taskTypeLabel(type: BackgroundTaskType): string {
     return {
         RecordedScan: '録画フォルダスキャン', MetadataAnalysis: 'メタデータ解析', PlaybackIndex: '再生索引作成',
         ThumbnailGeneration: 'サムネイル生成', CMAnalysis: 'CM区間解析', CMLogoGeneration: 'CMロゴ生成',
         BatchScan: '録画フォルダ一括スキャン', BatchMetadataReanalysis: '全件メタデータ再解析',
         BatchCMAnalysis: '全件CM再判定', BatchSeriesResolution: '既存録画シリーズ一括判定',
-        BatchEpisodeResolution: '既存録画話数一括判定',
+        BatchEpisodeResolution: '既存録画話数一括判定', BatchSeriesPipeline: 'シリーズ・話数一括判定',
         BackgroundAnalysis: 'バックグラウンド一括解析',
+        SeriesAIFallback: 'シリーズ AI 補完',
     }[type];
+}
+
+
+export function backgroundTaskStatusLabel(status: BackgroundTaskStatus): string {
+    if (status === null) return '';
+    return {
+        Running: '実行中', Queued: '待機中', Idle: '待機中', Disabled: '無効', Stopped: '停止',
+    }[status];
 }
 
 
@@ -42,13 +56,16 @@ export function stageLabel(stage: string | null): string {
         IndexingMedia: '共有索引作成中', ChapterAnalyzing: '無音・シーン解析中', LogoAnalyzing: 'ロゴ解析中',
         HardwareFallback: 'CPU解析へ切替中', CombiningCM: 'CM区間統合中',
         Committing: '結果確定中', Processing: '処理中', Saving: '保存中',
+        indexer_rebuild: '確定規則を適用中', ai_fallback: 'シリーズ AI 補完中',
+        external_sync: '外部メタデータ同期中', episode_backfill: '話数判定中',
     } as Record<string, string>)[stage] ?? stage;
 }
 
 
 const useAnalysisTasksStore = defineStore('analysisTasks', {
     state: () => ({
-        analysisOverview: {active: [], active_children: [], recent: []} as IAnalysisTaskOverview,
+        analysisOverview: {active: [], active_children: []} as IAnalysisTaskOverview,
+        seriesAIFallbackStatus: null as ISeriesAIFallbackStatus | null,
     }),
     getters: {
         activeTaskGroups(state): IActiveAnalysisTaskGroup[] {
@@ -72,8 +89,9 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
                 };
             });
         },
-        activeTaskStatus(state): ActiveAnalysisTaskStatus {
+        activeTaskStatus(state): BackgroundTaskStatus {
             if (state.analysisOverview.active.some(task => task.status === 'Running')) return 'Running';
+            if (state.seriesAIFallbackStatus?.state === 'Running') return 'Running';
             if (state.analysisOverview.active.some(task => task.status === 'Queued')) return 'Queued';
             return null;
         },
@@ -88,12 +106,13 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
                     ...overview,
                     active_children: overview.active_children ?? [],
                 };
+                if (overview.series_ai_fallback !== undefined) {
+                    this.seriesAIFallbackStatus = overview.series_ai_fallback;
+                }
             }
         },
         startOverviewPolling(showError = false): void {
-            // 未ログイン画面では認証必須 API を定期呼び出ししない。
-            if (Utils.getAccessToken() === null) return;
-
+            // 実行中概要は未ログインでも閲覧できるサーバー全体の状態なので、認証有無に関わらずポーリングする。
             overviewPollingConsumers += 1;
             // 既に別コンポーネントが開始済みなら、そのタイマーとストア状態を共有する。
             if (overviewPollingTimer !== null) return;
@@ -108,10 +127,6 @@ const useAnalysisTasksStore = defineStore('analysisTasks', {
 
             window.clearInterval(overviewPollingTimer);
             overviewPollingTimer = null;
-            // ログアウト後に別ユーザーへ前ユーザー権限で取得した概要を一瞬見せないよう、認証情報がなければ破棄する。
-            if (Utils.getAccessToken() === null) {
-                this.analysisOverview = {active: [], active_children: [], recent: []};
-            }
         },
     },
 });

@@ -15,6 +15,19 @@ import Snackbars from '@/components/Snackbars.vue';
 
 // ***** ブラウザのデフォルトスタイルの上書き *****
 
+// 既存 UI はリセット済みの余白・フォーム装飾を前提とするため、Vuetify 4 で削除された部分を補う
+// コンポーネントや utility より低いレイヤーに置き、それぞれが指定する余白・装飾は維持する
+@layer vuetify-core.reset {
+    * {
+        margin: 0;
+        padding: 0;
+    }
+    button, input, select, textarea {
+        background-color: transparent;
+        border-style: none;
+    }
+}
+
 // スクロールバーのスタイル
 // なるべく ::webkit-scrollbar を優先させるため、::webkit-scrollbar 未対応の Firefox でのみ scrollbar-color/width を有効化する
 @supports (-moz-appearance: none) {

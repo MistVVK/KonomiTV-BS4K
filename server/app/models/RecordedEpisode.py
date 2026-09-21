@@ -47,6 +47,10 @@ class SeriesEpisode(TortoiseModel):
     series_id: int
     season_number = fields.IntField()
     episode_number = fields.DecimalField(max_digits=10, decimal_places=3)
+    bangumi_episode_id = cast(TortoiseField[int | None], fields.IntField(null=True))
+    # TMDb のエピソード ID。Bangumi 由来の話数構造が無い Series だけ、TMDb season data から
+    # 話数構造を組み立てるときに埋める。録画単位の bind は v1 では Bangumi 専属のまま。
+    tmdb_episode_id = cast(TortoiseField[int | None], fields.IntField(null=True))
     recorded_programs: fields.ReverseRelation[RecordedProgram]
     created_at = fields.DatetimeField(auto_now_add=True)
     updated_at = fields.DatetimeField(auto_now=True)

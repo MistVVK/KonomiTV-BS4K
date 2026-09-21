@@ -56,7 +56,6 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
         items: [
             {type: 'Route', label: 'アカウント・データ', icon: 'fluent:person-20-filled', to: '/settings/account'},
             {type: 'Route', label: 'ニコニコ実況', icon: 'bi:chat-left-text-fill', iconStyle: 'padding: 0 2px;', to: '/settings/account/niconico'},
-            {type: 'Route', label: 'Twitter / Bluesky 連携', icon: 'fa-brands:twitter', iconStyle: 'padding: 0 1px;', to: '/settings/account/social'},
         ],
     },
     {
@@ -66,6 +65,7 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
             {type: 'Route', label: '配信・エンコーダー', icon: 'fluent:video-settings-20-filled', to: '/settings/server/streaming'},
             {type: 'Route', label: 'AIバックエンド', icon: 'fluent:bot-20-filled', to: '/settings/server/ai-backends'},
             {type: 'Route', label: '録画・ストレージ', icon: 'fluent:hard-drive-20-filled', to: '/settings/server/storage'},
+            {type: 'Route', label: 'クラウドストレージ', icon: 'fluent:cloud-24-regular', to: '/settings/server/konomitv-bs4k-cloud-storage'},
             {
                 type: 'Route',
                 label: '録画シリーズ',
@@ -94,6 +94,7 @@ export const SETTINGS_NAVIGATION_CATEGORIES: readonly SettingsNavigationCategory
         label: '情報',
         items: [
             {type: 'Route', label: 'サーバー接続速度', icon: 'fluent:top-speed-20-filled', to: '/settings/info/speed-test'},
+            {type: 'Route', label: 'コーデック対応', icon: 'fluent:code-20-regular', to: '/settings/info/codec-support'},
             {
                 type: 'ExternalLink',
                 label: 'サードパーティーライセンス',
@@ -175,11 +176,6 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         beforeEnter: redirectDisabledJikkyoSettings,
     },
     {
-        path: '/settings/account/social',
-        name: 'Settings Account Social',
-        component: () => import('@/views/Settings/Twitter.vue'),
-    },
-    {
         path: '/settings/server/basic',
         name: 'Settings Server Basic',
         component: () => import('@/views/Settings/Server.vue'),
@@ -205,6 +201,11 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         path: '/settings/server/recorded-series',
         name: 'Settings Server Recorded Series',
         component: () => import('@/views/Settings/RecordedSeries.vue'),
+    },
+    {
+        path: '/settings/server/konomitv-bs4k-cloud-storage',
+        name: 'KonomiTVBS4K Cloud Storage',
+        component: () => import('@/views/Settings/KonomiTVBS4KCloudStorage.vue'),
     },
     {
         path: '/settings/server/recorded-series/series',
@@ -243,6 +244,11 @@ const CANONICAL_SETTINGS_ROUTES: RouteRecordRaw[] = [
         name: 'Settings Info Speed Test',
         component: () => import('@/views/Settings/KonomiTVBS4KSpeedTest.vue'),
     },
+    {
+        path: '/settings/info/codec-support',
+        name: 'Settings Info Codec Support',
+        component: () => import('@/views/Settings/KonomiTVBS4KCodecSupport.vue'),
+    },
 ];
 
 // ブックマークや外部リンクを壊さないよう、旧 URL は最も近い新しい分類へ転送する。
@@ -261,7 +267,6 @@ const LEGACY_SETTINGS_ROUTES: RouteRecordRaw[] = [
         path: '/settings/jikkyo',
         redirect: to => ({path: '/settings/account/niconico', query: to.query, hash: to.hash}),
     },
-    {path: '/settings/twitter', redirect: '/settings/account/social'},
     {
         path: '/settings/bs4k',
         redirect: to => ({path: '/settings/server/streaming', query: to.query, hash: '#bs4k'}),

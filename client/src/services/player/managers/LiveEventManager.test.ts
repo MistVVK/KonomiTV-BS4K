@@ -29,6 +29,8 @@ type LiveStreamStatusEvent = {
     client_count: number;
     is_rain_fallback: boolean | null;
     is_rain_fallback_broadcasting: boolean | null;
+    b60_video_transfer: number | null;
+    mh_eit_hdr_hint: boolean | null;
 };
 
 
@@ -43,6 +45,8 @@ function createLiveStreamStatusEvent(
         client_count: 1,
         is_rain_fallback: null,
         is_rain_fallback_broadcasting: null,
+        b60_video_transfer: null,
+        mh_eit_hdr_hint: null,
         ...overrides,
     };
 }

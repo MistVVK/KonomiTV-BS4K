@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, cast
 
 from app.schemas import Genre
 
 
-SERIES_TITLE_PARSER_VERSION = '3'
+SERIES_TITLE_PARSER_VERSION = '4'
 
 
 # ARIB の番組属性表示は作品名ではないため除去する。ただし、括弧そのものを一律で消すと
@@ -162,12 +163,11 @@ def _findQuotedSegment(value: str) -> tuple[int, int, str] | None:
                 stack.pop()
                 if len(stack) == 0:
                     return start, index + 1, value[start + 1:index]
-        return None
     return None
 
 
 def _isInsideQuotedSegment(value: str, position: int) -> bool:
-    """指定位置が対応済み引用区間内にあるかを返す。
+    """指定位置が対応済み引用区間内にあるかを検査する。
 
     Args:
         value: 引用符を検査する正規化済み文字列。
@@ -188,6 +188,69 @@ def _isInsideQuotedSegment(value: str, position: int) -> bool:
         offset = absolute_end
         remaining = value[offset:]
     return False
+
+
+# 映画枠・劇場版を作品単位で束ねるとき、放送装飾と同一作品の版表記だけを除く。
+## 枠名そのものは引用符の前にあるため、作品名の抽出では使わない。
+_MOVIE_DECORATION_PATTERN = re.compile(r'★[^★]*★|<[^<>]*>|\[[^\]]*\]|【[^【】]*】')
+# ディレクターズカット版は本編と同じ Series にするため、作品名から除く。
+_MOVIE_EDITION_MARKERS = ('ディレクターズカット', 'ディレクターズ・カット')
+# 版マーカー・本編表記を含む括弧は、対応する括弧ごと単位として除去する。
+## 文字列だけを削ると括弧や「版」が残り別キーになる。無関係な作品名の括弧は削らない。
+_MOVIE_EDITION_BRACKET_PATTERN = re.compile(
+    r'[\(（\[][^\(（\)）\[\]]*(?:ディレクターズカット|ディレクターズ・カット|本編)[^\(（\)）\[\]]*[\)）\]]',
+)
+# 「○○ 本編」と「○○ ディレクターズカット」を同一作品にするための末尾表記。
+_MOVIE_HONPEN_SUFFIX_PATTERN = re.compile(r'[\s　\[［\(\（]*本編[\s　\]］\)\）]*\s*$')
+# 映画枠の判定に使う劇場版表記。単独抱き合わせ特番の枠名ではなく作品側の表記である。
+_MOVIE_THEATER_MARKER = '劇場版'
+
+
+def ExtractMovieWorkTitle(
+    value: str,
+    primary_major_genre: str | None,
+) -> tuple[str, bool] | None:
+    """映画枠・劇場版のタイトルから作品単位の表示名を抜き出す。
+
+    枠名で束ねると別作品が混ざるため、引用された作品名と後続の installment を
+    作品識別名にする。引用が無い場合は全体を作品名とする。監督カット版・本編
+    表記は同一作品としてキーから除く。
+
+    Args:
+        value: 正規化済みの番組タイトル。
+        primary_major_genre: 先頭ジャンルの major。映画枠の判定に使う。
+
+    Returns:
+        (作品表示名, 引用の有無)。映画枠でなければ None。
+    """
+
+    if primary_major_genre != '映画' and _MOVIE_THEATER_MARKER not in value:
+        return None
+    segment = _findQuotedSegment(value)
+    if segment is not None:
+        # 引用以降（installment・属性）を作品名に含め、枠名は捨てる。
+        ## 例: 金曜ロードショー「耳をすませば」★...★ → 耳をすませば
+        ## 例: 劇場版「鬼滅の刃」無限列車編 → 鬼滅の刃 無限列車編
+        trailing = _MOVIE_DECORATION_PATTERN.sub('', value[segment[1]:])
+        work_title = _cleanSeriesTitle(f'{segment[2]} {trailing}')
+        has_quoted_movie = True
+    else:
+        work_title = _cleanSeriesTitle(_MOVIE_DECORATION_PATTERN.sub('', value))
+        has_quoted_movie = False
+    # 括弧付きの版表記は括弧ごと単位で除去し、対応する括弧や「版」を残さない。
+    work_title = _cleanSeriesTitle(_MOVIE_EDITION_BRACKET_PATTERN.sub('', work_title))
+    edition_found = False
+    for marker in _MOVIE_EDITION_MARKERS:
+        if marker in work_title:
+            edition_found = True
+            work_title = _cleanSeriesTitle(work_title.replace(marker, ''))
+    if edition_found:
+        # 「ディレクターズカット版」の版は作品名ではないため、除去後に残っても削る。
+        work_title = _cleanSeriesTitle(re.sub(r'版\s*$', '', work_title))
+    work_title = _cleanSeriesTitle(_MOVIE_HONPEN_SUFFIX_PATTERN.sub('', work_title))
+    if work_title == '':
+        return None
+    return work_title, has_quoted_movie
 
 
 def _stripLeadingStructuralDescriptor(value: str) -> str:
@@ -407,6 +470,24 @@ def ParseSeriesTitle(
         ):
             subtitle = _cleanSubtitle(description_subtitle_segment[2])
 
+    # 映画枠・劇場版は作品単位で Series を作る。枠名で束ねると別作品が混ざるため、
+    ## 引用された作品名と後続 installment をシリーズ名にする。抽出できた映画は
+    ## 単発除外せず、1作品1 Series として扱う。
+    movie_work = ExtractMovieWorkTitle(normalized_title, primary_major_genre)
+    if movie_work is not None:
+        movie_title, has_quoted_movie = movie_work
+        return SeriesTitleParseResult(
+            series_title=movie_title,
+            normalized_key=BuildSeriesGroupingKey(movie_title),
+            episode_number=None,
+            subtitle=movie_title if has_quoted_movie else subtitle,
+            season_number=None,
+            episode_source=None,
+            has_explicit_episode=False,
+            is_hard_standalone=False,
+            is_soft_standalone=False,
+        )
+
     return SeriesTitleParseResult(
         series_title=series_title,
         normalized_key=BuildSeriesGroupingKey(series_title),
@@ -417,7 +498,123 @@ def ParseSeriesTitle(
         has_explicit_episode=False,
         # 「映画『作品名』」のような汎用枠タイトルは引用符前が同じ root になるため、
         # 内容の異なる映画が2本揃っただけでシリーズへ昇格しないよう絶対除外にする。
-        # 明示話数がある場合は上の分岐ですでに返しており、この除外より優先される。
+        # 明示話数がある場合と抽出できた映画は上の分岐ですでに返しており、この除外より優先される。
         is_hard_standalone=is_hard_standalone or is_primary_movie,
         is_soft_standalone=is_soft_standalone and not is_primary_movie,
     )
+
+
+def ExtractEPGSearchQueries(
+    programs: list[dict[str, Any]],
+    existing_title: str | None = None,
+) -> list[str]:
+    """所属録画の EPG 題名から、外部メタデータ検索の補助クエリを抽出する。
+
+    EPG の番組名は放送枠名・話数・装飾を含むため、API クエリへ EPG 全文を
+    そのまま足しては汚さない。ローカル解析で作品名だけを取り出し、Series の
+    表示タイトルと同一のクエリを除外して返す。
+
+    Args:
+        programs (list[dict[str, Any]]): 所属録画の title / description / detail /
+            genres を含む行 (RecordedProgram.values() の結果)。
+        existing_title (str | None): Series 表示タイトル。同一作品名のクエリは除外する。
+
+    Returns:
+        list[str]: 出現数の多い順の補助クエリ。最大 3 件。抽出できなければ空リスト。
+    """
+
+    exclude_key = BuildSeriesGroupingKey(existing_title) if existing_title else ''
+    query_counts: Counter[str] = Counter()
+    for program in programs:
+        title = str(program.get('title') or '')
+        if title.strip() == '':
+            continue
+        genres = program.get('genres')
+        parsed_genres: list[Genre] = []
+        if isinstance(genres, list):
+            for genre in genres:
+                if isinstance(genre, dict):
+                    # values() の行は生 dict で届くため、Genre として読み替えて渡す。
+                    parsed_genres.append(cast(Genre, genre))
+        # ParseSeriesTitle は映画枠・劇場版を ExtractMovieWorkTitle() 経由で
+        # 作品単位の表示名へ解決するため、TV と映画の両方を同じ呼び出しで扱える。
+        parse = ParseSeriesTitle(
+            title,
+            str(program.get('description') or ''),
+            program['detail'] if isinstance(program.get('detail'), dict) else {},
+            parsed_genres,
+        )
+        candidate = parse.series_title
+        if candidate == '':
+            continue
+        if exclude_key != '' and BuildSeriesGroupingKey(candidate) == exclude_key:
+            continue
+        query_counts[candidate] += 1
+    # 頻度順にすることで、単発の特番名より継続して現れる作品名を優先する。
+    return [query for query, _count in query_counts.most_common(3)]
+
+
+def NormalizeTitleReading(value: str | None) -> str | None:
+    """AI などが返したタイトル読みを、ソート用の正規化済みひらがなへ整える。
+
+    カタカナはひらがなへ読み替え、空白は連続をまとめて除去する。かな以外の
+    文字はそのまま残す (番号やアルファベットは読みの一部として保持する)。
+
+    Args:
+        value (str | None): 正規化前の読み。
+
+    Returns:
+        str | None: 正規化済みの読み。空になった場合は None。
+    """
+
+    if value is None:
+        return None
+    normalized = NormalizeProgramText(value).replace(' ', '')
+    # カタカナ (U+30A1〜U+30F6) を対応するひらがなへ読み替える。長音記号はそのまま。
+    normalized = ''.join(
+        chr(ord(character) - 0x60) if 0x30A1 <= ord(character) <= 0x30F6 else character
+        for character in normalized
+    )
+    return normalized or None
+
+
+# あ→んソートで読み列を使うため、漢字コード表に属す文字は機械的な変換先を持たない。
+_KANJI_CODE_POINT_RANGES: tuple[tuple[int, int], ...] = (
+    (0x3400, 0x4DBF),  # CJK 拡張 A
+    (0x4E00, 0x9FFF),  # CJK 統合漢字
+)
+
+
+def ContainsKanjiCharacters(value: str) -> bool:
+    """タイトル読み候補に漢字が残っているかを判定する。
+
+    Args:
+        value: 判定する読み文字列。
+
+    Returns:
+        CJK 漢字コード表に属す文字を 1 つ以上含む場合は True。
+    """
+
+    return any(
+        start <= ord(character) <= end
+        for character in value
+        for start, end in _KANJI_CODE_POINT_RANGES
+    )
+
+
+def DeriveTitleReadingFromTitle(title: str) -> str | None:
+    """カナのみのタイトルから、AI を使わずに読みを機械的に生成する。
+
+    Args:
+        title (str): Series 表示タイトル。
+
+    Returns:
+        str | None: かな文字だけで構成されるタイトルの読み。それ以外は None。
+    """
+
+    normalized = NormalizeProgramText(title).replace(' ', '')
+    if normalized == '' or any(
+        not (0x3041 <= ord(character) <= 0x30FF) for character in normalized
+    ):
+        return None
+    return NormalizeTitleReading(normalized)

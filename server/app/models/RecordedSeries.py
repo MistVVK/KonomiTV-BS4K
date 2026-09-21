@@ -17,7 +17,9 @@ if TYPE_CHECKING:
 RecordedSeriesDecision = Literal['Series', 'NotSeries']
 RecordedSeriesResolutionStatus = Literal['Pending', 'Resolved', 'NotSeries', 'NeedsReview', 'Failed']
 RecordedSeriesSource = Literal['Rule', 'Local', 'EPG', 'MediaWiki', 'AI', 'Manual']
-RecordedSeriesAIRequestPurpose = Literal['Resolution', 'EpisodeLookup', 'ConnectionTest']
+# CandidateSelection / TitleReading は候補選択・タイトル読みの軽量経路で provider の
+# 非2xx (sanitizer 済み抜粋付き) を受けた失敗だけを記録する用途 (監査から本文を読めるようにする)。
+RecordedSeriesAIRequestPurpose = Literal['Resolution', 'EpisodeLookup', 'ConnectionTest', 'CandidateSelection', 'TitleReading']
 RecordedSeriesAIRequestStatus = Literal['Pending', 'Succeeded', 'Failed', 'Rejected']
 
 

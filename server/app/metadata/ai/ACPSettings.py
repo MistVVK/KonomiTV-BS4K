@@ -23,59 +23,26 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from app.constants import DATA_DIR
 
 
-# ACP 共通の推論深さ。CLI / agent には lowercase で渡す。
-# Codex は XHigh/Max/Ultra まで。ただし Ultra は Sol 系統だけで使用する。
-# Grok は Low/Medium/High のみ。
-AcpReasoningEffort = Literal['Low', 'Medium', 'High', 'XHigh', 'Max', 'Ultra']
-_ACP_REASONING_EFFORT_FROM_LOWER: dict[str, AcpReasoningEffort] = {
-    'low': 'Low',
-    'medium': 'Medium',
-    'high': 'High',
-    'xhigh': 'XHigh',
-    'max': 'Max',
-    'ultra': 'Ultra',
-}
+# ACP 共通の推論深さ。provider が広告した opaque ID をそのまま保存・適用する。
+type AcpReasoningEffort = str
 # 旧 UI の連結 ID（gpt-5.6-luna[medium]）を model + effort に分解する。
 _ACP_COMPOSITE_MODEL_RE = re.compile(
     r'^(?P<model>[^\[\]]+?)(?:\[(?P<effort>low|medium|high|xhigh|max|ultra)\])?$',
     re.IGNORECASE,
 )
-_ACP_BASIC_REASONING_EFFORTS: frozenset[AcpReasoningEffort] = frozenset({
-    'Low',
-    'Medium',
-    'High',
-})
-# backend ごとの未設定時デフォルト（CLI 既定ではなく明示プリセット）。
+# backend ごとの未設定時モデル。Grok は agent の currentModelId を実行時既定にする。
 ACP_DEFAULT_MODEL_BY_BACKEND: dict[str, str | None] = {
     'AcpCodex': 'gpt-5.6-luna',
     'AcpGrok': None,
-}
-ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND: dict[str, AcpReasoningEffort] = {
-    'AcpCodex': 'Medium',
-    'AcpGrok': 'High',
 }
 
 # KonomiTV-BS4K の ACP バックエンド種別。固定プリセットとして 2 種のみ。
 ACPBackendKind = Literal['AcpCodex', 'AcpGrok']
 
-
-def IsKonomiTVBS4KCodexSolModel(konomitv_bs4k_model: str | None) -> bool:
-    """Codex のモデル ID が Sol 系統かを判定する。
-
-    Args:
-        konomitv_bs4k_model: 判定する Codex モデル ID。
-
-    Returns:
-        Sol 系統（'sol' または '-sol' 末尾）なら True。
-    """
-
-    if konomitv_bs4k_model is None:
-        return False
-    konomitv_bs4k_normalized_model = konomitv_bs4k_model.strip().lower()
-    return (
-        konomitv_bs4k_normalized_model == 'sol' or
-        konomitv_bs4k_normalized_model.endswith('-sol')
-    )
+# version 未記録の設定文書は、ACP 設定分離から schema version 導入前までに保存された形式。
+_ACP_SETTINGS_SCHEMA_VERSION = 1
+_ACP_LEGACY_DEFAULT_TIMEOUT_SEC = 120
+_ACP_DEFAULT_TIMEOUT_SEC = 600
 
 
 def ParseAcpCompositeModel(
@@ -111,10 +78,7 @@ def ParseAcpCompositeModel(
     effort_raw = matched.group('effort')
     if effort_raw is None:
         return model, None
-    effort = _ACP_REASONING_EFFORT_FROM_LOWER.get(effort_raw.lower())
-    if effort is None:
-        raise ValueError('ACP 推論深さの値が不正です。')
-    return model, effort
+    return model, effort_raw.lower()
 
 
 class ACPBackendSettings(BaseModel):
@@ -124,15 +88,16 @@ class ACPBackendSettings(BaseModel):
 
     # プロバイダ種別。正規化に使用し、JSON には保存しない。
     backend_kind: Annotated[ACPBackendKind, Field(exclude=True)] = 'AcpCodex'
-    # Codex のみ使用。Grok は grok-4.5 固定のため常に None へ正規化する。
+    # Codex / Grok とも ACP agent が広告した ID を保存する。Codex は推論深さを ID から分離する。
     model: Annotated[str | None, Field(max_length=255)] = None
-    # Codex: Low…Ultra / Grok: Low…High。未設定時は backend 既定へ補完する。
-    reasoning_effort: Annotated[AcpReasoningEffort | None, Field()] = None
+    # Codex / Grok ACP が広告した opaque ID。未設定時は agent の現在値を使用する。
+    reasoning_effort: Annotated[AcpReasoningEffort | None, Field(max_length=255)] = None
     # KonomiTV-BS4K 固有。Codex の専用 profile へ Fast service tier を設定する。
     codex_fast_mode_enabled: Annotated[bool, Field()] = False
     # 壁時計の総実行上限ではなく、ACP stdio の無通信打ち切り秒数。
     # thought / tool update などの NDJSON 行が届くたびにタイマーはリセットされる。
-    timeout_sec: Annotated[int, Field(ge=30, le=600)] = 120
+    # Web 検索を伴う推論は 120 秒では打ち切られるため、既定を 600 秒へ引き上げる。
+    timeout_sec: Annotated[int, Field(ge=30, le=_ACP_DEFAULT_TIMEOUT_SEC)] = _ACP_DEFAULT_TIMEOUT_SEC
 
     @field_validator('model')
     @classmethod
@@ -146,22 +111,29 @@ class ACPBackendSettings(BaseModel):
             return None
         return model.strip() or None
 
-    @model_validator(mode='after')
-    def normalizeBackendCapabilities(self) -> ACPBackendSettings:
-        """backend ごとの固定能力とプリセット既定を正規化する。
+    @field_validator('reasoning_effort')
+    @classmethod
+    def validateReasoningEffort(cls, reasoning_effort: str | None) -> str | None:
+        """推論深さ ID の空文字を未指定へ正規化する。
 
-        Grok はモデル固定・Fast 無効・推論深さ Low..High のみ。
-        Codex はモデル既定と Ultra の Sol 制約を適用する。
+        Args:
+            reasoning_effort: ACP agent が広告した推論深さ ID。
+
+        Returns:
+            前後空白を除いた ID。空文字または None は None。
         """
 
+        if reasoning_effort is None:
+            return None
+        return reasoning_effort.strip() or None
+
+    @model_validator(mode='after')
+    def normalizeBackendCapabilities(self) -> ACPBackendSettings:
+        """backend ごとの固定能力と旧 Codex モデル形式を正規化する。"""
+
         if self.backend_kind == 'AcpGrok':
-            # Grok Build の ACP は grok-4.5 固定。モデル ID は保存せず深さだけを持つ。
-            self.model = None
+            # Grok のモデル ID は ACP 広告値を opaque に保存し、実行時に session/set_model へ渡す。
             self.codex_fast_mode_enabled = False
-            if self.reasoning_effort is None:
-                self.reasoning_effort = ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND['AcpGrok']
-            if self.reasoning_effort not in _ACP_BASIC_REASONING_EFFORTS:
-                raise ValueError('Grok の推論深さは Low / Medium / High のみです。')
             return self
 
         # 旧 UI の連結 ID を model + effort に分解する。
@@ -174,14 +146,6 @@ class ACPBackendSettings(BaseModel):
 
         if self.model is None:
             self.model = ACP_DEFAULT_MODEL_BY_BACKEND['AcpCodex']
-        if self.reasoning_effort is None:
-            self.reasoning_effort = ACP_DEFAULT_REASONING_EFFORT_BY_BACKEND['AcpCodex']
-        if (
-            self.reasoning_effort == 'Ultra' and
-            IsKonomiTVBS4KCodexSolModel(self.model) is False
-        ):
-            # 旧保存値や直接 API 入力も、非 Sol では Max へ安全に補正する。
-            self.reasoning_effort = 'Max'
         return self
 
 
@@ -258,7 +222,43 @@ class ACPSettingsStore:
             settings_json = json.loads(cls.SETTINGS_PATH.read_text(encoding='utf-8'))
             if isinstance(settings_json, dict) is False:
                 raise ValueError('ACP settings document is invalid.')
-            return ACPSettings.model_validate(settings_json)
+            schema_version = settings_json.pop('schema_version', None)
+            if schema_version not in (None, _ACP_SETTINGS_SCHEMA_VERSION):
+                raise ValueError('ACP settings schema version is unsupported.')
+
+            # schema version 導入前の旧既定値だけを一度更新し、利用者が選んだ他の値は保持する。
+            needs_migration = schema_version is None
+            if needs_migration:
+                settings_json = cls._migrateUnversionedSettingsDocumentLocked(settings_json)
+            settings = ACPSettings.model_validate(settings_json)
+            if needs_migration:
+                cls.saveSettings(settings)
+            return settings
+
+    @classmethod
+    def _migrateUnversionedSettingsDocumentLocked(
+        cls,
+        settings_json: dict[str, object],
+    ) -> dict[str, object]:
+        """schema version 導入前の ACP 設定を現行形式へ移行する。
+
+        Args:
+            settings_json: JSON から読み込んだ version 未記録の設定文書。
+
+        Returns:
+            旧既定値の timeout だけを600秒へ更新した設定文書。
+        """
+
+        migrated = dict(settings_json)
+        # Codex / Grok は独立設定のため、旧既定値を保持する側だけを更新する。
+        for backend_name in ('codex', 'grok'):
+            backend = migrated.get(backend_name)
+            if isinstance(backend, dict) and backend.get('timeout_sec') == _ACP_LEGACY_DEFAULT_TIMEOUT_SEC:
+                migrated[backend_name] = {
+                    **backend,
+                    'timeout_sec': _ACP_DEFAULT_TIMEOUT_SEC,
+                }
+        return migrated
 
     @classmethod
     def _tryMigrateFromRecordedSeriesSettingsLocked(cls) -> ACPSettings | None:
@@ -308,13 +308,14 @@ class ACPSettingsStore:
         if 'acp_timeout_sec' in legacy_raw:
             payload['timeout_sec'] = legacy_raw.get('acp_timeout_sec')
         try:
-            migrated = ACPSettings.model_validate({
+            migrated_payload = cls._migrateUnversionedSettingsDocumentLocked({
                 target_kind: payload,
                 # 移行対象でない側は既定値のまま。
                 'grok' if target_kind == 'codex' else 'codex': {
                     'backend_kind': 'AcpGrok' if target_kind == 'codex' else 'AcpCodex',
                 },
             })
+            migrated = ACPSettings.model_validate(migrated_payload)
         except ValueError:
             return None
         # 移行結果を atomic 保存し、次回以降は acp-settings.json を正本にする。
@@ -338,7 +339,11 @@ class ACPSettingsStore:
 
         with cls._lock:
             validated = ACPSettings.model_validate(settings.model_dump())
-            payload = validated.model_dump(mode='json')
+            # store 固有の schema version は API model に露出させず、永続化時だけ先頭へ付与する。
+            payload = {
+                'schema_version': _ACP_SETTINGS_SCHEMA_VERSION,
+                **validated.model_dump(mode='json'),
+            }
             content = json.dumps(payload, ensure_ascii=False, indent=4) + '\n'
             cls._writeAtomic(cls.SETTINGS_PATH, content)
 

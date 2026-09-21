@@ -4,7 +4,6 @@ import { defineStore } from 'pinia';
 
 import type { IOfflineVideo } from '@/services/OfflineVideos';
 
-import { ITweetCapture } from '@/components/Watch/Panel/Twitter.vue';
 import { ICommentData } from '@/services/player/managers/LiveCommentManager';
 import { IRecordedProgram, IRecordedProgramDefault } from '@/services/Videos';
 import useSettingsStore, {
@@ -32,10 +31,12 @@ export type PlayerEvents = {
         message_delay_seconds?: number;  // メッセージを表示するまでの待機時間 (秒)
         is_error_message?: boolean;  // メッセージをエラーメッセージとして表示するか (既定は true)
         should_resume_quality?: boolean;  // 再起動後に直前の画質を引き継ぐかどうか (既定は true)
+        is_user_initiated?: boolean;  // ユーザー操作による再起動かどうか (既定は false)
         // KonomiTV-BS4K の画質能力 guard が、切替開始前の対応画質を明示的に復元する場合だけ指定する
         konomitv_bs4k_resume_quality?: string;
-        // デコーダー・SourceBuffer の codec pipeline 失敗から自動復旧するときだけ指定する
-        konomitv_bs4k_restart_reason?: 'RuntimeCodecPipelineError';
+        // デコーダー・SourceBuffer の codec pipeline 失敗から自動復旧するとき (RuntimeCodecPipelineError)、または
+        // 帯域不足などによるライブストリーミング接続の喪失から自動復旧するとき (StreamingConnectionLost) だけ指定する
+        konomitv_bs4k_restart_reason?: 'RuntimeCodecPipelineError' | 'StreamingConnectionLost';
     };
     // PlayerController.setControlDisplayTimer() をそのまま呼び出す
     SetControlDisplayTimer: {
@@ -136,9 +137,6 @@ const usePlayerStore = defineStore('player', {
         // ビデオ視聴: 表示されるパネルのタブ
         video_panel_active_tab: useSettingsStore().settings.video_panel_active_tab,
 
-        // パネルの Twitter タブ内で表示されるタブ
-        twitter_active_tab: useSettingsStore().settings.twitter_active_tab,
-
         // リモコンを表示するか
         is_remocon_display: false,
 
@@ -215,6 +213,23 @@ const usePlayerStore = defineStore('player', {
         // SSE から状態を受信するまでの間は null
         is_rain_fallback_broadcasting: null as boolean | null,
 
+        // ライブ視聴: B60 0x8010 の video_transfer_characteristics。SSE 受信までは null
+        b60_video_transfer: null as number | null,
+
+        // ライブ視聴: MH-EIT 現在番組の HDR アイコン。SSE 受信までは null
+        mh_eit_hdr_hint: null as boolean | null,
+
+        // 視聴画面の設定パネルで選んだ一時 HDR 出力。SettingsStore へは書かず、視聴終了で破棄する。
+        // Debug はサーバー debug オン時だけ選べる視聴中 override で、設定へ同期しない。
+        konomitv_bs4k_playback_hdr_output_override: null as 'Auto' | 'HDR' | 'SDR' | 'Debug' | null,
+
+        // mpegts.js が検出した元の transfer_characteristics。HLG=18 / PQ=16。
+        // 録画 HLS では KonomiTVBS4KColorRewriteLoader が fMP4 から検出した値を書き込む
+        sps_transfer_characteristics: null as number | null,
+
+        // 録画 HLS: fMP4 の色信号を安全に書き換えられなかったか。true なら HDR canvas 変換を無効化する
+        konomitv_bs4k_recorded_color_rewrite_unsafe: false,
+
         // ライブ視聴: ニコニコ実況への接続に失敗した際のエラーメッセージ
         // null のとき、エラーは発生していないとみなす
         live_comment_init_failed_message: null as string | null,
@@ -222,22 +237,6 @@ const usePlayerStore = defineStore('player', {
         // ビデオ視聴: 過去ログコメントへの取得に失敗した際のエラーメッセージ
         // null のとき、エラーは発生していないとみなす
         video_comment_init_failed_message: null as string | null,
-
-        // Twitter パネルコンポーネントで利用する、ツイート添付候補のキャプチャのリスト
-        // UI 上と KeyboardShortcutManager の両方から操作する必要があるため PlayerStore に持たせている
-        twitter_captures: [] as ITweetCapture[],
-
-        // Twitter パネルコンポーネントで利用する、ツイートに添付するキャプチャの Blob データのリスト
-        // Twitter パネル本体とキャプチャタブの間で共有するため PlayerStore に持たせている
-        twitter_selected_capture_blobs: [] as Blob[],
-
-        // Twitter パネルコンポーネントで利用する、キャプチャを拡大表示するモーダルの表示状態
-        // UI 上と KeyboardShortcutManager の両方から操作する必要があるため PlayerStore に持たせている
-        twitter_zoom_capture_modal: false,
-
-        // Twitter パネルコンポーネントで利用する、現在モーダルで拡大表示中のキャプチャ
-        // UI 上と KeyboardShortcutManager の両方から操作する必要があるため PlayerStore に持たせている
-        twitter_zoom_capture: null as ITweetCapture | null,
     }),
     actions: {
 
@@ -286,7 +285,6 @@ const usePlayerStore = defineStore('player', {
             })();
             this.tv_panel_active_tab = useSettingsStore().settings.tv_panel_active_tab;
             this.video_panel_active_tab = useSettingsStore().settings.video_panel_active_tab;
-            this.twitter_active_tab = useSettingsStore().settings.twitter_active_tab;
             this.is_remocon_display = false;
             this.is_zapping = false;
             this.is_player_setting_panel_open = false;
@@ -304,10 +302,12 @@ const usePlayerStore = defineStore('player', {
             this.live_stream_status = null;
             this.is_rain_fallback = null;
             this.is_rain_fallback_broadcasting = null;
+            this.b60_video_transfer = null;
+            this.mh_eit_hdr_hint = null;
+            this.konomitv_bs4k_playback_hdr_output_override = null;
+            this.sps_transfer_characteristics = null;
+            this.konomitv_bs4k_recorded_color_rewrite_unsafe = false;
             this.live_comment_init_failed_message = null;
-            this.twitter_captures = [];
-            this.twitter_zoom_capture_modal = false;
-            this.twitter_zoom_capture = null;
         }
     }
 });

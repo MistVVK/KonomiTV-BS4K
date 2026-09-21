@@ -440,8 +440,8 @@ class AIBackendSettingsStore:
     SETTINGS_PATH = DATA_DIR / 'ai-backend-settings.json'
     SECRETS_PATH = DATA_DIR / 'secrets' / 'ai-api-keys.json'
 
+    # 件数では制限せず、秘密ファイル全体の byte 上限で異常な入力サイズだけを拒否する。
     _SECRETS_MAX_BYTES = 256 * 1024
-    _SECRETS_MAX_ENTRIES = 64
     _API_KEY_MAX_LENGTH = 8192
     _lock = threading.RLock()
 
@@ -623,22 +623,43 @@ class AIBackendSettingsStore:
             return removed
 
     @classmethod
-    def setOAuthConnected(cls, service_id: str, connected: bool) -> AIBackendService:
-        """OAuth 接続フラグだけを更新する。"""
+    def setOAuthProviderDisconnected(cls, provider_id: str) -> None:
+        """同一 provider を参照する全 OAuth service を1回の保存で切断済みにする。
+
+        Args:
+            provider_id: OpenCode auth entry と対応する provider ID。
+
+        Returns:
+            None
+
+        Raises:
+            KeyError: 対応する OAuth service が存在しない場合。
+        """
 
         with cls._lock:
             document = cls.getDocument()
-            normalized = service_id.strip().lower()
+            normalized = provider_id.strip().lower()
+            matched = False
+            changed = False
             for index, service in enumerate(document.services):
-                if service.service_id != normalized:
+                if (
+                    service.opencode_provider_id != normalized
+                    or service.auth_mode != 'OAuthSubscription'
+                ):
+                    continue
+                matched = True
+                if service.oauth_connected is False:
                     continue
                 data = service.model_dump()
-                data['oauth_connected'] = connected
+                data['oauth_connected'] = False
                 updated = AIBackendService.model_validate(data)
                 document.services[index] = updated
+                changed = True
+            if matched is False:
+                raise KeyError(normalized)
+            if changed:
+                document = AIBackendSettingsDocument.model_validate(document.model_dump())
                 cls.saveDocument(document)
-                return updated
-            raise KeyError(normalized)
 
     # ----- secrets -----
 
@@ -670,8 +691,6 @@ class AIBackendSettingsStore:
         # 旧 recorded-series-api.key 形式を拒否
         if set(data.keys()) == {'api_base_url', 'api_key'}:
             raise cls._invalidSecrets()
-        if len(data) > cls._SECRETS_MAX_ENTRIES:
-            raise cls._invalidSecrets()
         result: dict[str, str] = {}
         for raw_id, raw_key in data.items():
             if isinstance(raw_id, str) is False or isinstance(raw_key, str) is False:
@@ -696,8 +715,6 @@ class AIBackendSettingsStore:
                 cls.SECRETS_PATH.unlink()
                 cls._fsyncParentDirectory(cls.SECRETS_PATH)
             return
-        if len(secrets_map) > cls._SECRETS_MAX_ENTRIES:
-            raise cls._invalidSecrets()
         content = json.dumps(secrets_map, ensure_ascii=False, indent=4) + '\n'
         if len(content.encode('utf-8')) > cls._SECRETS_MAX_BYTES:
             raise cls._invalidSecrets()
@@ -755,7 +772,9 @@ class AIBackendSettingsStore:
         if service.auth_mode == 'ApiKey':
             return cls.hasAPIKey(service.service_id)
         if service.auth_mode == 'OAuthSubscription':
-            return service.oauth_connected
+            # OpenCode auth は provider-scoped なので、永続 flag ではなく実在する entry を正本にする。
+            from app.metadata.ai.opencode_cli import HasStoredOpenCodeAuth
+            return HasStoredOpenCodeAuth(service.opencode_provider_id, auth_type='oauth')
         if service.auth_mode == 'VertexAdc':
             return service.google_cloud_project is not None
         if service.auth_mode == 'NoneLocal':
@@ -766,9 +785,14 @@ class AIBackendSettingsStore:
     def toResponse(cls, service: AIBackendService) -> AIBackendServiceResponse:
         """秘密を含まない応答モデルへ変換する。"""
 
+        auth_configured = cls.isAuthConfigured(service)
+        response_service = service
+        if service.auth_mode == 'OAuthSubscription':
+            # 手動配置 token も UI へ接続済みとして示し、切断操作を必ず公開する。
+            response_service = service.model_copy(update={'oauth_connected': auth_configured})
         return AIBackendServiceResponse(
-            **service.model_dump(),
-            auth_configured=cls.isAuthConfigured(service),
+            **response_service.model_dump(),
+            auth_configured=auth_configured,
             episode_lookup_ready=False,
         )
 

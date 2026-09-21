@@ -4,12 +4,24 @@ import APIClient from '@/services/APIClient';
 
 
 /** 録画シリーズが選択できる AI バックエンド。OpenCode は AIBackend service_id を参照する。 */
-export type AIBackendKind = 'OpenCode' | 'AcpCodex' | 'AcpGrok';
+export type AIBackendKind = 'OpenCode' | 'OpenAICompatible' | 'OpenAICompatible2' | 'AcpCodex' | 'AcpGrok';
 /** 主系 AI 失敗後の回復方針。既定は追加試行なしの Fail。 */
 export type AIFailureRecoveryStrategy = 'FallbackBackend' | 'RetrySameBackend' | 'Fail';
+/** シリーズメタデータの外部ソース。TMDb と Bangumi (bgm.tv) の併用可否を選ぶ。 */
+export type ExternalMetadataSource = 'TmdbAndBangumi' | 'TmdbOnly' | 'BangumiOnly' | 'None';
 export type EpisodeLookupOutcome =
     'Pending' | 'Resolved' | 'NotNumbered' | 'NoPublishedNumber' | 'InsufficientEvidence' | 'SearchFailed' |
     'SearchNotRun' | 'InvalidModelOutput' | 'Disabled' | 'RateLimited' | 'Cancelled';
+
+
+/** TMDb 接続試験の結果。API キー本体は含まれない。 */
+export interface ITmdbConnectionTestResult {
+    success: boolean;
+    latency_ms: number;
+    message: string;
+    http_status: number | null;
+    error_code: string | null;
+}
 
 
 /** 録画シリーズ判定のサーバー共有設定。AI 接続・認証・モデルは AI バックエンド側が正本。 */
@@ -33,6 +45,12 @@ export interface IRecordedSeriesSettings {
     ai_fallback_backend_service_name: string | null;
     // 予備 OpenCode / ACP バックエンドに利用可能な認証があるか。
     ai_fallback_backend_auth_configured: boolean;
+    // シリーズメタデータの外部ソース。既定は TMDb と Bangumi の併用。
+    external_metadata_source: ExternalMetadataSource;
+    // TMDb API キーがサーバーの Fernet ストアに保存済みか。キー本体は返らない。
+    tmdb_api_key_configured: boolean;
+    // TMDb API キーのマスク表示。未設定時は null。
+    tmdb_api_key_masked: string | null;
 }
 
 /** 録画シリーズ判定設定の更新リクエスト。 */
@@ -44,26 +62,37 @@ export interface IRecordedSeriesSettingsUpdate {
     ai_failure_recovery_strategy: AIFailureRecoveryStrategy;
     ai_fallback_backend: AIBackendKind | null;
     ai_fallback_backend_service_id: string | null;
+    external_metadata_source: ExternalMetadataSource;
 }
 
 /** 録画シリーズ判定の全体状況。 */
 export interface IRecordedSeriesStatus {
     total: number;
-    pending: number;
-    resolved: number;
-    not_series: number;
-    needs_review: number;
-    failed: number;
+    assigned: number;
+    unassigned: number;
     episode_resolved: number;
     episode_unknown: number;
     episode_not_numbered: number;
     episode_no_published_number: number;
     episode_needs_review: number;
     episode_failed: number;
-    last_run_at: string | null;
     episode_last_run_at: string | null;
     is_running: boolean;
     is_episode_running: boolean;
+}
+
+/** シリーズ DB 削除で消した表ごとの行数。録画本体は含まない。 */
+export interface IRecordedSeriesDatabaseDeleteResult {
+    series: number;
+    series_episodes: number;
+    series_aliases: number;
+    series_broadcast_periods: number;
+    series_ai_fallbacks: number;
+    recorded_series_rules: number;
+    recorded_series_resolutions: number;
+    recorded_series_ai_requests: number;
+    recorded_episode_resolutions: number;
+    bangumi_episode_completions: number;
 }
 
 /** 管理画面の一覧に表示する、録画シリーズの軽量な集計情報。 */
@@ -86,28 +115,6 @@ export interface IRecordedSeriesManagementList {
     items: IRecordedSeriesManagementItem[];
 }
 
-/** 録画シリーズの表示情報を管理者が編集するときのリクエスト。 */
-export interface IRecordedSeriesManagementUpdate {
-    title: string;
-    description: string;
-    expected_title: string;
-    expected_description: string;
-}
-
-/** 録画シリーズの表示情報を更新した結果。 */
-export type IRecordedSeriesManagementUpdateResult =
-    | {type: 'Success'}
-    | {type: 'Stale'}
-    | {type: 'Conflict'}
-    | {type: 'Busy'}
-    | {type: 'Error'};
-
-/** 管理者が録画番組のシリーズ割り当てを訂正するときのリクエスト。 */
-export type IRecordedSeriesAssignment =
-    | {decision: 'Series'; series_id: number}
-    | {decision: 'Series'; series_title: string}
-    | {decision: 'NotSeries'};
-
 /** 管理画面でシリーズへ割り当て直せる、シリーズ未所属の再生可能録画。 */
 export interface IRecordedSeriesStandaloneProgram {
     recorded_program_id: number;
@@ -116,8 +123,6 @@ export interface IRecordedSeriesStandaloneProgram {
     start_time: string;
     channel_id: string | null;
     channel_name: string | null;
-    resolution_status: 'Pending' | 'Resolved' | 'NotSeries' | 'NeedsReview' | 'Failed' | null;
-    resolution_source: 'Rule' | 'Local' | 'EPG' | 'MediaWiki' | 'AI' | 'Manual' | null;
 }
 
 /** シリーズ未所属録画のページング一覧。 */
@@ -184,60 +189,7 @@ export interface IRecordedEpisodeAssignmentList {
     programs: IRecordedEpisodeAssignmentProgram[];
 }
 
-/** 管理者が録画の話数を手動訂正するときの、楽観ロック付きリクエスト。 */
-export type IRecordedEpisodeAssignmentUpdate =
-    | {
-        decision: 'ExistingEpisode';
-        expected_series_id: number;
-        expected_series_episode_id: number | null;
-        episode_id: number;
-    }
-    | {
-        decision: 'StructuredEpisode';
-        expected_series_id: number;
-        expected_series_episode_id: number | null;
-        season_number: number;
-        episode_number: string;
-    }
-    | {
-        decision: 'Unknown';
-        expected_series_id: number;
-        expected_series_episode_id: number | null;
-    }
-    | {
-        decision: 'NoPublishedNumber' | 'NotNumbered';
-        expected_series_id: number;
-        expected_series_episode_id: number | null;
-        season_number: number | null;
-    }
-    | {
-        decision: 'AdoptAI';
-        expected_series_id: number;
-        expected_series_episode_id: number | null;
-    };
 
-/** 手動話数訂正の更新結果。 */
-export type IRecordedEpisodeAssignmentUpdateResult =
-    | {type: 'Success'}
-    | {type: 'Stale'}
-    | {type: 'NotFound'}
-    | {type: 'Error'};
-
-/** 管理者が録画1件の AI 話数再検索を明示的に開始するときの楽観ロック付きリクエスト。 */
-export interface IRecordedEpisodeRelookupRequest {
-    expected_series_id: number;
-    expected_series_episode_id: number | null;
-    override_manual: boolean;
-}
-
-/** AI 話数再検索の開始結果。HTTP エラーは UI が安全な固定文言へ変換できる粒度に限定する。 */
-export type IRecordedEpisodeRelookupResult =
-    | {type: 'Accepted'; task: IAnalysisTaskAccepted}
-    | {type: 'NotFound'}
-    | {type: 'Conflict'}
-    | {type: 'RateLimited'}
-    | {type: 'Unavailable'}
-    | {type: 'Error'};
 
 
 /** 録画シリーズ判定の設定・接続確認・一括判定 API。 */
@@ -261,6 +213,41 @@ export default class RecordedSeries {
             return false;
         }
         return true;
+    }
+
+    /** TMDb API キーをサーバーの Fernet ストアへ保存する。 */
+    static async setTmdbAPIKey(api_key: string): Promise<boolean> {
+        const response = await APIClient.put('/recorded-series/settings/tmdb-api-key', {api_key});
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'TMDb API キーを設定できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** 保存済みの TMDb API キーを削除する。既存の TMDb メタデータは残る。 */
+    static async deleteTmdbAPIKey(): Promise<boolean> {
+        const response = await APIClient.delete('/recorded-series/settings/tmdb-api-key');
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'TMDb API キーを削除できませんでした。');
+            return false;
+        }
+        return true;
+    }
+
+    /** 保存済み TMDb API キーで TMDb へ実通信し、成否を取得する。 */
+    static async testTmdbConnection(): Promise<ITmdbConnectionTestResult | null> {
+        const response = await APIClient.post<ITmdbConnectionTestResult>(
+            '/recorded-series/settings/tmdb-connection-test',
+            undefined,
+            // サーバー側の TMDb タイムアウト 10 秒に余裕を持たせる。
+            {timeout: 30 * 1000},
+        );
+        if (response.type === 'error') {
+            APIClient.showGenericError(response, 'TMDb の接続試験を実行できませんでした。');
+            return null;
+        }
+        return response.data;
     }
 
     /** 録画シリーズ判定の件数・実行状況を取得する。 */
@@ -298,45 +285,6 @@ export default class RecordedSeries {
         return response.data;
     }
 
-    /** 管理者向けの録画シリーズ1件を最新状態で取得する。 */
-    static async fetchManagementSeries(
-        series_id: number,
-        show_error = true,
-    ): Promise<IRecordedSeriesManagementItem | null> {
-        const response = await APIClient.get<IRecordedSeriesManagementItem>(`/recorded-series/series/${series_id}`);
-        if (response.type === 'error') {
-            if (show_error) {
-                APIClient.showGenericError(response, '録画シリーズ情報を取得できませんでした。');
-            }
-            return null;
-        }
-        return response.data;
-    }
-
-    /** 録画シリーズのタイトルと説明を更新する。 */
-    static async updateManagementSeries(
-        series_id: number,
-        update: IRecordedSeriesManagementUpdate,
-    ): Promise<IRecordedSeriesManagementUpdateResult> {
-        const response = await APIClient.put(
-            `/recorded-series/series/${series_id}`,
-            update,
-        );
-        if (response.type === 'error') {
-            if (response.status === 409) {
-                if (response.data.detail === 'Recorded series metadata was updated by another request.') {
-                    return {type: 'Stale'};
-                }
-                return {type: 'Conflict'};
-            }
-            if (response.status === 503) return {type: 'Busy'};
-
-            APIClient.showGenericError(response, '録画シリーズを更新できませんでした。');
-            return {type: 'Error'};
-        }
-        return {type: 'Success'};
-    }
-
     /** 管理者向けに、Series 内の構造化話数候補と録画ごとの割当を取得する。 */
     static async fetchEpisodeAssignments(
         series_id: number,
@@ -354,85 +302,24 @@ export default class RecordedSeries {
         return response.data;
     }
 
-    /** 録画の構造化話数を、読み込み時点の割当を確認して手動更新する。 */
-    static async updateEpisodeAssignment(
-        recorded_program_id: number,
-        update: IRecordedEpisodeAssignmentUpdate,
-    ): Promise<IRecordedEpisodeAssignmentUpdateResult> {
-        const response = await APIClient.put(
-            `/recorded-series/programs/${recorded_program_id}/episode-assignment`,
-            update,
-        );
+    /** 指定範囲の Indexer・AI 補完・外部同期・話数判定を単一履歴で開始する。 */
+    static async startPipeline(scope: 'Unresolved' | 'All'): Promise<IAnalysisTaskAccepted | null> {
+        const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/pipeline', {scope});
         if (response.type === 'error') {
-            if (response.status === 404) return {type: 'NotFound'};
-            if (response.status === 409) return {type: 'Stale'};
-
-            APIClient.showGenericError(response, '録画の話数を訂正できませんでした。');
-            return {type: 'Error'};
-        }
-        return {type: 'Success'};
-    }
-
-    /** 録画1件の AI 話数再検索を開始し、完了を待たず AnalysisTask の識別子を返す。 */
-    static async startEpisodeRelookup(
-        recorded_program_id: number,
-        request: IRecordedEpisodeRelookupRequest,
-    ): Promise<IRecordedEpisodeRelookupResult> {
-        const response = await APIClient.post<IAnalysisTaskAccepted>(
-            `/recorded-series/programs/${recorded_program_id}/episode-relookup`,
-            request,
-        );
-        if (response.type === 'error') {
-            if (response.status === 404) return {type: 'NotFound'};
-            if (response.status === 409) {
-                if (response.data.detail === 'AI episode number search is not available with the current settings.') {
-                    return {type: 'Unavailable'};
-                }
-                return {type: 'Conflict'};
-            }
-            if (response.status === 429) return {type: 'RateLimited'};
-            if (response.status === 503) return {type: 'Unavailable'};
-
-            APIClient.showGenericError(response, '録画の話数を AI で再検索できませんでした。');
-            return {type: 'Error'};
-        }
-        return {type: 'Accepted', task: response.data};
-    }
-
-    /** 既存録画のシリーズ判定を開始する。force 時は確定済みも再判定する。 */
-    static async startBackfill(force = false): Promise<IAnalysisTaskAccepted | null> {
-        const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/backfill', {force});
-        if (response.type === 'error') {
-            APIClient.showGenericError(response, '既存録画のシリーズ判定を開始できませんでした。');
+            APIClient.showGenericError(response, '録画のシリーズ・話数一括判定を開始できませんでした。');
             return null;
         }
         return response.data;
     }
 
-    /** 既存録画の話数判定を開始する。force 時は自動判定済みの結果も再判定する。 */
-    static async startEpisodeBackfill(force = false): Promise<IAnalysisTaskAccepted | null> {
-        const response = await APIClient.post<IAnalysisTaskAccepted>('/recorded-series/episodes/backfill', {force});
+    /** シリーズ関連データだけを削除する。録画本体・サムネイル・CM・履歴は残る。 */
+    static async deleteSeriesDatabase(): Promise<IRecordedSeriesDatabaseDeleteResult | null> {
+        const response = await APIClient.delete<IRecordedSeriesDatabaseDeleteResult>('/recorded-series/database');
         if (response.type === 'error') {
-            APIClient.showGenericError(response, '既存録画の話数判定を開始できませんでした。');
+            APIClient.showGenericError(response, 'シリーズデータベースを削除できませんでした。');
             return null;
         }
         return response.data;
-    }
-
-    /** 録画番組を既存・新規シリーズへ割り当てるか、単発番組へ訂正する。 */
-    static async updateProgramAssignment(
-        recorded_program_id: number,
-        assignment: IRecordedSeriesAssignment,
-    ): Promise<boolean> {
-        const response = await APIClient.put(
-            `/recorded-series/programs/${recorded_program_id}/assignment`,
-            assignment,
-        );
-        if (response.type === 'error') {
-            APIClient.showGenericError(response, '録画番組のシリーズを訂正できませんでした。');
-            return false;
-        }
-        return true;
     }
 
     /** 管理画面向けに、シリーズ未所属の再生可能録画をページング取得する。 */

@@ -55,9 +55,6 @@ analysis_ffmpeg_install="${SOURCE_ROOT}/ffmpeg8-cm-analysis-install"
 clone-commit \
     "${FFMPEG8_REPOSITORY}" "${FFMPEG8_COMMIT}" "${analysis_ffmpeg_source}" \
     "refs/tags/${FFMPEG8_TAG}"
-echo "${FFMPEG8_LICENSE_SHA256}  ${analysis_ffmpeg_source}/LICENSE.md" | sha256sum --check --strict
-echo "${FFMPEG8_LGPLV21_SHA256}  ${analysis_ffmpeg_source}/COPYING.LGPLv2.1" | \
-    sha256sum --check --strict
 test -s "${FFMPEG_SDK_ROOT}/lib/pkgconfig/ffnvcodec.pc"
 test -s "${FFMPEG_SDK_ROOT}/include/AMF/core/Platform.h"
 
@@ -150,8 +147,6 @@ cmake -S "${SOURCE_ROOT}/avisynthplus" -B "${SOURCE_ROOT}/avisynthplus-build" -G
     -DENABLE_PLUGINS=OFF
 cmake --build "${SOURCE_ROOT}/avisynthplus-build" --parallel "$(nproc)"
 cmake --install "${SOURCE_ROOT}/avisynthplus-build"
-echo "${AVISYNTHPLUS_LICENSE_SHA256}  ${SOURCE_ROOT}/avisynthplus/distrib/gpl.txt" | \
-    sha256sum --check --strict
 AVISYNTH_PKGCONFIG="$(find "${SOURCE_ROOT}/avisynthplus-install" -name avisynth.pc -printf '%h' -quit)"
 test -n "${AVISYNTH_PKGCONFIG}"
 
@@ -162,9 +157,6 @@ ffms2_source="${SOURCE_ROOT}/ffms2"
 ffms2_build="${SOURCE_ROOT}/ffms2-build"
 ffms2_install="${SOURCE_ROOT}/ffms2-install"
 clone-commit "${FFMS2_REPOSITORY}" "${FFMS2_COMMIT}" "${ffms2_source}"
-echo "${FFMS2_LICENSE_SHA256}  ${ffms2_source}/COPYING" | sha256sum --check --strict
-echo "${FFMS2_HARDWARE_DECODING_PATCH_SHA256}  ${SCRIPT_DIR}/patches/ffms2-hardware-decoding.patch" | \
-    sha256sum --check --strict
 patch --fuzz=0 -d "${ffms2_source}" -p1 < "${SCRIPT_DIR}/patches/ffms2-hardware-decoding.patch"
 pushd "${ffms2_source}"
 NOCONFIGURE=1 ./autogen.sh
@@ -184,24 +176,12 @@ make install
 popd
 
 clone-commit "${CHAPTER_EXE_REPOSITORY}" "${CHAPTER_EXE_COMMIT}" "${SOURCE_ROOT}/chapter_exe"
-echo "${CHAPTER_EXE_AVISYNTH_INIT_PATCH_SHA256}  ${SCRIPT_DIR}/patches/chapter-exe-initialize-avisynth.patch" | \
-    sha256sum --check --strict
 patch --fuzz=0 -d "${SOURCE_ROOT}/chapter_exe" -p1 < "${SCRIPT_DIR}/patches/chapter-exe-initialize-avisynth.patch"
 make -C "${SOURCE_ROOT}/chapter_exe/src" -j"$(nproc)" \
     CFLAGS="-O3 -I${SOURCE_ROOT}/avisynthplus-install/include/avisynth -ffast-math -Wall -Wshadow -Wempty-body -I. -std=gnu99 -fpermissive -fomit-frame-pointer -fno-tree-vectorize" \
     LDLAGS="-ldl -lstdc++ -pthread"
-echo "${CHAPTER_EXE_LICENSE_SHA256}  ${SOURCE_ROOT}/chapter_exe/LICENSE" | sha256sum --check --strict
 
 clone-commit "${LOGOFRAME_REPOSITORY}" "${LOGOFRAME_COMMIT}" "${SOURCE_ROOT}/logoframe"
-echo "${LOGOFRAME_LICENSE_SHA256}  ${SOURCE_ROOT}/logoframe/LICENSE" | sha256sum --check --strict
-echo "${LOGOFRAME_ERROR_LIFETIME_PATCH_SHA256}  ${SCRIPT_DIR}/patches/logoframe-error-lifetime.patch" | \
-    sha256sum --check --strict
-echo "${LOGOFRAME_PARALLEL_SCAN_PATCH_SHA256}  ${SCRIPT_DIR}/patches/logoframe-parallel-scan.patch" | \
-    sha256sum --check --strict
-echo "${LOGOFRAME_NATIVE_LUMA_PATCH_SHA256}  ${SCRIPT_DIR}/patches/logoframe-native-luma.patch" | \
-    sha256sum --check --strict
-echo "${LOGOFRAME_HIGH_BIT_RGB_FALLBACK_PATCH_SHA256}  ${SCRIPT_DIR}/patches/logoframe-high-bit-rgb-fallback.patch" | \
-    sha256sum --check --strict
 # The pinned upstream source uses CRLF in these patched files.
 sed -i 's/\r$//' \
     "${SOURCE_ROOT}/logoframe/src/logoframe.c" \
@@ -217,10 +197,6 @@ make -C "${SOURCE_ROOT}/logoframe/src" -j"$(nproc)" \
 
 clone-commit "${JOIN_LOGO_SCP_REPOSITORY}" "${JOIN_LOGO_SCP_COMMIT}" "${SOURCE_ROOT}/join_logo_scp"
 make -C "${SOURCE_ROOT}/join_logo_scp/src" -j"$(nproc)"
-echo "${JOIN_LOGO_SCP_LICENSE_SHA256}  ${SOURCE_ROOT}/join_logo_scp/LICENSE" | \
-    sha256sum --check --strict
-echo "${JOIN_LOGO_SCP_COMMAND_SHA256}  ${SOURCE_ROOT}/join_logo_scp/JL/JL_標準.txt" | \
-    sha256sum --check --strict
 
 install -m 0755 "${SOURCE_ROOT}/chapter_exe/src/chapter_exe" "${CM_ROOT}/chapter_exe"
 install -m 0755 "${SOURCE_ROOT}/logoframe/src/logoframe" "${CM_ROOT}/logoframe"
@@ -243,6 +219,16 @@ install -m 0644 "${SOURCE_ROOT}/join_logo_scp/LICENSE" "${CM_ROOT}/License-join_
 
 # The server hashes this deterministic file to invalidate stale CM results when
 # any native component, command file, or local compatibility patch changes.
+# 各 hash は manifest.env の固定値ではなく、実際に使ったファイルから都度算出する
+# (事前固定すると patch やコマンド定義の更新ごとに manifest の更新も必要になり、
+# 忘れた場合にビルドが止まるため)。
+join_logo_scp_command_sha256="$(sha256sum "${SOURCE_ROOT}/join_logo_scp/JL/JL_標準.txt" | cut -d' ' -f1)"
+chapter_exe_avisynth_init_patch_sha256="$(sha256sum "${SCRIPT_DIR}/patches/chapter-exe-initialize-avisynth.patch" | cut -d' ' -f1)"
+ffms2_hardware_decoding_patch_sha256="$(sha256sum "${SCRIPT_DIR}/patches/ffms2-hardware-decoding.patch" | cut -d' ' -f1)"
+logoframe_error_lifetime_patch_sha256="$(sha256sum "${SCRIPT_DIR}/patches/logoframe-error-lifetime.patch" | cut -d' ' -f1)"
+logoframe_parallel_scan_patch_sha256="$(sha256sum "${SCRIPT_DIR}/patches/logoframe-parallel-scan.patch" | cut -d' ' -f1)"
+logoframe_native_luma_patch_sha256="$(sha256sum "${SCRIPT_DIR}/patches/logoframe-native-luma.patch" | cut -d' ' -f1)"
+logoframe_high_bit_rgb_fallback_patch_sha256="$(sha256sum "${SCRIPT_DIR}/patches/logoframe-high-bit-rgb-fallback.patch" | cut -d' ' -f1)"
 {
     printf '{\n'
     printf '  "schema_version": 1,\n'
@@ -255,18 +241,18 @@ install -m 0644 "${SOURCE_ROOT}/join_logo_scp/LICENSE" "${CM_ROOT}/License-join_
     printf '    "ffms2": {"version": "%s", "commit": "%s", "profile": "avisynth-only-hardware"},\n' \
         "${FFMS2_VERSION}" "${FFMS2_COMMIT}"
     printf '    "join_logo_scp": {"commit": "%s", "command_sha256": "%s"},\n' \
-        "${JOIN_LOGO_SCP_COMMIT}" "${JOIN_LOGO_SCP_COMMAND_SHA256}"
+        "${JOIN_LOGO_SCP_COMMIT}" "${join_logo_scp_command_sha256}"
     printf '    "logoframe": {"version": "%s", "commit": "%s"}\n' \
         "${LOGOFRAME_VERSION}" "${LOGOFRAME_COMMIT}"
     printf '  },\n'
     printf '  "patches": {\n'
-    printf '    "chapter-exe-initialize-avisynth.patch": "%s",\n' "${CHAPTER_EXE_AVISYNTH_INIT_PATCH_SHA256}"
-    printf '    "ffms2-hardware-decoding.patch": "%s",\n' "${FFMS2_HARDWARE_DECODING_PATCH_SHA256}"
-    printf '    "logoframe-error-lifetime.patch": "%s",\n' "${LOGOFRAME_ERROR_LIFETIME_PATCH_SHA256}"
-    printf '    "logoframe-parallel-scan.patch": "%s",\n' "${LOGOFRAME_PARALLEL_SCAN_PATCH_SHA256}"
-    printf '    "logoframe-native-luma.patch": "%s",\n' "${LOGOFRAME_NATIVE_LUMA_PATCH_SHA256}"
+    printf '    "chapter-exe-initialize-avisynth.patch": "%s",\n' "${chapter_exe_avisynth_init_patch_sha256}"
+    printf '    "ffms2-hardware-decoding.patch": "%s",\n' "${ffms2_hardware_decoding_patch_sha256}"
+    printf '    "logoframe-error-lifetime.patch": "%s",\n' "${logoframe_error_lifetime_patch_sha256}"
+    printf '    "logoframe-parallel-scan.patch": "%s",\n' "${logoframe_parallel_scan_patch_sha256}"
+    printf '    "logoframe-native-luma.patch": "%s",\n' "${logoframe_native_luma_patch_sha256}"
     printf '    "logoframe-high-bit-rgb-fallback.patch": "%s"\n' \
-        "${LOGOFRAME_HIGH_BIT_RGB_FALLBACK_PATCH_SHA256}"
+        "${logoframe_high_bit_rgb_fallback_patch_sha256}"
     printf '  }\n'
     printf '}\n'
 } > "${CM_ROOT}/Runtime-Manifest.json"

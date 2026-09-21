@@ -5,10 +5,12 @@
             <Navigation />
             <div class="videos-home-container-wrapper">
                 <SPHeaderBar />
+                <KonomiTVBS4KVideoSectionTabs />
                 <div class="videos-home-container">
                     <Breadcrumbs :crumbs="[
                         { name: 'ホーム', path: '/' },
-                        { name: 'ビデオをみる', path: '/videos/', disabled: true },
+                        { name: 'ビデオをみる', path: '/videos/' },
+                        { name: 'ビデオ', path: '/videos/', disabled: true },
                     ]" />
                     <RecordedProgramList
                         class="videos-home-container__recent-programs"
@@ -62,6 +64,7 @@ import { onMounted, ref, onUnmounted, watch } from 'vue';
 
 import Breadcrumbs from '@/components/Breadcrumbs.vue';
 import HeaderBar from '@/components/HeaderBar.vue';
+import KonomiTVBS4KVideoSectionTabs from '@/components/KonomiTVBS4KVideoSectionTabs.vue';
 import Navigation from '@/components/Navigation.vue';
 import SPHeaderBar from '@/components/SPHeaderBar.vue';
 import RecordedProgramList from '@/components/Videos/RecordedProgramList.vue';

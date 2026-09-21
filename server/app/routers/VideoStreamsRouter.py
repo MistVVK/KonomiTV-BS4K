@@ -3,6 +3,7 @@ import asyncio
 import json
 import math
 import uuid
+from dataclasses import replace
 from typing import Annotated, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request, status
@@ -11,6 +12,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from app import logging, schemas
 from app.config import Config
+from app.constants import QUALITY_TYPES
 from app.metadata.RecordedPlaybackIndex import IsRecordedPlaybackIndexReady
 from app.metadata.RecordedPlaybackIndexer import RecordedPlaybackIndexer
 from app.models.RecordedProgram import RecordedProgram
@@ -34,6 +36,7 @@ from app.streams.KonomiTVBS4KPlaybackEncoding import (
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
 from app.streams.RecordedSubtitleStream import RecordedSubtitleStream
 from app.streams.StreamEncodingOptions import (
+    RequireEncodedQuality,
     SplitQualityAndEncodingOptions,
     StreamQualityWithOptions,
 )
@@ -47,6 +50,15 @@ router = APIRouter(
 )
 
 VideoBitDepthQuery = KonomiTVBS4KVideoBitDepthQuery
+# M3U8 の URI へ埋め込む値なので、全 HTTP 入口で改行や URI 区切り文字を拒否する。
+CacheKeyQuery = Annotated[
+    str | None,
+    Query(
+        description='キャッシュ制御用のキー。',
+        pattern=r'^[0-9A-Za-z_-]{1,64}$',
+    ),
+]
+
 
 def SetTSCodecBridgeProcessCounterHeaders(response: Response) -> None:
     """互換API隔離の前後で比較するBridge process世代と用途別回数を設定する。"""
@@ -80,11 +92,12 @@ def GetRecordedStream(
         return RecordedFMP4Stream(
             session_id,
             recorded_program,
-            stream_quality.quality,
+            RequireEncodedQuality(stream_quality.quality),
             encoding_options=stream_quality.encoding_options,
             is_new_session_allowed=False,
             client_key=client_key,
             is_offline_continuous=is_offline_continuous,
+            cm_skip_aware=stream_quality.cm_skip_aware,
         )
     if IsRecordedPlaybackIndexReady(
         recorded_program.recorded_video.playback_index_status,
@@ -100,11 +113,12 @@ def GetRecordedStream(
     return RecordedFMP4Stream(
         session_id,
         recorded_program,
-        stream_quality.quality,
+        RequireEncodedQuality(stream_quality.quality),
         stream_quality.encoding_options,
         is_new_session_allowed=is_new_session_allowed,
         client_key=client_key,
         is_offline_continuous=is_offline_continuous,
+        cm_skip_aware=stream_quality.cm_skip_aware,
     )
 
 
@@ -247,6 +261,10 @@ async def KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
         bool,
         Query(description='映像SourceBufferを使う再生対象かどうか。'),
     ],
+    quality: Annotated[
+        QUALITY_TYPES | None,
+        Query(description='録画再生で実際に生成する画質。ライブでは省略可能。'),
+    ] = None,
 ) -> schemas.KonomiTVBS4KPlaybackCapabilities:
     """再生開始に必要なexact行とAVC/AAC互換fallback行だけを返す。"""
 
@@ -254,14 +272,25 @@ async def KonomiTVBS4KTargetedPlaybackCapabilitiesAPI(
         tuple[KonomiTVBS4KVideoBitDepth, ...],
         tuple(int(value) for value in video_bit_depths.split(',')),
     )
-    capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
-        encoder,
-        playback_mode,
-        video_codec,
-        parsed_video_bit_depths,
-        audio_codec,
-        has_video,
-    )
+    if quality is None:
+        capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
+            encoder,
+            playback_mode,
+            video_codec,
+            parsed_video_bit_depths,
+            audio_codec,
+            has_video,
+        )
+    else:
+        capabilities = await KonomiTVBS4KPlaybackCapabilityProbe.getTargetedCapabilities(
+            encoder,
+            playback_mode,
+            video_codec,
+            parsed_video_bit_depths,
+            audio_codec,
+            has_video,
+            quality,
+        )
     SetTSCodecBridgeProcessCounterHeaders(response)
     return schemas.KonomiTVBS4KPlaybackCapabilities(
         video = [
@@ -315,6 +344,13 @@ async def ValidateVideoID(video_id: Annotated[int, Path(description='録画番�
             detail = 'Specified video_id was not found',
         )
 
+    # 削除開始後や部分削除後の録画を新しい索引・再生・オフライン保存へ渡さない。
+    if recorded_program.recorded_video.status in ('Deleting', 'DeleteFailed'):
+        raise HTTPException(
+            status_code = status.HTTP_409_CONFLICT,
+            detail = 'Recorded video is being deleted',
+        )
+
     return recorded_program
 
 
@@ -354,6 +390,7 @@ async def ValidateRecordedPlaybackCapabilities(
                 selected_encoder,
                 stream_quality.encoding_options.video_codec,
                 stream_quality.encoding_options.video_bit_depth,
+                quality = RequireEncodedQuality(stream_quality.quality),
             )
         )
         if video_capability.recorded_available is False:
@@ -391,8 +428,17 @@ async def ValidateQuality(
     video_bit_depth: Annotated[VideoBitDepthQuery | None, Query(description='出力映像bit depth。')] = None,
     audio_codec: Annotated[KonomiTVBS4KAudioCodec, Query(description='出力音声コーデック。')] = 'aac',
     audio_track: Annotated[str | None, Query(description='映像と多重化する音声レンディション ID。')] = None,
+    cm_skip_aware: Annotated[bool, Query(description='CM スキップ有効の視聴セッションかどうか。')] = False,
 ) -> StreamQualityWithOptions:
     """ 映像の品質のバリデーション """
+
+    # 録画再生の original は VideoEncodingTask を戻さない方針のため拒否する
+    if quality == 'original':
+        logging.error(f'[VideoStreamsRouter][ValidateQuality] Original quality is not available for recorded playback. [quality: {quality}]')
+        raise HTTPException(
+            status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail = 'Original quality is not available for recorded playback',
+        )
 
     # 指定された品質が存在するか確認
     ## 品質の指定に -10bit や -24fps が付いていれば分解する
@@ -415,6 +461,10 @@ async def ValidateQuality(
             status_code = status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail = 'Specified quality was not found',
         )
+
+    # CM スキップの有無は画質とは別のセッション条件として、全 HLS 子 API で同じ query を必須にする
+    if cm_skip_aware is True:
+        stream_quality = replace(stream_quality, cm_skip_aware=True)
 
     # Ready済み録画は依存解決時に早期拒否する。Pending/Staleはmaster handlerが
     # index生成後の最新メタデータで同じhelperを必ず再実行する。
@@ -476,7 +526,7 @@ def BuildOfflineStreamEstimate(
     video_bitrate_max = 0
     if recorded_program.recorded_video.has_video is True:
         bitrate = RecordedFMP4Stream.getOfflineVideoBitrate(
-            stream_quality.quality,
+            RequireEncodedQuality(stream_quality.quality),
             stream_quality.encoding_options.video_codec,
         )
         video_bitrate = int(bitrate.video_bitrate.removesuffix('K'))
@@ -703,7 +753,7 @@ async def VideoHLSPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query(description='セッション ID（クライアント側で適宜生成したランダム値を指定する）。')],
-    cache_key: Annotated[str | None, Query(description='キャッシュ制御用のキー。')] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     """
     指定された画質に対応する、録画番組のストリーミング用 HLS M3U8 プレイリストを返す。<br>
@@ -741,7 +791,7 @@ async def VideoHLSVideoPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     return Response(
@@ -757,10 +807,11 @@ async def VideoHLSVideoSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
+    request_generation: Annotated[int | None, Query(ge=0)] = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
-    segment_data = await video_stream.getVideoSegment(sequence)
+    segment_data = await video_stream.getVideoSegment(sequence, request_generation)
     if segment_data is None:
         raise HTTPException(status_code=422, detail='Video segment was not found')
     return Response(content=segment_data, media_type='video/mp4', headers={'Cache-Control': 'max-age=10800'})
@@ -773,7 +824,7 @@ async def VideoHLSVideoInitSegmentAPI(
     session_id: Annotated[str, Query()],
     generation: Annotated[int, Query()],
     sequence: Annotated[int, Query()] = 0,
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     """録画映像の初期化セグメントを返す。"""
 
@@ -790,7 +841,7 @@ async def VideoHLSAudioPlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     return Response(
@@ -807,10 +858,11 @@ async def VideoHLSAudioSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
+    request_generation: Annotated[int | None, Query(ge=0)] = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
-    segment_data = await video_stream.getAudioSegment(rendition_id, sequence)
+    segment_data = await video_stream.getAudioSegment(rendition_id, sequence, request_generation)
     if segment_data is None:
         raise HTTPException(status_code=422, detail='Audio segment was not found')
     return Response(
@@ -827,7 +879,7 @@ async def VideoHLSAudioInitSegmentAPI(
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
     sequence: Annotated[int, Query()] = 0,
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     init_segment = await video_stream.getAudioInitSegment(rendition_id, sequence)
@@ -842,7 +894,7 @@ async def VideoHLSSubtitlePlaylistAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     video_stream = GetRecordedStream(session_id, recorded_program, stream_quality)
     subtitle_stream = RecordedSubtitleStream(recorded_program.recorded_video)
@@ -867,7 +919,7 @@ async def VideoHLSSubtitleSegmentAPI(
     recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
     stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
     session_id: Annotated[str, Query()],
-    cache_key: Annotated[str | None, Query()] = None,
+    cache_key: CacheKeyQuery = None,
 ):
     GetRecordedStream(session_id, recorded_program, stream_quality).keepAlive()
     segment_data = await RecordedSubtitleStream(recorded_program.recorded_video).getWebVTT(subtitle_index)
@@ -1056,3 +1108,33 @@ async def VideoHLSKeepAliveAPI(
 
     # セッションのアクティブ状態を維持する
     video_stream.keepAlive()
+
+
+@router.delete(
+    '/{video_id}/{quality}/session',
+    summary = '録画番組 HLS セッション終了 API',
+    status_code = status.HTTP_204_NO_CONTENT,
+)
+async def VideoHLSSessionDeleteAPI(
+    recorded_program: Annotated[RecordedProgram, Depends(ValidateVideoID)],
+    stream_quality: Annotated[StreamQualityWithOptions, Depends(ValidateQuality)],
+    session_id: Annotated[str, Query(description='終了するセッション ID。')],
+) -> None:
+    """画質切り替えやプレイヤー破棄で不要になった録画視聴セッションを直ちに終了する。
+
+    Args:
+        recorded_program: 再生対象の録画番組。
+        stream_quality: 終了するセッションに固定された画質と生成条件。
+        session_id: 終了する視聴セッションID。
+
+    Returns:
+        None
+    """
+
+    await RecordedFMP4Stream.destroySession(
+        session_id,
+        recorded_program,
+        RequireEncodedQuality(stream_quality.quality),
+        stream_quality.encoding_options,
+        cm_skip_aware=stream_quality.cm_skip_aware,
+    )
