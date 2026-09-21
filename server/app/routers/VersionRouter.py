@@ -33,8 +33,6 @@ latest_version_updated_at: float = 0
 # ライセンス文書は数十 MB に達するため、同じ原文をリクエストごとに Markdown 変換・gzip 圧縮し直さない。
 # 原文の SHA-256、HTML、gzip 済み HTML、ETag だけを1世代保持し、文書更新時は自動的に入れ替える。
 _license_document_cache: tuple[bytes, bytes, bytes, str] | None = None
-_chromium_license_document_cache: tuple[bytes, bytes, bytes, str] | None = None
-CHROMIUM_THIRD_PARTY_LICENSES_PATH = THIRD_PARTY_LICENSES_PATH.with_name('CHROMIUM_THIRD_PARTY_LICENSES.md')
 
 
 def _render_table_open(*_: Any) -> str:
@@ -428,57 +426,6 @@ async def ThirdPartyLicensesAPI(request: Request) -> Response:
         etag,
         'text/html; charset=utf-8',
         "default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'",
-    )
-
-
-@router.get(
-    '/chromium-third-party-licenses',
-    summary = 'Chromium サードパーティーライセンス取得 API',
-    response_class = Response,
-)
-async def ChromiumThirdPartyLicensesAPI(request: Request) -> Response:
-    """
-    Chromium が同梱する多数のコンポーネントのライセンス原文を Markdown 形式で返す。
-
-    Args:
-        request (Request): FastAPI が受け取った HTTP リクエスト
-
-    Returns:
-        Response: Chromium のライセンス文書、またはキャッシュが有効な場合は 304 レスポンス
-    """
-
-    global _chromium_license_document_cache
-
-    try:
-        document = CHROMIUM_THIRD_PARTY_LICENSES_PATH.read_bytes()
-    except FileNotFoundError as ex:
-        raise HTTPException(status_code=404, detail='Chromium のサードパーティーライセンス文書が見つかりません。') from ex
-
-    # 765件規模の Markdown を巨大な HTML DOM へ変換せず、原文のまま gzip と HTTP キャッシュを適用する。
-    source_digest = hashlib.sha256(document).digest()
-    if _chromium_license_document_cache is not None and _chromium_license_document_cache[0] == source_digest:
-        _, cached_document, cached_compressed_document, cached_etag = _chromium_license_document_cache
-        return _create_cached_document_response(
-            request,
-            cached_document,
-            cached_compressed_document,
-            cached_etag,
-            'text/markdown; charset=utf-8',
-            "default-src 'none'; base-uri 'none'; form-action 'none'",
-            'inline; filename="CHROMIUM_THIRD_PARTY_LICENSES.md"',
-        )
-
-    compressed_document = gzip.compress(document, compresslevel=6, mtime=0)
-    etag = f'W/"{source_digest.hex()}"'
-    _chromium_license_document_cache = (source_digest, document, compressed_document, etag)
-    return _create_cached_document_response(
-        request,
-        document,
-        compressed_document,
-        etag,
-        'text/markdown; charset=utf-8',
-        "default-src 'none'; base-uri 'none'; form-action 'none'",
-        'inline; filename="CHROMIUM_THIRD_PARTY_LICENSES.md"',
     )
 
 

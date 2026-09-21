@@ -481,44 +481,6 @@ RUN test ! -e /NGC-DL-CONTAINER-LICENSE && \
         exit 1; \
     fi
 
-# Linux Mint は InRelease を提供していないため、署名対象の Release をリモート入力にして
-# Chromium の更新時に、ブラウザ導入レイヤーが古いキャッシュを再利用しないようにする
-ADD https://fastly.linuxmint.io/dists/virginia/Release /tmp/linuxmint-virginia-Release
-
-RUN curl -fsSL https://fastly.linuxmint.io/pool/main/l/linuxmint-keyring/linuxmint-keyring_2022.06.21_all.deb \
-        --output /tmp/linuxmint-keyring.deb && \
-    echo 'b71be690c543112ea7b65f43e9bbce9a3f17dd5cc784074858f0824154942a99  /tmp/linuxmint-keyring.deb' | sha256sum --check - && \
-    dpkg-deb --extract /tmp/linuxmint-keyring.deb /tmp/linuxmint-keyring && \
-    install -m 0644 /tmp/linuxmint-keyring/etc/apt/trusted.gpg.d/linuxmint-keyring.gpg \
-        /usr/share/keyrings/linuxmint-archive-keyring.gpg && \
-    echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/linuxmint-archive-keyring.gpg] https://fastly.linuxmint.io virginia upstream' \
-        > /etc/apt/sources.list.d/linuxmint-virginia.list && \
-    printf '%s\n' \
-        'Package: *' \
-        'Pin: release o=linuxmint' \
-        'Pin-Priority: -1' \
-        '' \
-        'Package: chromium' \
-        'Pin: release o=linuxmint,n=virginia,c=upstream' \
-        'Pin-Priority: 1001' \
-        > /etc/apt/preferences.d/linuxmint-chromium && \
-    rm -rf /var/lib/apt/lists/* && \
-    { nala update || true; } && \
-    set -- /var/lib/apt/lists/*_dists_jammy_InRelease && \
-    if [ ! -e "$1" ]; then \
-        echo 'nala update fetched no jammy InRelease' >&2; \
-        exit 1; \
-    fi && \
-    nala install -y --no-install-recommends chromium libasound2 && \
-    chromium_candidate="$(apt-cache policy chromium | awk '/Candidate:/ { print $2; exit }')" && \
-    chromium_installed="$(dpkg-query --showformat='${Version}' --show chromium)" && \
-    test "${chromium_candidate}" = "${chromium_installed}" && \
-    printf '%s' "${chromium_installed}" | grep -Eq '~linuxmint[0-9]+\+virginia$' && \
-    apt-cache policy chromium | grep -F 'https://fastly.linuxmint.io virginia/upstream amd64 Packages' && \
-    test "$(command -v chromium)" = '/usr/bin/chromium' && \
-    chromium --version && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/*
-
 # ACP adapter / Codex / Gemini / Grok は公式 npm package と lockfile integrity で固定する。
 # Google Cloud CLI は完成イメージへコピーせず、Gemini は host HOME の read-only mount にある ADC だけを参照する。
 #
@@ -682,32 +644,18 @@ COPY ./config.example.yaml /code/config.example.yaml
 COPY ./THIRD_PARTY_LICENSES.md /tmp/BASE_THIRD_PARTY_LICENSES.md
 COPY ./docker/thirdparty/assemble-runtime-license-document.py /tmp/assemble-runtime-license-document.py
 COPY ./docker/thirdparty/collect-license-manifest.py /tmp/collect-license-manifest.py
-COPY ./docker/thirdparty/generate-chromium-license-document.py /tmp/generate-chromium-license-document.py
-COPY ./docker/thirdparty/licenses/chromium-LICENSE /tmp/chromium-LICENSE
-# grapheme 0.6.0 の wheel/sdist は LICENSE を欠くため、公開時コミット
-# 7350dfcc1a75a8e347f38ed9e38cb9f9fa928ce0 の上流 LICENSE
-# (https://github.com/alvinlindstam/grapheme/blob/7350dfcc1a75a8e347f38ed9e38cb9f9fa928ce0/LICENSE) を固定して補う。
-COPY ./docker/thirdparty/licenses/grapheme-0.6.0-LICENSE /tmp/grapheme-0.6.0-LICENSE
 COPY --from=client-builder /tmp/CLIENT_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md
 COPY --from=thirdparty-builder /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/BUILDER_THIRD_PARTY_LICENSES.md
 COPY --from=acp-builder /opt/konomitv-bs4k-acp/ACP_THIRD_PARTY_LICENSES.md /tmp/ACP_THIRD_PARTY_LICENSES.md
 COPY --from=opencode-builder /opt/konomitv-bs4k-opencode/dist/OPENCODE_THIRD_PARTY_LICENSES.md \
     /tmp/OPENCODE_THIRD_PARTY_LICENSES.md
 RUN . /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
-    chromium_version="$(dpkg-query --showformat='${Version}' --show chromium)" && \
-    python3 /tmp/generate-chromium-license-document.py \
-        --chromium /usr/bin/chromium \
-        --package-version "${chromium_version}" \
-        --chromium-license /tmp/chromium-LICENSE \
-        --package-copyright /usr/share/doc/chromium/copyright \
-        --output /code/CHROMIUM_THIRD_PARTY_LICENSES.md && \
     python3 /tmp/collect-license-manifest.py \
-        --stage 'Final Runtime Dependencies' --dpkg --dpkg-exclude chromium \
+        --stage 'Final Runtime Dependencies' --dpkg \
         --root /usr/share/vpl/licensing \
         --root /opt/rocm \
         --python-root /code/server/.venv \
         --python-root /code/server/thirdparty/Python \
-        --python-license-override 'grapheme=/tmp/grapheme-0.6.0-LICENSE' \
         --root /code/server/thirdparty/Python \
         --root /code/server/thirdparty/KonomiTVBS4KTSCodecBridge \
         --output /tmp/RUNTIME_THIRD_PARTY_LICENSES.md && \
@@ -780,9 +728,7 @@ RUN . /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
     rm /tmp/BASE_THIRD_PARTY_LICENSES.md /tmp/CLIENT_THIRD_PARTY_LICENSES.md \
         /tmp/BUILDER_THIRD_PARTY_LICENSES.md /tmp/RUNTIME_THIRD_PARTY_LICENSES.md \
         /tmp/ACP_THIRD_PARTY_LICENSES.md /tmp/OPENCODE_THIRD_PARTY_LICENSES.md \
-        /tmp/assemble-runtime-license-document.py /tmp/collect-license-manifest.py \
-        /tmp/generate-chromium-license-document.py /tmp/chromium-LICENSE \
-        /tmp/grapheme-0.6.0-LICENSE
+        /tmp/assemble-runtime-license-document.py /tmp/collect-license-manifest.py
 
 # KonomiTV-BS4K 本体は専用の非 root ユーザーで実行する。
 # bind mount する config.yaml・data・logs も、ホスト側で同じ UID/GID が所有している必要がある。

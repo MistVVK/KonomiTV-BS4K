@@ -22,23 +22,11 @@ KonomiTV-BS4K の Docker image に直接組み込む third-party ソフトウェ
 
 このファイルは `docker/thirdparty/generate-license-document.py` から生成します。手動編集しないでください。
 Ubuntu・CUDA・GPU runtime・Python／JavaScript パッケージの推移的依存関係を含め、各配布物の著作権表示とライセンス全文を掲載します。
-Chromium の大容量なライセンス全文は、同じイメージ内の専用文書へ分離してこの文書からリンクします。
 -->
 
 ## Directly Managed Third-Party Components
 
 ### Bundled Components
-
-#### Chromium
-
-- Source package and binaries: <https://packages.linuxmint.com/>
-- Upstream source: <https://chromium.googlesource.com/chromium/src/>
-- Package: `chromium` from the signed Linux Mint Virginia `upstream` repository
-- Licenses include: BSD 3-Clause and the licenses listed by the installed Chromium binary
-
-The exact Chromium license and every third-party notice reported by the installed binary are generated during the Docker build.
-
-[Open the complete Chromium license document](/api/version/chromium-third-party-licenses)
 
 #### KonomiTV upstream
 
