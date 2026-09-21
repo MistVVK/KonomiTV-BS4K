@@ -274,8 +274,8 @@ def test_nvidia_compose_contains_all_nvidia_runtime_settings() -> None:
         assert 'driver: nvidia' not in compose_text
 
 
-def test_intel_compose_contains_dri_device_and_intel_nonfree_default() -> None:
-    """公開・Developmentで共有するIntel overlayにDRMデバイスとNONFREE既定を集約する。
+def test_intel_compose_contains_dri_device_and_intel_vendor_flags() -> None:
+    """公開・Developmentで共有するIntel overlayにDRMデバイスとvendor flag既定を集約する。
 
     Returns:
         None
@@ -284,15 +284,18 @@ def test_intel_compose_contains_dri_device_and_intel_nonfree_default() -> None:
     service = _load_compose_service('compose.intel.yaml')
     build = cast(dict[str, Any], service['build'])
 
-    assert build['args']['NONFREE'] == '${KONOMITV_NONFREE:-intel-nonfree}'
+    # NONFREE の既定値上書きはやめ、ベンダー選択は INTEL_NONFREE / AMD_NONFREE の直接指定へ移行した
+    assert 'NONFREE' not in build['args']
+    assert build['args']['INTEL_NONFREE'] == '${KONOMITV_INTEL_NONFREE:-true}'
+    assert build['args']['AMD_NONFREE'] == '${KONOMITV_AMD_NONFREE:-false}'
     assert service['devices'] == ['${KONOMITV_INTEL_DRI_DEVICE:-/dev/dri/}']
     for compose_filename in COMPOSE_FILENAMES:
         service = _load_compose_service(compose_filename)
         assert service.get('devices') is None
 
 
-def test_amd_compose_contains_dri_device_and_amd_nonfree_default() -> None:
-    """公開・Developmentで共有するAMD overlayにDRMデバイスとNONFREE既定を集約する。
+def test_amd_compose_contains_dri_device_and_amd_vendor_flags() -> None:
+    """公開・Developmentで共有するAMD overlayにDRMデバイスとvendor flag既定を集約する。
 
     Returns:
         None
@@ -301,7 +304,10 @@ def test_amd_compose_contains_dri_device_and_amd_nonfree_default() -> None:
     service = _load_compose_service('compose.amd.yaml')
     build = cast(dict[str, Any], service['build'])
 
-    assert build['args']['NONFREE'] == '${KONOMITV_NONFREE:-amd-nonfree}'
+    # NONFREE の既定値上書きはやめ、ベンダー選択は INTEL_NONFREE / AMD_NONFREE の直接指定へ移行した
+    assert 'NONFREE' not in build['args']
+    assert build['args']['INTEL_NONFREE'] == '${KONOMITV_INTEL_NONFREE:-false}'
+    assert build['args']['AMD_NONFREE'] == '${KONOMITV_AMD_NONFREE:-true}'
     assert service['devices'] == ['${KONOMITV_AMD_DRI_DEVICE:-/dev/dri/}']
     for compose_filename in COMPOSE_FILENAMES:
         service = _load_compose_service(compose_filename)

@@ -37,6 +37,7 @@
 - Main 環境は、動作確認済みの `main` ブランチを提供する常用環境です
 - エージェントは、ユーザーの明示的な許可なく Main コンテナを起動・停止・再起動・再構築・再設定してはいけません
 - 通常のコード変更を Main 環境で直接検証してはいけません。Development 環境で検証してから Main へ反映します
+- 番組タイトルや番組概要を表示するときは必ず `ProgramUtils.decorateProgramInfo(program, 'field_name')` を使用してください
 
 ### Development 環境 (port 7100)
 

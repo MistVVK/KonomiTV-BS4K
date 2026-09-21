@@ -93,27 +93,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 `;
 
-const copyToLicense = `The MIT License (MIT)
-
-Copyright (c) 2014 dead_horse
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.`;
 
 const nodableEntitiesLicense = `MIT License
 
@@ -156,32 +135,6 @@ const licenseFallbacks = {
         source: 'https://github.com/vuejs/devtools-v6/blob/df6ab6bb7791a7a525a97990de73b3ea5e9a1941/LICENSE',
         sourceLicenseText: vueDevtoolsLicense,
     },
-    'cache-content-type': {
-        declaredLicense: 'MIT',
-        license: 'MIT',
-        source: 'https://github.com/node-modules/cache-content-type/blob/8a43ff8b3f800aef8fa366d99e0a2828705a9ffe/package.json',
-    },
-    'copy-to': {
-        declaredLicense: 'MIT',
-        license: 'MIT',
-        source: 'https://github.com/node-modules/copy-to/blob/16cc01116fbb05e48ebf96e8e8f9b14cf2a4fba1/LICENSE',
-        sourceLicenseText: copyToLicense,
-    },
-    'koa-compose': {
-        declaredLicense: 'MIT',
-        license: 'MIT',
-        source: 'https://github.com/koajs/compose/blob/06e82e65a368ac12cd6405beaf19fd5d208a1477/Readme.md',
-    },
-    'koa-json': {
-        declaredLicense: 'MIT',
-        license: 'MIT',
-        source: 'https://github.com/koajs/json/blob/741f78c09f4b1db55f857d0489b14498e7a42e30/Readme.md',
-    },
-    'koa-logger': {
-        declaredLicense: 'MIT',
-        license: 'MIT',
-        source: 'https://github.com/koajs/logger/blob/e7b24bd5a112e5928ebbc19e810bcf9fc4bba189/Readme.md',
-    },
     'mitt': {
         declaredLicense: 'MIT',
         license: 'MIT',
@@ -197,11 +150,6 @@ const licenseFallbacks = {
         declaredLicense: 'MIT',
         license: 'MIT',
         source: 'https://github.com/Akryum/vue-resize/blob/d365c5e7a69cdba8985b9d608d18f34b5f0b044d/packages/vue-resize/README.md',
-    },
-    'humanize-number': {
-        declaredLicense: 'not declared',
-        license: 'MIT',
-        source: 'https://github.com/component/humanize-number/blob/bff0f636fcca0dfbcb1bf7777e46c0b8a64defbc/Readme.md',
     },
 };
 

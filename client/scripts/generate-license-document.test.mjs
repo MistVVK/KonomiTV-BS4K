@@ -126,12 +126,6 @@ test('all packages without bundled license files use registered upstream-verifie
     for (const name of [
         '@nodable/entities',
         '@vue/devtools-api',
-        'cache-content-type',
-        'copy-to',
-        'humanize-number',
-        'koa-compose',
-        'koa-json',
-        'koa-logger',
         'mitt',
         'pwa-install-handler',
         'vue-resize',
@@ -150,25 +144,8 @@ test('all packages without bundled license files use registered upstream-verifie
         vueDevtoolsSection,
         /Repository: \[https:\/\/github\.com\/vuejs\/vue-devtools]\(https:\/\/github\.com\/vuejs\/vue-devtools\)/,
     );
-    assert.match(GetPackageSection(document, 'copy-to'), /Copyright \(c\) 2014 dead_horse/);
     assert.match(GetPackageSection(document, 'mitt'), /© Jason Miller/);
     assert.match(GetPackageSection(document, '@nodable/entities'), /Copyright \(c\) 2026 Nodable/);
-});
-
-test('README license text preserves only attribution and verifies humanize-number fallback', async () => {
-    const temporaryDirectory = await mkdtemp(join(tmpdir(), 'konomitv-bs4k-client-licenses-'));
-    const outputPath = join(temporaryDirectory, 'CLIENT_THIRD_PARTY_LICENSES.md');
-    await GenerateLicenseDocument(clientRoot, outputPath);
-    const document = await readFile(outputPath, 'utf8');
-
-    const onlySection = GetPackageSection(document, 'only', '0.0.2');
-    assert.match(onlySection, /Copyright \(c\) 2012 TJ Holowaychuk <tj@vision-media\.ca>/);
-    assert.match(onlySection, /Permission is hereby granted, free of charge/);
-
-    const humanizeSection = GetPackageSection(document, 'humanize-number');
-    assert.match(humanizeSection, /Declared license: `not declared`/);
-    assert.match(humanizeSection, /bff0f636fcca0dfbcb1bf7777e46c0b8a64defbc\/Readme\.md/);
-    assert.match(humanizeSection, /Permission is hereby granted, free of charge/);
 });
 
 test('undeclared and unverified README license degrades to a declared-only entry without assuming MIT', () => {
@@ -213,11 +190,11 @@ test('corrupted README license text is left unrepaired with a warning instead of
 test('registered fallback applies by package name even when the published README content changes', () => {
     // フォールバックは配布物の hash ではなく package 名と宣言ライセンスの一致だけを条件にする
     const materials = ResolveMissingLicenseMaterials({
-        key: 'humanize-number@9.9.9',
-        name: 'humanize-number',
-        declaredLicense: 'not declared',
+        key: 'vue-resize@9.9.9',
+        name: 'vue-resize',
+        declaredLicense: 'MIT',
         packageJson: '{}',
-        readmes: [['Readme.md', '# humanize-number\n\n## License\n\nMIT\nmodified']],
+        readmes: [['Readme.md', '# vue-resize\n\n## License\n\nMIT\nmodified']],
     });
     assert.equal(materials.length, 1);
     assert.match(materials[0].name, /Verified MIT license from fixed upstream source/);

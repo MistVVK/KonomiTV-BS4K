@@ -24,8 +24,8 @@
         "@github/mini-throttle": "^2.1.1",
         "@iconify/vue": "^4.1.2",
         "@microsoft/fetch-event-source": "^2.0.1",
-        "@tsukumijima/aribts": "github:tsukumijima/node-aribts#v1.5.3",
         "@vue/devtools-api": "^8.2.1",
+        "arib-mmt-tlv-ts": "^2.0.2",
         "assert": "^2.1.0",
         "axios": "^1.16.0",
         "buffer": "^6.0.3",
@@ -53,7 +53,7 @@
         "vue-virtual-scroller": "^2.0.0-beta.8",
         "vuedraggable": "^4.1.0",
         "vuetify": "~4.2.0",
-        "web-bml": "github:tsukumijima/web-bml#6448ad51179048cedf9fae78d1c9e1c87ac395e6"
+        "web-bml": "github:tsukumijima/web-bml#47fec53cd66734d6cba0fff3c6dfcfc150043109"
     },
     "devDependencies": {
         "@babel/types": "^7.25.4",

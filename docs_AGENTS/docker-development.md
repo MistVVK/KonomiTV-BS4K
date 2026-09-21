@@ -15,7 +15,8 @@ Development 環境のビルド・再作成・再起動など、Docker コンテ�
 - GPU 構成を含む Compose ファイルの組み合わせは `.env` の `COMPOSE_FILE` で切り替える（`.env.example` 参照）。`-f` を毎回手で並べない。
   - Development 例: `COMPOSE_FILE=compose.development.yaml:compose.intel.yaml:compose.nvidia.yaml`
   - 公開・Main 例: `COMPOSE_FILE=compose.yaml` に必要なら `compose.intel.yaml` / `compose.amd.yaml` / `compose.nvidia.yaml` を連結
-  - `compose.intel.yaml` / `compose.amd.yaml` は `NONFREE` ビルド引数の既定値をそれぞれ `intel-nonfree` / `amd-nonfree` にし、Intel / AMD 専用イメージのライセンス文書から不要なベンダーの警告を除く。Intel と AMD を併用する場合は `.env` に `KONOMITV_NONFREE=nonfree` を明示する（後勝ちマージで `amd-nonfree` になるため）
+  - GPU overlay `compose.intel.yaml` / `compose.amd.yaml` は `NONFREE` の既定値を上書きせず、`INTEL_NONFREE` / `AMD_NONFREE` build arg を直接指定する（Intel→true/false、AMD→false/true。`.env` の `KONOMITV_INTEL_NONFREE` / `KONOMITV_AMD_NONFREE` で上書き可）。Intel と AMD を併用する場合は `.env` で両方 true を明示する
+  - 基本 Compose（`compose.yaml` / `compose.development.yaml`）は `KONOMITV_INTEL_NONFREE` / `KONOMITV_AMD_NONFREE` を build arg へ伝達する（未設定なら unset のまま。overlay 併用時は overlay 側の既定が後勝ちで優先適用される）。ベンダーフラグ未指定は常に「その非自由を含めない」へ解決され、profile=nonfree で未指定がある場合は非自由なし構成になる警告のみで通る。Main（常用環境）は意図した GPU overlay を併用するか `.env` で両 vendor flag を明示し、警告なしに混合構成・取りこぼしを確定させてください
   - `compose.intel.yaml` / `compose.amd.yaml` は `devices` に `${KONOMITV_INTEL_DRI_DEVICE:-/dev/dri/}` / `${KONOMITV_AMD_DRI_DEVICE:-/dev/dri/}` を使う。空なら `/dev/dri/` 全体を渡して自動選択、render node を書けばそのノードだけを渡す
 - 公開・Main 用の `compose.yaml` に Development の状態を上書きする運用は行わない。
 - Development は本体 `konomitv` と専用 sidecar `cloud-storage` の2サービスで構成される。

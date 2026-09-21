@@ -49,6 +49,7 @@ from app.routers.UsersRouter import GetCurrentAdminUser
 from app.streams.KonomiTVBS4KOfflineJobManager import KonomiTVBS4KOfflineJobManager
 from app.streams.RecordedFMP4Cache import RecordedFMP4CacheManager
 from app.streams.RecordedFMP4Stream import RecordedFMP4Stream
+from app.utils.DisconnectAwareFileResponse import DisconnectAwareFileResponse
 from app.utils.DriveIOLimiter import DriveIOLimiter
 from app.utils.JikkyoClient import JikkyoClient
 from app.utils.KonomiTVBS4KCloudCatalog import KonomiTVBS4KCloudCatalog
@@ -1140,7 +1141,7 @@ def GetRecordedFileDownloadMediaType(filename: str) -> str:
     '/{video_id}/download',
     summary = '録画番組ダウンロード API',
     response_description = '録画番組のファイル。',
-    response_class = FileResponse,
+    response_class = DisconnectAwareFileResponse,
     responses = {
         200: {'content': {'video/mp2t': {}, 'video/mp4': {}, 'video/x-matroska': {}, 'application/octet-stream': {}}},
         422: {'description': 'Specified video_id was not found'},
@@ -1166,7 +1167,8 @@ async def VideoDownloadAPI(
             detail='Specified video_id was not found',
         )
 
-    return FileResponse(
+    # 録画ファイルをダウンロードさせる (切断検知で読み出しループを打ち切る)
+    return DisconnectAwareFileResponse(
         path = str(file_path),
         filename = filename,
         media_type = GetRecordedFileDownloadMediaType(filename),

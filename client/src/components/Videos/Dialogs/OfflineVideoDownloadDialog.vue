@@ -37,10 +37,10 @@
                     :density="selectDensity" />
                 <div class="offline-download-dialog__switch mt-3">
                     <div>
-                        <div class="font-weight-bold mb-1" style="font-size: 15px;">24fps モード</div>
-                        <div class="text-text-darken-1">映画やアニメなど 24fps で制作された映像を検出し、本来の動きに近づけます。</div>
+                        <label class="font-weight-bold mb-1" style="font-size: 15px;" for="offline_download_24fps_mode">24fps モード</label>
+                        <label class="text-text-darken-1" for="offline_download_24fps_mode">映画やアニメなど 24fps で制作された映像を検出し、本来の動きに近づけます。</label>
                     </div>
-                    <v-switch v-model="is24fpsMode" color="primary" hide-details :disabled="is24fpsUnavailable" />
+                    <v-switch id="offline_download_24fps_mode" v-model="is24fpsMode" color="primary" hide-details :disabled="is24fpsUnavailable" />
                 </div>
                 <v-alert v-if="estimate !== null" class="mt-4" color="info" variant="tonal">
                     推定保存容量: {{OfflineVideos.formatOfflineSize(estimate.estimated_size_bytes, true)}}
@@ -502,6 +502,12 @@ watch(() => props.show, async (show) => {
             min-width: 0;
         }
 
+        // 設定画面と同様に、見出しと説明文のクリックでもスイッチを切り替えられるようにする
+        label {
+            display: block;
+            cursor: pointer;
+        }
+
         :deep(.v-switch) {
             position: absolute;
             top: 4px;
@@ -517,6 +523,10 @@ watch(() => props.show, async (show) => {
 
         &--disabled {
             opacity: 0.5;
+
+            label {
+                cursor: default;
+            }
         }
     }
 }

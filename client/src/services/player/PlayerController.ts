@@ -1963,11 +1963,24 @@ class PlayerController {
                         this.destroying === true ||
                         this.destroyed === true
                     ) return;
+                    const target_quality = dplayer_instance.options.video.quality?.[index];
                     if (dplayer_instance.options?.pluginOptions?.hls && dplayer_instance.video) {
                         // 切り替え直前の再生位置からロードし、終了 API の待機中に進んだ位置も引き継ぐ。
                         dplayer_instance.options.pluginOptions.hls.startPosition = dplayer_instance.video.currentTime;
                     }
                     originalSwitchQuality(index);
+
+                    // MSE は AAC のサンプル境界に合わせてシーク位置をわずかに補正する場合がある
+                    // DPlayer の画質切り替え完了判定が同じ位置へ戻し続けないよう、50ms 以内の補正値を現在位置として確定する
+                    if ((target_quality?.type === 'mpeg2toh264' || target_quality?.type === 'hls') && dplayer_instance.prevVideo !== null) {
+                        const video = dplayer_instance.video;
+                        const requested_time = dplayer_instance.prevVideoCurrentTime;
+                        video.addEventListener('seeked', () => {
+                            if (Math.abs(video.currentTime - requested_time) <= 0.05) {
+                                dplayer_instance.prevVideoCurrentTime = video.currentTime;
+                            }
+                        }, {once: true});
+                    }
                 });
             };
 

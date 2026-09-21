@@ -1,10 +1,12 @@
 # AMD GPU (AMF) 向けの GPU overlay。
-# NONFREE の既定値を amd-nonfree にし、AMD proprietary runtime だけを含むイメージを構築する。
+# vendor flag を直接指定し、AMD proprietary runtime だけを含むイメージを構築する。
+# Intel も併用する場合は .env で KONOMITV_INTEL_NONFREE=true を明示する（後勝ちではなく各フラグが独立）。
 services:
   konomitv:
     build:
       args:
-        NONFREE: '${KONOMITV_NONFREE:-amd-nonfree}'
+        INTEL_NONFREE: '${KONOMITV_INTEL_NONFREE:-false}'
+        AMD_NONFREE: '${KONOMITV_AMD_NONFREE:-true}'
     devices:
       # 空なら /dev/dri/ 全体を渡して自動選択する。特定の GPU だけを使う場合は
       # KONOMITV_AMD_DRI_DEVICE=/dev/dri/renderD128 のように render node を指定する。

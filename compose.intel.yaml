@@ -1,10 +1,12 @@
 # Intel GPU (QSV) 向けの GPU overlay。
-# NONFREE の既定値を intel-nonfree にし、Intel Media Driver の Full Feature 版だけを含むイメージを構築する。
+# vendor flag を直接指定し、Intel Media Driver の Full Feature 版だけを含むイメージを構築する。
+# AMD も併用する場合は .env で KONOMITV_AMD_NONFREE=true を明示する（後勝ちではなく各フラグが独立）。
 services:
   konomitv:
     build:
       args:
-        NONFREE: '${KONOMITV_NONFREE:-intel-nonfree}'
+        INTEL_NONFREE: '${KONOMITV_INTEL_NONFREE:-true}'
+        AMD_NONFREE: '${KONOMITV_AMD_NONFREE:-false}'
     devices:
       # 空なら /dev/dri/ 全体を渡して自動選択する。特定の GPU だけを使う場合は
       # KONOMITV_INTEL_DRI_DEVICE=/dev/dri/renderD128 のように render node を指定する。

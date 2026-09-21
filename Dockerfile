@@ -1,16 +1,23 @@
 # syntax=docker/dockerfile:1.7
 
-# プロファイル enum: nonfree / free / intel-nonfree / amd-nonfree（互換のため true → nonfree、false → free も受け付ける）
-# この ARG は FROM 行の stage 解決だけに使い、各 stage の cache key へ混ぜない。
+# プロファイル enum: nonfree / free（互換のため true → nonfree、false → free も受け付ける）
+# 非自由コンポーネントのベンダー選択は INTEL_NONFREE / AMD_NONFREE (true / false) で行う。
+# 未指定 (unset) は常に「そのベンダーを含めない」(false) と解決する。profile=nonfree で
+# 未指定がある場合は非自由なしの構成になる旨の警告を出す。profile=free への true 指定は
+# ビルドエラー（再配布可否の矛盾のため）。
+# これらの ARG は FROM 行の stage 解決だけに使い、各 stage の cache key へ混ぜない。
 ARG NONFREE=nonfree
+ARG INTEL_NONFREE=unset
+ARG AMD_NONFREE=unset
 
 # --------------------------------------------------------------------------------------------------------------
 # サードパーティー実行環境を固定構築するステージ群
 # --------------------------------------------------------------------------------------------------------------
 
 # Intel 非自由カーネルに依存しない共通部分（apt 導入と build context の COPY）を
-# 先に構築し、下の Intel 派生 stage が共有する。ここに ARG NONFREE を宣言しないことが、
-# 8 プロファイル分のフルビルドを 4 本（CUDA 2種 × Intel 2種）へ抑える鍵になる。
+# 先に構築し、下の Intel 派生 stage が共有する。ここに vendor ARG を宣言しないことが、
+# ベンダー組み合わせの分だけフルビルドが重複するのを防ぎ、CUDA 2種 × Intel 2種の
+# 4本に抑える鍵になる（profile 名ではなく成果物の組み合わせで決まる）。
 # ベースイメージは digest 固定しない。apt は後続の nala upgrade で archive の最新に揃える。
 FROM ubuntu:22.04 AS thirdparty-builder-base
 
@@ -98,7 +105,7 @@ COPY ./thirdparty-src/tsreadex/ /build/thirdparty-src/tsreadex/
 RUN chmod +x /build/docker/thirdparty/*.sh
 
 # Intel Media Driver の Full Feature 版を組み込むビルド（FFmpeg 8・Intel Media Stack・その他実行環境一式）
-# プロファイル nonfree / intel-nonfree がこの成果物を共有する。
+# INTEL_NONFREE=true のビルドがこの成果物を使う。
 FROM thirdparty-builder-base AS thirdparty-intel-true
 
 RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downloads \
@@ -140,7 +147,7 @@ COPY ./docker/thirdparty/verify.sh \
 RUN chmod +x /build/docker/thirdparty/verify.sh && \
     INTEL_NONFREE='true' /build/docker/thirdparty/verify.sh /opt/thirdparty
 
-# Intel Media Driver の Free Kernel 版を組み込むビルド。プロファイル free / amd-nonfree がこの成果物を共有する。
+# Intel Media Driver の Free Kernel 版を組み込むビルド。INTEL_NONFREE=false のビルドがこの成果物を使う。
 FROM thirdparty-builder-base AS thirdparty-intel-false
 
 RUN --mount=type=cache,id=konomitv-bs4k-thirdparty-downloads,target=/build/downloads \
@@ -182,18 +189,15 @@ COPY ./docker/thirdparty/verify.sh \
 RUN chmod +x /build/docker/thirdparty/verify.sh && \
     INTEL_NONFREE='false' /build/docker/thirdparty/verify.sh /opt/thirdparty
 
-# プロファイル enum と互換値から、Intel 非自由カーネル有無の stage を選ぶ素通し alias。
-# 実体を持たないため、ここでビルドコストが増えることはない。
-FROM thirdparty-intel-true AS thirdparty-nonfree
-FROM thirdparty-intel-true AS thirdparty-intel-nonfree
-FROM thirdparty-intel-false AS thirdparty-amd-nonfree
-FROM thirdparty-intel-false AS thirdparty-free
-FROM thirdparty-intel-true AS thirdparty-true
-FROM thirdparty-intel-false AS thirdparty-false
+# INTEL_NONFREE 未指定時の素通し alias。FROM 行の stage 解決は静的なため、unset は
+# runtime 段の正規化と同じ「非自由を含めない」(false) 側へ解決する。これでどの経路でも
+# Intel 成果物の選択と解決値が一致し、free/nonfree を問わず Full Feature が混入しない。
+# 実体を持たないためビルドコストは増えない。
+FROM thirdparty-intel-false AS thirdparty-intel-unset
 
-# ビルド要求の NONFREE enum に応じて Intel 成果物 stage を動的に選択する。
-# AMD proprietary runtime はこの stage には入らず、runtime stage だけが NONFREE を見て導入する。
-FROM thirdparty-${NONFREE} AS thirdparty-builder
+# ビルド要求の INTEL_NONFREE に応じて Intel 成果物 stage を動的に選択する。
+# AMD proprietary runtime はこの stage には入らず、runtime stage だけが AMD_NONFREE を見て導入する。
+FROM thirdparty-intel-${INTEL_NONFREE} AS thirdparty-builder
 
 # 基礎ライセンス文書はプロファイルに依存しない。エイリアスの後段に置くことで、
 # 文書・generator の変更が Intel 成果物の cache key を汚さないようにする。
@@ -374,10 +378,14 @@ FROM ubuntu:22.04 AS runtime
 
 ARG CUDA_VERSION=12.4
 ARG NONFREE=nonfree
+ARG INTEL_NONFREE=unset
+ARG AMD_NONFREE=unset
 ARG KONOMITV_UID=1000
 ARG KONOMITV_GID=1000
 LABEL cc.konomi.konomitv-bs4k.cuda-version="${CUDA_VERSION}" \
-      cc.konomi.konomitv-bs4k.nonfree="${NONFREE}"
+      cc.konomi.konomitv-bs4k.nonfree="${NONFREE}" \
+      cc.konomi.konomitv-bs4k.intel-nonfree="${INTEL_NONFREE}" \
+      cc.konomi.konomitv-bs4k.amd-nonfree="${AMD_NONFREE}"
 ENV TZ=Asia/Tokyo
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -387,12 +395,37 @@ RUN case "${CUDA_VERSION}" in \
         *) echo 'CUDA_VERSION must be either 12.4 or 12.8.' >&2; exit 1 ;; \
     esac && \
     case "${NONFREE}" in \
-        'nonfree'|'true') NONFREE_PROFILE='nonfree'; INTEL_NONFREE='true'; AMD_NONFREE='true' ;; \
-        'intel-nonfree') NONFREE_PROFILE='intel-nonfree'; INTEL_NONFREE='true'; AMD_NONFREE='false' ;; \
-        'amd-nonfree') NONFREE_PROFILE='amd-nonfree'; INTEL_NONFREE='false'; AMD_NONFREE='true' ;; \
-        'free'|'false') NONFREE_PROFILE='free'; INTEL_NONFREE='false'; AMD_NONFREE='false' ;; \
-        *) echo 'NONFREE must be one of nonfree, free, intel-nonfree or amd-nonfree (true and false are also accepted).' >&2; exit 1 ;; \
+        'nonfree'|'true') NONFREE_PROFILE='nonfree' ;; \
+        'free'|'false') NONFREE_PROFILE='free' ;; \
+        'intel-nonfree'|'amd-nonfree') \
+            echo 'NONFREE=intel-nonfree / amd-nonfree are removed. Select vendors with INTEL_NONFREE / AMD_NONFREE build args (GPU overlays set them).' >&2; \
+            exit 1 ;; \
+        *) echo 'NONFREE must be one of nonfree or free (true and false are also accepted).' >&2; exit 1 ;; \
     esac && \
+    case "${INTEL_NONFREE}" in \
+        'true'|'false'|'unset') ;; \
+        *) echo 'INTEL_NONFREE must be one of true, false or unset.' >&2; exit 1 ;; \
+    esac && \
+    case "${AMD_NONFREE}" in \
+        'true'|'false'|'unset') ;; \
+        *) echo 'AMD_NONFREE must be one of true, false or unset.' >&2; exit 1 ;; \
+    esac && \
+    if [ "${NONFREE_PROFILE}" = 'free' ]; then \
+        # free は再配布可能な構成を表すため、明示 true のみが矛盾として拒否対象。
+        # 未指定は非自由なし (=false) として解け、従来の「false 単独 = 再配布用」動作を戻す。
+        if [ "${INTEL_NONFREE}" = 'true' ] || [ "${AMD_NONFREE}" = 'true' ]; then \
+            echo 'free profile cannot include vendor nonfree components (INTEL_NONFREE/AMD_NONFREE=true).' >&2; \
+            exit 1; \
+        fi; \
+    else \
+        # 未指定のベンダーは常に含めない。nonfree プロファイルで黙って非自由なしにならないよう警告する。
+        # FROM 段の unset alias も同じ false 側へ解決しており、成果物と解決値は常に一致する。
+        if [ "${INTEL_NONFREE}" = 'unset' ] || [ "${AMD_NONFREE}" = 'unset' ]; then \
+            echo 'WARNING: NONFREE=nonfree with unset vendor flag(s); no nonfree component will be included. Set INTEL_NONFREE/AMD_NONFREE=true to include each vendor explicitly.' >&2; \
+        fi; \
+    fi; \
+    if [ "${INTEL_NONFREE}" = 'unset' ]; then INTEL_NONFREE='false'; fi; \
+    if [ "${AMD_NONFREE}" = 'unset' ]; then AMD_NONFREE='false'; fi; \
     printf 'NONFREE_PROFILE=%s\nINTEL_NONFREE=%s\nAMD_NONFREE=%s\n' \
         "${NONFREE_PROFILE}" "${INTEL_NONFREE}" "${AMD_NONFREE}" \
         > /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
@@ -686,6 +719,8 @@ RUN . /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
         --manifest /tmp/OPENCODE_THIRD_PARTY_LICENSES.md \
         --cuda-version "${CUDA_VERSION}" \
         --nonfree-profile "${NONFREE_PROFILE}" \
+        --intel-nonfree "${INTEL_NONFREE}" \
+        --amd-nonfree "${AMD_NONFREE}" \
         --output /code/THIRD_PARTY_LICENSES.md && \
     grep -F '## ACP Runtime Dependencies' /code/THIRD_PARTY_LICENSES.md && \
     grep -E '^### Node\.js [0-9]' /code/THIRD_PARTY_LICENSES.md && \
@@ -696,15 +731,16 @@ RUN . /usr/local/share/konomitv-bs4k-nonfree-profile.env && \
     grep -F '## OpenCode Runtime Dependencies' /code/THIRD_PARTY_LICENSES.md && \
     grep -E '^### opencode-ai [0-9]' /code/THIRD_PARTY_LICENSES.md && \
     grep -E '^### opencode-linux-x64 [0-9]' /code/THIRD_PARTY_LICENSES.md && \
-    # ライセンス文書が実際のビルドプロファイルと食い違っていないか、4 パターンで検査する。
-    # 警告見出しは free 以外で必須、Intel Full Feature と AMD proprietary の記述は各フラグと一致させる。
-    if [ "${NONFREE_PROFILE}" = 'free' ]; then \
+    # ライセンス文書が実際のベンダーフラグと食い違っていないか fail-closed で検査する。
+    # プロファイル文字列ではなく成果物に混入した非自由コンポーネントそのものを基準とし、
+    # 再配布警告はいずれかのベンダー非自由を含む構成でのみ必須となる。
+    if [ "${INTEL_NONFREE}" = 'true' ] || [ "${AMD_NONFREE}" = 'true' ]; then \
+        grep -Fq '重要: この Docker イメージは再配布しないでください。' /code/THIRD_PARTY_LICENSES.md; \
+    else \
         if grep -Fq '再配布しないでください' /code/THIRD_PARTY_LICENSES.md; then \
-            echo 'free license document contains the redistribution warning.' >&2; \
+            echo 'vendor-free license document contains the redistribution warning.' >&2; \
             exit 1; \
         fi; \
-    else \
-        grep -Fq '重要: この Docker イメージは再配布しないでください。' /code/THIRD_PARTY_LICENSES.md; \
     fi && \
     if [ "${INTEL_NONFREE}" = 'false' ]; then \
         if grep -Fq 'ENABLE_NONFREE_KERNELS=ON' /code/THIRD_PARTY_LICENSES.md; then \
